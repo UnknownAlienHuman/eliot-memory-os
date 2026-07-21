@@ -17,12 +17,12 @@ use eliot_store::{CanonicalStore, CanonicalToolObservation};
 use eliot_types::{
     AgentCapabilityEnvelope, AgentHostId, AgentId, AgentInvocationRequest, AgentResultEnvelope,
     AgentResultStatus, AgentRole, AgentSessionHostBinding, AgentSessionId, AgentSessionStatus,
-    CommandContext, DelegationState, HostIntegrationReceipt, HostLaunchScope, HostMode,
-    HostProfileStatus, LifecycleStatus, MAX_SECRET_BOUNDARY_BYTES, ProjectId, SecretBoundaryRule,
-    SemanticCommand, SemanticCommandKind, SessionId, TaintClass, TaskContract, TaskContractStatus,
-    TaskId, ToolObservationRecordCommand, Visibility, WorkItemId, WorkLease, WorkLeaseId,
-    WorktreeLease, WorktreeLeaseId, WorktreeLeaseState, WriteId, WriteReceipt, WriteReceiptRef,
-    WriteStatus, inspect_secret_bytes,
+    ClaudeSurface, CommandContext, DelegationState, HostIntegrationReceipt, HostLaunchScope,
+    HostMode, HostProfileStatus, LifecycleStatus, MAX_SECRET_BOUNDARY_BYTES, ProjectId,
+    SecretBoundaryRule, SemanticCommand, SemanticCommandKind, SessionId, TaintClass, TaskContract,
+    TaskContractStatus, TaskId, ToolObservationRecordCommand, Visibility, WorkItemId, WorkLease,
+    WorkLeaseId, WorktreeLease, WorktreeLeaseId, WorktreeLeaseState, WriteId, WriteReceipt,
+    WriteReceiptRef, WriteStatus, inspect_secret_bytes,
 };
 use jsonc_parser::{
     ParseOptions,
@@ -461,10 +461,20 @@ pub(crate) async fn dispatch(config_path: &Path, command: HostCommand) -> Result
             }
         }
         HostCommand::Doctor { host } => {
-            if is_claude_desktop_host(&host) {
-                write_json(&claude_desktop_doctor(config_path)?)
-            } else {
-                write_json(&doctor(config_path, parse_host(&host)?)?)
+            // A surface selector reports that surface; the bare family selector
+            // reports both, because whether two are active at once is a fact
+            // only the family view can see.
+            match claude_surface_selector(&host) {
+                Some(ClaudeSurface::ClaudeDesktopMcpb) => {
+                    write_json(&claude_desktop_doctor(config_path)?)
+                }
+                Some(ClaudeSurface::ClaudeCodePlugin) => {
+                    write_json(&doctor(config_path, AgentHostId::Claude)?)
+                }
+                None if parse_host(&host)? == AgentHostId::Claude => {
+                    write_json(&claude_family_doctor(config_path)?)
+                }
+                None => write_json(&doctor(config_path, parse_host(&host)?)?),
             }
         }
         HostCommand::Render {
@@ -658,11 +668,24 @@ fn doctor(config_path: &Path, host: AgentHostId) -> Result<Value> {
     }))
 }
 
+/// Resolves which Claude surface a `--host` selector names.
+///
+/// `claude-desktop` was historically a host string of its own, sitting beside
+/// `claude` as though Anthropic shipped two unrelated products. It is one host
+/// family with two packaged surfaces, so the selector now resolves to a
+/// [`ClaudeSurface`] and the family stays [`AgentHostId::Claude`]. The old
+/// spellings keep resolving; they are never emitted as the current name.
+fn claude_surface_selector(value: &str) -> Option<ClaudeSurface> {
+    let normalized = value.trim().to_ascii_lowercase().replace('-', "_");
+    match normalized.as_str() {
+        // Bare `claude` names the family, not a surface: the caller decides.
+        "claude" => None,
+        other => ClaudeSurface::parse(other),
+    }
+}
+
 fn is_claude_desktop_host(value: &str) -> bool {
-    matches!(
-        value.trim().to_ascii_lowercase().as_str(),
-        "claude-desktop" | "claude_desktop"
-    )
+    claude_surface_selector(value) == Some(ClaudeSurface::ClaudeDesktopMcpb)
 }
 
 fn claude_desktop_manifest_info(repo: &Path) -> Result<(PathBuf, String, String)> {
@@ -4566,6 +4589,105 @@ fn claude_global_plugin_path() -> Result<PathBuf> {
             .join("skills")
             .join("eliot"),
     )
+}
+
+fn claude_user_root() -> Result<PathBuf> {
+    Ok(
+        PathBuf::from(std::env::var_os("USERPROFILE").context("USERPROFILE is not set")?)
+            .join(".claude"),
+    )
+}
+
+/// Every root from which Claude Code could load ELIOT.
+///
+/// Claude Code discovers plugins from more than one place, and ELIOT has been
+/// installed both into a skills directory and registered under the plugin data
+/// root. Two roots holding ELIOT is not a cosmetic duplication: each one binds
+/// its own MCP server, so a single session gets the tool set twice under
+/// competing namespaces. Every root is reported, never just the first found.
+fn claude_code_plugin_roots() -> Result<Vec<PathBuf>> {
+    let mut roots = Vec::new();
+    let skills_install = claude_global_plugin_path()?;
+    if skills_install.join(".mcp.json").is_file() || skills_install.join(".claude-plugin").is_dir()
+    {
+        roots.push(skills_install);
+    }
+    let plugin_data = claude_user_root()?.join("plugins").join("data");
+    if let Ok(entries) = std::fs::read_dir(&plugin_data) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_dir() {
+                continue;
+            }
+            let names_eliot = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.to_ascii_lowercase().contains("eliot"));
+            // An empty registration directory is a leftover, not a live root.
+            let has_content = std::fs::read_dir(&path).is_ok_and(|mut d| d.next().is_some());
+            if names_eliot && has_content {
+                roots.push(path);
+            }
+        }
+    }
+    Ok(roots)
+}
+
+/// One doctor for the whole Claude host family.
+///
+/// `claude` is a single vendor with a single Governor authority behind two
+/// packaged surfaces. Reporting them separately is what let both be active at
+/// once without anything calling it a fault, so the family view is the one that
+/// decides readiness: two active surfaces is a configuration error, not health.
+fn claude_family_doctor(config_path: &Path) -> Result<Value> {
+    let code_roots = claude_code_plugin_roots()?;
+    let desktop = claude_desktop_doctor(config_path)?;
+    let desktop_active = desktop
+        .get("extension")
+        .is_some_and(|state| !state.is_null());
+    let code_active = !code_roots.is_empty();
+
+    let mut conflicts = Vec::new();
+    if code_roots.len() > 1 {
+        conflicts.push(json!({
+            "kind": "duplicate_code_plugin_roots",
+            "detail": "Claude Code can load ELIOT from more than one root, exposing the tool set twice",
+            "roots": &code_roots,
+            "remediation": "keep exactly one ELIOT plugin root and remove the others"
+        }));
+    }
+    if code_active && desktop_active {
+        conflicts.push(json!({
+            "kind": "dual_active_surface",
+            "detail": "the Claude Code plugin and the Claude Desktop MCPB are both active; a Claude Code session hosted in Desktop binds ELIOT twice",
+            "remediation": "activate exactly one surface for this machine"
+        }));
+    }
+
+    Ok(json!({
+        "schema_version": "eliot-claude-family-doctor-v1",
+        "host": AgentHostId::Claude.as_str(),
+        "surfaces": {
+            ClaudeSurface::ClaudeCodePlugin.as_str(): {
+                "active": code_active,
+                "roots": &code_roots,
+                "root_count": code_roots.len(),
+                "supports_lifecycle_hooks": ClaudeSurface::ClaudeCodePlugin.supports_lifecycle_hooks()
+            },
+            ClaudeSurface::ClaudeDesktopMcpb.as_str(): {
+                "active": desktop_active,
+                "supports_lifecycle_hooks": ClaudeSurface::ClaudeDesktopMcpb.supports_lifecycle_hooks(),
+                "detail": desktop
+            }
+        },
+        "active_surface_count": usize::from(code_active) + usize::from(desktop_active),
+        "conflicts": conflicts,
+        "status": if conflicts.is_empty() {
+            if code_active || desktop_active { "ready" } else { "not_installed" }
+        } else {
+            "conflict"
+        }
+    }))
 }
 
 fn claude_plugin_hash(bundle: &Path, governor: &Path) -> Result<String> {

@@ -26,6 +26,54 @@ impl AgentHostId {
     }
 }
 
+/// Which packaged surface of the Claude host family an operation targets.
+///
+/// `AgentHostId::Claude` is the vendor: one host family, one Governor
+/// authority. It ships as two packages with genuinely different capabilities,
+/// and treating them as one blurred surface is what allowed a single session to
+/// bind both and see the tool set twice. The distinction is explicit here so it
+/// stops being carried around as a magic host string.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ClaudeSurface {
+    /// Claude Code plugin: MCP server, skills, and lifecycle hooks.
+    ClaudeCodePlugin,
+    /// Claude Desktop MCPB: MCP tools, prompts, and server instructions.
+    /// Desktop has no Claude Code lifecycle hooks and must not claim them.
+    ClaudeDesktopMcpb,
+}
+
+impl ClaudeSurface {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ClaudeCodePlugin => "claude_code_plugin",
+            Self::ClaudeDesktopMcpb => "claude_desktop_mcpb",
+        }
+    }
+
+    /// Parses a surface selector.
+    ///
+    /// `claude-desktop` and `claude_desktop` were historically host strings of
+    /// their own, which made the Desktop package look like a separate vendor.
+    /// They are still accepted so existing scripts and receipts keep resolving,
+    /// but [`Self::as_str`] never emits them as the current spelling.
+    #[must_use]
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().replace('-', "_").as_str() {
+            "code" | "claude_code" | "claude_code_plugin" => Some(Self::ClaudeCodePlugin),
+            "desktop" | "claude_desktop" | "claude_desktop_mcpb" => Some(Self::ClaudeDesktopMcpb),
+            _ => None,
+        }
+    }
+
+    /// True when this surface can enforce Claude Code lifecycle hooks.
+    #[must_use]
+    pub const fn supports_lifecycle_hooks(self) -> bool {
+        matches!(self, Self::ClaudeCodePlugin)
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum HostMode {
@@ -343,4 +391,76 @@ pub struct HostContextFootprintReport {
     pub supporting_files_loaded: Vec<String>,
     pub unrelated_architecture_docs_loaded: bool,
     pub result: String,
+}
+
+#[cfg(test)]
+mod claude_surface_tests {
+    use super::{AgentHostId, ClaudeSurface};
+
+    /// One vendor, two packages. The family never becomes two hosts.
+    #[test]
+    fn both_surfaces_belong_to_the_same_host_family() {
+        assert_eq!(AgentHostId::Claude.as_str(), "claude");
+        assert_ne!(
+            ClaudeSurface::ClaudeCodePlugin.as_str(),
+            ClaudeSurface::ClaudeDesktopMcpb.as_str()
+        );
+    }
+
+    /// `claude-desktop` used to be a host string of its own. It must keep
+    /// resolving so existing scripts and receipts still work.
+    #[test]
+    fn the_retired_desktop_host_spellings_still_resolve() {
+        for spelling in [
+            "desktop",
+            "claude_desktop",
+            "claude-desktop",
+            "claude_desktop_mcpb",
+            "CLAUDE-DESKTOP",
+            "  desktop  ",
+        ] {
+            assert_eq!(
+                ClaudeSurface::parse(spelling),
+                Some(ClaudeSurface::ClaudeDesktopMcpb),
+                "{spelling} must resolve to the Desktop surface"
+            );
+        }
+        for spelling in ["code", "claude_code", "claude-code", "claude_code_plugin"] {
+            assert_eq!(
+                ClaudeSurface::parse(spelling),
+                Some(ClaudeSurface::ClaudeCodePlugin),
+                "{spelling} must resolve to the Code surface"
+            );
+        }
+        assert_eq!(ClaudeSurface::parse("opencode"), None);
+    }
+
+    /// The retired spelling resolves but is never written back out.
+    #[test]
+    fn the_retired_spelling_is_never_emitted_as_the_current_name() {
+        let parsed = ClaudeSurface::parse("claude-desktop").expect("resolves");
+        assert_eq!(parsed.as_str(), "claude_desktop_mcpb");
+        assert_ne!(parsed.as_str(), "claude-desktop");
+    }
+
+    /// Desktop ships MCP tools and prompts. It does not get Claude Code
+    /// lifecycle hooks, and must never be described as if it did.
+    #[test]
+    fn only_the_code_surface_claims_lifecycle_hooks() {
+        assert!(ClaudeSurface::ClaudeCodePlugin.supports_lifecycle_hooks());
+        assert!(!ClaudeSurface::ClaudeDesktopMcpb.supports_lifecycle_hooks());
+    }
+
+    #[test]
+    fn surfaces_round_trip_through_serde() -> Result<(), serde_json::Error> {
+        for surface in [
+            ClaudeSurface::ClaudeCodePlugin,
+            ClaudeSurface::ClaudeDesktopMcpb,
+        ] {
+            let json = serde_json::to_string(&surface)?;
+            assert_eq!(json, format!("\"{}\"", surface.as_str()));
+            assert_eq!(serde_json::from_str::<ClaudeSurface>(&json)?, surface);
+        }
+        Ok(())
+    }
 }

@@ -147,10 +147,10 @@ pub use health::{ComponentHealth, HealthStatus, StartupHealthReport};
 pub use host::{
     AgentCapabilityEnvelope, AgentHostId, AgentHostIdentity, AgentHostRuntimeProfile,
     AgentInvocationRequest, AgentResultDisposition, AgentResultDispositionKind,
-    AgentResultEnvelope, AgentResultStatus, AgentSessionHostBinding, ControllerLease,
-    HostContextFootprintReport, HostEventEnvelope, HostIntegrationReceipt, HostLaunchContract,
-    HostLaunchScope, HostMode, HostProfileStatus, HostProtocolSurfaces, OperationJob,
-    OperationJobState, TaskRoleLease,
+    AgentResultEnvelope, AgentResultStatus, AgentSessionHostBinding, ClaudeSurface,
+    ControllerLease, HostContextFootprintReport, HostEventEnvelope, HostIntegrationReceipt,
+    HostLaunchContract, HostLaunchScope, HostMode, HostProfileStatus, HostProtocolSurfaces,
+    OperationJob, OperationJobState, TaskRoleLease,
 };
 pub use ids::{
     ActionLeaseId, ActionRequestId, AgentId, AgentRunId, AgentSessionId,
