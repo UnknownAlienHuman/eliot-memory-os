@@ -1,0 +1,21 @@
+[package]
+name = "eliot-engine"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+blake3.workspace = true
+eliot-store.workspace = true
+eliot-types.workspace = true
+eliot-windows-ipc.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+time.workspace = true
+tokio.workspace = true
+uuid.workspace = true
+
+[lints]
+workspace = true

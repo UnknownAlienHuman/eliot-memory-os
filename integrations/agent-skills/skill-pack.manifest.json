@@ -1,0 +1,28 @@
+{
+  "schema_version": "eliot-agent-skill-pack-v1",
+  "hash_algorithm": "blake3(name:content_blake3 joined with LF in manifest order)",
+  "pack_hash": "585dd74e630594e985baef1f970abfcd0377375258b421bf0b7714e08a618a89",
+  "listing_characters": 626,
+  "skills": [
+    {
+      "name": "eliot-task-cycle",
+      "content_blake3": "c49e9a4fd73b81b2cd5fe5da0f64f4bd39a44046378919c62055e519e813966a"
+    },
+    {
+      "name": "eliot-understanding",
+      "content_blake3": "09d415f513bfbee782f1b85d57b048b8f9a95d6969096366f93012f99276193a"
+    },
+    {
+      "name": "eliot-delegation",
+      "content_blake3": "82eaaeb2a52f08d55da463c68c75bffa3ae6f50101c7fb6df5deb3f34f0a407d"
+    },
+    {
+      "name": "eliot-verify-finish",
+      "content_blake3": "3eac10cc385ff18d5520137789f77921d5e6ae743f1bda4b429059bc81384a05"
+    }
+  ],
+  "derived_packages": [
+    "integrations/opencode/skills",
+    "integrations/claude/eliot/skills"
+  ]
+}

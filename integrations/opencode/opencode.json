@@ -1,0 +1,20 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "instructions": ["instructions/eliot.md"],
+  "mcp": {
+    "eliot": {
+      "type": "local",
+      "command": [
+        "{env:ELIOT_GOVERNOR_EXE}",
+        "mcp",
+        "stdio",
+        "--host",
+        "opencode",
+        "--instance",
+        "default"
+      ],
+      "enabled": true,
+      "timeout": 30000
+    }
+  }
+}

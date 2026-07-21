@@ -1,0 +1,29 @@
+[package]
+name = "eliot-store"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+base64.workspace = true
+blake3.workspace = true
+eliot-types.workspace = true
+eliot-windows-ipc.workspace = true
+futures-util.workspace = true
+redb.workspace = true
+secrecy.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+time.workspace = true
+tokio.workspace = true
+tokio-tungstenite.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+time.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,16 @@
+{
+  "mcpServers": {
+    "eliot": {
+      "type": "stdio",
+      "command": "${CLAUDE_PLUGIN_ROOT}/bin/eliot-governor.exe",
+      "args": [
+        "mcp",
+        "stdio",
+        "--host",
+        "claude",
+        "--instance",
+        "default"
+      ]
+    }
+  }
+}

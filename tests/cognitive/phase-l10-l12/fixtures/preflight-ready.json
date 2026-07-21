@@ -1,0 +1,19 @@
+{
+  "schema_version": "eliot-cognitive-preflight-v1",
+  "provider_calls": 0,
+  "estimated_provider_calls": 18,
+  "hard_provider_call_cap": 18,
+  "ready": true,
+  "checks": [
+    {"name":"opencode_binary","passed":true},
+    {"name":"opencode_model","passed":true},
+    {"name":"antigravity_binary","passed":true},
+    {"name":"antigravity_model","passed":true},
+    {"name":"governor_binary","passed":true},
+    {"name":"governor_runtime","passed":true},
+    {"name":"opencode_host_doctor","passed":true},
+    {"name":"antigravity_plugin","passed":true},
+    {"name":"antigravity_mcp","passed":true},
+    {"name":"readonly_mcp_probe","passed":true}
+  ]
+}

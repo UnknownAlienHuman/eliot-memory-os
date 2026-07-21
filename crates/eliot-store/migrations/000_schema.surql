@@ -1,0 +1,18 @@
+DEFINE TABLE IF NOT EXISTS scope_head SCHEMALESS;
+DEFINE TABLE IF NOT EXISTS source_snapshot SCHEMALESS;
+DEFINE TABLE IF NOT EXISTS evidence_atom SCHEMALESS;
+DEFINE TABLE IF NOT EXISTS tool_observation SCHEMALESS;
+DEFINE TABLE IF NOT EXISTS claim_card SCHEMALESS;
+DEFINE TABLE IF NOT EXISTS verification_run SCHEMALESS;
+DEFINE TABLE IF NOT EXISTS failure_fingerprint SCHEMALESS;
+DEFINE TABLE IF NOT EXISTS write_receipt SCHEMALESS;
+DEFINE TABLE IF NOT EXISTS memory_transition SCHEMALESS;
+DEFINE TABLE IF NOT EXISTS canonical_record SCHEMALESS;
+DEFINE TABLE IF NOT EXISTS trace_span SCHEMALESS;
+DEFINE TABLE IF NOT EXISTS context_packet_receipt SCHEMALESS;
+DEFINE INDEX OVERWRITE idx_tool_observation_project_task_kind_pattern ON TABLE tool_observation FIELDS project_id, task_id, payload.receipt_kind, payload.receipt_body.pattern_id;
+DEFINE INDEX OVERWRITE idx_canonical_project_kind ON TABLE canonical_record FIELDS project_id, receipt_kind;
+DEFINE INDEX OVERWRITE idx_canonical_project_task_kind ON TABLE canonical_record FIELDS project_id, task_id, receipt_kind;
+DEFINE INDEX OVERWRITE idx_canonical_project_subject ON TABLE canonical_record FIELDS project_id, subject_ref;
+DEFINE INDEX OVERWRITE idx_canonical_write ON TABLE canonical_record FIELDS write_id;
+RETURN { migrated: true };

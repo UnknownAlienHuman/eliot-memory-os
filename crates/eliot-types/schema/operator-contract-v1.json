@@ -1,0 +1,97 @@
+{
+  "schema_version": "eliot-operator-contract-v1",
+  "ipc_protocol_version": "eliot-ipc-l3-v1",
+  "transport": "authenticated_windows_named_pipe",
+  "request_envelope": "MCP JSON-RPC tools/call over the existing Governor pipe",
+  "projections": [
+    "OperatorSnapshot",
+    "TaskCognitionView",
+    "MemoryInspectorView",
+    "ExperienceCase",
+    "ExperiencePattern",
+    "MemoryApplicabilityDecision",
+    "NegativeTransferRecord",
+    "CognitiveTransferLabReport",
+    "AgentRoutingView",
+    "AutonomyRunView",
+    "ApprovalView",
+    "TraceTimelineView",
+    "OperatorProjectionPage",
+    "OperatorRecordView",
+    "OperatorRelationshipView",
+    "OperatorActionView"
+  ],
+  "projection_kinds": [
+    "overview",
+    "tasks_work",
+    "task_cognition",
+    "memory_explorer",
+    "causal_provenance",
+    "schema_contracts",
+    "query_lab",
+    "experience_skills",
+    "sleep_meta",
+    "agents_routing",
+    "autonomy",
+    "approvals",
+    "timeline_operations"
+  ],
+  "read_operations": [
+    "operator_snapshot",
+    "operator_query"
+  ],
+  "schema_families": [
+    {"id":"task","family":"TaskContract/ActiveDecisionState/WorkItem","owner":"Governor control plane","read_authority":"HumanOperator","write_authority":"WriterActor","required_fields":["project_id","task_id","memory_revision"],"relations":["task -> work_item","task -> active_decision_state"],"migration":"eliot-types schema plus canonical store migrations","index_health":"Governor contract and store health projections","docs_ref":"docs/ARCHITECTURE_CONTRACT.md"},
+    {"id":"memory","family":"Claim/Evidence/Context/Lifecycle","owner":"Memory OS","read_authority":"HumanOperator","write_authority":"WriterActor","required_fields":["project_id","subject_ref","receipt_kind"],"relations":["claim -> evidence","memory_state_transition -> target_ref"],"migration":"canonical semantic observation migrations","index_health":"canonical receipt-kind and subject indexes","docs_ref":"docs/ARCHITECTURE_CONTRACT.md"},
+    {"id":"experience","family":"ExperienceCase/Pattern/Skill","owner":"Semantic memory and curator","read_authority":"HumanOperator","write_authority":"Governor/WriterActor","required_fields":["authority","maturity","evidence_refs"],"relations":["pattern -> case","skill -> lifecycle"],"migration":"semantic-memory schema migrations","index_health":"receipt-kind projection health","docs_ref":"docs/ARCHITECTURE_CONTRACT.md"},
+    {"id":"routing","family":"HostSession/RoleLease/WorkLease/WorktreeLease/OperationJob","owner":"Governor host broker","read_authority":"HumanOperator","write_authority":"Governor services","required_fields":["session_id","task_id","expires_at"],"relations":["host_session -> task_role_lease","work_item -> work_lease","work_lease -> worktree_lease"],"migration":"delegation and work-state schema","index_health":"native state load plus typed projection","docs_ref":"docs/AGENT_HOST_INTEGRATIONS.md"},
+    {"id":"autonomy","family":"AutonomyRun/WorkGraph/Budget/Tripwire/Recovery","owner":"Governor autonomy runtime","read_authority":"HumanOperator","write_authority":"Governor/WriterActor","required_fields":["autonomy_run_id","root_task_id","state_revision"],"relations":["run -> work_graph","run -> budget_ledger","tripwire -> recovery"],"migration":"canonical autonomy aggregate migrations","index_health":"canonical autonomy run view","docs_ref":"docs/ARCHITECTURE_CONTRACT.md"},
+    {"id":"operations","family":"ApprovalRequest/Incident/Backup/LogHandle","owner":"Governor operations","read_authority":"HumanOperator","write_authority":"Specialized Governor executor/WriterActor","required_fields":["exact_action_hash or evidence_ref","status","generated_at"],"relations":["approval_request -> exact_action_hash","incident -> evidence_ref","backup -> manifest_ref"],"migration":"operations report and canonical request schemas","index_health":"native report inventory and log parser health","docs_ref":"docs/release/WINDOWS_X64_RELEASE.md"}
+  ],
+  "query_operations": [
+    {"id":"current_state","title":"Current state","parameters":["project_id","task_id"],"result_modes":["human","json"]},
+    {"id":"recall_preview","title":"Recall preview","parameters":["project_id","task_id","query","lifecycle_audit"],"result_modes":["human","json"]},
+    {"id":"exact_evidence","title":"Exact evidence","parameters":["project_id","task_id","record_ref_or_handles"],"result_modes":["human","json"]},
+    {"id":"relationship_slice","title":"Relationship slice","parameters":["project_id","task_id","selected_ref","expand_depth"],"result_modes":["human","json","graph"]},
+    {"id":"trace_replay","title":"Trace and replay","parameters":["project_id","task_id","filters"],"result_modes":["human","json"]},
+    {"id":"health_report","title":"Health and reports","parameters":["filters"],"result_modes":["human","json"]}
+  ],
+  "commands": [
+    "select_task",
+    "refresh_packet",
+    "request_revalidation",
+    "create_autonomy_run",
+    "preview_autonomy_edit",
+    "start_run",
+    "pause_run",
+    "resume_run",
+    "cancel_run",
+    "disposition_agent_result",
+    "contest_memory",
+    "suppress_memory",
+    "archive_memory",
+    "restore_memory",
+    "review_candidate",
+    "trigger_backup_validation",
+    "request_import_preview",
+    "grant_approval",
+    "deny_approval",
+    "finish_gap_preview"
+  ],
+  "invariants": [
+    "Governor is the only business-rule authority",
+    "client never receives database credentials",
+    "mutations return canonical WriterActor receipts",
+    "R3 requires exact action-hash approval",
+    "stale runtime authentication is rejected",
+    "hidden chain-of-thought is never projected",
+    "experience priors are separate from verified current truth",
+    "single episodes never grant procedure or action authority"
+  ],
+  "query_invariants": [
+    "semantic projections only; no raw SQL or shell",
+    "server-enforced page size and opaque continuation cursor",
+    "graph expansion is bounded to the selected neighborhood",
+    "filters are typed and cannot carry arbitrary record mutations"
+  ]
+}

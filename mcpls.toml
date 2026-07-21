@@ -1,0 +1,24 @@
+[workspace]
+roots = ["."]
+position_encodings = ["utf-8", "utf-16"]
+heuristics_max_depth = 10
+
+[[workspace.language_extensions]]
+extensions = ["rs"]
+language_id = "rust"
+
+[[workspace.language_extensions]]
+extensions = ["toml"]
+language_id = "toml"
+
+[[lsp_servers]]
+language_id = "rust"
+command = "rust-analyzer"
+args = []
+file_patterns = ["**/*.rs"]
+timeout_seconds = 30
+
+[lsp_servers.env]
+
+[lsp_servers.heuristics]
+project_markers = ["Cargo.toml", "rust-toolchain.toml", ".git"]

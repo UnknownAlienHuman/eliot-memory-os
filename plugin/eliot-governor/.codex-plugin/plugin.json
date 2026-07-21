@@ -1,0 +1,22 @@
+{
+  "name": "eliot-governor",
+  "version": "0.1.0+codex.local-20260711-080500",
+  "description": "Governed Eliot lifecycle hooks, MCP surface, and task skills.",
+  "author": {
+    "name": "Eliot Governor"
+  },
+  "skills": "./skills/",
+  "mcpServers": "./.mcp.json",
+  "interface": {
+    "displayName": "Eliot Governor",
+    "shortDescription": "Governed memory, verification, and external review.",
+    "longDescription": "Use Eliot Governor MCP tools and skills for bounded memory, task verification, and candidate-only Antigravity delegation.",
+    "developerName": "Eliot Governor",
+    "category": "Developer Tools",
+    "capabilities": ["MCP", "Skills"],
+    "defaultPrompt": [
+      "Run a governed Eliot task cycle.",
+      "Ask Antigravity for a bounded second opinion."
+    ]
+  }
+}

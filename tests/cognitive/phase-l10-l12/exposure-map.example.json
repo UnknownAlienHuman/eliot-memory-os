@@ -1,0 +1,18 @@
+{
+  "schema_version": "eliot-cognitive-exposure-map-v1",
+  "sealed_after_integration": false,
+  "cases": {
+    "PC-01": {"current_truth_revision":"REPLACE","treatment_handles":["REPLACE"],"control_handles":[]},
+    "PC-02": {"current_truth_revision":"REPLACE","treatment_handles":["REPLACE"],"control_handles":[]},
+    "LC-01": {"current_truth_revision":"REPLACE","treatment_handles":[],"control_handles":[]},
+    "LC-02": {"current_truth_revision":"REPLACE","treatment_handles":[],"control_handles":[]},
+    "PR-01": {"current_truth_revision":"REPLACE","treatment_handles":["REPLACE"],"control_handles":[]},
+    "NM-01": {"current_truth_revision":"REPLACE","treatment_handles":["REPLACE"],"control_handles":[]},
+    "DM-01": {"current_truth_revision":"REPLACE","treatment_handles":["REPLACE"],"control_handles":[]},
+    "ST-01": {"current_truth_revision":"REPLACE","treatment_handles":["REPLACE"],"control_handles":[]},
+    "NU-01": {"current_truth_revision":"REPLACE","treatment_handles":["REPLACE_DISTRACTOR"],"control_handles":[]},
+    "SL-01": {"current_truth_revision":"REPLACE","treatment_handles":["REPLACE_CANDIDATE"],"control_handles":[]},
+    "FG-01": {"current_truth_revision":"REPLACE","treatment_handles":["REPLACE_SUPPRESSED"],"control_handles":[]},
+    "AR-01": {"current_truth_revision":"REPLACE","treatment_handles":["REPLACE"],"control_handles":[]}
+  }
+}

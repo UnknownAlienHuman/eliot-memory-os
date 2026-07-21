@@ -1,0 +1,8 @@
+[default.extend-words]
+# Public status variant retained for compatibility with serialized Governor reports.
+Unparseable = "Unparseable"
+# Valid tasklist.exe format-output switch used by the Antigravity process probe.
+FO = "FO"
+# SurrealDB query language name used throughout phase closeouts.
+Sur = "Sur"
+SurQL = "SurQL"

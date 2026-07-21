@@ -1,0 +1,8 @@
+{
+  "name": "eliot",
+  "version": "0.1.0",
+  "description": "Connects Claude Code to ELIOT Memory OS for governed task state, causal context, agent coordination, verification, and durable receipts.",
+  "author": {
+    "name": "ELIOT"
+  }
+}

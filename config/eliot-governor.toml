@@ -1,0 +1,54 @@
+schema_version = "1"
+
+[service]
+service_name = "EliotGovernor"
+instance_id = "local-dev"
+
+[db]
+mode = "surreal_rpc_server"
+
+[db.surreal]
+exe = "surreal"
+bind = "127.0.0.1:18000"
+endpoint = "ws://127.0.0.1:18000/rpc"
+storage = "rocksdb:.eliot-governor/surrealdb-rocks"
+ns = "eliot"
+db = "system"
+user = "root"
+credential_provider = "windows_credential_manager"
+credential_id = "surreal-runtime/local-dev"
+password_file = "%LOCALAPPDATA%/Eliot/secrets/surreal_root_password.txt"
+log_level = "warn"
+query_timeout_ms = 15000
+transaction_timeout_ms = 15000
+startup_timeout_ms = 20000
+restart_backoff_ms = 200
+max_restart_backoff_ms = 2000
+
+[db.surreal.capabilities]
+deny_all = true
+allow_funcs = ["array", "string", "time", "type", "math", "vector", "search"]
+allow_net = []
+allow_scripting = false
+allow_guests = false
+
+[control_wal]
+path = ".eliot-governor/control/control.redb"
+
+[blob_store]
+root = ".eliot-governor/blobs"
+
+[store]
+surql_dir = "crates/eliot-store/src/surql"
+migrations_dir = "crates/eliot-store/migrations"
+
+[delegation_calibration]
+minimum_real_tasks_total = 12
+minimum_real_tasks_per_family = 5
+minimum_executed_reviews_total = 4
+minimum_executed_reviews_per_candidate_family = 3
+minimum_complete_outcome_fraction = 0.80
+minimum_shadow_tasks_total = 12
+require_zero_authority_violations = true
+require_zero_live_tree_violations = true
+require_zero_recursive_executions = true

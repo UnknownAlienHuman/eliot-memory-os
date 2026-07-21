@@ -1,0 +1,61 @@
+# Rust / build output
+target/
+dist/
+**/bin/
+**/obj/
+
+# Rust binary source modules are source, not build output
+!crates/**/src/bin/
+!crates/**/src/bin/**
+
+# Runtime state
+.eliot-governor/
+**/.eliot-governor/
+logs/
+reports/
+runtime/
+
+# Environment and credentials
+.env
+.env.*
+!.env.example
+!.env.*.example
+.npmrc
+.pypirc
+.netrc
+credentials.json
+**/credentials.json
+*.pem
+*.key
+*.p12
+*.pfx
+*.kdbx
+id_rsa
+id_ed25519
+
+# Developer-local agent/tool state
+.claude/settings.local.json
+.codex/config.toml
+.codex/config.local.toml
+.codex/cargo_metadata.json
+history.txt
+
+# Generated code-understanding state
+.codebase-memory/artifact.json
+.codebase-memory/graph.db.zst
+
+# Local databases / WAL / crash files
+*.redb
+*.wal
+*.sqlite
+*.sqlite3
+*.db-wal
+*.db-shm
+*.dmp
+*.core
+
+# Common temporary files
+*.tmp
+*.temp
+*.bak
+*.swp

@@ -1,0 +1,16 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+  </PropertyGroup>
+  <ItemGroup>
+    <Compile Include="../../apps/Eliot.Operator/Protocol/OperatorContracts.cs" Link="Protocol/OperatorContracts.cs" />
+    <Compile Include="../../apps/Eliot.Operator/Services/IGovernorClient.cs" Link="Services/IGovernorClient.cs" />
+    <Compile Include="../../apps/Eliot.Operator/Services/GovernorPipeClient.cs" Link="Services/GovernorPipeClient.cs" />
+    <Compile Include="../../apps/Eliot.Operator/Services/RuntimeDiscoveryService.cs" Link="Services/RuntimeDiscoveryService.cs" />
+    <Compile Include="../../apps/Eliot.Operator/ViewModels/MainViewModel.cs" Link="ViewModels/MainViewModel.cs" />
+    <None Include="../../crates/eliot-types/schema/operator-contract-v1.json" Link="operator-contract-v1.json" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+</Project>

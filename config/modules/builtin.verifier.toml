@@ -1,0 +1,33 @@
+module_id = "00000000-0000-4000-8000-000000000004"
+name = "builtin.verifier"
+version = "0.1.0"
+description = "G0 builtin verifier contract."
+module_kind = "verifier_adapter"
+transport = "in_process"
+capabilities = ["submit_verifier_result", "run_verifier", "health_check"]
+input_schemas = [{ schema_id = "builtin.verifier.run", version = "1" }]
+output_schemas = [{ schema_id = "builtin.verifier.result", version = "1" }]
+enabled_by_default = true
+
+[[endpoints]]
+endpoint_id = "health"
+name = "health"
+direction = "bidirectional"
+schema = { schema_id = "builtin.verifier.health", version = "1" }
+max_payload_bytes = 4096
+requires_ack = true
+
+[authority_profile]
+allowed_projects = []
+allowed_roles = []
+allowed_capabilities = ["submit_verifier_result", "run_verifier", "health_check"]
+can_write_truth = false
+can_request_patch = false
+can_finish_task = false
+
+[resource_limits]
+max_runtime_seconds = 30
+max_payload_bytes = 65536
+max_concurrent_requests = 1
+idle_ttl_seconds = 300
+restart_budget = 0

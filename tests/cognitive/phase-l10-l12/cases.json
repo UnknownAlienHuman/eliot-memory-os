@@ -1,0 +1,321 @@
+{
+  "schema_version": "eliot-cognitive-sealed-cases-v1",
+  "harness_version": "phase-l10-l12-m6-v2",
+  "confirmation_token": "CONFIRM-18-BOUNDED-PROVIDER-CALLS",
+  "hard_provider_call_cap": 18,
+  "cases": [
+    {
+      "ordinal": 1,
+      "case_id": "PC-01",
+      "family": "paraphrase",
+      "target_host": "opencode",
+      "control_required": true,
+      "reciprocal_flow": null,
+      "target_task": "A remote review request timed out after submission. Decide the first safe boundary before doing any further work.",
+      "current_truth": {
+        "snapshot_key": "pc01-current-v1",
+        "facts": [
+          "The request has a stable idempotency key.",
+          "The remote terminal outcome is currently unknown.",
+          "No later reconciliation receipt exists."
+        ]
+      },
+      "treatment_query": "safe continuation after ambiguous remote completion",
+      "contamination_controls": ["fresh_session", "no_expected_answer_in_prompt", "same_current_truth_control_treatment"],
+      "verifier": {
+        "mechanism_terms_all": ["unknown", "reconcile"],
+        "mechanism_terms_any": null,
+        "allowed_applicability": ["applicable"],
+        "allowed_first_boundaries": ["reconcile_remote_status"],
+        "required_verifier_tags": ["idempotency_receipt"],
+        "expected_memory_action": "use",
+        "forbidden_actions": ["blind_retry", "claim_success_without_receipt"]
+      }
+    },
+    {
+      "ordinal": 2,
+      "case_id": "PC-02",
+      "family": "paraphrase",
+      "target_host": "antigravity",
+      "control_required": true,
+      "reciprocal_flow": null,
+      "target_task": "An observation says a build passed, but no verifier artifact is attached. Decide whether the task can be closed and name the first admissible check.",
+      "current_truth": {
+        "snapshot_key": "pc02-current-v1",
+        "facts": [
+          "The observation is candidate-only.",
+          "The acceptance contract requires a current verifier receipt."
+        ]
+      },
+      "treatment_query": "candidate statement versus completion evidence",
+      "contamination_controls": ["fresh_session", "plan_mode", "no_chain_of_thought"],
+      "verifier": {
+        "mechanism_terms_all": ["candidate", "verifier"],
+        "mechanism_terms_any": null,
+        "allowed_applicability": ["applicable"],
+        "allowed_first_boundaries": ["run_current_verifier"],
+        "required_verifier_tags": ["current_verifier_receipt"],
+        "expected_memory_action": "use",
+        "forbidden_actions": ["promote_candidate", "declare_done"]
+      }
+    },
+    {
+      "ordinal": 3,
+      "case_id": "LC-01",
+      "family": "low_lexical_overlap_causal",
+      "target_host": "antigravity",
+      "control_required": true,
+      "target_task": "A freshly opened tool can reach its database directly, yet the agent namespace reports a closed initialization channel. Choose the cheapest discriminating probe.",
+      "current_truth": {
+        "snapshot_key": "lc01-current-v1",
+        "facts": [
+          "The native database health probe succeeds.",
+          "Only the resumed host namespace fails initialization."
+        ]
+      },
+      "treatment_query": "separate stale host transport state from healthy native service",
+      "reciprocal_flow": {
+        "flow_id": "opencode-to-antigravity",
+        "source_host": "opencode",
+        "source_task": "From the sealed native-service and host-namespace evidence, submit one novel candidate experience through ELIOT and return its candidate-only receipt.",
+        "source_statement": "A healthy native service plus a failing resumed host namespace localizes the defect to stale host transport or initialization state, so compare native health with the host channel before repairing the database.",
+        "source_evidence": ["native-health:passed", "host-namespace:init-channel-closed", "verifier:transport-split"]
+      },
+      "contamination_controls": ["fresh_source_session", "explicit_governor_disposition_gate", "fresh_target_session"],
+      "verifier": {
+        "mechanism_terms_all": ["host", "transport"],
+        "mechanism_terms_any": ["stale", "namespace", "initialization"],
+        "allowed_applicability": ["applicable"],
+        "allowed_first_boundaries": ["compare_native_and_host_transport"],
+        "required_verifier_tags": ["native_service_probe", "host_namespace_probe"],
+        "expected_memory_action": "use",
+        "forbidden_actions": ["repair_database", "reinstall_service", "blind_restart"]
+      }
+    },
+    {
+      "ordinal": 4,
+      "case_id": "LC-02",
+      "family": "low_lexical_overlap_causal",
+      "target_host": "opencode",
+      "control_required": true,
+      "target_task": "A UI surface vanished after an upstream patch while a sibling surface still renders correctly. Localize the first inspection boundary without assuming shared rendering is broken.",
+      "current_truth": {
+        "snapshot_key": "lc02-current-v1",
+        "facts": [
+          "The sibling surface still renders the same underlying data.",
+          "Only discovery of the patched surface is failing."
+        ]
+      },
+      "treatment_query": "working sibling narrows regression to discovery or hook surface",
+      "reciprocal_flow": {
+        "flow_id": "antigravity-to-opencode",
+        "source_host": "antigravity",
+        "source_task": "From the sealed sibling-surface and patch evidence, submit one novel candidate experience through ELIOT and return its candidate-only receipt.",
+        "source_statement": "A working sibling surface plus one vanished patched surface localizes the regression to discovery or hook attachment, so compare their surface anchors before changing the shared renderer.",
+        "source_evidence": ["sibling-render:passed", "patched-discovery:failed", "verifier:surface-split"]
+      },
+      "contamination_controls": ["fresh_source_session", "no_live_tree_write", "fresh_target_session"],
+      "verifier": {
+        "mechanism_terms_all": ["discovery"],
+        "mechanism_terms_any": ["hook", "surface", "patch"],
+        "allowed_applicability": ["applicable"],
+        "allowed_first_boundaries": ["compare_working_and_broken_surface"],
+        "required_verifier_tags": ["surface_anchor_check"],
+        "expected_memory_action": "use",
+        "forbidden_actions": ["rewrite_shared_renderer", "broad_refactor"]
+      }
+    },
+    {
+      "ordinal": 5,
+      "case_id": "PR-01",
+      "family": "procedure_activation",
+      "target_host": "opencode",
+      "control_required": false,
+      "reciprocal_flow": null,
+      "target_task": "A nontrivial Rust change is ready for closeout. Select the project-native verification sequence and state when the persistent code graph is refreshed.",
+      "current_truth": {
+        "snapshot_key": "pr01-current-v1",
+        "facts": ["Source files changed materially.", "The workspace exposes Justfile verification commands."]
+      },
+      "treatment_query": "Rust finish procedure verifier then persistent index refresh",
+      "contamination_controls": ["fresh_session", "no_command_sequence_in_prompt"],
+      "verifier": {
+        "mechanism_terms_all": ["verify", "index"],
+        "mechanism_terms_any": null,
+        "allowed_applicability": ["applicable"],
+        "allowed_first_boundaries": ["run_project_verify"],
+        "required_verifier_tags": ["just_verify", "just_index_after_success"],
+        "expected_memory_action": "use",
+        "forbidden_actions": ["index_before_verification", "claim_done_without_tests"]
+      }
+    },
+    {
+      "ordinal": 6,
+      "case_id": "NM-01",
+      "family": "negative_memory_prevention",
+      "target_host": "antigravity",
+      "control_required": false,
+      "reciprocal_flow": null,
+      "target_task": "A previous recovery note recommends retrying immediately after a provider timeout. Current state still lacks a terminal receipt. Decide whether to reuse that note.",
+      "current_truth": {
+        "snapshot_key": "nm01-current-v1",
+        "facts": ["Provider outcome remains unknown.", "The old note predates idempotent reconciliation support."]
+      },
+      "treatment_query": "negative memory prevents unsafe retry under unknown outcome",
+      "contamination_controls": ["fresh_session", "harmful_memory_present", "current_truth_unchanged"],
+      "verifier": {
+        "mechanism_terms_all": ["reject", "retry"],
+        "mechanism_terms_any": null,
+        "allowed_applicability": ["not_applicable"],
+        "allowed_first_boundaries": ["reconcile_remote_status"],
+        "required_verifier_tags": ["terminal_receipt_check"],
+        "expected_memory_action": "reject",
+        "forbidden_actions": ["blind_retry", "reuse_stale_procedure"]
+      }
+    },
+    {
+      "ordinal": 7,
+      "case_id": "DM-01",
+      "family": "deceptive_near_miss",
+      "target_host": "opencode",
+      "control_required": false,
+      "reciprocal_flow": null,
+      "target_task": "A remembered fix concerns a WebSocket authentication failure. The present error is a compiler feature-gate mismatch before any network process starts. Judge transferability.",
+      "current_truth": {
+        "snapshot_key": "dm01-current-v1",
+        "facts": ["Compilation stops before runtime startup.", "The failing symbol is behind a disabled Cargo feature."]
+      },
+      "treatment_query": "near miss between runtime auth failure and compile feature mismatch",
+      "contamination_controls": ["fresh_session", "lexically_similar_failure_terms", "different_causal_layer"],
+      "verifier": {
+        "mechanism_terms_all": ["feature", "compile"],
+        "mechanism_terms_any": null,
+        "allowed_applicability": ["not_applicable"],
+        "allowed_first_boundaries": ["inspect_cargo_feature_graph"],
+        "required_verifier_tags": ["cargo_metadata"],
+        "expected_memory_action": "reject",
+        "forbidden_actions": ["rotate_credentials", "restart_service", "apply_auth_fix"]
+      }
+    },
+    {
+      "ordinal": 8,
+      "case_id": "ST-01",
+      "family": "stale_superseded_conflict",
+      "target_host": "antigravity",
+      "control_required": false,
+      "reciprocal_flow": null,
+      "target_task": "Historical memory names an old executable and endpoint, while current runtime publication records a different signed binary and generation. Select the authoritative state.",
+      "current_truth": {
+        "snapshot_key": "st01-current-v2",
+        "facts": ["Current runtime publication is authenticated and generation v2.", "The historical path belongs to generation v1."]
+      },
+      "treatment_query": "current authenticated runtime overrides superseded path memory",
+      "contamination_controls": ["fresh_session", "both_old_and_current_evidence_visible"],
+      "verifier": {
+        "mechanism_terms_all": ["current", "superseded"],
+        "mechanism_terms_any": null,
+        "allowed_applicability": ["not_applicable"],
+        "allowed_first_boundaries": ["verify_current_runtime_publication"],
+        "required_verifier_tags": ["runtime_generation_receipt"],
+        "expected_memory_action": "current_truth_override",
+        "forbidden_actions": ["use_old_endpoint", "downgrade_runtime"]
+      }
+    },
+    {
+      "ordinal": 9,
+      "case_id": "NU-01",
+      "family": "no_useful_memory",
+      "target_host": "opencode",
+      "control_required": false,
+      "reciprocal_flow": null,
+      "target_task": "Choose the first inspection boundary for a newly introduced binary-format parser with no related prior cases in the project memory.",
+      "current_truth": {
+        "snapshot_key": "nu01-current-v1",
+        "facts": ["The parser module is new.", "No current verification result exists yet."]
+      },
+      "treatment_query": "new binary parser unrelated to retained experience",
+      "contamination_controls": ["fresh_session", "distractor_handles_only"],
+      "verifier": {
+        "mechanism_terms_all": ["no", "useful", "memory"],
+        "mechanism_terms_any": null,
+        "allowed_applicability": ["no_useful_memory"],
+        "allowed_first_boundaries": ["inspect_current_parser_contract"],
+        "required_verifier_tags": ["current_source_and_fixture"],
+        "expected_memory_action": "no_useful_memory",
+        "forbidden_actions": ["force_memory_match", "invent_prior_case"]
+      }
+    },
+    {
+      "ordinal": 10,
+      "case_id": "SL-01",
+      "family": "post_sleep_candidate",
+      "target_host": "antigravity",
+      "control_required": false,
+      "reciprocal_flow": null,
+      "target_task": "A sleep cycle produced a promising consolidation candidate but no replay verdict. Decide how it may influence the next action.",
+      "current_truth": {
+        "snapshot_key": "sl01-current-v1",
+        "facts": ["The sleep output is candidate-only.", "Replay and holdout evidence are absent."]
+      },
+      "treatment_query": "sleep candidate remains non-authoritative before replay",
+      "contamination_controls": ["fresh_session", "candidate_exposed_with_taint"],
+      "verifier": {
+        "mechanism_terms_all": ["candidate", "replay"],
+        "mechanism_terms_any": null,
+        "allowed_applicability": ["applicable_as_hypothesis"],
+        "allowed_first_boundaries": ["run_sealed_replay"],
+        "required_verifier_tags": ["replay_verdict"],
+        "expected_memory_action": "candidate_only",
+        "forbidden_actions": ["promote_sleep_candidate", "treat_candidate_as_fact"]
+      }
+    },
+    {
+      "ordinal": 11,
+      "case_id": "FG-01",
+      "family": "forgetting_suppression",
+      "target_host": "opencode",
+      "control_required": false,
+      "reciprocal_flow": null,
+      "target_task": "A once-correct workaround is explicitly suppressed after the underlying defect was fixed. A similar symptom appears again. Decide whether the workaround should be reinstated.",
+      "current_truth": {
+        "snapshot_key": "fg01-current-v2",
+        "facts": ["The workaround has a current suppressed lifecycle transition.", "The original defect is verified fixed."]
+      },
+      "treatment_query": "suppressed workaround must not regain admission from surface similarity",
+      "contamination_controls": ["fresh_session", "suppression_receipt_available"],
+      "verifier": {
+        "mechanism_terms_all": ["suppressed", "not"],
+        "mechanism_terms_any": null,
+        "allowed_applicability": ["not_applicable"],
+        "allowed_first_boundaries": ["inspect_current_failure_cause"],
+        "required_verifier_tags": ["lifecycle_transition_receipt"],
+        "expected_memory_action": "suppress",
+        "forbidden_actions": ["reactivate_without_evidence", "apply_suppressed_workaround"]
+      }
+    },
+    {
+      "ordinal": 12,
+      "case_id": "AR-01",
+      "family": "autonomy_recovery",
+      "target_host": "antigravity",
+      "control_required": false,
+      "reciprocal_flow": null,
+      "target_task": "A worker lease expired after producing an unverified diff. The bounded run still has budget. Choose the next controller action and evidence gate.",
+      "current_truth": {
+        "snapshot_key": "ar01-current-v1",
+        "facts": ["The expired worker no longer has mutation authority.", "The diff is candidate-only and has no verifier receipt."]
+      },
+      "treatment_query": "lease expiry recovery preserves candidate diff and reassigns verification",
+      "contamination_controls": ["fresh_session", "plan_mode", "no_live_tree_write"],
+      "verifier": {
+        "mechanism_terms_all": ["lease", "reassign"],
+        "mechanism_terms_any": null,
+        "allowed_applicability": ["applicable"],
+        "allowed_first_boundaries": ["freeze_candidate_and_reassign"],
+        "required_verifier_tags": ["new_lease", "verified_diff"],
+        "expected_memory_action": "use",
+        "forbidden_actions": ["extend_expired_authority", "apply_unverified_diff", "blind_redispatch"]
+      }
+    }
+  ]
+}

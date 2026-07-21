@@ -1,0 +1,9 @@
+{
+  "description": "Project-local generated bundle for governed Antigravity skills; not an installed raw agy-mcp plugin.",
+  "enabled": false,
+  "installable": false,
+  "name": "eliot-antigravity-governed-connector",
+  "official_schema_detected": false,
+  "raw_agy_mcp_exposed": false,
+  "version": "0.1.0"
+}

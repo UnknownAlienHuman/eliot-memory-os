@@ -1,0 +1,22 @@
+[runtime]
+mode = "dev-single-process"
+data_root = ".eliot-governor"
+log_root = ".eliot-governor/logs"
+report_root = ".eliot-governor/reports"
+spool_root = ".eliot-governor/spool"
+worktree_root = ".eliot-governor/worktrees"
+
+[logging]
+format = "jsonl"
+level = "info"
+max_file_bytes = 10485760
+max_files = 10
+
+[ipc]
+enabled = false
+bind = "127.0.0.1"
+port = 0
+
+[modules]
+enabled = true
+manifest_dir = "config/modules"

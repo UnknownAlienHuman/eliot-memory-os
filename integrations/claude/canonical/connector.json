@@ -1,0 +1,16 @@
+{
+  "schema_version": "eliot-claude-connector-canonical-v1",
+  "purpose": "Use the local Eliot Governor for current task state, compact evidence, governed memory, bounded delegation, and receipted verification.",
+  "role_rule": "Claude vendor identity grants no task role or completion authority.",
+  "progressive_disclosure": {
+    "startup": "purpose plus live tool and prompt descriptions",
+    "material_task": "current state and one compact packet",
+    "expansion": "exact evidence or memory handles only on demand"
+  },
+  "prompts": [
+    "eliot-start",
+    "eliot-understand",
+    "eliot-delegate",
+    "eliot-verify-finish"
+  ]
+}

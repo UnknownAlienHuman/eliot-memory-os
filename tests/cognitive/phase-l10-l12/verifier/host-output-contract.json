@@ -1,0 +1,62 @@
+{
+  "schema_version": "eliot-cognitive-host-output-contract-v1",
+  "required_fields": [
+    "schema_version",
+    "case_id",
+    "variant",
+    "host",
+    "host_session_id",
+    "model",
+    "current_truth_revision",
+    "memory_exposure_handles",
+    "memory_used_handles",
+    "memory_rejected_handles",
+    "mechanism_claim",
+    "applicability_verdict",
+    "first_boundary_tag",
+    "selected_module_or_boundary",
+    "write_set",
+    "verifier_tags",
+    "wrong_path_attempts",
+    "tool_calls",
+    "tool_calls_before_useful_action",
+    "current_truth_overrides",
+    "negative_memory_actions",
+    "memory_action",
+    "final_outcome",
+    "negative_transfer",
+    "operator_intervention",
+    "recovery_behavior",
+    "artifacts",
+    "candidate_write_receipt",
+    "tokens"
+  ],
+  "forbidden_recursive_fields": [
+    "chain_of_thought",
+    "chainOfThought",
+    "reasoning",
+    "hidden_reasoning",
+    "thoughts",
+    "scratchpad"
+  ],
+  "allowed_applicability": [
+    "applicable",
+    "applicable_as_hypothesis",
+    "not_applicable",
+    "no_useful_memory"
+  ],
+  "allowed_memory_actions": [
+    "use",
+    "reject",
+    "suppress",
+    "candidate_only",
+    "current_truth_override",
+    "no_useful_memory"
+  ],
+  "local_classifications": [
+    "AuditFindingCandidate",
+    "DiffArtifactCandidate",
+    "ProcedureCandidate",
+    "RejectedExternalOpinion"
+  ]
+}

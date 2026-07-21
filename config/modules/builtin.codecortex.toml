@@ -1,0 +1,33 @@
+module_id = "00000000-0000-4000-8000-000000000003"
+name = "builtin.codecortex"
+version = "0.1.0"
+description = "G0 builtin CodeCortex grounding contract."
+module_kind = "internal_rust"
+transport = "in_process"
+capabilities = ["read_memory", "submit_finding_candidate", "health_check"]
+input_schemas = [{ schema_id = "builtin.codecortex.scan", version = "1" }]
+output_schemas = [{ schema_id = "builtin.codecortex.report", version = "1" }]
+enabled_by_default = true
+
+[[endpoints]]
+endpoint_id = "health"
+name = "health"
+direction = "bidirectional"
+schema = { schema_id = "builtin.codecortex.health", version = "1" }
+max_payload_bytes = 4096
+requires_ack = true
+
+[authority_profile]
+allowed_projects = []
+allowed_roles = []
+allowed_capabilities = ["read_memory", "submit_finding_candidate", "health_check"]
+can_write_truth = false
+can_request_patch = false
+can_finish_task = false
+
+[resource_limits]
+max_runtime_seconds = 30
+max_payload_bytes = 65536
+max_concurrent_requests = 1
+idle_ttl_seconds = 300
+restart_budget = 0

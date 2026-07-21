@@ -1,0 +1,10 @@
+{
+  "schema_version": "eliot-antigravity-integration-v1",
+  "host": "antigravity",
+  "launch_mode": "governor_managed_readonly_plan",
+  "candidate_output": "unified_git_diff",
+  "provider_configuration_owned_by_eliot": false,
+  "provider_credentials_read_or_modified": false,
+  "auto_update_disabled_during_managed_launch": true,
+  "account_info_hidden_during_managed_launch": true
+}
