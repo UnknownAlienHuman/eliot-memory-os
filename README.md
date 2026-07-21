@@ -22,3 +22,6 @@ cargo test --workspace
 `just quick` provides the bounded metadata, formatting, and check loop. Runtime
 state belongs under `.eliot-governor` or the configured per-user data root and is
 never source-controlled.
+
+The installed Windows credential boundary and its verification procedure are
+documented in [`docs/operations/SURREALDB_CREDENTIAL_AUTHORITY.md`](docs/operations/SURREALDB_CREDENTIAL_AUTHORITY.md).

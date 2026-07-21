@@ -17,6 +17,7 @@ db = "system"
 user = "root"
 credential_provider = "windows_credential_manager"
 credential_id = "surreal-runtime/local-dev"
+# Migration-only locator. It is not an authority while the Windows provider is selected.
 password_file = "%LOCALAPPDATA%/Eliot/secrets/surreal_root_password.txt"
 log_level = "warn"
 query_timeout_ms = 15000
