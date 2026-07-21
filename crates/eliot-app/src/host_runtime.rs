@@ -460,6 +460,21 @@ pub(crate) async fn dispatch(config_path: &Path, command: HostCommand) -> Result
                 write_json(&inspect(parse_host(&host)?)?)
             }
         }
+        HostCommand::Activate {
+            host,
+            surface,
+            dry_run,
+        } => {
+            let family = parse_host(&host)?;
+            anyhow::ensure!(
+                family == AgentHostId::Claude,
+                "only the Claude host family has selectable surfaces"
+            );
+            let surface = ClaudeSurface::parse(&surface).with_context(|| {
+                format!("unknown Claude surface {surface}; expected `code` or `desktop`")
+            })?;
+            write_json(&activate_claude_surface(config_path, surface, dry_run)?)
+        }
         HostCommand::Doctor { host } => {
             // A surface selector reports that surface; the bare family selector
             // reports both, because whether two are active at once is a fact
@@ -4633,6 +4648,109 @@ fn claude_code_plugin_roots() -> Result<Vec<PathBuf>> {
     Ok(roots)
 }
 
+/// Where the selected Claude surface is recorded.
+///
+/// Runtime state, not source: it describes this machine, so it lives with the
+/// other host-integration receipts outside the repository and never in Git.
+fn claude_surface_selection_path(config_path: &Path) -> PathBuf {
+    runtime_root(config_path)
+        .join("reports")
+        .join("host-integrations")
+        .join("claude-surface-selection.json")
+}
+
+fn selected_claude_surface(config_path: &Path) -> Option<ClaudeSurface> {
+    let raw = std::fs::read(claude_surface_selection_path(config_path)).ok()?;
+    let value: Value = serde_json::from_slice(&raw).ok()?;
+    value
+        .get("selected_surface")
+        .and_then(Value::as_str)
+        .and_then(ClaudeSurface::parse)
+}
+
+/// Selects the one Claude surface this machine should expose.
+///
+/// Idempotent by construction: the plan is derived from observed state, so
+/// re-running once the machine already matches asks for no actions at all.
+/// Only ELIOT-owned integration state is ever named -- unrelated Claude
+/// configuration and other vendors' extensions are not this command's business.
+fn activate_claude_surface(
+    config_path: &Path,
+    surface: ClaudeSurface,
+    dry_run: bool,
+) -> Result<Value> {
+    let before = claude_family_doctor(config_path)?;
+    let code_active = before
+        .pointer("/surfaces/claude_code_plugin/active")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let desktop_active = before
+        .pointer("/surfaces/claude_desktop_mcpb/active")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+
+    let (keep_active, stand_down_active) = match surface {
+        ClaudeSurface::ClaudeCodePlugin => (code_active, desktop_active),
+        ClaudeSurface::ClaudeDesktopMcpb => (desktop_active, code_active),
+    };
+    let stand_down = match surface {
+        ClaudeSurface::ClaudeCodePlugin => ClaudeSurface::ClaudeDesktopMcpb,
+        ClaudeSurface::ClaudeDesktopMcpb => ClaudeSurface::ClaudeCodePlugin,
+    };
+
+    let mut actions = Vec::new();
+    if !keep_active {
+        actions.push(json!({
+            "action": "install_surface",
+            "surface": surface.as_str(),
+            "command": format!("host install --host {}", match surface {
+                ClaudeSurface::ClaudeCodePlugin => "claude",
+                ClaudeSurface::ClaudeDesktopMcpb => "claude-desktop",
+            })
+        }));
+    }
+    if stand_down_active {
+        actions.push(json!({
+            "action": "stand_down_surface",
+            "surface": stand_down.as_str(),
+            "command": format!("host uninstall --host {}", match stand_down {
+                ClaudeSurface::ClaudeCodePlugin => "claude",
+                ClaudeSurface::ClaudeDesktopMcpb => "claude-desktop",
+            })
+        }));
+    }
+
+    let selection_path = claude_surface_selection_path(config_path);
+    if !dry_run {
+        if let Some(parent) = selection_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        atomic_write_json(
+            &selection_path,
+            &json!({
+                "schema_version": "eliot-claude-surface-selection-v1",
+                "host": AgentHostId::Claude.as_str(),
+                "selected_surface": surface.as_str(),
+                "selected_at": OffsetDateTime::now_utc(),
+            }),
+        )?;
+    }
+
+    Ok(json!({
+        "schema_version": "eliot-claude-surface-activation-v1",
+        "host": AgentHostId::Claude.as_str(),
+        "selected_surface": surface.as_str(),
+        "stood_down_surface": stand_down.as_str(),
+        "dry_run": dry_run,
+        "already_satisfied": actions.is_empty(),
+        "pending_actions": actions,
+        "selection_receipt": selection_path,
+        // A live Claude process keeps the surfaces it started with.
+        "claude_restart_required": !actions.is_empty(),
+        "supports_lifecycle_hooks": surface.supports_lifecycle_hooks()
+    }))
+}
+
 /// One doctor for the whole Claude host family.
 ///
 /// `claude` is a single vendor with a single Governor authority behind two
@@ -4656,12 +4774,35 @@ fn claude_family_doctor(config_path: &Path) -> Result<Value> {
             "remediation": "keep exactly one ELIOT plugin root and remove the others"
         }));
     }
+    let selected = selected_claude_surface(config_path);
     if code_active && desktop_active {
         conflicts.push(json!({
             "kind": "dual_active_surface",
             "detail": "the Claude Code plugin and the Claude Desktop MCPB are both active; a Claude Code session hosted in Desktop binds ELIOT twice",
-            "remediation": "activate exactly one surface for this machine"
+            "remediation": match selected {
+                Some(surface) => format!("host activate --host claude --surface {}", match surface {
+                    ClaudeSurface::ClaudeCodePlugin => "code",
+                    ClaudeSurface::ClaudeDesktopMcpb => "desktop",
+                }),
+                None => "host activate --host claude --surface code|desktop".to_owned(),
+            }
         }));
+    }
+    // A selection that the machine does not match is drift, not health: the
+    // intended surface is recorded but something else is answering.
+    if let Some(surface) = selected {
+        let selected_is_active = match surface {
+            ClaudeSurface::ClaudeCodePlugin => code_active,
+            ClaudeSurface::ClaudeDesktopMcpb => desktop_active,
+        };
+        if !selected_is_active {
+            conflicts.push(json!({
+                "kind": "selected_surface_inactive",
+                "detail": "the selected Claude surface is not active on this machine",
+                "selected_surface": surface.as_str(),
+                "remediation": "install the selected surface or select the one that is active"
+            }));
+        }
     }
 
     Ok(json!({
@@ -4681,6 +4822,8 @@ fn claude_family_doctor(config_path: &Path) -> Result<Value> {
             }
         },
         "active_surface_count": usize::from(code_active) + usize::from(desktop_active),
+        "selected_surface": selected.map(ClaudeSurface::as_str),
+        "selection_receipt": claude_surface_selection_path(config_path),
         "conflicts": conflicts,
         "status": if conflicts.is_empty() {
             if code_active || desktop_active { "ready" } else { "not_installed" }

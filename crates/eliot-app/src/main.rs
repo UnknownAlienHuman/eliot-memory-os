@@ -1723,6 +1723,20 @@ enum HostCommand {
         #[arg(long, default_value_t = 180)]
         wait_seconds: u64,
     },
+    /// Select which packaged surface of a host family is the active one.
+    ///
+    /// Claude ships as a Code plugin and a Desktop MCPB. Both active at once
+    /// exposes the tool set twice to a Claude Code session hosted in Desktop,
+    /// so exactly one is selected and the other is stood down.
+    Activate {
+        #[arg(long)]
+        host: String,
+        /// `code` or `desktop` for the Claude host family.
+        #[arg(long)]
+        surface: String,
+        #[arg(long)]
+        dry_run: bool,
+    },
     Uninstall {
         #[arg(long)]
         host: String,
