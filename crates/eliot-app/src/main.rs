@@ -251,137 +251,13 @@ enum Command {
         #[command(subcommand)]
         command: HostCommand,
     },
-    PhaseB {
+    CalibrationCampaign {
         #[command(subcommand)]
-        command: PhaseBCommand,
+        command: CalibrationCampaignCommand,
     },
-    PhaseC {
+    CalibrationReconcile {
         #[command(subcommand)]
-        command: PhaseCCommand,
-    },
-    PhaseD1 {
-        #[command(subcommand)]
-        command: PhaseD1Command,
-    },
-    PhaseD2 {
-        #[command(subcommand)]
-        command: PhaseD2Command,
-    },
-    PhaseD {
-        #[command(subcommand)]
-        command: PhaseDCommand,
-    },
-    PhaseE1 {
-        #[command(subcommand)]
-        command: PhaseE1Command,
-    },
-    PhaseE2 {
-        #[command(subcommand)]
-        command: PhaseE2Command,
-    },
-    PhaseE {
-        #[command(subcommand)]
-        command: PhaseECommand,
-    },
-    PhaseF0 {
-        #[command(subcommand)]
-        command: PhaseF0Command,
-    },
-    PhaseF1 {
-        #[command(subcommand)]
-        command: PhaseF1Command,
-    },
-    PhaseF2 {
-        #[command(subcommand)]
-        command: PhaseF2Command,
-    },
-    PhaseF3 {
-        #[command(subcommand)]
-        command: PhaseF3Command,
-    },
-    PhaseG0 {
-        #[command(subcommand)]
-        command: PhaseG0Command,
-    },
-    PhaseG1 {
-        #[command(subcommand)]
-        command: PhaseG1Command,
-    },
-    PhaseG2 {
-        #[command(subcommand)]
-        command: PhaseG2Command,
-    },
-    PhaseG3a {
-        #[command(subcommand)]
-        command: PhaseG3aCommand,
-    },
-    PhaseG3b {
-        #[command(subcommand)]
-        command: PhaseG3bCommand,
-    },
-    PhaseL0 {
-        #[command(subcommand)]
-        command: PhaseL0Command,
-    },
-    PhaseL1a {
-        #[command(subcommand)]
-        command: PhaseL1aCommand,
-    },
-    PhaseL1b {
-        #[command(subcommand)]
-        command: PhaseL1bCommand,
-    },
-    PhaseL1bR {
-        #[command(subcommand)]
-        command: PhaseL1bRCommand,
-    },
-    PhaseL1c {
-        #[command(subcommand)]
-        command: PhaseL1cCommand,
-    },
-    PhaseL1cR {
-        #[command(subcommand)]
-        command: PhaseL1cRCommand,
-    },
-    PhaseH0 {
-        #[command(subcommand)]
-        command: PhaseH0Command,
-    },
-    PhaseH1 {
-        #[command(subcommand)]
-        command: PhaseH1Command,
-    },
-    PhaseI0 {
-        #[command(subcommand)]
-        command: PhaseI0Command,
-    },
-    PhaseI1 {
-        #[command(subcommand)]
-        command: PhaseI1Command,
-    },
-    PhaseI2 {
-        #[command(subcommand)]
-        command: PhaseI2Command,
-    },
-    PhaseJ0 {
-        #[command(subcommand)]
-        command: PhaseJ0Command,
-    },
-    PhaseK0 {
-        #[command(subcommand)]
-        command: PhaseK0Command,
-    },
-    PhaseK1 {
-        #[command(subcommand)]
-        command: PhaseK1Command,
-    },
-    PhaseK2 {
-        #[command(subcommand)]
-        command: PhaseK2Command,
-    },
-    PhaseM0 {
-        #[command(subcommand)]
-        command: PhaseM0Command,
+        command: CalibrationReconcileCommand,
     },
 }
 
@@ -1786,112 +1662,7 @@ enum HostCommand {
 }
 
 #[derive(Debug, Subcommand)]
-enum PhaseBCommand {
-    Closeout,
-}
-
-#[derive(Debug, Subcommand)]
-enum PhaseCCommand {
-    Closeout,
-}
-
-#[derive(Debug, Subcommand)]
-enum PhaseD1Command {
-    Closeout,
-}
-
-#[derive(Debug, Subcommand)]
-enum PhaseD2Command {
-    Closeout,
-}
-
-#[derive(Debug, Subcommand)]
-enum PhaseDCommand {
-    Closeout,
-}
-
-#[derive(Debug, Subcommand)]
-enum PhaseE1Command {
-    Closeout,
-}
-
-#[derive(Debug, Subcommand)]
-enum PhaseE2Command {
-    Closeout,
-}
-
-#[derive(Debug, Subcommand)]
-enum PhaseECommand {
-    Closeout,
-}
-
-#[derive(Debug, Subcommand)]
-enum PhaseF0Command {
-    Closeout,
-}
-
-#[derive(Debug, Subcommand)]
-enum PhaseF1Command {
-    Closeout,
-}
-
-#[derive(Debug, Subcommand)]
-enum PhaseF2Command {
-    Closeout,
-}
-
-#[derive(Debug, Subcommand)]
-enum PhaseF3Command {
-    Closeout,
-}
-
-#[derive(Debug, Subcommand)]
-enum PhaseG0Command {
-    Closeout,
-}
-
-#[derive(Debug, Subcommand)]
-enum PhaseG1Command {
-    Closeout,
-}
-
-#[derive(Debug, Subcommand)]
-enum PhaseG2Command {
-    Closeout,
-}
-
-#[derive(Debug, Subcommand)]
-enum PhaseG3aCommand {
-    Closeout,
-}
-
-#[derive(Debug, Subcommand)]
-enum PhaseG3bCommand {
-    Closeout,
-}
-
-#[derive(Debug, Subcommand)]
-enum PhaseL0Command {
-    Closeout,
-}
-
-#[derive(Debug, Subcommand)]
-enum PhaseL1aCommand {
-    Closeout,
-}
-
-#[derive(Debug, Subcommand)]
-enum PhaseL1bCommand {
-    Closeout,
-}
-
-#[derive(Debug, Subcommand)]
-enum PhaseL1bRCommand {
-    Closeout,
-}
-
-#[derive(Debug, Subcommand)]
-enum PhaseL1cCommand {
+enum CalibrationCampaignCommand {
     Prepare,
     ProviderOnce {
         #[arg(long)]
@@ -1911,58 +1682,8 @@ enum PhaseL1cCommand {
 }
 
 #[derive(Debug, Subcommand)]
-enum PhaseL1cRCommand {
+enum CalibrationReconcileCommand {
     Reconcile,
-    Closeout,
-}
-
-#[derive(Debug, Subcommand)]
-enum PhaseH0Command {
-    Closeout,
-}
-
-#[derive(Debug, Subcommand)]
-enum PhaseH1Command {
-    Closeout,
-}
-
-#[derive(Debug, Subcommand)]
-enum PhaseI0Command {
-    Closeout,
-}
-
-#[derive(Debug, Subcommand)]
-enum PhaseI1Command {
-    Closeout,
-}
-
-#[derive(Debug, Subcommand)]
-enum PhaseI2Command {
-    Closeout,
-}
-
-#[derive(Debug, Subcommand)]
-enum PhaseJ0Command {
-    Closeout,
-}
-
-#[derive(Debug, Subcommand)]
-enum PhaseK0Command {
-    Closeout,
-}
-
-#[derive(Debug, Subcommand)]
-enum PhaseK1Command {
-    Closeout,
-}
-
-#[derive(Debug, Subcommand)]
-enum PhaseK2Command {
-    Closeout,
-}
-
-#[derive(Debug, Subcommand)]
-enum PhaseM0Command {
     Closeout,
 }
 
@@ -2416,119 +2137,17 @@ async fn dispatch_command(
             Ok(())
         }
         Command::Host { command } => Box::pin(host_runtime::dispatch(config, command)).await,
-        Command::PhaseB {
-            command: PhaseBCommand::Closeout,
-        } => commands::run_phase_b_closeout(config).await,
-        Command::PhaseC {
-            command: PhaseCCommand::Closeout,
-        } => commands::run_phase_c_closeout(config).await,
-        Command::PhaseD1 {
-            command: PhaseD1Command::Closeout,
-        } => commands::run_phase_d1_closeout(config),
-        Command::PhaseD2 {
-            command: PhaseD2Command::Closeout,
-        } => commands::run_phase_d2_closeout(config).await,
-        Command::PhaseD {
-            command: PhaseDCommand::Closeout,
-        } => commands::run_phase_d_closeout(config),
-        Command::PhaseE1 {
-            command: PhaseE1Command::Closeout,
-        } => commands::run_phase_e1_closeout(config).await,
-        Command::PhaseE2 {
-            command: PhaseE2Command::Closeout,
-        } => Box::pin(commands::run_phase_e2_closeout(config)).await,
-        Command::PhaseE {
-            command: PhaseECommand::Closeout,
-        } => commands::run_phase_e_closeout(config),
-        Command::PhaseF0 {
-            command: PhaseF0Command::Closeout,
-        } => commands::run_phase_f0_closeout(config),
-        Command::PhaseF1 {
-            command: PhaseF1Command::Closeout,
-        } => commands::run_phase_f1_closeout(config).await,
-        Command::PhaseF2 {
-            command: PhaseF2Command::Closeout,
-        } => commands::run_phase_f2_closeout(config).await,
-        Command::PhaseF3 {
-            command: PhaseF3Command::Closeout,
-        } => commands::run_phase_f3_closeout(config).await,
-        Command::PhaseG0 {
-            command: PhaseG0Command::Closeout,
-        } => commands::run_phase_g0_closeout(config).await,
-        Command::PhaseG1 {
-            command: PhaseG1Command::Closeout,
-        } => commands::run_phase_g1_closeout(config).await,
-        Command::PhaseG2 {
-            command: PhaseG2Command::Closeout,
-        } => commands::run_phase_g2_closeout(config).await,
-        Command::PhaseG3a {
-            command: PhaseG3aCommand::Closeout,
-        } => commands::run_phase_g3a_closeout(config),
-        Command::PhaseG3b {
-            command: PhaseG3bCommand::Closeout,
-        } => commands::run_phase_g3b_closeout(config),
-        Command::PhaseL0 {
-            command: PhaseL0Command::Closeout,
-        } => commands::run_phase_l0_closeout(config),
-        Command::PhaseL1a {
-            command: PhaseL1aCommand::Closeout,
-        } => {
-            let root = delegation_runtime::root_from_config(config);
-            let loaded = config::load_config(config)?;
-            let value = calibration_runtime::closeout(
-                &root,
-                &loaded.delegation_calibration,
-                Path::new("."),
-            )?;
-            #[allow(clippy::print_stdout)]
-            {
-                println!("{}", serde_json::to_string_pretty(&value)?);
-            }
-            Ok(())
-        }
-        Command::PhaseL1b {
-            command: PhaseL1bCommand::Closeout,
-        } => {
-            let root = delegation_runtime::root_from_config(config);
-            let loaded = config::load_config(config)?;
-            let value = calibration_runtime::closeout_l1b(
-                &root,
-                &loaded.delegation_calibration,
-                Path::new("."),
-            )?;
-            #[allow(clippy::print_stdout)]
-            {
-                println!("{}", serde_json::to_string_pretty(&value)?);
-            }
-            Ok(())
-        }
-        Command::PhaseL1bR {
-            command: PhaseL1bRCommand::Closeout,
-        } => {
-            let root = delegation_runtime::root_from_config(config);
-            let loaded = config::load_config(config)?;
-            let value = calibration_runtime::closeout_l1b_r(
-                &root,
-                &loaded.delegation_calibration,
-                Path::new("."),
-            )?;
-            #[allow(clippy::print_stdout)]
-            {
-                println!("{}", serde_json::to_string_pretty(&value)?);
-            }
-            Ok(())
-        }
-        Command::PhaseL1c { command } => {
+        Command::CalibrationCampaign { command } => {
             let root = delegation_runtime::root_from_config(config);
             let loaded = config::load_config(config)?;
             let value = match command {
-                PhaseL1cCommand::Prepare => {
+                CalibrationCampaignCommand::Prepare => {
                     l1c_runtime::prepare(&root, &loaded.delegation_calibration, Path::new("."))?
                 }
-                PhaseL1cCommand::ProviderOnce { campaign, confirm } => {
+                CalibrationCampaignCommand::ProviderOnce { campaign, confirm } => {
                     Box::pin(l1c_runtime::provider_once(&root, &campaign, &confirm)).await?
                 }
-                PhaseL1cCommand::Evaluate {
+                CalibrationCampaignCommand::Evaluate {
                     campaign,
                     dispositions,
                     evidence,
@@ -2539,7 +2158,7 @@ async fn dispatch_command(
                     &dispositions,
                     &evidence,
                 )?,
-                PhaseL1cCommand::Closeout => {
+                CalibrationCampaignCommand::Closeout => {
                     l1c_runtime::closeout(&root, &loaded.delegation_calibration)?
                 }
             };
@@ -2549,11 +2168,11 @@ async fn dispatch_command(
             }
             Ok(())
         }
-        Command::PhaseL1cR { command } => {
+        Command::CalibrationReconcile { command } => {
             let root = delegation_runtime::root_from_config(config);
             let value = match command {
-                PhaseL1cRCommand::Reconcile => l1c_r_runtime::reconcile(&root)?,
-                PhaseL1cRCommand::Closeout => l1c_r_runtime::closeout(&root)?,
+                CalibrationReconcileCommand::Reconcile => l1c_r_runtime::reconcile(&root)?,
+                CalibrationReconcileCommand::Closeout => l1c_r_runtime::closeout(&root)?,
             };
             #[allow(clippy::print_stdout)]
             {
@@ -2561,36 +2180,6 @@ async fn dispatch_command(
             }
             Ok(())
         }
-        Command::PhaseH0 {
-            command: PhaseH0Command::Closeout,
-        } => commands::run_phase_h0_closeout(config).await,
-        Command::PhaseH1 {
-            command: PhaseH1Command::Closeout,
-        } => commands::run_phase_h1_closeout(config),
-        Command::PhaseI0 {
-            command: PhaseI0Command::Closeout,
-        } => commands::run_phase_i0_closeout(config).await,
-        Command::PhaseI1 {
-            command: PhaseI1Command::Closeout,
-        } => Box::pin(commands::run_phase_i1_closeout(config)).await,
-        Command::PhaseI2 {
-            command: PhaseI2Command::Closeout,
-        } => Box::pin(commands::run_phase_i2_closeout(config)).await,
-        Command::PhaseJ0 {
-            command: PhaseJ0Command::Closeout,
-        } => commands::run_phase_j0_closeout(config),
-        Command::PhaseK0 {
-            command: PhaseK0Command::Closeout,
-        } => commands::run_phase_k0_closeout(config),
-        Command::PhaseK1 {
-            command: PhaseK1Command::Closeout,
-        } => commands::run_phase_k1_closeout(config),
-        Command::PhaseK2 {
-            command: PhaseK2Command::Closeout,
-        } => commands::run_phase_k2_closeout(config),
-        Command::PhaseM0 {
-            command: PhaseM0Command::Closeout,
-        } => commands::run_phase_m0_closeout(config),
     }
 }
 

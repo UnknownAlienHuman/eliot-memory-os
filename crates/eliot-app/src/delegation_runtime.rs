@@ -285,55 +285,6 @@ pub fn explain(origin: DelegationOrigin, kind: DelegationReviewKind, question: &
     json!({ "request": request, "decision": decision, "provider_process_started": false })
 }
 
-pub fn fixture_report() -> Value {
-    let codex = fixture_request(
-        DelegationOrigin::CodexRequested,
-        "Review the security authority boundary.",
-    );
-    let trivial = fixture_request(DelegationOrigin::CodexRequested, "format this file");
-    let shadow = fixture_request(
-        DelegationOrigin::PolicyShadow,
-        "Review this high-risk security integration.",
-    );
-    let mut recursive = fixture_request(DelegationOrigin::UserDirected, "Review this boundary.");
-    recursive
-        .origin_chain
-        .provider_chain
-        .push("antigravity".to_owned());
-    let context = DelegationPolicyContext::default();
-    let codex_decision = DelegationPolicyService.decide(&codex, &context);
-    let trivial_decision = DelegationPolicyService.decide(&trivial, &context);
-    let shadow_decision = DelegationPolicyService.decide(&shadow, &context);
-    let recursive_decision = DelegationPolicyService.decide(&recursive, &context);
-    let mut budget = DelegationBudgetService.for_task(eliot_types::TaskId::new_v7());
-    budget.cooldown_seconds = 0;
-    let now = OffsetDateTime::now_utc();
-    let _ = DelegationBudgetService.reserve(&mut budget, DelegationOrigin::UserDirected, now);
-    let _ = DelegationBudgetService.reserve(&mut budget, DelegationOrigin::UserDirected, now);
-    let budget_enforced =
-        DelegationBudgetService.reserve(&mut budget, DelegationOrigin::UserDirected, now)
-            == DelegationBudgetReservation::BudgetExceeded;
-    let mut cooldown = DelegationBudgetService.for_task(eliot_types::TaskId::new_v7());
-    let _ = DelegationBudgetService.reserve(&mut cooldown, DelegationOrigin::UserDirected, now);
-    let cooldown_enforced = DelegationBudgetService.reserve(
-        &mut cooldown,
-        DelegationOrigin::UserDirected,
-        now + time::Duration::seconds(1),
-    ) == DelegationBudgetReservation::CooldownActive;
-    json!({
-        "component": "delegation_fixture_proofs",
-        "codex_requested_positive": codex_decision.kind == DelegationDecisionKind::Execute
-            && codex_decision.reasons.contains(&DelegationReason::SecurityBoundary),
-        "trivial_task_no_call": trivial_decision.kind == DelegationDecisionKind::NoExternalReview,
-        "policy_shadow_no_execution": shadow_decision.kind == DelegationDecisionKind::ShadowRecommend,
-        "recursive_call_denied": recursive_decision.kind == DelegationDecisionKind::Deny
-            && recursive_decision.reasons.contains(&DelegationReason::RecursiveProviderCall),
-        "budget_enforced": budget_enforced,
-        "cooldown_enforced": cooldown_enforced,
-        "provider_process_count": 0,
-    })
-}
-
 #[allow(clippy::if_not_else, clippy::too_many_lines)]
 pub async fn review(root: &Path, input: DelegationReviewInput) -> Result<Value> {
     let mut delegation_state = load_state(root)?;
@@ -1456,22 +1407,6 @@ fn default_origin_chain(origin: DelegationOrigin) -> DelegationOriginChain {
         provider_chain: Vec::new(),
         delegation_depth: 0,
         parent_delegation_id: None,
-    }
-}
-
-fn fixture_request(origin: DelegationOrigin, question: &str) -> DelegationRequest {
-    DelegationRequest {
-        delegation_id: new_id("delegation-fixture"),
-        project_id: eliot_types::ProjectId::new_v7(),
-        task_id: eliot_types::TaskId::new_v7(),
-        origin,
-        origin_chain: default_origin_chain(origin),
-        review_kind: DelegationReviewKind::RiskReview,
-        question: question.to_owned(),
-        work_lease_id: WorkLeaseId::new_v7(),
-        evidence_refs: Vec::new(),
-        preferred_provider: DelegationProviderPreference::Auto,
-        created_at: OffsetDateTime::now_utc(),
     }
 }
 
