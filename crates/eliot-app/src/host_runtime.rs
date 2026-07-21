@@ -5226,6 +5226,40 @@ fn uninstall(config_path: &Path, host: AgentHostId, dry_run: bool) -> Result<Val
     }))
 }
 
+/// Decides what a Claude hook event is allowed to do.
+///
+/// Three outcomes, and the distinction between the last two matters:
+///
+/// - `deny` blocks the call. A task is attached and the session is about to
+///   mutate without holding a work lease, which is the one thing this gate
+///   exists to stop.
+/// - `recorded` allows the call and is worth persisting: a task is attached, so
+///   the event is evidence about that task.
+/// - `passive` allows the call and is worth nothing. No task is attached, so
+///   the session is not ELIOT's business. The plugin is installed at user
+///   scope and sees every project on the machine, so this is the common case.
+///
+/// Pulled out of the event handler so the blocking rule can be exercised
+/// directly: a gate that is never tested is indistinguishable from one that
+/// only records.
+const fn claude_hook_decision(
+    declared_event: &str,
+    task_attached: bool,
+    holds_work_lease: bool,
+) -> &'static str {
+    let mutation_gate_point = matches!(
+        declared_event.as_bytes(),
+        b"PreToolUse" | b"tool.execute.before"
+    );
+    if !task_attached {
+        return "passive";
+    }
+    if mutation_gate_point && !holds_work_lease {
+        return "deny";
+    }
+    "recorded"
+}
+
 fn record_event(config_path: &Path, host: AgentHostId, declared_event: &str) -> Result<Value> {
     ensure_l7_host(host)?;
     let mut raw = Vec::new();
@@ -5234,22 +5268,25 @@ fn record_event(config_path: &Path, host: AgentHostId, declared_event: &str) -> 
     envelope.task_id = env_parse("ELIOT_TASK_ID")?;
     envelope.work_item_id = env_parse("ELIOT_WORK_ITEM_ID")?;
     let lease: Option<WorkLeaseId> = env_parse("ELIOT_WORK_LEASE_ID")?;
-    let attached_mutation = envelope.task_id.is_some()
-        && matches!(declared_event, "PreToolUse" | "tool.execute.before");
-    let decision = if attached_mutation && lease.is_none() {
-        "deny"
-    } else if envelope.task_id.is_some() {
-        "recorded"
+    let decision =
+        claude_hook_decision(declared_event, envelope.task_id.is_some(), lease.is_some());
+    // The plugin is installed at user scope, so these hooks fire in every
+    // Claude session on this machine, including projects that have nothing to
+    // do with ELIOT. An unbound event describes no task and changes no ELIOT
+    // state, so persisting it writes two files per tool call to record that
+    // something unrelated happened. Answer and get out of the way.
+    let path = if decision == "passive" {
+        None
     } else {
-        "passive"
+        let event_root = runtime_root(config_path)
+            .join("reports")
+            .join("host-events")
+            .join(host.as_str());
+        let path = event_root.join(format!("{}.json", Uuid::new_v4()));
+        atomic_write_json(&path, &envelope)?;
+        atomic_write_json(&event_root.join("latest.json"), &envelope)?;
+        Some(path)
     };
-    let event_root = runtime_root(config_path)
-        .join("reports")
-        .join("host-events")
-        .join(host.as_str());
-    let path = event_root.join(format!("{}.json", Uuid::new_v4()));
-    atomic_write_json(&path, &envelope)?;
-    atomic_write_json(&event_root.join("latest.json"), &envelope)?;
     if host == AgentHostId::Claude {
         if decision == "deny" {
             return Ok(json!({
@@ -7457,6 +7494,101 @@ mod tests {
             !fallback.iter().any(|argument| argument == "--mcp-config"),
             "--plugin-dir already carries .mcp.json: {fallback:?}"
         );
+        Ok(())
+    }
+
+    /// The one blocking rule this gate exists for: a session carrying a task
+    /// must not mutate without a work lease. Deleting the deny branch makes
+    /// this test fail rather than quietly turning the gate into a recorder.
+    #[test]
+    fn a_bound_session_without_a_work_lease_is_denied_before_it_mutates() {
+        for event in ["PreToolUse", "tool.execute.before"] {
+            assert_eq!(
+                super::claude_hook_decision(event, true, false),
+                "deny",
+                "{event} must block an attached task that holds no work lease"
+            );
+            assert_eq!(
+                super::claude_hook_decision(event, true, true),
+                "recorded",
+                "{event} must allow an attached task that holds a work lease"
+            );
+        }
+    }
+
+    /// The plugin is installed at user scope and sees every project on the
+    /// machine. An unrelated session must never be blocked, whatever it does.
+    #[test]
+    fn an_unbound_session_is_never_blocked() {
+        for event in [
+            "PreToolUse",
+            "tool.execute.before",
+            "PostToolUseFailure",
+            "SessionStart",
+            "SessionEnd",
+        ] {
+            assert_eq!(
+                super::claude_hook_decision(event, false, false),
+                "passive",
+                "{event} must not gate a session with no attached task"
+            );
+        }
+    }
+
+    /// Only the mutation entry point gates. Observations of an attached task
+    /// are evidence, not decisions, and must not deny.
+    #[test]
+    fn observation_events_do_not_gate_even_when_a_task_is_attached() {
+        for event in [
+            "SessionStart",
+            "SessionEnd",
+            "PostToolUseFailure",
+            "SubagentStart",
+            "SubagentStop",
+            "PreCompact",
+            "TaskCompleted",
+        ] {
+            assert_eq!(
+                super::claude_hook_decision(event, true, false),
+                "recorded",
+                "{event} observes; it must not block"
+            );
+        }
+    }
+
+    /// Every declared hook must be an event this Claude Code version knows,
+    /// and each one must earn its place: the unfiltered PostToolUse spawned a
+    /// Governor process after every successful tool call in every project.
+    #[test]
+    fn the_declared_hooks_are_the_ones_that_carry_eliot_evidence() -> anyhow::Result<()> {
+        let repo = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(Path::parent)
+            .ok_or_else(|| anyhow::anyhow!("workspace root"))?;
+        let hooks: Value = serde_json::from_slice(&std::fs::read(
+            repo.join("integrations/claude/eliot/hooks/hooks.json"),
+        )?)?;
+        let declared = hooks
+            .get("hooks")
+            .and_then(Value::as_object)
+            .ok_or_else(|| anyhow::anyhow!("hooks object"))?;
+
+        assert!(
+            !declared.contains_key("PostToolUse"),
+            "an unfiltered PostToolUse fires on every successful tool call"
+        );
+        for required in ["SessionStart", "PreToolUse"] {
+            assert!(declared.contains_key(required), "{required} is required");
+        }
+
+        // The mutation gate must stay filtered to the tools that can mutate.
+        let matcher = hooks
+            .pointer("/hooks/PreToolUse/0/matcher")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow::anyhow!("PreToolUse matcher"))?;
+        for tool in ["Bash", "Edit", "Write", "NotebookEdit"] {
+            assert!(matcher.contains(tool), "{tool} must reach the gate");
+        }
         Ok(())
     }
 

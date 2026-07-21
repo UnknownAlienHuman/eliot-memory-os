@@ -1,5 +1,5 @@
 {
-  "description": "Bounded ELIOT session, task, tool, and continuity observations.",
+  "description": "One authority gate plus the session and delegation events that carry real ELIOT evidence. Events that change no ELIOT state are deliberately absent: this plugin is installed at user scope, so every hook here fires in every Claude session on the machine.",
   "hooks": {
     "SessionStart": [
       {
@@ -8,18 +8,6 @@
             "type": "command",
             "command": "${CLAUDE_PLUGIN_ROOT}/bin/eliot-governor.exe",
             "args": ["host", "event", "--host", "claude", "--event", "SessionStart"],
-            "timeout": 10
-          }
-        ]
-      }
-    ],
-    "UserPromptSubmit": [
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "${CLAUDE_PLUGIN_ROOT}/bin/eliot-governor.exe",
-            "args": ["host", "event", "--host", "claude", "--event", "UserPromptSubmit"],
             "timeout": 10
           }
         ]
@@ -38,20 +26,9 @@
         ]
       }
     ],
-    "PostToolUse": [
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "${CLAUDE_PLUGIN_ROOT}/bin/eliot-governor.exe",
-            "args": ["host", "event", "--host", "claude", "--event", "PostToolUse"],
-            "timeout": 10
-          }
-        ]
-      }
-    ],
     "PostToolUseFailure": [
       {
+        "matcher": "Bash|Edit|Write|NotebookEdit",
         "hooks": [
           {
             "type": "command",
@@ -86,18 +63,6 @@
         ]
       }
     ],
-    "TaskCompleted": [
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "${CLAUDE_PLUGIN_ROOT}/bin/eliot-governor.exe",
-            "args": ["host", "event", "--host", "claude", "--event", "TaskCompleted"],
-            "timeout": 10
-          }
-        ]
-      }
-    ],
     "PreCompact": [
       {
         "hooks": [
@@ -110,25 +75,13 @@
         ]
       }
     ],
-    "PostCompact": [
+    "TaskCompleted": [
       {
         "hooks": [
           {
             "type": "command",
             "command": "${CLAUDE_PLUGIN_ROOT}/bin/eliot-governor.exe",
-            "args": ["host", "event", "--host", "claude", "--event", "PostCompact"],
-            "timeout": 10
-          }
-        ]
-      }
-    ],
-    "Stop": [
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "${CLAUDE_PLUGIN_ROOT}/bin/eliot-governor.exe",
-            "args": ["host", "event", "--host", "claude", "--event", "Stop"],
+            "args": ["host", "event", "--host", "claude", "--event", "TaskCompleted"],
             "timeout": 10
           }
         ]
@@ -141,30 +94,6 @@
             "type": "command",
             "command": "${CLAUDE_PLUGIN_ROOT}/bin/eliot-governor.exe",
             "args": ["host", "event", "--host", "claude", "--event", "SessionEnd"],
-            "timeout": 10
-          }
-        ]
-      }
-    ],
-    "InstructionsLoaded": [
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "${CLAUDE_PLUGIN_ROOT}/bin/eliot-governor.exe",
-            "args": ["host", "event", "--host", "claude", "--event", "InstructionsLoaded"],
-            "timeout": 10
-          }
-        ]
-      }
-    ],
-    "CwdChanged": [
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "${CLAUDE_PLUGIN_ROOT}/bin/eliot-governor.exe",
-            "args": ["host", "event", "--host", "claude", "--event", "CwdChanged"],
             "timeout": 10
           }
         ]
