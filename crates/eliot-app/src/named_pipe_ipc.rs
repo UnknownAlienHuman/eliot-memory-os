@@ -8,7 +8,7 @@ use eliot_types::{ProjectId, SessionId, TaskId};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest as _, Sha256};
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -769,6 +769,51 @@ struct IpcPrincipal {
     capability_token: Option<String>,
 }
 
+/// Bounded window of recently seen handshake nonces.
+///
+/// Membership is what rejects a replay; the queue only decides what ages out.
+/// Reaching capacity evicts the oldest nonce rather than refusing the client:
+/// a full cache previously failed every subsequent handshake for the lifetime
+/// of the auth generation, which turned the defence into an outage. Memory
+/// stays bounded by `capacity` either way.
+///
+/// The window is per auth generation, so rotating the token discards it.
+struct ReplayWindow {
+    seen: HashSet<String>,
+    order: VecDeque<String>,
+    capacity: usize,
+}
+
+impl ReplayWindow {
+    fn with_capacity(capacity: usize) -> Self {
+        Self {
+            seen: HashSet::with_capacity(capacity),
+            order: VecDeque::with_capacity(capacity),
+            capacity,
+        }
+    }
+
+    /// Records a nonce, returning `false` when it was already in the window.
+    fn accept(&mut self, nonce: String) -> bool {
+        if self.seen.contains(&nonce) {
+            return false;
+        }
+        if self.order.len() >= self.capacity
+            && let Some(evicted) = self.order.pop_front()
+        {
+            self.seen.remove(&evicted);
+        }
+        self.seen.insert(nonce.clone());
+        self.order.push_back(nonce);
+        true
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.order.len()
+    }
+}
+
 struct IpcAuthenticationState {
     instance_name: String,
     runtime_id: String,
@@ -777,7 +822,7 @@ struct IpcAuthenticationState {
     token_generation_id: String,
     cognitive_client_executable: PathBuf,
     cognitive_client_executable_sha256: String,
-    replay_nonces: Mutex<HashSet<String>>,
+    replay_nonces: Mutex<ReplayWindow>,
 }
 
 #[cfg(windows)]
@@ -845,7 +890,7 @@ impl IpcAuthenticationState {
             token_generation_id: publication.auth_generation.clone(),
             cognitive_client_executable,
             cognitive_client_executable_sha256,
-            replay_nonces: Mutex::new(HashSet::new()),
+            replay_nonces: Mutex::new(ReplayWindow::with_capacity(MAX_REPLAY_NONCES)),
         })
     }
 
@@ -937,13 +982,9 @@ impl IpcAuthenticationState {
             _ => return Err("handshake_required"),
         }
         let mut replay_nonces = self.replay_nonces.lock().await;
-        if replay_nonces.contains(&handshake.client_nonce) {
+        if !replay_nonces.accept(handshake.client_nonce) {
             return Err("replayed_handshake");
         }
-        if replay_nonces.len() >= MAX_REPLAY_NONCES {
-            return Err("replay_cache_full");
-        }
-        replay_nonces.insert(handshake.client_nonce);
         let session_id = if handshake.kind == "eliot_cognitive_child_handshake" {
             SessionId::new_v7()
         } else {
@@ -1231,10 +1272,9 @@ pub(crate) async fn run_stdio_client(
 mod tests {
     use super::{
         ClientProcessAttestation, IPC_PROTOCOL_VERSION, IpcAuthenticationState, IpcClientHandshake,
-        allowed_ipc_profile, sha256_file,
+        MAX_REPLAY_NONCES, ReplayWindow, allowed_ipc_profile, sha256_file,
     };
     use anyhow::{Context as _, Result};
-    use std::collections::HashSet;
     use tokio::sync::Mutex;
     use uuid::Uuid;
 
@@ -1242,6 +1282,65 @@ mod tests {
     fn claude_desktop_is_an_authenticated_ipc_profile() {
         assert!(allowed_ipc_profile("claude_desktop"));
         assert!(!allowed_ipc_profile("raw_patch_runner"));
+    }
+
+    #[test]
+    fn a_repeated_handshake_nonce_is_rejected() {
+        let mut window = ReplayWindow::with_capacity(8);
+        let nonce = Uuid::new_v4().to_string();
+
+        assert!(window.accept(nonce.clone()), "first use must be accepted");
+        assert!(!window.accept(nonce), "the same nonce must not be reusable");
+    }
+
+    /// The window used to refuse every client once it filled up, so a runtime
+    /// that had seen `MAX_REPLAY_NONCES` handshakes could never be connected to
+    /// again until its auth generation rotated.
+    #[test]
+    fn fresh_clients_still_connect_after_the_window_has_turned_over() {
+        let capacity = 8;
+        let mut window = ReplayWindow::with_capacity(capacity);
+
+        for _ in 0..capacity * 4 {
+            assert!(
+                window.accept(Uuid::new_v4().to_string()),
+                "a fresh nonce must be accepted however many preceded it"
+            );
+        }
+    }
+
+    #[test]
+    fn the_replay_window_never_grows_past_its_capacity() {
+        let capacity = 8;
+        let mut window = ReplayWindow::with_capacity(capacity);
+
+        for _ in 0..capacity * 10 {
+            window.accept(Uuid::new_v4().to_string());
+        }
+
+        assert_eq!(window.len(), capacity);
+    }
+
+    /// Eviction is what bounds memory, so the oldest nonce is the one that
+    /// becomes replayable again. Anything still inside the window must not be.
+    #[test]
+    fn only_nonces_evicted_from_the_window_become_acceptable_again() {
+        let capacity = 4;
+        let mut window = ReplayWindow::with_capacity(capacity);
+        let oldest = Uuid::new_v4().to_string();
+        let newest = Uuid::new_v4().to_string();
+
+        assert!(window.accept(oldest.clone()));
+        for _ in 0..capacity - 2 {
+            window.accept(Uuid::new_v4().to_string());
+        }
+        assert!(window.accept(newest.clone()));
+        assert!(!window.accept(newest.clone()), "still inside the window");
+
+        // Push exactly enough fresh nonces to evict `oldest` but not `newest`.
+        window.accept(Uuid::new_v4().to_string());
+        assert!(window.accept(oldest), "evicted nonce is no longer tracked");
+        assert!(!window.accept(newest), "newest is still inside the window");
     }
 
     #[test]
@@ -1275,7 +1374,7 @@ mod tests {
             token_generation_id: "generation".to_owned(),
             cognitive_client_executable_sha256: sha256_file(&executable)?,
             cognitive_client_executable: executable,
-            replay_nonces: Mutex::new(HashSet::new()),
+            replay_nonces: Mutex::new(ReplayWindow::with_capacity(MAX_REPLAY_NONCES)),
         })
     }
 

@@ -2,7 +2,6 @@ use crate::{config::load_config, runtime_instance::RuntimeInstance};
 use anyhow::{Context as _, Result};
 use eliot_store::{CanonicalStore, SurrealServerSupervisor};
 use serde::Serialize;
-use sha2::{Digest as _, Sha256};
 use std::fs;
 use std::io::Write as _;
 use std::path::Path;
@@ -30,10 +29,12 @@ struct CredentialMetadataReport {
     credential_version: Option<u64>,
 }
 
+/// Carries no value derived from the legacy key. A SHA-256 of the retired
+/// signing key would be a durable record of a secret in a report that is
+/// printed to stdout, and nothing consumes it.
 #[derive(Debug, Serialize)]
 struct LegacyFileRotationReport {
     present_before: bool,
-    legacy_value_fingerprint_sha256: Option<String>,
     removed: bool,
 }
 
@@ -81,9 +82,6 @@ pub fn rotate_operator_cursor_credential(
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
         Err(error) => return Err(error).context("read exact legacy operator cursor key"),
     };
-    let legacy_value_fingerprint_sha256 = legacy_bytes
-        .as_deref()
-        .map(|bytes| format!("{:x}", Sha256::digest(bytes)));
     let status_before = eliot_windows_ipc::credential_status_current_user(&credential_id)?;
 
     let mut generated = [0_u8; OPERATOR_CURSOR_SIGNING_KEY_BYTES];
@@ -134,7 +132,6 @@ pub fn rotate_operator_cursor_credential(
         },
         legacy_file: LegacyFileRotationReport {
             present_before: legacy_bytes.is_some(),
-            legacy_value_fingerprint_sha256,
             removed: legacy_file_removed,
         },
         secret_values_redacted: true,

@@ -63,12 +63,19 @@ impl SurrealShutdown {
     }
 }
 
+/// Evidence that a rotation happened, carrying no value derived from either
+/// secret. The report is printed to stdout, so a deterministic hash of the old
+/// or new password would be a durable, offline-attackable record of it for no
+/// operational gain.
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
 pub struct CredentialRotationReport {
     pub schema_version: String,
     pub credential_id: String,
-    pub previous_fingerprint: String,
-    pub current_fingerprint: String,
+    /// Randomly generated per rotation. Deliberately not derived from any
+    /// secret, so it identifies the operation without describing its inputs.
+    pub rotation_id: String,
+    pub authority_before: CredentialProviderKind,
+    pub authority_after: CredentialProviderKind,
     pub database_auth_verified: bool,
     pub legacy_file_deleted: bool,
 }
@@ -162,8 +169,15 @@ impl SurrealServerSupervisor {
     }
 
     /// Rotates the persisted `SurrealDB` root user from the configured legacy
-    /// password file to the already provisioned Windows credential. Secret
-    /// values are bound as RPC variables and never returned or placed in argv.
+    /// password file to the already provisioned Windows credential.
+    ///
+    /// The new password is escaped into the statement text rather than bound as
+    /// an RPC variable. That is not a preference: SurrealDB 3.1.4 rejects a
+    /// parameter in the `DEFINE USER ... PASSWORD` position outright, while
+    /// accepting a literal, so a bound variable is not available here. The
+    /// statement is therefore treated as secret-bearing -- built immediately
+    /// before the call, never logged, never echoed into an error, and dropped
+    /// with the function. Secrets are never placed in argv and never returned.
     pub async fn rotate_legacy_credential_to_windows(
         &self,
     ) -> Result<CredentialRotationReport, StoreError> {
@@ -209,16 +223,15 @@ impl SurrealServerSupervisor {
 
         let verified = self.connect_and_auth(&current, 2_000).await?;
         drop(verified);
-        let previous_fingerprint = format!("{:x}", Sha256::digest(previous.expose_secret()));
-        let current_fingerprint = format!("{:x}", Sha256::digest(current.expose_secret()));
         let (legacy_path, _) = resolve_password_path(&self.config.password_file)?;
         fs::remove_file(&legacy_path)?;
 
         Ok(CredentialRotationReport {
-            schema_version: "eliot-credential-rotation-v1".to_owned(),
+            schema_version: "eliot-credential-rotation-v2".to_owned(),
             credential_id: self.config.credential_id.clone(),
-            previous_fingerprint,
-            current_fingerprint,
+            rotation_id: Uuid::new_v4().to_string(),
+            authority_before: CredentialProviderKind::LegacyPasswordFile,
+            authority_after: CredentialProviderKind::WindowsCredentialManager,
             database_auth_verified: true,
             legacy_file_deleted: true,
         })
@@ -253,6 +266,15 @@ impl SurrealServerSupervisor {
         let mut child = self.spawn_server(&password)?;
         let pid = child.id();
         if let Some(pid) = pid {
+            // The executable was resolved before the spawn. Confirm the image
+            // the kernel actually loaded is that same file, so a substitution
+            // landing in the window between resolution and exec cannot pass
+            // itself off as the canonical server -- and is never recorded as
+            // an owned pid this runtime would later terminate.
+            if let Err(error) = self.verify_owned_process_identity(pid) {
+                let _ = child.kill().await;
+                return Err(error);
+            }
             let pid_path = self.pid_path();
             if let Some(parent) = pid_path.parent() {
                 fs::create_dir_all(parent)?;
@@ -1382,6 +1404,35 @@ mod lifecycle_tests {
         assert!(supervisor.stop_owned_process(exited_pid()?).await?);
 
         fs::remove_dir_all(&root)?;
+        Ok(())
+    }
+
+    /// The rotation report is printed to stdout. A deterministic digest of the
+    /// old or new password would make that output a durable, offline-attackable
+    /// record of a live credential, so no field may carry one.
+    #[test]
+    fn a_rotation_report_carries_no_secret_derived_digest() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let report = super::CredentialRotationReport {
+            schema_version: "eliot-credential-rotation-v2".to_owned(),
+            credential_id: "surreal-runtime/default".to_owned(),
+            rotation_id: uuid::Uuid::new_v4().to_string(),
+            authority_before: CredentialProviderKind::LegacyPasswordFile,
+            authority_after: CredentialProviderKind::WindowsCredentialManager,
+            database_auth_verified: true,
+            legacy_file_deleted: true,
+        };
+
+        let json = serde_json::to_string(&report)?;
+        let longest_hex_run = json
+            .split(|c: char| !c.is_ascii_hexdigit())
+            .map(str::len)
+            .max()
+            .unwrap_or(0);
+        assert!(
+            longest_hex_run < 64,
+            "a 64-character hex run in {json} looks like a secret digest"
+        );
         Ok(())
     }
 

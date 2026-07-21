@@ -259,8 +259,11 @@ impl Default for GovernorConfig {
     }
 }
 
+/// A configuration that says nothing about credential storage gets the secure
+/// authority, not the legacy one. Selecting the password file is a deliberate,
+/// gated migration step and must be written out explicitly.
 fn default_surreal_credential_provider() -> CredentialProviderKind {
-    CredentialProviderKind::LegacyPasswordFile
+    CredentialProviderKind::WindowsCredentialManager
 }
 
 fn default_surreal_credential_id() -> String {
@@ -281,10 +284,56 @@ fn require_non_empty(field: &'static str, value: &str) -> Result<(), ConfigError
 
 #[cfg(test)]
 mod tests {
-    use super::{ConfigError, GovernorConfig};
+    use super::{ConfigError, CredentialProviderKind, GovernorConfig, SurrealServerConfig};
 
     #[test]
     fn default_config_is_valid() -> Result<(), ConfigError> {
         GovernorConfig::default().validate()
+    }
+
+    /// Omitting `credential_provider` must not silently select the plaintext
+    /// password file. Storing the secret in Windows Credential Manager is the
+    /// production authority, so it is what an unspecified config resolves to.
+    #[test]
+    fn an_unspecified_credential_provider_resolves_to_the_windows_credential_manager()
+    -> Result<(), serde_json::Error> {
+        let surreal: SurrealServerConfig = serde_json::from_str(
+            r#"{
+                "exe": "surreal",
+                "bind": "127.0.0.1:18000",
+                "endpoint": "ws://127.0.0.1:18000/rpc",
+                "storage": "rocksdb:data/surrealdb-rocks",
+                "ns": "eliot",
+                "db": "eliot",
+                "user": "root",
+                "log_level": "warn",
+                "query_timeout_ms": 5000,
+                "transaction_timeout_ms": 5000,
+                "startup_timeout_ms": 20000,
+                "restart_backoff_ms": 200,
+                "max_restart_backoff_ms": 2000,
+                "capabilities": {
+                    "deny_all": true,
+                    "allow_funcs": [],
+                    "allow_net": [],
+                    "allow_scripting": false,
+                    "allow_guests": false
+                }
+            }"#,
+        )?;
+
+        assert_eq!(
+            surreal.credential_provider,
+            CredentialProviderKind::WindowsCredentialManager
+        );
+        Ok(())
+    }
+
+    /// The legacy provider remains reachable, but only by naming it.
+    #[test]
+    fn the_legacy_password_file_provider_must_be_requested_explicitly() {
+        let explicit: CredentialProviderKind =
+            serde_json::from_str("\"legacy_password_file\"").expect("legacy variant still parses");
+        assert_eq!(explicit, CredentialProviderKind::LegacyPasswordFile);
     }
 }
