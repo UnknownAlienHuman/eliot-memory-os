@@ -4798,7 +4798,17 @@ fn claude_code_plugin_report(root: &Path) -> Value {
 /// decides readiness: two active surfaces is a configuration error, not health.
 fn claude_family_doctor(config_path: &Path) -> Result<Value> {
     let code_roots = claude_code_plugin_roots()?;
-    let desktop = claude_desktop_doctor(config_path)?;
+    // The Desktop report needs the source tree for its manifest, which an
+    // installed runtime does not have. A diagnostic must not fail because one
+    // of its inputs is out of reach: report that surface as unreadable and
+    // carry on, so the rest of the picture still reaches the operator.
+    let desktop = claude_desktop_doctor(config_path).unwrap_or_else(|error| {
+        json!({
+            "readable": false,
+            "detail": format!("{error:#}"),
+        })
+    });
+    let desktop_readable = desktop.get("readable") != Some(&Value::Bool(false));
     let desktop_active = desktop
         .get("extension")
         .is_some_and(|state| !state.is_null());
@@ -4873,6 +4883,7 @@ fn claude_family_doctor(config_path: &Path) -> Result<Value> {
             },
             ClaudeSurface::ClaudeDesktopMcpb.as_str(): {
                 "active": desktop_active,
+                "readable": desktop_readable,
                 "supports_lifecycle_hooks": ClaudeSurface::ClaudeDesktopMcpb.supports_lifecycle_hooks(),
                 "detail": desktop
             }
