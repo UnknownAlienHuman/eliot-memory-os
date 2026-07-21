@@ -3799,17 +3799,18 @@ fn launch_argv(
             }
         }
         AgentHostId::Claude => {
+            // The plugin carries its own `.mcp.json`, whether Claude discovered
+            // it as an installed plugin or we point at it with `--plugin-dir`.
+            // Handing Claude that same file again through `--mcp-config`
+            // attaches ELIOT a second time, which is how one session ended up
+            // exposing the tool set under two MCP namespaces with two
+            // competing authorities. Exactly one attachment, either way.
             if attach_session_plugin {
                 args.extend([
                     "--plugin-dir".to_owned(),
                     bundle.to_string_lossy().into_owned(),
                 ]);
             }
-            args.extend([
-                "--mcp-config".to_owned(),
-                bundle.join(".mcp.json").to_string_lossy().into_owned(),
-                "--strict-mcp-config".to_owned(),
-            ]);
             if let Some(model) = &contract.model_route_if_selected {
                 args.extend(["--model".to_owned(), model.clone()]);
             }
@@ -7064,6 +7065,77 @@ mod tests {
         assert_eq!(model_pairs[0][1], selected_model);
         assert!(!args.iter().any(|argument| argument == "--session"));
         assert_eq!(args.last().map(String::as_str), Some("sealed reader task"));
+        Ok(())
+    }
+
+    /// ELIOT must reach a Claude session exactly once. The plugin already
+    /// carries its own `.mcp.json`, so passing that file again through
+    /// `--mcp-config` attached the tool set twice under two MCP namespaces,
+    /// giving one session two competing ELIOT authorities.
+    #[test]
+    fn claude_managed_launch_attaches_eliot_exactly_once() -> anyhow::Result<()> {
+        let fixture = scope_fixture()?;
+        let repo = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(Path::parent)
+            .ok_or_else(|| anyhow::anyhow!("workspace root"))?;
+        let mut profile = antigravity_profile();
+        profile.host_id = AgentHostId::Claude;
+        profile.implementation_name = "Claude Code".to_owned();
+        let contract = HostLaunchContractService.render(
+            repo,
+            &profile,
+            HostMode::Supervised,
+            &fixture.cwd,
+            None,
+            None,
+            &fixture.scope,
+        )?;
+        let bundle = repo.join("integrations/claude/eliot");
+
+        let attachments = |args: &[String]| {
+            args.iter()
+                .filter(|argument| {
+                    argument.as_str() == "--plugin-dir" || argument.as_str() == "--mcp-config"
+                })
+                .count()
+        };
+
+        // Canonical path: Claude discovered the installed plugin, so it loads
+        // the MCP server itself and the launcher must add nothing.
+        let (_program, installed) = launch_argv(
+            AgentHostId::Claude,
+            "claude.exe",
+            &bundle,
+            false,
+            &contract,
+            Some("bounded task".to_owned()),
+        )?;
+        assert_eq!(
+            attachments(&installed),
+            0,
+            "an installed plugin already provides ELIOT: {installed:?}"
+        );
+
+        // Development fallback: no installed plugin, so the bundle is pointed
+        // at directly -- still one attachment, never both.
+        let (_program, fallback) = launch_argv(
+            AgentHostId::Claude,
+            "claude.exe",
+            &bundle,
+            true,
+            &contract,
+            Some("bounded task".to_owned()),
+        )?;
+        assert_eq!(
+            attachments(&fallback),
+            1,
+            "the development fallback must attach ELIOT once: {fallback:?}"
+        );
+        assert!(
+            !fallback.iter().any(|argument| argument == "--mcp-config"),
+            "--plugin-dir already carries .mcp.json: {fallback:?}"
+        );
         Ok(())
     }
 
