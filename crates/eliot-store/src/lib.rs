@@ -26,5 +26,7 @@ pub use control_wal::{
 pub use error::StoreError;
 pub use migration::{CompiledMigration, MigrationRunner};
 pub use surql::{NamedSurqlOp, SurqlTemplate, SurqlTemplateRegistry};
-pub use surreal_server::{CredentialRotationReport, ReadySurrealServer, SurrealServerSupervisor};
+pub use surreal_server::{
+    CredentialRotationReport, ReadySurrealServer, SurrealServerSupervisor, SurrealShutdown,
+};
 pub use surreal_store::{SurrealSmokeReport, SurrealStore};

@@ -693,14 +693,16 @@ async fn run_daemon_instance(config_path: &Path, instance: &RuntimeInstance) -> 
             .shutdown_if_spawned()
             .await
             .map_err(anyhow::Error::from),
-        None => Ok(false),
+        None => Ok(eliot_store::SurrealShutdown::not_owned()),
     };
     match (runtime_result, database_result) {
-        (Ok(publication_cleaned), Ok(database_stopped)) => {
+        (Ok(publication_cleaned), Ok(database)) => {
             lock.mark_clean_shutdown()?;
             info!("governor daemon shutdown requested");
             tracing::info!(
-                database_stopped,
+                database_stopped = database.stopped_owned_process,
+                database_drain_incomplete = database.drain_incomplete,
+                database_already_exited = database.already_exited,
                 publication_cleaned,
                 "owned runtime resources released"
             );

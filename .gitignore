@@ -34,6 +34,8 @@ id_rsa
 id_ed25519
 
 # Developer-local agent/tool state
+# .cargo/config.toml carries a machine-specific external build-cache path.
+.cargo/config.toml
 .claude/settings.local.json
 .codex/config.toml
 .codex/config.local.toml

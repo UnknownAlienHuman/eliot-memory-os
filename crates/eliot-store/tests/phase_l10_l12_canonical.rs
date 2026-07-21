@@ -1135,7 +1135,12 @@ async fn physical_surreal_restart_preserves_canonical_l10_l12_records() -> Resul
     assert_pre_exact_lookup_authority(&store, project_id, task_id, &pre_exact_lookup).await?;
 
     drop(store);
-    assert!(first_server.shutdown_if_spawned().await?);
+    assert!(
+        first_server
+            .shutdown_if_spawned()
+            .await?
+            .stopped_owned_process
+    );
     let second_server = SurrealServerSupervisor::new(config.clone())
         .start_or_connect()
         .await?;
@@ -1185,7 +1190,12 @@ async fn physical_surreal_restart_preserves_canonical_l10_l12_records() -> Resul
         .await?;
 
     drop(restarted_store);
-    assert!(second_server.shutdown_if_spawned().await?);
+    assert!(
+        second_server
+            .shutdown_if_spawned()
+            .await?
+            .stopped_owned_process
+    );
     let removed_root = root.remove()?;
     assert!(!removed_root.exists());
     report_physical_restart_evidence(
@@ -1331,7 +1341,7 @@ async fn exact_result_and_latest_authority_queries_survive_bounded_history()
     );
 
     drop(store);
-    assert!(server.shutdown_if_spawned().await?);
+    assert!(server.shutdown_if_spawned().await?.stopped_owned_process);
     let removed_root = root.remove()?;
     assert!(!removed_root.exists());
     Ok(())
@@ -1400,7 +1410,7 @@ async fn authenticated_canonical_blob_reference_scan_is_complete_and_evidence_bo
     );
 
     drop(store);
-    assert!(server.shutdown_if_spawned().await?);
+    assert!(server.shutdown_if_spawned().await?.stopped_owned_process);
     let removed_root = root.remove()?;
     assert!(!removed_root.exists());
     Ok(())
@@ -1594,7 +1604,12 @@ async fn canonical_operator_paging_survives_restart_without_gaps_or_duplicates()
             .await?,
     ];
     drop(first_store);
-    assert!(first_server.shutdown_if_spawned().await?);
+    assert!(
+        first_server
+            .shutdown_if_spawned()
+            .await?
+            .stopped_owned_process
+    );
 
     let second_server = SurrealServerSupervisor::new(config.clone())
         .start_or_connect()
@@ -1640,7 +1655,12 @@ async fn canonical_operator_paging_survives_restart_without_gaps_or_duplicates()
         311
     );
     drop(restarted_store);
-    assert!(second_server.shutdown_if_spawned().await?);
+    assert!(
+        second_server
+            .shutdown_if_spawned()
+            .await?
+            .stopped_owned_process
+    );
     let removed_root = root.remove()?;
     assert!(!removed_root.exists());
     Ok(())

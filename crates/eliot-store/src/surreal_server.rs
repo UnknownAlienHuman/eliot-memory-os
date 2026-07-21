@@ -31,9 +31,36 @@ pub struct SurrealServerSupervisor {
 pub struct ReadySurrealServer {
     transport: SurrealRpcTransport,
     started_pid: Option<u32>,
-    pid_path: PathBuf,
     lease_path: Option<PathBuf>,
     supervisor: SurrealServerSupervisor,
+}
+
+/// Outcome of releasing this runtime's handle on the canonical SurrealDB server.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize)]
+pub struct SurrealShutdown {
+    /// True when this runtime started the server and has now stopped it.
+    /// False when the runtime merely connected to a pre-existing server, which
+    /// it does not own and must not stop.
+    pub stopped_owned_process: bool,
+    /// True when other client leases were still held when the owned process was
+    /// stopped. Shutdown proceeds anyway: leaving the process this runtime is
+    /// responsible for running is the worse outcome, and it is the exact defect
+    /// that orphaned SurrealDB after `daemon stop`.
+    pub drain_incomplete: bool,
+    /// True when the recorded pid was already gone before shutdown ran.
+    pub already_exited: bool,
+}
+
+impl SurrealShutdown {
+    /// The outcome for a server this runtime connected to but does not own.
+    #[must_use]
+    pub const fn not_owned() -> Self {
+        Self {
+            stopped_owned_process: false,
+            drain_incomplete: false,
+            already_exited: false,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
@@ -573,7 +600,6 @@ impl SurrealServerSupervisor {
         Ok(ReadySurrealServer {
             transport,
             started_pid,
-            pid_path: self.pid_path(),
             lease_path: Some(self.create_client_lease()?),
             supervisor: self.clone(),
         })
@@ -599,6 +625,65 @@ impl SurrealServerSupervisor {
         storage_path(&self.config.storage)
             .and_then(|path| path.parent().map(Path::to_path_buf))
             .unwrap_or_else(|| PathBuf::from(".eliot-governor"))
+    }
+
+    /// Stops the SurrealDB process this runtime started, returning whether the
+    /// process had already exited on its own.
+    ///
+    /// A recorded pid is not by itself authority to terminate anything. Pids are
+    /// reused, so a stale record can name an unrelated process; the pid is bound
+    /// to the executable image actually backing it before any termination, and
+    /// the exit is confirmed afterwards.
+    async fn stop_owned_process(&self, pid: u32) -> Result<bool, StoreError> {
+        if !process_is_alive(pid)? {
+            return Ok(true);
+        }
+        self.verify_owned_process_identity(pid)?;
+        stop_pid(pid).await?;
+        self.wait_for_process_exit(pid).await?;
+        Ok(false)
+    }
+
+    /// Refuses to act on a pid whose running image is not the SurrealDB
+    /// executable this supervisor is configured to own.
+    #[cfg(windows)]
+    fn verify_owned_process_identity(&self, pid: u32) -> Result<(), StoreError> {
+        let expected = self.executable_path()?;
+        let actual = eliot_windows_ipc::process_image_path(pid).map_err(|error| {
+            StoreError::Process(format!("cannot read the image of pid {pid}: {error}"))
+        })?;
+        if same_executable(&expected, &actual) {
+            return Ok(());
+        }
+        Err(StoreError::PolicyViolation(format!(
+            "refusing to stop pid {pid}: running image {} is not the owned SurrealDB executable {}",
+            actual.display(),
+            expected.display()
+        )))
+    }
+
+    #[cfg(not(windows))]
+    fn verify_owned_process_identity(&self, _pid: u32) -> Result<(), StoreError> {
+        Ok(())
+    }
+
+    async fn wait_for_process_exit(&self, pid: u32) -> Result<(), StoreError> {
+        let deadline =
+            Instant::now() + Duration::from_millis(self.config.startup_timeout_ms.max(5_000));
+        loop {
+            if !process_is_alive(pid)? {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                return Err(StoreError::Process(format!(
+                    "owned SurrealDB pid {pid} did not exit after being stopped"
+                )));
+            }
+            sleep(Duration::from_millis(
+                self.config.restart_backoff_ms.max(50),
+            ))
+            .await;
+        }
     }
 }
 
@@ -828,18 +913,44 @@ impl ReadySurrealServer {
         self.started_pid
     }
 
-    pub async fn shutdown_if_spawned(mut self) -> Result<bool, StoreError> {
+    /// Releases this runtime's handle on the SurrealDB server, stopping the
+    /// server process when — and only when — this runtime started it.
+    ///
+    /// Draining and lock acquisition are cooperative courtesies to other
+    /// clients, not preconditions for ownership. Neither may abort the
+    /// shutdown: a runtime that started a server and then exits without
+    /// stopping it leaves an orphan holding the canonical data directory.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the owned process cannot be identified, refuses to
+    /// stop, or when pid/lease bookkeeping cannot be updated.
+    pub async fn shutdown_if_spawned(mut self) -> Result<SurrealShutdown, StoreError> {
         self.release_client_lease()?;
-        if let Some(pid) = self.started_pid.take() {
-            let _lock = self.supervisor.acquire_start_lock().await?;
-            self.supervisor.wait_for_client_leases_to_drain().await?;
-            stop_pid(pid).await?;
-            if self.pid_path.is_file() {
-                fs::remove_file(&self.pid_path)?;
-            }
-            return Ok(true);
-        }
-        Ok(false)
+        let Some(pid) = self.started_pid.take() else {
+            // Connected to a pre-existing server. It is not ours to stop.
+            return Ok(SurrealShutdown::not_owned());
+        };
+
+        // Best-effort: a start lock held by another starter must not strand the
+        // process this runtime owns.
+        let lock = self.supervisor.acquire_start_lock().await.ok();
+        let drain_incomplete = self
+            .supervisor
+            .wait_for_client_leases_to_drain()
+            .await
+            .is_err();
+
+        let stop = self.supervisor.stop_owned_process(pid).await;
+        drop(lock);
+        let already_exited = stop?;
+
+        self.supervisor.remove_pid_file_if_matches(pid)?;
+        Ok(SurrealShutdown {
+            stopped_owned_process: true,
+            drain_incomplete,
+            already_exited,
+        })
     }
 
     fn release_client_lease(&mut self) -> Result<(), StoreError> {
@@ -890,11 +1001,61 @@ fn cleanup_stale_client_leases(dir: &Path, startup_timeout_ms: u64) -> Result<()
             .and_then(|metadata| metadata.modified())
             .and_then(|modified| modified.elapsed().map_err(std::io::Error::other))
             .is_ok_and(|elapsed| elapsed > stale_after);
-        if stale {
+        if stale || lease_owner_is_gone(&path) {
             let _ = fs::remove_file(path);
         }
     }
     Ok(())
+}
+
+#[cfg(windows)]
+fn process_is_alive(pid: u32) -> Result<bool, StoreError> {
+    eliot_windows_ipc::process_is_alive(pid)
+        .map_err(|error| StoreError::Process(format!("cannot query pid {pid}: {error}")))
+}
+
+#[cfg(not(windows))]
+fn process_is_alive(pid: u32) -> Result<bool, StoreError> {
+    let status = std::process::Command::new("kill")
+        .arg("-0")
+        .arg(pid.to_string())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map_err(|error| StoreError::Process(error.to_string()))?;
+    Ok(status.success())
+}
+
+/// Compares two executable paths as Windows resolves them: canonical where the
+/// file is reachable, case-insensitive either way.
+#[cfg(windows)]
+fn same_executable(expected: &Path, actual: &Path) -> bool {
+    let normalize = |path: &Path| {
+        fs::canonicalize(path)
+            .unwrap_or_else(|_| path.to_path_buf())
+            .to_string_lossy()
+            .to_lowercase()
+    };
+    normalize(expected) == normalize(actual)
+}
+
+/// Extracts the owning process id encoded in a `{pid}-{uuid}.lease` file name.
+fn lease_owner_pid(path: &Path) -> Option<u32> {
+    path.file_stem()?
+        .to_str()?
+        .split_once('-')
+        .and_then(|(pid, _)| pid.parse::<u32>().ok())
+}
+
+/// A lease whose owning process no longer exists can never be released by that
+/// process. Waiting out the full stale window for it would block graceful
+/// shutdown behind a client that is already gone.
+///
+/// Pid reuse only makes this more conservative: if the pid now belongs to some
+/// unrelated live process the lease is still treated as held, and the
+/// age-based sweep remains the backstop.
+fn lease_owner_is_gone(path: &Path) -> bool {
+    lease_owner_pid(path).is_some_and(|pid| matches!(process_is_alive(pid), Ok(false)))
 }
 
 async fn stop_pid(pid: u32) -> Result<(), StoreError> {
@@ -1083,5 +1244,152 @@ mod security_tests {
 
         fs::remove_dir_all(root)?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod lifecycle_tests {
+    use super::{
+        SurrealServerSupervisor, SurrealShutdown, cleanup_stale_client_leases, lease_owner_pid,
+        process_is_alive,
+    };
+    use eliot_types::{CredentialProviderKind, SurrealCapabilities, SurrealServerConfig};
+    use std::fs;
+    use std::path::{Path, PathBuf};
+
+    fn test_root(label: &str) -> Result<PathBuf, Box<dyn std::error::Error>> {
+        let root = std::env::temp_dir().join(format!(
+            "eliot-surreal-lifecycle-{label}-{}",
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(root.join("tmp").join("surreal.clients"))?;
+        Ok(root)
+    }
+
+    fn supervisor_for(exe: &str, root: &Path) -> SurrealServerSupervisor {
+        SurrealServerSupervisor::new(SurrealServerConfig {
+            exe: exe.to_owned(),
+            bind: "127.0.0.1:0".to_owned(),
+            endpoint: "ws://127.0.0.1:0/rpc".to_owned(),
+            storage: format!("rocksdb:{}/surrealdb-rocks", root.display()),
+            ns: "eliot".to_owned(),
+            db: "eliot".to_owned(),
+            user: "root".to_owned(),
+            credential_provider: CredentialProviderKind::WindowsCredentialManager,
+            credential_id: "surreal-runtime/lifecycle-test".to_owned(),
+            password_file: "%LOCALAPPDATA%/Eliot/secrets/lifecycle-test-unused.txt".to_owned(),
+            log_level: "warn".to_owned(),
+            query_timeout_ms: 2_000,
+            transaction_timeout_ms: 2_000,
+            startup_timeout_ms: 2_000,
+            restart_backoff_ms: 50,
+            max_restart_backoff_ms: 200,
+            capabilities: SurrealCapabilities {
+                deny_all: true,
+                allow_funcs: Vec::new(),
+                allow_net: Vec::new(),
+                allow_scripting: false,
+                allow_guests: false,
+            },
+        })
+    }
+
+    /// Returns a pid that is guaranteed to have exited.
+    fn exited_pid() -> Result<u32, Box<dyn std::error::Error>> {
+        let mut child = if cfg!(windows) {
+            std::process::Command::new("cmd")
+                .args(["/c", "exit"])
+                .spawn()?
+        } else {
+            std::process::Command::new("true").spawn()?
+        };
+        let pid = child.id();
+        child.wait()?;
+        Ok(pid)
+    }
+
+    #[test]
+    fn lease_file_names_carry_their_owning_process_id() {
+        assert_eq!(
+            lease_owner_pid(Path::new("4321-2f1d6d1e-0000-4000-8000-000000000000.lease")),
+            Some(4321)
+        );
+        assert_eq!(lease_owner_pid(Path::new("not-a-pid.lease")), None);
+    }
+
+    /// The drain window is ten minutes. Before this, a lease left behind by a
+    /// client that had already died held graceful shutdown open for that entire
+    /// window, which is what orphaned SurrealDB after `daemon stop`.
+    #[test]
+    fn a_fresh_lease_from_a_dead_client_is_reclaimed_immediately()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root = test_root("dead-lease")?;
+        let leases = root.join("tmp").join("surreal.clients");
+        let dead = leases.join(format!("{}-{}.lease", exited_pid()?, uuid::Uuid::new_v4()));
+        let live = leases.join(format!(
+            "{}-{}.lease",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        fs::write(&dead, "")?;
+        fs::write(&live, "")?;
+
+        cleanup_stale_client_leases(&leases, 2_000)?;
+
+        assert!(
+            !dead.is_file(),
+            "dead client lease must not block the drain"
+        );
+        assert!(live.is_file(), "a live client lease must still be honored");
+        fs::remove_dir_all(&root)?;
+        Ok(())
+    }
+
+    /// Pids are reused. A recorded pid alone must never authorize termination:
+    /// this test points the supervisor at a pid whose image is deliberately not
+    /// SurrealDB -- the running test process itself. If the identity check is
+    /// removed, this test kills its own process instead of failing politely.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn a_pid_whose_image_is_not_surreal_is_never_stopped()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root = test_root("identity")?;
+        let supervisor = supervisor_for("cmd", &root);
+        let self_pid = std::process::id();
+
+        let refusal = supervisor.stop_owned_process(self_pid).await;
+
+        assert!(
+            refusal.is_err(),
+            "stopping a pid backed by a foreign image must be refused"
+        );
+        assert!(
+            process_is_alive(self_pid)?,
+            "the refused process must still be running"
+        );
+        fs::remove_dir_all(&root)?;
+        Ok(())
+    }
+
+    /// A pid that has already exited is reported, not re-killed.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn an_already_exited_owned_process_is_reported_not_killed()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root = test_root("exited")?;
+        let supervisor = supervisor_for("cmd", &root);
+
+        assert!(supervisor.stop_owned_process(exited_pid()?).await?);
+
+        fs::remove_dir_all(&root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn a_server_this_runtime_did_not_start_is_not_owned() {
+        let outcome = SurrealShutdown::not_owned();
+        assert!(!outcome.stopped_owned_process);
+        assert!(!outcome.drain_incomplete);
+        assert!(!outcome.already_exited);
     }
 }
