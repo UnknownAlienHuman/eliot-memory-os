@@ -75,7 +75,7 @@ use eliot_types::{
     CanonicalCaseDisposition, CanonicalReplayAuthority, CanonicalReplayExecutionRecord,
     CanonicalReplayObservationEvidence, CanonicalTraceCompletenessContract, CanonicalTraceEvidence,
     CanonicalTraceEvidenceKind, CanonicalTraceEvidenceSource, CanonicalTraceReceiptBinding,
-    ChangePlan, ClaimCardInput, ClaimId, CodeCortexReport, CodeCortexRequest,
+    ChangePlan, ClaimCardInput, ClaimId, ClaudeSurface, CodeCortexReport, CodeCortexRequest,
     CognitiveCandidateCapability, CognitiveCaseSpec, CognitiveExecutionSeal,
     CognitiveFailureLocalizationReport, CognitiveGateRequest, CognitiveHostObservation,
     CognitiveInvocationRole, CognitiveRawVerifierEvidence, CognitiveReaderAnswer,
@@ -23833,6 +23833,55 @@ fn agent_broker_tool_definitions() -> Vec<Value> {
     ]
 }
 
+/// The tools and prompts a Claude surface sees, resolved offline.
+///
+/// This is the same catalog the live server answers `tools/list` and
+/// `prompts/list` from. Package manifests must be generated from here rather
+/// than transcribed: a hand-maintained second copy of the tool set drifts
+/// silently, and the drift is only visible to whoever is holding the manifest.
+///
+/// Both Claude surfaces currently resolve to the same access profile. That
+/// profile is still named after Claude Desktop even though Claude Code uses it
+/// too, which is a misnomer scheduled for renaming, not a capability
+/// difference: one host family, one Governor authority, one tool set.
+pub(crate) fn claude_surface_catalog(surface: ClaudeSurface) -> Value {
+    let profile = match surface {
+        ClaudeSurface::ClaudeCodePlugin | ClaudeSurface::ClaudeDesktopMcpb => {
+            McpAccessProfile::ClaudeDesktop
+        }
+    };
+    let mut tools = tool_definitions_for_profile(profile)
+        .into_iter()
+        .filter_map(|definition| {
+            definition
+                .get("name")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        })
+        .collect::<Vec<_>>();
+    let mut prompts = prompt_definitions()
+        .into_iter()
+        .filter_map(|definition| {
+            definition
+                .get("name")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        })
+        .collect::<Vec<_>>();
+    // Sorted so the catalog is comparable byte for byte across runs.
+    tools.sort();
+    prompts.sort();
+    json!({
+        "schema_version": "eliot-mcp-catalog-v1",
+        "host": "claude",
+        "surface": surface.as_str(),
+        "access_profile": profile.as_str(),
+        "supports_lifecycle_hooks": surface.supports_lifecycle_hooks(),
+        "tools": tools,
+        "prompts": prompts,
+    })
+}
+
 fn tool_definitions_for_profile(profile: McpAccessProfile) -> Vec<Value> {
     tool_definitions()
         .into_iter()
@@ -33719,5 +33768,116 @@ mod l4_tests {
         assert_eq!(profile.scanned_records, 22);
         assert!(!profile.scan_truncated);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod catalog_parity_tests {
+    use super::claude_surface_catalog;
+    use eliot_types::ClaudeSurface;
+    use serde_json::Value;
+    use std::path::{Path, PathBuf};
+
+    fn repo_root() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(Path::parent)
+            .expect("workspace root")
+            .to_path_buf()
+    }
+
+    fn manifest_names(manifest: &Value, field: &str) -> Vec<String> {
+        let mut names = manifest
+            .get(field)
+            .and_then(Value::as_array)
+            .map(|entries| {
+                entries
+                    .iter()
+                    .filter_map(|entry| {
+                        entry.get("name").and_then(Value::as_str).map(str::to_owned)
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        names.sort();
+        names
+    }
+
+    fn catalog_names(catalog: &Value, field: &str) -> Vec<String> {
+        catalog
+            .get(field)
+            .and_then(Value::as_array)
+            .map(|entries| {
+                entries
+                    .iter()
+                    .filter_map(|entry| entry.as_str().map(str::to_owned))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// The Desktop package declares its tools and prompts in a manifest that is
+    /// maintained by hand. Whatever it declares must be what the Governor
+    /// actually serves: a manifest promising a tool the server does not expose,
+    /// or omitting one it does, is a lie Claude Desktop shows to the user.
+    ///
+    /// This is the parity gate until the manifest is generated outright.
+    #[test]
+    fn the_desktop_manifest_declares_exactly_what_the_governor_serves()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let manifest: Value = serde_json::from_slice(&std::fs::read(
+            repo_root().join("integrations/claude/claude-desktop/mcpb/manifest.json"),
+        )?)?;
+        let catalog = claude_surface_catalog(ClaudeSurface::ClaudeDesktopMcpb);
+
+        assert_eq!(
+            manifest_names(&manifest, "tools"),
+            catalog_names(&catalog, "tools"),
+            "MCPB manifest tools drifted from the Governor catalog"
+        );
+        assert_eq!(
+            manifest_names(&manifest, "prompts"),
+            catalog_names(&catalog, "prompts"),
+            "MCPB manifest prompts drifted from the Governor catalog"
+        );
+        Ok(())
+    }
+
+    /// ELIOT is MIT. Every place ELIOT declares its own license must say so,
+    /// and a dual-license string in a shipped package manifest is a claim about
+    /// terms the project does not offer.
+    #[test]
+    fn the_desktop_manifest_declares_the_project_license() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let manifest: Value = serde_json::from_slice(&std::fs::read(
+            repo_root().join("integrations/claude/claude-desktop/mcpb/manifest.json"),
+        )?)?;
+        assert_eq!(manifest.get("license").and_then(Value::as_str), Some("MIT"));
+        Ok(())
+    }
+
+    /// Both Claude surfaces are one host family behind one Governor authority,
+    /// so they see the same tools. Only hook capability differs.
+    #[test]
+    fn both_claude_surfaces_expose_the_same_tool_set() {
+        let code = claude_surface_catalog(ClaudeSurface::ClaudeCodePlugin);
+        let desktop = claude_surface_catalog(ClaudeSurface::ClaudeDesktopMcpb);
+        assert_eq!(
+            catalog_names(&code, "tools"),
+            catalog_names(&desktop, "tools")
+        );
+        assert_eq!(code["supports_lifecycle_hooks"], Value::Bool(true));
+        assert_eq!(desktop["supports_lifecycle_hooks"], Value::Bool(false));
+    }
+
+    /// Sorted output keeps generated manifests byte-stable across runs.
+    #[test]
+    fn the_catalog_is_deterministically_ordered() {
+        let catalog = claude_surface_catalog(ClaudeSurface::ClaudeDesktopMcpb);
+        let tools = catalog_names(&catalog, "tools");
+        let mut sorted = tools.clone();
+        sorted.sort();
+        assert_eq!(tools, sorted);
+        assert!(!tools.is_empty());
     }
 }

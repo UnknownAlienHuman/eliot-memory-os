@@ -1602,6 +1602,15 @@ enum McpCommand {
         #[arg(long)]
         instance: Option<String>,
     },
+    /// Print the tools and prompts a host surface sees, without starting a
+    /// server. Package manifests are generated from this, never transcribed.
+    Catalog {
+        #[arg(long, default_value = "claude")]
+        host: String,
+        /// `code` or `desktop` for the Claude host family.
+        #[arg(long, default_value = "desktop")]
+        surface: String,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -2388,6 +2397,23 @@ async fn dispatch_command(
                 selected_instance(instance, implicit_instance).as_deref(),
             )
             .await
+        }
+        Command::Mcp {
+            command: McpCommand::Catalog { host, surface },
+        } => {
+            anyhow::ensure!(
+                host.trim().eq_ignore_ascii_case("claude"),
+                "only the Claude host family exposes surface catalogs"
+            );
+            let surface = eliot_types::ClaudeSurface::parse(&surface).ok_or_else(|| {
+                anyhow::anyhow!("unknown Claude surface {surface}; expected `code` or `desktop`")
+            })?;
+            let catalog = mcp_stdio::claude_surface_catalog(surface);
+            let mut stdout = std::io::stdout().lock();
+            serde_json::to_writer_pretty(&mut stdout, &catalog)?;
+            use std::io::Write as _;
+            writeln!(stdout)?;
+            Ok(())
         }
         Command::Host { command } => Box::pin(host_runtime::dispatch(config, command)).await,
         Command::PhaseB {

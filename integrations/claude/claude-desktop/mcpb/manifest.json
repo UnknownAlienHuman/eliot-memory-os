@@ -109,7 +109,7 @@
     "agents",
     "verification"
   ],
-  "license": "MIT OR Apache-2.0",
+  "license": "MIT",
   "compatibility": {
     "claude_desktop": ">=1.0.0",
     "platforms": [
