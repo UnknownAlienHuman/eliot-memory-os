@@ -4751,6 +4751,45 @@ fn activate_claude_surface(
     }))
 }
 
+/// What an installed Claude Code plugin root says about itself.
+///
+/// The install manifest records where the plugin was built from. That source
+/// can be moved or deleted long after installation, leaving a plugin that still
+/// loads and works but can never be updated again -- a failure that is
+/// invisible until someone tries to reinstall and finds nothing there.
+fn claude_code_plugin_report(root: &Path) -> Value {
+    let manifest = std::fs::read(root.join(".claude-plugin").join("plugin.json"))
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok());
+    let install = std::fs::read(root.join(CLAUDE_GLOBAL_MANIFEST))
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok());
+    let source_path = install
+        .as_ref()
+        .and_then(|value| value.get("source_plugin_path"))
+        .and_then(Value::as_str);
+    let source_present = source_path.map(|path| Path::new(path).is_dir());
+
+    json!({
+        "root": root,
+        "manifest_valid": manifest.is_some(),
+        "plugin_version": manifest
+            .as_ref()
+            .and_then(|value| value.get("version"))
+            .and_then(Value::as_str),
+        "license": manifest
+            .as_ref()
+            .and_then(|value| value.get("license"))
+            .and_then(Value::as_str),
+        "install_source_path": source_path,
+        "install_source_present": source_present,
+        "installed_governor_sha256": install
+            .as_ref()
+            .and_then(|value| value.get("installed_governor_sha256"))
+            .and_then(Value::as_str),
+    })
+}
+
 /// One doctor for the whole Claude host family.
 ///
 /// `claude` is a single vendor with a single Governor authority behind two
@@ -4774,6 +4813,22 @@ fn claude_family_doctor(config_path: &Path) -> Result<Value> {
             "remediation": "keep exactly one ELIOT plugin root and remove the others"
         }));
     }
+    let code_reports = code_roots
+        .iter()
+        .map(|root| claude_code_plugin_report(root))
+        .collect::<Vec<_>>();
+    for report in &code_reports {
+        if report.get("install_source_present") == Some(&Value::Bool(false)) {
+            conflicts.push(json!({
+                "kind": "install_source_missing",
+                "detail": "the plugin still loads but the tree it was installed from is gone, so it can never be updated in place",
+                "root": report.get("root"),
+                "install_source_path": report.get("install_source_path"),
+                "remediation": "reinstall from the canonical repository with `host install --host claude`"
+            }));
+        }
+    }
+
     let selected = selected_claude_surface(config_path);
     if code_active && desktop_active {
         conflicts.push(json!({
@@ -4813,6 +4868,7 @@ fn claude_family_doctor(config_path: &Path) -> Result<Value> {
                 "active": code_active,
                 "roots": &code_roots,
                 "root_count": code_roots.len(),
+                "installations": &code_reports,
                 "supports_lifecycle_hooks": ClaudeSurface::ClaudeCodePlugin.supports_lifecycle_hooks()
             },
             ClaudeSurface::ClaudeDesktopMcpb.as_str(): {
