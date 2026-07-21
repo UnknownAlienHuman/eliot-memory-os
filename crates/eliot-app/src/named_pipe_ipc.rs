@@ -1075,6 +1075,7 @@ fn allowed_ipc_profile(profile: &str) -> bool {
     matches!(
         profile,
         "dynamic_agent"
+            | "claude_governed"
             | "claude_desktop"
             | "codex_controller"
             | "codex_worker"

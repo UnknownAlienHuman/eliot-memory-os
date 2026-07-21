@@ -9,12 +9,38 @@ param(
 $ErrorActionPreference = 'Stop'
 $repoRoot = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
 $sourceRoot = Join-Path $repoRoot 'integrations\claude\claude-desktop\mcpb'
-$targetRoot = Join-Path $repoRoot 'target\claude-desktop-mcpb\eliot-governor'
+
+# The MCPB CLI version is a build input. Resolving it as `@latest` means the
+# same source can produce different package bytes on different days for reasons
+# nobody recorded, so the exact verified version is pinned in source.
+$toolVersions = Get-Content -LiteralPath (Join-Path $repoRoot 'tool-versions.json') -Raw | ConvertFrom-Json
+$mcpbPackage = "$($toolVersions.tools.mcpb_cli.package)@$($toolVersions.tools.mcpb_cli.version)"
+
+# The repository lives in OneDrive. Staging and package output are rebuildable
+# and must not be synced: this is the same rule that kept 124 GB of Cargo output
+# out of the source tree.
+$packageCacheRoot = if ($env:ELIOT_PACKAGE_ROOT) {
+    $env:ELIOT_PACKAGE_ROOT
+} else {
+    Join-Path $env:LOCALAPPDATA 'Eliot\packages'
+}
+$targetRoot = Join-Path $packageCacheRoot 'claude-desktop-mcpb\eliot-governor'
 $targetParent = [System.IO.Path]::GetFullPath((Split-Path $targetRoot -Parent))
-$distRoot = Join-Path $repoRoot 'dist\claude'
+$distRoot = Join-Path $packageCacheRoot 'claude'
 
 if (-not $GovernorExe) {
-    $GovernorExe = Join-Path $repoRoot 'target\release\eliot-governor.exe'
+    # Cargo output is redirected out of OneDrive, so an in-repo `target\` is no
+    # longer where the release binary lands. Ask Cargo where it actually is.
+    $cargoTargetDir = $env:CARGO_TARGET_DIR
+    if (-not $cargoTargetDir) {
+        $cargoConfig = Join-Path $repoRoot '.cargo\config.toml'
+        if (Test-Path -LiteralPath $cargoConfig) {
+            $match = Select-String -LiteralPath $cargoConfig -Pattern '^\s*target-dir\s*=\s*"(.+)"' | Select-Object -First 1
+            if ($match) { $cargoTargetDir = $match.Matches[0].Groups[1].Value }
+        }
+    }
+    if (-not $cargoTargetDir) { $cargoTargetDir = Join-Path $repoRoot 'target' }
+    $GovernorExe = Join-Path $cargoTargetDir 'release\eliot-governor.exe'
 }
 $GovernorExe = [System.IO.Path]::GetFullPath($GovernorExe)
 if (-not (Test-Path -LiteralPath $GovernorExe -PathType Leaf)) {
@@ -66,9 +92,9 @@ function Invoke-Mcpb {
     if ($McpbCli) {
         & $McpbCli @Arguments
     } elseif ($PnpmCli) {
-        & $PnpmCli dlx '@anthropic-ai/mcpb@latest' @Arguments
+        & $PnpmCli dlx $mcpbPackage @Arguments
     } else {
-        & $NpxCli --yes '@anthropic-ai/mcpb@latest' @Arguments
+        & $NpxCli --yes $mcpbPackage @Arguments
     }
     if ($LASTEXITCODE -ne 0) {
         throw "mcpb $($Arguments -join ' ') failed with exit code $LASTEXITCODE"
@@ -79,9 +105,9 @@ function Get-McpbVersion {
     if ($McpbCli) {
         $output = @(& $McpbCli --version)
     } elseif ($PnpmCli) {
-        $output = @(& $PnpmCli dlx '@anthropic-ai/mcpb@latest' --version)
+        $output = @(& $PnpmCli dlx $mcpbPackage --version)
     } else {
-        $output = @(& $NpxCli --yes '@anthropic-ai/mcpb@latest' --version)
+        $output = @(& $NpxCli --yes $mcpbPackage --version)
     }
     if ($LASTEXITCODE -ne 0) {
         throw "mcpb --version failed with exit code $LASTEXITCODE"
@@ -90,6 +116,13 @@ function Get-McpbVersion {
 }
 
 $mcpbVersion = Get-McpbVersion
+# A pin that is never checked is a comment. If an explicitly supplied CLI or a
+# cached package runner resolves to something else, the package was not built
+# with the toolchain this repository claims, and the build says so.
+$pinnedMcpbVersion = $toolVersions.tools.mcpb_cli.version
+if ($mcpbVersion -ne $pinnedMcpbVersion) {
+    throw "MCPB CLI version mismatch: tool-versions.json pins $pinnedMcpbVersion but the packager reports $mcpbVersion"
+}
 $stagedGovernor = Join-Path $targetRoot 'server\eliot-governor.exe'
 $buildManifest = [ordered]@{
     schema_version = 'eliot-claude-desktop-build-v1'
@@ -138,9 +171,9 @@ $report = [ordered]@{
     packager = if ($McpbCli) {
         $McpbCli
     } elseif ($PnpmCli) {
-        "$PnpmCli dlx @anthropic-ai/mcpb@latest"
+        "$PnpmCli dlx $mcpbPackage"
     } else {
-        "$NpxCli --yes @anthropic-ai/mcpb@latest"
+        "$NpxCli --yes $mcpbPackage"
     }
     generated_at = [DateTimeOffset]::UtcNow.ToString('O')
 }

@@ -1,0 +1,12 @@
+{
+  "$comment": "Exact external build tools. A moving version is not a build input we control: the same source must not silently produce different package bytes because a registry moved on.",
+  "schema_version": "eliot-tool-versions-v1",
+  "tools": {
+    "mcpb_cli": {
+      "package": "@anthropic-ai/mcpb",
+      "version": "2.1.2",
+      "purpose": "Builds and validates the Claude Desktop MCPB package.",
+      "verified_on": "2026-07-21"
+    }
+  }
+}

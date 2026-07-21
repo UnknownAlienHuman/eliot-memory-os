@@ -461,7 +461,7 @@ enum McpAccessProfile {
     CognitiveChild,
     CognitiveControl,
     DynamicAgent,
-    ClaudeDesktop,
+    ClaudeGoverned,
     CodexController,
     CodexWorker,
     ExternalAuditor,
@@ -478,7 +478,11 @@ impl McpAccessProfile {
             "cognitive_child" => Ok(Self::CognitiveChild),
             "cognitive_control" => Ok(Self::CognitiveControl),
             "dynamic_agent" | "agent_host" => Ok(Self::DynamicAgent),
-            "claude_desktop" => Ok(Self::ClaudeDesktop),
+            // `claude_desktop` is the retired spelling. Claude Code shares this
+            // profile with Claude Desktop, so naming it after one UI product
+            // misdescribed the other. Still parsed: it is present in persisted
+            // session bindings and receipts written before the rename.
+            "claude_governed" | "claude_desktop" => Ok(Self::ClaudeGoverned),
             "default" | "codex_controller" => Ok(Self::CodexController),
             "codex_worker" => Ok(Self::CodexWorker),
             "antigravity-auditor" | "external_auditor" => Ok(Self::ExternalAuditor),
@@ -496,7 +500,7 @@ impl McpAccessProfile {
             Self::CognitiveChild => "cognitive_child",
             Self::CognitiveControl => "cognitive_control",
             Self::DynamicAgent => "dynamic_agent",
-            Self::ClaudeDesktop => "claude_desktop",
+            Self::ClaudeGoverned => "claude_governed",
             Self::CodexController => "codex_controller",
             Self::CodexWorker => "codex_worker",
             Self::ExternalAuditor => "external_auditor",
@@ -529,7 +533,7 @@ impl McpAccessProfile {
                     )
             }
             Self::CodexController => GOVERNED_TOOLS.contains(&name),
-            Self::ClaudeDesktop => CLAUDE_DESKTOP_TOOLS.contains(&name),
+            Self::ClaudeGoverned => CLAUDE_DESKTOP_TOOLS.contains(&name),
             Self::CodexWorker => {
                 GOVERNED_TOOLS.contains(&name)
                     && !is_l11_control_mutation(name)
@@ -592,7 +596,7 @@ pub async fn run(
         "cognitive_control"
     } else {
         match host {
-            Some("claude" | "claude-desktop") => "claude_desktop",
+            Some("claude" | "claude-desktop") => "claude_governed",
             Some(_) => "dynamic_agent",
             None => profile,
         }
@@ -953,7 +957,7 @@ impl McpDaemon {
                 schema_ready: OnceCell::new(),
                 control_wal: config.control_wal.clone(),
                 blob_store: config.blob_store.clone(),
-                profile: McpAccessProfile::ClaudeDesktop,
+                profile: McpAccessProfile::ClaudeGoverned,
                 writer: writer.clone(),
                 pipe_name: pipe_name.clone(),
                 instance_name: publication.instance_name.clone(),
@@ -1082,7 +1086,7 @@ impl McpDaemon {
             McpAccessProfile::CognitiveChild => &self.cognitive_child,
             McpAccessProfile::CognitiveControl => &self.cognitive_control,
             McpAccessProfile::DynamicAgent => &self.dynamic_agent,
-            McpAccessProfile::ClaudeDesktop => &self.claude_desktop,
+            McpAccessProfile::ClaudeGoverned => &self.claude_desktop,
             McpAccessProfile::CodexController => &self.codex_controller,
             McpAccessProfile::CodexWorker => &self.codex_worker,
             McpAccessProfile::ExternalAuditor => &self.external_auditor,
@@ -23317,7 +23321,7 @@ fn profile_instructions(profile: McpAccessProfile) -> String {
         McpAccessProfile::HumanOperator | McpAccessProfile::HumanReadonly => {
             "Use the bounded operator projections and typed commands only. The Governor remains the sole business-rule and memory authority; do not request raw records, database access, credentials, shell, or hidden reasoning."
         }
-        McpAccessProfile::ClaudeDesktop => {
+        McpAccessProfile::ClaudeGoverned => {
             "For a material project task, resolve one stable project identity, read task/current state, and expand only the exact memory or packet handles needed for the decision. Record cross-memory influence explicitly and submit only novel candidate evidence with a retry-stable write ID. Use delegation and disposition tools only when the current task-scoped role lease authorizes them; this compact profile intentionally omits direct patch, provider, database, and completion authority."
         }
         _ => {
@@ -23337,7 +23341,7 @@ fn profile_instructions(profile: McpAccessProfile) -> String {
         McpAccessProfile::CognitiveControl => {
             "This sealed memory-free control profile exposes an empty MCP tool catalog."
         }
-        McpAccessProfile::DynamicAgent | McpAccessProfile::ClaudeDesktop => {
+        McpAccessProfile::DynamicAgent | McpAccessProfile::ClaudeGoverned => {
             "Your host identity grants no controller, worker, auditor, verifier, patch, or completion role. Any such role is task-scoped and must be evidenced by eliot_host_session_status plus a current Eliot role/work lease. When that status reports governor_bound_scope_active, call project identity and task/current-memory tools without inventing or restating project/task identifiers; the Governor supplies the bound scope and rejects PROJECT_SCOPE_MISMATCH or TASK_SCOPE_MISMATCH. Never derive scope from a case label, current directory, playground, or host UI. Never infer your role from host-specific Antigravity visibility, provider status, old invocation receipts, or memory history. Use the governed tools directly for proactive recall, candidate writeback, and task work; do not wait for repeated user prompting."
         }
         McpAccessProfile::ExternalAuditor => {
@@ -23847,7 +23851,7 @@ fn agent_broker_tool_definitions() -> Vec<Value> {
 pub(crate) fn claude_surface_catalog(surface: ClaudeSurface) -> Value {
     let profile = match surface {
         ClaudeSurface::ClaudeCodePlugin | ClaudeSurface::ClaudeDesktopMcpb => {
-            McpAccessProfile::ClaudeDesktop
+            McpAccessProfile::ClaudeGoverned
         }
     };
     let mut tools = tool_definitions_for_profile(profile)
@@ -33868,6 +33872,38 @@ mod catalog_parity_tests {
         );
         assert_eq!(code["supports_lifecycle_hooks"], Value::Bool(true));
         assert_eq!(desktop["supports_lifecycle_hooks"], Value::Bool(false));
+    }
+
+    /// The profile Claude Code and Claude Desktop share was named after one of
+    /// them. Records written under the retired spelling must keep loading, but
+    /// it is never what the Governor writes back.
+    #[test]
+    fn the_retired_profile_spelling_reads_but_is_never_emitted()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let from_retired = super::McpAccessProfile::parse("claude_desktop")?;
+        let from_current = super::McpAccessProfile::parse("claude_governed")?;
+        assert_eq!(
+            from_retired, from_current,
+            "both spellings name one profile"
+        );
+        assert_eq!(from_retired.as_str(), "claude_governed");
+        assert_ne!(from_retired.as_str(), "claude_desktop");
+        Ok(())
+    }
+
+    /// The catalog is what package generation reads, so it must report the
+    /// profile under its current name.
+    #[test]
+    fn the_catalog_reports_the_semantic_profile_name() {
+        for surface in [
+            ClaudeSurface::ClaudeCodePlugin,
+            ClaudeSurface::ClaudeDesktopMcpb,
+        ] {
+            assert_eq!(
+                claude_surface_catalog(surface)["access_profile"],
+                Value::String("claude_governed".to_owned())
+            );
+        }
     }
 
     /// Sorted output keeps generated manifests byte-stable across runs.
