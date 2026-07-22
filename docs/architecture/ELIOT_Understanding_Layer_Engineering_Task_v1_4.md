@@ -1224,17 +1224,19 @@ This scenario is the behavior contract. If the implemented system cannot reprodu
 
 ---
 
-# Part B — Audit alignment addendum (v1.1, normative)
+# Part B — Implementation alignment addendum (normative)
 
-Part A was written against the Rust Governor architecture document. The 2026-07-19 audit examined the **implemented** system (135k LoC, 5 crates, live MCPB plugin, SurrealDB 3.1.4 server, phase L14 `ARCHITECTURE_COMPLETE_UNCERTIFIED`). Part B binds Part A to that reality. Precedence: **B over A**; canon guard-list (B5.4) over both.
+Part A was written against the Rust Governor architecture document. Part B binds it to the implemented system. Precedence: **B over A**; canon guard-list (B5.4) over both.
 
-## B1. Implemented-system snapshot (audit-Verified facts UL relies on)
+The prerequisites below are stated as architectural conditions, not as a status report. Whether any given one currently holds is a question for the code and the runtime's own doctor output, not for this document -- a specification that carries a snapshot becomes a progress diary and starts lying the moment the system moves.
+
+## B1. Prerequisites the Understanding Layer depends on
 
 ```text
-WORKS (build on it):
+MAY BE RELIED ON (the Understanding Layer builds on these):
   authenticated sessions, honest no_task_role_granted, lease authority model;
   candidate-only writes; promotion only via verifiers; anti-falsification of
-    influence (downstream_outcome_ref gate, cognition.rs:300-310);
+    influence (downstream_outcome_ref gate);
   revision fences on every response; single WriterActor on bounded mpsc;
   three storage classes live (Surreal server/RocksDB, redb WAL, BlobStore);
   blake3-pinned registered verifiers; clean fmt/check/clippy; crate-boundary
@@ -1243,7 +1245,8 @@ WORKS (build on it):
   L3 compiler honestly reports insufficiency; causal-bridge hop math is real;
   protected DecisionLocalitySuffix survives budget cuts.
 
-BROKEN OR ABSENT (UL must not assume it):
+MUST NOT BE ASSUMED (the Understanding Layer provides for its own
+absence, and must degrade honestly where a capability is missing):
   P0-1 recall L0 = exact-phrase substring over claim_card only; questions get
        false no_useful_memory; considered/returned funnel is theater;
   P0-2 need-logic circular (unread candidate_handles counted as evidence),
@@ -1252,20 +1255,20 @@ BROKEN OR ABSENT (UL must not assume it):
   P0-4 language blindness in need heuristics;
   P1-1 observability writes (influence trace) not idempotent, move memory_revision;
   P1-2 at least one host write path destroys Cyrillic (UTF-8 → '?');
-  P1-3 published MCP schemas lie vs serde reality (16-field material_frame,
-       ~14-field trace discovered by error archaeology);
+  P1-3 published MCP schemas lie vs serde reality ;
   P1-4 top-level packet_id overwritten by constant task ref;
   P1-5 duplicates unsuppressed; correction annotations create no edges;
   P1-6 relation graph EMPTY on live paths (0 edges in project memory);
-  P1-7 double MCP server registration (global + plugin);
-  0 promoted claims in 395 revisions; memory polluted by nonce probes;
+  promotion may have produced no claims at all; memory may contain probe residue;
   all canonical tables SCHEMALESS (validation Rust-side only);
-  eliot-app monoliths: mcp_stdio.rs 33k / commands.rs 19k / host_runtime.rs 7.8k.
+  application-layer modules large enough that a change can be hard to place.
 ```
 
 ## B2. Terminology and surface mapping
 
-Part A used architecture-document names. Bind them to the implemented 12-tool MCPB surface **by capability, not by name**. Observed mapping:
+Part A used architecture-document names. Bind them to the implemented MCP surface **by capability, not by name**. The
+authoritative list of tools is the Governor catalog (`mcp catalog`), not this
+table, which maps concepts rather than enumerating a surface:
 
 | Part A / arch doc | Implemented (observed in audit) |
 |---|---|
