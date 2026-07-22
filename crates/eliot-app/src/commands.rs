@@ -2051,7 +2051,7 @@ fn write_runtime_bundle(
     let (runtime_report_path, _) = report_service.write_latest(
         "runtime",
         &runtime_report,
-        &phase_closeout_markdown("Runtime Report", &runtime_report),
+        &report_markdown("Runtime Report", &runtime_report),
     )?;
 
     let module_report = module_registry(config_path)?.report();
@@ -2177,7 +2177,7 @@ fn read_module_manifest(path: &Path) -> Result<ModuleManifest> {
 
 fn typed_report_markdown<T: serde::Serialize>(title: &str, report: &T) -> Result<String> {
     let value = serde_json::to_value(report)?;
-    Ok(phase_closeout_markdown(title, &value))
+    Ok(report_markdown(title, &value))
 }
 
 pub async fn run_db_start(config_path: &Path) -> Result<()> {
@@ -2477,7 +2477,7 @@ pub fn run_memory_lifecycle_propose(
             .join("memory-lifecycle")
             .join("latest.md"),
         &report,
-        &phase_closeout_markdown("Memory Lifecycle Proposal", &report),
+        &report_markdown("Memory Lifecycle Proposal", &report),
     )?;
     write_json(&report)
 }
@@ -2518,7 +2518,7 @@ pub async fn run_memory_lifecycle_apply(config_path: &Path, policy_id: &str) -> 
             .join("memory-lifecycle")
             .join("latest.md"),
         &report,
-        &phase_closeout_markdown("Memory Lifecycle Apply", &report),
+        &report_markdown("Memory Lifecycle Apply", &report),
     )?;
     write_json(&report)
 }
@@ -4036,7 +4036,7 @@ pub fn run_blackboard_list(config_path: &Path, project: &str, task: &str) -> Res
         &root.join("reports").join("blackboard").join("latest.json"),
         &root.join("reports").join("blackboard").join("latest.md"),
         &report,
-        &phase_closeout_markdown("Blackboard Report", &report),
+        &report_markdown("Blackboard Report", &report),
     )?;
     write_json(&report)
 }
@@ -4117,7 +4117,7 @@ pub fn run_mailbox_inbox(config_path: &Path, project: &str, task: &str) -> Resul
         &root.join("reports").join("mailbox").join("latest.json"),
         &root.join("reports").join("mailbox").join("latest.md"),
         &report,
-        &phase_closeout_markdown("Mailbox Report", &report),
+        &report_markdown("Mailbox Report", &report),
     )?;
     write_json(&report)
 }
@@ -4198,7 +4198,7 @@ pub fn run_recovery_report(config_path: &Path, latest: bool) -> Result<()> {
         &root.join("reports").join("recovery").join("latest.json"),
         &root.join("reports").join("recovery").join("latest.md"),
         &report,
-        &phase_closeout_markdown("Recovery Report", &report),
+        &report_markdown("Recovery Report", &report),
     )?;
     write_json(&report)
 }
@@ -4239,7 +4239,7 @@ pub fn run_collective_report(config_path: &Path, latest: bool) -> Result<()> {
         &root.join("reports").join("collective").join("latest.json"),
         &root.join("reports").join("collective").join("latest.md"),
         &report,
-        &phase_closeout_markdown("Collective Trace Report", &report),
+        &report_markdown("Collective Trace Report", &report),
     )?;
     write_json(&report)
 }
@@ -5638,28 +5638,28 @@ fn save_collective_reports(
         &root.join("reports").join("blackboard").join("latest.json"),
         &root.join("reports").join("blackboard").join("latest.md"),
         &blackboard,
-        &phase_closeout_markdown("Blackboard Report", &blackboard),
+        &report_markdown("Blackboard Report", &blackboard),
     )?;
     let mailbox = mailbox_report_value(state, project, task);
     write_report_pair(
         &root.join("reports").join("mailbox").join("latest.json"),
         &root.join("reports").join("mailbox").join("latest.md"),
         &mailbox,
-        &phase_closeout_markdown("Mailbox Report", &mailbox),
+        &report_markdown("Mailbox Report", &mailbox),
     )?;
     let recovery = recovery_report_value(state, project, task);
     write_report_pair(
         &root.join("reports").join("recovery").join("latest.json"),
         &root.join("reports").join("recovery").join("latest.md"),
         &recovery,
-        &phase_closeout_markdown("Recovery Report", &recovery),
+        &report_markdown("Recovery Report", &recovery),
     )?;
     let collective = collective_report_value(state, project, task);
     write_report_pair(
         &root.join("reports").join("collective").join("latest.json"),
         &root.join("reports").join("collective").join("latest.md"),
         &collective,
-        &phase_closeout_markdown("Collective Trace Report", &collective),
+        &report_markdown("Collective Trace Report", &collective),
     )
 }
 
@@ -7102,7 +7102,7 @@ fn write_verifier_report(root: &Path, plan_ref: &str, verifier_runs: &[VerifierR
         &root.join("reports").join("verifier").join("latest.json"),
         &root.join("reports").join("verifier").join("latest.md"),
         &report,
-        &phase_closeout_markdown("Verifier Report", &report),
+        &report_markdown("Verifier Report", &report),
     )
 }
 
@@ -7284,7 +7284,9 @@ fn graph_health_markdown(report: &eliot_types::GraphHealthResponse) -> String {
     )
 }
 
-fn phase_closeout_markdown(title: &str, report: &serde_json::Value) -> String {
+/// Renders a report as Markdown. Named for the phase closeouts it used to
+/// render; those commands are gone and this is the generic renderer.
+fn report_markdown(title: &str, report: &serde_json::Value) -> String {
     let mut output = format!("# {title}\n\n");
     if let Some(checks) = report.get("checks").and_then(serde_json::Value::as_object) {
         for (name, status) in checks {

@@ -61,7 +61,7 @@ jobs:
       - name: Repository-only integration tests
         run: |
           cargo test -p eliot-engine --test verification_gates
-          cargo test -p eliot-engine --test phase_l7_host_integration
-          cargo test -p eliot-engine --test phase_f3_collective
-          cargo test -p eliot-engine --test phase_g0_runtime
-          cargo test -p eliot-engine --test phase_h0_safety
+          cargo test -p eliot-engine --test host_integration
+          cargo test -p eliot-engine --test collective_blackboard
+          cargo test -p eliot-engine --test runtime_services
+          cargo test -p eliot-engine --test safety_and_backup
