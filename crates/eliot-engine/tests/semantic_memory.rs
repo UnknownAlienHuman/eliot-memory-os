@@ -288,7 +288,7 @@ fn task_meaning_requires_intent_to_verifier_bridge() {
         control_data_state_path: vec!["task -> packet -> verifier".to_owned()],
         current_evidence: vec!["file:semantic_memory.rs".to_owned()],
         predicted_observable: "experience prior appears separately".to_owned(),
-        verifier_need: "phase_l9_semantic_memory".to_owned(),
+        verifier_need: "semantic_memory".to_owned(),
         ..TaskMeaningFrame::default()
     };
     assert!(TaskMeaningService::bridge_quality(&frame).decision_sufficient);

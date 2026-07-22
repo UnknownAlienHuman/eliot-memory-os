@@ -1732,7 +1732,7 @@ impl EvalMemoryWriter {
                 session_id: None,
                 project_id,
                 task_id,
-                scope: "phase-k0-eval-harness".to_owned(),
+                scope: "eval-suites-harness".to_owned(),
                 authority: "local-eval-harness".to_owned(),
                 visibility: Visibility::Internal,
                 taint: TaintClass::Unknown,

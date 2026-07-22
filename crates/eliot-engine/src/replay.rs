@@ -1242,7 +1242,7 @@ impl ReplayMemoryWriter {
                 session_id: None,
                 project_id,
                 task_id,
-                scope: "phase-j0-replay-sleep".to_owned(),
+                scope: "replay-and-sleep".to_owned(),
                 authority: "local-replay-sleep".to_owned(),
                 visibility: Visibility::Internal,
                 taint: TaintClass::Unknown,

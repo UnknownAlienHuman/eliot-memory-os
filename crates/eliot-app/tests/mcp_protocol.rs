@@ -471,7 +471,7 @@ fn procedure_candidate_disposition_is_canonical_idempotent_and_never_activates()
         "source_trace_refs": ["experience-case:one", "experience-case:two"],
         "replay_result_refs": [],
         "success_count": 0, "failure_count": 0, "last_verified_at": null,
-        "version": "candidate-v1", "owner": "phase_c_mcp_stdio",
+        "version": "candidate-v1", "owner": "mcp_protocol",
         "created_at": "2026-07-16T00:00:00Z",
         "updated_at": "2026-07-16T00:00:00Z"
     });
@@ -5948,7 +5948,7 @@ fn seed_operator_cursor_records(project_id: &str, task_id: &str, count: usize) -
                 disposition: "denied_test_fixture".to_owned(),
                 exact_action_hash: None,
                 reason_or_evidence_refs: vec!["isolated-cursor-restart-test".to_owned()],
-                requested_by: "phase_c_mcp_stdio".to_owned(),
+                requested_by: "mcp_protocol".to_owned(),
                 created_at,
                 canonical_receipt: None,
             };
@@ -5959,7 +5959,7 @@ fn seed_operator_cursor_records(project_id: &str, task_id: &str, count: usize) -
                 payload: json!({
                     "receipt_kind": "operator_control_request",
                     "receipt_body": body,
-                    "writer_path": "phase_c_mcp_stdio::seed_operator_cursor_records"
+                    "writer_path": "mcp_protocol::seed_operator_cursor_records"
                 }),
             }
         })
@@ -6029,7 +6029,7 @@ fn seed_m2_canonical_noise(
                 payload: json!({
                     "receipt_kind": receipt_kind,
                     "receipt_body": body,
-                    "writer_path": "phase_c_mcp_stdio::seed_m2_canonical_noise"
+                    "writer_path": "mcp_protocol::seed_m2_canonical_noise"
                 }),
             }
         })
@@ -8158,13 +8158,13 @@ fn mcp_compile_packet_and_gates_generate_reports() -> TestResult {
             "goal": "prove MCP report path",
             "changed_files": ["crates/eliot-app/src/mcp_stdio.rs"],
             "memory_refs_used": [],
-            "checks_run": ["cargo test -p eliot-app --test phase_c_mcp_stdio"],
+            "checks_run": ["cargo test -p eliot-app --test mcp_protocol"],
             "checks_not_run": [],
             "acceptance_items": [{
                 "item": "mcp reports generated",
                 "status": "verified",
                 "evidence": "MCP tool calls returned success",
-                "verifier": "phase_c_mcp_stdio",
+                "verifier": "mcp_protocol",
                 "residual_uncertainty": "none"
             }],
             "evidence": ["MCP compile/gate/completion calls succeeded"],

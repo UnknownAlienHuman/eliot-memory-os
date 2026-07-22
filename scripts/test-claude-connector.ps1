@@ -195,7 +195,7 @@ try {
         $env:ELIOT_GOVERNOR_CONFIG = Join-Path $repoRoot '.eliot-governor\config\governor.toml'
         $env:ELIOT_GOVERNOR_PLUGIN_ROOT = Join-Path $repoRoot 'plugin\eliot-governor'
         try {
-            Invoke-NativeChecked 'cargo' @('test', '-p', 'eliot-app', '--test', 'phase_f0_plugin_hooks', '--', '--nocapture', '--test-threads=1') 'Claude plugin hook tests' | Out-Null
+            Invoke-NativeChecked 'cargo' @('test', '-p', 'eliot-app', '--test', 'plugin_hooks', '--', '--nocapture', '--test-threads=1') 'Claude plugin hook tests' | Out-Null
         }
         finally {
             if ($null -eq $previousGovernorConfig) {
@@ -209,18 +209,18 @@ try {
                 $env:ELIOT_GOVERNOR_PLUGIN_ROOT = $previousPluginRoot
             }
         }
-        Add-PassedStep 'claude_plugin_hook_tests' @{ command = 'cargo test -p eliot-app --test phase_f0_plugin_hooks -- --nocapture --test-threads=1' }
+        Add-PassedStep 'claude_plugin_hook_tests' @{ command = 'cargo test -p eliot-app --test plugin_hooks -- --nocapture --test-threads=1' }
 
         $testPasswordRoot = Join-Path $env:LOCALAPPDATA 'Eliot\tests\claude-connector'
         New-Item -ItemType Directory -Path $testPasswordRoot -Force | Out-Null
         $env:ELIOT_TEST_SURREAL_PASSWORD_FILE = Join-Path $testPasswordRoot 'surreal-password.txt'
         try {
-            Invoke-NativeChecked 'cargo' @('test', '-p', 'eliot-app', '--test', 'phase_l5_memory_os_multi_agent_access', 'facade_reconnects_after_rotation_and_replay_does_not_duplicate_memory', '--', '--exact', '--nocapture', '--test-threads=1') 'Claude facade reconnect test' | Out-Null
+            Invoke-NativeChecked 'cargo' @('test', '-p', 'eliot-app', '--test', 'multi_agent_access', 'facade_reconnects_after_rotation_and_replay_does_not_duplicate_memory', '--', '--exact', '--nocapture', '--test-threads=1') 'Claude facade reconnect test' | Out-Null
         }
         finally {
             Remove-Item Env:ELIOT_TEST_SURREAL_PASSWORD_FILE -ErrorAction SilentlyContinue
         }
-        Add-PassedStep 'claude_facade_reconnect_test' @{ command = 'cargo test -p eliot-app --test phase_l5_memory_os_multi_agent_access facade_reconnects_after_rotation_and_replay_does_not_duplicate_memory -- --exact --nocapture --test-threads=1' }
+        Add-PassedStep 'claude_facade_reconnect_test' @{ command = 'cargo test -p eliot-app --test multi_agent_access facade_reconnects_after_rotation_and_replay_does_not_duplicate_memory -- --exact --nocapture --test-threads=1' }
     }
 
     New-Item -ItemType Directory -Path $reportRoot -Force | Out-Null

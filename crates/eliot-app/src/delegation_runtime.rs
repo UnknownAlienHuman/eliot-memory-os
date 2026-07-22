@@ -197,7 +197,7 @@ pub fn ensure_l1c_read_only_work_lease(
                     project_id,
                     task_id,
                     project: "eliot-governor".to_owned(),
-                    task: "phase-l1c-integrity-canary".to_owned(),
+                    task: "integrity-canary".to_owned(),
                     goal: "Read-only audit of the sealed L1B-R provider-budget integrity baseline"
                         .to_owned(),
                     scope: default_work_scope(

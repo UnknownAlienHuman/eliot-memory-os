@@ -475,7 +475,7 @@ migrations_dir = "$migrationsPath"
         '--final-status-level', 'fail', '--failure-output', 'immediate'
     )
     if ($McpOnly) {
-        $nextestArgs += @('-p', 'eliot-app', '--test', 'phase_c_mcp_stdio')
+        $nextestArgs += @('-p', 'eliot-app', '--test', 'mcp_protocol')
     }
     elseif ($TestBinary) {
         $nextestArgs += @('-p', $TestPackage, '--test', $TestBinary)

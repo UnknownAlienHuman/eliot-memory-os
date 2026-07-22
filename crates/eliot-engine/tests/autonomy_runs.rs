@@ -417,7 +417,7 @@ fn completion_proof(project_id: ProjectId, task_id: TaskId) -> CompletionProof {
         acceptance_items: vec![CompletionAcceptanceItem {
             item: "focused tests pass".to_owned(),
             status: "verified".to_owned(),
-            evidence: "phase_l12_autonomy".to_owned(),
+            evidence: "autonomy_runs".to_owned(),
             verifier: "cargo test".to_owned(),
             residual_uncertainty: String::new(),
         }],

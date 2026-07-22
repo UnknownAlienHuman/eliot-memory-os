@@ -607,7 +607,7 @@ fn context(project_id: ProjectId, write_id: Option<WriteId>) -> CommandContext {
         session_id: None,
         project_id,
         task_id: Some(TaskId::new_v7()),
-        scope: "phase-b-closeout-test".to_owned(),
+        scope: "write-idempotency-and-recovery-test".to_owned(),
         authority: "local-test".to_owned(),
         visibility: Visibility::Internal,
         taint: TaintClass::LocalVerified,

@@ -308,7 +308,7 @@ async fn patch_runner_requires_active_work_lease() -> TestResult {
 
 #[tokio::test]
 async fn patch_runner_denies_file_outside_work_lease() -> TestResult {
-    let mut bundle = PatchBundle::new("phase-f1-work-outside", value_diff("2"))?;
+    let mut bundle = PatchBundle::new("work-lease-outside", value_diff("2"))?;
     bundle.work_lease.scope.write_set = vec!["src/other.rs".to_owned()];
     let run = bundle
         .runner()

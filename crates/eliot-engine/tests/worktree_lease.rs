@@ -793,7 +793,7 @@ impl Bundle {
             .parent()
             .and_then(Path::parent)
             .unwrap_or_else(|| Path::new("."))
-            .join("phase-f2-worktrees")
+            .join("worktree-leases")
             .join(name);
         if worktree_root.exists() {
             fs::remove_dir_all(&worktree_root)?;

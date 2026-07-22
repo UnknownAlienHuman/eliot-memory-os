@@ -605,7 +605,7 @@ impl CampaignIntegrityReconciliationService {
                 "report, replay and closeout remain observation-only".to_owned(),
             ],
             regression_test_refs: vec![
-                "phase_l1b_r_provider_budget_integrity".to_owned(),
+                "provider_budget_integrity".to_owned(),
                 "provider_call_concurrency".to_owned(),
                 "provider_call_crash_recovery".to_owned(),
             ],

@@ -42,7 +42,7 @@ const READ_SET: [&str; 7] = [
     "crates/eliot-engine/src/delegation.rs",
     "crates/eliot-engine/src/delegation_calibration.rs",
     "crates/eliot-app/src/delegation_runtime.rs",
-    "crates/eliot-engine/tests/phase_l1b_r_provider_budget_integrity.rs",
+    "crates/eliot-engine/tests/provider_budget_integrity.rs",
     "docs/ARCHITECTURE_CONTRACT.md",
     "Justfile",
     ".eliot-governor/reports",
@@ -931,7 +931,7 @@ fn collect_frozen_inputs(project_root: &Path, root: &Path) -> Result<Vec<FrozenI
         "crates/eliot-engine/src/delegation.rs",
         "crates/eliot-engine/src/delegation_calibration.rs",
         "crates/eliot-app/src/delegation_runtime.rs",
-        "crates/eliot-engine/tests/phase_l1b_r_provider_budget_integrity.rs",
+        "crates/eliot-engine/tests/provider_budget_integrity.rs",
         "docs/ARCHITECTURE_CONTRACT.md",
     ] {
         inputs.push(file_digest(project_root, path)?);

@@ -607,7 +607,7 @@ fn evidence(result: IndependentEvidenceResult) -> IndependentOutcomeEvidence {
         evidence_kind: IndependentEvidenceKind::Verifier,
         producer_identity: "cargo-nextest".to_owned(),
         independent_from_provider: true,
-        scope: "phase_l1b_delegation_utility".to_owned(),
+        scope: "delegation_utility".to_owned(),
         observed_at: OffsetDateTime::now_utc(),
         exact_anchor_refs: vec!["verification:phase-l1b".to_owned()],
         result,

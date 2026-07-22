@@ -342,7 +342,7 @@ fn curated_test_metadata() -> Vec<TestMetadata> {
         test(
             "mcp_tools_list_contains_only_governed_tools",
             "eliot-app",
-            "phase_c_mcp_stdio",
+            "mcp_protocol",
             TestKind::McpBoundary,
             TestIntent::BoundarySecurity,
             Some("phase-c"),
@@ -353,7 +353,7 @@ fn curated_test_metadata() -> Vec<TestMetadata> {
         test(
             "mcp_exposes_no_raw_sql_tool",
             "eliot-app",
-            "phase_c_mcp_stdio",
+            "mcp_protocol",
             TestKind::McpBoundary,
             TestIntent::BoundarySecurity,
             Some("phase-c"),
@@ -364,7 +364,7 @@ fn curated_test_metadata() -> Vec<TestMetadata> {
         test(
             "codecortex_report_written_to_memory",
             "eliot-engine",
-            "phase_d1_codecortex",
+            "codecortex",
             TestKind::Integration,
             TestIntent::StatefulDbSafety,
             Some("phase-d1"),
@@ -375,7 +375,7 @@ fn curated_test_metadata() -> Vec<TestMetadata> {
         test(
             "external_result_written_through_writer_actor",
             "eliot-engine",
-            "phase_g2_external_review",
+            "external_review",
             TestKind::Integration,
             TestIntent::ExternalProviderSafety,
             Some("phase-g2"),
@@ -386,7 +386,7 @@ fn curated_test_metadata() -> Vec<TestMetadata> {
         test(
             "phase_minimal_gate_passes",
             "eliot-engine",
-            "phase_k1_eval",
+            "eval_baselines",
             TestKind::EvalCase,
             TestIntent::BehaviorEval,
             Some("phase-k1"),
@@ -397,7 +397,7 @@ fn curated_test_metadata() -> Vec<TestMetadata> {
         test(
             "provider_integration_gate_requires_taint_tool_coverage",
             "eliot-engine",
-            "phase_k1_eval",
+            "eval_baselines",
             TestKind::EvalCase,
             TestIntent::ExternalProviderSafety,
             Some("phase-k1"),
@@ -408,7 +408,7 @@ fn curated_test_metadata() -> Vec<TestMetadata> {
         test(
             "h1_named_pipe_ipc_accepts_valid_and_rejects_invalid_handshake",
             "eliot-engine",
-            "phase_h1_service",
+            "windows_service",
             TestKind::Integration,
             TestIntent::RuntimeServiceSafety,
             Some("phase-h1"),
@@ -419,7 +419,7 @@ fn curated_test_metadata() -> Vec<TestMetadata> {
         test(
             "ten_agent_concurrent_writes_are_governed",
             "eliot-engine",
-            "phase_b_closeout",
+            "write_idempotency_and_recovery",
             TestKind::Integration,
             TestIntent::StatefulDbSafety,
             Some("phase-b"),
@@ -463,7 +463,7 @@ fn curated_test_metadata() -> Vec<TestMetadata> {
         test(
             "metric_definitions_created",
             "eliot-engine",
-            "phase_m0_metrics",
+            "metrics_and_slo",
             TestKind::Unit,
             TestIntent::TypeContract,
             Some("phase-m0"),
@@ -474,7 +474,7 @@ fn curated_test_metadata() -> Vec<TestMetadata> {
         test(
             "runtime_dashboard_generated",
             "eliot-engine",
-            "phase_m0_metrics",
+            "metrics_and_slo",
             TestKind::Unit,
             TestIntent::Regression,
             Some("phase-m0"),
@@ -485,7 +485,7 @@ fn curated_test_metadata() -> Vec<TestMetadata> {
         test(
             "mcp_exposes_only_safe_metrics_tools",
             "eliot-app",
-            "phase_c_mcp_stdio",
+            "mcp_protocol",
             TestKind::McpBoundary,
             TestIntent::BoundarySecurity,
             Some("phase-m0"),
@@ -496,7 +496,7 @@ fn curated_test_metadata() -> Vec<TestMetadata> {
         test(
             "mcp_exposes_no_raw_ingest_remote_export_tools",
             "eliot-app",
-            "phase_c_mcp_stdio",
+            "mcp_protocol",
             TestKind::McpBoundary,
             TestIntent::BoundarySecurity,
             Some("phase-m0"),
@@ -518,7 +518,7 @@ fn curated_test_metadata() -> Vec<TestMetadata> {
         test(
             "windows_resolver_finds_agy_in_path",
             "eliot-engine",
-            "phase_g3a_antigravity",
+            "antigravity_contract",
             TestKind::Integration,
             TestIntent::BoundarySecurity,
             Some("phase-g3a"),
@@ -529,7 +529,7 @@ fn curated_test_metadata() -> Vec<TestMetadata> {
         test(
             "dangerously_skip_permissions_forbidden",
             "eliot-engine",
-            "phase_g3a_antigravity",
+            "antigravity_contract",
             TestKind::Unit,
             TestIntent::BoundarySecurity,
             Some("phase-g3a"),
@@ -540,7 +540,7 @@ fn curated_test_metadata() -> Vec<TestMetadata> {
         test(
             "normalizer_uses_g2_external_review_result",
             "eliot-engine",
-            "phase_g3a_antigravity",
+            "antigravity_contract",
             TestKind::Unit,
             TestIntent::Regression,
             Some("phase-g3a"),
@@ -551,7 +551,7 @@ fn curated_test_metadata() -> Vec<TestMetadata> {
         test(
             "mcp_exposes_only_governed_antigravity_tools",
             "eliot-app",
-            "phase_c_mcp_stdio",
+            "mcp_protocol",
             TestKind::McpBoundary,
             TestIntent::BoundarySecurity,
             Some("phase-g3a"),
@@ -562,7 +562,7 @@ fn curated_test_metadata() -> Vec<TestMetadata> {
         test(
             "mcp_exposes_no_raw_agy_agymcp_login_install_shell_secret_patch_truth_tools",
             "eliot-app",
-            "phase_c_mcp_stdio",
+            "mcp_protocol",
             TestKind::McpBoundary,
             TestIntent::BoundarySecurity,
             Some("phase-g3a"),
