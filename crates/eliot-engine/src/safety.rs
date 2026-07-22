@@ -409,27 +409,44 @@ impl DataRootService {
         })
     }
 
+    /// Every live runtime root must be excluded from Git. A blanket ignore of
+    /// the runtime directory satisfies that for all of them at once, so accept
+    /// it rather than demanding one literal line per subdirectory: the property
+    /// is that live state cannot be committed, not that the file is written a
+    /// particular way.
     pub fn gitignore_excludes_live_roots(repo_root: &Path) -> bool {
         let Ok(content) = fs::read_to_string(repo_root.join(".gitignore")) else {
             return false;
         };
-        [
-            "/.eliot-governor/blobs/",
-            "/.eliot-governor/control/",
-            "/.eliot-governor/control-wal/",
-            "/.eliot-governor/secrets/",
-            "/.eliot-governor/surrealdb-rocks/",
-            "/.eliot-governor/logs/",
-            "/.eliot-governor/runtime/",
-            "/.eliot-governor/tmp/",
-            "/.eliot-governor/backups/",
-            "/.eliot-governor/exports/",
-            "/.eliot-governor/imports/",
-            "/.eliot-governor/incidents/",
-        ]
-        .iter()
-        .all(|entry| content.lines().any(|line| line.trim() == *entry))
+        let lines = content
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty() && !line.starts_with('#'))
+            .collect::<Vec<_>>();
+        let blanket = lines
+            .iter()
+            .any(|line| matches!(*line, ".eliot-governor/" | "/.eliot-governor/"));
+        blanket
+            || Self::LIVE_ROOT_DIRECTORIES.iter().all(|entry| {
+                let explicit = format!("/.eliot-governor/{entry}/");
+                lines.iter().any(|line| *line == explicit)
+            })
     }
+
+    const LIVE_ROOT_DIRECTORIES: [&'static str; 12] = [
+        "blobs",
+        "control",
+        "control-wal",
+        "secrets",
+        "surrealdb-rocks",
+        "logs",
+        "runtime",
+        "tmp",
+        "backups",
+        "exports",
+        "imports",
+        "incidents",
+    ];
 }
 
 pub struct BackupService {

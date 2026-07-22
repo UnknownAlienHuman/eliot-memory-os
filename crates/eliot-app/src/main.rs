@@ -1049,7 +1049,7 @@ enum VerifyCommand {
     },
     CostReport,
     Flake {
-        #[arg(long, default_value = "phase-gate")]
+        #[arg(long, default_value = "change-gate")]
         profile: String,
         #[arg(long, default_value_t = 2)]
         repeat: u64,
@@ -1057,7 +1057,7 @@ enum VerifyCommand {
     DbIsolation,
     Report,
     DevFast,
-    PhaseGate,
+    ChangeGate,
     ProviderGate,
     Full,
 }
@@ -1127,7 +1127,7 @@ enum ReplaySetCommand {
     Create {
         #[arg(long)]
         project: String,
-        #[arg(long, default_value = "phase-j0-smoke")]
+        #[arg(long, default_value = "replay-smoke")]
         name: String,
         #[arg(long)]
         fixed: bool,
@@ -1659,6 +1659,8 @@ enum HostCommand {
     },
     BrokerStatus,
     SkillLint,
+    /// Rewrite every derived host skill package from the canonical bodies.
+    SkillSync,
 }
 
 #[derive(Debug, Subcommand)]
@@ -2573,7 +2575,7 @@ fn dispatch_verify_command(config: &Path, command: VerifyCommand) -> Result<()> 
         VerifyCommand::DbIsolation => commands::run_verify_db_isolation(config),
         VerifyCommand::Report => commands::run_verify_report(config),
         VerifyCommand::DevFast => commands::run_verify_run(config, "dev-fast"),
-        VerifyCommand::PhaseGate => commands::run_verify_run(config, "phase-gate"),
+        VerifyCommand::ChangeGate => commands::run_verify_run(config, "change-gate"),
         VerifyCommand::ProviderGate => commands::run_verify_run(config, "provider-gate"),
         VerifyCommand::Full => commands::run_verify_run(config, "full"),
     }

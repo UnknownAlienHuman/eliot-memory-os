@@ -180,6 +180,127 @@ impl SkillPackService {
     }
 }
 
+/// The two host packages that carry a copy of the canonical skill bodies.
+/// Declared in `skill-pack.manifest.json` as `derived_packages`; kept here so
+/// the sync and the lint cannot disagree about what is derived.
+pub const DERIVED_SKILL_PACKAGES: [&str; 2] = [
+    "integrations/opencode/skills",
+    "integrations/claude/eliot/skills",
+];
+
+const DERIVED_PACKAGE_NOTICE: &str = "\
+# Generated skill copies -- do not edit
+
+Every `SKILL.md` under this directory is a byte-for-byte copy of
+`integrations/agent-skills/<name>/SKILL.md`, written by:
+
+```
+just sync-skills
+```
+
+Edit the canonical body under `integrations/agent-skills` and re-run that
+command. Editing a file here is silently reverted by the next sync, and
+`SkillPackService::lint` fails the build in the meantime.
+";
+
+/// Report of one sync pass: which copies were rewritten and whether the
+/// manifest hashes moved.
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct SkillPackSyncReport {
+    pub rewritten: Vec<String>,
+    pub already_current: Vec<String>,
+    pub manifest_updated: bool,
+    pub pack_hash: String,
+}
+
+impl SkillPackService {
+    /// Rewrites every derived host copy from the canonical body and refreshes
+    /// the manifest hashes. This is the only writer of the derived packages:
+    /// the goal is one editable source, not three that a lint compares.
+    pub fn sync(self, repo_root: &Path) -> Result<SkillPackSyncReport, EngineError> {
+        let canonical_root = repo_root.join("integrations/agent-skills");
+        let mut report = SkillPackSyncReport::default();
+        let mut pack_material = String::new();
+        let mut manifest_skills = Vec::new();
+        let mut listing_characters = 0usize;
+
+        for name in ELIOT_SKILL_NAMES {
+            let body = std::fs::read_to_string(canonical_root.join(name).join("SKILL.md"))?;
+            let hash = canonical_skill_content_hash(&body);
+            if let Some((frontmatter, _)) = split_frontmatter(&body) {
+                listing_characters += frontmatter_value(frontmatter, "description")
+                    .unwrap_or_default()
+                    .chars()
+                    .count();
+            }
+
+            for package in DERIVED_SKILL_PACKAGES {
+                let target_dir = repo_root.join(package).join(name);
+                let target = target_dir.join("SKILL.md");
+                let current = std::fs::read(&target).ok();
+                let label = format!("{package}/{name}/SKILL.md");
+                if current.as_deref() == Some(body.as_bytes()) {
+                    report.already_current.push(label);
+                    continue;
+                }
+                std::fs::create_dir_all(&target_dir)?;
+                std::fs::write(&target, body.as_bytes())?;
+                report.rewritten.push(label);
+            }
+
+            pack_material.push_str(name);
+            pack_material.push(':');
+            pack_material.push_str(&hash);
+            pack_material.push('\n');
+            manifest_skills.push(ManifestSkill {
+                name,
+                content_blake3: hash,
+            });
+        }
+
+        for package in DERIVED_SKILL_PACKAGES {
+            let notice = repo_root.join(package).join("README.md");
+            if std::fs::read_to_string(&notice).ok().as_deref() != Some(DERIVED_PACKAGE_NOTICE) {
+                std::fs::write(&notice, DERIVED_PACKAGE_NOTICE)?;
+                report.rewritten.push(format!("{package}/README.md"));
+            }
+        }
+
+        report.pack_hash = blake3::hash(pack_material.as_bytes()).to_hex().to_string();
+        let manifest_path = canonical_root.join("skill-pack.manifest.json");
+        // A struct, not `json!`: serde_json without `preserve_order` sorts map
+        // keys, which would reorder the manifest on every sync for no reason.
+        #[derive(Serialize)]
+        struct Manifest<'a> {
+            schema_version: &'a str,
+            hash_algorithm: &'a str,
+            pack_hash: &'a str,
+            listing_characters: usize,
+            skills: &'a [ManifestSkill],
+            derived_packages: &'a [&'a str],
+        }
+        #[derive(Serialize)]
+        struct ManifestSkill {
+            name: &'static str,
+            content_blake3: String,
+        }
+        let manifest = Manifest {
+            schema_version: "eliot-agent-skill-pack-v1",
+            hash_algorithm: "blake3(name:content_blake3 joined with LF in manifest order)",
+            pack_hash: &report.pack_hash,
+            listing_characters,
+            skills: &manifest_skills,
+            derived_packages: &DERIVED_SKILL_PACKAGES,
+        };
+        let rendered = format!("{}\n", serde_json::to_string_pretty(&manifest)?);
+        if std::fs::read_to_string(&manifest_path).ok().as_deref() != Some(rendered.as_str()) {
+            std::fs::write(&manifest_path, rendered)?;
+            report.manifest_updated = true;
+        }
+        Ok(report)
+    }
+}
+
 fn canonical_skill_content_hash(body: &str) -> String {
     blake3::hash(body.replace("\r\n", "\n").as_bytes())
         .to_hex()

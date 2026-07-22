@@ -306,7 +306,8 @@ pub struct DashboardHealthSummary {
     pub ready: bool,
     pub degraded_reasons: Vec<String>,
     pub blocking_incidents: Vec<String>,
-    pub last_phase_gate_ref: Option<String>,
+    #[serde(alias = "last_change_gate_ref")]
+    pub last_change_gate_ref: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]

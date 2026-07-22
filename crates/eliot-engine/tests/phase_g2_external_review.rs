@@ -554,14 +554,12 @@ fn doctor_reports_external_review_status() {
 }
 
 #[test]
-fn phase_b_c_d_e_f0_f1_f2_f3_g0_g1_h0_h1_i0_i1_i2_j0_k0_k1_non_regression() -> TestResult {
+fn the_external_review_gate_admits_no_direct_provider_call() -> TestResult {
     let root = repo_root();
     let mcp = fs::read_to_string(root.join("crates/eliot-app/src/mcp_stdio.rs"))?;
-    let app = fs::read_to_string(root.join("crates/eliot-app/src/commands.rs"))?;
     let engine = fs::read_to_string(root.join("crates/eliot-engine/src/external_review.rs"))?;
 
     assert!(mcp.contains("eliot_external_review_providers"));
-    assert!(app.contains("run_phase_g2_closeout"));
     assert!(engine.contains("ExternalReviewGate"));
     for forbidden in [
         "surrealdb::",

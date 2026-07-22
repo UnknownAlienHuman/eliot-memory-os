@@ -355,21 +355,16 @@ fn module_event_to_blackboard_candidate_is_tainted() -> TestResult {
 }
 
 #[test]
-fn phase_b_c_d_e_f0_f1_f2_f3_non_regression() -> TestResult {
+fn the_runtime_adapter_surface_stays_governed() -> TestResult {
     let repo = repo_root();
-    let commands = fs::read_to_string(repo.join("crates/eliot-app/src/commands.rs"))?;
-    for marker in [
-        "run_phase_b_closeout",
-        "run_phase_c_closeout",
-        "run_phase_d_closeout",
-        "run_phase_e_closeout",
-        "run_phase_f0_closeout",
-        "run_phase_f1_closeout",
-        "run_phase_f2_closeout",
-        "run_phase_f3_closeout",
-        "run_phase_g0_closeout",
-    ] {
-        assert!(commands.contains(marker), "{marker} missing");
+    let mcp = fs::read_to_string(repo.join("crates/eliot-app/src/mcp_stdio.rs"))?;
+    assert!(mcp.contains("eliot_runtime_status"));
+    assert!(mcp.contains("eliot_adapter_list"));
+    for forbidden in ["eliot_adapter_execute_raw", "eliot_spawn_process"] {
+        assert!(
+            !mcp.contains(forbidden),
+            "{forbidden} leaked into the MCP surface"
+        );
     }
     Ok(())
 }

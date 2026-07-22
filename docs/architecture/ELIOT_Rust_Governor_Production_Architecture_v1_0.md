@@ -3,6 +3,14 @@
 
 **Дата:** 2026-06-18  
 **Статус:** final architecture decision; production-first; код в документе отсутствует  
+
+> **Authority note.** This is the *target* architecture and implementation
+> contract, written before the Governor existed. Where it disagrees with the
+> code, the code is authoritative and this document is the thing that is wrong.
+> Sections that describe a chosen dependency or layout are design intent, not a
+> report of what is currently linked; §23.10 and §23.11 in particular list
+> candidates that were later rejected, and say so inline.
+
 **Назначение:** Codex должен реализовать Governor по этому документу без самостоятельного выбора архитектуры  
 **Primary brain:** Codex  
 **Canonical durable memory:** SurrealDB 3.x server with RocksDB production storage  
@@ -354,13 +362,14 @@ The workspace is five: `eliot-types`, `eliot-store`, `eliot-engine`,
 boundary from the rest of the workspace's `forbid(unsafe_code)`.
 
 ```text
-eliot-governor/
+eliot-memory-os/
   Cargo.toml
   crates/
     eliot-types/       # pure schemas, enums, IDs, validation rules
     eliot-store/       # SurrealDB, redb WAL, blob CAS, migrations
     eliot-engine/      # governance, cognition, coordination, adapters
-    eliot-app/         # daemon, CLI, MCP, HTTP, hooks, Windows service
+    eliot-app/         # daemon, CLI, MCP, hooks, Windows service
+    eliot-windows-ipc/ # the single Win32 FFI boundary
   migrations/
   plugin/
   config/
@@ -5141,15 +5150,21 @@ paths stored in normalized canonical form plus original display form.
 
 ## 23.10. Required crate set
 
-Production core:
+Production core. Four entries here were candidates that the implementation
+rejected and never linked: `rmcp`, `axum` and `tower` (MCP stdio and the IPC
+surface are hand-written, and no HTTP server ships), and `surrealdb` (the store
+speaks its own WebSocket/RPC transport, which is how the `rsa` audit blocker in
+the SDK graph is avoided — see §4.1 and the transport note above). They are kept
+listed with this caveat so the rejection stays visible rather than looking like
+an omission.
 
 ```text
 tokio
 tokio-util
-rmcp
-axum
-tower
-surrealdb
+rmcp                (rejected: MCP stdio is hand-written)
+axum                (rejected: no HTTP server ships)
+tower               (rejected: no HTTP server ships)
+surrealdb           (rejected: own WebSocket/RPC transport)
 redb
 serde
 serde_json
@@ -5245,7 +5260,7 @@ Tests may use an isolated real SurrealDB instance and temporary data directories
 Create:
 
 ```text
-four-crate workspace;
+five-crate workspace;
 config loader and typed schemas;
 Windows service entry point;
 SurrealDB service configuration in remote server mode on a new RocksDB data root;

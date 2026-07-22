@@ -48,8 +48,20 @@ jobs:
       - name: Workspace check
         run: cargo check --workspace --all-targets
 
-      # Tests that need a live database or daemon are `#[ignore]`d at the
-      # source, so this is the deterministic set by construction rather than
-      # by a skip list that drifts.
-      - name: Deterministic tests
+      # Unit tests only. The integration tests under `crates/*/tests` need a
+      # provisioned local runtime -- a Governor daemon, an authenticated
+      # SurrealDB and a git identity -- none of which exist on a runner, so
+      # they are out of scope here rather than `#[ignore]`d one by one.
+      - name: Unit tests
         run: cargo test --workspace --lib --bins
+
+      # The integration tests that need nothing but the checkout. These are the
+      # ones that read source and manifests, and they are exactly the tests that
+      # went red unnoticed when the phase-closeout commands were deleted.
+      - name: Repository-only integration tests
+        run: |
+          cargo test -p eliot-engine --test verification_gates
+          cargo test -p eliot-engine --test phase_l7_host_integration
+          cargo test -p eliot-engine --test phase_f3_collective
+          cargo test -p eliot-engine --test phase_g0_runtime
+          cargo test -p eliot-engine --test phase_h0_safety

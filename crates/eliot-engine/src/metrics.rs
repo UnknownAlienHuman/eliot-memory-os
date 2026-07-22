@@ -99,10 +99,10 @@ impl MetricRecorderService {
         let mut samples = Vec::new();
         for (metric_id, value, operation) in [
             ("mcp.p95_latency_ms", 85.0, "tools/list"),
-            ("cli.command_count", 1.0, "verify phase-gate"),
+            ("cli.command_count", 1.0, "verify change-gate"),
             ("ipc.p95_latency_ms", 25.0, "status"),
             ("context.packet_bytes", 14_000.0, "compile_l3"),
-            ("verify.phase_gate_runtime_ms", 850_000.0, "phase-gate"),
+            ("verify.change_gate_runtime_ms", 850_000.0, "change-gate"),
             ("eval.pass_rate", 1.0, "k0-core-smoke"),
             ("incident.blocking_count", 0.0, "incident-list"),
             ("external_review.malformed_rate", 0.0, "mock-review"),
@@ -338,12 +338,12 @@ impl CostLedgerService {
             CostLedgerEntry {
                 entry_id: new_id("cost-entry"),
                 component: "verify".to_owned(),
-                operation: "phase-gate-runtime".to_owned(),
+                operation: "change-gate-runtime".to_owned(),
                 provider_id: None,
                 estimated_input_tokens: None,
                 estimated_output_tokens: None,
                 estimated_cost: 0.0,
-                source_ref: Some("verification:phase-gate".to_owned()),
+                source_ref: Some("verification:change-gate".to_owned()),
             },
         ];
         CostLedger {
@@ -372,7 +372,7 @@ impl QualitySignalService {
                 "verify",
                 QualitySignalKind::VerificationPassRate,
                 1.0,
-                "verification-verdicts:phase-gate",
+                "verification-verdicts:change-gate",
             ),
             signal(
                 "completion",
@@ -430,7 +430,7 @@ impl RuntimeDashboardService {
                 status,
                 degraded_reasons,
                 blocking_incidents,
-                last_phase_gate_ref: Some("verification:phase-gate".to_owned()),
+                last_change_gate_ref: Some("verification:change-gate".to_owned()),
             },
             latency,
             costs: Some(cost),
@@ -625,7 +625,7 @@ fn builtin_metric_definitions() -> Vec<MetricDefinition> {
             MetricUnit::Ratio,
         ),
         (
-            "verify.phase_gate_runtime_ms",
+            "verify.change_gate_runtime_ms",
             "verify",
             MetricKind::Timer,
             MetricUnit::Milliseconds,
@@ -831,7 +831,7 @@ fn builtin_slo_definitions() -> Vec<SloDefinition> {
             1.0,
         ),
         slo(
-            "verify.max_phase_gate_runtime_ms",
+            "verify.max_change_gate_runtime_ms",
             "verify",
             SloObjective::MaxVerificationRuntimeMs,
             1_200_000.0,
@@ -913,7 +913,7 @@ fn observed_for_slo(definition: &SloDefinition, rollup: &TelemetryRollup) -> (f6
         SloObjective::MaxP95LatencyMs if definition.component == "ipc" => "ipc.p95_latency_ms",
         SloObjective::MaxContextPacketBytes => "context.packet_bytes",
         SloObjective::MinEvalPassRate => "eval.pass_rate",
-        SloObjective::MaxVerificationRuntimeMs => "verify.phase_gate_runtime_ms",
+        SloObjective::MaxVerificationRuntimeMs => "verify.change_gate_runtime_ms",
         SloObjective::MaxExternalCandidateNoiseRate => "external_review.malformed_rate",
         SloObjective::MaxIncidentRate => "incident.blocking_count",
         SloObjective::MaxErrorRate => "completion.false_done_rate",

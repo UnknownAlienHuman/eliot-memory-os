@@ -308,8 +308,8 @@ pub use verification::{
     TestCostReport, TestCountByCost, TestCountByIntent, TestCountByKind, TestIntent, TestInventory,
     TestKind, TestMetadata, TestStatefulness, TestSuiteProfile, VerificationCommandResult,
     VerificationCommandStatus, VerificationDecision, VerificationDoctorStatus, VerificationPlan,
-    VerificationProfileRequirement, VerificationRun as ProfileVerificationRun,
-    VerificationRunStatus, VerificationRuntimeClass, VerificationVerdict,
+    VerificationRun as ProfileVerificationRun, VerificationRunStatus, VerificationRuntimeClass,
+    VerificationVerdict,
 };
 
 pub const SCHEMA_VERSION: &str = "1";

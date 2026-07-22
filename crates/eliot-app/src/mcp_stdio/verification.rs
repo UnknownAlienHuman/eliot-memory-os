@@ -1422,7 +1422,7 @@ pub(super) fn dispatch_verify_inventory(state: &McpState) -> Result<Value> {
 
 pub(super) fn dispatch_verify_plan(state: &McpState, arguments: Value) -> Result<Value> {
     let input: VerifyPlanToolInput = serde_json::from_value(arguments)?;
-    let profile = input.profile.as_deref().unwrap_or("phase-gate");
+    let profile = input.profile.as_deref().unwrap_or("change-gate");
     let inventory = mcp_verification_inventory();
     let plan = VerificationPlannerService.plan(
         &inventory,
@@ -1445,13 +1445,13 @@ pub(super) fn dispatch_verify_report(state: &McpState) -> Result<Value> {
     let profiles = VerificationProfileService.profiles();
     let plan = VerificationPlannerService.plan(
         &inventory,
-        "phase-gate",
+        "change-gate",
         vec!["workspace:mcp".to_owned(), "phase:k2".to_owned()],
     )?;
     let run = VerificationRunnerService.run_profile_record(&plan)?;
     let verdict = VerificationVerdictService.verdict(&run);
     let cost = TestCostService.report(&inventory, Some(&run));
-    let flake = FlakeDetectionService.report("phase-gate", 2, &inventory);
+    let flake = FlakeDetectionService.report("change-gate", 2, &inventory);
     let db_isolation = StatefulDbTestIsolationService.report(&inventory);
     let doctor =
         VerificationDoctorIntegration.status(&inventory, &cost, &flake, &db_isolation, Some(&run));

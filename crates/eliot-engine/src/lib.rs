@@ -118,9 +118,10 @@ pub use external_review::{
     ExternalReviewTaintPolicy, external_review_request,
 };
 pub use host::{
-    ELIOT_SKILL_NAMES, HostBrokerService, HostEventService, HostLaunchContractService,
-    HostProfileService, SkillPackEntryReport, SkillPackLintReport, SkillPackService, bundle_hash,
-    bundle_root, host_generated_bundle_entry, host_profile_fingerprint,
+    DERIVED_SKILL_PACKAGES, ELIOT_SKILL_NAMES, HostBrokerService, HostEventService,
+    HostLaunchContractService, HostProfileService, SkillPackEntryReport, SkillPackLintReport,
+    SkillPackService, SkillPackSyncReport, bundle_hash, bundle_root, host_generated_bundle_entry,
+    host_profile_fingerprint,
 };
 pub use lifecycle::{BoxServiceFuture, ServiceContext, ServiceHandle, ServiceLifecycle};
 pub use memory_lifecycle::{

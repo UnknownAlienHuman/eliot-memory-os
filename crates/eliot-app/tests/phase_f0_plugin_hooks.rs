@@ -262,22 +262,13 @@ fn plugin_verify_report_generated() -> TestResult {
 }
 
 #[test]
-fn phase_b_c_d_e_non_regression() -> TestResult {
-    let main = fs::read_to_string(repo_root().join("crates/eliot-app/src/main.rs"))?;
-    let commands = fs::read_to_string(repo_root().join("crates/eliot-app/src/commands.rs"))?;
-    for phase in [
-        "run_phase_b_closeout",
-        "run_phase_c_closeout",
-        "run_phase_d_closeout",
-        "run_phase_e_closeout",
-    ] {
-        assert!(
-            main.contains(phase) || commands.contains(phase),
-            "{phase} dispatch is missing"
-        );
-    }
-    assert!(commands.contains("crate_absent(\"surrealdb\""));
-    assert!(commands.contains("crate_absent(\"rsa\""));
+/// The dependency doctor must keep checking for the two crates the workspace
+/// deliberately refuses to link. The check lives in the engine's safety module;
+/// this only proves nobody quietly deleted it.
+fn the_dependency_doctor_still_checks_the_forbidden_crates() -> TestResult {
+    let safety = fs::read_to_string(repo_root().join("crates/eliot-engine/src/safety.rs"))?;
+    assert!(safety.contains("crate_absent(&self.repo_root, \"surrealdb\")"));
+    assert!(safety.contains("crate_absent(&self.repo_root, \"rsa\")"));
     Ok(())
 }
 

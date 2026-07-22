@@ -4570,10 +4570,10 @@ struct VerificationVerdictsReport {
 fn ensure_verification_summary(root: &Path) -> Result<serde_json::Value> {
     let inventory = write_verification_inventory_report(root)?.inventory;
     let profiles = write_verification_profiles_report(root)?.profiles;
-    let phase_gate_plan = write_verification_plan_report(root, &inventory, "phase-gate")?.plan;
-    let (run_report, verdict_report) = write_verification_run_and_verdict(root, &phase_gate_plan)?;
+    let change_gate_plan = write_verification_plan_report(root, &inventory, "change-gate")?.plan;
+    let (run_report, verdict_report) = write_verification_run_and_verdict(root, &change_gate_plan)?;
     let cost = write_test_cost_report(root, &inventory, Some(&run_report.run))?;
-    let flake = write_flake_report(root, "phase-gate", 2, &inventory)?;
+    let flake = write_flake_report(root, "change-gate", 2, &inventory)?;
     let db_isolation = write_db_isolation_report(root, &inventory)?;
     let doctor = VerificationDoctorIntegration.status(
         &inventory,
@@ -4586,7 +4586,7 @@ fn ensure_verification_summary(root: &Path) -> Result<serde_json::Value> {
         "component": "verification_report",
         "inventory": inventory,
         "profiles": profiles,
-        "latest_plan": phase_gate_plan,
+        "latest_plan": change_gate_plan,
         "latest_run": run_report.run,
         "latest_verdict": verdict_report.verdict,
         "cost": cost,
@@ -8187,11 +8187,11 @@ fn h1_credentials_report(config_path: &Path) -> Result<eliot_types::CredentialDi
 }
 
 fn h1_readiness_probe(root: &Path) -> Result<eliot_types::ServiceReadinessProbe> {
-    let phase_gate_passed = h1_phase_minimal_eval_gate_passed(root)?;
-    h1_readiness_probe_with_phase_gate(root, phase_gate_passed)
+    let change_gate_passed = h1_minimal_eval_gate_passed(root)?;
+    h1_readiness_probe_with_change_gate(root, change_gate_passed)
 }
 
-fn h1_readiness_probe_with_phase_gate(
+fn h1_readiness_probe_with_change_gate(
     root: &Path,
     phase_minimal_eval_gate_passed: bool,
 ) -> Result<eliot_types::ServiceReadinessProbe> {
@@ -8211,7 +8211,7 @@ fn h1_readiness_probe_with_phase_gate(
     Ok(ProductionReadinessService::probe("EliotGovernor", &fixture))
 }
 
-fn h1_phase_minimal_eval_gate_passed(root: &Path) -> Result<bool> {
+fn h1_minimal_eval_gate_passed(root: &Path) -> Result<bool> {
     let artifacts = ensure_k1_smoke_artifacts(root, "k0-core-smoke")?;
     Ok(artifacts.gate_decision.decision == EvalGateDecisionKind::Allow)
 }

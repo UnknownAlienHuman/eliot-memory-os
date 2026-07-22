@@ -23,6 +23,11 @@ operator-check:
 claude-package:
     powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build-claude-desktop-extension.ps1
 
+# Rewrites the OpenCode and Claude skill copies from integrations/agent-skills.
+# The copies are generated: edit the canonical body, then run this.
+sync-skills:
+    cargo run --quiet -p eliot-app -- host skill-sync
+
 quick: metadata fmt-check check
 
 verify: metadata fmt-check check clippy test

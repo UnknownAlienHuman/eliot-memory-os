@@ -644,6 +644,19 @@ pub(crate) async fn dispatch(config_path: &Path, command: HostCommand) -> Result
             }
             write_json(&report)
         }
+        HostCommand::SkillSync => {
+            let root = repo_root(config_path);
+            let sync = SkillPackService.sync(&root)?;
+            let report = SkillPackService.lint(&root)?;
+            if !report.valid {
+                write_json(&report)?;
+                bail!(
+                    "ELIOT skill pack is invalid after sync: {}",
+                    report.errors.join("; ")
+                );
+            }
+            write_json(&sync)
+        }
     }
 }
 

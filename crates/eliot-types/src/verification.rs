@@ -51,7 +51,11 @@ pub enum TestIntent {
     TypeContract,
     BoundarySecurity,
     Regression,
-    PhaseCloseout,
+    /// Tests that prove a unit of work is actually finished. Named after the
+    /// development milestones it used to close out; records written under that
+    /// spelling still load.
+    #[serde(alias = "phase_closeout")]
+    CompletionProof,
     BehaviorEval,
     StatefulDbSafety,
     RuntimeServiceSafety,
@@ -88,7 +92,6 @@ pub struct TestSuiteProfile {
     pub name: String,
     pub description: String,
     pub included_intents: Vec<TestIntent>,
-    pub included_phases: Vec<String>,
     pub excluded_statefulness: Vec<TestStatefulness>,
     pub max_cost_class: Option<TestCostClass>,
     pub requires_serial: bool,
@@ -244,16 +247,6 @@ pub struct FlakeReport {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct VerificationProfileRequirement {
-    pub phase_id: String,
-    pub required_profile: String,
-    pub required_eval_gate_profiles: Vec<String>,
-    pub full_verify_required: bool,
-    #[serde(with = "time::serde::rfc3339")]
-    pub created_at: OffsetDateTime,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct StatefulDbIsolationReport {
     pub report_id: String,
     #[serde(with = "time::serde::rfc3339")]
@@ -271,7 +264,8 @@ pub struct VerificationDoctorStatus {
     pub last_profile: Option<String>,
     pub last_run_status: Option<VerificationRunStatus>,
     pub last_full_verify: Option<String>,
-    pub required_profile_for_current_phase: String,
+    #[serde(alias = "required_profile")]
+    pub required_profile: String,
     pub test_inventory_count: u64,
     pub slow_high_cost_commands: Vec<String>,
     pub flake_status: String,

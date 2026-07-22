@@ -5,8 +5,7 @@ use eliot_types::{
     TestCountByCost, TestCountByIntent, TestCountByKind, TestIntent, TestInventory, TestKind,
     TestMetadata, TestStatefulness, TestSuiteProfile, VerificationCommandResult,
     VerificationCommandStatus, VerificationDecision, VerificationDoctorStatus, VerificationPlan,
-    VerificationProfileRequirement, VerificationRunStatus, VerificationRuntimeClass,
-    VerificationVerdict,
+    VerificationRunStatus, VerificationRuntimeClass, VerificationVerdict,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use time::OffsetDateTime;
@@ -42,7 +41,7 @@ impl VerificationProfileService {
     pub fn profiles(&self) -> Vec<TestSuiteProfile> {
         vec![
             dev_fast_profile(),
-            phase_gate_profile(),
+            change_gate_profile(),
             provider_gate_profile(),
             service_gate_profile(),
             full_profile(),
@@ -60,17 +59,6 @@ impl VerificationProfileService {
                     &format!("unknown profile: {profile_id}"),
                 )
             })
-    }
-
-    #[must_use]
-    pub fn requirement_for_phase(&self, phase_id: &str) -> VerificationProfileRequirement {
-        VerificationProfileRequirement {
-            phase_id: phase_id.to_owned(),
-            required_profile: "phase-gate".to_owned(),
-            required_eval_gate_profiles: vec!["phase-minimal".to_owned()],
-            full_verify_required: false,
-            created_at: OffsetDateTime::now_utc(),
-        }
     }
 }
 
@@ -215,7 +203,7 @@ impl VerificationVerdictService {
                 VerificationDecision::AllowWithWarnings
             };
         let required_followups = if decision == VerificationDecision::RequireFullVerify {
-            vec!["run phase-gate or full before DONE_VERIFIED".to_owned()]
+            vec!["run change-gate or full before DONE_VERIFIED".to_owned()]
         } else {
             Vec::new()
         };
@@ -256,7 +244,7 @@ impl TestCostService {
                 .unwrap_or_default(),
             recommendations: vec![
                 "use dev-fast for local edit feedback only".to_owned(),
-                "use phase-gate or full before DONE_VERIFIED".to_owned(),
+                "use change-gate or full before DONE_VERIFIED".to_owned(),
                 "keep stateful DB safety tests serial".to_owned(),
             ],
         }
@@ -330,7 +318,7 @@ impl VerificationDoctorIntegration {
             last_full_verify: Some(
                 "just verify baseline passed in current phase preflight".to_owned(),
             ),
-            required_profile_for_current_phase: "phase-gate".to_owned(),
+            required_profile: "change-gate".to_owned(),
             test_inventory_count: inventory.test_count,
             slow_high_cost_commands: cost
                 .slowest_commands
@@ -360,7 +348,7 @@ fn curated_test_metadata() -> Vec<TestMetadata> {
             Some("phase-c"),
             TestCostClass::Medium,
             TestStatefulness::LocalDbIsolated,
-            &["phase-gate", "provider-gate", "service-gate", "full"],
+            &["change-gate", "provider-gate", "service-gate", "full"],
         ),
         test(
             "mcp_exposes_no_raw_sql_tool",
@@ -371,7 +359,7 @@ fn curated_test_metadata() -> Vec<TestMetadata> {
             Some("phase-c"),
             TestCostClass::Medium,
             TestStatefulness::LocalDbIsolated,
-            &["phase-gate", "full"],
+            &["change-gate", "full"],
         ),
         test(
             "codecortex_report_written_to_memory",
@@ -382,7 +370,7 @@ fn curated_test_metadata() -> Vec<TestMetadata> {
             Some("phase-d1"),
             TestCostClass::Large,
             TestStatefulness::LocalDbSharedSerial,
-            &["phase-gate", "full", "deep"],
+            &["change-gate", "full", "deep"],
         ),
         test(
             "external_result_written_through_writer_actor",
@@ -393,7 +381,7 @@ fn curated_test_metadata() -> Vec<TestMetadata> {
             Some("phase-g2"),
             TestCostClass::Medium,
             TestStatefulness::LocalDbIsolated,
-            &["provider-gate", "phase-gate", "full"],
+            &["provider-gate", "change-gate", "full"],
         ),
         test(
             "phase_minimal_gate_passes",
@@ -404,7 +392,7 @@ fn curated_test_metadata() -> Vec<TestMetadata> {
             Some("phase-k1"),
             TestCostClass::Tiny,
             TestStatefulness::Pure,
-            &["phase-gate", "full"],
+            &["change-gate", "full"],
         ),
         test(
             "provider_integration_gate_requires_taint_tool_coverage",
@@ -448,7 +436,7 @@ fn curated_test_metadata() -> Vec<TestMetadata> {
             None,
             TestCostClass::Small,
             TestStatefulness::NetworkForbidden,
-            &["phase-gate", "provider-gate", "service-gate", "full"],
+            &["change-gate", "provider-gate", "service-gate", "full"],
         ),
         test(
             "cargo_deny_check",
@@ -459,7 +447,7 @@ fn curated_test_metadata() -> Vec<TestMetadata> {
             None,
             TestCostClass::Small,
             TestStatefulness::NetworkForbidden,
-            &["phase-gate", "provider-gate", "service-gate", "full"],
+            &["change-gate", "provider-gate", "service-gate", "full"],
         ),
         test(
             "cargo_machete",
@@ -481,7 +469,7 @@ fn curated_test_metadata() -> Vec<TestMetadata> {
             Some("phase-m0"),
             TestCostClass::Tiny,
             TestStatefulness::Pure,
-            &["phase-gate", "full"],
+            &["change-gate", "full"],
         ),
         test(
             "runtime_dashboard_generated",
@@ -492,7 +480,7 @@ fn curated_test_metadata() -> Vec<TestMetadata> {
             Some("phase-m0"),
             TestCostClass::Tiny,
             TestStatefulness::Pure,
-            &["phase-gate", "full"],
+            &["change-gate", "full"],
         ),
         test(
             "mcp_exposes_only_safe_metrics_tools",
@@ -503,7 +491,7 @@ fn curated_test_metadata() -> Vec<TestMetadata> {
             Some("phase-m0"),
             TestCostClass::Medium,
             TestStatefulness::LocalDbIsolated,
-            &["phase-gate", "full"],
+            &["change-gate", "full"],
         ),
         test(
             "mcp_exposes_no_raw_ingest_remote_export_tools",
@@ -514,18 +502,18 @@ fn curated_test_metadata() -> Vec<TestMetadata> {
             Some("phase-m0"),
             TestCostClass::Medium,
             TestStatefulness::LocalDbIsolated,
-            &["phase-gate", "full"],
+            &["change-gate", "full"],
         ),
         test(
             "phase_m0_closeout",
             "eliot-app",
             "commands",
             TestKind::Closeout,
-            TestIntent::PhaseCloseout,
+            TestIntent::CompletionProof,
             Some("phase-m0"),
             TestCostClass::Small,
             TestStatefulness::TempFs,
-            &["phase-gate", "full"],
+            &["change-gate", "full"],
         ),
         test(
             "windows_resolver_finds_agy_in_path",
@@ -536,7 +524,7 @@ fn curated_test_metadata() -> Vec<TestMetadata> {
             Some("phase-g3a"),
             TestCostClass::Tiny,
             TestStatefulness::TempFs,
-            &["phase-gate", "provider-gate", "full"],
+            &["change-gate", "provider-gate", "full"],
         ),
         test(
             "dangerously_skip_permissions_forbidden",
@@ -547,7 +535,7 @@ fn curated_test_metadata() -> Vec<TestMetadata> {
             Some("phase-g3a"),
             TestCostClass::Tiny,
             TestStatefulness::Pure,
-            &["phase-gate", "provider-gate", "full"],
+            &["change-gate", "provider-gate", "full"],
         ),
         test(
             "normalizer_uses_g2_external_review_result",
@@ -558,7 +546,7 @@ fn curated_test_metadata() -> Vec<TestMetadata> {
             Some("phase-g3a"),
             TestCostClass::Tiny,
             TestStatefulness::Pure,
-            &["phase-gate", "provider-gate", "full"],
+            &["change-gate", "provider-gate", "full"],
         ),
         test(
             "mcp_exposes_only_governed_antigravity_tools",
@@ -569,7 +557,7 @@ fn curated_test_metadata() -> Vec<TestMetadata> {
             Some("phase-g3a"),
             TestCostClass::Medium,
             TestStatefulness::LocalDbIsolated,
-            &["phase-gate", "provider-gate", "full"],
+            &["change-gate", "provider-gate", "full"],
         ),
         test(
             "mcp_exposes_no_raw_agy_agymcp_login_install_shell_secret_patch_truth_tools",
@@ -580,29 +568,29 @@ fn curated_test_metadata() -> Vec<TestMetadata> {
             Some("phase-g3a"),
             TestCostClass::Medium,
             TestStatefulness::LocalDbIsolated,
-            &["phase-gate", "provider-gate", "full"],
+            &["change-gate", "provider-gate", "full"],
         ),
         test(
             "phase_g3a_closeout",
             "eliot-app",
             "commands",
             TestKind::Closeout,
-            TestIntent::PhaseCloseout,
+            TestIntent::CompletionProof,
             Some("phase-g3a"),
             TestCostClass::Small,
             TestStatefulness::TempFs,
-            &["phase-gate", "provider-gate", "full"],
+            &["change-gate", "provider-gate", "full"],
         ),
         test(
             "phase_k2_closeout",
             "eliot-app",
             "commands",
             TestKind::Closeout,
-            TestIntent::PhaseCloseout,
+            TestIntent::CompletionProof,
             Some("phase-k2"),
             TestCostClass::Small,
             TestStatefulness::TempFs,
-            &["phase-gate", "full"],
+            &["change-gate", "full"],
         ),
     ]
 }
@@ -644,7 +632,7 @@ fn risk_refs_for(intent: TestIntent) -> Vec<String> {
         TestIntent::StatefulDbSafety => vec!["stateful_db_fixture_corruption".to_owned()],
         TestIntent::RuntimeServiceSafety => vec!["service_runtime_regression".to_owned()],
         TestIntent::ExternalProviderSafety => vec!["external_candidate_authority_leak".to_owned()],
-        TestIntent::PhaseCloseout => vec!["phase_done_without_proof".to_owned()],
+        TestIntent::CompletionProof => vec!["completion_claimed_without_proof".to_owned()],
         _ => vec!["regression".to_owned()],
     }
 }
@@ -655,7 +643,6 @@ fn dev_fast_profile() -> TestSuiteProfile {
         name: "Dev Fast".to_owned(),
         description: "Fast editing loop; never sufficient for DONE_VERIFIED.".to_owned(),
         included_intents: vec![TestIntent::TypeContract, TestIntent::Regression],
-        included_phases: Vec::new(),
         excluded_statefulness: vec![
             TestStatefulness::LocalDbSharedSerial,
             TestStatefulness::ServiceProcess,
@@ -671,18 +658,17 @@ fn dev_fast_profile() -> TestSuiteProfile {
     }
 }
 
-fn phase_gate_profile() -> TestSuiteProfile {
+fn change_gate_profile() -> TestSuiteProfile {
     TestSuiteProfile {
-        profile_id: "phase-gate".to_owned(),
-        name: "Phase Gate".to_owned(),
-        description: "Default required profile for future phase DONE_VERIFIED.".to_owned(),
+        profile_id: "change-gate".to_owned(),
+        name: "Change Gate".to_owned(),
+        description: "Default required profile before a change may claim DONE_VERIFIED.".to_owned(),
         included_intents: vec![
             TestIntent::BoundarySecurity,
             TestIntent::Regression,
-            TestIntent::PhaseCloseout,
+            TestIntent::CompletionProof,
             TestIntent::BehaviorEval,
         ],
-        included_phases: vec!["phase-k2".to_owned()],
         excluded_statefulness: Vec::new(),
         max_cost_class: Some(TestCostClass::VeryLarge),
         requires_serial: true,
@@ -690,7 +676,6 @@ fn phase_gate_profile() -> TestSuiteProfile {
             "just verify".to_owned(),
             "cargo run -p eliot-app -- eval gate --profile phase-minimal --suite k0-core-smoke"
                 .to_owned(),
-            "cargo run -p eliot-app -- phase-k2 closeout".to_owned(),
             "cargo tree -i surrealdb".to_owned(),
             "cargo tree --target all -i rsa".to_owned(),
             "cargo audit".to_owned(),
@@ -709,7 +694,6 @@ fn provider_gate_profile() -> TestSuiteProfile {
             TestIntent::BoundarySecurity,
             TestIntent::BehaviorEval,
         ],
-        included_phases: vec!["phase-g2".to_owned(), "phase-k2".to_owned()],
         excluded_statefulness: Vec::new(),
         max_cost_class: Some(TestCostClass::VeryLarge),
         requires_serial: true,
@@ -735,7 +719,6 @@ fn service_gate_profile() -> TestSuiteProfile {
             TestIntent::BoundarySecurity,
             TestIntent::Regression,
         ],
-        included_phases: vec!["phase-h1".to_owned()],
         excluded_statefulness: Vec::new(),
         max_cost_class: Some(TestCostClass::VeryLarge),
         requires_serial: true,
@@ -788,14 +771,13 @@ fn full_profile() -> TestSuiteProfile {
         included_intents: vec![
             TestIntent::BoundarySecurity,
             TestIntent::Regression,
-            TestIntent::PhaseCloseout,
+            TestIntent::CompletionProof,
             TestIntent::BehaviorEval,
             TestIntent::StatefulDbSafety,
             TestIntent::RuntimeServiceSafety,
             TestIntent::ExternalProviderSafety,
             TestIntent::PerformanceCost,
         ],
-        included_phases: vec!["all".to_owned()],
         excluded_statefulness: Vec::new(),
         max_cost_class: Some(TestCostClass::VeryLarge),
         requires_serial: true,
@@ -814,13 +796,12 @@ fn deep_profile() -> TestSuiteProfile {
             TestIntent::StatefulDbSafety,
             TestIntent::PerformanceCost,
         ],
-        included_phases: vec!["all".to_owned()],
         excluded_statefulness: Vec::new(),
         max_cost_class: Some(TestCostClass::VeryLarge),
         requires_serial: true,
         required_commands: vec![
             "cargo run -p eliot-app -- verify full".to_owned(),
-            "cargo run -p eliot-app -- verify flake --profile phase-gate --repeat 2".to_owned(),
+            "cargo run -p eliot-app -- verify flake --profile change-gate --repeat 2".to_owned(),
             "cargo run -p eliot-app -- startup-recovery scan".to_owned(),
             "cargo run -p eliot-app -- verify db-isolation".to_owned(),
         ],
@@ -830,7 +811,7 @@ fn deep_profile() -> TestSuiteProfile {
 fn runtime_class_for(profile_id: &str) -> VerificationRuntimeClass {
     match profile_id {
         "dev-fast" => VerificationRuntimeClass::Fast,
-        "phase-gate" | "provider-gate" | "service-gate" => VerificationRuntimeClass::Medium,
+        "change-gate" | "provider-gate" | "service-gate" => VerificationRuntimeClass::Medium,
         "deep" => VerificationRuntimeClass::Deep,
         _ => VerificationRuntimeClass::Full,
     }

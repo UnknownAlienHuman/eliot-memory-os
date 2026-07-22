@@ -518,11 +518,3 @@ fn delegation_hard_denial_order_is_deterministic() {
         vec![DelegationReason::RecursiveProviderCall]
     );
 }
-
-#[test]
-fn all_prior_closeouts_non_regression() {
-    let source = include_str!("../../eliot-app/src/commands.rs");
-    assert!(source.contains("g3b_baseline_preserved"));
-    assert!(source.contains("all_prior_closeouts_done"));
-    assert!(source.contains("run_phase_g3b_closeout"));
-}

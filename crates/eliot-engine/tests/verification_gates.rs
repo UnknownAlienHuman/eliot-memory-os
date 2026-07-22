@@ -51,7 +51,7 @@ fn test_profiles_created() {
 
     for profile_id in [
         "dev-fast",
-        "phase-gate",
+        "change-gate",
         "provider-gate",
         "service-gate",
         "full",
@@ -72,10 +72,10 @@ fn dev_fast_profile_exists() {
 }
 
 #[test]
-fn phase_gate_profile_exists() {
+fn the_change_gate_profile_exists() {
     let profile = VerificationProfileService
-        .profile("phase-gate")
-        .expect("phase-gate profile");
+        .profile("change-gate")
+        .expect("change-gate profile");
 
     assert!(profile.requires_serial);
     assert!(
@@ -140,9 +140,9 @@ fn deep_profile_exists() {
 
 #[test]
 fn verification_plan_generated() {
-    let plan = plan("phase-gate");
+    let plan = plan("change-gate");
 
-    assert_eq!(plan.profile_id, "phase-gate");
+    assert_eq!(plan.profile_id, "change-gate");
     assert!(!plan.required_commands.is_empty());
     assert!(!plan.selected_tests.is_empty());
 }
@@ -165,7 +165,7 @@ fn verification_plan_selects_profile_commands() {
 
 #[test]
 fn verification_run_profile_uses_only_known_commands() {
-    let plan = plan("phase-gate");
+    let plan = plan("change-gate");
 
     assert!(VerificationRunnerService.plan_uses_only_known_commands(&plan));
 }
@@ -182,7 +182,7 @@ fn verification_run_rejects_raw_command() {
 #[test]
 fn verification_verdict_generated() {
     let run = VerificationRunnerService
-        .run_profile_record(&plan("phase-gate"))
+        .run_profile_record(&plan("change-gate"))
         .expect("profile run");
     let verdict = VerificationVerdictService.verdict(&run);
 
@@ -193,7 +193,7 @@ fn verification_verdict_generated() {
 #[test]
 fn verification_verdict_blocks_failed_command() {
     let mut run = VerificationRunnerService
-        .run_profile_record(&plan("phase-gate"))
+        .run_profile_record(&plan("change-gate"))
         .expect("profile run");
     run.status = VerificationRunStatus::Failed;
     run.command_results.push(VerificationCommandResult {
@@ -216,10 +216,10 @@ fn verification_verdict_blocks_failed_command() {
 }
 
 #[test]
-fn phase_gate_requires_phase_minimal_eval() {
+fn the_change_gate_requires_the_minimal_eval_gate() {
     let profile = VerificationProfileService
-        .profile("phase-gate")
-        .expect("phase-gate profile");
+        .profile("change-gate")
+        .expect("change-gate profile");
 
     assert!(
         profile
@@ -279,7 +279,7 @@ fn full_profile_runs_dependency_absence_checks() {
 fn test_cost_report_generated() {
     let inventory = inventory();
     let run = VerificationRunnerService
-        .run_profile_record(&plan("phase-gate"))
+        .run_profile_record(&plan("change-gate"))
         .expect("profile run");
     let report = TestCostService.report(&inventory, Some(&run));
 
@@ -298,9 +298,9 @@ fn test_cost_report_counts_by_kind_intent_cost() {
 
 #[test]
 fn flake_report_generated_or_skipped_with_reason() {
-    let report = FlakeDetectionService.report("phase-gate", 2, &inventory());
+    let report = FlakeDetectionService.report("change-gate", 2, &inventory());
 
-    assert_eq!(report.repeated_profile, "phase-gate");
+    assert_eq!(report.repeated_profile, "change-gate");
     assert!(report.skipped_reason.is_none());
     assert!(!report.stable_tests.is_empty());
 }
@@ -316,8 +316,8 @@ fn stateful_db_isolation_report_generated() {
 #[test]
 fn stateful_db_profile_marks_serial() {
     let profile = VerificationProfileService
-        .profile("phase-gate")
-        .expect("phase-gate profile");
+        .profile("change-gate")
+        .expect("change-gate profile");
 
     assert!(profile.requires_serial);
     assert!(
@@ -332,16 +332,16 @@ fn stateful_db_profile_marks_serial() {
 fn doctor_reports_verification_status() {
     let inventory = inventory();
     let run = VerificationRunnerService
-        .run_profile_record(&plan("phase-gate"))
+        .run_profile_record(&plan("change-gate"))
         .expect("profile run");
     let cost = TestCostService.report(&inventory, Some(&run));
-    let flake = FlakeDetectionService.report("phase-gate", 2, &inventory);
+    let flake = FlakeDetectionService.report("change-gate", 2, &inventory);
     let db = StatefulDbTestIsolationService.report(&inventory);
     let status = VerificationDoctorIntegration.status(&inventory, &cost, &flake, &db, Some(&run));
 
-    assert_eq!(status.last_profile.as_deref(), Some("phase-gate"));
+    assert_eq!(status.last_profile.as_deref(), Some("change-gate"));
     assert_eq!(status.test_inventory_count, inventory.test_count);
-    assert_eq!(status.required_profile_for_current_phase, "phase-gate");
+    assert_eq!(status.required_profile, "change-gate");
 }
 
 #[test]
@@ -378,19 +378,24 @@ fn mcp_exposes_no_raw_command_or_override_tools() -> TestResult {
     Ok(())
 }
 
+/// The application layer must not reach past the verification runner. Linking
+/// the SurrealDB SDK would drag in the dependency graph the store deliberately
+/// avoids, and an arbitrary-command escape would make the profile allowlist
+/// decorative.
 #[test]
-fn phase_b_c_d_e_f0_f1_f2_f3_g0_g1_g2_h0_h1_i0_i1_i2_j0_k0_k1_non_regression() -> TestResult {
+fn the_application_layer_keeps_the_verification_boundary() -> TestResult {
     let root = repo_root();
     let app = fs::read_to_string(root.join("crates/eliot-app/src/commands.rs"))?;
     let mcp = fs::read_to_string(root.join("crates/eliot-app/src/mcp_stdio.rs"))?;
     let engine = fs::read_to_string(root.join("crates/eliot-engine/src/verification.rs"))?;
 
-    assert!(app.contains("run_phase_k2_closeout"));
-    assert!(app.contains("phase_g2_non_regression"));
     assert!(mcp.contains("eliot_verify_profiles"));
     assert!(engine.contains("VerificationRunnerService"));
     for forbidden in ["surrealdb::", "rsa::", "raw arbitrary verification command"] {
-        assert!(!app.contains(forbidden));
+        assert!(
+            !app.contains(forbidden),
+            "{forbidden} leaked into commands.rs"
+        );
     }
     Ok(())
 }

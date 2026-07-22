@@ -384,19 +384,9 @@ fn work_status_reports_active_blocked_completed() {
 }
 
 #[test]
-fn phase_b_c_d_e_f0_non_regression() -> TestResult {
+fn the_mcp_surface_exposes_no_raw_execution_tool() -> TestResult {
     let repo = repo_root();
-    let commands = fs::read_to_string(repo.join("crates/eliot-app/src/commands.rs"))?;
     let mcp = fs::read_to_string(repo.join("crates/eliot-app/src/mcp_stdio.rs"))?;
-    for marker in [
-        "run_phase_b_closeout",
-        "run_phase_c_closeout",
-        "run_phase_d_closeout",
-        "run_phase_e_closeout",
-        "run_phase_f0_closeout",
-    ] {
-        assert!(commands.contains(marker), "{marker} missing");
-    }
     for forbidden in [
         "eliot_shell",
         "eliot_git",
