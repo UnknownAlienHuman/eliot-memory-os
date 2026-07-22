@@ -27,6 +27,7 @@ impl Drop for OwnedRoot {
 }
 
 #[test]
+#[ignore = "requires a provisioned SurrealDB executable"]
 fn dogfood_runtime_starts_doctors_stops_and_restarts_persistent_state() -> TestResult {
     let nonce = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
     let owned = OwnedRoot(std::env::temp_dir().join(format!(
@@ -349,15 +350,10 @@ fn assert_codex_exec_plan(report: &Value, destination: &Path, runtime: &Path) ->
         .iter()
         .map(|item| item.as_str().ok_or("Codex exec argv item is not a string"))
         .collect::<Result<Vec<_>, _>>()?;
-    let destination = destination.to_string_lossy().replace('\\', "/");
-    let output_schema = runtime
-        .join("reports/live-codex/output-schema.json")
-        .to_string_lossy()
-        .replace('\\', "/");
-    let last_message = runtime
-        .join("reports/live-codex/last-message.json")
-        .to_string_lossy()
-        .replace('\\', "/");
+    let destination = canonical_path_text(destination)?;
+    let runtime = canonical_path_text(runtime)?;
+    let output_schema = format!("{runtime}/reports/live-codex/output-schema.json");
+    let last_message = format!("{runtime}/reports/live-codex/last-message.json");
     assert_eq!(
         &argv[..15],
         &[
@@ -387,6 +383,19 @@ fn assert_codex_exec_plan(report: &Value, destination: &Path, runtime: &Path) ->
     assert_eq!(report["codex_jsonl_stdout_redirection_required"], true);
     assert_eq!(report["codex_home_relocation_required"], false);
     Ok(())
+}
+
+fn canonical_path_text(path: &Path) -> TestResult<String> {
+    let canonical = fs::canonicalize(path)?;
+    let text = canonical.to_string_lossy();
+    let text = if let Some(rest) = text.strip_prefix(r"\\?\UNC\") {
+        format!(r"\\{rest}")
+    } else if let Some(rest) = text.strip_prefix(r"\\?\") {
+        rest.to_owned()
+    } else {
+        text.into_owned()
+    };
+    Ok(text.replace('\\', "/"))
 }
 
 fn run(args: &[&str]) -> TestResult<Value> {
