@@ -2305,7 +2305,11 @@ mod cognitive_contract_unit_tests {
         Ok(())
     }
 
+    /// Needs a live Governor config and database. Run with
+    /// `ELIOT_GOVERNOR_CONFIG` set and `--ignored`; ignored by default so a
+    /// plain `cargo test` is not a guaranteed failure on every machine.
     #[test]
+    #[ignore = "requires ELIOT_GOVERNOR_CONFIG and a live database"]
     fn cognitive_state_machine_is_db_backed_atomic_and_restart_safe() -> Result<()> {
         // This integration future owns the exact 18-call contract plus restart/saturation
         // fixtures. Give only this test an explicit stack instead of requiring a process-wide
@@ -29068,7 +29072,9 @@ mod l4_tests {
         Ok(())
     }
 
+    /// Needs a live Governor config and a running daemon-owned writer.
     #[tokio::test]
+    #[ignore = "requires ELIOT_GOVERNOR_CONFIG and a running daemon"]
     #[allow(clippy::too_many_lines)]
     async fn managed_host_observation_uses_the_daemon_owned_writer() -> Result<()> {
         let config_path = PathBuf::from(

@@ -11,7 +11,7 @@ operator application. Current architecture and engineering contracts live under
 
 ## Development
 
-Use stable MSVC Rust as pinned by `rust-toolchain.toml`.
+MSVC Rust 1.96.1, pinned exactly by `rust-toolchain.toml`.
 
 ```powershell
 cargo metadata --no-deps
@@ -25,3 +25,11 @@ never source-controlled.
 
 The installed Windows credential boundary and its verification procedure are
 documented in [`docs/operations/SURREALDB_CREDENTIAL_AUTHORITY.md`](docs/operations/SURREALDB_CREDENTIAL_AUTHORITY.md).
+
+## License
+
+MIT — see [`LICENSE`](LICENSE).
+
+SurrealDB is a separately installed runtime dependency under its own license.
+ELIOT talks to it over its own WebSocket/RPC transport and neither vendors nor
+redistributes it.

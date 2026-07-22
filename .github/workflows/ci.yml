@@ -1,0 +1,55 @@
+name: CI
+
+# Catches obvious repository regressions. It deliberately does not re-certify
+# the product: no live providers, no credential migration, no OS matrix. If a
+# check here needs a running database or a paid API, it does not belong here.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  check:
+    # Windows only: the Governor is a Windows product -- named pipes, Windows
+    # Credential Manager, Win32 process identity. A Linux runner would not be
+    # testing the same program.
+    runs-on: windows-latest
+    timeout-minutes: 45
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # rust-toolchain.toml pins the exact version; installing it explicitly
+      # keeps the runner from silently using whatever it shipped with.
+      - name: Install pinned toolchain
+        run: rustup show active-toolchain
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
+
+      - name: Metadata
+        run: cargo metadata --no-deps --format-version 1 > $null
+
+      - name: Formatting
+        run: cargo fmt --all -- --check
+
+      - name: Workspace check
+        run: cargo check --workspace --all-targets
+
+      # Tests that need a live database or daemon are `#[ignore]`d at the
+      # source, so this is the deterministic set by construction rather than
+      # by a skip list that drifts.
+      - name: Deterministic tests
+        run: cargo test --workspace --lib --bins

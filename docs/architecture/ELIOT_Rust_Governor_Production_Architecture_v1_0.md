@@ -265,7 +265,7 @@ Remote bind is disabled in v1. A future remote deployment must add TLS, OAuth cl
 
 ```text
 Governor daemon
-  -> SurrealDB Rust SDK
+  -> ELIOT WebSocket/RPC transport
   -> WebSocket/RPC connection to 127.0.0.1
   -> namespace eliot / database system
 ```
@@ -308,7 +308,7 @@ Governor monitors the DB service through health queries and Windows Service Cont
 
 ## 3.6. Storage-engine decision
 
-Production v1 initially pins the already installed SurrealDB server line `3.1.4` and a matching Rust SDK compatibility line in `Cargo.lock` and the service manifest. Upgrades require migration rehearsal, backup/restore proof and the normal release gate.
+Production v1 pins the already installed SurrealDB server line `3.1.4`. The Governor speaks to it over its own WebSocket/RPC transport rather than the SurrealDB Rust SDK, so there is no SDK compatibility line to pin. Upgrades require migration rehearsal, backup/restore proof and the normal release gate.
 
 Production v1 uses this exact ownership chain:
 
@@ -324,7 +324,7 @@ Rules:
 ```text
 RocksDB is the production default for the single-node server;
 SurrealKV is accepted only as the legacy import source and an explicit experimental profile;
-Governor is compiled with the remote SurrealDB Rust SDK transport only;
+Governor talks to the remote server over its own WebSocket/RPC transport and does not link the SurrealDB Rust SDK;
 Governor never links an embedded RocksDB or SurrealKV engine;
 no agent sees the storage URI or database credentials;
 server credentials are supplied through protected environment/secret configuration, never command-line logs;
@@ -348,7 +348,10 @@ a migration ADR is approved and a reversible cutover is documented.
 
 ## 4.1. Workspace layout
 
-Use four crates. Do not create a dozen micro-crates.
+Use a small fixed set of crates. Do not create a dozen micro-crates.
+The workspace is five: `eliot-types`, `eliot-store`, `eliot-engine`,
+`eliot-app`, and `eliot-windows-ipc`, which isolates the single Win32 FFI
+boundary from the rest of the workspace's `forbid(unsafe_code)`.
 
 ```text
 eliot-governor/
@@ -463,7 +466,7 @@ This is a conceptual signature; exact Rust syntax may differ, but responsibiliti
 | async runtime | `tokio` | mature, bounded channels, process/network/Windows named pipes |
 | MCP | official `rmcp` | stdio + Streamable HTTP + tools/resources/tasks |
 | HTTP/health | `axum` + `tower` | small, Tokio-native, timeouts/concurrency/load shedding |
-| canonical DB | `surrealdb` Rust SDK | typed local connection to server and transactions |
+| canonical DB | ELIOT WebSocket/RPC transport | local connection to the SurrealDB server and transactions, without the SDK dependency graph |
 | operational WAL | `redb` | pure Rust, ACID, crash-safe, one writer/concurrent readers |
 | serialization | `serde`, `serde_json`, `schemars` | wire schemas and JSON Schema |
 | config snapshots | `arc-swap` | lock-light atomic config replacement |
