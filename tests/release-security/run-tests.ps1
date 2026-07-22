@@ -79,6 +79,24 @@ try {
         throw 'UTF-16 credential fixture was not rejected'
     }
 
+    $documentationRoot = Join-Path $root 'documentation-scan'
+    $operationsDocs = Join-Path $documentationRoot 'docs\operations'
+    New-Item -ItemType Directory -Path $operationsDocs -Force | Out-Null
+    Set-Content -LiteralPath (Join-Path $operationsDocs 'SURREALDB_CREDENTIAL_AUTHORITY.md') -Value '# Credential authority' -Encoding utf8
+    Assert-NoReleaseSecrets $documentationRoot
+
+    Set-Content -LiteralPath (Join-Path $scanRoot 'credential.json') -Value '{"status":"redacted"}' -Encoding utf8
+    $secretNameRejected = $false
+    try {
+        Assert-NoReleaseSecrets $scanRoot
+    }
+    catch {
+        $secretNameRejected = $_.Exception.Message -match 'secret-like filename'
+    }
+    if (-not $secretNameRejected) {
+        throw 'secret-like non-document filename was not rejected'
+    }
+
     [ordered]@{
         component = 'eliot_release_security_smoke'
         status = 'VERIFIED'
@@ -86,6 +104,8 @@ try {
         dirty_tracked_rejected = $true
         secret_fixture_rejected = $true
         utf16_fixture_rejected = $true
+        credential_document_name_allowed = $true
+        secret_filename_rejected = $true
     } | ConvertTo-Json -Depth 3
 }
 finally {

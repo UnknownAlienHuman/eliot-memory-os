@@ -23,7 +23,9 @@ function Assert-SafeRelativePath([string]$Path, [string]$Purpose) {
 function Assert-NoSecretFile([System.IO.FileInfo]$File, [string]$RelativePath) {
     $relative = $RelativePath.Replace('\', '/')
     $sensitiveName = '(?i)(^|[/._-])(secret|token|credential|private[-_]?key|password)([/._-]|$)|(^|/)\.(env($|\.)|envrc$|netrc$|npmrc$)|\.(pfx|p12|kdbx)$|(^|/)id_(rsa|ed25519)$'
-    if ([regex]::IsMatch($relative, $sensitiveName)) {
+    $isTrackedDocumentation = $relative.StartsWith('docs/', [System.StringComparison]::OrdinalIgnoreCase) -and
+        $File.Extension.Equals('.md', [System.StringComparison]::OrdinalIgnoreCase)
+    if ([regex]::IsMatch($relative, $sensitiveName) -and -not $isTrackedDocumentation) {
         throw "release payload contains a secret-like filename: $relative"
     }
 
