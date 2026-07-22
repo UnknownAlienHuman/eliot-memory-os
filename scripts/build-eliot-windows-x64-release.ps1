@@ -187,7 +187,6 @@ function Test-ReleaseBundle([string]$Path) {
         'config',
         'integrations',
         'skills',
-        'plugins',
         'migrations',
         'docs/operations',
         'docs/release',

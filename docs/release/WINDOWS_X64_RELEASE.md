@@ -1,6 +1,6 @@
 # Windows x64 Release
 
-`scripts/build-eliot-windows-x64-release.ps1` stages an intentionally unsigned bundle containing the release governor, required Eliot.Operator publish output, config templates, integrations, plugins/skills, migrations, and operations/release runbooks. Its default output root is `%LOCALAPPDATA%\Eliot\packages`; `-OutputRoot` accepts an explicit absolute path or a repository-relative override.
+`scripts/build-eliot-windows-x64-release.ps1` stages an intentionally unsigned bundle containing the release governor, required Eliot.Operator publish output, config templates, canonical host integration packages, shared skills, migrations, and operations/release runbooks. Host plugins live under their owning `integrations/<host>` tree; the bundle does not create a second top-level plugin copy. Its default output root is `%LOCALAPPDATA%\Eliot\packages`; `-OutputRoot` accepts an explicit absolute path or a repository-relative override.
 
 Use `-PlanOnly` to inspect paths and contents without building or writing a bundle. Every real staging run requires `-OperatorSource <published-directory>` containing `Eliot.Operator.exe`; the script refuses a Governor-only package and refuses to overwrite an existing versioned bundle.
 
