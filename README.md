@@ -28,8 +28,23 @@ documented in [`docs/operations/SURREALDB_CREDENTIAL_AUTHORITY.md`](docs/operati
 
 ## License
 
-MIT — see [`LICENSE`](LICENSE).
+ELIOT is licensed under the MIT License — see [`LICENSE`](LICENSE). That grant
+is unconditional.
 
-SurrealDB is a separately installed runtime dependency under its own license.
-ELIOT talks to it over its own WebSocket/RPC transport and neither vendors nor
-redistributes it.
+Third-party runtimes such as SurrealDB are **optional, separately licensed
+components**, not parts of ELIOT. They are obtained and licensed by the operator
+directly. ELIOT does not vendor, bundle, redistribute or link them; it reaches
+them across a network protocol boundary over a transport implemented in this
+repository rather than through a vendor SDK. That boundary is deliberate: it
+keeps the dependency surface narrow and lets a capability — including the
+canonical data store — be re-pointed at a different implementation without
+redesign.
+
+Where a capability can be satisfied by more than one component, ELIOT prefers
+permissive open-source licenses, openly specified protocols with more than one
+implementation, and independently addressable endpoints, and aims to document an
+alternative or migration path for each dependency so that no operator is
+compelled to accept terms they decline.
+
+The full statement, including definitions and scope, is in
+[`docs/DEPENDENCY_POLICY.md`](docs/DEPENDENCY_POLICY.md).
