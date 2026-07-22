@@ -3,7 +3,7 @@
   "manifest_version": "0.3",
   "name": "eliot-governor",
   "display_name": "ELIOT Governor",
-  "version": "0.1.5",
+  "version": "0.1.6",
   "description": "Connect Claude Desktop to the local ELIOT cognitive control plane.",
   "long_description": "Read current task truth, expand exact evidence, use governed memory, delegate bounded work, and submit receipted candidate or verification results through the existing local ELIOT Governor. Claude identity never grants a permanent role.",
   "author": {

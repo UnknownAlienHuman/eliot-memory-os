@@ -460,7 +460,8 @@ fn doctor_report_generated() -> TestResult {
 
 #[test]
 fn doctor_detects_stale_lock_fixture() -> TestResult {
-    let repo = repo_root();
+    let repo = test_root("doctor-lock-repo")?;
+    std::fs::create_dir_all(repo.join("target"))?;
     let lock = repo
         .join("target")
         .join("eliot-governor-shared-db-test.lock");
@@ -477,7 +478,7 @@ fn doctor_detects_stale_lock_fixture() -> TestResult {
 }
 
 #[test]
-fn operations_doctor_is_ready_for_isolated_root() -> TestResult {
+fn operations_doctor_reports_isolated_root_and_required_cli_state() -> TestResult {
     let root = test_root("operations-doctor")?;
     let password_file = root.join("secrets").join("password.txt");
     std::fs::create_dir_all(password_file.parent().ok_or("password parent missing")?)?;
@@ -495,7 +496,22 @@ fn operations_doctor_is_ready_for_isolated_root() -> TestResult {
             legacy_password_file_authorized: true,
             storage_root: Some(root.join("store")),
         })?;
-    assert_eq!(report.status, "degraded", "checks={:#?}", report.checks);
+    let surreal_cli = report
+        .checks
+        .iter()
+        .find(|check| check.name == "surreal_cli")
+        .ok_or("surreal_cli check missing")?;
+    assert!(surreal_cli.blocking);
+    assert_eq!(
+        report.status,
+        if surreal_cli.passed {
+            "degraded"
+        } else {
+            "blocked"
+        },
+        "checks={:#?}",
+        report.checks
+    );
     assert!(report.checks.iter().any(|check| {
         check.name == "operator_protocol_contract" && check.passed && check.blocking
     }));
