@@ -23,6 +23,10 @@ the exact bundled Governor catalog, validates and packs with the MCPB CLI versio
 pinned in `tool-versions.json`, and writes the package and compatibility receipts
 under `%LOCALAPPDATA%\Eliot\packages\claude`.
 
+MCPB versioning is independent from the application version. The packager
+rejects a changed embedded Governor under an already reported extension version;
+advance the tracked manifest version before producing those new package bytes.
+
 Installation and activation use Claude Desktop's official extension lifecycle:
 
 ```powershell

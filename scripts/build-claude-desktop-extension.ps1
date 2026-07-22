@@ -66,6 +66,16 @@ if (-not (Test-Path -LiteralPath (Join-Path $sourceRoot 'manifest.json') -PathTy
 }
 $sourceManifest = Get-Content -LiteralPath (Join-Path $sourceRoot 'manifest.json') -Raw | ConvertFrom-Json
 $packagePath = Join-Path $distRoot "eliot-$($sourceManifest.version)-windows-x64.mcpb"
+$governorSha256 = Get-Sha256Hex $GovernorExe
+$priorReportPath = Join-Path $distRoot 'compatibility-report.json'
+if (Test-Path -LiteralPath $priorReportPath -PathType Leaf) {
+    $priorReport = Get-Content -LiteralPath $priorReportPath -Raw | ConvertFrom-Json
+    if ([string]$priorReport.extension_version -eq [string]$sourceManifest.version -and
+        [string]$priorReport.governor_sha256 -and
+        -not ([string]$priorReport.governor_sha256).Equals($governorSha256, [System.StringComparison]::OrdinalIgnoreCase)) {
+        throw "Claude Desktop extension version $($sourceManifest.version) already identifies different package bytes; bump integrations/claude/claude-desktop/mcpb/manifest.json before rebuilding"
+    }
+}
 
 if (Test-Path -LiteralPath $targetRoot) {
     $resolvedTarget = [System.IO.Path]::GetFullPath($targetRoot)
@@ -173,7 +183,7 @@ $buildManifest = [ordered]@{
     mcpb_cli_version = $mcpbVersion
     manifest_schema = $sourceManifest.'$schema'
     manifest_sha256 = Get-Sha256Hex (Join-Path $targetRoot 'manifest.json')
-    governor_sha256 = Get-Sha256Hex $stagedGovernor
+    governor_sha256 = $governorSha256
     governor_source = $GovernorExe
     server_entry_point = $sourceManifest.server.entry_point
     host_argument = 'claude-desktop'
@@ -199,7 +209,7 @@ $report = [ordered]@{
     package = $package.FullName
     package_bytes = $package.Length
     package_sha256 = Get-Sha256Hex $packagePath
-    governor_sha256 = Get-Sha256Hex $GovernorExe
+    governor_sha256 = $governorSha256
     manifest_sha256 = Get-Sha256Hex $manifestPath
     manifest_version = $manifest.manifest_version
     extension_version = $manifest.version

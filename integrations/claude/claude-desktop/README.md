@@ -21,6 +21,11 @@ pinned official `mcpb` CLI, and writes package hashes plus a context footprint
 report under `%LOCALAPPDATA%\Eliot\packages\claude`. The package name is
 `eliot-<version>-windows-x64.mcpb`.
 
+The Desktop extension version is independent from the Governor application
+version. If the embedded Governor hash changes, the build refuses to reuse an
+existing extension version; bump `mcpb/manifest.json` before packaging so Claude
+Desktop can distinguish and update the installed bytes.
+
 Install and activate through Governor, which opens the official Claude Desktop
 review dialog and verifies the extension registry and installed server hash before
 writing its receipt:
