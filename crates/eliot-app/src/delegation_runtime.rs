@@ -32,13 +32,6 @@ use std::str::FromStr;
 use std::time::Instant;
 use time::OffsetDateTime;
 
-pub const DELEGATION_TOOL_NAMES: [&str; 4] = [
-    "eliot_delegate_review",
-    "eliot_delegate_status",
-    "eliot_delegate_result",
-    "eliot_delegate_report",
-];
-
 pub fn root_from_config(config_path: &Path) -> PathBuf {
     config_path
         .parent()

@@ -24,13 +24,6 @@ use std::process::Command;
 use std::str::FromStr;
 use time::OffsetDateTime;
 
-pub const CALIBRATION_TOOL_NAMES: [&str; 4] = [
-    "eliot_delegation_calibration_status",
-    "eliot_delegation_calibration_report",
-    "eliot_delegation_policy_candidate",
-    "eliot_delegation_promotion_status",
-];
-
 #[derive(Clone, Debug)]
 pub struct CampaignPreviewInput {
     pub project_id: ProjectId,
