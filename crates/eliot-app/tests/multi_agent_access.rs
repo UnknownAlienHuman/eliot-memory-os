@@ -295,6 +295,7 @@ fn default_instance_bootstrap_is_stable_and_outside_the_repository() -> TestResu
 }
 
 #[test]
+#[ignore = "requires a provisioned SurrealDB executable"]
 fn standalone_startup_failure_stops_its_owned_database_and_publishes_failed() -> TestResult {
     let runtime = OwnedRuntime::new()?;
     let config_path = runtime.path().join("config").join("governor.toml");

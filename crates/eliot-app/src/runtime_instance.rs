@@ -403,7 +403,7 @@ pub(crate) fn atomic_write_bytes(path: &Path, bytes: &[u8]) -> Result<()> {
 }
 
 pub(crate) fn path_identity(path: &Path) -> String {
-    let absolute = absolute_path(path);
+    let absolute = fs::canonicalize(path).unwrap_or_else(|_| absolute_path(path));
     let text = absolute.to_string_lossy();
     let normalized = text
         .strip_prefix(r"\\?\UNC\")
@@ -441,6 +441,7 @@ fn validate_instance_name(name: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{RuntimeInstance, path_identity};
+    use std::fs;
     use std::path::Path;
 
     #[test]
@@ -449,6 +450,24 @@ mod tests {
             path_identity(Path::new(r"C:\Profiles\Example\Eliot")),
             path_identity(Path::new(r"\\?\C:\Profiles\Example\Eliot"))
         );
+    }
+
+    #[test]
+    fn existing_windows_path_aliases_share_identity() -> anyhow::Result<()> {
+        let root = std::env::temp_dir().join(format!(
+            "eliot-runtime-path-identity-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)?
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root)?;
+        let canonical = fs::canonicalize(&root)?;
+
+        assert_eq!(path_identity(&root), path_identity(&canonical));
+
+        fs::remove_dir_all(&canonical)?;
+        Ok(())
     }
 
     #[test]
