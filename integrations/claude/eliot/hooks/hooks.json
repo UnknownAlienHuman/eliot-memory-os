@@ -1,5 +1,5 @@
 {
-  "description": "Two enforcement points and the session events that carry real ELIOT evidence. Events that change no ELIOT state are deliberately absent: this plugin is installed at user scope, so every hook here fires in every Claude session on the machine. Enforcement runs through `hook <event>`, which emits the exact per-event decision schema and defers when the session is not attached to an ELIOT task; pure observation runs through `host event`, which has no decision to make.",
+  "description": "Two enforcement points and the session events that carry real ELIOT evidence. Events that change no ELIOT state are deliberately absent: this plugin is installed at user scope, so every hook here fires in every Claude session on the machine. Enforcement runs through `hook <event>`, which emits the exact per-event decision schema and defers when the session is not attached to an ELIOT task. Pure observation is `async` so it cannot hold up a turn; SessionStart is not, because its context has to arrive before the first model request.",
   "hooks": {
     "SessionStart": [
       {
@@ -7,7 +7,10 @@
           {
             "type": "command",
             "command": "${CLAUDE_PLUGIN_ROOT}/bin/eliot-governor.exe",
-            "args": ["hook", "session-start"],
+            "args": [
+              "hook",
+              "session-start"
+            ],
             "timeout": 10
           }
         ]
@@ -20,7 +23,10 @@
           {
             "type": "command",
             "command": "${CLAUDE_PLUGIN_ROOT}/bin/eliot-governor.exe",
-            "args": ["hook", "pre-tool-use"],
+            "args": [
+              "hook",
+              "pre-tool-use"
+            ],
             "timeout": 10
           }
         ]
@@ -33,8 +39,16 @@
           {
             "type": "command",
             "command": "${CLAUDE_PLUGIN_ROOT}/bin/eliot-governor.exe",
-            "args": ["host", "event", "--host", "claude", "--event", "PostToolUseFailure"],
-            "timeout": 10
+            "args": [
+              "host",
+              "event",
+              "--host",
+              "claude",
+              "--event",
+              "PostToolUseFailure"
+            ],
+            "timeout": 10,
+            "async": true
           }
         ]
       }
@@ -45,8 +59,12 @@
           {
             "type": "command",
             "command": "${CLAUDE_PLUGIN_ROOT}/bin/eliot-governor.exe",
-            "args": ["hook", "subagent-start"],
-            "timeout": 10
+            "args": [
+              "hook",
+              "subagent-start"
+            ],
+            "timeout": 10,
+            "async": true
           }
         ]
       }
@@ -57,8 +75,12 @@
           {
             "type": "command",
             "command": "${CLAUDE_PLUGIN_ROOT}/bin/eliot-governor.exe",
-            "args": ["hook", "subagent-stop"],
-            "timeout": 10
+            "args": [
+              "hook",
+              "subagent-stop"
+            ],
+            "timeout": 10,
+            "async": true
           }
         ]
       }
@@ -69,19 +91,25 @@
           {
             "type": "command",
             "command": "${CLAUDE_PLUGIN_ROOT}/bin/eliot-governor.exe",
-            "args": ["hook", "pre-compact"],
+            "args": [
+              "hook",
+              "pre-compact"
+            ],
             "timeout": 10
           }
         ]
       }
     ],
-    "TaskCompleted": [
+    "Stop": [
       {
         "hooks": [
           {
             "type": "command",
             "command": "${CLAUDE_PLUGIN_ROOT}/bin/eliot-governor.exe",
-            "args": ["hook", "stop"],
+            "args": [
+              "hook",
+              "stop"
+            ],
             "timeout": 10
           }
         ]
@@ -93,8 +121,16 @@
           {
             "type": "command",
             "command": "${CLAUDE_PLUGIN_ROOT}/bin/eliot-governor.exe",
-            "args": ["host", "event", "--host", "claude", "--event", "SessionEnd"],
-            "timeout": 10
+            "args": [
+              "host",
+              "event",
+              "--host",
+              "claude",
+              "--event",
+              "SessionEnd"
+            ],
+            "timeout": 10,
+            "async": true
           }
         ]
       }

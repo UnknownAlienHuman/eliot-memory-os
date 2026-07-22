@@ -5489,7 +5489,7 @@ mod tests {
         // means the emitted decision schema is only accidentally right.
         for (event, expected) in [
             ("PreToolUse", "pre-tool-use"),
-            ("TaskCompleted", "stop"),
+            ("Stop", "stop"),
             ("PreCompact", "pre-compact"),
         ] {
             let args = hooks
@@ -5503,6 +5503,39 @@ mod tests {
                 args,
                 ["hook", expected],
                 "{event} must reach the dedicated handler, not the generic event path"
+            );
+        }
+
+        // The finish gate blocks with a top-level `{"decision": "block"}`, which
+        // is the Stop schema. TaskCompleted blocks with `continue: false` or
+        // exit code 2 instead, so declaring the gate there would emit a
+        // decision Claude Code does not read -- a gate that silently allows.
+        assert!(
+            !declared.contains_key("TaskCompleted"),
+            "the stop handler emits the Stop decision schema, not TaskCompleted's"
+        );
+
+        // A hook that can block must be able to answer before the turn moves
+        // on; one that only records must not hold the turn up.
+        for (event, blocking) in [
+            ("SessionStart", true),
+            ("PreToolUse", true),
+            ("PreCompact", true),
+            ("Stop", true),
+            ("PostToolUseFailure", false),
+            ("SubagentStart", false),
+            ("SubagentStop", false),
+            ("SessionEnd", false),
+        ] {
+            let is_async = hooks
+                .pointer(&format!("/hooks/{event}/0/hooks/0/async"))
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            assert_eq!(
+                is_async,
+                !blocking,
+                "{event} is declared {}synchronous",
+                if blocking { "a" } else { "" }
             );
         }
         Ok(())
