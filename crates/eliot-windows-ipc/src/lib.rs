@@ -1999,7 +1999,12 @@ mod tests {
         let mut child = SuspendedJobChild::spawn(&managed_powershell(script, &root))?;
         let mut stdout = child.take_stdout().ok_or("stdout")?;
         let mut stderr = child.take_stderr().ok_or("stderr")?;
-        assert_eq!(child.wait_timeout(Duration::from_secs(5))?, Some(0));
+        // Setup, not the assertion under test: this only waits for PowerShell
+        // to start and exit. A cold CI runner takes well over five seconds to
+        // do that, and treating slow startup as a job-object failure made the
+        // test report the wrong defect. The bound that matters is the one
+        // below -- that terminate closes the inherited pipes promptly.
+        assert_eq!(child.wait_timeout(Duration::from_secs(60))?, Some(0));
         let started = Instant::now();
         child.terminate(37)?;
         let mut stdout_bytes = Vec::new();
