@@ -513,13 +513,26 @@ pub(super) fn activate_claude_surface(
         }));
     }
     if stand_down_active {
+        // Not automated, and deliberately so. Claude Desktop owns its own
+        // extension registry: uninstall opens Desktop and waits for Claude to
+        // remove the entry, rather than ELIOT editing another application's
+        // state behind its back. The Code plugin is likewise Claude Code's to
+        // enable and disable. Selection is recorded here; the surface change
+        // is executed through the owner.
         actions.push(json!({
             "action": "stand_down_surface",
             "surface": stand_down.as_str(),
             "command": format!("host uninstall --host {}", match stand_down {
                 ClaudeSurface::ClaudeCodePlugin => "claude",
                 ClaudeSurface::ClaudeDesktopMcpb => "claude-desktop",
-            })
+            }),
+            "automated": false,
+            "reason": match stand_down {
+                ClaudeSurface::ClaudeCodePlugin =>
+                    "Claude Code owns plugin activation; run the command or `claude plugin disable eliot@skills-dir`",
+                ClaudeSurface::ClaudeDesktopMcpb =>
+                    "Claude Desktop owns its extension registry; uninstall opens Desktop and waits for it to remove the entry",
+            }
         }));
     }
 
