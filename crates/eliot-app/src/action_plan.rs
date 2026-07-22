@@ -237,12 +237,12 @@ pub fn default_verifier_plan(path: &str) -> VerifierPlan {
                 expected_signal: "workspace type-checks".to_owned(),
             },
             VerifierRequirement {
-                name: "phase-e1-closeout".to_owned(),
+                name: "workspace-tests".to_owned(),
                 command_kind: VerifierCommandKind::DomainVerifier,
-                command_display: "cargo run -p eliot-app -- phase-e1 closeout".to_owned(),
+                command_display: "cargo test --workspace".to_owned(),
                 scope: vec![path.to_owned()],
                 required_for_done: true,
-                expected_signal: "Phase E1 closeout reports DONE_VERIFIED".to_owned(),
+                expected_signal: "workspace tests pass".to_owned(),
             },
         ],
         optional: vec![VerifierRequirement {

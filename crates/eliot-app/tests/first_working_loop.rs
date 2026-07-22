@@ -708,7 +708,7 @@ fn first_working_loop_end_to_end() -> TestResult {
             "project_id": project_id,
             "task_id": task_id,
             "write_id": create_write,
-            "title": "Phase L2 deterministic First Working Loop",
+            "title": "deterministic First Working Loop",
             "acceptance_items": [
                 {"item_id": acceptance_ids[0], "description": "one scoped observation is receipted", "required_evidence": "observation"},
                 {"item_id": acceptance_ids[1], "description": "one trusted verifier result is receipted", "required_evidence": "verification"}

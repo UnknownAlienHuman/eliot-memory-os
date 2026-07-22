@@ -161,7 +161,7 @@ impl IpcServer {
         _instance: &RuntimeInstance,
         _store_root: &Path,
     ) -> Result<Self> {
-        anyhow::bail!("Phase L2 named-pipe IPC requires Windows")
+        anyhow::bail!("named-pipe IPC requires Windows")
     }
 
     pub(crate) fn name(&self) -> &str {
@@ -169,7 +169,7 @@ impl IpcServer {
     }
 
     pub(crate) fn publish_ready(&mut self) -> Result<RuntimePublication> {
-        anyhow::bail!("Phase L2 named-pipe IPC requires Windows")
+        anyhow::bail!("named-pipe IPC requires Windows")
     }
 
     pub(crate) async fn serve(
@@ -177,7 +177,7 @@ impl IpcServer {
         _daemon: Arc<McpDaemon>,
         _shutdown: watch::Receiver<bool>,
     ) -> Result<()> {
-        anyhow::bail!("Phase L2 named-pipe IPC requires Windows")
+        anyhow::bail!("named-pipe IPC requires Windows")
     }
 }
 
@@ -327,7 +327,7 @@ pub(crate) async fn probe_authenticated_client(
     _instance: &RuntimeInstance,
     _profile: &str,
 ) -> Result<RuntimePublication> {
-    anyhow::bail!("Phase L2 named-pipe IPC requires Windows")
+    anyhow::bail!("named-pipe IPC requires Windows")
 }
 
 #[cfg(windows)]
@@ -1266,7 +1266,7 @@ pub(crate) async fn run_stdio_client(
     _profile: &str,
     _requested_scope: Option<RequestedSessionScope>,
 ) -> Result<()> {
-    anyhow::bail!("Phase L2 named-pipe IPC requires Windows")
+    anyhow::bail!("named-pipe IPC requires Windows")
 }
 
 #[cfg(test)]

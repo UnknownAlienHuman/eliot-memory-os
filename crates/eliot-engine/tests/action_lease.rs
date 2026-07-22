@@ -493,7 +493,7 @@ impl Drop for TestLock {
 }
 
 async fn migrate_schema_locked(store: &CanonicalStore) -> TestResult {
-    let lock_path = repo_root().join("target/phase-e1-migrate.lock");
+    let lock_path = repo_root().join("target/action-lease-migrate.lock");
     if let Some(parent) = lock_path.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -530,7 +530,7 @@ fn report() -> CodeCortexReport {
     }];
     CodeCortexReport {
         project: "eliot-governor".to_owned(),
-        task: "phase-e1-test-report".to_owned(),
+        task: "action-lease-test-report".to_owned(),
         goal: "Plan an E1 ActionLease change without executing patches".to_owned(),
         generated_at: time::OffsetDateTime::now_utc(),
         repo_root: repo_root().display().to_string(),
