@@ -657,7 +657,12 @@ fn validate_explicit_safe_root(root: &Path) -> Result<PathBuf> {
         .into_iter()
         .flatten()
         .map(PathBuf::from)
-        .any(|base| path_starts_with_case_insensitive(root, &base));
+        .any(|base| {
+            path_starts_with_case_insensitive(root, &base)
+                || canonicalize_windows(&base).is_ok_and(|canonical_base| {
+                    path_starts_with_case_insensitive(root, &canonical_base)
+                })
+        });
     if !permitted {
         bail!("dogfood runtime root must descend from LOCALAPPDATA or TEMP");
     }
@@ -668,10 +673,7 @@ fn validate_existing_root(root: &Path) -> Result<PathBuf> {
     let safe = validate_explicit_safe_root(root)?;
     let canonical = canonicalize_windows(&safe)
         .with_context(|| format!("canonicalize initialized dogfood root {}", safe.display()))?;
-    if !path_eq_case_insensitive(&canonical, &safe) {
-        bail!("dogfood root canonical path differs from manifest path");
-    }
-    Ok(canonical)
+    validate_explicit_safe_root(&canonical)
 }
 
 fn canonical_git_root(project: &Path) -> Result<PathBuf> {
@@ -1372,5 +1374,31 @@ mod tests {
         assert!(validate_explicit_safe_root(&temp).is_err());
         let git = env::temp_dir().join("repo").join(".git").join("run");
         assert!(validate_explicit_safe_root(&git).is_err());
+    }
+
+    #[test]
+    fn accepts_canonical_temp_base_when_environment_uses_an_alias() -> Result<()> {
+        let canonical_temp = canonicalize_windows(&env::temp_dir())?;
+        let candidate = canonical_temp.join("eliot-dogfood-canonical-base");
+        assert_eq!(validate_explicit_safe_root(&candidate)?, candidate);
+        Ok(())
+    }
+
+    #[test]
+    fn existing_runtime_root_normalizes_an_equivalent_alias() -> Result<()> {
+        let root = env::temp_dir().join(format!(
+            "eliot-dogfood-root-alias-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)?
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root)?;
+        let expected = canonicalize_windows(&root)?;
+
+        assert_eq!(validate_existing_root(&root)?, expected);
+
+        fs::remove_dir_all(&expected)?;
+        Ok(())
     }
 }
