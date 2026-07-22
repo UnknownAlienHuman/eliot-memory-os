@@ -72,10 +72,27 @@ pub(super) fn claude_desktop_install_receipt_path(config_path: &Path) -> PathBuf
         .join("claude-desktop-install.json")
 }
 
-pub(super) fn claude_desktop_package_path(repo: &Path, version: &str) -> PathBuf {
-    repo.join("dist")
+/// Where `scripts/build-claude-desktop-extension.ps1` leaves the package.
+///
+/// The build script moved its output to an external cache so that rebuildable
+/// artifacts stay out of OneDrive, but this resolver kept pointing at the
+/// repository's `dist/`, so installation reported a missing package
+/// immediately after a successful build. The two must read the same
+/// `ELIOT_PACKAGE_ROOT`.
+pub(super) fn claude_desktop_package_path(_repo: &Path, version: &str) -> PathBuf {
+    claude_package_cache_root()
         .join("claude")
         .join(format!("eliot-{version}-windows-x64.mcpb"))
+}
+
+fn claude_package_cache_root() -> PathBuf {
+    if let Some(root) = std::env::var_os("ELIOT_PACKAGE_ROOT") {
+        return PathBuf::from(root);
+    }
+    std::env::var_os("LOCALAPPDATA").map_or_else(
+        || PathBuf::from("Eliot").join("packages"),
+        |local| PathBuf::from(local).join("Eliot").join("packages"),
+    )
 }
 
 pub(super) fn claude_desktop_uninstall_receipt_path(config_path: &Path) -> PathBuf {

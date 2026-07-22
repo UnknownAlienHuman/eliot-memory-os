@@ -4640,22 +4640,41 @@ fn ensure_l7_host(host: AgentHostId) -> Result<()> {
     }
 }
 
+/// The source tree, or the best honest guess at it.
+///
+/// This used to fall back to the runtime root's parent, which was the checkout
+/// only while the runtime lived inside it. Once the runtime moved to
+/// `%LOCALAPPDATA%/Eliot`, that fallback produced
+/// `%LOCALAPPDATA%/integrations/...` -- a path that exists nowhere, so callers
+/// reported "cannot find the path" about a directory nobody had ever named.
+/// Failing back to the working directory keeps a wrong answer recognisable as
+/// one.
 fn repo_root(config_path: &Path) -> PathBuf {
+    let _ = config_path;
     if let Some(root) = std::env::var_os("ELIOT_GOVERNOR_REPO_ROOT") {
         return PathBuf::from(root);
     }
+    let is_source_tree = |candidate: &Path| {
+        candidate.join("Cargo.toml").is_file()
+            && candidate.join("integrations/agent-skills").is_dir()
+    };
     if let Ok(current) = std::env::current_dir()
-        && let Some(root) = current.ancestors().find(|candidate| {
-            candidate.join("Cargo.toml").is_file()
-                && candidate.join("integrations/agent-skills").is_dir()
-        })
+        && let Some(root) = current
+            .ancestors()
+            .find(|candidate| is_source_tree(candidate))
     {
         return root.to_path_buf();
     }
-    runtime_root(config_path).parent().map_or_else(
-        || std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
-        Path::to_path_buf,
-    )
+    // An installed Governor runs from outside the checkout, but a Governor
+    // built for development runs from `<repo>/target/...` or an external build
+    // cache; the first case is worth finding, the second correctly finds
+    // nothing.
+    if let Ok(exe) = std::env::current_exe()
+        && let Some(root) = exe.ancestors().find(|candidate| is_source_tree(candidate))
+    {
+        return root.to_path_buf();
+    }
+    std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
 }
 
 fn runtime_root(config_path: &Path) -> PathBuf {
