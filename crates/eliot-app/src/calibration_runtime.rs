@@ -8,16 +8,14 @@ use eliot_engine::{
     IndependentOutcomeEvidenceService, ProviderUtilityAssessmentService,
 };
 use eliot_types::{
-    AntigravityNormalizedResult, CalibrationCompleteness, CalibrationCorpusSampleKind,
-    CalibrationEvidenceClass, CalibrationIntegrityStatus, CampaignIntegrityIncidentStatus,
-    CampaignIntegrityRootCauseStatus, DelegationCalibrationCampaign,
-    DelegationCalibrationCampaignBudget, DelegationCalibrationCampaignCloseoutStatus,
-    DelegationCalibrationCampaignState, DelegationCalibrationConfig, DelegationCalibrationCosts,
-    DelegationCalibrationLabels, DelegationCalibrationSample, DelegationCalibrationState,
-    DelegationCalibrationTaskFamily, DelegationDecisionKind, DelegationEvidenceFloorSnapshot,
-    DelegationOutcomeStatus, DelegationPolicyPromotionDecisionKind,
-    DelegationPromotionReadinessVerdict, DelegationReviewKind, ExecutedProviderReview,
-    ExecutedProviderReviewStatus, IndependentOutcomeEvidence, ProjectId, TaskId, WorkLeaseId,
+    AntigravityNormalizedResult, CalibrationCompleteness, CalibrationEvidenceClass,
+    DelegationCalibrationCampaign, DelegationCalibrationCampaignBudget,
+    DelegationCalibrationCampaignCloseoutStatus, DelegationCalibrationCampaignState,
+    DelegationCalibrationConfig, DelegationCalibrationCosts, DelegationCalibrationLabels,
+    DelegationCalibrationSample, DelegationCalibrationState, DelegationCalibrationTaskFamily,
+    DelegationDecisionKind, DelegationEvidenceFloorSnapshot, DelegationOutcomeStatus,
+    DelegationReviewKind, ExecutedProviderReview, ExecutedProviderReviewStatus,
+    IndependentOutcomeEvidence, ProjectId, TaskId, WorkLeaseId,
 };
 use serde::{Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
