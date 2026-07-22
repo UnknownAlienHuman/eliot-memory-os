@@ -23,12 +23,42 @@ pub struct HookProcessingResult {
 
 pub struct EliotHookService {
     runtime_root: PathBuf,
+    task_bound: bool,
 }
 
 impl EliotHookService {
+    /// A service that gates. Use this only when the session is attached to an
+    /// ELIOT task; see [`EliotHookService::unbound`] for the alternative.
     pub fn new(runtime_root: impl Into<PathBuf>) -> Self {
         Self {
             runtime_root: runtime_root.into(),
+            task_bound: true,
+        }
+    }
+
+    /// The plugin is installed at user scope, so these hooks fire in every
+    /// Claude session on the machine -- including projects that have nothing to
+    /// do with ELIOT. A session with no attached task has no lease to check
+    /// against and no completion to gate, so the enforcement points defer
+    /// instead of blocking. Observation is unchanged: the event is still
+    /// spooled, it just cannot deny anything.
+    #[must_use]
+    pub fn unbound(runtime_root: impl Into<PathBuf>) -> Self {
+        Self {
+            runtime_root: runtime_root.into(),
+            task_bound: false,
+        }
+    }
+
+    /// Builds the service for a session, gating only when `ELIOT_TASK_ID`
+    /// attaches it to a task. This is the same binding signal the generic host
+    /// event path uses, so the two cannot disagree about whether a session is
+    /// ELIOT's to govern.
+    #[must_use]
+    pub fn for_session(runtime_root: impl Into<PathBuf>, task_attached: bool) -> Self {
+        Self {
+            runtime_root: runtime_root.into(),
+            task_bound: task_attached,
         }
     }
 
@@ -74,6 +104,20 @@ impl EliotHookService {
         &self,
         event: &EliotHookEvent,
     ) -> Result<(bool, HookProcessingStatus, Vec<HookDecisionReason>), EngineError> {
+        // Every arm below that can block is reachable only for a bound
+        // session. An unbound one falls through to the same spooled
+        // observation the non-gating events get.
+        if !self.task_bound
+            && matches!(
+                event.kind,
+                HookEventKind::PreToolUse | HookEventKind::PermissionRequest | HookEventKind::Stop
+            )
+        {
+            return Ok(allow_decision(
+                "session_not_eliot_bound",
+                "ELIOT defers: this session is not attached to an ELIOT task.",
+            ));
+        }
         match event.kind {
             HookEventKind::PreToolUse => Ok(evaluate_pre_tool_use(event)),
             HookEventKind::PermissionRequest => Ok(evaluate_permission_request(event)),

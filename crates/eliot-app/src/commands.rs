@@ -3742,7 +3742,11 @@ pub fn run_hook(config_path: &Path, kind: HookEventKind) -> Result<()> {
     } else {
         serde_json::from_str(&input).context("parse hook JSON stdin")?
     };
-    let result = EliotHookService::new(runtime_root(config_path)).process(kind, &payload)?;
+    let task_attached = std::env::var("ELIOT_TASK_ID")
+        .ok()
+        .is_some_and(|value| !value.trim().is_empty());
+    let result = EliotHookService::for_session(runtime_root(config_path), task_attached)
+        .process(kind, &payload)?;
     write_json(&result.decision.stdout)
 }
 
@@ -4674,15 +4678,16 @@ fn resolve_runtime_executable_path(root: &Path, configured: &str) -> PathBuf {
     }
 }
 
-fn plugin_root(config_path: &Path) -> PathBuf {
+/// The Codex plugin source, which is tracked in the repository. It used to be
+/// derived from the runtime root's parent, which held only while the runtime
+/// lived inside the checkout; once it moved to `%LOCALAPPDATA%` that resolved
+/// to `%LOCALAPPDATA%/plugin/eliot-governor` and every verify check failed on a
+/// missing path rather than on anything about the plugin.
+fn plugin_root(_config_path: &Path) -> PathBuf {
     if let Some(path) = std::env::var_os("ELIOT_GOVERNOR_PLUGIN_ROOT") {
         return PathBuf::from(path);
     }
-    runtime_root(config_path)
-        .parent()
-        .unwrap_or_else(|| Path::new("."))
-        .join("plugin")
-        .join("eliot-governor")
+    repo_root().join("plugin").join("eliot-governor")
 }
 
 fn parse_project_id(value: &str) -> Result<ProjectId> {
@@ -6948,8 +6953,22 @@ fn read_or_generate_doctor_report(config_path: &Path) -> Result<serde_json::Valu
     }
 }
 
+/// The source tree, found by walking up from the working directory to the
+/// workspace that owns the canonical skills. Plain `current_dir` was wrong from
+/// any subdirectory, and deriving it from the runtime root stopped working when
+/// the runtime moved out of the repository.
 fn repo_root() -> PathBuf {
-    std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+    if let Some(root) = std::env::var_os("ELIOT_GOVERNOR_REPO_ROOT") {
+        return PathBuf::from(root);
+    }
+    let current = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    current
+        .ancestors()
+        .find(|candidate| {
+            candidate.join("Cargo.toml").is_file()
+                && candidate.join("integrations/agent-skills").is_dir()
+        })
+        .map_or(current.clone(), Path::to_path_buf)
 }
 
 fn parse_data_root_mode(value: &str) -> Result<DataRootMode> {

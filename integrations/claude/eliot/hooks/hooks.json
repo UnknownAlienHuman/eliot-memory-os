@@ -1,5 +1,5 @@
 {
-  "description": "One authority gate plus the session and delegation events that carry real ELIOT evidence. Events that change no ELIOT state are deliberately absent: this plugin is installed at user scope, so every hook here fires in every Claude session on the machine.",
+  "description": "Two enforcement points and the session events that carry real ELIOT evidence. Events that change no ELIOT state are deliberately absent: this plugin is installed at user scope, so every hook here fires in every Claude session on the machine. Enforcement runs through `hook <event>`, which emits the exact per-event decision schema and defers when the session is not attached to an ELIOT task; pure observation runs through `host event`, which has no decision to make.",
   "hooks": {
     "SessionStart": [
       {
@@ -7,7 +7,7 @@
           {
             "type": "command",
             "command": "${CLAUDE_PLUGIN_ROOT}/bin/eliot-governor.exe",
-            "args": ["host", "event", "--host", "claude", "--event", "SessionStart"],
+            "args": ["hook", "session-start"],
             "timeout": 10
           }
         ]
@@ -20,7 +20,7 @@
           {
             "type": "command",
             "command": "${CLAUDE_PLUGIN_ROOT}/bin/eliot-governor.exe",
-            "args": ["host", "event", "--host", "claude", "--event", "PreToolUse"],
+            "args": ["hook", "pre-tool-use"],
             "timeout": 10
           }
         ]
@@ -45,7 +45,7 @@
           {
             "type": "command",
             "command": "${CLAUDE_PLUGIN_ROOT}/bin/eliot-governor.exe",
-            "args": ["host", "event", "--host", "claude", "--event", "SubagentStart"],
+            "args": ["hook", "subagent-start"],
             "timeout": 10
           }
         ]
@@ -57,7 +57,7 @@
           {
             "type": "command",
             "command": "${CLAUDE_PLUGIN_ROOT}/bin/eliot-governor.exe",
-            "args": ["host", "event", "--host", "claude", "--event", "SubagentStop"],
+            "args": ["hook", "subagent-stop"],
             "timeout": 10
           }
         ]
@@ -69,7 +69,7 @@
           {
             "type": "command",
             "command": "${CLAUDE_PLUGIN_ROOT}/bin/eliot-governor.exe",
-            "args": ["host", "event", "--host", "claude", "--event", "PreCompact"],
+            "args": ["hook", "pre-compact"],
             "timeout": 10
           }
         ]
@@ -81,7 +81,7 @@
           {
             "type": "command",
             "command": "${CLAUDE_PLUGIN_ROOT}/bin/eliot-governor.exe",
-            "args": ["host", "event", "--host", "claude", "--event", "TaskCompleted"],
+            "args": ["hook", "stop"],
             "timeout": 10
           }
         ]

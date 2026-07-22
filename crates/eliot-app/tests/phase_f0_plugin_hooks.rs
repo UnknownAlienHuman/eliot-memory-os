@@ -149,6 +149,45 @@ fn hook_pre_tool_use_denies_unleased_patch() -> TestResult {
     Ok(())
 }
 
+/// The plugin lives at user scope, so this hook fires on every project on the
+/// machine. Blocking a patch in a session ELIOT was never asked to govern would
+/// make the plugin unusable, so an unbound session must be let through -- and
+/// this is the exact payload that gets denied when a task is attached.
+#[test]
+fn hook_pre_tool_use_defers_outside_an_eliot_session() -> TestResult {
+    let output = run_unbound_hook(
+        "hook-pre-tool-unbound",
+        "pre-tool-use",
+        &json!({ "tool_name": "apply_patch" }),
+    )?;
+    assert_ne!(
+        output
+            .get("hookSpecificOutput")
+            .and_then(|value| value.get("permissionDecision"))
+            .and_then(Value::as_str),
+        Some("deny"),
+        "an unbound session must not be blocked"
+    );
+    Ok(())
+}
+
+/// Same contract for the finish gate: DONE without DONE_VERIFIED is only
+/// ELIOT's business when the session is attached to an ELIOT task.
+#[test]
+fn hook_stop_defers_outside_an_eliot_session() -> TestResult {
+    let output = run_unbound_hook(
+        "hook-stop-unbound",
+        "stop",
+        &json!({ "final_status": "DONE" }),
+    )?;
+    assert_ne!(
+        output.get("decision").and_then(Value::as_str),
+        Some("block"),
+        "an unbound session must not be blocked"
+    );
+    Ok(())
+}
+
 #[test]
 fn hook_pre_tool_use_allows_governed_mcp_read() -> TestResult {
     let output = run_hook(
@@ -238,7 +277,13 @@ fn hook_stop_allows_verified_done() -> TestResult {
 
 #[test]
 fn plugin_verify_report_generated() -> TestResult {
+    // Pin the runtime: without `--config` the report lands in whatever runtime
+    // root this machine happens to have, and the test then reads a path that
+    // only exists when the runtime lives inside the checkout.
+    let runtime = runtime_for("plugin-verify");
     let output = Command::new(binary())
+        .arg("--config")
+        .arg(runtime.join("config").join("governor.toml"))
         .arg("plugin")
         .arg("verify")
         .current_dir(repo_root())
@@ -248,12 +293,7 @@ fn plugin_verify_report_generated() -> TestResult {
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
-    let report = read_json(
-        &test_runtime_root()
-            .join("reports")
-            .join("plugin")
-            .join("latest.json"),
-    )?;
+    let report = read_json(&runtime.join("reports").join("plugin").join("latest.json"))?;
     assert_eq!(
         report.get("final_status").and_then(Value::as_str),
         Some("DONE_VERIFIED")
@@ -272,19 +312,48 @@ fn the_dependency_doctor_still_checks_the_forbidden_crates() -> TestResult {
     Ok(())
 }
 
+/// Runs a hook in a session attached to an ELIOT task, which is the only
+/// context in which the enforcement points may block.
 fn run_hook(name: &str, hook: &str, payload: &Value) -> TestResult<Value> {
     let runtime = runtime_for(name);
     run_hook_with_runtime(&runtime, hook, payload)
 }
 
+/// Runs a hook in a session that is not ELIOT's to govern -- the state every
+/// unrelated project on the machine is in.
+fn run_unbound_hook(name: &str, hook: &str, payload: &Value) -> TestResult<Value> {
+    let runtime = runtime_for(name);
+    run_hook_inner(&runtime, hook, payload, None)
+}
+
 fn run_hook_with_runtime(runtime: &Path, hook: &str, payload: &Value) -> TestResult<Value> {
+    run_hook_inner(
+        runtime,
+        hook,
+        payload,
+        Some("01936000-0000-7000-8000-000000000001"),
+    )
+}
+
+fn run_hook_inner(
+    runtime: &Path,
+    hook: &str,
+    payload: &Value,
+    task_id: Option<&str>,
+) -> TestResult<Value> {
     let config_path = runtime.join("config").join("governor.toml");
-    let mut child = Command::new(binary())
+    let mut command = Command::new(binary());
+    command
         .arg("--config")
         .arg(config_path)
         .arg("hook")
         .arg(hook)
-        .current_dir(repo_root())
+        .current_dir(repo_root());
+    match task_id {
+        Some(value) => command.env("ELIOT_TASK_ID", value),
+        None => command.env_remove("ELIOT_TASK_ID"),
+    };
+    let mut child = command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

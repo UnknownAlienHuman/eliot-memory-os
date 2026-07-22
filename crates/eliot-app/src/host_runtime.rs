@@ -5463,6 +5463,29 @@ mod tests {
         for tool in ["Bash", "Edit", "Write", "NotebookEdit"] {
             assert!(matcher.contains(tool), "{tool} must reach the gate");
         }
+
+        // An enforcement point must run the dedicated handler. The generic
+        // `host event` path answers every event with one shape and hardcodes
+        // `PreToolUse` into its deny response, so routing a gate through it
+        // means the emitted decision schema is only accidentally right.
+        for (event, expected) in [
+            ("PreToolUse", "pre-tool-use"),
+            ("TaskCompleted", "stop"),
+            ("PreCompact", "pre-compact"),
+        ] {
+            let args = hooks
+                .pointer(&format!("/hooks/{event}/0/hooks/0/args"))
+                .and_then(Value::as_array)
+                .ok_or_else(|| anyhow::anyhow!("{event} args"))?
+                .iter()
+                .filter_map(Value::as_str)
+                .collect::<Vec<_>>();
+            assert_eq!(
+                args,
+                ["hook", expected],
+                "{event} must reach the dedicated handler, not the generic event path"
+            );
+        }
         Ok(())
     }
 
