@@ -118,9 +118,11 @@ use tracing::info;
 
 mod antigravity;
 mod eval;
+mod skill_fixtures;
 
 pub use antigravity::*;
 pub use eval::*;
+use skill_fixtures::*;
 
 pub async fn run_doctor_command(config_path: &Path, offline: bool) -> Result<()> {
     let startup = build_startup_report(config_path, offline).await?;
@@ -1585,301 +1587,6 @@ pub fn run_startup_recovery_report(config_path: &Path) -> Result<()> {
     write_json(&value)
 }
 
-fn phase_i1_skill_cards() -> Vec<SkillCardV2> {
-    vec![
-        SkillRegistryService::create_candidate("Phase I1 candidate", "codex"),
-        phase_i1_active_skill(),
-        phase_i1_active_skill_with_id(SkillId::new_v7(), SkillState::Stale),
-        phase_i1_active_skill_with_id(SkillId::new_v7(), SkillState::Archived),
-        phase_i1_active_skill_with_id(SkillId::new_v7(), SkillState::Quarantined),
-    ]
-}
-
-fn phase_i1_filter_skill_cards() -> Vec<SkillCardV2> {
-    vec![
-        phase_i1_active_skill(),
-        phase_i1_irrelevant_skill(),
-        phase_i1_rare_skill(),
-        SkillRegistryService::create_candidate("Phase I1 candidate", "codex"),
-    ]
-}
-
-fn phase_i1_active_skill() -> SkillCardV2 {
-    phase_i1_active_skill_with_id(SkillId::new_v7(), SkillState::Active)
-}
-
-fn phase_i1_rare_skill() -> SkillCardV2 {
-    let mut skill = phase_i1_active_skill_with_id(SkillId::new_v7(), SkillState::Active);
-    "Rare Phase I1 verifier routing".clone_into(&mut skill.name);
-    skill.success_count = 0;
-    skill.failure_count = 0;
-    skill.source_trace_refs = vec!["evidence:rare-skill-protected".to_owned()];
-    skill
-}
-
-fn phase_i1_irrelevant_skill() -> SkillCardV2 {
-    let mut skill = phase_i1_active_skill_with_id(SkillId::new_v7(), SkillState::Active);
-    "Irrelevant release-note writing".clone_into(&mut skill.name);
-    skill.applies_when = vec![SkillScopeRule {
-        rule_id: "release-notes".to_owned(),
-        description: "release note drafting".to_owned(),
-        positive_examples: vec!["release notes".to_owned()],
-        negative_examples: vec!["phase-i1 skill lifecycle".to_owned()],
-        required_evidence_refs: Vec::new(),
-    }];
-    skill
-}
-
-fn phase_i1_active_skill_with_id(skill_id: SkillId, state: SkillState) -> SkillCardV2 {
-    let now = time::OffsetDateTime::now_utc();
-    SkillCardV2 {
-        skill_id,
-        name: "Phase I1 skill lifecycle foundation".to_owned(),
-        purpose: "govern procedural skill activation, L3 inclusion, and execution proof".to_owned(),
-        level: eliot_types::SkillLevel::Procedure,
-        lifecycle_state: state,
-        applies_when: vec![SkillScopeRule {
-            rule_id: "phase-i1-scope".to_owned(),
-            description: "phase-i1 skill lifecycle foundation".to_owned(),
-            positive_examples: vec!["phase-i1-smoke".to_owned(), "skill lifecycle".to_owned()],
-            negative_examples: vec!["release notes".to_owned()],
-            required_evidence_refs: vec!["evidence:phase-i1".to_owned()],
-        }],
-        does_not_apply_when: vec![SkillScopeRule {
-            rule_id: "phase-i1-anti-scope".to_owned(),
-            description: "raw sql or external agent bypass".to_owned(),
-            positive_examples: vec!["raw sql".to_owned(), "external agent".to_owned()],
-            negative_examples: vec!["governed skill proof".to_owned()],
-            required_evidence_refs: Vec::new(),
-        }],
-        required_inputs: vec![
-            SkillInputRequirement {
-                name: "task_goal".to_owned(),
-                description: "current user task".to_owned(),
-                required: true,
-                source: SkillInputSource::UserPrompt,
-            },
-            SkillInputRequirement {
-                name: "verifier_plan".to_owned(),
-                description: "required verifier plan for completion".to_owned(),
-                required: true,
-                source: SkillInputSource::VerifierPlan,
-            },
-        ],
-        ordered_steps: vec![
-            SkillStep {
-                step_id: "inspect-scope".to_owned(),
-                order: 1,
-                instruction: "Confirm scope, anti-scope, required inputs, and lifecycle state."
-                    .to_owned(),
-                expected_observation: Some("activation gate decision is explicit".to_owned()),
-                required_tool_or_capability: None,
-                stop_if_fails: true,
-            },
-            SkillStep {
-                step_id: "run-verifier".to_owned(),
-                order: 2,
-                instruction: "Run required verifier and attach refs to SkillExecutionProof."
-                    .to_owned(),
-                expected_observation: Some("verifier refs are present".to_owned()),
-                required_tool_or_capability: Some("rust-verifier".to_owned()),
-                stop_if_fails: true,
-            },
-        ],
-        required_tools_and_capabilities: vec![SkillToolRequirement {
-            capability: "rust-verifier".to_owned(),
-            required: true,
-            allowed_tools: vec!["cargo".to_owned(), "just".to_owned()],
-            forbidden_tools: vec!["surreal sql".to_owned(), "external-agent".to_owned()],
-        }],
-        expected_outputs: vec![SkillOutputSpec {
-            name: "SkillExecutionProof".to_owned(),
-            description: "proof with steps, outputs, and verifier refs".to_owned(),
-            evidence_required: true,
-            verifier_required: true,
-        }],
-        verification_plan: phase_i1_verifier_plan(),
-        stop_conditions: vec![
-            "anti-scope matches".to_owned(),
-            "required verifier unavailable".to_owned(),
-        ],
-        known_failure_modes: vec![SkillFailureMode {
-            failure_id: "phase-i1-known-failure".to_owned(),
-            description: "negative transfer from irrelevant procedural recall".to_owned(),
-            detection_signal: "phase-i1-known-failure".to_owned(),
-            mitigation: "exclude or quarantine skill".to_owned(),
-            negative_memory_refs: vec!["failure:phase-i1-known-failure".to_owned()],
-        }],
-        rollback_or_recovery: Some("archive or quarantine the skill with evidence".to_owned()),
-        source_trace_refs: vec!["evidence:phase-i1".to_owned()],
-        replay_result_refs: vec!["replay:phase-i1-smoke".to_owned()],
-        success_count: 1,
-        failure_count: 0,
-        last_verified_at: Some(now),
-        version: "1.0.0".to_owned(),
-        owner: "eliot-governor".to_owned(),
-        created_at: now,
-        updated_at: now,
-    }
-}
-
-fn phase_i1_verifier_plan() -> VerifierPlan {
-    VerifierPlan {
-        required: vec![VerifierRequirement {
-            name: "just_verify".to_owned(),
-            command_kind: VerifierCommandKind::DomainVerifier,
-            command_display: "just verify".to_owned(),
-            scope: vec!["eliot-governor".to_owned()],
-            required_for_done: true,
-            expected_signal: "exit code 0".to_owned(),
-        }],
-        optional: Vec::new(),
-        acceptance_items: vec!["skill execution proof has verifier refs".to_owned()],
-    }
-}
-
-fn phase_i1_skill_context(task: &str) -> SkillActivationContext {
-    SkillActivationContext {
-        goal: format!("phase-i1 skill lifecycle foundation task {task}"),
-        evidence_refs: vec!["evidence:phase-i1".to_owned()],
-        available_input_sources: vec![
-            SkillInputSource::UserPrompt,
-            SkillInputSource::CurrentState,
-            SkillInputSource::VerifierPlan,
-        ],
-        available_input_names: vec!["task_goal".to_owned(), "verifier_plan".to_owned()],
-        available_capabilities: vec!["rust-verifier".to_owned()],
-        available_tools: vec!["cargo".to_owned(), "just".to_owned()],
-        verifier_refs: vec!["just verify".to_owned()],
-        active_negative_signals: Vec::new(),
-        conflicting_skill_refs: Vec::new(),
-        audit_mode: false,
-    }
-}
-
-fn phase_i2_curator_run(project: &str, dry_run: bool) -> SkillCuratorRun {
-    SkillCuratorService::run(SkillCuratorRunInput {
-        project_id: project_id_from_label(project),
-        project: project.to_owned(),
-        dry_run,
-        skills: phase_i2_skill_cards(),
-    })
-}
-
-fn phase_i2_gate_decisions(run: &SkillCuratorRun) -> Vec<SkillCurationGateDecision> {
-    run.proposals
-        .iter()
-        .map(|proposal| SkillCurationGate::decide(proposal, false))
-        .collect()
-}
-
-fn phase_i2_skill_cards() -> Vec<SkillCardV2> {
-    let mut repeated_success = phase_i1_active_skill_with_id(SkillId::new_v7(), SkillState::Active);
-    "Phase I2 repeated success skill".clone_into(&mut repeated_success.name);
-    repeated_success.success_count = 3;
-    repeated_success.failure_count = 0;
-
-    let mut missing_anti_scope =
-        phase_i1_active_skill_with_id(SkillId::new_v7(), SkillState::Active);
-    "Phase I2 missing anti-scope skill".clone_into(&mut missing_anti_scope.name);
-    missing_anti_scope.does_not_apply_when.clear();
-
-    let mut low_utility = phase_i1_active_skill_with_id(SkillId::new_v7(), SkillState::Active);
-    "Phase I2 low utility high cost skill".clone_into(&mut low_utility.name);
-    low_utility.success_count = 0;
-    low_utility.failure_count = 5;
-    low_utility
-        .ordered_steps
-        .extend((0..20).map(|index| SkillStep {
-            step_id: format!("phase-i2-expensive-{index}"),
-            order: index + 20,
-            instruction: "large context cost step with repeated low utility".repeat(4),
-            expected_observation: None,
-            required_tool_or_capability: None,
-            stop_if_fails: false,
-        }));
-
-    let mut negative_transfer =
-        phase_i1_active_skill_with_id(SkillId::new_v7(), SkillState::Active);
-    "Phase I2 negative transfer skill".clone_into(&mut negative_transfer.name);
-    negative_transfer.success_count = 0;
-    negative_transfer.failure_count = 3;
-    negative_transfer
-        .known_failure_modes
-        .push(SkillFailureMode {
-            failure_id: "phase-i2-negative-transfer".to_owned(),
-            description: "negative transfer into unrelated procedural task".to_owned(),
-            detection_signal: "negative-transfer".to_owned(),
-            mitigation: "quarantine and retain audit trail".to_owned(),
-            negative_memory_refs: vec!["failure:phase-i2-negative-transfer".to_owned()],
-        });
-
-    let mut overbroad = phase_i1_active_skill_with_id(SkillId::new_v7(), SkillState::Active);
-    "Phase I2 overbroad skill".clone_into(&mut overbroad.name);
-    overbroad.applies_when.extend([
-        SkillScopeRule {
-            rule_id: "phase-i2-any-project".to_owned(),
-            description: "any project task".to_owned(),
-            positive_examples: vec!["any project".to_owned()],
-            negative_examples: Vec::new(),
-            required_evidence_refs: Vec::new(),
-        },
-        SkillScopeRule {
-            rule_id: "phase-i2-all-tasks".to_owned(),
-            description: "all tasks with tools".to_owned(),
-            positive_examples: vec!["all tasks".to_owned()],
-            negative_examples: Vec::new(),
-            required_evidence_refs: Vec::new(),
-        },
-    ]);
-
-    let duplicate_a = {
-        let mut skill = phase_i1_active_skill_with_id(SkillId::new_v7(), SkillState::Active);
-        "Phase I2 duplicate skill".clone_into(&mut skill.name);
-        "duplicate phase i2 procedural routing".clone_into(&mut skill.purpose);
-        skill
-    };
-    let mut duplicate_b = duplicate_a.clone();
-    duplicate_b.skill_id = SkillId::new_v7();
-
-    let mut rare = phase_i1_active_skill_with_id(SkillId::new_v7(), SkillState::Active);
-    "Phase I2 rare protected skill".clone_into(&mut rare.name);
-    rare.success_count = 1;
-    rare.failure_count = 0;
-    rare.source_trace_refs
-        .push("evidence:phase-i2-rare-important".to_owned());
-
-    vec![
-        repeated_success,
-        missing_anti_scope,
-        low_utility,
-        negative_transfer,
-        overbroad,
-        duplicate_a,
-        duplicate_b,
-        rare,
-    ]
-}
-
-fn skill_curation_receipt(
-    proposal: &SkillCurationProposal,
-    applied: bool,
-    summary: &str,
-) -> SkillCurationReceipt {
-    SkillCurationReceipt {
-        receipt_id: format!("skill-curation-receipt-{}", TaskId::new_v7()),
-        proposal_id: proposal.proposal_id.clone(),
-        project_id: proposal.project_id,
-        skill_ref: proposal.skill_ref,
-        action: proposal.action,
-        applied,
-        summary: summary.to_owned(),
-        rollback_plan: proposal.rollback_plan.clone(),
-        created_at: time::OffsetDateTime::now_utc(),
-        write_receipt: None,
-    }
-}
-
 struct RuntimeReportBundle {
     health: RuntimeHealthReport,
     log_report: RuntimeLogReport,
@@ -2596,12 +2303,12 @@ pub async fn run_skill_create(config_path: &Path, project: &str, name: &str) -> 
 pub fn run_skill_list(config_path: &Path, project: &str) -> Result<()> {
     let root = runtime_root(config_path);
     let project_id = project_id_from_label(project);
-    let skills = phase_i1_skill_cards();
+    let skills = smoke_skill_cards();
     let normal = SkillDistractorFilterService::filter(
         project_id,
         TaskId::new_v7(),
         &skills,
-        &phase_i1_skill_context("phase-i1-smoke"),
+        &smoke_skill_context("phase-i1-smoke"),
     );
     let report = serde_json::json!({
         "component": "skill_list",
@@ -2618,7 +2325,7 @@ pub fn run_skill_list(config_path: &Path, project: &str) -> Result<()> {
 pub fn run_skill_inspect(config_path: &Path, skill: &str) -> Result<()> {
     let root = runtime_root(config_path);
     let skill_id = skill_id_from_label(skill);
-    let card = phase_i1_active_skill_with_id(skill_id, SkillState::Active);
+    let card = smoke_active_skill_with_id(skill_id, SkillState::Active);
     let record = SkillLifecycleService::record_for(&card, None);
     let report = serde_json::json!({
         "component": "skill_inspect",
@@ -2632,7 +2339,7 @@ pub fn run_skill_inspect(config_path: &Path, skill: &str) -> Result<()> {
 pub fn run_skill_activate(config_path: &Path, skill: &str) -> Result<()> {
     let root = runtime_root(config_path);
     let skill_id = skill_id_from_label(skill);
-    let card = phase_i1_active_skill_with_id(skill_id, SkillState::Candidate);
+    let card = smoke_active_skill_with_id(skill_id, SkillState::Candidate);
     let (activated, record) =
         SkillLifecycleService::activate(&card, vec!["evidence:phase-i1-activation".to_owned()])
             .map_err(|decision| anyhow::anyhow!("skill activation denied: {decision:?}"))?;
@@ -2649,7 +2356,7 @@ pub fn run_skill_activate(config_path: &Path, skill: &str) -> Result<()> {
 pub fn run_skill_archive(config_path: &Path, skill: &str, reason: &str) -> Result<()> {
     let root = runtime_root(config_path);
     let skill_id = skill_id_from_label(skill);
-    let card = phase_i1_active_skill_with_id(skill_id, SkillState::Active);
+    let card = smoke_active_skill_with_id(skill_id, SkillState::Active);
     let (archived, record) = SkillLifecycleService::archive(&card, reason);
     let report = serde_json::json!({
         "component": "skill_archive",
@@ -2664,7 +2371,7 @@ pub fn run_skill_archive(config_path: &Path, skill: &str, reason: &str) -> Resul
 pub fn run_skill_quarantine(config_path: &Path, skill: &str, reason: &str) -> Result<()> {
     let root = runtime_root(config_path);
     let skill_id = skill_id_from_label(skill);
-    let card = phase_i1_active_skill_with_id(skill_id, SkillState::Active);
+    let card = smoke_active_skill_with_id(skill_id, SkillState::Active);
     let (quarantined, record) = SkillLifecycleService::quarantine(&card, reason);
     let report = serde_json::json!({
         "component": "skill_quarantine",
@@ -2680,9 +2387,9 @@ pub fn run_skill_estimate(config_path: &Path, project: &str, task: &str) -> Resu
     let root = runtime_root(config_path);
     let project_id = project_id_from_label(project);
     let task_id = task_id_from_label(task);
-    let skill = phase_i1_active_skill();
+    let skill = smoke_active_skill();
     let estimate =
-        SkillNeedEstimator::estimate(project_id, task_id, &skill, &phase_i1_skill_context(task));
+        SkillNeedEstimator::estimate(project_id, task_id, &skill, &smoke_skill_context(task));
     write_skill_report_pair(&root, "skill-activation", "Skill Activation", &estimate)?;
     write_json(&estimate)
 }
@@ -2694,8 +2401,8 @@ pub fn run_skill_filter(config_path: &Path, project: &str, task: &str) -> Result
     let report = SkillDistractorFilterService::filter(
         project_id,
         task_id,
-        &phase_i1_filter_skill_cards(),
-        &phase_i1_skill_context(task),
+        &smoke_filter_skill_cards(),
+        &smoke_skill_context(task),
     );
     write_skill_report_pair(&root, "skill-activation", "Skill Activation", &report)?;
     write_json(&report)
@@ -2729,7 +2436,7 @@ pub async fn run_skill_influence(config_path: &Path, project: &str, task: &str) 
     let root = runtime_root(config_path);
     let project_id = project_id_from_label(project);
     let task_id = task_id_from_label(task);
-    let skill = phase_i1_active_skill();
+    let skill = smoke_active_skill();
     let mut report = SkillInfluenceService::report(SkillInfluenceReportInput {
         project_id,
         task_id,
@@ -2749,8 +2456,8 @@ pub fn run_skill_report(config_path: &Path) -> Result<()> {
     let root = runtime_root(config_path);
     let project_id = ProjectId::new_v7();
     let task_id = TaskId::new_v7();
-    let skills = phase_i1_filter_skill_cards();
-    let context = phase_i1_skill_context("phase-i1-smoke");
+    let skills = smoke_filter_skill_cards();
+    let context = smoke_skill_context("phase-i1-smoke");
     let filter = SkillDistractorFilterService::filter(project_id, task_id, &skills, &context);
     let influence = SkillInfluenceService::report(SkillInfluenceReportInput {
         project_id,
@@ -2774,9 +2481,9 @@ pub fn run_skill_report(config_path: &Path) -> Result<()> {
 
 pub async fn run_skill_curator_run(config_path: &Path, project: &str, dry_run: bool) -> Result<()> {
     let root = runtime_root(config_path);
-    let mut run = phase_i2_curator_run(project, dry_run);
+    let mut run = smoke_curator_run(project, dry_run);
     write_skill_curator_run_to_memory(config_path, &mut run).await?;
-    let gate_decisions = phase_i2_gate_decisions(&run);
+    let gate_decisions = smoke_curator_gate_decisions(&run);
     write_skill_curator_reports(&root, &run, &gate_decisions)?;
     let report = SkillCurationReportService::report(run);
     write_json(&report)
@@ -2796,11 +2503,11 @@ pub async fn run_skill_curator_proposals(config_path: &Path, project: &str) -> R
     let run = if let Some(run) = latest_skill_curator_run(&root)? {
         run
     } else {
-        let mut run = phase_i2_curator_run(project, true);
+        let mut run = smoke_curator_run(project, true);
         write_skill_curator_run_to_memory(config_path, &mut run).await?;
         run
     };
-    let gate_decisions = phase_i2_gate_decisions(&run);
+    let gate_decisions = smoke_curator_gate_decisions(&run);
     write_skill_curator_reports(&root, &run, &gate_decisions)?;
     let report = serde_json::json!({
         "component": "skill_curation_proposals",
@@ -2837,7 +2544,7 @@ pub async fn run_skill_curator_apply(config_path: &Path, proposal_id: &str) -> R
         bail!("skill-curator apply supports only safe patch/archive/quarantine in I2");
     }
 
-    let base_skill = phase_i1_active_skill_with_id(proposal.skill_ref, SkillState::Active);
+    let base_skill = smoke_active_skill_with_id(proposal.skill_ref, SkillState::Active);
     let summary = match proposal.action {
         SkillCurationAction::Patch => {
             let _patched = SkillPatchService::apply_narrow_patch(&base_skill, &proposal).map_err(
