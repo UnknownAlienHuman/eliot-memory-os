@@ -1978,7 +1978,7 @@ mod tests {
         let raw = fs::read(
             Path::new(env!("CARGO_MANIFEST_DIR"))
                 .join("../..")
-                .join("tests/cognitive/phase-l10-l12/fixtures/opencode-events.jsonl"),
+                .join("tests/cognitive/cognitive-contract/fixtures/opencode-events.jsonl"),
         )?;
         let parsed = parse_provider_output(&raw)?;
         assert_eq!(parsed.get("case_id").and_then(Value::as_str), Some("PC-01"));

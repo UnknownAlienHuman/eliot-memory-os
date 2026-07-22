@@ -33,7 +33,7 @@ impl RestartTestRoot {
     fn new() -> Result<Self, Box<dyn Error>> {
         let temp = std::env::temp_dir();
         let path = temp.join(format!(
-            "eliot-phase-l10-l12-restart-{}-{}",
+            "eliot-cognitive-contract-restart-{}-{}",
             std::process::id(),
             WriteId::new_v7()
         ));
@@ -403,7 +403,7 @@ async fn persist<T: Serialize>(
 }
 
 #[tokio::test]
-// The ordered scenario deliberately spans L10-L12 so the same isolated database
+// The ordered scenario deliberately spans the full cognitive contract so the same isolated database
 // proves cross-contour idempotency, client reconstruction, and scoped retrieval.
 #[allow(clippy::too_many_lines)]
 async fn canonical_l10_l12_records_are_idempotent_restart_safe_and_bounded()

@@ -59,7 +59,11 @@ fn dogfood_runtime_starts_doctors_stops_and_restarts_persistent_state() -> TestR
         let doctor = run(&["dogfood", "doctor", "--root", &root_arg])?;
         assert_eq!(doctor["daemon_health"], "ready", "cycle {cycle}");
         assert_eq!(doctor["db_health"], "ready", "cycle {cycle}");
-        assert_eq!(doctor["plugin_bundle_status"], "valid");
+        assert_eq!(
+            doctor["codex_integration_model"],
+            "mcp_and_skills_no_plugin"
+        );
+        assert!(doctor.get("plugin_bundle_status").is_none());
         assert_eq!(
             doctor["project_codex_config_status"],
             "valid_disposable_config"

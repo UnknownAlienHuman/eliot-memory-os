@@ -331,9 +331,10 @@ mod tests {
 
     /// The legacy provider remains reachable, but only by naming it.
     #[test]
-    fn the_legacy_password_file_provider_must_be_requested_explicitly() {
-        let explicit: CredentialProviderKind =
-            serde_json::from_str("\"legacy_password_file\"").expect("legacy variant still parses");
+    fn the_legacy_password_file_provider_must_be_requested_explicitly()
+    -> Result<(), serde_json::Error> {
+        let explicit: CredentialProviderKind = serde_json::from_str("\"legacy_password_file\"")?;
         assert_eq!(explicit, CredentialProviderKind::LegacyPasswordFile);
+        Ok(())
     }
 }

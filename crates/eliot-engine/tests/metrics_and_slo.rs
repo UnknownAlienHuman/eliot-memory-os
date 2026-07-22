@@ -381,7 +381,7 @@ fn mcp_exposes_no_raw_ingest_remote_export_tools() {
 }
 
 #[test]
-fn phase_b_c_d_e_f0_f1_f2_f3_g0_g1_g2_h0_h1_i0_i1_i2_j0_k0_k1_k2_non_regression() {
+fn accumulated_capabilities_non_regression() {
     assert!(!VerificationProfileService.profiles().is_empty());
     assert!(!MetricRegistryService.definitions().is_empty());
 }

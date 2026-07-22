@@ -135,7 +135,7 @@ async fn patch_records_patch_run_through_writer_actor() -> TestResult {
         .runner()
         .preflight(&bundle.input(Some(&bundle.lease)))
         .await?;
-    let harness = Harness::new("phase-e2-patch-records.redb").await?;
+    let harness = Harness::new("patch-runner-patch-records.redb").await?;
     let wal = ControlWal::open(&harness.control_wal)?;
     let (handle, actor) = WriterActor::channel(wal, harness.store, &WriterConfig::default());
     let actor_task = tokio::spawn(actor.run());
@@ -204,7 +204,7 @@ async fn rollback_on_verifier_failure() -> TestResult {
 }
 
 #[test]
-fn phase_b_c_d_e1_non_regression() -> TestResult {
+fn accumulated_capabilities_non_regression() -> TestResult {
     let repo = repo_root();
     let action = fs::read_to_string(repo.join("crates/eliot-engine/src/action.rs"))?;
     let context = fs::read_to_string(repo.join("crates/eliot-engine/src/context.rs"))?;
@@ -422,7 +422,7 @@ fn fixture_repo(name: &str) -> TestResult<PathBuf> {
         repo.join("Cargo.toml"),
         concat!(
             "[package]\n",
-            "name = \"phase-e2-test-fixture\"\n",
+            "name = \"patch-runner-test-fixture\"\n",
             "version = \"0.1.0\"\n",
             "edition = \"2024\"\n\n",
             "[workspace]\n"
@@ -452,8 +452,8 @@ fn report(repo_root: &Path) -> TestResult<CodeCortexReport> {
         source: CodeEvidenceSource::Rg,
     };
     Ok(CodeCortexReport {
-        project: "phase-e2-fixture".to_owned(),
-        task: "phase-e2-test".to_owned(),
+        project: "patch-runner-fixture".to_owned(),
+        task: "patch-runner-test".to_owned(),
         goal: "Patch src/lib.rs".to_owned(),
         generated_at: time::OffsetDateTime::now_utc(),
         repo_root: repo_root.display().to_string(),
@@ -461,8 +461,8 @@ fn report(repo_root: &Path) -> TestResult<CodeCortexReport> {
         dirty: false,
         tracked_files: vec![evidence.clone()],
         workspace_members: vec![repo_root.display().to_string()],
-        crates: vec!["phase-e2-test-fixture".to_owned()],
-        targets: vec!["phase_e2_test_fixture".to_owned()],
+        crates: vec!["patch-runner-test-fixture".to_owned()],
+        targets: vec!["patch_runner_test_fixture".to_owned()],
         file_evidence: vec![evidence],
         symbol_evidence: vec![SymbolEvidence {
             name: "value".to_owned(),
@@ -488,7 +488,7 @@ fn report(repo_root: &Path) -> TestResult<CodeCortexReport> {
         }],
         blast_radius: BlastRadiusView {
             files: vec!["src/lib.rs".to_owned()],
-            crates: vec!["phase-e2-test-fixture".to_owned()],
+            crates: vec!["patch-runner-test-fixture".to_owned()],
             reasons: vec!["test fixture".to_owned()],
         },
         invariant_cards: vec![InvariantCard {
@@ -637,7 +637,7 @@ impl Drop for TestLock {
 }
 
 async fn migrate_schema_locked(store: &CanonicalStore) -> TestResult {
-    let lock_path = repo_root().join("target/phase-e2-migrate.lock");
+    let lock_path = repo_root().join("target/patch-runner-migrate.lock");
     if let Some(parent) = lock_path.parent() {
         fs::create_dir_all(parent)?;
     }

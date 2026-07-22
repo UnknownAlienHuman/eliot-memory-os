@@ -96,15 +96,15 @@ fn fwl_static_safety_boundaries_hold() -> TestResult {
 
     let justfile = include_str!("../../../Justfile");
     let phase_recipe = justfile
-        .split_once("phase-l2-focused:")
-        .ok_or("phase-l2 recipe must exist")?
+        .split_once("first-working-loop-focused:")
+        .ok_or("first-working-loop recipe must exist")?
         .1
         .split_once("doc-test:")
-        .ok_or("phase-l2 recipe must be bounded")?
+        .ok_or("first-working-loop recipe must be bounded")?
         .0;
     assert!(phase_recipe.contains("ELIOT_DISABLE_REAL_PROVIDER = '1'"));
     for forbidden in [
-        "phase-l1c-provider-once",
+        "provider-budget-provider-once",
         "Get-Service",
         "New-Service",
         "Set-ItemProperty",
@@ -113,7 +113,7 @@ fn fwl_static_safety_boundaries_hold() -> TestResult {
     ] {
         assert!(
             !phase_recipe.contains(forbidden),
-            "phase-l2 recipe must not contain host/provider action {forbidden}"
+            "first-working-loop recipe must not contain host/provider action {forbidden}"
         );
     }
 
@@ -845,7 +845,7 @@ fn first_working_loop_end_to_end() -> TestResult {
             "expected_revision": action_revision,
             "action_lease_id": action_lease_id,
             "item_id": acceptance_ids[1],
-            "tool_name": "phase_l3_wrong_evidence_kind_probe",
+            "tool_name": "runtime_security_wrong_evidence_kind_probe",
             "observation": "candidate evidence must not satisfy verification acceptance",
             "status": "passed",
             "scope": format!("eliot/task/{task_id}/acceptance/{}", acceptance_ids[1]),
@@ -870,7 +870,7 @@ fn first_working_loop_end_to_end() -> TestResult {
             "expected_revision": action_revision,
             "action_lease_id": action_lease_id,
             "item_id": acceptance_ids[0],
-            "tool_name": "phase_l2_deterministic_probe",
+            "tool_name": "first_working_loop_deterministic_probe",
             "observation": "daemon owns the receipted task mutation",
             "status": "passed",
             "scope": format!("eliot/task/{task_id}/acceptance/{}", acceptance_ids[0]),
@@ -951,7 +951,7 @@ fn first_working_loop_end_to_end() -> TestResult {
             "expected_revision": observation_revision,
             "action_lease_id": action_lease_id,
             "item_id": acceptance_ids[1],
-            "tool_name": "phase_l2_candidate_substitution_probe",
+            "tool_name": "first_working_loop_candidate_substitution_probe",
             "observation": "candidate evidence must not satisfy a verifier item",
             "status": "passed",
             "scope": format!("eliot/task/{task_id}/acceptance/{}", acceptance_ids[1]),
@@ -1262,7 +1262,7 @@ impl McpClient {
                 "params": {
                     "protocolVersion": "2025-06-18",
                     "capabilities": {},
-                    "clientInfo": {"name": "phase-l2-fwl", "version": "0.1.0"}
+                    "clientInfo": {"name": "first-working-loop-fwl", "version": "0.1.0"}
                 }
             }),
             Duration::from_secs(10),
@@ -1385,7 +1385,7 @@ impl OwnedRuntime {
         let nonce = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
         let temp = std::env::temp_dir();
         let path = temp.join(format!(
-            "eliot-governor-phase-l2-{label}-{}-{nonce}",
+            "eliot-governor-first-working-loop-{label}-{}-{nonce}",
             std::process::id()
         ));
         let lower = path.to_string_lossy().to_ascii_lowercase();
@@ -1765,7 +1765,7 @@ fn assert_no_provider_activity(runtime: &Path) -> TestResult {
         "runtime/provider-call-ledger.json",
         "runtime/provider-invocations",
         "spool/provider-invocations",
-        "reports/phase-l1c-provider-review",
+        "reports/provider-budget-provider-review",
     ] {
         if runtime.join(relative).exists() {
             return Err(
@@ -1793,8 +1793,8 @@ fn write_test_config(runtime: &Path, config_path: &Path, port: u16) -> TestResul
         r#"schema_version = "1"
 
 [service]
-service_name = "EliotGovernorPhaseL2"
-instance_id = "phase-l2-test"
+service_name = "EliotGovernorFirstWorkingLoop"
+instance_id = "first-working-loop-test"
 
 [db]
 mode = "surreal_rpc_server"
@@ -1808,7 +1808,7 @@ ns = "eliot_phase_l2"
 db = "first_working_loop"
 user = "root"
 credential_provider = "legacy_password_file"
-credential_id = "test-only/phase-l2"
+credential_id = "test-only/first-working-loop"
 password_file = "{password_file}"
 log_level = "warn"
 query_timeout_ms = 15000

@@ -493,7 +493,7 @@ async fn patch_request_rejects_payload_different_from_reviewed_artifact() -> Tes
         action_lease: &action_lease,
         diff_text: altered,
         codecortex_report_refs: vec![codecortex_report_ref(&bundle.report)],
-        verifier_plan_ref: "verifier_plan:phase-f2".to_owned(),
+        verifier_plan_ref: "verifier_plan:worktree-lease".to_owned(),
     });
 
     assert!(
@@ -527,7 +527,7 @@ async fn patch_request_rejects_tampered_reviewed_artifact() -> TestResult {
         action_lease: &action_lease,
         diff_text: tampered,
         codecortex_report_refs: vec![codecortex_report_ref(&bundle.report)],
-        verifier_plan_ref: "verifier_plan:phase-f2".to_owned(),
+        verifier_plan_ref: "verifier_plan:worktree-lease".to_owned(),
     });
 
     assert!(
@@ -760,7 +760,7 @@ fn mcp_exposes_no_raw_git_shell_file_tools() -> TestResult {
 }
 
 #[test]
-fn phase_b_c_d_e_f0_f1_non_regression() -> TestResult {
+fn accumulated_capabilities_non_regression() -> TestResult {
     let repo = repo_root();
     let context = fs::read_to_string(repo.join("crates/eliot-engine/src/context.rs"))?;
     let patch = fs::read_to_string(repo.join("crates/eliot-engine/src/patch.rs"))?;
@@ -802,7 +802,7 @@ impl Bundle {
             .parent()
             .and_then(Path::parent)
             .unwrap_or_else(|| Path::new("."))
-            .join("phase-f2-candidate-diffs")
+            .join("worktree-lease-candidate-diffs")
             .join(name);
         if diff_root.exists() {
             fs::remove_dir_all(&diff_root)?;
@@ -821,7 +821,7 @@ impl Bundle {
             WorkCreateRequest {
                 project_id,
                 task_id,
-                project: "phase-f2-fixture".to_owned(),
+                project: "worktree-lease-fixture".to_owned(),
                 task: name.to_owned(),
                 goal: "Exercise WorktreeLease candidate diff governance".to_owned(),
                 scope: default_work_scope(
@@ -965,7 +965,7 @@ impl Bundle {
             action_lease: &action_lease,
             diff_text,
             codecortex_report_refs: vec![codecortex_report_ref(&self.report)],
-            verifier_plan_ref: "verifier_plan:phase-f2".to_owned(),
+            verifier_plan_ref: "verifier_plan:worktree-lease".to_owned(),
         })?;
         let runner = PatchRunner::new(&self.repo_root, None);
         let verifier = VerifierHarness::new(&self.repo_root, None);
@@ -1015,7 +1015,7 @@ impl Bundle {
 }
 
 fn fixture_repo(name: &str) -> TestResult<PathBuf> {
-    let target = repo_root().join("target").join("phase-f2-fixtures");
+    let target = repo_root().join("target").join("worktree-lease-fixtures");
     fs::create_dir_all(&target)?;
     let repo = target.join(name);
     if repo.exists() {
@@ -1029,7 +1029,7 @@ fn fixture_repo(name: &str) -> TestResult<PathBuf> {
         repo.join("Cargo.toml"),
         concat!(
             "[package]\n",
-            "name = \"phase-f2-test-fixture\"\n",
+            "name = \"worktree-lease-test-fixture\"\n",
             "version = \"0.1.0\"\n",
             "edition = \"2024\"\n\n",
             "[workspace]\n"
@@ -1072,8 +1072,8 @@ fn report(repo_root: &Path) -> TestResult<CodeCortexReport> {
         source: CodeEvidenceSource::Rg,
     };
     Ok(CodeCortexReport {
-        project: "phase-f2-fixture".to_owned(),
-        task: "phase-f2-test".to_owned(),
+        project: "worktree-lease-fixture".to_owned(),
+        task: "worktree-lease-test".to_owned(),
         goal: "Patch src/lib.rs through candidate diff".to_owned(),
         generated_at: time::OffsetDateTime::now_utc(),
         repo_root: repo_root.display().to_string(),
@@ -1081,8 +1081,8 @@ fn report(repo_root: &Path) -> TestResult<CodeCortexReport> {
         dirty: false,
         tracked_files: vec![evidence.clone()],
         workspace_members: vec![repo_root.display().to_string()],
-        crates: vec!["phase-f2-test-fixture".to_owned()],
-        targets: vec!["phase_f2_test_fixture".to_owned()],
+        crates: vec!["worktree-lease-test-fixture".to_owned()],
+        targets: vec!["worktree_lease_test_fixture".to_owned()],
         file_evidence: vec![evidence],
         symbol_evidence: vec![SymbolEvidence {
             name: "value".to_owned(),
@@ -1108,7 +1108,7 @@ fn report(repo_root: &Path) -> TestResult<CodeCortexReport> {
         }],
         blast_radius: eliot_types::BlastRadiusView {
             files: vec!["src/lib.rs".to_owned()],
-            crates: vec!["phase-f2-test-fixture".to_owned()],
+            crates: vec!["worktree-lease-test-fixture".to_owned()],
             reasons: vec!["test fixture".to_owned()],
         },
         invariant_cards: vec![InvariantCard {

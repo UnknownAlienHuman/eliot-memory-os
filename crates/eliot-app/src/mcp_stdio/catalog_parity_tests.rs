@@ -4,26 +4,7 @@ use serde_json::Value;
 use std::path::{Path, PathBuf};
 
 fn repo_root() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .and_then(Path::parent)
-        .expect("workspace root")
-        .to_path_buf()
-}
-
-fn manifest_names(manifest: &Value, field: &str) -> Vec<String> {
-    let mut names = manifest
-        .get(field)
-        .and_then(Value::as_array)
-        .map(|entries| {
-            entries
-                .iter()
-                .filter_map(|entry| entry.get("name").and_then(Value::as_str).map(str::to_owned))
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
-    names.sort();
-    names
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
 }
 
 fn catalog_names(catalog: &Value, field: &str) -> Vec<String> {
@@ -39,30 +20,38 @@ fn catalog_names(catalog: &Value, field: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// The Desktop package declares its tools and prompts in a manifest that is
-/// maintained by hand. Whatever it declares must be what the Governor
-/// actually serves: a manifest promising a tool the server does not expose,
-/// or omitting one it does, is a lie Claude Desktop shows to the user.
-///
-/// This is the parity gate until the manifest is generated outright.
+/// The tracked Desktop manifest is only a package template. Keeping generated
+/// catalog entries there would create a second authority beside the Governor.
 #[test]
-fn the_desktop_manifest_declares_exactly_what_the_governor_serves()
--> Result<(), Box<dyn std::error::Error>> {
+fn the_desktop_manifest_has_no_hand_maintained_catalog() -> Result<(), Box<dyn std::error::Error>> {
     let manifest: Value = serde_json::from_slice(&std::fs::read(
         repo_root().join("integrations/claude/claude-desktop/mcpb/manifest.json"),
     )?)?;
-    let catalog = claude_surface_catalog(ClaudeSurface::ClaudeDesktopMcpb);
+    assert_eq!(manifest["tools"], serde_json::json!([]));
+    assert_eq!(manifest["prompts"], serde_json::json!([]));
+    assert_eq!(manifest["tools_generated"], Value::Bool(true));
+    assert_eq!(manifest["prompts_generated"], Value::Bool(true));
+    Ok(())
+}
 
-    assert_eq!(
-        manifest_names(&manifest, "tools"),
-        catalog_names(&catalog, "tools"),
-        "MCPB manifest tools drifted from the Governor catalog"
-    );
-    assert_eq!(
-        manifest_names(&manifest, "prompts"),
-        catalog_names(&catalog, "prompts"),
-        "MCPB manifest prompts drifted from the Governor catalog"
-    );
+#[test]
+fn the_governor_catalog_contains_complete_mcpb_metadata() -> Result<(), Box<dyn std::error::Error>>
+{
+    let catalog = claude_surface_catalog(ClaudeSurface::ClaudeDesktopMcpb);
+    let tools = catalog["mcpb_tools"].as_array().ok_or("tool catalog")?;
+    let prompts = catalog["mcpb_prompts"].as_array().ok_or("prompt catalog")?;
+    assert_eq!(tools.len(), catalog_names(&catalog, "tools").len());
+    assert_eq!(prompts.len(), catalog_names(&catalog, "prompts").len());
+    assert!(tools.iter().all(|tool| {
+        tool.get("name").and_then(Value::as_str).is_some()
+            && tool.get("description").and_then(Value::as_str).is_some()
+    }));
+    assert!(prompts.iter().all(|prompt| {
+        prompt.get("name").and_then(Value::as_str).is_some()
+            && prompt.get("description").and_then(Value::as_str).is_some()
+            && prompt.get("arguments").and_then(Value::as_array).is_some()
+            && prompt.get("text").and_then(Value::as_str).is_some()
+    }));
     Ok(())
 }
 

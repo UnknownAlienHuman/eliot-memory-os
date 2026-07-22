@@ -1,15 +1,21 @@
 # Architecture contract
 
-The normative architecture set is:
+The architecture documents have three deliberately different authorities:
 
-- `docs/architecture/ELIOT_Canonical_Master.md`
-- `docs/architecture/ELIOT_Rust_Governor_Production_Architecture_v1_0.md`
-- `docs/architecture/ELIOT_Understanding_Layer_Engineering_Task_v1_4.md`
+| Category | Document | Meaning |
+|---|---|---|
+| Canonical vision | `docs/architecture/ELIOT_Canonical_Master.md` | Governing product theory and long-term architecture; it does not claim that every mechanism exists today. |
+| Current implementation | `docs/architecture/ELIOT_Rust_Governor_Production_Architecture_v1_0.md` | The maintained description of the code and runtime that exist now. |
+| Future design | `docs/architecture/ELIOT_Understanding_Layer_Engineering_Task_v1_4.md` | A bounded design specification for deeper project understanding; it is not a progress report or evidence of implementation. |
 
 Current source, Cargo manifests, migrations, generated metadata, diagnostics, and
 tests take precedence when implementation and prose diverge. Runtime databases,
 reports, agent memory, and generated code graphs are evidence layers and are not
 repository truth.
+
+Development milestone names are not product architecture. Historical ADR names
+may retain the milestone that motivated a decision, but active CLI, protocol,
+schema, tests, and current documentation use semantic capability names.
 
 ## Product boundaries
 

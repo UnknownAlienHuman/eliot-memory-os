@@ -89,7 +89,6 @@ pub enum DelegationReason {
     RecursiveProviderCall,
     IncidentLockdown,
     ForbiddenDataExposure,
-    G3BNotDoneVerified,
     ProviderUnavailable,
     ProviderUnhealthy,
     ProviderVersionBelow1_1_1,

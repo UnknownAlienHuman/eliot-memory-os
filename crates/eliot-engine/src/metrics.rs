@@ -103,7 +103,7 @@ impl MetricRecorderService {
             ("ipc.p95_latency_ms", 25.0, "status"),
             ("context.packet_bytes", 14_000.0, "compile_l3"),
             ("verify.change_gate_runtime_ms", 850_000.0, "change-gate"),
-            ("eval.pass_rate", 1.0, "k0-core-smoke"),
+            ("eval.pass_rate", 1.0, "core-smoke"),
             ("incident.blocking_count", 0.0, "incident-list"),
             ("external_review.malformed_rate", 0.0, "mock-review"),
         ] {
@@ -366,7 +366,7 @@ impl QualitySignalService {
                 "eval",
                 QualitySignalKind::EvalPassRate,
                 1.0,
-                "eval-gates:phase-minimal",
+                "eval-gates:fast-deterministic",
             ),
             signal(
                 "verify",

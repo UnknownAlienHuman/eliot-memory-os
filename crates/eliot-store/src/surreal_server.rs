@@ -35,7 +35,7 @@ pub struct ReadySurrealServer {
     supervisor: SurrealServerSupervisor,
 }
 
-/// Outcome of releasing this runtime's handle on the canonical SurrealDB server.
+/// Outcome of releasing this runtime's handle on the canonical `SurrealDB` server.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize)]
 pub struct SurrealShutdown {
     /// True when this runtime started the server and has now stopped it.
@@ -45,7 +45,7 @@ pub struct SurrealShutdown {
     /// True when other client leases were still held when the owned process was
     /// stopped. Shutdown proceeds anyway: leaving the process this runtime is
     /// responsible for running is the worse outcome, and it is the exact defect
-    /// that orphaned SurrealDB after `daemon stop`.
+    /// that orphaned `SurrealDB` after `daemon stop`.
     pub drain_incomplete: bool,
     /// True when the recorded pid was already gone before shutdown ran.
     pub already_exited: bool,
@@ -172,7 +172,7 @@ impl SurrealServerSupervisor {
     /// password file to the already provisioned Windows credential.
     ///
     /// The new password is escaped into the statement text rather than bound as
-    /// an RPC variable. That is not a preference: SurrealDB 3.1.4 rejects a
+    /// an RPC variable. That is not a preference: `SurrealDB` 3.1.4 rejects a
     /// parameter in the `DEFINE USER ... PASSWORD` position outright, while
     /// accepting a literal, so a bound variable is not available here. The
     /// statement is therefore treated as secret-bearing -- built immediately
@@ -649,7 +649,7 @@ impl SurrealServerSupervisor {
             .unwrap_or_else(|| PathBuf::from(".eliot-governor"))
     }
 
-    /// Stops the SurrealDB process this runtime started, returning whether the
+    /// Stops the `SurrealDB` process this runtime started, returning whether the
     /// process had already exited on its own.
     ///
     /// A recorded pid is not by itself authority to terminate anything. Pids are
@@ -666,7 +666,7 @@ impl SurrealServerSupervisor {
         Ok(false)
     }
 
-    /// Refuses to act on a pid whose running image is not the SurrealDB
+    /// Refuses to act on a pid whose running image is not the `SurrealDB`
     /// executable this supervisor is configured to own.
     #[cfg(windows)]
     fn verify_owned_process_identity(&self, pid: u32) -> Result<(), StoreError> {
@@ -935,7 +935,7 @@ impl ReadySurrealServer {
         self.started_pid
     }
 
-    /// Releases this runtime's handle on the SurrealDB server, stopping the
+    /// Releases this runtime's handle on the `SurrealDB` server, stopping the
     /// server process when — and only when — this runtime started it.
     ///
     /// Draining and lock acquisition are cooperative courtesies to other
@@ -1341,7 +1341,7 @@ mod lifecycle_tests {
 
     /// The drain window is ten minutes. Before this, a lease left behind by a
     /// client that had already died held graceful shutdown open for that entire
-    /// window, which is what orphaned SurrealDB after `daemon stop`.
+    /// window, which is what orphaned `SurrealDB` after `daemon stop`.
     #[test]
     fn a_fresh_lease_from_a_dead_client_is_reclaimed_immediately()
     -> Result<(), Box<dyn std::error::Error>> {
@@ -1369,7 +1369,7 @@ mod lifecycle_tests {
 
     /// Pids are reused. A recorded pid alone must never authorize termination:
     /// this test points the supervisor at a pid whose image is deliberately not
-    /// SurrealDB -- the running test process itself. If the identity check is
+    /// `SurrealDB` -- the running test process itself. If the identity check is
     /// removed, this test kills its own process instead of failing politely.
     #[cfg(windows)]
     #[tokio::test]

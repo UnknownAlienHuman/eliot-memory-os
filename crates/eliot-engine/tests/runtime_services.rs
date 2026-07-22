@@ -21,7 +21,7 @@ type TestResult<T = ()> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 async fn daemon_run_smoke() -> TestResult {
     let mut supervisor = ServiceSupervisor::new(default_runtime_services());
 
-    supervisor.start_all("phase-g0-daemon-run").await?;
+    supervisor.start_all("runtime-services-daemon-run").await?;
     let statuses = supervisor.service_statuses();
 
     assert_eq!(statuses.len(), 7);
@@ -90,7 +90,7 @@ async fn service_supervisor_start_shutdown_order() -> TestResult {
         Box::new(StaticRuntimeService::healthy("second")),
     ]);
 
-    supervisor.start_all("phase-g0-order").await?;
+    supervisor.start_all("runtime-services-order").await?;
     supervisor
         .shutdown_all(shutdown_deadline_after(StdDuration::from_secs(1)))
         .await?;
@@ -108,7 +108,7 @@ async fn service_supervisor_reports_failed_service() {
     ])
     .with_restart_budget(2);
 
-    let result = supervisor.start_all("phase-g0-failed").await;
+    let result = supervisor.start_all("runtime-services-failed").await;
     let statuses = supervisor.service_statuses();
 
     assert!(result.is_err());
@@ -153,7 +153,7 @@ fn structured_jsonl_logs_written() -> TestResult {
     logs.write_event(LogService::event(
         LogLevel::Info,
         LogEventKind::ServiceStart,
-        "phase_g0",
+        "runtime_services",
         "service started",
         Some("trace-jsonl".to_owned()),
     ))?;
@@ -179,7 +179,7 @@ fn logs_contain_trace_task_agent_fields() -> TestResult {
     let mut event = LogService::event(
         LogLevel::Info,
         LogEventKind::MailboxDelivered,
-        "phase_g0",
+        "runtime_services",
         "mailbox delivered",
         Some("trace-fields".to_owned()),
     );
@@ -202,7 +202,7 @@ fn logs_redact_secret_like_values() -> TestResult {
     let written = logs.write_event(LogService::event(
         LogLevel::Warn,
         LogEventKind::Error,
-        "phase_g0",
+        "runtime_services",
         "bearer token abc123 leaked",
         Some("trace-redacted".to_owned()),
     ))?;
@@ -308,12 +308,12 @@ fn mailbox_exchange_envelope_smoke() -> TestResult {
         ExchangeParty::AgentSession(AgentSessionId::new_v7()),
         ExchangeKind::MailboxMessage,
         local_tool_authority(vec![ModuleCapability::SubmitFindingCandidate]),
-        json!({ "payload_ref": "mailbox:phase-g0" }),
+        json!({ "payload_ref": "mailbox:runtime-services" }),
     )?;
 
     assert_eq!(envelope.kind, ExchangeKind::MailboxMessage);
     assert_eq!(envelope.authority.taint, TaintClass::LocalTool);
-    assert_eq!(envelope.payload["payload_ref"], "mailbox:phase-g0");
+    assert_eq!(envelope.payload["payload_ref"], "mailbox:runtime-services");
     Ok(())
 }
 
@@ -326,11 +326,14 @@ fn blackboard_exchange_envelope_smoke() -> TestResult {
         ExchangeParty::Governor,
         ExchangeKind::BlackboardItem,
         local_tool_authority(vec![ModuleCapability::SubmitFindingCandidate]),
-        json!({ "payload_ref": "blackboard:phase-g0" }),
+        json!({ "payload_ref": "blackboard:runtime-services" }),
     )?;
 
     assert_eq!(envelope.kind, ExchangeKind::BlackboardItem);
-    assert_eq!(envelope.payload["payload_ref"], "blackboard:phase-g0");
+    assert_eq!(
+        envelope.payload["payload_ref"],
+        "blackboard:runtime-services"
+    );
     Ok(())
 }
 
@@ -387,7 +390,7 @@ fn test_manifest(name: &str) -> ModuleManifest {
         module_id: ModuleId::new_v7(),
         name: name.to_owned(),
         version: "0.1.0".to_owned(),
-        description: "phase-g0 test manifest".to_owned(),
+        description: "runtime-services test manifest".to_owned(),
         module_kind: ModuleKind::InternalRust,
         transport: ModuleTransport::InProcess,
         capabilities: vec![ModuleCapability::HealthCheck],
@@ -417,7 +420,7 @@ fn test_root(name: &str) -> TestResult<PathBuf> {
         .to_string();
     let path = repo_root()
         .join("target")
-        .join("phase-g0-tests")
+        .join("runtime-services-tests")
         .join(format!("{name}-{unique}"));
     fs::create_dir_all(&path)?;
     Ok(path)

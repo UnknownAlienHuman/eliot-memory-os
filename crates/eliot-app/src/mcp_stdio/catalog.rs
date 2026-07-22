@@ -63,21 +63,7 @@ pub(super) fn prompt_get(params: &Value) -> Result<Value> {
         .and_then(Value::as_str)
         .unwrap_or("the active task")
         .trim();
-    let text = match name {
-        "eliot-start" => format!(
-            "Start or resume {task}. Call eliot_host_session_status, resolve the stable project identity, read current task/current state, and compile only the smallest packet needed. Confirm the task-scoped role and revision before any material action."
-        ),
-        "eliot-understand" => format!(
-            "For {task}, separate current verified truth from supported, assumed, conflicted, stale, and unknown state. Expand exact handles, check negative memory, trace goal -> owner -> symbol or artifact -> observable -> verifier, then submit an UnderstandingProof or run the cheapest discriminative probe."
-        ),
-        "eliot-delegate" => format!(
-            "For {task}, confirm that delegation has positive value and that the current session has the required task-scoped role. Delegate one bounded work item with exact acceptance, packet refs, expected result, verifier, leases, and an idempotency key; reconcile unknown outcomes before retrying."
-        ),
-        "eliot-verify-finish" => format!(
-            "For {task}, read exact finish gaps, run mapped verifiers against the accepted artifact scope, account for every acceptance item, and submit CompletionProof with the honest status. A model response is candidate evidence, not a verifier."
-        ),
-        other => anyhow::bail!("unknown Eliot prompt: {other}"),
-    };
+    let text = prompt_text(name, task)?;
     Ok(json!({
         "description": prompt_definitions()
             .into_iter()
@@ -93,6 +79,25 @@ pub(super) fn prompt_get(params: &Value) -> Result<Value> {
     }))
 }
 
+fn prompt_text(name: &str, task: &str) -> Result<String> {
+    let text = match name {
+        "eliot-start" => format!(
+            "Start or resume {task}. Call eliot_host_session_status, resolve the stable project identity, read current task/current state, and compile only the smallest packet needed. Confirm the task-scoped role and revision before any material action."
+        ),
+        "eliot-understand" => format!(
+            "For {task}, separate current verified truth from supported, assumed, conflicted, stale, and unknown state. Expand exact handles, check negative memory, trace goal -> owner -> symbol or artifact -> observable -> verifier, then submit an UnderstandingProof or run the cheapest discriminative probe."
+        ),
+        "eliot-delegate" => format!(
+            "For {task}, confirm that delegation has positive value and that the current session has the required task-scoped role. Delegate one bounded work item with exact acceptance, packet refs, expected result, verifier, leases, and an idempotency key; reconcile unknown outcomes before retrying."
+        ),
+        "eliot-verify-finish" => format!(
+            "For {task}, read exact finish gaps, run mapped verifiers against the accepted artifact scope, account for every acceptance item, and submit CompletionProof with the honest status. A model response is candidate evidence, not a verifier."
+        ),
+        other => anyhow::bail!("unknown Eliot prompt: {other}"),
+    };
+    Ok(text)
+}
+
 pub(super) fn tool_definitions() -> Vec<Value> {
     let mut tools = task_tool_definitions();
     tools.extend(core_tool_definitions());
@@ -104,7 +109,7 @@ pub(super) fn tool_definitions() -> Vec<Value> {
     tools.extend(eval_tool_definitions());
     tools.extend(verification_tool_definitions());
     tools.extend(metrics_tool_definitions());
-    tools.extend(j0_tool_definitions());
+    tools.extend(replay_tool_definitions());
     tools.extend(action_tool_definitions());
     tools.extend(patch_tool_definitions());
     tools.extend(work_tool_definitions());
@@ -505,35 +510,56 @@ pub(crate) fn claude_surface_catalog(surface: ClaudeSurface) -> Value {
             McpAccessProfile::ClaudeGoverned
         }
     };
-    let mut tools = tool_definitions_for_profile(profile)
+    let mut mcpb_tools = tool_definitions_for_profile(profile)
         .into_iter()
         .filter_map(|definition| {
-            definition
-                .get("name")
-                .and_then(Value::as_str)
-                .map(str::to_owned)
+            Some(json!({
+                "name": definition.get("name")?.as_str()?,
+                "description": definition.get("description")?.as_str()?,
+            }))
         })
         .collect::<Vec<_>>();
-    let mut prompts = prompt_definitions()
+    let mut mcpb_prompts = prompt_definitions()
         .into_iter()
         .filter_map(|definition| {
-            definition
-                .get("name")
-                .and_then(Value::as_str)
-                .map(str::to_owned)
+            let name = definition.get("name")?.as_str()?;
+            let description = definition.get("description")?.as_str()?;
+            let arguments = definition
+                .get("arguments")?
+                .as_array()?
+                .iter()
+                .filter_map(|argument| argument.get("name").and_then(Value::as_str))
+                .collect::<Vec<_>>();
+            let text = prompt_text(name, "${arguments.task}").ok()?;
+            Some(json!({
+                "name": name,
+                "description": description,
+                "arguments": arguments,
+                "text": text,
+            }))
         })
         .collect::<Vec<_>>();
     // Sorted so the catalog is comparable byte for byte across runs.
-    tools.sort();
-    prompts.sort();
+    mcpb_tools.sort_by(|left, right| left["name"].as_str().cmp(&right["name"].as_str()));
+    mcpb_prompts.sort_by(|left, right| left["name"].as_str().cmp(&right["name"].as_str()));
+    let tools = mcpb_tools
+        .iter()
+        .filter_map(|entry| entry.get("name").and_then(Value::as_str))
+        .collect::<Vec<_>>();
+    let prompts = mcpb_prompts
+        .iter()
+        .filter_map(|entry| entry.get("name").and_then(Value::as_str))
+        .collect::<Vec<_>>();
     json!({
-        "schema_version": "eliot-mcp-catalog-v1",
+        "schema_version": "eliot-mcp-catalog-v2",
         "host": "claude",
         "surface": surface.as_str(),
         "access_profile": profile.as_str(),
         "supports_lifecycle_hooks": surface.supports_lifecycle_hooks(),
         "tools": tools,
         "prompts": prompts,
+        "mcpb_tools": mcpb_tools,
+        "mcpb_prompts": mcpb_prompts,
     })
 }
 
@@ -577,7 +603,7 @@ pub(super) fn external_review_tool_definitions() -> Vec<Value> {
         tool(
             "eliot_external_review_providers",
             "Eliot External Review Providers",
-            "List governed external review provider profiles; real providers are disabled in G2.",
+            "List governed external review provider profiles; real providers are policy-gated.",
             &json!({ "type": "object" }),
         ),
         tool(
@@ -674,7 +700,7 @@ pub(super) fn delegation_calibration_tool_definitions() -> Vec<Value> {
         tool(
             "eliot_delegation_calibration_status",
             "Eliot Delegation Calibration Status",
-            "Read bounded L1A calibration counts and doctor status.",
+            "Read bounded delegation calibration counts and doctor status.",
             &json!({"type":"object"}),
         ),
         tool(
@@ -686,7 +712,7 @@ pub(super) fn delegation_calibration_tool_definitions() -> Vec<Value> {
         tool(
             "eliot_delegation_policy_candidate",
             "Eliot Delegation Policy Candidate",
-            "Read the inactive L1A routing policy candidate.",
+            "Read the inactive delegation routing policy candidate.",
             &json!({"type":"object"}),
         ),
         tool(
@@ -747,13 +773,13 @@ pub(super) fn antigravity_tool_definitions() -> Vec<Value> {
         tool(
             "eliot_antigravity_skills",
             "Eliot Antigravity Skills",
-            "Return generated governed Antigravity skill bundle metadata.",
+            "Return official installed Antigravity plugin skill visibility status (compatibility alias).",
             &json!({ "type": "object" }),
         ),
         tool(
             "eliot_antigravity_plugin",
             "Eliot Antigravity Plugin",
-            "Return generated non-installable Antigravity plugin bundle metadata.",
+            "Return official installed Antigravity plugin status (compatibility alias).",
             &json!({ "type": "object" }),
         ),
         tool(
@@ -795,7 +821,7 @@ pub(super) fn antigravity_tool_definitions() -> Vec<Value> {
         tool(
             "eliot_antigravity_real_report",
             "Eliot Antigravity Real Report",
-            "Return bounded G3B real-provider report without raw agy access or execution authority.",
+            "Return a bounded real-provider report without raw agy access or execution authority.",
             &json!({ "type": "object" }),
         ),
     ]
@@ -806,43 +832,43 @@ pub(super) fn eval_tool_definitions() -> Vec<Value> {
         tool(
             "eliot_eval_case_list",
             "Eliot Eval Case List",
-            "List deterministic K0 eval cases without creating or mutating benchmark truth.",
+            "List deterministic eval cases without creating or mutating benchmark truth.",
             &json_schema(&[("family", "string")], &[]),
         ),
         tool(
             "eliot_eval_suite_list",
             "Eliot Eval Suite List",
-            "Return fixed K0 suite and manifest handles without raw fixture access.",
+            "Return fixed eval suite and manifest handles without raw fixture access.",
             &json_schema(&[("suite", "string")], &[]),
         ),
         tool(
             "eliot_eval_run",
             "Eliot Eval Run",
-            "Run deterministic no-mutation K0 evaluation and write report-only artifacts.",
+            "Run deterministic no-mutation evaluation and write report-only artifacts.",
             &json_schema(&[("suite", "string"), ("profile", "string")], &[]),
         ),
         tool(
             "eliot_eval_verdict",
             "Eliot Eval Verdict",
-            "Return a report-only K0 verdict that grants no authority.",
+            "Return a report-only eval verdict that grants no authority.",
             &json_schema(&[("run", "string")], &[]),
         ),
         tool(
             "eliot_eval_report",
             "Eliot Eval Report",
-            "Return bounded K0 eval status and report handles.",
+            "Return bounded eval status and report handles.",
             &json!({ "type": "object" }),
         ),
         tool(
             "eliot_eval_smoke",
             "Eliot Eval Smoke",
-            "Run the K0 core smoke suite in deterministic no-mutation mode.",
+            "Run the core smoke suite in deterministic no-mutation mode.",
             &json_schema(&[("suite", "string")], &[]),
         ),
         tool(
             "eliot_eval_coverage",
             "Eliot Eval Coverage",
-            "Return K1 eval coverage matrix without exposing raw fixtures.",
+            "Return the integration eval coverage matrix without exposing raw fixtures.",
             &json_schema(&[("suite", "string")], &[]),
         ),
         tool(
@@ -867,13 +893,13 @@ pub(super) fn eval_tool_definitions() -> Vec<Value> {
         tool(
             "eliot_eval_gate",
             "Eliot Eval Gate",
-            "Evaluate a governed K1 regression gate without granting action or patch authority.",
+            "Evaluate a governed integration regression gate without granting action or patch authority.",
             &json_schema(&[("profile", "string"), ("suite", "string")], &[]),
         ),
         tool(
             "eliot_eval_profiles",
             "Eliot Eval Profiles",
-            "List built-in K1 regression gate profiles.",
+            "List built-in integration regression gate profiles.",
             &json!({ "type": "object" }),
         ),
         tool(
@@ -896,7 +922,7 @@ pub(super) fn verification_tool_definitions() -> Vec<Value> {
         tool(
             "eliot_verify_inventory",
             "Eliot Verify Inventory",
-            "Return classified K2 test inventory and profile routing metadata.",
+            "Return classified verification test inventory and profile routing metadata.",
             &json!({ "type": "object" }),
         ),
         tool(
@@ -908,7 +934,7 @@ pub(super) fn verification_tool_definitions() -> Vec<Value> {
         tool(
             "eliot_verify_report",
             "Eliot Verify Report",
-            "Return K2 verification economy status and report handles.",
+            "Return verification economy status and report handles.",
             &json!({ "type": "object" }),
         ),
         tool(
@@ -1289,11 +1315,11 @@ pub(super) fn core_tool_definitions() -> Vec<Value> {
 }
 
 #[allow(clippy::too_many_lines)]
-pub(super) fn j0_tool_definitions() -> Vec<Value> {
+pub(super) fn replay_tool_definitions() -> Vec<Value> {
     vec![
         tool(
             "eliot_trace_completeness",
-            "Eliot L11 Trace Register",
+            "Eliot Canonical Trace Register",
             "Resolve all 13 trace evidence parts from canonical task, observation, verifier receipts and engine derivations; caller-shaped evidence strings are not accepted.",
             &json_schema(
                 &[
@@ -1357,7 +1383,7 @@ pub(super) fn j0_tool_definitions() -> Vec<Value> {
         ),
         tool(
             "eliot_replay_run",
-            "Eliot L11 Sealed Replay Run",
+            "Eliot Sealed Replay Run",
             "Seal a named 2-20 case fixed or holdout set, persist its cases and snapshots, then derive baseline and candidate executions only from canonical trace evidence.",
             &json_schema(
                 &[
@@ -1405,7 +1431,7 @@ pub(super) fn j0_tool_definitions() -> Vec<Value> {
         ),
         tool(
             "eliot_sleep_run",
-            "Eliot L11 Sleep Run",
+            "Eliot Governed Sleep Run",
             "Run candidate-only sleep over registered complete trace refs; missing/incomplete refs are retained as exclusions.",
             &json_schema(
                 &[
@@ -1455,7 +1481,7 @@ pub(super) fn j0_tool_definitions() -> Vec<Value> {
         ),
         tool(
             "eliot_meta_experiment_run",
-            "Eliot L11 Meta Experiment Run",
+            "Eliot Meta Experiment Run",
             "Derive metrics from canonical fixed/holdout baseline and candidate executions, persist isolation rejection receipts, and stage only replay_threshold_v1 policy candidates.",
             &json_schema(
                 &[
@@ -1494,7 +1520,7 @@ pub(super) fn j0_tool_definitions() -> Vec<Value> {
         ),
         tool(
             "eliot_meta_experiment_disposition",
-            "Eliot L11 Meta Experiment Disposition",
+            "Eliot Meta Experiment Disposition",
             "Promote or exactly roll back replay_threshold_v1 using the engine-derived exact action hash; unsupported policies remain blocked.",
             &json_schema(
                 &[
@@ -1521,8 +1547,8 @@ pub(super) fn j0_tool_definitions() -> Vec<Value> {
             ),
         ),
         tool(
-            "eliot_l11_status",
-            "Eliot L11 Canonical Status",
+            "eliot_canonical_status",
+            "Eliot Canonical Status",
             "Rehydrate canonical traces, exclusions, replay hashes, metrics, and terminal dispositions for one task.",
             &json_schema(
                 &[("project_id", "string"), ("task_id", "string")],

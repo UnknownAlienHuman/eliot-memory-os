@@ -19,7 +19,6 @@ const CONSTRAINTS: [&str; 3] = ["candidate_only", "tainted", "disposable_worktre
 pub struct DelegationPolicyContext {
     pub incident_lockdown: bool,
     pub forbidden_data_exposure: bool,
-    pub g3b_done_verified: bool,
     pub provider_available: bool,
     pub provider_healthy: bool,
     pub provider_version_supported: bool,
@@ -35,7 +34,6 @@ impl Default for DelegationPolicyContext {
         Self {
             incident_lockdown: false,
             forbidden_data_exposure: false,
-            g3b_done_verified: true,
             provider_available: true,
             provider_healthy: true,
             provider_version_supported: true,
@@ -467,7 +465,7 @@ fn ensure_provider_call_budget(
     }
     ledger.budgets.push(ProviderCallBudgetState {
         campaign_id: request.campaign_id.clone(),
-        schema_version: "l1b-r-1".to_owned(),
+        schema_version: "provider-budget-recovery-1".to_owned(),
         max_calls: request.max_calls,
         next_slot_index: 1,
         reserved_slots: 0,
@@ -624,7 +622,6 @@ fn bounded_u32(value: usize) -> u32 {
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 #[allow(clippy::struct_excessive_bools)]
 pub struct DelegationHealth {
-    pub g3b_done_verified: bool,
     pub provider_available: bool,
     pub provider_healthy: bool,
     pub provider_version_supported: bool,
@@ -650,7 +647,6 @@ impl DelegationHealthService {
     ) -> DelegationPolicyContext {
         DelegationPolicyContext {
             incident_lockdown: health.incident_lockdown,
-            g3b_done_verified: health.g3b_done_verified,
             provider_available: health.provider_available,
             provider_healthy: health.provider_healthy,
             provider_version_supported: health.provider_version_supported,
@@ -859,7 +855,7 @@ impl DelegationDoctorIntegration {
             .sum::<u64>();
         serde_json::json!({
             "component": "delegation_doctor",
-            "g3b_baseline_health": health,
+            "provider_integration_health": health,
             "last_routed_call": state.requests.last(),
             "task_budget_state": state.budgets.last(),
             "recursion_denials": state.decisions.iter().filter(|decision| decision.reasons.contains(&DelegationReason::RecursiveProviderCall)).count(),
@@ -893,10 +889,6 @@ fn hard_denial(
         (
             context.forbidden_data_exposure,
             DelegationReason::ForbiddenDataExposure,
-        ),
-        (
-            !context.g3b_done_verified,
-            DelegationReason::G3BNotDoneVerified,
         ),
         (
             !context.provider_available,

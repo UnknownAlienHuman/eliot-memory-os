@@ -8,10 +8,9 @@ runtime, task state, receipts, and canonical store boundary. A host name selects
 transport and capabilities; it never grants a task role, truth authority, or
 completion authority.
 
-Every live MCP session registers an `AgentSessionHostBinding`. The authoritative
-role source is `eliot_host_session_status`, which returns only current task-role
-and controller leases for that session. Historical receipts and host labels are
-not role evidence.
+Every live MCP session registers an `AgentSessionHostBinding`. Current task-role
+and controller leases come from `eliot_host_session_status`; historical receipts
+and host labels are not role evidence.
 
 The portable skill pack contains exactly four skills:
 
@@ -20,72 +19,73 @@ The portable skill pack contains exactly four skills:
 - `eliot-delegation`
 - `eliot-verify-finish`
 
-Canonical skill bodies live in `integrations/agent-skills`. OpenCode and Claude
-copies must remain byte-identical.
+Canonical skill bodies live in `integrations/agent-skills`. Generated host copies
+must remain byte-identical.
 
 ## Host surfaces
 
-| Host | Product integration | Authority notes |
+| Host | Product integration | Installation authority |
 |---|---|---|
-| Codex | project MCP and repository instructions | controller-capable only through current leases |
-| Antigravity | official plugin, agent, rules, skill, governed MCP | host identity is never a permanent auditor role |
-| OpenCode | additive JSONC configuration, lifecycle plugin, four skills | preserves unrelated user configuration |
-| Claude Code | self-contained plugin, hooks, four skills, compact MCP | provider authentication remains Claude-owned |
-| Claude Desktop | MCPB extension with embedded native stdio facade | no database credentials or host-derived role |
+| Codex | Project MCP plus shared/project skills and repository instructions; there is no ELIOT Codex plugin | Codex MCP configuration and skill roots |
+| Antigravity | Official ELIOT plugin plus a governed MCP registration | Antigravity plugin directory and GUI MCP config |
+| OpenCode | Additive JSONC configuration, lifecycle plugin, four skills | Governor ownership manifest |
+| Claude Code | Official local-marketplace plugin with MCP, hooks, and four skills | `claude plugin` lifecycle |
+| Claude Desktop | MCPB extension with an embedded native stdio facade; no hooks | Claude Desktop extension UI/registry |
 
-## Inspect and launch
+Claude is one host family with two package surfaces. In a Claude Code session
+hosted by Desktop, exactly one surface may be active: `code` or `desktop`.
+
+## Resolve the release binary
+
+Cargo output is intentionally outside OneDrive. Commands below assume:
 
 ```powershell
-.\target\release\eliot-governor.exe daemon health --instance default
-.\target\release\eliot-governor.exe host inspect --host opencode
-.\target\release\eliot-governor.exe host doctor --host opencode
-.\target\release\eliot-governor.exe host inspect --host claude
-.\target\release\eliot-governor.exe host doctor --host claude
-.\target\release\eliot-governor.exe host skill-lint
+cargo build --release --package eliot-app --bin eliot-governor
+$target = cargo metadata --format-version 1 --no-deps |
+  ConvertFrom-Json | Select-Object -ExpandProperty target_directory
+$governor = Join-Path $target 'release\eliot-governor.exe'
 ```
+
+## Inspect, install, and activate
+
+```powershell
+& $governor daemon health --instance default
+& $governor host inspect --host opencode
+& $governor host doctor --host opencode
+& $governor host install --host opencode
+
+& $governor antigravity plugin install-official --admin-confirm
+& $governor antigravity mcp register --admin-confirm
+& $governor antigravity doctor
+
+& $governor host install --host claude
+& $governor host activate --host claude --surface code
+& $governor host doctor --host claude
+
+# Optional Desktop package; activate only when Code mode is intentionally stood down.
+& $governor host install --host claude-desktop
+& $governor host activate --host claude --surface desktop
+```
+
+Installers modify only ELIOT-owned surfaces and preserve unrelated providers,
+models, permissions, MCP entries, instructions, plugins, settings, and provider
+authentication. Switching surfaces is idempotent and reports whether Claude must
+reload or start a new session.
+
+## Managed work and result authority
 
 Render or launch supervised work only with an explicit model and bounded prompt:
 
 ```powershell
-.\target\release\eliot-governor.exe host render --host opencode --mode supervised --model <model>
-.\target\release\eliot-governor.exe host launch --host opencode --mode supervised --model <model> --prompt '<bounded work>'
+& $governor host render --host opencode --mode supervised --model <model>
+& $governor host launch --host opencode --mode supervised --model <model> --prompt '<bounded work>'
 ```
 
-Managed launch reuses a ready default Governor or starts the same ELIOT release as
-a hidden per-user process. Readiness requires an authenticated named-pipe
-handshake. Runtime evidence belongs under the per-user ELIOT runtime root, not in
-the repository.
+Managed launch reuses a ready default Governor or starts the same ELIOT release
+as a hidden per-user process. Readiness requires an authenticated named-pipe
+handshake. Runtime evidence belongs under the per-user ELIOT runtime root.
 
-## Installation and rollback
-
-Installers own only named ELIOT surfaces and must preserve unrelated providers,
-models, permissions, MCP entries, instructions, plugins, and settings.
-
-```powershell
-.\target\release\eliot-governor.exe host install --host opencode --dry-run
-.\target\release\eliot-governor.exe host install --host opencode
-.\target\release\eliot-governor.exe host uninstall --host opencode --dry-run
-.\target\release\eliot-governor.exe host uninstall --host opencode
-
-.\target\release\eliot-governor.exe host install --host claude
-.\target\release\eliot-governor.exe host uninstall --host claude
-
-.\target\release\eliot-governor.exe host install --host claude-desktop
-.\target\release\eliot-governor.exe host doctor --host claude-desktop
-.\target\release\eliot-governor.exe host uninstall --host claude-desktop
-```
-
-Provider credentials and auth files are never read or modified. Rollback is
-ownership-manifest bounded and refuses an ELIOT-owned entry that changed after
-installation.
-
-## Dynamic roles and results
-
-Registering a host session gives no role. Role and controller leases are scoped to
-one task and a bounded lifetime. Delegated results remain candidate evidence until
-the controller records a disposition; disposition does not bypass verification or
-FinishGate.
-
-Unknown provider outcomes must be reconciled by session ID, idempotency key, and
-broker state before retry. Never blindly redispatch an operation whose result may
-already have been accepted.
+Registering a host session gives no role. Delegated results remain candidate
+evidence until the controller records a disposition; disposition never bypasses
+verification or FinishGate. Unknown provider outcomes must be reconciled by
+session ID, idempotency key, and broker state before retry.

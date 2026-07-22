@@ -62,7 +62,7 @@ fn facade_and_daemon_resolve_one_runtime_across_windows_path_spellings() -> Test
             "params": {
                 "protocolVersion": "2025-06-18",
                 "capabilities": {},
-                "clientInfo": {"name": "phase-l5-red", "version": "0.1.0"}
+                "clientInfo": {"name": "multi-agent-red", "version": "0.1.0"}
             }
         }),
     )?;
@@ -169,7 +169,7 @@ fn initialize_cannot_widen_the_authenticated_profile() -> TestResult {
         "params": {
             "protocolVersion": "2025-06-18",
             "capabilities": {},
-            "clientInfo": {"name": "Antigravity", "version": "phase-l5-test"},
+            "clientInfo": {"name": "Antigravity", "version": "multi-agent-test"},
             "eliotProfile": "codex_controller"
         }
     });
@@ -410,7 +410,7 @@ fn external_candidate_is_shared_without_authority_widening() -> TestResult {
                     "where_applicable": ["standalone default instance"],
                     "where_not_applicable": ["isolated disposable test instances"],
                     "negative_constraints": ["never treat candidate memory as completion authority"],
-                    "provenance_refs": ["phase-l5-process-test"],
+                    "provenance_refs": ["multi-agent-process-test"],
                     "freshness_rule": "revalidate after runtime generation or repository truth changes"
                 }}
             }),
@@ -603,7 +603,7 @@ fn facade_reconnects_after_rotation_and_replay_does_not_duplicate_memory() -> Te
             "where_applicable": ["same canonical store after daemon restart"],
             "where_not_applicable": ["different instance selector"],
             "negative_constraints": ["replay must not create a second claim"],
-            "provenance_refs": ["phase-l5-rotation-test"],
+            "provenance_refs": ["multi-agent-rotation-test"],
             "freshness_rule": "valid only while project and instance identity remain the same"
         }}
     });
@@ -677,7 +677,7 @@ fn initialize_request(id: u64, client_name: &str) -> Value {
         "params": {
             "protocolVersion": "2025-06-18",
             "capabilities": {},
-            "clientInfo": {"name": client_name, "version": "phase-l5-test"}
+            "clientInfo": {"name": client_name, "version": "multi-agent-test"}
         }
     })
 }
@@ -811,7 +811,7 @@ impl OwnedRuntime {
     fn new() -> TestResult<Self> {
         let nonce = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
         let path = std::env::temp_dir().join(format!(
-            "eliot-phase-l5-path-identity-{}-{nonce}",
+            "eliot-multi-agent-path-identity-{}-{nonce}",
             std::process::id()
         ));
         fs::create_dir_all(&path)?;
@@ -910,7 +910,7 @@ fn write_test_config(runtime: &Path, config_path: &Path, port: u16) -> TestResul
         .join("secrets")
         .join("surreal_root_password.txt");
     fs::create_dir_all(password_file.parent().ok_or("password parent missing")?)?;
-    fs::write(&password_file, "phase-l5-test-secret")?;
+    fs::write(&password_file, "multi-agent-test-secret")?;
     let storage = slash(&runtime.join("surrealdb-rocks"));
     let run_id = runtime
         .file_name()
@@ -927,8 +927,8 @@ fn write_test_config(runtime: &Path, config_path: &Path, port: u16) -> TestResul
         r#"schema_version = "1"
 
 [service]
-service_name = "EliotGovernorPhaseL5"
-instance_id = "phase-l5-path-identity"
+service_name = "EliotGovernorMultiAgent"
+instance_id = "multi-agent-path-identity"
 
 [db]
 mode = "surreal_rpc_server"
@@ -993,7 +993,7 @@ fn start_surreal(runtime: &Path, port: u16) -> TestResult<OwnedChild> {
     OwnedChild::spawn(
         Command::new("surreal")
             .env("SURREAL_USER", "root")
-            .env("SURREAL_PASS", "phase-l5-test-secret")
+            .env("SURREAL_PASS", "multi-agent-test-secret")
             .arg("start")
             .arg("--bind")
             .arg(format!("127.0.0.1:{port}"))
@@ -1060,8 +1060,8 @@ fn test_secret_root(runtime: &Path) -> TestResult<PathBuf> {
     let run_id = runtime
         .file_name()
         .and_then(|name| name.to_str())
-        .filter(|name| name.starts_with("eliot-phase-l5-path-identity-"))
-        .ok_or("unsafe phase-l5 test runtime name")?;
+        .filter(|name| name.starts_with("eliot-multi-agent-path-identity-"))
+        .ok_or("unsafe multi-agent test runtime name")?;
     Ok(PathBuf::from(local_app_data)
         .join("Eliot")
         .join("tests")

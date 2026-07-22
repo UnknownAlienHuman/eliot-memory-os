@@ -82,7 +82,7 @@ fn sealed_replay_input(project_id: ProjectId, name: &str, holdout: bool) -> Seal
     let set = ReplaySetService::create(ReplaySetInput {
         project_id,
         name: name.to_owned(),
-        purpose: "L11 sealed replay".to_owned(),
+        purpose: "sealed replay verification".to_owned(),
         cases: vec![case.replay_case_id],
         fixed: true,
         holdout,

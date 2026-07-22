@@ -35,7 +35,7 @@ fn episode(
         source_task_refs: vec![format!("task:{suffix}")],
         source_agent_sessions: Vec::new(),
         source_branch_commit_environment: SourceBranchCommitEnvironment {
-            branch: "phase-l9".to_owned(),
+            branch: "semantic-memory".to_owned(),
             commit: format!("commit-{suffix}"),
             environment: vec!["windows".to_owned()],
             observed_at: None,
@@ -604,7 +604,7 @@ fn sealed_case(index: usize) -> (CognitiveCaseSpec, CognitiveReaderAnswer) {
 fn provider_free_cognitive_lab_passes_ten_sealed_contracts() {
     let (specs, answers): (Vec<_>, Vec<_>) = (0..10).map(sealed_case).unzip();
     let report = CognitiveTransferLabService::evaluate(
-        "phase-l9-provider-free".to_owned(),
+        "semantic-memory-provider-free".to_owned(),
         &specs,
         &answers,
     );

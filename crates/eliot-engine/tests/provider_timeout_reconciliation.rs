@@ -371,16 +371,19 @@ fn raw_spool_is_bounded_hashed_and_stream_specific() -> TestResult {
 }
 
 #[test]
-fn l1c_r_verifier_surface_has_no_provider_dispatch_command() -> TestResult {
+fn provider_reconciliation_surface_has_no_provider_dispatch_command() -> TestResult {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .and_then(Path::parent)
         .ok_or("workspace root missing")?;
     let justfile = fs::read_to_string(root.join("Justfile"))?;
-    let l1c_r = justfile.split("phase-l1c-r:").nth(1).unwrap_or_default();
-    assert!(!l1c_r.contains("phase-l1c-provider-once"));
-    assert!(!l1c_r.contains("provider-once"));
-    let runtime = fs::read_to_string(root.join("crates/eliot-app/src/l1c_r_runtime.rs"))?;
+    let reconciliation = justfile
+        .split("provider-reconciliation:")
+        .nth(1)
+        .unwrap_or_default();
+    assert!(!reconciliation.contains("provider-budget-provider-once"));
+    assert!(!reconciliation.contains("provider-once"));
+    let runtime = fs::read_to_string(root.join("crates/eliot-app/src/provider_budget_runtime.rs"))?;
     assert!(!runtime.contains("AntigravityRunner"));
     assert!(!runtime.contains("execute_real"));
     Ok(())

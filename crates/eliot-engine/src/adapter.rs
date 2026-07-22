@@ -234,7 +234,7 @@ impl AdapterSupervisor {
                 message: if manifest.transport == ModuleTransport::Disabled {
                     "disabled adapter module contract".to_owned()
                 } else {
-                    "G1 adapter runtime executes only governed built-in adapters".to_owned()
+                    "adapter runtime executes only governed built-in adapters".to_owned()
                 },
             })
             .collect()

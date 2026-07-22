@@ -1,4 +1,4 @@
-//! Phase L9 semantic-experience, applicability, and transfer-lab contracts.
+//! Semantic-experience, applicability, and transfer-lab contracts.
 
 use crate::{AgentSessionId, ProjectId, VerificationResult, WriteReceiptRef};
 use serde::{Deserialize, Serialize};

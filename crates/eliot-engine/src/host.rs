@@ -213,6 +213,24 @@ pub struct SkillPackSyncReport {
     pub pack_hash: String,
 }
 
+// Structs keep manifest field order stable; `serde_json` map ordering is not
+// part of the package contract.
+#[derive(Serialize)]
+struct SkillPackManifest<'a> {
+    schema_version: &'a str,
+    hash_algorithm: &'a str,
+    pack_hash: &'a str,
+    listing_characters: usize,
+    skills: &'a [ManifestSkill],
+    derived_packages: &'a [&'a str],
+}
+
+#[derive(Serialize)]
+struct ManifestSkill {
+    name: &'static str,
+    content_blake3: String,
+}
+
 impl SkillPackService {
     /// Rewrites every derived host copy from the canonical body and refreshes
     /// the manifest hashes. This is the only writer of the derived packages:
@@ -268,23 +286,7 @@ impl SkillPackService {
 
         report.pack_hash = blake3::hash(pack_material.as_bytes()).to_hex().to_string();
         let manifest_path = canonical_root.join("skill-pack.manifest.json");
-        // A struct, not `json!`: serde_json without `preserve_order` sorts map
-        // keys, which would reorder the manifest on every sync for no reason.
-        #[derive(Serialize)]
-        struct Manifest<'a> {
-            schema_version: &'a str,
-            hash_algorithm: &'a str,
-            pack_hash: &'a str,
-            listing_characters: usize,
-            skills: &'a [ManifestSkill],
-            derived_packages: &'a [&'a str],
-        }
-        #[derive(Serialize)]
-        struct ManifestSkill {
-            name: &'static str,
-            content_blake3: String,
-        }
-        let manifest = Manifest {
+        let manifest = SkillPackManifest {
             schema_version: "eliot-agent-skill-pack-v1",
             hash_algorithm: "blake3(name:content_blake3 joined with LF in manifest order)",
             pack_hash: &report.pack_hash,

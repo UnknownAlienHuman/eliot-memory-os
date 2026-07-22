@@ -285,7 +285,6 @@ $savedEnvironment = @{}
 foreach ($name in @(
     'ELIOT_DISABLE_REAL_PROVIDER',
     'ELIOT_GOVERNOR_CONFIG',
-    'ELIOT_GOVERNOR_PLUGIN_ROOT',
     'ELIOT_TEST_SURREAL_BIND',
     'ELIOT_TEST_SURREAL_ENDPOINT',
     'ELIOT_TEST_SURREAL_PASSWORD_FILE',
@@ -389,7 +388,6 @@ migrations_dir = "$migrationsPath"
     $env:ELIOT_DISABLE_REAL_PROVIDER = '1'
     $env:ELIOT_TEST_ALLOW_LEGACY_OPERATOR_CURSOR_KEY_FILE = '1'
     $env:ELIOT_GOVERNOR_CONFIG = $configPath
-    $env:ELIOT_GOVERNOR_PLUGIN_ROOT = Join-Path $repo 'plugin\eliot-governor'
     $env:ELIOT_TEST_SURREAL_BIND = "127.0.0.1:$port"
     $env:ELIOT_TEST_SURREAL_ENDPOINT = "ws://127.0.0.1:$port/rpc"
     $env:ELIOT_TEST_SURREAL_PASSWORD_FILE = $passwordConfigPath
@@ -714,7 +712,7 @@ foreach ($name in @('LOCALAPPDATA', 'APPDATA', 'USERPROFILE', 'HOME')) {
 }
 
 $report = [ordered]@{
-    component = 'phase_l2_isolated_workspace_tests'
+    component = 'isolated_workspace_tests'
     final_status = if ($testExit -eq 0) { 'DONE_VERIFIED' } else { 'FAILED_VERIFIER' }
     harness_probe = $HarnessProbe
     provider_calls = 0

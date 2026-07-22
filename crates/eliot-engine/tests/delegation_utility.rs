@@ -508,7 +508,7 @@ fn read_only_work_scope_never_invents_write_authority() {
     let scope = default_work_scope("repo", vec!["repo/**".to_owned()], Vec::new(), Vec::new());
     assert!(scope.write_set.is_empty());
     assert!(!scope.authority.allows_write());
-    let source = include_str!("../../eliot-app/src/commands.rs");
+    let source = include_str!("../../eliot-app/src/commands/execution.rs");
     let create = source
         .split_once("pub async fn run_work_create")
         .map(|(_, tail)| tail)
@@ -532,7 +532,7 @@ fn campaign() -> DelegationCalibrationCampaign {
         policy_snapshot_id: "policy:l0".to_owned(),
         provider_route: "antigravity".to_owned(),
         task_family: DelegationCalibrationTaskFamily::SecurityBoundary,
-        selection_rule: "explicit bounded L1B sample".to_owned(),
+        selection_rule: "explicit bounded provider sample".to_owned(),
         budget: DelegationCalibrationCampaignBudget {
             max_provider_calls: 1,
             max_cost_if_known: None,
@@ -609,7 +609,7 @@ fn evidence(result: IndependentEvidenceResult) -> IndependentOutcomeEvidence {
         independent_from_provider: true,
         scope: "delegation_utility".to_owned(),
         observed_at: OffsetDateTime::now_utc(),
-        exact_anchor_refs: vec!["verification:phase-l1b".to_owned()],
+        exact_anchor_refs: vec!["verification:provider-experiment".to_owned()],
         result,
         materiality: DelegationFindingMateriality::Medium,
         supports_provider_finding_ids: vec!["finding-1".to_owned()],

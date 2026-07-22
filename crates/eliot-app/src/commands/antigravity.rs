@@ -5,6 +5,9 @@
 //! rest of the command layer does not share. Keeping it here means the generic
 //! commands stay readable and a change to this provider stays in one file.
 
+// This child module is a decomposition boundary for the parent command
+// implementation and deliberately consumes its private service vocabulary.
+#[allow(clippy::wildcard_imports)]
 use super::*;
 
 pub fn run_antigravity_windows_discover(config_path: &Path) -> Result<()> {
@@ -107,15 +110,23 @@ pub fn run_antigravity_status(config_path: &Path) -> Result<()> {
     if enablement_is_current {
         probe.provider_state = AntigravityProviderState::ReadyEnabled;
     }
-    let skills =
-        AntigravitySkillBundleService.generate(&antigravity_plugin_root(config_path), true);
-    let plugin = AntigravityPluginBundleService.generate(&antigravity_plugin_root(config_path));
+    let home = antigravity_home()?;
+    let official_plugin = AntigravityOfficialPluginService.status(&home);
+    let mcp_configs = AntigravityMcpConfigService.status(&home);
+    let official_plugin_ready = (official_plugin.gui_installed || official_plugin.cli_installed)
+        && official_plugin.official_schema_valid
+        && official_plugin.skill_visible
+        && official_plugin.agent_visible
+        && official_plugin.rule_visible;
+    let mcp_registered = mcp_configs.iter().any(|status| {
+        status.surface == eliot_types::AntigravityMcpConfigSurface::Gui && status.registered
+    });
     let doctor = AntigravityDoctorIntegration.status(
         &resolution,
         &probe,
         &contract,
-        skills.verification_passed,
-        plugin.verification_passed,
+        official_plugin_ready,
+        mcp_registered,
         antigravity_mcp_tools_governed_only(),
     );
     write_antigravity_report_pair(
@@ -125,7 +136,11 @@ pub fn run_antigravity_status(config_path: &Path) -> Result<()> {
         &probe,
     )?;
     write_antigravity_report_pair(&root, "antigravity-doctor", "Antigravity Doctor", &doctor)?;
-    write_json(&doctor)
+    write_json(&serde_json::json!({
+        "doctor": doctor,
+        "official_plugin": official_plugin,
+        "mcp_configs": mcp_configs
+    }))
 }
 
 pub fn run_antigravity_doctor(config_path: &Path) -> Result<()> {
@@ -223,45 +238,6 @@ pub fn run_antigravity_result(config_path: &Path, run_id: &str) -> Result<()> {
         .normalized_result
         .with_context(|| "latest Antigravity run has no normalized result")?;
     write_json(&result)
-}
-
-pub fn run_antigravity_skills_generate(config_path: &Path) -> Result<()> {
-    let root = runtime_root(config_path);
-    let bundle =
-        AntigravitySkillBundleService.generate(&antigravity_plugin_root(config_path), true);
-    write_antigravity_skill_files(config_path, &bundle)?;
-    write_antigravity_report_pair(&root, "antigravity-skills", "Antigravity Skills", &bundle)?;
-    write_json(&bundle)
-}
-
-pub fn run_antigravity_skills_verify(config_path: &Path) -> Result<()> {
-    run_antigravity_skills_generate(config_path)
-}
-
-pub fn run_antigravity_skills_install(
-    config_path: &Path,
-    dry_run: bool,
-    target: &str,
-) -> Result<()> {
-    if !dry_run {
-        bail!("Antigravity skill install is dry-run only in G3A");
-    }
-    if target != "user-agy" {
-        bail!("unsupported Antigravity skill target: {target}");
-    }
-    run_antigravity_skills_generate(config_path)
-}
-
-pub fn run_antigravity_plugin_generate(config_path: &Path) -> Result<()> {
-    let root = runtime_root(config_path);
-    let bundle = AntigravityPluginBundleService.generate(&antigravity_plugin_root(config_path));
-    write_antigravity_plugin_files(config_path, &bundle)?;
-    write_antigravity_report_pair(&root, "antigravity-plugin", "Antigravity Plugin", &bundle)?;
-    write_json(&bundle)
-}
-
-pub fn run_antigravity_plugin_verify(config_path: &Path) -> Result<()> {
-    run_antigravity_plugin_generate(config_path)
 }
 
 pub fn run_antigravity_plugin_schema(config_path: &Path) -> Result<()> {
@@ -574,15 +550,23 @@ pub fn run_antigravity_report(config_path: &Path) -> Result<()> {
     let latest_run = latest_antigravity_run(&root)?;
     let runs = latest_run.iter().cloned().collect::<Vec<_>>();
     let telemetry = AntigravityTelemetryService.report(&probe, &runs);
-    let skills =
-        AntigravitySkillBundleService.generate(&antigravity_plugin_root(config_path), true);
-    let plugin = AntigravityPluginBundleService.generate(&antigravity_plugin_root(config_path));
+    let home = antigravity_home()?;
+    let official_plugin = AntigravityOfficialPluginService.status(&home);
+    let mcp_configs = AntigravityMcpConfigService.status(&home);
+    let official_plugin_ready = (official_plugin.gui_installed || official_plugin.cli_installed)
+        && official_plugin.official_schema_valid
+        && official_plugin.skill_visible
+        && official_plugin.agent_visible
+        && official_plugin.rule_visible;
+    let mcp_registered = mcp_configs.iter().any(|status| {
+        status.surface == eliot_types::AntigravityMcpConfigSurface::Gui && status.registered
+    });
     let doctor = AntigravityDoctorIntegration.status(
         &resolution,
         &probe,
         &contract,
-        skills.verification_passed,
-        plugin.verification_passed,
+        official_plugin_ready,
+        mcp_registered,
         antigravity_mcp_tools_governed_only(),
     );
     let report = antigravity_report(
@@ -686,7 +670,7 @@ pub fn run_antigravity_enable(config_path: &Path, scope: &str, admin_confirm: bo
         true,
         vec![
             "explicit local admin CLI confirmation received".to_owned(),
-            "G3B enables only governed real Antigravity smoke scopes".to_owned(),
+            "only governed real Antigravity smoke scopes are enabled".to_owned(),
         ],
     )?;
     write_antigravity_report_pair(
@@ -736,7 +720,8 @@ pub async fn run_antigravity_live_smoke(config_path: &Path, mode: &str) -> Resul
         "Antigravity Live Tree Before",
         &live_before,
     )?;
-    let (mut work_state, work_lease) = antigravity_smoke_work_lease(&root, "phase-g3b-live-smoke")?;
+    let (mut work_state, work_lease) =
+        antigravity_smoke_work_lease(&root, "antigravity-live-smoke")?;
     let worktree_root = std::env::temp_dir().join("eliot-governor-antigravity-worktrees");
     let worktree_lease = smoke_service
         .create_disposable_worktree(
@@ -755,7 +740,7 @@ pub async fn run_antigravity_live_smoke(config_path: &Path, mode: &str) -> Resul
     );
     let mut request = antigravity_review_request(
         "eliot-governor",
-        "phase-g3b-live-smoke",
+        "antigravity-live-smoke",
         match mode {
             AntigravityLiveSmokeMode::DisposableWorktreeAudit => AntigravityReviewMode::AuditPlan,
             AntigravityLiveSmokeMode::DisposableWorktreeCandidateNoApply => {
@@ -890,7 +875,7 @@ pub async fn run_antigravity_live_smoke(config_path: &Path, mode: &str) -> Resul
                 .map_or(AntigravityEnablementState::ReadyDisabled, |receipt| {
                     receipt.requested_state
                 }),
-            "provider disabled after governed G3B live smoke attempt",
+            "provider disabled after governed live smoke attempt",
         );
         write_antigravity_report_pair(
             &root,
@@ -922,7 +907,7 @@ pub fn run_antigravity_rollback(config_path: &Path) -> Result<()> {
         .map_or(AntigravityEnablementState::ReadyDisabled, |receipt| {
             receipt.requested_state
         });
-    let receipt = AntigravityRollbackService.rollback(previous_state, "manual G3B rollback");
+    let receipt = AntigravityRollbackService.rollback(previous_state, "manual governed rollback");
     write_antigravity_report_pair(
         &root,
         "antigravity-disable",

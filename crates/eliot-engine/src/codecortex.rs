@@ -720,10 +720,9 @@ fn invariant_cards() -> Vec<InvariantCard> {
                 .to_owned(),
         },
         InvariantCard {
-            name: "no_public_codecortex_mcp_tools_in_d1".to_owned(),
+            name: "no_public_codecortex_mcp_tools".to_owned(),
             status: "enforced".to_owned(),
-            evidence: "D1 exposes CLI only; MCP tool list remains Phase C governed surface"
-                .to_owned(),
+            evidence: "CodeCortex remains behind the governed MCP tool boundary".to_owned(),
         },
         InvariantCard {
             name: "domain_api_disabled".to_owned(),

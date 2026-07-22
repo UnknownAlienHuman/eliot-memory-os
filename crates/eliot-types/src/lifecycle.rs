@@ -190,7 +190,7 @@ pub struct MemoryVitalityScore {
     pub harm_millis: i64,
     #[serde(default)]
     pub decision: MemoryEcologyDecision,
-    // Compatibility projections for I0 reports. L10 decisions use the fixed
+    // Compatibility projections for older lifecycle reports. Current decisions use the fixed
     // point fields above.
     pub recency_score: f64,
     pub scope_fit_score: f64,

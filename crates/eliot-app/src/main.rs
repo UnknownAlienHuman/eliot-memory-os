@@ -8,10 +8,9 @@ mod config;
 mod delegation_runtime;
 mod dogfood;
 mod host_runtime;
-mod l1c_r_runtime;
-mod l1c_runtime;
 mod mcp_stdio;
 mod named_pipe_ipc;
+mod provider_budget_runtime;
 mod runtime_bootstrap;
 mod runtime_instance;
 mod security_scan;
@@ -19,6 +18,7 @@ mod windows_service;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use tracing_subscriber::EnvFilter;
 
@@ -239,10 +239,6 @@ enum Command {
         #[command(subcommand)]
         command: HookCommand,
     },
-    Plugin {
-        #[command(subcommand)]
-        command: PluginCommand,
-    },
     Mcp {
         #[command(subcommand)]
         command: McpCommand,
@@ -250,14 +246,6 @@ enum Command {
     Host {
         #[command(subcommand)]
         command: HostCommand,
-    },
-    CalibrationCampaign {
-        #[command(subcommand)]
-        command: CalibrationCampaignCommand,
-    },
-    CalibrationReconcile {
-        #[command(subcommand)]
-        command: CalibrationReconcileCommand,
     },
 }
 
@@ -866,10 +854,6 @@ enum AntigravityCommand {
         #[arg(long)]
         run: String,
     },
-    Skills {
-        #[command(subcommand)]
-        command: AntigravitySkillsCommand,
-    },
     Plugin {
         #[command(subcommand)]
         command: AntigravityPluginCommand,
@@ -883,21 +867,7 @@ enum AntigravityCommand {
 }
 
 #[derive(Debug, Subcommand)]
-enum AntigravitySkillsCommand {
-    Generate,
-    Verify,
-    Install {
-        #[arg(long)]
-        dry_run: bool,
-        #[arg(long, default_value = "user-agy")]
-        target: String,
-    },
-}
-
-#[derive(Debug, Subcommand)]
 enum AntigravityPluginCommand {
-    Generate,
-    Verify,
     Schema,
     InstallOfficial {
         #[arg(long)]
@@ -927,11 +897,11 @@ enum EvalCommand {
         command: EvalSuiteCommand,
     },
     Manifest {
-        #[arg(long, default_value = "k0-core-smoke")]
+        #[arg(long, default_value = "core-smoke")]
         suite: String,
     },
     Run {
-        #[arg(long, default_value = "k0-core-smoke")]
+        #[arg(long, default_value = "core-smoke")]
         suite: String,
         #[arg(long, default_value = "deterministic-no-mutation")]
         profile: String,
@@ -945,7 +915,7 @@ enum EvalCommand {
         run: String,
     },
     Coverage {
-        #[arg(long, default_value = "k0-core-smoke")]
+        #[arg(long, default_value = "core-smoke")]
         suite: String,
     },
     Baseline {
@@ -953,7 +923,7 @@ enum EvalCommand {
         command: EvalBaselineCommand,
     },
     Compare {
-        #[arg(long, default_value = "k0-core-smoke")]
+        #[arg(long, default_value = "core-smoke")]
         suite: String,
         #[arg(long, default_value = "latest")]
         baseline: String,
@@ -961,26 +931,26 @@ enum EvalCommand {
         candidate_run: String,
     },
     Gate {
-        #[arg(long, default_value = "phase-minimal")]
+        #[arg(long, default_value = "fast-deterministic")]
         profile: String,
-        #[arg(long, default_value = "k0-core-smoke")]
+        #[arg(long, default_value = "core-smoke")]
         suite: String,
     },
     Profiles,
     Trend {
-        #[arg(long, default_value = "k0-core-smoke")]
+        #[arg(long, default_value = "core-smoke")]
         suite: String,
     },
     Stability {
-        #[arg(long, default_value = "k0-core-smoke")]
+        #[arg(long, default_value = "core-smoke")]
         suite: String,
         #[arg(long, default_value_t = 2)]
         repeat: u8,
     },
-    K1Smoke,
+    IntegrationSmoke,
     Report,
     Smoke {
-        #[arg(long, default_value = "k0-core-smoke")]
+        #[arg(long, default_value = "core-smoke")]
         suite: String,
     },
 }
@@ -1020,13 +990,13 @@ enum EvalSuiteCommand {
 #[derive(Debug, Subcommand)]
 enum EvalBaselineCommand {
     Create {
-        #[arg(long, default_value = "k0-core-smoke")]
+        #[arg(long, default_value = "core-smoke")]
         suite: String,
         #[arg(long, default_value = "latest")]
         run: String,
     },
     List {
-        #[arg(long, default_value = "k0-core-smoke")]
+        #[arg(long, default_value = "core-smoke")]
         suite: String,
     },
 }
@@ -1461,13 +1431,6 @@ enum HookCommand {
     Stop,
 }
 
-#[derive(Clone, Copy, Debug, Subcommand)]
-enum PluginCommand {
-    PrintPath,
-    Inspect,
-    Verify,
-}
-
 #[derive(Debug, Subcommand)]
 enum McpCommand {
     Stdio {
@@ -1661,32 +1624,6 @@ enum HostCommand {
     SkillLint,
     /// Rewrite every derived host skill package from the canonical bodies.
     SkillSync,
-}
-
-#[derive(Debug, Subcommand)]
-enum CalibrationCampaignCommand {
-    Prepare,
-    ProviderOnce {
-        #[arg(long)]
-        campaign: String,
-        #[arg(long)]
-        confirm: String,
-    },
-    Evaluate {
-        #[arg(long)]
-        campaign: String,
-        #[arg(long)]
-        dispositions: PathBuf,
-        #[arg(long = "evidence")]
-        evidence: Vec<PathBuf>,
-    },
-    Closeout,
-}
-
-#[derive(Debug, Subcommand)]
-enum CalibrationReconcileCommand {
-    Reconcile,
-    Closeout,
 }
 
 #[derive(Debug, Subcommand)]
@@ -2104,7 +2041,6 @@ async fn dispatch_command(
         Command::Adapter { command } => dispatch_adapter_command(config, command).await,
         Command::Verifier { command } => dispatch_verifier_command(config, command).await,
         Command::Hook { command } => dispatch_hook_command(config, command),
-        Command::Plugin { command } => dispatch_plugin_command(config, command),
         Command::Mcp {
             command:
                 McpCommand::Stdio {
@@ -2134,54 +2070,10 @@ async fn dispatch_command(
             let catalog = mcp_stdio::claude_surface_catalog(surface);
             let mut stdout = std::io::stdout().lock();
             serde_json::to_writer_pretty(&mut stdout, &catalog)?;
-            use std::io::Write as _;
             writeln!(stdout)?;
             Ok(())
         }
         Command::Host { command } => Box::pin(host_runtime::dispatch(config, command)).await,
-        Command::CalibrationCampaign { command } => {
-            let root = delegation_runtime::root_from_config(config);
-            let loaded = config::load_config(config)?;
-            let value = match command {
-                CalibrationCampaignCommand::Prepare => {
-                    l1c_runtime::prepare(&root, &loaded.delegation_calibration, Path::new("."))?
-                }
-                CalibrationCampaignCommand::ProviderOnce { campaign, confirm } => {
-                    Box::pin(l1c_runtime::provider_once(&root, &campaign, &confirm)).await?
-                }
-                CalibrationCampaignCommand::Evaluate {
-                    campaign,
-                    dispositions,
-                    evidence,
-                } => l1c_runtime::evaluate(
-                    &root,
-                    &loaded.delegation_calibration,
-                    &campaign,
-                    &dispositions,
-                    &evidence,
-                )?,
-                CalibrationCampaignCommand::Closeout => {
-                    l1c_runtime::closeout(&root, &loaded.delegation_calibration)?
-                }
-            };
-            #[allow(clippy::print_stdout)]
-            {
-                println!("{}", serde_json::to_string_pretty(&value)?);
-            }
-            Ok(())
-        }
-        Command::CalibrationReconcile { command } => {
-            let root = delegation_runtime::root_from_config(config);
-            let value = match command {
-                CalibrationReconcileCommand::Reconcile => l1c_r_runtime::reconcile(&root)?,
-                CalibrationReconcileCommand::Closeout => l1c_r_runtime::closeout(&root)?,
-            };
-            #[allow(clippy::print_stdout)]
-            {
-                println!("{}", serde_json::to_string_pretty(&value)?);
-            }
-            Ok(())
-        }
     }
 }
 
@@ -2484,16 +2376,7 @@ async fn dispatch_antigravity_command(config: &Path, command: AntigravityCommand
         }
         AntigravityCommand::JobStatus { run } => commands::run_antigravity_job_status(config, &run),
         AntigravityCommand::Result { run } => commands::run_antigravity_result(config, &run),
-        AntigravityCommand::Skills { command } => match command {
-            AntigravitySkillsCommand::Generate => commands::run_antigravity_skills_generate(config),
-            AntigravitySkillsCommand::Verify => commands::run_antigravity_skills_verify(config),
-            AntigravitySkillsCommand::Install { dry_run, target } => {
-                commands::run_antigravity_skills_install(config, dry_run, &target)
-            }
-        },
         AntigravityCommand::Plugin { command } => match command {
-            AntigravityPluginCommand::Generate => commands::run_antigravity_plugin_generate(config),
-            AntigravityPluginCommand::Verify => commands::run_antigravity_plugin_verify(config),
             AntigravityPluginCommand::Schema => commands::run_antigravity_plugin_schema(config),
             AntigravityPluginCommand::InstallOfficial { admin_confirm } => {
                 commands::run_antigravity_plugin_install_official(config, admin_confirm)
@@ -2555,7 +2438,7 @@ fn dispatch_eval_command(config: &Path, command: EvalCommand) -> Result<()> {
         EvalCommand::Stability { suite, repeat } => {
             commands::run_eval_stability(config, &suite, repeat)
         }
-        EvalCommand::K1Smoke => commands::run_eval_k1_smoke(config),
+        EvalCommand::IntegrationSmoke => commands::run_eval_integration_smoke(config),
         EvalCommand::Report => commands::run_eval_report(config),
         EvalCommand::Smoke { suite } => commands::run_eval_smoke(config, &suite),
     }
@@ -2979,14 +2862,6 @@ fn dispatch_hook_command(config: &Path, command: HookCommand) -> Result<()> {
         HookCommand::Stop => eliot_types::HookEventKind::Stop,
     };
     commands::run_hook(config, kind)
-}
-
-fn dispatch_plugin_command(config: &Path, command: PluginCommand) -> Result<()> {
-    match command {
-        PluginCommand::PrintPath => commands::run_plugin_print_path(config),
-        PluginCommand::Inspect => commands::run_plugin_inspect(config),
-        PluginCommand::Verify => commands::run_plugin_verify(config),
-    }
 }
 
 fn selected_instance(explicit: Option<String>, implicit: Option<&str>) -> Option<String> {

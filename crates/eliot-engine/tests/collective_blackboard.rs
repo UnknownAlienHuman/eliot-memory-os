@@ -71,10 +71,13 @@ fn blackboard_ack_resolve_reject() -> TestResult {
 fn blackboard_large_payload_by_ref() -> TestResult {
     let mut fixture = Fixture::new("blackboard-large-ref");
     let large_payload = "x".repeat(4096);
-    let item = fixture.add_blackboard(BlackboardItemKind::EvidenceHandle, "blob:phase-f3-large");
+    let item = fixture.add_blackboard(
+        BlackboardItemKind::EvidenceHandle,
+        "blob:collective-work-large",
+    );
 
     assert_ne!(item.payload_ref, large_payload);
-    assert_eq!(item.payload_ref, "blob:phase-f3-large");
+    assert_eq!(item.payload_ref, "blob:collective-work-large");
     assert!(!serde_json::to_string(&item)?.contains(&large_payload));
     Ok(())
 }
@@ -402,7 +405,7 @@ impl Fixture {
                 task_id,
                 project: "eliot-governor".to_owned(),
                 task: name.to_owned(),
-                goal: "phase f3 fixture".to_owned(),
+                goal: "collective-work fixture".to_owned(),
                 scope: default_work_scope(
                     repo.display().to_string(),
                     vec!["crates/eliot-engine/src/collective.rs".to_owned()],
@@ -461,7 +464,7 @@ impl Fixture {
         let worktree_lease_id = WorktreeLeaseId::new_v7();
         let worktree_path = repo
             .join("target")
-            .join("phase-f3-tests")
+            .join("collective-work-tests")
             .join(name.replace('\\', "-"));
         assert!(fs::create_dir_all(&worktree_path).is_ok());
         state.worktree_leases.push(WorktreeLease {
@@ -473,8 +476,8 @@ impl Fixture {
             holder_session_id: worker.agent_session_id,
             repo_root: repo.display().to_string(),
             worktree_path: worktree_path.display().to_string(),
-            branch_name: format!("phase-f3-{name}"),
-            base_commit: "phase-f3-fixture".to_owned(),
+            branch_name: format!("collective-work-{name}"),
+            base_commit: "collective-work-fixture".to_owned(),
             allowed_read_set: vec!["crates/eliot-engine/src/collective.rs".to_owned()],
             allowed_write_set: vec!["crates/eliot-engine/src/collective.rs".to_owned()],
             state: WorktreeLeaseState::Active,
@@ -511,13 +514,13 @@ impl Fixture {
                 lease_id: Some(self.work_lease_id),
                 kind,
                 scope: BlackboardScope {
-                    memory_scope: vec!["phase-f3".to_owned()],
+                    memory_scope: vec!["collective-work".to_owned()],
                     files: vec!["crates/eliot-engine/src/collective.rs".to_owned()],
                     symbols: vec!["BlackboardService".to_owned()],
                     work_items: vec![self.work_item_id],
                 },
                 payload_ref: payload_ref.to_owned(),
-                evidence_refs: vec!["evidence:phase-f3".to_owned()],
+                evidence_refs: vec!["evidence:collective-work".to_owned()],
                 confidence: Some(ConfidenceLevel::High),
                 expires_at: None,
             },
@@ -538,7 +541,7 @@ impl Fixture {
                 sender_session_id: self.worker_id,
                 recipient: MailboxRecipient::Controller,
                 kind,
-                payload_ref: "mailbox:phase-f3".to_owned(),
+                payload_ref: "mailbox:collective-work".to_owned(),
                 requires_ack: None,
                 expires_at: None,
             },
@@ -562,10 +565,10 @@ impl Fixture {
             project_id: self.project_id,
             task_id: self.task_id,
             work_item_id: self.work_item_id,
-            base_commit: "phase-f3-fixture".to_owned(),
+            base_commit: "collective-work-fixture".to_owned(),
             worktree_head: None,
-            diff_hash: "phase-f3-rejected".to_owned(),
-            diff_ref: "candidate-diff:phase-f3-rejected".to_owned(),
+            diff_hash: "collective-work-rejected".to_owned(),
+            diff_ref: "candidate-diff:collective-work-rejected".to_owned(),
             changed_files: vec!["crates/eliot-engine/src/collective.rs".to_owned()],
             added_files: Vec::new(),
             modified_files: vec!["crates/eliot-engine/src/collective.rs".to_owned()],

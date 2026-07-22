@@ -48,11 +48,8 @@ jobs:
       - name: Workspace check
         run: cargo check --workspace --all-targets
 
-      # The whole workspace. The 117 tests that need a provisioned local runtime
-      # -- a Governor daemon, an authenticated SurrealDB, a git identity -- are
-      # `#[ignore]`d at the source with the reason on each one, so this is the
-      # deterministic set by construction rather than by a scope that quietly
-      # skipped every integration test. That scope is how eight tests stayed red
-      # for a day after the phase-closeout commands were deleted.
+      # Provider-free workspace tests. Tests requiring a provisioned local
+      # runtime, authenticated SurrealDB, or interactive host are explicitly
+      # ignored at the source with their prerequisite recorded there.
       - name: Tests
         run: cargo test --workspace

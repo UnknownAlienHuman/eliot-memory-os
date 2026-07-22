@@ -98,7 +98,7 @@ fn sealed_reader_is_direct_without_globally_disabling_opencode_subagents() {
     assert!(config.get("permission").is_none());
 
     let prompt = std::fs::read_to_string(
-        repo_root().join("tests/cognitive/phase-l10-l12/templates/sealed-host-prompt.txt"),
+        repo_root().join("tests/cognitive/cognitive-contract/templates/sealed-host-prompt.txt"),
     )
     .expect("read sealed cognitive prompt");
     assert!(prompt.contains("Solve this sealed reader task directly"));

@@ -105,7 +105,7 @@ fn plan_rejects_array_order_flow_and_gate_drift() {
 fn contract_hash_excludes_only_its_own_field() -> Result<()> {
     let mut contract = CognitiveRunContract {
         schema_version: COGNITIVE_RUN_SCHEMA_VERSION.to_owned(),
-        harness_version: "phase-l10-l12-m6-v2".to_owned(),
+        harness_version: "cognitive-contract-v2".to_owned(),
         instance_name: "default".to_owned(),
         run_id: "fixture-run".to_owned(),
         project_id: ProjectId::new_v7(),
@@ -139,7 +139,7 @@ fn contract_hash_excludes_only_its_own_field() -> Result<()> {
 #[test]
 fn cognitive_seal_rejects_source_commit_and_policy_drift() -> Result<()> {
     let mut input = CognitiveSealInput {
-        harness_version: "phase-l13-bounded-v1".to_owned(),
+        harness_version: "bounded-retrieval-v1".to_owned(),
         instance_name: "default".to_owned(),
         run_id: "fixture-source-binding".to_owned(),
         project_id: ProjectId::new_v7(),

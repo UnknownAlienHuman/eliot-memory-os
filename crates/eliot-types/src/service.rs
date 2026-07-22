@@ -221,7 +221,7 @@ pub enum ServiceReadinessCheck {
     WriterSelfCheckPassed,
     ReadSelfCheckPassed,
     IpcServerListening,
-    PhaseMinimalEvalGatePassed,
+    FastDeterministicEvalGatePassed,
     NoBlockingIncidents,
 }
 

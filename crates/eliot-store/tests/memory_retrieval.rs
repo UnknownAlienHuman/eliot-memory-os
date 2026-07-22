@@ -51,7 +51,7 @@ fn retrieval_envelope(
         policy_snapshot_id: Some("policy:l13-query-aware-retrieval".to_owned()),
         project_sequence_hint: Some(ProjectSequence::new(1)),
         created_at: OffsetDateTime::now_utc(),
-        scope: "phase-l13-bounded-retrieval".to_owned(),
+        scope: "bounded-retrieval".to_owned(),
         authority: "isolated-local-verified".to_owned(),
         task_contracts: Vec::new(),
         source_snapshots: Vec::new(),
@@ -146,7 +146,7 @@ async fn query_aware_l0_and_exact_l2_are_bounded_scoped_and_restart_deterministi
             evidence_id,
             source_id: "source:l13-retrieval".to_owned(),
             summary: "exact retrieval evidence".to_owned(),
-            payload: json!({ "scope": "phase-l13" }),
+            payload: json!({ "scope": "bounded-retrieval" }),
         }],
         vec![RelationInput {
             relation_type: RelationType::Supports,

@@ -3,13 +3,14 @@
 //! Both hosts get the same guarantee and need different mechanics to keep it:
 //! ELIOT owns only the paths it wrote, records their hashes, and backs up
 //! whatever it replaced, so uninstall can prove it is removing its own files
-//! and not the user's. OpenCode needs a lossless JSONC merge because its config
+//! and not the user's. `OpenCode` needs a lossless JSONC merge because its config
 //! is hand-edited and the comments have to survive; Claude gets a plain owned
 //! directory. Install and uninstall share a file because the manifest they
 //! agree on is the whole safety property.
 
 use super::*;
 
+#[allow(clippy::too_many_lines)]
 pub(super) fn install(
     config_path: &Path,
     host: AgentHostId,
@@ -76,6 +77,7 @@ pub(super) fn install(
         backup_refs.extend(global.backup_refs);
     } else if host == AgentHostId::Claude {
         let global = install_claude_global(
+            &repo,
             &source,
             &target,
             &governor,
@@ -99,7 +101,7 @@ pub(super) fn install(
         host_version: profile.version,
         scope: match host {
             AgentHostId::OpenCode => "user-local Eliot bundle plus additive OpenCode global discovery; provider/auth and unrelated config preserved".to_owned(),
-            AgentHostId::Claude => "user-local Eliot bundle plus additive Claude Code skills-dir plugin discovery; provider/auth/settings and unrelated config preserved".to_owned(),
+            AgentHostId::Claude => "user-local Eliot bundle packaged into a local marketplace and installed through the official Claude Code plugin lifecycle; provider/auth and unrelated settings preserved".to_owned(),
             _ => "user-local Eliot integration bundle; host auth/config untouched".to_owned(),
         },
         installed_paths,
@@ -146,10 +148,43 @@ pub(super) fn read_claude_global_manifest(
     } else {
         target.join(CLAUDE_LEGACY_GLOBAL_MANIFEST)
     };
-    if !path.is_file() {
-        return Ok(None);
+    if path.is_file() {
+        return Ok(Some(serde_json::from_reader(std::fs::File::open(path)?)?));
     }
-    Ok(Some(serde_json::from_reader(std::fs::File::open(path)?)?))
+    // A host install swaps the versioned bundle before invoking the provider's
+    // lifecycle. If that lifecycle fails, the previous ownership manifest is
+    // still in the exact backup made by the swap and is required for a safe
+    // retry (especially to retire the old skills-dir plugin). Recover only the
+    // newest ELIOT-created Claude backup beside this target.
+    let Some(parent) = target.parent() else {
+        return Ok(None);
+    };
+    let mut backups = std::fs::read_dir(parent)?
+        .filter_map(std::result::Result::ok)
+        .filter(|entry| {
+            entry
+                .file_name()
+                .to_str()
+                .is_some_and(|name| name.starts_with(".claude-") && name.ends_with("-backup"))
+        })
+        .filter_map(|entry| {
+            let manifest = entry.path().join(CLAUDE_GLOBAL_MANIFEST);
+            manifest.is_file().then(|| {
+                let modified = entry
+                    .metadata()
+                    .and_then(|metadata| metadata.modified())
+                    .ok();
+                (modified, manifest)
+            })
+        })
+        .collect::<Vec<_>>();
+    backups.sort_by_key(|entry| entry.0);
+    let Some((_, recovered)) = backups.pop() else {
+        return Ok(None);
+    };
+    Ok(Some(serde_json::from_reader(std::fs::File::open(
+        recovered,
+    )?)?))
 }
 
 #[allow(clippy::too_many_lines)]
@@ -563,97 +598,341 @@ pub(super) fn record_owned_outcome(
 }
 
 pub(super) fn install_claude_global(
+    repo: &Path,
     source: &Path,
     target: &Path,
     governor: &Path,
     previous: Option<&ClaudeGlobalInstallManifest>,
     dry_run: bool,
 ) -> Result<GlobalInstallOutcome> {
-    let destination = claude_global_plugin_path()?;
-    let installed_hash = claude_plugin_hash(source, governor)?;
-    let current_hash =
-        if destination.is_dir() && destination.join("bin").join("eliot-governor.exe").is_file() {
-            Some(claude_plugin_hash(
-                &destination,
-                &destination.join("bin").join("eliot-governor.exe"),
-            )?)
-        } else if destination.exists() {
-            Some(hash_owned_path(&destination)?)
-        } else {
-            None
-        };
-    let continuing_owned = previous.is_some_and(|manifest| {
-        manifest.owned_plugin.path == destination
-            && current_hash.as_deref() == Some(manifest.owned_plugin.installed_hash.as_str())
-    });
-    let backup_ref = if continuing_owned {
-        previous.and_then(|manifest| manifest.owned_plugin.backup_ref.clone())
-    } else if destination.exists() {
-        Some(global_backup_path("claude-eliot-plugin", None)?)
-    } else {
-        None
-    };
-    let changed = current_hash.as_deref() != Some(installed_hash.as_str());
+    const MARKETPLACE_NAME: &str = "eliot-local";
+    const PLUGIN_ID: &str = "eliot@eliot-local";
 
-    if !dry_run && changed {
-        if let Some(backup) = &backup_ref
-            && !continuing_owned
-        {
-            std::fs::create_dir_all(backup.parent().context("backup has no parent")?)?;
-            std::fs::rename(&destination, backup)?;
-        } else if destination.exists() {
-            remove_owned_path(&destination)?;
-        }
-        copy_tree(source, &destination, AgentHostId::Claude)?;
-        std::fs::create_dir_all(destination.join("bin"))?;
-        std::fs::copy(governor, destination.join("bin").join("eliot-governor.exe"))?;
-        let actual_hash = claude_plugin_hash(
-            &destination,
-            &destination.join("bin").join("eliot-governor.exe"),
-        )?;
-        if actual_hash != installed_hash {
-            bail!("installed Claude Eliot plugin hash does not match the source bundle");
-        }
-    }
-
-    let owned_plugin = OpenCodeOwnedPath {
-        path: destination.clone(),
-        installed_hash,
-        backup_ref,
-    };
-    if !dry_run {
-        let installed_governor = destination.join("bin").join("eliot-governor.exe");
-        let manifest = ClaudeGlobalInstallManifest {
-            schema_version: "eliot-claude-global-install-v2".to_owned(),
-            source_plugin_path: source.to_path_buf(),
-            source_bundle_hash: bundle_hash(source, AgentHostId::Claude)?,
-            target_plugin_path: destination.clone(),
-            governor_source_path: governor.to_path_buf(),
-            governor_sha256: sha256_file(governor)?,
-            installed_governor_path: installed_governor.clone(),
-            installed_governor_sha256: sha256_file(&installed_governor)?,
-            generated_at: OffsetDateTime::now_utc().to_string(),
-            owned_plugin: owned_plugin.clone(),
-        };
-        atomic_write_json(&target.join(CLAUDE_GLOBAL_MANIFEST), &manifest)?;
-        atomic_write_json(&destination.join(CLAUDE_GLOBAL_MANIFEST), &manifest)?;
-    }
-
+    let profile = HostProfileService.probe(AgentHostId::Claude)?;
+    let claude = PathBuf::from(&profile.executable_path);
+    let package_root = claude_package_cache_root();
+    let marketplace_root = package_root.join("claude-code-marketplace");
+    let legacy_destination = claude_global_plugin_path()?;
     let mut outcome = GlobalInstallOutcome::default();
     outcome
         .installed_paths
-        .push(destination.to_string_lossy().into_owned());
-    if changed {
+        .push(marketplace_root.to_string_lossy().into_owned());
+
+    if dry_run {
         outcome
-            .modified_files
-            .push(destination.to_string_lossy().into_owned());
+            .installed_paths
+            .push(format!("official-plugin:{PLUGIN_ID}"));
+        return Ok(outcome);
     }
-    if let Some(backup) = &owned_plugin.backup_ref {
-        outcome
-            .backup_refs
-            .push(backup.to_string_lossy().into_owned());
-    }
+
+    let artifact =
+        build_claude_marketplace(repo, source, governor, &marketplace_root, MARKETPLACE_NAME)?;
+    let installed = install_official_claude_plugin(
+        &claude,
+        &marketplace_root,
+        MARKETPLACE_NAME,
+        PLUGIN_ID,
+        &artifact.version,
+        governor,
+    )?;
+    let legacy_direct_backup =
+        retire_legacy_claude_plugin(&claude, &legacy_destination, previous, &mut outcome)?;
+
+    let manifest = ClaudeGlobalInstallManifest {
+        schema_version: "eliot-claude-global-install-v3".to_owned(),
+        source_plugin_path: source.to_path_buf(),
+        source_bundle_hash: bundle_hash(source, AgentHostId::Claude)?,
+        target_plugin_path: installed.path.clone(),
+        governor_source_path: governor.to_path_buf(),
+        governor_sha256: installed.governor_sha256.clone(),
+        installed_governor_path: installed.governor,
+        installed_governor_sha256: installed.governor_sha256,
+        generated_at: OffsetDateTime::now_utc().to_string(),
+        legacy_owned_plugin: None,
+        legacy_direct_backup,
+        marketplace_name: MARKETPLACE_NAME.to_owned(),
+        marketplace_root: marketplace_root.clone(),
+        plugin_id: PLUGIN_ID.to_owned(),
+        plugin_version: artifact.version,
+        artifact_hash: artifact.hash,
+        source_commit: artifact.source_commit,
+        claude_executable: claude,
+        claude_version: profile.version,
+    };
+    atomic_write_json(&target.join(CLAUDE_GLOBAL_MANIFEST), &manifest)?;
+    outcome
+        .installed_paths
+        .push(installed.path.to_string_lossy().into_owned());
+    outcome
+        .modified_files
+        .push(marketplace_root.to_string_lossy().into_owned());
+    outcome
+        .modified_files
+        .push(format!("official-plugin:{PLUGIN_ID}"));
     Ok(outcome)
+}
+
+struct InstalledClaudePlugin {
+    path: PathBuf,
+    governor: PathBuf,
+    governor_sha256: String,
+}
+
+fn install_official_claude_plugin(
+    claude: &Path,
+    marketplace_root: &Path,
+    marketplace_name: &str,
+    plugin_id: &str,
+    expected_version: &str,
+    governor: &Path,
+) -> Result<InstalledClaudePlugin> {
+    claude_cli_checked(
+        claude,
+        &[
+            "plugin",
+            "validate",
+            "--strict",
+            &path_arg(marketplace_root),
+        ],
+    )?;
+    let marketplaces = claude_cli_json(claude, &["plugin", "marketplace", "list", "--json"])?;
+    let registered = marketplaces.as_array().is_some_and(|entries| {
+        entries
+            .iter()
+            .any(|entry| entry.get("name").and_then(Value::as_str) == Some(marketplace_name))
+    });
+    if registered {
+        claude_cli_checked(
+            claude,
+            &["plugin", "marketplace", "update", marketplace_name],
+        )?;
+    } else {
+        claude_cli_checked(
+            claude,
+            &["plugin", "marketplace", "add", &path_arg(marketplace_root)],
+        )?;
+    }
+    if claude_installed_plugin(claude, plugin_id)?.is_some() {
+        claude_cli_checked(claude, &["plugin", "update", plugin_id])?;
+    } else {
+        claude_cli_checked(claude, &["plugin", "install", plugin_id, "--scope", "user"])?;
+    }
+    let mut installed = claude_installed_plugin(claude, plugin_id)?
+        .context("Claude reported success but the official Eliot plugin is not installed")?;
+    if installed.get("enabled").and_then(Value::as_bool) != Some(true) {
+        claude_cli_checked(claude, &["plugin", "enable", plugin_id, "--scope", "user"])?;
+        installed = claude_installed_plugin(claude, plugin_id)?
+            .context("Claude enabled Eliot but no longer reports the plugin")?;
+    }
+    let installed_version = installed
+        .get("version")
+        .and_then(Value::as_str)
+        .context("installed Claude Eliot plugin has no version")?;
+    if installed_version != expected_version {
+        bail!(
+            "installed Claude Eliot plugin version {installed_version} differs from generated {expected_version}"
+        );
+    }
+    if installed.get("enabled").and_then(Value::as_bool) != Some(true) {
+        bail!("the official Claude Eliot plugin is installed but not enabled");
+    }
+    let path = PathBuf::from(
+        installed
+            .get("installPath")
+            .and_then(Value::as_str)
+            .context("installed Claude Eliot plugin has no installPath")?,
+    );
+    let installed_governor = path.join("bin").join("eliot-governor.exe");
+    let governor_sha256 = sha256_file(governor)?;
+    let installed_governor_sha256 = sha256_file(&installed_governor)
+        .context("official Claude Eliot plugin is missing its Governor binary")?;
+    if installed_governor_sha256 != governor_sha256 {
+        bail!("official Claude Eliot plugin Governor differs from the current binary");
+    }
+    Ok(InstalledClaudePlugin {
+        path,
+        governor: installed_governor,
+        governor_sha256,
+    })
+}
+
+fn retire_legacy_claude_plugin(
+    claude: &Path,
+    destination: &Path,
+    previous: Option<&ClaudeGlobalInstallManifest>,
+    outcome: &mut GlobalInstallOutcome,
+) -> Result<Option<PathBuf>> {
+    if !destination.exists() {
+        return Ok(previous.and_then(|manifest| manifest.legacy_direct_backup.clone()));
+    }
+    let owned = previous
+        .and_then(|manifest| manifest.legacy_owned_plugin.as_ref())
+        .context("refuse to remove an unowned Claude skills-dir plugin")?;
+    let governor = destination.join("bin").join("eliot-governor.exe");
+    let current_hash = claude_plugin_hash(destination, &governor)?;
+    if owned.path != destination || owned.installed_hash != current_hash {
+        bail!("refuse to remove the changed Claude skills-dir plugin");
+    }
+    claude_cli_checked(
+        claude,
+        &["plugin", "disable", "eliot@skills-dir", "--scope", "user"],
+    )?;
+    let backup = global_backup_path("claude-legacy-skills-dir", None)?;
+    std::fs::create_dir_all(backup.parent().context("backup has no parent")?)?;
+    std::fs::rename(destination, &backup)?;
+    outcome
+        .backup_refs
+        .push(backup.to_string_lossy().into_owned());
+    Ok(Some(backup))
+}
+
+struct ClaudeMarketplaceArtifact {
+    version: String,
+    hash: String,
+    source_commit: String,
+}
+
+fn build_claude_marketplace(
+    repo: &Path,
+    source: &Path,
+    governor: &Path,
+    destination: &Path,
+    marketplace_name: &str,
+) -> Result<ClaudeMarketplaceArtifact> {
+    let package_root = claude_package_cache_root();
+    ensure_child(&package_root, destination)?;
+    std::fs::create_dir_all(&package_root)?;
+    let staging = package_root.join(format!(
+        ".claude-code-marketplace-{}-staging",
+        Uuid::new_v4()
+    ));
+    ensure_child(&package_root, &staging)?;
+    let plugin = staging.join("plugins").join("eliot");
+    copy_tree(source, &plugin, AgentHostId::Claude)?;
+    std::fs::create_dir_all(plugin.join("bin"))?;
+    std::fs::copy(governor, plugin.join("bin").join("eliot-governor.exe"))?;
+
+    let plugin_manifest_path = plugin.join(".claude-plugin").join("plugin.json");
+    let mut plugin_manifest: Value =
+        serde_json::from_slice(&std::fs::read(&plugin_manifest_path)?)?;
+    let base_version = plugin_manifest
+        .get("version")
+        .and_then(Value::as_str)
+        .context("Claude plugin source version is missing")?;
+    let source_hash = bundle_hash(source, AgentHostId::Claude)?;
+    let governor_hash = sha256_file(governor)?;
+    let version = format!(
+        "{base_version}+{}.{}",
+        short_hash(&source_hash),
+        short_hash(&governor_hash)
+    );
+    plugin_manifest["version"] = Value::String(version.clone());
+    atomic_write_json(&plugin_manifest_path, &plugin_manifest)?;
+
+    let source_commit = git_head(repo)?;
+    let marketplace = json!({
+        "name": marketplace_name,
+        "owner": { "name": "ELIOT Project" },
+        "description": "Local deterministic marketplace for the private pre-alpha ELIOT Claude Code plugin.",
+        "version": version,
+        "plugins": [{
+            "name": "eliot",
+            "source": "./plugins/eliot",
+            "description": plugin_manifest["description"],
+            "version": plugin_manifest["version"],
+            "author": plugin_manifest["author"],
+            "homepage": plugin_manifest["homepage"],
+            "repository": plugin_manifest["repository"],
+            "license": plugin_manifest["license"],
+            "strict": true
+        }]
+    });
+    atomic_write_json(
+        &staging.join(".claude-plugin").join("marketplace.json"),
+        &marketplace,
+    )?;
+    let hash = claude_plugin_hash(&plugin, &plugin.join("bin").join("eliot-governor.exe"))?;
+    atomic_write_json(
+        &staging.join("build-receipt.json"),
+        &json!({
+            "schema_version": "eliot-claude-code-marketplace-build-v1",
+            "plugin_version": version,
+            "source_commit": source_commit,
+            "source_bundle_hash": source_hash,
+            "governor_sha256": governor_hash,
+            "artifact_hash": hash,
+            "generated_at": OffsetDateTime::now_utc()
+        }),
+    )?;
+
+    let replaced = package_root.join(format!(
+        ".claude-code-marketplace-{}-replaced",
+        Uuid::new_v4()
+    ));
+    if destination.exists() {
+        std::fs::rename(destination, &replaced)?;
+    }
+    std::fs::rename(&staging, destination)?;
+    if replaced.exists() {
+        remove_owned_path(&replaced)?;
+    }
+    Ok(ClaudeMarketplaceArtifact {
+        version,
+        hash,
+        source_commit,
+    })
+}
+
+fn short_hash(value: &str) -> &str {
+    value.get(..12).unwrap_or(value)
+}
+
+fn git_head(repo: &Path) -> Result<String> {
+    let output = StdCommand::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .context("read canonical source commit for Claude plugin package")?;
+    if !output.status.success() {
+        bail!("git rev-parse failed while packaging the Claude plugin");
+    }
+    Ok(String::from_utf8(output.stdout)?.trim().to_owned())
+}
+
+fn path_arg(path: &Path) -> String {
+    path.to_string_lossy().into_owned()
+}
+
+fn claude_cli_checked(claude: &Path, args: &[&str]) -> Result<String> {
+    let output = StdCommand::new(claude)
+        .args(args)
+        .output()
+        .with_context(|| format!("run Claude Code plugin command: {}", args.join(" ")))?;
+    if !output.status.success() {
+        bail!(
+            "Claude Code plugin command failed: {}\n{}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(String::from_utf8(output.stdout)?.trim().to_owned())
+}
+
+fn claude_cli_json(claude: &Path, args: &[&str]) -> Result<Value> {
+    let stdout = claude_cli_checked(claude, args)?;
+    serde_json::from_str(&stdout)
+        .with_context(|| format!("parse Claude Code JSON output for {}", args.join(" ")))
+}
+
+fn claude_installed_plugin(claude: &Path, plugin_id: &str) -> Result<Option<Value>> {
+    let plugins = claude_cli_json(claude, &["plugin", "list", "--json"])?;
+    Ok(plugins.as_array().and_then(|entries| {
+        entries
+            .iter()
+            .find(|entry| entry.get("id").and_then(Value::as_str) == Some(plugin_id))
+            .cloned()
+    }))
 }
 
 pub(super) fn sha256_file(path: &Path) -> Result<String> {
@@ -771,7 +1050,86 @@ pub(super) fn uninstall_claude_global(
     manifest: &ClaudeGlobalInstallManifest,
     dry_run: bool,
 ) -> Result<Value> {
-    let owned = &manifest.owned_plugin;
+    if !manifest.marketplace_name.is_empty() && !manifest.plugin_id.is_empty() {
+        return uninstall_claude_marketplace(manifest, dry_run);
+    }
+
+    uninstall_legacy_claude_global(manifest, dry_run)
+}
+
+fn uninstall_claude_marketplace(
+    manifest: &ClaudeGlobalInstallManifest,
+    dry_run: bool,
+) -> Result<Value> {
+    if dry_run {
+        return Ok(json!({
+            "schema_version": "eliot-claude-global-uninstall-v2",
+            "dry_run": true,
+            "plugin_id": manifest.plugin_id,
+            "marketplace_name": manifest.marketplace_name,
+            "marketplace_root": manifest.marketplace_root,
+            "mechanism": "official Claude Code plugin CLI",
+            "provider_auth_modified": false,
+            "settings_modified_outside_official_plugin_state": false,
+            "unrelated_config_preserved": true
+        }));
+    }
+    claude_cli_checked(
+        &manifest.claude_executable,
+        &[
+            "plugin",
+            "uninstall",
+            &manifest.plugin_id,
+            "--scope",
+            "user",
+        ],
+    )?;
+    claude_cli_checked(
+        &manifest.claude_executable,
+        &[
+            "plugin",
+            "marketplace",
+            "remove",
+            &manifest.marketplace_name,
+        ],
+    )?;
+    let package_root = claude_package_cache_root();
+    ensure_child(&package_root, &manifest.marketplace_root)?;
+    if manifest.marketplace_root.is_dir() {
+        let marketplace: Value = serde_json::from_slice(&std::fs::read(
+            manifest
+                .marketplace_root
+                .join(".claude-plugin")
+                .join("marketplace.json"),
+        )?)?;
+        if marketplace.get("name").and_then(Value::as_str)
+            != Some(manifest.marketplace_name.as_str())
+        {
+            bail!("refuse to remove a marketplace directory with a different identity");
+        }
+        remove_owned_path(&manifest.marketplace_root)?;
+    }
+    Ok(json!({
+        "schema_version": "eliot-claude-global-uninstall-v2",
+        "dry_run": false,
+        "plugin_id": manifest.plugin_id,
+        "marketplace_name": manifest.marketplace_name,
+        "marketplace_root": manifest.marketplace_root,
+        "removed_through_official_cli": true,
+        "legacy_direct_backup_preserved": manifest.legacy_direct_backup,
+        "provider_auth_modified": false,
+        "settings_modified_outside_official_plugin_state": false,
+        "unrelated_config_preserved": true
+    }))
+}
+
+fn uninstall_legacy_claude_global(
+    manifest: &ClaudeGlobalInstallManifest,
+    dry_run: bool,
+) -> Result<Value> {
+    let owned = manifest.legacy_owned_plugin.as_ref().context(
+        "Claude install manifest has neither official marketplace state nor a legacy owned plugin",
+    )?;
     let governor = owned.path.join("bin").join("eliot-governor.exe");
     if !owned.path.is_dir() || !governor.is_file() {
         bail!(

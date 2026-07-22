@@ -346,7 +346,7 @@ fn operator_revalidation_request_uses_receipted_executor() -> TestResult {
                 "project_id": project_id,
                 "task_id": task_id,
                 "write_id": uuid::Uuid::new_v4().to_string(),
-                "title": "L10 receipted revalidation request",
+                "title": "Receipted memory revalidation request",
                 "acceptance_items": [
                     {
                         "item_id": "revalidation",
@@ -7261,7 +7261,7 @@ fn mcp_tools_include_codecortex_only_governed() -> TestResult {
 
 #[test]
 #[ignore = "requires a provisioned local Governor runtime: a running daemon, an authenticated SurrealDB and a git identity"]
-fn mcp_tools_include_j0_only_governed() -> TestResult {
+fn mcp_tools_include_only_governed_replay_surfaces() -> TestResult {
     let _guard = TestLock::acquire()?;
     let mut client = McpClient::start()?;
     let response = client.request(1, "tools/list", &json!({}))?;
@@ -7309,7 +7309,7 @@ fn mcp_tools_include_j0_only_governed() -> TestResult {
 
 #[test]
 #[ignore = "requires a provisioned local Governor runtime: a running daemon, an authenticated SurrealDB and a git identity"]
-fn mcp_exposes_no_j0_promote_apply_raw_tools() -> TestResult {
+fn mcp_exposes_no_raw_replay_promotion_tools() -> TestResult {
     let _guard = TestLock::acquire()?;
     let mut client = McpClient::start()?;
     let response = client.request(1, "tools/list", &json!({}))?;
@@ -8090,7 +8090,7 @@ fn mcp_compile_packet_and_gates_generate_reports() -> TestResult {
         "eliot_compile_packet_l3",
         &json!({
             "project_id": project_id,
-            "task_id": "phase-c-mcp-report",
+            "task_id": "context-proof-mcp-report",
             "goal": "prove MCP report path",
             "candidate_handles": [],
             "max_tokens": 4000
@@ -8120,7 +8120,7 @@ fn mcp_compile_packet_and_gates_generate_reports() -> TestResult {
         3,
         "eliot_submit_understanding_proof",
         &json!({
-            "task_id": "phase-c-mcp-report",
+            "task_id": "context-proof-mcp-report",
             "project_id": project_id,
             "goal": "prove MCP report path",
             "current_truth_refs": [claim_ref],
@@ -8153,7 +8153,7 @@ fn mcp_compile_packet_and_gates_generate_reports() -> TestResult {
         5,
         "eliot_submit_completion_proof",
         &json!({
-            "task_id": "phase-c-mcp-report",
+            "task_id": "context-proof-mcp-report",
             "project_id": project_id,
             "goal": "prove MCP report path",
             "changed_files": ["crates/eliot-app/src/mcp_stdio.rs"],
@@ -8202,8 +8202,8 @@ fn run_codecortex_scan(client: &mut McpClient) -> TestResult {
         "eliot_codecortex_scan",
         &json!({
             "project": "eliot-governor",
-            "task": "phase-d2-mcp-smoke",
-            "goal": "Find the Phase C MCP tools and cognitive gate implementation",
+            "task": "cognitive-gate-mcp-smoke",
+            "goal": "Find the MCP tools and cognitive gate implementation",
             "exact_patterns": ["eliot_cognitive_gate", "CognitiveGate", "governed_tool_names"],
             "max_files": 80,
             "max_matches_per_pattern": 16,
@@ -8212,7 +8212,7 @@ fn run_codecortex_scan(client: &mut McpClient) -> TestResult {
     )?;
     assert_eq!(
         scan.get("task").and_then(Value::as_str),
-        Some("phase-d2-mcp-smoke")
+        Some("cognitive-gate-mcp-smoke")
     );
     assert!(
         scan.get("memory_receipt")
@@ -8231,8 +8231,8 @@ fn assert_l3_packet_has_codecortex(
         "eliot_compile_packet_l3",
         &json!({
             "project_id": project_id,
-            "task_id": "phase-d2-mcp-l3",
-            "goal": "Find the Phase C MCP tools and cognitive gate implementation",
+            "task_id": "cognitive-gate-mcp-l3",
+            "goal": "Find the MCP tools and cognitive gate implementation",
             "candidate_handles": [],
             "max_tokens": 4000
         }),
@@ -8322,9 +8322,9 @@ fn submit_code_proof(
         id,
         "eliot_submit_understanding_proof",
         &json!({
-            "task_id": "phase-d2-mcp-l3",
+            "task_id": "cognitive-gate-mcp-l3",
             "project_id": project_id,
-            "goal": "Find the Phase C MCP tools and cognitive gate implementation",
+            "goal": "Find the MCP tools and cognitive gate implementation",
             "code_task": true,
             "current_truth_refs": [],
             "evidence_refs": [],
@@ -8744,7 +8744,7 @@ impl McpClient {
                 "protocolVersion": "2025-06-18",
                 "capabilities": {},
                 "clientInfo": {
-                    "name": scoped.map_or("phase-c-test", |scope| scope.host.as_str()),
+                    "name": scoped.map_or("context-proof-test", |scope| scope.host.as_str()),
                     "version": "0.1.0"
                 }
             }),

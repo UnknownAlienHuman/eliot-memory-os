@@ -291,7 +291,7 @@ impl StatefulDbTestIsolationService {
             generated_at: OffsetDateTime::now_utc(),
             serial_required: !shared_db_tests.is_empty(),
             isolated_fixture_roots: vec![
-                "target/phase-*".to_owned(),
+                "target/test-*".to_owned(),
                 ".eliot-governor/test-roots".to_owned(),
             ],
             shared_db_tests,
@@ -380,7 +380,7 @@ fn curated_test_metadata() -> Vec<TestMetadata> {
             &["provider-gate", "change-gate", "full"],
         ),
         test(
-            "phase_minimal_gate_passes",
+            "fast_deterministic_gate_passes",
             "eliot-engine",
             "eval_baselines",
             TestKind::EvalCase,
@@ -490,16 +490,6 @@ fn curated_test_metadata() -> Vec<TestMetadata> {
             &["change-gate", "full"],
         ),
         test(
-            "phase_m0_closeout",
-            "eliot-app",
-            "commands",
-            TestKind::Closeout,
-            TestIntent::CompletionProof,
-            TestCostClass::Small,
-            TestStatefulness::TempFs,
-            &["change-gate", "full"],
-        ),
-        test(
             "windows_resolver_finds_agy_in_path",
             "eliot-engine",
             "antigravity_contract",
@@ -548,26 +538,6 @@ fn curated_test_metadata() -> Vec<TestMetadata> {
             TestCostClass::Medium,
             TestStatefulness::LocalDbIsolated,
             &["change-gate", "provider-gate", "full"],
-        ),
-        test(
-            "phase_g3a_closeout",
-            "eliot-app",
-            "commands",
-            TestKind::Closeout,
-            TestIntent::CompletionProof,
-            TestCostClass::Small,
-            TestStatefulness::TempFs,
-            &["change-gate", "provider-gate", "full"],
-        ),
-        test(
-            "phase_k2_closeout",
-            "eliot-app",
-            "commands",
-            TestKind::Closeout,
-            TestIntent::CompletionProof,
-            TestCostClass::Small,
-            TestStatefulness::TempFs,
-            &["change-gate", "full"],
         ),
     ]
 }
@@ -649,7 +619,7 @@ fn change_gate_profile() -> TestSuiteProfile {
         requires_serial: true,
         required_commands: vec![
             "just verify".to_owned(),
-            "cargo run -p eliot-app -- eval gate --profile phase-minimal --suite k0-core-smoke"
+            "cargo run -p eliot-app -- eval gate --profile fast-deterministic --suite core-smoke"
                 .to_owned(),
             "cargo tree -i surrealdb".to_owned(),
             "cargo tree --target all -i rsa".to_owned(),
@@ -674,7 +644,7 @@ fn provider_gate_profile() -> TestSuiteProfile {
         requires_serial: true,
         required_commands: vec![
             "just verify".to_owned(),
-            "cargo run -p eliot-app -- eval gate --profile provider-integration --suite k0-core-smoke"
+            "cargo run -p eliot-app -- eval gate --profile provider-integration --suite core-smoke"
                 .to_owned(),
             "cargo run -p eliot-app -- external-review report".to_owned(),
             "cargo audit".to_owned(),
@@ -699,7 +669,7 @@ fn service_gate_profile() -> TestSuiteProfile {
         requires_serial: true,
         required_commands: vec![
             "just verify".to_owned(),
-            "cargo run -p eliot-app -- eval gate --profile production-release --suite k0-core-smoke"
+            "cargo run -p eliot-app -- eval gate --profile production-release --suite core-smoke"
                 .to_owned(),
             "cargo run -p eliot-app -- readiness probe".to_owned(),
             "cargo run -p eliot-app -- service validate".to_owned(),
@@ -713,20 +683,11 @@ fn service_gate_profile() -> TestSuiteProfile {
 fn full_profile() -> TestSuiteProfile {
     let mut required_commands = vec![
         "just verify".to_owned(),
-        "cargo run -p eliot-app -- eval gate --profile phase-minimal --suite k0-core-smoke"
+        "cargo run -p eliot-app -- eval gate --profile fast-deterministic --suite core-smoke"
             .to_owned(),
-        "cargo run -p eliot-app -- eval gate --profile provider-integration --suite k0-core-smoke"
+        "cargo run -p eliot-app -- eval gate --profile provider-integration --suite core-smoke"
             .to_owned(),
     ];
-    required_commands.extend(
-        [
-            "phase-b", "phase-c", "phase-d", "phase-e", "phase-f0", "phase-f1", "phase-f2",
-            "phase-f3", "phase-g0", "phase-g1", "phase-g2", "phase-h0", "phase-h1", "phase-i0",
-            "phase-i1", "phase-i2", "phase-j0", "phase-k0", "phase-k1", "phase-k2",
-        ]
-        .into_iter()
-        .map(|phase| format!("cargo run -p eliot-app -- {phase} closeout")),
-    );
     required_commands.extend(
         [
             "cargo tree -i surrealdb",
@@ -828,7 +789,7 @@ fn count_by_cost(tests: &[TestMetadata]) -> Vec<TestCountByCost> {
 fn estimated_command_duration_ms(command: &str) -> u64 {
     if command == "just verify" {
         850_000
-    } else if command.contains("phase-") && command.contains("closeout") {
+    } else if command.contains("historical-") && command.contains("closeout") {
         12_000
     } else if command.contains("cargo audit") || command.contains("cargo deny") {
         3_000

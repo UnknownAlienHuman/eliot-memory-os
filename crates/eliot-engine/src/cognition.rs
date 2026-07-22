@@ -370,7 +370,7 @@ impl CognitiveMemoryWriter {
         ];
         if !ALLOWED_KINDS.contains(&kind) {
             return Err(EngineError::WriteRejected(format!(
-                "unsupported L9 semantic record kind {kind}"
+                "unsupported semantic experience record kind {kind}"
             )));
         }
         let value = serde_json::to_value(record)?;
@@ -466,10 +466,10 @@ fn deterministic_semantic_context_ids(
     let agent_id = deterministic_uuid_text(b"eliot-l9-agent", &material);
     Ok((
         WriteId::from_str(&write_id).map_err(|error| {
-            EngineError::WriteRejected(format!("invalid deterministic L9 write id: {error}"))
+            EngineError::WriteRejected(format!("invalid deterministic semantic write id: {error}"))
         })?,
         AgentId::from_str(&agent_id).map_err(|error| {
-            EngineError::WriteRejected(format!("invalid deterministic L9 agent id: {error}"))
+            EngineError::WriteRejected(format!("invalid deterministic semantic agent id: {error}"))
         })?,
     ))
 }

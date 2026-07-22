@@ -17,18 +17,19 @@ scripts/build-claude-desktop-extension.ps1
 ```
 
 The script stages the release binary, validates and packs the extension with the
-official `mcpb` CLI when it is available, and writes package hashes plus a context
-footprint report under `dist/claude`. The package name is
+pinned official `mcpb` CLI, and writes package hashes plus a context footprint
+report under `%LOCALAPPDATA%\Eliot\packages\claude`. The package name is
 `eliot-<version>-windows-x64.mcpb`.
 
-Install and uninstall through Governor, which opens the official Claude Desktop
+Install and activate through Governor, which opens the official Claude Desktop
 review dialog and verifies the extension registry and installed server hash before
 writing its receipt:
 
 ```powershell
-.\target\release\eliot-governor.exe host install --host claude-desktop
-.\target\release\eliot-governor.exe host doctor --host claude-desktop
-.\target\release\eliot-governor.exe host uninstall --host claude-desktop
+& $governor host install --host claude-desktop
+& $governor host activate --host claude --surface desktop
+& $governor host doctor --host claude
+& $governor host uninstall --host claude-desktop
 ```
 
 Do not edit `claude_desktop_config.json`. Provider authentication is outside the

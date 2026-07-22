@@ -4,6 +4,9 @@
 //! commands exercise. They are deterministic sample data, not product
 //! behaviour, and they were named after the milestones that first needed them.
 
+// Fixtures are built from the parent's private command types; keeping that
+// vocabulary in the parent avoids a second public API just for test data.
+#[allow(clippy::wildcard_imports)]
 use super::*;
 
 pub(super) fn smoke_skill_cards() -> Vec<SkillCardV2> {
@@ -257,7 +260,7 @@ pub(super) fn smoke_curator_skill_cards() -> Vec<SkillCardV2> {
     let duplicate_a = {
         let mut skill = smoke_active_skill_with_id(SkillId::new_v7(), SkillState::Active);
         "curator smoke duplicate skill".clone_into(&mut skill.name);
-        "duplicate phase i2 procedural routing".clone_into(&mut skill.purpose);
+        "duplicate procedural skill routing".clone_into(&mut skill.purpose);
         skill
     };
     let mut duplicate_b = duplicate_a.clone();

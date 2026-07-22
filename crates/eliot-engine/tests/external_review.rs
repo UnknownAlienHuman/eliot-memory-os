@@ -66,7 +66,7 @@ fn mock_provider_enabled() {
 fn external_review_request_created() {
     let request = external_review_request(
         "eliot-governor",
-        "phase-g2-test",
+        "external-review-test",
         "mock-auditor",
         ExternalReviewRole::Auditor,
         "review governed protocol",
@@ -148,7 +148,7 @@ fn external_review_gate_requires_worklease() {
 fn external_review_gate_requires_worktree_for_changes() {
     let mut request = external_review_request(
         "eliot-governor",
-        "phase-g2-test",
+        "external-review-test",
         "mock-proposed-change",
         ExternalReviewRole::Worker,
         "propose change",
@@ -468,7 +468,7 @@ async fn external_review_to_mailbox_review_requested() -> TestResult {
 fn proposed_change_to_candidate_diff_only() {
     let mut request = external_review_request(
         "eliot-governor",
-        "phase-g2-test",
+        "external-review-test",
         "mock-proposed-change",
         ExternalReviewRole::Worker,
         "propose change",
@@ -573,8 +573,11 @@ fn the_external_review_gate_admits_no_direct_provider_call() -> TestResult {
     Ok(())
 }
 
-async fn run_mock_job() -> TestResult<(PathBuf, eliot_types::ExternalReviewJob, serde_json::Value)>
-{
+async fn run_mock_job() -> TestResult<(
+    OwnedTestRoot,
+    eliot_types::ExternalReviewJob,
+    serde_json::Value,
+)> {
     let root = test_root("mock-job")?;
     let blob_store = BlobStore::open(&BlobStoreConfig {
         root: root.join("blobs").display().to_string(),
@@ -592,7 +595,7 @@ async fn run_mock_job() -> TestResult<(PathBuf, eliot_types::ExternalReviewJob, 
 fn request() -> eliot_types::ExternalReviewRequest {
     external_review_request(
         "eliot-governor",
-        "phase-g2-test",
+        "external-review-test",
         "mock-auditor",
         ExternalReviewRole::Auditor,
         "review governed protocol",
@@ -646,11 +649,19 @@ struct Harness {
     store: CanonicalStore,
 }
 
+impl Drop for Harness {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.root);
+    }
+}
+
 impl Harness {
     async fn new(name: &str) -> TestResult<Self> {
-        let root =
-            std::env::temp_dir().join(format!("eliot-phase-g2-{name}-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&root);
+        let root = std::env::temp_dir().join(format!(
+            "eliot-external-review-{name}-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
         fs::create_dir_all(&root)?;
         let mut config = GovernorConfig::default();
         let repo = repo_root();
@@ -722,7 +733,7 @@ impl Drop for TestLock {
 }
 
 async fn migrate_schema_locked(store: &CanonicalStore) -> TestResult {
-    let lock_path = repo_root().join("target/phase-g2-migrate.lock");
+    let lock_path = repo_root().join("target/external-review-migrate.lock");
     if let Some(parent) = lock_path.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -748,11 +759,28 @@ async fn migrate_schema_locked(store: &CanonicalStore) -> TestResult {
     Ok(())
 }
 
-fn test_root(name: &str) -> TestResult<PathBuf> {
-    let root = std::env::temp_dir().join(format!("eliot-phase-g2-{name}-{}", std::process::id()));
-    let _ = fs::remove_dir_all(&root);
+struct OwnedTestRoot(PathBuf);
+
+impl OwnedTestRoot {
+    fn join(&self, path: impl AsRef<Path>) -> PathBuf {
+        self.0.join(path)
+    }
+}
+
+impl Drop for OwnedTestRoot {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
+
+fn test_root(name: &str) -> TestResult<OwnedTestRoot> {
+    let root = std::env::temp_dir().join(format!(
+        "eliot-external-review-{name}-{}-{}",
+        std::process::id(),
+        uuid::Uuid::new_v4()
+    ));
     fs::create_dir_all(&root)?;
-    Ok(root)
+    Ok(OwnedTestRoot(root))
 }
 
 fn repo_root() -> PathBuf {

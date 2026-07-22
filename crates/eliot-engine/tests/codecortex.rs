@@ -111,7 +111,7 @@ fn codecortex_health_reports_unavailable_adapters_honestly() -> TestResult {
 }
 
 #[test]
-fn phase_b_c_non_regression() -> TestResult {
+fn accumulated_capabilities_non_regression() -> TestResult {
     let mcp_stdio = fs::read_to_string(repo_root().join("crates/eliot-app/src/mcp_stdio.rs"))?;
     let context = fs::read_to_string(repo_root().join("crates/eliot-engine/src/context.rs"))?;
 
@@ -134,7 +134,7 @@ struct Harness {
 impl Harness {
     async fn new(name: &str) -> TestResult<Self> {
         let root =
-            std::env::temp_dir().join(format!("eliot-phase-d1-{name}-{}", std::process::id()));
+            std::env::temp_dir().join(format!("eliot-codecortex-{name}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(&root)?;
         let mut config = GovernorConfig::default();
@@ -207,7 +207,7 @@ impl Drop for TestLock {
 }
 
 async fn migrate_schema_locked(store: &CanonicalStore) -> TestResult {
-    let lock_path = repo_root().join("target/phase-d1-migrate.lock");
+    let lock_path = repo_root().join("target/codecortex-migrate.lock");
     if let Some(parent) = lock_path.parent() {
         fs::create_dir_all(parent)?;
     }

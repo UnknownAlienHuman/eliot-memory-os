@@ -1,7 +1,7 @@
 use crate::runtime_instance::atomic_write_bytes;
 use anyhow::{Context, Result, bail};
 use eliot_engine::{
-    AgentSessionService, AntigravityBinaryResolver, AntigravityCapabilityProbeService,
+    AntigravityBinaryResolver, AntigravityCapabilityProbeService,
     AntigravityCommandContractService, AntigravityDisposableWorktreeSmokeService,
     AntigravityEnablementService, AntigravityExecutionGate, AntigravityRunner,
     AntigravityVersionGateService, CandidateDiffService, DelegationBudgetReservation,
@@ -10,19 +10,17 @@ use eliot_engine::{
     DelegationReportService, ExternalResultCompletenessService, ExternalReviewJobService,
     IncidentService, ProviderCallReservationDecision, ProviderCallReservationOwner,
     ProviderCallReservationRequest, ProviderCompletenessInput, ProviderInvocationJournal,
-    WorkClaimRequest, WorkCreateRequest, WorkLeaseService, WorkQueueService, WorkState,
-    antigravity_review_request, default_work_scope, external_review_request, l1c_timeout_profile,
-    work_lease_is_active,
+    WorkState, antigravity_plan_timeout_profile, antigravity_review_request,
+    external_review_request, work_lease_is_active,
 };
 use eliot_types::{
-    AgentRole, AntigravityBinaryResolutionStatus, AntigravityEnablementScope,
-    AntigravityEnablementState, AntigravityExecutionGateDecisionKind, AntigravityProviderState,
-    AntigravityReviewMode, AntigravityRunState, DelegationDecisionKind, DelegationJobState,
-    DelegationOrigin, DelegationOriginChain, DelegationOutcomeStatus, DelegationProviderPreference,
-    DelegationReason, DelegationRequest, DelegationReviewKind, DelegationRootOrigin,
-    DelegationState, ExternalReviewJobStatus, ExternalReviewRole, ProjectId,
-    ProviderCallReservationState, ProviderInvocationAttempt, ProviderInvocationState,
-    ProviderReviewPreRegistration, TaintClass, TaskId, WorkLease, WorkLeaseDecisionKind,
+    AntigravityBinaryResolutionStatus, AntigravityEnablementScope, AntigravityEnablementState,
+    AntigravityExecutionGateDecisionKind, AntigravityProviderState, AntigravityReviewMode,
+    AntigravityRunState, DelegationDecisionKind, DelegationJobState, DelegationOrigin,
+    DelegationOriginChain, DelegationOutcomeStatus, DelegationProviderPreference, DelegationReason,
+    DelegationRequest, DelegationReviewKind, DelegationRootOrigin, DelegationState,
+    ExternalReviewJobStatus, ExternalReviewRole, ProviderCallReservationState,
+    ProviderInvocationAttempt, ProviderInvocationState, ProviderReviewPreRegistration, TaintClass,
     WorkLeaseId, WorktreeLeaseState,
 };
 use serde::{Deserialize, Serialize};
@@ -117,12 +115,6 @@ pub(crate) fn save_host_broker_state(root: &Path, state: &DelegationState) -> Re
 }
 
 pub fn health(root: &Path) -> Result<DelegationHealth> {
-    let phase_g3b = read_json_value(&root.join("reports/phase-g3b/latest.json"))?;
-    let g3b_done_verified = phase_g3b
-        .as_ref()
-        .and_then(|value| value.get("final_status"))
-        .and_then(Value::as_str)
-        == Some("DONE_VERIFIED");
     let resolution =
         AntigravityBinaryResolver.resolve(&AntigravityBinaryResolver::default_config());
     let probe = AntigravityCapabilityProbeService.probe_from_resolution(&resolution);
@@ -136,12 +128,8 @@ pub fn health(root: &Path) -> Result<DelegationHealth> {
         .is_file();
     let mcp_proof = root
         .join("reports/antigravity-mcp-registration/latest.json")
-        .is_file()
-        && root
-            .join("reports/antigravity-mcp-invocation-proof/latest.json")
-            .is_file();
+        .is_file();
     Ok(DelegationHealth {
-        g3b_done_verified,
         provider_available: resolution.status == AntigravityBinaryResolutionStatus::Resolved
             && contract.noninteractive_supported,
         provider_healthy: !matches!(probe.provider_state, AntigravityProviderState::NotInstalled),
@@ -149,96 +137,11 @@ pub fn health(root: &Path) -> Result<DelegationHealth> {
         plugin_and_mcp_verified: plugin_proof && mcp_proof,
         incident_lockdown: IncidentService::new(root).lockdown_active()?,
         evidence_refs: vec![
-            "reports/phase-g3b/latest.json".to_owned(),
             "reports/antigravity-plugin-install/latest.json".to_owned(),
             "reports/antigravity-mcp-registration/latest.json".to_owned(),
-            "reports/antigravity-mcp-invocation-proof/latest.json".to_owned(),
         ],
         checked_at: OffsetDateTime::now_utc(),
     })
-}
-
-pub fn ensure_l1c_read_only_work_lease(
-    root: &Path,
-    project_id: ProjectId,
-    task_id: TaskId,
-    read_set: Vec<String>,
-) -> Result<WorkLease> {
-    let mut state = load_work_state(root)?;
-    if let Some(existing) = state
-        .leases
-        .iter()
-        .find(|lease| {
-            lease.project_id == project_id
-                && lease.task_id == task_id
-                && work_lease_is_active(lease)
-        })
-        .cloned()
-    {
-        return Ok(existing);
-    }
-    let project_root = root
-        .parent()
-        .filter(|path| !path.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new("."))
-        .canonicalize()?;
-    let session = AgentSessionService.create_controller(&mut state, project_id);
-    let work_item_id = if let Some(existing) = state
-        .work_items
-        .iter()
-        .find(|item| item.project_id == project_id && item.task_id == task_id)
-    {
-        existing.work_item_id
-    } else {
-        WorkQueueService
-            .create_work_item(
-                &mut state,
-                WorkCreateRequest {
-                    project_id,
-                    task_id,
-                    project: "eliot-governor".to_owned(),
-                    task: "integrity-canary".to_owned(),
-                    goal: "Read-only audit of the sealed L1B-R provider-budget integrity baseline"
-                        .to_owned(),
-                    scope: default_work_scope(
-                        project_root.display().to_string(),
-                        read_set,
-                        Vec::new(),
-                        Vec::new(),
-                    ),
-                    required: true,
-                    created_by: session.agent_session_id,
-                    required_verifiers: Vec::new(),
-                },
-            )
-            .work_item_id
-    };
-    let decision = WorkLeaseService.claim(
-        &mut state,
-        WorkClaimRequest {
-            work_item_id,
-            agent_session_id: session.agent_session_id,
-            role: AgentRole::Auditor,
-            ttl_minutes: 180,
-        },
-    );
-    if decision.kind != WorkLeaseDecisionKind::Granted {
-        bail!(
-            "L1C read-only WorkLease was not granted: {:?}",
-            decision.reason
-        );
-    }
-    let lease_id = decision
-        .work_lease_id
-        .context("granted L1C WorkLease has no ID")?;
-    let lease = state
-        .leases
-        .iter()
-        .find(|lease| lease.work_lease_id == lease_id)
-        .cloned()
-        .context("granted L1C WorkLease disappeared")?;
-    save_work_state(root, &state)?;
-    Ok(lease)
 }
 
 pub fn policy_report() -> Value {
@@ -249,7 +152,7 @@ pub fn policy_report() -> Value {
         "provider": "antigravity",
         "hard_denial_order": [
             "recursive_provider_call", "incident_lockdown", "forbidden_data_exposure",
-            "g3_b_not_done_verified", "provider_unavailable", "provider_unhealthy",
+            "provider_unavailable", "provider_unhealthy",
             "provider_version_below1_1_1", "plugin_or_mcp_integration_not_verified",
             "missing_work_lease", "budget_exceeded", "cooldown_active",
             "fresh_equivalent_review", "unsupported_review_kind"
@@ -368,7 +271,6 @@ pub async fn review(root: &Path, input: DelegationReviewInput) -> Result<Value> 
     let context = DelegationPolicyContext {
         incident_lockdown: health.incident_lockdown,
         forbidden_data_exposure,
-        g3b_done_verified: health.g3b_done_verified,
         provider_available: health.provider_available,
         provider_healthy: health.provider_healthy,
         provider_version_supported: health.provider_version_supported,
@@ -389,7 +291,7 @@ pub async fn review(root: &Path, input: DelegationReviewInput) -> Result<Value> 
             input.execution_token.as_deref(),
         ) {
             (Some(campaign_id), Some(preregistration_id), Some(token)) => {
-                crate::l1c_runtime::validate_execution_authorization(
+                crate::provider_budget_runtime::validate_execution_authorization(
                     root,
                     campaign_id,
                     preregistration_id,
@@ -482,7 +384,7 @@ pub async fn review(root: &Path, input: DelegationReviewInput) -> Result<Value> 
                                 .preregistration_id
                                 .as_deref()
                                 .context("authorized provider execution lost preregistration ID")?;
-                            crate::l1c_runtime::record_reservation(
+                            crate::provider_budget_runtime::record_reservation(
                                 root,
                                 campaign_id,
                                 preregistration_id,
@@ -490,7 +392,7 @@ pub async fn review(root: &Path, input: DelegationReviewInput) -> Result<Value> 
                             )?;
                             let reservation =
                                 reservation_owner.mark_dispatching(&reservation.reservation_id)?;
-                            crate::l1c_runtime::record_dispatching(
+                            crate::provider_budget_runtime::record_dispatching(
                                 root,
                                 campaign_id,
                                 &reservation.reservation_id,
@@ -526,7 +428,7 @@ pub async fn review(root: &Path, input: DelegationReviewInput) -> Result<Value> 
                                             item.reservation_id == reservation.reservation_id
                                         })
                                         .context("completed provider reservation disappeared")?;
-                                    crate::l1c_runtime::record_execution_terminal(
+                                    crate::provider_budget_runtime::record_execution_terminal(
                                         root,
                                         campaign_id,
                                         preregistration_id,
@@ -576,7 +478,7 @@ pub async fn review(root: &Path, input: DelegationReviewInput) -> Result<Value> 
                                             item.reservation_id == reservation.reservation_id
                                         })
                                         .context("terminal provider reservation disappeared")?;
-                                    crate::l1c_runtime::record_execution_terminal(
+                                    crate::provider_budget_runtime::record_execution_terminal(
                                         root,
                                         campaign_id,
                                         preregistration_id,
@@ -837,7 +739,7 @@ async fn execute_real(
         previous_state,
         AntigravityEnablementScope::DisposableWorktreeAuditOnly,
         true,
-        vec!["governed L0 routed delegation".to_owned()],
+        vec!["governed routed delegation".to_owned()],
     )?;
     let mut provider_request = antigravity_review_request(
         project,
@@ -870,11 +772,11 @@ async fn execute_real(
     if gate.decision != AntigravityExecutionGateDecisionKind::AllowRealRun {
         cleanup_failed_worktree(work_state, worktree.worktree_lease_id).await;
         bail!(
-            "G3B execution gate denied routed delegation: {:?}",
+            "Antigravity execution gate denied routed delegation: {:?}",
             gate.reasons
         );
     }
-    let timeout_profile = l1c_timeout_profile();
+    let timeout_profile = antigravity_plan_timeout_profile();
     crate::calibration_runtime::write_pair(root, "provider-timeout-profile", &timeout_profile)?;
     let journal = ProviderInvocationJournal::new(root);
     let mut attempt = journal.create(ProviderInvocationAttempt {
@@ -1061,7 +963,7 @@ async fn execute_real(
     );
     let disable = AntigravityEnablementService.disable(
         enablement.requested_state,
-        "provider disabled after governed L0 delegation",
+        "provider disabled after governed delegation",
     );
     let result_ref = normalized
         .external_review_result
@@ -1200,7 +1102,7 @@ fn recover_completed_transcript(
         .context("completed official CLI transcript has no final planner response")?;
     let mut provider_request = antigravity_review_request(
         "eliot-governor",
-        "phase-l0-real-delegation",
+        "antigravity-real-delegation",
         AntigravityReviewMode::AuditPlan,
         &request.question,
     );

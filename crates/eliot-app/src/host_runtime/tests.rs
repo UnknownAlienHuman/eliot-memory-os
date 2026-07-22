@@ -221,7 +221,7 @@ fn scope_fixture() -> anyhow::Result<ScopeFixture> {
         work_lease: WorkLeaseId::new_v7(),
         worktree_lease: WorktreeLeaseId::new_v7(),
     };
-    let write_set = vec!["scripts/phase-l12".to_owned()];
+    let write_set = vec!["scripts/cognitive-contract".to_owned()];
     let delegation = fixture_delegation(ids, now);
     let work = fixture_work(ids, &root, &cwd, &write_set, &base_commit, now);
     Ok(ScopeFixture {
@@ -634,7 +634,7 @@ fn observation_events_do_not_gate_even_when_a_task_is_attached() {
 }
 
 /// Every declared hook must be an event this Claude Code version knows,
-/// and each one must earn its place: the unfiltered PostToolUse spawned a
+/// and each one must earn its place: the unfiltered `PostToolUse` spawned a
 /// Governor process after every successful tool call in every project.
 #[test]
 fn the_declared_hooks_are_the_ones_that_carry_eliot_evidence() -> anyhow::Result<()> {

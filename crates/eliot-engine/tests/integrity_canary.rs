@@ -1,5 +1,5 @@
 use eliot_engine::{
-    DelegationCalibrationCampaignService, L1cCorpusEligibilityService,
+    DelegationCalibrationCampaignService, PreregisteredCorpusEligibilityService,
     ProviderReviewPreRegistrationService, ProviderUtilityAssessmentService,
 };
 use eliot_types::{
@@ -126,7 +126,8 @@ fn complete_negative_canary_is_promotion_eligible() -> Result<(), String> {
         utility_assessments: vec![assessment],
         ..DelegationCalibrationState::default()
     };
-    let records = L1cCorpusEligibilityService.decide(&mut state, "campaign-l1c", &reservation())?;
+    let records =
+        PreregisteredCorpusEligibilityService.decide(&mut state, "campaign-l1c", &reservation())?;
     assert_eq!(
         records
             .iter()
@@ -214,16 +215,11 @@ fn novel_confirmed_material_finding_requires_independent_evidence() {
 }
 
 #[test]
-fn provider_free_phase_target_contains_no_execution_surface() -> std::io::Result<()> {
+fn provider_free_commands_contain_no_unbounded_execution_surface() -> std::io::Result<()> {
     let justfile = std::fs::read_to_string("../../Justfile")?;
-    if let Some(target) = justfile.split("phase-l1c:\n").nth(1) {
-        let body = target.split("\n\n").next().unwrap_or_default();
-        assert!(!body.contains("provider-once"));
-        assert!(!body.contains("execute-provider"));
-        assert!(!body.contains("run_real"));
-    }
-    let mcp = std::fs::read_to_string("../eliot-app/src/mcp_stdio.rs")?;
-    assert!(!mcp.contains("phase_l1c_provider_once"));
+    assert!(!justfile.contains("provider-once"));
+    assert!(!justfile.contains("execute-provider"));
+    assert!(!justfile.contains("run_real"));
     Ok(())
 }
 
@@ -236,7 +232,7 @@ fn historical_exclusions_are_not_rewritten_by_l1c_eligibility() -> Result<(), St
         integrity_status: CalibrationIntegrityStatus::OverBudget,
         promotion_eligible: false,
         exclusion_reasons: vec!["campaign_call_budget_exceeded".to_owned()],
-        decided_by_rule_version: "l1b-r-integrity-1".to_owned(),
+        decided_by_rule_version: "provider-budget-integrity-1".to_owned(),
         evidence_refs: vec!["historical".to_owned()],
         decided_at: OffsetDateTime::now_utc(),
     };
@@ -260,7 +256,7 @@ fn historical_exclusions_are_not_rewritten_by_l1c_eligibility() -> Result<(), St
         corpus_eligibility: vec![historical.clone()],
         ..DelegationCalibrationState::default()
     };
-    L1cCorpusEligibilityService.decide(&mut state, "campaign-l1c", &reservation())?;
+    PreregisteredCorpusEligibilityService.decide(&mut state, "campaign-l1c", &reservation())?;
     assert!(state.corpus_eligibility.contains(&historical));
     Ok(())
 }

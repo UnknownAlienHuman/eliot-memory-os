@@ -424,8 +424,10 @@ struct Harness {
 
 impl Harness {
     async fn new(name: &str) -> TestResult<Self> {
-        let root =
-            std::env::temp_dir().join(format!("eliot-phase-b-{name}-{}", std::process::id()));
+        let root = std::env::temp_dir().join(format!(
+            "eliot-write-admission-{name}-{}",
+            std::process::id()
+        ));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root)?;
         let mut config = GovernorConfig::default();
@@ -574,7 +576,7 @@ async fn submit(
 }
 
 async fn migrate_schema_locked(store: &CanonicalStore) -> TestResult {
-    let lock_path = repo_root().join("target/phase-b-migrate.lock");
+    let lock_path = repo_root().join("target/write-admission-migrate.lock");
     if let Some(parent) = lock_path.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -696,7 +698,7 @@ fn verification_record(
         verification: VerificationRunInput {
             verification_id: eliot_types::VerificationId::new_v7(),
             claim_id: Some(claim_id),
-            verifier: "phase-b-test".to_owned(),
+            verifier: "write-admission-test".to_owned(),
             result,
             summary: format!("{result:?}"),
             payload: json!({ "result": format!("{result:?}") }),
@@ -716,7 +718,7 @@ fn claim_verify(
         verification: VerificationRunInput {
             verification_id: eliot_types::VerificationId::new_v7(),
             claim_id: Some(claim_id),
-            verifier: "phase-b-test".to_owned(),
+            verifier: "write-admission-test".to_owned(),
             result,
             summary: format!("{result:?}"),
             payload: json!({ "result": format!("{result:?}") }),

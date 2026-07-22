@@ -264,18 +264,6 @@ fn delegation_low_quality_response_not_retried() {
 }
 
 #[test]
-fn delegation_requires_g3b_done_verified() {
-    let decision = DelegationPolicyService.decide(
-        &request(DelegationOrigin::UserDirected, "review"),
-        &DelegationPolicyContext {
-            g3b_done_verified: false,
-            ..DelegationPolicyContext::default()
-        },
-    );
-    assert_eq!(decision.reasons, vec![DelegationReason::G3BNotDoneVerified]);
-}
-
-#[test]
 fn delegation_requires_cli_1_1_1() {
     let decision = DelegationPolicyService.decide(
         &request(DelegationOrigin::UserDirected, "review"),
@@ -502,7 +490,6 @@ fn delegation_hard_denial_order_is_deterministic() {
         &DelegationPolicyContext {
             incident_lockdown: true,
             forbidden_data_exposure: true,
-            g3b_done_verified: false,
             provider_available: false,
             provider_healthy: false,
             provider_version_supported: false,

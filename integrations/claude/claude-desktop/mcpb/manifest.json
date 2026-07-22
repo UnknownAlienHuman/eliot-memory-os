@@ -25,84 +25,10 @@
       "env": {}
     }
   },
-  "tools": [
-    {
-      "name": "eliot_host_session_status",
-      "description": "Inspect this session's task-scoped role and leases."
-    },
-    {
-      "name": "eliot_project_identity",
-      "description": "Resolve one stable cross-host project identity."
-    },
-    {
-      "name": "eliot_current_state",
-      "description": "Read bounded current project truth and conflicts."
-    },
-    {
-      "name": "eliot_task_state",
-      "description": "Read the current task contract, leases, progress, and finish gaps."
-    },
-    {
-      "name": "eliot_recall_l0",
-      "description": "Recall compact memory handles for one project."
-    },
-    {
-      "name": "eliot_fetch_l2",
-      "description": "Expand only exact selected evidence handles."
-    },
-    {
-      "name": "eliot_compile_packet_l3",
-      "description": "Compile one decision-local governed context packet."
-    },
-    {
-      "name": "eliot_memory_influence_trace",
-      "description": "Record how recalled memory was used, adapted, or rejected after a local check."
-    },
-    {
-      "name": "eliot_agent_candidate_submit",
-      "description": "Submit one novel bounded candidate with a canonical receipt."
-    },
-    {
-      "name": "eliot_agent_delegate",
-      "description": "Delegate one separately verifiable work item under a current controller lease."
-    },
-    {
-      "name": "eliot_agent_result",
-      "description": "Read the exact candidate result and its evidence for a delegated work item."
-    },
-    {
-      "name": "eliot_agent_result_disposition",
-      "description": "Accept, reject, or request a probe for one candidate result under controller authority."
-    }
-  ],
-  "tools_generated": false,
-  "prompts": [
-    {
-      "name": "eliot-start",
-      "description": "Start or resume a material task through ELIOT.",
-      "arguments": ["task"],
-      "text": "Start or resume ${arguments.task} through the live ELIOT task cycle. Confirm current state, task-scoped role, revision, and the smallest required packet before material action."
-    },
-    {
-      "name": "eliot-understand",
-      "description": "Build decision-sufficient current understanding.",
-      "arguments": ["task"],
-      "text": "For ${arguments.task}, separate current truth from supported, assumed, conflicted, stale, and unknown state. Expand exact handles and trace the causal path to an observable verifier."
-    },
-    {
-      "name": "eliot-delegate",
-      "description": "Delegate one bounded role-leased work item.",
-      "arguments": ["task"],
-      "text": "For ${arguments.task}, delegate one bounded role-leased work item with exact acceptance, packet refs, expected result, verifier, and stable idempotency."
-    },
-    {
-      "name": "eliot-verify-finish",
-      "description": "Verify current artifacts and finish honestly.",
-      "arguments": ["task"],
-      "text": "For ${arguments.task}, read exact finish gaps, run mapped verifiers against accepted artifacts, account for every acceptance item, and submit the honest completion status."
-    }
-  ],
-  "prompts_generated": false,
+  "tools": [],
+  "tools_generated": true,
+  "prompts": [],
+  "prompts_generated": true,
   "keywords": [
     "eliot",
     "memory",

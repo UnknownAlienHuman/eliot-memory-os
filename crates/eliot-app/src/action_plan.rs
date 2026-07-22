@@ -7,11 +7,10 @@ use eliot_engine::{
 use eliot_store::{CanonicalStore, ControlWal};
 use eliot_types::{
     ActionKind, ActionLeaseRecord, ActionRequest, AgentId, AgentRole, AgentSessionId, ChangePlan,
-    CodeCortexReport, CognitiveGateDecision, CognitiveGateRequest, ControlWalConfig,
-    FileChangeIntent, FileChangeKind, LeaseDecision, SymbolChangeIntent, TaskId,
-    UnderstandingProof, UnderstandingProofReceipt, VerifierCommandKind, VerifierPlan,
-    VerifierRequirement, WorkItemId, WorkLease, WorkLeaseDecision, WorkLeaseDecisionKind,
-    WorkLeaseDecisionReason, WorkLeaseId, WorkLeaseState,
+    CodeCortexReport, CognitiveGateRequest, ControlWalConfig, FileChangeIntent, FileChangeKind,
+    LeaseDecision, SymbolChangeIntent, TaskId, UnderstandingProof, VerifierCommandKind,
+    VerifierPlan, VerifierRequirement, WorkItemId, WorkLease, WorkLeaseDecision,
+    WorkLeaseDecisionKind, WorkLeaseDecisionReason, WorkLeaseId, WorkLeaseState,
 };
 use serde_json::{Value, json};
 use std::fmt::Write as _;
@@ -31,12 +30,6 @@ pub struct ActionPlanInput {
 }
 
 pub struct ActionLeaseArtifacts {
-    pub report: CodeCortexReport,
-    pub proof: UnderstandingProof,
-    pub receipt: UnderstandingProofReceipt,
-    pub gate_decision: CognitiveGateDecision,
-    pub request: ActionRequest,
-    pub work_lease: WorkLease,
     pub record: ActionLeaseRecord,
 }
 
@@ -117,15 +110,7 @@ pub async fn create_action_lease_artifacts(
     let record = service.write_lease(&handle, &admission, lease).await?;
     drop(handle);
     actor_task.await?;
-    Ok(ActionLeaseArtifacts {
-        report,
-        proof,
-        receipt,
-        gate_decision,
-        request,
-        work_lease,
-        record,
-    })
+    Ok(ActionLeaseArtifacts { record })
 }
 
 pub fn latest_codecortex_report(root: &Path) -> Result<Option<CodeCortexReport>> {

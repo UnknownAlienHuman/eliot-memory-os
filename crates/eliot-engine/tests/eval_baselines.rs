@@ -169,8 +169,8 @@ fn comparison_reports_family_delta() {
 fn gate_profiles_created() {
     let profiles = EvalGateProfileService::built_in_profiles();
     for profile_id in [
-        "phase-minimal",
-        "phase-standard",
+        "fast-deterministic",
+        "architecture-standard",
         "provider-integration",
         "production-release",
     ] {
@@ -183,9 +183,9 @@ fn gate_profiles_created() {
 }
 
 #[test]
-fn phase_minimal_gate_passes() {
+fn fast_deterministic_gate_passes() {
     let artifacts = artifacts();
-    let profile = profile("phase-minimal");
+    let profile = profile("fast-deterministic");
     let comparison = clean_comparison(&artifacts);
     let decision =
         EvalRegressionGateService::evaluate_comparison(&profile, &comparison, &artifacts.integrity);
@@ -193,9 +193,9 @@ fn phase_minimal_gate_passes() {
 }
 
 #[test]
-fn phase_minimal_gate_blocks_critical_regression_fixture() {
+fn fast_deterministic_gate_blocks_critical_regression_fixture() {
     let artifacts = artifacts();
-    let profile = profile("phase-minimal");
+    let profile = profile("fast-deterministic");
     let baseline = baseline(&artifacts);
     let failed =
         EvalComparisonService::run_with_failed_family(&artifacts.run, EvalFamily::Understand);
@@ -207,9 +207,9 @@ fn phase_minimal_gate_blocks_critical_regression_fixture() {
 }
 
 #[test]
-fn phase_standard_gate_blocks_new_required_failure() {
+fn architecture_standard_gate_blocks_new_required_failure() {
     let artifacts = artifacts();
-    let profile = profile("phase-standard");
+    let profile = profile("architecture-standard");
     let baseline = baseline(&artifacts);
     let failed = EvalComparisonService::run_with_failed_family(&artifacts.run, EvalFamily::Memory);
     let comparison =
@@ -248,7 +248,7 @@ fn production_release_gate_requires_bench_done_trace() {
 #[test]
 fn benchmark_integrity_required_by_gate() {
     let artifacts = artifacts();
-    let profile = profile("phase-minimal");
+    let profile = profile("fast-deterministic");
     let comparison = clean_comparison(&artifacts);
     let mismatch =
         EvalDatasetManifestService::checksum_mismatch(&artifacts.suite, &artifacts.manifest);
@@ -306,7 +306,7 @@ fn doctor_reports_eval_status() {
     let artifacts = artifacts();
     let coverage = coverage(&artifacts);
     let baseline = baseline(&artifacts);
-    let profile = profile("phase-minimal");
+    let profile = profile("fast-deterministic");
     let comparison = clean_comparison(&artifacts);
     let decision =
         EvalRegressionGateService::evaluate_comparison(&profile, &comparison, &artifacts.integrity);
@@ -343,7 +343,7 @@ fn incident_lockdown_blocks_suite_mutation() {
 }
 
 #[test]
-fn phase_b_c_d_e_f0_f1_f2_f3_g0_g1_h0_i0_i1_i2_j0_k0_non_regression() {
+fn accumulated_capabilities_non_regression() {
     let artifacts = artifacts();
     assert_eq!(artifacts.run.status, EvalRunStatus::Completed);
     assert_eq!(artifacts.verdict.status, EvalVerdictStatus::Pass);
@@ -363,7 +363,7 @@ fn artifacts() -> Artifacts {
     let cases = EvalCaseService::k0_core_cases(project_id, Some(TaskId::new_v7()));
     let mut suite = EvalSuiteService::create(EvalSuiteInput {
         project_id,
-        name: "k0-core-smoke".to_owned(),
+        name: "core-smoke".to_owned(),
         purpose: "test deterministic no-mutation suite".to_owned(),
         cases: cases.iter().map(|case| case.eval_case_id).collect(),
         fixed: false,
@@ -412,14 +412,14 @@ fn baseline(artifacts: &Artifacts) -> EvalBaseline {
         "test",
     ) {
         Ok(baseline) => baseline,
-        Err(error) => panic!("expected passing K1 baseline: {error}"),
+        Err(error) => panic!("expected passing integration-smoke baseline: {error}"),
     }
 }
 
 fn profile(profile_id: &str) -> EvalRegressionGateProfile {
     match EvalGateProfileService::find(profile_id) {
         Some(profile) => profile,
-        None => panic!("missing K1 eval gate profile {profile_id}"),
+        None => panic!("missing integration-smoke eval gate profile {profile_id}"),
     }
 }
 

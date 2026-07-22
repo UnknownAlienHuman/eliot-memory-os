@@ -12,7 +12,6 @@ use eliot_types::{
     DelegationPolicyPromotionReason, DelegationReviewKind, DelegationShadowDecisionKind, ProjectId,
     TaskId,
 };
-use std::path::PathBuf;
 use time::OffsetDateTime;
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
@@ -337,28 +336,6 @@ fn metrics_are_low_cardinality() {
         );
     }
 }
-#[test]
-fn all_prior_closeouts_non_regression() -> TestResult {
-    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/prior-closeouts");
-    for phase in ["phase-g3b", "phase-l0"] {
-        let v: serde_json::Value =
-            serde_json::from_reader(std::fs::File::open(root.join(format!("{phase}.json")))?)?;
-        assert_eq!(
-            v.get("schema_version").and_then(serde_json::Value::as_str),
-            Some("eliot-closeout-fixture-v1")
-        );
-        assert_eq!(
-            v.get("phase").and_then(serde_json::Value::as_str),
-            Some(phase)
-        );
-        assert_eq!(
-            v.get("final_status").and_then(serde_json::Value::as_str),
-            Some("DONE_VERIFIED")
-        );
-    }
-    Ok(())
-}
-
 fn state_with_candidate() -> DelegationCalibrationState {
     let mut s = DelegationCalibrationState::default();
     s.samples

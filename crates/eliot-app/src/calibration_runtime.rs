@@ -751,7 +751,7 @@ pub fn report(root: &Path) -> Result<Value> {
     Ok(report)
 }
 
-/// Reconstructs the frozen L1B campaign incident without invoking a provider.
+/// Reconstructs a frozen provider-budget incident without invoking a provider.
 /// Historical observations remain immutable; only eligibility projections and
 /// the typed containment record are derived.
 pub fn integrity_reconcile(
@@ -855,7 +855,7 @@ fn write_baseline(root: &Path) -> Result<()> {
     write_pair(
         root,
         "delegation-calibration-baseline",
-        &json!({"phase":"L0","commit":"761f969ec46743951efbb7e2fe064baddf0452fd","working_tree_was_clean":true}),
+        &json!({"baseline":"delegation_policy","commit":"761f969ec46743951efbb7e2fe064baddf0452fd","working_tree_was_clean":true}),
     )
 }
 pub(crate) fn write_pair<T: Serialize>(root: &Path, name: &str, value: &T) -> Result<()> {

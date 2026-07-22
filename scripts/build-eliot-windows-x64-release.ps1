@@ -1,7 +1,7 @@
 [CmdletBinding()]
 param(
     [string]$Version = '0.1.0',
-    [string]$OutputRoot = 'dist',
+    [string]$OutputRoot = (Join-Path $env:LOCALAPPDATA 'Eliot\packages'),
     [string]$OperatorSource,
     [switch]$SkipBuild,
     [switch]$PlanOnly,
@@ -226,7 +226,18 @@ if ($VerifyBundle) {
 }
 
 $bundleName = "eliot-windows-x64-$Version-unsigned"
-$bundle = Join-Path (Join-Path $repo $OutputRoot) $bundleName
+$resolvedOutputRoot = if ([System.IO.Path]::IsPathRooted($OutputRoot)) {
+    [System.IO.Path]::GetFullPath($OutputRoot)
+}
+else {
+    [System.IO.Path]::GetFullPath((Join-Path $repo $OutputRoot))
+}
+$bundle = Join-Path $resolvedOutputRoot $bundleName
+$cargoMetadata = (& cargo metadata --format-version 1 --no-deps 2>$null | Out-String) | ConvertFrom-Json
+if ($LASTEXITCODE -ne 0 -or -not $cargoMetadata.target_directory) {
+    throw 'failed to resolve the Cargo target directory'
+}
+$governorPath = Join-Path ([string]$cargoMetadata.target_directory) 'release\eliot-governor.exe'
 $sourceCommit = (& git -C $repo rev-parse HEAD 2>$null | Out-String).Trim()
 if ($LASTEXITCODE -ne 0 -or $sourceCommit -notmatch '^[0-9a-f]{40}$') {
     throw 'failed to resolve the release source commit'
@@ -240,9 +251,9 @@ $plan = [ordered]@{
     source_policy = 'pinned-commit-tracked-files-only'
     secret_scan = 'required-before-manifest-and-on-verification'
     output = $bundle
-    governor = (Join-Path $repo 'target/release/eliot-governor.exe')
+    governor = $governorPath
     operator_source = $OperatorSource
-    includes = @('governor', 'operator', 'config', 'integrations', 'skills', 'plugins', 'migrations', 'operations-runbooks')
+    includes = @('governor', 'operator', 'config', 'integrations', 'skills', 'migrations', 'operations-runbooks')
     signing_required_before_public_distribution = $true
 }
 
@@ -277,7 +288,7 @@ try {
         throw 'release source changed during the Governor build'
     }
 
-    $governor = Join-Path $repo 'target/release/eliot-governor.exe'
+    $governor = $governorPath
     if (-not (Test-Path -LiteralPath $governor -PathType Leaf)) {
         throw "release governor executable is missing: $governor"
     }
@@ -290,7 +301,7 @@ try {
     Copy-Item -LiteralPath $governor -Destination $bundle
     Copy-TrackedTree $repo $sourceCommit 'config' (Join-Path $bundle 'config')
     Copy-TrackedTree $repo $sourceCommit 'integrations' (Join-Path $bundle 'integrations')
-    Copy-TrackedTree $repo $sourceCommit 'plugin' (Join-Path $bundle 'plugins')
+    Copy-TrackedTree $repo $sourceCommit 'plugin/eliot-antigravity-official' (Join-Path $bundle 'integrations/antigravity/official-plugin')
     Copy-TrackedTree $repo $sourceCommit 'integrations/agent-skills' (Join-Path $bundle 'skills')
     Copy-TrackedTree $repo $sourceCommit 'migrations' (Join-Path $bundle 'migrations')
     Copy-TrackedTree $repo $sourceCommit 'docs/operations' (Join-Path $bundle 'docs/operations')

@@ -13,12 +13,13 @@ pub(super) async fn dispatch_trace_completeness(
     context: AuthenticatedRequestContext,
     arguments: Value,
 ) -> Result<Value> {
-    require_l11_controller_authority(state)?;
+    require_canonical_controller_authority(state)?;
     let input: TraceCompletenessToolInput = serde_json::from_value(arguments)?;
     let project_id = parse_project_id(&input.project_id)?;
-    let task_id = TaskId::from_str(&input.task_id).context("parse L11 trace task_id")?;
-    let task = require_l11_task(state, project_id, task_id, input.expected_task_revision).await?;
-    let write_key = l11_idempotency_key(&input.idempotency_key, "trace-registration")?;
+    let task_id = TaskId::from_str(&input.task_id).context("parse canonical trace task_id")?;
+    let task =
+        require_canonical_task(state, project_id, task_id, input.expected_task_revision).await?;
+    let write_key = canonical_idempotency_key(&input.idempotency_key, "trace-registration")?;
     let write_id = deterministic_canonical_write_id(
         project_id,
         Some(task_id),
@@ -96,7 +97,7 @@ pub(super) async fn dispatch_trace_completeness(
         .await?
         .context("canonical trace contract was not rehydrated after write")?;
     write_json_report(
-        &j0_latest_path(&state.root, "trace-completeness"),
+        &latest_report_path(&state.root, "trace-completeness"),
         &contract,
     )?;
     Ok(json!({
@@ -115,11 +116,12 @@ pub(super) async fn dispatch_replay_run(
     context: AuthenticatedRequestContext,
     arguments: Value,
 ) -> Result<Value> {
-    require_l11_controller_authority(state)?;
+    require_canonical_controller_authority(state)?;
     let input: ReplayRunToolInput = serde_json::from_value(arguments)?;
     let project_id = parse_project_id(&input.project_id)?;
-    let task_id = TaskId::from_str(&input.task_id).context("parse L11 replay task_id")?;
-    let task = require_l11_task(state, project_id, task_id, input.expected_task_revision).await?;
+    let task_id = TaskId::from_str(&input.task_id).context("parse canonical replay task_id")?;
+    let task =
+        require_canonical_task(state, project_id, task_id, input.expected_task_revision).await?;
     let input_fingerprint = canonical_struct_hash(&input)?;
     let (trace_refs, role) = validate_canonical_replay_request(&input)?;
     let baseline_ref = canonical_struct_hash(&ExperimentalMetaPolicyPayload::ReplayThresholdV1 {
@@ -128,9 +130,9 @@ pub(super) async fn dispatch_replay_run(
     let candidate_ref = canonical_struct_hash(&ExperimentalMetaPolicyPayload::ReplayThresholdV1 {
         policy: input.candidate_policy.clone(),
     })?;
-    let set_key = l11_idempotency_key(&input.idempotency_key, "replay-set")?;
-    let baseline_key = l11_idempotency_key(&input.idempotency_key, "replay-baseline")?;
-    let candidate_key = l11_idempotency_key(&input.idempotency_key, "replay-candidate")?;
+    let set_key = canonical_idempotency_key(&input.idempotency_key, "replay-set")?;
+    let baseline_key = canonical_idempotency_key(&input.idempotency_key, "replay-baseline")?;
+    let candidate_key = canonical_idempotency_key(&input.idempotency_key, "replay-candidate")?;
     let expected_baseline_write = deterministic_canonical_write_id(
         project_id,
         Some(task_id),
@@ -209,7 +211,7 @@ pub(super) async fn dispatch_replay_run(
     let set = ReplaySetService::create(ReplaySetInput {
         project_id,
         name: input.set_name.clone(),
-        purpose: format!("L11 {} sealed canonical replay", input.set_role),
+        purpose: format!("{} sealed canonical replay", input.set_role),
         cases: cases.iter().map(|case| case.replay_case_id).collect(),
         fixed: true,
         holdout: role == ReplaySetRole::Holdout,
@@ -271,7 +273,8 @@ pub(super) async fn dispatch_replay_run(
     );
     let expected_case_write_ids = (0..sealed.cases.len())
         .map(|index| {
-            let key = l11_idempotency_key(&input.idempotency_key, &format!("replay-case-{index}"))?;
+            let key =
+                canonical_idempotency_key(&input.idempotency_key, &format!("replay-case-{index}"))?;
             Ok(deterministic_canonical_write_id(
                 project_id,
                 Some(task_id),
@@ -282,8 +285,10 @@ pub(super) async fn dispatch_replay_run(
         .collect::<Result<Vec<_>>>()?;
     let expected_snapshot_write_ids = (0..sealed.snapshots.len())
         .map(|index| {
-            let key =
-                l11_idempotency_key(&input.idempotency_key, &format!("replay-snapshot-{index}"))?;
+            let key = canonical_idempotency_key(
+                &input.idempotency_key,
+                &format!("replay-snapshot-{index}"),
+            )?;
             Ok(deterministic_canonical_write_id(
                 project_id,
                 Some(task_id),
@@ -304,7 +309,7 @@ pub(super) async fn dispatch_replay_run(
         expected_case_write_ids,
         expected_snapshot_write_ids,
     }));
-    let baseline_receipt = persist_l11_record(
+    let baseline_receipt = persist_canonical_record(
         state,
         context,
         project_id,
@@ -338,9 +343,12 @@ pub(super) async fn dispatch_replay_run(
         replayed: false,
     };
     let report = reconcile_authoritative_replay(state, context, &request).await?;
-    write_json_report(&j0_latest_path(&state.root, "replay-runs"), &report)?;
+    write_json_report(&latest_report_path(&state.root, "replay-runs"), &report)?;
     let verdict = ReplayVerdictService::verdict(&candidate_execution.run);
-    write_json_report(&j0_latest_path(&state.root, "replay-verdicts"), &verdict)?;
+    write_json_report(
+        &latest_report_path(&state.root, "replay-verdicts"),
+        &verdict,
+    )?;
     Ok(report)
 }
 
@@ -353,7 +361,7 @@ struct AuthoritativeReplayRequest<'a> {
     replayed: bool,
 }
 
-pub(super) fn validate_authoritative_replay<'a>(
+fn validate_authoritative_replay<'a>(
     request: &'a AuthoritativeReplayRequest<'a>,
 ) -> Result<&'a CanonicalReplayAuthority> {
     let project_id = request.task.project_id;
@@ -364,8 +372,9 @@ pub(super) fn validate_authoritative_replay<'a>(
         .authoritative_replay
         .as_deref()
         .context("canonical replay baseline has no authoritative aggregate")?;
-    let baseline_key = l11_idempotency_key(&request.input.idempotency_key, "replay-baseline")?;
-    let set_key = l11_idempotency_key(&request.input.idempotency_key, "replay-set")?;
+    let baseline_key =
+        canonical_idempotency_key(&request.input.idempotency_key, "replay-baseline")?;
+    let set_key = canonical_idempotency_key(&request.input.idempotency_key, "replay-set")?;
     let expected_baseline_write = deterministic_canonical_write_id(
         project_id,
         Some(task_id),
@@ -380,7 +389,7 @@ pub(super) fn validate_authoritative_replay<'a>(
     );
     let expected_case_writes = (0..authority.cases.len())
         .map(|index| {
-            let key = l11_idempotency_key(
+            let key = canonical_idempotency_key(
                 &request.input.idempotency_key,
                 &format!("replay-case-{index}"),
             )?;
@@ -394,7 +403,7 @@ pub(super) fn validate_authoritative_replay<'a>(
         .collect::<Result<Vec<_>>>()?;
     let expected_snapshot_writes = (0..authority.snapshots.len())
         .map(|index| {
-            let key = l11_idempotency_key(
+            let key = canonical_idempotency_key(
                 &request.input.idempotency_key,
                 &format!("replay-snapshot-{index}"),
             )?;
@@ -445,15 +454,16 @@ pub(super) fn validate_authoritative_replay<'a>(
     Ok(authority)
 }
 
-pub(super) async fn reconcile_authoritative_replay(
+async fn reconcile_authoritative_replay(
     state: &McpState,
     context: AuthenticatedRequestContext,
     request: &AuthoritativeReplayRequest<'_>,
 ) -> Result<Value> {
     let scope = (request.task.project_id, request.task.task_id);
     let authority = validate_authoritative_replay(request)?;
-    let candidate_key = l11_idempotency_key(&request.input.idempotency_key, "replay-candidate")?;
-    let set_key = l11_idempotency_key(&request.input.idempotency_key, "replay-set")?;
+    let candidate_key =
+        canonical_idempotency_key(&request.input.idempotency_key, "replay-candidate")?;
+    let set_key = canonical_idempotency_key(&request.input.idempotency_key, "replay-set")?;
     revalidate_execution_trace_authority(state, request.task, &request.baseline.receipt_body)
         .await?;
     revalidate_execution_trace_authority(state, request.task, &authority.candidate_execution)
@@ -461,7 +471,7 @@ pub(super) async fn reconcile_authoritative_replay(
 
     let mut record_receipts = Vec::new();
     record_receipts.push(
-        reconcile_l11_record(
+        reconcile_canonical_record(
             state,
             context,
             scope,
@@ -472,12 +482,12 @@ pub(super) async fn reconcile_authoritative_replay(
         .await?,
     );
     for (index, case) in authority.cases.iter().enumerate() {
-        let key = l11_idempotency_key(
+        let key = canonical_idempotency_key(
             &request.input.idempotency_key,
             &format!("replay-case-{index}"),
         )?;
         record_receipts.push(
-            reconcile_l11_record(
+            reconcile_canonical_record(
                 state,
                 context,
                 scope,
@@ -489,12 +499,12 @@ pub(super) async fn reconcile_authoritative_replay(
         );
     }
     for (index, snapshot) in authority.snapshots.iter().enumerate() {
-        let key = l11_idempotency_key(
+        let key = canonical_idempotency_key(
             &request.input.idempotency_key,
             &format!("replay-snapshot-{index}"),
         )?;
         record_receipts.push(
-            reconcile_l11_record(
+            reconcile_canonical_record(
                 state,
                 context,
                 scope,
@@ -505,7 +515,7 @@ pub(super) async fn reconcile_authoritative_replay(
             .await?,
         );
     }
-    let candidate_receipt = reconcile_l11_record(
+    let candidate_receipt = reconcile_canonical_record(
         state,
         context,
         scope,
@@ -594,7 +604,7 @@ pub(super) fn validate_canonical_replay_request(
     Ok((trace_refs, role))
 }
 
-pub(super) async fn persist_l11_record<T: serde::Serialize>(
+pub(super) async fn persist_canonical_record<T: serde::Serialize>(
     state: &McpState,
     context: AuthenticatedRequestContext,
     project_id: ProjectId,
@@ -606,7 +616,7 @@ pub(super) async fn persist_l11_record<T: serde::Serialize>(
     write_canonical_observation(state, context, project_id, Some(task_id), kind, key, record).await
 }
 
-pub(super) async fn reconcile_l11_record<T>(
+pub(super) async fn reconcile_canonical_record<T>(
     state: &McpState,
     context: AuthenticatedRequestContext,
     scope: (ProjectId, TaskId),
@@ -640,14 +650,14 @@ where
             .status;
         return Ok((existing.canonical_receipt, status));
     }
-    persist_l11_record(state, context, project_id, task_id, kind, key, body).await
+    persist_canonical_record(state, context, project_id, task_id, kind, key, body).await
 }
 
 pub(super) fn dispatch_replay_report(state: &McpState) -> Value {
     json!({
         "component": "replay_report",
-        "run": read_j0_latest_value(&state.root, "replay-runs").ok(),
-        "verdict": read_j0_latest_value(&state.root, "replay-verdicts").ok()
+        "run": read_latest_report_value(&state.root, "replay-runs").ok(),
+        "verdict": read_latest_report_value(&state.root, "replay-verdicts").ok()
     })
 }
 
@@ -657,13 +667,14 @@ pub(super) async fn dispatch_sleep_run(
     context: AuthenticatedRequestContext,
     arguments: Value,
 ) -> Result<Value> {
-    require_l11_controller_authority(state)?;
+    require_canonical_controller_authority(state)?;
     let input: SleepRunToolInput = serde_json::from_value(arguments)?;
     let project_id = parse_project_id(&input.project_id)?;
-    let task_id = TaskId::from_str(&input.task_id).context("parse L11 sleep task_id")?;
-    let task = require_l11_task(state, project_id, task_id, input.expected_task_revision).await?;
+    let task_id = TaskId::from_str(&input.task_id).context("parse governed sleep task_id")?;
+    let task =
+        require_canonical_task(state, project_id, task_id, input.expected_task_revision).await?;
     if !input.dry_run {
-        anyhow::bail!("L11 sleep MCP is candidate-only and requires dry_run=true");
+        anyhow::bail!("governed sleep MCP is candidate-only and requires dry_run=true");
     }
     if input.trace_refs.is_empty() || input.trace_refs.len() > 20 {
         anyhow::bail!("sleep requires between 1 and 20 requested trace refs");
@@ -680,7 +691,7 @@ pub(super) async fn dispatch_sleep_run(
         anyhow::bail!("sleep input contains an unregistered or duplicate canonical trace");
     }
     let fingerprint = canonical_struct_hash(&input)?;
-    let bundle_key = l11_idempotency_key(&input.idempotency_key, "sleep-bundle")?;
+    let bundle_key = canonical_idempotency_key(&input.idempotency_key, "sleep-bundle")?;
     let expected_write = deterministic_canonical_write_id(
         project_id,
         Some(task_id),
@@ -701,7 +712,7 @@ pub(super) async fn dispatch_sleep_run(
             .receipt_body
             .run
             .reasoning_route_ref
-            .contains(&l11_fingerprint_marker(&fingerprint))
+            .contains(&canonical_fingerprint_marker(&fingerprint))
         {
             anyhow::bail!("sleep idempotency conflict");
         }
@@ -726,7 +737,7 @@ pub(super) async fn dispatch_sleep_run(
         bundle.run.input_scope.task_ids = vec![task_id];
         bundle.run.reasoning_route_ref = format!(
             "deterministic:sleep-consolidation-v3; {}",
-            l11_fingerprint_marker(&fingerprint)
+            canonical_fingerprint_marker(&fingerprint)
         );
         finalize_sleep_bundle_identity(&mut bundle)?;
         validate_sleep_bundle(&bundle)?;
@@ -751,7 +762,7 @@ pub(super) async fn dispatch_sleep_run(
         &bundle,
     )
     .await?;
-    write_json_report(&j0_latest_path(&state.root, "sleep"), &bundle)?;
+    write_json_report(&latest_report_path(&state.root, "sleep"), &bundle)?;
     Ok(json!({
         "accepted": true,
         "replayed": replayed,
@@ -808,7 +819,7 @@ pub(super) async fn reconcile_sleep_artifacts(
 ) -> Result<Vec<Value>> {
     let mut receipts = Vec::new();
     for (index, artifact) in bundle.artifacts.iter().enumerate() {
-        let key = l11_idempotency_key(
+        let key = canonical_idempotency_key(
             idempotency_key,
             &format!(
                 "sleep-artifact-{}-{index}",
@@ -857,7 +868,7 @@ pub(super) async fn reconcile_sleep_artifacts(
         maybe_inject_sleep_reconciliation_failure(index + 1)?;
     }
     for (index, artifact) in bundle.artifacts.iter().enumerate() {
-        let key = l11_idempotency_key(
+        let key = canonical_idempotency_key(
             idempotency_key,
             &format!(
                 "sleep-artifact-{}-{index}",

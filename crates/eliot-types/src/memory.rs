@@ -2211,18 +2211,3 @@ pub enum HookProcessingStatus {
     FailedClosed,
     Blocked,
 }
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct PluginManifestCheck {
-    pub name: String,
-    pub status: String,
-    pub detail: String,
-    pub path: String,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct PluginInstallCheck {
-    pub plugin_root: String,
-    pub checks: Vec<PluginManifestCheck>,
-    pub final_status: String,
-}

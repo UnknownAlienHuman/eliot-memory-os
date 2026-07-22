@@ -354,7 +354,7 @@ fn module_capability_does_not_grant_authority() {
 }
 
 #[test]
-fn phase_b_c_d_e_f0_f1_f2_f3_g0_non_regression() -> TestResult {
+fn accumulated_capabilities_non_regression() -> TestResult {
     let root = repo_root();
     let writer = fs::read_to_string(root.join("crates/eliot-engine/src/writer.rs"))?;
     let context = fs::read_to_string(root.join("crates/eliot-engine/src/context.rs"))?;
@@ -466,7 +466,7 @@ impl Drop for TestLock {
 }
 
 async fn migrate_schema_locked(store: &CanonicalStore) -> TestResult {
-    let lock_path = repo_root().join("target/phase-g1-migrate.lock");
+    let lock_path = repo_root().join("target/adapter-migration-migrate.lock");
     if let Some(parent) = lock_path.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -499,7 +499,7 @@ fn test_root(name: &str) -> TestResult<PathBuf> {
         .to_string();
     let path = repo_root()
         .join("target")
-        .join("phase-g1-tests")
+        .join("adapter-migration-tests")
         .join(format!("{name}-{unique}"));
     fs::create_dir_all(&path)?;
     Ok(path)

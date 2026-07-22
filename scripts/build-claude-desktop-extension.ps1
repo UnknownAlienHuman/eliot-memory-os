@@ -7,6 +7,24 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+
+function Get-Sha256Hex {
+    param([Parameter(Mandatory = $true)][string]$LiteralPath)
+    $stream = [System.IO.File]::OpenRead($LiteralPath)
+    try {
+        $sha256 = [System.Security.Cryptography.SHA256]::Create()
+        try {
+            return ([System.BitConverter]::ToString($sha256.ComputeHash($stream))).Replace('-', '')
+        }
+        finally {
+            $sha256.Dispose()
+        }
+    }
+    finally {
+        $stream.Dispose()
+    }
+}
+
 $repoRoot = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
 $sourceRoot = Join-Path $repoRoot 'integrations\claude\claude-desktop\mcpb'
 
@@ -29,17 +47,14 @@ $targetParent = [System.IO.Path]::GetFullPath((Split-Path $targetRoot -Parent))
 $distRoot = Join-Path $packageCacheRoot 'claude'
 
 if (-not $GovernorExe) {
-    # Cargo output is redirected out of OneDrive, so an in-repo `target\` is no
-    # longer where the release binary lands. Ask Cargo where it actually is.
-    $cargoTargetDir = $env:CARGO_TARGET_DIR
-    if (-not $cargoTargetDir) {
-        $cargoConfig = Join-Path $repoRoot '.cargo\config.toml'
-        if (Test-Path -LiteralPath $cargoConfig) {
-            $match = Select-String -LiteralPath $cargoConfig -Pattern '^\s*target-dir\s*=\s*"(.+)"' | Select-Object -First 1
-            if ($match) { $cargoTargetDir = $match.Matches[0].Groups[1].Value }
-        }
+    # Cargo output is redirected out of OneDrive. Cargo metadata is the source
+    # of truth even when an environment or developer-local config overrides it.
+    $metadataText = @(& cargo metadata --format-version 1 --no-deps 2>&1)
+    if ($LASTEXITCODE -ne 0) {
+        throw "cargo metadata failed: $($metadataText -join [Environment]::NewLine)"
     }
-    if (-not $cargoTargetDir) { $cargoTargetDir = Join-Path $repoRoot 'target' }
+    $cargoTargetDir = [string](($metadataText -join [Environment]::NewLine) | ConvertFrom-Json).target_directory
+    if (-not $cargoTargetDir) { throw 'cargo metadata returned no target_directory' }
     $GovernorExe = Join-Path $cargoTargetDir 'release\eliot-governor.exe'
 }
 $GovernorExe = [System.IO.Path]::GetFullPath($GovernorExe)
@@ -64,6 +79,33 @@ New-Item -ItemType Directory -Path (Join-Path $targetRoot 'server') -Force | Out
 New-Item -ItemType Directory -Path $distRoot -Force | Out-Null
 Copy-Item -Path (Join-Path $sourceRoot '*') -Destination $targetRoot -Recurse -Force
 Copy-Item -LiteralPath $GovernorExe -Destination (Join-Path $targetRoot 'server\eliot-governor.exe')
+
+# The Governor is the only tool/prompt catalog authority. The tracked manifest
+# is deliberately just a package template; materialize the MCPB metadata from
+# the exact binary being bundled so package claims cannot drift from runtime.
+$catalogOutput = @(& $GovernorExe mcp catalog --host claude --surface desktop)
+if ($LASTEXITCODE -ne 0) {
+    throw "Governor MCP catalog generation failed with exit code $LASTEXITCODE"
+}
+$catalog = ($catalogOutput -join [Environment]::NewLine) | ConvertFrom-Json
+if ($catalog.schema_version -ne 'eliot-mcp-catalog-v2') {
+    throw "unexpected Governor MCP catalog schema: $($catalog.schema_version)"
+}
+if (@($catalog.mcpb_tools).Count -eq 0 -or @($catalog.mcpb_prompts).Count -eq 0) {
+    throw 'Governor MCP catalog did not produce MCPB tools and prompts'
+}
+$targetManifestPath = Join-Path $targetRoot 'manifest.json'
+$targetManifest = Get-Content -LiteralPath $targetManifestPath -Raw | ConvertFrom-Json
+$targetManifest.tools = @($catalog.mcpb_tools)
+$targetManifest.tools_generated = $true
+$targetManifest.prompts = @($catalog.mcpb_prompts)
+$targetManifest.prompts_generated = $true
+$targetManifestJson = $targetManifest | ConvertTo-Json -Depth 50
+[System.IO.File]::WriteAllText(
+    $targetManifestPath,
+    $targetManifestJson + [Environment]::NewLine,
+    (New-Object System.Text.UTF8Encoding($false))
+)
 
 if (-not $McpbCli) {
     $resolved = Get-Command mcpb -ErrorAction SilentlyContinue
@@ -130,8 +172,8 @@ $buildManifest = [ordered]@{
     target = 'windows-x64'
     mcpb_cli_version = $mcpbVersion
     manifest_schema = $sourceManifest.'$schema'
-    manifest_sha256 = (Get-FileHash -LiteralPath (Join-Path $targetRoot 'manifest.json') -Algorithm SHA256).Hash
-    governor_sha256 = (Get-FileHash -LiteralPath $stagedGovernor -Algorithm SHA256).Hash
+    manifest_sha256 = Get-Sha256Hex (Join-Path $targetRoot 'manifest.json')
+    governor_sha256 = Get-Sha256Hex $stagedGovernor
     governor_source = $GovernorExe
     server_entry_point = $sourceManifest.server.entry_point
     host_argument = 'claude-desktop'
@@ -156,9 +198,9 @@ $report = [ordered]@{
     schema_version = 'eliot-claude-desktop-package-report-v1'
     package = $package.FullName
     package_bytes = $package.Length
-    package_sha256 = (Get-FileHash -LiteralPath $packagePath -Algorithm SHA256).Hash
-    governor_sha256 = (Get-FileHash -LiteralPath $GovernorExe -Algorithm SHA256).Hash
-    manifest_sha256 = (Get-FileHash -LiteralPath $manifestPath -Algorithm SHA256).Hash
+    package_sha256 = Get-Sha256Hex $packagePath
+    governor_sha256 = Get-Sha256Hex $GovernorExe
+    manifest_sha256 = Get-Sha256Hex $manifestPath
     manifest_version = $manifest.manifest_version
     extension_version = $manifest.version
     mcpb_cli_version = $mcpbVersion

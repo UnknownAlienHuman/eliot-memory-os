@@ -292,7 +292,7 @@ fn action_lease_denies_file_outside_work_lease() {
 
 #[tokio::test]
 async fn patch_runner_requires_active_work_lease() -> TestResult {
-    let bundle = PatchBundle::new("phase-f1-missing-work-lease", value_diff("2"))?;
+    let bundle = PatchBundle::new("work-lease-missing-work-lease", value_diff("2"))?;
     let run = bundle
         .runner()
         .preflight(&bundle.input(Some(&bundle.action_lease), None))
@@ -860,7 +860,7 @@ fn fixture_repo(name: &str) -> TestResult<PathBuf> {
     fs::create_dir_all(repo.join("src"))?;
     fs::write(
         repo.join("Cargo.toml"),
-        "[package]\nname=\"phase-f1-fixture\"\nversion=\"0.1.0\"\nedition=\"2024\"\n\n[workspace]\n",
+        "[package]\nname=\"work-lease-fixture\"\nversion=\"0.1.0\"\nedition=\"2024\"\n\n[workspace]\n",
     )?;
     fs::write(repo.join("src/lib.rs"), "pub fn value() -> u32 { 1 }\n")?;
     run_process(&repo, "git", &["init"])?;

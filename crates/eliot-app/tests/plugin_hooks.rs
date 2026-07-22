@@ -7,32 +7,36 @@ type TestResult<T = ()> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
 #[test]
 fn plugin_manifest_exists_and_parses() -> TestResult {
-    let manifest = read_json(&plugin_root().join(".codex-plugin").join("plugin.json"))?;
-    assert_eq!(
-        manifest.get("name").and_then(Value::as_str),
-        Some("eliot-governor")
-    );
-    assert_eq!(
-        manifest.get("skills").and_then(Value::as_str),
-        Some("./skills/")
-    );
+    let manifest = read_json(&plugin_root().join(".claude-plugin").join("plugin.json"))?;
+    assert_eq!(manifest.get("name").and_then(Value::as_str), Some("eliot"));
+    assert_eq!(manifest.get("license").and_then(Value::as_str), Some("MIT"));
     Ok(())
 }
 
 #[test]
 fn plugin_mcp_config_exists_and_has_governed_server() -> TestResult {
     let mcp = read_json(&plugin_root().join(".mcp.json"))?;
-    let servers = mcp.as_object().ok_or("direct MCP server map missing")?;
+    let servers = mcp
+        .get("mcpServers")
+        .and_then(Value::as_object)
+        .ok_or("Claude MCP server map missing")?;
     assert_eq!(servers.len(), 1);
-    let server = servers
-        .get("eliot-governor")
-        .ok_or("eliot-governor server missing")?;
+    let server = servers.get("eliot").ok_or("eliot server missing")?;
     assert_eq!(
         server.get("command").and_then(Value::as_str),
-        Some("./bin/eliot-governor.exe")
+        Some("${CLAUDE_PLUGIN_ROOT}/bin/eliot-governor.exe")
     );
-    assert_eq!(server.get("args"), Some(&json!(["mcp", "stdio"])));
-    assert_eq!(server.get("cwd").and_then(Value::as_str), Some("."));
+    assert_eq!(
+        server.get("args"),
+        Some(&json!([
+            "mcp",
+            "stdio",
+            "--host",
+            "claude",
+            "--instance",
+            "default"
+        ]))
+    );
     Ok(())
 }
 
@@ -45,15 +49,13 @@ fn plugin_hooks_config_exists_and_parses() -> TestResult {
         .ok_or("hooks object missing")?;
     for event in [
         "SessionStart",
-        "UserPromptSubmit",
-        "SubagentStart",
         "PreToolUse",
-        "PermissionRequest",
-        "PostToolUse",
-        "PreCompact",
-        "PostCompact",
+        "PostToolUseFailure",
+        "SubagentStart",
         "SubagentStop",
+        "PreCompact",
         "Stop",
+        "SessionEnd",
     ] {
         assert!(
             events
@@ -69,16 +71,32 @@ fn plugin_hooks_config_exists_and_parses() -> TestResult {
 #[test]
 fn plugin_hooks_use_rust_binary_not_python_node() -> TestResult {
     let hooks_path = plugin_root().join("hooks").join("hooks.json");
-    let text = fs::read_to_string(hooks_path)?;
-    let lowered = text.to_ascii_lowercase();
-    for forbidden in ["python", "node", "npx", "bash", "cmd /c", "powershell"] {
-        assert!(
-            !lowered.contains(forbidden),
-            "forbidden hook wrapper: {forbidden}"
-        );
+    let hooks = read_json(&hooks_path)?;
+    let events = hooks
+        .get("hooks")
+        .and_then(Value::as_object)
+        .ok_or("hooks object missing")?;
+    let commands = events
+        .values()
+        .filter_map(Value::as_array)
+        .flatten()
+        .filter_map(|entry| entry.get("hooks").and_then(Value::as_array))
+        .flatten()
+        .filter_map(|hook| hook.get("command").and_then(Value::as_str))
+        .collect::<Vec<_>>();
+
+    assert!(!commands.is_empty(), "no hook commands found");
+    for command in commands {
+        let lowered = command.to_ascii_lowercase();
+        for forbidden in ["python", "node", "npx", "bash", "cmd /c", "powershell"] {
+            assert!(
+                !lowered.contains(forbidden),
+                "forbidden hook wrapper: {forbidden}"
+            );
+        }
+        assert!(lowered.ends_with("eliot-governor.exe"));
+        assert!(command.contains("CLAUDE_PLUGIN_ROOT"));
     }
-    assert!(lowered.contains("eliot-governor.exe"));
-    assert!(text.contains("PLUGIN_ROOT"));
     Ok(())
 }
 
@@ -86,9 +104,9 @@ fn plugin_hooks_use_rust_binary_not_python_node() -> TestResult {
 fn plugin_skills_exist() {
     for skill in [
         "eliot-task-cycle",
-        "eliot-code-understanding",
-        "eliot-action-verification",
-        "eliot-memory-discipline",
+        "eliot-understanding",
+        "eliot-delegation",
+        "eliot-verify-finish",
     ] {
         assert!(
             plugin_root()
@@ -125,7 +143,7 @@ fn hook_user_prompt_submit_records_task_candidate() -> TestResult {
     let output = run_hook_with_runtime(
         &runtime,
         "user-prompt-submit",
-        &json!({ "prompt": "Implement Phase F0", "session_id": "f0-prompt" }),
+        &json!({ "prompt": "Implement canonical host integration", "session_id": "governed-prompt" }),
     )?;
     assert_eq!(output.get("continue").and_then(Value::as_bool), Some(true));
     assert!(pending_spool_count(&runtime)? > 0);
@@ -171,7 +189,7 @@ fn hook_pre_tool_use_defers_outside_an_eliot_session() -> TestResult {
     Ok(())
 }
 
-/// Same contract for the finish gate: DONE without DONE_VERIFIED is only
+/// Same contract for the finish gate: DONE without `DONE_VERIFIED` is only
 /// ELIOT's business when the session is attached to an ELIOT task.
 #[test]
 fn hook_stop_defers_outside_an_eliot_session() -> TestResult {
@@ -276,32 +294,6 @@ fn hook_stop_allows_verified_done() -> TestResult {
 }
 
 #[test]
-fn plugin_verify_report_generated() -> TestResult {
-    // Pin the runtime: without `--config` the report lands in whatever runtime
-    // root this machine happens to have, and the test then reads a path that
-    // only exists when the runtime lives inside the checkout.
-    let runtime = runtime_for("plugin-verify");
-    let output = Command::new(binary())
-        .arg("--config")
-        .arg(runtime.join("config").join("governor.toml"))
-        .arg("plugin")
-        .arg("verify")
-        .current_dir(repo_root())
-        .output()?;
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let report = read_json(&runtime.join("reports").join("plugin").join("latest.json"))?;
-    assert_eq!(
-        report.get("final_status").and_then(Value::as_str),
-        Some("DONE_VERIFIED")
-    );
-    Ok(())
-}
-
-#[test]
 /// The dependency doctor must keep checking for the two crates the workspace
 /// deliberately refuses to link. The check lives in the engine's safety module;
 /// this only proves nobody quietly deleted it.
@@ -379,7 +371,7 @@ fn pending_spool_count(runtime: &Path) -> TestResult<usize> {
 }
 
 fn runtime_for(name: &str) -> PathBuf {
-    repo_root().join("target").join("phase-f0-hooks").join(name)
+    std::env::temp_dir().join("eliot-hook-tests").join(name)
 }
 
 fn read_json(path: &Path) -> TestResult<Value> {
@@ -387,7 +379,10 @@ fn read_json(path: &Path) -> TestResult<Value> {
 }
 
 fn plugin_root() -> PathBuf {
-    repo_root().join("plugin").join("eliot-governor")
+    repo_root()
+        .join("integrations")
+        .join("claude")
+        .join("eliot")
 }
 
 fn repo_root() -> PathBuf {

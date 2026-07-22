@@ -210,7 +210,7 @@ async fn action_lease_written_through_writer_actor() -> TestResult {
 }
 
 #[test]
-fn phase_b_c_d_non_regression() -> TestResult {
+fn accumulated_capabilities_non_regression() -> TestResult {
     let repo = repo_root();
     let mcp_stdio = fs::read_to_string(repo.join("crates/eliot-app/src/mcp_stdio.rs"))?;
     let context = fs::read_to_string(repo.join("crates/eliot-engine/src/context.rs"))?;

@@ -1,0 +1,52 @@
+{
+  "schema_version": "eliot-cognitive-reciprocal-disposition-map-v1",
+  "harness_version": "cognitive-contract-v2",
+  "execution_mode": "production",
+  "reference_client_path": "REPO/scripts/eliot-mcp-reference-client.ps1",
+  "reference_client_sha256": "PINNED_SHA256",
+  "governor_exe_sha256": "PINNED_SHA256",
+  "governor_config_sha256": "PINNED_SHA256",
+  "project_id": "REPLACE_WITH_CANONICAL_PROJECT_UUID",
+  "task_id": "REPLACE_WITH_CANONICAL_TASK_UUID",
+  "generated_at": "GENERATED_ONLY_BY_DISPOSITION_RECIPROCAL",
+  "flows": {
+    "opencode-to-antigravity": {
+      "status": "VERIFIED_ADMITTED",
+      "source_invocation_id": "LC-01-source-opencode",
+      "candidate_write_id": "SOURCE_WRITE_UUID",
+      "source_memory_revision": "SOURCE_CANONICAL_REVISION",
+      "source_statement": "EXACT_PARSED_MECHANISM_CLAIM",
+      "source_topic": "M6_FLOW_AND_NONCE_BOUND_TOPIC",
+      "source_freshness_rule": "M6_NONCE_AND_CURRENT_TRUTH_BOUND_FRESHNESS",
+      "where_applicable": ["SEALED_APPLICABILITY"],
+      "where_not_applicable": ["SEALED_EXCLUSION"],
+      "negative_constraints": ["SEALED_NEGATIVE_CONSTRAINT"],
+      "evidence_refs": ["EXACT_SOURCE_EVIDENCE"],
+      "source_provenance_refs": ["EXACT_SOURCE_EVIDENCE"],
+      "admitted_memory_handles": ["SOURCE_WRITE_UUID"],
+      "idempotency_key": "DETERMINISTIC_REVIEW_KEY",
+      "operator_session_id": "HUMAN_OPERATOR_SESSION_UUID",
+      "canonical_receipt": {"receipt_id": "CANONICAL_RECEIPT_ID", "write_id": "VERIFICATION_WRITE_UUID"},
+      "resulting_revision": "POST_PROMOTION_REVISION"
+    },
+    "antigravity-to-opencode": {
+      "status": "VERIFIED_ADMITTED",
+      "source_invocation_id": "LC-02-source-antigravity",
+      "candidate_write_id": "SOURCE_WRITE_UUID",
+      "source_memory_revision": "SOURCE_CANONICAL_REVISION",
+      "source_statement": "EXACT_PARSED_MECHANISM_CLAIM",
+      "source_topic": "M6_FLOW_AND_NONCE_BOUND_TOPIC",
+      "source_freshness_rule": "M6_NONCE_AND_CURRENT_TRUTH_BOUND_FRESHNESS",
+      "where_applicable": ["SEALED_APPLICABILITY"],
+      "where_not_applicable": ["SEALED_EXCLUSION"],
+      "negative_constraints": ["SEALED_NEGATIVE_CONSTRAINT"],
+      "evidence_refs": ["EXACT_SOURCE_EVIDENCE"],
+      "source_provenance_refs": ["EXACT_SOURCE_EVIDENCE"],
+      "admitted_memory_handles": ["SOURCE_WRITE_UUID"],
+      "idempotency_key": "DETERMINISTIC_REVIEW_KEY",
+      "operator_session_id": "HUMAN_OPERATOR_SESSION_UUID",
+      "canonical_receipt": {"receipt_id": "CANONICAL_RECEIPT_ID", "write_id": "VERIFICATION_WRITE_UUID"},
+      "resulting_revision": "POST_PROMOTION_REVISION"
+    }
+  }
+}

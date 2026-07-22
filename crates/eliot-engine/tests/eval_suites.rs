@@ -20,7 +20,7 @@ fn eval_case_schema_exists() {
 #[test]
 fn eval_suite_schema_exists() {
     let (_, suite, _, _, _, _) = artifacts();
-    assert_eq!(suite.name, "k0-core-smoke");
+    assert_eq!(suite.name, "core-smoke");
     assert!(suite.fixed);
     assert!(suite.holdout);
     assert!(!suite.integrity_checksum.is_empty());
@@ -215,7 +215,7 @@ fn incident_lockdown_blocks_mutating_eval() {
 }
 
 #[test]
-fn phase_b_c_d_e_f0_f1_f2_f3_g0_g1_h0_i0_i1_i2_j0_non_regression() {
+fn accumulated_capabilities_non_regression() {
     let (_, _, _, _, run, verdict) = artifacts();
     assert_eq!(run.status, EvalRunStatus::Completed);
     assert_eq!(verdict.status, EvalVerdictStatus::Pass);
@@ -235,7 +235,7 @@ fn case_for(family: EvalFamily) -> TestResult<EvalCase> {
     found.ok_or_else(|| {
         std::io::Error::new(
             std::io::ErrorKind::NotFound,
-            format!("missing K0 case for {family:?}"),
+            format!("missing core-smoke case for {family:?}"),
         )
         .into()
     })
@@ -252,7 +252,7 @@ fn artifacts() -> (
     let cases = cases();
     let mut suite = EvalSuiteService::create(EvalSuiteInput {
         project_id: project_id(),
-        name: "k0-core-smoke".to_owned(),
+        name: "core-smoke".to_owned(),
         purpose: "test deterministic no-mutation suite".to_owned(),
         cases: cases.iter().map(|case| case.eval_case_id).collect(),
         fixed: false,

@@ -729,7 +729,7 @@ pub(super) async fn dispatch_tool(
             ))
             .await?
         }
-        "eliot_l11_status" => Box::pin(dispatch_l11_status(state, arguments)).await?,
+        "eliot_canonical_status" => Box::pin(dispatch_canonical_status(state, arguments)).await?,
         "eliot_memory_lifecycle_status" => dispatch_memory_lifecycle_status(arguments)?,
         "eliot_memory_lifecycle_propose" => dispatch_memory_lifecycle_propose(arguments)?,
         "eliot_memory_lifecycle_vitality" => dispatch_memory_lifecycle_vitality(arguments)?,

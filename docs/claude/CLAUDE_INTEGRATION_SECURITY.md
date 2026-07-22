@@ -26,16 +26,16 @@ caches, private conversations, database passwords, or runtime auth tokens.
 Authentication remains owned by Claude's official login flow. Install manifests
 and receipts may contain owned paths and hashes but never secret values.
 
-Claude Code installation owns only the ELIOT plugin directory beneath the
-current user's Claude skills root. Claude Desktop installation uses the official
-MCPB review UI. Neither path may rewrite unrelated settings, provider auth,
-services, registry keys, or system `PATH`.
+Claude Code installation uses the official local-marketplace lifecycle and owns
+only `eliot@eliot-local` plus its ELIOT package cache and receipts. Claude Desktop
+installation uses the official MCPB review UI. Neither path may rewrite unrelated
+settings, provider auth, services, registry keys, or system `PATH`.
 
 ## Rollback
 
 ```powershell
-.\target\release\eliot-governor.exe host uninstall --host claude
-.\target\release\eliot-governor.exe host uninstall --host claude-desktop
+& $governor host uninstall --host claude
+& $governor host uninstall --host claude-desktop
 ```
 
 Uninstall is scoped by the ELIOT-owned install manifest and must refuse content

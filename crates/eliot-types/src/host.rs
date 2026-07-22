@@ -438,9 +438,11 @@ mod claude_surface_tests {
     /// The retired spelling resolves but is never written back out.
     #[test]
     fn the_retired_spelling_is_never_emitted_as_the_current_name() {
-        let parsed = ClaudeSurface::parse("claude-desktop").expect("resolves");
-        assert_eq!(parsed.as_str(), "claude_desktop_mcpb");
-        assert_ne!(parsed.as_str(), "claude-desktop");
+        assert_eq!(
+            ClaudeSurface::parse("claude-desktop"),
+            Some(ClaudeSurface::ClaudeDesktopMcpb)
+        );
+        assert_ne!(ClaudeSurface::ClaudeDesktopMcpb.as_str(), "claude-desktop");
     }
 
     /// Desktop ships MCP tools and prompts. It does not get Claude Code

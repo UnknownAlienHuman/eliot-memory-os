@@ -1865,8 +1865,8 @@ mod current_git_scope_tests {
                 CausalBridgeHop {
                     from: "ContextPacketL3".to_owned(),
                     relation: "verified_by".to_owned(),
-                    to: "phase_l8_packet_test".to_owned(),
-                    evidence_ref: Some("test:phase_l8_packet_test".to_owned()),
+                    to: "operator_packet_test".to_owned(),
+                    evidence_ref: Some("test:operator_packet_test".to_owned()),
                 },
             ],
             negative_memory_checked: true,

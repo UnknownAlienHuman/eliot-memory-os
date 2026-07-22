@@ -303,6 +303,7 @@ pub struct AntigravityMcpConfigStatus {
     pub registered: bool,
     pub command: Option<PathRef>,
     pub command_absolute: bool,
+    pub command_exists: bool,
     pub profile_args_exact: bool,
     pub secret_fields_present: bool,
     pub recursion_detected: bool,
@@ -700,48 +701,6 @@ pub struct AntigravityNormalizedResult {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum AntigravitySkillTarget {
-    UserAgy,
-    ProjectBundle,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct AntigravitySkillSpec {
-    pub name: String,
-    pub relative_path: PathRef,
-    pub body: String,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct AntigravitySkillBundle {
-    pub component: String,
-    pub target: AntigravitySkillTarget,
-    pub root: PathRef,
-    pub skills: Vec<AntigravitySkillSpec>,
-    pub install_dry_run: bool,
-    pub verification_passed: bool,
-    pub forbidden_terms_absent: bool,
-    #[serde(with = "time::serde::rfc3339")]
-    pub generated_at: OffsetDateTime,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[allow(clippy::struct_excessive_bools)]
-pub struct AntigravityPluginBundle {
-    pub component: String,
-    pub root: PathRef,
-    pub manifest_path: PathRef,
-    pub official_schema_detected: bool,
-    pub installable: bool,
-    pub raw_agy_mcp_exposed: bool,
-    pub verification_passed: bool,
-    pub files: Vec<PathRef>,
-    #[serde(with = "time::serde::rfc3339")]
-    pub generated_at: OffsetDateTime,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
 pub enum AntigravityExecutionGateDecisionKind {
     AllowDryRun,
     AllowRealRun,
@@ -767,10 +726,11 @@ pub struct AntigravityDoctorStatus {
     pub provider_state: AntigravityProviderState,
     pub binary_resolution_status: AntigravityBinaryResolutionStatus,
     pub contract_available: bool,
-    pub skills_verified: bool,
-    pub plugin_verified: bool,
+    pub official_plugin_ready: bool,
+    pub mcp_registered: bool,
     pub raw_agy_mcp_exposed: bool,
     pub governed_mcp_tools_only: bool,
+    pub ready: bool,
     pub message: String,
     #[serde(with = "time::serde::rfc3339")]
     pub generated_at: OffsetDateTime,

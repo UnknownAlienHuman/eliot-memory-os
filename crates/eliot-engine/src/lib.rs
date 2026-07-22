@@ -52,9 +52,8 @@ pub use antigravity::{
     AntigravityEnablementService, AntigravityEnvPolicyService, AntigravityExecutionGate,
     AntigravityGuiProcessProbeService, AntigravityLiveSmokeService, AntigravityMcpBoundaryService,
     AntigravityMcpConfigService, AntigravityOfficialCliInstallerService,
-    AntigravityOfficialPluginService, AntigravityPluginBundleService,
-    AntigravityRealExecutionDoctor, AntigravityRollbackService, AntigravityRunner,
-    AntigravitySafetyPolicy, AntigravitySkillBundleService, AntigravityTelemetryService,
+    AntigravityOfficialPluginService, AntigravityRealExecutionDoctor, AntigravityRollbackService,
+    AntigravityRunner, AntigravitySafetyPolicy, AntigravityTelemetryService,
     AntigravityTextOutputNormalizer, AntigravityVersionGateService, AntigravityVisibilityService,
     AntigravityWindowsInstallDiscoveryService, antigravity_real_report, antigravity_report,
     antigravity_review_request,
@@ -95,7 +94,7 @@ pub use delegation_calibration::{
     DelegationCounterfactualService, DelegationOutcomeEvidence, DelegationOutcomeLabelService,
     DelegationPolicyCandidateService, DelegationPromotionGateService,
     DelegationShadowEvaluationService, IndependentOutcomeEvidenceService,
-    L1cCorpusEligibilityService, ProviderReviewPreRegistrationService,
+    PreregisteredCorpusEligibilityService, ProviderReviewPreRegistrationService,
     ProviderUtilityAssessmentService,
 };
 pub use error::EngineError;
@@ -136,12 +135,12 @@ pub use metrics::{
     RuntimeDashboardService, SloService, TelemetryEventService,
 };
 pub use patch::{PatchMemoryWriter, PatchRunner, PatchRunnerInput, VerifierHarness};
-pub use plugin::{EliotHookService, HookProcessingResult, PluginVerifier, plugin_report_markdown};
+pub use plugin::{EliotHookService, HookProcessingResult};
 pub use provider_invocation::{
     ExternalResultCompletenessService, ProviderCompletenessInput, ProviderInvocationJournal,
     ProviderInvocationLifecycleService, ProviderOutputCapture, ProviderOutputSpool,
     ProviderReadinessInput, ProviderReconciliationInput, ProviderReconciliationResult,
-    ProviderReconciliationService, ProviderRouteReadinessService, l1c_timeout_profile,
+    ProviderReconciliationService, ProviderRouteReadinessService, antigravity_plan_timeout_profile,
 };
 pub use read::{
     GraphHealthService, ReadService, filter_exact_l2_response, filter_required_exact_l2_response,

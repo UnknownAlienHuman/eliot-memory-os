@@ -1294,6 +1294,20 @@ mod tests {
         assert!(!window.accept(nonce), "the same nonce must not be reusable");
     }
 
+    #[test]
+    fn a_new_auth_generation_starts_with_an_empty_replay_window() {
+        let nonce = Uuid::new_v4().to_string();
+        let mut previous_generation = ReplayWindow::with_capacity(8);
+
+        assert!(previous_generation.accept(nonce.clone()));
+        assert!(!previous_generation.accept(nonce.clone()));
+
+        // Rotating authentication creates a new IpcAuthenticationState and,
+        // therefore, a new generation-local replay window.
+        let mut rotated_generation = ReplayWindow::with_capacity(8);
+        assert!(rotated_generation.accept(nonce));
+    }
+
     /// The window used to refuse every client once it filled up, so a runtime
     /// that had seen `MAX_REPLAY_NONCES` handshakes could never be connected to
     /// again until its auth generation rotated.

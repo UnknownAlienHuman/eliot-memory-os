@@ -6,8 +6,9 @@ ELIOT is a governed memory, understanding, and learning system for AI agents.
 
 The repository contains the native Windows Rust Governor, canonical memory and
 governance schemas, host integrations, deterministic tests, migrations, and the
-operator application. Current architecture and engineering contracts live under
-`docs/architecture`.
+operator application. [`docs/ARCHITECTURE_CONTRACT.md`](docs/ARCHITECTURE_CONTRACT.md)
+separates current implementation truth from the canonical vision and future
+design specifications.
 
 ## Development
 
@@ -19,9 +20,10 @@ cargo check --workspace --all-targets
 cargo test --workspace
 ```
 
-`just quick` provides the bounded metadata, formatting, and check loop. Runtime
-state belongs under `.eliot-governor` or the configured per-user data root and is
-never source-controlled.
+`just quick` provides the bounded metadata, formatting, and check loop. Cargo
+output is redirected to `%LOCALAPPDATA%\Eliot\build\eliot-memory-os-target` by
+the developer-local Cargo configuration. Runtime state belongs under the
+configured per-user ELIOT data root and is never source-controlled.
 
 The installed Windows credential boundary and its verification procedure are
 documented in [`docs/operations/SURREALDB_CREDENTIAL_AUTHORITY.md`](docs/operations/SURREALDB_CREDENTIAL_AUTHORITY.md).

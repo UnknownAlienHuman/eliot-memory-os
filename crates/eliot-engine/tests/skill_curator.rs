@@ -335,7 +335,10 @@ fn candidate_patch_not_in_normal_l3() {
 
 #[test]
 fn doctor_reports_open_curation_proposals() -> TestResult {
-    let root = std::env::temp_dir().join(format!("eliot-phase-i2-doctor-{}", std::process::id()));
+    let root = std::env::temp_dir().join(format!(
+        "eliot-skill-curation-doctor-{}",
+        std::process::id()
+    ));
     let _ = fs::remove_dir_all(&root);
     fs::create_dir_all(root.join("reports/skill-curation-proposals"))?;
     fs::write(
@@ -363,18 +366,18 @@ fn incident_lockdown_blocks_skill_patch_apply() {
 }
 
 #[test]
-fn phase_b_c_d_e_f0_f1_f2_f3_g0_g1_h0_i0_i1_non_regression() {
+fn accumulated_capabilities_non_regression() {
     let project_id = ProjectId::new_v7();
     let task_id = eliot_types::TaskId::new_v7();
-    let active = active_skill("phase i2 skill lifecycle");
+    let active = active_skill("skill curation skill lifecycle");
     let archived = skill_with_state("archived", SkillLifecycleState::Archived);
     let packet = SkillCuratorService::procedural_packet(
         project_id,
         task_id,
         &[active, archived],
         &eliot_engine::SkillActivationContext {
-            goal: "phase i2 skill lifecycle".to_owned(),
-            evidence_refs: vec!["runbook:phase-i2".to_owned()],
+            goal: "skill curation skill lifecycle".to_owned(),
+            evidence_refs: vec!["runbook:skill-curation".to_owned()],
             available_input_sources: vec![SkillInputSource::UserPrompt],
             available_input_names: vec!["task_goal".to_owned()],
             available_capabilities: vec!["rust-toolchain".to_owned()],
@@ -458,7 +461,7 @@ fn proposal_for_action(action: SkillCurationAction) -> SkillCurationProposal {
                         proposal.action = action;
                         proposal
                     });
-            proposal.evidence_refs = vec!["evidence:phase-i2".to_owned()];
+            proposal.evidence_refs = vec!["evidence:skill-curation".to_owned()];
             proposal
         })
 }
@@ -485,10 +488,10 @@ fn skill_with_state(name: &str, state: SkillLifecycleState) -> SkillCardV2 {
     SkillCardV2 {
         skill_id: SkillId::new_v7(),
         name: name.to_owned(),
-        purpose: "phase i2 skill lifecycle curation".to_owned(),
+        purpose: "skill curation skill lifecycle curation".to_owned(),
         level: SkillLevel::Procedure,
         lifecycle_state: state,
-        applies_when: vec![scope_rule("phase i2 skill lifecycle")],
+        applies_when: vec![scope_rule("skill curation skill lifecycle")],
         does_not_apply_when: vec![scope_rule("unrelated task")],
         required_inputs: vec![SkillInputRequirement {
             name: "task_goal".to_owned(),
@@ -526,13 +529,13 @@ fn skill_with_state(name: &str, state: SkillLifecycleState) -> SkillCardV2 {
             negative_memory_refs: Vec::new(),
         }],
         rollback_or_recovery: Some("restore previous SkillCardV2".to_owned()),
-        source_trace_refs: vec!["runbook:phase-i2".to_owned()],
-        replay_result_refs: vec!["replay:phase-i2".to_owned()],
+        source_trace_refs: vec!["runbook:skill-curation".to_owned()],
+        replay_result_refs: vec!["replay:skill-curation".to_owned()],
         success_count: 3,
         failure_count: 0,
         last_verified_at: Some(now),
         version: "0.1.0".to_owned(),
-        owner: "phase-i2-test".to_owned(),
+        owner: "skill-curation-test".to_owned(),
         created_at: now,
         updated_at: now,
     }
@@ -570,8 +573,10 @@ struct Harness {
 
 impl Harness {
     async fn new(name: &str) -> TestResult<Self> {
-        let root =
-            std::env::temp_dir().join(format!("eliot-phase-i2-{name}-{}", std::process::id()));
+        let root = std::env::temp_dir().join(format!(
+            "eliot-skill-curation-{name}-{}",
+            std::process::id()
+        ));
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(&root)?;
         let mut config = GovernorConfig::default();

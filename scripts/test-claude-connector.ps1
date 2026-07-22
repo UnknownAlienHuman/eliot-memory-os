@@ -7,81 +7,60 @@ $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 
 $repoRoot = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
-$governorExe = Join-Path $repoRoot 'target\release\eliot-governor.exe'
 $referenceClient = Join-Path $PSScriptRoot 'eliot-mcp-reference-client.ps1'
-$reportRoot = Join-Path $repoRoot '.eliot-governor\reports\claude-connector'
+$packageRoot = if ($env:ELIOT_PACKAGE_ROOT) {
+    [System.IO.Path]::GetFullPath($env:ELIOT_PACKAGE_ROOT)
+} else {
+    Join-Path $env:LOCALAPPDATA 'Eliot\packages'
+}
+$reportRoot = Join-Path $env:LOCALAPPDATA 'Eliot\reports\claude-connector'
 $reportPath = Join-Path $reportRoot 'latest.json'
 $steps = [System.Collections.Generic.List[object]]::new()
 
 function Assert-True {
     param(
-        [Parameter(Mandatory = $true)]
-        [bool]$Condition,
-
-        [Parameter(Mandatory = $true)]
-        [string]$Message
+        [Parameter(Mandatory = $true)][bool]$Condition,
+        [Parameter(Mandatory = $true)][string]$Message
     )
-
-    if (-not $Condition) {
-        throw $Message
-    }
+    if (-not $Condition) { throw $Message }
 }
 
 function Add-PassedStep {
     param(
-        [Parameter(Mandatory = $true)]
-        [string]$Name,
-
+        [Parameter(Mandatory = $true)][string]$Name,
         [hashtable]$Evidence = @{}
     )
-
-    $steps.Add([ordered]@{
-        name = $Name
-        status = 'passed'
-        evidence = $Evidence
-    })
+    $steps.Add([ordered]@{ name = $Name; status = 'passed'; evidence = $Evidence })
 }
 
 function Invoke-NativeChecked {
     param(
-        [Parameter(Mandatory = $true)]
-        [string]$FilePath,
-
-        [Parameter(Mandatory = $true)]
-        [string[]]$ArgumentList,
-
-        [Parameter(Mandatory = $true)]
-        [string]$Description
+        [Parameter(Mandatory = $true)][string]$FilePath,
+        [Parameter(Mandatory = $true)][string[]]$ArgumentList,
+        [Parameter(Mandatory = $true)][string]$Description
     )
-
     $output = @(& $FilePath @ArgumentList 2>&1)
-    $exitCode = $LASTEXITCODE
-    if ($exitCode -ne 0) {
-        throw "$Description failed with exit code ${exitCode}: $($output -join [Environment]::NewLine)"
+    if ($LASTEXITCODE -ne 0) {
+        throw "$Description failed with exit code ${LASTEXITCODE}: $($output -join [Environment]::NewLine)"
     }
     return ($output -join [Environment]::NewLine)
 }
 
 function Assert-CompactClaudeSurface {
     param(
-        [Parameter(Mandatory = $true)]
-        [string]$HostSurface,
-
-        [Parameter(Mandatory = $true)]
-        [string]$InstalledGovernor
+        [Parameter(Mandatory = $true)][string]$HostSurface,
+        [Parameter(Mandatory = $true)][string]$Governor
     )
-
-    $projectIdentityArguments = @{ project_key = $repoRoot } | ConvertTo-Json -Compress
+    $arguments = @{ project_key = 'eliot-memory-os' } | ConvertTo-Json -Compress
     $json = & $referenceClient `
-        -EliotExe $InstalledGovernor `
+        -EliotExe $Governor `
         -HostSurface $HostSurface `
         -Instance default `
         -ToolName eliot_project_identity `
-        -ToolArgumentsJson $projectIdentityArguments `
+        -ToolArgumentsJson $arguments `
         -ClientName "eliot-${HostSurface}-connector-test" `
         -TimeoutSeconds 60
     $result = $json | ConvertFrom-Json -Depth 40
-
     $expectedTools = @(
         'eliot_task_state',
         'eliot_agent_candidate_submit',
@@ -95,140 +74,117 @@ function Assert-CompactClaudeSurface {
         'eliot_agent_delegate',
         'eliot_agent_result',
         'eliot_agent_result_disposition'
-    )
+    ) | Sort-Object
     $actualTools = @($result.tool_names | Sort-Object)
-    $sortedExpectedTools = @($expectedTools | Sort-Object)
-
     Assert-True ($result.status -eq 'passed') "$HostSurface MCP reference client did not pass"
-    Assert-True ($result.profile -eq 'claude_desktop') "$HostSurface resolved the wrong access profile"
-    Assert-True ($actualTools.Count -eq 12) "$HostSurface exposed $($actualTools.Count) tools instead of 12"
-    Assert-True (@(Compare-Object $actualTools $sortedExpectedTools).Count -eq 0) "$HostSurface compact tool set drifted"
-    Assert-True (@($result.prompt_names).Count -eq 4) "$HostSurface exposed $(@($result.prompt_names).Count) prompts instead of 4"
-    Assert-True ($null -eq $result.tool_call_error) "$HostSurface project identity read returned an MCP error"
-    Assert-True ($null -ne $result.tool_call) "$HostSurface project identity read returned no structured content"
-
+    Assert-True ($result.profile -eq 'claude_governed') "$HostSurface resolved the wrong compact access profile"
+    Assert-True (@(Compare-Object $actualTools $expectedTools).Count -eq 0) "$HostSurface compact tool set drifted"
+    Assert-True (@($result.prompt_names).Count -eq 4) "$HostSurface must expose four prompts"
+    Assert-True ($null -eq $result.tool_call_error) "$HostSurface project identity returned an MCP error"
     Add-PassedStep "${HostSurface}_mcp_surface" @{
-        installed_governor = $InstalledGovernor
+        governor = $Governor
         tools = $actualTools.Count
         prompts = @($result.prompt_names).Count
         profile = $result.profile
-        agent_session_id = $result.agent_session.agent_session_id
     }
 }
 
 Push-Location $repoRoot
 try {
+    $metadata = (Invoke-NativeChecked 'cargo' @('metadata', '--format-version', '1', '--no-deps') 'Cargo metadata') | ConvertFrom-Json
+    $governorExe = Join-Path ([string]$metadata.target_directory) 'release\eliot-governor.exe'
     Assert-True (Test-Path -LiteralPath $governorExe -PathType Leaf) "release Governor binary is missing: $governorExe"
     Assert-True (Test-Path -LiteralPath $referenceClient -PathType Leaf) "reference client is missing: $referenceClient"
 
-    $claudeDoctorText = Invoke-NativeChecked $governorExe @('host', 'doctor', '--host', 'claude') 'Claude Code doctor'
-    $claudeDoctor = $claudeDoctorText | ConvertFrom-Json -Depth 40
-    Assert-True ([bool]$claudeDoctor.ready) 'Claude Code doctor is not ready'
-    Assert-True ([bool]$claudeDoctor.skill_pack.valid) 'Claude Code skill pack is invalid'
-    Assert-True (@($claudeDoctor.skill_pack.entries).Count -eq 4) 'Claude Code does not expose exactly four ELIOT skills'
-    Assert-True ([bool]$claudeDoctor.bundle.config_valid) 'Claude Code MCP config is invalid'
-    Assert-True ([bool]$claudeDoctor.bundle.lifecycle_valid) 'Claude Code hooks config is invalid'
-    Add-PassedStep 'claude_code_doctor' @{
-        version = $claudeDoctor.profile.version
-        skills = @($claudeDoctor.skill_pack.entries).Count
-        pack_hash = $claudeDoctor.skill_pack.pack_hash
+    $family = (Invoke-NativeChecked $governorExe @('host', 'doctor', '--host', 'claude') 'Claude family doctor') | ConvertFrom-Json -Depth 50
+    Assert-True ($family.status -eq 'ready') 'Claude family doctor is not ready'
+    Assert-True ([int]$family.active_surface_count -eq 1) 'Claude must expose exactly one active ELIOT surface'
+    Assert-True ($family.selected_surface -eq 'claude_code_plugin') 'Claude Code must be the selected surface for this smoke'
+    Assert-True ([bool]$family.surfaces.claude_code_plugin.active) 'Claude Code plugin is not active'
+    Assert-True (-not [bool]$family.surfaces.claude_desktop_mcpb.active) 'Claude Desktop MCPB must be inactive in Code mode'
+    Assert-True (@($family.conflicts).Count -eq 0) 'Claude family doctor reported an integration conflict'
+    Add-PassedStep 'claude_family_single_surface' @{
+        selected_surface = $family.selected_surface
+        active_surface_count = $family.active_surface_count
+        claude_version = $family.detected_claude_code_version
     }
 
-    $desktopDoctorText = Invoke-NativeChecked $governorExe @('host', 'doctor', '--host', 'claude-desktop') 'Claude Desktop doctor'
-    $desktopDoctor = $desktopDoctorText | ConvertFrom-Json -Depth 40
-    Assert-True ([bool]$desktopDoctor.ready) 'Claude Desktop doctor is not ready'
-    Assert-True ([bool]$desktopDoctor.install_receipt_exists) 'Claude Desktop install receipt is missing'
-    Assert-True (-not [bool]$desktopDoctor.manual_claude_config_edit) 'Claude Desktop was installed by a manual config edit'
-    Assert-True (-not [bool]$desktopDoctor.provider_auth_read_or_modified) 'Claude Desktop install touched provider authentication'
-    Add-PassedStep 'claude_desktop_doctor' @{
-        extension_id = $desktopDoctor.extension.extension_id
-        version = $desktopDoctor.extension.version
-        registry_hash = $desktopDoctor.extension.registry_hash
-    }
+    $claudeExe = [string]$family.detected_claude_code_executable
+    Assert-True (Test-Path -LiteralPath $claudeExe -PathType Leaf) "Claude executable is missing: $claudeExe"
+    $inventory = (Invoke-NativeChecked $claudeExe @('plugin', 'list', '--json') 'Claude official plugin inventory') | ConvertFrom-Json -Depth 30
+    $eliotEntries = @($inventory | Where-Object { $_.id -like 'eliot@*' })
+    Assert-True ($eliotEntries.Count -eq 1) "Claude inventory contains $($eliotEntries.Count) ELIOT plugins instead of one"
+    $plugin = $eliotEntries[0]
+    Assert-True ($plugin.id -eq 'eliot@eliot-local') "unexpected Claude plugin id: $($plugin.id)"
+    Assert-True ([bool]$plugin.enabled) 'official Claude plugin is disabled'
+    $pluginRoot = [string]$plugin.installPath
+    Assert-True (Test-Path -LiteralPath $pluginRoot -PathType Container) "installed plugin root is missing: $pluginRoot"
+    Invoke-NativeChecked $claudeExe @('plugin', 'validate', '--strict', $pluginRoot) 'Claude strict plugin validation' | Out-Null
 
-    Invoke-NativeChecked $governorExe @('host', 'skill-lint') 'Claude skill lint' | Out-Null
-    Add-PassedStep 'claude_skill_lint'
+    $skills = @(Get-ChildItem -LiteralPath (Join-Path $pluginRoot 'skills') -Directory)
+    $hooks = Get-Content -LiteralPath (Join-Path $pluginRoot 'hooks\hooks.json') -Raw | ConvertFrom-Json -Depth 30
+    $hookEvents = @($hooks.hooks.PSObject.Properties.Name)
+    $mcp = Get-Content -LiteralPath (Join-Path $pluginRoot '.mcp.json') -Raw | ConvertFrom-Json -Depth 20
+    Assert-True ($skills.Count -eq 4) "installed plugin contains $($skills.Count) skills instead of four"
+    Assert-True ($hookEvents.Count -eq 8) "installed plugin contains $($hookEvents.Count) hook events instead of eight"
+    Assert-True (@($mcp.mcpServers.PSObject.Properties.Name).Count -eq 1) 'installed plugin must declare exactly one MCP server'
+    Assert-True ($null -ne $mcp.mcpServers.eliot) 'installed plugin MCP server must be named eliot'
 
-    $claudeExe = [string]$claudeDoctor.profile.executable_path
-    Assert-True (Test-Path -LiteralPath $claudeExe -PathType Leaf) "Claude Code executable is missing: $claudeExe"
-    $claudeVersion = Invoke-NativeChecked $claudeExe @('--version') 'Claude Code version probe'
-    Assert-True ($claudeVersion -match '^2\.1\.207\b') "unexpected Claude Code version: $claudeVersion"
-
-    $claudePluginRoot = Join-Path ([Environment]::GetFolderPath('UserProfile')) '.claude\skills\eliot'
-    $claudeInstalledGovernor = Join-Path $claudePluginRoot 'bin\eliot-governor.exe'
-    Assert-True (Test-Path -LiteralPath $claudeInstalledGovernor -PathType Leaf) "installed Claude Code Governor is missing: $claudeInstalledGovernor"
-    Invoke-NativeChecked $claudeExe @('plugin', 'validate', '--strict', $claudePluginRoot) 'Claude Code strict plugin validation' | Out-Null
-    $mcpList = Invoke-NativeChecked $claudeExe @('mcp', 'list') 'Claude Code MCP health probe'
-    Assert-True ($mcpList -match 'plugin:eliot:eliot:.*Connected') 'Claude Code ELIOT MCP server is not connected'
-    Add-PassedStep 'claude_code_plugin_and_mcp' @{
-        version = $claudeVersion.Trim()
-        plugin_root = $claudePluginRoot
+    $mcpList = Invoke-NativeChecked $claudeExe @('mcp', 'list') 'Claude MCP health probe'
+    Assert-True ($mcpList -match 'plugin:eliot:eliot:.*Connected') 'Claude ELIOT MCP server is not connected'
+    Add-PassedStep 'claude_official_plugin' @{
+        id = $plugin.id
+        version = $plugin.version
+        install_path = $pluginRoot
+        skills = $skills.Count
+        hooks = $hookEvents.Count
         mcp_connected = $true
     }
 
-    $desktopInstalledGovernor = Join-Path ([string]$desktopDoctor.extension.extension_path) 'server\eliot-governor.exe'
-    Assert-True (Test-Path -LiteralPath $desktopInstalledGovernor -PathType Leaf) "installed Claude Desktop Governor is missing: $desktopInstalledGovernor"
+    $installedGovernor = Join-Path $pluginRoot 'bin\eliot-governor.exe'
+    Assert-True (Test-Path -LiteralPath $installedGovernor -PathType Leaf) "installed Governor is missing: $installedGovernor"
     $releaseSha256 = (Get-FileHash -LiteralPath $governorExe -Algorithm SHA256).Hash
-    $claudeSha256 = (Get-FileHash -LiteralPath $claudeInstalledGovernor -Algorithm SHA256).Hash
-    $desktopSha256 = (Get-FileHash -LiteralPath $desktopInstalledGovernor -Algorithm SHA256).Hash
-    Assert-True ($releaseSha256 -eq $claudeSha256) 'Claude Code installed Governor differs from the release binary'
-    Assert-True ($releaseSha256 -eq $desktopSha256) 'Claude Desktop installed Governor differs from the release binary'
+    $installedSha256 = (Get-FileHash -LiteralPath $installedGovernor -Algorithm SHA256).Hash
+    Assert-True ($releaseSha256 -eq $installedSha256) 'installed Claude Governor differs from the canonical release binary'
 
-    $packagePath = [string]$desktopDoctor.package_path
-    Assert-True (Test-Path -LiteralPath $packagePath -PathType Leaf) "Claude Desktop MCPB package is missing: $packagePath"
-    $packageSha256 = (Get-FileHash -LiteralPath $packagePath -Algorithm SHA256).Hash.ToLowerInvariant()
-    Assert-True ($packageSha256 -eq ([string]$desktopDoctor.extension.registry_hash).ToLowerInvariant()) 'Claude Desktop registry hash differs from the current MCPB package'
-    Add-PassedStep 'installed_binary_and_package_parity' @{
+    $packageReportPath = Join-Path $packageRoot 'claude\compatibility-report.json'
+    Assert-True (Test-Path -LiteralPath $packageReportPath -PathType Leaf) "Claude Desktop package report is missing: $packageReportPath"
+    $packageReport = Get-Content -LiteralPath $packageReportPath -Raw | ConvertFrom-Json -Depth 20
+    $desktopGovernor = Join-Path $packageRoot 'claude-desktop-mcpb\eliot-governor\server\eliot-governor.exe'
+    $desktopManifest = Join-Path $packageRoot 'claude-desktop-mcpb\eliot-governor\manifest.json'
+    Assert-True (Test-Path -LiteralPath $desktopGovernor -PathType Leaf) 'staged Desktop Governor is missing'
+    Assert-True (Test-Path -LiteralPath $desktopManifest -PathType Leaf) 'generated Desktop manifest is missing'
+    $desktopSha256 = (Get-FileHash -LiteralPath $desktopGovernor -Algorithm SHA256).Hash
+    Assert-True ($releaseSha256 -eq $desktopSha256) 'staged Desktop Governor differs from the canonical release binary'
+    $generatedManifest = Get-Content -LiteralPath $desktopManifest -Raw | ConvertFrom-Json -Depth 50
+    Assert-True (@($generatedManifest.tools).Count -eq 12) 'generated MCPB manifest must contain twelve tools'
+    Assert-True (@($generatedManifest.prompts).Count -eq 4) 'generated MCPB manifest must contain four prompts'
+    Assert-True ([bool]$generatedManifest.tools_generated) 'MCPB tools were not marked generated'
+    Assert-True ([bool]$generatedManifest.prompts_generated) 'MCPB prompts were not marked generated'
+    Add-PassedStep 'binary_and_package_parity' @{
         governor_sha256 = $releaseSha256
-        package_sha256 = $packageSha256.ToUpperInvariant()
+        package_sha256 = $packageReport.package_sha256
+        mcpb_cli_version = $packageReport.mcpb_cli_version
+        tools = @($generatedManifest.tools).Count
+        prompts = @($generatedManifest.prompts).Count
     }
 
-    Assert-CompactClaudeSurface -HostSurface 'claude' -InstalledGovernor $claudeInstalledGovernor
-    Assert-CompactClaudeSurface -HostSurface 'claude-desktop' -InstalledGovernor $desktopInstalledGovernor
+    Assert-CompactClaudeSurface -HostSurface 'claude' -Governor $installedGovernor
+    Assert-CompactClaudeSurface -HostSurface 'claude-desktop' -Governor $desktopGovernor
 
     if (-not $SkipCargoTests) {
-        Invoke-NativeChecked 'cargo' @('test', '-p', 'eliot-app', '--bin', 'eliot-governor', 'claude_desktop_', '--', '--nocapture', '--test-threads=1') 'Claude compact-profile tests' | Out-Null
-        Add-PassedStep 'claude_compact_profile_tests' @{ command = 'cargo test -p eliot-app --bin eliot-governor claude_desktop_ -- --nocapture --test-threads=1' }
+        Invoke-NativeChecked 'cargo' @('test', '-p', 'eliot-app', '--test', 'plugin_hooks', '--', '--nocapture', '--test-threads=1') 'Claude hook tests' | Out-Null
+        Add-PassedStep 'claude_hook_tests' @{ command = 'cargo test -p eliot-app --test plugin_hooks' }
 
-        $previousGovernorConfig = $env:ELIOT_GOVERNOR_CONFIG
-        $previousPluginRoot = $env:ELIOT_GOVERNOR_PLUGIN_ROOT
-        $env:ELIOT_GOVERNOR_CONFIG = Join-Path $repoRoot '.eliot-governor\config\governor.toml'
-        $env:ELIOT_GOVERNOR_PLUGIN_ROOT = Join-Path $repoRoot 'plugin\eliot-governor'
-        try {
-            Invoke-NativeChecked 'cargo' @('test', '-p', 'eliot-app', '--test', 'plugin_hooks', '--', '--nocapture', '--test-threads=1') 'Claude plugin hook tests' | Out-Null
-        }
-        finally {
-            if ($null -eq $previousGovernorConfig) {
-                Remove-Item Env:ELIOT_GOVERNOR_CONFIG -ErrorAction SilentlyContinue
-            } else {
-                $env:ELIOT_GOVERNOR_CONFIG = $previousGovernorConfig
-            }
-            if ($null -eq $previousPluginRoot) {
-                Remove-Item Env:ELIOT_GOVERNOR_PLUGIN_ROOT -ErrorAction SilentlyContinue
-            } else {
-                $env:ELIOT_GOVERNOR_PLUGIN_ROOT = $previousPluginRoot
-            }
-        }
-        Add-PassedStep 'claude_plugin_hook_tests' @{ command = 'cargo test -p eliot-app --test plugin_hooks -- --nocapture --test-threads=1' }
-
-        $testPasswordRoot = Join-Path $env:LOCALAPPDATA 'Eliot\tests\claude-connector'
-        New-Item -ItemType Directory -Path $testPasswordRoot -Force | Out-Null
-        $env:ELIOT_TEST_SURREAL_PASSWORD_FILE = Join-Path $testPasswordRoot 'surreal-password.txt'
-        try {
-            Invoke-NativeChecked 'cargo' @('test', '-p', 'eliot-app', '--test', 'multi_agent_access', 'facade_reconnects_after_rotation_and_replay_does_not_duplicate_memory', '--', '--exact', '--nocapture', '--test-threads=1') 'Claude facade reconnect test' | Out-Null
-        }
-        finally {
-            Remove-Item Env:ELIOT_TEST_SURREAL_PASSWORD_FILE -ErrorAction SilentlyContinue
-        }
-        Add-PassedStep 'claude_facade_reconnect_test' @{ command = 'cargo test -p eliot-app --test multi_agent_access facade_reconnects_after_rotation_and_replay_does_not_duplicate_memory -- --exact --nocapture --test-threads=1' }
+        Invoke-NativeChecked 'cargo' @('test', '-p', 'eliot-app', 'claude_', '--', '--nocapture', '--test-threads=1') 'Claude integration unit tests' | Out-Null
+        Add-PassedStep 'claude_integration_tests' @{ command = 'cargo test -p eliot-app claude_' }
     }
 
     New-Item -ItemType Directory -Path $reportRoot -Force | Out-Null
     $report = [ordered]@{
-        schema_version = 'eliot-claude-connector-test-v1'
+        schema_version = 'eliot-claude-connector-test-v2'
         status = 'passed'
-        scope = @('claude-code-connector', 'claude-desktop-mcpb')
-        excluded = @('workspace-check', 'workspace-clippy', 'workspace-tests', 'other-phase-tests')
+        selected_surface = 'claude_code_plugin'
         cargo_tests_skipped = [bool]$SkipCargoTests
         steps = $steps
         generated_at = [DateTimeOffset]::UtcNow.ToString('O')

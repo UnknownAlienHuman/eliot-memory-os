@@ -4,6 +4,9 @@
 //! against. These share the report layout and the family parsing, so a change
 //! to how an eval result is recorded lands in one file.
 
+// This child module implements part of the parent command surface and shares
+// its private command/report vocabulary by design.
+#[allow(clippy::wildcard_imports)]
 use super::*;
 
 pub fn run_eval_case_create(config_path: &Path, family: &str, name: &str) -> Result<()> {
@@ -15,7 +18,7 @@ pub fn run_eval_case_create(config_path: &Path, family: &str, name: &str) -> Res
     });
     let case = EvalCaseService::create(EvalCaseInput {
         project_id: project_id_from_label("eliot-governor"),
-        task_id: Some(task_id_from_label("phase-k0-cli")),
+        task_id: Some(task_id_from_label("core-eval-cli")),
         family: parse_eval_family(family)?,
         name: name.to_owned(),
     })?;
@@ -53,11 +56,11 @@ pub fn run_eval_suite_create(config_path: &Path, name: &str) -> Result<()> {
     let suite = EvalSuiteService::create(EvalSuiteInput {
         project_id: project_id_from_label("eliot-governor"),
         name: name.to_owned(),
-        purpose: "K0 deterministic no-mutation eval suite".to_owned(),
+        purpose: "Deterministic no-mutation eval suite".to_owned(),
         cases: cases.iter().map(|case| case.eval_case_id).collect(),
         fixed: false,
         holdout: true,
-        created_from_refs: vec!["phase-k0:cli".to_owned()],
+        created_from_refs: vec!["eval:cli".to_owned()],
     });
     let report = EvalSuitesReport {
         component: "eval_suites".to_owned(),
@@ -78,7 +81,7 @@ pub fn run_eval_suite_add(config_path: &Path, suite: &str, case: &str) -> Result
         && suite != report.latest.name
         && suite != report.latest.eval_suite_id.to_string()
     {
-        bail!("only latest eval suite or its name/id is available in K0 CLI");
+        bail!("only the latest eval suite or its name/id is available through this CLI");
     }
     let cases = ensure_eval_cases(&root)?;
     let eval_case = cases
@@ -105,7 +108,7 @@ pub fn run_eval_suite_freeze(config_path: &Path, suite: &str) -> Result<()> {
         && suite != report.latest.name
         && suite != report.latest.eval_suite_id.to_string()
     {
-        bail!("only latest eval suite or its name/id is available in K0 CLI");
+        bail!("only the latest eval suite or its name/id is available through this CLI");
     }
     EvalSuiteService::freeze(&mut report.latest);
     report.suites.push(report.latest.clone());
@@ -122,7 +125,7 @@ pub fn run_eval_manifest(config_path: &Path, suite: &str) -> Result<()> {
         && suite != report.latest.name
         && suite != report.latest.eval_suite_id.to_string()
     {
-        bail!("only latest eval suite or its name/id is available in K0 CLI");
+        bail!("only the latest eval suite or its name/id is available through this CLI");
     }
     let cases = ensure_eval_cases(&root)?;
     let manifest = EvalDatasetManifestService::manifest(&report.latest, &cases);
@@ -134,10 +137,10 @@ pub fn run_eval_manifest(config_path: &Path, suite: &str) -> Result<()> {
 
 pub fn run_eval_run(config_path: &Path, suite: &str, profile: &str) -> Result<()> {
     if normalized_cli_value(profile) != "deterministicnomutation" {
-        bail!("K0 supports only deterministic-no-mutation eval runs");
+        bail!("the core eval runner supports only deterministic-no-mutation runs");
     }
     let root = runtime_root(config_path);
-    let artifacts = ensure_k0_smoke_artifacts(&root, suite)?;
+    let artifacts = ensure_core_smoke_artifacts(&root, suite)?;
     write_json(&artifacts.run)
 }
 
@@ -146,7 +149,7 @@ pub fn run_eval_verdict(config_path: &Path, run: &str) -> Result<()> {
     let run_report = read_eval_runs_report(&root)
         .context("no latest eval run found; run eval run or eval smoke first")?;
     if run != "latest" && run != run_report.run.eval_run_id.to_string() {
-        bail!("only latest eval run or its id is available in K0 CLI");
+        bail!("only the latest eval run or its id is available through this CLI");
     }
     let verdict = EvalVerdictService::verdict(&run_report.run);
     let report = EvalVerdictsReport {
@@ -163,7 +166,7 @@ pub fn run_eval_failures(config_path: &Path, run: &str) -> Result<()> {
     let run_report = read_eval_runs_report(&root)
         .context("no latest eval run found; run eval run or eval smoke first")?;
     if run != "latest" && run != run_report.run.eval_run_id.to_string() {
-        bail!("only latest eval run or its id is available in K0 CLI");
+        bail!("only the latest eval run or its id is available through this CLI");
     }
     let mut clusters = EvalVerdictService::failure_clusters(&run_report.run);
     if clusters.is_empty() {
@@ -188,7 +191,7 @@ pub fn run_eval_report(config_path: &Path) -> Result<()> {
 
 pub fn run_eval_smoke(config_path: &Path, suite: &str) -> Result<()> {
     let root = runtime_root(config_path);
-    let artifacts = ensure_k0_smoke_artifacts(&root, suite)?;
+    let artifacts = ensure_core_smoke_artifacts(&root, suite)?;
     let report = serde_json::json!({
         "component": "eval_smoke",
         "suite": artifacts.suite,
@@ -212,7 +215,7 @@ pub fn run_eval_smoke(config_path: &Path, suite: &str) -> Result<()> {
 
 pub fn run_eval_coverage(config_path: &Path, suite: &str) -> Result<()> {
     let root = runtime_root(config_path);
-    let artifacts = ensure_k0_smoke_artifacts(&root, suite)?;
+    let artifacts = ensure_core_smoke_artifacts(&root, suite)?;
     let report = eval_coverage_report(&artifacts);
     write_eval_report(&root, "eval-coverage", "Eval Coverage", &report)?;
     write_json(&report.coverage)
@@ -220,7 +223,7 @@ pub fn run_eval_coverage(config_path: &Path, suite: &str) -> Result<()> {
 
 pub fn run_eval_baseline_create(config_path: &Path, suite: &str, run: &str) -> Result<()> {
     let root = runtime_root(config_path);
-    let artifacts = ensure_k0_smoke_artifacts(&root, suite)?;
+    let artifacts = ensure_core_smoke_artifacts(&root, suite)?;
     ensure_eval_run_ref(&artifacts.run, run)?;
     let git_commit = git_head_blocking(&repo_root()).unwrap_or_else(|_| "unknown".to_owned());
     let baseline = EvalBaselineService::create(
@@ -238,7 +241,7 @@ pub fn run_eval_baseline_create(config_path: &Path, suite: &str, run: &str) -> R
 
 pub fn run_eval_baseline_list(config_path: &Path, suite: &str) -> Result<()> {
     let root = runtime_root(config_path);
-    let artifacts = ensure_k0_smoke_artifacts(&root, suite)?;
+    let artifacts = ensure_core_smoke_artifacts(&root, suite)?;
     let report = read_eval_baselines_report(&root).unwrap_or_else(|_| EvalBaselinesReport {
         component: "eval_baselines".to_owned(),
         suite_id: artifacts.suite.eval_suite_id.to_string(),
@@ -258,7 +261,7 @@ pub fn run_eval_compare(
     candidate_run: &str,
 ) -> Result<()> {
     let root = runtime_root(config_path);
-    let artifacts = ensure_k0_smoke_artifacts(&root, suite)?;
+    let artifacts = ensure_core_smoke_artifacts(&root, suite)?;
     ensure_eval_run_ref(&artifacts.run, candidate_run)?;
     let baseline = resolve_eval_baseline(&root, &artifacts, baseline)?;
     let git_commit = git_head_blocking(&repo_root()).unwrap_or_else(|_| "unknown".to_owned());
@@ -282,14 +285,14 @@ pub fn run_eval_compare(
 
 pub fn run_eval_gate(config_path: &Path, profile: &str, suite: &str) -> Result<()> {
     let root = runtime_root(config_path);
-    let artifacts = ensure_k1_smoke_artifacts(&root, suite)?;
+    let artifacts = ensure_integration_smoke_artifacts(&root, suite)?;
     let profile = EvalGateProfileService::find(profile)
         .with_context(|| format!("unknown eval gate profile: {profile}"))?;
     EvalGateProfileService::validate(&profile)?;
     let decision = EvalRegressionGateService::evaluate_comparison(
         &profile,
         &artifacts.comparison,
-        &artifacts.k0.integrity_receipt,
+        &artifacts.core.integrity_receipt,
     );
     let report = EvalGatesReport {
         component: "eval_gates".to_owned(),
@@ -318,7 +321,7 @@ pub fn run_eval_profiles(config_path: &Path) -> Result<()> {
 
 pub fn run_eval_trend(config_path: &Path, suite: &str) -> Result<()> {
     let root = runtime_root(config_path);
-    let artifacts = ensure_k0_smoke_artifacts(&root, suite)?;
+    let artifacts = ensure_core_smoke_artifacts(&root, suite)?;
     let trend = EvalTrendService::trend(
         &artifacts.suite,
         &[artifacts.run.clone(), artifacts.run.clone()],
@@ -335,7 +338,7 @@ pub fn run_eval_trend(config_path: &Path, suite: &str) -> Result<()> {
 pub fn run_eval_stability(config_path: &Path, suite: &str, repeat: u8) -> Result<()> {
     let root = runtime_root(config_path);
     let repeat = repeat.clamp(2, 5);
-    let artifacts = ensure_k0_smoke_artifacts(&root, suite)?;
+    let artifacts = ensure_core_smoke_artifacts(&root, suite)?;
     let runs = std::iter::repeat_with(|| artifacts.run.clone())
         .take(usize::from(repeat))
         .collect::<Vec<_>>();
@@ -355,11 +358,11 @@ pub fn run_eval_stability(config_path: &Path, suite: &str, repeat: u8) -> Result
     write_json(&stability)
 }
 
-pub fn run_eval_k1_smoke(config_path: &Path) -> Result<()> {
+pub fn run_eval_integration_smoke(config_path: &Path) -> Result<()> {
     let root = runtime_root(config_path);
-    let artifacts = ensure_k1_smoke_artifacts(&root, "k0-core-smoke")?;
+    let artifacts = ensure_integration_smoke_artifacts(&root, "core-smoke")?;
     let report = serde_json::json!({
-        "component": "eval_k1_smoke",
+        "component": "eval_integration_smoke",
         "coverage": artifacts.coverage,
         "baseline": artifacts.baseline,
         "comparison": artifacts.comparison,
@@ -381,23 +384,26 @@ pub fn run_eval_k1_smoke(config_path: &Path) -> Result<()> {
     write_json(&report)
 }
 
-pub(super) fn ensure_k0_smoke_artifacts(root: &Path, suite_name: &str) -> Result<K0SmokeArtifacts> {
+pub(super) fn ensure_core_smoke_artifacts(
+    root: &Path,
+    suite_name: &str,
+) -> Result<CoreSmokeArtifacts> {
     let suite_name = if suite_name == "latest" {
-        "k0-core-smoke"
+        "core-smoke"
     } else {
         suite_name
     };
     let project_id = project_id_from_label("eliot-governor");
-    let task_id = task_id_from_label("phase-k0-smoke");
+    let task_id = task_id_from_label("core-eval-smoke");
     let cases = EvalCaseService::k0_core_cases(project_id, Some(task_id));
     let mut suite = EvalSuiteService::create(EvalSuiteInput {
         project_id,
         name: suite_name.to_owned(),
-        purpose: "Phase K0 deterministic no-mutation core smoke suite".to_owned(),
+        purpose: "Deterministic no-mutation core smoke suite".to_owned(),
         cases: cases.iter().map(|case| case.eval_case_id).collect(),
         fixed: false,
         holdout: true,
-        created_from_refs: vec!["phase-k0:runbook".to_owned()],
+        created_from_refs: vec!["eval:core-smoke".to_owned()],
     });
     EvalSuiteService::freeze(&mut suite);
     let manifest = EvalDatasetManifestService::manifest(&suite, &cases);
@@ -424,7 +430,7 @@ pub(super) fn ensure_k0_smoke_artifacts(root: &Path, suite_name: &str) -> Result
     let verdict = EvalVerdictService::verdict(&run);
     let fixture_failure_cluster = EvalVerdictService::fixture_failure_cluster(run.eval_run_id);
     let experiment = harness_experiment_record(&run, &verdict);
-    let artifacts = K0SmokeArtifacts {
+    let artifacts = CoreSmokeArtifacts {
         cases,
         suite,
         manifest,
@@ -437,11 +443,14 @@ pub(super) fn ensure_k0_smoke_artifacts(root: &Path, suite_name: &str) -> Result
         fixture_failure_cluster,
         experiment,
     };
-    write_k0_artifact_reports(root, &artifacts)?;
+    write_core_artifact_reports(root, &artifacts)?;
     Ok(artifacts)
 }
 
-pub(super) fn write_k0_artifact_reports(root: &Path, artifacts: &K0SmokeArtifacts) -> Result<()> {
+pub(super) fn write_core_artifact_reports(
+    root: &Path,
+    artifacts: &CoreSmokeArtifacts,
+) -> Result<()> {
     let generated_at = time::OffsetDateTime::now_utc();
     write_eval_report(
         root,
@@ -512,9 +521,12 @@ pub(super) fn write_k0_artifact_reports(root: &Path, artifacts: &K0SmokeArtifact
 }
 
 #[allow(clippy::too_many_lines)]
-pub(super) fn ensure_k1_smoke_artifacts(root: &Path, suite_name: &str) -> Result<K1SmokeArtifacts> {
-    let k0 = ensure_k0_smoke_artifacts(root, suite_name)?;
-    let coverage = eval_coverage_report(&k0).coverage;
+pub(super) fn ensure_integration_smoke_artifacts(
+    root: &Path,
+    suite_name: &str,
+) -> Result<IntegrationSmokeArtifacts> {
+    let core = ensure_core_smoke_artifacts(root, suite_name)?;
+    let coverage = eval_coverage_report(&core).coverage;
     write_eval_report(
         root,
         "eval-coverage",
@@ -528,19 +540,19 @@ pub(super) fn ensure_k1_smoke_artifacts(root: &Path, suite_name: &str) -> Result
 
     let git_commit = git_head_blocking(&repo_root()).unwrap_or_else(|_| "unknown".to_owned());
     let baseline = EvalBaselineService::create(
-        &k0.suite,
-        &k0.manifest,
-        &k0.integrity_receipt,
-        &k0.run,
-        &k0.verdict,
+        &core.suite,
+        &core.manifest,
+        &core.integrity_receipt,
+        &core.run,
+        &core.verdict,
         &git_commit,
-        "phase-k1-smoke",
+        "provider-integration-smoke",
     )?;
-    write_eval_baseline_registry(root, &k0.suite, baseline.clone())?;
+    write_eval_baseline_registry(root, &core.suite, baseline.clone())?;
 
-    let candidate_run = k0.run.clone();
+    let candidate_run = core.run.clone();
     let comparison =
-        EvalComparisonService::compare(&k0.suite, &baseline, &candidate_run, &git_commit);
+        EvalComparisonService::compare(&core.suite, &baseline, &candidate_run, &git_commit);
     write_eval_report(
         root,
         "eval-comparisons",
@@ -558,26 +570,34 @@ pub(super) fn ensure_k1_smoke_artifacts(root: &Path, suite_name: &str) -> Result
     for profile in &profiles {
         EvalGateProfileService::validate(profile)?;
     }
-    let phase_minimal = EvalGateProfileService::find("phase-minimal")
-        .context("phase-minimal eval gate profile is missing")?;
+    let fast_deterministic = EvalGateProfileService::find("fast-deterministic")
+        .context("fast-deterministic eval gate profile is missing")?;
     let gate_decision = EvalRegressionGateService::evaluate_comparison(
-        &phase_minimal,
+        &fast_deterministic,
         &comparison,
-        &k0.integrity_receipt,
+        &core.integrity_receipt,
     );
     let critical_candidate_run =
         EvalComparisonService::run_with_failed_family(&candidate_run, EvalFamily::Understand);
-    let critical_comparison =
-        EvalComparisonService::compare(&k0.suite, &baseline, &critical_candidate_run, &git_commit);
+    let critical_comparison = EvalComparisonService::compare(
+        &core.suite,
+        &baseline,
+        &critical_candidate_run,
+        &git_commit,
+    );
     let critical_gate_decision = EvalRegressionGateService::evaluate_comparison(
-        &phase_minimal,
+        &fast_deterministic,
         &critical_comparison,
-        &k0.integrity_receipt,
+        &core.integrity_receipt,
     );
     let benchmark_repair_decision = EvalRegressionGateService::evaluate_comparison(
-        &phase_minimal,
+        &fast_deterministic,
         &comparison,
-        &k0.mismatch_receipt,
+        &core.mismatch_receipt,
+    );
+    anyhow::ensure!(
+        benchmark_repair_decision.decision == EvalGateDecisionKind::Block,
+        "a mismatched benchmark integrity receipt must block the eval gate"
     );
     write_eval_report(
         root,
@@ -585,7 +605,7 @@ pub(super) fn ensure_k1_smoke_artifacts(root: &Path, suite_name: &str) -> Result
         "Eval Gates",
         &EvalGatesReport {
             component: "eval_gates".to_owned(),
-            profile: phase_minimal,
+            profile: fast_deterministic,
             comparison: Some(comparison.clone()),
             decision: gate_decision.clone(),
             generated_at: time::OffsetDateTime::now_utc(),
@@ -593,7 +613,7 @@ pub(super) fn ensure_k1_smoke_artifacts(root: &Path, suite_name: &str) -> Result
     )?;
 
     let trend = EvalTrendService::trend(
-        &k0.suite,
+        &core.suite,
         &[candidate_run.clone(), critical_candidate_run.clone()],
     );
     write_eval_report(
@@ -608,7 +628,7 @@ pub(super) fn ensure_k1_smoke_artifacts(root: &Path, suite_name: &str) -> Result
     )?;
 
     let stability = EvalFixtureStabilityService::report(
-        &k0.suite,
+        &core.suite,
         &[candidate_run.clone(), candidate_run.clone()],
     );
     write_eval_report(
@@ -629,28 +649,24 @@ pub(super) fn ensure_k1_smoke_artifacts(root: &Path, suite_name: &str) -> Result
         &coverage,
         Some(&trend),
         Some(&stability),
-        &k0.integrity_receipt,
+        &core.integrity_receipt,
     );
 
-    Ok(K1SmokeArtifacts {
-        k0,
+    Ok(IntegrationSmokeArtifacts {
+        core,
         coverage,
         baseline,
-        candidate_run,
         comparison,
         gate_decision,
-        critical_candidate_run,
         critical_comparison,
         critical_gate_decision,
-        benchmark_repair_decision,
-        profiles,
         trend,
         stability,
         doctor_status,
     })
 }
 
-pub(super) fn eval_coverage_report(artifacts: &K0SmokeArtifacts) -> EvalCoverageReport {
+pub(super) fn eval_coverage_report(artifacts: &CoreSmokeArtifacts) -> EvalCoverageReport {
     EvalCoverageReport {
         component: "eval_coverage".to_owned(),
         coverage: EvalCoverageService::matrix(
@@ -686,7 +702,7 @@ pub(super) fn write_eval_baseline_registry(
 
 pub(super) fn resolve_eval_baseline(
     root: &Path,
-    artifacts: &K0SmokeArtifacts,
+    artifacts: &CoreSmokeArtifacts,
     baseline_ref: &str,
 ) -> Result<EvalBaseline> {
     let report = read_eval_baselines_report(root).ok();
@@ -720,7 +736,7 @@ pub(super) fn resolve_eval_baseline(
 
 pub(super) fn ensure_eval_run_ref(run: &EvalRun, run_ref: &str) -> Result<()> {
     if run_ref != "latest" && run_ref != run.eval_run_id.to_string() {
-        bail!("only latest eval run or its id is available in K1 CLI");
+        bail!("only the latest integration eval run or its id is available through this CLI");
     }
     Ok(())
 }
@@ -748,13 +764,13 @@ pub(super) fn ensure_eval_cases(root: &Path) -> Result<Vec<EvalCase>> {
 pub(super) fn k0_default_cases() -> Vec<EvalCase> {
     EvalCaseService::k0_core_cases(
         project_id_from_label("eliot-governor"),
-        Some(task_id_from_label("phase-k0-smoke")),
+        Some(task_id_from_label("core-eval-smoke")),
     )
 }
 
 pub(super) fn eval_summary_report(root: &Path) -> Result<serde_json::Value> {
     if !latest_report_path(root, "eval-runs").is_file() {
-        let _ = ensure_k0_smoke_artifacts(root, "k0-core-smoke")?;
+        let _ = ensure_core_smoke_artifacts(root, "core-smoke")?;
     }
     let run_report = read_latest_value(root, "eval-runs").ok();
     let verdict_report = read_latest_value(root, "eval-verdicts").ok();

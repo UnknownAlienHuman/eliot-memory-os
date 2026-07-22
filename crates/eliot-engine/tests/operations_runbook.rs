@@ -25,8 +25,7 @@ type TestResult<T = ()> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 #[allow(clippy::too_many_lines)]
 async fn real_surreal_store_backup_restore_to_new_root() -> TestResult {
     let surreal = std::env::var_os("ELIOT_SURREAL_EXE")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("surreal"));
+        .map_or_else(|| PathBuf::from("surreal"), PathBuf::from);
     if !surreal.is_file() {
         return Ok(());
     }
@@ -61,7 +60,7 @@ async fn real_surreal_store_backup_restore_to_new_root() -> TestResult {
         context: command_context(task_write_id, project_id, Some(task_id)),
         contract: TaskContractInput {
             task_id,
-            title: "L9 to L10 restored memory acceptance".to_owned(),
+            title: "Restored semantic-memory acceptance".to_owned(),
             status: TaskContractStatus::Active,
             acceptance_items: vec![TaskAcceptanceItem {
                 item_id: "m5-restore-known-task".to_owned(),
@@ -99,9 +98,9 @@ async fn real_surreal_store_backup_restore_to_new_root() -> TestResult {
         context: command_context(WriteId::new_v7(), project_id, Some(task_id)),
         claim: ClaimCardInput {
             claim_id,
-            statement: "L10 memory survives isolated restore".to_owned(),
+            statement: "Semantic memory survives isolated restore".to_owned(),
             status: EpistemicStatus::Candidate,
-            payload: json!({"layer": "L10", "provenance": "m5-isolated-e2e"}),
+            payload: json!({"layer": "semantic_memory", "provenance": "m5-isolated-e2e"}),
         },
     });
     let mut claim_envelope = WriteAdmissionService.admit(&claim_command)?;
@@ -213,7 +212,7 @@ async fn real_surreal_store_backup_restore_to_new_root() -> TestResult {
     let recall = target_store
         .recall_l0(&RecallL0Request {
             project_id,
-            query: "L10 memory survives".to_owned(),
+            query: "semantic memory survives".to_owned(),
             consistency: ReadConsistencyMode::Latest,
             at_least_revision: None,
             lifecycle_audit: false,
@@ -652,7 +651,7 @@ fn call_governed_operator_snapshot(
             format!("Operator snapshot omitted restored task {task_id}: {snapshot}").into(),
         );
     }
-    if !rendered.contains("L9 to L10 restored memory acceptance") {
+    if !rendered.contains("Restored semantic-memory acceptance") {
         return Err(format!("Operator snapshot omitted restored task title: {snapshot}").into());
     }
     Ok(())

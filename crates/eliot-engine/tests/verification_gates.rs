@@ -120,7 +120,32 @@ fn full_profile_exists() {
         .profile("full")
         .expect("full profile");
 
-    assert!(profile.required_commands.len() > 10);
+    for required in [
+        "just verify",
+        "cargo audit",
+        "cargo deny check",
+        "cargo machete",
+        "git diff --check",
+    ] {
+        assert!(
+            profile
+                .required_commands
+                .iter()
+                .any(|command| command == required)
+        );
+    }
+    assert!(
+        profile
+            .required_commands
+            .iter()
+            .any(|command| { command.contains("eval gate --profile fast-deterministic") })
+    );
+    assert!(
+        profile
+            .required_commands
+            .iter()
+            .any(|command| { command.contains("eval gate --profile provider-integration") })
+    );
     assert!(profile.requires_serial);
 }
 
@@ -225,7 +250,7 @@ fn the_change_gate_requires_the_minimal_eval_gate() {
         profile
             .required_commands
             .iter()
-            .any(|cmd| { cmd.contains("eval gate --profile phase-minimal") })
+            .any(|cmd| { cmd.contains("eval gate --profile fast-deterministic") })
     );
 }
 
@@ -379,7 +404,7 @@ fn mcp_exposes_no_raw_command_or_override_tools() -> TestResult {
 }
 
 /// The application layer must not reach past the verification runner. Linking
-/// the SurrealDB SDK would drag in the dependency graph the store deliberately
+/// the `SurrealDB` SDK would drag in the dependency graph the store deliberately
 /// avoids, and an arbitrary-command escape would make the profile allowlist
 /// decorative.
 #[test]

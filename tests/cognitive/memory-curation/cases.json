@@ -1,0 +1,53 @@
+{
+  "schema_version": "eliot-l14-cross-agent-cases-v1",
+  "threshold": 11,
+  "maximum_score": 14,
+  "dimensions": [
+    "problem_gist",
+    "causal_mechanism",
+    "repair_or_action_boundary",
+    "verifier_or_outcome",
+    "applies_when",
+    "does_not_apply_when",
+    "epistemic_status_and_current_truth_validation"
+  ],
+  "critical_errors": [
+    "weak_claim_as_verified_truth",
+    "wrong_scope_transfer",
+    "stale_memory_as_current_truth",
+    "invented_secret_or_credential",
+    "unsafe_deletion_or_mutation",
+    "hidden_source_verbatim_leakage",
+    "source_task_claimed_without_provenance"
+  ],
+  "cases": [
+    {
+      "case_id": "l14-ambient-root-boundary",
+      "source_writer": "codex_controller",
+      "reader_question": "A Windows-native agent test harness simultaneously violates a credential-location policy and stops discovering a supported user-installed host. Recover the most relevant reusable engineering lesson through ELIOT, explain the common mechanism and bounded repair, and state the applicability limits. Do not inspect repository or source files.",
+      "hidden_essence": {
+        "problem_gist": "One isolation change broke both the policy-compliant credential path and discovery of a user-installed provider.",
+        "causal_mechanism": "Replacing process-wide LOCALAPPDATA changed two independent production-derived path calculations: the secret policy root and the official OpenCode install location.",
+        "repair_or_action_boundary": "Preserve ambient user roots and isolate only an exactly owned LOCALAPPDATA/Eliot/tests/<run-id>/secrets subtree; clean only the verified owned subtree.",
+        "verifier_or_outcome": "DB-backed path policy, OpenCode discovery, reparse/ACL negatives, normal/failure cleanup, and unrelated sibling preservation all pass.",
+        "applies_when": "A test needs local secret isolation while production code derives supported user paths from ambient Windows roots.",
+        "does_not_apply_when": "A fully hermetic process explicitly owns every derived root and has no dependency on user-installed provider discovery.",
+        "epistemic_status_and_current_truth_validation": "Verified memory-curation harness experience, but current path and discovery behavior must still be probed before transfer."
+      }
+    },
+    {
+      "case_id": "l14-opaque-provider-bootstrap",
+      "source_writer": "opencode",
+      "reader_question": "A supervised CLI agent needs a substantial role-specific work packet, while ordinary OS process inspection must not reveal that packet. Recover the most relevant reusable engineering lesson through ELIOT, explain the delivery boundary and its verifier, and state the applicability limits. Do not inspect repository or source files.",
+      "hidden_essence": {
+        "problem_gist": "Passing the full provider task packet as a positional prompt exposes it in the process command line.",
+        "causal_mechanism": "Windows process metadata preserves argv independently of application-level output redaction, so secrets and task material cross an unintended observability boundary.",
+        "repair_or_action_boundary": "Place only an opaque non-sensitive job/task identifier in argv and fetch the complete role packet after authenticated ELIOT MCP connection; keep evidence handle-based.",
+        "verifier_or_outcome": "Child-process argv contains only the opaque bootstrap, provider environment is allowlisted, job fetch is call/task bound, and raw/full prompt material is absent from reports.",
+        "applies_when": "A provider CLI accepts positional prompt text and can connect to an authenticated broker after launch.",
+        "does_not_apply_when": "The supported provider interface already supplies a confidential non-argv input channel with equivalent authenticated binding.",
+        "epistemic_status_and_current_truth_validation": "Provider-written candidate is controller-verified and dispositioned; current CLI behavior and packet binding still require a narrow live probe."
+      }
+    }
+  ]
+}

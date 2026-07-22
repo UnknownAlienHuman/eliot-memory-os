@@ -29,7 +29,7 @@ async fn compile_packet_l3_budgeted() -> TestResult {
     let packet = ContextCompiler::new(ReadService::new(harness.store.clone()))
         .compile(&CompilePacketL3Request {
             project_id: seed.project,
-            task_id: "phase-c-budget".to_owned(),
+            task_id: "context-proof-budget".to_owned(),
             goal: "compile a bounded packet".to_owned(),
             candidate_handles: vec![format!("claim:{}", seed.verified_claim)],
             max_tokens: 1_800,
@@ -50,7 +50,7 @@ async fn compile_packet_l3_separates_verified_supported_weak() -> TestResult {
     let packet = ContextCompiler::new(ReadService::new(harness.store.clone()))
         .compile(&CompilePacketL3Request {
             project_id: seed.project,
-            task_id: "phase-c-separation".to_owned(),
+            task_id: "context-proof-separation".to_owned(),
             goal: "claim".to_owned(),
             candidate_handles: Vec::new(),
             max_tokens: 4_000,
@@ -152,7 +152,7 @@ async fn cognitive_gate_allows_valid_proof() -> TestResult {
 #[test]
 fn cognitive_gate_requires_probe_for_missing_evidence() {
     let receipt = eliot_types::UnderstandingProofReceipt {
-        task_id: "phase-c-require-probe".to_owned(),
+        task_id: "context-proof-require-probe".to_owned(),
         project_id: ProjectId::new_v7(),
         accepted: false,
         validation_errors: vec![CognitiveGateReason::MissingEvidence],
@@ -193,7 +193,7 @@ struct Harness {
 impl Harness {
     async fn new(name: &str) -> TestResult<Self> {
         let root =
-            std::env::temp_dir().join(format!("eliot-phase-c-{name}-{}", std::process::id()));
+            std::env::temp_dir().join(format!("eliot-context-proof-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root)?;
         let mut config = GovernorConfig::default();
@@ -237,7 +237,7 @@ impl Harness {
         submit(
             &self.admission,
             &handle,
-            evidence_command(project_id, evidence_id, "phase-c evidence"),
+            evidence_command(project_id, evidence_id, "context-proof evidence"),
         )
         .await?;
         submit(
@@ -283,7 +283,7 @@ impl Harness {
         submit(
             &self.admission,
             &handle,
-            failure_record(project_id, "phase-c-known-failure"),
+            failure_record(project_id, "context-proof-known-failure"),
         )
         .await?;
 
@@ -323,7 +323,7 @@ fn valid_proof(
     evidence_refs: Vec<String>,
 ) -> UnderstandingProof {
     UnderstandingProof {
-        task_id: "phase-c-proof".to_owned(),
+        task_id: "context-proof-proof".to_owned(),
         project_id: seed.project,
         goal: "prove governed action".to_owned(),
         code_task: false,
@@ -351,9 +351,9 @@ fn valid_proof(
 
 fn completion_proof(status: &str) -> CompletionProof {
     CompletionProof {
-        task_id: "phase-c-completion".to_owned(),
+        task_id: "context-proof-completion".to_owned(),
         project_id: ProjectId::new_v7(),
-        goal: "finish phase c".to_owned(),
+        goal: "finish the context-proof scenario".to_owned(),
         changed_files: vec!["crates/eliot-engine/src/context.rs".to_owned()],
         memory_refs_used: vec!["claim:verified".to_owned()],
         checks_run: vec!["cargo test".to_owned()],
@@ -412,7 +412,7 @@ impl Drop for TestLock {
 }
 
 async fn migrate_schema_locked(store: &CanonicalStore) -> TestResult {
-    let lock_path = repo_root().join("target/phase-c-migrate.lock");
+    let lock_path = repo_root().join("target/context-proof-migrate.lock");
     if let Some(parent) = lock_path.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -445,7 +445,7 @@ fn context(project_id: ProjectId) -> CommandContext {
         session_id: None,
         project_id,
         task_id: None,
-        scope: "phase-c-test".to_owned(),
+        scope: "context-proof-test".to_owned(),
         authority: "local-test".to_owned(),
         visibility: Visibility::Internal,
         taint: TaintClass::LocalVerified,
@@ -516,7 +516,7 @@ fn claim_verify(
         verification: VerificationRunInput {
             verification_id: eliot_types::VerificationId::new_v7(),
             claim_id: Some(claim_id),
-            verifier: "phase-c-test".to_owned(),
+            verifier: "context-proof-test".to_owned(),
             result,
             summary: format!("{result:?}"),
             payload: json!({ "result": format!("{result:?}") }),

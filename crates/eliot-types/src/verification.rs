@@ -53,6 +53,8 @@ pub enum TestIntent {
     /// Tests that prove a unit of work is actually finished. Named after the
     /// development milestones it used to close out; records written under that
     /// spelling still load.
+    // Existing canonical verification receipts used this field spelling. Read
+    // them during migration, but never emit the retired milestone name.
     #[serde(alias = "phase_closeout")]
     CompletionProof,
     BehaviorEval,

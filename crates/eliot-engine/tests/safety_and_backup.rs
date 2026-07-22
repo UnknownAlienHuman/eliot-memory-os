@@ -572,7 +572,7 @@ fn cutover_is_manifest_only_and_rejects_sync_roots() -> TestResult {
 }
 
 #[test]
-fn phase_b_c_d_e_f0_f1_f2_f3_g0_g1_non_regression() {
+fn accumulated_capabilities_non_regression() {
     assert!(DataRootService::gitignore_excludes_live_roots(&repo_root()));
 }
 

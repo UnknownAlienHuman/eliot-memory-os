@@ -307,7 +307,7 @@ impl ExternalReviewGate {
                     "provider-integration eval gate must pass before external review".to_owned()
                 }
                 ExternalReviewGateDecisionKind::Deny => {
-                    "external review request denied by G2 gate".to_owned()
+                    "external review request denied by the provider gate".to_owned()
                 }
             },
             decided_at: OffsetDateTime::now_utc(),
@@ -358,7 +358,7 @@ impl ExternalReviewJobService {
         if provider.kind != ExternalProviderKind::Mock {
             return Err(rejected(
                 "external-review-job-service",
-                "G2 can execute only mock external providers",
+                "the provider-free external review path can execute only mock providers",
             ));
         }
         if queued_job.request_id != request.request_id
@@ -789,9 +789,7 @@ fn disabled_real_profile(
         authority: ExternalProviderAuthority::default(),
         limits: ExternalProviderLimits::default(),
         credential_ref: None,
-        disabled_reason: Some(
-            "real external provider execution is disabled in Phase G2".to_owned(),
-        ),
+        disabled_reason: Some("real external provider execution is disabled by policy".to_owned()),
     }
 }
 

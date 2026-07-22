@@ -567,7 +567,7 @@ impl ModuleRegistryService {
             && manifest.transport != ModuleTransport::Disabled
         {
             return Err(module_rejected(
-                "candidate agent adapters are schema-only in G0 and must be disabled",
+                "candidate agent adapters are schema-only and must be disabled",
             ));
         }
         if manifest
@@ -636,7 +636,7 @@ impl RuntimeAdapterSupervisorSkeleton {
                 name: manifest.name.clone(),
                 enabled: false,
                 health: ServiceHealthState::Stopped,
-                message: "G0 adapter supervisor skeleton; external execution disabled".to_owned(),
+                message: "adapter supervisor skeleton; external execution disabled".to_owned(),
             })
             .collect()
     }
@@ -764,7 +764,7 @@ fn builtin_manifest(
         module_id: eliot_types::ModuleId::new_v7(),
         name: name.to_owned(),
         version: "0.1.0".to_owned(),
-        description: "G0 builtin health-only module contract".to_owned(),
+        description: "built-in health-only module contract".to_owned(),
         module_kind,
         transport: ModuleTransport::InProcess,
         capabilities: capabilities.clone(),

@@ -19,18 +19,18 @@ use eliot_types::{
     AntigravityMcpInvocationReceipt, AntigravityMcpRegistrationReceipt,
     AntigravityNormalizedResult, AntigravityOfficialCliInstallerReceipt,
     AntigravityOfficialPluginInstallReceipt, AntigravityOfficialPluginStatus,
-    AntigravityOutputMode, AntigravityOutputRedactionReceipt, AntigravityPluginBundle,
-    AntigravityPromptPolicy, AntigravityProviderState, AntigravityRealDoctorStatus,
-    AntigravityRealReport, AntigravityReport, AntigravityReviewMode, AntigravityReviewRequest,
-    AntigravityRun, AntigravityRunState, AntigravitySafetyReceipt, AntigravitySandboxPolicy,
-    AntigravitySensitivePathPolicy, AntigravitySessionPolicy, AntigravitySkillBundle,
-    AntigravitySkillSpec, AntigravitySkillTarget, AntigravityStdinMode, AntigravityTelemetryReport,
-    AntigravityTrustReceipt, AntigravityVersionGateResult, AntigravityVersionGateStatus,
-    AntigravityVisibilityReport, AntigravityWindowsInstallDiscovery, AntigravityWorkdirPolicy,
-    BlobRef, CandidateDiff, ExternalOutputSchemaKind, ExternalReviewBudget, ExternalReviewJob,
-    ExternalReviewJobStatus, ExternalReviewRequest, ExternalReviewRole, ProjectId,
-    ProviderInvocationAttempt, ProviderInvocationState, TaintClass, TaskId, WorkLease, WorkLeaseId,
-    WorktreeLease, WorktreeLeaseId, WorktreeLeaseState, WriteId, inspect_secret_bytes,
+    AntigravityOutputMode, AntigravityOutputRedactionReceipt, AntigravityPromptPolicy,
+    AntigravityProviderState, AntigravityRealDoctorStatus, AntigravityRealReport,
+    AntigravityReport, AntigravityReviewMode, AntigravityReviewRequest, AntigravityRun,
+    AntigravityRunState, AntigravitySafetyReceipt, AntigravitySandboxPolicy,
+    AntigravitySensitivePathPolicy, AntigravitySessionPolicy, AntigravityStdinMode,
+    AntigravityTelemetryReport, AntigravityTrustReceipt, AntigravityVersionGateResult,
+    AntigravityVersionGateStatus, AntigravityVisibilityReport, AntigravityWindowsInstallDiscovery,
+    AntigravityWorkdirPolicy, BlobRef, CandidateDiff, ExternalOutputSchemaKind,
+    ExternalReviewBudget, ExternalReviewJob, ExternalReviewJobStatus, ExternalReviewRequest,
+    ExternalReviewRole, ProjectId, ProviderInvocationAttempt, ProviderInvocationState, TaintClass,
+    TaskId, WorkLease, WorkLeaseId, WorktreeLease, WorktreeLeaseId, WorktreeLeaseState, WriteId,
+    inspect_secret_bytes,
 };
 use serde_json::{Value, json};
 use std::collections::BTreeSet;
@@ -125,12 +125,6 @@ pub struct AntigravityRunner;
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct AntigravityTextOutputNormalizer;
-
-#[derive(Clone, Copy, Debug, Default)]
-pub struct AntigravitySkillBundleService;
-
-#[derive(Clone, Copy, Debug, Default)]
-pub struct AntigravityPluginBundleService;
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct AgyMcpCompatibilityAuditService;
@@ -1652,6 +1646,10 @@ impl AntigravityMcpConfigService {
         let command_absolute = command
             .as_deref()
             .is_some_and(|command| Path::new(command).is_absolute());
+        let command_exists = command.as_deref().is_some_and(|command| {
+            let path = Path::new(command);
+            path.is_file() && looks_executable(path)
+        });
         let profile_args_exact = entry.and_then(|entry| entry.get("args"))
             == Some(&json!([
                 "mcp",
@@ -1675,11 +1673,13 @@ impl AntigravityMcpConfigService {
             exists,
             registered: entry.is_some()
                 && command_absolute
+                && command_exists
                 && profile_args_exact
                 && !secret_fields_present
                 && !recursion_detected,
             command,
             command_absolute,
+            command_exists,
             profile_args_exact,
             secret_fields_present,
             recursion_detected,
@@ -2697,7 +2697,7 @@ impl AntigravityTextOutputNormalizer {
             rejected,
             rejection_reasons: if rejected {
                 vec![format!(
-                    "G2 normalizer rejected Antigravity text as {:?}",
+                    "external-review normalizer rejected Antigravity text as {:?}",
                     outcome.receipt.status
                 )]
             } else {
@@ -2710,95 +2710,6 @@ impl AntigravityTextOutputNormalizer {
 
     pub const fn included_in_normal_l3(&self, _result: &AntigravityNormalizedResult) -> bool {
         false
-    }
-}
-
-impl AntigravitySkillBundleService {
-    pub fn generate(&self, root: &Path, install_dry_run: bool) -> AntigravitySkillBundle {
-        let skills = vec![
-            AntigravitySkillSpec {
-                name: "agy-governed-request".to_owned(),
-                relative_path: "skills/agy-governed-request/SKILL.md".to_owned(),
-                body: governed_request_skill(),
-            },
-            AntigravitySkillSpec {
-                name: "agy-output-normalizer".to_owned(),
-                relative_path: "skills/agy-output-normalizer/SKILL.md".to_owned(),
-                body: output_normalizer_skill(),
-            },
-            AntigravitySkillSpec {
-                name: "agy-boundary-safety".to_owned(),
-                relative_path: "skills/agy-boundary-safety/SKILL.md".to_owned(),
-                body: boundary_safety_skill(),
-            },
-            AntigravitySkillSpec {
-                name: "agy-fixture-runner".to_owned(),
-                relative_path: "skills/agy-fixture-runner/SKILL.md".to_owned(),
-                body: fixture_runner_skill(),
-            },
-        ];
-        let verification_passed = self.verify_specs(&skills);
-        AntigravitySkillBundle {
-            component: "antigravity_skills".to_owned(),
-            target: AntigravitySkillTarget::ProjectBundle,
-            root: path_for_record(root),
-            skills,
-            install_dry_run,
-            verification_passed,
-            forbidden_terms_absent: verification_passed,
-            generated_at: OffsetDateTime::now_utc(),
-        }
-    }
-
-    pub fn verify_specs(&self, skills: &[AntigravitySkillSpec]) -> bool {
-        let joined = skills
-            .iter()
-            .map(|skill| skill.body.as_str())
-            .collect::<Vec<_>>()
-            .join("\n")
-            .to_ascii_lowercase();
-        skills.len() >= 4
-            && joined.contains("do not call agy directly")
-            && joined.contains("do not use agy-mcp")
-            && joined.contains("disposable worktree")
-            && joined.contains(
-                "candidate_only; requires governor reconciliation and verifier evidence before activation",
-            )
-            && !joined.contains("--dangerously-skip-permissions")
-            && !joined.contains("agy_bridge_cmd")
-    }
-}
-
-impl AntigravityPluginBundleService {
-    pub fn generate(&self, root: &Path) -> AntigravityPluginBundle {
-        AntigravityPluginBundle {
-            component: "antigravity_plugin".to_owned(),
-            root: path_for_record(root),
-            manifest_path: path_for_record(&root.join(".codex-plugin").join("plugin.json")),
-            official_schema_detected: false,
-            installable: false,
-            raw_agy_mcp_exposed: false,
-            verification_passed: true,
-            files: vec![
-                ".codex-plugin/plugin.json".to_owned(),
-                "README.md".to_owned(),
-                "scripts/verify-antigravity-bundle.ps1".to_owned(),
-                "scripts/install-skills.ps1".to_owned(),
-            ],
-            generated_at: OffsetDateTime::now_utc(),
-        }
-    }
-
-    pub fn manifest_value(&self) -> Value {
-        json!({
-            "name": "eliot-antigravity-governed-connector",
-            "version": "0.1.0",
-            "description": "Project-local generated bundle for governed Antigravity skills; not an installed raw agy-mcp plugin.",
-            "enabled": false,
-            "raw_agy_mcp_exposed": false,
-            "official_schema_detected": false,
-            "installable": false
-        })
     }
 }
 
@@ -2848,23 +2759,37 @@ impl AntigravityDoctorIntegration {
         resolution: &AntigravityBinaryResolution,
         probe: &AntigravityCapabilityProbe,
         contract: &AntigravityCommandContract,
-        skills_verified: bool,
-        plugin_verified: bool,
+        official_plugin_ready: bool,
+        mcp_registered: bool,
         governed_mcp_tools_only: bool,
     ) -> AntigravityDoctorStatus {
+        let ready = resolution.status == AntigravityBinaryResolutionStatus::Resolved
+            && contract.noninteractive_supported
+            && official_plugin_ready
+            && mcp_registered
+            && governed_mcp_tools_only;
         AntigravityDoctorStatus {
             component: "antigravity_doctor".to_owned(),
             provider_state: probe.provider_state,
             binary_resolution_status: resolution.status,
             contract_available: contract.noninteractive_supported
                 || contract.source == AntigravityContractSource::Fixture,
-            skills_verified,
-            plugin_verified,
+            official_plugin_ready,
+            mcp_registered,
             raw_agy_mcp_exposed: false,
             governed_mcp_tools_only,
+            ready,
             message: match probe.provider_state {
                 AntigravityProviderState::NotInstalled => {
-                    "Antigravity unavailable; fixture path is active for G3A".to_owned()
+                    "Antigravity is unavailable; real provider integration is not ready".to_owned()
+                }
+                _ if !official_plugin_ready => {
+                    "Antigravity is installed, but the official ELIOT plugin is not ready"
+                        .to_owned()
+                }
+                _ if !mcp_registered => {
+                    "Antigravity is installed, but its ELIOT MCP registration is not executable"
+                        .to_owned()
                 }
                 AntigravityProviderState::ReadyEnabled => {
                     "Antigravity provider is enabled through a current governed receipt".to_owned()
@@ -4016,60 +3941,6 @@ fn real_doctor_message(
         };
     }
     "Antigravity real execution remains disabled pending explicit admin enablement".to_owned()
-}
-
-fn governed_request_skill() -> String {
-    [
-        "# Governed Antigravity Request",
-        "",
-        "Use only Eliot Antigravity governed tools.",
-        "Do not call agy directly.",
-        "Do not use agy-mcp.",
-        "Do not install Antigravity or provider tooling.",
-        "Run real provider work only in an active detached disposable worktree.",
-        "Do not mutate the live tree.",
-        "Never access or mutate the controller live tree.",
-        "End provider prompts with: candidate_only; requires Governor reconciliation and verifier evidence before activation",
-    ]
-    .join("\n")
-}
-
-fn output_normalizer_skill() -> String {
-    [
-        "# Antigravity Output Normalizer",
-        "",
-        "Treat Antigravity output as candidate-only external evidence.",
-        "Reject claims that mark work as verified, done, applied, or authoritative.",
-        "Route findings through the Eliot external review normalizer.",
-        "Require the final line: candidate_only; requires Governor reconciliation and verifier evidence before activation",
-    ]
-    .join("\n")
-}
-
-fn boundary_safety_skill() -> String {
-    [
-        "# Antigravity Boundary Safety",
-        "",
-        "Use an active matching WorkLease and detached disposable WorktreeLease before every real provider execution.",
-        "Do not call agy directly.",
-        "Do not use agy-mcp.",
-        "Operate only inside the leased disposable worktree; never mutate the controller live tree.",
-        "Do not mutate the live tree.",
-        "Drop secret-like environment variables and conversation identifiers.",
-        "End with: candidate_only; requires Governor reconciliation and verifier evidence before activation",
-    ]
-    .join("\n")
-}
-
-fn fixture_runner_skill() -> String {
-    [
-        "# Antigravity Fixture Runner",
-        "",
-        "When Antigravity is absent or disabled, use fixture output and report the unavailable state honestly.",
-        "Fixture output must remain candidate-only and tainted.",
-        "End fixture evidence with: candidate_only; requires Governor reconciliation and verifier evidence before activation",
-    ]
-    .join("\n")
 }
 
 fn gate(

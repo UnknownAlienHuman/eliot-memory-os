@@ -1,4 +1,4 @@
-use super::catalog::{j0_tool_definitions, memory_lifecycle_tool_definitions};
+use super::catalog::{memory_lifecycle_tool_definitions, replay_tool_definitions};
 use super::*;
 
 #[test]
@@ -555,6 +555,7 @@ fn antigravity_live_status_reads_user_config_and_plugin_instead_of_cached_report
     std::fs::create_dir_all(plugin_root.join("agents").join("eliot-agent"))?;
     std::fs::create_dir_all(plugin_root.join("rules"))?;
     let executable = home.join("eliot-governor.exe");
+    std::fs::write(&executable, b"test executable")?;
     std::fs::write(
         config_dir.join("mcp_config.json"),
         serde_json::to_vec_pretty(&json!({
@@ -1471,7 +1472,7 @@ fn durable_operator_requests_require_reason_evidence_or_exact_hash() {
     );
 }
 
-fn complete_l11_trace_input(task: &TaskContract) -> TraceCompletenessToolInput {
+fn complete_canonical_trace_input(task: &TaskContract) -> TraceCompletenessToolInput {
     let artifact = &task.verification_scopes[0].artifact_refs[0].resource_ref;
     TraceCompletenessToolInput {
         project_id: task.project_id.to_string(),
@@ -1491,9 +1492,9 @@ fn complete_l11_trace_input(task: &TaskContract) -> TraceCompletenessToolInput {
 }
 
 #[test]
-fn l11_trace_schema_requires_receiptable_sources_and_derives_ten_parts() -> Result<()> {
+fn canonical_trace_schema_requires_receiptable_sources_and_derives_ten_parts() -> Result<()> {
     let task = completion_task_fixture();
-    let input = complete_l11_trace_input(&task);
+    let input = complete_canonical_trace_input(&task);
     assert_eq!(
         canonical_derived_trace_references(
             &task,
@@ -1519,7 +1520,7 @@ fn l11_trace_schema_requires_receiptable_sources_and_derives_ten_parts() -> Resu
 }
 
 #[test]
-fn l11_mutation_authority_is_controller_or_operator_only() {
+fn canonical_mutation_authority_is_controller_or_operator_only() {
     for tool in [
         "eliot_trace_completeness",
         "eliot_replay_run",
@@ -1533,12 +1534,12 @@ fn l11_mutation_authority_is_controller_or_operator_only() {
         assert!(!McpAccessProfile::DynamicAgent.allows(tool));
         assert!(!McpAccessProfile::HumanReadonly.allows(tool));
     }
-    assert!(McpAccessProfile::CodexWorker.allows("eliot_l11_status"));
-    assert!(McpAccessProfile::HumanReadonly.allows("eliot_l11_status"));
+    assert!(McpAccessProfile::CodexWorker.allows("eliot_canonical_status"));
+    assert!(McpAccessProfile::HumanReadonly.allows("eliot_canonical_status"));
 }
 
 #[test]
-fn l11_replay_profile_hash_is_stable_and_exposed() -> Result<()> {
+fn canonical_replay_profile_hash_is_stable_and_exposed() -> Result<()> {
     let profile = ReplayRunnerService::deterministic_no_mutation_profile();
     let first = canonical_struct_hash(&profile)?;
     let second = canonical_struct_hash(&profile)?;
@@ -1549,7 +1550,7 @@ fn l11_replay_profile_hash_is_stable_and_exposed() -> Result<()> {
 }
 
 #[test]
-fn l11_meta_isolation_rejects_protected_mutation() -> Result<()> {
+fn canonical_meta_isolation_rejects_protected_mutation() -> Result<()> {
     let base = json!({
         "project_id": ProjectId::new_v7(),
         "task_id": TaskId::new_v7(),
@@ -1589,7 +1590,7 @@ fn l11_meta_isolation_rejects_protected_mutation() -> Result<()> {
 }
 
 #[test]
-fn l11_replay_rejects_one_case_and_caller_verdict_fields_are_absent() -> Result<()> {
+fn canonical_replay_rejects_one_case_and_caller_verdict_fields_are_absent() -> Result<()> {
     let input = ReplayRunToolInput {
         project_id: ProjectId::new_v7().to_string(),
         task_id: TaskId::new_v7().to_string(),
@@ -1620,7 +1621,7 @@ fn l11_replay_rejects_one_case_and_caller_verdict_fields_are_absent() -> Result<
     };
     assert!(validate_canonical_replay_request(&input).is_err());
 
-    let tools = j0_tool_definitions();
+    let tools = replay_tool_definitions();
     let replay = tools
         .iter()
         .find(|tool| tool["name"] == "eliot_replay_run")
@@ -1645,7 +1646,7 @@ fn l11_replay_rejects_one_case_and_caller_verdict_fields_are_absent() -> Result<
 }
 
 #[test]
-fn l11_sleep_rejects_dangling_artifact_and_meta_classes_fail_closed() {
+fn canonical_sleep_rejects_dangling_artifact_and_meta_classes_fail_closed() {
     let artifact = eliot_types::SleepCandidateArtifact {
         artifact_id: "replay-case-candidate:deadbeef".to_owned(),
         project_id: ProjectId::new_v7(),
@@ -1674,7 +1675,7 @@ fn l11_sleep_rejects_dangling_artifact_and_meta_classes_fail_closed() {
 }
 
 #[test]
-fn l11_exact_policy_authorization_rejects_missing_hash() {
+fn canonical_exact_policy_authorization_rejects_missing_hash() {
     let input = MetaDispositionToolInput {
         project_id: ProjectId::new_v7().to_string(),
         task_id: TaskId::new_v7().to_string(),
@@ -1693,7 +1694,7 @@ fn l11_exact_policy_authorization_rejects_missing_hash() {
 }
 
 #[test]
-fn l11_tool_schemas_are_visible_to_operator_and_status_is_readonly() {
+fn canonical_tool_schemas_are_visible_to_operator_and_status_is_readonly() {
     let operator = tool_definitions_for_profile(McpAccessProfile::HumanOperator);
     let names = operator
         .iter()
@@ -1701,14 +1702,14 @@ fn l11_tool_schemas_are_visible_to_operator_and_status_is_readonly() {
         .collect::<Vec<_>>();
     assert!(names.contains(&"eliot_trace_completeness"));
     assert!(names.contains(&"eliot_meta_experiment_disposition"));
-    assert!(names.contains(&"eliot_l11_status"));
+    assert!(names.contains(&"eliot_canonical_status"));
 
     let readonly = tool_definitions_for_profile(McpAccessProfile::HumanReadonly);
     let readonly_names = readonly
         .iter()
         .filter_map(|tool| tool.get("name").and_then(Value::as_str))
         .collect::<Vec<_>>();
-    assert!(readonly_names.contains(&"eliot_l11_status"));
+    assert!(readonly_names.contains(&"eliot_canonical_status"));
     assert!(!readonly_names.contains(&"eliot_meta_experiment_disposition"));
 }
 
@@ -2702,11 +2703,11 @@ fn l13_curation_preview_classifies_only_explicit_reversible_findings() {
 #[test]
 fn l14_curation_corpus_meets_precision_recall_and_protection_gates() -> Result<()> {
     let corpus: Value = serde_json::from_str(include_str!(
-        "../../../../tests/cognitive/phase-l14/curation-corpus.json"
+        "../../../../tests/cognitive/memory-curation/curation-corpus.json"
     ))?;
     let seeded = corpus["records"]
         .as_array()
-        .context("L14 curation corpus records must be an array")?;
+        .context("memory-curation corpus records must be an array")?;
     assert_eq!(seeded.len(), 22);
     let project_id = ProjectId::new_v7();
     let task_id = TaskId::new_v7();

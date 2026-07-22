@@ -25,8 +25,8 @@ async fn codecortex_report_included_in_l3_packet() -> TestResult {
         .compile_with_codecortex(
             &CompilePacketL3Request {
                 project_id: ProjectId::new_v7(),
-                task_id: "phase-d2-code-task".to_owned(),
-                goal: "Find the Phase C MCP tools and cognitive gate implementation".to_owned(),
+                task_id: "cognitive-gate-code-task".to_owned(),
+                goal: "Find the MCP tools and cognitive gate implementation".to_owned(),
                 candidate_handles: Vec::new(),
                 max_tokens: 4_000,
             },
@@ -161,7 +161,7 @@ async fn cognitive_gate_allows_grounded_code_task_read_only() -> TestResult {
 }
 
 #[test]
-fn phase_b_c_d1_non_regression() -> TestResult {
+fn accumulated_capabilities_non_regression() -> TestResult {
     let mcp_stdio = fs::read_to_string(repo_root().join("crates/eliot-app/src/mcp_stdio.rs"))?;
     let context = fs::read_to_string(repo_root().join("crates/eliot-engine/src/context.rs"))?;
 
@@ -241,7 +241,7 @@ impl Drop for TestLock {
 }
 
 async fn migrate_schema_locked(store: &CanonicalStore) -> TestResult {
-    let lock_path = repo_root().join("target/phase-d2-migrate.lock");
+    let lock_path = repo_root().join("target/cognitive-gate-migrate.lock");
     if let Some(parent) = lock_path.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -274,9 +274,9 @@ fn code_proof(
     blast_radius_acknowledged: bool,
 ) -> UnderstandingProof {
     UnderstandingProof {
-        task_id: "phase-d2-code-proof".to_owned(),
+        task_id: "cognitive-gate-code-proof".to_owned(),
         project_id: ProjectId::new_v7(),
-        goal: "Find the Phase C MCP tools and cognitive gate implementation".to_owned(),
+        goal: "Find the MCP tools and cognitive gate implementation".to_owned(),
         code_task: true,
         current_truth_refs: Vec::new(),
         evidence_refs: Vec::new(),
@@ -325,8 +325,8 @@ fn report() -> CodeCortexReport {
     ];
     CodeCortexReport {
         project: "eliot-governor".to_owned(),
-        task: "phase-d2-test-report".to_owned(),
-        goal: "Find the Phase C MCP tools and cognitive gate implementation".to_owned(),
+        task: "cognitive-gate-test-report".to_owned(),
+        goal: "Find the MCP tools and cognitive gate implementation".to_owned(),
         generated_at: time::OffsetDateTime::now_utc(),
         repo_root: repo_root().display().to_string(),
         git_head: Some("d2-test-head".to_owned()),

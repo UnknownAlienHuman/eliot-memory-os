@@ -67,5 +67,5 @@ DEFINE INDEX OVERWRITE idx_canonical_project_task_candidate_action ON TABLE cano
 
 RETURN {
   migrated: true,
-  schema: 'phase_b_canonical_memory_core'
+  schema: 'canonical_memory_core'
 };

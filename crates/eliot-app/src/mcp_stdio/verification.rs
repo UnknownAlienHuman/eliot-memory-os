@@ -1164,7 +1164,7 @@ pub(super) async fn dispatch_procedure_candidate_create(
     let project_id = parse_project_id(&input.project_id)?;
     let task_id = TaskId::from_str(&input.task_id).context("parse procedure task_id")?;
     validate_broker_text("idempotency_key", &input.idempotency_key, 256)?;
-    let task = require_l11_task(state, project_id, task_id, input.expected_revision).await?;
+    let task = require_canonical_task(state, project_id, task_id, input.expected_revision).await?;
     let (pattern, pattern_sha256, pattern_observation_ref, pattern_receipt) =
         resolve_exact_procedure_pattern(state, project_id, task_id, &input.pattern_ref).await?;
     let (candidate_ref, candidate_sha256, input_fingerprint) = procedure_candidate_identity(
@@ -1298,7 +1298,7 @@ pub(super) async fn dispatch_procedure_candidate_disposition(
     let project_id = parse_project_id(&input.project_id)?;
     let task_id = TaskId::from_str(&input.task_id).context("parse procedure task_id")?;
     validate_broker_text("idempotency_key", &input.idempotency_key, 256)?;
-    let task = require_l11_task(state, project_id, task_id, input.expected_revision).await?;
+    let task = require_canonical_task(state, project_id, task_id, input.expected_revision).await?;
     let (pattern, pattern_sha256, pattern_observation_ref, pattern_receipt) =
         resolve_exact_procedure_pattern(state, project_id, task_id, &input.pattern_ref).await?;
     let candidate_record =

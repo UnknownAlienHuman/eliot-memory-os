@@ -3,9 +3,8 @@
 use eliot_engine::{
     AntigravityBinaryResolver, AntigravityCapabilityProbeService,
     AntigravityCommandContractService, AntigravityEnvPolicyService, AntigravityExecutionGate,
-    AntigravityMcpBoundaryService, AntigravityPluginBundleService, AntigravityRunner,
-    AntigravitySafetyPolicy, AntigravitySkillBundleService, AntigravityTelemetryService,
-    AntigravityTextOutputNormalizer, antigravity_review_request,
+    AntigravityMcpBoundaryService, AntigravityRunner, AntigravitySafetyPolicy,
+    AntigravityTelemetryService, AntigravityTextOutputNormalizer, antigravity_review_request,
 };
 use eliot_types::{
     AgentId, AgentRole, AgentSessionId, AntigravityBinaryCandidateSource,
@@ -536,65 +535,6 @@ fn candidate_diff_only_for_proposed_change() {
 }
 
 #[test]
-fn skills_generated() {
-    let bundle =
-        AntigravitySkillBundleService.generate(Path::new("plugin/eliot-antigravity"), true);
-    assert!(bundle.skills.len() >= 4);
-}
-
-#[test]
-fn skills_verify_passes() {
-    let bundle =
-        AntigravitySkillBundleService.generate(Path::new("plugin/eliot-antigravity"), true);
-    assert!(bundle.verification_passed);
-}
-
-#[test]
-fn skills_forbid_direct_agy_and_agymcp() {
-    let bundle =
-        AntigravitySkillBundleService.generate(Path::new("plugin/eliot-antigravity"), true);
-    let body = skill_body(&bundle);
-    assert!(body.contains("do not call agy directly"));
-    assert!(body.contains("do not use agy-mcp"));
-}
-
-#[test]
-fn skills_forbid_agy_mcp_and_agy_bridge_cmd() {
-    let bundle =
-        AntigravitySkillBundleService.generate(Path::new("plugin/eliot-antigravity"), true);
-    let body = skill_body(&bundle);
-    assert!(body.contains("do not use agy-mcp"));
-    assert!(!body.contains("agy_bridge_cmd"));
-}
-
-#[test]
-fn skills_forbid_live_tree_mutation() {
-    let bundle =
-        AntigravitySkillBundleService.generate(Path::new("plugin/eliot-antigravity"), true);
-    assert!(skill_body(&bundle).contains("do not mutate the live tree"));
-}
-
-#[test]
-fn plugin_bundle_generated() {
-    let bundle = AntigravityPluginBundleService.generate(Path::new("plugin/eliot-antigravity"));
-    assert!(bundle.verification_passed);
-}
-
-#[test]
-fn plugin_schema_not_invented() {
-    let bundle = AntigravityPluginBundleService.generate(Path::new("plugin/eliot-antigravity"));
-    assert!(!bundle.official_schema_detected);
-    assert!(!bundle.installable);
-}
-
-#[test]
-fn plugin_skill_install_does_not_use_agy_install_skill_mcp() {
-    let manifest = AntigravityPluginBundleService.manifest_value().to_string();
-    assert!(!manifest.contains("agy_install"));
-    assert!(!manifest.contains("skill_mcp"));
-}
-
-#[test]
 fn raw_agy_mcp_not_exposed() {
     assert!(
         AntigravityMcpBoundaryService
@@ -639,7 +579,7 @@ fn telemetry_recorded() -> TestResult {
 }
 
 #[test]
-fn phase_b_c_d_e_f0_f1_f2_f3_g0_g1_g2_h0_h1_i0_i1_i2_j0_k0_k1_k2_m0_non_regression() {
+fn accumulated_capabilities_non_regression() {
     assert!(contract().dangerous_flags_forbidden);
     assert!(
         AntigravityMcpBoundaryService
@@ -658,7 +598,7 @@ fn request(
     mode: AntigravityReviewMode,
 ) -> eliot_types::AntigravityReviewRequest {
     let mut request =
-        antigravity_review_request("eliot-governor", "phase-g3a-test", mode, "inspect");
+        antigravity_review_request("eliot-governor", "antigravity-review-test", mode, "inspect");
     request.provider_enabled = provider_enabled;
     request.work_lease_id = Some(WorkLeaseId::new_v7());
     request.worktree_lease_id = Some(WorktreeLeaseId::new_v7());
@@ -742,15 +682,6 @@ fn work_lease(request: &eliot_types::AntigravityReviewRequest) -> WorkLease {
         revoked_at: None,
         write_receipt: None,
     }
-}
-
-fn skill_body(bundle: &eliot_types::AntigravitySkillBundle) -> String {
-    bundle
-        .skills
-        .iter()
-        .map(|skill| skill.body.to_ascii_lowercase())
-        .collect::<Vec<_>>()
-        .join("\n")
 }
 
 fn temp_binary(name: &str) -> TestResult<PathBuf> {

@@ -3,7 +3,6 @@ use crate::named_pipe_ipc::{
     IPC_PROTOCOL_VERSION, pipe_name, restrict_owned_directory_to_current_user,
 };
 use anyhow::{Context, Result, bail};
-use eliot_engine::PluginVerifier;
 use eliot_store::SurrealServerSupervisor;
 use eliot_types::{CredentialProviderKind, GovernorConfig, SCHEMA_VERSION};
 use serde::{Deserialize, Serialize};
@@ -501,11 +500,6 @@ pub(crate) async fn doctor(root: &Path) -> Result<()> {
     validate_manifest_binding(&root, &manifest)?;
     let config = load_config(&manifest.config_path)?;
     let status = machine_status(&root, &manifest, &config).await;
-    let plugin_root = manifest.project_root.join("plugin").join("eliot-governor");
-    let plugin_report = PluginVerifier::new(&plugin_root).verify();
-    let plugin_ok = plugin_report
-        .as_ref()
-        .is_ok_and(|report| report.final_status == "DONE_VERIFIED");
     let codex_config = root.join("codex").join("config.toml");
     let codex_config_ok = codex_config.is_file()
         && fs::read_to_string(&codex_config).is_ok_and(|text| {
@@ -517,9 +511,6 @@ pub(crate) async fn doctor(root: &Path) -> Result<()> {
     let acl_ok = restricted_acl_status(&root);
     let token_present = root.join("runtime").join("ipc-auth.json").is_file();
     let mut blockers = Vec::new();
-    if !plugin_ok {
-        blockers.push("plugin_bundle_invalid");
-    }
     if !codex_config_ok {
         blockers.push("project_codex_config_invalid");
     }
@@ -547,7 +538,7 @@ pub(crate) async fn doctor(root: &Path) -> Result<()> {
         "daemon_health": if status.daemon_ready { "ready" } else { "not_ready" },
         "db_health": if status.db_ready { "ready" } else { "not_ready" },
         "schema_version": SCHEMA_VERSION,
-        "plugin_bundle_status": if plugin_ok { "valid" } else { "invalid" },
+        "codex_integration_model": "mcp_and_skills_no_plugin",
         "project_codex_config_status": if codex_config_ok { "valid_disposable_config" } else { "invalid" },
         "provider_kill_switch": manifest.provider_kill_switch,
         "antigravity_ledger_count": antigravity_ledger_count(&manifest.project_root),
@@ -1317,14 +1308,24 @@ fn find_codex_cli() -> Option<PathBuf> {
 fn antigravity_ledger_count(project: &Path) -> Value {
     let path = project
         .join(".eliot-governor")
-        .join("reports")
-        .join("phase-l1c-provider-review")
-        .join("latest.json");
+        .join("runtime")
+        .join("provider-call-ledger.json");
     fs::read(path)
         .ok()
         .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
-        .and_then(|value| value.get("calls_after").cloned())
-        .unwrap_or(Value::Null)
+        .and_then(|value| value.get("reservations").and_then(Value::as_array).cloned())
+        .map_or(Value::Null, |reservations| {
+            Value::from(
+                reservations
+                    .iter()
+                    .filter(|reservation| {
+                        !reservation
+                            .get("dispatch_started_at")
+                            .is_none_or(Value::is_null)
+                    })
+                    .count(),
+            )
+        })
 }
 
 fn path_starts_with_case_insensitive(path: &Path, base: &Path) -> bool {

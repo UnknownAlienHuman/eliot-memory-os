@@ -1104,10 +1104,10 @@ fn deterministic_lifecycle_context_ids(
     let agent_id = deterministic_uuid_text(b"eliot-l10-agent", &material);
     Ok((
         WriteId::from_str(&write_id).map_err(|error| {
-            EngineError::WriteRejected(format!("invalid deterministic L10 write id: {error}"))
+            EngineError::WriteRejected(format!("invalid deterministic lifecycle write id: {error}"))
         })?,
         AgentId::from_str(&agent_id).map_err(|error| {
-            EngineError::WriteRejected(format!("invalid deterministic L10 agent id: {error}"))
+            EngineError::WriteRejected(format!("invalid deterministic lifecycle agent id: {error}"))
         })?,
     ))
 }

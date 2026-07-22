@@ -24,11 +24,8 @@ pub(super) fn dispatch_eval_case_list(arguments: Value) -> Result<Value> {
 
 pub(super) fn dispatch_eval_suite_list(state: &McpState, arguments: Value) -> Result<Value> {
     let input: EvalSuiteToolInput = serde_json::from_value(arguments)?;
-    let artifacts = mcp_eval_artifacts(
-        state,
-        input.suite.as_deref().unwrap_or("k0-core-smoke"),
-        None,
-    )?;
+    let artifacts =
+        mcp_eval_artifacts(state, input.suite.as_deref().unwrap_or("core-smoke"), None)?;
     Ok(json!({
         "component": "eval_suite_list",
         "bounded": true,
@@ -46,13 +43,10 @@ pub(super) fn dispatch_eval_run(state: &McpState, arguments: Value) -> Result<Va
         .map(normalized_cli_value)
         .is_some_and(|profile| profile != "deterministicnomutation")
     {
-        anyhow::bail!("K0 MCP eval run supports only deterministic-no-mutation profile");
+        anyhow::bail!("core MCP eval runs support only the deterministic-no-mutation profile");
     }
-    let artifacts = mcp_eval_artifacts(
-        state,
-        input.suite.as_deref().unwrap_or("k0-core-smoke"),
-        None,
-    )?;
+    let artifacts =
+        mcp_eval_artifacts(state, input.suite.as_deref().unwrap_or("core-smoke"), None)?;
     serde_json::to_value(json!({
         "component": "eval_run",
         "bounded": true,
@@ -64,7 +58,7 @@ pub(super) fn dispatch_eval_run(state: &McpState, arguments: Value) -> Result<Va
 
 pub(super) fn dispatch_eval_verdict(state: &McpState, arguments: Value) -> Result<Value> {
     let input: EvalRunRefToolInput = serde_json::from_value(arguments)?;
-    let artifacts = mcp_eval_artifacts(state, "k0-core-smoke", None)?;
+    let artifacts = mcp_eval_artifacts(state, "core-smoke", None)?;
     if let Some(run) = input.run.as_deref()
         && run != "latest"
         && run != artifacts.run.eval_run_id.to_string()
@@ -81,7 +75,7 @@ pub(super) fn dispatch_eval_verdict(state: &McpState, arguments: Value) -> Resul
 }
 
 pub(super) fn dispatch_eval_report(state: &McpState) -> Result<Value> {
-    let artifacts = mcp_eval_artifacts(state, "k0-core-smoke", None)?;
+    let artifacts = mcp_eval_artifacts(state, "core-smoke", None)?;
     let report = json!({
         "component": "eval_report",
         "bounded": true,
@@ -100,11 +94,8 @@ pub(super) fn dispatch_eval_report(state: &McpState) -> Result<Value> {
 
 pub(super) fn dispatch_eval_smoke(state: &McpState, arguments: Value) -> Result<Value> {
     let input: EvalSuiteToolInput = serde_json::from_value(arguments)?;
-    let artifacts = mcp_eval_artifacts(
-        state,
-        input.suite.as_deref().unwrap_or("k0-core-smoke"),
-        None,
-    )?;
+    let artifacts =
+        mcp_eval_artifacts(state, input.suite.as_deref().unwrap_or("core-smoke"), None)?;
     serde_json::to_value(json!({
         "component": "eval_smoke",
         "bounded": true,
@@ -123,11 +114,8 @@ pub(super) fn dispatch_eval_smoke(state: &McpState, arguments: Value) -> Result<
 
 pub(super) fn dispatch_eval_coverage(state: &McpState, arguments: Value) -> Result<Value> {
     let input: EvalSuiteToolInput = serde_json::from_value(arguments)?;
-    let artifacts = mcp_eval_artifacts(
-        state,
-        input.suite.as_deref().unwrap_or("k0-core-smoke"),
-        None,
-    )?;
+    let artifacts =
+        mcp_eval_artifacts(state, input.suite.as_deref().unwrap_or("core-smoke"), None)?;
     let coverage = EvalCoverageService::matrix(
         project_id_from_label("eliot-governor"),
         std::slice::from_ref(&artifacts.suite),
@@ -145,11 +133,8 @@ pub(super) fn dispatch_eval_coverage(state: &McpState, arguments: Value) -> Resu
 
 pub(super) fn dispatch_eval_baseline_list(state: &McpState, arguments: Value) -> Result<Value> {
     let input: EvalSuiteToolInput = serde_json::from_value(arguments)?;
-    let artifacts = mcp_eval_artifacts(
-        state,
-        input.suite.as_deref().unwrap_or("k0-core-smoke"),
-        None,
-    )?;
+    let artifacts =
+        mcp_eval_artifacts(state, input.suite.as_deref().unwrap_or("core-smoke"), None)?;
     let baseline = mcp_diagnostic_baseline(&artifacts);
     let report = json!({
         "component": "eval_baselines",
@@ -166,11 +151,8 @@ pub(super) fn dispatch_eval_baseline_list(state: &McpState, arguments: Value) ->
 
 pub(super) fn dispatch_eval_compare(state: &McpState, arguments: Value) -> Result<Value> {
     let input: EvalCompareToolInput = serde_json::from_value(arguments)?;
-    let artifacts = mcp_eval_artifacts(
-        state,
-        input.suite.as_deref().unwrap_or("k0-core-smoke"),
-        None,
-    )?;
+    let artifacts =
+        mcp_eval_artifacts(state, input.suite.as_deref().unwrap_or("core-smoke"), None)?;
     if input
         .candidate_run
         .as_deref()
@@ -209,12 +191,9 @@ pub(super) fn dispatch_eval_compare(state: &McpState, arguments: Value) -> Resul
 
 pub(super) fn dispatch_eval_gate(state: &McpState, arguments: Value) -> Result<Value> {
     let input: EvalGateToolInput = serde_json::from_value(arguments)?;
-    let artifacts = mcp_eval_artifacts(
-        state,
-        input.suite.as_deref().unwrap_or("k0-core-smoke"),
-        None,
-    )?;
-    let profile_id = input.profile.as_deref().unwrap_or("phase-minimal");
+    let artifacts =
+        mcp_eval_artifacts(state, input.suite.as_deref().unwrap_or("core-smoke"), None)?;
+    let profile_id = input.profile.as_deref().unwrap_or("fast-deterministic");
     let profile = EvalGateProfileService::find(profile_id)
         .with_context(|| format!("unknown eval gate profile: {profile_id}"))?;
     let baseline = mcp_diagnostic_baseline(&artifacts);
@@ -259,11 +238,8 @@ pub(super) fn dispatch_eval_profiles(state: &McpState) -> Result<Value> {
 
 pub(super) fn dispatch_eval_trend(state: &McpState, arguments: Value) -> Result<Value> {
     let input: EvalSuiteToolInput = serde_json::from_value(arguments)?;
-    let artifacts = mcp_eval_artifacts(
-        state,
-        input.suite.as_deref().unwrap_or("k0-core-smoke"),
-        None,
-    )?;
+    let artifacts =
+        mcp_eval_artifacts(state, input.suite.as_deref().unwrap_or("core-smoke"), None)?;
     let trend = EvalTrendService::trend(
         &artifacts.suite,
         &[artifacts.run.clone(), artifacts.run.clone()],
@@ -420,7 +396,7 @@ pub(super) fn mcp_metrics_dashboard_report(state: &McpState) -> Result<Dashboard
     Ok(report)
 }
 
-pub(super) fn mcp_metrics_registry_report(state: &McpState) -> Result<McpMetricsRegistryReport> {
+fn mcp_metrics_registry_report(state: &McpState) -> Result<McpMetricsRegistryReport> {
     let definitions = MetricRegistryService.definitions();
     for definition in &definitions {
         MetricRegistryService.validate_definition(definition)?;
@@ -435,7 +411,7 @@ pub(super) fn mcp_metrics_registry_report(state: &McpState) -> Result<McpMetrics
     Ok(report)
 }
 
-pub(super) fn mcp_metrics_samples_report(state: &McpState) -> Result<McpMetricsSamplesReport> {
+fn mcp_metrics_samples_report(state: &McpState) -> Result<McpMetricsSamplesReport> {
     let definitions = MetricRegistryService.definitions();
     let report = McpMetricsSamplesReport {
         component: "metrics_samples".to_owned(),
@@ -446,7 +422,7 @@ pub(super) fn mcp_metrics_samples_report(state: &McpState) -> Result<McpMetricsS
     Ok(report)
 }
 
-pub(super) fn mcp_metrics_rollup_report(
+fn mcp_metrics_rollup_report(
     state: &McpState,
     samples: &[MetricSample],
 ) -> Result<McpMetricsRollupReport> {
@@ -463,7 +439,7 @@ pub(super) fn mcp_metrics_rollup_report(
     Ok(report)
 }
 
-pub(super) fn mcp_metrics_slo_report(
+fn mcp_metrics_slo_report(
     state: &McpState,
     rollup: &TelemetryRollup,
 ) -> Result<McpMetricsSloReport> {
@@ -478,7 +454,7 @@ pub(super) fn mcp_metrics_slo_report(
     Ok(report)
 }
 
-pub(super) fn mcp_metrics_latency_report(
+fn mcp_metrics_latency_report(
     state: &McpState,
     rollup: &TelemetryRollup,
 ) -> Result<McpMetricsLatencyReport> {
@@ -491,7 +467,7 @@ pub(super) fn mcp_metrics_latency_report(
     Ok(report)
 }
 
-pub(super) fn mcp_metrics_cost_report(state: &McpState) -> Result<McpMetricsCostReport> {
+fn mcp_metrics_cost_report(state: &McpState) -> Result<McpMetricsCostReport> {
     let report = McpMetricsCostReport {
         component: "metrics_cost".to_owned(),
         cost: CostLedgerService.ledger(
@@ -504,7 +480,7 @@ pub(super) fn mcp_metrics_cost_report(state: &McpState) -> Result<McpMetricsCost
     Ok(report)
 }
 
-pub(super) fn mcp_metrics_quality_report(state: &McpState) -> Result<McpMetricsQualityReport> {
+fn mcp_metrics_quality_report(state: &McpState) -> Result<McpMetricsQualityReport> {
     let report = McpMetricsQualityReport {
         component: "metrics_quality".to_owned(),
         signals: QualitySignalService.signals(),
@@ -568,7 +544,7 @@ struct McpEvalArtifacts {
     fixture_failure_cluster: EvalFailureCluster,
 }
 
-pub(super) fn mcp_diagnostic_baseline(artifacts: &McpEvalArtifacts) -> EvalBaseline {
+fn mcp_diagnostic_baseline(artifacts: &McpEvalArtifacts) -> EvalBaseline {
     EvalBaselineService::create_diagnostic(
         &artifacts.suite,
         &artifacts.manifest,
@@ -578,7 +554,7 @@ pub(super) fn mcp_diagnostic_baseline(artifacts: &McpEvalArtifacts) -> EvalBasel
     )
 }
 
-pub(super) fn mcp_eval_artifacts(
+fn mcp_eval_artifacts(
     state: &McpState,
     suite_name: &str,
     mutation_attempt: Option<String>,
@@ -588,11 +564,11 @@ pub(super) fn mcp_eval_artifacts(
     let mut suite = EvalSuiteService::create(EvalSuiteInput {
         project_id,
         name: suite_name.to_owned(),
-        purpose: "K0 governed MCP deterministic no-mutation suite".to_owned(),
+        purpose: "Governed MCP deterministic no-mutation suite".to_owned(),
         cases: cases.iter().map(|case| case.eval_case_id).collect(),
         fixed: false,
         holdout: true,
-        created_from_refs: vec!["phase-k0:mcp".to_owned()],
+        created_from_refs: vec!["eval:mcp".to_owned()],
     });
     EvalSuiteService::freeze(&mut suite);
     let manifest = EvalDatasetManifestService::manifest(&suite, &cases);
@@ -637,11 +613,11 @@ pub(super) fn mcp_eval_artifacts(
 pub(super) fn mcp_k0_cases() -> Vec<EvalCase> {
     EvalCaseService::k0_core_cases(
         project_id_from_label("eliot-governor"),
-        Some(task_id_from_label("phase-k0-mcp")),
+        Some(task_id_from_label("core-eval-mcp")),
     )
 }
 
-pub(super) fn write_mcp_eval_reports(
+fn write_mcp_eval_reports(
     state: &McpState,
     artifacts: &McpEvalArtifacts,
     experiment: &eliot_types::HarnessExperimentRecord,

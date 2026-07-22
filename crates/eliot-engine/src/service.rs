@@ -518,7 +518,7 @@ pub struct ReadinessFixture {
     pub writer_self_check: bool,
     pub read_self_check: bool,
     pub ipc_listening: bool,
-    pub phase_minimal_eval_gate_passed: bool,
+    pub fast_deterministic_eval_gate_passed: bool,
     pub blocking_incident: bool,
 }
 
@@ -532,7 +532,7 @@ impl ReadinessFixture {
             writer_self_check: true,
             read_self_check: true,
             ipc_listening: true,
-            phase_minimal_eval_gate_passed: true,
+            fast_deterministic_eval_gate_passed: true,
             blocking_incident: false,
         }
     }
@@ -582,8 +582,8 @@ impl ProductionReadinessService {
         );
         push_check(
             &mut checks,
-            fixture.phase_minimal_eval_gate_passed,
-            ServiceReadinessCheck::PhaseMinimalEvalGatePassed,
+            fixture.fast_deterministic_eval_gate_passed,
+            ServiceReadinessCheck::FastDeterministicEvalGatePassed,
         );
         push_check(
             &mut checks,
@@ -596,7 +596,7 @@ impl ProductionReadinessService {
             && fixture.writer_self_check
             && fixture.read_self_check
             && fixture.ipc_listening
-            && fixture.phase_minimal_eval_gate_passed
+            && fixture.fast_deterministic_eval_gate_passed
             && !fixture.blocking_incident;
         let status = if fixture.blocking_incident {
             ServiceReadinessStatus::IncidentLockdown
@@ -755,7 +755,7 @@ impl ServiceDoctorIntegration {
         readiness: &ServiceReadinessProbe,
         restart_receipt: &ServiceRestartReceipt,
         startup_recovery: &StartupRecoveryReceipt,
-        phase_minimal_eval_gate_passed: bool,
+        fast_deterministic_eval_gate_passed: bool,
         blocking_incidents: bool,
     ) -> Value {
         json!({
@@ -778,7 +778,7 @@ impl ServiceDoctorIntegration {
             "readiness": readiness.status,
             "restart_budget": restart_receipt.status,
             "startup_recovery": startup_recovery.status,
-            "phase_minimal_eval_gate_passed": phase_minimal_eval_gate_passed,
+            "fast_deterministic_eval_gate_passed": fast_deterministic_eval_gate_passed,
             "blocking_incidents": blocking_incidents
         })
     }

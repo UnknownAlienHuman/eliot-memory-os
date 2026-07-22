@@ -26,7 +26,8 @@ type TestResult<T = ()> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
 #[test]
 fn skill_card_v2_defaults_to_candidate_and_is_audit_only() {
-    let candidate = SkillRegistryService::create_candidate("audit candidate", "phase-i1-test");
+    let candidate =
+        SkillRegistryService::create_candidate("audit candidate", "skill-lifecycle-test");
     let context = skill_context(candidate.skill_id);
     let activation = SkillActivationGate::decide(&candidate, &context);
 
@@ -202,7 +203,7 @@ fn action_lease_rejects_skills_that_bypass_activation_gate() {
         understanding_receipt: &receipt,
         cognitive_gate_decision: &gate,
         codecortex_reports: &[report],
-        current_git_head: Some("phase-i1-head"),
+        current_git_head: Some("skill-lifecycle-head"),
         work_lease: None,
         incident_lockdown_active: false,
     });
@@ -237,7 +238,7 @@ fn action_lease_allows_governed_skill_activation_for_non_execution_plan() {
         understanding_receipt: &receipt,
         cognitive_gate_decision: &gate,
         codecortex_reports: &[report],
-        current_git_head: Some("phase-i1-head"),
+        current_git_head: Some("skill-lifecycle-head"),
         work_lease: None,
         incident_lockdown_active: false,
     });
@@ -336,7 +337,7 @@ async fn skill_execution_proof_and_influence_report_write_through_writer_actor()
     let mut influence = SkillInfluenceService::report(SkillInfluenceReportInput {
         project_id,
         task_id,
-        packet_id: Some("packet:phase-i1".to_owned()),
+        packet_id: Some("packet:skill-lifecycle".to_owned()),
         considered: vec![skill.skill_id, SkillId::new_v7()],
         included: vec![skill.skill_id],
         executed: vec![skill.skill_id],
@@ -371,22 +372,22 @@ fn skill_with_state(state: SkillLifecycleState) -> eliot_types::SkillCardV2 {
     let skill_id = SkillId::new_v7();
     eliot_types::SkillCardV2 {
         skill_id,
-        name: "phase i1 scoped skill".to_owned(),
-        purpose: "apply the Phase I1 verifier-backed procedural path".to_owned(),
+        name: "skill lifecycle scoped skill".to_owned(),
+        purpose: "apply the verifier-backed procedural path".to_owned(),
         level: SkillLevel::Procedure,
         lifecycle_state: state,
         applies_when: vec![SkillScopeRule {
-            rule_id: "phase-i1-scope".to_owned(),
-            description: "phase i1 skill lifecycle".to_owned(),
-            positive_examples: vec!["phase i1 skill lifecycle".to_owned()],
+            rule_id: "skill-lifecycle-scope".to_owned(),
+            description: "skill lifecycle skill lifecycle".to_owned(),
+            positive_examples: vec!["skill lifecycle skill lifecycle".to_owned()],
             negative_examples: vec!["unrelated runtime".to_owned()],
-            required_evidence_refs: vec!["runbook:phase-i1".to_owned()],
+            required_evidence_refs: vec!["runbook:skill-lifecycle".to_owned()],
         }],
         does_not_apply_when: vec![SkillScopeRule {
-            rule_id: "phase-i1-anti-scope".to_owned(),
+            rule_id: "skill-lifecycle-anti-scope".to_owned(),
             description: "unrelated runtime".to_owned(),
             positive_examples: vec!["unrelated runtime".to_owned()],
-            negative_examples: vec!["phase i1 skill lifecycle".to_owned()],
+            negative_examples: vec!["skill lifecycle skill lifecycle".to_owned()],
             required_evidence_refs: Vec::new(),
         }],
         required_inputs: vec![SkillInputRequirement {
@@ -425,13 +426,13 @@ fn skill_with_state(state: SkillLifecycleState) -> eliot_types::SkillCardV2 {
             negative_memory_refs: vec!["failure:scope-drift".to_owned()],
         }],
         rollback_or_recovery: Some("archive or quarantine the skill".to_owned()),
-        source_trace_refs: vec!["runbook:phase-i1".to_owned()],
-        replay_result_refs: vec!["replay:phase-i1".to_owned()],
+        source_trace_refs: vec!["runbook:skill-lifecycle".to_owned()],
+        replay_result_refs: vec!["replay:skill-lifecycle".to_owned()],
         success_count: 2,
         failure_count: 0,
         last_verified_at: Some(now),
         version: "1.0.0".to_owned(),
-        owner: "phase-i1-test".to_owned(),
+        owner: "skill-lifecycle-test".to_owned(),
         created_at: now,
         updated_at: now,
     }
@@ -439,8 +440,8 @@ fn skill_with_state(state: SkillLifecycleState) -> eliot_types::SkillCardV2 {
 
 fn skill_context(skill_id: SkillId) -> SkillActivationContext {
     SkillActivationContext {
-        goal: "phase i1 skill lifecycle runbook:phase-i1".to_owned(),
-        evidence_refs: vec!["runbook:phase-i1".to_owned()],
+        goal: "skill lifecycle skill lifecycle runbook:skill-lifecycle".to_owned(),
+        evidence_refs: vec!["runbook:skill-lifecycle".to_owned()],
         available_input_sources: vec![SkillInputSource::UserPrompt],
         available_input_names: vec!["task_goal".to_owned()],
         available_capabilities: vec!["rust-toolchain".to_owned()],
@@ -487,7 +488,7 @@ fn understanding_proof(
     UnderstandingProof {
         task_id: task_id.to_string(),
         project_id,
-        goal: "phase i1 skill lifecycle".to_owned(),
+        goal: "skill lifecycle skill lifecycle".to_owned(),
         code_task: true,
         current_truth_refs: Vec::new(),
         evidence_refs: Vec::new(),
@@ -509,7 +510,7 @@ fn understanding_proof(
         blast_radius_acknowledged: true,
         skill_refs: vec![skill_id],
         skill_application_rationales: if include_skill_grounding {
-            vec!["task matches phase i1 scope".to_owned()]
+            vec!["task matches skill lifecycle scope".to_owned()]
         } else {
             Vec::new()
         },
@@ -561,7 +562,7 @@ fn receipt_from_errors(
         project_id,
         accepted: validation_errors.is_empty(),
         validation_errors,
-        checked_refs: vec!["skill:phase-i1".to_owned()],
+        checked_refs: vec!["skill:skill-lifecycle".to_owned()],
         code_task: false,
         codecortex_report_refs: Vec::new(),
         files_to_change: Vec::new(),
@@ -579,7 +580,7 @@ fn action_receipt(
         project_id,
         accepted: true,
         validation_errors: Vec::new(),
-        checked_refs: vec![report_ref.clone(), "skill:phase-i1".to_owned()],
+        checked_refs: vec![report_ref.clone(), "skill:skill-lifecycle".to_owned()],
         code_task: true,
         codecortex_report_refs: vec![report_ref],
         files_to_change: vec!["crates/eliot-engine/src/skill.rs".to_owned()],
@@ -601,8 +602,8 @@ fn action_request(
         agent_id,
         goal: "inspect governed skill path".to_owned(),
         requested_action_kind: ActionKind::ReadOnlyInspect,
-        understanding_proof_ref: "understanding_proof:phase-i1".to_owned(),
-        cognitive_gate_ref: "cognitive_gate:phase-i1".to_owned(),
+        understanding_proof_ref: "understanding_proof:skill-lifecycle".to_owned(),
+        cognitive_gate_ref: "cognitive_gate:skill-lifecycle".to_owned(),
         codecortex_report_refs: vec![codecortex_report_ref(&report)],
         skill_refs: vec![skill_id],
         skill_activation_decisions: vec![eliot_types::SkillActivationRecord {
@@ -641,21 +642,21 @@ fn completion_proof(
     CompletionProof {
         task_id: task_id.to_string(),
         project_id,
-        goal: "phase i1 skill lifecycle".to_owned(),
+        goal: "skill lifecycle skill lifecycle".to_owned(),
         changed_files: vec!["crates/eliot-engine/src/skill.rs".to_owned()],
-        memory_refs_used: vec!["skill:phase-i1".to_owned()],
-        evidence: vec!["proof:phase-i1".to_owned()],
+        memory_refs_used: vec!["skill:skill-lifecycle".to_owned()],
+        evidence: vec!["proof:skill-lifecycle".to_owned()],
         checks_run: vec!["just verify".to_owned()],
         checks_not_run: Vec::new(),
         acceptance_items: vec![CompletionAcceptanceItem {
             item: "skill proof is verifier-backed".to_owned(),
             status: "verified".to_owned(),
-            evidence: "proof:phase-i1".to_owned(),
+            evidence: "proof:skill-lifecycle".to_owned(),
             verifier: "just verify".to_owned(),
             residual_uncertainty: "none".to_owned(),
         }],
         skill_refs: vec![skill_id],
-        skill_execution_proof_refs: vec!["skill-execution-proof:phase-i1".to_owned()],
+        skill_execution_proof_refs: vec!["skill-execution-proof:skill-lifecycle".to_owned()],
         residual_uncertainty: "none".to_owned(),
         known_risks: Vec::new(),
     }
@@ -664,7 +665,7 @@ fn completion_proof(
 fn codecortex_report() -> CodeCortexReport {
     let file = FileEvidence {
         path: "crates/eliot-engine/src/skill.rs".to_owned(),
-        content_hash: Some("hash-phase-i1-skill".to_owned()),
+        content_hash: Some("hash-skill-lifecycle-skill".to_owned()),
         line_start: Some(1),
         line_end: Some(120),
         excerpt: "pub struct SkillActivationGate".to_owned(),
@@ -672,11 +673,11 @@ fn codecortex_report() -> CodeCortexReport {
     };
     CodeCortexReport {
         project: "eliot-governor".to_owned(),
-        task: "phase-i1".to_owned(),
-        goal: "phase i1 skill lifecycle".to_owned(),
+        task: "skill-lifecycle".to_owned(),
+        goal: "skill lifecycle skill lifecycle".to_owned(),
         generated_at: time::OffsetDateTime::now_utc(),
         repo_root: repo_root().display().to_string(),
-        git_head: Some("phase-i1-head".to_owned()),
+        git_head: Some("skill-lifecycle-head".to_owned()),
         dirty: false,
         tracked_files: vec![file.clone()],
         workspace_members: vec!["eliot-engine".to_owned()],
@@ -708,7 +709,7 @@ fn codecortex_report() -> CodeCortexReport {
         blast_radius: BlastRadiusView {
             files: vec!["crates/eliot-engine/src/skill.rs".to_owned()],
             crates: vec!["eliot-engine".to_owned()],
-            reasons: vec!["Phase I1 skill lifecycle service coverage".to_owned()],
+            reasons: vec!["Skill lifecycle service coverage".to_owned()],
         },
         invariant_cards: vec![InvariantCard {
             name: "skills_do_not_bypass_gates".to_owned(),
@@ -763,8 +764,10 @@ struct Harness {
 
 impl Harness {
     async fn new(name: &str) -> TestResult<Self> {
-        let root =
-            std::env::temp_dir().join(format!("eliot-phase-i1-{name}-{}", std::process::id()));
+        let root = std::env::temp_dir().join(format!(
+            "eliot-skill-lifecycle-{name}-{}",
+            std::process::id()
+        ));
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(&root)?;
         let mut config = GovernorConfig::default();

@@ -221,7 +221,8 @@ pub enum DelegationPolicyPromotionDecisionKind {
     RequireMoreRealTasks,
     RequireMoreExecutedReviews,
     RequireHumanReview,
-    ReadyForL1BExperiment,
+    #[serde(alias = "ready_for_l1_b_experiment")]
+    ReadyForProviderExperiment,
     DenySafetyViolation,
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]

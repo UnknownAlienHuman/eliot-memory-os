@@ -1260,10 +1260,10 @@ impl EvalComparisonService {
             result.status = EvalCaseStatus::Failed;
             result
                 .errors
-                .push("intentional K1 regression fixture".to_owned());
+                .push("intentional integration regression fixture".to_owned());
             if let Some(measurement) = result.measurements.first_mut() {
                 measurement.passed = false;
-                "intentional K1 regression fixture".clone_into(&mut measurement.observed);
+                "intentional integration regression fixture".clone_into(&mut measurement.observed);
             }
         }
         clone.finished_at = Some(OffsetDateTime::now_utc());
@@ -1277,10 +1277,10 @@ impl EvalGateProfileService {
     pub fn built_in_profiles() -> Vec<EvalRegressionGateProfile> {
         vec![
             profile(
-                "phase-minimal",
-                "Phase Minimal",
-                "Fast deterministic gate required for future phase closeouts.",
-                vec!["k0-core-smoke"],
+                "fast-deterministic",
+                "Fast Deterministic",
+                "Fast deterministic regression gate for governed changes.",
+                vec!["core-smoke"],
                 vec![
                     EvalFamily::Understand,
                     EvalFamily::Hallucination,
@@ -1301,10 +1301,10 @@ impl EvalGateProfileService {
                 0,
             ),
             profile(
-                "phase-standard",
-                "Phase Standard",
+                "architecture-standard",
+                "Architecture Standard",
                 "Broader deterministic gate for larger architectural changes.",
-                vec!["k0-core-smoke"],
+                vec!["core-smoke"],
                 runnable_k0_families().to_vec(),
                 runnable_k0_families().to_vec(),
                 false,
@@ -1313,8 +1313,8 @@ impl EvalGateProfileService {
             profile(
                 "provider-integration",
                 "Provider Integration",
-                "Gate before real external provider adapters; provider family remains placeholder until G2.",
-                vec!["k0-core-smoke"],
+                "Gate before real external provider adapters; provider family remains a placeholder until implemented.",
+                vec!["core-smoke"],
                 vec![
                     EvalFamily::Tool,
                     EvalFamily::Hallucination,
@@ -1336,7 +1336,7 @@ impl EvalGateProfileService {
                 "production-release",
                 "Production Release",
                 "Gate before production daemon or service cutover.",
-                vec!["k0-core-smoke"],
+                vec!["core-smoke"],
                 vec![
                     EvalFamily::Done,
                     EvalFamily::Trace,
@@ -1757,7 +1757,7 @@ pub fn harness_experiment_record(run: &EvalRun, verdict: &EvalVerdict) -> Harnes
         eval_run_id: run.eval_run_id,
         profile_id: run.profile.profile_id.clone(),
         verdict_id: Some(verdict.eval_verdict_id),
-        notes: vec!["K0 harness run is deterministic and report-only".to_owned()],
+        notes: vec!["core harness run is deterministic and report-only".to_owned()],
         no_mutation_confirmed: run.profile.no_mutation
             && !verdict.mutates_current_truth
             && !verdict.mutates_memory_lifecycle
@@ -1779,7 +1779,7 @@ pub fn harness_experiment_record(run: &EvalRun, verdict: &EvalVerdict) -> Harnes
         primary_metric_refs: Vec::new(),
         counter_metric_refs: Vec::new(),
         reproducibility_hash: String::new(),
-        uncertainty: "K0 record predates L11 holdout disposition".to_owned(),
+        uncertainty: "legacy record predates the current holdout disposition".to_owned(),
         decision: MetaExperimentDecision::InsufficientEvidence,
         authorized_command_ref: None,
         rollback_target_ref: String::new(),
@@ -1878,7 +1878,7 @@ fn default_case(
         task_id,
         family,
         name: name.to_owned(),
-        description: format!("K0 deterministic eval case for {slug}"),
+        description: format!("deterministic eval case for {slug}"),
         fixture_ref: format!("fixture:k0:{slug}"),
         holdout: true,
         criteria,
@@ -2237,7 +2237,7 @@ fn risk_coverage(cases: &[EvalCase]) -> Vec<EvalRiskCoverage> {
         ),
         risk(
             "risk-provider-real-eval",
-            "Real external provider evals are not implemented in K1.",
+            "Real external provider evals are not implemented in the integration suite.",
             EvalRegressionSeverity::Warning,
             &[EvalFamily::Provider],
             cases,
@@ -2245,7 +2245,7 @@ fn risk_coverage(cases: &[EvalCase]) -> Vec<EvalRiskCoverage> {
         ),
         risk(
             "risk-ale-real-eval",
-            "ALE eval coverage is schema-only in K1.",
+            "ALE eval coverage is schema-only.",
             EvalRegressionSeverity::Warning,
             &[EvalFamily::Ale],
             cases,
@@ -2253,7 +2253,7 @@ fn risk_coverage(cases: &[EvalCase]) -> Vec<EvalRiskCoverage> {
         ),
         risk(
             "risk-future-suite-expansion",
-            "Future phase eval families remain placeholders until their runbooks define cases.",
+            "Deferred eval families remain placeholders until their runbooks define cases.",
             EvalRegressionSeverity::Info,
             &[EvalFamily::Future],
             cases,
@@ -3126,7 +3126,7 @@ fn build_meta_experiment_record(
         profile_id: input.profile_id,
         verdict_id: input.verdict_id,
         notes: if blocking_reasons.is_empty() {
-            vec!["L11 experiment passed but remains candidate-only pending authorization".to_owned()]
+            vec!["experiment passed but remains candidate-only pending authorization".to_owned()]
         } else {
             blocking_reasons
         },

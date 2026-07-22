@@ -383,7 +383,7 @@ pub enum MemorySynthesisTaintReason {
     OfflineConsolidation,
 }
 
-/// The production L11 trace contract is exactly these thirteen evidence parts.
+/// The production canonical trace contract is exactly these thirteen evidence parts.
 pub const CANONICAL_TRACE_EVIDENCE_PART_COUNT: usize = 13;
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]

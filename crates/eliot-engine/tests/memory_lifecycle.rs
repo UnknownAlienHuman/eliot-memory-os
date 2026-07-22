@@ -334,7 +334,7 @@ fn doctor_reports_memory_pressure() -> TestResult {
 }
 
 #[test]
-fn phase_b_c_d_e_f0_f1_f2_f3_g0_g1_h0_non_regression() -> TestResult {
+fn accumulated_capabilities_non_regression() -> TestResult {
     let app = fs::read_to_string(repo_root().join("crates/eliot-app/src/mcp_stdio.rs"))?;
     let context = fs::read_to_string(repo_root().join("crates/eliot-engine/src/context.rs"))?;
     let safety = fs::read_to_string(repo_root().join("crates/eliot-engine/src/safety.rs"))?;
@@ -433,8 +433,10 @@ struct Harness {
 
 impl Harness {
     async fn new(name: &str) -> TestResult<Self> {
-        let root =
-            std::env::temp_dir().join(format!("eliot-phase-i0-{name}-{}", std::process::id()));
+        let root = std::env::temp_dir().join(format!(
+            "eliot-memory-lifecycle-{name}-{}",
+            std::process::id()
+        ));
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(&root)?;
         let mut config = GovernorConfig::default();
@@ -511,7 +513,7 @@ impl Drop for TestLock {
 }
 
 async fn migrate_schema_locked(store: &CanonicalStore) -> TestResult {
-    let lock_path = repo_root().join("target/phase-i0-migrate.lock");
+    let lock_path = repo_root().join("target/memory-lifecycle-migrate.lock");
     if let Some(parent) = lock_path.parent() {
         fs::create_dir_all(parent)?;
     }

@@ -486,9 +486,9 @@ impl ProviderRouteReadinessService {
     }
 }
 
-pub fn l1c_timeout_profile() -> ProviderTimeoutProfile {
+pub fn antigravity_plan_timeout_profile() -> ProviderTimeoutProfile {
     ProviderTimeoutProfile {
-        profile_id: "provider-timeout-profile:l1c-r:antigravity-plan-print-1".to_owned(),
+        profile_id: "provider-timeout-profile:antigravity-plan-print-1".to_owned(),
         provider: "antigravity".to_owned(),
         route_or_operation_class: "agy plan print audit".to_owned(),
         spawn_deadline_ms: None,
@@ -515,7 +515,7 @@ pub fn l1c_timeout_profile() -> ProviderTimeoutProfile {
             "no automatic retry".to_owned(),
             "no infinite wait".to_owned(),
         ],
-        policy_version: "l1c-r-timeout-1".to_owned(),
+        policy_version: "antigravity-plan-timeout-1".to_owned(),
     }
 }
 

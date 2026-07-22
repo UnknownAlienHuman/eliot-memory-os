@@ -466,7 +466,7 @@ impl CampaignIntegrityReconciliationService {
                     integrity_status: status,
                     promotion_eligible,
                     exclusion_reasons: reasons.clone(),
-                    decided_by_rule_version: "l1b-r-integrity-1".to_owned(),
+                    decided_by_rule_version: "provider-budget-integrity-1".to_owned(),
                     evidence_refs: vec![
                         review.provider_gate_decision_ref.clone(),
                         review.trace_ref.clone(),
@@ -499,7 +499,7 @@ impl CampaignIntegrityReconciliationService {
                 } else {
                     vec!["campaign_call_budget_exceeded".to_owned()]
                 },
-                decided_by_rule_version: "l1b-r-integrity-1".to_owned(),
+                decided_by_rule_version: "provider-budget-integrity-1".to_owned(),
                 evidence_refs: assessment.evidence_refs.clone(),
                 decided_at: OffsetDateTime::now_utc(),
             });
@@ -519,7 +519,7 @@ impl CampaignIntegrityReconciliationService {
                     exclusion_reasons: vec![
                         "mixed_campaign_lineage_contains_over_budget_call".to_owned(),
                     ],
-                    decided_by_rule_version: "l1b-r-integrity-1".to_owned(),
+                    decided_by_rule_version: "provider-budget-integrity-1".to_owned(),
                     evidence_refs: vec![campaign.campaign_id.clone()],
                     decided_at: OffsetDateTime::now_utc(),
                 });
@@ -560,7 +560,7 @@ impl CampaignIntegrityReconciliationService {
             .first()
             .map_or(campaign.created_at, |review| review.started_at);
         let details = CampaignIntegrityIncidentDetails {
-            phase: "L1B".to_owned(),
+            phase: "provider_budget_integrity".to_owned(),
             campaign_id: campaign.campaign_id.clone(),
             invariant: "campaign_provider_call_budget_preserved".to_owned(),
             campaign_limit: campaign.budget.max_provider_calls,
@@ -586,7 +586,6 @@ impl CampaignIntegrityReconciliationService {
             failed_control_boundary: "atomic campaign call-slot reservation before external dispatch"
                 .to_owned(),
             affected_reports: vec![
-                "reports/phase-l1b/latest.json".to_owned(),
                 "reports/delegation-calibration-campaign/latest.json".to_owned(),
                 "reports/delegation-promotion-gate/latest.json".to_owned(),
             ],
@@ -594,9 +593,9 @@ impl CampaignIntegrityReconciliationService {
                 "second provider call, review, calibration sample and utility assessment remain observed but are excluded from promotion inputs"
                     .to_owned(),
             containment: vec![
-                "historical L1B remains FAILED_VERIFIER".to_owned(),
+                "the historical over-budget sample remains excluded".to_owned(),
                 "over-budget lineage is promotion_eligible=false".to_owned(),
-                "L1B-R verification permits zero external provider dispatches".to_owned(),
+                "integrity reconciliation permits zero external provider dispatches".to_owned(),
             ],
             permanent_prevention: vec![
                 "file-locked persisted ProviderCallReservationOwner".to_owned(),
@@ -626,13 +625,12 @@ impl CampaignIntegrityReconciliationService {
             opened_at,
             acknowledged_at: Some(OffsetDateTime::now_utc()),
             closed_at: None,
-            evidence_refs: vec![
-                "reports/phase-l1b/latest.json".to_owned(),
-                "reports/delegation-calibration-campaign/latest.json".to_owned(),
-            ],
+            evidence_refs: vec!["reports/delegation-calibration-campaign/latest.json".to_owned()],
             last_known_safe_refs: vec![campaign.baseline_commit.clone()],
-            recovery_commands: vec!["just phase-l1b-r".to_owned()],
-            summary: "L1B provider call budget exceeded: two real calls under a one-call campaign"
+            recovery_commands: vec![
+                "cargo run -p eliot-app -- delegation-calibration integrity-reconcile".to_owned(),
+            ],
+            summary: "provider call budget exceeded: two real calls under a one-call campaign"
                 .to_owned(),
             campaign_integrity: Some(details),
         };
@@ -1026,9 +1024,9 @@ impl ProviderUtilityAssessmentService {
     }
 }
 
-pub struct L1cCorpusEligibilityService;
+pub struct PreregisteredCorpusEligibilityService;
 
-impl L1cCorpusEligibilityService {
+impl PreregisteredCorpusEligibilityService {
     #[allow(clippy::too_many_lines)]
     pub fn decide(
         &self,
@@ -1040,13 +1038,13 @@ impl L1cCorpusEligibilityService {
             .campaigns
             .iter()
             .find(|item| item.campaign_id == campaign_id)
-            .ok_or_else(|| "L1C campaign does not exist".to_owned())?
+            .ok_or_else(|| "calibration campaign does not exist".to_owned())?
             .clone();
         let preregistration = state
             .preregistrations
             .iter()
             .find(|item| item.campaign_id == campaign_id)
-            .ok_or_else(|| "L1C preregistration does not exist".to_owned())?
+            .ok_or_else(|| "provider preregistration does not exist".to_owned())?
             .clone();
         let reviews = state
             .executed_reviews
@@ -1055,7 +1053,9 @@ impl L1cCorpusEligibilityService {
             .cloned()
             .collect::<Vec<_>>();
         if reviews.len() != 1 {
-            return Err("L1C eligibility requires exactly one executed review".to_owned());
+            return Err(
+                "preregistered corpus eligibility requires exactly one executed review".to_owned(),
+            );
         }
         let review = &reviews[0];
         let assessment = state
@@ -1063,7 +1063,7 @@ impl L1cCorpusEligibilityService {
             .iter()
             .find(|item| item.review_id == review.review_id)
             .cloned()
-            .ok_or_else(|| "L1C utility assessment does not exist".to_owned())?;
+            .ok_or_else(|| "provider utility assessment does not exist".to_owned())?;
         let independent_evidence_complete = !assessment.evidence_refs.is_empty()
             && assessment.evidence_refs.iter().all(|evidence_id| {
                 state.independent_evidence.iter().any(|evidence| {
@@ -1752,7 +1752,7 @@ impl DelegationPromotionGateService {
             decision,
             reasons,
             required_followups: vec![
-                "human review is mandatory before any L1B experiment".to_owned(),
+                "human review is mandatory before any provider experiment".to_owned(),
             ],
             created_at: OffsetDateTime::now_utc(),
         }

@@ -15,13 +15,14 @@ pub(super) async fn dispatch_meta_experiment_run(
     context: AuthenticatedRequestContext,
     arguments: Value,
 ) -> Result<Value> {
-    require_l11_controller_authority(state)?;
+    require_canonical_controller_authority(state)?;
     let input: MetaExperimentToolInput = serde_json::from_value(arguments)?;
     let project_id = parse_project_id(&input.project_id)?;
-    let task_id = TaskId::from_str(&input.task_id).context("parse L11 meta task_id")?;
-    let task = require_l11_task(state, project_id, task_id, input.expected_task_revision).await?;
+    let task_id = TaskId::from_str(&input.task_id).context("parse meta experiment task_id")?;
+    let task =
+        require_canonical_task(state, project_id, task_id, input.expected_task_revision).await?;
     let fingerprint = canonical_struct_hash(&input)?;
-    let experiment_key = l11_idempotency_key(&input.idempotency_key, "meta-experiment")?;
+    let experiment_key = canonical_idempotency_key(&input.idempotency_key, "meta-experiment")?;
     let expected_write = deterministic_canonical_write_id(
         project_id,
         Some(task_id),
@@ -41,7 +42,7 @@ pub(super) async fn dispatch_meta_experiment_run(
         if !existing
             .receipt_body
             .notes
-            .contains(&l11_fingerprint_marker(&fingerprint))
+            .contains(&canonical_fingerprint_marker(&fingerprint))
         {
             anyhow::bail!("meta experiment idempotency conflict");
         }
@@ -139,7 +140,9 @@ pub(super) async fn dispatch_meta_experiment_run(
         attempted_fence: input.attempted_fence.clone(),
     })?;
     let mut experiment = assessment.records.experiment.clone();
-    experiment.notes.push(l11_fingerprint_marker(&fingerprint));
+    experiment
+        .notes
+        .push(canonical_fingerprint_marker(&fingerprint));
     experiment.authoritative_metric_evidence = assessment.records.metric_evidence.clone();
     experiment.authoritative_isolation_rejection = assessment.records.isolation_rejection.clone();
     experiment.authoritative_policy_candidate = if assessment.eligible_for_promotion {
@@ -185,7 +188,7 @@ struct AuthoritativeMetaRecords<'a> {
     candidate: Option<&'a eliot_types::ExperimentalMetaPolicyCandidate>,
 }
 
-pub(super) fn authoritative_meta_records<'a>(
+fn authoritative_meta_records<'a>(
     experiment: &'a eliot_types::HarnessExperimentRecord,
     fingerprint: &str,
 ) -> Result<AuthoritativeMetaRecords<'a>> {
@@ -196,7 +199,7 @@ pub(super) fn authoritative_meta_records<'a>(
     };
     if !experiment
         .notes
-        .contains(&l11_fingerprint_marker(fingerprint))
+        .contains(&canonical_fingerprint_marker(fingerprint))
         || experiment.authoritative_metric_evidence.is_empty()
         || records.rejection.is_some_and(|record| {
             record.source_experiment_ref != experiment_ref
@@ -231,9 +234,10 @@ pub(super) async fn reconcile_authoritative_meta_experiment(
     let scope = (project_id, task_id);
     let mut metric_receipts = Vec::new();
     for (index, metric) in experiment.authoritative_metric_evidence.iter().enumerate() {
-        let key = l11_idempotency_key(&input.idempotency_key, &format!("meta-metric-{index}"))?;
+        let key =
+            canonical_idempotency_key(&input.idempotency_key, &format!("meta-metric-{index}"))?;
         metric_receipts.push(
-            reconcile_l11_record(
+            reconcile_canonical_record(
                 state,
                 context,
                 scope,
@@ -245,9 +249,9 @@ pub(super) async fn reconcile_authoritative_meta_experiment(
         );
     }
     let isolation_receipt = if let Some(rejection) = rejection {
-        let key = l11_idempotency_key(&input.idempotency_key, "meta-isolation-rejection")?;
+        let key = canonical_idempotency_key(&input.idempotency_key, "meta-isolation-rejection")?;
         Some(
-            reconcile_l11_record(
+            reconcile_canonical_record(
                 state,
                 context,
                 scope,
@@ -262,8 +266,8 @@ pub(super) async fn reconcile_authoritative_meta_experiment(
     };
     require_receipted_meta_rejection(rejection.is_some(), isolation_receipt.is_some())?;
     let policy_candidate = if let Some(candidate) = candidate {
-        let key = l11_idempotency_key(&input.idempotency_key, "meta-policy-candidate")?;
-        let candidate_receipt = reconcile_l11_record(
+        let key = canonical_idempotency_key(&input.idempotency_key, "meta-policy-candidate")?;
+        let candidate_receipt = reconcile_canonical_record(
             state,
             context,
             scope,
@@ -510,7 +514,7 @@ pub(super) async fn rehydrate_meta_policy_action_replay(
     } else {
         return Ok(None);
     };
-    let action_key = l11_idempotency_key(&input.idempotency_key, action_suffix)?;
+    let action_key = canonical_idempotency_key(&input.idempotency_key, action_suffix)?;
     let expected_action_write =
         deterministic_canonical_write_id(project_id, Some(task_id), kind, &action_key);
     let Some(execution) = state
@@ -531,7 +535,7 @@ pub(super) async fn rehydrate_meta_policy_action_replay(
     {
         anyhow::bail!("meta policy idempotency key was reused for a different exact action");
     }
-    let state_key = l11_idempotency_key(&input.idempotency_key, state_suffix)?;
+    let state_key = canonical_idempotency_key(&input.idempotency_key, state_suffix)?;
     let expected_state_write = deterministic_canonical_write_id(
         project_id,
         Some(task_id),
@@ -552,7 +556,7 @@ pub(super) async fn rehydrate_meta_policy_action_replay(
     {
         anyhow::bail!("meta policy action and candidate state are not an exact pair");
     }
-    let candidate_receipt = reconcile_l11_record(
+    let candidate_receipt = reconcile_canonical_record(
         state,
         context,
         (project_id, task_id),
@@ -677,12 +681,13 @@ pub(super) async fn dispatch_meta_experiment_disposition(
     context: AuthenticatedRequestContext,
     arguments: Value,
 ) -> Result<Value> {
-    require_l11_controller_authority(state)?;
+    require_canonical_controller_authority(state)?;
     let _commit_guard = m2_meta_commit_serializer().lock().await;
     let input: MetaDispositionToolInput = serde_json::from_value(arguments)?;
     let project_id = parse_project_id(&input.project_id)?;
-    let task_id = TaskId::from_str(&input.task_id).context("parse L11 disposition task_id")?;
-    let task = require_l11_task(state, project_id, task_id, input.expected_task_revision).await?;
+    let task_id = TaskId::from_str(&input.task_id).context("parse meta disposition task_id")?;
+    let task =
+        require_canonical_task(state, project_id, task_id, input.expected_task_revision).await?;
     let experiment =
         canonical_meta_experiment(state, project_id, task_id, &input.experiment_id).await?;
     revalidate_meta_experiment_trace_authority(state, &task, &experiment.receipt_body).await?;
@@ -740,8 +745,9 @@ pub(super) async fn dispatch_meta_experiment_disposition(
             &promotion.receipt_body,
             &authorization,
         )?;
-        let rollback_key = l11_idempotency_key(&input.idempotency_key, "meta-policy-rollback")?;
-        let rollback_receipt = persist_l11_record(
+        let rollback_key =
+            canonical_idempotency_key(&input.idempotency_key, "meta-policy-rollback")?;
+        let rollback_receipt = persist_canonical_record(
             state,
             context,
             project_id,
@@ -756,8 +762,9 @@ pub(super) async fn dispatch_meta_experiment_disposition(
             &input.idempotency_key,
             "meta rollback action",
         )?;
-        let state_key = l11_idempotency_key(&input.idempotency_key, "meta-policy-rolled-back")?;
-        let state_receipt = persist_l11_record(
+        let state_key =
+            canonical_idempotency_key(&input.idempotency_key, "meta-policy-rolled-back")?;
+        let state_receipt = persist_canonical_record(
             state,
             context,
             project_id,
@@ -829,8 +836,9 @@ pub(super) async fn dispatch_meta_experiment_disposition(
             &assessment,
             &authorization,
         )?;
-        let promotion_key = l11_idempotency_key(&input.idempotency_key, "meta-policy-promotion")?;
-        let promotion_receipt = persist_l11_record(
+        let promotion_key =
+            canonical_idempotency_key(&input.idempotency_key, "meta-policy-promotion")?;
+        let promotion_receipt = persist_canonical_record(
             state,
             context,
             project_id,
@@ -845,8 +853,8 @@ pub(super) async fn dispatch_meta_experiment_disposition(
             &input.idempotency_key,
             "meta promotion action",
         )?;
-        let state_key = l11_idempotency_key(&input.idempotency_key, "meta-policy-promoted")?;
-        let state_receipt = persist_l11_record(
+        let state_key = canonical_idempotency_key(&input.idempotency_key, "meta-policy-promoted")?;
+        let state_receipt = persist_canonical_record(
             state,
             context,
             project_id,
@@ -898,7 +906,7 @@ pub(super) async fn dispatch_meta_experiment_disposition(
         }));
     }
     let fingerprint = canonical_struct_hash(&input)?;
-    let disposition_key = l11_idempotency_key(&input.idempotency_key, "meta-disposition")?;
+    let disposition_key = canonical_idempotency_key(&input.idempotency_key, "meta-disposition")?;
     let assessment = MetaExperimentAssessment {
         record: experiment.receipt_body.clone(),
         eligible_for_promotion: false,
@@ -917,7 +925,9 @@ pub(super) async fn dispatch_meta_experiment_disposition(
             rollback_command_ref: String::new(),
         },
     )?;
-    disposition.notes.push(l11_fingerprint_marker(&fingerprint));
+    disposition
+        .notes
+        .push(canonical_fingerprint_marker(&fingerprint));
     let (receipt, write_status) = write_canonical_observation(
         state,
         context,
@@ -958,12 +968,12 @@ pub(super) async fn reject_distinct_meta_terminal_action(
     Ok(())
 }
 
-pub(super) async fn dispatch_l11_status(state: &McpState, arguments: Value) -> Result<Value> {
-    let input: L11StatusToolInput = serde_json::from_value(arguments)?;
+pub(super) async fn dispatch_canonical_status(state: &McpState, arguments: Value) -> Result<Value> {
+    let input: CanonicalStatusToolInput = serde_json::from_value(arguments)?;
     let project_id = parse_project_id(&input.project_id)?;
-    let task_id = TaskId::from_str(&input.task_id).context("parse L11 status task_id")?;
+    let task_id = TaskId::from_str(&input.task_id).context("parse canonical status task_id")?;
     let task = require_task(state, project_id, task_id).await?;
-    let traces = l11_trace_records(state, project_id, task_id).await?;
+    let traces = canonical_trace_records(state, project_id, task_id).await?;
     let sleep = state
         .store
         .sleep_view(project_id, Some(task_id), 128)
@@ -1013,7 +1023,7 @@ pub(super) async fn dispatch_l11_status(state: &McpState, arguments: Value) -> R
         .collect::<Vec<_>>();
     let complete_replay_executions = complete_authoritative_replay_executions(&replay);
     Ok(json!({
-        "component": "l11_status",
+        "component": "canonical_status",
         "project_id": project_id,
         "task_id": task_id,
         "task_revision": task.memory_revision,
