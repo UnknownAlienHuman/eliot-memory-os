@@ -73,6 +73,7 @@ fn codecortex_rg_finds_known_symbol() -> TestResult {
 }
 
 #[tokio::test]
+#[ignore = "requires an authenticated local SurrealDB"]
 async fn codecortex_report_written_to_memory() -> TestResult {
     let _guard = lock_tests().await;
     let harness = Harness::new("codecortex-report-write").await?;

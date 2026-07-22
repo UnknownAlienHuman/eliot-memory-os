@@ -21,6 +21,7 @@ use tokio::time::{Duration, sleep};
 type TestResult<T = ()> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
 #[tokio::test]
+#[ignore = "requires an authenticated local SurrealDB"]
 async fn compile_packet_l3_budgeted() -> TestResult {
     let _guard = lock_tests().await;
     let harness = Harness::new("compile-budgeted").await?;
@@ -41,6 +42,7 @@ async fn compile_packet_l3_budgeted() -> TestResult {
 }
 
 #[tokio::test]
+#[ignore = "requires an authenticated local SurrealDB"]
 async fn compile_packet_l3_separates_verified_supported_weak() -> TestResult {
     let _guard = lock_tests().await;
     let harness = Harness::new("compile-separates").await?;
@@ -77,6 +79,7 @@ async fn compile_packet_l3_separates_verified_supported_weak() -> TestResult {
 }
 
 #[tokio::test]
+#[ignore = "requires an authenticated local SurrealDB"]
 async fn understanding_proof_rejects_missing_evidence() -> TestResult {
     let _guard = lock_tests().await;
     let harness = Harness::new("proof-missing-evidence").await?;
@@ -100,6 +103,7 @@ async fn understanding_proof_rejects_missing_evidence() -> TestResult {
 }
 
 #[tokio::test]
+#[ignore = "requires an authenticated local SurrealDB"]
 async fn understanding_proof_rejects_weak_claim_as_truth() -> TestResult {
     let _guard = lock_tests().await;
     let harness = Harness::new("proof-weak-truth").await?;
@@ -123,6 +127,7 @@ async fn understanding_proof_rejects_weak_claim_as_truth() -> TestResult {
 }
 
 #[tokio::test]
+#[ignore = "requires an authenticated local SurrealDB"]
 async fn cognitive_gate_allows_valid_proof() -> TestResult {
     let _guard = lock_tests().await;
     let harness = Harness::new("gate-valid").await?;

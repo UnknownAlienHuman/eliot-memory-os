@@ -16,6 +16,7 @@ use tokio::time::{Duration, sleep};
 type TestResult<T = ()> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
 #[tokio::test]
+#[ignore = "requires an authenticated local SurrealDB"]
 async fn codecortex_report_included_in_l3_packet() -> TestResult {
     let _guard = lock_tests().await;
     let harness = Harness::new("d2-l3-codecortex").await?;
@@ -70,6 +71,7 @@ async fn codecortex_report_included_in_l3_packet() -> TestResult {
 }
 
 #[tokio::test]
+#[ignore = "requires an authenticated local SurrealDB"]
 async fn understanding_proof_requires_codecortex_for_code_task() -> TestResult {
     let _guard = lock_tests().await;
     let harness = Harness::new("d2-proof-requires-codecortex").await?;
@@ -87,6 +89,7 @@ async fn understanding_proof_requires_codecortex_for_code_task() -> TestResult {
 }
 
 #[tokio::test]
+#[ignore = "requires an authenticated local SurrealDB"]
 async fn cognitive_gate_blocks_code_task_without_codecortex() -> TestResult {
     let _guard = lock_tests().await;
     let harness = Harness::new("d2-gate-missing-codecortex").await?;
@@ -103,6 +106,7 @@ async fn cognitive_gate_blocks_code_task_without_codecortex() -> TestResult {
 }
 
 #[tokio::test]
+#[ignore = "requires an authenticated local SurrealDB"]
 async fn cognitive_gate_blocks_stale_or_missing_code_refs() -> TestResult {
     let _guard = lock_tests().await;
     let harness = Harness::new("d2-gate-stale-codecortex").await?;
@@ -131,6 +135,7 @@ async fn cognitive_gate_blocks_stale_or_missing_code_refs() -> TestResult {
 }
 
 #[tokio::test]
+#[ignore = "requires an authenticated local SurrealDB"]
 async fn cognitive_gate_allows_grounded_code_task_read_only() -> TestResult {
     let _guard = lock_tests().await;
     let harness = Harness::new("d2-gate-grounded-code").await?;

@@ -1103,6 +1103,7 @@ async fn persist_physical_restart_baseline(
 }
 
 #[tokio::test]
+#[ignore = "requires an authenticated local SurrealDB"]
 async fn physical_surreal_restart_preserves_canonical_l10_l12_records() -> Result<(), Box<dyn Error>>
 {
     let mut root = RestartTestRoot::new()?;
@@ -1211,6 +1212,7 @@ async fn physical_surreal_restart_preserves_canonical_l10_l12_records() -> Resul
 
 #[tokio::test]
 #[allow(clippy::too_many_lines)]
+#[ignore = "requires an authenticated local SurrealDB"]
 async fn exact_result_and_latest_authority_queries_survive_bounded_history()
 -> Result<(), Box<dyn Error>> {
     let mut root = RestartTestRoot::new()?;
@@ -1348,6 +1350,7 @@ async fn exact_result_and_latest_authority_queries_survive_bounded_history()
 }
 
 #[tokio::test]
+#[ignore = "requires an authenticated local SurrealDB"]
 async fn authenticated_canonical_blob_reference_scan_is_complete_and_evidence_bound()
 -> Result<(), Box<dyn Error>> {
     let mut root = RestartTestRoot::new()?;
@@ -1569,6 +1572,7 @@ async fn canonical_claim_lookup_resolves_exact_candidate_and_project_scope()
 }
 
 #[tokio::test]
+#[ignore = "requires an authenticated local SurrealDB"]
 async fn canonical_operator_paging_survives_restart_without_gaps_or_duplicates()
 -> Result<(), Box<dyn Error>> {
     let mut root = RestartTestRoot::new()?;

@@ -140,6 +140,7 @@ fn memory_gravity_generated() {
 }
 
 #[tokio::test]
+#[ignore = "requires an authenticated local SurrealDB"]
 async fn suppression_receipt_written_through_writer_actor() -> TestResult {
     let receipt = SuppressionReceipt {
         suppression_id: "suppression:test".to_owned(),
@@ -160,6 +161,7 @@ async fn suppression_receipt_written_through_writer_actor() -> TestResult {
 }
 
 #[tokio::test]
+#[ignore = "requires an authenticated local SurrealDB"]
 async fn demotion_receipt_written_through_writer_actor() -> TestResult {
     let receipt = DemotionReceipt {
         demotion_id: "demotion:test".to_owned(),
@@ -180,6 +182,7 @@ async fn demotion_receipt_written_through_writer_actor() -> TestResult {
 }
 
 #[tokio::test]
+#[ignore = "requires an authenticated local SurrealDB"]
 async fn supersession_receipt_written_through_writer_actor() -> TestResult {
     let receipt = SupersessionReceipt {
         supersession_id: "supersession:test".to_owned(),
@@ -200,6 +203,7 @@ async fn supersession_receipt_written_through_writer_actor() -> TestResult {
 }
 
 #[tokio::test]
+#[ignore = "requires an authenticated local SurrealDB"]
 async fn archive_receipt_written_through_writer_actor() -> TestResult {
     let receipt = ArchiveReceipt {
         archive_id: "archive:test".to_owned(),
@@ -289,6 +293,7 @@ fn l3_packet_includes_lifecycle_section() {
 }
 
 #[tokio::test]
+#[ignore = "requires an authenticated local SurrealDB"]
 async fn context_compiler_writes_memory_influence_report() -> TestResult {
     let _compiler_symbol = std::any::type_name::<ContextCompiler>();
     let mut report = MemoryInfluenceService::report(

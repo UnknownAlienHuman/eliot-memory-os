@@ -20,6 +20,7 @@ use std::time::{Duration, Instant};
 type TestResult<T = ()> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
 #[test]
+#[ignore = "requires a provisioned local Governor runtime: a running daemon, an authenticated SurrealDB and a git identity"]
 fn host_role_grant_uses_the_live_daemon_writer() -> TestResult {
     let _guard = TestLock::acquire()?;
     let project_id = uuid::Uuid::new_v4().to_string();
@@ -88,6 +89,7 @@ fn host_role_grant_uses_the_live_daemon_writer() -> TestResult {
 }
 
 #[test]
+#[ignore = "requires a provisioned local Governor runtime: a running daemon, an authenticated SurrealDB and a git identity"]
 fn concurrent_host_role_grants_preserve_both_broker_mutations() -> TestResult {
     let _guard = TestLock::acquire()?;
     let project_id = uuid::Uuid::new_v4().to_string();
@@ -174,6 +176,7 @@ fn concurrent_host_role_grants_preserve_both_broker_mutations() -> TestResult {
 
 #[test]
 #[allow(clippy::too_many_lines)]
+#[ignore = "requires a provisioned local Governor runtime: a running daemon, an authenticated SurrealDB and a git identity"]
 fn operator_lifecycle_write_is_query_visible_idempotent_and_reconnect_safe() -> TestResult {
     let _guard = TestLock::acquire()?;
     let project_id = "10000000-0000-0000-0000-000000000041";
@@ -329,6 +332,7 @@ fn operator_lifecycle_write_is_query_visible_idempotent_and_reconnect_safe() -> 
 }
 
 #[test]
+#[ignore = "requires a provisioned local Governor runtime: a running daemon, an authenticated SurrealDB and a git identity"]
 fn operator_revalidation_request_uses_receipted_executor() -> TestResult {
     let _guard = TestLock::acquire()?;
     let project_id = uuid::Uuid::new_v4().to_string();
@@ -397,6 +401,7 @@ fn operator_revalidation_request_uses_receipted_executor() -> TestResult {
 
 #[test]
 #[allow(clippy::too_many_lines)]
+#[ignore = "requires a provisioned local Governor runtime: a running daemon, an authenticated SurrealDB and a git identity"]
 fn procedure_candidate_disposition_is_canonical_idempotent_and_never_activates() -> TestResult {
     let _guard = TestLock::acquire()?;
     let project_id = uuid::Uuid::new_v4().to_string();
@@ -759,6 +764,7 @@ fn procedure_candidate_disposition_is_canonical_idempotent_and_never_activates()
 }
 
 #[test]
+#[ignore = "requires a provisioned local Governor runtime: a running daemon, an authenticated SurrealDB and a git identity"]
 fn operator_cursor_survives_physical_daemon_restart_and_rejects_tampering() -> TestResult {
     let _guard = TestLock::acquire()?;
     let project_id = uuid::Uuid::new_v4().to_string();
@@ -862,6 +868,7 @@ fn operator_cursor_survives_physical_daemon_restart_and_rejects_tampering() -> T
 
 #[test]
 #[allow(clippy::too_many_lines)]
+#[ignore = "requires a provisioned local Governor runtime: a running daemon, an authenticated SurrealDB and a git identity"]
 fn operator_candidate_review_promotes_or_rejects_through_governed_writer() -> TestResult {
     let _guard = TestLock::acquire()?;
     let project_id = uuid::Uuid::new_v4().to_string();
@@ -1275,6 +1282,7 @@ fn operator_candidate_review_promotes_or_rejects_through_governed_writer() -> Te
 
 #[test]
 #[allow(clippy::too_many_lines)]
+#[ignore = "requires a provisioned local Governor runtime: a running daemon, an authenticated SurrealDB and a git identity"]
 fn canonical_m2_runtime_is_receipted_sealed_exact_and_restart_safe() -> TestResult {
     let _guard = TestLock::acquire()?;
     let project_id = uuid::Uuid::new_v4().to_string();
@@ -1796,6 +1804,7 @@ fn canonical_m2_runtime_is_receipted_sealed_exact_and_restart_safe() -> TestResu
 }
 
 #[test]
+#[ignore = "requires a provisioned local Governor runtime: a running daemon, an authenticated SurrealDB and a git identity"]
 fn canonical_m2_stale_trace_fails_closed_after_task_revision_advances() -> TestResult {
     let _guard = TestLock::acquire()?;
     let project_id = uuid::Uuid::new_v4().to_string();
@@ -1847,6 +1856,7 @@ fn canonical_m2_stale_trace_fails_closed_after_task_revision_advances() -> TestR
 }
 
 #[test]
+#[ignore = "requires a provisioned local Governor runtime: a running daemon, an authenticated SurrealDB and a git identity"]
 fn canonical_sleep_aggregate_heals_partial_secondaries_after_restart() -> TestResult {
     let _guard = TestLock::acquire()?;
     let project_id = uuid::Uuid::new_v4().to_string();
@@ -1890,6 +1900,7 @@ fn canonical_sleep_aggregate_heals_partial_secondaries_after_restart() -> TestRe
 }
 
 #[test]
+#[ignore = "requires a provisioned local Governor runtime: a running daemon, an authenticated SurrealDB and a git identity"]
 fn canonical_m2_interrupted_aggregates_heal_exactly_after_restart() -> TestResult {
     let _guard = TestLock::acquire()?;
     let project_id = uuid::Uuid::new_v4().to_string();
@@ -2240,6 +2251,7 @@ fn assert_interrupted_rejected_meta_heals(
 }
 
 #[test]
+#[ignore = "requires a provisioned local Governor runtime: a running daemon, an authenticated SurrealDB and a git identity"]
 fn canonical_m2_exact_authority_survives_projection_saturation_and_restart() -> TestResult {
     let _guard = TestLock::acquire()?;
     let project_id = uuid::Uuid::new_v4().to_string();
@@ -2375,6 +2387,7 @@ fn assert_saturated_sleep_heals(context: &M2InterruptedContext<'_>) -> TestResul
 
 #[test]
 #[allow(clippy::too_many_lines)]
+#[ignore = "requires a provisioned local Governor runtime: a running daemon, an authenticated SurrealDB and a git identity"]
 fn bounded_autonomy_runtime_is_durable_scoped_and_verifier_gated() -> TestResult {
     let _guard = TestLock::acquire()?;
     let project_id = uuid::Uuid::new_v4().to_string();
@@ -3581,6 +3594,7 @@ struct M3ClaimedWorkFixture {
 
 #[test]
 #[allow(clippy::too_many_lines)]
+#[ignore = "requires a provisioned local Governor runtime: a running daemon, an authenticated SurrealDB and a git identity"]
 fn managed_finalization_restarts_every_stage_and_converges_without_provider_dispatch() -> TestResult
 {
     let _guard = TestLock::acquire()?;
@@ -3846,6 +3860,7 @@ fn managed_finalization_restarts_every_stage_and_converges_without_provider_disp
 }
 
 #[test]
+#[ignore = "requires a provisioned local Governor runtime: a running daemon, an authenticated SurrealDB and a git identity"]
 fn managed_finalization_rejects_local_only_invocation_authority() -> TestResult {
     let _guard = TestLock::acquire()?;
     let fixture = prepare_managed_finalization_fixture_with_invocation_authority(
@@ -3903,6 +3918,7 @@ fn managed_finalization_rejects_local_only_invocation_authority() -> TestResult 
 }
 
 #[test]
+#[ignore = "requires a provisioned local Governor runtime: a running daemon, an authenticated SurrealDB and a git identity"]
 fn managed_finalization_rejects_local_invocation_mismatch_with_canonical() -> TestResult {
     let _guard = TestLock::acquire()?;
     let fixture = prepare_managed_finalization_fixture("canonical-request-mismatch")?;
@@ -3966,6 +3982,7 @@ fn managed_finalization_rejects_local_invocation_mismatch_with_canonical() -> Te
 }
 
 #[test]
+#[ignore = "requires a provisioned local Governor runtime: a running daemon, an authenticated SurrealDB and a git identity"]
 fn managed_aggregate_replay_rejects_reset_extra_commit_and_worktree_drift() -> TestResult {
     let _guard = TestLock::acquire()?;
     for mode in ["reset", "extra-commit", "worktree-drift"] {
@@ -4184,6 +4201,7 @@ fn managed_test_hash_json(value: &Value) -> TestResult<String> {
 }
 
 #[test]
+#[ignore = "requires a provisioned local Governor runtime: a running daemon, an authenticated SurrealDB and a git identity"]
 fn managed_finalization_rejects_missing_fabricated_and_mismatched_actual_verifier_refs()
 -> TestResult {
     let _guard = TestLock::acquire()?;
@@ -4249,6 +4267,7 @@ fn managed_finalization_rejects_missing_fabricated_and_mismatched_actual_verifie
 
 #[test]
 #[allow(clippy::too_many_lines)]
+#[ignore = "requires a provisioned local Governor runtime: a running daemon, an authenticated SurrealDB and a git identity"]
 fn task_completion_and_managed_finalization_race_has_one_serialized_authority_order() -> TestResult
 {
     let _guard = TestLock::acquire()?;
@@ -4419,6 +4438,7 @@ fn task_completion_and_managed_finalization_race_has_one_serialized_authority_or
 
 #[test]
 #[allow(clippy::too_many_lines)]
+#[ignore = "requires a provisioned local Governor runtime: a running daemon, an authenticated SurrealDB and a git identity"]
 fn second_process_verification_waits_until_managed_finalization_materializes() -> TestResult {
     let _guard = TestLock::acquire()?;
     let fixture = prepare_managed_finalization_fixture("verification-finalization-lock-race")?;
@@ -6271,6 +6291,7 @@ fn required_test_u64(value: &Value, pointer: &str) -> TestResult<u64> {
 
 #[test]
 #[allow(clippy::too_many_lines)]
+#[ignore = "requires a provisioned local Governor runtime: a running daemon, an authenticated SurrealDB and a git identity"]
 fn mcp_tools_list_contains_only_governed_tools() -> TestResult {
     let _guard = TestLock::acquire()?;
     let mut client = McpClient::start()?;
@@ -6447,6 +6468,7 @@ fn mcp_tools_list_contains_only_governed_tools() -> TestResult {
 }
 
 #[test]
+#[ignore = "requires a provisioned local Governor runtime: a running daemon, an authenticated SurrealDB and a git identity"]
 fn mcp_exposes_only_governed_external_review_tools() -> TestResult {
     let _guard = TestLock::acquire()?;
     let mut client = McpClient::start()?;
@@ -6481,6 +6503,7 @@ fn mcp_exposes_only_governed_external_review_tools() -> TestResult {
 }
 
 #[test]
+#[ignore = "requires a provisioned local Governor runtime: a running daemon, an authenticated SurrealDB and a git identity"]
 fn mcp_exposes_no_real_provider_raw_exec_secret_patch_truth_tools() -> TestResult {
     let _guard = TestLock::acquire()?;
     let mut client = McpClient::start()?;
@@ -6513,6 +6536,7 @@ fn mcp_exposes_no_real_provider_raw_exec_secret_patch_truth_tools() -> TestResul
 }
 
 #[test]
+#[ignore = "requires a provisioned local Governor runtime: a running daemon, an authenticated SurrealDB and a git identity"]
 fn mcp_exposes_only_governed_antigravity_tools() -> TestResult {
     let _guard = TestLock::acquire()?;
     let mut client = McpClient::start()?;
@@ -6545,6 +6569,7 @@ fn mcp_exposes_only_governed_antigravity_tools() -> TestResult {
 }
 
 #[test]
+#[ignore = "requires a provisioned local Governor runtime: a running daemon, an authenticated SurrealDB and a git identity"]
 fn mcp_exposes_no_raw_agy_agymcp_login_install_shell_secret_patch_truth_tools() -> TestResult {
     let _guard = TestLock::acquire()?;
     let mut client = McpClient::start()?;
@@ -6570,6 +6595,7 @@ fn mcp_exposes_no_raw_agy_agymcp_login_install_shell_secret_patch_truth_tools() 
 }
 
 #[test]
+#[ignore = "requires a provisioned local Governor runtime: a running daemon, an authenticated SurrealDB and a git identity"]
 fn mcp_antigravity_auditor_profile_is_narrow_and_audited() -> TestResult {
     let _guard = TestLock::acquire()?;
     let mut client = McpClient::start_with_profile("external_auditor")?;
@@ -6621,6 +6647,7 @@ fn mcp_antigravity_auditor_profile_is_narrow_and_audited() -> TestResult {
 }
 
 #[test]
+#[ignore = "requires a provisioned local Governor runtime: a running daemon, an authenticated SurrealDB and a git identity"]
 fn antigravity_auditor_profile_has_minimal_tools() -> TestResult {
     let _guard = TestLock::acquire()?;
     let mut client = McpClient::start_with_profile("external_auditor")?;
@@ -6664,6 +6691,7 @@ fn antigravity_auditor_profile_has_minimal_tools() -> TestResult {
 }
 
 #[test]
+#[ignore = "requires a provisioned local Governor runtime: a running daemon, an authenticated SurrealDB and a git identity"]
 fn antigravity_auditor_profile_denies_antigravity_recursion() -> TestResult {
     let _guard = TestLock::acquire()?;
     let mut client = McpClient::start_with_profile("external_auditor")?;
@@ -6682,6 +6710,7 @@ fn antigravity_auditor_profile_denies_antigravity_recursion() -> TestResult {
 }
 
 #[test]
+#[ignore = "requires a provisioned local Governor runtime: a running daemon, an authenticated SurrealDB and a git identity"]
 fn antigravity_auditor_profile_denies_patch_runner() -> TestResult {
     let _guard = TestLock::acquire()?;
     let mut client = McpClient::start_with_profile("external_auditor")?;
@@ -6693,6 +6722,7 @@ fn antigravity_auditor_profile_denies_patch_runner() -> TestResult {
 }
 
 #[test]
+#[ignore = "requires a provisioned local Governor runtime: a running daemon, an authenticated SurrealDB and a git identity"]
 fn antigravity_auditor_profile_denies_completion_authority() -> TestResult {
     let _guard = TestLock::acquire()?;
     let mut client = McpClient::start_with_profile("external_auditor")?;
@@ -6702,6 +6732,7 @@ fn antigravity_auditor_profile_denies_completion_authority() -> TestResult {
 }
 
 #[test]
+#[ignore = "requires a provisioned local Governor runtime: a running daemon, an authenticated SurrealDB and a git identity"]
 fn antigravity_auditor_profile_denies_credentials() -> TestResult {
     let _guard = TestLock::acquire()?;
     let mut client = McpClient::start_with_profile("external_auditor")?;
@@ -6716,6 +6747,7 @@ fn antigravity_auditor_profile_denies_credentials() -> TestResult {
 }
 
 #[test]
+#[ignore = "requires a provisioned local Governor runtime: a running daemon, an authenticated SurrealDB and a git identity"]
 fn mcp_exposes_only_governed_lifecycle_tools() -> TestResult {
     let _guard = TestLock::acquire()?;
     let mut client = McpClient::start()?;
@@ -6748,6 +6780,7 @@ fn mcp_exposes_only_governed_lifecycle_tools() -> TestResult {
 }
 
 #[test]
+#[ignore = "requires a provisioned local Governor runtime: a running daemon, an authenticated SurrealDB and a git identity"]
 fn mcp_exposes_no_delete_purge_raw_db_tools() -> TestResult {
     let _guard = TestLock::acquire()?;
     let mut client = McpClient::start()?;
@@ -6772,6 +6805,7 @@ fn mcp_exposes_no_delete_purge_raw_db_tools() -> TestResult {
 }
 
 #[test]
+#[ignore = "requires a provisioned local Governor runtime: a running daemon, an authenticated SurrealDB and a git identity"]
 fn mcp_exposes_only_governed_eval_tools() -> TestResult {
     let _guard = TestLock::acquire()?;
     let mut client = McpClient::start()?;
@@ -6818,6 +6852,7 @@ fn mcp_exposes_only_governed_eval_tools() -> TestResult {
 }
 
 #[test]
+#[ignore = "requires a provisioned local Governor runtime: a running daemon, an authenticated SurrealDB and a git identity"]
 fn mcp_exposes_only_governed_eval_gate_tools() -> TestResult {
     let _guard = TestLock::acquire()?;
     let mut client = McpClient::start()?;
@@ -6861,6 +6896,7 @@ fn mcp_exposes_only_governed_eval_gate_tools() -> TestResult {
 }
 
 #[test]
+#[ignore = "requires a provisioned local Governor runtime: a running daemon, an authenticated SurrealDB and a git identity"]
 fn mcp_exposes_no_mutate_promote_raw_eval_tools() -> TestResult {
     let _guard = TestLock::acquire()?;
     let mut client = McpClient::start()?;
@@ -6905,6 +6941,7 @@ fn mcp_exposes_no_mutate_promote_raw_eval_tools() -> TestResult {
 }
 
 #[test]
+#[ignore = "requires a provisioned local Governor runtime: a running daemon, an authenticated SurrealDB and a git identity"]
 fn mcp_exposes_no_baseline_create_fixture_mutate_override_tools() -> TestResult {
     let _guard = TestLock::acquire()?;
     let mut client = McpClient::start()?;
@@ -6943,6 +6980,7 @@ fn mcp_exposes_no_baseline_create_fixture_mutate_override_tools() -> TestResult 
 }
 
 #[test]
+#[ignore = "requires a provisioned local Governor runtime: a running daemon, an authenticated SurrealDB and a git identity"]
 fn mcp_exposes_only_safe_verify_tools() -> TestResult {
     let _guard = TestLock::acquire()?;
     let mut client = McpClient::start()?;
@@ -6977,6 +7015,7 @@ fn mcp_exposes_only_safe_verify_tools() -> TestResult {
 }
 
 #[test]
+#[ignore = "requires a provisioned local Governor runtime: a running daemon, an authenticated SurrealDB and a git identity"]
 fn mcp_exposes_no_raw_command_or_override_tools() -> TestResult {
     let _guard = TestLock::acquire()?;
     let mut client = McpClient::start()?;
@@ -7019,6 +7058,7 @@ fn mcp_exposes_no_raw_command_or_override_tools() -> TestResult {
 }
 
 #[test]
+#[ignore = "requires a provisioned local Governor runtime: a running daemon, an authenticated SurrealDB and a git identity"]
 fn mcp_exposes_only_safe_metrics_tools() -> TestResult {
     let _guard = TestLock::acquire()?;
     let mut client = McpClient::start()?;
@@ -7055,6 +7095,7 @@ fn mcp_exposes_only_safe_metrics_tools() -> TestResult {
 }
 
 #[test]
+#[ignore = "requires a provisioned local Governor runtime: a running daemon, an authenticated SurrealDB and a git identity"]
 fn mcp_exposes_no_raw_ingest_remote_export_tools() -> TestResult {
     let _guard = TestLock::acquire()?;
     let mut client = McpClient::start()?;
@@ -7092,6 +7133,7 @@ fn mcp_exposes_no_raw_ingest_remote_export_tools() -> TestResult {
 }
 
 #[test]
+#[ignore = "requires a provisioned local Governor runtime: a running daemon, an authenticated SurrealDB and a git identity"]
 fn mcp_exposes_only_governed_action_tools() -> TestResult {
     let _guard = TestLock::acquire()?;
     let mut client = McpClient::start()?;
@@ -7118,6 +7160,7 @@ fn mcp_exposes_only_governed_action_tools() -> TestResult {
 }
 
 #[test]
+#[ignore = "requires a provisioned local Governor runtime: a running daemon, an authenticated SurrealDB and a git identity"]
 fn mcp_exposes_only_governed_work_tools() -> TestResult {
     let _guard = TestLock::acquire()?;
     let mut client = McpClient::start()?;
@@ -7162,6 +7205,7 @@ fn mcp_exposes_only_governed_work_tools() -> TestResult {
 }
 
 #[test]
+#[ignore = "requires a provisioned local Governor runtime: a running daemon, an authenticated SurrealDB and a git identity"]
 fn mcp_exposes_only_governed_worktree_tools() -> TestResult {
     let _guard = TestLock::acquire()?;
     let mut client = McpClient::start()?;
@@ -7194,6 +7238,7 @@ fn mcp_exposes_only_governed_worktree_tools() -> TestResult {
 }
 
 #[test]
+#[ignore = "requires a provisioned local Governor runtime: a running daemon, an authenticated SurrealDB and a git identity"]
 fn mcp_tools_include_codecortex_only_governed() -> TestResult {
     let _guard = TestLock::acquire()?;
     let mut client = McpClient::start()?;
@@ -7215,6 +7260,7 @@ fn mcp_tools_include_codecortex_only_governed() -> TestResult {
 }
 
 #[test]
+#[ignore = "requires a provisioned local Governor runtime: a running daemon, an authenticated SurrealDB and a git identity"]
 fn mcp_tools_include_j0_only_governed() -> TestResult {
     let _guard = TestLock::acquire()?;
     let mut client = McpClient::start()?;
@@ -7262,6 +7308,7 @@ fn mcp_tools_include_j0_only_governed() -> TestResult {
 }
 
 #[test]
+#[ignore = "requires a provisioned local Governor runtime: a running daemon, an authenticated SurrealDB and a git identity"]
 fn mcp_exposes_no_j0_promote_apply_raw_tools() -> TestResult {
     let _guard = TestLock::acquire()?;
     let mut client = McpClient::start()?;
@@ -7293,6 +7340,7 @@ fn mcp_exposes_no_j0_promote_apply_raw_tools() -> TestResult {
 }
 
 #[test]
+#[ignore = "requires a provisioned local Governor runtime: a running daemon, an authenticated SurrealDB and a git identity"]
 fn mcp_tools_include_collective_only_governed() -> TestResult {
     let _guard = TestLock::acquire()?;
     let mut client = McpClient::start()?;
@@ -7337,6 +7385,7 @@ fn mcp_tools_include_collective_only_governed() -> TestResult {
 }
 
 #[test]
+#[ignore = "requires a provisioned local Governor runtime: a running daemon, an authenticated SurrealDB and a git identity"]
 fn mcp_exposes_only_governed_runtime_tools() -> TestResult {
     let _guard = TestLock::acquire()?;
     let mut client = McpClient::start()?;
@@ -7379,6 +7428,7 @@ fn mcp_exposes_only_governed_runtime_tools() -> TestResult {
 }
 
 #[test]
+#[ignore = "requires a provisioned local Governor runtime: a running daemon, an authenticated SurrealDB and a git identity"]
 fn mcp_exposes_no_raw_runtime_shell_db_tools() -> TestResult {
     let _guard = TestLock::acquire()?;
     let mut client = McpClient::start()?;
@@ -7405,6 +7455,7 @@ fn mcp_exposes_no_raw_runtime_shell_db_tools() -> TestResult {
 }
 
 #[test]
+#[ignore = "requires a provisioned local Governor runtime: a running daemon, an authenticated SurrealDB and a git identity"]
 fn mcp_exposes_only_safe_h1_service_status_tools() -> TestResult {
     let _guard = TestLock::acquire()?;
     let mut client = McpClient::start()?;
@@ -7443,6 +7494,7 @@ fn mcp_exposes_only_safe_h1_service_status_tools() -> TestResult {
 }
 
 #[test]
+#[ignore = "requires a provisioned local Governor runtime: a running daemon, an authenticated SurrealDB and a git identity"]
 fn mcp_exposes_no_h1_service_control_or_secret_tools() -> TestResult {
     let _guard = TestLock::acquire()?;
     let mut client = McpClient::start()?;
@@ -7469,6 +7521,7 @@ fn mcp_exposes_no_h1_service_control_or_secret_tools() -> TestResult {
 }
 
 #[test]
+#[ignore = "requires a provisioned local Governor runtime: a running daemon, an authenticated SurrealDB and a git identity"]
 fn mcp_exposes_only_safe_recovery_reports() -> TestResult {
     let _guard = TestLock::acquire()?;
     let mut client = McpClient::start()?;
@@ -7513,6 +7566,7 @@ fn mcp_exposes_only_safe_recovery_reports() -> TestResult {
 }
 
 #[test]
+#[ignore = "requires a provisioned local Governor runtime: a running daemon, an authenticated SurrealDB and a git identity"]
 fn mcp_exposes_no_dangerous_restore_or_delete_tools() -> TestResult {
     let _guard = TestLock::acquire()?;
     let mut client = McpClient::start()?;
@@ -7559,6 +7613,7 @@ fn mcp_exposes_no_dangerous_restore_or_delete_tools() -> TestResult {
 }
 
 #[test]
+#[ignore = "requires a provisioned local Governor runtime: a running daemon, an authenticated SurrealDB and a git identity"]
 fn mcp_exposes_only_governed_adapter_tools() -> TestResult {
     let _guard = TestLock::acquire()?;
     let mut client = McpClient::start()?;
@@ -7589,6 +7644,7 @@ fn mcp_exposes_only_governed_adapter_tools() -> TestResult {
 }
 
 #[test]
+#[ignore = "requires a provisioned local Governor runtime: a running daemon, an authenticated SurrealDB and a git identity"]
 fn mcp_exposes_no_external_agent_or_raw_exec_tools() -> TestResult {
     let _guard = TestLock::acquire()?;
     let mut client = McpClient::start()?;
@@ -7627,6 +7683,7 @@ fn mcp_exposes_no_external_agent_or_raw_exec_tools() -> TestResult {
 }
 
 #[test]
+#[ignore = "requires a provisioned local Governor runtime: a running daemon, an authenticated SurrealDB and a git identity"]
 fn mcp_exposes_only_governed_patch_tools() -> TestResult {
     let _guard = TestLock::acquire()?;
     let mut client = McpClient::start()?;
@@ -7657,6 +7714,7 @@ fn mcp_exposes_only_governed_patch_tools() -> TestResult {
 }
 
 #[test]
+#[ignore = "requires a provisioned local Governor runtime: a running daemon, an authenticated SurrealDB and a git identity"]
 fn mcp_no_raw_sql_tool() -> TestResult {
     let _guard = TestLock::acquire()?;
     let mut client = McpClient::start()?;
@@ -7674,6 +7732,7 @@ fn mcp_no_raw_sql_tool() -> TestResult {
 }
 
 #[test]
+#[ignore = "requires a provisioned local Governor runtime: a running daemon, an authenticated SurrealDB and a git identity"]
 fn mcp_exposes_no_external_agent_tools() -> TestResult {
     let _guard = TestLock::acquire()?;
     let mut client = McpClient::start()?;
@@ -7707,6 +7766,7 @@ fn mcp_exposes_no_external_agent_tools() -> TestResult {
 }
 
 #[test]
+#[ignore = "requires a provisioned local Governor runtime: a running daemon, an authenticated SurrealDB and a git identity"]
 fn mcp_exposes_only_governed_skill_tools() -> TestResult {
     let _guard = TestLock::acquire()?;
     let mut client = McpClient::start()?;
@@ -7739,6 +7799,7 @@ fn mcp_exposes_only_governed_skill_tools() -> TestResult {
 }
 
 #[test]
+#[ignore = "requires a provisioned local Governor runtime: a running daemon, an authenticated SurrealDB and a git identity"]
 fn mcp_exposes_only_governed_curator_tools() -> TestResult {
     let _guard = TestLock::acquire()?;
     let mut client = McpClient::start()?;
@@ -7771,6 +7832,7 @@ fn mcp_exposes_only_governed_curator_tools() -> TestResult {
 }
 
 #[test]
+#[ignore = "requires a provisioned local Governor runtime: a running daemon, an authenticated SurrealDB and a git identity"]
 fn mcp_exposes_no_apply_force_delete_raw_tools() -> TestResult {
     let _guard = TestLock::acquire()?;
     let mut client = McpClient::start()?;
@@ -7798,6 +7860,7 @@ fn mcp_exposes_no_apply_force_delete_raw_tools() -> TestResult {
 }
 
 #[test]
+#[ignore = "requires a provisioned local Governor runtime: a running daemon, an authenticated SurrealDB and a git identity"]
 fn mcp_exposes_no_force_activate_delete_raw_skill_tools() -> TestResult {
     let _guard = TestLock::acquire()?;
     let mut client = McpClient::start()?;
@@ -7822,6 +7885,7 @@ fn mcp_exposes_no_force_activate_delete_raw_skill_tools() -> TestResult {
 }
 
 #[test]
+#[ignore = "requires a provisioned local Governor runtime: a running daemon, an authenticated SurrealDB and a git identity"]
 fn mcp_no_raw_shell_rg_astgrep_git() -> TestResult {
     let _guard = TestLock::acquire()?;
     let mut client = McpClient::start()?;
@@ -7847,6 +7911,7 @@ fn mcp_no_raw_shell_rg_astgrep_git() -> TestResult {
 }
 
 #[test]
+#[ignore = "requires a provisioned local Governor runtime: a running daemon, an authenticated SurrealDB and a git identity"]
 fn mcp_exposes_no_raw_shell_or_git() -> TestResult {
     let _guard = TestLock::acquire()?;
     let mut client = McpClient::start()?;
@@ -7862,6 +7927,7 @@ fn mcp_exposes_no_raw_shell_or_git() -> TestResult {
 }
 
 #[test]
+#[ignore = "requires a provisioned local Governor runtime: a running daemon, an authenticated SurrealDB and a git identity"]
 fn current_state_mcp_matches_cli() -> TestResult {
     let _guard = TestLock::acquire()?;
     let project_id = seed_with_writer_smoke()?;
@@ -7878,6 +7944,7 @@ fn current_state_mcp_matches_cli() -> TestResult {
 }
 
 #[test]
+#[ignore = "requires a provisioned local Governor runtime: a running daemon, an authenticated SurrealDB and a git identity"]
 fn current_state_memory_free_control_excludes_all_memory_content() -> TestResult {
     let _guard = TestLock::acquire()?;
     let project_id = seed_with_writer_smoke()?;
@@ -7949,6 +8016,7 @@ fn current_state_memory_free_control_excludes_all_memory_content() -> TestResult
 }
 
 #[test]
+#[ignore = "requires a provisioned local Governor runtime: a running daemon, an authenticated SurrealDB and a git identity"]
 fn recall_l0_mcp_matches_cli() -> TestResult {
     let _guard = TestLock::acquire()?;
     let project_id = seed_with_writer_smoke()?;
@@ -7972,6 +8040,7 @@ fn recall_l0_mcp_matches_cli() -> TestResult {
 }
 
 #[test]
+#[ignore = "requires a provisioned local Governor runtime: a running daemon, an authenticated SurrealDB and a git identity"]
 fn fetch_l2_mcp_matches_cli() -> TestResult {
     let _guard = TestLock::acquire()?;
     let project_id = seed_with_writer_smoke()?;
@@ -8011,6 +8080,7 @@ fn fetch_l2_mcp_matches_cli() -> TestResult {
 }
 
 #[test]
+#[ignore = "requires a provisioned local Governor runtime: a running daemon, an authenticated SurrealDB and a git identity"]
 fn mcp_compile_packet_and_gates_generate_reports() -> TestResult {
     let _guard = TestLock::acquire()?;
     let project_id = seed_with_writer_smoke()?;
@@ -8110,6 +8180,7 @@ fn mcp_compile_packet_and_gates_generate_reports() -> TestResult {
 }
 
 #[test]
+#[ignore = "requires a provisioned local Governor runtime: a running daemon, an authenticated SurrealDB and a git identity"]
 fn codecortex_mcp_l3_and_gate_smoke() -> TestResult {
     let _guard = TestLock::acquire()?;
     let project_id = seed_with_writer_smoke()?;

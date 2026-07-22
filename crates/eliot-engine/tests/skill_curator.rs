@@ -221,6 +221,7 @@ fn curation_gate_allows_safe_quarantine() {
 }
 
 #[tokio::test]
+#[ignore = "requires an authenticated local SurrealDB"]
 async fn skill_patch_candidate_written_through_writer_actor() -> TestResult {
     let harness = Harness::new("patch-candidate").await?;
     let (handle, actor) = harness.writer_pair("patch-candidate")?;
@@ -263,6 +264,7 @@ fn skill_safe_narrow_patch_apply_when_allowed() {
 }
 
 #[tokio::test]
+#[ignore = "requires an authenticated local SurrealDB"]
 async fn skill_archive_receipt_written_through_writer_actor() -> TestResult {
     let harness = Harness::new("archive-receipt").await?;
     let (handle, actor) = harness.writer_pair("archive-receipt")?;
@@ -280,6 +282,7 @@ async fn skill_archive_receipt_written_through_writer_actor() -> TestResult {
 }
 
 #[tokio::test]
+#[ignore = "requires an authenticated local SurrealDB"]
 async fn skill_quarantine_receipt_written_through_writer_actor() -> TestResult {
     let harness = Harness::new("quarantine-receipt").await?;
     let (handle, actor) = harness.writer_pair("quarantine-receipt")?;

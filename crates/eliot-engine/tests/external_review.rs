@@ -393,6 +393,7 @@ async fn external_result_candidate_only_and_tainted() -> TestResult {
 }
 
 #[tokio::test]
+#[ignore = "requires an authenticated local SurrealDB"]
 async fn external_result_written_through_writer_actor() -> TestResult {
     let _guard = lock_tests().await;
     let harness = Harness::new("external-review-write").await?;

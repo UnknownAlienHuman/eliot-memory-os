@@ -264,6 +264,7 @@ fn canonical_profiles_publish_bounded_tool_sets() -> TestResult {
 }
 
 #[test]
+#[ignore = "requires a provisioned local Governor runtime: a running daemon, an authenticated SurrealDB and a git identity"]
 fn default_instance_bootstrap_is_stable_and_outside_the_repository() -> TestResult {
     let runtime = OwnedRuntime::new()?;
     let local_app_data = runtime.path().join("local-app-data");
@@ -331,6 +332,7 @@ fn standalone_startup_failure_stops_its_owned_database_and_publishes_failed() ->
 
 #[test]
 #[allow(clippy::too_many_lines)]
+#[ignore = "requires a provisioned local Governor runtime: a running daemon, an authenticated SurrealDB and a git identity"]
 fn external_candidate_is_shared_without_authority_widening() -> TestResult {
     let runtime = OwnedRuntime::new()?;
     let config_path = runtime.path().join("config").join("governor.toml");
@@ -527,6 +529,7 @@ fn external_candidate_is_shared_without_authority_widening() -> TestResult {
 
 #[test]
 #[allow(clippy::too_many_lines)]
+#[ignore = "requires a provisioned local Governor runtime: a running daemon, an authenticated SurrealDB and a git identity"]
 fn facade_reconnects_after_rotation_and_replay_does_not_duplicate_memory() -> TestResult {
     let runtime = OwnedRuntime::new()?;
     let config_path = runtime.path().join("config").join("governor.toml");

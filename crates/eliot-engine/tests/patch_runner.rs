@@ -127,6 +127,7 @@ async fn patch_apply_valid_scoped_patch() -> TestResult {
 }
 
 #[tokio::test]
+#[ignore = "requires an authenticated local SurrealDB"]
 async fn patch_records_patch_run_through_writer_actor() -> TestResult {
     let _guard = lock_tests().await;
     let bundle = Bundle::new("patch-records-writer", value_diff("2"))?;

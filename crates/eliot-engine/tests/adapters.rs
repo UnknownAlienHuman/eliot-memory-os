@@ -241,6 +241,7 @@ async fn adapter_observation_tainted_by_default() -> TestResult {
 }
 
 #[tokio::test]
+#[ignore = "requires an authenticated local SurrealDB"]
 async fn adapter_observation_written_through_writer_actor() -> TestResult {
     let _guard = lock_tests().await;
     let harness = Harness::new("adapter-observation-write").await?;

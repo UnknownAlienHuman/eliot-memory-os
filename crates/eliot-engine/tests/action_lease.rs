@@ -180,6 +180,7 @@ fn action_lease_allows_bounded_plan_only() {
 }
 
 #[tokio::test]
+#[ignore = "requires an authenticated local SurrealDB"]
 async fn action_lease_written_through_writer_actor() -> TestResult {
     let _guard = lock_tests().await;
     let fixture = Fixture::new();

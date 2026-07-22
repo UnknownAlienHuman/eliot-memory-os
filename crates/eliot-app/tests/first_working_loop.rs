@@ -11,6 +11,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 type TestResult<T = ()> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
 #[test]
+#[ignore = "requires a provisioned local Governor runtime: a running daemon, an authenticated SurrealDB and a git identity"]
 fn fwl_daemon_ready_requires_real_ipc() -> TestResult {
     let runtime = OwnedRuntime::new("daemon-real-ipc")?;
     let config_path = runtime.path().join("config").join("governor.toml");
@@ -75,6 +76,7 @@ fn fwl_daemon_ready_requires_real_ipc() -> TestResult {
 }
 
 #[test]
+#[ignore = "requires a provisioned local Governor runtime: a running daemon, an authenticated SurrealDB and a git identity"]
 fn fwl_static_safety_boundaries_hold() -> TestResult {
     let mcp_source = include_str!("../src/mcp_stdio.rs");
     let relay = mcp_source
@@ -164,6 +166,7 @@ fn fwl_static_safety_boundaries_hold() -> TestResult {
 #[cfg(windows)]
 #[test]
 #[allow(clippy::too_many_lines)]
+#[ignore = "requires a provisioned local Governor runtime: a running daemon, an authenticated SurrealDB and a git identity"]
 fn l3_pipe_authentication_requires_a_per_start_secret() -> TestResult {
     let runtime = OwnedRuntime::new("l3-auth-red")?;
     let port = free_local_port()?;
@@ -323,6 +326,7 @@ fn l3_pipe_authentication_requires_a_per_start_secret() -> TestResult {
 
 #[test]
 #[allow(clippy::too_many_lines)]
+#[ignore = "requires a provisioned local Governor runtime: a running daemon, an authenticated SurrealDB and a git identity"]
 fn l3_fabricated_provenance_cannot_authorize_action() -> TestResult {
     let runtime = OwnedRuntime::new("l3-provenance-red")?;
     let port = free_local_port()?;
@@ -503,6 +507,7 @@ fn l3_fabricated_provenance_cannot_authorize_action() -> TestResult {
 
 #[test]
 #[allow(clippy::too_many_lines)]
+#[ignore = "requires a provisioned local Governor runtime: a running daemon, an authenticated SurrealDB and a git identity"]
 fn l3_free_text_verifier_scope_cannot_satisfy_acceptance() -> TestResult {
     let runtime = OwnedRuntime::new("l3-verifier-red")?;
     let port = free_local_port()?;
@@ -618,6 +623,7 @@ fn l3_free_text_verifier_scope_cannot_satisfy_acceptance() -> TestResult {
 
 #[test]
 #[allow(clippy::print_stdout, clippy::too_many_lines)]
+#[ignore = "requires a provisioned local Governor runtime: a running daemon, an authenticated SurrealDB and a git identity"]
 fn first_working_loop_end_to_end() -> TestResult {
     assert_eq!(
         std::env::var("ELIOT_DISABLE_REAL_PROVIDER").as_deref(),

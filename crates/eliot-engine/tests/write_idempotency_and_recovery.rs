@@ -18,6 +18,7 @@ use tokio::time::{Duration, sleep};
 type TestResult<T = ()> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires an authenticated local SurrealDB"]
 async fn idempotency_same_hash_replay() -> TestResult {
     let _guard = lock_tests().await;
     let harness = Harness::new("idempotency_same_hash_replay").await?;
@@ -38,6 +39,7 @@ async fn idempotency_same_hash_replay() -> TestResult {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires an authenticated local SurrealDB"]
 async fn idempotency_conflict_rejects_different_hash() -> TestResult {
     let _guard = lock_tests().await;
     let harness = Harness::new("idempotency_conflict_rejects_different_hash").await?;
@@ -74,6 +76,7 @@ async fn idempotency_conflict_rejects_different_hash() -> TestResult {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires an authenticated local SurrealDB"]
 async fn recovery_pending_replay_applies_once() -> TestResult {
     let _guard = lock_tests().await;
     let harness = Harness::new("recovery_pending_replay_applies_once").await?;
@@ -108,6 +111,7 @@ async fn recovery_pending_replay_applies_once() -> TestResult {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires an authenticated local SurrealDB"]
 async fn recovery_unknown_commit_reconciles_by_write_id() -> TestResult {
     let _guard = lock_tests().await;
     let harness = Harness::new("recovery_unknown_commit_reconciles_by_write_id").await?;
@@ -139,6 +143,7 @@ async fn recovery_unknown_commit_reconciles_by_write_id() -> TestResult {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires an authenticated local SurrealDB"]
 async fn claim_matrix_candidate_supported_verified() -> TestResult {
     let _guard = lock_tests().await;
     let harness = Harness::new("claim_matrix_candidate_supported_verified").await?;
@@ -207,6 +212,7 @@ async fn claim_matrix_candidate_supported_verified() -> TestResult {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires an authenticated local SurrealDB"]
 async fn claim_matrix_failed_verification_not_verified() -> TestResult {
     let _guard = lock_tests().await;
     let harness = Harness::new("claim_matrix_failed_verification_not_verified").await?;
@@ -260,6 +266,7 @@ async fn claim_matrix_failed_verification_not_verified() -> TestResult {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires an authenticated local SurrealDB"]
 async fn ten_agent_concurrent_writes_are_governed() -> TestResult {
     let _guard = lock_tests().await;
     let harness = Harness::new("ten_agent_concurrent_writes_are_governed").await?;
@@ -314,6 +321,7 @@ async fn ten_agent_concurrent_writes_are_governed() -> TestResult {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires an authenticated local SurrealDB"]
 async fn fetch_l2_returns_relation_neighborhood() -> TestResult {
     let _guard = lock_tests().await;
     let harness = Harness::new("fetch_l2_returns_relation_neighborhood").await?;
@@ -372,6 +380,7 @@ async fn fetch_l2_returns_relation_neighborhood() -> TestResult {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires an authenticated local SurrealDB"]
 async fn read_after_write_at_least_revision() -> TestResult {
     let _guard = lock_tests().await;
     let harness = Harness::new("read_after_write_at_least_revision").await?;

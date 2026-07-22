@@ -312,6 +312,7 @@ fn skill_lifecycle_updates_counters_and_proposes_memory_lifecycle_actions() {
 }
 
 #[tokio::test]
+#[ignore = "requires an authenticated local SurrealDB"]
 async fn skill_execution_proof_and_influence_report_write_through_writer_actor() -> TestResult {
     let _guard = lock_tests().await?;
     let harness = Harness::new("skill-proof-writer").await?;
