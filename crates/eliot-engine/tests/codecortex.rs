@@ -50,25 +50,32 @@ fn codecortex_manifest_reads_workspace() -> TestResult {
 }
 
 #[test]
-fn codecortex_rg_finds_known_symbol() -> TestResult {
+fn codecortex_rg_finds_known_symbol_or_reports_unavailable() -> TestResult {
     let report = CodeCortexService::new(repo_root()).scan(&request(
         "codecortex-rg",
         "Find CognitiveGate implementation",
-        vec!["CognitiveGate".to_owned()],
+        vec!["pub struct CognitiveGate".to_owned()],
     ))?;
 
-    assert!(
-        report
-            .file_evidence
-            .iter()
-            .any(|evidence| evidence.excerpt.contains("CognitiveGate"))
-    );
-    assert!(
-        report
-            .symbol_evidence
-            .iter()
-            .any(|evidence| evidence.name == "CognitiveGate")
-    );
+    if adapter_status(&report, "rg_adapter", "unavailable") {
+        assert!(report.file_evidence.is_empty());
+        assert!(report.symbol_evidence.is_empty());
+        assert!(adapter_status(&report, "ast_grep_adapter", "failed"));
+    } else {
+        assert!(adapter_status(&report, "rg_adapter", "pass"));
+        assert!(
+            report
+                .file_evidence
+                .iter()
+                .any(|evidence| evidence.excerpt == "pub struct CognitiveGate;")
+        );
+        assert!(
+            report
+                .symbol_evidence
+                .iter()
+                .any(|evidence| evidence.name == "CognitiveGate")
+        );
+    }
     Ok(())
 }
 
