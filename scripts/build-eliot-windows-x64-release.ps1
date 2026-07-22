@@ -92,6 +92,28 @@ function Get-FilteredFileHash([string]$Repo, [string]$RelativePath, [string]$Fil
     return $hash
 }
 
+function Assert-TrackedSourceFile([System.IO.FileSystemInfo]$File, [string]$RelativePath) {
+    if (-not ($File -is [System.IO.FileInfo])) {
+        throw "tracked release source is not a regular file: $RelativePath"
+    }
+    if (($File.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -eq 0) {
+        return
+    }
+
+    # Files On-Demand keeps resident files inside a pinned OneDrive tree as
+    # ordinary FileInfo objects with the cloud reparse bit set. Permit only
+    # that opaque, fully resident form. Symbolic links expose LinkType/Target;
+    # offline, unpinned, and recall-on-access placeholders carry one of the
+    # non-resident attribute bits below and remain forbidden.
+    $linkTargets = @($File.Target) | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) }
+    $nonResidentMask = [int64]0x00541000
+    if (-not [string]::IsNullOrWhiteSpace([string]$File.LinkType) -or
+        $linkTargets.Count -ne 0 -or
+        (([int64]$File.Attributes -band $nonResidentMask) -ne 0)) {
+        throw "tracked release source is not a resident regular file: $RelativePath"
+    }
+}
+
 function Copy-TrackedTree([string]$Repo, [string]$SourceCommit, [string]$Source, [string]$Destination) {
     $sourcePath = Assert-SafeRelativePath $Source 'tracked source'
     $tracked = @(& git -C $Repo ls-tree -r --name-only $SourceCommit -- $sourcePath)
@@ -108,9 +130,7 @@ function Copy-TrackedTree([string]$Repo, [string]$SourceCommit, [string]$Source,
             throw "git returned a file outside the requested release source: $normalized"
         }
         $sourceFile = Get-Item -LiteralPath (Join-Path $Repo $normalized)
-        if (-not ($sourceFile -is [System.IO.FileInfo]) -or ($sourceFile.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
-            throw "tracked release source is not a regular file: $normalized"
-        }
+        Assert-TrackedSourceFile $sourceFile $normalized
         $suffix = $normalized.Substring($sourcePath.Length + 1)
         $expectedHash = Get-GitBlobHash $Repo $SourceCommit $normalized
         $sourceHash = Get-FilteredFileHash $Repo $normalized $sourceFile.FullName
