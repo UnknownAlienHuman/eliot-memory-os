@@ -21,7 +21,6 @@ pub struct TestMetadata {
     pub test_name: String,
     pub test_kind: TestKind,
     pub intent: TestIntent,
-    pub phase_owner: Option<String>,
     pub component_refs: Vec<String>,
     pub risk_refs: Vec<String>,
     pub estimated_cost: TestCostClass,
