@@ -382,13 +382,6 @@ fn runtime_for(name: &str) -> PathBuf {
     repo_root().join("target").join("phase-f0-hooks").join(name)
 }
 
-fn test_runtime_root() -> PathBuf {
-    std::env::var_os("ELIOT_GOVERNOR_CONFIG")
-        .map(PathBuf::from)
-        .and_then(|path| path.parent().and_then(Path::parent).map(Path::to_path_buf))
-        .unwrap_or_else(|| repo_root().join(".eliot-governor"))
-}
-
 fn read_json(path: &Path) -> TestResult<Value> {
     Ok(serde_json::from_reader(fs::File::open(path)?)?)
 }
