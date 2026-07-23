@@ -33,6 +33,15 @@ pub(super) async fn dispatch_host_governor_method(
             )
             .await,
         ),
+        "ul/onboard" => Some(
+            crate::commands::run_ul_onboard_from_daemon(
+                &state.root,
+                &state.store,
+                &state.writer,
+                params,
+            )
+            .await,
+        ),
         "ping" => Some(Ok(json!({}))),
         _ => None,
     }

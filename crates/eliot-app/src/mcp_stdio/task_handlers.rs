@@ -7,6 +7,8 @@ fn canonical_struct_hash<T: serde::Serialize>(value: &T) -> Result<String> {
 #[allow(clippy::too_many_lines)]
 async fn dispatch_compile_packet_l3(state: &McpState, arguments: Value) -> Result<Value> {
     let input = input_validation::decode_compile_packet_input(arguments)?;
+    let memory_free_control =
+        input.memory_mode == Some(MemoryExposureMode::MemoryFreeControl);
     if input
         .material_frame
         .as_ref()
@@ -144,6 +146,28 @@ async fn dispatch_compile_packet_l3(state: &McpState, arguments: Value) -> Resul
         packet.memory_applicability.inclusion_reasons.sort();
         packet.memory_applicability.inclusion_reasons.dedup();
     }
+    let touched_paths = packet_scope_paths(&packet, input.material_frame.as_ref(), &request);
+    let fallback_text = format!(
+        "{} {} {}",
+        request.goal,
+        request.candidate_handles.join(" "),
+        packet.exact_handles.join(" ")
+    );
+    let pyramid = if memory_free_control {
+        None
+    } else {
+        Some(
+            state
+                .ul
+                .packet_enrichment(
+                    request.project_id,
+                    &request.task_id,
+                    &touched_paths,
+                    &fallback_text,
+                )
+                .await?,
+        )
+    };
     write_json_report(
         &state
             .root
@@ -152,8 +176,16 @@ async fn dispatch_compile_packet_l3(state: &McpState, arguments: Value) -> Resul
             .join("latest.json"),
         &packet,
     )?;
-    let frame_stub = material_frame_stub(&packet, packet_task.as_ref());
+    let mut frame_stub = material_frame_stub(&packet, packet_task.as_ref());
+    if frame_stub.causal_bridge.is_empty()
+        && let Some(pyramid) = &pyramid
+    {
+        frame_stub.causal_bridge = pyramid.bridge.clone();
+    }
     let mut value = serde_json::to_value(packet)?;
+    if let Some(pyramid) = pyramid {
+        value["ul_understanding"] = pyramid.understanding;
+    }
     value["frame_stub"] = serde_json::to_value(frame_stub)?;
     value["frame_stub_required_edits"] = json!(["expected_observable"]);
     value["frame_stub_ready"] = Value::Bool(false);
@@ -161,6 +193,72 @@ async fn dispatch_compile_packet_l3(state: &McpState, arguments: Value) -> Resul
         enrich_packet_with_task(state, &mut value, task).await?;
     }
     Ok(value)
+}
+
+fn packet_scope_paths(
+    packet: &ContextPacketL3,
+    frame: Option<&MaterialPacketFrame>,
+    request: &CompilePacketL3Request,
+) -> Vec<String> {
+    let mut values = BTreeSet::new();
+    if let Some(codecortex) = &packet.codecortex {
+        for evidence in &codecortex.file_evidence {
+            insert_path_tokens(&mut values, &evidence.path);
+        }
+    }
+    for hop in &packet.causal_bridge {
+        insert_path_tokens(&mut values, &hop.from);
+        insert_path_tokens(&mut values, &hop.to);
+        if let Some(reference) = &hop.evidence_ref {
+            insert_path_tokens(&mut values, reference);
+        }
+    }
+    if let Some(frame) = frame {
+        for atom in &frame.exact_load_bearing_atoms {
+            insert_path_tokens(&mut values, atom);
+        }
+        for hop in &frame.causal_bridge {
+            insert_path_tokens(&mut values, &hop.from);
+            insert_path_tokens(&mut values, &hop.to);
+            if let Some(reference) = &hop.evidence_ref {
+                insert_path_tokens(&mut values, reference);
+            }
+        }
+    }
+    for handle in &request.candidate_handles {
+        insert_path_tokens(&mut values, handle);
+    }
+    insert_path_tokens(&mut values, &request.goal);
+    values.into_iter().collect()
+}
+
+fn insert_path_tokens(paths: &mut BTreeSet<String>, value: &str) {
+    for token in value.split_whitespace() {
+        let token = token
+            .trim_matches(|character: char| {
+                matches!(
+                    character,
+                    '`' | '"' | '\'' | ',' | ';' | '(' | ')' | '[' | ']' | '{' | '}'
+                )
+            })
+            .strip_prefix("file:")
+            .unwrap_or(token);
+        let token = token
+            .split('#')
+            .next()
+            .unwrap_or(token)
+            .replace('\\', "/")
+            .trim_start_matches("./")
+            .to_owned();
+        if token.contains('/')
+            && token
+                .rsplit('/')
+                .next()
+                .is_some_and(|leaf| leaf.contains('.') || leaf == "src")
+        {
+            paths.insert(token);
+        }
+    }
 }
 
 fn material_frame_stub(

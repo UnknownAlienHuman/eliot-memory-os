@@ -321,7 +321,9 @@ pub use ul::behavior::{
     CoChangeEdge, FIX_CLASSIFIER_VERSION, HotspotScore, MiningConfig, MiningRun,
 };
 pub use ul::concept::{
-    CapsuleBuild, ConceptNode, ModuleCard, ProjectCharter, SubsystemCapsule, SystemMap,
+    CapsuleBuild, CapsuleFreshness, ConceptKind, ConceptNode, DependencyManifest, FileDependency,
+    ModuleCard, ProjectCharter, PyramidBuildStatus, PyramidTargetKind, SubsystemCapsule,
+    SystemFlow, SystemMap,
 };
 pub use ul::cue::{
     CueBinding, CueBindingError, CueIndexRow, CueKind, CueMatchMode, CueRecordSource, CueStrength,
@@ -334,6 +336,10 @@ pub use ul::injection::{
 };
 pub use ul::normalize::{
     command_pattern, error_signature, normalize_path, normalize_query_tokens, normalize_symbol,
+};
+pub use ul::onboarding::{
+    ManifestPackage, OnboardingCheckpoint, OnboardingJob, OnboardingReport, OnboardingStage,
+    OnboardingTestHook,
 };
 pub use verification::{
     FlakeReport, SkippedTest, SkippedTestReason, StatefulDbIsolationReport, TestCostClass,

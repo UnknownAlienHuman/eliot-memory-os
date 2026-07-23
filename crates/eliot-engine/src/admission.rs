@@ -165,9 +165,7 @@ fn admit_ul_artifact_batch_record(
         if artifact.project_id() != body.context.project_id {
             return reject("UL artifact project_id must match command context");
         }
-        if let Some(relation) = task05_artifact_relation(artifact)? {
-            expected_relations.push(relation);
-        }
+        expected_relations.extend(ul_artifact_relations(artifact)?);
     }
 
     let mut supplied_relations = BTreeSet::new();
@@ -177,9 +175,13 @@ fn admit_ul_artifact_batch_record(
         }
         if !matches!(
             relation.relation_type,
-            RelationType::CoChange | RelationType::CardCovers
+            RelationType::CoChange
+                | RelationType::ConceptImplementedBy
+                | RelationType::ConceptDependsOn
+                | RelationType::CapsuleCovers
+                | RelationType::CardCovers
         ) {
-            return reject("relation type is not allowed for Task-05 UL artifacts");
+            return reject("relation type is not allowed for UL artifacts");
         }
         if !supplied_relations.insert((
             relation_type_name(relation.relation_type),
@@ -189,21 +191,28 @@ fn admit_ul_artifact_batch_record(
             return reject("UL artifact relations must be unique inside the batch");
         }
     }
-    if body.relations.len() != expected_relations.len()
-        || expected_relations.iter().any(|(relation_type, from, to)| {
-            body.relations
-                .iter()
-                .filter(|relation| {
-                    relation.relation_type == *relation_type
-                        && relation.from == *from
-                        && relation.to == *to
-                })
-                .count()
-                != 1
-        })
-    {
+    if expected_relations.iter().any(|(relation_type, from, to)| {
+        body.relations
+            .iter()
+            .filter(|relation| {
+                relation.relation_type == *relation_type
+                    && relation.from == *from
+                    && relation.to == *to
+            })
+            .count()
+            != 1
+    }) || body.relations.iter().any(|relation| {
+        relation.relation_type != RelationType::ConceptDependsOn
+            && !expected_relations.iter().any(|(relation_type, from, to)| {
+                relation.relation_type == *relation_type
+                    && relation.from == *from
+                    && relation.to == *to
+            })
+    }) {
         return reject("UL artifact relations do not exactly match their artifact bodies");
     }
+
+    validate_pyramid_build_pairs(&body.artifacts)?;
 
     for artifact in &body.artifacts {
         admitted.tool_observations.push(ToolObservationInput {
@@ -221,9 +230,9 @@ fn admit_ul_artifact_batch_record(
     Ok(())
 }
 
-fn task05_artifact_relation(
+fn ul_artifact_relations(
     artifact: &UlArtifact,
-) -> Result<Option<(RelationType, String, String)>, EngineError> {
+) -> Result<Vec<(RelationType, String, String)>, EngineError> {
     match artifact {
         UlArtifact::CoChangeEdge(edge) => {
             if edge.path_a.trim().is_empty()
@@ -232,29 +241,137 @@ fn task05_artifact_relation(
             {
                 return reject("co-change paths must be non-empty and lexicographically ordered");
             }
-            Ok(Some((
+            Ok(vec![(
                 RelationType::CoChange,
                 edge.path_a.clone(),
                 edge.path_b.clone(),
-            )))
+            )])
         }
         UlArtifact::ModuleCard(card) => {
             validate_normalized_cue_bindings(&card.cue_bindings)?;
-            Ok(Some((
+            Ok(vec![(
                 RelationType::CardCovers,
                 format!("card:{}", card.card_id),
                 format!("file:{}", card.path),
-            )))
+            )])
         }
-        UlArtifact::MiningRun(_) | UlArtifact::HotspotScore(_) => Ok(None),
-        UlArtifact::ConceptNode(_)
-        | UlArtifact::ProjectCharter(_)
-        | UlArtifact::SystemMap(_)
-        | UlArtifact::SubsystemCapsule(_)
-        | UlArtifact::CapsuleBuild(_) => {
-            reject("Task-06 UL pyramid artifact admission is not implemented")
+        UlArtifact::ConceptNode(concept) => {
+            validate_normalized_cue_bindings(&concept.cue_bindings)?;
+            if concept.name.trim().is_empty()
+                || concept.purpose.trim().is_empty()
+                || concept.boundary_paths.is_empty()
+            {
+                return reject("concept name, purpose, and boundaries are required");
+            }
+            Ok(concept
+                .boundary_paths
+                .iter()
+                .map(|path| {
+                    (
+                        RelationType::ConceptImplementedBy,
+                        format!("concept:{}", concept.concept_id),
+                        format!("file:{path}"),
+                    )
+                })
+                .collect())
+        }
+        UlArtifact::ProjectCharter(charter) => {
+            validate_normalized_cue_bindings(&charter.cue_bindings)?;
+            validate_pyramid_body(
+                &charter.body_md,
+                &[
+                    "WHAT",
+                    "FOR WHOM",
+                    "TOP INVARIANTS",
+                    "NON-GOALS",
+                    "VOCABULARY",
+                ],
+            )?;
+            Ok(Vec::new())
+        }
+        UlArtifact::SystemMap(map) => {
+            validate_normalized_cue_bindings(&map.cue_bindings)?;
+            validate_pyramid_body(&map.body_md, &["SYSTEMS", "FLOWS"])?;
+            Ok(Vec::new())
+        }
+        UlArtifact::SubsystemCapsule(capsule) => {
+            validate_normalized_cue_bindings(&capsule.cue_bindings)?;
+            validate_pyramid_body(
+                &capsule.body_md,
+                &[
+                    "PURPOSE",
+                    "BOUNDARIES",
+                    "KEY ENTRYPOINTS",
+                    "INVARIANTS",
+                    "DRAGONS",
+                    "KEY DECISIONS",
+                    "VERIFIERS",
+                ],
+            )?;
+            Ok(vec![(
+                RelationType::CapsuleCovers,
+                format!("capsule:{}", capsule.capsule_id),
+                format!("concept:{}", capsule.concept_id),
+            )])
+        }
+        UlArtifact::CapsuleBuild(build) => {
+            if build.status != eliot_types::PyramidBuildStatus::Promoted
+                || build.inputs_hash.len() != 64
+                || build.token_estimate > build.budget_limit
+            {
+                return reject("only validated promoted pyramid builds may be written");
+            }
+            Ok(Vec::new())
+        }
+        UlArtifact::MiningRun(_) | UlArtifact::HotspotScore(_) => Ok(Vec::new()),
+    }
+}
+
+fn validate_pyramid_build_pairs(artifacts: &[UlArtifact]) -> Result<(), EngineError> {
+    for artifact in artifacts {
+        let UlArtifact::CapsuleBuild(build) = artifact else {
+            continue;
+        };
+        let matches_target = artifacts.iter().any(|candidate| match candidate {
+            UlArtifact::SubsystemCapsule(value) => {
+                build.target_kind == eliot_types::PyramidTargetKind::SubsystemCapsule
+                    && value.capsule_id == build.target_id
+                    && value.build_id == build.build_id
+            }
+            UlArtifact::SystemMap(value) => {
+                build.target_kind == eliot_types::PyramidTargetKind::SystemMap
+                    && value.map_id == build.target_id
+                    && value.build_id == build.build_id
+            }
+            UlArtifact::ProjectCharter(value) => {
+                build.target_kind == eliot_types::PyramidTargetKind::ProjectCharter
+                    && value.charter_id == build.target_id
+                    && value.build_id == build.build_id
+            }
+            _ => false,
+        });
+        if !matches_target {
+            return reject("promoted pyramid build must share a batch with its exact target");
         }
     }
+    Ok(())
+}
+
+fn validate_pyramid_body(body: &str, headers: &[&str]) -> Result<(), EngineError> {
+    let mut last = None;
+    for header in headers {
+        if body.lines().filter(|line| line.trim() == *header).count() != 1 {
+            return reject("pyramid body must contain each required header exactly once");
+        }
+        let position = body.find(header).ok_or_else(|| {
+            EngineError::WriteRejected("required pyramid header missing".to_owned())
+        })?;
+        if last.is_some_and(|previous| position <= previous) {
+            return reject("pyramid body headers are out of order");
+        }
+        last = Some(position);
+    }
+    Ok(())
 }
 
 fn validate_normalized_cue_bindings(

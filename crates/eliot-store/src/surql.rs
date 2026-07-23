@@ -7,11 +7,13 @@ pub enum NamedSurqlOp {
     SchemaMigrateUl,
     SchemaMigrateUlDelivery,
     SchemaMigrateUlArtifacts,
+    SchemaMigrateUlPyramid,
     UpsertCueRows,
     DeleteCueRows,
     LoadCueRows,
     LoadCueRecords,
     LoadInjectionReceipts,
+    LoadUlArtifacts,
     ApplyWriteEnvelope,
     ApplyObservability,
     ObservabilityReceiptById,
@@ -51,11 +53,13 @@ impl NamedSurqlOp {
             Self::SchemaMigrateUl => "002_ul_core",
             Self::SchemaMigrateUlDelivery => "003_ul_delivery",
             Self::SchemaMigrateUlArtifacts => "004_ul_artifacts",
+            Self::SchemaMigrateUlPyramid => "005_ul_pyramid",
             Self::UpsertCueRows => "upsert_cue_rows",
             Self::DeleteCueRows => "delete_cues_for_record",
             Self::LoadCueRows => "load_cue_rows",
             Self::LoadCueRecords => "load_cue_records",
             Self::LoadInjectionReceipts => "load_injection_receipts",
+            Self::LoadUlArtifacts => "load_ul_artifacts",
             Self::ApplyWriteEnvelope => "apply_write_envelope",
             Self::ApplyObservability => "apply_observability",
             Self::ObservabilityReceiptById => "observability_receipt_by_id",
@@ -95,6 +99,7 @@ impl NamedSurqlOp {
             Self::SchemaMigrateUl => include_str!("surql/002_ul_core.surql"),
             Self::SchemaMigrateUlDelivery => include_str!("surql/003_ul_delivery.surql"),
             Self::SchemaMigrateUlArtifacts => include_str!("surql/004_ul_artifacts.surql"),
+            Self::SchemaMigrateUlPyramid => include_str!("surql/005_ul_pyramid.surql"),
             Self::UpsertCueRows => include_str!("surql/upsert_cue_rows.surql"),
             Self::DeleteCueRows => include_str!("surql/delete_cues_for_record.surql"),
             Self::LoadCueRows => include_str!("surql/load_cue_rows.surql"),
@@ -102,6 +107,7 @@ impl NamedSurqlOp {
             Self::LoadInjectionReceipts => {
                 include_str!("surql/load_injection_receipts.surql")
             }
+            Self::LoadUlArtifacts => include_str!("surql/load_ul_artifacts.surql"),
             Self::ApplyWriteEnvelope => include_str!("surql/apply_write_envelope.surql"),
             Self::ApplyObservability => include_str!("surql/apply_observability.surql"),
             Self::ObservabilityReceiptById => {
@@ -187,7 +193,7 @@ impl Default for SurqlTemplateRegistry {
 }
 
 #[allow(clippy::too_many_lines)]
-fn foundational_templates() -> [SurqlTemplate; 21] {
+fn foundational_templates() -> [SurqlTemplate; 23] {
     [
         template(
             NamedSurqlOp::SchemaMigrate,
@@ -220,6 +226,12 @@ fn foundational_templates() -> [SurqlTemplate; 21] {
             64 * 1024,
         ),
         template(
+            NamedSurqlOp::SchemaMigrateUlPyramid,
+            "SchemaMigrateUlPyramidInput",
+            "SchemaMigrateUlPyramidOutput",
+            64 * 1024,
+        ),
+        template(
             NamedSurqlOp::UpsertCueRows,
             "UpsertCueRowsInput",
             "UpsertCueRowsOutput",
@@ -247,6 +259,12 @@ fn foundational_templates() -> [SurqlTemplate; 21] {
             NamedSurqlOp::LoadInjectionReceipts,
             "LoadInjectionReceiptsInput",
             "LoadInjectionReceiptsOutput",
+            8 * 1024 * 1024,
+        ),
+        template(
+            NamedSurqlOp::LoadUlArtifacts,
+            "LoadUlArtifactsInput",
+            "LoadUlArtifactsOutput",
             8 * 1024 * 1024,
         ),
         template(

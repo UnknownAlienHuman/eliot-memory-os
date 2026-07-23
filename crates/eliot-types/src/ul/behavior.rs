@@ -1,9 +1,10 @@
 use crate::{CueBinding, ProjectId};
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 pub const FIX_CLASSIFIER_VERSION: &str = "ul-fixclass-1";
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, JsonSchema, PartialEq, Serialize, Deserialize)]
 pub struct MiningConfig {
     pub max_commits: usize,
     pub window_months: u32,
@@ -26,7 +27,7 @@ impl Default for MiningConfig {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, JsonSchema, PartialEq, Serialize, Deserialize)]
 pub struct MiningRun {
     pub run_id: String,
     pub project_id: ProjectId,
@@ -39,7 +40,7 @@ pub struct MiningRun {
     pub cue_bindings: Vec<CueBinding>,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, JsonSchema, PartialEq, Serialize, Deserialize)]
 pub struct CoChangeEdge {
     pub edge_id: String,
     pub project_id: ProjectId,
@@ -54,7 +55,7 @@ pub struct CoChangeEdge {
     pub cue_bindings: Vec<CueBinding>,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, JsonSchema, PartialEq, Serialize, Deserialize)]
 pub struct HotspotScore {
     pub hotspot_id: String,
     pub project_id: ProjectId,

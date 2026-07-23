@@ -1958,6 +1958,9 @@ async fn dispatch_command(
             commands::UlCommand::MineGit { project, root } => {
                 commands::run_ul_mine_git(config, project, &root).await
             }
+            commands::UlCommand::Onboard { project, root } => {
+                commands::run_ul_onboard(config, project, &root).await
+            }
         },
         Command::Codecortex { command } => match command {
             CodeCortexCommand::Health => commands::run_codecortex_health(config),

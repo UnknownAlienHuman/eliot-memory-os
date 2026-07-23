@@ -3,9 +3,10 @@ use super::concept::{
     CapsuleBuild, ConceptNode, ModuleCard, ProjectCharter, SubsystemCapsule, SystemMap,
 };
 use crate::{CueBinding, ProjectId};
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "body", rename_all = "snake_case")]
 pub enum UlArtifact {
     MiningRun(MiningRun),
@@ -44,7 +45,7 @@ impl UlArtifact {
             Self::ModuleCard(value) => &value.card_id,
             Self::ConceptNode(value) => &value.concept_id,
             Self::ProjectCharter(value) => &value.charter_id,
-            Self::SystemMap(value) => &value.system_map_id,
+            Self::SystemMap(value) => &value.map_id,
             Self::SubsystemCapsule(value) => &value.capsule_id,
             Self::CapsuleBuild(value) => &value.build_id,
         }
@@ -76,7 +77,7 @@ impl UlArtifact {
             Self::ProjectCharter(value) => &value.cue_bindings,
             Self::SystemMap(value) => &value.cue_bindings,
             Self::SubsystemCapsule(value) => &value.cue_bindings,
-            Self::CapsuleBuild(value) => &value.cue_bindings,
+            Self::CapsuleBuild(_) => &[],
         }
     }
 }

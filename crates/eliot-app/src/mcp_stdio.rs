@@ -95,13 +95,13 @@ use eliot_types::{
     ForgettingReason, LatencyHistogram, LifecycleStatus, MailboxMessageId, MailboxMessageKind,
     MailboxRecipient, MaintenanceJobKind, MaterialPacketFrame, MemoryAdmissionDecision,
     MemoryCurationCandidate, MemoryCurationCorpusProfile, MemoryCurationFindingKind,
-    MemoryCurationPreviewRequest, MemoryCurationPreviewResponse, MemoryExposurePolicy,
-    MemoryInfluenceClass, MemoryInfluenceReport, MemoryInfluenceToolInput, MemoryInfluenceTrace,
-    MemoryInfluenceTraceWriteResult, MemoryInspectorView, MemoryLifecyclePacketView,
-    MemoryLifecycleState, MemoryNeed, MemoryRevision, MemoryWriteEnvelope,
-    MetaCandidateChangeClass, MetaExperimentDecision, MetaIsolationFence, MetaPolicyAuthorization,
-    MetaPolicyExecutionAction, MetricDefinition, MetricSample, MetricWindow,
-    MinorityPressureRecord, MinorityPressureStatus, NegativeTransferHarm,
+    MemoryCurationPreviewRequest, MemoryCurationPreviewResponse, MemoryExposureMode,
+    MemoryExposurePolicy, MemoryInfluenceClass, MemoryInfluenceReport, MemoryInfluenceToolInput,
+    MemoryInfluenceTrace, MemoryInfluenceTraceWriteResult, MemoryInspectorView,
+    MemoryLifecyclePacketView, MemoryLifecycleState, MemoryNeed, MemoryRevision,
+    MemoryWriteEnvelope, MetaCandidateChangeClass, MetaExperimentDecision, MetaIsolationFence,
+    MetaPolicyAuthorization, MetaPolicyExecutionAction, MetricDefinition, MetricSample,
+    MetricWindow, MinorityPressureRecord, MinorityPressureStatus, NegativeTransferHarm,
     OPERATOR_CONTRACT_MANIFEST, OPERATOR_IPC_PROTOCOL_VERSION, OPERATOR_SCHEMA_VERSION,
     OperationJob, OperationJobState, OperatorActionView, OperatorCommand, OperatorCommandReceipt,
     OperatorControlRequest, OperatorFieldView, OperatorProjectionFilter, OperatorProjectionKind,
@@ -826,7 +826,7 @@ impl McpDaemon {
         let store = CanonicalStore::new(config.db.surreal.clone());
         let wal = ControlWal::open(&config.control_wal)?;
         let (writer, actor) = WriterActor::channel(wal, store.clone(), &WriterConfig::default());
-        let ul = Arc::new(UlRuntime::new(store.clone(), writer.clone()));
+        let ul = Arc::new(UlRuntime::new(store.clone(), writer.clone(), &root));
         let cursor_signing_key = load_or_create_operator_cursor_signing_key(instance)?;
         let cognitive_runtime = Arc::new(CognitiveRuntimePaths {
             runtime_dir: instance.runtime_dir(),

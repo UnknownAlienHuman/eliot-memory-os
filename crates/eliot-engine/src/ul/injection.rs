@@ -1,14 +1,16 @@
-use super::{CueIndexService, TouchedSetRegistry};
+use super::{CueIndexService, TouchedSetRegistry, capsule_freshness};
 use crate::{EngineError, WriterHandle};
 use eliot_store::CanonicalStore;
 use eliot_types::{
-    InjectionReceipt, OBSERVABILITY_SCHEMA_VERSION, ObservabilityKind, ObservabilityWriteEnvelope,
-    ObservabilityWriteStatus, ObservedCue, PendingInjectionItem, ProjectId, SessionId, TaskId,
-    UlFiredBlock, UlFiredItem, WriteId, ul_token_estimate,
+    CapsuleFreshness, ConceptNode, InjectionReceipt, OBSERVABILITY_SCHEMA_VERSION,
+    ObservabilityKind, ObservabilityWriteEnvelope, ObservabilityWriteStatus, ObservedCue,
+    PendingInjectionItem, ProjectCharter, ProjectId, SessionId, SubsystemCapsule, SystemMap,
+    TaskId, UlFiredBlock, UlFiredItem, WriteId, ul_token_estimate,
 };
 use serde_json::{Value, json};
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use uuid::Uuid;
 
@@ -30,6 +32,7 @@ pub struct InjectionPlanner {
     touched: Arc<TouchedSetRegistry>,
     pending: Mutex<HashMap<SessionId, PendingBatch>>,
     hydrated: Mutex<HashSet<(ProjectId, SessionId)>>,
+    project_root: PathBuf,
 }
 
 impl InjectionPlanner {
@@ -40,6 +43,23 @@ impl InjectionPlanner {
         writer: WriterHandle,
         touched: Arc<TouchedSetRegistry>,
     ) -> Self {
+        Self::with_project_root(
+            cue_index,
+            store,
+            writer,
+            touched,
+            std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+        )
+    }
+
+    #[must_use]
+    pub fn with_project_root(
+        cue_index: Arc<CueIndexService>,
+        store: CanonicalStore,
+        writer: WriterHandle,
+        touched: Arc<TouchedSetRegistry>,
+        project_root: PathBuf,
+    ) -> Self {
         Self {
             cue_index,
             store,
@@ -47,6 +67,7 @@ impl InjectionPlanner {
             touched,
             pending: Mutex::new(HashMap::new()),
             hydrated: Mutex::new(HashSet::new()),
+            project_root,
         }
     }
 
@@ -240,6 +261,8 @@ impl InjectionPlanner {
             .store
             .load_injection_receipts(project_id, session_id)
             .await?;
+        let mut boot_charter = false;
+        let mut boot_map = false;
         for receipt in receipts {
             self.touched.restore_delivered(
                 session_id,
@@ -249,6 +272,11 @@ impl InjectionPlanner {
             if receipt.item_ref == "ul_boot:not_onboarded" {
                 self.touched.mark_boot_sent(session_id);
             }
+            boot_charter |= receipt.item_ref.starts_with("charter:");
+            boot_map |= receipt.item_ref.starts_with("system-map:");
+        }
+        if boot_charter && boot_map {
+            self.touched.mark_boot_sent(session_id);
         }
         self.hydrated
             .lock()
@@ -272,6 +300,23 @@ impl InjectionPlanner {
             .or_else(|| response.get("memory_revision"))
             .cloned()
             .unwrap_or(Value::Null);
+        let charter = latest_artifact(
+            self.store
+                .load_ul_artifacts::<ProjectCharter>(project_id, &["project_charter"], 128)
+                .await?,
+        );
+        let map = latest_artifact(
+            self.store
+                .load_ul_artifacts::<SystemMap>(project_id, &["system_map"], 128)
+                .await?,
+        );
+        if let (Some(charter), Some(map)) = (charter, map) {
+            return self
+                .attach_ready_boot(
+                    project_id, task_id, session_id, response, revision, charter, map,
+                )
+                .await;
+        }
         let boot = json!({
             "status": "not_onboarded",
             "revision": revision,
@@ -299,6 +344,80 @@ impl InjectionPlanner {
             outcome: "delivered".to_owned(),
         };
         self.commit_receipt(project_id, task_id, &receipt).await?;
+        response_object_mut(response)?.insert("ul_boot".to_owned(), boot);
+        self.touched.mark_boot_sent(session_id);
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn attach_ready_boot(
+        &self,
+        project_id: ProjectId,
+        task_id: Option<TaskId>,
+        session_id: SessionId,
+        response: &mut Value,
+        revision: Value,
+        charter: ProjectCharter,
+        map: SystemMap,
+    ) -> Result<(), EngineError> {
+        let concepts = self
+            .store
+            .load_ul_artifacts::<ConceptNode>(project_id, &["concept_node"], 128)
+            .await?
+            .into_iter()
+            .map(|record| record.receipt_body)
+            .collect::<Vec<_>>();
+        let capsules = self
+            .store
+            .load_ul_artifacts::<SubsystemCapsule>(project_id, &["subsystem_capsule"], 128)
+            .await?
+            .into_iter()
+            .map(|record| record.receipt_body)
+            .collect::<Vec<_>>();
+        let fresh = capsules
+            .iter()
+            .filter(|capsule| {
+                capsule_freshness(capsule, &self.project_root) == CapsuleFreshness::Fresh
+            })
+            .count();
+        let unassigned = concepts
+            .iter()
+            .filter(|concept| concept.name == "_unassigned")
+            .map(|concept| concept.boundary_paths.len())
+            .sum::<usize>();
+        let coverage = format!(
+            "{} subsystems; {fresh} fresh capsules; {unassigned} unassigned source files",
+            concepts.len()
+        );
+        let charter_ref = format!("charter:{}", charter.charter_id);
+        let map_ref = format!("system-map:{}", map.map_id);
+        let content_units =
+            ul_token_estimate(&charter.body_md).saturating_add(ul_token_estimate(&map.body_md));
+        let over_budget = content_units > 1_200;
+        let boot = if over_budget {
+            json!({
+                "status": "ready",
+                "revision": revision,
+                "charter": {"ref": charter_ref},
+                "system_map": {"ref": map_ref},
+                "coverage": coverage,
+                "warning": "UL_BOOT_BUDGET_EXCEEDED: payload omitted; use artifact handles"
+            })
+        } else {
+            json!({
+                "status": "ready",
+                "revision": revision,
+                "charter": {"ref": charter_ref, "body_md": charter.body_md},
+                "system_map": {"ref": map_ref, "body_md": map.body_md},
+                "coverage": coverage
+            })
+        };
+        let charter_receipt = boot_receipt(session_id, task_id, &charter_ref, &charter.body_md);
+        self.commit_receipt(project_id, task_id, &charter_receipt)
+            .await?;
+        let map_receipt = boot_receipt(session_id, task_id, &map_ref, &map.body_md);
+        self.commit_receipt(project_id, task_id, &map_receipt)
+            .await?;
         response_object_mut(response)?.insert("ul_boot".to_owned(), boot);
         self.touched.mark_boot_sent(session_id);
         Ok(())
@@ -335,6 +454,50 @@ impl InjectionPlanner {
             return Err(EngineError::ObservabilityConflict);
         }
         Ok(())
+    }
+}
+
+fn latest_artifact<T>(records: Vec<eliot_store::CanonicalRecord<T>>) -> Option<T> {
+    records
+        .into_iter()
+        .max_by_key(|record| {
+            (
+                record
+                    .memory_revision
+                    .map_or(0, eliot_types::MemoryRevision::value),
+                record
+                    .project_sequence
+                    .map_or(0, eliot_types::ProjectSequence::value),
+            )
+        })
+        .map(|record| record.receipt_body)
+}
+
+fn boot_receipt(
+    session_id: SessionId,
+    task_id: Option<TaskId>,
+    item_ref: &str,
+    body: &str,
+) -> InjectionReceipt {
+    let source_fingerprint = blake3::hash(body.as_bytes()).to_hex().to_string();
+    InjectionReceipt {
+        injection_id: injection_write_id(
+            session_id,
+            task_id,
+            item_ref,
+            &source_fingerprint,
+            "mcp_auto_boot",
+        )
+        .to_string(),
+        session_id,
+        task_id,
+        surface: "mcp_auto_boot".to_owned(),
+        item_ref: item_ref.to_owned(),
+        render_form: "payload".to_owned(),
+        fired_cues: Vec::new(),
+        token_cost: ul_token_estimate(body),
+        source_fingerprint,
+        outcome: "delivered".to_owned(),
     }
 }
 

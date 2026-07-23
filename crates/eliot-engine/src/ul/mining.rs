@@ -474,6 +474,122 @@ impl UlArtifactWriterService {
         }
         Ok(report)
     }
+
+    pub async fn write_concepts(
+        &self,
+        writer: &WriterHandle,
+        admission: &WriteAdmissionService,
+        run_id: &str,
+        concepts: &[eliot_types::ConceptNode],
+        dependencies: &[(String, String)],
+    ) -> Result<UlArtifactWriteReport, EngineError> {
+        let project_id = concepts
+            .first()
+            .map(|concept| concept.project_id)
+            .ok_or_else(|| EngineError::WriteRejected("concept batch is empty".to_owned()))?;
+        let mut sorted = concepts.to_vec();
+        sorted.sort_by(|left, right| left.concept_id.cmp(&right.concept_id));
+        let mut report = UlArtifactWriteReport {
+            artifacts_written: 0,
+            relations_written: 0,
+            receipts: Vec::new(),
+        };
+        for (chunk_index, chunk) in sorted.chunks(50).enumerate() {
+            let chunk_ids = chunk
+                .iter()
+                .map(|concept| concept.concept_id.as_str())
+                .collect::<BTreeSet<_>>();
+            let mut relations = chunk
+                .iter()
+                .flat_map(|concept| {
+                    concept.boundary_paths.iter().map(|path| RelationInput {
+                        relation_type: RelationType::ConceptImplementedBy,
+                        from: format!("concept:{}", concept.concept_id),
+                        to: format!("file:{path}"),
+                    })
+                })
+                .collect::<Vec<_>>();
+            relations.extend(
+                dependencies
+                    .iter()
+                    .filter(|(from, _)| chunk_ids.contains(from.as_str()))
+                    .map(|(from, to)| RelationInput {
+                        relation_type: RelationType::ConceptDependsOn,
+                        from: format!("concept:{from}"),
+                        to: format!("concept:{to}"),
+                    }),
+            );
+            submit_batch(
+                writer,
+                admission,
+                project_id,
+                run_id,
+                "concept",
+                chunk_index,
+                chunk.iter().cloned().map(UlArtifact::ConceptNode).collect(),
+                relations,
+                &mut report,
+            )
+            .await?;
+        }
+        Ok(report)
+    }
+
+    pub async fn write_pyramid_target(
+        &self,
+        writer: &WriterHandle,
+        admission: &WriteAdmissionService,
+        run_id: &str,
+        target: UlArtifact,
+        build: eliot_types::CapsuleBuild,
+    ) -> Result<UlArtifactWriteReport, EngineError> {
+        if target.project_id() != build.project_id || target.artifact_id() != build.target_id {
+            return Err(EngineError::WriteRejected(
+                "pyramid target and build identity mismatch".to_owned(),
+            ));
+        }
+        let project_id = build.project_id;
+        let target_id = target.artifact_id().to_owned();
+        let phase = target.receipt_kind();
+        let relations = match &target {
+            UlArtifact::SubsystemCapsule(capsule) => vec![RelationInput {
+                relation_type: RelationType::CapsuleCovers,
+                from: format!("capsule:{}", capsule.capsule_id),
+                to: format!("concept:{}", capsule.concept_id),
+            }],
+            UlArtifact::ProjectCharter(_) | UlArtifact::SystemMap(_) => Vec::new(),
+            _ => {
+                return Err(EngineError::WriteRejected(
+                    "write_pyramid_target requires a capsule, map, or charter".to_owned(),
+                ));
+            }
+        };
+        let mut report = UlArtifactWriteReport {
+            artifacts_written: 0,
+            relations_written: 0,
+            receipts: Vec::new(),
+        };
+        submit_batch(
+            writer,
+            admission,
+            project_id,
+            run_id,
+            phase,
+            deterministic_chunk_index(&target_id),
+            vec![target, UlArtifact::CapsuleBuild(build)],
+            relations,
+            &mut report,
+        )
+        .await?;
+        Ok(report)
+    }
+}
+
+fn deterministic_chunk_index(value: &str) -> usize {
+    let digest = blake3::hash(value.as_bytes());
+    let mut bytes = [0_u8; std::mem::size_of::<usize>()];
+    bytes.copy_from_slice(&digest.as_bytes()[..std::mem::size_of::<usize>()]);
+    usize::from_le_bytes(bytes)
 }
 
 #[allow(clippy::too_many_arguments)]

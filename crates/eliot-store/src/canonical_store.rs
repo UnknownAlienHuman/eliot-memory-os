@@ -498,6 +498,7 @@ impl CanonicalStore {
             NamedSurqlOp::SchemaMigrateUl,
             NamedSurqlOp::SchemaMigrateUlDelivery,
             NamedSurqlOp::SchemaMigrateUlArtifacts,
+            NamedSurqlOp::SchemaMigrateUlPyramid,
         ] {
             value = self.migrate_schema_op(op).await?;
         }
@@ -1221,6 +1222,28 @@ impl CanonicalStore {
     {
         self.canonical_records_by_kind(project_id, None, &[receipt_kind], limit)
             .await
+    }
+
+    pub async fn load_ul_artifacts<T>(
+        &self,
+        project_id: ProjectId,
+        receipt_kinds: &[&str],
+        limit: u16,
+    ) -> Result<Vec<CanonicalRecord<T>>, StoreError>
+    where
+        T: DeserializeOwned,
+    {
+        let value = self
+            .execute_value(
+                NamedSurqlOp::LoadUlArtifacts,
+                json!({
+                    "project_id": project_id,
+                    "receipt_kinds": receipt_kinds,
+                    "limit": limit.clamp(1, MAX_CANONICAL_RECORDS),
+                }),
+            )
+            .await?;
+        decode_value(NamedSurqlOp::LoadUlArtifacts, value)
     }
 
     pub async fn meta_policy_actions_by_candidate(

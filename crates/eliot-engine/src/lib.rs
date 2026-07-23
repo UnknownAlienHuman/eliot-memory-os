@@ -190,9 +190,12 @@ pub use skill_curator::{
     SkillCuratorService, SkillMergeSplitService, SkillPatchService,
 };
 pub use ul::{
-    CueIndexService, FiredMemory, FiringResult, GitMiningArtifacts, GitMiningService,
-    GitMiningStatus, InjectionPlanner, ModuleCardService, ObservedCue, TouchedCue,
-    TouchedSetRegistry, UlArtifactWriteReport, UlArtifactWriterService, failure_bindings_by_path,
+    CapsuleEvidence, ConceptSeedResult, CueIndexService, FiredMemory, FiringResult,
+    GitMiningArtifacts, GitMiningService, GitMiningStatus, InjectionPlanner, ModuleCardService,
+    ObservedCue, OnboardingService, PromotedPyramid, PyramidBuilder, PyramidDecision,
+    PyramidDependency, PyramidFailure, TouchedCue, TouchedSetRegistry, UlArtifactWriteReport,
+    UlArtifactWriterService, canonical_project_root, capsule_freshness, failure_bindings_by_path,
+    render_capsule,
 };
 pub use verification::{
     FlakeDetectionService, StatefulDbTestIsolationService, TestCostService, TestInventoryService,

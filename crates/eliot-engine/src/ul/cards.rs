@@ -1,7 +1,7 @@
 use crate::EngineError;
 use eliot_types::{
     CoChangeEdge, CueBinding, CueKind, CueMatchMode, CueStrength, HotspotScore, ModuleCard,
-    ProjectId, ul_token_estimate,
+    ProjectId, normalize_bindings, ul_token_estimate,
 };
 use serde_json::json;
 use std::cmp::Ordering;
@@ -100,6 +100,8 @@ impl ModuleCardService {
                 .iter()
                 .map(|coupling| file_binding(&coupling.partner, CueStrength::Secondary)),
         );
+        let cue_bindings = normalize_bindings(cue_bindings, None)
+            .map_err(|error| EngineError::WriteRejected(error.to_string()))?;
 
         let fingerprint_material = json!({
             "project_id": project_id,

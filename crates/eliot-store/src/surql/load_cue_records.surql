@@ -27,6 +27,14 @@ LIMIT 10001;
 LET $observations = SELECT
   IF payload.receipt_kind = 'module_card' {
     string::concat('card:', <string> payload.receipt_body.card_id)
+  } ELSE IF payload.receipt_kind = 'concept_node' {
+    string::concat('concept:', <string> payload.receipt_body.concept_id)
+  } ELSE IF payload.receipt_kind = 'project_charter' {
+    string::concat('charter:', <string> payload.receipt_body.charter_id)
+  } ELSE IF payload.receipt_kind = 'system_map' {
+    string::concat('system-map:', <string> payload.receipt_body.map_id)
+  } ELSE IF payload.receipt_kind = 'subsystem_capsule' {
+    string::concat('capsule:', <string> payload.receipt_body.capsule_id)
   } ELSE {
     string::concat('tool_observation:', <string> observation_id)
   } AS record_ref,
@@ -48,6 +56,14 @@ LIMIT 10001;
 LET $canonical = SELECT
   IF receipt_kind = 'module_card' {
     string::concat('card:', <string> receipt_body.card_id)
+  } ELSE IF receipt_kind = 'concept_node' {
+    string::concat('concept:', <string> receipt_body.concept_id)
+  } ELSE IF receipt_kind = 'project_charter' {
+    string::concat('charter:', <string> receipt_body.charter_id)
+  } ELSE IF receipt_kind = 'system_map' {
+    string::concat('system-map:', <string> receipt_body.map_id)
+  } ELSE IF receipt_kind = 'subsystem_capsule' {
+    string::concat('capsule:', <string> receipt_body.capsule_id)
   } ELSE {
     string::concat('canonical:', <string> record_id)
   } AS record_ref,

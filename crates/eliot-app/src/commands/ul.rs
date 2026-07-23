@@ -6,6 +6,12 @@ pub enum UlCommand {
         #[arg(long)]
         root: PathBuf,
     },
+    Onboard {
+        #[arg(long)]
+        project: ProjectId,
+        #[arg(long)]
+        root: PathBuf,
+    },
 }
 
 pub async fn run_ul_mine_git(
@@ -108,6 +114,79 @@ pub async fn run_ul_mine_git(
             .len()
             .saturating_add(card_report.receipts.len()),
     }))
+}
+
+pub async fn run_ul_onboard(
+    config_path: &Path,
+    project_id: ProjectId,
+    project_root: &Path,
+) -> Result<()> {
+    let instance = ul_onboarding_instance(config_path)?;
+    let result = named_pipe_ipc::host_governor_request(
+        &instance,
+        "ul/onboard",
+        serde_json::json!({
+            "project_id": project_id,
+            "project_root": project_root,
+        }),
+    )
+    .await
+    .context("route UL onboarding through the daemon-owned WriterActor")?;
+    write_json(&result)
+}
+
+pub(crate) async fn run_ul_onboard_from_daemon(
+    runtime_root: &Path,
+    store: &CanonicalStore,
+    writer: &eliot_engine::WriterHandle,
+    params: serde_json::Value,
+) -> Result<serde_json::Value> {
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Input {
+        project_id: ProjectId,
+        project_root: PathBuf,
+    }
+
+    let input: Input = serde_json::from_value(params).context("decode UL onboarding request")?;
+    let _ = store.migrate_schema().await?;
+    let service = eliot_engine::OnboardingService::new(store.clone(), writer.clone());
+    let report = service
+        .run(
+            input.project_id,
+            &input.project_root,
+            runtime_root,
+            eliot_types::OnboardingTestHook::None,
+        )
+        .await?;
+    serde_json::to_value(report).context("encode UL onboarding report")
+}
+
+fn ul_onboarding_instance(config_path: &Path) -> Result<RuntimeInstance> {
+    let default = RuntimeInstance::select(
+        config_path,
+        Some(crate::runtime_instance::DEFAULT_INSTANCE_NAME),
+    )?;
+    if default
+        .read_publication(named_pipe_ipc::IPC_PROTOCOL_VERSION)
+        .is_ok_and(|publication| {
+            crate::runtime_instance::path_identity(&publication.config_path)
+                == crate::runtime_instance::path_identity(config_path)
+        })
+    {
+        return Ok(default);
+    }
+
+    let isolated = RuntimeInstance::select(config_path, None)?;
+    let publication = isolated
+        .read_publication(named_pipe_ipc::IPC_PROTOCOL_VERSION)
+        .context("UL onboarding requires a ready Governor daemon for this config")?;
+    if crate::runtime_instance::path_identity(&publication.config_path)
+        != crate::runtime_instance::path_identity(config_path)
+    {
+        anyhow::bail!("UL onboarding daemon config does not match the requested config");
+    }
+    Ok(isolated)
 }
 
 async fn refresh_card_cues(
