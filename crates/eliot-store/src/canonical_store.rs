@@ -14,11 +14,13 @@ use eliot_types::{
     FetchAtomsL2Request, FetchAtomsL2Response, GraphHealthResponse, HarnessExperimentRecord,
     LifecycleStatus, MemoryRevision, MemoryStateTransition, MemoryTrajectoryCorrectness,
     MemoryWriteEnvelope, MetaIsolationRejectionRecord, MetaPolicyExecutionAction,
-    MetaPolicyExecutionReceipt, MinorityPressureRecord, ProjectId, ProjectSequence,
-    RecallL0Request, RecallL0Response, ReplayAudit, ReplayRun, SealedReplayCaseRecord,
-    SealedReplayInputSnapshotRecord, SealedReplaySetRecord, SleepCandidateArtifact,
-    SleepConsolidationBundle, SleepConsolidationRun, SurrealServerConfig, TaintClass, TaskContract,
-    TaskId, ToolObservation, VerificationId, VerificationRun, Visibility, WriteId, WriteReceipt,
+    MetaPolicyExecutionReceipt, MinorityPressureRecord, ObservabilityKind,
+    ObservabilityWriteEnvelope, ObservabilityWriteReceipt, ObservabilityWriteStatus, ProjectId,
+    ProjectSequence, RecallL0Request, RecallL0Response, ReplayAudit, ReplayRun,
+    SealedReplayCaseRecord, SealedReplayInputSnapshotRecord, SealedReplaySetRecord,
+    SleepCandidateArtifact, SleepConsolidationBundle, SleepConsolidationRun, SurrealServerConfig,
+    TaintClass, TaskContract, TaskId, ToolObservation, VerificationId, VerificationRun, Visibility,
+    WriteId, WriteReceipt,
 };
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
@@ -483,13 +485,21 @@ impl CanonicalStore {
     }
 
     pub async fn migrate_schema(&self) -> Result<Value, StoreError> {
+        let mut value = Value::Null;
+        for op in [
+            NamedSurqlOp::SchemaMigrate,
+            NamedSurqlOp::SchemaMigrateObservability,
+        ] {
+            value = self.migrate_schema_op(op).await?;
+        }
+        Ok(value)
+    }
+
+    async fn migrate_schema_op(&self, op: NamedSurqlOp) -> Result<Value, StoreError> {
         let vars = Value::Object(serde_json::Map::new());
         let mut attempts = 0u8;
         loop {
-            match self
-                .execute_value(NamedSurqlOp::SchemaMigrate, vars.clone())
-                .await
-            {
+            match self.execute_value(op, vars.clone()).await {
                 Ok(value) => return Ok(value),
                 Err(error)
                     if is_retryable_schema_conflict(&error)
@@ -600,6 +610,64 @@ impl CanonicalStore {
             )
             .await?;
         decode_value(NamedSurqlOp::ApplyWriteEnvelope, value)
+    }
+
+    pub async fn apply_observability(
+        &self,
+        envelope: &ObservabilityWriteEnvelope,
+    ) -> Result<ObservabilityWriteReceipt, StoreError> {
+        let value = self
+            .execute_value(
+                NamedSurqlOp::ApplyObservability,
+                json!({
+                    "envelope": envelope,
+                    "target_table": envelope.kind.table_name(),
+                }),
+            )
+            .await?;
+        let receipt =
+            decode_value::<ObservabilityWriteReceipt>(NamedSurqlOp::ApplyObservability, value)?;
+        if receipt.status == ObservabilityWriteStatus::Rejected {
+            return Err(StoreError::ObservabilityConflict);
+        }
+        Ok(receipt)
+    }
+
+    pub async fn observability_receipt(
+        &self,
+        write_id: WriteId,
+    ) -> Result<Option<ObservabilityWriteReceipt>, StoreError> {
+        let value = self
+            .execute_value(
+                NamedSurqlOp::ObservabilityReceiptById,
+                json!({ "write_id": write_id }),
+            )
+            .await?;
+        if value.is_null() {
+            return Ok(None);
+        }
+        decode_value(NamedSurqlOp::ObservabilityReceiptById, value).map(Some)
+    }
+
+    pub async fn observability_records_by_kind<T: DeserializeOwned>(
+        &self,
+        project_id: ProjectId,
+        task_id: Option<TaskId>,
+        kind: ObservabilityKind,
+    ) -> Result<Vec<T>, StoreError> {
+        let value = self
+            .execute_value(
+                NamedSurqlOp::ObservabilityRecordsByKind,
+                json!({
+                    "project_id": project_id,
+                    "task_id": task_id,
+                    "has_task_id": task_id.is_some(),
+                    "kind": kind,
+                    "target_table": kind.table_name(),
+                }),
+            )
+            .await?;
+        decode_value(NamedSurqlOp::ObservabilityRecordsByKind, value)
     }
 
     pub async fn current_state(

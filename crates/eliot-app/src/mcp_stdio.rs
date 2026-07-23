@@ -95,7 +95,8 @@ use eliot_types::{
     ForgettingReason, LatencyHistogram, LifecycleStatus, MailboxMessageId, MailboxMessageKind,
     MailboxRecipient, MaintenanceJobKind, MemoryCurationCandidate, MemoryCurationCorpusProfile,
     MemoryCurationFindingKind, MemoryCurationPreviewRequest, MemoryCurationPreviewResponse,
-    MemoryExposurePolicy, MemoryInfluenceReport, MemoryInfluenceTrace, MemoryInspectorView,
+    MemoryExposurePolicy, MemoryInfluenceReport, MemoryInfluenceTrace,
+    MemoryInfluenceTraceWriteInput, MemoryInfluenceTraceWriteResult, MemoryInspectorView,
     MemoryLifecyclePacketView, MemoryLifecycleState, MemoryNeed, MemoryRevision,
     MemoryWriteEnvelope, MetaCandidateChangeClass, MetaExperimentDecision, MetaIsolationFence,
     MetaPolicyAuthorization, MetaPolicyExecutionAction, MetricDefinition, MetricSample,
@@ -1739,13 +1740,6 @@ struct FetchL2ToolInput {
 struct UnderstandingOutcomeToolInput {
     project_id: String,
     record: UnderstandingOutcomeRecord,
-}
-
-#[derive(serde::Deserialize)]
-#[serde(deny_unknown_fields)]
-struct MemoryInfluenceTraceToolInput {
-    project_id: String,
-    trace: MemoryInfluenceTrace,
 }
 
 #[derive(serde::Deserialize)]

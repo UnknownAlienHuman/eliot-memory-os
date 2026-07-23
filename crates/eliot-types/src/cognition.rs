@@ -183,7 +183,7 @@ pub struct UnderstandingOutcomeRecord {
     pub canonical_receipt: Option<WriteReceiptRef>,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MemoryAdmissionDecision {
     IncludeVerified,
@@ -195,7 +195,7 @@ pub enum MemoryAdmissionDecision {
     RejectTainted,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MemoryInfluenceClass {
     UsedAndChangedAction,
@@ -207,7 +207,7 @@ pub enum MemoryInfluenceClass {
     LoadedWithoutDelta,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[allow(clippy::struct_excessive_bools)]
 pub struct MemoryInfluenceTrace {
     pub task_id: TaskId,
@@ -225,6 +225,7 @@ pub struct MemoryInfluenceTrace {
     pub suppressed_as_stale_or_wrong_scope: bool,
     pub downstream_outcome_ref: Option<String>,
     pub influence_class: MemoryInfluenceClass,
+    #[schemars(with = "Option<serde_json::Value>")]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub canonical_receipt: Option<WriteReceiptRef>,
 }

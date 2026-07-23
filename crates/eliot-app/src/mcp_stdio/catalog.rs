@@ -9,9 +9,10 @@ use super::{
     McpAccessProfile, READ_ONLY_TOOLS, action_lease_status_schema, action_plan_schema,
     agent_candidate_schema, blackboard_ack_schema, blackboard_add_schema, codecortex_scan_schema,
     cognitive_record_schema, compile_packet_schema, json_schema, mailbox_ack_schema,
-    mailbox_send_schema, patch_apply_schema, tool, understanding_proof_schema, work_claim_schema,
-    work_create_schema, work_lease_schema, work_status_schema, worktree_create_schema,
-    worktree_lease_schema, worktree_review_schema, worktree_status_schema,
+    mailbox_send_schema, memory_influence_trace_schema, patch_apply_schema, tool,
+    understanding_proof_schema, work_claim_schema, work_create_schema, work_lease_schema,
+    work_status_schema, worktree_create_schema, worktree_lease_schema, worktree_review_schema,
+    worktree_status_schema,
 };
 use anyhow::{Context as _, Result};
 use eliot_types::ClaudeSurface;
@@ -1136,7 +1137,7 @@ pub(super) fn core_tool_definitions() -> Vec<Value> {
             "eliot_memory_influence_trace",
             "Eliot Memory Influence Trace",
             "Write an outcome-linked memory influence trace. Packet inclusion without observable delta remains loaded_without_delta.",
-            &cognitive_record_schema("trace"),
+            &memory_influence_trace_schema(),
         ),
         tool(
             "eliot_context_cargo_receipt",

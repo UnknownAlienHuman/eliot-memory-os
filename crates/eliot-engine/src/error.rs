@@ -13,6 +13,9 @@ pub enum EngineError {
         violations: Vec<eliot_types::TextEncodingViolation>,
     },
 
+    #[error("observability write_id conflicts with a different payload")]
+    ObservabilityConflict,
+
     #[error("writer backpressure")]
     Backpressure,
 

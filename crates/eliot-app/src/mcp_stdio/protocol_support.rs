@@ -92,6 +92,10 @@ fn compile_packet_schema() -> Value {
     eliot_types::compile_packet_input_schema()
 }
 
+fn memory_influence_trace_schema() -> Value {
+    eliot_types::memory_influence_trace_write_input_schema()
+}
+
 fn understanding_proof_schema() -> Value {
     json_schema(
         &[

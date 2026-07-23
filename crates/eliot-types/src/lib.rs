@@ -17,6 +17,7 @@ pub mod lifecycle;
 pub mod mcp_contract;
 pub mod memory;
 pub mod metrics;
+pub mod observability;
 pub mod provider_invocation;
 pub mod records;
 pub mod replay;
@@ -223,6 +224,11 @@ pub use metrics::{
     MetricUnit, MetricWindow, MetricsDoctorStatus, OperationalTrend, OperationalTrendDirection,
     QualitySignal, QualitySignalKind, RuntimeDashboard, SloBreachSeverity, SloDefinition,
     SloEvaluation, SloObjective, TelemetryEvent, TelemetryEventKind, TelemetryRollup,
+};
+pub use observability::{
+    MemoryInfluenceTraceWriteInput, MemoryInfluenceTraceWriteResult, OBSERVABILITY_SCHEMA_VERSION,
+    ObservabilityKind, ObservabilityWriteEnvelope, ObservabilityWriteReceipt,
+    ObservabilityWriteStatus, memory_influence_trace_write_input_schema,
 };
 pub use provider_invocation::{
     ExternalResultCompletenessReceipt, ProviderFailureIncident, ProviderIdentityCheck,

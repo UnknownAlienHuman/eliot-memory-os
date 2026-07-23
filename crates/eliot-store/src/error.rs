@@ -69,6 +69,9 @@ pub enum StoreError {
     #[error("SurrealDB transport policy violation: {0}")]
     PolicyViolation(String),
 
+    #[error("observability write_id conflicts with a different payload")]
+    ObservabilityConflict,
+
     #[error("WebSocket transport error: {0}")]
     WebSocket(String),
 

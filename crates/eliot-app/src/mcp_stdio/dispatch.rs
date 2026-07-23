@@ -167,6 +167,17 @@ fn dispatch_error_response(id: &Value, error: &anyhow::Error) -> Value {
             minimal_valid_example: Value::Null,
         };
         error_response_with_data(id, -32602, "encoding rejected", &data)
+    } else if matches!(
+        error.downcast_ref::<eliot_engine::EngineError>(),
+        Some(eliot_engine::EngineError::ObservabilityConflict)
+    ) {
+        let data = eliot_types::ToolInputErrorData {
+            code: "OBSERVABILITY_WRITE_ID_CONFLICT".to_owned(),
+            missing: Vec::new(),
+            invalid: Vec::new(),
+            minimal_valid_example: Value::Null,
+        };
+        error_response_with_data(id, -32602, "observability write_id conflict", &data)
     } else {
         error_response(id, -32603, &error.to_string())
     }

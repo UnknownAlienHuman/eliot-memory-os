@@ -164,12 +164,14 @@ async fn dispatch_understanding_outcome_record(
 }
 
 async fn dispatch_memory_influence_trace(state: &McpState, arguments: Value) -> Result<Value> {
-    let mut input: MemoryInfluenceTraceToolInput = serde_json::from_value(arguments)?;
-    CognitiveMemoryWriter::write_memory_influence_trace(
+    let input: MemoryInfluenceTraceWriteInput = serde_json::from_value(arguments)?;
+    let mut trace = input.trace;
+    trace.canonical_receipt = None;
+    let observability_receipt = CognitiveMemoryWriter::write_memory_influence_trace(
         &state.writer,
-        &WriteAdmissionService,
         parse_project_id(&input.project_id)?,
-        &mut input.trace,
+        WriteId::from_str(&input.write_id)?,
+        &trace,
     )
     .await?;
     write_json_report(
@@ -178,9 +180,13 @@ async fn dispatch_memory_influence_trace(state: &McpState, arguments: Value) -> 
             .join("reports")
             .join("cognition")
             .join("memory-influence-latest.json"),
-        &input.trace,
+        &trace,
     )?;
-    serde_json::to_value(input.trace).map_err(Into::into)
+    serde_json::to_value(MemoryInfluenceTraceWriteResult {
+        trace,
+        observability_receipt,
+    })
+    .map_err(Into::into)
 }
 
 async fn dispatch_context_cargo_receipt(state: &McpState, arguments: Value) -> Result<Value> {
