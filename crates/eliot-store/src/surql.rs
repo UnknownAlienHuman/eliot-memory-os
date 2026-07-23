@@ -4,6 +4,11 @@ use std::collections::HashMap;
 pub enum NamedSurqlOp {
     SchemaMigrate,
     SchemaMigrateObservability,
+    SchemaMigrateUl,
+    UpsertCueRows,
+    DeleteCueRows,
+    LoadCueRows,
+    LoadCueRecords,
     ApplyWriteEnvelope,
     ApplyObservability,
     ObservabilityReceiptById,
@@ -40,6 +45,11 @@ impl NamedSurqlOp {
         match self {
             Self::SchemaMigrate => "000_schema",
             Self::SchemaMigrateObservability => "001_observability",
+            Self::SchemaMigrateUl => "002_ul_core",
+            Self::UpsertCueRows => "upsert_cue_rows",
+            Self::DeleteCueRows => "delete_cues_for_record",
+            Self::LoadCueRows => "load_cue_rows",
+            Self::LoadCueRecords => "load_cue_records",
             Self::ApplyWriteEnvelope => "apply_write_envelope",
             Self::ApplyObservability => "apply_observability",
             Self::ObservabilityReceiptById => "observability_receipt_by_id",
@@ -76,6 +86,11 @@ impl NamedSurqlOp {
         match self {
             Self::SchemaMigrate => include_str!("surql/000_schema.surql"),
             Self::SchemaMigrateObservability => include_str!("surql/001_observability.surql"),
+            Self::SchemaMigrateUl => include_str!("surql/002_ul_core.surql"),
+            Self::UpsertCueRows => include_str!("surql/upsert_cue_rows.surql"),
+            Self::DeleteCueRows => include_str!("surql/delete_cues_for_record.surql"),
+            Self::LoadCueRows => include_str!("surql/load_cue_rows.surql"),
+            Self::LoadCueRecords => include_str!("surql/load_cue_records.surql"),
             Self::ApplyWriteEnvelope => include_str!("surql/apply_write_envelope.surql"),
             Self::ApplyObservability => include_str!("surql/apply_observability.surql"),
             Self::ObservabilityReceiptById => {
@@ -160,7 +175,8 @@ impl Default for SurqlTemplateRegistry {
     }
 }
 
-fn foundational_templates() -> [SurqlTemplate; 13] {
+#[allow(clippy::too_many_lines)]
+fn foundational_templates() -> [SurqlTemplate; 18] {
     [
         template(
             NamedSurqlOp::SchemaMigrate,
@@ -173,6 +189,36 @@ fn foundational_templates() -> [SurqlTemplate; 13] {
             "SchemaMigrateObservabilityInput",
             "SchemaMigrateObservabilityOutput",
             64 * 1024,
+        ),
+        template(
+            NamedSurqlOp::SchemaMigrateUl,
+            "SchemaMigrateUlInput",
+            "SchemaMigrateUlOutput",
+            64 * 1024,
+        ),
+        template(
+            NamedSurqlOp::UpsertCueRows,
+            "UpsertCueRowsInput",
+            "UpsertCueRowsOutput",
+            64 * 1024,
+        ),
+        template(
+            NamedSurqlOp::DeleteCueRows,
+            "DeleteCueRowsInput",
+            "DeleteCueRowsOutput",
+            64 * 1024,
+        ),
+        template(
+            NamedSurqlOp::LoadCueRows,
+            "LoadCueRowsInput",
+            "LoadCueRowsOutput",
+            4 * 1024 * 1024,
+        ),
+        template(
+            NamedSurqlOp::LoadCueRecords,
+            "LoadCueRecordsInput",
+            "LoadCueRecordsOutput",
+            8 * 1024 * 1024,
         ),
         template(
             NamedSurqlOp::ApplyWriteEnvelope,

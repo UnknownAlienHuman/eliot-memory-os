@@ -15,10 +15,11 @@ pub(super) async fn dispatch_agent_candidate_submit(
     arguments: Value,
 ) -> Result<Value> {
     let submitted_body_sha256 = sha256_json(&arguments)?;
-    let input: AgentCandidateSubmitInput = serde_json::from_value(arguments)?;
+    let mut input: AgentCandidateSubmitInput = serde_json::from_value(arguments)?;
     validate_candidate_field("topic", &input.topic, 160)?;
     validate_candidate_field("statement", &input.statement, 4_000)?;
     validate_candidate_field("freshness_rule", &input.freshness_rule, 1_000)?;
+    validate_candidate_field("expected_reuse_note", &input.expected_reuse_note, 200)?;
     validate_candidate_list("where_applicable", &input.where_applicable, 0, 32, 500)?;
     validate_candidate_list(
         "where_not_applicable",
@@ -38,6 +39,18 @@ pub(super) async fn dispatch_agent_candidate_submit(
     if let Some(curation) = input.curation.as_ref() {
         validate_candidate_curation(curation)?;
     }
+    let submitted_bindings = input.cue_bindings.clone();
+    let normalized_bindings =
+        eliot_types::normalize_bindings(input.cue_bindings, state.root.to_str())
+            .map_err(|error| invalid_cue_input_message(&error.to_string()))?;
+    if state.profile == McpAccessProfile::CognitiveChild
+        && normalized_bindings != submitted_bindings
+    {
+        return Err(invalid_cue_input_message(
+            "capability-bound cue_bindings must already be in canonical normalized form",
+        ));
+    }
+    input.cue_bindings = normalized_bindings;
     let project_id = parse_project_id(&input.project_id)?;
     let task_id = TaskId::from_str(&input.task_id).context("parse candidate task_id")?;
     let _task = require_task(state, project_id, task_id).await?;
@@ -135,6 +148,8 @@ pub(super) async fn dispatch_agent_candidate_submit(
         "negative_constraints": input.negative_constraints,
         "provenance_refs": input.provenance_refs,
         "freshness_rule": input.freshness_rule,
+        "cue_bindings": input.cue_bindings.clone(),
+        "expected_reuse_note": input.expected_reuse_note,
         "curation": input.curation
     });
     let payload = if let Some(claims) = cognitive_claims.as_ref() {
@@ -173,6 +188,7 @@ pub(super) async fn dispatch_agent_candidate_submit(
         .and_then(Value::as_str)
         .unwrap_or_default()
         .to_owned();
+    let claim_id = ClaimId::from_uuid(write_id.as_uuid());
     let command = SemanticCommand::ClaimPropose(eliot_types::ClaimProposeCommand {
         context: CommandContext {
             write_id,
@@ -191,8 +207,8 @@ pub(super) async fn dispatch_agent_candidate_submit(
             lifecycle_status: LifecycleStatus::Active,
         },
         claim: ClaimCardInput {
-            claim_id: ClaimId::from_uuid(write_id.as_uuid()),
-            statement,
+            claim_id,
+            statement: statement.clone(),
             status: EpistemicStatus::Candidate,
             payload,
         },
@@ -201,11 +217,38 @@ pub(super) async fn dispatch_agent_candidate_submit(
         .writer
         .submit(WriteAdmissionService.admit(&command)?)
         .await?;
+    let cue_projection_status = if matches!(
+        receipt.status,
+        WriteStatus::Committed | WriteStatus::IdempotentReplay
+    ) {
+        if state
+            .ul
+            .cue_index
+            .replace_record_bindings(
+                project_id,
+                &format!("claim:{claim_id}"),
+                "claim",
+                &statement,
+                &input.cue_bindings,
+                false,
+            )
+            .await
+            .is_ok()
+        {
+            "ready"
+        } else {
+            let _ = state.ul.cue_index.invalidate(project_id);
+            "rebuild_required"
+        }
+    } else {
+        "not_committed"
+    };
     Ok(json!({
         "status": "candidate_committed",
         "candidate_only": true,
         "controller_reconciliation_required": true,
         "write_receipt": receipt,
+        "cue_projection_status": cue_projection_status,
         "cognitive_binding": cognitive_claims.map(|claims| json!({
             "run_id": claims.capability.run_id,
             "call_id": claims.capability.call_id,
@@ -217,6 +260,30 @@ pub(super) async fn dispatch_agent_candidate_submit(
             "attempt_receipt": claims.attempt_receipt,
         }))
     }))
+}
+
+fn invalid_cue_input_message(reason: &str) -> anyhow::Error {
+    eliot_types::ToolInputError {
+        data: eliot_types::ToolInputErrorData {
+            code: "INVALID_TOOL_INPUT".to_owned(),
+            missing: Vec::new(),
+            invalid: vec![eliot_types::InvalidField {
+                field: "cue_bindings".to_owned(),
+                reason: reason.to_owned(),
+            }],
+            minimal_valid_example: json!({
+                "cue_bindings": [{
+                    "cue_kind": "file_path",
+                    "cue_value": "crates/eliot-store/src/lib.rs",
+                    "match_mode": "exact",
+                    "strength": "primary",
+                    "expected_reuse_note": "Reuse when editing the canonical store."
+                }],
+                "expected_reuse_note": "Reuse when the same project area is active."
+            }),
+        },
+    }
+    .into()
 }
 
 pub(super) fn existing_candidate_with_same_topic_and_statement<'a>(
@@ -1790,72 +1857,6 @@ pub(super) fn append_candidate_diff_authority_ref(
         }
     }
     Ok(())
-}
-
-pub(super) fn agent_candidate_schema() -> Value {
-    json!({
-        "type": "object",
-        "additionalProperties": false,
-        "properties": {
-            "project_id": {"type": "string", "minLength": 1, "maxLength": 64},
-            "task_id": {"type": "string", "minLength": 1, "maxLength": 64},
-            "write_id": {"type": "string", "minLength": 1, "maxLength": 64},
-            "topic": {"type": "string", "minLength": 1, "maxLength": 160},
-            "statement": {"type": "string", "minLength": 1, "maxLength": 4000},
-            "where_applicable": {
-                "type": "array",
-                "maxItems": 32,
-                "items": {"type": "string", "minLength": 1, "maxLength": 500}
-            },
-            "where_not_applicable": {
-                "type": "array",
-                "maxItems": 32,
-                "items": {"type": "string", "minLength": 1, "maxLength": 500}
-            },
-            "negative_constraints": {
-                "type": "array",
-                "maxItems": 32,
-                "items": {"type": "string", "minLength": 1, "maxLength": 500}
-            },
-            "provenance_refs": {
-                "type": "array",
-                "minItems": 1,
-                "maxItems": 32,
-                "items": {"type": "string", "minLength": 1, "maxLength": 1000}
-            },
-            "freshness_rule": {"type": "string", "minLength": 1, "maxLength": 1000},
-            "curation": {
-                "type": "object",
-                "additionalProperties": false,
-                "properties": {
-                    "handle": {"type": "string", "minLength": 1, "maxLength": 256},
-                    "duplicate_of": {"type": "string", "minLength": 1, "maxLength": 256},
-                    "scope_match": {"type": "boolean"},
-                    "wrong_scope_for": {"type": "array", "maxItems": 32, "items": {"type": "string", "minLength": 1, "maxLength": 500}},
-                    "utility_score": {"type": "integer", "minimum": 0, "maximum": 100},
-                    "evidence_sufficient": {"type": "boolean"},
-                    "superseded_by": {"type": "string", "minLength": 1, "maxLength": 256},
-                    "stale_reason_ref": {"type": "string", "minLength": 1, "maxLength": 256},
-                    "protected": {"type": "boolean"},
-                    "role": {"type": "string", "minLength": 1, "maxLength": 64},
-                    "lifecycle": {"type": "string", "minLength": 1, "maxLength": 64},
-                    "authority": {"type": "string", "minLength": 1, "maxLength": 128},
-                    "evidence_refs": {"type": "array", "maxItems": 32, "items": {"type": "string", "minLength": 1, "maxLength": 500}},
-                    "counterevidence_refs": {"type": "array", "maxItems": 32, "items": {"type": "string", "minLength": 1, "maxLength": 500}}
-                },
-                "required": ["handle"]
-            }
-        },
-        "required": [
-            "project_id",
-            "task_id",
-            "write_id",
-            "topic",
-            "statement",
-            "provenance_refs",
-            "freshness_rule"
-        ]
-    })
 }
 
 pub(super) fn verifier_latest_path(root: &Path) -> PathBuf {

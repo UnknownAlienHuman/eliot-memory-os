@@ -1,4 +1,4 @@
-use crate::{CompilePacketL3Request, MaterialPacketFrame, MemoryExposureMode};
+use crate::{CompilePacketL3Request, CueBinding, MaterialPacketFrame, MemoryExposureMode};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -46,6 +46,87 @@ pub fn compile_packet_minimal_example() -> Value {
             "instruction_hotset_size": 0
         }
     })
+}
+
+#[derive(Clone, Debug, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentCandidateSubmitInput {
+    pub project_id: String,
+    pub task_id: String,
+    pub write_id: String,
+    pub topic: String,
+    pub statement: String,
+    #[serde(default)]
+    pub where_applicable: Vec<String>,
+    #[serde(default)]
+    pub where_not_applicable: Vec<String>,
+    #[serde(default)]
+    pub negative_constraints: Vec<String>,
+    pub provenance_refs: Vec<String>,
+    pub freshness_rule: String,
+    pub cue_bindings: Vec<CueBinding>,
+    pub expected_reuse_note: String,
+    #[serde(default)]
+    pub curation: Option<AgentCandidateCurationInput>,
+}
+
+#[derive(Clone, Debug, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+#[allow(clippy::struct_excessive_bools)]
+pub struct AgentCandidateCurationInput {
+    pub handle: String,
+    #[serde(default)]
+    pub duplicate_of: Option<String>,
+    #[serde(default)]
+    pub semantic_duplicate_of: Option<String>,
+    #[serde(default)]
+    pub semantic_equivalence_verified: bool,
+    #[serde(default)]
+    pub scope_match: Option<bool>,
+    #[serde(default)]
+    pub wrong_scope_for: Vec<String>,
+    #[serde(default)]
+    pub utility_score: Option<u8>,
+    #[serde(default)]
+    pub utility_delta: Option<i16>,
+    #[serde(default)]
+    pub repeat_count: Option<u16>,
+    #[serde(default)]
+    pub repeated_with: Vec<String>,
+    #[serde(default)]
+    pub evidence_sufficient: Option<bool>,
+    #[serde(default)]
+    pub superseded_by: Option<String>,
+    #[serde(default)]
+    pub stale_reason_ref: Option<String>,
+    #[serde(default)]
+    pub protected: bool,
+    #[serde(default)]
+    pub current_truth: bool,
+    #[serde(default)]
+    pub audit_required: bool,
+    #[serde(default)]
+    pub reopen_condition_met: Option<bool>,
+    #[serde(default)]
+    pub unsafe_instruction: bool,
+    #[serde(default)]
+    pub unsafe_evidence_refs: Vec<String>,
+    #[serde(default)]
+    pub role: Option<String>,
+    #[serde(default)]
+    pub lifecycle: Option<String>,
+    #[serde(default)]
+    pub authority: Option<String>,
+    #[serde(default)]
+    pub evidence_refs: Vec<String>,
+    #[serde(default)]
+    pub counterevidence_refs: Vec<String>,
+}
+
+#[allow(clippy::expect_used)]
+pub fn agent_candidate_input_schema() -> Value {
+    serde_json::to_value(schemars::schema_for!(AgentCandidateSubmitInput))
+        .expect("AgentCandidateSubmitInput schema must serialize")
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]

@@ -32,6 +32,7 @@ pub mod semantic_memory;
 pub mod service;
 pub mod skill;
 pub mod skill_curator;
+pub mod ul;
 pub mod verification;
 pub mod work;
 pub mod worktree;
@@ -188,6 +189,7 @@ pub use skill_curator::{
     SkillCurationReportService, SkillCuratorMemoryWriter, SkillCuratorRunInput,
     SkillCuratorService, SkillMergeSplitService, SkillPatchService,
 };
+pub use ul::{CueIndexService, FiredMemory, FiringResult, ObservedCue};
 pub use verification::{
     FlakeDetectionService, StatefulDbTestIsolationService, TestCostService, TestInventoryService,
     VerificationDoctorIntegration, VerificationPlannerService, VerificationProfileService,

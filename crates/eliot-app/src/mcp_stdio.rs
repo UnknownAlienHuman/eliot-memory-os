@@ -62,32 +62,32 @@ use eliot_engine::{
 use eliot_store::{BlobStore, CanonicalClaimCard, CanonicalRecord, CanonicalStore, ControlWal};
 use eliot_types::{
     ActionKind, ActionLease, ActionLeaseId, ActionProvenanceSet, ActionSourceScope,
-    AdapterCapability, AgentCapabilityEnvelope, AgentHostId, AgentId, AgentInvocationRequest,
-    AgentResultDisposition, AgentResultDispositionKind, AgentResultEnvelope,
-    AgentResultRecordCommand, AgentResultStatus, AgentRole, AgentRoutingView, AgentSessionId,
-    AntigravityAuthCheck, AntigravityBinaryResolution, AntigravityCapabilityProbe,
-    AntigravityCommandContract, AntigravityDisableReceipt, AntigravityEnablementReceipt,
-    AntigravityLiveSmokeResult, AntigravityMcpInvocationReceipt, AntigravityReviewMode,
-    AntigravityRun, ApprovalView, AutonomyRunContract, AutonomyRunState, BenchmarkIntegrityReceipt,
-    BlackboardItemId, BlackboardItemKind, BlackboardScope, BlobStoreConfig,
-    COGNITIVE_RUN_EXACT_CALLS, COGNITIVE_RUN_RAW_VERIFIER_CALLS, COGNITIVE_RUN_SCHEMA_VERSION,
-    CandidateDiff, CandidateDiffId, CandidateDiffStatus, CandidateReview, CandidateReviewDecision,
-    CanonicalCaseDisposition, CanonicalReplayAuthority, CanonicalReplayExecutionRecord,
-    CanonicalReplayObservationEvidence, CanonicalTraceCompletenessContract, CanonicalTraceEvidence,
-    CanonicalTraceEvidenceKind, CanonicalTraceEvidenceSource, CanonicalTraceReceiptBinding,
-    ChangePlan, ClaimCardInput, ClaimId, CodeCortexReport, CodeCortexRequest,
-    CognitiveCandidateCapability, CognitiveCaseSpec, CognitiveExecutionSeal,
-    CognitiveFailureLocalizationReport, CognitiveGateRequest, CognitiveHostObservation,
-    CognitiveInvocationRole, CognitiveRawVerifierEvidence, CognitiveReaderAnswer,
-    CognitiveRunAttempt, CognitiveRunCallPlan, CognitiveRunCallStatus, CognitiveRunContract,
-    CognitiveRunTerminal, CognitiveSharedGateBinding, CognitiveToolObservation, CommandContext,
-    CompilePacketL3Request, CompletionDecisionMemory, CompletionMemoryAdmission,
-    CompletionMemoryRequest, CompletionProof, ConfidenceLevel, ContextPacketL3,
-    ContrastiveAbstractionResult, ControlWalConfig, ControllerCommitHandoff, CostLedger,
-    CredentialPurpose, CurrentStateRequest, DashboardReport, DataRootMode, EpistemicStatus,
-    EvalBaseline, EvalCase, EvalDatasetManifest, EvalFailureCluster, EvalFamily, EvalRun,
-    EvalRunId, EvalRunProfile, EvalSuite, EvalVerdict, EvalVerdictStatus, EvidenceAtomInput,
-    EvidenceId, ExperienceCase, ExperienceFormationResult, ExperiencePattern,
+    AdapterCapability, AgentCandidateCurationInput, AgentCandidateSubmitInput,
+    AgentCapabilityEnvelope, AgentHostId, AgentId, AgentInvocationRequest, AgentResultDisposition,
+    AgentResultDispositionKind, AgentResultEnvelope, AgentResultRecordCommand, AgentResultStatus,
+    AgentRole, AgentRoutingView, AgentSessionId, AntigravityAuthCheck, AntigravityBinaryResolution,
+    AntigravityCapabilityProbe, AntigravityCommandContract, AntigravityDisableReceipt,
+    AntigravityEnablementReceipt, AntigravityLiveSmokeResult, AntigravityMcpInvocationReceipt,
+    AntigravityReviewMode, AntigravityRun, ApprovalView, AutonomyRunContract, AutonomyRunState,
+    BenchmarkIntegrityReceipt, BlackboardItemId, BlackboardItemKind, BlackboardScope,
+    BlobStoreConfig, COGNITIVE_RUN_EXACT_CALLS, COGNITIVE_RUN_RAW_VERIFIER_CALLS,
+    COGNITIVE_RUN_SCHEMA_VERSION, CandidateDiff, CandidateDiffId, CandidateDiffStatus,
+    CandidateReview, CandidateReviewDecision, CanonicalCaseDisposition, CanonicalReplayAuthority,
+    CanonicalReplayExecutionRecord, CanonicalReplayObservationEvidence,
+    CanonicalTraceCompletenessContract, CanonicalTraceEvidence, CanonicalTraceEvidenceKind,
+    CanonicalTraceEvidenceSource, CanonicalTraceReceiptBinding, ChangePlan, ClaimCardInput,
+    ClaimId, CodeCortexReport, CodeCortexRequest, CognitiveCandidateCapability, CognitiveCaseSpec,
+    CognitiveExecutionSeal, CognitiveFailureLocalizationReport, CognitiveGateRequest,
+    CognitiveHostObservation, CognitiveInvocationRole, CognitiveRawVerifierEvidence,
+    CognitiveReaderAnswer, CognitiveRunAttempt, CognitiveRunCallPlan, CognitiveRunCallStatus,
+    CognitiveRunContract, CognitiveRunTerminal, CognitiveSharedGateBinding,
+    CognitiveToolObservation, CommandContext, CompilePacketL3Request, CompletionDecisionMemory,
+    CompletionMemoryAdmission, CompletionMemoryRequest, CompletionProof, ConfidenceLevel,
+    ContextPacketL3, ContrastiveAbstractionResult, ControlWalConfig, ControllerCommitHandoff,
+    CostLedger, CredentialPurpose, CurrentStateRequest, DashboardReport, DataRootMode,
+    EpistemicStatus, EvalBaseline, EvalCase, EvalDatasetManifest, EvalFailureCluster, EvalFamily,
+    EvalRun, EvalRunId, EvalRunProfile, EvalSuite, EvalVerdict, EvalVerdictStatus,
+    EvidenceAtomInput, EvidenceId, ExperienceCase, ExperienceFormationResult, ExperiencePattern,
     ExperienceRecallRequest, ExperimentalMetaPolicyPayload, ExperimentalMetaPolicyState,
     ExternalOutputSchemaKind, ExternalProviderProfile, ExternalReviewBudget,
     ExternalReviewGateDecisionKind, ExternalReviewPacket, ExternalReviewRequest,
@@ -197,6 +197,7 @@ mod operator;
 mod replay;
 mod skill;
 mod task;
+mod ul;
 mod work;
 #[allow(clippy::wildcard_imports)]
 use autonomy::*;
@@ -220,6 +221,7 @@ use replay::*;
 use skill::*;
 #[allow(clippy::wildcard_imports)]
 use task::*;
+use ul::UlRuntime;
 #[allow(clippy::wildcard_imports)]
 use work::*;
 
@@ -821,6 +823,7 @@ impl McpDaemon {
         let root = runtime_root(config_path);
         let pipe_name = instance.pipe_name();
         let store = CanonicalStore::new(config.db.surreal.clone());
+        let ul = Arc::new(UlRuntime::new(store.clone()));
         let wal = ControlWal::open(&config.control_wal)?;
         let (writer, actor) = WriterActor::channel(wal, store.clone(), &WriterConfig::default());
         let cursor_signing_key = load_or_create_operator_cursor_signing_key(instance)?;
@@ -835,6 +838,7 @@ impl McpDaemon {
             cognitive_governor: McpState {
                 root: root.clone(),
                 store: store.clone(),
+                ul: Arc::clone(&ul),
                 schema_ready: OnceCell::new(),
                 control_wal: config.control_wal.clone(),
                 blob_store: config.blob_store.clone(),
@@ -851,6 +855,7 @@ impl McpDaemon {
             host_governor: McpState {
                 root: root.clone(),
                 store: store.clone(),
+                ul: Arc::clone(&ul),
                 schema_ready: OnceCell::new(),
                 control_wal: config.control_wal.clone(),
                 blob_store: config.blob_store.clone(),
@@ -867,6 +872,7 @@ impl McpDaemon {
             cognitive_child: McpState {
                 root: root.clone(),
                 store: store.clone(),
+                ul: Arc::clone(&ul),
                 schema_ready: OnceCell::new(),
                 control_wal: config.control_wal.clone(),
                 blob_store: config.blob_store.clone(),
@@ -883,6 +889,7 @@ impl McpDaemon {
             cognitive_control: McpState {
                 root: root.clone(),
                 store: store.clone(),
+                ul: Arc::clone(&ul),
                 schema_ready: OnceCell::new(),
                 control_wal: config.control_wal.clone(),
                 blob_store: config.blob_store.clone(),
@@ -899,6 +906,7 @@ impl McpDaemon {
             dynamic_agent: McpState {
                 root: root.clone(),
                 store: store.clone(),
+                ul: Arc::clone(&ul),
                 schema_ready: OnceCell::new(),
                 control_wal: config.control_wal.clone(),
                 blob_store: config.blob_store.clone(),
@@ -915,6 +923,7 @@ impl McpDaemon {
             claude_desktop: McpState {
                 root: root.clone(),
                 store: store.clone(),
+                ul: Arc::clone(&ul),
                 schema_ready: OnceCell::new(),
                 control_wal: config.control_wal.clone(),
                 blob_store: config.blob_store.clone(),
@@ -931,6 +940,7 @@ impl McpDaemon {
             codex_controller: McpState {
                 root: root.clone(),
                 store: store.clone(),
+                ul: Arc::clone(&ul),
                 schema_ready: OnceCell::new(),
                 control_wal: config.control_wal.clone(),
                 blob_store: config.blob_store.clone(),
@@ -947,6 +957,7 @@ impl McpDaemon {
             codex_worker: McpState {
                 root: root.clone(),
                 store: store.clone(),
+                ul: Arc::clone(&ul),
                 schema_ready: OnceCell::new(),
                 control_wal: config.control_wal.clone(),
                 blob_store: config.blob_store.clone(),
@@ -963,6 +974,7 @@ impl McpDaemon {
             external_auditor: McpState {
                 root: root.clone(),
                 store: store.clone(),
+                ul: Arc::clone(&ul),
                 schema_ready: OnceCell::new(),
                 control_wal: config.control_wal.clone(),
                 blob_store: config.blob_store.clone(),
@@ -979,6 +991,7 @@ impl McpDaemon {
             verifier: McpState {
                 root: root.clone(),
                 store: store.clone(),
+                ul: Arc::clone(&ul),
                 schema_ready: OnceCell::new(),
                 control_wal: config.control_wal.clone(),
                 blob_store: config.blob_store.clone(),
@@ -995,6 +1008,7 @@ impl McpDaemon {
             human_operator: McpState {
                 root: root.clone(),
                 store: store.clone(),
+                ul: Arc::clone(&ul),
                 schema_ready: OnceCell::new(),
                 control_wal: config.control_wal.clone(),
                 blob_store: config.blob_store.clone(),
@@ -1011,6 +1025,7 @@ impl McpDaemon {
             human_readonly: McpState {
                 root,
                 store,
+                ul,
                 schema_ready: OnceCell::new(),
                 control_wal: config.control_wal,
                 blob_store: config.blob_store,
@@ -1572,79 +1587,6 @@ struct CurrentStateToolInput {
 struct ProjectIdentityToolInput {
     #[serde(default)]
     project_key: Option<String>,
-}
-
-#[derive(serde::Deserialize)]
-#[serde(deny_unknown_fields)]
-struct AgentCandidateSubmitInput {
-    project_id: String,
-    task_id: String,
-    write_id: String,
-    topic: String,
-    statement: String,
-    #[serde(default)]
-    where_applicable: Vec<String>,
-    #[serde(default)]
-    where_not_applicable: Vec<String>,
-    #[serde(default)]
-    negative_constraints: Vec<String>,
-    provenance_refs: Vec<String>,
-    freshness_rule: String,
-    #[serde(default)]
-    curation: Option<AgentCandidateCurationInput>,
-}
-
-#[derive(serde::Deserialize, serde::Serialize)]
-#[serde(deny_unknown_fields)]
-#[allow(clippy::struct_excessive_bools)] // Flat wire schema preserves explicit curator evidence flags.
-struct AgentCandidateCurationInput {
-    handle: String,
-    #[serde(default)]
-    duplicate_of: Option<String>,
-    #[serde(default)]
-    semantic_duplicate_of: Option<String>,
-    #[serde(default)]
-    semantic_equivalence_verified: bool,
-    #[serde(default)]
-    scope_match: Option<bool>,
-    #[serde(default)]
-    wrong_scope_for: Vec<String>,
-    #[serde(default)]
-    utility_score: Option<u8>,
-    #[serde(default)]
-    utility_delta: Option<i16>,
-    #[serde(default)]
-    repeat_count: Option<u16>,
-    #[serde(default)]
-    repeated_with: Vec<String>,
-    #[serde(default)]
-    evidence_sufficient: Option<bool>,
-    #[serde(default)]
-    superseded_by: Option<String>,
-    #[serde(default)]
-    stale_reason_ref: Option<String>,
-    #[serde(default)]
-    protected: bool,
-    #[serde(default)]
-    current_truth: bool,
-    #[serde(default)]
-    audit_required: bool,
-    #[serde(default)]
-    reopen_condition_met: Option<bool>,
-    #[serde(default)]
-    unsafe_instruction: bool,
-    #[serde(default)]
-    unsafe_evidence_refs: Vec<String>,
-    #[serde(default)]
-    role: Option<String>,
-    #[serde(default)]
-    lifecycle: Option<String>,
-    #[serde(default)]
-    authority: Option<String>,
-    #[serde(default)]
-    evidence_refs: Vec<String>,
-    #[serde(default)]
-    counterevidence_refs: Vec<String>,
 }
 
 #[derive(serde::Deserialize)]
@@ -2510,6 +2452,7 @@ struct TaskCompletionToolInput {
 struct McpState {
     root: PathBuf,
     store: CanonicalStore,
+    ul: Arc<UlRuntime>,
     schema_ready: OnceCell<()>,
     control_wal: ControlWalConfig,
     blob_store: BlobStoreConfig,

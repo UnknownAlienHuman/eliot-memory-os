@@ -9,18 +9,18 @@ use base64::engine::general_purpose::STANDARD_NO_PAD;
 use eliot_types::{
     AutonomyRunContract, AutonomyRunTransitionReceipt, BlobReachabilityRef, BlobReferenceSnapshot,
     BlobRetentionClass, BlobRetentionRef, CanonicalMetaMetricEvidence,
-    CanonicalReplayExecutionRecord, CanonicalTraceCompletenessContract, ClaimId,
-    CurrentStateRequest, CurrentStateResponse, EpistemicStatus, ExperimentalMetaPolicyCandidate,
-    FetchAtomsL2Request, FetchAtomsL2Response, GraphHealthResponse, HarnessExperimentRecord,
-    LifecycleStatus, MemoryRevision, MemoryStateTransition, MemoryTrajectoryCorrectness,
-    MemoryWriteEnvelope, MetaIsolationRejectionRecord, MetaPolicyExecutionAction,
-    MetaPolicyExecutionReceipt, MinorityPressureRecord, ObservabilityKind,
-    ObservabilityWriteEnvelope, ObservabilityWriteReceipt, ObservabilityWriteStatus, ProjectId,
-    ProjectSequence, RecallL0Request, RecallL0Response, ReplayAudit, ReplayRun,
-    SealedReplayCaseRecord, SealedReplayInputSnapshotRecord, SealedReplaySetRecord,
-    SleepCandidateArtifact, SleepConsolidationBundle, SleepConsolidationRun, SurrealServerConfig,
-    TaintClass, TaskContract, TaskId, ToolObservation, VerificationId, VerificationRun, Visibility,
-    WriteId, WriteReceipt,
+    CanonicalReplayExecutionRecord, CanonicalTraceCompletenessContract, ClaimId, CueIndexRow,
+    CueRecordSource, CurrentStateRequest, CurrentStateResponse, EpistemicStatus,
+    ExperimentalMetaPolicyCandidate, FetchAtomsL2Request, FetchAtomsL2Response,
+    GraphHealthResponse, HarnessExperimentRecord, LifecycleStatus, MemoryRevision,
+    MemoryStateTransition, MemoryTrajectoryCorrectness, MemoryWriteEnvelope,
+    MetaIsolationRejectionRecord, MetaPolicyExecutionAction, MetaPolicyExecutionReceipt,
+    MinorityPressureRecord, ObservabilityKind, ObservabilityWriteEnvelope,
+    ObservabilityWriteReceipt, ObservabilityWriteStatus, ProjectId, ProjectSequence,
+    RecallL0Request, RecallL0Response, ReplayAudit, ReplayRun, SealedReplayCaseRecord,
+    SealedReplayInputSnapshotRecord, SealedReplaySetRecord, SleepCandidateArtifact,
+    SleepConsolidationBundle, SleepConsolidationRun, SurrealServerConfig, TaintClass, TaskContract,
+    TaskId, ToolObservation, VerificationId, VerificationRun, Visibility, WriteId, WriteReceipt,
 };
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
@@ -489,6 +489,7 @@ impl CanonicalStore {
         for op in [
             NamedSurqlOp::SchemaMigrate,
             NamedSurqlOp::SchemaMigrateObservability,
+            NamedSurqlOp::SchemaMigrateUl,
         ] {
             value = self.migrate_schema_op(op).await?;
         }
@@ -668,6 +669,91 @@ impl CanonicalStore {
             )
             .await?;
         decode_value(NamedSurqlOp::ObservabilityRecordsByKind, value)
+    }
+
+    pub async fn replace_cue_rows(
+        &self,
+        project_id: ProjectId,
+        record_ref: &str,
+        rows: &[CueIndexRow],
+    ) -> Result<(), StoreError> {
+        let op = if rows.is_empty() {
+            NamedSurqlOp::DeleteCueRows
+        } else {
+            NamedSurqlOp::UpsertCueRows
+        };
+        let projection_rows = rows
+            .iter()
+            .map(|row| {
+                json!({
+                    "row_id_parts": cue_string_parts(&row.row_id),
+                    "project_id": row.project_id,
+                    "cue_kind": row.cue_kind,
+                    "cue_value_parts": cue_string_parts(&row.cue_value_norm),
+                    "match_mode": row.match_mode,
+                    "record_ref_parts": cue_string_parts(&row.record_ref),
+                    "record_kind": row.record_kind,
+                    "strength": row.strength,
+                    "negative_memory": row.negative_memory,
+                    "lifecycle": row.lifecycle,
+                    "token_estimate": row.token_estimate,
+                })
+            })
+            .collect::<Vec<_>>();
+        self.execute_value(
+            op,
+            json!({
+                "project_id": project_id,
+                "record_ref_parts": cue_string_parts(record_ref),
+                "rows": projection_rows,
+            }),
+        )
+        .await?;
+        Ok(())
+    }
+
+    pub async fn load_cue_rows(
+        &self,
+        project_id: ProjectId,
+    ) -> Result<Vec<CueIndexRow>, StoreError> {
+        let value = self
+            .execute_value(
+                NamedSurqlOp::LoadCueRows,
+                json!({ "project_id": project_id }),
+            )
+            .await?;
+        if value.get("truncated").and_then(Value::as_bool) == Some(true) {
+            return Err(StoreError::PolicyViolation(
+                "cue index exceeded the 10,000 row project cap".to_owned(),
+            ));
+        }
+        let rows = value
+            .get("rows")
+            .cloned()
+            .ok_or_else(|| StoreError::Decode("cue index response omitted rows".to_owned()))?;
+        serde_json::from_value(rows).map_err(|error| StoreError::Decode(error.to_string()))
+    }
+
+    pub async fn load_cue_records(
+        &self,
+        project_id: ProjectId,
+    ) -> Result<Vec<CueRecordSource>, StoreError> {
+        let value = self
+            .execute_value(
+                NamedSurqlOp::LoadCueRecords,
+                json!({ "project_id": project_id }),
+            )
+            .await?;
+        if value.get("truncated").and_then(Value::as_bool) == Some(true) {
+            return Err(StoreError::PolicyViolation(
+                "canonical cue sources exceeded the 10,000 record project cap".to_owned(),
+            ));
+        }
+        let records = value
+            .get("records")
+            .cloned()
+            .ok_or_else(|| StoreError::Decode("cue source response omitted records".to_owned()))?;
+        serde_json::from_value(records).map_err(|error| StoreError::Decode(error.to_string()))
     }
 
     pub async fn current_state(
@@ -1465,6 +1551,10 @@ impl CanonicalStore {
         }
         last_query_result(op, &raw)
     }
+}
+
+fn cue_string_parts(value: &str) -> Vec<&str> {
+    value.split(':').collect()
 }
 
 fn build_blob_reference_snapshot(

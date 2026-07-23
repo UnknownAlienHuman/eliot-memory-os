@@ -175,8 +175,9 @@ pub use lifecycle::{
     SupersessionReceipt, SuppressionReceipt,
 };
 pub use mcp_contract::{
-    CompilePacketToolInput, InvalidField, ToolInputError, ToolInputErrorData,
-    compile_packet_input_schema, compile_packet_minimal_example,
+    AgentCandidateCurationInput, AgentCandidateSubmitInput, CompilePacketToolInput, InvalidField,
+    ToolInputError, ToolInputErrorData, agent_candidate_input_schema, compile_packet_input_schema,
+    compile_packet_minimal_example,
 };
 pub use memory::{
     ActionKind, ActionLease, ActionLeaseRecord, ActionProvenanceSet, ActionRequest, ActionScope,
@@ -314,7 +315,14 @@ pub use skill::{
     SkillPatchProposal, SkillQuarantineProposal, SkillReplayRequirement, SkillScopeRule,
     SkillSplitProposal, SkillStep, SkillToolRequirement,
 };
+pub use ul::cue::{
+    CueBinding, CueBindingError, CueIndexRow, CueKind, CueMatchMode, CueRecordSource, CueStrength,
+    cue_row_id, normalize_binding, normalize_bindings, ul_token_estimate,
+};
 pub use ul::guard::{TextEncodingViolation, inspect_text_encoding, mojibake};
+pub use ul::normalize::{
+    command_pattern, error_signature, normalize_path, normalize_query_tokens, normalize_symbol,
+};
 pub use verification::{
     FlakeReport, SkippedTest, SkippedTestReason, StatefulDbIsolationReport, TestCostClass,
     TestCostReport, TestCountByCost, TestCountByIntent, TestCountByKind, TestIntent, TestInventory,
