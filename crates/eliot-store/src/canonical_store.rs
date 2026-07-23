@@ -499,6 +499,7 @@ impl CanonicalStore {
             NamedSurqlOp::SchemaMigrateUlDelivery,
             NamedSurqlOp::SchemaMigrateUlArtifacts,
             NamedSurqlOp::SchemaMigrateUlPyramid,
+            NamedSurqlOp::SchemaMigrateUlMeasurement,
         ] {
             value = self.migrate_schema_op(op).await?;
         }
@@ -1244,6 +1245,65 @@ impl CanonicalStore {
             )
             .await?;
         decode_value(NamedSurqlOp::LoadUlArtifacts, value)
+    }
+
+    pub async fn upsert_ul_task_ledger(
+        &self,
+        project_id: ProjectId,
+        task_id: TaskId,
+        delta: &eliot_types::UlLedgerDelta,
+    ) -> Result<eliot_types::UlTaskLedger, StoreError> {
+        let value = self
+            .execute_value(
+                NamedSurqlOp::UpsertUlTaskLedger,
+                json!({
+                    "ledger_key": format!("{project_id}:{task_id}"),
+                    "project_id": project_id,
+                    "task_id": task_id,
+                    "delta": delta,
+                }),
+            )
+            .await?;
+        decode_value(NamedSurqlOp::UpsertUlTaskLedger, value)
+    }
+
+    pub async fn load_ul_metrics(
+        &self,
+        project_id: ProjectId,
+    ) -> Result<Vec<eliot_types::UlTaskLedger>, StoreError> {
+        let value = self
+            .execute_value(
+                NamedSurqlOp::LoadUlMetrics,
+                json!({ "project_id": project_id }),
+            )
+            .await?;
+        decode_value(NamedSurqlOp::LoadUlMetrics, value)
+    }
+
+    pub async fn load_predictions(
+        &self,
+        project_id: ProjectId,
+        task_id: Option<TaskId>,
+        verifier: Option<&str>,
+        unresolved_only: bool,
+        created_before: Option<time::OffsetDateTime>,
+    ) -> Result<Vec<eliot_types::PredictionRecord>, StoreError> {
+        let value = self
+            .execute_value(
+                NamedSurqlOp::LoadPredictions,
+                json!({
+                    "project_id": project_id,
+                    "task_id": task_id,
+                    "has_task_id": task_id.is_some(),
+                    "verifier": verifier.unwrap_or_default(),
+                    "has_verifier": verifier.is_some(),
+                    "unresolved_only": unresolved_only,
+                    "created_before": created_before.unwrap_or_else(time::OffsetDateTime::now_utc),
+                    "has_created_before": created_before.is_some(),
+                }),
+            )
+            .await?;
+        decode_value(NamedSurqlOp::LoadPredictions, value)
     }
 
     pub async fn meta_policy_actions_by_candidate(

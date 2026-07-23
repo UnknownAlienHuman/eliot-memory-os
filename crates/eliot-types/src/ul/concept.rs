@@ -146,3 +146,40 @@ pub enum CapsuleFreshness {
         missing: Vec<String>,
     },
 }
+
+#[derive(
+    Clone, Copy, Debug, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize, Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum CoverageClass {
+    Covered,
+    Thin,
+    Blind,
+}
+
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+pub struct SubsystemCoverage {
+    pub concept_id: String,
+    pub capsule_ref: Option<String>,
+    pub capsule_fresh: bool,
+    pub module_card_count: u32,
+    pub claim_count: u32,
+    pub decision_count: u32,
+    pub failure_count: u32,
+    pub coverage: CoverageClass,
+}
+
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+pub struct DangerPath {
+    pub path: String,
+    pub score: u8,
+    pub failure_refs: Vec<String>,
+}
+
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+pub struct UlMetacognitionView {
+    pub coverage: Vec<SubsystemCoverage>,
+    pub novelty_percent: u8,
+    pub novel_paths: Vec<String>,
+    pub danger_paths: Vec<DangerPath>,
+}

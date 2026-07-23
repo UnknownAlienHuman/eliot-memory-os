@@ -8,12 +8,16 @@ pub enum NamedSurqlOp {
     SchemaMigrateUlDelivery,
     SchemaMigrateUlArtifacts,
     SchemaMigrateUlPyramid,
+    SchemaMigrateUlMeasurement,
     UpsertCueRows,
     DeleteCueRows,
     LoadCueRows,
     LoadCueRecords,
     LoadInjectionReceipts,
     LoadUlArtifacts,
+    UpsertUlTaskLedger,
+    LoadPredictions,
+    LoadUlMetrics,
     ApplyWriteEnvelope,
     ApplyObservability,
     ObservabilityReceiptById,
@@ -54,12 +58,16 @@ impl NamedSurqlOp {
             Self::SchemaMigrateUlDelivery => "003_ul_delivery",
             Self::SchemaMigrateUlArtifacts => "004_ul_artifacts",
             Self::SchemaMigrateUlPyramid => "005_ul_pyramid",
+            Self::SchemaMigrateUlMeasurement => "006_ul_measurement",
             Self::UpsertCueRows => "upsert_cue_rows",
             Self::DeleteCueRows => "delete_cues_for_record",
             Self::LoadCueRows => "load_cue_rows",
             Self::LoadCueRecords => "load_cue_records",
             Self::LoadInjectionReceipts => "load_injection_receipts",
             Self::LoadUlArtifacts => "load_ul_artifacts",
+            Self::UpsertUlTaskLedger => "upsert_ul_task_ledger",
+            Self::LoadPredictions => "load_predictions",
+            Self::LoadUlMetrics => "load_ul_metrics",
             Self::ApplyWriteEnvelope => "apply_write_envelope",
             Self::ApplyObservability => "apply_observability",
             Self::ObservabilityReceiptById => "observability_receipt_by_id",
@@ -100,6 +108,9 @@ impl NamedSurqlOp {
             Self::SchemaMigrateUlDelivery => include_str!("surql/003_ul_delivery.surql"),
             Self::SchemaMigrateUlArtifacts => include_str!("surql/004_ul_artifacts.surql"),
             Self::SchemaMigrateUlPyramid => include_str!("surql/005_ul_pyramid.surql"),
+            Self::SchemaMigrateUlMeasurement => {
+                include_str!("surql/006_ul_measurement.surql")
+            }
             Self::UpsertCueRows => include_str!("surql/upsert_cue_rows.surql"),
             Self::DeleteCueRows => include_str!("surql/delete_cues_for_record.surql"),
             Self::LoadCueRows => include_str!("surql/load_cue_rows.surql"),
@@ -108,6 +119,9 @@ impl NamedSurqlOp {
                 include_str!("surql/load_injection_receipts.surql")
             }
             Self::LoadUlArtifacts => include_str!("surql/load_ul_artifacts.surql"),
+            Self::UpsertUlTaskLedger => include_str!("surql/upsert_ul_task_ledger.surql"),
+            Self::LoadPredictions => include_str!("surql/load_predictions.surql"),
+            Self::LoadUlMetrics => include_str!("surql/load_ul_metrics.surql"),
             Self::ApplyWriteEnvelope => include_str!("surql/apply_write_envelope.surql"),
             Self::ApplyObservability => include_str!("surql/apply_observability.surql"),
             Self::ObservabilityReceiptById => {
@@ -193,7 +207,7 @@ impl Default for SurqlTemplateRegistry {
 }
 
 #[allow(clippy::too_many_lines)]
-fn foundational_templates() -> [SurqlTemplate; 23] {
+fn foundational_templates() -> [SurqlTemplate; 27] {
     [
         template(
             NamedSurqlOp::SchemaMigrate,
@@ -232,6 +246,12 @@ fn foundational_templates() -> [SurqlTemplate; 23] {
             64 * 1024,
         ),
         template(
+            NamedSurqlOp::SchemaMigrateUlMeasurement,
+            "SchemaMigrateUlMeasurementInput",
+            "SchemaMigrateUlMeasurementOutput",
+            64 * 1024,
+        ),
+        template(
             NamedSurqlOp::UpsertCueRows,
             "UpsertCueRowsInput",
             "UpsertCueRowsOutput",
@@ -266,6 +286,24 @@ fn foundational_templates() -> [SurqlTemplate; 23] {
             "LoadUlArtifactsInput",
             "LoadUlArtifactsOutput",
             8 * 1024 * 1024,
+        ),
+        template(
+            NamedSurqlOp::UpsertUlTaskLedger,
+            "UpsertUlTaskLedgerInput",
+            "UpsertUlTaskLedgerOutput",
+            64 * 1024,
+        ),
+        template(
+            NamedSurqlOp::LoadPredictions,
+            "LoadPredictionsInput",
+            "LoadPredictionsOutput",
+            512 * 1024,
+        ),
+        template(
+            NamedSurqlOp::LoadUlMetrics,
+            "LoadUlMetricsInput",
+            "LoadUlMetricsOutput",
+            512 * 1024,
         ),
         template(
             NamedSurqlOp::ApplyWriteEnvelope,

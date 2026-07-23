@@ -1,10 +1,11 @@
 use eliot_engine::{
-    CueIndexService, InjectionPlanner, TouchedSetRegistry, WriterHandle, capsule_freshness,
-    render_capsule,
+    CueIndexService, InjectionPlanner, MetacognitionService, PredictionService, TouchedSetRegistry,
+    UlLedgerService, WriterHandle, capsule_freshness, render_capsule,
 };
 use eliot_store::{CanonicalRecord, CanonicalStore};
 use eliot_types::{
-    CapsuleFreshness, CausalBridgeHop, ConceptNode, ProjectId, SubsystemCapsule, ul_token_estimate,
+    CapsuleFreshness, CausalBridgeHop, ConceptNode, CoverageClass, HotspotScore, ModuleCard,
+    ProjectId, SubsystemCapsule, UlMetacognitionView, ul_token_estimate,
 };
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
@@ -16,12 +17,19 @@ const PACKET_PYRAMID_BUDGET: u32 = 1_500;
 pub(super) struct PyramidPacketEnrichment {
     pub understanding: Value,
     pub bridge: Vec<CausalBridgeHop>,
+    pub meta: UlMetacognitionView,
+    pub coverage: CoverageClass,
+    pub blind_target: Option<String>,
+    pub recommended_probe: Option<String>,
+    pub subsystem_concept_id: Option<String>,
 }
 
 pub(super) struct UlRuntime {
     pub cue_index: Arc<CueIndexService>,
     pub touched: Arc<TouchedSetRegistry>,
     pub planner: Arc<InjectionPlanner>,
+    pub ledger: Arc<UlLedgerService>,
+    pub prediction: Arc<PredictionService>,
     store: CanonicalStore,
     project_root: PathBuf,
 }
@@ -34,14 +42,18 @@ impl UlRuntime {
         let planner = Arc::new(InjectionPlanner::with_project_root(
             Arc::clone(&cue_index),
             store.clone(),
-            writer,
+            writer.clone(),
             Arc::clone(&touched),
             project_root.clone(),
         ));
+        let ledger = Arc::new(UlLedgerService::new(store.clone()));
+        let prediction = Arc::new(PredictionService::new(store.clone(), writer));
         Self {
             cue_index,
             touched,
             planner,
+            ledger,
+            prediction,
             store,
             project_root,
         }
@@ -67,6 +79,40 @@ impl UlRuntime {
                 .await?,
             |capsule| capsule.concept_id.clone(),
         );
+        let concept_list = concepts.values().cloned().collect::<Vec<_>>();
+        let capsule_list = capsules.values().cloned().collect::<Vec<_>>();
+        let cards = latest_by(
+            self.store
+                .load_ul_artifacts::<ModuleCard>(project_id, &["module_card"], 512)
+                .await?,
+            |card| card.card_id.clone(),
+        )
+        .into_values()
+        .collect::<Vec<_>>();
+        let hotspots = latest_by(
+            self.store
+                .load_ul_artifacts::<HotspotScore>(project_id, &["hotspot_score"], 512)
+                .await?,
+            |hotspot| hotspot.hotspot_id.clone(),
+        )
+        .into_values()
+        .collect::<Vec<_>>();
+        let cue_sources = self.store.load_cue_records(project_id).await?;
+        let meta = MetacognitionService::evaluate(
+            &self.project_root,
+            &concept_list,
+            &capsule_list,
+            &cards,
+            &hotspots,
+            &cue_sources,
+            touched_paths,
+        );
+        let (coverage, blind_target) =
+            MetacognitionService::coverage_for_paths(&concept_list, &meta, touched_paths);
+        let recommended_probe = MetacognitionService::recommended_probe(&cards, touched_paths);
+        let subsystem_concept_id =
+            MetacognitionService::concept_for_paths(&concept_list, touched_paths);
+
         let fallback = fallback_text.to_ascii_lowercase();
         let mut ranked = concepts
             .into_values()
@@ -151,7 +197,7 @@ impl UlRuntime {
                 })
             })
             .count();
-        let coverage = if ranked.is_empty() {
+        let legacy_coverage = if ranked.is_empty() {
             "blind"
         } else if touched_paths.is_empty()
             || (covered_paths == touched_paths.len() && capsule_values.len() == ranked.len())
@@ -169,9 +215,14 @@ impl UlRuntime {
                 "concepts": concept_values,
                 "capsules": capsule_values,
                 "danger": danger.into_iter().collect::<Vec<_>>(),
-                "coverage": coverage,
+                "coverage": legacy_coverage,
             }),
             bridge,
+            meta,
+            coverage,
+            blind_target,
+            recommended_probe,
+            subsystem_concept_id,
         })
     }
 }

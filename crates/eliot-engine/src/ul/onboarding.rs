@@ -14,6 +14,7 @@ use eliot_types::{
     OnboardingReport, OnboardingStage, OnboardingTestHook, ProjectId, UlArtifact,
     normalize_bindings,
 };
+use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs::{self, File};
@@ -24,6 +25,7 @@ const MAX_CONCEPTS: usize = 20;
 const PURPOSE_LIMIT_BYTES: usize = 240;
 const EXPECTED_REUSE_NOTE: &str = "when working in this subsystem or its boundary paths";
 const ARTIFACT_READ_LIMIT: u16 = 128;
+const ARTIFACT_PAGE_SIZE: u16 = 100;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ConceptSeedResult {
@@ -457,42 +459,31 @@ impl OnboardingService {
     ) -> Result<GitMiningArtifacts, EngineError> {
         let service = GitMiningService::default();
         let config_hash = service.config_hash()?;
-        let runs = self
-            .store
-            .load_ul_artifacts::<MiningRun>(project_id, &["mining_run"], ARTIFACT_READ_LIMIT)
-            .await?;
+        let runs =
+            load_all_ul_artifact_bodies::<MiningRun>(&self.store, project_id, &["mining_run"])
+                .await?;
         let current = runs
             .into_iter()
-            .find(|record| {
-                record.receipt_body.head_commit == head_commit
-                    && record.receipt_body.config_hash == config_hash
-            })
-            .map(|record| record.receipt_body);
+            .find(|run| run.head_commit == head_commit && run.config_hash == config_hash);
         if let Some(run) = current {
-            let edges = self
-                .store
-                .load_ul_artifacts::<CoChangeEdge>(
-                    project_id,
-                    &["co_change_edge"],
-                    ARTIFACT_READ_LIMIT,
-                )
-                .await?
-                .into_iter()
-                .map(|record| record.receipt_body)
-                .filter(|edge| edge.mining_run_ref == run.run_id)
-                .collect();
-            let hotspots = self
-                .store
-                .load_ul_artifacts::<HotspotScore>(
-                    project_id,
-                    &["hotspot_score"],
-                    ARTIFACT_READ_LIMIT,
-                )
-                .await?
-                .into_iter()
-                .map(|record| record.receipt_body)
-                .filter(|hotspot| hotspot.mining_run_ref == run.run_id)
-                .collect();
+            let edges = load_all_ul_artifact_bodies::<CoChangeEdge>(
+                &self.store,
+                project_id,
+                &["co_change_edge"],
+            )
+            .await?
+            .into_iter()
+            .filter(|edge| edge.mining_run_ref == run.run_id)
+            .collect();
+            let hotspots = load_all_ul_artifact_bodies::<HotspotScore>(
+                &self.store,
+                project_id,
+                &["hotspot_score"],
+            )
+            .await?
+            .into_iter()
+            .filter(|hotspot| hotspot.mining_run_ref == run.run_id)
+            .collect();
             return Ok(GitMiningArtifacts {
                 run,
                 edges,
@@ -1097,6 +1088,32 @@ async fn stage_is_canonical<'a>(
         }
     }
     Ok(true)
+}
+
+async fn load_all_ul_artifact_bodies<T>(
+    store: &CanonicalStore,
+    project_id: ProjectId,
+    receipt_kinds: &[&str],
+) -> Result<Vec<T>, EngineError>
+where
+    T: DeserializeOwned,
+{
+    let mut start = 0_u64;
+    let mut bodies = Vec::new();
+    loop {
+        let page = store
+            .canonical_record_page(project_id, None, receipt_kinds, start, ARTIFACT_PAGE_SIZE)
+            .await?;
+        let page_len = page.len();
+        for record in page {
+            bodies.push(serde_json::from_value(record.receipt_body)?);
+        }
+        if page_len < usize::from(ARTIFACT_PAGE_SIZE) {
+            break;
+        }
+        start = start.saturating_add(u64::try_from(page_len).unwrap_or(u64::MAX));
+    }
+    Ok(bodies)
 }
 
 fn validate_project_root(root: &Path) -> Result<PathBuf, EngineError> {

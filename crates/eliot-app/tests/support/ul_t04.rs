@@ -192,6 +192,62 @@ impl Harness {
         )?)
     }
 
+    pub fn ul_artifacts<T: DeserializeOwned>(
+        &self,
+        project_id: ProjectId,
+        receipt_kinds: &[&str],
+    ) -> TestResult<Vec<eliot_store::CanonicalRecord<T>>> {
+        Ok(self.store_runtime.block_on(self.store.load_ul_artifacts(
+            project_id,
+            receipt_kinds,
+            512,
+        ))?)
+    }
+
+    pub fn ul_metrics(&self, project_id: ProjectId) -> TestResult<Vec<eliot_types::UlTaskLedger>> {
+        Ok(self
+            .store_runtime
+            .block_on(self.store.load_ul_metrics(project_id))?)
+    }
+
+    pub fn tool_schema(&mut self, request_id: u64, tool_name: &str) -> TestResult<Value> {
+        let response = self.client.request(
+            &json!({
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "method": "tools/list",
+                "params": {}
+            }),
+            Duration::from_secs(30),
+        )?;
+        response
+            .pointer("/result/tools")
+            .and_then(Value::as_array)
+            .and_then(|tools| tools.iter().find(|tool| tool["name"] == tool_name))
+            .and_then(|tool| tool.get("inputSchema"))
+            .cloned()
+            .ok_or_else(|| format!("tool schema is absent for {tool_name}").into())
+    }
+
+    pub fn run_ul_onboard(&self, project_id: ProjectId, project_root: &Path) -> TestResult<Value> {
+        let output = governor_command()
+            .arg("--config")
+            .arg(&self.config_path)
+            .args(["ul", "onboard", "--project"])
+            .arg(project_id.to_string())
+            .arg("--root")
+            .arg(project_root)
+            .output()?;
+        if !output.status.success() {
+            return Err(format!(
+                "UL onboarding CLI failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            )
+            .into());
+        }
+        Ok(serde_json::from_slice(&output.stdout)?)
+    }
+
     pub fn claim(
         &self,
         project_id: ProjectId,

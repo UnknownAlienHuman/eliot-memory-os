@@ -222,12 +222,11 @@ fn t04_frame_stub_and_boot() -> TestResult {
         }),
     )?;
     let mut frame: MaterialPacketFrame = serde_json::from_value(packet["frame_stub"].clone())?;
-    assert!(frame.expected_observable.is_empty());
-    assert_eq!(
-        packet["frame_stub_required_edits"],
-        json!(["expected_observable"])
-    );
-    assert_eq!(packet["frame_stub_ready"], false);
+    assert!(frame.expected_observable.starts_with("verifier:"));
+    assert!(frame.expected_observable.ends_with("=pass"));
+    assert_eq!(packet["frame_stub_required_edits"], json!([]));
+    assert_eq!(packet["frame_stub_ready"], true);
+    frame.expected_observable.clear();
     let rejected = harness.client.tool_call_response(
         64,
         "eliot_compile_packet_l3",
@@ -258,6 +257,10 @@ fn t04_frame_stub_and_boot() -> TestResult {
             "material_frame": frame
         }),
     )?;
+    assert_eq!(
+        resubmitted["ul_prediction"]["status"],
+        "not_machine_checkable"
+    );
     assert!(resubmitted["packet_id"].is_string());
     Ok(())
 }

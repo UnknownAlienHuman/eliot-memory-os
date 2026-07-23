@@ -1961,6 +1961,9 @@ async fn dispatch_command(
             commands::UlCommand::Onboard { project, root } => {
                 commands::run_ul_onboard(config, project, &root).await
             }
+            commands::UlCommand::Report { project } => {
+                commands::run_ul_report(config, project).await
+            }
         },
         Command::Codecortex { command } => match command {
             CodeCortexCommand::Health => commands::run_codecortex_health(config),

@@ -134,12 +134,13 @@ impl InjectionPlanner {
         session_id: SessionId,
         response: &mut Value,
         memory_free_control: bool,
-    ) -> Result<(), EngineError> {
+    ) -> Result<Vec<InjectionReceipt>, EngineError> {
         if memory_free_control {
-            return Ok(());
+            return Ok(Vec::new());
         }
         self.hydrate_delivery_state(project_id, session_id).await?;
-        self.attach_boot(project_id, task_id, session_id, response)
+        let mut committed_receipts = self
+            .attach_boot(project_id, task_id, session_id, response)
             .await?;
 
         let mut batch = self
@@ -217,6 +218,7 @@ impl InjectionPlanner {
             }
             self.touched
                 .mark_delivered(session_id, &item.item_ref, &item.source_fingerprint);
+            committed_receipts.push(receipt);
             delivered.push(UlFiredItem {
                 item_ref: item.item_ref.clone(),
                 kind: item.record_kind,
@@ -240,7 +242,7 @@ impl InjectionPlanner {
                 json!({"code": "INJECTION_RECEIPT_FAILED"}),
             );
         }
-        Ok(())
+        Ok(committed_receipts)
     }
 
     async fn hydrate_delivery_state(
@@ -291,9 +293,9 @@ impl InjectionPlanner {
         task_id: Option<TaskId>,
         session_id: SessionId,
         response: &mut Value,
-    ) -> Result<(), EngineError> {
+    ) -> Result<Vec<InjectionReceipt>, EngineError> {
         if self.touched.boot_sent(session_id) {
-            return Ok(());
+            return Ok(Vec::new());
         }
         let revision = response
             .get("at_revision")
@@ -346,7 +348,7 @@ impl InjectionPlanner {
         self.commit_receipt(project_id, task_id, &receipt).await?;
         response_object_mut(response)?.insert("ul_boot".to_owned(), boot);
         self.touched.mark_boot_sent(session_id);
-        Ok(())
+        Ok(vec![receipt])
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -359,7 +361,7 @@ impl InjectionPlanner {
         revision: Value,
         charter: ProjectCharter,
         map: SystemMap,
-    ) -> Result<(), EngineError> {
+    ) -> Result<Vec<InjectionReceipt>, EngineError> {
         let concepts = self
             .store
             .load_ul_artifacts::<ConceptNode>(project_id, &["concept_node"], 128)
@@ -420,7 +422,7 @@ impl InjectionPlanner {
             .await?;
         response_object_mut(response)?.insert("ul_boot".to_owned(), boot);
         self.touched.mark_boot_sent(session_id);
-        Ok(())
+        Ok(vec![charter_receipt, map_receipt])
     }
 
     async fn commit_receipt(

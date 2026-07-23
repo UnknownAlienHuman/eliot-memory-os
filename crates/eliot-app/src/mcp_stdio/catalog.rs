@@ -1053,7 +1053,7 @@ pub(super) fn task_tool_definitions() -> Vec<Value> {
         tool(
             "eliot_agent_candidate_submit",
             "Eliot Agent Candidate Submit",
-            "Submit bounded task-scoped candidate-only memory with applicability, negative constraints, provenance, and freshness through WriterActor. Cue bindings may be explicit or derived from the current session touched set; the write never grants completion or canonical authority.",
+            "Save a reusable claim, decision, or failure. Needs statement and expected_reuse_note; cue bindings can be derived from touched paths.",
             &agent_candidate_schema(),
         ),
         tool(
@@ -1096,7 +1096,7 @@ pub(super) fn core_tool_definitions() -> Vec<Value> {
         tool(
             "eliot_recall_l0",
             "Eliot Recall L0",
-            "Return compact memory handles and previews.",
+            "Search memory by keywords when pushed UL context is insufficient. Needs query. Returns handles and previews.",
             &json_schema(
                 &[
                     ("project_id", "string"),
@@ -1124,7 +1124,7 @@ pub(super) fn core_tool_definitions() -> Vec<Value> {
         tool(
             "eliot_compile_packet_l3",
             "Eliot Compile Packet L3",
-            "Compile a bounded task-specific packet and return a complete frame_stub for material follow-up. Fill frame_stub.expected_observable before resubmitting material work.",
+            "Compile task context and a complete frame_stub before material work. Needs goal; task/project may be session-bound.",
             &compile_packet_schema(),
         ),
         tool(
@@ -1136,7 +1136,7 @@ pub(super) fn core_tool_definitions() -> Vec<Value> {
         tool(
             "eliot_memory_influence_trace",
             "Eliot Memory Influence Trace",
-            "Write an outcome-linked memory influence trace from either the full trace or a minimal memory_handle/influence_class acknowledgement. Packet inclusion without observable delta remains loaded_without_delta.",
+            "Acknowledge memory use. Minimal form: memory_handle, influence_class, and downstream_outcome_ref when it changed action.",
             &memory_influence_trace_schema(),
         ),
         tool(

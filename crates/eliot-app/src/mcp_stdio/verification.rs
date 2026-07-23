@@ -762,6 +762,7 @@ pub(super) async fn dispatch_task_verification_run(
     context: AuthenticatedRequestContext,
     arguments: Value,
 ) -> Result<Value> {
+    let verification_started_at = time::OffsetDateTime::now_utc();
     let input: TaskVerificationToolInput = serde_json::from_value(arguments)?;
     if input.mode == "candidate_assertion" {
         return Ok(json!({
@@ -903,13 +904,41 @@ pub(super) async fn dispatch_task_verification_run(
         },
     )
     .await?;
+    let verification_ref = format!("verification:{verification_id}");
+    let prediction_resolution = match state
+        .ul
+        .prediction
+        .resolve(
+            project_id,
+            task_id,
+            verifier.id(),
+            VerificationResult::Passed,
+            &verification_ref,
+            verification_started_at,
+        )
+        .await
+    {
+        Ok(records) => json!({
+            "status": "resolved",
+            "count": records.len(),
+            "prediction_refs": records
+                .iter()
+                .map(|record| format!("prediction:{}", record.prediction_id))
+                .collect::<Vec<_>>(),
+        }),
+        Err(error) => json!({
+            "status": "measurement_error",
+            "message": error.to_string(),
+        }),
+    };
     Ok(json!({
         "status": "passed",
         "verification_id": verification_id,
         "verifier": verifier.id(),
         "artifact_scope": scope,
         "task_contract": task,
-        "write_receipt": receipt
+        "write_receipt": receipt,
+        "ul_prediction_resolution": prediction_resolution
     }))
 }
 

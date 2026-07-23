@@ -5,7 +5,11 @@ fn canonical_struct_hash<T: serde::Serialize>(value: &T) -> Result<String> {
 }
 
 #[allow(clippy::too_many_lines)]
-async fn dispatch_compile_packet_l3(state: &McpState, arguments: Value) -> Result<Value> {
+async fn dispatch_compile_packet_l3(
+    state: &McpState,
+    context: AuthenticatedRequestContext,
+    arguments: Value,
+) -> Result<Value> {
     let input = input_validation::decode_compile_packet_input(arguments)?;
     let memory_free_control =
         input.memory_mode == Some(MemoryExposureMode::MemoryFreeControl);
@@ -182,13 +186,76 @@ async fn dispatch_compile_packet_l3(state: &McpState, arguments: Value) -> Resul
     {
         frame_stub.causal_bridge = pyramid.bridge.clone();
     }
+    let packet_id = packet.packet_id.clone();
     let mut value = serde_json::to_value(packet)?;
-    if let Some(pyramid) = pyramid {
-        value["ul_understanding"] = pyramid.understanding;
+    if let Some(pyramid) = &pyramid {
+        value["ul_understanding"] = pyramid.understanding.clone();
+        let coverage = serde_json::to_value(pyramid.coverage)?
+            .as_str()
+            .unwrap_or("blind")
+            .to_owned();
+        value["ul_meta"] = json!({
+            "coverage": coverage,
+            "novelty_percent": pyramid.meta.novelty_percent,
+            "danger": pyramid.meta.danger_paths,
+            "recommended_probe": pyramid.recommended_probe,
+        });
+        let material_risk = input.material_frame.as_ref().is_some_and(|frame| {
+            frame.active_plan.len() > 1 || touched_paths.len() > 1
+        });
+        if material_risk
+            && pyramid.coverage == eliot_types::CoverageClass::Blind
+            && value.get("ul_gate").is_none()
+        {
+            let suggested_probe = pyramid
+                .recommended_probe
+                .clone()
+                .or_else(|| {
+                    input
+                        .material_frame
+                        .as_ref()
+                        .map(|frame| frame.verifier.clone())
+                })
+                .unwrap_or_else(|| frame_stub.verifier.clone());
+            value["ul_gate"] = json!({
+                "status": "require_probe",
+                "reason": "blind_subsystem",
+                "concept_or_path": pyramid
+                    .blind_target
+                    .clone()
+                    .or_else(|| touched_paths.first().cloned())
+                    .unwrap_or_else(|| "unknown".to_owned()),
+                "suggested_probe": suggested_probe,
+            });
+        }
+        if let Some(frame) = input.material_frame.as_ref() {
+            let source_frame_hash = canonical_struct_hash(frame)?;
+            if eliot_engine::parse_expected_observable(&frame.expected_observable).is_some() {
+                if let Ok(task_id) = TaskId::from_str(&request.task_id)
+                    && let Some(capture) = state
+                        .ul
+                        .prediction
+                        .capture(eliot_engine::PredictionCaptureInput {
+                            project_id: request.project_id,
+                            task_id,
+                            session_id: context.session_id,
+                            subsystem_concept_id: pyramid.subsystem_concept_id.clone(),
+                            packet_id: packet_id.clone(),
+                            expected_observable: frame.expected_observable.clone(),
+                            source_frame_hash,
+                        })
+                        .await?
+                {
+                    value["prediction_ref"] = Value::String(capture.prediction_ref);
+                }
+            } else {
+                value["ul_prediction"] = json!({"status": "not_machine_checkable"});
+            }
+        }
     }
     value["frame_stub"] = serde_json::to_value(frame_stub)?;
-    value["frame_stub_required_edits"] = json!(["expected_observable"]);
-    value["frame_stub_ready"] = Value::Bool(false);
+    value["frame_stub_required_edits"] = json!([]);
+    value["frame_stub_ready"] = Value::Bool(true);
     if let Some(task) = packet_task.as_ref() {
         enrich_packet_with_task(state, &mut value, task).await?;
     }
@@ -326,7 +393,7 @@ fn material_frame_stub(
             .responsibility_contour_route_refs
             .clone(),
         next_allowed_action: next_action,
-        expected_observable: String::new(),
+        expected_observable: format!("verifier:{verifier}=pass"),
         verifier,
         stop_condition,
         tool_schema_bytes_visible: packet

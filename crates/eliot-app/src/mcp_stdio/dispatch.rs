@@ -42,6 +42,18 @@ pub(super) async fn dispatch_host_governor_method(
             )
             .await,
         ),
+        "ul/mine-git" => Some(
+            crate::commands::run_ul_mine_git_from_daemon(&state.store, &state.writer, params).await,
+        ),
+        "ul/report" => Some(
+            crate::commands::run_ul_report_from_daemon(
+                &state.root,
+                &state.store,
+                &state.ul.ledger,
+                params,
+            )
+            .await,
+        ),
         "ping" => Some(Ok(json!({}))),
         _ => None,
     }
@@ -261,6 +273,7 @@ pub(super) async fn call_tool(
         .cloned()
         .unwrap_or_else(|| json!({}));
     let arguments = enforce_bound_tool_scope(context, name, arguments)?;
+    let ul_input_bytes = u64::try_from(serde_json::to_vec(&arguments)?.len()).unwrap_or(u64::MAX);
     let observed_arguments =
         state
             .ul
@@ -346,6 +359,8 @@ pub(super) async fn call_tool(
                 );
                 structured = serde_json::to_value(response)?;
             }
+            let ul_output_bytes =
+                u64::try_from(serde_json::to_vec(&structured)?.len()).unwrap_or(u64::MAX);
             let mut newly_observed = observed_arguments;
             newly_observed.extend(state.ul.touched.observe_result(
                 context.session_id,
@@ -364,6 +379,7 @@ pub(super) async fn call_tool(
                 .and_then(Value::as_str)
                 == Some("memory_free_control");
             let memory_free_control = argument_memory_free_control || response_memory_free_control;
+            let mut injection_receipts = Vec::new();
             if let Some(project_id) = ul_project_id {
                 if !memory_free_control {
                     state
@@ -372,7 +388,7 @@ pub(super) async fn call_tool(
                         .plan_after_tool(project_id, context.session_id, &newly_observed)
                         .await?;
                 }
-                state
+                injection_receipts = state
                     .ul
                     .planner
                     .attach(
@@ -383,6 +399,22 @@ pub(super) async fn call_tool(
                         memory_free_control,
                     )
                     .await?;
+            }
+            if let (Some(project_id), Some(task_id)) = (ul_project_id, ul_task_id) {
+                let _ = state
+                    .ul
+                    .ledger
+                    .record_call(eliot_engine::UlToolMeasurement {
+                        project_id,
+                        task_id,
+                        session_id: context.session_id,
+                        tool_name: name.to_owned(),
+                        arguments: observation_arguments.clone(),
+                        input_bytes: ul_input_bytes,
+                        output_bytes: ul_output_bytes,
+                        injection_receipts,
+                    })
+                    .await;
             }
             if let Some(claims) = cognitive_claims.as_ref() {
                 write_cognitive_tool_observation(
@@ -615,7 +647,9 @@ pub(super) async fn dispatch_tool(
                 .await?;
             serde_json::to_value(response)?
         }
-        "eliot_compile_packet_l3" => Box::pin(dispatch_compile_packet_l3(state, arguments)).await?,
+        "eliot_compile_packet_l3" => {
+            Box::pin(dispatch_compile_packet_l3(state, context, arguments)).await?
+        }
         "eliot_understanding_outcome_record" => {
             Box::pin(dispatch_understanding_outcome_record(state, arguments)).await?
         }

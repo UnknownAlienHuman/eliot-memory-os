@@ -1,9 +1,13 @@
-use eliot_engine::{ModuleCardService, OnboardingService, WriterActor, WriterConfig};
+use eliot_engine::{
+    GitMiningService, ModuleCardService, OnboardingService, UlArtifactWriterService,
+    WriteAdmissionService, WriterActor, WriterConfig,
+};
 use eliot_store::{CanonicalStore, ControlWal};
 use eliot_types::{
     CoChangeEdge, ConceptNode, ControlWalConfig, CredentialProviderKind, GovernorConfig,
     HotspotScore, ModuleCard, OnboardingTestHook, ProjectId, normalize_bindings,
 };
+use std::fmt::Write as _;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -25,6 +29,30 @@ async fn t06_onboarding_is_resumable_and_model_free() -> TestResult {
     let (writer, actor) =
         WriterActor::channel(wal, harness.store.clone(), &WriterConfig::default());
     let actor = tokio::spawn(actor.run());
+    let mining = GitMiningService::default().mine_history(
+        project_id,
+        &large_mining_history(&repository)?,
+        &std::collections::BTreeMap::new(),
+    )?;
+    UlArtifactWriterService
+        .write_mining(&writer, &WriteAdmissionService, &mining)
+        .await?;
+    let mined_cards = ModuleCardService::build(
+        project_id,
+        &repository,
+        &mining.hotspots,
+        &mining.edges,
+        &std::collections::BTreeMap::new(),
+        &std::collections::BTreeMap::new(),
+    )?;
+    UlArtifactWriterService
+        .write_module_cards(
+            &writer,
+            &WriteAdmissionService,
+            &mining.run.run_id,
+            &mined_cards,
+        )
+        .await?;
     let service = OnboardingService::new(harness.store.clone(), writer.clone());
 
     let interrupted = service
@@ -328,6 +356,31 @@ fn git(root: &Path, args: &[&str]) -> TestResult {
         return Err(String::from_utf8_lossy(&output.stderr).into_owned().into());
     }
     Ok(())
+}
+
+fn large_mining_history(root: &Path) -> TestResult<String> {
+    let output = Command::new("git")
+        .current_dir(root)
+        .args(["rev-parse", "HEAD"])
+        .output()?;
+    if !output.status.success() {
+        return Err(String::from_utf8_lossy(&output.stderr).into_owned().into());
+    }
+    let head = String::from_utf8(output.stdout)?.trim().to_owned();
+    let mut history = String::new();
+    for index in 0..70 {
+        let hash = if index == 0 {
+            head.clone()
+        } else {
+            format!("synthetic-{index}")
+        };
+        let timestamp = 1_760_100_000_i64 - i64::from(index) * 3_600;
+        writeln!(
+            history,
+            "@@ELIOT@@{hash}\u{1f}UL Test\u{1f}{timestamp}\u{1f}fixture history\nsegment_{index}/a.rs\nsegment_{index}/b.rs"
+        )?;
+    }
+    Ok(history)
 }
 
 fn test_runtime_root() -> TestResult<PathBuf> {

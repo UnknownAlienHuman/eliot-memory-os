@@ -325,6 +325,7 @@ pub use ul::concept::{
     ModuleCard, ProjectCharter, PyramidBuildStatus, PyramidTargetKind, SubsystemCapsule,
     SystemFlow, SystemMap,
 };
+pub use ul::concept::{CoverageClass, DangerPath, SubsystemCoverage, UlMetacognitionView};
 pub use ul::cue::{
     CueBinding, CueBindingError, CueIndexRow, CueKind, CueMatchMode, CueRecordSource, CueStrength,
     cue_row_id, normalize_binding, normalize_bindings, ul_token_estimate,
@@ -334,12 +335,16 @@ pub use ul::injection::{
     InjectionReceipt, MemoryInfluenceAckInput, ObservedCue, PendingInjectionItem, UlFiredBlock,
     UlFiredItem,
 };
+pub use ul::measurement::{UlLedgerDelta, UlTaskLedger, UlUseReport};
 pub use ul::normalize::{
     command_pattern, error_signature, normalize_path, normalize_query_tokens, normalize_symbol,
 };
 pub use ul::onboarding::{
     ManifestPackage, OnboardingCheckpoint, OnboardingJob, OnboardingReport, OnboardingStage,
     OnboardingTestHook,
+};
+pub use ul::prediction::{
+    CalibrationScore, PredictionExpectation, PredictionRecord, PredictionResolution,
 };
 pub use verification::{
     FlakeReport, SkippedTest, SkippedTestReason, StatefulDbIsolationReport, TestCostClass,

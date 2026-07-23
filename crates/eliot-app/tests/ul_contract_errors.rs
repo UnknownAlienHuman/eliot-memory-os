@@ -331,7 +331,15 @@ fn candidate_arguments(
         "where_not_applicable": [],
         "negative_constraints": [],
         "provenance_refs": ["test:UL-01"],
-        "freshness_rule": "valid only for this isolated repair test"
+        "freshness_rule": "valid only for this isolated repair test",
+        "expected_reuse_note": "Reuse only in this isolated contract test.",
+        "cue_bindings": [{
+            "cue_kind": "file_path",
+            "cue_value": "crates/eliot-app/tests/ul_contract_errors.rs",
+            "match_mode": "exact",
+            "strength": "primary",
+            "expected_reuse_note": "Reuse only in this isolated contract test."
+        }]
     })
 }
 

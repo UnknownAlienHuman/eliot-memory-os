@@ -4312,6 +4312,7 @@ pub(super) async fn dispatch_operator_command(
                 .unwrap_or_default();
             let packet = dispatch_compile_packet_l3(
                 state,
+                context,
                 json!({
                     "project_id": project_id,
                     "task_id": task_id.to_string(),
