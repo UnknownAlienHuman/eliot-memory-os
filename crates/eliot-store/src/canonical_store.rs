@@ -61,6 +61,11 @@ const SECRET_SCAN_TABLES: &[&str] = &[
     "belongs_to",
     "produced_by",
     "invalidated_by",
+    "co_change",
+    "concept_implemented_by",
+    "concept_depends_on",
+    "capsule_covers",
+    "card_covers",
 ];
 
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
@@ -492,6 +497,7 @@ impl CanonicalStore {
             NamedSurqlOp::SchemaMigrateObservability,
             NamedSurqlOp::SchemaMigrateUl,
             NamedSurqlOp::SchemaMigrateUlDelivery,
+            NamedSurqlOp::SchemaMigrateUlArtifacts,
         ] {
             value = self.migrate_schema_op(op).await?;
         }
@@ -738,30 +744,34 @@ impl CanonicalStore {
         } else {
             NamedSurqlOp::UpsertCueRows
         };
-        let projection_rows = rows
-            .iter()
-            .map(|row| {
-                json!({
-                    "row_id_parts": cue_string_parts(&row.row_id),
-                    "project_id": row.project_id,
-                    "cue_kind": row.cue_kind,
-                    "cue_value_parts": cue_string_parts(&row.cue_value_norm),
-                    "match_mode": row.match_mode,
-                    "record_ref_parts": cue_string_parts(&row.record_ref),
-                    "record_kind": row.record_kind,
-                    "strength": row.strength,
-                    "negative_memory": row.negative_memory,
-                    "lifecycle": row.lifecycle,
-                    "token_estimate": row.token_estimate,
-                })
-            })
-            .collect::<Vec<_>>();
+        let projection_rows = cue_projection_rows(rows);
         self.execute_value(
             op,
             json!({
                 "project_id": project_id,
+                "replace_project": false,
                 "record_ref_parts": cue_string_parts(record_ref),
+                "record_ref_key": cue_record_ref_key(record_ref),
                 "rows": projection_rows,
+            }),
+        )
+        .await?;
+        Ok(())
+    }
+
+    pub async fn replace_project_cue_rows(
+        &self,
+        project_id: ProjectId,
+        rows: &[CueIndexRow],
+    ) -> Result<(), StoreError> {
+        self.execute_value(
+            NamedSurqlOp::UpsertCueRows,
+            json!({
+                "project_id": project_id,
+                "replace_project": true,
+                "record_ref_parts": [],
+                "record_ref_key": "",
+                "rows": cue_projection_rows(rows),
             }),
         )
         .await?;
@@ -1177,6 +1187,39 @@ impl CanonicalStore {
         T: DeserializeOwned,
     {
         self.canonical_records(project_id, task_id, receipt_kinds, None, limit)
+            .await
+    }
+
+    pub async fn ul_artifact_by_id<T>(
+        &self,
+        project_id: ProjectId,
+        receipt_kind: &str,
+        artifact_id: &str,
+    ) -> Result<Option<CanonicalRecord<T>>, StoreError>
+    where
+        T: DeserializeOwned,
+    {
+        let mut records = self
+            .canonical_records_by_subject_ref(project_id, None, &[receipt_kind], artifact_id, 2)
+            .await?;
+        if records.len() > 1 {
+            return Err(StoreError::Decode(format!(
+                "UL artifact {artifact_id} resolved to multiple canonical records"
+            )));
+        }
+        Ok(records.pop())
+    }
+
+    pub async fn ul_artifacts_by_kind<T>(
+        &self,
+        project_id: ProjectId,
+        receipt_kind: &str,
+        limit: u16,
+    ) -> Result<Vec<CanonicalRecord<T>>, StoreError>
+    where
+        T: DeserializeOwned,
+    {
+        self.canonical_records_by_kind(project_id, None, &[receipt_kind], limit)
             .await
     }
 
@@ -1638,6 +1681,31 @@ fn cue_string_parts(value: &str) -> Vec<&str> {
     value.split(':').collect()
 }
 
+fn cue_record_ref_key(value: &str) -> String {
+    blake3::hash(value.as_bytes()).to_hex().to_string()
+}
+
+fn cue_projection_rows(rows: &[CueIndexRow]) -> Vec<Value> {
+    rows.iter()
+        .map(|row| {
+            json!({
+                "row_id_parts": cue_string_parts(&row.row_id),
+                "project_id": row.project_id,
+                "cue_kind": row.cue_kind,
+                "cue_value_parts": cue_string_parts(&row.cue_value_norm),
+                "match_mode": row.match_mode,
+                "record_ref_parts": cue_string_parts(&row.record_ref),
+                "record_ref_key": cue_record_ref_key(&row.record_ref),
+                "record_kind": row.record_kind,
+                "strength": row.strength,
+                "negative_memory": row.negative_memory,
+                "lifecycle": row.lifecycle,
+                "token_estimate": row.token_estimate,
+            })
+        })
+        .collect()
+}
+
 fn build_blob_reference_snapshot(
     config: &SurrealServerConfig,
     scope: &str,
@@ -1838,6 +1906,7 @@ fn canonical_payloads(envelope: &MemoryWriteEnvelope) -> Result<Vec<Value>, Stor
                 "trace_ref_fragments": canonical_field_fragments(body, "trace_ref"),
                 "candidate_id_fragments": canonical_field_fragments(body, "candidate_id"),
                 "action_fragments": canonical_field_fragments(body, "action"),
+                "cue_preview_fragments": canonical_field_fragments(body, "body_md"),
             }))
         })
         .collect()

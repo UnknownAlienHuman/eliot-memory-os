@@ -6,6 +6,7 @@ pub enum NamedSurqlOp {
     SchemaMigrateObservability,
     SchemaMigrateUl,
     SchemaMigrateUlDelivery,
+    SchemaMigrateUlArtifacts,
     UpsertCueRows,
     DeleteCueRows,
     LoadCueRows,
@@ -49,6 +50,7 @@ impl NamedSurqlOp {
             Self::SchemaMigrateObservability => "001_observability",
             Self::SchemaMigrateUl => "002_ul_core",
             Self::SchemaMigrateUlDelivery => "003_ul_delivery",
+            Self::SchemaMigrateUlArtifacts => "004_ul_artifacts",
             Self::UpsertCueRows => "upsert_cue_rows",
             Self::DeleteCueRows => "delete_cues_for_record",
             Self::LoadCueRows => "load_cue_rows",
@@ -92,6 +94,7 @@ impl NamedSurqlOp {
             Self::SchemaMigrateObservability => include_str!("surql/001_observability.surql"),
             Self::SchemaMigrateUl => include_str!("surql/002_ul_core.surql"),
             Self::SchemaMigrateUlDelivery => include_str!("surql/003_ul_delivery.surql"),
+            Self::SchemaMigrateUlArtifacts => include_str!("surql/004_ul_artifacts.surql"),
             Self::UpsertCueRows => include_str!("surql/upsert_cue_rows.surql"),
             Self::DeleteCueRows => include_str!("surql/delete_cues_for_record.surql"),
             Self::LoadCueRows => include_str!("surql/load_cue_rows.surql"),
@@ -184,7 +187,7 @@ impl Default for SurqlTemplateRegistry {
 }
 
 #[allow(clippy::too_many_lines)]
-fn foundational_templates() -> [SurqlTemplate; 20] {
+fn foundational_templates() -> [SurqlTemplate; 21] {
     [
         template(
             NamedSurqlOp::SchemaMigrate,
@@ -208,6 +211,12 @@ fn foundational_templates() -> [SurqlTemplate; 20] {
             NamedSurqlOp::SchemaMigrateUlDelivery,
             "SchemaMigrateUlDeliveryInput",
             "SchemaMigrateUlDeliveryOutput",
+            64 * 1024,
+        ),
+        template(
+            NamedSurqlOp::SchemaMigrateUlArtifacts,
+            "SchemaMigrateUlArtifactsInput",
+            "SchemaMigrateUlArtifactsOutput",
             64 * 1024,
         ),
         template(

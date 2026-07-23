@@ -25,9 +25,17 @@ WHERE <string> project_id = <string> $project_id
 LIMIT 10001;
 
 LET $observations = SELECT
-  string::concat('tool_observation:', <string> observation_id) AS record_ref,
+  IF payload.receipt_kind = 'module_card' {
+    string::concat('card:', <string> payload.receipt_body.card_id)
+  } ELSE {
+    string::concat('tool_observation:', <string> observation_id)
+  } AS record_ref,
   <string> payload.receipt_kind AS record_kind,
-  <string> observation AS preview_text,
+  IF payload.receipt_body.body_md != NONE {
+    <string> payload.receipt_body.body_md
+  } ELSE {
+    <string> observation
+  } AS preview_text,
   payload.receipt_body AS payload,
   payload.receipt_body.cue_bindings AS cue_bindings,
   false AS negative_memory,
@@ -38,12 +46,20 @@ WHERE <string> project_id = <string> $project_id
 LIMIT 10001;
 
 LET $canonical = SELECT
-  string::concat('canonical:', <string> record_id) AS record_ref,
+  IF receipt_kind = 'module_card' {
+    string::concat('card:', <string> receipt_body.card_id)
+  } ELSE {
+    string::concat('canonical:', <string> record_id)
+  } AS record_ref,
   <string> receipt_kind AS record_kind,
-  IF receipt_body.preview_text != NONE {
+  IF cue_preview_text != NONE AND cue_preview_text != '' {
+    <string> cue_preview_text
+  } ELSE IF receipt_body.preview_text != NONE {
     <string> receipt_body.preview_text
   } ELSE IF receipt_body.statement != NONE {
     <string> receipt_body.statement
+  } ELSE IF receipt_body.body_md != NONE {
+    <string> receipt_body.body_md
   } ELSE {
     <string> receipt_kind
   } AS preview_text,

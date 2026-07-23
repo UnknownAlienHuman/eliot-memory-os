@@ -190,8 +190,9 @@ pub use skill_curator::{
     SkillCuratorService, SkillMergeSplitService, SkillPatchService,
 };
 pub use ul::{
-    CueIndexService, FiredMemory, FiringResult, InjectionPlanner, ObservedCue, TouchedCue,
-    TouchedSetRegistry,
+    CueIndexService, FiredMemory, FiringResult, GitMiningArtifacts, GitMiningService,
+    GitMiningStatus, InjectionPlanner, ModuleCardService, ObservedCue, TouchedCue,
+    TouchedSetRegistry, UlArtifactWriteReport, UlArtifactWriterService, failure_bindings_by_path,
 };
 pub use verification::{
     FlakeDetectionService, StatefulDbTestIsolationService, TestCostService, TestInventoryService,

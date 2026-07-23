@@ -1,8 +1,9 @@
 use crate::EngineError;
 use eliot_store::CanonicalStore;
 use eliot_types::{
-    CueBinding, CueIndexRow, CueKind, CueRecordSource, CueStrength, ObservedCue, ProjectId,
-    cue_row_id, normalize_binding, normalize_path, normalize_symbol, ul_token_estimate,
+    CueBinding, CueIndexRow, CueKind, CueRecordSource, CueStrength, CurrentStateRequest,
+    MemoryRevision, ObservedCue, ProjectId, ReadConsistencyMode, cue_row_id, normalize_binding,
+    normalize_path, normalize_symbol, ul_token_estimate,
 };
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
@@ -31,6 +32,7 @@ pub struct FiringResult {
 }
 
 struct ProjectCueShard {
+    memory_revision: MemoryRevision,
     exact: BTreeMap<(CueKind, String), Vec<CueIndexRow>>,
     dir_prefix: Vec<CueIndexRow>,
 }
@@ -50,30 +52,46 @@ impl CueIndexService {
     }
 
     pub async fn rebuild(&self, project_id: ProjectId) -> Result<(), EngineError> {
+        for _attempt in 0..4 {
+            let start_revision = self.current_revision(project_id).await?;
+            let shard = self.build_shard(project_id, start_revision).await?;
+            let end_revision = self.current_revision(project_id).await?;
+            if start_revision != end_revision {
+                continue;
+            }
+            self.shards
+                .write()
+                .map_err(|_| lock_error())?
+                .insert(project_id, Arc::new(shard));
+            return Ok(());
+        }
+        Err(EngineError::ServiceNotReady {
+            service: "cue_index".to_owned(),
+            reason: "project revision changed repeatedly during cue-index rebuild".to_owned(),
+        })
+    }
+
+    async fn build_shard(
+        &self,
+        project_id: ProjectId,
+        memory_revision: MemoryRevision,
+    ) -> Result<ProjectCueShard, EngineError> {
         let mut rows = self.store.load_cue_rows(project_id).await?;
         let sources = self.store.load_cue_records(project_id).await?;
         if !sources.is_empty() {
-            let source_refs = sources
-                .iter()
-                .map(|source| source.record_ref.clone())
-                .collect::<BTreeSet<_>>();
-            let existing_refs = rows
-                .iter()
-                .map(|row| row.record_ref.clone())
-                .collect::<BTreeSet<_>>();
-            for stale in existing_refs.difference(&source_refs) {
-                self.store.replace_cue_rows(project_id, stale, &[]).await?;
-            }
+            rows.clear();
             for source in &sources {
-                let source_rows = rows_for_source(project_id, source)?;
-                self.store
-                    .replace_cue_rows(project_id, &source.record_ref, &source_rows)
-                    .await?;
+                rows.extend(rows_for_source(project_id, source)?);
             }
-            rows = self.store.load_cue_rows(project_id).await?;
+            rows.sort_by(|left, right| left.row_id.cmp(&right.row_id));
+            rows.dedup_by(|left, right| left.row_id == right.row_id);
+            self.store
+                .replace_project_cue_rows(project_id, &rows)
+                .await?;
         }
 
         let mut shard = ProjectCueShard {
+            memory_revision,
             exact: BTreeMap::new(),
             dir_prefix: Vec::new(),
         };
@@ -93,11 +111,19 @@ impl CueIndexService {
             rows.sort_by(compare_rows);
         }
         shard.dir_prefix.sort_by(compare_rows);
-        self.shards
-            .write()
-            .map_err(|_| lock_error())?
-            .insert(project_id, Arc::new(shard));
-        Ok(())
+        Ok(shard)
+    }
+
+    async fn current_revision(&self, project_id: ProjectId) -> Result<MemoryRevision, EngineError> {
+        Ok(self
+            .store
+            .current_state(&CurrentStateRequest {
+                project_id,
+                consistency: ReadConsistencyMode::Latest,
+                at_least_revision: None,
+            })
+            .await?
+            .memory_revision)
     }
 
     pub async fn replace_record_bindings(
@@ -139,12 +165,22 @@ impl CueIndexService {
         project_id: ProjectId,
         cues: &[ObservedCue],
     ) -> Result<FiringResult, EngineError> {
-        if !self
+        let current_revision = self
+            .store
+            .current_state(&CurrentStateRequest {
+                project_id,
+                consistency: ReadConsistencyMode::Latest,
+                at_least_revision: None,
+            })
+            .await?
+            .memory_revision;
+        let refresh_required = self
             .shards
             .read()
             .map_err(|_| lock_error())?
-            .contains_key(&project_id)
-        {
+            .get(&project_id)
+            .is_none_or(|shard| shard.memory_revision != current_revision);
+        if refresh_required {
             self.rebuild(project_id).await?;
         }
         let shard = self
@@ -155,38 +191,7 @@ impl CueIndexService {
             .cloned()
             .ok_or_else(lock_error)?;
 
-        let mut observed = cues
-            .iter()
-            .map(|cue| ObservedCue {
-                kind: cue.kind,
-                value: normalize_cue_value(cue.kind, &cue.value),
-            })
-            .filter(|cue| !cue.value.is_empty())
-            .collect::<Vec<_>>();
-        observed.sort_by(|left, right| {
-            left.kind
-                .cmp(&right.kind)
-                .then_with(|| left.value.cmp(&right.value))
-        });
-        observed.dedup();
-
-        let mut hits = Vec::new();
-        for cue in &observed {
-            if let Some(rows) = shard.exact.get(&(cue.kind, cue.value.clone())) {
-                hits.extend(rows.iter().cloned().map(|row| (row, cue.clone())));
-            }
-            if matches!(cue.kind, CueKind::FilePath | CueKind::DirPath) {
-                hits.extend(
-                    shard
-                        .dir_prefix
-                        .iter()
-                        .filter(|row| path_segment_prefix(&cue.value, &row.cue_value_norm))
-                        .cloned()
-                        .map(|row| (row, cue.clone())),
-                );
-            }
-        }
-
+        let hits = matching_rows(&shard, cues);
         let matched = hits.len();
         let unique_refs = hits
             .iter()
@@ -238,6 +243,41 @@ impl CueIndexService {
             overflow,
         })
     }
+}
+
+fn matching_rows(shard: &ProjectCueShard, cues: &[ObservedCue]) -> Vec<(CueIndexRow, ObservedCue)> {
+    let mut observed = cues
+        .iter()
+        .map(|cue| ObservedCue {
+            kind: cue.kind,
+            value: normalize_cue_value(cue.kind, &cue.value),
+        })
+        .filter(|cue| !cue.value.is_empty())
+        .collect::<Vec<_>>();
+    observed.sort_by(|left, right| {
+        left.kind
+            .cmp(&right.kind)
+            .then_with(|| left.value.cmp(&right.value))
+    });
+    observed.dedup();
+
+    let mut hits = Vec::new();
+    for cue in &observed {
+        if let Some(rows) = shard.exact.get(&(cue.kind, cue.value.clone())) {
+            hits.extend(rows.iter().cloned().map(|row| (row, cue.clone())));
+        }
+        if matches!(cue.kind, CueKind::FilePath | CueKind::DirPath) {
+            hits.extend(
+                shard
+                    .dir_prefix
+                    .iter()
+                    .filter(|row| path_segment_prefix(&cue.value, &row.cue_value_norm))
+                    .cloned()
+                    .map(|row| (row, cue.clone())),
+            );
+        }
+    }
+    hits
 }
 
 fn rows_for_source(

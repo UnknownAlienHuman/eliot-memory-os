@@ -209,14 +209,15 @@ pub use memory::{
     SymbolChangeIntent, SymbolEvidence, TaintClass, TaskAcceptanceEvidenceKind, TaskAcceptanceItem,
     TaskContract, TaskContractInput, TaskContractStatus, TaskContractWriteCommand,
     TokenBudgetReport, ToolObservation, ToolObservationInput, ToolObservationRecordCommand,
-    TruncationInfo, UnderstandingProof, UnderstandingProofReceipt, UnifiedDiff,
-    VerificationRecordCommand, VerificationResult, VerificationRun, VerificationRunInput,
-    VerifierArtifactRef, VerifierArtifactScope, VerifierCommandKind, VerifierEffectTrace,
-    VerifierEvidence, VerifierPlan, VerifierRequirement, VerifierRun, VerifierRunRef,
-    VerifierStatus, Visibility, WorkConflict, WorkConflictKind, WorkConflictResolution, WorkItem,
-    WorkItemStatus, WorkLease, WorkLeaseDecision, WorkLeaseDecisionKind, WorkLeaseDecisionReason,
-    WorkLeaseState, WorkScope, WorktreeLease, WorktreeLeaseRequest, WorktreeLeaseState,
-    WriteReceipt, WriteReceiptRef, WriteRejectReason, WriteStatus, WriterStatusResponse,
+    TruncationInfo, UlArtifactBatchRecordCommand, UnderstandingProof, UnderstandingProofReceipt,
+    UnifiedDiff, VerificationRecordCommand, VerificationResult, VerificationRun,
+    VerificationRunInput, VerifierArtifactRef, VerifierArtifactScope, VerifierCommandKind,
+    VerifierEffectTrace, VerifierEvidence, VerifierPlan, VerifierRequirement, VerifierRun,
+    VerifierRunRef, VerifierStatus, Visibility, WorkConflict, WorkConflictKind,
+    WorkConflictResolution, WorkItem, WorkItemStatus, WorkLease, WorkLeaseDecision,
+    WorkLeaseDecisionKind, WorkLeaseDecisionReason, WorkLeaseState, WorkScope, WorktreeLease,
+    WorktreeLeaseRequest, WorktreeLeaseState, WriteReceipt, WriteReceiptRef, WriteRejectReason,
+    WriteStatus, WriterStatusResponse,
 };
 pub use metrics::{
     CostLedger, CostLedgerEntry, DashboardHealthStatus, DashboardHealthSummary, DashboardReport,
@@ -314,6 +315,13 @@ pub use skill::{
     SkillMergeProposal, SkillNeedEstimate, SkillNeedVerdict, SkillOrderingRule, SkillOutputSpec,
     SkillPatchProposal, SkillQuarantineProposal, SkillReplayRequirement, SkillScopeRule,
     SkillSplitProposal, SkillStep, SkillToolRequirement,
+};
+pub use ul::artifact::UlArtifact;
+pub use ul::behavior::{
+    CoChangeEdge, FIX_CLASSIFIER_VERSION, HotspotScore, MiningConfig, MiningRun,
+};
+pub use ul::concept::{
+    CapsuleBuild, ConceptNode, ModuleCard, ProjectCharter, SubsystemCapsule, SystemMap,
 };
 pub use ul::cue::{
     CueBinding, CueBindingError, CueIndexRow, CueKind, CueMatchMode, CueRecordSource, CueStrength,

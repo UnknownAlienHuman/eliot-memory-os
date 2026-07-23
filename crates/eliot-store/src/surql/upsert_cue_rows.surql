@@ -1,8 +1,12 @@
 BEGIN TRANSACTION;
-LET $record_ref_value = array::join($record_ref_parts, ':');
-DELETE cue_index
-WHERE <string> project_id = <string> $project_id
-  AND record_ref = $record_ref_value;
+IF $replace_project {
+  DELETE cue_index
+  WHERE <string> project_id = <string> $project_id;
+} ELSE {
+  DELETE cue_index
+  WHERE <string> project_id = <string> $project_id
+    AND record_ref_key = $record_ref_key;
+};
 FOR $row IN $rows {
   LET $row_id_value = array::join($row.row_id_parts, ':');
   LET $cue_value = array::join($row.cue_value_parts, ':');
@@ -14,6 +18,8 @@ FOR $row IN $rows {
     cue_value_norm: $cue_value,
     match_mode: <string> $row.match_mode,
     record_ref: $row_record_ref,
+    record_ref_parts: $row.record_ref_parts,
+    record_ref_key: <string> $row.record_ref_key,
     record_kind: <string> $row.record_kind,
     strength: <string> $row.strength,
     negative_memory: <bool> $row.negative_memory,

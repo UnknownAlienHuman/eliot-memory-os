@@ -54,7 +54,16 @@ LET $canonical_kinds = [
   'cognitive_run_attempt',
   'cognitive_tool_observation',
   'cognitive_raw_verifier',
-  'cognitive_run_terminal'
+  'cognitive_run_terminal',
+  'mining_run',
+  'hotspot_score',
+  'co_change_edge',
+  'module_card',
+  'concept_node',
+  'project_charter',
+  'system_map',
+  'subsystem_capsule',
+  'capsule_build'
 ];
 LET $existing_receipt = SELECT * FROM ONLY type::record('write_receipt', $receipt_id);
 LET $idempotency_result = IF $existing_receipt != NONE {
@@ -232,6 +241,10 @@ FOR $observation IN $envelope.tool_observations {
       $canonical_payload.action_fragments.map(|$fragment| <string> $fragment),
       ''
     );
+    LET $cue_preview_text = <string> array::join(
+      $canonical_payload.cue_preview_fragments.map(|$fragment| <string> $fragment),
+      ''
+    );
 
     UPSERT type::record('canonical_record', $observation.observation_id) CONTENT {
       record_id: $observation.observation_id,
@@ -242,6 +255,7 @@ FOR $observation IN $envelope.tool_observations {
       trace_ref: $trace_ref,
       candidate_id: $candidate_id,
       canonical_action: $canonical_action,
+      cue_preview_text: $cue_preview_text,
       receipt_body: $body,
       receipt_body_json_b64: <string> $canonical_payload.receipt_body_json_b64,
       canonical_receipt: {

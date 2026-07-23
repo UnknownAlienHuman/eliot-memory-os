@@ -1,6 +1,6 @@
 #![allow(dead_code)]
 
-use eliot_engine::{WriteAdmissionService, WriterActor, WriterConfig};
+use eliot_engine::{CueIndexService, WriteAdmissionService, WriterActor, WriterConfig};
 use eliot_store::{CanonicalStore, ControlWal};
 use eliot_types::{
     ControlWalConfig, CredentialProviderKind, CurrentStateRequest, GovernorConfig, MemoryRevision,
@@ -143,6 +143,32 @@ impl Harness {
         })
     }
 
+    pub fn seed_many(&self, commands: &[SemanticCommand]) -> TestResult<Vec<WriteReceipt>> {
+        let first_write_id = commands
+            .first()
+            .map(|command| command.context().write_id)
+            .ok_or("seed_many requires at least one command")?;
+        let wal_path = self
+            .runtime
+            .path()
+            .join(format!("seed-many-{first_write_id}.redb"));
+        self.store_runtime.block_on(async {
+            let wal = ControlWal::open(&ControlWalConfig {
+                path: slash(&wal_path),
+            })?;
+            let (writer, actor) =
+                WriterActor::channel(wal, self.store.clone(), &WriterConfig::default());
+            let actor = tokio::spawn(actor.run());
+            let mut receipts = Vec::with_capacity(commands.len());
+            for command in commands {
+                receipts.push(writer.submit(WriteAdmissionService.admit(command)?).await?);
+            }
+            drop(writer);
+            actor.await?;
+            Ok(receipts)
+        })
+    }
+
     pub fn current_revision(&self, project_id: ProjectId) -> TestResult<MemoryRevision> {
         Ok(self
             .store_runtime
@@ -180,6 +206,35 @@ impl Harness {
         Ok(self
             .store_runtime
             .block_on(self.store.load_cue_rows(project_id))?)
+    }
+
+    pub fn cue_records(
+        &self,
+        project_id: ProjectId,
+    ) -> TestResult<Vec<eliot_types::CueRecordSource>> {
+        Ok(self
+            .store_runtime
+            .block_on(self.store.load_cue_records(project_id))?)
+    }
+
+    pub fn replace_cue_record(
+        &self,
+        project_id: ProjectId,
+        record_ref: &str,
+        record_kind: &str,
+        preview_text: &str,
+        bindings: &[eliot_types::CueBinding],
+    ) -> TestResult {
+        Ok(self.store_runtime.block_on(
+            CueIndexService::new(self.store.clone()).replace_record_bindings(
+                project_id,
+                record_ref,
+                record_kind,
+                preview_text,
+                bindings,
+                false,
+            ),
+        )?)
     }
 }
 
