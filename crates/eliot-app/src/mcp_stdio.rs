@@ -93,18 +93,18 @@ use eliot_types::{
     ExternalReviewGateDecisionKind, ExternalReviewPacket, ExternalReviewRequest,
     ExternalReviewRole, FetchAtomsL2Request, FetchAtomsL2Response, ForgettingOperator,
     ForgettingReason, LatencyHistogram, LifecycleStatus, MailboxMessageId, MailboxMessageKind,
-    MailboxRecipient, MaintenanceJobKind, MaterialPacketFrame, MemoryCurationCandidate,
-    MemoryCurationCorpusProfile, MemoryCurationFindingKind, MemoryCurationPreviewRequest,
-    MemoryCurationPreviewResponse, MemoryExposurePolicy, MemoryInfluenceReport,
-    MemoryInfluenceTrace, MemoryInspectorView, MemoryLifecyclePacketView, MemoryLifecycleState,
-    MemoryNeed, MemoryRevision, MemoryWriteEnvelope, MetaCandidateChangeClass,
-    MetaExperimentDecision, MetaIsolationFence, MetaPolicyAuthorization, MetaPolicyExecutionAction,
-    MetricDefinition, MetricSample, MetricWindow, MinorityPressureRecord, MinorityPressureStatus,
-    NegativeTransferHarm, OPERATOR_CONTRACT_MANIFEST, OPERATOR_IPC_PROTOCOL_VERSION,
-    OPERATOR_SCHEMA_VERSION, OperationJob, OperationJobState, OperatorActionView, OperatorCommand,
-    OperatorCommandReceipt, OperatorControlRequest, OperatorFieldView, OperatorProjectionFilter,
-    OperatorProjectionKind, OperatorProjectionPage, OperatorQueryOperation, OperatorQueryRequest,
-    OperatorRecordView, OperatorRelationshipView, OperatorSnapshot, PatchRequest, PatchRequestId,
+    MailboxRecipient, MaintenanceJobKind, MemoryCurationCandidate, MemoryCurationCorpusProfile,
+    MemoryCurationFindingKind, MemoryCurationPreviewRequest, MemoryCurationPreviewResponse,
+    MemoryExposurePolicy, MemoryInfluenceReport, MemoryInfluenceTrace, MemoryInspectorView,
+    MemoryLifecyclePacketView, MemoryLifecycleState, MemoryNeed, MemoryRevision,
+    MemoryWriteEnvelope, MetaCandidateChangeClass, MetaExperimentDecision, MetaIsolationFence,
+    MetaPolicyAuthorization, MetaPolicyExecutionAction, MetricDefinition, MetricSample,
+    MetricWindow, MinorityPressureRecord, MinorityPressureStatus, NegativeTransferHarm,
+    OPERATOR_CONTRACT_MANIFEST, OPERATOR_IPC_PROTOCOL_VERSION, OPERATOR_SCHEMA_VERSION,
+    OperationJob, OperationJobState, OperatorActionView, OperatorCommand, OperatorCommandReceipt,
+    OperatorControlRequest, OperatorFieldView, OperatorProjectionFilter, OperatorProjectionKind,
+    OperatorProjectionPage, OperatorQueryOperation, OperatorQueryRequest, OperatorRecordView,
+    OperatorRelationshipView, OperatorSnapshot, PatchRequest, PatchRequestId,
     ProcedurePromotionOutcome, ProfileVerificationRun, ProjectId, QualitySignal,
     ReactivationCondition, ReadConsistencyMode, RecallL0Request, RecallL0Response, ReceiptId,
     ReplayCaseKind, ReplayInputSnapshot, ReplaySetRole, ReplayThresholdPolicyV1, RuntimeMode,
@@ -190,6 +190,7 @@ mod dispatch;
 mod evaluation;
 mod experiment;
 mod finalization;
+mod input_validation;
 mod memory;
 mod operator;
 mod replay;
@@ -1731,16 +1732,6 @@ struct FetchL2ToolInput {
     #[serde(default)]
     continuation: Option<String>,
     at_least_revision: Option<u64>,
-}
-
-#[derive(serde::Deserialize)]
-struct CompilePacketToolInput {
-    #[serde(flatten)]
-    request: CompilePacketL3Request,
-    #[serde(default)]
-    material_frame: Option<MaterialPacketFrame>,
-    #[serde(default)]
-    memory_mode: Option<eliot_types::MemoryExposureMode>,
 }
 
 #[derive(serde::Deserialize)]

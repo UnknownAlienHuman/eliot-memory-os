@@ -13,6 +13,7 @@ use crate::{
     VerificationResult, WorkConflict, WorkItem, WorkItemId, WorkLease, WorktreeLease,
     WriteReceiptRef,
 };
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -99,7 +100,7 @@ pub struct CurrentTruthSnapshot {
     pub captured_at: OffsetDateTime,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 pub struct CausalBridgeHop {
     pub from: String,
     pub relation: String,
@@ -127,7 +128,7 @@ pub struct DecisionLocalitySuffix {
     pub stop_condition: String,
 }
 
-#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 pub struct MaterialPacketFrame {
     pub acceptance_items: Vec<String>,
     pub environment: Vec<String>,

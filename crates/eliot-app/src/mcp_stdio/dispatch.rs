@@ -137,8 +137,39 @@ pub(super) async fn handle_message(
     };
     Some(match result {
         Ok(result) => json!({ "jsonrpc": "2.0", "id": id, "result": result }),
-        Err(error) => error_response(&id, -32603, &error.to_string()),
+        Err(error) => dispatch_error_response(&id, &error),
     })
+}
+
+fn dispatch_error_response(id: &Value, error: &anyhow::Error) -> Value {
+    if let Some(input) = error.downcast_ref::<eliot_types::ToolInputError>() {
+        error_response_with_data(id, -32602, "invalid tool input", &input.data)
+    } else if let Some(eliot_engine::EngineError::EncodingRejected { violations }) =
+        error.downcast_ref::<eliot_engine::EngineError>()
+    {
+        let data = eliot_types::ToolInputErrorData {
+            code: "ENCODING_REJECTED".to_owned(),
+            missing: Vec::new(),
+            invalid: violations
+                .iter()
+                .filter(|violation| {
+                    violation.path != "$.claim.payload.statement"
+                        || !violations.iter().any(|canonical| {
+                            canonical.path == "$.claim.statement"
+                                && canonical.reason == violation.reason
+                        })
+                })
+                .map(|violation| eliot_types::InvalidField {
+                    field: violation.path.clone(),
+                    reason: violation.reason.clone(),
+                })
+                .collect(),
+            minimal_valid_example: Value::Null,
+        };
+        error_response_with_data(id, -32602, "encoding rejected", &data)
+    } else {
+        error_response(id, -32603, &error.to_string())
+    }
 }
 
 pub(super) fn enforce_bound_tool_scope(

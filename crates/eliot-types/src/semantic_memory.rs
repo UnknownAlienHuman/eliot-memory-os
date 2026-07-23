@@ -1,6 +1,7 @@
 //! Semantic-experience, applicability, and transfer-lab contracts.
 
 use crate::{AgentSessionId, ProjectId, VerificationResult, WriteReceiptRef};
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use time::OffsetDateTime;
@@ -460,7 +461,7 @@ pub struct NegativeTransferRecord {
     pub receipt: Option<WriteReceiptRef>,
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MemoryExposureMode {
     CurrentTruthOnly,

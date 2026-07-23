@@ -14,6 +14,7 @@ pub mod health;
 pub mod host;
 pub mod ids;
 pub mod lifecycle;
+pub mod mcp_contract;
 pub mod memory;
 pub mod metrics;
 pub mod provider_invocation;
@@ -25,6 +26,7 @@ pub mod secret_boundary;
 pub mod semantic_memory;
 pub mod service;
 pub mod skill;
+pub mod ul;
 pub mod verification;
 
 pub use adapter::{
@@ -171,6 +173,10 @@ pub use lifecycle::{
     MinorityPressureRecord, MinorityPressureStatus, ReactivationCondition, RevisionOperator,
     SupersessionReceipt, SuppressionReceipt,
 };
+pub use mcp_contract::{
+    CompilePacketToolInput, InvalidField, ToolInputError, ToolInputErrorData,
+    compile_packet_input_schema, compile_packet_minimal_example,
+};
 pub use memory::{
     ActionKind, ActionLease, ActionLeaseRecord, ActionProvenanceSet, ActionRequest, ActionScope,
     ActionSourceScope, ActiveDecisionTransitionCommand, AgentContributionTrace,
@@ -302,6 +308,7 @@ pub use skill::{
     SkillPatchProposal, SkillQuarantineProposal, SkillReplayRequirement, SkillScopeRule,
     SkillSplitProposal, SkillStep, SkillToolRequirement,
 };
+pub use ul::guard::{TextEncodingViolation, inspect_text_encoding, mojibake};
 pub use verification::{
     FlakeReport, SkippedTest, SkippedTestReason, StatefulDbIsolationReport, TestCostClass,
     TestCostReport, TestCountByCost, TestCountByIntent, TestCountByKind, TestIntent, TestInventory,

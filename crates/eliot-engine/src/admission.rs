@@ -16,6 +16,11 @@ pub struct WriteAdmissionService;
 
 impl WriteAdmissionService {
     pub fn admit(&self, command: &SemanticCommand) -> Result<MemoryWriteEnvelope, EngineError> {
+        let value = serde_json::to_value(command)?;
+        let violations = eliot_types::ul::guard::inspect_text_encoding(&value);
+        if !violations.is_empty() {
+            return Err(EngineError::EncodingRejected { violations });
+        }
         validate_command_shape(command)?;
         let input_hash = stable_input_hash(command)?;
         let context = command.context().clone();
@@ -234,6 +239,13 @@ fn admit_claim_propose(
         return reject("ClaimPropose must use candidate status");
     }
     admitted.claims.push(body.claim.clone());
+    if let Some(task_id) = body.context.task_id {
+        admitted.relations.push(RelationInput {
+            relation_type: RelationType::BelongsTo,
+            from: body.claim.claim_id.to_string(),
+            to: task_id.to_string(),
+        });
+    }
     Ok(())
 }
 

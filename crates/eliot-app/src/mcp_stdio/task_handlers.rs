@@ -6,7 +6,7 @@ fn canonical_struct_hash<T: serde::Serialize>(value: &T) -> Result<String> {
 
 #[allow(clippy::too_many_lines)]
 async fn dispatch_compile_packet_l3(state: &McpState, arguments: Value) -> Result<Value> {
-    let input: CompilePacketToolInput = serde_json::from_value(arguments)?;
+    let input = input_validation::decode_compile_packet_input(arguments)?;
     let request = input.request;
     let packet_task = if let Ok(packet_task_id) = TaskId::from_str(&request.task_id) {
         state.store.task_contract_by_id(packet_task_id).await?

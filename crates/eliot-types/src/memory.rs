@@ -13,6 +13,7 @@ use crate::{
     VerificationId, VerifierRunId, WorkItemId, WorkLeaseId, WorktreeLeaseId,
     WorktreeLeaseRequestId, WriteId,
 };
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeSet;
@@ -859,7 +860,7 @@ pub struct ProjectRevisionSummary {
     pub project_sequence: ProjectSequence,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, JsonSchema, Serialize, Deserialize)]
 pub struct CompilePacketL3Request {
     pub project_id: ProjectId,
     pub task_id: String,

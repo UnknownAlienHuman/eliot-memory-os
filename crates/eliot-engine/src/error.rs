@@ -8,6 +8,11 @@ pub enum EngineError {
     #[error("write rejected: {0}")]
     WriteRejected(String),
 
+    #[error("encoding rejected")]
+    EncodingRejected {
+        violations: Vec<eliot_types::TextEncodingViolation>,
+    },
+
     #[error("writer backpressure")]
     Backpressure,
 

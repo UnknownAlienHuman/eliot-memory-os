@@ -89,53 +89,7 @@ fn json_schema(properties: &[(&str, &str)], required: &[&str]) -> Value {
 }
 
 fn compile_packet_schema() -> Value {
-    json!({
-        "type": "object",
-        "properties": {
-            "project_id": {"type": "string"},
-            "task_id": {"type": "string"},
-            "goal": {"type": "string"},
-            "candidate_handles": {"type": "array", "items": {"type": "string"}},
-            "max_tokens": {"type": "integer", "minimum": 1},
-            "memory_mode": {
-                "type": "string",
-                "enum": [
-                    "current_truth_only", "memory_free_control", "mature_experience_only",
-                    "include_case_candidates", "full_audit"
-                ]
-            },
-            "material_frame": {
-                "type": "object",
-                "description": "Required for material work; omitted packets are honestly rated insufficient.",
-                "properties": {
-                    "acceptance_items": {"type": "array", "items": {"type": "string"}},
-                    "environment": {"type": "array", "items": {"type": "string"}},
-                    "active_plan": {"type": "array", "items": {"type": "string"}},
-                    "completed_work": {"type": "array", "items": {"type": "string"}},
-                    "killed_paths": {"type": "array", "items": {"type": "string"}},
-                    "causal_bridge": {"type": "array", "items": {"type": "object"}},
-                    "negative_memory_checked": {"type": "boolean"},
-                    "exact_load_bearing_atoms": {"type": "array", "items": {"type": "string"}},
-                    "cheapest_discriminative_probes": {"type": "array", "items": {"type": "string"}},
-                    "responsibility_contour_route_refs": {"type": "array", "items": {"type": "string"}},
-                    "next_allowed_action": {"type": "string"},
-                    "expected_observable": {"type": "string"},
-                    "verifier": {"type": "string"},
-                    "stop_condition": {"type": "string"},
-                    "tool_schema_bytes_visible": {"type": "integer", "minimum": 0},
-                    "instruction_hotset_size": {"type": "integer", "minimum": 0}
-                },
-                "required": [
-                    "acceptance_items", "environment", "causal_bridge",
-                    "negative_memory_checked", "exact_load_bearing_atoms",
-                    "cheapest_discriminative_probes", "responsibility_contour_route_refs",
-                    "next_allowed_action", "expected_observable", "verifier", "stop_condition",
-                    "tool_schema_bytes_visible", "instruction_hotset_size"
-                ]
-            }
-        },
-        "required": ["project_id", "task_id", "goal", "candidate_handles", "max_tokens"]
-    })
+    eliot_types::compile_packet_input_schema()
 }
 
 fn understanding_proof_schema() -> Value {
@@ -352,6 +306,23 @@ fn error_response(id: &Value, code: i64, message: &str) -> Value {
         "error": {
             "code": code,
             "message": message
+        }
+    })
+}
+
+fn error_response_with_data<T: serde::Serialize + ?Sized>(
+    id: &Value,
+    code: i64,
+    message: &str,
+    data: &T,
+) -> Value {
+    json!({
+        "jsonrpc": "2.0",
+        "id": id.clone(),
+        "error": {
+            "code": code,
+            "message": message,
+            "data": data
         }
     })
 }
