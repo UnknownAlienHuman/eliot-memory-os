@@ -2,6 +2,7 @@ LET $claims = SELECT
   string::concat('claim:', <string> claim_id) AS record_ref,
   'claim' AS record_kind,
   <string> statement AS preview_text,
+  payload AS payload,
   payload.cue_bindings AS cue_bindings,
   false AS negative_memory,
   <string> lifecycle_status AS lifecycle
@@ -14,6 +15,7 @@ LET $failures = SELECT
   string::concat('failure:', <string> fingerprint) AS record_ref,
   'failure_fingerprint' AS record_kind,
   <string> summary AS preview_text,
+  payload AS payload,
   payload.cue_bindings AS cue_bindings,
   true AS negative_memory,
   <string> lifecycle_status AS lifecycle
@@ -26,6 +28,7 @@ LET $observations = SELECT
   string::concat('tool_observation:', <string> observation_id) AS record_ref,
   <string> payload.receipt_kind AS record_kind,
   <string> observation AS preview_text,
+  payload.receipt_body AS payload,
   payload.receipt_body.cue_bindings AS cue_bindings,
   false AS negative_memory,
   <string> lifecycle_status AS lifecycle
@@ -44,6 +47,7 @@ LET $canonical = SELECT
   } ELSE {
     <string> receipt_kind
   } AS preview_text,
+  receipt_body AS payload,
   receipt_body.cue_bindings AS cue_bindings,
   false AS negative_memory,
   IF receipt_body.lifecycle != NONE {

@@ -1,8 +1,8 @@
 use crate::EngineError;
 use eliot_store::CanonicalStore;
 use eliot_types::{
-    CueBinding, CueIndexRow, CueKind, CueRecordSource, CueStrength, ProjectId, cue_row_id,
-    normalize_binding, normalize_path, normalize_symbol, ul_token_estimate,
+    CueBinding, CueIndexRow, CueKind, CueRecordSource, CueStrength, ObservedCue, ProjectId,
+    cue_row_id, normalize_binding, normalize_path, normalize_symbol, ul_token_estimate,
 };
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
@@ -10,12 +10,6 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::{Arc, RwLock};
 
 const MAX_FIRED_MEMORIES: usize = 8;
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct ObservedCue {
-    pub kind: CueKind,
-    pub value: String,
-}
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct FiredMemory {
@@ -119,6 +113,7 @@ impl CueIndexService {
             record_ref: record_ref.to_owned(),
             record_kind: record_kind.to_owned(),
             preview_text: preview_text.to_owned(),
+            payload: None,
             cue_bindings: bindings.to_vec(),
             negative_memory,
             lifecycle: "active".to_owned(),

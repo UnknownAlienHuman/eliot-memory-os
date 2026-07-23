@@ -18,6 +18,7 @@ use tokio::task::JoinHandle;
 type TestResult<T = ()> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(clippy::too_many_lines)]
 async fn t03_candidate_persists_normalized_bindings() -> TestResult {
     if rerun_with_legacy_credential_gate("t03_candidate_persists_normalized_bindings")? {
         return Ok(());
@@ -45,6 +46,7 @@ async fn t03_candidate_persists_normalized_bindings() -> TestResult {
             strength: CueStrength::Primary,
             expected_reuse_note: "Reuse for canonical store edits.".to_owned(),
         }],
+        auto_bind: None,
         expected_reuse_note: "Reuse when the canonical store is active.".to_owned(),
         curation: None,
     };

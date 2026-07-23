@@ -74,6 +74,7 @@ fn t03_candidate_schema_roundtrip() -> Result<(), Box<dyn std::error::Error>> {
             strength: CueStrength::Primary,
             expected_reuse_note: "Reuse for canonical store changes.".to_owned(),
         }],
+        auto_bind: None,
         expected_reuse_note: "Reuse when the canonical store is in scope.".to_owned(),
         curation: None,
     };
@@ -83,7 +84,7 @@ fn t03_candidate_schema_roundtrip() -> Result<(), Box<dyn std::error::Error>> {
     let required = schema["required"]
         .as_array()
         .ok_or("candidate schema omitted required")?;
-    assert!(required.contains(&json!("cue_bindings")));
+    assert!(!required.contains(&json!("cue_bindings")));
     assert!(required.contains(&json!("expected_reuse_note")));
     assert_eq!(
         serde_json::from_value::<AgentCandidateSubmitInput>(value)?,

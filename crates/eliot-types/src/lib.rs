@@ -227,9 +227,9 @@ pub use metrics::{
     SloEvaluation, SloObjective, TelemetryEvent, TelemetryEventKind, TelemetryRollup,
 };
 pub use observability::{
-    MemoryInfluenceTraceWriteInput, MemoryInfluenceTraceWriteResult, OBSERVABILITY_SCHEMA_VERSION,
-    ObservabilityKind, ObservabilityWriteEnvelope, ObservabilityWriteReceipt,
-    ObservabilityWriteStatus, memory_influence_trace_write_input_schema,
+    MemoryInfluenceToolInput, MemoryInfluenceTraceWriteInput, MemoryInfluenceTraceWriteResult,
+    OBSERVABILITY_SCHEMA_VERSION, ObservabilityKind, ObservabilityWriteEnvelope,
+    ObservabilityWriteReceipt, ObservabilityWriteStatus, memory_influence_trace_write_input_schema,
 };
 pub use provider_invocation::{
     ExternalResultCompletenessReceipt, ProviderFailureIncident, ProviderIdentityCheck,
@@ -320,6 +320,10 @@ pub use ul::cue::{
     cue_row_id, normalize_binding, normalize_bindings, ul_token_estimate,
 };
 pub use ul::guard::{TextEncodingViolation, inspect_text_encoding, mojibake};
+pub use ul::injection::{
+    InjectionReceipt, MemoryInfluenceAckInput, ObservedCue, PendingInjectionItem, UlFiredBlock,
+    UlFiredItem,
+};
 pub use ul::normalize::{
     command_pattern, error_signature, normalize_path, normalize_query_tokens, normalize_symbol,
 };

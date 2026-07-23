@@ -1053,7 +1053,7 @@ pub(super) fn task_tool_definitions() -> Vec<Value> {
         tool(
             "eliot_agent_candidate_submit",
             "Eliot Agent Candidate Submit",
-            "Submit bounded task-scoped candidate-only memory with applicability, negative constraints, provenance, and freshness through WriterActor; it never grants completion or canonical authority.",
+            "Submit bounded task-scoped candidate-only memory with applicability, negative constraints, provenance, and freshness through WriterActor. Cue bindings may be explicit or derived from the current session touched set; the write never grants completion or canonical authority.",
             &agent_candidate_schema(),
         ),
         tool(
@@ -1124,7 +1124,7 @@ pub(super) fn core_tool_definitions() -> Vec<Value> {
         tool(
             "eliot_compile_packet_l3",
             "Eliot Compile Packet L3",
-            "Compile a bounded task-specific packet. Material work should include material_frame so current truth, causal path, next action, expected observable and verifier remain explicit.",
+            "Compile a bounded task-specific packet and return a complete frame_stub for material follow-up. Fill frame_stub.expected_observable before resubmitting material work.",
             &compile_packet_schema(),
         ),
         tool(
@@ -1136,7 +1136,7 @@ pub(super) fn core_tool_definitions() -> Vec<Value> {
         tool(
             "eliot_memory_influence_trace",
             "Eliot Memory Influence Trace",
-            "Write an outcome-linked memory influence trace. Packet inclusion without observable delta remains loaded_without_delta.",
+            "Write an outcome-linked memory influence trace from either the full trace or a minimal memory_handle/influence_class acknowledgement. Packet inclusion without observable delta remains loaded_without_delta.",
             &memory_influence_trace_schema(),
         ),
         tool(

@@ -12,15 +12,16 @@ use eliot_types::{
     CanonicalReplayExecutionRecord, CanonicalTraceCompletenessContract, ClaimId, CueIndexRow,
     CueRecordSource, CurrentStateRequest, CurrentStateResponse, EpistemicStatus,
     ExperimentalMetaPolicyCandidate, FetchAtomsL2Request, FetchAtomsL2Response,
-    GraphHealthResponse, HarnessExperimentRecord, LifecycleStatus, MemoryRevision,
-    MemoryStateTransition, MemoryTrajectoryCorrectness, MemoryWriteEnvelope,
-    MetaIsolationRejectionRecord, MetaPolicyExecutionAction, MetaPolicyExecutionReceipt,
-    MinorityPressureRecord, ObservabilityKind, ObservabilityWriteEnvelope,
-    ObservabilityWriteReceipt, ObservabilityWriteStatus, ProjectId, ProjectSequence,
-    RecallL0Request, RecallL0Response, ReplayAudit, ReplayRun, SealedReplayCaseRecord,
-    SealedReplayInputSnapshotRecord, SealedReplaySetRecord, SleepCandidateArtifact,
-    SleepConsolidationBundle, SleepConsolidationRun, SurrealServerConfig, TaintClass, TaskContract,
-    TaskId, ToolObservation, VerificationId, VerificationRun, Visibility, WriteId, WriteReceipt,
+    GraphHealthResponse, HarnessExperimentRecord, InjectionReceipt, LifecycleStatus,
+    MemoryInfluenceTrace, MemoryRevision, MemoryStateTransition, MemoryTrajectoryCorrectness,
+    MemoryWriteEnvelope, MetaIsolationRejectionRecord, MetaPolicyExecutionAction,
+    MetaPolicyExecutionReceipt, MinorityPressureRecord, ObservabilityKind,
+    ObservabilityWriteEnvelope, ObservabilityWriteReceipt, ObservabilityWriteStatus, ProjectId,
+    ProjectSequence, RecallL0Request, RecallL0Response, ReplayAudit, ReplayRun,
+    SealedReplayCaseRecord, SealedReplayInputSnapshotRecord, SealedReplaySetRecord,
+    SleepCandidateArtifact, SleepConsolidationBundle, SleepConsolidationRun, SurrealServerConfig,
+    TaintClass, TaskContract, TaskId, ToolObservation, VerificationId, VerificationRun, Visibility,
+    WriteId, WriteReceipt,
 };
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
@@ -490,6 +491,7 @@ impl CanonicalStore {
             NamedSurqlOp::SchemaMigrate,
             NamedSurqlOp::SchemaMigrateObservability,
             NamedSurqlOp::SchemaMigrateUl,
+            NamedSurqlOp::SchemaMigrateUlDelivery,
         ] {
             value = self.migrate_schema_op(op).await?;
         }
@@ -617,12 +619,66 @@ impl CanonicalStore {
         &self,
         envelope: &ObservabilityWriteEnvelope,
     ) -> Result<ObservabilityWriteReceipt, StoreError> {
+        let injection_payload = if envelope.kind == ObservabilityKind::InjectionReceipt {
+            let receipt: InjectionReceipt = serde_json::from_value(envelope.payload.clone())
+                .map_err(|error| StoreError::Decode(error.to_string()))?;
+            json!({
+                "injection_id_parts": cue_string_parts(&receipt.injection_id),
+                "session_id_parts": vec![receipt.session_id.to_string()],
+                "task_id_parts": receipt
+                    .task_id
+                    .map(|task_id| vec![task_id.to_string()]),
+                "surface_parts": cue_string_parts(&receipt.surface),
+                "item_ref_parts": cue_string_parts(&receipt.item_ref),
+                "render_form_parts": cue_string_parts(&receipt.render_form),
+                "fired_cues": receipt.fired_cues.iter().map(|cue| json!({
+                    "kind": cue.kind,
+                    "value_parts": cue_string_parts(&cue.value),
+                })).collect::<Vec<_>>(),
+                "token_cost": receipt.token_cost,
+                "source_fingerprint_parts": cue_string_parts(&receipt.source_fingerprint),
+                "outcome_parts": cue_string_parts(&receipt.outcome),
+            })
+        } else {
+            Value::Null
+        };
+        let memory_influence_payload = if envelope.kind == ObservabilityKind::MemoryInfluenceTrace {
+            let trace: MemoryInfluenceTrace = serde_json::from_value(envelope.payload.clone())
+                .map_err(|error| StoreError::Decode(error.to_string()))?;
+            json!({
+                "task_id_parts": vec![trace.task_id.to_string()],
+                "session_id_parts": vec![trace.session_id.to_string()],
+                "memory_handle_parts": cue_string_parts(&trace.memory_handle),
+                "packet_id_parts": cue_string_parts(&trace.packet_id),
+                "admission_decision": trace.admission_decision,
+                "inclusion_reason_parts": cue_string_parts(
+                    &trace.inclusion_or_suppression_reason
+                ),
+                "epistemic_status_parts": cue_string_parts(&trace.epistemic_status_at_use),
+                "cited_in_understanding_proof": trace.cited_in_understanding_proof,
+                "action_or_probe_changed": trace.action_or_probe_changed,
+                "write_set_changed": trace.write_set_changed,
+                "verifier_changed": trace.verifier_changed,
+                "repeated_failure_prevented": trace.repeated_failure_prevented,
+                "suppressed_as_stale_or_wrong_scope": trace
+                    .suppressed_as_stale_or_wrong_scope,
+                "downstream_outcome_ref_parts": trace
+                    .downstream_outcome_ref
+                    .as_deref()
+                    .map(cue_string_parts),
+                "influence_class": trace.influence_class,
+            })
+        } else {
+            Value::Null
+        };
         let value = self
             .execute_value(
                 NamedSurqlOp::ApplyObservability,
                 json!({
                     "envelope": envelope,
                     "target_table": envelope.kind.table_name(),
+                    "injection_payload": injection_payload,
+                    "memory_influence_payload": memory_influence_payload,
                 }),
             )
             .await?;
@@ -754,6 +810,31 @@ impl CanonicalStore {
             .cloned()
             .ok_or_else(|| StoreError::Decode("cue source response omitted records".to_owned()))?;
         serde_json::from_value(records).map_err(|error| StoreError::Decode(error.to_string()))
+    }
+
+    pub async fn load_injection_receipts(
+        &self,
+        project_id: ProjectId,
+        session_id: eliot_types::SessionId,
+    ) -> Result<Vec<InjectionReceipt>, StoreError> {
+        let value = self
+            .execute_value(
+                NamedSurqlOp::LoadInjectionReceipts,
+                json!({
+                    "project_id": project_id,
+                    "session_id": session_id,
+                }),
+            )
+            .await?;
+        if value.get("truncated").and_then(Value::as_bool) == Some(true) {
+            return Err(StoreError::PolicyViolation(
+                "injection receipts exceeded the 10,000 session cap".to_owned(),
+            ));
+        }
+        let receipts = value.get("receipts").cloned().ok_or_else(|| {
+            StoreError::Decode("injection receipt response omitted receipts".to_owned())
+        })?;
+        serde_json::from_value(receipts).map_err(|error| StoreError::Decode(error.to_string()))
     }
 
     pub async fn current_state(

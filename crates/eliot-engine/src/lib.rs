@@ -189,7 +189,10 @@ pub use skill_curator::{
     SkillCurationReportService, SkillCuratorMemoryWriter, SkillCuratorRunInput,
     SkillCuratorService, SkillMergeSplitService, SkillPatchService,
 };
-pub use ul::{CueIndexService, FiredMemory, FiringResult, ObservedCue};
+pub use ul::{
+    CueIndexService, FiredMemory, FiringResult, InjectionPlanner, ObservedCue, TouchedCue,
+    TouchedSetRegistry,
+};
 pub use verification::{
     FlakeDetectionService, StatefulDbTestIsolationService, TestCostService, TestInventoryService,
     VerificationDoctorIntegration, VerificationPlannerService, VerificationProfileService,

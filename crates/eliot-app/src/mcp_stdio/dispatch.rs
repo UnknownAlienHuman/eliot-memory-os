@@ -252,6 +252,14 @@ pub(super) async fn call_tool(
         .cloned()
         .unwrap_or_else(|| json!({}));
     let arguments = enforce_bound_tool_scope(context, name, arguments)?;
+    let observed_arguments =
+        state
+            .ul
+            .touched
+            .observe_arguments(context.session_id, name, &arguments);
+    let (ul_project_id, ul_task_id) = ul_scope(context, &arguments);
+    let argument_memory_free_control = name == "eliot_compile_packet_l3"
+        && arguments.get("memory_mode").and_then(Value::as_str) == Some("memory_free_control");
     let cognitive_claims = if state.profile == McpAccessProfile::CognitiveChild {
         let claims = cognitive_principal(state, context.session_id).await?;
         ensure_cognitive_tool_observation_capacity(state, &claims.capability).await?;
@@ -329,6 +337,44 @@ pub(super) async fn call_tool(
                 );
                 structured = serde_json::to_value(response)?;
             }
+            let mut newly_observed = observed_arguments;
+            newly_observed.extend(state.ul.touched.observe_result(
+                context.session_id,
+                name,
+                &structured,
+            ));
+            newly_observed.sort_by(|left, right| {
+                left.kind
+                    .cmp(&right.kind)
+                    .then_with(|| left.value.cmp(&right.value))
+            });
+            newly_observed.dedup();
+            let response_memory_free_control = structured
+                .get("memory_view")
+                .and_then(|memory_view| memory_view.get("mode"))
+                .and_then(Value::as_str)
+                == Some("memory_free_control");
+            let memory_free_control = argument_memory_free_control || response_memory_free_control;
+            if let Some(project_id) = ul_project_id {
+                if !memory_free_control {
+                    state
+                        .ul
+                        .planner
+                        .plan_after_tool(project_id, context.session_id, &newly_observed)
+                        .await?;
+                }
+                state
+                    .ul
+                    .planner
+                    .attach(
+                        project_id,
+                        ul_task_id,
+                        context.session_id,
+                        &mut structured,
+                        memory_free_control,
+                    )
+                    .await?;
+            }
             if let Some(claims) = cognitive_claims.as_ref() {
                 write_cognitive_tool_observation(
                     state,
@@ -367,6 +413,27 @@ pub(super) async fn call_tool(
         write_antigravity_mcp_invocation_receipt(state, name)?;
     }
     tool_success(&structured)
+}
+
+fn ul_scope(
+    context: AuthenticatedRequestContext,
+    arguments: &Value,
+) -> (Option<ProjectId>, Option<TaskId>) {
+    let project_id = context.bound_project_id.or_else(|| {
+        arguments
+            .get("project_id")
+            .or_else(|| arguments.get("project"))
+            .and_then(Value::as_str)
+            .and_then(|value| ProjectId::from_str(value).ok())
+    });
+    let task_id = context.bound_task_id.or_else(|| {
+        arguments
+            .get("task_id")
+            .or_else(|| arguments.get("task"))
+            .and_then(Value::as_str)
+            .and_then(|value| TaskId::from_str(value).ok())
+    });
+    (project_id, task_id)
 }
 
 pub(super) fn string_array_field(value: &Value, field: &str) -> Vec<String> {
@@ -544,7 +611,7 @@ pub(super) async fn dispatch_tool(
             Box::pin(dispatch_understanding_outcome_record(state, arguments)).await?
         }
         "eliot_memory_influence_trace" => {
-            Box::pin(dispatch_memory_influence_trace(state, arguments)).await?
+            Box::pin(dispatch_memory_influence_trace(state, context, arguments)).await?
         }
         "eliot_context_cargo_receipt" => {
             Box::pin(dispatch_context_cargo_receipt(state, arguments)).await?

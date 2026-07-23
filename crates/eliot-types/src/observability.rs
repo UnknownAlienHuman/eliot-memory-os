@@ -1,6 +1,6 @@
 //! Durable non-truth observability contracts.
 
-use crate::{MemoryInfluenceTrace, ProjectId, SessionId, TaskId, WriteId};
+use crate::{MemoryInfluenceAckInput, MemoryInfluenceTrace, ProjectId, SessionId, TaskId, WriteId};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -83,8 +83,15 @@ pub struct MemoryInfluenceTraceWriteResult {
     pub observability_receipt: ObservabilityWriteReceipt,
 }
 
+#[derive(Clone, Debug, JsonSchema, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum MemoryInfluenceToolInput {
+    Full(MemoryInfluenceTraceWriteInput),
+    Ack(MemoryInfluenceAckInput),
+}
+
 #[allow(clippy::expect_used)]
 pub fn memory_influence_trace_write_input_schema() -> Value {
-    serde_json::to_value(schemars::schema_for!(MemoryInfluenceTraceWriteInput))
-        .expect("MemoryInfluenceTraceWriteInput schema must serialize")
+    serde_json::to_value(schemars::schema_for!(MemoryInfluenceToolInput))
+        .expect("MemoryInfluenceToolInput schema must serialize")
 }

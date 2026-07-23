@@ -93,14 +93,15 @@ use eliot_types::{
     ExternalReviewGateDecisionKind, ExternalReviewPacket, ExternalReviewRequest,
     ExternalReviewRole, FetchAtomsL2Request, FetchAtomsL2Response, ForgettingOperator,
     ForgettingReason, LatencyHistogram, LifecycleStatus, MailboxMessageId, MailboxMessageKind,
-    MailboxRecipient, MaintenanceJobKind, MemoryCurationCandidate, MemoryCurationCorpusProfile,
-    MemoryCurationFindingKind, MemoryCurationPreviewRequest, MemoryCurationPreviewResponse,
-    MemoryExposurePolicy, MemoryInfluenceReport, MemoryInfluenceTrace,
-    MemoryInfluenceTraceWriteInput, MemoryInfluenceTraceWriteResult, MemoryInspectorView,
-    MemoryLifecyclePacketView, MemoryLifecycleState, MemoryNeed, MemoryRevision,
-    MemoryWriteEnvelope, MetaCandidateChangeClass, MetaExperimentDecision, MetaIsolationFence,
-    MetaPolicyAuthorization, MetaPolicyExecutionAction, MetricDefinition, MetricSample,
-    MetricWindow, MinorityPressureRecord, MinorityPressureStatus, NegativeTransferHarm,
+    MailboxRecipient, MaintenanceJobKind, MaterialPacketFrame, MemoryAdmissionDecision,
+    MemoryCurationCandidate, MemoryCurationCorpusProfile, MemoryCurationFindingKind,
+    MemoryCurationPreviewRequest, MemoryCurationPreviewResponse, MemoryExposurePolicy,
+    MemoryInfluenceClass, MemoryInfluenceReport, MemoryInfluenceToolInput, MemoryInfluenceTrace,
+    MemoryInfluenceTraceWriteResult, MemoryInspectorView, MemoryLifecyclePacketView,
+    MemoryLifecycleState, MemoryNeed, MemoryRevision, MemoryWriteEnvelope,
+    MetaCandidateChangeClass, MetaExperimentDecision, MetaIsolationFence, MetaPolicyAuthorization,
+    MetaPolicyExecutionAction, MetricDefinition, MetricSample, MetricWindow,
+    MinorityPressureRecord, MinorityPressureStatus, NegativeTransferHarm,
     OPERATOR_CONTRACT_MANIFEST, OPERATOR_IPC_PROTOCOL_VERSION, OPERATOR_SCHEMA_VERSION,
     OperationJob, OperationJobState, OperatorActionView, OperatorCommand, OperatorCommandReceipt,
     OperatorControlRequest, OperatorFieldView, OperatorProjectionFilter, OperatorProjectionKind,
@@ -823,9 +824,9 @@ impl McpDaemon {
         let root = runtime_root(config_path);
         let pipe_name = instance.pipe_name();
         let store = CanonicalStore::new(config.db.surreal.clone());
-        let ul = Arc::new(UlRuntime::new(store.clone()));
         let wal = ControlWal::open(&config.control_wal)?;
         let (writer, actor) = WriterActor::channel(wal, store.clone(), &WriterConfig::default());
+        let ul = Arc::new(UlRuntime::new(store.clone(), writer.clone()));
         let cursor_signing_key = load_or_create_operator_cursor_signing_key(instance)?;
         let cognitive_runtime = Arc::new(CognitiveRuntimePaths {
             runtime_dir: instance.runtime_dir(),

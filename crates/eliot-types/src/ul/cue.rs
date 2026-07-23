@@ -1,7 +1,7 @@
 use crate::{ProjectId, inspect_text_encoding};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use serde_json::json;
+use serde_json::{Value, json};
 use std::collections::BTreeMap;
 
 use super::normalize::{normalize_path, normalize_symbol};
@@ -205,6 +205,8 @@ pub struct CueRecordSource {
     pub record_ref: String,
     pub record_kind: String,
     pub preview_text: String,
+    #[serde(default)]
+    pub payload: Option<Value>,
     pub cue_bindings: Vec<CueBinding>,
     pub negative_memory: bool,
     pub lifecycle: String,

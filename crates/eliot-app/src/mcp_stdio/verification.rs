@@ -39,6 +39,18 @@ pub(super) async fn dispatch_agent_candidate_submit(
     if let Some(curation) = input.curation.as_ref() {
         validate_candidate_curation(curation)?;
     }
+    let binding_source;
+    if input.cue_bindings.is_empty() {
+        if input.auto_bind == Some(false) || state.profile == McpAccessProfile::CognitiveChild {
+            return Err(invalid_cue_input_message(
+                "CUE_BINDING_REQUIRED: provide cue_bindings or permit automatic binding",
+            ));
+        }
+        input.cue_bindings = auto_candidate_bindings(state, context, &input)?;
+        binding_source = "auto";
+    } else {
+        binding_source = "explicit";
+    }
     let submitted_bindings = input.cue_bindings.clone();
     let normalized_bindings =
         eliot_types::normalize_bindings(input.cue_bindings, state.root.to_str())
@@ -132,6 +144,7 @@ pub(super) async fn dispatch_agent_candidate_submit(
                 "controller_reconciliation_required": true,
                 "existing_claim_id": claim.claim_id,
                 "at_revision": existing.at_revision,
+                "cue_binding_summary": cue_binding_summary(binding_source, &input.cue_bindings),
                 "reason": "an active candidate with the same normalized topic and statement already exists; no duplicate write was committed"
             }));
         }
@@ -249,6 +262,7 @@ pub(super) async fn dispatch_agent_candidate_submit(
         "controller_reconciliation_required": true,
         "write_receipt": receipt,
         "cue_projection_status": cue_projection_status,
+        "cue_binding_summary": cue_binding_summary(binding_source, &input.cue_bindings),
         "cognitive_binding": cognitive_claims.map(|claims| json!({
             "run_id": claims.capability.run_id,
             "call_id": claims.capability.call_id,
@@ -260,6 +274,88 @@ pub(super) async fn dispatch_agent_candidate_submit(
             "attempt_receipt": claims.attempt_receipt,
         }))
     }))
+}
+
+fn auto_candidate_bindings(
+    state: &McpState,
+    context: AuthenticatedRequestContext,
+    input: &AgentCandidateSubmitInput,
+) -> Result<Vec<eliot_types::CueBinding>> {
+    let recent = state.ul.touched.recent_cues(context.session_id, 16);
+    let corpus = [
+        input.topic.as_str(),
+        input.statement.as_str(),
+        &input.provenance_refs.join(" "),
+    ]
+    .join(" ")
+    .chars()
+    .flat_map(char::to_lowercase)
+    .collect::<String>();
+    let mut selected = Vec::new();
+    for cue in &recent {
+        let value = cue
+            .value
+            .chars()
+            .flat_map(char::to_lowercase)
+            .collect::<String>();
+        if !value.is_empty() && corpus.contains(&value) {
+            selected.push((cue.clone(), eliot_types::CueStrength::Primary));
+        }
+    }
+    if selected.is_empty()
+        && let Some(cue) = recent.iter().find(|cue| {
+            matches!(
+                cue.kind,
+                eliot_types::CueKind::FilePath | eliot_types::CueKind::Symbol
+            )
+        })
+    {
+        selected.push((cue.clone(), eliot_types::CueStrength::Primary));
+    }
+    for cue in recent {
+        if selected.len() >= 5 {
+            break;
+        }
+        if !selected.iter().any(|(selected, _)| selected == &cue) {
+            selected.push((cue, eliot_types::CueStrength::Secondary));
+        }
+    }
+    if selected.is_empty() {
+        return Err(invalid_cue_input_message(
+            "CUE_BINDING_REQUIRED: the session touched set has no reusable cue",
+        ));
+    }
+    selected
+        .into_iter()
+        .take(5)
+        .map(|(cue, strength)| {
+            Ok(eliot_types::CueBinding {
+                match_mode: match cue.kind {
+                    eliot_types::CueKind::DirPath => eliot_types::CueMatchMode::Prefix,
+                    eliot_types::CueKind::ErrorSignature => eliot_types::CueMatchMode::Signature,
+                    _ => eliot_types::CueMatchMode::Exact,
+                },
+                cue_kind: cue.kind,
+                cue_value: cue.value,
+                strength,
+                expected_reuse_note: input.expected_reuse_note.clone(),
+            })
+        })
+        .collect()
+}
+
+fn cue_binding_summary(source: &str, bindings: &[eliot_types::CueBinding]) -> Value {
+    json!({
+        "source": source,
+        "primary": bindings
+            .iter()
+            .filter(|binding| binding.strength == eliot_types::CueStrength::Primary)
+            .count(),
+        "secondary": bindings
+            .iter()
+            .filter(|binding| binding.strength == eliot_types::CueStrength::Secondary)
+            .count()
+    })
 }
 
 fn invalid_cue_input_message(reason: &str) -> anyhow::Error {

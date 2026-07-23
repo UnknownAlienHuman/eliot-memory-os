@@ -1,6 +1,61 @@
 BEGIN TRANSACTION;
 
 LET $receipt_id = $envelope.write_id;
+LET $stored_payload = IF $envelope.kind = 'injection_receipt' {
+  {
+    injection_id: array::join($injection_payload.injection_id_parts, ':'),
+    session_id: array::join($injection_payload.session_id_parts, ':'),
+    task_id: IF $injection_payload.task_id_parts = NONE
+      OR $injection_payload.task_id_parts = NULL {
+      NONE
+    } ELSE {
+      array::join($injection_payload.task_id_parts, ':')
+    },
+    surface: array::join($injection_payload.surface_parts, ':'),
+    item_ref: array::join($injection_payload.item_ref_parts, ':'),
+    render_form: array::join($injection_payload.render_form_parts, ':'),
+    fired_cues: $injection_payload.fired_cues.map(|$cue| {
+      RETURN {
+        kind: <string> $cue.kind,
+        value: array::join($cue.value_parts, ':')
+      };
+    }),
+    token_cost: <int> $injection_payload.token_cost,
+    source_fingerprint: array::join($injection_payload.source_fingerprint_parts, ':'),
+    outcome: array::join($injection_payload.outcome_parts, ':')
+  }
+} ELSE IF $envelope.kind = 'memory_influence_trace' {
+  {
+    task_id: array::join($memory_influence_payload.task_id_parts, ':'),
+    session_id: array::join($memory_influence_payload.session_id_parts, ':'),
+    memory_handle: array::join($memory_influence_payload.memory_handle_parts, ':'),
+    packet_id: array::join($memory_influence_payload.packet_id_parts, ':'),
+    admission_decision: <string> $memory_influence_payload.admission_decision,
+    inclusion_or_suppression_reason: array::join(
+      $memory_influence_payload.inclusion_reason_parts,
+      ':'
+    ),
+    epistemic_status_at_use: array::join(
+      $memory_influence_payload.epistemic_status_parts,
+      ':'
+    ),
+    cited_in_understanding_proof: <bool> $memory_influence_payload.cited_in_understanding_proof,
+    action_or_probe_changed: <bool> $memory_influence_payload.action_or_probe_changed,
+    write_set_changed: <bool> $memory_influence_payload.write_set_changed,
+    verifier_changed: <bool> $memory_influence_payload.verifier_changed,
+    repeated_failure_prevented: <bool> $memory_influence_payload.repeated_failure_prevented,
+    suppressed_as_stale_or_wrong_scope: <bool> $memory_influence_payload.suppressed_as_stale_or_wrong_scope,
+    downstream_outcome_ref: IF $memory_influence_payload.downstream_outcome_ref_parts = NONE
+      OR $memory_influence_payload.downstream_outcome_ref_parts = NULL {
+      NONE
+    } ELSE {
+      array::join($memory_influence_payload.downstream_outcome_ref_parts, ':')
+    },
+    influence_class: <string> $memory_influence_payload.influence_class
+  }
+} ELSE {
+  $envelope.payload
+};
 LET $existing_receipt =
   SELECT * FROM ONLY type::record('observability_receipt', $receipt_id);
 LET $result = IF $existing_receipt != NONE {
@@ -36,7 +91,7 @@ LET $result = IF $existing_receipt != NONE {
     project_id: $envelope.project_id,
     task_id: $envelope.task_id,
     session_id: $envelope.session_id,
-    payload: $envelope.payload,
+    payload: $stored_payload,
     write_id: $envelope.write_id,
     input_hash: $envelope.input_hash,
     created_at: $envelope.created_at

@@ -64,7 +64,10 @@ pub struct AgentCandidateSubmitInput {
     pub negative_constraints: Vec<String>,
     pub provenance_refs: Vec<String>,
     pub freshness_rule: String,
+    #[serde(default)]
     pub cue_bindings: Vec<CueBinding>,
+    #[serde(default)]
+    pub auto_bind: Option<bool>,
     pub expected_reuse_note: String,
     #[serde(default)]
     pub curation: Option<AgentCandidateCurationInput>,
