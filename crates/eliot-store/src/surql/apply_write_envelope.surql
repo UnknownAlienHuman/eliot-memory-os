@@ -344,12 +344,20 @@ FOR $failure IN $envelope.failures {
   };
 };
 
-FOR $relation IN $envelope.relations {
-  UPSERT type::record(<string> $relation.relation_type, string::concat($envelope.write_id, '-', $relation.from, '-', $relation.to)) CONTENT {
+FOR $relation IN $relation_payloads {
+  LET $relation_from = <string> array::join(
+    $relation.from_fragments.map(|$fragment| <string> $fragment),
+    ''
+  );
+  LET $relation_to = <string> array::join(
+    $relation.to_fragments.map(|$fragment| <string> $fragment),
+    ''
+  );
+  UPSERT type::record(<string> $relation.relation_type, string::concat($envelope.write_id, '-', $relation_from, '-', $relation_to)) CONTENT {
     relation_type: $relation.relation_type,
     project_id: $envelope.project_id,
-    from: $relation.from,
-    to: $relation.to,
+    from: $relation_from,
+    to: $relation_to,
     write_id: $envelope.write_id,
     memory_revision: $revision,
     project_sequence: $sequence,
@@ -390,7 +398,7 @@ UPSERT type::record('write_receipt', $receipt_id) CONTENT {
     $envelope.claims.*.claim_id,
     $envelope.verification_runs.*.verification_id
   ),
-  created_relations: $envelope.relations.*.relation_type,
+  created_relations: $relation_payloads.*.relation_type,
   weak_records: $envelope.claims[WHERE status = 'candidate'].*.claim_id,
   rejected_reason: NONE,
   db_operation_id: $envelope.operation_id,

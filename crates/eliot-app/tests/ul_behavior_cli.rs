@@ -3,9 +3,9 @@ mod support;
 
 use eliot_engine::{GitMiningService, ModuleCardService};
 use eliot_types::{
-    AgentId, CommandContext, CueBinding, CueKind, CueMatchMode, CueStrength, FailureRecordCommand,
-    LifecycleStatus, ProjectId, RelationInput, RelationType, SemanticCommand, TaintClass,
-    UlArtifact, UlArtifactBatchRecordCommand, Visibility, WriteId,
+    AgentId, CoChangeEdge, CommandContext, CueBinding, CueKind, CueMatchMode, CueStrength,
+    FailureRecordCommand, LifecycleStatus, ProjectId, RelationInput, RelationType, SemanticCommand,
+    TaintClass, UlArtifact, UlArtifactBatchRecordCommand, Visibility, WriteId, WriteStatus,
 };
 use serde_json::json;
 use std::collections::BTreeMap;
@@ -113,6 +113,78 @@ fn t05_touching_hotspot_fires_card_and_danger() -> TestResult {
             .as_str()
             .is_some_and(|line| line.starts_with("PURPOSE:"))
     );
+    Ok(())
+}
+
+#[test]
+fn h6_co_change_is_reachable_from_canonical_file_handle() -> TestResult {
+    let _guard = test_guard();
+    if rerun_with_credential_gate("h6_co_change_is_reachable_from_canonical_file_handle")? {
+        return Ok(());
+    }
+    let mut harness = Harness::start("h6-file-handle")?;
+    let project_id = ProjectId::new_v7();
+    let receipt = harness.seed(&SemanticCommand::UlArtifactBatchRecord(
+        UlArtifactBatchRecordCommand {
+            context: ul_context(project_id),
+            artifacts: vec![UlArtifact::CoChangeEdge(CoChangeEdge {
+                edge_id: "h6-direct-edge".to_owned(),
+                project_id,
+                path_a: "src/a.rs".to_owned(),
+                path_b: "src/b.rs".to_owned(),
+                support: 1,
+                confidence_ab: 1.0,
+                confidence_ba: 1.0,
+                last_cochange_at_unix: 0,
+                static_edge_exists: None,
+                mining_run_ref: "h6-direct-seed".to_owned(),
+                cue_bindings: Vec::new(),
+            })],
+            relations: vec![RelationInput {
+                relation_type: RelationType::CoChange,
+                from: "file:src/a.rs".to_owned(),
+                to: "file:src/b.rs".to_owned(),
+            }],
+        },
+    ))?;
+    assert_eq!(receipt.status, WriteStatus::Committed);
+    assert!(
+        receipt
+            .created_relations
+            .iter()
+            .any(|kind| kind == "co_change")
+    );
+    let exact = harness.client.tool_call(
+        510,
+        "eliot_fetch_l2",
+        &json!({
+            "project_id": project_id,
+            "handles": ["file:src/a.rs"]
+        }),
+    )?;
+    let relations = exact["relations"]
+        .as_array()
+        .ok_or("L2 relations missing")?;
+    assert!(
+        relations.iter().any(|relation| {
+            relation["relation_type"] == json!(RelationType::CoChange)
+                && relation["from"] == "file:src/a.rs"
+                && relation["to"] == "file:src/b.rs"
+        }),
+        "canonical co-change relation missing: {relations:#?}"
+    );
+    assert_eq!(exact["requested_handles"], json!(["file:src/a.rs"]));
+    assert_eq!(exact["returned_handles"], json!(["file:src/a.rs"]));
+    assert_eq!(exact["missing_handles"], json!([]));
+    assert!(relations.iter().all(|relation| {
+        relation["relation_type"] != json!(RelationType::CoChange)
+            || (relation["from"]
+                .as_str()
+                .is_some_and(|value| value.starts_with("file:"))
+                && relation["to"]
+                    .as_str()
+                    .is_some_and(|value| value.starts_with("file:")))
+    }));
     Ok(())
 }
 

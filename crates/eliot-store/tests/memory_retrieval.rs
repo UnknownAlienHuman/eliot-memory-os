@@ -100,6 +100,56 @@ fn l2_request(project_id: ProjectId, handles: Vec<String>) -> FetchAtomsL2Reques
 }
 
 #[tokio::test]
+async fn file_selector_returns_incident_relation_and_is_restart_deterministic()
+-> Result<(), Box<dyn Error>> {
+    let Some(config) = isolated_config() else {
+        return Ok(());
+    };
+    let store = CanonicalStore::new(config.clone());
+    store.migrate_schema().await?;
+
+    let project_id = ProjectId::new_v7();
+    let relation = RelationInput {
+        relation_type: RelationType::CoChange,
+        from: "file:src/a.rs".to_owned(),
+        to: "file:src/b.rs".to_owned(),
+    };
+    let receipt = store
+        .apply_write_envelope(&retrieval_envelope(
+            project_id,
+            TaskId::new_v7(),
+            Vec::new(),
+            Vec::new(),
+            vec![relation.clone()],
+        )?)
+        .await?;
+    assert_eq!(receipt.status, WriteStatus::Committed);
+    assert!(
+        receipt
+            .created_relations
+            .iter()
+            .any(|kind| kind == "co_change")
+    );
+    let request = l2_request(project_id, vec!["file:src/a.rs".to_owned()]);
+    let first = store.fetch_atoms_l2(&request).await?;
+    assert_eq!(first.requested_handles, vec!["file:src/a.rs"]);
+    assert_eq!(first.returned_handles, vec!["file:src/a.rs"]);
+    assert!(first.missing_handles.is_empty());
+    assert_eq!(first.relations.len(), 1);
+    assert_eq!(first.relations[0].relation_type, relation.relation_type);
+    assert_eq!(first.relations[0].from, relation.from);
+    assert_eq!(first.relations[0].to, relation.to);
+
+    let restarted = CanonicalStore::new(config);
+    let after_restart = restarted.fetch_atoms_l2(&request).await?;
+    assert_eq!(
+        serde_json::to_value(after_restart)?,
+        serde_json::to_value(first)?
+    );
+    Ok(())
+}
+
+#[tokio::test]
 #[allow(clippy::too_many_lines)]
 async fn query_aware_l0_and_exact_l2_are_bounded_scoped_and_restart_deterministic()
 -> Result<(), Box<dyn Error>> {

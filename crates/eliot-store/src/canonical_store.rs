@@ -91,6 +91,7 @@ pub struct CanonicalSecretScanReport {
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 enum L2HandleKind {
     Any,
+    File,
     Claim,
     Evidence,
     Verification,
@@ -117,6 +118,7 @@ struct ExactL2Bindings {
 
 fn parse_l2_selector(raw: &str) -> (L2HandleKind, &str, &'static str) {
     for (prefix, kind, canonical) in [
+        ("file:", L2HandleKind::File, "file:"),
         ("claim:", L2HandleKind::Claim, "claim:"),
         ("claim_card:", L2HandleKind::Claim, "claim:"),
         ("evidence:", L2HandleKind::Evidence, "evidence:"),
@@ -258,7 +260,11 @@ fn l2_selector_identities(selectors: &[L2Selector], kind: L2HandleKind) -> Vec<S
 fn l2_relation_identities(selectors: &[L2Selector]) -> Vec<String> {
     let mut relation_ids = BTreeSet::new();
     for selector in selectors {
+        relation_ids.insert(selector.public_handle.clone());
         relation_ids.insert(selector.identity.clone());
+        if selector.kind == L2HandleKind::File {
+            continue;
+        }
         for prefix in [
             "claim:",
             "claim_card:",
@@ -385,6 +391,13 @@ fn resolved_exact_l2_handles(response: &FetchAtomsL2Response) -> HashSet<(L2Hand
             .iter()
             .map(|record| (L2HandleKind::Failure, record.fingerprint.clone())),
     );
+    for relation in &response.relations {
+        for endpoint in [&relation.from, &relation.to] {
+            if let Some(path) = endpoint.strip_prefix("file:") {
+                resolved.insert((L2HandleKind::File, path.to_owned()));
+            }
+        }
+    }
     resolved
 }
 
@@ -611,12 +624,14 @@ impl CanonicalStore {
         envelope: &MemoryWriteEnvelope,
     ) -> Result<WriteReceipt, StoreError> {
         let canonical_payloads = canonical_payloads(envelope)?;
+        let relation_payloads = relation_payloads(envelope);
         let value = self
             .execute_value(
                 NamedSurqlOp::ApplyWriteEnvelope,
                 json!({
                     "envelope": envelope,
                     "canonical_payloads": canonical_payloads,
+                    "relation_payloads": relation_payloads,
                 }),
             )
             .await?;
@@ -1991,6 +2006,20 @@ fn canonical_payloads(envelope: &MemoryWriteEnvelope) -> Result<Vec<Value>, Stor
                 "action_fragments": canonical_field_fragments(body, "action"),
                 "cue_preview_fragments": canonical_field_fragments(body, "body_md"),
             }))
+        })
+        .collect()
+}
+
+fn relation_payloads(envelope: &MemoryWriteEnvelope) -> Vec<Value> {
+    envelope
+        .relations
+        .iter()
+        .map(|relation| {
+            json!({
+                "relation_type": relation.relation_type,
+                "from_fragments": string_fragments(&relation.from),
+                "to_fragments": string_fragments(&relation.to),
+            })
         })
         .collect()
 }
