@@ -274,11 +274,10 @@ impl Harness {
             std::process::id()
         ));
         fs::create_dir_all(&root)?;
-        fs::write(root.join("surreal-root.txt"), "ul-t06-test-secret")?;
+        let password = format!("ul-t06-test-secret-{}-{nonce}", std::process::id());
+        fs::write(root.join("surreal-root.txt"), &password)?;
         let surreal_exe = pinned_surreal_exe()?;
-        let port = test_port()?;
-        let surreal = start_surreal(&surreal_exe, port)?;
-        wait_for_tcp(port, Duration::from_secs(20))?;
+        let (surreal, port) = start_surreal(&surreal_exe, &password)?;
 
         let mut config = GovernorConfig::default();
         config.db.surreal.exe = slash(&surreal_exe);
@@ -378,10 +377,24 @@ impl Drop for OwnedChild {
     }
 }
 
-fn start_surreal(exe: &Path, port: u16) -> TestResult<OwnedChild> {
+fn start_surreal(exe: &Path, password: &str) -> TestResult<(OwnedChild, u16)> {
+    for port in 8700..=8799 {
+        let Ok(reservation) = std::net::TcpListener::bind(("127.0.0.1", port)) else {
+            continue;
+        };
+        drop(reservation);
+        let mut child = spawn_surreal(exe, password, port)?;
+        if wait_for_tcp(&mut child, port, Duration::from_secs(20))? {
+            return Ok((child, port));
+        }
+    }
+    Err("SurrealDB could not claim a UL-06 test port in 8700-8799".into())
+}
+
+fn spawn_surreal(exe: &Path, password: &str, port: u16) -> TestResult<OwnedChild> {
     let child = Command::new(exe)
         .env("SURREAL_USER", "root")
-        .env("SURREAL_PASS", "ul-t06-test-secret")
+        .env("SURREAL_PASS", password)
         .arg("start")
         .arg("--bind")
         .arg(format!("127.0.0.1:{port}"))
@@ -413,20 +426,26 @@ fn pinned_surreal_exe() -> TestResult<PathBuf> {
     Ok(path)
 }
 
-fn test_port() -> TestResult<u16> {
-    for port in 8700..=8799 {
-        if std::net::TcpListener::bind(("127.0.0.1", port)).is_ok() {
-            return Ok(port);
-        }
-    }
-    Err("no free UL-06 test port in 8700-8799".into())
-}
-
-fn wait_for_tcp(port: u16, timeout: Duration) -> TestResult {
+fn wait_for_tcp(surreal: &mut OwnedChild, port: u16, timeout: Duration) -> TestResult<bool> {
     let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
+        if surreal
+            .0
+            .as_mut()
+            .ok_or("SurrealDB child missing during startup")?
+            .try_wait()?
+            .is_some()
+        {
+            return Ok(false);
+        }
         if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
-            return Ok(());
+            std::thread::sleep(Duration::from_millis(50));
+            return Ok(surreal
+                .0
+                .as_mut()
+                .ok_or("SurrealDB child missing after startup")?
+                .try_wait()?
+                .is_none());
         }
         std::thread::sleep(Duration::from_millis(25));
     }
