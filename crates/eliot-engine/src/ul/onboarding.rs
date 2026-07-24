@@ -12,7 +12,7 @@ use eliot_types::{
     CoChangeEdge, ConceptKind, ConceptNode, CueBinding, CueKind, CueMatchMode, CueRecordSource,
     CueStrength, HotspotScore, ManifestPackage, MiningRun, ModuleCard, OnboardingCheckpoint,
     OnboardingReport, OnboardingStage, OnboardingTestHook, ProjectId, UlArtifact,
-    normalize_bindings,
+    normalize_bindings, path_matches_boundary,
 };
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
@@ -1424,14 +1424,6 @@ fn truncate_bytes(value: &str, max_bytes: usize) -> String {
         end = end.saturating_sub(1);
     }
     value[..end].trim_end().to_owned()
-}
-
-fn path_matches_boundary(path: &str, boundary: &str) -> bool {
-    boundary == "."
-        || path == boundary
-        || path
-            .strip_prefix(boundary.trim_end_matches('/'))
-            .is_some_and(|suffix| suffix.starts_with('/'))
 }
 
 fn common_prefix_components(left: &str, right: &str) -> usize {

@@ -338,6 +338,7 @@ pub use ul::injection::{
 pub use ul::measurement::{UlLedgerDelta, UlTaskLedger, UlUseReport};
 pub use ul::normalize::{
     command_pattern, error_signature, normalize_path, normalize_query_tokens, normalize_symbol,
+    path_matches_boundary,
 };
 pub use ul::onboarding::{
     ManifestPackage, OnboardingCheckpoint, OnboardingJob, OnboardingReport, OnboardingStage,

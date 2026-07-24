@@ -2,6 +2,7 @@ use super::capsule_freshness;
 use eliot_types::{
     CapsuleFreshness, ConceptNode, CoverageClass, CueKind, CueRecordSource, DangerPath,
     HotspotScore, ModuleCard, SubsystemCapsule, SubsystemCoverage, UlMetacognitionView,
+    path_matches_boundary,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
@@ -268,13 +269,4 @@ fn concept_for_path<'a>(concepts: &'a [ConceptNode], path: &str) -> Option<&'a C
                 .max()
                 .unwrap_or_default()
         })
-}
-
-fn path_matches_boundary(path: &str, boundary: &str) -> bool {
-    let path = path.replace('\\', "/");
-    let boundary = boundary.replace('\\', "/");
-    path == boundary
-        || path
-            .strip_prefix(boundary.trim_end_matches('/'))
-            .is_some_and(|suffix| suffix.starts_with('/'))
 }

@@ -1,11 +1,13 @@
 #[path = "support/ul_t04.rs"]
 mod support;
 
-use eliot_engine::{CalibrationService, CapsuleEvidence, PyramidBuilder, resolve_prediction};
+use eliot_engine::{
+    CalibrationService, CapsuleEvidence, MetacognitionService, PyramidBuilder, resolve_prediction,
+};
 use eliot_types::{
-    AgentId, CapsuleBuild, CommandContext, ConceptKind, ConceptNode, CueBinding, CueKind,
-    CueMatchMode, CueStrength, DependencyManifest, InjectionReceipt, LifecycleStatus, ModuleCard,
-    ObservabilityKind, PredictionExpectation, PredictionRecord, PredictionResolution,
+    AgentId, CapsuleBuild, CommandContext, ConceptKind, ConceptNode, CoverageClass, CueBinding,
+    CueKind, CueMatchMode, CueStrength, DependencyManifest, InjectionReceipt, LifecycleStatus,
+    ModuleCard, ObservabilityKind, PredictionExpectation, PredictionRecord, PredictionResolution,
     ProjectCharter, ProjectId, PyramidBuildStatus, PyramidTargetKind, RelationInput, RelationType,
     SemanticCommand, SessionId, SubsystemCapsule, SystemMap, TaintClass, TaskId, UlArtifact,
     UlArtifactBatchRecordCommand, VerificationResult, Visibility, WriteId, ul_token_estimate,
@@ -199,11 +201,33 @@ fn h3_custom_root_freshness_and_dot_boundary_reach_runtime_packet() -> TestResul
         project_root.path(),
         &root_concept,
         &CapsuleEvidence {
-            module_cards: vec![module_card],
+            module_cards: vec![module_card.clone()],
             ..CapsuleEvidence::default()
         },
         None,
     )?;
+    assert!(
+        promoted
+            .artifact
+            .body_md
+            .contains("PURPOSE: exercise a custom project root [file:src/lib.rs]")
+    );
+    let metacognition = MetacognitionService::evaluate(
+        project_root.path(),
+        std::slice::from_ref(&root_concept),
+        std::slice::from_ref(&promoted.artifact),
+        std::slice::from_ref(&module_card),
+        &[],
+        &[],
+        &["src/lib.rs".to_owned()],
+    );
+    assert!(metacognition.novel_paths.is_empty());
+    let (coverage, _) = MetacognitionService::coverage_for_paths(
+        std::slice::from_ref(&root_concept),
+        &metacognition,
+        &["src/lib.rs".to_owned()],
+    );
+    assert_ne!(coverage, CoverageClass::Blind);
     let expected_root = project_root
         .path()
         .canonicalize()?
