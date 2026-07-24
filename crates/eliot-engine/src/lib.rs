@@ -195,10 +195,12 @@ pub use ul::{
     MetacognitionService, ModuleCardService, ObservedCue, OnboardingService, PredictionCapture,
     PredictionCaptureInput, PredictionService, PromotedPyramid, PyramidBuilder, PyramidDecision,
     PyramidDependency, PyramidFailure, TouchedCue, TouchedSetRegistry, UlArtifactWriteReport,
-    UlArtifactWriterService, UlLedgerAccumulator, UlLedgerService, UlToolMeasurement,
-    canonical_project_root, capsule_freshness, failure_bindings_by_path, is_mutation_tool,
-    is_read_class_tool, normalize_verifier, parse_expected_observable, prediction_id,
-    render_capsule, resolve_prediction,
+    UlArtifactWriterService, UlFieldValidationLoad, UlLedgerAccumulator, UlLedgerService,
+    UlReadinessService, UlToolMeasurement, canonical_project_root, capsule_freshness,
+    evaluate_task08_readiness, failure_bindings_by_path, field_validation_manifest_path,
+    is_mutation_tool, is_read_class_tool, load_field_validation_manifest, normalize_verifier,
+    parse_expected_observable, prediction_id, render_capsule, resolve_prediction,
+    summarize_field_evidence,
 };
 pub use verification::{
     FlakeDetectionService, StatefulDbTestIsolationService, TestCostService, TestInventoryService,

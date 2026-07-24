@@ -150,6 +150,84 @@ async fn file_selector_returns_incident_relation_and_is_restart_deterministic()
 }
 
 #[tokio::test]
+async fn fv1_d_readiness_graph_inventory_is_project_scoped() -> Result<(), Box<dyn Error>> {
+    let Some(config) = isolated_config() else {
+        return Ok(());
+    };
+    let store = CanonicalStore::new(config);
+    store.migrate_schema().await?;
+    let project_a = ProjectId::new_v7();
+    let project_b = ProjectId::new_v7();
+    let relations_a = vec![
+        RelationInput {
+            relation_type: RelationType::CoChange,
+            from: "file:a/src/lib.rs".to_owned(),
+            to: "file:a/src/main.rs".to_owned(),
+        },
+        RelationInput {
+            relation_type: RelationType::CardCovers,
+            from: "card:a".to_owned(),
+            to: "file:a/src/lib.rs".to_owned(),
+        },
+        RelationInput {
+            relation_type: RelationType::ConceptImplementedBy,
+            from: "concept:a".to_owned(),
+            to: "file:a/src/lib.rs".to_owned(),
+        },
+        RelationInput {
+            relation_type: RelationType::ConceptDependsOn,
+            from: "concept:a".to_owned(),
+            to: "concept:a-dependency".to_owned(),
+        },
+        RelationInput {
+            relation_type: RelationType::CapsuleCovers,
+            from: "capsule:a".to_owned(),
+            to: "concept:a".to_owned(),
+        },
+    ];
+    let relations_b = vec![
+        RelationInput {
+            relation_type: RelationType::CoChange,
+            from: "file:b/src/lib.rs".to_owned(),
+            to: "file:b/src/main.rs".to_owned(),
+        },
+        RelationInput {
+            relation_type: RelationType::CoChange,
+            from: "file:b/src/lib.rs".to_owned(),
+            to: "file:b/src/other.rs".to_owned(),
+        },
+    ];
+    for (project_id, relations) in [(project_a, relations_a), (project_b, relations_b)] {
+        let receipt = store
+            .apply_write_envelope(&retrieval_envelope(
+                project_id,
+                TaskId::new_v7(),
+                Vec::new(),
+                Vec::new(),
+                relations,
+            )?)
+            .await?;
+        assert_eq!(receipt.status, WriteStatus::Committed);
+    }
+
+    let a = store.load_ul_readiness_inventory(project_a).await?;
+    let b = store.load_ul_readiness_inventory(project_b).await?;
+    assert_eq!(a.co_change_edges, 1);
+    assert_eq!(a.card_covers_edges, 1);
+    assert_eq!(a.concept_implemented_by_edges, 1);
+    assert_eq!(a.concept_depends_on_edges, 1);
+    assert_eq!(a.capsule_covers_edges, 1);
+    assert_eq!(a.total_ul_edges, 5);
+    assert_eq!(b.co_change_edges, 2);
+    assert_eq!(b.card_covers_edges, 0);
+    assert_eq!(b.concept_implemented_by_edges, 0);
+    assert_eq!(b.concept_depends_on_edges, 0);
+    assert_eq!(b.capsule_covers_edges, 0);
+    assert_eq!(b.total_ul_edges, 2);
+    Ok(())
+}
+
+#[tokio::test]
 #[allow(clippy::too_many_lines)]
 async fn query_aware_l0_and_exact_l2_are_bounded_scoped_and_restart_deterministic()
 -> Result<(), Box<dyn Error>> {

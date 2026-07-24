@@ -1295,6 +1295,27 @@ impl CanonicalStore {
         decode_value(NamedSurqlOp::LoadUlMetrics, value)
     }
 
+    pub async fn load_ul_readiness_inventory(
+        &self,
+        project_id: ProjectId,
+    ) -> Result<eliot_types::UlGraphInventory, StoreError> {
+        let value = self
+            .execute_value(
+                NamedSurqlOp::LoadUlReadiness,
+                json!({ "project_id": project_id }),
+            )
+            .await?;
+        let mut inventory: eliot_types::UlGraphInventory =
+            decode_value(NamedSurqlOp::LoadUlReadiness, value)?;
+        inventory.total_ul_edges = inventory
+            .co_change_edges
+            .saturating_add(inventory.card_covers_edges)
+            .saturating_add(inventory.concept_implemented_by_edges)
+            .saturating_add(inventory.concept_depends_on_edges)
+            .saturating_add(inventory.capsule_covers_edges);
+        Ok(inventory)
+    }
+
     pub async fn load_predictions(
         &self,
         project_id: ProjectId,

@@ -206,37 +206,12 @@ fn h3_custom_root_freshness_and_dot_boundary_reach_runtime_packet() -> TestResul
         },
         None,
     )?;
-    assert!(
-        promoted
-            .artifact
-            .body_md
-            .contains("PURPOSE: exercise a custom project root [file:src/lib.rs]")
-    );
-    let metacognition = MetacognitionService::evaluate(
+    assert_fv1_root_boundary_consistency(
         project_root.path(),
-        std::slice::from_ref(&root_concept),
-        std::slice::from_ref(&promoted.artifact),
-        std::slice::from_ref(&module_card),
-        &[],
-        &[],
-        &["src/lib.rs".to_owned()],
-    );
-    assert!(metacognition.novel_paths.is_empty());
-    let (coverage, _) = MetacognitionService::coverage_for_paths(
-        std::slice::from_ref(&root_concept),
-        &metacognition,
-        &["src/lib.rs".to_owned()],
-    );
-    assert_ne!(coverage, CoverageClass::Blind);
-    let expected_root = project_root
-        .path()
-        .canonicalize()?
-        .to_string_lossy()
-        .replace('\\', "/");
-    assert_eq!(
-        promoted.artifact.dependency_manifest.project_root,
-        expected_root
-    );
+        &root_concept,
+        &module_card,
+        &promoted.artifact,
+    )?;
     harness.seed(&ul_command(
         project_id,
         vec![UlArtifact::ConceptNode(root_concept.clone())],
@@ -409,6 +384,41 @@ fn compile_packet(
             "max_tokens": 1_200
         }),
     )
+}
+
+fn assert_fv1_root_boundary_consistency(
+    project_root: &Path,
+    root_concept: &ConceptNode,
+    module_card: &ModuleCard,
+    capsule: &SubsystemCapsule,
+) -> TestResult {
+    assert!(
+        capsule
+            .body_md
+            .contains("PURPOSE: exercise a custom project root [file:src/lib.rs]")
+    );
+    let metacognition = MetacognitionService::evaluate(
+        project_root,
+        std::slice::from_ref(root_concept),
+        std::slice::from_ref(capsule),
+        std::slice::from_ref(module_card),
+        &[],
+        &[],
+        &["src/lib.rs".to_owned()],
+    );
+    assert!(metacognition.novel_paths.is_empty());
+    let (coverage, _) = MetacognitionService::coverage_for_paths(
+        std::slice::from_ref(root_concept),
+        &metacognition,
+        &["src/lib.rs".to_owned()],
+    );
+    assert_ne!(coverage, CoverageClass::Blind);
+    let expected_root = project_root
+        .canonicalize()?
+        .to_string_lossy()
+        .replace('\\', "/");
+    assert_eq!(capsule.dependency_manifest.project_root, expected_root);
+    Ok(())
 }
 
 #[allow(clippy::too_many_lines)]
