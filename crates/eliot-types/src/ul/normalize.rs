@@ -71,6 +71,34 @@ fn slash_normalize(raw: &str) -> String {
     result
 }
 
+fn normalize_relative_boundary_value(value: &str) -> String {
+    let normalized = value.replace('\\', "/");
+    let normalized = normalized.trim();
+    let normalized = normalized.trim_start_matches("./");
+    let normalized = normalized.trim_matches('/');
+
+    if normalized.is_empty() {
+        ".".to_owned()
+    } else {
+        normalized.to_owned()
+    }
+}
+
+#[must_use]
+pub fn path_matches_boundary(path: &str, boundary: &str) -> bool {
+    let path = normalize_relative_boundary_value(path);
+    let boundary = normalize_relative_boundary_value(boundary);
+
+    if boundary == "." {
+        return true;
+    }
+
+    path == boundary
+        || path
+            .strip_prefix(boundary.trim_end_matches('/'))
+            .is_some_and(|suffix| suffix.starts_with('/'))
+}
+
 #[must_use]
 pub fn normalize_path(raw: &str, project_root: Option<&str>) -> String {
     let mut path = unicode_lower(&slash_normalize(raw.trim()));

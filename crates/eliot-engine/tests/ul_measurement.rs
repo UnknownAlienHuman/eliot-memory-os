@@ -1,10 +1,17 @@
-use eliot_engine::{MetacognitionService, UlLedgerAccumulator, UlLedgerService, UlToolMeasurement};
+use eliot_engine::{
+    MetacognitionService, UlLedgerAccumulator, UlLedgerService, UlToolMeasurement,
+    evaluate_task08_readiness, field_validation_manifest_path, load_field_validation_manifest,
+    summarize_field_evidence,
+};
 use eliot_types::{
     ConceptKind, ConceptNode, CoverageClass, CueBinding, CueKind, CueMatchMode, CueRecordSource,
     CueStrength, DependencyManifest, InjectionReceipt, ModuleCard, ProjectId, SessionId,
-    SubsystemCapsule, TaskId, UlTaskLedger,
+    SubsystemCapsule, TaskId, UL_FIELD_VALIDATION_BASELINE_COMMIT,
+    UL_FIELD_VALIDATION_SCHEMA_VERSION, UlFieldTaskAnnotation, UlFieldValidationManifest,
+    UlReadinessInventory, UlReadinessState, UlTaskLedger,
 };
 use serde_json::json;
+use std::fs;
 use std::path::Path;
 
 #[test]
@@ -198,6 +205,118 @@ fn t07_blind_material_task_gets_advisory_probe() {
     assert_eq!(target.as_deref(), Some("blind/src/lib.rs"));
     assert_eq!(suggested_probe, "cargo test -p blind");
     assert_eq!(view.novelty_percent, 50);
+}
+
+#[test]
+fn fv1_c_readiness_thresholds_are_exact() {
+    let mut inventory = UlReadinessInventory::default();
+    inventory.graph.total_ul_edges = 499;
+    inventory.artifacts.module_card_count = 10;
+    inventory.artifacts.capsule_count = 3;
+    inventory.artifacts.fresh_capsule_count = 3;
+    inventory.tasks_with_injection = 20;
+    let below_activation = evaluate_task08_readiness(&inventory, None);
+    assert_eq!(
+        below_activation.spreading_activation.state,
+        UlReadinessState::NotEligible
+    );
+    assert_eq!(
+        below_activation.spreading_activation.reasons,
+        ["requires_at_least_500_live_edges"]
+    );
+    inventory.graph.total_ul_edges = 500;
+    assert_eq!(
+        evaluate_task08_readiness(&inventory, None)
+            .spreading_activation
+            .state,
+        UlReadinessState::Eligible
+    );
+
+    inventory.ledger_tasks = 19;
+    inventory.injection_receipts = 20;
+    inventory.read_tool_input_bytes = 1;
+    let below_token = evaluate_task08_readiness(&inventory, None);
+    assert_eq!(
+        below_token.token_ab_and_downgrade.reasons,
+        ["requires_at_least_20_ledger_tasks"]
+    );
+    inventory.ledger_tasks = 20;
+    assert_eq!(
+        evaluate_task08_readiness(&inventory, None)
+            .token_ab_and_downgrade
+            .state,
+        UlReadinessState::Eligible
+    );
+
+    inventory.artifacts.capsule_count = 5;
+    inventory.artifacts.fresh_capsule_count = 4;
+    inventory.artifacts.stale_capsule_count = 1;
+    inventory.predictions.hit = 19;
+    inventory.predictions.resolved_subsystem_count = 2;
+    let below_exam = evaluate_task08_readiness(&inventory, None);
+    assert_eq!(
+        below_exam.weekly_understanding_exam.reasons,
+        ["requires_at_least_20_resolved_predictions"]
+    );
+    inventory.predictions.hit = 20;
+    assert_eq!(
+        evaluate_task08_readiness(&inventory, None)
+            .weekly_understanding_exam
+            .state,
+        UlReadinessState::Eligible
+    );
+}
+
+#[test]
+fn fv1_e_manifest_cannot_manufacture_eligibility() -> Result<(), Box<dyn std::error::Error>> {
+    let project_id = ProjectId::new_v7();
+    let runtime_root = std::env::temp_dir().join(format!("eliot-ul-fv1-{}", TaskId::new_v7()));
+    let manifest = UlFieldValidationManifest {
+        schema_version: UL_FIELD_VALIDATION_SCHEMA_VERSION.to_owned(),
+        project_id,
+        project_root: env!("CARGO_MANIFEST_DIR").to_owned(),
+        baseline_merge_commit: UL_FIELD_VALIDATION_BASELINE_COMMIT.to_owned(),
+        second_repository: None,
+        task_annotations: (0..20)
+            .map(|index| UlFieldTaskAnnotation {
+                task_id: TaskId::new_v7(),
+                task_class: "fake-counter-only".to_owned(),
+                real_task: true,
+                verifier_ref: format!("missing:verification:{index}"),
+                outcome: "claimed".to_owned(),
+                notes: "has no canonical ledger or receipt".to_owned(),
+            })
+            .collect(),
+        prose_failure_signals: Vec::new(),
+        host_surface_incidents: Vec::new(),
+    };
+    let path = field_validation_manifest_path(&runtime_root, project_id);
+    fs::create_dir_all(path.parent().ok_or("manifest parent missing")?)?;
+    fs::write(&path, serde_json::to_vec_pretty(&manifest)?)?;
+
+    let loaded = load_field_validation_manifest(&runtime_root, project_id);
+    assert!(loaded.present);
+    assert!(loaded.manifest.is_some());
+    let mut warnings = loaded.warnings;
+    let summary = summarize_field_evidence(true, loaded.manifest.as_ref(), &[], &[], &mut warnings);
+    let readiness =
+        evaluate_task08_readiness(&UlReadinessInventory::default(), loaded.manifest.as_ref());
+
+    assert_eq!(summary.matched_real_tasks, 0);
+    assert_eq!(summary.matched_real_injected_tasks, 0);
+    assert_eq!(
+        readiness.token_ab_and_downgrade.state,
+        UlReadinessState::NotEligible
+    );
+    assert_eq!(
+        warnings
+            .iter()
+            .filter(|warning| warning.contains("unmatched_task_annotation"))
+            .count(),
+        20
+    );
+    fs::remove_dir_all(&runtime_root)?;
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]

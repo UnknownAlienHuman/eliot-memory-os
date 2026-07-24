@@ -1,9 +1,51 @@
 use eliot_types::{
     AgentCandidateSubmitInput, CueBinding, CueKind, CueMatchMode, CueStrength,
     agent_candidate_input_schema, command_pattern, error_signature, normalize_path,
-    normalize_query_tokens,
+    normalize_query_tokens, path_matches_boundary,
 };
 use serde_json::{Value, json};
+use std::fs;
+use std::path::{Path, PathBuf};
+
+#[test]
+fn fv1_a_project_boundary_matcher_has_one_shared_definition()
+-> Result<(), Box<dyn std::error::Error>> {
+    let cases = [
+        ("root covers src", ".", "src/lib.rs", true),
+        ("root covers nested", ".", "nested/a.rs", true),
+        ("directory matches itself", "src", "src", true),
+        ("directory covers child", "src", "src/lib.rs", true),
+        (
+            "directory does not cover sibling prefix",
+            "src",
+            "src2/lib.rs",
+            false,
+        ),
+        ("slash forms normalize", "./src/", r"src\lib.rs", true),
+        (
+            "package boundary does not cover sibling prefix",
+            "crates/eliot-store",
+            "crates/eliot-store2/src/lib.rs",
+            false,
+        ),
+    ];
+    for (name, boundary, path, expected) in cases {
+        assert_eq!(
+            path_matches_boundary(path, boundary),
+            expected,
+            "boundary case failed: {name}"
+        );
+    }
+
+    let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let mut definitions = Vec::new();
+    collect_boundary_definitions(&workspace.join("crates"), &mut definitions)?;
+    assert_eq!(
+        definitions,
+        [workspace.join("crates/eliot-types/src/ul/normalize.rs")]
+    );
+    Ok(())
+}
 
 #[test]
 fn t03_normalizers_are_stable() {
@@ -95,6 +137,25 @@ fn t03_candidate_schema_roundtrip() -> Result<(), Box<dyn std::error::Error>> {
 
 fn strings(values: &[&str]) -> Vec<String> {
     values.iter().map(|value| (*value).to_owned()).collect()
+}
+
+fn collect_boundary_definitions(
+    directory: &Path,
+    definitions: &mut Vec<PathBuf>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let needle = ["fn ", "path_matches_boundary"].concat();
+    for entry in fs::read_dir(directory)? {
+        let path = entry?.path();
+        if path.is_dir() {
+            collect_boundary_definitions(&path, definitions)?;
+        } else if path.extension().is_some_and(|extension| extension == "rs")
+            && fs::read_to_string(&path)?.contains(&needle)
+        {
+            definitions.push(path);
+        }
+    }
+    definitions.sort();
+    Ok(())
 }
 
 fn validate_schema(

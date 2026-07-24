@@ -3,7 +3,7 @@ use eliot_types::{
     CapsuleBuild, CapsuleFreshness, CoChangeEdge, ConceptNode, CueBinding, CueKind, CueMatchMode,
     CueStrength, DependencyManifest, FileDependency, HotspotScore, ModuleCard, ProjectCharter,
     ProjectId, PyramidBuildStatus, PyramidTargetKind, SubsystemCapsule, SystemFlow, SystemMap,
-    inspect_text_encoding, normalize_bindings, ul_token_estimate,
+    inspect_text_encoding, normalize_bindings, path_matches_boundary, ul_token_estimate,
 };
 use serde::Serialize;
 use serde_json::json;
@@ -875,13 +875,6 @@ fn path_in_concept(path: &str, concept: &ConceptNode) -> bool {
         .boundary_paths
         .iter()
         .any(|boundary| path_matches_boundary(path, boundary))
-}
-
-fn path_matches_boundary(path: &str, boundary: &str) -> bool {
-    path == boundary
-        || path
-            .strip_prefix(boundary.trim_end_matches('/'))
-            .is_some_and(|suffix| suffix.starts_with('/'))
 }
 
 fn project_what(root: &Path, project_name: &str) -> Result<(String, Option<String>), EngineError> {

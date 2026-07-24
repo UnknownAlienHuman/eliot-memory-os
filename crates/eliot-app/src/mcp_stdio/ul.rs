@@ -5,7 +5,7 @@ use eliot_engine::{
 use eliot_store::{CanonicalRecord, CanonicalStore};
 use eliot_types::{
     CapsuleFreshness, CausalBridgeHop, ConceptNode, CoverageClass, HotspotScore, ModuleCard,
-    ProjectId, SubsystemCapsule, UlMetacognitionView, ul_token_estimate,
+    ProjectId, SubsystemCapsule, UlMetacognitionView, path_matches_boundary, ul_token_estimate,
 };
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
@@ -286,14 +286,4 @@ fn concept_bridge(task_id: &str, concept: &ConceptNode) -> Vec<CausalBridgeHop> 
         });
     }
     bridge
-}
-
-fn path_matches_boundary(path: &str, boundary: &str) -> bool {
-    if boundary == "." {
-        return true;
-    }
-    path == boundary
-        || path
-            .strip_prefix(boundary.trim_end_matches('/'))
-            .is_some_and(|suffix| suffix.starts_with('/'))
 }

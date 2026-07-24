@@ -8,6 +8,7 @@ pub mod metacog;
 pub mod mining;
 pub mod onboarding;
 pub mod prediction;
+pub mod readiness;
 pub mod touched;
 
 pub use calibration::CalibrationService;
@@ -31,5 +32,9 @@ pub use onboarding::{ConceptSeedResult, OnboardingService};
 pub use prediction::{
     PredictionCapture, PredictionCaptureInput, PredictionService, normalize_verifier,
     parse_expected_observable, prediction_id, resolve_prediction,
+};
+pub use readiness::{
+    UlFieldValidationLoad, UlReadinessService, evaluate_task08_readiness,
+    field_validation_manifest_path, load_field_validation_manifest, summarize_field_evidence,
 };
 pub use touched::{TouchedCue, TouchedSetRegistry};

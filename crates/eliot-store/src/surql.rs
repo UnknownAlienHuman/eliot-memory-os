@@ -18,6 +18,7 @@ pub enum NamedSurqlOp {
     UpsertUlTaskLedger,
     LoadPredictions,
     LoadUlMetrics,
+    LoadUlReadiness,
     ApplyWriteEnvelope,
     ApplyObservability,
     ObservabilityReceiptById,
@@ -68,6 +69,7 @@ impl NamedSurqlOp {
             Self::UpsertUlTaskLedger => "upsert_ul_task_ledger",
             Self::LoadPredictions => "load_predictions",
             Self::LoadUlMetrics => "load_ul_metrics",
+            Self::LoadUlReadiness => "load_ul_readiness",
             Self::ApplyWriteEnvelope => "apply_write_envelope",
             Self::ApplyObservability => "apply_observability",
             Self::ObservabilityReceiptById => "observability_receipt_by_id",
@@ -122,6 +124,7 @@ impl NamedSurqlOp {
             Self::UpsertUlTaskLedger => include_str!("surql/upsert_ul_task_ledger.surql"),
             Self::LoadPredictions => include_str!("surql/load_predictions.surql"),
             Self::LoadUlMetrics => include_str!("surql/load_ul_metrics.surql"),
+            Self::LoadUlReadiness => include_str!("surql/load_ul_readiness.surql"),
             Self::ApplyWriteEnvelope => include_str!("surql/apply_write_envelope.surql"),
             Self::ApplyObservability => include_str!("surql/apply_observability.surql"),
             Self::ObservabilityReceiptById => {
@@ -207,7 +210,7 @@ impl Default for SurqlTemplateRegistry {
 }
 
 #[allow(clippy::too_many_lines)]
-fn foundational_templates() -> [SurqlTemplate; 27] {
+fn foundational_templates() -> [SurqlTemplate; 28] {
     [
         template(
             NamedSurqlOp::SchemaMigrate,
@@ -304,6 +307,12 @@ fn foundational_templates() -> [SurqlTemplate; 27] {
             "LoadUlMetricsInput",
             "LoadUlMetricsOutput",
             512 * 1024,
+        ),
+        template(
+            NamedSurqlOp::LoadUlReadiness,
+            "LoadUlReadinessInput",
+            "LoadUlReadinessOutput",
+            64 * 1024,
         ),
         template(
             NamedSurqlOp::ApplyWriteEnvelope,
@@ -578,6 +587,18 @@ mod tests {
             assert!(template.contains("project_id = $project_id"));
             assert!(template.contains("$limit > 128"));
         }
+        let readiness = NamedSurqlOp::LoadUlReadiness.template();
+        assert_eq!(readiness.matches("project_id = $project_id").count(), 5);
+        for table in [
+            "co_change",
+            "card_covers",
+            "concept_implemented_by",
+            "concept_depends_on",
+            "capsule_covers",
+        ] {
+            assert!(readiness.contains(&format!("FROM {table}")));
+        }
+        assert!(!readiness.contains("type::table"));
     }
 
     #[test]

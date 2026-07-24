@@ -254,8 +254,12 @@ pub(crate) async fn run_ul_report_from_daemon(
         .iter()
         .map(|ledger| u64::from(ledger.expanded_injected_handles))
         .sum::<u64>();
+    let readiness = eliot_engine::UlReadinessService::new(store.clone())
+        .collect(runtime_root, input.project_id)
+        .await?;
+    let readiness_table = render_task08_readiness_table(&readiness.task08_readiness);
     let markdown = format!(
-        "# UL use report\n\n- Project: `{}`\n- Tasks: {}\n- Injection receipts: {}\n- Injected tokens: {}\n- Exploration tokens: {}\n- Read input bytes: {}\n- Read output bytes: {}\n- Acknowledged items: {}\n- Expanded injected handles: {}\n- Predictions: {}\n- Calibration groups: {}\n",
+        "# UL use report\n\n- Project: `{}`\n- Tasks: {}\n- Injection receipts: {}\n- Injected tokens: {}\n- Exploration tokens: {}\n- Read input bytes: {}\n- Read output bytes: {}\n- Acknowledged items: {}\n- Expanded injected handles: {}\n- Predictions: {}\n- Calibration groups: {}\n- UL graph edges: {}\n- Capsules fresh/total: {}/{}\n- Real injected field tasks: {}\n- Second repository: {}\n\n## Task08 readiness\n\n{}\n",
         input.project_id,
         report.tasks,
         injection_receipts,
@@ -267,6 +271,12 @@ pub(crate) async fn run_ul_report_from_daemon(
         expanded_injected_handles,
         predictions.len(),
         calibration.len(),
+        readiness.inventory.graph.total_ul_edges,
+        readiness.inventory.artifacts.fresh_capsule_count,
+        readiness.inventory.artifacts.capsule_count,
+        readiness.field_evidence.matched_real_injected_tasks,
+        readiness.field_evidence.second_repository_status,
+        readiness_table,
     );
     let output = serde_json::json!({
         "report": report,
@@ -280,6 +290,10 @@ pub(crate) async fn run_ul_report_from_daemon(
         "ledgers": ledgers,
         "prediction_count": predictions.len(),
         "calibration": calibration,
+        "inventory": readiness.inventory,
+        "task08_readiness": readiness.task08_readiness,
+        "field_validation": readiness.field_evidence,
+        "warnings": readiness.warnings,
         "markdown": markdown,
     });
     let report_root = runtime_root
@@ -294,6 +308,37 @@ pub(crate) async fn run_ul_report_from_daemon(
         &markdown,
     )?;
     Ok(output)
+}
+
+fn render_task08_readiness_table(readiness: &eliot_types::UlTask08Readiness) -> String {
+    let rows = [
+        (
+            "Reverse dependency index",
+            &readiness.reverse_dependency_index,
+        ),
+        ("Spreading activation", &readiness.spreading_activation),
+        ("Token A/B and downgrade", &readiness.token_ab_and_downgrade),
+        ("Weekly understanding exam", &readiness.weekly_understanding_exam),
+        ("Model prose refinement", &readiness.model_prose_refinement),
+        ("Host/package optimization", &readiness.host_surface_optimization),
+    ];
+    let mut table = vec![
+        "Feature | Eligible | Blocking reasons".to_owned(),
+        "--- | --- | ---".to_owned(),
+    ];
+    table.extend(rows.into_iter().map(|(name, feature)| {
+        let eligible = match feature.state {
+            eliot_types::UlReadinessState::Eligible => "yes",
+            eliot_types::UlReadinessState::NotEligible => "no",
+        };
+        let reasons = if feature.reasons.is_empty() {
+            "-".to_owned()
+        } else {
+            feature.reasons.join(", ")
+        };
+        format!("{name} | {eligible} | {reasons}")
+    }));
+    table.join("\n")
 }
 
 fn ul_daemon_instance(config_path: &Path) -> Result<RuntimeInstance> {

@@ -335,9 +335,16 @@ pub use ul::injection::{
     InjectionReceipt, MemoryInfluenceAckInput, ObservedCue, PendingInjectionItem, UlFiredBlock,
     UlFiredItem,
 };
-pub use ul::measurement::{UlLedgerDelta, UlTaskLedger, UlUseReport};
+pub use ul::measurement::{
+    UL_FIELD_VALIDATION_BASELINE_COMMIT, UL_FIELD_VALIDATION_SCHEMA_VERSION, UlArtifactInventory,
+    UlFeatureReadiness, UlFieldEvidenceSummary, UlFieldTaskAnnotation, UlFieldValidationManifest,
+    UlGraphInventory, UlHostSurfaceIncident, UlLedgerDelta, UlPredictionInventory,
+    UlProseFailureSignal, UlReadinessInventory, UlReadinessSnapshot, UlReadinessState,
+    UlSecondRepositoryValidation, UlTask08Readiness, UlTaskLedger, UlUseReport,
+};
 pub use ul::normalize::{
     command_pattern, error_signature, normalize_path, normalize_query_tokens, normalize_symbol,
+    path_matches_boundary,
 };
 pub use ul::onboarding::{
     ManifestPackage, OnboardingCheckpoint, OnboardingJob, OnboardingReport, OnboardingStage,
