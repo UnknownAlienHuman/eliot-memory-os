@@ -14,8 +14,10 @@ pub mod health;
 pub mod host;
 pub mod ids;
 pub mod lifecycle;
+pub mod mcp_contract;
 pub mod memory;
 pub mod metrics;
+pub mod observability;
 pub mod provider_invocation;
 pub mod records;
 pub mod replay;
@@ -25,6 +27,7 @@ pub mod secret_boundary;
 pub mod semantic_memory;
 pub mod service;
 pub mod skill;
+pub mod ul;
 pub mod verification;
 
 pub use adapter::{
@@ -171,6 +174,11 @@ pub use lifecycle::{
     MinorityPressureRecord, MinorityPressureStatus, ReactivationCondition, RevisionOperator,
     SupersessionReceipt, SuppressionReceipt,
 };
+pub use mcp_contract::{
+    AgentCandidateCurationInput, AgentCandidateSubmitInput, CompilePacketToolInput, InvalidField,
+    ToolInputError, ToolInputErrorData, agent_candidate_input_schema, compile_packet_input_schema,
+    compile_packet_minimal_example,
+};
 pub use memory::{
     ActionKind, ActionLease, ActionLeaseRecord, ActionProvenanceSet, ActionRequest, ActionScope,
     ActionSourceScope, ActiveDecisionTransitionCommand, AgentContributionTrace,
@@ -201,14 +209,15 @@ pub use memory::{
     SymbolChangeIntent, SymbolEvidence, TaintClass, TaskAcceptanceEvidenceKind, TaskAcceptanceItem,
     TaskContract, TaskContractInput, TaskContractStatus, TaskContractWriteCommand,
     TokenBudgetReport, ToolObservation, ToolObservationInput, ToolObservationRecordCommand,
-    TruncationInfo, UnderstandingProof, UnderstandingProofReceipt, UnifiedDiff,
-    VerificationRecordCommand, VerificationResult, VerificationRun, VerificationRunInput,
-    VerifierArtifactRef, VerifierArtifactScope, VerifierCommandKind, VerifierEffectTrace,
-    VerifierEvidence, VerifierPlan, VerifierRequirement, VerifierRun, VerifierRunRef,
-    VerifierStatus, Visibility, WorkConflict, WorkConflictKind, WorkConflictResolution, WorkItem,
-    WorkItemStatus, WorkLease, WorkLeaseDecision, WorkLeaseDecisionKind, WorkLeaseDecisionReason,
-    WorkLeaseState, WorkScope, WorktreeLease, WorktreeLeaseRequest, WorktreeLeaseState,
-    WriteReceipt, WriteReceiptRef, WriteRejectReason, WriteStatus, WriterStatusResponse,
+    TruncationInfo, UlArtifactBatchRecordCommand, UnderstandingProof, UnderstandingProofReceipt,
+    UnifiedDiff, VerificationRecordCommand, VerificationResult, VerificationRun,
+    VerificationRunInput, VerifierArtifactRef, VerifierArtifactScope, VerifierCommandKind,
+    VerifierEffectTrace, VerifierEvidence, VerifierPlan, VerifierRequirement, VerifierRun,
+    VerifierRunRef, VerifierStatus, Visibility, WorkConflict, WorkConflictKind,
+    WorkConflictResolution, WorkItem, WorkItemStatus, WorkLease, WorkLeaseDecision,
+    WorkLeaseDecisionKind, WorkLeaseDecisionReason, WorkLeaseState, WorkScope, WorktreeLease,
+    WorktreeLeaseRequest, WorktreeLeaseState, WriteReceipt, WriteReceiptRef, WriteRejectReason,
+    WriteStatus, WriterStatusResponse,
 };
 pub use metrics::{
     CostLedger, CostLedgerEntry, DashboardHealthStatus, DashboardHealthSummary, DashboardReport,
@@ -217,6 +226,11 @@ pub use metrics::{
     MetricUnit, MetricWindow, MetricsDoctorStatus, OperationalTrend, OperationalTrendDirection,
     QualitySignal, QualitySignalKind, RuntimeDashboard, SloBreachSeverity, SloDefinition,
     SloEvaluation, SloObjective, TelemetryEvent, TelemetryEventKind, TelemetryRollup,
+};
+pub use observability::{
+    MemoryInfluenceToolInput, MemoryInfluenceTraceWriteInput, MemoryInfluenceTraceWriteResult,
+    OBSERVABILITY_SCHEMA_VERSION, ObservabilityKind, ObservabilityWriteEnvelope,
+    ObservabilityWriteReceipt, ObservabilityWriteStatus, memory_influence_trace_write_input_schema,
 };
 pub use provider_invocation::{
     ExternalResultCompletenessReceipt, ProviderFailureIncident, ProviderIdentityCheck,
@@ -301,6 +315,36 @@ pub use skill::{
     SkillMergeProposal, SkillNeedEstimate, SkillNeedVerdict, SkillOrderingRule, SkillOutputSpec,
     SkillPatchProposal, SkillQuarantineProposal, SkillReplayRequirement, SkillScopeRule,
     SkillSplitProposal, SkillStep, SkillToolRequirement,
+};
+pub use ul::artifact::UlArtifact;
+pub use ul::behavior::{
+    CoChangeEdge, FIX_CLASSIFIER_VERSION, HotspotScore, MiningConfig, MiningRun,
+};
+pub use ul::concept::{
+    CapsuleBuild, CapsuleFreshness, ConceptKind, ConceptNode, DependencyManifest, FileDependency,
+    ModuleCard, ProjectCharter, PyramidBuildStatus, PyramidTargetKind, SubsystemCapsule,
+    SystemFlow, SystemMap,
+};
+pub use ul::concept::{CoverageClass, DangerPath, SubsystemCoverage, UlMetacognitionView};
+pub use ul::cue::{
+    CueBinding, CueBindingError, CueIndexRow, CueKind, CueMatchMode, CueRecordSource, CueStrength,
+    cue_row_id, normalize_binding, normalize_bindings, ul_token_estimate,
+};
+pub use ul::guard::{TextEncodingViolation, inspect_text_encoding, mojibake};
+pub use ul::injection::{
+    InjectionReceipt, MemoryInfluenceAckInput, ObservedCue, PendingInjectionItem, UlFiredBlock,
+    UlFiredItem,
+};
+pub use ul::measurement::{UlLedgerDelta, UlTaskLedger, UlUseReport};
+pub use ul::normalize::{
+    command_pattern, error_signature, normalize_path, normalize_query_tokens, normalize_symbol,
+};
+pub use ul::onboarding::{
+    ManifestPackage, OnboardingCheckpoint, OnboardingJob, OnboardingReport, OnboardingStage,
+    OnboardingTestHook,
+};
+pub use ul::prediction::{
+    CalibrationScore, PredictionExpectation, PredictionRecord, PredictionResolution,
 };
 pub use verification::{
     FlakeReport, SkippedTest, SkippedTestReason, StatefulDbIsolationReport, TestCostClass,

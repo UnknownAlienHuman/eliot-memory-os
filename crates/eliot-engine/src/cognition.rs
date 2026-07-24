@@ -4,7 +4,8 @@ use crate::{EngineError, WriteAdmissionService, WriterHandle};
 use eliot_types::{
     AgentId, AgentSessionId, CommandContext, ContextCargoReceipt, LifecycleStatus,
     MemoryAdmissionDecision, MemoryDecisionReceipt, MemoryInfluenceClass, MemoryInfluenceTrace,
-    MemoryValueComparison, MemoryValueExperiment, PlanningDecisionRecord, ProjectId,
+    MemoryValueComparison, MemoryValueExperiment, OBSERVABILITY_SCHEMA_VERSION, ObservabilityKind,
+    ObservabilityWriteEnvelope, ObservabilityWriteReceipt, PlanningDecisionRecord, ProjectId,
     SemanticCommand, SessionId, TaintClass, TaskId, ToolObservationRecordCommand,
     UnderstandingOutcome, UnderstandingOutcomeRecord, VerificationResult, Visibility, WriteId,
     WriteReceiptRef,
@@ -293,10 +294,10 @@ impl CognitiveMemoryWriter {
 
     pub async fn write_memory_influence_trace(
         handle: &WriterHandle,
-        admission: &WriteAdmissionService,
         project_id: ProjectId,
-        trace: &mut MemoryInfluenceTrace,
-    ) -> Result<WriteReceiptRef, EngineError> {
+        write_id: WriteId,
+        trace: &MemoryInfluenceTrace,
+    ) -> Result<ObservabilityWriteReceipt, EngineError> {
         if matches!(
             trace.influence_class,
             MemoryInfluenceClass::UsedAndChangedAction
@@ -308,19 +309,36 @@ impl CognitiveMemoryWriter {
                 "claimed memory influence requires a downstream outcome reference".to_owned(),
             ));
         }
-        let receipt = write_cognitive_observation(
-            handle,
-            admission,
+        let mut canonical_trace = trace.clone();
+        canonical_trace.canonical_receipt = None;
+        let payload = serde_json::to_value(&canonical_trace)?;
+        let kind = ObservabilityKind::MemoryInfluenceTrace;
+        let task_id = Some(trace.task_id);
+        let session_id = Some(SessionId::from_uuid(trace.session_id.as_uuid()));
+        let input_hash = blake3::hash(&serde_json::to_vec(&(
+            OBSERVABILITY_SCHEMA_VERSION,
             project_id,
-            trace.task_id,
-            trace.session_id,
-            "memory_influence_trace",
-            "cognitive-memory-l8",
-            trace,
-        )
-        .await?;
-        trace.canonical_receipt = Some(receipt.clone());
-        Ok(receipt)
+            task_id,
+            session_id,
+            kind,
+            &payload,
+        ))?)
+        .to_hex()
+        .to_string();
+        handle
+            .submit_observability(ObservabilityWriteEnvelope {
+                schema_version: OBSERVABILITY_SCHEMA_VERSION.to_owned(),
+                write_id,
+                project_id,
+                task_id,
+                session_id,
+                kind,
+                record_id: format!("memory-influence:{write_id}"),
+                payload,
+                input_hash,
+                created_at: time::OffsetDateTime::now_utc(),
+            })
+            .await
     }
 
     pub async fn write_context_cargo_receipt(

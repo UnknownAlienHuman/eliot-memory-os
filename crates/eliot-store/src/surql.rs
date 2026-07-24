@@ -3,7 +3,25 @@ use std::collections::HashMap;
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum NamedSurqlOp {
     SchemaMigrate,
+    SchemaMigrateObservability,
+    SchemaMigrateUl,
+    SchemaMigrateUlDelivery,
+    SchemaMigrateUlArtifacts,
+    SchemaMigrateUlPyramid,
+    SchemaMigrateUlMeasurement,
+    UpsertCueRows,
+    DeleteCueRows,
+    LoadCueRows,
+    LoadCueRecords,
+    LoadInjectionReceipts,
+    LoadUlArtifacts,
+    UpsertUlTaskLedger,
+    LoadPredictions,
+    LoadUlMetrics,
     ApplyWriteEnvelope,
+    ApplyObservability,
+    ObservabilityReceiptById,
+    ObservabilityRecordsByKind,
     CurrentState,
     RecallL0,
     FetchAtomsL2,
@@ -35,7 +53,25 @@ impl NamedSurqlOp {
     pub const fn name(self) -> &'static str {
         match self {
             Self::SchemaMigrate => "000_schema",
+            Self::SchemaMigrateObservability => "001_observability",
+            Self::SchemaMigrateUl => "002_ul_core",
+            Self::SchemaMigrateUlDelivery => "003_ul_delivery",
+            Self::SchemaMigrateUlArtifacts => "004_ul_artifacts",
+            Self::SchemaMigrateUlPyramid => "005_ul_pyramid",
+            Self::SchemaMigrateUlMeasurement => "006_ul_measurement",
+            Self::UpsertCueRows => "upsert_cue_rows",
+            Self::DeleteCueRows => "delete_cues_for_record",
+            Self::LoadCueRows => "load_cue_rows",
+            Self::LoadCueRecords => "load_cue_records",
+            Self::LoadInjectionReceipts => "load_injection_receipts",
+            Self::LoadUlArtifacts => "load_ul_artifacts",
+            Self::UpsertUlTaskLedger => "upsert_ul_task_ledger",
+            Self::LoadPredictions => "load_predictions",
+            Self::LoadUlMetrics => "load_ul_metrics",
             Self::ApplyWriteEnvelope => "apply_write_envelope",
+            Self::ApplyObservability => "apply_observability",
+            Self::ObservabilityReceiptById => "observability_receipt_by_id",
+            Self::ObservabilityRecordsByKind => "observability_records_by_kind",
             Self::CurrentState => "current_state",
             Self::RecallL0 => "recall_l0",
             Self::FetchAtomsL2 => "fetch_atoms_l2",
@@ -67,7 +103,33 @@ impl NamedSurqlOp {
     pub const fn template(self) -> &'static str {
         match self {
             Self::SchemaMigrate => include_str!("surql/000_schema.surql"),
+            Self::SchemaMigrateObservability => include_str!("surql/001_observability.surql"),
+            Self::SchemaMigrateUl => include_str!("surql/002_ul_core.surql"),
+            Self::SchemaMigrateUlDelivery => include_str!("surql/003_ul_delivery.surql"),
+            Self::SchemaMigrateUlArtifacts => include_str!("surql/004_ul_artifacts.surql"),
+            Self::SchemaMigrateUlPyramid => include_str!("surql/005_ul_pyramid.surql"),
+            Self::SchemaMigrateUlMeasurement => {
+                include_str!("surql/006_ul_measurement.surql")
+            }
+            Self::UpsertCueRows => include_str!("surql/upsert_cue_rows.surql"),
+            Self::DeleteCueRows => include_str!("surql/delete_cues_for_record.surql"),
+            Self::LoadCueRows => include_str!("surql/load_cue_rows.surql"),
+            Self::LoadCueRecords => include_str!("surql/load_cue_records.surql"),
+            Self::LoadInjectionReceipts => {
+                include_str!("surql/load_injection_receipts.surql")
+            }
+            Self::LoadUlArtifacts => include_str!("surql/load_ul_artifacts.surql"),
+            Self::UpsertUlTaskLedger => include_str!("surql/upsert_ul_task_ledger.surql"),
+            Self::LoadPredictions => include_str!("surql/load_predictions.surql"),
+            Self::LoadUlMetrics => include_str!("surql/load_ul_metrics.surql"),
             Self::ApplyWriteEnvelope => include_str!("surql/apply_write_envelope.surql"),
+            Self::ApplyObservability => include_str!("surql/apply_observability.surql"),
+            Self::ObservabilityReceiptById => {
+                include_str!("surql/observability_receipt_by_id.surql")
+            }
+            Self::ObservabilityRecordsByKind => {
+                include_str!("surql/observability_records_by_kind.surql")
+            }
             Self::CurrentState => include_str!("surql/current_state.surql"),
             Self::RecallL0 => include_str!("surql/recall_l0.surql"),
             Self::FetchAtomsL2 => include_str!("surql/fetch_atoms_l2.surql"),
@@ -144,7 +206,8 @@ impl Default for SurqlTemplateRegistry {
     }
 }
 
-fn foundational_templates() -> [SurqlTemplate; 9] {
+#[allow(clippy::too_many_lines)]
+fn foundational_templates() -> [SurqlTemplate; 27] {
     [
         template(
             NamedSurqlOp::SchemaMigrate,
@@ -153,10 +216,118 @@ fn foundational_templates() -> [SurqlTemplate; 9] {
             64 * 1024,
         ),
         template(
+            NamedSurqlOp::SchemaMigrateObservability,
+            "SchemaMigrateObservabilityInput",
+            "SchemaMigrateObservabilityOutput",
+            64 * 1024,
+        ),
+        template(
+            NamedSurqlOp::SchemaMigrateUl,
+            "SchemaMigrateUlInput",
+            "SchemaMigrateUlOutput",
+            64 * 1024,
+        ),
+        template(
+            NamedSurqlOp::SchemaMigrateUlDelivery,
+            "SchemaMigrateUlDeliveryInput",
+            "SchemaMigrateUlDeliveryOutput",
+            64 * 1024,
+        ),
+        template(
+            NamedSurqlOp::SchemaMigrateUlArtifacts,
+            "SchemaMigrateUlArtifactsInput",
+            "SchemaMigrateUlArtifactsOutput",
+            64 * 1024,
+        ),
+        template(
+            NamedSurqlOp::SchemaMigrateUlPyramid,
+            "SchemaMigrateUlPyramidInput",
+            "SchemaMigrateUlPyramidOutput",
+            64 * 1024,
+        ),
+        template(
+            NamedSurqlOp::SchemaMigrateUlMeasurement,
+            "SchemaMigrateUlMeasurementInput",
+            "SchemaMigrateUlMeasurementOutput",
+            64 * 1024,
+        ),
+        template(
+            NamedSurqlOp::UpsertCueRows,
+            "UpsertCueRowsInput",
+            "UpsertCueRowsOutput",
+            64 * 1024,
+        ),
+        template(
+            NamedSurqlOp::DeleteCueRows,
+            "DeleteCueRowsInput",
+            "DeleteCueRowsOutput",
+            64 * 1024,
+        ),
+        template(
+            NamedSurqlOp::LoadCueRows,
+            "LoadCueRowsInput",
+            "LoadCueRowsOutput",
+            4 * 1024 * 1024,
+        ),
+        template(
+            NamedSurqlOp::LoadCueRecords,
+            "LoadCueRecordsInput",
+            "LoadCueRecordsOutput",
+            8 * 1024 * 1024,
+        ),
+        template(
+            NamedSurqlOp::LoadInjectionReceipts,
+            "LoadInjectionReceiptsInput",
+            "LoadInjectionReceiptsOutput",
+            8 * 1024 * 1024,
+        ),
+        template(
+            NamedSurqlOp::LoadUlArtifacts,
+            "LoadUlArtifactsInput",
+            "LoadUlArtifactsOutput",
+            8 * 1024 * 1024,
+        ),
+        template(
+            NamedSurqlOp::UpsertUlTaskLedger,
+            "UpsertUlTaskLedgerInput",
+            "UpsertUlTaskLedgerOutput",
+            64 * 1024,
+        ),
+        template(
+            NamedSurqlOp::LoadPredictions,
+            "LoadPredictionsInput",
+            "LoadPredictionsOutput",
+            512 * 1024,
+        ),
+        template(
+            NamedSurqlOp::LoadUlMetrics,
+            "LoadUlMetricsInput",
+            "LoadUlMetricsOutput",
+            512 * 1024,
+        ),
+        template(
             NamedSurqlOp::ApplyWriteEnvelope,
             "ApplyWriteEnvelopeInput",
             "ApplyWriteEnvelopeOutput",
             256 * 1024,
+        ),
+        template(
+            NamedSurqlOp::ApplyObservability,
+            "ApplyObservabilityInput",
+            "ApplyObservabilityOutput",
+            64 * 1024,
+        ),
+        template(
+            NamedSurqlOp::ObservabilityReceiptById,
+            "ObservabilityReceiptByIdInput",
+            "ObservabilityReceiptByIdOutput",
+            64 * 1024,
+        ),
+        template(
+            NamedSurqlOp::ObservabilityRecordsByKind,
+            "ObservabilityRecordsByKindInput",
+            "ObservabilityRecordsByKindOutput",
+            512 * 1024,
         ),
         template(
             NamedSurqlOp::CurrentState,

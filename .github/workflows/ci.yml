@@ -48,8 +48,60 @@ jobs:
       - name: Workspace check
         run: cargo check --workspace --all-targets
 
-      # Provider-free workspace tests. Tests requiring a provisioned local
-      # runtime, authenticated SurrealDB, or interactive host are explicitly
-      # ignored at the source with their prerequisite recorded there.
+      - name: Provision pinned SurrealDB 3.1.4
+        shell: pwsh
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $headers = @{
+            Accept = "application/vnd.github+json"
+            Authorization = "Bearer $env:GITHUB_TOKEN"
+            "User-Agent" = "eliot-memory-os-ci"
+            "X-GitHub-Api-Version" = "2022-11-28"
+          }
+          $release = Invoke-RestMethod `
+            -Headers $headers `
+            -Uri "https://api.github.com/repos/surrealdb/surrealdb/releases/tags/v3.1.4"
+          $assets = @(
+            $release.assets |
+              Where-Object { $_.name -eq "surreal-v3.1.4.windows-amd64.exe" }
+          )
+          if ($assets.Count -ne 1) {
+            throw "Expected one pinned SurrealDB 3.1.4 Windows asset; found $($assets.Count)"
+          }
+          $surreal = Join-Path `
+            $env:RUNNER_TEMP `
+            "surreal-v3.1.4.windows-amd64.exe"
+          Invoke-WebRequest `
+            -Headers @{ "User-Agent" = "eliot-memory-os-ci" } `
+            -Uri $assets[0].browser_download_url `
+            -OutFile $surreal
+          if (-not (Test-Path -LiteralPath $surreal -PathType Leaf)) {
+            throw "Pinned SurrealDB executable was not downloaded"
+          }
+          $version = (& $surreal version | Out-String).Trim()
+          if ($LASTEXITCODE -ne 0 -or $version -notmatch "^3\.1\.4\b") {
+            throw "Expected SurrealDB 3.1.4, got '$version'"
+          }
+          Add-Content `
+            -LiteralPath $env:GITHUB_ENV `
+            -Value "ELIOT_SURREAL_EXE=$surreal"
+
       - name: Tests
-        run: cargo test --workspace
+        shell: pwsh
+        run: |
+          if (
+            [string]::IsNullOrWhiteSpace($env:ELIOT_SURREAL_EXE) -or
+            -not (Test-Path -LiteralPath $env:ELIOT_SURREAL_EXE -PathType Leaf)
+          ) {
+            throw "ELIOT_SURREAL_EXE is missing"
+          }
+          $version = (& $env:ELIOT_SURREAL_EXE version | Out-String).Trim()
+          if ($LASTEXITCODE -ne 0 -or $version -notmatch "^3\.1\.4\b") {
+            throw "Expected SurrealDB 3.1.4 before tests, got '$version'"
+          }
+          cargo test --workspace
+          if ($LASTEXITCODE -ne 0) {
+            exit $LASTEXITCODE
+          }

@@ -9,16 +9,19 @@ use base64::engine::general_purpose::STANDARD_NO_PAD;
 use eliot_types::{
     AutonomyRunContract, AutonomyRunTransitionReceipt, BlobReachabilityRef, BlobReferenceSnapshot,
     BlobRetentionClass, BlobRetentionRef, CanonicalMetaMetricEvidence,
-    CanonicalReplayExecutionRecord, CanonicalTraceCompletenessContract, ClaimId,
-    CurrentStateRequest, CurrentStateResponse, EpistemicStatus, ExperimentalMetaPolicyCandidate,
-    FetchAtomsL2Request, FetchAtomsL2Response, GraphHealthResponse, HarnessExperimentRecord,
-    LifecycleStatus, MemoryRevision, MemoryStateTransition, MemoryTrajectoryCorrectness,
+    CanonicalReplayExecutionRecord, CanonicalTraceCompletenessContract, ClaimId, CueIndexRow,
+    CueRecordSource, CurrentStateRequest, CurrentStateResponse, EpistemicStatus,
+    ExperimentalMetaPolicyCandidate, FetchAtomsL2Request, FetchAtomsL2Response,
+    GraphHealthResponse, HarnessExperimentRecord, InjectionReceipt, LifecycleStatus,
+    MemoryInfluenceTrace, MemoryRevision, MemoryStateTransition, MemoryTrajectoryCorrectness,
     MemoryWriteEnvelope, MetaIsolationRejectionRecord, MetaPolicyExecutionAction,
-    MetaPolicyExecutionReceipt, MinorityPressureRecord, ProjectId, ProjectSequence,
-    RecallL0Request, RecallL0Response, ReplayAudit, ReplayRun, SealedReplayCaseRecord,
-    SealedReplayInputSnapshotRecord, SealedReplaySetRecord, SleepCandidateArtifact,
-    SleepConsolidationBundle, SleepConsolidationRun, SurrealServerConfig, TaintClass, TaskContract,
-    TaskId, ToolObservation, VerificationId, VerificationRun, Visibility, WriteId, WriteReceipt,
+    MetaPolicyExecutionReceipt, MinorityPressureRecord, ObservabilityKind,
+    ObservabilityWriteEnvelope, ObservabilityWriteReceipt, ObservabilityWriteStatus, ProjectId,
+    ProjectSequence, RecallL0Request, RecallL0Response, ReplayAudit, ReplayRun,
+    SealedReplayCaseRecord, SealedReplayInputSnapshotRecord, SealedReplaySetRecord,
+    SleepCandidateArtifact, SleepConsolidationBundle, SleepConsolidationRun, SurrealServerConfig,
+    TaintClass, TaskContract, TaskId, ToolObservation, VerificationId, VerificationRun, Visibility,
+    WriteId, WriteReceipt,
 };
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
@@ -58,6 +61,11 @@ const SECRET_SCAN_TABLES: &[&str] = &[
     "belongs_to",
     "produced_by",
     "invalidated_by",
+    "co_change",
+    "concept_implemented_by",
+    "concept_depends_on",
+    "capsule_covers",
+    "card_covers",
 ];
 
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
@@ -83,6 +91,7 @@ pub struct CanonicalSecretScanReport {
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 enum L2HandleKind {
     Any,
+    File,
     Claim,
     Evidence,
     Verification,
@@ -109,6 +118,7 @@ struct ExactL2Bindings {
 
 fn parse_l2_selector(raw: &str) -> (L2HandleKind, &str, &'static str) {
     for (prefix, kind, canonical) in [
+        ("file:", L2HandleKind::File, "file:"),
         ("claim:", L2HandleKind::Claim, "claim:"),
         ("claim_card:", L2HandleKind::Claim, "claim:"),
         ("evidence:", L2HandleKind::Evidence, "evidence:"),
@@ -250,7 +260,11 @@ fn l2_selector_identities(selectors: &[L2Selector], kind: L2HandleKind) -> Vec<S
 fn l2_relation_identities(selectors: &[L2Selector]) -> Vec<String> {
     let mut relation_ids = BTreeSet::new();
     for selector in selectors {
+        relation_ids.insert(selector.public_handle.clone());
         relation_ids.insert(selector.identity.clone());
+        if selector.kind == L2HandleKind::File {
+            continue;
+        }
         for prefix in [
             "claim:",
             "claim_card:",
@@ -377,6 +391,13 @@ fn resolved_exact_l2_handles(response: &FetchAtomsL2Response) -> HashSet<(L2Hand
             .iter()
             .map(|record| (L2HandleKind::Failure, record.fingerprint.clone())),
     );
+    for relation in &response.relations {
+        for endpoint in [&relation.from, &relation.to] {
+            if let Some(path) = endpoint.strip_prefix("file:") {
+                resolved.insert((L2HandleKind::File, path.to_owned()));
+            }
+        }
+    }
     resolved
 }
 
@@ -483,13 +504,26 @@ impl CanonicalStore {
     }
 
     pub async fn migrate_schema(&self) -> Result<Value, StoreError> {
+        let mut value = Value::Null;
+        for op in [
+            NamedSurqlOp::SchemaMigrate,
+            NamedSurqlOp::SchemaMigrateObservability,
+            NamedSurqlOp::SchemaMigrateUl,
+            NamedSurqlOp::SchemaMigrateUlDelivery,
+            NamedSurqlOp::SchemaMigrateUlArtifacts,
+            NamedSurqlOp::SchemaMigrateUlPyramid,
+            NamedSurqlOp::SchemaMigrateUlMeasurement,
+        ] {
+            value = self.migrate_schema_op(op).await?;
+        }
+        Ok(value)
+    }
+
+    async fn migrate_schema_op(&self, op: NamedSurqlOp) -> Result<Value, StoreError> {
         let vars = Value::Object(serde_json::Map::new());
         let mut attempts = 0u8;
         loop {
-            match self
-                .execute_value(NamedSurqlOp::SchemaMigrate, vars.clone())
-                .await
-            {
+            match self.execute_value(op, vars.clone()).await {
                 Ok(value) => return Ok(value),
                 Err(error)
                     if is_retryable_schema_conflict(&error)
@@ -590,16 +624,244 @@ impl CanonicalStore {
         envelope: &MemoryWriteEnvelope,
     ) -> Result<WriteReceipt, StoreError> {
         let canonical_payloads = canonical_payloads(envelope)?;
+        let relation_payloads = relation_payloads(envelope);
         let value = self
             .execute_value(
                 NamedSurqlOp::ApplyWriteEnvelope,
                 json!({
                     "envelope": envelope,
                     "canonical_payloads": canonical_payloads,
+                    "relation_payloads": relation_payloads,
                 }),
             )
             .await?;
         decode_value(NamedSurqlOp::ApplyWriteEnvelope, value)
+    }
+
+    pub async fn apply_observability(
+        &self,
+        envelope: &ObservabilityWriteEnvelope,
+    ) -> Result<ObservabilityWriteReceipt, StoreError> {
+        let injection_payload = if envelope.kind == ObservabilityKind::InjectionReceipt {
+            let receipt: InjectionReceipt = serde_json::from_value(envelope.payload.clone())
+                .map_err(|error| StoreError::Decode(error.to_string()))?;
+            json!({
+                "injection_id_parts": cue_string_parts(&receipt.injection_id),
+                "session_id_parts": vec![receipt.session_id.to_string()],
+                "task_id_parts": receipt
+                    .task_id
+                    .map(|task_id| vec![task_id.to_string()]),
+                "surface_parts": cue_string_parts(&receipt.surface),
+                "item_ref_parts": cue_string_parts(&receipt.item_ref),
+                "render_form_parts": cue_string_parts(&receipt.render_form),
+                "fired_cues": receipt.fired_cues.iter().map(|cue| json!({
+                    "kind": cue.kind,
+                    "value_parts": cue_string_parts(&cue.value),
+                })).collect::<Vec<_>>(),
+                "token_cost": receipt.token_cost,
+                "source_fingerprint_parts": cue_string_parts(&receipt.source_fingerprint),
+                "outcome_parts": cue_string_parts(&receipt.outcome),
+            })
+        } else {
+            Value::Null
+        };
+        let memory_influence_payload = if envelope.kind == ObservabilityKind::MemoryInfluenceTrace {
+            let trace: MemoryInfluenceTrace = serde_json::from_value(envelope.payload.clone())
+                .map_err(|error| StoreError::Decode(error.to_string()))?;
+            json!({
+                "task_id_parts": vec![trace.task_id.to_string()],
+                "session_id_parts": vec![trace.session_id.to_string()],
+                "memory_handle_parts": cue_string_parts(&trace.memory_handle),
+                "packet_id_parts": cue_string_parts(&trace.packet_id),
+                "admission_decision": trace.admission_decision,
+                "inclusion_reason_parts": cue_string_parts(
+                    &trace.inclusion_or_suppression_reason
+                ),
+                "epistemic_status_parts": cue_string_parts(&trace.epistemic_status_at_use),
+                "cited_in_understanding_proof": trace.cited_in_understanding_proof,
+                "action_or_probe_changed": trace.action_or_probe_changed,
+                "write_set_changed": trace.write_set_changed,
+                "verifier_changed": trace.verifier_changed,
+                "repeated_failure_prevented": trace.repeated_failure_prevented,
+                "suppressed_as_stale_or_wrong_scope": trace
+                    .suppressed_as_stale_or_wrong_scope,
+                "downstream_outcome_ref_parts": trace
+                    .downstream_outcome_ref
+                    .as_deref()
+                    .map(cue_string_parts),
+                "influence_class": trace.influence_class,
+            })
+        } else {
+            Value::Null
+        };
+        let value = self
+            .execute_value(
+                NamedSurqlOp::ApplyObservability,
+                json!({
+                    "envelope": envelope,
+                    "target_table": envelope.kind.table_name(),
+                    "injection_payload": injection_payload,
+                    "memory_influence_payload": memory_influence_payload,
+                }),
+            )
+            .await?;
+        let receipt =
+            decode_value::<ObservabilityWriteReceipt>(NamedSurqlOp::ApplyObservability, value)?;
+        if receipt.status == ObservabilityWriteStatus::Rejected {
+            return Err(StoreError::ObservabilityConflict);
+        }
+        Ok(receipt)
+    }
+
+    pub async fn observability_receipt(
+        &self,
+        write_id: WriteId,
+    ) -> Result<Option<ObservabilityWriteReceipt>, StoreError> {
+        let value = self
+            .execute_value(
+                NamedSurqlOp::ObservabilityReceiptById,
+                json!({ "write_id": write_id }),
+            )
+            .await?;
+        if value.is_null() {
+            return Ok(None);
+        }
+        decode_value(NamedSurqlOp::ObservabilityReceiptById, value).map(Some)
+    }
+
+    pub async fn observability_records_by_kind<T: DeserializeOwned>(
+        &self,
+        project_id: ProjectId,
+        task_id: Option<TaskId>,
+        kind: ObservabilityKind,
+    ) -> Result<Vec<T>, StoreError> {
+        let value = self
+            .execute_value(
+                NamedSurqlOp::ObservabilityRecordsByKind,
+                json!({
+                    "project_id": project_id,
+                    "task_id": task_id,
+                    "has_task_id": task_id.is_some(),
+                    "kind": kind,
+                    "target_table": kind.table_name(),
+                }),
+            )
+            .await?;
+        decode_value(NamedSurqlOp::ObservabilityRecordsByKind, value)
+    }
+
+    pub async fn replace_cue_rows(
+        &self,
+        project_id: ProjectId,
+        record_ref: &str,
+        rows: &[CueIndexRow],
+    ) -> Result<(), StoreError> {
+        let op = if rows.is_empty() {
+            NamedSurqlOp::DeleteCueRows
+        } else {
+            NamedSurqlOp::UpsertCueRows
+        };
+        let projection_rows = cue_projection_rows(rows);
+        self.execute_value(
+            op,
+            json!({
+                "project_id": project_id,
+                "replace_project": false,
+                "record_ref_parts": cue_string_parts(record_ref),
+                "record_ref_key": cue_record_ref_key(record_ref),
+                "rows": projection_rows,
+            }),
+        )
+        .await?;
+        Ok(())
+    }
+
+    pub async fn replace_project_cue_rows(
+        &self,
+        project_id: ProjectId,
+        rows: &[CueIndexRow],
+    ) -> Result<(), StoreError> {
+        self.execute_value(
+            NamedSurqlOp::UpsertCueRows,
+            json!({
+                "project_id": project_id,
+                "replace_project": true,
+                "record_ref_parts": [],
+                "record_ref_key": "",
+                "rows": cue_projection_rows(rows),
+            }),
+        )
+        .await?;
+        Ok(())
+    }
+
+    pub async fn load_cue_rows(
+        &self,
+        project_id: ProjectId,
+    ) -> Result<Vec<CueIndexRow>, StoreError> {
+        let value = self
+            .execute_value(
+                NamedSurqlOp::LoadCueRows,
+                json!({ "project_id": project_id }),
+            )
+            .await?;
+        if value.get("truncated").and_then(Value::as_bool) == Some(true) {
+            return Err(StoreError::PolicyViolation(
+                "cue index exceeded the 10,000 row project cap".to_owned(),
+            ));
+        }
+        let rows = value
+            .get("rows")
+            .cloned()
+            .ok_or_else(|| StoreError::Decode("cue index response omitted rows".to_owned()))?;
+        serde_json::from_value(rows).map_err(|error| StoreError::Decode(error.to_string()))
+    }
+
+    pub async fn load_cue_records(
+        &self,
+        project_id: ProjectId,
+    ) -> Result<Vec<CueRecordSource>, StoreError> {
+        let value = self
+            .execute_value(
+                NamedSurqlOp::LoadCueRecords,
+                json!({ "project_id": project_id }),
+            )
+            .await?;
+        if value.get("truncated").and_then(Value::as_bool) == Some(true) {
+            return Err(StoreError::PolicyViolation(
+                "canonical cue sources exceeded the 10,000 record project cap".to_owned(),
+            ));
+        }
+        let records = value
+            .get("records")
+            .cloned()
+            .ok_or_else(|| StoreError::Decode("cue source response omitted records".to_owned()))?;
+        serde_json::from_value(records).map_err(|error| StoreError::Decode(error.to_string()))
+    }
+
+    pub async fn load_injection_receipts(
+        &self,
+        project_id: ProjectId,
+        session_id: eliot_types::SessionId,
+    ) -> Result<Vec<InjectionReceipt>, StoreError> {
+        let value = self
+            .execute_value(
+                NamedSurqlOp::LoadInjectionReceipts,
+                json!({
+                    "project_id": project_id,
+                    "session_id": session_id,
+                }),
+            )
+            .await?;
+        if value.get("truncated").and_then(Value::as_bool) == Some(true) {
+            return Err(StoreError::PolicyViolation(
+                "injection receipts exceeded the 10,000 session cap".to_owned(),
+            ));
+        }
+        let receipts = value.get("receipts").cloned().ok_or_else(|| {
+            StoreError::Decode("injection receipt response omitted receipts".to_owned())
+        })?;
+        serde_json::from_value(receipts).map_err(|error| StoreError::Decode(error.to_string()))
     }
 
     pub async fn current_state(
@@ -943,6 +1205,120 @@ impl CanonicalStore {
     {
         self.canonical_records(project_id, task_id, receipt_kinds, None, limit)
             .await
+    }
+
+    pub async fn ul_artifact_by_id<T>(
+        &self,
+        project_id: ProjectId,
+        receipt_kind: &str,
+        artifact_id: &str,
+    ) -> Result<Option<CanonicalRecord<T>>, StoreError>
+    where
+        T: DeserializeOwned,
+    {
+        let mut records = self
+            .canonical_records_by_subject_ref(project_id, None, &[receipt_kind], artifact_id, 2)
+            .await?;
+        if records.len() > 1 {
+            return Err(StoreError::Decode(format!(
+                "UL artifact {artifact_id} resolved to multiple canonical records"
+            )));
+        }
+        Ok(records.pop())
+    }
+
+    pub async fn ul_artifacts_by_kind<T>(
+        &self,
+        project_id: ProjectId,
+        receipt_kind: &str,
+        limit: u16,
+    ) -> Result<Vec<CanonicalRecord<T>>, StoreError>
+    where
+        T: DeserializeOwned,
+    {
+        self.canonical_records_by_kind(project_id, None, &[receipt_kind], limit)
+            .await
+    }
+
+    pub async fn load_ul_artifacts<T>(
+        &self,
+        project_id: ProjectId,
+        receipt_kinds: &[&str],
+        limit: u16,
+    ) -> Result<Vec<CanonicalRecord<T>>, StoreError>
+    where
+        T: DeserializeOwned,
+    {
+        let value = self
+            .execute_value(
+                NamedSurqlOp::LoadUlArtifacts,
+                json!({
+                    "project_id": project_id,
+                    "receipt_kinds": receipt_kinds,
+                    "limit": limit.clamp(1, MAX_CANONICAL_RECORDS),
+                }),
+            )
+            .await?;
+        decode_value(NamedSurqlOp::LoadUlArtifacts, value)
+    }
+
+    pub async fn upsert_ul_task_ledger(
+        &self,
+        project_id: ProjectId,
+        task_id: TaskId,
+        delta: &eliot_types::UlLedgerDelta,
+    ) -> Result<eliot_types::UlTaskLedger, StoreError> {
+        let value = self
+            .execute_value(
+                NamedSurqlOp::UpsertUlTaskLedger,
+                json!({
+                    "ledger_key": format!("{project_id}:{task_id}"),
+                    "project_id": project_id,
+                    "task_id": task_id,
+                    "delta": delta,
+                }),
+            )
+            .await?;
+        decode_value(NamedSurqlOp::UpsertUlTaskLedger, value)
+    }
+
+    pub async fn load_ul_metrics(
+        &self,
+        project_id: ProjectId,
+    ) -> Result<Vec<eliot_types::UlTaskLedger>, StoreError> {
+        let value = self
+            .execute_value(
+                NamedSurqlOp::LoadUlMetrics,
+                json!({ "project_id": project_id }),
+            )
+            .await?;
+        decode_value(NamedSurqlOp::LoadUlMetrics, value)
+    }
+
+    pub async fn load_predictions(
+        &self,
+        project_id: ProjectId,
+        task_id: Option<TaskId>,
+        verifier: Option<&str>,
+        unresolved_only: bool,
+        created_before: Option<time::OffsetDateTime>,
+    ) -> Result<Vec<eliot_types::PredictionRecord>, StoreError> {
+        let value = self
+            .execute_value(
+                NamedSurqlOp::LoadPredictions,
+                json!({
+                    "project_id": project_id,
+                    "task_id": task_id,
+                    "has_task_id": task_id.is_some(),
+                    "verifier": verifier.unwrap_or_default(),
+                    "has_verifier": verifier.is_some(),
+                    "unresolved_only": unresolved_only,
+                    "created_before": created_before.unwrap_or_else(time::OffsetDateTime::now_utc),
+                    "has_created_before": created_before.is_some(),
+                }),
+            )
+            .await?;
+        decode_value(NamedSurqlOp::LoadPredictions, value)
     }
 
     pub async fn meta_policy_actions_by_candidate(
@@ -1399,6 +1775,35 @@ impl CanonicalStore {
     }
 }
 
+fn cue_string_parts(value: &str) -> Vec<&str> {
+    value.split(':').collect()
+}
+
+fn cue_record_ref_key(value: &str) -> String {
+    blake3::hash(value.as_bytes()).to_hex().to_string()
+}
+
+fn cue_projection_rows(rows: &[CueIndexRow]) -> Vec<Value> {
+    rows.iter()
+        .map(|row| {
+            json!({
+                "row_id_parts": cue_string_parts(&row.row_id),
+                "project_id": row.project_id,
+                "cue_kind": row.cue_kind,
+                "cue_value_parts": cue_string_parts(&row.cue_value_norm),
+                "match_mode": row.match_mode,
+                "record_ref_parts": cue_string_parts(&row.record_ref),
+                "record_ref_key": cue_record_ref_key(&row.record_ref),
+                "record_kind": row.record_kind,
+                "strength": row.strength,
+                "negative_memory": row.negative_memory,
+                "lifecycle": row.lifecycle,
+                "token_estimate": row.token_estimate,
+            })
+        })
+        .collect()
+}
+
 fn build_blob_reference_snapshot(
     config: &SurrealServerConfig,
     scope: &str,
@@ -1599,7 +2004,22 @@ fn canonical_payloads(envelope: &MemoryWriteEnvelope) -> Result<Vec<Value>, Stor
                 "trace_ref_fragments": canonical_field_fragments(body, "trace_ref"),
                 "candidate_id_fragments": canonical_field_fragments(body, "candidate_id"),
                 "action_fragments": canonical_field_fragments(body, "action"),
+                "cue_preview_fragments": canonical_field_fragments(body, "body_md"),
             }))
+        })
+        .collect()
+}
+
+fn relation_payloads(envelope: &MemoryWriteEnvelope) -> Vec<Value> {
+    envelope
+        .relations
+        .iter()
+        .map(|relation| {
+            json!({
+                "relation_type": relation.relation_type,
+                "from_fragments": string_fragments(&relation.from),
+                "to_fragments": string_fragments(&relation.to),
+            })
         })
         .collect()
 }

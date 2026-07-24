@@ -7,6 +7,11 @@ LET $mentions = SELECT relation_type, from, to FROM mentions WHERE project_id = 
 LET $belongs_to = SELECT relation_type, from, to FROM belongs_to WHERE project_id = $request.project_id LIMIT 50;
 LET $produced_by = SELECT relation_type, from, to FROM produced_by WHERE project_id = $request.project_id LIMIT 50;
 LET $invalidated_by = SELECT relation_type, from, to FROM invalidated_by WHERE project_id = $request.project_id LIMIT 50;
+LET $co_change = SELECT relation_type, from, to FROM co_change WHERE project_id = $request.project_id LIMIT 50;
+LET $concept_implemented_by = SELECT relation_type, from, to FROM concept_implemented_by WHERE project_id = $request.project_id LIMIT 50;
+LET $concept_depends_on = SELECT relation_type, from, to FROM concept_depends_on WHERE project_id = $request.project_id LIMIT 50;
+LET $capsule_covers = SELECT relation_type, from, to FROM capsule_covers WHERE project_id = $request.project_id LIMIT 50;
+LET $card_covers = SELECT relation_type, from, to FROM card_covers WHERE project_id = $request.project_id LIMIT 50;
 
 RETURN {
   project_id: $request.project_id,
@@ -16,7 +21,21 @@ RETURN {
   verification_runs: SELECT verification_id, result, summary, payload FROM verification_run WHERE project_id = $request.project_id LIMIT 50,
   tool_observations: SELECT observation_id, tool_name, observation, payload FROM tool_observation WHERE project_id = $request.project_id LIMIT 50,
   failure_fingerprints: SELECT fingerprint, summary, payload FROM failure_fingerprint WHERE project_id = $request.project_id LIMIT 50,
-  relations: array::concat($supports, $verified_by, $contradicts, $supersedes, $mentions, $belongs_to, $produced_by, $invalidated_by),
+  relations: array::concat(
+    $supports,
+    $verified_by,
+    $contradicts,
+    $supersedes,
+    $mentions,
+    $belongs_to,
+    $produced_by,
+    $invalidated_by,
+    $co_change,
+    $concept_implemented_by,
+    $concept_depends_on,
+    $capsule_covers,
+    $card_covers
+  ),
   requested_handles: [],
   returned_handles: [],
   missing_handles: [],

@@ -9,9 +9,10 @@ use super::{
     McpAccessProfile, READ_ONLY_TOOLS, action_lease_status_schema, action_plan_schema,
     agent_candidate_schema, blackboard_ack_schema, blackboard_add_schema, codecortex_scan_schema,
     cognitive_record_schema, compile_packet_schema, json_schema, mailbox_ack_schema,
-    mailbox_send_schema, patch_apply_schema, tool, understanding_proof_schema, work_claim_schema,
-    work_create_schema, work_lease_schema, work_status_schema, worktree_create_schema,
-    worktree_lease_schema, worktree_review_schema, worktree_status_schema,
+    mailbox_send_schema, memory_influence_trace_schema, patch_apply_schema, tool,
+    understanding_proof_schema, work_claim_schema, work_create_schema, work_lease_schema,
+    work_status_schema, worktree_create_schema, worktree_lease_schema, worktree_review_schema,
+    worktree_status_schema,
 };
 use anyhow::{Context as _, Result};
 use eliot_types::ClaudeSurface;
@@ -1052,7 +1053,7 @@ pub(super) fn task_tool_definitions() -> Vec<Value> {
         tool(
             "eliot_agent_candidate_submit",
             "Eliot Agent Candidate Submit",
-            "Submit bounded task-scoped candidate-only memory with applicability, negative constraints, provenance, and freshness through WriterActor; it never grants completion or canonical authority.",
+            "Save a reusable claim, decision, or failure. Needs statement and expected_reuse_note; cue bindings can be derived from touched paths.",
             &agent_candidate_schema(),
         ),
         tool(
@@ -1095,7 +1096,7 @@ pub(super) fn core_tool_definitions() -> Vec<Value> {
         tool(
             "eliot_recall_l0",
             "Eliot Recall L0",
-            "Return compact memory handles and previews.",
+            "Search memory by keywords when pushed UL context is insufficient. Needs query. Returns handles and previews.",
             &json_schema(
                 &[
                     ("project_id", "string"),
@@ -1123,7 +1124,7 @@ pub(super) fn core_tool_definitions() -> Vec<Value> {
         tool(
             "eliot_compile_packet_l3",
             "Eliot Compile Packet L3",
-            "Compile a bounded task-specific packet. Material work should include material_frame so current truth, causal path, next action, expected observable and verifier remain explicit.",
+            "Compile task context and a complete frame_stub before material work. Needs goal; task/project may be session-bound.",
             &compile_packet_schema(),
         ),
         tool(
@@ -1135,8 +1136,8 @@ pub(super) fn core_tool_definitions() -> Vec<Value> {
         tool(
             "eliot_memory_influence_trace",
             "Eliot Memory Influence Trace",
-            "Write an outcome-linked memory influence trace. Packet inclusion without observable delta remains loaded_without_delta.",
-            &cognitive_record_schema("trace"),
+            "Acknowledge memory use. Minimal form: memory_handle, influence_class, and downstream_outcome_ref when it changed action.",
+            &memory_influence_trace_schema(),
         ),
         tool(
             "eliot_context_cargo_receipt",

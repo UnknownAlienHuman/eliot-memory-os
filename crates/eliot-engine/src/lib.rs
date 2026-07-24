@@ -32,6 +32,7 @@ pub mod semantic_memory;
 pub mod service;
 pub mod skill;
 pub mod skill_curator;
+pub mod ul;
 pub mod verification;
 pub mod work;
 pub mod worktree;
@@ -187,6 +188,17 @@ pub use skill_curator::{
     SkillArchiveQuarantineService, SkillCurationGate, SkillCurationReport,
     SkillCurationReportService, SkillCuratorMemoryWriter, SkillCuratorRunInput,
     SkillCuratorService, SkillMergeSplitService, SkillPatchService,
+};
+pub use ul::{
+    CalibrationService, CapsuleEvidence, ConceptSeedResult, CueIndexService, FiredMemory,
+    FiringResult, GitMiningArtifacts, GitMiningService, GitMiningStatus, InjectionPlanner,
+    MetacognitionService, ModuleCardService, ObservedCue, OnboardingService, PredictionCapture,
+    PredictionCaptureInput, PredictionService, PromotedPyramid, PyramidBuilder, PyramidDecision,
+    PyramidDependency, PyramidFailure, TouchedCue, TouchedSetRegistry, UlArtifactWriteReport,
+    UlArtifactWriterService, UlLedgerAccumulator, UlLedgerService, UlToolMeasurement,
+    canonical_project_root, capsule_freshness, failure_bindings_by_path, is_mutation_tool,
+    is_read_class_tool, normalize_verifier, parse_expected_observable, prediction_id,
+    render_capsule, resolve_prediction,
 };
 pub use verification::{
     FlakeDetectionService, StatefulDbTestIsolationService, TestCostService, TestInventoryService,

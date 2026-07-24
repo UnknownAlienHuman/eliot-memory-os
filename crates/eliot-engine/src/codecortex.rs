@@ -191,11 +191,11 @@ impl CodeCortexMemoryWriter {
     }
 }
 
-struct ProcessOutput {
-    status: bool,
-    code: Option<i32>,
-    stdout: String,
-    stderr: String,
+pub(crate) struct ProcessOutput {
+    pub(crate) status: bool,
+    pub(crate) code: Option<i32>,
+    pub(crate) stdout: String,
+    pub(crate) stderr: String,
 }
 
 struct ManifestView {
@@ -215,7 +215,11 @@ impl ProcessOutput {
     }
 }
 
-fn run_process(cwd: &Path, program: &str, args: &[&str]) -> Result<ProcessOutput, EngineError> {
+pub(crate) fn run_process(
+    cwd: &Path,
+    program: &str,
+    args: &[&str],
+) -> Result<ProcessOutput, EngineError> {
     let output = Command::new(program).args(args).current_dir(cwd).output()?;
     Ok(ProcessOutput {
         status: output.status.success(),

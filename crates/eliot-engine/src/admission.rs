@@ -3,10 +3,11 @@ use eliot_types::{
     ClaimCardInput, EpistemicStatus, EvidenceAtomInput, FailureFingerprintInput,
     IdempotencyOptions, LifecycleWriteOptions, MemoryWriteEnvelope, OperationId, RelationInput,
     RelationType, SemanticCommand, SourceSnapshotInput, TaskContractInput, ToolObservationInput,
-    VerificationResult, VerificationRunInput, WriteRejectReason,
+    UlArtifact, VerificationResult, VerificationRunInput, WriteRejectReason, normalize_bindings,
 };
 use serde::Serialize;
 use serde_json::{Value, json};
+use std::collections::BTreeSet;
 use time::OffsetDateTime;
 
 const MAX_COMMAND_BYTES: usize = 128 * 1024;
@@ -16,6 +17,11 @@ pub struct WriteAdmissionService;
 
 impl WriteAdmissionService {
     pub fn admit(&self, command: &SemanticCommand) -> Result<MemoryWriteEnvelope, EngineError> {
+        let value = serde_json::to_value(command)?;
+        let violations = eliot_types::ul::guard::inspect_text_encoding(&value);
+        if !violations.is_empty() {
+            return Err(EngineError::EncodingRejected { violations });
+        }
         validate_command_shape(command)?;
         let input_hash = stable_input_hash(command)?;
         let context = command.context().clone();
@@ -116,6 +122,9 @@ fn admit_command(command: &SemanticCommand) -> Result<AdmittedCommand, EngineErr
             admitted.verification_runs.push(body.verification.clone());
         }
         SemanticCommand::AgentResultRecord(body) => admit_agent_result(&mut admitted, body)?,
+        SemanticCommand::UlArtifactBatchRecord(body) => {
+            admit_ul_artifact_batch_record(&mut admitted, body)?;
+        }
         SemanticCommand::DiagnosticBatchRecord(_)
         | SemanticCommand::ActiveDecisionTransition(_)
         | SemanticCommand::ProbeRecord(_)
@@ -127,6 +136,286 @@ fn admit_command(command: &SemanticCommand) -> Result<AdmittedCommand, EngineErr
         }
     }
     Ok(admitted)
+}
+
+fn admit_ul_artifact_batch_record(
+    admitted: &mut AdmittedCommand,
+    body: &eliot_types::UlArtifactBatchRecordCommand,
+) -> Result<(), EngineError> {
+    if body.context.authority != "local-ul-builder" {
+        return reject("UL artifacts require local-ul-builder authority");
+    }
+    if !matches!(
+        body.context.taint,
+        eliot_types::TaintClass::LocalTool | eliot_types::TaintClass::LocalVerified
+    ) {
+        return reject("UL artifacts require LocalTool or LocalVerified taint");
+    }
+    if body.artifacts.is_empty() || body.artifacts.len() > 50 {
+        return reject("UL artifact batches must contain 1..=50 artifacts");
+    }
+
+    let mut artifact_ids = BTreeSet::new();
+    let mut expected_relations = Vec::new();
+    for artifact in &body.artifacts {
+        let artifact_id = artifact.artifact_id().trim();
+        if artifact_id.is_empty() || !artifact_ids.insert(artifact_id.to_owned()) {
+            return reject("UL artifact ids must be non-empty and unique inside the batch");
+        }
+        if artifact.project_id() != body.context.project_id {
+            return reject("UL artifact project_id must match command context");
+        }
+        expected_relations.extend(ul_artifact_relations(artifact)?);
+    }
+
+    let mut supplied_relations = BTreeSet::new();
+    for relation in &body.relations {
+        if relation.from.trim().is_empty() || relation.to.trim().is_empty() {
+            return reject("UL artifact relation endpoints must be non-empty");
+        }
+        if !matches!(
+            relation.relation_type,
+            RelationType::CoChange
+                | RelationType::ConceptImplementedBy
+                | RelationType::ConceptDependsOn
+                | RelationType::CapsuleCovers
+                | RelationType::CardCovers
+        ) {
+            return reject("relation type is not allowed for UL artifacts");
+        }
+        if !supplied_relations.insert((
+            relation_type_name(relation.relation_type),
+            relation.from.clone(),
+            relation.to.clone(),
+        )) {
+            return reject("UL artifact relations must be unique inside the batch");
+        }
+    }
+    if expected_relations.iter().any(|(relation_type, from, to)| {
+        body.relations
+            .iter()
+            .filter(|relation| {
+                relation.relation_type == *relation_type
+                    && relation.from == *from
+                    && relation.to == *to
+            })
+            .count()
+            != 1
+    }) || body.relations.iter().any(|relation| {
+        relation.relation_type != RelationType::ConceptDependsOn
+            && !expected_relations.iter().any(|(relation_type, from, to)| {
+                relation.relation_type == *relation_type
+                    && relation.from == *from
+                    && relation.to == *to
+            })
+    }) {
+        return reject("UL artifact relations do not exactly match their artifact bodies");
+    }
+
+    validate_pyramid_build_pairs(&body.artifacts)?;
+
+    for artifact in &body.artifacts {
+        admitted.tool_observations.push(ToolObservationInput {
+            observation_id: artifact.artifact_id().to_owned(),
+            tool_name: "ul_artifact_writer_actor".to_owned(),
+            observation: format!("recorded {} artifact", artifact.receipt_kind()),
+            payload: json!({
+                "receipt_kind": artifact.receipt_kind(),
+                "receipt_body": ul_artifact_body(artifact)?,
+                "writer_path": "ul_artifact_writer_actor",
+            }),
+        });
+    }
+    admitted.relations.extend(body.relations.clone());
+    Ok(())
+}
+
+fn ul_artifact_relations(
+    artifact: &UlArtifact,
+) -> Result<Vec<(RelationType, String, String)>, EngineError> {
+    match artifact {
+        UlArtifact::CoChangeEdge(edge) => {
+            if edge.path_a.trim().is_empty()
+                || edge.path_b.trim().is_empty()
+                || edge.path_a >= edge.path_b
+            {
+                return reject("co-change paths must be non-empty and lexicographically ordered");
+            }
+            Ok(vec![(
+                RelationType::CoChange,
+                format!("file:{}", edge.path_a),
+                format!("file:{}", edge.path_b),
+            )])
+        }
+        UlArtifact::ModuleCard(card) => {
+            validate_normalized_cue_bindings(&card.cue_bindings)?;
+            Ok(vec![(
+                RelationType::CardCovers,
+                format!("card:{}", card.card_id),
+                format!("file:{}", card.path),
+            )])
+        }
+        UlArtifact::ConceptNode(concept) => {
+            validate_normalized_cue_bindings(&concept.cue_bindings)?;
+            if concept.name.trim().is_empty()
+                || concept.purpose.trim().is_empty()
+                || concept.boundary_paths.is_empty()
+            {
+                return reject("concept name, purpose, and boundaries are required");
+            }
+            Ok(concept
+                .boundary_paths
+                .iter()
+                .map(|path| {
+                    (
+                        RelationType::ConceptImplementedBy,
+                        format!("concept:{}", concept.concept_id),
+                        format!("file:{path}"),
+                    )
+                })
+                .collect())
+        }
+        UlArtifact::ProjectCharter(charter) => {
+            validate_normalized_cue_bindings(&charter.cue_bindings)?;
+            validate_pyramid_body(
+                &charter.body_md,
+                &[
+                    "WHAT",
+                    "FOR WHOM",
+                    "TOP INVARIANTS",
+                    "NON-GOALS",
+                    "VOCABULARY",
+                ],
+            )?;
+            Ok(Vec::new())
+        }
+        UlArtifact::SystemMap(map) => {
+            validate_normalized_cue_bindings(&map.cue_bindings)?;
+            validate_pyramid_body(&map.body_md, &["SYSTEMS", "FLOWS"])?;
+            Ok(Vec::new())
+        }
+        UlArtifact::SubsystemCapsule(capsule) => {
+            validate_normalized_cue_bindings(&capsule.cue_bindings)?;
+            validate_pyramid_body(
+                &capsule.body_md,
+                &[
+                    "PURPOSE",
+                    "BOUNDARIES",
+                    "KEY ENTRYPOINTS",
+                    "INVARIANTS",
+                    "DRAGONS",
+                    "KEY DECISIONS",
+                    "VERIFIERS",
+                ],
+            )?;
+            Ok(vec![(
+                RelationType::CapsuleCovers,
+                format!("capsule:{}", capsule.capsule_id),
+                format!("concept:{}", capsule.concept_id),
+            )])
+        }
+        UlArtifact::CapsuleBuild(build) => {
+            if build.status != eliot_types::PyramidBuildStatus::Promoted
+                || build.inputs_hash.len() != 64
+                || build.token_estimate > build.budget_limit
+            {
+                return reject("only validated promoted pyramid builds may be written");
+            }
+            Ok(Vec::new())
+        }
+        UlArtifact::MiningRun(_) | UlArtifact::HotspotScore(_) => Ok(Vec::new()),
+    }
+}
+
+fn validate_pyramid_build_pairs(artifacts: &[UlArtifact]) -> Result<(), EngineError> {
+    for artifact in artifacts {
+        let UlArtifact::CapsuleBuild(build) = artifact else {
+            continue;
+        };
+        let matches_target = artifacts.iter().any(|candidate| match candidate {
+            UlArtifact::SubsystemCapsule(value) => {
+                build.target_kind == eliot_types::PyramidTargetKind::SubsystemCapsule
+                    && value.capsule_id == build.target_id
+                    && value.build_id == build.build_id
+            }
+            UlArtifact::SystemMap(value) => {
+                build.target_kind == eliot_types::PyramidTargetKind::SystemMap
+                    && value.map_id == build.target_id
+                    && value.build_id == build.build_id
+            }
+            UlArtifact::ProjectCharter(value) => {
+                build.target_kind == eliot_types::PyramidTargetKind::ProjectCharter
+                    && value.charter_id == build.target_id
+                    && value.build_id == build.build_id
+            }
+            _ => false,
+        });
+        if !matches_target {
+            return reject("promoted pyramid build must share a batch with its exact target");
+        }
+    }
+    Ok(())
+}
+
+fn validate_pyramid_body(body: &str, headers: &[&str]) -> Result<(), EngineError> {
+    let mut last = None;
+    for header in headers {
+        if body.lines().filter(|line| line.trim() == *header).count() != 1 {
+            return reject("pyramid body must contain each required header exactly once");
+        }
+        let position = body.find(header).ok_or_else(|| {
+            EngineError::WriteRejected("required pyramid header missing".to_owned())
+        })?;
+        if last.is_some_and(|previous| position <= previous) {
+            return reject("pyramid body headers are out of order");
+        }
+        last = Some(position);
+    }
+    Ok(())
+}
+
+fn validate_normalized_cue_bindings(
+    bindings: &[eliot_types::CueBinding],
+) -> Result<(), EngineError> {
+    let normalized = normalize_bindings(bindings.to_vec(), None)
+        .map_err(|error| EngineError::WriteRejected(format!("invalid cue binding: {error}")))?;
+    if normalized != bindings {
+        return reject("UL artifact cue bindings must already be normalized");
+    }
+    Ok(())
+}
+
+fn ul_artifact_body(artifact: &UlArtifact) -> Result<Value, EngineError> {
+    let value = match artifact {
+        UlArtifact::MiningRun(value) => serde_json::to_value(value)?,
+        UlArtifact::HotspotScore(value) => serde_json::to_value(value)?,
+        UlArtifact::CoChangeEdge(value) => serde_json::to_value(value)?,
+        UlArtifact::ModuleCard(value) => serde_json::to_value(value)?,
+        UlArtifact::ConceptNode(value) => serde_json::to_value(value)?,
+        UlArtifact::ProjectCharter(value) => serde_json::to_value(value)?,
+        UlArtifact::SystemMap(value) => serde_json::to_value(value)?,
+        UlArtifact::SubsystemCapsule(value) => serde_json::to_value(value)?,
+        UlArtifact::CapsuleBuild(value) => serde_json::to_value(value)?,
+    };
+    Ok(value)
+}
+
+const fn relation_type_name(relation_type: RelationType) -> &'static str {
+    match relation_type {
+        RelationType::Supports => "supports",
+        RelationType::VerifiedBy => "verified_by",
+        RelationType::Contradicts => "contradicts",
+        RelationType::Supersedes => "supersedes",
+        RelationType::Mentions => "mentions",
+        RelationType::BelongsTo => "belongs_to",
+        RelationType::ProducedBy => "produced_by",
+        RelationType::InvalidatedBy => "invalidated_by",
+        RelationType::CoChange => "co_change",
+        RelationType::ConceptImplementedBy => "concept_implemented_by",
+        RelationType::ConceptDependsOn => "concept_depends_on",
+        RelationType::CapsuleCovers => "capsule_covers",
+        RelationType::CardCovers => "card_covers",
+    }
 }
 
 fn admit_agent_result(
@@ -234,6 +523,13 @@ fn admit_claim_propose(
         return reject("ClaimPropose must use candidate status");
     }
     admitted.claims.push(body.claim.clone());
+    if let Some(task_id) = body.context.task_id {
+        admitted.relations.push(RelationInput {
+            relation_type: RelationType::BelongsTo,
+            from: body.claim.claim_id.to_string(),
+            to: task_id.to_string(),
+        });
+    }
     Ok(())
 }
 

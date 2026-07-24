@@ -135,6 +135,10 @@ enum Command {
         #[command(subcommand)]
         command: GraphCommand,
     },
+    Ul {
+        #[command(subcommand)]
+        command: commands::UlCommand,
+    },
     Codecortex {
         #[command(subcommand)]
         command: CodeCortexCommand,
@@ -1950,6 +1954,17 @@ async fn dispatch_command(
         Command::Graph {
             command: GraphCommand::Health,
         } => commands::run_graph_health(config).await,
+        Command::Ul { command } => match command {
+            commands::UlCommand::MineGit { project, root } => {
+                commands::run_ul_mine_git(config, project, &root).await
+            }
+            commands::UlCommand::Onboard { project, root } => {
+                commands::run_ul_onboard(config, project, &root).await
+            }
+            commands::UlCommand::Report { project } => {
+                commands::run_ul_report(config, project).await
+            }
+        },
         Command::Codecortex { command } => match command {
             CodeCortexCommand::Health => commands::run_codecortex_health(config),
             CodeCortexCommand::Scan {

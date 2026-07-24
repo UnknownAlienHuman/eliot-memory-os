@@ -260,12 +260,26 @@ mod tests {
     }
 
     #[test]
-    fn relation_requires_both_endpoints_in_exact_scope() {
-        let (mut response, claim_handle) = scoped_response();
-        filter_exact_l2_response(&mut response, &[claim_handle]);
-        assert_eq!(response.claims.len(), 1);
-        assert!(response.evidence_atoms.is_empty());
+    fn sealed_relation_requires_both_endpoints_in_exact_scope() {
+        let (mut response, _) = scoped_response();
+        response.relations = vec![RelationSummary {
+            relation_type: RelationType::CoChange,
+            from: "file:src/a.rs".to_owned(),
+            to: "file:src/b.rs".to_owned(),
+        }];
+        filter_required_exact_l2_response(&mut response, &["file:src/a.rs".to_owned()]);
         assert!(response.relations.is_empty());
-        assert_eq!(response.truncation.returned, 1);
+
+        let (mut response, _) = scoped_response();
+        response.relations = vec![RelationSummary {
+            relation_type: RelationType::CoChange,
+            from: "file:src/a.rs".to_owned(),
+            to: "file:src/b.rs".to_owned(),
+        }];
+        filter_required_exact_l2_response(
+            &mut response,
+            &["file:src/a.rs".to_owned(), "file:src/b.rs".to_owned()],
+        );
+        assert_eq!(response.relations.len(), 1);
     }
 }

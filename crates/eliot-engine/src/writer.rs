@@ -2,8 +2,9 @@ use crate::{EngineError, resolve_canonical_case_dispositions};
 use eliot_store::{CanonicalStore, ControlWal, StoreError, WalWriteState};
 use eliot_types::{
     CognitiveRunContract, CognitiveRunTerminal, CognitiveSharedGateBinding, MemoryLifecycleState,
-    MemoryStateTransition, MemoryWriteEnvelope, ProjectId, ProjectSequence, SessionId, TaskId,
-    WriteId, WriteReceipt, WriteReceiptRef, WriteRejectReason, WriteStatus,
+    MemoryStateTransition, MemoryWriteEnvelope, ObservabilityWriteEnvelope,
+    ObservabilityWriteReceipt, ObservabilityWriteStatus, ProjectId, ProjectSequence, SessionId,
+    TaskId, WriteId, WriteReceipt, WriteReceiptRef, WriteRejectReason, WriteStatus,
 };
 use tokio::sync::{mpsc, oneshot};
 
@@ -39,6 +40,10 @@ pub struct CognitiveTerminalPrecondition {
 
 enum WriterMessage {
     Write(WriterRequest),
+    Observability {
+        envelope: ObservabilityWriteEnvelope,
+        response_tx: oneshot::Sender<Result<ObservabilityWriteReceipt, EngineError>>,
+    },
     CognitiveBegin {
         envelope: Box<MemoryWriteEnvelope>,
         precondition: CognitiveBeginPrecondition,
@@ -91,6 +96,13 @@ impl WriterActor {
                 WriterMessage::Write(request) => {
                     let result = self.apply(request.envelope).await;
                     let _ = request.response_tx.send(result);
+                }
+                WriterMessage::Observability {
+                    envelope,
+                    response_tx,
+                } => {
+                    let result = self.apply_observability(envelope).await;
+                    let _ = response_tx.send(result);
                 }
                 WriterMessage::CognitiveBegin {
                     envelope,
@@ -484,6 +496,52 @@ impl WriterActor {
         }
     }
 
+    async fn apply_observability(
+        &self,
+        envelope: ObservabilityWriteEnvelope,
+    ) -> Result<ObservabilityWriteReceipt, EngineError> {
+        let boundary_bytes = serde_json::to_vec(&envelope)?;
+        if let Err(violation) = eliot_types::inspect_secret_bytes(&boundary_bytes) {
+            return Err(EngineError::WriteRejected(format!(
+                "secret boundary rejected observability ingress: {}",
+                violation.rule
+            )));
+        }
+        if envelope.input_hash.trim().is_empty() {
+            return Err(EngineError::WriteRejected(
+                "observability input_hash is required".to_owned(),
+            ));
+        }
+        if envelope.record_id.trim().is_empty() {
+            return Err(EngineError::WriteRejected(
+                "observability record_id is required".to_owned(),
+            ));
+        }
+
+        if let Some(mut existing) = self.store.observability_receipt(envelope.write_id).await? {
+            if existing.input_hash == envelope.input_hash {
+                existing.status = ObservabilityWriteStatus::IdempotentReplay;
+                return Ok(existing);
+            }
+            return Err(EngineError::ObservabilityConflict);
+        }
+
+        match self.store.apply_observability(&envelope).await {
+            Ok(receipt) => Ok(receipt),
+            Err(StoreError::ObservabilityConflict) => Err(EngineError::ObservabilityConflict),
+            Err(error) if is_ambiguous_commit_error(&error) => {
+                if let Some(existing) = self.store.observability_receipt(envelope.write_id).await? {
+                    if existing.input_hash == envelope.input_hash {
+                        return Ok(existing);
+                    }
+                    return Err(EngineError::ObservabilityConflict);
+                }
+                Err(error.into())
+            }
+            Err(error) => Err(error.into()),
+        }
+    }
+
     fn handle_store_receipt(&self, receipt: WriteReceipt) -> Result<WriteReceipt, EngineError> {
         if receipt.status == WriteStatus::Rejected {
             self.wal.mark_rejected(&receipt)?;
@@ -583,6 +641,20 @@ impl WriterHandle {
         };
         self.tx
             .try_send(WriterMessage::Write(request))
+            .map_err(|_| EngineError::Backpressure)?;
+        response_rx.await.map_err(|_| EngineError::WriterClosed)?
+    }
+
+    pub async fn submit_observability(
+        &self,
+        envelope: ObservabilityWriteEnvelope,
+    ) -> Result<ObservabilityWriteReceipt, EngineError> {
+        let (response_tx, response_rx) = oneshot::channel();
+        self.tx
+            .try_send(WriterMessage::Observability {
+                envelope,
+                response_tx,
+            })
             .map_err(|_| EngineError::Backpressure)?;
         response_rx.await.map_err(|_| EngineError::WriterClosed)?
     }

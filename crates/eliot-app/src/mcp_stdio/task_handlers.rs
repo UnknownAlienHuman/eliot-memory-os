@@ -5,8 +5,33 @@ fn canonical_struct_hash<T: serde::Serialize>(value: &T) -> Result<String> {
 }
 
 #[allow(clippy::too_many_lines)]
-async fn dispatch_compile_packet_l3(state: &McpState, arguments: Value) -> Result<Value> {
-    let input: CompilePacketToolInput = serde_json::from_value(arguments)?;
+async fn dispatch_compile_packet_l3(
+    state: &McpState,
+    context: AuthenticatedRequestContext,
+    arguments: Value,
+) -> Result<Value> {
+    let input = input_validation::decode_compile_packet_input(arguments)?;
+    let memory_free_control =
+        input.memory_mode == Some(MemoryExposureMode::MemoryFreeControl);
+    if input
+        .material_frame
+        .as_ref()
+        .is_some_and(|frame| frame.expected_observable.trim().is_empty())
+    {
+        return Err(eliot_types::ToolInputError {
+            data: eliot_types::ToolInputErrorData {
+                code: "INVALID_TOOL_INPUT".to_owned(),
+                missing: Vec::new(),
+                invalid: vec![eliot_types::InvalidField {
+                    field: "material_frame.expected_observable".to_owned(),
+                    reason: "material work requires a machine-checkable expected observable"
+                        .to_owned(),
+                }],
+                minimal_valid_example: eliot_types::compile_packet_minimal_example(),
+            },
+        }
+        .into());
+    }
     let request = input.request;
     let packet_task = if let Ok(packet_task_id) = TaskId::from_str(&request.task_id) {
         state.store.task_contract_by_id(packet_task_id).await?
@@ -125,6 +150,28 @@ async fn dispatch_compile_packet_l3(state: &McpState, arguments: Value) -> Resul
         packet.memory_applicability.inclusion_reasons.sort();
         packet.memory_applicability.inclusion_reasons.dedup();
     }
+    let touched_paths = packet_scope_paths(&packet, input.material_frame.as_ref(), &request);
+    let fallback_text = format!(
+        "{} {} {}",
+        request.goal,
+        request.candidate_handles.join(" "),
+        packet.exact_handles.join(" ")
+    );
+    let pyramid = if memory_free_control {
+        None
+    } else {
+        Some(
+            state
+                .ul
+                .packet_enrichment(
+                    request.project_id,
+                    &request.task_id,
+                    &touched_paths,
+                    &fallback_text,
+                )
+                .await?,
+        )
+    };
     write_json_report(
         &state
             .root
@@ -133,11 +180,231 @@ async fn dispatch_compile_packet_l3(state: &McpState, arguments: Value) -> Resul
             .join("latest.json"),
         &packet,
     )?;
+    let mut frame_stub = material_frame_stub(&packet, packet_task.as_ref());
+    if frame_stub.causal_bridge.is_empty()
+        && let Some(pyramid) = &pyramid
+    {
+        frame_stub.causal_bridge = pyramid.bridge.clone();
+    }
+    let packet_id = packet.packet_id.clone();
     let mut value = serde_json::to_value(packet)?;
+    if let Some(pyramid) = &pyramid {
+        value["ul_understanding"] = pyramid.understanding.clone();
+        let coverage = serde_json::to_value(pyramid.coverage)?
+            .as_str()
+            .unwrap_or("blind")
+            .to_owned();
+        value["ul_meta"] = json!({
+            "coverage": coverage,
+            "novelty_percent": pyramid.meta.novelty_percent,
+            "danger": pyramid.meta.danger_paths,
+            "recommended_probe": pyramid.recommended_probe,
+        });
+        let material_risk = input.material_frame.as_ref().is_some_and(|frame| {
+            frame.active_plan.len() > 1 || touched_paths.len() > 1
+        });
+        if material_risk
+            && pyramid.coverage == eliot_types::CoverageClass::Blind
+            && value.get("ul_gate").is_none()
+        {
+            let suggested_probe = pyramid
+                .recommended_probe
+                .clone()
+                .or_else(|| {
+                    input
+                        .material_frame
+                        .as_ref()
+                        .map(|frame| frame.verifier.clone())
+                })
+                .unwrap_or_else(|| frame_stub.verifier.clone());
+            value["ul_gate"] = json!({
+                "status": "require_probe",
+                "reason": "blind_subsystem",
+                "concept_or_path": pyramid
+                    .blind_target
+                    .clone()
+                    .or_else(|| touched_paths.first().cloned())
+                    .unwrap_or_else(|| "unknown".to_owned()),
+                "suggested_probe": suggested_probe,
+            });
+        }
+        if let Some(frame) = input.material_frame.as_ref() {
+            let source_frame_hash = canonical_struct_hash(frame)?;
+            if eliot_engine::parse_expected_observable(&frame.expected_observable).is_some() {
+                if let Ok(task_id) = TaskId::from_str(&request.task_id)
+                    && let Some(capture) = state
+                        .ul
+                        .prediction
+                        .capture(eliot_engine::PredictionCaptureInput {
+                            project_id: request.project_id,
+                            task_id,
+                            session_id: context.session_id,
+                            subsystem_concept_id: pyramid.subsystem_concept_id.clone(),
+                            packet_id: packet_id.clone(),
+                            expected_observable: frame.expected_observable.clone(),
+                            source_frame_hash,
+                        })
+                        .await?
+                {
+                    value["prediction_ref"] = Value::String(capture.prediction_ref);
+                }
+            } else {
+                value["ul_prediction"] = json!({"status": "not_machine_checkable"});
+            }
+        }
+    }
+    value["frame_stub"] = serde_json::to_value(frame_stub)?;
+    value["frame_stub_required_edits"] = json!([]);
+    value["frame_stub_ready"] = Value::Bool(true);
     if let Some(task) = packet_task.as_ref() {
         enrich_packet_with_task(state, &mut value, task).await?;
     }
     Ok(value)
+}
+
+fn packet_scope_paths(
+    packet: &ContextPacketL3,
+    frame: Option<&MaterialPacketFrame>,
+    request: &CompilePacketL3Request,
+) -> Vec<String> {
+    let mut values = BTreeSet::new();
+    if let Some(codecortex) = &packet.codecortex {
+        for evidence in &codecortex.file_evidence {
+            insert_path_tokens(&mut values, &evidence.path);
+        }
+    }
+    for hop in &packet.causal_bridge {
+        insert_path_tokens(&mut values, &hop.from);
+        insert_path_tokens(&mut values, &hop.to);
+        if let Some(reference) = &hop.evidence_ref {
+            insert_path_tokens(&mut values, reference);
+        }
+    }
+    if let Some(frame) = frame {
+        for atom in &frame.exact_load_bearing_atoms {
+            insert_path_tokens(&mut values, atom);
+        }
+        for hop in &frame.causal_bridge {
+            insert_path_tokens(&mut values, &hop.from);
+            insert_path_tokens(&mut values, &hop.to);
+            if let Some(reference) = &hop.evidence_ref {
+                insert_path_tokens(&mut values, reference);
+            }
+        }
+    }
+    for handle in &request.candidate_handles {
+        insert_path_tokens(&mut values, handle);
+    }
+    insert_path_tokens(&mut values, &request.goal);
+    values.into_iter().collect()
+}
+
+fn insert_path_tokens(paths: &mut BTreeSet<String>, value: &str) {
+    for token in value.split_whitespace() {
+        let token = token
+            .trim_matches(|character: char| {
+                matches!(
+                    character,
+                    '`' | '"' | '\'' | ',' | ';' | '(' | ')' | '[' | ']' | '{' | '}'
+                )
+            })
+            .strip_prefix("file:")
+            .unwrap_or(token);
+        let token = token
+            .split('#')
+            .next()
+            .unwrap_or(token)
+            .replace('\\', "/")
+            .trim_start_matches("./")
+            .to_owned();
+        if token.contains('/')
+            && token
+                .rsplit('/')
+                .next()
+                .is_some_and(|leaf| leaf.contains('.') || leaf == "src")
+        {
+            paths.insert(token);
+        }
+    }
+}
+
+fn material_frame_stub(
+    packet: &ContextPacketL3,
+    task: Option<&TaskContract>,
+) -> MaterialPacketFrame {
+    let next_action = if packet
+        .decision_locality_suffix
+        .next_allowed_action
+        .trim()
+        .is_empty()
+    {
+        "inspect responsible boundary".to_owned()
+    } else {
+        packet.decision_locality_suffix.next_allowed_action.clone()
+    };
+    let verifier = if packet.decision_locality_suffix.verifier.trim().is_empty() {
+        "cargo test --workspace".to_owned()
+    } else {
+        packet.decision_locality_suffix.verifier.clone()
+    };
+    let stop_condition = if packet
+        .decision_locality_suffix
+        .stop_condition
+        .trim()
+        .is_empty()
+    {
+        "stop on verifier failure".to_owned()
+    } else {
+        packet.decision_locality_suffix.stop_condition.clone()
+    };
+    MaterialPacketFrame {
+        acceptance_items: task.map_or_else(Vec::new, |task| {
+            task.acceptance_items
+                .iter()
+                .map(|item| item.description.clone())
+                .collect()
+        }),
+        environment: packet
+            .current_truth_snapshot
+            .as_ref()
+            .map_or_else(Vec::new, |snapshot| snapshot.environment.clone()),
+        active_plan: vec![next_action.clone()],
+        completed_work: task.map_or_else(Vec::new, |task| {
+            task.acceptance_items
+                .iter()
+                .filter(|item| item.satisfied)
+                .map(|item| item.description.clone())
+                .collect()
+        }),
+        killed_paths: packet.killed_paths.clone(),
+        causal_bridge: packet.causal_bridge.clone(),
+        negative_memory_checked: !packet.negative_memory.is_empty()
+            || packet
+                .memory_decisions
+                .iter()
+                .any(|decision| decision.memory_handle.contains("failure")),
+        exact_load_bearing_atoms: packet.exact_handles.clone(),
+        cheapest_discriminative_probes: packet
+            .decision_locality_suffix
+            .cheapest_discriminative_probes
+            .clone(),
+        responsibility_contour_route_refs: packet
+            .decision_locality_suffix
+            .responsibility_contour_route_refs
+            .clone(),
+        next_allowed_action: next_action,
+        expected_observable: format!("verifier:{verifier}=pass"),
+        verifier,
+        stop_condition,
+        tool_schema_bytes_visible: packet
+            .packet_quality
+            .as_ref()
+            .map_or(0, |quality| quality.tool_schema_bytes_visible),
+        instruction_hotset_size: packet
+            .packet_quality
+            .as_ref()
+            .map_or(0, |quality| quality.instruction_hotset_size),
+    }
 }
 
 async fn dispatch_understanding_outcome_record(
@@ -163,13 +430,100 @@ async fn dispatch_understanding_outcome_record(
     serde_json::to_value(input.record).map_err(Into::into)
 }
 
-async fn dispatch_memory_influence_trace(state: &McpState, arguments: Value) -> Result<Value> {
-    let mut input: MemoryInfluenceTraceToolInput = serde_json::from_value(arguments)?;
-    CognitiveMemoryWriter::write_memory_influence_trace(
+#[allow(clippy::too_many_lines)] // One validated observability command is kept contiguous.
+async fn dispatch_memory_influence_trace(
+    state: &McpState,
+    context: AuthenticatedRequestContext,
+    arguments: Value,
+) -> Result<Value> {
+    let input: MemoryInfluenceToolInput = serde_json::from_value(arguments)?;
+    let (project_id, write_id, mut trace) = match input {
+        MemoryInfluenceToolInput::Full(input) => (
+            parse_project_id(&input.project_id)?,
+            WriteId::from_str(&input.write_id)?,
+            input.trace,
+        ),
+        MemoryInfluenceToolInput::Ack(ack) => {
+            let project_id = context
+                .bound_project_id
+                .or_else(|| {
+                    ack.project_id
+                        .as_deref()
+                        .and_then(|project_id| ProjectId::from_str(project_id).ok())
+                })
+                .context("minimal influence acknowledgement requires project_id when unbound")?;
+            let task_id = context
+                .bound_task_id
+                .or_else(|| {
+                    state
+                        .ul
+                        .touched
+                        .last_task_id(project_id, context.session_id)
+                })
+                .context(
+                    "MISSING_PROJECT_PACKET_CONTEXT: minimal influence acknowledgement requires a prior packet for this project or an explicit bound task",
+                )?;
+            let (packet_id, packet_handles) = state
+                .ul
+                .touched
+                .packet_context(project_id, context.session_id);
+            let packet_id = packet_id.context(
+                "MISSING_PROJECT_PACKET_CONTEXT: minimal influence acknowledgement requires a prior packet for this project or an explicit bound task",
+            )?;
+            let epistemic_status =
+                influence_epistemic_status(state, project_id, &ack.memory_handle).await?;
+            let admission_decision = match epistemic_status.as_str() {
+                "verified" => MemoryAdmissionDecision::IncludeVerified,
+                "supported" => MemoryAdmissionDecision::IncludeSupported,
+                _ => MemoryAdmissionDecision::RequireRevalidation,
+            };
+            let class_name = serde_json::to_value(ack.influence_class)?
+                .as_str()
+                .unwrap_or("unknown")
+                .to_owned();
+            let used_and_changed_action =
+                ack.influence_class == MemoryInfluenceClass::UsedAndChangedAction;
+            let used_for_verification =
+                ack.influence_class == MemoryInfluenceClass::UsedForVerification;
+            let prevented_repeated_failure =
+                ack.influence_class == MemoryInfluenceClass::PreventedRepeatedFailure;
+            let suppressed = matches!(
+                ack.influence_class,
+                MemoryInfluenceClass::SuppressedAsStale
+                    | MemoryInfluenceClass::SuppressedAsWrongScope
+            );
+            let cited_in_understanding_proof = packet_handles.contains(&ack.memory_handle);
+            let trace = MemoryInfluenceTrace {
+                task_id,
+                session_id: AgentSessionId::from_uuid(context.session_id.as_uuid()),
+                memory_handle: ack.memory_handle,
+                packet_id,
+                admission_decision,
+                inclusion_or_suppression_reason: format!("ack:{class_name}"),
+                epistemic_status_at_use: epistemic_status,
+                cited_in_understanding_proof,
+                action_or_probe_changed: used_and_changed_action,
+                write_set_changed: false,
+                verifier_changed: used_for_verification,
+                repeated_failure_prevented: prevented_repeated_failure,
+                suppressed_as_stale_or_wrong_scope: suppressed,
+                downstream_outcome_ref: ack.downstream_outcome_ref,
+                influence_class: ack.influence_class,
+                canonical_receipt: None,
+            };
+            let write_id = ack.write_id.map_or_else(
+                || deterministic_influence_write_id(project_id, &trace),
+                |write_id| WriteId::from_str(&write_id).context("parse influence write id"),
+            )?;
+            (project_id, write_id, trace)
+        }
+    };
+    trace.canonical_receipt = None;
+    let observability_receipt = CognitiveMemoryWriter::write_memory_influence_trace(
         &state.writer,
-        &WriteAdmissionService,
-        parse_project_id(&input.project_id)?,
-        &mut input.trace,
+        project_id,
+        write_id,
+        &trace,
     )
     .await?;
     write_json_report(
@@ -178,9 +532,55 @@ async fn dispatch_memory_influence_trace(state: &McpState, arguments: Value) -> 
             .join("reports")
             .join("cognition")
             .join("memory-influence-latest.json"),
-        &input.trace,
+        &trace,
     )?;
-    serde_json::to_value(input.trace).map_err(Into::into)
+    serde_json::to_value(MemoryInfluenceTraceWriteResult {
+        trace,
+        observability_receipt,
+    })
+    .map_err(Into::into)
+}
+
+async fn influence_epistemic_status(
+    state: &McpState,
+    project_id: ProjectId,
+    memory_handle: &str,
+) -> Result<String> {
+    let response = state
+        .store
+        .fetch_atoms_l2(&FetchAtomsL2Request {
+            project_id,
+            handles: vec![memory_handle.to_owned()],
+            continuation: None,
+            consistency: ReadConsistencyMode::Latest,
+            at_least_revision: None,
+        })
+        .await?;
+    let status = response
+        .claims
+        .iter()
+        .find(|claim| {
+            memory_handle == claim.claim_id.to_string()
+                || memory_handle == format!("claim:{}", claim.claim_id)
+        })
+        .map_or(EpistemicStatus::Unknown, |claim| claim.status);
+    Ok(serde_json::to_value(status)?
+        .as_str()
+        .unwrap_or("unknown")
+        .to_owned())
+}
+
+fn deterministic_influence_write_id(
+    project_id: ProjectId,
+    trace: &MemoryInfluenceTrace,
+) -> Result<WriteId> {
+    let canonical = serde_json::to_vec(&(project_id, trace))?;
+    let digest = blake3::hash(&canonical);
+    let mut bytes = [0_u8; 16];
+    bytes.copy_from_slice(&digest.as_bytes()[..16]);
+    bytes[6] = (bytes[6] & 0x0f) | 0x50;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    Ok(WriteId::from_uuid(uuid::Uuid::from_bytes(bytes)))
 }
 
 async fn dispatch_context_cargo_receipt(state: &McpState, arguments: Value) -> Result<Value> {

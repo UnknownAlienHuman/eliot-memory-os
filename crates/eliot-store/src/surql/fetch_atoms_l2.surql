@@ -49,6 +49,26 @@ LET $invalidated_by_raw = SELECT relation_type, from, to FROM invalidated_by
   WHERE project_id = $request.project_id
     AND (<string> from IN $relation_ids OR <string> to IN $relation_ids)
   ORDER BY from ASC, to ASC LIMIT 65;
+LET $co_change_raw = SELECT relation_type, from, to FROM co_change
+  WHERE project_id = $request.project_id
+    AND (<string> from IN $relation_ids OR <string> to IN $relation_ids)
+  ORDER BY from ASC, to ASC LIMIT 65;
+LET $concept_implemented_by_raw = SELECT relation_type, from, to FROM concept_implemented_by
+  WHERE project_id = $request.project_id
+    AND (<string> from IN $relation_ids OR <string> to IN $relation_ids)
+  ORDER BY from ASC, to ASC LIMIT 65;
+LET $concept_depends_on_raw = SELECT relation_type, from, to FROM concept_depends_on
+  WHERE project_id = $request.project_id
+    AND (<string> from IN $relation_ids OR <string> to IN $relation_ids)
+  ORDER BY from ASC, to ASC LIMIT 65;
+LET $capsule_covers_raw = SELECT relation_type, from, to FROM capsule_covers
+  WHERE project_id = $request.project_id
+    AND (<string> from IN $relation_ids OR <string> to IN $relation_ids)
+  ORDER BY from ASC, to ASC LIMIT 65;
+LET $card_covers_raw = SELECT relation_type, from, to FROM card_covers
+  WHERE project_id = $request.project_id
+    AND (<string> from IN $relation_ids OR <string> to IN $relation_ids)
+  ORDER BY from ASC, to ASC LIMIT 65;
 LET $relation_truncated = array::len($supports_raw) > 64
   OR array::len($verified_by_raw) > 64
   OR array::len($contradicts_raw) > 64
@@ -56,7 +76,12 @@ LET $relation_truncated = array::len($supports_raw) > 64
   OR array::len($mentions_raw) > 64
   OR array::len($belongs_to_raw) > 64
   OR array::len($produced_by_raw) > 64
-  OR array::len($invalidated_by_raw) > 64;
+  OR array::len($invalidated_by_raw) > 64
+  OR array::len($co_change_raw) > 64
+  OR array::len($concept_implemented_by_raw) > 64
+  OR array::len($concept_depends_on_raw) > 64
+  OR array::len($capsule_covers_raw) > 64
+  OR array::len($card_covers_raw) > 64;
 LET $supports = array::slice($supports_raw, 0, 64);
 LET $verified_by = array::slice($verified_by_raw, 0, 64);
 LET $contradicts = array::slice($contradicts_raw, 0, 64);
@@ -65,7 +90,26 @@ LET $mentions = array::slice($mentions_raw, 0, 64);
 LET $belongs_to = array::slice($belongs_to_raw, 0, 64);
 LET $produced_by = array::slice($produced_by_raw, 0, 64);
 LET $invalidated_by = array::slice($invalidated_by_raw, 0, 64);
-LET $relations = array::concat($supports, $verified_by, $contradicts, $supersedes, $mentions, $belongs_to, $produced_by, $invalidated_by);
+LET $co_change = array::slice($co_change_raw, 0, 64);
+LET $concept_implemented_by = array::slice($concept_implemented_by_raw, 0, 64);
+LET $concept_depends_on = array::slice($concept_depends_on_raw, 0, 64);
+LET $capsule_covers = array::slice($capsule_covers_raw, 0, 64);
+LET $card_covers = array::slice($card_covers_raw, 0, 64);
+LET $relations = array::concat(
+  $supports,
+  $verified_by,
+  $contradicts,
+  $supersedes,
+  $mentions,
+  $belongs_to,
+  $produced_by,
+  $invalidated_by,
+  $co_change,
+  $concept_implemented_by,
+  $concept_depends_on,
+  $capsule_covers,
+  $card_covers
+);
 LET $relation_neighbors = array::concat(
   $relations.map(|$relation| <string> $relation.from),
   $relations.map(|$relation| <string> $relation.to)

@@ -1,7 +1,7 @@
 {
   "schema_version": "eliot-agent-skill-pack-v1",
   "hash_algorithm": "blake3(name:content_blake3 joined with LF in manifest order)",
-  "pack_hash": "585dd74e630594e985baef1f970abfcd0377375258b421bf0b7714e08a618a89",
+  "pack_hash": "c9bdd7e63aff059f02a37848922ed1a0f53f1e9f6eb36ce705571f95927071bb",
   "listing_characters": 626,
   "skills": [
     {
@@ -10,7 +10,7 @@
     },
     {
       "name": "eliot-understanding",
-      "content_blake3": "09d415f513bfbee782f1b85d57b048b8f9a95d6969096366f93012f99276193a"
+      "content_blake3": "86bb9d0a2eb71c2fba30b7c21a0758e5771ac30dcc1553ec94462439e3f3f239"
     },
     {
       "name": "eliot-delegation",

@@ -33,6 +33,27 @@ pub(super) async fn dispatch_host_governor_method(
             )
             .await,
         ),
+        "ul/onboard" => Some(
+            crate::commands::run_ul_onboard_from_daemon(
+                &state.root,
+                &state.store,
+                &state.writer,
+                params,
+            )
+            .await,
+        ),
+        "ul/mine-git" => Some(
+            crate::commands::run_ul_mine_git_from_daemon(&state.store, &state.writer, params).await,
+        ),
+        "ul/report" => Some(
+            crate::commands::run_ul_report_from_daemon(
+                &state.root,
+                &state.store,
+                &state.ul.ledger,
+                params,
+            )
+            .await,
+        ),
         "ping" => Some(Ok(json!({}))),
         _ => None,
     }
@@ -137,8 +158,50 @@ pub(super) async fn handle_message(
     };
     Some(match result {
         Ok(result) => json!({ "jsonrpc": "2.0", "id": id, "result": result }),
-        Err(error) => error_response(&id, -32603, &error.to_string()),
+        Err(error) => dispatch_error_response(&id, &error),
     })
+}
+
+fn dispatch_error_response(id: &Value, error: &anyhow::Error) -> Value {
+    if let Some(input) = error.downcast_ref::<eliot_types::ToolInputError>() {
+        error_response_with_data(id, -32602, "invalid tool input", &input.data)
+    } else if let Some(eliot_engine::EngineError::EncodingRejected { violations }) =
+        error.downcast_ref::<eliot_engine::EngineError>()
+    {
+        let data = eliot_types::ToolInputErrorData {
+            code: "ENCODING_REJECTED".to_owned(),
+            missing: Vec::new(),
+            invalid: violations
+                .iter()
+                .filter(|violation| {
+                    violation.path != "$.claim.payload.statement"
+                        || !violations.iter().any(|canonical| {
+                            canonical.path == "$.claim.statement"
+                                && canonical.reason == violation.reason
+                        })
+                })
+                .map(|violation| eliot_types::InvalidField {
+                    field: violation.path.clone(),
+                    reason: violation.reason.clone(),
+                })
+                .collect(),
+            minimal_valid_example: Value::Null,
+        };
+        error_response_with_data(id, -32602, "encoding rejected", &data)
+    } else if matches!(
+        error.downcast_ref::<eliot_engine::EngineError>(),
+        Some(eliot_engine::EngineError::ObservabilityConflict)
+    ) {
+        let data = eliot_types::ToolInputErrorData {
+            code: "OBSERVABILITY_WRITE_ID_CONFLICT".to_owned(),
+            missing: Vec::new(),
+            invalid: Vec::new(),
+            minimal_valid_example: Value::Null,
+        };
+        error_response_with_data(id, -32602, "observability write_id conflict", &data)
+    } else {
+        error_response(id, -32603, &error.to_string())
+    }
 }
 
 pub(super) fn enforce_bound_tool_scope(
@@ -210,6 +273,16 @@ pub(super) async fn call_tool(
         .cloned()
         .unwrap_or_else(|| json!({}));
     let arguments = enforce_bound_tool_scope(context, name, arguments)?;
+    let ul_input_bytes = u64::try_from(serde_json::to_vec(&arguments)?.len()).unwrap_or(u64::MAX);
+    let (ul_project_id, ul_task_id) = ul_scope(context, &arguments);
+    let observed_arguments = ul_project_id.map_or_else(Vec::new, |project_id| {
+        state
+            .ul
+            .touched
+            .observe_arguments(project_id, context.session_id, name, &arguments)
+    });
+    let argument_memory_free_control = name == "eliot_compile_packet_l3"
+        && arguments.get("memory_mode").and_then(Value::as_str) == Some("memory_free_control");
     let cognitive_claims = if state.profile == McpAccessProfile::CognitiveChild {
         let claims = cognitive_principal(state, context.session_id).await?;
         ensure_cognitive_tool_observation_capacity(state, &claims.capability).await?;
@@ -287,6 +360,66 @@ pub(super) async fn call_tool(
                 );
                 structured = serde_json::to_value(response)?;
             }
+            let ul_output_bytes =
+                u64::try_from(serde_json::to_vec(&structured)?.len()).unwrap_or(u64::MAX);
+            let mut newly_observed = observed_arguments;
+            if let Some(project_id) = ul_project_id {
+                newly_observed.extend(state.ul.touched.observe_result(
+                    project_id,
+                    context.session_id,
+                    name,
+                    &structured,
+                ));
+            }
+            newly_observed.sort_by(|left, right| {
+                left.kind
+                    .cmp(&right.kind)
+                    .then_with(|| left.value.cmp(&right.value))
+            });
+            newly_observed.dedup();
+            let response_memory_free_control = structured
+                .get("memory_view")
+                .and_then(|memory_view| memory_view.get("mode"))
+                .and_then(Value::as_str)
+                == Some("memory_free_control");
+            let memory_free_control = argument_memory_free_control || response_memory_free_control;
+            let mut injection_receipts = Vec::new();
+            if let Some(project_id) = ul_project_id {
+                if !memory_free_control {
+                    state
+                        .ul
+                        .planner
+                        .plan_after_tool(project_id, context.session_id, &newly_observed)
+                        .await?;
+                }
+                injection_receipts = state
+                    .ul
+                    .planner
+                    .attach(
+                        project_id,
+                        ul_task_id,
+                        context.session_id,
+                        &mut structured,
+                        memory_free_control,
+                    )
+                    .await?;
+            }
+            if let (Some(project_id), Some(task_id)) = (ul_project_id, ul_task_id) {
+                let _ = state
+                    .ul
+                    .ledger
+                    .record_call(eliot_engine::UlToolMeasurement {
+                        project_id,
+                        task_id,
+                        session_id: context.session_id,
+                        tool_name: name.to_owned(),
+                        arguments: observation_arguments.clone(),
+                        input_bytes: ul_input_bytes,
+                        output_bytes: ul_output_bytes,
+                        injection_receipts,
+                    })
+                    .await;
+            }
             if let Some(claims) = cognitive_claims.as_ref() {
                 write_cognitive_tool_observation(
                     state,
@@ -325,6 +458,27 @@ pub(super) async fn call_tool(
         write_antigravity_mcp_invocation_receipt(state, name)?;
     }
     tool_success(&structured)
+}
+
+fn ul_scope(
+    context: AuthenticatedRequestContext,
+    arguments: &Value,
+) -> (Option<ProjectId>, Option<TaskId>) {
+    let project_id = context.bound_project_id.or_else(|| {
+        arguments
+            .get("project_id")
+            .or_else(|| arguments.get("project"))
+            .and_then(Value::as_str)
+            .and_then(|value| ProjectId::from_str(value).ok())
+    });
+    let task_id = context.bound_task_id.or_else(|| {
+        arguments
+            .get("task_id")
+            .or_else(|| arguments.get("task"))
+            .and_then(Value::as_str)
+            .and_then(|value| TaskId::from_str(value).ok())
+    });
+    (project_id, task_id)
 }
 
 pub(super) fn string_array_field(value: &Value, field: &str) -> Vec<String> {
@@ -497,12 +651,14 @@ pub(super) async fn dispatch_tool(
                 .await?;
             serde_json::to_value(response)?
         }
-        "eliot_compile_packet_l3" => Box::pin(dispatch_compile_packet_l3(state, arguments)).await?,
+        "eliot_compile_packet_l3" => {
+            Box::pin(dispatch_compile_packet_l3(state, context, arguments)).await?
+        }
         "eliot_understanding_outcome_record" => {
             Box::pin(dispatch_understanding_outcome_record(state, arguments)).await?
         }
         "eliot_memory_influence_trace" => {
-            Box::pin(dispatch_memory_influence_trace(state, arguments)).await?
+            Box::pin(dispatch_memory_influence_trace(state, context, arguments)).await?
         }
         "eliot_context_cargo_receipt" => {
             Box::pin(dispatch_context_cargo_receipt(state, arguments)).await?

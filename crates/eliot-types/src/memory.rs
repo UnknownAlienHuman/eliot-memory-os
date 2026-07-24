@@ -6,6 +6,7 @@ use crate::lifecycle::{MemoryLifecyclePacketView, MemoryLifecycleState};
 use crate::records::BlobRef;
 use crate::semantic_memory::{ExperienceBrief, MemoryNeedDecision};
 use crate::skill::{ProceduralSkillPacketView, SkillActivationRecord};
+use crate::ul::artifact::UlArtifact;
 use crate::{
     ActionLeaseId, ActionRequestId, AgentId, AgentRunId, AgentSessionId, BlackboardItemId,
     CandidateDiffId, ClaimId, EvidenceId, MailboxMessageId, MemoryRevision, OperationId,
@@ -13,6 +14,7 @@ use crate::{
     VerificationId, VerifierRunId, WorkItemId, WorkLeaseId, WorktreeLeaseId,
     WorktreeLeaseRequestId, WriteId,
 };
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeSet;
@@ -34,6 +36,7 @@ pub enum SemanticCommandKind {
     VerificationRecord,
     AgentResultRecord,
     CompletionProofSubmit,
+    UlArtifactBatchRecord,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -141,6 +144,7 @@ pub enum SemanticCommand {
     VerificationRecord(VerificationRecordCommand),
     AgentResultRecord(AgentResultRecordCommand),
     CompletionProofSubmit(CompletionProofSubmitCommand),
+    UlArtifactBatchRecord(UlArtifactBatchRecordCommand),
 }
 
 impl SemanticCommand {
@@ -159,6 +163,7 @@ impl SemanticCommand {
             Self::VerificationRecord(_) => SemanticCommandKind::VerificationRecord,
             Self::AgentResultRecord(_) => SemanticCommandKind::AgentResultRecord,
             Self::CompletionProofSubmit(_) => SemanticCommandKind::CompletionProofSubmit,
+            Self::UlArtifactBatchRecord(_) => SemanticCommandKind::UlArtifactBatchRecord,
         }
     }
 
@@ -177,6 +182,7 @@ impl SemanticCommand {
             Self::VerificationRecord(command) => &command.context,
             Self::AgentResultRecord(command) => &command.context,
             Self::CompletionProofSubmit(command) => &command.context,
+            Self::UlArtifactBatchRecord(command) => &command.context,
         }
     }
 }
@@ -450,6 +456,13 @@ pub struct CompletionProofSubmitCommand {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct UlArtifactBatchRecordCommand {
+    pub context: CommandContext,
+    pub artifacts: Vec<UlArtifact>,
+    pub relations: Vec<RelationInput>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct MemoryWriteEnvelopeInput {
     pub command: SemanticCommand,
 }
@@ -556,6 +569,11 @@ pub enum RelationType {
     BelongsTo,
     ProducedBy,
     InvalidatedBy,
+    CoChange,
+    ConceptImplementedBy,
+    ConceptDependsOn,
+    CapsuleCovers,
+    CardCovers,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -859,7 +877,7 @@ pub struct ProjectRevisionSummary {
     pub project_sequence: ProjectSequence,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, JsonSchema, Serialize, Deserialize)]
 pub struct CompilePacketL3Request {
     pub project_id: ProjectId,
     pub task_id: String,
