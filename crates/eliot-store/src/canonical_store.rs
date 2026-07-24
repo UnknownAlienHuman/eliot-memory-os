@@ -495,6 +495,30 @@ struct MetaIntegrityRecords {
     policy_executions: Vec<CanonicalRecord<MetaPolicyExecutionReceipt>>,
 }
 
+#[derive(serde::Deserialize)]
+struct RawActivationRelation {
+    from_ref: String,
+    to_ref: String,
+}
+
+#[derive(serde::Deserialize)]
+struct RawActivationGraphRows {
+    #[serde(default)]
+    co_change: Vec<eliot_types::CoChangeEdge>,
+    #[serde(default)]
+    card_covers: Vec<RawActivationRelation>,
+    #[serde(default)]
+    capsule_covers: Vec<RawActivationRelation>,
+    #[serde(default)]
+    concept_implemented_by: Vec<RawActivationRelation>,
+    #[serde(default)]
+    concept_depends_on: Vec<RawActivationRelation>,
+    #[serde(default)]
+    supports: Vec<RawActivationRelation>,
+    #[serde(default)]
+    verified_by: Vec<RawActivationRelation>,
+}
+
 impl CanonicalStore {
     pub fn new(config: SurrealServerConfig) -> Self {
         Self {
@@ -513,6 +537,7 @@ impl CanonicalStore {
             NamedSurqlOp::SchemaMigrateUlArtifacts,
             NamedSurqlOp::SchemaMigrateUlPyramid,
             NamedSurqlOp::SchemaMigrateUlMeasurement,
+            NamedSurqlOp::SchemaMigrateUlDependencyActivation,
         ] {
             value = self.migrate_schema_op(op).await?;
         }
@@ -1262,6 +1287,197 @@ impl CanonicalStore {
         decode_value(NamedSurqlOp::LoadUlArtifacts, value)
     }
 
+    pub async fn replace_ul_reverse_dependencies(
+        &self,
+        project_id: ProjectId,
+        target_kind: eliot_types::PyramidTargetKind,
+        target_id: &str,
+        build_id: &str,
+        dependencies: &[eliot_types::UlDependencyRef],
+    ) -> Result<(), StoreError> {
+        let mut dependencies = dependencies.to_vec();
+        dependencies.sort();
+        dependencies.dedup();
+        let value = self
+            .execute_value(
+                NamedSurqlOp::ReplaceUlReverseDependencies,
+                json!({
+                    "project_id": project_id,
+                    "target_kind": target_kind,
+                    "target_id": target_id,
+                    "build_id": build_id,
+                    "dependencies": dependencies,
+                }),
+            )
+            .await?;
+        let _: Vec<eliot_types::UlReverseDependencyRow> =
+            decode_value(NamedSurqlOp::ReplaceUlReverseDependencies, value)?;
+        Ok(())
+    }
+
+    pub async fn load_ul_reverse_dependents(
+        &self,
+        project_id: ProjectId,
+        dependencies: &[eliot_types::UlDependencyRef],
+    ) -> Result<Vec<eliot_types::UlReverseDependencyRow>, StoreError> {
+        let expected = dependencies.iter().cloned().collect::<BTreeSet<_>>();
+        if expected.is_empty() {
+            return Ok(Vec::new());
+        }
+        let dependency_kinds = expected
+            .iter()
+            .map(|dependency| dependency.kind)
+            .collect::<BTreeSet<_>>();
+        let dependency_keys = expected
+            .iter()
+            .map(|dependency| dependency.key.clone())
+            .collect::<BTreeSet<_>>();
+        let value = self
+            .execute_value(
+                NamedSurqlOp::LoadUlReverseDependents,
+                json!({
+                    "project_id": project_id,
+                    "dependency_kinds": dependency_kinds,
+                    "dependency_keys": dependency_keys,
+                }),
+            )
+            .await?;
+        let mut rows: Vec<eliot_types::UlReverseDependencyRow> =
+            decode_value(NamedSurqlOp::LoadUlReverseDependents, value)?;
+        rows.retain(|row| expected.contains(&row.dependency));
+        rows.sort_by(|left, right| {
+            left.target_kind
+                .cmp(&right.target_kind)
+                .then_with(|| left.target_id.cmp(&right.target_id))
+                .then_with(|| left.dependency.cmp(&right.dependency))
+        });
+        rows.dedup();
+        Ok(rows)
+    }
+
+    pub async fn mark_ul_artifact_dirty(
+        &self,
+        state: &eliot_types::UlArtifactDirtyState,
+    ) -> Result<(), StoreError> {
+        let mut state = state.clone();
+        state.reasons.sort();
+        state.reasons.dedup();
+        let state_key = blake3::hash(
+            format!(
+                "{}|{:?}|{}",
+                state.project_id, state.target_kind, state.target_id
+            )
+            .as_bytes(),
+        )
+        .to_hex()
+        .to_string();
+        let value = self
+            .execute_value(
+                NamedSurqlOp::UpsertUlArtifactDirty,
+                json!({ "state_key": state_key, "state": state }),
+            )
+            .await?;
+        let _: eliot_types::UlArtifactDirtyState =
+            decode_value(NamedSurqlOp::UpsertUlArtifactDirty, value)?;
+        Ok(())
+    }
+
+    pub async fn load_ul_dirty_artifacts(
+        &self,
+        project_id: ProjectId,
+        limit: u16,
+    ) -> Result<Vec<eliot_types::UlArtifactDirtyState>, StoreError> {
+        let value = self
+            .execute_value(
+                NamedSurqlOp::LoadUlArtifactDirty,
+                json!({ "project_id": project_id, "limit": limit.clamp(1, 512) }),
+            )
+            .await?;
+        decode_value(NamedSurqlOp::LoadUlArtifactDirty, value)
+    }
+
+    pub async fn clear_ul_artifact_dirty(
+        &self,
+        project_id: ProjectId,
+        target_kind: eliot_types::PyramidTargetKind,
+        target_id: &str,
+        superseding_build_id: &str,
+    ) -> Result<(), StoreError> {
+        let _ = self
+            .execute_value(
+                NamedSurqlOp::ClearUlArtifactDirty,
+                json!({
+                    "project_id": project_id,
+                    "target_kind": target_kind,
+                    "target_id": target_id,
+                    "superseding_build_id": superseding_build_id,
+                }),
+            )
+            .await?;
+        Ok(())
+    }
+
+    pub async fn load_ul_activation_graph(
+        &self,
+        project_id: ProjectId,
+    ) -> Result<eliot_types::UlActivationGraphRows, StoreError> {
+        let value = self
+            .execute_value(
+                NamedSurqlOp::LoadUlActivationGraph,
+                json!({ "project_id": project_id }),
+            )
+            .await?;
+        let mut raw: RawActivationGraphRows =
+            decode_value(NamedSurqlOp::LoadUlActivationGraph, value)?;
+        let mut seen_co_change = std::collections::BTreeSet::new();
+        raw.co_change
+            .retain(|edge| seen_co_change.insert(edge.edge_id.clone()));
+        raw.co_change
+            .sort_by(|left, right| left.edge_id.cmp(&right.edge_id));
+        let mut relations = Vec::new();
+        append_activation_relations(
+            &mut relations,
+            raw.card_covers,
+            eliot_types::ActivationEdgeKind::CardCovers,
+        );
+        append_activation_relations(
+            &mut relations,
+            raw.capsule_covers,
+            eliot_types::ActivationEdgeKind::CapsuleCovers,
+        );
+        append_activation_relations(
+            &mut relations,
+            raw.concept_implemented_by,
+            eliot_types::ActivationEdgeKind::ConceptImplementedBy,
+        );
+        append_activation_relations(
+            &mut relations,
+            raw.concept_depends_on,
+            eliot_types::ActivationEdgeKind::ConceptDependsOn,
+        );
+        append_activation_relations(
+            &mut relations,
+            raw.supports,
+            eliot_types::ActivationEdgeKind::Supports,
+        );
+        append_activation_relations(
+            &mut relations,
+            raw.verified_by,
+            eliot_types::ActivationEdgeKind::VerifiedBy,
+        );
+        relations.sort_by(|left, right| {
+            left.from_ref
+                .cmp(&right.from_ref)
+                .then_with(|| left.to_ref.cmp(&right.to_ref))
+                .then_with(|| left.kind.cmp(&right.kind))
+        });
+        relations.dedup();
+        Ok(eliot_types::UlActivationGraphRows {
+            co_change: raw.co_change,
+            relations,
+        })
+    }
+
     pub async fn upsert_ul_task_ledger(
         &self,
         project_id: ProjectId,
@@ -1794,6 +2010,21 @@ impl CanonicalStore {
         }
         last_query_result(op, &raw)
     }
+}
+
+fn append_activation_relations(
+    output: &mut Vec<eliot_types::UlActivationGraphEdge>,
+    rows: Vec<RawActivationRelation>,
+    kind: eliot_types::ActivationEdgeKind,
+) {
+    output.extend(
+        rows.into_iter()
+            .map(|row| eliot_types::UlActivationGraphEdge {
+                from_ref: row.from_ref,
+                to_ref: row.to_ref,
+                kind,
+            }),
+    );
 }
 
 fn cue_string_parts(value: &str) -> Vec<&str> {

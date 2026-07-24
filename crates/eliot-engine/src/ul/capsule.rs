@@ -520,14 +520,40 @@ pub fn capsule_freshness(
 
 #[must_use]
 pub fn render_capsule(capsule: &SubsystemCapsule, project_root: &Path) -> String {
+    render_capsule_with_dirty(capsule, project_root, None)
+}
+
+#[must_use]
+pub fn render_capsule_with_dirty(
+    capsule: &SubsystemCapsule,
+    project_root: &Path,
+    dirty: Option<&eliot_types::UlArtifactDirtyState>,
+) -> String {
+    let mut dirty_keys = dirty
+        .filter(|state| state.dirty)
+        .into_iter()
+        .flat_map(|state| state.reasons.iter())
+        .map(|reason| reason.dependency.key.clone())
+        .collect::<Vec<_>>();
     match capsule_freshness(capsule, project_root) {
-        CapsuleFreshness::Fresh => capsule.body_md.clone(),
+        CapsuleFreshness::Fresh if dirty_keys.is_empty() => capsule.body_md.clone(),
+        CapsuleFreshness::Fresh => {
+            sort_dedup(&mut dirty_keys);
+            dirty_keys.truncate(3);
+            format!(
+                "{STALE_PREFIX}{}] — verify against code before relying.\n{}",
+                dirty_keys.join(", "),
+                capsule.body_md
+            )
+        }
         CapsuleFreshness::Stale {
             mut changed,
             missing,
         } => {
             changed.extend(missing);
+            changed.extend(dirty_keys);
             sort_dedup(&mut changed);
+            changed.truncate(3);
             format!(
                 "{STALE_PREFIX}{}] — verify against code before relying.\n{}",
                 changed.join(", "),

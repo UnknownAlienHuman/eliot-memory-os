@@ -428,6 +428,7 @@ fn card(project_id: ProjectId, path: &str) -> ModuleCard {
         source_refs: Vec::new(),
         cue_bindings: Vec::new(),
         build_fingerprint: "fixture".to_owned(),
+        dependency_manifest: eliot_types::DependencyManifest::default(),
     }
 }
 

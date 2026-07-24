@@ -2386,6 +2386,9 @@ fn parse_maintenance_job_kind(value: &str) -> Result<MaintenanceJobKind> {
         "incidentreview" | "incident-review" => Ok(MaintenanceJobKind::IncidentReview),
         "configsnapshot" | "config-snapshot" => Ok(MaintenanceJobKind::ConfigSnapshot),
         "policysnapshot" | "policy-snapshot" => Ok(MaintenanceJobKind::PolicySnapshot),
+        "ulcapsulemaintenance" | "ul-capsule-maintenance" => {
+            Ok(MaintenanceJobKind::UlCapsuleMaintenance)
+        }
         other => bail!("unknown maintenance job kind: {other}"),
     }
 }

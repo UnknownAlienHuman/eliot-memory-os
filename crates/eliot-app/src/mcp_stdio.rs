@@ -826,7 +826,12 @@ impl McpDaemon {
         let store = CanonicalStore::new(config.db.surreal.clone());
         let wal = ControlWal::open(&config.control_wal)?;
         let (writer, actor) = WriterActor::channel(wal, store.clone(), &WriterConfig::default());
-        let ul = Arc::new(UlRuntime::new(store.clone(), writer.clone(), &root));
+        let ul = Arc::new(UlRuntime::new(
+            store.clone(),
+            writer.clone(),
+            &root,
+            config.ul.activation.enable_min_edges,
+        ));
         let cursor_signing_key = load_or_create_operator_cursor_signing_key(instance)?;
         let cognitive_runtime = Arc::new(CognitiveRuntimePaths {
             runtime_dir: instance.runtime_dir(),

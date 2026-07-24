@@ -190,17 +190,18 @@ pub use skill_curator::{
     SkillCuratorService, SkillMergeSplitService, SkillPatchService,
 };
 pub use ul::{
-    CalibrationService, CapsuleEvidence, ConceptSeedResult, CueIndexService, FiredMemory,
-    FiringResult, GitMiningArtifacts, GitMiningService, GitMiningStatus, InjectionPlanner,
-    MetacognitionService, ModuleCardService, ObservedCue, OnboardingService, PredictionCapture,
-    PredictionCaptureInput, PredictionService, PromotedPyramid, PyramidBuilder, PyramidDecision,
-    PyramidDependency, PyramidFailure, TouchedCue, TouchedSetRegistry, UlArtifactWriteReport,
-    UlArtifactWriterService, UlFieldValidationLoad, UlLedgerAccumulator, UlLedgerService,
-    UlReadinessService, UlToolMeasurement, canonical_project_root, capsule_freshness,
+    ActivationEngine, CalibrationService, CapsuleEvidence, ConceptSeedResult, CueIndexService,
+    FiredMemory, FiringResult, GitMiningArtifacts, GitMiningService, GitMiningStatus,
+    InjectionPlanner, MetacognitionService, ModuleCardService, ObservedCue, OnboardingService,
+    PredictionCapture, PredictionCaptureInput, PredictionService, PromotedPyramid, PyramidBuilder,
+    PyramidDecision, PyramidDependency, PyramidFailure, TouchedCue, TouchedSetRegistry,
+    UlArtifactWriteReport, UlArtifactWriterService, UlDependencyService, UlFieldValidationLoad,
+    UlLedgerAccumulator, UlLedgerService, UlMaintenanceService, UlReadinessService,
+    UlToolMeasurement, canonical_project_root, capsule_freshness, dependency_refs,
     evaluate_task08_readiness, failure_bindings_by_path, field_validation_manifest_path,
     is_mutation_tool, is_read_class_tool, load_field_validation_manifest, normalize_verifier,
-    parse_expected_observable, prediction_id, render_capsule, resolve_prediction,
-    summarize_field_evidence,
+    parse_expected_observable, prediction_id, render_capsule, render_capsule_with_dirty,
+    resolve_prediction, summarize_field_evidence,
 };
 pub use verification::{
     FlakeDetectionService, StatefulDbTestIsolationService, TestCostService, TestInventoryService,

@@ -12,6 +12,27 @@ pub struct GovernorConfig {
     pub store: StoreConfig,
     #[serde(default)]
     pub delegation_calibration: DelegationCalibrationConfig,
+    #[serde(default)]
+    pub ul: UlConfig,
+}
+
+#[derive(Clone, Debug, Default, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+pub struct UlConfig {
+    #[serde(default)]
+    pub activation: UlActivationConfig,
+}
+
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+pub struct UlActivationConfig {
+    pub enable_min_edges: u32,
+}
+
+impl Default for UlActivationConfig {
+    fn default() -> Self {
+        Self {
+            enable_min_edges: 500,
+        }
+    }
 }
 
 #[derive(Clone, Debug, JsonSchema, PartialEq, Serialize, Deserialize)]
@@ -255,6 +276,7 @@ impl Default for GovernorConfig {
                 migrations_dir: "crates/eliot-store/migrations".to_owned(),
             },
             delegation_calibration: DelegationCalibrationConfig::default(),
+            ul: UlConfig::default(),
         }
     }
 }

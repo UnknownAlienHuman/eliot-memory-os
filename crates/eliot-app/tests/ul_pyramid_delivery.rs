@@ -196,6 +196,7 @@ fn h3_custom_root_freshness_and_dot_boundary_reach_runtime_packet() -> TestResul
         source_refs: vec!["file:src/lib.rs".to_owned()],
         cue_bindings: cue("root"),
         build_fingerprint: "h3-root-card".to_owned(),
+        dependency_manifest: DependencyManifest::default(),
     };
     let promoted = PyramidBuilder.build_capsule(
         project_root.path(),

@@ -23,6 +23,18 @@ pub enum UlCommand {
         #[arg(long)]
         project: ProjectId,
     },
+    Maintain {
+        #[arg(long)]
+        project: ProjectId,
+        #[arg(long)]
+        root: PathBuf,
+        #[arg(long, default_value_t = 5)]
+        limit: u16,
+    },
+    DirtyReport {
+        #[arg(long)]
+        project: ProjectId,
+    },
 }
 
 pub async fn run_ul_mine_git(
@@ -117,6 +129,7 @@ pub(crate) async fn run_ul_mine_git_from_daemon(
     };
 
     refresh_card_cues(store, project_id, &cards).await?;
+    refresh_card_dependencies(store, project_id, &cards).await?;
     let card_committed = card_report
         .receipts
         .iter()
@@ -147,6 +160,26 @@ pub(crate) async fn run_ul_mine_git_from_daemon(
             .len()
             .saturating_add(card_report.receipts.len()),
     }))
+}
+
+async fn refresh_card_dependencies(
+    store: &CanonicalStore,
+    project_id: ProjectId,
+    cards: &[eliot_types::ModuleCard],
+) -> Result<()> {
+    let dependency = eliot_engine::UlDependencyService::new(store.clone());
+    for card in cards {
+        dependency.index_card(card).await?;
+        store
+            .clear_ul_artifact_dirty(
+                project_id,
+                eliot_types::PyramidTargetKind::ModuleCard,
+                &card.path,
+                &card.build_fingerprint,
+            )
+            .await?;
+    }
+    Ok(())
 }
 
 fn mining_delivery_status(
@@ -192,6 +225,80 @@ pub async fn run_ul_report(config_path: &Path, project_id: ProjectId) -> Result<
     write_json(&result)
 }
 
+pub async fn run_ul_maintain(
+    config_path: &Path,
+    project_id: ProjectId,
+    project_root: &Path,
+    limit: u16,
+) -> Result<()> {
+    let instance = ul_daemon_instance(config_path)?;
+    let result = named_pipe_ipc::host_governor_request(
+        &instance,
+        "ul/maintain",
+        serde_json::json!({
+            "project_id": project_id,
+            "project_root": project_root,
+            "limit": limit,
+        }),
+    )
+    .await
+    .context("route bounded UL maintenance through the daemon-owned WriterActor")?;
+    write_json(&result)
+}
+
+pub async fn run_ul_dirty_report(config_path: &Path, project_id: ProjectId) -> Result<()> {
+    let instance = ul_daemon_instance(config_path)?;
+    let result = named_pipe_ipc::host_governor_request(
+        &instance,
+        "ul/dirty-report",
+        serde_json::json!({ "project_id": project_id }),
+    )
+    .await
+    .context("read the derived UL dirty report from the ready Governor daemon")?;
+    write_json(&result)
+}
+
+pub(crate) async fn run_ul_maintain_from_daemon(
+    store: &CanonicalStore,
+    writer: &eliot_engine::WriterHandle,
+    params: serde_json::Value,
+) -> Result<serde_json::Value> {
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Input {
+        project_id: ProjectId,
+        project_root: PathBuf,
+        limit: u16,
+    }
+
+    let input: Input = serde_json::from_value(params).context("decode UL maintenance request")?;
+    store.migrate_schema().await?;
+    let report = eliot_engine::UlMaintenanceService::new(store.clone(), writer.clone())
+        .rebuild_dirty(input.project_id, &input.project_root, input.limit)
+        .await?;
+    serde_json::to_value(report).context("encode UL maintenance report")
+}
+
+pub(crate) async fn run_ul_dirty_report_from_daemon(
+    store: &CanonicalStore,
+    params: serde_json::Value,
+) -> Result<serde_json::Value> {
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Input {
+        project_id: ProjectId,
+    }
+
+    let input: Input = serde_json::from_value(params).context("decode UL dirty report request")?;
+    store.migrate_schema().await?;
+    let dirty = store.load_ul_dirty_artifacts(input.project_id, 512).await?;
+    Ok(serde_json::json!({
+        "project_id": input.project_id,
+        "dirty_count": dirty.len(),
+        "dirty": dirty,
+    }))
+}
+
 pub(crate) async fn run_ul_onboard_from_daemon(
     runtime_root: &Path,
     store: &CanonicalStore,
@@ -216,7 +323,68 @@ pub(crate) async fn run_ul_onboard_from_daemon(
             eliot_types::OnboardingTestHook::None,
         )
         .await?;
+    let dependency = eliot_engine::UlDependencyService::new(store.clone());
+    let _ = dependency.rebuild_index(input.project_id).await?;
+    clear_rebuilt_dirty(store, input.project_id).await?;
+    let _ = dependency.scan_project(input.project_id).await?;
     serde_json::to_value(report).context("encode UL onboarding report")
+}
+
+async fn clear_rebuilt_dirty(store: &CanonicalStore, project_id: ProjectId) -> Result<()> {
+    let dirty = store.load_ul_dirty_artifacts(project_id, 512).await?;
+    let cards = store
+        .load_ul_artifacts::<eliot_types::ModuleCard>(project_id, &["module_card"], 128)
+        .await?;
+    let capsules = store
+        .load_ul_artifacts::<eliot_types::SubsystemCapsule>(
+            project_id,
+            &["subsystem_capsule"],
+            128,
+        )
+        .await?;
+    let maps = store
+        .load_ul_artifacts::<eliot_types::SystemMap>(project_id, &["system_map"], 128)
+        .await?;
+    let charters = store
+        .load_ul_artifacts::<eliot_types::ProjectCharter>(
+            project_id,
+            &["project_charter"],
+            128,
+        )
+        .await?;
+    for state in dirty {
+        let build_id = match state.target_kind {
+            eliot_types::PyramidTargetKind::ModuleCard => cards
+                .iter()
+                .filter(|record| record.receipt_body.path == state.target_id)
+                .max_by_key(|record| record.memory_revision)
+                .map(|record| record.receipt_body.build_fingerprint.as_str()),
+            eliot_types::PyramidTargetKind::SubsystemCapsule => capsules
+                .iter()
+                .filter(|record| record.receipt_body.concept_id == state.target_id)
+                .max_by_key(|record| record.memory_revision)
+                .map(|record| record.receipt_body.build_id.as_str()),
+            eliot_types::PyramidTargetKind::SystemMap => maps
+                .iter()
+                .max_by_key(|record| record.memory_revision)
+                .map(|record| record.receipt_body.build_id.as_str()),
+            eliot_types::PyramidTargetKind::ProjectCharter => charters
+                .iter()
+                .max_by_key(|record| record.memory_revision)
+                .map(|record| record.receipt_body.build_id.as_str()),
+        };
+        if let Some(build_id) = build_id {
+            store
+                .clear_ul_artifact_dirty(
+                    project_id,
+                    state.target_kind,
+                    &state.target_id,
+                    build_id,
+                )
+                .await?;
+        }
+    }
+    Ok(())
 }
 
 pub(crate) async fn run_ul_report_from_daemon(

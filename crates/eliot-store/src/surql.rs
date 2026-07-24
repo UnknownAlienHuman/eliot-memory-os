@@ -9,6 +9,13 @@ pub enum NamedSurqlOp {
     SchemaMigrateUlArtifacts,
     SchemaMigrateUlPyramid,
     SchemaMigrateUlMeasurement,
+    SchemaMigrateUlDependencyActivation,
+    ReplaceUlReverseDependencies,
+    LoadUlReverseDependents,
+    UpsertUlArtifactDirty,
+    LoadUlArtifactDirty,
+    ClearUlArtifactDirty,
+    LoadUlActivationGraph,
     UpsertCueRows,
     DeleteCueRows,
     LoadCueRows,
@@ -60,6 +67,13 @@ impl NamedSurqlOp {
             Self::SchemaMigrateUlArtifacts => "004_ul_artifacts",
             Self::SchemaMigrateUlPyramid => "005_ul_pyramid",
             Self::SchemaMigrateUlMeasurement => "006_ul_measurement",
+            Self::SchemaMigrateUlDependencyActivation => "007_ul_dependency_activation",
+            Self::ReplaceUlReverseDependencies => "replace_ul_reverse_dependencies",
+            Self::LoadUlReverseDependents => "load_ul_reverse_dependents",
+            Self::UpsertUlArtifactDirty => "upsert_ul_artifact_dirty",
+            Self::LoadUlArtifactDirty => "load_ul_artifact_dirty",
+            Self::ClearUlArtifactDirty => "clear_ul_artifact_dirty",
+            Self::LoadUlActivationGraph => "load_ul_activation_graph",
             Self::UpsertCueRows => "upsert_cue_rows",
             Self::DeleteCueRows => "delete_cues_for_record",
             Self::LoadCueRows => "load_cue_rows",
@@ -113,6 +127,19 @@ impl NamedSurqlOp {
             Self::SchemaMigrateUlMeasurement => {
                 include_str!("surql/006_ul_measurement.surql")
             }
+            Self::SchemaMigrateUlDependencyActivation => {
+                include_str!("surql/007_ul_dependency_activation.surql")
+            }
+            Self::ReplaceUlReverseDependencies => {
+                include_str!("surql/replace_ul_reverse_dependencies.surql")
+            }
+            Self::LoadUlReverseDependents => {
+                include_str!("surql/load_ul_reverse_dependents.surql")
+            }
+            Self::UpsertUlArtifactDirty => include_str!("surql/upsert_ul_artifact_dirty.surql"),
+            Self::LoadUlArtifactDirty => include_str!("surql/load_ul_artifact_dirty.surql"),
+            Self::ClearUlArtifactDirty => include_str!("surql/clear_ul_artifact_dirty.surql"),
+            Self::LoadUlActivationGraph => include_str!("surql/load_ul_activation_graph.surql"),
             Self::UpsertCueRows => include_str!("surql/upsert_cue_rows.surql"),
             Self::DeleteCueRows => include_str!("surql/delete_cues_for_record.surql"),
             Self::LoadCueRows => include_str!("surql/load_cue_rows.surql"),
@@ -210,7 +237,7 @@ impl Default for SurqlTemplateRegistry {
 }
 
 #[allow(clippy::too_many_lines)]
-fn foundational_templates() -> [SurqlTemplate; 28] {
+fn foundational_templates() -> [SurqlTemplate; 35] {
     [
         template(
             NamedSurqlOp::SchemaMigrate,
@@ -253,6 +280,48 @@ fn foundational_templates() -> [SurqlTemplate; 28] {
             "SchemaMigrateUlMeasurementInput",
             "SchemaMigrateUlMeasurementOutput",
             64 * 1024,
+        ),
+        template(
+            NamedSurqlOp::SchemaMigrateUlDependencyActivation,
+            "SchemaMigrateUlDependencyActivationInput",
+            "SchemaMigrateUlDependencyActivationOutput",
+            64 * 1024,
+        ),
+        template(
+            NamedSurqlOp::ReplaceUlReverseDependencies,
+            "ReplaceUlReverseDependenciesInput",
+            "ReplaceUlReverseDependenciesOutput",
+            2 * 1024 * 1024,
+        ),
+        template(
+            NamedSurqlOp::LoadUlReverseDependents,
+            "LoadUlReverseDependentsInput",
+            "LoadUlReverseDependentsOutput",
+            4 * 1024 * 1024,
+        ),
+        template(
+            NamedSurqlOp::UpsertUlArtifactDirty,
+            "UpsertUlArtifactDirtyInput",
+            "UpsertUlArtifactDirtyOutput",
+            256 * 1024,
+        ),
+        template(
+            NamedSurqlOp::LoadUlArtifactDirty,
+            "LoadUlArtifactDirtyInput",
+            "LoadUlArtifactDirtyOutput",
+            4 * 1024 * 1024,
+        ),
+        template(
+            NamedSurqlOp::ClearUlArtifactDirty,
+            "ClearUlArtifactDirtyInput",
+            "ClearUlArtifactDirtyOutput",
+            256 * 1024,
+        ),
+        template(
+            NamedSurqlOp::LoadUlActivationGraph,
+            "LoadUlActivationGraphInput",
+            "LoadUlActivationGraphOutput",
+            8 * 1024 * 1024,
         ),
         template(
             NamedSurqlOp::UpsertCueRows,

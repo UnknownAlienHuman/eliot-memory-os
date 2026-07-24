@@ -54,6 +54,12 @@ pub(super) async fn dispatch_host_governor_method(
             )
             .await,
         ),
+        "ul/maintain" => Some(
+            crate::commands::run_ul_maintain_from_daemon(&state.store, &state.writer, params).await,
+        ),
+        "ul/dirty-report" => {
+            Some(crate::commands::run_ul_dirty_report_from_daemon(&state.store, params).await)
+        }
         "ping" => Some(Ok(json!({}))),
         _ => None,
     }
@@ -385,6 +391,16 @@ pub(super) async fn call_tool(
             let memory_free_control = argument_memory_free_control || response_memory_free_control;
             let mut injection_receipts = Vec::new();
             if let Some(project_id) = ul_project_id {
+                state
+                    .ul
+                    .observe_successful_tool(
+                        project_id,
+                        context.session_id,
+                        name,
+                        &observation_arguments,
+                        &newly_observed,
+                    )
+                    .await?;
                 if !memory_free_control {
                     state
                         .ul

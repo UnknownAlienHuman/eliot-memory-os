@@ -1,16 +1,18 @@
 use eliot_engine::{
     CueIndexService, InjectionPlanner, MetacognitionService, PredictionService, TouchedSetRegistry,
-    UlLedgerService, WriterHandle, capsule_freshness, render_capsule,
+    UlDependencyService, UlLedgerService, WriterHandle, capsule_freshness,
+    render_capsule_with_dirty,
 };
 use eliot_store::{CanonicalRecord, CanonicalStore};
 use eliot_types::{
     CapsuleFreshness, CausalBridgeHop, ConceptNode, CoverageClass, HotspotScore, ModuleCard,
-    ProjectId, SubsystemCapsule, UlMetacognitionView, path_matches_boundary, ul_token_estimate,
+    ProjectId, SessionId, SubsystemCapsule, UlMetacognitionView, path_matches_boundary,
+    ul_token_estimate,
 };
 use serde_json::{Value, json};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 const PACKET_PYRAMID_BUDGET: u32 = 1_500;
 
@@ -28,35 +30,93 @@ pub(super) struct UlRuntime {
     pub cue_index: Arc<CueIndexService>,
     pub touched: Arc<TouchedSetRegistry>,
     pub planner: Arc<InjectionPlanner>,
+    pub dependency: Arc<UlDependencyService>,
     pub ledger: Arc<UlLedgerService>,
     pub prediction: Arc<PredictionService>,
     store: CanonicalStore,
     project_root: PathBuf,
+    dependency_ready: Mutex<HashSet<ProjectId>>,
 }
 
 impl UlRuntime {
-    pub fn new(store: CanonicalStore, writer: WriterHandle, runtime_root: &Path) -> Self {
+    pub fn new(
+        store: CanonicalStore,
+        writer: WriterHandle,
+        runtime_root: &Path,
+        activation_enable_min_edges: u32,
+    ) -> Self {
         let cue_index = Arc::new(CueIndexService::new(store.clone()));
         let touched = Arc::new(TouchedSetRegistry::new());
         let project_root = eliot_engine::canonical_project_root(runtime_root);
-        let planner = Arc::new(InjectionPlanner::with_project_root(
-            Arc::clone(&cue_index),
-            store.clone(),
-            writer.clone(),
-            Arc::clone(&touched),
-            project_root.clone(),
-        ));
+        let planner = Arc::new(
+            InjectionPlanner::with_project_root_and_activation_min_edges(
+                Arc::clone(&cue_index),
+                store.clone(),
+                writer.clone(),
+                Arc::clone(&touched),
+                project_root.clone(),
+                activation_enable_min_edges,
+            ),
+        );
+        let dependency = Arc::new(UlDependencyService::new(store.clone()));
         let ledger = Arc::new(UlLedgerService::new(store.clone()));
         let prediction = Arc::new(PredictionService::new(store.clone(), writer));
         Self {
             cue_index,
             touched,
             planner,
+            dependency,
             ledger,
             prediction,
             store,
             project_root,
+            dependency_ready: Mutex::new(HashSet::new()),
         }
+    }
+
+    pub async fn ensure_dependency_state(&self, project_id: ProjectId) -> anyhow::Result<()> {
+        if self
+            .dependency_ready
+            .lock()
+            .map_err(|_| anyhow::anyhow!("UL dependency readiness lock poisoned"))?
+            .contains(&project_id)
+        {
+            return Ok(());
+        }
+        self.dependency.rebuild_index(project_id).await?;
+        self.dependency.scan_project(project_id).await?;
+        self.dependency_ready
+            .lock()
+            .map_err(|_| anyhow::anyhow!("UL dependency readiness lock poisoned"))?
+            .insert(project_id);
+        Ok(())
+    }
+
+    pub async fn observe_successful_tool(
+        &self,
+        project_id: ProjectId,
+        session_id: SessionId,
+        tool_name: &str,
+        arguments: &Value,
+        observed_cues: &[eliot_types::ObservedCue],
+    ) -> anyhow::Result<()> {
+        self.ensure_dependency_state(project_id).await?;
+        if !eliot_engine::is_mutation_tool(tool_name, arguments) {
+            return Ok(());
+        }
+        let changed_paths = observed_cues
+            .iter()
+            .filter(|cue| cue.kind == eliot_types::CueKind::FilePath)
+            .map(|cue| cue.value.clone())
+            .collect::<Vec<_>>();
+        self.dependency
+            .mark_paths_dirty(
+                project_id,
+                &changed_paths,
+                &format!("tool:{tool_name}:{session_id}"),
+            )
+            .await?;
+        Ok(())
     }
 
     #[allow(clippy::too_many_lines)]
@@ -98,6 +158,14 @@ impl UlRuntime {
         .into_values()
         .collect::<Vec<_>>();
         let cue_sources = self.store.load_cue_records(project_id).await?;
+        let dirty_capsules = self
+            .store
+            .load_ul_dirty_artifacts(project_id, 512)
+            .await?
+            .into_iter()
+            .filter(|state| state.target_kind == eliot_types::PyramidTargetKind::SubsystemCapsule)
+            .map(|state| (state.target_id.clone(), state))
+            .collect::<BTreeMap<_, _>>();
         let meta = MetacognitionService::evaluate(
             &self.project_root,
             &concept_list,
@@ -168,11 +236,12 @@ impl UlRuntime {
                 continue;
             };
             let freshness = capsule_freshness(capsule, &self.project_root);
+            let dirty = dirty_capsules.get(&capsule.concept_id);
             let freshness_name = match freshness {
-                CapsuleFreshness::Fresh => "fresh",
-                CapsuleFreshness::Stale { .. } => "stale",
+                CapsuleFreshness::Fresh if dirty.is_none() => "fresh",
+                CapsuleFreshness::Stale { .. } | CapsuleFreshness::Fresh => "stale",
             };
-            let rendered = render_capsule(capsule, &self.project_root);
+            let rendered = render_capsule_with_dirty(capsule, &self.project_root, dirty);
             let payload_units = ul_token_estimate(&rendered);
             let mut value = json!({
                 "ref": format!("capsule:{}", capsule.capsule_id),

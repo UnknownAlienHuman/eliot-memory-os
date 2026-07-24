@@ -88,6 +88,7 @@ pub use cognitive_run::{
 pub use config::{
     BlobStoreConfig, ControlWalConfig, DbConfig, DbMode, DelegationCalibrationConfig,
     GovernorConfig, ServiceConfig, StoreConfig, SurrealCapabilities, SurrealServerConfig,
+    UlActivationConfig, UlConfig,
 };
 pub use delegation::{
     DelegationBudget, DelegationDecision, DelegationDecisionKind, DelegationJob,
@@ -316,6 +317,10 @@ pub use skill::{
     SkillPatchProposal, SkillQuarantineProposal, SkillReplayRequirement, SkillScopeRule,
     SkillSplitProposal, SkillStep, SkillToolRequirement,
 };
+pub use ul::activation::{
+    ACTIVATION_SCALE, ACTIVATION_THRESHOLD, ActivationEdgeKind, ActivationNode, ActivationTrace,
+    SuppressedActivation, UlActivationGraphEdge, UlActivationGraphRows,
+};
 pub use ul::artifact::UlArtifact;
 pub use ul::behavior::{
     CoChangeEdge, FIX_CLASSIFIER_VERSION, HotspotScore, MiningConfig, MiningRun,
@@ -329,6 +334,10 @@ pub use ul::concept::{CoverageClass, DangerPath, SubsystemCoverage, UlMetacognit
 pub use ul::cue::{
     CueBinding, CueBindingError, CueIndexRow, CueKind, CueMatchMode, CueRecordSource, CueStrength,
     cue_row_id, normalize_binding, normalize_bindings, ul_token_estimate,
+};
+pub use ul::dependency::{
+    UlArtifactDirtyState, UlDependencyKind, UlDependencyRebuildReport, UlDependencyRef,
+    UlDirtyReason, UlMaintenanceReport, UlReverseDependencyRow,
 };
 pub use ul::guard::{TextEncodingViolation, inspect_text_encoding, mojibake};
 pub use ul::injection::{

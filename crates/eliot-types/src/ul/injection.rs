@@ -20,6 +20,10 @@ pub struct PendingInjectionItem {
     pub negative_memory: bool,
     pub invariant: bool,
     pub token_estimate: u32,
+    #[serde(default)]
+    pub activation_trace_ref: Option<String>,
+    #[serde(default)]
+    pub activation_score_milli: Option<u16>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -35,6 +39,10 @@ pub struct UlFiredItem {
     pub line: String,
     pub uri: String,
     pub payload: Option<Value>,
+    #[serde(default)]
+    pub activation_trace_ref: Option<String>,
+    #[serde(default)]
+    pub activation_score_milli: Option<u16>,
 }
 
 #[derive(Clone, Debug, JsonSchema, Serialize, Deserialize)]

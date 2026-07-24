@@ -1964,6 +1964,14 @@ async fn dispatch_command(
             commands::UlCommand::Report { project } => {
                 commands::run_ul_report(config, project).await
             }
+            commands::UlCommand::Maintain {
+                project,
+                root,
+                limit,
+            } => commands::run_ul_maintain(config, project, &root, limit).await,
+            commands::UlCommand::DirtyReport { project } => {
+                commands::run_ul_dirty_report(config, project).await
+            }
         },
         Command::Codecortex { command } => match command {
             CodeCortexCommand::Health => commands::run_codecortex_health(config),

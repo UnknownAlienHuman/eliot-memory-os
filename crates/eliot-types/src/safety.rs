@@ -499,6 +499,7 @@ pub enum MaintenanceJobKind {
     IncidentReview,
     ConfigSnapshot,
     PolicySnapshot,
+    UlCapsuleMaintenance,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
