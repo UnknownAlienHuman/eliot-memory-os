@@ -154,10 +154,12 @@ impl InjectionPlanner {
         let mut selected = Vec::new();
         let mut total_units = 0_u32;
         for item in batch.items {
-            if self
-                .touched
-                .was_delivered(session_id, &item.item_ref, &item.source_fingerprint)
-            {
+            if self.touched.was_delivered(
+                project_id,
+                session_id,
+                &item.item_ref,
+                &item.source_fingerprint,
+            ) {
                 continue;
             }
             let line = truncate_utf8(item.preview.trim(), MAX_LINE_BYTES);
@@ -216,8 +218,12 @@ impl InjectionPlanner {
             {
                 continue;
             }
-            self.touched
-                .mark_delivered(session_id, &item.item_ref, &item.source_fingerprint);
+            self.touched.mark_delivered(
+                project_id,
+                session_id,
+                &item.item_ref,
+                &item.source_fingerprint,
+            );
             committed_receipts.push(receipt);
             delivered.push(UlFiredItem {
                 item_ref: item.item_ref.clone(),
@@ -267,18 +273,19 @@ impl InjectionPlanner {
         let mut boot_map = false;
         for receipt in receipts {
             self.touched.restore_delivered(
+                project_id,
                 session_id,
                 &receipt.item_ref,
                 &receipt.source_fingerprint,
             );
             if receipt.item_ref == "ul_boot:not_onboarded" {
-                self.touched.mark_boot_sent(session_id);
+                self.touched.mark_boot_sent(project_id, session_id);
             }
             boot_charter |= receipt.item_ref.starts_with("charter:");
             boot_map |= receipt.item_ref.starts_with("system-map:");
         }
         if boot_charter && boot_map {
-            self.touched.mark_boot_sent(session_id);
+            self.touched.mark_boot_sent(project_id, session_id);
         }
         self.hydrated
             .lock()
@@ -294,7 +301,7 @@ impl InjectionPlanner {
         session_id: SessionId,
         response: &mut Value,
     ) -> Result<Vec<InjectionReceipt>, EngineError> {
-        if self.touched.boot_sent(session_id) {
+        if self.touched.boot_sent(project_id, session_id) {
             return Ok(Vec::new());
         }
         let revision = response
@@ -347,7 +354,7 @@ impl InjectionPlanner {
         };
         self.commit_receipt(project_id, task_id, &receipt).await?;
         response_object_mut(response)?.insert("ul_boot".to_owned(), boot);
-        self.touched.mark_boot_sent(session_id);
+        self.touched.mark_boot_sent(project_id, session_id);
         Ok(vec![receipt])
     }
 
@@ -421,7 +428,7 @@ impl InjectionPlanner {
         self.commit_receipt(project_id, task_id, &map_receipt)
             .await?;
         response_object_mut(response)?.insert("ul_boot".to_owned(), boot);
-        self.touched.mark_boot_sent(session_id);
+        self.touched.mark_boot_sent(project_id, session_id);
         Ok(vec![charter_receipt, map_receipt])
     }
 

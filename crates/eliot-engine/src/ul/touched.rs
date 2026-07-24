@@ -1,6 +1,6 @@
 use eliot_types::{
-    CueKind, ObservedCue, SessionId, TaskId, command_pattern, error_signature, normalize_path,
-    normalize_symbol,
+    CueKind, ObservedCue, ProjectId, SessionId, TaskId, command_pattern, error_signature,
+    normalize_path, normalize_symbol,
 };
 use serde_json::Value;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -28,7 +28,13 @@ struct SessionTouchedSet {
 
 #[derive(Default)]
 pub struct TouchedSetRegistry {
-    sessions: Mutex<HashMap<SessionId, SessionTouchedSet>>,
+    sessions: Mutex<HashMap<ProjectSessionKey, SessionTouchedSet>>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct ProjectSessionKey {
+    project_id: ProjectId,
+    session_id: SessionId,
 }
 
 impl TouchedSetRegistry {
@@ -39,22 +45,25 @@ impl TouchedSetRegistry {
 
     pub fn observe_arguments(
         &self,
+        project_id: ProjectId,
         session_id: SessionId,
         tool_name: &str,
         arguments: &Value,
     ) -> Vec<ObservedCue> {
-        self.observe(session_id, tool_name, arguments)
+        self.observe(project_id, session_id, tool_name, arguments)
     }
 
     pub fn observe_result(
         &self,
+        project_id: ProjectId,
         session_id: SessionId,
         tool_name: &str,
         result: &Value,
     ) -> Vec<ObservedCue> {
-        let observed = self.observe(session_id, tool_name, result);
+        let key = key(project_id, session_id);
+        let observed = self.observe(project_id, session_id, tool_name, result);
         if let Ok(mut sessions) = self.sessions.lock() {
-            let session = sessions.entry(session_id).or_default();
+            let session = sessions.entry(key).or_default();
             if let Some(packet_id) = result.get("packet_id").and_then(Value::as_str) {
                 session.last_packet_id = Some(packet_id.to_owned());
             }
@@ -77,12 +86,18 @@ impl TouchedSetRegistry {
     }
 
     #[must_use]
-    pub fn recent_cues(&self, session_id: SessionId, limit: usize) -> Vec<ObservedCue> {
+    pub fn recent_cues(
+        &self,
+        project_id: ProjectId,
+        session_id: SessionId,
+        limit: usize,
+    ) -> Vec<ObservedCue> {
+        let key = key(project_id, session_id);
         self.sessions
             .lock()
             .ok()
             .and_then(|sessions| {
-                sessions.get(&session_id).map(|session| {
+                sessions.get(&key).map(|session| {
                     let mut cues = session.cues.iter().cloned().collect::<Vec<_>>();
                     cues.sort_by_key(|touched| std::cmp::Reverse(touched.sequence));
                     cues.into_iter()
@@ -94,10 +109,16 @@ impl TouchedSetRegistry {
             .unwrap_or_default()
     }
 
-    pub fn mark_delivered(&self, session_id: SessionId, item_ref: &str, fingerprint: &str) {
+    pub fn mark_delivered(
+        &self,
+        project_id: ProjectId,
+        session_id: SessionId,
+        item_ref: &str,
+        fingerprint: &str,
+    ) {
         if let Ok(mut sessions) = self.sessions.lock() {
             sessions
-                .entry(session_id)
+                .entry(key(project_id, session_id))
                 .or_default()
                 .delivered
                 .insert(item_ref.to_owned(), fingerprint.to_owned());
@@ -105,30 +126,48 @@ impl TouchedSetRegistry {
     }
 
     #[must_use]
-    pub fn was_delivered(&self, session_id: SessionId, item_ref: &str, fingerprint: &str) -> bool {
+    pub fn was_delivered(
+        &self,
+        project_id: ProjectId,
+        session_id: SessionId,
+        item_ref: &str,
+        fingerprint: &str,
+    ) -> bool {
+        let key = key(project_id, session_id);
         self.sessions
             .lock()
             .ok()
             .and_then(|sessions| {
                 sessions
-                    .get(&session_id)
+                    .get(&key)
                     .and_then(|session| session.delivered.get(item_ref))
                     .map(|delivered| delivered == fingerprint)
             })
             .unwrap_or(false)
     }
 
-    pub fn restore_delivered(&self, session_id: SessionId, item_ref: &str, fingerprint: &str) {
-        self.mark_delivered(session_id, item_ref, fingerprint);
+    pub fn restore_delivered(
+        &self,
+        project_id: ProjectId,
+        session_id: SessionId,
+        item_ref: &str,
+        fingerprint: &str,
+    ) {
+        self.mark_delivered(project_id, session_id, item_ref, fingerprint);
     }
 
     #[must_use]
-    pub fn packet_context(&self, session_id: SessionId) -> (Option<String>, HashSet<String>) {
+    pub fn packet_context(
+        &self,
+        project_id: ProjectId,
+        session_id: SessionId,
+    ) -> (Option<String>, HashSet<String>) {
+        let key = key(project_id, session_id);
         self.sessions
             .lock()
             .ok()
             .and_then(|sessions| {
-                sessions.get(&session_id).map(|session| {
+                sessions.get(&key).map(|session| {
                     (
                         session.last_packet_id.clone(),
                         session.last_packet_handles.clone(),
@@ -139,30 +178,40 @@ impl TouchedSetRegistry {
     }
 
     #[must_use]
-    pub fn last_task_id(&self, session_id: SessionId) -> Option<TaskId> {
-        self.sessions.lock().ok().and_then(|sessions| {
-            sessions
-                .get(&session_id)
-                .and_then(|session| session.last_task_id)
-        })
-    }
-
-    #[must_use]
-    pub fn boot_sent(&self, session_id: SessionId) -> bool {
+    pub fn last_task_id(&self, project_id: ProjectId, session_id: SessionId) -> Option<TaskId> {
+        let key = key(project_id, session_id);
         self.sessions
             .lock()
             .ok()
-            .and_then(|sessions| sessions.get(&session_id).map(|session| session.boot_sent))
+            .and_then(|sessions| sessions.get(&key).and_then(|session| session.last_task_id))
+    }
+
+    #[must_use]
+    pub fn boot_sent(&self, project_id: ProjectId, session_id: SessionId) -> bool {
+        let key = key(project_id, session_id);
+        self.sessions
+            .lock()
+            .ok()
+            .and_then(|sessions| sessions.get(&key).map(|session| session.boot_sent))
             .unwrap_or(false)
     }
 
-    pub fn mark_boot_sent(&self, session_id: SessionId) {
+    pub fn mark_boot_sent(&self, project_id: ProjectId, session_id: SessionId) {
         if let Ok(mut sessions) = self.sessions.lock() {
-            sessions.entry(session_id).or_default().boot_sent = true;
+            sessions
+                .entry(key(project_id, session_id))
+                .or_default()
+                .boot_sent = true;
         }
     }
 
-    fn observe(&self, session_id: SessionId, tool_name: &str, value: &Value) -> Vec<ObservedCue> {
+    fn observe(
+        &self,
+        project_id: ProjectId,
+        session_id: SessionId,
+        tool_name: &str,
+        value: &Value,
+    ) -> Vec<ObservedCue> {
         let mut observed = Vec::new();
         extract_cues(tool_name, None, value, &mut observed);
         observed.sort_by(|left, right| {
@@ -174,7 +223,7 @@ impl TouchedSetRegistry {
         let Ok(mut sessions) = self.sessions.lock() else {
             return Vec::new();
         };
-        let session = sessions.entry(session_id).or_default();
+        let session = sessions.entry(key(project_id, session_id)).or_default();
         for cue in &observed {
             session.next_sequence = session.next_sequence.saturating_add(1);
             session.cues.retain(|touched| touched.cue != *cue);
@@ -187,6 +236,13 @@ impl TouchedSetRegistry {
             }
         }
         observed
+    }
+}
+
+const fn key(project_id: ProjectId, session_id: SessionId) -> ProjectSessionKey {
+    ProjectSessionKey {
+        project_id,
+        session_id,
     }
 }
 

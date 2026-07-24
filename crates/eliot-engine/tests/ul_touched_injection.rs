@@ -1,12 +1,14 @@
 use eliot_engine::TouchedSetRegistry;
-use eliot_types::{CueKind, SessionId};
+use eliot_types::{CueKind, ProjectId, SessionId};
 use serde_json::json;
 
 #[test]
 fn t04_touched_set_extracts_expected_cues() {
     let registry = TouchedSetRegistry::new();
+    let project_id = ProjectId::new_v7();
     let session_id = SessionId::new_v7();
     let observed = registry.observe_arguments(
+        project_id,
         session_id,
         "eliot_test",
         &json!({
@@ -44,12 +46,13 @@ fn t04_touched_set_extracts_expected_cues() {
 
     for index in 0..140 {
         registry.observe_arguments(
+            project_id,
             session_id,
             "eliot_test",
             &json!({"resource": format!("src/generated/{index}.rs")}),
         );
     }
-    let recent = registry.recent_cues(session_id, 256);
+    let recent = registry.recent_cues(project_id, session_id, 256);
     assert_eq!(recent.len(), 128);
     assert_eq!(recent[0].value, "src/generated/139.rs");
     assert!(!recent.iter().any(|cue| cue.value == "src/generated/0.rs"));

@@ -5,7 +5,8 @@ use eliot_engine::{
 use eliot_store::{CanonicalStore, ControlWal};
 use eliot_types::{
     CoChangeEdge, ConceptNode, ControlWalConfig, CredentialProviderKind, GovernorConfig,
-    HotspotScore, ModuleCard, OnboardingTestHook, ProjectId, normalize_bindings,
+    HotspotScore, MiningRun, ModuleCard, OnboardingTestHook, ProjectCharter, ProjectId,
+    SubsystemCapsule, SystemMap, normalize_bindings,
 };
 use std::fmt::Write as _;
 use std::fs;
@@ -104,6 +105,86 @@ async fn t06_onboarding_is_resumable_and_model_free() -> TestResult {
             .join("checkpoint.json")
             .is_file()
     );
+    drop(service);
+    drop(writer);
+    actor.await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn h4_dirty_onboarding_rejects_before_project_writes() -> TestResult {
+    if rerun_with_credential_gate("h4_dirty_onboarding_rejects_before_project_writes")? {
+        return Ok(());
+    }
+    let harness = Harness::start().await?;
+    let repository = harness.create_repository()?;
+    fs::write(
+        repository.join("src/lib.rs"),
+        "//! Dirty tracked change.\npub fn dirty() {}\n",
+    )?;
+    let project_id = ProjectId::new_v7();
+    let wal = ControlWal::open(&ControlWalConfig {
+        path: slash(&harness.root.join("dirty-control.redb")),
+    })?;
+    let (writer, actor) =
+        WriterActor::channel(wal, harness.store.clone(), &WriterConfig::default());
+    let actor = tokio::spawn(actor.run());
+    let service = OnboardingService::new(harness.store.clone(), writer.clone());
+
+    let error = service
+        .run(
+            project_id,
+            &repository,
+            &harness.root,
+            OnboardingTestHook::None,
+        )
+        .await
+        .expect_err("dirty onboarding must fail");
+    assert!(error.to_string().contains("UL_ONBOARDING_DIRTY_WORKTREE"));
+    assert!(
+        harness
+            .store
+            .load_ul_artifacts::<ConceptNode>(project_id, &["concept_node"], 128)
+            .await?
+            .is_empty()
+    );
+    assert!(
+        harness
+            .store
+            .load_ul_artifacts::<SubsystemCapsule>(project_id, &["subsystem_capsule"], 128,)
+            .await?
+            .is_empty()
+    );
+    assert!(
+        harness
+            .store
+            .load_ul_artifacts::<ProjectCharter>(project_id, &["project_charter"], 128)
+            .await?
+            .is_empty()
+    );
+    assert!(
+        harness
+            .store
+            .load_ul_artifacts::<SystemMap>(project_id, &["system_map"], 128)
+            .await?
+            .is_empty()
+    );
+    assert!(
+        harness
+            .store
+            .load_ul_artifacts::<MiningRun>(project_id, &["mining_run"], 128)
+            .await?
+            .is_empty()
+    );
+    assert!(
+        !harness
+            .store
+            .writer_receipts()
+            .await?
+            .to_string()
+            .contains(&project_id.to_string())
+    );
+
     drop(service);
     drop(writer);
     actor.await?;

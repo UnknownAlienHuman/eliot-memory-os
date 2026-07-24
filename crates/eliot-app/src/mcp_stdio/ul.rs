@@ -289,6 +289,9 @@ fn concept_bridge(task_id: &str, concept: &ConceptNode) -> Vec<CausalBridgeHop> 
 }
 
 fn path_matches_boundary(path: &str, boundary: &str) -> bool {
+    if boundary == "." {
+        return true;
+    }
     path == boundary
         || path
             .strip_prefix(boundary.trim_end_matches('/'))

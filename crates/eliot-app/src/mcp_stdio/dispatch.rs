@@ -274,12 +274,13 @@ pub(super) async fn call_tool(
         .unwrap_or_else(|| json!({}));
     let arguments = enforce_bound_tool_scope(context, name, arguments)?;
     let ul_input_bytes = u64::try_from(serde_json::to_vec(&arguments)?.len()).unwrap_or(u64::MAX);
-    let observed_arguments =
+    let (ul_project_id, ul_task_id) = ul_scope(context, &arguments);
+    let observed_arguments = ul_project_id.map_or_else(Vec::new, |project_id| {
         state
             .ul
             .touched
-            .observe_arguments(context.session_id, name, &arguments);
-    let (ul_project_id, ul_task_id) = ul_scope(context, &arguments);
+            .observe_arguments(project_id, context.session_id, name, &arguments)
+    });
     let argument_memory_free_control = name == "eliot_compile_packet_l3"
         && arguments.get("memory_mode").and_then(Value::as_str) == Some("memory_free_control");
     let cognitive_claims = if state.profile == McpAccessProfile::CognitiveChild {
@@ -362,11 +363,14 @@ pub(super) async fn call_tool(
             let ul_output_bytes =
                 u64::try_from(serde_json::to_vec(&structured)?.len()).unwrap_or(u64::MAX);
             let mut newly_observed = observed_arguments;
-            newly_observed.extend(state.ul.touched.observe_result(
-                context.session_id,
-                name,
-                &structured,
-            ));
+            if let Some(project_id) = ul_project_id {
+                newly_observed.extend(state.ul.touched.observe_result(
+                    project_id,
+                    context.session_id,
+                    name,
+                    &structured,
+                ));
+            }
             newly_observed.sort_by(|left, right| {
                 left.kind
                     .cmp(&right.kind)

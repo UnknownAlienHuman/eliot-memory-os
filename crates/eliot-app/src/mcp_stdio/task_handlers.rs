@@ -453,12 +453,22 @@ async fn dispatch_memory_influence_trace(
                 .context("minimal influence acknowledgement requires project_id when unbound")?;
             let task_id = context
                 .bound_task_id
-                .or_else(|| state.ul.touched.last_task_id(context.session_id))
+                .or_else(|| {
+                    state
+                        .ul
+                        .touched
+                        .last_task_id(project_id, context.session_id)
+                })
                 .context(
-                    "minimal influence acknowledgement requires a bound task or prior packet",
+                    "MISSING_PROJECT_PACKET_CONTEXT: minimal influence acknowledgement requires a prior packet for this project or an explicit bound task",
                 )?;
-            let (packet_id, packet_handles) =
-                state.ul.touched.packet_context(context.session_id);
+            let (packet_id, packet_handles) = state
+                .ul
+                .touched
+                .packet_context(project_id, context.session_id);
+            let packet_id = packet_id.context(
+                "MISSING_PROJECT_PACKET_CONTEXT: minimal influence acknowledgement requires a prior packet for this project or an explicit bound task",
+            )?;
             let epistemic_status =
                 influence_epistemic_status(state, project_id, &ack.memory_handle).await?;
             let admission_decision = match epistemic_status.as_str() {
@@ -486,7 +496,7 @@ async fn dispatch_memory_influence_trace(
                 task_id,
                 session_id: AgentSessionId::from_uuid(context.session_id.as_uuid()),
                 memory_handle: ack.memory_handle,
-                packet_id: packet_id.unwrap_or_else(|| "none".to_owned()),
+                packet_id,
                 admission_decision,
                 inclusion_or_suppression_reason: format!("ack:{class_name}"),
                 epistemic_status_at_use: epistemic_status,

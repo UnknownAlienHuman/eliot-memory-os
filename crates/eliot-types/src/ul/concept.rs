@@ -53,6 +53,8 @@ pub struct FileDependency {
 
 #[derive(Clone, Debug, Default, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 pub struct DependencyManifest {
+    #[serde(default)]
+    pub project_root: String,
     pub file_deps: Vec<FileDependency>,
     pub claim_deps: Vec<String>,
     pub decision_deps: Vec<String>,

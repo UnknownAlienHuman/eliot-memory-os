@@ -244,9 +244,9 @@ impl OnboardingService {
         hook: OnboardingTestHook,
     ) -> Result<OnboardingReport, EngineError> {
         let project_root = validate_project_root(project_root)?;
-        self.store.migrate_schema().await?;
         let head_commit = git_head(&project_root)?;
         validate_git_state(&project_root)?;
+        self.store.migrate_schema().await?;
         let cue_sources = self.store.load_cue_records(project_id).await?;
         let mining = self
             .ensure_mining(project_id, &project_root, &head_commit, &cue_sources)
@@ -1150,6 +1150,17 @@ fn validate_git_state(root: &Path) -> Result<(), EngineError> {
             service: "git".to_owned(),
             reason: process_failure(&output),
         });
+    }
+    if !output.stdout.trim().is_empty() {
+        let preview = output
+            .stdout
+            .lines()
+            .take(20)
+            .collect::<Vec<_>>()
+            .join("\n");
+        return Err(EngineError::WriteRejected(format!(
+            "UL_ONBOARDING_DIRTY_WORKTREE: commit or discard local changes before onboarding\n{preview}"
+        )));
     }
     Ok(())
 }

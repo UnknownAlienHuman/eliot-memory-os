@@ -39,6 +39,7 @@ pub(super) async fn dispatch_agent_candidate_submit(
     if let Some(curation) = input.curation.as_ref() {
         validate_candidate_curation(curation)?;
     }
+    let project_id = parse_project_id(&input.project_id)?;
     let binding_source;
     if input.cue_bindings.is_empty() {
         if input.auto_bind == Some(false) || state.profile == McpAccessProfile::CognitiveChild {
@@ -46,7 +47,7 @@ pub(super) async fn dispatch_agent_candidate_submit(
                 "CUE_BINDING_REQUIRED: provide cue_bindings or permit automatic binding",
             ));
         }
-        input.cue_bindings = auto_candidate_bindings(state, context, &input)?;
+        input.cue_bindings = auto_candidate_bindings(state, context, project_id, &input)?;
         binding_source = "auto";
     } else {
         binding_source = "explicit";
@@ -63,7 +64,6 @@ pub(super) async fn dispatch_agent_candidate_submit(
         ));
     }
     input.cue_bindings = normalized_bindings;
-    let project_id = parse_project_id(&input.project_id)?;
     let task_id = TaskId::from_str(&input.task_id).context("parse candidate task_id")?;
     let _task = require_task(state, project_id, task_id).await?;
     let write_id = WriteId::from_str(&input.write_id).context("parse candidate write id")?;
@@ -279,9 +279,13 @@ pub(super) async fn dispatch_agent_candidate_submit(
 fn auto_candidate_bindings(
     state: &McpState,
     context: AuthenticatedRequestContext,
+    project_id: ProjectId,
     input: &AgentCandidateSubmitInput,
 ) -> Result<Vec<eliot_types::CueBinding>> {
-    let recent = state.ul.touched.recent_cues(context.session_id, 16);
+    let recent = state
+        .ul
+        .touched
+        .recent_cues(project_id, context.session_id, 16);
     let corpus = [
         input.topic.as_str(),
         input.statement.as_str(),

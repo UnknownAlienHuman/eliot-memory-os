@@ -129,6 +129,85 @@ fn d02_observability_replay_one_row_and_no_truth_revision() -> TestResult {
 }
 
 #[test]
+fn h2_minimal_ack_uses_only_same_project_packet_context() -> TestResult {
+    let _guard = test_guard();
+    if rerun_with_credential_gate("h2_minimal_ack_uses_only_same_project_packet_context")? {
+        return Ok(());
+    }
+    let mut harness = Harness::start("h2-project-packet")?;
+    let project_a = ProjectId::new_v7();
+    let project_b = ProjectId::new_v7();
+    let task_a = TaskId::new_v7();
+    let task_b = TaskId::new_v7();
+    harness.create_task(15, project_a, task_a)?;
+    harness.create_task(16, project_b, task_b)?;
+    let packet_a = harness.client.tool_call(
+        17,
+        "eliot_compile_packet_l3",
+        &json!({
+            "project_id": project_a,
+            "task_id": task_a,
+            "goal": "compile project A packet context",
+            "candidate_handles": ["file:src/a.rs"],
+            "max_tokens": 1_200
+        }),
+    )?;
+    let packet_a_id = required_string(&packet_a, "/packet_id")?;
+    let rejected = harness.client.tool_call_response(
+        18,
+        "eliot_memory_influence_trace",
+        &json!({
+            "project_id": project_b,
+            "write_id": WriteId::new_v7(),
+            "memory_handle": "file:src/b.rs",
+            "influence_class": "used_for_verification",
+            "downstream_outcome_ref": "verification:h2-before-b"
+        }),
+    )?;
+    assert!(
+        rejected
+            .to_string()
+            .contains("MISSING_PROJECT_PACKET_CONTEXT")
+    );
+
+    let packet_b = harness.client.tool_call(
+        19,
+        "eliot_compile_packet_l3",
+        &json!({
+            "project_id": project_b,
+            "task_id": task_b,
+            "goal": "compile project B packet context",
+            "candidate_handles": ["file:src/b.rs"],
+            "max_tokens": 1_200
+        }),
+    )?;
+    let packet_b_id = required_string(&packet_b, "/packet_id")?;
+    harness.client.tool_call(
+        20,
+        "eliot_memory_influence_trace",
+        &json!({
+            "project_id": project_b,
+            "write_id": WriteId::new_v7(),
+            "memory_handle": "file:src/b.rs",
+            "influence_class": "used_for_verification",
+            "downstream_outcome_ref": "verification:h2-after-b"
+        }),
+    )?;
+    let traces: Vec<MemoryInfluenceTrace> = harness.observability_records(
+        project_b,
+        Some(task_b),
+        ObservabilityKind::MemoryInfluenceTrace,
+    )?;
+
+    assert_eq!(traces.len(), 1);
+    assert_eq!(traces[0].task_id, task_b);
+    assert_eq!(traces[0].packet_id, packet_b_id);
+    assert_ne!(traces[0].task_id, task_a);
+    assert_ne!(traces[0].packet_id, packet_a_id);
+    Ok(())
+}
+
+#[test]
 fn d03_published_compile_schema_matches_serde() -> TestResult {
     let _guard = test_guard();
     if rerun_with_credential_gate("d03_published_compile_schema_matches_serde")? {

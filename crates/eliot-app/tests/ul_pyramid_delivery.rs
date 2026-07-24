@@ -1,14 +1,18 @@
 #[path = "support/ul_t04.rs"]
 mod support;
 
+use eliot_engine::{CapsuleEvidence, PyramidBuilder};
 use eliot_types::{
     AgentId, CapsuleBuild, CommandContext, ConceptKind, ConceptNode, CueBinding, CueKind,
-    CueMatchMode, CueStrength, DependencyManifest, InjectionReceipt, LifecycleStatus,
+    CueMatchMode, CueStrength, DependencyManifest, InjectionReceipt, LifecycleStatus, ModuleCard,
     ObservabilityKind, ProjectCharter, ProjectId, PyramidBuildStatus, PyramidTargetKind,
-    RelationInput, RelationType, SemanticCommand, SubsystemCapsule, SystemMap, TaintClass,
+    RelationInput, RelationType, SemanticCommand, SubsystemCapsule, SystemMap, TaintClass, TaskId,
     UlArtifact, UlArtifactBatchRecordCommand, Visibility, WriteId, ul_token_estimate,
 };
 use serde_json::{Value, json};
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 use support::{Harness, TestResult, rerun_with_credential_gate, test_guard};
 
 #[test]
@@ -117,6 +121,150 @@ fn t06_packet_delivers_relevant_capsule() -> TestResult {
     Ok(())
 }
 
+#[test]
+fn h1_boot_and_delivery_dedup_are_project_scoped() -> TestResult {
+    let _guard = test_guard();
+    if rerun_with_credential_gate("h1_boot_and_delivery_dedup_are_project_scoped")? {
+        return Ok(());
+    }
+    let mut harness = Harness::start("h1-project-boot")?;
+    let project_a = ProjectId::new_v7();
+    let project_b = ProjectId::new_v7();
+    seed_pyramid(&harness, project_a)?;
+    seed_pyramid(&harness, project_b)?;
+
+    let first_a = current_state(&mut harness, 620, project_a, "src/a/lib.rs")?;
+    let first_b = current_state(&mut harness, 621, project_b, "src/a/lib.rs")?;
+    let second_a = current_state(&mut harness, 622, project_a, "src/a/lib.rs")?;
+    let second_b = current_state(&mut harness, 623, project_b, "src/a/lib.rs")?;
+    let receipts_a: Vec<InjectionReceipt> =
+        harness.observability_records(project_a, None, ObservabilityKind::InjectionReceipt)?;
+    let receipts_b: Vec<InjectionReceipt> =
+        harness.observability_records(project_b, None, ObservabilityKind::InjectionReceipt)?;
+
+    assert_eq!(first_a["ul_boot"]["status"], "ready");
+    assert_eq!(first_b["ul_boot"]["status"], "ready");
+    assert!(second_a.get("ul_boot").is_none());
+    assert!(second_b.get("ul_boot").is_none());
+    assert_eq!(
+        receipts_a
+            .iter()
+            .filter(|receipt| receipt.surface == "mcp_auto_boot")
+            .count(),
+        2
+    );
+    assert_eq!(
+        receipts_b
+            .iter()
+            .filter(|receipt| receipt.surface == "mcp_auto_boot")
+            .count(),
+        2
+    );
+    Ok(())
+}
+
+#[test]
+fn h3_custom_root_freshness_and_dot_boundary_reach_runtime_packet() -> TestResult {
+    let _guard = test_guard();
+    if rerun_with_credential_gate("h3_custom_root_freshness_and_dot_boundary_reach_runtime_packet")?
+    {
+        return Ok(());
+    }
+    let mut harness = Harness::start("h3-custom-root")?;
+    let project_root = TempProjectRoot::new("h3-custom-root")?;
+    let source_path = project_root.path().join("src").join("lib.rs");
+    fs::create_dir_all(source_path.parent().ok_or("source parent missing")?)?;
+    fs::write(&source_path, "pub fn before() {}\n")?;
+    let project_id = ProjectId::new_v7();
+    seed_pyramid(&harness, project_id)?;
+    let root_concept = ConceptNode {
+        entrypoint_refs: vec!["file:src/lib.rs".to_owned()],
+        ..concept(project_id, "concept-root", "root", ".")
+    };
+    let module_card = ModuleCard {
+        card_id: "card-root".to_owned(),
+        project_id,
+        path: "src/lib.rs".to_owned(),
+        body_md: "PURPOSE: exercise a custom project root".to_owned(),
+        verifier: "cargo test".to_owned(),
+        hotspot_ref: None,
+        co_change_refs: Vec::new(),
+        failure_refs: Vec::new(),
+        source_refs: vec!["file:src/lib.rs".to_owned()],
+        cue_bindings: cue("root"),
+        build_fingerprint: "h3-root-card".to_owned(),
+    };
+    let promoted = PyramidBuilder.build_capsule(
+        project_root.path(),
+        &root_concept,
+        &CapsuleEvidence {
+            module_cards: vec![module_card],
+            ..CapsuleEvidence::default()
+        },
+        None,
+    )?;
+    let expected_root = project_root
+        .path()
+        .canonicalize()?
+        .to_string_lossy()
+        .replace('\\', "/");
+    assert_eq!(
+        promoted.artifact.dependency_manifest.project_root,
+        expected_root
+    );
+    harness.seed(&ul_command(
+        project_id,
+        vec![UlArtifact::ConceptNode(root_concept.clone())],
+        vec![RelationInput {
+            relation_type: RelationType::ConceptImplementedBy,
+            from: format!("concept:{}", root_concept.concept_id),
+            to: "file:.".to_owned(),
+        }],
+    ))?;
+    let capsule_id = promoted.artifact.capsule_id.clone();
+    harness.seed(&ul_command(
+        project_id,
+        vec![
+            UlArtifact::SubsystemCapsule(promoted.artifact),
+            UlArtifact::CapsuleBuild(promoted.build),
+        ],
+        vec![RelationInput {
+            relation_type: RelationType::CapsuleCovers,
+            from: format!("capsule:{capsule_id}"),
+            to: format!("concept:{}", root_concept.concept_id),
+        }],
+    ))?;
+
+    let fresh = compile_packet(&mut harness, 624, project_id, "src/lib.rs")?;
+    let fresh_capsule = fresh["ul_understanding"]["capsules"]
+        .as_array()
+        .and_then(|capsules| {
+            capsules
+                .iter()
+                .find(|capsule| capsule["ref"] == format!("capsule:{capsule_id}"))
+        })
+        .ok_or("custom-root capsule missing from runtime packet")?;
+    assert_eq!(fresh_capsule["freshness"], "fresh");
+
+    fs::write(&source_path, "pub fn after() {}\n")?;
+    let stale = compile_packet(&mut harness, 625, project_id, "src/lib.rs")?;
+    let stale_capsule = stale["ul_understanding"]["capsules"]
+        .as_array()
+        .and_then(|capsules| {
+            capsules
+                .iter()
+                .find(|capsule| capsule["ref"] == format!("capsule:{capsule_id}"))
+        })
+        .ok_or("stale custom-root capsule missing from runtime packet")?;
+    assert_eq!(stale_capsule["freshness"], "stale");
+    assert!(
+        stale_capsule["body_md"]
+            .as_str()
+            .is_some_and(|body| body.contains("[STALE:"))
+    );
+    Ok(())
+}
+
 fn current_state(
     harness: &mut Harness,
     id: u64,
@@ -133,11 +281,41 @@ fn current_state(
     )
 }
 
+fn compile_packet(
+    harness: &mut Harness,
+    id: u64,
+    project_id: ProjectId,
+    path: &str,
+) -> TestResult<Value> {
+    harness.client.tool_call(
+        id,
+        "eliot_compile_packet_l3",
+        &json!({
+            "project_id": project_id,
+            "task_id": TaskId::new_v7(),
+            "goal": format!("change {path}"),
+            "candidate_handles": [format!("file:{path}")],
+            "max_tokens": 1_200
+        }),
+    )
+}
+
 #[allow(clippy::too_many_lines)]
 fn seed_pyramid(harness: &Harness, project_id: ProjectId) -> TestResult {
+    let project_suffix = project_id.to_string();
     let concepts = [
-        concept(project_id, "concept-a", "alpha", "src/a"),
-        concept(project_id, "concept-b", "beta", "src/b"),
+        concept(
+            project_id,
+            &format!("concept-a-{project_suffix}"),
+            "alpha",
+            "src/a",
+        ),
+        concept(
+            project_id,
+            &format!("concept-b-{project_suffix}"),
+            "beta",
+            "src/b",
+        ),
     ];
     harness.seed(&ul_command(
         project_id,
@@ -160,7 +338,7 @@ fn seed_pyramid(harness: &Harness, project_id: ProjectId) -> TestResult {
         .zip(["CAPSULE_ALPHA_MARKER", "CAPSULE_BETA_MARKER"])
     {
         let capsule_id = format!("capsule-{}", concept.name);
-        let build_id = format!("build-{}", concept.name);
+        let build_id = format!("build-{}-{project_suffix}", concept.name);
         let body_md = format!(
             "PURPOSE\n{marker}\n\nBOUNDARIES\n- {}\n\nKEY ENTRYPOINTS\n- {} [file:{}]\n\nINVARIANTS\n- none recorded\n\nDRAGONS\n- none recorded\n\nKEY DECISIONS\n- none recorded\n\nVERIFIERS\n- cargo test",
             concept.boundary_paths[0],
@@ -199,7 +377,7 @@ fn seed_pyramid(harness: &Harness, project_id: ProjectId) -> TestResult {
         ))?;
     }
     let map = SystemMap {
-        map_id: "map-ready".to_owned(),
+        map_id: format!("map-ready-{project_suffix}"),
         project_id,
         body_md: "SYSTEMS\n- alpha: owns a\n- beta: owns b\n\nFLOWS\n- none recorded".to_owned(),
         subsystem_concept_refs: concepts
@@ -208,12 +386,12 @@ fn seed_pyramid(harness: &Harness, project_id: ProjectId) -> TestResult {
             .collect(),
         flow_edges: Vec::new(),
         dependency_manifest: DependencyManifest::default(),
-        build_id: "build-map".to_owned(),
+        build_id: format!("build-map-{project_suffix}"),
         cue_bindings: cue("system map"),
     };
     let map_build = build(
         project_id,
-        "build-map".to_owned(),
+        map.build_id.clone(),
         PyramidTargetKind::SystemMap,
         map.map_id.clone(),
         600,
@@ -228,7 +406,7 @@ fn seed_pyramid(harness: &Harness, project_id: ProjectId) -> TestResult {
         Vec::new(),
     ))?;
     let charter = ProjectCharter {
-        charter_id: "charter-ready".to_owned(),
+        charter_id: format!("charter-ready-{project_suffix}"),
         project_id,
         body_md: "WHAT\nA governed test project.\n\nFOR WHOM\nAgents and operators changing this repository under verifier control.\n\nTOP INVARIANTS\n- preserve tests\n\nNON-GOALS\n- none\n\nVOCABULARY\n- alpha\n- beta".to_owned(),
         concept_refs: concepts
@@ -236,12 +414,12 @@ fn seed_pyramid(harness: &Harness, project_id: ProjectId) -> TestResult {
             .map(|concept| concept.concept_id.clone())
             .collect(),
         dependency_manifest: DependencyManifest::default(),
-        build_id: "build-charter".to_owned(),
+        build_id: format!("build-charter-{project_suffix}"),
         cue_bindings: cue("test project"),
     };
     let charter_build = build(
         project_id,
-        "build-charter".to_owned(),
+        charter.build_id.clone(),
         PyramidTargetKind::ProjectCharter,
         charter.charter_id.clone(),
         200,
@@ -328,4 +506,36 @@ fn ul_command(
         artifacts,
         relations,
     })
+}
+
+struct TempProjectRoot {
+    root: PathBuf,
+}
+
+impl TempProjectRoot {
+    fn new(name: &str) -> TestResult<Self> {
+        let nonce = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+        let root =
+            std::env::temp_dir().join(format!("eliot-ul-pr-{name}-{}-{nonce}", std::process::id()));
+        fs::create_dir_all(&root)?;
+        Ok(Self { root })
+    }
+
+    fn path(&self) -> &Path {
+        &self.root
+    }
+}
+
+impl Drop for TempProjectRoot {
+    fn drop(&mut self) {
+        if self
+            .root
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with("eliot-ul-pr-"))
+            && self.root.starts_with(std::env::temp_dir())
+        {
+            let _ = fs::remove_dir_all(&self.root);
+        }
+    }
 }

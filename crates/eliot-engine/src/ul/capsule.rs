@@ -487,7 +487,15 @@ impl PyramidBuilder {
 }
 
 #[must_use]
-pub fn capsule_freshness(capsule: &SubsystemCapsule, project_root: &Path) -> CapsuleFreshness {
+pub fn capsule_freshness(
+    capsule: &SubsystemCapsule,
+    fallback_project_root: &Path,
+) -> CapsuleFreshness {
+    let project_root = if capsule.dependency_manifest.project_root.trim().is_empty() {
+        fallback_project_root.to_path_buf()
+    } else {
+        PathBuf::from(&capsule.dependency_manifest.project_root)
+    };
     let mut changed = Vec::new();
     let mut missing = Vec::new();
     for dependency in &capsule.dependency_manifest.file_deps {
@@ -717,6 +725,7 @@ fn dependency_manifest(
     edge_deps: &[String],
     report_deps: &[String],
 ) -> Result<DependencyManifest, EngineError> {
+    let canonical_root = root.canonicalize()?;
     let mut paths = paths.to_vec();
     sort_dedup(&mut paths);
     let mut file_deps = Vec::new();
@@ -733,6 +742,7 @@ fn dependency_manifest(
         });
     }
     let mut manifest = DependencyManifest {
+        project_root: canonical_root.to_string_lossy().replace('\\', "/"),
         file_deps,
         claim_deps: claim_deps.to_vec(),
         decision_deps: decision_deps.to_vec(),
