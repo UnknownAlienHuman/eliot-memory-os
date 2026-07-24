@@ -152,7 +152,7 @@ fn h2_minimal_ack_uses_only_same_project_packet_context() -> TestResult {
             "max_tokens": 1_200
         }),
     )?;
-    let packet_a_id = required_string(&packet_a, "/packet_id")?;
+    let first_context_id = required_string(&packet_a, "/packet_id")?;
     let rejected = harness.client.tool_call_response(
         18,
         "eliot_memory_influence_trace",
@@ -181,7 +181,7 @@ fn h2_minimal_ack_uses_only_same_project_packet_context() -> TestResult {
             "max_tokens": 1_200
         }),
     )?;
-    let packet_b_id = required_string(&packet_b, "/packet_id")?;
+    let accepted_context_id = required_string(&packet_b, "/packet_id")?;
     harness.client.tool_call(
         20,
         "eliot_memory_influence_trace",
@@ -201,9 +201,9 @@ fn h2_minimal_ack_uses_only_same_project_packet_context() -> TestResult {
 
     assert_eq!(traces.len(), 1);
     assert_eq!(traces[0].task_id, task_b);
-    assert_eq!(traces[0].packet_id, packet_b_id);
+    assert_eq!(traces[0].packet_id, accepted_context_id);
     assert_ne!(traces[0].task_id, task_a);
-    assert_ne!(traces[0].packet_id, packet_a_id);
+    assert_ne!(traces[0].packet_id, first_context_id);
     Ok(())
 }
 

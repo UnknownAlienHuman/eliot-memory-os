@@ -41,8 +41,8 @@ fn t05_hidden_pair_is_mined() -> TestResult {
         artifacts: vec![UlArtifact::CoChangeEdge(edge.clone())],
         relations: vec![RelationInput {
             relation_type: RelationType::CoChange,
-            from: edge.path_a.clone(),
-            to: edge.path_b.clone(),
+            from: format!("file:{}", edge.path_a),
+            to: format!("file:{}", edge.path_b),
         }],
     });
     let envelope = WriteAdmissionService.admit(&command)?;

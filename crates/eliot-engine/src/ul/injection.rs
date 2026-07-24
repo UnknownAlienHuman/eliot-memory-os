@@ -403,12 +403,22 @@ impl InjectionPlanner {
         let content_units =
             ul_token_estimate(&charter.body_md).saturating_add(ul_token_estimate(&map.body_md));
         let over_budget = content_units > 1_200;
+        let charter_delivery = if over_budget {
+            json!({"ref": charter_ref})
+        } else {
+            json!({"ref": charter_ref, "body_md": charter.body_md})
+        };
+        let map_delivery = if over_budget {
+            json!({"ref": map_ref})
+        } else {
+            json!({"ref": map_ref, "body_md": map.body_md})
+        };
         let boot = if over_budget {
             json!({
                 "status": "ready",
                 "revision": revision,
-                "charter": {"ref": charter_ref},
-                "system_map": {"ref": map_ref},
+                "charter": charter_delivery.clone(),
+                "system_map": map_delivery.clone(),
                 "coverage": coverage,
                 "warning": "UL_BOOT_BUDGET_EXCEEDED: payload omitted; use artifact handles"
             })
@@ -416,15 +426,22 @@ impl InjectionPlanner {
             json!({
                 "status": "ready",
                 "revision": revision,
-                "charter": {"ref": charter_ref, "body_md": charter.body_md},
-                "system_map": {"ref": map_ref, "body_md": map.body_md},
+                "charter": charter_delivery.clone(),
+                "system_map": map_delivery.clone(),
                 "coverage": coverage
             })
         };
-        let charter_receipt = boot_receipt(session_id, task_id, &charter_ref, &charter.body_md);
+        let render_form = if over_budget { "handle" } else { "payload" };
+        let charter_receipt = boot_receipt(
+            session_id,
+            task_id,
+            &charter_ref,
+            &charter_delivery,
+            render_form,
+        )?;
         self.commit_receipt(project_id, task_id, &charter_receipt)
             .await?;
-        let map_receipt = boot_receipt(session_id, task_id, &map_ref, &map.body_md);
+        let map_receipt = boot_receipt(session_id, task_id, &map_ref, &map_delivery, render_form)?;
         self.commit_receipt(project_id, task_id, &map_receipt)
             .await?;
         response_object_mut(response)?.insert("ul_boot".to_owned(), boot);
@@ -486,10 +503,12 @@ fn boot_receipt(
     session_id: SessionId,
     task_id: Option<TaskId>,
     item_ref: &str,
-    body: &str,
-) -> InjectionReceipt {
-    let source_fingerprint = blake3::hash(body.as_bytes()).to_hex().to_string();
-    InjectionReceipt {
+    delivery: &Value,
+    render_form: &str,
+) -> Result<InjectionReceipt, EngineError> {
+    let rendered_bytes = serde_json::to_vec(delivery)?;
+    let source_fingerprint = blake3::hash(&rendered_bytes).to_hex().to_string();
+    Ok(InjectionReceipt {
         injection_id: injection_write_id(
             session_id,
             task_id,
@@ -502,12 +521,12 @@ fn boot_receipt(
         task_id,
         surface: "mcp_auto_boot".to_owned(),
         item_ref: item_ref.to_owned(),
-        render_form: "payload".to_owned(),
+        render_form: render_form.to_owned(),
         fired_cues: Vec::new(),
-        token_cost: ul_token_estimate(body),
+        token_cost: ul_token_estimate(&String::from_utf8_lossy(&rendered_bytes)),
         source_fingerprint,
         outcome: "delivered".to_owned(),
-    }
+    })
 }
 
 fn injection_write_id(

@@ -1,6 +1,9 @@
 #![allow(dead_code)]
 
-use eliot_engine::{CueIndexService, WriteAdmissionService, WriterActor, WriterConfig};
+use eliot_engine::{
+    CueIndexService, UlArtifactWriteReport, UlArtifactWriterService, WriteAdmissionService,
+    WriterActor, WriterConfig,
+};
 use eliot_store::{CanonicalStore, ControlWal};
 use eliot_types::{
     ControlWalConfig, CredentialProviderKind, CurrentStateRequest, GovernorConfig, MemoryRevision,
@@ -169,6 +172,31 @@ impl Harness {
         })
     }
 
+    pub fn write_module_cards(
+        &self,
+        run_id: &str,
+        cards: &[eliot_types::ModuleCard],
+    ) -> TestResult<UlArtifactWriteReport> {
+        let wal_path = self.runtime.path().join(format!(
+            "module-cards-{}.redb",
+            eliot_types::WriteId::new_v7()
+        ));
+        self.store_runtime.block_on(async {
+            let wal = ControlWal::open(&ControlWalConfig {
+                path: slash(&wal_path),
+            })?;
+            let (writer, actor) =
+                WriterActor::channel(wal, self.store.clone(), &WriterConfig::default());
+            let actor = tokio::spawn(actor.run());
+            let report = UlArtifactWriterService
+                .write_module_cards(&writer, &WriteAdmissionService, run_id, cards)
+                .await?;
+            drop(writer);
+            actor.await?;
+            Ok(report)
+        })
+    }
+
     pub fn current_revision(&self, project_id: ProjectId) -> TestResult<MemoryRevision> {
         Ok(self
             .store_runtime
@@ -241,6 +269,25 @@ impl Harness {
         if !output.status.success() {
             return Err(format!(
                 "UL onboarding CLI failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            )
+            .into());
+        }
+        Ok(serde_json::from_slice(&output.stdout)?)
+    }
+
+    pub fn run_ul_mine_git(&self, project_id: ProjectId, project_root: &Path) -> TestResult<Value> {
+        let output = governor_command()
+            .arg("--config")
+            .arg(&self.config_path)
+            .args(["ul", "mine-git", "--project"])
+            .arg(project_id.to_string())
+            .arg("--root")
+            .arg(project_root)
+            .output()?;
+        if !output.status.success() {
+            return Err(format!(
+                "UL mining CLI failed: {}",
                 String::from_utf8_lossy(&output.stderr)
             )
             .into());

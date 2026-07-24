@@ -131,15 +131,17 @@ async fn h4_dirty_onboarding_rejects_before_project_writes() -> TestResult {
     let actor = tokio::spawn(actor.run());
     let service = OnboardingService::new(harness.store.clone(), writer.clone());
 
-    let error = service
+    let result = service
         .run(
             project_id,
             &repository,
             &harness.root,
             OnboardingTestHook::None,
         )
-        .await
-        .expect_err("dirty onboarding must fail");
+        .await;
+    let Err(error) = result else {
+        return Err("dirty onboarding unexpectedly succeeded".into());
+    };
     assert!(error.to_string().contains("UL_ONBOARDING_DIRTY_WORKTREE"));
     assert!(
         harness

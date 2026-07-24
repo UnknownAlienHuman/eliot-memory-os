@@ -1,13 +1,14 @@
 #[path = "support/ul_t04.rs"]
 mod support;
 
-use eliot_engine::{CapsuleEvidence, PyramidBuilder};
+use eliot_engine::{CalibrationService, CapsuleEvidence, PyramidBuilder, resolve_prediction};
 use eliot_types::{
     AgentId, CapsuleBuild, CommandContext, ConceptKind, ConceptNode, CueBinding, CueKind,
     CueMatchMode, CueStrength, DependencyManifest, InjectionReceipt, LifecycleStatus, ModuleCard,
-    ObservabilityKind, ProjectCharter, ProjectId, PyramidBuildStatus, PyramidTargetKind,
-    RelationInput, RelationType, SemanticCommand, SubsystemCapsule, SystemMap, TaintClass, TaskId,
-    UlArtifact, UlArtifactBatchRecordCommand, Visibility, WriteId, ul_token_estimate,
+    ObservabilityKind, PredictionExpectation, PredictionRecord, PredictionResolution,
+    ProjectCharter, ProjectId, PyramidBuildStatus, PyramidTargetKind, RelationInput, RelationType,
+    SemanticCommand, SessionId, SubsystemCapsule, SystemMap, TaintClass, TaskId, UlArtifact,
+    UlArtifactBatchRecordCommand, VerificationResult, Visibility, WriteId, ul_token_estimate,
 };
 use serde_json::{Value, json};
 use std::fs;
@@ -265,6 +266,92 @@ fn h3_custom_root_freshness_and_dot_boundary_reach_runtime_packet() -> TestResul
     Ok(())
 }
 
+#[test]
+fn h7_inconclusive_predictions_and_handle_boot_receipts_are_truthful() -> TestResult {
+    let project_id = ProjectId::new_v7();
+    assert_eq!(
+        resolve_prediction(
+            PredictionExpectation::Pass,
+            VerificationResult::Inconclusive
+        ),
+        PredictionResolution::Unresolvable
+    );
+    assert_eq!(
+        resolve_prediction(
+            PredictionExpectation::Fail,
+            VerificationResult::Inconclusive
+        ),
+        PredictionResolution::Unresolvable
+    );
+    let scores = CalibrationService::scores(
+        project_id,
+        &[
+            prediction(project_id, PredictionResolution::Hit),
+            prediction(project_id, PredictionResolution::Miss),
+            prediction(project_id, PredictionResolution::Unresolvable),
+        ],
+    );
+    assert_eq!(scores.len(), 1);
+    assert_eq!(
+        (
+            scores[0].resolved_predictions,
+            scores[0].hits,
+            scores[0].misses
+        ),
+        (2, 1, 1)
+    );
+    assert!((scores[0].hit_rate - 0.5).abs() <= f64::EPSILON);
+
+    let _guard = test_guard();
+    if rerun_with_credential_gate(
+        "h7_inconclusive_predictions_and_handle_boot_receipts_are_truthful",
+    )? {
+        return Ok(());
+    }
+    let mut harness = Harness::start("h7-handle-boot")?;
+    let project_id = ProjectId::new_v7();
+    let charter_body = format!(
+        "WHAT\n{}\n\nFOR WHOM\nagents\n\nTOP INVARIANTS\n- exact receipts\n\nNON-GOALS\n- payload boot\n\nVOCABULARY\n- handle",
+        "charter ".repeat(1_400)
+    );
+    let map_body = format!(
+        "SYSTEMS\n{}\n\nFLOWS\n- handle-only delivery",
+        "system ".repeat(1_400)
+    );
+    seed_boot_artifacts(&harness, project_id, &charter_body, &map_body)?;
+    let response = current_state(&mut harness, 626, project_id, "src/lib.rs")?;
+    let receipts: Vec<InjectionReceipt> =
+        harness.observability_records(project_id, None, ObservabilityKind::InjectionReceipt)?;
+    let boot_receipts = receipts
+        .iter()
+        .filter(|receipt| receipt.surface == "mcp_auto_boot")
+        .collect::<Vec<_>>();
+
+    assert!(response["ul_boot"]["charter"].get("body_md").is_none());
+    assert!(response["ul_boot"]["system_map"].get("body_md").is_none());
+    assert_eq!(boot_receipts.len(), 2);
+    for (field, full_body) in [("charter", &charter_body), ("system_map", &map_body)] {
+        let delivery = response["ul_boot"][field].clone();
+        let item_ref = delivery["ref"].as_str().ok_or("boot ref missing")?;
+        let receipt = boot_receipts
+            .iter()
+            .find(|receipt| receipt.item_ref == item_ref)
+            .ok_or("boot receipt missing")?;
+        let rendered = serde_json::to_vec(&delivery)?;
+        assert_eq!(receipt.render_form, "handle");
+        assert_eq!(
+            receipt.token_cost,
+            ul_token_estimate(&String::from_utf8_lossy(&rendered))
+        );
+        assert_eq!(
+            receipt.source_fingerprint,
+            blake3::hash(&rendered).to_hex().to_string()
+        );
+        assert!(receipt.token_cost < ul_token_estimate(full_body));
+    }
+    Ok(())
+}
+
 fn current_state(
     harness: &mut Harness,
     id: u64,
@@ -434,6 +521,85 @@ fn seed_pyramid(harness: &Harness, project_id: ProjectId) -> TestResult {
         Vec::new(),
     ))?;
     Ok(())
+}
+
+fn seed_boot_artifacts(
+    harness: &Harness,
+    project_id: ProjectId,
+    charter_body: &str,
+    map_body: &str,
+) -> TestResult {
+    let map = SystemMap {
+        map_id: "map-over-budget".to_owned(),
+        project_id,
+        body_md: map_body.to_owned(),
+        subsystem_concept_refs: Vec::new(),
+        flow_edges: Vec::new(),
+        dependency_manifest: DependencyManifest::default(),
+        build_id: "build-map-over-budget".to_owned(),
+        cue_bindings: cue("system map"),
+    };
+    let charter = ProjectCharter {
+        charter_id: "charter-over-budget".to_owned(),
+        project_id,
+        body_md: charter_body.to_owned(),
+        concept_refs: Vec::new(),
+        dependency_manifest: DependencyManifest::default(),
+        build_id: "build-charter-over-budget".to_owned(),
+        cue_bindings: cue("test project"),
+    };
+    harness.seed(&ul_command(
+        project_id,
+        vec![
+            UlArtifact::SystemMap(map.clone()),
+            UlArtifact::CapsuleBuild(build(
+                project_id,
+                map.build_id.clone(),
+                PyramidTargetKind::SystemMap,
+                map.map_id,
+                10_000,
+                ul_token_estimate(map_body),
+            )),
+        ],
+        Vec::new(),
+    ))?;
+    harness.seed(&ul_command(
+        project_id,
+        vec![
+            UlArtifact::ProjectCharter(charter.clone()),
+            UlArtifact::CapsuleBuild(build(
+                project_id,
+                charter.build_id.clone(),
+                PyramidTargetKind::ProjectCharter,
+                charter.charter_id,
+                10_000,
+                ul_token_estimate(charter_body),
+            )),
+        ],
+        Vec::new(),
+    ))?;
+    Ok(())
+}
+
+fn prediction(project_id: ProjectId, resolution: PredictionResolution) -> PredictionRecord {
+    PredictionRecord {
+        prediction_id: uuid::Uuid::new_v4().to_string(),
+        project_id,
+        task_id: TaskId::new_v7(),
+        session_id: SessionId::new_v7(),
+        subsystem_concept_id: Some("h7".to_owned()),
+        packet_id: uuid::Uuid::new_v4().to_string(),
+        verifier: "h7-verifier".to_owned(),
+        expected: PredictionExpectation::Pass,
+        resolution: Some(resolution),
+        actual: Some(match resolution {
+            PredictionResolution::Hit => VerificationResult::Passed,
+            PredictionResolution::Miss => VerificationResult::Failed,
+            PredictionResolution::Unresolvable => VerificationResult::Inconclusive,
+        }),
+        verification_ref: Some("verification:h7".to_owned()),
+        source_frame_hash: "h7-frame".to_owned(),
+    }
 }
 
 fn concept(project_id: ProjectId, id: &str, name: &str, boundary: &str) -> ConceptNode {

@@ -1,3 +1,10 @@
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UlMiningInput {
+    project_id: ProjectId,
+    project_root: PathBuf,
+}
+
 #[derive(Debug, clap::Subcommand)]
 pub enum UlCommand {
     MineGit {
@@ -42,14 +49,8 @@ pub(crate) async fn run_ul_mine_git_from_daemon(
     writer: &eliot_engine::WriterHandle,
     params: serde_json::Value,
 ) -> Result<serde_json::Value> {
-    #[derive(serde::Deserialize)]
-    #[serde(deny_unknown_fields)]
-    struct Input {
-        project_id: ProjectId,
-        project_root: PathBuf,
-    }
-
-    let input: Input = serde_json::from_value(params).context("decode UL mining request")?;
+    let input: UlMiningInput =
+        serde_json::from_value(params).context("decode UL mining request")?;
     let project_id = input.project_id;
     let root = input.project_root;
     let _ = store.migrate_schema().await?;
@@ -73,19 +74,10 @@ pub(crate) async fn run_ul_mine_git_from_daemon(
             &artifacts.run.run_id,
         )
         .await?;
-    if mining_service.is_noop(
+    let mining_unchanged = mining_service.is_noop(
         &artifacts,
         existing.as_ref().map(|record| &record.receipt_body),
-    ) {
-        return Ok(serde_json::json!({
-            "status": "noop",
-            "project_id": project_id,
-            "run_id": artifacts.run.run_id,
-            "head_commit": artifacts.run.head_commit,
-            "artifacts_written": 0,
-            "relations_written": 0,
-        }));
-    }
+    );
 
     let cards = eliot_engine::ModuleCardService::build(
         project_id,
@@ -96,9 +88,17 @@ pub(crate) async fn run_ul_mine_git_from_daemon(
         &std::collections::BTreeMap::new(),
     )?;
     let artifact_writer = eliot_engine::UlArtifactWriterService;
-    let mining_report = artifact_writer
-        .write_mining(writer, &WriteAdmissionService, &artifacts)
-        .await?;
+    let mining_report = if mining_unchanged {
+        eliot_engine::UlArtifactWriteReport {
+            artifacts_written: 0,
+            relations_written: 0,
+            receipts: Vec::new(),
+        }
+    } else {
+        artifact_writer
+            .write_mining(writer, &WriteAdmissionService, &artifacts)
+            .await?
+    };
     let card_report = if cards.is_empty() {
         eliot_engine::UlArtifactWriteReport {
             artifacts_written: 0,
@@ -117,17 +117,25 @@ pub(crate) async fn run_ul_mine_git_from_daemon(
     };
 
     refresh_card_cues(store, project_id, &cards).await?;
+    let card_committed = card_report
+        .receipts
+        .iter()
+        .any(|receipt| receipt.status == eliot_types::WriteStatus::Committed);
+    let (status, mining_status, card_status) =
+        mining_delivery_status(mining_unchanged, card_committed);
 
     Ok(serde_json::json!({
-        "status": "written",
+        "status": status,
+        "mining_status": mining_status,
+        "card_status": card_status,
         "project_id": project_id,
         "run_id": artifacts.run.run_id,
         "head_commit": artifacts.run.head_commit,
         "commits_scanned": artifacts.run.commits_scanned,
         "baskets_used": artifacts.run.baskets_used,
-        "edges_written": artifacts.edges.len(),
-        "hotspots_written": artifacts.hotspots.len(),
-        "cards_written": cards.len(),
+        "edges_written": if mining_unchanged { 0 } else { artifacts.edges.len() },
+        "hotspots_written": if mining_unchanged { 0 } else { artifacts.hotspots.len() },
+        "cards_written": card_report.artifacts_written,
         "artifacts_written": mining_report
             .artifacts_written
             .saturating_add(card_report.artifacts_written),
@@ -139,6 +147,18 @@ pub(crate) async fn run_ul_mine_git_from_daemon(
             .len()
             .saturating_add(card_report.receipts.len()),
     }))
+}
+
+fn mining_delivery_status(
+    mining_unchanged: bool,
+    card_committed: bool,
+) -> (&'static str, &'static str, &'static str) {
+    match (mining_unchanged, card_committed) {
+        (true, true) => ("repaired", "noop", "repaired"),
+        (true, false) => ("noop", "noop", "idempotent"),
+        (false, true) => ("written", "written", "written"),
+        (false, false) => ("written", "written", "idempotent"),
+    }
 }
 
 pub async fn run_ul_onboard(

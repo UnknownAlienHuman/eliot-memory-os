@@ -4,7 +4,8 @@ use crate::{EngineError, WriteAdmissionService, WriterHandle};
 use eliot_types::{
     AgentId, CoChangeEdge, CommandContext, FIX_CLASSIFIER_VERSION, HotspotScore, LifecycleStatus,
     MiningConfig, MiningRun, ProjectId, RelationInput, RelationType, SemanticCommand, TaintClass,
-    UlArtifact, UlArtifactBatchRecordCommand, Visibility, WriteReceipt, normalize_path,
+    UlArtifact, UlArtifactBatchRecordCommand, Visibility, WriteReceipt, WriteStatus,
+    normalize_path,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -387,8 +388,8 @@ impl UlArtifactWriterService {
                 .iter()
                 .map(|edge| RelationInput {
                     relation_type: RelationType::CoChange,
-                    from: edge.path_a.clone(),
-                    to: edge.path_b.clone(),
+                    from: format!("file:{}", edge.path_a),
+                    to: format!("file:{}", edge.path_b),
                 })
                 .collect();
             let chunk_artifacts = chunk
@@ -592,6 +593,12 @@ fn deterministic_chunk_index(value: &str) -> usize {
     usize::from_le_bytes(bytes)
 }
 
+#[derive(Serialize)]
+struct BatchIdentity<'a> {
+    artifacts: &'a [UlArtifact],
+    relations: &'a [RelationInput],
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn submit_batch(
     writer: &WriterHandle,
@@ -609,9 +616,18 @@ async fn submit_batch(
         left.from
             .cmp(&right.from)
             .then_with(|| left.to.cmp(&right.to))
+            .then_with(|| {
+                format!("{:?}", left.relation_type).cmp(&format!("{:?}", right.relation_type))
+            })
     });
-    let write_id =
-        deterministic_write_id(&format!("ul05|{project_id}|{run_id}|{phase}|{chunk_index}"));
+    let batch_bytes = serde_json::to_vec(&BatchIdentity {
+        artifacts: &artifacts,
+        relations: &relations,
+    })?;
+    let batch_hash = blake3::hash(&batch_bytes).to_hex().to_string();
+    let write_id = deterministic_write_id(&format!(
+        "ul05|{project_id}|{run_id}|{phase}|{chunk_index}|{batch_hash}"
+    ));
     let command = SemanticCommand::UlArtifactBatchRecord(UlArtifactBatchRecordCommand {
         context: CommandContext {
             write_id,
@@ -629,13 +645,14 @@ async fn submit_batch(
         relations,
     });
     let envelope = admission.admit(&command)?;
-    report.artifacts_written = report
-        .artifacts_written
-        .saturating_add(envelope.tool_observations.len());
-    report.relations_written = report
-        .relations_written
-        .saturating_add(envelope.relations.len());
-    report.receipts.push(writer.submit(envelope).await?);
+    let artifact_count = envelope.tool_observations.len();
+    let relation_count = envelope.relations.len();
+    let receipt = writer.submit(envelope).await?;
+    if receipt.status == WriteStatus::Committed {
+        report.artifacts_written = report.artifacts_written.saturating_add(artifact_count);
+        report.relations_written = report.relations_written.saturating_add(relation_count);
+    }
+    report.receipts.push(receipt);
     Ok(())
 }
 

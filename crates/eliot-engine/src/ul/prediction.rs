@@ -171,15 +171,15 @@ pub fn resolve_prediction(
     expected: PredictionExpectation,
     actual: VerificationResult,
 ) -> PredictionResolution {
-    let hit = matches!(
-        (expected, actual),
-        (PredictionExpectation::Pass, VerificationResult::Passed)
-            | (PredictionExpectation::Fail, VerificationResult::Failed)
-    );
-    if hit {
-        PredictionResolution::Hit
-    } else {
-        PredictionResolution::Miss
+    match actual {
+        VerificationResult::Inconclusive => PredictionResolution::Unresolvable,
+        VerificationResult::Passed if expected == PredictionExpectation::Pass => {
+            PredictionResolution::Hit
+        }
+        VerificationResult::Failed if expected == PredictionExpectation::Fail => {
+            PredictionResolution::Hit
+        }
+        VerificationResult::Passed | VerificationResult::Failed => PredictionResolution::Miss,
     }
 }
 

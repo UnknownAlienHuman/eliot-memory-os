@@ -430,6 +430,7 @@ async fn dispatch_understanding_outcome_record(
     serde_json::to_value(input.record).map_err(Into::into)
 }
 
+#[allow(clippy::too_many_lines)] // One validated observability command is kept contiguous.
 async fn dispatch_memory_influence_trace(
     state: &McpState,
     context: AuthenticatedRequestContext,

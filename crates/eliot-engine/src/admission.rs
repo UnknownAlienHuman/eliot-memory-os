@@ -243,8 +243,8 @@ fn ul_artifact_relations(
             }
             Ok(vec![(
                 RelationType::CoChange,
-                edge.path_a.clone(),
-                edge.path_b.clone(),
+                format!("file:{}", edge.path_a),
+                format!("file:{}", edge.path_b),
             )])
         }
         UlArtifact::ModuleCard(card) => {
