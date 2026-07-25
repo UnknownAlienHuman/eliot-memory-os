@@ -15,6 +15,8 @@ pub struct ModuleCard {
     pub source_refs: Vec<String>,
     pub cue_bindings: Vec<CueBinding>,
     pub build_fingerprint: String,
+    #[serde(default)]
+    pub dependency_manifest: DependencyManifest,
 }
 
 #[derive(
@@ -110,6 +112,7 @@ pub struct SubsystemCapsule {
 )]
 #[serde(rename_all = "snake_case")]
 pub enum PyramidTargetKind {
+    ModuleCard,
     SubsystemCapsule,
     SystemMap,
     ProjectCharter,

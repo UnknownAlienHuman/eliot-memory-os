@@ -341,6 +341,7 @@ fn replay_card(project_id: ProjectId, index: usize) -> ModuleCard {
             expected_reuse_note: "when editing this deterministic replay module".to_owned(),
         }],
         build_fingerprint: format!("h5-fingerprint-{index:03}"),
+        dependency_manifest: eliot_types::DependencyManifest::default(),
     }
 }
 

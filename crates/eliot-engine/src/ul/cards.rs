@@ -1,7 +1,7 @@
 use crate::EngineError;
 use eliot_types::{
-    CoChangeEdge, CueBinding, CueKind, CueMatchMode, CueStrength, HotspotScore, ModuleCard,
-    ProjectId, normalize_bindings, ul_token_estimate,
+    CoChangeEdge, CueBinding, CueKind, CueMatchMode, CueStrength, DependencyManifest,
+    FileDependency, HotspotScore, ModuleCard, ProjectId, normalize_bindings, ul_token_estimate,
 };
 use serde_json::json;
 use std::cmp::Ordering;
@@ -103,6 +103,14 @@ impl ModuleCardService {
         let cue_bindings = normalize_bindings(cue_bindings, None)
             .map_err(|error| EngineError::WriteRejected(error.to_string()))?;
 
+        let dependency_manifest = card_dependency_manifest(
+            project_root,
+            &path,
+            &source_refs,
+            &failure_refs,
+            &co_change_refs,
+            hotspot.hotspot_id.as_str(),
+        );
         let fingerprint_material = json!({
             "project_id": project_id,
             "path": path,
@@ -113,6 +121,7 @@ impl ModuleCardService {
             "failure_refs": failure_refs,
             "source_refs": source_refs,
             "cue_bindings": cue_bindings,
+            "dependency_manifest": dependency_manifest,
         });
         let build_fingerprint = blake3::hash(&serde_json::to_vec(&fingerprint_material)?)
             .to_hex()
@@ -130,7 +139,56 @@ impl ModuleCardService {
             source_refs,
             cue_bindings,
             build_fingerprint,
+            dependency_manifest,
         })
+    }
+}
+
+fn card_dependency_manifest(
+    project_root: &Path,
+    card_path: &str,
+    source_refs: &[String],
+    claim_deps: &[String],
+    edge_deps: &[String],
+    report_dep: &str,
+) -> DependencyManifest {
+    let mut paths = vec![card_path.to_owned()];
+    paths.extend(source_refs.iter().filter_map(|reference| {
+        reference
+            .strip_prefix("file:")
+            .and_then(|value| value.split('#').next())
+            .map(str::to_owned)
+    }));
+    paths.sort();
+    paths.dedup();
+    let mut file_deps = paths
+        .into_iter()
+        .filter_map(|path| {
+            let bytes = fs::read(project_root.join(&path)).ok()?;
+            Some(FileDependency {
+                path,
+                blake3: blake3::hash(&bytes).to_hex().to_string(),
+            })
+        })
+        .collect::<Vec<_>>();
+    file_deps.sort_by(|left, right| left.path.cmp(&right.path));
+    let mut claim_deps = claim_deps.to_vec();
+    claim_deps.sort();
+    claim_deps.dedup();
+    let mut edge_deps = edge_deps.to_vec();
+    edge_deps.sort();
+    edge_deps.dedup();
+    DependencyManifest {
+        project_root: project_root
+            .canonicalize()
+            .unwrap_or_else(|_| project_root.to_path_buf())
+            .to_string_lossy()
+            .into_owned(),
+        file_deps,
+        claim_deps,
+        decision_deps: Vec::new(),
+        edge_deps,
+        report_deps: vec![report_dep.to_owned()],
     }
 }
 

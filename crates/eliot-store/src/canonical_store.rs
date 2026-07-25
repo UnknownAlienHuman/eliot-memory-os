@@ -495,6 +495,30 @@ struct MetaIntegrityRecords {
     policy_executions: Vec<CanonicalRecord<MetaPolicyExecutionReceipt>>,
 }
 
+#[derive(serde::Deserialize)]
+struct RawActivationRelation {
+    from_ref: String,
+    to_ref: String,
+}
+
+#[derive(serde::Deserialize)]
+struct RawActivationGraphRows {
+    #[serde(default)]
+    co_change: Vec<eliot_types::CoChangeEdge>,
+    #[serde(default)]
+    card_covers: Vec<RawActivationRelation>,
+    #[serde(default)]
+    capsule_covers: Vec<RawActivationRelation>,
+    #[serde(default)]
+    concept_implemented_by: Vec<RawActivationRelation>,
+    #[serde(default)]
+    concept_depends_on: Vec<RawActivationRelation>,
+    #[serde(default)]
+    supports: Vec<RawActivationRelation>,
+    #[serde(default)]
+    verified_by: Vec<RawActivationRelation>,
+}
+
 impl CanonicalStore {
     pub fn new(config: SurrealServerConfig) -> Self {
         Self {
@@ -513,6 +537,8 @@ impl CanonicalStore {
             NamedSurqlOp::SchemaMigrateUlArtifacts,
             NamedSurqlOp::SchemaMigrateUlPyramid,
             NamedSurqlOp::SchemaMigrateUlMeasurement,
+            NamedSurqlOp::SchemaMigrateUlDependencyActivation,
+            NamedSurqlOp::SchemaMigrateUlTokenPolicy,
         ] {
             value = self.migrate_schema_op(op).await?;
         }
@@ -661,6 +687,10 @@ impl CanonicalStore {
                 "token_cost": receipt.token_cost,
                 "source_fingerprint_parts": cue_string_parts(&receipt.source_fingerprint),
                 "outcome_parts": cue_string_parts(&receipt.outcome),
+                "policy_reason_parts": receipt
+                    .policy_reason
+                    .as_deref()
+                    .map(cue_string_parts),
             })
         } else {
             Value::Null
@@ -1262,17 +1292,209 @@ impl CanonicalStore {
         decode_value(NamedSurqlOp::LoadUlArtifacts, value)
     }
 
+    pub async fn replace_ul_reverse_dependencies(
+        &self,
+        project_id: ProjectId,
+        target_kind: eliot_types::PyramidTargetKind,
+        target_id: &str,
+        build_id: &str,
+        dependencies: &[eliot_types::UlDependencyRef],
+    ) -> Result<(), StoreError> {
+        let mut dependencies = dependencies.to_vec();
+        dependencies.sort();
+        dependencies.dedup();
+        let value = self
+            .execute_value(
+                NamedSurqlOp::ReplaceUlReverseDependencies,
+                json!({
+                    "project_id": project_id,
+                    "target_kind": target_kind,
+                    "target_id": target_id,
+                    "build_id": build_id,
+                    "dependencies": dependencies,
+                }),
+            )
+            .await?;
+        let _: Vec<eliot_types::UlReverseDependencyRow> =
+            decode_value(NamedSurqlOp::ReplaceUlReverseDependencies, value)?;
+        Ok(())
+    }
+
+    pub async fn load_ul_reverse_dependents(
+        &self,
+        project_id: ProjectId,
+        dependencies: &[eliot_types::UlDependencyRef],
+    ) -> Result<Vec<eliot_types::UlReverseDependencyRow>, StoreError> {
+        let expected = dependencies.iter().cloned().collect::<BTreeSet<_>>();
+        if expected.is_empty() {
+            return Ok(Vec::new());
+        }
+        let dependency_kinds = expected
+            .iter()
+            .map(|dependency| dependency.kind)
+            .collect::<BTreeSet<_>>();
+        let dependency_keys = expected
+            .iter()
+            .map(|dependency| dependency.key.clone())
+            .collect::<BTreeSet<_>>();
+        let value = self
+            .execute_value(
+                NamedSurqlOp::LoadUlReverseDependents,
+                json!({
+                    "project_id": project_id,
+                    "dependency_kinds": dependency_kinds,
+                    "dependency_keys": dependency_keys,
+                }),
+            )
+            .await?;
+        let mut rows: Vec<eliot_types::UlReverseDependencyRow> =
+            decode_value(NamedSurqlOp::LoadUlReverseDependents, value)?;
+        rows.retain(|row| expected.contains(&row.dependency));
+        rows.sort_by(|left, right| {
+            left.target_kind
+                .cmp(&right.target_kind)
+                .then_with(|| left.target_id.cmp(&right.target_id))
+                .then_with(|| left.dependency.cmp(&right.dependency))
+        });
+        rows.dedup();
+        Ok(rows)
+    }
+
+    pub async fn mark_ul_artifact_dirty(
+        &self,
+        state: &eliot_types::UlArtifactDirtyState,
+    ) -> Result<(), StoreError> {
+        let mut state = state.clone();
+        state.reasons.sort();
+        state.reasons.dedup();
+        let state_key = blake3::hash(
+            format!(
+                "{}|{:?}|{}",
+                state.project_id, state.target_kind, state.target_id
+            )
+            .as_bytes(),
+        )
+        .to_hex()
+        .to_string();
+        let value = self
+            .execute_value(
+                NamedSurqlOp::UpsertUlArtifactDirty,
+                json!({ "state_key": state_key, "state": state }),
+            )
+            .await?;
+        let _: eliot_types::UlArtifactDirtyState =
+            decode_value(NamedSurqlOp::UpsertUlArtifactDirty, value)?;
+        Ok(())
+    }
+
+    pub async fn load_ul_dirty_artifacts(
+        &self,
+        project_id: ProjectId,
+        limit: u16,
+    ) -> Result<Vec<eliot_types::UlArtifactDirtyState>, StoreError> {
+        let value = self
+            .execute_value(
+                NamedSurqlOp::LoadUlArtifactDirty,
+                json!({ "project_id": project_id, "limit": limit.clamp(1, 512) }),
+            )
+            .await?;
+        decode_value(NamedSurqlOp::LoadUlArtifactDirty, value)
+    }
+
+    pub async fn clear_ul_artifact_dirty(
+        &self,
+        project_id: ProjectId,
+        target_kind: eliot_types::PyramidTargetKind,
+        target_id: &str,
+        superseding_build_id: &str,
+    ) -> Result<(), StoreError> {
+        let _ = self
+            .execute_value(
+                NamedSurqlOp::ClearUlArtifactDirty,
+                json!({
+                    "project_id": project_id,
+                    "target_kind": target_kind,
+                    "target_id": target_id,
+                    "superseding_build_id": superseding_build_id,
+                }),
+            )
+            .await?;
+        Ok(())
+    }
+
+    pub async fn load_ul_activation_graph(
+        &self,
+        project_id: ProjectId,
+    ) -> Result<eliot_types::UlActivationGraphRows, StoreError> {
+        let value = self
+            .execute_value(
+                NamedSurqlOp::LoadUlActivationGraph,
+                json!({ "project_id": project_id }),
+            )
+            .await?;
+        let mut raw: RawActivationGraphRows =
+            decode_value(NamedSurqlOp::LoadUlActivationGraph, value)?;
+        let mut seen_co_change = std::collections::BTreeSet::new();
+        raw.co_change
+            .retain(|edge| seen_co_change.insert(edge.edge_id.clone()));
+        raw.co_change
+            .sort_by(|left, right| left.edge_id.cmp(&right.edge_id));
+        let mut relations = Vec::new();
+        append_activation_relations(
+            &mut relations,
+            raw.card_covers,
+            eliot_types::ActivationEdgeKind::CardCovers,
+        );
+        append_activation_relations(
+            &mut relations,
+            raw.capsule_covers,
+            eliot_types::ActivationEdgeKind::CapsuleCovers,
+        );
+        append_activation_relations(
+            &mut relations,
+            raw.concept_implemented_by,
+            eliot_types::ActivationEdgeKind::ConceptImplementedBy,
+        );
+        append_activation_relations(
+            &mut relations,
+            raw.concept_depends_on,
+            eliot_types::ActivationEdgeKind::ConceptDependsOn,
+        );
+        append_activation_relations(
+            &mut relations,
+            raw.supports,
+            eliot_types::ActivationEdgeKind::Supports,
+        );
+        append_activation_relations(
+            &mut relations,
+            raw.verified_by,
+            eliot_types::ActivationEdgeKind::VerifiedBy,
+        );
+        relations.sort_by(|left, right| {
+            left.from_ref
+                .cmp(&right.from_ref)
+                .then_with(|| left.to_ref.cmp(&right.to_ref))
+                .then_with(|| left.kind.cmp(&right.kind))
+        });
+        relations.dedup();
+        Ok(eliot_types::UlActivationGraphRows {
+            co_change: raw.co_change,
+            relations,
+        })
+    }
+
     pub async fn upsert_ul_task_ledger(
         &self,
         project_id: ProjectId,
         task_id: TaskId,
         delta: &eliot_types::UlLedgerDelta,
     ) -> Result<eliot_types::UlTaskLedger, StoreError> {
+        let ledger_key = format!("{project_id}:{task_id}");
         let value = self
             .execute_value(
                 NamedSurqlOp::UpsertUlTaskLedger,
                 json!({
-                    "ledger_key": format!("{project_id}:{task_id}"),
+                    "ledger_key": ledger_key,
                     "project_id": project_id,
                     "task_id": task_id,
                     "delta": delta,
@@ -1280,6 +1502,102 @@ impl CanonicalStore {
             )
             .await?;
         decode_value(NamedSurqlOp::UpsertUlTaskLedger, value)
+    }
+
+    pub async fn assign_ul_experiment_arm(
+        &self,
+        project_id: ProjectId,
+        task_id: TaskId,
+        task_class: &eliot_types::UlTaskClass,
+        config_hash: &str,
+    ) -> Result<eliot_types::UlTaskExperimentAssignment, StoreError> {
+        let task_class_key = task_class.key();
+        let assignment_key = derived_row_key(&format!("ul-experiment|{project_id}|{task_id}"));
+        let counter_key = derived_row_key(&format!("ul-ab-counter|{project_id}|{task_class_key}"));
+        let value = self
+            .execute_value(
+                NamedSurqlOp::AssignUlExperimentArm,
+                json!({
+                    "assignment_key": assignment_key,
+                    "counter_key": counter_key,
+                    "project_id": project_id,
+                    "task_id": task_id,
+                    "task_class": task_class,
+                    "task_class_key": task_class_key,
+                    "config_hash": config_hash,
+                }),
+            )
+            .await?;
+        decode_value(NamedSurqlOp::AssignUlExperimentArm, value)
+    }
+
+    pub async fn load_ul_experiment_assignment(
+        &self,
+        project_id: ProjectId,
+        task_id: TaskId,
+    ) -> Result<Option<eliot_types::UlTaskExperimentAssignment>, StoreError> {
+        let assignment_key = derived_row_key(&format!("ul-experiment|{project_id}|{task_id}"));
+        let value = self
+            .execute_value(
+                NamedSurqlOp::LoadUlExperimentAssignment,
+                json!({ "assignment_key": assignment_key }),
+            )
+            .await?;
+        decode_value(NamedSurqlOp::LoadUlExperimentAssignment, value)
+    }
+
+    pub async fn load_ul_task_class_ledgers(
+        &self,
+        project_id: ProjectId,
+        task_class_key: &str,
+    ) -> Result<Vec<eliot_types::UlTaskLedger>, StoreError> {
+        let value = self
+            .execute_value(
+                NamedSurqlOp::LoadUlTaskClassLedgers,
+                json!({
+                    "project_id": project_id,
+                    "task_class_key": task_class_key,
+                }),
+            )
+            .await?;
+        decode_value(NamedSurqlOp::LoadUlTaskClassLedgers, value)
+    }
+
+    pub async fn upsert_ul_task_class_policy(
+        &self,
+        policy: &eliot_types::UlTaskClassPolicy,
+    ) -> Result<eliot_types::UlTaskClassPolicy, StoreError> {
+        let policy_key = derived_row_key(&format!(
+            "ul-task-class-policy|{}|{}",
+            policy.project_id, policy.task_class_key
+        ));
+        let value = self
+            .execute_value(
+                NamedSurqlOp::UpsertUlTaskClassPolicy,
+                json!({
+                    "policy_key": policy_key,
+                    "policy": policy,
+                }),
+            )
+            .await?;
+        decode_value(NamedSurqlOp::UpsertUlTaskClassPolicy, value)
+    }
+
+    pub async fn load_ul_task_class_policy(
+        &self,
+        project_id: ProjectId,
+        task_class_key: &str,
+    ) -> Result<Option<eliot_types::UlTaskClassPolicy>, StoreError> {
+        let policy_key = derived_row_key(&format!(
+            "ul-task-class-policy|{project_id}|{task_class_key}"
+        ));
+        let value = self
+            .execute_value(
+                NamedSurqlOp::LoadUlTaskClassPolicy,
+                json!({ "policy_key": policy_key }),
+            )
+            .await?;
+        decode_value(NamedSurqlOp::LoadUlTaskClassPolicy, value)
     }
 
     pub async fn load_ul_metrics(
@@ -1796,6 +2114,21 @@ impl CanonicalStore {
     }
 }
 
+fn append_activation_relations(
+    output: &mut Vec<eliot_types::UlActivationGraphEdge>,
+    rows: Vec<RawActivationRelation>,
+    kind: eliot_types::ActivationEdgeKind,
+) {
+    output.extend(
+        rows.into_iter()
+            .map(|row| eliot_types::UlActivationGraphEdge {
+                from_ref: row.from_ref,
+                to_ref: row.to_ref,
+                kind,
+            }),
+    );
+}
+
 fn cue_string_parts(value: &str) -> Vec<&str> {
     value.split(':').collect()
 }
@@ -2175,4 +2508,8 @@ where
 {
     serde_json::from_value(value)
         .map_err(|error| StoreError::Decode(format!("{} output decode failed: {error}", op.name())))
+}
+
+fn derived_row_key(value: &str) -> String {
+    blake3::hash(value.as_bytes()).to_hex().to_string()
 }

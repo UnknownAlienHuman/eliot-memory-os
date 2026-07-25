@@ -960,6 +960,20 @@ impl AntigravityExecutionGate {
                 vec!["real Antigravity provider execution is disabled by default".to_owned()],
             );
         }
+        if request.mode == AntigravityReviewMode::CandidateImplementation
+            && request
+                .last_accepted_packet_id
+                .as_deref()
+                .is_none_or(|packet_id| packet_id.trim().is_empty())
+        {
+            return gate(
+                AntigravityExecutionGateDecisionKind::RequireAcceptedPacket,
+                vec![
+                    "mutating Antigravity role launch requires the last accepted UL packet gate"
+                        .to_owned(),
+                ],
+            );
+        }
         if resolution.selected_path.is_none()
             || !contract.noninteractive_supported
             || probe.provider_state == AntigravityProviderState::NotInstalled
@@ -2889,6 +2903,7 @@ pub fn antigravity_review_request(
         allowed_paths: vec!["crates/eliot-app/src/mcp_stdio.rs".to_owned()],
         evidence_refs: vec!["codecortex:latest".to_owned()],
         provider_enabled: false,
+        last_accepted_packet_id: None,
         created_at: OffsetDateTime::now_utc(),
     }
 }

@@ -619,6 +619,8 @@ pub struct AntigravityReviewRequest {
     pub allowed_paths: Vec<PathRef>,
     pub evidence_refs: Vec<String>,
     pub provider_enabled: bool,
+    #[serde(default)]
+    pub last_accepted_packet_id: Option<String>,
     #[serde(with = "time::serde::rfc3339")]
     pub created_at: OffsetDateTime,
 }
@@ -706,6 +708,7 @@ pub enum AntigravityExecutionGateDecisionKind {
     AllowRealRun,
     RequireProviderGate,
     RequireProviderEnable,
+    RequireAcceptedPacket,
     RequireWorkLease,
     RequireWorktreeLease,
     Deny,

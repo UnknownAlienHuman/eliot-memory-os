@@ -22,7 +22,13 @@ LET $stored_payload = IF $envelope.kind = 'injection_receipt' {
     }),
     token_cost: <int> $injection_payload.token_cost,
     source_fingerprint: array::join($injection_payload.source_fingerprint_parts, ':'),
-    outcome: array::join($injection_payload.outcome_parts, ':')
+    outcome: array::join($injection_payload.outcome_parts, ':'),
+    policy_reason: IF $injection_payload.policy_reason_parts = NONE
+      OR $injection_payload.policy_reason_parts = NULL {
+      NONE
+    } ELSE {
+      array::join($injection_payload.policy_reason_parts, ':')
+    }
   }
 } ELSE IF $envelope.kind = 'memory_influence_trace' {
   {

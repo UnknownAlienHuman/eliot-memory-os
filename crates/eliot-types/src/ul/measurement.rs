@@ -6,13 +6,84 @@ use time::OffsetDateTime;
 pub const UL_FIELD_VALIDATION_SCHEMA_VERSION: &str = "ul-field-validation-v1";
 pub const UL_FIELD_VALIDATION_BASELINE_COMMIT: &str = "80ff615062b61b08df6435a62ce27fd97ee8912f";
 
+#[derive(
+    Clone, Copy, Debug, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize, Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum UlExperimentArm {
+    Control,
+    Treatment,
+}
+
+#[derive(
+    Clone, Copy, Debug, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize, Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum UlInjectionMode {
+    Payload,
+    HandlesOnly,
+}
+
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+pub struct UlTaskClass {
+    pub action_class: String,
+    pub subsystem: String,
+    pub artifact_class: String,
+}
+
+impl UlTaskClass {
+    #[must_use]
+    pub fn key(&self) -> String {
+        format!(
+            "{}|{}|{}",
+            self.action_class, self.subsystem, self.artifact_class
+        )
+    }
+}
+
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+pub struct UlTaskExperimentAssignment {
+    pub project_id: ProjectId,
+    pub task_id: TaskId,
+    pub task_class: UlTaskClass,
+    pub ordinal: u64,
+    pub arm: UlExperimentArm,
+    pub injection_mode: UlInjectionMode,
+    pub config_hash: String,
+}
+
+#[derive(Clone, Debug, JsonSchema, PartialEq, Serialize, Deserialize)]
+pub struct UlTaskClassPolicy {
+    pub project_id: ProjectId,
+    pub task_class_key: String,
+    pub injection_mode: UlInjectionMode,
+    pub treatment_tasks: u32,
+    pub control_tasks: u32,
+    pub control_median_exploration_tokens: u64,
+    pub treatment_median_net_delta: i64,
+    pub reason: String,
+    pub evidence_task_ids: Vec<TaskId>,
+}
+
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 pub struct UlTaskLedger {
     pub task_id: TaskId,
     pub project_id: ProjectId,
+    #[serde(default)]
+    pub task_class_key: String,
+    #[serde(default)]
+    pub arm: Option<UlExperimentArm>,
+    #[serde(default)]
+    pub injection_mode: Option<UlInjectionMode>,
     pub injected_tokens: u64,
     pub read_tool_input_bytes: u64,
     pub read_tool_output_bytes: u64,
+    #[serde(default)]
+    pub exploration_tokens: u64,
+    #[serde(default)]
+    pub matched_baseline_tokens: u64,
+    #[serde(default)]
+    pub net_token_delta: i64,
     pub expanded_injected_handles: u32,
     pub acknowledged_items: u32,
     pub first_mutation_seen: bool,
@@ -184,9 +255,15 @@ pub struct UlReadinessSnapshot {
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
 pub struct UlLedgerDelta {
+    pub task_class_key: String,
+    pub arm: Option<UlExperimentArm>,
+    pub injection_mode: Option<UlInjectionMode>,
     pub injected_tokens: u64,
     pub read_tool_input_bytes: u64,
     pub read_tool_output_bytes: u64,
+    pub exploration_tokens: u64,
+    pub matched_baseline_tokens: u64,
+    pub net_token_delta: i64,
     pub expanded_injected_handles: u32,
     pub acknowledged_items: u32,
     pub first_mutation_seen: bool,

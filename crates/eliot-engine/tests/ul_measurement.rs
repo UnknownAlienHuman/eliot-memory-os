@@ -7,12 +7,58 @@ use eliot_types::{
     ConceptKind, ConceptNode, CoverageClass, CueBinding, CueKind, CueMatchMode, CueRecordSource,
     CueStrength, DependencyManifest, InjectionReceipt, ModuleCard, ProjectId, SessionId,
     SubsystemCapsule, TaskId, UL_FIELD_VALIDATION_BASELINE_COMMIT,
-    UL_FIELD_VALIDATION_SCHEMA_VERSION, UlFieldTaskAnnotation, UlFieldValidationManifest,
-    UlReadinessInventory, UlReadinessState, UlTaskLedger,
+    UL_FIELD_VALIDATION_SCHEMA_VERSION, UlExperimentArm, UlFieldTaskAnnotation,
+    UlFieldValidationManifest, UlInjectionMode, UlReadinessInventory, UlReadinessState,
+    UlTaskClass, UlTaskExperimentAssignment, UlTaskLedger,
 };
 use serde_json::json;
 use std::fs;
 use std::path::Path;
+
+#[test]
+fn u9_3_exploration_token_rounding_is_exact() {
+    let project_id = ProjectId::new_v7();
+    let task_id = TaskId::new_v7();
+    let session_id = SessionId::new_v7();
+    let mut accumulator = UlLedgerAccumulator::default();
+    let assignment = UlTaskExperimentAssignment {
+        project_id,
+        task_id,
+        task_class: UlTaskClass {
+            action_class: "read_only".to_owned(),
+            subsystem: "concept:test".to_owned(),
+            artifact_class: "code".to_owned(),
+        },
+        ordinal: 2,
+        arm: UlExperimentArm::Treatment,
+        injection_mode: UlInjectionMode::Payload,
+        config_hash: "u9-3".to_owned(),
+    };
+    let delta = accumulator.record_with_assignment(
+        &measurement(
+            project_id,
+            task_id,
+            session_id,
+            "eliot_current_state",
+            json!({"project_id": project_id}),
+            9,
+            12,
+            vec![receipt(session_id, task_id, "claim:u9-3", 9)],
+        ),
+        Some(&assignment),
+    );
+
+    assert_eq!(delta.read_tool_input_bytes, 9);
+    assert_eq!(delta.read_tool_output_bytes, 12);
+    assert_eq!(delta.exploration_tokens, 6);
+    assert_eq!(delta.injected_tokens, 9);
+    let baseline = UlLedgerService::matched_control_baseline(&[4, 6, 8]);
+    assert_eq!(baseline, Some(6));
+    assert_eq!(
+        UlLedgerService::net_token_delta(delta.injected_tokens, baseline.unwrap_or_default()),
+        3
+    );
+}
 
 #[test]
 fn t07_ledger_counts_bytes_and_injections() {
@@ -359,6 +405,7 @@ fn receipt(
         token_cost,
         source_fingerprint: format!("fingerprint:{item_ref}"),
         outcome: "delivered".to_owned(),
+        policy_reason: None,
     }
 }
 
@@ -370,12 +417,18 @@ fn ledger_from_deltas(
     UlTaskLedger {
         project_id,
         task_id,
+        task_class_key: String::new(),
+        arm: None,
+        injection_mode: None,
         injected_tokens: deltas.iter().map(|delta| delta.injected_tokens).sum(),
         read_tool_input_bytes: deltas.iter().map(|delta| delta.read_tool_input_bytes).sum(),
         read_tool_output_bytes: deltas
             .iter()
             .map(|delta| delta.read_tool_output_bytes)
             .sum(),
+        exploration_tokens: deltas.iter().map(|delta| delta.exploration_tokens).sum(),
+        matched_baseline_tokens: 0,
+        net_token_delta: 0,
         expanded_injected_handles: deltas
             .iter()
             .map(|delta| delta.expanded_injected_handles)
@@ -428,6 +481,7 @@ fn card(project_id: ProjectId, path: &str) -> ModuleCard {
         source_refs: Vec::new(),
         cue_bindings: Vec::new(),
         build_fingerprint: "fixture".to_owned(),
+        dependency_manifest: eliot_types::DependencyManifest::default(),
     }
 }
 

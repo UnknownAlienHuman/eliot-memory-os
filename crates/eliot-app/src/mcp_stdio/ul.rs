@@ -1,16 +1,18 @@
 use eliot_engine::{
     CueIndexService, InjectionPlanner, MetacognitionService, PredictionService, TouchedSetRegistry,
-    UlLedgerService, WriterHandle, capsule_freshness, render_capsule,
+    UlDependencyService, UlLedgerService, UlTokenPolicyService, WriterHandle, capsule_freshness,
+    render_capsule_with_dirty,
 };
 use eliot_store::{CanonicalRecord, CanonicalStore};
 use eliot_types::{
     CapsuleFreshness, CausalBridgeHop, ConceptNode, CoverageClass, HotspotScore, ModuleCard,
-    ProjectId, SubsystemCapsule, UlMetacognitionView, path_matches_boundary, ul_token_estimate,
+    ProjectId, SessionId, SubsystemCapsule, TaskId, UlExperimentArm, UlInjectionMode,
+    UlMetacognitionView, UlTaskExperimentAssignment, path_matches_boundary, ul_token_estimate,
 };
 use serde_json::{Value, json};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 const PACKET_PYRAMID_BUDGET: u32 = 1_500;
 
@@ -22,41 +24,190 @@ pub(super) struct PyramidPacketEnrichment {
     pub blind_target: Option<String>,
     pub recommended_probe: Option<String>,
     pub subsystem_concept_id: Option<String>,
+    pub required_invariant_refs: Vec<String>,
 }
 
 pub(super) struct UlRuntime {
     pub cue_index: Arc<CueIndexService>,
     pub touched: Arc<TouchedSetRegistry>,
     pub planner: Arc<InjectionPlanner>,
+    pub dependency: Arc<UlDependencyService>,
     pub ledger: Arc<UlLedgerService>,
+    pub token_policy: Arc<UlTokenPolicyService>,
     pub prediction: Arc<PredictionService>,
     store: CanonicalStore,
     project_root: PathBuf,
+    runtime_root: PathBuf,
+    dependency_ready: Mutex<HashSet<ProjectId>>,
 }
 
 impl UlRuntime {
-    pub fn new(store: CanonicalStore, writer: WriterHandle, runtime_root: &Path) -> Self {
+    pub fn new(
+        store: CanonicalStore,
+        writer: WriterHandle,
+        runtime_root: &Path,
+        activation_enable_min_edges: u32,
+    ) -> Self {
         let cue_index = Arc::new(CueIndexService::new(store.clone()));
         let touched = Arc::new(TouchedSetRegistry::new());
         let project_root = eliot_engine::canonical_project_root(runtime_root);
-        let planner = Arc::new(InjectionPlanner::with_project_root(
-            Arc::clone(&cue_index),
+        let planner = Arc::new(
+            InjectionPlanner::with_project_root_and_activation_min_edges(
+                Arc::clone(&cue_index),
+                store.clone(),
+                writer.clone(),
+                Arc::clone(&touched),
+                project_root.clone(),
+                activation_enable_min_edges,
+            ),
+        );
+        let dependency = Arc::new(UlDependencyService::new(store.clone()));
+        let ledger = Arc::new(UlLedgerService::with_runtime_root(
             store.clone(),
-            writer.clone(),
-            Arc::clone(&touched),
-            project_root.clone(),
+            runtime_root,
         ));
-        let ledger = Arc::new(UlLedgerService::new(store.clone()));
+        let token_policy = Arc::new(UlTokenPolicyService::with_runtime_root(
+            store.clone(),
+            runtime_root,
+        ));
         let prediction = Arc::new(PredictionService::new(store.clone(), writer));
         Self {
             cue_index,
             touched,
             planner,
+            dependency,
             ledger,
+            token_policy,
             prediction,
             store,
             project_root,
+            runtime_root: runtime_root.to_path_buf(),
+            dependency_ready: Mutex::new(HashSet::new()),
         }
+    }
+
+    pub async fn resolve_concept_ids(
+        &self,
+        project_id: ProjectId,
+        touched_paths: &[String],
+    ) -> anyhow::Result<Vec<String>> {
+        let mut concepts = self
+            .store
+            .load_ul_artifacts::<ConceptNode>(project_id, &["concept_node"], 128)
+            .await?
+            .into_iter()
+            .filter(|record| {
+                touched_paths.iter().any(|path| {
+                    record
+                        .receipt_body
+                        .boundary_paths
+                        .iter()
+                        .any(|boundary| path_matches_boundary(path, boundary))
+                })
+            })
+            .map(|record| record.receipt_body.concept_id)
+            .collect::<Vec<_>>();
+        concepts.sort();
+        concepts.dedup();
+        Ok(concepts)
+    }
+
+    pub async fn effective_injection_mode(
+        &self,
+        project_id: ProjectId,
+        task_id: Option<TaskId>,
+        explicit_control: bool,
+    ) -> anyhow::Result<(Option<UlInjectionMode>, Option<UlTaskExperimentAssignment>)> {
+        let assignment = if let Some(task_id) = task_id {
+            self.token_policy
+                .load_assignment(project_id, task_id)
+                .await?
+        } else {
+            None
+        };
+        let mode = if explicit_control {
+            None
+        } else if let Some(assignment) = assignment.as_ref() {
+            if assignment.arm == UlExperimentArm::Control {
+                None
+            } else {
+                self.token_policy.effective_mode(assignment).await?
+            }
+        } else {
+            Some(UlInjectionMode::Payload)
+        };
+        Ok((mode, assignment))
+    }
+
+    pub fn record_packet_gate(
+        &self,
+        project_id: ProjectId,
+        session_id: SessionId,
+        task_id: Option<TaskId>,
+        gate: Option<&Value>,
+    ) -> anyhow::Result<()> {
+        self.touched
+            .set_packet_gate(project_id, session_id, gate.cloned());
+        let directory = self.runtime_root.join("reports").join("ul-gates");
+        std::fs::create_dir_all(&directory)?;
+        let path = directory.join(format!("{session_id}.json"));
+        if let Some(gate) = gate {
+            let report = json!({
+                "project_id": project_id,
+                "session_id": session_id,
+                "task_id": task_id,
+                "gate": gate,
+            });
+            serde_json::to_writer_pretty(std::fs::File::create(path)?, &report)?;
+        } else if path.is_file() {
+            std::fs::remove_file(path)?;
+        }
+        Ok(())
+    }
+
+    pub async fn ensure_dependency_state(&self, project_id: ProjectId) -> anyhow::Result<()> {
+        if self
+            .dependency_ready
+            .lock()
+            .map_err(|_| anyhow::anyhow!("UL dependency readiness lock poisoned"))?
+            .contains(&project_id)
+        {
+            return Ok(());
+        }
+        self.dependency.rebuild_index(project_id).await?;
+        self.dependency.scan_project(project_id).await?;
+        self.dependency_ready
+            .lock()
+            .map_err(|_| anyhow::anyhow!("UL dependency readiness lock poisoned"))?
+            .insert(project_id);
+        Ok(())
+    }
+
+    pub async fn observe_successful_tool(
+        &self,
+        project_id: ProjectId,
+        session_id: SessionId,
+        tool_name: &str,
+        arguments: &Value,
+        observed_cues: &[eliot_types::ObservedCue],
+    ) -> anyhow::Result<()> {
+        self.ensure_dependency_state(project_id).await?;
+        if !eliot_engine::is_mutation_tool(tool_name, arguments) {
+            return Ok(());
+        }
+        let changed_paths = observed_cues
+            .iter()
+            .filter(|cue| cue.kind == eliot_types::CueKind::FilePath)
+            .map(|cue| cue.value.clone())
+            .collect::<Vec<_>>();
+        self.dependency
+            .mark_paths_dirty(
+                project_id,
+                &changed_paths,
+                &format!("tool:{tool_name}:{session_id}"),
+            )
+            .await?;
+        Ok(())
     }
 
     #[allow(clippy::too_many_lines)]
@@ -98,7 +249,15 @@ impl UlRuntime {
         .into_values()
         .collect::<Vec<_>>();
         let cue_sources = self.store.load_cue_records(project_id).await?;
-        let meta = MetacognitionService::evaluate(
+        let dirty_capsules = self
+            .store
+            .load_ul_dirty_artifacts(project_id, 512)
+            .await?
+            .into_iter()
+            .filter(|state| state.target_kind == eliot_types::PyramidTargetKind::SubsystemCapsule)
+            .map(|state| (state.target_id.clone(), state))
+            .collect::<BTreeMap<_, _>>();
+        let mut meta = MetacognitionService::evaluate(
             &self.project_root,
             &concept_list,
             &capsule_list,
@@ -107,7 +266,7 @@ impl UlRuntime {
             &cue_sources,
             touched_paths,
         );
-        let (coverage, blind_target) =
+        let (mut coverage, mut blind_target) =
             MetacognitionService::coverage_for_paths(&concept_list, &meta, touched_paths);
         let recommended_probe = MetacognitionService::recommended_probe(&cards, touched_paths);
         let subsystem_concept_id =
@@ -152,6 +311,8 @@ impl UlRuntime {
         let mut concept_values = Vec::new();
         let mut capsule_values = Vec::new();
         let mut danger = BTreeSet::new();
+        let mut required_invariant_refs = BTreeSet::new();
+        let mut stale_target = None;
         let mut units = 0_u32;
         for (_, _, concept) in &ranked {
             let concept_value = json!({
@@ -168,11 +329,15 @@ impl UlRuntime {
                 continue;
             };
             let freshness = capsule_freshness(capsule, &self.project_root);
-            let freshness_name = match freshness {
-                CapsuleFreshness::Fresh => "fresh",
-                CapsuleFreshness::Stale { .. } => "stale",
-            };
-            let rendered = render_capsule(capsule, &self.project_root);
+            let dirty = dirty_capsules.get(&capsule.concept_id);
+            let capsule_stale = freshness != CapsuleFreshness::Fresh || dirty.is_some();
+            if capsule_stale {
+                stale_target.get_or_insert_with(|| concept.concept_id.clone());
+            } else {
+                required_invariant_refs.extend(concept.invariant_refs.iter().cloned());
+            }
+            let freshness_name = if capsule_stale { "stale" } else { "fresh" };
+            let rendered = render_capsule_with_dirty(capsule, &self.project_root, dirty);
             let payload_units = ul_token_estimate(&rendered);
             let mut value = json!({
                 "ref": format!("capsule:{}", capsule.capsule_id),
@@ -197,7 +362,19 @@ impl UlRuntime {
                 })
             })
             .count();
-        let legacy_coverage = if ranked.is_empty() {
+        if let Some(target) = stale_target {
+            coverage = CoverageClass::Blind;
+            blind_target = Some(target.clone());
+            if let Some(subsystem) = meta
+                .coverage
+                .iter_mut()
+                .find(|subsystem| subsystem.concept_id == target)
+            {
+                subsystem.capsule_fresh = false;
+                subsystem.coverage = CoverageClass::Blind;
+            }
+        }
+        let legacy_coverage = if coverage == CoverageClass::Blind || ranked.is_empty() {
             "blind"
         } else if touched_paths.is_empty()
             || (covered_paths == touched_paths.len() && capsule_values.len() == ranked.len())
@@ -223,6 +400,7 @@ impl UlRuntime {
             blind_target,
             recommended_probe,
             subsystem_concept_id,
+            required_invariant_refs: required_invariant_refs.into_iter().collect(),
         })
     }
 }

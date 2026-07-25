@@ -196,6 +196,7 @@ fn h3_custom_root_freshness_and_dot_boundary_reach_runtime_packet() -> TestResul
         source_refs: vec!["file:src/lib.rs".to_owned()],
         cue_bindings: cue("root"),
         build_fingerprint: "h3-root-card".to_owned(),
+        dependency_manifest: DependencyManifest::default(),
     };
     let promoted = PyramidBuilder.build_capsule(
         project_root.path(),
@@ -625,12 +626,19 @@ fn prediction(project_id: ProjectId, resolution: PredictionResolution) -> Predic
         packet_id: uuid::Uuid::new_v4().to_string(),
         verifier: "h7-verifier".to_owned(),
         expected: PredictionExpectation::Pass,
+        prediction: Some(eliot_types::UlPrediction::VerifierVerdict {
+            verifier: "h7-verifier".to_owned(),
+            expected: PredictionExpectation::Pass,
+        }),
+        confidence: None,
         resolution: Some(resolution),
         actual: Some(match resolution {
             PredictionResolution::Hit => VerificationResult::Passed,
             PredictionResolution::Miss => VerificationResult::Failed,
             PredictionResolution::Unresolvable => VerificationResult::Inconclusive,
         }),
+        actual_detail: None,
+        blast_score: None,
         verification_ref: Some("verification:h7".to_owned()),
         source_frame_hash: "h7-frame".to_owned(),
     }

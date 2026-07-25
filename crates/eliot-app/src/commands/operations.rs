@@ -593,6 +593,11 @@ async fn run_published_daemon(
         let mut supervisor = ServiceSupervisor::new(default_runtime_services());
         supervisor.start_all("daemon").await?;
         let publication = ipc_server.publish_ready()?;
+        let mut scheduler_task = tokio::spawn(run_weekly_ul_exam_scheduler(
+            config_path.to_path_buf(),
+            std::sync::Arc::clone(&mcp_daemon),
+            ipc_shutdown_rx.clone(),
+        ));
         let ipc_task = tokio::spawn(ipc_server.serve(mcp_daemon, ipc_shutdown_rx));
         let bundle = write_runtime_bundle(
             config_path,
@@ -636,6 +641,15 @@ async fn run_published_daemon(
             .await
             .context("named-pipe server shutdown timed out")?;
         joined.context("named-pipe server task failed")??;
+        if let Ok(joined) =
+            tokio::time::timeout(Duration::from_secs(5), &mut scheduler_task).await
+        {
+            joined.context("UL weekly exam scheduler task failed")?;
+        } else {
+            scheduler_task.abort();
+            let _ = scheduler_task.await;
+            tracing::warn!("aborted in-flight UL weekly exam during daemon shutdown");
+        }
         supervisor
             .shutdown_all(shutdown_deadline_after(Duration::from_secs(5)))
             .await?;
@@ -652,6 +666,71 @@ async fn run_published_daemon(
         Ok(publication_cleaned)
     }
     .await
+}
+
+async fn run_weekly_ul_exam_scheduler(
+    config_path: PathBuf,
+    daemon: std::sync::Arc<mcp_stdio::McpDaemon>,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
+) {
+    let mut interval = tokio::time::interval(Duration::from_secs(60));
+    loop {
+        tokio::select! {
+            _ = interval.tick() => {
+                let local_now = match time::OffsetDateTime::now_local() {
+                    Ok(now) => now,
+                    Err(error) => {
+                        tracing::warn!(%error, "UL weekly exam scheduler could not resolve local time");
+                        continue;
+                    }
+                };
+                if !eliot_engine::weekly_exam_due(
+                    local_now.weekday().number_from_monday(),
+                    local_now.hour(),
+                ) {
+                    continue;
+                }
+                let (year, iso_week, _) = local_now.to_iso_week_date();
+                let window = format!("{year}-W{iso_week:02}");
+                let projects = match pending_ul_scheduled_projects(&config_path, &window) {
+                    Ok(projects) => projects,
+                    Err(error) => {
+                        tracing::warn!(%error, "UL weekly exam registry read failed");
+                        continue;
+                    }
+                };
+                let route = eliot_engine::weekly_exam_route(iso_week);
+                for project_id in projects {
+                    match daemon.run_scheduled_ul_exam(project_id, route).await {
+                        Ok(record)
+                            if record["grades"]
+                                .as_array()
+                                .is_some_and(|grades| !grades.is_empty()) =>
+                        {
+                            if let Err(error) = mark_ul_scheduled_project_complete(
+                                &config_path,
+                                project_id,
+                                &window,
+                            ) {
+                                tracing::warn!(%error, %project_id, "UL weekly exam completion window write failed");
+                            }
+                        }
+                        Ok(_) => {
+                            tracing::warn!(%project_id, "UL weekly exam was skipped and remains retryable this hour");
+                        }
+                        Err(error) => {
+                            tracing::warn!(%error, %project_id, "UL weekly exam run failed");
+                        }
+                    }
+                }
+            }
+            changed = shutdown.changed() => {
+                if changed.is_err() || *shutdown.borrow() {
+                    break;
+                }
+            }
+        }
+    }
 }
 
 pub fn run_daemon_status(config_path: &Path, instance: Option<&str>) -> Result<()> {

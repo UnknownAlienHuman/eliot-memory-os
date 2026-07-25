@@ -1,11 +1,12 @@
-use crate::EngineError;
+use crate::{EngineError, UlTokenPolicyService};
 use eliot_store::CanonicalStore;
 use eliot_types::{
     InjectionReceipt, MemoryInfluenceAckInput, ObservabilityKind, ProjectId, SessionId, TaskId,
-    UlLedgerDelta, UlTaskLedger, UlUseReport,
+    UlExperimentArm, UlLedgerDelta, UlTaskExperimentAssignment, UlTaskLedger, UlUseReport,
 };
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 #[derive(Clone, Debug)]
@@ -37,19 +38,33 @@ struct SessionLedger {
 
 pub struct UlLedgerService {
     store: CanonicalStore,
+    runtime_root: Option<PathBuf>,
     sessions: Mutex<UlLedgerAccumulator>,
     hydrated: Mutex<HashSet<(ProjectId, SessionId)>>,
 }
 
 #[derive(Default)]
 pub struct UlLedgerAccumulator {
-    sessions: HashMap<(ProjectId, SessionId), SessionLedger>,
+    sessions: HashMap<(ProjectId, SessionId, TaskId), SessionLedger>,
 }
 
 impl UlLedgerAccumulator {
     #[must_use]
     pub fn record(&mut self, measurement: &UlToolMeasurement) -> UlLedgerDelta {
-        let key = (measurement.project_id, measurement.session_id);
+        self.record_with_assignment(measurement, None)
+    }
+
+    #[must_use]
+    pub fn record_with_assignment(
+        &mut self,
+        measurement: &UlToolMeasurement,
+        assignment: Option<&UlTaskExperimentAssignment>,
+    ) -> UlLedgerDelta {
+        let key = (
+            measurement.project_id,
+            measurement.session_id,
+            measurement.task_id,
+        );
         let session = self.sessions.entry(key).or_default();
         session.call_sequence = session.call_sequence.saturating_add(1);
         let sequence = session.call_sequence;
@@ -64,6 +79,16 @@ impl UlLedgerAccumulator {
         if count_exploration {
             delta.read_tool_input_bytes = measurement.input_bytes;
             delta.read_tool_output_bytes = measurement.output_bytes;
+            delta.exploration_tokens = measurement
+                .input_bytes
+                .saturating_add(measurement.output_bytes)
+                .saturating_add(3)
+                / 4;
+        }
+        if let Some(assignment) = assignment {
+            delta.task_class_key = assignment.task_class.key();
+            delta.arm = Some(assignment.arm);
+            delta.injection_mode = Some(assignment.injection_mode);
         }
         if mutation {
             session.mutation_seen = true;
@@ -109,8 +134,11 @@ impl UlLedgerAccumulator {
     }
 
     fn restore(&mut self, project_id: ProjectId, session_id: SessionId, receipt: InjectionReceipt) {
+        let Some(task_id) = receipt.task_id else {
+            return;
+        };
         self.sessions
-            .entry((project_id, session_id))
+            .entry((project_id, session_id, task_id))
             .or_default()
             .delivered
             .insert(
@@ -128,14 +156,38 @@ impl UlLedgerService {
     pub fn new(store: CanonicalStore) -> Self {
         Self {
             store,
+            runtime_root: None,
             sessions: Mutex::new(UlLedgerAccumulator::default()),
             hydrated: Mutex::new(HashSet::new()),
         }
     }
 
+    #[must_use]
+    pub fn with_runtime_root(store: CanonicalStore, runtime_root: &Path) -> Self {
+        Self {
+            store,
+            runtime_root: Some(runtime_root.to_path_buf()),
+            sessions: Mutex::new(UlLedgerAccumulator::default()),
+            hydrated: Mutex::new(HashSet::new()),
+        }
+    }
+
+    #[must_use]
+    pub fn matched_control_baseline(exploration_tokens: &[u64]) -> Option<u64> {
+        upper_median(exploration_tokens.to_vec())
+    }
+
+    #[must_use]
+    pub fn net_token_delta(injected_tokens: u64, matched_baseline_tokens: u64) -> i64 {
+        i64::try_from(injected_tokens)
+            .unwrap_or(i64::MAX)
+            .saturating_sub(i64::try_from(matched_baseline_tokens).unwrap_or(i64::MAX))
+    }
+
     pub async fn record_call(
         &self,
         measurement: UlToolMeasurement,
+        assignment: Option<&UlTaskExperimentAssignment>,
     ) -> Result<UlTaskLedger, EngineError> {
         self.hydrate(
             measurement.project_id,
@@ -148,12 +200,44 @@ impl UlLedgerService {
                 .sessions
                 .lock()
                 .map_err(|_| ledger_lock_error("sessions"))?;
-            sessions.record(&measurement)
+            sessions.record_with_assignment(&measurement, assignment)
         };
-        self.store
+        let mut delta = delta;
+        if let Some(assignment) = assignment
+            && assignment.arm == UlExperimentArm::Treatment
+        {
+            let controls = self
+                .store
+                .load_ul_task_class_ledgers(measurement.project_id, &assignment.task_class.key())
+                .await?
+                .into_iter()
+                .filter(|ledger| {
+                    ledger.arm == Some(UlExperimentArm::Control) && ledger.first_mutation_seen
+                })
+                .map(|ledger| ledger.exploration_tokens)
+                .collect::<Vec<_>>();
+            delta.matched_baseline_tokens =
+                Self::matched_control_baseline(&controls).unwrap_or_default();
+        }
+        let ledger = self
+            .store
             .upsert_ul_task_ledger(measurement.project_id, measurement.task_id, &delta)
             .await
-            .map_err(Into::into)
+            .map_err(EngineError::from)?;
+        if let Some(assignment) = assignment
+            && assignment.arm == UlExperimentArm::Treatment
+        {
+            let policy_service = self.runtime_root.as_ref().map_or_else(
+                || UlTokenPolicyService::new(self.store.clone()),
+                |runtime_root| {
+                    UlTokenPolicyService::with_runtime_root(self.store.clone(), runtime_root)
+                },
+            );
+            let _ = policy_service
+                .evaluate_and_persist(measurement.project_id, &assignment.task_class.key())
+                .await?;
+        }
+        Ok(ledger)
     }
 
     pub async fn report(
@@ -258,6 +342,11 @@ impl UlLedgerService {
             .insert(key);
         Ok(())
     }
+}
+
+fn upper_median(mut values: Vec<u64>) -> Option<u64> {
+    values.sort_unstable();
+    values.get(values.len() / 2).copied()
 }
 
 #[must_use]

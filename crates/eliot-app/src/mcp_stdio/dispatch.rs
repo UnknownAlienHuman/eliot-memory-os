@@ -54,6 +54,47 @@ pub(super) async fn dispatch_host_governor_method(
             )
             .await,
         ),
+        "ul/maintain" => Some(
+            crate::commands::run_ul_maintain_from_daemon(
+                &state.config_path,
+                &state.store,
+                &state.writer,
+                params,
+            )
+            .await,
+        ),
+        "ul/dirty-report" => {
+            Some(crate::commands::run_ul_dirty_report_from_daemon(&state.store, params).await)
+        }
+        "ul/injection-policy-set" => Some(
+            crate::commands::run_ul_injection_policy_set_from_daemon(
+                &state.root,
+                &state.store,
+                params,
+            )
+            .await,
+        ),
+        "ul/exam-run" => Some(
+            crate::commands::run_ul_exam_run_from_daemon(
+                &state.config_path,
+                &state.root,
+                &state.store,
+                &state.writer,
+                params,
+            )
+            .await,
+        ),
+        "ul/exam-report" => {
+            Some(crate::commands::run_ul_exam_report_from_daemon(&state.store, params).await)
+        }
+        "ul/prediction-sweep" => Some(
+            crate::commands::run_ul_prediction_sweep_from_daemon(
+                &state.store,
+                &state.writer,
+                params,
+            )
+            .await,
+        ),
         "ping" => Some(Ok(json!({}))),
         _ => None,
     }
@@ -384,8 +425,29 @@ pub(super) async fn call_tool(
                 == Some("memory_free_control");
             let memory_free_control = argument_memory_free_control || response_memory_free_control;
             let mut injection_receipts = Vec::new();
+            let mut ul_assignment = None;
             if let Some(project_id) = ul_project_id {
-                if !memory_free_control {
+                let (effective_injection_mode, assignment) = state
+                    .ul
+                    .effective_injection_mode(project_id, ul_task_id, memory_free_control)
+                    .await?;
+                ul_assignment = assignment;
+                if let (Some(assignment), Some(mode)) =
+                    (ul_assignment.as_mut(), effective_injection_mode)
+                {
+                    assignment.injection_mode = mode;
+                }
+                state
+                    .ul
+                    .observe_successful_tool(
+                        project_id,
+                        context.session_id,
+                        name,
+                        &observation_arguments,
+                        &newly_observed,
+                    )
+                    .await?;
+                if effective_injection_mode.is_some() {
                     state
                         .ul
                         .planner
@@ -400,7 +462,7 @@ pub(super) async fn call_tool(
                         ul_task_id,
                         context.session_id,
                         &mut structured,
-                        memory_free_control,
+                        effective_injection_mode,
                     )
                     .await?;
             }
@@ -408,16 +470,19 @@ pub(super) async fn call_tool(
                 let _ = state
                     .ul
                     .ledger
-                    .record_call(eliot_engine::UlToolMeasurement {
-                        project_id,
-                        task_id,
-                        session_id: context.session_id,
-                        tool_name: name.to_owned(),
-                        arguments: observation_arguments.clone(),
-                        input_bytes: ul_input_bytes,
-                        output_bytes: ul_output_bytes,
-                        injection_receipts,
-                    })
+                    .record_call(
+                        eliot_engine::UlToolMeasurement {
+                            project_id,
+                            task_id,
+                            session_id: context.session_id,
+                            tool_name: name.to_owned(),
+                            arguments: observation_arguments.clone(),
+                            input_bytes: ul_input_bytes,
+                            output_bytes: ul_output_bytes,
+                            injection_receipts,
+                        },
+                        ul_assignment.as_ref(),
+                    )
                     .await;
             }
             if let Some(claims) = cognitive_claims.as_ref() {

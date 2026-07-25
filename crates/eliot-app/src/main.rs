@@ -1964,6 +1964,37 @@ async fn dispatch_command(
             commands::UlCommand::Report { project } => {
                 commands::run_ul_report(config, project).await
             }
+            commands::UlCommand::Maintain {
+                project,
+                root,
+                limit,
+                refine,
+            } => commands::run_ul_maintain(config, project, &root, limit, refine).await,
+            commands::UlCommand::DirtyReport { project } => {
+                commands::run_ul_dirty_report(config, project).await
+            }
+            commands::UlCommand::InjectionPolicy { command } => match command {
+                commands::UlInjectionPolicyCommand::Set {
+                    project,
+                    task_class,
+                    mode,
+                } => {
+                    commands::run_ul_injection_policy_set(config, project, &task_class, mode).await
+                }
+            },
+            commands::UlCommand::Exam { command } => match command {
+                commands::UlExamCommand::Run { project, route } => {
+                    commands::run_ul_exam_run(config, project, route).await
+                }
+                commands::UlExamCommand::Report { project, latest } => {
+                    commands::run_ul_exam_report(config, project, latest).await
+                }
+            },
+            commands::UlCommand::Prediction { command } => match command {
+                commands::UlPredictionCommand::Sweep { project } => {
+                    commands::run_ul_prediction_sweep(config, project).await
+                }
+            },
         },
         Command::Codecortex { command } => match command {
             CodeCortexCommand::Health => commands::run_codecortex_health(config),

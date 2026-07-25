@@ -1023,9 +1023,15 @@ fn launch_argv(
         }
     }
     if let Some(prompt) = prompt {
-        args.push(if host == AgentHostId::Antigravity {
+        args.push(if host == AgentHostId::Antigravity
+            && contract.permission_profile != "ul_structured_readonly"
+        {
             format!(
                 "READ-ONLY GOVERNED PLAN. Do not create, edit, delete, rename, or commit files. Do not mutate user, global, OneDrive, ProgramData, or provider configuration. Return only a raw git-style candidate unified diff, with no Markdown fences, prose, or summary; the controller will review and apply it later. Exact candidate request: {prompt}"
+            )
+        } else if host == AgentHostId::Antigravity {
+            format!(
+                "READ-ONLY STRUCTURED REASONING. Do not create, edit, delete, rename, or commit files. Return only the requested JSON value, with no Markdown fences or prose. Exact request: {prompt}"
             )
         } else {
             prompt
@@ -1042,7 +1048,9 @@ fn launch_environment_names(
     contract: &eliot_types::HostLaunchContract,
 ) -> Vec<&'static str> {
     let mut names = vec!["ELIOT_GOVERNOR_EXE"];
-    if host != AgentHostId::Antigravity {
+    if host != AgentHostId::Antigravity
+        || contract.permission_profile == "ul_structured_readonly"
+    {
         names.extend(STANDARD_MANAGED_ENV_ALLOWLIST.iter().copied());
     }
     if contract.agent_session_id.is_some() {

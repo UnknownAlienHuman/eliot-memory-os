@@ -100,12 +100,12 @@ use eliot_types::{
     SkillLifecycleState as SkillState, SkillOutputSpec, SkillScopeRule, SkillStep,
     SkillToolRequirement, SleepTrigger, SloDefinition, SloEvaluation, SourceSnapshotInput,
     StartupHealthReport, StatefulDbIsolationReport, TaintClass, TaskId, TelemetryRollup,
-    TestCostReport, TestInventory, TestSuiteProfile, TraceCompletenessContract, UnifiedDiff,
-    VerificationDecision, VerificationPlan, VerificationResult, VerificationRunInput,
-    VerificationVerdict, VerifierCommandKind, VerifierPlan, VerifierRequirement, VerifierRun,
-    VerifierStatus, Visibility, WorkItem, WorkItemId, WorkLease, WorkLeaseDecision,
-    WorkLeaseDecisionKind, WorkLeaseDecisionReason, WorkLeaseId, WorkLeaseState, WorktreeLease,
-    WorktreeLeaseId, WorktreeLeaseRequest, WorktreeLeaseRequestId,
+    TestCostReport, TestInventory, TestSuiteProfile, TraceCompletenessContract, UlInjectionMode,
+    UlTaskClassPolicy, UnifiedDiff, VerificationDecision, VerificationPlan, VerificationResult,
+    VerificationRunInput, VerificationVerdict, VerifierCommandKind, VerifierPlan,
+    VerifierRequirement, VerifierRun, VerifierStatus, Visibility, WorkItem, WorkItemId, WorkLease,
+    WorkLeaseDecision, WorkLeaseDecisionKind, WorkLeaseDecisionReason, WorkLeaseId, WorkLeaseState,
+    WorktreeLease, WorktreeLeaseId, WorktreeLeaseRequest, WorktreeLeaseRequestId, WriteId,
 };
 use std::fmt::Write as FmtWrite;
 use std::io::{Read as IoRead, Write as IoWrite};

@@ -128,6 +128,20 @@ pub struct DecisionLocalitySuffix {
     pub stop_condition: String,
 }
 
+#[derive(Clone, Copy, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PredictionConfidence {
+    Low,
+    Medium,
+    High,
+}
+
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+pub struct WaivedInvariant {
+    pub invariant_ref: String,
+    pub reason: String,
+}
+
 #[derive(Clone, Debug, Default, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 pub struct MaterialPacketFrame {
     pub acceptance_items: Vec<String>,
@@ -146,6 +160,16 @@ pub struct MaterialPacketFrame {
     pub stop_condition: String,
     pub tool_schema_bytes_visible: usize,
     pub instruction_hotset_size: usize,
+    #[serde(default)]
+    pub invariant_refs: Vec<String>,
+    #[serde(default)]
+    pub waived_invariants: Vec<WaivedInvariant>,
+    #[serde(default)]
+    pub prediction_confidence: Option<PredictionConfidence>,
+    #[serde(default)]
+    pub predicted_changed_paths: Vec<String>,
+    #[serde(default)]
+    pub predicted_failing_verifiers: Vec<String>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]

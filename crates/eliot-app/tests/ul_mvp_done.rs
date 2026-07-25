@@ -25,11 +25,24 @@ fn d01_packet_contains_memory_content() -> TestResult {
     }
     let mut harness = Harness::start("done-d01")?;
     let project_id = ProjectId::new_v7();
+    let control_task_id = TaskId::new_v7();
+    harness.create_task(0, project_id, control_task_id)?;
+    harness.client.tool_call(
+        1,
+        "eliot_compile_packet_l3",
+        &json!({
+            "project_id": project_id,
+            "task_id": control_task_id,
+            "goal": "reserve the deterministic memory-free control arm",
+            "candidate_handles": [],
+            "max_tokens": 500
+        }),
+    )?;
     let task_id = TaskId::new_v7();
-    harness.create_task(1, project_id, task_id)?;
+    harness.create_task(2, project_id, task_id)?;
     let write_id = WriteId::new_v7();
     harness.client.tool_call(
-        2,
+        3,
         "eliot_agent_candidate_submit",
         &candidate_arguments(
             project_id,
@@ -39,7 +52,7 @@ fn d01_packet_contains_memory_content() -> TestResult {
         ),
     )?;
     let packet = harness.client.tool_call(
-        3,
+        4,
         "eliot_compile_packet_l3",
         &json!({
             "project_id": project_id,
@@ -537,8 +550,19 @@ fn d09_prediction_resolves_against_real_verifier() -> TestResult {
 
     assert_eq!(verified["status"], "passed");
     assert_eq!(verified["ul_prediction_resolution"]["status"], "resolved");
-    assert_eq!(predictions.len(), 1);
-    assert_eq!(predictions[0].resolution, Some(PredictionResolution::Hit));
+    let verifier_prediction = predictions
+        .iter()
+        .find(|record| {
+            matches!(
+                record.prediction,
+                Some(eliot_types::UlPrediction::VerifierVerdict { .. })
+            )
+        })
+        .ok_or("verifier prediction was not captured")?;
+    assert_eq!(
+        verifier_prediction.resolution,
+        Some(PredictionResolution::Hit)
+    );
     Ok(())
 }
 

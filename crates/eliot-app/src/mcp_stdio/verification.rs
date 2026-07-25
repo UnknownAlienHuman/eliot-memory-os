@@ -909,7 +909,7 @@ pub(super) async fn dispatch_task_verification_run(
     )
     .await?;
     let verification_ref = format!("verification:{verification_id}");
-    let prediction_resolution = match state
+    let mut prediction_resolution = match state
         .ul
         .prediction
         .resolve(
@@ -935,6 +935,38 @@ pub(super) async fn dispatch_task_verification_run(
             "message": error.to_string(),
         }),
     };
+    let changed_paths = scope
+        .artifact_refs
+        .iter()
+        .map(|artifact| artifact.resource_ref.clone())
+        .collect::<Vec<_>>();
+    let blast_resolution = match state
+        .ul
+        .prediction
+        .resolve_blast(
+            project_id,
+            task_id,
+            &changed_paths,
+            &[],
+            &verification_ref,
+            verification_started_at,
+        )
+        .await
+    {
+        Ok(records) => json!({
+            "status": "resolved",
+            "count": records.len(),
+            "prediction_refs": records
+                .iter()
+                .map(|record| format!("prediction:{}", record.prediction_id))
+                .collect::<Vec<_>>(),
+        }),
+        Err(error) => json!({
+            "status": "measurement_error",
+            "message": error.to_string(),
+        }),
+    };
+    prediction_resolution["blast_radius"] = blast_resolution;
     Ok(json!({
         "status": "passed",
         "verification_id": verification_id,

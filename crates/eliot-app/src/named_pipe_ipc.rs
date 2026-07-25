@@ -479,7 +479,17 @@ pub(crate) async fn host_governor_request(
 ) -> Result<Value> {
     if !matches!(
         method,
-        "host/role-grant" | "host/observation-record" | "ul/onboard" | "ul/mine-git" | "ul/report"
+        "host/role-grant"
+            | "host/observation-record"
+            | "ul/onboard"
+            | "ul/mine-git"
+            | "ul/report"
+            | "ul/maintain"
+            | "ul/dirty-report"
+            | "ul/injection-policy-set"
+            | "ul/exam-run"
+            | "ul/exam-report"
+            | "ul/prediction-sweep"
     ) {
         anyhow::bail!("unsupported private host Governor RPC method");
     }

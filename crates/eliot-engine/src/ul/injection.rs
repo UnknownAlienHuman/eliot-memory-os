@@ -1,16 +1,17 @@
-use super::{CueIndexService, TouchedSetRegistry, capsule_freshness};
+use super::{ActivationEngine, CueIndexService, TouchedSetRegistry, capsule_freshness};
 use crate::{EngineError, WriterHandle};
 use eliot_store::CanonicalStore;
 use eliot_types::{
-    CapsuleFreshness, ConceptNode, InjectionReceipt, OBSERVABILITY_SCHEMA_VERSION,
-    ObservabilityKind, ObservabilityWriteEnvelope, ObservabilityWriteStatus, ObservedCue,
-    PendingInjectionItem, ProjectCharter, ProjectId, SessionId, SubsystemCapsule, SystemMap,
-    TaskId, UlFiredBlock, UlFiredItem, WriteId, ul_token_estimate,
+    ActivationTrace, CapsuleFreshness, ConceptNode, CueKind, CueRecordSource, InjectionReceipt,
+    OBSERVABILITY_SCHEMA_VERSION, ObservabilityKind, ObservabilityWriteEnvelope,
+    ObservabilityWriteStatus, ObservedCue, PendingInjectionItem, ProjectCharter, ProjectId,
+    SessionId, SubsystemCapsule, SystemMap, TaskId, UlFiredBlock, UlFiredItem, UlInjectionMode,
+    WriteId, ul_token_estimate,
 };
 use serde_json::{Value, json};
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use uuid::Uuid;
 
@@ -25,12 +26,19 @@ struct PendingBatch {
     overflow: usize,
 }
 
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct ProjectSessionKey {
+    project_id: ProjectId,
+    session_id: SessionId,
+}
+
 pub struct InjectionPlanner {
     cue_index: Arc<CueIndexService>,
     store: CanonicalStore,
     writer: WriterHandle,
+    activation: ActivationEngine,
     touched: Arc<TouchedSetRegistry>,
-    pending: Mutex<HashMap<SessionId, PendingBatch>>,
+    pending: Mutex<HashMap<ProjectSessionKey, PendingBatch>>,
     hydrated: Mutex<HashSet<(ProjectId, SessionId)>>,
     project_root: PathBuf,
 }
@@ -60,8 +68,28 @@ impl InjectionPlanner {
         touched: Arc<TouchedSetRegistry>,
         project_root: PathBuf,
     ) -> Self {
+        Self::with_project_root_and_activation_min_edges(
+            cue_index,
+            store,
+            writer,
+            touched,
+            project_root,
+            500,
+        )
+    }
+
+    #[must_use]
+    pub fn with_project_root_and_activation_min_edges(
+        cue_index: Arc<CueIndexService>,
+        store: CanonicalStore,
+        writer: WriterHandle,
+        touched: Arc<TouchedSetRegistry>,
+        project_root: PathBuf,
+        enable_min_edges: u32,
+    ) -> Self {
         Self {
             cue_index,
+            activation: ActivationEngine::new(store.clone(), writer.clone(), enable_min_edges),
             store,
             writer,
             touched,
@@ -90,6 +118,7 @@ impl InjectionPlanner {
             .map(|source| (source.record_ref.clone(), source))
             .collect::<HashMap<_, _>>();
         let mut planned = Vec::new();
+        let mut seed_refs = Vec::new();
         for fired in firing.fired {
             let Some(source) = sources.get(&fired.record_ref) else {
                 continue;
@@ -97,6 +126,8 @@ impl InjectionPlanner {
             let invariant = fired.record_kind == "invariant";
             let include_payload = fired.negative_memory || invariant;
             let source_bytes = serde_json::to_vec(source)?;
+            seed_refs.push(fired.record_ref.clone());
+            seed_refs.extend(fired.fired_cues.iter().filter_map(canonical_cue_ref));
             planned.push(PendingInjectionItem {
                 item_ref: fired.record_ref,
                 record_kind: fired.record_kind,
@@ -107,14 +138,36 @@ impl InjectionPlanner {
                 negative_memory: fired.negative_memory,
                 invariant,
                 token_estimate: fired.token_estimate,
+                activation_trace_ref: None,
+                activation_score_milli: None,
             });
         }
+        let trace = self
+            .activation
+            .activate(project_id, session_id, None, &seed_refs)
+            .await?;
+        if let Some(trace) = trace.as_ref() {
+            planned.extend(activation_items(trace, &sources)?);
+        }
+        let mut deduped = HashMap::<String, PendingInjectionItem>::new();
+        for item in planned {
+            let exact = item.activation_trace_ref.is_none();
+            if exact || !deduped.contains_key(&item.item_ref) {
+                deduped.insert(item.item_ref.clone(), item);
+            }
+        }
+        let mut planned = deduped.into_values().collect::<Vec<_>>();
         planned.sort_by(compare_pending);
         let mut pending = self
             .pending
             .lock()
             .map_err(|_| planner_lock_error("pending"))?;
-        let batch = pending.entry(session_id).or_default();
+        let batch = pending
+            .entry(ProjectSessionKey {
+                project_id,
+                session_id,
+            })
+            .or_default();
         for item in &planned {
             batch.items.retain(|pending| {
                 pending.item_ref != item.item_ref
@@ -133,21 +186,24 @@ impl InjectionPlanner {
         task_id: Option<TaskId>,
         session_id: SessionId,
         response: &mut Value,
-        memory_free_control: bool,
+        effective_mode: Option<UlInjectionMode>,
     ) -> Result<Vec<InjectionReceipt>, EngineError> {
-        if memory_free_control {
+        let Some(effective_mode) = effective_mode else {
             return Ok(Vec::new());
-        }
+        };
         self.hydrate_delivery_state(project_id, session_id).await?;
         let mut committed_receipts = self
-            .attach_boot(project_id, task_id, session_id, response)
+            .attach_boot(project_id, task_id, session_id, response, effective_mode)
             .await?;
 
         let mut batch = self
             .pending
             .lock()
             .map_err(|_| planner_lock_error("pending"))?
-            .remove(&session_id)
+            .remove(&ProjectSessionKey {
+                project_id,
+                session_id,
+            })
             .unwrap_or_default();
         batch.items.sort_by(compare_pending);
 
@@ -163,7 +219,11 @@ impl InjectionPlanner {
                 continue;
             }
             let line = truncate_utf8(item.preview.trim(), MAX_LINE_BYTES);
-            let mut payload = item.payload.clone();
+            let mut payload = if effective_mode == UlInjectionMode::HandlesOnly {
+                None
+            } else {
+                item.payload.clone()
+            };
             let payload_units = payload
                 .as_ref()
                 .map(serde_json::to_string)
@@ -210,6 +270,8 @@ impl InjectionPlanner {
                 token_cost,
                 source_fingerprint: item.source_fingerprint.clone(),
                 outcome: "delivered".to_owned(),
+                policy_reason: (effective_mode == UlInjectionMode::HandlesOnly)
+                    .then(|| "task_class_handles_only".to_owned()),
             };
             if self
                 .commit_receipt(project_id, task_id, &receipt)
@@ -231,6 +293,8 @@ impl InjectionPlanner {
                 line,
                 uri: format!("eliot://memory/{}", item.item_ref),
                 payload,
+                activation_trace_ref: item.activation_trace_ref,
+                activation_score_milli: item.activation_score_milli,
             });
         }
 
@@ -300,6 +364,7 @@ impl InjectionPlanner {
         task_id: Option<TaskId>,
         session_id: SessionId,
         response: &mut Value,
+        effective_mode: UlInjectionMode,
     ) -> Result<Vec<InjectionReceipt>, EngineError> {
         if self.touched.boot_sent(project_id, session_id) {
             return Ok(Vec::new());
@@ -322,15 +387,31 @@ impl InjectionPlanner {
         if let (Some(charter), Some(map)) = (charter, map) {
             return self
                 .attach_ready_boot(
-                    project_id, task_id, session_id, response, revision, charter, map,
+                    project_id,
+                    task_id,
+                    session_id,
+                    response,
+                    revision,
+                    charter,
+                    map,
+                    effective_mode,
                 )
                 .await;
         }
-        let boot = json!({
-            "status": "not_onboarded",
-            "revision": revision,
-            "message": "project understanding artifacts are not built yet; cue firing is active"
-        });
+        let boot = if effective_mode == UlInjectionMode::HandlesOnly {
+            json!({
+                "status": "not_onboarded",
+                "revision": revision,
+                "ref": "ul_boot:not_onboarded",
+                "handle_only": true
+            })
+        } else {
+            json!({
+                "status": "not_onboarded",
+                "revision": revision,
+                "message": "project understanding artifacts are not built yet; cue firing is active"
+            })
+        };
         let serialized = serde_json::to_vec(&boot)?;
         let source_fingerprint = blake3::hash(&serialized).to_hex().to_string();
         let receipt = InjectionReceipt {
@@ -346,11 +427,18 @@ impl InjectionPlanner {
             task_id,
             surface: "mcp_auto_boot".to_owned(),
             item_ref: "ul_boot:not_onboarded".to_owned(),
-            render_form: "payload".to_owned(),
+            render_form: if effective_mode == UlInjectionMode::HandlesOnly {
+                "handle"
+            } else {
+                "payload"
+            }
+            .to_owned(),
             fired_cues: Vec::new(),
             token_cost: ul_token_estimate(&String::from_utf8_lossy(&serialized)),
             source_fingerprint,
             outcome: "delivered".to_owned(),
+            policy_reason: (effective_mode == UlInjectionMode::HandlesOnly)
+                .then(|| "task_class_handles_only".to_owned()),
         };
         self.commit_receipt(project_id, task_id, &receipt).await?;
         response_object_mut(response)?.insert("ul_boot".to_owned(), boot);
@@ -368,6 +456,7 @@ impl InjectionPlanner {
         revision: Value,
         charter: ProjectCharter,
         map: SystemMap,
+        effective_mode: UlInjectionMode,
     ) -> Result<Vec<InjectionReceipt>, EngineError> {
         let concepts = self
             .store
@@ -383,35 +472,36 @@ impl InjectionPlanner {
             .into_iter()
             .map(|record| record.receipt_body)
             .collect::<Vec<_>>();
-        let fresh = capsules
-            .iter()
-            .filter(|capsule| {
-                capsule_freshness(capsule, &self.project_root) == CapsuleFreshness::Fresh
-            })
-            .count();
-        let unassigned = concepts
-            .iter()
-            .filter(|concept| concept.name == "_unassigned")
-            .map(|concept| concept.boundary_paths.len())
-            .sum::<usize>();
-        let coverage = format!(
-            "{} subsystems; {fresh} fresh capsules; {unassigned} unassigned source files",
-            concepts.len()
-        );
+        let coverage = boot_coverage(&concepts, &capsules, &self.project_root);
         let charter_ref = format!("charter:{}", charter.charter_id);
         let map_ref = format!("system-map:{}", map.map_id);
+        let dirty = self.store.load_ul_dirty_artifacts(project_id, 512).await?;
+        let charter_body = render_body_with_dirty(
+            &charter.body_md,
+            dirty.iter().find(|state| {
+                state.target_kind == eliot_types::PyramidTargetKind::ProjectCharter
+                    && state.target_id == project_id.to_string()
+            }),
+        );
+        let map_body = render_body_with_dirty(
+            &map.body_md,
+            dirty.iter().find(|state| {
+                state.target_kind == eliot_types::PyramidTargetKind::SystemMap
+                    && state.target_id == project_id.to_string()
+            }),
+        );
         let content_units =
-            ul_token_estimate(&charter.body_md).saturating_add(ul_token_estimate(&map.body_md));
-        let over_budget = content_units > 1_200;
+            ul_token_estimate(&charter_body).saturating_add(ul_token_estimate(&map_body));
+        let over_budget = content_units > 1_200 || effective_mode == UlInjectionMode::HandlesOnly;
         let charter_delivery = if over_budget {
             json!({"ref": charter_ref})
         } else {
-            json!({"ref": charter_ref, "body_md": charter.body_md})
+            json!({"ref": charter_ref, "body_md": charter_body})
         };
         let map_delivery = if over_budget {
             json!({"ref": map_ref})
         } else {
-            json!({"ref": map_ref, "body_md": map.body_md})
+            json!({"ref": map_ref, "body_md": map_body})
         };
         let boot = if over_budget {
             json!({
@@ -438,10 +528,18 @@ impl InjectionPlanner {
             &charter_ref,
             &charter_delivery,
             render_form,
+            effective_mode,
         )?;
         self.commit_receipt(project_id, task_id, &charter_receipt)
             .await?;
-        let map_receipt = boot_receipt(session_id, task_id, &map_ref, &map_delivery, render_form)?;
+        let map_receipt = boot_receipt(
+            session_id,
+            task_id,
+            &map_ref,
+            &map_delivery,
+            render_form,
+            effective_mode,
+        )?;
         self.commit_receipt(project_id, task_id, &map_receipt)
             .await?;
         response_object_mut(response)?.insert("ul_boot".to_owned(), boot);
@@ -499,12 +597,33 @@ fn latest_artifact<T>(records: Vec<eliot_store::CanonicalRecord<T>>) -> Option<T
         .map(|record| record.receipt_body)
 }
 
+fn boot_coverage(
+    concepts: &[ConceptNode],
+    capsules: &[SubsystemCapsule],
+    project_root: &Path,
+) -> String {
+    let fresh = capsules
+        .iter()
+        .filter(|capsule| capsule_freshness(capsule, project_root) == CapsuleFreshness::Fresh)
+        .count();
+    let unassigned = concepts
+        .iter()
+        .filter(|concept| concept.name == "_unassigned")
+        .map(|concept| concept.boundary_paths.len())
+        .sum::<usize>();
+    format!(
+        "{} subsystems; {fresh} fresh capsules; {unassigned} unassigned source files",
+        concepts.len()
+    )
+}
+
 fn boot_receipt(
     session_id: SessionId,
     task_id: Option<TaskId>,
     item_ref: &str,
     delivery: &Value,
     render_form: &str,
+    effective_mode: UlInjectionMode,
 ) -> Result<InjectionReceipt, EngineError> {
     let rendered_bytes = serde_json::to_vec(delivery)?;
     let source_fingerprint = blake3::hash(&rendered_bytes).to_hex().to_string();
@@ -526,6 +645,8 @@ fn boot_receipt(
         token_cost: ul_token_estimate(&String::from_utf8_lossy(&rendered_bytes)),
         source_fingerprint,
         outcome: "delivered".to_owned(),
+        policy_reason: (effective_mode == UlInjectionMode::HandlesOnly)
+            .then(|| "task_class_handles_only".to_owned()),
     })
 }
 
@@ -556,7 +677,100 @@ pub fn deterministic_write_id(key: &str) -> WriteId {
 fn compare_pending(left: &PendingInjectionItem, right: &PendingInjectionItem) -> Ordering {
     pending_rank(left)
         .cmp(&pending_rank(right))
+        .then_with(|| {
+            left.activation_trace_ref
+                .is_some()
+                .cmp(&right.activation_trace_ref.is_some())
+        })
+        .then_with(|| {
+            right
+                .activation_score_milli
+                .cmp(&left.activation_score_milli)
+        })
         .then_with(|| left.item_ref.cmp(&right.item_ref))
+}
+
+fn canonical_cue_ref(cue: &ObservedCue) -> Option<String> {
+    match cue.kind {
+        CueKind::FilePath => Some(format!("file:{}", cue.value)),
+        CueKind::DirPath => Some(format!("dir:{}", cue.value)),
+        CueKind::Symbol => Some(format!("symbol:{}", cue.value)),
+        CueKind::Dependency => Some(format!("dependency:{}", cue.value)),
+        CueKind::ApiSurface => Some(format!("api:{}", cue.value)),
+        CueKind::Subsystem => Some(format!("subsystem:{}", cue.value)),
+        CueKind::Concept => Some(format!("concept:{}", cue.value)),
+        CueKind::CommandPattern | CueKind::ErrorSignature | CueKind::TaskClass => None,
+    }
+}
+
+fn render_body_with_dirty(body: &str, dirty: Option<&eliot_types::UlArtifactDirtyState>) -> String {
+    let mut keys = dirty
+        .filter(|state| state.dirty)
+        .into_iter()
+        .flat_map(|state| state.reasons.iter())
+        .map(|reason| reason.dependency.key.clone())
+        .collect::<Vec<_>>();
+    keys.sort();
+    keys.dedup();
+    keys.truncate(3);
+    if keys.is_empty() {
+        body.to_owned()
+    } else {
+        format!(
+            "[STALE: changed dependencies: {}] — verify against code before relying.\n{body}",
+            keys.join(", ")
+        )
+    }
+}
+
+fn activation_items(
+    trace: &ActivationTrace,
+    sources: &HashMap<String, CueRecordSource>,
+) -> Result<Vec<PendingInjectionItem>, EngineError> {
+    let mut items = Vec::new();
+    for activated in &trace.activated {
+        let matching = activation_sources(&activated.node_ref, sources);
+        for source in matching {
+            let invariant = source.record_kind == "invariant";
+            let include_payload = source.negative_memory || invariant;
+            let source_bytes = serde_json::to_vec(source)?;
+            items.push(PendingInjectionItem {
+                item_ref: source.record_ref.clone(),
+                record_kind: source.record_kind.clone(),
+                preview: source.preview_text.clone(),
+                payload: include_payload.then(|| source.payload.clone()).flatten(),
+                source_fingerprint: blake3::hash(&source_bytes).to_hex().to_string(),
+                fired_cues: Vec::new(),
+                negative_memory: source.negative_memory,
+                invariant,
+                token_estimate: ul_token_estimate(&source.preview_text),
+                activation_trace_ref: Some(format!("activation:{}", trace.trace_id)),
+                activation_score_milli: Some(activated.score_milli),
+            });
+        }
+    }
+    Ok(items)
+}
+
+fn activation_sources<'a>(
+    node_ref: &str,
+    sources: &'a HashMap<String, CueRecordSource>,
+) -> Vec<&'a CueRecordSource> {
+    let mut matches = Vec::new();
+    if let Some(source) = sources.get(node_ref) {
+        matches.push(source);
+    }
+    if let Some(path) = node_ref.strip_prefix("file:") {
+        matches.extend(sources.values().filter(|source| {
+            source.cue_bindings.iter().any(|binding| {
+                binding.cue_kind == CueKind::FilePath
+                    && eliot_types::normalize_path(&binding.cue_value, None) == path
+            })
+        }));
+    }
+    matches.sort_by(|left, right| left.record_ref.cmp(&right.record_ref));
+    matches.dedup_by(|left, right| left.record_ref == right.record_ref);
+    matches
 }
 
 fn pending_rank(item: &PendingInjectionItem) -> u8 {
@@ -600,5 +814,103 @@ fn planner_lock_error(lock: &str) -> EngineError {
     EngineError::ServiceNotReady {
         service: "injection_planner".to_owned(),
         reason: format!("{lock} lock poisoned"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use eliot_types::{CueBinding, CueMatchMode, CueStrength};
+
+    #[test]
+    fn u8_1_pending_batches_are_isolated_by_project_and_session() {
+        let session_id = SessionId::new_v7();
+        let project_a = ProjectId::new_v7();
+        let project_b = ProjectId::new_v7();
+        let mut pending = HashMap::<ProjectSessionKey, PendingBatch>::new();
+        pending
+            .entry(ProjectSessionKey {
+                project_id: project_a,
+                session_id,
+            })
+            .or_default()
+            .overflow = 1;
+        pending
+            .entry(ProjectSessionKey {
+                project_id: project_b,
+                session_id,
+            })
+            .or_default()
+            .overflow = 2;
+
+        assert_eq!(
+            pending
+                .remove(&ProjectSessionKey {
+                    project_id: project_b,
+                    session_id,
+                })
+                .map(|batch| batch.overflow),
+            Some(2)
+        );
+        assert_eq!(
+            pending
+                .remove(&ProjectSessionKey {
+                    project_id: project_a,
+                    session_id,
+                })
+                .map(|batch| batch.overflow),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn u8_6_activated_file_maps_to_handle_only_partner() -> Result<(), EngineError> {
+        let project_id = ProjectId::new_v7();
+        let session_id = SessionId::new_v7();
+        let trace = ActivationTrace {
+            trace_id: Uuid::new_v4().to_string(),
+            project_id,
+            session_id,
+            task_id: None,
+            seed_refs: vec!["file:a.rs".to_owned()],
+            enabled_edge_count: 501,
+            depth_limit: 2,
+            fanout_cap: 20,
+            threshold_milli: 350,
+            activated: vec![eliot_types::ActivationNode {
+                node_ref: "file:b.rs".to_owned(),
+                score_milli: 560,
+                depth: 1,
+                via: vec!["file:a.rs".to_owned(), "file:b.rs".to_owned()],
+            }],
+            suppressed: Vec::new(),
+        };
+        let source = CueRecordSource {
+            record_ref: "card:b".to_owned(),
+            record_kind: "module_card".to_owned(),
+            preview_text: "partner card".to_owned(),
+            payload: Some(json!({"must_not": "flow"})),
+            cue_bindings: vec![CueBinding {
+                cue_kind: CueKind::FilePath,
+                cue_value: "b.rs".to_owned(),
+                match_mode: CueMatchMode::Exact,
+                strength: CueStrength::Primary,
+                expected_reuse_note: "test".to_owned(),
+            }],
+            negative_memory: false,
+            lifecycle: "active".to_owned(),
+        };
+        let sources = HashMap::from([(source.record_ref.clone(), source)]);
+        let items = activation_items(&trace, &sources)?;
+
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].item_ref, "card:b");
+        assert!(items[0].payload.is_none());
+        assert_eq!(items[0].activation_score_milli, Some(560));
+        assert_eq!(
+            items[0].activation_trace_ref.as_deref(),
+            Some(format!("activation:{}", trace.trace_id).as_str())
+        );
+        Ok(())
     }
 }

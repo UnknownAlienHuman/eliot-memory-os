@@ -122,6 +122,40 @@ pub fn normalize_path(raw: &str, project_root: Option<&str>) -> String {
     path
 }
 
+#[must_use]
+pub fn normalize_observed_path(raw: &str) -> String {
+    let trimmed = raw.trim_matches(|character: char| {
+        matches!(
+            character,
+            '`' | '"' | '\'' | ',' | ';' | '(' | ')' | '[' | ']' | '{' | '}'
+        )
+    });
+    let normalized = normalize_path(trimmed, None);
+    normalized
+        .strip_prefix("file:")
+        .unwrap_or(&normalized)
+        .split('#')
+        .next()
+        .unwrap_or_default()
+        .to_owned()
+}
+
+#[must_use]
+pub fn path_cue_tokens(raw: &str) -> Vec<String> {
+    raw.split_whitespace()
+        .map(normalize_observed_path)
+        .filter(|path| {
+            path.contains('/')
+                && path
+                    .rsplit('/')
+                    .next()
+                    .is_some_and(|leaf| leaf.contains('.') || leaf == "src")
+        })
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
 fn is_identifier(character: char) -> bool {
     character.is_alphanumeric() || character == '_'
 }

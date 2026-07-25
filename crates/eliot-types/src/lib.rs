@@ -74,9 +74,9 @@ pub use cognition::{
     OperatorCommandReceipt, OperatorControlRequest, OperatorFieldView, OperatorProjectionFilter,
     OperatorProjectionKind, OperatorProjectionPage, OperatorQueryOperation, OperatorQueryRequest,
     OperatorRecordView, OperatorRelationshipView, OperatorResultMode, OperatorSnapshot,
-    PacketQualityReport, PacketQualityResult, PlanningDecisionRecord, ResponsibilityContour,
-    TaskCognitionView, TraceTimelineView, UnderstandingOutcome, UnderstandingOutcomeRecord,
-    operator_contract_hash,
+    PacketQualityReport, PacketQualityResult, PlanningDecisionRecord, PredictionConfidence,
+    ResponsibilityContour, TaskCognitionView, TraceTimelineView, UnderstandingOutcome,
+    UnderstandingOutcomeRecord, WaivedInvariant, operator_contract_hash,
 };
 pub use cognitive_run::{
     COGNITIVE_RUN_EXACT_CALLS, COGNITIVE_RUN_RAW_VERIFIER_CALLS, COGNITIVE_RUN_SCHEMA_VERSION,
@@ -88,6 +88,7 @@ pub use cognitive_run::{
 pub use config::{
     BlobStoreConfig, ControlWalConfig, DbConfig, DbMode, DelegationCalibrationConfig,
     GovernorConfig, ServiceConfig, StoreConfig, SurrealCapabilities, SurrealServerConfig,
+    UlActivationConfig, UlConfig,
 };
 pub use delegation::{
     DelegationBudget, DelegationDecision, DelegationDecisionKind, DelegationJob,
@@ -316,6 +317,10 @@ pub use skill::{
     SkillPatchProposal, SkillQuarantineProposal, SkillReplayRequirement, SkillScopeRule,
     SkillSplitProposal, SkillStep, SkillToolRequirement,
 };
+pub use ul::activation::{
+    ACTIVATION_SCALE, ACTIVATION_THRESHOLD, ActivationEdgeKind, ActivationNode, ActivationTrace,
+    SuppressedActivation, UlActivationGraphEdge, UlActivationGraphRows,
+};
 pub use ul::artifact::UlArtifact;
 pub use ul::behavior::{
     CoChangeEdge, FIX_CLASSIFIER_VERSION, HotspotScore, MiningConfig, MiningRun,
@@ -330,6 +335,14 @@ pub use ul::cue::{
     CueBinding, CueBindingError, CueIndexRow, CueKind, CueMatchMode, CueRecordSource, CueStrength,
     cue_row_id, normalize_binding, normalize_bindings, ul_token_estimate,
 };
+pub use ul::dependency::{
+    UlArtifactDirtyState, UlDependencyKind, UlDependencyRebuildReport, UlDependencyRef,
+    UlDirtyReason, UlMaintenanceReport, UlReverseDependencyRow,
+};
+pub use ul::exam::{
+    UlExamAnswer, UlExamGrade, UlExamQuestion, UlExamQuestionKind, UlExamRecord,
+    UlReasoningRequest, UlReasoningRoute,
+};
 pub use ul::guard::{TextEncodingViolation, inspect_text_encoding, mojibake};
 pub use ul::injection::{
     InjectionReceipt, MemoryInfluenceAckInput, ObservedCue, PendingInjectionItem, UlFiredBlock,
@@ -337,21 +350,23 @@ pub use ul::injection::{
 };
 pub use ul::measurement::{
     UL_FIELD_VALIDATION_BASELINE_COMMIT, UL_FIELD_VALIDATION_SCHEMA_VERSION, UlArtifactInventory,
-    UlFeatureReadiness, UlFieldEvidenceSummary, UlFieldTaskAnnotation, UlFieldValidationManifest,
-    UlGraphInventory, UlHostSurfaceIncident, UlLedgerDelta, UlPredictionInventory,
-    UlProseFailureSignal, UlReadinessInventory, UlReadinessSnapshot, UlReadinessState,
-    UlSecondRepositoryValidation, UlTask08Readiness, UlTaskLedger, UlUseReport,
+    UlExperimentArm, UlFeatureReadiness, UlFieldEvidenceSummary, UlFieldTaskAnnotation,
+    UlFieldValidationManifest, UlGraphInventory, UlHostSurfaceIncident, UlInjectionMode,
+    UlLedgerDelta, UlPredictionInventory, UlProseFailureSignal, UlReadinessInventory,
+    UlReadinessSnapshot, UlReadinessState, UlSecondRepositoryValidation, UlTask08Readiness,
+    UlTaskClass, UlTaskClassPolicy, UlTaskExperimentAssignment, UlTaskLedger, UlUseReport,
 };
 pub use ul::normalize::{
-    command_pattern, error_signature, normalize_path, normalize_query_tokens, normalize_symbol,
-    path_matches_boundary,
+    command_pattern, error_signature, normalize_observed_path, normalize_path,
+    normalize_query_tokens, normalize_symbol, path_cue_tokens, path_matches_boundary,
 };
 pub use ul::onboarding::{
     ManifestPackage, OnboardingCheckpoint, OnboardingJob, OnboardingReport, OnboardingStage,
     OnboardingTestHook,
 };
 pub use ul::prediction::{
-    CalibrationScore, PredictionExpectation, PredictionRecord, PredictionResolution,
+    BlastScore, CalibrationScore, CalibrationTrend, DiagnosticExpectation, PredictionExpectation,
+    PredictionRecord, PredictionResolution, UlPrediction, UlPredictionActual,
 };
 pub use verification::{
     FlakeReport, SkippedTest, SkippedTestReason, StatefulDbIsolationReport, TestCostClass,
