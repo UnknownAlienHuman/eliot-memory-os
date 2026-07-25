@@ -378,7 +378,10 @@ fn seed_invariant_capsule(harness: &Harness, project_id: ProjectId) -> TestResul
         concept_id: concept_id.clone(),
         body_md: "PURPOSE\nOwn invariant-sensitive code.\n\nBOUNDARIES\n- src/invariant\n\nKEY ENTRYPOINTS\n- file:src/invariant/lib.rs\n\nINVARIANTS\n- preserve order [invariant:preserve-order]\n\nDRAGONS\n- none\n\nKEY DECISIONS\n- none\n\nVERIFIERS\n- cargo test"
             .to_owned(),
-        dependency_manifest: DependencyManifest::default(),
+        dependency_manifest: DependencyManifest {
+            project_root: std::env::current_dir()?.to_string_lossy().into_owned(),
+            ..DependencyManifest::default()
+        },
         build_id: build_id.clone(),
         cue_bindings: vec![CueBinding {
             cue_kind: CueKind::FilePath,

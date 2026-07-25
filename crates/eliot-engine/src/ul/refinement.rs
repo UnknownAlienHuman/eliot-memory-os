@@ -116,14 +116,31 @@ impl UlRefinementService {
         UlDependencyService::new(self.store.clone())
             .index_capsule(&result.capsule)
             .await?;
-        self.store
-            .clear_ul_artifact_dirty(
-                capsule.project_id,
-                PyramidTargetKind::SubsystemCapsule,
-                &capsule.concept_id,
-                &result.capsule.build_id,
-            )
-            .await?;
+        let dirty = self
+            .store
+            .load_ul_dirty_artifacts(capsule.project_id, 512)
+            .await?
+            .into_iter()
+            .find(|state| {
+                state.target_kind == PyramidTargetKind::SubsystemCapsule
+                    && state.target_id == capsule.concept_id
+            });
+        let prose_only_dirty = dirty.as_ref().is_none_or(|state| {
+            state
+                .reasons
+                .iter()
+                .all(|reason| reason.dependency.kind == eliot_types::UlDependencyKind::Report)
+        });
+        if prose_only_dirty {
+            self.store
+                .clear_ul_artifact_dirty(
+                    capsule.project_id,
+                    PyramidTargetKind::SubsystemCapsule,
+                    &capsule.concept_id,
+                    &result.capsule.build_id,
+                )
+                .await?;
+        }
         Ok(UlRefinementResult {
             used_fallback,
             reason,

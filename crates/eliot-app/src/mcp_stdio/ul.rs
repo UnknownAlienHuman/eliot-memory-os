@@ -257,7 +257,7 @@ impl UlRuntime {
             .filter(|state| state.target_kind == eliot_types::PyramidTargetKind::SubsystemCapsule)
             .map(|state| (state.target_id.clone(), state))
             .collect::<BTreeMap<_, _>>();
-        let meta = MetacognitionService::evaluate(
+        let mut meta = MetacognitionService::evaluate(
             &self.project_root,
             &concept_list,
             &capsule_list,
@@ -266,7 +266,7 @@ impl UlRuntime {
             &cue_sources,
             touched_paths,
         );
-        let (coverage, blind_target) =
+        let (mut coverage, mut blind_target) =
             MetacognitionService::coverage_for_paths(&concept_list, &meta, touched_paths);
         let recommended_probe = MetacognitionService::recommended_probe(&cards, touched_paths);
         let subsystem_concept_id =
@@ -312,6 +312,7 @@ impl UlRuntime {
         let mut capsule_values = Vec::new();
         let mut danger = BTreeSet::new();
         let mut required_invariant_refs = BTreeSet::new();
+        let mut stale_target = None;
         let mut units = 0_u32;
         for (_, _, concept) in &ranked {
             let concept_value = json!({
@@ -329,13 +330,13 @@ impl UlRuntime {
             };
             let freshness = capsule_freshness(capsule, &self.project_root);
             let dirty = dirty_capsules.get(&capsule.concept_id);
-            if freshness == CapsuleFreshness::Fresh && dirty.is_none() {
+            let capsule_stale = freshness != CapsuleFreshness::Fresh || dirty.is_some();
+            if capsule_stale {
+                stale_target.get_or_insert_with(|| concept.concept_id.clone());
+            } else {
                 required_invariant_refs.extend(concept.invariant_refs.iter().cloned());
             }
-            let freshness_name = match freshness {
-                CapsuleFreshness::Fresh if dirty.is_none() => "fresh",
-                CapsuleFreshness::Stale { .. } | CapsuleFreshness::Fresh => "stale",
-            };
+            let freshness_name = if capsule_stale { "stale" } else { "fresh" };
             let rendered = render_capsule_with_dirty(capsule, &self.project_root, dirty);
             let payload_units = ul_token_estimate(&rendered);
             let mut value = json!({
@@ -361,7 +362,19 @@ impl UlRuntime {
                 })
             })
             .count();
-        let legacy_coverage = if ranked.is_empty() {
+        if let Some(target) = stale_target {
+            coverage = CoverageClass::Blind;
+            blind_target = Some(target.clone());
+            if let Some(subsystem) = meta
+                .coverage
+                .iter_mut()
+                .find(|subsystem| subsystem.concept_id == target)
+            {
+                subsystem.capsule_fresh = false;
+                subsystem.coverage = CoverageClass::Blind;
+            }
+        }
+        let legacy_coverage = if coverage == CoverageClass::Blind || ranked.is_empty() {
             "blind"
         } else if touched_paths.is_empty()
             || (covered_paths == touched_paths.len() && capsule_values.len() == ranked.len())

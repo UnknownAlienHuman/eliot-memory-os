@@ -112,6 +112,7 @@ pub(super) async fn dispatch_task_action_request(
     }))
 }
 
+#[allow(clippy::too_many_lines)]
 pub(super) async fn dispatch_task_observation_record(
     state: &McpState,
     context: AuthenticatedRequestContext,
@@ -151,6 +152,10 @@ pub(super) async fn dispatch_task_observation_record(
     if action_receipt.project_id != project_id || action_receipt.task_id != Some(task_id) {
         anyhow::bail!("active ActionLease WriteReceipt scope mismatch");
     }
+    let changed_paths = input.changed_paths.clone();
+    let failing_verifiers = input.failing_verifiers.clone();
+    let diagnostic_before = input.diagnostic_before.clone();
+    let diagnostic_after = input.diagnostic_after.clone();
     let observation_id = write_id.to_string();
     let item = task
         .acceptance_items
@@ -177,6 +182,10 @@ pub(super) async fn dispatch_task_observation_record(
             "provenance_set_hash": provenance.hash,
             "planned_verifier_ref": provenance.planned_verifier_ref,
             "task_revision": input.expected_revision,
+            "changed_paths": &changed_paths,
+            "failing_verifiers": &failing_verifiers,
+            "diagnostic_before": &diagnostic_before,
+            "diagnostic_after": &diagnostic_after,
             "candidate_only": true
         }),
     };
@@ -195,12 +204,98 @@ pub(super) async fn dispatch_task_observation_record(
         },
     )
     .await?;
+    let observation_ref = format!("observation:{observation_id}");
+    let prediction_resolution = resolve_observation_predictions(
+        state,
+        project_id,
+        task_id,
+        &diagnostic_before,
+        &diagnostic_after,
+        &changed_paths,
+        &failing_verifiers,
+        &observation_ref,
+    )
+    .await;
     Ok(json!({
         "status": "observed_candidate",
         "observation_id": observation_id,
         "task_contract": task,
-        "write_receipt": receipt
+        "write_receipt": receipt,
+        "ul_prediction_resolution": prediction_resolution
     }))
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn resolve_observation_predictions(
+    state: &McpState,
+    project_id: ProjectId,
+    task_id: TaskId,
+    diagnostic_before: &[String],
+    diagnostic_after: &[String],
+    changed_paths: &[String],
+    failing_verifiers: &[String],
+    observation_ref: &str,
+) -> Value {
+    let event_time = time::OffsetDateTime::now_utc();
+    let diagnostic = if diagnostic_before.is_empty() && diagnostic_after.is_empty() {
+        json!({ "status": "not_observed" })
+    } else {
+        prediction_resolution_json(
+            state
+                .ul
+                .prediction
+                .resolve_diagnostic_delta(
+                    project_id,
+                    task_id,
+                    diagnostic_before,
+                    diagnostic_after,
+                    observation_ref,
+                    event_time,
+                )
+                .await,
+        )
+    };
+    let blast = if changed_paths.is_empty() && failing_verifiers.is_empty() {
+        json!({ "status": "not_observed" })
+    } else {
+        prediction_resolution_json(
+            state
+                .ul
+                .prediction
+                .resolve_blast(
+                    project_id,
+                    task_id,
+                    changed_paths,
+                    failing_verifiers,
+                    observation_ref,
+                    event_time,
+                )
+                .await,
+        )
+    };
+    json!({
+        "diagnostic_delta": diagnostic,
+        "blast_radius": blast
+    })
+}
+
+fn prediction_resolution_json(
+    result: std::result::Result<Vec<eliot_types::PredictionRecord>, eliot_engine::EngineError>,
+) -> Value {
+    match result {
+        Ok(records) => json!({
+            "status": "resolved",
+            "count": records.len(),
+            "prediction_refs": records
+                .iter()
+                .map(|record| format!("prediction:{}", record.prediction_id))
+                .collect::<Vec<_>>(),
+        }),
+        Err(error) => json!({
+            "status": "measurement_error",
+            "message": error.to_string(),
+        }),
+    }
 }
 
 pub(super) const MAX_COMPLETION_DECISION_BYTES: usize = 512;

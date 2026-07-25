@@ -1489,7 +1489,7 @@ impl CanonicalStore {
         task_id: TaskId,
         delta: &eliot_types::UlLedgerDelta,
     ) -> Result<eliot_types::UlTaskLedger, StoreError> {
-        let ledger_key = derived_row_key(&format!("ul-task-ledger|{project_id}|{task_id}"));
+        let ledger_key = format!("{project_id}:{task_id}");
         let value = self
             .execute_value(
                 NamedSurqlOp::UpsertUlTaskLedger,

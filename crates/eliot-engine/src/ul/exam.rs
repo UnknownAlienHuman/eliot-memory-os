@@ -3,10 +3,11 @@ use crate::{EngineError, WriterHandle};
 use eliot_store::{CanonicalRecord, CanonicalStore};
 use eliot_types::{
     CoChangeEdge, ConceptNode, OBSERVABILITY_SCHEMA_VERSION, ObservabilityKind,
-    ObservabilityWriteEnvelope, ProjectCharter, ProjectId, PyramidTargetKind, SubsystemCapsule,
-    SystemMap, TaskId, UlArtifactDirtyState, UlDependencyKind, UlDependencyRef, UlDirtyReason,
-    UlExamAnswer, UlExamGrade, UlExamQuestion, UlExamQuestionKind, UlExamRecord,
-    UlReasoningRequest, UlReasoningRoute, WriteId, normalize_observed_path, ul_token_estimate,
+    ObservabilityWriteEnvelope, ObservabilityWriteStatus, ProjectCharter, ProjectId,
+    PyramidTargetKind, SubsystemCapsule, SystemMap, TaskId, UlArtifactDirtyState, UlDependencyKind,
+    UlDependencyRef, UlDirtyReason, UlExamAnswer, UlExamGrade, UlExamQuestion, UlExamQuestionKind,
+    UlExamRecord, UlReasoningRequest, UlReasoningRoute, WriteId, normalize_observed_path,
+    ul_token_estimate,
 };
 use serde::Serialize;
 use serde_json::json;
@@ -200,14 +201,7 @@ impl UlExamService {
             }
         };
         let (grades, subsystem_scores_milli) = grade_exam(&plan, &answers);
-        let dirty_capsule_refs = self
-            .mark_failed_capsules(
-                project_id,
-                &plan.exam_id,
-                &subsystem_scores_milli,
-                &capsules,
-            )
-            .await?;
+        let dirty_capsule_refs = failed_capsule_refs(&subsystem_scores_milli, &capsules);
         let record = UlExamRecord {
             exam_id: plan.exam_id,
             project_id,
@@ -220,6 +214,13 @@ impl UlExamService {
             dirty_capsule_refs,
         };
         self.write_record(&record).await?;
+        self.mark_failed_capsules(
+            project_id,
+            &record.exam_id,
+            &record.subsystem_scores_milli,
+            &capsules,
+        )
+        .await?;
         Ok(record)
     }
 
@@ -255,7 +256,8 @@ impl UlExamService {
         let input_hash = blake3::hash(&serde_json::to_vec(&payload)?)
             .to_hex()
             .to_string();
-        self.writer
+        let receipt = self
+            .writer
             .submit_observability(ObservabilityWriteEnvelope {
                 schema_version: OBSERVABILITY_SCHEMA_VERSION.to_owned(),
                 write_id: deterministic_write_id(&format!("ul-exam|{}", record.exam_id)),
@@ -269,6 +271,9 @@ impl UlExamService {
                 created_at: OffsetDateTime::now_utc(),
             })
             .await?;
+        if receipt.status == ObservabilityWriteStatus::Rejected {
+            return Err(EngineError::ObservabilityConflict);
+        }
         Ok(())
     }
 
@@ -616,11 +621,11 @@ pub const fn weekly_exam_due(local_weekday: u8, local_hour: u8) -> bool {
 }
 
 #[derive(Serialize)]
-struct ColdQuestion<'a> {
-    question_id: &'a str,
-    subsystem_concept_id: &'a str,
+struct ColdQuestion {
+    question_id: String,
+    subsystem_concept_id: String,
     kind: UlExamQuestionKind,
-    prompt: &'a str,
+    prompt: String,
 }
 
 const EXAM_OUTPUT_INSTRUCTION: &str = "\n\nOUTPUT JSON SCHEMA\n{\"answers\":[{\"question_id\":\"...\",\"answer_values\":[\"...\"],\"cited_refs\":[\"...\"]}]}";
@@ -631,28 +636,57 @@ fn exam_prompt(
     questions: &[UlExamQuestion],
     max_bytes: usize,
 ) -> String {
-    let cold_questions = questions
+    let mut cold_questions = questions
         .iter()
         .map(|question| ColdQuestion {
-            question_id: &question.question_id,
-            subsystem_concept_id: &question.subsystem_concept_id,
+            question_id: question.question_id.clone(),
+            subsystem_concept_id: question.subsystem_concept_id.clone(),
             kind: question.kind,
-            prompt: &question.prompt,
+            prompt: question.prompt.clone(),
         })
         .collect::<Vec<_>>();
-    let serialized_questions =
+    let mut serialized_questions =
         serde_json::to_string(&cold_questions).unwrap_or_else(|_| "[]".to_owned());
-    let mut prefix = format!(
-        "CHARTER\n{}\n\nSYSTEM MAP\n{}\n\nQUESTIONS\n{}",
-        charter.unwrap_or("unavailable"),
-        map.unwrap_or("unavailable"),
-        serialized_questions,
-    );
-    truncate_utf8(
-        &mut prefix,
-        max_bytes.saturating_sub(EXAM_OUTPUT_INSTRUCTION.len()),
-    );
-    format!("{prefix}{EXAM_OUTPUT_INSTRUCTION}")
+    let framing_bytes = "CHARTER\n".len()
+        + "\n\nSYSTEM MAP\n".len()
+        + "\n\nQUESTIONS\n".len()
+        + EXAM_OUTPUT_INSTRUCTION.len();
+    while framing_bytes + serialized_questions.len() > max_bytes
+        && let Some(question) = cold_questions
+            .iter_mut()
+            .filter(|question| !question.prompt.is_empty())
+            .max_by_key(|question| question.prompt.len())
+    {
+        let excess = (framing_bytes + serialized_questions.len()).saturating_sub(max_bytes);
+        let retained = question.prompt.len().saturating_sub(excess.max(16));
+        truncate_utf8(&mut question.prompt, retained);
+        serialized_questions =
+            serde_json::to_string(&cold_questions).unwrap_or_else(|_| "[]".to_owned());
+    }
+    let prose_budget = max_bytes.saturating_sub(framing_bytes + serialized_questions.len());
+    let mut charter = charter.unwrap_or("unavailable").to_owned();
+    let mut map = map.unwrap_or("unavailable").to_owned();
+    truncate_utf8(&mut charter, prose_budget / 2);
+    truncate_utf8(&mut map, prose_budget.saturating_sub(charter.len()));
+    format!(
+        "CHARTER\n{charter}\n\nSYSTEM MAP\n{map}\n\nQUESTIONS\n{serialized_questions}{EXAM_OUTPUT_INSTRUCTION}"
+    )
+}
+
+fn failed_capsule_refs(scores: &[(String, u16)], capsules: &[SubsystemCapsule]) -> Vec<String> {
+    let known = capsules
+        .iter()
+        .map(|capsule| (capsule.concept_id.as_str(), capsule.capsule_id.as_str()))
+        .collect::<BTreeMap<_, _>>();
+    scores
+        .iter()
+        .filter_map(|(concept_id, score)| {
+            (*score < UL_EXAM_DIRTY_MILLI)
+                .then(|| known.get(concept_id.as_str()).copied())
+                .flatten()
+        })
+        .map(|capsule_id| format!("capsule:{capsule_id}"))
+        .collect()
 }
 
 fn blast_ground_truth(

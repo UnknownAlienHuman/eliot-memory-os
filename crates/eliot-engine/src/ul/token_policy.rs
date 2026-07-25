@@ -210,7 +210,8 @@ impl UlTokenPolicyService {
         ledgers: &[UlTaskLedger],
     ) -> Option<UlTaskClassPolicy> {
         if let Some(current) = current
-            && current.injection_mode == UlInjectionMode::HandlesOnly
+            && (current.injection_mode == UlInjectionMode::HandlesOnly
+                || current.reason.starts_with("operator_"))
         {
             return Some(current.clone());
         }

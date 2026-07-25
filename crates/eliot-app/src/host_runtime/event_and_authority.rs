@@ -367,7 +367,7 @@ async fn launch(
     let canonical_authority =
         bind_launch_scope(config_path, host, cwd.as_deref(), &mut scope).await?;
     let mut contract = render_contract(config_path, host, mode, cwd, model, session, &scope)?;
-    if host == AgentHostId::Antigravity {
+    if host == AgentHostId::Antigravity && !structured_antigravity {
         finalize_antigravity_contract(&mut contract, idempotency_key.as_deref(), timeout_seconds)?;
         if structured_antigravity {
             "ul_structured_readonly".clone_into(&mut contract.permission_profile);

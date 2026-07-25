@@ -2445,6 +2445,14 @@ struct TaskObservationToolInput {
     provenance_handles: Vec<String>,
     #[serde(default)]
     provenance_set_hash: String,
+    #[serde(default)]
+    changed_paths: Vec<String>,
+    #[serde(default)]
+    failing_verifiers: Vec<String>,
+    #[serde(default)]
+    diagnostic_before: Vec<String>,
+    #[serde(default)]
+    diagnostic_after: Vec<String>,
 }
 
 #[derive(serde::Deserialize)]

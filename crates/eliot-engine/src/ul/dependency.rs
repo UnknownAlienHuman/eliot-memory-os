@@ -5,6 +5,7 @@ use eliot_types::{
     SystemMap, UlArtifactDirtyState, UlDependencyKind, UlDependencyRebuildReport, UlDependencyRef,
     UlDirtyReason,
 };
+use serde::de::DeserializeOwned;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -265,13 +266,12 @@ impl UlDependencyService {
     ) -> Result<UlDependencyRebuildReport, EngineError> {
         let mut artifacts_indexed = 0_u32;
         let mut dependencies_indexed = 0_u32;
-        for card in latest_by(
-            self.store
-                .load_ul_artifacts::<ModuleCard>(project_id, &["module_card"], 128)
-                .await?,
-            |card| card.path.clone(),
-        )
-        .into_values()
+        for card in self
+            .current_artifacts::<ModuleCard, _>(project_id, &["module_card"], |card| {
+                card.path.clone()
+            })
+            .await?
+            .into_values()
         {
             dependencies_indexed = dependencies_indexed.saturating_add(saturating_len(
                 dependency_refs(&card.dependency_manifest).len(),
@@ -279,13 +279,14 @@ impl UlDependencyService {
             self.index_card(&card).await?;
             artifacts_indexed = artifacts_indexed.saturating_add(1);
         }
-        for capsule in latest_by(
-            self.store
-                .load_ul_artifacts::<SubsystemCapsule>(project_id, &["subsystem_capsule"], 128)
-                .await?,
-            |capsule| capsule.concept_id.clone(),
-        )
-        .into_values()
+        for capsule in self
+            .current_artifacts::<SubsystemCapsule, _>(
+                project_id,
+                &["subsystem_capsule"],
+                |capsule| capsule.concept_id.clone(),
+            )
+            .await?
+            .into_values()
         {
             dependencies_indexed = dependencies_indexed.saturating_add(saturating_len(
                 dependency_refs(&capsule.dependency_manifest).len(),
@@ -293,22 +294,28 @@ impl UlDependencyService {
             self.index_capsule(&capsule).await?;
             artifacts_indexed = artifacts_indexed.saturating_add(1);
         }
-        if let Some(map) = latest_single(
-            self.store
-                .load_ul_artifacts::<SystemMap>(project_id, &["system_map"], 128)
-                .await?,
-        ) {
+        if let Some(map) = self
+            .current_artifacts::<SystemMap, _>(project_id, &["system_map"], |map| {
+                map.project_id.to_string()
+            })
+            .await?
+            .into_values()
+            .next()
+        {
             dependencies_indexed = dependencies_indexed.saturating_add(saturating_len(
                 dependency_refs(&map.dependency_manifest).len(),
             ));
             self.index_map(&map).await?;
             artifacts_indexed = artifacts_indexed.saturating_add(1);
         }
-        if let Some(charter) = latest_single(
-            self.store
-                .load_ul_artifacts::<ProjectCharter>(project_id, &["project_charter"], 128)
-                .await?,
-        ) {
+        if let Some(charter) = self
+            .current_artifacts::<ProjectCharter, _>(project_id, &["project_charter"], |charter| {
+                charter.project_id.to_string()
+            })
+            .await?
+            .into_values()
+            .next()
+        {
             dependencies_indexed = dependencies_indexed.saturating_add(saturating_len(
                 dependency_refs(&charter.dependency_manifest).len(),
             ));
@@ -320,6 +327,53 @@ impl UlDependencyService {
             artifacts_indexed,
             dependencies_indexed,
         })
+    }
+
+    async fn current_artifacts<T, F>(
+        &self,
+        project_id: ProjectId,
+        receipt_kinds: &[&str],
+        key: F,
+    ) -> Result<BTreeMap<String, T>, EngineError>
+    where
+        T: DeserializeOwned,
+        F: Fn(&T) -> String,
+    {
+        let mut selected = BTreeMap::<String, ((u64, u64), T)>::new();
+        let mut start = 0_u64;
+        loop {
+            let page = self
+                .store
+                .canonical_record_page(project_id, None, receipt_kinds, start, 100)
+                .await?;
+            let page_len = page.len();
+            for record in page {
+                let order = (
+                    record
+                        .memory_revision
+                        .map_or(0, eliot_types::MemoryRevision::value),
+                    record
+                        .project_sequence
+                        .map_or(0, eliot_types::ProjectSequence::value),
+                );
+                let artifact = serde_json::from_value(record.receipt_body)?;
+                let identity = key(&artifact);
+                if selected
+                    .get(&identity)
+                    .is_none_or(|(current_order, _)| order > *current_order)
+                {
+                    selected.insert(identity, (order, artifact));
+                }
+            }
+            if page_len < 100 {
+                break;
+            }
+            start = start.saturating_add(u64::try_from(page_len).unwrap_or(100));
+        }
+        Ok(selected
+            .into_iter()
+            .map(|(identity, (_, artifact))| (identity, artifact))
+            .collect())
     }
 }
 
@@ -377,7 +431,23 @@ struct ManifestTarget {
 fn stale_reasons(manifest: &DependencyManifest, event_ref: &str) -> Vec<UlDirtyReason> {
     let root = PathBuf::from(&manifest.project_root);
     if manifest.project_root.trim().is_empty() || !root.is_dir() {
-        return Vec::new();
+        let key = if manifest.project_root.trim().is_empty() {
+            "project-root:missing".to_owned()
+        } else {
+            format!(
+                "project-root:{}",
+                eliot_types::normalize_path(&manifest.project_root, None)
+            )
+        };
+        return vec![UlDirtyReason {
+            dependency: UlDependencyRef {
+                kind: UlDependencyKind::File,
+                key,
+            },
+            expected_fingerprint: Some("available-directory".to_owned()),
+            observed_fingerprint: None,
+            event_ref: event_ref.to_owned(),
+        }];
     }
     let mut reasons = Vec::new();
     for dependency in &manifest.file_deps {

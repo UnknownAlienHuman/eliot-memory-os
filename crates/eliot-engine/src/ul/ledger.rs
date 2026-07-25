@@ -69,9 +69,6 @@ impl UlLedgerAccumulator {
         session.call_sequence = session.call_sequence.saturating_add(1);
         let sequence = session.call_sequence;
         let mutation = is_mutation_tool(&measurement.tool_name, &measurement.arguments);
-        if measurement.tool_name == "eliot_compile_packet_l3" && !mutation {
-            session.mutation_seen = false;
-        }
         let count_exploration = !session.mutation_seen
             && !mutation
             && is_read_class_tool(&measurement.tool_name, &measurement.arguments);
