@@ -339,6 +339,10 @@ pub use ul::dependency::{
     UlArtifactDirtyState, UlDependencyKind, UlDependencyRebuildReport, UlDependencyRef,
     UlDirtyReason, UlMaintenanceReport, UlReverseDependencyRow,
 };
+pub use ul::exam::{
+    UlExamAnswer, UlExamGrade, UlExamQuestion, UlExamQuestionKind, UlExamRecord,
+    UlReasoningRequest, UlReasoningRoute,
+};
 pub use ul::guard::{TextEncodingViolation, inspect_text_encoding, mojibake};
 pub use ul::injection::{
     InjectionReceipt, MemoryInfluenceAckInput, ObservedCue, PendingInjectionItem, UlFiredBlock,
@@ -361,7 +365,8 @@ pub use ul::onboarding::{
     OnboardingTestHook,
 };
 pub use ul::prediction::{
-    CalibrationScore, PredictionExpectation, PredictionRecord, PredictionResolution,
+    BlastScore, CalibrationScore, CalibrationTrend, DiagnosticExpectation, PredictionExpectation,
+    PredictionRecord, PredictionResolution, UlPrediction, UlPredictionActual,
 };
 pub use verification::{
     FlakeReport, SkippedTest, SkippedTestReason, StatefulDbIsolationReport, TestCostClass,

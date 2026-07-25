@@ -814,6 +814,26 @@ pub(crate) struct McpDaemon {
 }
 
 impl McpDaemon {
+    pub(crate) async fn run_scheduled_ul_exam(
+        &self,
+        project_id: ProjectId,
+        route: eliot_types::UlReasoningRoute,
+    ) -> Result<Value> {
+        crate::commands::run_ul_exam_run_from_daemon(
+            &self.host_governor.config_path,
+            &self.host_governor.root,
+            &self.host_governor.store,
+            &self.host_governor.writer,
+            json!({
+                "project_id": project_id,
+                "route": route,
+            }),
+        )
+        .await
+    }
+}
+
+impl McpDaemon {
     #[allow(clippy::too_many_lines)]
     pub(crate) fn new(
         config_path: &Path,
@@ -843,6 +863,7 @@ impl McpDaemon {
             host_governor_authority: Mutex::new(()),
             cognitive_governor: McpState {
                 root: root.clone(),
+                config_path: config_path.to_path_buf(),
                 store: store.clone(),
                 ul: Arc::clone(&ul),
                 schema_ready: OnceCell::new(),
@@ -860,6 +881,7 @@ impl McpDaemon {
             },
             host_governor: McpState {
                 root: root.clone(),
+                config_path: config_path.to_path_buf(),
                 store: store.clone(),
                 ul: Arc::clone(&ul),
                 schema_ready: OnceCell::new(),
@@ -877,6 +899,7 @@ impl McpDaemon {
             },
             cognitive_child: McpState {
                 root: root.clone(),
+                config_path: config_path.to_path_buf(),
                 store: store.clone(),
                 ul: Arc::clone(&ul),
                 schema_ready: OnceCell::new(),
@@ -894,6 +917,7 @@ impl McpDaemon {
             },
             cognitive_control: McpState {
                 root: root.clone(),
+                config_path: config_path.to_path_buf(),
                 store: store.clone(),
                 ul: Arc::clone(&ul),
                 schema_ready: OnceCell::new(),
@@ -911,6 +935,7 @@ impl McpDaemon {
             },
             dynamic_agent: McpState {
                 root: root.clone(),
+                config_path: config_path.to_path_buf(),
                 store: store.clone(),
                 ul: Arc::clone(&ul),
                 schema_ready: OnceCell::new(),
@@ -928,6 +953,7 @@ impl McpDaemon {
             },
             claude_desktop: McpState {
                 root: root.clone(),
+                config_path: config_path.to_path_buf(),
                 store: store.clone(),
                 ul: Arc::clone(&ul),
                 schema_ready: OnceCell::new(),
@@ -945,6 +971,7 @@ impl McpDaemon {
             },
             codex_controller: McpState {
                 root: root.clone(),
+                config_path: config_path.to_path_buf(),
                 store: store.clone(),
                 ul: Arc::clone(&ul),
                 schema_ready: OnceCell::new(),
@@ -962,6 +989,7 @@ impl McpDaemon {
             },
             codex_worker: McpState {
                 root: root.clone(),
+                config_path: config_path.to_path_buf(),
                 store: store.clone(),
                 ul: Arc::clone(&ul),
                 schema_ready: OnceCell::new(),
@@ -979,6 +1007,7 @@ impl McpDaemon {
             },
             external_auditor: McpState {
                 root: root.clone(),
+                config_path: config_path.to_path_buf(),
                 store: store.clone(),
                 ul: Arc::clone(&ul),
                 schema_ready: OnceCell::new(),
@@ -996,6 +1025,7 @@ impl McpDaemon {
             },
             verifier: McpState {
                 root: root.clone(),
+                config_path: config_path.to_path_buf(),
                 store: store.clone(),
                 ul: Arc::clone(&ul),
                 schema_ready: OnceCell::new(),
@@ -1013,6 +1043,7 @@ impl McpDaemon {
             },
             human_operator: McpState {
                 root: root.clone(),
+                config_path: config_path.to_path_buf(),
                 store: store.clone(),
                 ul: Arc::clone(&ul),
                 schema_ready: OnceCell::new(),
@@ -1030,6 +1061,7 @@ impl McpDaemon {
             },
             human_readonly: McpState {
                 root,
+                config_path: config_path.to_path_buf(),
                 store,
                 ul,
                 schema_ready: OnceCell::new(),
@@ -2457,6 +2489,7 @@ struct TaskCompletionToolInput {
 
 struct McpState {
     root: PathBuf,
+    config_path: PathBuf,
     store: CanonicalStore,
     ul: Arc<UlRuntime>,
     schema_ready: OnceCell<()>,

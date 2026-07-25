@@ -83,14 +83,13 @@ fn t04_minimal_ack_derives_full_trace() -> TestResult {
     }
     let mut harness = Harness::start("minimal-ack")?;
     let project_id = ProjectId::new_v7();
-    let task_id = TaskId::new_v7();
-    harness.create_task(50, project_id, task_id)?;
+    let task_id = create_treatment_task(&mut harness, 50, project_id)?;
     let claim_id = ClaimId::new_v7();
     let handle = format!("claim:{claim_id}");
     harness.seed(&claim_propose(project_id, task_id, claim_id))?;
     harness.seed(&claim_verify(project_id, task_id, claim_id))?;
     let packet = harness.client.tool_call(
-        51,
+        53,
         "eliot_compile_packet_l3",
         &json!({
             "project_id": project_id,
@@ -111,7 +110,7 @@ fn t04_minimal_ack_derives_full_trace() -> TestResult {
     );
 
     let response = harness.client.tool_call(
-        52,
+        54,
         "eliot_memory_influence_trace",
         &json!({
             "project_id": project_id,
@@ -157,7 +156,7 @@ fn t04_minimal_ack_derives_full_trace() -> TestResult {
     assert!(trace.canonical_receipt.is_none());
 
     let rejected = harness.client.tool_call_response(
-        53,
+        55,
         "eliot_memory_influence_trace",
         &json!({
             "project_id": project_id,
@@ -208,10 +207,9 @@ fn t04_frame_stub_and_boot() -> TestResult {
         1
     );
 
-    let task_id = TaskId::new_v7();
-    harness.create_task(62, project_id, task_id)?;
+    let task_id = create_treatment_task(&mut harness, 62, project_id)?;
     let packet = harness.client.tool_call(
-        63,
+        65,
         "eliot_compile_packet_l3",
         &json!({
             "project_id": project_id,
@@ -228,7 +226,7 @@ fn t04_frame_stub_and_boot() -> TestResult {
     assert_eq!(packet["frame_stub_ready"], true);
     frame.expected_observable.clear();
     let rejected = harness.client.tool_call_response(
-        64,
+        66,
         "eliot_compile_packet_l3",
         &json!({
             "project_id": project_id,
@@ -246,7 +244,7 @@ fn t04_frame_stub_and_boot() -> TestResult {
     );
     frame.expected_observable = "cargo test exits successfully".to_owned();
     let resubmitted = harness.client.tool_call(
-        65,
+        67,
         "eliot_compile_packet_l3",
         &json!({
             "project_id": project_id,
@@ -257,12 +255,36 @@ fn t04_frame_stub_and_boot() -> TestResult {
             "material_frame": frame
         }),
     )?;
-    assert_eq!(
-        resubmitted["ul_prediction"]["status"],
-        "not_machine_checkable"
+    assert!(
+        resubmitted["prediction_refs"]
+            .as_array()
+            .is_some_and(|references| !references.is_empty())
     );
     assert!(resubmitted["packet_id"].is_string());
     Ok(())
+}
+
+fn create_treatment_task(
+    harness: &mut Harness,
+    request_id: u64,
+    project_id: ProjectId,
+) -> TestResult<TaskId> {
+    let control_task_id = TaskId::new_v7();
+    harness.create_task(request_id, project_id, control_task_id)?;
+    harness.client.tool_call(
+        request_id + 1,
+        "eliot_compile_packet_l3",
+        &json!({
+            "project_id": project_id,
+            "task_id": control_task_id,
+            "goal": "reserve the deterministic memory-free control arm",
+            "candidate_handles": [],
+            "max_tokens": 500
+        }),
+    )?;
+    let treatment_task_id = TaskId::new_v7();
+    harness.create_task(request_id + 2, project_id, treatment_task_id)?;
+    Ok(treatment_task_id)
 }
 
 fn command_context(project_id: ProjectId, task_id: TaskId) -> CommandContext {

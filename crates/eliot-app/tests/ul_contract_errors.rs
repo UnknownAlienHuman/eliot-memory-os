@@ -135,10 +135,22 @@ fn rerun_with_legacy_credential_gate(test_name: &str) -> TestResult<bool> {
 fn t01_packet_content_regression() -> TestResult {
     let _guard = test_guard();
     let mut harness = Harness::start("packet-content")?;
-    let (project_id, task_id) = harness.create_task(30)?;
+    let (project_id, control_task_id) = harness.create_task(30)?;
+    harness.client.tool_call(
+        31,
+        "eliot_compile_packet_l3",
+        &json!({
+            "project_id": project_id,
+            "task_id": control_task_id,
+            "goal": "reserve the deterministic memory-free control arm",
+            "candidate_handles": [],
+            "max_tokens": 500
+        }),
+    )?;
+    let task_id = harness.create_task_in_project(32, project_id)?;
     let write_id = WriteId::new_v7();
     harness.submit_candidate(
-        31,
+        33,
         project_id,
         task_id,
         write_id,
@@ -146,7 +158,7 @@ fn t01_packet_content_regression() -> TestResult {
         "QUARTZ pipeline reads config from quartz.toml",
     )?;
     let packet = harness.client.tool_call(
-        32,
+        34,
         "eliot_compile_packet_l3",
         &json!({
             "project_id": project_id,
@@ -223,6 +235,15 @@ impl Harness {
 
     fn create_task(&mut self, request_id: u64) -> TestResult<(ProjectId, TaskId)> {
         let project_id = ProjectId::new_v7();
+        let task_id = self.create_task_in_project(request_id, project_id)?;
+        Ok((project_id, task_id))
+    }
+
+    fn create_task_in_project(
+        &mut self,
+        request_id: u64,
+        project_id: ProjectId,
+    ) -> TestResult<TaskId> {
         let task_id = TaskId::new_v7();
         self.client.tool_call(
             request_id,
@@ -246,7 +267,7 @@ impl Harness {
                 ]
             }),
         )?;
-        Ok((project_id, task_id))
+        Ok(task_id)
     }
 
     fn submit_candidate(

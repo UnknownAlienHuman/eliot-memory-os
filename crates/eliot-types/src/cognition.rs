@@ -166,6 +166,10 @@ pub struct MaterialPacketFrame {
     pub waived_invariants: Vec<WaivedInvariant>,
     #[serde(default)]
     pub prediction_confidence: Option<PredictionConfidence>,
+    #[serde(default)]
+    pub predicted_changed_paths: Vec<String>,
+    #[serde(default)]
+    pub predicted_failing_verifiers: Vec<String>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]

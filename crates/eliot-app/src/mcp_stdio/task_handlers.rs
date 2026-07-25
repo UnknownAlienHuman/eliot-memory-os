@@ -286,29 +286,55 @@ async fn dispatch_compile_packet_l3(
                 "suggested_probe": suggested_probe,
             });
         }
-        if let Some(frame) = input.material_frame.as_ref() {
-            let source_frame_hash = canonical_struct_hash(frame)?;
-            if eliot_engine::parse_expected_observable(&frame.expected_observable).is_some() {
-                if let Ok(task_id) = TaskId::from_str(&request.task_id)
-                    && let Some(capture) = state
-                        .ul
-                        .prediction
-                        .capture(eliot_engine::PredictionCaptureInput {
-                            project_id: request.project_id,
-                            task_id,
-                            session_id: context.session_id,
-                            subsystem_concept_id: pyramid.subsystem_concept_id.clone(),
-                            packet_id: packet_id.clone(),
-                            expected_observable: frame.expected_observable.clone(),
-                            source_frame_hash,
-                        })
-                        .await?
-                {
-                    value["prediction_ref"] = Value::String(capture.prediction_ref);
-                }
-            } else {
-                value["ul_prediction"] = json!({"status": "not_machine_checkable"});
+    }
+    if let Some(frame) = input.material_frame.as_ref() {
+        let source_frame_hash = canonical_struct_hash(frame)?;
+        if let Ok(task_id) = TaskId::from_str(&request.task_id) {
+            let diagnostic_prediction = frame
+                .cheapest_discriminative_probes
+                .first()
+                .map(|probe| {
+                    (
+                        probe.clone(),
+                        eliot_types::DiagnosticExpectation::Appears,
+                    )
+                });
+            let captures = state
+                .ul
+                .prediction
+                .capture_frame(eliot_engine::PredictionFrameCaptureInput {
+                    base: eliot_engine::PredictionCaptureInput {
+                        project_id: request.project_id,
+                        task_id,
+                        session_id: context.session_id,
+                        subsystem_concept_id: pyramid
+                            .as_ref()
+                            .and_then(|value| value.subsystem_concept_id.clone()),
+                        packet_id: packet_id.clone(),
+                        expected_observable: frame.expected_observable.clone(),
+                        source_frame_hash,
+                    },
+                    confidence: frame.prediction_confidence,
+                    predicted_changed_paths: frame.predicted_changed_paths.clone(),
+                    predicted_failing_verifiers: frame.predicted_failing_verifiers.clone(),
+                    diagnostic_prediction,
+                })
+                .await?;
+            if !captures.is_empty() {
+                value["prediction_refs"] = serde_json::to_value(
+                    captures
+                        .iter()
+                        .map(|capture| capture.prediction_ref.clone())
+                        .collect::<Vec<_>>(),
+                )?;
+                value["prediction_ref"] = Value::String(captures[0].prediction_ref.clone());
             }
+        }
+        if eliot_engine::parse_expected_observable(&frame.expected_observable).is_none()
+            && frame.predicted_changed_paths.is_empty()
+            && frame.predicted_failing_verifiers.is_empty()
+        {
+            value["ul_prediction"] = json!({"status": "not_machine_checkable"});
         }
     }
     value["frame_stub"] = serde_json::to_value(frame_stub)?;
@@ -496,7 +522,7 @@ fn material_frame_stub(
             .clone(),
         next_allowed_action: next_action,
         expected_observable: format!("verifier:{verifier}=pass"),
-        verifier,
+        verifier: verifier.clone(),
         stop_condition,
         tool_schema_bytes_visible: packet
             .packet_quality
@@ -509,6 +535,14 @@ fn material_frame_stub(
         invariant_refs: required_invariant_refs.to_vec(),
         waived_invariants: Vec::new(),
         prediction_confidence: None,
+        predicted_changed_paths: packet
+            .exact_handles
+            .iter()
+            .flat_map(|handle| eliot_types::path_cue_tokens(handle))
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect(),
+        predicted_failing_verifiers: vec![verifier],
     }
 }
 

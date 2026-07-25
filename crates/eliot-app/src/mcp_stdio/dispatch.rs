@@ -55,7 +55,13 @@ pub(super) async fn dispatch_host_governor_method(
             .await,
         ),
         "ul/maintain" => Some(
-            crate::commands::run_ul_maintain_from_daemon(&state.store, &state.writer, params).await,
+            crate::commands::run_ul_maintain_from_daemon(
+                &state.config_path,
+                &state.store,
+                &state.writer,
+                params,
+            )
+            .await,
         ),
         "ul/dirty-report" => {
             Some(crate::commands::run_ul_dirty_report_from_daemon(&state.store, params).await)
@@ -64,6 +70,27 @@ pub(super) async fn dispatch_host_governor_method(
             crate::commands::run_ul_injection_policy_set_from_daemon(
                 &state.root,
                 &state.store,
+                params,
+            )
+            .await,
+        ),
+        "ul/exam-run" => Some(
+            crate::commands::run_ul_exam_run_from_daemon(
+                &state.config_path,
+                &state.root,
+                &state.store,
+                &state.writer,
+                params,
+            )
+            .await,
+        ),
+        "ul/exam-report" => {
+            Some(crate::commands::run_ul_exam_report_from_daemon(&state.store, params).await)
+        }
+        "ul/prediction-sweep" => Some(
+            crate::commands::run_ul_prediction_sweep_from_daemon(
+                &state.store,
+                &state.writer,
                 params,
             )
             .await,

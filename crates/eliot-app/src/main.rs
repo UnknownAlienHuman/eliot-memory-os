@@ -1968,7 +1968,8 @@ async fn dispatch_command(
                 project,
                 root,
                 limit,
-            } => commands::run_ul_maintain(config, project, &root, limit).await,
+                refine,
+            } => commands::run_ul_maintain(config, project, &root, limit, refine).await,
             commands::UlCommand::DirtyReport { project } => {
                 commands::run_ul_dirty_report(config, project).await
             }
@@ -1979,6 +1980,19 @@ async fn dispatch_command(
                     mode,
                 } => {
                     commands::run_ul_injection_policy_set(config, project, &task_class, mode).await
+                }
+            },
+            commands::UlCommand::Exam { command } => match command {
+                commands::UlExamCommand::Run { project, route } => {
+                    commands::run_ul_exam_run(config, project, route).await
+                }
+                commands::UlExamCommand::Report { project, latest } => {
+                    commands::run_ul_exam_report(config, project, latest).await
+                }
+            },
+            commands::UlCommand::Prediction { command } => match command {
+                commands::UlPredictionCommand::Sweep { project } => {
+                    commands::run_ul_prediction_sweep(config, project).await
                 }
             },
         },

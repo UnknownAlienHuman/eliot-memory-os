@@ -487,6 +487,9 @@ pub(crate) async fn host_governor_request(
             | "ul/maintain"
             | "ul/dirty-report"
             | "ul/injection-policy-set"
+            | "ul/exam-run"
+            | "ul/exam-report"
+            | "ul/prediction-sweep"
     ) {
         anyhow::bail!("unsupported private host Governor RPC method");
     }

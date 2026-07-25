@@ -138,6 +138,7 @@ pub(crate) async fn dispatch(config_path: &Path, command: HostCommand) -> Result
                 idempotency_key,
                 timeout_seconds,
                 dry_run,
+                None,
             ))
             .await
         }
@@ -359,13 +360,20 @@ async fn launch(
     idempotency_key: Option<String>,
     timeout_seconds: Option<u64>,
     dry_run: bool,
+    structured_capture: Option<&mut Value>,
 ) -> Result<()> {
+    let structured_antigravity =
+        host == AgentHostId::Antigravity && structured_capture.is_some();
     let canonical_authority =
         bind_launch_scope(config_path, host, cwd.as_deref(), &mut scope).await?;
     let mut contract = render_contract(config_path, host, mode, cwd, model, session, &scope)?;
     if host == AgentHostId::Antigravity {
         finalize_antigravity_contract(&mut contract, idempotency_key.as_deref(), timeout_seconds)?;
-        "canonical_readonly_candidate_plan".clone_into(&mut contract.permission_profile);
+        if structured_antigravity {
+            "ul_structured_readonly".clone_into(&mut contract.permission_profile);
+        } else {
+            "canonical_readonly_candidate_plan".clone_into(&mut contract.permission_profile);
+        }
         contract.contract_hash.clear();
         contract.contract_hash = blake3::hash(&serde_json::to_vec(&contract)?)
             .to_hex()
@@ -435,13 +443,13 @@ async fn launch(
         return write_json(&rendered);
     }
 
-    let _managed_guard = if host == AgentHostId::Antigravity {
+    let _managed_guard = if host == AgentHostId::Antigravity && !structured_antigravity {
         Some(managed_launch_mutex().lock().await)
     } else {
         None
     };
     let mut invocation_lock = None;
-    if host == AgentHostId::Antigravity {
+    if host == AgentHostId::Antigravity && !structured_antigravity {
         match reconcile_existing_managed_invocation(config_path, &invocation_root, &request_hash)
             .await?
         {
@@ -473,7 +481,7 @@ async fn launch(
         .args(&args)
         .current_dir(&contract.cwd_or_worktree)
         .kill_on_drop(true);
-    let managed_environment = if host == AgentHostId::Antigravity {
+    let managed_environment = if host == AgentHostId::Antigravity && !structured_antigravity {
         Some(configure_antigravity_environment(
             &mut command,
             config_path,
@@ -505,7 +513,7 @@ async fn launch(
     if let Some(worktree_lease_id) = contract.worktree_lease_id {
         command.env("ELIOT_WORKTREE_LEASE_ID", worktree_lease_id.to_string());
     }
-    if host == AgentHostId::Antigravity {
+    if host == AgentHostId::Antigravity && !structured_antigravity {
         command.stdin(Stdio::null());
     }
     if host == AgentHostId::OpenCode {
@@ -593,8 +601,12 @@ async fn launch(
             "candidate_only": true
         }),
     )?;
-    std::io::stdout().write_all(&sanitized_stdout.bytes)?;
-    std::io::stderr().write_all(&sanitized_stderr.bytes)?;
+    if let Some(capture) = structured_capture {
+        *capture = parse_structured_host_output(host, &sanitized_stdout.bytes)?;
+    } else {
+        std::io::stdout().write_all(&sanitized_stdout.bytes)?;
+        std::io::stderr().write_all(&sanitized_stderr.bytes)?;
+    }
     if !output.status.success() {
         bail!(
             "{} supervised launch exited with {}",
@@ -603,6 +615,128 @@ async fn launch(
         );
     }
     Ok(())
+}
+
+pub(crate) async fn invoke_ul_reasoning(
+    config_path: &Path,
+    cwd: &Path,
+    request: &eliot_types::UlReasoningRequest,
+) -> Result<Value> {
+    let host = request.route.host();
+    let doctor = doctor(config_path, host)?;
+    if doctor.get("ready").and_then(Value::as_bool) != Some(true) {
+        bail!("{} host doctor is not ready", host.as_str());
+    }
+    let prompt = format!(
+        "REQUEST IDEMPOTENCY KEY: {}\n\n{}\n\nReturn one JSON value matching this exact schema and no surrounding prose:\n{}",
+        request.idempotency_key,
+        request.prompt,
+        serde_json::to_string(&request.output_schema)?
+    );
+    let config_path = config_path.to_path_buf();
+    let cwd = cwd.to_path_buf();
+    let idempotency_key = (host == AgentHostId::Antigravity)
+        .then(|| request.idempotency_key.clone());
+    let timeout_seconds = (host == AgentHostId::Antigravity).then_some(120);
+    tokio::task::spawn_blocking(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .context("build supervised UL host runtime")?;
+        let mut captured = Value::Null;
+        runtime.block_on(launch(
+            &config_path,
+            host,
+            HostMode::Supervised,
+            Some(cwd),
+            None,
+            None,
+            HostLaunchScope {
+                project_id: None,
+                agent_session_id: None,
+                task_id: None,
+                work_item_id: None,
+                role_lease_id: None,
+                work_lease_id: None,
+                worktree_lease_id: None,
+                planned_verifier_ref: None,
+                baseline_commit: None,
+                allowed_paths: Vec::new(),
+                forbidden_paths: Vec::new(),
+            },
+            Some(prompt),
+            idempotency_key,
+            timeout_seconds,
+            false,
+            Some(&mut captured),
+        ))?;
+        Ok(captured)
+    })
+    .await
+    .context("join supervised UL host invocation")?
+}
+
+fn parse_structured_host_output(host: AgentHostId, stdout: &[u8]) -> Result<Value> {
+    if let Ok(value) = serde_json::from_slice::<Value>(stdout) {
+        return structured_value_from_host_event(host, value);
+    }
+    for line in stdout.rsplit(|byte| *byte == b'\n') {
+        let line = line
+            .iter()
+            .copied()
+            .skip_while(u8::is_ascii_whitespace)
+            .collect::<Vec<_>>();
+        if line.is_empty() {
+            continue;
+        }
+        if let Ok(value) = serde_json::from_slice::<Value>(&line)
+            && let Ok(structured) = structured_value_from_host_event(host, value)
+        {
+            return Ok(structured);
+        }
+    }
+    bail!(
+        "{} supervised output contained no structured JSON result",
+        host.as_str()
+    )
+}
+
+fn structured_value_from_host_event(host: AgentHostId, value: Value) -> Result<Value> {
+    if let Some(structured) = value.get("structured_output") {
+        return Ok(structured.clone());
+    }
+    if let Some(result) = value.get("result") {
+        if let Some(text) = result.as_str() {
+            return parse_json_text(text);
+        }
+        if result.is_object() || result.is_array() {
+            return Ok(result.clone());
+        }
+    }
+    if value.get("answers").is_some()
+        || value.get("purpose").is_some()
+        || value.get("boundaries").is_some()
+    {
+        return Ok(value);
+    }
+    bail!(
+        "{} host event is not a structured UL result",
+        host.as_str()
+    )
+}
+
+fn parse_json_text(text: &str) -> Result<Value> {
+    let text = text.trim();
+    if let Ok(value) = serde_json::from_str(text) {
+        return Ok(value);
+    }
+    let text = text
+        .strip_prefix("```json")
+        .or_else(|| text.strip_prefix("```"))
+        .and_then(|value| value.strip_suffix("```"))
+        .map(str::trim)
+        .context("structured host result is not JSON")?;
+    serde_json::from_str(text).context("decode structured host result")
 }
 
 include!("launch_support.rs");
