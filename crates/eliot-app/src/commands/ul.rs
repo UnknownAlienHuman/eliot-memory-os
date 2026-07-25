@@ -35,6 +35,37 @@ pub enum UlCommand {
         #[arg(long)]
         project: ProjectId,
     },
+    InjectionPolicy {
+        #[command(subcommand)]
+        command: UlInjectionPolicyCommand,
+    },
+}
+
+#[derive(Debug, clap::Subcommand)]
+pub enum UlInjectionPolicyCommand {
+    Set {
+        #[arg(long)]
+        project: ProjectId,
+        #[arg(long = "task-class")]
+        task_class: String,
+        #[arg(long)]
+        mode: UlInjectionPolicyMode,
+    },
+}
+
+#[derive(Clone, Copy, Debug, clap::ValueEnum)]
+pub enum UlInjectionPolicyMode {
+    Payload,
+    HandlesOnly,
+}
+
+impl From<UlInjectionPolicyMode> for UlInjectionMode {
+    fn from(value: UlInjectionPolicyMode) -> Self {
+        match value {
+            UlInjectionPolicyMode::Payload => Self::Payload,
+            UlInjectionPolicyMode::HandlesOnly => Self::HandlesOnly,
+        }
+    }
 }
 
 pub async fn run_ul_mine_git(
@@ -256,6 +287,99 @@ pub async fn run_ul_dirty_report(config_path: &Path, project_id: ProjectId) -> R
     .await
     .context("read the derived UL dirty report from the ready Governor daemon")?;
     write_json(&result)
+}
+
+pub async fn run_ul_injection_policy_set(
+    config_path: &Path,
+    project_id: ProjectId,
+    task_class_key: &str,
+    mode: UlInjectionPolicyMode,
+) -> Result<()> {
+    let instance = ul_daemon_instance(config_path)?;
+    let result = named_pipe_ipc::host_governor_request(
+        &instance,
+        "ul/injection-policy-set",
+        serde_json::json!({
+            "project_id": project_id,
+            "task_class_key": task_class_key,
+            "mode": UlInjectionMode::from(mode),
+        }),
+    )
+    .await
+    .context("route the operator UL injection policy action through the daemon-owned store")?;
+    write_json(&result)
+}
+
+pub(crate) async fn run_ul_injection_policy_set_from_daemon(
+    runtime_root: &Path,
+    store: &CanonicalStore,
+    params: serde_json::Value,
+) -> Result<serde_json::Value> {
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Input {
+        project_id: ProjectId,
+        task_class_key: String,
+        mode: UlInjectionMode,
+    }
+
+    let input: Input =
+        serde_json::from_value(params).context("decode UL injection policy operator action")?;
+    if input.task_class_key.trim().is_empty() {
+        bail!("--task-class must be non-empty");
+    }
+    store.migrate_schema().await?;
+    let previous = store
+        .load_ul_task_class_policy(input.project_id, &input.task_class_key)
+        .await?;
+    let policy = UlTaskClassPolicy {
+        project_id: input.project_id,
+        task_class_key: input.task_class_key.clone(),
+        injection_mode: input.mode,
+        treatment_tasks: previous.as_ref().map_or(0, |row| row.treatment_tasks),
+        control_tasks: previous.as_ref().map_or(0, |row| row.control_tasks),
+        control_median_exploration_tokens: previous
+            .as_ref()
+            .map_or(0, |row| row.control_median_exploration_tokens),
+        treatment_median_net_delta: previous
+            .as_ref()
+            .map_or(0, |row| row.treatment_median_net_delta),
+        reason: match input.mode {
+            UlInjectionMode::Payload => "operator_payload_reenable",
+            UlInjectionMode::HandlesOnly => "operator_handles_only",
+        }
+        .to_owned(),
+        evidence_task_ids: previous
+            .as_ref()
+            .map_or_else(Vec::new, |row| row.evidence_task_ids.clone()),
+    };
+    let persisted = store.upsert_ul_task_class_policy(&policy).await?;
+    let receipt_id = format!("UL-INJECTION-POLICY-ADMIN-{}", WriteId::new_v7());
+    let receipt = serde_json::json!({
+        "schema_version": "eliot-ul-injection-policy-admin-receipt-v1",
+        "receipt_id": receipt_id,
+        "authority": "local_operator_cli",
+        "project_id": persisted.project_id,
+        "task_class_key": persisted.task_class_key,
+        "previous_mode": previous.as_ref().map(|row| row.injection_mode),
+        "mode": persisted.injection_mode,
+        "reason": persisted.reason,
+        "recorded_at": time::OffsetDateTime::now_utc(),
+    });
+    let receipt_path = runtime_root
+        .join("reports")
+        .join("ul-token-policy")
+        .join("admin-receipts")
+        .join(format!("{receipt_id}.json"));
+    if let Some(parent) = receipt_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    atomic_write_bytes(&receipt_path, &serde_json::to_vec_pretty(&receipt)?)?;
+    Ok(serde_json::json!({
+        "policy": persisted,
+        "administrative_receipt": receipt,
+        "receipt_path": receipt_path,
+    }))
 }
 
 pub(crate) async fn run_ul_maintain_from_daemon(

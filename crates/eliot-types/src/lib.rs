@@ -74,9 +74,9 @@ pub use cognition::{
     OperatorCommandReceipt, OperatorControlRequest, OperatorFieldView, OperatorProjectionFilter,
     OperatorProjectionKind, OperatorProjectionPage, OperatorQueryOperation, OperatorQueryRequest,
     OperatorRecordView, OperatorRelationshipView, OperatorResultMode, OperatorSnapshot,
-    PacketQualityReport, PacketQualityResult, PlanningDecisionRecord, ResponsibilityContour,
-    TaskCognitionView, TraceTimelineView, UnderstandingOutcome, UnderstandingOutcomeRecord,
-    operator_contract_hash,
+    PacketQualityReport, PacketQualityResult, PlanningDecisionRecord, PredictionConfidence,
+    ResponsibilityContour, TaskCognitionView, TraceTimelineView, UnderstandingOutcome,
+    UnderstandingOutcomeRecord, WaivedInvariant, operator_contract_hash,
 };
 pub use cognitive_run::{
     COGNITIVE_RUN_EXACT_CALLS, COGNITIVE_RUN_RAW_VERIFIER_CALLS, COGNITIVE_RUN_SCHEMA_VERSION,
@@ -346,14 +346,15 @@ pub use ul::injection::{
 };
 pub use ul::measurement::{
     UL_FIELD_VALIDATION_BASELINE_COMMIT, UL_FIELD_VALIDATION_SCHEMA_VERSION, UlArtifactInventory,
-    UlFeatureReadiness, UlFieldEvidenceSummary, UlFieldTaskAnnotation, UlFieldValidationManifest,
-    UlGraphInventory, UlHostSurfaceIncident, UlLedgerDelta, UlPredictionInventory,
-    UlProseFailureSignal, UlReadinessInventory, UlReadinessSnapshot, UlReadinessState,
-    UlSecondRepositoryValidation, UlTask08Readiness, UlTaskLedger, UlUseReport,
+    UlExperimentArm, UlFeatureReadiness, UlFieldEvidenceSummary, UlFieldTaskAnnotation,
+    UlFieldValidationManifest, UlGraphInventory, UlHostSurfaceIncident, UlInjectionMode,
+    UlLedgerDelta, UlPredictionInventory, UlProseFailureSignal, UlReadinessInventory,
+    UlReadinessSnapshot, UlReadinessState, UlSecondRepositoryValidation, UlTask08Readiness,
+    UlTaskClass, UlTaskClassPolicy, UlTaskExperimentAssignment, UlTaskLedger, UlUseReport,
 };
 pub use ul::normalize::{
-    command_pattern, error_signature, normalize_path, normalize_query_tokens, normalize_symbol,
-    path_matches_boundary,
+    command_pattern, error_signature, normalize_observed_path, normalize_path,
+    normalize_query_tokens, normalize_symbol, path_cue_tokens, path_matches_boundary,
 };
 pub use ul::onboarding::{
     ManifestPackage, OnboardingCheckpoint, OnboardingJob, OnboardingReport, OnboardingStage,

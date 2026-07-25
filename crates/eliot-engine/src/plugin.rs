@@ -117,7 +117,7 @@ impl EliotHookService {
             ));
         }
         match event.kind {
-            HookEventKind::PreToolUse => Ok(evaluate_pre_tool_use(event)),
+            HookEventKind::PreToolUse => self.evaluate_pre_tool_use(event),
             HookEventKind::PermissionRequest => Ok(evaluate_permission_request(event)),
             HookEventKind::PreCompact => self.evaluate_pre_compact(),
             HookEventKind::Stop => self.evaluate_stop(event),
@@ -149,6 +149,22 @@ impl EliotHookService {
                 "ELIOT hook spool is within the F0 compaction bound.",
             ))
         }
+    }
+
+    fn evaluate_pre_tool_use(
+        &self,
+        event: &EliotHookEvent,
+    ) -> Result<(bool, HookProcessingStatus, Vec<HookDecisionReason>), EngineError> {
+        if packet_gate_blocks_mutation(&self.runtime_root, event)?
+            && is_packet_gate_mutation_tool(event.tool_name.as_deref())
+        {
+            return Ok(block_decision(
+                HookProcessingStatus::Blocked,
+                "ul_packet_gate_requires_refresh",
+                "ELIOT blocks mutation until a fresh packet satisfies the subsystem probe and invariant gate.",
+            ));
+        }
+        Ok(evaluate_pre_tool_use(event))
     }
 
     fn evaluate_stop(
@@ -394,6 +410,40 @@ fn is_unleased_write_tool(tool_name: Option<&str>) -> bool {
     ]
     .iter()
     .any(|needle| lowered.contains(needle))
+}
+
+fn is_packet_gate_mutation_tool(tool_name: Option<&str>) -> bool {
+    let Some(tool_name) = tool_name else {
+        return false;
+    };
+    matches!(
+        tool_name.to_ascii_lowercase().as_str(),
+        "bash" | "edit" | "write" | "notebookedit" | "notebook_edit"
+    )
+}
+
+fn packet_gate_blocks_mutation(root: &Path, event: &EliotHookEvent) -> Result<bool, EngineError> {
+    let Some(session_id) = event.session_id.as_deref() else {
+        return Ok(false);
+    };
+    if !session_id
+        .chars()
+        .all(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '_'))
+    {
+        return Ok(false);
+    }
+    let path = root
+        .join("reports")
+        .join("ul-gates")
+        .join(format!("{session_id}.json"));
+    if !path.is_file() {
+        return Ok(false);
+    }
+    let value: Value = serde_json::from_reader(std::fs::File::open(path)?)?;
+    Ok(matches!(
+        value.pointer("/gate/status").and_then(Value::as_str),
+        Some("require_probe" | "require_packet_refresh")
+    ))
 }
 
 fn sanitize_value(value: &Value, depth: usize) -> Value {

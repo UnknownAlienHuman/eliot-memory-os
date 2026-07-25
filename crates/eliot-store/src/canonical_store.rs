@@ -538,6 +538,7 @@ impl CanonicalStore {
             NamedSurqlOp::SchemaMigrateUlPyramid,
             NamedSurqlOp::SchemaMigrateUlMeasurement,
             NamedSurqlOp::SchemaMigrateUlDependencyActivation,
+            NamedSurqlOp::SchemaMigrateUlTokenPolicy,
         ] {
             value = self.migrate_schema_op(op).await?;
         }
@@ -686,6 +687,10 @@ impl CanonicalStore {
                 "token_cost": receipt.token_cost,
                 "source_fingerprint_parts": cue_string_parts(&receipt.source_fingerprint),
                 "outcome_parts": cue_string_parts(&receipt.outcome),
+                "policy_reason_parts": receipt
+                    .policy_reason
+                    .as_deref()
+                    .map(cue_string_parts),
             })
         } else {
             Value::Null
@@ -1484,11 +1489,12 @@ impl CanonicalStore {
         task_id: TaskId,
         delta: &eliot_types::UlLedgerDelta,
     ) -> Result<eliot_types::UlTaskLedger, StoreError> {
+        let ledger_key = derived_row_key(&format!("ul-task-ledger|{project_id}|{task_id}"));
         let value = self
             .execute_value(
                 NamedSurqlOp::UpsertUlTaskLedger,
                 json!({
-                    "ledger_key": format!("{project_id}:{task_id}"),
+                    "ledger_key": ledger_key,
                     "project_id": project_id,
                     "task_id": task_id,
                     "delta": delta,
@@ -1496,6 +1502,102 @@ impl CanonicalStore {
             )
             .await?;
         decode_value(NamedSurqlOp::UpsertUlTaskLedger, value)
+    }
+
+    pub async fn assign_ul_experiment_arm(
+        &self,
+        project_id: ProjectId,
+        task_id: TaskId,
+        task_class: &eliot_types::UlTaskClass,
+        config_hash: &str,
+    ) -> Result<eliot_types::UlTaskExperimentAssignment, StoreError> {
+        let task_class_key = task_class.key();
+        let assignment_key = derived_row_key(&format!("ul-experiment|{project_id}|{task_id}"));
+        let counter_key = derived_row_key(&format!("ul-ab-counter|{project_id}|{task_class_key}"));
+        let value = self
+            .execute_value(
+                NamedSurqlOp::AssignUlExperimentArm,
+                json!({
+                    "assignment_key": assignment_key,
+                    "counter_key": counter_key,
+                    "project_id": project_id,
+                    "task_id": task_id,
+                    "task_class": task_class,
+                    "task_class_key": task_class_key,
+                    "config_hash": config_hash,
+                }),
+            )
+            .await?;
+        decode_value(NamedSurqlOp::AssignUlExperimentArm, value)
+    }
+
+    pub async fn load_ul_experiment_assignment(
+        &self,
+        project_id: ProjectId,
+        task_id: TaskId,
+    ) -> Result<Option<eliot_types::UlTaskExperimentAssignment>, StoreError> {
+        let assignment_key = derived_row_key(&format!("ul-experiment|{project_id}|{task_id}"));
+        let value = self
+            .execute_value(
+                NamedSurqlOp::LoadUlExperimentAssignment,
+                json!({ "assignment_key": assignment_key }),
+            )
+            .await?;
+        decode_value(NamedSurqlOp::LoadUlExperimentAssignment, value)
+    }
+
+    pub async fn load_ul_task_class_ledgers(
+        &self,
+        project_id: ProjectId,
+        task_class_key: &str,
+    ) -> Result<Vec<eliot_types::UlTaskLedger>, StoreError> {
+        let value = self
+            .execute_value(
+                NamedSurqlOp::LoadUlTaskClassLedgers,
+                json!({
+                    "project_id": project_id,
+                    "task_class_key": task_class_key,
+                }),
+            )
+            .await?;
+        decode_value(NamedSurqlOp::LoadUlTaskClassLedgers, value)
+    }
+
+    pub async fn upsert_ul_task_class_policy(
+        &self,
+        policy: &eliot_types::UlTaskClassPolicy,
+    ) -> Result<eliot_types::UlTaskClassPolicy, StoreError> {
+        let policy_key = derived_row_key(&format!(
+            "ul-task-class-policy|{}|{}",
+            policy.project_id, policy.task_class_key
+        ));
+        let value = self
+            .execute_value(
+                NamedSurqlOp::UpsertUlTaskClassPolicy,
+                json!({
+                    "policy_key": policy_key,
+                    "policy": policy,
+                }),
+            )
+            .await?;
+        decode_value(NamedSurqlOp::UpsertUlTaskClassPolicy, value)
+    }
+
+    pub async fn load_ul_task_class_policy(
+        &self,
+        project_id: ProjectId,
+        task_class_key: &str,
+    ) -> Result<Option<eliot_types::UlTaskClassPolicy>, StoreError> {
+        let policy_key = derived_row_key(&format!(
+            "ul-task-class-policy|{project_id}|{task_class_key}"
+        ));
+        let value = self
+            .execute_value(
+                NamedSurqlOp::LoadUlTaskClassPolicy,
+                json!({ "policy_key": policy_key }),
+            )
+            .await?;
+        decode_value(NamedSurqlOp::LoadUlTaskClassPolicy, value)
     }
 
     pub async fn load_ul_metrics(
@@ -2406,4 +2508,8 @@ where
 {
     serde_json::from_value(value)
         .map_err(|error| StoreError::Decode(format!("{} output decode failed: {error}", op.name())))
+}
+
+fn derived_row_key(value: &str) -> String {
+    blake3::hash(value.as_bytes()).to_hex().to_string()
 }

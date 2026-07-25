@@ -238,6 +238,15 @@ impl Harness {
             .block_on(self.store.load_ul_metrics(project_id))?)
     }
 
+    pub fn upsert_ul_task_class_policy(
+        &self,
+        policy: &eliot_types::UlTaskClassPolicy,
+    ) -> TestResult {
+        self.store_runtime
+            .block_on(self.store.upsert_ul_task_class_policy(policy))?;
+        Ok(())
+    }
+
     pub fn tool_schema(&mut self, request_id: u64, tool_name: &str) -> TestResult<Value> {
         let response = self.client.request(
             &json!({

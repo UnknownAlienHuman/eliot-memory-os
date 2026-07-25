@@ -57,6 +57,8 @@ pub struct InjectionReceipt {
     pub token_cost: u32,
     pub source_fingerprint: String,
     pub outcome: String,
+    #[serde(default)]
+    pub policy_reason: Option<String>,
 }
 
 #[derive(Clone, Debug, JsonSchema, Serialize, Deserialize)]

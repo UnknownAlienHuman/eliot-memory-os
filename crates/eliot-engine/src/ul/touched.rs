@@ -1,6 +1,6 @@
 use eliot_types::{
     CueKind, ObservedCue, ProjectId, SessionId, TaskId, command_pattern, error_signature,
-    normalize_path, normalize_symbol,
+    normalize_observed_path, normalize_symbol, path_cue_tokens,
 };
 use serde_json::Value;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -24,6 +24,7 @@ struct SessionTouchedSet {
     last_packet_handles: HashSet<String>,
     last_task_id: Option<TaskId>,
     boot_sent: bool,
+    packet_gate: Option<Value>,
 }
 
 #[derive(Default)]
@@ -205,6 +206,29 @@ impl TouchedSetRegistry {
         }
     }
 
+    pub fn set_packet_gate(
+        &self,
+        project_id: ProjectId,
+        session_id: SessionId,
+        gate: Option<Value>,
+    ) {
+        if let Ok(mut sessions) = self.sessions.lock() {
+            sessions
+                .entry(key(project_id, session_id))
+                .or_default()
+                .packet_gate = gate;
+        }
+    }
+
+    #[must_use]
+    pub fn packet_gate(&self, project_id: ProjectId, session_id: SessionId) -> Option<Value> {
+        self.sessions.lock().ok().and_then(|sessions| {
+            sessions
+                .get(&key(project_id, session_id))
+                .and_then(|session| session.packet_gate.clone())
+        })
+    }
+
     fn observe(
         &self,
         project_id: ProjectId,
@@ -290,7 +314,7 @@ fn extract_cues(
         Value::String(raw) if raw.len() <= MAX_TOUCHED_STRING_BYTES => {
             let field = key.unwrap_or_default();
             if is_path_key(field) && (field != "resource_ref" || looks_like_path(raw)) {
-                push_cue(observed, CueKind::FilePath, normalize_path(raw, None));
+                push_cue(observed, CueKind::FilePath, normalize_observed_path(raw));
             } else if is_symbol_key(field) {
                 push_cue(observed, CueKind::Symbol, normalize_symbol(raw));
             } else if is_command_key(field) {
@@ -308,7 +332,9 @@ fn extract_cues(
                 push_cue(observed, CueKind::ErrorSignature, signature);
             }
             if has_source_extension(raw) {
-                push_cue(observed, CueKind::FilePath, normalize_path(raw, None));
+                for path in path_cue_tokens(raw) {
+                    push_cue(observed, CueKind::FilePath, path);
+                }
             }
         }
         _ => {}

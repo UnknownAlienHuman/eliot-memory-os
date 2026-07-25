@@ -5,13 +5,13 @@ use eliot_types::{
     ActivationTrace, CapsuleFreshness, ConceptNode, CueKind, CueRecordSource, InjectionReceipt,
     OBSERVABILITY_SCHEMA_VERSION, ObservabilityKind, ObservabilityWriteEnvelope,
     ObservabilityWriteStatus, ObservedCue, PendingInjectionItem, ProjectCharter, ProjectId,
-    SessionId, SubsystemCapsule, SystemMap, TaskId, UlFiredBlock, UlFiredItem, WriteId,
-    ul_token_estimate,
+    SessionId, SubsystemCapsule, SystemMap, TaskId, UlFiredBlock, UlFiredItem, UlInjectionMode,
+    WriteId, ul_token_estimate,
 };
 use serde_json::{Value, json};
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use uuid::Uuid;
 
@@ -186,14 +186,14 @@ impl InjectionPlanner {
         task_id: Option<TaskId>,
         session_id: SessionId,
         response: &mut Value,
-        memory_free_control: bool,
+        effective_mode: Option<UlInjectionMode>,
     ) -> Result<Vec<InjectionReceipt>, EngineError> {
-        if memory_free_control {
+        let Some(effective_mode) = effective_mode else {
             return Ok(Vec::new());
-        }
+        };
         self.hydrate_delivery_state(project_id, session_id).await?;
         let mut committed_receipts = self
-            .attach_boot(project_id, task_id, session_id, response)
+            .attach_boot(project_id, task_id, session_id, response, effective_mode)
             .await?;
 
         let mut batch = self
@@ -219,7 +219,11 @@ impl InjectionPlanner {
                 continue;
             }
             let line = truncate_utf8(item.preview.trim(), MAX_LINE_BYTES);
-            let mut payload = item.payload.clone();
+            let mut payload = if effective_mode == UlInjectionMode::HandlesOnly {
+                None
+            } else {
+                item.payload.clone()
+            };
             let payload_units = payload
                 .as_ref()
                 .map(serde_json::to_string)
@@ -266,6 +270,8 @@ impl InjectionPlanner {
                 token_cost,
                 source_fingerprint: item.source_fingerprint.clone(),
                 outcome: "delivered".to_owned(),
+                policy_reason: (effective_mode == UlInjectionMode::HandlesOnly)
+                    .then(|| "task_class_handles_only".to_owned()),
             };
             if self
                 .commit_receipt(project_id, task_id, &receipt)
@@ -358,6 +364,7 @@ impl InjectionPlanner {
         task_id: Option<TaskId>,
         session_id: SessionId,
         response: &mut Value,
+        effective_mode: UlInjectionMode,
     ) -> Result<Vec<InjectionReceipt>, EngineError> {
         if self.touched.boot_sent(project_id, session_id) {
             return Ok(Vec::new());
@@ -380,15 +387,31 @@ impl InjectionPlanner {
         if let (Some(charter), Some(map)) = (charter, map) {
             return self
                 .attach_ready_boot(
-                    project_id, task_id, session_id, response, revision, charter, map,
+                    project_id,
+                    task_id,
+                    session_id,
+                    response,
+                    revision,
+                    charter,
+                    map,
+                    effective_mode,
                 )
                 .await;
         }
-        let boot = json!({
-            "status": "not_onboarded",
-            "revision": revision,
-            "message": "project understanding artifacts are not built yet; cue firing is active"
-        });
+        let boot = if effective_mode == UlInjectionMode::HandlesOnly {
+            json!({
+                "status": "not_onboarded",
+                "revision": revision,
+                "ref": "ul_boot:not_onboarded",
+                "handle_only": true
+            })
+        } else {
+            json!({
+                "status": "not_onboarded",
+                "revision": revision,
+                "message": "project understanding artifacts are not built yet; cue firing is active"
+            })
+        };
         let serialized = serde_json::to_vec(&boot)?;
         let source_fingerprint = blake3::hash(&serialized).to_hex().to_string();
         let receipt = InjectionReceipt {
@@ -404,11 +427,18 @@ impl InjectionPlanner {
             task_id,
             surface: "mcp_auto_boot".to_owned(),
             item_ref: "ul_boot:not_onboarded".to_owned(),
-            render_form: "payload".to_owned(),
+            render_form: if effective_mode == UlInjectionMode::HandlesOnly {
+                "handle"
+            } else {
+                "payload"
+            }
+            .to_owned(),
             fired_cues: Vec::new(),
             token_cost: ul_token_estimate(&String::from_utf8_lossy(&serialized)),
             source_fingerprint,
             outcome: "delivered".to_owned(),
+            policy_reason: (effective_mode == UlInjectionMode::HandlesOnly)
+                .then(|| "task_class_handles_only".to_owned()),
         };
         self.commit_receipt(project_id, task_id, &receipt).await?;
         response_object_mut(response)?.insert("ul_boot".to_owned(), boot);
@@ -426,6 +456,7 @@ impl InjectionPlanner {
         revision: Value,
         charter: ProjectCharter,
         map: SystemMap,
+        effective_mode: UlInjectionMode,
     ) -> Result<Vec<InjectionReceipt>, EngineError> {
         let concepts = self
             .store
@@ -441,21 +472,7 @@ impl InjectionPlanner {
             .into_iter()
             .map(|record| record.receipt_body)
             .collect::<Vec<_>>();
-        let fresh = capsules
-            .iter()
-            .filter(|capsule| {
-                capsule_freshness(capsule, &self.project_root) == CapsuleFreshness::Fresh
-            })
-            .count();
-        let unassigned = concepts
-            .iter()
-            .filter(|concept| concept.name == "_unassigned")
-            .map(|concept| concept.boundary_paths.len())
-            .sum::<usize>();
-        let coverage = format!(
-            "{} subsystems; {fresh} fresh capsules; {unassigned} unassigned source files",
-            concepts.len()
-        );
+        let coverage = boot_coverage(&concepts, &capsules, &self.project_root);
         let charter_ref = format!("charter:{}", charter.charter_id);
         let map_ref = format!("system-map:{}", map.map_id);
         let dirty = self.store.load_ul_dirty_artifacts(project_id, 512).await?;
@@ -475,7 +492,7 @@ impl InjectionPlanner {
         );
         let content_units =
             ul_token_estimate(&charter_body).saturating_add(ul_token_estimate(&map_body));
-        let over_budget = content_units > 1_200;
+        let over_budget = content_units > 1_200 || effective_mode == UlInjectionMode::HandlesOnly;
         let charter_delivery = if over_budget {
             json!({"ref": charter_ref})
         } else {
@@ -511,10 +528,18 @@ impl InjectionPlanner {
             &charter_ref,
             &charter_delivery,
             render_form,
+            effective_mode,
         )?;
         self.commit_receipt(project_id, task_id, &charter_receipt)
             .await?;
-        let map_receipt = boot_receipt(session_id, task_id, &map_ref, &map_delivery, render_form)?;
+        let map_receipt = boot_receipt(
+            session_id,
+            task_id,
+            &map_ref,
+            &map_delivery,
+            render_form,
+            effective_mode,
+        )?;
         self.commit_receipt(project_id, task_id, &map_receipt)
             .await?;
         response_object_mut(response)?.insert("ul_boot".to_owned(), boot);
@@ -572,12 +597,33 @@ fn latest_artifact<T>(records: Vec<eliot_store::CanonicalRecord<T>>) -> Option<T
         .map(|record| record.receipt_body)
 }
 
+fn boot_coverage(
+    concepts: &[ConceptNode],
+    capsules: &[SubsystemCapsule],
+    project_root: &Path,
+) -> String {
+    let fresh = capsules
+        .iter()
+        .filter(|capsule| capsule_freshness(capsule, project_root) == CapsuleFreshness::Fresh)
+        .count();
+    let unassigned = concepts
+        .iter()
+        .filter(|concept| concept.name == "_unassigned")
+        .map(|concept| concept.boundary_paths.len())
+        .sum::<usize>();
+    format!(
+        "{} subsystems; {fresh} fresh capsules; {unassigned} unassigned source files",
+        concepts.len()
+    )
+}
+
 fn boot_receipt(
     session_id: SessionId,
     task_id: Option<TaskId>,
     item_ref: &str,
     delivery: &Value,
     render_form: &str,
+    effective_mode: UlInjectionMode,
 ) -> Result<InjectionReceipt, EngineError> {
     let rendered_bytes = serde_json::to_vec(delivery)?;
     let source_fingerprint = blake3::hash(&rendered_bytes).to_hex().to_string();
@@ -599,6 +645,8 @@ fn boot_receipt(
         token_cost: ul_token_estimate(&String::from_utf8_lossy(&rendered_bytes)),
         source_fingerprint,
         outcome: "delivered".to_owned(),
+        policy_reason: (effective_mode == UlInjectionMode::HandlesOnly)
+            .then(|| "task_class_handles_only".to_owned()),
     })
 }
 

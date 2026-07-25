@@ -15,5 +15,5 @@ SELECT VALUE {
   first_mutation_seen: first_mutation_seen
 }
 FROM ul_task_ledger
-WHERE project_id = $project_id
+WHERE project_id = $project_id AND task_class_key = $task_class_key
 ORDER BY task_id ASC;

@@ -11,7 +11,7 @@ async fn dispatch_compile_packet_l3(
     arguments: Value,
 ) -> Result<Value> {
     let input = input_validation::decode_compile_packet_input(arguments)?;
-    let memory_free_control =
+    let requested_memory_free_control =
         input.memory_mode == Some(MemoryExposureMode::MemoryFreeControl);
     if input
         .material_frame
@@ -33,7 +33,8 @@ async fn dispatch_compile_packet_l3(
         .into());
     }
     let request = input.request;
-    let packet_task = if let Ok(packet_task_id) = TaskId::from_str(&request.task_id) {
+    let parsed_task_id = TaskId::from_str(&request.task_id).ok();
+    let packet_task = if let Some(packet_task_id) = parsed_task_id {
         state.store.task_contract_by_id(packet_task_id).await?
     } else {
         None
@@ -66,6 +67,51 @@ async fn dispatch_compile_packet_l3(
             Box::pin(compiler.compile_with_codecortex(&request, &codecortex_reports)).await?
         }
     };
+    let touched_paths = packet_scope_paths(&packet, input.material_frame.as_ref(), &request);
+    let resolved_concept_ids = if packet_task.is_some() {
+        state
+            .ul
+            .resolve_concept_ids(request.project_id, &touched_paths)
+            .await?
+    } else {
+        Vec::new()
+    };
+    let assignment = if let (Some(task_id), Some(task)) = (parsed_task_id, packet_task.as_ref()) {
+        let task_class = eliot_engine::UlTokenPolicyService::classify(
+            Some(task),
+            input.material_frame.as_ref(),
+            &resolved_concept_ids,
+            &touched_paths,
+        );
+        let config_hash = blake3::hash(b"ul-token-policy-v1").to_hex();
+        Some(
+            state
+                .ul
+                .token_policy
+                .assignment(
+                    request.project_id,
+                    task_id,
+                    &task_class,
+                    config_hash.as_ref(),
+                )
+                .await?,
+        )
+    } else {
+        None
+    };
+    let experiment_control = assignment
+        .as_ref()
+        .is_some_and(|assignment| assignment.arm == eliot_types::UlExperimentArm::Control);
+    let memory_free_control = requested_memory_free_control || experiment_control;
+    let effective_memory_mode = if memory_free_control {
+        MemoryExposureMode::MemoryFreeControl
+    } else {
+        input.memory_mode.unwrap_or_default()
+    };
+    if memory_free_control {
+        enforce_memory_free_control(&mut packet, input.material_frame.as_ref());
+        eliot_engine::PacketQualityService::finalize(&mut packet, input.material_frame.as_ref())?;
+    }
     let task_frame = TaskMeaningFrame {
         task_id: request.task_id.clone(),
         user_goal: request.goal.clone(),
@@ -121,10 +167,10 @@ async fn dispatch_compile_packet_l3(
         semantic_records::<ExperienceCase>(state, request.project_id, "experience_case").await?,
     );
     let exposure_policy = MemoryExposurePolicy {
-        mode: input.memory_mode.unwrap_or_default(),
+        mode: effective_memory_mode,
         packet_cache_partition: format!(
             "{:?}:{}",
-            input.memory_mode.unwrap_or_default(),
+            effective_memory_mode,
             request.task_id
         )
         .to_ascii_lowercase(),
@@ -150,7 +196,6 @@ async fn dispatch_compile_packet_l3(
         packet.memory_applicability.inclusion_reasons.sort();
         packet.memory_applicability.inclusion_reasons.dedup();
     }
-    let touched_paths = packet_scope_paths(&packet, input.material_frame.as_ref(), &request);
     let fallback_text = format!(
         "{} {} {}",
         request.goal,
@@ -180,7 +225,11 @@ async fn dispatch_compile_packet_l3(
             .join("latest.json"),
         &packet,
     )?;
-    let mut frame_stub = material_frame_stub(&packet, packet_task.as_ref());
+    let required_invariant_refs = pyramid
+        .as_ref()
+        .map_or_else(Vec::new, |pyramid| pyramid.required_invariant_refs.clone());
+    let mut frame_stub =
+        material_frame_stub(&packet, packet_task.as_ref(), &required_invariant_refs);
     if frame_stub.causal_bridge.is_empty()
         && let Some(pyramid) = &pyramid
     {
@@ -200,9 +249,18 @@ async fn dispatch_compile_packet_l3(
             "danger": pyramid.meta.danger_paths,
             "recommended_probe": pyramid.recommended_probe,
         });
-        let material_risk = input.material_frame.as_ref().is_some_and(|frame| {
-            frame.active_plan.len() > 1 || touched_paths.len() > 1
-        });
+        let material_risk = input.material_frame.is_some();
+        if let Some(frame) = input.material_frame.as_ref() {
+            let missing_invariant_refs =
+                missing_invariant_refs(&pyramid.required_invariant_refs, frame);
+            if !missing_invariant_refs.is_empty() {
+                value["ul_gate"] = json!({
+                    "status": "require_packet_refresh",
+                    "reason": "missing_capsule_invariants",
+                    "missing_invariant_refs": missing_invariant_refs,
+                });
+            }
+        }
         if material_risk
             && pyramid.coverage == eliot_types::CoverageClass::Blind
             && value.get("ul_gate").is_none()
@@ -259,7 +317,73 @@ async fn dispatch_compile_packet_l3(
     if let Some(task) = packet_task.as_ref() {
         enrich_packet_with_task(state, &mut value, task).await?;
     }
+    if let Some(assignment) = assignment {
+        let effective_injection_mode = if assignment.arm == eliot_types::UlExperimentArm::Control {
+            None
+        } else {
+            state.ul.token_policy.effective_mode(&assignment).await?
+        };
+        value["ul_experiment"] = json!({
+            "project_id": assignment.project_id,
+            "task_id": assignment.task_id,
+            "task_class": assignment.task_class,
+            "ordinal": assignment.ordinal,
+            "arm": assignment.arm,
+            "assignment_injection_mode": assignment.injection_mode,
+            "effective_injection_mode": effective_injection_mode,
+            "effective_memory_mode": if memory_free_control {
+                "memory_free_control"
+            } else {
+                "configured"
+            },
+            "config_hash": assignment.config_hash,
+        });
+    }
+    state.ul.record_packet_gate(
+        request.project_id,
+        context.session_id,
+        parsed_task_id,
+        value.get("ul_gate"),
+    )?;
     Ok(value)
+}
+
+fn enforce_memory_free_control(
+    packet: &mut ContextPacketL3,
+    frame: Option<&MaterialPacketFrame>,
+) {
+    packet.current_truth.clear();
+    packet.relevant_verified_claims.clear();
+    packet.relevant_supported_claims.clear();
+    packet.weak_claims_warning.clear();
+    packet.negative_memory.clear();
+    packet.recent_failures.clear();
+    packet.known_decisions.clear();
+    packet.open_questions.clear();
+    packet.exact_handles.clear();
+    packet.source_receipts.clear();
+    packet.epistemic_state = eliot_types::EpistemicPacketState::default();
+    packet.memory_decisions.clear();
+    packet.experience_priors.clear();
+    packet.memory_need_decision = None;
+    packet.memory_applicability.decisions.clear();
+    packet.memory_applicability.inclusion_reasons.clear();
+    packet.memory_applicability.suppression_reasons =
+        vec!["memory_free_control".to_owned()];
+    packet.memory_applicability.revalidation_reasons.clear();
+    packet.historical_memory.clear();
+    packet.memory_lifecycle.suppressed_refs.clear();
+    packet.memory_lifecycle.demoted_refs.clear();
+    packet.memory_lifecycle.superseded_refs.clear();
+    packet.memory_lifecycle.archived_refs.clear();
+    packet.memory_lifecycle.minority_preserved_refs.clear();
+    packet.memory_lifecycle.lifecycle_warnings =
+        vec!["memory_free_control".to_owned()];
+    packet.decision_locality_suffix.exact_load_bearing_atoms =
+        frame.map_or_else(Vec::new, |frame| frame.exact_load_bearing_atoms.clone());
+    packet.decision_locality_suffix.open_unknowns.clear();
+    packet.truncation.truncated = false;
+    packet.truncation.returned = 0;
 }
 
 fn packet_scope_paths(
@@ -300,37 +424,15 @@ fn packet_scope_paths(
 }
 
 fn insert_path_tokens(paths: &mut BTreeSet<String>, value: &str) {
-    for token in value.split_whitespace() {
-        let token = token
-            .trim_matches(|character: char| {
-                matches!(
-                    character,
-                    '`' | '"' | '\'' | ',' | ';' | '(' | ')' | '[' | ']' | '{' | '}'
-                )
-            })
-            .strip_prefix("file:")
-            .unwrap_or(token);
-        let token = token
-            .split('#')
-            .next()
-            .unwrap_or(token)
-            .replace('\\', "/")
-            .trim_start_matches("./")
-            .to_owned();
-        if token.contains('/')
-            && token
-                .rsplit('/')
-                .next()
-                .is_some_and(|leaf| leaf.contains('.') || leaf == "src")
-        {
-            paths.insert(token);
-        }
+    for token in eliot_types::path_cue_tokens(value) {
+        paths.insert(token);
     }
 }
 
 fn material_frame_stub(
     packet: &ContextPacketL3,
     task: Option<&TaskContract>,
+    required_invariant_refs: &[String],
 ) -> MaterialPacketFrame {
     let next_action = if packet
         .decision_locality_suffix
@@ -404,7 +506,29 @@ fn material_frame_stub(
             .packet_quality
             .as_ref()
             .map_or(0, |quality| quality.instruction_hotset_size),
+        invariant_refs: required_invariant_refs.to_vec(),
+        waived_invariants: Vec::new(),
+        prediction_confidence: None,
     }
+}
+
+fn missing_invariant_refs(
+    required_invariant_refs: &[String],
+    frame: &MaterialPacketFrame,
+) -> Vec<String> {
+    let mut covered = frame.invariant_refs.iter().cloned().collect::<BTreeSet<_>>();
+    covered.extend(frame.waived_invariants.iter().filter_map(|waiver| {
+        let reason = waiver.reason.trim();
+        (!reason.is_empty() && reason.len() <= 240).then(|| waiver.invariant_ref.clone())
+    }));
+    let mut missing = required_invariant_refs
+        .iter()
+        .filter(|invariant| !covered.contains(*invariant))
+        .cloned()
+        .collect::<Vec<_>>();
+    missing.sort();
+    missing.dedup();
+    missing
 }
 
 async fn dispatch_understanding_outcome_record(

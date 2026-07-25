@@ -1,13 +1,13 @@
 use eliot_engine::{
     CueIndexService, InjectionPlanner, MetacognitionService, PredictionService, TouchedSetRegistry,
-    UlDependencyService, UlLedgerService, WriterHandle, capsule_freshness,
+    UlDependencyService, UlLedgerService, UlTokenPolicyService, WriterHandle, capsule_freshness,
     render_capsule_with_dirty,
 };
 use eliot_store::{CanonicalRecord, CanonicalStore};
 use eliot_types::{
     CapsuleFreshness, CausalBridgeHop, ConceptNode, CoverageClass, HotspotScore, ModuleCard,
-    ProjectId, SessionId, SubsystemCapsule, UlMetacognitionView, path_matches_boundary,
-    ul_token_estimate,
+    ProjectId, SessionId, SubsystemCapsule, TaskId, UlExperimentArm, UlInjectionMode,
+    UlMetacognitionView, UlTaskExperimentAssignment, path_matches_boundary, ul_token_estimate,
 };
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet, HashSet};
@@ -24,6 +24,7 @@ pub(super) struct PyramidPacketEnrichment {
     pub blind_target: Option<String>,
     pub recommended_probe: Option<String>,
     pub subsystem_concept_id: Option<String>,
+    pub required_invariant_refs: Vec<String>,
 }
 
 pub(super) struct UlRuntime {
@@ -32,9 +33,11 @@ pub(super) struct UlRuntime {
     pub planner: Arc<InjectionPlanner>,
     pub dependency: Arc<UlDependencyService>,
     pub ledger: Arc<UlLedgerService>,
+    pub token_policy: Arc<UlTokenPolicyService>,
     pub prediction: Arc<PredictionService>,
     store: CanonicalStore,
     project_root: PathBuf,
+    runtime_root: PathBuf,
     dependency_ready: Mutex<HashSet<ProjectId>>,
 }
 
@@ -59,7 +62,14 @@ impl UlRuntime {
             ),
         );
         let dependency = Arc::new(UlDependencyService::new(store.clone()));
-        let ledger = Arc::new(UlLedgerService::new(store.clone()));
+        let ledger = Arc::new(UlLedgerService::with_runtime_root(
+            store.clone(),
+            runtime_root,
+        ));
+        let token_policy = Arc::new(UlTokenPolicyService::with_runtime_root(
+            store.clone(),
+            runtime_root,
+        ));
         let prediction = Arc::new(PredictionService::new(store.clone(), writer));
         Self {
             cue_index,
@@ -67,11 +77,92 @@ impl UlRuntime {
             planner,
             dependency,
             ledger,
+            token_policy,
             prediction,
             store,
             project_root,
+            runtime_root: runtime_root.to_path_buf(),
             dependency_ready: Mutex::new(HashSet::new()),
         }
+    }
+
+    pub async fn resolve_concept_ids(
+        &self,
+        project_id: ProjectId,
+        touched_paths: &[String],
+    ) -> anyhow::Result<Vec<String>> {
+        let mut concepts = self
+            .store
+            .load_ul_artifacts::<ConceptNode>(project_id, &["concept_node"], 128)
+            .await?
+            .into_iter()
+            .filter(|record| {
+                touched_paths.iter().any(|path| {
+                    record
+                        .receipt_body
+                        .boundary_paths
+                        .iter()
+                        .any(|boundary| path_matches_boundary(path, boundary))
+                })
+            })
+            .map(|record| record.receipt_body.concept_id)
+            .collect::<Vec<_>>();
+        concepts.sort();
+        concepts.dedup();
+        Ok(concepts)
+    }
+
+    pub async fn effective_injection_mode(
+        &self,
+        project_id: ProjectId,
+        task_id: Option<TaskId>,
+        explicit_control: bool,
+    ) -> anyhow::Result<(Option<UlInjectionMode>, Option<UlTaskExperimentAssignment>)> {
+        let assignment = if let Some(task_id) = task_id {
+            self.token_policy
+                .load_assignment(project_id, task_id)
+                .await?
+        } else {
+            None
+        };
+        let mode = if explicit_control {
+            None
+        } else if let Some(assignment) = assignment.as_ref() {
+            if assignment.arm == UlExperimentArm::Control {
+                None
+            } else {
+                self.token_policy.effective_mode(assignment).await?
+            }
+        } else {
+            Some(UlInjectionMode::Payload)
+        };
+        Ok((mode, assignment))
+    }
+
+    pub fn record_packet_gate(
+        &self,
+        project_id: ProjectId,
+        session_id: SessionId,
+        task_id: Option<TaskId>,
+        gate: Option<&Value>,
+    ) -> anyhow::Result<()> {
+        self.touched
+            .set_packet_gate(project_id, session_id, gate.cloned());
+        let directory = self.runtime_root.join("reports").join("ul-gates");
+        std::fs::create_dir_all(&directory)?;
+        let path = directory.join(format!("{session_id}.json"));
+        if let Some(gate) = gate {
+            let report = json!({
+                "project_id": project_id,
+                "session_id": session_id,
+                "task_id": task_id,
+                "gate": gate,
+            });
+            serde_json::to_writer_pretty(std::fs::File::create(path)?, &report)?;
+        } else if path.is_file() {
+            std::fs::remove_file(path)?;
+        }
+        Ok(())
     }
 
     pub async fn ensure_dependency_state(&self, project_id: ProjectId) -> anyhow::Result<()> {
@@ -220,6 +311,7 @@ impl UlRuntime {
         let mut concept_values = Vec::new();
         let mut capsule_values = Vec::new();
         let mut danger = BTreeSet::new();
+        let mut required_invariant_refs = BTreeSet::new();
         let mut units = 0_u32;
         for (_, _, concept) in &ranked {
             let concept_value = json!({
@@ -237,6 +329,9 @@ impl UlRuntime {
             };
             let freshness = capsule_freshness(capsule, &self.project_root);
             let dirty = dirty_capsules.get(&capsule.concept_id);
+            if freshness == CapsuleFreshness::Fresh && dirty.is_none() {
+                required_invariant_refs.extend(concept.invariant_refs.iter().cloned());
+            }
             let freshness_name = match freshness {
                 CapsuleFreshness::Fresh if dirty.is_none() => "fresh",
                 CapsuleFreshness::Stale { .. } | CapsuleFreshness::Fresh => "stale",
@@ -292,6 +387,7 @@ impl UlRuntime {
             blind_target,
             recommended_probe,
             subsystem_concept_id,
+            required_invariant_refs: required_invariant_refs.into_iter().collect(),
         })
     }
 }

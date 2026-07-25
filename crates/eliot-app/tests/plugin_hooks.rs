@@ -225,6 +225,58 @@ fn hook_pre_tool_use_allows_governed_mcp_read() -> TestResult {
 }
 
 #[test]
+fn u9_7_hook_blocks_mutation_until_the_packet_gate_is_cleared() -> TestResult {
+    let runtime = runtime_for("u9-packet-gate");
+    let session_id = "u9-gated-session";
+    let gate_dir = runtime.join("reports").join("ul-gates");
+    fs::create_dir_all(&gate_dir)?;
+    let gate_path = gate_dir.join(format!("{session_id}.json"));
+    fs::write(
+        &gate_path,
+        serde_json::to_vec_pretty(&json!({
+            "project_id": "01936000-0000-7000-8000-000000000010",
+            "session_id": session_id,
+            "task_id": "01936000-0000-7000-8000-000000000011",
+            "gate": {
+                "status": "require_probe",
+                "reason": "blind_subsystem"
+            }
+        }))?,
+    )?;
+
+    let denied = run_hook_with_runtime(
+        &runtime,
+        "pre-tool-use",
+        &json!({"session_id": session_id, "tool_name": "Bash"}),
+    )?;
+    assert_eq!(
+        denied.pointer("/hookSpecificOutput/permissionDecision"),
+        Some(&json!("deny"))
+    );
+    let read_allowed = run_hook_with_runtime(
+        &runtime,
+        "pre-tool-use",
+        &json!({"session_id": session_id, "tool_name": "Read"}),
+    )?;
+    assert_ne!(
+        read_allowed.pointer("/hookSpecificOutput/permissionDecision"),
+        Some(&json!("deny"))
+    );
+
+    fs::remove_file(gate_path)?;
+    let mutation_allowed = run_hook_with_runtime(
+        &runtime,
+        "pre-tool-use",
+        &json!({"session_id": session_id, "tool_name": "Bash"}),
+    )?;
+    assert_ne!(
+        mutation_allowed.pointer("/hookSpecificOutput/permissionDecision"),
+        Some(&json!("deny"))
+    );
+    Ok(())
+}
+
+#[test]
 fn hook_post_tool_use_spools_observation() -> TestResult {
     let runtime = runtime_for("hook-post-tool-use");
     let output = run_hook_with_runtime(

@@ -373,6 +373,13 @@ fn execution_gate_requires_worklease() {
 #[test]
 fn execution_gate_requires_worktree_for_candidate_implementation() {
     let request = request(true, AntigravityReviewMode::CandidateImplementation);
+    let mut missing_packet = request.clone();
+    missing_packet.last_accepted_packet_id = None;
+    let missing_packet_gate = gate(&missing_packet, None, None, true, false, false);
+    assert_eq!(
+        missing_packet_gate.decision,
+        AntigravityExecutionGateDecisionKind::RequireAcceptedPacket
+    );
     let lease = work_lease(&request);
     let gate = gate(&request, Some(&lease), None, true, false, false);
     assert_eq!(
@@ -602,6 +609,9 @@ fn request(
     request.provider_enabled = provider_enabled;
     request.work_lease_id = Some(WorkLeaseId::new_v7());
     request.worktree_lease_id = Some(WorktreeLeaseId::new_v7());
+    if mode == AntigravityReviewMode::CandidateImplementation {
+        request.last_accepted_packet_id = Some("packet:test-accepted".to_owned());
+    }
     request
 }
 

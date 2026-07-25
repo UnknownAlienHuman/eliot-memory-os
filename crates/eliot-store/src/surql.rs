@@ -10,6 +10,12 @@ pub enum NamedSurqlOp {
     SchemaMigrateUlPyramid,
     SchemaMigrateUlMeasurement,
     SchemaMigrateUlDependencyActivation,
+    SchemaMigrateUlTokenPolicy,
+    AssignUlExperimentArm,
+    LoadUlExperimentAssignment,
+    LoadUlTaskClassLedgers,
+    UpsertUlTaskClassPolicy,
+    LoadUlTaskClassPolicy,
     ReplaceUlReverseDependencies,
     LoadUlReverseDependents,
     UpsertUlArtifactDirty,
@@ -68,6 +74,12 @@ impl NamedSurqlOp {
             Self::SchemaMigrateUlPyramid => "005_ul_pyramid",
             Self::SchemaMigrateUlMeasurement => "006_ul_measurement",
             Self::SchemaMigrateUlDependencyActivation => "007_ul_dependency_activation",
+            Self::SchemaMigrateUlTokenPolicy => "008_ul_token_policy",
+            Self::AssignUlExperimentArm => "assign_ul_experiment_arm",
+            Self::LoadUlExperimentAssignment => "load_ul_experiment_assignment",
+            Self::LoadUlTaskClassLedgers => "load_ul_task_class_ledgers",
+            Self::UpsertUlTaskClassPolicy => "upsert_ul_task_class_policy",
+            Self::LoadUlTaskClassPolicy => "load_ul_task_class_policy",
             Self::ReplaceUlReverseDependencies => "replace_ul_reverse_dependencies",
             Self::LoadUlReverseDependents => "load_ul_reverse_dependents",
             Self::UpsertUlArtifactDirty => "upsert_ul_artifact_dirty",
@@ -130,6 +142,16 @@ impl NamedSurqlOp {
             Self::SchemaMigrateUlDependencyActivation => {
                 include_str!("surql/007_ul_dependency_activation.surql")
             }
+            Self::SchemaMigrateUlTokenPolicy => include_str!("surql/008_ul_token_policy.surql"),
+            Self::AssignUlExperimentArm => include_str!("surql/assign_ul_experiment_arm.surql"),
+            Self::LoadUlExperimentAssignment => {
+                include_str!("surql/load_ul_experiment_assignment.surql")
+            }
+            Self::LoadUlTaskClassLedgers => include_str!("surql/load_ul_task_class_ledgers.surql"),
+            Self::UpsertUlTaskClassPolicy => {
+                include_str!("surql/upsert_ul_task_class_policy.surql")
+            }
+            Self::LoadUlTaskClassPolicy => include_str!("surql/load_ul_task_class_policy.surql"),
             Self::ReplaceUlReverseDependencies => {
                 include_str!("surql/replace_ul_reverse_dependencies.surql")
             }
@@ -237,7 +259,7 @@ impl Default for SurqlTemplateRegistry {
 }
 
 #[allow(clippy::too_many_lines)]
-fn foundational_templates() -> [SurqlTemplate; 35] {
+fn foundational_templates() -> [SurqlTemplate; 41] {
     [
         template(
             NamedSurqlOp::SchemaMigrate,
@@ -285,6 +307,42 @@ fn foundational_templates() -> [SurqlTemplate; 35] {
             NamedSurqlOp::SchemaMigrateUlDependencyActivation,
             "SchemaMigrateUlDependencyActivationInput",
             "SchemaMigrateUlDependencyActivationOutput",
+            64 * 1024,
+        ),
+        template(
+            NamedSurqlOp::SchemaMigrateUlTokenPolicy,
+            "SchemaMigrateUlTokenPolicyInput",
+            "SchemaMigrateUlTokenPolicyOutput",
+            64 * 1024,
+        ),
+        template(
+            NamedSurqlOp::AssignUlExperimentArm,
+            "AssignUlExperimentArmInput",
+            "AssignUlExperimentArmOutput",
+            64 * 1024,
+        ),
+        template(
+            NamedSurqlOp::LoadUlExperimentAssignment,
+            "LoadUlExperimentAssignmentInput",
+            "LoadUlExperimentAssignmentOutput",
+            64 * 1024,
+        ),
+        template(
+            NamedSurqlOp::LoadUlTaskClassLedgers,
+            "LoadUlTaskClassLedgersInput",
+            "LoadUlTaskClassLedgersOutput",
+            512 * 1024,
+        ),
+        template(
+            NamedSurqlOp::UpsertUlTaskClassPolicy,
+            "UpsertUlTaskClassPolicyInput",
+            "UpsertUlTaskClassPolicyOutput",
+            64 * 1024,
+        ),
+        template(
+            NamedSurqlOp::LoadUlTaskClassPolicy,
+            "LoadUlTaskClassPolicyInput",
+            "LoadUlTaskClassPolicyOutput",
             64 * 1024,
         ),
         template(

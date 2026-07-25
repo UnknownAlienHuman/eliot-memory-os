@@ -12,6 +12,7 @@ pub mod mining;
 pub mod onboarding;
 pub mod prediction;
 pub mod readiness;
+pub mod token_policy;
 pub mod touched;
 
 pub use activation::ActivationEngine;
@@ -44,4 +45,5 @@ pub use readiness::{
     UlFieldValidationLoad, UlReadinessService, evaluate_task08_readiness,
     field_validation_manifest_path, load_field_validation_manifest, summarize_field_evidence,
 };
+pub use token_policy::UlTokenPolicyService;
 pub use touched::{TouchedCue, TouchedSetRegistry};
