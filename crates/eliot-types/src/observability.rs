@@ -92,6 +92,26 @@ pub enum MemoryInfluenceToolInput {
 
 #[allow(clippy::expect_used)]
 pub fn memory_influence_trace_write_input_schema() -> Value {
-    serde_json::to_value(schemars::schema_for!(MemoryInfluenceToolInput))
-        .expect("MemoryInfluenceToolInput schema must serialize")
+    let mut schema = serde_json::to_value(schemars::schema_for!(MemoryInfluenceToolInput))
+        .expect("MemoryInfluenceToolInput schema must serialize");
+    schema
+        .as_object_mut()
+        .expect("MemoryInfluenceToolInput schema root must be an object")
+        .insert("type".to_owned(), Value::String("object".to_owned()));
+    schema
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn memory_influence_tool_schema_has_mcp_object_root() {
+        let schema = memory_influence_trace_write_input_schema();
+        assert_eq!(schema.get("type").and_then(Value::as_str), Some("object"));
+        assert!(
+            schema.get("anyOf").and_then(Value::as_array).is_some(),
+            "the full and acknowledgement input variants must remain represented"
+        );
+    }
 }

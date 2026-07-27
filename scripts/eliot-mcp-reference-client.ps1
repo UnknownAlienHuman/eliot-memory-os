@@ -30,6 +30,71 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
+function ConvertTo-NativeCommandLineArgument {
+    param(
+        [AllowEmptyString()]
+        [string]$Argument
+    )
+
+    if ($null -eq $Argument) {
+        $Argument = ''
+    }
+    if ($Argument.Length -gt 0 -and $Argument -notmatch '[\s"]') {
+        return $Argument
+    }
+
+    $builder = [System.Text.StringBuilder]::new()
+    [void]$builder.Append('"')
+    $backslashCount = 0
+    foreach ($character in $Argument.ToCharArray()) {
+        if ($character -eq '\') {
+            $backslashCount += 1
+            continue
+        }
+        if ($character -eq '"') {
+            [void]$builder.Append(('\' * (($backslashCount * 2) + 1)))
+            [void]$builder.Append('"')
+            $backslashCount = 0
+            continue
+        }
+        if ($backslashCount -gt 0) {
+            [void]$builder.Append(('\' * $backslashCount))
+            $backslashCount = 0
+        }
+        [void]$builder.Append($character)
+    }
+    if ($backslashCount -gt 0) {
+        [void]$builder.Append(('\' * ($backslashCount * 2)))
+    }
+    [void]$builder.Append('"')
+    return $builder.ToString()
+}
+
+function ConvertFrom-JsonCompatible {
+    param(
+        [Parameter(Mandatory = $true, ValueFromPipeline = $true)]
+        [string]$InputObject,
+
+        [switch]$AsHashtable
+    )
+
+    process {
+        $command = Get-Command ConvertFrom-Json
+        $supportsDepth = $command.Parameters.ContainsKey('Depth')
+        $supportsHashtable = $command.Parameters.ContainsKey('AsHashtable')
+        if ($AsHashtable -and $supportsHashtable -and $supportsDepth) {
+            return $InputObject | ConvertFrom-Json -AsHashtable -Depth 30
+        }
+        if ($AsHashtable -and $supportsHashtable) {
+            return $InputObject | ConvertFrom-Json -AsHashtable
+        }
+        if ($supportsDepth) {
+            return $InputObject | ConvertFrom-Json -Depth 30
+        }
+        return $InputObject | ConvertFrom-Json
+    }
+}
+
 $exe = (Resolve-Path -LiteralPath $EliotExe).Path
 $startInfo = [System.Diagnostics.ProcessStartInfo]::new()
 $startInfo.FileName = $exe
@@ -39,23 +104,37 @@ $startInfo.RedirectStandardInput = $true
 $startInfo.RedirectStandardOutput = $true
 $startInfo.RedirectStandardError = $true
 
+$processArguments = [System.Collections.Generic.List[string]]::new()
 if ($Config) {
-    $startInfo.ArgumentList.Add('--config')
-    $startInfo.ArgumentList.Add((Resolve-Path -LiteralPath $Config).Path)
+    $processArguments.Add('--config')
+    $processArguments.Add((Resolve-Path -LiteralPath $Config).Path)
 }
-$startInfo.ArgumentList.Add('mcp')
-$startInfo.ArgumentList.Add('stdio')
+$processArguments.Add('mcp')
+$processArguments.Add('stdio')
 if ($HostSurface) {
-    $startInfo.ArgumentList.Add('--host')
-    $startInfo.ArgumentList.Add($HostSurface)
+    $processArguments.Add('--host')
+    $processArguments.Add($HostSurface)
 }
 else {
-    $startInfo.ArgumentList.Add('--profile')
-    $startInfo.ArgumentList.Add($Profile)
+    $processArguments.Add('--profile')
+    $processArguments.Add($Profile)
 }
 if ($Instance) {
-    $startInfo.ArgumentList.Add('--instance')
-    $startInfo.ArgumentList.Add($Instance)
+    $processArguments.Add('--instance')
+    $processArguments.Add($Instance)
+}
+
+if ($null -ne $startInfo.ArgumentList) {
+    foreach ($argument in $processArguments) {
+        $startInfo.ArgumentList.Add($argument)
+    }
+}
+else {
+    $startInfo.Arguments = (@(
+        $processArguments | ForEach-Object {
+            ConvertTo-NativeCommandLineArgument -Argument $_
+        }
+    ) -join ' ')
 }
 
 foreach ($name in @(
@@ -102,12 +181,15 @@ $recallResponseIndex = $null
 
 if ($ToolName) {
     try {
-        $toolArguments = $ToolArgumentsJson | ConvertFrom-Json -AsHashtable -Depth 30
+        $toolArguments = $ToolArgumentsJson | ConvertFrom-JsonCompatible -AsHashtable
     }
     catch {
         throw "-ToolArgumentsJson must contain one valid JSON object: $($_.Exception.Message)"
     }
-    if ($toolArguments -isnot [System.Collections.IDictionary]) {
+    if (
+        $toolArguments -isnot [System.Collections.IDictionary] -and
+        $toolArguments -isnot [System.Management.Automation.PSCustomObject]
+    ) {
         throw '-ToolArgumentsJson must contain one JSON object'
     }
     $toolCallResponseIndex = $requests.Count
@@ -157,7 +239,13 @@ foreach ($request in $requests) {
 $process.StandardInput.Close()
 
 if (-not $process.WaitForExit($TimeoutSeconds * 1000)) {
-    $process.Kill($true)
+    try {
+        $process.Kill($true)
+    }
+    catch [System.Management.Automation.MethodException] {
+        # Windows PowerShell 5.1 exposes only Process.Kill().
+        $process.Kill()
+    }
     throw "Eliot MCP facade timed out after $TimeoutSeconds seconds"
 }
 $stdout = $stdoutTask.GetAwaiter().GetResult()
@@ -167,7 +255,7 @@ if ($process.ExitCode -ne 0) {
 }
 
 $responses = @($stdout -split "`r?`n" | Where-Object { $_ } | ForEach-Object {
-    $_ | ConvertFrom-Json -Depth 30
+    $_ | ConvertFrom-JsonCompatible
 })
 if ($responses.Count -ne $requests.Count) {
     throw "expected $($requests.Count) MCP responses, received $($responses.Count)"

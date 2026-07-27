@@ -71,6 +71,7 @@ const SAFE_AUDITOR_MCP_TOOLS: &[&str] = &[
     "eliot_recall_l0",
     "eliot_fetch_l2",
     "eliot_compile_packet_l3",
+    "eliot_memory_influence_trace",
     "eliot_task_meaning",
     "eliot_experience_recall",
     "eliot_skill_list",
@@ -1565,10 +1566,26 @@ impl AntigravityMcpConfigService {
     }
 
     pub fn desired_server_value(&self, eliot_exe: &Path) -> Result<Value, EngineError> {
+        self.desired_server_value_with_profile(eliot_exe, None)
+    }
+
+    pub fn desired_server_value_with_profile(
+        &self,
+        eliot_exe: &Path,
+        profile: Option<&str>,
+    ) -> Result<Value, EngineError> {
         let command = validate_eliot_mcp_executable(eliot_exe)?;
+        let mut args = vec!["mcp", "stdio", "--host", "antigravity"];
+        if let Some(profile) = profile {
+            if profile.trim().is_empty() {
+                return Err(rejected("Antigravity MCP profile must not be empty"));
+            }
+            args.extend(["--profile", profile]);
+        }
+        args.extend(["--instance", "default"]);
         Ok(json!({
             "command": command,
-            "args": ["mcp", "stdio", "--host", "antigravity", "--instance", "default"]
+            "args": args
         }))
     }
 

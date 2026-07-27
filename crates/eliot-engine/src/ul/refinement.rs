@@ -227,6 +227,7 @@ fn refinement_request(
         project_id: capsule.project_id,
         task_id: deterministic_task_id(&format!("ul-refinement-{}", capsule.concept_id)),
         route,
+        model: None,
         prompt,
         output_schema: json!({
             "type": "object",

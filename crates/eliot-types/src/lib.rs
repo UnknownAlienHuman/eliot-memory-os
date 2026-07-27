@@ -331,6 +331,16 @@ pub use ul::concept::{
     SystemFlow, SystemMap,
 };
 pub use ul::concept::{CoverageClass, DangerPath, SubsystemCoverage, UlMetacognitionView};
+pub use ul::cross_agent::{
+    UL_CROSS_AGENT_CONFIRMATION_TOKEN, UL_CROSS_AGENT_EXACT_CALLS, UL_CROSS_AGENT_EXACT_CALLS_U8,
+    UL_CROSS_AGENT_REPORT_SCHEMA_VERSION, UL_CROSS_AGENT_SCHEMA_VERSION, UlCrossAgentCase,
+    UlCrossAgentContaminationReceipt, UlCrossAgentDirection, UlCrossAgentDirectionEvidence,
+    UlCrossAgentDirectionScore, UlCrossAgentDispatchDecision, UlCrossAgentInputDigest,
+    UlCrossAgentInvocationState, UlCrossAgentMemoryMode, UlCrossAgentPlan, UlCrossAgentPlannedCall,
+    UlCrossAgentReaderOutput, UlCrossAgentReport, UlCrossAgentRole, UlCrossAgentScoreCheck,
+    UlCrossAgentSuite, UlCrossAgentWriterOutput, scan_ul_cross_agent_reader_inputs,
+    ul_cross_agent_dispatch_decision,
+};
 pub use ul::cue::{
     CueBinding, CueBindingError, CueIndexRow, CueKind, CueMatchMode, CueRecordSource, CueStrength,
     cue_row_id, normalize_binding, normalize_bindings, ul_token_estimate,

@@ -49,6 +49,23 @@ pub enum UlCommand {
         #[command(subcommand)]
         command: UlPredictionCommand,
     },
+    CrossAgent {
+        #[command(subcommand)]
+        command: UlCrossAgentCommand,
+    },
+}
+
+#[derive(Debug, clap::Subcommand)]
+pub enum UlCrossAgentCommand {
+    Doctor,
+    Run {
+        #[arg(long)]
+        confirm: String,
+    },
+    Report {
+        #[arg(long)]
+        run: String,
+    },
 }
 
 #[derive(Debug, clap::Subcommand)]

@@ -1,0 +1,51 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "marker",
+    "memory_handle",
+    "delivery_surface",
+    "applicability",
+    "first_action",
+    "influence_receipt"
+  ],
+  "properties": {
+    "marker": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "memory_handle": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "delivery_surface": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "applicability": {
+      "enum": [
+        "applicable",
+        "not_applicable",
+        "no_useful_memory"
+      ]
+    },
+    "first_action": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "influence_receipt": {
+      "type": [
+        "string",
+        "null"
+      ]
+    }
+  }
+}

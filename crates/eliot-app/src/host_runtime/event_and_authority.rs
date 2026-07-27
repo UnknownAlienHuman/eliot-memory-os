@@ -82,7 +82,8 @@ pub(crate) async fn dispatch(config_path: &Path, command: HostCommand) -> Result
                 baseline,
                 write_path,
             )?;
-            let _ = bind_launch_scope(config_path, host, cwd.as_deref(), &mut scope).await?;
+            let _ =
+                bind_launch_scope(config_path, host, cwd.as_deref(), &mut scope, false).await?;
             let contract = render_contract(
                 config_path,
                 host,
@@ -138,6 +139,7 @@ pub(crate) async fn dispatch(config_path: &Path, command: HostCommand) -> Result
                 idempotency_key,
                 timeout_seconds,
                 dry_run,
+                None,
                 None,
             ))
             .await
@@ -347,6 +349,25 @@ fn render_contract(
     Ok(HostLaunchContractService.render(&root, &profile, mode, &cwd, model, session, scope)?)
 }
 
+fn uses_managed_antigravity_launch(
+    host: AgentHostId,
+    structured_capture_requested: bool,
+) -> bool {
+    host == AgentHostId::Antigravity && !structured_capture_requested
+}
+
+fn uses_managed_antigravity_containment(host: AgentHostId) -> bool {
+    host == AgentHostId::Antigravity
+}
+
+fn antigravity_permission_profile(bounded_auditor: bool) -> &'static str {
+    if bounded_auditor {
+        "ul_structured_auditor"
+    } else {
+        "canonical_readonly_candidate_plan"
+    }
+}
+
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 async fn launch(
     config_path: &Path,
@@ -360,27 +381,49 @@ async fn launch(
     idempotency_key: Option<String>,
     timeout_seconds: Option<u64>,
     dry_run: bool,
+    structured_output_schema: Option<Value>,
     structured_capture: Option<&mut Value>,
 ) -> Result<()> {
-    let structured_antigravity =
-        host == AgentHostId::Antigravity && structured_capture.is_some();
-    let canonical_authority =
-        bind_launch_scope(config_path, host, cwd.as_deref(), &mut scope).await?;
+    let bounded_auditor = structured_capture.is_some()
+        && scope.project_id.is_some()
+        && scope.task_id.is_some()
+        && scope.role_lease_id.is_some();
+    let managed_antigravity =
+        uses_managed_antigravity_launch(host, structured_capture.is_some());
+    let antigravity_containment = uses_managed_antigravity_containment(host);
+    let canonical_authority = bind_launch_scope(
+        config_path,
+        host,
+        cwd.as_deref(),
+        &mut scope,
+        bounded_auditor,
+    )
+    .await?;
     let mut contract = render_contract(config_path, host, mode, cwd, model, session, &scope)?;
-    if host == AgentHostId::Antigravity && !structured_antigravity {
+    if host == AgentHostId::Antigravity {
         finalize_antigravity_contract(&mut contract, idempotency_key.as_deref(), timeout_seconds)?;
-        if structured_antigravity {
-            "ul_structured_readonly".clone_into(&mut contract.permission_profile);
-        } else {
-            "canonical_readonly_candidate_plan".clone_into(&mut contract.permission_profile);
+        antigravity_permission_profile(bounded_auditor)
+            .clone_into(&mut contract.permission_profile);
+    } else {
+        if idempotency_key.is_some() {
+            bail!("--idempotency-key is currently managed for Antigravity only");
         }
-        contract.contract_hash.clear();
-        contract.contract_hash = blake3::hash(&serde_json::to_vec(&contract)?)
-            .to_hex()
-            .to_string();
-    } else if idempotency_key.is_some() || timeout_seconds.is_some() {
-        bail!("--idempotency-key and --timeout-seconds are currently managed for Antigravity only");
+        if timeout_seconds.is_some() && !bounded_auditor {
+            bail!("--timeout-seconds requires Antigravity or a bounded structured launch");
+        }
+        if bounded_auditor {
+            "ul_structured_auditor".clone_into(&mut contract.permission_profile);
+        }
     }
+    if bounded_auditor
+        && let Some(timeout_seconds) = timeout_seconds
+    {
+        contract.wall_clock_budget_seconds = timeout_seconds.clamp(1, MAX_MANAGED_LAUNCH_SECONDS);
+    }
+    contract.contract_hash.clear();
+    contract.contract_hash = blake3::hash(&serde_json::to_vec(&contract)?)
+        .to_hex()
+        .to_string();
     let profile = HostProfileService.probe(host)?;
     let root = repo_root(config_path);
     let source_bundle = bundle_root(&root, host);
@@ -406,15 +449,15 @@ async fn launch(
         blake3::hash(prompt.as_deref().unwrap_or_default().as_bytes()).to_hex()
     );
     let prompt_present = prompt.is_some();
-    let (program, args) = launch_argv(
+    let (mut program, args) = launch_argv(
         host,
         &profile.executable_path,
         &bundle,
         attach_session_plugin,
         &contract,
+        structured_output_schema.as_ref(),
         prompt,
     )?;
-    let request_hash = managed_request_hash(&contract, &program, &args)?;
     let invocation_root = invocation_root(config_path, &contract.invocation_id);
     let receipt_args = if prompt_present {
         &args[..args.len().saturating_sub(1)]
@@ -443,26 +486,41 @@ async fn launch(
         return write_json(&rendered);
     }
 
-    let _managed_guard = if host == AgentHostId::Antigravity && !structured_antigravity {
+    let _managed_guard = if antigravity_containment {
         Some(managed_launch_mutex().lock().await)
     } else {
         None
     };
+    if antigravity_containment {
+        program = prepare_antigravity_executable_snapshot(&profile, &contract)?
+            .to_string_lossy()
+            .into_owned();
+    }
+    let request_hash = managed_request_hash(&contract, &program, &args)?;
     let mut invocation_lock = None;
-    if host == AgentHostId::Antigravity && !structured_antigravity {
+    if antigravity_containment {
         match reconcile_existing_managed_invocation(config_path, &invocation_root, &request_hash)
             .await?
         {
             ExistingManagedInvocation::New => {}
-            ExistingManagedInvocation::Reuse(receipt) => return write_json(&receipt),
+            ExistingManagedInvocation::Reuse(receipt) => {
+                if structured_capture.is_some() {
+                    bail!(
+                        "provider dispatched: contained Antigravity invocation already completed; its structured output was intentionally not retained and redispatch is forbidden"
+                    );
+                }
+                return write_json(&receipt);
+            }
             ExistingManagedInvocation::UnknownOutcome => {
                 bail!(
-                    "Antigravity invocation has an unknown outcome; inspect `host invocation-status --idempotency-key {}` and do not redispatch",
+                    "provider dispatched: Antigravity invocation has an unknown outcome; inspect `host invocation-status --idempotency-key {}` and do not redispatch",
                     contract.idempotency_key
                 );
             }
             ExistingManagedInvocation::InProgress => {
-                bail!("Antigravity invocation with this idempotency key is already in progress");
+                bail!(
+                    "provider dispatched: Antigravity invocation with this idempotency key is already in progress"
+                );
             }
         }
         invocation_lock = Some(ManagedInvocationLock::acquire(&invocation_root)?);
@@ -481,7 +539,7 @@ async fn launch(
         .args(&args)
         .current_dir(&contract.cwd_or_worktree)
         .kill_on_drop(true);
-    let managed_environment = if host == AgentHostId::Antigravity && !structured_antigravity {
+    let managed_environment = if antigravity_containment {
         Some(configure_antigravity_environment(
             &mut command,
             config_path,
@@ -513,7 +571,7 @@ async fn launch(
     if let Some(worktree_lease_id) = contract.worktree_lease_id {
         command.env("ELIOT_WORKTREE_LEASE_ID", worktree_lease_id.to_string());
     }
-    if host == AgentHostId::Antigravity && !structured_antigravity {
+    if antigravity_containment {
         command.stdin(Stdio::null());
     }
     if host == AgentHostId::OpenCode {
@@ -536,17 +594,29 @@ async fn launch(
 
     command.stdout(Stdio::piped()).stderr(Stdio::piped());
     let daemon_readiness = serde_json::to_value(daemon_readiness)?;
-    if host == AgentHostId::Antigravity {
-        let authority = canonical_authority
-            .as_ref()
-            .context("managed Antigravity launch lost canonical authority")?;
-        let launch_boundary = managed_launch_boundary_attestation(
+    let launch_boundary = if antigravity_containment {
+        Some(managed_launch_boundary_attestation(
             &profile,
             &program,
             &bundle,
             &invocation_root,
             managed_environment.context("managed Antigravity environment was not prepared")?,
-        )?;
+        )?)
+    } else {
+        None
+    };
+    let _antigravity_executable_guard = if antigravity_containment {
+        Some(lock_antigravity_executable_snapshot(Path::new(
+            &program,
+        ))?)
+    } else {
+        None
+    };
+    if managed_antigravity {
+        let authority = canonical_authority
+            .managed
+            .as_ref()
+            .context("managed Antigravity launch lost canonical authority")?;
         return run_managed_antigravity(
             config_path,
             command,
@@ -559,57 +629,168 @@ async fn launch(
             &prompt_hash,
             &daemon_readiness,
             authority,
-            launch_boundary,
+            launch_boundary.context("managed Antigravity launch boundary disappeared")?,
             invocation_lock.context("managed invocation lock was not acquired")?,
         )
         .await;
     }
+    if antigravity_containment {
+        let mut attempt = ContainedAntigravityAttemptJournal {
+            schema_version: CONTAINED_ANTIGRAVITY_ATTEMPT_SCHEMA_V1.to_owned(),
+            invocation_id: contract.invocation_id.clone(),
+            idempotency_key: contract.idempotency_key.clone(),
+            request_hash: request_hash.clone(),
+            contract_hash: contract.contract_hash.clone(),
+            host: AgentHostId::Antigravity,
+            project_id: contract.project_id,
+            task_id: contract.task_id,
+            agent_session_id: contract.agent_session_id,
+            role_lease_id: contract.role_lease_id.clone(),
+            permission_profile: contract.permission_profile.clone(),
+            prompt_hash: prompt_hash.clone(),
+            owner_pid: std::process::id(),
+            bounded_auditor_authority_hash: canonical_authority
+                .bounded_auditor
+                .as_ref()
+                .map(|authority| authority.authority_hash.clone()),
+            launch_boundary: launch_boundary
+                .clone()
+                .context("contained Antigravity launch boundary disappeared")?,
+            attempt_hash: String::new(),
+            attempt_recorded_before_provider_call: true,
+            provider_call_budget_consumed: true,
+            redispatch_allowed: false,
+            started_at: OffsetDateTime::now_utc(),
+        };
+        attempt.attempt_hash = contained_antigravity_attempt_hash(&attempt)?;
+        std::fs::create_dir_all(&invocation_root)?;
+        if invocation_root.join("attempt.json").exists() {
+            bail!("contained Antigravity attempt-before-call CAS already exists");
+        }
+        atomic_write_json(&invocation_root.join("attempt.json"), &attempt)?;
+        write_provider_start_marker(&invocation_root, &attempt.attempt_hash)?;
+    }
+    let child = match command.spawn() {
+        Ok(child) => child,
+        Err(error) => {
+            if antigravity_containment {
+                clear_contained_antigravity_pre_dispatch(&invocation_root).with_context(|| {
+                    format!(
+                        "{} provider launch failed before dispatch and its pre-dispatch journal could not be cleared",
+                        host.as_str()
+                    )
+                })?;
+            }
+            return Err(error)
+                .with_context(|| format!("{} provider launch failed before dispatch", host.as_str()));
+        }
+    };
+    if antigravity_containment {
+        validate_contained_antigravity_attempt(
+            &read_contained_antigravity_attempt(&invocation_root.join("attempt.json"))?
+                .context("contained Antigravity attempt journal disappeared after dispatch")?,
+        )
+        .context(
+            "provider dispatched: contained Antigravity attempt journal became invalid; outcome is unknown",
+        )?;
+    }
     let output = tokio::time::timeout(
         std::time::Duration::from_secs(contract.wall_clock_budget_seconds),
-        command.output(),
+        child.wait_with_output(),
     )
     .await
     .with_context(|| {
         format!(
-            "{} exceeded the {} second wall-clock budget; outcome is unknown",
+            "provider dispatched: {} exceeded the {} second wall-clock budget; outcome is unknown",
             host.as_str(),
             contract.wall_clock_budget_seconds
         )
-    })??;
+    })?
+    .with_context(|| {
+        format!(
+            "provider dispatched: {} output collection failed; outcome is unknown",
+            host.as_str()
+        )
+    })?;
     let sanitized_stdout = sanitize_managed_output(&output.stdout);
     let sanitized_stderr = sanitize_managed_output(&output.stderr);
-    std::fs::create_dir_all(&invocation_root)?;
-    std::fs::write(
-        invocation_root.join("stdout.jsonl"),
-        &sanitized_stdout.bytes,
-    )?;
-    std::fs::write(invocation_root.join("stderr.log"), &sanitized_stderr.bytes)?;
-    atomic_write_json(
-        &invocation_root.join("result.json"),
-        &json!({
-            "schema_version": "eliot-host-launch-result-v1",
-            "contract_hash": contract.contract_hash,
-            "idempotency_key": contract.idempotency_key,
-            "host": host,
-            "exit_status": output.status.code(),
-            "success": output.status.success(),
-            "stdout_ref": invocation_root.join("stdout.jsonl"),
-            "stderr_ref": invocation_root.join("stderr.log"),
-            "stdout_redaction": sanitized_stdout.receipt,
-            "stderr_redaction": sanitized_stderr.receipt,
-            "governor_daemon": &daemon_readiness,
-            "candidate_only": true
-        }),
-    )?;
-    if let Some(capture) = structured_capture {
-        *capture = parse_structured_host_output(host, &sanitized_stdout.bytes)?;
+    std::fs::create_dir_all(&invocation_root).with_context(|| {
+        "provider dispatched: create invocation archive failed; outcome is unknown"
+    })?;
+    let stdout_ref = structured_capture
+        .is_none()
+        .then(|| invocation_root.join("stdout.jsonl"));
+    let stderr_ref = structured_capture
+        .is_none()
+        .then(|| invocation_root.join("stderr.log"));
+    if let Some(stdout_ref) = stdout_ref.as_ref() {
+        std::fs::write(stdout_ref, &sanitized_stdout.bytes).with_context(|| {
+            "provider dispatched: write stdout archive failed; outcome is unknown"
+        })?;
+    }
+    if let Some(stderr_ref) = stderr_ref.as_ref() {
+        std::fs::write(stderr_ref, &sanitized_stderr.bytes).with_context(|| {
+            "provider dispatched: write stderr archive failed; outcome is unknown"
+        })?;
+    }
+    let mut result_receipt = json!({
+        "schema_version": "eliot-host-launch-result-v1",
+        "contract_hash": contract.contract_hash,
+        "request_hash": request_hash,
+        "idempotency_key": contract.idempotency_key,
+        "host": host,
+        "exit_status": output.status.code(),
+        "success": output.status.success(),
+        "stdout_ref": stdout_ref,
+        "stderr_ref": stderr_ref,
+        "stdout_hash": hash_bytes(&sanitized_stdout.bytes),
+        "stderr_hash": hash_bytes(&sanitized_stderr.bytes),
+        "stdout_redaction": sanitized_stdout.receipt,
+        "stderr_redaction": sanitized_stderr.receipt,
+        "governor_daemon": &daemon_readiness,
+        "launch_boundary": launch_boundary,
+        "bounded_auditor_authority": canonical_authority.bounded_auditor,
+        "candidate_only": true,
+        "provider_outcome_status": if structured_capture.is_some() {
+            "pending_structured_validation"
+        } else {
+            "process_exit_observed"
+        },
+        "structured_capture": {
+            "requested": structured_capture.is_some(),
+            "status": if structured_capture.is_some() {
+                "pending"
+            } else {
+                "not_requested"
+            }
+        }
+    });
+    let captured_value = if structured_capture.is_some() {
+        Some(persist_and_parse_structured_host_output(
+            host,
+            &invocation_root,
+            &sanitized_stdout.bytes,
+            &mut result_receipt,
+        )?)
     } else {
-        std::io::stdout().write_all(&sanitized_stdout.bytes)?;
-        std::io::stderr().write_all(&sanitized_stderr.bytes)?;
+        atomic_write_json(&invocation_root.join("result.json"), &result_receipt).with_context(
+            || "provider dispatched: write invocation result failed; outcome is unknown",
+        )?;
+        None
+    };
+    if let (Some(capture), Some(value)) = (structured_capture, captured_value) {
+        *capture = value;
+    } else {
+        std::io::stdout()
+            .write_all(&sanitized_stdout.bytes)
+            .context("provider dispatched: forward provider stdout failed")?;
+        std::io::stderr()
+            .write_all(&sanitized_stderr.bytes)
+            .context("provider dispatched: forward provider stderr failed")?;
     }
     if !output.status.success() {
         bail!(
-            "{} supervised launch exited with {}",
+            "provider dispatched: {} supervised launch exited with {}",
             host.as_str(),
             output.status
         );
@@ -621,6 +802,92 @@ pub(crate) async fn invoke_ul_reasoning(
     config_path: &Path,
     cwd: &Path,
     request: &eliot_types::UlReasoningRequest,
+) -> Result<Value> {
+    invoke_ul_reasoning_with_scope(config_path, cwd, request, HostLaunchScope::default(), None).await
+}
+
+pub(crate) async fn prepare_ul_auditor_scope(
+    config_path: &Path,
+    host: AgentHostId,
+    project_id: ProjectId,
+    task_id: TaskId,
+    session_id: SessionId,
+    client_instance: &str,
+) -> Result<HostLaunchScope> {
+    let agent_session_id = AgentSessionId::from_uuid(session_id.as_uuid());
+    register_session(
+        config_path,
+        host,
+        Some(agent_session_id.to_string()),
+        Some(client_instance.to_owned()),
+    )?;
+    let grant = grant_role(
+        config_path,
+        &task_id.to_string(),
+        &agent_session_id.to_string(),
+        "auditor",
+        [
+            "eliot_host_session_status",
+            "eliot_project_identity",
+            "eliot_task_state",
+            "eliot_current_state",
+            "eliot_recall_l0",
+            "eliot_fetch_l2",
+            "eliot_compile_packet_l3",
+            "eliot_memory_influence_trace",
+            "eliot_agent_candidate_submit",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect(),
+        30,
+    )
+    .await?;
+    let role_lease_id = grant
+        .pointer("/task_role_lease/role_lease_id")
+        .and_then(Value::as_str)
+        .context("UL auditor role grant returned no TaskRoleLease")?
+        .to_owned();
+    Ok(HostLaunchScope {
+        project_id: Some(project_id),
+        agent_session_id: Some(agent_session_id),
+        task_id: Some(task_id),
+        work_item_id: None,
+        role_lease_id: Some(role_lease_id),
+        work_lease_id: None,
+        worktree_lease_id: None,
+        planned_verifier_ref: None,
+        baseline_commit: None,
+        allowed_paths: Vec::new(),
+        forbidden_paths: vec![
+            "global-provider-config".to_owned(),
+            "truth-promotion".to_owned(),
+        ],
+    })
+}
+
+pub(crate) async fn invoke_ul_scoped_reasoning(
+    config_path: &Path,
+    cwd: &Path,
+    request: &eliot_types::UlReasoningRequest,
+    scope: HostLaunchScope,
+) -> Result<Value> {
+    let provider_session = (request.route.host() == AgentHostId::Claude).then(|| {
+        scope
+            .agent_session_id
+            .map(|session| session.to_string())
+            .context("Claude UL launch requires a fresh scoped session")
+    });
+    let provider_session = provider_session.transpose()?;
+    invoke_ul_reasoning_with_scope(config_path, cwd, request, scope, provider_session).await
+}
+
+async fn invoke_ul_reasoning_with_scope(
+    config_path: &Path,
+    cwd: &Path,
+    request: &eliot_types::UlReasoningRequest,
+    scope: HostLaunchScope,
+    provider_session: Option<String>,
 ) -> Result<Value> {
     let host = request.route.host();
     let doctor = doctor(config_path, host)?;
@@ -637,7 +904,11 @@ pub(crate) async fn invoke_ul_reasoning(
     let cwd = cwd.to_path_buf();
     let idempotency_key = (host == AgentHostId::Antigravity)
         .then(|| request.idempotency_key.clone());
-    let timeout_seconds = (host == AgentHostId::Antigravity).then_some(120);
+    let scoped = scope.task_id.is_some();
+    let timeout_seconds =
+        (host == AgentHostId::Antigravity || scoped).then_some(request.timeout_seconds);
+    let model = request.model.clone();
+    let output_schema = request.output_schema.clone();
     tokio::task::spawn_blocking(move || {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -649,36 +920,27 @@ pub(crate) async fn invoke_ul_reasoning(
             host,
             HostMode::Supervised,
             Some(cwd),
-            None,
-            None,
-            HostLaunchScope {
-                project_id: None,
-                agent_session_id: None,
-                task_id: None,
-                work_item_id: None,
-                role_lease_id: None,
-                work_lease_id: None,
-                worktree_lease_id: None,
-                planned_verifier_ref: None,
-                baseline_commit: None,
-                allowed_paths: Vec::new(),
-                forbidden_paths: Vec::new(),
-            },
+            model,
+            provider_session,
+            scope,
             Some(prompt),
             idempotency_key,
             timeout_seconds,
             false,
+            Some(output_schema),
             Some(&mut captured),
         ))?;
         Ok(captured)
     })
     .await
-    .context("join supervised UL host invocation")?
+    .context("provider dispatched: supervised UL host task failed to join; outcome is unknown")?
 }
 
 fn parse_structured_host_output(host: AgentHostId, stdout: &[u8]) -> Result<Value> {
-    if let Ok(value) = serde_json::from_slice::<Value>(stdout) {
-        return structured_value_from_host_event(host, value);
+    if let Ok(value) = serde_json::from_slice::<Value>(stdout)
+        && let Ok(structured) = structured_value_from_host_event(host, value)
+    {
+        return Ok(structured);
     }
     for line in stdout.rsplit(|byte| *byte == b'\n') {
         let line = line
@@ -702,6 +964,9 @@ fn parse_structured_host_output(host: AgentHostId, stdout: &[u8]) -> Result<Valu
 }
 
 fn structured_value_from_host_event(host: AgentHostId, value: Value) -> Result<Value> {
+    if let Some(text) = value.as_str() {
+        return parse_json_text(text);
+    }
     if let Some(structured) = value.get("structured_output") {
         return Ok(structured.clone());
     }
@@ -716,6 +981,7 @@ fn structured_value_from_host_event(host: AgentHostId, value: Value) -> Result<V
     if value.get("answers").is_some()
         || value.get("purpose").is_some()
         || value.get("boundaries").is_some()
+        || (host == AgentHostId::Antigravity && (value.is_object() || value.is_array()))
     {
         return Ok(value);
     }
@@ -725,18 +991,182 @@ fn structured_value_from_host_event(host: AgentHostId, value: Value) -> Result<V
     )
 }
 
+fn persist_and_parse_structured_host_output(
+    host: AgentHostId,
+    invocation_root: &Path,
+    stdout: &[u8],
+    result_receipt: &mut Value,
+) -> Result<Value> {
+    let result_path = invocation_root.join("result.json");
+    atomic_write_json(&result_path, result_receipt).with_context(|| {
+        "provider dispatched: write pre-parse invocation result failed; provider outcome is known but its receipt is incomplete"
+    })?;
+
+    match parse_structured_host_output(host, stdout) {
+        Ok(value) => {
+            let receipt = result_receipt
+                .as_object_mut()
+                .context("host launch result receipt is not an object")?;
+            receipt.insert(
+                "provider_outcome_status".to_owned(),
+                json!("structured_output_valid"),
+            );
+            receipt.insert("structured_output_valid".to_owned(), json!(true));
+            receipt.insert(
+                "structured_capture".to_owned(),
+                json!({
+                    "requested": true,
+                    "status": "valid",
+                    "output_hash": hash_bytes(&serde_json::to_vec(&value)?)
+                }),
+            );
+            atomic_write_json(&result_path, result_receipt).with_context(|| {
+                "provider dispatched: write valid structured-output receipt failed; provider outcome is known but its receipt is incomplete"
+            })?;
+            Ok(value)
+        }
+        Err(error) => {
+            let receipt = result_receipt
+                .as_object_mut()
+                .context("host launch result receipt is not an object")?;
+            receipt.insert(
+                "provider_outcome_status".to_owned(),
+                json!("invalid_structured_output"),
+            );
+            receipt.insert("structured_output_valid".to_owned(), json!(false));
+            receipt.insert(
+                "structured_capture".to_owned(),
+                json!({
+                    "requested": true,
+                    "status": "invalid",
+                    "error_code": "INVALID_STRUCTURED_OUTPUT",
+                    "structural_diagnostic": structured_output_diagnostic(stdout)
+                }),
+            );
+            atomic_write_json(&result_path, result_receipt).with_context(|| {
+                "provider dispatched: write invalid structured-output receipt failed; provider outcome is known but its receipt is incomplete"
+            })?;
+            Err(error).context("provider dispatched: structured output contract was invalid")
+        }
+    }
+}
+
 fn parse_json_text(text: &str) -> Result<Value> {
     let text = text.trim();
     if let Ok(value) = serde_json::from_str(text) {
         return Ok(value);
     }
-    let text = text
+    if let Some(fenced) = text
         .strip_prefix("```json")
         .or_else(|| text.strip_prefix("```"))
         .and_then(|value| value.strip_suffix("```"))
         .map(str::trim)
-        .context("structured host result is not JSON")?;
-    serde_json::from_str(text).context("decode structured host result")
+        && let Ok(value) = serde_json::from_str(fenced)
+    {
+        return Ok(value);
+    }
+    for (open, close) in [('{', '}'), ('[', ']')] {
+        if let (Some(start), Some(end)) = (text.find(open), text.rfind(close))
+            && start < end
+            && let Ok(value) = serde_json::from_str(&text[start..=end])
+        {
+            return Ok(value);
+        }
+    }
+    bail!("structured host result is not JSON")
+}
+
+const STRUCTURAL_DIAGNOSTIC_MAX_LINES: usize = 16;
+const STRUCTURAL_DIAGNOSTIC_MAX_KEYS: usize = 32;
+const STRUCTURAL_KEY_ALLOWLIST: &[&str] = &[
+    "answer",
+    "answers",
+    "applicability",
+    "boundaries",
+    "candidate",
+    "candidates",
+    "completion",
+    "content",
+    "data",
+    "delta",
+    "delivery_surface",
+    "event",
+    "final",
+    "first_action",
+    "influence_receipt",
+    "marker",
+    "memory_handle",
+    "message",
+    "messages",
+    "output",
+    "outputs",
+    "parts",
+    "payload",
+    "purpose",
+    "response",
+    "result",
+    "role",
+    "status",
+    "structured_output",
+    "text",
+    "type",
+];
+
+fn structured_output_diagnostic(stdout: &[u8]) -> Value {
+    let whole_document = serde_json::from_slice::<Value>(stdout)
+        .ok()
+        .map(|value| structural_json_projection(&value));
+    let line_documents = stdout
+        .split(|byte| *byte == b'\n')
+        .filter_map(|line| serde_json::from_slice::<Value>(line).ok())
+        .take(STRUCTURAL_DIAGNOSTIC_MAX_LINES)
+        .map(|value| structural_json_projection(&value))
+        .collect::<Vec<_>>();
+    json!({
+        "schema_version": "eliot-structured-output-diagnostic-v1",
+        "byte_length": stdout.len(),
+        "whole_document": whole_document,
+        "line_documents": line_documents,
+        "raw_output_retained": false
+    })
+}
+
+fn structural_json_projection(value: &Value) -> Value {
+    let kind = json_value_kind(value);
+    let keys = value.as_object().map(|object| {
+        object
+            .iter()
+            .take(STRUCTURAL_DIAGNOSTIC_MAX_KEYS)
+            .map(|(name, nested)| {
+                let retained_name = STRUCTURAL_KEY_ALLOWLIST
+                    .contains(&name.as_str())
+                    .then(|| name.clone());
+                json!({
+                    "name": retained_name,
+                    "name_hash": retained_name
+                        .is_none()
+                        .then(|| hash_bytes(name.as_bytes())),
+                    "value_kind": json_value_kind(nested)
+                })
+            })
+            .collect::<Vec<_>>()
+    });
+    json!({
+        "kind": kind,
+        "keys": keys,
+        "key_count": value.as_object().map_or(0, serde_json::Map::len)
+    })
+}
+
+fn json_value_kind(value: &Value) -> &'static str {
+    match value {
+        Value::Null => "null",
+        Value::Bool(_) => "bool",
+        Value::Number(_) => "number",
+        Value::String(_) => "string",
+        Value::Array(_) => "array",
+        Value::Object(_) => "object",
+    }
 }
 
 include!("launch_support.rs");
@@ -908,14 +1338,15 @@ async fn bind_launch_scope(
     host: AgentHostId,
     cwd: Option<&Path>,
     scope: &mut HostLaunchScope,
-) -> Result<Option<ManagedCanonicalAuthority>> {
+    bounded_auditor: bool,
+) -> Result<LaunchCanonicalAuthority> {
     if scope.task_id.is_none()
         && scope.role_lease_id.is_none()
         && scope.work_lease_id.is_none()
         && scope.worktree_lease_id.is_none()
     {
         scope.agent_session_id = None;
-        return Ok(None);
+        return Ok(LaunchCanonicalAuthority::default());
     }
     let task_id = scope
         .task_id
@@ -950,6 +1381,14 @@ async fn bind_launch_scope(
         bail!("--agent-session does not match TaskRoleLease holder");
     }
     scope.agent_session_id = Some(role.agent_session_id);
+    if bounded_auditor {
+        let authority =
+            validate_bounded_auditor_authority(config_path, &state, scope, now).await?;
+        return Ok(LaunchCanonicalAuthority {
+            managed: None,
+            bounded_auditor: Some(authority),
+        });
+    }
     let work_state = delegation_runtime::load_work_state(&runtime_root(config_path))?;
     if let Some(work_lease_id) = scope.work_lease_id {
         let active = work_state.leases.iter().any(|lease| {
@@ -964,12 +1403,133 @@ async fn bind_launch_scope(
     }
     if host == AgentHostId::Antigravity {
         validate_antigravity_scope(&state, &work_state, cwd, scope, now)?;
-        return Ok(Some(
-            validate_canonical_antigravity_authority(config_path, &state, &work_state, scope)
-                .await?,
-        ));
+        return Ok(LaunchCanonicalAuthority {
+            managed: Some(
+                validate_canonical_antigravity_authority(config_path, &state, &work_state, scope)
+                    .await?,
+            ),
+            bounded_auditor: None,
+        });
     }
-    Ok(None)
+    Ok(LaunchCanonicalAuthority::default())
+}
+
+async fn validate_bounded_auditor_authority(
+    config_path: &Path,
+    delegation_state: &DelegationState,
+    scope: &HostLaunchScope,
+    now: OffsetDateTime,
+) -> Result<BoundedAuditorCanonicalAuthority> {
+    let project_id = scope
+        .project_id
+        .context("bounded auditor launch requires --project")?;
+    let task_id = scope
+        .task_id
+        .context("bounded auditor launch requires --task")?;
+    let session_id = scope
+        .agent_session_id
+        .context("bounded auditor launch requires --agent-session")?;
+    let role_lease_id = scope
+        .role_lease_id
+        .as_deref()
+        .context("bounded auditor launch requires --role-lease")?;
+    let role = delegation_state
+        .task_role_leases
+        .iter()
+        .find(|role| role.role_lease_id == role_lease_id)
+        .context("bounded auditor TaskRoleLease disappeared")?;
+    validate_bounded_auditor_shape(role, scope, now)?;
+    let binding = delegation_state
+        .agent_host_sessions
+        .iter()
+        .find(|binding| binding.agent_session_id == session_id)
+        .context("bounded auditor host binding disappeared")?;
+    if binding.bound_project_id != Some(project_id)
+        || binding.bound_task_id != Some(task_id)
+        || !binding
+            .task_role_lease_refs
+            .iter()
+            .any(|reference| reference == role_lease_id)
+    {
+        bail!("bounded auditor host binding is not canonically task-scoped");
+    }
+
+    let config = load_config(config_path)?;
+    let store = CanonicalStore::new(config.db.surreal);
+    let (task, task_receipt) = current_task_authority(&store, project_id, task_id).await?;
+    let (_, role_receipt, role_authority) = current_role_authority(
+        config_path,
+        &store,
+        delegation_state,
+        project_id,
+        task_id,
+        role_lease_id,
+        task.memory_revision.value(),
+    )
+    .await?;
+    let host_binding_receipt = current_host_binding_authority(
+        &store,
+        project_id,
+        task_id,
+        binding,
+        &role_authority,
+    )
+    .await?;
+    let task_receipt_ref = WriteReceiptRef {
+        receipt_id: task_receipt.receipt_id,
+        write_id: task_receipt.write_id,
+    };
+    let role_receipt_ref = WriteReceiptRef {
+        receipt_id: role_receipt.receipt_id,
+        write_id: role_receipt.write_id,
+    };
+    let host_binding_receipt_ref = WriteReceiptRef {
+        receipt_id: host_binding_receipt.receipt_id,
+        write_id: host_binding_receipt.write_id,
+    };
+    let authority_hash = hash_json(&json!({
+        "authority_kind": "bounded_auditor",
+        "project_id": project_id,
+        "task_id": task_id,
+        "session_id": session_id,
+        "role_lease_id": role_lease_id,
+        "task_receipt": task_receipt_ref,
+        "role_receipt": role_receipt_ref,
+        "host_binding_receipt": host_binding_receipt_ref,
+        "work_authority": Value::Null,
+    }))?;
+    Ok(BoundedAuditorCanonicalAuthority {
+        task_receipt: task_receipt_ref,
+        role_receipt: role_receipt_ref,
+        host_binding_receipt: host_binding_receipt_ref,
+        authority_hash,
+    })
+}
+
+fn validate_bounded_auditor_shape(
+    role: &eliot_types::TaskRoleLease,
+    scope: &HostLaunchScope,
+    now: OffsetDateTime,
+) -> Result<()> {
+    let task_id = scope
+        .task_id
+        .context("bounded auditor launch requires --task")?;
+    let session_id = scope
+        .agent_session_id
+        .context("bounded auditor launch requires --agent-session")?;
+    if role.task_id != task_id
+        || role.agent_session_id != session_id
+        || role.role != AgentRole::Auditor
+        || role.expires_at <= now
+        || scope.work_item_id.is_some()
+        || scope.work_lease_id.is_some()
+        || scope.worktree_lease_id.is_some()
+        || scope.planned_verifier_ref.is_some()
+        || !scope.allowed_paths.is_empty()
+    {
+        bail!("bounded auditor scope must be active, read-only, and free of work authority");
+    }
+    Ok(())
 }
 
 fn validate_antigravity_scope(

@@ -667,6 +667,17 @@ fn external_auditor_initialize_instructions_make_memory_proactive() {
 fn claude_desktop_profile_is_compact_and_role_neutral() -> Result<()> {
     let profile = McpAccessProfile::parse("claude_desktop")?;
     let tools = tool_definitions_for_profile(profile);
+    for tool in &tools {
+        let name = tool
+            .get("name")
+            .and_then(Value::as_str)
+            .context("Claude tool name")?;
+        assert_eq!(
+            tool.pointer("/inputSchema/type").and_then(Value::as_str),
+            Some("object"),
+            "Claude Code requires an object-root input schema for {name}"
+        );
+    }
     let names = tools
         .iter()
         .filter_map(|tool| tool.get("name").and_then(Value::as_str))
@@ -1012,6 +1023,91 @@ fn dynamic_agent_profile_is_host_neutral_and_proactive() -> Result<()> {
     assert!(instructions.contains("do not wait for repeated user prompting"));
     assert!(instructions.contains("daemon runtime_id and auth_generation"));
     assert!(!instructions.contains("You are an external_auditor"));
+    Ok(())
+}
+
+#[test]
+fn default_antigravity_remains_dynamic_agent() -> Result<()> {
+    assert_eq!(
+        resolve_effective_profile("default", Some("antigravity"), false)?,
+        McpAccessProfile::DynamicAgent
+    );
+    Ok(())
+}
+
+#[test]
+fn explicit_antigravity_auditor_is_honored() -> Result<()> {
+    assert_eq!(
+        resolve_effective_profile("external_auditor", Some("antigravity"), false)?,
+        McpAccessProfile::ExternalAuditor
+    );
+    assert_eq!(
+        resolve_effective_profile("antigravity-auditor", Some("antigravity"), false)?,
+        McpAccessProfile::ExternalAuditor
+    );
+    Ok(())
+}
+
+#[test]
+fn unsupported_pair_fails_closed() -> Result<()> {
+    let error = resolve_effective_profile("codex_controller", Some("antigravity"), false)
+        .err()
+        .context("an explicit controller profile must not be inferred from host identity")?;
+    assert!(error.to_string().contains("UNSUPPORTED_HOST_PROFILE_PAIR"));
+    Ok(())
+}
+
+#[test]
+fn bounded_catalog() {
+    let profile = McpAccessProfile::ExternalAuditor;
+    for allowed in [
+        "eliot_recall_l0",
+        "eliot_fetch_l2",
+        "eliot_compile_packet_l3",
+        "eliot_agent_candidate_submit",
+        "eliot_memory_influence_trace",
+    ] {
+        assert!(profile.allows(allowed), "{allowed} must remain bounded");
+    }
+    for denied in [
+        "eliot_patch_apply",
+        "eliot_submit_completion_proof",
+        "eliot_worktree_review",
+        "eliot_autonomy_runtime_action",
+    ] {
+        assert!(!profile.allows(denied), "{denied} must remain unavailable");
+    }
+}
+
+#[test]
+fn scoped_authority_unchanged() -> Result<()> {
+    let project_id = ProjectId::new_v7();
+    let task_id = TaskId::new_v7();
+    let session_id = SessionId::new_v7();
+    let agent_session_id = AgentSessionId::from_uuid(session_id.as_uuid());
+    let mut broker = eliot_types::DelegationState::default();
+    broker
+        .agent_host_sessions
+        .push(eliot_types::AgentSessionHostBinding {
+            agent_session_id,
+            host_identity: eliot_types::AgentHostIdentity {
+                host_id: AgentHostId::Antigravity,
+                implementation_name: "antigravity".to_owned(),
+                client_instance_id: format!("client:{session_id}"),
+            },
+            capability_envelope: AgentCapabilityEnvelope::default(),
+            bound_project_id: Some(project_id),
+            bound_task_id: Some(task_id),
+            task_role_lease_refs: vec!["role:missing".to_owned()],
+        });
+    let error = validate_canonical_host_scope(&broker, session_id, project_id, task_id)
+        .err()
+        .context("host identity without a TaskRoleLease must fail before dispatch")?;
+    assert!(
+        error
+            .to_string()
+            .contains("no active matching TaskRoleLease")
+    );
     Ok(())
 }
 

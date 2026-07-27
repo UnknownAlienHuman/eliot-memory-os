@@ -1268,6 +1268,9 @@ fn decode_bounded_line(mut bytes: Vec<u8>, read: usize) -> Result<Option<String>
     while matches!(bytes.last(), Some(b'\n' | b'\r')) {
         bytes.pop();
     }
+    if bytes.starts_with(&[0xEF, 0xBB, 0xBF]) {
+        bytes.drain(..3);
+    }
     String::from_utf8(bytes)
         .context("IPC frame is not UTF-8")
         .map(Some)
@@ -1286,7 +1289,7 @@ pub(crate) async fn run_stdio_client(
 mod tests {
     use super::{
         ClientProcessAttestation, IPC_PROTOCOL_VERSION, IpcAuthenticationState, IpcClientHandshake,
-        MAX_REPLAY_NONCES, ReplayWindow, allowed_ipc_profile, sha256_file,
+        MAX_REPLAY_NONCES, ReplayWindow, allowed_ipc_profile, decode_bounded_line, sha256_file,
     };
     use anyhow::{Context as _, Result};
     use tokio::sync::Mutex;
@@ -1296,6 +1299,16 @@ mod tests {
     fn claude_desktop_is_an_authenticated_ipc_profile() {
         assert!(allowed_ipc_profile("claude_desktop"));
         assert!(!allowed_ipc_profile("raw_patch_runner"));
+    }
+
+    #[test]
+    fn stdio_frame_accepts_one_leading_utf8_bom_from_windows_powershell() -> Result<()> {
+        let payload = b"\xEF\xBB\xBF{\"jsonrpc\":\"2.0\",\"id\":1}\r\n".to_vec();
+        let decoded = decode_bounded_line(payload.clone(), payload.len())?.context("frame")?;
+        assert_eq!(decoded, r#"{"jsonrpc":"2.0","id":1}"#);
+        let parsed: serde_json::Value = serde_json::from_str(&decoded)?;
+        assert_eq!(parsed["jsonrpc"], "2.0");
+        Ok(())
     }
 
     #[test]

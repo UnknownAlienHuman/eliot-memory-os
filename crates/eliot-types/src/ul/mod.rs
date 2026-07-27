@@ -2,6 +2,7 @@ pub mod activation;
 pub mod artifact;
 pub mod behavior;
 pub mod concept;
+pub mod cross_agent;
 pub mod cue;
 pub mod dependency;
 pub mod exam;

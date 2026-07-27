@@ -3,8 +3,9 @@
 use eliot_engine::{
     AntigravityBinaryResolver, AntigravityCapabilityProbeService,
     AntigravityCommandContractService, AntigravityEnvPolicyService, AntigravityExecutionGate,
-    AntigravityMcpBoundaryService, AntigravityRunner, AntigravitySafetyPolicy,
-    AntigravityTelemetryService, AntigravityTextOutputNormalizer, antigravity_review_request,
+    AntigravityMcpBoundaryService, AntigravityMcpConfigService, AntigravityRunner,
+    AntigravitySafetyPolicy, AntigravityTelemetryService, AntigravityTextOutputNormalizer,
+    antigravity_review_request,
 };
 use eliot_types::{
     AgentId, AgentRole, AgentSessionId, AntigravityBinaryCandidateSource,
@@ -34,6 +35,51 @@ fn windows_resolver_finds_agy_in_path() -> TestResult {
         AntigravityBinaryResolutionStatus::Resolved
     );
     assert!(resolution.selected_path.is_some());
+    Ok(())
+}
+
+#[test]
+fn plugin_default_unchanged() -> TestResult {
+    let executable = temp_binary("eliot-governor.exe")?;
+    let desired = AntigravityMcpConfigService.desired_server_value(&executable)?;
+    assert_eq!(
+        desired.get("args"),
+        Some(&serde_json::json!([
+            "mcp",
+            "stdio",
+            "--host",
+            "antigravity",
+            "--instance",
+            "default"
+        ]))
+    );
+    assert!(
+        desired
+            .get("args")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|args| args.iter().all(|arg| arg != "external_auditor"))
+    );
+    Ok(())
+}
+
+#[test]
+fn isolated_certification_profile_is_explicit() -> TestResult {
+    let executable = temp_binary("eliot-governor.exe")?;
+    let desired = AntigravityMcpConfigService
+        .desired_server_value_with_profile(&executable, Some("external_auditor"))?;
+    assert_eq!(
+        desired.get("args"),
+        Some(&serde_json::json!([
+            "mcp",
+            "stdio",
+            "--host",
+            "antigravity",
+            "--profile",
+            "external_auditor",
+            "--instance",
+            "default"
+        ]))
+    );
     Ok(())
 }
 

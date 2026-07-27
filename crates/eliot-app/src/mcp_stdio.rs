@@ -601,7 +601,12 @@ impl McpAccessProfile {
             }
             Self::ExternalAuditor => {
                 READ_ONLY_TOOLS.contains(&name)
-                    || matches!(name, "eliot_agent_candidate_submit" | "eliot_agent_result")
+                    || matches!(
+                        name,
+                        "eliot_agent_candidate_submit"
+                            | "eliot_agent_result"
+                            | "eliot_memory_influence_trace"
+                    )
             }
             Self::Verifier => READ_ONLY_TOOLS.contains(&name),
             Self::HumanOperator => OPERATOR_TOOLS.contains(&name),
@@ -615,6 +620,30 @@ impl McpAccessProfile {
                     )
             }
         }
+    }
+}
+
+fn resolve_effective_profile(
+    requested_profile: &str,
+    host: Option<&str>,
+    cognitive_control: bool,
+) -> Result<McpAccessProfile> {
+    if cognitive_control {
+        return Ok(McpAccessProfile::CognitiveControl);
+    }
+    match (host, requested_profile) {
+        (None, requested) => McpAccessProfile::parse(requested),
+        (Some("claude" | "claude-desktop"), "default") => Ok(McpAccessProfile::ClaudeGoverned),
+        (Some("antigravity" | "opencode" | "codex"), "default")
+        | (Some("antigravity"), "dynamic_agent" | "agent_host") => {
+            Ok(McpAccessProfile::DynamicAgent)
+        }
+        (Some("antigravity"), "external_auditor" | "antigravity-auditor") => {
+            Ok(McpAccessProfile::ExternalAuditor)
+        }
+        (Some(host), requested) => anyhow::bail!(
+            "UNSUPPORTED_HOST_PROFILE_PAIR: host={host} requested_profile={requested}"
+        ),
     }
 }
 
@@ -642,16 +671,11 @@ pub async fn run(
     {
         anyhow::bail!("unsupported agent host: {host}");
     }
-    let effective_profile = if std::env::var_os("ELIOT_COGNITIVE_CONTROL").is_some() {
-        "cognitive_control"
-    } else {
-        match host {
-            Some("claude" | "claude-desktop") => "claude_governed",
-            Some(_) => "dynamic_agent",
-            None => profile,
-        }
-    };
-    let profile = McpAccessProfile::parse(effective_profile)?;
+    let profile = resolve_effective_profile(
+        profile,
+        host,
+        std::env::var_os("ELIOT_COGNITIVE_CONTROL").is_some(),
+    )?;
     if matches!(
         profile,
         McpAccessProfile::CognitiveGovernor

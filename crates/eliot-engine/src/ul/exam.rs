@@ -510,6 +510,7 @@ pub fn build_cold_exam_request(
         project_id: plan.project_id,
         task_id: deterministic_task_id(&plan.exam_id),
         route,
+        model: None,
         prompt: exam_prompt(charter, map, &plan.questions, UL_EXAM_INPUT_BYTES),
         output_schema: json!({
             "type": "object",
