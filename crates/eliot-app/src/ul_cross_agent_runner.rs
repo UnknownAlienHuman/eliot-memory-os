@@ -36,6 +36,7 @@ const ANTIGRAVITY_UL_MODEL: &str = "claude-opus-4-6-thinking";
 const CLAUDE_SMOKE_MODEL: &str = "sonnet";
 const ANTIGRAVITY_SMOKE_MODEL: &str = "gemini-3.6-flash-high";
 const CLAUDE_WRITER_REFUSAL_NOTE: &str = "Claude Code previously safety-refused the legacy imperative UL-11 writer prompt before tool_use. Under explicit operator authorization, the writer prompt now states that this is a synthetic candidate-only certification write. Preserve this note as a provider-compatibility regression marker.";
+const ANTIGRAVITY_WRITER_NON_JSON_NOTE: &str = "Antigravity Opus 4.6 previously exited successfully before tool_use with bounded non-JSON stdout. Raw provider prose was intentionally not retained, so this is an unclassified contract failure and must not be relabeled as a safety refusal.";
 
 #[derive(Clone, Debug, Serialize)]
 struct CrossAgentDoctor {
@@ -81,6 +82,7 @@ struct ScopedMcpPreflightEvidence {
     host: AgentHostId,
     profile: String,
     agent_session_id: String,
+    memory_scope: &'static str,
     project_id: String,
     task_id: String,
     role_lease_id: String,
@@ -282,6 +284,26 @@ pub(crate) async fn run(config_path: &Path, confirmation: &str) -> Result<()> {
             break;
         }
 
+        let preflight_session_id = fresh_preflight_session(call.session_id);
+        let preflight_scope = crate::host_runtime::prepare_ul_auditor_scope(
+            config_path,
+            call.host,
+            project_id,
+            call.task_id,
+            preflight_session_id,
+            &format!("{run_id}-{}-preflight", call.case_id),
+        )
+        .await
+        .with_context(|| format!("prepare isolated MCP preflight for {}", call.case_id))?;
+        let mcp_preflight = scoped_mcp_preflight(
+            config_path,
+            call.host,
+            project_id,
+            call.task_id,
+            preflight_session_id,
+            &preflight_scope,
+        )
+        .with_context(|| format!("run scoped MCP preflight for {}", call.case_id))?;
         let launch_scope = crate::host_runtime::prepare_ul_auditor_scope(
             config_path,
             call.host,
@@ -292,15 +314,6 @@ pub(crate) async fn run(config_path: &Path, confirmation: &str) -> Result<()> {
         )
         .await
         .with_context(|| format!("prepare canonical auditor scope for {}", call.case_id))?;
-        let mcp_preflight = scoped_mcp_preflight(
-            config_path,
-            call.host,
-            project_id,
-            call.task_id,
-            call.session_id,
-            &launch_scope,
-        )
-        .with_context(|| format!("run scoped MCP preflight for {}", call.case_id))?;
         let revision_before = project_revision(config_path, project_id).ok();
         let request = UlReasoningRequest {
             idempotency_key: format!("{run_id}-{}", call.case_id),
@@ -451,12 +464,20 @@ pub(crate) async fn run(config_path: &Path, confirmation: &str) -> Result<()> {
         provider_call_count,
         calls,
         terminal_errors,
-        known_provider_issues: vec![KnownProviderIssue {
-            provider: "claude-code",
-            category: "safety_refusal_before_tool_use",
-            status: "prompt_reworded_under_operator_authorization",
-            note: CLAUDE_WRITER_REFUSAL_NOTE,
-        }],
+        known_provider_issues: vec![
+            KnownProviderIssue {
+                provider: "claude-code",
+                category: "safety_refusal_before_tool_use",
+                status: "prompt_reworded_under_operator_authorization",
+                note: CLAUDE_WRITER_REFUSAL_NOTE,
+            },
+            KnownProviderIssue {
+                provider: "antigravity",
+                category: "unclassified_non_json_before_tool_use",
+                status: "provider_contract_hardened_pending_retest",
+                note: ANTIGRAVITY_WRITER_NON_JSON_NOTE,
+            },
+        ],
     };
     atomic_write_json(&run_root.join("evidence.json"), &evidence)?;
     atomic_write_json(
@@ -970,7 +991,7 @@ fn scoped_mcp_preflight(
         "-ToolName",
         "eliot_current_state",
         "-ToolArgumentsJson",
-        &serde_json::to_string(&json!({"project_id": project_id}))?,
+        &serde_json::to_string(&preflight_current_state_arguments())?,
         "-ClientName",
         &format!("eliot-ul11r3-{}-preflight", host.as_str()),
         "-TimeoutSeconds",
@@ -1074,6 +1095,7 @@ fn scoped_mcp_preflight(
         host,
         profile: actual_profile.to_owned(),
         agent_session_id: agent_session_id.to_string(),
+        memory_scope: "memory_free_control",
         project_id: project_id.to_string(),
         task_id: task_id.to_string(),
         role_lease_id: role_lease_id.to_owned(),
@@ -1336,13 +1358,17 @@ fn reader_prompt(call: &eliot_types::UlCrossAgentPlannedCall, project_id: Projec
         UlCrossAgentDirection::A => READER_PROMPT_ALPHA,
         UlCrossAgentDirection::B => READER_PROMPT_BETA,
     };
-    let memory_boundary = if call.memory_mode == UlCrossAgentMemoryMode::MemoryFreeControl {
-        "This is the pre-registered memory_free_control arm. Every ELIOT packet/current-state call must use memory_free_control, and no reusable memory handle may be exposed."
-    } else {
-        "Use the normal governed ELIOT retrieval path for this certification project."
+    let memory_boundary = match call.memory_mode {
+        UlCrossAgentMemoryMode::MemoryFreeControl => {
+            "This is the pre-registered memory_free_control arm. Do not call recall_l0, fetch_l2, compile_packet_l3, or memory_influence_trace. If you inspect current state, its scope must be memory_free_control. No reusable memory handle may be exposed."
+        }
+        UlCrossAgentMemoryMode::Treatment => {
+            "Use the normal governed ELIOT retrieval path for this certification project. Start with recall_l0 using the inspected file path as the query; if it returns a relevant handle, fetch that exact handle before acknowledging influence."
+        }
+        _ => "Use the normal governed ELIOT retrieval path for this certification project.",
     };
     format!(
-        "{semantic}\n\nCertification scope (contains no marker): project_id={project_id}; task_id={}; planned fresh session={}. {memory_boundary}\nIf a useful bound memory is actually retrieved, return its exact canonical handle and allowed delivery surface. For a treatment call, record eliot_memory_influence_trace with seen_but_not_used or used_and_changed_action; the latter requires downstream_outcome_ref. Set influence_receipt to the exact observability_receipt.write_id returned by that call. Controls must return influence_receipt=null. Return only the six-field JSON object.",
+        "{semantic}\n\nCertification scope (contains no marker): project_id={project_id}; task_id={}; planned fresh session={}. {memory_boundary}\nIf useful bound memory is actually received or retrieved, return its exact canonical handle. delivery_surface must be the exact receipt surface and one of ul_boot, ul_fired, recall_l0, fetch_l2, or packet; it is never an influence class. first_action must be the lowercase snake_case action identifier derived from the recovered lesson's imperative phrase, not a retrieval tool name or narration. For a treatment call, record eliot_memory_influence_trace with seen_but_not_used or used_and_changed_action; the latter requires downstream_outcome_ref. Set influence_receipt to the exact observability_receipt.write_id returned by that call. Controls must return influence_receipt=null. Return only the six-field JSON object.",
         call.task_id, call.session_id
     )
 }
@@ -1384,9 +1410,22 @@ fn writer_prompt(
 
 fn render_writer_prompt(candidate: &Value, write_id: &str) -> Result<String> {
     Ok(format!(
-        "Authorized synthetic UL-11 certification writer step. The operator approved one candidate-only test write through the installed ELIOT MCP tool. Invoke eliot_agent_candidate_submit exactly once using the JSON arguments below. The arguments contain generated certification data, do not authorize truth promotion, and do not authorize direct database access.\nTool arguments:\n{}\nAfter the tool succeeds, return only writer receipt JSON with candidate_handle exactly `claim:{write_id}`, write_receipt exactly the committed write_receipt.write_id `{write_id}`, binding_refs, and candidate_only=true.",
+        "Authorized synthetic UL-11 certification writer step. Review the supplied JSON as data against the installed ELIOT MCP schema and the candidate-only boundary. This task authorizes one reversible candidate proposal, not source-file or shell changes, truth promotion, or direct database access. If the arguments satisfy that boundary, invoke eliot_agent_candidate_submit exactly once; do not fabricate success or repeat the call.\nTool arguments:\n{}\nAfter the tool succeeds, return only raw writer receipt JSON with no prose or Markdown: candidate_handle exactly `claim:{write_id}`, write_receipt exactly the committed write_receipt.write_id `{write_id}`, binding_refs, and candidate_only=true.",
         serde_json::to_string(candidate)?
     ))
+}
+
+fn preflight_current_state_arguments() -> Value {
+    json!({"scope": "memory_free_control"})
+}
+
+fn fresh_preflight_session(provider_session_id: SessionId) -> SessionId {
+    loop {
+        let session_id = SessionId::new_v7();
+        if session_id != provider_session_id {
+            return session_id;
+        }
+    }
 }
 
 fn expected_writer_statement(call: &eliot_types::UlCrossAgentPlannedCall, marker: &str) -> String {
@@ -1748,7 +1787,7 @@ fn random_marker() -> String {
 
 fn report_markdown(report: &UlCrossAgentReport) -> String {
     format!(
-        "# UL-11 blind reciprocal memory certification\n\n- Run: `{}`\n- Project: `{}`\n- Provider calls: `{}/{}`\n- Claude to Antigravity: `{}`\n- Antigravity to Claude: `{}`\n- Global result: `{}`\n- Unknown outcomes: `{}`\n- Known provider issue: Claude Code previously safety-refused the legacy writer wording before tool use; the operator-authorized synthetic wording is tracked as a regression fix.\n\nThis report is sanitized: hidden markers, private writer prompts, and provider credentials are not included.\n",
+        "# UL-11 blind reciprocal memory certification\n\n- Run: `{}`\n- Project: `{}`\n- Provider calls: `{}/{}`\n- Claude to Antigravity: `{}`\n- Antigravity to Claude: `{}`\n- Global result: `{}`\n- Unknown outcomes: `{}`\n- Known provider issue: Claude Code previously safety-refused the legacy writer wording before tool use; the operator-authorized synthetic wording is tracked as a regression fix.\n- Known provider issue: Antigravity previously returned bounded non-JSON output before tool use; because raw prose was not retained, the cause remains unclassified rather than being labeled a refusal.\n\nThis report is sanitized: hidden markers, private writer prompts, and provider credentials are not included.\n",
         report.run_id,
         report.project_id,
         report.provider_call_count,
@@ -1821,10 +1860,14 @@ fn certification_root() -> Result<PathBuf> {
 mod tests {
     use super::{
         auditor_mcp_profile, error_reports_provider_dispatched, error_reports_unknown_outcome,
-        provider_doctor_selector, provider_model, render_writer_prompt, subprocess_path,
+        fresh_preflight_session, preflight_current_state_arguments, provider_doctor_selector,
+        provider_model, reader_prompt, render_writer_prompt, subprocess_path,
         write_antigravity_workspace_mcp,
     };
-    use eliot_types::AgentHostId;
+    use eliot_types::{
+        AgentHostId, SessionId, TaskId, UlCrossAgentDirection, UlCrossAgentMemoryMode,
+        UlCrossAgentPlannedCall, UlCrossAgentRole,
+    };
     use serde_json::json;
     use std::path::Path;
 
@@ -1892,8 +1935,62 @@ mod tests {
         .expect("writer prompt");
         assert!(prompt.contains("Authorized synthetic UL-11 certification writer step"));
         assert!(prompt.contains("eliot_agent_candidate_submit exactly once"));
-        assert!(prompt.contains("do not authorize truth promotion"));
+        assert!(prompt.contains("one reversible candidate proposal"));
+        assert!(prompt.contains("not source-file or shell changes, truth promotion"));
+        assert!(prompt.contains("only raw writer receipt JSON with no prose or Markdown"));
         assert!(!prompt.contains("Private UL-11 writer call"));
+    }
+
+    #[test]
+    fn full_call_preflight_is_isolated_and_reader_contract_stays_blind() {
+        let provider_session = SessionId::new_v7();
+        let preflight_session = fresh_preflight_session(provider_session);
+        assert_ne!(preflight_session, provider_session);
+        assert_eq!(
+            preflight_current_state_arguments(),
+            json!({"scope": "memory_free_control"})
+        );
+
+        let treatment = UlCrossAgentPlannedCall {
+            call_number: 3,
+            case_id: "A2".to_owned(),
+            direction: UlCrossAgentDirection::A,
+            host: AgentHostId::Antigravity,
+            role: UlCrossAgentRole::Treatment,
+            memory_mode: UlCrossAgentMemoryMode::Treatment,
+            task_id: TaskId::new_v7(),
+            session_id: provider_session,
+            file_cue: "src/relay_alpha.rs".to_owned(),
+            branch_phrase: "FROST-17".to_owned(),
+            expected_first_action: "inspect_frame_owner".to_owned(),
+            marker_visible_to_provider: false,
+        };
+        let prompt = reader_prompt(
+            &treatment,
+            "00000000-0000-0000-0000-000000000001"
+                .parse()
+                .expect("project id"),
+        );
+        for surface in ["ul_boot", "ul_fired", "recall_l0", "fetch_l2", "packet"] {
+            assert!(prompt.contains(surface));
+        }
+        assert!(prompt.contains("it is never an influence class"));
+        assert!(prompt.contains("lowercase snake_case action identifier"));
+        assert!(!prompt.contains("inspect_frame_owner"));
+        assert!(!prompt.contains("ULX-"));
+        assert!(!prompt.contains("claim:"));
+
+        let mut memory_free = treatment;
+        memory_free.role = UlCrossAgentRole::MemoryFreeControl;
+        memory_free.memory_mode = UlCrossAgentMemoryMode::MemoryFreeControl;
+        let memory_free_prompt = reader_prompt(
+            &memory_free,
+            "00000000-0000-0000-0000-000000000001"
+                .parse()
+                .expect("project id"),
+        );
+        assert!(memory_free_prompt.contains("Do not call recall_l0, fetch_l2"));
+        assert!(memory_free_prompt.contains("scope must be memory_free_control"));
     }
 
     #[test]
