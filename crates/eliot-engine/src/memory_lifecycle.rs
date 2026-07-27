@@ -261,6 +261,20 @@ impl MemoryLifecycleService {
         response.truncation.returned = response.handles.len();
         response.rank_trace.candidates_returned = response.handles.len();
         response.rank_trace.no_useful_memory = response.handles.is_empty();
+        let visible_handles = response
+            .handles
+            .iter()
+            .map(|handle| handle.handle.as_str())
+            .collect::<std::collections::HashSet<_>>();
+        response.memory_confidence = eliot_types::MemoryConfidence::from_top_score(
+            response
+                .rank_trace
+                .feature_scores
+                .iter()
+                .filter(|score| visible_handles.contains(score.handle.as_str()))
+                .map(|score| score.total)
+                .max(),
+        );
         response
     }
 
@@ -277,7 +291,9 @@ impl MemoryLifecycleService {
                 | MemoryLifecycleState::HardDeleted => {
                     packet.suppressed_refs.push(target_ref.clone());
                 }
-                MemoryLifecycleState::Dormant | MemoryLifecycleState::Demoted => {
+                MemoryLifecycleState::Dormant
+                | MemoryLifecycleState::Demoted
+                | MemoryLifecycleState::Stale => {
                     packet.demoted_refs.push(target_ref.clone());
                 }
                 MemoryLifecycleState::Superseded => packet.superseded_refs.push(target_ref.clone()),
@@ -994,6 +1010,7 @@ fn state_name(state: MemoryLifecycleState) -> &'static str {
         MemoryLifecycleState::Poisoned => "poisoned",
         MemoryLifecycleState::RetainedForAudit => "retained_for_audit",
         MemoryLifecycleState::ReactivationCandidate => "reactivation_candidate",
+        MemoryLifecycleState::Stale => "stale",
     }
 }
 

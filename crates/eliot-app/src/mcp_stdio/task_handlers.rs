@@ -392,6 +392,7 @@ fn enforce_memory_free_control(
     packet.memory_decisions.clear();
     packet.experience_priors.clear();
     packet.memory_need_decision = None;
+    packet.memory_confidence = eliot_types::MemoryConfidence::None;
     packet.memory_applicability.decisions.clear();
     packet.memory_applicability.inclusion_reasons.clear();
     packet.memory_applicability.suppression_reasons =

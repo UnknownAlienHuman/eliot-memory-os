@@ -539,6 +539,7 @@ fn assemble_packet(
         project_id: request.project_id,
         task_id: request.task_id.clone(),
         goal: request.goal.clone(),
+        memory_confidence: reads.recall.memory_confidence,
         acceptance_items: Vec::new(),
         at_revision: max_revision(reads.current_state.memory_revision, reads.fetch.at_revision),
         current_truth: reads.current_state.verified_now,
@@ -1643,6 +1644,7 @@ mod current_git_scope_tests {
             project_id,
             task_id: "task".to_owned(),
             goal: "resolve current truth".to_owned(),
+            memory_confidence: eliot_types::MemoryConfidence::None,
             acceptance_items: Vec::new(),
             at_revision: MemoryRevision::new(1),
             current_truth: vec![ClaimSummary {

@@ -14,6 +14,18 @@ LET $observation_ids = $exact.observations.map(|$fragments| {
 LET $failure_ids = $exact.failures.map(|$fragments| {
   RETURN <string> array::join($fragments.map(|$fragment| <string> $fragment), '');
 });
+LET $card_ids = $exact.cards.map(|$fragments| {
+  RETURN <string> array::join($fragments.map(|$fragment| <string> $fragment), '');
+});
+LET $capsule_ids = $exact.capsules.map(|$fragments| {
+  RETURN <string> array::join($fragments.map(|$fragment| <string> $fragment), '');
+});
+LET $charter_ids = $exact.charters.map(|$fragments| {
+  RETURN <string> array::join($fragments.map(|$fragment| <string> $fragment), '');
+});
+LET $map_ids = $exact.maps.map(|$fragments| {
+  RETURN <string> array::join($fragments.map(|$fragment| <string> $fragment), '');
+});
 LET $relation_ids = $exact.relations.map(|$fragments| {
   RETURN <string> array::join($fragments.map(|$fragment| <string> $fragment), '');
 });
@@ -124,6 +136,28 @@ LET $forbidden_observations = SELECT VALUE string::concat('observation:', <strin
   FROM tool_observation WHERE project_id != $request.project_id AND <string> observation_id IN $observation_ids;
 LET $forbidden_failures = SELECT VALUE string::concat('failure:', <string> fingerprint)
   FROM failure_fingerprint WHERE project_id != $request.project_id AND <string> fingerprint IN $failure_ids;
+LET $forbidden_ul_artifacts = SELECT VALUE
+  IF receipt_kind = 'module_card' {
+    string::concat('card:', <string> receipt_body.card_id)
+  } ELSE IF receipt_kind = 'subsystem_capsule' {
+    string::concat('capsule:', <string> receipt_body.capsule_id)
+  } ELSE IF receipt_kind = 'project_charter' {
+    string::concat('charter:', <string> receipt_body.charter_id)
+  } ELSE {
+    string::concat('map:', <string> receipt_body.map_id)
+  }
+  FROM canonical_record
+  WHERE project_id != $request.project_id
+    AND (
+      (receipt_kind = 'module_card' AND <string> receipt_body.card_id IN $card_ids)
+      OR (receipt_kind = 'subsystem_capsule' AND <string> receipt_body.capsule_id IN $capsule_ids)
+      OR (receipt_kind = 'project_charter' AND <string> receipt_body.charter_id IN $charter_ids)
+      OR (receipt_kind = 'system_map' AND <string> receipt_body.map_id IN $map_ids)
+    );
+LET $dirty_ul_artifacts = SELECT target_kind, target_id
+  FROM ul_artifact_dirty
+  WHERE project_id = $request.project_id
+    AND dirty = true;
 
 RETURN {
   project_id: $request.project_id,
@@ -143,11 +177,69 @@ RETURN {
   failure_fingerprints: SELECT fingerprint, summary, payload FROM failure_fingerprint
     WHERE project_id = $request.project_id
       AND <string> fingerprint IN array::concat($failure_ids, $relation_neighbors),
+  ul_artifacts: SELECT
+      memory_revision,
+      project_sequence,
+      IF receipt_kind = 'module_card' {
+        string::concat('card:', <string> receipt_body.card_id)
+      } ELSE IF receipt_kind = 'subsystem_capsule' {
+        string::concat('capsule:', <string> receipt_body.capsule_id)
+      } ELSE IF receipt_kind = 'project_charter' {
+        string::concat('charter:', <string> receipt_body.charter_id)
+      } ELSE {
+        string::concat('map:', <string> receipt_body.map_id)
+      } AS handle,
+      <string> receipt_kind AS record_type,
+      <string> receipt_body.body_md AS body_md,
+      IF receipt_body.source_refs != NONE {
+        receipt_body.source_refs
+      } ELSE IF receipt_body.concept_refs != NONE {
+        receipt_body.concept_refs
+      } ELSE IF receipt_body.subsystem_concept_refs != NONE {
+        receipt_body.subsystem_concept_refs
+      } ELSE {
+        []
+      } AS source_refs,
+      IF receipt_body.freshness != NONE {
+        <string> receipt_body.freshness
+      } ELSE IF array::len($dirty_ul_artifacts.filter(|$dirty| {
+        RETURN <string> $dirty.target_kind = <string> receipt_kind
+          AND <string> $dirty.target_id = IF receipt_kind = 'module_card' {
+            <string> receipt_body.card_id
+          } ELSE IF receipt_kind = 'subsystem_capsule' {
+            <string> receipt_body.capsule_id
+          } ELSE IF receipt_kind = 'project_charter' {
+            <string> receipt_body.charter_id
+          } ELSE {
+            <string> receipt_body.map_id
+          };
+      })) > 0 {
+        'stale'
+      } ELSE {
+        'unverified'
+      } AS freshness
+    FROM canonical_record
+    WHERE project_id = $request.project_id
+      AND (
+        (receipt_kind = 'module_card' AND <string> receipt_body.card_id IN $card_ids)
+        OR (receipt_kind = 'subsystem_capsule' AND <string> receipt_body.capsule_id IN $capsule_ids)
+        OR (receipt_kind = 'project_charter' AND <string> receipt_body.charter_id IN $charter_ids)
+        OR (receipt_kind = 'system_map' AND <string> receipt_body.map_id IN $map_ids)
+      )
+    ORDER BY memory_revision DESC, project_sequence DESC
+    LIMIT 64,
   relations: $relations,
   requested_handles: [],
   returned_handles: [],
   missing_handles: [],
-  forbidden_handles: array::concat($forbidden_claims, $forbidden_evidence, $forbidden_verifications, $forbidden_observations, $forbidden_failures),
+  forbidden_handles: array::concat(
+    $forbidden_claims,
+    $forbidden_evidence,
+    $forbidden_verifications,
+    $forbidden_observations,
+    $forbidden_failures,
+    $forbidden_ul_artifacts
+  ),
   continuation: NONE,
   truncation: {
     truncated: $relation_truncated,

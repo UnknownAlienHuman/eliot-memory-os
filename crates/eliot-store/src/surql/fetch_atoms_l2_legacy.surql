@@ -21,6 +21,7 @@ RETURN {
   verification_runs: SELECT verification_id, result, summary, payload FROM verification_run WHERE project_id = $request.project_id LIMIT 50,
   tool_observations: SELECT observation_id, tool_name, observation, payload FROM tool_observation WHERE project_id = $request.project_id LIMIT 50,
   failure_fingerprints: SELECT fingerprint, summary, payload FROM failure_fingerprint WHERE project_id = $request.project_id LIMIT 50,
+  ul_artifacts: [],
   relations: array::concat(
     $supports,
     $verified_by,

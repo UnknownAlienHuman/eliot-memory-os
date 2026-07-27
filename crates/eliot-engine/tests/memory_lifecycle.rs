@@ -382,6 +382,7 @@ fn l0_fixture() -> RecallL0Response {
             handle("claim:suppressed", MemoryLifecycleState::Suppressed),
             handle("claim:archived", MemoryLifecycleState::Archived),
         ],
+        memory_confidence: eliot_types::MemoryConfidence::Found,
         query_mode: "fixture".to_owned(),
         rank_trace: eliot_types::L0RankTrace::default(),
         truncation: TruncationInfo {

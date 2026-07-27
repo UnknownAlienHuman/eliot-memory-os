@@ -99,6 +99,9 @@ pub fn filter_required_exact_l2_response(response: &mut FetchAtomsL2Response, ha
     response
         .failure_fingerprints
         .retain(|failure| handles.contains(normalized_public_handle(&failure.fingerprint)));
+    response
+        .ul_artifacts
+        .retain(|artifact| handles.contains(normalized_public_handle(&artifact.handle)));
     response.relations.retain(|relation| {
         handles.contains(normalized_public_handle(&relation.from))
             && handles.contains(normalized_public_handle(&relation.to))
@@ -108,6 +111,7 @@ pub fn filter_required_exact_l2_response(response: &mut FetchAtomsL2Response, ha
         + response.verification_runs.len()
         + response.tool_observations.len()
         + response.failure_fingerprints.len()
+        + response.ul_artifacts.len()
         + response.relations.len();
 }
 
@@ -123,6 +127,11 @@ fn normalized_public_handle(value: &str) -> &str {
         "tool_observation:",
         "failure:",
         "failure_fingerprint:",
+        "card:",
+        "capsule:",
+        "charter:",
+        "map:",
+        "system-map:",
     ];
     PREFIXES
         .iter()
@@ -208,6 +217,7 @@ mod tests {
                 verification_runs: Vec::new(),
                 tool_observations: Vec::new(),
                 failure_fingerprints: Vec::new(),
+                ul_artifacts: Vec::new(),
                 relations: vec![RelationSummary {
                     relation_type: RelationType::Supports,
                     from: claim_handle.clone(),

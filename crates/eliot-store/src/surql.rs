@@ -37,7 +37,7 @@ pub enum NamedSurqlOp {
     ObservabilityReceiptById,
     ObservabilityRecordsByKind,
     CurrentState,
-    RecallL0,
+    LoadRecallCandidates,
     FetchAtomsL2,
     FetchAtomsL2Legacy,
     GraphHealth,
@@ -101,7 +101,7 @@ impl NamedSurqlOp {
             Self::ObservabilityReceiptById => "observability_receipt_by_id",
             Self::ObservabilityRecordsByKind => "observability_records_by_kind",
             Self::CurrentState => "current_state",
-            Self::RecallL0 => "recall_l0",
+            Self::LoadRecallCandidates => "load_recall_candidates",
             Self::FetchAtomsL2 => "fetch_atoms_l2",
             Self::FetchAtomsL2Legacy => "fetch_atoms_l2_legacy",
             Self::GraphHealth => "graph_health",
@@ -183,7 +183,7 @@ impl NamedSurqlOp {
                 include_str!("surql/observability_records_by_kind.surql")
             }
             Self::CurrentState => include_str!("surql/current_state.surql"),
-            Self::RecallL0 => include_str!("surql/recall_l0.surql"),
+            Self::LoadRecallCandidates => include_str!("surql/load_recall_candidates.surql"),
             Self::FetchAtomsL2 => include_str!("surql/fetch_atoms_l2.surql"),
             Self::FetchAtomsL2Legacy => include_str!("surql/fetch_atoms_l2_legacy.surql"),
             Self::GraphHealth => include_str!("surql/graph_health.surql"),
@@ -472,9 +472,9 @@ fn foundational_templates() -> [SurqlTemplate; 41] {
             512 * 1024,
         ),
         template(
-            NamedSurqlOp::RecallL0,
-            "RecallL0Request",
-            "RecallL0Response",
+            NamedSurqlOp::LoadRecallCandidates,
+            "LoadRecallCandidatesInput",
+            "LoadRecallCandidatesOutput",
             128 * 1024,
         ),
         template(
@@ -675,19 +675,20 @@ mod tests {
     }
 
     #[test]
-    fn l0_recall_resolves_current_lifecycle_state_for_admission_filtering() {
-        let template = NamedSurqlOp::RecallL0.template();
+    fn l0_candidate_load_is_bounded_multi_kind_and_does_not_rank() {
+        let template = NamedSurqlOp::LoadRecallCandidates.template();
 
-        assert!(template.contains("receipt_kind = 'state_transition'"));
-        assert!(template.contains("receipt_body.to_state"));
-        assert!(template.contains("LET $resolved = $claims.map"));
-        assert!(template.contains("$lifecycle_state IN ['active', 'restored']"));
-        assert!(template.contains("query_aware_semantic_lexical_relational_v2"));
-        let write = NamedSurqlOp::ApplyWriteEnvelope.template();
-        assert!(write.contains("'state_transition'"));
-        assert!(write.contains("$observation.payload.receipt_kind IN $canonical_kinds"));
-        assert!(write.contains("UPSERT type::record('canonical_record'"));
-        assert!(!write.contains("UPDATE type::record('claim_card'"));
+        assert!(template.contains("FROM claim_card"));
+        assert!(template.contains("FROM failure_fingerprint"));
+        assert!(template.contains("FROM canonical_record"));
+        assert!(template.contains("'module_card'"));
+        assert!(template.contains("'subsystem_capsule'"));
+        assert!(template.contains("'project_charter'"));
+        assert!(template.contains("'system_map'"));
+        assert!(template.contains("array::slice($all_candidates, 0, 512)"));
+        assert!(!template.contains("string::words"));
+        assert!(!template.contains("string::slug"));
+        assert!(!template.contains("relevance_score"));
     }
 
     #[test]

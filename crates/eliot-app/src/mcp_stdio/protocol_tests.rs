@@ -1246,6 +1246,7 @@ fn operator_memory_projection_exposes_rank_suppression_and_exact_resolution_fiel
             lifecycle_state: Some(MemoryLifecycleState::Active),
             lifecycle_badge: None,
         }],
+        memory_confidence: eliot_types::MemoryConfidence::Found,
         query_mode: "query_aware_semantic_lexical_relational_v2".to_owned(),
         rank_trace: eliot_types::L0RankTrace {
             query: "current candidate".to_owned(),
@@ -1326,6 +1327,7 @@ fn operator_memory_projection_exposes_rank_suppression_and_exact_resolution_fiel
         verification_runs: Vec::new(),
         tool_observations: Vec::new(),
         failure_fingerprints: Vec::new(),
+        ul_artifacts: Vec::new(),
         relations: Vec::new(),
         requested_handles: vec![format!("claim:{active_id}"), "claim:missing".to_owned()],
         returned_handles: vec![format!("claim:{active_id}")],
@@ -1371,6 +1373,7 @@ fn operator_memory_projection_surfaces_no_useful_memory() {
         project_id: ProjectId::new_v7(),
         at_revision: MemoryRevision::new(7),
         handles: Vec::new(),
+        memory_confidence: eliot_types::MemoryConfidence::None,
         query_mode: "query_aware_semantic_lexical_relational_v2".to_owned(),
         rank_trace: eliot_types::L0RankTrace {
             query: "absent memory".to_owned(),

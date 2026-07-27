@@ -22,6 +22,7 @@ pub enum MemoryLifecycleState {
     Poisoned,
     RetainedForAudit,
     ReactivationCandidate,
+    Stale,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

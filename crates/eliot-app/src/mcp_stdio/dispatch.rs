@@ -706,6 +706,14 @@ pub(super) async fn dispatch_tool(
                 .retain(|score| returned.contains(score.handle.as_str()));
             response.rank_trace.candidates_returned = response.handles.len();
             response.rank_trace.no_useful_memory = response.handles.is_empty();
+            response.memory_confidence = eliot_types::MemoryConfidence::from_top_score(
+                response
+                    .rank_trace
+                    .feature_scores
+                    .iter()
+                    .map(|score| score.total)
+                    .max(),
+            );
             serde_json::to_value(response)?
         }
         "eliot_fetch_l2" => {
