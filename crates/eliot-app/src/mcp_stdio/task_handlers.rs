@@ -620,15 +620,22 @@ async fn dispatch_memory_influence_trace(
                         .last_task_id(project_id, context.session_id)
                 })
                 .context(
-                    "MISSING_PROJECT_PACKET_CONTEXT: minimal influence acknowledgement requires a prior packet for this project or an explicit bound task",
+                    "MISSING_PROJECT_PACKET_CONTEXT: minimal influence acknowledgement requires an explicit bound task and a same-session L3 packet or exact fetch context",
                 )?;
             let (packet_id, packet_handles) = state
                 .ul
                 .touched
                 .packet_context(project_id, context.session_id);
             let packet_id = packet_id.context(
-                "MISSING_PROJECT_PACKET_CONTEXT: minimal influence acknowledgement requires a prior packet for this project or an explicit bound task",
+                "MISSING_PROJECT_PACKET_CONTEXT: minimal influence acknowledgement requires an explicit bound task and a same-session L3 packet or exact fetch context",
             )?;
+            if packet_id.starts_with("retrieval:")
+                && !packet_handles.contains(&ack.memory_handle)
+            {
+                anyhow::bail!(
+                    "EXACT_FETCH_CONTEXT_MISMATCH: minimal influence acknowledgement must name a handle returned by the same-session exact fetch"
+                );
+            }
             let epistemic_status =
                 influence_epistemic_status(state, project_id, &ack.memory_handle).await?;
             let admission_decision = match epistemic_status.as_str() {

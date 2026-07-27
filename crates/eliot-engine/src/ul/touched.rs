@@ -74,9 +74,16 @@ impl TouchedSetRegistry {
                     .filter_map(Value::as_str)
                     .map(ToOwned::to_owned)
                     .collect();
+            } else if tool_name == "eliot_fetch_l2"
+                && let Some((context_id, handles)) =
+                    exact_fetch_context(project_id, session_id, result)
+            {
+                session.last_packet_id = Some(context_id);
+                session.last_packet_handles = handles;
             }
             if let Some(task_id) = result
                 .get("task_id")
+                .or_else(|| result.pointer("/task_contract/task_id"))
                 .and_then(Value::as_str)
                 .and_then(|task_id| task_id.parse().ok())
             {
@@ -261,6 +268,44 @@ impl TouchedSetRegistry {
         }
         observed
     }
+}
+
+fn exact_fetch_context(
+    project_id: ProjectId,
+    session_id: SessionId,
+    result: &Value,
+) -> Option<(String, HashSet<String>)> {
+    let mut handles = result
+        .get("returned_handles")?
+        .as_array()?
+        .iter()
+        .filter_map(Value::as_str)
+        .map(ToOwned::to_owned)
+        .collect::<Vec<_>>();
+    handles.sort();
+    handles.dedup();
+    if handles.is_empty() {
+        return None;
+    }
+
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"eliot-exact-fetch-context-v1\0");
+    hasher.update(project_id.to_string().as_bytes());
+    hasher.update(b"\0");
+    hasher.update(session_id.to_string().as_bytes());
+    hasher.update(b"\0");
+    if let Some(revision) = result.get("at_revision") {
+        hasher.update(revision.to_string().as_bytes());
+    }
+    for handle in &handles {
+        hasher.update(b"\0");
+        hasher.update(handle.as_bytes());
+    }
+
+    Some((
+        format!("retrieval:{}", hasher.finalize().to_hex()),
+        handles.into_iter().collect(),
+    ))
 }
 
 const fn key(project_id: ProjectId, session_id: SessionId) -> ProjectSessionKey {

@@ -263,7 +263,7 @@ fn cli_exposes_separate_cross_agent_group() -> Result<()> {
         .output()?;
     assert!(output.status.success());
     let help = String::from_utf8(output.stdout)?;
-    for command in ["doctor", "run", "report"] {
+    for command in ["doctor", "inspect", "run", "report"] {
         assert!(
             help.contains(command),
             "missing cross-agent command {command}"

@@ -1915,7 +1915,6 @@ impl AntigravityOfficialPluginService {
             && listed_by_agy
             && status.gui_installed
             && status.official_schema_valid
-            && status.agent_visible
             && status.skill_visible;
         AntigravityOfficialPluginInstallReceipt {
             component: "antigravity_official_plugin_install_receipt".to_owned(),
@@ -1931,9 +1930,15 @@ impl AntigravityOfficialPluginService {
             agent_visible: status.agent_visible,
             skill_visible: status.skill_visible,
             reasons: if installed {
-                vec!["official plugin install, listing, agent, and skill checks passed".to_owned()]
+                vec![
+                    "official plugin install, listing, schema, and skill checks passed; the default Antigravity agent consumes the package without a required custom agent"
+                        .to_owned(),
+                ]
             } else {
-                vec!["official plugin install requires command success, agy listing, valid installed schema, agent, and skill".to_owned()]
+                vec![
+                    "official plugin install requires command success, agy listing, valid installed schema, and skill"
+                        .to_owned(),
+                ]
             },
             created_at: OffsetDateTime::now_utc(),
         }

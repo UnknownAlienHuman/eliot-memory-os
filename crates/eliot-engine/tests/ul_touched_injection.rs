@@ -57,3 +57,39 @@ fn t04_touched_set_extracts_expected_cues() {
     assert_eq!(recent[0].value, "src/generated/139.rs");
     assert!(!recent.iter().any(|cue| cue.value == "src/generated/0.rs"));
 }
+
+#[test]
+fn exact_fetch_establishes_a_session_scoped_retrieval_context() {
+    let registry = TouchedSetRegistry::new();
+    let project_id = ProjectId::new_v7();
+    let session_id = SessionId::new_v7();
+    let other_session_id = SessionId::new_v7();
+    let result = json!({
+        "at_revision": "revision:019f0000-0000-7000-8000-000000000001",
+        "returned_handles": [
+            "claim:019f0000-0000-7000-8000-000000000002",
+            "claim:019f0000-0000-7000-8000-000000000002"
+        ]
+    });
+
+    registry.observe_result(project_id, session_id, "eliot_fetch_l2", &result);
+
+    let (context_id, handles) = registry.packet_context(project_id, session_id);
+    assert!(
+        context_id
+            .as_deref()
+            .is_some_and(|context| context.starts_with("retrieval:"))
+    );
+    assert_eq!(handles.len(), 1);
+    assert!(handles.contains("claim:019f0000-0000-7000-8000-000000000002"));
+    assert_eq!(
+        registry.packet_context(project_id, other_session_id),
+        (None, std::collections::HashSet::new())
+    );
+
+    registry.observe_result(project_id, session_id, "eliot_fetch_l2", &result);
+    assert_eq!(
+        registry.packet_context(project_id, session_id).0.as_deref(),
+        context_id.as_deref()
+    );
+}

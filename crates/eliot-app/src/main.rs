@@ -1999,6 +1999,9 @@ async fn dispatch_command(
             },
             commands::UlCommand::CrossAgent { command } => match command {
                 commands::UlCrossAgentCommand::Doctor => ul_cross_agent_runner::doctor(config),
+                commands::UlCrossAgentCommand::Inspect { run_id } => {
+                    ul_cross_agent_runner::inspect(config, &run_id).await
+                }
                 commands::UlCrossAgentCommand::Smoke { host, confirm } => {
                     ul_cross_agent_runner::smoke(config, host.into(), &confirm).await
                 }

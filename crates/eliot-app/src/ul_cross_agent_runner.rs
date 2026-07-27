@@ -164,6 +164,80 @@ pub(crate) fn doctor(config_path: &Path) -> Result<()> {
     Ok(())
 }
 
+pub(crate) async fn inspect(config_path: &Path, run_id: &str) -> Result<()> {
+    validate_run_id(run_id)?;
+    let evidence_path = certification_root()?.join(run_id).join("evidence.json");
+    let evidence: Value = serde_json::from_slice(
+        &fs::read(&evidence_path)
+            .with_context(|| format!("read cross-agent evidence {}", evidence_path.display()))?,
+    )
+    .context("decode cross-agent evidence")?;
+    if evidence.get("run_id").and_then(Value::as_str) != Some(run_id) {
+        bail!("cross-agent evidence run_id does not match the requested run");
+    }
+    let project_id = evidence
+        .get("project_id")
+        .and_then(Value::as_str)
+        .context("cross-agent evidence has no project_id")
+        .and_then(|value| ProjectId::from_str(value).context("parse evidence project_id"))?;
+    let calls = evidence
+        .get("calls")
+        .and_then(Value::as_array)
+        .context("cross-agent evidence has no calls")?;
+    let config = crate::config::load_config(config_path)?;
+    let store = CanonicalStore::new(config.db.surreal);
+    let mut treatments = Vec::new();
+    for call in calls {
+        if call.get("role").and_then(Value::as_str) != Some("treatment") {
+            continue;
+        }
+        let case_id = call
+            .get("case_id")
+            .and_then(Value::as_str)
+            .context("treatment evidence has no case_id")?;
+        let session_id = call
+            .get("planned_session_id")
+            .and_then(Value::as_str)
+            .context("treatment evidence has no planned_session_id")
+            .and_then(|value| SessionId::from_str(value).context("parse treatment session_id"))?;
+        let task_id = call
+            .get("task_id")
+            .and_then(Value::as_str)
+            .context("treatment evidence has no task_id")
+            .and_then(|value| TaskId::from_str(value).context("parse treatment task_id"))?;
+        let receipts = store
+            .load_injection_receipts(project_id, session_id)
+            .await
+            .with_context(|| format!("load {case_id} injection receipts"))?;
+        let influence = store
+            .observability_records_by_kind::<MemoryInfluenceTrace>(
+                project_id,
+                Some(task_id),
+                ObservabilityKind::MemoryInfluenceTrace,
+            )
+            .await
+            .with_context(|| format!("load {case_id} influence records"))?;
+        treatments.push(json!({
+            "case_id": case_id,
+            "provider_session_id": session_id,
+            "task_id": task_id,
+            "injection_receipts": receipts,
+            "influence_records": influence,
+        }));
+    }
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&json!({
+            "schema_version": "eliot-ul-cross-agent-receipt-inspection-v1",
+            "run_id": run_id,
+            "project_id": project_id,
+            "read_only": true,
+            "treatments": treatments,
+        }))?
+    );
+    Ok(())
+}
+
 pub(crate) async fn run(config_path: &Path, confirmation: &str) -> Result<()> {
     if confirmation != UL_CROSS_AGENT_CONFIRMATION_TOKEN {
         bail!("UL cross-agent live run requires --confirm {UL_CROSS_AGENT_CONFIRMATION_TOKEN}");
@@ -1158,6 +1232,40 @@ fn project_revision(config_path: &Path, project_id: ProjectId) -> Result<u64> {
         .context("fetch_l2 returned no at_revision")
 }
 
+fn treatment_surface_matches_canonical_evidence(
+    reader_surface: Option<&str>,
+    receipt_surface: &str,
+    influence_context_id: Option<&str>,
+) -> bool {
+    let known_receipt_surface = matches!(
+        receipt_surface,
+        "mcp_auto_boot"
+            | "mcp_response_piggyback"
+            | "ul_boot"
+            | "ul_fired"
+            | "recall_l0"
+            | "fetch_l2"
+            | "packet"
+    );
+    if !known_receipt_surface {
+        return false;
+    }
+
+    match reader_surface {
+        Some("ul_boot") => matches!(receipt_surface, "mcp_auto_boot" | "ul_boot"),
+        Some("ul_fired") => {
+            matches!(receipt_surface, "mcp_response_piggyback" | "ul_fired")
+        }
+        Some("recall_l0" | "fetch_l2") => {
+            influence_context_id.is_some_and(|context_id| context_id.starts_with("retrieval:"))
+        }
+        Some("packet") => {
+            influence_context_id.is_some_and(|context_id| !context_id.starts_with("retrieval:"))
+        }
+        _ => false,
+    }
+}
+
 #[allow(clippy::too_many_lines)]
 async fn verify_canonical_call(
     config_path: &Path,
@@ -1265,17 +1373,6 @@ async fn verify_canonical_call(
                 .iter()
                 .map(|receipt| receipt.injection_id.clone())
                 .collect();
-            verification.treatment_received_exact_handle = receipts.iter().any(|receipt| {
-                receipt.session_id == call.session_id
-                    && receipt.task_id == Some(call.task_id)
-                    && receipt.item_ref == expected_handle
-                    && matches!(
-                        receipt.surface.as_str(),
-                        "ul_boot" | "ul_fired" | "recall_l0" | "fetch_l2" | "packet"
-                    )
-                    && reader.delivery_surface.as_deref() == Some(receipt.surface.as_str())
-                    && !receipt.outcome.to_ascii_lowercase().contains("suppress")
-            });
             let traces = store
                 .observability_records_by_kind::<MemoryInfluenceTrace>(
                     project_id,
@@ -1298,6 +1395,17 @@ async fn verify_canonical_call(
                             .downstream_outcome_ref
                             .as_deref()
                             .is_some_and(|reference| !reference.trim().is_empty()))
+            });
+            verification.treatment_received_exact_handle = receipts.iter().any(|receipt| {
+                receipt.session_id == call.session_id
+                    && receipt.task_id == Some(call.task_id)
+                    && receipt.item_ref == expected_handle
+                    && !receipt.outcome.to_ascii_lowercase().contains("suppress")
+                    && treatment_surface_matches_canonical_evidence(
+                        reader.delivery_surface.as_deref(),
+                        receipt.surface.as_str(),
+                        matching_trace.map(|trace| trace.packet_id.as_str()),
+                    )
             });
             let influence_receipt = if let Some(value) = reader.influence_receipt.as_deref() {
                 let write_id = WriteId::from_str(value)
@@ -1363,12 +1471,12 @@ fn reader_prompt(call: &eliot_types::UlCrossAgentPlannedCall, project_id: Projec
             "This is the pre-registered memory_free_control arm. Do not call recall_l0, fetch_l2, compile_packet_l3, or memory_influence_trace. If you inspect current state, its scope must be memory_free_control. No reusable memory handle may be exposed."
         }
         UlCrossAgentMemoryMode::Treatment => {
-            "Use the normal governed ELIOT retrieval path for this certification project. Start with recall_l0 using the inspected file path as the query; if it returns a relevant handle, fetch that exact handle before acknowledging influence."
+            "Use the normal governed ELIOT retrieval path for this certification project. Start with recall_l0 using the inspected file path as the query; if it returns a relevant handle, fetch that exact handle before acknowledging influence. That exact fetch establishes the same-session retrieval context required by the minimal influence acknowledgement."
         }
         _ => "Use the normal governed ELIOT retrieval path for this certification project.",
     };
     format!(
-        "{semantic}\n\nCertification scope (contains no marker): project_id={project_id}; task_id={}; planned fresh session={}. {memory_boundary}\nIf useful bound memory is actually received or retrieved, return its exact canonical handle. delivery_surface must be the exact receipt surface and one of ul_boot, ul_fired, recall_l0, fetch_l2, or packet; it is never an influence class. first_action must be the lowercase snake_case action identifier derived from the recovered lesson's imperative phrase, not a retrieval tool name or narration. For a treatment call, record eliot_memory_influence_trace with seen_but_not_used or used_and_changed_action; the latter requires downstream_outcome_ref. Set influence_receipt to the exact observability_receipt.write_id returned by that call. Controls must return influence_receipt=null. Return only the six-field JSON object.",
+        "{semantic}\n\nCertification scope (contains no marker): project_id={project_id}; task_id={}; planned fresh session={}. {memory_boundary}\nIf useful bound memory is actually received or retrieved, return its exact canonical handle. delivery_surface must be the public delivery surface and one of ul_boot, ul_fired, recall_l0, fetch_l2, or packet; it is never an influence class. first_action must be the lowercase snake_case action identifier derived from the recovered lesson's imperative phrase, not a retrieval tool name or narration. For a treatment call, record eliot_memory_influence_trace with seen_but_not_used or used_and_changed_action; the latter requires downstream_outcome_ref. Set influence_receipt to the exact observability_receipt.write_id returned by that call. Controls must return influence_receipt=null. Return only the six-field JSON object.",
         call.task_id, call.session_id
     )
 }
@@ -1856,12 +1964,25 @@ fn certification_root() -> Result<PathBuf> {
         .join("ul-cross-agent"))
 }
 
+fn validate_run_id(run_id: &str) -> Result<()> {
+    if !run_id.starts_with("ul-cross-agent-")
+        || run_id.len() > 96
+        || !run_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+    {
+        bail!("cross-agent run_id is not a safe certification directory name");
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         auditor_mcp_profile, error_reports_provider_dispatched, error_reports_unknown_outcome,
         fresh_preflight_session, preflight_current_state_arguments, provider_doctor_selector,
         provider_model, reader_prompt, render_writer_prompt, subprocess_path,
+        treatment_surface_matches_canonical_evidence, validate_run_id,
         write_antigravity_workspace_mcp,
     };
     use eliot_types::{
@@ -1886,6 +2007,19 @@ mod tests {
     }
 
     #[test]
+    fn receipt_inspection_accepts_only_safe_run_ids() {
+        assert!(validate_run_id("ul-cross-agent-019fa36e-3c6b-74c1-9365-3f62bad6c3fe").is_ok());
+        for invalid in [
+            "../ul-cross-agent-run",
+            r"ul-cross-agent-..\run",
+            "ul-cross-agent-run.json",
+            "other-run",
+        ] {
+            assert!(validate_run_id(invalid).is_err(), "{invalid}");
+        }
+    }
+
+    #[test]
     fn provider_dispatch_classification_ignores_timeout_option_names() {
         let predispatch =
             "--idempotency-key and --timeout-seconds are currently managed for Antigravity only";
@@ -1896,6 +2030,40 @@ mod tests {
             "provider dispatched: antigravity exceeded the wall-clock budget; outcome is unknown";
         assert!(error_reports_provider_dispatched(unknown));
         assert!(error_reports_unknown_outcome(unknown));
+    }
+
+    #[test]
+    fn public_delivery_surfaces_are_bound_to_canonical_evidence() {
+        assert!(treatment_surface_matches_canonical_evidence(
+            Some("ul_boot"),
+            "mcp_auto_boot",
+            None
+        ));
+        assert!(treatment_surface_matches_canonical_evidence(
+            Some("ul_fired"),
+            "mcp_response_piggyback",
+            None
+        ));
+        assert!(treatment_surface_matches_canonical_evidence(
+            Some("fetch_l2"),
+            "mcp_response_piggyback",
+            Some("retrieval:0123456789abcdef")
+        ));
+        assert!(!treatment_surface_matches_canonical_evidence(
+            Some("fetch_l2"),
+            "mcp_response_piggyback",
+            Some("packet:0123456789abcdef")
+        ));
+        assert!(treatment_surface_matches_canonical_evidence(
+            Some("packet"),
+            "mcp_response_piggyback",
+            Some("packet:0123456789abcdef")
+        ));
+        assert!(!treatment_surface_matches_canonical_evidence(
+            Some("ul_fired"),
+            "unknown_surface",
+            None
+        ));
     }
 
     #[test]
