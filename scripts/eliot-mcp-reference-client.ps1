@@ -24,6 +24,12 @@ param(
 
     [string]$ClientName = 'eliot-powershell-reference-client',
 
+    [string]$AgentSessionId,
+
+    [string]$TaskId,
+
+    [string]$RoleLeaseId,
+
     [ValidateRange(1, 60)]
     [int]$TimeoutSeconds = 30
 )
@@ -114,6 +120,10 @@ $processArguments.Add('stdio')
 if ($HostSurface) {
     $processArguments.Add('--host')
     $processArguments.Add($HostSurface)
+    if ($PSBoundParameters.ContainsKey('Profile')) {
+        $processArguments.Add('--profile')
+        $processArguments.Add($Profile)
+    }
 }
 else {
     $processArguments.Add('--profile')
@@ -146,6 +156,21 @@ foreach ($name in @(
     'ELIOT_TEST_SURREAL_STORAGE'
 )) {
     [void]$startInfo.Environment.Remove($name)
+}
+if ($Config) {
+    $startInfo.Environment['ELIOT_GOVERNOR_CONFIG'] = (Resolve-Path -LiteralPath $Config).Path
+}
+if ($AgentSessionId) {
+    $startInfo.Environment['ELIOT_AGENT_SESSION_ID'] = $AgentSessionId
+}
+if ($ProjectId) {
+    $startInfo.Environment['ELIOT_PROJECT_ID'] = $ProjectId
+}
+if ($TaskId) {
+    $startInfo.Environment['ELIOT_TASK_ID'] = $TaskId
+}
+if ($RoleLeaseId) {
+    $startInfo.Environment['ELIOT_ROLE_LEASE_ID'] = $RoleLeaseId
 }
 
 $requests = [System.Collections.Generic.List[object]]::new()
@@ -235,6 +260,12 @@ $stdoutTask = $process.StandardOutput.ReadToEndAsync()
 $stderrTask = $process.StandardError.ReadToEndAsync()
 foreach ($request in $requests) {
     $process.StandardInput.WriteLine(($request | ConvertTo-Json -Compress -Depth 20))
+    if ($request.id -eq 1) {
+        $process.StandardInput.WriteLine((([ordered]@{
+            jsonrpc = '2.0'
+            method = 'notifications/initialized'
+        }) | ConvertTo-Json -Compress -Depth 20))
+    }
 }
 $process.StandardInput.Close()
 
@@ -282,7 +313,7 @@ if ($ToolName -and $ToolName -notin $toolNames) {
     component = 'eliot_mcp_reference_client'
     status = 'passed'
     executable = $exe
-    profile = if ($HostSurface) { $responses[0].result.experimental.eliotAgentSession.access_profile } else { $Profile }
+    profile = $responses[0].result.experimental.eliotAgentSession.access_profile
     host_surface = if ($HostSurface) { $HostSurface } else { $null }
     instance = if ($Instance) { $Instance } else { 'isolated_from_config' }
     server = $responses[0].result.serverInfo

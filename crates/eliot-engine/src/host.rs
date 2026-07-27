@@ -530,6 +530,8 @@ impl HostLaunchContractService {
             lifecycle_bridge_ref,
             environment_allowlist: vec![
                 "ELIOT_GOVERNOR_EXE".to_owned(),
+                "ELIOT_GOVERNOR_CONFIG".to_owned(),
+                "ELIOT_MCP_ACCESS_PROFILE".to_owned(),
                 "ELIOT_AGENT_SESSION_ID".to_owned(),
                 "ELIOT_PROJECT_ID".to_owned(),
                 "ELIOT_TASK_ID".to_owned(),

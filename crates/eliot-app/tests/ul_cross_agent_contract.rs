@@ -236,6 +236,23 @@ fn reference_client_supports_windows_powershell_51_argument_marshalling() -> Res
     assert!(script.contains("function ConvertFrom-JsonCompatible"));
     assert!(script.contains("if ($null -ne $startInfo.ArgumentList)"));
     assert!(script.contains("$startInfo.Arguments ="));
+    let initialize = script
+        .find("method = 'initialize'")
+        .context("reference client initialize request")?;
+    let initialized = script
+        .find("method = 'notifications/initialized'")
+        .context("reference client initialized notification")?;
+    let tools_list = script
+        .find("method = 'tools/list'")
+        .context("reference client tools/list request")?;
+    assert!(initialize < tools_list);
+    assert!(initialized > tools_list);
+    assert!(script.contains("if ($request.id -eq 1)"));
+    assert!(script.contains("ELIOT_GOVERNOR_CONFIG"));
+    assert!(script.contains("ELIOT_AGENT_SESSION_ID"));
+    assert!(script.contains("ELIOT_PROJECT_ID"));
+    assert!(script.contains("ELIOT_TASK_ID"));
+    assert!(script.contains("ELIOT_ROLE_LEASE_ID"));
     Ok(())
 }
 

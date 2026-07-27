@@ -1197,7 +1197,7 @@ fn launch_environment_names(
     mode: HostMode,
     contract: &eliot_types::HostLaunchContract,
 ) -> Vec<&'static str> {
-    let mut names = vec!["ELIOT_GOVERNOR_EXE"];
+    let mut names = vec!["ELIOT_GOVERNOR_EXE", "ELIOT_GOVERNOR_CONFIG"];
     if host == AgentHostId::Antigravity {
         names.extend([
             "SystemRoot",
@@ -1215,6 +1215,11 @@ fn launch_environment_names(
     }
     if contract.agent_session_id.is_some() {
         names.push("ELIOT_AGENT_SESSION_ID");
+    }
+    if host == AgentHostId::Antigravity
+        && contract.permission_profile == "ul_structured_auditor"
+    {
+        names.push("ELIOT_MCP_ACCESS_PROFILE");
     }
     if contract.task_id.is_some() {
         names.push("ELIOT_TASK_ID");

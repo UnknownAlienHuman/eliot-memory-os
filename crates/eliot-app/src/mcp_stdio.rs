@@ -487,7 +487,7 @@ const BOUND_TASK_DEFAULT_TOOLS: &[&str] = &[
 
 const BOUND_PROJECT_ALIAS_DEFAULT_TOOLS: &[&str] = &["eliot_skill_list"];
 
-const PART_E_WORKER_TOOLS: &[&str] = &[
+pub(crate) const PART_E_WORKER_TOOLS: &[&str] = &[
     "eliot_current_state",
     "eliot_recall_l0",
     "eliot_fetch_l2",
@@ -640,6 +640,32 @@ fn resolve_effective_profile(
     }
 }
 
+fn scoped_profile_override(
+    requested_profile: &str,
+    host: Option<&str>,
+    override_profile: Option<&str>,
+    has_agent_session: bool,
+    has_role_lease: bool,
+) -> Result<String> {
+    let Some(override_profile) = override_profile else {
+        return Ok(requested_profile.to_owned());
+    };
+    if override_profile != "external_auditor"
+        || host != Some("antigravity")
+        || !matches!(
+            requested_profile,
+            "default" | "dynamic_agent" | "agent_host" | "external_auditor"
+        )
+        || !has_agent_session
+        || !has_role_lease
+    {
+        anyhow::bail!(
+            "UNSUPPORTED_SCOPED_PROFILE_OVERRIDE: bounded Antigravity external_auditor requires matching AgentSession and TaskRoleLease"
+        );
+    }
+    Ok("external_auditor".to_owned())
+}
+
 pub async fn run(
     config_path: &Path,
     profile: &str,
@@ -664,8 +690,15 @@ pub async fn run(
     {
         anyhow::bail!("unsupported agent host: {host}");
     }
-    let profile = resolve_effective_profile(
+    let requested_profile = scoped_profile_override(
         profile,
+        host,
+        std::env::var("ELIOT_MCP_ACCESS_PROFILE").ok().as_deref(),
+        std::env::var_os("ELIOT_AGENT_SESSION_ID").is_some(),
+        std::env::var_os("ELIOT_ROLE_LEASE_ID").is_some(),
+    )?;
+    let profile = resolve_effective_profile(
+        &requested_profile,
         host,
         std::env::var_os("ELIOT_COGNITIVE_CONTROL").is_some(),
     )?;

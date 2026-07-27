@@ -8,8 +8,8 @@ use super::{
     configure_antigravity_environment, configure_standard_managed_environment,
     contained_antigravity_attempt_hash, encode_managed_invocation_lock, hash_bytes,
     hash_file_content, hash_json, integration_refs, invocation_root, invocation_status,
-    is_claude_desktop_host, latest_canonical_authority_observation, launch_argv,
-    lock_antigravity_executable_snapshot, managed_attempt_hash,
+    invoke_ul_scoped_reasoning, is_claude_desktop_host, latest_canonical_authority_observation,
+    launch_argv, lock_antigravity_executable_snapshot, managed_attempt_hash,
     managed_launch_boundary_attestation, managed_launch_boundary_is_current, managed_sandbox_root,
     merge_opencode_mcp_config, normalize_relative_path, parse_opencode_jsonc,
     parse_structured_host_output, persist_and_parse_structured_host_output,
@@ -22,15 +22,17 @@ use super::{
     validate_managed_result_integrity,
 };
 use crate::runtime_instance::{atomic_write_bytes, atomic_write_json};
+use anyhow::Context as _;
 use eliot_engine::{HostLaunchContractService, WorkState, default_work_scope};
 use eliot_store::CanonicalToolObservation;
 use eliot_types::{
     AgentCapabilityEnvelope, AgentHostId, AgentHostIdentity, AgentHostRuntimeProfile, AgentId,
     AgentRole, AgentSessionHostBinding, AgentSessionId, DelegationState, HostLaunchScope, HostMode,
     HostProfileStatus, HostProtocolSurfaces, MemoryRevision, ProjectId, ProjectSequence, ReceiptId,
-    SemanticCommandKind, TaskId, TaskRoleLease, WorkItemId, WorkLease, WorkLeaseDecision,
-    WorkLeaseDecisionKind, WorkLeaseDecisionReason, WorkLeaseId, WorkLeaseState, WorktreeLease,
-    WorktreeLeaseId, WorktreeLeaseState, WriteId, WriteReceipt, WriteReceiptRef, WriteStatus,
+    SemanticCommandKind, TaskId, TaskRoleLease, UlReasoningRequest, UlReasoningRoute, WorkItemId,
+    WorkLease, WorkLeaseDecision, WorkLeaseDecisionKind, WorkLeaseDecisionReason, WorkLeaseId,
+    WorkLeaseState, WorktreeLease, WorktreeLeaseId, WorktreeLeaseState, WriteId, WriteReceipt,
+    WriteReceiptRef, WriteStatus,
 };
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
@@ -78,6 +80,39 @@ fn external_auditor_profile_is_bounded_to_ul_certification_scope() {
         antigravity_permission_profile(false),
         "canonical_readonly_candidate_plan"
     );
+}
+
+#[tokio::test]
+async fn ul_scoped_reasoning_rejects_missing_binding_before_provider_probe() -> anyhow::Result<()> {
+    let project_id = ProjectId::new_v7();
+    let task_id = TaskId::new_v7();
+    let request = UlReasoningRequest {
+        idempotency_key: "ul11r3-unscoped-regression".to_owned(),
+        project_id,
+        task_id,
+        route: UlReasoningRoute::Claude,
+        model: Some("opus".to_owned()),
+        prompt: "must not dispatch".to_owned(),
+        output_schema: json!({"type": "object"}),
+        max_input_bytes: 1024,
+        max_output_units: 128,
+        timeout_seconds: 30,
+    };
+    let error = invoke_ul_scoped_reasoning(
+        Path::new("missing-governor-config.toml"),
+        Path::new("."),
+        &request,
+        HostLaunchScope::default(),
+    )
+    .await
+    .err()
+    .context("unscoped UL provider launch must fail")?;
+    assert!(
+        format!("{error:#}")
+            .contains("requires matching project/task plus AgentSessionHostBinding"),
+        "unexpected error: {error:#}"
+    );
+    Ok(())
 }
 
 #[test]
@@ -1219,6 +1254,25 @@ async fn antigravity_environment_preserves_real_profile_without_secret_spill() -
             .any(|name| name == "XDG_CONFIG_HOME"),
         "Antigravity must not be redirected to a blank config root"
     );
+    assert!(
+        managed
+            .environment_names
+            .iter()
+            .any(|name| name == "ELIOT_GOVERNOR_CONFIG"),
+        "the Antigravity MCP child must receive the exact Governor config"
+    );
+    let sandbox = PathBuf::from(&managed.sandbox_root);
+    for credential_name in [
+        "credentials.json",
+        "oauth_creds.json",
+        "application_default_credentials.json",
+        "secure_storage.json",
+    ] {
+        assert!(
+            !sandbox.join(credential_name).exists(),
+            "managed launch must not copy provider credential files"
+        );
+    }
     let local = PathBuf::from(
         std::env::var_os("LOCALAPPDATA")
             .ok_or_else(|| anyhow::anyhow!("LOCALAPPDATA is required"))?,

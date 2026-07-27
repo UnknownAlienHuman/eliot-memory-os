@@ -10,17 +10,19 @@ use crate::runtime_instance::{atomic_write_bytes, atomic_write_json};
 use anyhow::{Context, Result, bail};
 use eliot_store::CanonicalStore;
 use eliot_types::{
-    AgentHostId, AgentSessionId, EpistemicStatus, FetchAtomsL2Request, MemoryInfluenceClass,
-    MemoryInfluenceTrace, ObservabilityKind, ObservabilityWriteStatus, ProjectId,
-    ReadConsistencyMode, SemanticCommandKind, UL_CROSS_AGENT_CONFIRMATION_TOKEN,
-    UlCrossAgentContaminationReceipt, UlCrossAgentDirection, UlCrossAgentDirectionEvidence,
-    UlCrossAgentMemoryMode, UlCrossAgentPlan, UlCrossAgentReaderOutput, UlCrossAgentReport,
-    UlCrossAgentRole, UlCrossAgentSuite, UlCrossAgentWriterOutput, UlReasoningRequest,
-    UlReasoningRoute, WriteId, WriteStatus, scan_ul_cross_agent_reader_inputs,
+    AgentHostId, AgentSessionId, EpistemicStatus, FetchAtomsL2Request, HostLaunchScope,
+    MemoryInfluenceClass, MemoryInfluenceTrace, ObservabilityKind, ObservabilityWriteStatus,
+    ProjectId, ReadConsistencyMode, SemanticCommandKind, SessionId, TaskId,
+    UL_CROSS_AGENT_CONFIRMATION_TOKEN, UlCrossAgentContaminationReceipt, UlCrossAgentDirection,
+    UlCrossAgentDirectionEvidence, UlCrossAgentMemoryMode, UlCrossAgentPlan,
+    UlCrossAgentReaderOutput, UlCrossAgentReport, UlCrossAgentRole, UlCrossAgentSuite,
+    UlCrossAgentWriterOutput, UlReasoningRequest, UlReasoningRoute, WriteId, WriteStatus,
+    scan_ul_cross_agent_reader_inputs,
 };
 use serde::Serialize;
 use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
+use std::collections::BTreeSet;
 use std::ffi::OsStr;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -31,6 +33,8 @@ const READER_PROMPT_ALPHA: &str = "Open or inspect src/relay_alpha.rs. Determine
 const READER_PROMPT_BETA: &str = "Open or inspect src/relay_beta.rs. Determine whether ELIOT contains a previous lesson specifically bound to this file. Return the required JSON. Do not guess an opaque marker.";
 const CLAUDE_UL_MODEL: &str = "opus";
 const ANTIGRAVITY_UL_MODEL: &str = "claude-opus-4-6-thinking";
+const CLAUDE_SMOKE_MODEL: &str = "sonnet";
+const ANTIGRAVITY_SMOKE_MODEL: &str = "gemini-3.6-flash-high";
 const CLAUDE_WRITER_REFUSAL_NOTE: &str = "Claude Code previously safety-refused the legacy imperative UL-11 writer prompt before tool_use. Under explicit operator authorization, the writer prompt now states that this is a synthetic candidate-only certification write. Preserve this note as a provider-compatibility regression marker.";
 
 #[derive(Clone, Debug, Serialize)]
@@ -59,6 +63,7 @@ struct CallArchive {
     prompt_sha256: String,
     provider_executable_hash: String,
     integration_bundle_hash: String,
+    mcp_preflight: Option<ScopedMcpPreflightEvidence>,
     contamination: Option<UlCrossAgentContaminationReceipt>,
     provider_dispatched: bool,
     outcome_unknown: bool,
@@ -69,6 +74,42 @@ struct CallArchive {
     structured_output: Option<Value>,
     canonical_verification: CanonicalCallVerification,
     terminal_error: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct ScopedMcpPreflightEvidence {
+    host: AgentHostId,
+    profile: String,
+    agent_session_id: String,
+    project_id: String,
+    task_id: String,
+    role_lease_id: String,
+    tool_names: Vec<String>,
+    current_state_revision: u64,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct ProviderMcpSmokeEvidence {
+    schema_version: &'static str,
+    smoke_id: String,
+    host: AgentHostId,
+    model: String,
+    model_selection_reason: &'static str,
+    project_id: ProjectId,
+    task_id: TaskId,
+    agent_session_id: AgentSessionId,
+    role_lease_id: String,
+    repo: PathBuf,
+    mcp_preflight: ScopedMcpPreflightEvidence,
+    provider_session_client_name: String,
+    provider_session_transport: String,
+    provider_executable_hash: String,
+    integration_bundle_hash: String,
+    structured_output: Value,
+    structured_output_sha256: String,
+    provider_dispatched: bool,
+    controller_substitute_call: bool,
+    passed: bool,
 }
 
 #[derive(Clone, Debug, Default, Serialize)]
@@ -125,6 +166,7 @@ pub(crate) async fn run(config_path: &Path, confirmation: &str) -> Result<()> {
     if confirmation != UL_CROSS_AGENT_CONFIRMATION_TOKEN {
         bail!("UL cross-agent live run requires --confirm {UL_CROSS_AGENT_CONFIRMATION_TOKEN}");
     }
+    require_provider_smokes()?;
     let doctor = doctor_projection(config_path)?;
     if !doctor.ready {
         bail!(
@@ -142,7 +184,7 @@ pub(crate) async fn run(config_path: &Path, confirmation: &str) -> Result<()> {
     let run_root = certification_root()?.join(&run_id);
     let repo = run_root.join("repo");
     fs::create_dir_all(&run_root)?;
-    create_fixture_repo(&source_root, &repo)?;
+    create_fixture_repo(&source_root, config_path, &repo)?;
 
     let project_identity = invoke_reference_tool(
         config_path,
@@ -226,6 +268,7 @@ pub(crate) async fn run(config_path: &Path, confirmation: &str) -> Result<()> {
                 prompt_sha256,
                 provider_executable_hash: provider_evidence.executable_hash,
                 integration_bundle_hash: provider_evidence.bundle_hash,
+                mcp_preflight: None,
                 contamination,
                 provider_dispatched: false,
                 outcome_unknown: false,
@@ -249,6 +292,15 @@ pub(crate) async fn run(config_path: &Path, confirmation: &str) -> Result<()> {
         )
         .await
         .with_context(|| format!("prepare canonical auditor scope for {}", call.case_id))?;
+        let mcp_preflight = scoped_mcp_preflight(
+            config_path,
+            call.host,
+            project_id,
+            call.task_id,
+            call.session_id,
+            &launch_scope,
+        )
+        .with_context(|| format!("run scoped MCP preflight for {}", call.case_id))?;
         let revision_before = project_revision(config_path, project_id).ok();
         let request = UlReasoningRequest {
             idempotency_key: format!("{run_id}-{}", call.case_id),
@@ -308,6 +360,7 @@ pub(crate) async fn run(config_path: &Path, confirmation: &str) -> Result<()> {
                     prompt_sha256,
                     provider_executable_hash: provider_evidence.executable_hash,
                     integration_bundle_hash: provider_evidence.bundle_hash,
+                    mcp_preflight: Some(mcp_preflight.clone()),
                     contamination,
                     provider_dispatched: true,
                     outcome_unknown: false,
@@ -343,6 +396,7 @@ pub(crate) async fn run(config_path: &Path, confirmation: &str) -> Result<()> {
                     prompt_sha256,
                     provider_executable_hash: provider_evidence.executable_hash,
                     integration_bundle_hash: provider_evidence.bundle_hash,
+                    mcp_preflight: Some(mcp_preflight),
                     contamination,
                     provider_dispatched,
                     outcome_unknown,
@@ -428,6 +482,278 @@ pub(crate) async fn run(config_path: &Path, confirmation: &str) -> Result<()> {
             "UL cross-agent certification did not pass; sanitized report: {}",
             run_root.join("report.json").display()
         );
+    }
+    Ok(())
+}
+
+pub(crate) async fn smoke(
+    config_path: &Path,
+    route: UlReasoningRoute,
+    confirmation: &str,
+) -> Result<()> {
+    if confirmation != UL_CROSS_AGENT_CONFIRMATION_TOKEN {
+        bail!(
+            "UL cross-agent provider smoke requires --confirm {UL_CROSS_AGENT_CONFIRMATION_TOKEN}"
+        );
+    }
+    let host = route.host();
+    let source_root = source_root()?;
+    let smoke_id = format!("ul11r3-smoke-{}-{}", host.as_str(), uuid::Uuid::now_v7());
+    let smoke_root = certification_root()?
+        .join("provider-smokes")
+        .join(&smoke_id);
+    let repo = smoke_root.join("repo");
+    fs::create_dir_all(&smoke_root)?;
+    create_fixture_repo(&source_root, config_path, &repo)?;
+
+    let project_identity = invoke_reference_tool(
+        config_path,
+        "codex_controller",
+        "eliot_project_identity",
+        &json!({"project_key": repo.to_string_lossy()}),
+    )?;
+    let project_id = project_identity
+        .pointer("/tool_call/project_id")
+        .and_then(Value::as_str)
+        .context("provider smoke project identity returned no project_id")
+        .and_then(|value| ProjectId::from_str(value).context("parse smoke project_id"))?;
+    let task_id = TaskId::new_v7();
+    create_smoke_task_contract(config_path, project_id, task_id, host)?;
+    let session_id = SessionId::new_v7();
+    let launch_scope = crate::host_runtime::prepare_ul_auditor_scope(
+        config_path,
+        host,
+        project_id,
+        task_id,
+        session_id,
+        &smoke_id,
+    )
+    .await
+    .context("prepare provider smoke scope")?;
+    let mcp_preflight = scoped_mcp_preflight(
+        config_path,
+        host,
+        project_id,
+        task_id,
+        session_id,
+        &launch_scope,
+    )
+    .context("run provider smoke MCP preflight")?;
+    let role_lease_id = launch_scope
+        .role_lease_id
+        .clone()
+        .context("provider smoke scope has no TaskRoleLease")?;
+    let agent_session_id = launch_scope
+        .agent_session_id
+        .context("provider smoke scope has no AgentSession")?;
+    let provider_evidence = provider_evidence(config_path, host)?;
+    let (model, model_selection_reason) = match host {
+        AgentHostId::Claude => (
+            CLAUDE_SMOKE_MODEL,
+            "simple MCP-adoption smoke uses the economical Claude route; Opus is reserved for complex certification or escalation",
+        ),
+        AgentHostId::Antigravity => (
+            ANTIGRAVITY_SMOKE_MODEL,
+            "Gemini Flash high has ample quota and is sufficient for a single current_state tool call; Antigravity Opus is reserved for UL-11 reasoning",
+        ),
+        _ => bail!("unsupported provider smoke host"),
+    };
+    let request = UlReasoningRequest {
+        idempotency_key: smoke_id.clone(),
+        project_id,
+        task_id,
+        route,
+        model: Some(model.to_owned()),
+        prompt: "Use the installed ELIOT workflow and ELIOT MCP. Read the current project/task state and return project_id, task_id, memory_revision as JSON. Do not copy identifiers from files or infer them from the path; use ELIOT current_state under the bound session.".to_owned(),
+        output_schema: json!({
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "project_id": {"type": "string"},
+                "task_id": {"type": "string"},
+                "memory_revision": {"type": "integer", "minimum": 0}
+            },
+            "required": ["project_id", "task_id", "memory_revision"]
+        }),
+        max_input_bytes: 16 * 1024,
+        max_output_units: 1_024,
+        timeout_seconds: 180,
+    };
+    let output =
+        crate::host_runtime::invoke_ul_scoped_reasoning(config_path, &repo, &request, launch_scope)
+            .await
+            .with_context(|| format!("{} live provider smoke failed", host.as_str()))?;
+    if output.get("project_id").and_then(Value::as_str) != Some(project_id.to_string().as_str())
+        || output.get("task_id").and_then(Value::as_str) != Some(task_id.to_string().as_str())
+        || output.get("memory_revision").and_then(Value::as_u64)
+            != Some(mcp_preflight.current_state_revision)
+    {
+        bail!(
+            "{} provider smoke returned schema-valid but canonically incorrect current_state",
+            host.as_str()
+        );
+    }
+
+    let provider_session = load_provider_session_report(config_path, agent_session_id)?;
+    let provider_session_client_name = provider_session
+        .get("client_name")
+        .and_then(Value::as_str)
+        .context("provider AgentSession report has no client_name")?
+        .to_owned();
+    let provider_session_transport = provider_session
+        .get("transport")
+        .and_then(Value::as_str)
+        .context("provider AgentSession report has no transport")?
+        .to_owned();
+    if provider_session_client_name.starts_with("eliot-ul11r3-")
+        || provider_session_transport != "mcp_stdio_windows_named_pipe"
+        || provider_session
+            .get("agent_session_id")
+            .and_then(Value::as_str)
+            != Some(agent_session_id.to_string().as_str())
+        || provider_session
+            .get("bound_project_id")
+            .and_then(Value::as_str)
+            != Some(project_id.to_string().as_str())
+        || provider_session
+            .get("bound_task_id")
+            .and_then(Value::as_str)
+            != Some(task_id.to_string().as_str())
+        || provider_session
+            .get("access_profile")
+            .and_then(Value::as_str)
+            != Some(auditor_mcp_profile(host))
+        || provider_session
+            .pointer("/host_identity/host_id")
+            .and_then(Value::as_str)
+            != Some(host.as_str())
+        || !provider_session
+            .get("task_role_lease_refs")
+            .and_then(Value::as_array)
+            .is_some_and(|refs| {
+                refs.iter()
+                    .any(|reference| reference.as_str() == Some(role_lease_id.as_str()))
+            })
+    {
+        bail!(
+            "{} provider smoke did not leave an exact provider-owned scoped MCP AgentSession receipt",
+            host.as_str()
+        );
+    }
+
+    let structured_output_sha256 = sha256_bytes(&serde_json::to_vec(&output)?);
+    let evidence = ProviderMcpSmokeEvidence {
+        schema_version: "eliot-ul11r3-provider-mcp-smoke-v1",
+        smoke_id,
+        host,
+        model: model.to_owned(),
+        model_selection_reason,
+        project_id,
+        task_id,
+        agent_session_id,
+        role_lease_id,
+        repo,
+        mcp_preflight,
+        provider_session_client_name,
+        provider_session_transport,
+        provider_executable_hash: provider_evidence.executable_hash,
+        integration_bundle_hash: provider_evidence.bundle_hash,
+        structured_output: output,
+        structured_output_sha256,
+        provider_dispatched: true,
+        controller_substitute_call: false,
+        passed: true,
+    };
+    let evidence_path = smoke_root.join("evidence.json");
+    atomic_write_json(&evidence_path, &evidence)?;
+    atomic_write_json(&provider_smoke_latest_path(host)?, &evidence)?;
+    println!(
+        "{}",
+        serde_json::to_string(&json!({
+            "status": "passed",
+            "host": host,
+            "model": model,
+            "evidence": evidence_path
+        }))?
+    );
+    Ok(())
+}
+
+fn create_smoke_task_contract(
+    config_path: &Path,
+    project_id: ProjectId,
+    task_id: TaskId,
+    host: AgentHostId,
+) -> Result<()> {
+    let response = invoke_reference_tool(
+        config_path,
+        "codex_controller",
+        "eliot_task_contract_create",
+        &json!({
+            "project_id": project_id,
+            "task_id": task_id,
+            "write_id": uuid::Uuid::now_v7(),
+            "title": format!("UL-11R3 {} authenticated MCP adoption smoke", host.as_str()),
+            "acceptance_items": [
+                {
+                    "item_id": "scoped_transport",
+                    "description": "provider starts the exact scoped ELIOT stdio child",
+                    "required_evidence": "observation"
+                },
+                {
+                    "item_id": "current_state",
+                    "description": "provider returns the canonical bound project/task revision",
+                    "required_evidence": "verification"
+                }
+            ]
+        }),
+    )?;
+    if response.pointer("/tool_call/task_contract").is_none() {
+        bail!("provider smoke task contract creation returned no canonical task");
+    }
+    Ok(())
+}
+
+fn load_provider_session_report(
+    config_path: &Path,
+    agent_session_id: AgentSessionId,
+) -> Result<Value> {
+    let path = crate::delegation_runtime::root_from_config(config_path)
+        .join("reports")
+        .join("agent-sessions")
+        .join(format!("{agent_session_id}.json"));
+    serde_json::from_slice(&fs::read(&path)?)
+        .with_context(|| format!("read provider AgentSession receipt {}", path.display()))
+}
+
+fn provider_smoke_latest_path(host: AgentHostId) -> Result<PathBuf> {
+    Ok(certification_root()?
+        .join("provider-smokes")
+        .join(format!("{}-latest.json", host.as_str())))
+}
+
+fn require_provider_smokes() -> Result<()> {
+    for host in [AgentHostId::Claude, AgentHostId::Antigravity] {
+        let path = provider_smoke_latest_path(host)?;
+        let evidence: Value = serde_json::from_slice(&fs::read(&path).with_context(|| {
+            format!(
+                "{} provider smoke has not passed; run the bounded smoke before the eight-call suite",
+                host.as_str()
+            )
+        })?)?;
+        if evidence.get("passed").and_then(Value::as_bool) != Some(true)
+            || evidence.get("host").and_then(Value::as_str) != Some(host.as_str())
+            || evidence.get("provider_dispatched").and_then(Value::as_bool) != Some(true)
+            || evidence
+                .get("controller_substitute_call")
+                .and_then(Value::as_bool)
+                != Some(false)
+        {
+            bail!(
+                "{} provider smoke evidence is not a passing live MCP receipt",
+                host.as_str()
+            );
+        }
     }
     Ok(())
 }
@@ -596,6 +922,164 @@ fn invoke_reference_tool(
         );
     }
     Ok(value)
+}
+
+fn scoped_mcp_preflight(
+    config_path: &Path,
+    host: AgentHostId,
+    project_id: ProjectId,
+    task_id: eliot_types::TaskId,
+    session_id: eliot_types::SessionId,
+    scope: &HostLaunchScope,
+) -> Result<ScopedMcpPreflightEvidence> {
+    let agent_session_id = scope
+        .agent_session_id
+        .context("scoped MCP preflight requires agent_session_id")?;
+    let role_lease_id = scope
+        .role_lease_id
+        .as_deref()
+        .context("scoped MCP preflight requires role_lease_id")?;
+    if agent_session_id != AgentSessionId::from_uuid(session_id.as_uuid())
+        || scope.project_id != Some(project_id)
+        || scope.task_id != Some(task_id)
+    {
+        bail!("scoped MCP preflight scope differs from the planned provider call");
+    }
+
+    let script = source_root()?.join("scripts/eliot-mcp-reference-client.ps1");
+    let governor_executable = subprocess_path(&std::env::current_exe()?);
+    let mut command = Command::new("powershell.exe");
+    command.args([
+        "-NoProfile",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-File",
+        &script.to_string_lossy(),
+        "-EliotExe",
+        &governor_executable,
+        "-HostSurface",
+        host.as_str(),
+        "-ProjectId",
+        &project_id.to_string(),
+        "-AgentSessionId",
+        &agent_session_id.to_string(),
+        "-TaskId",
+        &task_id.to_string(),
+        "-RoleLeaseId",
+        role_lease_id,
+        "-ToolName",
+        "eliot_current_state",
+        "-ToolArgumentsJson",
+        &serde_json::to_string(&json!({"project_id": project_id}))?,
+        "-ClientName",
+        &format!("eliot-ul11r3-{}-preflight", host.as_str()),
+        "-TimeoutSeconds",
+        "60",
+    ]);
+    if host == AgentHostId::Antigravity {
+        command.args(["-Profile", "external_auditor"]);
+    }
+    if config_path.is_file() {
+        command.args(["-Config", &config_path.to_string_lossy()]);
+    }
+    let output = command.output()?;
+    if !output.status.success() {
+        bail!(
+            "{} scoped MCP preflight failed: {}",
+            host.as_str(),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    let value: Value =
+        serde_json::from_slice(&output.stdout).context("decode scoped MCP preflight JSON")?;
+    if !value.get("tool_call_error").is_none_or(Value::is_null) {
+        bail!(
+            "{} scoped current_state returned an error: {}",
+            host.as_str(),
+            value["tool_call_error"]
+        );
+    }
+
+    let expected_profile = auditor_mcp_profile(host);
+    let actual_profile = value
+        .get("profile")
+        .and_then(Value::as_str)
+        .context("scoped MCP preflight returned no access profile")?;
+    if actual_profile != expected_profile {
+        bail!(
+            "{} scoped MCP profile mismatch: expected {expected_profile}, received {actual_profile}",
+            host.as_str()
+        );
+    }
+    let tool_names = value
+        .get("tool_names")
+        .and_then(Value::as_array)
+        .context("scoped MCP preflight returned no tool list")?
+        .iter()
+        .map(|name| {
+            name.as_str()
+                .map(str::to_owned)
+                .context("scoped MCP tool name is not a string")
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let actual_tools = tool_names
+        .iter()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    let expected_tools = crate::mcp_stdio::PART_E_WORKER_TOOLS
+        .iter()
+        .copied()
+        .collect::<BTreeSet<_>>();
+    if actual_tools != expected_tools || tool_names.len() != expected_tools.len() {
+        bail!(
+            "{} scoped MCP tool list is not the exact duplicate-free Part-E surface",
+            host.as_str()
+        );
+    }
+
+    let agent_session = value
+        .get("agent_session")
+        .context("scoped MCP preflight returned no AgentSession")?;
+    for (field, expected) in [
+        ("agent_session_id", agent_session_id.to_string()),
+        ("bound_project_id", project_id.to_string()),
+        ("bound_task_id", task_id.to_string()),
+    ] {
+        if agent_session.get(field).and_then(Value::as_str) != Some(expected.as_str()) {
+            bail!(
+                "{} scoped MCP AgentSession field {field} did not match the bound scope",
+                host.as_str()
+            );
+        }
+    }
+    if !agent_session
+        .get("task_role_lease_refs")
+        .and_then(Value::as_array)
+        .is_some_and(|refs| {
+            refs.iter()
+                .any(|reference| reference.as_str() == Some(role_lease_id))
+        })
+    {
+        bail!(
+            "{} scoped MCP AgentSession did not carry the bound TaskRoleLease",
+            host.as_str()
+        );
+    }
+    let current_state_revision = value
+        .pointer("/tool_call/memory_revision")
+        .and_then(Value::as_u64)
+        .context("scoped MCP current_state returned no revision fence")?;
+
+    Ok(ScopedMcpPreflightEvidence {
+        host,
+        profile: actual_profile.to_owned(),
+        agent_session_id: agent_session_id.to_string(),
+        project_id: project_id.to_string(),
+        task_id: task_id.to_string(),
+        role_lease_id: role_lease_id.to_owned(),
+        tool_names,
+        current_state_revision,
+    })
 }
 
 fn create_task_contract(
@@ -1136,12 +1620,13 @@ fn collect_regular_files(
     Ok(())
 }
 
-fn create_fixture_repo(source_root: &Path, repo: &Path) -> Result<()> {
+fn create_fixture_repo(source_root: &Path, config_path: &Path, repo: &Path) -> Result<()> {
     let template = source_root.join("tests/cognitive/ul-cross-agent/fixture-template");
     if repo.exists() {
         bail!("UL cross-agent fixture repository already exists");
     }
     copy_tree(&template, repo)?;
+    write_antigravity_workspace_mcp(config_path, repo)?;
     run_git(repo, ["init"])?;
     run_git(repo, ["config", "user.name", "ELIOT UL Certification"])?;
     run_git(
@@ -1155,6 +1640,34 @@ fn create_fixture_repo(source_root: &Path, repo: &Path) -> Result<()> {
         bail!("UL cross-agent fixture worktree is not clean");
     }
     Ok(())
+}
+
+fn write_antigravity_workspace_mcp(config_path: &Path, repo: &Path) -> Result<()> {
+    let agents_root = repo.join(".agents");
+    fs::create_dir_all(&agents_root)?;
+    let governor_executable = subprocess_path(&std::env::current_exe()?);
+    atomic_write_json(
+        &agents_root.join("mcp_config.json"),
+        &json!({
+            "mcpServers": {
+                "eliot-governor": {
+                    "command": governor_executable,
+                    "args": [
+                        "--config",
+                        config_path,
+                        "mcp",
+                        "stdio",
+                        "--host",
+                        "antigravity",
+                        "--profile",
+                        "external_auditor",
+                        "--instance",
+                        "default"
+                    ]
+                }
+            }
+        }),
+    )
 }
 
 fn copy_tree(source: &Path, destination: &Path) -> Result<()> {
@@ -1309,6 +1822,7 @@ mod tests {
     use super::{
         auditor_mcp_profile, error_reports_provider_dispatched, error_reports_unknown_outcome,
         provider_doctor_selector, provider_model, render_writer_prompt, subprocess_path,
+        write_antigravity_workspace_mcp,
     };
     use eliot_types::AgentHostId;
     use serde_json::json;
@@ -1380,5 +1894,45 @@ mod tests {
         assert!(prompt.contains("eliot_agent_candidate_submit exactly once"));
         assert!(prompt.contains("do not authorize truth promotion"));
         assert!(!prompt.contains("Private UL-11 writer call"));
+    }
+
+    #[test]
+    fn certification_repo_has_one_workspace_scoped_antigravity_mcp() {
+        let root = std::env::temp_dir().join(format!(
+            "eliot-ul11r3-workspace-mcp-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&root).expect("create fixture root");
+        let config = root.join("governor.toml");
+        write_antigravity_workspace_mcp(&config, &root).expect("write workspace MCP config");
+        let value: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(root.join(".agents/mcp_config.json")).expect("read MCP config"),
+        )
+        .expect("parse MCP config");
+        let servers = value["mcpServers"].as_object().expect("mcpServers object");
+        assert_eq!(servers.len(), 1);
+        let eliot = &servers["eliot-governor"];
+        assert_eq!(
+            eliot["args"],
+            json!([
+                "--config",
+                config,
+                "mcp",
+                "stdio",
+                "--host",
+                "antigravity",
+                "--profile",
+                "external_auditor",
+                "--instance",
+                "default"
+            ])
+        );
+        assert!(
+            !root
+                .join(".gemini/antigravity-cli/mcp_config.json")
+                .exists()
+        );
+        assert!(!root.join(".agents/agents").exists());
+        std::fs::remove_dir_all(root).expect("remove fixture root");
     }
 }

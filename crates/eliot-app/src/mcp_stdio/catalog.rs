@@ -6,13 +6,13 @@
 //! what is actually served.
 
 use super::{
-    McpAccessProfile, READ_ONLY_TOOLS, action_lease_status_schema, action_plan_schema,
-    agent_candidate_schema, blackboard_ack_schema, blackboard_add_schema, codecortex_scan_schema,
-    cognitive_record_schema, compile_packet_schema, json_schema, mailbox_ack_schema,
-    mailbox_send_schema, memory_influence_trace_schema, patch_apply_schema, tool,
-    understanding_proof_schema, work_claim_schema, work_create_schema, work_lease_schema,
-    work_status_schema, worktree_create_schema, worktree_lease_schema, worktree_review_schema,
-    worktree_status_schema,
+    BOUND_PROJECT_DEFAULT_TOOLS, BOUND_TASK_DEFAULT_TOOLS, McpAccessProfile, READ_ONLY_TOOLS,
+    action_lease_status_schema, action_plan_schema, agent_candidate_schema, blackboard_ack_schema,
+    blackboard_add_schema, codecortex_scan_schema, cognitive_record_schema, compile_packet_schema,
+    json_schema, mailbox_ack_schema, mailbox_send_schema, memory_influence_trace_schema,
+    patch_apply_schema, tool, understanding_proof_schema, work_claim_schema, work_create_schema,
+    work_lease_schema, work_status_schema, worktree_create_schema, worktree_lease_schema,
+    worktree_review_schema, worktree_status_schema,
 };
 use anyhow::{Context as _, Result};
 use eliot_types::ClaudeSurface;
@@ -568,9 +568,38 @@ pub(super) fn tool_definitions_for_profile(profile: McpAccessProfile) -> Vec<Val
     tool_definitions()
         .into_iter()
         .filter_map(|mut definition| {
-            let name = definition.get("name").and_then(Value::as_str)?;
-            if !profile.allows(name) {
+            let name = definition.get("name").and_then(Value::as_str)?.to_owned();
+            if !profile.allows(&name) {
                 return None;
+            }
+            if matches!(
+                profile,
+                McpAccessProfile::DynamicAgent
+                    | McpAccessProfile::ClaudeGoverned
+                    | McpAccessProfile::CodexWorker
+                    | McpAccessProfile::ExternalAuditor
+            ) {
+                let defaulted_fields = [
+                    BOUND_PROJECT_DEFAULT_TOOLS
+                        .contains(&name.as_str())
+                        .then_some("project_id"),
+                    BOUND_TASK_DEFAULT_TOOLS
+                        .contains(&name.as_str())
+                        .then_some("task_id"),
+                ]
+                .into_iter()
+                .flatten()
+                .collect::<Vec<_>>();
+                if let Some(required) = definition
+                    .pointer_mut("/inputSchema/required")
+                    .and_then(Value::as_array_mut)
+                {
+                    required.retain(|field| {
+                        field
+                            .as_str()
+                            .is_none_or(|field| !defaulted_fields.contains(&field))
+                    });
+                }
             }
             if name == "eliot_compile_packet_l3" {
                 definition["annotations"] = json!({
@@ -579,7 +608,7 @@ pub(super) fn tool_definitions_for_profile(profile: McpAccessProfile) -> Vec<Val
                     "idempotentHint": true,
                     "openWorldHint": false
                 });
-            } else if READ_ONLY_TOOLS.contains(&name) {
+            } else if READ_ONLY_TOOLS.contains(&name.as_str()) {
                 definition["annotations"] = json!({
                     "readOnlyHint": true,
                     "destructiveHint": false,

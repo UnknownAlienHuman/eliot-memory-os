@@ -312,6 +312,12 @@ fn contains_named_file(root: &Path, expected: &str) -> bool {
 #[derive(Debug, clap::Subcommand)]
 pub enum UlCrossAgentCommand {
     Doctor,
+    Smoke {
+        #[arg(long, value_enum)]
+        host: UlReasoningRouteArg,
+        #[arg(long)]
+        confirm: String,
+    },
     Run {
         #[arg(long)]
         confirm: String,

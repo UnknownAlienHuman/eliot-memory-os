@@ -991,24 +991,65 @@ async fn cargo_workspace_check_registry_runs_fixed_offline_command() -> Result<(
 fn dynamic_agent_profile_is_host_neutral_and_proactive() -> Result<()> {
     let profile = McpAccessProfile::parse("dynamic_agent")?;
     assert_eq!(profile, McpAccessProfile::DynamicAgent);
-    assert!(profile.allows("eliot_recall_l0"));
-    assert!(profile.allows("eliot_agent_candidate_submit"));
-    assert!(profile.allows("eliot_host_session_status"));
-    assert!(profile.allows("eliot_autonomy_run_status"));
+    for tool in PART_E_WORKER_TOOLS {
+        assert!(profile.allows(tool), "missing Part-E tool {tool}");
+    }
+    assert!(!profile.allows("eliot_host_session_status"));
+    assert!(!profile.allows("eliot_project_identity"));
+    assert!(!profile.allows("eliot_task_state"));
+    assert!(!profile.allows("eliot_autonomy_run_status"));
     assert!(!profile.allows("eliot_autonomy_contract_write"));
     assert!(!profile.allows("eliot_autonomy_runtime_action"));
     assert!(!profile.allows("eliot_worktree_review"));
     assert!(!profile.allows("eliot_agent_result_finalize"));
-    assert!(profile.allows("eliot_task_meaning"));
-    assert!(profile.allows("eliot_experience_recall"));
-    assert!(profile.allows("eliot_experience_form"));
+    assert!(!profile.allows("eliot_task_meaning"));
+    assert!(!profile.allows("eliot_experience_recall"));
+    assert!(!profile.allows("eliot_experience_form"));
     let instructions = profile_instructions(profile);
-    assert!(instructions.contains("host identity grants no controller"));
-    assert!(instructions.contains("eliot_host_session_status"));
-    assert!(instructions.contains("Never infer your role"));
-    assert!(instructions.contains("do not wait for repeated user prompting"));
-    assert!(instructions.contains("daemon runtime_id and auth_generation"));
+    assert!(instructions.contains("Host identity grants no controller"));
+    assert!(instructions.contains("Context arrives by itself"));
+    assert!(instructions.contains("compile a packet"));
+    assert!(instructions.contains("Save only novel lessons"));
     assert!(!instructions.contains("You are an external_auditor"));
+    Ok(())
+}
+
+#[test]
+fn bound_part_e_catalog_marks_server_defaulted_scope_fields_optional() -> Result<()> {
+    for profile in [
+        McpAccessProfile::DynamicAgent,
+        McpAccessProfile::ClaudeGoverned,
+        McpAccessProfile::CodexWorker,
+        McpAccessProfile::ExternalAuditor,
+    ] {
+        let current_state = tool_definitions_for_profile(profile)
+            .into_iter()
+            .find(|tool| tool["name"] == "eliot_current_state")
+            .context("bounded current_state tool")?;
+        let required = current_state
+            .pointer("/inputSchema/required")
+            .and_then(Value::as_array)
+            .context("bounded current_state required fields")?;
+        assert!(!required.iter().any(|field| field == "project_id"));
+        assert!(
+            current_state
+                .pointer("/inputSchema/properties/project_id")
+                .is_some(),
+            "the optional explicit project fence remains documented"
+        );
+    }
+
+    let readonly_current_state = tool_definitions_for_profile(McpAccessProfile::HumanReadonly)
+        .into_iter()
+        .find(|tool| tool["name"] == "eliot_current_state")
+        .context("unbound readonly current_state tool")?;
+    assert!(
+        readonly_current_state
+            .pointer("/inputSchema/required")
+            .and_then(Value::as_array)
+            .is_some_and(|required| required.iter().any(|field| field == "project_id")),
+        "unbound callers must still supply a project"
+    );
     Ok(())
 }
 
@@ -1031,6 +1072,45 @@ fn explicit_antigravity_auditor_is_honored() -> Result<()> {
         resolve_effective_profile("antigravity-auditor", Some("antigravity"), false)?,
         McpAccessProfile::ExternalAuditor
     );
+    Ok(())
+}
+
+#[test]
+fn scoped_antigravity_profile_override_is_explicit_and_fail_closed() -> Result<()> {
+    assert_eq!(
+        scoped_profile_override("default", Some("antigravity"), None, true, true)?,
+        "default"
+    );
+    assert_eq!(
+        scoped_profile_override(
+            "default",
+            Some("antigravity"),
+            Some("external_auditor"),
+            true,
+            true,
+        )?,
+        "external_auditor"
+    );
+    for (host, has_session, has_role) in [
+        (Some("claude"), true, true),
+        (Some("antigravity"), false, true),
+        (Some("antigravity"), true, false),
+    ] {
+        let error = scoped_profile_override(
+            "default",
+            host,
+            Some("external_auditor"),
+            has_session,
+            has_role,
+        )
+        .err()
+        .context("invalid scoped profile override must fail")?;
+        assert!(
+            error
+                .to_string()
+                .contains("UNSUPPORTED_SCOPED_PROFILE_OVERRIDE")
+        );
+    }
     Ok(())
 }
 

@@ -207,6 +207,12 @@ fn launch_contract_has_stable_idempotency_and_immutable_hash() {
             .iter()
             .any(|name| name == "ELIOT_AGENT_SESSION_ID")
     );
+    assert!(
+        first
+            .environment_allowlist
+            .iter()
+            .any(|name| name == "ELIOT_GOVERNOR_CONFIG")
+    );
     let mut unhashed = first.clone();
     let expected = unhashed.contract_hash.clone();
     unhashed.contract_hash.clear();

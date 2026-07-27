@@ -550,6 +550,10 @@ async fn launch(
         configure_standard_managed_environment(&mut command, &governor_env);
         None
     };
+    command.env("ELIOT_GOVERNOR_CONFIG", config_path);
+    if host == AgentHostId::Antigravity && bounded_auditor {
+        command.env("ELIOT_MCP_ACCESS_PROFILE", "external_auditor");
+    }
     if let Some(agent_session_id) = contract.agent_session_id {
         command.env("ELIOT_AGENT_SESSION_ID", agent_session_id.to_string());
     }
@@ -826,18 +830,9 @@ pub(crate) async fn prepare_ul_auditor_scope(
         &task_id.to_string(),
         &agent_session_id.to_string(),
         "auditor",
-        [
-            "eliot_host_session_status",
-            "eliot_project_identity",
-            "eliot_task_state",
-            "eliot_current_state",
-            "eliot_recall_l0",
-            "eliot_fetch_l2",
-            "eliot_compile_packet_l3",
-            "eliot_memory_influence_trace",
-            "eliot_agent_candidate_submit",
-        ]
-        .into_iter()
+        crate::mcp_stdio::PART_E_WORKER_TOOLS
+        .iter()
+        .copied()
         .map(str::to_owned)
         .collect(),
         30,
@@ -872,6 +867,15 @@ pub(crate) async fn invoke_ul_scoped_reasoning(
     request: &eliot_types::UlReasoningRequest,
     scope: HostLaunchScope,
 ) -> Result<Value> {
+    if scope.project_id != Some(request.project_id)
+        || scope.task_id != Some(request.task_id)
+        || scope.agent_session_id.is_none()
+        || scope.role_lease_id.is_none()
+    {
+        bail!(
+            "UL scoped provider launch requires matching project/task plus AgentSessionHostBinding and TaskRoleLease"
+        );
+    }
     let provider_session = (request.route.host() == AgentHostId::Claude).then(|| {
         scope
             .agent_session_id
