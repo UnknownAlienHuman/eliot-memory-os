@@ -111,6 +111,20 @@ fn governor_bound_scope_defaults_ids_and_rejects_scope_spoofing() -> Result<()> 
     Ok(())
 }
 
+#[test]
+fn bound_current_state_exposes_canonical_task_without_changing_unbound_shape() {
+    let project_id = ProjectId::new_v7();
+    let task_id = TaskId::new_v7();
+    let current_state =
+        current_state_with_bound_task(json!({"project_id": project_id}), Some(task_id));
+    assert_eq!(current_state["project_id"], json!(project_id));
+    assert_eq!(current_state["task_id"], json!(task_id));
+
+    let unbound_current_state =
+        current_state_with_bound_task(json!({"project_id": project_id}), None);
+    assert!(unbound_current_state.get("task_id").is_none());
+}
+
 /// Needs a live Governor config and a running daemon-owned writer.
 #[tokio::test]
 #[ignore = "requires ELIOT_GOVERNOR_CONFIG and a running daemon"]

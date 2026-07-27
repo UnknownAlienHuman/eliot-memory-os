@@ -640,7 +640,7 @@ pub(super) async fn dispatch_tool(
                     at_least_revision: revision(input.at_least_revision),
                 })
                 .await?;
-            match input.scope.as_deref() {
+            let response = match input.scope.as_deref() {
                 None | Some("" | "all_memory") => serde_json::to_value(response)?,
                 Some("memory_free_control") => {
                     let excluded_item_count = response.verified_now.len()
@@ -669,7 +669,8 @@ pub(super) async fn dispatch_tool(
                 Some(scope) => anyhow::bail!(
                     "unsupported current-state scope {scope}; expected all_memory or memory_free_control"
                 ),
-            }
+            };
+            current_state_with_bound_task(response, context.bound_task_id)
         }
         "eliot_recall_l0" => {
             let input: RecallL0ToolInput = serde_json::from_value(arguments)?;
@@ -1058,4 +1059,14 @@ pub(super) async fn dispatch_tool(
         _ => unreachable!("tool list pre-check guarantees known tool names"),
     };
     Ok(structured)
+}
+
+pub(super) fn current_state_with_bound_task(
+    mut response: Value,
+    bound_task_id: Option<TaskId>,
+) -> Value {
+    if let Some(task_id) = bound_task_id {
+        response["task_id"] = json!(task_id);
+    }
+    response
 }
