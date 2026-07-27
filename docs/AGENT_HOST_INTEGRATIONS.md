@@ -14,10 +14,10 @@ and host labels are not role evidence.
 
 The portable skill pack contains exactly four skills:
 
-- `eliot-task-cycle`
-- `eliot-understanding`
-- `eliot-delegation`
-- `eliot-verify-finish`
+- `eliot-work`
+- `eliot-remember`
+- `eliot-recover`
+- `eliot-finish`
 
 Canonical skill bodies live in `integrations/agent-skills`. Generated host copies
 must remain byte-identical.
@@ -26,7 +26,7 @@ must remain byte-identical.
 
 | Host | Product integration | Installation authority |
 |---|---|---|
-| Codex | Project MCP plus shared/project skills and repository instructions; there is no ELIOT Codex plugin | Codex MCP configuration and skill roots |
+| Codex | Native ELIOT plugin with one MCP server, four canonical skills, and bounded lifecycle hooks | Codex plugin lifecycle and MCP configuration |
 | Antigravity | Official ELIOT plugin plus a governed MCP registration | Antigravity plugin directory and GUI MCP config |
 | OpenCode | Additive JSONC configuration, lifecycle plugin, four skills | Governor ownership manifest |
 | Claude Code | Official local-marketplace plugin with MCP, hooks, and four skills | `claude plugin` lifecycle |
@@ -89,3 +89,21 @@ Registering a host session gives no role. Delegated results remain candidate
 evidence until the controller records a disposition; disposition never bypasses
 verification or FinishGate. Unknown provider outcomes must be reconciled by
 session ID, idempotency key, and broker state before retry.
+
+## Understanding Layer v1.4 certification
+
+Codex has a native ELIOT plugin. The package exposes one governed MCP server,
+the four canonical skills, and bounded lifecycle hooks; it is not a prose-only
+integration.
+
+Antigravity's official package is consumed by the default agent through its
+skills, rules, and governed GUI MCP registration. A custom `eliot-agent`,
+`--agent eliot-agent`, a duplicate legacy CLI MCP config, or a blank replacement
+profile is neither required nor accepted as readiness evidence.
+
+The Claude Code and Antigravity packages were exercised in blind reciprocal run
+`ul-cross-agent-019fa39f-64a1-7321-ad19-077ffb616486`. The run completed exactly
+eight provider calls, both directions passed, and no provider outcome was
+unknown. Canonical receipts prove provider-owned candidate submission, exact
+handle retrieval, influence acknowledgement, clean memory-free controls, and
+unchanged truth revision for observability-only writes.

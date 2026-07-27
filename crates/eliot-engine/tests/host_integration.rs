@@ -58,13 +58,11 @@ fn canonical_skill_pack_has_exact_host_parity_and_budget() {
         .expect("lint skill pack");
     assert!(report.valid, "{:?}", report.errors);
     assert_eq!(report.skill_count, 4);
-    assert!(report.listing_characters <= 1_200);
-    assert!(
-        report
-            .entries
-            .iter()
-            .all(|entry| entry.opencode_parity && entry.claude_parity)
-    );
+    assert!(report.listing_characters.div_ceil(4) <= 100);
+    assert!(report.entries.iter().all(|entry| entry.opencode_parity
+        && entry.claude_parity
+        && entry.package_parity.get("codex") == Some(&true)
+        && entry.package_parity.get("antigravity") == Some(&true)));
 }
 
 #[test]
@@ -208,6 +206,12 @@ fn launch_contract_has_stable_idempotency_and_immutable_hash() {
             .environment_allowlist
             .iter()
             .any(|name| name == "ELIOT_AGENT_SESSION_ID")
+    );
+    assert!(
+        first
+            .environment_allowlist
+            .iter()
+            .any(|name| name == "ELIOT_GOVERNOR_CONFIG")
     );
     let mut unhashed = first.clone();
     let expected = unhashed.contract_hash.clone();

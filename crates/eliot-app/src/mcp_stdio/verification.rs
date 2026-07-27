@@ -149,7 +149,7 @@ pub(super) async fn dispatch_agent_candidate_submit(
             }));
         }
     }
-    let payload = json!({
+    let mut payload = json!({
         "candidate_only": true,
         "controller_reconciliation_required": true,
         "profile": state.profile.as_str(),
@@ -165,6 +165,12 @@ pub(super) async fn dispatch_agent_candidate_submit(
         "expected_reuse_note": input.expected_reuse_note,
         "curation": input.curation
     });
+    if context.bound_project_id == Some(project_id) && context.bound_task_id == Some(task_id) {
+        payload
+            .as_object_mut()
+            .context("candidate payload must be an object")?
+            .insert("agent_session_id".to_owned(), json!(context.session_id));
+    }
     let payload = if let Some(claims) = cognitive_claims.as_ref() {
         let mut payload = payload;
         let object = payload
@@ -202,15 +208,17 @@ pub(super) async fn dispatch_agent_candidate_submit(
         .unwrap_or_default()
         .to_owned();
     let claim_id = ClaimId::from_uuid(write_id.as_uuid());
+    let governor_bound =
+        context.bound_project_id == Some(project_id) && context.bound_task_id == Some(task_id);
+    let bound_session =
+        (cognitive_claims.is_some() || governor_bound).then_some(context.session_id);
     let command = SemanticCommand::ClaimPropose(eliot_types::ClaimProposeCommand {
         context: CommandContext {
             write_id,
             agent_id: AgentId::from_uuid(
-                cognitive_claims
-                    .as_ref()
-                    .map_or(write_id.as_uuid(), |_| context.session_id.as_uuid()),
+                bound_session.map_or(write_id.as_uuid(), eliot_types::SessionId::as_uuid),
             ),
-            session_id: cognitive_claims.as_ref().map(|_| context.session_id),
+            session_id: bound_session,
             project_id,
             task_id: Some(task_id),
             scope: format!("task:{task_id}:agent-candidate-memory"),

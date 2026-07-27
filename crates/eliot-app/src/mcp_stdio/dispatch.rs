@@ -578,6 +578,12 @@ pub(super) async fn dispatch_tool(
         "eliot_task_observation_record" => {
             Box::pin(dispatch_task_observation_record(state, context, arguments)).await?
         }
+        "eliot_write_cognitive_observation" => {
+            Box::pin(dispatch_write_cognitive_observation(
+                state, context, arguments,
+            ))
+            .await?
+        }
         "eliot_agent_candidate_submit" => {
             Box::pin(dispatch_agent_candidate_submit(state, context, arguments)).await?
         }
@@ -700,6 +706,14 @@ pub(super) async fn dispatch_tool(
                 .retain(|score| returned.contains(score.handle.as_str()));
             response.rank_trace.candidates_returned = response.handles.len();
             response.rank_trace.no_useful_memory = response.handles.is_empty();
+            response.memory_confidence = eliot_types::MemoryConfidence::from_top_score(
+                response
+                    .rank_trace
+                    .feature_scores
+                    .iter()
+                    .map(|score| score.total)
+                    .max(),
+            );
             serde_json::to_value(response)?
         }
         "eliot_fetch_l2" => {

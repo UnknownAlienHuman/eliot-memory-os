@@ -71,6 +71,7 @@ const SAFE_AUDITOR_MCP_TOOLS: &[&str] = &[
     "eliot_recall_l0",
     "eliot_fetch_l2",
     "eliot_compile_packet_l3",
+    "eliot_memory_influence_trace",
     "eliot_task_meaning",
     "eliot_experience_recall",
     "eliot_skill_list",
@@ -1565,10 +1566,26 @@ impl AntigravityMcpConfigService {
     }
 
     pub fn desired_server_value(&self, eliot_exe: &Path) -> Result<Value, EngineError> {
+        self.desired_server_value_with_profile(eliot_exe, None)
+    }
+
+    pub fn desired_server_value_with_profile(
+        &self,
+        eliot_exe: &Path,
+        profile: Option<&str>,
+    ) -> Result<Value, EngineError> {
         let command = validate_eliot_mcp_executable(eliot_exe)?;
+        let mut args = vec!["mcp", "stdio", "--host", "antigravity"];
+        if let Some(profile) = profile {
+            if profile.trim().is_empty() {
+                return Err(rejected("Antigravity MCP profile must not be empty"));
+            }
+            args.extend(["--profile", profile]);
+        }
+        args.extend(["--instance", "default"]);
         Ok(json!({
             "command": command,
-            "args": ["mcp", "stdio", "--host", "antigravity", "--instance", "default"]
+            "args": args
         }))
     }
 
@@ -1898,7 +1915,6 @@ impl AntigravityOfficialPluginService {
             && listed_by_agy
             && status.gui_installed
             && status.official_schema_valid
-            && status.agent_visible
             && status.skill_visible;
         AntigravityOfficialPluginInstallReceipt {
             component: "antigravity_official_plugin_install_receipt".to_owned(),
@@ -1914,9 +1930,15 @@ impl AntigravityOfficialPluginService {
             agent_visible: status.agent_visible,
             skill_visible: status.skill_visible,
             reasons: if installed {
-                vec!["official plugin install, listing, agent, and skill checks passed".to_owned()]
+                vec![
+                    "official plugin install, listing, schema, and skill checks passed; the default Antigravity agent consumes the package without a required custom agent"
+                        .to_owned(),
+                ]
             } else {
-                vec!["official plugin install requires command success, agy listing, valid installed schema, agent, and skill".to_owned()]
+                vec![
+                    "official plugin install requires command success, agy listing, valid installed schema, and skill"
+                        .to_owned(),
+                ]
             },
             created_at: OffsetDateTime::now_utc(),
         }

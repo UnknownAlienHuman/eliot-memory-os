@@ -116,7 +116,6 @@ pub fn run_antigravity_status(config_path: &Path) -> Result<()> {
     let official_plugin_ready = (official_plugin.gui_installed || official_plugin.cli_installed)
         && official_plugin.official_schema_valid
         && official_plugin.skill_visible
-        && official_plugin.agent_visible
         && official_plugin.rule_visible;
     let mcp_registered = mcp_configs.iter().any(|status| {
         status.surface == eliot_types::AntigravityMcpConfigSurface::Gui && status.registered
@@ -556,7 +555,6 @@ pub fn run_antigravity_report(config_path: &Path) -> Result<()> {
     let official_plugin_ready = (official_plugin.gui_installed || official_plugin.cli_installed)
         && official_plugin.official_schema_valid
         && official_plugin.skill_visible
-        && official_plugin.agent_visible
         && official_plugin.rule_visible;
     let mcp_registered = mcp_configs.iter().any(|status| {
         status.surface == eliot_types::AntigravityMcpConfigSurface::Gui && status.registered

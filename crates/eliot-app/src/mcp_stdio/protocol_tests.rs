@@ -649,41 +649,38 @@ fn project_identity_accepts_stable_labels_and_normalizes_windows_paths() -> Resu
 #[test]
 fn external_auditor_initialize_instructions_make_memory_proactive() {
     let instructions = profile_instructions(McpAccessProfile::ExternalAuditor);
-    assert!(instructions.contains("For every nontrivial project task"));
-    assert!(instructions.contains("eliot_project_identity"));
-    assert!(instructions.contains("eliot_recall_l0"));
-    assert!(instructions.contains("eliot_agent_candidate_submit"));
-    assert!(instructions.contains("governor_bound_scope_active"));
-    assert!(instructions.contains("PROJECT_SCOPE_MISMATCH"));
-    assert!(instructions.contains("a bound session may omit project_id/task_id"));
-    assert!(instructions.contains("recall-only or status-only task needs no handoff write"));
-    assert!(instructions.contains("all three array fields"));
-    assert!(instructions.contains("do not call CodeCortex"));
-    assert!(instructions.contains("candidate evidence only"));
-    assert!(!instructions.contains("antigravity-auditor"));
+    assert!(instructions.contains("Context arrives by itself"));
+    assert!(instructions.contains("ul_boot"));
+    assert!(instructions.contains("frame_stub"));
+    assert!(instructions.contains("matching negative memory"));
+    assert!(instructions.contains("Host identity grants no controller"));
+    assert!(instructions.contains("model writes remain evidence"));
 }
 
 #[test]
 fn claude_desktop_profile_is_compact_and_role_neutral() -> Result<()> {
     let profile = McpAccessProfile::parse("claude_desktop")?;
     let tools = tool_definitions_for_profile(profile);
+    for tool in &tools {
+        let name = tool
+            .get("name")
+            .and_then(Value::as_str)
+            .context("Claude tool name")?;
+        assert_eq!(
+            tool.pointer("/inputSchema/type").and_then(Value::as_str),
+            Some("object"),
+            "Claude Code requires an object-root input schema for {name}"
+        );
+    }
     let names = tools
         .iter()
         .filter_map(|tool| tool.get("name").and_then(Value::as_str))
         .collect::<Vec<_>>();
-    assert_eq!(names.len(), CLAUDE_DESKTOP_TOOLS.len());
-    assert!(names.contains(&"eliot_host_session_status"));
-    assert!(names.contains(&"eliot_compile_packet_l3"));
-    assert!(names.contains(&"eliot_agent_candidate_submit"));
-    assert!(names.contains(&"eliot_memory_influence_trace"));
-    assert!(names.contains(&"eliot_agent_delegate"));
-    assert!(names.contains(&"eliot_agent_result_disposition"));
-    assert!(!names.contains(&"eliot_patch_apply"));
-    assert!(!names.contains(&"eliot_antigravity_request"));
-    assert!(names.len() <= 12);
+    assert_eq!(names.len(), PART_E_WORKER_TOOLS.len());
+    assert!(PART_E_WORKER_TOOLS.iter().all(|name| names.contains(name)));
     let instructions = profile_instructions(profile);
-    assert!(instructions.contains("host identity grants no controller"));
-    assert!(instructions.contains("compact profile intentionally omits direct patch"));
+    assert!(instructions.contains("Host identity grants no controller"));
+    assert!(instructions.contains("Context arrives by itself"));
     assert!(!instructions.contains("You are an external_auditor"));
     Ok(())
 }
@@ -994,24 +991,189 @@ async fn cargo_workspace_check_registry_runs_fixed_offline_command() -> Result<(
 fn dynamic_agent_profile_is_host_neutral_and_proactive() -> Result<()> {
     let profile = McpAccessProfile::parse("dynamic_agent")?;
     assert_eq!(profile, McpAccessProfile::DynamicAgent);
-    assert!(profile.allows("eliot_recall_l0"));
-    assert!(profile.allows("eliot_agent_candidate_submit"));
-    assert!(profile.allows("eliot_host_session_status"));
-    assert!(profile.allows("eliot_autonomy_run_status"));
+    for tool in PART_E_WORKER_TOOLS {
+        assert!(profile.allows(tool), "missing Part-E tool {tool}");
+    }
+    assert!(!profile.allows("eliot_host_session_status"));
+    assert!(!profile.allows("eliot_project_identity"));
+    assert!(!profile.allows("eliot_task_state"));
+    assert!(!profile.allows("eliot_autonomy_run_status"));
     assert!(!profile.allows("eliot_autonomy_contract_write"));
     assert!(!profile.allows("eliot_autonomy_runtime_action"));
     assert!(!profile.allows("eliot_worktree_review"));
     assert!(!profile.allows("eliot_agent_result_finalize"));
-    assert!(profile.allows("eliot_task_meaning"));
-    assert!(profile.allows("eliot_experience_recall"));
-    assert!(profile.allows("eliot_experience_form"));
+    assert!(!profile.allows("eliot_task_meaning"));
+    assert!(!profile.allows("eliot_experience_recall"));
+    assert!(!profile.allows("eliot_experience_form"));
     let instructions = profile_instructions(profile);
-    assert!(instructions.contains("host identity grants no controller"));
-    assert!(instructions.contains("eliot_host_session_status"));
-    assert!(instructions.contains("Never infer your role"));
-    assert!(instructions.contains("do not wait for repeated user prompting"));
-    assert!(instructions.contains("daemon runtime_id and auth_generation"));
+    assert!(instructions.contains("Host identity grants no controller"));
+    assert!(instructions.contains("Context arrives by itself"));
+    assert!(instructions.contains("compile a packet"));
+    assert!(instructions.contains("Save only novel lessons"));
     assert!(!instructions.contains("You are an external_auditor"));
+    Ok(())
+}
+
+#[test]
+fn bound_part_e_catalog_marks_server_defaulted_scope_fields_optional() -> Result<()> {
+    for profile in [
+        McpAccessProfile::DynamicAgent,
+        McpAccessProfile::ClaudeGoverned,
+        McpAccessProfile::CodexWorker,
+        McpAccessProfile::ExternalAuditor,
+    ] {
+        let current_state = tool_definitions_for_profile(profile)
+            .into_iter()
+            .find(|tool| tool["name"] == "eliot_current_state")
+            .context("bounded current_state tool")?;
+        let required = current_state
+            .pointer("/inputSchema/required")
+            .and_then(Value::as_array)
+            .context("bounded current_state required fields")?;
+        assert!(!required.iter().any(|field| field == "project_id"));
+        assert!(
+            current_state
+                .pointer("/inputSchema/properties/project_id")
+                .is_some(),
+            "the optional explicit project fence remains documented"
+        );
+    }
+
+    let readonly_current_state = tool_definitions_for_profile(McpAccessProfile::HumanReadonly)
+        .into_iter()
+        .find(|tool| tool["name"] == "eliot_current_state")
+        .context("unbound readonly current_state tool")?;
+    assert!(
+        readonly_current_state
+            .pointer("/inputSchema/required")
+            .and_then(Value::as_array)
+            .is_some_and(|required| required.iter().any(|field| field == "project_id")),
+        "unbound callers must still supply a project"
+    );
+    Ok(())
+}
+
+#[test]
+fn default_antigravity_remains_dynamic_agent() -> Result<()> {
+    assert_eq!(
+        resolve_effective_profile("default", Some("antigravity"), false)?,
+        McpAccessProfile::DynamicAgent
+    );
+    Ok(())
+}
+
+#[test]
+fn explicit_antigravity_auditor_is_honored() -> Result<()> {
+    assert_eq!(
+        resolve_effective_profile("external_auditor", Some("antigravity"), false)?,
+        McpAccessProfile::ExternalAuditor
+    );
+    assert_eq!(
+        resolve_effective_profile("antigravity-auditor", Some("antigravity"), false)?,
+        McpAccessProfile::ExternalAuditor
+    );
+    Ok(())
+}
+
+#[test]
+fn scoped_antigravity_profile_override_is_explicit_and_fail_closed() -> Result<()> {
+    assert_eq!(
+        scoped_profile_override("default", Some("antigravity"), None, true, true)?,
+        "default"
+    );
+    assert_eq!(
+        scoped_profile_override(
+            "default",
+            Some("antigravity"),
+            Some("external_auditor"),
+            true,
+            true,
+        )?,
+        "external_auditor"
+    );
+    for (host, has_session, has_role) in [
+        (Some("claude"), true, true),
+        (Some("antigravity"), false, true),
+        (Some("antigravity"), true, false),
+    ] {
+        let error = scoped_profile_override(
+            "default",
+            host,
+            Some("external_auditor"),
+            has_session,
+            has_role,
+        )
+        .err()
+        .context("invalid scoped profile override must fail")?;
+        assert!(
+            error
+                .to_string()
+                .contains("UNSUPPORTED_SCOPED_PROFILE_OVERRIDE")
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn unsupported_pair_fails_closed() -> Result<()> {
+    let error = resolve_effective_profile("codex_controller", Some("antigravity"), false)
+        .err()
+        .context("an explicit controller profile must not be inferred from host identity")?;
+    assert!(error.to_string().contains("UNSUPPORTED_HOST_PROFILE_PAIR"));
+    Ok(())
+}
+
+#[test]
+fn bounded_catalog() {
+    let profile = McpAccessProfile::ExternalAuditor;
+    for allowed in [
+        "eliot_recall_l0",
+        "eliot_fetch_l2",
+        "eliot_compile_packet_l3",
+        "eliot_agent_candidate_submit",
+        "eliot_memory_influence_trace",
+    ] {
+        assert!(profile.allows(allowed), "{allowed} must remain bounded");
+    }
+    for denied in [
+        "eliot_patch_apply",
+        "eliot_submit_completion_proof",
+        "eliot_worktree_review",
+        "eliot_autonomy_runtime_action",
+    ] {
+        assert!(!profile.allows(denied), "{denied} must remain unavailable");
+    }
+}
+
+#[test]
+fn scoped_authority_unchanged() -> Result<()> {
+    let project_id = ProjectId::new_v7();
+    let task_id = TaskId::new_v7();
+    let session_id = SessionId::new_v7();
+    let agent_session_id = AgentSessionId::from_uuid(session_id.as_uuid());
+    let mut broker = eliot_types::DelegationState::default();
+    broker
+        .agent_host_sessions
+        .push(eliot_types::AgentSessionHostBinding {
+            agent_session_id,
+            host_identity: eliot_types::AgentHostIdentity {
+                host_id: AgentHostId::Antigravity,
+                implementation_name: "antigravity".to_owned(),
+                client_instance_id: format!("client:{session_id}"),
+            },
+            capability_envelope: AgentCapabilityEnvelope::default(),
+            bound_project_id: Some(project_id),
+            bound_task_id: Some(task_id),
+            task_role_lease_refs: vec!["role:missing".to_owned()],
+        });
+    let error = validate_canonical_host_scope(&broker, session_id, project_id, task_id)
+        .err()
+        .context("host identity without a TaskRoleLease must fail before dispatch")?;
+    assert!(
+        error
+            .to_string()
+            .contains("no active matching TaskRoleLease")
+    );
     Ok(())
 }
 
@@ -1164,6 +1326,7 @@ fn operator_memory_projection_exposes_rank_suppression_and_exact_resolution_fiel
             lifecycle_state: Some(MemoryLifecycleState::Active),
             lifecycle_badge: None,
         }],
+        memory_confidence: eliot_types::MemoryConfidence::Found,
         query_mode: "query_aware_semantic_lexical_relational_v2".to_owned(),
         rank_trace: eliot_types::L0RankTrace {
             query: "current candidate".to_owned(),
@@ -1244,6 +1407,7 @@ fn operator_memory_projection_exposes_rank_suppression_and_exact_resolution_fiel
         verification_runs: Vec::new(),
         tool_observations: Vec::new(),
         failure_fingerprints: Vec::new(),
+        ul_artifacts: Vec::new(),
         relations: Vec::new(),
         requested_handles: vec![format!("claim:{active_id}"), "claim:missing".to_owned()],
         returned_handles: vec![format!("claim:{active_id}")],
@@ -1289,6 +1453,7 @@ fn operator_memory_projection_surfaces_no_useful_memory() {
         project_id: ProjectId::new_v7(),
         at_revision: MemoryRevision::new(7),
         handles: Vec::new(),
+        memory_confidence: eliot_types::MemoryConfidence::None,
         query_mode: "query_aware_semantic_lexical_relational_v2".to_owned(),
         rank_trace: eliot_types::L0RankTrace {
             query: "absent memory".to_owned(),
@@ -1534,7 +1699,7 @@ fn canonical_mutation_authority_is_controller_or_operator_only() {
         assert!(!McpAccessProfile::DynamicAgent.allows(tool));
         assert!(!McpAccessProfile::HumanReadonly.allows(tool));
     }
-    assert!(McpAccessProfile::CodexWorker.allows("eliot_canonical_status"));
+    assert!(!McpAccessProfile::CodexWorker.allows("eliot_canonical_status"));
     assert!(McpAccessProfile::HumanReadonly.allows("eliot_canonical_status"));
 }
 
@@ -2494,7 +2659,7 @@ fn l13_curation_preview_classifies_only_explicit_reversible_findings() {
     }
 
     assert!(READ_ONLY_TOOLS.contains(&"eliot_memory_curation_preview"));
-    assert!(McpAccessProfile::ExternalAuditor.allows("eliot_memory_curation_preview"));
+    assert!(!McpAccessProfile::ExternalAuditor.allows("eliot_memory_curation_preview"));
     assert!(memory_lifecycle_tool_definitions().iter().any(|tool| {
         tool.get("name").and_then(Value::as_str) == Some("eliot_memory_curation_preview")
     }));

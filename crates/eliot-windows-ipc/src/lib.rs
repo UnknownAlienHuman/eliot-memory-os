@@ -1995,7 +1995,7 @@ mod tests {
             root.join("child.cmd"),
             "@echo off\r\n\"%SystemRoot%\\System32\\ping.exe\" -n 30 127.0.0.1 >NUL\r\n",
         )?;
-        let script = "$info = New-Object System.Diagnostics.ProcessStartInfo; $info.FileName = $env:ComSpec; $info.Arguments = '/D /C child.cmd'; $info.UseShellExecute = $false; $info.CreateNoWindow = $true; [System.Diagnostics.Process]::Start($info) | Out-Null; Write-Output root";
+        let script = "$info = New-Object System.Diagnostics.ProcessStartInfo; $info.FileName = $env:ComSpec; $info.Arguments = '/D /C child.cmd'; $info.UseShellExecute = $false; $info.CreateNoWindow = $true; $process = [System.Diagnostics.Process]::Start($info); $process.Dispose(); Write-Output root";
         let mut child = SuspendedJobChild::spawn(&managed_powershell(script, &root))?;
         let mut stdout = child.take_stdout().ok_or("stdout")?;
         let mut stderr = child.take_stderr().ok_or("stderr")?;

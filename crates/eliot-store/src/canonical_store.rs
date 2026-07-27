@@ -12,7 +12,8 @@ use eliot_types::{
     CanonicalReplayExecutionRecord, CanonicalTraceCompletenessContract, ClaimId, CueIndexRow,
     CueRecordSource, CurrentStateRequest, CurrentStateResponse, EpistemicStatus,
     ExperimentalMetaPolicyCandidate, FetchAtomsL2Request, FetchAtomsL2Response,
-    GraphHealthResponse, HarnessExperimentRecord, InjectionReceipt, LifecycleStatus,
+    GraphHealthResponse, HarnessExperimentRecord, InjectionReceipt, L0FeatureScore, L0RankTrace,
+    L0SuppressionTrace, LifecycleStatus, MemoryConfidence, MemoryHandlePreview,
     MemoryInfluenceTrace, MemoryRevision, MemoryStateTransition, MemoryTrajectoryCorrectness,
     MemoryWriteEnvelope, MetaIsolationRejectionRecord, MetaPolicyExecutionAction,
     MetaPolicyExecutionReceipt, MinorityPressureRecord, ObservabilityKind,
@@ -20,8 +21,8 @@ use eliot_types::{
     ProjectSequence, RecallL0Request, RecallL0Response, ReplayAudit, ReplayRun,
     SealedReplayCaseRecord, SealedReplayInputSnapshotRecord, SealedReplaySetRecord,
     SleepCandidateArtifact, SleepConsolidationBundle, SleepConsolidationRun, SurrealServerConfig,
-    TaintClass, TaskContract, TaskId, ToolObservation, VerificationId, VerificationRun, Visibility,
-    WriteId, WriteReceipt,
+    TaintClass, TaskContract, TaskId, ToolObservation, TruncationInfo, VerificationId,
+    VerificationRun, Visibility, WriteId, WriteReceipt,
 };
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
@@ -68,6 +69,34 @@ const SECRET_SCAN_TABLES: &[&str] = &[
     "card_covers",
 ];
 
+const MAX_RECALL_CANDIDATES: usize = 512;
+const MAX_RECALL_RESULTS: usize = 12;
+
+#[derive(Clone, Debug, serde::Deserialize)]
+struct RecallCandidateRow {
+    handle: String,
+    record_type: String,
+    preview: String,
+    search_text: String,
+    status: String,
+    lifecycle_state: Option<eliot_types::MemoryLifecycleState>,
+    authority_rank: i32,
+    negative_memory: bool,
+}
+
+#[derive(serde::Deserialize)]
+struct RecallCandidateLoad {
+    at_revision: MemoryRevision,
+    candidates: Vec<RecallCandidateRow>,
+    truncated: bool,
+}
+
+#[derive(Clone)]
+struct RankedRecallCandidate {
+    row: RecallCandidateRow,
+    score: L0FeatureScore,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
 pub struct CanonicalSecretScanFinding {
     pub table: String,
@@ -97,6 +126,10 @@ enum L2HandleKind {
     Verification,
     Observation,
     Failure,
+    Card,
+    Capsule,
+    Charter,
+    Map,
 }
 
 #[derive(Clone, Debug)]
@@ -113,6 +146,10 @@ struct ExactL2Bindings {
     verifications: Vec<Vec<String>>,
     observations: Vec<Vec<String>>,
     failures: Vec<Vec<String>>,
+    cards: Vec<Vec<String>>,
+    capsules: Vec<Vec<String>>,
+    charters: Vec<Vec<String>>,
+    maps: Vec<Vec<String>>,
     relations: Vec<Vec<String>>,
 }
 
@@ -137,6 +174,11 @@ fn parse_l2_selector(raw: &str) -> (L2HandleKind, &str, &'static str) {
         ),
         ("failure:", L2HandleKind::Failure, "failure:"),
         ("failure_fingerprint:", L2HandleKind::Failure, "failure:"),
+        ("card:", L2HandleKind::Card, "card:"),
+        ("capsule:", L2HandleKind::Capsule, "capsule:"),
+        ("charter:", L2HandleKind::Charter, "charter:"),
+        ("map:", L2HandleKind::Map, "map:"),
+        ("system-map:", L2HandleKind::Map, "map:"),
     ] {
         if let Some(identity) = raw.strip_prefix(prefix) {
             return (kind, identity, canonical);
@@ -158,6 +200,10 @@ fn exact_l2_bindings(
         verifications: l2_fragment_lists(&identities(L2HandleKind::Verification)),
         observations: l2_fragment_lists(&identities(L2HandleKind::Observation)),
         failures: l2_fragment_lists(&identities(L2HandleKind::Failure)),
+        cards: l2_fragment_lists(&identities(L2HandleKind::Card)),
+        capsules: l2_fragment_lists(&identities(L2HandleKind::Capsule)),
+        charters: l2_fragment_lists(&identities(L2HandleKind::Charter)),
+        maps: l2_fragment_lists(&identities(L2HandleKind::Map)),
         relations: l2_fragment_lists(&l2_relation_identities(&selectors)),
     };
     Ok((selectors, bindings, next_continuation))
@@ -276,6 +322,11 @@ fn l2_relation_identities(selectors: &[L2Selector]) -> Vec<String> {
             "tool_observation:",
             "failure:",
             "failure_fingerprint:",
+            "card:",
+            "capsule:",
+            "charter:",
+            "map:",
+            "system-map:",
         ] {
             relation_ids.insert(format!("{prefix}{}", selector.identity));
         }
@@ -313,6 +364,7 @@ fn finalize_exact_l2_response(
         + response.verification_runs.len()
         + response.tool_observations.len()
         + response.failure_fingerprints.len()
+        + response.ul_artifacts.len()
         + response.relations.len();
 }
 
@@ -350,6 +402,13 @@ fn sort_exact_l2_response(response: &mut FetchAtomsL2Response, selectors: &[L2Se
             record.fingerprint.clone(),
         )
     });
+    response.ul_artifacts.sort_by_cached_key(|record| {
+        let (kind, identity, _) = parse_l2_selector(&record.handle);
+        (
+            selector_position(selectors, kind, identity),
+            record.handle.clone(),
+        )
+    });
     response.relations.sort_by_key(|relation| {
         (
             relation.from.clone(),
@@ -367,6 +426,10 @@ fn resolved_exact_l2_handles(response: &FetchAtomsL2Response) -> HashSet<(L2Hand
             .iter()
             .map(|record| (L2HandleKind::Claim, record.claim_id.to_string())),
     );
+    for artifact in &response.ul_artifacts {
+        let (kind, identity, _) = parse_l2_selector(&artifact.handle);
+        resolved.insert((kind, identity.to_owned()));
+    }
     resolved.extend(
         response
             .evidence_atoms
@@ -439,6 +502,184 @@ fn classify_exact_l2_handles(response: &mut FetchAtomsL2Response, selectors: &[L
                 .push(selector.public_handle.clone());
         }
     }
+}
+
+fn rank_recall_candidates(
+    request: &RecallL0Request,
+    load: RecallCandidateLoad,
+) -> RecallL0Response {
+    let query_tokens = eliot_types::normalize_query_tokens(&request.query);
+    let normalized_query = query_tokens.join(" ");
+    let exact_query = request.query.trim().to_lowercase();
+    let candidates_considered = load.candidates.len();
+    let lifecycle_suppressions = load
+        .candidates
+        .iter()
+        .filter_map(|candidate| match candidate.lifecycle_state {
+            Some(eliot_types::MemoryLifecycleState::Suppressed) => Some(L0SuppressionTrace {
+                handle: candidate.handle.clone(),
+                reason: "lifecycle_suppressed".to_owned(),
+            }),
+            Some(eliot_types::MemoryLifecycleState::Stale) => Some(L0SuppressionTrace {
+                handle: candidate.handle.clone(),
+                reason: "lifecycle_stale".to_owned(),
+            }),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let mut admitted = load
+        .candidates
+        .into_iter()
+        .filter_map(|row| {
+            rank_recall_candidate(row, &query_tokens, &normalized_query, &exact_query)
+        })
+        .collect::<Vec<_>>();
+    admitted.sort_by(|left, right| {
+        right
+            .score
+            .total
+            .cmp(&left.score.total)
+            .then_with(|| right.row.authority_rank.cmp(&left.row.authority_rank))
+            .then_with(|| left.row.handle.cmp(&right.row.handle))
+    });
+    let admitted_count = admitted.len();
+    admitted.truncate(MAX_RECALL_RESULTS);
+    let top_score = admitted.first().map(|candidate| candidate.score.total);
+    let memory_confidence = MemoryConfidence::from_top_score(top_score);
+    let handles = admitted
+        .iter()
+        .map(|candidate| MemoryHandlePreview {
+            handle: candidate.row.handle.clone(),
+            record_type: candidate.row.record_type.clone(),
+            preview: candidate.row.preview.clone(),
+            lifecycle_state: candidate.row.lifecycle_state,
+            lifecycle_badge: None,
+        })
+        .collect::<Vec<_>>();
+    let feature_scores = admitted
+        .into_iter()
+        .map(|candidate| candidate.score)
+        .collect::<Vec<_>>();
+    let candidates_returned = handles.len();
+    let query_mode = "unicode_multi_kind_deterministic_v3".to_owned();
+
+    RecallL0Response {
+        project_id: request.project_id,
+        at_revision: load.at_revision,
+        handles,
+        memory_confidence,
+        query_mode: query_mode.clone(),
+        rank_trace: L0RankTrace {
+            query: request.query.clone(),
+            normalized_query,
+            candidates_considered,
+            candidates_returned,
+            feature_scores,
+            lifecycle_suppressions,
+            scope_suppressions: Vec::new(),
+            no_useful_memory: candidates_returned == 0,
+            query_mode,
+        },
+        truncation: TruncationInfo {
+            truncated: load.truncated
+                || candidates_considered > MAX_RECALL_CANDIDATES
+                || admitted_count > MAX_RECALL_RESULTS,
+            limit: MAX_RECALL_RESULTS,
+            returned: candidates_returned,
+        },
+    }
+}
+
+fn rank_recall_candidate(
+    row: RecallCandidateRow,
+    query_tokens: &[String],
+    normalized_query: &str,
+    exact_query: &str,
+) -> Option<RankedRecallCandidate> {
+    let candidate_tokens = eliot_types::normalize_query_tokens(&row.search_text);
+    let preview_tokens = eliot_types::normalize_query_tokens(&row.preview);
+    let normalized_preview = preview_tokens.join(" ");
+    let overlap = query_tokens
+        .iter()
+        .filter(|token| candidate_tokens.contains(token))
+        .count();
+    let overlap_score = i32::try_from(overlap).unwrap_or(i32::MAX);
+    let exact_identifier = i32::from(row.handle.to_lowercase() == exact_query) * 1_000;
+    let subject_identity =
+        i32::from(!query_tokens.is_empty() && overlap == query_tokens.len()) * 200;
+    let exact_preview =
+        i32::from(!normalized_query.is_empty() && normalized_preview == normalized_query) * 250;
+    let preview_contains =
+        i32::from(!normalized_query.is_empty() && normalized_preview.contains(normalized_query))
+            * 140;
+    let lexical_overlap = overlap_score * 40 + exact_preview + preview_contains;
+    let lifecycle_fit = if matches!(
+        row.lifecycle_state,
+        Some(
+            eliot_types::MemoryLifecycleState::Stale
+                | eliot_types::MemoryLifecycleState::Suppressed
+        )
+    ) || row.status.eq_ignore_ascii_case("stale")
+    {
+        -300
+    } else {
+        0
+    };
+    let evidence_authority = match row.status.to_ascii_lowercase().as_str() {
+        "verified" => 80,
+        "supported" => 50,
+        "candidate" => 10,
+        _ => 0,
+    };
+    let negative_memory = i32::from(row.negative_memory && overlap > 0) * 80;
+    let total = exact_identifier
+        + subject_identity
+        + lexical_overlap
+        + lifecycle_fit
+        + evidence_authority
+        + negative_memory;
+    let lexical_signal = overlap > 0 || exact_preview > 0 || preview_contains > 0;
+    if exact_identifier == 0 && (!lexical_signal || total < 80) {
+        return None;
+    }
+    let mut reasons = Vec::new();
+    if exact_identifier > 0 {
+        reasons.push("exact_handle".to_owned());
+    }
+    if subject_identity > 0 {
+        reasons.push("all_query_tokens".to_owned());
+    }
+    if overlap > 0 {
+        reasons.push(format!("token_overlap:{overlap}"));
+    }
+    if exact_preview > 0 {
+        reasons.push("exact_preview".to_owned());
+    }
+    if preview_contains > 0 {
+        reasons.push("preview_contains_query".to_owned());
+    }
+    if negative_memory > 0 {
+        reasons.push("negative_memory_overlap".to_owned());
+    }
+    if lifecycle_fit < 0 {
+        reasons.push("stale_or_suppressed".to_owned());
+    }
+    Some(RankedRecallCandidate {
+        score: L0FeatureScore {
+            handle: row.handle.clone(),
+            exact_identifier,
+            subject_identity,
+            lexical_overlap,
+            task_relation: 0,
+            scope_fit: 0,
+            lifecycle_fit,
+            evidence_authority,
+            prior_decision_delta: negative_memory,
+            total,
+            reasons,
+        },
+        row,
+    })
 }
 
 #[derive(Clone, Debug)]
@@ -910,14 +1151,12 @@ impl CanonicalStore {
     ) -> Result<RecallL0Response, StoreError> {
         let value = self
             .execute_value(
-                NamedSurqlOp::RecallL0,
-                json!({
-                    "request": request,
-                    "query_fragments": string_fragments(&request.query),
-                }),
+                NamedSurqlOp::LoadRecallCandidates,
+                json!({ "project_id": request.project_id }),
             )
             .await?;
-        decode_value(NamedSurqlOp::RecallL0, value)
+        let load: RecallCandidateLoad = decode_value(NamedSurqlOp::LoadRecallCandidates, value)?;
+        Ok(rank_recall_candidates(request, load))
     }
 
     pub async fn fetch_atoms_l2(

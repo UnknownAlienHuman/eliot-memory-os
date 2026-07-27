@@ -22,8 +22,11 @@ fn profile_instructions(profile: McpAccessProfile) -> String {
         McpAccessProfile::HumanOperator | McpAccessProfile::HumanReadonly => {
             "Use the bounded operator projections and typed commands only. The Governor remains the sole business-rule and memory authority; do not request raw records, database access, credentials, shell, or hidden reasoning."
         }
-        McpAccessProfile::ClaudeGoverned => {
-            "For a material project task, resolve one stable project identity, read task/current state, and expand only the exact memory or packet handles needed for the decision. Record cross-memory influence explicitly and submit only novel candidate evidence with a retry-stable write ID. Use delegation and disposition tools only when the current task-scoped role lease authorizes them; this compact profile intentionally omits direct patch, provider, database, and completion authority."
+        McpAccessProfile::DynamicAgent
+        | McpAccessProfile::ClaudeGoverned
+        | McpAccessProfile::CodexWorker
+        | McpAccessProfile::ExternalAuditor => {
+            "Context arrives by itself as ul_boot, ul_fired, or a bounded hook injection. Never re-fetch injected material; expand only handles needed for the next action. Before material work compile a packet and edit its frame_stub. On failure inspect matching negative memory, then record a normalized observation if none applies. Verify with the packet verifier. Save only novel lessons and acknowledge only memory actually used."
         }
         _ => {
             "For every nontrivial project task, use Eliot before searching local memory files. First call eliot_host_session_status. If it reports governor_bound_scope_active, call eliot_project_identity with no key and let the Governor default all supported project/task fields; never derive or restate those identifiers from a case label, current directory, playground, or host UI. Otherwise call eliot_project_identity with one stable repository key. Then use eliot_task_state, eliot_recall_l0, and eliot_fetch_l2 as needed. Explicit scope must match the Governor binding or it is rejected as PROJECT_SCOPE_MISMATCH or TASK_SCOPE_MISMATCH. Recover daemon runtime_id and auth_generation only from eliot_runtime_status, and bounded autonomy only from eliot_autonomy_run_status; never substitute an AgentSession, role status, or verification run for those canonical identities. Call MCP tools from their live definitions; never read generated MCP JSON schema or report/output files. A recall-only or status-only task needs no handoff write, and an existing recalled claim must never be copied into a new candidate. Submit only a novel reusable finding created by the current material work. Use one eliot_agent_candidate_submit call with one retry-stable UUID write_id, topic, statement, all three array fields where_applicable/where_not_applicable/negative_constraints (empty arrays are valid), non-empty provenance_refs, and freshness_rule; a bound session may omit project_id/task_id. For memory recall, do not call CodeCortex or Antigravity connector reports/smokes unless the task explicitly requires them."
@@ -42,20 +45,17 @@ fn profile_instructions(profile: McpAccessProfile) -> String {
         McpAccessProfile::CognitiveControl => {
             "This sealed memory-free control profile exposes an empty MCP tool catalog."
         }
-        McpAccessProfile::DynamicAgent | McpAccessProfile::ClaudeGoverned => {
-            "Your host identity grants no controller, worker, auditor, verifier, patch, or completion role. Any such role is task-scoped and must be evidenced by eliot_host_session_status plus a current Eliot role/work lease. When that status reports governor_bound_scope_active, call project identity and task/current-memory tools without inventing or restating project/task identifiers; the Governor supplies the bound scope and rejects PROJECT_SCOPE_MISMATCH or TASK_SCOPE_MISMATCH. Never derive scope from a case label, current directory, playground, or host UI. Never infer your role from host-specific Antigravity visibility, provider status, old invocation receipts, or memory history. Use the governed tools directly for proactive recall, candidate writeback, and task work; do not wait for repeated user prompting."
-        }
-        McpAccessProfile::ExternalAuditor => {
-            "You are an external_auditor: recalled state and your writes are candidate evidence only; never claim truth promotion, patch, lease, provider, or completion authority."
+        McpAccessProfile::DynamicAgent
+        | McpAccessProfile::ClaudeGoverned
+        | McpAccessProfile::CodexWorker
+        | McpAccessProfile::ExternalAuditor => {
+            "Host identity grants no controller, patch, provider, truth-promotion, or completion authority. Recalled state and model writes remain evidence subject to current task policy."
         }
         McpAccessProfile::HumanReadonly | McpAccessProfile::Verifier => {
             "This profile is read-only; never claim write, patch, lease, provider, or completion authority."
         }
         McpAccessProfile::HumanOperator => {
             "This is a human operator session. Only typed operator commands are allowed; every mutation remains subject to Governor policy and must return a canonical receipt."
-        }
-        McpAccessProfile::CodexWorker => {
-            "This worker profile cannot apply patches, delegate reviews, or claim completion."
         }
         McpAccessProfile::CodexController => {
             "Controller authority remains governed by task contracts, action leases, and verifier evidence."

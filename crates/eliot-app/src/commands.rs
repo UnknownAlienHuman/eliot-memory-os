@@ -44,10 +44,10 @@ use eliot_engine::{
     SkillCurationReport, SkillCurationReportService, SkillCuratorMemoryWriter,
     SkillCuratorRunInput, SkillCuratorService, SkillDistractorFilterService,
     SkillExecutionProofService, SkillInfluenceReportInput, SkillInfluenceService,
-    SkillLifecycleService, SkillNeedEstimator, SkillPatchService, SkillRegistryService,
-    SleepConsolidationService, SleepRunInput, SloService, StartupRecoveryService,
-    StatefulDbTestIsolationService, StdioShimService, SurrealLogicalConfig, TestCostService,
-    TestInventoryService, TraceCompletenessInput, TraceCompletenessService,
+    SkillLifecycleService, SkillNeedEstimator, SkillPackService, SkillPatchService,
+    SkillRegistryService, SleepConsolidationService, SleepRunInput, SloService,
+    StartupRecoveryService, StatefulDbTestIsolationService, StdioShimService, SurrealLogicalConfig,
+    TestCostService, TestInventoryService, TraceCompletenessInput, TraceCompletenessService,
     VerificationDoctorIntegration, VerificationPlannerService, VerificationProfileService,
     VerificationRunnerService, VerificationVerdictService, VerifierHarness, WindowsServiceManager,
     WorkClaimRequest, WorkCreateRequest, WorkLeaseService, WorkMemoryWriter, WorkQueueService,
@@ -107,6 +107,8 @@ use eliot_types::{
     WorkLeaseDecision, WorkLeaseDecisionKind, WorkLeaseDecisionReason, WorkLeaseId, WorkLeaseState,
     WorktreeLease, WorktreeLeaseId, WorktreeLeaseRequest, WorktreeLeaseRequestId, WriteId,
 };
+use serde_json::Value;
+use std::collections::BTreeSet;
 use std::fmt::Write as FmtWrite;
 use std::io::{Read as IoRead, Write as IoWrite};
 use std::path::{Path, PathBuf};

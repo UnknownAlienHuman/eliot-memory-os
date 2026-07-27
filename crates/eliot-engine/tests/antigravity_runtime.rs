@@ -335,23 +335,15 @@ fn mcp_config_denies_antigravity_recursion_and_non_status_tools() {
 }
 
 #[test]
-fn official_plugin_install_receipt_requires_agy_plugin_install_success() -> TestResult {
+fn official_plugin_install_receipt_uses_default_agent_package_contract() -> TestResult {
     let root = TempRoot::new("official-plugin-receipt")?;
     let home = root.path.join("home");
     let (gui_root, _) = AntigravityOfficialPluginService.plugin_roots(&home);
-    fs::create_dir_all(gui_root.join("agents").join("eliot-auditor"))?;
     fs::create_dir_all(gui_root.join("skills").join("eliot-governor"))?;
     fs::create_dir_all(gui_root.join("rules"))?;
     fs::write(
         gui_root.join("plugin.json"),
         serde_json::to_vec_pretty(&AntigravityOfficialPluginService.manifest_value())?,
-    )?;
-    fs::write(
-        gui_root
-            .join("agents")
-            .join("eliot-auditor")
-            .join("agent.md"),
-        b"auditor",
     )?;
     fs::write(
         gui_root
@@ -387,7 +379,7 @@ fn official_plugin_install_receipt_requires_agy_plugin_install_success() -> Test
     assert!(installed.installed);
     assert!(installed.install_command_succeeded);
     assert!(installed.listed_by_agy);
-    assert!(installed.agent_visible);
+    assert!(!installed.agent_visible);
     assert!(installed.skill_visible);
     Ok(())
 }

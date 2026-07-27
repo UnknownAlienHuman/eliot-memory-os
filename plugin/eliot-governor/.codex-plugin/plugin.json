@@ -1,0 +1,34 @@
+{
+  "name": "eliot-governor",
+  "version": "0.1.0",
+  "description": "Connects Codex to the ELIOT Memory OS task and memory surface.",
+  "author": {
+    "name": "ELIOT"
+  },
+  "homepage": "https://github.com/UnknownAlienHuman/eliot-memory-os",
+  "repository": "https://github.com/UnknownAlienHuman/eliot-memory-os",
+  "license": "MIT",
+  "keywords": [
+    "eliot",
+    "memory",
+    "rust"
+  ],
+  "skills": "./skills/",
+  "mcpServers": "./.mcp.json",
+  "interface": {
+    "displayName": "ELIOT Governor",
+    "shortDescription": "Bounded project memory for Codex",
+    "longDescription": "Connects Codex to ELIOT project memory, task context, observations, and verification receipts.",
+    "developerName": "ELIOT",
+    "category": "Developer Tools",
+    "capabilities": [
+      "Read",
+      "Write"
+    ],
+    "defaultPrompt": [
+      "Resume this project with the smallest relevant ELIOT context.",
+      "Record and recover from this failing test with ELIOT.",
+      "Verify this material change and finish honestly."
+    ]
+  }
+}

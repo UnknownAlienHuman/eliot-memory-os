@@ -601,6 +601,50 @@ pub(super) fn reconciled_unknown_outcome_base(
     })
 }
 
+fn reconcile_contained_antigravity_invocation(
+    root: &Path,
+    request_hash: &str,
+) -> Result<Option<ExistingManagedInvocation>> {
+    let attempt_path = root.join("attempt.json");
+    let result_path = root.join("result.json");
+    let Some(attempt) = read_contained_antigravity_attempt(&attempt_path)? else {
+        return Ok(None);
+    };
+    if attempt.request_hash != request_hash {
+        bail!("Antigravity idempotency key was already used for a different request");
+    }
+    if result_path.is_file() {
+        let result: Value = serde_json::from_reader(std::fs::File::open(&result_path)?)?;
+        let expected_boundary = serde_json::to_value(&attempt.launch_boundary)?;
+        let result_authority_hash = result
+            .pointer("/bounded_auditor_authority/authority_hash")
+            .and_then(Value::as_str);
+        if result.get("schema_version").and_then(Value::as_str)
+            != Some("eliot-host-launch-result-v1")
+            || result.get("request_hash").and_then(Value::as_str)
+                != Some(attempt.request_hash.as_str())
+            || result.get("contract_hash").and_then(Value::as_str)
+                != Some(attempt.contract_hash.as_str())
+            || result.get("host").and_then(Value::as_str) != Some(AgentHostId::Antigravity.as_str())
+            || result.get("success").and_then(Value::as_bool).is_none()
+            || result.get("launch_boundary") != Some(&expected_boundary)
+            || result_authority_hash != attempt.bounded_auditor_authority_hash.as_deref()
+        {
+            bail!("contained Antigravity result does not match its attempt journal");
+        }
+        return Ok(Some(ExistingManagedInvocation::Reuse(result)));
+    }
+    let lock = invocation_lock_record(root)?;
+    if lock_owner_is_active(&lock)? {
+        return Ok(Some(ExistingManagedInvocation::InProgress));
+    }
+    if provider_start_marker_path(root).exists() {
+        return Ok(Some(ExistingManagedInvocation::UnknownOutcome));
+    }
+    clear_pre_provider_journals(root)?;
+    Ok(Some(ExistingManagedInvocation::New))
+}
+
 pub(super) async fn reconcile_existing_managed_invocation(
     config_path: &Path,
     root: &Path,
@@ -608,6 +652,9 @@ pub(super) async fn reconcile_existing_managed_invocation(
 ) -> Result<ExistingManagedInvocation> {
     let attempt_path = root.join("attempt.json");
     let result_path = root.join("result.json");
+    if let Some(outcome) = reconcile_contained_antigravity_invocation(root, request_hash)? {
+        return Ok(outcome);
+    }
     let attempt_state = read_managed_attempt(&attempt_path)?;
     if result_path.is_file() {
         if !matches!(&attempt_state, ManagedAttemptJournalState::Valid(_)) {
@@ -725,11 +772,14 @@ pub(super) async fn invocation_status(config_path: &Path, idempotency_key: &str)
     let invocation_id = stable_invocation_id(idempotency_key);
     let root = invocation_root(config_path, &invocation_id);
     let attempt_path = root.join("attempt.json");
+    let contained_attempt = read_contained_antigravity_attempt(&attempt_path)?;
     let attempt_state = read_managed_attempt(&attempt_path)?;
-    let attempt_was_valid = matches!(&attempt_state, ManagedAttemptJournalState::Valid(_));
-    let request_hash = match &attempt_state {
-        ManagedAttemptJournalState::Valid(attempt) => attempt.request_hash.as_str(),
-        ManagedAttemptJournalState::Missing | ManagedAttemptJournalState::Malformed => "",
+    let attempt_was_valid = contained_attempt.is_some()
+        || matches!(&attempt_state, ManagedAttemptJournalState::Valid(_));
+    let request_hash = match (&contained_attempt, &attempt_state) {
+        (Some(attempt), _) => attempt.request_hash.as_str(),
+        (None, ManagedAttemptJournalState::Valid(attempt)) => attempt.request_hash.as_str(),
+        (None, ManagedAttemptJournalState::Missing | ManagedAttemptJournalState::Malformed) => "",
     };
     match reconcile_existing_managed_invocation(config_path, &root, request_hash).await? {
         ExistingManagedInvocation::Reuse(receipt) => Ok(receipt),

@@ -113,6 +113,13 @@ fn t06_packet_delivers_relevant_capsule() -> TestResult {
         .ok_or("frame_stub.causal_bridge missing")?;
 
     assert_eq!(response["ul_understanding"]["coverage"], "covered");
+    assert!(
+        matches!(
+            response["memory_confidence"].as_str(),
+            Some("found" | "weak" | "none")
+        ),
+        "compile_packet_l3 must expose server-computed memory_confidence"
+    );
     assert!(serialized.contains("CAPSULE_ALPHA_MARKER"));
     assert!(!serialized.contains("CAPSULE_BETA_MARKER"));
     assert!(bridge.iter().any(|hop| {

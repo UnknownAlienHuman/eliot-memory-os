@@ -1,10 +1,11 @@
 use eliot_store::CanonicalStore;
 use eliot_types::{
     AgentId, ClaimCardInput, ClaimId, EpistemicStatus, EvidenceAtomInput, EvidenceId,
-    FetchAtomsL2Request, GovernorConfig, IdempotencyOptions, LifecycleStatus,
-    LifecycleWriteOptions, MemoryWriteEnvelope, OperationId, ProjectId, ProjectSequence,
-    ReadConsistencyMode, RecallL0Request, RelationInput, RelationType, SemanticCommandKind,
-    SurrealServerConfig, TaintClass, TaskId, Visibility, WriteId, WriteStatus,
+    FailureFingerprintInput, FetchAtomsL2Request, GovernorConfig, IdempotencyOptions,
+    LifecycleStatus, LifecycleWriteOptions, MemoryConfidence, MemoryWriteEnvelope, OperationId,
+    ProjectId, ProjectSequence, ReadConsistencyMode, RecallL0Request, RelationInput, RelationType,
+    SemanticCommandKind, SurrealServerConfig, TaintClass, TaskId, ToolObservationInput, Visibility,
+    WriteId, WriteStatus,
 };
 use serde_json::json;
 use std::error::Error;
@@ -288,26 +289,25 @@ async fn query_aware_l0_and_exact_l2_are_bounded_scoped_and_restart_deterministi
     let ranked = store
         .recall_l0(&recall_request(project_id, "omega needle"))
         .await?;
-    assert_eq!(ranked.rank_trace.candidates_considered, 61);
-    assert_eq!(ranked.rank_trace.candidates_returned, 50);
+    assert_eq!(ranked.rank_trace.candidates_considered, 65);
+    assert_eq!(ranked.rank_trace.candidates_returned, 12);
     assert!(ranked.truncation.truncated);
-    assert_eq!(ranked.handles[0].handle, exact_id.to_string());
+    assert_eq!(ranked.handles[0].handle, format!("claim:{exact_id}"));
     assert_eq!(
         ranked.rank_trace.query_mode,
-        "query_aware_semantic_lexical_relational_v2"
+        "unicode_multi_kind_deterministic_v3"
     );
-    assert_eq!(ranked.rank_trace.feature_scores[0].lexical_overlap, 250);
+    assert_eq!(ranked.rank_trace.feature_scores[0].lexical_overlap, 470);
 
     let alpha_ranked = store
         .recall_l0(&recall_request(project_id, "alpha disjoint memory"))
         .await?;
-    assert_eq!(alpha_ranked.handles.len(), 1);
-    assert_eq!(alpha_ranked.handles[0].handle, alpha_id.to_string());
+    assert_eq!(alpha_ranked.handles[0].handle, format!("claim:{alpha_id}"));
     assert!(
         alpha_ranked
             .handles
             .iter()
-            .all(|handle| handle.handle != beta_id.to_string())
+            .any(|handle| handle.handle == format!("claim:{beta_id}"))
     );
 
     let exact_ranked = store
@@ -317,30 +317,24 @@ async fn query_aware_l0_and_exact_l2_are_bounded_scoped_and_restart_deterministi
         !exact_ranked.handles.is_empty(),
         "exact-id recall returned no handles: {exact_ranked:?}"
     );
-    assert_eq!(exact_ranked.handles[0].handle, exact_id.to_string());
+    assert_eq!(exact_ranked.handles[0].handle, format!("claim:{exact_id}"));
     assert_eq!(
         exact_ranked.rank_trace.feature_scores[0].exact_identifier,
         1000
     );
 
     let empty = store
-        .recall_l0(&recall_request(project_id, "memory-that-does-not-exist"))
+        .recall_l0(&recall_request(project_id, "quasar telemetry absent"))
         .await?;
     assert!(empty.handles.is_empty());
     assert!(empty.rank_trace.no_useful_memory);
 
-    let causal_ranked = store
+    let lexical_ranked = store
         .recall_l0(&recall_request(project_id, "causal-probe-42"))
         .await?;
-    assert_eq!(causal_ranked.handles.len(), 2);
-    assert_eq!(causal_ranked.handles[0].handle, causal_id.to_string());
-    assert_eq!(
-        causal_ranked.rank_trace.feature_scores[0].task_relation,
-        120
-    );
-    assert!(
-        causal_ranked.rank_trace.feature_scores[0].total
-            > causal_ranked.rank_trace.feature_scores[1].total
+    assert_ne!(
+        lexical_ranked.handles[0].handle,
+        format!("claim:{causal_id}")
     );
 
     let ordered = store
@@ -492,6 +486,193 @@ async fn query_aware_l0_and_exact_l2_are_bounded_scoped_and_restart_deterministi
 
 #[tokio::test]
 #[allow(clippy::too_many_lines)]
+async fn unicode_multi_kind_recall_and_ul_expansion_are_truthful_and_scoped()
+-> Result<(), Box<dyn Error>> {
+    let Some(config) = isolated_config() else {
+        return Ok(());
+    };
+    let store = CanonicalStore::new(config);
+    store.migrate_schema().await?;
+
+    let project_id = ProjectId::new_v7();
+    let russian = claim(
+        "Русская память находит границу подсистемы".to_owned(),
+        "граница подсистемы",
+    );
+    let russian_id = russian.claim_id;
+    let failure_id = format!("ul11r2-failure-{}", ClaimId::new_v7());
+    let card_id = format!("ul11r2-card-{}", ClaimId::new_v7());
+    let capsule_id = format!("ul11r2-capsule-{}", ClaimId::new_v7());
+    let mut envelope = retrieval_envelope(
+        project_id,
+        TaskId::new_v7(),
+        vec![russian],
+        Vec::new(),
+        Vec::new(),
+    )?;
+    envelope.failures = vec![FailureFingerprintInput {
+        fingerprint: failure_id.clone(),
+        summary: "редкий отказ синхронизации библиотекаря".to_owned(),
+        payload: json!({"cause": "граница кодировки"}),
+    }];
+    envelope.tool_observations = vec![
+        ToolObservationInput {
+            observation_id: card_id.clone(),
+            tool_name: "ul_artifact_writer_actor".to_owned(),
+            observation: "recorded module_card artifact".to_owned(),
+            payload: json!({
+                "receipt_kind": "module_card",
+                "receipt_body": {
+                    "card_id": card_id,
+                    "project_id": project_id,
+                    "path": "src/библиотекарь.rs",
+                    "body_md": "Карточка модуля описывает Юникод поиск библиотекаря.",
+                    "source_refs": ["file:src/библиотекарь.rs"]
+                }
+            }),
+        },
+        ToolObservationInput {
+            observation_id: capsule_id.clone(),
+            tool_name: "ul_artifact_writer_actor".to_owned(),
+            observation: "recorded subsystem_capsule artifact".to_owned(),
+            payload: json!({
+                "receipt_kind": "subsystem_capsule",
+                "receipt_body": {
+                    "capsule_id": capsule_id,
+                    "project_id": project_id,
+                    "concept_id": "concept:unicode-librarian",
+                    "body_md": "Капсула подсистемы хранит причинную границу Юникод поиска.",
+                    "source_refs": ["file:src/библиотекарь.rs"]
+                }
+            }),
+        },
+    ];
+    envelope.input_hash =
+        blake3::hash(format!("{project_id}:{failure_id}:{card_id}:{capsule_id}").as_bytes())
+            .to_hex()
+            .to_string();
+    let receipt = store.apply_write_envelope(&envelope).await?;
+    assert_eq!(receipt.status, WriteStatus::Committed);
+
+    let russian_recall = store
+        .recall_l0(&recall_request(project_id, "русская граница подсистемы"))
+        .await?;
+    assert_eq!(
+        russian_recall.handles[0].handle,
+        format!("claim:{russian_id}")
+    );
+    assert_eq!(russian_recall.memory_confidence, MemoryConfidence::Found);
+
+    let failure_recall = store
+        .recall_l0(&recall_request(project_id, "отказ синхронизации"))
+        .await?;
+    assert_eq!(
+        failure_recall.handles[0].handle,
+        format!("failure:{failure_id}")
+    );
+    let card_recall = store
+        .recall_l0(&recall_request(project_id, "карточка модуля Юникод"))
+        .await?;
+    assert_eq!(card_recall.handles[0].handle, format!("card:{card_id}"));
+    let capsule_recall = store
+        .recall_l0(&recall_request(project_id, "капсула Юникод поиска"))
+        .await?;
+    assert_eq!(
+        capsule_recall.handles[0].handle,
+        format!("capsule:{capsule_id}")
+    );
+
+    let exact = store
+        .recall_l0(&recall_request(project_id, format!("capsule:{capsule_id}")))
+        .await?;
+    assert_eq!(exact.handles[0].handle, format!("capsule:{capsule_id}"));
+    assert_eq!(exact.rank_trace.feature_scores[0].exact_identifier, 1_000);
+
+    let expanded = store
+        .fetch_atoms_l2(&l2_request(
+            project_id,
+            vec![format!("card:{card_id}"), format!("capsule:{capsule_id}")],
+        ))
+        .await?;
+    assert_eq!(expanded.ul_artifacts.len(), 2);
+    assert_eq!(
+        expanded.returned_handles,
+        vec![format!("card:{card_id}"), format!("capsule:{capsule_id}")]
+    );
+    assert_eq!(expanded.ul_artifacts[0].record_type, "module_card");
+    assert_eq!(expanded.ul_artifacts[1].record_type, "subsystem_capsule");
+    assert!(expanded.tool_observations.is_empty());
+
+    let unknown_card = format!("card:missing-{}", ClaimId::new_v7());
+    let missing = store
+        .fetch_atoms_l2(&l2_request(project_id, vec![unknown_card.clone()]))
+        .await?;
+    assert_eq!(missing.missing_handles, vec![unknown_card]);
+
+    let other_project_id = ProjectId::new_v7();
+    let foreign_claim = claim(
+        "Русская память находит границу подсистемы".to_owned(),
+        "граница подсистемы",
+    );
+    let foreign_claim_id = foreign_claim.claim_id;
+    let foreign_card_id = format!("ul11r2-foreign-card-{}", ClaimId::new_v7());
+    let mut foreign_envelope = retrieval_envelope(
+        other_project_id,
+        TaskId::new_v7(),
+        vec![foreign_claim],
+        Vec::new(),
+        Vec::new(),
+    )?;
+    foreign_envelope.tool_observations = vec![ToolObservationInput {
+        observation_id: foreign_card_id.clone(),
+        tool_name: "ul_artifact_writer_actor".to_owned(),
+        observation: "recorded module_card artifact".to_owned(),
+        payload: json!({
+            "receipt_kind": "module_card",
+            "receipt_body": {
+                "card_id": foreign_card_id,
+                "project_id": other_project_id,
+                "path": "src/библиотекарь.rs",
+                "body_md": "Карточка модуля описывает Юникод поиск библиотекаря.",
+                "source_refs": ["file:src/библиотекарь.rs"]
+            }
+        }),
+    }];
+    foreign_envelope.input_hash =
+        blake3::hash(format!("{other_project_id}:{foreign_card_id}").as_bytes())
+            .to_hex()
+            .to_string();
+    store.apply_write_envelope(&foreign_envelope).await?;
+
+    let scoped = store
+        .recall_l0(&recall_request(project_id, "русская граница подсистемы"))
+        .await?;
+    assert!(scoped.handles.iter().all(|handle| handle.handle
+        != format!("claim:{foreign_claim_id}")
+        && handle.handle != format!("card:{foreign_card_id}")));
+    assert_eq!(scoped.rank_trace.candidates_considered, 4);
+
+    let absent = store
+        .recall_l0(&recall_request(
+            project_id,
+            "квантовая телеметрия отсутствует",
+        ))
+        .await?;
+    assert!(absent.handles.is_empty());
+    assert!(absent.rank_trace.no_useful_memory);
+    assert_eq!(absent.memory_confidence, MemoryConfidence::None);
+    assert_eq!(absent.rank_trace.candidates_returned, 0);
+
+    let store_source = include_str!("../src/canonical_store.rs");
+    let query_source = include_str!("../src/surql/load_recall_candidates.surql");
+    assert!(store_source.contains("eliot_types::normalize_query_tokens"));
+    assert!(!query_source.contains("string::words"));
+    assert!(!query_source.contains("string::slug"));
+    Ok(())
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
 async fn neutral_l15_paraphrases_recall_the_right_admitted_memory_without_handles()
 -> Result<(), Box<dyn Error>> {
     let Some(config) = isolated_config() else {
@@ -601,7 +782,7 @@ async fn neutral_l15_paraphrases_recall_the_right_admitted_memory_without_handle
     ];
     for (query, expected_id) in cases {
         let recalled = store.recall_l0(&recall_request(project_id, query)).await?;
-        let expected_handle = expected_id.to_string();
+        let expected_handle = format!("claim:{expected_id}");
         assert!(
             !recalled.rank_trace.no_useful_memory,
             "neutral query admitted no memory: {query}"
@@ -617,7 +798,7 @@ async fn neutral_l15_paraphrases_recall_the_right_admitted_memory_without_handle
         );
         assert_eq!(
             recalled.rank_trace.query_mode,
-            "query_aware_semantic_lexical_relational_v2"
+            "unicode_multi_kind_deterministic_v3"
         );
     }
 

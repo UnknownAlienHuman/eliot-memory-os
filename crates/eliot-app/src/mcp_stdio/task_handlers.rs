@@ -392,6 +392,7 @@ fn enforce_memory_free_control(
     packet.memory_decisions.clear();
     packet.experience_priors.clear();
     packet.memory_need_decision = None;
+    packet.memory_confidence = eliot_types::MemoryConfidence::None;
     packet.memory_applicability.decisions.clear();
     packet.memory_applicability.inclusion_reasons.clear();
     packet.memory_applicability.suppression_reasons =
@@ -619,15 +620,22 @@ async fn dispatch_memory_influence_trace(
                         .last_task_id(project_id, context.session_id)
                 })
                 .context(
-                    "MISSING_PROJECT_PACKET_CONTEXT: minimal influence acknowledgement requires a prior packet for this project or an explicit bound task",
+                    "MISSING_PROJECT_PACKET_CONTEXT: minimal influence acknowledgement requires an explicit bound task and a same-session L3 packet or exact fetch context",
                 )?;
             let (packet_id, packet_handles) = state
                 .ul
                 .touched
                 .packet_context(project_id, context.session_id);
             let packet_id = packet_id.context(
-                "MISSING_PROJECT_PACKET_CONTEXT: minimal influence acknowledgement requires a prior packet for this project or an explicit bound task",
+                "MISSING_PROJECT_PACKET_CONTEXT: minimal influence acknowledgement requires an explicit bound task and a same-session L3 packet or exact fetch context",
             )?;
+            if packet_id.starts_with("retrieval:")
+                && !packet_handles.contains(&ack.memory_handle)
+            {
+                anyhow::bail!(
+                    "EXACT_FETCH_CONTEXT_MISMATCH: minimal influence acknowledgement must name a handle returned by the same-session exact fetch"
+                );
+            }
             let epistemic_status =
                 influence_epistemic_status(state, project_id, &ack.memory_handle).await?;
             let admission_decision = match epistemic_status.as_str() {
@@ -1417,6 +1425,75 @@ fn deterministic_canonical_write_id(
     bytes[6] = (bytes[6] & 0x0f) | 0x50;
     bytes[8] = (bytes[8] & 0x3f) | 0x80;
     WriteId::from_uuid(uuid::Uuid::from_bytes(bytes))
+}
+
+async fn dispatch_write_cognitive_observation(
+    state: &McpState,
+    context: AuthenticatedRequestContext,
+    arguments: Value,
+) -> Result<Value> {
+    let input: CognitiveObservationToolInput = serde_json::from_value(arguments)?;
+    if input.payload.is_null() {
+        anyhow::bail!("payload must contain a normalized error, diagnostic, or tool observation");
+    }
+    let project_id = parse_project_id(&input.project_id)?;
+    let task_id = TaskId::from_str(&input.task_id).context("parse task id")?;
+    let payload_hash = blake3::hash(&serde_json::to_vec(&input.payload)?)
+        .to_hex()
+        .to_string();
+    let write_id = input.write_id.as_deref().map_or_else(
+        || {
+            Ok(deterministic_canonical_write_id(
+                project_id,
+                Some(task_id),
+                CanonicalReceiptKind::CognitiveToolObservation,
+                &format!("part-e-observation:{payload_hash}"),
+            ))
+        },
+        |value| WriteId::from_str(value).context("parse write id"),
+    )?;
+    let tool_name = input
+        .payload
+        .get("tool_name")
+        .and_then(Value::as_str)
+        .unwrap_or("eliot-worker")
+        .to_owned();
+    let observation = input
+        .payload
+        .get("error")
+        .or_else(|| input.payload.get("diagnostic"))
+        .or_else(|| input.payload.get("message"))
+        .and_then(Value::as_str)
+        .map_or_else(
+            || format!("cognitive observation {}", &payload_hash[..16]),
+            str::to_owned,
+        );
+    let command = SemanticCommand::ToolObservationRecord(ToolObservationRecordCommand {
+        context: CommandContext {
+            write_id,
+            agent_id: AgentId::from_uuid(context.session_id.as_uuid()),
+            session_id: Some(context.session_id),
+            project_id,
+            task_id: Some(task_id),
+            scope: format!("eliot/task/{task_id}/cognitive-observation"),
+            authority: "model-owned Part-E cognitive observation".to_owned(),
+            visibility: Visibility::Internal,
+            taint: TaintClass::LocalVerified,
+            lifecycle_status: LifecycleStatus::Active,
+        },
+        tool_name,
+        observation,
+        payload: input.payload,
+    });
+    let envelope = WriteAdmissionService.admit(&command)?;
+    let receipt = state.writer.submit(envelope).await?;
+    Ok(json!({
+        "receipt": {
+            "receipt_id": receipt.receipt_id,
+            "write_id": receipt.write_id,
+            "status": receipt.status,
+        }
+    }))
 }
 
 async fn write_canonical_observation<T: serde::Serialize>(

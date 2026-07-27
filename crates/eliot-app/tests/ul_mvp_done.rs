@@ -221,6 +221,87 @@ fn h2_minimal_ack_uses_only_same_project_packet_context() -> TestResult {
 }
 
 #[test]
+fn h2_exact_fetch_context_supports_minimal_influence_ack() -> TestResult {
+    let _guard = test_guard();
+    if rerun_with_credential_gate("h2_exact_fetch_context_supports_minimal_influence_ack")? {
+        return Ok(());
+    }
+    let mut harness = Harness::start("h2-exact-fetch-context")?;
+    let project_id = ProjectId::new_v7();
+    let task_id = TaskId::new_v7();
+    let candidate_write = WriteId::new_v7();
+    let handle = format!("claim:{candidate_write}");
+    harness.create_task(21, project_id, task_id)?;
+    harness.client.tool_call(
+        22,
+        "eliot_agent_candidate_submit",
+        &candidate_arguments(
+            project_id,
+            task_id,
+            candidate_write,
+            "An exact L2 fetch can be acknowledged without compiling an unrelated L3 packet.",
+        ),
+    )?;
+    let revision = harness.current_revision(project_id)?;
+    let fetched = harness.client.tool_call(
+        23,
+        "eliot_fetch_l2",
+        &json!({
+            "project_id": project_id,
+            "handles": [handle],
+            "consistency": "latest"
+        }),
+    )?;
+    assert!(
+        fetched["returned_handles"]
+            .as_array()
+            .is_some_and(|handles| handles.iter().any(|candidate| candidate == &json!(handle)))
+    );
+
+    let mismatched = harness.client.tool_call_response(
+        24,
+        "eliot_memory_influence_trace",
+        &json!({
+            "project_id": project_id,
+            "write_id": WriteId::new_v7(),
+            "memory_handle": "claim:019f0000-0000-7000-8000-000000000099",
+            "influence_class": "seen_but_not_used"
+        }),
+    )?;
+    assert!(
+        mismatched
+            .to_string()
+            .contains("EXACT_FETCH_CONTEXT_MISMATCH")
+    );
+
+    let response = harness.client.tool_call(
+        25,
+        "eliot_memory_influence_trace",
+        &json!({
+            "project_id": project_id,
+            "write_id": WriteId::new_v7(),
+            "memory_handle": handle,
+            "influence_class": "seen_but_not_used"
+        }),
+    )?;
+    let after = harness.current_revision(project_id)?;
+    let traces: Vec<MemoryInfluenceTrace> = harness.observability_records(
+        project_id,
+        Some(task_id),
+        ObservabilityKind::MemoryInfluenceTrace,
+    )?;
+
+    assert_eq!(response["observability_receipt"]["status"], "committed");
+    assert_eq!(revision, after);
+    assert_eq!(traces.len(), 1);
+    assert_eq!(traces[0].task_id, task_id);
+    assert_eq!(traces[0].memory_handle, handle);
+    assert!(traces[0].packet_id.starts_with("retrieval:"));
+    assert!(traces[0].cited_in_understanding_proof);
+    Ok(())
+}
+
+#[test]
 fn d03_published_compile_schema_matches_serde() -> TestResult {
     let _guard = test_guard();
     if rerun_with_credential_gate("d03_published_compile_schema_matches_serde")? {

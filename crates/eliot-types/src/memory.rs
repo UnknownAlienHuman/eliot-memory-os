@@ -657,10 +657,32 @@ pub struct RecallL0Response {
     pub project_id: ProjectId,
     pub at_revision: MemoryRevision,
     pub handles: Vec<MemoryHandlePreview>,
+    #[serde(default)]
+    pub memory_confidence: MemoryConfidence,
     pub query_mode: String,
     #[serde(default)]
     pub rank_trace: L0RankTrace,
     pub truncation: TruncationInfo,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MemoryConfidence {
+    Found,
+    Weak,
+    #[default]
+    None,
+}
+
+impl MemoryConfidence {
+    #[must_use]
+    pub const fn from_top_score(top_score: Option<i32>) -> Self {
+        match top_score {
+            Some(score) if score >= 200 => Self::Found,
+            Some(score) if score >= 80 => Self::Weak,
+            _ => Self::None,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -716,6 +738,8 @@ pub struct FetchAtomsL2Response {
     pub verification_runs: Vec<VerificationRun>,
     pub tool_observations: Vec<ToolObservation>,
     pub failure_fingerprints: Vec<FailureFingerprint>,
+    #[serde(default)]
+    pub ul_artifacts: Vec<UlMemoryArtifact>,
     pub relations: Vec<RelationSummary>,
     #[serde(default)]
     pub requested_handles: Vec<String>,
@@ -728,6 +752,15 @@ pub struct FetchAtomsL2Response {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub continuation: Option<String>,
     pub truncation: TruncationInfo,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct UlMemoryArtifact {
+    pub handle: String,
+    pub record_type: String,
+    pub body_md: String,
+    pub source_refs: Vec<String>,
+    pub freshness: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -955,6 +988,8 @@ pub struct ContextPacketL3 {
     pub project_id: ProjectId,
     pub task_id: String,
     pub goal: String,
+    #[serde(default)]
+    pub memory_confidence: MemoryConfidence,
     #[serde(default)]
     pub acceptance_items: Vec<String>,
     pub at_revision: MemoryRevision,

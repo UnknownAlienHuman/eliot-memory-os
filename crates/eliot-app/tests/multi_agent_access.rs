@@ -209,6 +209,8 @@ fn canonical_profiles_publish_bounded_tool_sets() -> TestResult {
     for profile in [
         "codex_controller",
         "codex_worker",
+        "claude_governed",
+        "dynamic_agent",
         "external_auditor",
         "verifier",
         "human_readonly",
@@ -227,26 +229,35 @@ fn canonical_profiles_publish_bounded_tool_sets() -> TestResult {
                 .and_then(Value::as_str),
             Some(profile)
         );
-        let names = responses[1]
+        let mut names = responses[1]
             .pointer("/result/tools")
             .and_then(Value::as_array)
             .ok_or("profile tools missing")?
             .iter()
             .filter_map(|tool| tool["name"].as_str())
             .collect::<Vec<_>>();
+        if matches!(
+            profile,
+            "codex_worker" | "claude_governed" | "dynamic_agent" | "external_auditor"
+        ) {
+            names.sort_unstable();
+            let mut expected = vec![
+                "eliot_current_state",
+                "eliot_recall_l0",
+                "eliot_fetch_l2",
+                "eliot_compile_packet_l3",
+                "eliot_agent_candidate_submit",
+                "eliot_memory_influence_trace",
+                "eliot_write_cognitive_observation",
+            ];
+            expected.sort_unstable();
+            assert_eq!(names, expected, "{profile}");
+            continue;
+        }
         assert!(names.contains(&"eliot_project_identity"));
         assert!(names.contains(&"eliot_runtime_status"));
         match profile {
             "codex_controller" => assert!(names.contains(&"eliot_submit_completion_proof")),
-            "codex_worker" => {
-                assert!(!names.contains(&"eliot_submit_completion_proof"));
-                assert!(!names.contains(&"eliot_patch_apply"));
-                assert!(!names.contains(&"eliot_delegate_review"));
-            }
-            "external_auditor" => {
-                assert!(names.contains(&"eliot_agent_candidate_submit"));
-                assert!(!names.contains(&"eliot_submit_completion_proof"));
-            }
             "verifier" | "human_readonly" => {
                 assert!(!names.contains(&"eliot_agent_candidate_submit"));
                 assert!(!names.contains(&"eliot_submit_completion_proof"));

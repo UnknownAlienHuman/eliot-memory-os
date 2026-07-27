@@ -14,6 +14,7 @@ mod provider_budget_runtime;
 mod runtime_bootstrap;
 mod runtime_instance;
 mod security_scan;
+mod ul_cross_agent_runner;
 mod windows_service;
 
 use anyhow::Result;
@@ -1955,6 +1956,7 @@ async fn dispatch_command(
             command: GraphCommand::Health,
         } => commands::run_graph_health(config).await,
         Command::Ul { command } => match command {
+            commands::UlCommand::Doctor { host } => commands::run_ul_doctor(host),
             commands::UlCommand::MineGit { project, root } => {
                 commands::run_ul_mine_git(config, project, &root).await
             }
@@ -1993,6 +1995,21 @@ async fn dispatch_command(
             commands::UlCommand::Prediction { command } => match command {
                 commands::UlPredictionCommand::Sweep { project } => {
                     commands::run_ul_prediction_sweep(config, project).await
+                }
+            },
+            commands::UlCommand::CrossAgent { command } => match command {
+                commands::UlCrossAgentCommand::Doctor => ul_cross_agent_runner::doctor(config),
+                commands::UlCrossAgentCommand::Inspect { run_id } => {
+                    ul_cross_agent_runner::inspect(config, &run_id).await
+                }
+                commands::UlCrossAgentCommand::Smoke { host, confirm } => {
+                    ul_cross_agent_runner::smoke(config, host.into(), &confirm).await
+                }
+                commands::UlCrossAgentCommand::Run { confirm } => {
+                    ul_cross_agent_runner::run(config, &confirm).await
+                }
+                commands::UlCrossAgentCommand::Report { run } => {
+                    ul_cross_agent_runner::report(&run)
                 }
             },
         },

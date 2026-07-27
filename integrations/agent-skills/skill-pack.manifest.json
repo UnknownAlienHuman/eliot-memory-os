@@ -1,28 +1,30 @@
 {
   "schema_version": "eliot-agent-skill-pack-v1",
   "hash_algorithm": "blake3(name:content_blake3 joined with LF in manifest order)",
-  "pack_hash": "c9bdd7e63aff059f02a37848922ed1a0f53f1e9f6eb36ce705571f95927071bb",
-  "listing_characters": 626,
+  "pack_hash": "efd9df3c12ae68a07366fa652b7108ac21022fdd4850b8de24cb43cc9626e9d0",
+  "listing_characters": 141,
   "skills": [
     {
-      "name": "eliot-task-cycle",
-      "content_blake3": "c49e9a4fd73b81b2cd5fe5da0f64f4bd39a44046378919c62055e519e813966a"
+      "name": "eliot-work",
+      "content_blake3": "8594f906c594556ad03d880d0fca9b5a07cf769311b6fd0a260e9c7b9d81db24"
     },
     {
-      "name": "eliot-understanding",
-      "content_blake3": "86bb9d0a2eb71c2fba30b7c21a0758e5771ac30dcc1553ec94462439e3f3f239"
+      "name": "eliot-remember",
+      "content_blake3": "6620d35ea1726017917c95afb389eafe60fa615bce99729abedbadc4bc53d99d"
     },
     {
-      "name": "eliot-delegation",
-      "content_blake3": "82eaaeb2a52f08d55da463c68c75bffa3ae6f50101c7fb6df5deb3f34f0a407d"
+      "name": "eliot-recover",
+      "content_blake3": "1fccd4edeedbd442b200c4a322ef4896dfb60214b423c2c6a9c80d34c13f18d1"
     },
     {
-      "name": "eliot-verify-finish",
-      "content_blake3": "3eac10cc385ff18d5520137789f77921d5e6ae743f1bda4b429059bc81384a05"
+      "name": "eliot-finish",
+      "content_blake3": "3a5db195606246819756b049207624fb9f725b2613e5bdc63cc2875751a1e8cd"
     }
   ],
   "derived_packages": [
     "integrations/opencode/skills",
-    "integrations/claude/eliot/skills"
+    "integrations/claude/eliot/skills",
+    "plugin/eliot-governor/skills",
+    "plugin/eliot-antigravity-official/skills"
   ]
 }

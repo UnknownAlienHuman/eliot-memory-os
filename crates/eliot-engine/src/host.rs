@@ -18,10 +18,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use time::OffsetDateTime;
 
 pub const ELIOT_SKILL_NAMES: [&str; 4] = [
-    "eliot-task-cycle",
-    "eliot-understanding",
-    "eliot-delegation",
-    "eliot-verify-finish",
+    "eliot-work",
+    "eliot-remember",
+    "eliot-recover",
+    "eliot-finish",
 ];
 
 #[derive(Clone, Debug, Serialize)]
@@ -33,6 +33,7 @@ pub struct SkillPackEntryReport {
     pub canonical_hash: String,
     pub opencode_parity: bool,
     pub claude_parity: bool,
+    pub package_parity: BTreeMap<String, bool>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -54,6 +55,8 @@ impl SkillPackService {
         let canonical_root = repo_root.join("integrations/agent-skills");
         let opencode_root = repo_root.join("integrations/opencode/skills");
         let claude_root = repo_root.join("integrations/claude/eliot/skills");
+        let codex_root = repo_root.join("plugin/eliot-governor/skills");
+        let antigravity_root = repo_root.join("plugin/eliot-antigravity-official/skills");
         let mut errors = Vec::new();
         let mut entries = Vec::new();
         let mut descriptions = 0;
@@ -82,8 +85,13 @@ impl SkillPackService {
             if nonblank_lines > 100 {
                 errors.push(format!("{name}: body exceeds 100 nonblank lines"));
             }
-            if estimated_tokens > 900 {
-                errors.push(format!("{name}: body exceeds estimated 900 token budget"));
+            if estimated_tokens > 500 {
+                errors.push(format!("{name}: body exceeds estimated 500 token budget"));
+            }
+            if description.chars().count().div_ceil(4) > 25 {
+                errors.push(format!(
+                    "{name}: description exceeds estimated 25 token budget"
+                ));
             }
             let lower = body.to_ascii_lowercase();
             for forbidden in [
@@ -118,9 +126,13 @@ impl SkillPackService {
             let canonical_hash = canonical_skill_content_hash(&body);
             let opencode = std::fs::read(opencode_root.join(name).join("SKILL.md"))?;
             let claude = std::fs::read(claude_root.join(name).join("SKILL.md"))?;
+            let codex = std::fs::read(codex_root.join(name).join("SKILL.md"))?;
+            let antigravity = std::fs::read(antigravity_root.join(name).join("SKILL.md"))?;
             let opencode_parity = opencode == body.as_bytes();
             let claude_parity = claude == body.as_bytes();
-            if !opencode_parity || !claude_parity {
+            let codex_parity = codex == body.as_bytes();
+            let antigravity_parity = antigravity == body.as_bytes();
+            if !opencode_parity || !claude_parity || !codex_parity || !antigravity_parity {
                 errors.push(format!("{name}: generated host package drift"));
             }
             pack_material.push_str(name);
@@ -135,10 +147,14 @@ impl SkillPackService {
                 canonical_hash,
                 opencode_parity,
                 claude_parity,
+                package_parity: BTreeMap::from([
+                    ("codex".to_owned(), codex_parity),
+                    ("antigravity".to_owned(), antigravity_parity),
+                ]),
             });
         }
-        if descriptions > 1_200 {
-            errors.push("combined descriptions exceed 1,200 characters".to_owned());
+        if descriptions.div_ceil(4) > 100 {
+            errors.push("combined descriptions exceed estimated 100 token budget".to_owned());
         }
         let skill_count = entries.len();
         let pack_hash = blake3::hash(pack_material.as_bytes()).to_hex().to_string();
@@ -180,12 +196,14 @@ impl SkillPackService {
     }
 }
 
-/// The two host packages that carry a copy of the canonical skill bodies.
+/// The host packages that carry a copy of the canonical skill bodies.
 /// Declared in `skill-pack.manifest.json` as `derived_packages`; kept here so
 /// the sync and the lint cannot disagree about what is derived.
-pub const DERIVED_SKILL_PACKAGES: [&str; 2] = [
+pub const DERIVED_SKILL_PACKAGES: [&str; 4] = [
     "integrations/opencode/skills",
     "integrations/claude/eliot/skills",
+    "plugin/eliot-governor/skills",
+    "plugin/eliot-antigravity-official/skills",
 ];
 
 const DERIVED_PACKAGE_NOTICE: &str = "\
@@ -276,7 +294,10 @@ impl SkillPackService {
             });
         }
 
-        for package in DERIVED_SKILL_PACKAGES {
+        for package in DERIVED_SKILL_PACKAGES
+            .into_iter()
+            .filter(|package| package.starts_with("integrations/"))
+        {
             let notice = repo_root.join(package).join("README.md");
             if std::fs::read_to_string(&notice).ok().as_deref() != Some(DERIVED_PACKAGE_NOTICE) {
                 std::fs::write(&notice, DERIVED_PACKAGE_NOTICE)?;
@@ -509,6 +530,8 @@ impl HostLaunchContractService {
             lifecycle_bridge_ref,
             environment_allowlist: vec![
                 "ELIOT_GOVERNOR_EXE".to_owned(),
+                "ELIOT_GOVERNOR_CONFIG".to_owned(),
+                "ELIOT_MCP_ACCESS_PROFILE".to_owned(),
                 "ELIOT_AGENT_SESSION_ID".to_owned(),
                 "ELIOT_PROJECT_ID".to_owned(),
                 "ELIOT_TASK_ID".to_owned(),

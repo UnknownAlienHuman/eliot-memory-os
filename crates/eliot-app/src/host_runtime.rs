@@ -74,6 +74,7 @@ use managed::{remaining_to_deadline, validate_managed_result_integrity};
 const CLAUDE_DESKTOP_MANIFEST: &str = "integrations/claude/claude-desktop/mcpb/manifest.json";
 const MAX_MANAGED_LAUNCH_SECONDS: u64 = 900;
 const MANAGED_ATTEMPT_SCHEMA_V4: &str = "eliot-managed-host-attempt-v4";
+const CONTAINED_ANTIGRAVITY_ATTEMPT_SCHEMA_V1: &str = "eliot-contained-antigravity-attempt-v1";
 const MANAGED_LOCK_MAGIC: &str = "ELIOT-MANAGED-LOCK-V2";
 const MANAGED_LOCK_STALE_AFTER: Duration = Duration::from_secs(1);
 const PROVIDER_START_MARKER: &str = "provider.started";
@@ -230,6 +231,31 @@ struct ManagedHostAttemptJournal {
     started_at: OffsetDateTime,
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct ContainedAntigravityAttemptJournal {
+    schema_version: String,
+    invocation_id: String,
+    idempotency_key: String,
+    request_hash: String,
+    contract_hash: String,
+    host: AgentHostId,
+    project_id: Option<ProjectId>,
+    task_id: Option<TaskId>,
+    agent_session_id: Option<AgentSessionId>,
+    role_lease_id: Option<String>,
+    permission_profile: String,
+    prompt_hash: String,
+    owner_pid: u32,
+    bounded_auditor_authority_hash: Option<String>,
+    launch_boundary: ManagedLaunchBoundaryAttestation,
+    attempt_hash: String,
+    attempt_recorded_before_provider_call: bool,
+    provider_call_budget_consumed: bool,
+    redispatch_allowed: bool,
+    #[serde(with = "time::serde::rfc3339")]
+    started_at: OffsetDateTime,
+}
+
 #[derive(Clone, Debug)]
 enum ExistingManagedInvocation {
     New,
@@ -281,6 +307,20 @@ struct ManagedCanonicalAuthority {
     worktree_lease: WorktreeLease,
     host_binding: AgentSessionHostBinding,
     authority_hash: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct BoundedAuditorCanonicalAuthority {
+    task_receipt: WriteReceiptRef,
+    role_receipt: WriteReceiptRef,
+    host_binding_receipt: WriteReceiptRef,
+    authority_hash: String,
+}
+
+#[derive(Default)]
+struct LaunchCanonicalAuthority {
+    managed: Option<ManagedCanonicalAuthority>,
+    bounded_auditor: Option<BoundedAuditorCanonicalAuthority>,
 }
 
 struct ManagedWorkAuthority {

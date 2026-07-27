@@ -144,6 +144,26 @@ fn read_managed_attempt(path: &Path) -> Result<ManagedAttemptJournalState> {
     })
 }
 
+fn read_contained_antigravity_attempt(
+    path: &Path,
+) -> Result<Option<ContainedAntigravityAttemptJournal>> {
+    if !path.is_file() {
+        return Ok(None);
+    }
+    let bytes = std::fs::read(path)?;
+    let Ok(value) = serde_json::from_slice::<Value>(&bytes) else {
+        return Ok(None);
+    };
+    if value.get("schema_version").and_then(Value::as_str)
+        != Some(CONTAINED_ANTIGRAVITY_ATTEMPT_SCHEMA_V1)
+    {
+        return Ok(None);
+    }
+    let attempt: ContainedAntigravityAttemptJournal = serde_json::from_value(value)?;
+    validate_contained_antigravity_attempt(&attempt)?;
+    Ok(Some(attempt))
+}
+
 fn provider_start_marker_path(root: &Path) -> PathBuf {
     root.join(PROVIDER_START_MARKER)
 }
@@ -180,6 +200,18 @@ fn lock_owner_is_active(state: &ManagedInvocationLockRecordState) -> Result<bool
 
 fn clear_pre_provider_journals(root: &Path) -> Result<()> {
     for path in [root.join("attempt.json"), root.join("dispatch.lock")] {
+        if path.exists() {
+            std::fs::remove_file(path)?;
+        }
+    }
+    Ok(())
+}
+
+fn clear_contained_antigravity_pre_dispatch(root: &Path) -> Result<()> {
+    for path in [
+        provider_start_marker_path(root),
+        root.join("attempt.json"),
+    ] {
         if path.exists() {
             std::fs::remove_file(path)?;
         }
@@ -513,6 +545,30 @@ fn managed_attempt_hash(attempt: &ManagedHostAttemptJournal) -> Result<String> {
     hash_json(&serde_json::to_value(material)?)
 }
 
+fn contained_antigravity_attempt_hash(
+    attempt: &ContainedAntigravityAttemptJournal,
+) -> Result<String> {
+    let mut material = attempt.clone();
+    material.attempt_hash.clear();
+    hash_json(&serde_json::to_value(material)?)
+}
+
+fn validate_contained_antigravity_attempt(
+    attempt: &ContainedAntigravityAttemptJournal,
+) -> Result<()> {
+    if attempt.schema_version != CONTAINED_ANTIGRAVITY_ATTEMPT_SCHEMA_V1
+        || attempt.host != AgentHostId::Antigravity
+        || !attempt.attempt_recorded_before_provider_call
+        || !attempt.provider_call_budget_consumed
+        || attempt.redispatch_allowed
+        || attempt.owner_pid == 0
+        || attempt.attempt_hash != contained_antigravity_attempt_hash(attempt)?
+    {
+        bail!("contained Antigravity attempt journal is incomplete or tampered");
+    }
+    Ok(())
+}
+
 fn validate_attempt_journal(attempt: &ManagedHostAttemptJournal) -> Result<()> {
     if !matches!(attempt.schema_version.as_str(), MANAGED_ATTEMPT_SCHEMA_V4)
         || !attempt.attempt_recorded_before_provider_call
@@ -541,9 +597,6 @@ fn managed_launch_boundary_attestation(
     let profiled_executable = Path::new(&profile.executable_path)
         .canonicalize()
         .context("canonicalize profiled agy executable")?;
-    if executable != profiled_executable {
-        bail!("managed agy executable identity differs from the probed host profile");
-    }
     let executable_hash = hash_file_content(&executable)?;
     if executable_hash != profile.executable_hash
         || profile.version.trim().is_empty()
@@ -568,11 +621,25 @@ fn managed_launch_boundary_attestation(
     assert_managed_path_is_local_and_private(invocation_root)?;
     let sandbox_root = Path::new(&environment.sandbox_root);
     assert_managed_path_is_local_and_private(sandbox_root)?;
+    let executable_is_profiled = executable == profiled_executable;
+    let executable_is_isolated_snapshot =
+        path_is_within(&executable, sandbox_root).unwrap_or(false);
+    if !executable_is_profiled && !executable_is_isolated_snapshot {
+        bail!("managed agy executable identity differs from the probed host profile");
+    }
     if !environment.inherited_environment_cleared
-        || environment
-            .inherited_environment_allowlist
-            .iter()
-            .any(|name| !matches!(name.as_str(), "SystemRoot" | "WINDIR" | "ComSpec"))
+        || environment.inherited_environment_allowlist.iter().any(|name| {
+            !matches!(
+                name.as_str(),
+                "SystemRoot"
+                    | "WINDIR"
+                    | "ComSpec"
+                    | "USERPROFILE"
+                    | "HOME"
+                    | "LOCALAPPDATA"
+                    | "APPDATA"
+            )
+        })
         || environment
             .isolated_paths
             .iter()
@@ -660,6 +727,67 @@ fn managed_sandbox_root(contract: &eliot_types::HostLaunchContract) -> Result<Pa
         .join(contract.invocation_id.replace(':', "_"));
     assert_managed_path_is_local_and_private(&root)?;
     Ok(root)
+}
+
+fn prepare_antigravity_executable_snapshot(
+    profile: &eliot_types::AgentHostRuntimeProfile,
+    contract: &eliot_types::HostLaunchContract,
+) -> Result<PathBuf> {
+    if profile.host_id != AgentHostId::Antigravity {
+        bail!("Antigravity executable isolation requires an Antigravity host profile");
+    }
+    let source = Path::new(&profile.executable_path)
+        .canonicalize()
+        .context("canonicalize profiled agy executable for isolation")?;
+    if hash_file_content(&source)? != profile.executable_hash {
+        bail!("profiled agy executable changed before isolated launch");
+    }
+    let provider_bin = managed_sandbox_root(contract)?.join("provider-bin");
+    std::fs::create_dir_all(&provider_bin)?;
+    let file_name = source
+        .file_name()
+        .context("profiled agy executable has no file name")?;
+    let snapshot = provider_bin.join(file_name);
+    if snapshot.exists() {
+        if hash_file_content(&snapshot)? != profile.executable_hash {
+            bail!("isolated agy executable snapshot already exists with a different hash");
+        }
+        return Ok(snapshot);
+    }
+
+    let partial = provider_bin.join(format!(
+        "{}.partial-{}",
+        file_name.to_string_lossy(),
+        std::process::id()
+    ));
+    let mut input = File::open(&source)?;
+    let mut output = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&partial)?;
+    std::io::copy(&mut input, &mut output)?;
+    output.flush()?;
+    output.sync_all()?;
+    drop(output);
+    std::fs::rename(&partial, &snapshot)?;
+    if hash_file_content(&snapshot)? != profile.executable_hash {
+        bail!("isolated agy executable snapshot hash differs from the probed profile");
+    }
+    Ok(snapshot)
+}
+
+fn lock_antigravity_executable_snapshot(path: &Path) -> Result<File> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_SHARE_READ: u32 = 0x0000_0001;
+        options.share_mode(FILE_SHARE_READ);
+    }
+    options
+        .open(path)
+        .context("lock isolated agy executable against self-update")
 }
 
 const REDACTED_MANAGED_OUTPUT_LINE: &str = "[REDACTED:SENSITIVE_MANAGED_HOST_OUTPUT]";
@@ -867,47 +995,35 @@ fn configure_antigravity_environment(
     governor: &str,
 ) -> Result<ManagedSanitizedEnvironment> {
     let sandbox = managed_sandbox_root(contract)?;
-    let home = sandbox.join("home");
-    let local = sandbox.join("local");
-    let roaming = sandbox.join("roaming");
     let temp = sandbox.join("temp");
-    let config = sandbox.join("config");
-    for path in [&home, &local, &roaming, &temp, &config] {
+    let provider_bin = sandbox.join("provider-bin");
+    for path in [&temp, &provider_bin] {
         std::fs::create_dir_all(path)?;
     }
     command.env_clear();
     let mut inherited_environment_allowlist = Vec::new();
-    for name in ["SystemRoot", "WINDIR", "ComSpec"] {
+    for name in [
+        "SystemRoot",
+        "WINDIR",
+        "ComSpec",
+        "USERPROFILE",
+        "HOME",
+        "LOCALAPPDATA",
+        "APPDATA",
+    ] {
         if let Some(value) = std::env::var_os(name) {
             command.env(name, value);
             inherited_environment_allowlist.push(name.to_owned());
         }
     }
     command
-        .env("USERPROFILE", &home)
-        .env("HOME", &home)
-        .env("LOCALAPPDATA", &local)
-        .env("APPDATA", &roaming)
-        .env("XDG_CONFIG_HOME", &config)
         .env("TEMP", &temp)
         .env("TMP", &temp)
         .env("ELIOT_GOVERNOR_EXE", governor)
         .env("AGY_CLI_DISABLE_AUTO_UPDATE", "1")
         .env("AGY_CLI_HIDE_ACCOUNT_INFO", "1");
     let mut environment_names = inherited_environment_allowlist.clone();
-    environment_names.extend(
-        [
-            "USERPROFILE",
-            "HOME",
-            "LOCALAPPDATA",
-            "APPDATA",
-            "XDG_CONFIG_HOME",
-            "TEMP",
-            "TMP",
-        ]
-        .into_iter()
-        .map(str::to_owned),
-    );
+    environment_names.extend(["TEMP", "TMP"].into_iter().map(str::to_owned));
     environment_names.extend(
         launch_environment_names(AgentHostId::Antigravity, contract.mode, contract)
             .into_iter()
@@ -920,19 +1036,21 @@ fn configure_antigravity_environment(
         inherited_environment_allowlist,
         environment_names,
         sandbox_root: sandbox.to_string_lossy().into_owned(),
-        isolated_paths: [&home, &local, &roaming, &temp, &config]
+        isolated_paths: [&temp, &provider_bin]
             .into_iter()
             .map(|path| path.to_string_lossy().into_owned())
             .collect(),
     })
 }
 
+#[allow(clippy::too_many_lines)]
 fn launch_argv(
     host: AgentHostId,
     executable: &str,
     bundle: &Path,
     attach_session_plugin: bool,
     contract: &eliot_types::HostLaunchContract,
+    structured_output_schema: Option<&Value>,
     prompt: Option<String>,
 ) -> Result<(String, Vec<String>)> {
     let mut args = Vec::new();
@@ -974,7 +1092,15 @@ fn launch_argv(
                 args.extend(["--model".to_owned(), model.clone()]);
             }
             if let Some(session) = &contract.session_id {
-                args.extend(["--resume".to_owned(), session.clone()]);
+                args.extend([
+                    if contract.permission_profile == "ul_structured_auditor" {
+                        "--session-id"
+                    } else {
+                        "--resume"
+                    }
+                    .to_owned(),
+                    session.clone(),
+                ]);
             }
             if contract.mode == HostMode::Supervised {
                 args.extend([
@@ -984,12 +1110,29 @@ fn launch_argv(
                     "--verbose".to_owned(),
                     "--include-hook-events".to_owned(),
                     "--permission-mode".to_owned(),
-                    if contract.work_lease_id.is_some() {
+                    if contract.permission_profile == "ul_structured_auditor" {
+                        "dontAsk".to_owned()
+                    } else if contract.work_lease_id.is_some() {
                         "default".to_owned()
                     } else {
                         "plan".to_owned()
                     },
                 ]);
+                if let Some(schema) = structured_output_schema {
+                    args.extend([
+                        "--json-schema".to_owned(),
+                        serde_json::to_string(schema)
+                            .context("serialize Claude structured output schema")?,
+                    ]);
+                }
+                if contract.permission_profile == "ul_structured_auditor" {
+                    args.extend([
+                        "--allowedTools".to_owned(),
+                        "Read,mcp__plugin_eliot_eliot__*".to_owned(),
+                        "--disallowedTools".to_owned(),
+                        "Bash,Edit,Write,NotebookEdit,WebFetch,WebSearch".to_owned(),
+                    ]);
+                }
             }
         }
         AgentHostId::Antigravity => {
@@ -1003,8 +1146,8 @@ fn launch_argv(
                 "--new-project".to_owned(),
                 "--add-dir".to_owned(),
                 contract.cwd_or_worktree.clone(),
-                "--agent".to_owned(),
-                "eliot-agent".to_owned(),
+            ]);
+            args.extend([
                 "--mode".to_owned(),
                 "plan".to_owned(),
                 "--sandbox".to_owned(),
@@ -1023,8 +1166,15 @@ fn launch_argv(
         }
     }
     if let Some(prompt) = prompt {
+        if host == AgentHostId::Claude {
+            // Claude's tool allow/deny flags accept a variable number of
+            // values. Without the option terminator, the positional prompt is
+            // consumed as another permission rule and print mode starts with
+            // no input.
+            args.push("--".to_owned());
+        }
         args.push(if host == AgentHostId::Antigravity
-            && contract.permission_profile != "ul_structured_readonly"
+            && contract.permission_profile != "ul_structured_auditor"
         {
             format!(
                 "READ-ONLY GOVERNED PLAN. Do not create, edit, delete, rename, or commit files. Do not mutate user, global, OneDrive, ProgramData, or provider configuration. Return only a raw git-style candidate unified diff, with no Markdown fences, prose, or summary; the controller will review and apply it later. Exact candidate request: {prompt}"
@@ -1047,14 +1197,29 @@ fn launch_environment_names(
     mode: HostMode,
     contract: &eliot_types::HostLaunchContract,
 ) -> Vec<&'static str> {
-    let mut names = vec!["ELIOT_GOVERNOR_EXE"];
-    if host != AgentHostId::Antigravity
-        || contract.permission_profile == "ul_structured_readonly"
-    {
+    let mut names = vec!["ELIOT_GOVERNOR_EXE", "ELIOT_GOVERNOR_CONFIG"];
+    if host == AgentHostId::Antigravity {
+        names.extend([
+            "SystemRoot",
+            "WINDIR",
+            "ComSpec",
+            "USERPROFILE",
+            "HOME",
+            "LOCALAPPDATA",
+            "APPDATA",
+            "TEMP",
+            "TMP",
+        ]);
+    } else {
         names.extend(STANDARD_MANAGED_ENV_ALLOWLIST.iter().copied());
     }
     if contract.agent_session_id.is_some() {
         names.push("ELIOT_AGENT_SESSION_ID");
+    }
+    if host == AgentHostId::Antigravity
+        && contract.permission_profile == "ul_structured_auditor"
+    {
+        names.push("ELIOT_MCP_ACCESS_PROFILE");
     }
     if contract.task_id.is_some() {
         names.push("ELIOT_TASK_ID");

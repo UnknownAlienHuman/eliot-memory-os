@@ -87,6 +87,8 @@ pub struct UlReasoningRequest {
     pub project_id: ProjectId,
     pub task_id: TaskId,
     pub route: UlReasoningRoute,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
     pub prompt: String,
     pub output_schema: Value,
     pub max_input_bytes: u32,

@@ -1,30 +1,38 @@
 use super::{
-    CanonicalAuthorityBody, CanonicalBodyNormalization, ExistingManagedInvocation,
-    MANAGED_ATTEMPT_SCHEMA_V4, ManagedHostAttemptJournal, ManagedInvocationLock,
-    ManagedInvocationLockRecord, ManagedLaunchBoundaryAttestation, ManagedSanitizedEnvironment,
-    ManagedWorktreeSnapshot, assert_managed_path_is_local_and_private, candidate_unified_diff_hash,
+    BoundedAuditorCanonicalAuthority, CONTAINED_ANTIGRAVITY_ATTEMPT_SCHEMA_V1,
+    CanonicalAuthorityBody, CanonicalBodyNormalization, ContainedAntigravityAttemptJournal,
+    ExistingManagedInvocation, MANAGED_ATTEMPT_SCHEMA_V4, ManagedHostAttemptJournal,
+    ManagedInvocationLock, ManagedInvocationLockRecord, ManagedLaunchBoundaryAttestation,
+    ManagedSanitizedEnvironment, ManagedWorktreeSnapshot, antigravity_permission_profile,
+    assert_managed_path_is_local_and_private, candidate_unified_diff_hash,
     configure_antigravity_environment, configure_standard_managed_environment,
-    encode_managed_invocation_lock, hash_bytes, hash_file_content, hash_json, integration_refs,
-    invocation_root, invocation_status, is_claude_desktop_host,
-    latest_canonical_authority_observation, launch_argv, managed_attempt_hash,
+    contained_antigravity_attempt_hash, encode_managed_invocation_lock, hash_bytes,
+    hash_file_content, hash_json, integration_refs, invocation_root, invocation_status,
+    invoke_ul_scoped_reasoning, is_claude_desktop_host, latest_canonical_authority_observation,
+    launch_argv, lock_antigravity_executable_snapshot, managed_attempt_hash,
     managed_launch_boundary_attestation, managed_launch_boundary_is_current, managed_sandbox_root,
     merge_opencode_mcp_config, normalize_relative_path, parse_opencode_jsonc,
-    provider_start_marker_path, receipt_ref_from_option, reconcile_existing_managed_invocation,
-    registry_entry_by_manifest, remaining_to_deadline, remove_opencode_mcp_config,
-    sanitize_managed_output, stable_invocation_id, validate_antigravity_scope,
-    validate_attempt_journal, validate_canonical_observation_identity,
+    parse_structured_host_output, persist_and_parse_structured_host_output,
+    prepare_antigravity_executable_snapshot, provider_start_marker_path, receipt_ref_from_option,
+    reconcile_existing_managed_invocation, registry_entry_by_manifest, remaining_to_deadline,
+    remove_opencode_mcp_config, sanitize_managed_output, stable_invocation_id,
+    uses_managed_antigravity_containment, uses_managed_antigravity_launch,
+    validate_antigravity_scope, validate_attempt_journal, validate_bounded_auditor_shape,
+    validate_canonical_observation_identity, validate_contained_antigravity_attempt,
     validate_managed_result_integrity,
 };
 use crate::runtime_instance::{atomic_write_bytes, atomic_write_json};
+use anyhow::Context as _;
 use eliot_engine::{HostLaunchContractService, WorkState, default_work_scope};
 use eliot_store::CanonicalToolObservation;
 use eliot_types::{
     AgentCapabilityEnvelope, AgentHostId, AgentHostIdentity, AgentHostRuntimeProfile, AgentId,
     AgentRole, AgentSessionHostBinding, AgentSessionId, DelegationState, HostLaunchScope, HostMode,
     HostProfileStatus, HostProtocolSurfaces, MemoryRevision, ProjectId, ProjectSequence, ReceiptId,
-    SemanticCommandKind, TaskId, TaskRoleLease, WorkItemId, WorkLease, WorkLeaseDecision,
-    WorkLeaseDecisionKind, WorkLeaseDecisionReason, WorkLeaseId, WorkLeaseState, WorktreeLease,
-    WorktreeLeaseId, WorktreeLeaseState, WriteId, WriteReceipt, WriteReceiptRef, WriteStatus,
+    SemanticCommandKind, TaskId, TaskRoleLease, UlReasoningRequest, UlReasoningRoute, WorkItemId,
+    WorkLease, WorkLeaseDecision, WorkLeaseDecisionKind, WorkLeaseDecisionReason, WorkLeaseId,
+    WorkLeaseState, WorktreeLease, WorktreeLeaseId, WorktreeLeaseState, WriteId, WriteReceipt,
+    WriteReceiptRef, WriteStatus,
 };
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
@@ -43,6 +51,266 @@ fn eliot_entry() -> Value {
 
 fn instruction_entry() -> &'static str {
     "C:/Eliot/instructions/eliot-governor.md"
+}
+
+#[test]
+fn structured_antigravity_capture_does_not_use_candidate_diff_runner() {
+    assert!(uses_managed_antigravity_launch(
+        AgentHostId::Antigravity,
+        false
+    ));
+    assert!(!uses_managed_antigravity_launch(
+        AgentHostId::Antigravity,
+        true
+    ));
+    assert!(!uses_managed_antigravity_launch(AgentHostId::Claude, false));
+    assert!(uses_managed_antigravity_containment(
+        AgentHostId::Antigravity
+    ));
+    assert!(!uses_managed_antigravity_containment(AgentHostId::Claude));
+}
+
+#[test]
+fn external_auditor_profile_is_bounded_to_ul_certification_scope() {
+    assert_eq!(
+        antigravity_permission_profile(true),
+        "ul_structured_auditor"
+    );
+    assert_eq!(
+        antigravity_permission_profile(false),
+        "canonical_readonly_candidate_plan"
+    );
+}
+
+#[tokio::test]
+async fn ul_scoped_reasoning_rejects_missing_binding_before_provider_probe() -> anyhow::Result<()> {
+    let project_id = ProjectId::new_v7();
+    let task_id = TaskId::new_v7();
+    let request = UlReasoningRequest {
+        idempotency_key: "ul11r3-unscoped-regression".to_owned(),
+        project_id,
+        task_id,
+        route: UlReasoningRoute::Claude,
+        model: Some("opus".to_owned()),
+        prompt: "must not dispatch".to_owned(),
+        output_schema: json!({"type": "object"}),
+        max_input_bytes: 1024,
+        max_output_units: 128,
+        timeout_seconds: 30,
+    };
+    let error = invoke_ul_scoped_reasoning(
+        Path::new("missing-governor-config.toml"),
+        Path::new("."),
+        &request,
+        HostLaunchScope::default(),
+    )
+    .await
+    .err()
+    .context("unscoped UL provider launch must fail")?;
+    assert!(
+        format!("{error:#}")
+            .contains("requires matching project/task plus AgentSessionHostBinding"),
+        "unexpected error: {error:#}"
+    );
+    Ok(())
+}
+
+#[test]
+fn antigravity_structured_output_accepts_the_bare_a0_contract() -> anyhow::Result<()> {
+    let expected = json!({
+        "applicability": "no_useful_memory",
+        "delivery_surface": Value::Null,
+        "first_action": Value::Null,
+        "influence_receipt": Value::Null,
+        "marker": Value::Null,
+        "memory_handle": Value::Null
+    });
+    for output in [
+        serde_json::to_vec(&expected)?,
+        serde_json::to_vec(&format!(
+            "Model response follows:\n{expected}\nEnd response."
+        ))?,
+    ] {
+        assert_eq!(
+            parse_structured_host_output(AgentHostId::Antigravity, &output)?,
+            expected
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn invalid_structured_output_records_known_terminal_receipt_without_raw_output()
+-> anyhow::Result<()> {
+    let root = std::env::temp_dir().join(format!("eliot-structured-receipt-{}", TaskId::new_v7()));
+    std::fs::create_dir_all(&root)?;
+    let mut receipt = json!({
+        "schema_version": "eliot-host-launch-result-v1",
+        "success": true,
+        "structured_capture": {
+            "requested": true,
+            "status": "pending"
+        }
+    });
+    let error = require_error(
+        persist_and_parse_structured_host_output(
+            AgentHostId::Claude,
+            &root,
+            br#"{"event":"completed-without-response"}"#,
+            &mut receipt,
+        ),
+        "an event without a response must fail closed",
+    )?;
+    assert!(
+        error
+            .to_string()
+            .contains("structured output contract was invalid")
+    );
+    let archived: Value = serde_json::from_slice(&std::fs::read(root.join("result.json"))?)?;
+    assert_eq!(
+        archived.pointer("/structured_capture/status"),
+        Some(&json!("invalid"))
+    );
+    assert_eq!(
+        archived.pointer("/structured_capture/error_code"),
+        Some(&json!("INVALID_STRUCTURED_OUTPUT"))
+    );
+    assert_eq!(
+        archived.get("provider_outcome_status"),
+        Some(&json!("invalid_structured_output"))
+    );
+    assert_eq!(archived.get("structured_output_valid"), Some(&json!(false)));
+    assert_eq!(
+        archived.pointer("/structured_capture/structural_diagnostic/whole_document/keys/0/name"),
+        Some(&json!("event"))
+    );
+    assert_eq!(
+        archived.pointer("/structured_capture/structural_diagnostic/raw_output_retained"),
+        Some(&json!(false))
+    );
+    assert!(!root.join("stdout.jsonl").exists());
+    assert!(!root.join("stderr.log").exists());
+    assert!(archived.get("structured_output").is_none());
+    std::fs::remove_dir_all(root)?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn contained_antigravity_attempt_reconciles_a_known_result() -> anyhow::Result<()> {
+    let root = std::env::temp_dir().join(format!("eliot-contained-agy-{}", TaskId::new_v7()));
+    std::fs::create_dir_all(&root)?;
+    let request_hash = "blake3:contained-request";
+    let contract_hash = "blake3:contained-contract";
+    let boundary = ManagedLaunchBoundaryAttestation {
+        schema_version: "eliot-managed-launch-boundary-v1".to_owned(),
+        executable_path: "C:/Eliot/agy.exe".to_owned(),
+        executable_hash: "blake3:agy".to_owned(),
+        executable_version: "1.0.0".to_owned(),
+        capability_probe_receipt: "blake3:probe".to_owned(),
+        integration_bundle_ref: "C:/Eliot/antigravity".to_owned(),
+        integration_bundle_hash: "blake3:bundle".to_owned(),
+        invocation_root: root.to_string_lossy().into_owned(),
+        environment: ManagedSanitizedEnvironment {
+            inherited_environment_cleared: true,
+            inherited_environment_allowlist: Vec::new(),
+            environment_names: vec!["HOME".to_owned()],
+            sandbox_root: root.join("sandbox").to_string_lossy().into_owned(),
+            isolated_paths: Vec::new(),
+        },
+    };
+    let mut attempt = ContainedAntigravityAttemptJournal {
+        schema_version: CONTAINED_ANTIGRAVITY_ATTEMPT_SCHEMA_V1.to_owned(),
+        invocation_id: "host-invocation:contained".to_owned(),
+        idempotency_key: "contained".to_owned(),
+        request_hash: request_hash.to_owned(),
+        contract_hash: contract_hash.to_owned(),
+        host: AgentHostId::Antigravity,
+        project_id: Some(ProjectId::new_v7()),
+        task_id: Some(TaskId::new_v7()),
+        agent_session_id: Some(AgentSessionId::new_v7()),
+        role_lease_id: Some("role:auditor".to_owned()),
+        permission_profile: "ul_structured_auditor".to_owned(),
+        prompt_hash: "blake3:prompt".to_owned(),
+        owner_pid: std::process::id(),
+        bounded_auditor_authority_hash: None,
+        launch_boundary: boundary.clone(),
+        attempt_hash: String::new(),
+        attempt_recorded_before_provider_call: true,
+        provider_call_budget_consumed: true,
+        redispatch_allowed: false,
+        started_at: OffsetDateTime::now_utc(),
+    };
+    attempt.attempt_hash = contained_antigravity_attempt_hash(&attempt)?;
+    validate_contained_antigravity_attempt(&attempt)?;
+    let serialized = serde_json::to_value(&attempt)?;
+    assert!(serialized.get("work_lease_id").is_none());
+    assert!(serialized.get("worktree_lease_id").is_none());
+    atomic_write_json(&root.join("attempt.json"), &attempt)?;
+    atomic_write_json(
+        &root.join("result.json"),
+        &json!({
+            "schema_version": "eliot-host-launch-result-v1",
+            "contract_hash": contract_hash,
+            "request_hash": request_hash,
+            "host": AgentHostId::Antigravity,
+            "success": true,
+            "launch_boundary": boundary,
+            "bounded_auditor_authority": Value::Null
+        }),
+    )?;
+    assert!(matches!(
+        reconcile_existing_managed_invocation(&root, &root, request_hash).await?,
+        ExistingManagedInvocation::Reuse(_)
+    ));
+    std::fs::remove_dir_all(root)?;
+    Ok(())
+}
+
+#[test]
+fn bounded_auditor_scope_rejects_work_authority() {
+    let task = TaskId::new_v7();
+    let session = AgentSessionId::new_v7();
+    let now = OffsetDateTime::now_utc();
+    let role = TaskRoleLease {
+        role_lease_id: "role:ul-auditor".to_owned(),
+        task_id: task,
+        agent_session_id: session,
+        role: AgentRole::Auditor,
+        capability_scope: vec!["eliot_fetch_l2".to_owned()],
+        expires_at: now + time::Duration::minutes(20),
+        epoch: 1,
+    };
+    let mut scope = HostLaunchScope {
+        project_id: Some(ProjectId::new_v7()),
+        agent_session_id: Some(session),
+        task_id: Some(task),
+        role_lease_id: Some(role.role_lease_id.clone()),
+        ..HostLaunchScope::default()
+    };
+    assert!(validate_bounded_auditor_shape(&role, &scope, now).is_ok());
+    scope.work_lease_id = Some(WorkLeaseId::new_v7());
+    assert!(validate_bounded_auditor_shape(&role, &scope, now).is_err());
+}
+
+#[test]
+fn bounded_auditor_authority_contains_no_work_receipts() -> anyhow::Result<()> {
+    let reference = WriteReceiptRef {
+        receipt_id: ReceiptId::new_v7(),
+        write_id: WriteId::new_v7(),
+    };
+    let authority = BoundedAuditorCanonicalAuthority {
+        task_receipt: reference.clone(),
+        role_receipt: reference.clone(),
+        host_binding_receipt: reference,
+        authority_hash: "blake3:fixture".to_owned(),
+    };
+    let value = serde_json::to_value(authority)?;
+    assert!(value.get("task_receipt").is_some());
+    assert!(value.get("role_receipt").is_some());
+    assert!(value.get("host_binding_receipt").is_some());
+    assert!(value.get("work_receipt").is_none());
+    assert!(value.get("worktree_receipt").is_none());
+    Ok(())
 }
 
 fn write_stale_managed_lock(root: &Path) -> anyhow::Result<()> {
@@ -423,6 +691,7 @@ fn antigravity_is_a_scoped_managed_launch_target() -> anyhow::Result<()> {
         &repo.join("integrations/antigravity"),
         false,
         &contract,
+        None,
         Some("bounded candidate task".to_owned()),
     )?;
     assert!(args.windows(2).any(|pair| pair == ["--mode", "plan"]));
@@ -434,6 +703,10 @@ fn antigravity_is_a_scoped_managed_launch_target() -> anyhow::Result<()> {
     assert!(args.iter().any(|arg| arg == "--new-project"));
     assert!(args.iter().any(|arg| arg == "--sandbox"));
     assert!(args.iter().any(|arg| arg == "--print"));
+    assert!(
+        !args.iter().any(|argument| argument == "--agent"),
+        "managed Antigravity must use the provider's default agent: {args:?}"
+    );
     let prompt = args.last().map(String::as_str).unwrap_or_default();
     assert!(prompt.contains("READ-ONLY GOVERNED PLAN"));
     assert!(prompt.contains("candidate unified diff"));
@@ -465,6 +738,49 @@ fn antigravity_is_a_scoped_managed_launch_target() -> anyhow::Result<()> {
 }
 
 #[test]
+fn antigravity_ul_structured_launch_uses_default_agent_without_persona_prose() -> anyhow::Result<()>
+{
+    let fixture = scope_fixture()?;
+    let repo = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(Path::parent)
+        .ok_or_else(|| anyhow::anyhow!("workspace root"))?;
+    let mut contract = HostLaunchContractService.render(
+        repo,
+        &antigravity_profile(),
+        HostMode::Supervised,
+        &fixture.cwd,
+        Some("claude-opus-4-6-thinking".to_owned()),
+        None,
+        &fixture.scope,
+    )?;
+    contract.permission_profile = "ul_structured_auditor".to_owned();
+    let (_program, args) = launch_argv(
+        AgentHostId::Antigravity,
+        "agy.exe",
+        &repo.join("integrations/antigravity"),
+        false,
+        &contract,
+        None,
+        Some("bounded structured task".to_owned()),
+    )?;
+
+    assert!(
+        !args.iter().any(|arg| arg == "--agent"),
+        "the bounded launch must avoid the custom-main-agent MCP inheritance defect: {args:?}"
+    );
+    assert!(args.windows(2).any(|pair| pair == ["--mode", "plan"]));
+    assert!(args.last().is_some_and(|prompt| {
+        prompt.contains("READ-ONLY STRUCTURED REASONING")
+            && prompt.contains("Return only the requested JSON value")
+            && prompt.contains("bounded structured task")
+            && !prompt.contains("MCP server, not an agent")
+            && !prompt.contains("starting with `eliot_host_session_status`")
+    }));
+    Ok(())
+}
+
+#[test]
 fn opencode_managed_launch_preserves_the_exact_dynamic_model_route() -> anyhow::Result<()> {
     let fixture = scope_fixture()?;
     let repo = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -490,6 +806,7 @@ fn opencode_managed_launch_preserves_the_exact_dynamic_model_route() -> anyhow::
         &repo.join("integrations/opencode"),
         false,
         &contract,
+        None,
         Some("sealed reader task".to_owned()),
     )?;
     let model_pairs = args
@@ -544,6 +861,7 @@ fn claude_managed_launch_attaches_eliot_exactly_once() -> anyhow::Result<()> {
         &bundle,
         false,
         &contract,
+        None,
         Some("bounded task".to_owned()),
     )?;
     assert_eq!(
@@ -560,6 +878,7 @@ fn claude_managed_launch_attaches_eliot_exactly_once() -> anyhow::Result<()> {
         &bundle,
         true,
         &contract,
+        None,
         Some("bounded task".to_owned()),
     )?;
     assert_eq!(
@@ -570,6 +889,60 @@ fn claude_managed_launch_attaches_eliot_exactly_once() -> anyhow::Result<()> {
     assert!(
         !fallback.iter().any(|argument| argument == "--mcp-config"),
         "--plugin-dir already carries .mcp.json: {fallback:?}"
+    );
+    Ok(())
+}
+
+#[test]
+fn claude_ul_launch_passes_exact_schema_and_terminates_permission_flags() -> anyhow::Result<()> {
+    let fixture = scope_fixture()?;
+    let repo = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(Path::parent)
+        .ok_or_else(|| anyhow::anyhow!("workspace root"))?;
+    let mut profile = antigravity_profile();
+    profile.host_id = AgentHostId::Claude;
+    profile.implementation_name = "Claude Code".to_owned();
+    let mut contract = HostLaunchContractService.render(
+        repo,
+        &profile,
+        HostMode::Supervised,
+        &fixture.cwd,
+        None,
+        None,
+        &fixture.scope,
+    )?;
+    contract.permission_profile = "ul_structured_auditor".to_owned();
+    let schema = json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["purpose"],
+        "properties": {
+            "purpose": {"type": "string"}
+        }
+    });
+    let prompt = "bounded structured task";
+    let (_program, args) = launch_argv(
+        AgentHostId::Claude,
+        "claude.exe",
+        &repo.join("integrations/claude/eliot"),
+        false,
+        &contract,
+        Some(&schema),
+        Some(prompt.to_owned()),
+    )?;
+
+    let schema_args = args
+        .windows(2)
+        .filter(|pair| pair[0] == "--json-schema")
+        .collect::<Vec<_>>();
+    assert_eq!(schema_args.len(), 1, "expected one exact schema: {args:?}");
+    assert_eq!(serde_json::from_str::<Value>(&schema_args[0][1])?, schema);
+    assert_eq!(args.last().map(String::as_str), Some(prompt));
+    assert_eq!(
+        args.get(args.len().saturating_sub(2)).map(String::as_str),
+        Some("--"),
+        "Claude's variadic permission flags must be terminated before the prompt: {args:?}"
     );
     Ok(())
 }
@@ -762,8 +1135,62 @@ fn candidate_diff_validates_hunk_semantics_and_all_metadata_paths() {
     assert!(candidate_unified_diff_hash(fake_new_file, &allowed).is_none());
 }
 
+#[test]
+fn antigravity_executable_snapshot_is_private_current_and_update_locked() -> anyhow::Result<()> {
+    let fixture = scope_fixture()?;
+    let repo = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(Path::parent)
+        .ok_or_else(|| anyhow::anyhow!("workspace root"))?;
+    let mut contract = HostLaunchContractService.render(
+        repo,
+        &antigravity_profile(),
+        HostMode::Supervised,
+        &fixture.cwd,
+        Some("gemini-2.5-pro".to_owned()),
+        None,
+        &fixture.scope,
+    )?;
+    contract.invocation_id = format!("host-invocation:test-{}", TaskId::new_v7());
+
+    let local = PathBuf::from(
+        std::env::var_os("LOCALAPPDATA")
+            .ok_or_else(|| anyhow::anyhow!("LOCALAPPDATA is required"))?,
+    );
+    let source_root = local
+        .join("Eliot")
+        .join("host-runtime-tests")
+        .join(TaskId::new_v7().to_string());
+    std::fs::create_dir_all(&source_root)?;
+    let source = source_root.join("agy.exe");
+    let executable_bytes = b"fixture agy executable";
+    std::fs::write(&source, executable_bytes)?;
+    let mut profile = antigravity_profile();
+    profile.executable_path = source.canonicalize()?.to_string_lossy().into_owned();
+    profile.executable_hash = hash_file_content(&source)?;
+
+    let snapshot = prepare_antigravity_executable_snapshot(&profile, &contract)?;
+    assert!(snapshot.starts_with(managed_sandbox_root(&contract)?));
+    assert_eq!(hash_file_content(&snapshot)?, profile.executable_hash);
+
+    let update_guard = lock_antigravity_executable_snapshot(&snapshot)?;
+    assert!(
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&snapshot)
+            .is_err(),
+        "the isolated executable must reject an updater write while the provider is running"
+    );
+    drop(update_guard);
+    std::fs::write(&snapshot, executable_bytes)?;
+
+    std::fs::remove_dir_all(managed_sandbox_root(&contract)?)?;
+    std::fs::remove_dir_all(source_root)?;
+    Ok(())
+}
+
 #[tokio::test]
-async fn antigravity_environment_is_allowlisted_and_global_paths_are_denied() -> anyhow::Result<()>
+async fn antigravity_environment_preserves_real_profile_without_secret_spill() -> anyhow::Result<()>
 {
     let fixture = scope_fixture()?;
     let repo = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -783,7 +1210,7 @@ async fn antigravity_environment_is_allowlisted_and_global_paths_are_denied() ->
         .ok_or_else(|| anyhow::anyhow!("ComSpec is required on Windows"))?;
     let mut command = tokio::process::Command::new(comspec);
     command.args(["/D", "/C", "set"]);
-    configure_antigravity_environment(
+    let managed = configure_antigravity_environment(
         &mut command,
         repo,
         &contract,
@@ -802,6 +1229,48 @@ async fn antigravity_environment_is_allowlisted_and_global_paths_are_denied() ->
         assert!(
             !environment.lines().any(|line| line.starts_with(forbidden)),
             "forbidden inherited environment variable: {forbidden}"
+        );
+    }
+    for name in ["USERPROFILE", "HOME", "LOCALAPPDATA", "APPDATA"] {
+        if let Some(expected) = std::env::var_os(name) {
+            let expected = format!("{name}={}", expected.to_string_lossy()).to_ascii_uppercase();
+            assert!(
+                environment.lines().any(|line| line == expected),
+                "{name} must preserve the authenticated Windows user profile"
+            );
+            assert!(
+                managed
+                    .inherited_environment_allowlist
+                    .iter()
+                    .any(|candidate| candidate == name),
+                "{name} must be explicit in the attested allowlist"
+            );
+        }
+    }
+    assert!(
+        !managed
+            .environment_names
+            .iter()
+            .any(|name| name == "XDG_CONFIG_HOME"),
+        "Antigravity must not be redirected to a blank config root"
+    );
+    assert!(
+        managed
+            .environment_names
+            .iter()
+            .any(|name| name == "ELIOT_GOVERNOR_CONFIG"),
+        "the Antigravity MCP child must receive the exact Governor config"
+    );
+    let sandbox = PathBuf::from(&managed.sandbox_root);
+    for credential_name in [
+        "credentials.json",
+        "oauth_creds.json",
+        "application_default_credentials.json",
+        "secure_storage.json",
+    ] {
+        assert!(
+            !sandbox.join(credential_name).exists(),
+            "managed launch must not copy provider credential files"
         );
     }
     let local = PathBuf::from(

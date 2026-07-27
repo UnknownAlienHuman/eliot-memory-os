@@ -1,0 +1,104 @@
+{
+  "schema_version": "eliot-ul-cross-agent-suite-v1",
+  "harness_version": "ul-cross-agent-v1",
+  "confirmation_token": "CONFIRM-8-CLAUDE-ANTIGRAVITY-BLIND-RELAY",
+  "hard_provider_call_cap": 8,
+  "cases": [
+    {
+      "ordinal": 1,
+      "case_id": "A0",
+      "direction": "A",
+      "host": "antigravity",
+      "role": "prewrite_control",
+      "memory_mode": "current_memory",
+      "file_cue": "src/relay_alpha.rs",
+      "branch_phrase": "FROST-17",
+      "expected_first_action": "inspect_frame_owner",
+      "marker_visible_to_provider": false
+    },
+    {
+      "ordinal": 2,
+      "case_id": "A1",
+      "direction": "A",
+      "host": "claude",
+      "role": "writer",
+      "memory_mode": "candidate_write",
+      "file_cue": "src/relay_alpha.rs",
+      "branch_phrase": "FROST-17",
+      "expected_first_action": "inspect_frame_owner",
+      "marker_visible_to_provider": true
+    },
+    {
+      "ordinal": 3,
+      "case_id": "A2",
+      "direction": "A",
+      "host": "antigravity",
+      "role": "treatment",
+      "memory_mode": "treatment",
+      "file_cue": "src/relay_alpha.rs",
+      "branch_phrase": "FROST-17",
+      "expected_first_action": "inspect_frame_owner",
+      "marker_visible_to_provider": false
+    },
+    {
+      "ordinal": 4,
+      "case_id": "A3",
+      "direction": "A",
+      "host": "antigravity",
+      "role": "memory_free_control",
+      "memory_mode": "memory_free_control",
+      "file_cue": "src/relay_alpha.rs",
+      "branch_phrase": "FROST-17",
+      "expected_first_action": "inspect_frame_owner",
+      "marker_visible_to_provider": false
+    },
+    {
+      "ordinal": 5,
+      "case_id": "B0",
+      "direction": "B",
+      "host": "claude",
+      "role": "prewrite_control",
+      "memory_mode": "current_memory",
+      "file_cue": "src/relay_beta.rs",
+      "branch_phrase": "EMBER-29",
+      "expected_first_action": "inspect_discovery_anchor",
+      "marker_visible_to_provider": false
+    },
+    {
+      "ordinal": 6,
+      "case_id": "B1",
+      "direction": "B",
+      "host": "antigravity",
+      "role": "writer",
+      "memory_mode": "candidate_write",
+      "file_cue": "src/relay_beta.rs",
+      "branch_phrase": "EMBER-29",
+      "expected_first_action": "inspect_discovery_anchor",
+      "marker_visible_to_provider": true
+    },
+    {
+      "ordinal": 7,
+      "case_id": "B2",
+      "direction": "B",
+      "host": "claude",
+      "role": "treatment",
+      "memory_mode": "treatment",
+      "file_cue": "src/relay_beta.rs",
+      "branch_phrase": "EMBER-29",
+      "expected_first_action": "inspect_discovery_anchor",
+      "marker_visible_to_provider": false
+    },
+    {
+      "ordinal": 8,
+      "case_id": "B3",
+      "direction": "B",
+      "host": "claude",
+      "role": "memory_free_control",
+      "memory_mode": "memory_free_control",
+      "file_cue": "src/relay_beta.rs",
+      "branch_phrase": "EMBER-29",
+      "expected_first_action": "inspect_discovery_anchor",
+      "marker_visible_to_provider": false
+    }
+  ]
+}
