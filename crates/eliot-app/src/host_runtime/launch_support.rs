@@ -1198,9 +1198,7 @@ fn launch_environment_names(
     contract: &eliot_types::HostLaunchContract,
 ) -> Vec<&'static str> {
     let mut names = vec!["ELIOT_GOVERNOR_EXE"];
-    if host != AgentHostId::Antigravity {
-        names.extend(STANDARD_MANAGED_ENV_ALLOWLIST.iter().copied());
-    } else {
+    if host == AgentHostId::Antigravity {
         names.extend([
             "SystemRoot",
             "WINDIR",
@@ -1212,6 +1210,8 @@ fn launch_environment_names(
             "TEMP",
             "TMP",
         ]);
+    } else {
+        names.extend(STANDARD_MANAGED_ENV_ALLOWLIST.iter().copied());
     }
     if contract.agent_session_id.is_some() {
         names.push("ELIOT_AGENT_SESSION_ID");

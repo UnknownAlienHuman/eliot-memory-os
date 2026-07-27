@@ -538,7 +538,7 @@ pub(crate) async fn doctor(root: &Path) -> Result<()> {
         "daemon_health": if status.daemon_ready { "ready" } else { "not_ready" },
         "db_health": if status.db_ready { "ready" } else { "not_ready" },
         "schema_version": SCHEMA_VERSION,
-        "codex_integration_model": "mcp_and_skills_no_plugin",
+        "codex_integration_model": "project_mcp_with_native_plugin_available",
         "project_codex_config_status": if codex_config_ok { "valid_disposable_config" } else { "invalid" },
         "provider_kill_switch": manifest.provider_kill_switch,
         "antigravity_ledger_count": antigravity_ledger_count(&manifest.project_root),

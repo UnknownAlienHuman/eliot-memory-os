@@ -578,6 +578,12 @@ pub(super) async fn dispatch_tool(
         "eliot_task_observation_record" => {
             Box::pin(dispatch_task_observation_record(state, context, arguments)).await?
         }
+        "eliot_write_cognitive_observation" => {
+            Box::pin(dispatch_write_cognitive_observation(
+                state, context, arguments,
+            ))
+            .await?
+        }
         "eliot_agent_candidate_submit" => {
             Box::pin(dispatch_agent_candidate_submit(state, context, arguments)).await?
         }

@@ -1,7 +1,12 @@
 # ELIOT Tool Usage
 
-For every nontrivial project task, use `eliot-governor` before searching local memory files: resolve a stable repository key with `eliot_project_identity`, recall with `eliot_recall_l0`, and fetch relevant handles with `eliot_fetch_l2`. If the user names a repository or project, that normalized name takes precedence over the active Antigravity project or playground. Reuse the same stable key in all `project_id` fields. Call the live MCP tools directly instead of reading generated JSON schema files. Do this automatically when the user asks to continue or resume work; do not wait for an explicit Eliot instruction.
+Context arrives as `ul_boot`, `ul_fired`, or a bounded hook injection. Do not
+re-fetch injected material. Before a material edit, compile the smallest packet
+and use its `frame_stub`; after an error, inspect matching negative memory
+before debugging from scratch. Verify with the packet's verifier.
 
-Recall-only and status-only tasks need no write. Never copy a recalled claim into a new candidate. Before ending material work, submit only novel reusable state created by the current task. Use one complete `eliot_agent_candidate_submit` call containing `project_id`, retry-stable UUID `write_id`, `topic`, `statement`, the three arrays `where_applicable`, `where_not_applicable`, `negative_constraints` (use `[]` when empty), non-empty `provenance_refs`, and `freshness_rule`. Retry at most once after fixing the exact validation error. Antigravity connects as host `antigravity`; host identity grants no role, and every write is candidate-only.
-
-For ordinary recall, do not call CodeCortex, Antigravity connector reports/live smoke, or read generated schema/report/output files. Never search `.gemini/antigravity/mcp`, `.eliot-governor`, raw SQL, or database files to discover a project UUID. Call `eliot_host_session_status` before role-sensitive work; only its active `TaskRoleLease` entries are authoritative, never host identity, visibility/provider reports, old invocation receipts, or memory history. A Controller may coordinate its task but cannot bypass leases or promote truth. Repository or service mutation requires a matching current work/action lease. Never request credentials, bypass a Governor denial, invoke Antigravity recursively, or claim completion without current verifier evidence.
+Save only novel lessons with `statement`, `kind`, and `expected_reuse_note`;
+bindings are automatic. Ack only memory actually used. Host identity never
+grants a task role, and model output remains candidate-only. Do not inspect
+credentials, bypass a Governor denial, invoke Antigravity recursively, or claim
+completion without current verifier evidence.

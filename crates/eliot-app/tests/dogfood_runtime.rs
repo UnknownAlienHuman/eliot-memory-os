@@ -62,7 +62,7 @@ fn dogfood_runtime_starts_doctors_stops_and_restarts_persistent_state() -> TestR
         assert_eq!(doctor["db_health"], "ready", "cycle {cycle}");
         assert_eq!(
             doctor["codex_integration_model"],
-            "mcp_and_skills_no_plugin"
+            "project_mcp_with_native_plugin_available"
         );
         assert!(doctor.get("plugin_bundle_status").is_none());
         assert_eq!(

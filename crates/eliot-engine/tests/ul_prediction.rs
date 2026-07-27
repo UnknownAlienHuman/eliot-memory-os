@@ -104,9 +104,11 @@ fn t07_calibration_is_per_subsystem() -> Result<(), Box<dyn std::error::Error>> 
 fn t07_skill_and_description_budget() -> Result<(), Box<dyn std::error::Error>> {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     let skills = [
-        root.join("integrations/agent-skills/eliot-understanding/SKILL.md"),
-        root.join("integrations/claude/eliot/skills/eliot-understanding/SKILL.md"),
-        root.join("integrations/opencode/skills/eliot-understanding/SKILL.md"),
+        root.join("integrations/agent-skills/eliot-work/SKILL.md"),
+        root.join("integrations/claude/eliot/skills/eliot-work/SKILL.md"),
+        root.join("integrations/opencode/skills/eliot-work/SKILL.md"),
+        root.join("plugin/eliot-governor/skills/eliot-work/SKILL.md"),
+        root.join("plugin/eliot-antigravity-official/skills/eliot-work/SKILL.md"),
     ];
     let bodies = skills
         .iter()
@@ -119,28 +121,22 @@ fn t07_skill_and_description_budget() -> Result<(), Box<dyn std::error::Error>> 
         .ok_or("skill frontmatter missing")?
         .trim();
     let required = [
-        "1. Read `ul_boot` and `ul_fired`; do not fetch injected content again.",
-        "2. Before material work, compile a packet and use `frame_stub`; keep the",
-        "3. On failure, inspect pushed negative memory before debugging from scratch.",
-        "4. Save a non-obvious lesson with `expected_reuse_note`; the server derives",
-        "5. Acknowledge only memory actually injected or fetched. Influence claims",
-        "6. A stale capsule is historical guidance; verify against current code.",
+        "context arrives with the first successful ELIOT call.",
+        "Call `eliot_compile_packet_l3` with `goal`.",
+        "check `ul_fired` for a matching",
+        "Run the packet verifier.",
+        "[STALE ...]",
     ];
     assert!(required.iter().all(|line| body.contains(line)));
-    assert_eq!(
-        body.lines()
-            .filter(|line| line.starts_with(char::is_numeric))
-            .count(),
-        6
-    );
     assert!(ul_token_estimate(body) <= 500);
 
     let catalog = fs::read_to_string(root.join("crates/eliot-app/src/mcp_stdio/catalog.rs"))?;
     let descriptions = [
-        "Search memory by keywords when pushed UL context is insufficient. Needs query. Returns handles and previews.",
-        "Compile task context and a complete frame_stub before material work. Needs goal; task/project may be session-bound.",
-        "Save a reusable claim, decision, or failure. Needs statement and expected_reuse_note; cue bindings can be derived from touched paths.",
-        "Acknowledge memory use. Minimal form: memory_handle, influence_class, and downstream_outcome_ref when it changed action.",
+        "Search memory by keywords. Use when you need knowledge NOT already injected (ul_boot/ul_fired). Needs: query (plain words). Returns: handles + one-liners.",
+        "Task context packet + prefilled frame_stub. Use BEFORE any material edit. Needs: goal (task_id auto). Returns: packet, frame_stub (edit <=5 fields), verifier, ul_gate.",
+        "Save a lesson/decision/failure to memory. Use after solving anything non-obvious or failing. Needs: statement, kind, expected_reuse_note (bindings auto from your session). Returns: handle.",
+        "Acknowledge memory you used. Minimal form: memory_handle, influence_class[, downstream_outcome_ref]. Server fills the rest. Returns: receipt.",
+        "Record a tool/test observation (errors, diagnostics). Use on notable failures. Needs: payload. Returns: receipt; may trigger ul_fired on next call.",
     ];
     for description in descriptions {
         assert!(catalog.contains(description));

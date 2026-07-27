@@ -1,3 +1,10 @@
 # ELIOT Tool Usage
 
-Use only the `eliot-governor` MCP server. Antigravity connects through host `antigravity`; host identity grants no task role. At the start of every nontrivial project task, call `eliot_project_identity` directly with a stable repository key, then recall/fetch before local memory-file exploration. An explicitly user-named repository wins over the active Antigravity project or playground. Do not read generated MCP schema/report/output files. Recall-only and status-only tasks need no write; never copy a recalled claim. At the end, submit only novel material state using one complete candidate call with all arrays, provenance, freshness, and one retry-stable UUID. Call `eliot_host_session_status` before role-sensitive work; only its active `TaskRoleLease` entries are authoritative, never host identity, visibility/provider reports, old invocation receipts, or memory history. A Controller may coordinate only its task. Mutation requires the matching work/action lease. Do not invoke CodeCortex or Antigravity reports/smokes for ordinary recall, inspect credentials, bypass a Governor denial, invoke Antigravity recursively, or claim completion without verifier evidence.
+Use only the `eliot-governor` MCP server. Context arrives as `ul_boot`,
+`ul_fired`, or a bounded hook injection; expand only handles needed for the next
+action. Compile before material edits, check matching failures before fresh
+debugging, and run the packet verifier.
+
+Candidate and influence calls belong to the model, never the plugin. Host
+identity grants no task role. Never inspect credentials, bypass Governor,
+invoke Antigravity recursively, or claim completion without verifier evidence.

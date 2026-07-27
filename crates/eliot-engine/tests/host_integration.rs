@@ -58,13 +58,11 @@ fn canonical_skill_pack_has_exact_host_parity_and_budget() {
         .expect("lint skill pack");
     assert!(report.valid, "{:?}", report.errors);
     assert_eq!(report.skill_count, 4);
-    assert!(report.listing_characters <= 1_200);
-    assert!(
-        report
-            .entries
-            .iter()
-            .all(|entry| entry.opencode_parity && entry.claude_parity)
-    );
+    assert!(report.listing_characters.div_ceil(4) <= 100);
+    assert!(report.entries.iter().all(|entry| entry.opencode_parity
+        && entry.claude_parity
+        && entry.package_parity.get("codex") == Some(&true)
+        && entry.package_parity.get("antigravity") == Some(&true)));
 }
 
 #[test]

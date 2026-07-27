@@ -4,8 +4,8 @@ This bootstrap is mandatory for every nontrivial project task. Before any
 filesystem, grep, glob, shell, web, or broad repository tool:
 
 1. Call the connected Eliot MCP tool `eliot_host_session_status`.
-2. Call OpenCode's `skill` tool with `eliot-understanding` for analysis or
-   `eliot-task-cycle` for implementation/resumption.
+2. Call OpenCode's `skill` tool with `eliot-work` for implementation/resumption,
+   `eliot-recover` for failures, and `eliot-finish` before completion.
 3. Follow that loaded skill: resolve project identity, read current truth before
    recall, and expand only exact Eliot handles before broad search.
 4. Recover daemon identity only from `eliot_runtime_status` and bounded autonomy

@@ -124,16 +124,18 @@ tool catalog.
 
 ### Codex
 
-Codex uses MCP plus shared and project-specific skills/instructions. ELIOT does
-not claim or ship a Codex plugin. Global shared skills live in the shared MCP
-workspace; project truth remains in this repository.
+Codex uses the native `plugin/eliot-governor` package with one MCP registration,
+four canonical Part-E skills, and secondary lifecycle hooks. Global shared
+skills remain in the shared MCP workspace; project truth remains in this
+repository.
 
 ### Antigravity
 
 Antigravity uses its official plugin schema/lifecycle and an ELIOT MCP entry in
 the GUI configuration. Doctor requires the installed official plugin surfaces,
-schema validity, visible ELIOT agent/rules/skill, and an existing executable in
-the live MCP registration. Old generated pseudo-plugin/skill bundles are not a
+schema validity, four hash-current skills, rules, no custom main-agent
+dependency, and an existing executable in the live MCP registration. Old
+generated pseudo-plugin/skill bundles are not a
 supported product surface.
 
 ### OpenCode

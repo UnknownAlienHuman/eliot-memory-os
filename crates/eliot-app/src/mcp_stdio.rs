@@ -229,11 +229,51 @@ use work::*;
 pub(crate) use catalog::claude_surface_catalog;
 use catalog::{prompt_definitions, prompt_get, tool_definitions_for_profile};
 
+pub(crate) fn part_e_surface_report(profile: &str) -> Result<Value> {
+    let profile = McpAccessProfile::parse(profile)?;
+    if !matches!(
+        profile,
+        McpAccessProfile::CodexWorker
+            | McpAccessProfile::ClaudeGoverned
+            | McpAccessProfile::DynamicAgent
+            | McpAccessProfile::ExternalAuditor
+    ) {
+        anyhow::bail!("Part-E report requires a bounded cognitive profile");
+    }
+    let tools = tool_definitions_for_profile(profile);
+    let entries = tools
+        .iter()
+        .map(|tool| {
+            let name = tool.get("name").and_then(Value::as_str).unwrap_or_default();
+            let description = tool
+                .get("description")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            json!({
+                "name": name,
+                "description_ul_tokens": description.chars().count().div_ceil(4),
+            })
+        })
+        .collect::<Vec<_>>();
+    let combined_ul_tokens = tools
+        .iter()
+        .filter_map(|tool| tool.get("description").and_then(Value::as_str))
+        .map(|description| description.chars().count().div_ceil(4))
+        .sum::<usize>();
+    Ok(json!({
+        "profile": profile.as_str(),
+        "tool_count": tools.len(),
+        "combined_description_ul_tokens": combined_ul_tokens,
+        "tools": entries,
+    }))
+}
+
 const GOVERNED_TOOLS: &[&str] = &[
     "eliot_task_contract_create",
     "eliot_task_state",
     "eliot_task_action_request",
     "eliot_task_observation_record",
+    "eliot_write_cognitive_observation",
     "eliot_agent_candidate_submit",
     "eliot_task_verification_run",
     "eliot_host_session_status",
@@ -435,29 +475,26 @@ const BOUND_PROJECT_DEFAULT_TOOLS: &[&str] = &[
     "eliot_experience_recall",
     "eliot_experience_reinstate",
     "eliot_agent_candidate_submit",
+    "eliot_write_cognitive_observation",
 ];
 
 const BOUND_TASK_DEFAULT_TOOLS: &[&str] = &[
     "eliot_task_state",
     "eliot_compile_packet_l3",
     "eliot_agent_candidate_submit",
+    "eliot_write_cognitive_observation",
 ];
 
 const BOUND_PROJECT_ALIAS_DEFAULT_TOOLS: &[&str] = &["eliot_skill_list"];
 
-const CLAUDE_DESKTOP_TOOLS: &[&str] = &[
-    "eliot_host_session_status",
-    "eliot_project_identity",
-    "eliot_task_state",
+const PART_E_WORKER_TOOLS: &[&str] = &[
     "eliot_current_state",
     "eliot_recall_l0",
     "eliot_fetch_l2",
     "eliot_compile_packet_l3",
-    "eliot_memory_influence_trace",
     "eliot_agent_candidate_submit",
-    "eliot_agent_delegate",
-    "eliot_agent_result",
-    "eliot_agent_result_disposition",
+    "eliot_memory_influence_trace",
+    "eliot_write_cognitive_observation",
 ];
 
 const OPERATOR_TOOLS: &[&str] = &[
@@ -482,17 +519,6 @@ const OPERATOR_TOOLS: &[&str] = &[
     "eliot_canonical_status",
     "eliot_worktree_review",
 ];
-
-fn is_canonical_control_mutation(name: &str) -> bool {
-    matches!(
-        name,
-        "eliot_trace_completeness"
-            | "eliot_replay_run"
-            | "eliot_sleep_run"
-            | "eliot_meta_experiment_run"
-            | "eliot_meta_experiment_disposition"
-    )
-}
 
 fn require_canonical_controller_authority(state: &McpState) -> Result<()> {
     if !matches!(
@@ -570,44 +596,11 @@ impl McpAccessProfile {
                     | "eliot_fetch_l2"
             ),
             Self::CognitiveGovernor | Self::HostGovernor | Self::CognitiveControl => false,
-            Self::DynamicAgent => {
-                GOVERNED_TOOLS.contains(&name)
-                    && !is_canonical_control_mutation(name)
-                    && !matches!(
-                        name,
-                        "eliot_agent_result_finalize"
-                            | "eliot_autonomy_contract_write"
-                            | "eliot_autonomy_approval_request"
-                            | "eliot_autonomy_runtime_action"
-                            | "eliot_worktree_review"
-                    )
-            }
+            Self::DynamicAgent
+            | Self::ClaudeGoverned
+            | Self::CodexWorker
+            | Self::ExternalAuditor => PART_E_WORKER_TOOLS.contains(&name),
             Self::CodexController => GOVERNED_TOOLS.contains(&name),
-            Self::ClaudeGoverned => CLAUDE_DESKTOP_TOOLS.contains(&name),
-            Self::CodexWorker => {
-                GOVERNED_TOOLS.contains(&name)
-                    && !is_canonical_control_mutation(name)
-                    && !matches!(
-                        name,
-                        "eliot_agent_result_finalize"
-                            | "eliot_submit_completion_proof"
-                            | "eliot_patch_apply"
-                            | "eliot_delegate_review"
-                            | "eliot_worktree_review"
-                            | "eliot_autonomy_contract_write"
-                            | "eliot_autonomy_approval_request"
-                            | "eliot_autonomy_runtime_action"
-                    )
-            }
-            Self::ExternalAuditor => {
-                READ_ONLY_TOOLS.contains(&name)
-                    || matches!(
-                        name,
-                        "eliot_agent_candidate_submit"
-                            | "eliot_agent_result"
-                            | "eliot_memory_influence_trace"
-                    )
-            }
             Self::Verifier => READ_ONLY_TOOLS.contains(&name),
             Self::HumanOperator => OPERATOR_TOOLS.contains(&name),
             Self::HumanReadonly => {
@@ -2477,6 +2470,16 @@ struct TaskObservationToolInput {
     diagnostic_before: Vec<String>,
     #[serde(default)]
     diagnostic_after: Vec<String>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CognitiveObservationToolInput {
+    project_id: String,
+    task_id: String,
+    #[serde(default)]
+    write_id: Option<String>,
+    payload: Value,
 }
 
 #[derive(serde::Deserialize)]

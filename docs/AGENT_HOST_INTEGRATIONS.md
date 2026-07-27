@@ -14,10 +14,10 @@ and host labels are not role evidence.
 
 The portable skill pack contains exactly four skills:
 
-- `eliot-task-cycle`
-- `eliot-understanding`
-- `eliot-delegation`
-- `eliot-verify-finish`
+- `eliot-work`
+- `eliot-remember`
+- `eliot-recover`
+- `eliot-finish`
 
 Canonical skill bodies live in `integrations/agent-skills`. Generated host copies
 must remain byte-identical.
@@ -26,7 +26,7 @@ must remain byte-identical.
 
 | Host | Product integration | Installation authority |
 |---|---|---|
-| Codex | Project MCP plus shared/project skills and repository instructions; there is no ELIOT Codex plugin | Codex MCP configuration and skill roots |
+| Codex | Native ELIOT plugin with one MCP server, four canonical skills, and bounded lifecycle hooks | Codex plugin lifecycle and MCP configuration |
 | Antigravity | Official ELIOT plugin plus a governed MCP registration | Antigravity plugin directory and GUI MCP config |
 | OpenCode | Additive JSONC configuration, lifecycle plugin, four skills | Governor ownership manifest |
 | Claude Code | Official local-marketplace plugin with MCP, hooks, and four skills | `claude plugin` lifecycle |

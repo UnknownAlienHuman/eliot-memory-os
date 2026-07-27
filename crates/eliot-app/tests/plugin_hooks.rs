@@ -101,13 +101,14 @@ fn plugin_hooks_use_rust_binary_not_python_node() -> TestResult {
 }
 
 #[test]
-fn plugin_skills_exist() {
-    for skill in [
-        "eliot-task-cycle",
-        "eliot-understanding",
-        "eliot-delegation",
-        "eliot-verify-finish",
-    ] {
+fn plugin_skills_exist() -> TestResult {
+    let expected = [
+        "eliot-work",
+        "eliot-remember",
+        "eliot-recover",
+        "eliot-finish",
+    ];
+    for skill in expected {
         assert!(
             plugin_root()
                 .join("skills")
@@ -117,6 +118,56 @@ fn plugin_skills_exist() {
             "{skill} is missing"
         );
     }
+    let active = fs::read_dir(plugin_root().join("skills"))?
+        .filter_map(Result::ok)
+        .filter(|entry| entry.path().join("SKILL.md").is_file())
+        .filter_map(|entry| entry.file_name().to_str().map(str::to_owned))
+        .collect::<Vec<_>>();
+    assert_eq!(active.len(), expected.len());
+    assert!(
+        expected
+            .iter()
+            .all(|name| active.iter().any(|item| item == name))
+    );
+    Ok(())
+}
+
+#[test]
+fn hooks_cannot_create_model_owned_candidate_or_influence_records() -> TestResult {
+    let hook_files = [
+        plugin_root().join("hooks/hooks.json"),
+        repo_root().join("plugin/eliot-governor/hooks/hooks.json"),
+    ];
+    for path in hook_files {
+        let text = fs::read_to_string(&path)?;
+        let lowered = text.to_ascii_lowercase();
+        for forbidden in [
+            "eliot_agent_candidate_submit",
+            "eliot_memory_influence_trace",
+            "candidate_submit",
+            "influence_trace",
+        ] {
+            assert!(
+                !lowered.contains(forbidden),
+                "{} lets a hook own {forbidden}",
+                path.display()
+            );
+        }
+    }
+
+    let runtime = runtime_for("hook-cognition-boundary");
+    run_hook_with_runtime(
+        &runtime,
+        "post-tool-use",
+        &json!({"tool_name":"Bash","result":"failed fixture"}),
+    )?;
+    let pending = runtime.join("hook-spool/pending");
+    for entry in fs::read_dir(pending)?.filter_map(Result::ok) {
+        let text = fs::read_to_string(entry.path())?.to_ascii_lowercase();
+        assert!(!text.contains("candidate_submit"));
+        assert!(!text.contains("influence_trace"));
+    }
+    Ok(())
 }
 
 #[test]

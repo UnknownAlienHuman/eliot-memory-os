@@ -649,18 +649,12 @@ fn project_identity_accepts_stable_labels_and_normalizes_windows_paths() -> Resu
 #[test]
 fn external_auditor_initialize_instructions_make_memory_proactive() {
     let instructions = profile_instructions(McpAccessProfile::ExternalAuditor);
-    assert!(instructions.contains("For every nontrivial project task"));
-    assert!(instructions.contains("eliot_project_identity"));
-    assert!(instructions.contains("eliot_recall_l0"));
-    assert!(instructions.contains("eliot_agent_candidate_submit"));
-    assert!(instructions.contains("governor_bound_scope_active"));
-    assert!(instructions.contains("PROJECT_SCOPE_MISMATCH"));
-    assert!(instructions.contains("a bound session may omit project_id/task_id"));
-    assert!(instructions.contains("recall-only or status-only task needs no handoff write"));
-    assert!(instructions.contains("all three array fields"));
-    assert!(instructions.contains("do not call CodeCortex"));
-    assert!(instructions.contains("candidate evidence only"));
-    assert!(!instructions.contains("antigravity-auditor"));
+    assert!(instructions.contains("Context arrives by itself"));
+    assert!(instructions.contains("ul_boot"));
+    assert!(instructions.contains("frame_stub"));
+    assert!(instructions.contains("matching negative memory"));
+    assert!(instructions.contains("Host identity grants no controller"));
+    assert!(instructions.contains("model writes remain evidence"));
 }
 
 #[test]
@@ -682,19 +676,11 @@ fn claude_desktop_profile_is_compact_and_role_neutral() -> Result<()> {
         .iter()
         .filter_map(|tool| tool.get("name").and_then(Value::as_str))
         .collect::<Vec<_>>();
-    assert_eq!(names.len(), CLAUDE_DESKTOP_TOOLS.len());
-    assert!(names.contains(&"eliot_host_session_status"));
-    assert!(names.contains(&"eliot_compile_packet_l3"));
-    assert!(names.contains(&"eliot_agent_candidate_submit"));
-    assert!(names.contains(&"eliot_memory_influence_trace"));
-    assert!(names.contains(&"eliot_agent_delegate"));
-    assert!(names.contains(&"eliot_agent_result_disposition"));
-    assert!(!names.contains(&"eliot_patch_apply"));
-    assert!(!names.contains(&"eliot_antigravity_request"));
-    assert!(names.len() <= 12);
+    assert_eq!(names.len(), PART_E_WORKER_TOOLS.len());
+    assert!(PART_E_WORKER_TOOLS.iter().all(|name| names.contains(name)));
     let instructions = profile_instructions(profile);
-    assert!(instructions.contains("host identity grants no controller"));
-    assert!(instructions.contains("compact profile intentionally omits direct patch"));
+    assert!(instructions.contains("Host identity grants no controller"));
+    assert!(instructions.contains("Context arrives by itself"));
     assert!(!instructions.contains("You are an external_auditor"));
     Ok(())
 }
@@ -1630,7 +1616,7 @@ fn canonical_mutation_authority_is_controller_or_operator_only() {
         assert!(!McpAccessProfile::DynamicAgent.allows(tool));
         assert!(!McpAccessProfile::HumanReadonly.allows(tool));
     }
-    assert!(McpAccessProfile::CodexWorker.allows("eliot_canonical_status"));
+    assert!(!McpAccessProfile::CodexWorker.allows("eliot_canonical_status"));
     assert!(McpAccessProfile::HumanReadonly.allows("eliot_canonical_status"));
 }
 
@@ -2590,7 +2576,7 @@ fn l13_curation_preview_classifies_only_explicit_reversible_findings() {
     }
 
     assert!(READ_ONLY_TOOLS.contains(&"eliot_memory_curation_preview"));
-    assert!(McpAccessProfile::ExternalAuditor.allows("eliot_memory_curation_preview"));
+    assert!(!McpAccessProfile::ExternalAuditor.allows("eliot_memory_curation_preview"));
     assert!(memory_lifecycle_tool_definitions().iter().any(|tool| {
         tool.get("name").and_then(Value::as_str) == Some("eliot_memory_curation_preview")
     }));

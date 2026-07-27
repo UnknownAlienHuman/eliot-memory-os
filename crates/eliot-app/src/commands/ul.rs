@@ -7,6 +7,10 @@ struct UlMiningInput {
 
 #[derive(Debug, clap::Subcommand)]
 pub enum UlCommand {
+    Doctor {
+        #[arg(long)]
+        host: UlDoctorHostArg,
+    },
     MineGit {
         #[arg(long)]
         project: ProjectId,
@@ -53,6 +57,256 @@ pub enum UlCommand {
         #[command(subcommand)]
         command: UlCrossAgentCommand,
     },
+}
+
+#[derive(Clone, Copy, Debug, clap::ValueEnum)]
+pub enum UlDoctorHostArg {
+    Codex,
+    Claude,
+    Antigravity,
+}
+
+impl UlDoctorHostArg {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Codex => "codex",
+            Self::Claude => "claude",
+            Self::Antigravity => "antigravity",
+        }
+    }
+
+    fn profile(self) -> &'static str {
+        match self {
+            Self::Codex => "codex_worker",
+            Self::Claude => "claude_governed",
+            Self::Antigravity => "dynamic_agent",
+        }
+    }
+}
+
+// The static doctor intentionally keeps the host matrix and exact PASS/FIX
+// rendering together so adding a check cannot silently omit one host.
+#[allow(clippy::too_many_lines, clippy::print_stdout)]
+pub fn run_ul_doctor(host: UlDoctorHostArg) -> Result<()> {
+    let root = repo_root();
+    let mut checks = Vec::<(&str, bool, String)>::new();
+    let surface = mcp_stdio::part_e_surface_report(host.profile())?;
+    let tools = surface
+        .get("tools")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let exact_names = [
+        "eliot_current_state",
+        "eliot_recall_l0",
+        "eliot_fetch_l2",
+        "eliot_compile_packet_l3",
+        "eliot_agent_candidate_submit",
+        "eliot_memory_influence_trace",
+        "eliot_write_cognitive_observation",
+    ];
+    let names = tools
+        .iter()
+        .filter_map(|tool| tool.get("name").and_then(Value::as_str))
+        .collect::<BTreeSet<_>>();
+    checks.push((
+        "part-e-tool-list",
+        names == exact_names.into_iter().collect(),
+        format!(
+            "use exact seven-tool profile in {}",
+            root.join("crates/eliot-app/src/mcp_stdio.rs").display()
+        ),
+    ));
+    checks.push((
+        "description-budget",
+        surface
+            .get("combined_description_ul_tokens")
+            .and_then(Value::as_u64)
+            .is_some_and(|tokens| tokens <= 900)
+            && tools.iter().all(|tool| {
+                tool.get("description_ul_tokens")
+                    .and_then(Value::as_u64)
+                    .is_some_and(|tokens| tokens <= 90)
+            }),
+        format!(
+            "shorten Part-E descriptions in {}",
+            root.join("crates/eliot-app/src/mcp_stdio/catalog.rs")
+                .display()
+        ),
+    ));
+
+    let skills = SkillPackService.lint(&root)?;
+    let host_parity = skills.entries.iter().all(|entry| match host {
+        UlDoctorHostArg::Codex => entry.package_parity.get("codex") == Some(&true),
+        UlDoctorHostArg::Claude => entry.claude_parity,
+        UlDoctorHostArg::Antigravity => {
+            entry.package_parity.get("antigravity") == Some(&true)
+        }
+    });
+    checks.push((
+        "canonical-skills",
+        skills.valid && skills.skill_count == 4 && host_parity,
+        format!(
+            "run `just sync-skills` from {}",
+            root.display()
+        ),
+    ));
+
+    match host {
+        UlDoctorHostArg::Codex => {
+            let package = root.join("plugin/eliot-governor");
+            checks.push((
+                "plugin-package",
+                package.join(".codex-plugin/plugin.json").is_file(),
+                format!(
+                    "restore {}",
+                    package.join(".codex-plugin/plugin.json").display()
+                ),
+            ));
+            checks.push((
+                "single-registration",
+                mcp_server_matches(
+                    &package.join(".mcp.json"),
+                    "eliot",
+                    "eliot-governor.exe",
+                    &["mcp", "stdio", "--profile", "codex_controller"],
+                ),
+                format!(
+                    "keep one `eliot` entry with codex_controller in {}",
+                    package.join(".mcp.json").display()
+                ),
+            ));
+            checks.push(hook_check(&package.join("hooks/hooks.json")));
+        }
+        UlDoctorHostArg::Claude => {
+            let package = root.join("integrations/claude/eliot");
+            checks.push((
+                "plugin-package",
+                package.join(".claude-plugin/plugin.json").is_file(),
+                format!(
+                    "restore {}",
+                    package.join(".claude-plugin/plugin.json").display()
+                ),
+            ));
+            checks.push((
+                "single-registration",
+                mcp_server_matches(
+                    &package.join(".mcp.json"),
+                    "eliot",
+                    "${CLAUDE_PLUGIN_ROOT}/bin/eliot-governor.exe",
+                    &[
+                        "mcp",
+                        "stdio",
+                        "--host",
+                        "claude",
+                        "--instance",
+                        "default",
+                    ],
+                ),
+                format!("keep one supported `eliot` entry in {}", package.join(".mcp.json").display()),
+            ));
+            checks.push(hook_check(&package.join("hooks/hooks.json")));
+        }
+        UlDoctorHostArg::Antigravity => {
+            let package = root.join("plugin/eliot-antigravity-official");
+            let manifest_valid = read_json_file(&package.join("plugin.json")).is_some_and(|value| {
+                value.get("$schema").and_then(Value::as_str)
+                    == Some("https://antigravity.google/schemas/v1/plugin.json")
+                    && value
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .is_some_and(|name| !name.trim().is_empty())
+            });
+            checks.push((
+                "plugin-package",
+                manifest_valid,
+                format!("repair {}", package.join("plugin.json").display()),
+            ));
+            checks.push((
+                "single-registration",
+                !package.join("mcp_config.json").exists(),
+                format!(
+                    "delete plugin-owned {}; keep MCP in the supported host config",
+                    package.join("mcp_config.json").display()
+                ),
+            ));
+            checks.push((
+                "no-custom-agent",
+                !contains_named_file(&package.join("agents"), "agent.md"),
+                format!("remove custom main agents from {}", package.join("agents").display()),
+            ));
+        }
+    }
+
+    for (name, passed, fix) in checks {
+        if passed {
+            println!("PASS {} {}", host.as_str(), name);
+        } else {
+            println!("FIX {} {}: {}", host.as_str(), name, fix);
+        }
+    }
+    Ok(())
+}
+
+fn hook_check(path: &Path) -> (&'static str, bool, String) {
+    let valid = std::fs::read_to_string(path).ok().is_some_and(|text| {
+        let lower = text.to_ascii_lowercase();
+        text.contains("SessionStart")
+            && text.contains("PreToolUse")
+            && text.contains("PreCompact")
+            && text.contains("Stop")
+            && !lower.contains("eliot_agent_candidate_submit")
+            && !lower.contains("eliot_memory_influence_trace")
+    });
+    (
+        "hooks-boundary",
+        valid,
+        format!("restore bounded lifecycle hooks in {}", path.display()),
+    )
+}
+
+fn mcp_server_matches(path: &Path, key: &str, command: &str, args: &[&str]) -> bool {
+    read_json_file(path)
+        .and_then(|value| value.get("mcpServers").cloned())
+        .and_then(|servers| {
+            (servers.as_object().map(serde_json::Map::len) == Some(1))
+                .then(|| servers.get(key).cloned())
+                .flatten()
+        })
+        .is_some_and(|server| {
+            server.get("command").and_then(Value::as_str) == Some(command)
+                && server
+                    .get("args")
+                    .and_then(Value::as_array)
+                    .is_some_and(|actual| {
+                        actual
+                            .iter()
+                            .filter_map(Value::as_str)
+                            .eq(args.iter().copied())
+                    })
+        })
+}
+
+fn read_json_file(path: &Path) -> Option<Value> {
+    serde_json::from_slice(&std::fs::read(path).ok()?).ok()
+}
+
+fn contains_named_file(root: &Path, expected: &str) -> bool {
+    std::fs::read_dir(root)
+        .ok()
+        .into_iter()
+        .flatten()
+        .filter_map(std::result::Result::ok)
+        .any(|entry| {
+            let path = entry.path();
+            if path.is_file() {
+                path.file_name().is_some_and(|name| name == expected)
+            } else if path.is_dir() {
+                contains_named_file(&path, expected)
+            } else {
+                false
+            }
+        })
 }
 
 #[derive(Debug, clap::Subcommand)]

@@ -33,7 +33,7 @@ pub(super) fn prompt_definitions() -> Vec<Value> {
             "Delegate or accept one bounded, role-leased Eliot work item.",
         ),
         prompt_definition(
-            "eliot-verify-finish",
+            "eliot-finish",
             "Verify current artifacts and submit an honest completion proof.",
         ),
     ]
@@ -91,7 +91,7 @@ fn prompt_text(name: &str, task: &str) -> Result<String> {
         "eliot-delegate" => format!(
             "For {task}, confirm that delegation has positive value and that the current session has the required task-scoped role. Delegate one bounded work item with exact acceptance, packet refs, expected result, verifier, leases, and an idempotency key; reconcile unknown outcomes before retrying."
         ),
-        "eliot-verify-finish" => format!(
+        "eliot-finish" => format!(
             "For {task}, read exact finish gaps, run mapped verifiers against the accepted artifact scope, account for every acceptance item, and submit CompletionProof with the honest status. A model response is candidate evidence, not a verifier."
         ),
         other => anyhow::bail!("unknown Eliot prompt: {other}"),
@@ -1053,8 +1053,22 @@ pub(super) fn task_tool_definitions() -> Vec<Value> {
         tool(
             "eliot_agent_candidate_submit",
             "Eliot Agent Candidate Submit",
-            "Save a reusable claim, decision, or failure. Needs statement and expected_reuse_note; cue bindings can be derived from touched paths.",
+            "Save a lesson/decision/failure to memory. Use after solving anything non-obvious or failing. Needs: statement, kind, expected_reuse_note (bindings auto from your session). Returns: handle.",
             &agent_candidate_schema(),
+        ),
+        tool(
+            "eliot_write_cognitive_observation",
+            "Eliot Write Cognitive Observation",
+            "Record a tool/test observation (errors, diagnostics). Use on notable failures. Needs: payload. Returns: receipt; may trigger ul_fired on next call.",
+            &json_schema(
+                &[
+                    ("project_id", "string"),
+                    ("task_id", "string"),
+                    ("write_id", "string"),
+                    ("payload", "object"),
+                ],
+                &["payload"],
+            ),
         ),
         tool(
             "eliot_task_verification_run",
@@ -1083,7 +1097,7 @@ pub(super) fn core_tool_definitions() -> Vec<Value> {
         tool(
             "eliot_current_state",
             "Eliot Current State",
-            "Return verified, supported, weak, contested, and do-not-use memory state. For a pre-registered control experiment, scope=memory_free_control retains only the revision fence and excludes every reusable or historical memory item.",
+            "Project memory snapshot + revision. Use at doubt about current truth. Needs: nothing. Returns: verified/contested claims, revision fence.",
             &json_schema(
                 &[
                     ("project_id", "string"),
@@ -1096,7 +1110,7 @@ pub(super) fn core_tool_definitions() -> Vec<Value> {
         tool(
             "eliot_recall_l0",
             "Eliot Recall L0",
-            "Search memory by keywords when pushed UL context is insufficient. Needs query. Returns handles and previews.",
+            "Search memory by keywords. Use when you need knowledge NOT already injected (ul_boot/ul_fired). Needs: query (plain words). Returns: handles + one-liners.",
             &json_schema(
                 &[
                     ("project_id", "string"),
@@ -1110,7 +1124,7 @@ pub(super) fn core_tool_definitions() -> Vec<Value> {
         tool(
             "eliot_fetch_l2",
             "Eliot Fetch L2",
-            "Fetch exact atoms and relation neighborhood for selected handles.",
+            "Expand memory handles to full cards. Use only for handles you will act on. Needs: handles[]. Returns: cards + relations.",
             &json_schema(
                 &[
                     ("project_id", "string"),
@@ -1124,7 +1138,7 @@ pub(super) fn core_tool_definitions() -> Vec<Value> {
         tool(
             "eliot_compile_packet_l3",
             "Eliot Compile Packet L3",
-            "Compile task context and a complete frame_stub before material work. Needs goal; task/project may be session-bound.",
+            "Task context packet + prefilled frame_stub. Use BEFORE any material edit. Needs: goal (task_id auto). Returns: packet, frame_stub (edit <=5 fields), verifier, ul_gate.",
             &compile_packet_schema(),
         ),
         tool(
@@ -1136,7 +1150,7 @@ pub(super) fn core_tool_definitions() -> Vec<Value> {
         tool(
             "eliot_memory_influence_trace",
             "Eliot Memory Influence Trace",
-            "Acknowledge memory use. Minimal form: memory_handle, influence_class, and downstream_outcome_ref when it changed action.",
+            "Acknowledge memory you used. Minimal form: memory_handle, influence_class[, downstream_outcome_ref]. Server fills the rest. Returns: receipt.",
             &memory_influence_trace_schema(),
         ),
         tool(

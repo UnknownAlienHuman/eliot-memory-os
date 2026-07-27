@@ -1,0 +1,14 @@
+{
+  "mcpServers": {
+    "eliot": {
+      "type": "stdio",
+      "command": "eliot-governor.exe",
+      "args": [
+        "mcp",
+        "stdio",
+        "--profile",
+        "codex_controller"
+      ]
+    }
+  }
+}

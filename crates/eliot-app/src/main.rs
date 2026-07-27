@@ -1956,6 +1956,7 @@ async fn dispatch_command(
             command: GraphCommand::Health,
         } => commands::run_graph_health(config).await,
         Command::Ul { command } => match command {
+            commands::UlCommand::Doctor { host } => commands::run_ul_doctor(host),
             commands::UlCommand::MineGit { project, root } => {
                 commands::run_ul_mine_git(config, project, &root).await
             }
