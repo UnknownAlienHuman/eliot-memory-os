@@ -1633,6 +1633,54 @@ mod tests {
         command
     }
 
+    fn managed_cmd(script_name: &str, cwd: &std::path::Path) -> std::process::Command {
+        let comspec = std::env::var_os("ComSpec").expect("ComSpec");
+        let mut command = std::process::Command::new(comspec);
+        command
+            .args(["/D", "/C", script_name])
+            .current_dir(cwd)
+            .env_clear();
+        for name in ["SystemRoot", "WINDIR", "ComSpec"] {
+            if let Some(value) = std::env::var_os(name) {
+                command.env(name, value);
+            }
+        }
+        command
+    }
+
+    fn is_post_terminate_pipe_closure(error: &std::io::Error) -> bool {
+        matches!(error.raw_os_error(), Some(31 | 109 | 232 | 233))
+    }
+
+    fn accept_post_terminate_pipe_closure(
+        stage: &str,
+        result: std::io::Result<usize>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        match result {
+            Ok(_) => Ok(()),
+            Err(error) if is_post_terminate_pipe_closure(&error) => Ok(()),
+            Err(error) => Err(std::io::Error::new(
+                error.kind(),
+                format!("{stage}: unexpected read error: {error}"),
+            )
+            .into()),
+        }
+    }
+
+    #[test]
+    fn post_terminate_pipe_closure_classifier_is_exact() {
+        for code in [31, 109, 232, 233] {
+            assert!(is_post_terminate_pipe_closure(
+                &std::io::Error::from_raw_os_error(code)
+            ));
+        }
+        for code in [5, 6, 87] {
+            assert!(!is_post_terminate_pipe_closure(
+                &std::io::Error::from_raw_os_error(code)
+            ));
+        }
+    }
+
     #[test]
     fn credential_manager_round_trip_is_current_user_scoped() -> std::io::Result<()> {
         struct CredentialCleanup(String);
@@ -1995,23 +2043,59 @@ mod tests {
             root.join("child.cmd"),
             "@echo off\r\n\"%SystemRoot%\\System32\\ping.exe\" -n 30 127.0.0.1 >NUL\r\n",
         )?;
-        let script = "$info = New-Object System.Diagnostics.ProcessStartInfo; $info.FileName = $env:ComSpec; $info.Arguments = '/D /C child.cmd'; $info.UseShellExecute = $false; $info.CreateNoWindow = $true; $process = [System.Diagnostics.Process]::Start($info); $process.Dispose(); Write-Output root";
-        let mut child = SuspendedJobChild::spawn(&managed_powershell(script, &root))?;
+        fs::write(
+            root.join("root.cmd"),
+            "@echo off\r\nstart \"\" /B \"%ComSpec%\" /D /C child.cmd\r\necho root\r\n",
+        )?;
+        let mut child = SuspendedJobChild::spawn(&managed_cmd("root.cmd", &root))?;
         let mut stdout = child.take_stdout().ok_or("stdout")?;
         let mut stderr = child.take_stderr().ok_or("stderr")?;
-        // Setup, not the assertion under test: this only waits for PowerShell
-        // to start and exit. A cold CI runner takes well over five seconds to
-        // do that, and treating slow startup as a job-object failure made the
-        // test report the wrong defect. The bound that matters is the one
-        // below -- that terminate closes the inherited pipes promptly.
-        assert_eq!(child.wait_timeout(Duration::from_secs(60))?, Some(0));
+        let root_started = Instant::now();
+        assert_eq!(child.wait_timeout(Duration::from_secs(5))?, Some(0));
+        assert!(root_started.elapsed() < Duration::from_secs(2));
+        assert!(
+            child
+                .job_processes()?
+                .iter()
+                .any(|process| process.pid != child.id()),
+            "root exited without leaving a live descendant in the Job Object"
+        );
+
+        let (stdout_tx, stdout_rx) = std::sync::mpsc::channel();
+        let stdout_reader = std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            let result = stdout.read_to_end(&mut bytes);
+            let _ = stdout_tx.send((result, bytes));
+        });
+        let (stderr_tx, stderr_rx) = std::sync::mpsc::channel();
+        let stderr_reader = std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            let result = stderr.read_to_end(&mut bytes);
+            let _ = stderr_tx.send((result, bytes));
+        });
+        assert!(matches!(
+            stdout_rx.recv_timeout(Duration::from_millis(500)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        ));
+        assert!(matches!(
+            stderr_rx.recv_timeout(Duration::from_millis(500)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        ));
+
         let started = Instant::now();
         child.terminate(37)?;
-        let mut stdout_bytes = Vec::new();
-        let mut stderr_bytes = Vec::new();
-        stdout.read_to_end(&mut stdout_bytes)?;
-        stderr.read_to_end(&mut stderr_bytes)?;
+        let (stdout_result, stdout_bytes) = stdout_rx.recv_timeout(Duration::from_secs(2))?;
+        accept_post_terminate_pipe_closure("stdout drain after terminate", stdout_result)?;
+        let remaining = Duration::from_secs(2).saturating_sub(started.elapsed());
+        let (stderr_result, _) = stderr_rx.recv_timeout(remaining)?;
+        accept_post_terminate_pipe_closure("stderr drain after terminate", stderr_result)?;
         assert!(started.elapsed() < Duration::from_secs(2));
+        stdout_reader
+            .join()
+            .map_err(|_| std::io::Error::other("stdout reader panicked"))?;
+        stderr_reader
+            .join()
+            .map_err(|_| std::io::Error::other("stderr reader panicked"))?;
         assert!(String::from_utf8(stdout_bytes)?.contains("root"));
         Ok(())
     }
