@@ -223,11 +223,48 @@ function Read-NextestSummary {
     }
 }
 
+function Get-BoundedRedactedText {
+    param(
+        [AllowEmptyString()]
+        [Parameter(Mandatory)][string]$Text,
+        [AllowNull()][string]$Secret,
+        [ValidateRange(1, 1048576)]
+        [int]$MaxBytes = 65536
+    )
+
+    $redacted = $Text
+    if (-not [string]::IsNullOrEmpty($Secret)) {
+        $redacted = $redacted.Replace($Secret, '[redacted-owned-test-secret]')
+    }
+    $bytes = [Text.Encoding]::UTF8.GetBytes($redacted)
+    $truncated = $bytes.Length -gt $MaxBytes
+    if ($truncated) {
+        $redacted = [Text.Encoding]::UTF8.GetString(
+            $bytes,
+            $bytes.Length - $MaxBytes,
+            $MaxBytes
+        )
+        $bytes = [Text.Encoding]::UTF8.GetBytes($redacted)
+    }
+    [pscustomobject]@{
+        text = $redacted
+        bytes = $bytes.Length
+        truncated = $truncated
+    }
+}
+
 if (-not $ownedPrefix.StartsWith($tempBase, [StringComparison]::OrdinalIgnoreCase)) {
     throw "isolated test root must descend from TEMP: $ownedRoot"
 }
 if ($lower.Contains('onedrive') -or $lower.Contains('programdata')) {
     throw "isolated test root crossed a forbidden host boundary: $ownedRoot"
+}
+$resolvedEvidenceLog = $null
+if (-not [string]::IsNullOrWhiteSpace($EvidenceLogPath)) {
+    $resolvedEvidenceLog = [IO.Path]::GetFullPath($EvidenceLogPath)
+    if ($resolvedEvidenceLog.StartsWith($ownedPrefix, [StringComparison]::OrdinalIgnoreCase)) {
+        throw 'evidence log path must remain outside the run-owned cleanup root'
+    }
 }
 
 $ambientLocalAppData = [Environment]::GetEnvironmentVariable('LOCALAPPDATA', 'Process')
@@ -316,6 +353,10 @@ $boundedFailureExercised = $false
 $secretReparseChecked = $false
 $secretAclRestricted = $false
 $terminalError = $null
+$terminalErrorDetail = $null
+$nextestFailureExcerptBytes = 0
+$nextestFailureExcerptTruncated = $false
+$password = $null
 try {
     New-Item -ItemType Directory -Force `
         (Split-Path $configPath), `
@@ -590,14 +631,6 @@ exit 42
         $testExit = 96
     }
     $nextestLogHash = (Get-FileHash -LiteralPath $nextestLog -Algorithm SHA256).Hash.ToLowerInvariant()
-    if (-not [string]::IsNullOrWhiteSpace($EvidenceLogPath)) {
-        $resolvedEvidenceLog = [IO.Path]::GetFullPath($EvidenceLogPath)
-        if ($resolvedEvidenceLog.StartsWith($ownedPrefix, [StringComparison]::OrdinalIgnoreCase)) {
-            throw 'evidence log path must remain outside the run-owned cleanup root'
-        }
-        New-Item -ItemType Directory -Force (Split-Path $resolvedEvidenceLog) | Out-Null
-        Copy-Item -LiteralPath $nextestLog -Destination $resolvedEvidenceLog -Force
-    }
     if ($testExit -ne 0) {
         $boundedFailureExercised = $true
     }
@@ -607,6 +640,8 @@ catch {
     if ($null -eq $terminalError) {
         $terminalError = 'wrapper_exception'
     }
+    $detail = Get-BoundedRedactedText -Text $_.Exception.Message -Secret $password -MaxBytes 4096
+    $terminalErrorDetail = $detail.text
     $testExit = 97
 }
 finally {
@@ -666,6 +701,39 @@ finally {
     }
     if ($guardianBuildProcess) {
         Stop-ExactOwnedProcess $guardianBuildProcess 'guardian_build' $cleanupFailures $processReceipts
+    }
+    try {
+        $evidenceParts = [Collections.Generic.List[string]]::new()
+        if (Test-Path -LiteralPath $nextestLog -PathType Leaf) {
+            $evidenceParts.Add((Get-Content -LiteralPath $nextestLog -Raw))
+        }
+        if (-not [string]::IsNullOrWhiteSpace($terminalErrorDetail)) {
+            $evidenceParts.Add("wrapper_error: $terminalErrorDetail")
+        }
+        $evidence = Get-BoundedRedactedText `
+            -Text ($evidenceParts -join [Environment]::NewLine) `
+            -Secret $password
+        if ($null -ne $resolvedEvidenceLog) {
+            New-Item -ItemType Directory -Force (Split-Path $resolvedEvidenceLog) | Out-Null
+            [IO.File]::WriteAllText(
+                $resolvedEvidenceLog,
+                $evidence.text,
+                [Text.UTF8Encoding]::new($false)
+            )
+        }
+        if ($testExit -ne 0 -and $evidence.bytes -gt 0) {
+            $nextestFailureExcerptBytes = $evidence.bytes
+            $nextestFailureExcerptTruncated = $evidence.truncated
+            [Console]::Error.WriteLine($evidence.text.TrimEnd())
+        }
+    }
+    catch {
+        $boundedFailureExercised = $true
+        $terminalError = 'evidence_publication_failed'
+        $detail = Get-BoundedRedactedText -Text $_.Exception.Message -Secret $password -MaxBytes 4096
+        $terminalErrorDetail = $detail.text
+        $testExit = 97
+        [Console]::Error.WriteLine('isolated test evidence publication failed')
     }
     foreach ($name in $savedEnvironment.Keys) {
         [Environment]::SetEnvironmentVariable($name, $savedEnvironment[$name], 'Process')
@@ -740,8 +808,12 @@ $report = [ordered]@{
     nextest_timed_out = $nextestTimedOut
     nextest_terminal_summary = $nextestSummary
     nextest_log_sha256 = $nextestLogHash
+    nextest_failure_excerpt_bytes = $nextestFailureExcerptBytes
+    nextest_failure_excerpt_truncated = $nextestFailureExcerptTruncated
+    evidence_log_path = if ($null -eq $resolvedEvidenceLog) { $null } else { $resolvedEvidenceLog.Replace('\', '/') }
     child_exit_code = $childExit
     terminal_error = $terminalError
+    terminal_error_detail = $terminalErrorDetail
     host_configuration_changes = 0
     workspace_test_exit_code = $testExit
 }

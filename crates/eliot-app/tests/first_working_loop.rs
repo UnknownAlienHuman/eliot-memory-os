@@ -136,6 +136,12 @@ fn fwl_static_safety_boundaries_hold() -> TestResult {
     assert!(isolated_tests.contains("$env:ELIOT_TEST_SURREAL_PASSWORD_FILE = $passwordConfigPath"));
     assert!(isolated_tests.contains("Remove-ExactOwnedSecretRoot"));
     assert!(isolated_tests.contains(".eliot-test-owner.json"));
+    assert!(isolated_tests.contains("[redacted-owned-test-secret]"));
+    assert!(isolated_tests.contains("nextest_failure_excerpt_bytes"));
+    assert!(isolated_tests.contains("[Console]::Error.WriteLine($evidence.text.TrimEnd())"));
+    assert!(
+        isolated_tests.contains("evidence log path must remain outside the run-owned cleanup root")
+    );
     assert!(!isolated_tests.contains("Remove-Item -LiteralPath $secretTestsRoot -Recurse"));
 
     let mcp_stdio = include_str!("../src/mcp_stdio.rs");

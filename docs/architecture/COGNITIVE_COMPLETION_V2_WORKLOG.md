@@ -582,6 +582,58 @@ green.
   credentials into the user store. The exact C3 test then passed 1/1 in
   14,035 ms end to end (11.94 seconds test body), and isolated Credential
   Manager records remained exactly 0 before and after the test.
+- The next immutable run, `cognitive-field-40b0d7a`, prepared in 11.3 seconds
+  with zero provider calls. A first private provider-plan generation stopped
+  before dispatch because the new run root lacked its verified Codex binary
+  copy. After copying the prior exact-hash binary
+  (`39e9e041...6ef3`), generation produced 24 capped calls plus four smokes;
+  calls JSON SHA-256 is `ec9426a8...e27ca`. No model was called.
+- Its deterministic `workspace-verify` passed in 407,480 ms. The live receipts
+  also passed: context packets 2,131 ms, memory retrieval 19,296 ms, lifecycle
+  2,129 ms, and writer recovery 2,033 ms. R01 ran as exactly one process tree,
+  remained CPU-active with an approximately 350-440 MiB isolated SurrealDB
+  working set, and terminated without timeout or orphan after 2,179,092 ms
+  (36.3 minutes) with nextest exit 100.
+- The R01 wrapper retained only the terminal summary (`0 passed, 1 failed`).
+  Guardian metadata proved that 10,747 stderr bytes existed inside the owned
+  temporary root, but `run-isolated-tests.ps1` removed that root before the
+  optional evidence path had been used. The outer verifier stderr was empty.
+  Therefore no lost seed, L0, or L2 metric is reported or inferred as an
+  observed result.
+- This repeated long-test blocker was escalated once to Claude Code with
+  explicit `claude-opus-5`, high effort, plan mode, read-only Read/Grep/Glob,
+  and a strict empty MCP config. The first-party response was successful:
+  session `2fbf68f1-a243-4224-987e-ac8256447196`, 21 turns, 412,938 ms,
+  31,640 output tokens, no web search, and USD 2.090176 reported by the CLI.
+  Opus confirmed the evidence-publication defect and identified a separate
+  source-provable fixture bug: the first needle claim was included in the
+  5,000 history IDs and then replaced through `UPSERT ... CONTENT` before the
+  test queried its old statement.
+- Local source verification accepted both findings. The bounded fix now
+  publishes a redacted, 64-KiB-tail-bounded failure excerpt to hash-bound
+  stderr before exact cleanup, optionally writes the same redacted evidence
+  outside the cleanup root, and receipts byte/truncation/path/detail fields.
+  Passing batches remain silent. R01 now excludes ordinal zero from historical
+  updates and has a fast regression for the exact history-selection boundary.
+  Corpus size, 75/150 ms SLOs, scan cap, provider isolation, and cleanup were
+  not weakened.
+- Focused harness evidence:
+  - failure probe: expected exit 41 in 2,062 ms, 68-byte stderr and external
+    evidence with the same SHA-256 as the merged nextest log;
+  - success probe: exit 0 in 1,974 ms, zero-byte stderr with SHA-256
+    `e3b0c442...b855`, zero failure excerpt;
+  - retained-descendant probe: expected exit 42 in 2,013 ms, excerpt retained,
+    all process receipts stopped, exact roots removed;
+  - harness-security PASS (provider calls zero and exact cleanup preserved);
+  - real-nextest empty filter: expected exit 4 in 3,433 ms, 521-byte bounded
+    excerpt / 474-byte captured stderr, exact roots removed;
+  - fixture regression PASS in 1,342 ms and app/store test Clippy PASS in
+    924 ms.
+- An attempted execution of the ignored `fwl_static_safety_boundaries_hold`
+  body stopped in 389 ms because its provisioned first-working-loop recipe was
+  absent. This is the test's declared environment precondition, not an
+  acceptance result; static anchors still compile and the directly exercised
+  security probes cover the changed harness behavior.
 
 ## Logging rule
 

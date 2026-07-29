@@ -17,6 +17,24 @@ const BATCH_SIZE: usize = 1_000;
 const HISTORICAL_VERSIONS: usize = 5_000;
 const SAMPLE_COUNT: usize = 25;
 
+fn should_capture_historical_claim(ordinal: usize, captured: usize) -> bool {
+    ordinal != 0 && captured < HISTORICAL_VERSIONS
+}
+
+#[test]
+fn r01_history_fixture_keeps_the_search_needle_immutable() {
+    assert!(!should_capture_historical_claim(0, 0));
+    assert!(should_capture_historical_claim(4, 0));
+    assert!(should_capture_historical_claim(
+        20_000,
+        HISTORICAL_VERSIONS - 1
+    ));
+    assert!(!should_capture_historical_claim(
+        20_004,
+        HISTORICAL_VERSIONS
+    ));
+}
+
 fn isolated_config() -> Option<SurrealServerConfig> {
     let endpoint = std::env::var("ELIOT_TEST_SURREAL_ENDPOINT").ok()?;
     let bind = std::env::var("ELIOT_TEST_SURREAL_BIND").ok()?;
@@ -59,7 +77,7 @@ async fn r01_large_corpus_retrieval_meets_target_workstation_slos() -> Result<()
             } else {
                 format!("r01 claim distractor batch {batch:03} ordinal {ordinal:06}")
             };
-            if historical_claims.len() < HISTORICAL_VERSIONS {
+            if should_capture_historical_claim(ordinal, historical_claims.len()) {
                 historical_claims.push(claim_id);
             }
             claims.push(ClaimCardInput {
