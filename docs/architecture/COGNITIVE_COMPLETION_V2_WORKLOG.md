@@ -635,6 +635,74 @@ green.
   acceptance result; static anchors still compile and the directly exercised
   security probes cover the changed harness behavior.
 
+## Terminal R01 diagnostic and blocked handoff
+
+- Commit `94af919` was tested with one final, exact R01 diagnostic under
+  `%LOCALAPPDATA%\Eliot\cognitive-field\diagnostics\r01-94af919`. The wrapper
+  used an external evidence path, one owned process tree, the unchanged
+  100,000-record / 5,000-history / four-kind fixture, 25 samples, and the
+  unchanged 75/150 ms SLOs.
+- The diagnostic ended `FAILED_VERIFIER`, not timeout, after nextest reported
+  2,569.350 seconds (42.82 minutes). Seeding took 76,218 ms. The exact result
+  was:
+  - warm L0 p95 `93058.839 ms` versus `75 ms` (`1240.78452x` over);
+  - small L2 p95 `237.4652 ms` versus `150 ms` (`1.58310x` over).
+- All owned process receipts were stopped, temporary and secret roots were
+  removed, and cleanup failures/pending lists were empty. The retained
+  evidence is 10,880 bytes with SHA-256
+  `84c623da4b882339d95fa2fb12a355d47eafe8271461c25705ad9d5d0467f764`.
+  Wrapper stderr is 10,821 bytes with SHA-256
+  `2f4fc0c2d9420c2e444ba435a5185d8ab162b81e8c91e1993f2f84c0df6944a9`;
+  stdout is 2,194 bytes with SHA-256
+  `ec764c1cce829d60a6229ce4e4d228a2ef3b46bc4d8f6d4e5787297db4e3dbf7`.
+- This is a product/architecture performance failure on the requested Ryzen 9
+  9950X host with fast memory, not host RAM exhaustion. The certification task
+  intentionally did not weaken the SLO, corpus, sampling, scan cap, or query
+  semantics and did not expand into an open-ended retrieval optimization.
+- The contract order therefore stopped before provider-plan sealing. No
+  Worker/Reader/Judge certification calls, Antigravity cognitive-field calls,
+  grade, PR, merge, or CI were performed or claimed. The earlier explicit
+  `claude-opus-5` call remains a read-only engineering consultation, not a
+  certification provider call.
+
+## Eliot durable writeback
+
+- The first atomic write attempt safely rolled back because the live
+  `task_contract` schema requires `acceptance`, `expected_artifacts`, `goal`,
+  `non_goals`, and object `scope`; no partial records were left.
+- The schema-aligned retry committed and exact readback confirmed one blocked
+  task contract, one contract source snapshot, three evidence atoms, one
+  verified blocking claim, one verification run, five initial failure
+  fingerprints, one trace span, one context packet, and one each of
+  `supports`, `verified_by`, `belongs_to`, and `produces`.
+- The repository `graph_health.surql` could not run unchanged against the live
+  global Eliot schema: it references absent `produced_by` and
+  `invalidated_by` relation tables and would also query absent `scope_head`;
+  the live relation is `produces`. This tooling/schema drift was recorded as a
+  sixth failure fingerprint. A bounded equivalent over the live tables passed
+  in 1.356 ms with zero orphan, weak, contested, or duplicate-write findings.
+- Inbox sources are
+  `.eliot/inbox/20260729T123511Z-cognitive-completion-v2-blocked.surql` and
+  `.eliot/inbox/20260729T124426Z-graph-health-schema-drift.surql`. They remain
+  untracked project-local state and are not part of the Git commit.
+- The final 339-line / 23,107-byte report was written to
+  `reports/cognitive-field/COGNITIVE_COMPLETION_V2_BLOCKED_REPORT_20260729.md`
+  with SHA-256
+  `8f691e07215f8ad61171b1841c2f82d499632f8a31dac5979fd8a525028c079c`.
+  A third inbox write added this report as
+  `evidence_atom:cognitive_completion_v2_blocked_report_20260729`; exact
+  readback confirmed its checksum and a typed record reference in the context
+  packet.
+
+## Final disposition
+
+- Product implementation through the C6 harness is committed on
+  `codex/cognitive-completion-v2`, but the master package is not certified.
+- Terminal state is `BLOCKED / FAILED_VERIFIER` at R01. The next honest work
+  package is a bounded retrieval/query performance investigation followed by
+  exactly one unchanged R01 rerun. Only after that gate passes may the sealed
+  provider sequence resume.
+
 ## Logging rule
 
 For each next step, record:
