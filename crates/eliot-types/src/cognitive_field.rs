@@ -1,4 +1,4 @@
-use crate::{ProjectId, TaskId};
+use crate::{AgentHostId, ProjectId, TaskId};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -15,6 +15,13 @@ pub const COGNITIVE_DETERMINISTIC_EVIDENCE_SCHEMA_VERSION: &str =
     "eliot-cognitive-deterministic-evidence-v1";
 pub const COGNITIVE_FIELD_CONTRACT_SCHEMA_VERSION: &str = "eliot-cognitive-field-contract-v1";
 pub const COGNITIVE_FIELD_PLAN_SCHEMA_VERSION: &str = "eliot-cognitive-field-plan-v1";
+pub const COGNITIVE_FIELD_PROVIDER_PLAN_SCHEMA_VERSION: &str =
+    "eliot-cognitive-field-provider-plan-v1";
+pub const COGNITIVE_FIELD_PROVIDER_EVIDENCE_SCHEMA_VERSION: &str =
+    "eliot-cognitive-field-provider-evidence-v1";
+pub const COGNITIVE_FIELD_PROVIDER_PROJECTION_SCHEMA_VERSION: &str =
+    "eliot-cognitive-field-provider-projection-v1";
+pub const COGNITIVE_FIELD_WORKER_SCHEMA_VERSION: &str = "eliot-cognitive-worker-result-v1";
 pub const COGNITIVE_FIELD_MAX_PROVIDER_CALLS: u8 = 24;
 
 #[derive(
@@ -335,6 +342,146 @@ pub struct CognitiveDeterministicEvidenceReceipt {
     pub truth_revision_after_observability: String,
 }
 
+#[derive(Clone, Debug, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CognitiveFieldExecutionKey {
+    pub case_id: String,
+    pub memory_condition: CognitiveMemoryCondition,
+}
+
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CognitiveFieldProviderCallPlan {
+    pub call_number: u8,
+    pub call_id: String,
+    pub role: CognitiveFieldRole,
+    #[schemars(with = "String")]
+    pub host: AgentHostId,
+    pub requested_model: String,
+    pub expected_provider_executable_sha256: String,
+    pub prompt_ref: String,
+    pub prompt_sha256: String,
+    pub provider_smoke: bool,
+    pub counts_against_cap: bool,
+    pub executions: Vec<CognitiveFieldExecutionKey>,
+}
+
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CognitiveFieldProviderPlan {
+    pub schema_version: String,
+    pub run_id: String,
+    pub contract_hash: String,
+    pub calls: Vec<CognitiveFieldProviderCallPlan>,
+    pub planned_provider_calls: u8,
+    pub planned_smoke_calls: u8,
+    pub plan_hash: String,
+    #[schemars(with = "String")]
+    #[serde(with = "time::serde::rfc3339")]
+    pub sealed_at: OffsetDateTime,
+}
+
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CognitiveWorkerResult {
+    pub schema_version: String,
+    pub case_id: String,
+    pub project_id: ProjectId,
+    pub task_id: TaskId,
+    pub memory_condition: CognitiveMemoryCondition,
+    pub simulated: bool,
+    pub work_summary: String,
+    pub current_truth_refs: Vec<String>,
+    pub observation_refs: Vec<String>,
+    pub verifier_refs: Vec<String>,
+    pub failure_refs: Vec<String>,
+    pub decision_refs: Vec<String>,
+    pub memory_handles_used: Vec<String>,
+    pub influence_receipt_refs: Vec<String>,
+    pub next_state_ref: String,
+}
+
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CognitiveFieldProviderOutputReceipt {
+    pub execution: CognitiveFieldExecutionKey,
+    pub output_path: String,
+    pub output_sha256: String,
+}
+
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+#[allow(clippy::struct_excessive_bools)]
+pub struct CognitiveFieldProviderEvidenceReceipt {
+    pub schema_version: String,
+    pub run_id: String,
+    pub contract_hash: String,
+    pub provider_plan_hash: String,
+    pub source_commit: String,
+    pub call_id: String,
+    pub role: CognitiveFieldRole,
+    #[schemars(with = "String")]
+    pub host: AgentHostId,
+    pub requested_model: String,
+    pub resolved_model: String,
+    pub provider_session_id: String,
+    pub provider_receipt_ref: String,
+    pub provider_executable: String,
+    pub provider_executable_sha256: String,
+    pub prompt_path: String,
+    pub prompt_sha256: String,
+    pub raw_stdout_path: String,
+    pub raw_stdout_sha256: String,
+    pub raw_stderr_path: String,
+    pub raw_stderr_sha256: String,
+    pub outputs: Vec<CognitiveFieldProviderOutputReceipt>,
+    pub provider_calls: u8,
+    pub exit_code: i32,
+    pub elapsed_ms: u64,
+    pub timed_out: bool,
+    pub unknown_outcome: bool,
+    pub controller_substitution: bool,
+    pub oracle_exposed: bool,
+    pub worker_transcript_exposed: bool,
+    pub read_only: bool,
+}
+
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CognitiveFieldProviderOutputProjection {
+    pub execution: CognitiveFieldExecutionKey,
+    pub output_sha256: String,
+}
+
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CognitiveFieldProviderProjection {
+    pub schema_version: String,
+    pub run_id: String,
+    pub contract_hash: String,
+    pub provider_plan_hash: String,
+    pub source_commit: String,
+    pub call_id: String,
+    pub role: CognitiveFieldRole,
+    #[schemars(with = "String")]
+    pub host: AgentHostId,
+    pub requested_model: String,
+    pub resolved_model: String,
+    pub provider_session_id: String,
+    pub provider_receipt_ref: String,
+    pub provider_executable_sha256: String,
+    pub prompt_sha256: String,
+    pub raw_stdout_sha256: String,
+    pub raw_stderr_sha256: String,
+    pub outputs: Vec<CognitiveFieldProviderOutputProjection>,
+    pub provider_smoke: bool,
+    pub counts_against_cap: bool,
+    pub elapsed_ms: u64,
+    #[schemars(with = "String")]
+    #[serde(with = "time::serde::rfc3339")]
+    pub recorded_at: OffsetDateTime,
+}
+
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CognitiveFieldValidationReport {
@@ -421,6 +568,10 @@ pub fn cognitive_understanding_answer_schema() -> Result<Value, serde_json::Erro
 
 pub fn cognitive_judge_result_schema() -> Result<Value, serde_json::Error> {
     serde_json::to_value(schemars::schema_for!(CognitiveJudgeResult))
+}
+
+pub fn cognitive_worker_result_schema() -> Result<Value, serde_json::Error> {
+    serde_json::to_value(schemars::schema_for!(CognitiveWorkerResult))
 }
 
 pub fn minimal_cognitive_understanding_answer() -> CognitiveUnderstandingAnswer {

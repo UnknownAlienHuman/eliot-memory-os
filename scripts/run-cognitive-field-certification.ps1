@@ -1,12 +1,14 @@
 [CmdletBinding()]
 param(
-    [ValidateSet('Prepare', 'Deterministic', 'Grade', 'All')]
+    [ValidateSet('Prepare', 'Deterministic', 'SealProviderPlan', 'RecordProvider', 'Grade', 'All')]
     [string]$Mode = 'All',
     [string]$RunId,
     [string]$SecondRepository = $env:ELIOT_COGNITIVE_SECOND_REPO,
     [string]$ReportRoot,
     [string]$PrivateRoot,
     [string]$Governor,
+    [string]$ProviderCalls,
+    [string[]]$ProviderReceipt = @(),
     [ValidateRange(60, 7200)]
     [int]$TestTimeoutSeconds = 3600
 )
@@ -294,6 +296,38 @@ if ($Mode -in @('Prepare', 'All')) {
 }
 if ($Mode -in @('Deterministic', 'All')) {
     Invoke-DeterministicCorpus
+}
+if ($Mode -in @('SealProviderPlan', 'All')) {
+    if ([string]::IsNullOrWhiteSpace($ProviderCalls)) {
+        if ($Mode -eq 'SealProviderPlan') {
+            throw 'SealProviderPlan requires -ProviderCalls.'
+        }
+    }
+    else {
+        Invoke-Governor @(
+            'cognitive-field', 'seal-provider-plan',
+            '--report-root', $ReportRoot,
+            '--private-root', $PrivateRoot,
+            '--calls', ([IO.Path]::GetFullPath($ProviderCalls))
+        )
+    }
+}
+if ($Mode -in @('RecordProvider', 'All')) {
+    if ($ProviderReceipt.Count -eq 0) {
+        if ($Mode -eq 'RecordProvider') {
+            throw 'RecordProvider requires at least one -ProviderReceipt.'
+        }
+    }
+    else {
+        foreach ($receipt in $ProviderReceipt) {
+            Invoke-Governor @(
+                'cognitive-field', 'record-provider',
+                '--report-root', $ReportRoot,
+                '--private-root', $PrivateRoot,
+                '--receipt', ([IO.Path]::GetFullPath($receipt))
+            )
+        }
+    }
 }
 if ($Mode -in @('Grade', 'All')) {
     & $script:GovernorPath cognitive-field grade --report-root $ReportRoot --private-root $PrivateRoot

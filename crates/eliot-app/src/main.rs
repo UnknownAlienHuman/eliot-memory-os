@@ -1672,6 +1672,24 @@ enum CognitiveFieldCommand {
         #[arg(long)]
         receipt: PathBuf,
     },
+    SealProviderPlan {
+        #[arg(long)]
+        report_root: PathBuf,
+        #[arg(long)]
+        private_root: PathBuf,
+        /// Private JSON array of exact provider calls.
+        #[arg(long)]
+        calls: PathBuf,
+    },
+    RecordProvider {
+        #[arg(long)]
+        report_root: PathBuf,
+        #[arg(long)]
+        private_root: PathBuf,
+        /// Private provider-owned invocation receipt.
+        #[arg(long)]
+        receipt: PathBuf,
+    },
     Grade {
         #[arg(long)]
         report_root: PathBuf,
@@ -2287,6 +2305,16 @@ fn dispatch_cognitive_field_command(command: CognitiveFieldCommand) -> Result<()
             &memory_condition,
             &receipt,
         ),
+        CognitiveFieldCommand::SealProviderPlan {
+            report_root,
+            private_root,
+            calls,
+        } => cognitive_field_runner::seal_provider_plan(&report_root, &private_root, &calls),
+        CognitiveFieldCommand::RecordProvider {
+            report_root,
+            private_root,
+            receipt,
+        } => cognitive_field_runner::record_provider(&report_root, &private_root, &receipt),
         CognitiveFieldCommand::Grade {
             report_root,
             private_root,

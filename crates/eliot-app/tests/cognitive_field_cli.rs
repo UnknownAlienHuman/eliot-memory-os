@@ -22,6 +22,7 @@ fn cognitive_field_cli_validates_the_exact_suite_and_publishes_schemas() -> Resu
     assert_eq!(report["model_backed_case_count"], 18);
 
     for (kind, title) in [
+        ("worker", "CognitiveWorkerResult"),
         ("reader", "CognitiveUnderstandingAnswer"),
         ("judge", "CognitiveJudgeResult"),
     ] {
@@ -51,6 +52,8 @@ fn cognitive_field_help_exposes_validation_preparation_recording_and_grade() -> 
         "schema",
         "prepare",
         "record-deterministic",
+        "seal-provider-plan",
+        "record-provider",
         "grade",
     ] {
         assert!(help.contains(command), "missing cognitive-field {command}");

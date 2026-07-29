@@ -390,6 +390,68 @@ green.
   separate 18-call OpenCode/Antigravity contract and cannot be silently reused
   as field-v2 evidence. Rust LSP reported the field files as unlinked from its
   current workspace; Cargo metadata and verifiers remain the source of truth.
+- Added a field-v2-specific sealed provider plan instead of weakening or
+  silently reinterpreting the older runner. Every call now binds an exact
+  call number/id, isolated role, host, explicit versioned requested model,
+  provider-executable SHA-256, private prompt path/hash, smoke/cap policy, and
+  the exact case/condition executions it may produce. The validator requires
+  complete Worker/Reader/Judge coverage exactly once, four separately
+  accounted provider smokes, and no more than 24 non-smoke calls.
+- Added provider-owned evidence receipts and sanitized per-role projections.
+  Import now fails closed on alias/resolved-model mismatch, binary or prompt
+  drift, source movement, timeout/unknown/controller substitution, multiple
+  provider calls, nonzero exit, missing read-only role proof, oracle exposure
+  outside Judge, Worker-transcript exposure, duplicate sessions/receipts,
+  output-set drift, memory in a control execution, or missing M08 influence
+  evidence. Worker, Reader, and Judge outputs are typed and bound to the same
+  deterministic execution; the grader no longer accepts unproven loose
+  `reader.json`/`judge.json` files.
+- Added `cognitive-field seal-provider-plan`, `record-provider`, the Worker
+  schema, and resumable PowerShell `SealProviderPlan`/`RecordProvider` modes.
+  A constructed complete plan contains 23 capped calls plus four provider
+  smokes and passed its first focused gate 1/1 in 50.373 seconds end to end.
+  The provider envelope and plan gate passed 2/2 in 14.676 seconds.
+- The first provider-importer compile attempt stopped after 3.141 seconds
+  because a fixture replacement targeted the wrong similarly named receipt;
+  no runtime evidence was accepted. After correcting the fixture binding, the
+  end-to-end importer passed 1/1 in 19.233 seconds (0.09-second test body) and
+  proved that only a sanitized, output-hash-bound Reader projection enters the
+  report tree.
+- Parallel provider-grader and CLI gates passed 3/3 in 26.911 seconds and 2/2
+  in 56.028 seconds. The first provider-layer clippy run stopped after 99.267
+  seconds on two bounded orchestration-size lints and one needless
+  `drop` of a non-`Drop` value. Two narrow function-level allowances and
+  removal of the needless drop produced a 16.260-second clippy pass.
+- A post-implementation secret-boundary review found that exact provider
+  binding alone did not scan the raw receipt, prompt, stdout, stderr, and
+  structured output for common credential forms. Added zero-tolerance scans
+  before parsing or publishing any of them. The resulting clippy run passed in
+  8.165 seconds, provider tests passed 3/3 in 12.281 seconds, and CLI tests
+  passed 2/2 in 12.506 seconds. The PowerShell orchestrator parser reported
+  zero errors across 2,079 tokens.
+- The first negative grade against the older `cognitive-field-04b18c7` sealed
+  run exposed a Windows path-identity defect: `fs::canonicalize` produced a
+  verbatim `\\?\C:\...` path while the contract stored slash-normalized
+  `C:/...`, so the command failed before grading. Canonical identities now
+  strip the Windows verbatim prefix while legacy contract hashes remain
+  readable. A dedicated regression passed 1/1 in 0.00 seconds test time and
+  0.6 seconds end to end.
+- Two verifier-command corrections were required after the connection resumed:
+  `eliot-app` has no library target (2.1 seconds), and its binary is
+  `eliot-governor`, not `eliot` (0.5 seconds). Both were pre-test command
+  errors, not product failures. The corrected provider-filter run passed
+  13/13 in 13.7 seconds end to end.
+- The repaired negative grade completed its evidence aggregation in 14.2
+  seconds and then returned the expected nonzero
+  `MECHANISMS_COMPLETE_FIELD_CERTIFICATION_BLOCKED`: 61/61 model executions
+  remain absent, zero provider calls were consumed, and neither a provider
+  plan nor provider evidence was falsely inferred from the old run.
+- Added a checked-in isolated `CodexWorker` prompt with explicit no-oracle,
+  no-self-grading, no-invented-evidence, control-isolation, and secret-boundary
+  rules. Zero-provider prepare now scans it together with the Reader prompt,
+  Reader schema, and public suite for every private oracle value. The final
+  focused CLI gate passed 2/2 and focused all-target clippy passed with
+  warnings denied in 24.4 seconds total.
 
 ## Logging rule
 
