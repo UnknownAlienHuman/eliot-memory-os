@@ -331,6 +331,7 @@ fn report() -> CodeCortexReport {
         repo_root: repo_root().display().to_string(),
         git_head: Some("d2-test-head".to_owned()),
         dirty: false,
+        scope_binding: eliot_types::CodeCortexScopeBinding::default(),
         tracked_files: file_evidence.clone(),
         workspace_members: vec!["eliot-app".to_owned(), "eliot-engine".to_owned()],
         crates: vec!["eliot-app".to_owned(), "eliot-engine".to_owned()],

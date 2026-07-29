@@ -76,6 +76,7 @@ fn t04_auto_bind_uses_touched_path() -> TestResult {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)]
 fn t04_minimal_ack_derives_full_trace() -> TestResult {
     let _guard = test_guard();
     if rerun_with_credential_gate("t04_minimal_ack_derives_full_trace")? {
@@ -106,7 +107,28 @@ fn t04_minimal_ack_derives_full_trace() -> TestResult {
     assert!(
         packet["exact_handles"]
             .as_array()
-            .is_some_and(|handles| handles.iter().any(|candidate| candidate == &json!(handle)))
+            .is_some_and(|handles| handles.iter().any(|candidate| candidate == &json!(handle))),
+        "exact handle missing; exact_handles={:?}; budget={}; project_understanding_bytes={}",
+        packet["exact_handles"],
+        packet["token_budget_report"],
+        serde_json::to_vec(&packet["project_understanding"])?.len()
+    );
+    assert!(
+        packet["codecortex"].is_null(),
+        "claim-only evidence contract must not auto-attach CodeCortex"
+    );
+    assert_eq!(
+        packet["project_understanding"]["causal_model"]["hops"]
+            .as_array()
+            .map(Vec::len),
+        Some(6)
+    );
+    assert!(
+        packet["token_budget_report"]["estimated_tokens"]
+            .as_u64()
+            .is_some_and(|estimated| estimated <= 1_200),
+        "budget report must remain bounded: {}",
+        packet["token_budget_report"]
     );
 
     let response = harness.client.tool_call(
@@ -289,7 +311,7 @@ fn create_treatment_task(
             "task_id": control_task_id,
             "goal": "reserve the deterministic memory-free control arm",
             "candidate_handles": [],
-            "max_tokens": 500
+            "max_tokens": 1200
         }),
     )?;
     let treatment_task_id = TaskId::new_v7();

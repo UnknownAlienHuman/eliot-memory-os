@@ -782,6 +782,7 @@ fn report(repo_root: &str, git_head: Option<String>) -> CodeCortexReport {
         repo_root: repo_root.to_owned(),
         git_head,
         dirty: false,
+        scope_binding: eliot_types::CodeCortexScopeBinding::default(),
         tracked_files: vec![file.clone()],
         workspace_members: vec![repo_root.to_owned()],
         crates: vec!["fixture".to_owned()],

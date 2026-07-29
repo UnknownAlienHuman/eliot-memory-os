@@ -1079,6 +1079,7 @@ fn report(repo_root: &Path) -> TestResult<CodeCortexReport> {
         repo_root: repo_root.display().to_string(),
         git_head: Some(git_head(repo_root)?),
         dirty: false,
+        scope_binding: eliot_types::CodeCortexScopeBinding::default(),
         tracked_files: vec![evidence.clone()],
         workspace_members: vec![repo_root.display().to_string()],
         crates: vec!["worktree-lease-test-fixture".to_owned()],

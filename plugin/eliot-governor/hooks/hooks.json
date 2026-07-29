@@ -64,6 +64,22 @@
         ]
       }
     ],
+    "PostCompact": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "eliot-governor.exe",
+            "args": [
+              "hook",
+              "post-compact"
+            ],
+            "timeout": 10,
+            "async": true
+          }
+        ]
+      }
+    ],
     "Stop": [
       {
         "hooks": [

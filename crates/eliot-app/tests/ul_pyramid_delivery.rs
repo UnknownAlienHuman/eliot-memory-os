@@ -49,7 +49,7 @@ fn t06_boot_delivers_charter_map_once() -> TestResult {
             "task_id": eliot_types::TaskId::new_v7(),
             "goal": "memory-free control for src/a/lib.rs",
             "candidate_handles": ["file:src/a/lib.rs"],
-            "max_tokens": 800,
+            "max_tokens": 1200,
             "memory_mode": "memory_free_control"
         }),
     )?;
@@ -112,7 +112,17 @@ fn t06_packet_delivers_relevant_capsule() -> TestResult {
         .as_array()
         .ok_or("frame_stub.causal_bridge missing")?;
 
-    assert_eq!(response["ul_understanding"]["coverage"], "covered");
+    assert_eq!(
+        response["ul_understanding"]["coverage"], "blind",
+        "unexpected UL coverage: understanding={} meta={}",
+        response["ul_understanding"], response["ul_meta"]
+    );
+    assert!(
+        response["ul_meta"]["blind_target"]
+            .as_str()
+            .is_some_and(|target| target.starts_with("concept-a-")),
+        "coverage v2 must identify the evidence-thin subsystem without suppressing its capsule"
+    );
     assert!(
         matches!(
             response["memory_confidence"].as_str(),

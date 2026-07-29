@@ -136,7 +136,7 @@ fn t01_packet_content_regression() -> TestResult {
     let _guard = test_guard();
     let mut harness = Harness::start("packet-content")?;
     let (project_id, control_task_id) = harness.create_task(30)?;
-    harness.client.tool_call(
+    let below_floor = harness.client.tool_call_response(
         31,
         "eliot_compile_packet_l3",
         &json!({
@@ -147,10 +147,27 @@ fn t01_packet_content_regression() -> TestResult {
             "max_tokens": 500
         }),
     )?;
-    let task_id = harness.create_task_in_project(32, project_id)?;
+    assert_eq!(below_floor["error"]["code"], -32602);
+    assert_eq!(
+        below_floor["error"]["data"]["code"],
+        "PACKET_FLOOR_EXCEEDS_BUDGET"
+    );
+    assert_eq!(below_floor["error"]["data"]["max_tokens"], 500);
+    harness.client.tool_call(
+        32,
+        "eliot_compile_packet_l3",
+        &json!({
+            "project_id": project_id,
+            "task_id": control_task_id,
+            "goal": "reserve the deterministic memory-free control arm",
+            "candidate_handles": [],
+            "max_tokens": 1200
+        }),
+    )?;
+    let task_id = harness.create_task_in_project(33, project_id)?;
     let write_id = WriteId::new_v7();
     harness.submit_candidate(
-        33,
+        34,
         project_id,
         task_id,
         write_id,
@@ -158,7 +175,7 @@ fn t01_packet_content_regression() -> TestResult {
         "QUARTZ pipeline reads config from quartz.toml",
     )?;
     let packet = harness.client.tool_call(
-        34,
+        35,
         "eliot_compile_packet_l3",
         &json!({
             "project_id": project_id,

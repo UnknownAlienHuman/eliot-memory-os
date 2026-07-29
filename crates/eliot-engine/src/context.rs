@@ -1,3 +1,4 @@
+use crate::project_understanding::ProjectUnderstandingCompiler;
 use crate::task_execution::TaskExecutionClassifier;
 use crate::{
     EngineError, ReadService, SkillActivationContext, SkillCuratorService,
@@ -18,7 +19,7 @@ use eliot_types::{
     TaskId, TokenBudgetReport, TruncationInfo, UnderstandingProof, UnderstandingProofReceipt,
     VerifierArtifactRef, WorkItem, WorkItemStatus, WorkLease, WorkLeaseState,
 };
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::str::FromStr;
 use time::OffsetDateTime;
 
@@ -101,11 +102,22 @@ impl ContextCompiler {
         }
         packet.task_execution_class =
             TaskExecutionClassifier::classify(request, frame, &[], &packet.exact_handles);
-        if packet.task_execution_class.requires_codecortex() {
+        if TaskExecutionClassifier::should_attach_codecortex(
+            request,
+            frame,
+            &[],
+            &packet.task_execution_class,
+        ) {
             attach_codecortex_reports(&mut packet, codecortex_reports);
         }
         hydrate_material_packet(&mut packet, request, current_git_scope, frame);
-        enforce_budget(&mut packet, request.max_tokens)?;
+        packet.project_understanding = Some(ProjectUnderstandingCompiler::compile(
+            &packet,
+            frame,
+            None,
+            &eliot_types::ProjectUnderstandingEvidence::default(),
+        ));
+        enforce_budget(&mut packet, request.max_tokens, &request.candidate_handles)?;
         PacketQualityService::finalize(&mut packet, frame)?;
         Ok(packet)
     }
@@ -139,7 +151,7 @@ impl ContextCompiler {
             &visible_skills,
             skill_context,
         );
-        enforce_budget(&mut packet, request.max_tokens)?;
+        enforce_budget(&mut packet, request.max_tokens, &request.candidate_handles)?;
         Ok(packet)
     }
 
@@ -543,6 +555,7 @@ fn assemble_packet(
         task_id: request.task_id.clone(),
         goal: request.goal.clone(),
         task_execution_class: eliot_types::TaskExecutionClass::default(),
+        project_understanding: None,
         memory_confidence: reads.recall.memory_confidence,
         acceptance_items: Vec::new(),
         at_revision: max_revision(reads.current_state.memory_revision, reads.fetch.at_revision),
@@ -817,7 +830,6 @@ impl PacketQualityService {
             signal_density,
             result,
         };
-        packet.token_budget_report.estimated_tokens = report.estimated_tokens;
         packet.packet_quality = Some(report);
         Ok(())
     }
@@ -860,6 +872,7 @@ fn attach_codecortex_reports(packet: &mut ContextPacketL3, reports: &[CodeCortex
     packet.codecortex = Some(CodeCortexPacketView {
         report_refs: vec![report_ref],
         git_head: report.git_head.clone(),
+        scope_binding: report.scope_binding.clone(),
         file_evidence: report.file_evidence.clone(),
         symbol_evidence: report.symbol_evidence.clone(),
         diagnostic_evidence: report.diagnostic_evidence.clone(),
@@ -1331,29 +1344,54 @@ fn max_revision(left: MemoryRevision, right: MemoryRevision) -> MemoryRevision {
     if left >= right { left } else { right }
 }
 
-fn enforce_budget(packet: &mut ContextPacketL3, max_tokens: usize) -> Result<(), EngineError> {
+fn enforce_budget(
+    packet: &mut ContextPacketL3,
+    max_tokens: usize,
+    required_handles: &[String],
+) -> Result<(), EngineError> {
+    let required_handles = required_handles.iter().collect::<BTreeSet<_>>();
     let mut sections_truncated = Vec::new();
-    let mut estimated = estimate_tokens(packet)?;
-    while estimated > max_tokens && trim_next(packet, &mut sections_truncated) {
-        estimated = estimate_tokens(packet)?;
+    loop {
+        let truncated = !sections_truncated.is_empty();
+        let mut estimated = estimate_tokens(packet)?;
+        for _ in 0..4 {
+            packet.token_budget_report = TokenBudgetReport {
+                max_tokens,
+                estimated_tokens: estimated,
+                truncated,
+                sections_truncated: sections_truncated.clone(),
+            };
+            let next = estimate_tokens(packet)?;
+            if next == estimated {
+                break;
+            }
+            estimated = next;
+        }
+        packet.token_budget_report.estimated_tokens = estimated;
+        let verified_estimate = estimate_tokens(packet)?;
+        if verified_estimate <= max_tokens {
+            packet.token_budget_report.estimated_tokens = verified_estimate;
+            packet.truncation.truncated |= truncated;
+            packet.truncation.returned = packet.exact_handles.len();
+            return Ok(());
+        }
+        if !trim_next(packet, &required_handles, &mut sections_truncated) {
+            return Err(EngineError::PacketFloorExceedsBudget {
+                max_tokens,
+                estimated_tokens: verified_estimate,
+                section_tokens: section_token_accounting(packet)?,
+            });
+        }
     }
-    if estimated > max_tokens {
-        sections_truncated.push("protected_decision_locality_suffix_exceeds_budget".to_owned());
-    }
-    let truncated = !sections_truncated.is_empty();
-    packet.token_budget_report = TokenBudgetReport {
-        max_tokens,
-        estimated_tokens: estimated,
-        truncated,
-        sections_truncated,
-    };
-    packet.truncation.truncated |= truncated;
-    packet.truncation.returned = packet.exact_handles.len();
-    Ok(())
 }
 
-fn trim_next(packet: &mut ContextPacketL3, sections: &mut Vec<String>) -> bool {
-    trim_section(&mut packet.open_questions, "open_questions", sections)
+fn trim_next(
+    packet: &mut ContextPacketL3,
+    required_handles: &BTreeSet<&String>,
+    sections: &mut Vec<String>,
+) -> bool {
+    trim_codecortex(packet, required_handles, sections)
+        || trim_section(&mut packet.open_questions, "open_questions", sections)
         || trim_section(&mut packet.known_decisions, "known_decisions", sections)
         || trim_section(&mut packet.recent_failures, "recent_failures", sections)
         || trim_section(&mut packet.negative_memory, "negative_memory", sections)
@@ -1395,17 +1433,84 @@ fn trim_next(packet: &mut ContextPacketL3, sections: &mut Vec<String>) -> bool {
             sections,
         )
         || trim_section(&mut packet.source_receipts, "source_receipts", sections)
-        || trim_section(&mut packet.exact_handles, "exact_handles", sections)
+        || trim_non_requested_handle(&mut packet.exact_handles, required_handles, sections)
+}
+
+fn trim_codecortex(
+    packet: &mut ContextPacketL3,
+    required_handles: &BTreeSet<&String>,
+    sections: &mut Vec<String>,
+) -> bool {
+    let Some(codecortex) = packet.codecortex.as_mut() else {
+        return false;
+    };
+    if !codecortex.file_evidence.is_empty()
+        || !codecortex.symbol_evidence.is_empty()
+        || !codecortex.diagnostic_evidence.is_empty()
+        || !codecortex.verifier_map.is_empty()
+        || !codecortex.blast_radius.files.is_empty()
+        || !codecortex.blast_radius.crates.is_empty()
+        || !codecortex.blast_radius.reasons.is_empty()
+        || !codecortex.unknowns.is_empty()
+    {
+        codecortex.file_evidence.clear();
+        codecortex.symbol_evidence.clear();
+        codecortex.diagnostic_evidence.clear();
+        codecortex.verifier_map.clear();
+        codecortex.blast_radius.files.clear();
+        codecortex.blast_radius.crates.clear();
+        codecortex.blast_radius.reasons.clear();
+        codecortex.unknowns.clear();
+        push_section(sections, "codecortex.full_to_scope_summary");
+        return true;
+    }
+    if codecortex.git_head.is_some()
+        || codecortex.scope_binding != eliot_types::CodeCortexScopeBinding::default()
+    {
+        codecortex.git_head = None;
+        codecortex.scope_binding = eliot_types::CodeCortexScopeBinding::default();
+        push_section(sections, "codecortex.scope_summary_to_handle");
+        return true;
+    }
+
+    let report_refs = codecortex.report_refs.clone();
+    packet.codecortex = None;
+    packet.exact_handles.retain(|handle| {
+        required_handles.contains(handle)
+            || !report_refs.iter().any(|report_ref| report_ref == handle)
+    });
+    push_section(sections, "codecortex.handle_dropped");
+    true
+}
+
+fn trim_non_requested_handle(
+    handles: &mut Vec<String>,
+    required_handles: &BTreeSet<&String>,
+    sections: &mut Vec<String>,
+) -> bool {
+    let Some(index) = handles
+        .iter()
+        .rposition(|handle| !required_handles.contains(handle))
+    else {
+        return false;
+    };
+    handles.remove(index);
+    push_section(sections, "non_requested_exact_handles");
+    true
 }
 
 fn trim_section<T>(values: &mut Vec<T>, name: &str, sections: &mut Vec<String>) -> bool {
     if values.pop().is_some() {
-        if !sections.iter().any(|section| section == name) {
-            sections.push(name.to_owned());
-        }
+        push_section(sections, name);
         return true;
     }
     false
+}
+
+fn push_section(sections: &mut Vec<String>, name: &str) {
+    if !sections.iter().any(|section| section == name) {
+        sections.push(name.to_owned());
+    }
 }
 
 fn estimate_tokens(packet: &ContextPacketL3) -> Result<usize, EngineError> {
@@ -1414,6 +1519,7 @@ fn estimate_tokens(packet: &ContextPacketL3) -> Result<usize, EngineError> {
     bytes += estimate_serialized_value(&packet.at_revision)?;
     bytes += packet.task_id.len();
     bytes += packet.goal.len();
+    bytes += estimate_serialized_value(&packet.project_understanding)?;
     bytes += estimate_serialized_slice(&packet.acceptance_items)?;
     bytes += estimate_serialized_slice(&packet.current_truth)?;
     bytes += estimate_serialized_slice(&packet.relevant_verified_claims)?;
@@ -1449,6 +1555,48 @@ fn estimate_tokens(packet: &ContextPacketL3) -> Result<usize, EngineError> {
     bytes += estimate_serialized_value(&packet.token_budget_report)?;
     bytes += estimate_serialized_value(&packet.truncation)?;
     Ok(bytes.div_ceil(4))
+}
+
+pub fn refinalize_compiled_packet(
+    packet: &mut ContextPacketL3,
+    frame: Option<&MaterialPacketFrame>,
+    max_tokens: usize,
+    required_handles: &[String],
+) -> Result<(), EngineError> {
+    enforce_budget(packet, max_tokens, required_handles)?;
+    PacketQualityService::finalize(packet, frame)
+}
+
+fn section_token_accounting(
+    packet: &ContextPacketL3,
+) -> Result<BTreeMap<String, usize>, EngineError> {
+    let mut sections = BTreeMap::new();
+    sections.insert(
+        "project_understanding".to_owned(),
+        estimate_serialized_value(&packet.project_understanding)?.div_ceil(4),
+    );
+    sections.insert(
+        "exact_handles".to_owned(),
+        estimate_serialized_slice(&packet.exact_handles)?.div_ceil(4),
+    );
+    sections.insert(
+        "decision_locality_suffix".to_owned(),
+        estimate_serialized_value(&packet.decision_locality_suffix)?.div_ceil(4),
+    );
+    sections.insert(
+        "codecortex".to_owned(),
+        estimate_serialized_value(&packet.codecortex)?.div_ceil(4),
+    );
+    sections.insert(
+        "continuity".to_owned(),
+        (estimate_serialized_slice(&packet.active_plan)?
+            + estimate_serialized_slice(&packet.completed_work)?
+            + estimate_serialized_slice(&packet.killed_paths)?
+            + estimate_serialized_slice(&packet.causal_bridge)?)
+        .div_ceil(4),
+    );
+    sections.insert("whole_packet_estimate".to_owned(), estimate_tokens(packet)?);
+    Ok(sections)
 }
 
 fn estimate_serialized_slice<T: serde::Serialize>(values: &[T]) -> Result<usize, EngineError> {
@@ -1594,7 +1742,10 @@ fn skill_grounding_error(reason: CognitiveGateReason) -> bool {
 #[cfg(test)]
 mod current_git_scope_tests {
     use super::*;
-    use eliot_types::{CausalBridgeHop, ClaimId, ClaimSummary};
+    use eliot_types::{
+        BlastRadiusView, CausalBridgeHop, ClaimId, ClaimSummary, CodeCortexScopeBinding,
+        CodeEvidenceSource, FileEvidence,
+    };
     use serde_json::json;
 
     const BRANCH: &str = "l5-session-b";
@@ -1634,6 +1785,7 @@ mod current_git_scope_tests {
             task_id: "task".to_owned(),
             goal: "resolve current truth".to_owned(),
             task_execution_class: eliot_types::TaskExecutionClass::default(),
+            project_understanding: None,
             memory_confidence: eliot_types::MemoryConfidence::None,
             acceptance_items: Vec::new(),
             at_revision: MemoryRevision::new(1),
@@ -1899,7 +2051,7 @@ mod current_git_scope_tests {
     }
 
     #[test]
-    fn budget_never_trims_decision_locality_suffix() -> Result<(), EngineError> {
+    fn budget_never_trims_decision_locality_suffix() {
         let project_id = eliot_types::ProjectId::new_v7();
         let claim = verified_claim(project_id, BRANCH);
         let mut packet = packet(project_id, &claim);
@@ -1913,15 +2065,69 @@ mod current_git_scope_tests {
         };
         let suffix = packet.decision_locality_suffix.clone();
 
-        enforce_budget(&mut packet, 10)?;
+        let result = enforce_budget(&mut packet, 10, &[]);
 
         assert_eq!(packet.decision_locality_suffix, suffix);
+        assert!(matches!(
+            result,
+            Err(EngineError::PacketFloorExceedsBudget { max_tokens: 10, .. })
+        ));
+    }
+
+    #[test]
+    fn budget_drops_auto_codecortex_before_requested_handles() -> Result<(), EngineError> {
+        let project_id = eliot_types::ProjectId::new_v7();
+        let claim = verified_claim(project_id, BRANCH);
+        let required_handle = claim_handle(&claim);
+        let mut packet = packet(project_id, &claim);
+        let floor_tokens = estimate_tokens(&packet)?;
+        let report_ref = "codecortex_report:task:head:receipt".to_owned();
+        packet.exact_handles.push(report_ref.clone());
+        packet.codecortex = Some(CodeCortexPacketView {
+            report_refs: vec![report_ref],
+            git_head: Some("f".repeat(4_000)),
+            scope_binding: CodeCortexScopeBinding {
+                branch: "branch".repeat(400),
+                commit: "commit".repeat(400),
+                dirty_state_hash: "dirty".repeat(400),
+                adapter_versions: BTreeMap::from([("rg".to_owned(), "version".repeat(400))]),
+                verifier_config_hash: "config".repeat(400),
+            },
+            file_evidence: vec![FileEvidence {
+                path: ARTIFACT.to_owned(),
+                content_hash: Some(ARTIFACT_HASH.to_owned()),
+                line_start: Some(1),
+                line_end: Some(2),
+                excerpt: "evidence".repeat(1_000),
+                source: CodeEvidenceSource::Rg,
+            }],
+            symbol_evidence: Vec::new(),
+            diagnostic_evidence: Vec::new(),
+            verifier_map: Vec::new(),
+            blast_radius: BlastRadiusView {
+                files: vec![ARTIFACT.to_owned()],
+                crates: vec!["eliot-engine".to_owned()],
+                reasons: vec!["test pressure".to_owned()],
+            },
+            unknowns: vec!["unknown".repeat(1_000)],
+        });
+
+        enforce_budget(
+            &mut packet,
+            floor_tokens + 8,
+            std::slice::from_ref(&required_handle),
+        )?;
+
+        assert_eq!(packet.exact_handles, [required_handle]);
+        assert!(packet.codecortex.is_none());
         assert!(
             packet
                 .token_budget_report
                 .sections_truncated
-                .contains(&"protected_decision_locality_suffix_exceeds_budget".to_owned())
+                .iter()
+                .all(|section| section.starts_with("codecortex."))
         );
+        assert!(packet.token_budget_report.estimated_tokens <= floor_tokens + 8);
         Ok(())
     }
 }

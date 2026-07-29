@@ -96,7 +96,16 @@ fn codex_manifest_has_one_mcp_and_discoverable_hooks() -> TestResult {
             "default"
         ]))
     );
-    assert!(package.join("hooks/hooks.json").is_file());
+    let hooks: Value = serde_json::from_slice(&std::fs::read(package.join("hooks/hooks.json"))?)?;
+    for event in [
+        "SessionStart",
+        "PreToolUse",
+        "PostToolUse",
+        "PreCompact",
+        "PostCompact",
+    ] {
+        assert!(hooks.pointer(&format!("/hooks/{event}")).is_some());
+    }
     Ok(())
 }
 

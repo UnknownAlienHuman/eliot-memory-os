@@ -6,8 +6,9 @@ use eliot_engine::{
 use eliot_store::{CanonicalRecord, CanonicalStore};
 use eliot_types::{
     CapsuleFreshness, CausalBridgeHop, ConceptNode, CoverageClass, HotspotScore, ModuleCard,
-    ProjectId, SessionId, SubsystemCapsule, TaskId, UlExperimentArm, UlInjectionMode,
-    UlMetacognitionView, UlTaskExperimentAssignment, path_matches_boundary, ul_token_estimate,
+    ProjectCharter, ProjectId, ProjectUnderstandingEvidence, SessionId, SubsystemCapsule,
+    SystemMap, TaskId, UlExperimentArm, UlInjectionMode, UlMetacognitionView,
+    UlTaskExperimentAssignment, path_matches_boundary, ul_token_estimate,
 };
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet, HashSet};
@@ -25,6 +26,7 @@ pub(super) struct PyramidPacketEnrichment {
     pub recommended_probe: Option<String>,
     pub subsystem_concept_id: Option<String>,
     pub required_invariant_refs: Vec<String>,
+    pub project_evidence: ProjectUnderstandingEvidence,
 }
 
 pub(super) struct UlRuntime {
@@ -218,6 +220,20 @@ impl UlRuntime {
         touched_paths: &[String],
         fallback_text: &str,
     ) -> anyhow::Result<PyramidPacketEnrichment> {
+        let charter = latest_by(
+            self.store
+                .load_ul_artifacts::<ProjectCharter>(project_id, &["project_charter"], 32)
+                .await?,
+            |charter| charter.project_id.to_string(),
+        )
+        .remove(&project_id.to_string());
+        let system_map = latest_by(
+            self.store
+                .load_ul_artifacts::<SystemMap>(project_id, &["system_map"], 32)
+                .await?,
+            |map| map.project_id.to_string(),
+        )
+        .remove(&project_id.to_string());
         let concepts = latest_by(
             self.store
                 .load_ul_artifacts::<ConceptNode>(project_id, &["concept_node"], 128)
@@ -393,6 +409,16 @@ impl UlRuntime {
             .first()
             .map(|(_, _, concept)| concept_bridge(task_id, concept))
             .unwrap_or_default();
+        let project_evidence = project_understanding_evidence(
+            charter.as_ref(),
+            system_map.as_ref(),
+            &ranked,
+            &cards,
+            touched_paths,
+            &capsule_values,
+            &danger,
+            &required_invariant_refs,
+        );
         Ok(PyramidPacketEnrichment {
             understanding: json!({
                 "concepts": concept_values,
@@ -407,8 +433,98 @@ impl UlRuntime {
             recommended_probe,
             subsystem_concept_id,
             required_invariant_refs: required_invariant_refs.into_iter().collect(),
+            project_evidence,
         })
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn project_understanding_evidence(
+    charter: Option<&ProjectCharter>,
+    system_map: Option<&SystemMap>,
+    ranked: &[(usize, bool, ConceptNode)],
+    cards: &[ModuleCard],
+    touched_paths: &[String],
+    capsule_values: &[Value],
+    danger: &BTreeSet<String>,
+    invariant_refs: &BTreeSet<String>,
+) -> ProjectUnderstandingEvidence {
+    let subsystem_refs = ranked
+        .iter()
+        .map(|(_, _, concept)| format!("concept:{}", concept.concept_id))
+        .collect::<Vec<_>>();
+    let owner_modules = cards
+        .iter()
+        .filter(|card| {
+            touched_paths
+                .iter()
+                .any(|path| path_matches_boundary(path, &card.path))
+        })
+        .map(|card| card.path.clone())
+        .collect();
+    let entrypoint_refs = ranked
+        .iter()
+        .flat_map(|(_, _, concept)| concept.entrypoint_refs.iter().cloned())
+        .collect();
+    let mut artifact_refs = ranked
+        .iter()
+        .map(|(_, _, concept)| format!("concept:{}", concept.concept_id))
+        .collect::<Vec<_>>();
+    artifact_refs.extend(
+        capsule_values
+            .iter()
+            .filter_map(|value| value.get("ref").and_then(Value::as_str).map(str::to_owned)),
+    );
+    if let Some(charter) = charter {
+        artifact_refs.push(format!("charter:{}", charter.charter_id));
+    }
+    if let Some(map) = system_map {
+        artifact_refs.push(format!("system-map:{}", map.map_id));
+    }
+    ProjectUnderstandingEvidence {
+        project_purpose: charter
+            .and_then(|charter| first_content_line(&charter.body_md))
+            .unwrap_or_default(),
+        subsystem_refs,
+        owner_modules,
+        entrypoint_refs,
+        invariant_refs: invariant_refs.iter().cloned().collect(),
+        danger_refs: danger.iter().cloned().collect(),
+        artifact_refs,
+        flow_evidence_refs: system_map.map_or_else(Vec::new, |map| {
+            map.flow_edges
+                .iter()
+                .map(|flow| flow.evidence_ref.clone())
+                .collect()
+        }),
+        non_goals: charter.map_or_else(Vec::new, |charter| {
+            markdown_section_items(&charter.body_md, &["non-goal", "не цел"])
+        }),
+    }
+}
+
+fn first_content_line(markdown: &str) -> Option<String> {
+    markdown
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty() && !line.starts_with('#'))
+        .map(|line| line.trim_start_matches(['-', '*', ' ']).to_owned())
+}
+
+fn markdown_section_items(markdown: &str, headings: &[&str]) -> Vec<String> {
+    let mut active = false;
+    let mut items = Vec::new();
+    for line in markdown.lines().map(str::trim) {
+        if line.starts_with('#') {
+            let normalized = eliot_types::normalize_unicode_lowercase(line);
+            active = headings.iter().any(|heading| normalized.contains(heading));
+            continue;
+        }
+        if active && let Some(item) = line.strip_prefix("- ").or_else(|| line.strip_prefix("* ")) {
+            items.push(item.to_owned());
+        }
+    }
+    items
 }
 
 fn latest_by<T, F>(records: Vec<CanonicalRecord<T>>, key: F) -> BTreeMap<String, T>

@@ -4310,7 +4310,7 @@ pub(super) async fn dispatch_operator_command(
             let candidate_handles = latest_task_packet(state, task_id)?
                 .map(|packet| packet.exact_handles)
                 .unwrap_or_default();
-            let packet = dispatch_compile_packet_l3(
+            let packet = Box::pin(dispatch_compile_packet_l3(
                 state,
                 context,
                 json!({
@@ -4320,7 +4320,7 @@ pub(super) async fn dispatch_operator_command(
                     "candidate_handles": candidate_handles,
                     "max_tokens": 4096
                 }),
-            )
+            ))
             .await?;
             let packet_id = packet
                 .get("packet_id")

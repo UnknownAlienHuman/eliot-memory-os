@@ -35,7 +35,7 @@ fn d01_packet_contains_memory_content() -> TestResult {
             "task_id": control_task_id,
             "goal": "reserve the deterministic memory-free control arm",
             "candidate_handles": [],
-            "max_tokens": 500
+            "max_tokens": 1200
         }),
     )?;
     let task_id = TaskId::new_v7();

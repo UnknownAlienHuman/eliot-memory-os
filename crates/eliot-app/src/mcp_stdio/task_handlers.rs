@@ -40,9 +40,12 @@ async fn dispatch_compile_packet_l3(
     } else {
         None
     };
-    let codecortex_reports = latest_codecortex_report(&state.root)?
-        .into_iter()
-        .collect::<Vec<_>>();
+    let previous_packet = parsed_task_id
+        .map(|task_id| latest_task_packet(state, task_id))
+        .transpose()?
+        .flatten();
+    let codecortex_reports =
+        fresh_codecortex_reports(state, &request, input.material_frame.as_ref()).await?;
     let current_git_scope =
         resolve_governed_packet_git_scope(&request, packet_task.as_ref(), &codecortex_reports)
             .await?;
@@ -68,6 +71,7 @@ async fn dispatch_compile_packet_l3(
             Box::pin(compiler.compile_with_codecortex(&request, &codecortex_reports)).await?
         }
     };
+    ProjectContinuityService::restore(&mut packet, previous_packet.as_ref());
     let touched_paths = packet_scope_paths(&packet, input.material_frame.as_ref(), &request);
     let resolved_concept_ids = if packet_task.is_some() {
         state
@@ -219,24 +223,34 @@ async fn dispatch_compile_packet_l3(
                 .await?,
         )
     };
-    write_json_report(
-        &state
-            .root
-            .join("reports")
-            .join("context-packets")
-            .join("latest.json"),
+    if packet.causal_bridge.is_empty()
+        && let Some(pyramid) = &pyramid
+    {
+        packet.causal_bridge.clone_from(&pyramid.bridge);
+    }
+    let project_evidence = pyramid
+        .as_ref()
+        .map_or_else(eliot_types::ProjectUnderstandingEvidence::default, |pyramid| {
+            pyramid.project_evidence.clone()
+        });
+    packet.project_understanding = Some(ProjectUnderstandingCompiler::compile(
         &packet,
+        input.material_frame.as_ref(),
+        packet_task.as_ref(),
+        &project_evidence,
+    ));
+    refinalize_compiled_packet(
+        &mut packet,
+        input.material_frame.as_ref(),
+        request.max_tokens,
+        &request.candidate_handles,
     )?;
+    persist_context_packet(state, &packet)?;
     let required_invariant_refs = pyramid
         .as_ref()
         .map_or_else(Vec::new, |pyramid| pyramid.required_invariant_refs.clone());
-    let mut frame_stub =
+    let frame_stub =
         material_frame_stub(&packet, packet_task.as_ref(), &required_invariant_refs);
-    if frame_stub.causal_bridge.is_empty()
-        && let Some(pyramid) = &pyramid
-    {
-        frame_stub.causal_bridge = pyramid.bridge.clone();
-    }
     let packet_id = packet.packet_id.clone();
     let mut value = serde_json::to_value(packet)?;
     if let Some(pyramid) = &pyramid {
@@ -250,6 +264,8 @@ async fn dispatch_compile_packet_l3(
             "novelty_percent": pyramid.meta.novelty_percent,
             "danger": pyramid.meta.danger_paths,
             "recommended_probe": pyramid.recommended_probe,
+            "blind_target": pyramid.blind_target,
+            "scope_paths": touched_paths,
         });
         let material_risk = input.material_frame.is_some();
         if let Some(frame) = input.material_frame.as_ref() {
@@ -422,18 +438,6 @@ fn packet_scope_paths(
     request: &CompilePacketL3Request,
 ) -> Vec<String> {
     let mut values = BTreeSet::new();
-    if let Some(codecortex) = &packet.codecortex {
-        for evidence in &codecortex.file_evidence {
-            insert_path_tokens(&mut values, &evidence.path);
-        }
-    }
-    for hop in &packet.causal_bridge {
-        insert_path_tokens(&mut values, &hop.from);
-        insert_path_tokens(&mut values, &hop.to);
-        if let Some(reference) = &hop.evidence_ref {
-            insert_path_tokens(&mut values, reference);
-        }
-    }
     if let Some(frame) = frame {
         for atom in &frame.exact_load_bearing_atoms {
             insert_path_tokens(&mut values, atom);
@@ -450,6 +454,20 @@ fn packet_scope_paths(
         insert_path_tokens(&mut values, handle);
     }
     insert_path_tokens(&mut values, &request.goal);
+    if values.is_empty() {
+        if let Some(codecortex) = &packet.codecortex {
+            for evidence in &codecortex.file_evidence {
+                insert_path_tokens(&mut values, &evidence.path);
+            }
+        }
+        for hop in &packet.causal_bridge {
+            insert_path_tokens(&mut values, &hop.from);
+            insert_path_tokens(&mut values, &hop.to);
+            if let Some(reference) = &hop.evidence_ref {
+                insert_path_tokens(&mut values, reference);
+            }
+        }
+    }
     values.into_iter().collect()
 }
 
@@ -1073,12 +1091,84 @@ async fn dispatch_negative_transfer_record(
     Ok(value)
 }
 
+async fn fresh_codecortex_reports(
+    state: &McpState,
+    request: &CompilePacketL3Request,
+    frame: Option<&MaterialPacketFrame>,
+) -> Result<Vec<CodeCortexReport>> {
+    let class =
+        TaskExecutionClassifier::classify(request, frame, &[], &request.candidate_handles);
+    if !TaskExecutionClassifier::should_attach_codecortex(request, frame, &[], &class) {
+        return Ok(Vec::new());
+    }
+    let mut exact_patterns = request.candidate_handles.clone();
+    if let Some(frame) = frame {
+        exact_patterns.extend(frame.predicted_changed_paths.iter().cloned());
+        exact_patterns.extend(frame.exact_load_bearing_atoms.iter().cloned());
+    }
+    exact_patterns.sort();
+    exact_patterns.dedup();
+    exact_patterns.truncate(32);
+    let codecortex_request = CodeCortexRequest {
+        project: request.project_id.to_string(),
+        task: request.task_id.clone(),
+        goal: request.goal.clone(),
+        exact_patterns,
+        max_files: 160,
+        max_matches_per_pattern: 24,
+        include_diagnostics: false,
+    };
+    let project_root = eliot_engine::canonical_project_root(&state.root);
+    let service = CodeCortexService::new(project_root);
+    if let Some(report) = latest_codecortex_report(&state.root)?
+        && service.report_is_fresh(&report, &codecortex_request)?
+    {
+        return Ok(vec![report]);
+    }
+    let mut report = service.scan(&codecortex_request)?;
+    write_codecortex_report_to_memory(state, &mut report).await?;
+    write_json_report(&codecortex_latest_path(&state.root), &report)?;
+    Ok(vec![report])
+}
+
+fn persist_context_packet(state: &McpState, packet: &ContextPacketL3) -> Result<()> {
+    let root = state.root.join("reports").join("context-packets");
+    write_json_report(&root.join("latest.json"), packet)?;
+    let task_root = root.join("tasks").join(task_packet_key(&packet.task_id));
+    write_json_report(&task_root.join("latest.json"), packet)?;
+    let packet_suffix = packet
+        .packet_id
+        .rsplit('/')
+        .next()
+        .unwrap_or("unidentified");
+    write_json_report(
+        &task_root.join("revisions").join(format!(
+            "{}-{packet_suffix}.json",
+            packet.at_revision.value()
+        )),
+        packet,
+    )
+}
+
+fn task_packet_key(task_id: &str) -> String {
+    TaskId::from_str(task_id).map_or_else(
+        |_| blake3::hash(task_id.as_bytes()).to_hex().to_string(),
+        |task_id| task_id.to_string(),
+    )
+}
+
 fn latest_task_packet(state: &McpState, task_id: TaskId) -> Result<Option<ContextPacketL3>> {
-    let path = state
-        .root
-        .join("reports")
-        .join("context-packets")
+    let root = state.root.join("reports").join("context-packets");
+    let task_path = root
+        .join("tasks")
+        .join(task_packet_key(&task_id.to_string()))
         .join("latest.json");
+    let legacy_path = root.join("latest.json");
+    let path = if task_path.is_file() {
+        task_path
+    } else {
+        legacy_path
+    };
     if !path.is_file() {
         return Ok(None);
     }

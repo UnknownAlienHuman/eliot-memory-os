@@ -25,6 +25,15 @@ pub enum EngineError {
     #[error("stale read: project revision {actual} is below required {required}")]
     StaleRead { required: u64, actual: u64 },
 
+    #[error(
+        "context packet floor exceeds budget: estimated {estimated_tokens} tokens > max {max_tokens}"
+    )]
+    PacketFloorExceedsBudget {
+        max_tokens: usize,
+        estimated_tokens: usize,
+        section_tokens: std::collections::BTreeMap<String, usize>,
+    },
+
     #[error(transparent)]
     Store(#[from] eliot_store::StoreError),
 

@@ -32,6 +32,23 @@
         ]
       }
     ],
+    "PostToolUse": [
+      {
+        "matcher": "Bash|Edit|Write|NotebookEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "${CLAUDE_PLUGIN_ROOT}/bin/eliot-governor.exe",
+            "args": [
+              "hook",
+              "post-tool-use"
+            ],
+            "timeout": 10,
+            "async": true
+          }
+        ]
+      }
+    ],
     "PostToolUseFailure": [
       {
         "matcher": "Bash|Edit|Write|NotebookEdit",

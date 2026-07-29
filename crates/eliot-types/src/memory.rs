@@ -17,7 +17,7 @@ use crate::{
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use time::OffsetDateTime;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -990,6 +990,8 @@ pub struct ContextPacketL3 {
     pub goal: String,
     #[serde(default)]
     pub task_execution_class: crate::TaskExecutionClass,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_understanding: Option<crate::ProjectUnderstandingModel>,
     #[serde(default)]
     pub memory_confidence: MemoryConfidence,
     #[serde(default)]
@@ -1045,6 +1047,8 @@ pub struct ContextPacketL3 {
 pub struct CodeCortexPacketView {
     pub report_refs: Vec<String>,
     pub git_head: Option<String>,
+    #[serde(default)]
+    pub scope_binding: CodeCortexScopeBinding,
     pub file_evidence: Vec<FileEvidence>,
     pub symbol_evidence: Vec<SymbolEvidence>,
     pub diagnostic_evidence: Vec<DiagnosticEvidence>,
@@ -1520,6 +1524,8 @@ pub struct CodeCortexReport {
     pub repo_root: String,
     pub git_head: Option<String>,
     pub dirty: bool,
+    #[serde(default)]
+    pub scope_binding: CodeCortexScopeBinding,
     pub tracked_files: Vec<FileEvidence>,
     pub workspace_members: Vec<String>,
     pub crates: Vec<String>,
@@ -1534,6 +1540,15 @@ pub struct CodeCortexReport {
     pub adapter_notes: Vec<String>,
     pub memory_receipt: Option<WriteReceiptRef>,
     pub final_status: String,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct CodeCortexScopeBinding {
+    pub branch: String,
+    pub commit: String,
+    pub dirty_state_hash: String,
+    pub adapter_versions: BTreeMap<String, String>,
+    pub verifier_config_hash: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

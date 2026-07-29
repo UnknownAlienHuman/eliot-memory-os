@@ -21,6 +21,7 @@ pub mod memory_lifecycle;
 pub mod metrics;
 pub mod patch;
 pub mod plugin;
+pub mod project_understanding;
 pub mod provider_invocation;
 pub mod read;
 pub mod readiness;
@@ -73,7 +74,7 @@ pub use collective::{
 };
 pub use context::{
     CognitiveGate, CompletionGate, ContextCompiler, PacketQualityService,
-    UnderstandingProofValidator, codecortex_report_ref,
+    UnderstandingProofValidator, codecortex_report_ref, refinalize_compiled_packet,
 };
 pub use control_plane::{
     AutonomyBudgetDecision, AutonomyBudgetLedger, AutonomyLeaseBinding, AutonomyRecoveryAction,
@@ -138,6 +139,7 @@ pub use metrics::{
 };
 pub use patch::{PatchMemoryWriter, PatchRunner, PatchRunnerInput, VerifierHarness};
 pub use plugin::{EliotHookService, HookProcessingResult};
+pub use project_understanding::{ProjectContinuityService, ProjectUnderstandingCompiler};
 pub use provider_invocation::{
     ExternalResultCompletenessService, ProviderCompletenessInput, ProviderInvocationJournal,
     ProviderInvocationLifecycleService, ProviderOutputCapture, ProviderOutputSpool,

@@ -1,9 +1,9 @@
 use crate::{EngineError, WriteAdmissionService, WriterHandle};
 use eliot_types::{
-    AgentId, BlastRadiusView, CodeCortexReport, CodeCortexRequest, CodeEvidenceSource,
-    CommandContext, DiagnosticEvidence, FileEvidence, InvariantCard, LifecycleStatus, ProjectId,
-    SemanticCommand, SymbolEvidence, TaintClass, TaskId, ToolObservationRecordCommand,
-    VerifierEvidence, Visibility, WriteId, WriteReceiptRef,
+    AgentId, BlastRadiusView, CodeCortexReport, CodeCortexRequest, CodeCortexScopeBinding,
+    CodeEvidenceSource, CommandContext, DiagnosticEvidence, FileEvidence, InvariantCard,
+    LifecycleStatus, ProjectId, SemanticCommand, SymbolEvidence, TaintClass, TaskId,
+    ToolObservationRecordCommand, VerifierEvidence, Visibility, WriteId, WriteReceiptRef,
 };
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
@@ -45,6 +45,22 @@ impl CodeCortexService {
         self.build_report(request, true)
     }
 
+    pub fn report_is_fresh(
+        &self,
+        report: &CodeCortexReport,
+        request: &CodeCortexRequest,
+    ) -> Result<bool, EngineError> {
+        let repo_root = resolve_repo_root(&self.repo_root)?;
+        let binding = scope_binding(&repo_root, request)?;
+        Ok(report.project == request.project
+            && report.task == request.task
+            && report.goal == request.goal
+            && normalized_path(&report.repo_root)
+                == normalized_path(&repo_root.display().to_string())
+            && report.git_head.as_deref() == Some(binding.commit.as_str())
+            && report.scope_binding == binding)
+    }
+
     fn build_report(
         &self,
         request: &CodeCortexRequest,
@@ -67,6 +83,7 @@ impl CodeCortexService {
 
         let git_head = git_text(&repo_root, &["rev-parse", "HEAD"], &mut verifier_evidence)?;
         let dirty = git_dirty(&repo_root, &mut verifier_evidence)?;
+        let scope_binding = scope_binding(&repo_root, request)?;
         let tracked_files = tracked_files(&repo_root, &mut verifier_evidence)?;
 
         let manifest = cargo_manifest(&repo_root, &mut verifier_evidence)?;
@@ -133,6 +150,7 @@ impl CodeCortexService {
             repo_root: repo_root.display().to_string(),
             git_head,
             dirty,
+            scope_binding,
             tracked_files,
             workspace_members: manifest.workspace_members,
             crates: manifest.crates,
@@ -153,6 +171,121 @@ impl CodeCortexService {
             final_status: final_status.to_owned(),
         })
     }
+}
+
+fn resolve_repo_root(root: &Path) -> Result<PathBuf, EngineError> {
+    let git_root = run_process(root, "git", &["rev-parse", "--show-toplevel"])?;
+    Ok(if git_root.status {
+        PathBuf::from(git_root.stdout.trim())
+    } else {
+        root.to_path_buf()
+    })
+}
+
+fn scope_binding(
+    repo_root: &Path,
+    request: &CodeCortexRequest,
+) -> Result<CodeCortexScopeBinding, EngineError> {
+    let branch = successful_stdout(repo_root, "git", &["rev-parse", "--abbrev-ref", "HEAD"]);
+    let commit = successful_stdout(repo_root, "git", &["rev-parse", "HEAD"]);
+    let dirty_state_hash = dirty_state_hash(repo_root)?;
+    let mut adapter_versions = BTreeMap::new();
+    insert_adapter_version(
+        &mut adapter_versions,
+        repo_root,
+        "git",
+        "git",
+        &["--version"],
+    );
+    insert_adapter_version(
+        &mut adapter_versions,
+        repo_root,
+        "cargo",
+        "cargo",
+        &["--version"],
+    );
+    insert_adapter_version(&mut adapter_versions, repo_root, "rg", "rg", &["--version"]);
+    insert_adapter_version(
+        &mut adapter_versions,
+        repo_root,
+        "ast-grep",
+        "sg",
+        &["--version"],
+    );
+    let verifier_config_hash = blake3::hash(&serde_json::to_vec(request)?)
+        .to_hex()
+        .to_string();
+    Ok(CodeCortexScopeBinding {
+        branch,
+        commit,
+        dirty_state_hash,
+        adapter_versions,
+        verifier_config_hash,
+    })
+}
+
+fn successful_stdout(cwd: &Path, program: &str, args: &[&str]) -> String {
+    run_process(cwd, program, args).map_or_else(
+        |_| "unavailable".to_owned(),
+        |output| {
+            if output.status {
+                output.stdout.trim().to_owned()
+            } else {
+                "unavailable".to_owned()
+            }
+        },
+    )
+}
+
+fn insert_adapter_version(
+    versions: &mut BTreeMap<String, String>,
+    cwd: &Path,
+    name: &str,
+    program: &str,
+    args: &[&str],
+) {
+    let version = successful_stdout(cwd, program, args)
+        .lines()
+        .next()
+        .unwrap_or("unavailable")
+        .trim()
+        .to_owned();
+    versions.insert(name.to_owned(), version);
+}
+
+fn dirty_state_hash(repo_root: &Path) -> Result<String, EngineError> {
+    let diff = run_process(repo_root, "git", &["diff", "--binary", "HEAD", "--"])?;
+    let untracked = run_process(
+        repo_root,
+        "git",
+        &["ls-files", "--others", "--exclude-standard"],
+    )?;
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(diff.stdout.as_bytes());
+    let mut paths = untracked
+        .stdout
+        .lines()
+        .map(str::trim)
+        .filter(|path| !path.is_empty())
+        .collect::<Vec<_>>();
+    paths.sort_unstable();
+    for relative in paths {
+        hasher.update(relative.as_bytes());
+        let path = repo_root.join(relative);
+        match fs::read(path) {
+            Ok(bytes) => {
+                hasher.update(&bytes);
+            }
+            Err(error) => {
+                hasher.update(error.to_string().as_bytes());
+            }
+        }
+    }
+    Ok(hasher.finalize().to_hex().to_string())
+}
+
+fn normalized_path(path: &str) -> String {
+    path.replace('\\', "/").to_ascii_lowercase()
 }
 
 pub struct CodeCortexMemoryWriter;

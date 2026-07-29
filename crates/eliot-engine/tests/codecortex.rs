@@ -118,6 +118,38 @@ fn codecortex_health_reports_unavailable_adapters_honestly() -> TestResult {
 }
 
 #[test]
+fn codecortex_report_freshness_tracks_content_and_config() -> TestResult {
+    let root =
+        std::env::temp_dir().join(format!("eliot-codecortex-freshness-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("src"))?;
+    fs::write(
+        root.join("Cargo.toml"),
+        "[package]\nname=\"codecortex-freshness\"\nversion=\"0.1.0\"\nedition=\"2024\"\n",
+    )?;
+    fs::write(root.join("src/lib.rs"), "pub fn value() -> u32 { 1 }\n")?;
+    git(&root, &["init"])?;
+    git(&root, &["config", "user.email", "eliot@example.invalid"])?;
+    git(&root, &["config", "user.name", "ELIOT Test"])?;
+    git(&root, &["add", "."])?;
+    git(&root, &["commit", "-m", "fixture"])?;
+    let request = request("freshness", "Find value", vec!["pub fn value".to_owned()]);
+    let service = CodeCortexService::new(&root);
+    let report = service.scan(&request)?;
+    assert!(service.report_is_fresh(&report, &request)?);
+    assert!(!report.scope_binding.branch.is_empty());
+    assert!(!report.scope_binding.adapter_versions.is_empty());
+
+    let mut changed_config = request.clone();
+    changed_config.max_files += 1;
+    assert!(!service.report_is_fresh(&report, &changed_config)?);
+    fs::write(root.join("src/lib.rs"), "pub fn value() -> u32 { 2 }\n")?;
+    assert!(!service.report_is_fresh(&report, &request)?);
+    fs::remove_dir_all(root)?;
+    Ok(())
+}
+
+#[test]
 fn accumulated_capabilities_non_regression() -> TestResult {
     let mcp_stdio = fs::read_to_string(repo_root().join("crates/eliot-app/src/mcp_stdio.rs"))?;
     let context = fs::read_to_string(repo_root().join("crates/eliot-engine/src/context.rs"))?;
@@ -136,6 +168,18 @@ fn accumulated_capabilities_non_regression() -> TestResult {
 struct Harness {
     root: PathBuf,
     store: CanonicalStore,
+}
+
+fn git(root: &Path, args: &[&str]) -> TestResult {
+    let output = std::process::Command::new("git")
+        .args(args)
+        .current_dir(root)
+        .output()?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(String::from_utf8_lossy(&output.stderr).into_owned().into())
+    }
 }
 
 impl Harness {

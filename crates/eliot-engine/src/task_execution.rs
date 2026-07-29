@@ -91,6 +91,53 @@ impl TaskExecutionClassifier {
             source,
         }
     }
+
+    #[must_use]
+    pub fn should_attach_codecortex(
+        request: &CompilePacketL3Request,
+        frame: Option<&MaterialPacketFrame>,
+        touched_paths: &[String],
+        class: &TaskExecutionClass,
+    ) -> bool {
+        if !class.requires_codecortex() {
+            return false;
+        }
+
+        let candidate_handles = &request.candidate_handles;
+        let explicit_code_contract = candidate_handles.iter().any(|handle| {
+            matches!(
+                handle.trim(),
+                "task-domain:code"
+                    | "task-artifact:code"
+                    | "task-artifact:config"
+                    | "task-artifact:mixed"
+            )
+        });
+        let requested_code_evidence = candidate_handles
+            .iter()
+            .any(|handle| is_structured_code_handle(handle) || !path_cue_tokens(handle).is_empty())
+            || !touched_paths.is_empty()
+            || frame.is_some_and(|frame| {
+                !frame.predicted_changed_paths.is_empty()
+                    || frame
+                        .exact_load_bearing_atoms
+                        .iter()
+                        .any(|atom| is_structured_code_handle(atom))
+            });
+        let explicit_non_code_evidence = candidate_handles
+            .iter()
+            .any(|handle| is_non_code_evidence_handle(handle));
+
+        if explicit_non_code_evidence && !requested_code_evidence && !explicit_code_contract {
+            return false;
+        }
+
+        !(class.source == TaskExecutionClassSource::Fallback
+            && class.domain == TaskExecutionDomain::Mixed
+            && class.artifact == TaskExecutionArtifact::Mixed
+            && !requested_code_evidence
+            && !explicit_code_contract)
+    }
 }
 
 fn structured_value<'a>(handles: &'a [String], prefix: &str) -> Option<&'a str> {
@@ -373,4 +420,20 @@ fn is_structured_code_handle(handle: &str) -> bool {
     ["file:", "symbol:", "module:", "codecortex:"]
         .iter()
         .any(|prefix| handle.starts_with(prefix))
+}
+
+fn is_non_code_evidence_handle(handle: &str) -> bool {
+    let handle = handle.trim();
+    [
+        "claim:",
+        "evidence:",
+        "verification:",
+        "failure:",
+        "decision:",
+        "probe:",
+        "receipt:",
+        "memory:",
+    ]
+    .iter()
+    .any(|prefix| handle.starts_with(prefix))
 }

@@ -240,6 +240,23 @@ fn dispatch_error_response(id: &Value, error: &anyhow::Error) -> Value {
             minimal_valid_example: Value::Null,
         };
         error_response_with_data(id, -32602, "observability write_id conflict", &data)
+    } else if let Some(eliot_engine::EngineError::PacketFloorExceedsBudget {
+        max_tokens,
+        estimated_tokens,
+        section_tokens,
+    }) = error.downcast_ref::<eliot_engine::EngineError>()
+    {
+        error_response_with_data(
+            id,
+            -32602,
+            "context packet floor exceeds budget",
+            &serde_json::json!({
+                "code": "PACKET_FLOOR_EXCEEDS_BUDGET",
+                "max_tokens": max_tokens,
+                "estimated_tokens": estimated_tokens,
+                "section_tokens": section_tokens,
+            }),
+        )
     } else {
         error_response(id, -32603, &error.to_string())
     }

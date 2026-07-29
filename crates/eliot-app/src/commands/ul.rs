@@ -156,8 +156,7 @@ pub fn run_ul_doctor(host: UlDoctorHostArg) -> Result<()> {
         UlDoctorHostArg::Codex => {
             let package = root.join("plugin/eliot-governor");
             let registration = std::env::var_os("ELIOT_DOCTOR_CODEX_CONFIG")
-                .map(PathBuf::from)
-                .unwrap_or_else(|| root.join(".codex/config.toml"));
+                .map_or_else(|| root.join(".codex/config.toml"), PathBuf::from);
             checks.push((
                 "plugin-package",
                 package.join(".codex-plugin/plugin.json").is_file(),
@@ -196,7 +195,17 @@ pub fn run_ul_doctor(host: UlDoctorHostArg) -> Result<()> {
                     registration.display()
                 ),
             ));
-            checks.push(hook_check(&package.join("hooks/hooks.json")));
+            checks.push(hook_check(
+                &package.join("hooks/hooks.json"),
+                &[
+                    "SessionStart",
+                    "PreToolUse",
+                    "PostToolUse",
+                    "PreCompact",
+                    "PostCompact",
+                    "Stop",
+                ],
+            ));
         }
         UlDoctorHostArg::Claude => {
             let package = root.join("integrations/claude/eliot");
@@ -225,7 +234,16 @@ pub fn run_ul_doctor(host: UlDoctorHostArg) -> Result<()> {
                 ),
                 format!("keep one supported `eliot` entry in {}", package.join(".mcp.json").display()),
             ));
-            checks.push(hook_check(&package.join("hooks/hooks.json")));
+            checks.push(hook_check(
+                &package.join("hooks/hooks.json"),
+                &[
+                    "SessionStart",
+                    "PreToolUse",
+                    "PostToolUse",
+                    "PreCompact",
+                    "Stop",
+                ],
+            ));
         }
         UlDoctorHostArg::Antigravity => {
             let package = root.join("plugin/eliot-antigravity-official");
@@ -278,13 +296,10 @@ pub fn run_ul_doctor(host: UlDoctorHostArg) -> Result<()> {
     }
 }
 
-fn hook_check(path: &Path) -> (&'static str, bool, String) {
+fn hook_check(path: &Path, required_events: &[&str]) -> (&'static str, bool, String) {
     let valid = std::fs::read_to_string(path).ok().is_some_and(|text| {
         let lower = text.to_ascii_lowercase();
-        text.contains("SessionStart")
-            && text.contains("PreToolUse")
-            && text.contains("PreCompact")
-            && text.contains("Stop")
+        required_events.iter().all(|event| text.contains(event))
             && !lower.contains("eliot_agent_candidate_submit")
             && !lower.contains("eliot_memory_influence_trace")
     });

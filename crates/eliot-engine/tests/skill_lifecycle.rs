@@ -679,6 +679,7 @@ fn codecortex_report() -> CodeCortexReport {
         repo_root: repo_root().display().to_string(),
         git_head: Some("skill-lifecycle-head".to_owned()),
         dirty: false,
+        scope_binding: eliot_types::CodeCortexScopeBinding::default(),
         tracked_files: vec![file.clone()],
         workspace_members: vec!["eliot-engine".to_owned()],
         crates: vec!["eliot-engine".to_owned()],

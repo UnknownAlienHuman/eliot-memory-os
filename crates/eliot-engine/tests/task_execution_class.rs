@@ -60,3 +60,43 @@ fn explicit_contract_beats_fallback_words() {
     assert_eq!(class.subsystem_refs, ["certification"]);
     assert!(!class.requires_codecortex());
 }
+
+#[test]
+fn codecortex_attachment_is_disposed_by_the_evidence_contract() {
+    let claim_only = request(
+        "Fix code using the verified claim",
+        &["claim:01900000-0000-7000-8000-000000000001"],
+    );
+    let claim_class =
+        TaskExecutionClassifier::classify(&claim_only, None, &[], &claim_only.candidate_handles);
+    assert!(claim_class.requires_codecortex());
+    assert!(!TaskExecutionClassifier::should_attach_codecortex(
+        &claim_only,
+        None,
+        &[],
+        &claim_class,
+    ));
+
+    let code_handle = request(
+        "Fix code using current source truth",
+        &["file:crates/eliot-engine/src/context.rs"],
+    );
+    let code_class =
+        TaskExecutionClassifier::classify(&code_handle, None, &[], &code_handle.candidate_handles);
+    assert!(TaskExecutionClassifier::should_attach_codecortex(
+        &code_handle,
+        None,
+        &[],
+        &code_class,
+    ));
+
+    let ambiguous = request("reserve deterministic control arm", &[]);
+    let ambiguous_class =
+        TaskExecutionClassifier::classify(&ambiguous, None, &[], &ambiguous.candidate_handles);
+    assert!(!TaskExecutionClassifier::should_attach_codecortex(
+        &ambiguous,
+        None,
+        &[],
+        &ambiguous_class,
+    ));
+}
