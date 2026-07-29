@@ -246,7 +246,7 @@ impl MemoryLifecycleService {
         mut response: RecallL0Response,
         audit_mode: bool,
     ) -> RecallL0Response {
-        response.rank_trace.lifecycle_suppressions = response
+        let handle_suppressions = response
             .handles
             .iter()
             .filter_map(|handle| {
@@ -256,7 +256,17 @@ impl MemoryLifecycleService {
                     reason: format!("lifecycle_{state:?}").to_ascii_lowercase(),
                 })
             })
-            .collect();
+            .collect::<Vec<_>>();
+        for suppression in handle_suppressions {
+            if !response
+                .rank_trace
+                .lifecycle_suppressions
+                .iter()
+                .any(|existing| existing.handle == suppression.handle)
+            {
+                response.rank_trace.lifecycle_suppressions.push(suppression);
+            }
+        }
         response.handles = filter_l0_handles(response.handles, audit_mode);
         response.truncation.returned = response.handles.len();
         response.rank_trace.candidates_returned = response.handles.len();

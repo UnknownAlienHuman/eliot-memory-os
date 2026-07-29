@@ -543,6 +543,10 @@ async fn canonical_l10_l12_records_are_idempotent_restart_safe_and_bounded()
             consistency: ReadConsistencyMode::Latest,
             at_least_revision: None,
             lifecycle_audit: false,
+            task_id: None,
+            task_class_cues: Vec::new(),
+            scope_refs: Vec::new(),
+            concept_refs: Vec::new(),
         })
         .await?;
     assert_eq!(recall.handles.len(), 1);

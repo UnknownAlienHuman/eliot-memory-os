@@ -831,6 +831,10 @@ pub(super) async fn operator_typed_memory_query_records(
                         .get("lifecycle_audit")
                         .and_then(Value::as_bool)
                         .unwrap_or(false),
+                    task_id: request.task_id,
+                    task_class_cues: operator_string_array(parameters, "task_class_cues"),
+                    scope_refs: operator_string_array(parameters, "scope_refs"),
+                    concept_refs: operator_string_array(parameters, "concept_refs"),
                 })
                 .await?;
             Ok(Some(operator_l0_rank_records(&response)))
@@ -879,6 +883,17 @@ pub(super) async fn operator_typed_memory_query_records(
         | OperatorQueryOperation::TraceReplay
         | OperatorQueryOperation::HealthReport => Ok(None),
     }
+}
+
+fn operator_string_array(parameters: &Value, key: &str) -> Vec<String> {
+    parameters
+        .get(key)
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(str::to_owned)
+        .collect()
 }
 
 pub(super) async fn operator_canonical_disposition_records(
@@ -1038,6 +1053,39 @@ pub(super) fn operator_canonical_disposition_record(
     record
 }
 
+fn operator_l0_feature_fields(
+    score: &eliot_types::L0FeatureScore,
+    at_revision: MemoryRevision,
+) -> Vec<OperatorFieldView> {
+    vec![
+        operator_field("handle", &score.handle, true),
+        operator_field("reasons", score.reasons.join(", "), false),
+        operator_field("exact_identifier", score.exact_identifier, false),
+        operator_field("subject_identity", score.subject_identity, false),
+        operator_field("lexical_overlap", score.lexical_overlap, false),
+        operator_field("task_relation", score.task_relation, false),
+        operator_field("scope_fit", score.scope_fit, false),
+        operator_field("lifecycle_fit", score.lifecycle_fit, false),
+        operator_field("evidence_authority", score.evidence_authority, false),
+        operator_field("prior_decision_delta", score.prior_decision_delta, false),
+        operator_field("exact_cue", score.exact_cue, false),
+        operator_field("concept_relation", score.concept_relation, false),
+        operator_field("freshness_fit", score.freshness_fit, false),
+        operator_field("negative_memory_value", score.negative_memory_value, false),
+        operator_field("known_decision_delta", score.known_decision_delta, false),
+        operator_field("prior_beneficial_use", score.prior_beneficial_use, false),
+        operator_field("verification_value", score.verification_value, false),
+        operator_field("context_cost", score.context_cost, false),
+        operator_field("stale_penalty", score.stale_penalty, false),
+        operator_field("contradiction_penalty", score.contradiction_penalty, false),
+        operator_field("harm_penalty", score.harm_penalty, false),
+        operator_field("repetition_penalty", score.repetition_penalty, false),
+        operator_field("distraction_penalty", score.distraction_penalty, false),
+        operator_field("total", score.total, false),
+        operator_field("at_revision", at_revision.value(), true),
+    ]
+}
+
 pub(super) fn operator_l0_rank_records(response: &RecallL0Response) -> Vec<OperatorRecordView> {
     let trace = &response.rank_trace;
     let query_hash = blake3::hash(trace.normalized_query.as_bytes())
@@ -1098,26 +1146,36 @@ pub(super) fn operator_l0_rank_records(response: &RecallL0Response) -> Vec<Opera
                 "ranked"
             },
             "canonical_store_query_ranker",
-            vec![
-                operator_field("handle", &score.handle, true),
-                operator_field("reasons", score.reasons.join(", "), false),
-                operator_field("exact_identifier", score.exact_identifier, false),
-                operator_field("subject_identity", score.subject_identity, false),
-                operator_field("lexical_overlap", score.lexical_overlap, false),
-                operator_field("task_relation", score.task_relation, false),
-                operator_field("scope_fit", score.scope_fit, false),
-                operator_field("lifecycle_fit", score.lifecycle_fit, false),
-                operator_field("evidence_authority", score.evidence_authority, false),
-                operator_field("prior_decision_delta", score.prior_decision_delta, false),
-                operator_field("total", score.total, false),
-                operator_field("at_revision", response.at_revision.value(), true),
-            ],
+            operator_l0_feature_fields(score, response.at_revision),
         );
         record.lifecycle = preview
             .and_then(|handle| handle.lifecycle_state)
             .map(|state| format!("{state:?}").to_ascii_lowercase())
             .or_else(|| lifecycle_suppression.map(|_| "suppressed".to_owned()));
         records.push(record);
+    }
+    for duplicate in &trace.collapsed_duplicates {
+        records.push(operator_record(
+            &format!("l0-collapsed-duplicate:{}", duplicate.authoritative_handle),
+            "l0_collapsed_duplicate",
+            &duplicate.authoritative_handle,
+            &duplicate.reason,
+            "collapsed",
+            "canonical_store_query_ranker",
+            vec![
+                operator_field(
+                    "authoritative_handle",
+                    &duplicate.authoritative_handle,
+                    true,
+                ),
+                operator_field(
+                    "collapsed_record_refs",
+                    duplicate.collapsed_record_refs.join(", "),
+                    false,
+                ),
+                operator_field("reason", &duplicate.reason, false),
+            ],
+        ));
     }
     append_operator_l0_suppression_records(&mut records, response);
     records

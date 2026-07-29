@@ -12,17 +12,17 @@ use eliot_types::{
     CanonicalReplayExecutionRecord, CanonicalTraceCompletenessContract, ClaimId, CueIndexRow,
     CueRecordSource, CurrentStateRequest, CurrentStateResponse, EpistemicStatus,
     ExperimentalMetaPolicyCandidate, FetchAtomsL2Request, FetchAtomsL2Response,
-    GraphHealthResponse, HarnessExperimentRecord, InjectionReceipt, L0FeatureScore, L0RankTrace,
-    L0SuppressionTrace, LifecycleStatus, MemoryConfidence, MemoryHandlePreview,
-    MemoryInfluenceTrace, MemoryRevision, MemoryStateTransition, MemoryTrajectoryCorrectness,
-    MemoryWriteEnvelope, MetaIsolationRejectionRecord, MetaPolicyExecutionAction,
-    MetaPolicyExecutionReceipt, MinorityPressureRecord, ObservabilityKind,
-    ObservabilityWriteEnvelope, ObservabilityWriteReceipt, ObservabilityWriteStatus, ProjectId,
-    ProjectSequence, RecallL0Request, RecallL0Response, ReplayAudit, ReplayRun,
-    SealedReplayCaseRecord, SealedReplayInputSnapshotRecord, SealedReplaySetRecord,
-    SleepCandidateArtifact, SleepConsolidationBundle, SleepConsolidationRun, SurrealServerConfig,
-    TaintClass, TaskContract, TaskId, ToolObservation, TruncationInfo, VerificationId,
-    VerificationRun, Visibility, WriteId, WriteReceipt,
+    GraphHealthResponse, HarnessExperimentRecord, InjectionReceipt, L0CollapsedDuplicateTrace,
+    L0FeatureScore, L0RankTrace, L0SuppressionTrace, LifecycleStatus, MemoryConfidence,
+    MemoryHandlePreview, MemoryInfluenceTrace, MemoryRevision, MemoryStateTransition,
+    MemoryTrajectoryCorrectness, MemoryWriteEnvelope, MetaIsolationRejectionRecord,
+    MetaPolicyExecutionAction, MetaPolicyExecutionReceipt, MinorityPressureRecord,
+    ObservabilityKind, ObservabilityWriteEnvelope, ObservabilityWriteReceipt,
+    ObservabilityWriteStatus, ProjectId, ProjectSequence, RecallL0Request, RecallL0Response,
+    ReplayAudit, ReplayRun, SealedReplayCaseRecord, SealedReplayInputSnapshotRecord,
+    SealedReplaySetRecord, SleepCandidateArtifact, SleepConsolidationBundle, SleepConsolidationRun,
+    SurrealServerConfig, TaintClass, TaskContract, TaskId, ToolObservation, TruncationInfo,
+    VerificationId, VerificationRun, Visibility, WriteId, WriteReceipt,
 };
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
@@ -69,22 +69,61 @@ const SECRET_SCAN_TABLES: &[&str] = &[
     "card_covers",
 ];
 
-const MAX_RECALL_CANDIDATES: usize = 512;
+const RECALL_CANDIDATE_PAGE_SIZE: usize = 128;
+const MAX_RECALL_SCAN_CANDIDATES: usize = 65_536;
+const RECALL_REVISION_RESTART_ATTEMPTS: usize = 3;
+const RECALL_CANDIDATE_KINDS: &[&str] = &[
+    "claim",
+    "evidence",
+    "verification",
+    "observation",
+    "failure",
+    "artifact",
+];
 const MAX_RECALL_RESULTS: usize = 12;
 
 #[derive(Clone, Debug, serde::Deserialize)]
+#[allow(clippy::struct_excessive_bools)]
 struct RecallCandidateRow {
+    #[serde(default)]
+    record_ref: String,
     handle: String,
     record_type: String,
     preview: String,
     search_text: String,
+    #[serde(default)]
+    cue_text: String,
+    #[serde(default)]
+    scope_text: String,
+    #[serde(default)]
+    concept_text: String,
+    #[serde(default)]
+    task_id: Option<TaskId>,
     status: String,
     lifecycle_state: Option<eliot_types::MemoryLifecycleState>,
     authority_rank: i32,
     negative_memory: bool,
+    #[serde(default)]
+    memory_revision: Option<MemoryRevision>,
+    #[serde(default)]
+    project_sequence: Option<ProjectSequence>,
+    #[serde(default)]
+    verification_value: i32,
+    #[serde(default)]
+    known_decision_delta: i32,
+    #[serde(default)]
+    prior_beneficial_use: i32,
+    #[serde(default)]
+    contradiction_signal: bool,
+    #[serde(default)]
+    harm_signal: bool,
+    #[serde(default)]
+    repetition_signal: bool,
+    #[serde(default)]
+    distraction_signal: bool,
 }
 
-#[derive(serde::Deserialize)]
+#[derive(Debug, serde::Deserialize)]
 struct RecallCandidateLoad {
     at_revision: MemoryRevision,
     candidates: Vec<RecallCandidateRow>,
@@ -512,26 +551,44 @@ fn rank_recall_candidates(
     let normalized_query = query_tokens.join(" ");
     let exact_query = request.query.trim().to_lowercase();
     let candidates_considered = load.candidates.len();
-    let lifecycle_suppressions = load
-        .candidates
-        .iter()
-        .filter_map(|candidate| match candidate.lifecycle_state {
-            Some(eliot_types::MemoryLifecycleState::Suppressed) => Some(L0SuppressionTrace {
-                handle: candidate.handle.clone(),
-                reason: "lifecycle_suppressed".to_owned(),
-            }),
-            Some(eliot_types::MemoryLifecycleState::Stale) => Some(L0SuppressionTrace {
-                handle: candidate.handle.clone(),
-                reason: "lifecycle_stale".to_owned(),
-            }),
-            _ => None,
-        })
-        .collect::<Vec<_>>();
-    let mut admitted = load
-        .candidates
+    let mut lifecycle_suppressions = Vec::new();
+    let mut scope_suppressions = Vec::new();
+    let mut filtered = Vec::with_capacity(load.candidates.len());
+    for row in load.candidates {
+        if !request.lifecycle_audit && !is_default_visible_lifecycle(row.lifecycle_state) {
+            lifecycle_suppressions.push(L0SuppressionTrace {
+                handle: row.handle,
+                reason: format!(
+                    "lifecycle_{}",
+                    row.lifecycle_state
+                        .map_or_else(|| "unknown".to_owned(), |state| format!("{state:?}"))
+                        .to_ascii_lowercase()
+                ),
+            });
+            continue;
+        }
+        let Some(scope_fit) = recall_scope_fit(&row.scope_text, &request.scope_refs) else {
+            scope_suppressions.push(L0SuppressionTrace {
+                handle: row.handle,
+                reason: "scope_mismatch".to_owned(),
+            });
+            continue;
+        };
+        filtered.push((row, scope_fit));
+    }
+    let (collapsed, collapsed_duplicates) = collapse_recall_candidates(filtered);
+    let mut admitted = collapsed
         .into_iter()
-        .filter_map(|row| {
-            rank_recall_candidate(row, &query_tokens, &normalized_query, &exact_query)
+        .filter_map(|(row, scope_fit)| {
+            rank_recall_candidate(
+                row,
+                scope_fit,
+                request,
+                load.at_revision,
+                &query_tokens,
+                &normalized_query,
+                &exact_query,
+            )
         })
         .collect::<Vec<_>>();
     admitted.sort_by(|left, right| {
@@ -561,7 +618,7 @@ fn rank_recall_candidates(
         .map(|candidate| candidate.score)
         .collect::<Vec<_>>();
     let candidates_returned = handles.len();
-    let query_mode = "unicode_multi_kind_deterministic_v3".to_owned();
+    let query_mode = "unicode_multi_kind_lifecycle_aware_v4".to_owned();
 
     RecallL0Response {
         project_id: request.project_id,
@@ -576,28 +633,33 @@ fn rank_recall_candidates(
             candidates_returned,
             feature_scores,
             lifecycle_suppressions,
-            scope_suppressions: Vec::new(),
+            scope_suppressions,
+            collapsed_duplicates,
             no_useful_memory: candidates_returned == 0,
             query_mode,
         },
         truncation: TruncationInfo {
-            truncated: load.truncated
-                || candidates_considered > MAX_RECALL_CANDIDATES
-                || admitted_count > MAX_RECALL_RESULTS,
+            truncated: load.truncated || admitted_count > MAX_RECALL_RESULTS,
             limit: MAX_RECALL_RESULTS,
             returned: candidates_returned,
         },
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn rank_recall_candidate(
     row: RecallCandidateRow,
+    scope_fit: i32,
+    request: &RecallL0Request,
+    at_revision: MemoryRevision,
     query_tokens: &[String],
     normalized_query: &str,
     exact_query: &str,
 ) -> Option<RankedRecallCandidate> {
     let candidate_tokens = eliot_types::normalize_query_tokens(&row.search_text);
     let preview_tokens = eliot_types::normalize_query_tokens(&row.preview);
+    let cue_tokens = eliot_types::normalize_query_tokens(&row.cue_text);
+    let concept_tokens = eliot_types::normalize_query_tokens(&row.concept_text);
     let normalized_preview = preview_tokens.join(" ");
     let overlap = query_tokens
         .iter()
@@ -613,33 +675,100 @@ fn rank_recall_candidate(
         i32::from(!normalized_query.is_empty() && normalized_preview.contains(normalized_query))
             * 140;
     let lexical_overlap = overlap_score * 40 + exact_preview + preview_contains;
-    let lifecycle_fit = if matches!(
-        row.lifecycle_state,
+    let normalized_cues = cue_tokens.join(" ");
+    let query_exact_cue = i32::from(
+        !normalized_query.is_empty()
+            && (normalized_cues == normalized_query || normalized_cues.contains(normalized_query)),
+    ) * 180;
+    let requested_cue_hits = request
+        .task_class_cues
+        .iter()
+        .flat_map(|cue| eliot_types::normalize_query_tokens(cue))
+        .filter(|cue| cue_tokens.contains(cue))
+        .count();
+    let exact_cue = query_exact_cue + i32::try_from(requested_cue_hits.min(4)).unwrap_or(4) * 40;
+    let task_relation = i32::from(
+        request.task_id.is_some() && row.task_id.is_some() && request.task_id == row.task_id,
+    ) * 120;
+    let concept_query_overlap = query_tokens
+        .iter()
+        .filter(|token| concept_tokens.contains(token))
+        .count();
+    let requested_concept_hits = request
+        .concept_refs
+        .iter()
+        .flat_map(|concept| eliot_types::normalize_query_tokens(concept))
+        .filter(|token| concept_tokens.contains(token))
+        .count();
+    let concept_relation = i32::try_from(concept_query_overlap.min(4)).unwrap_or(4) * 25
+        + i32::try_from(requested_concept_hits.min(4)).unwrap_or(4) * 40;
+    let lifecycle_fit = match row.lifecycle_state {
         Some(
-            eliot_types::MemoryLifecycleState::Stale
-                | eliot_types::MemoryLifecycleState::Suppressed
+            eliot_types::MemoryLifecycleState::Active | eliot_types::MemoryLifecycleState::Restored,
         )
+        | None => 20,
+        Some(eliot_types::MemoryLifecycleState::Dormant) => -20,
+        _ => 0,
+    };
+    let evidence_authority = row.authority_rank.clamp(0, 100);
+    let revision_distance = row.memory_revision.map_or(u64::MAX, |revision| {
+        at_revision.value().saturating_sub(revision.value())
+    });
+    let freshness_fit = match revision_distance {
+        0 => 40,
+        1..=5 => 20,
+        6..=50 => 5,
+        _ => 0,
+    };
+    let negative_memory_value = i32::from(row.negative_memory && overlap > 0) * 80;
+    let known_decision_delta = i32::from(row.known_decision_delta > 0 && overlap > 0) * 60;
+    let prior_beneficial_use = row.prior_beneficial_use.clamp(0, 10) * 5;
+    let verification_value = if overlap > 0 {
+        row.verification_value.clamp(0, 100)
+    } else {
+        0
+    };
+    let context_cost = -i32::try_from(row.preview.len().div_ceil(64).min(40)).unwrap_or(40);
+    let stale_penalty = if matches!(
+        row.lifecycle_state,
+        Some(eliot_types::MemoryLifecycleState::Stale)
     ) || row.status.eq_ignore_ascii_case("stale")
     {
         -300
     } else {
         0
     };
-    let evidence_authority = match row.status.to_ascii_lowercase().as_str() {
-        "verified" => 80,
-        "supported" => 50,
-        "candidate" => 10,
-        _ => 0,
-    };
-    let negative_memory = i32::from(row.negative_memory && overlap > 0) * 80;
+    let contradiction_penalty = i32::from(row.contradiction_signal) * -120;
+    let harm_penalty = i32::from(row.harm_signal) * -250;
+    let repetition_penalty = i32::from(row.repetition_signal) * -40;
+    let weak_single_token = query_tokens.len() > 2 && overlap == 1;
+    let distraction_penalty = i32::from(row.distraction_signal || weak_single_token) * -60;
     let total = exact_identifier
         + subject_identity
         + lexical_overlap
+        + exact_cue
+        + task_relation
+        + scope_fit
+        + concept_relation
         + lifecycle_fit
+        + freshness_fit
         + evidence_authority
-        + negative_memory;
-    let lexical_signal = overlap > 0 || exact_preview > 0 || preview_contains > 0;
-    if exact_identifier == 0 && (!lexical_signal || total < 80) {
+        + negative_memory_value
+        + known_decision_delta
+        + prior_beneficial_use
+        + verification_value
+        + context_cost
+        + stale_penalty
+        + contradiction_penalty
+        + harm_penalty
+        + repetition_penalty
+        + distraction_penalty;
+    let retrieval_signal = overlap > 0
+        || exact_preview > 0
+        || preview_contains > 0
+        || exact_cue > 0
+        || concept_relation > 0;
+    if exact_identifier == 0 && (!retrieval_signal || total < 80) {
         return None;
     }
     let mut reasons = Vec::new();
@@ -658,11 +787,44 @@ fn rank_recall_candidate(
     if preview_contains > 0 {
         reasons.push("preview_contains_query".to_owned());
     }
-    if negative_memory > 0 {
+    if exact_cue > 0 {
+        reasons.push("exact_normalized_cue".to_owned());
+    }
+    if task_relation > 0 {
+        reasons.push("current_task_relation".to_owned());
+    }
+    if scope_fit > 0 {
+        reasons.push("scope_fit".to_owned());
+    }
+    if concept_relation > 0 {
+        reasons.push("concept_relation".to_owned());
+    }
+    if negative_memory_value > 0 {
         reasons.push("negative_memory_overlap".to_owned());
     }
-    if lifecycle_fit < 0 {
-        reasons.push("stale_or_suppressed".to_owned());
+    if known_decision_delta > 0 {
+        reasons.push("known_decision_delta".to_owned());
+    }
+    if prior_beneficial_use > 0 {
+        reasons.push("prior_beneficial_use".to_owned());
+    }
+    if verification_value > 0 {
+        reasons.push("verification_value".to_owned());
+    }
+    if stale_penalty < 0 {
+        reasons.push("stale_penalty".to_owned());
+    }
+    if contradiction_penalty < 0 {
+        reasons.push("contradiction_penalty".to_owned());
+    }
+    if harm_penalty < 0 {
+        reasons.push("harm_penalty".to_owned());
+    }
+    if repetition_penalty < 0 {
+        reasons.push("repetition_penalty".to_owned());
+    }
+    if distraction_penalty < 0 {
+        reasons.push("distraction_penalty".to_owned());
     }
     Some(RankedRecallCandidate {
         score: L0FeatureScore {
@@ -670,16 +832,150 @@ fn rank_recall_candidate(
             exact_identifier,
             subject_identity,
             lexical_overlap,
-            task_relation: 0,
-            scope_fit: 0,
+            task_relation,
+            scope_fit,
             lifecycle_fit,
             evidence_authority,
-            prior_decision_delta: negative_memory,
+            prior_decision_delta: negative_memory_value,
+            exact_cue,
+            concept_relation,
+            freshness_fit,
+            negative_memory_value,
+            known_decision_delta,
+            prior_beneficial_use,
+            verification_value,
+            context_cost,
+            stale_penalty,
+            contradiction_penalty,
+            harm_penalty,
+            repetition_penalty,
+            distraction_penalty,
             total,
             reasons,
         },
         row,
     })
+}
+
+fn is_default_visible_lifecycle(state: Option<eliot_types::MemoryLifecycleState>) -> bool {
+    !matches!(
+        state,
+        Some(
+            eliot_types::MemoryLifecycleState::Suppressed
+                | eliot_types::MemoryLifecycleState::Archived
+                | eliot_types::MemoryLifecycleState::Quarantined
+                | eliot_types::MemoryLifecycleState::Forgotten
+                | eliot_types::MemoryLifecycleState::HardDeleted
+        )
+    )
+}
+
+fn normalize_scope(value: &str) -> String {
+    value
+        .trim()
+        .replace('\\', "/")
+        .trim_matches('/')
+        .to_lowercase()
+}
+
+fn recall_scope_fit(candidate_scope: &str, requested_scopes: &[String]) -> Option<i32> {
+    if requested_scopes.is_empty() || candidate_scope.trim().is_empty() {
+        return Some(0);
+    }
+    let candidate = normalize_scope(candidate_scope);
+    requested_scopes
+        .iter()
+        .map(|scope| normalize_scope(scope))
+        .any(|scope| {
+            !scope.is_empty()
+                && (candidate == scope
+                    || candidate.starts_with(&format!("{scope}/"))
+                    || scope.starts_with(&format!("{candidate}/")))
+        })
+        .then_some(90)
+}
+
+fn recall_candidate_preference(row: &RecallCandidateRow) -> (u64, u64, i32) {
+    (
+        row.memory_revision.map_or(0, MemoryRevision::value),
+        row.project_sequence.map_or(0, ProjectSequence::value),
+        row.authority_rank,
+    )
+}
+
+fn choose_authoritative_candidate(
+    mut rows: Vec<(RecallCandidateRow, i32)>,
+    reason: &str,
+    traces: &mut Vec<L0CollapsedDuplicateTrace>,
+) -> (RecallCandidateRow, i32) {
+    rows.sort_by(|(left, _), (right, _)| {
+        recall_candidate_preference(right)
+            .cmp(&recall_candidate_preference(left))
+            .then_with(|| left.handle.cmp(&right.handle))
+            .then_with(|| left.record_ref.cmp(&right.record_ref))
+    });
+    let authoritative = rows.remove(0);
+    if !rows.is_empty() {
+        traces.push(L0CollapsedDuplicateTrace {
+            authoritative_handle: authoritative.0.handle.clone(),
+            collapsed_record_refs: rows
+                .into_iter()
+                .map(|(row, _)| {
+                    if row.record_ref.is_empty() {
+                        row.handle
+                    } else {
+                        row.record_ref
+                    }
+                })
+                .collect(),
+            reason: reason.to_owned(),
+        });
+    }
+    authoritative
+}
+
+fn collapse_recall_candidates(
+    candidates: Vec<(RecallCandidateRow, i32)>,
+) -> (
+    Vec<(RecallCandidateRow, i32)>,
+    Vec<L0CollapsedDuplicateTrace>,
+) {
+    let mut traces = Vec::new();
+    let mut by_handle = BTreeMap::<String, Vec<(RecallCandidateRow, i32)>>::new();
+    for candidate in candidates {
+        by_handle
+            .entry(candidate.0.handle.clone())
+            .or_default()
+            .push(candidate);
+    }
+    let current = by_handle
+        .into_values()
+        .map(|rows| choose_authoritative_candidate(rows, "superseded_revision", &mut traces))
+        .collect::<Vec<_>>();
+
+    let mut by_semantics = BTreeMap::<String, Vec<(RecallCandidateRow, i32)>>::new();
+    for candidate in current {
+        let preview = eliot_types::normalize_query_tokens(&candidate.0.preview).join(" ");
+        let semantics = if preview.is_empty() {
+            candidate.0.handle.clone()
+        } else {
+            format!(
+                "{}|{}|{}|{}|{}|{}",
+                candidate.0.record_type,
+                preview,
+                normalize_scope(&candidate.0.scope_text),
+                eliot_types::normalize_query_tokens(&candidate.0.concept_text).join(" "),
+                candidate.0.status.to_ascii_lowercase(),
+                candidate.0.negative_memory
+            )
+        };
+        by_semantics.entry(semantics).or_default().push(candidate);
+    }
+    let deduplicated = by_semantics
+        .into_values()
+        .map(|rows| choose_authoritative_candidate(rows, "semantic_duplicate", &mut traces))
+        .collect();
+    (deduplicated, traces)
 }
 
 #[derive(Clone, Debug)]
@@ -1149,14 +1445,88 @@ impl CanonicalStore {
         &self,
         request: &RecallL0Request,
     ) -> Result<RecallL0Response, StoreError> {
-        let value = self
-            .execute_value(
-                NamedSurqlOp::LoadRecallCandidates,
-                json!({ "project_id": request.project_id }),
-            )
-            .await?;
-        let load: RecallCandidateLoad = decode_value(NamedSurqlOp::LoadRecallCandidates, value)?;
-        Ok(rank_recall_candidates(request, load))
+        for _attempt in 0..RECALL_REVISION_RESTART_ATTEMPTS {
+            let mut at_revision = None;
+            let mut candidates = Vec::new();
+            let mut scan_truncated = false;
+            let mut revision_drift = false;
+            'projection: for kind in RECALL_CANDIDATE_KINDS {
+                let mut start = 0;
+                loop {
+                    let value = self
+                        .execute_value(
+                            NamedSurqlOp::LoadRecallCandidates,
+                            json!({
+                                "project_id": request.project_id,
+                                "kind": kind,
+                                "start": start,
+                                "limit": RECALL_CANDIDATE_PAGE_SIZE,
+                                "lifecycle_audit": request.lifecycle_audit,
+                            }),
+                        )
+                        .await?;
+                    let mut page: RecallCandidateLoad =
+                        decode_value(NamedSurqlOp::LoadRecallCandidates, value)?;
+                    if at_revision.is_some_and(|revision| revision != page.at_revision) {
+                        revision_drift = true;
+                        break 'projection;
+                    }
+                    at_revision.get_or_insert(page.at_revision);
+                    let page_len = page.candidates.len();
+                    let remaining = MAX_RECALL_SCAN_CANDIDATES.saturating_sub(candidates.len());
+                    if page_len > remaining {
+                        page.candidates.truncate(remaining);
+                        scan_truncated = true;
+                    }
+                    candidates.append(&mut page.candidates);
+                    if scan_truncated {
+                        break 'projection;
+                    }
+                    if !page.truncated {
+                        break;
+                    }
+                    if page_len == 0 {
+                        return Err(StoreError::PolicyViolation(
+                            "recall candidate projection returned an empty truncated page"
+                                .to_owned(),
+                        ));
+                    }
+                    start += page_len;
+                }
+            }
+            if revision_drift {
+                continue;
+            }
+            let head_value = self
+                .execute_value(
+                    NamedSurqlOp::LoadRecallCandidates,
+                    json!({
+                        "project_id": request.project_id,
+                        "kind": "head",
+                        "start": 0,
+                        "limit": 1,
+                        "lifecycle_audit": request.lifecycle_audit,
+                    }),
+                )
+                .await?;
+            let head: RecallCandidateLoad =
+                decode_value(NamedSurqlOp::LoadRecallCandidates, head_value)?;
+            if at_revision.is_some_and(|revision| revision != head.at_revision) {
+                continue;
+            }
+            return Ok(rank_recall_candidates(
+                request,
+                RecallCandidateLoad {
+                    at_revision: head.at_revision,
+                    candidates,
+                    truncated: scan_truncated,
+                },
+            ));
+        }
+        Err(StoreError::PolicyViolation(
+            "recall candidate projection could not obtain a stable project revision after 3 attempts"
+                .to_owned(),
+        ))
     }
 
     pub async fn fetch_atoms_l2(

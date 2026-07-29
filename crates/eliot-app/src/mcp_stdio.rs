@@ -1754,9 +1754,14 @@ struct AgentResultDispositionToolInput {
 struct RecallL0ToolInput {
     project_id: String,
     query: String,
-    #[allow(dead_code)]
     scope: Option<String>,
     limit: Option<usize>,
+    #[serde(default)]
+    lifecycle_audit: bool,
+    #[serde(default)]
+    task_class_cues: Vec<String>,
+    #[serde(default)]
+    concept_refs: Vec<String>,
 }
 
 #[derive(serde::Deserialize)]

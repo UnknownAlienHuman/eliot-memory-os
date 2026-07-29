@@ -184,6 +184,10 @@ impl ContextCompiler {
                     consistency: ReadConsistencyMode::AtLeastRevision,
                     at_least_revision: Some(revision),
                     lifecycle_audit: false,
+                    task_id: request.task_id.parse().ok(),
+                    task_class_cues: Vec::new(),
+                    scope_refs: Vec::new(),
+                    concept_refs: Vec::new(),
                 })
                 .await?;
             handles.extend(recall.handles.iter().map(|preview| preview.handle.clone()));

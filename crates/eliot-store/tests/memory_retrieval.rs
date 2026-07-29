@@ -87,6 +87,10 @@ fn recall_request(project_id: ProjectId, query: impl Into<String>) -> RecallL0Re
         consistency: ReadConsistencyMode::Latest,
         at_least_revision: None,
         lifecycle_audit: false,
+        task_id: None,
+        task_class_cues: Vec::new(),
+        scope_refs: Vec::new(),
+        concept_refs: Vec::new(),
     }
 }
 
@@ -289,13 +293,13 @@ async fn query_aware_l0_and_exact_l2_are_bounded_scoped_and_restart_deterministi
     let ranked = store
         .recall_l0(&recall_request(project_id, "omega needle"))
         .await?;
-    assert_eq!(ranked.rank_trace.candidates_considered, 65);
+    assert_eq!(ranked.rank_trace.candidates_considered, 66);
     assert_eq!(ranked.rank_trace.candidates_returned, 12);
     assert!(ranked.truncation.truncated);
     assert_eq!(ranked.handles[0].handle, format!("claim:{exact_id}"));
     assert_eq!(
         ranked.rank_trace.query_mode,
-        "unicode_multi_kind_deterministic_v3"
+        "unicode_multi_kind_lifecycle_aware_v4"
     );
     assert_eq!(ranked.rank_trace.feature_scores[0].lexical_overlap, 470);
 
@@ -650,7 +654,7 @@ async fn unicode_multi_kind_recall_and_ul_expansion_are_truthful_and_scoped()
     assert!(scoped.handles.iter().all(|handle| handle.handle
         != format!("claim:{foreign_claim_id}")
         && handle.handle != format!("card:{foreign_card_id}")));
-    assert_eq!(scoped.rank_trace.candidates_considered, 4);
+    assert_eq!(scoped.rank_trace.candidates_considered, 6);
 
     let absent = store
         .recall_l0(&recall_request(
@@ -798,7 +802,7 @@ async fn neutral_l15_paraphrases_recall_the_right_admitted_memory_without_handle
         );
         assert_eq!(
             recalled.rank_trace.query_mode,
-            "unicode_multi_kind_deterministic_v3"
+            "unicode_multi_kind_lifecycle_aware_v4"
         );
     }
 

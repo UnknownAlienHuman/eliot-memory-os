@@ -1139,13 +1139,16 @@ pub(super) fn core_tool_definitions() -> Vec<Value> {
         tool(
             "eliot_recall_l0",
             "Eliot Recall L0",
-            "Search memory by keywords. Use when you need knowledge NOT already injected (ul_boot/ul_fired). Needs: query (plain words). Returns: handles + one-liners.",
+            "Search the current multi-kind memory projection by keywords. Scope and lifecycle filtering happen before ranking; lifecycle_audit explicitly exposes audit-only records. Returns at most 12 compact handles plus inspectable integer rank features.",
             &json_schema(
                 &[
                     ("project_id", "string"),
                     ("query", "string"),
                     ("scope", "string"),
                     ("limit", "integer"),
+                    ("lifecycle_audit", "boolean"),
+                    ("task_class_cues", "array"),
+                    ("concept_refs", "array"),
                 ],
                 &["project_id", "query"],
             ),

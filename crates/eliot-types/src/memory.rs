@@ -650,6 +650,14 @@ pub struct RecallL0Request {
     pub at_least_revision: Option<MemoryRevision>,
     #[serde(default)]
     pub lifecycle_audit: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_id: Option<TaskId>,
+    #[serde(default)]
+    pub task_class_cues: Vec<String>,
+    #[serde(default)]
+    pub scope_refs: Vec<String>,
+    #[serde(default)]
+    pub concept_refs: Vec<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -694,6 +702,8 @@ pub struct L0RankTrace {
     pub feature_scores: Vec<L0FeatureScore>,
     pub lifecycle_suppressions: Vec<L0SuppressionTrace>,
     pub scope_suppressions: Vec<L0SuppressionTrace>,
+    #[serde(default)]
+    pub collapsed_duplicates: Vec<L0CollapsedDuplicateTrace>,
     pub no_useful_memory: bool,
     pub query_mode: String,
 }
@@ -709,6 +719,32 @@ pub struct L0FeatureScore {
     pub lifecycle_fit: i32,
     pub evidence_authority: i32,
     pub prior_decision_delta: i32,
+    #[serde(default)]
+    pub exact_cue: i32,
+    #[serde(default)]
+    pub concept_relation: i32,
+    #[serde(default)]
+    pub freshness_fit: i32,
+    #[serde(default)]
+    pub negative_memory_value: i32,
+    #[serde(default)]
+    pub known_decision_delta: i32,
+    #[serde(default)]
+    pub prior_beneficial_use: i32,
+    #[serde(default)]
+    pub verification_value: i32,
+    #[serde(default)]
+    pub context_cost: i32,
+    #[serde(default)]
+    pub stale_penalty: i32,
+    #[serde(default)]
+    pub contradiction_penalty: i32,
+    #[serde(default)]
+    pub harm_penalty: i32,
+    #[serde(default)]
+    pub repetition_penalty: i32,
+    #[serde(default)]
+    pub distraction_penalty: i32,
     pub total: i32,
     pub reasons: Vec<String>,
 }
@@ -716,6 +752,13 @@ pub struct L0FeatureScore {
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct L0SuppressionTrace {
     pub handle: String,
+    pub reason: String,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct L0CollapsedDuplicateTrace {
+    pub authoritative_handle: String,
+    pub collapsed_record_refs: Vec<String>,
     pub reason: String,
 }
 

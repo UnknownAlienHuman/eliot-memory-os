@@ -222,6 +222,10 @@ pub async fn run_memory_recall_l0(config_path: &Path, project: &str, query: &str
         consistency: ReadConsistencyMode::Latest,
         at_least_revision: None,
         lifecycle_audit: false,
+        task_id: None,
+        task_class_cues: Vec::new(),
+        scope_refs: Vec::new(),
+        concept_refs: Vec::new(),
     };
     let service = ReadService::new(CanonicalStore::new(config.db.surreal));
     let response = service.recall_l0(&request).await?;

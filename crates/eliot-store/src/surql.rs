@@ -475,7 +475,7 @@ fn foundational_templates() -> [SurqlTemplate; 41] {
             NamedSurqlOp::LoadRecallCandidates,
             "LoadRecallCandidatesInput",
             "LoadRecallCandidatesOutput",
-            128 * 1024,
+            512 * 1024,
         ),
         template(
             NamedSurqlOp::FetchAtomsL2,
@@ -675,17 +675,25 @@ mod tests {
     }
 
     #[test]
-    fn l0_candidate_load_is_bounded_multi_kind_and_does_not_rank() {
+    fn l0_candidate_load_is_paged_multi_kind_and_does_not_rank() {
         let template = NamedSurqlOp::LoadRecallCandidates.template();
 
         assert!(template.contains("FROM claim_card"));
+        assert!(template.contains("FROM evidence_atom"));
+        assert!(template.contains("FROM verification_run"));
+        assert!(template.contains("FROM tool_observation"));
         assert!(template.contains("FROM failure_fingerprint"));
         assert!(template.contains("FROM canonical_record"));
         assert!(template.contains("'module_card'"));
         assert!(template.contains("'subsystem_capsule'"));
         assert!(template.contains("'project_charter'"));
         assert!(template.contains("'system_map'"));
-        assert!(template.contains("array::slice($all_candidates, 0, 512)"));
+        assert!(template.contains("START $start LIMIT $page_limit_plus_one"));
+        assert!(template.contains("array::slice($rows, 0, $limit)"));
+        assert!(template.contains("$lifecycle_audit"));
+        assert!(!template.contains("LIMIT 257"));
+        assert!(!template.contains("LIMIT 129"));
+        assert!(!template.contains("array::slice($all_candidates, 0, 512)"));
         assert!(!template.contains("string::words"));
         assert!(!template.contains("string::slug"));
         assert!(!template.contains("relevance_score"));

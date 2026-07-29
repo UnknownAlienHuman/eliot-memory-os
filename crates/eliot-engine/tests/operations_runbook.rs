@@ -220,6 +220,10 @@ async fn real_surreal_store_backup_restore_to_new_root() -> TestResult {
             consistency: ReadConsistencyMode::Latest,
             at_least_revision: None,
             lifecycle_audit: false,
+            task_id: None,
+            task_class_cues: Vec::new(),
+            scope_refs: Vec::new(),
+            concept_refs: Vec::new(),
         })
         .await?;
     assert!(
@@ -317,6 +321,10 @@ async fn real_surreal_store_backup_restore_to_new_root() -> TestResult {
             consistency: ReadConsistencyMode::Latest,
             at_least_revision: None,
             lifecycle_audit: false,
+            task_id: None,
+            task_class_cues: Vec::new(),
+            scope_refs: Vec::new(),
+            concept_refs: Vec::new(),
         })
         .await?;
     assert!(imported_recall.handles.iter().any(|handle| {

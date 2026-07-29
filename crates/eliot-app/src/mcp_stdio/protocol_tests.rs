@@ -1382,6 +1382,7 @@ fn operator_memory_projection_exposes_rank_suppression_and_exact_resolution_fiel
                     prior_decision_delta: 0,
                     total: 380,
                     reasons: vec!["lexical_and_task_relation".to_owned()],
+                    ..Default::default()
                 },
                 eliot_types::L0FeatureScore {
                     handle: suppressed_handle.clone(),
@@ -1396,6 +1397,7 @@ fn operator_memory_projection_exposes_rank_suppression_and_exact_resolution_fiel
                 reason: "lifecycle_suppressed".to_owned(),
             }],
             scope_suppressions: Vec::new(),
+            collapsed_duplicates: Vec::new(),
             no_useful_memory: false,
             query_mode: "query_aware_semantic_lexical_relational_v2".to_owned(),
         },

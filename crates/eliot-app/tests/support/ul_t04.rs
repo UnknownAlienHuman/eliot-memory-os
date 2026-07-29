@@ -7,7 +7,8 @@ use eliot_engine::{
 use eliot_store::{CanonicalStore, ControlWal};
 use eliot_types::{
     ControlWalConfig, CredentialProviderKind, CurrentStateRequest, GovernorConfig, MemoryRevision,
-    ObservabilityKind, ProjectId, ReadConsistencyMode, SemanticCommand, TaskId, WriteReceipt,
+    MemoryWriteEnvelope, ObservabilityKind, ProjectId, ReadConsistencyMode, RecallL0Request,
+    RecallL0Response, SemanticCommand, TaskId, WriteReceipt,
 };
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
@@ -170,6 +171,19 @@ impl Harness {
             actor.await?;
             Ok(receipts)
         })
+    }
+
+    pub fn apply_memory_envelope(
+        &self,
+        envelope: &MemoryWriteEnvelope,
+    ) -> TestResult<WriteReceipt> {
+        Ok(self
+            .store_runtime
+            .block_on(self.store.apply_write_envelope(envelope))?)
+    }
+
+    pub fn recall_l0(&self, request: &RecallL0Request) -> TestResult<RecallL0Response> {
+        Ok(self.store_runtime.block_on(self.store.recall_l0(request))?)
     }
 
     pub fn write_module_cards(

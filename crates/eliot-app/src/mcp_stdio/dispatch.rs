@@ -700,7 +700,11 @@ pub(super) async fn dispatch_tool(
                     query: input.query,
                     consistency: ReadConsistencyMode::Latest,
                     at_least_revision: None,
-                    lifecycle_audit: false,
+                    lifecycle_audit: input.lifecycle_audit,
+                    task_id: context.bound_task_id,
+                    task_class_cues: input.task_class_cues,
+                    scope_refs: input.scope.into_iter().collect(),
+                    concept_refs: input.concept_refs,
                 })
                 .await?;
             let limit = input
