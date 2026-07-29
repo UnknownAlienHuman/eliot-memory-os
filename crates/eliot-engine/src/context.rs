@@ -1355,37 +1355,62 @@ fn enforce_budget(
 ) -> Result<(), EngineError> {
     let required_handles = required_handles.iter().collect::<BTreeSet<_>>();
     let mut sections_truncated = Vec::new();
+    packet.token_budget_report = TokenBudgetReport {
+        max_tokens,
+        estimated_tokens: 0,
+        truncated: false,
+        sections_truncated: Vec::new(),
+    };
+
     loop {
-        let truncated = !sections_truncated.is_empty();
-        let mut estimated = estimate_tokens(packet)?;
-        for _ in 0..4 {
-            packet.token_budget_report = TokenBudgetReport {
-                max_tokens,
-                estimated_tokens: estimated,
-                truncated,
-                sections_truncated: sections_truncated.clone(),
-            };
-            let next = estimate_tokens(packet)?;
-            if next == estimated {
-                break;
-            }
-            estimated = next;
-        }
-        packet.token_budget_report.estimated_tokens = estimated;
-        let verified_estimate = estimate_tokens(packet)?;
-        if verified_estimate <= max_tokens {
-            packet.token_budget_report.estimated_tokens = verified_estimate;
-            packet.truncation.truncated |= truncated;
-            packet.truncation.returned = packet.exact_handles.len();
-            return Ok(());
+        let content_estimate = estimate_tokens(packet)?;
+        if content_estimate <= max_tokens {
+            break;
         }
         if !trim_next(packet, &required_handles, &mut sections_truncated) {
             return Err(EngineError::PacketFloorExceedsBudget {
                 max_tokens,
-                estimated_tokens: verified_estimate,
+                estimated_tokens: content_estimate,
                 section_tokens: section_token_accounting(packet)?,
             });
         }
+    }
+
+    let truncated = !sections_truncated.is_empty();
+    let verified_estimate =
+        finalize_budget_report(packet, max_tokens, truncated, &sections_truncated)?;
+    if verified_estimate > max_tokens {
+        return Err(EngineError::PacketFloorExceedsBudget {
+            max_tokens,
+            estimated_tokens: verified_estimate,
+            section_tokens: section_token_accounting(packet)?,
+        });
+    }
+    packet.truncation.truncated |= truncated;
+    packet.truncation.returned = packet.exact_handles.len();
+    Ok(())
+}
+
+fn finalize_budget_report(
+    packet: &mut ContextPacketL3,
+    max_tokens: usize,
+    truncated: bool,
+    sections_truncated: &[String],
+) -> Result<usize, EngineError> {
+    let mut estimated = 0;
+    loop {
+        packet.token_budget_report = TokenBudgetReport {
+            max_tokens,
+            estimated_tokens: estimated,
+            truncated,
+            sections_truncated: sections_truncated.to_owned(),
+        };
+        let next = estimate_tokens(packet)?;
+        if next == estimated {
+            return Ok(next);
+        }
+        debug_assert!(next > estimated);
+        estimated = next;
     }
 }
 
@@ -2116,22 +2141,52 @@ mod current_git_scope_tests {
             unknowns: vec!["unknown".repeat(1_000)],
         });
 
-        enforce_budget(
+        let before_budget = packet.clone();
+        let tight_result = enforce_budget(
             &mut packet,
             floor_tokens + 8,
             std::slice::from_ref(&required_handle),
-        )?;
+        );
 
-        assert_eq!(packet.exact_handles, [required_handle]);
+        assert!(matches!(
+            tight_result,
+            Err(EngineError::PacketFloorExceedsBudget { .. })
+        ));
+        assert_eq!(packet.exact_handles, std::slice::from_ref(&required_handle));
         assert!(packet.codecortex.is_none());
+        let expected_known_decisions = serde_json::to_value(&before_budget.known_decisions)?;
+        assert_eq!(
+            serde_json::to_value(&packet.known_decisions)?,
+            expected_known_decisions
+        );
         assert!(
             packet
                 .token_budget_report
                 .sections_truncated
                 .iter()
-                .all(|section| section.starts_with("codecortex."))
+                .all(|section| section.starts_with("codecortex.")),
+            "unexpected truncation order: {:?}",
+            packet.token_budget_report.sections_truncated
         );
-        assert!(packet.token_budget_report.estimated_tokens <= floor_tokens + 8);
+        let exact_cap = packet.token_budget_report.estimated_tokens;
+        assert!(exact_cap > floor_tokens + 8);
+
+        let mut exact_packet = before_budget;
+        enforce_budget(
+            &mut exact_packet,
+            exact_cap,
+            std::slice::from_ref(&required_handle),
+        )?;
+        assert_eq!(
+            exact_packet.exact_handles,
+            std::slice::from_ref(&required_handle)
+        );
+        assert!(exact_packet.codecortex.is_none());
+        assert_eq!(
+            serde_json::to_value(&exact_packet.known_decisions)?,
+            expected_known_decisions
+        );
+        assert_eq!(exact_packet.token_budget_report.estimated_tokens, exact_cap);
         Ok(())
     }
 }

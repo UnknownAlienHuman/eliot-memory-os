@@ -311,6 +311,60 @@ green.
   require a non-empty suggested probe. The focused credential-gated regression
   passed parent and child 1/1 in 12.39 seconds test time and 14.410 seconds end
   to end.
+- The third sealed run prepared on source
+  `3cffdf5b3346bc21abe315f7c82e2ea34cc3d6f7` in 8.464 seconds. Its
+  `workspace-verify` advanced through the complete application and integration
+  surface before failing after 326.801 seconds in the engine unit regression
+  `budget_drops_auto_codecortex_before_requested_handles`.
+- The diagnostic rerun failed in 7.362 seconds and made the ordering defect
+  exact: the packet reported
+  `codecortex.full_to_scope_summary`,
+  `codecortex.scope_summary_to_handle`,
+  `codecortex.handle_dropped`, and then `known_decisions`. The requested handle
+  survived, but the audit report's growing verbose truncation list was itself
+  included in every token estimate. Its self-accounting overhead therefore
+  forced an unrelated decision out after CodeCortex had already reached its
+  floor.
+- This was the third distinct late-suite incompatibility, so it crossed the
+  agreed escalation threshold. The open Claude Desktop session was verified as
+  `Opus 5` with `Max` effort, but Terminator could not place text into the
+  prompt and no request was sent. The first non-interactive Claude Code attempt
+  also stopped before dispatch in 0.505 seconds because the supplied empty MCP
+  JSON lacked the required `mcpServers` record. It produced no stdout, only the
+  local validation error, and therefore consumed no provider call. Raw
+  provider-attempt evidence remains under the private certification root.
+- The corrected no-tool Claude Code consultation completed in 158.991 seconds
+  with exit 0. The requested CLI alias was `opus` at `max` effort, but the
+  returned provider accounting resolved it to backend model
+  `claude-opus-4-8`, not the `Opus 5` label visible in Claude Desktop. This
+  mismatch is recorded explicitly and the result is not represented as an
+  Opus 5 certification. The raw JSON is
+  SHA-256
+  `fe66a874e15a1daedbd089892a3e79d590f86c589db49d7d62cb5ba0b476b300`;
+  stderr was empty.
+- The consultation classified the token-budget failure as a product defect:
+  mutating an in-band audit while measuring the same packet creates
+  self-accounting pressure. It recommended bounded reservation/finalization,
+  compact codes or a sidecar, exact-cap checks, and a typed error when
+  protected content plus audit cannot fit.
+- Chose the smallest non-breaking repair: retain the readable public
+  `Vec<String>` audit schema, perform content trimming against a fixed empty
+  report, finalize the complete audit once, and return
+  `PacketFloorExceedsBudget` if mandatory audit metadata alone crosses the cap.
+  The function no longer evicts later decision state merely to fund its own
+  growing report, never raises the cap, and preserves exact-cap semantics.
+- Focused repair attempt 1 stopped at compile time after 7.275 seconds because
+  `ClaimCard` intentionally lacks `PartialEq`; attempt 2 stopped after 2.459
+  seconds because an assertion moved a required-handle `String`. Both were
+  narrow test-harness defects and never exercised the algorithm. Canonical JSON
+  comparison and borrowed-slice assertions fixed them.
+- The repaired budget regression then passed 1/1 in 0.00 seconds test-body time
+  and 33.076 seconds end to end, including 24.67 seconds of relinking. It proves
+  that the tight cap fails closed without dropping `known_decisions`, while a
+  fresh packet at the exact reported minimum cap succeeds with equality.
+- Focused clippy attempt 1 found one borrowed-slice improvement and three
+  forbidden test `expect` calls in 36.216 seconds. After the narrow repair,
+  clippy passed in 8.937 seconds and formatting passed in 1.586 seconds.
 
 ## Logging rule
 
