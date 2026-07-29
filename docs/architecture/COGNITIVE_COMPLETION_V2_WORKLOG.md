@@ -22,6 +22,7 @@ or change to the next action.
 | C2 | `6358b5d` | Six-hop typed project-understanding model, continuity/history, CodeCortex freshness/scope, host matrices, budget ladder, exact claim-only gating. |
 | C3 | `115babb` | Unified paged projection, revision fence/restart, lifecycle/scope and request context, inspectable ranking, dedup/supersession, operator fields. |
 | C4 | `305d84c` | Canonical utility ledger, pure distillation plan and governed apply, exact-only reversible automation, lifecycle/tier controls, bounded sleep, stable paging beyond 1,000. |
+| C5 | `90ad9cc` | Project-local bounded writer lanes, sole batched WAL actor, retry/unknown isolation, four-host seven-tool parity, concurrency/recovery/outage/secret gates. |
 
 ## Material attempts and timing evidence
 
@@ -41,9 +42,10 @@ or change to the next action.
   compilation continued; after the build completed, the test passed in
   0.252 seconds and CLI help passed in 0.836 seconds.
 
-## Current checkpoint: C5
+## Phase C5 acceptance record
 
-C5 implementation is in progress and is not yet accepted.
+C5 is accepted at `90ad9cc`. C6 cognitive field certification is now in
+progress.
 
 Confirmed gap:
 
@@ -63,10 +65,12 @@ Confirmed existing foundations:
 
 Next actions:
 
-1. Re-run the focused live C5 SurrealDB acceptance at the final C5 source
-   state.
-2. Run format, diff, and clippy gates; commit the accepted C5 phase.
-3. Begin the sealed C6 cognitive certification harness only after C5 is green.
+1. Inventory the existing cognitive runner, sealed oracle/reader/judge
+   contracts, fixtures, second-repository path, and provider adapters.
+2. Build deterministic and integration tiers before any quota-bearing provider
+   call.
+3. Run fresh Claude and Antigravity field cases only after the local C6 gates
+   are green, recording the actual resolved model and sealed verdicts.
 
 ### 2026-07-29 implementation log
 
@@ -159,6 +163,13 @@ Next actions:
   failure, secret leak, process leak, provider call, or host-configuration
   change; evidence log SHA-256
   `82d589819f7bb24d37d9a5eef4a51d1a0415b3b8f1eb8e87307be356a76352cd`.
+
+## Current checkpoint: C6
+
+C6 has not yet been accepted. The first action is a bounded inventory of the
+existing cognitive certification implementation against the master contract;
+do not spend provider quota until the deterministic and integration tiers are
+green.
 
 ## Logging rule
 
