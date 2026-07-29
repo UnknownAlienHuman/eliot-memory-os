@@ -533,21 +533,33 @@ pub fn record_provider(report_root: &Path, private_root: &Path, receipt_path: &P
                 "Worker/Reader provider surface contains private oracle values"
             );
         }
-        let target_name = match receipt.role {
+        let (target_name, reader_binding) = match receipt.role {
             CognitiveFieldRole::CodexWorker => {
                 let worker: CognitiveWorkerResult = serde_json::from_slice(&bytes)?;
                 validate_worker_output(&worker, execution, case, &deterministic)?;
-                "worker.json"
+                ("worker.json", None)
             }
             CognitiveFieldRole::UnderstandingReader => {
                 let reader: CognitiveUnderstandingAnswer = serde_json::from_slice(&bytes)?;
                 validate_reader_output(&reader, execution, &deterministic)?;
-                "reader.json"
+                (
+                    "reader.json",
+                    Some(json!({
+                        "schema_version": "eliot-cognitive-reader-binding-v1",
+                        "run_id": contract.run_id,
+                        "source_commit": contract.source_commit,
+                        "case_id": execution.case_id,
+                        "memory_condition": condition_name(execution.memory_condition),
+                        "reader_output_hash":
+                            CognitiveFieldGradingService::hash_json(&reader)?,
+                        "reader_output_sha256": output.output_sha256,
+                    })),
+                )
             }
             CognitiveFieldRole::CodexJudge => {
                 let judge: CognitiveJudgeResult = serde_json::from_slice(&bytes)?;
                 validate_judge_output(&judge, execution, &oracle, &deterministic)?;
-                "judge.json"
+                ("judge.json", None)
             }
         };
         admitted.push((
@@ -555,6 +567,7 @@ pub fn record_provider(report_root: &Path, private_root: &Path, receipt_path: &P
             target_name,
             bytes,
             output.output_sha256.clone(),
+            reader_binding,
         ));
     }
 
@@ -612,8 +625,11 @@ pub fn record_provider(report_root: &Path, private_root: &Path, receipt_path: &P
         );
     }
     write_new_or_same_json(&invocation_path, &projection)?;
-    for (evidence_root, target_name, bytes, _) in &admitted {
+    for (evidence_root, target_name, bytes, _, reader_binding) in &admitted {
         write_new_or_same(&evidence_root.join(target_name), bytes)?;
+        if let Some(reader_binding) = reader_binding {
+            write_new_or_same_json(&evidence_root.join("reader-binding.json"), reader_binding)?;
+        }
         write_new_or_same_json(
             &evidence_root.join(format!("provider-{}.json", role_name(call.role))),
             &projection,
@@ -2399,6 +2415,16 @@ mod tests {
         write_new_or_same_json(&receipt_path, &receipt)?;
         record_provider(&report_root, &private_root, &receipt_path)?;
         assert!(evidence_root.join("reader.json").is_file());
+        let reader_binding: serde_json::Value =
+            serde_json::from_slice(&fs::read(evidence_root.join("reader-binding.json"))?)?;
+        assert_eq!(
+            reader_binding["reader_output_hash"],
+            CognitiveFieldGradingService::hash_json(&reader)?
+        );
+        assert_eq!(
+            reader_binding["reader_output_sha256"],
+            sha256_bytes(&fs::read(&reader_path)?)
+        );
         assert!(evidence_root.join("provider-reader.json").is_file());
         assert!(
             report_root

@@ -516,6 +516,44 @@ green.
   one distilled-corpus call; the four host smokes remain outside the cap.
   The focused 24-call/isolation regression passed 1/1 and clippy passed with
   warnings denied in 27.7 seconds total.
+- Committed the memory-condition isolation fix as
+  `0d752c521126b5c28892847efc2505055dcaaf82`. Its sealed prepare completed in
+  13.5 seconds with contract
+  `blake3:0be0fe8640a3e69cb658a20fe6d93740dc541c0df03da0dd829732889dd5eb86`
+  and zero provider calls.
+- The `0d752c5` full local gate passed again with materially improved duration:
+  `workspace-verify` 406,584 ms, context packets 2,575 ms, memory retrieval
+  19,963 ms, lifecycle 2,336 ms, and writer recovery 2,145 ms. Every completed
+  batch has an exit-0 hash-bound receipt. R01 had started as exactly one
+  controller/nextest/test/SurrealDB tree when the next final-head issue was
+  found; it was stopped through the exact test guardian and Surreal stop-file,
+  leaving zero matching processes. It is not counted as an R01 result.
+- Built a private, non-dispatching provider-plan generator. Its first parser
+  pass found one PowerShell interpolation ambiguity (`$runId:`); runtime pass
+  then found the reserved read-only `$Host` name. Both were generator-only
+  pre-dispatch failures and consumed no model calls. The repaired generator
+  produced exactly 28 calls: 24 condition-isolated capped calls and four
+  smokes, with calls JSON SHA-256
+  `3abdf0dd40bb6ed4b4e1476c47ed73169756eac58b9c9c20f9979d077e03fc92`.
+- The private route assigns Codex Worker/Judge to explicit
+  `gpt-5.6-sol`; the Claude smoke and one complex U06/U07/U08 Reader block to
+  `claude-opus-5`; four Antigravity Reader calls including smoke, Russian,
+  unseen-repository, and control scenarios to
+  `google-antigravity/gemini-3.6-flash-high`; and the remaining Reader calls
+  to `openai/gpt-5.4` through OpenCode. The plan remains unsealed until the
+  final source SHA has complete deterministic evidence.
+- Final provider rehearsal exposed one more practical Judge-input omission:
+  engine grading independently checks the Judge's BLAKE3
+  `reader_output_hash`, but Reader import published no Governor-computed hash
+  for a fresh read-only Judge. Requiring the model to reproduce Rust's typed
+  serialization would create false failures. Reader import now writes a
+  sanitized `eliot-cognitive-reader-binding-v1` containing the typed BLAKE3
+  hash, source/run/case/condition binding, and raw output SHA-256. Final grade
+  still recomputes the hash independently.
+- The first focused reader-binding compile attempt stopped after 5.8 seconds
+  because the test module referenced unimported `Value`/`read_json`; replacing
+  those with fully qualified `serde_json` parsing fixed only the fixture.
+  Reader import, 24-call plan, and clippy then passed in 26.8 seconds total.
 
 ## Logging rule
 
