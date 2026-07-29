@@ -14,10 +14,17 @@ const EXACT_SKILLS: [&str; 4] = [
 #[test]
 fn part_e_static_doctor_passes_for_all_native_hosts() -> TestResult {
     for host in ["codex", "claude", "antigravity"] {
-        let output = Command::new(env!("CARGO_BIN_EXE_eliot-governor"))
+        let mut command = Command::new(env!("CARGO_BIN_EXE_eliot-governor"));
+        command
             .args(["ul", "doctor", "--host", host])
-            .current_dir(repo_root())
-            .output()?;
+            .current_dir(repo_root());
+        if host == "codex" {
+            command.env(
+                "ELIOT_DOCTOR_CODEX_CONFIG",
+                repo_root().join("crates/eliot-app/tests/fixtures/codex_worker_config.toml"),
+            );
+        }
+        let output = command.output()?;
         assert!(
             output.status.success(),
             "{host}: {}",
@@ -28,6 +35,9 @@ fn part_e_static_doctor_passes_for_all_native_hosts() -> TestResult {
         assert!(stdout.contains(&format!("PASS {host} part-e-tool-list")));
         assert!(stdout.contains(&format!("PASS {host} description-budget")));
         assert!(stdout.contains(&format!("PASS {host} canonical-skills")));
+        if host == "codex" {
+            assert!(stdout.contains("PASS codex installed-registration"));
+        }
     }
     Ok(())
 }
@@ -72,6 +82,19 @@ fn codex_manifest_has_one_mcp_and_discoverable_hooks() -> TestResult {
             .and_then(Value::as_object)
             .map(serde_json::Map::len),
         Some(1)
+    );
+    assert_eq!(
+        mcp.pointer("/mcpServers/eliot/args"),
+        Some(&serde_json::json!([
+            "mcp",
+            "stdio",
+            "--host",
+            "codex",
+            "--profile",
+            "codex_worker",
+            "--instance",
+            "default"
+        ]))
     );
     assert!(package.join("hooks/hooks.json").is_file());
     Ok(())

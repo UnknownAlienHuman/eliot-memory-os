@@ -15,6 +15,8 @@ use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 
 pub const MAX_CANONICAL_RECORDS: u16 = 128;
+pub const MAX_CURRENT_UL_ARTIFACTS: usize = 4_096;
+pub const UL_ARTIFACT_PAGE_SIZE: u16 = 256;
 
 #[derive(Clone, Debug, Serialize)]
 pub struct CanonicalRecord<T> {

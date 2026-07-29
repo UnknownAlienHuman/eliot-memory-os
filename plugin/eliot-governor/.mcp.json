@@ -6,8 +6,12 @@
       "args": [
         "mcp",
         "stdio",
+        "--host",
+        "codex",
         "--profile",
-        "codex_controller"
+        "codex_worker",
+        "--instance",
+        "default"
       ]
     }
   }

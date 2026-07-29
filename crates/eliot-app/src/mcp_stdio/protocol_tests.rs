@@ -1077,6 +1077,28 @@ fn default_antigravity_remains_dynamic_agent() -> Result<()> {
 }
 
 #[test]
+fn installed_codex_profile_resolves_to_exact_worker_surface() -> Result<()> {
+    let profile = resolve_effective_profile("codex_worker", Some("codex"), false)?;
+    assert_eq!(profile, McpAccessProfile::CodexWorker);
+    let names = tool_definitions_for_profile(profile)
+        .into_iter()
+        .filter_map(|tool| tool["name"].as_str().map(str::to_owned))
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        names,
+        PART_E_WORKER_TOOLS
+            .iter()
+            .copied()
+            .map(str::to_owned)
+            .collect()
+    );
+    assert_eq!(names.len(), PART_E_WORKER_TOOLS.len());
+    assert!(!profile.allows("eliot_operator_command"));
+    assert!(!profile.allows("eliot_autonomy_runtime_action"));
+    Ok(())
+}
+
+#[test]
 fn explicit_antigravity_auditor_is_honored() -> Result<()> {
     assert_eq!(
         resolve_effective_profile("external_auditor", Some("antigravity"), false)?,

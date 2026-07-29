@@ -1,3 +1,4 @@
+use crate::task_execution::TaskExecutionClassifier;
 use crate::{
     EngineError, ReadService, SkillActivationContext, SkillCuratorService,
     SkillDistractorFilterService, WriteAdmissionService, WriterHandle,
@@ -98,7 +99,9 @@ impl ContextCompiler {
         if let Some(scope) = current_git_scope {
             resolve_memory_applicability(&mut packet, &scope_claims, scope);
         }
-        if code_related_request(request) {
+        packet.task_execution_class =
+            TaskExecutionClassifier::classify(request, frame, &[], &packet.exact_handles);
+        if packet.task_execution_class.requires_codecortex() {
             attach_codecortex_reports(&mut packet, codecortex_reports);
         }
         hydrate_material_packet(&mut packet, request, current_git_scope, frame);
@@ -539,6 +542,7 @@ fn assemble_packet(
         project_id: request.project_id,
         task_id: request.task_id.clone(),
         goal: request.goal.clone(),
+        task_execution_class: eliot_types::TaskExecutionClass::default(),
         memory_confidence: reads.recall.memory_confidence,
         acceptance_items: Vec::new(),
         at_revision: max_revision(reads.current_state.memory_revision, reads.fetch.at_revision),
@@ -884,21 +888,6 @@ fn codecortex_unknowns(report: &CodeCortexReport) -> Vec<String> {
     unknowns.sort();
     unknowns.dedup();
     unknowns
-}
-
-fn code_related_request(request: &CompilePacketL3Request) -> bool {
-    let text = format!("{} {}", request.task_id, request.goal).to_ascii_lowercase();
-    [
-        "code",
-        "rust",
-        "crate",
-        "file",
-        "symbol",
-        "implementation",
-        "codecortex",
-    ]
-    .iter()
-    .any(|needle| text.contains(needle))
 }
 
 fn collect_exact_handles(
@@ -1644,6 +1633,7 @@ mod current_git_scope_tests {
             project_id,
             task_id: "task".to_owned(),
             goal: "resolve current truth".to_owned(),
+            task_execution_class: eliot_types::TaskExecutionClass::default(),
             memory_confidence: eliot_types::MemoryConfidence::None,
             acceptance_items: Vec::new(),
             at_revision: MemoryRevision::new(1),

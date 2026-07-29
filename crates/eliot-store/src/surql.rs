@@ -730,6 +730,24 @@ mod tests {
     }
 
     #[test]
+    fn ul_artifact_projection_selects_latest_logical_targets_before_pagination() {
+        let template = NamedSurqlOp::LoadUlArtifacts.template();
+        let latest = template.find("AND record_id = array::first");
+        let pagination = template.find("START $bounded_start");
+        assert!(latest.is_some(), "latest-per-target predicate");
+        assert!(pagination.is_some(), "stable pagination");
+        assert!(latest < pagination);
+        assert!(template.contains("subject_ref = $parent.subject_ref"));
+        assert!(template.contains("receipt_kind = $parent.receipt_kind"));
+        assert!(
+            template
+                .contains("ORDER BY memory_revision DESC, project_sequence DESC, record_id DESC")
+        );
+        assert!(template.contains("$limit > 256"));
+        assert!(!template.contains("$limit > 128"));
+    }
+
+    #[test]
     fn canonical_operator_page_has_stable_unbounded_continuation_order() {
         let template = NamedSurqlOp::CanonicalRecordPage.template();
         assert!(template.contains("project_id = $project_id"));

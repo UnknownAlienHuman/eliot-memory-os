@@ -155,6 +155,9 @@ pub fn run_ul_doctor(host: UlDoctorHostArg) -> Result<()> {
     match host {
         UlDoctorHostArg::Codex => {
             let package = root.join("plugin/eliot-governor");
+            let registration = std::env::var_os("ELIOT_DOCTOR_CODEX_CONFIG")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| root.join(".codex/config.toml"));
             checks.push((
                 "plugin-package",
                 package.join(".codex-plugin/plugin.json").is_file(),
@@ -169,11 +172,28 @@ pub fn run_ul_doctor(host: UlDoctorHostArg) -> Result<()> {
                     &package.join(".mcp.json"),
                     "eliot",
                     "eliot-governor.exe",
-                    &["mcp", "stdio", "--profile", "codex_controller"],
+                    &[
+                        "mcp",
+                        "stdio",
+                        "--host",
+                        "codex",
+                        "--profile",
+                        "codex_worker",
+                        "--instance",
+                        "default",
+                    ],
                 ),
                 format!(
-                    "keep one `eliot` entry with codex_controller in {}",
+                    "keep one `eliot` entry with codex_worker in {}",
                     package.join(".mcp.json").display()
+                ),
+            ));
+            checks.push((
+                "installed-registration",
+                codex_overlay_matches(&registration),
+                format!(
+                    "keep one live codex_worker registration in {}",
+                    registration.display()
                 ),
             ));
             checks.push(hook_check(&package.join("hooks/hooks.json")));
@@ -238,14 +258,24 @@ pub fn run_ul_doctor(host: UlDoctorHostArg) -> Result<()> {
         }
     }
 
+    let mut failed = Vec::new();
     for (name, passed, fix) in checks {
         if passed {
             println!("PASS {} {}", host.as_str(), name);
         } else {
             println!("FIX {} {}: {}", host.as_str(), name, fix);
+            failed.push(name);
         }
     }
-    Ok(())
+    if failed.is_empty() {
+        Ok(())
+    } else {
+        anyhow::bail!(
+            "{} doctor failed checks: {}",
+            host.as_str(),
+            failed.join(", ")
+        )
+    }
 }
 
 fn hook_check(path: &Path) -> (&'static str, bool, String) {
@@ -283,6 +313,50 @@ fn mcp_server_matches(path: &Path, key: &str, command: &str, args: &[&str]) -> b
                             .iter()
                             .filter_map(Value::as_str)
                             .eq(args.iter().copied())
+                    })
+        })
+}
+
+fn codex_overlay_matches(path: &Path) -> bool {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return false;
+    };
+    let Ok(value) = toml::from_str::<toml::Value>(&text) else {
+        return false;
+    };
+    let Some(servers) = value.get("mcp_servers").and_then(toml::Value::as_table) else {
+        return false;
+    };
+    if servers.len() != 1 {
+        return false;
+    }
+    servers
+        .get("eliot-governor")
+        .and_then(toml::Value::as_table)
+        .is_some_and(|server| {
+            server
+                .get("command")
+                .and_then(toml::Value::as_str)
+                .is_some_and(|command| {
+                    command
+                        .replace('\\', "/")
+                        .to_ascii_lowercase()
+                        .ends_with("/eliot-governor.exe")
+                })
+                && server
+                    .get("args")
+                    .and_then(toml::Value::as_array)
+                    .is_some_and(|args| {
+                        args.iter().filter_map(toml::Value::as_str).eq([
+                            "mcp",
+                            "stdio",
+                            "--host",
+                            "codex",
+                            "--profile",
+                            "codex_worker",
+                            "--instance",
+                            "default",
+                        ])
                     })
         })
 }

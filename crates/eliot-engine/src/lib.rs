@@ -32,6 +32,7 @@ pub mod semantic_memory;
 pub mod service;
 pub mod skill;
 pub mod skill_curator;
+pub mod task_execution;
 pub mod ul;
 pub mod verification;
 pub mod work;
@@ -189,6 +190,7 @@ pub use skill_curator::{
     SkillCurationReportService, SkillCuratorMemoryWriter, SkillCuratorRunInput,
     SkillCuratorService, SkillMergeSplitService, SkillPatchService,
 };
+pub use task_execution::TaskExecutionClassifier;
 pub use ul::{
     ActivationEngine, BoxUlReasoningFuture, BoxUlRefinementFuture, CalibrationService,
     CapsuleEvidence, ConceptSeedResult, CueIndexService, FiredMemory, FiringResult,

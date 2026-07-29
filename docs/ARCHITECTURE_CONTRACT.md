@@ -44,3 +44,25 @@ typed arguments, an idempotency key, explicit budgets, and a terminal or
 reconcilable outcome. An unknown outcome must be reconciled before redispatch.
 Provider credentials remain owned by the provider host and never enter canonical
 memory or repository configuration.
+
+## Metacognition coverage policy
+
+The current implementation uses the versioned policy
+`metacognition-coverage-v2` for every `covered`, `thin`, and `blind` decision.
+The policy is deliberately conservative:
+
+- `blind`: the subsystem has no capsule, its capsule is stale, or it has no
+  module card anchoring the concept to a current path;
+- `thin`: the capsule and module-card anchors are current, but fewer than three
+  distinct knowledge records, fewer than two evidence classes, or no behavioral
+  evidence are available;
+- `covered`: the capsule is fresh, at least one module card exists, at least
+  three distinct records span at least two evidence classes, and at least one
+  decision, failure fingerprint, episode, experience case, or experience
+  pattern supplies behavioral evidence.
+
+Claims, decisions, failure fingerprints, episodes, experience cases, and
+experience patterns are counted by distinct canonical record reference. Missing
+or stale structural anchors never become `thin` or `covered` merely because
+writer-provided prose is abundant. `UlMetacognitionView.policy_version` exposes
+the applied policy to packets, tests, and external readers.

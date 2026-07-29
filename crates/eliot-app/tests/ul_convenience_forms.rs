@@ -220,11 +220,13 @@ fn t04_frame_stub_and_boot() -> TestResult {
         }),
     )?;
     let mut frame: MaterialPacketFrame = serde_json::from_value(packet["frame_stub"].clone())?;
-    assert!(frame.expected_observable.starts_with("verifier:"));
-    assert!(frame.expected_observable.ends_with("=pass"));
-    assert_eq!(packet["frame_stub_required_edits"], json!([]));
-    assert_eq!(packet["frame_stub_ready"], true);
-    frame.expected_observable.clear();
+    assert!(frame.expected_observable.is_empty());
+    assert!(frame.predicted_failing_verifiers.is_empty());
+    assert_eq!(
+        packet["frame_stub_required_edits"],
+        json!(["material_frame.expected_observable"])
+    );
+    assert_eq!(packet["frame_stub_ready"], false);
     let rejected = harness.client.tool_call_response(
         66,
         "eliot_compile_packet_l3",
@@ -239,10 +241,18 @@ fn t04_frame_stub_and_boot() -> TestResult {
     )?;
     assert_eq!(rejected["error"]["code"], -32602);
     assert_eq!(
-        rejected["error"]["data"]["invalid"][0]["field"],
-        "material_frame.expected_observable"
+        rejected["error"]["data"]["invalid"],
+        json!([{
+            "field": "material_frame.expected_observable",
+            "reason": "material work requires a machine-checkable expected observable"
+        }])
     );
-    frame.expected_observable = "cargo test exits successfully".to_owned();
+    assert!(
+        rejected["error"]["data"]["minimal_valid_example"]["material_frame"]["expected_observable"]
+            .as_str()
+            .is_some_and(|value| value.starts_with("verifier:") && value.ends_with("=pass"))
+    );
+    frame.expected_observable = format!("verifier:{}=pass", frame.verifier);
     let resubmitted = harness.client.tool_call(
         67,
         "eliot_compile_packet_l3",

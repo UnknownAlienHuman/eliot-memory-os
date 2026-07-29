@@ -1,0 +1,3 @@
+[mcp_servers.eliot-governor]
+command = "C:/fixture/eliot-governor.exe"
+args = ["mcp", "stdio", "--host", "codex", "--profile", "codex_worker", "--instance", "default"]

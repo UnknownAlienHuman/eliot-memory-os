@@ -27,6 +27,7 @@ pub mod secret_boundary;
 pub mod semantic_memory;
 pub mod service;
 pub mod skill;
+pub mod task_execution;
 pub mod ul;
 pub mod verification;
 
@@ -318,6 +319,10 @@ pub use skill::{
     SkillPatchProposal, SkillQuarantineProposal, SkillReplayRequirement, SkillScopeRule,
     SkillSplitProposal, SkillStep, SkillToolRequirement,
 };
+pub use task_execution::{
+    TaskExecutionAction, TaskExecutionArtifact, TaskExecutionClass, TaskExecutionClassSource,
+    TaskExecutionDomain,
+};
 pub use ul::activation::{
     ACTIVATION_SCALE, ACTIVATION_THRESHOLD, ActivationEdgeKind, ActivationNode, ActivationTrace,
     SuppressedActivation, UlActivationGraphEdge, UlActivationGraphRows,
@@ -369,7 +374,8 @@ pub use ul::measurement::{
 };
 pub use ul::normalize::{
     command_pattern, error_signature, normalize_observed_path, normalize_path,
-    normalize_query_tokens, normalize_symbol, path_cue_tokens, path_matches_boundary,
+    normalize_query_tokens, normalize_symbol, normalize_unicode_lowercase, path_cue_tokens,
+    path_matches_boundary,
 };
 pub use ul::onboarding::{
     ManifestPackage, OnboardingCheckpoint, OnboardingJob, OnboardingReport, OnboardingStage,

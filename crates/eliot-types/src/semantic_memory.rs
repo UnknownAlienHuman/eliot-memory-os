@@ -201,6 +201,7 @@ pub struct TaskMeaningFrame {
     pub task_id: String,
     pub user_goal: String,
     pub normalized_goal: String,
+    pub execution_class: Option<crate::TaskExecutionClass>,
     pub task_or_action_type: String,
     pub desired_state_transition: String,
     pub problem_or_failure_signature: String,

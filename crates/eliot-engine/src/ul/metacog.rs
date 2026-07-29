@@ -10,6 +10,8 @@ use std::path::Path;
 pub struct MetacognitionService;
 
 impl MetacognitionService {
+    pub const COVERAGE_POLICY_VERSION: &'static str = "metacognition-coverage-v2";
+
     #[must_use]
     pub fn evaluate(
         project_root: &Path,
@@ -32,6 +34,15 @@ impl MetacognitionService {
                 .collect::<Vec<_>>();
             let claim_count = count_kind(&sources, &["claim", "claim_card"]);
             let decision_count = count_kind(&sources, &["decision"]);
+            let experience_count = count_kind(
+                &sources,
+                &[
+                    "episode",
+                    "historical_episode",
+                    "experience_case",
+                    "experience_pattern",
+                ],
+            );
             let failure_count = u32::try_from(
                 sources
                     .iter()
@@ -59,16 +70,12 @@ impl MetacognitionService {
             let capsule_fresh = capsule.is_some_and(|capsule| {
                 capsule_freshness(capsule, project_root) == CapsuleFreshness::Fresh
             });
-            let knowledge_count = claim_count
-                .saturating_add(decision_count)
-                .saturating_add(failure_count);
-            let class = if capsule.is_none() {
-                CoverageClass::Blind
-            } else if capsule_fresh && module_card_count >= 1 && knowledge_count >= 3 {
-                CoverageClass::Covered
-            } else {
-                CoverageClass::Thin
-            };
+            let class = coverage_class(
+                capsule.is_some(),
+                capsule_fresh,
+                module_card_count,
+                [claim_count, decision_count, failure_count, experience_count],
+            );
             coverage.push(SubsystemCoverage {
                 concept_id: concept.concept_id.clone(),
                 capsule_ref: capsule.map(|capsule| format!("capsule:{}", capsule.capsule_id)),
@@ -77,6 +84,7 @@ impl MetacognitionService {
                 claim_count,
                 decision_count,
                 failure_count,
+                experience_count,
                 coverage: class,
             });
         }
@@ -97,6 +105,7 @@ impl MetacognitionService {
         };
         let danger_paths = danger_paths(hotspots, cue_sources);
         UlMetacognitionView {
+            policy_version: Self::COVERAGE_POLICY_VERSION.to_owned(),
             coverage,
             novelty_percent,
             novel_paths,
@@ -187,6 +196,24 @@ impl MetacognitionService {
         probes.sort();
         probes.dedup();
         probes.into_iter().next()
+    }
+}
+
+fn coverage_class(
+    capsule_present: bool,
+    capsule_fresh: bool,
+    module_card_count: u32,
+    counts: [u32; 4],
+) -> CoverageClass {
+    let knowledge_count = counts.into_iter().fold(0_u32, u32::saturating_add);
+    let evidence_class_count = counts.into_iter().filter(|count| *count > 0).count();
+    let behavioral_evidence_count = counts[1..].iter().copied().fold(0_u32, u32::saturating_add);
+    if !capsule_present || !capsule_fresh || module_card_count == 0 {
+        CoverageClass::Blind
+    } else if knowledge_count >= 3 && evidence_class_count >= 2 && behavioral_evidence_count >= 1 {
+        CoverageClass::Covered
+    } else {
+        CoverageClass::Thin
     }
 }
 

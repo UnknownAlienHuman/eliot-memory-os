@@ -14,7 +14,8 @@ pub mod surreal_store;
 pub use blob_store::BlobStore;
 pub use canonical_projection::{
     CanonicalAutonomyRunView, CanonicalLifecycleView, CanonicalRecord, CanonicalReplayView,
-    CanonicalSleepView, CanonicalTruncation, MAX_CANONICAL_RECORDS, SleepCandidatesResponse,
+    CanonicalSleepView, CanonicalTruncation, MAX_CANONICAL_RECORDS, MAX_CURRENT_UL_ARTIFACTS,
+    SleepCandidatesResponse, UL_ARTIFACT_PAGE_SIZE,
 };
 pub use canonical_store::{
     CanonicalClaimCard, CanonicalSecretScanFinding, CanonicalSecretScanReport, CanonicalStore,

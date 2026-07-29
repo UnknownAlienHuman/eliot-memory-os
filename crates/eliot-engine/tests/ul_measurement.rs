@@ -193,7 +193,10 @@ fn t07_coverage_classes_are_exact() {
         concept(project_id, "blind", "blind"),
     ];
     let capsules = vec![capsule(project_id, "covered"), capsule(project_id, "thin")];
-    let cards = vec![card(project_id, "covered/src/lib.rs")];
+    let cards = vec![
+        card(project_id, "covered/src/lib.rs"),
+        card(project_id, "thin/src/lib.rs"),
+    ];
     let cue_sources = vec![
         source("claim:covered", "claim", "covered/src/lib.rs", false),
         source("decision:covered", "decision", "covered/src/lib.rs", false),
@@ -203,6 +206,13 @@ fn t07_coverage_classes_are_exact() {
             "covered/src/lib.rs",
             true,
         ),
+        source(
+            "experience:covered",
+            "experience_case",
+            "covered/src/lib.rs",
+            false,
+        ),
+        source("claim:thin", "claim", "thin/src/lib.rs", false),
     ];
     let view = MetacognitionService::evaluate(
         Path::new("."),
@@ -223,6 +233,10 @@ fn t07_coverage_classes_are_exact() {
     assert_eq!(classes["thin"], CoverageClass::Thin);
     assert_eq!(classes["blind"], CoverageClass::Blind);
     assert_eq!(
+        view.policy_version,
+        MetacognitionService::COVERAGE_POLICY_VERSION
+    );
+    assert_eq!(
         view.coverage
             .iter()
             .find(|coverage| coverage.concept_id == "covered")
@@ -231,8 +245,9 @@ fn t07_coverage_classes_are_exact() {
                 coverage.claim_count,
                 coverage.decision_count,
                 coverage.failure_count,
+                coverage.experience_count,
             )),
-        Some((1, 1, 1, 1))
+        Some((1, 1, 1, 1, 1))
     );
 }
 

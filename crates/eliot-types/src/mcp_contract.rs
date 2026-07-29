@@ -39,7 +39,7 @@ pub fn compile_packet_minimal_example() -> Value {
             "cheapest_discriminative_probes": [],
             "responsibility_contour_route_refs": [],
             "next_allowed_action": "inspect the responsible boundary",
-            "expected_observable": "replace with a machine-checkable observation",
+            "expected_observable": "verifier:cargo test --workspace=pass",
             "verifier": "replace with a registered verifier",
             "stop_condition": "stop on verifier failure",
             "tool_schema_bytes_visible": 0,

@@ -272,7 +272,9 @@ impl UlRuntime {
         let subsystem_concept_id =
             MetacognitionService::concept_for_paths(&concept_list, touched_paths);
 
-        let fallback = fallback_text.to_ascii_lowercase();
+        let fallback = eliot_types::normalize_query_tokens(fallback_text)
+            .into_iter()
+            .collect::<BTreeSet<_>>();
         let mut ranked = concepts
             .into_values()
             .filter_map(|concept| {
@@ -288,11 +290,15 @@ impl UlRuntime {
                     })
                     .max()
                     .unwrap_or_default();
-                let fallback_match = fallback.contains(&concept.name.to_ascii_lowercase())
-                    || concept
-                        .boundary_paths
-                        .iter()
-                        .any(|boundary| fallback.contains(&boundary.to_ascii_lowercase()));
+                let concept_tokens = eliot_types::normalize_query_tokens(&format!(
+                    "{} {} {}",
+                    concept.name,
+                    concept.purpose,
+                    concept.boundary_paths.join(" ")
+                ))
+                .into_iter()
+                .collect::<BTreeSet<_>>();
+                let fallback_match = !fallback.is_disjoint(&concept_tokens);
                 (path_score > 0 || fallback_match).then_some((path_score, fallback_match, concept))
             })
             .collect::<Vec<_>>();

@@ -1,9 +1,15 @@
 LET $bounded_limit = IF $limit < 1 {
   1
-} ELSE IF $limit > 128 {
-  128
+} ELSE IF $limit > 256 {
+  256
 } ELSE {
   $limit
+};
+
+LET $bounded_start = IF $start < 0 {
+  0
+} ELSE {
+  $start
 };
 
 RETURN SELECT
@@ -20,5 +26,15 @@ RETURN SELECT
 FROM canonical_record
 WHERE project_id = $project_id
   AND receipt_kind IN $receipt_kinds
-ORDER BY receipt_kind ASC, subject_ref ASC, memory_revision DESC, project_sequence DESC
+  AND record_id = array::first(
+    SELECT VALUE record_id
+    FROM canonical_record
+    WHERE project_id = $parent.project_id
+      AND receipt_kind = $parent.receipt_kind
+      AND subject_ref = $parent.subject_ref
+    ORDER BY memory_revision DESC, project_sequence DESC, record_id DESC
+    LIMIT 1
+  )
+ORDER BY receipt_kind ASC, subject_ref ASC, memory_revision DESC, project_sequence DESC, record_id DESC
+START $bounded_start
 LIMIT $bounded_limit;

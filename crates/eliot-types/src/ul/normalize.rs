@@ -48,7 +48,8 @@ const STOP_RU: &[&str] = &[
     "при",
 ];
 
-fn unicode_lower(raw: &str) -> String {
+#[must_use]
+pub fn normalize_unicode_lowercase(raw: &str) -> String {
     raw.chars().flat_map(char::to_lowercase).collect()
 }
 
@@ -101,9 +102,9 @@ pub fn path_matches_boundary(path: &str, boundary: &str) -> bool {
 
 #[must_use]
 pub fn normalize_path(raw: &str, project_root: Option<&str>) -> String {
-    let mut path = unicode_lower(&slash_normalize(raw.trim()));
+    let mut path = normalize_unicode_lowercase(&slash_normalize(raw.trim()));
     if let Some(root) = project_root {
-        let root = unicode_lower(&slash_normalize(root.trim()))
+        let root = normalize_unicode_lowercase(&slash_normalize(root.trim()))
             .trim_end_matches('/')
             .to_owned();
         if path == root {
@@ -179,12 +180,12 @@ pub fn normalize_symbol(raw: &str) -> String {
     while normalized.contains("::::") {
         normalized = normalized.replace("::::", "::");
     }
-    unicode_lower(&normalized)
+    normalize_unicode_lowercase(&normalized)
 }
 
 #[must_use]
 pub fn normalize_query_tokens(raw: &str) -> Vec<String> {
-    let lower = unicode_lower(raw);
+    let lower = normalize_unicode_lowercase(raw);
     let mut seen = BTreeSet::new();
     lower
         .split(|character: char| !character.is_alphanumeric())
@@ -209,7 +210,7 @@ pub fn command_pattern(argv: &[String]) -> String {
         .next()
         .unwrap_or(executable)
         .trim();
-    let mut pattern = unicode_lower(basename);
+    let mut pattern = normalize_unicode_lowercase(basename);
     if let Some(argument) = argv
         .iter()
         .skip(1)
@@ -218,7 +219,7 @@ pub fn command_pattern(argv: &[String]) -> String {
         if !pattern.is_empty() {
             pattern.push(' ');
         }
-        pattern.push_str(&unicode_lower(argument.trim()));
+        pattern.push_str(&normalize_unicode_lowercase(argument.trim()));
     }
     pattern
 }
@@ -241,7 +242,7 @@ fn remove_quoted_contents(raw: &str) -> String {
 }
 
 fn normalize_error_message(raw: &str) -> String {
-    let raw = remove_quoted_contents(&unicode_lower(raw));
+    let raw = remove_quoted_contents(&normalize_unicode_lowercase(raw));
     let characters = raw.chars().collect::<Vec<_>>();
     let mut normalized = String::with_capacity(raw.len());
     let mut index = 0;

@@ -1513,22 +1513,38 @@ impl CanonicalStore {
         &self,
         project_id: ProjectId,
         receipt_kinds: &[&str],
-        limit: u16,
+        page_size: u16,
     ) -> Result<Vec<CanonicalRecord<T>>, StoreError>
     where
         T: DeserializeOwned,
     {
-        let value = self
-            .execute_value(
-                NamedSurqlOp::LoadUlArtifacts,
-                json!({
-                    "project_id": project_id,
-                    "receipt_kinds": receipt_kinds,
-                    "limit": limit.clamp(1, MAX_CANONICAL_RECORDS),
-                }),
-            )
-            .await?;
-        decode_value(NamedSurqlOp::LoadUlArtifacts, value)
+        let page_size = page_size.clamp(1, crate::UL_ARTIFACT_PAGE_SIZE);
+        let mut records = Vec::new();
+        loop {
+            let value = self
+                .execute_value(
+                    NamedSurqlOp::LoadUlArtifacts,
+                    json!({
+                        "project_id": project_id,
+                        "receipt_kinds": receipt_kinds,
+                        "start": records.len(),
+                        "limit": page_size,
+                    }),
+                )
+                .await?;
+            let page: Vec<CanonicalRecord<T>> = decode_value(NamedSurqlOp::LoadUlArtifacts, value)?;
+            if records.len().saturating_add(page.len()) > crate::MAX_CURRENT_UL_ARTIFACTS {
+                return Err(StoreError::Decode(format!(
+                    "current UL projection exceeds the explicit {}-artifact safety bound",
+                    crate::MAX_CURRENT_UL_ARTIFACTS
+                )));
+            }
+            let complete = page.len() < usize::from(page_size);
+            records.extend(page);
+            if complete {
+                return Ok(records);
+            }
+        }
     }
 
     pub async fn replace_ul_reverse_dependencies(

@@ -171,6 +171,7 @@ pub struct SubsystemCoverage {
     pub claim_count: u32,
     pub decision_count: u32,
     pub failure_count: u32,
+    pub experience_count: u32,
     pub coverage: CoverageClass,
 }
 
@@ -183,6 +184,7 @@ pub struct DangerPath {
 
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 pub struct UlMetacognitionView {
+    pub policy_version: String,
     pub coverage: Vec<SubsystemCoverage>,
     pub novelty_percent: u8,
     pub novel_paths: Vec<String>,

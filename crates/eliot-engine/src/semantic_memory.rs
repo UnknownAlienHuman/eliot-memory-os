@@ -415,19 +415,19 @@ pub struct MemoryNeedService;
 impl MemoryNeedService {
     pub fn decide(frame: &TaskMeaningFrame, requested: Option<MemoryNeed>) -> MemoryNeedDecision {
         let need = requested.unwrap_or_else(|| {
-            let goal = normalized(&frame.normalized_goal);
-            let abstraction = normalized(&frame.abstraction_level_needed);
             if frame.material_unknowns.is_empty() && !frame.current_evidence.is_empty() {
                 MemoryNeed::None
-            } else if goal.contains("why") || !frame.problem_or_failure_signature.trim().is_empty()
+            } else if !frame.problem_or_failure_signature.trim().is_empty()
+                || !frame.control_data_state_path.is_empty()
+                || frame.execution_class.as_ref().is_some_and(|class| {
+                    matches!(
+                        class.action,
+                        eliot_types::TaskExecutionAction::CrossSubsystem
+                            | eliot_types::TaskExecutionAction::Destructive
+                    )
+                })
             {
                 MemoryNeed::CausalCase
-            } else if abstraction.contains("procedure") {
-                MemoryNeed::Procedure
-            } else if abstraction.contains("pattern") {
-                MemoryNeed::ExperiencePattern
-            } else if normalized(&frame.task_or_action_type).contains("decision") {
-                MemoryNeed::DecisionRationale
             } else {
                 MemoryNeed::CurrentFact
             }
@@ -1187,11 +1187,11 @@ fn tokens(value: &str) -> HashSet<String> {
 }
 
 fn normalized(value: &str) -> String {
-    value
+    eliot_types::normalize_unicode_lowercase(value)
         .chars()
         .map(|character| {
             if character.is_alphanumeric() {
-                character.to_ascii_lowercase()
+                character
             } else {
                 ' '
             }

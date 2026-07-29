@@ -989,6 +989,8 @@ pub struct ContextPacketL3 {
     pub task_id: String,
     pub goal: String,
     #[serde(default)]
+    pub task_execution_class: crate::TaskExecutionClass,
+    #[serde(default)]
     pub memory_confidence: MemoryConfidence,
     #[serde(default)]
     pub acceptance_items: Vec<String>,

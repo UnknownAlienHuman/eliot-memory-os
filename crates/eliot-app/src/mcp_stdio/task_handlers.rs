@@ -13,24 +13,25 @@ async fn dispatch_compile_packet_l3(
     let input = input_validation::decode_compile_packet_input(arguments)?;
     let requested_memory_free_control =
         input.memory_mode == Some(MemoryExposureMode::MemoryFreeControl);
-    if input
-        .material_frame
-        .as_ref()
-        .is_some_and(|frame| frame.expected_observable.trim().is_empty())
-    {
-        return Err(eliot_types::ToolInputError {
-            data: eliot_types::ToolInputErrorData {
-                code: "INVALID_TOOL_INPUT".to_owned(),
-                missing: Vec::new(),
-                invalid: vec![eliot_types::InvalidField {
-                    field: "material_frame.expected_observable".to_owned(),
-                    reason: "material work requires a machine-checkable expected observable"
-                        .to_owned(),
-                }],
-                minimal_valid_example: eliot_types::compile_packet_minimal_example(),
-            },
+    if let Some(frame) = input.material_frame.as_ref() {
+        let invalid = material_frame_required_edits(frame)
+            .into_iter()
+            .map(|field| eliot_types::InvalidField {
+                field: field.to_owned(),
+                reason: material_frame_required_edit_reason(field).to_owned(),
+            })
+            .collect::<Vec<_>>();
+        if !invalid.is_empty() {
+            return Err(eliot_types::ToolInputError {
+                data: eliot_types::ToolInputErrorData {
+                    code: "INVALID_TOOL_INPUT".to_owned(),
+                    missing: Vec::new(),
+                    invalid,
+                    minimal_valid_example: eliot_types::compile_packet_minimal_example(),
+                },
+            }
+            .into());
         }
-        .into());
     }
     let request = input.request;
     let parsed_task_id = TaskId::from_str(&request.task_id).ok();
@@ -115,7 +116,8 @@ async fn dispatch_compile_packet_l3(
     let task_frame = TaskMeaningFrame {
         task_id: request.task_id.clone(),
         user_goal: request.goal.clone(),
-        normalized_goal: request.goal.to_ascii_lowercase(),
+        normalized_goal: eliot_types::normalize_unicode_lowercase(&request.goal),
+        execution_class: Some(packet.task_execution_class.clone()),
         task_or_action_type: "governed_task".to_owned(),
         desired_state_transition: request.goal.clone(),
         problem_or_failure_signature: packet.open_questions.join(" "),
@@ -337,9 +339,10 @@ async fn dispatch_compile_packet_l3(
             value["ul_prediction"] = json!({"status": "not_machine_checkable"});
         }
     }
+    let frame_stub_required_edits = material_frame_required_edits(&frame_stub);
     value["frame_stub"] = serde_json::to_value(frame_stub)?;
-    value["frame_stub_required_edits"] = json!([]);
-    value["frame_stub_ready"] = Value::Bool(true);
+    value["frame_stub_ready"] = Value::Bool(frame_stub_required_edits.is_empty());
+    value["frame_stub_required_edits"] = serde_json::to_value(frame_stub_required_edits)?;
     if let Some(task) = packet_task.as_ref() {
         enrich_packet_with_task(state, &mut value, task).await?;
     }
@@ -522,7 +525,7 @@ fn material_frame_stub(
             .responsibility_contour_route_refs
             .clone(),
         next_allowed_action: next_action,
-        expected_observable: format!("verifier:{verifier}=pass"),
+        expected_observable: String::new(),
         verifier: verifier.clone(),
         stop_condition,
         tool_schema_bytes_visible: packet
@@ -543,7 +546,38 @@ fn material_frame_stub(
             .collect::<BTreeSet<_>>()
             .into_iter()
             .collect(),
-        predicted_failing_verifiers: vec![verifier],
+        predicted_failing_verifiers: Vec::new(),
+    }
+}
+
+fn material_frame_required_edits(frame: &MaterialPacketFrame) -> Vec<&'static str> {
+    let mut fields = Vec::new();
+    if frame.next_allowed_action.trim().is_empty() {
+        fields.push("material_frame.next_allowed_action");
+    }
+    if frame.expected_observable.trim().is_empty() {
+        fields.push("material_frame.expected_observable");
+    }
+    if frame.verifier.trim().is_empty() {
+        fields.push("material_frame.verifier");
+    }
+    if frame.stop_condition.trim().is_empty() {
+        fields.push("material_frame.stop_condition");
+    }
+    fields
+}
+
+fn material_frame_required_edit_reason(field: &str) -> &'static str {
+    match field {
+        "material_frame.next_allowed_action" => {
+            "material work requires an explicit next allowed action"
+        }
+        "material_frame.expected_observable" => {
+            "material work requires a machine-checkable expected observable"
+        }
+        "material_frame.verifier" => "material work requires a registered verifier",
+        "material_frame.stop_condition" => "material work requires an explicit stop condition",
+        _ => "material work requires this load-bearing field",
     }
 }
 
