@@ -2,6 +2,7 @@
 
 mod action_plan;
 mod calibration_runtime;
+mod cognitive_field_runner;
 mod cognitive_runner;
 mod commands;
 mod config;
@@ -251,6 +252,10 @@ enum Command {
     Host {
         #[command(subcommand)]
         command: HostCommand,
+    },
+    CognitiveField {
+        #[command(subcommand)]
+        command: CognitiveFieldCommand,
     },
 }
 
@@ -1632,6 +1637,38 @@ enum HostCommand {
 }
 
 #[derive(Debug, Subcommand)]
+enum CognitiveFieldCommand {
+    Validate {
+        #[arg(long)]
+        suite: PathBuf,
+    },
+    Schema {
+        #[arg(long)]
+        kind: String,
+    },
+    Prepare {
+        #[arg(long)]
+        suite: PathBuf,
+        #[arg(long)]
+        run_id: String,
+        #[arg(long)]
+        primary_repo: PathBuf,
+        #[arg(long)]
+        second_repo: PathBuf,
+        #[arg(long)]
+        report_root: PathBuf,
+        #[arg(long)]
+        private_root: PathBuf,
+    },
+    Grade {
+        #[arg(long)]
+        report_root: PathBuf,
+        #[arg(long)]
+        private_root: PathBuf,
+    },
+}
+
+#[derive(Debug, Subcommand)]
 enum MemoryLifecycleCommand {
     Status {
         #[arg(long)]
@@ -2202,6 +2239,33 @@ async fn dispatch_command(
             Ok(())
         }
         Command::Host { command } => Box::pin(host_runtime::dispatch(config, command)).await,
+        Command::CognitiveField { command } => dispatch_cognitive_field_command(command),
+    }
+}
+
+fn dispatch_cognitive_field_command(command: CognitiveFieldCommand) -> Result<()> {
+    match command {
+        CognitiveFieldCommand::Validate { suite } => cognitive_field_runner::validate(&suite),
+        CognitiveFieldCommand::Schema { kind } => cognitive_field_runner::schema(&kind),
+        CognitiveFieldCommand::Prepare {
+            suite,
+            run_id,
+            primary_repo,
+            second_repo,
+            report_root,
+            private_root,
+        } => cognitive_field_runner::prepare(
+            &suite,
+            &run_id,
+            &primary_repo,
+            &second_repo,
+            &report_root,
+            &private_root,
+        ),
+        CognitiveFieldCommand::Grade {
+            report_root,
+            private_root,
+        } => cognitive_field_runner::grade(&report_root, &private_root),
     }
 }
 

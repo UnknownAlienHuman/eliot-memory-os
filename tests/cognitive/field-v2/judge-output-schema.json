@@ -1,0 +1,12 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "CognitiveJudgeResult",
+  "description": "Generated authoritatively from eliot_types::CognitiveJudgeResult.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version", "case_id", "oracle_hash", "reader_output_hash",
+    "deterministic_report_hash", "scores", "exact_discrepancies",
+    "forbidden_conclusion_detected", "semantic_pass"
+  ]
+}

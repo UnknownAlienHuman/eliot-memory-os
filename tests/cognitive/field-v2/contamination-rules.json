@@ -1,0 +1,28 @@
+{
+  "schema_version": "eliot-cognitive-field-contamination-v1",
+  "forbidden_reader_inputs": [
+    "worker transcript",
+    "task-intent oracle",
+    "judge rubric answers",
+    "private markers",
+    "expected owner/file/symbol alternatives",
+    "forbidden conclusions",
+    "controller-authored provider answer"
+  ],
+  "scan_surfaces": [
+    "reader prompt",
+    "reader output schema",
+    "repository files",
+    "provider bundle",
+    "environment",
+    "git history",
+    "ELIOT-visible memory"
+  ],
+  "memory_free_control_zero_fields": [
+    "memory_handles_received",
+    "memory_handles_expanded",
+    "memory_handles_used",
+    "influence_receipt_refs"
+  ],
+  "raw_provider_transcripts_in_git": false
+}

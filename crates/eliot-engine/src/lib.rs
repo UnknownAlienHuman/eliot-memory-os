@@ -7,6 +7,7 @@ pub mod antigravity;
 pub mod codecortex;
 pub mod cognition;
 pub mod cognitive_disposition;
+pub mod cognitive_field;
 pub mod collective;
 pub mod context;
 pub mod control_plane;
@@ -68,6 +69,7 @@ pub use cognition::{
     MemoryInfluenceTraceService, UnderstandingOutcomeService,
 };
 pub use cognitive_disposition::resolve_canonical_case_dispositions;
+pub use cognitive_field::CognitiveFieldGradingService;
 pub use collective::{
     BlackboardAddInput, BlackboardService, CollectiveMemoryWriter, CollectiveTraceService,
     LostAgentRecoveryService, MailboxSendInput, MailboxService, StopCoordinationDecision,

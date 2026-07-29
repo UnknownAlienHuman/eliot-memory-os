@@ -171,6 +171,68 @@ existing cognitive certification implementation against the master contract;
 do not spend provider quota until the deterministic and integration tiers are
 green.
 
+### 2026-07-29 C6 implementation log
+
+- Cargo metadata confirms the five-crate workspace boundary. Fresh CodeCortex
+  graph search found the existing managed `cognitive_runner`, canonical
+  18-call contract, provider attestation, and old 12-case sealed suite.
+- Rust LSP workspace-symbol search returned an empty result for `Cognitive`;
+  source/metadata and the current code graph are the bounded fallback. No code
+  claim relies on the missing LSP result.
+- Confirmed product gap: no field-v2 48-case manifest, `TaskIntentOracle`,
+  `CognitiveUnderstandingAnswer`, `CognitiveJudgeResult`, field grader, or
+  field runner exists. The old runner remains the provider-process isolation
+  layer rather than being replaced.
+- Added the first field-v2 contract acceptance test. Its intended baseline
+  failure is `E0432` for the nine absent field-v2 exports; 0.355 seconds end to
+  end. No provider call occurred.
+- First contract implementation compile failed because `JsonSchema` required
+  an explicit string projection for the RFC3339 seal timestamp: `E0573`,
+  23.215 seconds. Added the published string schema projection.
+- Reader/Judge schema roundtrip then passed; the second contract test failed
+  only because the field-v2 manifest did not yet exist, 27.595 seconds.
+- Added the exact 48-case manifest with family counts U12/M8/D10/A6/H6/R6,
+  provider cap 24, real-second-repository policy, shared zero-tolerance gates,
+  reader/judge schemas, contamination rules, and role prompts.
+- Field contract gate passed 2/2 in 0.01 seconds test time and 0.165 seconds end
+  to end.
+- Added the first field-grading acceptance test. Its intended baseline failure
+  was absent `CognitiveFieldGradingService` (`E0432`), 40.151 seconds.
+- Initial grader implementation passed 2/3 but incorrectly treated a
+  Reader-discovered required verifier as an oracle leak. This was a product
+  semantics error, not a test issue: pre-dispatch surfaces must hide oracle
+  fields, while the externally graded answer may independently recover the
+  correct verifier. Restricted output scanning to exact forbidden/private
+  conclusions and retained full scanning for pre-dispatch surfaces.
+- Field grader gate then passed 3/3: 0.00 seconds test time, 7.928 seconds end
+  to end. It proves aggregate invalid-input reporting, stable oracle sealing,
+  hidden-value scanning without raw-value persistence, score thresholds,
+  memory-free zero-exposure, and deterministic hard-gate precedence.
+- Added `cognitive-field validate/schema/prepare/grade`. The prepare path
+  separates sanitized report output from a hashed private certification root,
+  seals primary and second-repository Git SHAs, generates private per-case
+  oracles before role execution, performs reader-surface leak scans, consumes
+  zero providers, and is idempotently resumable only for an identical sealed
+  request. Grade never upgrades missing evidence: it writes durable aggregate
+  outputs and returns the blocked status until every expected execution passes.
+- Initial CLI acceptance baseline failed 2/2 exactly because
+  `cognitive-field` did not exist; 0.64 seconds test body, 84.906 seconds end
+  to end due first full app link.
+- CLI validation/schema/help then passed 2/2 in 0.65 seconds test time and
+  38.597 seconds end to end.
+- The remembered `projects/eliot-governor` second-repository path was absent.
+  A bounded local scan confirmed that `eliot-memory-os` is the only current
+  Rust Git repository under the workspace. Cloned the real MIT-licensed
+  `BurntSushi/ripgrep` repository outside the workspace as the contract's
+  network fallback; sealed candidate SHA
+  `dffd776a737dc19a48b758dd6a621de113794121`.
+- C6 clippy repair attempts: three findings in 25.691 seconds (explicit policy
+  booleans and fallible schema serialization), one formatting lint in 33.728
+  seconds, one standard-library lint in 24.197 seconds, final PASS in 17.028
+  seconds.
+- Combined C6 deterministic gate passed 7/7: 0.63 seconds test bodies,
+  26.424 seconds end to end. No provider call occurred.
+
 ## Logging rule
 
 For each next step, record:

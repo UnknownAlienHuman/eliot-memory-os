@@ -1,0 +1,19 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "CognitiveUnderstandingAnswer",
+  "description": "Generated authoritatively from eliot_types::CognitiveUnderstandingAnswer; private reasoning is forbidden.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version", "case_id", "project_id", "task_id", "memory_condition",
+    "user_goal", "desired_state", "non_goals", "project_purpose",
+    "subsystem_refs", "owner_modules", "entrypoint_refs", "files_to_inspect",
+    "files_to_change", "causal_hops", "invariants", "known_failures",
+    "current_truth_refs", "stale_or_rejected_memory_refs", "open_unknowns",
+    "cheapest_discriminative_probes", "predicted_changed_paths",
+    "predicted_failing_verifiers", "next_action", "expected_observable",
+    "verifier_ref", "stop_condition", "memory_handles_received",
+    "memory_handles_expanded", "memory_handles_used", "influence_receipt_refs",
+    "confidence_by_section"
+  ]
+}
