@@ -64,6 +64,8 @@ pub enum UlDoctorHostArg {
     Codex,
     Claude,
     Antigravity,
+    #[value(name = "opencode")]
+    OpenCode,
 }
 
 impl UlDoctorHostArg {
@@ -72,6 +74,7 @@ impl UlDoctorHostArg {
             Self::Codex => "codex",
             Self::Claude => "claude",
             Self::Antigravity => "antigravity",
+            Self::OpenCode => "opencode",
         }
     }
 
@@ -79,7 +82,7 @@ impl UlDoctorHostArg {
         match self {
             Self::Codex => "codex_worker",
             Self::Claude => "claude_governed",
-            Self::Antigravity => "dynamic_agent",
+            Self::Antigravity | Self::OpenCode => "dynamic_agent",
         }
     }
 }
@@ -142,6 +145,7 @@ pub fn run_ul_doctor(host: UlDoctorHostArg) -> Result<()> {
         UlDoctorHostArg::Antigravity => {
             entry.package_parity.get("antigravity") == Some(&true)
         }
+        UlDoctorHostArg::OpenCode => entry.opencode_parity,
     });
     checks.push((
         "canonical-skills",
@@ -272,6 +276,42 @@ pub fn run_ul_doctor(host: UlDoctorHostArg) -> Result<()> {
                 "no-custom-agent",
                 !contains_named_file(&package.join("agents"), "agent.md"),
                 format!("remove custom main agents from {}", package.join("agents").display()),
+            ));
+        }
+        UlDoctorHostArg::OpenCode => {
+            let package = root.join("integrations/opencode");
+            let config = read_json_file(&package.join("opencode.json"));
+            let registration_valid = config.as_ref().is_some_and(|value| {
+                value.get("$schema").and_then(Value::as_str)
+                    == Some("https://opencode.ai/config.json")
+                    && value.pointer("/mcp/eliot/type").and_then(Value::as_str) == Some("local")
+                    && value
+                        .pointer("/mcp/eliot/command")
+                        .and_then(Value::as_array)
+                        .is_some_and(|command| {
+                            command
+                                == &[
+                                    serde_json::json!("{env:ELIOT_GOVERNOR_EXE}"),
+                                    serde_json::json!("mcp"),
+                                    serde_json::json!("stdio"),
+                                    serde_json::json!("--host"),
+                                    serde_json::json!("opencode"),
+                                    serde_json::json!("--instance"),
+                                    serde_json::json!("default"),
+                                ]
+                        })
+                    && value.pointer("/mcp/eliot/enabled").and_then(Value::as_bool) == Some(true)
+            });
+            checks.push((
+                "plugin-package",
+                package.join("plugins/eliot.js").is_file()
+                    && package.join("instructions/eliot.md").is_file(),
+                format!("restore the OpenCode package under {}", package.display()),
+            ));
+            checks.push((
+                "single-registration",
+                registration_valid,
+                format!("repair {}", package.join("opencode.json").display()),
             ));
         }
     }

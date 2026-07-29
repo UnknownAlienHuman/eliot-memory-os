@@ -1099,6 +1099,42 @@ fn installed_codex_profile_resolves_to_exact_worker_surface() -> Result<()> {
 }
 
 #[test]
+fn c5_all_native_worker_hosts_share_exact_seven_tool_schemas() -> Result<()> {
+    let mut canonical = None;
+    for host in ["codex", "claude", "antigravity", "opencode"] {
+        let profile = resolve_effective_profile("default", Some(host), false)?;
+        let tools = tool_definitions_for_profile(profile);
+        let names = tools
+            .iter()
+            .filter_map(|tool| tool["name"].as_str().map(str::to_owned))
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            names,
+            PART_E_WORKER_TOOLS
+                .iter()
+                .copied()
+                .map(str::to_owned)
+                .collect(),
+            "{host} worker semantics drifted"
+        );
+        assert_eq!(tools.len(), 7, "{host} must expose exactly seven tools");
+        assert!(
+            profile_instructions(profile).contains("Host identity grants no controller"),
+            "{host} inferred authority from host identity"
+        );
+        if let Some(canonical) = &canonical {
+            assert_eq!(
+                &tools, canonical,
+                "{host} tool names, field names, or schemas drifted"
+            );
+        } else {
+            canonical = Some(tools);
+        }
+    }
+    Ok(())
+}
+
+#[test]
 fn explicit_antigravity_auditor_is_honored() -> Result<()> {
     assert_eq!(
         resolve_effective_profile("external_auditor", Some("antigravity"), false)?,

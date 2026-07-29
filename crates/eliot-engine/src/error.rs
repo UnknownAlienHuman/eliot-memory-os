@@ -22,6 +22,23 @@ pub enum EngineError {
     #[error("writer response channel closed")]
     WriterClosed,
 
+    #[error("canonical commit outcome is still unknown for write_id {write_id}")]
+    UnknownCommit { write_id: eliot_types::WriteId },
+
+    #[error("canonical store is unavailable; write_id {write_id} remains retryable: {reason}")]
+    RetryableWriteUnavailable {
+        write_id: eliot_types::WriteId,
+        reason: String,
+    },
+
+    #[error(
+        "project {project_id} is paused while write_id {unknown_write_id} has an unknown commit outcome"
+    )]
+    ProjectWritePaused {
+        project_id: eliot_types::ProjectId,
+        unknown_write_id: eliot_types::WriteId,
+    },
+
     #[error("stale read: project revision {actual} is below required {required}")]
     StaleRead { required: u64, actual: u64 },
 

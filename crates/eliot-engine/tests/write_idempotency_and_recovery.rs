@@ -4,16 +4,18 @@ use eliot_types::{
     AgentId, ClaimCardInput, ClaimId, CommandContext, ControlWalConfig, CurrentStateRequest,
     EpistemicStatus, EvidenceAtomInput, EvidenceId, EvidenceIngestCommand, FetchAtomsL2Request,
     GovernorConfig, LifecycleStatus, MemoryRevision, MemoryWriteEnvelope, ProjectId,
-    ReadConsistencyMode, RelationType, SemanticCommand, SourceSnapshotInput, TaintClass, TaskId,
-    VerificationResult, VerificationRunInput, Visibility, WriteId, WriteStatus,
+    ReadConsistencyMode, RelationType, SemanticCommand, SessionId, SourceSnapshotInput, TaintClass,
+    TaskId, VerificationResult, VerificationRunInput, Visibility, WriteId, WriteStatus,
 };
 use serde_json::json;
 use std::collections::HashSet;
 use std::fs::{self, OpenOptions};
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use tokio::sync::Barrier;
 use tokio::task::JoinHandle;
-use tokio::time::{Duration, sleep};
+use tokio::time::{Duration, sleep, timeout};
 
 type TestResult<T = ()> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
@@ -320,6 +322,156 @@ async fn ten_agent_concurrent_writes_are_governed() -> TestResult {
     Ok(())
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+#[ignore = "requires an authenticated local SurrealDB"]
+async fn c5_thirty_two_sessions_across_eight_projects_are_bounded_and_ordered() -> TestResult {
+    let _guard = lock_tests().await;
+    let harness =
+        Harness::new("c5_thirty_two_sessions_across_eight_projects_are_bounded_and_ordered")
+            .await?;
+    let projects = (0..8).map(|_| ProjectId::new_v7()).collect::<Vec<_>>();
+    let (wal_path, handle, actor_task) = harness.start_writer("c5-32x8")?;
+    let barrier = Arc::new(Barrier::new(33));
+    let mut tasks = Vec::new();
+
+    for session_index in 0..32 {
+        let agent_handle = handle.clone();
+        let barrier = Arc::clone(&barrier);
+        let project_id = projects[session_index % projects.len()];
+        tasks.push(tokio::spawn(async move {
+            let admission = WriteAdmissionService;
+            let session_id = SessionId::new_v7();
+            let mut receipts = Vec::new();
+            barrier.wait().await;
+            for write_index in 0..2 {
+                let mut command = evidence_command(
+                    project_id,
+                    None,
+                    &format!("session-{session_index}-write-{write_index}"),
+                    json!({
+                        "session_index": session_index,
+                        "write_index": write_index,
+                    }),
+                );
+                bind_session(&mut command, session_id);
+                receipts.push((
+                    project_id,
+                    agent_handle.submit(admission.admit(&command)?).await?,
+                ));
+            }
+            TestResult::Ok(receipts)
+        }));
+    }
+    barrier.wait().await;
+
+    let mut receipts = Vec::new();
+    for task in tasks {
+        receipts.extend(task.await??);
+    }
+    let metrics = handle.metrics();
+    drop(handle);
+    actor_task.await?;
+    let wal = open_wal(&wal_path)?;
+
+    assert_eq!(receipts.len(), 64);
+    assert_eq!(metrics.configured_lanes, 4);
+    assert!(
+        metrics.max_in_flight_projects >= 2,
+        "independent projects never overlapped: {metrics:?}"
+    );
+    assert_eq!(metrics.rejected_backpressure, 0);
+    assert_eq!(metrics.paused_projects, 0);
+    for project_id in projects {
+        let mut sequences = receipts
+            .iter()
+            .filter(|(receipt_project, _)| *receipt_project == project_id)
+            .filter_map(|(_, receipt)| receipt.project_sequence)
+            .map(eliot_types::ProjectSequence::value)
+            .collect::<Vec<_>>();
+        sequences.sort_unstable();
+        assert_eq!(sequences, (1..=8).collect::<Vec<_>>());
+    }
+    assert_eq!(wal.committed_count()?, 64);
+    assert_eq!(harness.store.graph_health().await?.duplicate_write_ids, 0);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires an authenticated local SurrealDB"]
+async fn c5_retry_timer_releases_its_only_lane_for_an_unrelated_project() -> TestResult {
+    let _guard = lock_tests().await;
+    let harness =
+        Harness::new("c5_retry_timer_releases_its_only_lane_for_an_unrelated_project").await?;
+    let delayed_project = ProjectId::new_v7();
+    let unrelated_project = ProjectId::new_v7();
+    let mut delayed = harness.admission.admit(&evidence_command(
+        delayed_project,
+        None,
+        "delayed-unknown",
+        json!({ "project": "delayed" }),
+    ))?;
+    delayed.project_sequence_hint = Some(eliot_types::ProjectSequence::new(1));
+    let unrelated = harness.admission.admit(&evidence_command(
+        unrelated_project,
+        None,
+        "unrelated",
+        json!({ "project": "unrelated" }),
+    ))?;
+    let wal_path = harness.wal_path("c5-retry-isolation");
+    let wal = open_wal(&wal_path)?;
+    wal.append_pending(&delayed)?;
+    wal.mark_unknown_commit(
+        &delayed.write_id,
+        &eliot_store::StoreError::ConnectionClosed,
+    )?;
+    let config = WriterConfig {
+        lane_count: 1,
+        unknown_commit_retry_delay: Duration::from_millis(250),
+        ..WriterConfig::default()
+    };
+    let (handle, actor) = WriterActor::channel(wal, harness.store.clone(), &config);
+    let actor_task = tokio::spawn(actor.run());
+    let (completion_tx, mut completion_rx) = tokio::sync::mpsc::unbounded_channel();
+
+    let delayed_handle = handle.clone();
+    let delayed_completion = completion_tx.clone();
+    let delayed_task = tokio::spawn(async move {
+        let result = delayed_handle.submit(delayed).await;
+        let _ = delayed_completion.send("delayed");
+        result
+    });
+    timeout(Duration::from_secs(2), async {
+        while handle.metrics().scheduled_retries == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await?;
+    let unrelated_handle = handle.clone();
+    let unrelated_task = tokio::spawn(async move {
+        let result = unrelated_handle.submit(unrelated).await;
+        let _ = completion_tx.send("unrelated");
+        result
+    });
+
+    assert_eq!(
+        timeout(Duration::from_secs(5), completion_rx.recv()).await?,
+        Some("unrelated")
+    );
+    let unrelated_receipt = unrelated_task.await??;
+    let delayed_receipt = delayed_task.await??;
+    let metrics = handle.metrics();
+    drop(handle);
+    actor_task.await?;
+
+    assert_eq!(unrelated_receipt.project_id, unrelated_project);
+    assert_eq!(delayed_receipt.project_id, delayed_project);
+    assert_eq!(metrics.configured_lanes, 1);
+    assert_eq!(metrics.scheduled_retries, 1);
+    assert_eq!(metrics.max_in_flight_projects, 1);
+    assert_eq!(metrics.paused_projects, 0);
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires an authenticated local SurrealDB"]
 async fn fetch_l2_returns_relation_neighborhood() -> TestResult {
@@ -528,6 +680,12 @@ impl Harness {
                 at_least_revision: revision,
             })
             .await?)
+    }
+}
+
+fn bind_session(command: &mut SemanticCommand, session_id: SessionId) {
+    if let SemanticCommand::EvidenceIngest(command) = command {
+        command.context.session_id = Some(session_id);
     }
 }
 

@@ -236,5 +236,5 @@ pub use worktree::{
 };
 pub use writer::{
     CognitiveBeginPrecondition, CognitiveTerminalPrecondition, WriterActor, WriterConfig,
-    WriterHandle, WriterRequest,
+    WriterHandle, WriterMetricsSnapshot, WriterRequest, default_writer_lane_count,
 };

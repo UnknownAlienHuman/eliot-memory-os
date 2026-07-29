@@ -43,7 +43,7 @@ or change to the next action.
 
 ## Current checkpoint: C5
 
-No C5 source edit has been made yet.
+C5 implementation is in progress and is not yet accepted.
 
 Confirmed gap:
 
@@ -63,17 +63,102 @@ Confirmed existing foundations:
 
 Next actions:
 
-1. Add one `ControlWalActor` as the sole short redb writer owner.
-2. Add a bounded `WriterCoordinator` with
-   `min(4, logical_cpu_count)` default workers.
-3. Preserve strict per-project FIFO and one canonical transaction in flight per
-   project while allowing independent projects to progress concurrently.
-4. Reconcile ambiguous commits by `write_id`; if still unknowable, pause only
-   that project and never report success or failure as known.
-5. Add reliability tests for 32 sessions / 8 projects, four agents on one
-   project, retry isolation, restart/unknown commit, deduplication, and secret
-   rejection.
-6. Re-run host-package parity and seven-tool semantic checks.
+1. Re-run the focused live C5 SurrealDB acceptance at the final C5 source
+   state.
+2. Run format, diff, and clippy gates; commit the accepted C5 phase.
+3. Begin the sealed C6 cognitive certification harness only after C5 is green.
+
+### 2026-07-29 implementation log
+
+- Added `ControlWal::append_pending_batch`; one short redb transaction stages a
+  bounded group.
+- Added `ControlWalActor` as the only runtime owner of `ControlWal`.
+- Added `WriterCoordinator` with bounded ingress/internal queues and default
+  lane count `min(4, logical_cpu_count)`.
+- Added strict one-active-job-per-project scheduling. Independent projects can
+  occupy separate lanes.
+- Delayed unknown-commit retry returns its lane before the timer starts; the
+  affected project remains active, so unrelated projects are not blocked and
+  same-project order cannot pass the retry.
+- Added exact `write_id` reconciliation and explicit `UnknownCommit` /
+  `ProjectWritePaused` terminal classifications. Unknowable outcome is never
+  rewritten as known failure or success.
+- Added metrics for configured lanes, maximum concurrent projects,
+  backpressure, retry scheduling, and paused projects.
+- During review, found a cross-project idempotency race in separate WAL
+  `get`/`append` commands. Replaced them with actor-owned batched
+  `stage-if-absent`, so two projects cannot both stage the same `write_id`.
+- First engine/store all-target compile gate: PASS, 30.926 seconds. It reported
+  only dead-code warnings for the metrics snapshot before public handle access
+  was wired.
+- Full `eliot-app --all-targets` compile gate after metrics and staging-race
+  repair: PASS without warnings, 41.878 seconds.
+- Writer unit gate: 3/3 passed. It proves CPU-bounded defaults,
+  cross-project same-`write_id` staging admits exactly one pending record, and
+  secret-bearing ingress is rejected before WAL staging. Latest incremental
+  run: 0.08 seconds test body, 5.483 seconds end to end.
+- Isolated C5 concurrency gate: 2/2 passed in 5.036 seconds test time and
+  26.097 seconds end to end. It covers 32 sessions across 8 projects and
+  single-lane retry isolation.
+- Combined recovery gate initially failed 1/2. Separate evidence-log reruns
+  classified `recovery_pending_replay_applies_once` as PASS and
+  `recovery_unknown_commit_reconciles_by_write_id` as product failure:
+  reconciliation returned the original receipt as `Committed` instead of
+  classifying the current request as `IdempotentReplay`. No duplicate record or
+  ordering failure occurred.
+- Applied the replay-status repair at WAL hit, unknown preflight, concurrent
+  stage hit, and exact reconciliation. Focused unknown-commit recovery then
+  passed in 2.036 seconds test time and 10.373 seconds end to end.
+- Host/session boundary suite: 12/12 passed in 0.01 seconds test time and
+  5.004 seconds end to end. It covers host/role separation, immutable scoped
+  session bindings, role inversion, candidate-only results, provider session
+  identity, idempotent receipts, secret-free normalized events, and exact
+  four-package skill hashes.
+- Added a protocol equality test for Codex, Claude, Antigravity, and OpenCode:
+  all four resolve to exactly the same seven names, input field names, schemas,
+  and role-neutral instructions. PASS in 0.02 seconds test time and
+  43.300 seconds end to end; compilation dominated.
+- Found that the OpenCode bootstrap referenced three tools outside the exact
+  seven-tool worker surface and that `ul doctor` omitted OpenCode. Repaired the
+  bootstrap and added the fourth doctor host with config/plugin/skill checks.
+- First four-host doctor compile failed because the new JSON comparison used an
+  unimported `json!` macro. Replaced it with the fully qualified macro.
+- Second doctor attempt compiled but exposed a real CLI identity mismatch:
+  clap derived `open-code` while every canonical host/config field is
+  `opencode`. Added the explicit value name.
+- Four-host doctor then passed in 0.73 seconds test time and 20.241 seconds end
+  to end.
+- Canonical idempotency live gate passed 2/2 in 5.381 seconds test time and
+  20.547 seconds end to end.
+- Ten-agent / 100-write same-project ordering gate passed in 7.576 seconds test
+  time and 9.291 seconds end to end.
+- Clippy required four bounded repair passes: 11 findings in 8.710 seconds
+  (manual clamp, documentation markup, large/long types, expect usage, and
+  duplicate match arms); two remaining findings in 7.349 seconds; one
+  remaining configuration-construction finding in 27.462 seconds; final pass
+  in 0.811 seconds. A later parallel final pass also succeeded in 26.454
+  seconds while waiting on the Cargo build lock.
+- Added a pure `ProjectPauseTable` test after final scheduler review. The
+  writer unit suite passed 4/4; the 0.04-second test body took 33.950 seconds
+  end to end because a concurrent build held the shared target lock.
+- Found a missing known-outage classification during final C5 review:
+  `ServerNotFound`, `ServerStartFailed`, and `ServerAuthFailed` would have been
+  made permanent on the first attempt. Added `FailedRetryable` WAL state, one
+  bounded delayed retry, and `RetryableWriteUnavailable`; the affected project
+  pauses on the exact unresolved `write_id`, while permanent and dead-letter
+  counts remain unchanged.
+- The focused no-server outage test passed as part of writer 5/5: 0.09 seconds
+  test body, 8.772 seconds end to end. It proves one scheduled retry, one
+  paused project, rejection of a later same-project write, one pending
+  `FailedRetryable` record, and zero permanent/dead-letter records.
+- Final format and diff checks passed.
+- Final clippy gate for `eliot-store`, `eliot-engine`, and `eliot-app`, all
+  targets with warnings denied: PASS in 20.695 seconds.
+- Final isolated live C5 gate: 2/2 passed in 5.292 seconds test time and
+  24.416 seconds end to end. The bounded harness reported no timeout, cleanup
+  failure, secret leak, process leak, provider call, or host-configuration
+  change; evidence log SHA-256
+  `82d589819f7bb24d37d9a5eef4a51d1a0415b3b8f1eb8e87307be356a76352cd`.
 
 ## Logging rule
 

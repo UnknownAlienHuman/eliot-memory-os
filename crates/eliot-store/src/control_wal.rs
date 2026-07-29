@@ -41,17 +41,29 @@ impl ControlWal {
     }
 
     pub fn append_pending(&self, envelope: &MemoryWriteEnvelope) -> Result<(), StoreError> {
+        self.append_pending_batch(std::slice::from_ref(envelope))
+    }
+
+    pub fn append_pending_batch(
+        &self,
+        envelopes: &[MemoryWriteEnvelope],
+    ) -> Result<(), StoreError> {
+        if envelopes.is_empty() {
+            return Ok(());
+        }
         let write_txn = self.db.begin_write()?;
         {
             let mut table = write_txn.open_table(PENDING_WRITES)?;
-            let pending = WalPendingWrite {
-                envelope: envelope.clone(),
-                status: WriteStatus::Staged,
-                attempts: 0,
-                last_error: None,
-            };
-            let payload = encode(&pending)?;
-            table.insert(envelope.write_id.to_string().as_str(), payload.as_str())?;
+            for envelope in envelopes {
+                let pending = WalPendingWrite {
+                    envelope: envelope.clone(),
+                    status: WriteStatus::Staged,
+                    attempts: 0,
+                    last_error: None,
+                };
+                let payload = encode(&pending)?;
+                table.insert(envelope.write_id.to_string().as_str(), payload.as_str())?;
+            }
         }
         write_txn.commit()?;
         Ok(())
@@ -133,12 +145,11 @@ impl ControlWal {
     }
 
     pub fn mark_failed(&self, write_id: &WriteId, error: &StoreError) -> Result<(), StoreError> {
-        self.mark_terminal_failure(
-            write_id,
-            WriteStatus::FailedPermanent,
-            error.to_string(),
-            None,
-        )
+        self.mark_failed_message(write_id, error.to_string())
+    }
+
+    pub fn mark_failed_message(&self, write_id: &WriteId, error: String) -> Result<(), StoreError> {
+        self.mark_terminal_failure(write_id, WriteStatus::FailedPermanent, error, None)
     }
 
     pub fn mark_rejected(&self, receipt: &WriteReceipt) -> Result<(), StoreError> {
@@ -158,9 +169,28 @@ impl ControlWal {
         write_id: &WriteId,
         error: &StoreError,
     ) -> Result<(), StoreError> {
+        self.mark_unknown_commit_message(write_id, error.to_string())
+    }
+
+    pub fn mark_unknown_commit_message(
+        &self,
+        write_id: &WriteId,
+        error: String,
+    ) -> Result<(), StoreError> {
         self.update_pending(write_id, |pending| {
             pending.status = WriteStatus::UnknownCommit;
-            pending.last_error = Some(error.to_string());
+            pending.last_error = Some(error);
+        })
+    }
+
+    pub fn mark_retryable_message(
+        &self,
+        write_id: &WriteId,
+        error: String,
+    ) -> Result<(), StoreError> {
+        self.update_pending(write_id, |pending| {
+            pending.status = WriteStatus::FailedRetryable;
+            pending.last_error = Some(error);
         })
     }
 
@@ -254,6 +284,10 @@ impl ControlWal {
 
     pub fn unknown_commit_count(&self) -> Result<u64, StoreError> {
         self.count_pending_by(|pending| pending.status == WriteStatus::UnknownCommit)
+    }
+
+    pub fn retryable_count(&self) -> Result<u64, StoreError> {
+        self.count_pending_by(|pending| pending.status == WriteStatus::FailedRetryable)
     }
 
     pub fn idempotent_replay_count(&self) -> Result<u64, StoreError> {

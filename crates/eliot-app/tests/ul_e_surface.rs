@@ -13,7 +13,7 @@ const EXACT_SKILLS: [&str; 4] = [
 
 #[test]
 fn part_e_static_doctor_passes_for_all_native_hosts() -> TestResult {
-    for host in ["codex", "claude", "antigravity"] {
+    for host in ["codex", "claude", "antigravity", "opencode"] {
         let mut command = Command::new(env!("CARGO_BIN_EXE_eliot-governor"));
         command
             .args(["ul", "doctor", "--host", host])
