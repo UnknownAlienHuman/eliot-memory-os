@@ -452,6 +452,70 @@ green.
   Reader schema, and public suite for every private oracle value. The final
   focused CLI gate passed 2/2 and focused all-target clippy passed with
   warnings denied in 24.4 seconds total.
+- Committed the sealed provider-role evidence layer as
+  `ff3ca775279558ff9f955d047d460dd0574f678b`. A new zero-provider prepare
+  completed in 10.0 seconds, sealed all 48 cases and ripgrep
+  `dffd776a737dc19a48b758dd6a621de113794121`, consumed zero provider calls,
+  and produced contract
+  `blake3:bcf851b40dee063adf96d13196de5ba009a5ef7bf89cd496c6c278bf5aaa1f77`.
+- The resumable deterministic run proved the final local suite substantially
+  farther than every previous attempt. `workspace-verify` passed with an exact
+  receipt in 509,994 ms. The four real isolated SurrealDB batches also passed:
+  context packets 2,387 ms, memory retrieval 20,757 ms, lifecycle 2,583 ms,
+  and writer recovery 2,099 ms. Their stdout/stderr hashes are sealed under
+  the private run root.
+- The outer tool envelope expired after 904.040 seconds while R01 was still
+  seeding. It killed the visible controller but left the process-guardian tree
+  alive. The first inspection incorrectly looked only for a direct controller
+  descendant and therefore missed the orphan. A second same-RunId R01 was
+  launched, after preserving the two zero-byte unsealed outer logs; subsequent
+  full process inspection found both 100k tests and both isolated SurrealDB
+  instances running concurrently.
+- No timing from the concurrent interval is accepted as a clean benchmark.
+  The exact old guardian/tree was reconciled and stopped; the second tree later
+  lost its nextest child without writing a final status while both guardians
+  and the PowerShell controller remained waiting. Its receipt, outer stdout,
+  and outer stderr were also absent/empty. This is classified
+  `UNKNOWN_INTERRUPTED`, not a test pass or failure. The exact remaining
+  guardians, SurrealDB child, and controller were then stopped through their
+  own stop-file/exact-PID boundaries; zero matching processes remained.
+- The R01 behavior is a separate test-infrastructure concern: on the target
+  Ryzen 9 9950X, the test writes 100,000 mixed records in 100 sequential
+  1,000-record governed envelopes plus 5,000 history updates before measuring
+  25 L0/L2 samples. Its serial seeding and guardian disconnect behavior need
+  dedicated study, but optimizing that test is outside this task. A single
+  clean final-head retry remains required; neither interrupted attempt is
+  counted.
+- Antigravity preflight used the authorized desktop app without sending a
+  prompt. Version 2.3.1 executable SHA-256 is
+  `df97dea5fbd72adfd36abcc6806c6855564979f945ef0ab897dde3dfeba2ad07`.
+  The actual selector currently offers Gemini 3.6 Flash High/Medium/Low,
+  Gemini 3.5 Flash High/Medium/Low, Gemini 3.1 Pro High/Low, Claude Sonnet 4.6
+  Thinking, Claude Opus 4.6 Thinking, and GPT-OSS 120B Medium. It does not
+  expose Opus 5. No model call was consumed.
+- Provider executable preflight recorded Claude Code 2.1.219 SHA-256
+  `10f4c1f85b07f3cf6b8fff930fd26ecd475bd146a378acfafa559a6db9d89637`
+  and OpenCode 1.4.3 SHA-256
+  `619233c27bd8433cd8ea5aa8f6336404c31cc3872d5212685d5e5b279778a217`.
+  OpenCode reports authenticated OpenAI and Anthropic OAuth routes. Its model
+  catalog includes explicit `openai/gpt-5.4` and
+  `openrouter/anthropic/claude-opus-5`, but no paid OpenRouter route was used.
+- Direct execution of the Codex Desktop binary inside WindowsApps failed
+  pre-dispatch with ACL `Access is denied`. An exact-hash copy under the
+  private certification root ran successfully as `codex-cli
+  0.146.0-alpha.3.1`; both source and copy hash to
+  `39e9e041ea33ac34aad9578adfe660c5c7a6dc8f82620b77623960f9352a6ef3`.
+  Only `--version` and `exec --help` were run, so no provider call was
+  consumed.
+- Provider-plan review found a hard isolation defect before dispatch: the
+  previous chunking could combine treatment and memory-free-control executions
+  in one provider session. Empty control output fields would not prove zero
+  memory influence after a treatment in the same context. Validation now
+  rejects every mixed-condition call. The exact 24-call plan allocates, for
+  each role, four treatment calls, two control calls, one raw-corpus call, and
+  one distilled-corpus call; the four host smokes remain outside the cap.
+  The focused 24-call/isolation regression passed 1/1 and clippy passed with
+  warnings denied in 27.7 seconds total.
 
 ## Logging rule
 

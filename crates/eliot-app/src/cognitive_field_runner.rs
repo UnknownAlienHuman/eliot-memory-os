@@ -1216,6 +1216,13 @@ fn validate_provider_calls(
             !call.executions.is_empty() && call.executions.windows(2).all(|pair| pair[0] < pair[1]),
             "provider call executions must be non-empty, unique, and sorted"
         );
+        let memory_condition = call.executions[0].memory_condition;
+        ensure!(
+            call.executions
+                .iter()
+                .all(|execution| execution.memory_condition == memory_condition),
+            "one provider call must not mix memory conditions"
+        );
         match call.role {
             CognitiveFieldRole::CodexWorker | CognitiveFieldRole::CodexJudge => ensure!(
                 call.host == AgentHostId::Codex,
@@ -2014,7 +2021,10 @@ mod tests {
         fs::create_dir_all(private_root.join("prompts"))?;
         let private_root = fs::canonicalize(private_root)?;
         let mut calls = Vec::new();
-        let mut by_role = BTreeMap::<CognitiveFieldRole, Vec<CognitiveFieldExecutionKey>>::new();
+        let mut by_role_condition = BTreeMap::<
+            (CognitiveFieldRole, CognitiveMemoryCondition),
+            Vec<CognitiveFieldExecutionKey>,
+        >::new();
         let smoke_role = |case_id: &str| match case_id {
             "H01" => Some(CognitiveFieldRole::CodexWorker),
             "H02" | "H03" | "H04" => Some(CognitiveFieldRole::UnderstandingReader),
@@ -2028,8 +2038,8 @@ mod tests {
                     {
                         continue;
                     }
-                    by_role
-                        .entry(*role)
+                    by_role_condition
+                        .entry((*role, condition))
                         .or_default()
                         .push(CognitiveFieldExecutionKey {
                             case_id: case.case_id.clone(),
@@ -2038,7 +2048,7 @@ mod tests {
                 }
             }
         }
-        for executions in by_role.values_mut() {
+        for executions in by_role_condition.values_mut() {
             executions.sort();
         }
         let model = |host: AgentHostId| match host {
@@ -2105,19 +2115,28 @@ mod tests {
             CognitiveFieldRole::UnderstandingReader,
             CognitiveFieldRole::CodexJudge,
         ] {
-            let executions = by_role.remove(&role).ok_or("missing role executions")?;
-            let chunk_size = executions.len().div_ceil(8);
             let host = if role == CognitiveFieldRole::UnderstandingReader {
                 AgentHostId::Claude
             } else {
                 AgentHostId::Codex
             };
-            for chunk in executions.chunks(chunk_size) {
-                add_call(role, host, false, chunk.to_vec())?;
+            for (condition, target_chunks) in [
+                (CognitiveMemoryCondition::Treatment, 4_usize),
+                (CognitiveMemoryCondition::MemoryFreeControl, 2),
+                (CognitiveMemoryCondition::RawCorpus, 1),
+                (CognitiveMemoryCondition::DistilledCorpus, 1),
+            ] {
+                let executions = by_role_condition
+                    .remove(&(role, condition))
+                    .ok_or("missing role/condition executions")?;
+                let chunk_size = executions.len().div_ceil(target_chunks);
+                for chunk in executions.chunks(chunk_size) {
+                    add_call(role, host, false, chunk.to_vec())?;
+                }
             }
         }
         let (capped, smokes) = validate_provider_calls(&suite, &calls, &private_root)?;
-        assert!(capped <= suite.hard_provider_call_cap);
+        assert_eq!(capped, suite.hard_provider_call_cap);
         assert_eq!(smokes, 4);
         assert_eq!(usize::from(capped) + usize::from(smokes), calls.len());
 
