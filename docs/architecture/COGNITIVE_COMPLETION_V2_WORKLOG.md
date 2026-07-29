@@ -299,6 +299,18 @@ green.
   parity, the dedicated `post-tool-use` handler, passive unbound behavior, and
   asynchronous observation. The focused regression passed 1/1 with 0.00
   seconds test time and 10.670 seconds end to end (10.23-second relink).
+- The second sealed run prepared on source
+  `0e8c1df4918c5f696b2002d32387836641a49d8e` in 8.221 seconds. Its
+  `workspace-verify` passed metadata, formatting, check, clippy, the repaired
+  app unit suite, and subsequent integration binaries before failing in
+  `ul_control_treatment` after 142.711 seconds.
+- The second failure was another stale pre-C2 assertion: an explicit invariant
+  waiver correctly clears `missing_capsule_invariants`, but it must not bypass
+  the newer `blind_subsystem` discriminative-probe gate. Updated the test to
+  require `require_probe`, prove the invariant-specific gate is gone, and
+  require a non-empty suggested probe. The focused credential-gated regression
+  passed parent and child 1/1 in 12.39 seconds test time and 14.410 seconds end
+  to end.
 
 ## Logging rule
 

@@ -230,7 +230,18 @@ fn u9_6_invariant_gate_prefills_requires_and_accepts_an_explicit_waiver() -> Tes
         )),
         "src/invariant/lib.rs",
     )?;
-    assert!(accepted.get("ul_gate").is_none());
+    assert_eq!(accepted["ul_gate"]["status"], "require_probe");
+    assert_eq!(accepted["ul_gate"]["reason"], "blind_subsystem");
+    assert!(
+        accepted["ul_gate"].get("missing_invariant_refs").is_none(),
+        "the explicit bounded waiver must clear only the invariant gate"
+    );
+    assert!(
+        accepted["ul_gate"]["suggested_probe"]
+            .as_str()
+            .is_some_and(|probe| !probe.trim().is_empty()),
+        "blind subsystem coverage still requires a discriminative probe"
+    );
 
     let schema = harness.tool_schema(35, "eliot_compile_packet_l3")?;
     let serialized = serde_json::to_string(&schema)?;
