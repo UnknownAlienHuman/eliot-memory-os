@@ -40,13 +40,19 @@ fn cognitive_field_cli_validates_the_exact_suite_and_publishes_schemas() -> Resu
 }
 
 #[test]
-fn cognitive_field_help_exposes_validate_prepare_and_grade() -> Result<()> {
+fn cognitive_field_help_exposes_validation_preparation_recording_and_grade() -> Result<()> {
     let output = Command::new(env!("CARGO_BIN_EXE_eliot-governor"))
         .args(["cognitive-field", "--help"])
         .output()?;
     assert!(output.status.success());
     let help = String::from_utf8(output.stdout)?;
-    for command in ["validate", "schema", "prepare", "grade"] {
+    for command in [
+        "validate",
+        "schema",
+        "prepare",
+        "record-deterministic",
+        "grade",
+    ] {
         assert!(help.contains(command), "missing cognitive-field {command}");
     }
     Ok(())

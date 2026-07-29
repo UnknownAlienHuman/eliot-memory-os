@@ -246,6 +246,45 @@ green.
   tool output, so it was not credited. A bounded rerun passed with exit 0 in
   0.323 seconds (incremental), followed by `cargo fmt --all -- --check` in
   1.476 seconds and a clean `git diff --check`.
+- Zero-provider prepare on source commit
+  `97257a3fb9789a2fe6ef1c90d13c507349b4cc06` passed in 0.472 seconds for
+  all 48 cases. It sealed ripgrep commit
+  `dffd776a737dc19a48b758dd6a621de113794121`, consumed 0 provider calls,
+  and produced contract hash
+  `blake3:486a0ccfcc019a8a43f7a262a7beb6c51172a56610706ce2f643613f1730541a`.
+- An identical prepare resume passed in 0.358 seconds with identical contract,
+  plan, and private-root hashes. The sanitized report root contained four
+  files and the private root exactly 48 oracle files.
+- The intentional no-evidence grade took 0.500 seconds, emitted all four
+  required aggregate artifacts, reported 0 passed and 61 missing executions,
+  and exited nonzero with
+  `MECHANISMS_COMPLETE_FIELD_CERTIFICATION_BLOCKED`. This is the required
+  fail-closed result, not a claimed field failure. A raw private-value scan
+  across all eight sanitized report artifacts was clean.
+- Added a fail-closed deterministic-evidence importer. It accepts only the
+  exact sealed run/case/condition/source binding, exact registered verifier
+  coverage, zero provider calls, unchanged truth revision, zero exit codes,
+  and SHA-256 readback of stdout/stderr files canonicalized under the private
+  certification root. Only hashes, durations, command refs, and the sealed
+  deterministic report enter the sanitized report tree.
+- The importer and 48-oracle contamination regressions passed 2/2 in 0.08
+  seconds test time and 47.655 seconds end to end; 47.11 seconds were compile
+  and link time. The CLI surface passed 2/2 in 0.62 seconds test time and
+  26.992 seconds end to end, again dominated by a 26.23-second relink.
+- Added the required resumable PowerShell certification orchestrator. Every
+  verifier batch is source/argv/output-hash bound and reusable after a client
+  disconnect. It keeps raw logs outside Git, runs the workspace gate and real
+  isolated SurrealDB suites, and emits all 61 planned deterministic
+  case/condition receipts. PowerShell parsing passed with 1,891 tokens.
+- Added an ignored real-SurrealDB R01 scale gate for 100,000 mixed logical
+  records, 5,000 historical versions, 25 warm L0/L2 samples, and the exact
+  75/150 ms p95 thresholds. Compile-only validation passed in 20.027 seconds;
+  the measured run remains pending until this source state is committed and
+  sealed.
+- Focused clippy attempt 1 found only two test-harness policy findings
+  (`too_many_lines` and intentional benchmark JSON stdout), 32.432 seconds.
+  Attempt 2 found one uninlined format argument, 15.900 seconds. After narrow
+  fixes, clippy passed in 15.935 seconds.
 
 ## Logging rule
 

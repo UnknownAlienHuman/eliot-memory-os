@@ -11,6 +11,8 @@ pub const COGNITIVE_UNDERSTANDING_SCHEMA_VERSION: &str = "eliot-cognitive-unders
 pub const COGNITIVE_JUDGE_SCHEMA_VERSION: &str = "eliot-cognitive-judge-result-v1";
 pub const COGNITIVE_DETERMINISTIC_REPORT_SCHEMA_VERSION: &str =
     "eliot-cognitive-deterministic-report-v1";
+pub const COGNITIVE_DETERMINISTIC_EVIDENCE_SCHEMA_VERSION: &str =
+    "eliot-cognitive-deterministic-evidence-v1";
 pub const COGNITIVE_FIELD_CONTRACT_SCHEMA_VERSION: &str = "eliot-cognitive-field-contract-v1";
 pub const COGNITIVE_FIELD_PLAN_SCHEMA_VERSION: &str = "eliot-cognitive-field-plan-v1";
 pub const COGNITIVE_FIELD_MAX_PROVIDER_CALLS: u8 = 24;
@@ -303,6 +305,34 @@ pub struct CognitiveDeterministicReport {
     pub truth_revision_after_observability: String,
     pub report_hash: String,
     pub passed: bool,
+}
+
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CognitiveVerifierCommandReceipt {
+    pub command_ref: String,
+    pub arguments_sha256: String,
+    pub exit_code: i32,
+    pub elapsed_ms: u64,
+    pub stdout_path: String,
+    pub stdout_sha256: String,
+    pub stderr_path: String,
+    pub stderr_sha256: String,
+}
+
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CognitiveDeterministicEvidenceReceipt {
+    pub schema_version: String,
+    pub run_id: String,
+    pub case_id: String,
+    pub memory_condition: CognitiveMemoryCondition,
+    pub source_commit: String,
+    pub verifier_refs: Vec<String>,
+    pub commands: Vec<CognitiveVerifierCommandReceipt>,
+    pub controller_provider_calls: u8,
+    pub truth_revision_before: String,
+    pub truth_revision_after_observability: String,
 }
 
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]

@@ -1660,6 +1660,18 @@ enum CognitiveFieldCommand {
         #[arg(long)]
         private_root: PathBuf,
     },
+    RecordDeterministic {
+        #[arg(long)]
+        report_root: PathBuf,
+        #[arg(long)]
+        private_root: PathBuf,
+        #[arg(long)]
+        case_id: String,
+        #[arg(long)]
+        memory_condition: String,
+        #[arg(long)]
+        receipt: PathBuf,
+    },
     Grade {
         #[arg(long)]
         report_root: PathBuf,
@@ -2261,6 +2273,19 @@ fn dispatch_cognitive_field_command(command: CognitiveFieldCommand) -> Result<()
             &second_repo,
             &report_root,
             &private_root,
+        ),
+        CognitiveFieldCommand::RecordDeterministic {
+            report_root,
+            private_root,
+            case_id,
+            memory_condition,
+            receipt,
+        } => cognitive_field_runner::record_deterministic(
+            &report_root,
+            &private_root,
+            &case_id,
+            &memory_condition,
+            &receipt,
         ),
         CognitiveFieldCommand::Grade {
             report_root,

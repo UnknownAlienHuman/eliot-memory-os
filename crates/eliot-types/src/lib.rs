@@ -83,10 +83,11 @@ pub use cognition::{
     UnderstandingOutcomeRecord, WaivedInvariant, operator_contract_hash,
 };
 pub use cognitive_field::{
-    COGNITIVE_DETERMINISTIC_REPORT_SCHEMA_VERSION, COGNITIVE_FIELD_CONTRACT_SCHEMA_VERSION,
-    COGNITIVE_FIELD_MAX_PROVIDER_CALLS, COGNITIVE_FIELD_ORACLE_SCHEMA_VERSION,
-    COGNITIVE_FIELD_PLAN_SCHEMA_VERSION, COGNITIVE_FIELD_SUITE_SCHEMA_VERSION,
-    COGNITIVE_JUDGE_SCHEMA_VERSION, COGNITIVE_UNDERSTANDING_SCHEMA_VERSION,
+    COGNITIVE_DETERMINISTIC_EVIDENCE_SCHEMA_VERSION, COGNITIVE_DETERMINISTIC_REPORT_SCHEMA_VERSION,
+    COGNITIVE_FIELD_CONTRACT_SCHEMA_VERSION, COGNITIVE_FIELD_MAX_PROVIDER_CALLS,
+    COGNITIVE_FIELD_ORACLE_SCHEMA_VERSION, COGNITIVE_FIELD_PLAN_SCHEMA_VERSION,
+    COGNITIVE_FIELD_SUITE_SCHEMA_VERSION, COGNITIVE_JUDGE_SCHEMA_VERSION,
+    COGNITIVE_UNDERSTANDING_SCHEMA_VERSION, CognitiveDeterministicEvidenceReceipt,
     CognitiveDeterministicReport, CognitiveFieldCase, CognitiveFieldCaseGrade,
     CognitiveFieldCausalHop, CognitiveFieldFamily, CognitiveFieldPlan, CognitiveFieldPlanItem,
     CognitiveFieldRole, CognitiveFieldRunContract, CognitiveFieldSuite, CognitiveFieldTier,
@@ -94,8 +95,9 @@ pub use cognitive_field::{
     CognitiveJudgeDiscrepancy, CognitiveJudgeResult, CognitiveJudgeScores,
     CognitiveMemoryCondition, CognitiveOracleLeakFinding, CognitiveOracleLeakReport,
     CognitiveRepositoryCondition, CognitiveSecondRepositoryPolicy, CognitiveUnderstandingAnswer,
-    TaskIntentOracle, cognitive_judge_result_schema, cognitive_understanding_answer_schema,
-    minimal_cognitive_judge_result, minimal_cognitive_understanding_answer,
+    CognitiveVerifierCommandReceipt, TaskIntentOracle, cognitive_judge_result_schema,
+    cognitive_understanding_answer_schema, minimal_cognitive_judge_result,
+    minimal_cognitive_understanding_answer,
 };
 pub use cognitive_run::{
     COGNITIVE_RUN_EXACT_CALLS, COGNITIVE_RUN_RAW_VERIFIER_CALLS, COGNITIVE_RUN_SCHEMA_VERSION,

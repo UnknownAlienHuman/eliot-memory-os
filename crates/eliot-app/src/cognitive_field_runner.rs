@@ -1,12 +1,14 @@
 use anyhow::{Context, Result, bail, ensure};
 use eliot_engine::CognitiveFieldGradingService;
 use eliot_types::{
+    COGNITIVE_DETERMINISTIC_EVIDENCE_SCHEMA_VERSION, COGNITIVE_DETERMINISTIC_REPORT_SCHEMA_VERSION,
     COGNITIVE_FIELD_CONTRACT_SCHEMA_VERSION, COGNITIVE_FIELD_ORACLE_SCHEMA_VERSION,
-    COGNITIVE_FIELD_PLAN_SCHEMA_VERSION, CognitiveDeterministicReport, CognitiveFieldCase,
-    CognitiveFieldPlan, CognitiveFieldPlanItem, CognitiveFieldRunContract, CognitiveFieldSuite,
-    CognitiveFieldValidationReport, CognitiveJudgeResult, CognitiveMemoryCondition,
-    CognitiveUnderstandingAnswer, TaskIntentOracle, cognitive_judge_result_schema,
-    cognitive_understanding_answer_schema,
+    COGNITIVE_FIELD_PLAN_SCHEMA_VERSION, CognitiveDeterministicEvidenceReceipt,
+    CognitiveDeterministicReport, CognitiveFieldCase, CognitiveFieldPlan, CognitiveFieldPlanItem,
+    CognitiveFieldRunContract, CognitiveFieldSuite, CognitiveFieldValidationReport,
+    CognitiveHardGateEvidence, CognitiveHardGateKind, CognitiveJudgeResult,
+    CognitiveMemoryCondition, CognitiveUnderstandingAnswer, ProjectId, TaskId, TaskIntentOracle,
+    cognitive_judge_result_schema, cognitive_understanding_answer_schema,
 };
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -17,6 +19,7 @@ use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use time::OffsetDateTime;
+use uuid::Uuid;
 
 pub fn validate(suite_path: &Path) -> Result<()> {
     let (_, report, _) = load_and_validate_suite(suite_path)?;
@@ -199,6 +202,125 @@ pub fn prepare(
         "provider_calls": 0,
         "report_root": report_root,
         "private_root_sha256": contract.private_root_sha256,
+    }))
+}
+
+#[allow(clippy::too_many_lines)]
+pub fn record_deterministic(
+    report_root: &Path,
+    private_root: &Path,
+    case_id: &str,
+    memory_condition: &str,
+    receipt_path: &Path,
+) -> Result<()> {
+    let report_root = canonical_directory(report_root, "cognitive report root")?;
+    let private_root = canonical_directory(private_root, "private certification root")?;
+    let receipt_path = fs::canonicalize(receipt_path)
+        .with_context(|| format!("resolve deterministic receipt {}", receipt_path.display()))?;
+    ensure!(
+        receipt_path.starts_with(&private_root),
+        "deterministic receipt must remain inside the private certification root"
+    );
+    let suite: CognitiveFieldSuite = read_json(&report_root.join("suite.json"))?;
+    let contract: CognitiveFieldRunContract = read_json(&report_root.join("contract.json"))?;
+    ensure!(
+        canonical_path(&report_root) == contract.output_root,
+        "report root differs from the sealed contract"
+    );
+    ensure!(
+        sha256_bytes(canonical_path(&private_root).as_bytes()) == contract.private_root_sha256,
+        "private certification root does not match the sealed contract"
+    );
+    ensure!(
+        git_commit(Path::new(&contract.primary_repository))? == contract.source_commit,
+        "primary repository HEAD moved after the field contract was sealed"
+    );
+    let case = suite
+        .cases
+        .iter()
+        .find(|case| case.case_id == case_id)
+        .with_context(|| format!("unknown cognitive field case {case_id}"))?;
+    let condition = parse_condition(memory_condition)?;
+    ensure!(
+        execution_conditions(case).contains(&condition),
+        "memory condition {memory_condition} is not planned for {case_id}"
+    );
+    let receipt: CognitiveDeterministicEvidenceReceipt = read_json(&receipt_path)?;
+    validate_deterministic_receipt(&contract, case, condition, &private_root, &receipt)?;
+    let receipt_hash = CognitiveFieldGradingService::hash_json(&receipt)?;
+    let binding = format!(
+        "{}:{}:{}:{}",
+        contract.run_id,
+        case.case_id,
+        condition_name(condition),
+        contract.source_commit
+    );
+    let (project_id, task_id) = stable_binding_ids(&binding);
+    let gate_evidence = CognitiveHardGateKind::ALL
+        .into_iter()
+        .map(|gate| CognitiveHardGateEvidence {
+            gate,
+            passed: true,
+            evidence_refs: vec![
+                format!("deterministic-receipt:{receipt_hash}"),
+                format!("contract:{}", contract.contract_hash),
+            ],
+            explanation: format!(
+                "The sealed verifier receipt and field contract satisfy the {gate:?} hard gate"
+            ),
+        })
+        .collect();
+    let mut report = CognitiveDeterministicReport {
+        schema_version: COGNITIVE_DETERMINISTIC_REPORT_SCHEMA_VERSION.to_owned(),
+        case_id: case.case_id.clone(),
+        project_id,
+        task_id,
+        source_commit: contract.source_commit.clone(),
+        verifier_refs: receipt.verifier_refs.clone(),
+        hard_gate_evidence: gate_evidence,
+        controller_provider_calls: receipt.controller_provider_calls,
+        truth_revision_before: receipt.truth_revision_before.clone(),
+        truth_revision_after_observability: receipt.truth_revision_after_observability.clone(),
+        report_hash: String::new(),
+        passed: true,
+    };
+    CognitiveFieldGradingService::seal_deterministic_report(&mut report)?;
+    let evidence_root = report_root
+        .join("evidence")
+        .join(&case.case_id)
+        .join(condition_name(condition));
+    write_new_or_same_json(&evidence_root.join("deterministic.json"), &report)?;
+    write_new_or_same_json(
+        &evidence_root.join("verifier-receipt.json"),
+        &json!({
+            "schema_version": "eliot-cognitive-sanitized-verifier-receipt-v1",
+            "run_id": receipt.run_id,
+            "case_id": receipt.case_id,
+            "memory_condition": receipt.memory_condition,
+            "source_commit": receipt.source_commit,
+            "verifier_refs": receipt.verifier_refs,
+            "commands": receipt.commands.iter().map(|command| json!({
+                "command_ref": command.command_ref,
+                "arguments_sha256": command.arguments_sha256,
+                "exit_code": command.exit_code,
+                "elapsed_ms": command.elapsed_ms,
+                "stdout_sha256": command.stdout_sha256,
+                "stderr_sha256": command.stderr_sha256,
+            })).collect::<Vec<_>>(),
+            "controller_provider_calls": receipt.controller_provider_calls,
+            "truth_revision_before": receipt.truth_revision_before,
+            "truth_revision_after_observability": receipt.truth_revision_after_observability,
+            "private_receipt_hash": receipt_hash,
+        }),
+    )?;
+    print_json(&json!({
+        "status": "deterministic_evidence_recorded",
+        "run_id": contract.run_id,
+        "case_id": case.case_id,
+        "memory_condition": condition_name(condition),
+        "deterministic_report_hash": report.report_hash,
+        "private_receipt_hash": receipt_hash,
+        "provider_calls": 0,
     }))
 }
 
@@ -491,6 +613,110 @@ fn condition_name(condition: CognitiveMemoryCondition) -> &'static str {
     }
 }
 
+fn parse_condition(value: &str) -> Result<CognitiveMemoryCondition> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "treatment" => Ok(CognitiveMemoryCondition::Treatment),
+        "memory_free_control" => Ok(CognitiveMemoryCondition::MemoryFreeControl),
+        "raw_corpus" => Ok(CognitiveMemoryCondition::RawCorpus),
+        "distilled_corpus" => Ok(CognitiveMemoryCondition::DistilledCorpus),
+        other => bail!("unsupported cognitive memory condition {other}"),
+    }
+}
+
+fn validate_deterministic_receipt(
+    contract: &CognitiveFieldRunContract,
+    case: &CognitiveFieldCase,
+    condition: CognitiveMemoryCondition,
+    private_root: &Path,
+    receipt: &CognitiveDeterministicEvidenceReceipt,
+) -> Result<()> {
+    ensure!(
+        receipt.schema_version == COGNITIVE_DETERMINISTIC_EVIDENCE_SCHEMA_VERSION,
+        "deterministic evidence schema version is invalid"
+    );
+    ensure!(
+        receipt.run_id == contract.run_id
+            && receipt.case_id == case.case_id
+            && receipt.memory_condition == condition
+            && receipt.source_commit == contract.source_commit,
+        "deterministic evidence binding differs from the sealed plan"
+    );
+    ensure!(
+        receipt.controller_provider_calls == 0,
+        "controller substitution is forbidden in deterministic evidence"
+    );
+    ensure!(
+        !receipt.truth_revision_before.trim().is_empty()
+            && receipt.truth_revision_before == receipt.truth_revision_after_observability,
+        "observability changed or omitted the truth revision"
+    );
+    let expected = case
+        .deterministic_verifier_refs
+        .iter()
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let observed = receipt
+        .verifier_refs
+        .iter()
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    ensure!(
+        expected == observed && expected.len() == receipt.verifier_refs.len(),
+        "deterministic evidence does not exactly cover the registered verifier refs"
+    );
+    ensure!(
+        !receipt.commands.is_empty(),
+        "deterministic evidence has no command receipts"
+    );
+    for command in &receipt.commands {
+        ensure!(
+            !command.command_ref.trim().is_empty()
+                && is_sha256(&command.arguments_sha256)
+                && command.exit_code == 0
+                && is_sha256(&command.stdout_sha256)
+                && is_sha256(&command.stderr_sha256),
+            "deterministic command receipt is incomplete or failed"
+        );
+        verify_private_log(private_root, &command.stdout_path, &command.stdout_sha256)?;
+        verify_private_log(private_root, &command.stderr_path, &command.stderr_sha256)?;
+    }
+    Ok(())
+}
+
+fn verify_private_log(private_root: &Path, path: &str, expected_sha256: &str) -> Result<()> {
+    let path = fs::canonicalize(path).with_context(|| format!("resolve private log {path}"))?;
+    ensure!(
+        path.starts_with(private_root) && path.is_file(),
+        "verifier log must be a file inside the private certification root"
+    );
+    ensure!(
+        sha256_bytes(&fs::read(&path)?) == expected_sha256,
+        "verifier log hash mismatch for {}",
+        path.display()
+    );
+    Ok(())
+}
+
+fn stable_binding_ids(binding: &str) -> (ProjectId, TaskId) {
+    (
+        ProjectId::from_uuid(stable_uuid(&format!("project:{binding}"))),
+        TaskId::from_uuid(stable_uuid(&format!("task:{binding}"))),
+    )
+}
+
+fn stable_uuid(value: &str) -> Uuid {
+    let digest = Sha256::digest(value.as_bytes());
+    let mut bytes = [0_u8; 16];
+    bytes.copy_from_slice(&digest[..16]);
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    Uuid::from_bytes(bytes)
+}
+
+fn is_sha256(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
 fn deterministic_report_is_valid(report: &CognitiveDeterministicReport) -> Result<bool> {
     let original_hash = report.report_hash.clone();
     let original_passed = report.passed;
@@ -665,13 +891,17 @@ fn print_json<T: Serialize>(value: &T) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{generated_oracle, sha256_bytes};
+    use super::{generated_oracle, sha256_bytes, validate_deterministic_receipt};
     use eliot_engine::CognitiveFieldGradingService;
     use eliot_types::{
-        COGNITIVE_FIELD_CONTRACT_SCHEMA_VERSION, CognitiveFieldRunContract, CognitiveFieldSuite,
+        COGNITIVE_DETERMINISTIC_EVIDENCE_SCHEMA_VERSION, COGNITIVE_FIELD_CONTRACT_SCHEMA_VERSION,
+        CognitiveDeterministicEvidenceReceipt, CognitiveFieldRunContract, CognitiveFieldSuite,
+        CognitiveMemoryCondition, CognitiveVerifierCommandReceipt,
     };
+    use std::fs;
     use std::path::Path;
     use time::OffsetDateTime;
+    use uuid::Uuid;
 
     #[test]
     fn generated_private_oracle_values_are_absent_from_the_versioned_suite()
@@ -705,6 +935,87 @@ mod tests {
             );
             assert!(scan.clean, "{}: {:?}", case.case_id, scan.findings);
         }
+        Ok(())
+    }
+
+    #[test]
+    fn deterministic_receipt_requires_real_private_logs_and_exact_hashes()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root = std::env::temp_dir().join(format!(
+            "eliot-cognitive-deterministic-receipt-{}",
+            Uuid::new_v4()
+        ));
+        fs::create_dir_all(&root)?;
+        let stdout = root.join("stdout.log");
+        let stderr = root.join("stderr.log");
+        fs::write(&stdout, b"focused verifier passed\n")?;
+        fs::write(&stderr, b"")?;
+        let suite_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(Path::parent)
+            .ok_or("resolve workspace root")?;
+        let suite: CognitiveFieldSuite = serde_json::from_slice(&fs::read(
+            suite_root.join("tests/cognitive/field-v2/suite.json"),
+        )?)?;
+        let case = suite
+            .cases
+            .iter()
+            .find(|case| case.case_id == "U01")
+            .ok_or("find U01")?;
+        let contract = CognitiveFieldRunContract {
+            schema_version: COGNITIVE_FIELD_CONTRACT_SCHEMA_VERSION.to_owned(),
+            run_id: "receipt-test".to_owned(),
+            suite_sha256: "0".repeat(64),
+            source_commit: "0123456789abcdef0123456789abcdef01234567".to_owned(),
+            primary_repository: "C:/primary".to_owned(),
+            second_repository: "C:/second".to_owned(),
+            second_repository_commit: "fedcba9876543210fedcba9876543210fedcba98".to_owned(),
+            output_root: "C:/reports".to_owned(),
+            private_root_sha256: sha256_bytes(root.to_string_lossy().as_bytes()),
+            hard_provider_call_cap: suite.hard_provider_call_cap,
+            contract_hash: "contract".to_owned(),
+            sealed_at: OffsetDateTime::UNIX_EPOCH,
+        };
+        let mut receipt = CognitiveDeterministicEvidenceReceipt {
+            schema_version: COGNITIVE_DETERMINISTIC_EVIDENCE_SCHEMA_VERSION.to_owned(),
+            run_id: contract.run_id.clone(),
+            case_id: case.case_id.clone(),
+            memory_condition: CognitiveMemoryCondition::Treatment,
+            source_commit: contract.source_commit.clone(),
+            verifier_refs: case.deterministic_verifier_refs.clone(),
+            commands: vec![CognitiveVerifierCommandReceipt {
+                command_ref: "cargo:test/cognitive_field_grading".to_owned(),
+                arguments_sha256: "1".repeat(64),
+                exit_code: 0,
+                elapsed_ms: 12,
+                stdout_path: stdout.to_string_lossy().into_owned(),
+                stdout_sha256: sha256_bytes(&fs::read(&stdout)?),
+                stderr_path: stderr.to_string_lossy().into_owned(),
+                stderr_sha256: sha256_bytes(&fs::read(&stderr)?),
+            }],
+            controller_provider_calls: 0,
+            truth_revision_before: "revision:1".to_owned(),
+            truth_revision_after_observability: "revision:1".to_owned(),
+        };
+        validate_deterministic_receipt(
+            &contract,
+            case,
+            CognitiveMemoryCondition::Treatment,
+            &fs::canonicalize(&root)?,
+            &receipt,
+        )?;
+        receipt.commands[0].stdout_sha256 = "2".repeat(64);
+        assert!(
+            validate_deterministic_receipt(
+                &contract,
+                case,
+                CognitiveMemoryCondition::Treatment,
+                &fs::canonicalize(&root)?,
+                &receipt,
+            )
+            .is_err()
+        );
+        fs::remove_dir_all(&root)?;
         Ok(())
     }
 }
