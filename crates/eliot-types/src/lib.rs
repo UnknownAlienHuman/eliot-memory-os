@@ -7,6 +7,7 @@ pub mod cognitive_run;
 pub mod config;
 pub mod delegation;
 pub mod delegation_calibration;
+pub mod distillation;
 pub mod error;
 pub mod eval;
 pub mod external_review;
@@ -121,6 +122,16 @@ pub use delegation_calibration::{
     ProviderCallLineageTerminalState, ProviderFindingDisposition, ProviderFindingMateriality,
     ProviderFindingNovelty, ProviderFindingVerdict, ProviderReviewPreRegistration,
     ProviderUtilityAssessment, ProviderUtilityReason,
+};
+pub use distillation::{
+    CanonicalMemoryUtilityLedger, MemoryCompressionArtifact, MemoryDistillationAction,
+    MemoryDistillationApplyReceipt, MemoryDistillationApplySelection, MemoryDistillationCandidate,
+    MemoryDistillationCheckpoint, MemoryDistillationCorpusItem, MemoryDistillationCorpusProfile,
+    MemoryDistillationFinding, MemoryDistillationInput, MemoryDistillationPlan,
+    MemoryDistillationScheduleRequest, MemoryDistillationTrigger, MemoryTier,
+    MemoryUtilityLedgerEntry, MemoryUtilitySignalKind, MemoryUtilitySourceRecord,
+    memory_compression_artifact_schema, memory_distillation_plan_schema,
+    memory_distillation_schedule_schema,
 };
 pub use error::ConfigError;
 pub use eval::{

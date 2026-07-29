@@ -771,6 +771,16 @@ pub(super) async fn dispatch_tool(
         "eliot_memory_curation_preview" => {
             Box::pin(dispatch_memory_curation_preview(state, arguments)).await?
         }
+        "eliot_memory_distillation_preview" => {
+            Box::pin(dispatch_memory_distillation_preview(state, arguments)).await?
+        }
+        "eliot_memory_distillation_schedule" => dispatch_memory_distillation_schedule(arguments)?,
+        "eliot_memory_distillation_apply" => {
+            Box::pin(dispatch_memory_distillation_apply(
+                state, context, arguments,
+            ))
+            .await?
+        }
         "eliot_experience_recall" => Box::pin(dispatch_experience_recall(state, arguments)).await?,
         "eliot_experience_reinstate" => {
             Box::pin(dispatch_experience_reinstate(state, arguments)).await?
@@ -987,10 +997,16 @@ pub(super) async fn dispatch_tool(
             .await?
         }
         "eliot_canonical_status" => Box::pin(dispatch_canonical_status(state, arguments)).await?,
-        "eliot_memory_lifecycle_status" => dispatch_memory_lifecycle_status(arguments)?,
+        "eliot_memory_lifecycle_status" => {
+            Box::pin(dispatch_memory_lifecycle_status(state, arguments)).await?
+        }
         "eliot_memory_lifecycle_propose" => dispatch_memory_lifecycle_propose(arguments)?,
-        "eliot_memory_lifecycle_vitality" => dispatch_memory_lifecycle_vitality(arguments)?,
-        "eliot_memory_lifecycle_gravity" => dispatch_memory_lifecycle_gravity(arguments)?,
+        "eliot_memory_lifecycle_vitality" => {
+            Box::pin(dispatch_memory_lifecycle_vitality(state, arguments)).await?
+        }
+        "eliot_memory_lifecycle_gravity" => {
+            Box::pin(dispatch_memory_lifecycle_gravity(state, arguments)).await?
+        }
         "eliot_memory_lifecycle_influence" => {
             Box::pin(dispatch_memory_lifecycle_influence(state, arguments)).await?
         }

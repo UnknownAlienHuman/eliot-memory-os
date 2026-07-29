@@ -291,6 +291,8 @@ fn sleep_uses_only_real_complete_traces_and_emits_candidate_classes() {
                     failure.trace_ref.clone(),
                     incomplete.trace_ref.clone(),
                 ],
+                max_input_bytes: 8_192,
+                reasoning_retry_limit: 1,
             },
             &[success, failure, incomplete.clone()],
             false,

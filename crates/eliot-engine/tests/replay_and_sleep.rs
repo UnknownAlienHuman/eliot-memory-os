@@ -198,6 +198,8 @@ fn sleep_outputs_candidate_only_and_does_not_mutate_truth() {
             trigger: SleepTrigger::Manual,
             dry_run: true,
             input_traces: vec!["trace:test".to_owned()],
+            max_input_bytes: 8_192,
+            reasoning_retry_limit: 1,
         },
         false,
     ) {
@@ -208,6 +210,31 @@ fn sleep_outputs_candidate_only_and_does_not_mutate_truth() {
     assert!(run.outputs.iter().all(|output| output.candidate_only));
     assert!(run.replay_requirement.required);
     assert_eq!(run.taint, TaintClass::Unknown);
+    assert_eq!(run.input_bytes, 10);
+    assert_eq!(run.input_budget_bytes, 8_192);
+    assert_eq!(run.reasoning_attempts, 0);
+    assert_eq!(run.reasoning_retry_limit, 1);
+    assert!(run.deterministic_fallback);
+    assert!(!run.degraded);
+}
+
+#[test]
+fn sleep_rejects_oversized_inputs_and_more_than_one_reasoning_retry() {
+    let project_id = ProjectId::new_v7();
+    for (max_input_bytes, reasoning_retry_limit) in [(4, 1), (8_192, 2)] {
+        let result = SleepConsolidationService::run(
+            SleepRunInput {
+                project_id,
+                trigger: SleepTrigger::Manual,
+                dry_run: true,
+                input_traces: vec!["trace:test".to_owned()],
+                max_input_bytes,
+                reasoning_retry_limit,
+            },
+            false,
+        );
+        assert!(result.is_err());
+    }
 }
 
 #[test]
@@ -257,6 +284,8 @@ fn incident_lockdown_blocks_sleep_candidate_creation() {
             trigger: SleepTrigger::Manual,
             dry_run: true,
             input_traces: vec!["trace:test".to_owned()],
+            max_input_bytes: 8_192,
+            reasoning_retry_limit: 1,
         },
         true,
     );

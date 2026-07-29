@@ -1590,7 +1590,7 @@ async fn canonical_operator_paging_survives_restart_without_gaps_or_duplicates()
 
     let project_id = ProjectId::new_v7();
     let task_id = TaskId::new_v7();
-    let expected = seed_operator_page_records(&first_store, project_id, task_id, 311).await?;
+    let expected = seed_operator_page_records(&first_store, project_id, task_id, 1_011).await?;
     let mut pages = vec![
         first_store
             .canonical_record_page(
@@ -1624,31 +1624,38 @@ async fn canonical_operator_paging_survives_restart_without_gaps_or_duplicates()
         .await?;
     let restarted_store = CanonicalStore::new(config);
     restarted_store.migrate_schema().await?;
-    pages.push(
+    let mut start = 200_u64;
+    loop {
+        let page = restarted_store
+            .canonical_record_page(project_id, Some(task_id), &[], start, 100)
+            .await?;
+        let returned = page.len();
+        pages.push(page);
+        start = start.saturating_add(u64::try_from(returned)?);
+        if returned < 100 {
+            break;
+        }
+    }
+    assert!(
         restarted_store
-            .canonical_record_page(
+            .canonical_record_page_at_revision(
                 project_id,
                 Some(task_id),
-                &["operator_control_request"],
-                200,
-                100,
+                &[],
+                Some(MemoryRevision::new(0)),
+                0,
+                1,
             )
-            .await?,
-    );
-    pages.push(
-        restarted_store
-            .canonical_record_page(
-                project_id,
-                Some(task_id),
-                &["operator_control_request"],
-                300,
-                100,
-            )
-            .await?,
+            .await?
+            .is_empty(),
+        "revision-fenced scan exposed a future canonical record"
     );
 
     let page_sizes = pages.iter().map(Vec::len).collect::<Vec<_>>();
-    assert_eq!(page_sizes, [100, 100, 100, 11]);
+    assert_eq!(
+        page_sizes,
+        [100, 100, 100, 100, 100, 100, 100, 100, 100, 100, 11]
+    );
     let actual = pages
         .into_iter()
         .flatten()
@@ -1660,7 +1667,7 @@ async fn canonical_operator_paging_survives_restart_without_gaps_or_duplicates()
             .iter()
             .collect::<std::collections::BTreeSet<_>>()
             .len(),
-        311
+        1_011
     );
     drop(restarted_store);
     assert!(

@@ -363,10 +363,24 @@ async fn apply_lifecycle_policy_to_memory(
     let config = load_config(config_path)?;
     let store = CanonicalStore::new(config.db.surreal.clone());
     let _ = store.migrate_schema().await?;
+    let latest_transition = store
+        .canonical_records_by_subject_ref::<MemoryStateTransition>(
+            policy.project_id,
+            None,
+            &["state_transition"],
+            &policy.target_ref,
+            1,
+        )
+        .await?
+        .into_iter()
+        .next();
+    let lifecycle = latest_transition.map_or_else(MemoryLifecycleService::new, |record| {
+        MemoryLifecycleService::new().with_state(&policy.target_ref, record.receipt_body.to_state)
+    });
     let wal = ControlWal::open(&config.control_wal)?;
     let (handle, actor) = WriterActor::channel(wal, store, &WriterConfig::default());
     let actor_task = tokio::spawn(actor.run());
-    let outcome = MemoryLifecycleService::new()
+    let outcome = lifecycle
         .apply_policy_through_writer(
             &handle,
             &WriteAdmissionService,

@@ -377,6 +377,8 @@ fn sleep_materializes_all_five_candidate_only_artifact_types() {
                 trigger: SleepTrigger::Manual,
                 dry_run: false,
                 input_traces: vec![contract.trace_ref.clone()],
+                max_input_bytes: 8_192,
+                reasoning_retry_limit: 1,
             },
             &[contract],
             false,

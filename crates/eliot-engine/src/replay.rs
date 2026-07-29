@@ -96,6 +96,8 @@ pub struct SleepRunInput {
     pub trigger: SleepTrigger,
     pub dry_run: bool,
     pub input_traces: Vec<String>,
+    pub max_input_bytes: u32,
+    pub reasoning_retry_limit: u8,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -1017,6 +1019,7 @@ impl SleepConsolidationService {
         })
     }
 
+    #[allow(clippy::too_many_lines)]
     fn run_internal(
         mut input: SleepRunInput,
         mut excluded_trace_contract_refs: Vec<String>,
@@ -1031,6 +1034,20 @@ impl SleepConsolidationService {
         input.input_traces.sort();
         input.input_traces.dedup();
         input.input_traces.truncate(20);
+        if input.reasoning_retry_limit > 1 {
+            return Err(EngineError::WriteRejected(
+                "sleep reasoning retry limit must be at most one".to_owned(),
+            ));
+        }
+        let input_bytes = input.input_traces.iter().map(String::len).sum::<usize>();
+        if input.max_input_bytes == 0
+            || input_bytes > usize::try_from(input.max_input_bytes).unwrap_or(usize::MAX)
+        {
+            return Err(EngineError::WriteRejected(format!(
+                "sleep input handle/excerpt budget exceeded: input_bytes={input_bytes} budget_bytes={}",
+                input.max_input_bytes
+            )));
+        }
         excluded_trace_contract_refs.sort();
         excluded_trace_contract_refs.dedup();
         if input.input_traces.is_empty() {
@@ -1105,6 +1122,12 @@ impl SleepConsolidationService {
             ],
             excluded_trace_contract_refs,
             reasoning_route_ref: format!("deterministic:sleep-consolidation-v2:{short_digest}"),
+            input_bytes: u32::try_from(input_bytes).unwrap_or(u32::MAX),
+            input_budget_bytes: input.max_input_bytes,
+            reasoning_attempts: 0,
+            reasoning_retry_limit: input.reasoning_retry_limit,
+            deterministic_fallback: true,
+            degraded: false,
             replay_requirement: SkillReplayRequirement {
                 required: true,
                 reason: "sleep output requires replay before activation".to_owned(),

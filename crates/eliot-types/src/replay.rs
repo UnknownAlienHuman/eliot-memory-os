@@ -255,6 +255,18 @@ pub struct SleepConsolidationRun {
     pub excluded_trace_contract_refs: Vec<String>,
     #[serde(default)]
     pub reasoning_route_ref: String,
+    #[serde(default)]
+    pub input_bytes: u32,
+    #[serde(default)]
+    pub input_budget_bytes: u32,
+    #[serde(default)]
+    pub reasoning_attempts: u8,
+    #[serde(default)]
+    pub reasoning_retry_limit: u8,
+    #[serde(default)]
+    pub deterministic_fallback: bool,
+    #[serde(default)]
+    pub degraded: bool,
     pub replay_requirement: SkillReplayRequirement,
     pub taint: TaintClass,
     pub status: SleepConsolidationStatus,

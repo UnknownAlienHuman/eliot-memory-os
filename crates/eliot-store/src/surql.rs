@@ -760,6 +760,14 @@ mod tests {
         let template = NamedSurqlOp::CanonicalRecordPage.template();
         assert!(template.contains("project_id = $project_id"));
         assert!(
+            template.contains("array::len($receipt_kinds) = 0"),
+            "an empty kind filter must provide a project-wide canonical scan"
+        );
+        assert!(
+            template.contains("memory_revision <= $at_revision"),
+            "canonical scans must support a stable revision fence"
+        );
+        assert!(
             template.contains("ORDER BY memory_revision ASC, project_sequence ASC, record_id ASC")
         );
         assert!(template.contains("START $start"));

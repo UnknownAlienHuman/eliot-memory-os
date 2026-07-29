@@ -52,6 +52,201 @@ const CURATION_RULESET_VERSION: &str = "eliot-l13-curation-v1";
 const MAX_CURATION_SCAN_RECORDS_PER_SOURCE: usize = 1_000;
 const CURATION_SCAN_PAGE_SIZE: u16 = 100;
 
+pub(super) async fn dispatch_memory_distillation_preview(
+    state: &McpState,
+    arguments: Value,
+) -> Result<Value> {
+    let request: MemoryDistillationPreviewToolInput = serde_json::from_value(arguments)?;
+    if request.page_size == 0 || request.page_size > 100 {
+        anyhow::bail!("distillation preview page_size must be between 1 and 100");
+    }
+    if request.ruleset_version != eliot_engine::MEMORY_DISTILLATION_RULESET_VERSION {
+        anyhow::bail!("unsupported memory distillation ruleset_version");
+    }
+    if request.cursor.is_some() && request.at_revision.is_none() {
+        anyhow::bail!("continued distillation preview requires the returned at_revision");
+    }
+    let project_id = parse_project_id(&request.project_id)?;
+    let requested_revision = request.at_revision.map(MemoryRevision::new);
+    let (snapshot_revision, records, scan_complete) =
+        canonical_memory_snapshot(state, project_id, &[], requested_revision).await?;
+    let utility_ledger = MemoryDistillationService::derive_utility_ledger(
+        project_id,
+        snapshot_revision,
+        &canonical_utility_sources(&records)?,
+        scan_complete,
+    );
+    let items = canonical_distillation_items(&records)?;
+    let mut plan = MemoryDistillationService::plan(MemoryDistillationInput {
+        project_id,
+        snapshot_revision,
+        ruleset_version: request.ruleset_version.clone(),
+        complete: scan_complete,
+        items,
+        utility_ledger,
+    })?;
+    let total_matching = plan.candidates.len();
+    let cursor_scope = canonical_struct_hash(&json!({
+        "tool": "eliot_memory_distillation_preview",
+        "project_id": project_id,
+        "at_revision": snapshot_revision,
+        "ruleset_version": request.ruleset_version,
+        "plan_id": plan.plan_id,
+    }))?;
+    let cursor_state = operator_cursor_state(
+        request.cursor.as_deref(),
+        &cursor_scope,
+        &state.cursor_signing_key,
+    )?;
+    if cursor_state.canonical_start != 0 || cursor_state.matched_seen != 0 {
+        anyhow::bail!("distillation preview cursor has invalid state");
+    }
+    let offset = usize::try_from(cursor_state.base_offset)
+        .context("distillation preview cursor offset exceeds this platform")?;
+    if offset > total_matching {
+        anyhow::bail!("distillation preview cursor exceeds the stable result set");
+    }
+    let end = offset
+        .saturating_add(usize::from(request.page_size))
+        .min(total_matching);
+    plan.candidates = plan.candidates[offset..end].to_vec();
+    let next_cursor = (end < total_matching).then(|| {
+        operator_cursor(
+            OperatorCursorState {
+                base_offset: u64::try_from(end).unwrap_or(u64::MAX),
+                canonical_start: 0,
+                matched_seen: 0,
+            },
+            &cursor_scope,
+            &state.cursor_signing_key,
+        )
+    });
+    Ok(json!({
+        "project_id": project_id,
+        "at_revision": snapshot_revision,
+        "read_only": true,
+        "plan": plan,
+        "cursor": request.cursor,
+        "next_cursor": next_cursor,
+        "total_matching": total_matching,
+        "total_is_exact": scan_complete,
+    }))
+}
+
+pub(super) fn dispatch_memory_distillation_schedule(arguments: Value) -> Result<Value> {
+    let request: MemoryDistillationScheduleRequest = serde_json::from_value(arguments)?;
+    serde_json::to_value(MemoryDistillationService::schedule(&request)).map_err(Into::into)
+}
+
+pub(super) async fn dispatch_memory_distillation_apply(
+    state: &McpState,
+    context: AuthenticatedRequestContext,
+    arguments: Value,
+) -> Result<Value> {
+    require_canonical_controller_authority(state)?;
+    let input: MemoryDistillationApplyToolInput = serde_json::from_value(arguments)?;
+    if input.selected_candidate_ids.is_empty() || input.selected_candidate_ids.len() > 100 {
+        anyhow::bail!("distillation apply requires between 1 and 100 selected candidate ids");
+    }
+    validate_broker_text("idempotency_key", &input.idempotency_key, 256)?;
+    if input.ruleset_version != eliot_engine::MEMORY_DISTILLATION_RULESET_VERSION {
+        anyhow::bail!("unsupported memory distillation ruleset_version");
+    }
+    let project_id = parse_project_id(&input.project_id)?;
+    let task_id = TaskId::from_str(&input.task_id).context("parse distillation task_id")?;
+    let task = state
+        .store
+        .task_contract_by_id(task_id)
+        .await?
+        .context("distillation apply task does not exist")?;
+    if task.project_id != project_id {
+        anyhow::bail!("distillation apply task belongs to a different project");
+    }
+    let expected_revision = MemoryRevision::new(input.at_revision);
+    let current_revision = state
+        .store
+        .current_state(&CurrentStateRequest {
+            project_id,
+            consistency: ReadConsistencyMode::Latest,
+            at_least_revision: None,
+        })
+        .await?
+        .memory_revision;
+    if current_revision != expected_revision {
+        anyhow::bail!(
+            "distillation apply snapshot is stale: expected={} current={}",
+            expected_revision.value(),
+            current_revision.value()
+        );
+    }
+    let (snapshot_revision, records, complete) =
+        canonical_memory_snapshot(state, project_id, &[], Some(expected_revision)).await?;
+    let utility_ledger = MemoryDistillationService::derive_utility_ledger(
+        project_id,
+        snapshot_revision,
+        &canonical_utility_sources(&records)?,
+        complete,
+    );
+    let plan = MemoryDistillationService::plan(MemoryDistillationInput {
+        project_id,
+        snapshot_revision,
+        ruleset_version: input.ruleset_version,
+        complete,
+        items: canonical_distillation_items(&records)?,
+        utility_ledger,
+    })?;
+    let mut receipt =
+        MemoryDistillationService::select_reversible_actions(&plan, &input.selected_candidate_ids)?;
+    if !receipt.rejected_candidate_ids.is_empty() {
+        anyhow::bail!(
+            "distillation apply rejected unsafe, incomplete, missing, or non-reversible candidates: {:?}",
+            receipt.rejected_candidate_ids
+        );
+    }
+    for selection in &receipt.selected {
+        let candidate = plan
+            .candidates
+            .iter()
+            .find(|candidate| candidate.candidate_id == selection.candidate_id)
+            .context("selected distillation candidate disappeared from the exact plan")?;
+        let reason = distillation_forgetting_reason(candidate.finding)?;
+        let stable_key = format!(
+            "distillation:{}",
+            blake3::hash(
+                format!("{}:{}", input.idempotency_key, selection.candidate_id).as_bytes()
+            )
+            .to_hex()
+        );
+        let write_receipt = persist_operator_lifecycle_transition(
+            state,
+            context,
+            project_id,
+            task_id,
+            &selection.target_ref,
+            selection.operator,
+            reason,
+            OperatorLifecycleBinding::unbound(selection.evidence_refs.clone()),
+            &stable_key,
+        )
+        .await?;
+        receipt.write_receipts.push(write_receipt);
+    }
+    serde_json::to_value(receipt).map_err(Into::into)
+}
+
+fn distillation_forgetting_reason(finding: MemoryDistillationFinding) -> Result<ForgettingReason> {
+    match finding {
+        MemoryDistillationFinding::ExactDuplicate => Ok(ForgettingReason::Duplicate),
+        MemoryDistillationFinding::StaleSuperseded
+        | MemoryDistillationFinding::ObsoleteArtifact => Ok(ForgettingReason::Superseded),
+        MemoryDistillationFinding::WrongScope => Ok(ForgettingReason::WrongScope),
+        MemoryDistillationFinding::RepeatedLowDelta => Ok(ForgettingReason::LowUtility),
+        other => {
+            anyhow::bail!("distillation finding is not eligible for automatic apply: {other:?}")
+        }
+    }
+}
+
 #[allow(clippy::too_many_lines)]
 pub(super) async fn dispatch_memory_curation_preview(
     state: &McpState,
@@ -292,43 +487,32 @@ pub(super) fn analyze_curation_records(
                     "restore receipt with revised scope".to_owned(),
                 ],
             ))
-        } else if curation_numeric(metadata, "utility_score").is_some_and(|score| score <= 25.0)
-            && metadata.get("evidence_sufficient").and_then(Value::as_bool) == Some(true)
-        {
-            Some((
-                MemoryCurationFindingKind::LowUtility,
-                "archive",
-                92,
-                Vec::new(),
-                vec![
-                    "new evidence of positive retrieval utility".to_owned(),
-                    "restore receipt after utility re-evaluation".to_owned(),
-                ],
-            ))
-        } else if curation_numeric(metadata, "utility_score").is_some_and(|score| score <= 25.0)
-            && metadata.get("evidence_sufficient").and_then(Value::as_bool) == Some(false)
-        {
+        } else if curation_numeric(metadata, "utility_score").is_some_and(|score| score <= 25.0) {
             Some((
                 MemoryCurationFindingKind::LowUtilityInsufficientEvidence,
                 "propose_archive",
-                60,
-                Vec::new(),
+                40,
+                vec!["writer_utility_score_is_not_canonical_evidence".to_owned()],
                 vec![
-                    "new supporting evidence".to_owned(),
-                    "restore receipt after utility re-evaluation".to_owned(),
+                    "derive utility from canonical inclusion, influence, verification, cost, and regret records"
+                        .to_owned(),
+                    "re-run memory distillation against a complete revision-fenced utility ledger"
+                        .to_owned(),
                 ],
             ))
         } else if curation_numeric(metadata, "utility_delta").is_some_and(|score| score <= 0.0)
             && curation_numeric(metadata, "repeat_count").is_some_and(|count| count >= 2.0)
         {
             Some((
-                MemoryCurationFindingKind::RepeatedLowDelta,
-                "archive",
-                95,
-                curation_strings(metadata, "repeated_with"),
+                MemoryCurationFindingKind::LowUtilityInsufficientEvidence,
+                "propose_archive",
+                40,
+                vec!["writer_utility_delta_is_not_canonical_evidence".to_owned()],
                 vec![
-                    "positive utility delta at a later revision".to_owned(),
-                    "restore receipt after cargo re-evaluation".to_owned(),
+                    "derive repeated low delta from complete canonical use and outcome records"
+                        .to_owned(),
+                    "preserve the active handle until the governed distillation plan is complete"
+                        .to_owned(),
                 ],
             ))
         } else if metadata.get("unsafe_instruction").and_then(Value::as_bool) == Some(true)
@@ -491,10 +675,400 @@ pub(super) fn curation_numeric(value: &Value, name: &str) -> Option<f64> {
     })
 }
 
-pub(super) fn dispatch_memory_lifecycle_status(arguments: Value) -> Result<Value> {
+const MEMORY_DISTILLATION_SCAN_PAGE_SIZE: u16 = 100;
+const MAX_MEMORY_DISTILLATION_SCAN_RECORDS: usize = 1_000_000;
+
+pub(super) async fn canonical_memory_snapshot(
+    state: &McpState,
+    project_id: ProjectId,
+    receipt_kinds: &[&str],
+    requested_revision: Option<MemoryRevision>,
+) -> Result<(MemoryRevision, Vec<CanonicalRecord<Value>>, bool)> {
+    let snapshot_revision = if let Some(revision) = requested_revision {
+        revision
+    } else {
+        state
+            .store
+            .current_state(&CurrentStateRequest {
+                project_id,
+                consistency: ReadConsistencyMode::Latest,
+                at_least_revision: None,
+            })
+            .await?
+            .memory_revision
+    };
+    let mut records = Vec::new();
+    let mut start = 0_u64;
+    let mut complete = false;
+    while records.len() < MAX_MEMORY_DISTILLATION_SCAN_RECORDS {
+        let remaining = MAX_MEMORY_DISTILLATION_SCAN_RECORDS.saturating_sub(records.len());
+        let limit = u16::try_from(remaining.min(usize::from(MEMORY_DISTILLATION_SCAN_PAGE_SIZE)))?;
+        let page = state
+            .store
+            .canonical_record_page_at_revision(
+                project_id,
+                None,
+                receipt_kinds,
+                Some(snapshot_revision),
+                start,
+                limit,
+            )
+            .await?;
+        let returned = page.len();
+        records.extend(page);
+        start = start.saturating_add(u64::try_from(returned)?);
+        if returned < usize::from(limit) {
+            complete = true;
+            break;
+        }
+    }
+    if !complete && records.len() == MAX_MEMORY_DISTILLATION_SCAN_RECORDS {
+        complete = state
+            .store
+            .canonical_record_page_at_revision(
+                project_id,
+                None,
+                receipt_kinds,
+                Some(snapshot_revision),
+                start,
+                1,
+            )
+            .await?
+            .is_empty();
+    }
+    Ok((snapshot_revision, records, complete))
+}
+
+pub(crate) fn canonical_utility_sources(
+    records: &[CanonicalRecord<Value>],
+) -> Result<Vec<MemoryUtilitySourceRecord>> {
+    records
+        .iter()
+        .map(|record| {
+            let mut target_refs = BTreeSet::new();
+            target_refs.insert(record.subject_ref.clone());
+            collect_memory_target_refs(&record.receipt_body, None, &mut target_refs);
+            Ok(MemoryUtilitySourceRecord {
+                record_ref: format!("canonical:{}", record.record_id),
+                record_kind: record.receipt_kind.clone(),
+                target_refs: target_refs.into_iter().collect(),
+                evidence_ref: format!("receipt:{}", record.canonical_receipt.receipt_id),
+                payload: record.receipt_body.clone(),
+                memory_revision: record.memory_revision,
+                project_sequence: record.project_sequence,
+                serialized_bytes: u64::try_from(serde_json::to_vec(&record.receipt_body)?.len())?,
+            })
+        })
+        .collect()
+}
+
+fn collect_memory_target_refs(
+    value: &Value,
+    field_name: Option<&str>,
+    output: &mut BTreeSet<String>,
+) {
+    let is_memory_reference_field = field_name.is_some_and(|name| {
+        matches!(
+            name,
+            "target_ref"
+                | "memory_ref"
+                | "memory_handle"
+                | "handle"
+                | "included_refs"
+                | "memory_handles_received"
+                | "memory_handles_expanded"
+                | "memory_handles_used"
+                | "suppressed_refs"
+                | "collapsed_duplicate_refs"
+        )
+    });
+    match value {
+        Value::String(text) if is_memory_reference_field && !text.trim().is_empty() => {
+            output.insert(text.trim().to_owned());
+        }
+        Value::Array(values) => {
+            for item in values {
+                collect_memory_target_refs(item, field_name, output);
+            }
+        }
+        Value::Object(object) => {
+            for (name, nested) in object {
+                collect_memory_target_refs(nested, Some(name), output);
+            }
+        }
+        _ => {}
+    }
+}
+
+#[allow(clippy::too_many_lines)]
+pub(crate) fn canonical_distillation_items(
+    records: &[CanonicalRecord<Value>],
+) -> Result<Vec<MemoryDistillationCorpusItem>> {
+    let mut lifecycle = BTreeMap::new();
+    let mut minority_protected = BTreeSet::new();
+    for record in records {
+        if record.receipt_kind == CanonicalReceiptKind::StateTransition.as_str() {
+            let transition =
+                serde_json::from_value::<MemoryStateTransition>(record.receipt_body.clone())?;
+            lifecycle.insert(record.subject_ref.clone(), transition.to_state);
+        } else if record.receipt_kind == CanonicalReceiptKind::MinorityPressureRecord.as_str() {
+            minority_protected.insert(record.subject_ref.clone());
+        }
+    }
+    records
+        .iter()
+        .filter(|record| is_distillable_record_kind(&record.receipt_kind))
+        .map(|record| {
+            let metadata = explicit_curation_metadata(&record.receipt_body);
+            let scope = distillation_string(metadata, &record.receipt_body, &["scope"])
+                .unwrap_or_else(|| format!("project:{}", record.project_id));
+            let normalized_proposition = distillation_string(
+                metadata,
+                &record.receipt_body,
+                &[
+                    "normalized_proposition",
+                    "statement",
+                    "summary",
+                    "description",
+                ],
+            )
+            .unwrap_or_default();
+            let mechanism = distillation_string(
+                metadata,
+                &record.receipt_body,
+                &["mechanism", "causal_mechanism"],
+            )
+            .unwrap_or_default();
+            let content_hash =
+                distillation_string(metadata, &record.receipt_body, &["content_hash"])
+                    .unwrap_or_else(|| {
+                        blake3::hash(
+                            serde_json::to_vec(&record.receipt_body)
+                                .unwrap_or_else(|_| record.record_id.as_bytes().to_vec())
+                                .as_slice(),
+                        )
+                        .to_hex()
+                        .to_string()
+                    });
+            let status = distillation_string(
+                metadata,
+                &record.receipt_body,
+                &["status", "epistemic_status"],
+            )
+            .unwrap_or_else(|| "candidate".to_owned());
+            let role =
+                distillation_string(metadata, &record.receipt_body, &["role"]).unwrap_or_default();
+            let current_truth = distillation_bool(metadata, &record.receipt_body, "current_truth")
+                || status.eq_ignore_ascii_case("verified");
+            let negative_memory = record.receipt_kind.contains("failure")
+                || matches!(role.as_str(), "failure_fingerprint" | "negative_memory");
+            let protected = current_truth
+                || negative_memory
+                || minority_protected.contains(&record.subject_ref)
+                || distillation_bool(metadata, &record.receipt_body, "protected")
+                || matches!(
+                    role.as_str(),
+                    "counterexample" | "minority" | "audit_history" | "current_truth"
+                );
+            let serialized_bytes = u64::try_from(serde_json::to_vec(&record.receipt_body)?.len())?;
+            let mut evidence_refs =
+                distillation_strings(metadata, &record.receipt_body, "evidence_refs");
+            evidence_refs.push(format!("receipt:{}", record.canonical_receipt.receipt_id));
+            evidence_refs.sort();
+            evidence_refs.dedup();
+            Ok(MemoryDistillationCorpusItem {
+                record_ref: format!("canonical:{}", record.record_id),
+                target_ref: record.subject_ref.clone(),
+                record_kind: record.receipt_kind.clone(),
+                task_id: record.task_id,
+                scope,
+                content_hash,
+                normalized_proposition,
+                mechanism,
+                applies_when: distillation_strings(metadata, &record.receipt_body, "applies_when"),
+                does_not_apply_when: distillation_strings(
+                    metadata,
+                    &record.receipt_body,
+                    "does_not_apply_when",
+                ),
+                counterexamples: distillation_strings(
+                    metadata,
+                    &record.receipt_body,
+                    "counterexamples",
+                ),
+                evidence_refs,
+                verifier_refs: distillation_strings(
+                    metadata,
+                    &record.receipt_body,
+                    "verifier_refs",
+                ),
+                lifecycle: lifecycle
+                    .get(&record.subject_ref)
+                    .copied()
+                    .unwrap_or(MemoryLifecycleState::Active),
+                status,
+                token_units: serialized_bytes.div_ceil(4).max(1),
+                current_truth,
+                negative_memory,
+                protected,
+                superseded_by: distillation_string(
+                    metadata,
+                    &record.receipt_body,
+                    &["superseded_by"],
+                ),
+                exact_scope_contradiction: distillation_string(
+                    metadata,
+                    &record.receipt_body,
+                    &["exact_scope_contradiction", "wrong_scope_for"],
+                ),
+                obsolete_replacement: distillation_string(
+                    metadata,
+                    &record.receipt_body,
+                    &["obsolete_replacement", "current_replacement"],
+                ),
+                certification_noise: distillation_bool(
+                    metadata,
+                    &record.receipt_body,
+                    "certification_noise",
+                ),
+            })
+        })
+        .collect()
+}
+
+fn is_distillable_record_kind(kind: &str) -> bool {
+    [
+        "claim",
+        "evidence",
+        "failure",
+        "invariant",
+        "decision",
+        "capsule",
+        "card",
+        "experience",
+        "pattern",
+        "procedure",
+        "episode",
+        "snapshot",
+        "artifact",
+    ]
+    .iter()
+    .any(|candidate| kind.contains(candidate))
+        && ![
+            "receipt",
+            "transition",
+            "trajectory",
+            "observation",
+            "injection",
+        ]
+        .iter()
+        .any(|candidate| kind.contains(candidate))
+}
+
+fn distillation_string(metadata: Option<&Value>, body: &Value, names: &[&str]) -> Option<String> {
+    names
+        .iter()
+        .find_map(|name| metadata.and_then(|value| curation_string(value, name)))
+        .or_else(|| names.iter().find_map(|name| recursive_string(body, name)))
+}
+
+fn recursive_string(value: &Value, name: &str) -> Option<String> {
+    curation_string(value, name).or_else(|| match value {
+        Value::Array(values) => values
+            .iter()
+            .find_map(|value| recursive_string(value, name)),
+        Value::Object(object) => object
+            .values()
+            .find_map(|value| recursive_string(value, name)),
+        _ => None,
+    })
+}
+
+fn distillation_strings(metadata: Option<&Value>, body: &Value, name: &str) -> Vec<String> {
+    let direct = metadata.map_or_else(Vec::new, |value| curation_strings(value, name));
+    if direct.is_empty() {
+        recursive_strings(body, name)
+    } else {
+        direct
+    }
+}
+
+fn recursive_strings(value: &Value, name: &str) -> Vec<String> {
+    let direct = curation_strings(value, name);
+    if !direct.is_empty() {
+        return direct;
+    }
+    match value {
+        Value::Array(values) => values
+            .iter()
+            .flat_map(|value| recursive_strings(value, name))
+            .take(64)
+            .collect(),
+        Value::Object(object) => object
+            .values()
+            .flat_map(|value| recursive_strings(value, name))
+            .take(64)
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+fn distillation_bool(metadata: Option<&Value>, body: &Value, name: &str) -> bool {
+    metadata
+        .and_then(|value| value.get(name))
+        .and_then(Value::as_bool)
+        .or_else(|| recursive_bool(body, name))
+        .unwrap_or(false)
+}
+
+fn recursive_bool(value: &Value, name: &str) -> Option<bool> {
+    value
+        .get(name)
+        .and_then(Value::as_bool)
+        .or_else(|| match value {
+            Value::Array(values) => values.iter().find_map(|value| recursive_bool(value, name)),
+            Value::Object(object) => object
+                .values()
+                .find_map(|value| recursive_bool(value, name)),
+            _ => None,
+        })
+}
+
+pub(super) async fn dispatch_memory_lifecycle_status(
+    state: &McpState,
+    arguments: Value,
+) -> Result<Value> {
     let input: MemoryLifecycleStatusToolInput = serde_json::from_value(arguments)?;
     let project_id = project_id_from_label(&input.project);
-    let report = MemoryLifecycleService::new().status(project_id, &input.memory_ref);
+    let (_, records, complete) = canonical_memory_snapshot(
+        state,
+        project_id,
+        &[CanonicalReceiptKind::StateTransition.as_str()],
+        None,
+    )
+    .await?;
+    if !complete {
+        anyhow::bail!("canonical lifecycle projection is incomplete");
+    }
+    let mut matching = records
+        .into_iter()
+        .filter(|record| record.subject_ref == input.memory_ref)
+        .map(|record| {
+            let transition = serde_json::from_value::<MemoryStateTransition>(record.receipt_body)?;
+            Ok((transition, record.canonical_receipt))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    matching.sort_by_key(|item| item.0.created_at);
+    let lifecycle = matching
+        .last()
+        .map_or_else(MemoryLifecycleService::new, |latest| {
+            MemoryLifecycleService::new().with_state(&input.memory_ref, latest.0.to_state)
+        });
+    let mut report = lifecycle.status(project_id, &input.memory_ref);
+    report.related_receipts = matching
+        .into_iter()
+        .map(|(_, receipt)| format!("receipt:{}", receipt.receipt_id))
+        .collect();
     serde_json::to_value(report).map_err(Into::into)
 }
 
@@ -522,27 +1096,47 @@ pub(super) fn dispatch_memory_lifecycle_propose(arguments: Value) -> Result<Valu
     .map_err(Into::into)
 }
 
-pub(super) fn dispatch_memory_lifecycle_vitality(arguments: Value) -> Result<Value> {
+pub(super) async fn dispatch_memory_lifecycle_vitality(
+    state: &McpState,
+    arguments: Value,
+) -> Result<Value> {
     let input: MemoryLifecycleProjectToolInput = serde_json::from_value(arguments)?;
-    let score = MemoryVitalityService::score(
-        project_id_from_label(&input.project),
-        input
-            .memory_ref
-            .as_deref()
-            .unwrap_or("memory-lifecycle:baseline"),
+    let project_id = project_id_from_label(&input.project);
+    let (snapshot_revision, records, complete) =
+        canonical_memory_snapshot(state, project_id, &[], None).await?;
+    let ledger = MemoryDistillationService::derive_utility_ledger(
+        project_id,
+        snapshot_revision,
+        &canonical_utility_sources(&records)?,
+        complete,
     );
+    let target_ref = input
+        .memory_ref
+        .or_else(|| ledger.entries.first().map(|entry| entry.target_ref.clone()))
+        .unwrap_or_else(|| "memory-lifecycle:empty-corpus".to_owned());
+    let score = MemoryDistillationService::vitality_from_ledger(project_id, &target_ref, &ledger);
     serde_json::to_value(score).map_err(Into::into)
 }
 
-pub(super) fn dispatch_memory_lifecycle_gravity(arguments: Value) -> Result<Value> {
+pub(super) async fn dispatch_memory_lifecycle_gravity(
+    state: &McpState,
+    arguments: Value,
+) -> Result<Value> {
     let input: MemoryLifecycleProjectToolInput = serde_json::from_value(arguments)?;
-    let score = MemoryVitalityService::score(
-        project_id_from_label(&input.project),
-        input
-            .memory_ref
-            .as_deref()
-            .unwrap_or("memory-lifecycle:baseline"),
+    let project_id = project_id_from_label(&input.project);
+    let (snapshot_revision, records, complete) =
+        canonical_memory_snapshot(state, project_id, &[], None).await?;
+    let ledger = MemoryDistillationService::derive_utility_ledger(
+        project_id,
+        snapshot_revision,
+        &canonical_utility_sources(&records)?,
+        complete,
     );
+    let target_ref = input
+        .memory_ref
+        .or_else(|| ledger.entries.first().map(|entry| entry.target_ref.clone()))
+        .unwrap_or_else(|| "memory-lifecycle:empty-corpus".to_owned());
+    let score = MemoryDistillationService::vitality_from_ledger(project_id, &target_ref, &ledger);
     let gravity = MemoryGravityService::gravity(&score);
     serde_json::to_value(gravity).map_err(Into::into)
 }

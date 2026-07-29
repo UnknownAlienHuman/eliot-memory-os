@@ -730,6 +730,8 @@ pub(super) async fn dispatch_sleep_run(
                 trigger: input.trigger,
                 dry_run: input.dry_run,
                 input_traces: input.trace_refs.clone(),
+                max_input_bytes: 8_192,
+                reasoning_retry_limit: 1,
             },
             &contracts,
             IncidentService::new(&state.root).lockdown_active()?,

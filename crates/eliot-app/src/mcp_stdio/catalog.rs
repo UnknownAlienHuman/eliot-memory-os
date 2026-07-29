@@ -1605,6 +1605,7 @@ pub(super) fn replay_tool_definitions() -> Vec<Value> {
     ]
 }
 
+#[allow(clippy::too_many_lines)]
 pub(super) fn memory_lifecycle_tool_definitions() -> Vec<Value> {
     vec![
         tool(
@@ -1623,6 +1624,79 @@ pub(super) fn memory_lifecycle_tool_definitions() -> Vec<Value> {
                     "page_size": {"type": "integer", "minimum": 1, "maximum": 100}
                 },
                 "required": ["project_id", "task_id", "at_revision", "ruleset_version", "page_size"]
+            }),
+        ),
+        tool(
+            "eliot_memory_distillation_preview",
+            "Eliot Memory Distillation Preview",
+            "Build a pure revision-fenced distillation plan from the complete canonical corpus and canonical utility ledger. Semantic merges and incomplete scans remain candidate-only.",
+            &json!({
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                    "project_id": {"type": "string"},
+                    "at_revision": {"type": "integer", "minimum": 0},
+                    "ruleset_version": {"type": "string", "enum": ["eliot-c4-distillation-v1"]},
+                    "cursor": {"type": "string"},
+                    "page_size": {"type": "integer", "minimum": 1, "maximum": 100}
+                },
+                "required": ["project_id", "ruleset_version", "page_size"]
+            }),
+        ),
+        tool(
+            "eliot_memory_distillation_schedule",
+            "Eliot Memory Distillation Schedule",
+            "Return a resumable bounded scheduler checkpoint. It pauses under interactive load, invalid batch sizes, or insufficient new evidence.",
+            &json!({
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                    "project_id": {"type": "string"},
+                    "trigger": {"type": "string", "enum": ["verified_task_closure", "nightly", "idle", "manual"]},
+                    "new_evidence_count": {"type": "integer", "minimum": 0},
+                    "minimum_evidence_count": {"type": "integer", "minimum": 0},
+                    "interactive_load_active": {"type": "boolean"},
+                    "cursor": {"type": "string"},
+                    "batch_size": {"type": "integer", "minimum": 1, "maximum": 500}
+                },
+                "required": [
+                    "project_id",
+                    "trigger",
+                    "new_evidence_count",
+                    "minimum_evidence_count",
+                    "interactive_load_active",
+                    "batch_size"
+                ]
+            }),
+        ),
+        tool(
+            "eliot_memory_distillation_apply",
+            "Eliot Memory Distillation Apply",
+            "Recompute an exact revision-fenced plan and apply only explicitly selected high-confidence reversible actions through canonical lifecycle transitions. Requires controller or human-operator authority.",
+            &json!({
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                    "project_id": {"type": "string"},
+                    "task_id": {"type": "string"},
+                    "at_revision": {"type": "integer", "minimum": 0},
+                    "ruleset_version": {"type": "string", "enum": ["eliot-c4-distillation-v1"]},
+                    "selected_candidate_ids": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "minItems": 1,
+                        "maxItems": 100
+                    },
+                    "idempotency_key": {"type": "string", "minLength": 1, "maxLength": 256}
+                },
+                "required": [
+                    "project_id",
+                    "task_id",
+                    "at_revision",
+                    "ruleset_version",
+                    "selected_candidate_ids",
+                    "idempotency_key"
+                ]
             }),
         ),
         tool(

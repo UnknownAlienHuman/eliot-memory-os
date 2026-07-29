@@ -2904,6 +2904,7 @@ fn l13_curation_preview_classifies_only_explicit_reversible_findings() {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)]
 fn l14_curation_corpus_meets_precision_recall_and_protection_gates() -> Result<()> {
     let corpus: Value = serde_json::from_str(include_str!(
         "../../../../tests/cognitive/memory-curation/curation-corpus.json"
@@ -2951,6 +2952,10 @@ fn l14_curation_corpus_meets_precision_recall_and_protection_gates() -> Result<(
             project_sequence: None,
         });
     }
+    for writer_scored in ["action-low-utility", "action-zero-delta"] {
+        assert!(actionable.remove(writer_scored));
+        proposal_expected.insert(writer_scored.to_owned());
+    }
 
     let (mut candidates, mut protected, profile) = analyze_curation_records(&records, true);
     protected.sort();
@@ -2981,6 +2986,23 @@ fn l14_curation_corpus_meets_precision_recall_and_protection_gates() -> Result<(
     );
     assert_eq!(applied, actionable);
     assert_eq!(proposals, proposal_expected);
+    assert!(
+        candidates
+            .iter()
+            .filter(|candidate| {
+                matches!(
+                    candidate.handle.as_str(),
+                    "action-low-utility" | "action-zero-delta"
+                )
+            })
+            .all(|candidate| {
+                candidate.confidence == 40
+                    && candidate.evidence_refs.iter().any(|evidence| {
+                        evidence.contains("writer_utility")
+                            && evidence.contains("not_canonical_evidence")
+                    })
+            })
+    );
     assert_eq!(protected, protected_expected);
     assert!(candidates.iter().all(|candidate| {
         matches!(
@@ -2990,5 +3012,96 @@ fn l14_curation_corpus_meets_precision_recall_and_protection_gates() -> Result<(
     }));
     assert_eq!(profile.scanned_records, 22);
     assert!(!profile.scan_truncated);
+    Ok(())
+}
+
+#[test]
+fn c4_distillation_projection_preserves_exact_and_near_miss_boundaries() -> Result<()> {
+    fn record(
+        project_id: ProjectId,
+        task_id: TaskId,
+        handle: &str,
+        body: Value,
+    ) -> CanonicalRecord<Value> {
+        let write_id = WriteId::new_v7();
+        CanonicalRecord {
+            record_id: write_id.to_string(),
+            receipt_kind: "claim_card".to_owned(),
+            project_id,
+            task_id: Some(task_id),
+            subject_ref: handle.to_owned(),
+            receipt_body: body,
+            canonical_receipt: WriteReceiptRef {
+                receipt_id: ReceiptId::new_v7(),
+                write_id,
+            },
+            memory_revision: Some(MemoryRevision::new(12)),
+            project_sequence: None,
+        }
+    }
+
+    let project_id = ProjectId::new_v7();
+    let task_id = TaskId::new_v7();
+    for tool_name in [
+        "eliot_memory_distillation_preview",
+        "eliot_memory_distillation_schedule",
+        "eliot_memory_distillation_apply",
+    ] {
+        assert!(
+            memory_lifecycle_tool_definitions()
+                .iter()
+                .any(|tool| tool.get("name").and_then(Value::as_str) == Some(tool_name))
+        );
+    }
+    assert!(READ_ONLY_TOOLS.contains(&"eliot_memory_distillation_preview"));
+    assert!(READ_ONLY_TOOLS.contains(&"eliot_memory_distillation_schedule"));
+    assert!(!READ_ONLY_TOOLS.contains(&"eliot_memory_distillation_apply"));
+    assert!(McpAccessProfile::HumanOperator.allows("eliot_memory_distillation_apply"));
+    assert!(!McpAccessProfile::CodexWorker.allows("eliot_memory_distillation_apply"));
+
+    let shared = json!({
+        "payload": {
+            "curation": {
+                "statement": "Use the canonical revision fence",
+                "mechanism": "stable pagination",
+                "scope": "project:alpha",
+                "applies_when": ["canonical scan"],
+                "does_not_apply_when": ["foreign project"],
+                "verifier_refs": ["test:c4"],
+                "utility_score": 999_999
+            }
+        }
+    });
+    let near = json!({
+        "payload": {
+            "curation": {
+                "statement": "Use the canonical revision fence",
+                "mechanism": "stable pagination",
+                "scope": "project:alpha",
+                "applies_when": ["canonical scan"],
+                "does_not_apply_when": ["interactive write load"],
+                "counterexamples": ["revision drift"],
+                "verifier_refs": ["test:c4"]
+            }
+        }
+    });
+    let records = vec![
+        record(project_id, task_id, "claim:physical-a", shared.clone()),
+        record(project_id, task_id, "claim:physical-b", shared),
+        record(project_id, task_id, "claim:near-miss", near),
+    ];
+
+    let items = canonical_distillation_items(&records)?;
+    assert_eq!(items.len(), 3);
+    assert_eq!(items[0].content_hash, items[1].content_hash);
+    assert_ne!(items[0].content_hash, items[2].content_hash);
+    assert_eq!(items[0].mechanism, "stable pagination");
+    assert_eq!(items[2].counterexamples, ["revision drift"]);
+    assert_eq!(items[2].does_not_apply_when, ["interactive write load"]);
+    assert!(items.iter().all(|item| {
+        item.evidence_refs
+            .iter()
+            .any(|evidence| evidence.starts_with("receipt:"))
+    }));
     Ok(())
 }

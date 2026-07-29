@@ -251,14 +251,32 @@ pub async fn run_memory_fetch_l2(config_path: &Path, project: &str, handles: &st
     write_json(&response)
 }
 
-pub fn run_memory_lifecycle_status(
+pub async fn run_memory_lifecycle_status(
     config_path: &Path,
     project: &str,
     memory_ref: &str,
 ) -> Result<()> {
     let root = runtime_root(config_path);
     let project_id = project_id_from_label(project);
-    let report = MemoryLifecycleService::new().status(project_id, memory_ref);
+    let config = load_config(config_path)?;
+    let latest = CanonicalStore::new(config.db.surreal)
+        .canonical_records_by_subject_ref::<MemoryStateTransition>(
+            project_id,
+            None,
+            &["state_transition"],
+            memory_ref,
+            1,
+        )
+        .await?
+        .into_iter()
+        .next();
+    let lifecycle = latest.as_ref().map_or_else(MemoryLifecycleService::new, |record| {
+        MemoryLifecycleService::new().with_state(memory_ref, record.receipt_body.to_state)
+    });
+    let mut report = lifecycle.status(project_id, memory_ref);
+    report.related_receipts = latest
+        .map(|record| vec![format!("receipt:{}", record.canonical_receipt.receipt_id)])
+        .unwrap_or_default();
     write_report_pair(
         &root
             .join("reports")
@@ -345,21 +363,273 @@ pub async fn run_memory_lifecycle_apply(config_path: &Path, policy_id: &str) -> 
     write_json(&report)
 }
 
-pub fn run_memory_lifecycle_vitality(config_path: &Path, project: &str) -> Result<()> {
+pub async fn run_memory_lifecycle_vitality(
+    config_path: &Path,
+    project: &str,
+    memory_ref: Option<&str>,
+) -> Result<()> {
     let root = runtime_root(config_path);
     let project_id = project_id_from_label(project);
-    let score = MemoryVitalityService::score(project_id, "memory-lifecycle:baseline");
+    let (_, _, ledger) = cli_memory_distillation_projection(config_path, project_id).await?;
+    let target_ref = memory_ref
+        .map(str::to_owned)
+        .or_else(|| ledger.entries.first().map(|entry| entry.target_ref.clone()))
+        .unwrap_or_else(|| "memory-lifecycle:empty-corpus".to_owned());
+    let score =
+        MemoryDistillationService::vitality_from_ledger(project_id, &target_ref, &ledger);
     write_memory_vitality_report(&root, &score)?;
     write_json(&score)
 }
 
-pub fn run_memory_lifecycle_gravity(config_path: &Path, project: &str) -> Result<()> {
+pub async fn run_memory_lifecycle_gravity(
+    config_path: &Path,
+    project: &str,
+    memory_ref: Option<&str>,
+) -> Result<()> {
     let root = runtime_root(config_path);
     let project_id = project_id_from_label(project);
-    let score = MemoryVitalityService::score(project_id, "memory-lifecycle:baseline");
+    let (_, _, ledger) = cli_memory_distillation_projection(config_path, project_id).await?;
+    let target_ref = memory_ref
+        .map(str::to_owned)
+        .or_else(|| ledger.entries.first().map(|entry| entry.target_ref.clone()))
+        .unwrap_or_else(|| "memory-lifecycle:empty-corpus".to_owned());
+    let score =
+        MemoryDistillationService::vitality_from_ledger(project_id, &target_ref, &ledger);
     let gravity = MemoryGravityService::gravity(&score);
     write_memory_gravity_report(&root, &gravity)?;
     write_json(&gravity)
+}
+
+pub async fn run_memory_distillation_preview(
+    config_path: &Path,
+    project: &str,
+) -> Result<()> {
+    let project_id = project_id_from_label(project);
+    let (records, snapshot_revision, utility_ledger) =
+        cli_memory_distillation_projection(config_path, project_id).await?;
+    let plan = MemoryDistillationService::plan(MemoryDistillationInput {
+        project_id,
+        snapshot_revision,
+        ruleset_version: eliot_engine::MEMORY_DISTILLATION_RULESET_VERSION.to_owned(),
+        complete: utility_ledger.complete,
+        items: mcp_stdio::canonical_distillation_items(&records)?,
+        utility_ledger,
+    })?;
+    write_memory_distillation_run(config_path, &plan, None, None)?;
+    write_json(&plan)
+}
+
+pub fn run_memory_distillation_schedule(
+    project: &str,
+    trigger: &str,
+    new_evidence_count: u64,
+    minimum_evidence_count: u64,
+    interactive_load_active: bool,
+    cursor: Option<String>,
+    batch_size: u16,
+) -> Result<()> {
+    let trigger = match trigger {
+        "verified_task_closure" => MemoryDistillationTrigger::VerifiedTaskClosure,
+        "nightly" => MemoryDistillationTrigger::Nightly,
+        "idle" => MemoryDistillationTrigger::Idle,
+        "manual" => MemoryDistillationTrigger::Manual,
+        other => bail!("unsupported distillation trigger: {other}"),
+    };
+    let checkpoint = MemoryDistillationService::schedule(&MemoryDistillationScheduleRequest {
+        project_id: project_id_from_label(project),
+        trigger,
+        new_evidence_count,
+        minimum_evidence_count,
+        interactive_load_active,
+        cursor,
+        batch_size,
+    });
+    write_json(&checkpoint)
+}
+
+pub async fn run_memory_distillation_apply(
+    config_path: &Path,
+    project: &str,
+    selected_candidate_ids: &[String],
+) -> Result<()> {
+    if selected_candidate_ids.is_empty() || selected_candidate_ids.len() > 100 {
+        bail!("distillation apply requires between 1 and 100 candidate ids");
+    }
+    let project_id = project_id_from_label(project);
+    let (records, snapshot_revision, utility_ledger) =
+        cli_memory_distillation_projection(config_path, project_id).await?;
+    let plan = MemoryDistillationService::plan(MemoryDistillationInput {
+        project_id,
+        snapshot_revision,
+        ruleset_version: eliot_engine::MEMORY_DISTILLATION_RULESET_VERSION.to_owned(),
+        complete: utility_ledger.complete,
+        items: mcp_stdio::canonical_distillation_items(&records)?,
+        utility_ledger,
+    })?;
+    let mut receipt =
+        MemoryDistillationService::select_reversible_actions(&plan, selected_candidate_ids)?;
+    if !receipt.rejected_candidate_ids.is_empty() {
+        bail!(
+            "distillation apply rejected unsafe, missing, or non-reversible candidates: {:?}",
+            receipt.rejected_candidate_ids
+        );
+    }
+    let mut outcomes = Vec::new();
+    for selection in &receipt.selected {
+        let candidate = plan
+            .candidates
+            .iter()
+            .find(|candidate| candidate.candidate_id == selection.candidate_id)
+            .context("selected candidate disappeared from the exact plan")?;
+        let reason = match candidate.finding {
+            eliot_types::MemoryDistillationFinding::ExactDuplicate => ForgettingReason::Duplicate,
+            eliot_types::MemoryDistillationFinding::StaleSuperseded
+            | eliot_types::MemoryDistillationFinding::ObsoleteArtifact => {
+                ForgettingReason::Superseded
+            }
+            eliot_types::MemoryDistillationFinding::WrongScope => ForgettingReason::WrongScope,
+            eliot_types::MemoryDistillationFinding::RepeatedLowDelta => {
+                ForgettingReason::LowUtility
+            }
+            other => bail!("finding is not safe for CLI apply: {other:?}"),
+        };
+        let mut policy = ForgettingPolicyService::propose(
+            project_id,
+            &selection.target_ref,
+            selection.operator,
+            reason,
+            selection.evidence_refs.clone(),
+            None,
+            None,
+        );
+        policy.policy_id = format!("{}:{}", plan.plan_id, selection.candidate_id);
+        let outcome = apply_lifecycle_policy_to_memory(config_path, &policy).await?;
+        if let Some(write_receipt) = outcome.write_receipt.clone() {
+            receipt.write_receipts.push(write_receipt);
+        }
+        outcomes.push(serde_json::json!({
+            "decision": outcome.decision,
+            "transition": outcome.transition,
+            "write_receipt": outcome.write_receipt,
+        }));
+    }
+    let (after_records, after_revision, after_ledger) =
+        cli_memory_distillation_projection(config_path, project_id).await?;
+    let after = MemoryDistillationService::plan(MemoryDistillationInput {
+        project_id,
+        snapshot_revision: after_revision,
+        ruleset_version: eliot_engine::MEMORY_DISTILLATION_RULESET_VERSION.to_owned(),
+        complete: after_ledger.complete,
+        items: mcp_stdio::canonical_distillation_items(&after_records)?,
+        utility_ledger: after_ledger,
+    })?;
+    write_memory_distillation_run(config_path, &plan, Some(&after), Some(&receipt))?;
+    write_json(&serde_json::json!({
+        "receipt": receipt,
+        "outcomes": outcomes,
+        "after_profile": after.corpus_profile_before,
+    }))
+}
+
+async fn cli_memory_distillation_projection(
+    config_path: &Path,
+    project_id: ProjectId,
+) -> Result<(
+    Vec<CanonicalRecord<Value>>,
+    MemoryRevision,
+    eliot_types::CanonicalMemoryUtilityLedger,
+)> {
+    const PAGE_SIZE: u16 = 100;
+    const MAX_RECORDS: usize = 1_000_000;
+    let config = load_config(config_path)?;
+    let store = CanonicalStore::new(config.db.surreal);
+    let snapshot_revision = store
+        .current_state(&CurrentStateRequest {
+            project_id,
+            consistency: ReadConsistencyMode::Latest,
+            at_least_revision: None,
+        })
+        .await?
+        .memory_revision;
+    let mut records = Vec::new();
+    let mut start = 0_u64;
+    let mut complete = false;
+    while records.len() < MAX_RECORDS {
+        let remaining = MAX_RECORDS.saturating_sub(records.len());
+        let limit = u16::try_from(remaining.min(usize::from(PAGE_SIZE)))?;
+        let page = store
+            .canonical_record_page_at_revision(
+                project_id,
+                None,
+                &[],
+                Some(snapshot_revision),
+                start,
+                limit,
+            )
+            .await?;
+        let returned = page.len();
+        records.extend(page);
+        start = start.saturating_add(u64::try_from(returned)?);
+        if returned < usize::from(limit) {
+            complete = true;
+            break;
+        }
+    }
+    if !complete && records.len() == MAX_RECORDS {
+        complete = store
+            .canonical_record_page_at_revision(
+                project_id,
+                None,
+                &[],
+                Some(snapshot_revision),
+                start,
+                1,
+            )
+            .await?
+            .is_empty();
+    }
+    let utility_ledger = MemoryDistillationService::derive_utility_ledger(
+        project_id,
+        snapshot_revision,
+        &mcp_stdio::canonical_utility_sources(&records)?,
+        complete,
+    );
+    Ok((records, snapshot_revision, utility_ledger))
+}
+
+fn write_memory_distillation_run(
+    config_path: &Path,
+    plan: &MemoryDistillationPlan,
+    after: Option<&MemoryDistillationPlan>,
+    receipts: Option<&eliot_types::MemoryDistillationApplyReceipt>,
+) -> Result<()> {
+    let run_id = plan.plan_id.replace(':', "-");
+    let root = runtime_root(config_path)
+        .join("reports")
+        .join("memory-distillation")
+        .join(run_id);
+    std::fs::create_dir_all(&root)?;
+    std::fs::write(
+        root.join("plan.json"),
+        serde_json::to_vec_pretty(plan)?,
+    )?;
+    std::fs::write(
+        root.join("before.json"),
+        serde_json::to_vec_pretty(&plan.corpus_profile_before)?,
+    )?;
+    if let Some(after) = after {
+        std::fs::write(
+            root.join("after.json"),
+            serde_json::to_vec_pretty(&after.corpus_profile_before)?,
+        )?;
+    }
+    if let Some(receipts) = receipts {
+        std::fs::write(
+            root.join("receipts.json"),
+            serde_json::to_vec_pretty(receipts)?,
+        )?;
+    }
+    Ok(())
 }
 
 pub async fn run_memory_lifecycle_influence(
@@ -918,6 +1188,8 @@ pub fn run_sleep_run(
             trigger: parse_sleep_trigger(trigger)?,
             dry_run,
             input_traces: vec!["trace:latest".to_owned()],
+            max_input_bytes: 8_192,
+            reasoning_retry_limit: 1,
         },
         IncidentService::new(&root).lockdown_active()?,
     )?;

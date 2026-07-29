@@ -33,10 +33,10 @@ use eliot_engine::{
     GraphHealthService, HealthService, HistoricalImportMemoryWriter, ImportService,
     IncidentService, IpcGovernorClient, LifecycleService, LogService, LostAgentRecoveryService,
     MailboxSendInput, MailboxService, MaintenanceMemoryWriter, MaintenanceScheduler,
-    MemoryGravityService, MemoryInfluenceService, MemoryLifecycleGate, MemoryLifecycleMemoryWriter,
-    MemoryLifecycleService, MemoryVitalityService, MetricRecorderService, MetricRegistryService,
-    MetricRollupService, MetricsDoctorIntegration, ModuleRegistryService, NamedPipeIpcServer,
-    PatchMemoryWriter, PatchRunner, PatchRunnerInput, ProductionCutoverService,
+    MemoryDistillationService, MemoryGravityService, MemoryInfluenceService, MemoryLifecycleGate,
+    MemoryLifecycleMemoryWriter, MemoryLifecycleService, MetricRecorderService,
+    MetricRegistryService, MetricRollupService, MetricsDoctorIntegration, ModuleRegistryService,
+    NamedPipeIpcServer, PatchMemoryWriter, PatchRunner, PatchRunnerInput, ProductionCutoverService,
     ProductionReadinessService, QualitySignalService, ReadService, ReadinessFixture,
     ReplayCaseInput, ReplayCaseService, ReplayRunnerService, ReplaySetInput, ReplaySetService,
     ReplayVerdictService, ReportService, RestoreService, RuntimeDashboardService,
@@ -59,7 +59,8 @@ use eliot_engine::{
     hash_secret, shutdown_deadline_after, test_request,
 };
 use eliot_store::{
-    BlobStore, CanonicalStore, ControlWal, NamedSurqlOp, SurrealServerSupervisor, SurrealStore,
+    BlobStore, CanonicalRecord, CanonicalStore, ControlWal, NamedSurqlOp, SurrealServerSupervisor,
+    SurrealStore,
 };
 use eliot_types::{
     ActionKind, ActionLease, AdapterCapability, AdapterObservation, AdapterResult,
@@ -87,8 +88,10 @@ use eliot_types::{
     HarnessExperimentRecord, HealthStatus, HookEventKind, ImportKind, IncidentKind,
     IncidentSeverity, IpcFrame, IpcFrameKind, LatencyHistogram, LifecycleStatus, LogEventKind,
     LogLevel, MailboxMessage, MailboxMessageId, MailboxMessageKind, MailboxRecipient,
-    MaintenanceJobKind, MemoryGravity, MemoryInfluenceReport, MemoryLifecyclePacketView,
-    MemoryLifecycleReport, MemoryVitalityScore, MetricDefinition, MetricSample, MetricWindow,
+    MaintenanceJobKind, MemoryDistillationInput, MemoryDistillationPlan,
+    MemoryDistillationScheduleRequest, MemoryDistillationTrigger, MemoryGravity,
+    MemoryInfluenceReport, MemoryLifecyclePacketView, MemoryLifecycleReport, MemoryRevision,
+    MemoryStateTransition, MemoryVitalityScore, MetricDefinition, MetricSample, MetricWindow,
     ModuleManifest, PatchRequest, PatchRequestId, PatchRun, PatchRunStatus, ProfileVerificationRun,
     ProjectId, QualitySignal, ReadConsistencyMode, RecallL0Request, ReplayCase, ReplayCaseKind,
     ReplayRun, ReplaySet, RuntimeHealthReport, RuntimeLogReport, RuntimeMode, RuntimeStatusReport,

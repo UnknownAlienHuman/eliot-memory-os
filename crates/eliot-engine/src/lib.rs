@@ -17,6 +17,7 @@ pub mod eval;
 pub mod external_review;
 pub mod host;
 pub mod lifecycle;
+pub mod memory_distillation;
 pub mod memory_lifecycle;
 pub mod metrics;
 pub mod patch;
@@ -126,6 +127,7 @@ pub use host::{
     host_profile_fingerprint,
 };
 pub use lifecycle::{BoxServiceFuture, ServiceContext, ServiceHandle, ServiceLifecycle};
+pub use memory_distillation::{MEMORY_DISTILLATION_RULESET_VERSION, MemoryDistillationService};
 pub use memory_lifecycle::{
     ForgettingPolicyService, MemoryGravityService, MemoryInfluenceService,
     MemoryLifecycleApplyOutcome, MemoryLifecycleGate, MemoryLifecycleMemoryWriter,

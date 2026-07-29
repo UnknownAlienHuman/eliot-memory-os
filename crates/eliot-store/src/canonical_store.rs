@@ -1768,6 +1768,26 @@ impl CanonicalStore {
         start: u64,
         limit: u16,
     ) -> Result<Vec<CanonicalRecord<Value>>, StoreError> {
+        self.canonical_record_page_at_revision(
+            project_id,
+            task_id,
+            receipt_kinds,
+            None,
+            start,
+            limit,
+        )
+        .await
+    }
+
+    pub async fn canonical_record_page_at_revision(
+        &self,
+        project_id: ProjectId,
+        task_id: Option<TaskId>,
+        receipt_kinds: &[&str],
+        at_revision: Option<MemoryRevision>,
+        start: u64,
+        limit: u16,
+    ) -> Result<Vec<CanonicalRecord<Value>>, StoreError> {
         let value = self
             .execute_value(
                 NamedSurqlOp::CanonicalRecordPage,
@@ -1775,6 +1795,7 @@ impl CanonicalStore {
                     "project_id": project_id,
                     "task_id": task_id,
                     "receipt_kinds": receipt_kinds,
+                    "at_revision": at_revision,
                     "start": start,
                     "limit": limit.clamp(1, 100),
                 }),

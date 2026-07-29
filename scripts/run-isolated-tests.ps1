@@ -6,6 +6,7 @@ param(
     [string]$BinTarget,
     [string]$TestName,
     [string]$TestFilterExpression,
+    [switch]$RunIgnored,
     [ValidateRange(1, 7200)]
     [int]$TestTimeoutSeconds = 3600,
     [ValidateSet('none', 'success', 'failure', 'retained_handle')]
@@ -489,6 +490,9 @@ migrations_dir = "$migrationsPath"
     }
     if (-not [string]::IsNullOrWhiteSpace($TestFilterExpression)) {
         $nextestArgs += @('-E', $TestFilterExpression)
+    }
+    if ($RunIgnored) {
+        $nextestArgs += @('--run-ignored', 'ignored-only')
     }
 
     $childProgram = (Get-Command 'cargo.exe' -ErrorAction Stop).Source

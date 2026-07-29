@@ -33,9 +33,9 @@ use eliot_engine::{
     ExternalReviewPacketBuilder, ExternalReviewReportService, FlakeDetectionService,
     ForgettingPolicyService, HealthService, HostBrokerService, HostProfileService, ImportService,
     IncidentService, LogService, LostAgentRecoveryService, MailboxSendInput, MailboxService,
-    MaintenanceScheduler, MaturityGateService, MemoryGravityService, MemoryInfluenceService,
-    MemoryLifecycleGate, MemoryLifecycleMemoryWriter, MemoryLifecycleService, MemoryNeedService,
-    MemoryVitalityService, MetaDispositionRequest, MetaDispositionService,
+    MaintenanceScheduler, MaturityGateService, MemoryDistillationService, MemoryGravityService,
+    MemoryInfluenceService, MemoryLifecycleGate, MemoryLifecycleMemoryWriter,
+    MemoryLifecycleService, MemoryNeedService, MetaDispositionRequest, MetaDispositionService,
     MetaExperimentAssessment, MetaHarnessService, MetaPolicyExecutor, MetricRecorderService,
     MetricRegistryService, MetricRollupService, MetricsDoctorIntegration, ModuleRegistryService,
     NegativeTransferService, PatchMemoryWriter, PatchRunner, PatchRunnerInput,
@@ -97,13 +97,15 @@ use eliot_types::{
     ForgettingReason, LatencyHistogram, LifecycleStatus, MailboxMessageId, MailboxMessageKind,
     MailboxRecipient, MaintenanceJobKind, MaterialPacketFrame, MemoryAdmissionDecision,
     MemoryCurationCandidate, MemoryCurationCorpusProfile, MemoryCurationFindingKind,
-    MemoryCurationPreviewRequest, MemoryCurationPreviewResponse, MemoryExposureMode,
-    MemoryExposurePolicy, MemoryInfluenceClass, MemoryInfluenceReport, MemoryInfluenceToolInput,
-    MemoryInfluenceTrace, MemoryInfluenceTraceWriteResult, MemoryInspectorView,
-    MemoryLifecyclePacketView, MemoryLifecycleState, MemoryNeed, MemoryRevision,
-    MemoryWriteEnvelope, MetaCandidateChangeClass, MetaExperimentDecision, MetaIsolationFence,
-    MetaPolicyAuthorization, MetaPolicyExecutionAction, MetricDefinition, MetricSample,
-    MetricWindow, MinorityPressureRecord, MinorityPressureStatus, NegativeTransferHarm,
+    MemoryCurationPreviewRequest, MemoryCurationPreviewResponse, MemoryDistillationCorpusItem,
+    MemoryDistillationFinding, MemoryDistillationInput, MemoryDistillationScheduleRequest,
+    MemoryExposureMode, MemoryExposurePolicy, MemoryInfluenceClass, MemoryInfluenceReport,
+    MemoryInfluenceToolInput, MemoryInfluenceTrace, MemoryInfluenceTraceWriteResult,
+    MemoryInspectorView, MemoryLifecyclePacketView, MemoryLifecycleState, MemoryNeed,
+    MemoryRevision, MemoryStateTransition, MemoryUtilitySourceRecord, MemoryWriteEnvelope,
+    MetaCandidateChangeClass, MetaExperimentDecision, MetaIsolationFence, MetaPolicyAuthorization,
+    MetaPolicyExecutionAction, MetricDefinition, MetricSample, MetricWindow,
+    MinorityPressureRecord, MinorityPressureStatus, NegativeTransferHarm,
     OPERATOR_CONTRACT_MANIFEST, OPERATOR_IPC_PROTOCOL_VERSION, OPERATOR_SCHEMA_VERSION,
     OperationJob, OperationJobState, OperatorActionView, OperatorCommand, OperatorCommandReceipt,
     OperatorControlRequest, OperatorFieldView, OperatorProjectionFilter, OperatorProjectionKind,
@@ -216,6 +218,7 @@ use experiment::*;
 use finalization::*;
 #[allow(clippy::wildcard_imports)]
 use memory::*;
+pub(crate) use memory::{canonical_distillation_items, canonical_utility_sources};
 #[allow(clippy::wildcard_imports)]
 use operator::*;
 #[allow(clippy::wildcard_imports)]
@@ -290,6 +293,8 @@ const GOVERNED_TOOLS: &[&str] = &[
     "eliot_task_meaning",
     "eliot_memory_corpus_profile",
     "eliot_memory_curation_preview",
+    "eliot_memory_distillation_preview",
+    "eliot_memory_distillation_schedule",
     "eliot_experience_recall",
     "eliot_experience_reinstate",
     "eliot_experience_form",
@@ -446,6 +451,9 @@ const READ_ONLY_TOOLS: &[&str] = &[
     "eliot_task_meaning",
     "eliot_memory_corpus_profile",
     "eliot_memory_curation_preview",
+    "eliot_memory_distillation_preview",
+    "eliot_memory_distillation_schedule",
+    "eliot_memory_distillation_preview",
     "eliot_experience_recall",
     "eliot_experience_reinstate",
     "eliot_codecortex_latest",
@@ -504,6 +512,9 @@ const OPERATOR_TOOLS: &[&str] = &[
     "eliot_operator_snapshot",
     "eliot_operator_query",
     "eliot_memory_curation_preview",
+    "eliot_memory_distillation_preview",
+    "eliot_memory_distillation_schedule",
+    "eliot_memory_distillation_apply",
     "eliot_autonomy_run_status",
     "eliot_operator_command",
     "eliot_procedure_candidate_create",
@@ -2235,6 +2246,27 @@ struct MemoryLifecycleStatusToolInput {
     project: String,
     #[serde(alias = "ref")]
     memory_ref: String,
+}
+
+#[derive(serde::Deserialize)]
+struct MemoryDistillationPreviewToolInput {
+    project_id: String,
+    #[serde(default)]
+    at_revision: Option<u64>,
+    ruleset_version: String,
+    #[serde(default)]
+    cursor: Option<String>,
+    page_size: u16,
+}
+
+#[derive(serde::Deserialize)]
+struct MemoryDistillationApplyToolInput {
+    project_id: String,
+    task_id: String,
+    at_revision: u64,
+    ruleset_version: String,
+    selected_candidate_ids: Vec<String>,
+    idempotency_key: String,
 }
 
 #[derive(serde::Deserialize)]

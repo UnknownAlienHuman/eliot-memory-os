@@ -1656,10 +1656,40 @@ enum MemoryLifecycleCommand {
     Vitality {
         #[arg(long)]
         project: String,
+        #[arg(long = "ref")]
+        memory_ref: Option<String>,
     },
     Gravity {
         #[arg(long)]
         project: String,
+        #[arg(long = "ref")]
+        memory_ref: Option<String>,
+    },
+    DistillPreview {
+        #[arg(long)]
+        project: String,
+    },
+    DistillSchedule {
+        #[arg(long)]
+        project: String,
+        #[arg(long, default_value = "manual")]
+        trigger: String,
+        #[arg(long, default_value_t = 0)]
+        new_evidence_count: u64,
+        #[arg(long, default_value_t = 1)]
+        minimum_evidence_count: u64,
+        #[arg(long, default_value_t = false)]
+        interactive_load_active: bool,
+        #[arg(long)]
+        cursor: Option<String>,
+        #[arg(long, default_value_t = 100)]
+        batch_size: u16,
+    },
+    DistillApply {
+        #[arg(long)]
+        project: String,
+        #[arg(long = "candidate", required = true)]
+        selected_candidate_ids: Vec<String>,
     },
     Influence {
         #[arg(long)]
@@ -1923,7 +1953,7 @@ async fn dispatch_command(
             MemoryLifecycleCommand::Status {
                 project,
                 memory_ref,
-            } => commands::run_memory_lifecycle_status(config, &project, &memory_ref),
+            } => commands::run_memory_lifecycle_status(config, &project, &memory_ref).await,
             MemoryLifecycleCommand::Propose {
                 project,
                 memory_ref,
@@ -1939,11 +1969,46 @@ async fn dispatch_command(
             MemoryLifecycleCommand::Apply { policy } => {
                 commands::run_memory_lifecycle_apply(config, &policy).await
             }
-            MemoryLifecycleCommand::Vitality { project } => {
-                commands::run_memory_lifecycle_vitality(config, &project)
+            MemoryLifecycleCommand::Vitality {
+                project,
+                memory_ref,
+            } => {
+                commands::run_memory_lifecycle_vitality(config, &project, memory_ref.as_deref())
+                    .await
             }
-            MemoryLifecycleCommand::Gravity { project } => {
-                commands::run_memory_lifecycle_gravity(config, &project)
+            MemoryLifecycleCommand::Gravity {
+                project,
+                memory_ref,
+            } => {
+                commands::run_memory_lifecycle_gravity(config, &project, memory_ref.as_deref())
+                    .await
+            }
+            MemoryLifecycleCommand::DistillPreview { project } => {
+                commands::run_memory_distillation_preview(config, &project).await
+            }
+            MemoryLifecycleCommand::DistillSchedule {
+                project,
+                trigger,
+                new_evidence_count,
+                minimum_evidence_count,
+                interactive_load_active,
+                cursor,
+                batch_size,
+            } => commands::run_memory_distillation_schedule(
+                &project,
+                &trigger,
+                new_evidence_count,
+                minimum_evidence_count,
+                interactive_load_active,
+                cursor,
+                batch_size,
+            ),
+            MemoryLifecycleCommand::DistillApply {
+                project,
+                selected_candidate_ids,
+            } => {
+                commands::run_memory_distillation_apply(config, &project, &selected_candidate_ids)
+                    .await
             }
             MemoryLifecycleCommand::Influence { project, task } => {
                 commands::run_memory_lifecycle_influence(config, &project, &task).await
