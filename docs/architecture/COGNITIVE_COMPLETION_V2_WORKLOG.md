@@ -285,6 +285,20 @@ green.
   (`too_many_lines` and intentional benchmark JSON stdout), 32.432 seconds.
   Attempt 2 found one uninlined format argument, 15.900 seconds. After narrow
   fixes, clippy passed in 15.935 seconds.
+- The first committed orchestrator prepare on source
+  `2d683c1952109db3c0cd991d65bde1043d545c81` passed in 8.953 seconds,
+  including 7.85 seconds to rebuild the Governor. It wrote the required
+  versioned report layout and kept all 48 raw oracles outside Git.
+- The first background deterministic run stopped after `workspace-verify`.
+  Metadata, formatting, check, and clippy passed; app unit tests passed 152,
+  failed 1, and ignored 2. Total time to the fail-closed receipt was 123.542
+  seconds. The failure was a stale assertion that forbade all `PostToolUse`
+  hooks even though C5 intentionally added a mutation-filtered asynchronous
+  observation hook.
+- Updated the host contract test to require exact Pre/Post mutation matcher
+  parity, the dedicated `post-tool-use` handler, passive unbound behavior, and
+  asynchronous observation. The focused regression passed 1/1 with 0.00
+  seconds test time and 10.670 seconds end to end (10.23-second relink).
 
 ## Logging rule
 

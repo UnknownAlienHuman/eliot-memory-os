@@ -973,6 +973,7 @@ fn an_unbound_session_is_never_blocked() {
     for event in [
         "PreToolUse",
         "tool.execute.before",
+        "PostToolUse",
         "PostToolUseFailure",
         "SessionStart",
         "SessionEnd",
@@ -992,6 +993,7 @@ fn observation_events_do_not_gate_even_when_a_task_is_attached() {
     for event in [
         "SessionStart",
         "SessionEnd",
+        "PostToolUse",
         "PostToolUseFailure",
         "SubagentStart",
         "SubagentStop",
@@ -1006,9 +1008,10 @@ fn observation_events_do_not_gate_even_when_a_task_is_attached() {
     }
 }
 
-/// Every declared hook must be an event this Claude Code version knows,
-/// and each one must earn its place: the unfiltered `PostToolUse` spawned a
-/// Governor process after every successful tool call in every project.
+/// Every declared hook must be an event this Claude Code version knows, and
+/// each one must earn its place. Successful mutation observations are useful
+/// evidence, but `PostToolUse` must share the exact narrow mutation matcher
+/// instead of spawning a Governor process after every successful tool call.
 #[test]
 fn the_declared_hooks_are_the_ones_that_carry_eliot_evidence() -> anyhow::Result<()> {
     let repo = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -1023,21 +1026,23 @@ fn the_declared_hooks_are_the_ones_that_carry_eliot_evidence() -> anyhow::Result
         .and_then(Value::as_object)
         .ok_or_else(|| anyhow::anyhow!("hooks object"))?;
 
-    assert!(
-        !declared.contains_key("PostToolUse"),
-        "an unfiltered PostToolUse fires on every successful tool call"
-    );
-    for required in ["SessionStart", "PreToolUse"] {
+    for required in ["SessionStart", "PreToolUse", "PostToolUse"] {
         assert!(declared.contains_key(required), "{required} is required");
     }
 
-    // The mutation gate must stay filtered to the tools that can mutate.
-    let matcher = hooks
+    // Both sides of the mutation observation must stay filtered to the tools
+    // that can mutate, and must remain exactly aligned.
+    let pre_matcher = hooks
         .pointer("/hooks/PreToolUse/0/matcher")
         .and_then(Value::as_str)
         .ok_or_else(|| anyhow::anyhow!("PreToolUse matcher"))?;
+    let post_matcher = hooks
+        .pointer("/hooks/PostToolUse/0/matcher")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("PostToolUse matcher"))?;
+    assert_eq!(post_matcher, pre_matcher);
     for tool in ["Bash", "Edit", "Write", "NotebookEdit"] {
-        assert!(matcher.contains(tool), "{tool} must reach the gate");
+        assert!(pre_matcher.contains(tool), "{tool} must reach the gate");
     }
 
     // An enforcement point must run the dedicated handler. The generic
@@ -1046,6 +1051,7 @@ fn the_declared_hooks_are_the_ones_that_carry_eliot_evidence() -> anyhow::Result
     // means the emitted decision schema is only accidentally right.
     for (event, expected) in [
         ("PreToolUse", "pre-tool-use"),
+        ("PostToolUse", "post-tool-use"),
         ("Stop", "stop"),
         ("PreCompact", "pre-compact"),
     ] {
@@ -1077,6 +1083,7 @@ fn the_declared_hooks_are_the_ones_that_carry_eliot_evidence() -> anyhow::Result
     for (event, blocking) in [
         ("SessionStart", true),
         ("PreToolUse", true),
+        ("PostToolUse", false),
         ("PreCompact", true),
         ("Stop", true),
         ("PostToolUseFailure", false),
