@@ -365,6 +365,31 @@ green.
 - Focused clippy attempt 1 found one borrowed-slice improvement and three
   forbidden test `expect` calls in 36.216 seconds. After the narrow repair,
   clippy passed in 8.937 seconds and formatting passed in 1.586 seconds.
+- The fourth sealed run prepared on source
+  `04b18c79080ec23c01df15be17a9787e9260ddfe` in 11.473 seconds with 48
+  private oracles, 0 provider calls, and contract hash
+  `blake3:8e18dd3bd13360cd7c07bbeba8b607c6ce8188afa62a27b4ab6f4789ee59a0b3`.
+- Its workspace verifier reached the late `ul_prediction` binary before
+  failing after 432.870 seconds. The sole terminal failure was
+  `t07_skill_and_description_budget`: C3 had intentionally replaced the old
+  keyword-only `recall_l0` description with the current multi-kind,
+  lifecycle-first, inspectable-ranking description, while the test still
+  required the retired literal. Updated only that expected literal and
+  retained the 90-token budget assertion. The focused regression passed 1/1
+  in 0.00 seconds test time and 3.779 seconds end to end.
+- The same parallel workspace run logged one transient SurrealDB bind
+  `os error 10048`; it was not the terminal failure and the surrounding test
+  process continued. It remains infrastructure-noise evidence for the final
+  duration/reliability report.
+- A CodeCortex causal slice exposed a separate C6 acceptance gap before any
+  quota-bearing field calls: `cognitive_field_runner` imports deterministic
+  receipts but merely trusts the presence of `reader.json` and `judge.json`;
+  it has no sealed provider plan or provider-owned Worker/Reader/Judge
+  provenance. The older managed `cognitive_runner` has strong pinned-process,
+  secret-boundary, and UnknownOutcome controls, but its exact grammar is a
+  separate 18-call OpenCode/Antigravity contract and cannot be silently reused
+  as field-v2 evidence. Rust LSP reported the field files as unlinked from its
+  current workspace; Cargo metadata and verifiers remain the source of truth.
 
 ## Logging rule
 

@@ -132,7 +132,7 @@ fn t07_skill_and_description_budget() -> Result<(), Box<dyn std::error::Error>> 
 
     let catalog = fs::read_to_string(root.join("crates/eliot-app/src/mcp_stdio/catalog.rs"))?;
     let descriptions = [
-        "Search memory by keywords. Use when you need knowledge NOT already injected (ul_boot/ul_fired). Needs: query (plain words). Returns: handles + one-liners.",
+        "Search the current multi-kind memory projection by keywords. Scope and lifecycle filtering happen before ranking; lifecycle_audit explicitly exposes audit-only records. Returns at most 12 compact handles plus inspectable integer rank features.",
         "Task context packet + prefilled frame_stub. Use BEFORE any material edit. Needs: goal (task_id auto). Returns: packet, frame_stub (edit <=5 fields), verifier, ul_gate.",
         "Save a lesson/decision/failure to memory. Use after solving anything non-obvious or failing. Needs: statement, kind, expected_reuse_note (bindings auto from your session). Returns: handle.",
         "Acknowledge memory you used. Minimal form: memory_handle, influence_class[, downstream_outcome_ref]. Server fills the rest. Returns: receipt.",
