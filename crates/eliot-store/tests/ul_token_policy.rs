@@ -17,6 +17,7 @@ fn u9_1_assignment_is_stable_across_restart_and_project_scoped() -> TestResult {
         let status = Command::new(std::env::current_exe()?)
             .env("ELIOT_UL_U9_STORE_CHILD", TEST_NAME)
             .env("ELIOT_ALLOW_LEGACY_PASSWORD_FILE_MIGRATION", "1")
+            .env("ELIOT_TEST_ALLOW_LEGACY_OPERATOR_CURSOR_KEY_FILE", "1")
             .args(["--exact", TEST_NAME, "--nocapture"])
             .status()?;
         if !status.success() {

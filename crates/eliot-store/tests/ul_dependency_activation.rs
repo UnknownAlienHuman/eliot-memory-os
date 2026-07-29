@@ -18,6 +18,7 @@ fn u8_2_reverse_index_dirty_state_survives_store_restart() -> TestResult {
         let status = Command::new(std::env::current_exe()?)
             .env("ELIOT_UL_U8_STORE_CHILD", TEST_NAME)
             .env("ELIOT_ALLOW_LEGACY_PASSWORD_FILE_MIGRATION", "1")
+            .env("ELIOT_TEST_ALLOW_LEGACY_OPERATOR_CURSOR_KEY_FILE", "1")
             .args(["--exact", TEST_NAME, "--nocapture"])
             .status()?;
         if !status.success() {

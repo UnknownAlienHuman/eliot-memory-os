@@ -1063,7 +1063,9 @@ fn governor_command() -> Command {
     ] {
         command.env_remove(variable);
     }
-    command.env("ELIOT_ALLOW_LEGACY_PASSWORD_FILE_MIGRATION", "1");
+    command
+        .env("ELIOT_ALLOW_LEGACY_PASSWORD_FILE_MIGRATION", "1")
+        .env("ELIOT_TEST_ALLOW_LEGACY_OPERATOR_CURSOR_KEY_FILE", "1");
     command
 }
 

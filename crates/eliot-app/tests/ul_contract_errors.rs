@@ -123,6 +123,7 @@ fn rerun_with_legacy_credential_gate(test_name: &str) -> TestResult<bool> {
     let status = Command::new(std::env::current_exe()?)
         .env("ELIOT_UL_T01_CREDENTIAL_CHILD", test_name)
         .env("ELIOT_ALLOW_LEGACY_PASSWORD_FILE_MIGRATION", "1")
+        .env("ELIOT_TEST_ALLOW_LEGACY_OPERATOR_CURSOR_KEY_FILE", "1")
         .args(["--exact", test_name, "--nocapture"])
         .status()?;
     if !status.success() {
@@ -646,7 +647,8 @@ fn governor_command() -> Command {
     }
     command
         .env("ELIOT_DISABLE_REAL_PROVIDER", "1")
-        .env("ELIOT_ALLOW_LEGACY_PASSWORD_FILE_MIGRATION", "1");
+        .env("ELIOT_ALLOW_LEGACY_PASSWORD_FILE_MIGRATION", "1")
+        .env("ELIOT_TEST_ALLOW_LEGACY_OPERATOR_CURSOR_KEY_FILE", "1");
     command
 }
 

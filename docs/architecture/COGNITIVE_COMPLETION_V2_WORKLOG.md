@@ -554,6 +554,34 @@ green.
   because the test module referenced unimported `Value`/`read_json`; replacing
   those with fully qualified `serde_json` parsing fixed only the fixture.
   Reader import, 24-call plan, and clippy then passed in 26.8 seconds total.
+- The final `cognitive-field-67f6c6d` deterministic attempt terminated
+  cleanly after 115,350 ms with `workspace-verify` exit 1. The exact failure
+  was `c3_unified_projection_pages_beyond_512_and_preserves_filters_and_dedup`:
+  its daemon could not persist a new 32-byte Operator cursor key through
+  Windows `CredWriteW`, which returned `os error 8` (`Not enough memory
+  resources`). The source had 0 logical test failures before this environment
+  boundary; the failure receipt and raw logs remain under the run's private
+  verifier directory.
+- An isolated retry reproduced the same terminal failure in 31,028 ms despite
+  roughly 90 GiB of free physical memory. `cmdkey /list` then showed 837
+  current-user credentials, including 736 stale
+  `EliotGovernor/operator-cursor/isolated-*` records produced by prior unique
+  test runtimes. This was Credential Manager exhaustion, not host RAM
+  exhaustion or retrieval logic.
+- The first deletion preflight failed closed without deleting anything because
+  its process filter also matched the live default Antigravity MCP daemon and
+  the cleanup PowerShell itself. The corrected preflight matched only
+  `--instance isolated-*` or exact Rust test executables. It deleted exactly
+  the 736 pre-enumerated `operator-cursor/isolated-*` credentials with 0
+  failures and left production/default, local-dev, l15-cert, Surreal, and
+  round-trip credentials untouched.
+- All credential-gated Rust test harnesses now set the existing
+  `ELIOT_TEST_ALLOW_LEGACY_OPERATOR_CURSOR_KEY_FILE=1` boundary for their
+  subprocesses and direct test daemon commands. This keeps ephemeral cursor
+  keys in each access-restricted test runtime instead of leaking unique
+  credentials into the user store. The exact C3 test then passed 1/1 in
+  14,035 ms end to end (11.94 seconds test body), and isolated Credential
+  Manager records remained exactly 0 before and after the test.
 
 ## Logging rule
 

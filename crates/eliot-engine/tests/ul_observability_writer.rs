@@ -221,6 +221,7 @@ fn rerun_with_legacy_credential_gate(test_name: &str) -> TestResult<bool> {
     let status = Command::new(std::env::current_exe()?)
         .env("ELIOT_UL_T02_ENGINE_CHILD", test_name)
         .env("ELIOT_ALLOW_LEGACY_PASSWORD_FILE_MIGRATION", "1")
+        .env("ELIOT_TEST_ALLOW_LEGACY_OPERATOR_CURSOR_KEY_FILE", "1")
         .args(["--exact", test_name, "--nocapture"])
         .status()?;
     if !status.success() {
