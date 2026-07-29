@@ -232,6 +232,20 @@ green.
   seconds.
 - Combined C6 deterministic gate passed 7/7: 0.63 seconds test bodies,
   26.424 seconds end to end. No provider call occurred.
+- First zero-provider prepare correctly failed closed in 8.048 seconds because
+  generated U01 `required_verifier_refs` duplicated values present in the
+  Git-visible suite. Classified as real oracle contamination, not a scanner
+  false positive.
+- Separated public routing/verifier execution refs from run-salted private
+  oracle acceptance/invariant/verifier identifiers. The first focused
+  regression command used `--exact` with an incomplete test name and selected
+  0 tests (38.148 seconds, dominated by relink); the corrected filter passed
+  the intended 48-oracle leak regression in 0.08 seconds test time and 0.288
+  seconds end to end.
+- The first post-fix `clippy` result was lost when the client truncated the
+  tool output, so it was not credited. A bounded rerun passed with exit 0 in
+  0.323 seconds (incremental), followed by `cargo fmt --all -- --check` in
+  1.476 seconds and a clean `git diff --check`.
 
 ## Logging rule
 

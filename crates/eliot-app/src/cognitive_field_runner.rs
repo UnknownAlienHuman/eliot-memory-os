@@ -423,6 +423,20 @@ fn generated_oracle(
     contract: &CognitiveFieldRunContract,
     suite_bytes: &[u8],
 ) -> TaskIntentOracle {
+    let private_ref = |kind: &str| {
+        format!(
+            "private-{kind}:{}",
+            sha256_bytes(
+                format!(
+                    "{}:{}:{kind}:{}",
+                    contract.run_id,
+                    case.case_id,
+                    sha256_bytes(suite_bytes)
+                )
+                .as_bytes()
+            )
+        )
+    };
     let private_marker = format!(
         "PRIVATE-ORACLE-{}",
         sha256_bytes(format!("{}:{}", contract.run_id, case.case_id).as_bytes())
@@ -435,7 +449,7 @@ fn generated_oracle(
         source_commit: contract.source_commit.clone(),
         normalized_goal: case.title.clone(),
         desired_state: vec![format!("{} is satisfied with current evidence", case.title)],
-        acceptance_items: case.deterministic_verifier_refs.clone(),
+        acceptance_items: vec![private_ref("acceptance")],
         non_goals: vec![
             "Do not substitute controller output for a provider role".to_owned(),
             "Do not promote candidate-only evidence to current truth".to_owned(),
@@ -444,17 +458,10 @@ fn generated_oracle(
             "Current source and deterministic verifier evidence outrank memory".to_owned(),
             "Worker, Reader, and Judge sessions remain isolated".to_owned(),
         ],
-        expected_subsystem_set: vec![format!("family:{:?}", case.family)],
-        acceptable_owner_file_symbol_alternatives: vec![format!(
-            "sealed-suite-case:{}:{}",
-            case.case_id,
-            sha256_bytes(suite_bytes)
-        )],
-        required_invariant_refs: vec![
-            "contract:truth-hierarchy".to_owned(),
-            "contract:role-isolation".to_owned(),
-        ],
-        required_verifier_refs: case.deterministic_verifier_refs.clone(),
+        expected_subsystem_set: vec![private_ref("subsystem")],
+        acceptable_owner_file_symbol_alternatives: vec![private_ref("owner-alternative")],
+        required_invariant_refs: vec![private_ref("invariant")],
+        required_verifier_refs: vec![private_ref("verifier")],
         forbidden_conclusions: vec![private_marker],
         authoritative_source_refs: vec![
             format!("git:{}", contract.source_commit),
@@ -654,4 +661,50 @@ fn print_json<T: Serialize>(value: &T) -> Result<()> {
     serde_json::to_writer_pretty(&mut stdout, value)?;
     writeln!(stdout)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{generated_oracle, sha256_bytes};
+    use eliot_engine::CognitiveFieldGradingService;
+    use eliot_types::{
+        COGNITIVE_FIELD_CONTRACT_SCHEMA_VERSION, CognitiveFieldRunContract, CognitiveFieldSuite,
+    };
+    use std::path::Path;
+    use time::OffsetDateTime;
+
+    #[test]
+    fn generated_private_oracle_values_are_absent_from_the_versioned_suite()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(Path::parent)
+            .ok_or("resolve workspace root")?;
+        let suite_bytes = std::fs::read(root.join("tests/cognitive/field-v2/suite.json"))?;
+        let suite: CognitiveFieldSuite = serde_json::from_slice(&suite_bytes)?;
+        let contract = CognitiveFieldRunContract {
+            schema_version: COGNITIVE_FIELD_CONTRACT_SCHEMA_VERSION.to_owned(),
+            run_id: "preflight-test".to_owned(),
+            suite_sha256: sha256_bytes(&suite_bytes),
+            source_commit: "0123456789abcdef0123456789abcdef01234567".to_owned(),
+            primary_repository: "C:/primary".to_owned(),
+            second_repository: "C:/second".to_owned(),
+            second_repository_commit: "fedcba9876543210fedcba9876543210fedcba98".to_owned(),
+            output_root: "C:/reports".to_owned(),
+            private_root_sha256: "private-root".to_owned(),
+            hard_provider_call_cap: suite.hard_provider_call_cap,
+            contract_hash: "contract".to_owned(),
+            sealed_at: OffsetDateTime::UNIX_EPOCH,
+        };
+        for (index, case) in suite.cases.iter().enumerate() {
+            let mut oracle = generated_oracle(case, index, &contract, &suite_bytes);
+            CognitiveFieldGradingService::seal_oracle(&mut oracle)?;
+            let scan = CognitiveFieldGradingService::scan_reader_surfaces(
+                &oracle,
+                &[("suite-manifest".to_owned(), suite_bytes.clone())],
+            );
+            assert!(scan.clean, "{}: {:?}", case.case_id, scan.findings);
+        }
+        Ok(())
+    }
 }
