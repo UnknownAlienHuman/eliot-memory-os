@@ -15,6 +15,7 @@ pub mod delegation;
 pub mod delegation_calibration;
 pub mod error;
 pub mod eval;
+pub mod external_agent;
 pub mod external_review;
 pub mod host;
 pub mod lifecycle;
@@ -114,6 +115,11 @@ pub use eval::{
     MetaExperimentAssessment, MetaExperimentGate, MetaExperimentGateResult, MetaExperimentInput,
     MetaHarnessService, MetaIsolationSnapshot, MetaMetricDirection, MetaMetricObservation,
     MetaPolicyExecutor, family_slug, harness_experiment_record, runnable_k0_families,
+};
+pub use external_agent::{
+    computed_provider_runtime_contract_sha256, normalize_provider_runtime_contract,
+    seal_provider_runtime_contract, validate_external_agent_execution_request,
+    validate_provider_runtime_contract,
 };
 pub use external_review::{
     ExternalProviderRegistryReport, ExternalProviderRegistryService, ExternalReviewBridgeReport,

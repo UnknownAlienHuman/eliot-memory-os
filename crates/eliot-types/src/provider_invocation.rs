@@ -263,6 +263,26 @@ pub struct ProviderRouteReadinessGate {
     pub local_adapter_health: bool,
     pub executable_available: bool,
     pub auth_or_configuration_present: bool,
+    #[serde(default)]
+    pub installed: bool,
+    #[serde(default)]
+    pub provider_authenticated: bool,
+    #[serde(default)]
+    pub exact_model_selectable: bool,
+    #[serde(default)]
+    pub mcp_config_valid: bool,
+    #[serde(default)]
+    pub mcp_process_started: bool,
+    #[serde(default)]
+    pub mcp_initialized: bool,
+    #[serde(default)]
+    pub required_tools_visible: bool,
+    #[serde(default)]
+    pub structured_output_ready: bool,
+    #[serde(default)]
+    pub console_headless_ready: bool,
+    #[serde(default)]
+    pub last_successful_smoke_ref: Option<String>,
     pub provider_gate_current: bool,
     pub last_incident_class: ProviderInvocationOutcomeClass,
     pub timeout_profile_ref: String,

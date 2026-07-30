@@ -11,6 +11,7 @@ pub mod delegation_calibration;
 pub mod distillation;
 pub mod error;
 pub mod eval;
+pub mod external_agent;
 pub mod external_review;
 pub mod health;
 pub mod host;
@@ -178,6 +179,13 @@ pub use eval::{
     MetaCandidateChangeClass, MetaExperimentDecision, MetaIsolationFence,
     MetaIsolationRejectionRecord, MetaPolicyAuthorization, MetaPolicyExecutionAction,
     MetaPolicyExecutionReceipt, ReplayThresholdPolicyV1,
+};
+pub use external_agent::{
+    ExternalAgentExecutionRequest, ExternalAgentPurpose,
+    LEGACY_COGNITIVE_PROVIDER_RUNTIME_SCHEMA_VERSION, PROVIDER_RUNTIME_CONTRACT_SCHEMA_VERSION,
+    PROVIDER_RUNTIME_PREFLIGHT_SCHEMA_VERSION, ProviderAuthenticationState,
+    ProviderExecutionEvidence, ProviderMcpServerContract, ProviderRuntimeContract,
+    ProviderRuntimePreflightReceipt, ProviderStructuredOutputMode,
 };
 pub use external_review::{
     ExternalCitationStatus, ExternalClaimStatus, ExternalEvidenceCitation, ExternalFindingSeverity,

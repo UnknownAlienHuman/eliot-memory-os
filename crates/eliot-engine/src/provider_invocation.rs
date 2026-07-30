@@ -76,6 +76,16 @@ pub struct ProviderReadinessInput {
     pub local_adapter_health: bool,
     pub executable_available: bool,
     pub auth_or_configuration_present: bool,
+    pub installed: bool,
+    pub provider_authenticated: bool,
+    pub exact_model_selectable: bool,
+    pub mcp_config_valid: bool,
+    pub mcp_process_started: bool,
+    pub mcp_initialized: bool,
+    pub required_tools_visible: bool,
+    pub structured_output_ready: bool,
+    pub console_headless_ready: bool,
+    pub last_successful_smoke_ref: Option<String>,
     pub provider_gate_current: bool,
     pub provider_explicitly_unavailable: bool,
     pub timeout_contract_complete: bool,
@@ -432,6 +442,15 @@ impl ProviderRouteReadinessService {
         let (verdict, reasons) = if !input.local_adapter_health
             || !input.executable_available
             || !input.auth_or_configuration_present
+            || !input.installed
+            || !input.provider_authenticated
+            || !input.exact_model_selectable
+            || !input.mcp_config_valid
+            || !input.mcp_process_started
+            || !input.mcp_initialized
+            || !input.required_tools_visible
+            || !input.structured_output_ready
+            || !input.console_headless_ready
             || !input.durable_capture_ready
             || !input.process_tree_cancellation_ready
         {
@@ -469,6 +488,16 @@ impl ProviderRouteReadinessService {
             local_adapter_health: input.local_adapter_health,
             executable_available: input.executable_available,
             auth_or_configuration_present: input.auth_or_configuration_present,
+            installed: input.installed,
+            provider_authenticated: input.provider_authenticated,
+            exact_model_selectable: input.exact_model_selectable,
+            mcp_config_valid: input.mcp_config_valid,
+            mcp_process_started: input.mcp_process_started,
+            mcp_initialized: input.mcp_initialized,
+            required_tools_visible: input.required_tools_visible,
+            structured_output_ready: input.structured_output_ready,
+            console_headless_ready: input.console_headless_ready,
+            last_successful_smoke_ref: input.last_successful_smoke_ref,
             provider_gate_current: input.provider_gate_current,
             last_incident_class: input.last_incident_class,
             timeout_profile_ref: input.timeout_profile_ref,

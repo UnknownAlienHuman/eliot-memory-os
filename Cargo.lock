@@ -287,6 +287,7 @@ dependencies = [
  "eliot-windows-ipc",
  "serde",
  "serde_json",
+ "sha2",
  "thiserror",
  "time",
  "tokio",

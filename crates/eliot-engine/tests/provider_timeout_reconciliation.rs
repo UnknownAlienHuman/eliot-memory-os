@@ -324,6 +324,26 @@ fn readiness_gate_distinguishes_all_blockers() {
 }
 
 #[test]
+fn readiness_gate_does_not_infer_live_readiness_from_installation() {
+    let gate = ProviderRouteReadinessService.evaluate(ProviderReadinessInput {
+        provider_authenticated: false,
+        structured_output_ready: false,
+        console_headless_ready: false,
+        last_successful_smoke_ref: None,
+        operator_authorized: true,
+        ..readiness_input()
+    });
+    assert_eq!(
+        gate.verdict,
+        ProviderRouteReadinessVerdict::BlockedByLocalRoute
+    );
+    assert!(!gate.provider_authenticated);
+    assert!(!gate.structured_output_ready);
+    assert!(!gate.console_headless_ready);
+    assert!(gate.last_successful_smoke_ref.is_none());
+}
+
+#[test]
 fn raw_spool_is_bounded_hashed_and_stream_specific() -> TestResult {
     let root = temp_root("spool");
     let oversized = vec![b'x'; 70_000];
@@ -490,6 +510,16 @@ fn readiness_input() -> ProviderReadinessInput {
         local_adapter_health: true,
         executable_available: true,
         auth_or_configuration_present: true,
+        installed: true,
+        provider_authenticated: true,
+        exact_model_selectable: true,
+        mcp_config_valid: true,
+        mcp_process_started: true,
+        mcp_initialized: true,
+        required_tools_visible: true,
+        structured_output_ready: true,
+        console_headless_ready: true,
+        last_successful_smoke_ref: Some("provider-smoke:fixture".to_owned()),
         provider_gate_current: true,
         provider_explicitly_unavailable: false,
         timeout_contract_complete: true,
