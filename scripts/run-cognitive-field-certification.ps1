@@ -1,6 +1,6 @@
 [CmdletBinding()]
 param(
-    [ValidateSet('Prepare', 'Deterministic', 'SealProviderPlan', 'RecordProvider', 'Grade', 'All')]
+    [ValidateSet('Prepare', 'Deterministic', 'SealProviderPlan', 'ExecuteProvider', 'RecordProvider', 'Grade', 'All')]
     [string]$Mode = 'All',
     [string]$RunId,
     [string]$SecondRepository = $env:ELIOT_COGNITIVE_SECOND_REPO,
@@ -8,6 +8,7 @@ param(
     [string]$PrivateRoot,
     [string]$Governor,
     [string]$ProviderCalls,
+    [string[]]$ProviderCallId = @(),
     [string[]]$ProviderReceipt = @(),
     [ValidateRange(60, 7200)]
     [int]$TestTimeoutSeconds = 3600
@@ -325,6 +326,23 @@ if ($Mode -in @('RecordProvider', 'All')) {
                 '--report-root', $ReportRoot,
                 '--private-root', $PrivateRoot,
                 '--receipt', ([IO.Path]::GetFullPath($receipt))
+            )
+        }
+    }
+}
+if ($Mode -in @('ExecuteProvider', 'All')) {
+    if ($ProviderCallId.Count -eq 0) {
+        if ($Mode -eq 'ExecuteProvider') {
+            throw 'ExecuteProvider requires at least one -ProviderCallId.'
+        }
+    }
+    else {
+        foreach ($callId in $ProviderCallId) {
+            Invoke-Governor @(
+                'cognitive-field', 'execute-provider',
+                '--report-root', $ReportRoot,
+                '--private-root', $PrivateRoot,
+                '--call-id', $callId
             )
         }
     }

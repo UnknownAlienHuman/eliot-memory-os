@@ -67,17 +67,27 @@ pub(crate) struct OpenCodeCliAdapter {
     core: ExternalAgentAdapterCore,
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct ExternalAgentRuntimePreview {
+    pub adapter_id: String,
+    pub adapter_version: String,
+    pub runtime_contract: ProviderRuntimeContract,
+}
+
+struct PreparedExternalAgentExecution {
+    executable: PathBuf,
+    provider_hash_before: String,
+    schema: Value,
+    cwd: PathBuf,
+    plan: ProviderCommandPlan,
+    environment: BTreeMap<String, String>,
+    runtime_contract: ProviderRuntimeContract,
+}
+
 pub(crate) fn production_external_agent_supervisor(
     config_path: &Path,
 ) -> Result<AdapterSupervisor> {
-    let governor_executable =
-        std::env::var_os("ELIOT_GOVERNOR_EXE").map_or(std::env::current_exe()?, PathBuf::from);
-    let governor_executable = std::fs::canonicalize(&governor_executable).with_context(|| {
-        format!(
-            "canonicalize Governor executable {}",
-            governor_executable.display()
-        )
-    })?;
+    let governor_executable = resolved_governor_executable()?;
     let mut registry = AdapterRegistry::new();
     registry.register(ClaudeCodeCliAdapter::new(
         config_path,
@@ -89,6 +99,53 @@ pub(crate) fn production_external_agent_supervisor(
     )?)?;
     registry.register(OpenCodeCliAdapter::new(config_path, &governor_executable)?)?;
     Ok(AdapterSupervisor::new(registry))
+}
+
+pub(crate) fn prepare_external_agent_runtime(
+    config_path: &Path,
+    host: AgentHostId,
+    execution: &ExternalAgentExecutionRequest,
+) -> Result<ExternalAgentRuntimePreview> {
+    anyhow::ensure!(
+        host != AgentHostId::Codex,
+        "Codex does not use an external-agent adapter"
+    );
+    validate_external_agent_execution_request(execution)?;
+    let core = ExternalAgentAdapterCore::new(host, config_path, &resolved_governor_executable()?)?;
+    let prepared = core.prepare_governed(execution)?;
+    Ok(ExternalAgentRuntimePreview {
+        adapter_id: core.adapter_id,
+        adapter_version: core.manifest.version,
+        runtime_contract: prepared.runtime_contract,
+    })
+}
+
+pub(crate) fn external_agent_blob_path(config_path: &Path, reference: &str) -> Result<PathBuf> {
+    anyhow::ensure!(
+        !reference.trim().is_empty(),
+        "external-agent blob reference is empty"
+    );
+    let root = runtime_root(config_path);
+    let root = std::fs::canonicalize(&root).with_context(|| {
+        format!(
+            "canonicalize external-agent runtime root {}",
+            root.display()
+        )
+    })?;
+    let path = std::fs::canonicalize(root.join(reference))
+        .with_context(|| format!("resolve external-agent blob {reference}"))?;
+    anyhow::ensure!(
+        path.starts_with(&root) && path.is_file(),
+        "external-agent blob escaped its runtime root"
+    );
+    Ok(path)
+}
+
+fn resolved_governor_executable() -> Result<PathBuf> {
+    let executable =
+        std::env::var_os("ELIOT_GOVERNOR_EXE").map_or(std::env::current_exe()?, PathBuf::from);
+    std::fs::canonicalize(&executable)
+        .with_context(|| format!("canonicalize Governor executable {}", executable.display()))
 }
 
 pub(crate) async fn dispatch(
@@ -966,102 +1023,15 @@ impl ExternalAgentAdapterCore {
         request: AdapterRequest,
         execution: ExternalAgentExecutionRequest,
     ) -> Result<AdapterResult, eliot_engine::EngineError> {
-        let executable = self.executable.as_deref().ok_or_else(|| {
-            eliot_engine::EngineError::ServiceNotReady {
-                service: self.adapter_id.clone(),
-                reason: "headless provider executable is not installed".to_owned(),
-            }
-        })?;
-        let executable = std::fs::canonicalize(executable)?;
-        let provider_hash_before = engine_anyhow(sha256_file(&executable))?;
-        let provider_version =
-            self.version
-                .clone()
-                .ok_or_else(|| eliot_engine::EngineError::ServiceNotReady {
-                    service: self.adapter_id.clone(),
-                    reason: "provider version probe did not complete".to_owned(),
-                })?;
-        let prompt_path = canonical_bound_file(&execution.prompt_ref, "provider prompt")?;
-        let schema_path =
-            canonical_bound_file(&execution.output_schema_ref, "provider output schema")?;
-        let prompt_bytes = std::fs::read(&prompt_path)?;
-        let schema_bytes = std::fs::read(&schema_path)?;
-        require_sha256(
-            &prompt_bytes,
-            &execution.prompt_sha256,
-            "provider prompt SHA-256",
-        )?;
-        require_sha256(
-            &schema_bytes,
-            &execution.output_schema_sha256,
-            "provider output schema SHA-256",
-        )?;
-        let prompt = String::from_utf8(prompt_bytes).map_err(|_| {
-            eliot_engine::EngineError::WriteRejected(
-                "provider prompt must be valid UTF-8".to_owned(),
-            )
-        })?;
-        let schema: Value = serde_json::from_slice(&schema_bytes)?;
-        if !schema.is_object() && !schema.is_boolean() {
-            return Err(eliot_engine::EngineError::WriteRejected(
-                "provider output schema root is invalid".to_owned(),
-            ));
-        }
-        let cwd = std::fs::canonicalize(Path::new(&execution.launch_contract.cwd_or_worktree))?;
-        let invocation_root = runtime_root(&self.config_path)
-            .join("external-agent")
-            .join(safe_component(&execution.invocation.invocation_id));
-        std::fs::create_dir_all(&invocation_root)?;
-        let mcp = materialize_provider_mcp(
-            self.host,
-            &self.governor_executable,
-            &self.config_path,
-            &cwd,
-            &invocation_root,
-            &execution,
-        )?;
-        let plan = provider_command_plan(
-            self.host,
-            &execution,
-            &schema,
-            &prompt,
-            &mcp.provider_config_path,
-            &cwd,
-        )?;
-        let environment = provider_environment(
-            self.host,
-            &plan,
-            &self.config_path,
-            &self.governor_executable,
-            &execution,
-            &mcp,
-        );
-        let mut runtime_contract = ProviderRuntimeContract {
-            schema_version: PROVIDER_RUNTIME_CONTRACT_SCHEMA_VERSION.to_owned(),
-            host: self.host,
-            purpose: execution.purpose,
-            provider_executable: path_string(&executable),
-            provider_executable_sha256: provider_hash_before.clone(),
-            provider_version,
-            requested_model: execution.requested_model.clone(),
-            model_selection_mechanism: plan.model_selection_mechanism.clone(),
-            provider_cwd: path_string(&cwd),
-            provider_argv: plan.argv.clone(),
-            nonsecret_environment: environment.clone(),
-            mcp_servers: vec![mcp.contract],
-            expected_mcp_tool_names: execution.expected_mcp_tool_names.clone(),
-            forbidden_mcp_server_names: execution.forbidden_mcp_server_names.clone(),
-            allowed_provider_tools: execution.allowed_provider_tools.clone(),
-            denied_provider_tools: execution.denied_provider_tools.clone(),
-            permission_profile: execution.launch_contract.permission_profile.clone(),
-            structured_output_mode: plan.structured_output_mode,
-            output_schema_sha256: execution.output_schema_sha256.clone(),
-            timeout_profile_ref: execution.timeout_profile_ref.clone(),
-            process_containment: "windows-suspended-kill-on-close-job-object-v1".to_owned(),
-            candidate_only: true,
-            runtime_contract_sha256: String::new(),
-        };
-        seal_provider_runtime_contract(&mut runtime_contract)?;
+        let PreparedExternalAgentExecution {
+            executable,
+            provider_hash_before,
+            schema,
+            cwd,
+            plan,
+            environment,
+            runtime_contract,
+        } = self.prepare_governed(&execution)?;
 
         let runtime_root = runtime_root(&self.config_path);
         let attempt_id = format!(
@@ -1300,6 +1270,7 @@ impl ExternalAgentAdapterCore {
                     &stdout_capture,
                     &stderr_capture,
                     None,
+                    None,
                     AgentResultStatus::UnknownOutcome,
                     AdapterResultStatus::Timeout,
                     true,
@@ -1332,6 +1303,7 @@ impl ExternalAgentAdapterCore {
                     &process,
                     &stdout_capture,
                     &stderr_capture,
+                    None,
                     None,
                     AgentResultStatus::Failed,
                     AdapterResultStatus::Failed,
@@ -1373,6 +1345,7 @@ impl ExternalAgentAdapterCore {
                         &stdout_capture,
                         &stderr_capture,
                         None,
+                        None,
                         AgentResultStatus::Failed,
                         AdapterResultStatus::Failed,
                         false,
@@ -1412,7 +1385,7 @@ impl ExternalAgentAdapterCore {
         journal.transition(
             &mut attempt,
             ProviderInvocationState::CompletedCaptured,
-            vec![structured_capture.blob_ref.relative_path],
+            vec![structured_capture.blob_ref.relative_path.clone()],
         )?;
         journal.transition(
             &mut attempt,
@@ -1437,6 +1410,7 @@ impl ExternalAgentAdapterCore {
             &process,
             &stdout_capture,
             &stderr_capture,
+            Some(&structured_capture),
             Some(parsed),
             AgentResultStatus::Succeeded,
             AdapterResultStatus::Succeeded,
@@ -1444,6 +1418,121 @@ impl ExternalAgentAdapterCore {
             None,
         )
         .await
+    }
+
+    #[allow(
+        clippy::too_many_lines,
+        reason = "runtime preview and dispatch must share one exact preparation boundary"
+    )]
+    fn prepare_governed(
+        &self,
+        execution: &ExternalAgentExecutionRequest,
+    ) -> Result<PreparedExternalAgentExecution, eliot_engine::EngineError> {
+        let executable = self.executable.as_deref().ok_or_else(|| {
+            eliot_engine::EngineError::ServiceNotReady {
+                service: self.adapter_id.clone(),
+                reason: "headless provider executable is not installed".to_owned(),
+            }
+        })?;
+        let executable = std::fs::canonicalize(executable)?;
+        let provider_hash_before = engine_anyhow(sha256_file(&executable))?;
+        let provider_version =
+            self.version
+                .clone()
+                .ok_or_else(|| eliot_engine::EngineError::ServiceNotReady {
+                    service: self.adapter_id.clone(),
+                    reason: "provider version probe did not complete".to_owned(),
+                })?;
+        let prompt_path = canonical_bound_file(&execution.prompt_ref, "provider prompt")?;
+        let schema_path =
+            canonical_bound_file(&execution.output_schema_ref, "provider output schema")?;
+        let prompt_bytes = std::fs::read(&prompt_path)?;
+        let schema_bytes = std::fs::read(&schema_path)?;
+        require_sha256(
+            &prompt_bytes,
+            &execution.prompt_sha256,
+            "provider prompt SHA-256",
+        )?;
+        require_sha256(
+            &schema_bytes,
+            &execution.output_schema_sha256,
+            "provider output schema SHA-256",
+        )?;
+        let prompt = String::from_utf8(prompt_bytes).map_err(|_| {
+            eliot_engine::EngineError::WriteRejected(
+                "provider prompt must be valid UTF-8".to_owned(),
+            )
+        })?;
+        let schema: Value = serde_json::from_slice(&schema_bytes)?;
+        if !schema.is_object() && !schema.is_boolean() {
+            return Err(eliot_engine::EngineError::WriteRejected(
+                "provider output schema root is invalid".to_owned(),
+            ));
+        }
+        let cwd = std::fs::canonicalize(Path::new(&execution.launch_contract.cwd_or_worktree))?;
+        let invocation_root = runtime_root(&self.config_path)
+            .join("external-agent")
+            .join(safe_component(&execution.invocation.invocation_id));
+        std::fs::create_dir_all(&invocation_root)?;
+        let mcp = materialize_provider_mcp(
+            self.host,
+            &self.governor_executable,
+            &self.config_path,
+            &cwd,
+            &invocation_root,
+            execution,
+        )?;
+        let plan = provider_command_plan(
+            self.host,
+            execution,
+            &schema,
+            &prompt,
+            &mcp.provider_config_path,
+            &cwd,
+        )?;
+        let environment = provider_environment(
+            self.host,
+            &plan,
+            &self.config_path,
+            &self.governor_executable,
+            execution,
+            &mcp,
+        );
+        let mut runtime_contract = ProviderRuntimeContract {
+            schema_version: PROVIDER_RUNTIME_CONTRACT_SCHEMA_VERSION.to_owned(),
+            host: self.host,
+            purpose: execution.purpose,
+            provider_executable: path_string(&executable),
+            provider_executable_sha256: provider_hash_before.clone(),
+            provider_version,
+            requested_model: execution.requested_model.clone(),
+            model_selection_mechanism: plan.model_selection_mechanism.clone(),
+            provider_cwd: path_string(&cwd),
+            provider_argv: plan.argv.clone(),
+            nonsecret_environment: environment.clone(),
+            mcp_servers: vec![mcp.contract],
+            expected_mcp_tool_names: execution.expected_mcp_tool_names.clone(),
+            forbidden_mcp_server_names: execution.forbidden_mcp_server_names.clone(),
+            allowed_provider_tools: execution.allowed_provider_tools.clone(),
+            denied_provider_tools: execution.denied_provider_tools.clone(),
+            permission_profile: execution.launch_contract.permission_profile.clone(),
+            structured_output_mode: plan.structured_output_mode,
+            output_schema_sha256: execution.output_schema_sha256.clone(),
+            timeout_profile_ref: execution.timeout_profile_ref.clone(),
+            process_containment: "windows-suspended-kill-on-close-job-object-v1".to_owned(),
+            candidate_only: true,
+            runtime_contract_sha256: String::new(),
+        };
+        seal_provider_runtime_contract(&mut runtime_contract)?;
+        Ok(PreparedExternalAgentExecution {
+            executable,
+            provider_hash_before,
+            schema,
+            cwd,
+            plan,
+            environment,
+            runtime_contract,
+        })
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1459,6 +1548,7 @@ impl ExternalAgentAdapterCore {
         process: &ManagedExternalAgentOutput,
         stdout: &eliot_engine::ProviderOutputCapture,
         stderr: &eliot_engine::ProviderOutputCapture,
+        structured: Option<&eliot_engine::ProviderOutputCapture>,
         parsed: Option<ProviderTerminalResult>,
         agent_status: AgentResultStatus,
         adapter_status: AdapterResultStatus,
@@ -1490,6 +1580,7 @@ impl ExternalAgentAdapterCore {
             ),
             unknown_outcome,
             structured_output: structured_output.clone(),
+            structured_output_ref: structured.map(|capture| capture.blob_ref.relative_path.clone()),
             structured_output_sha256: structured_output
                 .as_ref()
                 .map(serde_json::to_vec)

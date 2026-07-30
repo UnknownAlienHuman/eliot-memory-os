@@ -188,6 +188,8 @@ pub struct ProviderExecutionEvidence {
     pub unknown_outcome: bool,
 
     pub structured_output: Option<Value>,
+    #[serde(default)]
+    pub structured_output_ref: Option<String>,
     pub structured_output_sha256: Option<String>,
 
     pub stdout_ref: Option<String>,

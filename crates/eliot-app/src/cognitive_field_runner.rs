@@ -1,7 +1,11 @@
 use anyhow::{Context, Result, bail, ensure};
-use eliot_engine::CognitiveFieldGradingService;
+use eliot_engine::{
+    CognitiveFieldGradingService, validate_external_agent_execution_request,
+    validate_provider_runtime_contract,
+};
 use eliot_types::{
-    AgentHostId, COGNITIVE_CORE_CONTINUATION_EXPECTED_PROVIDER_CALLS,
+    AdapterCapability, AdapterContext, AdapterRequest, AdapterResultStatus, AgentHostId,
+    AgentInvocationRequest, COGNITIVE_CORE_CONTINUATION_EXPECTED_PROVIDER_CALLS,
     COGNITIVE_CORE_CONTINUATION_MAX_PROVIDER_CALLS, COGNITIVE_CORE_QUALIFICATION_HARNESS_VERSION,
     COGNITIVE_CORE_QUALIFICATION_PROVIDER_CALLS, COGNITIVE_DETERMINISTIC_EVIDENCE_SCHEMA_VERSION,
     COGNITIVE_DETERMINISTIC_REPORT_SCHEMA_VERSION, COGNITIVE_FIELD_CONTRACT_SCHEMA_VERSION,
@@ -12,13 +16,15 @@ use eliot_types::{
     CognitiveDeterministicEvidenceReceipt, CognitiveDeterministicReport, CognitiveFieldCase,
     CognitiveFieldExecutionKey, CognitiveFieldPlan, CognitiveFieldPlanItem,
     CognitiveFieldProviderCallPlan, CognitiveFieldProviderEvidenceReceipt,
-    CognitiveFieldProviderOutputProjection, CognitiveFieldProviderPlan,
-    CognitiveFieldProviderProjection, CognitiveFieldRole, CognitiveFieldRunContract,
-    CognitiveFieldSuite, CognitiveFieldValidationReport, CognitiveHardGateEvidence,
-    CognitiveHardGateKind, CognitiveJudgeResult, CognitiveMemoryCondition,
-    CognitiveProviderMcpServer, CognitiveProviderRuntimeContract, CognitiveRuntimePreflightReceipt,
-    CognitiveUnderstandingAnswer, CognitiveWorkerResult, ProjectId, TaskId, TaskIntentOracle,
-    cognitive_judge_result_schema, cognitive_understanding_answer_schema,
+    CognitiveFieldProviderOutputProjection, CognitiveFieldProviderOutputReceipt,
+    CognitiveFieldProviderPlan, CognitiveFieldProviderProjection, CognitiveFieldRole,
+    CognitiveFieldRunContract, CognitiveFieldSuite, CognitiveFieldValidationReport,
+    CognitiveHardGateEvidence, CognitiveHardGateKind, CognitiveJudgeResult,
+    CognitiveMemoryCondition, CognitiveProviderMcpServer, CognitiveProviderRuntimeContract,
+    CognitiveRuntimePreflightReceipt, CognitiveUnderstandingAnswer, CognitiveWorkerResult,
+    ExternalAgentExecutionRequest, ExternalAgentPurpose, HostLaunchContract, HostMode, ProjectId,
+    ProviderExecutionEvidence, ProviderRuntimeContract, SessionId, TaskId, TaskIntentOracle,
+    WorkItemId, cognitive_judge_result_schema, cognitive_understanding_answer_schema,
     cognitive_worker_result_schema, inspect_secret_bytes,
 };
 use serde::{Deserialize, Serialize};
@@ -148,6 +154,69 @@ struct VerifiedPriorRole {
     source_private_root: PathBuf,
     outputs: Vec<(CognitiveFieldExecutionKey, Vec<u8>)>,
     candidate_diff: Option<Vec<u8>>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CognitiveCallScopeBinding {
+    schema_version: String,
+    run_id: String,
+    case_id: String,
+    project_id: ProjectId,
+    task_id: TaskId,
+}
+
+#[derive(Clone, Debug)]
+struct SealedPromptBinding {
+    project_id: ProjectId,
+    task_id: TaskId,
+    repository: PathBuf,
+}
+
+enum ProviderRuntimeBinding {
+    Current(Box<ProviderRuntimeContract>),
+    Legacy(Box<CognitiveProviderRuntimeContract>),
+}
+
+impl ProviderRuntimeBinding {
+    fn runtime_contract_sha256(&self) -> &str {
+        match self {
+            Self::Current(contract) => &contract.runtime_contract_sha256,
+            Self::Legacy(contract) => &contract.runtime_contract_sha256,
+        }
+    }
+
+    const fn host(&self) -> AgentHostId {
+        match self {
+            Self::Current(contract) => contract.host,
+            Self::Legacy(contract) => contract.host,
+        }
+    }
+
+    fn provider_executable_sha256(&self) -> &str {
+        match self {
+            Self::Current(contract) => &contract.provider_executable_sha256,
+            Self::Legacy(contract) => &contract.provider_executable_sha256,
+        }
+    }
+
+    fn expected_mcp_tool_names(&self) -> &[String] {
+        match self {
+            Self::Current(contract) => &contract.expected_mcp_tool_names,
+            Self::Legacy(contract) => &contract.expected_mcp_tool_names,
+        }
+    }
+
+    fn forbidden_mcp_server_names(&self) -> &[String] {
+        match self {
+            Self::Current(contract) => &contract.forbidden_mcp_server_names,
+            Self::Legacy(contract) => &contract.forbidden_mcp_server_names,
+        }
+    }
+
+    const fn is_current(&self) -> bool {
+        matches!(self, Self::Current(_))
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -1196,7 +1265,355 @@ pub fn record_deterministic(
     }))
 }
 
-pub fn seal_provider_plan(
+async fn bind_external_provider_calls(
+    config_path: &Path,
+    suite: &CognitiveFieldSuite,
+    contract: &CognitiveFieldRunContract,
+    private_root: &Path,
+    calls: &mut [CognitiveFieldProviderCallPlan],
+) -> Result<()> {
+    for call in calls
+        .iter_mut()
+        .filter(|call| call.host != AgentHostId::Codex)
+    {
+        ensure!(
+            call.role == CognitiveFieldRole::UnderstandingReader,
+            "only external UnderstandingReader calls are admitted by the cognitive cutover"
+        );
+        let prompt_path = private_relative_file(private_root, &call.prompt_ref, "provider prompt")?;
+        let prompt_bytes = fs::read(&prompt_path)?;
+        ensure!(
+            sha256_bytes(&prompt_bytes) == call.prompt_sha256,
+            "external provider prompt differs from its sealed call hash"
+        );
+        let prompt = std::str::from_utf8(&prompt_bytes).context("provider prompt is not UTF-8")?;
+        let prompt_binding = sealed_prompt_binding(prompt, suite, contract, private_root, call)?;
+        let request_path = private_root
+            .join("runtime")
+            .join(format!("{}-execution-request.json", call.call_id));
+        let execution = if request_path.is_file() {
+            let execution: ExternalAgentExecutionRequest = read_json(&request_path)?;
+            validate_external_agent_execution_request(&execution)?;
+            validate_execution_request_binding(
+                &execution,
+                call,
+                &prompt_binding,
+                &prompt_path,
+                private_root,
+            )?;
+            execution
+        } else {
+            let execution = cognitive_external_execution_request(
+                config_path,
+                contract,
+                private_root,
+                call,
+                &prompt_binding,
+                &prompt_path,
+            )
+            .await?;
+            write_new_or_same_json(&request_path, &execution)?;
+            execution
+        };
+        let preview = crate::host_runtime::prepare_external_agent_runtime(
+            config_path,
+            call.host,
+            &execution,
+        )?;
+        ensure!(
+            preview.runtime_contract.host == call.host
+                && preview.runtime_contract.requested_model == call.requested_model,
+            "production adapter preview differs from the sealed provider route"
+        );
+        let runtime_path = private_root
+            .join("runtime")
+            .join(format!("{}-provider-runtime.json", call.call_id));
+        write_new_or_same_json(&runtime_path, &preview.runtime_contract)?;
+        call.adapter_id = preview.adapter_id;
+        call.adapter_version = preview.adapter_version;
+        call.execution_request_ref = private_relative_ref(private_root, &request_path)?;
+        call.execution_request_sha256 = sha256_bytes(&fs::read(&request_path)?);
+        call.runtime_contract_ref = private_relative_ref(private_root, &runtime_path)?;
+        call.runtime_contract_sha256
+            .clone_from(&preview.runtime_contract.runtime_contract_sha256);
+        call.expected_provider_executable_sha256 =
+            preview.runtime_contract.provider_executable_sha256;
+    }
+    Ok(())
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "the request builder keeps one sealed authority contract visible end to end"
+)]
+async fn cognitive_external_execution_request(
+    config_path: &Path,
+    contract: &CognitiveFieldRunContract,
+    private_root: &Path,
+    call: &CognitiveFieldProviderCallPlan,
+    binding: &SealedPromptBinding,
+    prompt_path: &Path,
+) -> Result<ExternalAgentExecutionRequest> {
+    let output_schema_path = private_root.join("schemas").join("reader-provider.json");
+    let output_schema_path = canonical_file(&output_schema_path, "Reader provider output schema")?;
+    ensure!(
+        sha256_bytes(&fs::read(&output_schema_path)?) == call.provider_schema_sha256,
+        "Reader provider output schema differs from the sealed call"
+    );
+    let session_id = SessionId::new_v7();
+    let mut scope = crate::host_runtime::prepare_cognitive_external_scope(
+        config_path,
+        call.host,
+        binding.project_id,
+        binding.task_id,
+        session_id,
+        &format!("cognitive-field:{}:{}", contract.run_id, call.call_id),
+    )
+    .await?;
+    let work_item_id = WorkItemId::new_v7();
+    scope.work_item_id = Some(work_item_id);
+    scope.planned_verifier_ref = Some(format!(
+        "cognitive-field-provider-verifier:{}:{}",
+        contract.run_id, call.call_id
+    ));
+    scope.baseline_commit = Some(contract.source_commit.clone());
+    let invocation_id = format!("cognitive-field-{}-{}", contract.run_id, call.call_id);
+    let idempotency_key = format!("cognitive-field:{}:{}", contract.run_id, call.call_id);
+    let expected_tools = cognitive_expected_mcp_tools(call);
+    let allowed_provider_tools = cognitive_allowed_provider_tools(call.host, &expected_tools);
+    let agent_session_id = scope
+        .agent_session_id
+        .context("external cognitive scope has no AgentSession")?;
+    let role_lease_id = scope
+        .role_lease_id
+        .clone()
+        .context("external cognitive scope has no TaskRoleLease")?;
+    let mut launch_contract = HostLaunchContract {
+        invocation_id: invocation_id.clone(),
+        host_profile_ref: format!("external-agent-adapter:{}", call.host.as_str()),
+        mode: HostMode::Supervised,
+        project_id: Some(binding.project_id),
+        agent_session_id: Some(agent_session_id),
+        task_id: Some(binding.task_id),
+        work_item_id: Some(work_item_id),
+        role_lease_id: Some(role_lease_id.clone()),
+        work_lease_id: None,
+        worktree_lease_id: None,
+        planned_verifier_ref: scope.planned_verifier_ref.clone(),
+        cwd_or_worktree: canonical_path(&binding.repository),
+        baseline_commit: scope.baseline_commit.clone(),
+        allowed_paths: Vec::new(),
+        forbidden_paths: vec![
+            "provider-credential-roots".to_owned(),
+            "raw-database".to_owned(),
+            "truth-promotion".to_owned(),
+        ],
+        integration_bundle_ref: canonical_path(private_root),
+        mcp_config_ref: format!("runtime/{}/provider-mcp", call.call_id),
+        skill_bundle_ref: format!("runtime/{}/skills", call.call_id),
+        lifecycle_bridge_ref: "external-agent-adapter".to_owned(),
+        environment_allowlist: Vec::new(),
+        permission_profile: "external_auditor".to_owned(),
+        model_route_if_selected: Some(call.requested_model.clone()),
+        max_turns_or_steps: Some(24),
+        wall_clock_budget_seconds: 900,
+        cost_budget_if_supported: None,
+        session_id: None,
+        resume_policy: "fresh_only".to_owned(),
+        structured_output_schema_ref: Some(canonical_path(&output_schema_path)),
+        stdout_stderr_spool: format!("runtime/{}/spool", call.call_id),
+        artifact_manifest_ref: format!("runtime/{}/artifacts.json", call.call_id),
+        idempotency_key: idempotency_key.clone(),
+        expected_result_kind: "provider_execution_evidence".to_owned(),
+        contract_hash: String::new(),
+    };
+    launch_contract.contract_hash = blake3::hash(&serde_json::to_vec(&launch_contract)?)
+        .to_hex()
+        .to_string();
+    let invocation = AgentInvocationRequest {
+        invocation_id,
+        project_id: binding.project_id,
+        task_id: binding.task_id,
+        work_item_id,
+        requested_capabilities: vec![
+            "emit_candidate_observation".to_owned(),
+            "request_controller_review".to_owned(),
+        ],
+        role_lease_id,
+        work_lease_id: None,
+        packet_refs: Vec::new(),
+        expected_result_kind: "provider_execution_evidence".to_owned(),
+        verifier_ref: scope.planned_verifier_ref.unwrap_or_default(),
+        idempotency_key,
+    };
+    let execution = ExternalAgentExecutionRequest {
+        invocation,
+        launch_contract,
+        purpose: ExternalAgentPurpose::UnderstandingReader,
+        prompt_ref: canonical_path(prompt_path),
+        prompt_sha256: call.prompt_sha256.clone(),
+        output_schema_ref: canonical_path(&output_schema_path),
+        output_schema_sha256: call.provider_schema_sha256.clone(),
+        requested_model: call.requested_model.clone(),
+        max_turns_or_steps: 24,
+        timeout_profile_ref: format!("cognitive-field-{}-900s", call.host.as_str()),
+        allowed_provider_tools,
+        denied_provider_tools: vec![
+            "Bash".to_owned(),
+            "Edit".to_owned(),
+            "NotebookEdit".to_owned(),
+            "WebFetch".to_owned(),
+            "WebSearch".to_owned(),
+            "Write".to_owned(),
+        ],
+        expected_mcp_tool_names: expected_tools,
+        forbidden_mcp_server_names: vec!["eliot_surrealdb".to_owned(), "surrealdb".to_owned()],
+        read_only: true,
+        candidate_only: true,
+    };
+    validate_external_agent_execution_request(&execution)?;
+    Ok(execution)
+}
+
+fn validate_execution_request_binding(
+    execution: &ExternalAgentExecutionRequest,
+    call: &CognitiveFieldProviderCallPlan,
+    binding: &SealedPromptBinding,
+    prompt_path: &Path,
+    private_root: &Path,
+) -> Result<()> {
+    let schema_path = canonical_file(
+        &private_root.join("schemas").join("reader-provider.json"),
+        "Reader provider output schema",
+    )?;
+    ensure!(
+        execution.invocation.project_id == binding.project_id
+            && execution.invocation.task_id == binding.task_id
+            && execution.launch_contract.cwd_or_worktree == canonical_path(&binding.repository)
+            && execution.prompt_ref == canonical_path(prompt_path)
+            && execution.prompt_sha256 == call.prompt_sha256
+            && execution.output_schema_ref == canonical_path(&schema_path)
+            && execution.output_schema_sha256 == call.provider_schema_sha256
+            && execution.requested_model == call.requested_model
+            && execution.purpose == ExternalAgentPurpose::UnderstandingReader
+            && execution.read_only
+            && execution.candidate_only,
+        "stored external execution request differs from the sealed cognitive call"
+    );
+    Ok(())
+}
+
+fn sealed_prompt_binding(
+    prompt: &str,
+    suite: &CognitiveFieldSuite,
+    contract: &CognitiveFieldRunContract,
+    private_root: &Path,
+    call: &CognitiveFieldProviderCallPlan,
+) -> Result<SealedPromptBinding> {
+    ensure!(
+        call.executions.len() == 1,
+        "each external cognitive call must contain exactly one execution"
+    );
+    let execution = &call.executions[0];
+    let case = suite
+        .cases
+        .iter()
+        .find(|case| case.case_id == execution.case_id)
+        .context("external cognitive call names an unknown case")?;
+    let project_id: ProjectId = serde_json::from_value(Value::String(
+        prompt_field(prompt, "PROJECT_ID")?.to_owned(),
+    ))?;
+    let task_id: TaskId =
+        serde_json::from_value(Value::String(prompt_field(prompt, "TASK_ID")?.to_owned()))?;
+    let repository = canonical_directory(
+        Path::new(prompt_field(prompt, "REPOSITORY")?),
+        "external cognitive repository",
+    )?;
+    let worktrees_root = canonical_directory(
+        &private_root.join("worktrees"),
+        "private cognitive worktrees root",
+    )?;
+    ensure!(
+        prompt_field(prompt, "RUN")? == contract.run_id
+            && prompt_field(prompt, "CALL")? == call.call_id
+            && prompt_field(prompt, "CASE")? == execution.case_id
+            && prompt_field(prompt, "MEMORY_CONDITION")?
+                == condition_name(execution.memory_condition)
+            && prompt_field(prompt, "SOURCE_COMMIT")? == contract.source_commit
+            && repository.starts_with(&worktrees_root)
+            && git_commit(&repository)? == contract.source_commit,
+        "external cognitive prompt binding differs from the sealed run/call/worktree"
+    );
+    ensure!(
+        prompt.contains(&case.title),
+        "external cognitive prompt omits the exact public task"
+    );
+    let binding_path = private_root
+        .join("bindings")
+        .join(format!("{}.json", execution.case_id));
+    let binding: CognitiveCallScopeBinding = read_json(&binding_path)?;
+    ensure!(
+        binding.run_id == contract.run_id
+            && binding.case_id == execution.case_id
+            && binding.project_id == project_id
+            && binding.task_id == task_id,
+        "private scope binding differs from the provider prompt"
+    );
+    Ok(SealedPromptBinding {
+        project_id,
+        task_id,
+        repository,
+    })
+}
+
+fn prompt_field<'a>(prompt: &'a str, name: &str) -> Result<&'a str> {
+    let prefix = format!("{name}: ");
+    prompt
+        .lines()
+        .find_map(|line| line.strip_prefix(&prefix))
+        .filter(|value| !value.trim().is_empty())
+        .with_context(|| format!("provider prompt is missing {name}"))
+}
+
+fn cognitive_expected_mcp_tools(call: &CognitiveFieldProviderCallPlan) -> Vec<String> {
+    if call.executions[0].memory_condition == CognitiveMemoryCondition::MemoryFreeControl {
+        return Vec::new();
+    }
+    let mut tools = vec![
+        "eliot_current_state".to_owned(),
+        "eliot_fetch_l2".to_owned(),
+        "eliot_memory_influence_trace".to_owned(),
+        "eliot_recall_l0".to_owned(),
+    ];
+    tools.sort();
+    tools
+}
+
+fn cognitive_allowed_provider_tools(host: AgentHostId, expected: &[String]) -> Vec<String> {
+    if host == AgentHostId::Claude {
+        expected
+            .iter()
+            .map(|tool| format!("mcp__eliot-governor__{tool}"))
+            .collect()
+    } else {
+        expected.to_vec()
+    }
+}
+
+fn private_relative_ref(private_root: &Path, path: &Path) -> Result<String> {
+    let path = if path.exists() {
+        fs::canonicalize(path)?
+    } else {
+        absolute_path(path)?
+    };
+    let relative = path
+        .strip_prefix(private_root)
+        .context("private artifact escaped the certification root")?;
+    Ok(relative.to_string_lossy().replace('\\', "/"))
+}
+
+pub async fn seal_provider_plan(
+    config_path: &Path,
     report_root: &Path,
     private_root: &Path,
     calls_path: &Path,
@@ -1220,7 +1637,8 @@ pub fn seal_provider_plan(
         ensure_deterministic_evidence_complete(&suite, &report_root)?;
     }
 
-    let calls: Vec<CognitiveFieldProviderCallPlan> = read_json(&calls_path)?;
+    let mut calls: Vec<CognitiveFieldProviderCallPlan> = read_json(&calls_path)?;
+    bind_external_provider_calls(config_path, &suite, &contract, &private_root, &mut calls).await?;
     let role_evidence_plan =
         load_core_role_evidence_plan(&suite, &contract, &report_root, &private_root, &calls)?;
     let role_sources = role_evidence_plan
@@ -1283,6 +1701,208 @@ pub fn seal_provider_plan(
 }
 
 #[allow(clippy::too_many_lines)]
+pub async fn execute_provider(
+    config_path: &Path,
+    report_root: &Path,
+    private_root: &Path,
+    call_id: &str,
+) -> Result<()> {
+    let report_root = canonical_directory(report_root, "cognitive report root")?;
+    let private_root = canonical_directory(private_root, "private certification root")?;
+    ensure!(safe_segment(call_id), "provider call ID is unsafe");
+    let receipt_path = private_root
+        .join("receipts")
+        .join(format!("provider-{call_id}.json"));
+    if receipt_path.is_file() {
+        return record_provider(&report_root, &private_root, &receipt_path);
+    }
+    let contract: CognitiveFieldRunContract = read_json(&report_root.join("contract.json"))?;
+    let plan: CognitiveFieldProviderPlan = read_json(&report_root.join("provider-plan.json"))?;
+    validate_report_roots(&contract, &report_root, &private_root)?;
+    validate_provider_plan_hash(&plan)?;
+    let call = plan
+        .calls
+        .iter()
+        .find(|call| call.call_id == call_id)
+        .with_context(|| format!("provider call {call_id} is absent from the sealed plan"))?;
+    ensure!(
+        call.host != AgentHostId::Codex && call.role == CognitiveFieldRole::UnderstandingReader,
+        "execute-provider accepts only external UnderstandingReader calls"
+    );
+    let runtime = provider_runtime_contract(&private_root, call)?;
+    let ProviderRuntimeBinding::Current(sealed_runtime) = runtime else {
+        bail!("external cognitive call does not use the current provider runtime contract");
+    };
+    let sealed_runtime = *sealed_runtime;
+    let request_path = private_relative_file(
+        &private_root,
+        &call.execution_request_ref,
+        "external execution request",
+    )?;
+    let execution: ExternalAgentExecutionRequest = read_json(&request_path)?;
+    validate_external_agent_execution_request(&execution)?;
+    let preview =
+        crate::host_runtime::prepare_external_agent_runtime(config_path, call.host, &execution)?;
+    ensure!(
+        preview.adapter_id == call.adapter_id
+            && preview.adapter_version == call.adapter_version
+            && preview.runtime_contract == sealed_runtime,
+        "production adapter preview differs from the sealed cognitive runtime"
+    );
+    let agent_session_id = execution
+        .launch_contract
+        .agent_session_id
+        .context("external cognitive request has no AgentSession")?;
+    let adapter_request = AdapterRequest {
+        request_id: format!("cognitive-field-adapter:{call_id}"),
+        adapter_id: call.adapter_id.clone(),
+        requested_capability: AdapterCapability::EmitCandidateObservation,
+        context: AdapterContext {
+            project_id: execution.invocation.project_id,
+            task_id: execution.invocation.task_id,
+            session_id: Some(agent_session_id),
+            trace_id: format!("cognitive-field:{}:{call_id}", contract.run_id),
+            created_at: OffsetDateTime::now_utc(),
+        },
+        input: serde_json::to_value(&execution)?,
+    };
+    let supervisor = crate::host_runtime::production_external_agent_supervisor(config_path)?;
+    let result = supervisor
+        .execute(&call.adapter_id, adapter_request, None)
+        .await?;
+    ensure!(
+        result.status == AdapterResultStatus::Succeeded,
+        "production provider adapter failed: {}",
+        serde_json::to_string(&result)?
+    );
+    let evidence: ProviderExecutionEvidence = serde_json::from_value(
+        result
+            .output
+            .get("provider_execution_evidence")
+            .cloned()
+            .context("adapter result has no ProviderExecutionEvidence")?,
+    )?;
+    let observed_runtime: ProviderRuntimeContract = serde_json::from_value(
+        result
+            .output
+            .get("provider_runtime_contract")
+            .cloned()
+            .context("adapter result has no ProviderRuntimeContract")?,
+    )?;
+    ensure!(
+        observed_runtime == sealed_runtime
+            && evidence.runtime_contract_sha256 == call.runtime_contract_sha256
+            && evidence.requested_model == call.requested_model
+            && evidence.resolved_model == call.requested_model
+            && evidence.exit_code == Some(0)
+            && !evidence.unknown_outcome,
+        "adapter execution evidence differs from the sealed cognitive call"
+    );
+    let invocation_root = private_root.join("provider-invocations").join(call_id);
+    fs::create_dir_all(&invocation_root)?;
+    let stdout = copy_external_agent_blob(
+        config_path,
+        evidence.stdout_ref.as_deref(),
+        evidence.stdout_sha256.as_deref(),
+        &invocation_root.join("stdout.bin"),
+        "provider stdout",
+    )?;
+    let stderr = copy_external_agent_blob(
+        config_path,
+        evidence.stderr_ref.as_deref(),
+        evidence.stderr_sha256.as_deref(),
+        &invocation_root.join("stderr.bin"),
+        "provider stderr",
+    )?;
+    let structured = copy_external_agent_blob(
+        config_path,
+        evidence.structured_output_ref.as_deref(),
+        evidence.structured_output_sha256.as_deref(),
+        &invocation_root.join("structured.json"),
+        "provider structured output",
+    )?;
+    let structured_value: Value = serde_json::from_slice(&structured)?;
+    ensure!(
+        evidence.structured_output.as_ref() == Some(&structured_value),
+        "adapter structured spool differs from the parsed provider value"
+    );
+    let execution_key = call
+        .executions
+        .first()
+        .context("external provider call has no execution")?
+        .clone();
+    let mut observed_servers = evidence.observed_mcp_server_names.clone();
+    observed_servers.sort();
+    observed_servers.dedup();
+    let mut observed_tools = evidence.observed_mcp_tool_names.clone();
+    observed_tools.sort();
+    observed_tools.dedup();
+    let receipt = CognitiveFieldProviderEvidenceReceipt {
+        schema_version: COGNITIVE_FIELD_PROVIDER_EVIDENCE_SCHEMA_VERSION.to_owned(),
+        run_id: contract.run_id.clone(),
+        contract_hash: contract.contract_hash.clone(),
+        provider_plan_hash: plan.plan_hash.clone(),
+        source_commit: contract.source_commit.clone(),
+        call_id: call.call_id.clone(),
+        role: call.role,
+        host: call.host,
+        requested_model: call.requested_model.clone(),
+        resolved_model: evidence.resolved_model,
+        provider_session_id: evidence.provider_session_id,
+        provider_receipt_ref: format!("external-agent-result:{}", result.result_id),
+        provider_executable: sealed_runtime.provider_executable,
+        provider_executable_sha256: sealed_runtime.provider_executable_sha256,
+        prompt_path: call.prompt_ref.clone(),
+        prompt_sha256: call.prompt_sha256.clone(),
+        raw_stdout_path: private_relative_ref(&private_root, &invocation_root.join("stdout.bin"))?,
+        raw_stdout_sha256: sha256_bytes(&stdout),
+        raw_stderr_path: private_relative_ref(&private_root, &invocation_root.join("stderr.bin"))?,
+        raw_stderr_sha256: sha256_bytes(&stderr),
+        outputs: vec![CognitiveFieldProviderOutputReceipt {
+            execution: execution_key,
+            output_path: private_relative_ref(
+                &private_root,
+                &invocation_root.join("structured.json"),
+            )?,
+            output_sha256: sha256_bytes(&structured),
+        }],
+        provider_calls: 1,
+        exit_code: evidence.exit_code.unwrap_or(-1),
+        elapsed_ms: evidence.duration_ms,
+        timed_out: evidence.terminal_status == "timeout",
+        unknown_outcome: evidence.unknown_outcome,
+        controller_substitution: false,
+        oracle_exposed: false,
+        worker_transcript_exposed: false,
+        read_only: true,
+        runtime_contract_sha256: evidence.runtime_contract_sha256,
+        observed_mcp_server_names: observed_servers,
+        observed_mcp_tool_names: observed_tools,
+    };
+    write_new_or_same_json(&receipt_path, &receipt)?;
+    record_provider(&report_root, &private_root, &receipt_path)
+}
+
+fn copy_external_agent_blob(
+    config_path: &Path,
+    reference: Option<&str>,
+    expected_sha256: Option<&str>,
+    target: &Path,
+    label: &str,
+) -> Result<Vec<u8>> {
+    let reference = reference.with_context(|| format!("{label} reference is absent"))?;
+    let expected_sha256 = expected_sha256.with_context(|| format!("{label} SHA-256 is absent"))?;
+    let source = crate::host_runtime::external_agent_blob_path(config_path, reference)?;
+    let bytes = fs::read(source)?;
+    ensure!(
+        sha256_bytes(&bytes) == expected_sha256,
+        "{label} differs from AdapterSupervisor evidence"
+    );
+    write_new_or_same(target, &bytes)?;
+    Ok(bytes)
+}
+
+#[allow(clippy::too_many_lines)]
 pub fn record_provider(report_root: &Path, private_root: &Path, receipt_path: &Path) -> Result<()> {
     let report_root = canonical_directory(report_root, "cognitive report root")?;
     let private_root = canonical_directory(private_root, "private certification root")?;
@@ -1326,6 +1946,7 @@ pub fn record_provider(report_root: &Path, private_root: &Path, receipt_path: &P
             )
         })?;
     validate_provider_receipt_envelope(call, &receipt, &private_root)?;
+    let current_adapter_runtime = provider_runtime_contract(&private_root, call)?.is_current();
 
     let mut output_receipts = receipt
         .outputs
@@ -1360,10 +1981,10 @@ pub fn record_provider(report_root: &Path, private_root: &Path, receipt_path: &P
     enforce_provider_secret_boundary("provider stdout", &raw_stdout)?;
     enforce_provider_secret_boundary("provider stderr", &raw_stderr)?;
     let stdout_text = String::from_utf8_lossy(&raw_stdout);
-    let mut required_stdout_attestations = vec![
-        receipt.provider_session_id.as_str(),
-        receipt.provider_receipt_ref.as_str(),
-    ];
+    let mut required_stdout_attestations = vec![receipt.provider_session_id.as_str()];
+    if !current_adapter_runtime {
+        required_stdout_attestations.push(receipt.provider_receipt_ref.as_str());
+    }
     if suite.harness_version != COGNITIVE_CORE_QUALIFICATION_HARNESS_VERSION
         || receipt.host != AgentHostId::Codex
     {
@@ -2283,7 +2904,7 @@ fn validate_provider_calls(
 fn provider_runtime_contract(
     private_root: &Path,
     call: &CognitiveFieldProviderCallPlan,
-) -> Result<CognitiveProviderRuntimeContract> {
+) -> Result<ProviderRuntimeBinding> {
     ensure!(
         !call.runtime_contract_ref.trim().is_empty() && is_sha256(&call.runtime_contract_sha256),
         "new provider calls require a sealed runtime contract reference and SHA-256"
@@ -2293,15 +2914,59 @@ fn provider_runtime_contract(
         &call.runtime_contract_ref,
         "provider runtime contract",
     )?;
-    let contract: CognitiveProviderRuntimeContract = read_json(&path)?;
-    validate_runtime_contract(&contract)?;
+    let value: Value = read_json(&path)?;
+    let schema_version = value
+        .get("schema_version")
+        .and_then(Value::as_str)
+        .context("provider runtime contract has no schema version")?;
+    let binding = if schema_version == eliot_types::PROVIDER_RUNTIME_CONTRACT_SCHEMA_VERSION {
+        let contract: ProviderRuntimeContract = serde_json::from_value(value)?;
+        validate_provider_runtime_contract(&contract)?;
+        ProviderRuntimeBinding::Current(Box::new(contract))
+    } else {
+        let contract: CognitiveProviderRuntimeContract = serde_json::from_value(value)?;
+        validate_runtime_contract(&contract)?;
+        ProviderRuntimeBinding::Legacy(Box::new(contract))
+    };
     ensure!(
-        contract.runtime_contract_sha256 == call.runtime_contract_sha256
-            && contract.host == call.host
-            && contract.provider_executable_sha256 == call.expected_provider_executable_sha256,
+        binding.runtime_contract_sha256() == call.runtime_contract_sha256
+            && binding.host() == call.host
+            && binding.provider_executable_sha256() == call.expected_provider_executable_sha256,
         "provider runtime contract differs from the sealed call plan"
     );
-    Ok(contract)
+    if call.host != AgentHostId::Codex
+        && (!call.adapter_id.is_empty()
+            || !call.adapter_version.is_empty()
+            || !call.execution_request_ref.is_empty()
+            || !call.execution_request_sha256.is_empty())
+    {
+        ensure!(
+            binding.is_current()
+                && !call.adapter_id.trim().is_empty()
+                && !call.adapter_version.trim().is_empty()
+                && !call.execution_request_ref.trim().is_empty()
+                && is_sha256(&call.execution_request_sha256),
+            "external cognitive call lacks current production-adapter bindings"
+        );
+        let request_path = private_relative_file(
+            private_root,
+            &call.execution_request_ref,
+            "external execution request",
+        )?;
+        ensure!(
+            sha256_bytes(&fs::read(&request_path)?) == call.execution_request_sha256,
+            "external execution request hash differs from the sealed call"
+        );
+        let request: ExternalAgentExecutionRequest = read_json(&request_path)?;
+        validate_external_agent_execution_request(&request)?;
+        ensure!(
+            request.requested_model == call.requested_model
+                && request.prompt_sha256 == call.prompt_sha256
+                && request.output_schema_sha256 == call.provider_schema_sha256,
+            "external execution request differs from the sealed cognitive fields"
+        );
+    }
+    Ok(binding)
 }
 
 fn accepted_prior_executions(
@@ -3451,7 +4116,7 @@ fn validate_provider_receipt_envelope(
     );
     ensure!(
         receipt.runtime_contract_sha256 == call.runtime_contract_sha256
-            && receipt.runtime_contract_sha256 == runtime_contract.runtime_contract_sha256,
+            && receipt.runtime_contract_sha256 == runtime_contract.runtime_contract_sha256(),
         "provider receipt runtime hash differs from the sealed call"
     );
     ensure!(
@@ -3467,14 +4132,24 @@ fn validate_provider_receipt_envelope(
     );
     ensure!(
         receipt.observed_mcp_server_names.iter().all(|name| {
-            !runtime_contract.forbidden_mcp_server_names.contains(name)
+            !runtime_contract.forbidden_mcp_server_names().contains(name)
                 && !name.to_ascii_lowercase().contains("surreal")
         }) && runtime_contract
-            .expected_mcp_tool_names
+            .expected_mcp_tool_names()
             .iter()
             .all(|name| receipt.observed_mcp_tool_names.contains(name)),
         "provider receipt did not prove expected tools and absence of raw SurrealDB"
     );
+    if call
+        .executions
+        .iter()
+        .all(|execution| execution.memory_condition == CognitiveMemoryCondition::MemoryFreeControl)
+    {
+        ensure!(
+            receipt.observed_mcp_tool_names.is_empty(),
+            "memory-free control provider used an ELIOT MCP tool"
+        );
+    }
     if matches!(
         receipt.role,
         CognitiveFieldRole::CodexWorker | CognitiveFieldRole::CodexJudge
@@ -5208,6 +5883,10 @@ mod tests {
                 executions,
                 runtime_contract_ref,
                 runtime_contract_sha256,
+                adapter_id: String::new(),
+                adapter_version: String::new(),
+                execution_request_ref: String::new(),
+                execution_request_sha256: String::new(),
             });
             Ok(())
         };
@@ -5372,6 +6051,10 @@ mod tests {
                     executions,
                     runtime_contract_ref,
                     runtime_contract_sha256,
+                    adapter_id: String::new(),
+                    adapter_version: String::new(),
+                    execution_request_ref: String::new(),
+                    execution_request_sha256: String::new(),
                 });
             }
         }
@@ -5486,6 +6169,10 @@ mod tests {
                     executions,
                     runtime_contract_ref,
                     runtime_contract_sha256,
+                    adapter_id: String::new(),
+                    adapter_version: String::new(),
+                    execution_request_ref: String::new(),
+                    execution_request_sha256: String::new(),
                 });
             }
         }
@@ -5553,6 +6240,10 @@ mod tests {
     }
 
     #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one fixture exercises runtime, model, timeout, control-isolation, and binary-drift gates"
+    )]
     fn provider_receipt_rejects_aliases_unknown_outcomes_and_binary_drift()
     -> Result<(), Box<dyn std::error::Error>> {
         let private_root = std::env::temp_dir().join(format!(
@@ -5591,6 +6282,10 @@ mod tests {
             executions: vec![execution.clone()],
             runtime_contract_ref,
             runtime_contract_sha256: runtime_contract_sha256.clone(),
+            adapter_id: String::new(),
+            adapter_version: String::new(),
+            execution_request_ref: String::new(),
+            execution_request_sha256: String::new(),
         };
         let mut receipt = CognitiveFieldProviderEvidenceReceipt {
             schema_version: eliot_types::COGNITIVE_FIELD_PROVIDER_EVIDENCE_SCHEMA_VERSION
@@ -5633,7 +6328,13 @@ mod tests {
             observed_mcp_tool_names: Vec::new(),
         };
         validate_provider_receipt_envelope(&call, &receipt, &private_root)?;
-
+        let mut control_call = call.clone();
+        control_call.executions[0].memory_condition = CognitiveMemoryCondition::MemoryFreeControl;
+        receipt.observed_mcp_tool_names = vec!["eliot_recall_l0".to_owned()];
+        let control_result =
+            validate_provider_receipt_envelope(&control_call, &receipt, &private_root);
+        assert!(control_result.is_err());
+        receipt.observed_mcp_tool_names.clear();
         let accepted_runtime_sha256 = receipt.runtime_contract_sha256.clone();
         receipt.runtime_contract_sha256 = "e".repeat(64);
         assert!(validate_provider_receipt_envelope(&call, &receipt, &private_root).is_err());
@@ -5756,6 +6457,10 @@ mod tests {
             executions: vec![execution.clone()],
             runtime_contract_ref,
             runtime_contract_sha256: runtime_contract_sha256.clone(),
+            adapter_id: String::new(),
+            adapter_version: String::new(),
+            execution_request_ref: String::new(),
+            execution_request_sha256: String::new(),
         };
         let mut provider_plan = CognitiveFieldProviderPlan {
             schema_version: COGNITIVE_FIELD_PROVIDER_PLAN_SCHEMA_VERSION.to_owned(),

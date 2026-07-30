@@ -1739,6 +1739,15 @@ enum CognitiveFieldCommand {
         #[arg(long)]
         receipt: PathBuf,
     },
+    ExecuteProvider {
+        #[arg(long)]
+        report_root: PathBuf,
+        #[arg(long)]
+        private_root: PathBuf,
+        /// Exact `call_id` from the sealed provider plan.
+        #[arg(long)]
+        call_id: String,
+    },
     Grade {
         #[arg(long)]
         report_root: PathBuf,
@@ -2321,11 +2330,16 @@ async fn dispatch_command(
         Command::ExternalAgent { command } => {
             host_runtime::dispatch_external_agent(config, command).await
         }
-        Command::CognitiveField { command } => dispatch_cognitive_field_command(command),
+        Command::CognitiveField { command } => {
+            dispatch_cognitive_field_command(config, command).await
+        }
     }
 }
 
-fn dispatch_cognitive_field_command(command: CognitiveFieldCommand) -> Result<()> {
+async fn dispatch_cognitive_field_command(
+    config: &Path,
+    command: CognitiveFieldCommand,
+) -> Result<()> {
     match command {
         CognitiveFieldCommand::Validate { suite } => cognitive_field_runner::validate(&suite),
         CognitiveFieldCommand::Schema { kind } => cognitive_field_runner::schema(&kind),
@@ -2361,7 +2375,10 @@ fn dispatch_cognitive_field_command(command: CognitiveFieldCommand) -> Result<()
             report_root,
             private_root,
             calls,
-        } => cognitive_field_runner::seal_provider_plan(&report_root, &private_root, &calls),
+        } => {
+            cognitive_field_runner::seal_provider_plan(config, &report_root, &private_root, &calls)
+                .await
+        }
         CognitiveFieldCommand::CodexRuntimePreflight {
             provider_executable,
             worktree,
@@ -2386,6 +2403,14 @@ fn dispatch_cognitive_field_command(command: CognitiveFieldCommand) -> Result<()
             private_root,
             receipt,
         } => cognitive_field_runner::record_provider(&report_root, &private_root, &receipt),
+        CognitiveFieldCommand::ExecuteProvider {
+            report_root,
+            private_root,
+            call_id,
+        } => {
+            cognitive_field_runner::execute_provider(config, &report_root, &private_root, &call_id)
+                .await
+        }
         CognitiveFieldCommand::Grade {
             report_root,
             private_root,

@@ -818,6 +818,48 @@ pub(crate) async fn prepare_ul_auditor_scope(
     session_id: SessionId,
     client_instance: &str,
 ) -> Result<HostLaunchScope> {
+    prepare_auditor_scope(
+        config_path,
+        host,
+        project_id,
+        task_id,
+        session_id,
+        client_instance,
+        30,
+    )
+    .await
+}
+
+pub(crate) async fn prepare_cognitive_external_scope(
+    config_path: &Path,
+    host: AgentHostId,
+    project_id: ProjectId,
+    task_id: TaskId,
+    session_id: SessionId,
+    client_instance: &str,
+) -> Result<HostLaunchScope> {
+    prepare_auditor_scope(
+        config_path,
+        host,
+        project_id,
+        task_id,
+        session_id,
+        client_instance,
+        360,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn prepare_auditor_scope(
+    config_path: &Path,
+    host: AgentHostId,
+    project_id: ProjectId,
+    task_id: TaskId,
+    session_id: SessionId,
+    client_instance: &str,
+    ttl_minutes: i64,
+) -> Result<HostLaunchScope> {
     let agent_session_id = AgentSessionId::from_uuid(session_id.as_uuid());
     register_session(
         config_path,
@@ -835,7 +877,7 @@ pub(crate) async fn prepare_ul_auditor_scope(
         .copied()
         .map(str::to_owned)
         .collect(),
-        30,
+        ttl_minutes,
     )
     .await?;
     let role_lease_id = grant

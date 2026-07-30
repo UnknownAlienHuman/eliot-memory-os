@@ -381,6 +381,14 @@ pub struct CognitiveFieldProviderCallPlan {
     pub runtime_contract_ref: String,
     #[serde(default)]
     pub runtime_contract_sha256: String,
+    #[serde(default)]
+    pub adapter_id: String,
+    #[serde(default)]
+    pub adapter_version: String,
+    #[serde(default)]
+    pub execution_request_ref: String,
+    #[serde(default)]
+    pub execution_request_sha256: String,
 }
 
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]

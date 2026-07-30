@@ -63,7 +63,10 @@ use claude::{
     claude_surface_selector, install_claude_desktop, is_claude_desktop_host,
     uninstall_claude_desktop,
 };
-pub(crate) use external_agent::dispatch as dispatch_external_agent;
+pub(crate) use external_agent::{
+    dispatch as dispatch_external_agent, external_agent_blob_path, prepare_external_agent_runtime,
+    production_external_agent_supervisor,
+};
 use integration::{install, sha256_file, uninstall};
 #[cfg(test)]
 use integration::{merge_opencode_mcp_config, parse_opencode_jsonc, remove_opencode_mcp_config};
