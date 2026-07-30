@@ -15,9 +15,10 @@ use eliot_types::{
     AdapterAuthorityProfile, AdapterCapability, AdapterClass, AdapterError, AdapterHealth,
     AdapterLimits, AdapterObservation, AdapterRequest, AdapterResult, AdapterResultStatus,
     AdapterState, AgentResultEnvelope, AgentResultStatus, AgentRole, ExternalAgentExecutionRequest,
-    ExternalAgentPurpose, PROVIDER_RUNTIME_CONTRACT_SCHEMA_VERSION, ProcessExecutionPolicy,
-    ProviderExecutionEvidence, ProviderInvocationAttempt, ProviderInvocationState,
-    ProviderMcpServerContract, ProviderRuntimeContract, ProviderStructuredOutputMode, TaintClass,
+    ExternalAgentPurpose, OperationJobState, PROVIDER_RUNTIME_CONTRACT_SCHEMA_VERSION,
+    ProcessExecutionPolicy, ProviderExecutionEvidence, ProviderInvocationAttempt,
+    ProviderInvocationState, ProviderMcpServerContract, ProviderRuntimeContract,
+    ProviderStructuredOutputMode, TaintClass,
 };
 use std::collections::BTreeMap;
 use std::ffi::OsStr;
@@ -82,6 +83,12 @@ struct PreparedExternalAgentExecution {
     plan: ProviderCommandPlan,
     environment: BTreeMap<String, String>,
     runtime_contract: ProviderRuntimeContract,
+}
+
+struct CanonicalAgentResultWrite {
+    key: String,
+    receipt_kind: &'static str,
+    body: Value,
 }
 
 pub(crate) fn production_external_agent_supervisor(
@@ -654,7 +661,12 @@ async fn run_mcp_smoke(config_path: &Path, host: AgentHostId, model: &str) -> Re
     let evidence = result
         .output
         .get("provider_execution_evidence")
-        .context("adapter smoke returned no ProviderExecutionEvidence")?;
+        .with_context(|| {
+            format!(
+                "adapter smoke returned no ProviderExecutionEvidence; status={:?}; error={:?}; output={}",
+                result.status, result.error, result.output
+            )
+        })?;
     let structured = evidence
         .get("structured_output")
         .context("adapter smoke returned no structured output")?;
@@ -1040,6 +1052,8 @@ impl ExternalAgentAdapterCore {
         );
         let journal = ProviderInvocationJournal::new(&runtime_root);
         let payload_hash = sha256_bytes(&serde_json::to_vec(&execution)?);
+        let execution_request_path =
+            persist_external_execution_request(&runtime_root, &execution, &payload_hash)?;
         let mut attempt = journal.create(ProviderInvocationAttempt {
             invocation_attempt_id: attempt_id.clone(),
             provider: self.host.as_str().to_owned(),
@@ -1070,7 +1084,7 @@ impl ExternalAgentAdapterCore {
             exit_code_or_signal: None,
             process_or_job_identity: None,
             quota_or_cost_if_known: None,
-            original_closeout_ref: None,
+            original_closeout_ref: Some(path_string(&execution_request_path)),
         })?;
 
         let reservation_owner = ProviderCallReservationOwner::new(&runtime_root);
@@ -1130,6 +1144,40 @@ impl ExternalAgentAdapterCore {
             )],
         )?;
 
+        let broker_job_id = match enqueue_external_agent_broker_invocation(
+            &self.config_path,
+            self.host,
+            &execution,
+        )
+        .await
+        {
+            Ok(job_id) => job_id,
+            Err(error) => {
+                let _ = reservation_owner.release_pre_dispatch(
+                    &reservation.reservation_id,
+                    "HostBroker admission failed before provider dispatch",
+                );
+                let _ = journal.transition(
+                    &mut attempt,
+                    ProviderInvocationState::PreDispatchAborted,
+                    vec![format!("host_broker_admission_failed:{error}")],
+                );
+                return Err(error);
+            }
+        };
+        if let Err(error) = start_external_agent_broker_job(&self.config_path, &broker_job_id).await
+        {
+            let _ = reservation_owner.release_pre_dispatch(
+                &reservation.reservation_id,
+                "HostBroker failed before provider dispatch",
+            );
+            let _ = journal.transition(
+                &mut attempt,
+                ProviderInvocationState::PreDispatchAborted,
+                vec![format!("host_broker_start_failed:{error}")],
+            );
+            return Err(error);
+        }
         let worktree_before = worktree_snapshot_if_git(&cwd)?;
         let mut command = Command::new(&executable);
         command
@@ -1387,37 +1435,72 @@ impl ExternalAgentAdapterCore {
             ProviderInvocationState::CompletedCaptured,
             vec![structured_capture.blob_ref.relative_path.clone()],
         )?;
-        journal.transition(
-            &mut attempt,
-            ProviderInvocationState::ReviewNormalized,
-            vec![format!("provider-result:{}", request.request_id)],
-        )?;
-        reservation_owner.complete(
-            &reservation.reservation_id,
-            &format!("provider-result:{}", request.request_id),
-        )?;
-        journal.persist(&attempt)?;
         let provider_hash_after = engine_anyhow(sha256_file(&executable))?;
         if provider_hash_after != provider_hash_before {
+            let _ = journal.transition(
+                &mut attempt,
+                ProviderInvocationState::CleanupFailedAfterComplete,
+                vec!["provider_executable_hash_changed".to_owned()],
+            );
+            let _ = reservation_owner.fail_after_dispatch(
+                &reservation.reservation_id,
+                "provider executable hash changed during execution",
+            );
             return Err(eliot_engine::EngineError::WriteRejected(
                 "provider executable hash changed during execution".to_owned(),
             ));
         }
-        self.terminal_result(
-            &request,
-            &execution,
-            &runtime_contract,
-            &process,
-            &stdout_capture,
-            &stderr_capture,
-            Some(&structured_capture),
-            Some(parsed),
-            AgentResultStatus::Succeeded,
-            AdapterResultStatus::Succeeded,
-            false,
-            None,
-        )
-        .await
+        let mut result = self
+            .terminal_result(
+                &request,
+                &execution,
+                &runtime_contract,
+                &process,
+                &stdout_capture,
+                &stderr_capture,
+                Some(&structured_capture),
+                Some(parsed),
+                AgentResultStatus::Succeeded,
+                AdapterResultStatus::Succeeded,
+                false,
+                None,
+            )
+            .await?;
+        let review_ref = format!("provider-result:{}", result.result_id);
+        let closeout = reservation_owner
+            .complete(&reservation.reservation_id, &review_ref)
+            .and_then(|_| {
+                journal.transition(
+                    &mut attempt,
+                    ProviderInvocationState::ReviewNormalized,
+                    vec![review_ref.clone()],
+                )
+            });
+        if let Err(error) = closeout {
+            let _ = journal.transition(
+                &mut attempt,
+                ProviderInvocationState::CleanupFailedAfterComplete,
+                vec![format!("post_canonical_closeout_failed:{error}")],
+            );
+            result.status = AdapterResultStatus::Failed;
+            result.error = Some(AdapterError {
+                code: "adapter_closeout_failed".to_owned(),
+                message: format!(
+                    "provider result is canonical, but reservation/journal closeout failed: {error}"
+                ),
+                retryable: false,
+            });
+            if let Some(output) = result.output.as_object_mut() {
+                output.insert(
+                    "adapter_closeout".to_owned(),
+                    json!({
+                        "status": "cleanup_failed_after_complete",
+                        "error": error.to_string(),
+                    }),
+                );
+            }
+        }
+        Ok(result)
     }
 
     #[allow(
@@ -1608,8 +1691,8 @@ impl ExternalAgentAdapterCore {
                 .and_then(|parsed| parsed.token_or_cost_telemetry.clone()),
             duration_ms: process.duration_ms,
         };
-        let mut agent_result = AgentResultEnvelope {
-            result_id: format!("external-agent-result-{}", Uuid::new_v4()),
+        let agent_result = AgentResultEnvelope {
+            result_id: deterministic_external_result_id(execution),
             invocation_id: execution.invocation.invocation_id.clone(),
             host_id: self.host,
             host_session_id: parsed
@@ -1650,35 +1733,9 @@ impl ExternalAgentAdapterCore {
             provider_output_hash: evidence.structured_output_sha256.clone(),
             canonical_receipt: None,
         };
-        let body = json!({
-            "agent_result": agent_result,
-            "provider_execution_evidence": evidence,
-            "provider_runtime_contract": runtime_contract,
-        });
-        let session_id = execution.launch_contract.agent_session_id.ok_or_else(|| {
-            eliot_engine::EngineError::WriteRejected(
-                "external result lacks governed AgentSession".to_owned(),
-            )
-        })?;
-        let (canonical_receipt, _) = write_canonical_host_observation(
-            &self.config_path,
-            execution.invocation.project_id,
-            execution.invocation.task_id,
-            session_id,
-            &format!(
-                "external-agent-result:{}",
-                execution.invocation.invocation_id
-            ),
-            "external_agent_candidate_result",
-            &body,
-        )
-        .await
-        .map_err(|error| {
-            eliot_engine::EngineError::WriteRejected(format!(
-                "canonical external-agent observation failed: {error}"
-            ))
-        })?;
-        agent_result.canonical_receipt = Some(canonical_receipt);
+        let agent_result =
+            canonicalize_external_agent_broker_result(&self.config_path, execution, agent_result)
+                .await?;
         let output = json!({
             "agent_result": agent_result,
             "provider_execution_evidence": evidence,
@@ -1736,6 +1793,222 @@ impl ExternalAgentAdapterCore {
             created_at: OffsetDateTime::now_utc(),
         })
     }
+}
+
+fn deterministic_external_result_id(execution: &ExternalAgentExecutionRequest) -> String {
+    deterministic_external_result_id_from_parts(
+        &execution.invocation.invocation_id,
+        &execution.invocation.idempotency_key,
+    )
+}
+
+fn deterministic_external_result_id_from_parts(
+    invocation_id: impl AsRef<str>,
+    idempotency_key: impl AsRef<str>,
+) -> String {
+    let semantic_key = format!("{}\0{}", invocation_id.as_ref(), idempotency_key.as_ref());
+    format!(
+        "external-agent-result:{}",
+        blake3::hash(semantic_key.as_bytes()).to_hex()
+    )
+}
+
+fn canonical_agent_result_write(
+    result: &AgentResultEnvelope,
+) -> Result<CanonicalAgentResultWrite, eliot_engine::EngineError> {
+    if result.canonical_receipt.is_some() {
+        return Err(eliot_engine::EngineError::WriteRejected(
+            "external AgentResultEnvelope must be unreceipted before canonical write".to_owned(),
+        ));
+    }
+    Ok(CanonicalAgentResultWrite {
+        key: format!("managed-provider-result:{}", result.result_id),
+        receipt_kind: "agent_result",
+        body: serde_json::to_value(result)?,
+    })
+}
+
+fn existing_receipted_external_result(
+    existing: Option<&AgentResultEnvelope>,
+    unreceipted_result: &AgentResultEnvelope,
+) -> Result<Option<AgentResultEnvelope>, eliot_engine::EngineError> {
+    let Some(existing) = existing else {
+        return Ok(None);
+    };
+    let mut existing_semantic = existing.clone();
+    existing_semantic.canonical_receipt = None;
+    if existing_semantic != *unreceipted_result {
+        return Err(eliot_engine::EngineError::WriteRejected(
+            "external result replay changed the AgentResultEnvelope".to_owned(),
+        ));
+    }
+    Ok(existing
+        .canonical_receipt
+        .is_some()
+        .then(|| existing.clone()))
+}
+
+fn persist_external_execution_request(
+    root: &Path,
+    execution: &ExternalAgentExecutionRequest,
+    payload_hash: &str,
+) -> Result<PathBuf, eliot_engine::EngineError> {
+    let path = root
+        .join("external-agent-requests")
+        .join(format!("{payload_hash}.json"));
+    engine_anyhow(atomic_write_json(&path, execution))?;
+    Ok(path)
+}
+
+async fn enqueue_external_agent_broker_invocation(
+    config_path: &Path,
+    host: AgentHostId,
+    execution: &ExternalAgentExecutionRequest,
+) -> Result<String, eliot_engine::EngineError> {
+    let root = runtime_root(config_path);
+    let session_id = execution.launch_contract.agent_session_id.ok_or_else(|| {
+        eliot_engine::EngineError::WriteRejected(
+            "external invocation lacks governed AgentSession".to_owned(),
+        )
+    })?;
+    let mut state = engine_anyhow(delegation_runtime::load_state(&root))?;
+    let binding = state
+        .agent_host_sessions
+        .iter()
+        .find(|binding| binding.agent_session_id == session_id)
+        .cloned()
+        .ok_or_else(|| {
+            eliot_engine::EngineError::WriteRejected(
+                "external invocation has no exact AgentSessionHostBinding".to_owned(),
+            )
+        })?;
+    if binding.host_identity.host_id != host {
+        return Err(eliot_engine::EngineError::WriteRejected(
+            "external invocation host differs from its session binding".to_owned(),
+        ));
+    }
+    let profile = HostProfileService.connected(&binding);
+    let work_lease_active = if let Some(work_lease_id) = execution.invocation.work_lease_id {
+        let work_state = engine_anyhow(delegation_runtime::load_work_state(&root))?;
+        work_state
+            .leases
+            .iter()
+            .find(|lease| lease.work_lease_id == work_lease_id)
+            .is_some_and(work_lease_is_active)
+    } else {
+        false
+    };
+    let job = HostBrokerService.enqueue(
+        &mut state,
+        &execution.invocation,
+        &profile,
+        work_lease_active,
+    )?;
+    super::managed::write_canonical_managed_invocation_request(
+        config_path,
+        &state,
+        &execution.invocation,
+    )
+    .await
+    .map_err(anyhow_engine)?;
+    super::managed::write_canonical_managed_job(config_path, &state, &job)
+        .await
+        .map_err(anyhow_engine)?;
+    engine_anyhow(delegation_runtime::save_host_broker_state(&root, &state))?;
+    Ok(job.job_id)
+}
+
+async fn start_external_agent_broker_job(
+    config_path: &Path,
+    job_id: &str,
+) -> Result<(), eliot_engine::EngineError> {
+    let root = runtime_root(config_path);
+    let mut state = engine_anyhow(delegation_runtime::load_state(&root))?;
+    let job = state
+        .operation_jobs
+        .iter_mut()
+        .find(|job| job.job_id == job_id)
+        .ok_or_else(|| {
+            eliot_engine::EngineError::WriteRejected(
+                "external invocation OperationJob disappeared before dispatch".to_owned(),
+            )
+        })?;
+    if job.state == OperationJobState::Queued {
+        HostBrokerService.transition(job, OperationJobState::Running, None)?;
+    } else if job.state != OperationJobState::Running {
+        return Err(eliot_engine::EngineError::WriteRejected(
+            "external invocation OperationJob is not dispatchable".to_owned(),
+        ));
+    }
+    let job = job.clone();
+    super::managed::write_canonical_managed_job(config_path, &state, &job)
+        .await
+        .map_err(anyhow_engine)?;
+    engine_anyhow(delegation_runtime::save_host_broker_state(&root, &state))
+}
+
+async fn canonicalize_external_agent_broker_result(
+    config_path: &Path,
+    execution: &ExternalAgentExecutionRequest,
+    unreceipted_result: AgentResultEnvelope,
+) -> Result<AgentResultEnvelope, eliot_engine::EngineError> {
+    let root = runtime_root(config_path);
+    let mut state = engine_anyhow(delegation_runtime::load_state(&root))?;
+    let existing = state
+        .agent_results
+        .iter()
+        .find(|result| result.result_id == unreceipted_result.result_id);
+    if let Some(existing) = existing_receipted_external_result(existing, &unreceipted_result)? {
+        return Ok(existing);
+    }
+    let mut receipted_result = HostBrokerService.record_result(&mut state, unreceipted_result)?;
+    let session_id = execution.launch_contract.agent_session_id.ok_or_else(|| {
+        eliot_engine::EngineError::WriteRejected(
+            "external result lacks governed AgentSession".to_owned(),
+        )
+    })?;
+    let canonical_write = canonical_agent_result_write(&receipted_result)?;
+    let (canonical_receipt, _) = write_canonical_host_observation(
+        config_path,
+        execution.invocation.project_id,
+        execution.invocation.task_id,
+        session_id,
+        &canonical_write.key,
+        canonical_write.receipt_kind,
+        &canonical_write.body,
+    )
+    .await
+    .map_err(|error| {
+        eliot_engine::EngineError::WriteRejected(format!(
+            "canonical external-agent observation failed: {error}"
+        ))
+    })?;
+    receipted_result.canonical_receipt = Some(canonical_receipt);
+    let stored = state
+        .agent_results
+        .iter_mut()
+        .find(|result| result.result_id == receipted_result.result_id)
+        .ok_or_else(|| {
+            eliot_engine::EngineError::WriteRejected(
+                "external AgentResultEnvelope disappeared before receipt binding".to_owned(),
+            )
+        })?;
+    *stored = receipted_result.clone();
+    let job = state
+        .operation_jobs
+        .iter()
+        .find(|job| job.invocation_id == receipted_result.invocation_id)
+        .cloned()
+        .ok_or_else(|| {
+            eliot_engine::EngineError::WriteRejected(
+                "external AgentResultEnvelope has no matching OperationJob".to_owned(),
+            )
+        })?;
+    super::managed::write_canonical_managed_job(config_path, &state, &job)
+        .await
+        .map_err(anyhow_engine)?;
+    engine_anyhow(delegation_runtime::save_host_broker_state(&root, &state))?;
+    Ok(receipted_result)
 }
 
 struct MaterializedMcp {
@@ -2367,4 +2640,61 @@ pub(super) fn external_adapter_manifest_fixture(
     host: AgentHostId,
 ) -> eliot_types::CapabilityManifest {
     provider_manifest(host, adapter_id(host), None)
+}
+
+#[cfg(test)]
+pub(super) fn canonical_external_result_contract_fixture() -> Result<Value> {
+    let result = AgentResultEnvelope {
+        result_id: deterministic_external_result_id_from_parts(
+            "fixture-invocation",
+            "fixture-idempotency",
+        ),
+        invocation_id: "fixture-invocation".to_owned(),
+        host_id: AgentHostId::Claude,
+        host_session_id: Some("fixture-provider-session".to_owned()),
+        status: AgentResultStatus::Succeeded,
+        summary: "fixture candidate result".to_owned(),
+        artifact_refs: Vec::new(),
+        evidence_refs: vec!["fixture-evidence".to_owned()],
+        verifier_refs: vec!["fixture-verifier".to_owned()],
+        candidate_only: true,
+        exit_status: Some(0),
+        token_or_cost_telemetry: None,
+        unknown_outcome_evidence_refs: Vec::new(),
+        supersedes_result_id: None,
+        provider_output_hash: Some("a".repeat(64)),
+        canonical_receipt: None,
+    };
+    let write = canonical_agent_result_write(&result)
+        .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+    let mut receipted = result.clone();
+    receipted.canonical_receipt = Some(eliot_types::WriteReceiptRef {
+        receipt_id: eliot_types::ReceiptId::new_v7(),
+        write_id: eliot_types::WriteId::new_v7(),
+    });
+    let accepted_replay = existing_receipted_external_result(Some(&receipted), &result)
+        .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+    let mut changed = result.clone();
+    changed.summary.push_str(" changed");
+    let changed_replay_rejected =
+        existing_receipted_external_result(Some(&receipted), &changed).is_err();
+    Ok(json!({
+        "first_result_id": result.result_id,
+        "same_result_id": deterministic_external_result_id_from_parts(
+            "fixture-invocation",
+            "fixture-idempotency",
+        ),
+        "different_result_id": deterministic_external_result_id_from_parts(
+            "fixture-invocation",
+            "different-idempotency",
+        ),
+        "key": write.key,
+        "receipt_kind": write.receipt_kind,
+        "body": write.body,
+        "receipted_replay_accepted": accepted_replay
+            .as_ref()
+            .and_then(|result| result.canonical_receipt.as_ref())
+            .is_some(),
+        "changed_replay_rejected": changed_replay_rejected,
+    }))
 }

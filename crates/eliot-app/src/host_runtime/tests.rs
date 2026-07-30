@@ -1013,6 +1013,59 @@ fn production_external_adapters_share_candidate_only_authority() {
     }
 }
 
+#[test]
+fn external_adapter_uses_deterministic_canonical_agent_result_contract() -> anyhow::Result<()> {
+    let contract = super::external_agent::canonical_external_result_contract_fixture()?;
+    let result_id = contract["first_result_id"]
+        .as_str()
+        .context("fixture result ID")?;
+    assert_eq!(contract["same_result_id"].as_str(), Some(result_id));
+    assert_ne!(contract["different_result_id"].as_str(), Some(result_id));
+    assert_eq!(contract["receipt_kind"], "agent_result");
+    assert_eq!(
+        contract["key"].as_str(),
+        Some(format!("managed-provider-result:{result_id}").as_str())
+    );
+    assert_eq!(contract["body"]["result_id"], result_id);
+    assert!(contract["body"].get("agent_result").is_none());
+    assert!(
+        contract["body"]
+            .get("provider_execution_evidence")
+            .is_none()
+    );
+    assert_eq!(contract["body"]["candidate_only"], true);
+    assert!(contract["body"]["canonical_receipt"].is_null());
+    assert_eq!(contract["receipted_replay_accepted"], true);
+    assert_eq!(contract["changed_replay_rejected"], true);
+    Ok(())
+}
+
+#[test]
+fn external_auditor_role_adds_broker_capabilities_without_changing_mcp_tools() {
+    let scope = super::external_auditor_capability_scope();
+    assert_eq!(scope.len(), crate::mcp_stdio::PART_E_WORKER_TOOLS.len() + 2);
+    for tool in crate::mcp_stdio::PART_E_WORKER_TOOLS {
+        assert_eq!(
+            scope.iter().filter(|capability| capability == tool).count(),
+            1
+        );
+    }
+    assert_eq!(
+        scope
+            .iter()
+            .filter(|capability| capability.as_str() == "emit_candidate_observation")
+            .count(),
+        1
+    );
+    assert_eq!(
+        scope
+            .iter()
+            .filter(|capability| capability.as_str() == "request_controller_review")
+            .count(),
+        1
+    );
+}
+
 /// Only the mutation entry point gates. Observations of an attached task
 /// are evidence, not decisions, and must not deny.
 #[test]

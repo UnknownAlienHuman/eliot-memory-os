@@ -867,16 +867,13 @@ async fn prepare_auditor_scope(
         Some(agent_session_id.to_string()),
         Some(client_instance.to_owned()),
     )?;
+    let capability_scope = external_auditor_capability_scope();
     let grant = grant_role(
         config_path,
         &task_id.to_string(),
         &agent_session_id.to_string(),
         "auditor",
-        crate::mcp_stdio::PART_E_WORKER_TOOLS
-        .iter()
-        .copied()
-        .map(str::to_owned)
-        .collect(),
+        capability_scope,
         ttl_minutes,
     )
     .await?;
@@ -901,6 +898,19 @@ async fn prepare_auditor_scope(
             "truth-promotion".to_owned(),
         ],
     })
+}
+
+fn external_auditor_capability_scope() -> Vec<String> {
+    let mut capability_scope = crate::mcp_stdio::PART_E_WORKER_TOOLS
+        .iter()
+        .copied()
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    capability_scope.extend([
+        "emit_candidate_observation".to_owned(),
+        "request_controller_review".to_owned(),
+    ]);
+    capability_scope
 }
 
 pub(crate) async fn invoke_ul_scoped_reasoning(
