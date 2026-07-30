@@ -1,10 +1,27 @@
 use crate::EngineError;
 use eliot_types::{
     ExternalAgentExecutionRequest, ExternalAgentPurpose, PROVIDER_RUNTIME_CONTRACT_SCHEMA_VERSION,
-    ProviderRuntimeContract,
+    ProviderRuntimeContract, ProviderStructuredOutputMode,
 };
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use sha2::{Digest as _, Sha256};
+use std::collections::BTreeMap;
 use std::path::{Component, Path};
+
+mod antigravity;
+mod claude_code;
+mod opencode;
+mod structured_output;
+
+pub use antigravity::{
+    AntigravityCommandInput, build_antigravity_command, parse_antigravity_output,
+};
+pub use claude_code::{
+    ClaudeCodeCommandInput, build_claude_code_command, parse_claude_code_stream,
+};
+pub use opencode::{OpenCodeCommandInput, build_opencode_command, parse_opencode_stream};
+pub use structured_output::validate_json_schema_instance;
 
 const RAW_DATABASE_NAMES: [&str; 2] = ["eliot_surrealdb", "surrealdb"];
 const SECRET_NAME_FRAGMENTS: [&str; 7] = [
@@ -16,6 +33,26 @@ const SECRET_NAME_FRAGMENTS: [&str; 7] = [
     "authorization",
     "credential",
 ];
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderCommandPlan {
+    pub argv: Vec<String>,
+    pub nonsecret_environment: BTreeMap<String, String>,
+    pub structured_output_mode: ProviderStructuredOutputMode,
+    pub model_selection_mechanism: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderTerminalResult {
+    pub structured_output: Value,
+    pub resolved_model: String,
+    pub provider_session_id: String,
+    pub terminal_status: String,
+    pub observed_tool_names: Vec<String>,
+    pub token_or_cost_telemetry: Option<String>,
+}
 
 pub fn normalize_provider_runtime_contract(contract: &mut ProviderRuntimeContract) {
     contract
@@ -203,7 +240,7 @@ fn validate_canonical_absolute_path(value: &str, label: &str) -> Result<(), Engi
     Ok(())
 }
 
-fn reject_raw_database_surface<'a>(
+pub fn reject_raw_database_surface<'a>(
     values: impl Iterator<Item = &'a str>,
 ) -> Result<(), EngineError> {
     if values
@@ -231,6 +268,6 @@ fn sort_dedup(values: &mut Vec<String>) {
     values.dedup();
 }
 
-fn rejected<T>(message: impl Into<String>) -> Result<T, EngineError> {
+pub(super) fn rejected<T>(message: impl Into<String>) -> Result<T, EngineError> {
     Err(EngineError::WriteRejected(message.into()))
 }

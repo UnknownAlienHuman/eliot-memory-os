@@ -117,8 +117,12 @@ pub use eval::{
     MetaPolicyExecutor, family_slug, harness_experiment_record, runnable_k0_families,
 };
 pub use external_agent::{
-    computed_provider_runtime_contract_sha256, normalize_provider_runtime_contract,
-    seal_provider_runtime_contract, validate_external_agent_execution_request,
+    AntigravityCommandInput, ClaudeCodeCommandInput, OpenCodeCommandInput, ProviderCommandPlan,
+    ProviderTerminalResult, build_antigravity_command, build_claude_code_command,
+    build_opencode_command, computed_provider_runtime_contract_sha256,
+    normalize_provider_runtime_contract, parse_antigravity_output, parse_claude_code_stream,
+    parse_opencode_stream, reject_raw_database_surface, seal_provider_runtime_contract,
+    validate_external_agent_execution_request, validate_json_schema_instance,
     validate_provider_runtime_contract,
 };
 pub use external_review::{

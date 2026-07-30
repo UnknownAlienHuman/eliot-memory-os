@@ -986,6 +986,33 @@ fn an_unbound_session_is_never_blocked() {
     }
 }
 
+#[test]
+fn production_external_adapters_share_candidate_only_authority() {
+    for host in [
+        AgentHostId::Claude,
+        AgentHostId::Antigravity,
+        AgentHostId::OpenCode,
+    ] {
+        let manifest = super::external_agent::external_adapter_manifest_fixture(host);
+        assert_eq!(
+            manifest.adapter_class,
+            eliot_types::AdapterClass::ExternalCandidate
+        );
+        assert!(!manifest.authority_profile.can_write_truth);
+        assert!(!manifest.authority_profile.can_request_patch);
+        assert!(!manifest.authority_profile.can_finish_task);
+        assert!(!manifest.process_policy.inherit_environment);
+        assert!(manifest.capabilities.iter().all(|capability| {
+            !matches!(
+                capability,
+                eliot_types::AdapterCapability::WriteTruth
+                    | eliot_types::AdapterCapability::RequestPatch
+                    | eliot_types::AdapterCapability::FinishTask
+            )
+        }));
+    }
+}
+
 /// Only the mutation entry point gates. Observations of an attached task
 /// are evidence, not decisions, and must not deny.
 #[test]

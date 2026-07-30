@@ -50,6 +50,8 @@ const CLAUDE_LEGACY_GLOBAL_MANIFEST: &str = "eliot-global-install.json";
 const CLAUDE_DESKTOP_HOST: &str = "claude-desktop";
 
 mod claude;
+mod external_agent;
+mod external_agent_process;
 mod integration;
 mod managed;
 #[cfg(test)]
@@ -61,6 +63,7 @@ use claude::{
     claude_surface_selector, install_claude_desktop, is_claude_desktop_host,
     uninstall_claude_desktop,
 };
+pub(crate) use external_agent::dispatch as dispatch_external_agent;
 use integration::{install, sha256_file, uninstall};
 #[cfg(test)]
 use integration::{merge_opencode_mcp_config, parse_opencode_jsonc, remove_opencode_mcp_config};

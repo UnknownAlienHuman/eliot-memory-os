@@ -1,11 +1,14 @@
 use eliot_engine::{
-    computed_provider_runtime_contract_sha256, normalize_provider_runtime_contract,
+    AntigravityCommandInput, ClaudeCodeCommandInput, build_antigravity_command,
+    build_claude_code_command, computed_provider_runtime_contract_sha256,
+    normalize_provider_runtime_contract, parse_antigravity_output, parse_claude_code_stream,
     seal_provider_runtime_contract, validate_provider_runtime_contract,
 };
 use eliot_types::{
     AgentHostId, ExternalAgentPurpose, PROVIDER_RUNTIME_CONTRACT_SCHEMA_VERSION,
     ProviderMcpServerContract, ProviderRuntimeContract, ProviderStructuredOutputMode,
 };
+use serde_json::json;
 use std::collections::BTreeMap;
 use std::error::Error;
 
@@ -57,6 +60,120 @@ fn external_agent_runtime_rejects_hash_mismatch() -> TestResult {
     seal_provider_runtime_contract(&mut contract)?;
     contract.provider_argv.push("--changed".to_owned());
     assert!(validate_provider_runtime_contract(&contract).is_err());
+    Ok(())
+}
+
+#[test]
+fn claude_command_and_terminal_parser_are_exact_and_fail_closed() -> TestResult {
+    let schema = json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["status", "resolved_model"],
+        "properties": {
+            "status": {"const": "ready"},
+            "resolved_model": {"const": "claude-opus-5"}
+        }
+    });
+    let plan = build_claude_code_command(&ClaudeCodeCommandInput {
+        requested_model: "claude-opus-5".to_owned(),
+        output_schema: schema.clone(),
+        mcp_config_path: r"C:\runtime\mcp.json".to_owned(),
+        allowed_tools: vec!["mcp__eliot-governor__current_state".to_owned()],
+        denied_tools: vec!["Bash".to_owned(), "Write".to_owned()],
+        max_turns: 2,
+        prompt: "Call current_state once.".to_owned(),
+    })?;
+    assert_eq!(plan.argv.first().map(String::as_str), Some("-p"));
+    assert_eq!(
+        plan.argv
+            .windows(2)
+            .filter(|pair| pair[0] == "--mcp-config")
+            .count(),
+        1
+    );
+    assert!(plan.argv.iter().any(|arg| arg == "--strict-mcp-config"));
+    assert!(plan.argv.iter().any(|arg| arg == "--disallowedTools"));
+    assert!(!plan.argv.iter().any(|arg| arg.contains("Claude.exe")));
+
+    let stream = concat!(
+        "{\"type\":\"assistant\",\"output\":{\"status\":\"wrong-intermediate\"}}\n",
+        "{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,",
+        "\"session_id\":\"claude-session-1\",\"model\":\"claude-opus-5\",",
+        "\"structured_output\":{\"status\":\"ready\",\"resolved_model\":\"claude-opus-5\"}}\n"
+    );
+    let parsed = parse_claude_code_stream(stream.as_bytes(), "claude-opus-5", &schema)?;
+    assert_eq!(parsed.provider_session_id, "claude-session-1");
+    assert!(parse_claude_code_stream(stream.as_bytes(), "claude-opus-5.1", &schema).is_err());
+    let unknown = stream.replace("\"success\"", "\"future_terminal\"");
+    assert!(parse_claude_code_stream(unknown.as_bytes(), "claude-opus-5", &schema).is_err());
+    let wrong_schema = stream.replace("\"ready\"", "\"not-ready\"");
+    assert!(parse_claude_code_stream(wrong_schema.as_bytes(), "claude-opus-5", &schema).is_err());
+    Ok(())
+}
+
+#[test]
+fn antigravity_command_and_sentinel_parser_are_exact_and_fail_closed() -> TestResult {
+    let schema = json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["status", "resolved_model", "provider_session_id"],
+        "properties": {
+            "status": {"const": "ready"},
+            "resolved_model": {"const": "gemini-3.6-flash-high"},
+            "provider_session_id": {"type": "string", "minLength": 1}
+        }
+    });
+    let plan = build_antigravity_command(&AntigravityCommandInput {
+        requested_model: "gemini-3.6-flash-high".to_owned(),
+        workspace: r"C:\worktree".to_owned(),
+        output_schema: schema.clone(),
+        max_runtime_seconds: 120,
+        prompt: "Return readiness.".to_owned(),
+        native_json_schema: false,
+        read_only: true,
+    })?;
+    assert!(plan.argv.iter().any(|arg| arg == "--new-project"));
+    assert!(plan.argv.iter().any(|arg| arg == "--sandbox"));
+    assert!(!plan.argv.iter().any(|arg| arg == "--agent"));
+    assert_eq!(
+        plan.nonsecret_environment
+            .get("AGY_CLI_DISABLE_AUTO_UPDATE")
+            .map(String::as_str),
+        Some("1")
+    );
+    let output = concat!(
+        "provider log retained outside result\n",
+        "BEGIN_ELIOT_RESULT\n",
+        "{\"status\":\"ready\",\"resolved_model\":\"gemini-3.6-flash-high\",",
+        "\"provider_session_id\":\"agy-session-1\"}\n",
+        "END_ELIOT_RESULT\n"
+    );
+    let parsed = parse_antigravity_output(
+        output.as_bytes(),
+        "gemini-3.6-flash-high",
+        &schema,
+        ProviderStructuredOutputMode::SentinelJson,
+    )?;
+    assert_eq!(parsed.provider_session_id, "agy-session-1");
+    assert!(
+        parse_antigravity_output(
+            b"gemini-3.6-flash-high",
+            "gemini-3.6-flash-high",
+            &schema,
+            ProviderStructuredOutputMode::SentinelJson,
+        )
+        .is_err()
+    );
+    let duplicate = format!("{output}{output}");
+    assert!(
+        parse_antigravity_output(
+            duplicate.as_bytes(),
+            "gemini-3.6-flash-high",
+            &schema,
+            ProviderStructuredOutputMode::SentinelJson,
+        )
+        .is_err()
+    );
     Ok(())
 }
 

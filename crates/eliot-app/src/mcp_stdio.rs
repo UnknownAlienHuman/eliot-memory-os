@@ -640,6 +640,7 @@ fn resolve_effective_profile(
     match (host, requested_profile) {
         (None, requested) => McpAccessProfile::parse(requested),
         (Some("claude" | "claude-desktop"), "default") => Ok(McpAccessProfile::ClaudeGoverned),
+        (Some("claude"), "external_auditor") => Ok(McpAccessProfile::ExternalAuditor),
         (Some("codex"), "default" | "codex_worker") => Ok(McpAccessProfile::CodexWorker),
         (Some("antigravity" | "opencode"), "default")
         | (Some("antigravity"), "dynamic_agent" | "agent_host") => {

@@ -199,7 +199,7 @@ impl ProviderInvocationLifecycleService {
                 )
                 | (
                     State::DispatchStarting,
-                    State::Dispatched | State::DispatchAckUnknown
+                    State::Dispatched | State::DispatchAckUnknown | State::PreDispatchAborted
                 )
                 | (
                     State::Dispatched,

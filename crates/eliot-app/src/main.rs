@@ -253,6 +253,10 @@ enum Command {
         #[command(subcommand)]
         command: HostCommand,
     },
+    ExternalAgent {
+        #[command(subcommand)]
+        command: ExternalAgentCommand,
+    },
     CognitiveField {
         #[command(subcommand)]
         command: CognitiveFieldCommand,
@@ -1640,6 +1644,30 @@ enum HostCommand {
 }
 
 #[derive(Debug, Subcommand)]
+enum ExternalAgentCommand {
+    Doctor {
+        #[arg(long)]
+        host: String,
+    },
+    AuthSmoke {
+        #[arg(long)]
+        host: String,
+        #[arg(long)]
+        model: String,
+    },
+    McpSmoke {
+        #[arg(long)]
+        host: String,
+        #[arg(long)]
+        model: String,
+    },
+    Inspect {
+        #[arg(long)]
+        invocation: String,
+    },
+}
+
+#[derive(Debug, Subcommand)]
 enum CognitiveFieldCommand {
     Validate {
         #[arg(long)]
@@ -2290,6 +2318,9 @@ async fn dispatch_command(
             Ok(())
         }
         Command::Host { command } => Box::pin(host_runtime::dispatch(config, command)).await,
+        Command::ExternalAgent { command } => {
+            host_runtime::dispatch_external_agent(config, command).await
+        }
         Command::CognitiveField { command } => dispatch_cognitive_field_command(command),
     }
 }
