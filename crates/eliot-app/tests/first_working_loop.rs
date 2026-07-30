@@ -94,15 +94,9 @@ fn fwl_static_safety_boundaries_hold() -> TestResult {
         );
     }
 
-    let justfile = include_str!("../../../Justfile");
-    let phase_recipe = justfile
-        .split_once("first-working-loop-focused:")
-        .ok_or("first-working-loop recipe must exist")?
-        .1
-        .split_once("doc-test:")
-        .ok_or("first-working-loop recipe must be bounded")?
-        .0;
-    assert!(phase_recipe.contains("ELIOT_DISABLE_REAL_PROVIDER = '1'"));
+    let isolated_tests = include_str!("../../../scripts/run-isolated-tests.ps1");
+    assert!(isolated_tests.contains("GetTempPath"));
+    assert!(isolated_tests.contains("ELIOT_DISABLE_REAL_PROVIDER = '1'"));
     for forbidden in [
         "provider-budget-provider-once",
         "Get-Service",
@@ -112,17 +106,16 @@ fn fwl_static_safety_boundaries_hold() -> TestResult {
         "sc.exe",
     ] {
         assert!(
-            !phase_recipe.contains(forbidden),
-            "first-working-loop recipe must not contain host/provider action {forbidden}"
+            !isolated_tests.contains(forbidden),
+            "isolated test harness must not contain host/provider action {forbidden}"
         );
     }
-
-    let isolated_tests = include_str!("../../../scripts/run-isolated-tests.ps1");
-    assert!(isolated_tests.contains("GetTempPath"));
-    assert!(isolated_tests.contains("ELIOT_DISABLE_REAL_PROVIDER = '1'"));
-    assert!(isolated_tests.contains("ELIOT_TEST_ALLOW_LEGACY_OPERATOR_CURSOR_KEY_FILE = '1'"));
+    assert!(
+        isolated_tests.contains("ELIOT_TEST_OPERATOR_CURSOR_CREDENTIAL_BACKEND = 'ephemeral-file'")
+    );
+    assert!(isolated_tests.contains("eliot-credential-suite-guard.exe"));
     assert!(isolated_tests.contains("TcpListener]::new([Net.IPAddress]::Loopback, 0)"));
-    assert!(isolated_tests.contains("--bin', 'eliot-process-guardian'"));
+    assert!(isolated_tests.contains("'--bins'"));
     assert!(isolated_tests.contains("'--stop-file', $surrealStopPath"));
     assert!(isolated_tests.contains("[IO.File]::WriteAllText($surrealStopPath, 'stop'"));
     assert!(isolated_tests.contains("$surrealGuardianProcess.WaitForExit(10000)"));
@@ -144,15 +137,15 @@ fn fwl_static_safety_boundaries_hold() -> TestResult {
     );
     assert!(!isolated_tests.contains("Remove-Item -LiteralPath $secretTestsRoot -Recurse"));
 
-    let mcp_stdio = include_str!("../src/mcp_stdio.rs");
-    let cursor_loader = mcp_stdio
-        .split_once("fn load_or_create_operator_cursor_signing_key(")
+    let operator_source = include_str!("../src/mcp_stdio/operator.rs");
+    let cursor_loader = operator_source
+        .split_once("pub(super) fn load_or_create_operator_cursor_signing_key(")
         .ok_or("operator cursor key loader must exist")?
         .1
-        .split_once("impl McpDaemon")
+        .split_once("pub(super) fn dispatch_operator_contract")
         .ok_or("operator cursor key loader must remain bounded")?
         .0;
-    assert!(cursor_loader.contains("LEGACY_OPERATOR_CURSOR_TEST_OVERRIDE"));
+    assert!(cursor_loader.contains("IsolatedTestCredentialBackend::from_process_environment"));
     assert!(!cursor_loader.contains("ELIOT_DISABLE_REAL_PROVIDER"));
 
     let ipc_source = include_str!("../src/named_pipe_ipc.rs");

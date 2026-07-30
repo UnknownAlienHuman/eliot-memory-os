@@ -60,7 +60,7 @@ const SECRET_SCAN_TABLES: &[&str] = &[
     "supersedes",
     "mentions",
     "belongs_to",
-    "produced_by",
+    "produces",
     "invalidated_by",
     "co_change",
     "concept_implemented_by",
@@ -1550,11 +1550,36 @@ impl CanonicalStore {
         Ok(response)
     }
 
-    pub async fn graph_health(&self) -> Result<GraphHealthResponse, StoreError> {
+    pub async fn graph_health(
+        &self,
+        project_id: ProjectId,
+    ) -> Result<GraphHealthResponse, StoreError> {
+        const GRAPH_HEALTH_SCAN_LIMIT: u64 = 10_000;
+        let schema = self
+            .execute_value(
+                NamedSurqlOp::GraphHealthCapabilities,
+                Value::Object(serde_json::Map::new()),
+            )
+            .await?;
+        let tables = schema
+            .get("tables")
+            .and_then(Value::as_object)
+            .ok_or_else(|| {
+                StoreError::Decode(
+                    "graph_health_capabilities output omitted the database table map".to_owned(),
+                )
+            })?;
         let value = self
             .execute_value(
                 NamedSurqlOp::GraphHealth,
-                Value::Object(serde_json::Map::new()),
+                json!({
+                    "project_id": project_id,
+                    "scan_limit": GRAPH_HEALTH_SCAN_LIMIT,
+                    "scan_fetch_limit": GRAPH_HEALTH_SCAN_LIMIT + 1,
+                    "has_invalidated_by": tables.contains_key("invalidated_by"),
+                    "has_scope_head": tables.contains_key("scope_head"),
+                    "has_write_receipt": tables.contains_key("write_receipt"),
+                }),
             )
             .await?;
         decode_value(NamedSurqlOp::GraphHealth, value)

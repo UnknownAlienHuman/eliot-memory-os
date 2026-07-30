@@ -20,7 +20,7 @@ static TEST_LOCK: Mutex<()> = Mutex::new(());
 #[test]
 fn t02_mcp_replay_survives_restart() -> TestResult {
     let _guard = test_guard();
-    if rerun_with_legacy_credential_gate("t02_mcp_replay_survives_restart")? {
+    if rerun_with_isolated_credential_backend("t02_mcp_replay_survives_restart")? {
         return Ok(());
     }
     let mut harness = Harness::start("restart")?;
@@ -71,7 +71,7 @@ fn t02_mcp_replay_survives_restart() -> TestResult {
 #[test]
 fn t02_anti_falsification_is_unchanged() -> TestResult {
     let _guard = test_guard();
-    if rerun_with_legacy_credential_gate("t02_anti_falsification_is_unchanged")? {
+    if rerun_with_isolated_credential_backend("t02_anti_falsification_is_unchanged")? {
         return Ok(());
     }
     let mut harness = Harness::start("anti-falsification")?;
@@ -140,14 +140,17 @@ fn test_guard() -> std::sync::MutexGuard<'static, ()> {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-fn rerun_with_legacy_credential_gate(test_name: &str) -> TestResult<bool> {
+fn rerun_with_isolated_credential_backend(test_name: &str) -> TestResult<bool> {
     if std::env::var("ELIOT_UL_T02_APP_CHILD").as_deref() == Ok(test_name) {
         return Ok(false);
     }
-    let status = Command::new(std::env::current_exe()?)
+    let credentials =
+        eliot_windows_ipc::test_support::IsolatedTestCredentialFixture::new(test_name)?;
+    let mut command = Command::new(std::env::current_exe()?);
+    credentials.configure_command(&mut command);
+    let status = command
         .env("ELIOT_UL_T02_APP_CHILD", test_name)
         .env("ELIOT_ALLOW_LEGACY_PASSWORD_FILE_MIGRATION", "1")
-        .env("ELIOT_TEST_ALLOW_LEGACY_OPERATOR_CURSOR_KEY_FILE", "1")
         .args(["--exact", test_name, "--nocapture"])
         .status()?;
     if !status.success() {
@@ -284,7 +287,7 @@ struct McpClient {
 
 impl McpClient {
     fn start(config_path: &Path) -> TestResult<Self> {
-        let mut child = governor_command()
+        let mut child = governor_command(config_path)
             .arg("--config")
             .arg(config_path)
             .args(["mcp", "stdio", "--profile", "codex_controller"])
@@ -515,7 +518,7 @@ fn start_surreal(exe: &Path, port: u16) -> TestResult<OwnedChild> {
 
 fn start_daemon(config_path: &Path) -> TestResult<OwnedChild> {
     OwnedChild::spawn(
-        governor_command()
+        governor_command(config_path)
             .arg("--config")
             .arg(config_path)
             .args(["daemon", "run"])
@@ -525,7 +528,7 @@ fn start_daemon(config_path: &Path) -> TestResult<OwnedChild> {
     )
 }
 
-fn governor_command() -> Command {
+fn governor_command(config_path: &Path) -> Command {
     let mut command = Command::new(binary());
     for variable in [
         "ELIOT_GOVERNOR_CONFIG",
@@ -540,8 +543,15 @@ fn governor_command() -> Command {
     }
     command
         .env("ELIOT_DISABLE_REAL_PROVIDER", "1")
-        .env("ELIOT_ALLOW_LEGACY_PASSWORD_FILE_MIGRATION", "1")
-        .env("ELIOT_TEST_ALLOW_LEGACY_OPERATOR_CURSOR_KEY_FILE", "1");
+        .env("ELIOT_ALLOW_LEGACY_PASSWORD_FILE_MIGRATION", "1");
+    eliot_windows_ipc::test_support::IsolatedTestCredentialBackend::EphemeralFile {
+        root: config_path
+            .parent()
+            .and_then(Path::parent)
+            .unwrap_or(config_path)
+            .join("operator-cursor-credentials"),
+    }
+    .configure_command(&mut command);
     command
 }
 

@@ -307,7 +307,13 @@ $guardianBuildStdout = Join-Path $ownedRoot 'reports\guardian-build.stdout.log'
 $guardianBuildStderr = Join-Path $ownedRoot 'reports\guardian-build.stderr.log'
 $guardianStdout = Join-Path $ownedRoot 'reports\guardian.stdout.jsonl'
 $guardianStderr = Join-Path $ownedRoot 'reports\guardian.stderr.log'
-$guardianExe = Join-Path $repo 'target\debug\eliot-process-guardian.exe'
+$cargoTargetDirectory = [IO.Path]::GetFullPath((
+    cargo metadata --no-deps --format-version 1 | ConvertFrom-Json
+).target_directory)
+$guardianExe = Join-Path $cargoTargetDirectory 'debug\eliot-process-guardian.exe'
+$credentialGuardExe = Join-Path $cargoTargetDirectory 'debug\eliot-credential-suite-guard.exe'
+$credentialManifestPath = Join-Path $ownedRoot 'reports\isolated-credentials-before.json'
+$operatorCursorCredentialRoot = Join-Path $ownedRoot 'operator-cursor-credentials'
 $probeScript = Join-Path $ownedRoot 'tmp\wrapper-probe.ps1'
 $portListener = [Net.Sockets.TcpListener]::new([Net.IPAddress]::Loopback, 0)
 $portListener.Start()
@@ -327,6 +333,10 @@ foreach ($name in @(
     'ELIOT_TEST_SURREAL_ENDPOINT',
     'ELIOT_TEST_SURREAL_PASSWORD_FILE',
     'ELIOT_TEST_SURREAL_STORAGE',
+    'ELIOT_TEST_OPERATOR_CURSOR_CREDENTIAL_BACKEND',
+    'ELIOT_TEST_OPERATOR_CURSOR_CREDENTIAL_ROOT',
+    'ELIOT_TEST_OPERATOR_CURSOR_CREDENTIAL_TARGET',
+    'ELIOT_TEST_ALLOW_LEGACY_OPERATOR_CURSOR_KEY_FILE',
     'ELIOT_SURREAL_EXE',
     'SURREAL_USER',
     'SURREAL_PASS'
@@ -428,7 +438,10 @@ migrations_dir = "$migrationsPath"
     [IO.File]::WriteAllText($configPath, $config)
 
     $env:ELIOT_DISABLE_REAL_PROVIDER = '1'
-    $env:ELIOT_TEST_ALLOW_LEGACY_OPERATOR_CURSOR_KEY_FILE = '1'
+    $env:ELIOT_TEST_OPERATOR_CURSOR_CREDENTIAL_BACKEND = 'ephemeral-file'
+    $env:ELIOT_TEST_OPERATOR_CURSOR_CREDENTIAL_ROOT = $operatorCursorCredentialRoot
+    Remove-Item Env:ELIOT_TEST_OPERATOR_CURSOR_CREDENTIAL_TARGET -ErrorAction SilentlyContinue
+    Remove-Item Env:ELIOT_TEST_ALLOW_LEGACY_OPERATOR_CURSOR_KEY_FILE -ErrorAction SilentlyContinue
     $env:ELIOT_GOVERNOR_CONFIG = $configPath
     $env:ELIOT_TEST_SURREAL_BIND = "127.0.0.1:$port"
     $env:ELIOT_TEST_SURREAL_ENDPOINT = "ws://127.0.0.1:$port/rpc"
@@ -439,7 +452,7 @@ migrations_dir = "$migrationsPath"
     $env:SURREAL_PASS = $password
 
     $guardianBuildProcess = Start-Process -FilePath 'cargo.exe' -ArgumentList @(
-        'build', '--offline', '-p', 'eliot-windows-ipc', '--bin', 'eliot-process-guardian'
+        'build', '--offline', '-p', 'eliot-windows-ipc', '--bins'
     ) -WorkingDirectory $repo -RedirectStandardOutput $guardianBuildStdout `
         -RedirectStandardError $guardianBuildStderr -PassThru -WindowStyle Hidden
     if (-not $guardianBuildProcess.WaitForExit(300000)) {
@@ -447,8 +460,14 @@ migrations_dir = "$migrationsPath"
         $guardianBuildProcess = $null
         throw 'native process guardian build exceeded its five-minute bound'
     }
-    if ($guardianBuildProcess.ExitCode -ne 0 -or -not (Test-Path -LiteralPath $guardianExe -PathType Leaf)) {
+    if ($guardianBuildProcess.ExitCode -ne 0 -or
+        -not (Test-Path -LiteralPath $guardianExe -PathType Leaf) -or
+        -not (Test-Path -LiteralPath $credentialGuardExe -PathType Leaf)) {
         throw "native process guardian build failed: $($guardianBuildProcess.ExitCode)"
+    }
+    & $credentialGuardExe snapshot $credentialManifestPath
+    if ($LASTEXITCODE -ne 0) {
+        throw "isolated credential suite preflight failed: $LASTEXITCODE"
     }
 
     New-Item -ItemType Directory -Force (Split-Path $pidPath) | Out-Null
@@ -701,6 +720,13 @@ finally {
     }
     if ($guardianBuildProcess) {
         Stop-ExactOwnedProcess $guardianBuildProcess 'guardian_build' $cleanupFailures $processReceipts
+    }
+    if (Test-Path -LiteralPath $credentialManifestPath -PathType Leaf) {
+        & $credentialGuardExe verify $credentialManifestPath
+        if ($LASTEXITCODE -ne 0) {
+            $cleanupFailures.Add('isolated_operator_cursor_credential_set_changed')
+            $testExit = 98
+        }
     }
     try {
         $evidenceParts = [Collections.Generic.List[string]]::new()

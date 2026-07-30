@@ -28,7 +28,7 @@ use windows_sys::Win32::Security::Authorization::{
 };
 use windows_sys::Win32::Security::Credentials::{
     CRED_MAX_CREDENTIAL_BLOB_SIZE, CRED_PERSIST_LOCAL_MACHINE, CRED_TYPE_GENERIC, CREDENTIALW,
-    CredDeleteW, CredFree, CredReadW, CredWriteW,
+    CredDeleteW, CredEnumerateW, CredFree, CredReadW, CredWriteW,
 };
 use windows_sys::Win32::Security::{PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES};
 use windows_sys::Win32::Storage::FileSystem::{
@@ -1347,6 +1347,308 @@ impl Drop for CredentialBuffer {
     }
 }
 
+struct CredentialArray(*mut *mut CREDENTIALW);
+
+impl Drop for CredentialArray {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            // SAFETY: `self.0` was allocated by `CredEnumerateW` and remains
+            // owned by this guard until it is released exactly once here.
+            unsafe {
+                CredFree(self.0.cast());
+            }
+        }
+    }
+}
+
+fn credential_target_name(target: *const u16) -> io::Result<String> {
+    const MAX_TARGET_CHARS: usize = 512;
+
+    if target.is_null() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "credential target name is null",
+        ));
+    }
+    let mut length = 0;
+    // SAFETY: the pointer comes from a live `CREDENTIALW` allocation and
+    // WinCred guarantees a NUL-terminated target name. The bounded scan
+    // rejects malformed data rather than reading indefinitely.
+    unsafe {
+        while length < MAX_TARGET_CHARS && *target.add(length) != 0 {
+            length += 1;
+        }
+    }
+    if length == MAX_TARGET_CHARS {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "credential target name exceeded the bounded scan",
+        ));
+    }
+    // SAFETY: the bounded scan above proved `length` readable UTF-16 units
+    // before the terminating NUL in the live credential allocation.
+    let wide = unsafe { std::slice::from_raw_parts(target, length) };
+    String::from_utf16(wide).map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+}
+
+/// Enumerates Eliot credential identifiers under one exact logical prefix.
+///
+/// Returned values omit the fixed `EliotGovernor/` `WinCred` namespace prefix.
+/// The function is metadata-only and never reads or deletes credential values.
+///
+/// # Errors
+///
+/// Returns an error for an invalid prefix, malformed `WinCred` data, or a
+/// Windows Credential Manager failure other than an empty result.
+pub fn credential_ids_current_user_with_prefix(prefix: &str) -> io::Result<Vec<String>> {
+    let _ = credential_target(prefix)?;
+    let full_prefix = format!("EliotGovernor/{prefix}");
+    let mut filter = nul_terminated_wide(OsStr::new(&format!("{full_prefix}*")))?;
+    let mut count = 0_u32;
+    let mut raw = ptr::null_mut();
+    // SAFETY: `filter` is NUL-terminated and both out pointers are valid for
+    // the duration of the call.
+    let enumerated =
+        unsafe { CredEnumerateW(filter.as_mut_ptr(), 0, &raw mut count, &raw mut raw) };
+    if enumerated == 0 {
+        // SAFETY: this call immediately follows the failed Win32 operation.
+        let code = unsafe { GetLastError() };
+        if code == ERROR_NOT_FOUND {
+            return Ok(Vec::new());
+        }
+        return Err(io::Error::from_raw_os_error(code.cast_signed()));
+    }
+    let credentials = CredentialArray(raw);
+    let count = usize::try_from(count)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "credential count is invalid"))?;
+    // SAFETY: successful `CredEnumerateW` returned an array containing exactly
+    // `count` credential pointers, owned by `credentials`.
+    let entries = unsafe { std::slice::from_raw_parts(credentials.0, count) };
+    let mut identifiers = Vec::with_capacity(entries.len());
+    for entry in entries {
+        if entry.is_null() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "credential enumeration returned a null entry",
+            ));
+        }
+        // SAFETY: every non-null entry belongs to the live enumeration buffer.
+        let target = credential_target_name(unsafe { (**entry).TargetName })?;
+        let identifier = target.strip_prefix("EliotGovernor/").ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "credential escaped the EliotGovernor namespace",
+            )
+        })?;
+        if identifier.starts_with(prefix) {
+            identifiers.push(identifier.to_owned());
+        }
+    }
+    identifiers.sort();
+    identifiers.dedup();
+    Ok(identifiers)
+}
+
+/// Shared command configuration for disposable Governor integration fixtures.
+pub mod test_support {
+    use super::{credential_ids_current_user_with_prefix, credential_target};
+    use std::ffi::OsStr;
+    use std::fs;
+    use std::io;
+    use std::path::{Path, PathBuf};
+    use std::process::Command;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    /// Explicit backend selector understood only by isolated test fixtures.
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    pub enum IsolatedTestCredentialBackend {
+        /// Persist the disposable key below a fixture-owned directory.
+        EphemeralFile { root: PathBuf },
+        /// Exercise one exact, unique logical Windows Credential target.
+        WindowsCredentialManager { target: String },
+    }
+
+    /// Environment variable selecting the isolated credential backend.
+    pub const TEST_CREDENTIAL_BACKEND_ENV: &str = "ELIOT_TEST_OPERATOR_CURSOR_CREDENTIAL_BACKEND";
+    /// Environment variable containing the fixture-owned ephemeral root.
+    pub const TEST_CREDENTIAL_ROOT_ENV: &str = "ELIOT_TEST_OPERATOR_CURSOR_CREDENTIAL_ROOT";
+    /// Environment variable containing one exact logical `WinCred` target.
+    pub const TEST_CREDENTIAL_TARGET_ENV: &str = "ELIOT_TEST_OPERATOR_CURSOR_CREDENTIAL_TARGET";
+    /// Logical prefix guarded before and after focused/full integration suites.
+    pub const ISOLATED_OPERATOR_CURSOR_PREFIX: &str = "operator-cursor/isolated-";
+
+    impl IsolatedTestCredentialBackend {
+        /// Parses the explicit test-only process contract.
+        ///
+        /// # Errors
+        ///
+        /// Returns an error when the configured backend, root, or target is invalid.
+        pub fn from_process_environment() -> io::Result<Option<Self>> {
+            Self::from_environment_values(
+                std::env::var_os(TEST_CREDENTIAL_BACKEND_ENV).as_deref(),
+                std::env::var_os(TEST_CREDENTIAL_ROOT_ENV).as_deref(),
+                std::env::var_os(TEST_CREDENTIAL_TARGET_ENV).as_deref(),
+            )
+        }
+
+        /// Parses environment values without mutating process-global state.
+        ///
+        /// # Errors
+        ///
+        /// Returns an error when the backend is unknown or its required root or
+        /// target is missing, malformed, or conflicts with another backend.
+        pub fn from_environment_values(
+            backend: Option<&OsStr>,
+            root: Option<&OsStr>,
+            target: Option<&OsStr>,
+        ) -> io::Result<Option<Self>> {
+            let Some(backend) = backend else {
+                if root.is_some() || target.is_some() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "isolated credential root/target requires an explicit backend",
+                    ));
+                }
+                return Ok(None);
+            };
+            match backend.to_str() {
+                Some("ephemeral-file") => {
+                    let root = root.map(PathBuf::from).ok_or_else(|| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            "ephemeral-file backend requires a fixture-owned root",
+                        )
+                    })?;
+                    if !root.is_absolute() || target.is_some() {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            "ephemeral-file backend requires only an absolute root",
+                        ));
+                    }
+                    Ok(Some(Self::EphemeralFile { root }))
+                }
+                Some("windows-credential-manager") => {
+                    let target = target.and_then(OsStr::to_str).ok_or_else(|| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            "windows-credential-manager backend requires one UTF-8 target",
+                        )
+                    })?;
+                    if root.is_some() {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            "windows-credential-manager backend does not accept a file root",
+                        ));
+                    }
+                    let _ = credential_target(target)?;
+                    Ok(Some(Self::WindowsCredentialManager {
+                        target: target.to_owned(),
+                    }))
+                }
+                _ => Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "unknown isolated test credential backend",
+                )),
+            }
+        }
+
+        /// Applies the backend once to a child command owned by the fixture.
+        pub fn configure_command(&self, command: &mut Command) {
+            command.env_remove(TEST_CREDENTIAL_ROOT_ENV);
+            command.env_remove(TEST_CREDENTIAL_TARGET_ENV);
+            match self {
+                Self::EphemeralFile { root } => {
+                    command
+                        .env(TEST_CREDENTIAL_BACKEND_ENV, "ephemeral-file")
+                        .env(TEST_CREDENTIAL_ROOT_ENV, root);
+                }
+                Self::WindowsCredentialManager { target } => {
+                    command
+                        .env(TEST_CREDENTIAL_BACKEND_ENV, "windows-credential-manager")
+                        .env(TEST_CREDENTIAL_TARGET_ENV, target);
+                }
+            }
+        }
+    }
+
+    /// RAII owner for the default file backend used by child-process fixtures.
+    pub struct IsolatedTestCredentialFixture {
+        root: PathBuf,
+        backend: IsolatedTestCredentialBackend,
+    }
+
+    impl IsolatedTestCredentialFixture {
+        /// Creates a unique fixture root below the system temporary directory.
+        ///
+        /// # Errors
+        ///
+        /// Returns an error when the fixture-owned temporary directory cannot
+        /// be created.
+        pub fn new(label: &str) -> io::Result<Self> {
+            static NEXT_FIXTURE: AtomicU64 = AtomicU64::new(0);
+            let safe_label = label
+                .chars()
+                .map(|character| {
+                    if character.is_ascii_alphanumeric() || matches!(character, '-' | '_') {
+                        character
+                    } else {
+                        '-'
+                    }
+                })
+                .collect::<String>();
+            let created_at = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos();
+            let root = std::env::temp_dir().join(format!(
+                "eliot-isolated-credential-{safe_label}-{}-{created_at}-{}",
+                std::process::id(),
+                NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed)
+            ));
+            fs::create_dir(&root)?;
+            let backend = IsolatedTestCredentialBackend::EphemeralFile { root: root.clone() };
+            Ok(Self { root, backend })
+        }
+
+        /// Configures one fixture-owned child command.
+        pub fn configure_command(&self, command: &mut Command) {
+            self.backend.configure_command(command);
+        }
+
+        /// Returns the exact fixture-owned file root.
+        #[must_use]
+        pub fn root(&self) -> &Path {
+            &self.root
+        }
+    }
+
+    impl Drop for IsolatedTestCredentialFixture {
+        fn drop(&mut self) {
+            let temp = std::env::temp_dir();
+            if self.root.starts_with(&temp)
+                && self
+                    .root
+                    .file_name()
+                    .and_then(OsStr::to_str)
+                    .is_some_and(|name| name.starts_with("eliot-isolated-credential-"))
+            {
+                let _ = fs::remove_dir_all(&self.root);
+            }
+        }
+    }
+
+    /// Captures the exact isolated Operator credential set without mutation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the isolated prefix is invalid, `WinCred` returns
+    /// malformed metadata, or enumeration fails for another system reason.
+    pub fn isolated_operator_cursor_credentials() -> io::Result<Vec<String>> {
+        credential_ids_current_user_with_prefix(ISOLATED_OPERATOR_CURSOR_PREFIX)
+    }
+}
+
 /// Metadata-only view of a current-user Windows credential.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CurrentUserCredentialStatus {
@@ -1599,9 +1901,9 @@ mod tests {
     use super::{
         DirectoryMutationGuard, DirectoryOplockGuard, PinnedDirectory, PinnedFile,
         ProcessTreeGuard, SuspendedJobChild, atomic_replace_file, credential_delete_current_user,
-        credential_read_current_user, credential_status_current_user,
-        credential_write_current_user, process_image_path, process_is_alive, validate_sid,
-        write_new_pinned_file,
+        credential_ids_current_user_with_prefix, credential_read_current_user,
+        credential_status_current_user, credential_write_current_user, process_image_path,
+        process_is_alive, test_support, validate_sid, write_new_pinned_file,
     };
     use std::fs;
     use std::io::Read as _;
@@ -1681,36 +1983,73 @@ mod tests {
         }
     }
 
+    struct CredentialCleanup(String);
+
+    impl Drop for CredentialCleanup {
+        fn drop(&mut self) {
+            let _ = credential_delete_current_user(&self.0);
+        }
+    }
+
     #[test]
     fn credential_manager_round_trip_is_current_user_scoped() -> std::io::Result<()> {
-        struct CredentialCleanup(String);
-        impl Drop for CredentialCleanup {
-            fn drop(&mut self) {
-                let _ = credential_delete_current_user(&self.0);
-            }
-        }
+        static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _serial = SERIAL
+            .lock()
+            .map_err(|_| std::io::Error::other("credential test serializer was poisoned"))?;
         let nonce = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_nanos();
-        let credential_id = format!("tests/round-trip/{}-{nonce}", std::process::id());
-        let _cleanup = CredentialCleanup(credential_id.clone());
+        let credential_id = format!(
+            "operator-cursor/isolated-round-trip-{}-{nonce}",
+            std::process::id()
+        );
+        let before =
+            credential_ids_current_user_with_prefix(test_support::ISOLATED_OPERATOR_CURSOR_PREFIX)?;
+        assert!(!before.contains(&credential_id));
         let value = format!("synthetic-test-value-{}-{nonce}", std::process::id());
         assert_eq!(credential_read_current_user(&credential_id)?, None);
-        credential_write_current_user(&credential_id, value.as_bytes())?;
-        let status = credential_status_current_user(&credential_id)?;
-        assert!(status.present);
-        assert!(status.version.is_some());
-        let expected_size = u32::try_from(value.len()).map_err(|_| {
-            std::io::Error::new(std::io::ErrorKind::InvalidData, "test value is too large")
-        })?;
-        assert_eq!(status.size_bytes, Some(expected_size));
-        assert_eq!(
-            credential_read_current_user(&credential_id)?.as_deref(),
-            Some(value.as_bytes())
-        );
-        assert!(credential_delete_current_user(&credential_id)?);
+
+        let panic_result = std::panic::catch_unwind(|| {
+            let _cleanup = CredentialCleanup(credential_id.clone());
+            if let Err(error) = credential_write_current_user(&credential_id, value.as_bytes()) {
+                panic!("credential setup for panic cleanup failed: {error}");
+            }
+            panic!("intentional panic proving exact credential RAII cleanup");
+        });
+        assert!(panic_result.is_err());
         assert_eq!(credential_read_current_user(&credential_id)?, None);
+
+        {
+            let _cleanup = CredentialCleanup(credential_id.clone());
+            credential_write_current_user(&credential_id, value.as_bytes())?;
+            let during = credential_ids_current_user_with_prefix(
+                test_support::ISOLATED_OPERATOR_CURSOR_PREFIX,
+            )?;
+            assert_eq!(
+                during
+                    .iter()
+                    .filter(|target| target.as_str() == credential_id)
+                    .count(),
+                1
+            );
+            let status = credential_status_current_user(&credential_id)?;
+            assert!(status.present);
+            assert!(status.version.is_some());
+            let expected_size = u32::try_from(value.len()).map_err(|_| {
+                std::io::Error::new(std::io::ErrorKind::InvalidData, "test value is too large")
+            })?;
+            assert_eq!(status.size_bytes, Some(expected_size));
+            assert_eq!(
+                credential_read_current_user(&credential_id)?.as_deref(),
+                Some(value.as_bytes())
+            );
+        }
+        assert_eq!(credential_read_current_user(&credential_id)?, None);
+        let after =
+            credential_ids_current_user_with_prefix(test_support::ISOLATED_OPERATOR_CURSOR_PREFIX)?;
+        assert_eq!(after, before);
         Ok(())
     }
 

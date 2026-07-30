@@ -18,7 +18,7 @@ type TestResult<T = ()> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn t01_candidate_creates_one_belongs_to_edge() -> TestResult {
-    if rerun_with_legacy_credential_gate("t01_candidate_creates_one_belongs_to_edge")? {
+    if rerun_with_isolated_credential_backend("t01_candidate_creates_one_belongs_to_edge")? {
         return Ok(());
     }
     let harness = Harness::start("candidate-belongs-to").await?;
@@ -68,14 +68,17 @@ async fn t01_candidate_creates_one_belongs_to_edge() -> TestResult {
     Ok(())
 }
 
-fn rerun_with_legacy_credential_gate(test_name: &str) -> TestResult<bool> {
+fn rerun_with_isolated_credential_backend(test_name: &str) -> TestResult<bool> {
     if std::env::var("ELIOT_UL_T01_CREDENTIAL_CHILD").as_deref() == Ok(test_name) {
         return Ok(false);
     }
-    let status = Command::new(std::env::current_exe()?)
+    let credentials =
+        eliot_windows_ipc::test_support::IsolatedTestCredentialFixture::new(test_name)?;
+    let mut command = Command::new(std::env::current_exe()?);
+    credentials.configure_command(&mut command);
+    let status = command
         .env("ELIOT_UL_T01_CREDENTIAL_CHILD", test_name)
         .env("ELIOT_ALLOW_LEGACY_PASSWORD_FILE_MIGRATION", "1")
-        .env("ELIOT_TEST_ALLOW_LEGACY_OPERATOR_CURSOR_KEY_FILE", "1")
         .args(["--exact", test_name, "--nocapture"])
         .status()?;
     if !status.success() {

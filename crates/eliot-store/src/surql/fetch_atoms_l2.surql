@@ -53,7 +53,7 @@ LET $belongs_to_raw = SELECT relation_type, from, to FROM belongs_to
   WHERE project_id = $request.project_id
     AND (<string> from IN $relation_ids OR <string> to IN $relation_ids)
   ORDER BY from ASC, to ASC LIMIT 65;
-LET $produced_by_raw = SELECT relation_type, from, to FROM produced_by
+LET $produces_raw = SELECT relation_type, from, to FROM produces
   WHERE project_id = $request.project_id
     AND (<string> from IN $relation_ids OR <string> to IN $relation_ids)
   ORDER BY from ASC, to ASC LIMIT 65;
@@ -87,7 +87,7 @@ LET $relation_truncated = array::len($supports_raw) > 64
   OR array::len($supersedes_raw) > 64
   OR array::len($mentions_raw) > 64
   OR array::len($belongs_to_raw) > 64
-  OR array::len($produced_by_raw) > 64
+  OR array::len($produces_raw) > 64
   OR array::len($invalidated_by_raw) > 64
   OR array::len($co_change_raw) > 64
   OR array::len($concept_implemented_by_raw) > 64
@@ -100,7 +100,7 @@ LET $contradicts = array::slice($contradicts_raw, 0, 64);
 LET $supersedes = array::slice($supersedes_raw, 0, 64);
 LET $mentions = array::slice($mentions_raw, 0, 64);
 LET $belongs_to = array::slice($belongs_to_raw, 0, 64);
-LET $produced_by = array::slice($produced_by_raw, 0, 64);
+LET $produces = array::slice($produces_raw, 0, 64);
 LET $invalidated_by = array::slice($invalidated_by_raw, 0, 64);
 LET $co_change = array::slice($co_change_raw, 0, 64);
 LET $concept_implemented_by = array::slice($concept_implemented_by_raw, 0, 64);
@@ -114,7 +114,7 @@ LET $relations = array::concat(
   $supersedes,
   $mentions,
   $belongs_to,
-  $produced_by,
+  $produces,
   $invalidated_by,
   $co_change,
   $concept_implemented_by,

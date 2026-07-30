@@ -37,7 +37,11 @@ pub(super) async fn dispatch_memory_corpus_profile(
         .try_into()
         .unwrap_or(u64::MAX);
     let profile = CorpusProfileService::profile(&CorpusProfileInput {
-        graph_health: Some(state.store.graph_health().await?),
+        graph_health: Some(
+            GraphHealthService::new(state.store.clone())
+                .health(project_id)
+                .await?,
+        ),
         verified_episode_count,
         physical_case_record_count,
         physical_pattern_record_count,

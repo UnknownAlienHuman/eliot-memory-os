@@ -980,10 +980,10 @@ pub fn run_skill_curator_report(config_path: &Path) -> Result<()> {
     read_latest_json(config_path, "skill-curator")
 }
 
-pub async fn run_graph_health(config_path: &Path) -> Result<()> {
+pub async fn run_graph_health(config_path: &Path, project: &str) -> Result<()> {
     let config = load_config(config_path)?;
     let service = GraphHealthService::new(CanonicalStore::new(config.db.surreal));
-    let report = service.health().await?;
+    let report = service.health(parse_project_id(project)?).await?;
     let root = runtime_root(config_path);
     write_report_pair(
         &root.join("reports").join("graph").join("latest.json"),

@@ -249,10 +249,13 @@ fn rerun_with_credential_gate(test_name: &str) -> TestResult<bool> {
     if std::env::var("ELIOT_UL_T06_ENGINE_CHILD").as_deref() == Ok(test_name) {
         return Ok(false);
     }
-    let status = Command::new(std::env::current_exe()?)
+    let credentials =
+        eliot_windows_ipc::test_support::IsolatedTestCredentialFixture::new(test_name)?;
+    let mut command = Command::new(std::env::current_exe()?);
+    credentials.configure_command(&mut command);
+    let status = command
         .env("ELIOT_UL_T06_ENGINE_CHILD", test_name)
         .env("ELIOT_ALLOW_LEGACY_PASSWORD_FILE_MIGRATION", "1")
-        .env("ELIOT_TEST_ALLOW_LEGACY_OPERATOR_CURSOR_KEY_FILE", "1")
         .args(["--exact", test_name, "--nocapture"])
         .status()?;
     if !status.success() {

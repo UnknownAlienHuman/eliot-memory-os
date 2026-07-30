@@ -15,7 +15,7 @@ const PATH_CUE: &str = "crates/eliot-store/src/lib.rs";
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn t03_firing_order_and_cap() -> TestResult {
-    if rerun_with_legacy_credential_gate("t03_firing_order_and_cap")? {
+    if rerun_with_isolated_credential_backend("t03_firing_order_and_cap")? {
         return Ok(());
     }
     let harness = Harness::start("order", 8901).await?;
@@ -86,7 +86,7 @@ async fn t03_firing_order_and_cap() -> TestResult {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn t03_rebuild_after_restart_is_identical() -> TestResult {
-    if rerun_with_legacy_credential_gate("t03_rebuild_after_restart_is_identical")? {
+    if rerun_with_isolated_credential_backend("t03_rebuild_after_restart_is_identical")? {
         return Ok(());
     }
     let harness = Harness::start("restart", 8902).await?;
@@ -119,7 +119,7 @@ async fn t03_rebuild_after_restart_is_identical() -> TestResult {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn t03_no_cross_project_or_stale_leak() -> TestResult {
-    if rerun_with_legacy_credential_gate("t03_no_cross_project_or_stale_leak")? {
+    if rerun_with_isolated_credential_backend("t03_no_cross_project_or_stale_leak")? {
         return Ok(());
     }
     let harness = Harness::start("scope", 8903).await?;
@@ -206,14 +206,17 @@ fn row(
     }
 }
 
-fn rerun_with_legacy_credential_gate(test_name: &str) -> TestResult<bool> {
+fn rerun_with_isolated_credential_backend(test_name: &str) -> TestResult<bool> {
     if std::env::var("ELIOT_UL_T03_ENGINE_CHILD").as_deref() == Ok(test_name) {
         return Ok(false);
     }
-    let status = Command::new(std::env::current_exe()?)
+    let credentials =
+        eliot_windows_ipc::test_support::IsolatedTestCredentialFixture::new(test_name)?;
+    let mut command = Command::new(std::env::current_exe()?);
+    credentials.configure_command(&mut command);
+    let status = command
         .env("ELIOT_UL_T03_ENGINE_CHILD", test_name)
         .env("ELIOT_ALLOW_LEGACY_PASSWORD_FILE_MIGRATION", "1")
-        .env("ELIOT_TEST_ALLOW_LEGACY_OPERATOR_CURSOR_KEY_FILE", "1")
         .args(["--exact", test_name, "--nocapture"])
         .status()?;
     if !status.success() {

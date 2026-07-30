@@ -567,7 +567,7 @@ pub enum RelationType {
     Supersedes,
     Mentions,
     BelongsTo,
-    ProducedBy,
+    Produces,
     InvalidatedBy,
     CoChange,
     ConceptImplementedBy,
@@ -808,6 +808,11 @@ pub struct UlMemoryArtifact {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct GraphHealthResponse {
+    pub project_id: ProjectId,
+    pub scan_limit: u64,
+    pub scan_truncated: bool,
+    pub unsupported_relation_families: Vec<String>,
+    pub scope_head_supported: bool,
     pub orphan_claims: u64,
     pub claims_without_support: u64,
     pub claims_without_verification: u64,

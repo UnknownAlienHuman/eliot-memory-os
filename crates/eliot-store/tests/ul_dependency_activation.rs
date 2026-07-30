@@ -15,10 +15,13 @@ type TestResult<T = ()> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 fn u8_2_reverse_index_dirty_state_survives_store_restart() -> TestResult {
     const TEST_NAME: &str = "u8_2_reverse_index_dirty_state_survives_store_restart";
     if std::env::var("ELIOT_UL_U8_STORE_CHILD").as_deref() != Ok(TEST_NAME) {
-        let status = Command::new(std::env::current_exe()?)
+        let credentials =
+            eliot_windows_ipc::test_support::IsolatedTestCredentialFixture::new(TEST_NAME)?;
+        let mut command = Command::new(std::env::current_exe()?);
+        credentials.configure_command(&mut command);
+        let status = command
             .env("ELIOT_UL_U8_STORE_CHILD", TEST_NAME)
             .env("ELIOT_ALLOW_LEGACY_PASSWORD_FILE_MIGRATION", "1")
-            .env("ELIOT_TEST_ALLOW_LEGACY_OPERATOR_CURSOR_KEY_FILE", "1")
             .args(["--exact", TEST_NAME, "--nocapture"])
             .status()?;
         if !status.success() {

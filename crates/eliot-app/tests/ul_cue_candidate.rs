@@ -20,7 +20,7 @@ type TestResult<T = ()> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[allow(clippy::too_many_lines)]
 async fn t03_candidate_persists_normalized_bindings() -> TestResult {
-    if rerun_with_legacy_credential_gate("t03_candidate_persists_normalized_bindings")? {
+    if rerun_with_isolated_credential_backend("t03_candidate_persists_normalized_bindings")? {
         return Ok(());
     }
     let harness = Harness::start(8904).await?;
@@ -125,14 +125,17 @@ async fn t03_candidate_persists_normalized_bindings() -> TestResult {
     Ok(())
 }
 
-fn rerun_with_legacy_credential_gate(test_name: &str) -> TestResult<bool> {
+fn rerun_with_isolated_credential_backend(test_name: &str) -> TestResult<bool> {
     if std::env::var("ELIOT_UL_T03_APP_CHILD").as_deref() == Ok(test_name) {
         return Ok(false);
     }
-    let status = Command::new(std::env::current_exe()?)
+    let credentials =
+        eliot_windows_ipc::test_support::IsolatedTestCredentialFixture::new(test_name)?;
+    let mut command = Command::new(std::env::current_exe()?);
+    credentials.configure_command(&mut command);
+    let status = command
         .env("ELIOT_UL_T03_APP_CHILD", test_name)
         .env("ELIOT_ALLOW_LEGACY_PASSWORD_FILE_MIGRATION", "1")
-        .env("ELIOT_TEST_ALLOW_LEGACY_OPERATOR_CURSOR_KEY_FILE", "1")
         .args(["--exact", test_name, "--nocapture"])
         .status()?;
     if !status.success() {

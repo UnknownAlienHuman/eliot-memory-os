@@ -14,10 +14,13 @@ type TestResult<T = ()> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 fn u9_1_assignment_is_stable_across_restart_and_project_scoped() -> TestResult {
     const TEST_NAME: &str = "u9_1_assignment_is_stable_across_restart_and_project_scoped";
     if std::env::var("ELIOT_UL_U9_STORE_CHILD").as_deref() != Ok(TEST_NAME) {
-        let status = Command::new(std::env::current_exe()?)
+        let credentials =
+            eliot_windows_ipc::test_support::IsolatedTestCredentialFixture::new(TEST_NAME)?;
+        let mut command = Command::new(std::env::current_exe()?);
+        credentials.configure_command(&mut command);
+        let status = command
             .env("ELIOT_UL_U9_STORE_CHILD", TEST_NAME)
             .env("ELIOT_ALLOW_LEGACY_PASSWORD_FILE_MIGRATION", "1")
-            .env("ELIOT_TEST_ALLOW_LEGACY_OPERATOR_CURSOR_KEY_FILE", "1")
             .args(["--exact", TEST_NAME, "--nocapture"])
             .status()?;
         if !status.success() {

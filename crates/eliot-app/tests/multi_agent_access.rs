@@ -20,7 +20,7 @@ fn facade_and_daemon_resolve_one_runtime_across_windows_path_spellings() -> Test
     write_test_config(runtime.path(), &config_path, free_local_port()?)?;
 
     let mut daemon = OwnedChild::spawn(
-        governor_command()
+        governor_command(runtime.path())
             .arg("--config")
             .arg(&config_path)
             .args(["daemon", "run"])
@@ -43,7 +43,7 @@ fn facade_and_daemon_resolve_one_runtime_across_windows_path_spellings() -> Test
         "the red test requires Windows canonicalization to add a distinct path spelling"
     );
 
-    let mut facade = governor_command()
+    let mut facade = governor_command(runtime.path())
         .arg("--config")
         .arg(&canonical_config)
         .args(["mcp", "stdio", "--profile", "external_auditor"])
@@ -111,7 +111,7 @@ fn doctor_and_facade_name_the_exact_authentication_mismatch() -> TestResult {
         serde_json::to_vec_pretty(&authentication)?,
     )?;
 
-    let doctor = governor_command()
+    let doctor = governor_command(runtime.path())
         .arg("--config")
         .arg(&config_path)
         .args(["daemon", "doctor"])
@@ -129,7 +129,7 @@ fn doctor_and_facade_name_the_exact_authentication_mismatch() -> TestResult {
             .is_some_and(|detail| detail.ends_with("pipe_name"))
     );
 
-    let output = governor_command()
+    let output = governor_command(runtime.path())
         .arg("--config")
         .arg(&config_path)
         .args(["mcp", "stdio", "--profile", "external_auditor"])
@@ -283,7 +283,7 @@ fn default_instance_bootstrap_is_stable_and_outside_the_repository() -> TestResu
         .join(".eliot-governor")
         .join("config")
         .join("governor.toml");
-    let output = governor_command()
+    let output = governor_command(runtime.path())
         .args(["daemon", "init-default", "--source-config"])
         .arg(&source_config)
         .env("LOCALAPPDATA", &local_app_data)
@@ -316,7 +316,7 @@ fn standalone_startup_failure_stops_its_owned_database_and_publishes_failed() ->
     fs::create_dir_all(&invalid_wal_path)?;
     let local_app_data = runtime.path().join("local-app-data");
 
-    let output = governor_command()
+    let output = governor_command(runtime.path())
         .arg("--config")
         .arg(&config_path)
         .args(["daemon", "run", "--instance", "default"])
@@ -353,7 +353,7 @@ fn external_candidate_is_shared_without_authority_widening() -> TestResult {
     let mut database = start_surreal(runtime.path(), port)?;
     wait_for_tcp(port, Duration::from_secs(15))?;
     let mut daemon = OwnedChild::spawn(
-        governor_command()
+        governor_command(runtime.path())
             .arg("--config")
             .arg(&config_path)
             .args(["daemon", "run"])
@@ -699,15 +699,20 @@ fn run_facade_requests(
     profile: &str,
     requests: &[Value],
 ) -> TestResult<Vec<Value>> {
-    let mut child = governor_command()
-        .arg("--config")
-        .arg(config_path)
-        .args(["mcp", "stdio", "--profile", profile])
-        .env("ELIOT_DISABLE_REAL_PROVIDER", "1")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()?;
+    let mut child = governor_command(
+        config_path
+            .parent()
+            .and_then(Path::parent)
+            .unwrap_or(config_path),
+    )
+    .arg("--config")
+    .arg(config_path)
+    .args(["mcp", "stdio", "--profile", profile])
+    .env("ELIOT_DISABLE_REAL_PROVIDER", "1")
+    .stdin(Stdio::piped())
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped())
+    .spawn()?;
     let mut stdin = child.stdin.take().ok_or("facade stdin unavailable")?;
     for request in requests {
         serde_json::to_writer(&mut stdin, request)?;
@@ -730,14 +735,19 @@ fn run_facade_requests(
 
 fn start_daemon(config_path: &Path) -> TestResult<OwnedChild> {
     OwnedChild::spawn(
-        governor_command()
-            .arg("--config")
-            .arg(config_path)
-            .args(["daemon", "run"])
-            .env("ELIOT_DISABLE_REAL_PROVIDER", "1")
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null()),
+        governor_command(
+            config_path
+                .parent()
+                .and_then(Path::parent)
+                .unwrap_or(config_path),
+        )
+        .arg("--config")
+        .arg(config_path)
+        .args(["daemon", "run"])
+        .env("ELIOT_DISABLE_REAL_PROVIDER", "1")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null()),
     )
 }
 
@@ -750,15 +760,20 @@ struct LiveFacade {
 
 impl LiveFacade {
     fn start(config_path: &Path, profile: &str) -> TestResult<Self> {
-        let mut child = governor_command()
-            .arg("--config")
-            .arg(config_path)
-            .args(["mcp", "stdio", "--profile", profile])
-            .env("ELIOT_DISABLE_REAL_PROVIDER", "1")
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::inherit())
-            .spawn()?;
+        let mut child = governor_command(
+            config_path
+                .parent()
+                .and_then(Path::parent)
+                .unwrap_or(config_path),
+        )
+        .arg("--config")
+        .arg(config_path)
+        .args(["mcp", "stdio", "--profile", profile])
+        .env("ELIOT_DISABLE_REAL_PROVIDER", "1")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .spawn()?;
         let stdin = child.stdin.take().ok_or("facade stdin unavailable")?;
         let stdout = child.stdout.take().ok_or("facade stdout unavailable")?;
         let (sender, responses) = mpsc::channel();
@@ -1049,7 +1064,7 @@ fn binary() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_eliot-governor"))
 }
 
-fn governor_command() -> Command {
+fn governor_command(fixture_root: &Path) -> Command {
     let mut command = Command::new(binary());
     for variable in [
         "ELIOT_GOVERNOR_CONFIG",
@@ -1063,9 +1078,11 @@ fn governor_command() -> Command {
     ] {
         command.env_remove(variable);
     }
-    command
-        .env("ELIOT_ALLOW_LEGACY_PASSWORD_FILE_MIGRATION", "1")
-        .env("ELIOT_TEST_ALLOW_LEGACY_OPERATOR_CURSOR_KEY_FILE", "1");
+    command.env("ELIOT_ALLOW_LEGACY_PASSWORD_FILE_MIGRATION", "1");
+    eliot_windows_ipc::test_support::IsolatedTestCredentialBackend::EphemeralFile {
+        root: fixture_root.join("operator-cursor-credentials"),
+    }
+    .configure_command(&mut command);
     command
 }
 

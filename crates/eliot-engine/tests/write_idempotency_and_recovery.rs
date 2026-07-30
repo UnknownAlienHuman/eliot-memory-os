@@ -31,7 +31,7 @@ async fn idempotency_same_hash_replay() -> TestResult {
     let first = harness.submit_with_fresh_wal(envelope.clone()).await?;
     let replay = harness.submit_with_fresh_wal(envelope).await?;
     let l2 = harness.fetch_l2(project_id, first.memory_revision).await?;
-    let health = harness.store.graph_health().await?;
+    let health = harness.store.graph_health(project_id).await?;
 
     assert_eq!(first.status, WriteStatus::Committed);
     assert_eq!(replay.status, WriteStatus::IdempotentReplay);
@@ -318,7 +318,14 @@ async fn ten_agent_concurrent_writes_are_governed() -> TestResult {
     assert_eq!(write_ids.len(), 100);
     assert_eq!(sequences, (1..=100).collect::<Vec<_>>());
     assert_eq!(wal.committed_count()?, 100);
-    assert_eq!(harness.store.graph_health().await?.duplicate_write_ids, 0);
+    assert_eq!(
+        harness
+            .store
+            .graph_health(project_id)
+            .await?
+            .duplicate_write_ids,
+        0
+    );
     Ok(())
 }
 
@@ -381,6 +388,14 @@ async fn c5_thirty_two_sessions_across_eight_projects_are_bounded_and_ordered() 
     );
     assert_eq!(metrics.rejected_backpressure, 0);
     assert_eq!(metrics.paused_projects, 0);
+    assert_eq!(
+        harness
+            .store
+            .graph_health(projects[0])
+            .await?
+            .duplicate_write_ids,
+        0
+    );
     for project_id in projects {
         let mut sequences = receipts
             .iter()
@@ -392,7 +407,6 @@ async fn c5_thirty_two_sessions_across_eight_projects_are_bounded_and_ordered() 
         assert_eq!(sequences, (1..=8).collect::<Vec<_>>());
     }
     assert_eq!(wal.committed_count()?, 64);
-    assert_eq!(harness.store.graph_health().await?.duplicate_write_ids, 0);
     Ok(())
 }
 

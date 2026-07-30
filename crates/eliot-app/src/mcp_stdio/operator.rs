@@ -22,9 +22,14 @@ pub(super) fn read_operator_cursor_signing_key(
 pub(super) fn load_or_create_operator_cursor_signing_key_file(
     instance: &RuntimeInstance,
 ) -> Result<[u8; OPERATOR_CURSOR_SIGNING_KEY_BYTES]> {
-    let secret_dir = instance.runtime_dir().join("secrets");
-    fs::create_dir_all(&secret_dir).context("create operator runtime secret directory")?;
-    named_pipe_ipc::restrict_owned_directory_to_current_user(&secret_dir)?;
+    load_or_create_operator_cursor_signing_key_file_at(&instance.runtime_dir().join("secrets"))
+}
+
+fn load_or_create_operator_cursor_signing_key_file_at(
+    secret_dir: &Path,
+) -> Result<[u8; OPERATOR_CURSOR_SIGNING_KEY_BYTES]> {
+    fs::create_dir_all(secret_dir).context("create operator runtime secret directory")?;
+    named_pipe_ipc::restrict_owned_directory_to_current_user(secret_dir)?;
     let key_path = secret_dir.join(OPERATOR_CURSOR_SIGNING_KEY_FILE);
     match read_operator_cursor_signing_key(&key_path) {
         Ok(key) => Ok(key),
@@ -59,15 +64,14 @@ pub(super) fn load_or_create_operator_cursor_signing_key_file(
     }
 }
 
-pub(super) fn load_or_create_operator_cursor_signing_key(
-    instance: &RuntimeInstance,
-) -> Result<[u8; OPERATOR_CURSOR_SIGNING_KEY_BYTES]> {
-    if cfg!(test) || std::env::var(LEGACY_OPERATOR_CURSOR_TEST_OVERRIDE).as_deref() == Ok("1") {
-        return load_or_create_operator_cursor_signing_key_file(instance);
-    }
+fn production_operator_cursor_credential_target(instance: &RuntimeInstance) -> String {
+    format!("operator-cursor/{}", instance.name())
+}
 
-    let credential_id = format!("operator-cursor/{}", instance.name());
-    if let Some(bytes) = eliot_windows_ipc::credential_read_current_user(&credential_id)? {
+fn load_or_create_operator_cursor_signing_key_credential(
+    credential_id: &str,
+) -> Result<[u8; OPERATOR_CURSOR_SIGNING_KEY_BYTES]> {
+    if let Some(bytes) = eliot_windows_ipc::credential_read_current_user(credential_id)? {
         return bytes.try_into().map_err(|bytes: Vec<u8>| {
             anyhow::anyhow!(
                 "operator cursor credential must contain exactly {OPERATOR_CURSOR_SIGNING_KEY_BYTES} bytes, found {}",
@@ -79,8 +83,8 @@ pub(super) fn load_or_create_operator_cursor_signing_key(
     let mut generated = [0_u8; OPERATOR_CURSOR_SIGNING_KEY_BYTES];
     generated[..16].copy_from_slice(uuid::Uuid::new_v4().as_bytes());
     generated[16..].copy_from_slice(uuid::Uuid::new_v4().as_bytes());
-    eliot_windows_ipc::credential_write_current_user(&credential_id, &generated)?;
-    let persisted = eliot_windows_ipc::credential_read_current_user(&credential_id)?
+    eliot_windows_ipc::credential_write_current_user(credential_id, &generated)?;
+    let persisted = eliot_windows_ipc::credential_read_current_user(credential_id)?
         .context("operator cursor credential write did not persist")?;
     if persisted.as_slice() != generated {
         anyhow::bail!("operator cursor credential readback differs from generated value");
@@ -91,6 +95,30 @@ pub(super) fn load_or_create_operator_cursor_signing_key(
             bytes.len()
         )
     })
+}
+
+pub(super) fn load_or_create_operator_cursor_signing_key(
+    instance: &RuntimeInstance,
+) -> Result<[u8; OPERATOR_CURSOR_SIGNING_KEY_BYTES]> {
+    if let Some(backend) =
+        eliot_windows_ipc::test_support::IsolatedTestCredentialBackend::from_process_environment()?
+    {
+        return match backend {
+            eliot_windows_ipc::test_support::IsolatedTestCredentialBackend::EphemeralFile {
+                root,
+            } => load_or_create_operator_cursor_signing_key_file_at(&root),
+            eliot_windows_ipc::test_support::IsolatedTestCredentialBackend::WindowsCredentialManager {
+                target,
+            } => load_or_create_operator_cursor_signing_key_credential(&target),
+        };
+    }
+    if cfg!(test) || std::env::var(LEGACY_OPERATOR_CURSOR_TEST_OVERRIDE).as_deref() == Ok("1") {
+        return load_or_create_operator_cursor_signing_key_file(instance);
+    }
+
+    load_or_create_operator_cursor_signing_key_credential(
+        &production_operator_cursor_credential_target(instance),
+    )
 }
 
 pub(super) fn dispatch_operator_contract() -> Result<Value> {
@@ -4669,4 +4697,54 @@ pub(super) fn validate_operator_command_payload(command: &OperatorCommand) -> Re
         _ => {}
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod credential_tests {
+    use super::{
+        OPERATOR_CURSOR_SIGNING_KEY_FILE, RuntimeInstance,
+        load_or_create_operator_cursor_signing_key_file_at,
+        production_operator_cursor_credential_target,
+    };
+    use eliot_windows_ipc::test_support::{
+        IsolatedTestCredentialBackend, IsolatedTestCredentialFixture,
+        isolated_operator_cursor_credentials,
+    };
+    use std::path::Path;
+
+    #[test]
+    fn ordinary_and_concurrent_fixtures_use_only_unique_ephemeral_files() -> anyhow::Result<()> {
+        let before = isolated_operator_cursor_credentials()?;
+        let first = IsolatedTestCredentialFixture::new("operator-cursor-first")?;
+        let second = IsolatedTestCredentialFixture::new("operator-cursor-second")?;
+        let first_path = first.root().join(OPERATOR_CURSOR_SIGNING_KEY_FILE);
+        let second_path = second.root().join(OPERATOR_CURSOR_SIGNING_KEY_FILE);
+
+        let first_key = load_or_create_operator_cursor_signing_key_file_at(first.root())?;
+        let second_key = load_or_create_operator_cursor_signing_key_file_at(second.root())?;
+
+        assert_ne!(first.root(), second.root());
+        assert_ne!(first_path, second_path);
+        assert_ne!(first_key, second_key);
+        assert!(first_path.is_file());
+        assert!(second_path.is_file());
+        assert_eq!(isolated_operator_cursor_credentials()?, before);
+        Ok(())
+    }
+
+    #[test]
+    fn production_credential_selection_is_unchanged_without_test_configuration()
+    -> anyhow::Result<()> {
+        assert_eq!(
+            IsolatedTestCredentialBackend::from_environment_values(None, None, None)?,
+            None
+        );
+        let instance =
+            RuntimeInstance::select(Path::new("unused-governor.toml"), Some("isolated-default"))?;
+        assert_eq!(
+            production_operator_cursor_credential_target(&instance),
+            "operator-cursor/isolated-default"
+        );
+        Ok(())
+    }
 }

@@ -408,7 +408,7 @@ const fn relation_type_name(relation_type: RelationType) -> &'static str {
         RelationType::Supersedes => "supersedes",
         RelationType::Mentions => "mentions",
         RelationType::BelongsTo => "belongs_to",
-        RelationType::ProducedBy => "produced_by",
+        RelationType::Produces => "produces",
         RelationType::InvalidatedBy => "invalidated_by",
         RelationType::CoChange => "co_change",
         RelationType::ConceptImplementedBy => "concept_implemented_by",

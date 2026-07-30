@@ -13,7 +13,7 @@ type TestResult<T = ()> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn t02_store_replay_is_one_row() -> TestResult {
-    if rerun_with_legacy_credential_gate("t02_store_replay_is_one_row")? {
+    if rerun_with_isolated_credential_backend("t02_store_replay_is_one_row")? {
         return Ok(());
     }
     let harness = Harness::start("replay").await?;
@@ -49,7 +49,7 @@ async fn t02_store_replay_is_one_row() -> TestResult {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn t02_store_conflict_preserves_original() -> TestResult {
-    if rerun_with_legacy_credential_gate("t02_store_conflict_preserves_original")? {
+    if rerun_with_isolated_credential_backend("t02_store_conflict_preserves_original")? {
         return Ok(());
     }
     let harness = Harness::start("conflict").await?;
@@ -105,14 +105,17 @@ fn payload_hash(payload: &Value) -> String {
         .to_string()
 }
 
-fn rerun_with_legacy_credential_gate(test_name: &str) -> TestResult<bool> {
+fn rerun_with_isolated_credential_backend(test_name: &str) -> TestResult<bool> {
     if std::env::var("ELIOT_UL_T02_STORE_CHILD").as_deref() == Ok(test_name) {
         return Ok(false);
     }
-    let status = Command::new(std::env::current_exe()?)
+    let credentials =
+        eliot_windows_ipc::test_support::IsolatedTestCredentialFixture::new(test_name)?;
+    let mut command = Command::new(std::env::current_exe()?);
+    credentials.configure_command(&mut command);
+    let status = command
         .env("ELIOT_UL_T02_STORE_CHILD", test_name)
         .env("ELIOT_ALLOW_LEGACY_PASSWORD_FILE_MIGRATION", "1")
-        .env("ELIOT_TEST_ALLOW_LEGACY_OPERATOR_CURSOR_KEY_FILE", "1")
         .args(["--exact", test_name, "--nocapture"])
         .status()?;
     if !status.success() {

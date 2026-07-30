@@ -2634,6 +2634,11 @@ fn graph_health_markdown(report: &eliot_types::GraphHealthResponse) -> String {
     format!(
         concat!(
             "# Graph Health\n\n",
+            "- project_id: `{}`\n",
+            "- scan_limit: `{}`\n",
+            "- scan_truncated: `{}`\n",
+            "- scope_head_supported: `{}`\n",
+            "- unsupported_relation_families: `{}`\n",
             "- orphan_claims: `{}`\n",
             "- claims_without_support: `{}`\n",
             "- claims_without_verification: `{}`\n",
@@ -2643,6 +2648,11 @@ fn graph_health_markdown(report: &eliot_types::GraphHealthResponse) -> String {
             "- contested_claims: `{}`\n",
             "- duplicate_write_ids: `{}`\n"
         ),
+        report.project_id,
+        report.scan_limit,
+        report.scan_truncated,
+        report.scope_head_supported,
+        report.unsupported_relation_families.join(", "),
         report.orphan_claims,
         report.claims_without_support,
         report.claims_without_verification,

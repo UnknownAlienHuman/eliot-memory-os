@@ -40,6 +40,7 @@ pub enum NamedSurqlOp {
     LoadRecallCandidates,
     FetchAtomsL2,
     FetchAtomsL2Legacy,
+    GraphHealthCapabilities,
     GraphHealth,
     WriterReceipts,
     WriteReceiptById,
@@ -104,6 +105,7 @@ impl NamedSurqlOp {
             Self::LoadRecallCandidates => "load_recall_candidates",
             Self::FetchAtomsL2 => "fetch_atoms_l2",
             Self::FetchAtomsL2Legacy => "fetch_atoms_l2_legacy",
+            Self::GraphHealthCapabilities => "graph_health_capabilities",
             Self::GraphHealth => "graph_health",
             Self::WriterReceipts => "writer_receipts",
             Self::WriteReceiptById => "write_receipt_by_id",
@@ -186,6 +188,9 @@ impl NamedSurqlOp {
             Self::LoadRecallCandidates => include_str!("surql/load_recall_candidates.surql"),
             Self::FetchAtomsL2 => include_str!("surql/fetch_atoms_l2.surql"),
             Self::FetchAtomsL2Legacy => include_str!("surql/fetch_atoms_l2_legacy.surql"),
+            Self::GraphHealthCapabilities => {
+                include_str!("surql/graph_health_capabilities.surql")
+            }
             Self::GraphHealth => include_str!("surql/graph_health.surql"),
             Self::WriterReceipts => include_str!("surql/writer_receipts.surql"),
             Self::WriteReceiptById => include_str!("surql/write_receipt_by_id.surql"),
@@ -259,7 +264,7 @@ impl Default for SurqlTemplateRegistry {
 }
 
 #[allow(clippy::too_many_lines)]
-fn foundational_templates() -> [SurqlTemplate; 41] {
+fn foundational_templates() -> [SurqlTemplate; 42] {
     [
         template(
             NamedSurqlOp::SchemaMigrate,
@@ -488,6 +493,12 @@ fn foundational_templates() -> [SurqlTemplate; 41] {
             "FetchAtomsL2Request",
             "FetchAtomsL2Response",
             512 * 1024,
+        ),
+        template(
+            NamedSurqlOp::GraphHealthCapabilities,
+            "GraphHealthCapabilitiesRequest",
+            "GraphHealthCapabilitiesResponse",
+            128 * 1024,
         ),
         template(
             NamedSurqlOp::GraphHealth,

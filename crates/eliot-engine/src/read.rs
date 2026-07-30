@@ -178,8 +178,11 @@ impl GraphHealthService {
         Self { store }
     }
 
-    pub async fn health(&self) -> Result<GraphHealthResponse, EngineError> {
-        Ok(self.store.graph_health().await?)
+    pub async fn health(
+        &self,
+        project_id: eliot_types::ProjectId,
+    ) -> Result<GraphHealthResponse, EngineError> {
+        Ok(self.store.graph_health(project_id).await?)
     }
 }
 

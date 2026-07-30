@@ -602,7 +602,10 @@ enum MemoryCommand {
 
 #[derive(Debug, Subcommand)]
 enum GraphCommand {
-    Health,
+    Health {
+        #[arg(long)]
+        project: String,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -2085,8 +2088,8 @@ async fn dispatch_command(
         Command::Skill { command } => dispatch_skill_command(config, command).await,
         Command::SkillCurator { command } => dispatch_skill_curator_command(config, command).await,
         Command::Graph {
-            command: GraphCommand::Health,
-        } => commands::run_graph_health(config).await,
+            command: GraphCommand::Health { project },
+        } => commands::run_graph_health(config, &project).await,
         Command::Ul { command } => match command {
             commands::UlCommand::Doctor { host } => commands::run_ul_doctor(host),
             commands::UlCommand::MineGit { project, root } => {

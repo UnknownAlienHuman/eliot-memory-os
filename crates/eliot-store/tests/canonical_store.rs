@@ -2,16 +2,17 @@ use eliot_store::{CanonicalStore, SurrealServerSupervisor};
 use eliot_types::{
     AgentId, AutonomyRunContract, AutonomyRunState, AutonomyRunTransitionReceipt,
     CanonicalTraceCompletenessContract, ClaimCardInput, ClaimId, CredentialProviderKind,
-    EpistemicStatus, ExperimentalMetaPolicyPayload, ForgettingOperator, ForgettingReason,
-    GovernorConfig, HarnessExperimentRecord, HarnessExperimentRecordId, IdempotencyOptions,
-    LifecycleStatus, LifecycleWriteOptions, MemoryEcologyDecision, MemoryLifecycleState,
-    MemoryRevision, MemoryStateTransition, MemoryTrajectoryCorrectness, MemoryWriteEnvelope,
-    MetaCandidateChangeClass, MetaExperimentDecision, MetaPolicyExecutionAction,
-    MetaPolicyExecutionReceipt, MinorityPressureRecord, MinorityPressureStatus, OperationId,
-    ProjectId, ProjectSequence, ReadConsistencyMode, RecallL0Request, ReplayAudit, ReplayRun,
+    EpistemicStatus, EvidenceAtomInput, EvidenceId, ExperimentalMetaPolicyPayload,
+    ForgettingOperator, ForgettingReason, GovernorConfig, HarnessExperimentRecord,
+    HarnessExperimentRecordId, IdempotencyOptions, LifecycleStatus, LifecycleWriteOptions,
+    MemoryEcologyDecision, MemoryLifecycleState, MemoryRevision, MemoryStateTransition,
+    MemoryTrajectoryCorrectness, MemoryWriteEnvelope, MetaCandidateChangeClass,
+    MetaExperimentDecision, MetaPolicyExecutionAction, MetaPolicyExecutionReceipt,
+    MinorityPressureRecord, MinorityPressureStatus, OperationId, ProjectId, ProjectSequence,
+    ReadConsistencyMode, RecallL0Request, RelationInput, RelationType, ReplayAudit, ReplayRun,
     ReplayRunId, ReplayRunProfile, ReplayRunStatus, ReplaySetId, SemanticCommandKind,
-    SurrealServerConfig, TaintClass, TaskId, ToolObservationInput, Visibility, WriteId,
-    WriteStatus,
+    SurrealServerConfig, TaintClass, TaskId, ToolObservationInput, VerificationResult,
+    VerificationRunInput, Visibility, WriteId, WriteStatus,
 };
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -1104,6 +1105,173 @@ async fn persist_physical_restart_baseline(
     )
     .await?;
     Ok(transition)
+}
+
+fn graph_health_fixture_envelope(
+    project_id: ProjectId,
+    task_id: TaskId,
+    sequence: u64,
+    claim_id: ClaimId,
+    complete: bool,
+) -> Result<MemoryWriteEnvelope, serde_json::Error> {
+    let mut envelope = canonical_envelope(
+        project_id,
+        Some(task_id),
+        sequence,
+        "graph_health_fixture",
+        &json!({ "complete": complete }),
+    )?;
+    envelope.command_kind = SemanticCommandKind::ClaimPropose;
+    envelope.tool_observations.clear();
+    envelope.claims.push(ClaimCardInput {
+        claim_id,
+        statement: if complete {
+            "complete graph-health fixture"
+        } else {
+            "planted graph-health orphan"
+        }
+        .to_owned(),
+        status: EpistemicStatus::Verified,
+        payload: json!({ "fixture": "task-01-graph-health" }),
+    });
+    if complete {
+        let evidence_id = EvidenceId::new_v7();
+        let verification_id = eliot_types::VerificationId::new_v7();
+        envelope.evidence_atoms.push(EvidenceAtomInput {
+            evidence_id,
+            source_id: "source:task-01-graph-health".to_owned(),
+            summary: "real SurrealDB graph-health evidence".to_owned(),
+            payload: json!({ "db_version": "3.1.4" }),
+        });
+        envelope.verification_runs.push(VerificationRunInput {
+            verification_id,
+            claim_id: Some(claim_id),
+            verifier: "task-01-real-surreal".to_owned(),
+            result: VerificationResult::Passed,
+            summary: "complete fixture verified".to_owned(),
+            payload: json!({ "real_surreal": true }),
+        });
+        envelope.relations = vec![
+            RelationInput {
+                relation_type: RelationType::Supports,
+                from: evidence_id.to_string(),
+                to: claim_id.to_string(),
+            },
+            RelationInput {
+                relation_type: RelationType::VerifiedBy,
+                from: claim_id.to_string(),
+                to: verification_id.to_string(),
+            },
+            RelationInput {
+                relation_type: RelationType::BelongsTo,
+                from: claim_id.to_string(),
+                to: project_id.to_string(),
+            },
+            RelationInput {
+                relation_type: RelationType::Produces,
+                from: verification_id.to_string(),
+                to: evidence_id.to_string(),
+            },
+        ];
+    }
+    envelope.input_hash = blake3::hash(&serde_json::to_vec(&json!({
+        "claims": envelope.claims,
+        "evidence_atoms": envelope.evidence_atoms,
+        "verification_runs": envelope.verification_runs,
+        "relations": envelope.relations,
+    }))?)
+    .to_hex()
+    .to_string();
+    Ok(envelope)
+}
+
+fn relation_count(report: &eliot_types::GraphHealthResponse, name: &str) -> Option<u64> {
+    report
+        .relation_count_by_type
+        .iter()
+        .find(|count| count.name == name)
+        .map(|count| count.count)
+}
+
+#[tokio::test]
+#[ignore = "requires an authenticated local SurrealDB 3.1.4"]
+async fn graph_health_is_project_scoped_schema_aware_and_restart_stable()
+-> Result<(), Box<dyn Error>> {
+    let mut root = RestartTestRoot::new()?;
+    let port = free_local_port()?;
+    let config = root.config(port)?;
+    let version = Command::new(&config.exe).arg("--version").output()?;
+    assert!(version.status.success());
+    assert!(
+        String::from_utf8_lossy(&version.stdout).contains("3.1.4"),
+        "Task 01 graph-health certification requires SurrealDB 3.1.4"
+    );
+
+    let first_server = SurrealServerSupervisor::new(config.clone())
+        .start_or_connect()
+        .await?;
+    let first_pid = first_server
+        .started_pid()
+        .ok_or("graph-health test did not own the first SurrealDB process")?;
+    let store = CanonicalStore::new(config.clone());
+    store.migrate_schema().await?;
+    let project_id = ProjectId::new_v7();
+    let task_id = TaskId::new_v7();
+    let complete = graph_health_fixture_envelope(project_id, task_id, 1, ClaimId::new_v7(), true)?;
+    let orphan = graph_health_fixture_envelope(project_id, task_id, 2, ClaimId::new_v7(), false)?;
+    assert_eq!(
+        store.apply_write_envelope(&complete).await?.status,
+        WriteStatus::Committed
+    );
+    assert_eq!(
+        store.apply_write_envelope(&orphan).await?.status,
+        WriteStatus::Committed
+    );
+
+    let before = store.graph_health(project_id).await?;
+    assert_eq!(before.project_id, project_id);
+    assert!(!before.scan_truncated);
+    assert!(before.scope_head_supported);
+    assert!(before.unsupported_relation_families.is_empty());
+    assert_eq!(before.orphan_claims, 1);
+    assert_eq!(before.claims_without_support, 1);
+    assert_eq!(before.claims_without_verification, 1);
+    assert_eq!(before.weak_claims, 0);
+    assert_eq!(before.orphan_evidence, 0);
+    assert_eq!(before.orphan_verifications, 0);
+    assert_eq!(before.duplicate_write_ids, 0);
+    for relation in ["supports", "verified_by", "belongs_to", "produces"] {
+        assert_eq!(relation_count(&before, relation), Some(1));
+    }
+
+    drop(store);
+    assert!(
+        first_server
+            .shutdown_if_spawned()
+            .await?
+            .stopped_owned_process
+    );
+    let second_server = SurrealServerSupervisor::new(config.clone())
+        .start_or_connect()
+        .await?;
+    let second_pid = second_server
+        .started_pid()
+        .ok_or("graph-health test did not own the restarted SurrealDB process")?;
+    assert_ne!(first_pid, second_pid);
+    let restarted_store = CanonicalStore::new(config);
+    restarted_store.migrate_schema().await?;
+    let after = restarted_store.graph_health(project_id).await?;
+    assert_eq!(serde_json::to_value(after)?, serde_json::to_value(before)?);
+    drop(restarted_store);
+    assert!(
+        second_server
+            .shutdown_if_spawned()
+            .await?
+            .stopped_owned_process
+    );
+    let removed = root.remove()?;
+    assert!(!removed.exists());
+    Ok(())
 }
 
 #[tokio::test]

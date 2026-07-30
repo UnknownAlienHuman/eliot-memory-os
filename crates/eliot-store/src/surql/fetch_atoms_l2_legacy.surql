@@ -5,7 +5,7 @@ LET $contradicts = SELECT relation_type, from, to FROM contradicts WHERE project
 LET $supersedes = SELECT relation_type, from, to FROM supersedes WHERE project_id = $request.project_id LIMIT 50;
 LET $mentions = SELECT relation_type, from, to FROM mentions WHERE project_id = $request.project_id LIMIT 50;
 LET $belongs_to = SELECT relation_type, from, to FROM belongs_to WHERE project_id = $request.project_id LIMIT 50;
-LET $produced_by = SELECT relation_type, from, to FROM produced_by WHERE project_id = $request.project_id LIMIT 50;
+LET $produces = SELECT relation_type, from, to FROM produces WHERE project_id = $request.project_id LIMIT 50;
 LET $invalidated_by = SELECT relation_type, from, to FROM invalidated_by WHERE project_id = $request.project_id LIMIT 50;
 LET $co_change = SELECT relation_type, from, to FROM co_change WHERE project_id = $request.project_id LIMIT 50;
 LET $concept_implemented_by = SELECT relation_type, from, to FROM concept_implemented_by WHERE project_id = $request.project_id LIMIT 50;
@@ -29,7 +29,7 @@ RETURN {
     $supersedes,
     $mentions,
     $belongs_to,
-    $produced_by,
+    $produces,
     $invalidated_by,
     $co_change,
     $concept_implemented_by,
