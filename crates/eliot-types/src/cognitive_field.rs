@@ -6,6 +6,9 @@ use std::collections::BTreeMap;
 use time::OffsetDateTime;
 
 pub const COGNITIVE_FIELD_SUITE_SCHEMA_VERSION: &str = "eliot-cognitive-field-suite-v2";
+pub const COGNITIVE_FIELD_V2_HARNESS_VERSION: &str = "cognitive-field-v2";
+pub const COGNITIVE_CORE_QUALIFICATION_HARNESS_VERSION: &str = "cognitive-core-qualification-v1";
+pub const COGNITIVE_CORE_QUALIFICATION_PROVIDER_CALLS: u8 = 12;
 pub const COGNITIVE_FIELD_ORACLE_SCHEMA_VERSION: &str = "eliot-task-intent-oracle-v1";
 pub const COGNITIVE_UNDERSTANDING_SCHEMA_VERSION: &str = "eliot-cognitive-understanding-answer-v1";
 pub const COGNITIVE_JUDGE_SCHEMA_VERSION: &str = "eliot-cognitive-judge-result-v1";
@@ -361,6 +364,8 @@ pub struct CognitiveFieldProviderCallPlan {
     pub expected_provider_executable_sha256: String,
     pub prompt_ref: String,
     pub prompt_sha256: String,
+    pub canonical_schema_sha256: String,
+    pub provider_schema_sha256: String,
     pub provider_smoke: bool,
     pub counts_against_cap: bool,
     pub executions: Vec<CognitiveFieldExecutionKey>,
@@ -375,6 +380,10 @@ pub struct CognitiveFieldProviderPlan {
     pub calls: Vec<CognitiveFieldProviderCallPlan>,
     pub planned_provider_calls: u8,
     pub planned_smoke_calls: u8,
+    #[serde(default)]
+    pub planned_reused_roles: u8,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role_evidence_plan_hash: Option<String>,
     pub plan_hash: String,
     #[schemars(with = "String")]
     #[serde(with = "time::serde::rfc3339")]
@@ -562,8 +571,10 @@ pub struct CognitiveFieldPlan {
     pub plan_hash: String,
 }
 
-pub fn cognitive_understanding_answer_schema() -> Result<Value, serde_json::Error> {
+#[allow(clippy::expect_used)]
+pub fn cognitive_understanding_answer_schema() -> Value {
     serde_json::to_value(schemars::schema_for!(CognitiveUnderstandingAnswer))
+        .expect("CognitiveUnderstandingAnswer schema must serialize")
 }
 
 pub fn cognitive_judge_result_schema() -> Result<Value, serde_json::Error> {

@@ -1,19 +1,252 @@
 {
+  "$defs": {
+    "CognitiveFieldCausalHop": {
+      "additionalProperties": false,
+      "properties": {
+        "evidence_refs": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "from": {
+          "type": "string"
+        },
+        "hop_kind": {
+          "type": "string"
+        },
+        "relation": {
+          "type": "string"
+        },
+        "status": {
+          "type": "string"
+        },
+        "to": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "hop_kind",
+        "from",
+        "relation",
+        "to",
+        "evidence_refs",
+        "status"
+      ],
+      "type": "object"
+    },
+    "CognitiveMemoryCondition": {
+      "enum": [
+        "treatment",
+        "memory_free_control",
+        "raw_corpus",
+        "distilled_corpus"
+      ],
+      "type": "string"
+    }
+  },
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "title": "CognitiveUnderstandingAnswer",
-  "description": "Generated authoritatively from eliot_types::CognitiveUnderstandingAnswer; private reasoning is forbidden.",
-  "type": "object",
   "additionalProperties": false,
+  "properties": {
+    "case_id": {
+      "type": "string"
+    },
+    "causal_hops": {
+      "items": {
+        "$ref": "#/$defs/CognitiveFieldCausalHop"
+      },
+      "type": "array"
+    },
+    "cheapest_discriminative_probes": {
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "confidence_by_section": {
+      "additionalProperties": {
+        "format": "uint8",
+        "maximum": 255,
+        "minimum": 0,
+        "type": "integer"
+      },
+      "type": "object"
+    },
+    "current_truth_refs": {
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "desired_state": {
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "entrypoint_refs": {
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "expected_observable": {
+      "type": "string"
+    },
+    "files_to_change": {
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "files_to_inspect": {
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "influence_receipt_refs": {
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "invariants": {
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "known_failures": {
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "memory_condition": {
+      "$ref": "#/$defs/CognitiveMemoryCondition"
+    },
+    "memory_handles_expanded": {
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "memory_handles_received": {
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "memory_handles_used": {
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "next_action": {
+      "type": "string"
+    },
+    "non_goals": {
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "open_unknowns": {
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "owner_modules": {
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "predicted_changed_paths": {
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "predicted_failing_verifiers": {
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "project_id": {
+      "format": "uuid",
+      "type": "string"
+    },
+    "project_purpose": {
+      "type": "string"
+    },
+    "schema_version": {
+      "type": "string"
+    },
+    "stale_or_rejected_memory_refs": {
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "stop_condition": {
+      "type": "string"
+    },
+    "subsystem_refs": {
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "task_id": {
+      "format": "uuid",
+      "type": "string"
+    },
+    "user_goal": {
+      "type": "string"
+    },
+    "verifier_ref": {
+      "type": "string"
+    }
+  },
   "required": [
-    "schema_version", "case_id", "project_id", "task_id", "memory_condition",
-    "user_goal", "desired_state", "non_goals", "project_purpose",
-    "subsystem_refs", "owner_modules", "entrypoint_refs", "files_to_inspect",
-    "files_to_change", "causal_hops", "invariants", "known_failures",
-    "current_truth_refs", "stale_or_rejected_memory_refs", "open_unknowns",
-    "cheapest_discriminative_probes", "predicted_changed_paths",
-    "predicted_failing_verifiers", "next_action", "expected_observable",
-    "verifier_ref", "stop_condition", "memory_handles_received",
-    "memory_handles_expanded", "memory_handles_used", "influence_receipt_refs",
+    "schema_version",
+    "case_id",
+    "project_id",
+    "task_id",
+    "memory_condition",
+    "user_goal",
+    "desired_state",
+    "non_goals",
+    "project_purpose",
+    "subsystem_refs",
+    "owner_modules",
+    "entrypoint_refs",
+    "files_to_inspect",
+    "files_to_change",
+    "causal_hops",
+    "invariants",
+    "known_failures",
+    "current_truth_refs",
+    "stale_or_rejected_memory_refs",
+    "open_unknowns",
+    "cheapest_discriminative_probes",
+    "predicted_changed_paths",
+    "predicted_failing_verifiers",
+    "next_action",
+    "expected_observable",
+    "verifier_ref",
+    "stop_condition",
+    "memory_handles_received",
+    "memory_handles_expanded",
+    "memory_handles_used",
+    "influence_receipt_refs",
     "confidence_by_section"
-  ]
+  ],
+  "title": "CognitiveUnderstandingAnswer",
+  "type": "object"
 }

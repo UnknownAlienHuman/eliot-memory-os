@@ -1,13 +1,14 @@
 use crate::EngineError;
 use eliot_types::{
+    COGNITIVE_CORE_QUALIFICATION_HARNESS_VERSION, COGNITIVE_CORE_QUALIFICATION_PROVIDER_CALLS,
     COGNITIVE_DETERMINISTIC_REPORT_SCHEMA_VERSION, COGNITIVE_FIELD_MAX_PROVIDER_CALLS,
     COGNITIVE_FIELD_ORACLE_SCHEMA_VERSION, COGNITIVE_FIELD_SUITE_SCHEMA_VERSION,
-    COGNITIVE_JUDGE_SCHEMA_VERSION, COGNITIVE_UNDERSTANDING_SCHEMA_VERSION,
-    CognitiveDeterministicReport, CognitiveFieldCase, CognitiveFieldCaseGrade,
-    CognitiveFieldFamily, CognitiveFieldRole, CognitiveFieldSuite, CognitiveFieldValidationReport,
-    CognitiveHardGateKind, CognitiveJudgeResult, CognitiveMemoryCondition,
-    CognitiveOracleLeakFinding, CognitiveOracleLeakReport, CognitiveRepositoryCondition,
-    CognitiveUnderstandingAnswer, TaskIntentOracle,
+    COGNITIVE_FIELD_V2_HARNESS_VERSION, COGNITIVE_JUDGE_SCHEMA_VERSION,
+    COGNITIVE_UNDERSTANDING_SCHEMA_VERSION, CognitiveDeterministicReport, CognitiveFieldCase,
+    CognitiveFieldCaseGrade, CognitiveFieldFamily, CognitiveFieldRole, CognitiveFieldSuite,
+    CognitiveFieldValidationReport, CognitiveHardGateKind, CognitiveJudgeResult,
+    CognitiveMemoryCondition, CognitiveOracleLeakFinding, CognitiveOracleLeakReport,
+    CognitiveRepositoryCondition, CognitiveUnderstandingAnswer, TaskIntentOracle,
 };
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
@@ -23,8 +24,14 @@ impl CognitiveFieldGradingService {
                 "schema_version must be {COGNITIVE_FIELD_SUITE_SCHEMA_VERSION}"
             ));
         }
-        if suite.harness_version.trim().is_empty() {
-            errors.push("harness_version must not be empty".to_owned());
+        let field_v2 = suite.harness_version == COGNITIVE_FIELD_V2_HARNESS_VERSION;
+        let core_qualification =
+            suite.harness_version == COGNITIVE_CORE_QUALIFICATION_HARNESS_VERSION;
+        if !field_v2 && !core_qualification {
+            errors.push(format!(
+                "harness_version must be {COGNITIVE_FIELD_V2_HARNESS_VERSION} or \
+                 {COGNITIVE_CORE_QUALIFICATION_HARNESS_VERSION}"
+            ));
         }
         if suite.hard_provider_call_cap == 0
             || suite.hard_provider_call_cap > COGNITIVE_FIELD_MAX_PROVIDER_CALLS
@@ -131,40 +138,77 @@ impl CognitiveFieldGradingService {
             }
         }
 
-        if suite.cases.len() != 48 {
-            errors.push(format!(
-                "field-v2 suite must contain exactly 48 cases, found {}",
-                suite.cases.len()
-            ));
-        }
-        let expected_ordinals = (1..=48).collect::<BTreeSet<_>>();
-        if ordinals != expected_ordinals {
-            errors.push("field-v2 suite ordinals must be exactly 1 through 48".to_owned());
-        }
-        for (family, expected) in [
-            (CognitiveFieldFamily::U, 12usize),
-            (CognitiveFieldFamily::M, 8),
-            (CognitiveFieldFamily::D, 10),
-            (CognitiveFieldFamily::A, 6),
-            (CognitiveFieldFamily::H, 6),
-            (CognitiveFieldFamily::R, 6),
-        ] {
-            if family_counts.get(&family).copied().unwrap_or_default() != expected {
+        if field_v2 {
+            if suite.cases.len() != 48 {
                 errors.push(format!(
-                    "family {family:?} must contain exactly {expected} cases"
+                    "field-v2 suite must contain exactly 48 cases, found {}",
+                    suite.cases.len()
                 ));
             }
+            let expected_ordinals = (1..=48).collect::<BTreeSet<_>>();
+            if ordinals != expected_ordinals {
+                errors.push("field-v2 suite ordinals must be exactly 1 through 48".to_owned());
+            }
+            for (family, expected) in [
+                (CognitiveFieldFamily::U, 12usize),
+                (CognitiveFieldFamily::M, 8),
+                (CognitiveFieldFamily::D, 10),
+                (CognitiveFieldFamily::A, 6),
+                (CognitiveFieldFamily::H, 6),
+                (CognitiveFieldFamily::R, 6),
+            ] {
+                if family_counts.get(&family).copied().unwrap_or_default() != expected {
+                    errors.push(format!(
+                        "family {family:?} must contain exactly {expected} cases"
+                    ));
+                }
+            }
+            match suite.cases.iter().find(|case| case.case_id == "H06") {
+                Some(case)
+                    if case.repository_condition
+                        == CognitiveRepositoryCondition::SecondRepository => {}
+                _ => errors.push("H06 must use the real second-repository condition".to_owned()),
+            }
+            if suite.cases.iter().any(|case| {
+                case.repository_condition == CognitiveRepositoryCondition::SecondRepository
+                    && case.case_id != "H06"
+            }) {
+                errors.push("only H06 may declare the second-repository condition".to_owned());
+            }
         }
-        match suite.cases.iter().find(|case| case.case_id == "H06") {
-            Some(case)
-                if case.repository_condition == CognitiveRepositoryCondition::SecondRepository => {}
-            _ => errors.push("H06 must use the real second-repository condition".to_owned()),
-        }
-        if suite.cases.iter().any(|case| {
-            case.repository_condition == CognitiveRepositoryCondition::SecondRepository
-                && case.case_id != "H06"
-        }) {
-            errors.push("only H06 may declare the second-repository condition".to_owned());
+        if core_qualification {
+            let expected_case_ids = ["U03", "U06", "U11"]
+                .into_iter()
+                .map(str::to_owned)
+                .collect::<BTreeSet<_>>();
+            let expected_ordinals = [3_u8, 6, 11].into_iter().collect::<BTreeSet<_>>();
+            if case_ids != expected_case_ids
+                || ordinals != expected_ordinals
+                || suite.cases.len() != 3
+            {
+                errors.push("core qualification must contain exactly U03, U06, and U11".to_owned());
+            }
+            if suite.hard_provider_call_cap != COGNITIVE_CORE_QUALIFICATION_PROVIDER_CALLS {
+                errors.push(format!(
+                    "core qualification provider call cap must be exactly \
+                     {COGNITIVE_CORE_QUALIFICATION_PROVIDER_CALLS}"
+                ));
+            }
+            let expected_conditions = vec![
+                CognitiveMemoryCondition::Treatment,
+                CognitiveMemoryCondition::MemoryFreeControl,
+            ];
+            if suite.cases.iter().any(|case| {
+                !case.model_backed
+                    || case.repository_condition != CognitiveRepositoryCondition::PrimaryRepository
+                    || case.memory_conditions != expected_conditions
+            }) {
+                errors.push(
+                    "core qualification cases must be model-backed primary-repository \
+                     treatment/control pairs"
+                        .to_owned(),
+                );
+            }
         }
 
         CognitiveFieldValidationReport {

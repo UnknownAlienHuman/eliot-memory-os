@@ -1,5 +1,6 @@
 use eliot_engine::CognitiveFieldGradingService;
 use eliot_types::{
+    COGNITIVE_CORE_QUALIFICATION_HARNESS_VERSION, COGNITIVE_CORE_QUALIFICATION_PROVIDER_CALLS,
     COGNITIVE_DETERMINISTIC_REPORT_SCHEMA_VERSION, COGNITIVE_FIELD_ORACLE_SCHEMA_VERSION,
     COGNITIVE_FIELD_SUITE_SCHEMA_VERSION, CognitiveDeterministicReport, CognitiveFieldSuite,
     CognitiveHardGateEvidence, CognitiveMemoryCondition, ProjectId, TaskId, TaskIntentOracle,
@@ -47,6 +48,30 @@ fn exact_forty_eight_case_suite_is_valid_and_invalid_fields_are_aggregated() -> 
             .errors
             .iter()
             .any(|error| error.contains("three isolated roles"))
+    );
+    Ok(())
+}
+
+#[test]
+fn bounded_core_qualification_profile_is_separate_from_field_v2() -> TestResult {
+    let mut core = suite()?;
+    core.harness_version = COGNITIVE_CORE_QUALIFICATION_HARNESS_VERSION.to_owned();
+    core.hard_provider_call_cap = COGNITIVE_CORE_QUALIFICATION_PROVIDER_CALLS;
+    core.cases
+        .retain(|case| matches!(case.case_id.as_str(), "U03" | "U06" | "U11"));
+    let report = CognitiveFieldGradingService::validate_suite(&core);
+    assert!(report.valid, "{:?}", report.errors);
+    assert_eq!(report.case_count, 3);
+    assert_eq!(report.model_backed_case_count, 3);
+
+    core.hard_provider_call_cap -= 1;
+    let report = CognitiveFieldGradingService::validate_suite(&core);
+    assert!(!report.valid);
+    assert!(
+        report
+            .errors
+            .iter()
+            .any(|error| error.contains("exactly 12"))
     );
     Ok(())
 }

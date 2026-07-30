@@ -6,9 +6,17 @@ and no TaskIntentOracle. Retrieve or inherit memory yourself when the sealed
 condition allows it. For a memory-free control, do not request, accept, or use
 memory injection, exact handles, or influence.
 
-Return exactly one CognitiveUnderstandingAnswer JSON object matching the
-published schema. Report externally verifiable state only. Do not reveal or
-request private reasoning. Cite exact current source/evidence refs, mark stale
-or historical memory explicitly, state open unknowns, and choose the cheapest
-discriminative probe before any material action whose causal bridge is not
-verified.
+BEGIN_COGNITIVE_UNDERSTANDING_SCHEMA
+sha256={{COGNITIVE_UNDERSTANDING_SCHEMA_SHA256}}
+{{COGNITIVE_UNDERSTANDING_SCHEMA_JSON}}
+END_COGNITIVE_UNDERSTANDING_SCHEMA
+
+Return exactly one JSON object accepted by that schema.
+Do not add prose before or after the JSON.
+Do not coerce an array into a string or a string into an array.
+Use the exact bound identifiers and memory condition supplied by the controller.
+
+Report externally verifiable state only. Do not reveal or request private
+reasoning. Cite exact current source/evidence refs, mark stale or historical
+memory explicitly, state open unknowns, and choose the cheapest discriminative
+probe before any material action whose causal bridge is not verified.

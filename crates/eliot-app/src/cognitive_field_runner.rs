@@ -1,7 +1,8 @@
 use anyhow::{Context, Result, bail, ensure};
 use eliot_engine::CognitiveFieldGradingService;
 use eliot_types::{
-    AgentHostId, COGNITIVE_DETERMINISTIC_EVIDENCE_SCHEMA_VERSION,
+    AgentHostId, COGNITIVE_CORE_QUALIFICATION_HARNESS_VERSION,
+    COGNITIVE_CORE_QUALIFICATION_PROVIDER_CALLS, COGNITIVE_DETERMINISTIC_EVIDENCE_SCHEMA_VERSION,
     COGNITIVE_DETERMINISTIC_REPORT_SCHEMA_VERSION, COGNITIVE_FIELD_CONTRACT_SCHEMA_VERSION,
     COGNITIVE_FIELD_ORACLE_SCHEMA_VERSION, COGNITIVE_FIELD_PLAN_SCHEMA_VERSION,
     COGNITIVE_FIELD_PROVIDER_EVIDENCE_SCHEMA_VERSION, COGNITIVE_FIELD_PROVIDER_PLAN_SCHEMA_VERSION,
@@ -17,7 +18,7 @@ use eliot_types::{
     cognitive_judge_result_schema, cognitive_understanding_answer_schema,
     cognitive_worker_result_schema, inspect_secret_bytes,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
@@ -42,13 +43,176 @@ pub fn validate(suite_path: &Path) -> Result<()> {
 pub fn schema(kind: &str) -> Result<()> {
     let schema = match kind.trim().to_ascii_lowercase().as_str() {
         "worker" => cognitive_worker_result_schema()?,
-        "reader" => cognitive_understanding_answer_schema()?,
+        "reader" => cognitive_understanding_answer_schema(),
         "judge" => cognitive_judge_result_schema()?,
         other => {
             bail!("unsupported cognitive field schema {other}; expected worker, reader, or judge")
         }
     };
     print_json(&schema)
+}
+
+const READER_SCHEMA_JSON_PLACEHOLDER: &str = "{{COGNITIVE_UNDERSTANDING_SCHEMA_JSON}}";
+const READER_SCHEMA_SHA256_PLACEHOLDER: &str = "{{COGNITIVE_UNDERSTANDING_SCHEMA_SHA256}}";
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct RenderedProviderContract {
+    canonical_json: String,
+    sha256: String,
+}
+
+const CORE_ROLE_EVIDENCE_PLAN_SCHEMA_VERSION: &str = "eliot-core-role-evidence-plan-v1";
+const CORE_ROLE_REUSE_PROJECTION_SCHEMA_VERSION: &str = "eliot-core-role-reuse-projection-v1";
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CoreRoleEvidencePlan {
+    schema_version: String,
+    run_id: String,
+    sources: Vec<CoreRoleEvidenceSource>,
+    plan_hash: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "source_kind", rename_all = "snake_case")]
+#[allow(clippy::large_enum_variant)]
+enum CoreRoleEvidenceSource {
+    FreshProviderCall {
+        planned_call_id: String,
+    },
+    AcceptedPriorRoleArtifact {
+        source_run_id: String,
+        source_call_id: String,
+        role: CognitiveFieldRole,
+        case_id: String,
+        provider_session_id: String,
+        source_commit: String,
+        provider_executable_sha256: String,
+        output_schema_sha256: String,
+        artifact_sha256: String,
+        provider_receipt_ref: String,
+        deterministic_receipt_refs: Vec<String>,
+        contamination_receipt_ref: String,
+        worktree_diff_sha256: Option<String>,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CoreRoleReuseProjection {
+    schema_version: String,
+    run_id: String,
+    contract_hash: String,
+    provider_plan_hash: String,
+    source_run_id: String,
+    source_call_id: String,
+    role: CognitiveFieldRole,
+    case_id: String,
+    provider_session_id: String,
+    provider_receipt_ref: String,
+    provider_executable_sha256: String,
+    output_schema_sha256: String,
+    artifact_sha256: String,
+    deterministic_receipt_refs: Vec<String>,
+    contamination_receipt_ref: String,
+    worktree_diff_sha256: Option<String>,
+    outputs: Vec<CognitiveFieldProviderOutputProjection>,
+    recorded_at: OffsetDateTime,
+}
+
+#[derive(Debug)]
+struct VerifiedPriorRole {
+    source_private_root: PathBuf,
+    outputs: Vec<(CognitiveFieldExecutionKey, Vec<u8>)>,
+    candidate_diff: Option<Vec<u8>>,
+}
+
+fn provider_compatible_reader_schema(canonical: &Value) -> Result<Value> {
+    let mut provider = canonical.clone();
+    let root = provider
+        .as_object_mut()
+        .context("CognitiveUnderstandingAnswer schema root must be an object")?;
+    root.remove("$schema");
+    sort_json_object_keys(&mut provider);
+    Ok(provider)
+}
+
+fn render_provider_contract(schema: &Value) -> Result<RenderedProviderContract> {
+    let mut stable = schema.clone();
+    sort_json_object_keys(&mut stable);
+    let canonical_json = serde_json::to_string(&stable)?;
+    Ok(RenderedProviderContract {
+        sha256: sha256_bytes(canonical_json.as_bytes()),
+        canonical_json,
+    })
+}
+
+fn render_reader_prompt(template: &str, contract: &RenderedProviderContract) -> Result<String> {
+    ensure!(
+        template.matches(READER_SCHEMA_JSON_PLACEHOLDER).count() == 1
+            && template.matches(READER_SCHEMA_SHA256_PLACEHOLDER).count() == 1,
+        "Reader prompt must contain each generated schema placeholder exactly once"
+    );
+    let rendered = template
+        .replace(
+            READER_SCHEMA_JSON_PLACEHOLDER,
+            contract.canonical_json.as_str(),
+        )
+        .replace(READER_SCHEMA_SHA256_PLACEHOLDER, contract.sha256.as_str());
+    ensure!(
+        rendered.matches(&contract.canonical_json).count() == 1
+            && rendered.matches(&contract.sha256).count() == 1,
+        "Reader prompt must contain the generated schema bytes and hash exactly once"
+    );
+    Ok(rendered)
+}
+
+fn sort_json_object_keys(value: &mut Value) {
+    match value {
+        Value::Object(object) => {
+            let mut sorted = object
+                .iter_mut()
+                .map(|(key, value)| {
+                    sort_json_object_keys(value);
+                    (key.clone(), std::mem::take(value))
+                })
+                .collect::<Vec<_>>();
+            sorted.sort_by(|left, right| left.0.cmp(&right.0));
+            object.clear();
+            object.extend(sorted);
+        }
+        Value::Array(values) => {
+            for value in values {
+                sort_json_object_keys(value);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn schema_validation_projection(schema: &Value) -> Value {
+    const ANNOTATIONS: [&str; 7] = [
+        "$schema",
+        "$id",
+        "title",
+        "description",
+        "examples",
+        "default",
+        "deprecated",
+    ];
+    match schema {
+        Value::Object(object) => Value::Object(
+            object
+                .iter()
+                .filter(|(key, _)| !ANNOTATIONS.contains(&key.as_str()))
+                .map(|(key, value)| (key.clone(), schema_validation_projection(value)))
+                .collect(),
+        ),
+        Value::Array(values) => {
+            Value::Array(values.iter().map(schema_validation_projection).collect())
+        }
+        _ => schema.clone(),
+    }
 }
 
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
@@ -153,21 +317,80 @@ pub fn prepare(
         .parent()
         .context("field suite path has no parent")?;
     let worker_prompt = fs::read(suite_root.join("templates/worker-prompt.txt"))?;
-    let reader_prompt = fs::read(suite_root.join("templates/reader-prompt.txt"))?;
-    let reader_schema = fs::read(suite_root.join(&suite.reader_output_schema_ref))?;
+    let reader_prompt_template =
+        fs::read_to_string(suite_root.join("templates/reader-prompt.txt"))?;
+    let canonical_reader_schema = cognitive_understanding_answer_schema();
+    let provider_reader_schema = provider_compatible_reader_schema(&canonical_reader_schema)?;
+    ensure!(
+        schema_validation_projection(&canonical_reader_schema)
+            == schema_validation_projection(&provider_reader_schema),
+        "provider-compatible Reader schema changed validation semantics"
+    );
+    let canonical_reader_contract = render_provider_contract(&canonical_reader_schema)?;
+    let provider_reader_contract = render_provider_contract(&provider_reader_schema)?;
+    let reader_prompt =
+        render_reader_prompt(&reader_prompt_template, &provider_reader_contract)?.into_bytes();
+    let reader_schema = provider_reader_contract.canonical_json.as_bytes().to_vec();
+    let core_qualification = suite.harness_version == COGNITIVE_CORE_QUALIFICATION_HARNESS_VERSION;
+    let core_surfaces = core_qualification
+        .then(|| {
+            let exposure_path = private_root
+                .join("contamination")
+                .join("eliot-exposure-set.json");
+            ensure!(
+                exposure_path.is_file(),
+                "core qualification requires a private ELIOT exposure-set export"
+            );
+            Ok::<_, anyhow::Error>(vec![
+                (
+                    "fixture-repo-and-git-history".to_owned(),
+                    git_history(&primary)?,
+                ),
+                (
+                    "provider-environment".to_owned(),
+                    provider_environment_surface(),
+                ),
+                (
+                    "accessible-contract".to_owned(),
+                    serde_json::to_vec(&contract)?,
+                ),
+                ("accessible-plan".to_owned(), serde_json::to_vec(&plan)?),
+                ("eliot-exposure-set".to_owned(), fs::read(exposure_path)?),
+            ])
+        })
+        .transpose()?
+        .unwrap_or_default();
     let mut leak_reports = Vec::new();
     for (index, case) in suite.cases.iter().enumerate() {
-        let mut oracle = generated_oracle(case, index, &contract, &suite_bytes);
+        let mut oracle = if core_qualification {
+            read_json::<TaskIntentOracle>(
+                &private_root
+                    .join("oracle-inputs")
+                    .join(format!("{}.json", case.case_id)),
+            )
+            .with_context(|| format!("load private core oracle input for {}", case.case_id))?
+        } else {
+            generated_oracle(case, index, &contract, &suite_bytes)
+        };
+        if core_qualification {
+            ensure!(
+                oracle.source_commit == contract.source_commit,
+                "core oracle source commit differs from the sealed contract"
+            );
+            ensure!(
+                oracle.exact_user_prompt_hash == sha256_bytes(case.title.as_bytes()),
+                "core oracle prompt hash differs from the scenario task"
+            );
+        }
         CognitiveFieldGradingService::seal_oracle(&mut oracle)?;
-        let scan = CognitiveFieldGradingService::scan_reader_surfaces(
-            &oracle,
-            &[
-                ("worker-prompt".to_owned(), worker_prompt.clone()),
-                ("reader-prompt".to_owned(), reader_prompt.clone()),
-                ("reader-output-schema".to_owned(), reader_schema.clone()),
-                ("suite-manifest".to_owned(), suite_bytes.clone()),
-            ],
-        );
+        let mut surfaces = vec![
+            ("worker-prompt".to_owned(), worker_prompt.clone()),
+            ("reader-prompt".to_owned(), reader_prompt.clone()),
+            ("reader-output-schema".to_owned(), reader_schema.clone()),
+            ("suite-manifest".to_owned(), suite_bytes.clone()),
+        ];
+        surfaces.extend(core_surfaces.clone());
+        let scan = CognitiveFieldGradingService::scan_reader_surfaces(&oracle, &surfaces);
         ensure!(
             scan.clean,
             "reader pre-dispatch surface leaked hidden oracle values for {}",
@@ -188,6 +411,26 @@ pub fn prepare(
     }
 
     write_new_or_same(&report_root.join("suite.json"), &suite_bytes)?;
+    write_new_or_same(
+        &report_root.join("schemas/reader-canonical.json"),
+        canonical_reader_contract.canonical_json.as_bytes(),
+    )?;
+    write_new_or_same(
+        &report_root.join("schemas/reader-provider.json"),
+        provider_reader_contract.canonical_json.as_bytes(),
+    )?;
+    write_new_or_same(
+        &private_root.join("schemas/reader-canonical.json"),
+        canonical_reader_contract.canonical_json.as_bytes(),
+    )?;
+    write_new_or_same(
+        &private_root.join("schemas/reader-provider.json"),
+        provider_reader_contract.canonical_json.as_bytes(),
+    )?;
+    write_new_or_same(
+        &private_root.join("schemas/reader-prompt-bound.txt"),
+        &reader_prompt,
+    )?;
     write_new_or_same_json(&contract_path, &contract)?;
     write_new_or_same_json(&report_root.join("plan.json"), &plan)?;
     write_new_or_same_json(
@@ -200,6 +443,9 @@ pub fn prepare(
             "oracle_count": leak_reports.len(),
             "reader_surface_scans": leak_reports,
             "private_root_sha256": contract.private_root_sha256,
+            "canonical_reader_schema_sha256": canonical_reader_contract.sha256,
+            "provider_reader_schema_sha256": provider_reader_contract.sha256,
+            "rendered_reader_prompt_sha256": sha256_bytes(&reader_prompt),
             "provider_calls": 0,
         }),
     )?;
@@ -260,14 +506,36 @@ pub fn record_deterministic(
     let receipt: CognitiveDeterministicEvidenceReceipt = read_json(&receipt_path)?;
     validate_deterministic_receipt(&contract, case, condition, &private_root, &receipt)?;
     let receipt_hash = CognitiveFieldGradingService::hash_json(&receipt)?;
-    let binding = format!(
-        "{}:{}:{}:{}",
-        contract.run_id,
-        case.case_id,
-        condition_name(condition),
-        contract.source_commit
-    );
-    let (project_id, task_id) = stable_binding_ids(&binding);
+    let (project_id, task_id) =
+        if suite.harness_version == COGNITIVE_CORE_QUALIFICATION_HARNESS_VERSION {
+            let binding: CoreQualificationBinding = read_json(
+                &private_root
+                    .join("bindings")
+                    .join(format!("{}.json", case.case_id)),
+            )
+            .with_context(|| format!("load private core binding for {}", case.case_id))?;
+            ensure!(
+                binding.schema_version == "eliot-core-qualification-binding-v1"
+                    && binding.run_id == contract.run_id
+                    && binding.case_id == case.case_id,
+                "private core binding differs from the sealed execution"
+            );
+            (
+                ProjectId::from_uuid(
+                    Uuid::parse_str(&binding.project_id).context("parse core project id")?,
+                ),
+                TaskId::from_uuid(Uuid::parse_str(&binding.task_id).context("parse core task id")?),
+            )
+        } else {
+            let binding = format!(
+                "{}:{}:{}:{}",
+                contract.run_id,
+                case.case_id,
+                condition_name(condition),
+                contract.source_commit
+            );
+            stable_binding_ids(&binding)
+        };
     let gate_evidence = CognitiveHardGateKind::ALL
         .into_iter()
         .map(|gate| CognitiveHardGateEvidence {
@@ -356,11 +624,20 @@ pub fn seal_provider_plan(
         git_commit(Path::new(&contract.primary_repository))? == contract.source_commit,
         "primary repository HEAD moved after the field contract was sealed"
     );
-    ensure_deterministic_evidence_complete(&suite, &report_root)?;
+    if suite.harness_version != COGNITIVE_CORE_QUALIFICATION_HARNESS_VERSION {
+        ensure_deterministic_evidence_complete(&suite, &report_root)?;
+    }
 
     let calls: Vec<CognitiveFieldProviderCallPlan> = read_json(&calls_path)?;
+    let role_evidence_plan =
+        load_core_role_evidence_plan(&suite, &contract, &report_root, &private_root, &calls)?;
+    let role_sources = role_evidence_plan
+        .as_ref()
+        .map_or(&[][..], |plan| plan.sources.as_slice());
     let (planned_provider_calls, planned_smoke_calls) =
-        validate_provider_calls(&suite, &calls, &private_root)?;
+        validate_provider_calls_with_sources(&suite, &calls, &private_root, role_sources)?;
+    let planned_reused_roles = u8::try_from(prior_role_sources(role_sources).count())
+        .context("reused role count exceeds u8")?;
     let plan_path = report_root.join("provider-plan.json");
     let existing = plan_path
         .is_file()
@@ -373,6 +650,10 @@ pub fn seal_provider_plan(
         calls,
         planned_provider_calls,
         planned_smoke_calls,
+        planned_reused_roles,
+        role_evidence_plan_hash: role_evidence_plan
+            .as_ref()
+            .map(|role_plan| role_plan.plan_hash.clone()),
         plan_hash: String::new(),
         sealed_at: existing
             .as_ref()
@@ -387,12 +668,24 @@ pub fn seal_provider_plan(
         plan = existing;
     }
     write_new_or_same_json(&plan_path, &plan)?;
+    if let Some(role_plan) = &role_evidence_plan {
+        write_new_or_same_json(&report_root.join("role-evidence-plan.json"), role_plan)?;
+        materialize_accepted_prior_roles(
+            &suite,
+            &contract,
+            &plan,
+            role_plan,
+            &report_root,
+            &private_root,
+        )?;
+    }
     print_json(&json!({
         "status": "provider_plan_sealed",
         "run_id": contract.run_id,
         "provider_plan_hash": plan.plan_hash,
         "planned_provider_calls": plan.planned_provider_calls,
         "planned_smoke_calls": plan.planned_smoke_calls,
+        "planned_reused_roles": plan.planned_reused_roles,
         "total_calls": plan.calls.len(),
     }))
 }
@@ -475,11 +768,16 @@ pub fn record_provider(report_root: &Path, private_root: &Path, receipt_path: &P
     enforce_provider_secret_boundary("provider stdout", &raw_stdout)?;
     enforce_provider_secret_boundary("provider stderr", &raw_stderr)?;
     let stdout_text = String::from_utf8_lossy(&raw_stdout);
-    for required in [
-        receipt.resolved_model.as_str(),
+    let mut required_stdout_attestations = vec![
         receipt.provider_session_id.as_str(),
         receipt.provider_receipt_ref.as_str(),
-    ] {
+    ];
+    if suite.harness_version != COGNITIVE_CORE_QUALIFICATION_HARNESS_VERSION
+        || receipt.host != AgentHostId::Codex
+    {
+        required_stdout_attestations.push(receipt.resolved_model.as_str());
+    }
+    for required in required_stdout_attestations {
         ensure!(
             stdout_text.contains(required),
             "provider stdout does not attest the exact model/session/receipt identity"
@@ -540,7 +838,20 @@ pub fn record_provider(report_root: &Path, private_root: &Path, receipt_path: &P
                 ("worker.json", None)
             }
             CognitiveFieldRole::UnderstandingReader => {
-                let reader: CognitiveUnderstandingAnswer = serde_json::from_slice(&bytes)?;
+                let value: Value = serde_json::from_slice(&bytes)?;
+                let canonical_schema = cognitive_understanding_answer_schema();
+                let provider_schema = provider_compatible_reader_schema(&canonical_schema)?;
+                validate_json_schema_instance(
+                    &provider_schema,
+                    &value,
+                    "Reader provider-compatible output",
+                )?;
+                validate_json_schema_instance(
+                    &canonical_schema,
+                    &value,
+                    "Reader canonical output",
+                )?;
+                let reader: CognitiveUnderstandingAnswer = serde_json::from_value(value)?;
                 validate_reader_output(&reader, execution, &deterministic)?;
                 (
                     "reader.json",
@@ -666,18 +977,50 @@ pub fn grade(report_root: &Path, private_root: &Path) -> Result<()> {
         .is_file()
         .then(|| read_json::<CognitiveFieldProviderPlan>(&report_root.join("provider-plan.json")))
         .transpose()?;
-    if let Some(plan) = &provider_plan {
+    let role_plan = if let Some(plan) = &provider_plan {
         validate_provider_plan_hash(plan)?;
         ensure!(
             plan.run_id == contract.run_id && plan.contract_hash == contract.contract_hash,
             "provider plan differs from the sealed run contract"
         );
-        let (capped, smokes) = validate_provider_calls(&suite, &plan.calls, &private_root)?;
+        let role_plan = plan
+            .role_evidence_plan_hash
+            .as_ref()
+            .map(|expected_hash| {
+                let role_plan: CoreRoleEvidencePlan =
+                    read_json(&report_root.join("role-evidence-plan.json"))?;
+                ensure!(
+                    role_plan.plan_hash == *expected_hash
+                        && role_plan.run_id == contract.run_id
+                        && role_plan.schema_version == CORE_ROLE_EVIDENCE_PLAN_SCHEMA_VERSION,
+                    "role evidence plan differs from the sealed provider plan"
+                );
+                let mut material = role_plan.clone();
+                material.plan_hash.clear();
+                ensure!(
+                    CognitiveFieldGradingService::hash_json(&material)? == role_plan.plan_hash,
+                    "role evidence plan hash is invalid"
+                );
+                Ok::<_, anyhow::Error>(role_plan)
+            })
+            .transpose()?;
+        let role_sources = role_plan
+            .as_ref()
+            .map_or(&[][..], |role_plan| role_plan.sources.as_slice());
+        let (capped, smokes) =
+            validate_provider_calls_with_sources(&suite, &plan.calls, &private_root, role_sources)?;
+        let reused = u8::try_from(prior_role_sources(role_sources).count())
+            .context("reused role count exceeds u8")?;
         ensure!(
-            capped == plan.planned_provider_calls && smokes == plan.planned_smoke_calls,
+            capped == plan.planned_provider_calls
+                && smokes == plan.planned_smoke_calls
+                && reused == plan.planned_reused_roles,
             "provider plan summary counts are invalid"
         );
-    }
+        role_plan
+    } else {
+        None
+    };
     let provider_invocations = load_provider_projections(&report_root)?;
     let actual_provider_calls = provider_invocations
         .values()
@@ -700,6 +1043,7 @@ pub fn grade(report_root: &Path, private_root: &Path) -> Result<()> {
         planned == recorded
             && actual_provider_calls == usize::from(plan.planned_provider_calls)
             && actual_smoke_calls == usize::from(plan.planned_smoke_calls)
+            && plan.planned_reused_roles <= 1
             && actual_provider_calls <= usize::from(contract.hard_provider_call_cap)
     });
 
@@ -768,6 +1112,7 @@ pub fn grade(report_root: &Path, private_root: &Path) -> Result<()> {
                 provider_plan
                     .as_ref()
                     .context("provider plan disappeared")?,
+                role_plan.as_ref(),
                 &provider_invocations,
                 &evidence_root,
                 &execution,
@@ -835,6 +1180,9 @@ pub fn grade(report_root: &Path, private_root: &Path) -> Result<()> {
         "provider_plan_complete": provider_plan_complete,
         "actual_provider_calls": actual_provider_calls,
         "actual_smoke_calls": actual_smoke_calls,
+        "reused_provider_roles": provider_plan
+            .as_ref()
+            .map_or(0, |plan| plan.planned_reused_roles),
         "status": status,
     });
     crate::runtime_instance::atomic_write_json(
@@ -894,8 +1242,10 @@ fn load_provider_projections(
     Ok(projections)
 }
 
+#[allow(clippy::too_many_lines)]
 fn provider_role_errors(
     plan: &CognitiveFieldProviderPlan,
+    role_plan: Option<&CoreRoleEvidencePlan>,
     invocations: &BTreeMap<String, CognitiveFieldProviderProjection>,
     evidence_root: &Path,
     execution: &CognitiveFieldExecutionKey,
@@ -908,6 +1258,82 @@ fn provider_role_errors(
         CognitiveFieldRole::UnderstandingReader,
         CognitiveFieldRole::CodexJudge,
     ] {
+        let target = evidence_root.join(match role {
+            CognitiveFieldRole::CodexWorker => "worker.json",
+            CognitiveFieldRole::UnderstandingReader => "reader.json",
+            CognitiveFieldRole::CodexJudge => "judge.json",
+        });
+        let reuse_path = evidence_root.join("reused-worker.json");
+        if role == CognitiveFieldRole::CodexWorker && reuse_path.is_file() {
+            let projection: CoreRoleReuseProjection = read_json(&reuse_path)?;
+            let output = projection
+                .outputs
+                .iter()
+                .find(|output| output.execution == *execution);
+            let output_hash_matches = output.is_some_and(|output| {
+                target
+                    .is_file()
+                    .then(|| fs::read(&target).ok())
+                    .flatten()
+                    .is_some_and(|bytes| sha256_bytes(&bytes) == output.output_sha256)
+            });
+            let source_matches = role_plan.is_some_and(|role_plan| {
+                prior_role_sources(&role_plan.sources).any(|source| {
+                    let CoreRoleEvidenceSource::AcceptedPriorRoleArtifact {
+                        source_run_id,
+                        source_call_id,
+                        role,
+                        case_id,
+                        provider_session_id,
+                        provider_executable_sha256,
+                        output_schema_sha256,
+                        artifact_sha256,
+                        provider_receipt_ref,
+                        deterministic_receipt_refs,
+                        contamination_receipt_ref,
+                        worktree_diff_sha256,
+                        ..
+                    } = source
+                    else {
+                        return false;
+                    };
+                    projection.source_run_id == *source_run_id
+                        && projection.source_call_id == *source_call_id
+                        && projection.role == *role
+                        && projection.case_id == *case_id
+                        && projection.provider_session_id == *provider_session_id
+                        && projection.provider_executable_sha256 == *provider_executable_sha256
+                        && projection.output_schema_sha256 == *output_schema_sha256
+                        && projection.artifact_sha256 == *artifact_sha256
+                        && projection.provider_receipt_ref == *provider_receipt_ref
+                        && projection.deterministic_receipt_refs == *deterministic_receipt_refs
+                        && projection.contamination_receipt_ref == *contamination_receipt_ref
+                        && projection.worktree_diff_sha256 == *worktree_diff_sha256
+                })
+            });
+            if projection.schema_version != CORE_ROLE_REUSE_PROJECTION_SCHEMA_VERSION
+                || projection.run_id != plan.run_id
+                || projection.contract_hash != plan.contract_hash
+                || projection.provider_plan_hash != plan.plan_hash
+                || projection.role != CognitiveFieldRole::CodexWorker
+                || projection.case_id != execution.case_id
+                || plan.planned_reused_roles == 0
+                || plan.role_evidence_plan_hash.is_none()
+                || !source_matches
+                || !output_hash_matches
+                || evidence_root.join("provider-worker.json").is_file()
+            {
+                errors.push(
+                    "worker reuse projection failed its plan/session/output binding".to_owned(),
+                );
+            }
+            sessions.insert(projection.provider_session_id);
+            receipts.insert(projection.provider_receipt_ref);
+            continue;
+        }
+        if role != CognitiveFieldRole::CodexWorker && reuse_path.is_file() {
+            errors.push("only Worker evidence may be reused".to_owned());
+        }
         let projection_path = evidence_root.join(format!("provider-{}.json", role_name(role)));
         if !projection_path.is_file() {
             errors.push(format!(
@@ -933,11 +1359,6 @@ fn provider_role_errors(
             .outputs
             .iter()
             .find(|output| output.execution == *execution);
-        let target = evidence_root.join(match role {
-            CognitiveFieldRole::CodexWorker => "worker.json",
-            CognitiveFieldRole::UnderstandingReader => "reader.json",
-            CognitiveFieldRole::CodexJudge => "judge.json",
-        });
         let output_hash_matches = output.is_some_and(|output| {
             target
                 .is_file()
@@ -986,7 +1407,7 @@ fn load_and_validate_suite(
     let suite_root = suite_path
         .parent()
         .context("field suite path has no parent")?;
-    let reader_schema = cognitive_understanding_answer_schema()?;
+    let reader_schema = cognitive_understanding_answer_schema();
     validate_schema_asset(
         &mut report,
         &suite_root.join(&suite.reader_output_schema_ref),
@@ -1035,9 +1456,14 @@ fn validate_schema_asset(
             .push(format!("{kind} output schema is missing or invalid"));
         return;
     };
-    if required_set(&checked_in) != required_set(generated) {
+    let differs = if kind == "reader" {
+        checked_in != *generated
+    } else {
+        required_set(&checked_in) != required_set(generated)
+    };
+    if differs {
         report.errors.push(format!(
-            "{kind} output schema required fields differ from the Rust contract"
+            "{kind} output schema differs from the Rust-derived contract"
         ));
     }
 }
@@ -1105,6 +1531,44 @@ fn generated_oracle(
         ],
         oracle_hash: String::new(),
     }
+}
+
+fn git_history(repository: &Path) -> Result<Vec<u8>> {
+    const MAX_HISTORY_BYTES: usize = 64 * 1024 * 1024;
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repository)
+        .args(["log", "--all", "-p", "--no-ext-diff", "--no-textconv"])
+        .output()
+        .context("read fixture repository Git history for contamination scan")?;
+    ensure!(
+        output.status.success(),
+        "fixture repository Git history scan command failed"
+    );
+    ensure!(
+        output.stdout.len() <= MAX_HISTORY_BYTES,
+        "fixture repository Git history exceeds the bounded contamination-scan surface"
+    );
+    Ok(output.stdout)
+}
+
+fn provider_environment_surface() -> Vec<u8> {
+    let mut entries = std::env::vars_os()
+        .map(|(key, value)| {
+            let key = key.to_string_lossy();
+            let upper = key.to_ascii_uppercase();
+            let sensitive = ["TOKEN", "PASSWORD", "SECRET", "COOKIE", "AUTH", "API_KEY"]
+                .iter()
+                .any(|marker| upper.contains(marker));
+            if sensitive {
+                format!("{key}=<redacted>")
+            } else {
+                format!("{key}={}", value.to_string_lossy())
+            }
+        })
+        .collect::<Vec<_>>();
+    entries.sort();
+    entries.join("\n").into_bytes()
 }
 
 fn execution_conditions(case: &CognitiveFieldCase) -> Vec<CognitiveMemoryCondition> {
@@ -1194,15 +1658,58 @@ fn ensure_deterministic_evidence_complete(
 }
 
 #[allow(clippy::too_many_lines)]
+#[cfg(test)]
 fn validate_provider_calls(
     suite: &CognitiveFieldSuite,
     calls: &[CognitiveFieldProviderCallPlan],
     private_root: &Path,
 ) -> Result<(u8, u8)> {
+    validate_provider_calls_with_sources(suite, calls, private_root, &[])
+}
+
+#[allow(clippy::too_many_lines)]
+fn validate_provider_calls_with_sources(
+    suite: &CognitiveFieldSuite,
+    calls: &[CognitiveFieldProviderCallPlan],
+    private_root: &Path,
+    role_sources: &[CoreRoleEvidenceSource],
+) -> Result<(u8, u8)> {
     ensure!(!calls.is_empty(), "provider call plan must not be empty");
+    let core_qualification = suite.harness_version == COGNITIVE_CORE_QUALIFICATION_HARNESS_VERSION;
     let mut call_ids = BTreeSet::new();
     let mut observed =
         BTreeMap::<(String, CognitiveMemoryCondition, CognitiveFieldRole), u8>::new();
+    let mut source_call_ids = BTreeSet::new();
+    let mut reused_roles = 0_u8;
+    for source in role_sources {
+        match source {
+            CoreRoleEvidenceSource::FreshProviderCall { planned_call_id } => {
+                ensure!(
+                    safe_segment(planned_call_id)
+                        && source_call_ids.insert(planned_call_id.clone()),
+                    "role evidence plan contains a duplicate or unsafe fresh call id"
+                );
+            }
+            CoreRoleEvidenceSource::AcceptedPriorRoleArtifact { role, case_id, .. } => {
+                ensure!(
+                    core_qualification
+                        && *role == CognitiveFieldRole::CodexWorker
+                        && case_id == "U03"
+                        && reused_roles == 0,
+                    "Task-02R permits only the accepted prior U03 Worker role"
+                );
+                reused_roles = reused_roles
+                    .checked_add(1)
+                    .context("reused role count overflow")?;
+                for memory_condition in [
+                    CognitiveMemoryCondition::Treatment,
+                    CognitiveMemoryCondition::MemoryFreeControl,
+                ] {
+                    observed.insert((case_id.clone(), memory_condition, *role), 1);
+                }
+            }
+        }
+    }
     let mut smoke_cases = BTreeSet::new();
     let mut capped = 0_u8;
     let mut smokes = 0_u8;
@@ -1220,25 +1727,75 @@ fn validate_provider_calls(
             "provider model must be an explicit versioned ID, not a floating alias"
         );
         ensure!(
-            is_sha256(&call.expected_provider_executable_sha256) && is_sha256(&call.prompt_sha256),
-            "provider executable and prompt hashes must be SHA-256 values"
+            is_sha256(&call.expected_provider_executable_sha256)
+                && is_sha256(&call.prompt_sha256)
+                && is_sha256(&call.canonical_schema_sha256)
+                && is_sha256(&call.provider_schema_sha256),
+            "provider executable, prompt, and output schema hashes must be SHA-256 values"
         );
         let prompt_path = private_relative_file(private_root, &call.prompt_ref, "provider prompt")?;
+        let prompt_bytes = fs::read(&prompt_path)?;
         ensure!(
-            sha256_bytes(&fs::read(prompt_path)?) == call.prompt_sha256,
+            sha256_bytes(&prompt_bytes) == call.prompt_sha256,
             "provider prompt hash differs from the sealed call plan"
         );
+        let (canonical_contract, provider_contract) = role_schema_contracts(call.role)?;
+        ensure!(
+            call.canonical_schema_sha256 == canonical_contract.sha256
+                && call.provider_schema_sha256 == provider_contract.sha256,
+            "provider output schema hashes differ from the Rust-owned role contract"
+        );
+        if call.role == CognitiveFieldRole::UnderstandingReader {
+            let prompt = String::from_utf8(prompt_bytes).context("Reader prompt must be UTF-8")?;
+            ensure!(
+                prompt.matches(&provider_contract.canonical_json).count() == 1
+                    && prompt.matches(&provider_contract.sha256).count() == 1
+                    && prompt.contains("BEGIN_COGNITIVE_UNDERSTANDING_SCHEMA")
+                    && prompt.contains("END_COGNITIVE_UNDERSTANDING_SCHEMA"),
+                "Reader prompt is not bound to the exact generated provider schema"
+            );
+        }
         ensure!(
             !call.executions.is_empty() && call.executions.windows(2).all(|pair| pair[0] < pair[1]),
             "provider call executions must be non-empty, unique, and sorted"
         );
-        let memory_condition = call.executions[0].memory_condition;
-        ensure!(
-            call.executions
+        if core_qualification
+            && matches!(
+                call.role,
+                CognitiveFieldRole::CodexWorker | CognitiveFieldRole::CodexJudge
+            )
+        {
+            let case_ids = call
+                .executions
                 .iter()
-                .all(|execution| execution.memory_condition == memory_condition),
-            "one provider call must not mix memory conditions"
-        );
+                .map(|execution| execution.case_id.as_str())
+                .collect::<BTreeSet<_>>();
+            let conditions = call
+                .executions
+                .iter()
+                .map(|execution| execution.memory_condition)
+                .collect::<BTreeSet<_>>();
+            ensure!(
+                call.executions.len() == 2
+                    && case_ids.len() == 1
+                    && conditions
+                        == [
+                            CognitiveMemoryCondition::Treatment,
+                            CognitiveMemoryCondition::MemoryFreeControl,
+                        ]
+                        .into_iter()
+                        .collect(),
+                "core Worker and Judge calls must cover both conditions for exactly one case"
+            );
+        } else {
+            let memory_condition = call.executions[0].memory_condition;
+            ensure!(
+                call.executions
+                    .iter()
+                    .all(|execution| execution.memory_condition == memory_condition),
+                "one provider call must not mix memory conditions"
+            );
+        }
         match call.role {
             CognitiveFieldRole::CodexWorker | CognitiveFieldRole::CodexJudge => ensure!(
                 call.host == AgentHostId::Codex,
@@ -1251,6 +1808,22 @@ fn validate_provider_calls(
                 ),
                 "Reader calls must use Claude, Antigravity, or OpenCode"
             ),
+        }
+        if core_qualification && call.role == CognitiveFieldRole::UnderstandingReader {
+            ensure!(
+                call.executions.len() == 1,
+                "each core Reader call must cover exactly one condition"
+            );
+            let expected_host = match call.executions[0].case_id.as_str() {
+                "U03" => AgentHostId::Claude,
+                "U06" => AgentHostId::Antigravity,
+                "U11" => AgentHostId::OpenCode,
+                _ => bail!("core Reader call targets an unknown scenario"),
+            };
+            ensure!(
+                call.host == expected_host,
+                "core Reader host does not match the scenario contract"
+            );
         }
         ensure!(
             call.provider_smoke != call.counts_against_cap,
@@ -1307,6 +1880,19 @@ fn validate_provider_calls(
         capped <= suite.hard_provider_call_cap,
         "sealed provider plan exceeds the hard provider-call cap"
     );
+    if !role_sources.is_empty() {
+        ensure!(
+            source_call_ids == call_ids,
+            "role evidence plan must name every fresh provider call exactly once"
+        );
+    }
+    if core_qualification {
+        ensure!(
+            capped.saturating_add(reused_roles) == COGNITIVE_CORE_QUALIFICATION_PROVIDER_CALLS
+                && smokes == 0,
+            "core qualification must seal twelve logical role sources and no smokes"
+        );
+    }
     let expected_smokes = ["H01", "H02", "H03", "H04"]
         .into_iter()
         .filter(|case_id| suite.cases.iter().any(|case| case.case_id == *case_id))
@@ -1329,6 +1915,540 @@ fn validate_provider_calls(
         "provider plan must cover every model-backed execution role exactly once"
     );
     Ok((capped, smokes))
+}
+
+fn prior_role_sources(
+    sources: &[CoreRoleEvidenceSource],
+) -> impl Iterator<Item = &CoreRoleEvidenceSource> {
+    sources.iter().filter(|source| {
+        matches!(
+            source,
+            CoreRoleEvidenceSource::AcceptedPriorRoleArtifact { .. }
+        )
+    })
+}
+
+fn load_core_role_evidence_plan(
+    suite: &CognitiveFieldSuite,
+    contract: &CognitiveFieldRunContract,
+    report_root: &Path,
+    private_root: &Path,
+    calls: &[CognitiveFieldProviderCallPlan],
+) -> Result<Option<CoreRoleEvidencePlan>> {
+    if suite.harness_version != COGNITIVE_CORE_QUALIFICATION_HARNESS_VERSION {
+        return Ok(None);
+    }
+    let path = private_root.join("core-role-evidence.json");
+    ensure!(
+        path.is_file(),
+        "core qualification requires private core-role-evidence.json"
+    );
+    let mut plan: CoreRoleEvidencePlan = read_json(&path)?;
+    ensure!(
+        plan.schema_version == CORE_ROLE_EVIDENCE_PLAN_SCHEMA_VERSION
+            && plan.run_id == contract.run_id,
+        "core role evidence plan differs from the sealed run"
+    );
+    let mut material = plan.clone();
+    material.plan_hash.clear();
+    let expected_hash = CognitiveFieldGradingService::hash_json(&material)?;
+    ensure!(
+        plan.plan_hash.is_empty() || expected_hash == plan.plan_hash,
+        "core role evidence plan hash is invalid"
+    );
+    plan.plan_hash = expected_hash;
+    validate_provider_calls_with_sources(suite, calls, private_root, &plan.sources)?;
+    for source in prior_role_sources(&plan.sources) {
+        verify_accepted_prior_role(suite, contract, report_root, private_root, source)?;
+    }
+    Ok(Some(plan))
+}
+
+fn source_run_roots(
+    report_root: &Path,
+    private_root: &Path,
+    source_run_id: &str,
+) -> Result<(PathBuf, PathBuf)> {
+    ensure!(
+        safe_segment(source_run_id),
+        "prior role source run id is unsafe"
+    );
+    let source_report_root = canonical_directory(
+        &report_root
+            .parent()
+            .context("current report root has no qualification parent")?
+            .join(source_run_id),
+        "prior cognitive report root",
+    )?;
+    let source_private_root = canonical_directory(
+        &private_root
+            .parent()
+            .context("current private root has no qualification parent")?
+            .join(source_run_id),
+        "prior private certification root",
+    )?;
+    Ok((source_report_root, source_private_root))
+}
+
+fn content_ref_path(reference: &str, allowed_roots: &[&Path]) -> Result<PathBuf> {
+    let (path, expected_sha256) = reference
+        .rsplit_once("#sha256=")
+        .context("content reference must end with #sha256=<hex>")?;
+    ensure!(
+        is_sha256(expected_sha256),
+        "content reference hash is not SHA-256"
+    );
+    let path =
+        fs::canonicalize(path).with_context(|| format!("resolve content reference {path}"))?;
+    ensure!(
+        path.is_file() && allowed_roots.iter().any(|root| path.starts_with(root)),
+        "content reference is outside the accepted prior run roots"
+    );
+    ensure!(
+        sha256_bytes(&fs::read(&path)?) == expected_sha256,
+        "content reference hash mismatch for {}",
+        path.display()
+    );
+    Ok(path)
+}
+
+fn git_diff_bytes(repository: &Path) -> Result<Vec<u8>> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repository)
+        .args(["diff", "--binary", "--no-ext-diff", "HEAD", "--"])
+        .output()
+        .with_context(|| format!("read candidate diff from {}", repository.display()))?;
+    ensure!(
+        output.status.success(),
+        "git diff failed for {}: {}",
+        repository.display(),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    Ok(output.stdout)
+}
+
+fn paired_artifact_sha256(outputs: &[(CognitiveFieldExecutionKey, Vec<u8>)]) -> Result<String> {
+    let mut material = Vec::new();
+    for (execution, bytes) in outputs {
+        let execution = serde_json::to_vec(execution)?;
+        for part in [&execution, bytes] {
+            let length = u64::try_from(part.len()).context("artifact part length exceeds u64")?;
+            material.extend_from_slice(&length.to_le_bytes());
+            material.extend_from_slice(part);
+        }
+    }
+    Ok(sha256_bytes(&material))
+}
+
+#[allow(clippy::too_many_lines)]
+fn verify_accepted_prior_role(
+    suite: &CognitiveFieldSuite,
+    contract: &CognitiveFieldRunContract,
+    report_root: &Path,
+    private_root: &Path,
+    source: &CoreRoleEvidenceSource,
+) -> Result<VerifiedPriorRole> {
+    let CoreRoleEvidenceSource::AcceptedPriorRoleArtifact {
+        source_run_id,
+        source_call_id,
+        role,
+        case_id,
+        provider_session_id,
+        source_commit,
+        provider_executable_sha256,
+        output_schema_sha256,
+        artifact_sha256,
+        provider_receipt_ref,
+        deterministic_receipt_refs,
+        contamination_receipt_ref,
+        worktree_diff_sha256,
+    } = source
+    else {
+        bail!("fresh provider call is not a prior role artifact");
+    };
+    ensure!(
+        *role == CognitiveFieldRole::CodexWorker && case_id == "U03",
+        "only the accepted run-003 U03 Worker may be reused"
+    );
+    let (source_report_root, source_private_root) =
+        source_run_roots(report_root, private_root, source_run_id)?;
+    let source_contract: CognitiveFieldRunContract =
+        read_json(&source_report_root.join("contract.json"))?;
+    ensure!(
+        source_contract.run_id == *source_run_id
+            && source_contract.source_commit == *source_commit
+            && contract.source_commit == *source_commit
+            && same_git_repository(
+                Path::new(&source_contract.primary_repository),
+                Path::new(&contract.primary_repository),
+            )?,
+        "prior Worker repository or source commit differs from the resumed run"
+    );
+    let source_plan: Value = read_json(&source_report_root.join("provider-plan.json"))?;
+    ensure!(
+        source_plan.get("run_id").and_then(Value::as_str) == Some(source_run_id)
+            && source_plan.get("contract_hash").and_then(Value::as_str)
+                == Some(source_contract.contract_hash.as_str()),
+        "prior Worker provider plan differs from its run contract"
+    );
+    let source_call = source_plan
+        .get("calls")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .find(|call| call.get("call_id").and_then(Value::as_str) == Some(source_call_id))
+        .context("prior Worker call is absent from its provider plan")?;
+    ensure!(
+        source_call.get("role").and_then(Value::as_str) == Some("codex_worker")
+            && source_call.get("host").and_then(Value::as_str) == Some("codex")
+            && source_call
+                .get("expected_provider_executable_sha256")
+                .and_then(Value::as_str)
+                == Some(provider_executable_sha256)
+            && source_call
+                .get("counts_against_cap")
+                .and_then(Value::as_bool)
+                == Some(true)
+            && source_call.get("provider_smoke").and_then(Value::as_bool) == Some(false),
+        "prior Worker call plan binding is invalid"
+    );
+    let source_suite: CognitiveFieldSuite = read_json(&source_report_root.join("suite.json"))?;
+    let current_case = suite
+        .cases
+        .iter()
+        .find(|candidate| candidate.case_id == *case_id)
+        .context("current suite lacks prior Worker case")?;
+    let source_case = source_suite
+        .cases
+        .iter()
+        .find(|candidate| candidate.case_id == *case_id)
+        .context("prior suite lacks Worker case")?;
+    ensure!(
+        current_case == source_case,
+        "prior Worker public task differs from the resumed scenario"
+    );
+    let source_oracle: TaskIntentOracle = read_json(
+        &source_private_root
+            .join("oracles")
+            .join(format!("{case_id}.json")),
+    )?;
+    let current_oracle: TaskIntentOracle =
+        read_json(&private_root.join("oracles").join(format!("{case_id}.json")))?;
+    ensure!(
+        source_oracle.oracle_hash == current_oracle.oracle_hash
+            && source_oracle.source_commit == contract.source_commit,
+        "prior Worker private oracle differs from the resumed oracle"
+    );
+
+    let projection: CognitiveFieldProviderProjection = read_json(
+        &source_report_root
+            .join("provider-invocations")
+            .join(format!("{source_call_id}.json")),
+    )?;
+    ensure!(
+        projection.run_id == *source_run_id
+            && projection.call_id == *source_call_id
+            && projection.role == *role
+            && projection.provider_session_id == *provider_session_id
+            && projection.provider_receipt_ref == *provider_receipt_ref
+            && projection.provider_executable_sha256 == *provider_executable_sha256
+            && projection.source_commit == *source_commit
+            && projection.contract_hash == source_contract.contract_hash
+            && source_plan.get("plan_hash").and_then(Value::as_str)
+                == Some(projection.provider_plan_hash.as_str())
+            && projection.outputs.len() == 2,
+        "prior Worker provider projection differs from the sealed dependency"
+    );
+    let receipt: CognitiveFieldProviderEvidenceReceipt =
+        read_json(&source_private_root.join("provider-calls/core-call-01/receipt.json"))?;
+    ensure!(
+        receipt.run_id == *source_run_id
+            && receipt.call_id == *source_call_id
+            && receipt.role == *role
+            && receipt.provider_session_id == *provider_session_id
+            && receipt.provider_receipt_ref == *provider_receipt_ref
+            && receipt.provider_executable_sha256 == *provider_executable_sha256
+            && receipt.source_commit == *source_commit
+            && receipt.contract_hash == source_contract.contract_hash
+            && receipt.provider_plan_hash == projection.provider_plan_hash
+            && receipt.provider_calls == 1
+            && receipt.exit_code == 0
+            && !receipt.timed_out
+            && !receipt.unknown_outcome
+            && !receipt.controller_substitution,
+        "prior Worker provider receipt is not a canonical successful invocation"
+    );
+    let (worker_canonical, _) = role_schema_contracts(CognitiveFieldRole::CodexWorker)?;
+    ensure!(
+        worker_canonical.sha256 == *output_schema_sha256,
+        "prior Worker output schema differs from the current Rust contract"
+    );
+    let worker_schema = cognitive_worker_result_schema()?;
+    let mut outputs = Vec::new();
+    for output in &receipt.outputs {
+        ensure!(
+            output.execution.case_id == *case_id
+                && matches!(
+                    output.execution.memory_condition,
+                    CognitiveMemoryCondition::Treatment
+                        | CognitiveMemoryCondition::MemoryFreeControl
+                ),
+            "prior Worker output belongs to a different execution"
+        );
+        let output_path = fs::canonicalize(&output.output_path)?;
+        ensure!(
+            output_path.starts_with(&source_private_root) && output_path.is_file(),
+            "prior Worker output is outside its private run"
+        );
+        let bytes = fs::read(&output_path)?;
+        ensure!(
+            sha256_bytes(&bytes) == output.output_sha256
+                && projection.outputs.iter().any(|candidate| {
+                    candidate.execution == output.execution
+                        && candidate.output_sha256 == output.output_sha256
+                }),
+            "prior Worker output bytes differ from provider evidence"
+        );
+        let value: Value = serde_json::from_slice(&bytes)?;
+        validate_json_schema_instance(&worker_schema, &value, "prior Worker output")?;
+        let worker: CognitiveWorkerResult = serde_json::from_value(value)?;
+        ensure!(
+            worker.case_id == *case_id
+                && worker.memory_condition == output.execution.memory_condition,
+            "prior Worker output binding is invalid"
+        );
+        if output.execution.memory_condition == CognitiveMemoryCondition::Treatment {
+            ensure!(
+                !worker.memory_handles_used.is_empty() && !worker.influence_receipt_refs.is_empty(),
+                "prior treatment Worker lacks canonical ELIOT influence evidence"
+            );
+        } else {
+            ensure!(
+                worker.memory_handles_used.is_empty() && worker.influence_receipt_refs.is_empty(),
+                "prior control Worker contains ELIOT memory influence"
+            );
+        }
+        let source_evidence_root = source_report_root
+            .join("evidence")
+            .join(case_id)
+            .join(condition_name(output.execution.memory_condition));
+        ensure!(
+            fs::read(source_evidence_root.join("worker.json"))? == bytes,
+            "prior public Worker artifact differs from provider-owned output bytes"
+        );
+        let public_projection: CognitiveFieldProviderProjection =
+            read_json(&source_evidence_root.join("provider-worker.json"))?;
+        ensure!(
+            public_projection == projection,
+            "prior public Worker projection differs from the invocation registry"
+        );
+        let deterministic: CognitiveDeterministicReport =
+            read_json(&source_evidence_root.join("deterministic.json"))?;
+        ensure!(
+            deterministic_report_is_valid(&deterministic)?
+                && deterministic.source_commit == *source_commit
+                && deterministic.project_id == worker.project_id
+                && deterministic.task_id == worker.task_id,
+            "prior Worker deterministic acceptance is invalid"
+        );
+        outputs.push((output.execution.clone(), bytes));
+    }
+    outputs.sort_by(|left, right| left.0.cmp(&right.0));
+    ensure!(
+        paired_artifact_sha256(&outputs)? == *artifact_sha256,
+        "prior Worker paired artifact hash differs from the dependency"
+    );
+
+    ensure!(
+        deterministic_receipt_refs.len() == 2,
+        "prior Worker requires exact treatment and control deterministic receipts"
+    );
+    let mut deterministic_conditions = BTreeSet::new();
+    for reference in deterministic_receipt_refs {
+        let path = content_ref_path(reference, &[&source_report_root, &source_private_root])?;
+        let value: Value = read_json(&path)?;
+        ensure!(
+            value.get("case_id").and_then(Value::as_str) == Some(case_id)
+                && value.get("source_commit").and_then(Value::as_str) == Some(source_commit),
+            "prior deterministic receipt differs from Worker dependencies"
+        );
+        let condition = value
+            .get("memory_condition")
+            .and_then(Value::as_str)
+            .context("deterministic receipt lacks memory condition")?;
+        deterministic_conditions.insert(condition.to_owned());
+    }
+    ensure!(
+        deterministic_conditions
+            == ["memory_free_control".to_owned(), "treatment".to_owned()]
+                .into_iter()
+                .collect(),
+        "prior deterministic receipts do not cover treatment and control"
+    );
+    content_ref_path(
+        contamination_receipt_ref,
+        &[&source_report_root, &source_private_root],
+    )?;
+    let preflight: Value = read_json(&source_report_root.join("preflight.json"))?;
+    ensure!(
+        preflight
+            .get("reader_surface_scans")
+            .and_then(Value::as_array)
+            .is_some_and(|scans| {
+                !scans.is_empty()
+                    && scans
+                        .iter()
+                        .all(|scan| scan.get("clean").and_then(Value::as_bool) == Some(true))
+            }),
+        "prior contamination preflight was not clean"
+    );
+
+    let candidate_diff = if let Some(expected) = worktree_diff_sha256 {
+        ensure!(is_sha256(expected), "candidate diff hash is not SHA-256");
+        let candidate_root = canonical_directory(
+            &source_private_root.join("worktrees/cq1"),
+            "prior CQ1 worktree",
+        )?;
+        ensure!(
+            git_commit(&candidate_root)? == *source_commit,
+            "prior CQ1 worktree base commit differs from Worker source"
+        );
+        let bytes = git_diff_bytes(&candidate_root)?;
+        ensure!(
+            !bytes.is_empty() && sha256_bytes(&bytes) == *expected,
+            "prior CQ1 candidate diff is absent or hash-mismatched"
+        );
+        Some(bytes)
+    } else {
+        bail!("Task-02R U03 Worker reuse requires a candidate worktree diff hash");
+    };
+    Ok(VerifiedPriorRole {
+        source_private_root,
+        outputs,
+        candidate_diff,
+    })
+}
+
+fn materialize_accepted_prior_roles(
+    suite: &CognitiveFieldSuite,
+    contract: &CognitiveFieldRunContract,
+    provider_plan: &CognitiveFieldProviderPlan,
+    role_plan: &CoreRoleEvidencePlan,
+    report_root: &Path,
+    private_root: &Path,
+) -> Result<()> {
+    for source in prior_role_sources(&role_plan.sources) {
+        let verified =
+            verify_accepted_prior_role(suite, contract, report_root, private_root, source)?;
+        let CoreRoleEvidenceSource::AcceptedPriorRoleArtifact {
+            source_run_id,
+            source_call_id,
+            role,
+            case_id,
+            provider_session_id,
+            provider_executable_sha256,
+            output_schema_sha256,
+            artifact_sha256,
+            provider_receipt_ref,
+            deterministic_receipt_refs,
+            contamination_receipt_ref,
+            worktree_diff_sha256,
+            ..
+        } = source
+        else {
+            unreachable!("filtered prior role source");
+        };
+        let outputs = verified
+            .outputs
+            .iter()
+            .map(
+                |(execution, bytes)| CognitiveFieldProviderOutputProjection {
+                    execution: execution.clone(),
+                    output_sha256: sha256_bytes(bytes),
+                },
+            )
+            .collect::<Vec<_>>();
+        let reuse_root = private_root.join("reused").join(artifact_sha256);
+        for (execution, bytes) in &verified.outputs {
+            write_new_or_same(
+                &reuse_root.join(format!(
+                    "{}-worker.json",
+                    condition_name(execution.memory_condition)
+                )),
+                bytes,
+            )?;
+        }
+        if let Some(candidate_diff) = &verified.candidate_diff {
+            write_new_or_same(&reuse_root.join("candidate.diff"), candidate_diff)?;
+        }
+        write_new_or_same_json(
+            &reuse_root.join("source-private-root.json"),
+            &json!({
+                "source_private_root_sha256":
+                    sha256_bytes(canonical_path(&verified.source_private_root).as_bytes()),
+                "source_run_id": source_run_id,
+            }),
+        )?;
+        let projection = CoreRoleReuseProjection {
+            schema_version: CORE_ROLE_REUSE_PROJECTION_SCHEMA_VERSION.to_owned(),
+            run_id: contract.run_id.clone(),
+            contract_hash: contract.contract_hash.clone(),
+            provider_plan_hash: provider_plan.plan_hash.clone(),
+            source_run_id: source_run_id.clone(),
+            source_call_id: source_call_id.clone(),
+            role: *role,
+            case_id: case_id.clone(),
+            provider_session_id: provider_session_id.clone(),
+            provider_receipt_ref: provider_receipt_ref.clone(),
+            provider_executable_sha256: provider_executable_sha256.clone(),
+            output_schema_sha256: output_schema_sha256.clone(),
+            artifact_sha256: artifact_sha256.clone(),
+            deterministic_receipt_refs: deterministic_receipt_refs.clone(),
+            contamination_receipt_ref: contamination_receipt_ref.clone(),
+            worktree_diff_sha256: worktree_diff_sha256.clone(),
+            outputs,
+            recorded_at: OffsetDateTime::now_utc(),
+        };
+        for (execution, bytes) in verified.outputs {
+            let evidence_root = report_root
+                .join("evidence")
+                .join(&execution.case_id)
+                .join(condition_name(execution.memory_condition));
+            let deterministic: CognitiveDeterministicReport =
+                read_json(&evidence_root.join("deterministic.json"))?;
+            let worker: CognitiveWorkerResult = serde_json::from_slice(&bytes)?;
+            ensure!(
+                deterministic.passed
+                    && deterministic.source_commit == contract.source_commit
+                    && deterministic.project_id == worker.project_id
+                    && deterministic.task_id == worker.task_id,
+                "resumed deterministic binding differs from the accepted Worker artifact"
+            );
+            write_new_or_same(&evidence_root.join("worker.json"), &bytes)?;
+            write_new_or_same_json(&evidence_root.join("reused-worker.json"), &projection)?;
+        }
+    }
+    Ok(())
+}
+
+fn role_schema_contracts(
+    role: CognitiveFieldRole,
+) -> Result<(RenderedProviderContract, RenderedProviderContract)> {
+    let canonical = match role {
+        CognitiveFieldRole::CodexWorker => cognitive_worker_result_schema()?,
+        CognitiveFieldRole::UnderstandingReader => cognitive_understanding_answer_schema(),
+        CognitiveFieldRole::CodexJudge => cognitive_judge_result_schema()?,
+    };
+    let provider = if role == CognitiveFieldRole::UnderstandingReader {
+        provider_compatible_reader_schema(&canonical)?
+    } else {
+        canonical.clone()
+    };
+    Ok((
+        render_provider_contract(&canonical)?,
+        render_provider_contract(&provider)?,
+    ))
 }
 
 fn validate_provider_plan_hash(plan: &CognitiveFieldProviderPlan) -> Result<()> {
@@ -1464,6 +2584,276 @@ fn validate_worker_output(
         );
     }
     Ok(())
+}
+
+fn validate_json_schema_instance(schema: &Value, instance: &Value, label: &str) -> Result<()> {
+    let errors = json_schema_errors(schema, schema, instance, "$", 0);
+    ensure!(
+        errors.is_empty(),
+        "{label} failed JSON Schema validation: {}",
+        errors.join("; ")
+    );
+    Ok(())
+}
+
+#[allow(clippy::too_many_lines)]
+fn json_schema_errors(
+    root: &Value,
+    schema: &Value,
+    instance: &Value,
+    path: &str,
+    depth: usize,
+) -> Vec<String> {
+    if depth > 64 {
+        return vec![format!("{path}: schema recursion exceeded 64 levels")];
+    }
+    if schema == &Value::Bool(true) {
+        return Vec::new();
+    }
+    if schema == &Value::Bool(false) {
+        return vec![format!("{path}: rejected by false schema")];
+    }
+    let Some(object) = schema.as_object() else {
+        return vec![format!("{path}: schema node is not an object or boolean")];
+    };
+    if let Some(reference) = object.get("$ref").and_then(Value::as_str) {
+        let Some(pointer) = reference.strip_prefix('#') else {
+            return vec![format!(
+                "{path}: non-local schema ref {reference} is unsupported"
+            )];
+        };
+        let Some(target) = root.pointer(pointer) else {
+            return vec![format!("{path}: unresolved schema ref {reference}")];
+        };
+        return json_schema_errors(root, target, instance, path, depth + 1);
+    }
+
+    let mut errors = Vec::new();
+    if let Some(expected) = object.get("const")
+        && expected != instance
+    {
+        errors.push(format!("{path}: value differs from const"));
+    }
+    if let Some(variants) = object.get("enum").and_then(Value::as_array)
+        && !variants.contains(instance)
+    {
+        errors.push(format!("{path}: value is outside enum"));
+    }
+    if let Some(types) = object.get("type") {
+        let type_matches = match types {
+            Value::String(expected) => json_type_matches(expected, instance),
+            Value::Array(expected) => expected
+                .iter()
+                .filter_map(Value::as_str)
+                .any(|expected| json_type_matches(expected, instance)),
+            _ => false,
+        };
+        if !type_matches {
+            errors.push(format!(
+                "{path}: actual type {} does not satisfy schema type {types}",
+                json_type_name(instance)
+            ));
+            return errors;
+        }
+    }
+
+    if let Some(all_of) = object.get("allOf").and_then(Value::as_array) {
+        for branch in all_of {
+            errors.extend(json_schema_errors(root, branch, instance, path, depth + 1));
+        }
+    }
+    if let Some(any_of) = object.get("anyOf").and_then(Value::as_array)
+        && !any_of
+            .iter()
+            .any(|branch| json_schema_errors(root, branch, instance, path, depth + 1).is_empty())
+    {
+        errors.push(format!("{path}: no anyOf branch accepted the value"));
+    }
+    if let Some(one_of) = object.get("oneOf").and_then(Value::as_array) {
+        let accepted = one_of
+            .iter()
+            .filter(|branch| json_schema_errors(root, branch, instance, path, depth + 1).is_empty())
+            .count();
+        if accepted != 1 {
+            errors.push(format!(
+                "{path}: expected exactly one oneOf branch, accepted {accepted}"
+            ));
+        }
+    }
+
+    if let Some(actual) = instance.as_object() {
+        let required = object
+            .get("required")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .collect::<BTreeSet<_>>();
+        for key in required {
+            if !actual.contains_key(key) {
+                errors.push(format!("{path}/{key}: required property is missing"));
+            }
+        }
+        let properties = object.get("properties").and_then(Value::as_object);
+        if let Some(properties) = properties {
+            for (key, value) in actual {
+                if let Some(property_schema) = properties.get(key) {
+                    errors.extend(json_schema_errors(
+                        root,
+                        property_schema,
+                        value,
+                        &format!("{path}/{}", escape_json_pointer(key)),
+                        depth + 1,
+                    ));
+                    continue;
+                }
+                match object.get("additionalProperties") {
+                    Some(Value::Bool(false)) => errors.push(format!(
+                        "{path}/{}: additional property is forbidden",
+                        escape_json_pointer(key)
+                    )),
+                    Some(additional @ (Value::Object(_) | Value::Bool(true))) => {
+                        errors.extend(json_schema_errors(
+                            root,
+                            additional,
+                            value,
+                            &format!("{path}/{}", escape_json_pointer(key)),
+                            depth + 1,
+                        ));
+                    }
+                    _ => {}
+                }
+            }
+        } else if let Some(additional @ Value::Object(_)) = object.get("additionalProperties") {
+            for (key, value) in actual {
+                errors.extend(json_schema_errors(
+                    root,
+                    additional,
+                    value,
+                    &format!("{path}/{}", escape_json_pointer(key)),
+                    depth + 1,
+                ));
+            }
+        }
+        check_size_bound(
+            object,
+            "minProperties",
+            actual.len(),
+            path,
+            true,
+            &mut errors,
+        );
+        check_size_bound(
+            object,
+            "maxProperties",
+            actual.len(),
+            path,
+            false,
+            &mut errors,
+        );
+    }
+
+    if let Some(actual) = instance.as_array() {
+        if let Some(item_schema) = object.get("items") {
+            for (index, value) in actual.iter().enumerate() {
+                errors.extend(json_schema_errors(
+                    root,
+                    item_schema,
+                    value,
+                    &format!("{path}/{index}"),
+                    depth + 1,
+                ));
+            }
+        }
+        check_size_bound(object, "minItems", actual.len(), path, true, &mut errors);
+        check_size_bound(object, "maxItems", actual.len(), path, false, &mut errors);
+        if object.get("uniqueItems") == Some(&Value::Bool(true)) {
+            for (index, value) in actual.iter().enumerate() {
+                if actual[..index].contains(value) {
+                    errors.push(format!("{path}/{index}: array item is not unique"));
+                }
+            }
+        }
+    }
+
+    if let Some(actual) = instance.as_str() {
+        let length = actual.chars().count();
+        check_size_bound(object, "minLength", length, path, true, &mut errors);
+        check_size_bound(object, "maxLength", length, path, false, &mut errors);
+    }
+
+    if let Some(actual) = instance.as_f64() {
+        for (keyword, comparison) in [
+            ("minimum", std::cmp::Ordering::Less),
+            ("maximum", std::cmp::Ordering::Greater),
+        ] {
+            if let Some(bound) = object.get(keyword).and_then(Value::as_f64)
+                && actual.partial_cmp(&bound) == Some(comparison)
+            {
+                errors.push(format!("{path}: number violates {keyword} {bound}"));
+            }
+        }
+        if let Some(bound) = object.get("exclusiveMinimum").and_then(Value::as_f64)
+            && actual <= bound
+        {
+            errors.push(format!("{path}: number violates exclusiveMinimum {bound}"));
+        }
+        if let Some(bound) = object.get("exclusiveMaximum").and_then(Value::as_f64)
+            && actual >= bound
+        {
+            errors.push(format!("{path}: number violates exclusiveMaximum {bound}"));
+        }
+    }
+    errors
+}
+
+fn check_size_bound(
+    schema: &serde_json::Map<String, Value>,
+    keyword: &str,
+    actual: usize,
+    path: &str,
+    minimum: bool,
+    errors: &mut Vec<String>,
+) {
+    let Some(bound) = schema
+        .get(keyword)
+        .and_then(Value::as_u64)
+        .and_then(|value| usize::try_from(value).ok())
+    else {
+        return;
+    };
+    if (minimum && actual < bound) || (!minimum && actual > bound) {
+        errors.push(format!("{path}: size {actual} violates {keyword} {bound}"));
+    }
+}
+
+fn json_type_matches(expected: &str, value: &Value) -> bool {
+    match expected {
+        "null" => value.is_null(),
+        "boolean" => value.is_boolean(),
+        "object" => value.is_object(),
+        "array" => value.is_array(),
+        "number" => value.is_number(),
+        "integer" => value.as_i64().is_some() || value.as_u64().is_some(),
+        "string" => value.is_string(),
+        _ => false,
+    }
+}
+
+fn json_type_name(value: &Value) -> &'static str {
+    match value {
+        Value::Null => "null",
+        Value::Bool(_) => "boolean",
+        Value::Number(number) if number.is_i64() || number.is_u64() => "integer",
+        Value::Number(_) => "number",
+        Value::String(_) => "string",
+        Value::Array(_) => "array",
+        Value::Object(_) => "object",
+    }
+}
+
+fn escape_json_pointer(value: &str) -> String {
+    value.replace('~', "~0").replace('/', "~1")
 }
 
 fn validate_reader_output(
@@ -1647,6 +3037,16 @@ fn stable_binding_ids(binding: &str) -> (ProjectId, TaskId) {
     )
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CoreQualificationBinding {
+    schema_version: String,
+    run_id: String,
+    case_id: String,
+    project_id: String,
+    task_id: String,
+}
+
 fn stable_uuid(value: &str) -> Uuid {
     let digest = Sha256::digest(value.as_bytes());
     let mut bytes = [0_u8; 16];
@@ -1705,6 +3105,34 @@ fn git_commit(repository: &Path) -> Result<String> {
         repository.display()
     );
     Ok(commit)
+}
+
+fn same_git_repository(left: &Path, right: &Path) -> Result<bool> {
+    fn common_directory(repository: &Path) -> Result<PathBuf> {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(repository)
+            .args(["rev-parse", "--git-common-dir"])
+            .output()
+            .with_context(|| {
+                format!("resolve Git common directory for {}", repository.display())
+            })?;
+        ensure!(
+            output.status.success(),
+            "git rev-parse --git-common-dir failed for {}: {}",
+            repository.display(),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let value = String::from_utf8(output.stdout)?.trim().to_owned();
+        let path = PathBuf::from(value);
+        let path = if path.is_absolute() {
+            path
+        } else {
+            repository.join(path)
+        };
+        fs::canonicalize(path).context("canonicalize Git common directory")
+    }
+    Ok(common_directory(left)? == common_directory(right)?)
 }
 
 fn permissive_license_declared(repository: &Path) -> Result<bool> {
@@ -1869,13 +3297,19 @@ fn print_json<T: Serialize>(value: &T) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        execution_conditions, generated_oracle, provider_plan_without_hash, record_provider,
-        sha256_bytes, validate_deterministic_receipt, validate_provider_calls,
-        validate_provider_receipt_envelope, write_new_or_same_json,
+        CoreRoleEvidenceSource, READER_SCHEMA_JSON_PLACEHOLDER, READER_SCHEMA_SHA256_PLACEHOLDER,
+        execution_conditions, generated_oracle, provider_compatible_reader_schema,
+        provider_plan_without_hash, record_provider, render_provider_contract,
+        render_reader_prompt, role_schema_contracts, schema_validation_projection, sha256_bytes,
+        validate_deterministic_receipt, validate_json_schema_instance, validate_provider_calls,
+        validate_provider_calls_with_sources, validate_provider_receipt_envelope,
+        validate_reader_output, write_new_or_same_json,
     };
     use eliot_engine::CognitiveFieldGradingService;
     use eliot_types::{
-        AgentHostId, COGNITIVE_DETERMINISTIC_EVIDENCE_SCHEMA_VERSION,
+        AgentHostId, COGNITIVE_CORE_QUALIFICATION_HARNESS_VERSION,
+        COGNITIVE_CORE_QUALIFICATION_PROVIDER_CALLS,
+        COGNITIVE_DETERMINISTIC_EVIDENCE_SCHEMA_VERSION,
         COGNITIVE_DETERMINISTIC_REPORT_SCHEMA_VERSION, COGNITIVE_FIELD_CONTRACT_SCHEMA_VERSION,
         COGNITIVE_FIELD_PROVIDER_EVIDENCE_SCHEMA_VERSION,
         COGNITIVE_FIELD_PROVIDER_PLAN_SCHEMA_VERSION, CognitiveDeterministicEvidenceReceipt,
@@ -1883,13 +3317,359 @@ mod tests {
         CognitiveFieldProviderEvidenceReceipt, CognitiveFieldProviderOutputReceipt,
         CognitiveFieldProviderPlan, CognitiveFieldRole, CognitiveFieldRunContract,
         CognitiveFieldSuite, CognitiveHardGateEvidence, CognitiveMemoryCondition,
-        CognitiveVerifierCommandReceipt, minimal_cognitive_understanding_answer,
+        CognitiveUnderstandingAnswer, CognitiveVerifierCommandReceipt,
+        cognitive_understanding_answer_schema, minimal_cognitive_understanding_answer,
     };
-    use std::collections::BTreeMap;
+    use serde_json::{Value, json};
+    use std::collections::{BTreeMap, BTreeSet};
     use std::fs;
     use std::path::Path;
     use time::OffsetDateTime;
     use uuid::Uuid;
+
+    fn provider_test_prompt(
+        role: CognitiveFieldRole,
+        label: &str,
+    ) -> Result<(String, String, String), Box<dyn std::error::Error>> {
+        let (canonical, provider) = role_schema_contracts(role)?;
+        let prompt = if role == CognitiveFieldRole::UnderstandingReader {
+            format!(
+                "{label}\nBEGIN_COGNITIVE_UNDERSTANDING_SCHEMA\nsha256={}\n{}\nEND_COGNITIVE_UNDERSTANDING_SCHEMA\n",
+                provider.sha256, provider.canonical_json
+            )
+        } else {
+            format!("{label} exact provider role prompt\n")
+        };
+        Ok((prompt, canonical.sha256, provider.sha256))
+    }
+
+    fn complete_reader(condition: CognitiveMemoryCondition) -> CognitiveUnderstandingAnswer {
+        let mut reader = minimal_cognitive_understanding_answer();
+        reader.case_id = "U03".to_owned();
+        reader.memory_condition = condition;
+        reader.files_to_change = vec!["crates/eliot-engine/src/host.rs".to_owned()];
+        reader.known_failures = vec!["failure:stale-cli-discovery".to_owned()];
+        reader.stale_or_rejected_memory_refs = vec!["claim:rejected-route".to_owned()];
+        reader.open_unknowns = vec!["unknown:future-desktop-cache-layout".to_owned()];
+        reader.predicted_changed_paths = vec!["crates/eliot-engine/src/host.rs".to_owned()];
+        reader.predicted_failing_verifiers = vec!["cargo:test:host-integration".to_owned()];
+        reader
+            .confidence_by_section
+            .insert("causal_hops".to_owned(), 3);
+        if condition == CognitiveMemoryCondition::Treatment {
+            reader.memory_handles_received = vec!["claim:received".to_owned()];
+            reader.memory_handles_expanded = vec!["claim:expanded".to_owned()];
+            reader.memory_handles_used = vec!["claim:used".to_owned()];
+            reader.influence_receipt_refs = vec!["influence:verified".to_owned()];
+        } else {
+            reader.memory_handles_received.clear();
+            reader.memory_handles_expanded.clear();
+            reader.memory_handles_used.clear();
+            reader.influence_receipt_refs.clear();
+        }
+        reader
+    }
+
+    #[test]
+    fn canonical_and_provider_reader_contracts_accept_complete_fixture()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = complete_reader(CognitiveMemoryCondition::Treatment);
+        let value = serde_json::to_value(&fixture)?;
+        let canonical = cognitive_understanding_answer_schema();
+        let provider = provider_compatible_reader_schema(&canonical)?;
+        validate_json_schema_instance(&canonical, &value, "canonical fixture")?;
+        validate_json_schema_instance(&provider, &value, "provider fixture")?;
+        let roundtrip: CognitiveUnderstandingAnswer = serde_json::from_value(value.clone())?;
+        assert_eq!(roundtrip, fixture);
+        let properties = canonical["properties"]
+            .as_object()
+            .ok_or("canonical properties object")?
+            .keys()
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        let serialized = value
+            .as_object()
+            .ok_or("serialized reader object")?
+            .keys()
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        assert_eq!(serialized, properties);
+        Ok(())
+    }
+
+    #[test]
+    fn provider_transform_preserves_recursive_validation_semantics()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let canonical = cognitive_understanding_answer_schema();
+        let provider = provider_compatible_reader_schema(&canonical)?;
+        assert!(canonical.get("$schema").is_some());
+        assert!(provider.get("$schema").is_none());
+        assert_eq!(
+            schema_validation_projection(&canonical),
+            schema_validation_projection(&provider)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn desired_state_is_array_in_provider_contract() -> Result<(), Box<dyn std::error::Error>> {
+        let canonical = cognitive_understanding_answer_schema();
+        let provider = provider_compatible_reader_schema(&canonical)?;
+        let mut valid = serde_json::to_value(complete_reader(CognitiveMemoryCondition::Treatment))?;
+        valid["desired_state"] = json!([]);
+        validate_json_schema_instance(&canonical, &valid, "canonical desired_state array")?;
+        validate_json_schema_instance(&provider, &valid, "provider desired_state array")?;
+
+        let mut invalid = valid;
+        invalid["desired_state"] = json!("text");
+        let canonical_error =
+            validate_json_schema_instance(&canonical, &invalid, "canonical desired_state");
+        let provider_error =
+            validate_json_schema_instance(&provider, &invalid, "provider desired_state");
+        assert!(canonical_error.is_err());
+        assert!(provider_error.is_err());
+        let canonical_message = canonical_error
+            .err()
+            .ok_or("canonical schema accepted desired_state string")?
+            .to_string();
+        let provider_message = provider_error
+            .err()
+            .ok_or("provider schema accepted desired_state string")?
+            .to_string();
+        assert!(canonical_message.contains("/desired_state"));
+        assert!(provider_message.contains("/desired_state"));
+        Ok(())
+    }
+
+    #[test]
+    fn nested_causal_hop_is_closed_and_typed() -> Result<(), Box<dyn std::error::Error>> {
+        let canonical = cognitive_understanding_answer_schema();
+        let provider = provider_compatible_reader_schema(&canonical)?;
+        let valid = serde_json::to_value(complete_reader(CognitiveMemoryCondition::Treatment))?;
+        for field in [
+            "hop_kind",
+            "from",
+            "relation",
+            "to",
+            "evidence_refs",
+            "status",
+        ] {
+            let mut missing = valid.clone();
+            missing["causal_hops"][0]
+                .as_object_mut()
+                .ok_or("causal hop object")?
+                .remove(field);
+            assert!(
+                validate_json_schema_instance(&canonical, &missing, "missing causal field")
+                    .is_err()
+            );
+            assert!(
+                validate_json_schema_instance(&provider, &missing, "missing causal field").is_err()
+            );
+
+            let mut wrong = valid.clone();
+            wrong["causal_hops"][0][field] = if field == "evidence_refs" {
+                json!("not-an-array")
+            } else {
+                json!(7)
+            };
+            assert!(
+                validate_json_schema_instance(&canonical, &wrong, "wrong causal field type")
+                    .is_err()
+            );
+            assert!(
+                validate_json_schema_instance(&provider, &wrong, "wrong causal field type")
+                    .is_err()
+            );
+        }
+        let mut additional = valid;
+        additional["causal_hops"][0]["seventh"] = json!(true);
+        assert!(
+            validate_json_schema_instance(&canonical, &additional, "additional causal field")
+                .is_err()
+        );
+        assert!(
+            validate_json_schema_instance(&provider, &additional, "additional causal field")
+                .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn treatment_and_control_reader_fixtures_preserve_binding_and_isolation()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let canonical = cognitive_understanding_answer_schema();
+        let provider = provider_compatible_reader_schema(&canonical)?;
+        for condition in [
+            CognitiveMemoryCondition::Treatment,
+            CognitiveMemoryCondition::MemoryFreeControl,
+        ] {
+            let reader = complete_reader(condition);
+            let value = serde_json::to_value(&reader)?;
+            validate_json_schema_instance(&canonical, &value, "canonical bound fixture")?;
+            validate_json_schema_instance(&provider, &value, "provider bound fixture")?;
+            let roundtrip: CognitiveUnderstandingAnswer = serde_json::from_value(value)?;
+            let execution = CognitiveFieldExecutionKey {
+                case_id: reader.case_id.clone(),
+                memory_condition: condition,
+            };
+            let deterministic = CognitiveDeterministicReport {
+                schema_version: COGNITIVE_DETERMINISTIC_REPORT_SCHEMA_VERSION.to_owned(),
+                case_id: reader.case_id.clone(),
+                project_id: reader.project_id,
+                task_id: reader.task_id,
+                source_commit: "a".repeat(40),
+                verifier_refs: vec!["verifier:test".to_owned()],
+                hard_gate_evidence: Vec::new(),
+                controller_provider_calls: 0,
+                truth_revision_before: "revision:1".to_owned(),
+                truth_revision_after_observability: "revision:1".to_owned(),
+                report_hash: "report".to_owned(),
+                passed: true,
+            };
+            validate_reader_output(&roundtrip, &execution, &deterministic)?;
+            if condition == CognitiveMemoryCondition::MemoryFreeControl {
+                assert!(roundtrip.memory_handles_received.is_empty());
+                assert!(roundtrip.memory_handles_expanded.is_empty());
+                assert!(roundtrip.memory_handles_used.is_empty());
+                assert!(roundtrip.influence_receipt_refs.is_empty());
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn reader_prompt_binds_exact_generated_schema_and_hash_once()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let suite_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(Path::parent)
+            .ok_or("resolve workspace root")?;
+        let template = fs::read_to_string(
+            suite_root.join("tests/cognitive/field-v2/templates/reader-prompt.txt"),
+        )?;
+        let provider_schema =
+            provider_compatible_reader_schema(&cognitive_understanding_answer_schema())?;
+        let contract = render_provider_contract(&provider_schema)?;
+        let prompt = render_reader_prompt(&template, &contract)?;
+        assert_eq!(prompt.matches(&contract.canonical_json).count(), 1);
+        assert_eq!(prompt.matches(&contract.sha256).count(), 1);
+        assert_eq!(
+            sha256_bytes(contract.canonical_json.as_bytes()),
+            contract.sha256
+        );
+        assert!(!prompt.contains("all plural fields are arrays"));
+        assert!(!prompt.contains("do not emit any key other than"));
+        assert_eq!(
+            provider_schema["properties"]["desired_state"]["type"],
+            json!("array")
+        );
+        let (_, canonical_hash, provider_hash) =
+            provider_test_prompt(CognitiveFieldRole::UnderstandingReader, "reader")?;
+        assert_eq!(provider_hash, contract.sha256);
+        assert_ne!(canonical_hash, provider_hash);
+        Ok(())
+    }
+
+    #[test]
+    fn provider_transform_rejects_at_least_one_hundred_invalid_mutations()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let canonical = cognitive_understanding_answer_schema();
+        let provider = provider_compatible_reader_schema(&canonical)?;
+        let valid = serde_json::to_value(complete_reader(CognitiveMemoryCondition::Treatment))?;
+        let required = canonical["required"]
+            .as_array()
+            .ok_or("required field array")?
+            .iter()
+            .filter_map(Value::as_str)
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        let array_fields = canonical["properties"]
+            .as_object()
+            .ok_or("properties object")?
+            .iter()
+            .filter(|(_, schema)| schema.get("type") == Some(&json!("array")))
+            .map(|(name, _)| name.clone())
+            .collect::<Vec<_>>();
+        assert!(!required.is_empty());
+        assert!(!array_fields.is_empty());
+        for index in 0..120_usize {
+            let mut mutation = valid.clone();
+            match index % 6 {
+                0 => {
+                    let field = &array_fields[index % array_fields.len()];
+                    mutation[field] = json!("wrong-array-type");
+                }
+                1 => {
+                    let field = &required[index % required.len()];
+                    mutation
+                        .as_object_mut()
+                        .ok_or("reader object")?
+                        .remove(field);
+                }
+                2 => mutation["unknown_contract_field"] = json!(index),
+                3 => mutation["memory_condition"] = json!("invalid_condition"),
+                4 => mutation["causal_hops"][0]["evidence_refs"] = json!([7]),
+                _ => mutation["confidence_by_section"]["project_purpose"] = json!(256),
+            }
+            assert!(
+                validate_json_schema_instance(
+                    &canonical,
+                    &mutation,
+                    "canonical deterministic mutation"
+                )
+                .is_err(),
+                "canonical schema accepted mutation {index}"
+            );
+            assert!(
+                validate_json_schema_instance(
+                    &provider,
+                    &mutation,
+                    "provider deterministic mutation"
+                )
+                .is_err(),
+                "provider schema widened semantics for mutation {index}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn reader_contract_has_one_rust_owner_and_placeholder_only_template()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let workspace = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(Path::parent)
+            .ok_or("resolve workspace root")?;
+        let owner =
+            fs::read_to_string(workspace.join("crates/eliot-types/src/cognitive_field.rs"))?;
+        let runner =
+            fs::read_to_string(workspace.join("crates/eliot-app/src/cognitive_field_runner.rs"))?;
+        let template = fs::read_to_string(
+            workspace.join("tests/cognitive/field-v2/templates/reader-prompt.txt"),
+        )?;
+        assert_eq!(
+            owner
+                .matches("schema_for!(CognitiveUnderstandingAnswer)")
+                .count(),
+            1
+        );
+        let production_runner = runner
+            .split("#[cfg(test)]")
+            .next()
+            .ok_or("production runner section")?;
+        let forbidden_derivation = ["schema_for!(", "CognitiveUnderstandingAnswer", ")"].concat();
+        assert_eq!(production_runner.matches(&forbidden_derivation).count(), 0);
+        assert_eq!(template.matches(READER_SCHEMA_JSON_PLACEHOLDER).count(), 1);
+        assert_eq!(
+            template.matches(READER_SCHEMA_SHA256_PLACEHOLDER).count(),
+            1
+        );
+        assert!(!template.contains("all plural fields are arrays"));
+        assert!(!template.contains("`desired_state`"));
+        assert!(!template.contains("do not emit any key other than"));
+        Ok(())
+    }
 
     #[test]
     fn generated_private_oracle_values_are_absent_from_the_versioned_suite()
@@ -2081,7 +3861,8 @@ mod tests {
             let call_number = u8::try_from(calls.len() + 1)?;
             let call_id = format!("field-call-{call_number:02}");
             let prompt_ref = format!("prompts/{call_id}.txt");
-            let prompt = format!("{call_id} exact provider role prompt\n");
+            let (prompt, canonical_schema_sha256, provider_schema_sha256) =
+                provider_test_prompt(role, &call_id)?;
             fs::write(private_root.join(&prompt_ref), prompt.as_bytes())?;
             calls.push(CognitiveFieldProviderCallPlan {
                 call_number,
@@ -2092,6 +3873,8 @@ mod tests {
                 expected_provider_executable_sha256: "a".repeat(64),
                 prompt_ref,
                 prompt_sha256: sha256_bytes(prompt.as_bytes()),
+                canonical_schema_sha256,
+                provider_schema_sha256,
                 provider_smoke,
                 counts_against_cap: !provider_smoke,
                 executions,
@@ -2163,6 +3946,241 @@ mod tests {
     }
 
     #[test]
+    fn core_provider_plan_uses_four_fresh_calls_per_scenario()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let suite_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(Path::parent)
+            .ok_or("resolve workspace root")?;
+        let mut suite: CognitiveFieldSuite = serde_json::from_slice(&fs::read(
+            suite_root.join("tests/cognitive/field-v2/suite.json"),
+        )?)?;
+        suite.harness_version = COGNITIVE_CORE_QUALIFICATION_HARNESS_VERSION.to_owned();
+        suite.hard_provider_call_cap = COGNITIVE_CORE_QUALIFICATION_PROVIDER_CALLS;
+        suite
+            .cases
+            .retain(|case| matches!(case.case_id.as_str(), "U03" | "U06" | "U11"));
+
+        let private_root =
+            std::env::temp_dir().join(format!("eliot-core-provider-plan-{}", Uuid::new_v4()));
+        fs::create_dir_all(private_root.join("prompts"))?;
+        let private_root = fs::canonicalize(private_root)?;
+        let mut calls = Vec::new();
+        for (case_id, reader_host, reader_model) in [
+            ("U03", AgentHostId::Claude, "claude-opus-5"),
+            ("U06", AgentHostId::Antigravity, "gemini-3-flash"),
+            ("U11", AgentHostId::OpenCode, "openai/gpt-5.6-codex"),
+        ] {
+            for (role, host, model, conditions) in [
+                (
+                    CognitiveFieldRole::CodexWorker,
+                    AgentHostId::Codex,
+                    "gpt-5.6-codex",
+                    vec![
+                        CognitiveMemoryCondition::Treatment,
+                        CognitiveMemoryCondition::MemoryFreeControl,
+                    ],
+                ),
+                (
+                    CognitiveFieldRole::UnderstandingReader,
+                    reader_host,
+                    reader_model,
+                    vec![CognitiveMemoryCondition::Treatment],
+                ),
+                (
+                    CognitiveFieldRole::UnderstandingReader,
+                    reader_host,
+                    reader_model,
+                    vec![CognitiveMemoryCondition::MemoryFreeControl],
+                ),
+                (
+                    CognitiveFieldRole::CodexJudge,
+                    AgentHostId::Codex,
+                    "gpt-5.6-codex",
+                    vec![
+                        CognitiveMemoryCondition::Treatment,
+                        CognitiveMemoryCondition::MemoryFreeControl,
+                    ],
+                ),
+            ] {
+                let call_number = u8::try_from(calls.len() + 1)?;
+                let call_id = format!("core-call-{call_number:02}");
+                let prompt_ref = format!("prompts/{call_id}.txt");
+                let (prompt, canonical_schema_sha256, provider_schema_sha256) =
+                    provider_test_prompt(role, &call_id)?;
+                fs::write(private_root.join(&prompt_ref), prompt.as_bytes())?;
+                let mut executions = conditions
+                    .into_iter()
+                    .map(|memory_condition| CognitiveFieldExecutionKey {
+                        case_id: case_id.to_owned(),
+                        memory_condition,
+                    })
+                    .collect::<Vec<_>>();
+                executions.sort();
+                calls.push(CognitiveFieldProviderCallPlan {
+                    call_number,
+                    call_id,
+                    role,
+                    host,
+                    requested_model: model.to_owned(),
+                    expected_provider_executable_sha256: "a".repeat(64),
+                    prompt_ref,
+                    prompt_sha256: sha256_bytes(prompt.as_bytes()),
+                    canonical_schema_sha256,
+                    provider_schema_sha256,
+                    provider_smoke: false,
+                    counts_against_cap: true,
+                    executions,
+                });
+            }
+        }
+
+        let (capped, smokes) = validate_provider_calls(&suite, &calls, &private_root)?;
+        assert_eq!(capped, COGNITIVE_CORE_QUALIFICATION_PROVIDER_CALLS);
+        assert_eq!(smokes, 0);
+        assert_eq!(calls.len(), 12);
+
+        calls[1].host = AgentHostId::OpenCode;
+        assert!(validate_provider_calls(&suite, &calls, &private_root).is_err());
+        fs::remove_dir_all(&private_root)?;
+        Ok(())
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn core_provider_preflight_accepts_eleven_fresh_calls_plus_exact_prior_worker_source()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let suite_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(Path::parent)
+            .ok_or("resolve workspace root")?;
+        let mut suite: CognitiveFieldSuite = serde_json::from_slice(&fs::read(
+            suite_root.join("tests/cognitive/field-v2/suite.json"),
+        )?)?;
+        suite.harness_version = COGNITIVE_CORE_QUALIFICATION_HARNESS_VERSION.to_owned();
+        suite.hard_provider_call_cap = COGNITIVE_CORE_QUALIFICATION_PROVIDER_CALLS;
+        suite
+            .cases
+            .retain(|case| matches!(case.case_id.as_str(), "U03" | "U06" | "U11"));
+        let private_root =
+            std::env::temp_dir().join(format!("eliot-core-resume-plan-{}", Uuid::new_v4()));
+        fs::create_dir_all(private_root.join("prompts"))?;
+        let private_root = fs::canonicalize(private_root)?;
+        let mut calls = Vec::new();
+        for (case_id, reader_host, reader_model) in [
+            ("U03", AgentHostId::Claude, "claude-opus-5"),
+            ("U06", AgentHostId::Antigravity, "gemini-3.6-flash-high"),
+            ("U11", AgentHostId::OpenCode, "openai/gpt-5.4"),
+        ] {
+            for (role, host, model, conditions) in [
+                (
+                    CognitiveFieldRole::CodexWorker,
+                    AgentHostId::Codex,
+                    "gpt-5.6-sol",
+                    vec![
+                        CognitiveMemoryCondition::Treatment,
+                        CognitiveMemoryCondition::MemoryFreeControl,
+                    ],
+                ),
+                (
+                    CognitiveFieldRole::UnderstandingReader,
+                    reader_host,
+                    reader_model,
+                    vec![CognitiveMemoryCondition::Treatment],
+                ),
+                (
+                    CognitiveFieldRole::UnderstandingReader,
+                    reader_host,
+                    reader_model,
+                    vec![CognitiveMemoryCondition::MemoryFreeControl],
+                ),
+                (
+                    CognitiveFieldRole::CodexJudge,
+                    AgentHostId::Codex,
+                    "gpt-5.6-sol",
+                    vec![
+                        CognitiveMemoryCondition::Treatment,
+                        CognitiveMemoryCondition::MemoryFreeControl,
+                    ],
+                ),
+            ] {
+                if case_id == "U03" && role == CognitiveFieldRole::CodexWorker {
+                    continue;
+                }
+                let call_number = u8::try_from(calls.len() + 1)?;
+                let call_id = format!("resumed-call-{call_number:02}");
+                let prompt_ref = format!("prompts/{call_id}.txt");
+                let (prompt, canonical_schema_sha256, provider_schema_sha256) =
+                    provider_test_prompt(role, &call_id)?;
+                fs::write(private_root.join(&prompt_ref), prompt.as_bytes())?;
+                let mut executions = conditions
+                    .into_iter()
+                    .map(|memory_condition| CognitiveFieldExecutionKey {
+                        case_id: case_id.to_owned(),
+                        memory_condition,
+                    })
+                    .collect::<Vec<_>>();
+                executions.sort();
+                calls.push(CognitiveFieldProviderCallPlan {
+                    call_number,
+                    call_id,
+                    role,
+                    host,
+                    requested_model: model.to_owned(),
+                    expected_provider_executable_sha256: "a".repeat(64),
+                    prompt_ref,
+                    prompt_sha256: sha256_bytes(prompt.as_bytes()),
+                    canonical_schema_sha256,
+                    provider_schema_sha256,
+                    provider_smoke: false,
+                    counts_against_cap: true,
+                    executions,
+                });
+            }
+        }
+        let (worker_schema, _) = role_schema_contracts(CognitiveFieldRole::CodexWorker)?;
+        let mut sources = calls
+            .iter()
+            .map(|call| CoreRoleEvidenceSource::FreshProviderCall {
+                planned_call_id: call.call_id.clone(),
+            })
+            .collect::<Vec<_>>();
+        sources.push(CoreRoleEvidenceSource::AcceptedPriorRoleArtifact {
+            source_run_id: "cq-core-20260729-003".to_owned(),
+            source_call_id: "6f04e449-ecab-4555-8bd0-4a6bd762c1b4".to_owned(),
+            role: CognitiveFieldRole::CodexWorker,
+            case_id: "U03".to_owned(),
+            provider_session_id: "019fb120-97b7-78c1-8a27-0a54c1a573ae".to_owned(),
+            source_commit: "9e6d9161a133d7e501c163a6cc69a3da86713e7a".to_owned(),
+            provider_executable_sha256: "a".repeat(64),
+            output_schema_sha256: worker_schema.sha256,
+            artifact_sha256: "b".repeat(64),
+            provider_receipt_ref: "receipt:accepted-worker".to_owned(),
+            deterministic_receipt_refs: vec![
+                "treatment#sha256=".to_owned() + &"c".repeat(64),
+                "control#sha256=".to_owned() + &"d".repeat(64),
+            ],
+            contamination_receipt_ref: "contamination#sha256=".to_owned() + &"e".repeat(64),
+            worktree_diff_sha256: Some("f".repeat(64)),
+        });
+        let (fresh, smokes) =
+            validate_provider_calls_with_sources(&suite, &calls, &private_root, &sources)?;
+        assert_eq!(fresh, 11);
+        assert_eq!(smokes, 0);
+
+        if let Some(CoreRoleEvidenceSource::AcceptedPriorRoleArtifact { case_id, .. }) =
+            sources.last_mut()
+        {
+            *case_id = "U06".to_owned();
+        }
+        assert!(
+            validate_provider_calls_with_sources(&suite, &calls, &private_root, &sources).is_err()
+        );
+        fs::remove_dir_all(&private_root)?;
+        Ok(())
+    }
+
+    #[test]
     fn provider_receipt_rejects_aliases_unknown_outcomes_and_binary_drift()
     -> Result<(), Box<dyn std::error::Error>> {
         let private_root = std::env::temp_dir().join(format!(
@@ -2182,6 +4200,8 @@ mod tests {
         let model = "claude-opus-5";
         let executable_sha256 = sha256_bytes(&fs::read(&executable)?);
         let prompt_sha256 = sha256_bytes(&fs::read(&prompt)?);
+        let (_, canonical_schema_sha256, provider_schema_sha256) =
+            provider_test_prompt(CognitiveFieldRole::UnderstandingReader, "reader-01")?;
         let call = CognitiveFieldProviderCallPlan {
             call_number: 1,
             call_id: "reader-01".to_owned(),
@@ -2191,6 +4211,8 @@ mod tests {
             expected_provider_executable_sha256: executable_sha256.clone(),
             prompt_ref: "prompts/reader-01.txt".to_owned(),
             prompt_sha256: prompt_sha256.clone(),
+            canonical_schema_sha256,
+            provider_schema_sha256,
             provider_smoke: false,
             counts_against_cap: true,
             executions: vec![execution.clone()],
@@ -2332,6 +4354,8 @@ mod tests {
             case_id: "U01".to_owned(),
             memory_condition: CognitiveMemoryCondition::Treatment,
         };
+        let (_, canonical_schema_sha256, provider_schema_sha256) =
+            provider_test_prompt(CognitiveFieldRole::UnderstandingReader, "reader-01")?;
         let call = CognitiveFieldProviderCallPlan {
             call_number: 1,
             call_id: "reader-01".to_owned(),
@@ -2341,6 +4365,8 @@ mod tests {
             expected_provider_executable_sha256: sha256_bytes(&fs::read(&executable)?),
             prompt_ref: "prompts/reader-01.txt".to_owned(),
             prompt_sha256: sha256_bytes(&fs::read(&prompt)?),
+            canonical_schema_sha256,
+            provider_schema_sha256,
             provider_smoke: false,
             counts_against_cap: true,
             executions: vec![execution.clone()],
@@ -2352,6 +4378,8 @@ mod tests {
             calls: vec![call.clone()],
             planned_provider_calls: 1,
             planned_smoke_calls: 0,
+            planned_reused_roles: 0,
+            role_evidence_plan_hash: None,
             plan_hash: String::new(),
             sealed_at: OffsetDateTime::UNIX_EPOCH,
         };
