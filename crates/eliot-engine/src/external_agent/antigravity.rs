@@ -167,9 +167,11 @@ fn parse_native(stdout: &[u8]) -> Result<(Value, Vec<Value>), EngineError> {
         .find(|event| {
             event
                 .get("type")
+                .or_else(|| event.get("event"))
                 .and_then(Value::as_str)
                 .is_some_and(|kind| matches!(kind, "result" | "final" | "message.result"))
                 || event.get("structured_output").is_some()
+                || event.pointer("/result/structured_output").is_some()
         })
         .ok_or_else(|| {
             EngineError::WriteRejected(
@@ -179,15 +181,20 @@ fn parse_native(stdout: &[u8]) -> Result<(Value, Vec<Value>), EngineError> {
     let status = terminal
         .get("status")
         .or_else(|| terminal.get("subtype"))
+        .or_else(|| terminal.pointer("/result/status"))
         .and_then(Value::as_str)
         .unwrap_or("success");
-    if !matches!(status, "success" | "succeeded" | "completed" | "complete") {
+    if !matches!(
+        status.to_ascii_lowercase().as_str(),
+        "success" | "succeeded" | "completed" | "complete"
+    ) {
         return rejected(format!(
             "Antigravity terminal state is not recognized as success: {status}"
         ));
     }
     let output = terminal
-        .get("structured_output")
+        .pointer("/result/structured_output")
+        .or_else(|| terminal.get("structured_output"))
         .or_else(|| terminal.get("result"))
         .cloned()
         .unwrap_or_else(|| terminal.clone());

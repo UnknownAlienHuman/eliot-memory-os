@@ -347,7 +347,20 @@ fn collect_tool_names(value: &Value, names: &mut BTreeSet<String>) {
                         "tool" | "tool_use" | "tool_call" | "tool.result" | "tool_use_summary"
                     ) || kind.contains("tool")
                 });
-            if is_tool && let Some(name) = first_string(value, &["name", "tool_name", "toolName"]) {
+            let delegated_mcp_name = [
+                "/tool_info/parameters/ToolName",
+                "/tool_info/parameters/tool_name",
+                "/parameters/ToolName",
+                "/parameters/tool_name",
+            ]
+            .into_iter()
+            .find_map(|pointer| value.pointer(pointer).and_then(Value::as_str))
+            .filter(|name| !name.trim().is_empty());
+            if let Some(name) = delegated_mcp_name {
+                names.insert(name.to_owned());
+            } else if is_tool
+                && let Some(name) = first_string(value, &["name", "tool_name", "toolName"])
+            {
                 names.insert(name);
             }
             for child in object.values() {

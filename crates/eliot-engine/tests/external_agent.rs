@@ -174,6 +174,37 @@ fn antigravity_command_and_sentinel_parser_are_exact_and_fail_closed() -> TestRe
         )
         .is_err()
     );
+
+    let native_schema = json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["status", "resolved_model"],
+        "properties": {
+            "status": {"const": "ready"},
+            "resolved_model": {"const": "gemini-3.6-flash-high"}
+        }
+    });
+    let native_stream = concat!(
+        "{\"event\":\"init\",\"conversation_id\":\"agy-conversation-1\",",
+        "\"init\":{\"model\":\"gemini-3.6-flash-high\"}}\n",
+        "{\"event\":\"step_update\",\"step_update\":{\"step_type\":\"tool\",",
+        "\"tool_name\":\"call_mcp_tool\",\"tool_info\":{\"parameters\":{",
+        "\"ServerName\":\"eliot-governor\",\"ToolName\":\"eliot_current_state\"}}}}\n",
+        "{\"event\":\"result\",\"result\":{\"conversation_id\":\"agy-conversation-1\",",
+        "\"status\":\"SUCCESS\",\"structured_output\":{\"status\":\"ready\",",
+        "\"resolved_model\":\"gemini-3.6-flash-high\"}}}\n"
+    );
+    let native = parse_antigravity_output(
+        native_stream.as_bytes(),
+        "gemini-3.6-flash-high",
+        &native_schema,
+        ProviderStructuredOutputMode::NativeJsonSchema,
+    )?;
+    assert_eq!(native.provider_session_id, "agy-conversation-1");
+    assert_eq!(
+        native.observed_tool_names,
+        vec!["eliot_current_state".to_owned()]
+    );
     Ok(())
 }
 
