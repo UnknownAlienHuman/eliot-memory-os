@@ -1,12 +1,14 @@
 use anyhow::{Context, Result, bail, ensure};
 use eliot_engine::CognitiveFieldGradingService;
 use eliot_types::{
-    AgentHostId, COGNITIVE_CORE_QUALIFICATION_HARNESS_VERSION,
+    AgentHostId, COGNITIVE_CORE_CONTINUATION_EXPECTED_PROVIDER_CALLS,
+    COGNITIVE_CORE_CONTINUATION_MAX_PROVIDER_CALLS, COGNITIVE_CORE_QUALIFICATION_HARNESS_VERSION,
     COGNITIVE_CORE_QUALIFICATION_PROVIDER_CALLS, COGNITIVE_DETERMINISTIC_EVIDENCE_SCHEMA_VERSION,
     COGNITIVE_DETERMINISTIC_REPORT_SCHEMA_VERSION, COGNITIVE_FIELD_CONTRACT_SCHEMA_VERSION,
     COGNITIVE_FIELD_ORACLE_SCHEMA_VERSION, COGNITIVE_FIELD_PLAN_SCHEMA_VERSION,
     COGNITIVE_FIELD_PROVIDER_EVIDENCE_SCHEMA_VERSION, COGNITIVE_FIELD_PROVIDER_PLAN_SCHEMA_VERSION,
     COGNITIVE_FIELD_PROVIDER_PROJECTION_SCHEMA_VERSION, COGNITIVE_FIELD_WORKER_SCHEMA_VERSION,
+    COGNITIVE_PROVIDER_RUNTIME_SCHEMA_VERSION, COGNITIVE_RUNTIME_PREFLIGHT_SCHEMA_VERSION,
     CognitiveDeterministicEvidenceReceipt, CognitiveDeterministicReport, CognitiveFieldCase,
     CognitiveFieldExecutionKey, CognitiveFieldPlan, CognitiveFieldPlanItem,
     CognitiveFieldProviderCallPlan, CognitiveFieldProviderEvidenceReceipt,
@@ -14,6 +16,7 @@ use eliot_types::{
     CognitiveFieldProviderProjection, CognitiveFieldRole, CognitiveFieldRunContract,
     CognitiveFieldSuite, CognitiveFieldValidationReport, CognitiveHardGateEvidence,
     CognitiveHardGateKind, CognitiveJudgeResult, CognitiveMemoryCondition,
+    CognitiveProviderMcpServer, CognitiveProviderRuntimeContract, CognitiveRuntimePreflightReceipt,
     CognitiveUnderstandingAnswer, CognitiveWorkerResult, ProjectId, TaskId, TaskIntentOracle,
     cognitive_judge_result_schema, cognitive_understanding_answer_schema,
     cognitive_worker_result_schema, inspect_secret_bytes,
@@ -23,9 +26,11 @@ use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
-use std::io::Write as _;
+use std::io::{BufRead as _, BufReader, Write};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, channel};
+use std::time::{Duration, Instant};
 use time::OffsetDateTime;
 use uuid::Uuid;
 
@@ -90,6 +95,18 @@ enum CoreRoleEvidenceSource {
         provider_executable_sha256: String,
         output_schema_sha256: String,
         artifact_sha256: String,
+        #[serde(default)]
+        prompt_sha256: String,
+        #[serde(default)]
+        oracle_sha256: String,
+        #[serde(default)]
+        runtime_contract_sha256: String,
+        #[serde(default)]
+        input_artifact_sha256s: Vec<String>,
+        #[serde(default)]
+        deterministic_report_sha256s: Vec<String>,
+        #[serde(default)]
+        executions: Vec<CognitiveFieldExecutionKey>,
         provider_receipt_ref: String,
         deterministic_receipt_refs: Vec<String>,
         contamination_receipt_ref: String,
@@ -113,6 +130,12 @@ struct CoreRoleReuseProjection {
     provider_executable_sha256: String,
     output_schema_sha256: String,
     artifact_sha256: String,
+    prompt_sha256: String,
+    oracle_sha256: String,
+    runtime_contract_sha256: String,
+    input_artifact_sha256s: Vec<String>,
+    deterministic_report_sha256s: Vec<String>,
+    executions: Vec<CognitiveFieldExecutionKey>,
     deterministic_receipt_refs: Vec<String>,
     contamination_receipt_ref: String,
     worktree_diff_sha256: Option<String>,
@@ -125,6 +148,575 @@ struct VerifiedPriorRole {
     source_private_root: PathBuf,
     outputs: Vec<(CognitiveFieldExecutionKey, Vec<u8>)>,
     candidate_diff: Option<Vec<u8>>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CognitiveHarnessOnlyEquivalence {
+    schema_version: String,
+    product_source_commit: String,
+    governor_build_source_commit: String,
+    exact_diff_sha256: String,
+    changed_paths: Vec<String>,
+}
+
+const CODEX_COGNITIVE_EXPECTED_TOOLS: &[&str] = &[
+    "eliot_current_state",
+    "eliot_recall_l0",
+    "eliot_fetch_l2",
+    "eliot_compile_packet_l3",
+    "eliot_agent_candidate_submit",
+    "eliot_memory_influence_trace",
+    "eliot_write_cognitive_observation",
+];
+const COGNITIVE_RUNTIME_PREFLIGHT_LIMIT: Duration = Duration::from_secs(20);
+const APPROVED_HARNESS_PATHS: &[&str] = &[
+    "crates/eliot-app/src/cognitive_field_runner.rs",
+    "crates/eliot-app/src/main.rs",
+    "crates/eliot-types/src/cognitive_field.rs",
+    "crates/eliot-types/src/lib.rs",
+    "crates/eliot-types/src/secret_boundary.rs",
+];
+
+fn codex_cognitive_runtime_contract(
+    provider_executable: &Path,
+    worktree: &Path,
+    governor_executable: &Path,
+    governor_build_source_commit: Option<&str>,
+) -> Result<CognitiveProviderRuntimeContract> {
+    let provider_executable = canonical_file(provider_executable, "Codex provider executable")?;
+    let worktree = canonical_directory(worktree, "isolated cognitive worktree")?;
+    let governor_executable = canonical_file(governor_executable, "Eliot Governor executable")?;
+    if let Some(commit) = governor_build_source_commit {
+        ensure!(
+            commit.len() == 40 && commit.bytes().all(|byte| byte.is_ascii_hexdigit()),
+            "Governor build source commit must be a 40-character hexadecimal object id"
+        );
+    }
+
+    let provider_executable = canonical_path(&provider_executable);
+    let provider_cwd = canonical_path(&worktree);
+    let governor_executable_path = canonical_path(&governor_executable);
+    let governor_args = vec![
+        "mcp".to_owned(),
+        "stdio".to_owned(),
+        "--host".to_owned(),
+        "codex".to_owned(),
+        "--profile".to_owned(),
+        "codex_worker".to_owned(),
+        "--instance".to_owned(),
+        "default".to_owned(),
+    ];
+    let provider_argv = vec![
+        "exec".to_owned(),
+        "--cd".to_owned(),
+        provider_cwd.clone(),
+        "-c".to_owned(),
+        format!(
+            "mcp_servers.eliot-governor.command={}",
+            serde_json::to_string(&governor_executable_path)?
+        ),
+        "-c".to_owned(),
+        format!(
+            "mcp_servers.eliot-governor.args={}",
+            serde_json::to_string(&governor_args)?
+        ),
+        "-c".to_owned(),
+        format!(
+            "mcp_servers.eliot-governor.cwd={}",
+            serde_json::to_string(&provider_cwd)?
+        ),
+        "-c".to_owned(),
+        "mcp_servers.eliot-governor.required=true".to_owned(),
+        "-c".to_owned(),
+        "mcp_servers.eliot_surrealdb.enabled=false".to_owned(),
+    ];
+    let mut contract = CognitiveProviderRuntimeContract {
+        schema_version: COGNITIVE_PROVIDER_RUNTIME_SCHEMA_VERSION.to_owned(),
+        host: AgentHostId::Codex,
+        provider_executable: provider_executable.clone(),
+        provider_executable_sha256: sha256_bytes(&fs::read(&provider_executable)?),
+        provider_cwd: provider_cwd.clone(),
+        provider_argv,
+        nonsecret_environment: BTreeMap::new(),
+        mcp_servers: vec![
+            CognitiveProviderMcpServer {
+                name: "eliot-governor".to_owned(),
+                command: governor_executable_path,
+                args: governor_args,
+                cwd: provider_cwd,
+                required: true,
+                enabled: true,
+                executable_sha256: sha256_bytes(&fs::read(&governor_executable)?),
+                build_source_commit: governor_build_source_commit.map(str::to_owned),
+            },
+            CognitiveProviderMcpServer {
+                name: "eliot_surrealdb".to_owned(),
+                command: String::new(),
+                args: Vec::new(),
+                cwd: String::new(),
+                required: false,
+                enabled: false,
+                executable_sha256: String::new(),
+                build_source_commit: None,
+            },
+        ],
+        expected_mcp_tool_names: CODEX_COGNITIVE_EXPECTED_TOOLS
+            .iter()
+            .map(ToString::to_string)
+            .collect(),
+        forbidden_mcp_server_names: vec!["eliot_surrealdb".to_owned()],
+        runtime_contract_sha256: String::new(),
+    };
+    seal_runtime_contract(&mut contract)?;
+    Ok(contract)
+}
+
+fn runtime_contract_without_hash(
+    contract: &CognitiveProviderRuntimeContract,
+) -> CognitiveProviderRuntimeContract {
+    let mut material = contract.clone();
+    material.runtime_contract_sha256.clear();
+    material
+}
+
+fn normalize_runtime_contract(contract: &mut CognitiveProviderRuntimeContract) {
+    contract
+        .mcp_servers
+        .sort_by(|left, right| left.name.cmp(&right.name));
+    contract
+        .expected_mcp_tool_names
+        .sort_by(|left, right| left.as_bytes().cmp(right.as_bytes()));
+    contract.expected_mcp_tool_names.dedup();
+    contract
+        .forbidden_mcp_server_names
+        .sort_by(|left, right| left.as_bytes().cmp(right.as_bytes()));
+    contract.forbidden_mcp_server_names.dedup();
+}
+
+fn seal_runtime_contract(contract: &mut CognitiveProviderRuntimeContract) -> Result<()> {
+    normalize_runtime_contract(contract);
+    contract.runtime_contract_sha256.clear();
+    contract.runtime_contract_sha256 = computed_runtime_contract_sha256(contract)?;
+    validate_runtime_contract(contract)
+}
+
+fn computed_runtime_contract_sha256(contract: &CognitiveProviderRuntimeContract) -> Result<String> {
+    let mut material = runtime_contract_without_hash(contract);
+    normalize_runtime_contract(&mut material);
+    Ok(sha256_bytes(&serde_json::to_vec(&material)?))
+}
+
+fn validate_runtime_contract(contract: &CognitiveProviderRuntimeContract) -> Result<()> {
+    ensure!(
+        contract.schema_version == COGNITIVE_PROVIDER_RUNTIME_SCHEMA_VERSION,
+        "provider runtime schema version is invalid"
+    );
+    let mut normalized = contract.clone();
+    normalize_runtime_contract(&mut normalized);
+    ensure!(
+        normalized == *contract,
+        "provider runtime unordered fields must be sorted and deduplicated"
+    );
+    ensure!(
+        is_sha256(&contract.provider_executable_sha256)
+            && is_sha256(&contract.runtime_contract_sha256)
+            && computed_runtime_contract_sha256(contract)? == contract.runtime_contract_sha256,
+        "provider runtime hashes are invalid"
+    );
+    let provider_executable = canonical_file(
+        Path::new(&contract.provider_executable),
+        "provider executable",
+    )?;
+    let provider_cwd = canonical_directory(
+        Path::new(&contract.provider_cwd),
+        "provider working directory",
+    )?;
+    ensure!(
+        canonical_path(&provider_executable) == contract.provider_executable
+            && canonical_path(&provider_cwd) == contract.provider_cwd
+            && sha256_bytes(&fs::read(provider_executable)?) == contract.provider_executable_sha256,
+        "provider runtime executable or cwd differs from its canonical binding"
+    );
+    ensure!(
+        !contract.provider_argv.is_empty() && !contract.forbidden_mcp_server_names.is_empty(),
+        "provider runtime argv and forbidden servers are required"
+    );
+    for server in &contract.mcp_servers {
+        ensure!(
+            safe_segment(&server.name),
+            "provider runtime MCP server name is unsafe"
+        );
+        if server.enabled {
+            let executable = canonical_file(Path::new(&server.command), "MCP server executable")?;
+            let cwd = canonical_directory(Path::new(&server.cwd), "MCP server cwd")?;
+            ensure!(
+                canonical_path(&executable) == server.command
+                    && canonical_path(&cwd) == server.cwd
+                    && is_sha256(&server.executable_sha256)
+                    && sha256_bytes(&fs::read(executable)?) == server.executable_sha256,
+                "enabled MCP server runtime binding is invalid"
+            );
+            if let Some(commit) = &server.build_source_commit {
+                ensure!(
+                    commit.len() == 40 && commit.bytes().all(|byte| byte.is_ascii_hexdigit()),
+                    "MCP server build source commit is invalid"
+                );
+            }
+        }
+    }
+    if contract.host == AgentHostId::Codex {
+        ensure!(
+            !contract.expected_mcp_tool_names.is_empty(),
+            "Codex cognitive runtime requires expected MCP tools"
+        );
+        let governor = contract
+            .mcp_servers
+            .iter()
+            .find(|server| server.name == "eliot-governor")
+            .context("Codex cognitive runtime lacks eliot-governor")?;
+        ensure!(
+            governor.enabled
+                && governor.required
+                && governor.build_source_commit.is_some()
+                && governor.args
+                    == [
+                        "mcp",
+                        "stdio",
+                        "--host",
+                        "codex",
+                        "--profile",
+                        "codex_worker",
+                        "--instance",
+                        "default",
+                    ]
+                    .map(str::to_owned)
+                && contract
+                    .mcp_servers
+                    .iter()
+                    .filter(|server| {
+                        server.name.to_ascii_lowercase().contains("surreal")
+                            && server.name != "eliot-governor"
+                    })
+                    .all(|server| !server.enabled),
+            "Codex cognitive runtime must require Governor codex_worker and disable raw SurrealDB"
+        );
+    }
+    Ok(())
+}
+
+fn validate_governor_product_provenance(
+    contract: &CognitiveProviderRuntimeContract,
+    product_source_commit: &str,
+    equivalence: Option<&CognitiveHarnessOnlyEquivalence>,
+) -> Result<()> {
+    ensure!(
+        product_source_commit.len() == 40
+            && product_source_commit
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit()),
+        "product-under-test source commit is invalid"
+    );
+    let governor_commit = contract
+        .mcp_servers
+        .iter()
+        .find(|server| server.name == "eliot-governor" && server.enabled)
+        .and_then(|server| server.build_source_commit.as_deref())
+        .context("Governor runtime lacks exact build source provenance")?;
+    if governor_commit == product_source_commit {
+        return Ok(());
+    }
+    let equivalence =
+        equivalence.context("Governor build source differs without a harness-only equivalence")?;
+    ensure!(
+        equivalence.schema_version == "eliot-cognitive-harness-equivalence-v1"
+            && equivalence.product_source_commit == product_source_commit
+            && equivalence.governor_build_source_commit == governor_commit
+            && is_sha256(&equivalence.exact_diff_sha256)
+            && !equivalence.changed_paths.is_empty()
+            && equivalence
+                .changed_paths
+                .windows(2)
+                .all(|pair| pair[0] < pair[1])
+            && equivalence
+                .changed_paths
+                .iter()
+                .all(|path| APPROVED_HARNESS_PATHS.contains(&path.as_str())),
+        "Governor source mismatch equivalence is absent, unordered, or not harness-only"
+    );
+    Ok(())
+}
+
+fn codex_mcp_list_argv(contract: &CognitiveProviderRuntimeContract) -> Result<Vec<String>> {
+    let (subcommand, runtime_args) = contract
+        .provider_argv
+        .split_first()
+        .context("Codex runtime argv is empty")?;
+    ensure!(
+        subcommand == "exec",
+        "Codex cognitive provider argv must begin with exec"
+    );
+    let mut args = runtime_args.to_vec();
+    args.extend(["mcp", "list", "--json"].map(str::to_owned));
+    Ok(args)
+}
+
+fn configured_mcp_servers(value: &Value) -> Result<Vec<(String, bool)>> {
+    let entries = value
+        .as_array()
+        .or_else(|| value.get("servers").and_then(Value::as_array))
+        .context("Codex MCP list JSON is neither an array nor a servers object")?;
+    let mut servers = entries
+        .iter()
+        .map(|entry| {
+            let name = entry
+                .get("name")
+                .and_then(Value::as_str)
+                .context("Codex MCP entry lacks a name")?;
+            let enabled = entry
+                .get("enabled")
+                .and_then(Value::as_bool)
+                .unwrap_or(true);
+            Ok((name.to_owned(), enabled))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    servers.sort();
+    servers.dedup();
+    Ok(servers)
+}
+
+fn write_json_rpc(writer: &mut impl Write, value: &Value) -> Result<()> {
+    serde_json::to_writer(&mut *writer, value)?;
+    writer.write_all(b"\n")?;
+    writer.flush()?;
+    Ok(())
+}
+
+fn receive_json_rpc(receiver: &Receiver<String>, id: u64, deadline: Instant) -> Result<Value> {
+    loop {
+        let remaining = deadline
+            .checked_duration_since(Instant::now())
+            .context("Governor MCP preflight exceeded its deadline")?;
+        let line = match receiver.recv_timeout(remaining) {
+            Ok(line) => line,
+            Err(RecvTimeoutError::Timeout) => {
+                bail!("Governor MCP preflight timed out waiting for JSON-RPC id {id}")
+            }
+            Err(RecvTimeoutError::Disconnected) => {
+                bail!("Governor MCP stdout closed before JSON-RPC id {id}")
+            }
+        };
+        let value: Value = serde_json::from_str(&line)
+            .with_context(|| format!("Governor MCP emitted invalid JSON: {line}"))?;
+        if value.get("id").and_then(Value::as_u64) == Some(id) {
+            return Ok(value);
+        }
+    }
+}
+
+#[allow(clippy::too_many_lines)]
+fn preflight_codex_cognitive_runtime(
+    contract: &CognitiveProviderRuntimeContract,
+    scoped_environment: &BTreeMap<String, String>,
+) -> Result<CognitiveRuntimePreflightReceipt> {
+    let started = Instant::now();
+    let deadline = started + COGNITIVE_RUNTIME_PREFLIGHT_LIMIT;
+    validate_runtime_contract(contract)?;
+    ensure!(
+        contract.host == AgentHostId::Codex,
+        "Codex runtime preflight requires a Codex contract"
+    );
+
+    let config_output = Command::new(&contract.provider_executable)
+        .args(codex_mcp_list_argv(contract)?)
+        .current_dir(&contract.provider_cwd)
+        .envs(scoped_environment)
+        .output()
+        .context("run zero-model Codex MCP configuration listing")?;
+    ensure!(
+        config_output.status.success(),
+        "Codex MCP configuration listing failed: {}",
+        String::from_utf8_lossy(&config_output.stderr)
+    );
+    let config_json: Value = serde_json::from_slice(&config_output.stdout)
+        .context("parse zero-model Codex MCP configuration listing")?;
+    let configured_servers = configured_mcp_servers(&config_json)?;
+    let observed_server_names = configured_servers
+        .iter()
+        .map(|(name, _)| name.clone())
+        .collect::<Vec<_>>();
+    let forbidden_servers_absent = configured_servers.iter().all(|(name, enabled)| {
+        !enabled
+            || (!contract.forbidden_mcp_server_names.contains(name)
+                && !name.to_ascii_lowercase().contains("surreal"))
+    });
+    ensure!(
+        configured_servers
+            .iter()
+            .any(|(name, enabled)| name == "eliot-governor" && *enabled)
+            && forbidden_servers_absent,
+        "Codex MCP listing did not prove enabled Governor and disabled/absent raw SurrealDB"
+    );
+
+    let governor = contract
+        .mcp_servers
+        .iter()
+        .find(|server| server.name == "eliot-governor")
+        .context("runtime contract lacks Governor server")?;
+    let mut child = Command::new(&governor.command)
+        .args(&governor.args)
+        .current_dir(&governor.cwd)
+        .envs(scoped_environment)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .context("start exact Governor MCP stdio child")?;
+    let mut stdin = child.stdin.take().context("take Governor MCP stdin")?;
+    let stdout = child.stdout.take().context("take Governor MCP stdout")?;
+    let (sender, receiver) = channel();
+    std::thread::spawn(move || {
+        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+            if sender.send(line).is_err() {
+                break;
+            }
+        }
+    });
+
+    let result = (|| -> Result<(Vec<String>, bool)> {
+        write_json_rpc(
+            &mut stdin,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": "2025-06-18",
+                    "capabilities": {},
+                    "clientInfo": {
+                        "name": "eliot-cognitive-runtime-preflight",
+                        "version": COGNITIVE_RUNTIME_PREFLIGHT_SCHEMA_VERSION,
+                    },
+                },
+            }),
+        )?;
+        let initialize = receive_json_rpc(&receiver, 1, deadline)?;
+        ensure!(
+            initialize.get("error").is_none() && initialize.get("result").is_some(),
+            "Governor MCP initialize failed: {initialize}"
+        );
+        write_json_rpc(
+            &mut stdin,
+            &json!({"jsonrpc": "2.0", "method": "notifications/initialized", "params": {}}),
+        )?;
+        write_json_rpc(
+            &mut stdin,
+            &json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}}),
+        )?;
+        let tools = receive_json_rpc(&receiver, 2, deadline)?;
+        ensure!(
+            tools.get("error").is_none(),
+            "Governor MCP tools/list failed: {tools}"
+        );
+        let mut observed_tools = tools
+            .pointer("/result/tools")
+            .and_then(Value::as_array)
+            .context("Governor MCP tools/list lacks result.tools")?
+            .iter()
+            .map(|tool| {
+                tool.get("name")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+                    .context("Governor MCP tool lacks a name")
+            })
+            .collect::<Result<Vec<_>>>()?;
+        observed_tools.sort();
+        observed_tools.dedup();
+        ensure!(
+            contract
+                .expected_mcp_tool_names
+                .iter()
+                .all(|expected| observed_tools.contains(expected)),
+            "Governor MCP tools/list lacks one or more expected cognitive tools"
+        );
+
+        write_json_rpc(
+            &mut stdin,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": 3,
+                "method": "tools/call",
+                "params": {"name": "eliot_host_session_status", "arguments": {}},
+            }),
+        )?;
+        let status = receive_json_rpc(&receiver, 3, deadline)?;
+        let scoped_status_read_passed =
+            status.get("error").is_none() && status.get("result").is_some();
+        Ok((observed_tools, scoped_status_read_passed))
+    })();
+
+    drop(stdin);
+    let _ = child.kill();
+    child
+        .wait()
+        .context("reap Governor MCP child after preflight")?;
+    let (observed_mcp_tool_names, scoped_status_read_passed) = result?;
+    let elapsed_ms =
+        u64::try_from(started.elapsed().as_millis()).context("preflight duration exceeds u64")?;
+    ensure!(
+        started.elapsed() <= COGNITIVE_RUNTIME_PREFLIGHT_LIMIT,
+        "Governor MCP preflight exceeded 20 seconds"
+    );
+    Ok(CognitiveRuntimePreflightReceipt {
+        schema_version: COGNITIVE_RUNTIME_PREFLIGHT_SCHEMA_VERSION.to_owned(),
+        runtime_contract_sha256: contract.runtime_contract_sha256.clone(),
+        config_list_passed: true,
+        mcp_process_started: true,
+        mcp_initialized: true,
+        tools_listed: true,
+        expected_tools_present: true,
+        forbidden_servers_absent,
+        scoped_status_read_passed,
+        observed_server_names,
+        observed_tool_names: observed_mcp_tool_names,
+        governor_executable_sha256: governor.executable_sha256.clone(),
+        governor_build_source_commit: governor.build_source_commit.clone(),
+        elapsed_ms,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn codex_runtime_preflight(
+    provider_executable: &Path,
+    worktree: &Path,
+    governor_executable: &Path,
+    governor_build_source_commit: Option<&str>,
+    product_source_commit: &str,
+    equivalence_record: Option<&Path>,
+    contract_output: &Path,
+    receipt_output: &Path,
+) -> Result<()> {
+    let contract = codex_cognitive_runtime_contract(
+        provider_executable,
+        worktree,
+        governor_executable,
+        governor_build_source_commit,
+    )?;
+    let equivalence = equivalence_record
+        .map(read_json::<CognitiveHarnessOnlyEquivalence>)
+        .transpose()?;
+    validate_governor_product_provenance(&contract, product_source_commit, equivalence.as_ref())?;
+    let receipt = preflight_codex_cognitive_runtime(&contract, &BTreeMap::new())?;
+    write_new_or_same_json(contract_output, &contract)?;
+    write_new_or_same_json(receipt_output, &receipt)?;
+    print_json(&json!({
+        "status": "cognitive_runtime_preflight_passed",
+        "runtime_contract_sha256": contract.runtime_contract_sha256,
+        "contract_output": canonical_path(&absolute_path(contract_output)?),
+        "receipt_output": canonical_path(&absolute_path(receipt_output)?),
+        "elapsed_ms": receipt.elapsed_ms,
+        "scoped_status_read_passed": receipt.scoped_status_read_passed,
+    }))
 }
 
 fn provider_compatible_reader_schema(canonical: &Value) -> Result<Value> {
@@ -925,6 +1517,7 @@ pub fn record_provider(report_root: &Path, private_root: &Path, receipt_path: &P
         provider_smoke: call.provider_smoke,
         counts_against_cap: call.counts_against_cap,
         elapsed_ms: receipt.elapsed_ms,
+        runtime_contract_sha256: receipt.runtime_contract_sha256.clone(),
         recorded_at: existing
             .as_ref()
             .map_or_else(OffsetDateTime::now_utc, |projection| projection.recorded_at),
@@ -1263,76 +1856,96 @@ fn provider_role_errors(
             CognitiveFieldRole::UnderstandingReader => "reader.json",
             CognitiveFieldRole::CodexJudge => "judge.json",
         });
-        let reuse_path = evidence_root.join("reused-worker.json");
-        if role == CognitiveFieldRole::CodexWorker && reuse_path.is_file() {
-            let projection: CoreRoleReuseProjection = read_json(&reuse_path)?;
-            let output = projection
-                .outputs
-                .iter()
-                .find(|output| output.execution == *execution);
-            let output_hash_matches = output.is_some_and(|output| {
-                target
-                    .is_file()
-                    .then(|| fs::read(&target).ok())
-                    .flatten()
-                    .is_some_and(|bytes| sha256_bytes(&bytes) == output.output_sha256)
-            });
-            let source_matches = role_plan.is_some_and(|role_plan| {
-                prior_role_sources(&role_plan.sources).any(|source| {
-                    let CoreRoleEvidenceSource::AcceptedPriorRoleArtifact {
-                        source_run_id,
-                        source_call_id,
-                        role,
-                        case_id,
-                        provider_session_id,
-                        provider_executable_sha256,
-                        output_schema_sha256,
-                        artifact_sha256,
-                        provider_receipt_ref,
-                        deterministic_receipt_refs,
-                        contamination_receipt_ref,
-                        worktree_diff_sha256,
-                        ..
-                    } = source
-                    else {
-                        return false;
-                    };
-                    projection.source_run_id == *source_run_id
-                        && projection.source_call_id == *source_call_id
-                        && projection.role == *role
-                        && projection.case_id == *case_id
-                        && projection.provider_session_id == *provider_session_id
-                        && projection.provider_executable_sha256 == *provider_executable_sha256
-                        && projection.output_schema_sha256 == *output_schema_sha256
-                        && projection.artifact_sha256 == *artifact_sha256
-                        && projection.provider_receipt_ref == *provider_receipt_ref
-                        && projection.deterministic_receipt_refs == *deterministic_receipt_refs
-                        && projection.contamination_receipt_ref == *contamination_receipt_ref
-                        && projection.worktree_diff_sha256 == *worktree_diff_sha256
-                })
-            });
-            if projection.schema_version != CORE_ROLE_REUSE_PROJECTION_SCHEMA_VERSION
-                || projection.run_id != plan.run_id
-                || projection.contract_hash != plan.contract_hash
-                || projection.provider_plan_hash != plan.plan_hash
-                || projection.role != CognitiveFieldRole::CodexWorker
-                || projection.case_id != execution.case_id
-                || plan.planned_reused_roles == 0
-                || plan.role_evidence_plan_hash.is_none()
-                || !source_matches
-                || !output_hash_matches
-                || evidence_root.join("provider-worker.json").is_file()
-            {
-                errors.push(
-                    "worker reuse projection failed its plan/session/output binding".to_owned(),
-                );
+        let reuse_path = evidence_root.join("reused-roles.json");
+        if reuse_path.is_file() {
+            let projections: Vec<CoreRoleReuseProjection> = read_json(&reuse_path)?;
+            if let Some(projection) = projections.into_iter().find(|projection| {
+                projection.role == role
+                    && projection
+                        .outputs
+                        .iter()
+                        .any(|output| output.execution == *execution)
+            }) {
+                let output = projection
+                    .outputs
+                    .iter()
+                    .find(|output| output.execution == *execution);
+                let output_hash_matches = output.is_some_and(|output| {
+                    target
+                        .is_file()
+                        .then(|| fs::read(&target).ok())
+                        .flatten()
+                        .is_some_and(|bytes| sha256_bytes(&bytes) == output.output_sha256)
+                });
+                let source_matches = role_plan.is_some_and(|role_plan| {
+                    prior_role_sources(&role_plan.sources).any(|source| {
+                        let CoreRoleEvidenceSource::AcceptedPriorRoleArtifact {
+                            source_run_id,
+                            source_call_id,
+                            role,
+                            case_id,
+                            provider_session_id,
+                            provider_executable_sha256,
+                            output_schema_sha256,
+                            artifact_sha256,
+                            prompt_sha256,
+                            oracle_sha256,
+                            runtime_contract_sha256,
+                            input_artifact_sha256s,
+                            deterministic_report_sha256s,
+                            executions,
+                            provider_receipt_ref,
+                            deterministic_receipt_refs,
+                            contamination_receipt_ref,
+                            worktree_diff_sha256,
+                            ..
+                        } = source
+                        else {
+                            return false;
+                        };
+                        projection.source_run_id == *source_run_id
+                            && projection.source_call_id == *source_call_id
+                            && projection.role == *role
+                            && projection.case_id == *case_id
+                            && projection.provider_session_id == *provider_session_id
+                            && projection.provider_executable_sha256 == *provider_executable_sha256
+                            && projection.output_schema_sha256 == *output_schema_sha256
+                            && projection.artifact_sha256 == *artifact_sha256
+                            && projection.prompt_sha256 == *prompt_sha256
+                            && projection.oracle_sha256 == *oracle_sha256
+                            && projection.runtime_contract_sha256 == *runtime_contract_sha256
+                            && projection.input_artifact_sha256s == *input_artifact_sha256s
+                            && projection.deterministic_report_sha256s
+                                == *deterministic_report_sha256s
+                            && projection.executions == *executions
+                            && projection.provider_receipt_ref == *provider_receipt_ref
+                            && projection.deterministic_receipt_refs == *deterministic_receipt_refs
+                            && projection.contamination_receipt_ref == *contamination_receipt_ref
+                            && projection.worktree_diff_sha256 == *worktree_diff_sha256
+                    })
+                });
+                if projection.schema_version != CORE_ROLE_REUSE_PROJECTION_SCHEMA_VERSION
+                    || projection.run_id != plan.run_id
+                    || projection.contract_hash != plan.contract_hash
+                    || projection.provider_plan_hash != plan.plan_hash
+                    || projection.case_id != execution.case_id
+                    || plan.planned_reused_roles != 4
+                    || plan.role_evidence_plan_hash.is_none()
+                    || !source_matches
+                    || !output_hash_matches
+                    || evidence_root
+                        .join(format!("provider-{}.json", role_name(role)))
+                        .is_file()
+                {
+                    errors.push(format!(
+                        "{} reuse projection failed its plan/session/output binding",
+                        role_name(role)
+                    ));
+                }
+                sessions.insert(projection.provider_session_id);
+                receipts.insert(projection.provider_receipt_ref);
+                continue;
             }
-            sessions.insert(projection.provider_session_id);
-            receipts.insert(projection.provider_receipt_ref);
-            continue;
-        }
-        if role != CognitiveFieldRole::CodexWorker && reuse_path.is_file() {
-            errors.push("only Worker evidence may be reused".to_owned());
         }
         let projection_path = evidence_root.join(format!("provider-{}.json", role_name(role)));
         if !projection_path.is_file() {
@@ -1667,6 +2280,233 @@ fn validate_provider_calls(
     validate_provider_calls_with_sources(suite, calls, private_root, &[])
 }
 
+fn provider_runtime_contract(
+    private_root: &Path,
+    call: &CognitiveFieldProviderCallPlan,
+) -> Result<CognitiveProviderRuntimeContract> {
+    ensure!(
+        !call.runtime_contract_ref.trim().is_empty() && is_sha256(&call.runtime_contract_sha256),
+        "new provider calls require a sealed runtime contract reference and SHA-256"
+    );
+    let path = private_relative_file(
+        private_root,
+        &call.runtime_contract_ref,
+        "provider runtime contract",
+    )?;
+    let contract: CognitiveProviderRuntimeContract = read_json(&path)?;
+    validate_runtime_contract(&contract)?;
+    ensure!(
+        contract.runtime_contract_sha256 == call.runtime_contract_sha256
+            && contract.host == call.host
+            && contract.provider_executable_sha256 == call.expected_provider_executable_sha256,
+        "provider runtime contract differs from the sealed call plan"
+    );
+    Ok(contract)
+}
+
+fn accepted_prior_executions(
+    source: &CoreRoleEvidenceSource,
+) -> Result<&[CognitiveFieldExecutionKey]> {
+    let CoreRoleEvidenceSource::AcceptedPriorRoleArtifact {
+        role,
+        case_id,
+        executions,
+        ..
+    } = source
+    else {
+        bail!("fresh provider call is not a prior role artifact");
+    };
+    ensure!(
+        case_id == "U03"
+            && !executions.is_empty()
+            && executions.windows(2).all(|pair| pair[0] < pair[1])
+            && executions
+                .iter()
+                .all(|execution| execution.case_id == *case_id),
+        "Task-02R2 permits only explicit, sorted U03 prior-role executions"
+    );
+    let conditions = executions
+        .iter()
+        .map(|execution| execution.memory_condition)
+        .collect::<BTreeSet<_>>();
+    match role {
+        CognitiveFieldRole::CodexWorker | CognitiveFieldRole::CodexJudge => ensure!(
+            executions.len() == 2
+                && conditions
+                    == [
+                        CognitiveMemoryCondition::Treatment,
+                        CognitiveMemoryCondition::MemoryFreeControl,
+                    ]
+                    .into_iter()
+                    .collect(),
+            "reused U03 Worker/Judge must cover treatment and control"
+        ),
+        CognitiveFieldRole::UnderstandingReader => ensure!(
+            executions.len() == 1
+                && matches!(
+                    executions[0].memory_condition,
+                    CognitiveMemoryCondition::Treatment
+                        | CognitiveMemoryCondition::MemoryFreeControl
+                ),
+            "each reused U03 Reader must preserve one treatment/control identity"
+        ),
+    }
+    Ok(executions)
+}
+
+fn sorted_unique_sha256s(values: &[String]) -> bool {
+    !values.is_empty()
+        && values.iter().all(|value| is_sha256(value))
+        && values.windows(2).all(|pair| pair[0] < pair[1])
+}
+
+#[allow(clippy::too_many_lines)]
+fn validate_core_reused_role_dependencies(role_sources: &[CoreRoleEvidenceSource]) -> Result<()> {
+    let sources = prior_role_sources(role_sources).collect::<Vec<_>>();
+    if sources.is_empty() {
+        return Ok(());
+    }
+    ensure!(
+        sources.len() == 4,
+        "Task-02R2 continuation requires exactly four accepted U03 role sources"
+    );
+    let mut execution_roles = BTreeSet::new();
+    let mut source_calls = BTreeSet::new();
+    let mut oracle_hashes = BTreeSet::new();
+    let mut reader_artifacts = BTreeSet::new();
+    let mut judge_inputs = None;
+    for source in sources {
+        let CoreRoleEvidenceSource::AcceptedPriorRoleArtifact {
+            source_call_id,
+            role,
+            provider_executable_sha256,
+            output_schema_sha256,
+            artifact_sha256,
+            prompt_sha256,
+            oracle_sha256,
+            runtime_contract_sha256,
+            input_artifact_sha256s,
+            deterministic_report_sha256s,
+            contamination_receipt_ref,
+            worktree_diff_sha256,
+            ..
+        } = source
+        else {
+            unreachable!("filtered accepted prior role");
+        };
+        ensure!(
+            safe_segment(source_call_id)
+                && source_calls.insert(source_call_id.clone())
+                && [
+                    provider_executable_sha256,
+                    output_schema_sha256,
+                    artifact_sha256,
+                    prompt_sha256,
+                    oracle_sha256,
+                    runtime_contract_sha256,
+                ]
+                .into_iter()
+                .all(|value| is_sha256(value))
+                && sorted_unique_sha256s(input_artifact_sha256s)
+                && sorted_unique_sha256s(deterministic_report_sha256s),
+            "accepted U03 role source has missing, duplicate, or invalid exact dependencies"
+        );
+        oracle_hashes.insert(oracle_sha256.clone());
+        for execution in accepted_prior_executions(source)? {
+            ensure!(
+                execution_roles.insert((execution.clone(), *role)),
+                "accepted U03 role source duplicates an execution role"
+            );
+        }
+        match role {
+            CognitiveFieldRole::CodexWorker => ensure!(
+                worktree_diff_sha256
+                    .as_ref()
+                    .is_some_and(|hash| is_sha256(hash) && input_artifact_sha256s.contains(hash))
+                    && deterministic_report_sha256s.len() == 2,
+                "reused U03 Worker lacks candidate-diff or deterministic dependencies"
+            ),
+            CognitiveFieldRole::UnderstandingReader => {
+                ensure!(
+                    worktree_diff_sha256.is_none()
+                        && deterministic_report_sha256s.len() == 1
+                        && !contamination_receipt_ref.trim().is_empty(),
+                    "reused U03 Reader dependencies are incomplete"
+                );
+                reader_artifacts.insert(artifact_sha256.clone());
+            }
+            CognitiveFieldRole::CodexJudge => {
+                ensure!(
+                    worktree_diff_sha256.is_none() && deterministic_report_sha256s.len() == 2,
+                    "reused U03 Judge dependencies are incomplete"
+                );
+                judge_inputs = Some(input_artifact_sha256s.clone());
+            }
+        }
+    }
+    ensure!(
+        oracle_hashes.len() == 1
+            && reader_artifacts.len() == 2
+            && judge_inputs.is_some_and(|inputs| {
+                reader_artifacts
+                    .iter()
+                    .all(|artifact| inputs.contains(artifact))
+            }),
+        "U03 reused roles do not share one oracle or Judge is not bound to both Reader artifacts"
+    );
+    let expected = [
+        (
+            CognitiveFieldExecutionKey {
+                case_id: "U03".to_owned(),
+                memory_condition: CognitiveMemoryCondition::Treatment,
+            },
+            CognitiveFieldRole::CodexWorker,
+        ),
+        (
+            CognitiveFieldExecutionKey {
+                case_id: "U03".to_owned(),
+                memory_condition: CognitiveMemoryCondition::MemoryFreeControl,
+            },
+            CognitiveFieldRole::CodexWorker,
+        ),
+        (
+            CognitiveFieldExecutionKey {
+                case_id: "U03".to_owned(),
+                memory_condition: CognitiveMemoryCondition::Treatment,
+            },
+            CognitiveFieldRole::UnderstandingReader,
+        ),
+        (
+            CognitiveFieldExecutionKey {
+                case_id: "U03".to_owned(),
+                memory_condition: CognitiveMemoryCondition::MemoryFreeControl,
+            },
+            CognitiveFieldRole::UnderstandingReader,
+        ),
+        (
+            CognitiveFieldExecutionKey {
+                case_id: "U03".to_owned(),
+                memory_condition: CognitiveMemoryCondition::Treatment,
+            },
+            CognitiveFieldRole::CodexJudge,
+        ),
+        (
+            CognitiveFieldExecutionKey {
+                case_id: "U03".to_owned(),
+                memory_condition: CognitiveMemoryCondition::MemoryFreeControl,
+            },
+            CognitiveFieldRole::CodexJudge,
+        ),
+    ]
+    .into_iter()
+    .collect::<BTreeSet<_>>();
+    ensure!(
+        execution_roles == expected,
+        "accepted U03 roles do not cover Worker, treatment/control Readers and Judge exactly once"
+    );
+    Ok(())
+}
+
 #[allow(clippy::too_many_lines)]
 fn validate_provider_calls_with_sources(
     suite: &CognitiveFieldSuite,
@@ -1676,6 +2516,9 @@ fn validate_provider_calls_with_sources(
 ) -> Result<(u8, u8)> {
     ensure!(!calls.is_empty(), "provider call plan must not be empty");
     let core_qualification = suite.harness_version == COGNITIVE_CORE_QUALIFICATION_HARNESS_VERSION;
+    if core_qualification {
+        validate_core_reused_role_dependencies(role_sources)?;
+    }
     let mut call_ids = BTreeSet::new();
     let mut observed =
         BTreeMap::<(String, CognitiveMemoryCondition, CognitiveFieldRole), u8>::new();
@@ -1690,22 +2533,23 @@ fn validate_provider_calls_with_sources(
                     "role evidence plan contains a duplicate or unsafe fresh call id"
                 );
             }
-            CoreRoleEvidenceSource::AcceptedPriorRoleArtifact { role, case_id, .. } => {
+            source @ CoreRoleEvidenceSource::AcceptedPriorRoleArtifact { .. } => {
                 ensure!(
-                    core_qualification
-                        && *role == CognitiveFieldRole::CodexWorker
-                        && case_id == "U03"
-                        && reused_roles == 0,
-                    "Task-02R permits only the accepted prior U03 Worker role"
+                    core_qualification,
+                    "accepted prior roles are limited to core qualification"
                 );
                 reused_roles = reused_roles
                     .checked_add(1)
                     .context("reused role count overflow")?;
-                for memory_condition in [
-                    CognitiveMemoryCondition::Treatment,
-                    CognitiveMemoryCondition::MemoryFreeControl,
-                ] {
-                    observed.insert((case_id.clone(), memory_condition, *role), 1);
+                let role = match source {
+                    CoreRoleEvidenceSource::AcceptedPriorRoleArtifact { role, .. } => *role,
+                    CoreRoleEvidenceSource::FreshProviderCall { .. } => unreachable!(),
+                };
+                for execution in accepted_prior_executions(source)? {
+                    observed.insert(
+                        (execution.case_id.clone(), execution.memory_condition, role),
+                        1,
+                    );
                 }
             }
         }
@@ -1733,6 +2577,7 @@ fn validate_provider_calls_with_sources(
                 && is_sha256(&call.provider_schema_sha256),
             "provider executable, prompt, and output schema hashes must be SHA-256 values"
         );
+        provider_runtime_contract(private_root, call)?;
         let prompt_path = private_relative_file(private_root, &call.prompt_ref, "provider prompt")?;
         let prompt_bytes = fs::read(&prompt_path)?;
         ensure!(
@@ -1887,11 +2732,22 @@ fn validate_provider_calls_with_sources(
         );
     }
     if core_qualification {
-        ensure!(
-            capped.saturating_add(reused_roles) == COGNITIVE_CORE_QUALIFICATION_PROVIDER_CALLS
-                && smokes == 0,
-            "core qualification must seal twelve logical role sources and no smokes"
-        );
+        if reused_roles == 0 {
+            ensure!(
+                capped == COGNITIVE_CORE_QUALIFICATION_PROVIDER_CALLS && smokes == 0,
+                "fresh core qualification must seal twelve provider calls and no smokes"
+            );
+        } else {
+            ensure!(
+                capped == COGNITIVE_CORE_CONTINUATION_EXPECTED_PROVIDER_CALLS
+                    && capped <= COGNITIVE_CORE_CONTINUATION_MAX_PROVIDER_CALLS
+                    && reused_roles == 4
+                    && capped.saturating_add(reused_roles)
+                        == COGNITIVE_CORE_QUALIFICATION_PROVIDER_CALLS
+                    && smokes == 0,
+                "Task-02R2 must seal eight fresh calls, four reused U03 roles, and no smokes"
+            );
+        }
     }
     let expected_smokes = ["H01", "H02", "H03", "H04"]
         .into_iter()
@@ -2042,6 +2898,45 @@ fn paired_artifact_sha256(outputs: &[(CognitiveFieldExecutionKey, Vec<u8>)]) -> 
 }
 
 #[allow(clippy::too_many_lines)]
+fn find_prior_provider_receipt(
+    source_private_root: &Path,
+    source_call_id: &str,
+) -> Result<CognitiveFieldProviderEvidenceReceipt> {
+    fn visit(
+        directory: &Path,
+        source_call_id: &str,
+        matches: &mut Vec<CognitiveFieldProviderEvidenceReceipt>,
+        depth: u8,
+    ) -> Result<()> {
+        ensure!(
+            depth <= 4,
+            "provider receipt search exceeded its depth bound"
+        );
+        for entry in fs::read_dir(directory)? {
+            let entry = entry?;
+            let path = entry.path();
+            if path.is_dir() {
+                visit(&path, source_call_id, matches, depth.saturating_add(1))?;
+            } else if path.file_name().and_then(|name| name.to_str()) == Some("receipt.json")
+                && let Ok(receipt) = read_json::<CognitiveFieldProviderEvidenceReceipt>(&path)
+                && receipt.call_id == source_call_id
+            {
+                matches.push(receipt);
+            }
+        }
+        Ok(())
+    }
+    let root = source_private_root.join("provider-calls");
+    let mut matches = Vec::new();
+    visit(&root, source_call_id, &mut matches, 0)?;
+    ensure!(
+        matches.len() == 1,
+        "accepted prior role requires exactly one matching private provider receipt"
+    );
+    Ok(matches.remove(0))
+}
+
+#[allow(clippy::too_many_lines)]
 fn verify_accepted_prior_role(
     suite: &CognitiveFieldSuite,
     contract: &CognitiveFieldRunContract,
@@ -2059,18 +2954,21 @@ fn verify_accepted_prior_role(
         provider_executable_sha256,
         output_schema_sha256,
         artifact_sha256,
+        prompt_sha256,
+        oracle_sha256,
+        runtime_contract_sha256,
+        deterministic_report_sha256s,
+        executions,
         provider_receipt_ref,
         deterministic_receipt_refs,
         contamination_receipt_ref,
         worktree_diff_sha256,
+        ..
     } = source
     else {
         bail!("fresh provider call is not a prior role artifact");
     };
-    ensure!(
-        *role == CognitiveFieldRole::CodexWorker && case_id == "U03",
-        "only the accepted run-003 U03 Worker may be reused"
-    );
+    accepted_prior_executions(source)?;
     let (source_report_root, source_private_root) =
         source_run_roots(report_root, private_root, source_run_id)?;
     let source_contract: CognitiveFieldRunContract =
@@ -2083,14 +2981,14 @@ fn verify_accepted_prior_role(
                 Path::new(&source_contract.primary_repository),
                 Path::new(&contract.primary_repository),
             )?,
-        "prior Worker repository or source commit differs from the resumed run"
+        "accepted prior role repository or source commit differs from the resumed run"
     );
     let source_plan: Value = read_json(&source_report_root.join("provider-plan.json"))?;
     ensure!(
         source_plan.get("run_id").and_then(Value::as_str) == Some(source_run_id)
             && source_plan.get("contract_hash").and_then(Value::as_str)
                 == Some(source_contract.contract_hash.as_str()),
-        "prior Worker provider plan differs from its run contract"
+        "accepted prior provider plan differs from its run contract"
     );
     let source_call = source_plan
         .get("calls")
@@ -2098,47 +2996,74 @@ fn verify_accepted_prior_role(
         .into_iter()
         .flatten()
         .find(|call| call.get("call_id").and_then(Value::as_str) == Some(source_call_id))
-        .context("prior Worker call is absent from its provider plan")?;
+        .context("accepted prior role call is absent from its provider plan")?;
+    let expected_role = serde_json::to_value(role)?;
+    let expected_host = match role {
+        CognitiveFieldRole::CodexWorker | CognitiveFieldRole::CodexJudge => "codex",
+        CognitiveFieldRole::UnderstandingReader => "claude",
+    };
     ensure!(
-        source_call.get("role").and_then(Value::as_str) == Some("codex_worker")
-            && source_call.get("host").and_then(Value::as_str) == Some("codex")
+        source_call.get("role") == Some(&expected_role)
+            && source_call.get("host").and_then(Value::as_str) == Some(expected_host)
             && source_call
                 .get("expected_provider_executable_sha256")
                 .and_then(Value::as_str)
                 == Some(provider_executable_sha256)
+            && source_call.get("prompt_sha256").and_then(Value::as_str) == Some(prompt_sha256)
             && source_call
                 .get("counts_against_cap")
                 .and_then(Value::as_bool)
                 == Some(true)
             && source_call.get("provider_smoke").and_then(Value::as_bool) == Some(false),
-        "prior Worker call plan binding is invalid"
+        "accepted prior role call plan binding is invalid"
     );
+    let (canonical_schema, _) = role_schema_contracts(*role)?;
+    ensure!(
+        canonical_schema.sha256 == *output_schema_sha256
+            && source_call
+                .get("canonical_schema_sha256")
+                .and_then(Value::as_str)
+                == Some(output_schema_sha256),
+        "accepted prior output schema differs from the current Rust contract"
+    );
+    let prompt_ref = source_call
+        .get("prompt_ref")
+        .and_then(Value::as_str)
+        .context("accepted prior call lacks prompt_ref")?;
+    let prompt_path =
+        private_relative_file(&source_private_root, prompt_ref, "accepted prior prompt")?;
+    ensure!(
+        sha256_bytes(&fs::read(prompt_path)?) == *prompt_sha256,
+        "accepted prior prompt bytes differ from the dependency"
+    );
+
     let source_suite: CognitiveFieldSuite = read_json(&source_report_root.join("suite.json"))?;
     let current_case = suite
         .cases
         .iter()
         .find(|candidate| candidate.case_id == *case_id)
-        .context("current suite lacks prior Worker case")?;
+        .context("current suite lacks accepted prior case")?;
     let source_case = source_suite
         .cases
         .iter()
         .find(|candidate| candidate.case_id == *case_id)
-        .context("prior suite lacks Worker case")?;
+        .context("prior suite lacks accepted case")?;
     ensure!(
         current_case == source_case,
-        "prior Worker public task differs from the resumed scenario"
+        "accepted prior public task differs from the resumed scenario"
     );
-    let source_oracle: TaskIntentOracle = read_json(
-        &source_private_root
-            .join("oracles")
-            .join(format!("{case_id}.json")),
-    )?;
+    let source_oracle_path = source_private_root
+        .join("oracles")
+        .join(format!("{case_id}.json"));
+    let source_oracle_bytes = fs::read(&source_oracle_path)?;
+    let source_oracle: TaskIntentOracle = serde_json::from_slice(&source_oracle_bytes)?;
     let current_oracle: TaskIntentOracle =
         read_json(&private_root.join("oracles").join(format!("{case_id}.json")))?;
     ensure!(
-        source_oracle.oracle_hash == current_oracle.oracle_hash
+        sha256_bytes(&source_oracle_bytes) == *oracle_sha256
+            && source_oracle.oracle_hash == current_oracle.oracle_hash
             && source_oracle.source_commit == contract.source_commit,
-        "prior Worker private oracle differs from the resumed oracle"
+        "accepted prior private oracle differs from the exact dependency"
     );
 
     let projection: CognitiveFieldProviderProjection = read_json(
@@ -2153,15 +3078,17 @@ fn verify_accepted_prior_role(
             && projection.provider_session_id == *provider_session_id
             && projection.provider_receipt_ref == *provider_receipt_ref
             && projection.provider_executable_sha256 == *provider_executable_sha256
+            && projection.prompt_sha256 == *prompt_sha256
             && projection.source_commit == *source_commit
             && projection.contract_hash == source_contract.contract_hash
             && source_plan.get("plan_hash").and_then(Value::as_str)
                 == Some(projection.provider_plan_hash.as_str())
-            && projection.outputs.len() == 2,
-        "prior Worker provider projection differs from the sealed dependency"
+            && projection.outputs.len() == executions.len()
+            && (projection.runtime_contract_sha256.is_empty()
+                || projection.runtime_contract_sha256 == *runtime_contract_sha256),
+        "accepted prior provider projection differs from the sealed dependency"
     );
-    let receipt: CognitiveFieldProviderEvidenceReceipt =
-        read_json(&source_private_root.join("provider-calls/core-call-01/receipt.json"))?;
+    let receipt = find_prior_provider_receipt(&source_private_root, source_call_id)?;
     ensure!(
         receipt.run_id == *source_run_id
             && receipt.call_id == *source_call_id
@@ -2169,6 +3096,7 @@ fn verify_accepted_prior_role(
             && receipt.provider_session_id == *provider_session_id
             && receipt.provider_receipt_ref == *provider_receipt_ref
             && receipt.provider_executable_sha256 == *provider_executable_sha256
+            && receipt.prompt_sha256 == *prompt_sha256
             && receipt.source_commit == *source_commit
             && receipt.contract_hash == source_contract.contract_hash
             && receipt.provider_plan_hash == projection.provider_plan_hash
@@ -2176,30 +3104,28 @@ fn verify_accepted_prior_role(
             && receipt.exit_code == 0
             && !receipt.timed_out
             && !receipt.unknown_outcome
-            && !receipt.controller_substitution,
-        "prior Worker provider receipt is not a canonical successful invocation"
+            && !receipt.controller_substitution
+            && (receipt.runtime_contract_sha256.is_empty()
+                || receipt.runtime_contract_sha256 == *runtime_contract_sha256),
+        "accepted prior provider receipt is not one known successful invocation"
     );
-    let (worker_canonical, _) = role_schema_contracts(CognitiveFieldRole::CodexWorker)?;
+    let receipt_executions = receipt
+        .outputs
+        .iter()
+        .map(|output| output.execution.clone())
+        .collect::<BTreeSet<_>>();
     ensure!(
-        worker_canonical.sha256 == *output_schema_sha256,
-        "prior Worker output schema differs from the current Rust contract"
+        receipt_executions == executions.iter().cloned().collect(),
+        "accepted prior receipt executions differ from the role dependency"
     );
-    let worker_schema = cognitive_worker_result_schema()?;
+
     let mut outputs = Vec::new();
+    let mut observed_deterministic_hashes = Vec::new();
     for output in &receipt.outputs {
-        ensure!(
-            output.execution.case_id == *case_id
-                && matches!(
-                    output.execution.memory_condition,
-                    CognitiveMemoryCondition::Treatment
-                        | CognitiveMemoryCondition::MemoryFreeControl
-                ),
-            "prior Worker output belongs to a different execution"
-        );
         let output_path = fs::canonicalize(&output.output_path)?;
         ensure!(
             output_path.starts_with(&source_private_root) && output_path.is_file(),
-            "prior Worker output is outside its private run"
+            "accepted prior output is outside its private run"
         );
         let bytes = fs::read(&output_path)?;
         ensure!(
@@ -2208,84 +3134,75 @@ fn verify_accepted_prior_role(
                     candidate.execution == output.execution
                         && candidate.output_sha256 == output.output_sha256
                 }),
-            "prior Worker output bytes differ from provider evidence"
+            "accepted prior output bytes differ from provider evidence"
         );
-        let value: Value = serde_json::from_slice(&bytes)?;
-        validate_json_schema_instance(&worker_schema, &value, "prior Worker output")?;
-        let worker: CognitiveWorkerResult = serde_json::from_value(value)?;
-        ensure!(
-            worker.case_id == *case_id
-                && worker.memory_condition == output.execution.memory_condition,
-            "prior Worker output binding is invalid"
-        );
-        if output.execution.memory_condition == CognitiveMemoryCondition::Treatment {
-            ensure!(
-                !worker.memory_handles_used.is_empty() && !worker.influence_receipt_refs.is_empty(),
-                "prior treatment Worker lacks canonical ELIOT influence evidence"
-            );
-        } else {
-            ensure!(
-                worker.memory_handles_used.is_empty() && worker.influence_receipt_refs.is_empty(),
-                "prior control Worker contains ELIOT memory influence"
-            );
-        }
-        let source_evidence_root = source_report_root
+        let evidence_root = source_report_root
             .join("evidence")
             .join(case_id)
             .join(condition_name(output.execution.memory_condition));
+        let target_name = match role {
+            CognitiveFieldRole::CodexWorker => "worker.json",
+            CognitiveFieldRole::UnderstandingReader => "reader.json",
+            CognitiveFieldRole::CodexJudge => "judge.json",
+        };
         ensure!(
-            fs::read(source_evidence_root.join("worker.json"))? == bytes,
-            "prior public Worker artifact differs from provider-owned output bytes"
+            fs::read(evidence_root.join(target_name))? == bytes,
+            "accepted prior public role artifact differs from provider-owned bytes"
         );
         let public_projection: CognitiveFieldProviderProjection =
-            read_json(&source_evidence_root.join("provider-worker.json"))?;
+            read_json(&evidence_root.join(format!("provider-{}.json", role_name(*role))))?;
         ensure!(
             public_projection == projection,
-            "prior public Worker projection differs from the invocation registry"
+            "accepted prior public provider projection differs from its registry"
         );
+        let deterministic_path = evidence_root.join("deterministic.json");
+        let deterministic_bytes = fs::read(&deterministic_path)?;
         let deterministic: CognitiveDeterministicReport =
-            read_json(&source_evidence_root.join("deterministic.json"))?;
+            serde_json::from_slice(&deterministic_bytes)?;
         ensure!(
             deterministic_report_is_valid(&deterministic)?
-                && deterministic.source_commit == *source_commit
-                && deterministic.project_id == worker.project_id
-                && deterministic.task_id == worker.task_id,
-            "prior Worker deterministic acceptance is invalid"
+                && deterministic.source_commit == *source_commit,
+            "accepted prior deterministic report is invalid"
         );
+        observed_deterministic_hashes.push(sha256_bytes(&deterministic_bytes));
+        match role {
+            CognitiveFieldRole::CodexWorker => {
+                let worker: CognitiveWorkerResult = serde_json::from_slice(&bytes)?;
+                validate_worker_output(&worker, &output.execution, current_case, &deterministic)?;
+            }
+            CognitiveFieldRole::UnderstandingReader => {
+                let reader: CognitiveUnderstandingAnswer = serde_json::from_slice(&bytes)?;
+                validate_reader_output(&reader, &output.execution, &deterministic)?;
+            }
+            CognitiveFieldRole::CodexJudge => {
+                let judge: CognitiveJudgeResult = serde_json::from_slice(&bytes)?;
+                validate_judge_output(&judge, &output.execution, &source_oracle, &deterministic)?;
+            }
+        }
         outputs.push((output.execution.clone(), bytes));
     }
     outputs.sort_by(|left, right| left.0.cmp(&right.0));
+    observed_deterministic_hashes.sort();
+    observed_deterministic_hashes.dedup();
     ensure!(
-        paired_artifact_sha256(&outputs)? == *artifact_sha256,
-        "prior Worker paired artifact hash differs from the dependency"
+        paired_artifact_sha256(&outputs)? == *artifact_sha256
+            && observed_deterministic_hashes == *deterministic_report_sha256s,
+        "accepted prior role artifact or deterministic report hash differs"
     );
 
     ensure!(
-        deterministic_receipt_refs.len() == 2,
-        "prior Worker requires exact treatment and control deterministic receipts"
+        deterministic_receipt_refs.len() == executions.len(),
+        "accepted prior role lacks exact deterministic receipt references"
     );
-    let mut deterministic_conditions = BTreeSet::new();
     for reference in deterministic_receipt_refs {
         let path = content_ref_path(reference, &[&source_report_root, &source_private_root])?;
         let value: Value = read_json(&path)?;
         ensure!(
             value.get("case_id").and_then(Value::as_str) == Some(case_id)
                 && value.get("source_commit").and_then(Value::as_str) == Some(source_commit),
-            "prior deterministic receipt differs from Worker dependencies"
+            "accepted prior deterministic receipt differs from role dependencies"
         );
-        let condition = value
-            .get("memory_condition")
-            .and_then(Value::as_str)
-            .context("deterministic receipt lacks memory condition")?;
-        deterministic_conditions.insert(condition.to_owned());
     }
-    ensure!(
-        deterministic_conditions
-            == ["memory_free_control".to_owned(), "treatment".to_owned()]
-                .into_iter()
-                .collect(),
-        "prior deterministic receipts do not cover treatment and control"
-    );
     content_ref_path(
         contamination_receipt_ref,
         &[&source_report_root, &source_private_root],
@@ -2301,27 +3218,32 @@ fn verify_accepted_prior_role(
                         .iter()
                         .all(|scan| scan.get("clean").and_then(Value::as_bool) == Some(true))
             }),
-        "prior contamination preflight was not clean"
+        "accepted prior contamination preflight was not clean"
     );
 
-    let candidate_diff = if let Some(expected) = worktree_diff_sha256 {
-        ensure!(is_sha256(expected), "candidate diff hash is not SHA-256");
-        let candidate_root = canonical_directory(
-            &source_private_root.join("worktrees/cq1"),
-            "prior CQ1 worktree",
-        )?;
-        ensure!(
-            git_commit(&candidate_root)? == *source_commit,
-            "prior CQ1 worktree base commit differs from Worker source"
-        );
-        let bytes = git_diff_bytes(&candidate_root)?;
-        ensure!(
-            !bytes.is_empty() && sha256_bytes(&bytes) == *expected,
-            "prior CQ1 candidate diff is absent or hash-mismatched"
-        );
-        Some(bytes)
-    } else {
-        bail!("Task-02R U03 Worker reuse requires a candidate worktree diff hash");
+    let candidate_diff = match (role, worktree_diff_sha256) {
+        (CognitiveFieldRole::CodexWorker, Some(expected)) => {
+            ensure!(is_sha256(expected), "candidate diff hash is not SHA-256");
+            let candidate_root = canonical_directory(
+                &source_private_root.join("worktrees/cq1"),
+                "prior CQ1 worktree",
+            )?;
+            ensure!(
+                git_commit(&candidate_root)? == *source_commit,
+                "prior CQ1 worktree base commit differs from Worker source"
+            );
+            let bytes = git_diff_bytes(&candidate_root)?;
+            ensure!(
+                !bytes.is_empty() && sha256_bytes(&bytes) == *expected,
+                "prior CQ1 candidate diff is absent or hash-mismatched"
+            );
+            Some(bytes)
+        }
+        (CognitiveFieldRole::CodexWorker, None) => {
+            bail!("Task-02R2 U03 Worker reuse requires a candidate diff hash")
+        }
+        (_, None) => None,
+        (_, Some(_)) => bail!("only the U03 Worker may carry a candidate diff"),
     };
     Ok(VerifiedPriorRole {
         source_private_root,
@@ -2330,6 +3252,7 @@ fn verify_accepted_prior_role(
     })
 }
 
+#[allow(clippy::too_many_lines)]
 fn materialize_accepted_prior_roles(
     suite: &CognitiveFieldSuite,
     contract: &CognitiveFieldRunContract,
@@ -2338,6 +3261,7 @@ fn materialize_accepted_prior_roles(
     report_root: &Path,
     private_root: &Path,
 ) -> Result<()> {
+    let mut projections_by_execution = BTreeMap::<PathBuf, Vec<CoreRoleReuseProjection>>::new();
     for source in prior_role_sources(&role_plan.sources) {
         let verified =
             verify_accepted_prior_role(suite, contract, report_root, private_root, source)?;
@@ -2350,6 +3274,12 @@ fn materialize_accepted_prior_roles(
             provider_executable_sha256,
             output_schema_sha256,
             artifact_sha256,
+            prompt_sha256,
+            oracle_sha256,
+            runtime_contract_sha256,
+            input_artifact_sha256s,
+            deterministic_report_sha256s,
+            executions,
             provider_receipt_ref,
             deterministic_receipt_refs,
             contamination_receipt_ref,
@@ -2373,8 +3303,9 @@ fn materialize_accepted_prior_roles(
         for (execution, bytes) in &verified.outputs {
             write_new_or_same(
                 &reuse_root.join(format!(
-                    "{}-worker.json",
-                    condition_name(execution.memory_condition)
+                    "{}-{}.json",
+                    condition_name(execution.memory_condition),
+                    role_name(*role),
                 )),
                 bytes,
             )?;
@@ -2404,11 +3335,17 @@ fn materialize_accepted_prior_roles(
             provider_executable_sha256: provider_executable_sha256.clone(),
             output_schema_sha256: output_schema_sha256.clone(),
             artifact_sha256: artifact_sha256.clone(),
+            prompt_sha256: prompt_sha256.clone(),
+            oracle_sha256: oracle_sha256.clone(),
+            runtime_contract_sha256: runtime_contract_sha256.clone(),
+            input_artifact_sha256s: input_artifact_sha256s.clone(),
+            deterministic_report_sha256s: deterministic_report_sha256s.clone(),
+            executions: executions.clone(),
             deterministic_receipt_refs: deterministic_receipt_refs.clone(),
             contamination_receipt_ref: contamination_receipt_ref.clone(),
             worktree_diff_sha256: worktree_diff_sha256.clone(),
             outputs,
-            recorded_at: OffsetDateTime::now_utc(),
+            recorded_at: provider_plan.sealed_at,
         };
         for (execution, bytes) in verified.outputs {
             let evidence_root = report_root
@@ -2417,17 +3354,51 @@ fn materialize_accepted_prior_roles(
                 .join(condition_name(execution.memory_condition));
             let deterministic: CognitiveDeterministicReport =
                 read_json(&evidence_root.join("deterministic.json"))?;
-            let worker: CognitiveWorkerResult = serde_json::from_slice(&bytes)?;
+            let case = suite
+                .cases
+                .iter()
+                .find(|case| case.case_id == execution.case_id)
+                .context("resumed role case is absent from suite")?;
             ensure!(
-                deterministic.passed
-                    && deterministic.source_commit == contract.source_commit
-                    && deterministic.project_id == worker.project_id
-                    && deterministic.task_id == worker.task_id,
-                "resumed deterministic binding differs from the accepted Worker artifact"
+                deterministic_report_is_valid(&deterministic)?
+                    && deterministic.source_commit == contract.source_commit,
+                "resumed deterministic binding differs from accepted role evidence"
             );
-            write_new_or_same(&evidence_root.join("worker.json"), &bytes)?;
-            write_new_or_same_json(&evidence_root.join("reused-worker.json"), &projection)?;
+            let target = match role {
+                CognitiveFieldRole::CodexWorker => {
+                    let worker: CognitiveWorkerResult = serde_json::from_slice(&bytes)?;
+                    validate_worker_output(&worker, &execution, case, &deterministic)?;
+                    "worker.json"
+                }
+                CognitiveFieldRole::UnderstandingReader => {
+                    let reader: CognitiveUnderstandingAnswer = serde_json::from_slice(&bytes)?;
+                    validate_reader_output(&reader, &execution, &deterministic)?;
+                    "reader.json"
+                }
+                CognitiveFieldRole::CodexJudge => {
+                    let judge: CognitiveJudgeResult = serde_json::from_slice(&bytes)?;
+                    let oracle: TaskIntentOracle = read_json(
+                        &private_root
+                            .join("oracles")
+                            .join(format!("{}.json", execution.case_id)),
+                    )?;
+                    validate_judge_output(&judge, &execution, &oracle, &deterministic)?;
+                    "judge.json"
+                }
+            };
+            write_new_or_same(&evidence_root.join(target), &bytes)?;
+            projections_by_execution
+                .entry(evidence_root)
+                .or_default()
+                .push(projection.clone());
         }
+    }
+    for (evidence_root, mut projections) in projections_by_execution {
+        projections.sort_by(|left, right| {
+            (left.role, left.source_call_id.as_str())
+                .cmp(&(right.role, right.source_call_id.as_str()))
+        });
+        write_new_or_same_json(&evidence_root.join("reused-roles.json"), &projections)?;
     }
     Ok(())
 }
@@ -2464,11 +3435,13 @@ fn validate_provider_plan_hash(plan: &CognitiveFieldProviderPlan) -> Result<()> 
     Ok(())
 }
 
+#[allow(clippy::too_many_lines)]
 fn validate_provider_receipt_envelope(
     call: &CognitiveFieldProviderCallPlan,
     receipt: &CognitiveFieldProviderEvidenceReceipt,
     private_root: &Path,
 ) -> Result<()> {
+    let runtime_contract = provider_runtime_contract(private_root, call)?;
     ensure!(
         receipt.role == call.role
             && receipt.host == call.host
@@ -2476,6 +3449,43 @@ fn validate_provider_receipt_envelope(
             && receipt.resolved_model == call.requested_model,
         "provider role, host, or exact resolved model differs from the sealed call"
     );
+    ensure!(
+        receipt.runtime_contract_sha256 == call.runtime_contract_sha256
+            && receipt.runtime_contract_sha256 == runtime_contract.runtime_contract_sha256,
+        "provider receipt runtime hash differs from the sealed call"
+    );
+    ensure!(
+        receipt
+            .observed_mcp_server_names
+            .windows(2)
+            .all(|pair| pair[0] < pair[1])
+            && receipt
+                .observed_mcp_tool_names
+                .windows(2)
+                .all(|pair| pair[0] < pair[1]),
+        "provider-observed MCP server and tool names must be sorted and deduplicated"
+    );
+    ensure!(
+        receipt.observed_mcp_server_names.iter().all(|name| {
+            !runtime_contract.forbidden_mcp_server_names.contains(name)
+                && !name.to_ascii_lowercase().contains("surreal")
+        }) && runtime_contract
+            .expected_mcp_tool_names
+            .iter()
+            .all(|name| receipt.observed_mcp_tool_names.contains(name)),
+        "provider receipt did not prove expected tools and absence of raw SurrealDB"
+    );
+    if matches!(
+        receipt.role,
+        CognitiveFieldRole::CodexWorker | CognitiveFieldRole::CodexJudge
+    ) {
+        ensure!(
+            receipt
+                .observed_mcp_server_names
+                .contains(&"eliot-governor".to_owned()),
+            "Codex Worker/Judge receipt lacks the observed Governor server"
+        );
+    }
     ensure!(
         !receipt.provider_session_id.trim().is_empty()
             && !receipt.provider_receipt_ref.trim().is_empty(),
@@ -3200,6 +4210,13 @@ fn canonical_directory(path: &Path, label: &str) -> Result<PathBuf> {
     Ok(canonical)
 }
 
+fn canonical_file(path: &Path, label: &str) -> Result<PathBuf> {
+    let canonical = fs::canonicalize(path)
+        .with_context(|| format!("{label} does not exist: {}", path.display()))?;
+    ensure!(canonical.is_file(), "{label} is not a file");
+    Ok(canonical)
+}
+
 fn absolute_path(path: &Path) -> Result<PathBuf> {
     if path.is_absolute() {
         return Ok(path.to_path_buf());
@@ -3297,11 +4314,14 @@ fn print_json<T: Serialize>(value: &T) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        CoreRoleEvidenceSource, READER_SCHEMA_JSON_PLACEHOLDER, READER_SCHEMA_SHA256_PLACEHOLDER,
-        execution_conditions, generated_oracle, provider_compatible_reader_schema,
-        provider_plan_without_hash, record_provider, render_provider_contract,
-        render_reader_prompt, role_schema_contracts, schema_validation_projection, sha256_bytes,
-        validate_deterministic_receipt, validate_json_schema_instance, validate_provider_calls,
+        CognitiveHarnessOnlyEquivalence, CoreRoleEvidenceSource, READER_SCHEMA_JSON_PLACEHOLDER,
+        READER_SCHEMA_SHA256_PLACEHOLDER, canonical_path, codex_cognitive_runtime_contract,
+        computed_runtime_contract_sha256, execution_conditions, generated_oracle,
+        provider_compatible_reader_schema, provider_plan_without_hash, record_provider,
+        render_provider_contract, render_reader_prompt, role_schema_contracts,
+        schema_validation_projection, seal_runtime_contract, sha256_bytes,
+        validate_deterministic_receipt, validate_governor_product_provenance,
+        validate_json_schema_instance, validate_provider_calls,
         validate_provider_calls_with_sources, validate_provider_receipt_envelope,
         validate_reader_output, write_new_or_same_json,
     };
@@ -3312,13 +4332,15 @@ mod tests {
         COGNITIVE_DETERMINISTIC_EVIDENCE_SCHEMA_VERSION,
         COGNITIVE_DETERMINISTIC_REPORT_SCHEMA_VERSION, COGNITIVE_FIELD_CONTRACT_SCHEMA_VERSION,
         COGNITIVE_FIELD_PROVIDER_EVIDENCE_SCHEMA_VERSION,
-        COGNITIVE_FIELD_PROVIDER_PLAN_SCHEMA_VERSION, CognitiveDeterministicEvidenceReceipt,
-        CognitiveDeterministicReport, CognitiveFieldExecutionKey, CognitiveFieldProviderCallPlan,
+        COGNITIVE_FIELD_PROVIDER_PLAN_SCHEMA_VERSION, COGNITIVE_PROVIDER_RUNTIME_SCHEMA_VERSION,
+        CognitiveDeterministicEvidenceReceipt, CognitiveDeterministicReport,
+        CognitiveFieldExecutionKey, CognitiveFieldProviderCallPlan,
         CognitiveFieldProviderEvidenceReceipt, CognitiveFieldProviderOutputReceipt,
         CognitiveFieldProviderPlan, CognitiveFieldRole, CognitiveFieldRunContract,
         CognitiveFieldSuite, CognitiveHardGateEvidence, CognitiveMemoryCondition,
-        CognitiveUnderstandingAnswer, CognitiveVerifierCommandReceipt,
-        cognitive_understanding_answer_schema, minimal_cognitive_understanding_answer,
+        CognitiveProviderMcpServer, CognitiveProviderRuntimeContract, CognitiveUnderstandingAnswer,
+        CognitiveVerifierCommandReceipt, cognitive_understanding_answer_schema,
+        minimal_cognitive_understanding_answer,
     };
     use serde_json::{Value, json};
     use std::collections::{BTreeMap, BTreeSet};
@@ -3341,6 +4363,304 @@ mod tests {
             format!("{label} exact provider role prompt\n")
         };
         Ok((prompt, canonical.sha256, provider.sha256))
+    }
+
+    fn provider_test_runtime(
+        private_root: &Path,
+        host: AgentHostId,
+        call_id: &str,
+        executable: &Path,
+    ) -> Result<(String, String, String), Box<dyn std::error::Error>> {
+        if let Some(parent) = executable.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        if !executable.is_file() {
+            fs::write(
+                executable,
+                format!("synthetic provider executable for {call_id}"),
+            )?;
+        }
+        let executable = fs::canonicalize(executable)?;
+        let private_root = fs::canonicalize(private_root)?;
+        let mut contract = if host == AgentHostId::Codex {
+            codex_cognitive_runtime_contract(
+                &executable,
+                &private_root,
+                &executable,
+                Some("0123456789abcdef0123456789abcdef01234567"),
+            )?
+        } else {
+            let mut contract = CognitiveProviderRuntimeContract {
+                schema_version: COGNITIVE_PROVIDER_RUNTIME_SCHEMA_VERSION.to_owned(),
+                host,
+                provider_executable: canonical_path(&executable),
+                provider_executable_sha256: sha256_bytes(&fs::read(&executable)?),
+                provider_cwd: canonical_path(&private_root),
+                provider_argv: vec!["synthetic-provider-run".to_owned()],
+                nonsecret_environment: BTreeMap::new(),
+                mcp_servers: vec![CognitiveProviderMcpServer {
+                    name: "eliot_surrealdb".to_owned(),
+                    command: String::new(),
+                    args: Vec::new(),
+                    cwd: String::new(),
+                    required: false,
+                    enabled: false,
+                    executable_sha256: String::new(),
+                    build_source_commit: None,
+                }],
+                expected_mcp_tool_names: Vec::new(),
+                forbidden_mcp_server_names: vec!["eliot_surrealdb".to_owned()],
+                runtime_contract_sha256: String::new(),
+            };
+            seal_runtime_contract(&mut contract)?;
+            contract
+        };
+        seal_runtime_contract(&mut contract)?;
+        let runtime_ref = format!("provider-runtime/{call_id}.json");
+        write_new_or_same_json(&private_root.join(&runtime_ref), &contract)?;
+        Ok((
+            contract.provider_executable_sha256,
+            runtime_ref,
+            contract.runtime_contract_sha256,
+        ))
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn core_reused_role_sources() -> Result<Vec<CoreRoleEvidenceSource>, Box<dyn std::error::Error>>
+    {
+        let (worker_schema, _) = role_schema_contracts(CognitiveFieldRole::CodexWorker)?;
+        let (reader_schema, _) = role_schema_contracts(CognitiveFieldRole::UnderstandingReader)?;
+        let (judge_schema, _) = role_schema_contracts(CognitiveFieldRole::CodexJudge)?;
+        let treatment = CognitiveFieldExecutionKey {
+            case_id: "U03".to_owned(),
+            memory_condition: CognitiveMemoryCondition::Treatment,
+        };
+        let control = CognitiveFieldExecutionKey {
+            case_id: "U03".to_owned(),
+            memory_condition: CognitiveMemoryCondition::MemoryFreeControl,
+        };
+        let source_commit = "9e6d9161a133d7e501c163a6cc69a3da86713e7a".to_owned();
+        let oracle_sha256 = "2".repeat(64);
+        let runtime_contract_sha256 = "3".repeat(64);
+        let treatment_artifact = "4".repeat(64);
+        let control_artifact = "6".repeat(64);
+        Ok(vec![
+            CoreRoleEvidenceSource::AcceptedPriorRoleArtifact {
+                source_run_id: "cq-core-20260729-003".to_owned(),
+                source_call_id: "6f04e449-ecab-4555-8bd0-4a6bd762c1b4".to_owned(),
+                role: CognitiveFieldRole::CodexWorker,
+                case_id: "U03".to_owned(),
+                provider_session_id: "worker-session".to_owned(),
+                source_commit: source_commit.clone(),
+                provider_executable_sha256: "a".repeat(64),
+                output_schema_sha256: worker_schema.sha256,
+                artifact_sha256: "b".repeat(64),
+                prompt_sha256: "1".repeat(64),
+                oracle_sha256: oracle_sha256.clone(),
+                runtime_contract_sha256: runtime_contract_sha256.clone(),
+                input_artifact_sha256s: vec!["f".repeat(64)],
+                deterministic_report_sha256s: vec!["c".repeat(64), "d".repeat(64)],
+                executions: vec![treatment.clone(), control.clone()],
+                provider_receipt_ref: "receipt:accepted-worker".to_owned(),
+                deterministic_receipt_refs: vec![
+                    "treatment#sha256=".to_owned() + &"c".repeat(64),
+                    "control#sha256=".to_owned() + &"d".repeat(64),
+                ],
+                contamination_receipt_ref: "contamination:worker".to_owned(),
+                worktree_diff_sha256: Some("f".repeat(64)),
+            },
+            CoreRoleEvidenceSource::AcceptedPriorRoleArtifact {
+                source_run_id: "cq-core-20260730-005".to_owned(),
+                source_call_id: "f03d7867-82b9-4f2a-847e-424f90d9ec3f".to_owned(),
+                role: CognitiveFieldRole::UnderstandingReader,
+                case_id: "U03".to_owned(),
+                provider_session_id: "treatment-reader-session".to_owned(),
+                source_commit: source_commit.clone(),
+                provider_executable_sha256: "a".repeat(64),
+                output_schema_sha256: reader_schema.sha256.clone(),
+                artifact_sha256: treatment_artifact.clone(),
+                prompt_sha256: "5".repeat(64),
+                oracle_sha256: oracle_sha256.clone(),
+                runtime_contract_sha256: runtime_contract_sha256.clone(),
+                input_artifact_sha256s: vec!["b".repeat(64)],
+                deterministic_report_sha256s: vec!["c".repeat(64)],
+                executions: vec![treatment.clone()],
+                provider_receipt_ref: "receipt:accepted-treatment-reader".to_owned(),
+                deterministic_receipt_refs: vec!["treatment#sha256=".to_owned() + &"c".repeat(64)],
+                contamination_receipt_ref: "contamination:treatment-reader".to_owned(),
+                worktree_diff_sha256: None,
+            },
+            CoreRoleEvidenceSource::AcceptedPriorRoleArtifact {
+                source_run_id: "cq-core-20260730-005".to_owned(),
+                source_call_id: "e976e8db-17d8-477c-83a6-7d7d1c64f928".to_owned(),
+                role: CognitiveFieldRole::UnderstandingReader,
+                case_id: "U03".to_owned(),
+                provider_session_id: "control-reader-session".to_owned(),
+                source_commit: source_commit.clone(),
+                provider_executable_sha256: "a".repeat(64),
+                output_schema_sha256: reader_schema.sha256,
+                artifact_sha256: control_artifact.clone(),
+                prompt_sha256: "7".repeat(64),
+                oracle_sha256: oracle_sha256.clone(),
+                runtime_contract_sha256: runtime_contract_sha256.clone(),
+                input_artifact_sha256s: vec!["b".repeat(64)],
+                deterministic_report_sha256s: vec!["d".repeat(64)],
+                executions: vec![control.clone()],
+                provider_receipt_ref: "receipt:accepted-control-reader".to_owned(),
+                deterministic_receipt_refs: vec!["control#sha256=".to_owned() + &"d".repeat(64)],
+                contamination_receipt_ref: "contamination:control-reader".to_owned(),
+                worktree_diff_sha256: None,
+            },
+            CoreRoleEvidenceSource::AcceptedPriorRoleArtifact {
+                source_run_id: "cq-core-20260730-005".to_owned(),
+                source_call_id: "8a079450-0357-4abc-9dc3-918afac453cc".to_owned(),
+                role: CognitiveFieldRole::CodexJudge,
+                case_id: "U03".to_owned(),
+                provider_session_id: "judge-session".to_owned(),
+                source_commit,
+                provider_executable_sha256: "a".repeat(64),
+                output_schema_sha256: judge_schema.sha256,
+                artifact_sha256: "8".repeat(64),
+                prompt_sha256: "9".repeat(64),
+                oracle_sha256,
+                runtime_contract_sha256,
+                input_artifact_sha256s: vec![treatment_artifact, control_artifact],
+                deterministic_report_sha256s: vec!["c".repeat(64), "d".repeat(64)],
+                executions: vec![treatment, control],
+                provider_receipt_ref: "receipt:accepted-judge".to_owned(),
+                deterministic_receipt_refs: vec![
+                    "treatment#sha256=".to_owned() + &"c".repeat(64),
+                    "control#sha256=".to_owned() + &"d".repeat(64),
+                ],
+                contamination_receipt_ref: "contamination:judge".to_owned(),
+                worktree_diff_sha256: None,
+            },
+        ])
+    }
+
+    #[test]
+    #[allow(clippy::type_complexity)]
+    fn runtime_contract_hash_changes_for_every_load_bearing_field()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root =
+            std::env::temp_dir().join(format!("eliot-runtime-contract-hash-{}", Uuid::new_v4()));
+        fs::create_dir_all(&root)?;
+        let provider = root.join("codex.exe");
+        let governor = root.join("eliot-governor.exe");
+        fs::write(&provider, b"codex fixture")?;
+        fs::write(&governor, b"governor fixture")?;
+        let contract = codex_cognitive_runtime_contract(
+            &provider,
+            &root,
+            &governor,
+            Some("0123456789abcdef0123456789abcdef01234567"),
+        )?;
+        let baseline = contract.runtime_contract_sha256.clone();
+        let mutations: Vec<Box<dyn Fn(&mut CognitiveProviderRuntimeContract)>> = vec![
+            Box::new(|value| value.provider_executable.push_str(".changed")),
+            Box::new(|value| value.provider_argv.push("--changed".to_owned())),
+            Box::new(|value| value.provider_cwd.push_str("/changed")),
+            Box::new(|value| value.mcp_servers[0].command.push_str(".changed")),
+            Box::new(|value| value.mcp_servers[0].args.push("--changed".to_owned())),
+            Box::new(|value| value.mcp_servers[0].cwd.push_str("/changed")),
+            Box::new(|value| value.mcp_servers[0].required = false),
+            Box::new(|value| {
+                if let Some(server) = value
+                    .mcp_servers
+                    .iter_mut()
+                    .find(|server| server.name == "eliot_surrealdb")
+                {
+                    server.enabled = true;
+                }
+            }),
+            Box::new(|value| {
+                value
+                    .expected_mcp_tool_names
+                    .push("eliot_changed_tool".to_owned());
+            }),
+        ];
+        for mutate in mutations {
+            let mut changed = contract.clone();
+            mutate(&mut changed);
+            assert_ne!(computed_runtime_contract_sha256(&changed)?, baseline);
+        }
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn codex_runtime_contract_is_self_contained_without_project_config()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root =
+            std::env::temp_dir().join(format!("eliot-runtime-self-contained-{}", Uuid::new_v4()));
+        fs::create_dir_all(&root)?;
+        let provider = root.join("codex.exe");
+        let governor = root.join("eliot-governor.exe");
+        fs::write(&provider, b"codex fixture")?;
+        fs::write(&governor, b"governor fixture")?;
+        assert!(!root.join(".codex/config.toml").exists());
+        let contract = codex_cognitive_runtime_contract(
+            &provider,
+            &root,
+            &governor,
+            Some("0123456789abcdef0123456789abcdef01234567"),
+        )?;
+        let argv = contract.provider_argv.join("\n");
+        assert!(argv.contains("mcp_servers.eliot-governor.command="));
+        assert!(argv.contains("mcp_servers.eliot-governor.args="));
+        assert!(argv.contains("\"--profile\",\"codex_worker\""));
+        assert!(argv.contains("mcp_servers.eliot-governor.required=true"));
+        assert!(argv.contains("mcp_servers.eliot_surrealdb.enabled=false"));
+        let canonical_root = canonical_path(&fs::canonicalize(&root)?);
+        assert!(
+            contract
+                .provider_argv
+                .windows(2)
+                .any(|pair| pair[0] == "--cd" && pair[1] == canonical_root)
+        );
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn governor_product_source_mismatch_requires_exact_harness_only_equivalence()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root = std::env::temp_dir().join(format!(
+            "eliot-runtime-product-provenance-{}",
+            Uuid::new_v4()
+        ));
+        fs::create_dir_all(&root)?;
+        let provider = root.join("codex.exe");
+        let governor = root.join("eliot-governor.exe");
+        fs::write(&provider, b"codex fixture")?;
+        fs::write(&governor, b"governor fixture")?;
+        let build_commit = "0123456789abcdef0123456789abcdef01234567";
+        let product_commit = "9e6d9161a133d7e501c163a6cc69a3da86713e7a";
+        let contract =
+            codex_cognitive_runtime_contract(&provider, &root, &governor, Some(build_commit))?;
+        assert!(validate_governor_product_provenance(&contract, product_commit, None).is_err());
+        let equivalence = CognitiveHarnessOnlyEquivalence {
+            schema_version: "eliot-cognitive-harness-equivalence-v1".to_owned(),
+            product_source_commit: product_commit.to_owned(),
+            governor_build_source_commit: build_commit.to_owned(),
+            exact_diff_sha256: "a".repeat(64),
+            changed_paths: vec![
+                "crates/eliot-app/src/cognitive_field_runner.rs".to_owned(),
+                "crates/eliot-types/src/cognitive_field.rs".to_owned(),
+            ],
+        };
+        validate_governor_product_provenance(&contract, product_commit, Some(&equivalence))?;
+        let mut invalid = equivalence;
+        invalid
+            .changed_paths
+            .push("crates/eliot-engine/src/cognitive_field.rs".to_owned());
+        invalid.changed_paths.sort();
+        assert!(
+            validate_governor_product_provenance(&contract, product_commit, Some(&invalid))
+                .is_err()
+        );
+        fs::remove_dir_all(root)?;
+        Ok(())
     }
 
     fn complete_reader(condition: CognitiveMemoryCondition) -> CognitiveUnderstandingAnswer {
@@ -3864,13 +5184,21 @@ mod tests {
             let (prompt, canonical_schema_sha256, provider_schema_sha256) =
                 provider_test_prompt(role, &call_id)?;
             fs::write(private_root.join(&prompt_ref), prompt.as_bytes())?;
+            let executable = private_root
+                .join("providers")
+                .join(format!("{call_id}.exe"));
+            let (
+                expected_provider_executable_sha256,
+                runtime_contract_ref,
+                runtime_contract_sha256,
+            ) = provider_test_runtime(&private_root, host, &call_id, &executable)?;
             calls.push(CognitiveFieldProviderCallPlan {
                 call_number,
                 call_id,
                 role,
                 host,
                 requested_model: model(host).to_owned(),
-                expected_provider_executable_sha256: "a".repeat(64),
+                expected_provider_executable_sha256,
                 prompt_ref,
                 prompt_sha256: sha256_bytes(prompt.as_bytes()),
                 canonical_schema_sha256,
@@ -3878,6 +5206,8 @@ mod tests {
                 provider_smoke,
                 counts_against_cap: !provider_smoke,
                 executions,
+                runtime_contract_ref,
+                runtime_contract_sha256,
             });
             Ok(())
         };
@@ -3946,6 +5276,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn core_provider_plan_uses_four_fresh_calls_per_scenario()
     -> Result<(), Box<dyn std::error::Error>> {
         let suite_root = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -4009,6 +5340,14 @@ mod tests {
                 let (prompt, canonical_schema_sha256, provider_schema_sha256) =
                     provider_test_prompt(role, &call_id)?;
                 fs::write(private_root.join(&prompt_ref), prompt.as_bytes())?;
+                let executable = private_root
+                    .join("providers")
+                    .join(format!("{call_id}.exe"));
+                let (
+                    expected_provider_executable_sha256,
+                    runtime_contract_ref,
+                    runtime_contract_sha256,
+                ) = provider_test_runtime(&private_root, host, &call_id, &executable)?;
                 let mut executions = conditions
                     .into_iter()
                     .map(|memory_condition| CognitiveFieldExecutionKey {
@@ -4023,7 +5362,7 @@ mod tests {
                     role,
                     host,
                     requested_model: model.to_owned(),
-                    expected_provider_executable_sha256: "a".repeat(64),
+                    expected_provider_executable_sha256,
                     prompt_ref,
                     prompt_sha256: sha256_bytes(prompt.as_bytes()),
                     canonical_schema_sha256,
@@ -4031,6 +5370,8 @@ mod tests {
                     provider_smoke: false,
                     counts_against_cap: true,
                     executions,
+                    runtime_contract_ref,
+                    runtime_contract_sha256,
                 });
             }
         }
@@ -4048,7 +5389,7 @@ mod tests {
 
     #[test]
     #[allow(clippy::too_many_lines)]
-    fn core_provider_preflight_accepts_eleven_fresh_calls_plus_exact_prior_worker_source()
+    fn core_provider_preflight_accepts_eight_fresh_calls_plus_four_exact_u03_roles()
     -> Result<(), Box<dyn std::error::Error>> {
         let suite_root = Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
@@ -4058,7 +5399,7 @@ mod tests {
             suite_root.join("tests/cognitive/field-v2/suite.json"),
         )?)?;
         suite.harness_version = COGNITIVE_CORE_QUALIFICATION_HARNESS_VERSION.to_owned();
-        suite.hard_provider_call_cap = COGNITIVE_CORE_QUALIFICATION_PROVIDER_CALLS;
+        suite.hard_provider_call_cap = eliot_types::COGNITIVE_CORE_CONTINUATION_MAX_PROVIDER_CALLS;
         suite
             .cases
             .retain(|case| matches!(case.case_id.as_str(), "U03" | "U06" | "U11"));
@@ -4104,7 +5445,7 @@ mod tests {
                     ],
                 ),
             ] {
-                if case_id == "U03" && role == CognitiveFieldRole::CodexWorker {
+                if case_id == "U03" {
                     continue;
                 }
                 let call_number = u8::try_from(calls.len() + 1)?;
@@ -4113,6 +5454,14 @@ mod tests {
                 let (prompt, canonical_schema_sha256, provider_schema_sha256) =
                     provider_test_prompt(role, &call_id)?;
                 fs::write(private_root.join(&prompt_ref), prompt.as_bytes())?;
+                let executable = private_root
+                    .join("providers")
+                    .join(format!("{call_id}.exe"));
+                let (
+                    expected_provider_executable_sha256,
+                    runtime_contract_ref,
+                    runtime_contract_sha256,
+                ) = provider_test_runtime(&private_root, host, &call_id, &executable)?;
                 let mut executions = conditions
                     .into_iter()
                     .map(|memory_condition| CognitiveFieldExecutionKey {
@@ -4127,7 +5476,7 @@ mod tests {
                     role,
                     host,
                     requested_model: model.to_owned(),
-                    expected_provider_executable_sha256: "a".repeat(64),
+                    expected_provider_executable_sha256,
                     prompt_ref,
                     prompt_sha256: sha256_bytes(prompt.as_bytes()),
                     canonical_schema_sha256,
@@ -4135,41 +5484,64 @@ mod tests {
                     provider_smoke: false,
                     counts_against_cap: true,
                     executions,
+                    runtime_contract_ref,
+                    runtime_contract_sha256,
                 });
             }
         }
-        let (worker_schema, _) = role_schema_contracts(CognitiveFieldRole::CodexWorker)?;
         let mut sources = calls
             .iter()
             .map(|call| CoreRoleEvidenceSource::FreshProviderCall {
                 planned_call_id: call.call_id.clone(),
             })
             .collect::<Vec<_>>();
-        sources.push(CoreRoleEvidenceSource::AcceptedPriorRoleArtifact {
-            source_run_id: "cq-core-20260729-003".to_owned(),
-            source_call_id: "6f04e449-ecab-4555-8bd0-4a6bd762c1b4".to_owned(),
-            role: CognitiveFieldRole::CodexWorker,
-            case_id: "U03".to_owned(),
-            provider_session_id: "019fb120-97b7-78c1-8a27-0a54c1a573ae".to_owned(),
-            source_commit: "9e6d9161a133d7e501c163a6cc69a3da86713e7a".to_owned(),
-            provider_executable_sha256: "a".repeat(64),
-            output_schema_sha256: worker_schema.sha256,
-            artifact_sha256: "b".repeat(64),
-            provider_receipt_ref: "receipt:accepted-worker".to_owned(),
-            deterministic_receipt_refs: vec![
-                "treatment#sha256=".to_owned() + &"c".repeat(64),
-                "control#sha256=".to_owned() + &"d".repeat(64),
-            ],
-            contamination_receipt_ref: "contamination#sha256=".to_owned() + &"e".repeat(64),
-            worktree_diff_sha256: Some("f".repeat(64)),
-        });
+        sources.extend(core_reused_role_sources()?);
         let (fresh, smokes) =
             validate_provider_calls_with_sources(&suite, &calls, &private_root, &sources)?;
-        assert_eq!(fresh, 11);
+        assert_eq!(fresh, 8);
         assert_eq!(smokes, 0);
+        assert_eq!(calls.len() + 4, 12);
 
+        let treatment_index = sources
+            .iter()
+            .position(|source| {
+                matches!(
+                    source,
+                    CoreRoleEvidenceSource::AcceptedPriorRoleArtifact {
+                        role: CognitiveFieldRole::UnderstandingReader,
+                        executions,
+                        ..
+                    } if executions[0].memory_condition == CognitiveMemoryCondition::Treatment
+                )
+            })
+            .ok_or("find treatment Reader source")?;
+        if let CoreRoleEvidenceSource::AcceptedPriorRoleArtifact {
+            artifact_sha256, ..
+        } = &mut sources[treatment_index]
+        {
+            *artifact_sha256 = "5".repeat(64);
+        }
+        assert!(
+            validate_provider_calls_with_sources(&suite, &calls, &private_root, &sources).is_err()
+        );
+
+        sources = calls
+            .iter()
+            .map(|call| CoreRoleEvidenceSource::FreshProviderCall {
+                planned_call_id: call.call_id.clone(),
+            })
+            .chain(core_reused_role_sources()?)
+            .collect();
         if let Some(CoreRoleEvidenceSource::AcceptedPriorRoleArtifact { case_id, .. }) =
-            sources.last_mut()
+            sources.iter_mut().find(|source| {
+                matches!(
+                    source,
+                    CoreRoleEvidenceSource::AcceptedPriorRoleArtifact {
+                        role: CognitiveFieldRole::CodexWorker,
+                        ..
+                    }
+                )
+            })
         {
             *case_id = "U06".to_owned();
         }
@@ -4198,7 +5570,8 @@ mod tests {
             memory_condition: CognitiveMemoryCondition::Treatment,
         };
         let model = "claude-opus-5";
-        let executable_sha256 = sha256_bytes(&fs::read(&executable)?);
+        let (executable_sha256, runtime_contract_ref, runtime_contract_sha256) =
+            provider_test_runtime(&private_root, AgentHostId::Claude, "reader-01", &executable)?;
         let prompt_sha256 = sha256_bytes(&fs::read(&prompt)?);
         let (_, canonical_schema_sha256, provider_schema_sha256) =
             provider_test_prompt(CognitiveFieldRole::UnderstandingReader, "reader-01")?;
@@ -4216,6 +5589,8 @@ mod tests {
             provider_smoke: false,
             counts_against_cap: true,
             executions: vec![execution.clone()],
+            runtime_contract_ref,
+            runtime_contract_sha256: runtime_contract_sha256.clone(),
         };
         let mut receipt = CognitiveFieldProviderEvidenceReceipt {
             schema_version: eliot_types::COGNITIVE_FIELD_PROVIDER_EVIDENCE_SCHEMA_VERSION
@@ -4253,9 +5628,16 @@ mod tests {
             oracle_exposed: false,
             worker_transcript_exposed: false,
             read_only: true,
+            runtime_contract_sha256,
+            observed_mcp_server_names: Vec::new(),
+            observed_mcp_tool_names: Vec::new(),
         };
         validate_provider_receipt_envelope(&call, &receipt, &private_root)?;
 
+        let accepted_runtime_sha256 = receipt.runtime_contract_sha256.clone();
+        receipt.runtime_contract_sha256 = "e".repeat(64);
+        assert!(validate_provider_receipt_envelope(&call, &receipt, &private_root).is_err());
+        receipt.runtime_contract_sha256 = accepted_runtime_sha256;
         receipt.resolved_model = "opus".to_owned();
         assert!(validate_provider_receipt_envelope(&call, &receipt, &private_root).is_err());
         receipt.resolved_model = model.to_owned();
@@ -4356,13 +5738,15 @@ mod tests {
         };
         let (_, canonical_schema_sha256, provider_schema_sha256) =
             provider_test_prompt(CognitiveFieldRole::UnderstandingReader, "reader-01")?;
+        let (expected_provider_executable_sha256, runtime_contract_ref, runtime_contract_sha256) =
+            provider_test_runtime(&private_root, AgentHostId::Claude, "reader-01", &executable)?;
         let call = CognitiveFieldProviderCallPlan {
             call_number: 1,
             call_id: "reader-01".to_owned(),
             role: CognitiveFieldRole::UnderstandingReader,
             host: AgentHostId::Claude,
             requested_model: model.to_owned(),
-            expected_provider_executable_sha256: sha256_bytes(&fs::read(&executable)?),
+            expected_provider_executable_sha256,
             prompt_ref: "prompts/reader-01.txt".to_owned(),
             prompt_sha256: sha256_bytes(&fs::read(&prompt)?),
             canonical_schema_sha256,
@@ -4370,6 +5754,8 @@ mod tests {
             provider_smoke: false,
             counts_against_cap: true,
             executions: vec![execution.clone()],
+            runtime_contract_ref,
+            runtime_contract_sha256: runtime_contract_sha256.clone(),
         };
         let mut provider_plan = CognitiveFieldProviderPlan {
             schema_version: COGNITIVE_FIELD_PROVIDER_PLAN_SCHEMA_VERSION.to_owned(),
@@ -4438,6 +5824,9 @@ mod tests {
             oracle_exposed: false,
             worker_transcript_exposed: false,
             read_only: true,
+            runtime_contract_sha256,
+            observed_mcp_server_names: Vec::new(),
+            observed_mcp_tool_names: Vec::new(),
         };
         let receipt_path = private_root.join("receipt.json");
         write_new_or_same_json(&receipt_path, &receipt)?;

@@ -203,13 +203,15 @@ fn contains_provider_token_prefix(bytes: &[u8]) -> bool {
         b"AIza",
     ];
     PREFIXES.iter().any(|prefix| {
-        matches_for_each(bytes, prefix, |_before, after| {
-            after
-                .iter()
-                .take_while(|byte| is_token_byte(**byte))
-                .take(16)
-                .count()
-                >= 16
+        matches_for_each(bytes, prefix, |before, after| {
+            let token_boundary = before.last().is_none_or(|byte| !is_token_byte(*byte));
+            token_boundary
+                && after
+                    .iter()
+                    .take_while(|byte| is_token_byte(**byte))
+                    .take(16)
+                    .count()
+                    >= 16
         })
     })
 }
@@ -310,5 +312,29 @@ mod tests {
             inspect_secret_bytes(input.as_bytes())?;
         }
         Ok(())
+    }
+
+    #[test]
+    fn secret_prefix_requires_token_boundary() -> Result<(), super::SecretBoundaryViolation> {
+        inspect_secret_bytes(b"prefixsk-synthetic-token-value-12345")
+    }
+
+    #[test]
+    fn canonical_task_intent_oracle_version_is_not_a_provider_token()
+    -> Result<(), super::SecretBoundaryViolation> {
+        inspect_secret_bytes(b"eliot-task-intent-oracle-v1")
+    }
+
+    #[test]
+    fn actual_openai_style_prefix_is_still_rejected() {
+        for input in [
+            b"sk-synthetic-token-value-12345".as_slice(),
+            b"token=sk-synthetic-token-value-12345".as_slice(),
+        ] {
+            assert_eq!(
+                inspect_secret_bytes(input).map_err(|violation| violation.rule),
+                Err(SecretBoundaryRule::ProviderTokenPrefix)
+            );
+        }
     }
 }

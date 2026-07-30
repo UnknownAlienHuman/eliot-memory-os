@@ -9,6 +9,10 @@ license.workspace = true
 name = "eliot-governor"
 path = "src/main.rs"
 
+[[test]]
+name = "cognitive_field_runner"
+path = "src/main.rs"
+
 [dependencies]
 anyhow.workspace = true
 blake3.workspace = true

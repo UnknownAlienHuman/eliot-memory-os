@@ -9,6 +9,8 @@ pub const COGNITIVE_FIELD_SUITE_SCHEMA_VERSION: &str = "eliot-cognitive-field-su
 pub const COGNITIVE_FIELD_V2_HARNESS_VERSION: &str = "cognitive-field-v2";
 pub const COGNITIVE_CORE_QUALIFICATION_HARNESS_VERSION: &str = "cognitive-core-qualification-v1";
 pub const COGNITIVE_CORE_QUALIFICATION_PROVIDER_CALLS: u8 = 12;
+pub const COGNITIVE_CORE_CONTINUATION_EXPECTED_PROVIDER_CALLS: u8 = 8;
+pub const COGNITIVE_CORE_CONTINUATION_MAX_PROVIDER_CALLS: u8 = 9;
 pub const COGNITIVE_FIELD_ORACLE_SCHEMA_VERSION: &str = "eliot-task-intent-oracle-v1";
 pub const COGNITIVE_UNDERSTANDING_SCHEMA_VERSION: &str = "eliot-cognitive-understanding-answer-v1";
 pub const COGNITIVE_JUDGE_SCHEMA_VERSION: &str = "eliot-cognitive-judge-result-v1";
@@ -24,6 +26,8 @@ pub const COGNITIVE_FIELD_PROVIDER_EVIDENCE_SCHEMA_VERSION: &str =
     "eliot-cognitive-field-provider-evidence-v1";
 pub const COGNITIVE_FIELD_PROVIDER_PROJECTION_SCHEMA_VERSION: &str =
     "eliot-cognitive-field-provider-projection-v1";
+pub const COGNITIVE_PROVIDER_RUNTIME_SCHEMA_VERSION: &str = "eliot-cognitive-provider-runtime-v1";
+pub const COGNITIVE_RUNTIME_PREFLIGHT_SCHEMA_VERSION: &str = "eliot-cognitive-runtime-preflight-v1";
 pub const COGNITIVE_FIELD_WORKER_SCHEMA_VERSION: &str = "eliot-cognitive-worker-result-v1";
 pub const COGNITIVE_FIELD_MAX_PROVIDER_CALLS: u8 = 24;
 
@@ -354,6 +358,56 @@ pub struct CognitiveFieldExecutionKey {
 
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct CognitiveProviderMcpServer {
+    pub name: String,
+    pub command: String,
+    pub args: Vec<String>,
+    pub cwd: String,
+    pub required: bool,
+    pub enabled: bool,
+    pub executable_sha256: String,
+    pub build_source_commit: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CognitiveProviderRuntimeContract {
+    pub schema_version: String,
+    #[schemars(with = "String")]
+    pub host: AgentHostId,
+    pub provider_executable: String,
+    pub provider_executable_sha256: String,
+    pub provider_cwd: String,
+    pub provider_argv: Vec<String>,
+    pub nonsecret_environment: BTreeMap<String, String>,
+    pub mcp_servers: Vec<CognitiveProviderMcpServer>,
+    pub expected_mcp_tool_names: Vec<String>,
+    pub forbidden_mcp_server_names: Vec<String>,
+    pub runtime_contract_sha256: String,
+}
+
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+#[allow(clippy::struct_excessive_bools)]
+pub struct CognitiveRuntimePreflightReceipt {
+    pub schema_version: String,
+    pub runtime_contract_sha256: String,
+    pub config_list_passed: bool,
+    pub mcp_process_started: bool,
+    pub mcp_initialized: bool,
+    pub tools_listed: bool,
+    pub expected_tools_present: bool,
+    pub forbidden_servers_absent: bool,
+    pub scoped_status_read_passed: bool,
+    pub observed_server_names: Vec<String>,
+    pub observed_tool_names: Vec<String>,
+    pub governor_executable_sha256: String,
+    pub governor_build_source_commit: Option<String>,
+    pub elapsed_ms: u64,
+}
+
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CognitiveFieldProviderCallPlan {
     pub call_number: u8,
     pub call_id: String,
@@ -369,6 +423,10 @@ pub struct CognitiveFieldProviderCallPlan {
     pub provider_smoke: bool,
     pub counts_against_cap: bool,
     pub executions: Vec<CognitiveFieldExecutionKey>,
+    #[serde(default)]
+    pub runtime_contract_ref: String,
+    #[serde(default)]
+    pub runtime_contract_sha256: String,
 }
 
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
@@ -453,6 +511,12 @@ pub struct CognitiveFieldProviderEvidenceReceipt {
     pub oracle_exposed: bool,
     pub worker_transcript_exposed: bool,
     pub read_only: bool,
+    #[serde(default)]
+    pub runtime_contract_sha256: String,
+    #[serde(default)]
+    pub observed_mcp_server_names: Vec<String>,
+    #[serde(default)]
+    pub observed_mcp_tool_names: Vec<String>,
 }
 
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
@@ -486,6 +550,8 @@ pub struct CognitiveFieldProviderProjection {
     pub provider_smoke: bool,
     pub counts_against_cap: bool,
     pub elapsed_ms: u64,
+    #[serde(default)]
+    pub runtime_contract_sha256: String,
     #[schemars(with = "String")]
     #[serde(with = "time::serde::rfc3339")]
     pub recorded_at: OffsetDateTime,

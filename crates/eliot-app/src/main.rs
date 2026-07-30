@@ -1684,6 +1684,24 @@ enum CognitiveFieldCommand {
         #[arg(long)]
         calls: PathBuf,
     },
+    CodexRuntimePreflight {
+        #[arg(long)]
+        provider_executable: PathBuf,
+        #[arg(long)]
+        worktree: PathBuf,
+        #[arg(long)]
+        governor_executable: PathBuf,
+        #[arg(long)]
+        governor_build_source_commit: Option<String>,
+        #[arg(long)]
+        product_source_commit: String,
+        #[arg(long)]
+        equivalence_record: Option<PathBuf>,
+        #[arg(long)]
+        contract_output: PathBuf,
+        #[arg(long)]
+        receipt_output: PathBuf,
+    },
     RecordProvider {
         #[arg(long)]
         report_root: PathBuf,
@@ -2313,6 +2331,25 @@ fn dispatch_cognitive_field_command(command: CognitiveFieldCommand) -> Result<()
             private_root,
             calls,
         } => cognitive_field_runner::seal_provider_plan(&report_root, &private_root, &calls),
+        CognitiveFieldCommand::CodexRuntimePreflight {
+            provider_executable,
+            worktree,
+            governor_executable,
+            governor_build_source_commit,
+            product_source_commit,
+            equivalence_record,
+            contract_output,
+            receipt_output,
+        } => cognitive_field_runner::codex_runtime_preflight(
+            &provider_executable,
+            &worktree,
+            &governor_executable,
+            governor_build_source_commit.as_deref(),
+            &product_source_commit,
+            equivalence_record.as_deref(),
+            &contract_output,
+            &receipt_output,
+        ),
         CognitiveFieldCommand::RecordProvider {
             report_root,
             private_root,
