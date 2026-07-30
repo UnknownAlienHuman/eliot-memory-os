@@ -359,7 +359,7 @@ fn collect_tool_names(value: &Value, names: &mut BTreeSet<String>) {
             if let Some(name) = delegated_mcp_name {
                 names.insert(name.to_owned());
             } else if is_tool
-                && let Some(name) = first_string(value, &["name", "tool_name", "toolName"])
+                && let Some(name) = first_string(value, &["name", "tool", "tool_name", "toolName"])
             {
                 names.insert(name);
             }

@@ -6,7 +6,7 @@ use super::{ProviderCommandPlan, ProviderTerminalResult, rejected};
 use crate::EngineError;
 use eliot_types::ProviderStructuredOutputMode;
 use serde_json::Value;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Clone, Debug)]
 pub struct OpenCodeCommandInput {
@@ -52,20 +52,77 @@ pub fn parse_opencode_stream(
     schema: &Value,
 ) -> Result<ProviderTerminalResult, EngineError> {
     let events = json_events(stdout)?;
-    let session = events
+    if let Some(error) = events
         .iter()
-        .find(|event| event.get("type").and_then(Value::as_str) == Some("session.start"))
+        .find(|event| event.get("type").and_then(Value::as_str) == Some("error"))
+    {
+        let message = error
+            .get("error")
+            .and_then(|error| first_string(error, &["message"]))
+            .or_else(|| {
+                error
+                    .get("error")
+                    .and_then(|error| first_string(error, &["name"]))
+            })
+            .unwrap_or_else(|| "unknown provider error".to_owned());
+        return rejected(format!("OpenCode provider error: {message}"));
+    }
+
+    let session_ids = events
+        .iter()
+        .filter_map(|event| {
+            event
+                .get("sessionID")
+                .or_else(|| event.get("session_id"))
+                .and_then(Value::as_str)
+                .filter(|session| !session.trim().is_empty())
+                .map(str::to_owned)
+        })
+        .collect::<BTreeSet<_>>();
+    if session_ids.len() != 1 {
+        return rejected(format!(
+            "OpenCode stream must attest exactly one session ID, found {}",
+            session_ids.len()
+        ));
+    }
+    let provider_session_id = session_ids.into_iter().next().ok_or_else(|| {
+        EngineError::WriteRejected("OpenCode stream has no session ID".to_owned())
+    })?;
+
+    let observed_model = events
+        .iter()
+        .find_map(|event| first_string(event, &["model", "model_id", "modelId"]));
+    let resolved_model = if observed_model.is_some() {
+        exact_requested_model(observed_model, requested_model)?
+    } else {
+        // OpenCode's JSON event protocol does not repeat the selected model. The
+        // governed command binds the exact provider/model through --model, and
+        // the executable, argv and selection mechanism are sealed in the
+        // ProviderRuntimeContract before dispatch.
+        requested_model.to_owned()
+    };
+    if !events
+        .iter()
+        .any(|event| event.get("type").and_then(Value::as_str) == Some("step_start"))
+    {
+        return rejected("OpenCode stream has no step_start event");
+    }
+    let terminal_reason = events
+        .iter()
+        .rev()
+        .find(|event| event.get("type").and_then(Value::as_str) == Some("step_finish"))
+        .and_then(|event| event.pointer("/part/reason"))
+        .and_then(Value::as_str)
         .ok_or_else(|| {
-            EngineError::WriteRejected("OpenCode stream has no session.start event".to_owned())
+            EngineError::WriteRejected(
+                "OpenCode stream has no terminal step_finish reason".to_owned(),
+            )
         })?;
-    let resolved_model = exact_requested_model(
-        first_string(session, &["model", "model_id", "modelId"]),
-        requested_model,
-    )?;
-    let provider_session_id =
-        first_string(session, &["session_id", "sessionId"]).ok_or_else(|| {
-            EngineError::WriteRejected("OpenCode session.start has no session ID".to_owned())
-        })?;
+    if terminal_reason != "stop" {
+        return rejected(format!(
+            "OpenCode stream ended with nonterminal reason {terminal_reason}"
+        ));
+    }
     let outputs = events
         .iter()
         .filter_map(|event| {
@@ -92,8 +149,54 @@ pub fn parse_opencode_stream(
         structured_output,
         resolved_model,
         provider_session_id,
-        terminal_status: "stream_complete".to_owned(),
+        terminal_status: "step_finish:stop".to_owned(),
         observed_tool_names: observed_tool_names(&events),
         token_or_cost_telemetry: None,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_opencode_stream;
+    use serde_json::json;
+
+    #[test]
+    fn current_json_stream_accepts_one_session_and_schema_bound_result() {
+        let stdout = concat!(
+            "{\"type\":\"step_start\",\"sessionID\":\"ses_123\",\"part\":{\"type\":\"step-start\"}}\n",
+            "{\"type\":\"tool_use\",\"sessionID\":\"ses_123\",\"part\":{\"type\":\"tool\",\"tool\":\"eliot_current_state\",\"state\":{\"status\":\"completed\"}}}\n",
+            "{\"type\":\"text\",\"sessionID\":\"ses_123\",\"part\":{\"type\":\"text\",\"text\":\"{\\\"memory_revision\\\":3}\",\"time\":{\"end\":1}}}\n",
+            "{\"type\":\"step_finish\",\"sessionID\":\"ses_123\",\"part\":{\"type\":\"step-finish\",\"reason\":\"stop\"}}\n",
+        );
+        let parsed = parse_opencode_stream(
+            stdout.as_bytes(),
+            "openai/gpt-5.4",
+            &json!({
+                "type": "object",
+                "properties": {"memory_revision": {"const": 3}},
+                "required": ["memory_revision"],
+                "additionalProperties": false
+            }),
+        )
+        .expect("current OpenCode JSON events should parse");
+
+        assert_eq!(parsed.provider_session_id, "ses_123");
+        assert_eq!(parsed.resolved_model, "openai/gpt-5.4");
+        assert_eq!(parsed.terminal_status, "step_finish:stop");
+        assert_eq!(parsed.structured_output, json!({"memory_revision": 3}));
+        assert_eq!(parsed.observed_tool_names, vec!["eliot_current_state"]);
+    }
+
+    #[test]
+    fn provider_error_event_surfaces_the_actual_failure() {
+        let stdout = br#"{"type":"error","timestamp":1,"sessionID":"ses_401","error":{"name":"UnknownError","data":{"message":"Token refresh failed: 401"}}}"#;
+        let error = parse_opencode_stream(stdout, "openai/gpt-5.4", &json!(true))
+            .expect_err("provider error must be rejected");
+
+        assert!(
+            error
+                .to_string()
+                .contains("OpenCode provider error: Token refresh failed: 401")
+        );
+    }
 }
