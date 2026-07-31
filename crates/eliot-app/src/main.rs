@@ -1710,6 +1710,7 @@ enum CognitiveFieldCommand {
         #[arg(long)]
         receipt: PathBuf,
     },
+    #[command(name = "seal", visible_alias = "seal-provider-plan")]
     SealProviderPlan {
         #[arg(long)]
         report_root: PathBuf,
@@ -1718,6 +1719,28 @@ enum CognitiveFieldCommand {
         /// Private JSON array of exact provider calls.
         #[arg(long)]
         calls: PathBuf,
+        #[arg(long)]
+        dry_run: bool,
+    },
+    SealStatus {
+        #[arg(long)]
+        run: String,
+        #[arg(long)]
+        report_root: Option<PathBuf>,
+        #[arg(long)]
+        private_root: Option<PathBuf>,
+    },
+    RecoverSeal {
+        #[arg(long)]
+        run: String,
+        #[arg(long)]
+        report_root: Option<PathBuf>,
+        #[arg(long)]
+        private_root: Option<PathBuf>,
+        #[arg(long, conflicts_with = "apply")]
+        dry_run: bool,
+        #[arg(long, conflicts_with = "dry_run")]
+        apply: bool,
     },
     CodexRuntimePreflight {
         #[arg(long)]
@@ -2343,6 +2366,10 @@ async fn dispatch_command(
     }
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "the CLI dispatch state machine exhaustively maps cognitive-field subcommands"
+)]
 async fn dispatch_cognitive_field_command(
     config: &Path,
     command: CognitiveFieldCommand,
@@ -2382,10 +2409,41 @@ async fn dispatch_cognitive_field_command(
             report_root,
             private_root,
             calls,
+            dry_run,
         } => {
-            cognitive_field_runner::seal_provider_plan(config, &report_root, &private_root, &calls)
-                .await
+            cognitive_field_runner::seal_provider_plan_with_mode(
+                config,
+                &report_root,
+                &private_root,
+                &calls,
+                dry_run,
+            )
+            .await
         }
+        CognitiveFieldCommand::SealStatus {
+            run,
+            report_root,
+            private_root,
+        } => cognitive_field_runner::seal_status(
+            config,
+            &run,
+            report_root.as_deref(),
+            private_root.as_deref(),
+        ),
+        CognitiveFieldCommand::RecoverSeal {
+            run,
+            report_root,
+            private_root,
+            dry_run,
+            apply,
+        } => cognitive_field_runner::recover_seal(
+            config,
+            &run,
+            report_root.as_deref(),
+            private_root.as_deref(),
+            dry_run,
+            apply,
+        ),
         CognitiveFieldCommand::CodexRuntimePreflight {
             provider_executable,
             worktree,
@@ -2396,6 +2454,7 @@ async fn dispatch_cognitive_field_command(
             contract_output,
             receipt_output,
         } => cognitive_field_runner::codex_runtime_preflight(
+            config,
             &provider_executable,
             &worktree,
             &governor_executable,

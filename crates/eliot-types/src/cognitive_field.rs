@@ -404,6 +404,16 @@ pub struct CognitiveFieldProviderPlan {
     pub planned_reused_roles: u8,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub role_evidence_plan_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seal_attempt_id: Option<String>,
+    #[serde(default)]
+    pub seal_generation: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authority_activation_ref: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_manifest_sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifact_manifest_sha256: Option<String>,
     pub plan_hash: String,
     #[schemars(with = "String")]
     #[serde(with = "time::serde::rfc3339")]

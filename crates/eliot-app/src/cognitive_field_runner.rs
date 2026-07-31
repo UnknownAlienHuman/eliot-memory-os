@@ -1,11 +1,16 @@
+use crate::host_runtime::supervised_process::{
+    ChildCriticality, ProcessRestartPolicy, RestartStrategy, SupervisedChildKind,
+    SupervisedProcessSpec, run_supervised_process_blocking,
+};
 use anyhow::{Context, Result, bail, ensure};
 use eliot_engine::{
-    CognitiveFieldGradingService, validate_external_agent_execution_request,
+    CognitiveFieldGradingService, HostBrokerService, validate_external_agent_execution_request,
     validate_provider_runtime_contract,
 };
 use eliot_types::{
-    AdapterCapability, AdapterContext, AdapterRequest, AdapterResultStatus, AgentHostId,
-    AgentInvocationRequest, COGNITIVE_CORE_CONTINUATION_EXPECTED_PROVIDER_CALLS,
+    AdapterCapability, AdapterContext, AdapterRequest, AdapterResultStatus,
+    AgentCapabilityEnvelope, AgentHostId, AgentInvocationRequest, AgentRole, AgentSessionState,
+    AuthorityLeaseState, COGNITIVE_CORE_CONTINUATION_EXPECTED_PROVIDER_CALLS,
     COGNITIVE_CORE_CONTINUATION_MAX_PROVIDER_CALLS, COGNITIVE_CORE_QUALIFICATION_HARNESS_VERSION,
     COGNITIVE_CORE_QUALIFICATION_PROVIDER_CALLS, COGNITIVE_DETERMINISTIC_EVIDENCE_SCHEMA_VERSION,
     COGNITIVE_DETERMINISTIC_REPORT_SCHEMA_VERSION, COGNITIVE_FIELD_CONTRACT_SCHEMA_VERSION,
@@ -22,20 +27,23 @@ use eliot_types::{
     CognitiveHardGateEvidence, CognitiveHardGateKind, CognitiveJudgeResult,
     CognitiveMemoryCondition, CognitiveProviderMcpServer, CognitiveProviderRuntimeContract,
     CognitiveRuntimePreflightReceipt, CognitiveUnderstandingAnswer, CognitiveWorkerResult,
-    ExternalAgentExecutionRequest, ExternalAgentPurpose, HostLaunchContract, HostMode, ProjectId,
-    ProviderExecutionEvidence, ProviderRuntimeContract, SessionId, TaskId, TaskIntentOracle,
-    WorkItemId, cognitive_judge_result_schema, cognitive_understanding_answer_schema,
+    ExternalAgentExecutionRequest, ExternalAgentPurpose, HostLaunchContract, HostMode,
+    OperationJob, OperationJobState, OperationPhase, ProjectId, ProviderExecutionEvidence,
+    ProviderRuntimeContract, SEAL_STAGING_CHECKPOINT_SCHEMA_VERSION, SealStagingCheckpoint,
+    SealStagingState, TaskId, TaskIntentOracle, WorkItem, WorkItemId, WorkItemStatus, WorkScope,
+    cognitive_judge_result_schema, cognitive_understanding_answer_schema,
     cognitive_worker_result_schema, inspect_secret_bytes,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
+use std::ffi::OsString;
 use std::fs;
-use std::io::{BufRead as _, BufReader, Write};
+use std::io::Write as _;
+use std::os::windows::process::ExitStatusExt as _;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
-use std::sync::mpsc::{Receiver, RecvTimeoutError, channel};
+use std::process::Command;
 use std::time::{Duration, Instant};
 use time::OffsetDateTime;
 use uuid::Uuid;
@@ -83,6 +91,218 @@ const LEGACY_WORKER_SOURCE_CALL_ID: &str = "6f04e449-ecab-4555-8bd0-4a6bd762c1b4
 const LEGACY_WORKER_CASE_ID: &str = "U03";
 const LEGACY_WORKER_ACCEPTANCE_RUN_ID: &str = "cq-core-20260730-005";
 const LEGACY_WORKER_MISSING_FIELD: &str = "source_call.canonical_schema_sha256";
+const PROVIDER_PLAN_SEAL_RECORD_SCHEMA_VERSION: &str = "eliot-provider-plan-seal-v1";
+const SEAL_ARTIFACT_MANIFEST_SCHEMA_VERSION: &str = "eliot-seal-artifact-manifest-v1";
+const ABANDONED_SEAL_ATTEMPT_SCHEMA_VERSION: &str = "eliot-abandoned-seal-attempt-v1";
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum ProviderPlanSealState {
+    Validating,
+    Staged,
+    Activated,
+    Published,
+    Abandoned,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProviderPlanSealRecord {
+    schema_version: String,
+    seal_attempt_id: String,
+    run_id: String,
+    generation: u64,
+    state: ProviderPlanSealState,
+    contract_sha256: String,
+    role_evidence_plan_sha256: String,
+    staged_manifest_sha256: String,
+    provider_plan_sha256: Option<String>,
+    session_ids: Vec<eliot_types::AgentSessionId>,
+    role_lease_ids: Vec<String>,
+    work_item_ids: Vec<WorkItemId>,
+    operation_job_ids: Vec<String>,
+    staging_root: String,
+    published_root: String,
+    activated_at: Option<OffsetDateTime>,
+    published_at: Option<OffsetDateTime>,
+    abandoned_at: Option<OffsetDateTime>,
+    failure_ref: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SealArtifactEntry {
+    logical_kind: String,
+    relative_path: String,
+    sha256: String,
+    size_bytes: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SealArtifactManifest {
+    schema_version: String,
+    seal_attempt_id: String,
+    run_id: String,
+    generation: u64,
+    entries: Vec<SealArtifactEntry>,
+    manifest_sha256: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AbandonedSealAttemptRecord {
+    schema_version: String,
+    seal_attempt_id: String,
+    run_id: String,
+    generation: u64,
+    recovery_state: SealRecoveryRecordState,
+    recovery_guarantee: String,
+    failed_phase: ProviderPlanSealState,
+    exact_error: String,
+    created_session_ids: Vec<eliot_types::AgentSessionId>,
+    created_role_lease_ids: Vec<String>,
+    created_work_item_ids: Vec<WorkItemId>,
+    created_operation_job_ids: Vec<String>,
+    #[serde(default)]
+    referenced_work_item_ids: Vec<WorkItemId>,
+    #[serde(default)]
+    referenced_invocation_ids: Vec<String>,
+    #[serde(default)]
+    present_work_item_ids: Vec<WorkItemId>,
+    #[serde(default)]
+    present_operation_job_ids: Vec<String>,
+    #[serde(default)]
+    transitioned_work_item_ids: Vec<WorkItemId>,
+    #[serde(default)]
+    transitioned_operation_job_ids: Vec<String>,
+    #[serde(default)]
+    missing_projections: Vec<MissingAuthorityProjection>,
+    #[serde(default)]
+    non_projection_proofs: Vec<NonProjectionProof>,
+    #[serde(default)]
+    recovery_steps: Vec<SealRecoveryStep>,
+    quarantine_manifest_ref: String,
+    authority_revocation_refs: Vec<String>,
+    replacement_generation: Option<u64>,
+    recorded_at: OffsetDateTime,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum SealRecoveryRecordState {
+    InProgress,
+    Complete,
+    Failed,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MissingAuthorityProjection {
+    authority_kind: String,
+    referenced_id: String,
+    reason: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NonProjectionProof {
+    schema_version: String,
+    authority_kind: String,
+    owner_store_path: String,
+    owner_store_load_ok: bool,
+    owner_record_count: usize,
+    #[serde(with = "time::serde::rfc3339")]
+    owner_store_modified_at: OffsetDateTime,
+    #[serde(with = "time::serde::rfc3339")]
+    first_request_modified_at: OffsetDateTime,
+    owner_store_predates_first_request: bool,
+    scan_roots: Vec<String>,
+    scanned_file_count: usize,
+    scan_exclusions: Vec<String>,
+    scan_errors: Vec<String>,
+    matching_paths: Vec<String>,
+    source_evidence_ref: Option<String>,
+    complete: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SealRecoveryStep {
+    step: String,
+    outcome: String,
+    detail: String,
+    #[serde(with = "time::serde::rfc3339")]
+    recorded_at: OffsetDateTime,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StagedSealAuthority {
+    call_id: String,
+    host: AgentHostId,
+    project_id: ProjectId,
+    task_id: TaskId,
+    agent_session_id: eliot_types::AgentSessionId,
+    client_instance_id: String,
+    work_item_id: WorkItemId,
+    role_lease_id: String,
+    role_lease_epoch: u64,
+    operation_generation: u64,
+    runtime_contract_sha256: String,
+    invocation_id: String,
+    operation_job_id: String,
+    capability_scope: Vec<String>,
+    expires_at: OffsetDateTime,
+}
+
+type StagedSealArtifact = (String, String, Vec<u8>);
+type RenderedExternalProviderCalls = (Vec<StagedSealAuthority>, Vec<StagedSealArtifact>);
+
+#[derive(Clone, Debug)]
+struct PreparedProviderPlanSeal {
+    record: ProviderPlanSealRecord,
+    plan: CognitiveFieldProviderPlan,
+    role_evidence_plan: Option<CoreRoleEvidencePlan>,
+    authority: Vec<StagedSealAuthority>,
+    manifest: SealArtifactManifest,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+enum SealRecoveryDecision {
+    AbandonAndRevokeSafePredispatch,
+    AlreadyAbandoned,
+    BlockedProviderEvidence,
+    BlockedIntegrityMismatch,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SealRecoveryInspection {
+    schema_version: String,
+    run_id: String,
+    generation: u64,
+    decision: SealRecoveryDecision,
+    execution_request_paths: Vec<String>,
+    provider_runtime_paths: Vec<String>,
+    session_ids: Vec<eliot_types::AgentSessionId>,
+    role_lease_ids: Vec<String>,
+    referenced_work_item_ids: Vec<WorkItemId>,
+    referenced_invocation_ids: Vec<String>,
+    present_work_item_ids: Vec<WorkItemId>,
+    present_operation_job_ids: Vec<String>,
+    missing_work_item_ids: Vec<WorkItemId>,
+    missing_invocation_ids: Vec<String>,
+    non_projection_proofs: Vec<NonProjectionProof>,
+    scoped_authority_exact: bool,
+    legacy_authority_cas_ready: bool,
+    provider_plan_present: bool,
+    provider_reservation_count: usize,
+    provider_result_count: usize,
+    provider_artifact_paths: Vec<String>,
+    exact_error: Option<String>,
+}
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -638,54 +858,155 @@ fn configured_mcp_servers(value: &Value) -> Result<Vec<(String, bool)>> {
     Ok(servers)
 }
 
-fn write_json_rpc(writer: &mut impl Write, value: &Value) -> Result<()> {
-    serde_json::to_writer(&mut *writer, value)?;
-    writer.write_all(b"\n")?;
-    writer.flush()?;
-    Ok(())
-}
-
-fn receive_json_rpc(receiver: &Receiver<String>, id: u64, deadline: Instant) -> Result<Value> {
-    loop {
-        let remaining = deadline
-            .checked_duration_since(Instant::now())
-            .context("Governor MCP preflight exceeded its deadline")?;
-        let line = match receiver.recv_timeout(remaining) {
-            Ok(line) => line,
-            Err(RecvTimeoutError::Timeout) => {
-                bail!("Governor MCP preflight timed out waiting for JSON-RPC id {id}")
-            }
-            Err(RecvTimeoutError::Disconnected) => {
-                bail!("Governor MCP stdout closed before JSON-RPC id {id}")
-            }
-        };
-        let value: Value = serde_json::from_str(&line)
-            .with_context(|| format!("Governor MCP emitted invalid JSON: {line}"))?;
-        if value.get("id").and_then(Value::as_u64) == Some(id) {
-            return Ok(value);
+#[allow(
+    clippy::too_many_lines,
+    reason = "the bounded preflight state machine keeps process policy and output conversion together"
+)]
+fn supervised_preflight_command(
+    config_path: &Path,
+    command: &Command,
+    stdin_payload: Option<Vec<u8>>,
+    operation_id: String,
+    timeout: Duration,
+    child_kind: SupervisedChildKind,
+) -> Result<std::process::Output> {
+    let mut environment = [
+        "SystemRoot",
+        "WINDIR",
+        "ComSpec",
+        "PATH",
+        "PATHEXT",
+        "USERPROFILE",
+        "LOCALAPPDATA",
+        "APPDATA",
+        "TEMP",
+        "TMP",
+    ]
+    .into_iter()
+    .filter_map(|name| std::env::var_os(name).map(|value| (OsString::from(name), value)))
+    .collect::<BTreeMap<_, _>>();
+    for (name, value) in command.get_envs() {
+        if let Some(value) = value {
+            environment.insert(name.into(), value.into());
+        } else {
+            environment.remove(name);
         }
     }
+    let timeout_ms = u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX);
+    let operation_id_for_context = operation_id.clone();
+    let output = run_supervised_process_blocking(
+        SupervisedProcessSpec {
+            operation_id,
+            invocation_id: None,
+            generation: 1,
+            child_kind,
+            criticality: ChildCriticality::InvocationDependency,
+            restart_policy: ProcessRestartPolicy {
+                strategy: RestartStrategy::Never,
+                max_restarts: 0,
+                restart_window_seconds: 60,
+                base_backoff_ms: 0,
+                pre_dispatch_only: false,
+            },
+            executable: command.get_program().into(),
+            args: command.get_args().map(OsString::from).collect(),
+            cwd: command
+                .get_current_dir()
+                .map(ToOwned::to_owned)
+                .map_or_else(std::env::current_dir, Ok)?,
+            environment,
+            stdin_payload,
+            stdout_limit_bytes: 4 * 1024 * 1024,
+            stderr_limit_bytes: 4 * 1024 * 1024,
+            timeout_profile: eliot_types::ProviderTimeoutProfile {
+                profile_id: "cognitive-preflight-v1".to_owned(),
+                provider: "eliot-governor".to_owned(),
+                route_or_operation_class: "cognitive-preflight".to_owned(),
+                spawn_deadline_ms: Some(5_000),
+                dispatch_ack_deadline_ms: None,
+                first_output_deadline_ms: Some(timeout_ms),
+                idle_output_deadline_ms: Some(timeout_ms),
+                absolute_runtime_deadline_ms: timeout_ms,
+                cancellation_grace_ms: 25,
+                cleanup_grace_ms: 5_000,
+                reconciliation_window_ms: 0,
+                output_heartbeat_supported: true,
+                status_lookup_supported: false,
+                evidence_basis: vec!["bounded cognitive runtime preflight".to_owned()],
+                assumptions: Vec::new(),
+                hard_upper_bounds: vec!["20 second preflight limit".to_owned()],
+                policy_version: "runtime-supervision-v1".to_owned(),
+            },
+            runtime_contract_sha256: None,
+            role_lease_id: None,
+            role_lease_epoch: None,
+        },
+        eliot_engine::runtime_supervision::AdapterExecutionContext {
+            operation_id: operation_id_for_context,
+            generation: 1,
+            cancellation: eliot_engine::runtime_supervision::CancellationToken::new(),
+            deadline: tokio::time::Instant::now() + timeout,
+            runtime_store:
+                crate::host_runtime::supervised_process::daemon_operation_runtime_handle(
+                    config_path,
+                )?,
+            role_lease_id: None,
+            role_lease_epoch: None,
+            runtime_contract_sha256: None,
+        },
+    )?;
+    ensure!(
+        !output.timed_out && output.reap_receipt.proves_complete_reap(),
+        "supervised cognitive preflight timed out or did not reap its Job Object"
+    );
+    ensure!(
+        output.worker_error.is_none(),
+        "supervised cognitive preflight failed: {:?}",
+        output.worker_error
+    );
+    Ok(std::process::Output {
+        status: std::process::ExitStatus::from_raw(
+            output.exit_code.unwrap_or(i32::MAX).cast_unsigned(),
+        ),
+        stdout: output.stdout,
+        stderr: output.stderr,
+    })
+}
+
+fn json_rpc_response_by_id(responses: &[Value], id: u64) -> Result<&Value> {
+    responses
+        .iter()
+        .find(|response| response.get("id").and_then(Value::as_u64) == Some(id))
+        .with_context(|| format!("Governor MCP returned no JSON-RPC response for id {id}"))
 }
 
 #[allow(clippy::too_many_lines)]
 fn preflight_codex_cognitive_runtime(
+    config_path: &Path,
     contract: &CognitiveProviderRuntimeContract,
     scoped_environment: &BTreeMap<String, String>,
 ) -> Result<CognitiveRuntimePreflightReceipt> {
     let started = Instant::now();
-    let deadline = started + COGNITIVE_RUNTIME_PREFLIGHT_LIMIT;
     validate_runtime_contract(contract)?;
     ensure!(
         contract.host == AgentHostId::Codex,
         "Codex runtime preflight requires a Codex contract"
     );
 
-    let config_output = Command::new(&contract.provider_executable)
+    let mut config_command = Command::new(&contract.provider_executable);
+    config_command
         .args(codex_mcp_list_argv(contract)?)
         .current_dir(&contract.provider_cwd)
-        .envs(scoped_environment)
-        .output()
-        .context("run zero-model Codex MCP configuration listing")?;
+        .envs(scoped_environment);
+    let config_output = supervised_preflight_command(
+        config_path,
+        &config_command,
+        None,
+        format!("cognitive-config-preflight-{}", Uuid::now_v7()),
+        COGNITIVE_RUNTIME_PREFLIGHT_LIMIT,
+        SupervisedChildKind::Verifier,
+    )
+    .context("run zero-model Codex MCP configuration listing")?;
     ensure!(
         config_output.status.success(),
         "Codex MCP configuration listing failed: {}",
@@ -716,57 +1037,65 @@ fn preflight_codex_cognitive_runtime(
         .iter()
         .find(|server| server.name == "eliot-governor")
         .context("runtime contract lacks Governor server")?;
-    let mut child = Command::new(&governor.command)
+    let requests = [
+        json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-06-18",
+                "capabilities": {},
+                "clientInfo": {
+                    "name": "eliot-cognitive-runtime-preflight",
+                    "version": COGNITIVE_RUNTIME_PREFLIGHT_SCHEMA_VERSION,
+                },
+            },
+        }),
+        json!({"jsonrpc": "2.0", "method": "notifications/initialized", "params": {}}),
+        json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}}),
+        json!({
+            "jsonrpc": "2.0",
+            "id": 3,
+            "method": "tools/call",
+            "params": {"name": "eliot_host_session_status", "arguments": {}},
+        }),
+    ];
+    let mut request_bytes = Vec::new();
+    for request in requests {
+        request_bytes.extend_from_slice(&serde_json::to_vec(&request)?);
+        request_bytes.push(b'\n');
+    }
+    let mut governor_command = Command::new(&governor.command);
+    governor_command
         .args(&governor.args)
         .current_dir(&governor.cwd)
-        .envs(scoped_environment)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .context("start exact Governor MCP stdio child")?;
-    let mut stdin = child.stdin.take().context("take Governor MCP stdin")?;
-    let stdout = child.stdout.take().context("take Governor MCP stdout")?;
-    let (sender, receiver) = channel();
-    std::thread::spawn(move || {
-        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
-            if sender.send(line).is_err() {
-                break;
-            }
-        }
-    });
-
+        .envs(scoped_environment);
+    let mcp_output = supervised_preflight_command(
+        config_path,
+        &governor_command,
+        Some(request_bytes),
+        format!("cognitive-mcp-preflight-{}", Uuid::now_v7()),
+        COGNITIVE_RUNTIME_PREFLIGHT_LIMIT,
+        SupervisedChildKind::McpPreflight,
+    )
+    .context("run exact Governor MCP stdio child")?;
+    ensure!(
+        mcp_output.status.success(),
+        "Governor MCP preflight failed: {}",
+        String::from_utf8_lossy(&mcp_output.stderr)
+    );
+    let responses = String::from_utf8(mcp_output.stdout)?
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(serde_json::from_str)
+        .collect::<Result<Vec<Value>, _>>()?;
     let result = (|| -> Result<(Vec<String>, bool)> {
-        write_json_rpc(
-            &mut stdin,
-            &json!({
-                "jsonrpc": "2.0",
-                "id": 1,
-                "method": "initialize",
-                "params": {
-                    "protocolVersion": "2025-06-18",
-                    "capabilities": {},
-                    "clientInfo": {
-                        "name": "eliot-cognitive-runtime-preflight",
-                        "version": COGNITIVE_RUNTIME_PREFLIGHT_SCHEMA_VERSION,
-                    },
-                },
-            }),
-        )?;
-        let initialize = receive_json_rpc(&receiver, 1, deadline)?;
+        let initialize = json_rpc_response_by_id(&responses, 1)?;
         ensure!(
             initialize.get("error").is_none() && initialize.get("result").is_some(),
             "Governor MCP initialize failed: {initialize}"
         );
-        write_json_rpc(
-            &mut stdin,
-            &json!({"jsonrpc": "2.0", "method": "notifications/initialized", "params": {}}),
-        )?;
-        write_json_rpc(
-            &mut stdin,
-            &json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}}),
-        )?;
-        let tools = receive_json_rpc(&receiver, 2, deadline)?;
+        let tools = json_rpc_response_by_id(&responses, 2)?;
         ensure!(
             tools.get("error").is_none(),
             "Governor MCP tools/list failed: {tools}"
@@ -793,26 +1122,12 @@ fn preflight_codex_cognitive_runtime(
             "Governor MCP tools/list lacks one or more expected cognitive tools"
         );
 
-        write_json_rpc(
-            &mut stdin,
-            &json!({
-                "jsonrpc": "2.0",
-                "id": 3,
-                "method": "tools/call",
-                "params": {"name": "eliot_host_session_status", "arguments": {}},
-            }),
-        )?;
-        let status = receive_json_rpc(&receiver, 3, deadline)?;
+        let status = json_rpc_response_by_id(&responses, 3)?;
         let scoped_status_read_passed =
             status.get("error").is_none() && status.get("result").is_some();
         Ok((observed_tools, scoped_status_read_passed))
     })();
 
-    drop(stdin);
-    let _ = child.kill();
-    child
-        .wait()
-        .context("reap Governor MCP child after preflight")?;
     let (observed_mcp_tool_names, scoped_status_read_passed) = result?;
     let elapsed_ms =
         u64::try_from(started.elapsed().as_millis()).context("preflight duration exceeds u64")?;
@@ -840,6 +1155,7 @@ fn preflight_codex_cognitive_runtime(
 
 #[allow(clippy::too_many_arguments)]
 pub fn codex_runtime_preflight(
+    config_path: &Path,
     provider_executable: &Path,
     worktree: &Path,
     governor_executable: &Path,
@@ -859,7 +1175,7 @@ pub fn codex_runtime_preflight(
         .map(read_json::<CognitiveHarnessOnlyEquivalence>)
         .transpose()?;
     validate_governor_product_provenance(&contract, product_source_commit, equivalence.as_ref())?;
-    let receipt = preflight_codex_cognitive_runtime(&contract, &BTreeMap::new())?;
+    let receipt = preflight_codex_cognitive_runtime(config_path, &contract, &BTreeMap::new())?;
     write_new_or_same_json(contract_output, &contract)?;
     write_new_or_same_json(receipt_output, &receipt)?;
     print_json(&json!({
@@ -1349,13 +1665,51 @@ pub fn record_deterministic(
     }))
 }
 
-async fn bind_external_provider_calls(
+fn deterministic_seal_uuid(material: &str) -> Uuid {
+    let digest = blake3::hash(material.as_bytes());
+    let mut bytes = [0_u8; 16];
+    bytes.copy_from_slice(&digest.as_bytes()[..16]);
+    bytes[6] = (bytes[6] & 0x0f) | 0x70;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    Uuid::from_bytes(bytes)
+}
+
+fn deterministic_seal_id(prefix: &str, material: &str) -> String {
+    format!("{prefix}:{}", deterministic_seal_uuid(material))
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    reason = "transactional seal rendering validates all authority and artifact bindings in one state-machine phase"
+)]
+fn render_external_provider_calls(
     config_path: &Path,
     suite: &CognitiveFieldSuite,
     contract: &CognitiveFieldRunContract,
     private_root: &Path,
+    seal_attempt_id: &str,
+    generation: u64,
+    reference_prefix: &str,
     calls: &mut [CognitiveFieldProviderCallPlan],
-) -> Result<()> {
+) -> Result<RenderedExternalProviderCalls> {
+    ensure!(generation > 0, "seal generation must be nonzero");
+    let broker = crate::delegation_runtime::load_state(
+        &crate::delegation_runtime::root_from_config(config_path),
+    )?;
+    let mut next_epochs =
+        broker
+            .task_role_leases
+            .iter()
+            .fold(BTreeMap::<TaskId, u64>::new(), |mut epochs, lease| {
+                epochs
+                    .entry(lease.task_id)
+                    .and_modify(|epoch| *epoch = (*epoch).max(lease.epoch))
+                    .or_insert(lease.epoch);
+                epochs
+            });
+    let mut authority_entries = Vec::new();
+    let mut artifacts = Vec::new();
     for call in calls
         .iter_mut()
         .filter(|call| call.host != AgentHostId::Codex)
@@ -1372,33 +1726,60 @@ async fn bind_external_provider_calls(
         );
         let prompt = std::str::from_utf8(&prompt_bytes).context("provider prompt is not UTF-8")?;
         let prompt_binding = sealed_prompt_binding(prompt, suite, contract, private_root, call)?;
-        let request_path = private_root
-            .join("runtime")
-            .join(format!("{}-execution-request.json", call.call_id));
-        let execution = if request_path.is_file() {
-            let execution: ExternalAgentExecutionRequest = read_json(&request_path)?;
-            validate_external_agent_execution_request(&execution)?;
-            validate_execution_request_binding(
-                &execution,
-                call,
-                &prompt_binding,
-                &prompt_path,
-                private_root,
-            )?;
-            execution
-        } else {
-            let execution = cognitive_external_execution_request(
-                config_path,
-                contract,
-                private_root,
-                call,
-                &prompt_binding,
-                &prompt_path,
-            )
-            .await?;
-            write_new_or_same_json(&request_path, &execution)?;
-            execution
+        let role_lease_epoch = {
+            let epoch = next_epochs.entry(prompt_binding.task_id).or_insert(0);
+            *epoch += 1;
+            *epoch
         };
+        let authority_material = format!(
+            "{}\n{}\n{}\n{}",
+            seal_attempt_id,
+            generation,
+            call.call_id,
+            call.host.as_str()
+        );
+        let authority = StagedSealAuthority {
+            call_id: call.call_id.clone(),
+            host: call.host,
+            project_id: prompt_binding.project_id,
+            task_id: prompt_binding.task_id,
+            agent_session_id: eliot_types::AgentSessionId::from_uuid(deterministic_seal_uuid(
+                &format!("session\n{authority_material}"),
+            )),
+            client_instance_id: format!(
+                "cognitive-field:{}:{}:g{}",
+                contract.run_id, call.call_id, generation
+            ),
+            work_item_id: WorkItemId::from_uuid(deterministic_seal_uuid(&format!(
+                "work-item\n{authority_material}"
+            ))),
+            role_lease_id: deterministic_seal_id(
+                "task-role-lease",
+                &format!("role\n{authority_material}"),
+            ),
+            role_lease_epoch,
+            operation_generation: generation,
+            runtime_contract_sha256: call.runtime_contract_sha256.clone(),
+            invocation_id: format!("cognitive-field-{}-{}", contract.run_id, call.call_id),
+            operation_job_id: deterministic_seal_id(
+                "operation-job",
+                &format!("job\n{authority_material}"),
+            ),
+            capability_scope: vec![
+                "emit_candidate_observation".to_owned(),
+                "request_controller_review".to_owned(),
+            ],
+            expires_at: contract.sealed_at + time::Duration::days(30),
+        };
+        let execution = cognitive_external_execution_request(
+            contract,
+            private_root,
+            call,
+            &prompt_binding,
+            &prompt_path,
+            &authority,
+        )?;
+        validate_external_agent_execution_request(&execution)?;
         let preview = crate::host_runtime::prepare_external_agent_runtime(
             config_path,
             call.host,
@@ -1409,34 +1790,55 @@ async fn bind_external_provider_calls(
                 && preview.runtime_contract.requested_model == call.requested_model,
             "production adapter preview differs from the sealed provider route"
         );
-        let runtime_path = private_root
-            .join("runtime")
-            .join(format!("{}-provider-runtime.json", call.call_id));
-        write_new_or_same_json(&runtime_path, &preview.runtime_contract)?;
+        let request_relative = format!(
+            "{reference_prefix}/runtime/{}-execution-request.json",
+            call.call_id
+        );
+        let runtime_relative = format!(
+            "{reference_prefix}/runtime/{}-provider-runtime.json",
+            call.call_id
+        );
+        let mut request_bytes = serde_json::to_vec_pretty(&execution)?;
+        request_bytes.push(b'\n');
+        let mut runtime_bytes = serde_json::to_vec_pretty(&preview.runtime_contract)?;
+        runtime_bytes.push(b'\n');
         call.adapter_id = preview.adapter_id;
         call.adapter_version = preview.adapter_version;
-        call.execution_request_ref = private_relative_ref(private_root, &request_path)?;
-        call.execution_request_sha256 = sha256_bytes(&fs::read(&request_path)?);
-        call.runtime_contract_ref = private_relative_ref(private_root, &runtime_path)?;
+        call.execution_request_ref.clone_from(&request_relative);
+        call.execution_request_sha256 = sha256_bytes(&request_bytes);
+        call.runtime_contract_ref.clone_from(&runtime_relative);
         call.runtime_contract_sha256
             .clone_from(&preview.runtime_contract.runtime_contract_sha256);
         call.expected_provider_executable_sha256 =
             preview.runtime_contract.provider_executable_sha256;
+        artifacts.push((
+            "execution_request".to_owned(),
+            request_relative,
+            request_bytes,
+        ));
+        artifacts.push((
+            "provider_runtime".to_owned(),
+            runtime_relative,
+            runtime_bytes,
+        ));
+        authority_entries.push(authority);
     }
-    Ok(())
+    authority_entries.sort_by(|left, right| left.call_id.cmp(&right.call_id));
+    artifacts.sort_by(|left, right| left.1.cmp(&right.1));
+    Ok((authority_entries, artifacts))
 }
 
 #[allow(
     clippy::too_many_lines,
     reason = "the request builder keeps one sealed authority contract visible end to end"
 )]
-async fn cognitive_external_execution_request(
-    config_path: &Path,
+fn cognitive_external_execution_request(
     contract: &CognitiveFieldRunContract,
     private_root: &Path,
     call: &CognitiveFieldProviderCallPlan,
     binding: &SealedPromptBinding,
     prompt_path: &Path,
+    authority: &StagedSealAuthority,
 ) -> Result<ExternalAgentExecutionRequest> {
     let output_schema_path = private_root.join("schemas").join("reader-provider.json");
     let output_schema_path = canonical_file(&output_schema_path, "Reader provider output schema")?;
@@ -1444,50 +1846,37 @@ async fn cognitive_external_execution_request(
         sha256_bytes(&fs::read(&output_schema_path)?) == call.provider_schema_sha256,
         "Reader provider output schema differs from the sealed call"
     );
-    let session_id = SessionId::new_v7();
-    let mut scope = crate::host_runtime::prepare_cognitive_external_scope(
-        config_path,
-        call.host,
-        binding.project_id,
-        binding.task_id,
-        session_id,
-        &format!("cognitive-field:{}:{}", contract.run_id, call.call_id),
-    )
-    .await?;
-    let work_item_id = WorkItemId::new_v7();
-    scope.work_item_id = Some(work_item_id);
-    scope.planned_verifier_ref = Some(format!(
+    ensure!(
+        authority.call_id == call.call_id
+            && authority.host == call.host
+            && authority.project_id == binding.project_id
+            && authority.task_id == binding.task_id,
+        "staged seal authority differs from the cognitive call binding"
+    );
+    let planned_verifier_ref = format!(
         "cognitive-field-provider-verifier:{}:{}",
         contract.run_id, call.call_id
-    ));
-    scope.baseline_commit = Some(contract.source_commit.clone());
+    );
     let invocation_id = format!("cognitive-field-{}-{}", contract.run_id, call.call_id);
     let idempotency_key = format!("cognitive-field:{}:{}", contract.run_id, call.call_id);
     let expected_tools = cognitive_expected_mcp_tools(call);
     let allowed_provider_tools = cognitive_allowed_provider_tools(call.host, &expected_tools);
-    let agent_session_id = scope
-        .agent_session_id
-        .context("external cognitive scope has no AgentSession")?;
-    let role_lease_id = scope
-        .role_lease_id
-        .clone()
-        .context("external cognitive scope has no TaskRoleLease")?;
     let mut launch_contract = HostLaunchContract {
         invocation_id: invocation_id.clone(),
         host_profile_ref: format!("external-agent-adapter:{}", call.host.as_str()),
         mode: HostMode::Supervised,
         project_id: Some(binding.project_id),
-        agent_session_id: Some(agent_session_id),
+        agent_session_id: Some(authority.agent_session_id),
         task_id: Some(binding.task_id),
-        work_item_id: Some(work_item_id),
-        role_lease_id: Some(role_lease_id.clone()),
-        role_lease_epoch: 0,
-        operation_generation: 0,
+        work_item_id: Some(authority.work_item_id),
+        role_lease_id: Some(authority.role_lease_id.clone()),
+        role_lease_epoch: authority.role_lease_epoch,
+        operation_generation: authority.operation_generation,
         work_lease_id: None,
         worktree_lease_id: None,
-        planned_verifier_ref: scope.planned_verifier_ref.clone(),
+        planned_verifier_ref: Some(planned_verifier_ref.clone()),
         cwd_or_worktree: canonical_path(&binding.repository),
-        baseline_commit: scope.baseline_commit.clone(),
+        baseline_commit: Some(contract.source_commit.clone()),
         allowed_paths: Vec::new(),
         forbidden_paths: vec![
             "provider-credential-roots".to_owned(),
@@ -1520,19 +1909,19 @@ async fn cognitive_external_execution_request(
         invocation_id,
         project_id: binding.project_id,
         task_id: binding.task_id,
-        work_item_id,
+        work_item_id: authority.work_item_id,
         requested_capabilities: vec![
             "emit_candidate_observation".to_owned(),
             "request_controller_review".to_owned(),
         ],
-        role_lease_id,
-        role_lease_epoch: 0,
-        operation_generation: 0,
-        runtime_contract_sha256: None,
+        role_lease_id: authority.role_lease_id.clone(),
+        role_lease_epoch: authority.role_lease_epoch,
+        operation_generation: authority.operation_generation,
+        runtime_contract_sha256: Some(authority.runtime_contract_sha256.clone()),
         work_lease_id: None,
         packet_refs: Vec::new(),
         expected_result_kind: "provider_execution_evidence".to_owned(),
-        verifier_ref: scope.planned_verifier_ref.unwrap_or_default(),
+        verifier_ref: planned_verifier_ref,
         idempotency_key,
     };
     let execution = ExternalAgentExecutionRequest {
@@ -1564,6 +1953,7 @@ async fn cognitive_external_execution_request(
     Ok(execution)
 }
 
+#[allow(dead_code)]
 fn validate_execution_request_binding(
     execution: &ExternalAgentExecutionRequest,
     call: &CognitiveFieldProviderCallPlan,
@@ -1701,11 +2091,169 @@ fn private_relative_ref(private_root: &Path, path: &Path) -> Result<String> {
     Ok(relative.to_string_lossy().replace('\\', "/"))
 }
 
-pub async fn seal_provider_plan(
+fn seal_attempt_component(run_id: &str, generation: u64) -> String {
+    let digest = blake3::hash(format!("{run_id}\n{generation}").as_bytes())
+        .to_hex()
+        .to_string();
+    format!("seal-{}-g{generation}", &digest[..16])
+}
+
+fn seal_record_path(private_root: &Path, seal_attempt_id: &str) -> PathBuf {
+    let component = seal_attempt_id
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || matches!(character, '-' | '_') {
+                character
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    private_root
+        .join("seal-records")
+        .join(format!("{component}.json"))
+}
+
+fn load_seal_records(private_root: &Path) -> Result<Vec<ProviderPlanSealRecord>> {
+    let root = private_root.join("seal-records");
+    if !root.is_dir() {
+        return Ok(Vec::new());
+    }
+    let mut paths = fs::read_dir(root)?
+        .map(|entry| entry.map(|entry| entry.path()))
+        .collect::<std::io::Result<Vec<_>>>()?;
+    paths.sort();
+    paths
+        .into_iter()
+        .filter(|path| {
+            path.extension()
+                .is_some_and(|extension| extension == "json")
+        })
+        .map(|path| read_json(&path))
+        .collect()
+}
+
+fn next_seal_generation(
+    private_root: &Path,
+    existing_plan: Option<&CognitiveFieldProviderPlan>,
+) -> Result<u64> {
+    if let Some(plan) = existing_plan
+        && plan.seal_generation > 0
+    {
+        return Ok(plan.seal_generation);
+    }
+    Ok(load_seal_records(private_root)?
+        .iter()
+        .map(|record| record.generation)
+        .max()
+        .unwrap_or(0)
+        + 1)
+}
+
+fn encode_pretty_json<T: Serialize>(value: &T) -> Result<Vec<u8>> {
+    let mut bytes = serde_json::to_vec_pretty(value)?;
+    bytes.push(b'\n');
+    Ok(bytes)
+}
+
+fn atomic_stage_write(path: &Path, bytes: &[u8]) -> Result<()> {
+    let parent = path
+        .parent()
+        .context("staged artifact path has no parent directory")?;
+    fs::create_dir_all(parent)?;
+    let temporary = path.with_extension(format!(
+        "{}.tmp",
+        path.extension()
+            .and_then(|extension| extension.to_str())
+            .unwrap_or("artifact")
+    ));
+    if temporary.exists() {
+        fs::remove_file(&temporary)?;
+    }
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temporary)?;
+    file.write_all(bytes)?;
+    file.sync_all()?;
+    drop(file);
+    fs::rename(&temporary, path)?;
+    Ok(())
+}
+
+fn stage_artifacts_with_cleanup(
+    private_root: &Path,
+    staging_root: &Path,
+    artifacts: &[(String, String, Vec<u8>)],
+    fail_after: Option<usize>,
+) -> Result<()> {
+    ensure!(
+        !staging_root.exists(),
+        "seal staging root already exists: {}",
+        staging_root.display()
+    );
+    let outcome = (|| -> Result<()> {
+        fs::create_dir_all(staging_root)?;
+        for (index, (_kind, relative_path, bytes)) in artifacts.iter().enumerate() {
+            if fail_after == Some(index) {
+                bail!("injected seal staging failure after {index} artifacts");
+            }
+            let path = private_root.join(relative_path);
+            ensure!(
+                path.starts_with(staging_root),
+                "staged artifact escaped the generation staging root"
+            );
+            atomic_stage_write(&path, bytes)?;
+        }
+        Ok(())
+    })();
+    if outcome.is_err() {
+        let _ = fs::remove_dir_all(staging_root);
+    }
+    outcome
+}
+
+fn seal_manifest_hash(manifest: &SealArtifactManifest) -> Result<String> {
+    let mut unsigned = manifest.clone();
+    unsigned.manifest_sha256.clear();
+    Ok(sha256_bytes(&serde_json::to_vec(&unsigned)?))
+}
+
+fn write_seal_record(private_root: &Path, record: &ProviderPlanSealRecord) -> Result<()> {
+    crate::runtime_instance::atomic_write_json(
+        &seal_record_path(private_root, &record.seal_attempt_id),
+        record,
+    )
+}
+
+fn provider_plan_seal_response(
+    run_id: &str,
+    seal_attempt_id: &str,
+    generation: u64,
+    plan: &CognitiveFieldProviderPlan,
+    staged_manifest_sha256: &str,
+) -> Value {
+    json!({
+        "status": "provider_plan_sealed",
+        "run_id": run_id,
+        "seal_attempt_id": seal_attempt_id,
+        "seal_generation": generation,
+        "provider_plan_hash": plan.plan_hash,
+        "staged_manifest_sha256": staged_manifest_sha256,
+        "planned_provider_calls": plan.planned_provider_calls,
+        "planned_smoke_calls": plan.planned_smoke_calls,
+        "planned_reused_roles": plan.planned_reused_roles,
+        "total_calls": plan.calls.len(),
+    })
+}
+
+#[allow(clippy::too_many_lines)]
+pub async fn seal_provider_plan_with_mode(
     config_path: &Path,
     report_root: &Path,
     private_root: &Path,
     calls_path: &Path,
+    dry_run: bool,
 ) -> Result<()> {
     let report_root = canonical_directory(report_root, "cognitive report root")?;
     let private_root = canonical_directory(private_root, "private certification root")?;
@@ -1725,23 +2273,155 @@ pub async fn seal_provider_plan(
     if suite.harness_version != COGNITIVE_CORE_QUALIFICATION_HARNESS_VERSION {
         ensure_deterministic_evidence_complete(&suite, &report_root)?;
     }
-
-    let mut calls: Vec<CognitiveFieldProviderCallPlan> = read_json(&calls_path)?;
-    bind_external_provider_calls(config_path, &suite, &contract, &private_root, &mut calls).await?;
-    let role_evidence_plan =
-        load_core_role_evidence_plan(&suite, &contract, &report_root, &private_root, &calls)?;
-    let role_sources = role_evidence_plan
-        .as_ref()
-        .map_or(&[][..], |plan| plan.sources.as_slice());
-    let (planned_provider_calls, planned_smoke_calls) =
-        validate_provider_calls_with_sources(&suite, &calls, &private_root, role_sources)?;
-    let planned_reused_roles = u8::try_from(prior_role_sources(role_sources).count())
-        .context("reused role count exceeds u8")?;
     let plan_path = report_root.join("provider-plan.json");
     let existing = plan_path
         .is_file()
         .then(|| read_json::<CognitiveFieldProviderPlan>(&plan_path))
         .transpose()?;
+    if let Some(plan) = &existing {
+        let published_record = load_seal_records(&private_root)?.into_iter().any(|record| {
+            record.run_id == contract.run_id
+                && record.seal_attempt_id.as_str() == plan.seal_attempt_id.as_deref().unwrap_or("")
+                && record.generation == plan.seal_generation
+                && record.state == ProviderPlanSealState::Published
+        });
+        ensure!(
+            published_record,
+            "provider-plan exists without a matching Published seal record; recovery is required"
+        );
+    }
+    let generation = next_seal_generation(&private_root, existing.as_ref())?;
+    let seal_attempt_id = existing
+        .as_ref()
+        .and_then(|plan| plan.seal_attempt_id.clone())
+        .unwrap_or_else(|| {
+            format!(
+                "provider-plan-seal:{}",
+                seal_attempt_component(&contract.run_id, generation)
+            )
+        });
+    let incomplete = load_seal_records(&private_root)?
+        .into_iter()
+        .filter(|record| {
+            record.run_id == contract.run_id
+                && matches!(
+                    record.state,
+                    ProviderPlanSealState::Staged | ProviderPlanSealState::Activated
+                )
+        })
+        .collect::<Vec<_>>();
+    ensure!(
+        incomplete.is_empty()
+            || incomplete
+                .iter()
+                .all(|record| record.seal_attempt_id == seal_attempt_id),
+        "an incomplete provider-plan seal requires recovery before a new generation"
+    );
+    let staging_component = seal_attempt_component(&contract.run_id, generation);
+    let staging_prefix = format!("seal-staging/{staging_component}");
+    let final_prefix = format!("sealed/{generation}");
+    let staging_root = private_root.join(&staging_prefix);
+    let published_root = private_root.join(&final_prefix);
+    ensure!(
+        !staging_root.exists(),
+        "seal staging root already exists and must be recovered before sealing: {}",
+        staging_root.display()
+    );
+    let mut calls: Vec<CognitiveFieldProviderCallPlan> = read_json(&calls_path)?;
+    let (authority, mut private_artifacts) = render_external_provider_calls(
+        config_path,
+        &suite,
+        &contract,
+        &private_root,
+        &seal_attempt_id,
+        generation,
+        &staging_prefix,
+        &mut calls,
+    )?;
+    stage_artifacts_with_cleanup(&private_root, &staging_root, &private_artifacts, None)?;
+    let validation = (|| -> Result<(Option<CoreRoleEvidencePlan>, u8, u8, u8)> {
+        let role_evidence_plan =
+            load_core_role_evidence_plan(&suite, &contract, &report_root, &private_root, &calls)?;
+        let role_sources = role_evidence_plan
+            .as_ref()
+            .map_or(&[][..], |plan| plan.sources.as_slice());
+        let (planned_provider_calls, planned_smoke_calls) =
+            validate_provider_calls_with_sources(&suite, &calls, &private_root, role_sources)?;
+        let planned_reused_roles = u8::try_from(prior_role_sources(role_sources).count())
+            .context("reused role count exceeds u8")?;
+        Ok((
+            role_evidence_plan,
+            planned_provider_calls,
+            planned_smoke_calls,
+            planned_reused_roles,
+        ))
+    })();
+    let (role_evidence_plan, planned_provider_calls, planned_smoke_calls, planned_reused_roles) =
+        match validation {
+            Ok(validated) => validated,
+            Err(error) => {
+                let _ = fs::remove_dir_all(&staging_root);
+                return Err(error.context("validate staged provider-plan artifacts"));
+            }
+        };
+    for call in &mut calls {
+        if let Some(relative) = call.execution_request_ref.strip_prefix(&staging_prefix) {
+            call.execution_request_ref = format!("{final_prefix}{relative}");
+        }
+        if let Some(relative) = call.runtime_contract_ref.strip_prefix(&staging_prefix) {
+            call.runtime_contract_ref = format!("{final_prefix}{relative}");
+        }
+    }
+    let contract_bytes = encode_pretty_json(&contract)?;
+    private_artifacts.push((
+        "run_contract".to_owned(),
+        format!("{staging_prefix}/contract.json"),
+        contract_bytes,
+    ));
+    if let Some(role_plan) = &role_evidence_plan {
+        private_artifacts.push((
+            "role_evidence_plan".to_owned(),
+            format!("{staging_prefix}/role-evidence-plan.json"),
+            encode_pretty_json(role_plan)?,
+        ));
+    }
+    private_artifacts.sort_by(|left, right| left.1.cmp(&right.1));
+    for (_kind, relative_path, bytes) in &private_artifacts {
+        let path = private_root.join(relative_path);
+        if !path.is_file()
+            && let Err(error) = atomic_stage_write(&path, bytes)
+        {
+            let _ = fs::remove_dir_all(&staging_root);
+            return Err(error.context("complete provider-plan staging"));
+        }
+    }
+    let mut manifest = SealArtifactManifest {
+        schema_version: SEAL_ARTIFACT_MANIFEST_SCHEMA_VERSION.to_owned(),
+        seal_attempt_id: seal_attempt_id.clone(),
+        run_id: contract.run_id.clone(),
+        generation,
+        entries: private_artifacts
+            .iter()
+            .map(|(kind, relative_path, bytes)| SealArtifactEntry {
+                logical_kind: kind.clone(),
+                relative_path: relative_path.replacen(&staging_prefix, &final_prefix, 1),
+                sha256: sha256_bytes(bytes),
+                size_bytes: u64::try_from(bytes.len()).unwrap_or(u64::MAX),
+            })
+            .collect(),
+        manifest_sha256: String::new(),
+    };
+    manifest
+        .entries
+        .sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
+    manifest.manifest_sha256 = seal_manifest_hash(&manifest)?;
+    let authority_activation_ref = format!(
+        "seal-records/{}.json",
+        seal_record_path(&private_root, &seal_attempt_id)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("seal-record.json")
+    );
     let mut plan = CognitiveFieldProviderPlan {
         schema_version: COGNITIVE_FIELD_PROVIDER_PLAN_SCHEMA_VERSION.to_owned(),
         run_id: contract.run_id.clone(),
@@ -1753,39 +2433,1642 @@ pub async fn seal_provider_plan(
         role_evidence_plan_hash: role_evidence_plan
             .as_ref()
             .map(|role_plan| role_plan.plan_hash.clone()),
+        seal_attempt_id: Some(seal_attempt_id.clone()),
+        seal_generation: generation,
+        authority_activation_ref: Some(authority_activation_ref),
+        runtime_manifest_sha256: Some(manifest.manifest_sha256.clone()),
+        artifact_manifest_sha256: Some(manifest.manifest_sha256.clone()),
         plan_hash: String::new(),
-        sealed_at: existing
-            .as_ref()
-            .map_or_else(OffsetDateTime::now_utc, |plan| plan.sealed_at),
+        sealed_at: existing.as_ref().map_or(
+            contract.sealed_at
+                + time::Duration::nanoseconds(i64::try_from(generation).unwrap_or(i64::MAX)),
+            |plan| plan.sealed_at,
+        ),
     };
     plan.plan_hash = CognitiveFieldGradingService::hash_json(&provider_plan_without_hash(&plan))?;
+    let role_evidence_plan_sha256 = role_evidence_plan.as_ref().map_or_else(
+        || sha256_bytes(b"none"),
+        |role_plan| {
+            serde_json::to_vec(role_plan)
+                .map_or_else(|_| sha256_bytes(b"invalid"), |bytes| sha256_bytes(&bytes))
+        },
+    );
+    let mut record = ProviderPlanSealRecord {
+        schema_version: PROVIDER_PLAN_SEAL_RECORD_SCHEMA_VERSION.to_owned(),
+        seal_attempt_id: seal_attempt_id.clone(),
+        run_id: contract.run_id.clone(),
+        generation,
+        state: ProviderPlanSealState::Staged,
+        contract_sha256: sha256_bytes(&serde_json::to_vec(&contract)?),
+        role_evidence_plan_sha256,
+        staged_manifest_sha256: manifest.manifest_sha256.clone(),
+        provider_plan_sha256: Some(sha256_bytes(&encode_pretty_json(&plan)?)),
+        session_ids: authority
+            .iter()
+            .map(|entry| entry.agent_session_id)
+            .collect(),
+        role_lease_ids: authority
+            .iter()
+            .map(|entry| entry.role_lease_id.clone())
+            .collect(),
+        work_item_ids: authority.iter().map(|entry| entry.work_item_id).collect(),
+        operation_job_ids: authority
+            .iter()
+            .map(|entry| entry.operation_job_id.clone())
+            .collect(),
+        staging_root: staging_root.display().to_string(),
+        published_root: published_root.display().to_string(),
+        activated_at: None,
+        published_at: None,
+        abandoned_at: None,
+        failure_ref: None,
+    };
+    record.session_ids.sort();
+    record.role_lease_ids.sort();
+    record.work_item_ids.sort();
+    record.operation_job_ids.sort();
+    let prepared = PreparedProviderPlanSeal {
+        record: record.clone(),
+        plan: plan.clone(),
+        role_evidence_plan: role_evidence_plan.clone(),
+        authority,
+        manifest,
+    };
+    atomic_stage_write(
+        &staging_root.join("artifact-manifest.json"),
+        &encode_pretty_json(&prepared.manifest)?,
+    )?;
+    atomic_stage_write(
+        &staging_root.join("candidate-provider-plan.json"),
+        &encode_pretty_json(&prepared.plan)?,
+    )?;
     if let Some(existing) = existing {
         ensure!(
             existing == plan,
             "existing sealed provider plan differs from the requested call plan"
         );
-        plan = existing;
+        let broker = crate::delegation_runtime::load_state(
+            &crate::delegation_runtime::root_from_config(config_path),
+        )?;
+        let current_authority = prepared.record.role_lease_ids.iter().all(|role_lease_id| {
+            broker.task_role_leases.iter().any(|lease| {
+                lease.role_lease_id == *role_lease_id
+                    && lease.state == AuthorityLeaseState::Active
+                    && lease.generation == generation
+                    && broker.agent_host_sessions.iter().any(|session| {
+                        session.agent_session_id == lease.agent_session_id
+                            && session.state == AgentSessionState::Active
+                            && session.generation == generation
+                    })
+            })
+        });
+        ensure!(
+            current_authority,
+            "Published provider-plan authority is missing or stale; recovery is required"
+        );
+        fs::remove_dir_all(&staging_root)?;
+        return print_json(&provider_plan_seal_response(
+            &contract.run_id,
+            &seal_attempt_id,
+            generation,
+            &existing,
+            &prepared.manifest.manifest_sha256,
+        ));
     }
-    write_new_or_same_json(&plan_path, &plan)?;
-    if let Some(role_plan) = &role_evidence_plan {
-        write_new_or_same_json(&report_root.join("role-evidence-plan.json"), role_plan)?;
-        materialize_accepted_prior_roles(
-            &suite,
-            &contract,
-            &plan,
-            role_plan,
-            &report_root,
+    if dry_run {
+        fs::remove_dir_all(&staging_root)?;
+        return print_json(&json!({
+            "status": "provider_plan_seal_dry_run",
+            "run_id": contract.run_id,
+            "seal_attempt_id": seal_attempt_id,
+            "seal_generation": generation,
+            "provider_plan_hash": plan.plan_hash,
+            "staged_manifest_sha256": prepared.manifest.manifest_sha256,
+            "authority_side_effects": 0,
+            "planned_sessions": prepared.record.session_ids,
+            "planned_role_leases": prepared.record.role_lease_ids,
+            "planned_work_items": prepared.record.work_item_ids,
+            "planned_operation_jobs": prepared.record.operation_job_ids,
+        }));
+    }
+    let runtime_store =
+        crate::host_runtime::supervised_process::daemon_operation_runtime_handle(config_path)?;
+    if let Err(error) = runtime_store
+        .put_seal_staging(SealStagingCheckpoint {
+            schema_version: SEAL_STAGING_CHECKPOINT_SCHEMA_VERSION.to_owned(),
+            seal_attempt_id: seal_attempt_id.clone(),
+            run_id: contract.run_id.clone(),
+            generation,
+            staging_root: staging_root.display().to_string(),
+            manifest_sha256: prepared.manifest.manifest_sha256.clone(),
+            state: SealStagingState::Staged,
+            updated_at: OffsetDateTime::now_utc().to_string(),
+        })
+        .await
+    {
+        let _ = fs::remove_dir_all(&staging_root);
+        return Err(error).context("persist staged provider-plan seal checkpoint");
+    }
+    if let Err(error) = write_seal_record(&private_root, &record) {
+        let _ = fs::remove_dir_all(&staging_root);
+        let _ = runtime_store
+            .remove_seal_staging(seal_attempt_id.clone())
+            .await;
+        return Err(error).context("persist staged provider-plan seal record");
+    }
+    if let Err(error) =
+        activate_provider_seal_authority(config_path, &contract, &prepared.authority)
+    {
+        abandon_provider_seal(
+            config_path,
             &private_root,
+            Some(&plan_path),
+            &mut record,
+            &prepared.authority,
+            &error.to_string(),
+        )?;
+        let _ = runtime_store
+            .remove_seal_staging(seal_attempt_id.clone())
+            .await;
+        return Err(error.context("activate provider-plan seal authority"));
+    }
+    record.state = ProviderPlanSealState::Activated;
+    record.activated_at = Some(OffsetDateTime::now_utc());
+    let activated_checkpoint = SealStagingCheckpoint {
+        schema_version: SEAL_STAGING_CHECKPOINT_SCHEMA_VERSION.to_owned(),
+        seal_attempt_id: seal_attempt_id.clone(),
+        run_id: contract.run_id.clone(),
+        generation,
+        staging_root: staging_root.display().to_string(),
+        manifest_sha256: prepared.manifest.manifest_sha256.clone(),
+        state: SealStagingState::Activated,
+        updated_at: OffsetDateTime::now_utc().to_string(),
+    };
+    if let Err(error) = write_seal_record(&private_root, &record) {
+        abandon_provider_seal(
+            config_path,
+            &private_root,
+            Some(&plan_path),
+            &mut record,
+            &prepared.authority,
+            &error.to_string(),
+        )?;
+        let _ = runtime_store
+            .remove_seal_staging(seal_attempt_id.clone())
+            .await;
+        return Err(error).context("persist Activated provider-plan seal record");
+    }
+    if let Err(error) = runtime_store.put_seal_staging(activated_checkpoint).await {
+        abandon_provider_seal(
+            config_path,
+            &private_root,
+            Some(&plan_path),
+            &mut record,
+            &prepared.authority,
+            &error.to_string(),
+        )?;
+        let _ = runtime_store
+            .remove_seal_staging(seal_attempt_id.clone())
+            .await;
+        return Err(error).context("persist Activated provider-plan seal checkpoint");
+    }
+    let publish_result = (|| -> Result<()> {
+        ensure!(
+            !published_root.exists(),
+            "immutable seal generation root already exists"
+        );
+        fs::create_dir_all(
+            published_root
+                .parent()
+                .context("published seal root has no parent")?,
+        )?;
+        fs::rename(&staging_root, &published_root)?;
+        if let Some(role_plan) = &prepared.role_evidence_plan {
+            write_new_or_same_json(&report_root.join("role-evidence-plan.json"), role_plan)?;
+            materialize_accepted_prior_roles(
+                &suite,
+                &contract,
+                &plan,
+                role_plan,
+                &report_root,
+                &private_root,
+            )?;
+        }
+        write_new_or_same_json(&plan_path, &plan)?;
+        Ok(())
+    })();
+    if let Err(error) = publish_result {
+        abandon_provider_seal(
+            config_path,
+            &private_root,
+            Some(&plan_path),
+            &mut record,
+            &prepared.authority,
+            &error.to_string(),
+        )?;
+        let _ = runtime_store
+            .remove_seal_staging(seal_attempt_id.clone())
+            .await;
+        return Err(error.context("publish provider-plan seal"));
+    }
+    if let Err(error) = mark_provider_seal_jobs_published(config_path, &prepared.authority) {
+        abandon_provider_seal(
+            config_path,
+            &private_root,
+            Some(&plan_path),
+            &mut record,
+            &prepared.authority,
+            &error.to_string(),
+        )?;
+        let _ = runtime_store
+            .remove_seal_staging(seal_attempt_id.clone())
+            .await;
+        return Err(error).context("mark provider-plan authority published");
+    }
+    record.state = ProviderPlanSealState::Published;
+    record.published_at = Some(OffsetDateTime::now_utc());
+    if let Err(error) = write_seal_record(&private_root, &record) {
+        abandon_provider_seal(
+            config_path,
+            &private_root,
+            Some(&plan_path),
+            &mut record,
+            &prepared.authority,
+            &error.to_string(),
+        )?;
+        let _ = runtime_store
+            .remove_seal_staging(seal_attempt_id.clone())
+            .await;
+        return Err(error).context("persist Published provider-plan seal record");
+    }
+    runtime_store
+        .remove_seal_staging(seal_attempt_id.clone())
+        .await?;
+    if let Some(role_plan) = &prepared.role_evidence_plan {
+        ensure!(
+            report_root.join("role-evidence-plan.json").is_file()
+                && !role_plan.plan_hash.is_empty(),
+            "published role-evidence projection is missing"
+        );
+    }
+    print_json(&provider_plan_seal_response(
+        &contract.run_id,
+        &seal_attempt_id,
+        generation,
+        &plan,
+        &prepared.manifest.manifest_sha256,
+    ))
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "two-owner seal activation is intentionally kept as one auditable transactional state machine"
+)]
+fn activate_provider_seal_authority(
+    config_path: &Path,
+    contract: &CognitiveFieldRunContract,
+    authority: &[StagedSealAuthority],
+) -> Result<()> {
+    let root = crate::delegation_runtime::root_from_config(config_path);
+    let mut broker = crate::delegation_runtime::load_state(&root)?;
+    let mut work = crate::delegation_runtime::load_work_state(&root)?;
+    let mut next_broker = broker.clone();
+    let mut next_work = work.clone();
+    let mut grants = Vec::with_capacity(authority.len());
+    let now = OffsetDateTime::now_utc();
+    for entry in authority {
+        HostBrokerService.register_session_generation(
+            &mut next_broker,
+            entry.agent_session_id,
+            entry.host,
+            entry.host.as_str().to_owned(),
+            entry.client_instance_id.clone(),
+            AgentCapabilityEnvelope {
+                capabilities: entry.capability_scope.clone(),
+                structured_output: true,
+                resumable: true,
+                interactive: false,
+                supervised: true,
+            },
+            entry.operation_generation,
+            Some(entry.operation_job_id.clone()),
+        )?;
+        HostBrokerService.bind_session_scope(
+            &mut next_broker,
+            entry.agent_session_id,
+            entry.project_id,
+            entry.task_id,
+        )?;
+        let mut grant = HostBrokerService.prepare_role_grant(
+            &next_broker,
+            entry.task_id,
+            entry.agent_session_id,
+            AgentRole::Auditor,
+            entry.capability_scope.clone(),
+            30 * 24 * 60,
+            Some(entry.operation_job_id.clone()),
+        )?;
+        grant.role_lease_id.clone_from(&entry.role_lease_id);
+        grant.epoch = entry.role_lease_epoch;
+        grant.expires_at = entry.expires_at;
+        grants.push(grant);
+        if !next_work
+            .work_items
+            .iter()
+            .any(|item| item.work_item_id == entry.work_item_id)
+        {
+            next_work.work_items.push(WorkItem {
+                work_item_id: entry.work_item_id,
+                project_id: entry.project_id,
+                task_id: entry.task_id,
+                project: entry.project_id.to_string(),
+                task: entry.task_id.to_string(),
+                goal: format!(
+                    "cognitive field UnderstandingReader {} generation {}",
+                    entry.call_id, entry.operation_generation
+                ),
+                scope: WorkScope {
+                    repo_root: contract.primary_repository.clone(),
+                    read_set: vec![contract.primary_repository.clone()],
+                    write_set: Vec::new(),
+                    verifier_set: vec![format!(
+                        "cognitive-field-provider-verifier:{}:{}",
+                        contract.run_id, entry.call_id
+                    )],
+                    authority: eliot_types::AuthorityProfile::read_only(),
+                    risk_tier: eliot_types::RiskTier::Low,
+                    max_files: 0,
+                    requires_active_work_lease: false,
+                },
+                status: WorkItemStatus::Open,
+                required: true,
+                allowed_roles: vec![AgentRole::Auditor],
+                required_verifiers: Vec::new(),
+                created_by: entry.agent_session_id,
+                active_lease_id: None,
+                lease_refs: Vec::new(),
+                conflict_refs: Vec::new(),
+                created_at: now,
+                updated_at: now,
+                completed_at: None,
+                write_receipt: None,
+            });
+        }
+    }
+    let seal_attempt_id = authority.first().map_or_else(
+        || {
+            format!(
+                "provider-plan-seal:{}",
+                seal_attempt_component(&contract.run_id, 1)
+            )
+        },
+        |entry| {
+            format!(
+                "provider-plan-seal:{}",
+                seal_attempt_component(&contract.run_id, entry.operation_generation)
+            )
+        },
+    );
+    let activated = HostBrokerService.activate_role_grants(
+        &mut next_broker,
+        &grants,
+        &seal_attempt_id,
+        authority
+            .first()
+            .map_or(1, |entry| entry.operation_generation),
+    )?;
+    ensure!(
+        activated.len() == authority.len(),
+        "seal authority activation did not activate every prepared lease"
+    );
+    for entry in authority {
+        if !next_broker
+            .agent_invocations
+            .iter()
+            .any(|invocation| invocation.invocation_id == entry.invocation_id)
+        {
+            next_broker.agent_invocations.push(AgentInvocationRequest {
+                invocation_id: entry.invocation_id.clone(),
+                project_id: entry.project_id,
+                task_id: entry.task_id,
+                work_item_id: entry.work_item_id,
+                requested_capabilities: entry.capability_scope.clone(),
+                role_lease_id: entry.role_lease_id.clone(),
+                role_lease_epoch: entry.role_lease_epoch,
+                operation_generation: entry.operation_generation,
+                runtime_contract_sha256: Some(entry.runtime_contract_sha256.clone()),
+                work_lease_id: None,
+                packet_refs: Vec::new(),
+                expected_result_kind: "provider_execution_evidence".to_owned(),
+                verifier_ref: format!(
+                    "cognitive-field-provider-verifier:{}:{}",
+                    contract.run_id, entry.call_id
+                ),
+                idempotency_key: format!("cognitive-field:{}:{}", contract.run_id, entry.call_id),
+            });
+        }
+        if !next_broker
+            .operation_jobs
+            .iter()
+            .any(|job| job.job_id == entry.operation_job_id)
+        {
+            next_broker.operation_jobs.push(OperationJob {
+                job_id: entry.operation_job_id.clone(),
+                invocation_id: entry.invocation_id.clone(),
+                host_id: entry.host,
+                state: OperationJobState::Queued,
+                attempt: 0,
+                resume_session_id: None,
+                result_ref: None,
+                idempotency_key: format!("cognitive-field:{}:{}", contract.run_id, entry.call_id),
+                created_at: now,
+                updated_at: now,
+                generation: entry.operation_generation,
+                phase: OperationPhase::AuthorityActivating,
+                phase_started_at: Some(now),
+                last_progress_at: Some(now),
+                phase_deadline_at: None,
+                absolute_deadline_at: None,
+                restart_count: 0,
+                runtime_contract_sha256: Some(entry.runtime_contract_sha256.clone()),
+                role_lease_id: Some(entry.role_lease_id.clone()),
+                role_lease_epoch: Some(entry.role_lease_epoch),
+            });
+        }
+    }
+    crate::delegation_runtime::save_work_state(&root, &next_work)?;
+    crate::delegation_runtime::save_host_broker_state(&root, &next_broker)?;
+    broker = next_broker;
+    work = next_work;
+    ensure!(
+        broker.task_role_leases.iter().all(|lease| {
+            !authority
+                .iter()
+                .any(|entry| entry.role_lease_id == lease.role_lease_id)
+                || (lease.state == eliot_types::AuthorityLeaseState::Active
+                    && lease.generation
+                        == authority
+                            .iter()
+                            .find(|entry| entry.role_lease_id == lease.role_lease_id)
+                            .map_or(0, |entry| entry.operation_generation))
+        }) && work.work_items.iter().all(|item| {
+            !authority
+                .iter()
+                .any(|entry| entry.work_item_id == item.work_item_id)
+                || item.status == WorkItemStatus::Open
+        }),
+        "persisted provider-plan authority failed post-activation integrity"
+    );
+    Ok(())
+}
+
+fn mark_provider_seal_jobs_published(
+    config_path: &Path,
+    authority: &[StagedSealAuthority],
+) -> Result<()> {
+    let root = crate::delegation_runtime::root_from_config(config_path);
+    let mut broker = crate::delegation_runtime::load_state(&root)?;
+    let now = OffsetDateTime::now_utc();
+    for entry in authority {
+        let job = broker
+            .operation_jobs
+            .iter_mut()
+            .find(|job| job.job_id == entry.operation_job_id)
+            .context("activated seal operation job disappeared before publication")?;
+        ensure!(
+            job.generation == entry.operation_generation
+                && job.role_lease_epoch == Some(entry.role_lease_epoch),
+            "seal operation job generation fence changed before publication"
+        );
+        job.phase = OperationPhase::Published;
+        job.phase_started_at = Some(now);
+        job.last_progress_at = Some(now);
+        job.updated_at = now;
+    }
+    crate::delegation_runtime::save_host_broker_state(&root, &broker)
+}
+
+fn quarantine_tree_manifest(root: &Path) -> Result<Vec<SealArtifactEntry>> {
+    if !root.exists() {
+        return Ok(Vec::new());
+    }
+    let mut pending = vec![root.to_path_buf()];
+    let mut entries = Vec::new();
+    while let Some(path) = pending.pop() {
+        if path.is_dir() {
+            for child in fs::read_dir(&path)? {
+                pending.push(child?.path());
+            }
+        } else if path.is_file() {
+            let bytes = fs::read(&path)?;
+            entries.push(SealArtifactEntry {
+                logical_kind: "quarantined_seal_artifact".to_owned(),
+                relative_path: path
+                    .strip_prefix(root)
+                    .unwrap_or(&path)
+                    .to_string_lossy()
+                    .replace('\\', "/"),
+                sha256: sha256_bytes(&bytes),
+                size_bytes: u64::try_from(bytes.len()).unwrap_or(u64::MAX),
+            });
+        }
+    }
+    entries.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
+    Ok(entries)
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "seal compensation performs ordered fencing, quarantine, and receipt publication as one recovery state machine"
+)]
+fn abandon_provider_seal(
+    config_path: &Path,
+    private_root: &Path,
+    public_plan_path: Option<&Path>,
+    record: &mut ProviderPlanSealRecord,
+    authority: &[StagedSealAuthority],
+    error: &str,
+) -> Result<()> {
+    let root = crate::delegation_runtime::root_from_config(config_path);
+    let mut broker = crate::delegation_runtime::load_state(&root)?;
+    let mut work = crate::delegation_runtime::load_work_state(&root)?;
+    for entry in authority {
+        if let Some(lease) = broker
+            .task_role_leases
+            .iter()
+            .find(|lease| lease.role_lease_id == entry.role_lease_id)
+            .cloned()
+        {
+            HostBrokerService.revoke_role(
+                &mut broker,
+                &entry.role_lease_id,
+                lease.epoch,
+                "partial_seal_before_provider_plan",
+                Some(lease.epoch + 1),
+            )?;
+        }
+        if broker
+            .agent_host_sessions
+            .iter()
+            .any(|binding| binding.agent_session_id == entry.agent_session_id)
+        {
+            HostBrokerService.retire_session(
+                &mut broker,
+                entry.agent_session_id,
+                "partial_seal_before_provider_plan",
+            )?;
+        }
+        if broker
+            .operation_jobs
+            .iter()
+            .any(|job| job.job_id == entry.operation_job_id)
+        {
+            HostBrokerService.abandon_operation(
+                &mut broker,
+                &entry.operation_job_id,
+                "partial_seal_before_provider_plan",
+            )?;
+        }
+        if let Some(item) = work
+            .work_items
+            .iter_mut()
+            .find(|item| item.work_item_id == entry.work_item_id)
+        {
+            item.status = WorkItemStatus::Revoked;
+            item.updated_at = OffsetDateTime::now_utc();
+        }
+    }
+    crate::delegation_runtime::save_work_state(&root, &work)?;
+    crate::delegation_runtime::save_host_broker_state(&root, &broker)?;
+    let quarantine_root = private_root
+        .join("quarantine")
+        .join(seal_attempt_component(&record.run_id, record.generation));
+    fs::create_dir_all(&quarantine_root)?;
+    let mut quarantine_sources = vec![
+        PathBuf::from(&record.staging_root),
+        PathBuf::from(&record.published_root),
+    ];
+    quarantine_sources.extend(
+        public_plan_path
+            .filter(|path| path.exists())
+            .map(Path::to_path_buf),
+    );
+    for source in quarantine_sources {
+        if source.exists() {
+            let manifest = quarantine_tree_manifest(&source)?;
+            let target = quarantine_root.join(
+                source
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or("seal-artifacts"),
+            );
+            if !target.exists() {
+                fs::rename(&source, &target)?;
+            }
+            write_new_or_same_json(
+                &quarantine_root.join(format!(
+                    "{}-manifest.json",
+                    target
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .unwrap_or("seal")
+                )),
+                &manifest,
+            )?;
+        }
+    }
+    let revocation_refs = broker
+        .authority_revocation_receipts
+        .iter()
+        .filter(|receipt| {
+            authority
+                .iter()
+                .any(|entry| entry.role_lease_id == receipt.role_lease_id)
+        })
+        .map(|receipt| receipt.receipt_id.clone())
+        .collect::<Vec<_>>();
+    let abandoned = AbandonedSealAttemptRecord {
+        schema_version: ABANDONED_SEAL_ATTEMPT_SCHEMA_VERSION.to_owned(),
+        seal_attempt_id: record.seal_attempt_id.clone(),
+        run_id: record.run_id.clone(),
+        generation: record.generation,
+        recovery_state: SealRecoveryRecordState::Complete,
+        recovery_guarantee:
+            "ordered idempotent resumable recovery; no cross-file atomicity claimed".to_owned(),
+        failed_phase: record.state,
+        exact_error: error.to_owned(),
+        created_session_ids: record.session_ids.clone(),
+        created_role_lease_ids: record.role_lease_ids.clone(),
+        created_work_item_ids: record.work_item_ids.clone(),
+        created_operation_job_ids: record.operation_job_ids.clone(),
+        referenced_work_item_ids: record.work_item_ids.clone(),
+        referenced_invocation_ids: authority
+            .iter()
+            .map(|entry| entry.invocation_id.clone())
+            .collect(),
+        present_work_item_ids: record.work_item_ids.clone(),
+        present_operation_job_ids: record.operation_job_ids.clone(),
+        transitioned_work_item_ids: record.work_item_ids.clone(),
+        transitioned_operation_job_ids: record.operation_job_ids.clone(),
+        missing_projections: Vec::new(),
+        non_projection_proofs: Vec::new(),
+        recovery_steps: vec![SealRecoveryStep {
+            step: "abandon_provider_seal".to_owned(),
+            outcome: "complete".to_owned(),
+            detail: "all minted authority was revoked or abandoned before quarantine".to_owned(),
+            recorded_at: OffsetDateTime::now_utc(),
+        }],
+        quarantine_manifest_ref: private_relative_ref(private_root, &quarantine_root)?,
+        authority_revocation_refs: revocation_refs,
+        replacement_generation: Some(record.generation + 1),
+        recorded_at: OffsetDateTime::now_utc(),
+    };
+    crate::runtime_instance::atomic_write_json(
+        &private_root.join("abandoned-seals").join(format!(
+            "{}.json",
+            seal_attempt_component(&record.run_id, record.generation)
+        )),
+        &abandoned,
+    )?;
+    record.state = ProviderPlanSealState::Abandoned;
+    record.abandoned_at = Some(OffsetDateTime::now_utc());
+    record.failure_ref = Some(format!(
+        "abandoned-seals/{}.json",
+        seal_attempt_component(&record.run_id, record.generation)
+    ));
+    write_seal_record(private_root, record)
+}
+
+#[allow(dead_code, reason = "wired by SUP-03 startup reconciliation")]
+pub(crate) fn recover_incomplete_seal_checkpoint(
+    config_path: &Path,
+    checkpoint: &SealStagingCheckpoint,
+) -> Result<bool> {
+    let staging_root = PathBuf::from(&checkpoint.staging_root);
+    let private_root = staging_root
+        .parent()
+        .and_then(Path::parent)
+        .context("seal staging checkpoint has no private certification root")?;
+    let mut record = load_seal_records(private_root)?
+        .into_iter()
+        .find(|record| record.seal_attempt_id == checkpoint.seal_attempt_id)
+        .context("seal staging checkpoint has no matching seal record")?;
+    if matches!(
+        record.state,
+        ProviderPlanSealState::Published | ProviderPlanSealState::Abandoned
+    ) {
+        return Ok(true);
+    }
+    ensure!(
+        matches!(
+            record.state,
+            ProviderPlanSealState::Staged | ProviderPlanSealState::Activated
+        ),
+        "startup seal recovery found an unsupported seal state"
+    );
+    let root = crate::delegation_runtime::root_from_config(config_path);
+    let broker = crate::delegation_runtime::load_state(&root)?;
+    let mut authority = Vec::new();
+    for (index, role_lease_id) in record.role_lease_ids.iter().enumerate() {
+        let lease = broker
+            .task_role_leases
+            .iter()
+            .find(|lease| lease.role_lease_id == *role_lease_id)
+            .with_context(|| {
+                format!(
+                    "activated seal {} is missing role lease {}",
+                    record.seal_attempt_id, role_lease_id
+                )
+            })?;
+        let invocation = broker
+            .agent_invocations
+            .iter()
+            .find(|invocation| invocation.role_lease_id == *role_lease_id)
+            .context("activated seal role lease has no invocation")?;
+        let job = broker
+            .operation_jobs
+            .iter()
+            .find(|job| job.invocation_id == invocation.invocation_id)
+            .context("activated seal invocation has no OperationJob")?;
+        let session = broker
+            .agent_host_sessions
+            .iter()
+            .find(|session| session.agent_session_id == lease.agent_session_id)
+            .context("activated seal role lease has no AgentSession")?;
+        authority.push(StagedSealAuthority {
+            call_id: invocation.invocation_id.clone(),
+            host: job.host_id,
+            project_id: invocation.project_id,
+            task_id: invocation.task_id,
+            agent_session_id: lease.agent_session_id,
+            client_instance_id: session.host_identity.client_instance_id.clone(),
+            work_item_id: record
+                .work_item_ids
+                .get(index)
+                .copied()
+                .unwrap_or(invocation.work_item_id),
+            role_lease_id: role_lease_id.clone(),
+            role_lease_epoch: lease.epoch,
+            operation_generation: lease.generation,
+            runtime_contract_sha256: invocation
+                .runtime_contract_sha256
+                .clone()
+                .or_else(|| job.runtime_contract_sha256.clone())
+                .unwrap_or_else(|| sha256_bytes(b"unknown-runtime-contract")),
+            invocation_id: invocation.invocation_id.clone(),
+            operation_job_id: job.job_id.clone(),
+            capability_scope: lease.capability_scope.clone(),
+            expires_at: lease.expires_at,
+        });
+    }
+    let (report_root, _) = resolve_cognitive_run_roots(&record.run_id, None, Some(private_root))?;
+    abandon_provider_seal(
+        config_path,
+        private_root,
+        Some(&report_root.join("provider-plan.json")),
+        &mut record,
+        &authority,
+        "startup_recovery_incomplete_provider_plan_seal",
+    )?;
+    Ok(true)
+}
+
+fn resolve_cognitive_run_roots(
+    run_id: &str,
+    report_root: Option<&Path>,
+    private_root: Option<&Path>,
+) -> Result<(PathBuf, PathBuf)> {
+    ensure!(safe_segment(run_id), "cognitive run ID is unsafe");
+    let report = report_root.map_or_else(
+        || {
+            std::env::current_dir().map(|cwd| {
+                cwd.join("reports")
+                    .join("cognitive-field")
+                    .join("core-qualification")
+                    .join(run_id)
+            })
+        },
+        |path| Ok(path.to_path_buf()),
+    )?;
+    let private = private_root.map_or_else(
+        || {
+            std::env::var_os("LOCALAPPDATA").map_or_else(
+                || bail!("LOCALAPPDATA is required to locate the private cognitive run"),
+                |root| {
+                    Ok(PathBuf::from(root)
+                        .join("Eliot")
+                        .join("cognitive-field")
+                        .join("core-qualification")
+                        .join(run_id))
+                },
+            )
+        },
+        |path| Ok(path.to_path_buf()),
+    )?;
+    Ok((
+        canonical_directory(&report, "cognitive report root")?,
+        canonical_directory(&private, "private cognitive run root")?,
+    ))
+}
+
+fn recursive_files(root: &Path) -> Result<Vec<PathBuf>> {
+    if !root.exists() {
+        return Ok(Vec::new());
+    }
+    let mut pending = vec![root.to_path_buf()];
+    let mut files = Vec::new();
+    while let Some(path) = pending.pop() {
+        if path.is_dir() {
+            for child in fs::read_dir(path)? {
+                pending.push(child?.path());
+            }
+        } else if path.is_file() {
+            files.push(path);
+        }
+    }
+    files.sort();
+    Ok(files)
+}
+
+fn bytes_contain(haystack: &[u8], needle: &[u8]) -> bool {
+    !needle.is_empty()
+        && haystack
+            .windows(needle.len())
+            .any(|window| window == needle)
+}
+
+fn scan_projection_refs(
+    roots: &[PathBuf],
+    ids: &[String],
+) -> (usize, Vec<String>, Vec<String>, Vec<String>) {
+    let mut scanned_file_count = 0;
+    let mut scan_exclusions = Vec::new();
+    let mut scan_errors = Vec::new();
+    let mut matching_paths = Vec::new();
+    for root in roots {
+        let files = match recursive_files(root) {
+            Ok(files) => files,
+            Err(error) => {
+                scan_errors.push(format!("{}: {error:#}", root.display()));
+                continue;
+            }
+        };
+        for path in files {
+            if path
+                .extension()
+                .is_some_and(|extension| extension == "redb")
+            {
+                scan_exclusions.push(format!(
+                    "{}: ControlWal binary is not an authority projection owner and may be live-locked",
+                    path.display()
+                ));
+                continue;
+            }
+            scanned_file_count += 1;
+            match fs::read(&path) {
+                Ok(bytes) => {
+                    if ids.iter().any(|id| bytes_contain(&bytes, id.as_bytes())) {
+                        matching_paths.push(path.display().to_string());
+                    }
+                }
+                Err(error) => scan_errors.push(format!("{}: {error}", path.display())),
+            }
+        }
+    }
+    scan_exclusions.sort();
+    scan_exclusions.dedup();
+    matching_paths.sort();
+    matching_paths.dedup();
+    (
+        scanned_file_count,
+        scan_exclusions,
+        scan_errors,
+        matching_paths,
+    )
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the proof constructor records every independently verified absence condition"
+)]
+fn build_non_projection_proof(
+    authority_kind: &str,
+    owner_store_path: &Path,
+    owner_record_count: usize,
+    first_request_modified_at: OffsetDateTime,
+    scan_roots: &[PathBuf],
+    referenced_ids: &[String],
+    require_owner_predates_request: bool,
+    source_evidence_ref: Option<String>,
+) -> Result<NonProjectionProof> {
+    ensure!(
+        owner_store_path.is_file(),
+        "{authority_kind} owner store is absent: {}",
+        owner_store_path.display()
+    );
+    let owner_store_modified_at = OffsetDateTime::from(fs::metadata(owner_store_path)?.modified()?);
+    let owner_store_predates_first_request = owner_store_modified_at < first_request_modified_at;
+    let (scanned_file_count, scan_exclusions, scan_errors, matching_paths) =
+        scan_projection_refs(scan_roots, referenced_ids);
+    let owner_store_load_ok = true;
+    let complete = owner_store_load_ok
+        && owner_record_count > 0
+        && scan_errors.is_empty()
+        && matching_paths.is_empty()
+        && ((!require_owner_predates_request || owner_store_predates_first_request)
+            && (require_owner_predates_request || source_evidence_ref.is_some()));
+    Ok(NonProjectionProof {
+        schema_version: "eliot-non-projection-proof-v1".to_owned(),
+        authority_kind: authority_kind.to_owned(),
+        owner_store_path: owner_store_path.display().to_string(),
+        owner_store_load_ok,
+        owner_record_count,
+        owner_store_modified_at,
+        first_request_modified_at,
+        owner_store_predates_first_request,
+        scan_roots: scan_roots
+            .iter()
+            .map(|path| path.display().to_string())
+            .collect(),
+        scanned_file_count,
+        scan_exclusions,
+        scan_errors,
+        matching_paths,
+        source_evidence_ref,
+        complete,
+    })
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "run recovery inspection is a single fail-closed classification over all seal evidence"
+)]
+fn inspect_seal_recovery(
+    config_path: &Path,
+    run_id: &str,
+    report_root: &Path,
+    private_root: &Path,
+) -> Result<SealRecoveryInspection> {
+    let calls: Vec<CognitiveFieldProviderCallPlan> = read_json(&private_root.join("calls.json"))?;
+    let external_calls = calls
+        .iter()
+        .filter(|call| call.host != AgentHostId::Codex)
+        .collect::<Vec<_>>();
+    let root = crate::delegation_runtime::root_from_config(config_path);
+    let broker = crate::delegation_runtime::load_state(&root)?;
+    let work = crate::delegation_runtime::load_work_state(&root)?;
+    let mut execution_request_paths = Vec::new();
+    let mut provider_runtime_paths = Vec::new();
+    let mut session_ids = Vec::new();
+    let mut role_lease_ids = Vec::new();
+    let mut referenced_work_item_ids = Vec::new();
+    let mut referenced_invocation_ids = Vec::new();
+    let mut present_work_item_ids = Vec::new();
+    let mut present_operation_job_ids = Vec::new();
+    let mut invocation_ids = Vec::new();
+    let mut requests = Vec::new();
+    let mut request_modified_at = Vec::new();
+    for call in &external_calls {
+        let request_path = private_root
+            .join("runtime")
+            .join(format!("{}-execution-request.json", call.call_id));
+        let runtime_path = private_root
+            .join("runtime")
+            .join(format!("{}-provider-runtime.json", call.call_id));
+        if request_path.is_file() {
+            let request: ExternalAgentExecutionRequest = read_json(&request_path)?;
+            execution_request_paths.push(private_relative_ref(private_root, &request_path)?);
+            invocation_ids.push(request.invocation.invocation_id.clone());
+            referenced_invocation_ids.push(request.invocation.invocation_id.clone());
+            referenced_work_item_ids.push(request.invocation.work_item_id);
+            request_modified_at.push(OffsetDateTime::from(
+                fs::metadata(&request_path)?.modified()?,
+            ));
+            if let Some(session_id) = request.launch_contract.agent_session_id
+                && broker
+                    .agent_host_sessions
+                    .iter()
+                    .any(|binding| binding.agent_session_id == session_id)
+            {
+                session_ids.push(session_id);
+            }
+            if broker
+                .task_role_leases
+                .iter()
+                .any(|lease| lease.role_lease_id == request.invocation.role_lease_id)
+            {
+                role_lease_ids.push(request.invocation.role_lease_id.clone());
+            }
+            if work
+                .work_items
+                .iter()
+                .any(|item| item.work_item_id == request.invocation.work_item_id)
+            {
+                present_work_item_ids.push(request.invocation.work_item_id);
+            }
+            present_operation_job_ids.extend(
+                broker
+                    .operation_jobs
+                    .iter()
+                    .filter(|job| job.invocation_id == request.invocation.invocation_id)
+                    .map(|job| job.job_id.clone()),
+            );
+            requests.push(request);
+        }
+        if runtime_path.is_file() {
+            provider_runtime_paths.push(private_relative_ref(private_root, &runtime_path)?);
+        }
+    }
+    execution_request_paths.sort();
+    provider_runtime_paths.sort();
+    session_ids.sort();
+    session_ids.dedup();
+    role_lease_ids.sort();
+    role_lease_ids.dedup();
+    referenced_work_item_ids.sort();
+    referenced_work_item_ids.dedup();
+    referenced_invocation_ids.sort();
+    referenced_invocation_ids.dedup();
+    present_work_item_ids.sort();
+    present_work_item_ids.dedup();
+    present_operation_job_ids.sort();
+    present_operation_job_ids.dedup();
+    let present_invocation_ids = broker
+        .operation_jobs
+        .iter()
+        .filter(|job| referenced_invocation_ids.contains(&job.invocation_id))
+        .map(|job| job.invocation_id.clone())
+        .collect::<BTreeSet<_>>();
+    let missing_work_item_ids = referenced_work_item_ids
+        .iter()
+        .filter(|id| !present_work_item_ids.contains(id))
+        .copied()
+        .collect::<Vec<_>>();
+    let missing_invocation_ids = referenced_invocation_ids
+        .iter()
+        .filter(|id| !present_invocation_ids.contains(*id))
+        .cloned()
+        .collect::<Vec<_>>();
+    let scoped_session_ids = broker
+        .agent_host_sessions
+        .iter()
+        .filter(|binding| {
+            binding
+                .host_identity
+                .client_instance_id
+                .starts_with(&format!("cognitive-field:{run_id}:"))
+        })
+        .map(|binding| binding.agent_session_id)
+        .collect::<BTreeSet<_>>();
+    let expected_session_ids = session_ids.iter().copied().collect::<BTreeSet<_>>();
+    let scoped_role_lease_ids = broker
+        .task_role_leases
+        .iter()
+        .filter(|lease| expected_session_ids.contains(&lease.agent_session_id))
+        .map(|lease| lease.role_lease_id.clone())
+        .collect::<BTreeSet<_>>();
+    let expected_role_lease_ids = role_lease_ids.iter().cloned().collect::<BTreeSet<_>>();
+    let scoped_authority_exact = scoped_session_ids == expected_session_ids
+        && scoped_role_lease_ids == expected_role_lease_ids;
+    let legacy_authority_cas_ready = session_ids.iter().all(|id| {
+        broker.agent_host_sessions.iter().any(|binding| {
+            binding.agent_session_id == *id
+                && binding.state == AgentSessionState::Active
+                && binding.generation == 0
+                && binding.owner_operation_id.is_none()
+        })
+    }) && role_lease_ids.iter().all(|id| {
+        broker.task_role_leases.iter().any(|lease| {
+            lease.role_lease_id == *id
+                && lease.state == AuthorityLeaseState::Active
+                && lease.generation == 0
+                && lease.owner_operation_id.is_none()
+                && lease.seal_attempt_id.is_none()
+        })
+    });
+    let work_bindings_valid = present_work_item_ids.iter().all(|id| {
+        let Some(item) = work.work_items.iter().find(|item| item.work_item_id == *id) else {
+            return false;
+        };
+        requests.iter().any(|request| {
+            request.invocation.work_item_id == *id
+                && item.project_id == request.invocation.project_id
+                && item.task_id == request.invocation.task_id
+                && request
+                    .launch_contract
+                    .agent_session_id
+                    .is_none_or(|session_id| item.created_by == session_id)
+        })
+    });
+    let job_bindings_valid = broker
+        .operation_jobs
+        .iter()
+        .filter(|job| referenced_invocation_ids.contains(&job.invocation_id))
+        .all(|job| {
+            requests.iter().any(|request| {
+                request.invocation.invocation_id == job.invocation_id
+                    && job.generation == 0
+                    && job.role_lease_id.as_deref()
+                        == Some(request.invocation.role_lease_id.as_str())
+            })
+        });
+    let mut non_projection_proofs = Vec::new();
+    if let Some(first_request_modified_at) = request_modified_at.iter().min().copied() {
+        let scan_roots = vec![root.join("reports"), root.join("control")];
+        if present_work_item_ids.is_empty() && !referenced_work_item_ids.is_empty() {
+            non_projection_proofs.push(build_non_projection_proof(
+                "work_item",
+                &root.join("reports/work/state.json"),
+                work.work_items.len(),
+                first_request_modified_at,
+                &scan_roots,
+                &referenced_work_item_ids
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>(),
+                true,
+                None,
+            )?);
+        }
+        if present_operation_job_ids.is_empty() && !referenced_invocation_ids.is_empty() {
+            non_projection_proofs.push(build_non_projection_proof(
+                "operation_job",
+                &root.join("reports/delegation-state/latest.json"),
+                broker.operation_jobs.len(),
+                first_request_modified_at,
+                &scan_roots,
+                &referenced_invocation_ids,
+                false,
+                Some(
+                    "git:8d2db4a:crates/eliot-app/src/cognitive_field_runner.rs\
+                     #cognitive_external_execution_request_minted_ids_without_job_projection"
+                        .to_owned(),
+                ),
+            )?);
+        }
+    }
+    let work_projection_safe = (present_work_item_ids.len() == 4
+        && missing_work_item_ids.is_empty()
+        && work_bindings_valid)
+        || (present_work_item_ids.is_empty()
+            && non_projection_proofs
+                .iter()
+                .any(|proof| proof.authority_kind == "work_item" && proof.complete));
+    let job_projection_safe = (present_operation_job_ids.len() == 4
+        && missing_invocation_ids.is_empty()
+        && job_bindings_valid)
+        || (present_operation_job_ids.is_empty()
+            && non_projection_proofs
+                .iter()
+                .any(|proof| proof.authority_kind == "operation_job" && proof.complete));
+    let call_ids = external_calls
+        .iter()
+        .map(|call| call.call_id.as_str())
+        .collect::<Vec<_>>();
+    let provider_reservation_count = broker
+        .provider_call_reservations
+        .iter()
+        .filter(|reservation| {
+            serde_json::to_string(reservation)
+                .ok()
+                .is_some_and(|value| call_ids.iter().any(|call_id| value.contains(call_id)))
+        })
+        .count();
+    let provider_result_count = broker
+        .agent_results
+        .iter()
+        .filter(|result| invocation_ids.contains(&result.invocation_id))
+        .count();
+    let provider_artifact_paths = recursive_files(private_root)?
+        .into_iter()
+        .filter(|path| {
+            let relative = path
+                .strip_prefix(private_root)
+                .unwrap_or(path)
+                .to_string_lossy()
+                .replace('\\', "/");
+            !relative.starts_with("runtime/")
+                && call_ids.iter().any(|call_id| relative.contains(call_id))
+                && (relative.contains("spool")
+                    || relative.contains("raw")
+                    || relative.starts_with("outputs/")
+                    || relative.starts_with("receipts/provider-"))
+        })
+        .map(|path| private_relative_ref(private_root, &path))
+        .collect::<Result<Vec<_>>>()?;
+    let provider_plan_present = report_root.join("provider-plan.json").is_file();
+    let abandoned_exists = load_seal_records(private_root)?.iter().any(|record| {
+        record.run_id == run_id
+            && record.generation == 1
+            && record.state == ProviderPlanSealState::Abandoned
+    });
+    let exact_partial_shape = external_calls.len() == 4
+        && execution_request_paths.len() == 4
+        && provider_runtime_paths.len() == 4
+        && session_ids.len() == 4
+        && role_lease_ids.len() == 4
+        && referenced_work_item_ids.len() == 4
+        && referenced_invocation_ids.len() == 4
+        && scoped_authority_exact
+        && legacy_authority_cas_ready
+        && work_projection_safe
+        && job_projection_safe
+        && !provider_plan_present
+        && provider_reservation_count == 0
+        && provider_result_count == 0
+        && provider_artifact_paths.is_empty();
+    let decision = if abandoned_exists {
+        SealRecoveryDecision::AlreadyAbandoned
+    } else if provider_reservation_count > 0
+        || provider_result_count > 0
+        || !provider_artifact_paths.is_empty()
+    {
+        SealRecoveryDecision::BlockedProviderEvidence
+    } else if exact_partial_shape {
+        SealRecoveryDecision::AbandonAndRevokeSafePredispatch
+    } else {
+        SealRecoveryDecision::BlockedIntegrityMismatch
+    };
+    let mut integrity_errors = Vec::new();
+    if !scoped_authority_exact {
+        integrity_errors.push("scoped session/lease sets differ from the four request bindings");
+    }
+    if !legacy_authority_cas_ready {
+        integrity_errors.push("legacy authority is not Active generation-0 CAS-ready");
+    }
+    if !work_projection_safe {
+        integrity_errors.push("WorkItem projection is partial, misbound, or lacks absence proof");
+    }
+    if !job_projection_safe {
+        integrity_errors
+            .push("OperationJob projection is partial, misbound, or lacks absence proof");
+    }
+    Ok(SealRecoveryInspection {
+        schema_version: "eliot-seal-recovery-inspection-v1".to_owned(),
+        run_id: run_id.to_owned(),
+        generation: 1,
+        decision,
+        execution_request_paths,
+        provider_runtime_paths,
+        session_ids,
+        role_lease_ids,
+        referenced_work_item_ids,
+        referenced_invocation_ids,
+        present_work_item_ids,
+        present_operation_job_ids,
+        missing_work_item_ids,
+        missing_invocation_ids,
+        non_projection_proofs,
+        scoped_authority_exact,
+        legacy_authority_cas_ready,
+        provider_plan_present,
+        provider_reservation_count,
+        provider_result_count,
+        provider_artifact_paths,
+        exact_error: (decision == SealRecoveryDecision::BlockedIntegrityMismatch).then(|| {
+            if integrity_errors.is_empty() {
+                "partial seal shape differs from the exact four-call run006 contract".to_owned()
+            } else {
+                integrity_errors.join("; ")
+            }
+        }),
+    })
+}
+
+pub fn seal_status(
+    config_path: &Path,
+    run_id: &str,
+    report_root: Option<&Path>,
+    private_root: Option<&Path>,
+) -> Result<()> {
+    let (report_root, private_root) =
+        resolve_cognitive_run_roots(run_id, report_root, private_root)?;
+    let inspection = inspect_seal_recovery(config_path, run_id, &report_root, &private_root)?;
+    let records = load_seal_records(&private_root)?;
+    print_json(&json!({
+        "component": "cognitive_field_seal_status",
+        "run_id": run_id,
+        "inspection": inspection,
+        "seal_records": records,
+    }))
+}
+
+#[allow(clippy::too_many_lines)]
+pub fn recover_seal(
+    config_path: &Path,
+    run_id: &str,
+    report_root: Option<&Path>,
+    private_root: Option<&Path>,
+    dry_run: bool,
+    apply: bool,
+) -> Result<()> {
+    ensure!(
+        dry_run ^ apply,
+        "recover-seal requires exactly one of --dry-run or --apply"
+    );
+    let (report_root, private_root) =
+        resolve_cognitive_run_roots(run_id, report_root, private_root)?;
+    let inspection = inspect_seal_recovery(config_path, run_id, &report_root, &private_root)?;
+    if dry_run || inspection.decision == SealRecoveryDecision::AlreadyAbandoned {
+        return print_json(&inspection);
+    }
+    ensure!(
+        inspection.decision == SealRecoveryDecision::AbandonAndRevokeSafePredispatch,
+        "seal recovery is not safe to apply: {:?}",
+        inspection.decision
+    );
+    let root = crate::delegation_runtime::root_from_config(config_path);
+    let seal_attempt_id = format!("provider-plan-seal:legacy-{run_id}-generation-1");
+    let quarantine_root = private_root
+        .join("quarantine")
+        .join(seal_attempt_component(run_id, 1));
+    let manifest_path = quarantine_root.join("generation-1-manifest.json");
+    let abandoned_path = private_root
+        .join("abandoned-seals")
+        .join(format!("{}.json", seal_attempt_component(run_id, 1)));
+    let mut manifest = SealArtifactManifest {
+        schema_version: SEAL_ARTIFACT_MANIFEST_SCHEMA_VERSION.to_owned(),
+        seal_attempt_id: seal_attempt_id.clone(),
+        run_id: run_id.to_owned(),
+        generation: 1,
+        entries: Vec::new(),
+        manifest_sha256: String::new(),
+    };
+    for relative in inspection
+        .execution_request_paths
+        .iter()
+        .chain(&inspection.provider_runtime_paths)
+    {
+        let source = private_root.join(relative);
+        let bytes = fs::read(&source)?;
+        manifest.entries.push(SealArtifactEntry {
+            logical_kind: if relative.ends_with("-execution-request.json") {
+                "execution_request".to_owned()
+            } else {
+                "provider_runtime".to_owned()
+            },
+            relative_path: relative.clone(),
+            sha256: sha256_bytes(&bytes),
+            size_bytes: u64::try_from(bytes.len()).unwrap_or(u64::MAX),
+        });
+    }
+    manifest
+        .entries
+        .sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
+    ensure!(
+        manifest.entries.len() == 8,
+        "legacy seal recovery must hash exactly eight immutable artifacts before mutation"
+    );
+    manifest.manifest_sha256 = seal_manifest_hash(&manifest)?;
+    let missing_projections = inspection
+        .missing_work_item_ids
+        .iter()
+        .map(|id| MissingAuthorityProjection {
+            authority_kind: "work_item".to_owned(),
+            referenced_id: id.to_string(),
+            reason: "never_projected".to_owned(),
+        })
+        .chain(
+            inspection
+                .missing_invocation_ids
+                .iter()
+                .map(|id| MissingAuthorityProjection {
+                    authority_kind: "operation_job".to_owned(),
+                    referenced_id: id.clone(),
+                    reason: "never_projected".to_owned(),
+                }),
+        )
+        .collect::<Vec<_>>();
+    let mut abandoned = AbandonedSealAttemptRecord {
+        schema_version: ABANDONED_SEAL_ATTEMPT_SCHEMA_VERSION.to_owned(),
+        seal_attempt_id: seal_attempt_id.clone(),
+        run_id: run_id.to_owned(),
+        generation: 1,
+        recovery_state: SealRecoveryRecordState::InProgress,
+        recovery_guarantee:
+            "ordered idempotent resumable recovery; no cross-file atomicity claimed".to_owned(),
+        failed_phase: ProviderPlanSealState::Activated,
+        exact_error: "partial seal before provider-plan publication".to_owned(),
+        created_session_ids: inspection.session_ids.clone(),
+        created_role_lease_ids: inspection.role_lease_ids.clone(),
+        created_work_item_ids: inspection.present_work_item_ids.clone(),
+        created_operation_job_ids: inspection.present_operation_job_ids.clone(),
+        referenced_work_item_ids: inspection.referenced_work_item_ids.clone(),
+        referenced_invocation_ids: inspection.referenced_invocation_ids.clone(),
+        present_work_item_ids: inspection.present_work_item_ids.clone(),
+        present_operation_job_ids: inspection.present_operation_job_ids.clone(),
+        transitioned_work_item_ids: Vec::new(),
+        transitioned_operation_job_ids: Vec::new(),
+        missing_projections,
+        non_projection_proofs: inspection.non_projection_proofs.clone(),
+        recovery_steps: vec![SealRecoveryStep {
+            step: "pre_mutation_inventory".to_owned(),
+            outcome: "complete".to_owned(),
+            detail: format!(
+                "hashed {} immutable files; pre-provider and non-projection gates passed",
+                manifest.entries.len()
+            ),
+            recorded_at: OffsetDateTime::now_utc(),
+        }],
+        quarantine_manifest_ref: private_relative_ref(&private_root, &manifest_path)?,
+        authority_revocation_refs: Vec::new(),
+        replacement_generation: Some(2),
+        recorded_at: OffsetDateTime::now_utc(),
+    };
+    crate::runtime_instance::atomic_write_json(&abandoned_path, &abandoned)?;
+    let mut broker = crate::delegation_runtime::load_state(&root)?;
+    let mut work = crate::delegation_runtime::load_work_state(&root)?;
+    for role_lease_id in &inspection.role_lease_ids {
+        let lease = broker
+            .task_role_leases
+            .iter()
+            .find(|lease| lease.role_lease_id == *role_lease_id)
+            .cloned()
+            .context("run006 role lease disappeared before typed recovery")?;
+        HostBrokerService.revoke_role(
+            &mut broker,
+            role_lease_id,
+            lease.epoch,
+            "partial_seal_before_provider_plan",
+            Some(lease.epoch + 1),
         )?;
     }
+    for session_id in &inspection.session_ids {
+        HostBrokerService.retire_session(
+            &mut broker,
+            *session_id,
+            "partial_seal_before_provider_plan",
+        )?;
+    }
+    for job_id in &inspection.present_operation_job_ids {
+        HostBrokerService.abandon_operation(
+            &mut broker,
+            job_id,
+            "partial_seal_before_provider_plan",
+        )?;
+        abandoned
+            .transitioned_operation_job_ids
+            .push(job_id.clone());
+    }
+    for work_item_id in &inspection.present_work_item_ids {
+        let item = work
+            .work_items
+            .iter_mut()
+            .find(|item| item.work_item_id == *work_item_id)
+            .context("run006 WorkItem disappeared before typed recovery")?;
+        item.status = WorkItemStatus::Revoked;
+        item.updated_at = OffsetDateTime::now_utc();
+        abandoned.transitioned_work_item_ids.push(*work_item_id);
+    }
+    if !abandoned.transitioned_work_item_ids.is_empty() {
+        crate::delegation_runtime::save_work_state(&root, &work)?;
+    }
+    crate::delegation_runtime::save_host_broker_state(&root, &broker)?;
+    abandoned.recovery_steps.push(SealRecoveryStep {
+        step: "authority_compensation".to_owned(),
+        outcome: "complete".to_owned(),
+        detail: format!(
+            "revoked {} leases, retired {} sessions, abandoned {} jobs and {} WorkItems",
+            inspection.role_lease_ids.len(),
+            inspection.session_ids.len(),
+            abandoned.transitioned_operation_job_ids.len(),
+            abandoned.transitioned_work_item_ids.len()
+        ),
+        recorded_at: OffsetDateTime::now_utc(),
+    });
+    crate::runtime_instance::atomic_write_json(&abandoned_path, &abandoned)?;
+    fs::create_dir_all(quarantine_root.join("runtime"))?;
+    for entry in &manifest.entries {
+        let relative = &entry.relative_path;
+        let source = private_root.join(relative);
+        let target = quarantine_root.join(relative);
+        fs::create_dir_all(target.parent().context("quarantine target has no parent")?)?;
+        fs::rename(&source, &target)?;
+        let quarantined = fs::read(&target)?;
+        ensure!(
+            sha256_bytes(&quarantined) == entry.sha256
+                && u64::try_from(quarantined.len()).unwrap_or(u64::MAX) == entry.size_bytes,
+            "quarantined artifact differs from its pre-mutation digest: {}",
+            target.display()
+        );
+    }
+    write_new_or_same_json(&manifest_path, &manifest)?;
+    abandoned.recovery_steps.push(SealRecoveryStep {
+        step: "artifact_quarantine".to_owned(),
+        outcome: "complete".to_owned(),
+        detail: "all eight post-move digests equal their pre-move digests".to_owned(),
+        recorded_at: OffsetDateTime::now_utc(),
+    });
+    crate::runtime_instance::atomic_write_json(&abandoned_path, &abandoned)?;
+    let fresh_broker = crate::delegation_runtime::load_state(&root)?;
+    let fresh_work = crate::delegation_runtime::load_work_state(&root)?;
+    ensure!(
+        inspection.role_lease_ids.iter().all(|role_lease_id| {
+            fresh_broker.task_role_leases.iter().any(|lease| {
+                lease.role_lease_id == *role_lease_id
+                    && lease.state == AuthorityLeaseState::Revoked
+                    && lease.revoke_reason.as_deref() == Some("partial_seal_before_provider_plan")
+            })
+        }),
+        "fresh post-recovery load found a role lease that was not revoked"
+    );
+    ensure!(
+        inspection.session_ids.iter().all(|session_id| {
+            fresh_broker.agent_host_sessions.iter().any(|binding| {
+                binding.agent_session_id == *session_id
+                    && binding.state == AgentSessionState::Retired
+                    && binding.disconnect_reason.as_deref()
+                        == Some("partial_seal_before_provider_plan")
+            })
+        }),
+        "fresh post-recovery load found a session that was not retired"
+    );
+    ensure!(
+        inspection
+            .referenced_work_item_ids
+            .iter()
+            .all(|work_item_id| {
+                fresh_work
+                    .work_items
+                    .iter()
+                    .find(|item| item.work_item_id == *work_item_id)
+                    .is_none_or(|item| item.status == WorkItemStatus::Revoked)
+            }),
+        "fresh post-recovery load found an active matching WorkItem"
+    );
+    ensure!(
+        inspection
+            .referenced_invocation_ids
+            .iter()
+            .all(|invocation_id| {
+                fresh_broker
+                    .operation_jobs
+                    .iter()
+                    .filter(|job| job.invocation_id == *invocation_id)
+                    .all(|job| job.state == OperationJobState::Abandoned)
+            }),
+        "fresh post-recovery load found an active matching OperationJob"
+    );
+    abandoned.authority_revocation_refs = fresh_broker
+        .authority_revocation_receipts
+        .iter()
+        .filter(|receipt| inspection.role_lease_ids.contains(&receipt.role_lease_id))
+        .map(|receipt| receipt.receipt_id.clone())
+        .collect::<Vec<_>>();
+    abandoned.recovery_steps.push(SealRecoveryStep {
+        step: "fresh_postcondition_reload".to_owned(),
+        outcome: "complete".to_owned(),
+        detail: "no active matching session, lease, WorkItem, or OperationJob remains".to_owned(),
+        recorded_at: OffsetDateTime::now_utc(),
+    });
+    let record = ProviderPlanSealRecord {
+        schema_version: PROVIDER_PLAN_SEAL_RECORD_SCHEMA_VERSION.to_owned(),
+        seal_attempt_id,
+        run_id: run_id.to_owned(),
+        generation: 1,
+        state: ProviderPlanSealState::Abandoned,
+        contract_sha256: read_json::<CognitiveFieldRunContract>(&report_root.join("contract.json"))
+            .and_then(|contract| serde_json::to_vec(&contract).map_err(Into::into))
+            .map(|bytes| sha256_bytes(&bytes))?,
+        role_evidence_plan_sha256: sha256_bytes(b"legacy-partial-seal"),
+        staged_manifest_sha256: manifest.manifest_sha256.clone(),
+        provider_plan_sha256: None,
+        session_ids: inspection.session_ids.clone(),
+        role_lease_ids: inspection.role_lease_ids.clone(),
+        work_item_ids: inspection.present_work_item_ids.clone(),
+        operation_job_ids: inspection.present_operation_job_ids.clone(),
+        staging_root: private_root.join("runtime").display().to_string(),
+        published_root: String::new(),
+        activated_at: None,
+        published_at: None,
+        abandoned_at: Some(OffsetDateTime::now_utc()),
+        failure_ref: Some(private_relative_ref(&private_root, &abandoned_path)?),
+    };
+    write_seal_record(&private_root, &record)?;
+    abandoned.recovery_state = SealRecoveryRecordState::Complete;
+    abandoned.recovery_steps.push(SealRecoveryStep {
+        step: "typed_abandonment_publication".to_owned(),
+        outcome: "complete".to_owned(),
+        detail: "generation-1 seal is Abandoned and generation 2 may be minted".to_owned(),
+        recorded_at: OffsetDateTime::now_utc(),
+    });
+    crate::runtime_instance::atomic_write_json(&abandoned_path, &abandoned)?;
+    let after = inspect_seal_recovery(config_path, run_id, &report_root, &private_root)?;
+    ensure!(
+        after.decision == SealRecoveryDecision::AlreadyAbandoned
+            && after.provider_result_count == 0
+            && after.provider_reservation_count == 0,
+        "run006 recovery did not converge to an idempotent abandoned state"
+    );
     print_json(&json!({
-        "status": "provider_plan_sealed",
-        "run_id": contract.run_id,
-        "provider_plan_hash": plan.plan_hash,
-        "planned_provider_calls": plan.planned_provider_calls,
-        "planned_smoke_calls": plan.planned_smoke_calls,
-        "planned_reused_roles": plan.planned_reused_roles,
-        "total_calls": plan.calls.len(),
+        "status": "seal_recovery_applied",
+        "decision": "ABANDON_AND_REVOKE_SAFE_PREDISPATCH",
+        "run_id": run_id,
+        "generation": 1,
+        "replacement_generation": 2,
+        "quarantine_manifest": private_relative_ref(&private_root, &manifest_path)?,
+        "quarantined_files": manifest.entries.len(),
+        "provider_calls": 0,
     }))
 }
 
@@ -1809,6 +4092,19 @@ pub async fn execute_provider(
     let plan: CognitiveFieldProviderPlan = read_json(&report_root.join("provider-plan.json"))?;
     validate_report_roots(&contract, &report_root, &private_root)?;
     validate_provider_plan_hash(&plan)?;
+    let seal_attempt_id = plan
+        .seal_attempt_id
+        .as_deref()
+        .context("provider plan has no transactional seal attempt binding")?;
+    let seal_record: ProviderPlanSealRecord =
+        read_json(&seal_record_path(&private_root, seal_attempt_id))?;
+    let provider_plan_sha256 = sha256_bytes(&encode_pretty_json(&plan)?);
+    ensure!(
+        seal_record.state == ProviderPlanSealState::Published
+            && seal_record.generation == plan.seal_generation
+            && seal_record.provider_plan_sha256.as_deref() == Some(provider_plan_sha256.as_str()),
+        "provider dispatch is fenced until the transactional seal is Published"
+    );
     let call = plan
         .calls
         .iter()
@@ -1852,10 +4148,10 @@ pub async fn execute_provider(
             session_id: Some(agent_session_id),
             trace_id: format!("cognitive-field:{}:{call_id}", contract.run_id),
             created_at: OffsetDateTime::now_utc(),
-            role_lease_id: None,
-            role_lease_epoch: None,
-            operation_generation: None,
-            runtime_contract_sha256: None,
+            role_lease_id: Some(execution.invocation.role_lease_id.clone()),
+            role_lease_epoch: Some(execution.invocation.role_lease_epoch),
+            operation_generation: Some(execution.invocation.operation_generation),
+            runtime_contract_sha256: Some(call.runtime_contract_sha256.clone()),
         },
         input: serde_json::to_value(&execution)?,
     };
@@ -5312,24 +7608,30 @@ fn print_json<T: Serialize>(value: &T) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        CognitiveHarnessOnlyEquivalence, CoreRoleEvidenceSource,
-        LEGACY_EVIDENCE_ADMISSION_SCHEMA_VERSION, LEGACY_WORKER_ACCEPTANCE_RUN_ID,
-        LEGACY_WORKER_CASE_ID, LEGACY_WORKER_MISSING_FIELD, LEGACY_WORKER_SOURCE_CALL_ID,
-        LEGACY_WORKER_SOURCE_RUN_ID, LegacyEvidenceAdmissionRecord, READER_SCHEMA_JSON_PLACEHOLDER,
-        READER_SCHEMA_SHA256_PLACEHOLDER, canonical_path, codex_cognitive_runtime_contract,
+        AbandonedSealAttemptRecord, CognitiveHarnessOnlyEquivalence, CoreRoleEvidenceSource,
+        ExternalAgentExecutionRequest, LEGACY_EVIDENCE_ADMISSION_SCHEMA_VERSION,
+        LEGACY_WORKER_ACCEPTANCE_RUN_ID, LEGACY_WORKER_CASE_ID, LEGACY_WORKER_MISSING_FIELD,
+        LEGACY_WORKER_SOURCE_CALL_ID, LEGACY_WORKER_SOURCE_RUN_ID, LegacyEvidenceAdmissionRecord,
+        ProviderPlanSealRecord, ProviderPlanSealState, READER_SCHEMA_JSON_PLACEHOLDER,
+        READER_SCHEMA_SHA256_PLACEHOLDER, SealRecoveryDecision, SealedPromptBinding,
+        StagedSealAuthority, abandon_provider_seal, canonical_path,
+        codex_cognitive_runtime_contract, cognitive_external_execution_request,
         computed_runtime_contract_sha256, execution_conditions, generated_oracle,
-        provider_compatible_reader_schema, provider_plan_without_hash, record_provider,
+        inspect_seal_recovery, load_seal_records, provider_compatible_reader_schema,
+        provider_plan_seal_response, provider_plan_without_hash, record_provider, recover_seal,
         render_provider_contract, render_reader_prompt, role_schema_contracts,
-        schema_validation_projection, seal_runtime_contract, sha256_bytes,
-        validate_deterministic_receipt, validate_governor_product_provenance,
-        validate_json_schema_instance, validate_legacy_evidence_admission_record,
-        validate_provider_calls, validate_provider_calls_with_sources,
-        validate_provider_receipt_envelope, validate_reader_output, write_new_or_same_json,
+        schema_validation_projection, seal_attempt_component, seal_runtime_contract, sha256_bytes,
+        stage_artifacts_with_cleanup, validate_deterministic_receipt,
+        validate_governor_product_provenance, validate_json_schema_instance,
+        validate_legacy_evidence_admission_record, validate_provider_calls,
+        validate_provider_calls_with_sources, validate_provider_receipt_envelope,
+        validate_reader_output, write_new_or_same_json,
     };
     use eliot_engine::CognitiveFieldGradingService;
     use eliot_types::{
-        AgentHostId, COGNITIVE_CORE_QUALIFICATION_HARNESS_VERSION,
-        COGNITIVE_CORE_QUALIFICATION_PROVIDER_CALLS,
+        AgentCapabilityEnvelope, AgentHostId, AgentHostIdentity, AgentInvocationRequest, AgentRole,
+        AgentSessionHostBinding, AgentSessionId, AgentSessionState, AuthorityLeaseState,
+        COGNITIVE_CORE_QUALIFICATION_HARNESS_VERSION, COGNITIVE_CORE_QUALIFICATION_PROVIDER_CALLS,
         COGNITIVE_DETERMINISTIC_EVIDENCE_SCHEMA_VERSION,
         COGNITIVE_DETERMINISTIC_REPORT_SCHEMA_VERSION, COGNITIVE_FIELD_CONTRACT_SCHEMA_VERSION,
         COGNITIVE_FIELD_PROVIDER_EVIDENCE_SCHEMA_VERSION,
@@ -5340,8 +7642,9 @@ mod tests {
         CognitiveFieldProviderPlan, CognitiveFieldRole, CognitiveFieldRunContract,
         CognitiveFieldSuite, CognitiveHardGateEvidence, CognitiveMemoryCondition,
         CognitiveProviderMcpServer, CognitiveProviderRuntimeContract, CognitiveUnderstandingAnswer,
-        CognitiveVerifierCommandReceipt, cognitive_understanding_answer_schema,
-        minimal_cognitive_understanding_answer,
+        CognitiveVerifierCommandReceipt, OperationJob, OperationJobState, OperationPhase,
+        ProjectId, TaskId, TaskRoleLease, WorkItem, WorkItemId, WorkItemStatus, WorkScope,
+        cognitive_understanding_answer_schema, minimal_cognitive_understanding_answer,
     };
     use serde_json::{Value, json};
     use std::collections::{BTreeMap, BTreeSet};
@@ -5349,6 +7652,647 @@ mod tests {
     use std::path::Path;
     use time::OffsetDateTime;
     use uuid::Uuid;
+
+    #[test]
+    fn seal_stage_failure_cleans_private_root_and_retry_succeeds_without_authority()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let private_root =
+            std::env::temp_dir().join(format!("eliot-seal-stage-failure-{}", Uuid::new_v4()));
+        fs::create_dir_all(&private_root)?;
+        let private_root = fs::canonicalize(private_root)?;
+        let staging_root = private_root.join("seal-staging").join("fixture-g1");
+        let artifacts = vec![
+            (
+                "execution_request".to_owned(),
+                "seal-staging/fixture-g1/runtime/request.json".to_owned(),
+                b"{\"request\":1}\n".to_vec(),
+            ),
+            (
+                "provider_runtime".to_owned(),
+                "seal-staging/fixture-g1/runtime/runtime.json".to_owned(),
+                b"{\"runtime\":1}\n".to_vec(),
+            ),
+        ];
+        let broker = eliot_types::DelegationState::default();
+        let work = eliot_engine::WorkState::default();
+        assert!(
+            stage_artifacts_with_cleanup(&private_root, &staging_root, &artifacts, Some(1))
+                .is_err()
+        );
+        assert!(!staging_root.exists());
+        assert!(broker.agent_host_sessions.is_empty());
+        assert!(broker.task_role_leases.is_empty());
+        assert!(broker.operation_jobs.is_empty());
+        assert!(work.work_items.is_empty());
+        stage_artifacts_with_cleanup(&private_root, &staging_root, &artifacts, None)?;
+        assert!(staging_root.join("runtime/request.json").is_file());
+        assert!(staging_root.join("runtime/runtime.json").is_file());
+        fs::remove_dir_all(&private_root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn published_seal_replay_response_is_byte_identical() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let plan = CognitiveFieldProviderPlan {
+            schema_version: COGNITIVE_FIELD_PROVIDER_PLAN_SCHEMA_VERSION.to_owned(),
+            run_id: "run-idempotent".to_owned(),
+            contract_hash: "a".repeat(64),
+            calls: Vec::new(),
+            planned_provider_calls: 0,
+            planned_smoke_calls: 0,
+            planned_reused_roles: 0,
+            role_evidence_plan_hash: None,
+            seal_attempt_id: Some("seal-idempotent".to_owned()),
+            seal_generation: 2,
+            authority_activation_ref: Some("seal-records/seal-idempotent.json".to_owned()),
+            runtime_manifest_sha256: Some("b".repeat(64)),
+            artifact_manifest_sha256: Some("b".repeat(64)),
+            plan_hash: "c".repeat(64),
+            sealed_at: OffsetDateTime::now_utc(),
+        };
+        let first = provider_plan_seal_response(
+            "run-idempotent",
+            "seal-idempotent",
+            2,
+            &plan,
+            &"b".repeat(64),
+        );
+        let replay = provider_plan_seal_response(
+            "run-idempotent",
+            "seal-idempotent",
+            2,
+            &plan,
+            &"b".repeat(64),
+        );
+        assert_eq!(serde_json::to_vec(&first)?, serde_json::to_vec(&replay)?);
+        assert_eq!(
+            first.get("status").and_then(Value::as_str),
+            Some("provider_plan_sealed")
+        );
+        assert!(first.get("idempotent").is_none());
+        Ok(())
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the S11 failure-injection test asserts the full compensation postcondition set"
+    )]
+    fn activated_seal_failure_revokes_authority_and_quarantines_publication()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root = std::env::temp_dir().join(format!(
+            "eliot-activated-seal-compensation-{}",
+            Uuid::new_v4()
+        ));
+        let config_path = root.join("config/governor.toml");
+        fs::create_dir_all(
+            config_path
+                .parent()
+                .ok_or_else(|| std::io::Error::other("config path has no parent"))?,
+        )?;
+        let private_root = root.join("cognitive-field/run-s11");
+        let report_root = root.join("reports/run-s11");
+        let staging_root = private_root.join("seal-staging/seal-s11-g1");
+        let published_root = private_root.join("sealed/1");
+        fs::create_dir_all(&staging_root)?;
+        fs::create_dir_all(&report_root)?;
+        fs::write(staging_root.join("artifact.json"), b"{\"staged\":true}\n")?;
+        let public_plan_path = report_root.join("provider-plan.json");
+        fs::write(&public_plan_path, b"{\"published\":true}\n")?;
+        let private_root = fs::canonicalize(private_root)?;
+
+        let project_id = ProjectId::new_v7();
+        let task_id = TaskId::new_v7();
+        let session_id = AgentSessionId::new_v7();
+        let work_item_id = WorkItemId::new_v7();
+        let now = OffsetDateTime::now_utc();
+        let role_lease_id = "role-lease:s11".to_owned();
+        let invocation_id = "invocation:s11".to_owned();
+        let job_id = "operation-job:s11".to_owned();
+        let mut broker = eliot_types::DelegationState::default();
+        broker.agent_host_sessions.push(AgentSessionHostBinding {
+            agent_session_id: session_id,
+            host_identity: AgentHostIdentity {
+                host_id: AgentHostId::Claude,
+                implementation_name: "claude-code".to_owned(),
+                client_instance_id: "s11-client".to_owned(),
+            },
+            capability_envelope: AgentCapabilityEnvelope {
+                capabilities: vec!["emit_candidate_observation".to_owned()],
+                structured_output: true,
+                resumable: true,
+                interactive: false,
+                supervised: true,
+            },
+            bound_project_id: Some(project_id),
+            bound_task_id: Some(task_id),
+            task_role_lease_refs: vec![role_lease_id.clone()],
+            state: AgentSessionState::Active,
+            generation: 1,
+            owner_operation_id: Some(job_id.clone()),
+            disconnected_at: None,
+            disconnect_reason: None,
+        });
+        broker.task_role_leases.push(TaskRoleLease {
+            role_lease_id: role_lease_id.clone(),
+            task_id,
+            agent_session_id: session_id,
+            role: AgentRole::Implementer,
+            capability_scope: vec!["emit_candidate_observation".to_owned()],
+            expires_at: now + time::Duration::minutes(30),
+            epoch: 1,
+            state: AuthorityLeaseState::Active,
+            owner_operation_id: Some(job_id.clone()),
+            seal_attempt_id: Some("seal-attempt:s11".to_owned()),
+            generation: 1,
+            issued_at: Some(now),
+            activated_at: Some(now),
+            consumed_at: None,
+            revoked_at: None,
+            revoke_reason: None,
+            superseded_by_epoch: None,
+        });
+        broker.agent_invocations.push(AgentInvocationRequest {
+            invocation_id: invocation_id.clone(),
+            project_id,
+            task_id,
+            work_item_id,
+            requested_capabilities: vec!["emit_candidate_observation".to_owned()],
+            role_lease_id: role_lease_id.clone(),
+            role_lease_epoch: 1,
+            operation_generation: 1,
+            runtime_contract_sha256: Some("a".repeat(64)),
+            work_lease_id: None,
+            packet_refs: Vec::new(),
+            expected_result_kind: "provider_execution_evidence".to_owned(),
+            verifier_ref: "verifier:s11".to_owned(),
+            idempotency_key: "idempotency:s11".to_owned(),
+        });
+        broker.operation_jobs.push(OperationJob {
+            job_id: job_id.clone(),
+            invocation_id: invocation_id.clone(),
+            host_id: AgentHostId::Claude,
+            state: OperationJobState::Queued,
+            attempt: 0,
+            resume_session_id: None,
+            result_ref: None,
+            idempotency_key: "idempotency:s11".to_owned(),
+            created_at: now,
+            updated_at: now,
+            generation: 1,
+            phase: OperationPhase::AuthorityActivating,
+            phase_started_at: Some(now),
+            last_progress_at: Some(now),
+            phase_deadline_at: None,
+            absolute_deadline_at: None,
+            restart_count: 0,
+            runtime_contract_sha256: Some("a".repeat(64)),
+            role_lease_id: Some(role_lease_id.clone()),
+            role_lease_epoch: Some(1),
+        });
+        crate::delegation_runtime::save_host_broker_state(&root, &broker)?;
+        crate::delegation_runtime::save_work_state(&root, &eliot_engine::WorkState::default())?;
+
+        let authority = vec![StagedSealAuthority {
+            call_id: "call:s11".to_owned(),
+            host: AgentHostId::Claude,
+            project_id,
+            task_id,
+            agent_session_id: session_id,
+            client_instance_id: "s11-client".to_owned(),
+            work_item_id,
+            role_lease_id: role_lease_id.clone(),
+            role_lease_epoch: 1,
+            operation_generation: 1,
+            runtime_contract_sha256: "a".repeat(64),
+            invocation_id,
+            operation_job_id: job_id,
+            capability_scope: vec!["emit_candidate_observation".to_owned()],
+            expires_at: now + time::Duration::minutes(30),
+        }];
+        let mut record = ProviderPlanSealRecord {
+            schema_version: "eliot-provider-plan-seal-v1".to_owned(),
+            seal_attempt_id: "seal-attempt:s11".to_owned(),
+            run_id: "run-s11".to_owned(),
+            generation: 1,
+            state: ProviderPlanSealState::Activated,
+            contract_sha256: "b".repeat(64),
+            role_evidence_plan_sha256: "c".repeat(64),
+            staged_manifest_sha256: "d".repeat(64),
+            provider_plan_sha256: Some("e".repeat(64)),
+            session_ids: vec![session_id],
+            role_lease_ids: vec![role_lease_id],
+            work_item_ids: vec![work_item_id],
+            operation_job_ids: vec!["operation-job:s11".to_owned()],
+            staging_root: staging_root.display().to_string(),
+            published_root: published_root.display().to_string(),
+            activated_at: Some(now),
+            published_at: None,
+            abandoned_at: None,
+            failure_ref: None,
+        };
+        abandon_provider_seal(
+            &config_path,
+            &private_root,
+            Some(&public_plan_path),
+            &mut record,
+            &authority,
+            "injected_failure_after_activation",
+        )?;
+
+        let recovered = crate::delegation_runtime::load_state(&root)?;
+        assert_eq!(
+            recovered.task_role_leases[0].state,
+            AuthorityLeaseState::Revoked
+        );
+        assert_eq!(
+            recovered.agent_host_sessions[0].state,
+            AgentSessionState::Retired
+        );
+        assert_eq!(
+            recovered.operation_jobs[0].state,
+            OperationJobState::Abandoned
+        );
+        assert!(!public_plan_path.exists());
+        assert_eq!(record.state, ProviderPlanSealState::Abandoned);
+        assert!(
+            load_seal_records(&private_root)?
+                .iter()
+                .any(|stored| stored.state == ProviderPlanSealState::Abandoned)
+        );
+        let abandoned_path = fs::read_dir(private_root.join("abandoned-seals"))?
+            .next()
+            .ok_or_else(|| std::io::Error::other("abandoned seal record is missing"))??
+            .path();
+        let _typed: AbandonedSealAttemptRecord =
+            serde_json::from_slice(&fs::read(abandoned_path)?)?;
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "S14 deliberately reconstructs the complete four-call legacy recovery boundary"
+    )]
+    fn exact_run006_partial_shape_is_recovered_once_without_provider_evidence()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let run_id = "run-s14";
+        let root =
+            std::env::temp_dir().join(format!("eliot-exact-run006-recovery-{}", Uuid::new_v4()));
+        let config_path = root.join("config/governor.toml");
+        let private_root = root.join("cognitive-field").join(run_id);
+        let report_root = root.join("reports").join(run_id);
+        let runtime_root = private_root.join("runtime");
+        let schema_root = private_root.join("schemas");
+        fs::create_dir_all(
+            config_path
+                .parent()
+                .ok_or_else(|| std::io::Error::other("config path has no parent"))?,
+        )?;
+        fs::create_dir_all(&runtime_root)?;
+        fs::create_dir_all(&schema_root)?;
+        fs::create_dir_all(&report_root)?;
+        fs::write(&config_path, b"# S14 fixture\n")?;
+        let private_root = fs::canonicalize(private_root)?;
+        let report_root = fs::canonicalize(report_root)?;
+        let repository = fs::canonicalize(&root)?;
+        let now = OffsetDateTime::now_utc();
+        let contract = CognitiveFieldRunContract {
+            schema_version: COGNITIVE_FIELD_CONTRACT_SCHEMA_VERSION.to_owned(),
+            run_id: run_id.to_owned(),
+            suite_sha256: "1".repeat(64),
+            source_commit: "2".repeat(40),
+            primary_repository: repository.display().to_string(),
+            second_repository: repository.display().to_string(),
+            second_repository_commit: "3".repeat(40),
+            output_root: report_root.display().to_string(),
+            private_root_sha256: sha256_bytes(private_root.display().to_string().as_bytes()),
+            hard_provider_call_cap: 4,
+            contract_hash: "4".repeat(64),
+            sealed_at: now,
+        };
+        crate::runtime_instance::atomic_write_json(&report_root.join("contract.json"), &contract)?;
+        let schema_path = schema_root.join("reader-provider.json");
+        fs::write(&schema_path, b"{\"type\":\"object\"}\n")?;
+        let schema_sha256 = sha256_bytes(&fs::read(&schema_path)?);
+        let project_id = ProjectId::new_v7();
+        let task_id = TaskId::new_v7();
+        let hosts = [
+            AgentHostId::Claude,
+            AgentHostId::Antigravity,
+            AgentHostId::OpenCode,
+            AgentHostId::Claude,
+        ];
+        let models = [
+            "claude-opus-5",
+            "gemini-3.6-flash-high",
+            "opencode/mimo-v2.5-free",
+            "claude-opus-5",
+        ];
+        let mut calls = Vec::new();
+        let mut broker = eliot_types::DelegationState::default();
+        let mut work = eliot_engine::WorkState::default();
+        for (index, (host, model)) in hosts.into_iter().zip(models).enumerate() {
+            let call_id = format!("s14-call-{}", index + 1);
+            let prompt_path = private_root.join(format!("prompts/{call_id}.md"));
+            fs::create_dir_all(
+                prompt_path
+                    .parent()
+                    .ok_or_else(|| std::io::Error::other("prompt path has no parent"))?,
+            )?;
+            fs::write(&prompt_path, format!("S14 provider prompt {call_id}\n"))?;
+            let prompt_sha256 = sha256_bytes(&fs::read(&prompt_path)?);
+            let session_id = AgentSessionId::new_v7();
+            let work_item_id = WorkItemId::new_v7();
+            let role_lease_id = format!("task-role-lease:s14-{}", index + 1);
+            let invocation_id = format!("cognitive-field-{run_id}-{call_id}");
+            let operation_job_id = format!("operation-job:s14-{}", index + 1);
+            let runtime_contract_sha256 = format!("{:064x}", index + 10);
+            let call = CognitiveFieldProviderCallPlan {
+                call_number: u8::try_from(index + 1)?,
+                call_id: call_id.clone(),
+                role: CognitiveFieldRole::UnderstandingReader,
+                host,
+                requested_model: model.to_owned(),
+                expected_provider_executable_sha256: "5".repeat(64),
+                prompt_ref: canonical_path(&prompt_path),
+                prompt_sha256,
+                canonical_schema_sha256: schema_sha256.clone(),
+                provider_schema_sha256: schema_sha256.clone(),
+                provider_smoke: false,
+                counts_against_cap: true,
+                executions: vec![CognitiveFieldExecutionKey {
+                    case_id: format!("S14-{}", index + 1),
+                    memory_condition: CognitiveMemoryCondition::Treatment,
+                }],
+                runtime_contract_ref: format!("runtime/{call_id}-provider-runtime.json"),
+                runtime_contract_sha256: runtime_contract_sha256.clone(),
+                adapter_id: format!("s14-{}", host.as_str()),
+                adapter_version: "fixture-v1".to_owned(),
+                execution_request_ref: format!("runtime/{call_id}-execution-request.json"),
+                execution_request_sha256: String::new(),
+            };
+            let authority = StagedSealAuthority {
+                call_id: call_id.clone(),
+                host,
+                project_id,
+                task_id,
+                agent_session_id: session_id,
+                client_instance_id: format!("cognitive-field:{run_id}:{call_id}:g1"),
+                work_item_id,
+                role_lease_id: role_lease_id.clone(),
+                role_lease_epoch: 1,
+                operation_generation: 1,
+                runtime_contract_sha256: runtime_contract_sha256.clone(),
+                invocation_id: invocation_id.clone(),
+                operation_job_id: operation_job_id.clone(),
+                capability_scope: vec!["emit_candidate_observation".to_owned()],
+                expires_at: now + time::Duration::minutes(30),
+            };
+            let binding = SealedPromptBinding {
+                project_id,
+                task_id,
+                repository: repository.clone(),
+            };
+            let execution = cognitive_external_execution_request(
+                &contract,
+                &private_root,
+                &call,
+                &binding,
+                &prompt_path,
+                &authority,
+            )?;
+            crate::runtime_instance::atomic_write_json(
+                &runtime_root.join(format!("{call_id}-execution-request.json")),
+                &execution,
+            )?;
+            crate::runtime_instance::atomic_write_json(
+                &runtime_root.join(format!("{call_id}-provider-runtime.json")),
+                &json!({
+                    "schema_version": "s14-provider-runtime-fixture-v1",
+                    "call_id": call_id,
+                    "runtime_contract_sha256": runtime_contract_sha256,
+                }),
+            )?;
+            broker.agent_host_sessions.push(AgentSessionHostBinding {
+                agent_session_id: session_id,
+                host_identity: AgentHostIdentity {
+                    host_id: host,
+                    implementation_name: format!("s14-{}", host.as_str()),
+                    client_instance_id: authority.client_instance_id.clone(),
+                },
+                capability_envelope: AgentCapabilityEnvelope {
+                    capabilities: authority.capability_scope.clone(),
+                    structured_output: true,
+                    resumable: true,
+                    interactive: false,
+                    supervised: true,
+                },
+                bound_project_id: Some(project_id),
+                bound_task_id: Some(task_id),
+                task_role_lease_refs: vec![role_lease_id.clone()],
+                state: AgentSessionState::Active,
+                generation: 0,
+                owner_operation_id: None,
+                disconnected_at: None,
+                disconnect_reason: None,
+            });
+            broker.task_role_leases.push(TaskRoleLease {
+                role_lease_id: role_lease_id.clone(),
+                task_id,
+                agent_session_id: session_id,
+                role: AgentRole::Auditor,
+                capability_scope: authority.capability_scope.clone(),
+                expires_at: authority.expires_at,
+                epoch: 1,
+                state: AuthorityLeaseState::Active,
+                owner_operation_id: None,
+                seal_attempt_id: None,
+                generation: 0,
+                issued_at: Some(now),
+                activated_at: Some(now),
+                consumed_at: None,
+                revoked_at: None,
+                revoke_reason: None,
+                superseded_by_epoch: None,
+            });
+            broker.agent_invocations.push(execution.invocation.clone());
+            broker.operation_jobs.push(OperationJob {
+                job_id: operation_job_id,
+                invocation_id,
+                host_id: host,
+                state: OperationJobState::Queued,
+                attempt: 0,
+                resume_session_id: None,
+                result_ref: None,
+                idempotency_key: format!("cognitive-field:{run_id}:{call_id}"),
+                created_at: now,
+                updated_at: now,
+                generation: 0,
+                phase: OperationPhase::AuthorityActivating,
+                phase_started_at: Some(now),
+                last_progress_at: Some(now),
+                phase_deadline_at: None,
+                absolute_deadline_at: None,
+                restart_count: 0,
+                runtime_contract_sha256: Some(authority.runtime_contract_sha256.clone()),
+                role_lease_id: Some(role_lease_id),
+                role_lease_epoch: Some(1),
+            });
+            work.work_items.push(WorkItem {
+                work_item_id,
+                project_id,
+                task_id,
+                project: "s14".to_owned(),
+                task: call_id.clone(),
+                goal: "recover the exact run006 partial seal shape".to_owned(),
+                scope: WorkScope {
+                    repo_root: repository.display().to_string(),
+                    read_set: vec![repository.display().to_string()],
+                    write_set: Vec::new(),
+                    verifier_set: vec!["s14".to_owned()],
+                    authority: eliot_types::AuthorityProfile::read_only(),
+                    risk_tier: eliot_types::RiskTier::Low,
+                    max_files: 0,
+                    requires_active_work_lease: false,
+                },
+                status: WorkItemStatus::Open,
+                required: true,
+                allowed_roles: vec![AgentRole::Auditor],
+                required_verifiers: Vec::new(),
+                created_by: session_id,
+                active_lease_id: None,
+                lease_refs: Vec::new(),
+                conflict_refs: Vec::new(),
+                created_at: now,
+                updated_at: now,
+                completed_at: None,
+                write_receipt: None,
+            });
+            calls.push(call);
+        }
+        crate::runtime_instance::atomic_write_json(&private_root.join("calls.json"), &calls)?;
+        crate::delegation_runtime::save_host_broker_state(&root, &broker)?;
+        crate::delegation_runtime::save_work_state(&root, &work)?;
+        for call in &calls {
+            let request: ExternalAgentExecutionRequest = serde_json::from_slice(&fs::read(
+                private_root
+                    .join("runtime")
+                    .join(format!("{}-execution-request.json", call.call_id)),
+            )?)?;
+            assert_eq!(request.invocation.operation_generation, 1);
+            assert_eq!(request.launch_contract.operation_generation, 1);
+        }
+        assert!(
+            broker
+                .agent_host_sessions
+                .iter()
+                .all(|session| { session.generation == 0 && session.owner_operation_id.is_none() })
+        );
+        assert!(broker.task_role_leases.iter().all(|lease| {
+            lease.generation == 0
+                && lease.owner_operation_id.is_none()
+                && lease.seal_attempt_id.is_none()
+        }));
+        assert!(broker.operation_jobs.iter().all(|job| job.generation == 0));
+
+        let before = inspect_seal_recovery(&config_path, run_id, &report_root, &private_root)?;
+        assert_eq!(
+            before.decision,
+            SealRecoveryDecision::AbandonAndRevokeSafePredispatch
+        );
+        assert_eq!(before.execution_request_paths.len(), 4);
+        assert_eq!(before.provider_runtime_paths.len(), 4);
+        assert_eq!(before.present_work_item_ids.len(), 4);
+        assert_eq!(before.present_operation_job_ids.len(), 4);
+        assert_eq!(before.provider_reservation_count, 0);
+        assert_eq!(before.provider_result_count, 0);
+        assert!(before.provider_artifact_paths.is_empty());
+        assert!(before.legacy_authority_cas_ready);
+        assert!(before.scoped_authority_exact);
+        assert!(before.exact_error.is_none());
+        assert!(before.non_projection_proofs.is_empty());
+
+        recover_seal(
+            &config_path,
+            run_id,
+            Some(&report_root),
+            Some(&private_root),
+            false,
+            true,
+        )?;
+        let recovered_broker = crate::delegation_runtime::load_state(&root)?;
+        let recovered_work = crate::delegation_runtime::load_work_state(&root)?;
+        let seal_component = seal_attempt_component(run_id, 1);
+        let manifest_path = private_root
+            .join("quarantine")
+            .join(&seal_component)
+            .join("generation-1-manifest.json");
+        let abandoned_path = private_root
+            .join("abandoned-seals")
+            .join(format!("{seal_component}.json"));
+        let manifest: Value = serde_json::from_slice(&fs::read(&manifest_path)?)?;
+        assert_eq!(
+            manifest
+                .get("entries")
+                .and_then(Value::as_array)
+                .map(Vec::len),
+            Some(8)
+        );
+        assert!(recovered_broker.task_role_leases.iter().all(|lease| {
+            lease.state == AuthorityLeaseState::Revoked
+                && lease.revoke_reason.as_deref() == Some("partial_seal_before_provider_plan")
+        }));
+        assert!(recovered_broker.agent_host_sessions.iter().all(|session| {
+            session.state == AgentSessionState::Retired
+                && session.disconnect_reason.as_deref() == Some("partial_seal_before_provider_plan")
+        }));
+        assert!(
+            recovered_broker
+                .operation_jobs
+                .iter()
+                .all(|job| job.state == OperationJobState::Abandoned)
+        );
+        assert!(
+            recovered_work
+                .work_items
+                .iter()
+                .all(|item| item.status == WorkItemStatus::Revoked)
+        );
+        assert!(!report_root.join("provider-plan.json").exists());
+        assert!(fs::read_dir(private_root.join("runtime"))?.next().is_none());
+        let after = inspect_seal_recovery(&config_path, run_id, &report_root, &private_root)?;
+        assert_eq!(after.decision, SealRecoveryDecision::AlreadyAbandoned);
+        assert_eq!(after.provider_reservation_count, 0);
+        assert_eq!(after.provider_result_count, 0);
+        assert!(after.provider_artifact_paths.is_empty());
+        let broker_snapshot = serde_json::to_vec(&recovered_broker)?;
+        let work_snapshot = serde_json::to_vec(&recovered_work)?;
+        let manifest_snapshot = fs::read(&manifest_path)?;
+        let abandoned_snapshot = fs::read(&abandoned_path)?;
+        recover_seal(
+            &config_path,
+            run_id,
+            Some(&report_root),
+            Some(&private_root),
+            false,
+            true,
+        )?;
+        assert_eq!(
+            serde_json::to_vec(&crate::delegation_runtime::load_state(&root)?)?,
+            broker_snapshot
+        );
+        assert_eq!(
+            serde_json::to_vec(&crate::delegation_runtime::load_work_state(&root)?)?,
+            work_snapshot
+        );
+        assert_eq!(fs::read(manifest_path)?, manifest_snapshot);
+        assert_eq!(fs::read(abandoned_path)?, abandoned_snapshot);
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
 
     fn provider_test_prompt(
         role: CognitiveFieldRole,
@@ -6900,6 +9844,11 @@ mod tests {
             planned_smoke_calls: 0,
             planned_reused_roles: 0,
             role_evidence_plan_hash: None,
+            seal_attempt_id: None,
+            seal_generation: 0,
+            authority_activation_ref: None,
+            runtime_manifest_sha256: None,
+            artifact_manifest_sha256: None,
             plan_hash: String::new(),
             sealed_at: OffsetDateTime::UNIX_EPOCH,
         };
