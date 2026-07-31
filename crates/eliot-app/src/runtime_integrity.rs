@@ -470,6 +470,46 @@ pub(crate) async fn inspect(
     })
 }
 
+async fn open_external_adapter_circuits(
+    runtime_store: &OperationRuntimeHandle,
+) -> Result<Vec<&'static str>> {
+    let mut adapter_ids = Vec::new();
+    for adapter_id in EXTERNAL_ADAPTER_IDS {
+        if runtime_store
+            .load_restart_window(adapter_id)
+            .await?
+            .is_some_and(|window| window.circuit_state == AdapterCircuitState::Open)
+        {
+            adapter_ids.push(adapter_id);
+        }
+    }
+    Ok(adapter_ids)
+}
+
+async fn open_external_adapter_circuit_decisions(
+    runtime_store: &OperationRuntimeHandle,
+) -> Result<Vec<RuntimeReconcileDecision>> {
+    Ok(open_external_adapter_circuits(runtime_store)
+        .await?
+        .into_iter()
+        .map(|adapter_id| RuntimeReconcileDecision {
+            operation_id: adapter_id.to_owned(),
+            generation: 0,
+            decision: "half_open_static_adapter_probe".to_owned(),
+            mutates: false,
+            reason: "durable_adapter_circuit_open".to_owned(),
+        })
+        .collect())
+}
+
+fn sort_reconcile_decisions(decisions: &mut [RuntimeReconcileDecision]) {
+    decisions.sort_by(|left, right| {
+        left.operation_id
+            .cmp(&right.operation_id)
+            .then(left.generation.cmp(&right.generation))
+    });
+}
+
 pub(crate) async fn reconcile_dry_run(
     config_path: &Path,
     runtime_store: &OperationRuntimeHandle,
@@ -559,11 +599,8 @@ pub(crate) async fn reconcile_dry_run(
             reason: "local_fence_present_canonical_close_incomplete".to_owned(),
         });
     }
-    decisions.sort_by(|left, right| {
-        left.operation_id
-            .cmp(&right.operation_id)
-            .then(left.generation.cmp(&right.generation))
-    });
+    decisions.extend(open_external_adapter_circuit_decisions(runtime_store).await?);
+    sort_reconcile_decisions(&mut decisions);
     Ok(RuntimeReconcileDryRun {
         schema_version: "eliot-runtime-reconcile-dry-run-v1".to_owned(),
         generated_at: now.to_string(),
@@ -594,6 +631,12 @@ pub(crate) async fn reconcile_apply(
         .context("reconcile partial operation close through daemon-owned WriterActor")?;
         close_receipts.push(response);
     }
+    let mut adapter_circuit_probes = Vec::new();
+    for adapter_id in open_external_adapter_circuits(runtime_store).await? {
+        adapter_circuit_probes.push(
+            crate::host_runtime::half_open_external_agent_circuit(config_path, adapter_id).await?,
+        );
+    }
     let status = inspect(config_path, runtime_store, true, instance).await?;
     persist_report(config_path, &status)?;
     Ok(json!({
@@ -603,6 +646,7 @@ pub(crate) async fn reconcile_apply(
         "provider_calls": 0,
         "raw_state_edits": 0,
         "canonical_close_receipts": close_receipts,
+        "adapter_circuit_probes": adapter_circuit_probes,
         "provider_dispatch_safe": status.provider_dispatch_safe,
         "runtime_integrity_clean": status.runtime_integrity.clean,
     }))
@@ -1215,13 +1259,14 @@ fn usize_to_u32(value: usize) -> u32 {
 
 #[cfg(test)]
 mod tests {
-    use super::{authority_owner_issue, bounded_seal_files, inspect};
+    use super::{authority_owner_issue, bounded_seal_files, inspect, reconcile_dry_run};
     use eliot_engine::{WriterActor, WriterConfig};
     use eliot_store::{CanonicalStore, ControlWal};
     use eliot_types::{
-        AgentHostId, AgentRole, AgentSessionId, AuthorityLeaseLifetime, AuthorityLeaseState,
-        ControlWalConfig, DelegationState, GovernorConfig, OperationJob, OperationJobState,
-        OperationPhase, RuntimeOverallStatus, TaskId, TaskRoleLease,
+        AdapterCircuitState, AgentHostId, AgentRole, AgentSessionId, AuthorityLeaseLifetime,
+        AuthorityLeaseState, ControlWalConfig, DelegationState, GovernorConfig, OperationJob,
+        OperationJobState, OperationPhase, OperationRestartWindow, RuntimeOverallStatus, TaskId,
+        TaskRoleLease,
     };
     use std::fs;
     use time::OffsetDateTime;
@@ -1351,6 +1396,63 @@ mod tests {
         assert_eq!(report.overall, RuntimeOverallStatus::IntegrityFailed);
         assert!(!report.provider_dispatch_safe);
         assert_eq!(report.authority_integrity.orphaned_role_leases, 1);
+
+        drop(runtime);
+        drop(writer);
+        actor_task.await?;
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn reconcile_dry_run_reports_open_external_adapter_circuit_without_mutation()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root = std::env::temp_dir().join(format!("eliot-runtime-reconcile-{}", Uuid::new_v4()));
+        let config_path = root.join("config/governor.toml");
+        fs::create_dir_all(
+            config_path
+                .parent()
+                .ok_or_else(|| std::io::Error::other("config path has no parent"))?,
+        )?;
+        crate::delegation_runtime::save_host_broker_state(&root, &DelegationState::default())?;
+        let wal = ControlWal::open(&ControlWalConfig {
+            path: root.join("control.redb").display().to_string(),
+        })?;
+        let store = CanonicalStore::new(GovernorConfig::default().db.surreal);
+        let (writer, actor) = WriterActor::channel(wal, store, &WriterConfig::default());
+        let runtime = writer.operation_runtime();
+        let actor_task = tokio::spawn(actor.run());
+        let now = OffsetDateTime::now_utc();
+        runtime
+            .put_restart_window(OperationRestartWindow {
+                schema_version: "eliot-operation-restart-window-v1".to_owned(),
+                key: "external-agent:claude".to_owned(),
+                restart_timestamps: vec![now.to_string()],
+                circuit_state: AdapterCircuitState::Open,
+                consecutive_failures: 2,
+                last_success_at: None,
+                last_failure_at: Some(now.to_string()),
+                last_failure_class: Some("pre_dispatch".to_owned()),
+                last_terminal_operation_ref: Some("operation:fixture".to_owned()),
+                updated_at: now.to_string(),
+            })
+            .await?;
+
+        let dry_run = reconcile_dry_run(&config_path, &runtime).await?;
+        assert_eq!(dry_run.provider_calls, 0);
+        assert_eq!(dry_run.writes, 0);
+        assert!(dry_run.decisions.iter().any(|decision| {
+            decision.operation_id == "external-agent:claude"
+                && decision.decision == "half_open_static_adapter_probe"
+                && !decision.mutates
+        }));
+        assert_eq!(
+            runtime
+                .load_restart_window("external-agent:claude")
+                .await?
+                .map(|window| window.circuit_state),
+            Some(AdapterCircuitState::Open)
+        );
 
         drop(runtime);
         drop(writer);

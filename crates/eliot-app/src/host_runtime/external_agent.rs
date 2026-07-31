@@ -122,6 +122,33 @@ pub(crate) fn production_external_agent_supervisor(
     ))
 }
 
+pub(crate) async fn half_open_external_agent_circuit(
+    config_path: &Path,
+    requested_adapter_id: &str,
+) -> Result<Value> {
+    anyhow::ensure!(
+        matches!(
+            requested_adapter_id,
+            "external-agent:claude" | "external-agent:antigravity" | "external-agent:opencode"
+        ),
+        "adapter is not in the bounded external-agent inventory"
+    );
+    let supervisor = production_external_agent_supervisor(config_path)?;
+    let health = supervisor.half_open_probe(requested_adapter_id).await;
+    anyhow::ensure!(
+        health.healthy && !health.circuit_open,
+        "external adapter half-open probe failed: {}",
+        health.message
+    );
+    Ok(json!({
+        "schema_version": "eliot-external-agent-circuit-probe-v1",
+        "adapter_id": requested_adapter_id,
+        "status": "closed",
+        "provider_calls": 0,
+        "health": health,
+    }))
+}
+
 pub(crate) fn prepare_external_agent_runtime(
     config_path: &Path,
     host: AgentHostId,
