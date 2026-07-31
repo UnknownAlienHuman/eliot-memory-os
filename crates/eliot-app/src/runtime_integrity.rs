@@ -616,7 +616,7 @@ fn scan_seal_inventory(
         return Ok(SealInventory::default());
     }
     let mut inventory = SealInventory::default();
-    let files = bounded_files(&root, 20_000)?;
+    let files = bounded_seal_files(&root, 20_000, 100_000, 20_000)?;
     let mut published_ids = BTreeSet::new();
     for path in files {
         let parent_name = path
@@ -712,23 +712,52 @@ fn scan_seal_inventory(
     Ok(inventory)
 }
 
-fn bounded_files(root: &Path, limit: usize) -> Result<Vec<PathBuf>> {
+fn bounded_seal_files(
+    root: &Path,
+    directory_limit: usize,
+    entry_limit: usize,
+    relevant_file_limit: usize,
+) -> Result<Vec<PathBuf>> {
     let mut pending = vec![root.to_path_buf()];
     let mut files = Vec::new();
+    let mut directories = 0_usize;
+    let mut entries_seen = 0_usize;
     while let Some(directory) = pending.pop() {
+        directories = directories.saturating_add(1);
+        if directories > directory_limit {
+            bail!(
+                "runtime integrity scan exceeded bounded directory limit {directory_limit} under {}",
+                root.display()
+            );
+        }
         let mut entries = std::fs::read_dir(&directory)
             .with_context(|| format!("scan runtime integrity directory {}", directory.display()))?
             .map(|entry| entry.map(|entry| entry.path()))
             .collect::<std::io::Result<Vec<_>>>()?;
+        entries_seen = entries_seen.saturating_add(entries.len());
+        if entries_seen > entry_limit {
+            bail!(
+                "runtime integrity scan exceeded bounded entry limit {entry_limit} under {}",
+                root.display()
+            );
+        }
         entries.sort();
+        let relevant_directory = directory
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| matches!(name, "seal-records" | "abandoned-seals"));
         for path in entries {
             if path.is_dir() {
                 pending.push(path);
-            } else {
+            } else if relevant_directory
+                && path
+                    .extension()
+                    .is_some_and(|extension| extension == "json")
+            {
                 files.push(path);
-                if files.len() > limit {
+                if files.len() > relevant_file_limit {
                     bail!(
-                        "runtime integrity scan exceeded bounded file limit {limit} under {}",
+                        "runtime integrity scan exceeded bounded relevant-file limit {relevant_file_limit} under {}",
                         root.display()
                     );
                 }
@@ -765,7 +794,7 @@ fn usize_to_u32(value: usize) -> u32 {
 
 #[cfg(test)]
 mod tests {
-    use super::inspect;
+    use super::{bounded_seal_files, inspect};
     use eliot_engine::{WriterActor, WriterConfig};
     use eliot_store::{CanonicalStore, ControlWal};
     use eliot_types::{
@@ -775,6 +804,27 @@ mod tests {
     use std::fs;
     use time::OffsetDateTime;
     use uuid::Uuid;
+
+    #[test]
+    fn seal_scan_bounds_relevant_records_without_counting_historical_artifacts()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root = std::env::temp_dir().join(format!("eliot-seal-scan-{}", Uuid::new_v4()));
+        let history = root.join("run/history");
+        let seals = root.join("run/seal-records");
+        fs::create_dir_all(&history)?;
+        fs::create_dir_all(&seals)?;
+        for index in 0..4 {
+            fs::write(history.join(format!("artifact-{index}.json")), b"{}")?;
+        }
+        let seal = seals.join("seal.json");
+        fs::write(&seal, b"{}")?;
+
+        let files = bounded_seal_files(&root, 8, 16, 1)?;
+        assert_eq!(files, [seal]);
+
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
 
     #[tokio::test]
     async fn runtime_integrity_reports_core_ready_orphan_authority_as_integrity_failed()
