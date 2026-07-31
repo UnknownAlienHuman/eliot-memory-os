@@ -480,6 +480,8 @@ pub(crate) async fn host_governor_request(
     if !matches!(
         method,
         "host/role-grant"
+            | "host/operation-scope-open"
+            | "host/operation-scope-close"
             | "host/observation-record"
             | "ul/onboard"
             | "ul/mine-git"

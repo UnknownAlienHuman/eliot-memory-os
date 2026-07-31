@@ -24,6 +24,24 @@ pub(super) async fn dispatch_host_governor_method(
             )
             .await,
         ),
+        "host/operation-scope-open" => Some(
+            crate::host_runtime::open_operation_scope_from_daemon(
+                &state.root,
+                &state.store,
+                &state.writer,
+                params,
+            )
+            .await,
+        ),
+        "host/operation-scope-close" => Some(
+            crate::host_runtime::close_operation_scope_from_daemon(
+                &state.root,
+                &state.store,
+                &state.writer,
+                params,
+            )
+            .await,
+        ),
         "host/observation-record" => Some(
             crate::host_runtime::record_host_observation_from_daemon(
                 &state.root,

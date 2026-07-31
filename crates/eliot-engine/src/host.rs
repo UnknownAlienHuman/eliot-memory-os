@@ -3,10 +3,10 @@ use eliot_types::{
     AgentCapabilityEnvelope, AgentHostId, AgentHostIdentity, AgentHostRuntimeProfile,
     AgentInvocationRequest, AgentResultDisposition, AgentResultDispositionKind,
     AgentResultEnvelope, AgentResultStatus, AgentRole, AgentSessionHostBinding, AgentSessionId,
-    AgentSessionState, AuthorityLeaseState, AuthorityRevocationReceipt, ControllerLease,
-    DelegationState, HostEventEnvelope, HostLaunchContract, HostLaunchScope, HostMode,
-    HostProfileStatus, HostProtocolSurfaces, OperationJob, OperationJobState, OperationPhase,
-    ProjectId, TaintClass, TaskId, TaskRoleLease,
+    AgentSessionState, AuthorityLeaseLifetime, AuthorityLeaseState, AuthorityRevocationReceipt,
+    ControllerLease, DelegationState, HostEventEnvelope, HostLaunchContract, HostLaunchScope,
+    HostMode, HostProfileStatus, HostProtocolSurfaces, OperationJob, OperationJobState,
+    OperationPhase, ProjectId, TaintClass, TaskId, TaskRoleLease,
 };
 use serde::Serialize;
 use serde_json::Value;
@@ -693,6 +693,24 @@ pub struct PendingRoleGrant {
     pub owner_operation_id: Option<String>,
 }
 
+#[derive(Clone, Debug)]
+pub struct ActiveRoleAuthorityCheck<'a> {
+    pub operation_id: &'a str,
+    pub task_id: TaskId,
+    pub role_lease_id: &'a str,
+    pub expected_epoch: u64,
+    pub generation: u64,
+    pub host_id: AgentHostId,
+    pub requested_capabilities: &'a [String],
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ActiveRoleAuthority {
+    pub role_lease: TaskRoleLease,
+    pub host_binding: AgentSessionHostBinding,
+    pub operation_job: Option<OperationJob>,
+}
+
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct AuthorityCleanupReport {
     pub expired_role_lease_ids: Vec<String>,
@@ -857,7 +875,13 @@ impl HostBrokerService {
             ttl_minutes,
             None,
         )?;
-        let mut leases = self.activate_role_grants(state, &[grant], "legacy-live-grant", 1)?;
+        let mut leases = self.activate_role_grants(
+            state,
+            &[grant],
+            AuthorityLeaseLifetime::Persistent,
+            None,
+            1,
+        )?;
         let lease = leases
             .pop()
             .ok_or_else(|| host_broker_error("role activation returned no lease"))?;
@@ -928,13 +952,48 @@ impl HostBrokerService {
         self,
         state: &mut DelegationState,
         grants: &[PendingRoleGrant],
-        seal_attempt_id: &str,
+        lifetime: AuthorityLeaseLifetime,
+        seal_attempt_id: Option<&str>,
         generation: u64,
     ) -> Result<Vec<TaskRoleLease>, EngineError> {
-        if generation == 0 || seal_attempt_id.trim().is_empty() {
+        if generation == 0 {
             return Err(host_broker_error(
-                "authority activation requires nonzero generation and seal attempt",
+                "authority activation requires nonzero generation",
             ));
+        }
+        match lifetime {
+            AuthorityLeaseLifetime::Legacy => {
+                return Err(host_broker_error("new code cannot mint Legacy authority"));
+            }
+            AuthorityLeaseLifetime::Persistent => {
+                if seal_attempt_id.is_some()
+                    || grants
+                        .iter()
+                        .any(|grant| grant.owner_operation_id.is_some())
+                {
+                    return Err(host_broker_error(
+                        "Persistent authority cannot carry an operation or seal owner",
+                    ));
+                }
+            }
+            AuthorityLeaseLifetime::OperationBound => {
+                if seal_attempt_id.is_some()
+                    || grants
+                        .iter()
+                        .any(|grant| grant.owner_operation_id.is_none())
+                {
+                    return Err(host_broker_error(
+                        "OperationBound authority requires an operation owner and no seal owner",
+                    ));
+                }
+            }
+            AuthorityLeaseLifetime::SealBound => {
+                if seal_attempt_id.is_none_or(|value| value.trim().is_empty()) {
+                    return Err(host_broker_error(
+                        "SealBound authority requires an exact seal attempt",
+                    ));
+                }
+            }
         }
         let now = OffsetDateTime::now_utc();
         let mut next = state.clone();
@@ -985,8 +1044,9 @@ impl HostBrokerService {
                 expires_at: grant.expires_at,
                 epoch: grant.epoch,
                 state: AuthorityLeaseState::Active,
+                lifetime,
                 owner_operation_id: grant.owner_operation_id.clone(),
-                seal_attempt_id: Some(seal_attempt_id.to_owned()),
+                seal_attempt_id: seal_attempt_id.map(str::to_owned),
                 generation,
                 issued_at: Some(now),
                 activated_at: Some(now),
@@ -1008,8 +1068,9 @@ impl HostBrokerService {
                     expires_at: grant.expires_at,
                     epoch: grant.epoch,
                     state: AuthorityLeaseState::Active,
+                    lifetime,
                     owner_operation_id: grant.owner_operation_id.clone(),
-                    seal_attempt_id: Some(seal_attempt_id.to_owned()),
+                    seal_attempt_id: seal_attempt_id.map(str::to_owned),
                     generation,
                     issued_at: Some(now),
                     activated_at: Some(now),
@@ -1162,6 +1223,133 @@ impl HostBrokerService {
         report
     }
 
+    pub fn validate_active_role_authority(
+        self,
+        state: &DelegationState,
+        check: &ActiveRoleAuthorityCheck<'_>,
+    ) -> Result<ActiveRoleAuthority, EngineError> {
+        if check.expected_epoch == 0 || check.generation == 0 {
+            return Err(host_broker_error(
+                "fresh authority check requires nonzero epoch and generation",
+            ));
+        }
+        let now = OffsetDateTime::now_utc();
+        let role = state
+            .task_role_leases
+            .iter()
+            .find(|lease| {
+                lease.role_lease_id == check.role_lease_id
+                    && lease.task_id == check.task_id
+                    && lease.state == AuthorityLeaseState::Active
+                    && lease.epoch == check.expected_epoch
+                    && lease.generation == check.generation
+                    && lease.expires_at > now
+            })
+            .ok_or_else(|| host_broker_error("no active matching TaskRoleLease"))?;
+        let binding = state
+            .agent_host_sessions
+            .iter()
+            .find(|binding| binding.agent_session_id == role.agent_session_id)
+            .ok_or_else(|| host_broker_error("role lease owner session is missing"))?;
+        if binding.state != AgentSessionState::Active
+            || binding.host_identity.host_id != check.host_id
+            || binding.generation != check.generation
+            || binding
+                .bound_task_id
+                .is_some_and(|task| task != check.task_id)
+            || !binding
+                .task_role_lease_refs
+                .iter()
+                .any(|role_lease_id| role_lease_id == check.role_lease_id)
+        {
+            return Err(host_broker_error(
+                "role lease owner binding is inactive, stale, or scope-mismatched",
+            ));
+        }
+        if check
+            .requested_capabilities
+            .iter()
+            .any(|capability| !role.capability_scope.contains(capability))
+        {
+            return Err(host_broker_error(
+                "operation requests capability outside the TaskRoleLease",
+            ));
+        }
+        let operation_job = match role.lifetime {
+            AuthorityLeaseLifetime::Legacy => {
+                return Err(host_broker_error(
+                    "Legacy authority is decode/recovery-only and cannot dispatch",
+                ));
+            }
+            AuthorityLeaseLifetime::Persistent => {
+                if role.owner_operation_id.is_some() || role.seal_attempt_id.is_some() {
+                    return Err(host_broker_error(
+                        "Persistent authority has an invalid owner",
+                    ));
+                }
+                None
+            }
+            AuthorityLeaseLifetime::OperationBound => {
+                if role.owner_operation_id.as_deref() != Some(check.operation_id)
+                    || role.seal_attempt_id.is_some()
+                {
+                    return Err(host_broker_error(
+                        "OperationBound authority does not match the exact operation owner",
+                    ));
+                }
+                let job = state
+                    .operation_jobs
+                    .iter()
+                    .find(|job| {
+                        job.job_id == check.operation_id
+                            && job.invocation_id == check.operation_id
+                            && job.generation == check.generation
+                            && job.role_lease_id.as_deref() == Some(check.role_lease_id)
+                            && job.role_lease_epoch == Some(check.expected_epoch)
+                    })
+                    .ok_or_else(|| {
+                        host_broker_error("OperationBound authority owner job is missing or stale")
+                    })?;
+                if !matches!(
+                    job.state,
+                    OperationJobState::Queued | OperationJobState::Running
+                ) {
+                    return Err(host_broker_error(
+                        "OperationBound authority owner job is already terminal",
+                    ));
+                }
+                Some(job.clone())
+            }
+            AuthorityLeaseLifetime::SealBound => {
+                if role.seal_attempt_id.as_deref().is_none_or(str::is_empty) {
+                    return Err(host_broker_error("SealBound authority has no seal owner"));
+                }
+                let owner = role.owner_operation_id.as_deref().ok_or_else(|| {
+                    host_broker_error("SealBound authority has no operation job owner")
+                })?;
+                let job = state
+                    .operation_jobs
+                    .iter()
+                    .find(|job| {
+                        job.job_id == owner
+                            && job.invocation_id == check.operation_id
+                            && job.generation == check.generation
+                            && job.role_lease_id.as_deref() == Some(check.role_lease_id)
+                            && job.role_lease_epoch == Some(check.expected_epoch)
+                    })
+                    .ok_or_else(|| {
+                        host_broker_error("SealBound authority owner job is missing or stale")
+                    })?;
+                Some(job.clone())
+            }
+        };
+        Ok(ActiveRoleAuthority {
+            role_lease: role.clone(),
+            host_binding: binding.clone(),
+            operation_job,
+        })
+    }
+
     pub fn enqueue(
         self,
         state: &mut DelegationState,
@@ -1173,49 +1361,65 @@ impl HostBrokerService {
             return Err(host_broker_error("host runtime profile is not current"));
         }
         let now = OffsetDateTime::now_utc();
-        let role = state
-            .task_role_leases
-            .iter()
-            .find(|lease| {
-                lease.role_lease_id == request.role_lease_id
-                    && lease.task_id == request.task_id
-                    && lease.state == AuthorityLeaseState::Active
-                    && lease.epoch == request.role_lease_epoch
-                    && lease.generation == request.operation_generation
-                    && lease.expires_at > now
-            })
-            .ok_or_else(|| host_broker_error("invocation has no active matching TaskRoleLease"))?;
-        if request.role_lease_epoch == 0 || request.operation_generation == 0 {
-            return Err(host_broker_error(
-                "fresh invocation requires nonzero role lease epoch and operation generation",
-            ));
-        }
-        let session = state
-            .agent_host_sessions
-            .iter()
-            .find(|binding| binding.agent_session_id == role.agent_session_id)
-            .ok_or_else(|| host_broker_error("role lease owner session is missing"))?;
-        if session.state != AgentSessionState::Active
-            || session
-                .bound_task_id
-                .is_some_and(|task| task != request.task_id)
-            || session.generation != request.operation_generation
-        {
-            return Err(host_broker_error(
-                "invocation owner session is inactive or generation-mismatched",
-            ));
-        }
+        let authority = self.validate_active_role_authority(
+            state,
+            &ActiveRoleAuthorityCheck {
+                operation_id: &request.invocation_id,
+                task_id: request.task_id,
+                role_lease_id: &request.role_lease_id,
+                expected_epoch: request.role_lease_epoch,
+                generation: request.operation_generation,
+                host_id: host_profile.host_id,
+                requested_capabilities: &request.requested_capabilities,
+            },
+        )?;
         if request.work_lease_id.is_some() && !work_lease_active {
             return Err(host_broker_error(
                 "invocation references a WorkLease that is not active",
             ));
         }
-        for capability in &request.requested_capabilities {
-            if !role.capability_scope.contains(capability) {
+        if authority.role_lease.lifetime == AuthorityLeaseLifetime::OperationBound {
+            let existing = authority
+                .operation_job
+                .ok_or_else(|| host_broker_error("operation owner job is missing"))?;
+            if existing.host_id != host_profile.host_id
+                || existing.idempotency_key != request.idempotency_key
+                || (existing.runtime_contract_sha256.is_some()
+                    && existing.runtime_contract_sha256 != request.runtime_contract_sha256)
+            {
                 return Err(host_broker_error(
-                    "invocation requests capability outside the TaskRoleLease",
+                    "existing operation owner differs from the invocation binding",
                 ));
             }
+            if let Some(persisted) = state
+                .agent_invocations
+                .iter()
+                .find(|item| item.invocation_id == request.invocation_id)
+                && persisted != request
+            {
+                return Err(host_broker_error(
+                    "operation adoption changed the AgentInvocationRequest",
+                ));
+            }
+            if !state
+                .agent_invocations
+                .iter()
+                .any(|item| item.invocation_id == request.invocation_id)
+            {
+                state.agent_invocations.push(request.clone());
+            }
+            let adopted = state
+                .operation_jobs
+                .iter_mut()
+                .find(|job| job.job_id == existing.job_id)
+                .ok_or_else(|| host_broker_error("operation owner job disappeared"))?;
+            if adopted.runtime_contract_sha256.is_none() {
+                adopted
+                    .runtime_contract_sha256
+                    .clone_from(&request.runtime_contract_sha256);
+                adopted.updated_at = OffsetDateTime::now_utc();
+            }
+            return Ok(adopted.clone());
         }
         if let Some(existing) = state
             .operation_jobs

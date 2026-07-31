@@ -183,10 +183,12 @@ pub use eval::{
 };
 pub use external_agent::{
     ExternalAgentExecutionRequest, ExternalAgentPurpose,
-    LEGACY_COGNITIVE_PROVIDER_RUNTIME_SCHEMA_VERSION, PROVIDER_RUNTIME_CONTRACT_SCHEMA_VERSION,
-    PROVIDER_RUNTIME_PREFLIGHT_SCHEMA_VERSION, ProviderAuthenticationState,
-    ProviderExecutionEvidence, ProviderMcpServerContract, ProviderRuntimeContract,
-    ProviderRuntimePreflightReceipt, ProviderStructuredOutputMode,
+    LEGACY_COGNITIVE_PROVIDER_RUNTIME_SCHEMA_VERSION, OPERATION_AUTHORITY_SCHEMA_VERSION,
+    OperationAuthorityCloseReceipt, OperationAuthorityCloseRequest, OperationAuthorityOpenReceipt,
+    OperationAuthorityOpenRequest, OperationAuthorityTerminalOutcome,
+    PROVIDER_RUNTIME_CONTRACT_SCHEMA_VERSION, PROVIDER_RUNTIME_PREFLIGHT_SCHEMA_VERSION,
+    ProviderAuthenticationState, ProviderExecutionEvidence, ProviderMcpServerContract,
+    ProviderRuntimeContract, ProviderRuntimePreflightReceipt, ProviderStructuredOutputMode,
 };
 pub use external_review::{
     ExternalCitationStatus, ExternalClaimStatus, ExternalEvidenceCitation, ExternalFindingSeverity,
@@ -204,10 +206,10 @@ pub use host::{
     AgentCapabilityEnvelope, AgentHostId, AgentHostIdentity, AgentHostRuntimeProfile,
     AgentInvocationRequest, AgentResultDisposition, AgentResultDispositionKind,
     AgentResultEnvelope, AgentResultStatus, AgentSessionHostBinding, AgentSessionState,
-    AuthorityLeaseState, AuthorityRevocationReceipt, ClaudeSurface, ControllerLease,
-    HostContextFootprintReport, HostEventEnvelope, HostIntegrationReceipt, HostLaunchContract,
-    HostLaunchScope, HostMode, HostProfileStatus, HostProtocolSurfaces, OperationJob,
-    OperationJobState, TaskRoleLease,
+    AuthorityLeaseLifetime, AuthorityLeaseState, AuthorityRevocationReceipt, ClaudeSurface,
+    ControllerLease, HostContextFootprintReport, HostEventEnvelope, HostIntegrationReceipt,
+    HostLaunchContract, HostLaunchScope, HostMode, HostProfileStatus, HostProtocolSurfaces,
+    OperationJob, OperationJobState, TaskRoleLease,
 };
 pub use ids::{
     ActionLeaseId, ActionRequestId, AgentId, AgentRunId, AgentSessionId,

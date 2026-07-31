@@ -1,8 +1,13 @@
-use crate::{AgentHostId, AgentInvocationRequest, HostLaunchContract};
+use crate::{
+    AgentHostId, AgentInvocationRequest, AgentRole, AgentSessionHostBinding, AgentSessionId,
+    AuthorityRevocationReceipt, HostLaunchContract, HostLaunchScope, OperationJob,
+    OperationJobState, ProjectId, TaskId, TaskRoleLease, WriteReceiptRef,
+};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
+use time::OffsetDateTime;
 
 pub const PROVIDER_RUNTIME_CONTRACT_SCHEMA_VERSION: &str = "eliot-provider-runtime-v1";
 pub const PROVIDER_RUNTIME_PREFLIGHT_SCHEMA_VERSION: &str = "eliot-provider-runtime-preflight-v1";
@@ -21,6 +26,89 @@ pub enum ExternalAgentPurpose {
     ReasoningJob,
     CapsuleRefinement,
     UnderstandingExam,
+    McpPreflight,
+}
+
+pub const OPERATION_AUTHORITY_SCHEMA_VERSION: &str = "eliot-operation-authority-v1";
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OperationAuthorityOpenRequest {
+    pub schema_version: String,
+    pub operation_id: String,
+    pub purpose: ExternalAgentPurpose,
+    pub generation: u64,
+    pub host: AgentHostId,
+    pub project_id: ProjectId,
+    pub task_id: TaskId,
+    pub agent_session_id: AgentSessionId,
+    pub role: AgentRole,
+    pub capability_scope: Vec<String>,
+    pub ttl_seconds: u64,
+    pub client_instance_id: String,
+    pub idempotency_key: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct OperationAuthorityOpenReceipt {
+    pub operation_id: String,
+    pub purpose: ExternalAgentPurpose,
+    pub generation: u64,
+    pub launch_scope: HostLaunchScope,
+    pub operation_job_id: String,
+    pub role_authority_receipt: WriteReceiptRef,
+    pub host_binding_authority_receipt: WriteReceiptRef,
+    pub operation_job_authority_receipt: WriteReceiptRef,
+    pub state_hash: String,
+    pub idempotent_replay: bool,
+    #[serde(with = "time::serde::rfc3339")]
+    pub opened_at: OffsetDateTime,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OperationAuthorityTerminalOutcome {
+    Completed,
+    FailedBeforeDispatch,
+    FailedAfterDispatch,
+    Cancelled,
+    TimedOut,
+    ReconciledUnknown,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OperationAuthorityCloseRequest {
+    pub schema_version: String,
+    pub operation_id: String,
+    pub purpose: ExternalAgentPurpose,
+    pub generation: u64,
+    pub project_id: ProjectId,
+    pub task_id: TaskId,
+    pub agent_session_id: AgentSessionId,
+    pub role_lease_id: String,
+    pub expected_epoch: u64,
+    pub terminal_outcome: OperationAuthorityTerminalOutcome,
+    pub result_or_failure_ref: Option<String>,
+    pub reason: String,
+    pub idempotency_key: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct OperationAuthorityCloseReceipt {
+    pub operation_id: String,
+    pub purpose: ExternalAgentPurpose,
+    pub generation: u64,
+    pub authority_revocation_receipt: AuthorityRevocationReceipt,
+    pub canonical_revoked_role_receipt: WriteReceiptRef,
+    pub canonical_retired_binding_receipt: WriteReceiptRef,
+    pub canonical_terminal_job_receipt: WriteReceiptRef,
+    pub final_role_lease: TaskRoleLease,
+    pub final_host_binding: AgentSessionHostBinding,
+    pub final_operation_job: OperationJob,
+    pub final_job_state: OperationJobState,
+    pub state_hash: String,
+    pub idempotent_replay: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]

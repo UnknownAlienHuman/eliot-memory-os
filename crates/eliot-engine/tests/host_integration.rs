@@ -7,9 +7,10 @@ use eliot_engine::{
 use eliot_types::{
     AgentCapabilityEnvelope, AgentHostId, AgentHostIdentity, AgentHostRuntimeProfile,
     AgentInvocationRequest, AgentResultDispositionKind, AgentResultEnvelope, AgentResultStatus,
-    AgentRole, AgentSessionHostBinding, AgentSessionId, AgentSessionState, AuthorityLeaseState,
-    DelegationState, HostLaunchScope, HostMode, HostProfileStatus, HostProtocolSurfaces,
-    OperationJobState, ProjectId, TaskId, TaskRoleLease, WorkItemId,
+    AgentRole, AgentSessionHostBinding, AgentSessionId, AgentSessionState, AuthorityLeaseLifetime,
+    AuthorityLeaseState, DelegationState, HostLaunchScope, HostMode, HostProfileStatus,
+    HostProtocolSurfaces, OperationJob, OperationJobState, OperationPhase, ProjectId, TaskId,
+    TaskRoleLease, WorkItemId,
 };
 use std::path::{Path, PathBuf};
 use time::OffsetDateTime;
@@ -140,6 +141,7 @@ fn host_identity_is_not_role_and_role_can_invert_per_task() {
         expires_at: OffsetDateTime::now_utc() + time::Duration::minutes(30),
         epoch: 1,
         state: AuthorityLeaseState::Active,
+        lifetime: eliot_types::AuthorityLeaseLifetime::Persistent,
         owner_operation_id: None,
         seal_attempt_id: None,
         generation: 1,
@@ -159,6 +161,7 @@ fn host_identity_is_not_role_and_role_can_invert_per_task() {
         expires_at: OffsetDateTime::now_utc() + time::Duration::minutes(30),
         epoch: 1,
         state: AuthorityLeaseState::Active,
+        lifetime: eliot_types::AuthorityLeaseLifetime::Persistent,
         owner_operation_id: None,
         seal_attempt_id: None,
         generation: 1,
@@ -314,6 +317,120 @@ fn connected_session_profile_does_not_require_a_local_cli() {
         profile
             .executable_path
             .starts_with("connected-session://codex/")
+    );
+}
+
+#[test]
+fn host_broker_operation_bound_authority_adopts_one_exact_job() {
+    let mut state = DelegationState::default();
+    let project_id = ProjectId::new_v7();
+    let task_id = TaskId::new_v7();
+    let session_id = AgentSessionId::new_v7();
+    let operation_id = "operation:authority-lifecycle-fixture";
+    HostBrokerService
+        .register_session_generation(
+            &mut state,
+            session_id,
+            AgentHostId::Claude,
+            "claude-fixture".to_owned(),
+            operation_id.to_owned(),
+            AgentCapabilityEnvelope {
+                capabilities: vec!["emit_candidate_observation".to_owned()],
+                structured_output: true,
+                resumable: true,
+                interactive: false,
+                supervised: true,
+            },
+            7,
+            Some(operation_id.to_owned()),
+        )
+        .expect("register operation owner");
+    HostBrokerService
+        .bind_session_scope(&mut state, session_id, project_id, task_id)
+        .expect("bind operation owner");
+    let mut grant = HostBrokerService
+        .prepare_role_grant(
+            &state,
+            task_id,
+            session_id,
+            AgentRole::Auditor,
+            vec!["emit_candidate_observation".to_owned()],
+            5,
+            Some(operation_id.to_owned()),
+        )
+        .expect("prepare operation role");
+    grant.role_lease_id = "operation-role-lease:fixture".to_owned();
+    let now = OffsetDateTime::now_utc();
+    state.operation_jobs.push(OperationJob {
+        job_id: operation_id.to_owned(),
+        invocation_id: operation_id.to_owned(),
+        host_id: AgentHostId::Claude,
+        state: OperationJobState::Queued,
+        attempt: 0,
+        resume_session_id: None,
+        result_ref: None,
+        idempotency_key: "operation-authority-fixture".to_owned(),
+        created_at: now,
+        updated_at: now,
+        generation: 7,
+        phase: OperationPhase::Prepared,
+        phase_started_at: Some(now),
+        last_progress_at: Some(now),
+        phase_deadline_at: Some(grant.expires_at),
+        absolute_deadline_at: Some(grant.expires_at),
+        restart_count: 0,
+        runtime_contract_sha256: None,
+        role_lease_id: Some(grant.role_lease_id.clone()),
+        role_lease_epoch: Some(grant.epoch),
+    });
+    let lease = HostBrokerService
+        .activate_role_grants(
+            &mut state,
+            &[grant],
+            AuthorityLeaseLifetime::OperationBound,
+            None,
+            7,
+        )
+        .expect("activate operation-bound role")
+        .pop()
+        .expect("one activated lease");
+    HostBrokerService
+        .transition(
+            &mut state.operation_jobs[0],
+            OperationJobState::Running,
+            None,
+        )
+        .expect("start owner job");
+    let request = AgentInvocationRequest {
+        invocation_id: operation_id.to_owned(),
+        project_id,
+        task_id,
+        work_item_id: WorkItemId::new_v7(),
+        requested_capabilities: vec!["emit_candidate_observation".to_owned()],
+        role_lease_id: lease.role_lease_id,
+        role_lease_epoch: lease.epoch,
+        operation_generation: 7,
+        runtime_contract_sha256: Some("b".repeat(64)),
+        work_lease_id: None,
+        packet_refs: Vec::new(),
+        expected_result_kind: "provider_execution_evidence".to_owned(),
+        verifier_ref: "fixture-verifier".to_owned(),
+        idempotency_key: "operation-authority-fixture".to_owned(),
+    };
+    let adopted = HostBrokerService
+        .enqueue(
+            &mut state,
+            &request,
+            &profile(AgentHostId::Claude, HostProfileStatus::Current),
+            true,
+        )
+        .expect("adopt operation owner job");
+    assert_eq!(adopted.job_id, operation_id);
+    assert_eq!(state.operation_jobs.len(), 1);
+    assert_eq!(state.agent_invocations, vec![request]);
+    assert_eq!(
+        state.operation_jobs[0].runtime_contract_sha256,
+        Some("b".repeat(64))
     );
 }
 

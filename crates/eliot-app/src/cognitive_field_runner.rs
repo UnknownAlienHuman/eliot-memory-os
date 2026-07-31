@@ -2832,7 +2832,8 @@ fn activate_provider_seal_authority(
     let activated = HostBrokerService.activate_role_grants(
         &mut next_broker,
         &grants,
-        &seal_attempt_id,
+        eliot_types::AuthorityLeaseLifetime::SealBound,
+        Some(&seal_attempt_id),
         authority
             .first()
             .map_or(1, |entry| entry.operation_generation),
@@ -7802,6 +7803,7 @@ mod tests {
             expires_at: now + time::Duration::minutes(30),
             epoch: 1,
             state: AuthorityLeaseState::Active,
+            lifetime: eliot_types::AuthorityLeaseLifetime::SealBound,
             owner_operation_id: Some(job_id.clone()),
             seal_attempt_id: Some("seal-attempt:s11".to_owned()),
             generation: 1,
@@ -8107,6 +8109,7 @@ mod tests {
                 expires_at: authority.expires_at,
                 epoch: 1,
                 state: AuthorityLeaseState::Active,
+                lifetime: eliot_types::AuthorityLeaseLifetime::Legacy,
                 owner_operation_id: None,
                 seal_attempt_id: None,
                 generation: 0,

@@ -2383,6 +2383,7 @@ fn append_m3_host_chain(
         expires_at: now + time::Duration::hours(1),
         epoch: 1,
         state: eliot_types::AuthorityLeaseState::Active,
+        lifetime: eliot_types::AuthorityLeaseLifetime::Persistent,
         owner_operation_id: Some(invocation_id.clone()),
         seal_attempt_id: None,
         generation: 1,

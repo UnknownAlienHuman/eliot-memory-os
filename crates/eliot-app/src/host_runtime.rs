@@ -7,7 +7,7 @@ use crate::{
         path_identity,
     },
 };
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, bail, ensure};
 use eliot_engine::{
     HostBrokerService, HostEventService, HostLaunchContractService, HostProfileService,
     SkillPackService, WorkState, WriteAdmissionService, WriterHandle, bundle_hash, bundle_root,
@@ -17,12 +17,16 @@ use eliot_store::{CanonicalStore, CanonicalToolObservation};
 use eliot_types::{
     AgentCapabilityEnvelope, AgentHostId, AgentId, AgentInvocationRequest, AgentResultEnvelope,
     AgentResultStatus, AgentRole, AgentSessionHostBinding, AgentSessionId, AgentSessionStatus,
-    ClaudeSurface, CommandContext, DelegationState, HostIntegrationReceipt, HostLaunchScope,
-    HostMode, HostProfileStatus, LifecycleStatus, MAX_SECRET_BOUNDARY_BYTES, ProjectId,
-    SecretBoundaryRule, SemanticCommand, SemanticCommandKind, SessionId, TaintClass, TaskContract,
-    TaskContractStatus, TaskId, ToolObservationRecordCommand, Visibility, WorkItemId, WorkLease,
-    WorkLeaseId, WorktreeLease, WorktreeLeaseId, WorktreeLeaseState, WriteId, WriteReceipt,
-    WriteReceiptRef, WriteStatus, inspect_secret_bytes,
+    AuthorityLeaseLifetime, AuthorityLeaseState, ClaudeSurface, CommandContext, DelegationState,
+    ExternalAgentPurpose, HostIntegrationReceipt, HostLaunchScope, HostMode, HostProfileStatus,
+    LifecycleStatus, MAX_SECRET_BOUNDARY_BYTES, OPERATION_AUTHORITY_SCHEMA_VERSION,
+    OperationAuthorityCloseReceipt, OperationAuthorityCloseRequest, OperationAuthorityOpenReceipt,
+    OperationAuthorityOpenRequest, OperationAuthorityTerminalOutcome, OperationJob,
+    OperationJobState, OperationPhase, ProjectId, SecretBoundaryRule, SemanticCommand,
+    SemanticCommandKind, SessionId, TaintClass, TaskContract, TaskContractStatus, TaskId,
+    ToolObservationRecordCommand, Visibility, WorkItemId, WorkLease, WorkLeaseId, WorktreeLease,
+    WorktreeLeaseId, WorktreeLeaseState, WriteId, WriteReceipt, WriteReceiptRef, WriteStatus,
+    inspect_secret_bytes,
 };
 use jsonc_parser::{
     ParseOptions,
@@ -431,6 +435,26 @@ struct RoleLeaseAuthorityRecord {
     canonical_receipt: WriteReceiptRef,
     host_binding_hash: String,
     canonical_host_binding_receipt: WriteReceiptRef,
+    #[serde(default)]
+    operation_job_hash: Option<String>,
+    #[serde(default)]
+    canonical_operation_job_receipt: Option<WriteReceiptRef>,
+    #[serde(default)]
+    purpose: Option<ExternalAgentPurpose>,
+    #[serde(default)]
+    generation: u64,
+    #[serde(default)]
+    state_hash: String,
+    #[serde(default, with = "time::serde::rfc3339::option")]
+    opened_at: Option<OffsetDateTime>,
+    #[serde(default)]
+    close_idempotency_key: Option<String>,
+    #[serde(default)]
+    canonical_revoked_role_receipt: Option<WriteReceiptRef>,
+    #[serde(default)]
+    canonical_retired_binding_receipt: Option<WriteReceiptRef>,
+    #[serde(default)]
+    canonical_terminal_job_receipt: Option<WriteReceiptRef>,
 }
 
 #[derive(Debug, Deserialize)]

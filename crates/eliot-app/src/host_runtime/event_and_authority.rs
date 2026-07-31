@@ -2675,6 +2675,561 @@ pub(crate) async fn grant_role_from_daemon(
     grant_role_with_writer(root, store, writer, input).await
 }
 
+pub(crate) async fn open_operation_scope_from_daemon(
+    root: &Path,
+    store: &CanonicalStore,
+    writer: &WriterHandle,
+    params: Value,
+) -> Result<Value> {
+    let input: OperationAuthorityOpenRequest =
+        serde_json::from_value(params).context("decode private operation scope open RPC")?;
+    store.migrate_schema().await?;
+    let receipt = open_operation_scope_with_writer(root, store, writer, input).await?;
+    Ok(serde_json::to_value(receipt)?)
+}
+
+pub(crate) async fn close_operation_scope_from_daemon(
+    root: &Path,
+    store: &CanonicalStore,
+    writer: &WriterHandle,
+    params: Value,
+) -> Result<Value> {
+    let input: OperationAuthorityCloseRequest =
+        serde_json::from_value(params).context("decode private operation scope close RPC")?;
+    store.migrate_schema().await?;
+    let receipt = close_operation_scope_with_writer(root, store, writer, input).await?;
+    Ok(serde_json::to_value(receipt)?)
+}
+
+fn deterministic_operation_role_lease_id(operation_id: &str) -> String {
+    format!(
+        "operation-role-lease:{}",
+        blake3::hash(operation_id.as_bytes()).to_hex()
+    )
+}
+
+fn operation_launch_scope(
+    input: &OperationAuthorityOpenRequest,
+    role_lease_id: String,
+    role_lease_epoch: u64,
+) -> HostLaunchScope {
+    HostLaunchScope {
+        project_id: Some(input.project_id),
+        agent_session_id: Some(input.agent_session_id),
+        task_id: Some(input.task_id),
+        work_item_id: None,
+        role_lease_id: Some(role_lease_id),
+        role_lease_epoch,
+        operation_generation: input.generation,
+        work_lease_id: None,
+        worktree_lease_id: None,
+        planned_verifier_ref: None,
+        baseline_commit: None,
+        allowed_paths: Vec::new(),
+        forbidden_paths: vec![
+            "global-provider-config".to_owned(),
+            "truth-promotion".to_owned(),
+        ],
+    }
+}
+
+fn load_role_authority_record(root: &Path, role_lease_id: &str) -> Result<RoleLeaseAuthorityRecord> {
+    let path = role_authority_path_from_root(root, role_lease_id);
+    let bytes = std::fs::read(&path)
+        .with_context(|| format!("read role authority projection {}", path.display()))?;
+    serde_json::from_slice(&bytes)
+        .with_context(|| format!("decode role authority projection {}", path.display()))
+}
+
+fn validate_operation_open(input: &OperationAuthorityOpenRequest) -> Result<()> {
+    ensure!(
+        input.schema_version == OPERATION_AUTHORITY_SCHEMA_VERSION,
+        "unsupported operation authority schema"
+    );
+    ensure!(
+        !input.operation_id.trim().is_empty()
+            && !input.client_instance_id.trim().is_empty()
+            && !input.idempotency_key.trim().is_empty(),
+        "operation authority identity fields must be nonempty"
+    );
+    ensure!(input.generation > 0, "operation generation must be nonzero");
+    ensure!(
+        (1..=30 * 60).contains(&input.ttl_seconds),
+        "operation authority TTL must be between 1 and 1800 seconds"
+    );
+    if input.purpose == ExternalAgentPurpose::McpPreflight {
+        ensure!(
+            input.ttl_seconds <= 5 * 60,
+            "MCP preflight authority TTL exceeds five minutes"
+        );
+    }
+    ensure!(
+        input.role != AgentRole::Controller,
+        "one-shot external operation cannot acquire Controller authority"
+    );
+    ensure!(
+        !input.capability_scope.is_empty()
+            && input
+                .capability_scope
+                .iter()
+                .all(|capability| !capability.trim().is_empty()),
+        "operation authority requires a nonempty capability scope"
+    );
+    Ok(())
+}
+
+#[allow(clippy::too_many_lines)]
+async fn open_operation_scope_with_writer(
+    root: &Path,
+    store: &CanonicalStore,
+    writer: &WriterHandle,
+    input: OperationAuthorityOpenRequest,
+) -> Result<OperationAuthorityOpenReceipt> {
+    validate_operation_open(&input)?;
+    let task = store
+        .task_contract_by_id(input.task_id)
+        .await?
+        .context("operation authority requires a current canonical TaskContract")?;
+    ensure!(
+        task.status == TaskContractStatus::Open && task.project_id == input.project_id,
+        "operation authority requires an open TaskContract in the exact project"
+    );
+    let role_lease_id = deterministic_operation_role_lease_id(&input.operation_id);
+    let state = delegation_runtime::load_state(root)?;
+    if let Some(job) = state
+        .operation_jobs
+        .iter()
+        .find(|job| job.job_id == input.operation_id || job.invocation_id == input.operation_id)
+    {
+        ensure!(
+            job.job_id == input.operation_id
+                && job.invocation_id == input.operation_id
+                && job.host_id == input.host
+                && job.generation == input.generation
+                && job.idempotency_key == input.idempotency_key
+                && job.role_lease_id.as_deref() == Some(role_lease_id.as_str()),
+            "operation scope open replay conflicts with its existing owner"
+        );
+        let lease = state
+            .task_role_leases
+            .iter()
+            .find(|lease| lease.role_lease_id == role_lease_id)
+            .context("operation scope replay has no role lease")?;
+        ensure!(
+            lease.state == AuthorityLeaseState::Active
+                && lease.lifetime == AuthorityLeaseLifetime::OperationBound
+                && lease.owner_operation_id.as_deref() == Some(input.operation_id.as_str())
+                && lease.generation == input.generation,
+            "operation scope replay has no current operation-bound authority"
+        );
+        let authority = load_role_authority_record(root, &role_lease_id)?;
+        return Ok(OperationAuthorityOpenReceipt {
+            operation_id: input.operation_id.clone(),
+            purpose: input.purpose,
+            generation: input.generation,
+            launch_scope: operation_launch_scope(&input, role_lease_id, lease.epoch),
+            operation_job_id: job.job_id.clone(),
+            role_authority_receipt: authority.canonical_receipt,
+            host_binding_authority_receipt: authority.canonical_host_binding_receipt,
+            operation_job_authority_receipt: authority
+                .canonical_operation_job_receipt
+                .context("operation scope replay has no canonical job receipt")?,
+            state_hash: hash_json(&serde_json::to_value(&state)?)?,
+            idempotent_replay: true,
+            opened_at: authority.opened_at.context("operation scope replay has no open time")?,
+        });
+    }
+    ensure!(
+        !state.operation_jobs.iter().any(|job| {
+            job.idempotency_key == input.idempotency_key
+                || (job.host_id == input.host
+                    && job.generation == input.generation
+                    && matches!(job.state, OperationJobState::Queued | OperationJobState::Running))
+        }),
+        "operation scope conflicts with an active owner or idempotency key"
+    );
+    ensure!(
+        !state.task_role_leases.iter().any(|lease| {
+            lease.agent_session_id == input.agent_session_id
+                && lease.state == AuthorityLeaseState::Active
+        }),
+        "operation session already owns active authority"
+    );
+
+    let now = OffsetDateTime::now_utc();
+    let mut owner_shell = state;
+    let binding = HostBrokerService.register_session_generation(
+        &mut owner_shell,
+        input.agent_session_id,
+        input.host,
+        input.host.as_str().to_owned(),
+        input.client_instance_id.clone(),
+        AgentCapabilityEnvelope {
+            capabilities: input.capability_scope.clone(),
+            structured_output: true,
+            resumable: true,
+            interactive: false,
+            supervised: true,
+        },
+        input.generation,
+        Some(input.operation_id.clone()),
+    )?;
+    HostBrokerService.bind_session_scope(
+        &mut owner_shell,
+        binding.agent_session_id,
+        input.project_id,
+        input.task_id,
+    )?;
+    let mut grant = HostBrokerService.prepare_role_grant(
+        &owner_shell,
+        input.task_id,
+        input.agent_session_id,
+        input.role,
+        input.capability_scope.clone(),
+        i64::try_from(input.ttl_seconds.div_ceil(60))?,
+        Some(input.operation_id.clone()),
+    )?;
+    grant.role_lease_id.clone_from(&role_lease_id);
+    grant.expires_at = now + time::Duration::seconds(i64::try_from(input.ttl_seconds)?);
+    let prepared_job = OperationJob {
+        job_id: input.operation_id.clone(),
+        invocation_id: input.operation_id.clone(),
+        host_id: input.host,
+        state: OperationJobState::Queued,
+        attempt: 0,
+        resume_session_id: None,
+        result_ref: None,
+        idempotency_key: input.idempotency_key.clone(),
+        created_at: now,
+        updated_at: now,
+        generation: input.generation,
+        phase: OperationPhase::Prepared,
+        phase_started_at: Some(now),
+        last_progress_at: Some(now),
+        phase_deadline_at: Some(grant.expires_at),
+        absolute_deadline_at: Some(grant.expires_at),
+        restart_count: 0,
+        runtime_contract_sha256: None,
+        role_lease_id: Some(role_lease_id.clone()),
+        role_lease_epoch: Some(grant.epoch),
+    };
+    owner_shell.operation_jobs.push(prepared_job.clone());
+    delegation_runtime::save_host_broker_state(root, &owner_shell)?;
+
+    let mut activated_state = owner_shell;
+    let mut activated = HostBrokerService.activate_role_grants(
+        &mut activated_state,
+        &[grant],
+        AuthorityLeaseLifetime::OperationBound,
+        None,
+        input.generation,
+    )?;
+    let role_lease = activated
+        .pop()
+        .context("operation authority activation returned no role lease")?;
+    let job = activated_state
+        .operation_jobs
+        .iter_mut()
+        .find(|job| job.job_id == input.operation_id)
+        .context("operation owner job disappeared before activation")?;
+    HostBrokerService.transition(job, OperationJobState::Running, None)?;
+    let running_job = job.clone();
+    let active_binding = activated_state
+        .agent_host_sessions
+        .iter()
+        .find(|candidate| candidate.agent_session_id == input.agent_session_id)
+        .cloned()
+        .context("operation host binding disappeared before activation")?;
+
+    let role_value = serde_json::to_value(&role_lease)?;
+    let binding_value = serde_json::to_value(&active_binding)?;
+    let job_value = serde_json::to_value(&running_job)?;
+    let (role_authority_receipt, _) = write_canonical_host_observation_with_writer(
+        writer,
+        input.project_id,
+        input.task_id,
+        input.agent_session_id,
+        &format!("host-role-lease:{role_lease_id}"),
+        "host_role_lease_authority",
+        &role_value,
+    )
+    .await?;
+    let (host_binding_authority_receipt, _) = write_canonical_host_observation_with_writer(
+        writer,
+        input.project_id,
+        input.task_id,
+        input.agent_session_id,
+        &format!("host-binding:{}:{}", input.agent_session_id, input.task_id),
+        "host_binding_authority",
+        &binding_value,
+    )
+    .await?;
+    let (operation_job_authority_receipt, _) = write_canonical_host_observation_with_writer(
+        writer,
+        input.project_id,
+        input.task_id,
+        input.agent_session_id,
+        &format!("operation-job:{}", input.operation_id),
+        "operation_job_authority",
+        &job_value,
+    )
+    .await?;
+
+    let state_hash = hash_json(&serde_json::to_value(&activated_state)?)?;
+    let authority = RoleLeaseAuthorityRecord {
+        schema_version: "eliot-host-role-lease-authority-v2".to_owned(),
+        role_lease_id: role_lease_id.clone(),
+        lease_hash: hash_json(&role_value)?,
+        task_revision: task.memory_revision.value(),
+        canonical_receipt: role_authority_receipt.clone(),
+        host_binding_hash: hash_json(&binding_value)?,
+        canonical_host_binding_receipt: host_binding_authority_receipt.clone(),
+        operation_job_hash: Some(hash_json(&job_value)?),
+        canonical_operation_job_receipt: Some(operation_job_authority_receipt.clone()),
+        purpose: Some(input.purpose),
+        generation: input.generation,
+        state_hash: state_hash.clone(),
+        opened_at: Some(now),
+        close_idempotency_key: None,
+        canonical_revoked_role_receipt: None,
+        canonical_retired_binding_receipt: None,
+        canonical_terminal_job_receipt: None,
+    };
+    atomic_write_json(&role_authority_path_from_root(root, &role_lease_id), &authority)?;
+    delegation_runtime::save_host_broker_state(root, &activated_state)?;
+    Ok(OperationAuthorityOpenReceipt {
+        operation_id: input.operation_id.clone(),
+        purpose: input.purpose,
+        generation: input.generation,
+        launch_scope: operation_launch_scope(&input, role_lease_id, role_lease.epoch),
+        operation_job_id: running_job.job_id,
+        role_authority_receipt,
+        host_binding_authority_receipt,
+        operation_job_authority_receipt,
+        state_hash,
+        idempotent_replay: false,
+        opened_at: now,
+    })
+}
+
+#[allow(clippy::too_many_lines)]
+async fn close_operation_scope_with_writer(
+    root: &Path,
+    store: &CanonicalStore,
+    writer: &WriterHandle,
+    input: OperationAuthorityCloseRequest,
+) -> Result<OperationAuthorityCloseReceipt> {
+    ensure!(
+        input.schema_version == OPERATION_AUTHORITY_SCHEMA_VERSION,
+        "unsupported operation authority schema"
+    );
+    ensure!(
+        input.generation > 0
+            && input.expected_epoch > 0
+            && !input.operation_id.trim().is_empty()
+            && !input.idempotency_key.trim().is_empty()
+            && !input.reason.trim().is_empty(),
+        "operation close identity fields are invalid"
+    );
+    let task = store
+        .task_contract_by_id(input.task_id)
+        .await?
+        .context("operation close requires a canonical TaskContract")?;
+    ensure!(
+        task.project_id == input.project_id,
+        "operation close project/task scope mismatch"
+    );
+    let mut authority = load_role_authority_record(root, &input.role_lease_id)?;
+    ensure!(
+        authority.purpose == Some(input.purpose) && authority.generation == input.generation,
+        "operation close purpose or generation differs from open"
+    );
+    let state = delegation_runtime::load_state(root)?;
+    let lease = state
+        .task_role_leases
+        .iter()
+        .find(|lease| lease.role_lease_id == input.role_lease_id)
+        .context("operation close role lease is missing")?;
+    if lease.state == AuthorityLeaseState::Revoked
+        && authority.close_idempotency_key.as_deref() == Some(input.idempotency_key.as_str())
+    {
+        let binding = state
+            .agent_host_sessions
+            .iter()
+            .find(|binding| binding.agent_session_id == input.agent_session_id)
+            .cloned()
+            .context("closed operation host binding is missing")?;
+        let job = state
+            .operation_jobs
+            .iter()
+            .find(|job| job.job_id == input.operation_id)
+            .cloned()
+            .context("closed operation job is missing")?;
+        let revocation = state
+            .authority_revocation_receipts
+            .iter()
+            .find(|receipt| {
+                receipt.role_lease_id == input.role_lease_id
+                    && receipt.prior_epoch == input.expected_epoch
+                    && receipt.prior_generation == input.generation
+            })
+            .cloned()
+            .context("closed operation revocation receipt is missing")?;
+        return Ok(OperationAuthorityCloseReceipt {
+            operation_id: input.operation_id,
+            purpose: input.purpose,
+            generation: input.generation,
+            authority_revocation_receipt: revocation,
+            canonical_revoked_role_receipt: authority
+                .canonical_revoked_role_receipt
+                .context("closed operation role receipt is missing")?,
+            canonical_retired_binding_receipt: authority
+                .canonical_retired_binding_receipt
+                .context("closed operation binding receipt is missing")?,
+            canonical_terminal_job_receipt: authority
+                .canonical_terminal_job_receipt
+                .context("closed operation job receipt is missing")?,
+            final_role_lease: lease.clone(),
+            final_host_binding: binding,
+            final_job_state: job.state,
+            final_operation_job: job,
+            state_hash: hash_json(&serde_json::to_value(&state)?)?,
+            idempotent_replay: true,
+        });
+    }
+    ensure!(
+        lease.task_id == input.task_id
+            && lease.agent_session_id == input.agent_session_id
+            && lease.state == AuthorityLeaseState::Active
+            && lease.lifetime == AuthorityLeaseLifetime::OperationBound
+            && lease.owner_operation_id.as_deref() == Some(input.operation_id.as_str())
+            && lease.seal_attempt_id.is_none()
+            && lease.epoch == input.expected_epoch
+            && lease.generation == input.generation,
+        "operation close does not match the exact active owner"
+    );
+    let mut fenced = state;
+    let final_role_lease = HostBrokerService.revoke_role(
+        &mut fenced,
+        &input.role_lease_id,
+        input.expected_epoch,
+        &input.reason,
+        None,
+    )?;
+    let final_host_binding = HostBrokerService.retire_session(
+        &mut fenced,
+        input.agent_session_id,
+        &input.reason,
+    )?;
+    let job = fenced
+        .operation_jobs
+        .iter_mut()
+        .find(|job| {
+            job.job_id == input.operation_id
+                && job.invocation_id == input.operation_id
+                && job.generation == input.generation
+        })
+        .context("operation close owner job is missing or stale")?;
+    job.state = match input.terminal_outcome {
+        OperationAuthorityTerminalOutcome::Completed => OperationJobState::Completed,
+        OperationAuthorityTerminalOutcome::FailedBeforeDispatch
+        | OperationAuthorityTerminalOutcome::FailedAfterDispatch => OperationJobState::Failed,
+        OperationAuthorityTerminalOutcome::Cancelled => OperationJobState::Cancelled,
+        OperationAuthorityTerminalOutcome::TimedOut => OperationJobState::TimedOut,
+        OperationAuthorityTerminalOutcome::ReconciledUnknown => OperationJobState::Reconciled,
+    };
+    job.phase = match job.state {
+        OperationJobState::Completed | OperationJobState::Reconciled => OperationPhase::Completed,
+        OperationJobState::Cancelled
+        | OperationJobState::Failed
+        | OperationJobState::TimedOut
+        | OperationJobState::UnknownOutcome => OperationPhase::Failed,
+        _ => OperationPhase::Abandoned,
+    };
+    job.result_ref.clone_from(&input.result_or_failure_ref);
+    let now = OffsetDateTime::now_utc();
+    job.phase_started_at = Some(now);
+    job.last_progress_at = Some(now);
+    job.updated_at = now;
+    let final_operation_job = job.clone();
+    let authority_revocation_receipt = fenced
+        .authority_revocation_receipts
+        .iter()
+        .find(|receipt| {
+            receipt.role_lease_id == input.role_lease_id
+                && receipt.prior_epoch == input.expected_epoch
+                && receipt.prior_generation == input.generation
+        })
+        .cloned()
+        .context("operation close produced no revocation receipt")?;
+    delegation_runtime::save_host_broker_state(root, &fenced)?;
+
+    let role_value = serde_json::to_value(&final_role_lease)?;
+    let binding_value = serde_json::to_value(&final_host_binding)?;
+    let job_value = serde_json::to_value(&final_operation_job)?;
+    let (canonical_revoked_role_receipt, _) = write_canonical_host_observation_with_writer(
+        writer,
+        input.project_id,
+        input.task_id,
+        input.agent_session_id,
+        &format!("host-role-lease:{}", input.role_lease_id),
+        "host_role_lease_authority",
+        &role_value,
+    )
+    .await?;
+    let (canonical_retired_binding_receipt, _) = write_canonical_host_observation_with_writer(
+        writer,
+        input.project_id,
+        input.task_id,
+        input.agent_session_id,
+        &format!("host-binding:{}:{}", input.agent_session_id, input.task_id),
+        "host_binding_authority",
+        &binding_value,
+    )
+    .await?;
+    let (canonical_terminal_job_receipt, _) = write_canonical_host_observation_with_writer(
+        writer,
+        input.project_id,
+        input.task_id,
+        input.agent_session_id,
+        &format!("operation-job:{}", input.operation_id),
+        "operation_job_authority",
+        &job_value,
+    )
+    .await?;
+    let state_hash = hash_json(&serde_json::to_value(&fenced)?)?;
+    authority.lease_hash = hash_json(&role_value)?;
+    authority.canonical_receipt = canonical_revoked_role_receipt.clone();
+    authority.host_binding_hash = hash_json(&binding_value)?;
+    authority.canonical_host_binding_receipt = canonical_retired_binding_receipt.clone();
+    authority.operation_job_hash = Some(hash_json(&job_value)?);
+    authority.canonical_operation_job_receipt = Some(canonical_terminal_job_receipt.clone());
+    authority.state_hash.clone_from(&state_hash);
+    authority.close_idempotency_key = Some(input.idempotency_key);
+    authority.canonical_revoked_role_receipt = Some(canonical_revoked_role_receipt.clone());
+    authority.canonical_retired_binding_receipt = Some(canonical_retired_binding_receipt.clone());
+    authority.canonical_terminal_job_receipt = Some(canonical_terminal_job_receipt.clone());
+    atomic_write_json(
+        &role_authority_path_from_root(root, &input.role_lease_id),
+        &authority,
+    )?;
+    Ok(OperationAuthorityCloseReceipt {
+        operation_id: input.operation_id,
+        purpose: input.purpose,
+        generation: input.generation,
+        authority_revocation_receipt,
+        canonical_revoked_role_receipt,
+        canonical_retired_binding_receipt,
+        canonical_terminal_job_receipt,
+        final_role_lease,
+        final_host_binding,
+        final_job_state: final_operation_job.state,
+        final_operation_job,
+        state_hash,
+        idempotent_replay: false,
+    })
+}
+
 pub(crate) async fn record_host_observation_from_daemon(
     root: &Path,
     store: &CanonicalStore,
@@ -2939,6 +3494,16 @@ async fn grant_role_with_writer(
         canonical_receipt: canonical_receipt.clone(),
         host_binding_hash: hash_json(&host_binding_value)?,
         canonical_host_binding_receipt: canonical_host_binding_receipt.clone(),
+        operation_job_hash: None,
+        canonical_operation_job_receipt: None,
+        purpose: None,
+        generation: role_lease.generation,
+        state_hash: hash_json(&serde_json::to_value(&state)?)?,
+        opened_at: role_lease.activated_at,
+        close_idempotency_key: None,
+        canonical_revoked_role_receipt: None,
+        canonical_retired_binding_receipt: None,
+        canonical_terminal_job_receipt: None,
     };
     atomic_write_json(
         &role_authority_path_from_root(root, &role_lease.role_lease_id),

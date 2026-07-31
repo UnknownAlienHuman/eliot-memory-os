@@ -720,16 +720,107 @@ impl SmokePhaseTrace {
     }
 }
 
+#[derive(Clone)]
+struct OperationBoundHostScope {
+    open_receipt: OperationAuthorityOpenReceipt,
+    launch_scope: HostLaunchScope,
+    instance: RuntimeInstance,
+}
+
+async fn with_operation_bound_host_scope<T, F, Fut>(
+    config_path: &Path,
+    open: OperationAuthorityOpenRequest,
+    operation: F,
+) -> Result<T>
+where
+    F: FnOnce(OperationBoundHostScope) -> Fut,
+    Fut: std::future::Future<Output = Result<T>>,
+{
+    let instance = host_governor_instance(config_path)?;
+    let response = named_pipe_ipc::host_governor_request(
+        &instance,
+        "host/operation-scope-open",
+        serde_json::to_value(&open)?,
+    )
+    .await
+    .context("open operation-bound host authority")?;
+    let open_receipt: OperationAuthorityOpenReceipt =
+        serde_json::from_value(response).context("decode operation scope open receipt")?;
+    let scope = OperationBoundHostScope {
+        launch_scope: open_receipt.launch_scope.clone(),
+        open_receipt: open_receipt.clone(),
+        instance: instance.clone(),
+    };
+    let body = operation(scope).await;
+    let (terminal_outcome, result_or_failure_ref, reason) = match &body {
+        Ok(_) => (
+            OperationAuthorityTerminalOutcome::Completed,
+            Some(format!("operation-completed:{}", open.operation_id)),
+            "operation_body_completed".to_owned(),
+        ),
+        Err(error) => (
+            if open.purpose == ExternalAgentPurpose::McpPreflight {
+                OperationAuthorityTerminalOutcome::FailedBeforeDispatch
+            } else {
+                OperationAuthorityTerminalOutcome::FailedAfterDispatch
+            },
+            Some(format!(
+                "operation-error:{}",
+                blake3::hash(error.to_string().as_bytes()).to_hex()
+            )),
+            format!("operation_body_failed: {error}"),
+        ),
+    };
+    let role_lease_id = open_receipt
+        .launch_scope
+        .role_lease_id
+        .clone()
+        .context("operation scope open receipt has no role lease")?;
+    let close = OperationAuthorityCloseRequest {
+        schema_version: OPERATION_AUTHORITY_SCHEMA_VERSION.to_owned(),
+        operation_id: open.operation_id.clone(),
+        purpose: open.purpose,
+        generation: open.generation,
+        project_id: open.project_id,
+        task_id: open.task_id,
+        agent_session_id: open.agent_session_id,
+        role_lease_id,
+        expected_epoch: open_receipt.launch_scope.role_lease_epoch,
+        terminal_outcome,
+        result_or_failure_ref,
+        reason,
+        idempotency_key: format!("{}:close", open.idempotency_key),
+    };
+    let close_result = named_pipe_ipc::host_governor_request(
+        &instance,
+        "host/operation-scope-close",
+        serde_json::to_value(close)?,
+    )
+    .await
+    .and_then(|response| {
+        serde_json::from_value::<OperationAuthorityCloseReceipt>(response)
+            .context("decode operation scope close receipt")
+    });
+    match (body, close_result) {
+        (Ok(value), Ok(_)) => Ok(value),
+        (Err(body_error), Ok(_)) => Err(body_error),
+        (Ok(_), Err(close_error)) => {
+            Err(close_error).context("operation body passed but authority cleanup failed")
+        }
+        (Err(body_error), Err(close_error)) => Err(anyhow::anyhow!(
+            "operation body failed: {body_error}; authority cleanup also failed: {close_error}"
+        )),
+    }
+}
+
 struct McpSmokePreparation {
     smoke_id: String,
     smoke_root: PathBuf,
     workspace: PathBuf,
     project_id: ProjectId,
     task_id: TaskId,
-    scope: HostLaunchScope,
+    agent_session_id: AgentSessionId,
     work_item_id: WorkItemId,
-    memory_revision: u64,
-    preflight: McpReferenceExchange,
     trace: SmokePhaseTrace,
 }
 
@@ -826,24 +917,171 @@ async fn prepare_mcp_smoke(
                 .is_some_and(|value| value.get("task_contract").is_some()),
             "smoke task contract was not created canonically"
         );
-        let session_id = SessionId::new_v7();
-        let mut scope = trace
+        let agent_session_id = AgentSessionId::new_v7();
+        let work_item_id = WorkItemId::new_v7();
+        Ok(McpSmokePreparation {
+            smoke_id,
+            smoke_root,
+            workspace,
+            project_id,
+            task_id,
+            agent_session_id,
+            work_item_id,
+            trace: trace.clone(),
+        })
+    };
+    let Ok(result) = tokio::time::timeout(MCP_SMOKE_PRE_PROVIDER_TIMEOUT, preparation).await else {
+        trace.abort_active("whole pre-provider deadline exceeded")?;
+        anyhow::bail!(
+            "MCP smoke pre-provider preparation exceeded {} seconds; phase journal={}",
+            MCP_SMOKE_PRE_PROVIDER_TIMEOUT.as_secs(),
+            trace.path().display()
+        )
+    };
+    result
+}
+
+async fn run_mcp_preflight(config_path: &Path, host: AgentHostId, model: &str) -> Result<Value> {
+    let preparation = prepare_mcp_smoke(config_path, host, model).await?;
+    let report_path = runtime_root(config_path)
+        .join("reports")
+        .join("external-agent-smokes")
+        .join(format!("{}-preflight-latest.json", host.as_str()));
+    let smoke_report_path = preparation.smoke_root.join("preflight-report.json");
+    let open = OperationAuthorityOpenRequest {
+        schema_version: OPERATION_AUTHORITY_SCHEMA_VERSION.to_owned(),
+        operation_id: preparation.smoke_id.clone(),
+        purpose: ExternalAgentPurpose::McpPreflight,
+        generation: 1,
+        host,
+        project_id: preparation.project_id,
+        task_id: preparation.task_id,
+        agent_session_id: preparation.agent_session_id,
+        role: AgentRole::Auditor,
+        capability_scope: external_auditor_capability_scope(),
+        ttl_seconds: 5 * 60,
+        client_instance_id: preparation.smoke_id.clone(),
+        idempotency_key: format!("operation-authority:{}", preparation.smoke_id),
+    };
+    let report = with_operation_bound_host_scope(config_path, open, |operation_scope| async move {
+        let mut scope = operation_scope.launch_scope.clone();
+        scope.work_item_id = Some(preparation.work_item_id);
+        scope.planned_verifier_ref = Some(format!(
+            "external-agent-smoke-verifier:{}",
+            preparation.smoke_id
+        ));
+        let preflight = preparation
+            .trace
             .run(
-                "ul_auditor_scope",
-                prepare_ul_auditor_scope(
+                "current_state_preflight",
+                mcp_reference_exchange(
                     config_path,
-                    host,
-                    project_id,
-                    task_id,
-                    session_id,
-                    &smoke_id,
+                    if host == AgentHostId::OpenCode {
+                        Some("default")
+                    } else {
+                        Some("external_auditor")
+                    },
+                    Some(host),
+                    Some(&scope),
+                    Some("eliot_current_state"),
+                    Some(&json!({"scope": "memory_free_control"})),
+                    "current_state_preflight",
                 ),
             )
             .await?;
-        let work_item_id = WorkItemId::new_v7();
+        anyhow::ensure!(
+            preflight
+                .tool_names
+                .iter()
+                .any(|name| name == "eliot_current_state"),
+            "zero-model preflight did not expose eliot_current_state"
+        );
+        let current_state = preflight
+            .tool_call
+            .as_ref()
+            .context("zero-model current_state preflight returned no structured content")?;
+        let memory_revision = current_state
+            .get("memory_revision")
+            .or_else(|| current_state.get("revision"))
+            .and_then(Value::as_u64)
+            .context("zero-model current_state returned no memory revision")?;
+        anyhow::ensure!(
+            operation_scope.instance == host_governor_instance(config_path)?,
+            "operation scope daemon instance changed during preflight"
+        );
+        Ok(json!({
+            "schema_version": "eliot-external-agent-mcp-preflight-v2",
+            "status": "passed",
+            "smoke_id": preparation.smoke_id,
+            "host": host,
+            "model": model,
+            "project_id": preparation.project_id,
+            "task_id": preparation.task_id,
+            "memory_revision": memory_revision,
+            "tool_names": preflight.tool_names,
+            "raw_database_absent": preflight.raw_database_absent,
+            "phase_journal_ref": path_string(preparation.trace.path()),
+            "authority_open_state_hash": operation_scope.open_receipt.state_hash,
+            "provider_calls": 0,
+            "gui_used": false,
+        }))
+    })
+    .await?;
+    atomic_write_json(&report_path, &report)?;
+    atomic_write_json(&smoke_report_path, &report)?;
+    Ok(report)
+}
+
+fn mcp_smoke_prompt(model: &str) -> String {
+    format!(
+        "Use the configured ELIOT MCP server. Call eliot_current_state exactly once with the sole argument {{\"scope\":\"memory_free_control\"}}; do not pass project_id or task_id because the Governor binds them. Return one plain JSON object, without Markdown fences or prose, containing only the schema-bound project_id, task_id, memory_revision and resolved_model={model}. Do not edit files."
+    )
+}
+
+fn memory_revision_within_execution_window(
+    preflight_revision: u64,
+    observed_revision: u64,
+    postflight_revision: u64,
+) -> bool {
+    observed_revision >= preflight_revision && observed_revision <= postflight_revision
+}
+
+#[allow(clippy::too_many_lines)]
+async fn run_mcp_smoke(config_path: &Path, host: AgentHostId, model: &str) -> Result<Value> {
+    let McpSmokePreparation {
+        smoke_id,
+        smoke_root,
+        workspace,
+        project_id,
+        task_id,
+        agent_session_id: prepared_agent_session_id,
+        work_item_id,
+        trace,
+    } = prepare_mcp_smoke(config_path, host, model).await?;
+    let report_path = runtime_root(config_path)
+        .join("reports")
+        .join("external-agent-smokes")
+        .join(format!("{}-latest.json", host.as_str()));
+    let smoke_report_path = smoke_root.join("smoke-report.json");
+    let open = OperationAuthorityOpenRequest {
+        schema_version: OPERATION_AUTHORITY_SCHEMA_VERSION.to_owned(),
+        operation_id: smoke_id.clone(),
+        purpose: ExternalAgentPurpose::ProviderSmoke,
+        generation: 1,
+        host,
+        project_id,
+        task_id,
+        agent_session_id: prepared_agent_session_id,
+        role: AgentRole::Auditor,
+        capability_scope: external_auditor_capability_scope(),
+        ttl_seconds: 5 * 60,
+        client_instance_id: smoke_id.clone(),
+        idempotency_key: format!("external-agent-smoke:{smoke_id}"),
+    };
+    let report = with_operation_bound_host_scope(config_path, open, |operation_scope| async move {
+        let mut scope = operation_scope.launch_scope.clone();
         scope.work_item_id = Some(work_item_id);
         scope.planned_verifier_ref = Some(format!("external-agent-smoke-verifier:{smoke_id}"));
-
         let preflight = trace
             .run(
                 "current_state_preflight",
@@ -878,89 +1116,8 @@ async fn prepare_mcp_smoke(
             .or_else(|| current_state.get("revision"))
             .and_then(Value::as_u64)
             .context("zero-model current_state returned no memory revision")?;
-        Ok(McpSmokePreparation {
-            smoke_id,
-            smoke_root,
-            workspace,
-            project_id,
-            task_id,
-            scope,
-            work_item_id,
-            memory_revision,
-            preflight,
-            trace: trace.clone(),
-        })
-    };
-    let Ok(result) = tokio::time::timeout(MCP_SMOKE_PRE_PROVIDER_TIMEOUT, preparation).await else {
-        trace.abort_active("whole pre-provider deadline exceeded")?;
-        anyhow::bail!(
-            "MCP smoke pre-provider preparation exceeded {} seconds; phase journal={}",
-            MCP_SMOKE_PRE_PROVIDER_TIMEOUT.as_secs(),
-            trace.path().display()
-        )
-    };
-    result
-}
 
-async fn run_mcp_preflight(config_path: &Path, host: AgentHostId, model: &str) -> Result<Value> {
-    let preparation = prepare_mcp_smoke(config_path, host, model).await?;
-    let report = json!({
-        "schema_version": "eliot-external-agent-mcp-preflight-v1",
-        "status": "passed",
-        "smoke_id": preparation.smoke_id,
-        "host": host,
-        "model": model,
-        "project_id": preparation.project_id,
-        "task_id": preparation.task_id,
-        "memory_revision": preparation.memory_revision,
-        "tool_names": preparation.preflight.tool_names,
-        "raw_database_absent": preparation.preflight.raw_database_absent,
-        "phase_journal_ref": path_string(preparation.trace.path()),
-        "provider_calls": 0,
-        "gui_used": false,
-    });
-    let report_path = runtime_root(config_path)
-        .join("reports")
-        .join("external-agent-smokes")
-        .join(format!("{}-preflight-latest.json", host.as_str()));
-    atomic_write_json(&report_path, &report)?;
-    atomic_write_json(
-        &preparation.smoke_root.join("preflight-report.json"),
-        &report,
-    )?;
-    Ok(report)
-}
-
-fn mcp_smoke_prompt(model: &str) -> String {
-    format!(
-        "Use the configured ELIOT MCP server. Call eliot_current_state exactly once with the sole argument {{\"scope\":\"memory_free_control\"}}; do not pass project_id or task_id because the Governor binds them. Return one plain JSON object, without Markdown fences or prose, containing only the schema-bound project_id, task_id, memory_revision and resolved_model={model}. Do not edit files."
-    )
-}
-
-fn memory_revision_within_execution_window(
-    preflight_revision: u64,
-    observed_revision: u64,
-    postflight_revision: u64,
-) -> bool {
-    observed_revision >= preflight_revision && observed_revision <= postflight_revision
-}
-
-#[allow(clippy::too_many_lines)]
-async fn run_mcp_smoke(config_path: &Path, host: AgentHostId, model: &str) -> Result<Value> {
-    let McpSmokePreparation {
-        smoke_id,
-        smoke_root,
-        workspace,
-        project_id,
-        task_id,
-        scope,
-        work_item_id,
-        memory_revision,
-        preflight,
-        trace,
-    } = prepare_mcp_smoke(config_path, host, model).await?;
-
-    let (_schema, prompt, prompt_path, schema_path) = trace.run_sync("prompt_build", || {
+        let (_schema, prompt, prompt_path, schema_path) = trace.run_sync("prompt_build", || {
         let schema = json!({
             "type": "object",
             "additionalProperties": false,
@@ -1185,8 +1342,8 @@ async fn run_mcp_smoke(config_path: &Path, host: AgentHostId, model: &str) -> Re
         );
         Ok(())
     })?;
-    let report = json!({
-        "schema_version": "eliot-external-agent-mcp-smoke-v1",
+        let report = json!({
+        "schema_version": "eliot-external-agent-mcp-smoke-v2",
         "status": "passed",
         "smoke_id": smoke_id,
         "host": host,
@@ -1205,16 +1362,20 @@ async fn run_mcp_smoke(config_path: &Path, host: AgentHostId, model: &str) -> Re
             "memory_revision": postflight_memory_revision,
         },
         "phase_journal_ref": path_string(trace.path()),
+        "authority_open_state_hash": operation_scope.open_receipt.state_hash,
         "adapter_result": result,
         "provider_calls": 1,
         "gui_used": false,
-    });
-    let report_path = runtime_root(config_path)
-        .join("reports")
-        .join("external-agent-smokes")
-        .join(format!("{}-latest.json", host.as_str()));
+        });
+        anyhow::ensure!(
+            operation_scope.instance == host_governor_instance(config_path)?,
+            "operation scope daemon instance changed during provider smoke"
+        );
+        Ok(report)
+    })
+    .await?;
     atomic_write_json(&report_path, &report)?;
-    atomic_write_json(&smoke_root.join("smoke-report.json"), &report)?;
+    atomic_write_json(&smoke_report_path, &report)?;
     Ok(report)
 }
 

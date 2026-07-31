@@ -848,6 +848,7 @@ mod tests {
             expires_at: now + time::Duration::minutes(5),
             epoch: 1,
             state: AuthorityLeaseState::Active,
+            lifetime: eliot_types::AuthorityLeaseLifetime::OperationBound,
             owner_operation_id: Some("missing-owner".to_owned()),
             seal_attempt_id: None,
             generation: 1,

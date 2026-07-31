@@ -291,6 +291,18 @@ pub enum AuthorityLeaseState {
     Expired,
 }
 
+#[derive(
+    Clone, Copy, Debug, Default, Eq, schemars::JsonSchema, PartialEq, Serialize, Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum AuthorityLeaseLifetime {
+    #[default]
+    Legacy,
+    Persistent,
+    OperationBound,
+    SealBound,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct TaskRoleLease {
     pub role_lease_id: String,
@@ -303,6 +315,8 @@ pub struct TaskRoleLease {
     pub epoch: u64,
     #[serde(default)]
     pub state: AuthorityLeaseState,
+    #[serde(default)]
+    pub lifetime: AuthorityLeaseLifetime,
     #[serde(default)]
     pub owner_operation_id: Option<String>,
     #[serde(default)]
@@ -333,6 +347,8 @@ pub struct ControllerLease {
     pub epoch: u64,
     #[serde(default)]
     pub state: AuthorityLeaseState,
+    #[serde(default)]
+    pub lifetime: AuthorityLeaseLifetime,
     #[serde(default)]
     pub owner_operation_id: Option<String>,
     #[serde(default)]
@@ -519,7 +535,25 @@ pub struct HostContextFootprintReport {
 
 #[cfg(test)]
 mod claude_surface_tests {
-    use super::{AgentHostId, ClaudeSurface};
+    use super::{AgentHostId, AuthorityLeaseLifetime, ClaudeSurface};
+
+    #[test]
+    fn authority_lifetime_legacy_decode_and_explicit_variants_are_stable() {
+        assert_eq!(
+            serde_json::from_str::<AuthorityLeaseLifetime>("\"operation_bound\"")
+                .expect("decode operation-bound lifetime"),
+            AuthorityLeaseLifetime::OperationBound
+        );
+        assert_eq!(
+            serde_json::from_str::<AuthorityLeaseLifetime>("\"seal_bound\"")
+                .expect("decode seal-bound lifetime"),
+            AuthorityLeaseLifetime::SealBound
+        );
+        assert_eq!(
+            AuthorityLeaseLifetime::default(),
+            AuthorityLeaseLifetime::Legacy
+        );
+    }
 
     /// One vendor, two packages. The family never becomes two hosts.
     #[test]
