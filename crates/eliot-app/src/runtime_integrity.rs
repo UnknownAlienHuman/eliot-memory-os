@@ -1,17 +1,18 @@
 use crate::runtime_instance::{
     RuntimeInstance, RuntimePublicationState, atomic_write_json, sha256_file,
 };
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, bail, ensure};
 use eliot_engine::{HostBrokerService, OperationRuntimeHandle};
 use eliot_types::{
-    AdapterCircuitState, AgentHostId, AgentSessionState, AuthorityLeaseState,
-    OperationCancellationState, OperationReconciliationState,
-    RUNTIME_INTEGRITY_REPORT_SCHEMA_VERSION, RuntimeAdapterHealth, RuntimeAuthorityIntegrity,
-    RuntimeCoreHealth, RuntimeIntegrityHealth, RuntimeOperationDetail, RuntimeOperationHealth,
-    RuntimeOverallStatus, RuntimeReconcileDecision, RuntimeReconcileDryRun,
-    RuntimeSupervisionReport, SealStagingState,
+    AdapterCircuitState, AgentHostId, AgentSessionState, AuthorityLeaseLifetime,
+    AuthorityLeaseState, ExternalAgentPurpose, OPERATION_AUTHORITY_SCHEMA_VERSION,
+    OperationAuthorityCloseRequest, OperationAuthorityTerminalOutcome, OperationCancellationState,
+    OperationJobState, OperationReconciliationState, RUNTIME_INTEGRITY_REPORT_SCHEMA_VERSION,
+    RuntimeAdapterHealth, RuntimeAuthorityIntegrity, RuntimeCoreHealth, RuntimeIntegrityHealth,
+    RuntimeOperationDetail, RuntimeOperationHealth, RuntimeOverallStatus, RuntimeReconcileDecision,
+    RuntimeReconcileDryRun, RuntimeSupervisionReport, SealStagingState,
 };
-use serde_json::Value;
+use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use time::OffsetDateTime;
@@ -29,6 +30,41 @@ struct SealInventory {
     authority_without_published: u32,
     quarantine_records: u32,
     errors: Vec<String>,
+}
+
+fn authority_owner_issue(
+    broker: &eliot_types::DelegationState,
+    lease: &eliot_types::TaskRoleLease,
+) -> Option<&'static str> {
+    match lease.lifetime {
+        AuthorityLeaseLifetime::Legacy => Some("legacy_authority_requires_typed_recovery"),
+        AuthorityLeaseLifetime::Persistent => (lease.owner_operation_id.is_some()
+            || lease.seal_attempt_id.is_some())
+        .then_some("persistent_authority_has_temporary_owner"),
+        AuthorityLeaseLifetime::OperationBound => {
+            let Some(owner) = lease.owner_operation_id.as_deref() else {
+                return Some("operation_bound_authority_has_no_live_exact_owner");
+            };
+            let healthy = lease.seal_attempt_id.is_none()
+                && broker.operation_jobs.iter().any(|job| {
+                    job.job_id == owner
+                        && job.invocation_id == owner
+                        && job.generation == lease.generation
+                        && job.role_lease_id.as_deref() == Some(lease.role_lease_id.as_str())
+                        && job.role_lease_epoch == Some(lease.epoch)
+                        && matches!(
+                            job.state,
+                            OperationJobState::Queued | OperationJobState::Running
+                        )
+                });
+            (!healthy).then_some("operation_bound_authority_has_no_live_exact_owner")
+        }
+        AuthorityLeaseLifetime::SealBound => lease
+            .seal_attempt_id
+            .as_deref()
+            .is_none_or(str::is_empty)
+            .then_some("seal_bound_authority_has_no_seal_owner"),
+    }
 }
 
 #[allow(
@@ -157,12 +193,13 @@ pub(crate) async fn inspect(
             matches!(
                 lease.state,
                 AuthorityLeaseState::Active | AuthorityLeaseState::Pending
-            ) && session_by_id
+            ) && (session_by_id
                 .get(&lease.agent_session_id)
                 .is_none_or(|session| {
                     session.state != AgentSessionState::Active
                         || session.generation != lease.generation
                 })
+                || authority_owner_issue(&broker, lease).is_some())
         })
         .count();
     let stale_epoch_results = broker
@@ -375,18 +412,29 @@ pub(crate) async fn reconcile_dry_run(
         if matches!(
             lease.state,
             AuthorityLeaseState::Active | AuthorityLeaseState::Pending
-        ) && broker
+        ) && (broker
             .agent_host_sessions
             .iter()
             .find(|session| session.agent_session_id == lease.agent_session_id)
             .is_none_or(|session| session.state != AgentSessionState::Active)
+            || authority_owner_issue(&broker, lease).is_some())
         {
+            let reason = authority_owner_issue(&broker, lease)
+                .unwrap_or("no_active_owner_session")
+                .to_owned();
             decisions.push(RuntimeReconcileDecision {
                 operation_id: lease.role_lease_id.clone(),
                 generation: lease.generation,
-                decision: "revoke_orphaned_role_lease".to_owned(),
+                decision: match lease.lifetime {
+                    AuthorityLeaseLifetime::OperationBound => "close_operation_bound_authority",
+                    AuthorityLeaseLifetime::Legacy => "typed_legacy_authority_recovery",
+                    AuthorityLeaseLifetime::Persistent | AuthorityLeaseLifetime::SealBound => {
+                        "block_invalid_declared_authority"
+                    }
+                }
+                .to_owned(),
                 mutates: false,
-                reason: "no_active_owner_session".to_owned(),
+                reason,
             });
         }
     }
@@ -403,6 +451,170 @@ pub(crate) async fn reconcile_dry_run(
         provider_calls: 0,
         writes: 0,
     })
+}
+
+#[allow(clippy::too_many_lines)]
+pub(crate) async fn legacy_authority_recovery(
+    config_path: &Path,
+    runtime_store: &OperationRuntimeHandle,
+    dry_run: bool,
+) -> Result<Value> {
+    let root = crate::delegation_runtime::root_from_config(config_path);
+    let broker = crate::delegation_runtime::load_state(&root)?;
+    let checkpoints = runtime_store.list_nonterminal_checkpoints().await?;
+    let mut dispositions = Vec::new();
+    let mut recoverable = Vec::new();
+    for lease in broker
+        .task_role_leases
+        .iter()
+        .filter(|lease| lease.lifetime == AuthorityLeaseLifetime::Legacy)
+    {
+        let binding = broker
+            .agent_host_sessions
+            .iter()
+            .find(|binding| binding.agent_session_id == lease.agent_session_id);
+        let invocation = broker.agent_invocations.iter().find(|request| {
+            request.role_lease_id == lease.role_lease_id
+                && request.task_id == lease.task_id
+                && request.role_lease_epoch == lease.epoch
+                && request.operation_generation == lease.generation
+        });
+        let job = invocation.and_then(|request| {
+            broker
+                .operation_jobs
+                .iter()
+                .find(|job| job.invocation_id == request.invocation_id)
+        });
+        let result = invocation.and_then(|request| {
+            broker.agent_results.iter().find(|result| {
+                result.invocation_id == request.invocation_id
+                    && result.role_lease_epoch == lease.epoch
+                    && result.operation_generation == lease.generation
+            })
+        });
+        let live_checkpoint = invocation.is_some_and(|request| {
+            checkpoints.iter().any(|checkpoint| {
+                checkpoint.operation_id == request.invocation_id
+                    || checkpoint.role_lease_id.as_deref() == Some(lease.role_lease_id.as_str())
+            })
+        });
+        let exact_legacy_smoke = lease.state == AuthorityLeaseState::Active
+            && lease.seal_attempt_id.as_deref() == Some("legacy-live-grant")
+            && lease.owner_operation_id.is_none()
+            && lease.epoch > 0
+            && lease.generation > 0
+            && binding.is_some_and(|binding| {
+                binding.state == AgentSessionState::Active
+                    && binding.generation == lease.generation
+                    && binding.bound_task_id == Some(lease.task_id)
+                    && binding
+                        .task_role_lease_refs
+                        .iter()
+                        .any(|role_lease_id| role_lease_id == &lease.role_lease_id)
+            })
+            && invocation
+                .is_some_and(|request| request.invocation_id.starts_with("external-agent-smoke-"))
+            && job.is_some_and(|job| {
+                !matches!(
+                    job.state,
+                    OperationJobState::Queued | OperationJobState::Running
+                ) && job.result_ref.is_some()
+                    && job.generation == lease.generation
+                    && job.role_lease_id.as_deref() == Some(lease.role_lease_id.as_str())
+                    && job.role_lease_epoch == Some(lease.epoch)
+            })
+            && result.is_some_and(|result| result.canonical_receipt.is_some())
+            && !live_checkpoint;
+        let disposition = if exact_legacy_smoke {
+            "recover_exact_terminal_legacy_smoke"
+        } else if lease.state != AuthorityLeaseState::Active {
+            "already_terminal"
+        } else if lease.seal_attempt_id.as_deref() != Some("legacy-live-grant") {
+            "ambiguous_legacy_owner"
+        } else if live_checkpoint {
+            "live_or_unreconciled_operation"
+        } else {
+            "insufficient_exact_terminal_evidence"
+        };
+        dispositions.push(json!({
+            "role_lease_id": lease.role_lease_id,
+            "epoch": lease.epoch,
+            "generation": lease.generation,
+            "state": lease.state,
+            "disposition": disposition,
+            "recoverable": exact_legacy_smoke,
+        }));
+        if exact_legacy_smoke {
+            let request = invocation.context("recoverable legacy lease has no invocation")?;
+            let job = job.context("recoverable legacy lease has no operation job")?;
+            recoverable.push(OperationAuthorityCloseRequest {
+                schema_version: OPERATION_AUTHORITY_SCHEMA_VERSION.to_owned(),
+                operation_id: request.invocation_id.clone(),
+                purpose: ExternalAgentPurpose::ProviderSmoke,
+                generation: lease.generation,
+                project_id: request.project_id,
+                task_id: lease.task_id,
+                agent_session_id: lease.agent_session_id,
+                role_lease_id: lease.role_lease_id.clone(),
+                expected_epoch: lease.epoch,
+                terminal_outcome: match job.state {
+                    OperationJobState::Completed => OperationAuthorityTerminalOutcome::Completed,
+                    OperationJobState::TimedOut => OperationAuthorityTerminalOutcome::TimedOut,
+                    OperationJobState::Cancelled => OperationAuthorityTerminalOutcome::Cancelled,
+                    OperationJobState::UnknownOutcome | OperationJobState::Reconciled => {
+                        OperationAuthorityTerminalOutcome::ReconciledUnknown
+                    }
+                    OperationJobState::Failed | OperationJobState::Abandoned => {
+                        OperationAuthorityTerminalOutcome::FailedAfterDispatch
+                    }
+                    OperationJobState::Queued | OperationJobState::Running => {
+                        unreachable!("recoverable legacy job was proven terminal")
+                    }
+                },
+                result_or_failure_ref: job.result_ref.clone(),
+                reason: "typed_exact_terminal_legacy_smoke_recovery".to_owned(),
+                idempotency_key: format!(
+                    "legacy-authority-recovery:{}:{}",
+                    lease.role_lease_id, lease.epoch
+                ),
+            });
+        }
+    }
+    dispositions.sort_by(|left, right| {
+        left.get("role_lease_id")
+            .and_then(Value::as_str)
+            .cmp(&right.get("role_lease_id").and_then(Value::as_str))
+    });
+    let mut close_receipts = Vec::new();
+    if !dry_run {
+        ensure!(
+            dispositions.iter().all(|item| {
+                item.get("recoverable").and_then(Value::as_bool) == Some(true)
+                    || item.get("disposition").and_then(Value::as_str) == Some("already_terminal")
+            }),
+            "legacy authority recovery refuses apply while ambiguous active Legacy leases remain"
+        );
+        let instance = crate::host_runtime::host_governor_instance(config_path)?;
+        for close in recoverable {
+            let response = crate::named_pipe_ipc::host_governor_request(
+                &instance,
+                "host/operation-scope-close",
+                serde_json::to_value(close)?,
+            )
+            .await
+            .context("route typed legacy recovery through operation close")?;
+            close_receipts.push(response);
+        }
+    }
+    Ok(json!({
+        "schema_version": "eliot-legacy-authority-recovery-v1",
+        "generated_at": OffsetDateTime::now_utc(),
+        "dry_run": dry_run,
+        "provider_calls": 0,
+        "raw_state_edits": 0,
+        "dispositions": dispositions,
+        "close_receipts": close_receipts,
+    }))
 }
 
 pub(crate) async fn startup_recover_and_report(
@@ -530,6 +742,36 @@ fn recover_authority(
             )
         })
         .collect::<Vec<_>>();
+    let operation_bound_leaks = broker
+        .task_role_leases
+        .iter()
+        .filter(|lease| {
+            matches!(
+                lease.state,
+                AuthorityLeaseState::Active | AuthorityLeaseState::Pending
+            ) && lease.lifetime == AuthorityLeaseLifetime::OperationBound
+                && authority_owner_issue(&broker, lease).is_some()
+        })
+        .map(|lease| {
+            (
+                lease.role_lease_id.clone(),
+                lease.epoch,
+                lease.agent_session_id,
+            )
+        })
+        .collect::<Vec<_>>();
+    for (role_lease_id, epoch, session_id) in operation_bound_leaks {
+        revoke.push((
+            role_lease_id,
+            epoch,
+            "startup_operation_bound_owner_not_live".to_owned(),
+        ));
+        let _ = HostBrokerService.retire_session(
+            &mut broker,
+            session_id,
+            "startup_operation_bound_owner_not_live",
+        );
+    }
     for checkpoint in recovered_checkpoints {
         if let (Some(role_lease_id), Some(role_lease_epoch)) =
             (&checkpoint.role_lease_id, checkpoint.role_lease_epoch)
@@ -794,16 +1036,74 @@ fn usize_to_u32(value: usize) -> u32 {
 
 #[cfg(test)]
 mod tests {
-    use super::{bounded_seal_files, inspect};
+    use super::{authority_owner_issue, bounded_seal_files, inspect};
     use eliot_engine::{WriterActor, WriterConfig};
     use eliot_store::{CanonicalStore, ControlWal};
     use eliot_types::{
-        AgentRole, AgentSessionId, AuthorityLeaseState, ControlWalConfig, DelegationState,
-        GovernorConfig, RuntimeOverallStatus, TaskId, TaskRoleLease,
+        AgentHostId, AgentRole, AgentSessionId, AuthorityLeaseLifetime, AuthorityLeaseState,
+        ControlWalConfig, DelegationState, GovernorConfig, OperationJob, OperationJobState,
+        OperationPhase, RuntimeOverallStatus, TaskId, TaskRoleLease,
     };
     use std::fs;
     use time::OffsetDateTime;
     use uuid::Uuid;
+
+    #[test]
+    fn operation_bound_runtime_integrity_requires_one_live_exact_owner() {
+        let mut broker = DelegationState::default();
+        let now = OffsetDateTime::now_utc();
+        let task_id = TaskId::new_v7();
+        let session_id = AgentSessionId::new_v7();
+        let lease = TaskRoleLease {
+            role_lease_id: "operation-role-lease:integrity".to_owned(),
+            task_id,
+            agent_session_id: session_id,
+            role: AgentRole::Auditor,
+            capability_scope: vec!["emit_candidate_observation".to_owned()],
+            expires_at: now + time::Duration::minutes(5),
+            epoch: 3,
+            state: AuthorityLeaseState::Active,
+            lifetime: AuthorityLeaseLifetime::OperationBound,
+            owner_operation_id: Some("operation:integrity".to_owned()),
+            seal_attempt_id: None,
+            generation: 4,
+            issued_at: Some(now),
+            activated_at: Some(now),
+            consumed_at: None,
+            revoked_at: None,
+            revoke_reason: None,
+            superseded_by_epoch: None,
+        };
+        broker.task_role_leases.push(lease.clone());
+        broker.operation_jobs.push(OperationJob {
+            job_id: "operation:integrity".to_owned(),
+            invocation_id: "operation:integrity".to_owned(),
+            host_id: AgentHostId::Claude,
+            state: OperationJobState::Running,
+            attempt: 1,
+            resume_session_id: None,
+            result_ref: None,
+            idempotency_key: "operation:integrity".to_owned(),
+            created_at: now,
+            updated_at: now,
+            generation: 4,
+            phase: OperationPhase::Running,
+            phase_started_at: Some(now),
+            last_progress_at: Some(now),
+            phase_deadline_at: Some(lease.expires_at),
+            absolute_deadline_at: Some(lease.expires_at),
+            restart_count: 0,
+            runtime_contract_sha256: Some("c".repeat(64)),
+            role_lease_id: Some(lease.role_lease_id.clone()),
+            role_lease_epoch: Some(lease.epoch),
+        });
+        assert_eq!(authority_owner_issue(&broker, &lease), None);
+        broker.operation_jobs[0].state = OperationJobState::Completed;
+        assert_eq!(
+            authority_owner_issue(&broker, &lease),
+            Some("operation_bound_authority_has_no_live_exact_owner")
+        );
+    }
 
     #[test]
     fn seal_scan_bounds_relevant_records_without_counting_historical_artifacts()

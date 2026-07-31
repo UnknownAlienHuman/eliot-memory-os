@@ -2649,7 +2649,7 @@ async fn grant_role(
     .context("route host role grant through the daemon-owned WriterActor")
 }
 
-fn host_governor_instance(config_path: &Path) -> Result<RuntimeInstance> {
+pub(crate) fn host_governor_instance(config_path: &Path) -> Result<RuntimeInstance> {
     let default_instance = RuntimeInstance::select(config_path, Some(DEFAULT_INSTANCE_NAME))?;
     let default_matches_config = default_instance
         .read_publication(named_pipe_ipc::IPC_PROTOCOL_VERSION)
@@ -3039,17 +3039,23 @@ async fn close_operation_scope_with_writer(
         task.project_id == input.project_id,
         "operation close project/task scope mismatch"
     );
-    let mut authority = load_role_authority_record(root, &input.role_lease_id)?;
-    ensure!(
-        authority.purpose == Some(input.purpose) && authority.generation == input.generation,
-        "operation close purpose or generation differs from open"
-    );
     let state = delegation_runtime::load_state(root)?;
     let lease = state
         .task_role_leases
         .iter()
         .find(|lease| lease.role_lease_id == input.role_lease_id)
         .context("operation close role lease is missing")?;
+    let mut authority = load_role_authority_record(root, &input.role_lease_id)?;
+    let legacy_recovery = lease.lifetime == AuthorityLeaseLifetime::Legacy
+        && lease.seal_attempt_id.as_deref() == Some("legacy-live-grant")
+        && lease.owner_operation_id.is_none()
+        && input.purpose == ExternalAgentPurpose::ProviderSmoke;
+    ensure!(
+        authority.generation == input.generation
+            && (authority.purpose == Some(input.purpose)
+                || (legacy_recovery && authority.purpose.is_none())),
+        "operation close purpose or generation differs from open"
+    );
     if lease.state == AuthorityLeaseState::Revoked
         && authority.close_idempotency_key.as_deref() == Some(input.idempotency_key.as_str())
     {
@@ -3097,16 +3103,36 @@ async fn close_operation_scope_with_writer(
             idempotent_replay: true,
         });
     }
+    let operation_bound_owner = lease.lifetime == AuthorityLeaseLifetime::OperationBound
+        && lease.owner_operation_id.as_deref() == Some(input.operation_id.as_str())
+        && lease.seal_attempt_id.is_none();
+    let legacy_owner = legacy_recovery
+        && state.operation_jobs.iter().any(|job| {
+            job.invocation_id == input.operation_id
+                && job.generation == input.generation
+                && !matches!(job.state, OperationJobState::Queued | OperationJobState::Running)
+                && job.result_ref.is_some()
+        })
+        && state.agent_invocations.iter().any(|request| {
+            request.invocation_id == input.operation_id
+                && request.role_lease_id == input.role_lease_id
+                && request.role_lease_epoch == input.expected_epoch
+                && request.operation_generation == input.generation
+        })
+        && state.agent_results.iter().any(|result| {
+            result.invocation_id == input.operation_id
+                && result.role_lease_epoch == input.expected_epoch
+                && result.operation_generation == input.generation
+                && result.canonical_receipt.is_some()
+        });
     ensure!(
         lease.task_id == input.task_id
             && lease.agent_session_id == input.agent_session_id
             && lease.state == AuthorityLeaseState::Active
-            && lease.lifetime == AuthorityLeaseLifetime::OperationBound
-            && lease.owner_operation_id.as_deref() == Some(input.operation_id.as_str())
-            && lease.seal_attempt_id.is_none()
+            && (operation_bound_owner || legacy_owner)
             && lease.epoch == input.expected_epoch
             && lease.generation == input.generation,
-        "operation close does not match the exact active owner"
+        "operation close does not match the exact active owner or legacy smoke proof"
     );
     let mut fenced = state;
     let final_role_lease = HostBrokerService.revoke_role(
@@ -3125,7 +3151,7 @@ async fn close_operation_scope_with_writer(
         .operation_jobs
         .iter_mut()
         .find(|job| {
-            job.job_id == input.operation_id
+            (job.job_id == input.operation_id || legacy_recovery)
                 && job.invocation_id == input.operation_id
                 && job.generation == input.generation
         })
@@ -3205,6 +3231,7 @@ async fn close_operation_scope_with_writer(
     authority.operation_job_hash = Some(hash_json(&job_value)?);
     authority.canonical_operation_job_receipt = Some(canonical_terminal_job_receipt.clone());
     authority.state_hash.clone_from(&state_hash);
+    authority.purpose = Some(input.purpose);
     authority.close_idempotency_key = Some(input.idempotency_key);
     authority.canonical_revoked_role_receipt = Some(canonical_revoked_role_receipt.clone());
     authority.canonical_retired_binding_receipt = Some(canonical_retired_binding_receipt.clone());

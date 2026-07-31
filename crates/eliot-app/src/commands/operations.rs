@@ -985,6 +985,22 @@ pub async fn run_runtime_supervision_reconcile(
     write_json(&report)
 }
 
+pub async fn run_legacy_authority_recovery(
+    config_path: &Path,
+    dry_run: bool,
+    instance: Option<&str>,
+) -> Result<()> {
+    let runtime_store =
+        crate::host_runtime::supervised_process::daemon_operation_runtime_handle_for_instance(
+            config_path,
+            instance,
+        )?;
+    let report =
+        crate::runtime_integrity::legacy_authority_recovery(config_path, &runtime_store, dry_run)
+            .await?;
+    write_json(&report)
+}
+
 pub fn run_module_list(config_path: &Path) -> Result<()> {
     let root = runtime_root(config_path);
     let registry = module_registry(config_path)?;

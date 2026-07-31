@@ -218,6 +218,10 @@ enum Command {
         #[command(subcommand)]
         command: RecoveryCommand,
     },
+    Legacy {
+        #[command(subcommand)]
+        command: LegacyCommand,
+    },
     Collective {
         #[command(subcommand)]
         command: CollectiveCommand,
@@ -1361,6 +1365,22 @@ enum RecoveryCommand {
 }
 
 #[derive(Debug, Subcommand)]
+enum LegacyCommand {
+    Authority {
+        #[command(subcommand)]
+        command: LegacyAuthorityCommand,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Subcommand)]
+enum LegacyAuthorityCommand {
+    Recovery {
+        #[arg(long)]
+        dry_run: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
 enum CollectiveCommand {
     Trace {
         #[arg(long)]
@@ -2333,6 +2353,12 @@ async fn dispatch_command(
         Command::Blackboard { command } => dispatch_blackboard_command(config, command).await,
         Command::Mailbox { command } => dispatch_mailbox_command(config, command).await,
         Command::Recovery { command } => dispatch_recovery_command(config, command).await,
+        Command::Legacy {
+            command:
+                LegacyCommand::Authority {
+                    command: LegacyAuthorityCommand::Recovery { dry_run },
+                },
+        } => commands::run_legacy_authority_recovery(config, dry_run, implicit_instance).await,
         Command::Collective { command } => dispatch_collective_command(config, command).await,
         Command::Runtime { command } => {
             dispatch_runtime_command(config, command, implicit_instance).await
