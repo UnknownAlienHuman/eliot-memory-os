@@ -195,7 +195,9 @@ impl eliot_engine::OperationRuntimeProxy for DaemonOperationRuntimeProxy {
 pub fn daemon_operation_runtime_handle(
     config_path: &Path,
 ) -> Result<eliot_engine::OperationRuntimeHandle> {
-    daemon_operation_runtime_handle_for_instance(config_path, None)
+    Ok(daemon_operation_runtime_handle_for_runtime_instance(
+        default_daemon_runtime_instance(config_path)?,
+    ))
 }
 
 pub fn daemon_operation_runtime_handle_for_instance(
@@ -203,9 +205,26 @@ pub fn daemon_operation_runtime_handle_for_instance(
     instance: Option<&str>,
 ) -> Result<eliot_engine::OperationRuntimeHandle> {
     let instance = crate::runtime_instance::RuntimeInstance::select(config_path, instance)?;
-    Ok(eliot_engine::OperationRuntimeHandle::from_proxy(Arc::new(
-        DaemonOperationRuntimeProxy { instance },
-    )))
+    Ok(daemon_operation_runtime_handle_for_runtime_instance(
+        instance,
+    ))
+}
+
+fn default_daemon_runtime_instance(
+    config_path: &Path,
+) -> Result<crate::runtime_instance::RuntimeInstance> {
+    crate::runtime_instance::RuntimeInstance::select(
+        config_path,
+        Some(crate::runtime_instance::DEFAULT_INSTANCE_NAME),
+    )
+}
+
+fn daemon_operation_runtime_handle_for_runtime_instance(
+    instance: crate::runtime_instance::RuntimeInstance,
+) -> eliot_engine::OperationRuntimeHandle {
+    eliot_engine::OperationRuntimeHandle::from_proxy(Arc::new(DaemonOperationRuntimeProxy {
+        instance,
+    }))
 }
 
 pub struct SharedAntigravityProcessExecutor {
@@ -1435,7 +1454,8 @@ mod tests {
     use super::{
         ChildCriticality, ProcessRestartPolicy, RestartStrategy, SharedAntigravityProcessExecutor,
         SupervisedChildKind, SupervisedProcessSpec, checkpoint_requests_process_cancellation,
-        checkpoint_requires_process_recovery, operation_checkpoint, run_supervised_process,
+        checkpoint_requires_process_recovery, default_daemon_runtime_instance,
+        operation_checkpoint, run_supervised_process,
     };
     use anyhow::{Result, anyhow, bail};
     use eliot_engine::{
@@ -1446,10 +1466,28 @@ mod tests {
     use std::collections::BTreeMap;
     use std::ffi::OsString;
     use std::io::{Read, Write};
+    use std::path::Path;
     use std::time::Duration;
     use tokio::time::Instant;
 
     const FIXTURE_ENV: &str = "ELIOT_SUPERVISED_PROCESS_FIXTURE";
+
+    #[test]
+    fn production_operation_runtime_routes_to_default_daemon_instance() -> Result<()> {
+        let instance = default_daemon_runtime_instance(Path::new("ignored/governor.toml"))?;
+
+        assert_eq!(
+            instance.name(),
+            crate::runtime_instance::DEFAULT_INSTANCE_NAME
+        );
+        assert!(instance.standalone());
+        assert!(
+            instance
+                .publication_path()
+                .ends_with(Path::new("instances/default/runtime/publication.json"))
+        );
+        Ok(())
+    }
 
     #[test]
     fn supervised_process_native_fixture() -> Result<()> {
