@@ -785,7 +785,23 @@ pub(crate) async fn startup_recover_and_report(
     recover_unowned_staging(config_path, runtime_store).await?;
     let report = inspect(config_path, runtime_store, true, instance).await?;
     persist_report(config_path, &report)?;
-    if !report.provider_dispatch_safe {
+    let canonical_close_recovery_only = report.core.ready
+        && report.operations.active == 0
+        && report.operations.stuck == 0
+        && report.operations.orphan_processes == 0
+        && report
+            .integrity_errors
+            .iter()
+            .any(|error| error == "partial_operation_close_canonical_proof")
+        && report.integrity_errors.iter().all(|error| {
+            matches!(
+                error.as_str(),
+                "partial_operation_close_canonical_proof"
+                    | "operations_awaiting_reconciliation"
+                    | "orphan_or_cleanup_processes"
+            )
+        });
+    if !report.provider_dispatch_safe && !canonical_close_recovery_only {
         bail!(
             "runtime integrity blocks provider dispatch: {}",
             report.integrity_errors.join(", ")

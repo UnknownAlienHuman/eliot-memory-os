@@ -1713,6 +1713,22 @@ impl ExternalAgentAdapterCore {
                     "AdapterContext differs from sealed external-agent authority".to_owned(),
                 ));
             }
+            let runtime_store =
+                super::supervised_process::daemon_operation_runtime_handle_for_instance(
+                    &self.config_path,
+                    None,
+                )
+                .map_err(anyhow_engine)?;
+            let runtime_integrity =
+                crate::runtime_integrity::inspect(&self.config_path, &runtime_store, true, None)
+                    .await
+                    .map_err(anyhow_engine)?;
+            if !runtime_integrity.provider_dispatch_safe {
+                return Err(eliot_engine::EngineError::WriteRejected(format!(
+                    "runtime integrity blocks external provider dispatch: {}",
+                    runtime_integrity.integrity_errors.join(", ")
+                )));
+            }
             self.execute_governed(request, execution, context).await
         })
     }
