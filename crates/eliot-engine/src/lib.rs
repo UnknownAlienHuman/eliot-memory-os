@@ -31,6 +31,7 @@ pub mod readiness;
 pub mod replay;
 pub mod reports;
 pub mod runtime;
+pub mod runtime_supervision;
 pub mod safety;
 pub mod semantic_memory;
 pub mod service;
@@ -46,9 +47,9 @@ pub mod writer;
 pub use action::{ActionLeaseEvaluation, ActionLeaseService};
 pub use adapter::{
     Adapter, AdapterMemoryWriter, AdapterObservationBridge, AdapterObservationReport,
-    AdapterRegistry, AdapterRegistryReport, AdapterSupervisor, HealthAdapter, TestEchoAdapter,
-    TestFailingAdapter, TestLargeOutputAdapter, TestSlowAdapter, normalize_result_to_observation,
-    test_request,
+    AdapterRegistry, AdapterRegistryReport, AdapterSupervisor, BoxAdapterFuture, HealthAdapter,
+    TestEchoAdapter, TestFailingAdapter, TestLargeOutputAdapter, TestSlowAdapter,
+    normalize_result_to_observation, test_request,
 };
 pub use admission::WriteAdmissionService;
 pub use antigravity::{
@@ -58,11 +59,12 @@ pub use antigravity::{
     AntigravityEnablementService, AntigravityEnvPolicyService, AntigravityExecutionGate,
     AntigravityGuiProcessProbeService, AntigravityLiveSmokeService, AntigravityMcpBoundaryService,
     AntigravityMcpConfigService, AntigravityOfficialCliInstallerService,
-    AntigravityOfficialPluginService, AntigravityRealExecutionDoctor, AntigravityRollbackService,
-    AntigravityRunner, AntigravitySafetyPolicy, AntigravityTelemetryService,
-    AntigravityTextOutputNormalizer, AntigravityVersionGateService, AntigravityVisibilityService,
-    AntigravityWindowsInstallDiscoveryService, antigravity_real_report, antigravity_report,
-    antigravity_review_request,
+    AntigravityOfficialPluginService, AntigravityProcessExecutor, AntigravityRealExecutionDoctor,
+    AntigravityRollbackService, AntigravityRunner, AntigravitySafetyPolicy,
+    AntigravitySupervisedProcessOutput, AntigravitySupervisedProcessSpec,
+    AntigravityTelemetryService, AntigravityTextOutputNormalizer, AntigravityVersionGateService,
+    AntigravityVisibilityService, AntigravityWindowsInstallDiscoveryService,
+    antigravity_real_report, antigravity_report, antigravity_review_request,
 };
 pub use codecortex::{CodeCortexMemoryWriter, CodeCortexService};
 pub use cognition::{
@@ -133,9 +135,10 @@ pub use external_review::{
     ExternalReviewTaintPolicy, external_review_request,
 };
 pub use host::{
-    DERIVED_SKILL_PACKAGES, ELIOT_SKILL_NAMES, HostBrokerService, HostEventService,
-    HostLaunchContractService, HostProfileService, SkillPackEntryReport, SkillPackLintReport,
-    SkillPackService, SkillPackSyncReport, bundle_hash, bundle_root, host_generated_bundle_entry,
+    AgentResultAdmission, AuthorityCleanupReport, DERIVED_SKILL_PACKAGES, ELIOT_SKILL_NAMES,
+    HostBrokerService, HostEventService, HostLaunchContractService, HostProfileService,
+    PendingRoleGrant, SkillPackEntryReport, SkillPackLintReport, SkillPackService,
+    SkillPackSyncReport, bundle_hash, bundle_root, host_generated_bundle_entry,
     host_profile_fingerprint,
 };
 pub use lifecycle::{BoxServiceFuture, ServiceContext, ServiceHandle, ServiceLifecycle};
@@ -176,6 +179,10 @@ pub use runtime::{
     ExchangeEnvelopeService, HealthService, LifecycleService, LogService, ModuleRegistryService,
     ReportService, RuntimeLock, ServiceSupervisor, StaticRuntimeService, builtin_manifests,
     default_runtime_services, shutdown_deadline_after,
+};
+pub use runtime_supervision::{
+    AdapterExecutionContext, CancellationToken, OperationSupervisor, RestartDecision,
+    classify_restart,
 };
 pub use safety::{
     BackupService, BlobGcService, DataRootService, DoctorService, ExportService,
@@ -247,6 +254,7 @@ pub use worktree::{
     WorktreeCleanupService, WorktreeCreateInput, WorktreeLeaseService, WorktreeMemoryWriter,
 };
 pub use writer::{
-    CognitiveBeginPrecondition, CognitiveTerminalPrecondition, WriterActor, WriterConfig,
-    WriterHandle, WriterMetricsSnapshot, WriterRequest, default_writer_lane_count,
+    CognitiveBeginPrecondition, CognitiveTerminalPrecondition, OperationRuntimeHandle,
+    OperationRuntimeProxy, OperationRuntimeRequest, OperationRuntimeResponse, WriterActor,
+    WriterConfig, WriterHandle, WriterMetricsSnapshot, WriterRequest, default_writer_lane_count,
 };

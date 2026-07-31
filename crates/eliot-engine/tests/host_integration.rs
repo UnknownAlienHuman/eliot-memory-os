@@ -7,9 +7,9 @@ use eliot_engine::{
 use eliot_types::{
     AgentCapabilityEnvelope, AgentHostId, AgentHostIdentity, AgentHostRuntimeProfile,
     AgentInvocationRequest, AgentResultDispositionKind, AgentResultEnvelope, AgentResultStatus,
-    AgentRole, AgentSessionHostBinding, AgentSessionId, DelegationState, HostLaunchScope, HostMode,
-    HostProfileStatus, HostProtocolSurfaces, OperationJobState, ProjectId, TaskId, TaskRoleLease,
-    WorkItemId,
+    AgentRole, AgentSessionHostBinding, AgentSessionId, AgentSessionState, AuthorityLeaseState,
+    DelegationState, HostLaunchScope, HostMode, HostProfileStatus, HostProtocolSurfaces,
+    OperationJobState, ProjectId, TaskId, TaskRoleLease, WorkItemId,
 };
 use std::path::{Path, PathBuf};
 use time::OffsetDateTime;
@@ -120,6 +120,11 @@ fn host_identity_is_not_role_and_role_can_invert_per_task() {
         bound_project_id: None,
         bound_task_id: None,
         task_role_lease_refs: Vec::new(),
+        state: AgentSessionState::Active,
+        generation: 1,
+        owner_operation_id: None,
+        disconnected_at: None,
+        disconnect_reason: None,
     };
     let serialized = serde_json::to_value(&open_binding).expect("serialize binding");
     assert!(serialized.get("role").is_none());
@@ -134,6 +139,16 @@ fn host_identity_is_not_role_and_role_can_invert_per_task() {
         capability_scope: vec!["delegate".to_owned()],
         expires_at: OffsetDateTime::now_utc() + time::Duration::minutes(30),
         epoch: 1,
+        state: AuthorityLeaseState::Active,
+        owner_operation_id: None,
+        seal_attempt_id: None,
+        generation: 1,
+        issued_at: None,
+        activated_at: None,
+        consumed_at: None,
+        revoked_at: None,
+        revoke_reason: None,
+        superseded_by_epoch: None,
     };
     let claude_worker = TaskRoleLease {
         role_lease_id: "role:claude-worker".to_owned(),
@@ -143,6 +158,16 @@ fn host_identity_is_not_role_and_role_can_invert_per_task() {
         capability_scope: vec!["review".to_owned()],
         expires_at: OffsetDateTime::now_utc() + time::Duration::minutes(30),
         epoch: 1,
+        state: AuthorityLeaseState::Active,
+        owner_operation_id: None,
+        seal_attempt_id: None,
+        generation: 1,
+        issued_at: None,
+        activated_at: None,
+        consumed_at: None,
+        revoked_at: None,
+        revoke_reason: None,
+        superseded_by_epoch: None,
     };
     assert_eq!(open_controller.role, AgentRole::Controller);
     assert_eq!(claude_worker.role, AgentRole::Implementer);
@@ -276,6 +301,11 @@ fn connected_session_profile_does_not_require_a_local_cli() {
         bound_project_id: None,
         bound_task_id: None,
         task_role_lease_refs: Vec::new(),
+        state: AgentSessionState::Active,
+        generation: 1,
+        owner_operation_id: None,
+        disconnected_at: None,
+        disconnect_reason: None,
     };
     let profile = eliot_engine::HostProfileService.connected(&binding);
     assert_eq!(profile.status, HostProfileStatus::Current);
@@ -475,7 +505,10 @@ fn shared_broker_supports_role_inversion_idempotency_and_candidate_results() {
         task_id: first_task,
         work_item_id: WorkItemId::new_v7(),
         requested_capabilities: vec!["review".to_owned()],
-        role_lease_id: claude_worker.role_lease_id,
+        role_lease_id: claude_worker.role_lease_id.clone(),
+        role_lease_epoch: claude_worker.epoch,
+        operation_generation: claude_worker.generation,
+        runtime_contract_sha256: Some("a".repeat(64)),
         work_lease_id: None,
         packet_refs: vec!["packet:fixture".to_owned()],
         expected_result_kind: "agent_result_envelope".to_owned(),
@@ -499,12 +532,14 @@ fn shared_broker_supports_role_inversion_idempotency_and_candidate_results() {
         .expect("start operation");
     assert_eq!(state.operation_jobs[0].attempt, 1);
 
-    let result = AgentResultEnvelope {
+    let mut result = AgentResultEnvelope {
         result_id: "result:fixture".to_owned(),
         invocation_id: request.invocation_id,
         host_id: AgentHostId::Claude,
         host_session_id: Some("host-session:fixture".to_owned()),
         status: AgentResultStatus::Succeeded,
+        role_lease_epoch: claude_worker.epoch,
+        operation_generation: claude_worker.generation,
         summary: "bounded candidate".to_owned(),
         artifact_refs: Vec::new(),
         evidence_refs: vec!["evidence:fixture".to_owned()],
@@ -517,6 +552,38 @@ fn shared_broker_supports_role_inversion_idempotency_and_candidate_results() {
         provider_output_hash: None,
         canonical_receipt: None,
     };
+    let mut stale_result = result.clone();
+    stale_result.result_id = "result:old-epoch".to_owned();
+    let next_epoch = claude_worker.epoch.saturating_add(1);
+    let next_generation = claude_worker.generation.saturating_add(1);
+    let current_lease = state
+        .task_role_leases
+        .iter_mut()
+        .find(|lease| lease.role_lease_id == claude_worker.role_lease_id)
+        .expect("current worker lease");
+    current_lease.epoch = next_epoch;
+    current_lease.generation = next_generation;
+    state
+        .agent_host_sessions
+        .iter_mut()
+        .find(|session| session.agent_session_id == claude_session)
+        .expect("current worker session")
+        .generation = next_generation;
+    state.agent_invocations[0].role_lease_epoch = next_epoch;
+    state.agent_invocations[0].operation_generation = next_generation;
+    state.operation_jobs[0].role_lease_epoch = Some(next_epoch);
+    state.operation_jobs[0].generation = next_generation;
+    let stale_admission = HostBrokerService
+        .record_result(&mut state, stale_result)
+        .expect("preserve stale generation result as evidence");
+    assert!(matches!(
+        stale_admission,
+        eliot_engine::AgentResultAdmission::StaleEvidencePreserved(_)
+    ));
+    assert_eq!(state.operation_jobs[0].state, OperationJobState::Running);
+    assert!(state.operation_jobs[0].result_ref.is_none());
+    result.role_lease_epoch = next_epoch;
+    result.operation_generation = next_generation;
     let recorded = HostBrokerService
         .record_result(&mut state, result.clone())
         .expect("record candidate result");
@@ -524,7 +591,11 @@ fn shared_broker_supports_role_inversion_idempotency_and_candidate_results() {
         .record_result(&mut state, result)
         .expect("replay identical result");
     assert_eq!(recorded, replay);
-    assert_eq!(state.agent_results.len(), 1);
+    assert!(matches!(
+        recorded,
+        eliot_engine::AgentResultAdmission::Accepted(_)
+    ));
+    assert_eq!(state.agent_results.len(), 2);
     assert_eq!(state.operation_jobs[0].state, OperationJobState::Completed);
     let disposition = HostBrokerService
         .disposition_result(

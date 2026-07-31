@@ -270,6 +270,8 @@ pub struct DelegationState {
     pub agent_results: Vec<AgentResultEnvelope>,
     #[serde(default)]
     pub agent_result_dispositions: Vec<AgentResultDisposition>,
+    #[serde(default)]
+    pub authority_revocation_receipts: Vec<crate::AuthorityRevocationReceipt>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]

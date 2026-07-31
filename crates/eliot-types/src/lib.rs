@@ -26,6 +26,7 @@ pub mod provider_invocation;
 pub mod records;
 pub mod replay;
 pub mod runtime;
+pub mod runtime_supervision;
 pub mod safety;
 pub mod secret_boundary;
 pub mod semantic_memory;
@@ -121,8 +122,8 @@ pub use cognitive_run::{
 };
 pub use config::{
     BlobStoreConfig, ControlWalConfig, DbConfig, DbMode, DelegationCalibrationConfig,
-    GovernorConfig, ServiceConfig, StoreConfig, SurrealCapabilities, SurrealServerConfig,
-    UlActivationConfig, UlConfig,
+    GovernorConfig, RuntimeSupervisionConfig, ServiceConfig, StoreConfig, SurrealCapabilities,
+    SurrealServerConfig, UlActivationConfig, UlConfig,
 };
 pub use delegation::{
     DelegationBudget, DelegationDecision, DelegationDecisionKind, DelegationJob,
@@ -202,10 +203,11 @@ pub use health::{ComponentHealth, HealthStatus, StartupHealthReport};
 pub use host::{
     AgentCapabilityEnvelope, AgentHostId, AgentHostIdentity, AgentHostRuntimeProfile,
     AgentInvocationRequest, AgentResultDisposition, AgentResultDispositionKind,
-    AgentResultEnvelope, AgentResultStatus, AgentSessionHostBinding, ClaudeSurface,
-    ControllerLease, HostContextFootprintReport, HostEventEnvelope, HostIntegrationReceipt,
-    HostLaunchContract, HostLaunchScope, HostMode, HostProfileStatus, HostProtocolSurfaces,
-    OperationJob, OperationJobState, TaskRoleLease,
+    AgentResultEnvelope, AgentResultStatus, AgentSessionHostBinding, AgentSessionState,
+    AuthorityLeaseState, AuthorityRevocationReceipt, ClaudeSurface, ControllerLease,
+    HostContextFootprintReport, HostEventEnvelope, HostIntegrationReceipt, HostLaunchContract,
+    HostLaunchScope, HostMode, HostProfileStatus, HostProtocolSurfaces, OperationJob,
+    OperationJobState, TaskRoleLease,
 };
 pub use ids::{
     ActionLeaseId, ActionRequestId, AgentId, AgentRunId, AgentSessionId,
@@ -322,6 +324,16 @@ pub use runtime::{
     ModuleResourceLimits, ModuleTransport, RedactionInfo, RuntimeConfig, RuntimeHealthReport,
     RuntimeIpcConfig, RuntimeLocalConfig, RuntimeLogReport, RuntimeLoggingConfig, RuntimeMode,
     RuntimeModulesConfig, RuntimeStatusReport, SchemaRef, ServiceHealthState, ServiceRuntimeStatus,
+};
+pub use runtime_supervision::{
+    AdapterCircuitState, OPERATION_RESTART_WINDOW_SCHEMA_VERSION,
+    OPERATION_RUNTIME_CHECKPOINT_SCHEMA_VERSION, OperationCancellationState, OperationPhase,
+    OperationReconciliationState, OperationRestartWindow, OperationRuntimeCheckpoint,
+    ProcessReapReceipt, ProviderDispatchState, RUNTIME_INTEGRITY_REPORT_SCHEMA_VERSION,
+    RuntimeAdapterHealth, RuntimeAuthorityIntegrity, RuntimeCoreHealth, RuntimeIntegrityHealth,
+    RuntimeOperationDetail, RuntimeOperationHealth, RuntimeOverallStatus, RuntimeReconcileDecision,
+    RuntimeReconcileDryRun, RuntimeSupervisionReport, SEAL_STAGING_CHECKPOINT_SCHEMA_VERSION,
+    SealStagingCheckpoint, SealStagingState,
 };
 pub use safety::{
     BackupBlobEntry, BackupChecksum, BackupInventoryEntry, BackupKind, BackupManifest,

@@ -27,12 +27,12 @@ use eliot_engine::{HostLaunchContractService, WorkState, default_work_scope};
 use eliot_store::CanonicalToolObservation;
 use eliot_types::{
     AgentCapabilityEnvelope, AgentHostId, AgentHostIdentity, AgentHostRuntimeProfile, AgentId,
-    AgentRole, AgentSessionHostBinding, AgentSessionId, DelegationState, HostLaunchScope, HostMode,
-    HostProfileStatus, HostProtocolSurfaces, MemoryRevision, ProjectId, ProjectSequence, ReceiptId,
-    SemanticCommandKind, TaskId, TaskRoleLease, UlReasoningRequest, UlReasoningRoute, WorkItemId,
-    WorkLease, WorkLeaseDecision, WorkLeaseDecisionKind, WorkLeaseDecisionReason, WorkLeaseId,
-    WorkLeaseState, WorktreeLease, WorktreeLeaseId, WorktreeLeaseState, WriteId, WriteReceipt,
-    WriteReceiptRef, WriteStatus,
+    AgentRole, AgentSessionHostBinding, AgentSessionId, AgentSessionState, AuthorityLeaseState,
+    DelegationState, HostLaunchScope, HostMode, HostProfileStatus, HostProtocolSurfaces,
+    MemoryRevision, ProjectId, ProjectSequence, ReceiptId, SemanticCommandKind, TaskId,
+    TaskRoleLease, UlReasoningRequest, UlReasoningRoute, WorkItemId, WorkLease, WorkLeaseDecision,
+    WorkLeaseDecisionKind, WorkLeaseDecisionReason, WorkLeaseId, WorkLeaseState, WorktreeLease,
+    WorktreeLeaseId, WorktreeLeaseState, WriteId, WriteReceipt, WriteReceiptRef, WriteStatus,
 };
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
@@ -279,6 +279,16 @@ fn bounded_auditor_scope_rejects_work_authority() {
         capability_scope: vec!["eliot_fetch_l2".to_owned()],
         expires_at: now + time::Duration::minutes(20),
         epoch: 1,
+        state: AuthorityLeaseState::Active,
+        owner_operation_id: None,
+        seal_attempt_id: None,
+        generation: 1,
+        issued_at: Some(now),
+        activated_at: Some(now),
+        consumed_at: None,
+        revoked_at: None,
+        revoke_reason: None,
+        superseded_by_epoch: None,
     };
     let mut scope = HostLaunchScope {
         project_id: Some(ProjectId::new_v7()),
@@ -373,6 +383,11 @@ fn fixture_delegation(ids: ScopeFixtureIds, now: OffsetDateTime) -> DelegationSt
             bound_project_id: Some(ids.project),
             bound_task_id: Some(ids.task),
             task_role_lease_refs: vec![ROLE_LEASE_ID.to_owned()],
+            state: AgentSessionState::Active,
+            generation: 1,
+            owner_operation_id: None,
+            disconnected_at: None,
+            disconnect_reason: None,
         });
     delegation.task_role_leases.push(TaskRoleLease {
         role_lease_id: ROLE_LEASE_ID.to_owned(),
@@ -382,6 +397,16 @@ fn fixture_delegation(ids: ScopeFixtureIds, now: OffsetDateTime) -> DelegationSt
         capability_scope: vec!["bounded_write".to_owned()],
         expires_at: now + time::Duration::minutes(30),
         epoch: 1,
+        state: AuthorityLeaseState::Active,
+        owner_operation_id: None,
+        seal_attempt_id: None,
+        generation: 1,
+        issued_at: Some(now),
+        activated_at: Some(now),
+        consumed_at: None,
+        revoked_at: None,
+        revoke_reason: None,
+        superseded_by_epoch: None,
     });
     delegation
 }
@@ -503,6 +528,8 @@ fn scope_fixture() -> anyhow::Result<ScopeFixture> {
             task_id: Some(ids.task),
             work_item_id: Some(ids.work_item),
             role_lease_id: Some(ROLE_LEASE_ID.to_owned()),
+            role_lease_epoch: 1,
+            operation_generation: 1,
             work_lease_id: Some(ids.work_lease),
             worktree_lease_id: Some(ids.worktree_lease),
             planned_verifier_ref: Some(

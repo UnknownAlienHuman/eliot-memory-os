@@ -1,3 +1,5 @@
+use std::os::windows::process::ExitStatusExt as _;
+
 #[allow(clippy::too_many_lines)]
 pub(crate) async fn dispatch(config_path: &Path, command: HostCommand) -> Result<()> {
     match command {
@@ -82,8 +84,7 @@ pub(crate) async fn dispatch(config_path: &Path, command: HostCommand) -> Result
                 baseline,
                 write_path,
             )?;
-            let _ =
-                bind_launch_scope(config_path, host, cwd.as_deref(), &mut scope, false).await?;
+            let _ = bind_launch_scope(config_path, host, cwd.as_deref(), &mut scope, false).await?;
             let contract = render_contract(
                 config_path,
                 host,
@@ -349,10 +350,7 @@ fn render_contract(
     Ok(HostLaunchContractService.render(&root, &profile, mode, &cwd, model, session, scope)?)
 }
 
-fn uses_managed_antigravity_launch(
-    host: AgentHostId,
-    structured_capture_requested: bool,
-) -> bool {
+fn uses_managed_antigravity_launch(host: AgentHostId, structured_capture_requested: bool) -> bool {
     host == AgentHostId::Antigravity && !structured_capture_requested
 }
 
@@ -388,8 +386,7 @@ async fn launch(
         && scope.project_id.is_some()
         && scope.task_id.is_some()
         && scope.role_lease_id.is_some();
-    let managed_antigravity =
-        uses_managed_antigravity_launch(host, structured_capture.is_some());
+    let managed_antigravity = uses_managed_antigravity_launch(host, structured_capture.is_some());
     let antigravity_containment = uses_managed_antigravity_containment(host);
     let canonical_authority = bind_launch_scope(
         config_path,
@@ -415,9 +412,7 @@ async fn launch(
             "ul_structured_auditor".clone_into(&mut contract.permission_profile);
         }
     }
-    if bounded_auditor
-        && let Some(timeout_seconds) = timeout_seconds
-    {
+    if bounded_auditor && let Some(timeout_seconds) = timeout_seconds {
         contract.wall_clock_budget_seconds = timeout_seconds.clamp(1, MAX_MANAGED_LAUNCH_SECONDS);
     }
     contract.contract_hash.clear();
@@ -610,9 +605,7 @@ async fn launch(
         None
     };
     let _antigravity_executable_guard = if antigravity_containment {
-        Some(lock_antigravity_executable_snapshot(Path::new(
-            &program,
-        ))?)
+        Some(lock_antigravity_executable_snapshot(Path::new(&program))?)
     } else {
         None
     };
@@ -674,10 +667,108 @@ async fn launch(
         atomic_write_json(&invocation_root.join("attempt.json"), &attempt)?;
         write_provider_start_marker(&invocation_root, &attempt.attempt_hash)?;
     }
-    let child = match command.spawn() {
-        Ok(child) => child,
-        Err(error) => {
+    let wall_clock = Duration::from_secs(contract.wall_clock_budget_seconds);
+    let raw_command = command.as_std();
+    let supervised_context = eliot_engine::runtime_supervision::AdapterExecutionContext {
+        operation_id: format!("host-provider-{}", contract.invocation_id),
+        generation: 1,
+        cancellation: eliot_engine::runtime_supervision::CancellationToken::new(),
+        deadline: tokio::time::Instant::now() + wall_clock,
+        runtime_store: supervised_process::daemon_operation_runtime_handle(config_path)?,
+        role_lease_id: contract.role_lease_id.clone(),
+        role_lease_epoch: Some(contract.role_lease_epoch),
+        runtime_contract_sha256: Some(contract.contract_hash.clone()),
+    };
+    let supervised_spec = supervised_process::SupervisedProcessSpec {
+        operation_id: supervised_context.operation_id.clone(),
+        invocation_id: Some(contract.invocation_id.clone()),
+        generation: supervised_context.generation,
+        child_kind: supervised_process::SupervisedChildKind::Provider,
+        criticality: supervised_process::ChildCriticality::InvocationDependency,
+        restart_policy: supervised_process::ProcessRestartPolicy {
+            strategy: supervised_process::RestartStrategy::RestForOne,
+            max_restarts: 1,
+            restart_window_seconds: 60,
+            base_backoff_ms: 250,
+            pre_dispatch_only: true,
+        },
+        executable: raw_command.get_program().into(),
+        args: raw_command
+            .get_args()
+            .map(std::ffi::OsString::from)
+            .collect(),
+        cwd: raw_command
+            .get_current_dir()
+            .map(ToOwned::to_owned)
+            .map_or_else(std::env::current_dir, Ok)?,
+        environment: raw_command
+            .get_envs()
+            .filter_map(|(name, value)| {
+                value.map(|value| {
+                    (
+                        std::ffi::OsString::from(name),
+                        std::ffi::OsString::from(value),
+                    )
+                })
+            })
+            .collect(),
+        stdin_payload: None,
+        stdout_limit_bytes: u64::try_from(MAX_SECRET_BOUNDARY_BYTES).unwrap_or(u64::MAX),
+        stderr_limit_bytes: u64::try_from(MAX_SECRET_BOUNDARY_BYTES).unwrap_or(u64::MAX),
+        timeout_profile: eliot_types::ProviderTimeoutProfile {
+            profile_id: format!("host-provider-{}-v1", host.as_str()),
+            provider: host.as_str().to_owned(),
+            route_or_operation_class: "host-launch".to_owned(),
+            spawn_deadline_ms: Some(5_000),
+            dispatch_ack_deadline_ms: Some(5_000),
+            first_output_deadline_ms: None,
+            idle_output_deadline_ms: None,
+            absolute_runtime_deadline_ms: u64::try_from(wall_clock.as_millis()).unwrap_or(u64::MAX),
+            cancellation_grace_ms: 100,
+            cleanup_grace_ms: 5_000,
+            reconciliation_window_ms: 5_000,
+            output_heartbeat_supported: false,
+            status_lookup_supported: false,
+            evidence_basis: vec!["sealed HostLaunchContract wall-clock budget".to_owned()],
+            assumptions: Vec::new(),
+            hard_upper_bounds: vec!["absolute host provider runtime".to_owned()],
+            policy_version: "runtime-supervision-v1".to_owned(),
+        },
+        runtime_contract_sha256: Some(contract.contract_hash.clone()),
+        role_lease_id: contract.role_lease_id.clone(),
+        role_lease_epoch: None,
+    };
+    let spawned = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let spawned_in_hook = std::sync::Arc::clone(&spawned);
+    let invocation_root_for_hook = invocation_root.clone();
+    let process = match supervised_process::run_supervised_process_with_spawn_hook(
+        supervised_spec,
+        supervised_context,
+        move |_| {
+            spawned_in_hook.store(true, std::sync::atomic::Ordering::Release);
             if antigravity_containment {
+                validate_contained_antigravity_attempt(
+                    &read_contained_antigravity_attempt(
+                        &invocation_root_for_hook.join("attempt.json"),
+                    )?
+                        .context(
+                            "contained Antigravity attempt journal disappeared after dispatch",
+                        )?,
+                )
+                .context(
+                    "provider dispatched: contained Antigravity attempt journal became invalid; outcome is unknown",
+                )?;
+            }
+            Ok(())
+        },
+    )
+    .await
+    {
+        Ok(process) => process,
+        Err(error) => {
+            if antigravity_containment
+                && !spawned.load(std::sync::atomic::Ordering::Acquire)
+            {
                 clear_contained_antigravity_pre_dispatch(&invocation_root).with_context(|| {
                     format!(
                         "{} provider launch failed before dispatch and its pre-dispatch journal could not be cleared",
@@ -685,42 +776,44 @@ async fn launch(
                     )
                 })?;
             }
-            return Err(error)
-                .with_context(|| format!("{} provider launch failed before dispatch", host.as_str()));
+            let dispatch_started = spawned.load(std::sync::atomic::Ordering::Acquire);
+            return Err(error).with_context(|| {
+                if dispatch_started {
+                    format!(
+                        "provider dispatched: {} launch admission failed; process tree reaped and outcome requires reconciliation",
+                        host.as_str()
+                    )
+                } else {
+                    format!("{} provider launch failed before dispatch", host.as_str())
+                }
+            });
         }
     };
-    if antigravity_containment {
-        validate_contained_antigravity_attempt(
-            &read_contained_antigravity_attempt(&invocation_root.join("attempt.json"))?
-                .context("contained Antigravity attempt journal disappeared after dispatch")?,
-        )
-        .context(
-            "provider dispatched: contained Antigravity attempt journal became invalid; outcome is unknown",
-        )?;
-    }
-    let output = tokio::time::timeout(
-        std::time::Duration::from_secs(contract.wall_clock_budget_seconds),
-        child.wait_with_output(),
-    )
-    .await
-    .with_context(|| {
-        format!(
-            "provider dispatched: {} exceeded the {} second wall-clock budget; outcome is unknown",
-            host.as_str(),
-            contract.wall_clock_budget_seconds
-        )
-    })?
-    .with_context(|| {
-        format!(
-            "provider dispatched: {} output collection failed; outcome is unknown",
-            host.as_str()
-        )
-    })?;
+    anyhow::ensure!(
+        !process.timed_out,
+        "provider dispatched: {} exceeded the {} second wall-clock budget; process tree reaped; outcome requires reconciliation",
+        host.as_str(),
+        contract.wall_clock_budget_seconds
+    );
+    anyhow::ensure!(
+        process.worker_error.is_none() && process.reap_receipt.proves_complete_reap(),
+        "provider dispatched: {} cleanup failed; outcome is unknown: {:?}",
+        host.as_str(),
+        process.worker_error
+    );
+    let reap_receipt = process.reap_receipt.clone();
+    let output = std::process::Output {
+        status: std::process::ExitStatus::from_raw(
+            process.exit_code.unwrap_or(i32::MAX).cast_unsigned(),
+        ),
+        stdout: process.stdout,
+        stderr: process.stderr,
+    };
     let sanitized_stdout = sanitize_managed_output(&output.stdout);
     let sanitized_stderr = sanitize_managed_output(&output.stderr);
-    std::fs::create_dir_all(&invocation_root).with_context(|| {
-        "provider dispatched: create invocation archive failed; outcome is unknown"
-    })?;
+    std::fs::create_dir_all(&invocation_root).with_context(
+        || "provider dispatched: create invocation archive failed; outcome is unknown",
+    )?;
     let stdout_ref = structured_capture
         .is_none()
         .then(|| invocation_root.join("stdout.jsonl"));
@@ -728,14 +821,14 @@ async fn launch(
         .is_none()
         .then(|| invocation_root.join("stderr.log"));
     if let Some(stdout_ref) = stdout_ref.as_ref() {
-        std::fs::write(stdout_ref, &sanitized_stdout.bytes).with_context(|| {
-            "provider dispatched: write stdout archive failed; outcome is unknown"
-        })?;
+        std::fs::write(stdout_ref, &sanitized_stdout.bytes).with_context(
+            || "provider dispatched: write stdout archive failed; outcome is unknown",
+        )?;
     }
     if let Some(stderr_ref) = stderr_ref.as_ref() {
-        std::fs::write(stderr_ref, &sanitized_stderr.bytes).with_context(|| {
-            "provider dispatched: write stderr archive failed; outcome is unknown"
-        })?;
+        std::fs::write(stderr_ref, &sanitized_stderr.bytes).with_context(
+            || "provider dispatched: write stderr archive failed; outcome is unknown",
+        )?;
     }
     let mut result_receipt = json!({
         "schema_version": "eliot-host-launch-result-v1",
@@ -754,6 +847,7 @@ async fn launch(
         "governor_daemon": &daemon_readiness,
         "launch_boundary": launch_boundary,
         "bounded_auditor_authority": canonical_authority.bounded_auditor,
+        "reap_receipt": reap_receipt,
         "candidate_only": true,
         "provider_outcome_status": if structured_capture.is_some() {
             "pending_structured_validation"
@@ -807,7 +901,8 @@ pub(crate) async fn invoke_ul_reasoning(
     cwd: &Path,
     request: &eliot_types::UlReasoningRequest,
 ) -> Result<Value> {
-    invoke_ul_reasoning_with_scope(config_path, cwd, request, HostLaunchScope::default(), None).await
+    invoke_ul_reasoning_with_scope(config_path, cwd, request, HostLaunchScope::default(), None)
+        .await
 }
 
 pub(crate) async fn prepare_ul_auditor_scope(
@@ -830,6 +925,7 @@ pub(crate) async fn prepare_ul_auditor_scope(
     .await
 }
 
+#[allow(dead_code)]
 pub(crate) async fn prepare_cognitive_external_scope(
     config_path: &Path,
     host: AgentHostId,
@@ -882,12 +978,22 @@ async fn prepare_auditor_scope(
         .and_then(Value::as_str)
         .context("UL auditor role grant returned no TaskRoleLease")?
         .to_owned();
+    let role_lease_epoch = grant
+        .pointer("/task_role_lease/epoch")
+        .and_then(Value::as_u64)
+        .context("UL auditor role grant returned no lease epoch")?;
+    let operation_generation = grant
+        .pointer("/task_role_lease/generation")
+        .and_then(Value::as_u64)
+        .context("UL auditor role grant returned no operation generation")?;
     Ok(HostLaunchScope {
         project_id: Some(project_id),
         agent_session_id: Some(agent_session_id),
         task_id: Some(task_id),
         work_item_id: None,
         role_lease_id: Some(role_lease_id),
+        role_lease_epoch,
+        operation_generation,
         work_lease_id: None,
         worktree_lease_id: None,
         planned_verifier_ref: None,
@@ -958,8 +1064,8 @@ async fn invoke_ul_reasoning_with_scope(
     );
     let config_path = config_path.to_path_buf();
     let cwd = cwd.to_path_buf();
-    let idempotency_key = (host == AgentHostId::Antigravity)
-        .then(|| request.idempotency_key.clone());
+    let idempotency_key =
+        (host == AgentHostId::Antigravity).then(|| request.idempotency_key.clone());
     let scoped = scope.task_id.is_some();
     let timeout_seconds =
         (host == AgentHostId::Antigravity || scoped).then_some(request.timeout_seconds);
@@ -1041,10 +1147,7 @@ fn structured_value_from_host_event(host: AgentHostId, value: Value) -> Result<V
     {
         return Ok(value);
     }
-    bail!(
-        "{} host event is not a structured UL result",
-        host.as_str()
-    )
+    bail!("{} host event is not a structured UL result", host.as_str())
 }
 
 fn persist_and_parse_structured_host_output(
@@ -1376,6 +1479,8 @@ fn parse_launch_scope(
             .map(|value| WorkItemId::from_str(&value).context("parse --work-item"))
             .transpose()?,
         role_lease_id: role_lease,
+        role_lease_epoch: 0,
+        operation_generation: 0,
         work_lease_id: work_lease
             .map(|value| WorkLeaseId::from_str(&value).context("parse --work-lease"))
             .transpose()?,
@@ -1438,8 +1543,7 @@ async fn bind_launch_scope(
     }
     scope.agent_session_id = Some(role.agent_session_id);
     if bounded_auditor {
-        let authority =
-            validate_bounded_auditor_authority(config_path, &state, scope, now).await?;
+        let authority = validate_bounded_auditor_authority(config_path, &state, scope, now).await?;
         return Ok(LaunchCanonicalAuthority {
             managed: None,
             bounded_auditor: Some(authority),
@@ -1523,14 +1627,9 @@ async fn validate_bounded_auditor_authority(
         task.memory_revision.value(),
     )
     .await?;
-    let host_binding_receipt = current_host_binding_authority(
-        &store,
-        project_id,
-        task_id,
-        binding,
-        &role_authority,
-    )
-    .await?;
+    let host_binding_receipt =
+        current_host_binding_authority(&store, project_id, task_id, binding, &role_authority)
+            .await?;
     let task_receipt_ref = WriteReceiptRef {
         receipt_id: task_receipt.receipt_id,
         write_id: task_receipt.write_id,

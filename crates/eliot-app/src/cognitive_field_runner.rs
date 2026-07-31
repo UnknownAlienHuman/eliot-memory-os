@@ -141,6 +141,10 @@ struct LegacyCoreRoleEvidencePlanV0 {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "source_kind", rename_all = "snake_case", deny_unknown_fields)]
+#[allow(
+    clippy::large_enum_variant,
+    reason = "legacy evidence wire variants must retain their established serialized shape"
+)]
 enum LegacyCoreRoleEvidenceSourceV0 {
     FreshProviderCall {
         planned_call_id: String,
@@ -1477,6 +1481,8 @@ async fn cognitive_external_execution_request(
         task_id: Some(binding.task_id),
         work_item_id: Some(work_item_id),
         role_lease_id: Some(role_lease_id.clone()),
+        role_lease_epoch: 0,
+        operation_generation: 0,
         work_lease_id: None,
         worktree_lease_id: None,
         planned_verifier_ref: scope.planned_verifier_ref.clone(),
@@ -1520,6 +1526,9 @@ async fn cognitive_external_execution_request(
             "request_controller_review".to_owned(),
         ],
         role_lease_id,
+        role_lease_epoch: 0,
+        operation_generation: 0,
+        runtime_contract_sha256: None,
         work_lease_id: None,
         packet_refs: Vec::new(),
         expected_result_kind: "provider_execution_evidence".to_owned(),
@@ -1843,6 +1852,10 @@ pub async fn execute_provider(
             session_id: Some(agent_session_id),
             trace_id: format!("cognitive-field:{}:{call_id}", contract.run_id),
             created_at: OffsetDateTime::now_utc(),
+            role_lease_id: None,
+            role_lease_epoch: None,
+            operation_generation: None,
+            runtime_contract_sha256: None,
         },
         input: serde_json::to_value(&execution)?,
     };

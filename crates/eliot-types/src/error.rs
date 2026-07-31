@@ -11,6 +11,9 @@ pub enum ConfigError {
     #[error("{field} must not be empty")]
     EmptyField { field: &'static str },
 
+    #[error("{field} must be non-zero")]
+    ZeroField { field: &'static str },
+
     #[error("SurrealDB bind address must stay on 127.0.0.1, got {bind}")]
     ForbiddenDbBind { bind: String },
 

@@ -573,6 +573,8 @@ pub(super) fn build_finalized_agent_result(
         host_id: authority.provider_result.host_id,
         host_session_id: authority.provider_result.host_session_id.clone(),
         status: AgentResultStatus::Succeeded,
+        role_lease_epoch: authority.provider_result.role_lease_epoch,
+        operation_generation: authority.provider_result.operation_generation,
         summary: "controller finalized exact managed provider CandidateDiff".to_owned(),
         artifact_refs: vec![
             artifacts.diff.diff_ref.clone(),

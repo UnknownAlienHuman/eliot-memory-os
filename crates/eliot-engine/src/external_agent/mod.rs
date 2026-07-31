@@ -172,6 +172,8 @@ pub fn validate_external_agent_execution_request(
                 EngineError::WriteRejected("launch contract work_item_id is required".to_owned())
             })?
         || invocation.role_lease_id != launch.role_lease_id.clone().unwrap_or_default()
+        || invocation.role_lease_epoch != launch.role_lease_epoch
+        || invocation.operation_generation != launch.operation_generation
         || invocation.idempotency_key != launch.idempotency_key
     {
         return rejected("execution request and launch authority do not agree");
@@ -182,6 +184,8 @@ pub fn validate_external_agent_execution_request(
             .as_deref()
             .unwrap_or_default()
             .is_empty()
+        || launch.role_lease_epoch == 0
+        || launch.operation_generation == 0
         || request.prompt_ref.trim().is_empty()
         || request.output_schema_ref.trim().is_empty()
         || !is_sha256(&request.prompt_sha256)

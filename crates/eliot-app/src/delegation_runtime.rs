@@ -182,7 +182,11 @@ pub fn explain(origin: DelegationOrigin, kind: DelegationReviewKind, question: &
 }
 
 #[allow(clippy::if_not_else, clippy::too_many_lines)]
-pub async fn review(root: &Path, input: DelegationReviewInput) -> Result<Value> {
+pub async fn review(
+    root: &Path,
+    config_path: &Path,
+    input: DelegationReviewInput,
+) -> Result<Value> {
     let mut delegation_state = load_state(root)?;
     let mut work_state = load_work_state(root)?;
     let reservation_owner = ProviderCallReservationOwner::new(root);
@@ -406,6 +410,7 @@ pub async fn review(root: &Path, input: DelegationReviewInput) -> Result<Value> 
                                 .context("active matching WorkLease disappeared")?;
                             match execute_real(
                                 root,
+                                config_path,
                                 &input.project_id,
                                 &input.task_id,
                                 &request,
@@ -694,6 +699,7 @@ pub fn shadow_report(root: &Path) -> Result<Value> {
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 async fn execute_real(
     root: &Path,
+    config_path: &Path,
     project: &str,
     task: &str,
     request: &DelegationRequest,
@@ -825,7 +831,10 @@ async fn execute_real(
         ProviderInvocationState::Reserved,
         vec![format!("reservation:{reservation_id}")],
     )?;
-    let run_result = AntigravityRunner.run_real_recorded(
+    let executor = crate::host_runtime::supervised_process::SharedAntigravityProcessExecutor::new(
+        config_path,
+    )?;
+    let run_result = AntigravityRunner.run_real_recorded_supervised(
         &provider_request,
         &contract,
         &worktree,
@@ -835,6 +844,7 @@ async fn execute_real(
         reservation_id,
         &journal,
         &mut attempt,
+        &executor,
     );
     let run = match run_result {
         Ok(run) => run,

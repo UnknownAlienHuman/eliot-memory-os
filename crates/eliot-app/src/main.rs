@@ -2335,7 +2335,7 @@ async fn dispatch_command(
         }
         Command::Host { command } => Box::pin(host_runtime::dispatch(config, command)).await,
         Command::ExternalAgent { command } => {
-            host_runtime::dispatch_external_agent(config, command).await
+            Box::pin(host_runtime::dispatch_external_agent(config, command)).await
         }
         Command::CognitiveField { command } => {
             dispatch_cognitive_field_command(config, command).await
@@ -2496,6 +2496,7 @@ async fn dispatch_delegate_command(config: &Path, command: DelegateCommand) -> R
             };
             delegation_runtime::review(
                 &root,
+                config,
                 delegation_runtime::DelegationReviewInput {
                     project_id: project,
                     task_id: task,
@@ -2539,6 +2540,7 @@ async fn dispatch_delegate_command(config: &Path, command: DelegateCommand) -> R
             };
             delegation_runtime::review(
                 &root,
+                config,
                 delegation_runtime::DelegationReviewInput {
                     project_id: project,
                     task_id: task,

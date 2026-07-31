@@ -1,6 +1,11 @@
 use super::external_agent_process::{ManagedExternalAgentOutput, run_external_agent_process};
+use super::supervised_process::{
+    ChildCriticality, ProcessRestartPolicy, RestartStrategy, SupervisedChildKind,
+    SupervisedProcessSpec, run_supervised_process,
+};
 use super::*;
 use eliot_engine::adapter::BoxAdapterFuture;
+use eliot_engine::runtime_supervision::AdapterExecutionContext;
 use eliot_engine::{
     Adapter, AdapterRegistry, AdapterSupervisor, AntigravityCommandInput, ClaudeCodeCommandInput,
     ExternalResultCompletenessService, OpenCodeCommandInput, ProviderCallReservationDecision,
@@ -21,11 +26,11 @@ use eliot_types::{
     ProviderStructuredOutputMode, TaintClass,
 };
 use std::collections::BTreeMap;
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::future::Future;
+use std::os::windows::process::ExitStatusExt as _;
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
-use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWriteExt as _};
 
 const MAX_PROVIDER_OUTPUT_BYTES: u64 = 1_048_576;
 const MAX_MCP_REFERENCE_OUTPUT_BYTES: u64 = 1_048_576;
@@ -111,7 +116,10 @@ pub(crate) fn production_external_agent_supervisor(
         &governor_executable,
     )?)?;
     registry.register(OpenCodeCliAdapter::new(config_path, &governor_executable)?)?;
-    Ok(AdapterSupervisor::new(registry))
+    Ok(AdapterSupervisor::with_runtime(
+        registry,
+        super::supervised_process::daemon_operation_runtime_handle(config_path)?,
+    ))
 }
 
 pub(crate) fn prepare_external_agent_runtime(
@@ -256,130 +264,136 @@ struct McpReferenceExchange {
     tool_call: Option<Value>,
 }
 
-#[derive(Debug)]
-struct CappedRead {
-    bytes: Vec<u8>,
-    overflowed: bool,
-}
-
-async fn read_and_drain_capped<R>(
-    mut reader: R,
-    max_bytes: u64,
-    stream_name: &'static str,
-) -> Result<CappedRead>
-where
-    R: AsyncRead + Unpin,
-{
-    let max_bytes = usize::try_from(max_bytes).context("MCP output cap exceeds usize")?;
-    let mut bytes = Vec::new();
-    let mut overflowed = false;
-    let mut chunk = [0_u8; 8_192];
-    loop {
-        let read = reader
-            .read(&mut chunk)
-            .await
-            .with_context(|| format!("read MCP reference {stream_name}"))?;
-        if read == 0 {
-            break;
-        }
-        let keep = max_bytes.saturating_sub(bytes.len()).min(read);
-        bytes.extend_from_slice(&chunk[..keep]);
-        overflowed |= keep != read;
-    }
-    Ok(CappedRead { bytes, overflowed })
-}
-
+#[allow(
+    clippy::too_many_lines,
+    reason = "one supervised MCP child state machine keeps spawn, drain, timeout, and reap evidence together"
+)]
 async fn run_bounded_mcp_child(
-    mut command: tokio::process::Command,
+    config_path: &Path,
+    command: Command,
     request_bytes: Vec<u8>,
     phase: &str,
     timeout: Duration,
 ) -> Result<std::process::Output> {
-    command.kill_on_drop(true);
-    let mut child = command
-        .spawn()
-        .with_context(|| format!("start Rust MCP reference exchange phase={phase}"))?;
-    let pid = child.id().unwrap_or_default();
-    let mut stdin = child
-        .stdin
-        .take()
-        .context("MCP reference stdin is absent")?;
-    let stdout = child
-        .stdout
-        .take()
-        .context("MCP reference stdout is absent")?;
-    let stderr = child
-        .stderr
-        .take()
-        .context("MCP reference stderr is absent")?;
-
-    let writer = tokio::spawn(async move {
-        stdin
-            .write_all(&request_bytes)
-            .await
-            .context("write MCP reference requests")?;
-        stdin
-            .shutdown()
-            .await
-            .context("shutdown MCP reference stdin")?;
-        Ok::<(), anyhow::Error>(())
-    });
-    let stdout_reader = tokio::spawn(read_and_drain_capped(
-        stdout,
-        MAX_MCP_REFERENCE_OUTPUT_BYTES,
-        "stdout",
-    ));
-    let stderr_reader = tokio::spawn(read_and_drain_capped(
-        stderr,
-        MAX_MCP_REFERENCE_OUTPUT_BYTES,
-        "stderr",
-    ));
-
-    let deadline = tokio::time::sleep(timeout);
-    tokio::pin!(deadline);
-    let status = tokio::select! {
-        status = child.wait() => Some(status.context("wait for Rust MCP reference exchange")?),
-        () = &mut deadline => None,
+    let executable = PathBuf::from(command.get_program());
+    let args = command.get_args().map(OsString::from).collect();
+    let cwd = command
+        .get_current_dir()
+        .map(ToOwned::to_owned)
+        .map_or_else(std::env::current_dir, Ok)?;
+    let mut environment = SAFE_INHERITED_ENVIRONMENT
+        .iter()
+        .filter_map(|name| std::env::var_os(name).map(|value| (OsString::from(name), value)))
+        .collect::<BTreeMap<_, _>>();
+    for (name, value) in command.get_envs() {
+        if let Some(value) = value {
+            environment.insert(name.into(), value.into());
+        } else {
+            environment.remove(name);
+        }
+    }
+    let operation_id = format!(
+        "mcp-preflight-{}-{}",
+        phase
+            .chars()
+            .map(|character| if character.is_ascii_alphanumeric() {
+                character
+            } else {
+                '-'
+            })
+            .collect::<String>(),
+        Uuid::now_v7()
+    );
+    let cancellation = eliot_engine::runtime_supervision::CancellationToken::new();
+    let context = AdapterExecutionContext {
+        operation_id: operation_id.clone(),
+        generation: 1,
+        cancellation,
+        deadline: tokio::time::Instant::now() + timeout,
+        runtime_store: super::supervised_process::daemon_operation_runtime_handle(config_path)?,
+        role_lease_id: None,
+        role_lease_epoch: None,
+        runtime_contract_sha256: None,
     };
-    let Some(status) = status else {
-        let kill_error = child.kill().await.err();
-        let reap_error = child.wait().await.err();
-        writer.abort();
-        stdout_reader.abort();
-        stderr_reader.abort();
-        drop(writer.await);
-        drop(stdout_reader.await);
-        drop(stderr_reader.await);
+    let timeout_ms = u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX);
+    let output = run_supervised_process(
+        SupervisedProcessSpec {
+            operation_id,
+            invocation_id: None,
+            generation: 1,
+            child_kind: SupervisedChildKind::McpPreflight,
+            criticality: ChildCriticality::InvocationDependency,
+            restart_policy: ProcessRestartPolicy {
+                strategy: RestartStrategy::OneForOne,
+                max_restarts: 1,
+                restart_window_seconds: 60,
+                base_backoff_ms: 100,
+                pre_dispatch_only: true,
+            },
+            executable,
+            args,
+            cwd,
+            environment,
+            stdin_payload: Some(request_bytes),
+            stdout_limit_bytes: MAX_MCP_REFERENCE_OUTPUT_BYTES,
+            stderr_limit_bytes: MAX_MCP_REFERENCE_OUTPUT_BYTES,
+            timeout_profile: eliot_types::ProviderTimeoutProfile {
+                profile_id: "mcp-preflight-v1".to_owned(),
+                provider: "eliot-governor".to_owned(),
+                route_or_operation_class: phase.to_owned(),
+                spawn_deadline_ms: Some(5_000),
+                dispatch_ack_deadline_ms: None,
+                first_output_deadline_ms: Some(timeout_ms),
+                idle_output_deadline_ms: Some(timeout_ms),
+                absolute_runtime_deadline_ms: timeout_ms,
+                cancellation_grace_ms: 25,
+                cleanup_grace_ms: 5_000,
+                reconciliation_window_ms: 0,
+                output_heartbeat_supported: true,
+                status_lookup_supported: false,
+                evidence_basis: vec!["bounded local MCP reference exchange".to_owned()],
+                assumptions: Vec::new(),
+                hard_upper_bounds: vec!["absolute runtime deadline".to_owned()],
+                policy_version: "runtime-supervision-v1".to_owned(),
+            },
+            runtime_contract_sha256: None,
+            role_lease_id: None,
+            role_lease_epoch: None,
+        },
+        context,
+    )
+    .await?;
+    let pid = output.reap_receipt.root_pid.unwrap_or_default();
+    if output.timed_out {
         anyhow::ensure!(
-            kill_error.is_none() && reap_error.is_none(),
-            "Rust MCP reference exchange phase={phase} exceeded {} seconds; pid={pid}; kill_error={kill_error:?}; reap_error={reap_error:?}",
+            output.reap_receipt.proves_complete_reap(),
+            "Rust MCP reference exchange phase={phase} exceeded {} seconds; pid={pid}; cleanup receipt incomplete",
             timeout.as_secs_f64()
         );
         anyhow::bail!(
             "Rust MCP reference exchange phase={phase} exceeded {} seconds; pid={pid}; child killed and reaped",
             timeout.as_secs_f64()
         );
-    };
-
-    writer.await.context("join MCP reference stdin writer")??;
-    let stdout = stdout_reader
-        .await
-        .context("join MCP reference stdout reader")??;
-    let stderr = stderr_reader
-        .await
-        .context("join MCP reference stderr reader")??;
+    }
     anyhow::ensure!(
-        !stdout.overflowed,
+        output.worker_error.is_none(),
+        "Rust MCP reference exchange phase={phase} cleanup failed: {:?}",
+        output.worker_error
+    );
+    anyhow::ensure!(
+        !output.stdout_truncated,
         "Rust MCP reference exchange phase={phase} stdout exceeded {MAX_MCP_REFERENCE_OUTPUT_BYTES} bytes"
     );
     anyhow::ensure!(
-        !stderr.overflowed,
+        !output.stderr_truncated,
         "Rust MCP reference exchange phase={phase} stderr exceeded {MAX_MCP_REFERENCE_OUTPUT_BYTES} bytes"
     );
     Ok(std::process::Output {
-        status,
-        stdout: stdout.bytes,
-        stderr: stderr.bytes,
+        status: std::process::ExitStatus::from_raw(
+            output.exit_code.unwrap_or(i32::MAX).cast_unsigned(),
+        ),
+        stdout: output.stdout,
+        stderr: output.stderr,
     })
 }
 
@@ -399,7 +413,7 @@ async fn mcp_reference_exchange(
     let executable =
         std::env::var_os("ELIOT_GOVERNOR_EXE").map_or(std::env::current_exe()?, PathBuf::from);
     let executable = std::fs::canonicalize(executable)?;
-    let mut command = tokio::process::Command::new(executable);
+    let mut command = Command::new(executable);
     if config_path.is_file() {
         command.args(["--config", &path_string(config_path)]);
     }
@@ -414,8 +428,7 @@ async fn mcp_reference_exchange(
     command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true);
+        .stderr(Stdio::piped());
     for name in [
         "SURREAL_USER",
         "SURREAL_PASS",
@@ -488,8 +501,14 @@ async fn mcp_reference_exchange(
             request_bytes.push(b'\n');
         }
     }
-    let output =
-        run_bounded_mcp_child(command, request_bytes, phase, MCP_REFERENCE_TIMEOUT).await?;
+    let output = run_bounded_mcp_child(
+        config_path,
+        command,
+        request_bytes,
+        phase,
+        MCP_REFERENCE_TIMEOUT,
+    )
+    .await?;
     anyhow::ensure!(
         output.status.success(),
         "Rust MCP reference exchange failed: {}",
@@ -980,6 +999,8 @@ async fn run_mcp_smoke(config_path: &Path, host: AgentHostId, model: &str) -> Re
             task_id: Some(task_id),
             work_item_id: Some(work_item_id),
             role_lease_id: Some(role_lease_id.clone()),
+            role_lease_epoch: scope.role_lease_epoch,
+            operation_generation: scope.operation_generation,
             work_lease_id: None,
             worktree_lease_id: None,
             planned_verifier_ref: scope.planned_verifier_ref.clone(),
@@ -1026,6 +1047,9 @@ async fn run_mcp_smoke(config_path: &Path, host: AgentHostId, model: &str) -> Re
                 "request_controller_review".to_owned(),
             ],
             role_lease_id,
+            role_lease_epoch: scope.role_lease_epoch,
+            operation_generation: scope.operation_generation,
+            runtime_contract_sha256: Some(launch_contract.contract_hash.clone()),
             work_lease_id: None,
             packet_refs: Vec::new(),
             expected_result_kind: "provider_execution_evidence".to_owned(),
@@ -1067,6 +1091,10 @@ async fn run_mcp_smoke(config_path: &Path, host: AgentHostId, model: &str) -> Re
                 session_id: Some(agent_session_id),
                 trace_id: format!("external-agent-smoke:{smoke_id}"),
                 created_at: OffsetDateTime::now_utc(),
+                role_lease_id: Some(execution.invocation.role_lease_id.clone()),
+                role_lease_epoch: Some(execution.invocation.role_lease_epoch),
+                operation_generation: Some(execution.invocation.operation_generation),
+                runtime_contract_sha256: Some(execution.launch_contract.contract_hash.clone()),
             },
             input: serde_json::to_value(execution)?,
         };
@@ -1310,10 +1338,22 @@ async fn run_auth_smoke(config_path: &Path, host: AgentHostId, model: &str) -> R
     for (name, value) in &environment {
         command.env(name, value);
     }
+    let operation_id = format!("auth-smoke-{auth_id}");
     let output = run_external_agent_process(
         command,
+        operation_id.clone(),
         Duration::from_secs(120),
         Duration::from_secs(PROVIDER_CLEANUP_GRACE_SECONDS),
+        Some(AdapterExecutionContext {
+            operation_id,
+            generation: 1,
+            cancellation: eliot_engine::runtime_supervision::CancellationToken::new(),
+            deadline: tokio::time::Instant::now() + Duration::from_secs(120),
+            runtime_store: super::supervised_process::daemon_operation_runtime_handle(config_path)?,
+            role_lease_id: None,
+            role_lease_epoch: None,
+            runtime_contract_sha256: None,
+        }),
         |_| Ok(()),
     )
     .await?;
@@ -1345,6 +1385,7 @@ async fn run_auth_smoke(config_path: &Path, host: AgentHostId, model: &str) -> R
         "stdout_sha256": sha256_bytes(&output.stdout),
         "stderr_sha256": sha256_bytes(&output.stderr),
         "process_tree_terminated": output.process_tree_terminated,
+        "reap_receipt": output.reap_receipt,
         "gui_used": false,
     });
     let report_path = runtime_root(config_path)
@@ -1415,8 +1456,12 @@ macro_rules! impl_external_adapter {
                 self.core.health()
             }
 
-            fn execute(&self, request: AdapterRequest) -> BoxAdapterFuture<'_, AdapterResult> {
-                self.core.execute(request)
+            fn execute(
+                &self,
+                request: AdapterRequest,
+                context: AdapterExecutionContext,
+            ) -> BoxAdapterFuture<'_, AdapterResult> {
+                self.core.execute(request, context)
             }
 
             fn shutdown(&self) -> BoxAdapterFuture<'_, ()> {
@@ -1482,7 +1527,11 @@ impl ExternalAgentAdapterCore {
         })
     }
 
-    fn execute(&self, request: AdapterRequest) -> BoxAdapterFuture<'_, AdapterResult> {
+    fn execute(
+        &self,
+        request: AdapterRequest,
+        context: AdapterExecutionContext,
+    ) -> BoxAdapterFuture<'_, AdapterResult> {
         Box::pin(async move {
             let execution: ExternalAgentExecutionRequest =
                 serde_json::from_value(request.input.clone())?;
@@ -1495,7 +1544,7 @@ impl ExternalAgentAdapterCore {
                     "AdapterContext differs from sealed external-agent authority".to_owned(),
                 ));
             }
-            self.execute_governed(request, execution).await
+            self.execute_governed(request, execution, context).await
         })
     }
 
@@ -1504,6 +1553,7 @@ impl ExternalAgentAdapterCore {
         &self,
         request: AdapterRequest,
         execution: ExternalAgentExecutionRequest,
+        context: AdapterExecutionContext,
     ) -> Result<AdapterResult, eliot_engine::EngineError> {
         let PreparedExternalAgentExecution {
             executable,
@@ -1670,8 +1720,10 @@ impl ExternalAgentAdapterCore {
             Duration::from_secs(execution.launch_contract.wall_clock_budget_seconds.max(1));
         let process = run_external_agent_process(
             command,
+            context.operation_id.clone(),
             absolute_timeout,
             Duration::from_secs(PROVIDER_CLEANUP_GRACE_SECONDS),
+            Some(context),
             |pid| {
                 reservation_owner
                     .mark_dispatched(&reservation.reservation_id, &attempt_id)
@@ -1730,8 +1782,9 @@ impl ExternalAgentAdapterCore {
         attempt.cleanup_completed_at = Some(OffsetDateTime::now_utc());
         attempt.exit_code_or_signal = process.exit_code.map(|code| code.to_string());
         attempt.process_or_job_identity = Some(format!(
-            "pid:{};terminated={};observed={}",
+            "pid:{};job={};terminated={};observed={}",
             process.root_pid,
+            process.reap_receipt.job_object_name,
             process.process_tree_terminated,
             process.observed_processes.join("|")
         ));
@@ -2169,6 +2222,8 @@ impl ExternalAgentAdapterCore {
                 .as_ref()
                 .map(|parsed| parsed.provider_session_id.clone()),
             status: agent_status,
+            role_lease_epoch: execution.invocation.role_lease_epoch,
+            operation_generation: execution.invocation.operation_generation,
             summary: error_message
                 .clone()
                 .unwrap_or_else(|| "provider returned a schema-valid candidate result".to_owned()),
@@ -2431,7 +2486,19 @@ async fn canonicalize_external_agent_broker_result(
     if let Some(existing) = existing_receipted_external_result(existing, &unreceipted_result)? {
         return Ok(existing);
     }
-    let mut receipted_result = HostBrokerService.record_result(&mut state, unreceipted_result)?;
+    let admission = HostBrokerService.record_result(&mut state, unreceipted_result)?;
+    let mut receipted_result = match admission {
+        eliot_engine::AgentResultAdmission::Accepted(result) => result,
+        eliot_engine::AgentResultAdmission::StaleEvidencePreserved(_) => {
+            engine_anyhow(crate::delegation_runtime::save_host_broker_state(
+                &root, &state,
+            ))?;
+            return Err(eliot_engine::EngineError::WriteRejected(
+                "stale role epoch or operation generation result preserved as evidence but rejected as current"
+                    .to_owned(),
+            ));
+        }
+    };
     let session_id = execution.launch_contract.agent_session_id.ok_or_else(|| {
         eliot_engine::EngineError::WriteRejected(
             "external result lacks governed AgentSession".to_owned(),
@@ -3123,6 +3190,8 @@ pub(super) fn canonical_external_result_contract_fixture() -> Result<Value> {
         host_id: AgentHostId::Claude,
         host_session_id: Some("fixture-provider-session".to_owned()),
         status: AgentResultStatus::Succeeded,
+        role_lease_epoch: 1,
+        operation_generation: 1,
         summary: "fixture candidate result".to_owned(),
         artifact_refs: Vec::new(),
         evidence_refs: vec!["fixture-evidence".to_owned()],
@@ -3211,81 +3280,6 @@ mod mcp_smoke_tests {
         assert_eq!(entries[1]["phase"], "current_state_preflight");
         assert_eq!(entries[1]["detail"], "test deadline");
         std::fs::remove_dir_all(&root)?;
-        Ok(())
-    }
-
-    #[cfg(windows)]
-    fn powershell_child(script: &str) -> tokio::process::Command {
-        let mut command = tokio::process::Command::new("powershell.exe");
-        command
-            .args([
-                "-NoLogo",
-                "-NoProfile",
-                "-NonInteractive",
-                "-Command",
-                script,
-            ])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        command
-    }
-
-    #[cfg(windows)]
-    #[tokio::test]
-    async fn bounded_child_drains_output_while_writing_input() -> Result<()> {
-        let command = powershell_child(
-            "$s = 'x' * 131072; [Console]::Out.Write($s); [Console]::Error.Write($s); $null = [Console]::In.ReadToEnd()",
-        );
-        let output = run_bounded_mcp_child(
-            command,
-            vec![b'i'; 262_144],
-            "flood_regression",
-            Duration::from_secs(10),
-        )
-        .await?;
-        assert!(output.status.success());
-        assert_eq!(output.stdout.len(), 131_072);
-        assert_eq!(output.stderr.len(), 131_072);
-        Ok(())
-    }
-
-    #[cfg(windows)]
-    #[tokio::test]
-    async fn bounded_child_kills_and_reaps_a_hang() -> Result<()> {
-        let started = Instant::now();
-        let error = run_bounded_mcp_child(
-            powershell_child("Start-Sleep -Seconds 30"),
-            Vec::new(),
-            "hang_regression",
-            Duration::from_millis(300),
-        )
-        .await
-        .expect_err("hanging child must be bounded");
-        assert!(started.elapsed() < Duration::from_secs(5));
-        let message = error.to_string();
-        assert!(message.contains("phase=hang_regression"));
-        assert!(message.contains("child killed and reaped"));
-        let pid = message
-            .split("pid=")
-            .nth(1)
-            .and_then(|tail| tail.split(';').next())
-            .context("timeout error did not expose the child PID")?;
-        let probe = Command::new("powershell.exe")
-            .args([
-                "-NoLogo",
-                "-NoProfile",
-                "-NonInteractive",
-                "-Command",
-                &format!(
-                    "if (Get-Process -Id {pid} -ErrorAction SilentlyContinue) {{ exit 1 }} else {{ exit 0 }}"
-                ),
-            ])
-            .output()?;
-        assert!(
-            probe.status.success(),
-            "timed-out MCP child PID {pid} still exists"
-        );
         Ok(())
     }
 }

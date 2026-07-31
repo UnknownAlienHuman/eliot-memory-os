@@ -13,15 +13,16 @@ use std::os::windows::fs::{MetadataExt as _, OpenOptionsExt as _};
 use std::os::windows::io::{AsRawHandle as _, FromRawHandle as _};
 use std::path::{Path, PathBuf};
 use std::ptr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
 use tokio::net::windows::named_pipe::{NamedPipeServer, ServerOptions};
 use windows_sys::Win32::Foundation::{
-    CloseHandle, ERROR_ACCESS_DENIED, ERROR_INVALID_PARAMETER, ERROR_IO_PENDING, ERROR_MORE_DATA,
-    ERROR_NOT_FOUND, ERROR_SHARING_VIOLATION, FILETIME, GetLastError, HANDLE, HANDLE_FLAG_INHERIT,
-    INVALID_HANDLE_VALUE, LocalFree, STILL_ACTIVE, SetHandleInformation, WAIT_OBJECT_0,
-    WAIT_TIMEOUT,
+    CloseHandle, ERROR_ACCESS_DENIED, ERROR_ALREADY_EXISTS, ERROR_INVALID_PARAMETER,
+    ERROR_IO_PENDING, ERROR_MORE_DATA, ERROR_NOT_FOUND, ERROR_SHARING_VIOLATION, FILETIME,
+    GetLastError, HANDLE, HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE, LocalFree, STILL_ACTIVE,
+    SetHandleInformation, WAIT_OBJECT_0, WAIT_TIMEOUT,
 };
 use windows_sys::Win32::Security::Authorization::{
     ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
@@ -53,15 +54,18 @@ use windows_sys::Win32::System::JobObjects::{
     AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
     JOBOBJECT_ASSOCIATE_COMPLETION_PORT, JOBOBJECT_BASIC_PROCESS_ID_LIST,
     JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectAssociateCompletionPortInformation,
-    JobObjectBasicProcessIdList, JobObjectExtendedLimitInformation, QueryInformationJobObject,
-    SetInformationJobObject, TerminateJobObject,
+    JobObjectBasicProcessIdList, JobObjectExtendedLimitInformation, OpenJobObjectW,
+    QueryInformationJobObject, SetInformationJobObject, TerminateJobObject,
 };
 use windows_sys::Win32::System::Pipes::{CreatePipe, GetNamedPipeClientProcessId};
 use windows_sys::Win32::System::Threading::{
     CREATE_NO_WINDOW, CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, CreateEventW, CreateProcessW,
-    GetExitCodeProcess, OpenProcess, PROCESS_INFORMATION, PROCESS_QUERY_LIMITED_INFORMATION,
+    DeleteProcThreadAttributeList, EXTENDED_STARTUPINFO_PRESENT, GetExitCodeProcess,
+    GetProcessTimes, InitializeProcThreadAttributeList, LPPROC_THREAD_ATTRIBUTE_LIST, OpenProcess,
+    PROC_THREAD_ATTRIBUTE_HANDLE_LIST, PROCESS_INFORMATION, PROCESS_QUERY_LIMITED_INFORMATION,
     PROCESS_SET_QUOTA, PROCESS_TERMINATE, QueryFullProcessImageNameW, ResumeThread,
-    STARTF_USESTDHANDLES, STARTUPINFOW, TerminateProcess, WaitForSingleObject,
+    STARTF_USESTDHANDLES, STARTUPINFOEXW, TerminateProcess, UpdateProcThreadAttribute,
+    WaitForSingleObject,
 };
 
 const MAX_PROCESS_IMAGE_CHARS: usize = 32_768;
@@ -69,6 +73,9 @@ const MAX_JOB_PROCESS_IDS: usize = 4_096;
 const JOB_COMPLETION_KEY: usize = 0x454c_494f;
 const JOB_OBSERVER_SHUTDOWN_KEY: usize = 0x454e_4421;
 const JOB_OBJECT_MSG_NEW_PROCESS: u32 = 6;
+static LEGACY_JOB_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+const JOB_OBJECT_QUERY_ACCESS: u32 = 0x0004;
+const JOB_OBJECT_TERMINATE_ACCESS: u32 = 0x0008;
 
 /// Kernel-derived identity of a process observed through a named pipe or Job Object.
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -387,7 +394,7 @@ pub fn process_image_path(pid: u32) -> io::Result<PathBuf> {
     Ok(open_process_identity(pid)?.identity.image)
 }
 
-fn query_process_image(process: &OwnedHandle) -> io::Result<PathBuf> {
+fn query_process_image(process: HANDLE) -> io::Result<PathBuf> {
     let mut image = vec![0_u16; MAX_PROCESS_IMAGE_CHARS];
     let mut chars = u32::try_from(image.len()).map_err(|_| {
         io::Error::new(
@@ -397,7 +404,7 @@ fn query_process_image(process: &OwnedHandle) -> io::Result<PathBuf> {
     })?;
     // SAFETY: the process handle is live and the UTF-16 output buffer has `chars` elements.
     let queried =
-        unsafe { QueryFullProcessImageNameW(process.0, 0, image.as_mut_ptr(), &raw mut chars) };
+        unsafe { QueryFullProcessImageNameW(process, 0, image.as_mut_ptr(), &raw mut chars) };
     if queried == 0 || chars == 0 {
         return Err(io::Error::last_os_error());
     }
@@ -421,7 +428,7 @@ fn open_process_identity(pid: u32) -> io::Result<ObservedProcess> {
     // SAFETY: `pid` is only used by Windows to resolve a process handle.
     let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
     let process = OwnedHandle::new(process)?;
-    let image = query_process_image(&process)?;
+    let image = query_process_image(process.0)?;
     let image_file = PinnedFile::open(&image)?;
     Ok(ObservedProcess {
         identity: ProcessImageIdentity {
@@ -432,6 +439,105 @@ fn open_process_identity(pid: u32) -> io::Result<ObservedProcess> {
         _process: process,
         _image_file: image_file,
     })
+}
+
+/// A process reopened during startup recovery while retaining both its process
+/// handle and a pinned executable image.
+///
+/// Callers must verify both [`Self::start_ticks`] and the bytes reachable
+/// through [`Self::identity`] before terminating it. Keeping these handles
+/// open prevents PID reuse and executable replacement between verification and
+/// termination.
+pub struct RecoverableProcess {
+    process: OwnedHandle,
+    identity: ProcessImageIdentity,
+    _image_file: PinnedFile,
+}
+
+impl RecoverableProcess {
+    /// Reopens one exact PID with query and terminate rights.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the PID is zero, absent, inaccessible, or its
+    /// executable cannot be pinned.
+    pub fn open(pid: u32) -> io::Result<Self> {
+        if pid == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "PID must be non-zero",
+            ));
+        }
+        // SAFETY: `pid` is only used by Windows to resolve a process handle.
+        let process = unsafe {
+            OpenProcess(
+                PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_TERMINATE,
+                0,
+                pid,
+            )
+        };
+        let process = OwnedHandle::new(process)?;
+        let image = query_process_image(process.0)?;
+        let image_file = PinnedFile::open(&image)?;
+        Ok(Self {
+            identity: ProcessImageIdentity {
+                pid,
+                image,
+                file_identity: image_file.identity(),
+            },
+            process,
+            _image_file: image_file,
+        })
+    }
+
+    #[must_use]
+    pub fn identity(&self) -> &ProcessImageIdentity {
+        &self.identity
+    }
+
+    /// Returns the process creation FILETIME ticks through the retained handle.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when Windows cannot query the process times.
+    pub fn start_ticks(&self) -> io::Result<u64> {
+        process_start_ticks(self.process.0)
+    }
+
+    /// Terminates this already verified process through the retained handle.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when Windows cannot terminate the process.
+    pub fn terminate(&self, exit_code: u32) -> io::Result<()> {
+        // SAFETY: the retained process handle is live for the call.
+        if unsafe { TerminateProcess(self.process.0, exit_code) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    /// Waits for the verified process to become terminal.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the duration cannot be represented or Windows
+    /// cannot wait for the process.
+    pub fn wait_timeout(&self, timeout: Duration) -> io::Result<bool> {
+        let millis = timeout.as_millis().min(u128::from(u32::MAX - 1));
+        let millis = u32::try_from(millis).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "wait duration does not fit u32",
+            )
+        })?;
+        // SAFETY: the retained process handle is live for the call.
+        match unsafe { WaitForSingleObject(self.process.0, millis) } {
+            WAIT_OBJECT_0 => Ok(true),
+            WAIT_TIMEOUT => Ok(false),
+            _ => Err(io::Error::last_os_error()),
+        }
+    }
 }
 
 /// Owns a Windows Job Object configured to kill the complete provider process
@@ -557,9 +663,30 @@ impl Drop for OwnedHandle {
     }
 }
 
-fn create_kill_on_close_job() -> io::Result<OwnedHandle> {
-    // SAFETY: null name and security pointers request an unnamed job owned here.
-    let job = OwnedHandle::new(unsafe { CreateJobObjectW(ptr::null(), ptr::null()) })?;
+fn create_kill_on_close_job(name: &str) -> io::Result<OwnedHandle> {
+    let name = nul_terminated_wide(OsStr::new(name))?;
+    let descriptor = SecurityDescriptor::for_job_owner()?;
+    let attributes = SECURITY_ATTRIBUTES {
+        nLength: u32::try_from(std::mem::size_of::<SECURITY_ATTRIBUTES>()).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "SECURITY_ATTRIBUTES is too large",
+            )
+        })?,
+        lpSecurityDescriptor: descriptor.raw,
+        bInheritHandle: 0,
+    };
+    // SAFETY: the name is NUL-terminated and the security descriptor and
+    // attributes remain live for the complete creation call.
+    let raw_job = unsafe { CreateJobObjectW(&raw const attributes, name.as_ptr()) };
+    let creation_error = unsafe { GetLastError() };
+    let job = OwnedHandle::new(raw_job)?;
+    if creation_error == ERROR_ALREADY_EXISTS {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "supervised Job Object already exists",
+        ));
+    }
     let mut info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
     info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
     let info_size = u32::try_from(std::mem::size_of_val(&info)).map_err(|_| {
@@ -850,6 +977,135 @@ fn job_process_observer_loop(raw_port: usize, observed: &Arc<Mutex<Vec<ObservedP
     }
 }
 
+struct ProcThreadAttributeList {
+    _storage: Vec<usize>,
+    list: LPPROC_THREAD_ATTRIBUTE_LIST,
+}
+
+impl ProcThreadAttributeList {
+    fn for_inherited_handles(handles: &[HANDLE]) -> io::Result<Self> {
+        let mut bytes = 0_usize;
+        // SAFETY: the documented sizing call uses a null list and writes only
+        // the required byte count.
+        unsafe {
+            InitializeProcThreadAttributeList(ptr::null_mut(), 1, 0, &raw mut bytes);
+        }
+        if bytes == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let words = bytes.div_ceil(std::mem::size_of::<usize>());
+        let mut storage = vec![0_usize; words];
+        let list = storage.as_mut_ptr().cast::<c_void>();
+        // SAFETY: `storage` is pointer-aligned, large enough for the size
+        // returned above, and remains owned by the returned wrapper.
+        if unsafe { InitializeProcThreadAttributeList(list, 1, 0, &raw mut bytes) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let handle_bytes = std::mem::size_of_val(handles);
+        // SAFETY: the attribute list is initialized, `handles` is live for the
+        // call, and the exact HANDLE array size is supplied.
+        if unsafe {
+            UpdateProcThreadAttribute(
+                list,
+                0,
+                usize::try_from(PROC_THREAD_ATTRIBUTE_HANDLE_LIST).map_err(|_| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "process handle-list attribute does not fit usize",
+                    )
+                })?,
+                handles.as_ptr().cast::<c_void>(),
+                handle_bytes,
+                ptr::null_mut(),
+                ptr::null(),
+            )
+        } == 0
+        {
+            let error = io::Error::last_os_error();
+            // SAFETY: the list was initialized successfully above.
+            unsafe {
+                DeleteProcThreadAttributeList(list);
+            }
+            return Err(error);
+        }
+        Ok(Self {
+            _storage: storage,
+            list,
+        })
+    }
+}
+
+impl Drop for ProcThreadAttributeList {
+    fn drop(&mut self) {
+        // SAFETY: the list is initialized and its backing storage remains live
+        // until after this Drop completes.
+        unsafe {
+            DeleteProcThreadAttributeList(self.list);
+        }
+    }
+}
+
+struct SuspendedProcessGuard {
+    process: HANDLE,
+    thread: HANDLE,
+    armed: bool,
+}
+
+impl SuspendedProcessGuard {
+    fn new(information: PROCESS_INFORMATION) -> io::Result<Self> {
+        if information.hProcess.is_null() || information.hThread.is_null() {
+            if !information.hProcess.is_null() {
+                // SAFETY: `hProcess` was returned by CreateProcessW and is
+                // uniquely owned on this error path.
+                unsafe {
+                    TerminateProcess(information.hProcess, 1);
+                    WaitForSingleObject(information.hProcess, 5_000);
+                    CloseHandle(information.hProcess);
+                }
+            }
+            if !information.hThread.is_null() {
+                // SAFETY: `hThread` was returned by CreateProcessW and is
+                // uniquely owned on this error path.
+                unsafe {
+                    CloseHandle(information.hThread);
+                }
+            }
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "CreateProcessW returned an incomplete process-information record",
+            ));
+        }
+        Ok(Self {
+            process: information.hProcess,
+            thread: information.hThread,
+            armed: true,
+        })
+    }
+
+    fn into_handles(mut self) -> (OwnedHandle, OwnedHandle) {
+        self.armed = false;
+        (OwnedHandle(self.process), OwnedHandle(self.thread))
+    }
+}
+
+impl Drop for SuspendedProcessGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        // SAFETY: both handles came from one successful CreateProcessW call,
+        // remain uniquely owned here, and the process is still suspended or
+        // already contained. Termination plus a bounded wait prevents an
+        // unassigned suspended orphan on every early-return path.
+        unsafe {
+            TerminateProcess(self.process, 1);
+            WaitForSingleObject(self.process, 5_000);
+            CloseHandle(self.thread);
+            CloseHandle(self.process);
+        }
+    }
+}
+
 /// A child process created suspended, assigned to its kill-on-close Job Object,
 /// and only then resumed. Its stdout/stderr read handles belong to the caller.
 pub struct SuspendedJobChild {
@@ -857,10 +1113,91 @@ pub struct SuspendedJobChild {
     root_identity: ProcessImageIdentity,
     _root_image_file: PinnedFile,
     job: OwnedHandle,
+    job_name: String,
+    stdin: Option<File>,
     stdout: Option<File>,
     stderr: Option<File>,
     pid: u32,
     observer: JobProcessObserver,
+}
+
+/// A named Job Object reopened during startup/runtime reconciliation.
+pub struct RecoverableJobObject {
+    job: OwnedHandle,
+    name: String,
+}
+
+impl RecoverableJobObject {
+    /// Reopens an existing named Job Object with query and terminate rights.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the name is invalid, absent, or inaccessible.
+    pub fn open(name: &str) -> io::Result<Self> {
+        let wide = nul_terminated_wide(OsStr::new(name))?;
+        // SAFETY: the name is NUL-terminated and remains live for the call.
+        let job = unsafe {
+            OpenJobObjectW(
+                JOB_OBJECT_QUERY_ACCESS | JOB_OBJECT_TERMINATE_ACCESS,
+                0,
+                wide.as_ptr(),
+            )
+        };
+        Ok(Self {
+            job: OwnedHandle::new(job)?,
+            name: name.to_owned(),
+        })
+    }
+
+    #[must_use]
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// Returns the current number of process members.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when Windows cannot query the Job Object.
+    pub fn active_process_count(&self) -> io::Result<u32> {
+        u32::try_from(job_process_ids(self.job.0)?.len()).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Job Object process count does not fit u32",
+            )
+        })
+    }
+
+    /// Terminates every process in the reopened Job Object.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when Windows cannot terminate the Job Object.
+    pub fn terminate(&self, exit_code: u32) -> io::Result<()> {
+        // SAFETY: the reopened Job Object handle remains live.
+        if unsafe { TerminateJobObject(self.job.0, exit_code) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    /// Waits until no process remains in the reopened Job Object.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when Windows cannot query the Job Object.
+    pub fn wait_for_empty(&self, timeout: Duration) -> io::Result<bool> {
+        let started = std::time::Instant::now();
+        loop {
+            if self.active_process_count()? == 0 {
+                return Ok(true);
+            }
+            if started.elapsed() >= timeout {
+                return Ok(false);
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
 }
 
 impl SuspendedJobChild {
@@ -872,6 +1209,27 @@ impl SuspendedJobChild {
     /// Returns an error for invalid command material or any pipe, process, Job
     /// Object assignment, or resume failure. Assignment always precedes resume.
     pub fn spawn(command: &std::process::Command) -> io::Result<Self> {
+        let sequence = LEGACY_JOB_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let name = format!("Eliot-legacy-{}-{sequence}", std::process::id());
+        Self::spawn_named(command, &name)
+    }
+
+    /// Creates a hidden process in a unique, named, owner-scoped Job Object.
+    ///
+    /// The name is retained for durable recovery evidence. A pre-existing name
+    /// is rejected so a new generation cannot silently join an orphaned job.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid command or Job Object material, name
+    /// collision, or any spawn, assignment, or resume failure.
+    pub fn spawn_named(command: &std::process::Command, job_name: &str) -> io::Result<Self> {
+        if job_name.is_empty() || job_name.encode_utf16().count() > 240 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Job Object name must contain 1..=240 UTF-16 code units",
+            ));
+        }
         let application = nul_terminated_wide(command.get_program())?;
         let mut command_line = command_line(command)?;
         let mut environment = command_environment(command)?;
@@ -882,24 +1240,31 @@ impl SuspendedJobChild {
         let (stdin_read, stdin_write) = inheritable_pipe()?;
         let (stdout_read, stdout_write) = inheritable_pipe()?;
         let (stderr_read, stderr_write) = inheritable_pipe()?;
+        make_non_inheritable(stdin_write.0)?;
         make_non_inheritable(stdout_read.0)?;
         make_non_inheritable(stderr_read.0)?;
-        drop(stdin_write);
-        let job = create_kill_on_close_job()?;
+        let job = create_kill_on_close_job(job_name)?;
         let observer = JobProcessObserver::attach(job.0)?;
-        let startup = STARTUPINFOW {
-            cb: u32::try_from(std::mem::size_of::<STARTUPINFOW>()).map_err(|_| {
-                io::Error::new(io::ErrorKind::InvalidData, "STARTUPINFOW is too large")
-            })?,
-            dwFlags: STARTF_USESTDHANDLES,
-            hStdInput: stdin_read.0,
-            hStdOutput: stdout_write.0,
-            hStdError: stderr_write.0,
-            ..STARTUPINFOW::default()
+        let inherited_handles = [stdin_read.0, stdout_write.0, stderr_write.0];
+        let attributes = ProcThreadAttributeList::for_inherited_handles(&inherited_handles)?;
+        let mut startup = STARTUPINFOEXW {
+            StartupInfo: windows_sys::Win32::System::Threading::STARTUPINFOW {
+                cb: u32::try_from(std::mem::size_of::<STARTUPINFOEXW>()).map_err(|_| {
+                    io::Error::new(io::ErrorKind::InvalidData, "STARTUPINFOEXW is too large")
+                })?,
+                dwFlags: STARTF_USESTDHANDLES,
+                hStdInput: stdin_read.0,
+                hStdOutput: stdout_write.0,
+                hStdError: stderr_write.0,
+                ..windows_sys::Win32::System::Threading::STARTUPINFOW::default()
+            },
+            lpAttributeList: attributes.list,
         };
         let mut information = PROCESS_INFORMATION::default();
         // SAFETY: all UTF-16 buffers are NUL-terminated and live for the call;
-        // STARTUPINFO and PROCESS_INFORMATION pointers are valid out/in structs.
+        // STARTUPINFOEX and PROCESS_INFORMATION pointers are valid out/in
+        // structs, and the attribute list restricts inheritance to the three
+        // child-side standard handles.
         let created = unsafe {
             CreateProcessW(
                 application.as_ptr(),
@@ -907,22 +1272,25 @@ impl SuspendedJobChild {
                 ptr::null(),
                 ptr::null(),
                 1,
-                CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT | CREATE_NO_WINDOW,
+                CREATE_SUSPENDED
+                    | CREATE_UNICODE_ENVIRONMENT
+                    | CREATE_NO_WINDOW
+                    | EXTENDED_STARTUPINFO_PRESENT,
                 environment.as_mut_ptr().cast(),
                 current_directory.as_ref().map_or(ptr::null(), Vec::as_ptr),
-                &raw const startup,
+                &raw mut startup.StartupInfo,
                 &raw mut information,
             )
         };
         if created == 0 {
             return Err(io::Error::last_os_error());
         }
-        let process = OwnedHandle::new(information.hProcess)?;
-        let thread = OwnedHandle::new(information.hThread)?;
-        let root_image = query_process_image(&process)?;
+        let pid = information.dwProcessId;
+        let spawned = SuspendedProcessGuard::new(information)?;
+        let root_image = query_process_image(spawned.process)?;
         let root_image_file = PinnedFile::open(&root_image)?;
         let root_identity = ProcessImageIdentity {
-            pid: information.dwProcessId,
+            pid,
             image: root_image,
             file_identity: root_image_file.identity(),
         };
@@ -931,34 +1299,25 @@ impl SuspendedJobChild {
         drop(stdout_write);
         drop(stderr_write);
         // SAFETY: the process is still suspended and both handles are live.
-        if unsafe { AssignProcessToJobObject(job.0, process.0) } == 0 {
-            let error = io::Error::last_os_error();
-            // SAFETY: process is live and remains suspended, so it cannot escape.
-            unsafe {
-                TerminateProcess(process.0, 1);
-                WaitForSingleObject(process.0, 5_000);
-            }
-            return Err(error);
+        if unsafe { AssignProcessToJobObject(job.0, spawned.process) } == 0 {
+            return Err(io::Error::last_os_error());
         }
         // SAFETY: the primary thread is live and suspended exactly once here.
-        if unsafe { ResumeThread(thread.0) } == u32::MAX {
-            let error = io::Error::last_os_error();
-            // SAFETY: job contains the process before this error path.
-            unsafe {
-                TerminateJobObject(job.0, 1);
-                WaitForSingleObject(process.0, 5_000);
-            }
-            return Err(error);
+        if unsafe { ResumeThread(spawned.thread) } == u32::MAX {
+            return Err(io::Error::last_os_error());
         }
+        let (process, thread) = spawned.into_handles();
         drop(thread);
         Ok(Self {
             process,
             root_identity,
             _root_image_file: root_image_file,
             job,
+            job_name: job_name.to_owned(),
+            stdin: Some(stdin_write.into_file()),
             stdout: Some(stdout_read.into_file()),
             stderr: Some(stderr_read.into_file()),
-            pid: information.dwProcessId,
+            pid,
             observer,
         })
     }
@@ -966,6 +1325,11 @@ impl SuspendedJobChild {
     #[must_use]
     pub const fn id(&self) -> u32 {
         self.pid
+    }
+
+    #[must_use]
+    pub fn job_name(&self) -> &str {
+        &self.job_name
     }
 
     /// Returns the root process identity through the same held process handle
@@ -976,6 +1340,20 @@ impl SuspendedJobChild {
     /// Returns an error when Windows cannot query the held root process handle.
     pub fn root_process_identity(&self) -> io::Result<ProcessImageIdentity> {
         Ok(self.root_identity.clone())
+    }
+
+    /// Returns the root process creation FILETIME ticks from the retained
+    /// process handle, avoiding PID reuse ambiguity during recovery.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when Windows cannot query the retained process handle.
+    pub fn root_process_start_ticks(&self) -> io::Result<u64> {
+        process_start_ticks(self.process.0)
+    }
+
+    pub fn take_stdin(&mut self) -> Option<File> {
+        self.stdin.take()
     }
 
     pub fn take_stdout(&mut self) -> Option<File> {
@@ -1011,6 +1389,38 @@ impl SuspendedJobChild {
         processes.sort();
         processes.dedup();
         Ok(processes)
+    }
+
+    /// Returns the number of processes currently assigned to the Job Object.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when Windows cannot query the Job Object.
+    pub fn active_process_count(&self) -> io::Result<u32> {
+        u32::try_from(job_process_ids(self.job.0)?.len()).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Job Object process count does not fit u32",
+            )
+        })
+    }
+
+    /// Waits until the Job Object has no active process members.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when Windows cannot query the Job Object.
+    pub fn wait_for_empty(&self, timeout: Duration) -> io::Result<bool> {
+        let started = std::time::Instant::now();
+        loop {
+            if self.active_process_count()? == 0 {
+                return Ok(true);
+            }
+            if started.elapsed() >= timeout {
+                return Ok(false);
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
 
     /// Returns identities already bound to retained process handles without a
@@ -1078,6 +1488,28 @@ impl SuspendedJobChild {
         }
         Ok(())
     }
+}
+
+fn process_start_ticks(process: HANDLE) -> io::Result<u64> {
+    let mut created = FILETIME::default();
+    let mut exited = FILETIME::default();
+    let mut kernel = FILETIME::default();
+    let mut user = FILETIME::default();
+    // SAFETY: the process handle is live and all FILETIME output pointers
+    // refer to initialized stack values.
+    if unsafe {
+        GetProcessTimes(
+            process,
+            &raw mut created,
+            &raw mut exited,
+            &raw mut kernel,
+            &raw mut user,
+        )
+    } == 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    Ok((u64::from(created.dwHighDateTime) << 32) | u64::from(created.dwLowDateTime))
 }
 
 fn job_process_ids(job: HANDLE) -> io::Result<Vec<u32>> {
@@ -1860,8 +2292,7 @@ struct SecurityDescriptor {
 }
 
 impl SecurityDescriptor {
-    fn for_current_user(sid: &str) -> io::Result<Self> {
-        let sddl = format!("D:P(A;;GA;;;SY)(A;;GA;;;{sid})");
+    fn from_sddl(sddl: &str) -> io::Result<Self> {
         let wide = sddl
             .encode_utf16()
             .chain(std::iter::once(0))
@@ -1882,6 +2313,17 @@ impl SecurityDescriptor {
         }
         Ok(Self { raw })
     }
+
+    fn for_current_user(sid: &str) -> io::Result<Self> {
+        let sddl = format!("D:P(A;;GA;;;SY)(A;;GA;;;{sid})");
+        Self::from_sddl(&sddl)
+    }
+
+    fn for_job_owner() -> io::Result<Self> {
+        // `OW` is the Windows OWNER RIGHTS SID. The creating user owns the Job
+        // Object; LocalSystem is admitted for service-side recovery.
+        Self::from_sddl("D:P(A;;GA;;;SY)(A;;GA;;;OW)")
+    }
 }
 
 impl Drop for SecurityDescriptor {
@@ -1900,16 +2342,154 @@ impl Drop for SecurityDescriptor {
 mod tests {
     use super::{
         DirectoryMutationGuard, DirectoryOplockGuard, PinnedDirectory, PinnedFile,
-        ProcessTreeGuard, SuspendedJobChild, atomic_replace_file, credential_delete_current_user,
-        credential_ids_current_user_with_prefix, credential_read_current_user,
-        credential_status_current_user, credential_write_current_user, process_image_path,
-        process_is_alive, test_support, validate_sid, write_new_pinned_file,
+        ProcessTreeGuard, RecoverableJobObject, SuspendedJobChild, atomic_replace_file,
+        credential_delete_current_user, credential_ids_current_user_with_prefix,
+        credential_read_current_user, credential_status_current_user,
+        credential_write_current_user, process_image_path, process_is_alive, test_support,
+        validate_sid, write_new_pinned_file,
     };
     use std::fs;
-    use std::io::Read as _;
+    use std::io::{Read as _, Write as _};
     use std::os::windows::fs::OpenOptionsExt as _;
     use std::time::{Duration, Instant};
     use windows_sys::Win32::Storage::FileSystem::FILE_SHARE_READ;
+
+    const SUPERVISED_FIXTURE_ENV: &str = "ELIOT_WINDOWS_IPC_SUPERVISED_FIXTURE";
+
+    #[test]
+    fn supervised_process_native_fixture_process() {
+        if std::env::var_os(SUPERVISED_FIXTURE_ENV).is_none() {
+            return;
+        }
+        let mut input = Vec::new();
+        std::io::stdin().read_to_end(&mut input).unwrap();
+        std::io::stdout().write_all(&input).unwrap();
+        std::io::stderr().write_all(b"fixture-stderr").unwrap();
+    }
+
+    fn supervised_fixture_command() -> Result<std::process::Command, Box<dyn std::error::Error>> {
+        let mut command = std::process::Command::new(std::env::current_exe()?);
+        command
+            .args([
+                "--exact",
+                "tests::supervised_process_native_fixture_process",
+                "--nocapture",
+            ])
+            .env(SUPERVISED_FIXTURE_ENV, "1");
+        Ok(command)
+    }
+
+    #[test]
+    fn supervised_process_named_job_retains_stdin_and_reaps()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let command = supervised_fixture_command()?;
+        let job_name = format!("Eliot-ipc-supervised-{}", std::process::id());
+        let mut child = SuspendedJobChild::spawn_named(&command, &job_name)?;
+        assert_eq!(child.job_name(), job_name);
+        let reopened = RecoverableJobObject::open(&job_name)?;
+        assert_eq!(reopened.name(), job_name);
+        assert!(reopened.active_process_count()? >= 1);
+        let mut stdin = child.take_stdin().ok_or("stdin")?;
+        let mut stdout = child.take_stdout().ok_or("stdout")?;
+        let mut stderr = child.take_stderr().ok_or("stderr")?;
+        let stdout_task = std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            stdout.read_to_end(&mut bytes).map(|_| bytes)
+        });
+        let stderr_task = std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            stderr.read_to_end(&mut bytes).map(|_| bytes)
+        });
+        stdin.write_all(b"native-supervised-input")?;
+        drop(stdin);
+        assert_eq!(child.wait_timeout(Duration::from_secs(5))?, Some(0));
+        assert!(child.wait_for_empty(Duration::from_secs(1))?);
+        assert_eq!(child.active_process_count()?, 0);
+        let stdout = stdout_task.join().map_err(|_| "stdout reader panic")??;
+        let stderr = stderr_task.join().map_err(|_| "stderr reader panic")??;
+        assert!(
+            stdout
+                .windows(b"native-supervised-input".len())
+                .any(|window| window == b"native-supervised-input")
+        );
+        assert!(
+            stderr
+                .windows(b"fixture-stderr".len())
+                .any(|window| window == b"fixture-stderr")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn supervised_process_concurrent_named_jobs_do_not_share_pipe_handles()
+    -> Result<(), Box<dyn std::error::Error>> {
+        struct FixtureChild {
+            child: SuspendedJobChild,
+            stdin: Option<std::fs::File>,
+            stdout: Option<std::fs::File>,
+            stderr_task: Option<std::thread::JoinHandle<std::io::Result<Vec<u8>>>>,
+        }
+
+        let mut fixtures = Vec::new();
+        for index in 0..4 {
+            let command = supervised_fixture_command()?;
+            let job_name = format!("Eliot-ipc-concurrent-{}-{index}", std::process::id());
+            let mut child = SuspendedJobChild::spawn_named(&command, &job_name)?;
+            let stdin = child.take_stdin().ok_or("stdin")?;
+            let stdout = child.take_stdout().ok_or("stdout")?;
+            let mut stderr = child.take_stderr().ok_or("stderr")?;
+            let stderr_task = std::thread::spawn(move || {
+                let mut bytes = Vec::new();
+                stderr.read_to_end(&mut bytes).map(|_| bytes)
+            });
+            fixtures.push(FixtureChild {
+                child,
+                stdin: Some(stdin),
+                stdout: Some(stdout),
+                stderr_task: Some(stderr_task),
+            });
+        }
+
+        let mut first_stdin = fixtures[0].stdin.take().ok_or("first stdin")?;
+        first_stdin.write_all(b"first-child-only")?;
+        drop(first_stdin);
+        assert_eq!(
+            fixtures[0].child.wait_timeout(Duration::from_secs(5))?,
+            Some(0)
+        );
+        assert!(fixtures[0].child.wait_for_empty(Duration::from_secs(1))?);
+        let mut first_stdout = fixtures[0].stdout.take().ok_or("first stdout")?;
+        let (stdout_tx, stdout_rx) = std::sync::mpsc::sync_channel(1);
+        let first_stdout_task = std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            let result = first_stdout.read_to_end(&mut bytes).map(|_| bytes);
+            let _ = stdout_tx.send(result);
+        });
+        let first_result = stdout_rx.recv_timeout(Duration::from_secs(2));
+
+        for fixture in fixtures.iter_mut().skip(1) {
+            drop(fixture.stdin.take());
+            fixture.child.terminate(1)?;
+            assert!(fixture.child.wait_for_empty(Duration::from_secs(2))?);
+            drop(fixture.stdout.take());
+        }
+        let _ = first_stdout_task.join();
+        for fixture in &mut fixtures {
+            if let Some(task) = fixture.stderr_task.take() {
+                let _ = task.join();
+            }
+        }
+
+        let first_output = first_result.map_err(
+            |_| "first child stdout did not reach EOF while sibling jobs remained live",
+        )??;
+        assert!(
+            first_output
+                .windows(b"first-child-only".len())
+                .any(|window| window == b"first-child-only")
+        );
+        Ok(())
+    }
 
     fn managed_powershell(script: &str, cwd: &std::path::Path) -> std::process::Command {
         let system_root = std::env::var_os("SystemRoot").expect("SystemRoot");

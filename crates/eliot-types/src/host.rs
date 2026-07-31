@@ -1,6 +1,6 @@
 use crate::{
-    AgentRole, AgentSessionId, ProjectId, TaintClass, TaskId, WorkItemId, WorkLeaseId,
-    WorktreeLeaseId, WriteReceiptRef,
+    AgentRole, AgentSessionId, OperationPhase, ProjectId, TaintClass, TaskId, WorkItemId,
+    WorkLeaseId, WorktreeLeaseId, WriteReceiptRef,
 };
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
@@ -142,6 +142,15 @@ pub struct AgentCapabilityEnvelope {
     pub supervised: bool,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentSessionState {
+    #[default]
+    Active,
+    Disconnected,
+    Retired,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct AgentSessionHostBinding {
     pub agent_session_id: AgentSessionId,
@@ -152,6 +161,16 @@ pub struct AgentSessionHostBinding {
     #[serde(default)]
     pub bound_task_id: Option<TaskId>,
     pub task_role_lease_refs: Vec<String>,
+    #[serde(default)]
+    pub state: AgentSessionState,
+    #[serde(default)]
+    pub generation: u64,
+    #[serde(default)]
+    pub owner_operation_id: Option<String>,
+    #[serde(default, with = "time::serde::rfc3339::option")]
+    pub disconnected_at: Option<OffsetDateTime>,
+    #[serde(default)]
+    pub disconnect_reason: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -165,6 +184,10 @@ pub struct HostLaunchContract {
     pub task_id: Option<TaskId>,
     pub work_item_id: Option<WorkItemId>,
     pub role_lease_id: Option<String>,
+    #[serde(default)]
+    pub role_lease_epoch: u64,
+    #[serde(default)]
+    pub operation_generation: u64,
     pub work_lease_id: Option<WorkLeaseId>,
     #[serde(default)]
     pub worktree_lease_id: Option<WorktreeLeaseId>,
@@ -202,6 +225,10 @@ pub struct HostLaunchScope {
     pub task_id: Option<TaskId>,
     pub work_item_id: Option<WorkItemId>,
     pub role_lease_id: Option<String>,
+    #[serde(default)]
+    pub role_lease_epoch: u64,
+    #[serde(default)]
+    pub operation_generation: u64,
     pub work_lease_id: Option<WorkLeaseId>,
     #[serde(default)]
     pub worktree_lease_id: Option<WorktreeLeaseId>,
@@ -240,11 +267,28 @@ pub struct AgentInvocationRequest {
     pub work_item_id: WorkItemId,
     pub requested_capabilities: Vec<String>,
     pub role_lease_id: String,
+    #[serde(default)]
+    pub role_lease_epoch: u64,
+    #[serde(default)]
+    pub operation_generation: u64,
+    #[serde(default)]
+    pub runtime_contract_sha256: Option<String>,
     pub work_lease_id: Option<WorkLeaseId>,
     pub packet_refs: Vec<String>,
     pub expected_result_kind: String,
     pub verifier_ref: String,
     pub idempotency_key: String,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AuthorityLeaseState {
+    Pending,
+    #[default]
+    Active,
+    Consumed,
+    Revoked,
+    Expired,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -257,6 +301,26 @@ pub struct TaskRoleLease {
     #[serde(with = "time::serde::rfc3339")]
     pub expires_at: OffsetDateTime,
     pub epoch: u64,
+    #[serde(default)]
+    pub state: AuthorityLeaseState,
+    #[serde(default)]
+    pub owner_operation_id: Option<String>,
+    #[serde(default)]
+    pub seal_attempt_id: Option<String>,
+    #[serde(default)]
+    pub generation: u64,
+    #[serde(default, with = "time::serde::rfc3339::option")]
+    pub issued_at: Option<OffsetDateTime>,
+    #[serde(default, with = "time::serde::rfc3339::option")]
+    pub activated_at: Option<OffsetDateTime>,
+    #[serde(default, with = "time::serde::rfc3339::option")]
+    pub consumed_at: Option<OffsetDateTime>,
+    #[serde(default, with = "time::serde::rfc3339::option")]
+    pub revoked_at: Option<OffsetDateTime>,
+    #[serde(default)]
+    pub revoke_reason: Option<String>,
+    #[serde(default)]
+    pub superseded_by_epoch: Option<u64>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -267,6 +331,24 @@ pub struct ControllerLease {
     #[serde(with = "time::serde::rfc3339")]
     pub expires_at: OffsetDateTime,
     pub epoch: u64,
+    #[serde(default)]
+    pub state: AuthorityLeaseState,
+    #[serde(default)]
+    pub owner_operation_id: Option<String>,
+    #[serde(default)]
+    pub seal_attempt_id: Option<String>,
+    #[serde(default)]
+    pub generation: u64,
+    #[serde(default, with = "time::serde::rfc3339::option")]
+    pub issued_at: Option<OffsetDateTime>,
+    #[serde(default, with = "time::serde::rfc3339::option")]
+    pub activated_at: Option<OffsetDateTime>,
+    #[serde(default, with = "time::serde::rfc3339::option")]
+    pub revoked_at: Option<OffsetDateTime>,
+    #[serde(default)]
+    pub revoke_reason: Option<String>,
+    #[serde(default)]
+    pub superseded_by_epoch: Option<u64>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -287,6 +369,10 @@ pub struct AgentResultEnvelope {
     pub host_id: AgentHostId,
     pub host_session_id: Option<String>,
     pub status: AgentResultStatus,
+    #[serde(default)]
+    pub role_lease_epoch: u64,
+    #[serde(default)]
+    pub operation_generation: u64,
     pub summary: String,
     pub artifact_refs: Vec<String>,
     pub evidence_refs: Vec<String>,
@@ -342,6 +428,26 @@ pub struct OperationJob {
     pub created_at: OffsetDateTime,
     #[serde(with = "time::serde::rfc3339")]
     pub updated_at: OffsetDateTime,
+    #[serde(default)]
+    pub generation: u64,
+    #[serde(default)]
+    pub phase: OperationPhase,
+    #[serde(default, with = "time::serde::rfc3339::option")]
+    pub phase_started_at: Option<OffsetDateTime>,
+    #[serde(default, with = "time::serde::rfc3339::option")]
+    pub last_progress_at: Option<OffsetDateTime>,
+    #[serde(default, with = "time::serde::rfc3339::option")]
+    pub phase_deadline_at: Option<OffsetDateTime>,
+    #[serde(default, with = "time::serde::rfc3339::option")]
+    pub absolute_deadline_at: Option<OffsetDateTime>,
+    #[serde(default)]
+    pub restart_count: u32,
+    #[serde(default)]
+    pub runtime_contract_sha256: Option<String>,
+    #[serde(default)]
+    pub role_lease_id: Option<String>,
+    #[serde(default)]
+    pub role_lease_epoch: Option<u64>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -354,6 +460,24 @@ pub enum OperationJobState {
     TimedOut,
     UnknownOutcome,
     Reconciled,
+    Cancelled,
+    Abandoned,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct AuthorityRevocationReceipt {
+    pub receipt_id: String,
+    pub role_lease_id: String,
+    pub prior_epoch: u64,
+    pub prior_generation: u64,
+    pub task_id: TaskId,
+    pub agent_session_id: AgentSessionId,
+    pub reason: String,
+    pub owner_operation_id: Option<String>,
+    pub seal_attempt_id: Option<String>,
+    pub superseded_by_epoch: Option<u64>,
+    #[serde(with = "time::serde::rfc3339")]
+    pub revoked_at: OffsetDateTime,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

@@ -183,7 +183,7 @@ mod tests {
             "{\"type\":\"text\",\"sessionID\":\"ses_123\",\"part\":{\"type\":\"text\",\"text\":\"{\\\"memory_revision\\\":3}\",\"time\":{\"end\":1}}}\n",
             "{\"type\":\"step_finish\",\"sessionID\":\"ses_123\",\"part\":{\"type\":\"step-finish\",\"reason\":\"stop\"}}\n",
         );
-        let parsed = parse_opencode_stream(
+        let parsed = match parse_opencode_stream(
             stdout.as_bytes(),
             "openai/gpt-5.4",
             &json!({
@@ -192,8 +192,10 @@ mod tests {
                 "required": ["memory_revision"],
                 "additionalProperties": false
             }),
-        )
-        .expect("current OpenCode JSON events should parse");
+        ) {
+            Ok(parsed) => parsed,
+            Err(error) => panic!("current OpenCode JSON events should parse: {error}"),
+        };
 
         assert_eq!(parsed.provider_session_id, "ses_123");
         assert_eq!(parsed.resolved_model, "openai/gpt-5.4");
@@ -210,7 +212,7 @@ mod tests {
             "{\"type\":\"text\",\"sessionID\":\"ses_mimo\",\"part\":{\"type\":\"text\",\"text\":\"{\\\"memory_revision\\\":6}\"}}\n",
             "{\"type\":\"step_finish\",\"sessionID\":\"ses_mimo\",\"part\":{\"type\":\"step-finish\",\"reason\":\"stop\"}}\n",
         );
-        let parsed = parse_opencode_stream(
+        let parsed = match parse_opencode_stream(
             stdout.as_bytes(),
             "opencode/mimo-v2.5-free",
             &json!({
@@ -224,8 +226,12 @@ mod tests {
                 "required": ["memory_revision"],
                 "additionalProperties": false
             }),
-        )
-        .expect("revision advanced by governed dispatch bookkeeping must remain admissible");
+        ) {
+            Ok(parsed) => parsed,
+            Err(error) => panic!(
+                "revision advanced by governed dispatch bookkeeping must remain admissible: {error}"
+            ),
+        };
 
         assert_eq!(parsed.structured_output, json!({"memory_revision": 6}));
         assert_eq!(
@@ -237,8 +243,9 @@ mod tests {
     #[test]
     fn provider_error_event_surfaces_the_actual_failure() {
         let stdout = br#"{"type":"error","timestamp":1,"sessionID":"ses_401","error":{"name":"UnknownError","data":{"message":"Token refresh failed: 401"}}}"#;
-        let error = parse_opencode_stream(stdout, "openai/gpt-5.4", &json!(true))
-            .expect_err("provider error must be rejected");
+        let Err(error) = parse_opencode_stream(stdout, "openai/gpt-5.4", &json!(true)) else {
+            panic!("provider error must be rejected");
+        };
 
         assert!(
             error

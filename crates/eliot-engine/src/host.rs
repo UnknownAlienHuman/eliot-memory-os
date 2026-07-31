@@ -3,9 +3,10 @@ use eliot_types::{
     AgentCapabilityEnvelope, AgentHostId, AgentHostIdentity, AgentHostRuntimeProfile,
     AgentInvocationRequest, AgentResultDisposition, AgentResultDispositionKind,
     AgentResultEnvelope, AgentResultStatus, AgentRole, AgentSessionHostBinding, AgentSessionId,
-    ControllerLease, DelegationState, HostEventEnvelope, HostLaunchContract, HostLaunchScope,
-    HostMode, HostProfileStatus, HostProtocolSurfaces, OperationJob, OperationJobState, ProjectId,
-    TaintClass, TaskId, TaskRoleLease,
+    AgentSessionState, AuthorityLeaseState, AuthorityRevocationReceipt, ControllerLease,
+    DelegationState, HostEventEnvelope, HostLaunchContract, HostLaunchScope, HostMode,
+    HostProfileStatus, HostProtocolSurfaces, OperationJob, OperationJobState, OperationPhase,
+    ProjectId, TaintClass, TaskId, TaskRoleLease,
 };
 use serde::Serialize;
 use serde_json::Value;
@@ -513,6 +514,8 @@ impl HostLaunchContractService {
             task_id: scope.task_id,
             work_item_id: scope.work_item_id,
             role_lease_id: scope.role_lease_id.clone(),
+            role_lease_epoch: scope.role_lease_epoch,
+            operation_generation: scope.operation_generation,
             work_lease_id: scope.work_lease_id,
             worktree_lease_id: scope.worktree_lease_id,
             planned_verifier_ref: scope.planned_verifier_ref.clone(),
@@ -672,6 +675,32 @@ impl HostEventService {
 #[derive(Clone, Copy, Debug, Default)]
 pub struct HostBrokerService;
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum AgentResultAdmission {
+    Accepted(AgentResultEnvelope),
+    StaleEvidencePreserved(AgentResultEnvelope),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PendingRoleGrant {
+    pub role_lease_id: String,
+    pub task_id: TaskId,
+    pub agent_session_id: AgentSessionId,
+    pub role: AgentRole,
+    pub capability_scope: Vec<String>,
+    pub expires_at: OffsetDateTime,
+    pub epoch: u64,
+    pub owner_operation_id: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct AuthorityCleanupReport {
+    pub expired_role_lease_ids: Vec<String>,
+    pub retired_session_ids: Vec<AgentSessionId>,
+    pub abandoned_operation_ids: Vec<String>,
+    pub revocation_receipt_ids: Vec<String>,
+}
+
 impl HostBrokerService {
     pub fn register_session(
         self,
@@ -682,6 +711,35 @@ impl HostBrokerService {
         client_instance_id: String,
         capability_envelope: AgentCapabilityEnvelope,
     ) -> Result<AgentSessionHostBinding, EngineError> {
+        self.register_session_generation(
+            state,
+            agent_session_id,
+            host_id,
+            implementation_name,
+            client_instance_id,
+            capability_envelope,
+            1,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn register_session_generation(
+        self,
+        state: &mut DelegationState,
+        agent_session_id: AgentSessionId,
+        host_id: AgentHostId,
+        implementation_name: String,
+        client_instance_id: String,
+        capability_envelope: AgentCapabilityEnvelope,
+        generation: u64,
+        owner_operation_id: Option<String>,
+    ) -> Result<AgentSessionHostBinding, EngineError> {
+        if generation == 0 {
+            return Err(host_broker_error(
+                "fresh agent session requires nonzero generation",
+            ));
+        }
         if let Some(existing) = state
             .agent_host_sessions
             .iter()
@@ -692,12 +750,22 @@ impl HostBrokerService {
                     "agent session is already bound to a different host",
                 ));
             }
+            if existing.state != AgentSessionState::Active || existing.generation != generation {
+                return Err(host_broker_error(
+                    "agent session ID is retired, disconnected, or generation-mismatched",
+                ));
+            }
             return Ok(existing.clone());
         }
         if let Some(existing) = state.agent_host_sessions.iter().find(|binding| {
             binding.host_identity.host_id == host_id
                 && binding.host_identity.client_instance_id == client_instance_id
         }) {
+            if existing.state != AgentSessionState::Active || existing.generation != generation {
+                return Err(host_broker_error(
+                    "host client instance is retired, disconnected, or generation-mismatched",
+                ));
+            }
             return Ok(existing.clone());
         }
         let binding = AgentSessionHostBinding {
@@ -711,6 +779,11 @@ impl HostBrokerService {
             bound_project_id: None,
             bound_task_id: None,
             task_role_lease_refs: Vec::new(),
+            state: AgentSessionState::Active,
+            generation,
+            owner_operation_id,
+            disconnected_at: None,
+            disconnect_reason: None,
         };
         state.agent_host_sessions.push(binding.clone());
         Ok(binding)
@@ -755,21 +828,12 @@ impl HostBrokerService {
         capability_scope: Vec<String>,
         ttl_minutes: i64,
     ) -> Result<(TaskRoleLease, Option<ControllerLease>), EngineError> {
-        if ttl_minutes <= 0 {
-            return Err(host_broker_error("role lease TTL must be positive"));
-        }
-        if !state
-            .agent_host_sessions
-            .iter()
-            .any(|binding| binding.agent_session_id == agent_session_id)
-        {
-            return Err(host_broker_error("agent host session is not registered"));
-        }
         let now = OffsetDateTime::now_utc();
         if let Some(existing) = state.task_role_leases.iter().find(|lease| {
             lease.task_id == task_id
                 && lease.agent_session_id == agent_session_id
                 && lease.role == role
+                && lease.state == AuthorityLeaseState::Active
                 && lease.expires_at > now
         }) {
             let controller = state
@@ -778,20 +842,66 @@ impl HostBrokerService {
                 .find(|lease| {
                     lease.task_id == task_id
                         && lease.agent_session_id == agent_session_id
+                        && lease.state == AuthorityLeaseState::Active
                         && lease.expires_at > now
                 })
                 .cloned();
             return Ok((existing.clone(), controller));
         }
-        if role == AgentRole::Controller
-            && state.controller_leases.iter().any(|lease| {
-                lease.task_id == task_id
-                    && lease.agent_session_id != agent_session_id
-                    && lease.expires_at > now
+        let grant = self.prepare_role_grant(
+            state,
+            task_id,
+            agent_session_id,
+            role,
+            capability_scope,
+            ttl_minutes,
+            None,
+        )?;
+        let mut leases = self.activate_role_grants(state, &[grant], "legacy-live-grant", 1)?;
+        let lease = leases
+            .pop()
+            .ok_or_else(|| host_broker_error("role activation returned no lease"))?;
+        let controller = state
+            .controller_leases
+            .iter()
+            .find(|candidate| {
+                candidate.task_id == task_id
+                    && candidate.agent_session_id == agent_session_id
+                    && candidate.epoch == lease.epoch
+                    && candidate.generation == lease.generation
+                    && candidate.state == AuthorityLeaseState::Active
             })
-        {
+            .cloned();
+        Ok((lease, controller))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn prepare_role_grant(
+        self,
+        state: &DelegationState,
+        task_id: TaskId,
+        agent_session_id: AgentSessionId,
+        role: AgentRole,
+        capability_scope: Vec<String>,
+        ttl_minutes: i64,
+        owner_operation_id: Option<String>,
+    ) -> Result<PendingRoleGrant, EngineError> {
+        if ttl_minutes <= 0 {
+            return Err(host_broker_error("role lease TTL must be positive"));
+        }
+        let session = state
+            .agent_host_sessions
+            .iter()
+            .find(|binding| binding.agent_session_id == agent_session_id)
+            .ok_or_else(|| host_broker_error("agent host session is not registered"))?;
+        if session.state != AgentSessionState::Active {
             return Err(host_broker_error(
-                "task already has a different active ControllerLease",
+                "retired or disconnected session cannot acquire authority",
+            ));
+        }
+        if session.bound_task_id.is_some_and(|bound| bound != task_id) {
+            return Err(host_broker_error(
+                "agent host session is bound to a different task",
             ));
         }
         let epoch = state
@@ -802,36 +912,254 @@ impl HostBrokerService {
             .max()
             .unwrap_or(0)
             + 1;
-        let lease = TaskRoleLease {
+        Ok(PendingRoleGrant {
             role_lease_id: uuid_like("task-role-lease"),
             task_id,
             agent_session_id,
             role,
             capability_scope,
-            expires_at: now + time::Duration::minutes(ttl_minutes),
+            expires_at: OffsetDateTime::now_utc() + time::Duration::minutes(ttl_minutes),
             epoch,
-        };
-        let controller = (role == AgentRole::Controller).then(|| ControllerLease {
-            controller_lease_id: uuid_like("controller-lease"),
-            task_id,
-            agent_session_id,
-            expires_at: lease.expires_at,
-            epoch,
-        });
-        if let Some(binding) = state
-            .agent_host_sessions
-            .iter_mut()
-            .find(|binding| binding.agent_session_id == agent_session_id)
-        {
+            owner_operation_id,
+        })
+    }
+
+    pub fn activate_role_grants(
+        self,
+        state: &mut DelegationState,
+        grants: &[PendingRoleGrant],
+        seal_attempt_id: &str,
+        generation: u64,
+    ) -> Result<Vec<TaskRoleLease>, EngineError> {
+        if generation == 0 || seal_attempt_id.trim().is_empty() {
+            return Err(host_broker_error(
+                "authority activation requires nonzero generation and seal attempt",
+            ));
+        }
+        let now = OffsetDateTime::now_utc();
+        let mut next = state.clone();
+        let mut activated = Vec::with_capacity(grants.len());
+        let mut seen_ids = BTreeSet::new();
+        for grant in grants {
+            if !seen_ids.insert(grant.role_lease_id.clone())
+                || next
+                    .task_role_leases
+                    .iter()
+                    .any(|lease| lease.role_lease_id == grant.role_lease_id)
+            {
+                return Err(host_broker_error("duplicate prepared role lease ID"));
+            }
+            let binding = next
+                .agent_host_sessions
+                .iter_mut()
+                .find(|binding| binding.agent_session_id == grant.agent_session_id)
+                .ok_or_else(|| host_broker_error("prepared role session is not registered"))?;
+            if binding.state != AgentSessionState::Active
+                || binding.generation != generation
+                || binding
+                    .bound_task_id
+                    .is_some_and(|task| task != grant.task_id)
+            {
+                return Err(host_broker_error(
+                    "prepared role session is stale, retired, or task-mismatched",
+                ));
+            }
+            if grant.role == AgentRole::Controller
+                && next.controller_leases.iter().any(|lease| {
+                    lease.task_id == grant.task_id
+                        && lease.agent_session_id != grant.agent_session_id
+                        && lease.state == AuthorityLeaseState::Active
+                        && lease.expires_at > now
+                })
+            {
+                return Err(host_broker_error(
+                    "task already has a different active ControllerLease",
+                ));
+            }
+            let lease = TaskRoleLease {
+                role_lease_id: grant.role_lease_id.clone(),
+                task_id: grant.task_id,
+                agent_session_id: grant.agent_session_id,
+                role: grant.role,
+                capability_scope: grant.capability_scope.clone(),
+                expires_at: grant.expires_at,
+                epoch: grant.epoch,
+                state: AuthorityLeaseState::Active,
+                owner_operation_id: grant.owner_operation_id.clone(),
+                seal_attempt_id: Some(seal_attempt_id.to_owned()),
+                generation,
+                issued_at: Some(now),
+                activated_at: Some(now),
+                consumed_at: None,
+                revoked_at: None,
+                revoke_reason: None,
+                superseded_by_epoch: None,
+            };
             binding
                 .task_role_lease_refs
                 .push(lease.role_lease_id.clone());
+            binding.task_role_lease_refs.sort();
+            binding.task_role_lease_refs.dedup();
+            if grant.role == AgentRole::Controller {
+                next.controller_leases.push(ControllerLease {
+                    controller_lease_id: uuid_like("controller-lease"),
+                    task_id: grant.task_id,
+                    agent_session_id: grant.agent_session_id,
+                    expires_at: grant.expires_at,
+                    epoch: grant.epoch,
+                    state: AuthorityLeaseState::Active,
+                    owner_operation_id: grant.owner_operation_id.clone(),
+                    seal_attempt_id: Some(seal_attempt_id.to_owned()),
+                    generation,
+                    issued_at: Some(now),
+                    activated_at: Some(now),
+                    revoked_at: None,
+                    revoke_reason: None,
+                    superseded_by_epoch: None,
+                });
+            }
+            next.task_role_leases.push(lease.clone());
+            activated.push(lease);
         }
-        state.task_role_leases.push(lease.clone());
-        if let Some(controller) = &controller {
-            state.controller_leases.push(controller.clone());
+        *state = next;
+        Ok(activated)
+    }
+
+    pub fn revoke_role(
+        self,
+        state: &mut DelegationState,
+        role_lease_id: &str,
+        expected_epoch: u64,
+        reason: &str,
+        superseding_epoch: Option<u64>,
+    ) -> Result<TaskRoleLease, EngineError> {
+        let now = OffsetDateTime::now_utc();
+        let lease = state
+            .task_role_leases
+            .iter_mut()
+            .find(|lease| lease.role_lease_id == role_lease_id)
+            .ok_or_else(|| host_broker_error("role lease does not exist"))?;
+        if lease.epoch != expected_epoch {
+            return Err(host_broker_error(
+                "role lease epoch fence rejected revocation",
+            ));
         }
-        Ok((lease, controller))
+        if matches!(
+            lease.state,
+            AuthorityLeaseState::Revoked | AuthorityLeaseState::Expired
+        ) {
+            return Ok(lease.clone());
+        }
+        let prior = lease.clone();
+        lease.state = AuthorityLeaseState::Revoked;
+        lease.revoked_at = Some(now);
+        lease.revoke_reason = Some(reason.to_owned());
+        lease.superseded_by_epoch = superseding_epoch;
+        for controller in &mut state.controller_leases {
+            if controller.task_id == prior.task_id
+                && controller.agent_session_id == prior.agent_session_id
+                && controller.epoch == prior.epoch
+                && controller.generation == prior.generation
+            {
+                controller.state = AuthorityLeaseState::Revoked;
+                controller.revoked_at = Some(now);
+                controller.revoke_reason = Some(reason.to_owned());
+                controller.superseded_by_epoch = superseding_epoch;
+            }
+        }
+        let receipt = AuthorityRevocationReceipt {
+            receipt_id: uuid_like("authority-revocation"),
+            role_lease_id: prior.role_lease_id,
+            prior_epoch: prior.epoch,
+            prior_generation: prior.generation,
+            task_id: prior.task_id,
+            agent_session_id: prior.agent_session_id,
+            reason: reason.to_owned(),
+            owner_operation_id: prior.owner_operation_id,
+            seal_attempt_id: prior.seal_attempt_id,
+            superseded_by_epoch: superseding_epoch,
+            revoked_at: now,
+        };
+        if !state.authority_revocation_receipts.iter().any(|existing| {
+            existing.role_lease_id == receipt.role_lease_id
+                && existing.prior_epoch == receipt.prior_epoch
+                && existing.prior_generation == receipt.prior_generation
+        }) {
+            state.authority_revocation_receipts.push(receipt);
+        }
+        Ok(lease.clone())
+    }
+
+    pub fn retire_session(
+        self,
+        state: &mut DelegationState,
+        session_id: AgentSessionId,
+        reason: &str,
+    ) -> Result<AgentSessionHostBinding, EngineError> {
+        let binding = state
+            .agent_host_sessions
+            .iter_mut()
+            .find(|binding| binding.agent_session_id == session_id)
+            .ok_or_else(|| host_broker_error("agent host session is not registered"))?;
+        binding.state = AgentSessionState::Retired;
+        binding.disconnected_at = Some(OffsetDateTime::now_utc());
+        binding.disconnect_reason = Some(reason.to_owned());
+        Ok(binding.clone())
+    }
+
+    pub fn abandon_operation(
+        self,
+        state: &mut DelegationState,
+        operation_id: &str,
+        reason: &str,
+    ) -> Result<OperationJob, EngineError> {
+        let job = state
+            .operation_jobs
+            .iter_mut()
+            .find(|job| job.job_id == operation_id || job.invocation_id == operation_id)
+            .ok_or_else(|| host_broker_error("operation job does not exist"))?;
+        job.state = OperationJobState::Abandoned;
+        job.phase = OperationPhase::Abandoned;
+        job.last_progress_at = Some(OffsetDateTime::now_utc());
+        job.result_ref = Some(format!("abandoned:{reason}"));
+        job.updated_at = OffsetDateTime::now_utc();
+        Ok(job.clone())
+    }
+
+    pub fn expire_authority(
+        self,
+        state: &mut DelegationState,
+        now: OffsetDateTime,
+    ) -> AuthorityCleanupReport {
+        let mut report = AuthorityCleanupReport::default();
+        let expired = state
+            .task_role_leases
+            .iter()
+            .filter(|lease| lease.state == AuthorityLeaseState::Active && lease.expires_at <= now)
+            .map(|lease| (lease.role_lease_id.clone(), lease.epoch))
+            .collect::<Vec<_>>();
+        for (role_lease_id, epoch) in expired {
+            if let Ok(lease) = self.revoke_role(state, &role_lease_id, epoch, "lease_expired", None)
+            {
+                if let Some(updated) = state
+                    .task_role_leases
+                    .iter_mut()
+                    .find(|candidate| candidate.role_lease_id == role_lease_id)
+                {
+                    updated.state = AuthorityLeaseState::Expired;
+                }
+                report.expired_role_lease_ids.push(lease.role_lease_id);
+            }
+        }
+        report.revocation_receipt_ids = state
+            .authority_revocation_receipts
+            .iter()
+            .filter(|receipt| receipt.revoked_at == now || receipt.reason == "lease_expired")
+            .map(|receipt| receipt.receipt_id.clone())
+            .collect();
+        report.expired_role_lease_ids.sort();
+        report.revocation_receipt_ids.sort();
+        report
     }
 
     pub fn enqueue(
@@ -851,9 +1179,32 @@ impl HostBrokerService {
             .find(|lease| {
                 lease.role_lease_id == request.role_lease_id
                     && lease.task_id == request.task_id
+                    && lease.state == AuthorityLeaseState::Active
+                    && lease.epoch == request.role_lease_epoch
+                    && lease.generation == request.operation_generation
                     && lease.expires_at > now
             })
             .ok_or_else(|| host_broker_error("invocation has no active matching TaskRoleLease"))?;
+        if request.role_lease_epoch == 0 || request.operation_generation == 0 {
+            return Err(host_broker_error(
+                "fresh invocation requires nonzero role lease epoch and operation generation",
+            ));
+        }
+        let session = state
+            .agent_host_sessions
+            .iter()
+            .find(|binding| binding.agent_session_id == role.agent_session_id)
+            .ok_or_else(|| host_broker_error("role lease owner session is missing"))?;
+        if session.state != AgentSessionState::Active
+            || session
+                .bound_task_id
+                .is_some_and(|task| task != request.task_id)
+            || session.generation != request.operation_generation
+        {
+            return Err(host_broker_error(
+                "invocation owner session is inactive or generation-mismatched",
+            ));
+        }
         if request.work_lease_id.is_some() && !work_lease_active {
             return Err(host_broker_error(
                 "invocation references a WorkLease that is not active",
@@ -899,6 +1250,16 @@ impl HostBrokerService {
             idempotency_key: request.idempotency_key.clone(),
             created_at: now,
             updated_at: now,
+            generation: request.operation_generation,
+            phase: OperationPhase::Prepared,
+            phase_started_at: Some(now),
+            last_progress_at: Some(now),
+            phase_deadline_at: None,
+            absolute_deadline_at: None,
+            restart_count: 0,
+            runtime_contract_sha256: request.runtime_contract_sha256.clone(),
+            role_lease_id: Some(request.role_lease_id.clone()),
+            role_lease_epoch: Some(request.role_lease_epoch),
         };
         state.agent_invocations.push(request.clone());
         state.operation_jobs.push(job.clone());
@@ -922,9 +1283,14 @@ impl HostBrokerService {
                     | OperationJobState::Failed
                     | OperationJobState::TimedOut
                     | OperationJobState::UnknownOutcome
+                    | OperationJobState::Cancelled
+                    | OperationJobState::Abandoned
             ) | (
                 OperationJobState::UnknownOutcome,
-                OperationJobState::Reconciled
+                OperationJobState::Reconciled | OperationJobState::Abandoned
+            ) | (
+                OperationJobState::Queued,
+                OperationJobState::Cancelled | OperationJobState::Abandoned
             )
         );
         if !legal {
@@ -937,7 +1303,22 @@ impl HostBrokerService {
             job.resume_session_id = resume_session_id;
         }
         job.state = next;
-        job.updated_at = OffsetDateTime::now_utc();
+        job.phase = match next {
+            OperationJobState::Queued => OperationPhase::Prepared,
+            OperationJobState::Running => OperationPhase::Running,
+            OperationJobState::Completed | OperationJobState::Reconciled => {
+                OperationPhase::Completed
+            }
+            OperationJobState::Abandoned => OperationPhase::Abandoned,
+            OperationJobState::Cancelled
+            | OperationJobState::Failed
+            | OperationJobState::TimedOut
+            | OperationJobState::UnknownOutcome => OperationPhase::Failed,
+        };
+        let now = OffsetDateTime::now_utc();
+        job.phase_started_at = Some(now);
+        job.last_progress_at = Some(now);
+        job.updated_at = now;
         Ok(())
     }
 
@@ -945,7 +1326,7 @@ impl HostBrokerService {
         self,
         state: &mut DelegationState,
         result: AgentResultEnvelope,
-    ) -> Result<AgentResultEnvelope, EngineError> {
+    ) -> Result<AgentResultAdmission, EngineError> {
         if !result.candidate_only {
             return Err(host_broker_error(
                 "external agent result must remain candidate-only",
@@ -963,7 +1344,7 @@ impl HostBrokerService {
                     "result id replay changed the AgentResultEnvelope",
                 ));
             }
-            return Ok(existing.clone());
+            return Ok(AgentResultAdmission::Accepted(existing.clone()));
         }
         let job = state
             .operation_jobs
@@ -972,6 +1353,47 @@ impl HostBrokerService {
             .ok_or_else(|| host_broker_error("AgentResultEnvelope has no matching OperationJob"))?;
         if job.host_id != result.host_id {
             return Err(host_broker_error("result host does not match OperationJob"));
+        }
+        let invocation = state
+            .agent_invocations
+            .iter()
+            .find(|invocation| invocation.invocation_id == result.invocation_id)
+            .ok_or_else(|| host_broker_error("result invocation request is missing"))?;
+        let lease = state
+            .task_role_leases
+            .iter()
+            .find(|lease| lease.role_lease_id == invocation.role_lease_id)
+            .ok_or_else(|| host_broker_error("result role lease is missing"))?;
+        let session_current = state.agent_host_sessions.iter().any(|session| {
+            session.agent_session_id == lease.agent_session_id
+                && session.state == AgentSessionState::Active
+                && session.generation == lease.generation
+                && session.host_identity.host_id == result.host_id
+                && session
+                    .bound_project_id
+                    .is_none_or(|project_id| project_id == invocation.project_id)
+                && session
+                    .bound_task_id
+                    .is_none_or(|task_id| task_id == invocation.task_id)
+        });
+        let current_authority = lease.state == AuthorityLeaseState::Active
+            && session_current
+            && lease.epoch == result.role_lease_epoch
+            && lease.generation == result.operation_generation
+            && invocation.role_lease_epoch == result.role_lease_epoch
+            && invocation.operation_generation == result.operation_generation
+            && job.generation == result.operation_generation
+            && job.role_lease_epoch == Some(result.role_lease_epoch)
+            && lease.expires_at > OffsetDateTime::now_utc();
+        if !current_authority {
+            if !state
+                .agent_results
+                .iter()
+                .any(|existing| existing.result_id == result.result_id)
+            {
+                state.agent_results.push(result.clone());
+            }
+            return Ok(AgentResultAdmission::StaleEvidencePreserved(result));
         }
         if job.state != OperationJobState::Running {
             return Err(host_broker_error(
@@ -987,9 +1409,15 @@ impl HostBrokerService {
             AgentResultStatus::UnknownOutcome => OperationJobState::UnknownOutcome,
         };
         job.result_ref = Some(result.result_id.clone());
+        job.phase = if job.state == OperationJobState::Completed {
+            OperationPhase::Completed
+        } else {
+            OperationPhase::Failed
+        };
+        job.last_progress_at = Some(OffsetDateTime::now_utc());
         job.updated_at = OffsetDateTime::now_utc();
         state.agent_results.push(result.clone());
-        Ok(result)
+        Ok(AgentResultAdmission::Accepted(result))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1008,6 +1436,7 @@ impl HostBrokerService {
         let controller_active = state.controller_leases.iter().any(|lease| {
             lease.task_id == task_id
                 && lease.agent_session_id == controller_session_id
+                && lease.state == AuthorityLeaseState::Active
                 && lease.expires_at > now
         });
         if !controller_active {

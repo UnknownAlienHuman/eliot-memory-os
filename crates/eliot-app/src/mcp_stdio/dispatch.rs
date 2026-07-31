@@ -33,6 +33,20 @@ pub(super) async fn dispatch_host_governor_method(
             )
             .await,
         ),
+        "runtime/operation" => Some(
+            async {
+                let request: eliot_engine::OperationRuntimeRequest =
+                    serde_json::from_value(params)?;
+                let response = state
+                    .writer
+                    .operation_runtime()
+                    .dispatch_proxy_request(request)
+                    .await
+                    .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+                Ok(serde_json::to_value(response)?)
+            }
+            .await,
+        ),
         "ul/onboard" => Some(
             crate::commands::run_ul_onboard_from_daemon(
                 &state.root,
@@ -903,7 +917,7 @@ pub(super) async fn dispatch_tool(
             let input: delegation_runtime::DelegationReviewInput =
                 serde_json::from_value(arguments)?;
             authorize_dynamic_delegation(state, context, &input)?;
-            delegation_runtime::review(&state.root, input).await?
+            delegation_runtime::review(&state.root, &state.config_path, input).await?
         }
         "eliot_delegate_status" => {
             let input: DelegationRefToolInput = serde_json::from_value(arguments)?;

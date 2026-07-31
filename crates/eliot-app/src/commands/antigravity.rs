@@ -791,7 +791,17 @@ pub async fn run_antigravity_live_smoke(config_path: &Path, mode: &str) -> Resul
         write_antigravity_report_pair(&root, "antigravity-runs", "Antigravity Run", &run)?;
         AntigravityLiveSmokeService.result_from_run(&smoke, &run)
     } else {
-        match AntigravityRunner.run_real(&request, &contract, &worktree_lease, &worktree_path) {
+        let executor =
+            crate::host_runtime::supervised_process::SharedAntigravityProcessExecutor::new(
+                config_path,
+            )?;
+        match AntigravityRunner.run_real_supervised(
+            &request,
+            &contract,
+            &worktree_lease,
+            &worktree_path,
+            &executor,
+        ) {
             Ok(run) => {
                 let inferred_auth = AntigravityAuthCheckService.from_probe_output(
                     &format!("{}\n{}", run.stdout_excerpt, run.stderr_excerpt),

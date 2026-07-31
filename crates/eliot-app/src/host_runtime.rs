@@ -54,6 +54,7 @@ mod external_agent;
 mod external_agent_process;
 mod integration;
 mod managed;
+pub(crate) mod supervised_process;
 #[cfg(test)]
 use claude::registry_entry_by_manifest;
 use claude::{

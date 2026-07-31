@@ -22,6 +22,9 @@ pub enum EngineError {
     #[error("writer response channel closed")]
     WriterClosed,
 
+    #[error("runtime supervision failed: {0}")]
+    RuntimeSupervision(String),
+
     #[error("canonical commit outcome is still unknown for write_id {write_id}")]
     UnknownCommit { write_id: eliot_types::WriteId },
 

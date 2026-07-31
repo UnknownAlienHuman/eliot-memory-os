@@ -385,6 +385,10 @@ impl ExternalReviewJobService {
                 session_id: None,
                 trace_id: new_id("external-review-trace"),
                 created_at: OffsetDateTime::now_utc(),
+                role_lease_id: None,
+                role_lease_epoch: None,
+                operation_generation: None,
+                runtime_contract_sha256: None,
             },
             input: json!({
                 "external_provider_id": provider.provider_id,

@@ -124,6 +124,42 @@ pub struct AntigravityExecutionGate;
 #[derive(Clone, Copy, Debug, Default)]
 pub struct AntigravityRunner;
 
+#[derive(Clone, Debug)]
+pub struct AntigravitySupervisedProcessSpec {
+    pub operation_id: String,
+    pub executable: PathBuf,
+    pub args: Vec<String>,
+    pub cwd: PathBuf,
+    pub environment: Vec<(String, String)>,
+    pub timeout_ms: u64,
+    pub max_output_bytes: u64,
+}
+
+#[derive(Clone, Debug)]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "the process result records independent bounded-cleanup outcomes"
+)]
+pub struct AntigravitySupervisedProcessOutput {
+    pub exit_code: Option<i32>,
+    pub stdout: Vec<u8>,
+    pub stderr: Vec<u8>,
+    pub stdout_truncated: bool,
+    pub stderr_truncated: bool,
+    pub timed_out: bool,
+    pub root_pid: u32,
+    pub job_object_name: String,
+    pub reap_complete: bool,
+}
+
+pub trait AntigravityProcessExecutor {
+    fn execute(
+        &self,
+        spec: AntigravitySupervisedProcessSpec,
+        on_spawned: &mut (dyn FnMut(u32) -> Result<(), EngineError> + Send),
+    ) -> Result<AntigravitySupervisedProcessOutput, EngineError>;
+}
+
 #[derive(Clone, Copy, Debug, Default)]
 pub struct AntigravityTextOutputNormalizer;
 
@@ -2020,6 +2056,7 @@ impl AntigravityRealExecutionDoctor {
 }
 
 impl AntigravityRunner {
+    #[cfg(any())]
     #[allow(clippy::too_many_lines)]
     pub fn run_real(
         &self,
@@ -2172,6 +2209,7 @@ impl AntigravityRunner {
         })
     }
 
+    #[cfg(any())]
     #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
     pub fn run_real_recorded(
         &self,
@@ -2546,6 +2584,430 @@ impl AntigravityRunner {
             } else {
                 "real Antigravity run exited nonzero; durable output is pending reconciliation"
                     .to_owned()
+            },
+            created_at: started,
+            completed_at: Some(completed_at),
+        })
+    }
+
+    pub fn run_real(
+        &self,
+        _request: &AntigravityReviewRequest,
+        _contract: &AntigravityCommandContract,
+        _worktree_lease: &WorktreeLease,
+        _effective_cwd: &Path,
+    ) -> Result<AntigravityRun, EngineError> {
+        Err(rejected(
+            "legacy unsupervised Antigravity execution is disabled; use run_real_supervised",
+        ))
+    }
+
+    #[allow(
+        clippy::too_many_lines,
+        reason = "provider execution is one ordered security and supervision transaction"
+    )]
+    pub fn run_real_supervised(
+        &self,
+        request: &AntigravityReviewRequest,
+        contract: &AntigravityCommandContract,
+        worktree_lease: &WorktreeLease,
+        effective_cwd: &Path,
+        executor: &dyn AntigravityProcessExecutor,
+    ) -> Result<AntigravityRun, EngineError> {
+        if std::env::var_os("ELIOT_DISABLE_REAL_PROVIDER").is_some() {
+            return Err(rejected(
+                "real Antigravity execution is disabled for provider-free verification",
+            ));
+        }
+        inspect_secret_bytes(request.question.as_bytes()).map_err(|violation| {
+            rejected(&format!(
+                "secret boundary rejected provider input: {}",
+                violation.rule
+            ))
+        })?;
+        let effective_cwd = validate_real_worktree(request, worktree_lease, effective_cwd)?;
+        let argv =
+            AntigravityCommandContractService.typed_review_argv(contract, &request.question)?;
+        let binary = argv
+            .first()
+            .ok_or_else(|| rejected("Antigravity real run has no binary argv"))?;
+        let version_gate = AntigravityVersionGateService.probe(Path::new(binary));
+        if !version_gate.allowed {
+            return Err(rejected(&format!(
+                "Antigravity version gate blocked real execution: {}",
+                version_gate.reasons.join("; ")
+            )));
+        }
+        let source_env = std::env::vars().collect::<Vec<_>>();
+        let mut process_env = AntigravityEnvPolicyService.minimal_windows_env(&source_env);
+        for fixed in &contract.env_policy.fixed_vars {
+            if !process_env.iter().any(|(name, _)| name == &fixed.0) {
+                process_env.push(fixed.clone());
+            }
+        }
+        let dropped_names = AntigravityEnvPolicyService.minimal_windows_dropped_names(&source_env);
+        let started = OffsetDateTime::now_utc();
+        let output = executor.execute(
+            AntigravitySupervisedProcessSpec {
+                operation_id: new_id("antigravity-process"),
+                executable: PathBuf::from(binary),
+                args: argv.iter().skip(1).cloned().collect(),
+                cwd: effective_cwd.clone(),
+                environment: process_env.clone(),
+                timeout_ms: DEFAULT_TIMEOUT_MS,
+                max_output_bytes: DEFAULT_MAX_OUTPUT_BYTES as u64,
+            },
+            &mut |_| Ok(()),
+        )?;
+        if !output.reap_complete {
+            return Err(rejected(
+                "supervised Antigravity process returned an incomplete reap receipt",
+            ));
+        }
+        if let Some(violation) = inspect_secret_bytes(&output.stdout)
+            .err()
+            .or_else(|| inspect_secret_bytes(&output.stderr).err())
+        {
+            return Err(rejected(&format!(
+                "secret boundary rejected provider output: {}",
+                violation.rule
+            )));
+        }
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let redacted_stdout = redact_output(&stdout);
+        let redacted_stderr = redact_output(&stderr);
+        let redaction_receipt =
+            merge_redaction_receipts(&redacted_stdout.receipt, &redacted_stderr.receipt);
+        let combined = output_text(
+            redacted_stdout.text.as_bytes(),
+            redacted_stderr.text.as_bytes(),
+        );
+        let normalized = AntigravityTextOutputNormalizer.normalize_text(request, &combined);
+        let exit_success = output.exit_code == Some(0);
+        let state = if output.timed_out {
+            AntigravityRunState::TimedOut
+        } else if exit_success {
+            AntigravityRunState::Succeeded
+        } else {
+            AntigravityRunState::Failed
+        };
+        let (receipt_argv, prompt_hash_blake3) = safety_argv_receipt(&argv, &request.question);
+        Ok(AntigravityRun {
+            run_id: new_id("antigravity-run"),
+            request_id: request.request_id.clone(),
+            state,
+            provider_state: if exit_success {
+                AntigravityProviderState::ReadyEnabled
+            } else {
+                AntigravityProviderState::DetectedDisabled
+            },
+            dry_run: false,
+            fixture_runner: false,
+            binary_path: contract.binary_path.clone(),
+            effective_cwd: path_for_record(&effective_cwd),
+            stdout_blob_ref: Some(blob_ref(
+                "antigravity/stdout.txt",
+                redacted_stdout.text.len(),
+            )),
+            stderr_blob_ref: Some(blob_ref(
+                "antigravity/stderr.txt",
+                redacted_stderr.text.len(),
+            )),
+            log_blob_ref: Some(blob_ref("antigravity/log.txt", combined.len())),
+            stdout_excerpt: truncate_text(&redacted_stdout.text, 2_000),
+            stderr_excerpt: truncate_text(&redacted_stderr.text, 2_000),
+            safety_receipt: AntigravitySafetyReceipt {
+                typed_argv: receipt_argv,
+                prompt_hash_blake3,
+                shell_false: true,
+                stdin_devnull: true,
+                process_group_kill_on_timeout: true,
+                timeout_ms: DEFAULT_TIMEOUT_MS,
+                max_output_bytes: DEFAULT_MAX_OUTPUT_BYTES,
+                effective_cwd: path_for_record(&effective_cwd),
+                env_fixed_vars: process_env,
+                env_dropped_names: dropped_names,
+            },
+            redaction_receipt,
+            normalized_result: Some(normalized),
+            message: if output.timed_out {
+                "real Antigravity run timed out and its supervised Job Object was reaped".to_owned()
+            } else if exit_success {
+                "real Antigravity run completed through the shared supervised process primitive"
+                    .to_owned()
+            } else {
+                "real Antigravity run failed; supervised output was captured".to_owned()
+            },
+            created_at: started,
+            completed_at: Some(OffsetDateTime::now_utc()),
+        })
+    }
+
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+    pub fn run_real_recorded(
+        &self,
+        _request: &AntigravityReviewRequest,
+        _contract: &AntigravityCommandContract,
+        _worktree_lease: &WorktreeLease,
+        _effective_cwd: &Path,
+        _data_root: &Path,
+        _reservation_owner: &ProviderCallReservationOwner,
+        _reservation_id: &str,
+        _journal: &ProviderInvocationJournal,
+        _attempt: &mut ProviderInvocationAttempt,
+    ) -> Result<AntigravityRun, EngineError> {
+        Err(rejected(
+            "legacy unsupervised recorded Antigravity execution is disabled; use run_real_recorded_supervised",
+        ))
+    }
+
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+    pub fn run_real_recorded_supervised(
+        &self,
+        request: &AntigravityReviewRequest,
+        contract: &AntigravityCommandContract,
+        worktree_lease: &WorktreeLease,
+        effective_cwd: &Path,
+        data_root: &Path,
+        reservation_owner: &ProviderCallReservationOwner,
+        reservation_id: &str,
+        journal: &ProviderInvocationJournal,
+        attempt: &mut ProviderInvocationAttempt,
+        executor: &dyn AntigravityProcessExecutor,
+    ) -> Result<AntigravityRun, EngineError> {
+        if std::env::var_os("ELIOT_DISABLE_REAL_PROVIDER").is_some() {
+            return Err(rejected(
+                "real Antigravity execution is disabled for provider-free verification",
+            ));
+        }
+        inspect_secret_bytes(request.question.as_bytes()).map_err(|violation| {
+            rejected(&format!(
+                "secret boundary rejected provider input: {}",
+                violation.rule
+            ))
+        })?;
+        let effective_cwd = validate_real_worktree(request, worktree_lease, effective_cwd)?;
+        let argv =
+            AntigravityCommandContractService.typed_review_argv(contract, &request.question)?;
+        let binary = argv
+            .first()
+            .ok_or_else(|| rejected("Antigravity real run has no binary argv"))?;
+        let version_gate = AntigravityVersionGateService.probe(Path::new(binary));
+        if !version_gate.allowed {
+            return Err(rejected(&format!(
+                "Antigravity version gate blocked real execution: {}",
+                version_gate.reasons.join("; ")
+            )));
+        }
+        let source_env = std::env::vars().collect::<Vec<_>>();
+        let mut process_env = AntigravityEnvPolicyService.minimal_windows_env(&source_env);
+        for fixed in &contract.env_policy.fixed_vars {
+            if !process_env.iter().any(|(name, _)| name == &fixed.0) {
+                process_env.push(fixed.clone());
+            }
+        }
+        let dropped_names = AntigravityEnvPolicyService.minimal_windows_dropped_names(&source_env);
+        journal.transition(
+            attempt,
+            ProviderInvocationState::DispatchStarting,
+            vec!["durable dispatch-starting receipt precedes supervised spawn".to_owned()],
+        )?;
+        let started = OffsetDateTime::now_utc();
+        let process_spec = AntigravitySupervisedProcessSpec {
+            operation_id: format!(
+                "antigravity-recorded-{}",
+                safe_invocation_component(&attempt.invocation_attempt_id)
+            ),
+            executable: PathBuf::from(binary),
+            args: argv.iter().skip(1).cloned().collect(),
+            cwd: effective_cwd.clone(),
+            environment: process_env.clone(),
+            timeout_ms: DEFAULT_TIMEOUT_MS,
+            max_output_bytes: DEFAULT_MAX_OUTPUT_BYTES as u64,
+        };
+        let execution = {
+            let mut on_spawned = |pid| {
+                reservation_owner.mark_dispatched(reservation_id, &request.request_id)?;
+                attempt.process_started_at = Some(OffsetDateTime::now_utc());
+                attempt.dispatch_started_at = attempt.process_started_at;
+                attempt.external_invocation_ref = Some(request.request_id.clone());
+                attempt.process_or_job_identity = Some(format!("pid:{pid};supervised=true"));
+                journal.persist(attempt)?;
+                journal.transition(
+                    attempt,
+                    ProviderInvocationState::Dispatched,
+                    vec![format!("external_invocation_ref:{}", request.request_id)],
+                )?;
+                journal.transition(
+                    attempt,
+                    ProviderInvocationState::Running,
+                    vec![format!("pid:{pid}")],
+                )
+            };
+            executor.execute(process_spec, &mut on_spawned)
+        };
+        let output = match execution {
+            Ok(output) => output,
+            Err(error) => {
+                let state = attempt
+                    .state_transitions
+                    .last()
+                    .map(|transition| transition.to);
+                if state == Some(ProviderInvocationState::DispatchStarting) {
+                    let _ = reservation_owner.release_pre_dispatch(
+                        reservation_id,
+                        "supervised process failed before provider dispatch",
+                    );
+                    journal.transition(
+                        attempt,
+                        ProviderInvocationState::PreDispatchAborted,
+                        vec![error.to_string()],
+                    )?;
+                } else {
+                    let _ =
+                        reservation_owner.mark_unknown_outcome(reservation_id, &error.to_string());
+                    journal.transition(
+                        attempt,
+                        ProviderInvocationState::DispatchAckUnknown,
+                        vec![error.to_string()],
+                    )?;
+                }
+                return Err(error);
+            }
+        };
+        attempt.process_or_job_identity = Some(format!(
+            "pid:{};job={};reap_complete={}",
+            output.root_pid, output.job_object_name, output.reap_complete
+        ));
+        let stdout_capture = ProviderOutputSpool.capture(
+            data_root,
+            &attempt.invocation_attempt_id,
+            "stdout",
+            std::io::Cursor::new(output.stdout.clone()),
+            DEFAULT_MAX_OUTPUT_BYTES as u64,
+        )?;
+        let stderr_capture = ProviderOutputSpool.capture(
+            data_root,
+            &attempt.invocation_attempt_id,
+            "stderr",
+            std::io::Cursor::new(output.stderr.clone()),
+            DEFAULT_MAX_OUTPUT_BYTES as u64,
+        )?;
+        if stdout_capture.output_observed || stderr_capture.output_observed {
+            let now = OffsetDateTime::now_utc();
+            attempt.first_output_at = Some(now);
+            attempt.last_output_at = Some(now);
+            journal.persist(attempt)?;
+            journal.transition(
+                attempt,
+                ProviderInvocationState::OutputObserved,
+                vec!["supervised capture observed provider output".to_owned()],
+            )?;
+        }
+        let stdout_text = String::from_utf8_lossy(&output.stdout).into_owned();
+        let stderr_text = String::from_utf8_lossy(&output.stderr).into_owned();
+        let combined = output_text(stdout_text.as_bytes(), stderr_text.as_bytes());
+        let normalized = AntigravityTextOutputNormalizer.normalize_text(request, &combined);
+        let structured_capture = ProviderOutputSpool.capture(
+            data_root,
+            &attempt.invocation_attempt_id,
+            "structured",
+            std::io::Cursor::new(serde_json::to_vec(&normalized)?),
+            DEFAULT_MAX_OUTPUT_BYTES as u64,
+        )?;
+        let exit_success = output.exit_code == Some(0);
+        let capture_complete = output.reap_complete
+            && !output.stdout_truncated
+            && !output.stderr_truncated
+            && !stdout_capture.truncation_detected
+            && !stderr_capture.truncation_detected
+            && !structured_capture.truncation_detected
+            && stdout_capture.stream_closed_cleanly
+            && stderr_capture.stream_closed_cleanly
+            && structured_capture.stream_closed_cleanly;
+        let state = if output.timed_out {
+            AntigravityRunState::TimedOut
+        } else if exit_success && capture_complete {
+            AntigravityRunState::Succeeded
+        } else {
+            AntigravityRunState::Failed
+        };
+        let completed_at = OffsetDateTime::now_utc();
+        attempt.process_exit_at = Some(completed_at);
+        attempt.stdout_blob_or_hash = Some(stdout_capture.blob_ref.clone());
+        attempt.stderr_blob_or_hash = Some(stderr_capture.blob_ref.clone());
+        attempt.structured_output_blob_or_hash = Some(structured_capture.blob_ref);
+        attempt.exit_code_or_signal = Some(output.exit_code.map_or_else(
+            || "terminated_without_exit_code".to_owned(),
+            |code| format!("exit_code:{code}"),
+        ));
+        journal.persist(attempt)?;
+        let terminal_state = if !capture_complete {
+            ProviderInvocationState::LocalCaptureFailed
+        } else if output.timed_out || stderr_text.contains("timeout waiting for response") {
+            ProviderInvocationState::TimeoutPendingReconciliation
+        } else if exit_success {
+            ProviderInvocationState::CompletedCaptured
+        } else {
+            ProviderInvocationState::ProcessExitedNonzero
+        };
+        journal.transition(
+            attempt,
+            terminal_state,
+            vec![format!(
+                "exit_success={exit_success};timed_out={};reap_complete={};stdout_truncated={};stderr_truncated={}",
+                output.timed_out,
+                output.reap_complete,
+                output.stdout_truncated,
+                output.stderr_truncated
+            )],
+        )?;
+        let redaction_receipt = AntigravityOutputRedactionReceipt {
+            redacted: false,
+            redacted_markers: Vec::new(),
+            original_bytes: output.stdout.len().saturating_add(output.stderr.len()),
+            retained_bytes: output.stdout.len().saturating_add(output.stderr.len()),
+        };
+        let (receipt_argv, prompt_hash_blake3) = safety_argv_receipt(&argv, &request.question);
+        Ok(AntigravityRun {
+            run_id: new_id("antigravity-run"),
+            request_id: request.request_id.clone(),
+            state,
+            provider_state: if exit_success && capture_complete {
+                AntigravityProviderState::ReadyEnabled
+            } else {
+                AntigravityProviderState::DetectedDisabled
+            },
+            dry_run: false,
+            fixture_runner: false,
+            binary_path: contract.binary_path.clone(),
+            effective_cwd: path_for_record(&effective_cwd),
+            stdout_blob_ref: Some(stdout_capture.blob_ref),
+            stderr_blob_ref: Some(stderr_capture.blob_ref),
+            log_blob_ref: Some(blob_ref("antigravity/log.txt", combined.len())),
+            stdout_excerpt: truncate_text(&stdout_text, 2_000),
+            stderr_excerpt: truncate_text(&stderr_text, 2_000),
+            safety_receipt: AntigravitySafetyReceipt {
+                typed_argv: receipt_argv,
+                prompt_hash_blake3,
+                shell_false: true,
+                stdin_devnull: true,
+                process_group_kill_on_timeout: true,
+                timeout_ms: DEFAULT_TIMEOUT_MS,
+                max_output_bytes: DEFAULT_MAX_OUTPUT_BYTES,
+                effective_cwd: path_for_record(&effective_cwd),
+                env_fixed_vars: process_env,
+                env_dropped_names: dropped_names,
+            },
+            redaction_receipt,
+            normalized_result: Some(normalized),
+            message: if output.timed_out {
+                "real Antigravity run hit the supervised absolute deadline".to_owned()
+            } else if exit_success {
+                "real Antigravity run completed with supervised durable capture".to_owned()
+            } else {
+                "real Antigravity run exited nonzero; output is pending reconciliation".to_owned()
             },
             created_at: started,
             completed_at: Some(completed_at),
@@ -3052,26 +3514,6 @@ fn terminate_process_tree(child: &mut std::process::Child) {
             .status();
     }
     let _ = child.kill();
-}
-
-fn abort_spawned_on_record_error<T>(
-    result: Result<T, EngineError>,
-    child: &mut std::process::Child,
-    reservation_owner: &ProviderCallReservationOwner,
-    reservation_id: &str,
-    operation: &str,
-) -> Result<T, EngineError> {
-    result.map_err(|error| {
-        terminate_process_tree(child);
-        let _ = child.wait();
-        let reason = format!("{operation} failed after provider spawn: {error}");
-        let _ = reservation_owner.mark_unknown_outcome(reservation_id, &reason);
-        error
-    })
-}
-
-fn file_len(path: &Path) -> u64 {
-    fs::metadata(path).map_or(0, |metadata| metadata.len())
 }
 
 fn safe_invocation_component(value: &str) -> String {

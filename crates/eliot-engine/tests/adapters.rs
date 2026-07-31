@@ -1,22 +1,144 @@
 use eliot_engine::{
-    Adapter, AdapterMemoryWriter, AdapterObservationBridge, AdapterRegistry, AdapterSupervisor,
-    HealthAdapter, TestEchoAdapter, TestFailingAdapter, TestLargeOutputAdapter, TestSlowAdapter,
-    WorkState, WriteAdmissionService, WriterActor, WriterConfig, normalize_result_to_observation,
+    Adapter, AdapterExecutionContext, AdapterMemoryWriter, AdapterObservationBridge,
+    AdapterRegistry, AdapterSupervisor, BoxAdapterFuture, EngineError, HealthAdapter,
+    TestEchoAdapter, TestFailingAdapter, TestLargeOutputAdapter, TestSlowAdapter, WorkState,
+    WriteAdmissionService, WriterActor, WriterConfig, normalize_result_to_observation,
     test_request,
 };
 use eliot_store::{BlobStore, CanonicalStore, ControlWal};
 use eliot_types::{
-    AdapterAuthorityProfile, AdapterCapability, AdapterResultStatus, AdapterState,
-    BlackboardItemKind, BlobStoreConfig, ControlWalConfig, GovernorConfig, MailboxMessageKind,
-    ModuleAuthorityProfile, ModuleCapability, TaintClass,
+    AdapterAuthorityProfile, AdapterCapability, AdapterClass, AdapterResult, AdapterResultStatus,
+    AdapterState, BlackboardItemKind, BlobStoreConfig, CapabilityManifest, ControlWalConfig,
+    GovernorConfig, MailboxMessageKind, ModuleAuthorityProfile, ModuleCapability, OperationPhase,
+    OperationReconciliationState, ProviderDispatchState, TaintClass,
 };
 use std::fs::{self, OpenOptions};
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::time::{Duration, sleep};
 
 type TestResult<T = ()> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
+
+struct FlakyExternalAdapter {
+    manifest: CapabilityManifest,
+    echo: TestEchoAdapter,
+}
+
+impl FlakyExternalAdapter {
+    fn new() -> Self {
+        Self {
+            manifest: external_test_manifest("flaky-external", 1_000),
+            echo: TestEchoAdapter::new(),
+        }
+    }
+}
+
+impl Adapter for FlakyExternalAdapter {
+    fn id(&self) -> &str {
+        &self.manifest.adapter_id
+    }
+
+    fn manifest(&self) -> &CapabilityManifest {
+        &self.manifest
+    }
+
+    fn health(&self) -> BoxAdapterFuture<'_, eliot_types::AdapterHealth> {
+        self.echo.health()
+    }
+
+    fn execute(
+        &self,
+        request: eliot_types::AdapterRequest,
+        context: AdapterExecutionContext,
+    ) -> BoxAdapterFuture<'_, AdapterResult> {
+        if context.generation == 1 {
+            Box::pin(async {
+                Err(EngineError::RuntimeSupervision(
+                    "injected pre-dispatch transport failure".to_owned(),
+                ))
+            })
+        } else {
+            self.echo.execute(request, context)
+        }
+    }
+
+    fn shutdown(&self) -> BoxAdapterFuture<'_, ()> {
+        self.echo.shutdown()
+    }
+}
+
+struct PostDispatchHangAdapter {
+    manifest: CapabilityManifest,
+    executions: Arc<AtomicU32>,
+    echo: TestEchoAdapter,
+}
+
+impl PostDispatchHangAdapter {
+    fn new(executions: Arc<AtomicU32>) -> Self {
+        Self {
+            manifest: external_test_manifest("post-dispatch-hang", 50),
+            executions,
+            echo: TestEchoAdapter::new(),
+        }
+    }
+}
+
+impl Adapter for PostDispatchHangAdapter {
+    fn id(&self) -> &str {
+        &self.manifest.adapter_id
+    }
+
+    fn manifest(&self) -> &CapabilityManifest {
+        &self.manifest
+    }
+
+    fn health(&self) -> BoxAdapterFuture<'_, eliot_types::AdapterHealth> {
+        self.echo.health()
+    }
+
+    fn execute(
+        &self,
+        _request: eliot_types::AdapterRequest,
+        context: AdapterExecutionContext,
+    ) -> BoxAdapterFuture<'_, AdapterResult> {
+        let executions = Arc::clone(&self.executions);
+        Box::pin(async move {
+            executions.fetch_add(1, Ordering::AcqRel);
+            let mut checkpoint = context
+                .runtime_store
+                .get_checkpoint(context.operation_id.clone())
+                .await?
+                .ok_or_else(|| {
+                    EngineError::RuntimeSupervision(
+                        "injected adapter checkpoint is absent".to_owned(),
+                    )
+                })?;
+            checkpoint.phase = OperationPhase::Running;
+            checkpoint.dispatch_state = ProviderDispatchState::Proven;
+            context.runtime_store.put_checkpoint(checkpoint).await?;
+            context.cancellation.cancelled().await;
+            Err(EngineError::RuntimeSupervision(
+                "injected post-dispatch hang observed cancellation".to_owned(),
+            ))
+        })
+    }
+
+    fn shutdown(&self) -> BoxAdapterFuture<'_, ()> {
+        self.echo.shutdown()
+    }
+}
+
+fn external_test_manifest(adapter_id: &str, timeout_ms: u64) -> CapabilityManifest {
+    let mut manifest = TestEchoAdapter::new().manifest().clone();
+    adapter_id.clone_into(&mut manifest.adapter_id);
+    adapter_id.clone_into(&mut manifest.name);
+    manifest.adapter_class = AdapterClass::ExternalCandidate;
+    manifest.limits.timeout_ms = timeout_ms;
+    manifest
+}
 
 #[test]
 fn adapter_trait_exists() {
@@ -125,6 +247,36 @@ async fn adapter_execute_timeout() -> TestResult {
 }
 
 #[tokio::test]
+async fn adapter_timeout_is_isolated_from_other_adapter_capacity() -> TestResult {
+    let supervisor = AdapterSupervisor::builtin()?;
+    let slow = supervisor.execute(
+        "test-slow",
+        test_request("test-slow", AdapterCapability::ExecuteTest),
+        None,
+    );
+    tokio::pin!(slow);
+    tokio::select! {
+        result = &mut slow => {
+            return Err(format!("slow adapter completed before isolation probe: {result:?}").into());
+        }
+        () = sleep(Duration::from_millis(5)) => {}
+    }
+
+    let echo = tokio::time::timeout(
+        Duration::from_millis(100),
+        supervisor.execute(
+            "test-echo",
+            test_request("test-echo", AdapterCapability::ExecuteTest),
+            None,
+        ),
+    )
+    .await??;
+    assert_eq!(echo.status, AdapterResultStatus::Succeeded);
+    assert_eq!(slow.await?.status, AdapterResultStatus::Timeout);
+    Ok(())
+}
+
+#[tokio::test]
 async fn adapter_execute_output_too_large_to_blob_ref() -> TestResult {
     let root = test_root("large-output-blob")?;
     let blob_store = BlobStore::open(&BlobStoreConfig {
@@ -163,7 +315,7 @@ async fn adapter_supervisor_health_probe() -> TestResult {
 async fn adapter_supervisor_circuit_breaker_opens() -> TestResult {
     let supervisor = AdapterSupervisor::builtin()?;
 
-    for _ in 0..2 {
+    for _ in 0..5 {
         let result = supervisor
             .execute(
                 "test-failing",
@@ -181,10 +333,167 @@ async fn adapter_supervisor_circuit_breaker_opens() -> TestResult {
 }
 
 #[tokio::test]
+async fn adapter_supervisor_hydrates_durable_open_circuit() -> TestResult {
+    let root = test_root("adapter-durable-circuit")?;
+    let wal = ControlWal::open(&ControlWalConfig {
+        path: root.join("control.redb").display().to_string(),
+    })?;
+    let store = CanonicalStore::new(GovernorConfig::default().db.surreal);
+    let (writer, actor) = WriterActor::channel(wal, store, &WriterConfig::default());
+    let runtime = writer.operation_runtime();
+    let actor_task = tokio::spawn(actor.run());
+
+    let first = AdapterSupervisor::with_runtime(AdapterRegistry::builtin()?, runtime.clone());
+    for _ in 0..5 {
+        let result = first
+            .execute(
+                "test-failing",
+                test_request("test-failing", AdapterCapability::ExecuteTest),
+                None,
+            )
+            .await?;
+        assert_eq!(result.status, AdapterResultStatus::Failed);
+    }
+    drop(first);
+
+    let restarted = AdapterSupervisor::with_runtime(AdapterRegistry::builtin()?, runtime);
+    let rejected = restarted
+        .execute(
+            "test-failing",
+            test_request("test-failing", AdapterCapability::ExecuteTest),
+            None,
+        )
+        .await?;
+    assert_eq!(rejected.status, AdapterResultStatus::CircuitOpen);
+    drop(restarted);
+    drop(writer);
+    actor_task.await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn adapter_supervisor_restarts_one_fresh_generation_before_dispatch() -> TestResult {
+    let root = test_root("adapter-pre-dispatch-restart")?;
+    let wal = ControlWal::open(&ControlWalConfig {
+        path: root.join("control.redb").display().to_string(),
+    })?;
+    let store = CanonicalStore::new(GovernorConfig::default().db.surreal);
+    let (writer, actor) = WriterActor::channel(wal, store, &WriterConfig::default());
+    let runtime = writer.operation_runtime();
+    let actor_task = tokio::spawn(actor.run());
+    let mut registry = AdapterRegistry::new();
+    registry.register(FlakyExternalAdapter::new())?;
+    let supervisor = AdapterSupervisor::with_runtime(registry, runtime.clone());
+    let request = test_request("flaky-external", AdapterCapability::ExecuteTest);
+    let operation_id = format!("adapter:flaky-external:{}", request.request_id);
+
+    let result = supervisor.execute("flaky-external", request, None).await?;
+    assert_eq!(result.status, AdapterResultStatus::Succeeded);
+    let checkpoint = runtime
+        .get_checkpoint(operation_id)
+        .await?
+        .ok_or_else(|| std::io::Error::other("restart checkpoint missing"))?;
+    assert_eq!(checkpoint.generation, 2);
+    assert_eq!(checkpoint.restart_count, 1);
+    assert_eq!(checkpoint.phase, OperationPhase::Completed);
+    let window = runtime
+        .load_restart_window("flaky-external")
+        .await?
+        .ok_or_else(|| std::io::Error::other("restart window missing"))?;
+    assert_eq!(window.restart_timestamps.len(), 1);
+
+    drop(supervisor);
+    drop(runtime);
+    drop(writer);
+    actor_task.await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn adapter_supervisor_persists_exact_authority_generation_binding() -> TestResult {
+    let root = test_root("adapter-authority-binding")?;
+    let wal = ControlWal::open(&ControlWalConfig {
+        path: root.join("control.redb").display().to_string(),
+    })?;
+    let store = CanonicalStore::new(GovernorConfig::default().db.surreal);
+    let (writer, actor) = WriterActor::channel(wal, store, &WriterConfig::default());
+    let runtime = writer.operation_runtime();
+    let actor_task = tokio::spawn(actor.run());
+    let supervisor = AdapterSupervisor::with_runtime(AdapterRegistry::builtin()?, runtime.clone());
+    let mut request = test_request("test-echo", AdapterCapability::ExecuteTest);
+    request.context.operation_generation = Some(2);
+    request.context.role_lease_id = Some("role-lease:g2".to_owned());
+    request.context.role_lease_epoch = Some(7);
+    request.context.runtime_contract_sha256 = Some("a".repeat(64));
+    let operation_id = format!("adapter:test-echo:{}", request.request_id);
+
+    let result = supervisor.execute("test-echo", request, None).await?;
+    assert_eq!(result.status, AdapterResultStatus::Succeeded);
+    let checkpoint = runtime
+        .get_checkpoint(operation_id)
+        .await?
+        .ok_or_else(|| std::io::Error::other("authority-bound checkpoint missing"))?;
+    assert_eq!(checkpoint.generation, 2);
+    assert_eq!(checkpoint.role_lease_id.as_deref(), Some("role-lease:g2"));
+    assert_eq!(checkpoint.role_lease_epoch, Some(7));
+    assert_eq!(
+        checkpoint.runtime_contract_sha256.as_deref(),
+        Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+    );
+
+    drop(supervisor);
+    drop(runtime);
+    drop(writer);
+    actor_task.await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn adapter_supervisor_never_restarts_after_dispatch_proof() -> TestResult {
+    let root = test_root("adapter-post-dispatch-no-restart")?;
+    let wal = ControlWal::open(&ControlWalConfig {
+        path: root.join("control.redb").display().to_string(),
+    })?;
+    let store = CanonicalStore::new(GovernorConfig::default().db.surreal);
+    let (writer, actor) = WriterActor::channel(wal, store, &WriterConfig::default());
+    let runtime = writer.operation_runtime();
+    let actor_task = tokio::spawn(actor.run());
+    let executions = Arc::new(AtomicU32::new(0));
+    let mut registry = AdapterRegistry::new();
+    registry.register(PostDispatchHangAdapter::new(Arc::clone(&executions)))?;
+    let supervisor = AdapterSupervisor::with_runtime(registry, runtime.clone());
+    let request = test_request("post-dispatch-hang", AdapterCapability::ExecuteTest);
+    let operation_id = format!("adapter:post-dispatch-hang:{}", request.request_id);
+
+    let result = supervisor
+        .execute("post-dispatch-hang", request, None)
+        .await?;
+    assert_eq!(result.status, AdapterResultStatus::Timeout);
+    assert_eq!(executions.load(Ordering::Acquire), 1);
+    let checkpoint = runtime
+        .get_checkpoint(operation_id)
+        .await?
+        .ok_or_else(|| std::io::Error::other("post-dispatch checkpoint missing"))?;
+    assert_eq!(checkpoint.generation, 1);
+    assert_eq!(checkpoint.restart_count, 0);
+    assert_eq!(checkpoint.dispatch_state, ProviderDispatchState::Proven);
+    assert_eq!(
+        checkpoint.reconciliation_state,
+        OperationReconciliationState::Pending
+    );
+
+    drop(supervisor);
+    drop(runtime);
+    drop(writer);
+    actor_task.await?;
+    Ok(())
+}
+
+#[tokio::test]
 async fn adapter_supervisor_half_open_probe() -> TestResult {
     let supervisor = AdapterSupervisor::builtin()?;
 
-    for _ in 0..2 {
+    for _ in 0..5 {
         let _ = supervisor
             .execute(
                 "test-failing",

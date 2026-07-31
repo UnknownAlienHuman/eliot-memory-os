@@ -207,6 +207,10 @@ pub(super) fn authorize_dynamic_delegation(
     Ok(())
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "one delegation admission state machine validates and persists the complete authority transition"
+)]
 pub(super) async fn dispatch_agent_delegate(
     state: &McpState,
     context: AuthenticatedRequestContext,
@@ -236,6 +240,7 @@ pub(super) async fn dispatch_agent_delegate(
         .find(|lease| {
             lease.role_lease_id == input.target_role_lease_id
                 && lease.task_id == task_id
+                && lease.state == eliot_types::AuthorityLeaseState::Active
                 && lease.expires_at > now
         })
         .cloned()
@@ -249,6 +254,11 @@ pub(super) async fn dispatch_agent_delegate(
         .find(|binding| binding.agent_session_id == target_role.agent_session_id)
         .cloned()
         .context("target TaskRoleLease has no host binding")?;
+    if target_binding.state != eliot_types::AgentSessionState::Active
+        || target_binding.generation != target_role.generation
+    {
+        anyhow::bail!("target TaskRoleLease owner session is inactive or stale");
+    }
     if target_binding.host_identity.host_id != input.target_host {
         anyhow::bail!("target_host does not match the target TaskRoleLease binding");
     }
@@ -277,6 +287,9 @@ pub(super) async fn dispatch_agent_delegate(
         work_item_id,
         requested_capabilities: input.requested_capabilities,
         role_lease_id: input.target_role_lease_id,
+        role_lease_epoch: target_role.epoch,
+        operation_generation: target_role.generation,
+        runtime_contract_sha256: None,
         work_lease_id: Some(work_lease_id),
         packet_refs: input.packet_refs,
         expected_result_kind: input.expected_result_kind,
@@ -391,6 +404,8 @@ pub(super) async fn dispatch_agent_result_submit(
         host_id: binding.host_identity.host_id,
         host_session_id: Some(binding.host_identity.client_instance_id),
         status: input.status,
+        role_lease_epoch: request.role_lease_epoch,
+        operation_generation: request.operation_generation,
         summary: input.summary,
         artifact_refs,
         evidence_refs: input.evidence_refs,
@@ -403,7 +418,16 @@ pub(super) async fn dispatch_agent_result_submit(
         provider_output_hash: None,
         canonical_receipt: None,
     };
-    let mut result = HostBrokerService.record_result(&mut broker_state, result)?;
+    let admission = HostBrokerService.record_result(&mut broker_state, result)?;
+    let mut result = match admission {
+        eliot_engine::AgentResultAdmission::Accepted(result) => result,
+        eliot_engine::AgentResultAdmission::StaleEvidencePreserved(_) => {
+            delegation_runtime::save_host_broker_state(&state.root, &broker_state)?;
+            anyhow::bail!(
+                "stale role epoch or operation generation result preserved as evidence but rejected as current"
+            );
+        }
+    };
     if result.canonical_receipt.is_none() {
         let (receipt, _) = write_canonical_observation(
             state,

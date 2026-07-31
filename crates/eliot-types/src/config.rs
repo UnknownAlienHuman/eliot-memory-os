@@ -11,9 +11,24 @@ pub struct GovernorConfig {
     pub blob_store: BlobStoreConfig,
     pub store: StoreConfig,
     #[serde(default)]
+    pub supervision: RuntimeSupervisionConfig,
+    #[serde(default)]
     pub delegation_calibration: DelegationCalibrationConfig,
     #[serde(default)]
     pub ul: UlConfig,
+}
+
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+pub struct RuntimeSupervisionConfig {
+    pub watchdog_interval_ms: u64,
+}
+
+impl Default for RuntimeSupervisionConfig {
+    fn default() -> Self {
+        Self {
+            watchdog_interval_ms: 2_000,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
@@ -169,6 +184,11 @@ impl GovernorConfig {
         require_non_empty("control_wal.path", &self.control_wal.path)?;
         require_non_empty("blob_store.root", &self.blob_store.root)?;
         require_non_empty("store.surql_dir", &self.store.surql_dir)?;
+        if self.supervision.watchdog_interval_ms == 0 {
+            return Err(ConfigError::ZeroField {
+                field: "supervision.watchdog_interval_ms",
+            });
+        }
         require_non_empty("store.migrations_dir", &self.store.migrations_dir)?;
 
         let bind = self.db.surreal.bind.to_ascii_lowercase();
@@ -275,6 +295,7 @@ impl Default for GovernorConfig {
                 surql_dir: "crates/eliot-store/src/surql".to_owned(),
                 migrations_dir: "crates/eliot-store/migrations".to_owned(),
             },
+            supervision: RuntimeSupervisionConfig::default(),
             delegation_calibration: DelegationCalibrationConfig::default(),
             ul: UlConfig::default(),
         }

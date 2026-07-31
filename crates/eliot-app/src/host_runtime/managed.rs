@@ -846,6 +846,9 @@ pub(super) async fn begin_managed_broker_chain(
         work_item_id,
         requested_capabilities: vec!["lease_scoped_candidate_implementation".to_owned()],
         role_lease_id,
+        role_lease_epoch: contract.role_lease_epoch,
+        operation_generation: contract.operation_generation,
+        runtime_contract_sha256: Some(contract.contract_hash.clone()),
         work_lease_id: contract.work_lease_id,
         packet_refs: vec![
             authority.task_receipt.receipt_id.to_string(),
@@ -933,7 +936,14 @@ pub(super) async fn record_managed_broker_result(
         .candidate_diff_hash
         .map(|hash| vec![format!("candidate-unified-diff:{hash}")])
         .unwrap_or_default();
-    let mut result = HostBrokerService.record_result(
+    let invocation = state
+        .agent_invocations
+        .iter()
+        .find(|candidate| candidate.invocation_id == invocation_id)
+        .context("managed broker invocation disappeared before result admission")?;
+    let role_lease_epoch = invocation.role_lease_epoch;
+    let operation_generation = invocation.operation_generation;
+    let admission = HostBrokerService.record_result(
         &mut state,
         AgentResultEnvelope {
             result_id: chain.result_id.clone(),
@@ -941,6 +951,8 @@ pub(super) async fn record_managed_broker_result(
             host_id: AgentHostId::Antigravity,
             host_session_id: Some(chain.host_session_id.clone()),
             status: record.status,
+            role_lease_epoch,
+            operation_generation,
             summary: record.summary.to_owned(),
             artifact_refs,
             evidence_refs: record.evidence_refs,
@@ -958,6 +970,15 @@ pub(super) async fn record_managed_broker_result(
             canonical_receipt: None,
         },
     )?;
+    let mut result = match admission {
+        eliot_engine::AgentResultAdmission::Accepted(result) => result,
+        eliot_engine::AgentResultAdmission::StaleEvidencePreserved(_) => {
+            delegation_runtime::save_host_broker_state(&runtime_root(config_path), &state)?;
+            bail!(
+                "stale role epoch or operation generation result preserved as evidence but rejected as current"
+            );
+        }
+    };
     let (project_id, task_id, agent_session_id) =
         managed_broker_canonical_scope(&state, invocation_id)?;
     if result.canonical_receipt.is_none() {
@@ -1051,46 +1072,7 @@ pub(super) async fn write_canonical_managed_invocation_request(
     Ok(receipt)
 }
 
-pub(super) async fn wait_managed_root(child: &eliot_windows_ipc::SuspendedJobChild) -> Result<i32> {
-    loop {
-        if let Some(code) = child.try_wait()? {
-            return Ok(code);
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
-}
-
-pub(super) fn spawn_managed_pipe_reader(
-    file: File,
-) -> tokio::task::JoinHandle<std::io::Result<Vec<u8>>> {
-    tokio::task::spawn_blocking(move || {
-        let mut file = file;
-        let mut retained = Vec::new();
-        let mut chunk = [0_u8; 8192];
-        loop {
-            let count = file.read(&mut chunk)?;
-            if count == 0 {
-                break;
-            }
-            let remaining = MAX_SECRET_BOUNDARY_BYTES
-                .saturating_add(1)
-                .saturating_sub(retained.len());
-            retained.extend_from_slice(&chunk[..count.min(remaining)]);
-        }
-        Ok(retained)
-    })
-}
-
-pub(super) async fn finish_managed_pipe_reads(
-    stdout: tokio::task::JoinHandle<std::io::Result<Vec<u8>>>,
-    stderr: tokio::task::JoinHandle<std::io::Result<Vec<u8>>>,
-    timeout: Duration,
-) -> Result<(Vec<u8>, Vec<u8>)> {
-    tokio::time::timeout(timeout, async { Ok((stdout.await??, stderr.await??)) })
-        .await
-        .context("managed provider pipe drain exceeded its bounded deadline")?
-}
-
+#[cfg(test)]
 pub(super) fn remaining_to_deadline(deadline: Instant) -> Duration {
     deadline.saturating_duration_since(Instant::now())
 }
@@ -1165,8 +1147,84 @@ pub(super) async fn run_managed_antigravity(
     mark_managed_broker_running(config_path, &broker).await?;
     write_provider_start_marker(invocation_root, &attempt.attempt_hash)?;
 
-    let mut child = match eliot_windows_ipc::SuspendedJobChild::spawn(command.as_std()) {
-        Ok(child) => child,
+    let wall_clock = Duration::from_secs(contract.wall_clock_budget_seconds);
+    let raw_command = command.as_std();
+    let managed_context = eliot_engine::runtime_supervision::AdapterExecutionContext {
+        operation_id: format!("managed-provider-{}", contract.invocation_id),
+        generation: 1,
+        cancellation: eliot_engine::runtime_supervision::CancellationToken::new(),
+        deadline: tokio::time::Instant::now() + wall_clock,
+        runtime_store: super::supervised_process::daemon_operation_runtime_handle(config_path)?,
+        role_lease_id: contract.role_lease_id.clone(),
+        role_lease_epoch: Some(contract.role_lease_epoch),
+        runtime_contract_sha256: Some(contract.contract_hash.clone()),
+    };
+    let managed_spec = super::supervised_process::SupervisedProcessSpec {
+        operation_id: managed_context.operation_id.clone(),
+        invocation_id: Some(contract.invocation_id.clone()),
+        generation: managed_context.generation,
+        child_kind: super::supervised_process::SupervisedChildKind::Provider,
+        criticality: super::supervised_process::ChildCriticality::InvocationDependency,
+        restart_policy: super::supervised_process::ProcessRestartPolicy {
+            strategy: super::supervised_process::RestartStrategy::RestForOne,
+            max_restarts: 1,
+            restart_window_seconds: 60,
+            base_backoff_ms: 250,
+            pre_dispatch_only: true,
+        },
+        executable: raw_command.get_program().into(),
+        args: raw_command
+            .get_args()
+            .map(std::ffi::OsString::from)
+            .collect(),
+        cwd: raw_command
+            .get_current_dir()
+            .map(ToOwned::to_owned)
+            .map_or_else(std::env::current_dir, Ok)?,
+        environment: raw_command
+            .get_envs()
+            .filter_map(|(name, value)| {
+                value.map(|value| {
+                    (
+                        std::ffi::OsString::from(name),
+                        std::ffi::OsString::from(value),
+                    )
+                })
+            })
+            .collect(),
+        stdin_payload: None,
+        stdout_limit_bytes: u64::try_from(MAX_SECRET_BOUNDARY_BYTES).unwrap_or(u64::MAX),
+        stderr_limit_bytes: u64::try_from(MAX_SECRET_BOUNDARY_BYTES).unwrap_or(u64::MAX),
+        timeout_profile: eliot_types::ProviderTimeoutProfile {
+            profile_id: "managed-antigravity-v1".to_owned(),
+            provider: "antigravity".to_owned(),
+            route_or_operation_class: "managed-provider".to_owned(),
+            spawn_deadline_ms: Some(5_000),
+            dispatch_ack_deadline_ms: None,
+            first_output_deadline_ms: None,
+            idle_output_deadline_ms: None,
+            absolute_runtime_deadline_ms: u64::try_from(wall_clock.as_millis()).unwrap_or(u64::MAX),
+            cancellation_grace_ms: 100,
+            cleanup_grace_ms: 5_000,
+            reconciliation_window_ms: 5_000,
+            output_heartbeat_supported: false,
+            status_lookup_supported: false,
+            evidence_basis: vec!["sealed HostLaunchContract wall-clock budget".to_owned()],
+            assumptions: Vec::new(),
+            hard_upper_bounds: vec!["absolute managed provider runtime".to_owned()],
+            policy_version: "runtime-supervision-v1".to_owned(),
+        },
+        runtime_contract_sha256: Some(contract.contract_hash.clone()),
+        role_lease_id: contract.role_lease_id.clone(),
+        role_lease_epoch: None,
+    };
+    let process = match super::supervised_process::run_supervised_process(
+        managed_spec,
+        managed_context,
+    )
+    .await
+    {
+        Ok(process) => process,
         Err(error) => {
             let reason = format!("failed to start official agy CLI: {error}");
             let launch_boundary_intact = managed_launch_boundary_is_current(&launch_boundary);
@@ -1208,47 +1266,17 @@ pub(super) async fn run_managed_antigravity(
             bail!("failed to start managed Antigravity launch");
         }
     };
-    let stdout_task = spawn_managed_pipe_reader(
-        child
-            .take_stdout()
-            .context("managed stdout pipe is missing")?,
-    );
-    let stderr_task = spawn_managed_pipe_reader(
-        child
-            .take_stderr()
-            .context("managed stderr pipe is missing")?,
-    );
-    let wall_clock = Duration::from_secs(contract.wall_clock_budget_seconds);
-    let deadline = Instant::now()
-        .checked_add(wall_clock)
-        .context("managed launch deadline overflowed")?;
-    let root_wait =
-        tokio::time::timeout(remaining_to_deadline(deadline), wait_managed_root(&child)).await;
-    let root_exit_code = root_wait
-        .as_ref()
-        .ok()
-        .and_then(|result| result.as_ref().ok())
-        .copied();
-    let root_wait_error = match &root_wait {
-        Ok(Err(error)) => Some(format!("provider wait failed: {error}")),
-        Err(_) => Some(
-            "wall-clock timeout elapsed; the native Job Object terminated the provider process tree"
-                .to_owned(),
-        ),
-        Ok(Ok(_)) => None,
-    };
-    let terminate_error = child.terminate(1).err();
-    let process_wait_error = match child.wait_timeout(remaining_to_deadline(deadline)) {
-        Ok(Some(_)) => None,
-        Ok(None) => Some("provider process did not signal before the absolute deadline".to_owned()),
-        Err(error) => Some(format!("provider termination wait failed: {error}")),
-    };
-    let drained =
-        finish_managed_pipe_reads(stdout_task, stderr_task, remaining_to_deadline(deadline)).await;
-    let (mut stdout_bytes, mut stderr_bytes, drain_error) = match drained {
-        Ok((stdout, stderr)) => (Some(stdout), Some(stderr), None),
-        Err(error) => (None, None, Some(error.to_string())),
-    };
+    let root_exit_code = process.exit_code;
+    let root_wait_error = process.timed_out.then(|| {
+        "wall-clock timeout elapsed; the native Job Object terminated the provider process tree"
+            .to_owned()
+    });
+    let terminate_error = (!process.reap_receipt.proves_complete_reap())
+        .then(|| anyhow::anyhow!("process reap receipt is incomplete"));
+    let process_wait_error = (process.reap_receipt.process_count_after != 0)
+        .then(|| "provider Job Object still has active process members".to_owned());
+    let drain_error = process.worker_error.clone();
+    let (mut stdout_bytes, mut stderr_bytes) = (Some(process.stdout), Some(process.stderr));
     let secret_boundary_rule = stdout_bytes
         .as_deref()
         .and_then(|bytes| inspect_secret_bytes(bytes).err())

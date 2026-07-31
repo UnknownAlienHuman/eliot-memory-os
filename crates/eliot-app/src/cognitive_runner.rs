@@ -6,7 +6,14 @@
     clippy::too_many_lines
 )]
 
-use crate::{named_pipe_ipc, runtime_bootstrap, runtime_instance::RuntimeInstance};
+use crate::{
+    host_runtime::supervised_process::{
+        ChildCriticality, ProcessRestartPolicy, RestartStrategy, SupervisedChildKind,
+        SupervisedProcessSpec, run_supervised_process_blocking,
+    },
+    named_pipe_ipc, runtime_bootstrap,
+    runtime_instance::RuntimeInstance,
+};
 use anyhow::{Context, Result};
 use eliot_types::{
     AgentHostId, CognitiveExecutionSeal, CognitiveHostObservation, CognitiveInvocationRole,
@@ -18,10 +25,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
+use std::ffi::OsString;
 use std::fs;
-use std::io;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::str::FromStr;
 use std::time::{Duration, Instant};
 
@@ -535,6 +541,8 @@ pub(crate) async fn run(
     let command_launcher_sha256 = execution.executable_sha256.clone();
     let command_provider_sha256 = execution.provider_executable_sha256.clone();
     let command_bundle_sha256 = execution.bundle_sha256.clone();
+    let operation_runtime =
+        crate::host_runtime::supervised_process::daemon_operation_runtime_handle(config_path)?;
     let managed = tokio::task::spawn_blocking(move || {
         run_managed_process(
             &command_request,
@@ -544,6 +552,7 @@ pub(crate) async fn run(
             &command_provider_sha256,
             &command_bundle_sha256,
             execution_authority,
+            operation_runtime,
         )
     })
     .await
@@ -1269,6 +1278,10 @@ fn write_output_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {
         .with_context(|| format!("write new sealed cognitive output {}", path.display()))
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the managed execution boundary receives independently pinned authority and hash inputs"
+)]
 fn run_managed_process(
     request: &CognitiveRunnerRequest,
     environment: &BTreeMap<String, String>,
@@ -1277,6 +1290,7 @@ fn run_managed_process(
     expected_provider_sha256: &str,
     expected_bundle_sha256: &str,
     mut authority: PinnedExecutionAuthority,
+    operation_runtime: eliot_engine::OperationRuntimeHandle,
 ) -> Result<ManagedOutput> {
     let launcher_file_identity = authority.launcher.identity();
     let provider_file_identity = authority.provider.identity();
@@ -1285,66 +1299,102 @@ fn run_managed_process(
         provider_executable_sha256_before,
         provider_bundle_sha256_before,
     ) = authority.hashes()?;
-    let mut command = Command::new(&request.executable);
-    command
-        .args(&request.argv)
-        .current_dir(&request.cwd)
-        .env_clear()
-        .envs(environment);
     let started = Instant::now();
-    let mut child = eliot_windows_ipc::SuspendedJobChild::spawn(&command)
-        .context("spawn provider suspended, assign Job Object, and resume")?;
-    let launcher_pid = child.id();
-    let launcher_process = child
-        .root_process_identity()
+    let timeout = Duration::from_secs(request.timeout_seconds);
+    let operation_id = format!("cognitive-{call_id}");
+    let output = run_supervised_process_blocking(
+        SupervisedProcessSpec {
+            operation_id: operation_id.clone(),
+            invocation_id: Some(call_id.to_owned()),
+            generation: 1,
+            child_kind: SupervisedChildKind::Provider,
+            criticality: ChildCriticality::InvocationDependency,
+            restart_policy: ProcessRestartPolicy {
+                strategy: RestartStrategy::RestForOne,
+                max_restarts: 1,
+                restart_window_seconds: 60,
+                base_backoff_ms: 250,
+                pre_dispatch_only: true,
+            },
+            executable: request.executable.clone(),
+            args: request.argv.iter().map(OsString::from).collect(),
+            cwd: request.cwd.clone(),
+            environment: environment
+                .iter()
+                .map(|(name, value)| (OsString::from(name), OsString::from(value)))
+                .collect(),
+            stdin_payload: None,
+            stdout_limit_bytes: u64::try_from(MAX_SECRET_BOUNDARY_BYTES).unwrap_or(u64::MAX),
+            stderr_limit_bytes: u64::try_from(MAX_SECRET_BOUNDARY_BYTES).unwrap_or(u64::MAX),
+            timeout_profile: eliot_types::ProviderTimeoutProfile {
+                profile_id: "cognitive-provider-v1".to_owned(),
+                provider: request.host.as_str().to_owned(),
+                route_or_operation_class: "cognitive-field".to_owned(),
+                spawn_deadline_ms: Some(5_000),
+                dispatch_ack_deadline_ms: None,
+                first_output_deadline_ms: None,
+                idle_output_deadline_ms: None,
+                absolute_runtime_deadline_ms: u64::try_from(timeout.as_millis())
+                    .unwrap_or(u64::MAX),
+                cancellation_grace_ms: 100,
+                cleanup_grace_ms: 5_000,
+                reconciliation_window_ms: 5_000,
+                output_heartbeat_supported: false,
+                status_lookup_supported: false,
+                evidence_basis: vec!["sealed cognitive run timeout".to_owned()],
+                assumptions: Vec::new(),
+                hard_upper_bounds: vec!["absolute cognitive call runtime".to_owned()],
+                policy_version: "runtime-supervision-v1".to_owned(),
+            },
+            runtime_contract_sha256: Some(expected_bundle_sha256.to_owned()),
+            role_lease_id: None,
+            role_lease_epoch: None,
+        },
+        eliot_engine::runtime_supervision::AdapterExecutionContext {
+            operation_id,
+            generation: 1,
+            cancellation: eliot_engine::runtime_supervision::CancellationToken::new(),
+            deadline: tokio::time::Instant::now() + timeout,
+            runtime_store: operation_runtime,
+            role_lease_id: None,
+            role_lease_epoch: None,
+            runtime_contract_sha256: Some(expected_bundle_sha256.to_owned()),
+        },
+    )?;
+    anyhow::ensure!(
+        output.worker_error.is_none() && output.reap_receipt.proves_complete_reap(),
+        "cognitive provider process cleanup failed: {:?}",
+        output.worker_error
+    );
+    let launcher_pid = output
+        .reap_receipt
+        .root_pid
+        .context("supervised cognitive provider lacks a root PID")?;
+    let launcher_process = output
+        .observed_processes
+        .iter()
+        .find(|process| process.pid == launcher_pid)
+        .cloned()
         .context("query held launcher process identity")?;
     if launcher_process.pid != launcher_pid {
         anyhow::bail!("held launcher process identity has a conflicting PID");
     }
     let launcher_image = canonical_path_string(&launcher_process.image)?;
-    let mut observed_job_processes = BTreeSet::new();
-    let mut job_observation_errors = BTreeSet::new();
-    observe_job_processes(
-        &child,
-        &mut observed_job_processes,
-        &mut job_observation_errors,
-    );
-    let mut stdout = child
-        .take_stdout()
-        .context("managed child stdout is absent")?;
-    let mut stderr = child
-        .take_stderr()
-        .context("managed child stderr is absent")?;
-    let stdout_thread =
-        std::thread::spawn(move || read_bounded_to_end(&mut stdout, MAX_SECRET_BOUNDARY_BYTES));
-    let stderr_thread =
-        std::thread::spawn(move || read_bounded_to_end(&mut stderr, MAX_SECRET_BOUNDARY_BYTES));
-    let deadline = started + Duration::from_secs(request.timeout_seconds);
-    let exit_code = loop {
-        observe_job_processes(
-            &child,
-            &mut observed_job_processes,
-            &mut job_observation_errors,
-        );
-        if let Some(exit_code) = child.try_wait()? {
-            break Some(exit_code);
-        }
-        let now = Instant::now();
-        if now >= deadline {
-            break None;
-        }
-        std::thread::sleep(Duration::from_millis(5).min(deadline.saturating_duration_since(now)));
-    };
-    let timed_out = exit_code.is_none();
-    if timed_out {
-        child.terminate(124)?;
-        let _ = child.wait_timeout(Duration::from_secs(5));
-    }
-    observe_job_processes(
-        &child,
-        &mut observed_job_processes,
-        &mut job_observation_errors,
-    );
+    let observed_job_processes = output
+        .observed_processes
+        .iter()
+        .map(|process| {
+            Ok(CognitiveJobProcessProjection {
+                pid: process.pid,
+                image: canonical_path_string(&process.image)?,
+                volume_serial_number: process.file_identity.volume_serial_number,
+                file_index: process.file_identity.file_index,
+            })
+        })
+        .collect::<Result<BTreeSet<_>>>()?;
+    let job_observation_errors = BTreeSet::new();
+    let exit_code = output.exit_code;
+    let timed_out = output.timed_out;
     let launcher_executable_sha256_after = authority
         .launcher
         .read_all()
@@ -1390,13 +1440,8 @@ fn run_managed_process(
     let provider_attested_in_job =
         provider_process.is_some() && provider_binary_stable && provider_matches_execution_seal;
     let provider_image_sha256 = provider_process.and(provider_executable_sha256_after.clone());
-    drop(child);
-    let mut stdout = stdout_thread
-        .join()
-        .map_err(|_| anyhow::anyhow!("join provider stdout reader"))??;
-    let mut stderr = stderr_thread
-        .join()
-        .map_err(|_| anyhow::anyhow!("join provider stderr reader"))??;
+    let mut stdout = output.stdout;
+    let mut stderr = output.stderr;
     let (secret_boundary_rule, stdout_sha256, stderr_sha256) =
         admit_provider_output(&mut stdout, &mut stderr);
     Ok(ManagedOutput {
@@ -1450,20 +1495,6 @@ fn run_managed_process(
     })
 }
 
-fn read_bounded_to_end(reader: &mut impl io::Read, limit: usize) -> io::Result<Vec<u8>> {
-    let mut retained = Vec::new();
-    let mut chunk = [0_u8; 8192];
-    loop {
-        let count = reader.read(&mut chunk)?;
-        if count == 0 {
-            break;
-        }
-        let remaining = limit.saturating_add(1).saturating_sub(retained.len());
-        retained.extend_from_slice(&chunk[..count.min(remaining)]);
-    }
-    Ok(retained)
-}
-
 fn admit_provider_output(
     stdout: &mut Vec<u8>,
     stderr: &mut Vec<u8>,
@@ -1485,38 +1516,6 @@ fn admit_provider_output(
 
 fn hash_attestation(before: &str, after: Option<&str>, expected: &str) -> (bool, bool) {
     (after == Some(before), before == expected)
-}
-
-fn observe_job_processes(
-    child: &eliot_windows_ipc::SuspendedJobChild,
-    observed: &mut BTreeSet<CognitiveJobProcessProjection>,
-    errors: &mut BTreeSet<String>,
-) {
-    match child.job_processes() {
-        Ok(processes) => {
-            for process in processes {
-                match canonical_path_string(&process.image) {
-                    Ok(image) => {
-                        observed.insert(CognitiveJobProcessProjection {
-                            pid: process.pid,
-                            image,
-                            volume_serial_number: process.file_identity.volume_serial_number,
-                            file_index: process.file_identity.file_index,
-                        });
-                    }
-                    Err(error) => {
-                        errors.insert(format!(
-                            "pid {} image canonicalization: {error}",
-                            process.pid
-                        ));
-                    }
-                }
-            }
-        }
-        Err(error) => {
-            errors.insert(format!("JobObjectBasicProcessIdList: {error}"));
-        }
-    }
 }
 
 fn host_observation(

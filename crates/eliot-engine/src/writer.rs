@@ -3,11 +3,14 @@ use eliot_store::{CanonicalStore, ControlWal, StoreError, WalPendingWrite, WalWr
 use eliot_types::{
     CognitiveRunContract, CognitiveRunTerminal, CognitiveSharedGateBinding, MemoryLifecycleState,
     MemoryStateTransition, MemoryWriteEnvelope, ObservabilityWriteEnvelope,
-    ObservabilityWriteReceipt, ObservabilityWriteStatus, ProjectId, ProjectRevisionSummary,
-    ProjectSequence, SessionId, TaskId, WriteId, WriteReceipt, WriteReceiptRef, WriteRejectReason,
-    WriteStatus,
+    ObservabilityWriteReceipt, ObservabilityWriteStatus, OperationRestartWindow,
+    OperationRuntimeCheckpoint, ProjectId, ProjectRevisionSummary, ProjectSequence,
+    SealStagingCheckpoint, SessionId, TaskId, WriteId, WriteReceipt, WriteReceiptRef,
+    WriteRejectReason, WriteStatus,
 };
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use tokio::sync::{mpsc, oneshot};
@@ -229,6 +232,47 @@ enum ControlWalMessage {
     ProjectHeads {
         response_tx: oneshot::Sender<Result<Vec<ProjectRevisionSummary>, String>>,
     },
+    PutOperationCheckpoint {
+        checkpoint: OperationRuntimeCheckpoint,
+        response_tx: oneshot::Sender<Result<(), String>>,
+    },
+    GetOperationCheckpoint {
+        operation_id: String,
+        response_tx: oneshot::Sender<Result<Option<OperationRuntimeCheckpoint>, String>>,
+    },
+    ListNonterminalOperationCheckpoints {
+        response_tx: oneshot::Sender<Result<Vec<OperationRuntimeCheckpoint>, String>>,
+    },
+    DeleteTerminalOperationCheckpoint {
+        operation_id: String,
+        response_tx: oneshot::Sender<Result<bool, String>>,
+    },
+    LoadRestartWindow {
+        key: String,
+        response_tx: oneshot::Sender<Result<Option<OperationRestartWindow>, String>>,
+    },
+    PutRestartWindow {
+        window: OperationRestartWindow,
+        response_tx: oneshot::Sender<Result<(), String>>,
+    },
+    PutSealStagingCheckpoint {
+        checkpoint: SealStagingCheckpoint,
+        response_tx: oneshot::Sender<Result<(), String>>,
+    },
+    LoadIncompleteSealStaging {
+        response_tx: oneshot::Sender<Result<Vec<SealStagingCheckpoint>, String>>,
+    },
+    RemoveSealStagingCheckpoint {
+        seal_attempt_id: String,
+        response_tx: oneshot::Sender<Result<bool, String>>,
+    },
+    GetSupervisionRecoveryCursor {
+        response_tx: oneshot::Sender<Result<Option<String>, String>>,
+    },
+    PutSupervisionRecoveryCursor {
+        cursor: String,
+        response_tx: oneshot::Sender<Result<(), String>>,
+    },
 }
 
 #[derive(Clone)]
@@ -421,6 +465,104 @@ impl ControlWalActor {
                     let _ = response_tx
                         .send(self.wal.project_heads().map_err(|error| error.to_string()));
                 }
+                ControlWalMessage::PutOperationCheckpoint {
+                    checkpoint,
+                    response_tx,
+                } => {
+                    let _ = response_tx.send(
+                        self.wal
+                            .put_operation_checkpoint(&checkpoint)
+                            .map_err(|error| error.to_string()),
+                    );
+                }
+                ControlWalMessage::GetOperationCheckpoint {
+                    operation_id,
+                    response_tx,
+                } => {
+                    let _ = response_tx.send(
+                        self.wal
+                            .get_operation_checkpoint(&operation_id)
+                            .map_err(|error| error.to_string()),
+                    );
+                }
+                ControlWalMessage::ListNonterminalOperationCheckpoints { response_tx } => {
+                    let _ = response_tx.send(
+                        self.wal
+                            .list_nonterminal_operation_checkpoints()
+                            .map_err(|error| error.to_string()),
+                    );
+                }
+                ControlWalMessage::DeleteTerminalOperationCheckpoint {
+                    operation_id,
+                    response_tx,
+                } => {
+                    let _ = response_tx.send(
+                        self.wal
+                            .delete_terminal_operation_checkpoint_after_retention(&operation_id)
+                            .map_err(|error| error.to_string()),
+                    );
+                }
+                ControlWalMessage::LoadRestartWindow { key, response_tx } => {
+                    let _ = response_tx.send(
+                        self.wal
+                            .load_restart_window(&key)
+                            .map_err(|error| error.to_string()),
+                    );
+                }
+                ControlWalMessage::PutRestartWindow {
+                    window,
+                    response_tx,
+                } => {
+                    let _ = response_tx.send(
+                        self.wal
+                            .record_restart(&window)
+                            .map_err(|error| error.to_string()),
+                    );
+                }
+                ControlWalMessage::PutSealStagingCheckpoint {
+                    checkpoint,
+                    response_tx,
+                } => {
+                    let _ = response_tx.send(
+                        self.wal
+                            .put_seal_staging_checkpoint(&checkpoint)
+                            .map_err(|error| error.to_string()),
+                    );
+                }
+                ControlWalMessage::LoadIncompleteSealStaging { response_tx } => {
+                    let _ = response_tx.send(
+                        self.wal
+                            .load_incomplete_seal_staging()
+                            .map_err(|error| error.to_string()),
+                    );
+                }
+                ControlWalMessage::RemoveSealStagingCheckpoint {
+                    seal_attempt_id,
+                    response_tx,
+                } => {
+                    let _ = response_tx.send(
+                        self.wal
+                            .complete_or_remove_seal_staging_checkpoint(&seal_attempt_id)
+                            .map_err(|error| error.to_string()),
+                    );
+                }
+                ControlWalMessage::GetSupervisionRecoveryCursor { response_tx } => {
+                    let _ = response_tx.send(
+                        self.wal
+                            .supervision_recovery_cursor()
+                            .map_err(|error| error.to_string()),
+                    );
+                }
+                ControlWalMessage::PutSupervisionRecoveryCursor {
+                    cursor,
+                    response_tx,
+                } => {
+                    let _ = response_tx.send(
+                        self.wal
+                            .put_supervision_recovery_cursor(&cursor)
+                            .map_err(|error| error.to_string()),
+                    );
+                }
             }
         }
     }
@@ -575,14 +717,407 @@ impl ControlWalHandle {
     }
 }
 
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case", tag = "operation", content = "payload")]
+#[allow(
+    clippy::large_enum_variant,
+    reason = "the authenticated IPC wire schema intentionally carries typed runtime records inline"
+)]
+pub enum OperationRuntimeRequest {
+    PutCheckpoint(OperationRuntimeCheckpoint),
+    GetCheckpoint(String),
+    ListNonterminalCheckpoints,
+    DeleteTerminalCheckpoint(String),
+    LoadRestartWindow(String),
+    PutRestartWindow(OperationRestartWindow),
+    PutSealStaging(SealStagingCheckpoint),
+    LoadIncompleteSealStaging,
+    RemoveSealStaging(String),
+    GetRecoveryCursor,
+    PutRecoveryCursor(String),
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case", tag = "result", content = "payload")]
+#[allow(
+    clippy::large_enum_variant,
+    reason = "the authenticated IPC wire schema intentionally carries typed runtime records inline"
+)]
+pub enum OperationRuntimeResponse {
+    Unit,
+    Checkpoint(Option<OperationRuntimeCheckpoint>),
+    Checkpoints(Vec<OperationRuntimeCheckpoint>),
+    Bool(bool),
+    RestartWindow(Option<OperationRestartWindow>),
+    SealStaging(Vec<SealStagingCheckpoint>),
+    Cursor(Option<String>),
+}
+
+pub trait OperationRuntimeProxy: Send + Sync {
+    fn request(
+        &self,
+        request: OperationRuntimeRequest,
+    ) -> Pin<Box<dyn Future<Output = Result<OperationRuntimeResponse, EngineError>> + Send + '_>>;
+}
+
+#[derive(Clone, Default)]
+pub struct OperationRuntimeHandle {
+    wal: Option<ControlWalHandle>,
+    proxy: Option<Arc<dyn OperationRuntimeProxy>>,
+}
+
+impl OperationRuntimeHandle {
+    #[must_use]
+    pub const fn disabled() -> Self {
+        Self {
+            wal: None,
+            proxy: None,
+        }
+    }
+
+    #[must_use]
+    pub fn from_proxy(proxy: Arc<dyn OperationRuntimeProxy>) -> Self {
+        Self {
+            wal: None,
+            proxy: Some(proxy),
+        }
+    }
+
+    #[must_use]
+    pub const fn is_enabled(&self) -> bool {
+        self.wal.is_some() || self.proxy.is_some()
+    }
+
+    pub async fn put_checkpoint(
+        &self,
+        checkpoint: OperationRuntimeCheckpoint,
+    ) -> Result<(), EngineError> {
+        match self
+            .request(OperationRuntimeRequest::PutCheckpoint(checkpoint))
+            .await?
+        {
+            OperationRuntimeResponse::Unit => Ok(()),
+            response => Err(unexpected_runtime_response(response)),
+        }
+    }
+
+    pub async fn get_checkpoint(
+        &self,
+        operation_id: impl Into<String>,
+    ) -> Result<Option<OperationRuntimeCheckpoint>, EngineError> {
+        match self
+            .request(OperationRuntimeRequest::GetCheckpoint(operation_id.into()))
+            .await?
+        {
+            OperationRuntimeResponse::Checkpoint(checkpoint) => Ok(checkpoint),
+            response => Err(unexpected_runtime_response(response)),
+        }
+    }
+
+    pub async fn list_nonterminal_checkpoints(
+        &self,
+    ) -> Result<Vec<OperationRuntimeCheckpoint>, EngineError> {
+        match self
+            .request(OperationRuntimeRequest::ListNonterminalCheckpoints)
+            .await?
+        {
+            OperationRuntimeResponse::Checkpoints(checkpoints) => Ok(checkpoints),
+            response => Err(unexpected_runtime_response(response)),
+        }
+    }
+
+    pub async fn delete_terminal_checkpoint(
+        &self,
+        operation_id: impl Into<String>,
+    ) -> Result<bool, EngineError> {
+        match self
+            .request(OperationRuntimeRequest::DeleteTerminalCheckpoint(
+                operation_id.into(),
+            ))
+            .await?
+        {
+            OperationRuntimeResponse::Bool(removed) => Ok(removed),
+            response => Err(unexpected_runtime_response(response)),
+        }
+    }
+
+    pub async fn load_restart_window(
+        &self,
+        key: impl Into<String>,
+    ) -> Result<Option<OperationRestartWindow>, EngineError> {
+        match self
+            .request(OperationRuntimeRequest::LoadRestartWindow(key.into()))
+            .await?
+        {
+            OperationRuntimeResponse::RestartWindow(window) => Ok(window),
+            response => Err(unexpected_runtime_response(response)),
+        }
+    }
+
+    pub async fn put_restart_window(
+        &self,
+        window: OperationRestartWindow,
+    ) -> Result<(), EngineError> {
+        match self
+            .request(OperationRuntimeRequest::PutRestartWindow(window))
+            .await?
+        {
+            OperationRuntimeResponse::Unit => Ok(()),
+            response => Err(unexpected_runtime_response(response)),
+        }
+    }
+
+    pub async fn put_seal_staging(
+        &self,
+        checkpoint: SealStagingCheckpoint,
+    ) -> Result<(), EngineError> {
+        match self
+            .request(OperationRuntimeRequest::PutSealStaging(checkpoint))
+            .await?
+        {
+            OperationRuntimeResponse::Unit => Ok(()),
+            response => Err(unexpected_runtime_response(response)),
+        }
+    }
+
+    pub async fn load_incomplete_seal_staging(
+        &self,
+    ) -> Result<Vec<SealStagingCheckpoint>, EngineError> {
+        match self
+            .request(OperationRuntimeRequest::LoadIncompleteSealStaging)
+            .await?
+        {
+            OperationRuntimeResponse::SealStaging(checkpoints) => Ok(checkpoints),
+            response => Err(unexpected_runtime_response(response)),
+        }
+    }
+
+    pub async fn remove_seal_staging(
+        &self,
+        seal_attempt_id: impl Into<String>,
+    ) -> Result<bool, EngineError> {
+        match self
+            .request(OperationRuntimeRequest::RemoveSealStaging(
+                seal_attempt_id.into(),
+            ))
+            .await?
+        {
+            OperationRuntimeResponse::Bool(removed) => Ok(removed),
+            response => Err(unexpected_runtime_response(response)),
+        }
+    }
+
+    pub async fn recovery_cursor(&self) -> Result<Option<String>, EngineError> {
+        match self
+            .request(OperationRuntimeRequest::GetRecoveryCursor)
+            .await?
+        {
+            OperationRuntimeResponse::Cursor(cursor) => Ok(cursor),
+            response => Err(unexpected_runtime_response(response)),
+        }
+    }
+
+    pub async fn put_recovery_cursor(&self, cursor: impl Into<String>) -> Result<(), EngineError> {
+        match self
+            .request(OperationRuntimeRequest::PutRecoveryCursor(cursor.into()))
+            .await?
+        {
+            OperationRuntimeResponse::Unit => Ok(()),
+            response => Err(unexpected_runtime_response(response)),
+        }
+    }
+
+    pub async fn dispatch_proxy_request(
+        &self,
+        request: OperationRuntimeRequest,
+    ) -> Result<OperationRuntimeResponse, EngineError> {
+        self.request(request).await
+    }
+
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the match is the exhaustive typed WAL request dispatcher"
+    )]
+    async fn request(
+        &self,
+        request: OperationRuntimeRequest,
+    ) -> Result<OperationRuntimeResponse, EngineError> {
+        if let Some(proxy) = &self.proxy {
+            return proxy.request(request).await;
+        }
+        let Some(wal) = &self.wal else {
+            return Ok(disabled_runtime_response(&request));
+        };
+        match request {
+            OperationRuntimeRequest::PutCheckpoint(checkpoint) => {
+                let (response_tx, response_rx) = oneshot::channel();
+                wal.tx
+                    .send(ControlWalMessage::PutOperationCheckpoint {
+                        checkpoint,
+                        response_tx,
+                    })
+                    .await
+                    .map_err(|_| EngineError::WriterClosed)?;
+                ControlWalHandle::response(response_rx).await?;
+                Ok(OperationRuntimeResponse::Unit)
+            }
+            OperationRuntimeRequest::GetCheckpoint(operation_id) => {
+                let (response_tx, response_rx) = oneshot::channel();
+                wal.tx
+                    .send(ControlWalMessage::GetOperationCheckpoint {
+                        operation_id,
+                        response_tx,
+                    })
+                    .await
+                    .map_err(|_| EngineError::WriterClosed)?;
+                Ok(OperationRuntimeResponse::Checkpoint(
+                    ControlWalHandle::response(response_rx).await?,
+                ))
+            }
+            OperationRuntimeRequest::ListNonterminalCheckpoints => {
+                let (response_tx, response_rx) = oneshot::channel();
+                wal.tx
+                    .send(ControlWalMessage::ListNonterminalOperationCheckpoints { response_tx })
+                    .await
+                    .map_err(|_| EngineError::WriterClosed)?;
+                Ok(OperationRuntimeResponse::Checkpoints(
+                    ControlWalHandle::response(response_rx).await?,
+                ))
+            }
+            OperationRuntimeRequest::DeleteTerminalCheckpoint(operation_id) => {
+                let (response_tx, response_rx) = oneshot::channel();
+                wal.tx
+                    .send(ControlWalMessage::DeleteTerminalOperationCheckpoint {
+                        operation_id,
+                        response_tx,
+                    })
+                    .await
+                    .map_err(|_| EngineError::WriterClosed)?;
+                Ok(OperationRuntimeResponse::Bool(
+                    ControlWalHandle::response(response_rx).await?,
+                ))
+            }
+            OperationRuntimeRequest::LoadRestartWindow(key) => {
+                let (response_tx, response_rx) = oneshot::channel();
+                wal.tx
+                    .send(ControlWalMessage::LoadRestartWindow { key, response_tx })
+                    .await
+                    .map_err(|_| EngineError::WriterClosed)?;
+                Ok(OperationRuntimeResponse::RestartWindow(
+                    ControlWalHandle::response(response_rx).await?,
+                ))
+            }
+            OperationRuntimeRequest::PutRestartWindow(window) => {
+                let (response_tx, response_rx) = oneshot::channel();
+                wal.tx
+                    .send(ControlWalMessage::PutRestartWindow {
+                        window,
+                        response_tx,
+                    })
+                    .await
+                    .map_err(|_| EngineError::WriterClosed)?;
+                ControlWalHandle::response(response_rx).await?;
+                Ok(OperationRuntimeResponse::Unit)
+            }
+            OperationRuntimeRequest::PutSealStaging(checkpoint) => {
+                let (response_tx, response_rx) = oneshot::channel();
+                wal.tx
+                    .send(ControlWalMessage::PutSealStagingCheckpoint {
+                        checkpoint,
+                        response_tx,
+                    })
+                    .await
+                    .map_err(|_| EngineError::WriterClosed)?;
+                ControlWalHandle::response(response_rx).await?;
+                Ok(OperationRuntimeResponse::Unit)
+            }
+            OperationRuntimeRequest::LoadIncompleteSealStaging => {
+                let (response_tx, response_rx) = oneshot::channel();
+                wal.tx
+                    .send(ControlWalMessage::LoadIncompleteSealStaging { response_tx })
+                    .await
+                    .map_err(|_| EngineError::WriterClosed)?;
+                Ok(OperationRuntimeResponse::SealStaging(
+                    ControlWalHandle::response(response_rx).await?,
+                ))
+            }
+            OperationRuntimeRequest::RemoveSealStaging(seal_attempt_id) => {
+                let (response_tx, response_rx) = oneshot::channel();
+                wal.tx
+                    .send(ControlWalMessage::RemoveSealStagingCheckpoint {
+                        seal_attempt_id,
+                        response_tx,
+                    })
+                    .await
+                    .map_err(|_| EngineError::WriterClosed)?;
+                Ok(OperationRuntimeResponse::Bool(
+                    ControlWalHandle::response(response_rx).await?,
+                ))
+            }
+            OperationRuntimeRequest::GetRecoveryCursor => {
+                let (response_tx, response_rx) = oneshot::channel();
+                wal.tx
+                    .send(ControlWalMessage::GetSupervisionRecoveryCursor { response_tx })
+                    .await
+                    .map_err(|_| EngineError::WriterClosed)?;
+                Ok(OperationRuntimeResponse::Cursor(
+                    ControlWalHandle::response(response_rx).await?,
+                ))
+            }
+            OperationRuntimeRequest::PutRecoveryCursor(cursor) => {
+                let (response_tx, response_rx) = oneshot::channel();
+                wal.tx
+                    .send(ControlWalMessage::PutSupervisionRecoveryCursor {
+                        cursor,
+                        response_tx,
+                    })
+                    .await
+                    .map_err(|_| EngineError::WriterClosed)?;
+                ControlWalHandle::response(response_rx).await?;
+                Ok(OperationRuntimeResponse::Unit)
+            }
+        }
+    }
+}
+
+fn disabled_runtime_response(request: &OperationRuntimeRequest) -> OperationRuntimeResponse {
+    match request {
+        OperationRuntimeRequest::PutCheckpoint(_)
+        | OperationRuntimeRequest::PutRestartWindow(_)
+        | OperationRuntimeRequest::PutSealStaging(_)
+        | OperationRuntimeRequest::PutRecoveryCursor(_) => OperationRuntimeResponse::Unit,
+        OperationRuntimeRequest::GetCheckpoint(_) => OperationRuntimeResponse::Checkpoint(None),
+        OperationRuntimeRequest::ListNonterminalCheckpoints => {
+            OperationRuntimeResponse::Checkpoints(Vec::new())
+        }
+        OperationRuntimeRequest::DeleteTerminalCheckpoint(_)
+        | OperationRuntimeRequest::RemoveSealStaging(_) => OperationRuntimeResponse::Bool(false),
+        OperationRuntimeRequest::LoadRestartWindow(_) => {
+            OperationRuntimeResponse::RestartWindow(None)
+        }
+        OperationRuntimeRequest::LoadIncompleteSealStaging => {
+            OperationRuntimeResponse::SealStaging(Vec::new())
+        }
+        OperationRuntimeRequest::GetRecoveryCursor => OperationRuntimeResponse::Cursor(None),
+    }
+}
+
+fn unexpected_runtime_response(response: OperationRuntimeResponse) -> EngineError {
+    let detail = format!("operation runtime proxy returned an unexpected response: {response:?}");
+    drop(response);
+    EngineError::RuntimeSupervision(detail)
+}
+
 #[derive(Clone)]
 pub struct WriterHandle {
     tx: mpsc::Sender<WriterMessage>,
     metrics: Arc<WriterRuntimeMetrics>,
+    operation_runtime: OperationRuntimeHandle,
 }
 
 pub struct WriterActor {
-    wal: ControlWal,
+    wal_actor: ControlWalActor,
+    wal_handle: ControlWalHandle,
     store: CanonicalStore,
     rx: mpsc::Receiver<WriterMessage>,
     config: WriterConfig,
@@ -599,13 +1134,23 @@ impl WriterActor {
         let lane_count = config.lane_count.max(1).min(queue_capacity);
         let (tx, rx) = mpsc::channel(queue_capacity);
         let metrics = Arc::new(WriterRuntimeMetrics::new(lane_count));
+        let (wal_handle, wal_actor) = ControlWalActor::channel(
+            wal,
+            config.control_wal_queue_capacity,
+            config.control_wal_staging_batch_size,
+        );
         (
             WriterHandle {
                 tx,
                 metrics: Arc::clone(&metrics),
+                operation_runtime: OperationRuntimeHandle {
+                    wal: Some(wal_handle.clone()),
+                    proxy: None,
+                },
             },
             Self {
-                wal,
+                wal_actor,
+                wal_handle,
                 store,
                 rx,
                 config: WriterConfig {
@@ -623,17 +1168,13 @@ impl WriterActor {
 
     pub async fn run(self) {
         let Self {
-            wal,
+            wal_actor,
+            wal_handle,
             store,
             rx,
             config,
             metrics,
         } = self;
-        let (wal_handle, wal_actor) = ControlWalActor::channel(
-            wal,
-            config.control_wal_queue_capacity,
-            config.control_wal_staging_batch_size,
-        );
         let wal_task = tokio::spawn(wal_actor.run());
         let worker = WriterWorker {
             wal: wal_handle,
@@ -1708,6 +2249,11 @@ fn conflict_receipt(
 impl WriterHandle {
     pub fn metrics(&self) -> WriterMetricsSnapshot {
         self.metrics.snapshot()
+    }
+
+    #[must_use]
+    pub fn operation_runtime(&self) -> OperationRuntimeHandle {
+        self.operation_runtime.clone()
     }
 
     fn enqueue(&self, message: WriterMessage) -> Result<(), EngineError> {

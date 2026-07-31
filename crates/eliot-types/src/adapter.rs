@@ -126,6 +126,14 @@ pub struct AdapterContext {
     pub trace_id: String,
     #[serde(with = "time::serde::rfc3339")]
     pub created_at: OffsetDateTime,
+    #[serde(default)]
+    pub role_lease_id: Option<String>,
+    #[serde(default)]
+    pub role_lease_epoch: Option<u64>,
+    #[serde(default)]
+    pub operation_generation: Option<u64>,
+    #[serde(default)]
+    pub runtime_contract_sha256: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

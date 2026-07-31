@@ -6,7 +6,13 @@
     clippy::struct_excessive_bools
 )]
 
-use crate::runtime_instance::{atomic_write_bytes, atomic_write_json};
+use crate::{
+    host_runtime::supervised_process::{
+        ChildCriticality, ProcessRestartPolicy, RestartStrategy, SupervisedChildKind,
+        SupervisedProcessSpec, run_supervised_process_blocking,
+    },
+    runtime_instance::{atomic_write_bytes, atomic_write_json},
+};
 use anyhow::{Context, Result, bail};
 use eliot_store::CanonicalStore;
 use eliot_types::{
@@ -23,11 +29,13 @@ use serde::Serialize;
 use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
 use std::collections::BTreeSet;
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::fs;
+use std::os::windows::process::ExitStatusExt as _;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::str::FromStr;
+use std::time::Duration;
 
 const READER_PROMPT_ALPHA: &str = "Open or inspect src/relay_alpha.rs. Determine whether ELIOT contains a previous lesson specifically bound to this file. Return the required JSON. Do not guess an opaque marker.";
 const READER_PROMPT_BETA: &str = "Open or inspect src/relay_beta.rs. Determine whether ELIOT contains a previous lesson specifically bound to this file. Return the required JSON. Do not guess an opaque marker.";
@@ -927,7 +935,14 @@ where
     if config_path.is_file() {
         command.args(["--config", &config_path.to_string_lossy()]);
     }
-    let output = command.args(args).output()?;
+    command.args(args);
+    let output = run_cross_agent_supervised(
+        config_path,
+        &command,
+        "governor-doctor",
+        Duration::from_secs(60),
+        SupervisedChildKind::Verifier,
+    )?;
     if !output.status.success() {
         bail!(
             "governor doctor subprocess failed: {}",
@@ -972,6 +987,113 @@ fn auditor_mcp_profile(host: AgentHostId) -> &'static str {
     }
 }
 
+fn run_cross_agent_supervised(
+    config_path: &Path,
+    command: &Command,
+    operation_class: &str,
+    timeout: Duration,
+    child_kind: SupervisedChildKind,
+) -> Result<std::process::Output> {
+    let mut environment = std::env::vars_os().collect::<std::collections::BTreeMap<_, _>>();
+    for (name, value) in command.get_envs() {
+        if let Some(value) = value {
+            environment.insert(OsString::from(name), OsString::from(value));
+        } else {
+            environment.remove(name);
+        }
+    }
+    let timeout_ms = u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX);
+    let operation_id = format!(
+        "ul-cross-agent-{}-{}",
+        operation_class
+            .chars()
+            .map(|character| if character.is_ascii_alphanumeric() {
+                character
+            } else {
+                '-'
+            })
+            .collect::<String>(),
+        uuid::Uuid::now_v7()
+    );
+    let output = run_supervised_process_blocking(
+        SupervisedProcessSpec {
+            operation_id: operation_id.clone(),
+            invocation_id: None,
+            generation: 1,
+            child_kind,
+            criticality: ChildCriticality::InvocationDependency,
+            restart_policy: ProcessRestartPolicy {
+                strategy: RestartStrategy::Never,
+                max_restarts: 0,
+                restart_window_seconds: 60,
+                base_backoff_ms: 0,
+                pre_dispatch_only: false,
+            },
+            executable: command.get_program().into(),
+            args: command.get_args().map(OsString::from).collect(),
+            cwd: command
+                .get_current_dir()
+                .map(ToOwned::to_owned)
+                .map_or_else(std::env::current_dir, Ok)?,
+            environment,
+            stdin_payload: None,
+            stdout_limit_bytes: 8 * 1024 * 1024,
+            stderr_limit_bytes: 8 * 1024 * 1024,
+            timeout_profile: eliot_types::ProviderTimeoutProfile {
+                profile_id: "ul-cross-agent-process-v1".to_owned(),
+                provider: "eliot-governor".to_owned(),
+                route_or_operation_class: operation_class.to_owned(),
+                spawn_deadline_ms: Some(5_000),
+                dispatch_ack_deadline_ms: None,
+                first_output_deadline_ms: Some(timeout_ms),
+                idle_output_deadline_ms: Some(timeout_ms),
+                absolute_runtime_deadline_ms: timeout_ms,
+                cancellation_grace_ms: 25,
+                cleanup_grace_ms: 5_000,
+                reconciliation_window_ms: 0,
+                output_heartbeat_supported: true,
+                status_lookup_supported: false,
+                evidence_basis: vec!["bounded UL cross-agent helper".to_owned()],
+                assumptions: Vec::new(),
+                hard_upper_bounds: vec!["caller-supplied timeout".to_owned()],
+                policy_version: "runtime-supervision-v1".to_owned(),
+            },
+            runtime_contract_sha256: None,
+            role_lease_id: None,
+            role_lease_epoch: None,
+        },
+        eliot_engine::runtime_supervision::AdapterExecutionContext {
+            operation_id,
+            generation: 1,
+            cancellation: eliot_engine::runtime_supervision::CancellationToken::new(),
+            deadline: tokio::time::Instant::now() + timeout,
+            runtime_store:
+                crate::host_runtime::supervised_process::daemon_operation_runtime_handle(
+                    config_path,
+                )?,
+            role_lease_id: None,
+            role_lease_epoch: None,
+            runtime_contract_sha256: None,
+        },
+    )?;
+    if output.timed_out
+        || output.worker_error.is_some()
+        || !output.reap_receipt.proves_complete_reap()
+    {
+        bail!(
+            "UL cross-agent supervised subprocess failed or timed out: {:?}",
+            output.worker_error
+        );
+    }
+    Ok(std::process::Output {
+        status: std::process::ExitStatus::from_raw(
+            output.exit_code.unwrap_or(i32::MAX).cast_unsigned(),
+        ),
+        stdout: output.stdout,
+        stderr: output.stderr,
+    })
+}
+
 fn invoke_reference_tool(
     config_path: &Path,
     profile: &str,
@@ -1001,7 +1123,13 @@ fn invoke_reference_tool(
     if config_path.is_file() {
         command.args(["-Config", &config_path.to_string_lossy()]);
     }
-    let output = command.output()?;
+    let output = run_cross_agent_supervised(
+        config_path,
+        &command,
+        &format!("reference-tool-{tool_name}"),
+        Duration::from_secs(65),
+        SupervisedChildKind::McpPreflight,
+    )?;
     if !output.status.success() {
         bail!(
             "reference MCP tool {tool_name} failed: {}",
@@ -1077,7 +1205,13 @@ fn scoped_mcp_preflight(
     if config_path.is_file() {
         command.args(["-Config", &config_path.to_string_lossy()]);
     }
-    let output = command.output()?;
+    let output = run_cross_agent_supervised(
+        config_path,
+        &command,
+        &format!("scoped-preflight-{}", host.as_str()),
+        Duration::from_secs(65),
+        SupervisedChildKind::McpPreflight,
+    )?;
     if !output.status.success() {
         bail!(
             "{} scoped MCP preflight failed: {}",

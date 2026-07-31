@@ -1,26 +1,32 @@
+use crate::runtime_supervision::{
+    AdapterExecutionContext, CancellationToken, RestartDecision, classify_restart,
+};
 use crate::{
     BlackboardAddInput, BlackboardService, EngineError, MailboxSendInput, MailboxService,
-    WorkState, WriteAdmissionService, WriterHandle,
+    OperationRuntimeHandle, WorkState, WriteAdmissionService, WriterHandle,
 };
 use eliot_store::BlobStore;
 use eliot_types::{
-    AdapterAuthorityProfile, AdapterCapability, AdapterClass, AdapterContext, AdapterError,
-    AdapterHealth, AdapterLimits, AdapterObservation, AdapterRequest, AdapterResult,
+    AdapterAuthorityProfile, AdapterCapability, AdapterCircuitState, AdapterClass, AdapterContext,
+    AdapterError, AdapterHealth, AdapterLimits, AdapterObservation, AdapterRequest, AdapterResult,
     AdapterResultStatus, AdapterState, BlackboardItem, BlackboardItemKind, BlackboardScope,
     CapabilityManifest, CommandContext, ConfidenceLevel, LifecycleStatus, MailboxMessage,
     MailboxMessageKind, MailboxRecipient, ModuleHealth, ModuleManifest, ModuleTransport,
-    ProcessExecutionPolicy, SemanticCommand, ServiceHealthState, TaintClass,
+    OPERATION_RESTART_WINDOW_SCHEMA_VERSION, OPERATION_RUNTIME_CHECKPOINT_SCHEMA_VERSION,
+    OperationCancellationState, OperationPhase, OperationReconciliationState,
+    OperationRestartWindow, OperationRuntimeCheckpoint, ProcessExecutionPolicy,
+    ProviderDispatchState, SemanticCommand, ServiceHealthState, TaintClass,
     ToolObservationRecordCommand, Visibility, WriteId, WriteReceiptRef,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use time::OffsetDateTime;
 use tokio::sync::Semaphore;
-use tokio::time::{Duration, Instant, sleep, timeout};
+use tokio::time::{Duration, Instant, sleep};
 
 pub type BoxAdapterFuture<'a, T> =
     Pin<Box<dyn Future<Output = Result<T, EngineError>> + Send + 'a>>;
@@ -29,7 +35,11 @@ pub trait Adapter: Send + Sync {
     fn id(&self) -> &str;
     fn manifest(&self) -> &CapabilityManifest;
     fn health(&self) -> BoxAdapterFuture<'_, AdapterHealth>;
-    fn execute(&self, request: AdapterRequest) -> BoxAdapterFuture<'_, AdapterResult>;
+    fn execute(
+        &self,
+        request: AdapterRequest,
+        context: AdapterExecutionContext,
+    ) -> BoxAdapterFuture<'_, AdapterResult>;
     fn shutdown(&self) -> BoxAdapterFuture<'_, ()>;
 }
 
@@ -182,6 +192,7 @@ impl Default for AdapterRegistry {
     }
 }
 
+#[derive(Clone)]
 struct CircuitRecord {
     consecutive_failures: u32,
     circuit_open: bool,
@@ -201,21 +212,35 @@ impl Default for CircuitRecord {
 pub struct AdapterSupervisor {
     registry: AdapterRegistry,
     circuits: Arc<Mutex<BTreeMap<String, CircuitRecord>>>,
-    semaphore: Arc<Semaphore>,
+    hydrated_circuits: Arc<Mutex<BTreeSet<String>>>,
+    semaphores: BTreeMap<String, Arc<Semaphore>>,
+    runtime_store: OperationRuntimeHandle,
 }
 
 impl AdapterSupervisor {
     pub fn new(registry: AdapterRegistry) -> Self {
-        let max_concurrency = registry
+        Self::with_runtime(registry, OperationRuntimeHandle::disabled())
+    }
+
+    pub fn with_runtime(registry: AdapterRegistry, runtime_store: OperationRuntimeHandle) -> Self {
+        let semaphores = registry
             .manifests()
             .into_iter()
-            .map(|manifest| manifest.limits.max_concurrent_requests)
-            .max()
-            .unwrap_or(1);
+            .map(|manifest| {
+                (
+                    manifest.adapter_id,
+                    Arc::new(Semaphore::new(
+                        manifest.limits.max_concurrent_requests.max(1),
+                    )),
+                )
+            })
+            .collect();
         Self {
             registry,
             circuits: Arc::new(Mutex::new(BTreeMap::new())),
-            semaphore: Arc::new(Semaphore::new(max_concurrency)),
+            hydrated_circuits: Arc::new(Mutex::new(BTreeSet::new())),
+            semaphores,
+            runtime_store,
         }
     }
 
@@ -253,6 +278,27 @@ impl AdapterSupervisor {
     }
 
     pub async fn health_probe(&self, adapter_id: &str) -> AdapterHealth {
+        if let Err(error) = self.hydrate_circuit(adapter_id).await {
+            let manifest = match self.registry.adapter(adapter_id) {
+                Ok(adapter) => adapter.manifest().clone(),
+                Err(error) => {
+                    return AdapterHealth {
+                        adapter_id: adapter_id.to_owned(),
+                        name: adapter_id.to_owned(),
+                        state: AdapterState::Unavailable,
+                        healthy: false,
+                        message: error.to_string(),
+                        consecutive_failures: 0,
+                        circuit_open: false,
+                        checked_at: OffsetDateTime::now_utc(),
+                    };
+                }
+            };
+            return Self::unavailable_health(
+                &manifest,
+                format!("load durable adapter circuit state: {error}"),
+            );
+        }
         match self.registry.adapter(adapter_id) {
             Ok(adapter) => match adapter.health().await {
                 Ok(mut health) => {
@@ -274,6 +320,10 @@ impl AdapterSupervisor {
         }
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "adapter execution is one ordered supervision transaction with shared cleanup"
+    )]
     pub async fn execute(
         &self,
         adapter_id: &str,
@@ -282,6 +332,7 @@ impl AdapterSupervisor {
     ) -> Result<AdapterResult, EngineError> {
         let adapter = self.registry.adapter(adapter_id)?;
         validate_request(adapter.manifest(), &request)?;
+        self.hydrate_circuit(adapter_id).await?;
         if self.circuit_is_open(adapter_id) {
             return Ok(rejected_result(
                 &request,
@@ -291,47 +342,311 @@ impl AdapterSupervisor {
             ));
         }
 
-        let _permit = self
-            .semaphore
-            .acquire()
-            .await
-            .map_err(|_| EngineError::ServiceNotReady {
-                service: adapter_id.to_owned(),
-                reason: "adapter supervisor semaphore closed".to_owned(),
-            })?;
+        let semaphore = self
+            .semaphores
+            .get(adapter_id)
+            .cloned()
+            .ok_or_else(|| adapter_rejected("adapter semaphore is missing"))?;
+        let Ok(_permit) = semaphore.try_acquire_owned() else {
+            return Ok(rejected_result(
+                &request,
+                AdapterResultStatus::Unavailable,
+                "busy",
+                "adapter concurrency is saturated; retry later",
+            ));
+        };
         let started = Instant::now();
         let timeout_ms = adapter.manifest().limits.timeout_ms;
-        let result = timeout(
-            Duration::from_millis(timeout_ms),
-            adapter.execute(request.clone()),
-        )
-        .await;
-        let mut result = match result {
-            Ok(Ok(result)) => result,
-            Ok(Err(error)) => rejected_result(
-                &request,
-                AdapterResultStatus::Failed,
-                "adapter_error",
-                &error.to_string(),
-            ),
-            Err(_) => rejected_result(
-                &request,
-                AdapterResultStatus::Timeout,
-                "timeout",
-                "adapter execution timed out",
-            ),
+        let deadline = started
+            .checked_add(Duration::from_millis(timeout_ms))
+            .unwrap_or(started);
+        let operation_id = format!("adapter:{}:{}", adapter_id, request.request_id);
+        let cancellation = CancellationToken::new();
+        let generation = request.context.operation_generation.unwrap_or(1);
+        let context = AdapterExecutionContext {
+            operation_id: operation_id.clone(),
+            generation,
+            cancellation: cancellation.clone(),
+            deadline,
+            runtime_store: self.runtime_store.clone(),
+            role_lease_id: request.context.role_lease_id.clone(),
+            role_lease_epoch: request.context.role_lease_epoch,
+            runtime_contract_sha256: request.context.runtime_contract_sha256.clone(),
         };
+        let now = OffsetDateTime::now_utc();
+        let deadline_at =
+            now + time::Duration::milliseconds(i64::try_from(timeout_ms).unwrap_or(i64::MAX));
+        let mut checkpoint = OperationRuntimeCheckpoint {
+            schema_version: OPERATION_RUNTIME_CHECKPOINT_SCHEMA_VERSION.to_owned(),
+            operation_id,
+            invocation_id: Some(request.request_id.clone()),
+            adapter_id: Some(adapter_id.to_owned()),
+            generation,
+            phase: OperationPhase::Prepared,
+            dispatch_state: ProviderDispatchState::NotStarted,
+            cancellation_state: OperationCancellationState::NotRequested,
+            reconciliation_state: OperationReconciliationState::NotRequired,
+            root_pid: None,
+            root_process_start_ticks: None,
+            root_executable_sha256: None,
+            job_object_name: None,
+            active_process_count: 0,
+            stdin_bytes: 0,
+            stdout_bytes: 0,
+            stderr_bytes: 0,
+            phase_started_at: now,
+            last_progress_at: now,
+            phase_deadline_at: deadline_at,
+            absolute_deadline_at: deadline_at,
+            restart_count: 0,
+            restart_window_started_at: None,
+            role_lease_id: context.role_lease_id.clone(),
+            role_lease_epoch: context.role_lease_epoch,
+            runtime_contract_sha256: context.runtime_contract_sha256.clone(),
+            last_error_class: None,
+            last_evidence_refs: Vec::new(),
+        };
+        self.runtime_store
+            .put_checkpoint(checkpoint.clone())
+            .await?;
+        let adapter_future = adapter.execute(request.clone(), context.clone());
+        tokio::pin!(adapter_future);
+        let result = tokio::select! {
+            result = &mut adapter_future => Some(result),
+            () = tokio::time::sleep_until(deadline) => None,
+        };
+        let (mut result, mut timed_out, mut cleanup_completed) = match result {
+            Some(Ok(result)) => (result, false, true),
+            Some(Err(error)) => (
+                rejected_result(
+                    &request,
+                    AdapterResultStatus::Failed,
+                    "adapter_error",
+                    &error.to_string(),
+                ),
+                false,
+                true,
+            ),
+            None => {
+                cancellation.cancel();
+                if let Some(latest) = self
+                    .runtime_store
+                    .get_checkpoint(checkpoint.operation_id.clone())
+                    .await?
+                {
+                    checkpoint = latest;
+                }
+                checkpoint.phase = OperationPhase::Cancelling;
+                checkpoint.cancellation_state = OperationCancellationState::Requested;
+                checkpoint.last_progress_at = OffsetDateTime::now_utc();
+                self.runtime_store
+                    .put_checkpoint(checkpoint.clone())
+                    .await?;
+                let cleanup = adapter_future.await;
+                let cleanup_completed = cancellation.reap_completed();
+                let detail = match (cleanup, cleanup_completed) {
+                    (Ok(_), true) => "adapter execution timed out; cancellation and reap completed",
+                    (Err(_), true) => {
+                        "adapter execution timed out; cancellation reaped the child and returned an error"
+                    }
+                    (Ok(_) | Err(_), false) => {
+                        "adapter execution timed out; process reap receipt is incomplete"
+                    }
+                };
+                (
+                    rejected_result(&request, AdapterResultStatus::Timeout, "timeout", detail),
+                    true,
+                    cleanup_completed,
+                )
+            }
+        };
+        if adapter.manifest().adapter_class == AdapterClass::ExternalCandidate
+            && self.runtime_store.is_enabled()
+            && context.role_lease_id.is_none()
+            && matches!(
+                result.status,
+                AdapterResultStatus::Failed | AdapterResultStatus::Timeout
+            )
+            && let Some(mut persisted) = self
+                .runtime_store
+                .get_checkpoint(checkpoint.operation_id.clone())
+                .await?
+        {
+            match classify_restart(&persisted, None, false) {
+                RestartDecision::RestartFreshGeneration if persisted.restart_count == 0 => {
+                    persisted.generation = persisted.generation.saturating_add(1);
+                    persisted.restart_count = 1;
+                    persisted.phase = OperationPhase::Prepared;
+                    persisted.dispatch_state = ProviderDispatchState::NotStarted;
+                    persisted.cancellation_state = OperationCancellationState::NotRequested;
+                    persisted.reconciliation_state = OperationReconciliationState::NotRequired;
+                    persisted.root_pid = None;
+                    persisted.root_process_start_ticks = None;
+                    persisted.root_executable_sha256 = None;
+                    persisted.job_object_name = None;
+                    persisted.active_process_count = 0;
+                    persisted.stdin_bytes = 0;
+                    persisted.stdout_bytes = 0;
+                    persisted.stderr_bytes = 0;
+                    persisted.last_error_class = Some("pre_dispatch_restart".to_owned());
+                    persisted.last_progress_at = OffsetDateTime::now_utc();
+                    persisted.phase_started_at = persisted.last_progress_at;
+                    self.runtime_store.put_checkpoint(persisted.clone()).await?;
+                    self.persist_safe_restart(adapter_id, "pre_dispatch_transport")
+                        .await?;
+                    sleep(Duration::from_millis(250)).await;
+
+                    let retry_cancellation = CancellationToken::new();
+                    let retry_context = AdapterExecutionContext {
+                        operation_id: checkpoint.operation_id.clone(),
+                        generation: persisted.generation,
+                        cancellation: retry_cancellation.clone(),
+                        deadline,
+                        runtime_store: self.runtime_store.clone(),
+                        role_lease_id: context.role_lease_id.clone(),
+                        role_lease_epoch: context.role_lease_epoch,
+                        runtime_contract_sha256: context.runtime_contract_sha256.clone(),
+                    };
+                    let retry_future = adapter.execute(request.clone(), retry_context);
+                    tokio::pin!(retry_future);
+                    let retry = tokio::select! {
+                        result = &mut retry_future => Some(result),
+                        () = tokio::time::sleep_until(deadline) => None,
+                    };
+                    (result, timed_out, cleanup_completed) = match retry {
+                        Some(Ok(result)) => (result, false, true),
+                        Some(Err(error)) => (
+                            rejected_result(
+                                &request,
+                                AdapterResultStatus::Failed,
+                                "adapter_error",
+                                &error.to_string(),
+                            ),
+                            false,
+                            true,
+                        ),
+                        None => {
+                            retry_cancellation.cancel();
+                            let cleanup = retry_future.await;
+                            let cleanup_completed = retry_cancellation.reap_completed();
+                            let detail = match (cleanup, cleanup_completed) {
+                                (Ok(_), true) => {
+                                    "adapter restart timed out; cancellation and reap completed"
+                                }
+                                (Err(_), true) => {
+                                    "adapter restart timed out; child reaped and returned an error"
+                                }
+                                (Ok(_) | Err(_), false) => {
+                                    "adapter restart timed out; process reap receipt is incomplete"
+                                }
+                            };
+                            (
+                                rejected_result(
+                                    &request,
+                                    AdapterResultStatus::Timeout,
+                                    "timeout",
+                                    detail,
+                                ),
+                                true,
+                                cleanup_completed,
+                            )
+                        }
+                    };
+                    checkpoint = self
+                        .runtime_store
+                        .get_checkpoint(checkpoint.operation_id.clone())
+                        .await?
+                        .unwrap_or(persisted);
+                }
+                RestartDecision::ReconcileBeforeAnyRetry => {
+                    persisted.reconciliation_state = OperationReconciliationState::Pending;
+                    checkpoint = persisted;
+                }
+                RestartDecision::OpenCircuit => {
+                    checkpoint = persisted;
+                    if let Some(record) = self.force_open_circuit(adapter_id) {
+                        self.persist_circuit(adapter_id, &record, result.status)
+                            .await?;
+                    }
+                }
+                RestartDecision::AcceptCapturedTerminalThenReap
+                | RestartDecision::RestartFreshGeneration
+                | RestartDecision::TerminalFailure => {}
+            }
+        }
         result.duration_ms = millis(started.elapsed());
         Self::enforce_output_limit(adapter.manifest(), &mut result, blob_store)?;
-        self.update_circuit(adapter_id, result.status);
+        checkpoint.phase = if result.status == AdapterResultStatus::Succeeded {
+            OperationPhase::Completed
+        } else {
+            OperationPhase::Failed
+        };
+        checkpoint.last_progress_at = OffsetDateTime::now_utc();
+        if timed_out && cleanup_completed {
+            checkpoint.cancellation_state = OperationCancellationState::Reaped;
+        }
+        checkpoint.last_error_class = result.error.as_ref().map(|error| error.code.clone());
+        self.runtime_store.put_checkpoint(checkpoint).await?;
+        if let Some(record) = self.update_circuit(adapter_id, result.status) {
+            self.persist_circuit(adapter_id, &record, result.status)
+                .await?;
+        }
         Ok(result)
     }
 
     pub async fn half_open_probe(&self, adapter_id: &str) -> AdapterHealth {
-        self.set_half_open(adapter_id);
+        if let Err(error) = self.hydrate_circuit(adapter_id).await {
+            return match self.registry.adapter(adapter_id) {
+                Ok(adapter) => Self::unavailable_health(
+                    adapter.manifest(),
+                    format!("load durable adapter circuit state: {error}"),
+                ),
+                Err(_) => AdapterHealth {
+                    adapter_id: adapter_id.to_owned(),
+                    name: adapter_id.to_owned(),
+                    state: AdapterState::Unavailable,
+                    healthy: false,
+                    message: error.to_string(),
+                    consecutive_failures: 0,
+                    circuit_open: false,
+                    checked_at: OffsetDateTime::now_utc(),
+                },
+            };
+        }
+        if let Some(record) = self.set_half_open(adapter_id)
+            && let Err(error) = self
+                .persist_circuit(adapter_id, &record, AdapterResultStatus::Unavailable)
+                .await
+        {
+            return match self.registry.adapter(adapter_id) {
+                Ok(adapter) => Self::unavailable_health(
+                    adapter.manifest(),
+                    format!("persist half-open adapter circuit state: {error}"),
+                ),
+                Err(_) => AdapterHealth {
+                    adapter_id: adapter_id.to_owned(),
+                    name: adapter_id.to_owned(),
+                    state: AdapterState::Unavailable,
+                    healthy: false,
+                    message: error.to_string(),
+                    consecutive_failures: 0,
+                    circuit_open: true,
+                    checked_at: OffsetDateTime::now_utc(),
+                },
+            };
+        }
         let mut health = self.health_probe(adapter_id).await;
         if health.healthy {
-            self.reset_circuit(adapter_id);
+            if let Some(record) = self.reset_circuit(adapter_id)
+                && let Err(error) = self
+                    .persist_circuit(adapter_id, &record, AdapterResultStatus::Succeeded)
+                    .await
+            {
+                health.healthy = false;
+                health.state = AdapterState::Unavailable;
+                health.message = format!("persist closed adapter circuit state: {error}");
+                return health;
+            }
             health.circuit_open = false;
             health.consecutive_failures = 0;
             health.state = AdapterState::Healthy;
@@ -398,9 +713,13 @@ impl AdapterSupervisor {
         Ok(())
     }
 
-    fn update_circuit(&self, adapter_id: &str, status: AdapterResultStatus) {
+    fn update_circuit(
+        &self,
+        adapter_id: &str,
+        status: AdapterResultStatus,
+    ) -> Option<CircuitRecord> {
         let Ok(mut circuits) = self.circuits.lock() else {
-            return;
+            return None;
         };
         let record = circuits.entry(adapter_id.to_owned()).or_default();
         match status {
@@ -424,6 +743,7 @@ impl AdapterSupervisor {
             }
             _ => {}
         }
+        Some(record.clone())
     }
 
     fn circuit_is_open(&self, adapter_id: &str) -> bool {
@@ -441,21 +761,151 @@ impl AdapterSupervisor {
         })
     }
 
-    fn set_half_open(&self, adapter_id: &str) {
-        if let Ok(mut circuits) = self.circuits.lock() {
-            let record = circuits.entry(adapter_id.to_owned()).or_default();
-            record.circuit_open = false;
-            record.state = AdapterState::Degraded;
-        }
+    fn set_half_open(&self, adapter_id: &str) -> Option<CircuitRecord> {
+        let mut circuits = self.circuits.lock().ok()?;
+        let record = circuits.entry(adapter_id.to_owned()).or_default();
+        record.circuit_open = false;
+        record.state = AdapterState::Degraded;
+        Some(record.clone())
     }
 
-    fn reset_circuit(&self, adapter_id: &str) {
-        if let Ok(mut circuits) = self.circuits.lock() {
-            let record = circuits.entry(adapter_id.to_owned()).or_default();
-            record.consecutive_failures = 0;
-            record.circuit_open = false;
-            record.state = AdapterState::Healthy;
+    fn force_open_circuit(&self, adapter_id: &str) -> Option<CircuitRecord> {
+        let mut circuits = self.circuits.lock().ok()?;
+        let record = circuits.entry(adapter_id.to_owned()).or_default();
+        record.circuit_open = true;
+        record.state = AdapterState::CircuitOpen;
+        Some(record.clone())
+    }
+
+    async fn hydrate_circuit(&self, adapter_id: &str) -> Result<(), EngineError> {
+        if self
+            .hydrated_circuits
+            .lock()
+            .is_ok_and(|hydrated| hydrated.contains(adapter_id))
+        {
+            return Ok(());
         }
+        let window = self.runtime_store.load_restart_window(adapter_id).await?;
+        if let Some(window) = window {
+            let state = match window.circuit_state {
+                AdapterCircuitState::Closed if window.consecutive_failures == 0 => {
+                    AdapterState::Healthy
+                }
+                AdapterCircuitState::Closed | AdapterCircuitState::HalfOpen => {
+                    AdapterState::Degraded
+                }
+                AdapterCircuitState::Open => AdapterState::CircuitOpen,
+            };
+            let mut circuits = self
+                .circuits
+                .lock()
+                .map_err(|_| adapter_rejected("adapter circuit state lock is poisoned"))?;
+            circuits.insert(
+                adapter_id.to_owned(),
+                CircuitRecord {
+                    consecutive_failures: window.consecutive_failures,
+                    circuit_open: window.circuit_state == AdapterCircuitState::Open,
+                    state,
+                },
+            );
+        }
+        self.hydrated_circuits
+            .lock()
+            .map_err(|_| adapter_rejected("adapter circuit hydration lock is poisoned"))?
+            .insert(adapter_id.to_owned());
+        Ok(())
+    }
+
+    fn reset_circuit(&self, adapter_id: &str) -> Option<CircuitRecord> {
+        let mut circuits = self.circuits.lock().ok()?;
+        let record = circuits.entry(adapter_id.to_owned()).or_default();
+        record.consecutive_failures = 0;
+        record.circuit_open = false;
+        record.state = AdapterState::Healthy;
+        Some(record.clone())
+    }
+
+    async fn persist_circuit(
+        &self,
+        adapter_id: &str,
+        record: &CircuitRecord,
+        status: AdapterResultStatus,
+    ) -> Result<(), EngineError> {
+        let now = OffsetDateTime::now_utc();
+        let now_epoch = now.unix_timestamp();
+        let mut window = self
+            .runtime_store
+            .load_restart_window(adapter_id)
+            .await?
+            .unwrap_or_else(|| OperationRestartWindow {
+                schema_version: OPERATION_RESTART_WINDOW_SCHEMA_VERSION.to_owned(),
+                key: adapter_id.to_owned(),
+                restart_timestamps: Vec::new(),
+                circuit_state: AdapterCircuitState::Closed,
+                consecutive_failures: 0,
+                last_failure_class: None,
+                updated_at: now_epoch.to_string(),
+            });
+        window.restart_timestamps.retain(|timestamp| {
+            timestamp
+                .parse::<i64>()
+                .is_ok_and(|observed| observed >= now_epoch.saturating_sub(60))
+        });
+        match status {
+            AdapterResultStatus::Failed | AdapterResultStatus::Timeout => {
+                window.restart_timestamps.push(now_epoch.to_string());
+                window.last_failure_class = Some(format!("{status:?}").to_ascii_lowercase());
+            }
+            AdapterResultStatus::Succeeded => {
+                window.last_failure_class = None;
+            }
+            _ => {}
+        }
+        window.consecutive_failures = record.consecutive_failures;
+        window.circuit_state = if record.circuit_open {
+            AdapterCircuitState::Open
+        } else if record.state == AdapterState::Degraded
+            && !matches!(
+                status,
+                AdapterResultStatus::Failed | AdapterResultStatus::Timeout
+            )
+        {
+            AdapterCircuitState::HalfOpen
+        } else {
+            AdapterCircuitState::Closed
+        };
+        window.updated_at = now_epoch.to_string();
+        self.runtime_store.put_restart_window(window).await
+    }
+
+    async fn persist_safe_restart(
+        &self,
+        adapter_id: &str,
+        reason: &str,
+    ) -> Result<(), EngineError> {
+        let now = OffsetDateTime::now_utc().unix_timestamp();
+        let mut window = self
+            .runtime_store
+            .load_restart_window(adapter_id)
+            .await?
+            .unwrap_or_else(|| OperationRestartWindow {
+                schema_version: OPERATION_RESTART_WINDOW_SCHEMA_VERSION.to_owned(),
+                key: adapter_id.to_owned(),
+                restart_timestamps: Vec::new(),
+                circuit_state: AdapterCircuitState::Closed,
+                consecutive_failures: 0,
+                last_failure_class: None,
+                updated_at: now.to_string(),
+            });
+        window.restart_timestamps.retain(|timestamp| {
+            timestamp
+                .parse::<i64>()
+                .is_ok_and(|observed| observed >= now.saturating_sub(60))
+        });
+        window.restart_timestamps.push(now.to_string());
+        window.last_failure_class = Some(reason.to_owned());
+        window.updated_at = now.to_string();
+        self.runtime_store.put_restart_window(window).await
     }
 }
 
@@ -612,6 +1062,10 @@ pub fn test_request(adapter_id: &str, capability: AdapterCapability) -> AdapterR
             session_id: None,
             trace_id: uuid_like("trace"),
             created_at: OffsetDateTime::now_utc(),
+            role_lease_id: None,
+            role_lease_epoch: None,
+            operation_generation: None,
+            runtime_contract_sha256: None,
         },
         input: json!({ "mode": "test" }),
     }
@@ -657,7 +1111,11 @@ impl Adapter for HealthAdapter {
         Box::pin(async move { Ok(healthy(&self.manifest, "health adapter available")) })
     }
 
-    fn execute(&self, request: AdapterRequest) -> BoxAdapterFuture<'_, AdapterResult> {
+    fn execute(
+        &self,
+        request: AdapterRequest,
+        _context: AdapterExecutionContext,
+    ) -> BoxAdapterFuture<'_, AdapterResult> {
         Box::pin(async move {
             Ok(success_result(
                 &request,
@@ -713,7 +1171,11 @@ impl Adapter for TestEchoAdapter {
         Box::pin(async move { Ok(healthy(&self.manifest, "test echo adapter available")) })
     }
 
-    fn execute(&self, request: AdapterRequest) -> BoxAdapterFuture<'_, AdapterResult> {
+    fn execute(
+        &self,
+        request: AdapterRequest,
+        _context: AdapterExecutionContext,
+    ) -> BoxAdapterFuture<'_, AdapterResult> {
         Box::pin(async move {
             Ok(success_result(
                 &request,
@@ -734,7 +1196,7 @@ pub struct TestFailingAdapter {
 impl TestFailingAdapter {
     pub fn new() -> Self {
         let limits = AdapterLimits {
-            circuit_breaker_failures: 2,
+            circuit_breaker_failures: 5,
             ..AdapterLimits::default()
         };
         Self {
@@ -771,7 +1233,11 @@ impl Adapter for TestFailingAdapter {
         Box::pin(async move { Ok(healthy(&self.manifest, "test failing adapter registered")) })
     }
 
-    fn execute(&self, request: AdapterRequest) -> BoxAdapterFuture<'_, AdapterResult> {
+    fn execute(
+        &self,
+        request: AdapterRequest,
+        _context: AdapterExecutionContext,
+    ) -> BoxAdapterFuture<'_, AdapterResult> {
         Box::pin(async move {
             Ok(rejected_result(
                 &request,
@@ -831,10 +1297,25 @@ impl Adapter for TestSlowAdapter {
         Box::pin(async move { Ok(healthy(&self.manifest, "test slow adapter registered")) })
     }
 
-    fn execute(&self, request: AdapterRequest) -> BoxAdapterFuture<'_, AdapterResult> {
+    fn execute(
+        &self,
+        request: AdapterRequest,
+        context: AdapterExecutionContext,
+    ) -> BoxAdapterFuture<'_, AdapterResult> {
         Box::pin(async move {
-            sleep(Duration::from_millis(250)).await;
-            Ok(success_result(&request, json!({ "slow": true })))
+            tokio::select! {
+                () = sleep(Duration::from_millis(250)) => {
+                    Ok(success_result(&request, json!({ "slow": true })))
+                }
+                () = context.cancellation.cancelled() => {
+                    Ok(rejected_result(
+                        &request,
+                        AdapterResultStatus::Timeout,
+                        "cancelled",
+                        "test adapter observed cancellation",
+                    ))
+                }
+            }
         })
     }
 
@@ -892,7 +1373,11 @@ impl Adapter for TestLargeOutputAdapter {
         })
     }
 
-    fn execute(&self, request: AdapterRequest) -> BoxAdapterFuture<'_, AdapterResult> {
+    fn execute(
+        &self,
+        request: AdapterRequest,
+        _context: AdapterExecutionContext,
+    ) -> BoxAdapterFuture<'_, AdapterResult> {
         Box::pin(async move {
             Ok(success_result(
                 &request,
