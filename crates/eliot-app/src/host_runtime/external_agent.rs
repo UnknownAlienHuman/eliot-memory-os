@@ -1716,7 +1716,7 @@ impl ExternalAgentAdapterCore {
             let runtime_store =
                 super::supervised_process::daemon_operation_runtime_handle_for_instance(
                     &self.config_path,
-                    None,
+                    Some(DEFAULT_INSTANCE_NAME),
                 )
                 .map_err(anyhow_engine)?;
             let runtime_integrity =
