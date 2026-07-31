@@ -972,16 +972,18 @@ pub async fn run_runtime_supervision_reconcile(
     dry_run: bool,
     instance: Option<&str>,
 ) -> Result<()> {
-    if !dry_run {
-        bail!("runtime supervision reconcile is controller-owned and currently requires --dry-run");
-    }
     let runtime_store =
         crate::host_runtime::supervised_process::daemon_operation_runtime_handle_for_instance(
             config_path,
             instance,
         )?;
-    let report =
-        crate::runtime_integrity::reconcile_dry_run(config_path, &runtime_store).await?;
+    let report = if dry_run {
+        serde_json::to_value(
+            crate::runtime_integrity::reconcile_dry_run(config_path, &runtime_store).await?,
+        )?
+    } else {
+        crate::runtime_integrity::reconcile_apply(config_path, &runtime_store, instance).await?
+    };
     write_json(&report)
 }
 

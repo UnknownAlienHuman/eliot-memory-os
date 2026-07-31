@@ -16,17 +16,17 @@ use eliot_engine::{
 use eliot_store::{CanonicalStore, CanonicalToolObservation};
 use eliot_types::{
     AgentCapabilityEnvelope, AgentHostId, AgentId, AgentInvocationRequest, AgentResultEnvelope,
-    AgentResultStatus, AgentRole, AgentSessionHostBinding, AgentSessionId, AgentSessionStatus,
-    AuthorityLeaseLifetime, AuthorityLeaseState, ClaudeSurface, CommandContext, DelegationState,
-    ExternalAgentPurpose, HostIntegrationReceipt, HostLaunchScope, HostMode, HostProfileStatus,
-    LifecycleStatus, MAX_SECRET_BOUNDARY_BYTES, OPERATION_AUTHORITY_SCHEMA_VERSION,
-    OperationAuthorityCloseReceipt, OperationAuthorityCloseRequest, OperationAuthorityOpenReceipt,
-    OperationAuthorityOpenRequest, OperationAuthorityTerminalOutcome, OperationJob,
-    OperationJobState, OperationPhase, ProjectId, SecretBoundaryRule, SemanticCommand,
-    SemanticCommandKind, SessionId, TaintClass, TaskContract, TaskContractStatus, TaskId,
-    ToolObservationRecordCommand, Visibility, WorkItemId, WorkLease, WorkLeaseId, WorktreeLease,
-    WorktreeLeaseId, WorktreeLeaseState, WriteId, WriteReceipt, WriteReceiptRef, WriteStatus,
-    inspect_secret_bytes,
+    AgentResultStatus, AgentRole, AgentSessionHostBinding, AgentSessionId, AgentSessionState,
+    AgentSessionStatus, AuthorityLeaseLifetime, AuthorityLeaseState, ClaudeSurface, CommandContext,
+    DelegationState, ExternalAgentPurpose, HostIntegrationReceipt, HostLaunchScope, HostMode,
+    HostProfileStatus, LifecycleStatus, MAX_SECRET_BOUNDARY_BYTES,
+    OPERATION_AUTHORITY_SCHEMA_VERSION, OperationAuthorityCloseReceipt,
+    OperationAuthorityCloseRequest, OperationAuthorityOpenReceipt, OperationAuthorityOpenRequest,
+    OperationAuthorityTerminalOutcome, OperationJob, OperationJobState, OperationPhase, ProjectId,
+    SecretBoundaryRule, SemanticCommand, SemanticCommandKind, SessionId, TaintClass, TaskContract,
+    TaskContractStatus, TaskId, TaskRoleLease, ToolObservationRecordCommand, Visibility,
+    WorkItemId, WorkLease, WorkLeaseId, WorktreeLease, WorktreeLeaseId, WorktreeLeaseState,
+    WriteId, WriteReceipt, WriteReceiptRef, WriteStatus, inspect_secret_bytes,
 };
 use jsonc_parser::{
     ParseOptions,

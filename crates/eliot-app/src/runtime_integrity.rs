@@ -67,6 +67,112 @@ fn authority_owner_issue(
     }
 }
 
+fn terminal_authority_outcome(
+    state: OperationJobState,
+) -> Option<OperationAuthorityTerminalOutcome> {
+    match state {
+        OperationJobState::Completed => Some(OperationAuthorityTerminalOutcome::Completed),
+        OperationJobState::Failed | OperationJobState::Abandoned => {
+            Some(OperationAuthorityTerminalOutcome::FailedAfterDispatch)
+        }
+        OperationJobState::TimedOut => Some(OperationAuthorityTerminalOutcome::TimedOut),
+        OperationJobState::Cancelled => Some(OperationAuthorityTerminalOutcome::Cancelled),
+        OperationJobState::UnknownOutcome | OperationJobState::Reconciled => {
+            Some(OperationAuthorityTerminalOutcome::ReconciledUnknown)
+        }
+        OperationJobState::Queued | OperationJobState::Running => None,
+    }
+}
+
+fn partial_operation_close_requests(
+    root: &Path,
+    broker: &eliot_types::DelegationState,
+) -> Result<Vec<OperationAuthorityCloseRequest>> {
+    let mut requests = Vec::new();
+    for lease in broker.task_role_leases.iter().filter(|lease| {
+        lease.lifetime == AuthorityLeaseLifetime::OperationBound
+            && lease.state == AuthorityLeaseState::Revoked
+    }) {
+        let Some(operation_id) = lease.owner_operation_id.as_deref() else {
+            continue;
+        };
+        let Some(job) = broker.operation_jobs.iter().find(|job| {
+            job.job_id == operation_id
+                && job.invocation_id == operation_id
+                && job.generation == lease.generation
+                && job.role_lease_id.as_deref() == Some(lease.role_lease_id.as_str())
+                && job.role_lease_epoch == Some(lease.epoch)
+        }) else {
+            continue;
+        };
+        let Some(terminal_outcome) = terminal_authority_outcome(job.state) else {
+            continue;
+        };
+        let Some(binding) = broker.agent_host_sessions.iter().find(|binding| {
+            binding.agent_session_id == lease.agent_session_id
+                && binding.generation == lease.generation
+                && binding.state == AgentSessionState::Retired
+                && binding.bound_task_id == Some(lease.task_id)
+        }) else {
+            continue;
+        };
+        let authority_path = root
+            .join("reports")
+            .join("role-lease-authority")
+            .join(format!(
+                "{}.json",
+                blake3::hash(lease.role_lease_id.as_bytes()).to_hex()
+            ));
+        let authority: Value =
+            serde_json::from_slice(&std::fs::read(&authority_path).with_context(|| {
+                format!(
+                    "read operation close authority projection {}",
+                    authority_path.display()
+                )
+            })?)?;
+        let close_complete = [
+            "canonical_revoked_role_receipt",
+            "canonical_retired_binding_receipt",
+            "canonical_terminal_job_receipt",
+        ]
+        .iter()
+        .all(|field| authority.get(*field).is_some_and(|value| !value.is_null()));
+        if close_complete {
+            continue;
+        }
+        let purpose: ExternalAgentPurpose = serde_json::from_value(
+            authority
+                .get("purpose")
+                .cloned()
+                .context("partial operation close has no typed purpose")?,
+        )?;
+        let project_id = binding
+            .bound_project_id
+            .context("partial operation close binding has no project")?;
+        let close_idempotency_key = authority
+            .get("close_idempotency_key")
+            .and_then(Value::as_str)
+            .map_or_else(|| format!("{}:close", job.idempotency_key), str::to_owned);
+        requests.push(OperationAuthorityCloseRequest {
+            schema_version: OPERATION_AUTHORITY_SCHEMA_VERSION.to_owned(),
+            operation_id: operation_id.to_owned(),
+            purpose,
+            generation: lease.generation,
+            project_id,
+            task_id: lease.task_id,
+            agent_session_id: lease.agent_session_id,
+            role_lease_id: lease.role_lease_id.clone(),
+            expected_epoch: lease.epoch,
+            terminal_outcome,
+            result_or_failure_ref: job.result_ref.clone(),
+            reason: "typed_partial_operation_close_reconciliation".to_owned(),
+            idempotency_key: close_idempotency_key,
+        });
+    }
+    requests.sort_by(|left, right| left.operation_id.cmp(&right.operation_id));
+    Ok(requests)
+}
+
 #[allow(
     clippy::too_many_lines,
     reason = "one read-only integrity snapshot keeps cross-section counts and decisions consistent"
@@ -80,6 +186,7 @@ pub(crate) async fn inspect(
     let now = OffsetDateTime::now_utc();
     let root = crate::delegation_runtime::root_from_config(config_path);
     let broker = crate::delegation_runtime::load_state(&root)?;
+    let partial_operation_closes = partial_operation_close_requests(&root, &broker)?;
     let checkpoints = runtime_store.list_nonterminal_checkpoints().await?;
     let staging = runtime_store.load_incomplete_seal_staging().await?;
     let recovery_cursor = runtime_store.recovery_cursor().await?;
@@ -149,7 +256,8 @@ pub(crate) async fn inspect(
             checkpoint.active_process_count > 0
                 && checkpoint.cancellation_state != OperationCancellationState::NotRequested
         })
-        .count();
+        .count()
+        + partial_operation_closes.len();
     let orphan_processes = checkpoints
         .iter()
         .filter(|checkpoint| {
@@ -169,7 +277,8 @@ pub(crate) async fn inspect(
                 .filter(|checkpoint| {
                     checkpoint.reconciliation_state == OperationReconciliationState::Pending
                 })
-                .count(),
+                .count()
+                + partial_operation_closes.len(),
         ),
         cleanup_pending: usize_to_u32(cleanup_pending),
         orphan_processes,
@@ -290,6 +399,9 @@ pub(crate) async fn inspect(
     }
     if operations.orphan_processes > 0 || operations.cleanup_pending > 0 {
         integrity_errors.push("orphan_or_cleanup_processes".to_owned());
+    }
+    if !partial_operation_closes.is_empty() {
+        integrity_errors.push("partial_operation_close_canonical_proof".to_owned());
     }
     if operations.awaiting_reconciliation > 0 {
         integrity_errors.push("operations_awaiting_reconciliation".to_owned());
@@ -438,6 +550,15 @@ pub(crate) async fn reconcile_dry_run(
             });
         }
     }
+    for close in partial_operation_close_requests(&root, &broker)? {
+        decisions.push(RuntimeReconcileDecision {
+            operation_id: close.operation_id,
+            generation: close.generation,
+            decision: "retry_operation_close_canonical_proof".to_owned(),
+            mutates: false,
+            reason: "local_fence_present_canonical_close_incomplete".to_owned(),
+        });
+    }
     decisions.sort_by(|left, right| {
         left.operation_id
             .cmp(&right.operation_id)
@@ -451,6 +572,40 @@ pub(crate) async fn reconcile_dry_run(
         provider_calls: 0,
         writes: 0,
     })
+}
+
+pub(crate) async fn reconcile_apply(
+    config_path: &Path,
+    runtime_store: &OperationRuntimeHandle,
+    instance: Option<&str>,
+) -> Result<Value> {
+    let root = crate::delegation_runtime::root_from_config(config_path);
+    let broker = crate::delegation_runtime::load_state(&root)?;
+    let requests = partial_operation_close_requests(&root, &broker)?;
+    let governor_instance = crate::host_runtime::host_governor_instance(config_path)?;
+    let mut close_receipts = Vec::new();
+    for close in requests {
+        let response = crate::named_pipe_ipc::host_governor_request(
+            &governor_instance,
+            "host/operation-scope-close",
+            serde_json::to_value(close)?,
+        )
+        .await
+        .context("reconcile partial operation close through daemon-owned WriterActor")?;
+        close_receipts.push(response);
+    }
+    let status = inspect(config_path, runtime_store, true, instance).await?;
+    persist_report(config_path, &status)?;
+    Ok(json!({
+        "schema_version": "eliot-runtime-reconcile-apply-v1",
+        "generated_at": OffsetDateTime::now_utc(),
+        "dry_run": false,
+        "provider_calls": 0,
+        "raw_state_edits": 0,
+        "canonical_close_receipts": close_receipts,
+        "provider_dispatch_safe": status.provider_dispatch_safe,
+        "runtime_integrity_clean": status.runtime_integrity.clean,
+    }))
 }
 
 #[allow(clippy::too_many_lines)]

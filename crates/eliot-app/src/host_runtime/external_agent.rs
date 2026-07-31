@@ -2598,6 +2598,13 @@ async fn enqueue_external_agent_broker_invocation(
         &profile,
         work_lease_active,
     )?;
+    // The private observation RPC validates managed job authority against the
+    // daemon-owned projection. Publish the adopted invocation/job projection
+    // before asking WriterActor for canonical receipts; otherwise the daemon
+    // can only see the pre-adoption owner shell and correctly rejects the
+    // running-job observation as unbound. A later canonical-write failure is
+    // still fenced by the operation-scope close path and is never dispatchable.
+    engine_anyhow(delegation_runtime::save_host_broker_state(&root, &state))?;
     super::managed::write_canonical_managed_invocation_request(
         config_path,
         &state,
@@ -2608,7 +2615,6 @@ async fn enqueue_external_agent_broker_invocation(
     super::managed::write_canonical_managed_job(config_path, &state, &job)
         .await
         .map_err(anyhow_engine)?;
-    engine_anyhow(delegation_runtime::save_host_broker_state(&root, &state))?;
     Ok(job.job_id)
 }
 
