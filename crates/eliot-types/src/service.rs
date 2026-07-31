@@ -41,6 +41,10 @@ pub struct ServiceRestartPolicy {
     pub max_restarts_per_window: u32,
     pub window_seconds: u64,
     pub backoff_seconds: u64,
+    #[serde(default)]
+    pub restart_delays_seconds: Vec<u64>,
+    #[serde(default)]
+    pub reset_period_seconds: u64,
     pub open_incident_on_exhaustion: bool,
 }
 
@@ -48,9 +52,11 @@ impl Default for ServiceRestartPolicy {
     fn default() -> Self {
         Self {
             enabled: true,
-            max_restarts_per_window: 1,
-            window_seconds: 900,
-            backoff_seconds: 30,
+            max_restarts_per_window: 2,
+            window_seconds: 86_400,
+            backoff_seconds: 5,
+            restart_delays_seconds: vec![5, 30],
+            reset_period_seconds: 86_400,
             open_incident_on_exhaustion: true,
         }
     }
@@ -335,4 +341,19 @@ pub struct CredentialStatus {
     pub present: bool,
     pub version: Option<String>,
     pub fingerprint: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ServiceRestartPolicy;
+
+    #[test]
+    fn governor_scm_restart_policy_is_two_attempts_then_stop_with_daily_reset() {
+        let policy = ServiceRestartPolicy::default();
+        assert!(policy.enabled);
+        assert_eq!(policy.max_restarts_per_window, 2);
+        assert_eq!(policy.restart_delays_seconds, [5, 30]);
+        assert_eq!(policy.reset_period_seconds, 86_400);
+        assert!(policy.open_incident_on_exhaustion);
+    }
 }

@@ -839,6 +839,16 @@ fn validate_service_config(config: &WindowsServiceConfig) -> (Vec<String>, Vec<S
     if config.restart_policy.enabled && config.restart_policy.backoff_seconds == 0 {
         warnings.push("restart policy backoff is zero; H1 recommends bounded backoff".to_owned());
     }
+    if config.restart_policy.enabled
+        && (config.restart_policy.max_restarts_per_window != 2
+            || config.restart_policy.restart_delays_seconds != [5, 30]
+            || config.restart_policy.reset_period_seconds != 86_400)
+    {
+        errors.push(
+            "Governor SCM recovery must be bounded to 5s, 30s, then stop with a 24h reset"
+                .to_owned(),
+        );
+    }
     (warnings, errors)
 }
 

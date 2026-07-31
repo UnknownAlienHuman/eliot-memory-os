@@ -14,6 +14,7 @@ mod named_pipe_ipc;
 mod provider_budget_runtime;
 mod runtime_bootstrap;
 mod runtime_instance;
+mod runtime_integrity;
 mod security_scan;
 mod ul_cross_agent_runner;
 mod windows_service;
@@ -1378,6 +1379,19 @@ enum RuntimeCommand {
     Status,
     Health,
     Report,
+    Supervision {
+        #[command(subcommand)]
+        command: RuntimeSupervisionCommand,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Subcommand)]
+enum RuntimeSupervisionCommand {
+    Status,
+    Reconcile {
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -1997,7 +2011,9 @@ async fn dispatch_command(
             DogfoodCommand::RunCodex { root } => dogfood::run_codex(&root).await,
             DogfoodCommand::Stop { root } => dogfood::stop(&root).await,
         },
-        Command::Doctor { command } => dispatch_doctor_command(config, command).await,
+        Command::Doctor { command } => {
+            dispatch_doctor_command(config, command, implicit_instance).await
+        }
         Command::DataRoot { command } => dispatch_data_root_command(config, command),
         Command::Backup { command } => dispatch_backup_command(config, command),
         Command::Restore { command } => dispatch_restore_command(config, command),
@@ -2318,7 +2334,9 @@ async fn dispatch_command(
         Command::Mailbox { command } => dispatch_mailbox_command(config, command).await,
         Command::Recovery { command } => dispatch_recovery_command(config, command).await,
         Command::Collective { command } => dispatch_collective_command(config, command).await,
-        Command::Runtime { command } => dispatch_runtime_command(config, command),
+        Command::Runtime { command } => {
+            dispatch_runtime_command(config, command, implicit_instance).await
+        }
         Command::Module { command } => dispatch_module_command(config, command),
         Command::Logs { command } => dispatch_logs_command(config, command),
         Command::Adapter { command } => dispatch_adapter_command(config, command).await,
@@ -2939,11 +2957,17 @@ async fn dispatch_skill_curator_command(config: &Path, command: SkillCuratorComm
     }
 }
 
-async fn dispatch_doctor_command(config: &Path, command: DoctorCommand) -> Result<()> {
+async fn dispatch_doctor_command(
+    config: &Path,
+    command: DoctorCommand,
+    implicit_instance: Option<&str>,
+) -> Result<()> {
     match command {
         DoctorCommand::Run { offline } => commands::run_doctor_command(config, offline).await,
         DoctorCommand::Report => commands::run_doctor_report(config),
-        DoctorCommand::Operations => commands::run_operations_doctor(config),
+        DoctorCommand::Operations => {
+            commands::run_operations_doctor(config, implicit_instance).await
+        }
     }
 }
 
@@ -3213,11 +3237,21 @@ async fn dispatch_collective_command(config: &Path, command: CollectiveCommand) 
     }
 }
 
-fn dispatch_runtime_command(config: &Path, command: RuntimeCommand) -> Result<()> {
+async fn dispatch_runtime_command(
+    config: &Path,
+    command: RuntimeCommand,
+    implicit_instance: Option<&str>,
+) -> Result<()> {
     match command {
         RuntimeCommand::Status => commands::run_runtime_status(config),
         RuntimeCommand::Health => commands::run_runtime_health(config),
         RuntimeCommand::Report => commands::run_runtime_report(config),
+        RuntimeCommand::Supervision {
+            command: RuntimeSupervisionCommand::Status,
+        } => commands::run_runtime_supervision_status(config, implicit_instance).await,
+        RuntimeCommand::Supervision {
+            command: RuntimeSupervisionCommand::Reconcile { dry_run },
+        } => commands::run_runtime_supervision_reconcile(config, dry_run, implicit_instance).await,
     }
 }
 

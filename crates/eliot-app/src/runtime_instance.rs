@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest as _, Sha256};
 use std::fmt;
 use std::fs;
 use std::io::Write as _;
@@ -37,6 +38,8 @@ pub(crate) struct RuntimePublication {
     pub daemon_pid: u32,
     pub process_start_identity: String,
     pub executable: PathBuf,
+    #[serde(default)]
+    pub executable_sha256: String,
     pub config_path: PathBuf,
     pub store_root: PathBuf,
     pub publication_root: PathBuf,
@@ -153,6 +156,7 @@ impl RuntimeInstance {
             .context("resolve current Eliot executable")?
             .canonicalize()
             .unwrap_or_else(|_| std::env::current_exe().unwrap_or_default());
+        let executable_sha256 = sha256_file(&executable)?;
         let published_at = time::OffsetDateTime::now_utc().to_string();
         Ok(RuntimePublication {
             schema_version: PUBLICATION_SCHEMA_VERSION.to_owned(),
@@ -169,6 +173,7 @@ impl RuntimeInstance {
                 published_at
             ),
             executable,
+            executable_sha256,
             config_path: absolute_path(config_path),
             store_root: absolute_path(store_root),
             publication_root: absolute_path(&self.publication_root),
@@ -331,6 +336,8 @@ impl RuntimeInstance {
                 .process_start_identity
                 .contains(&publication.runtime_id)
             || !publication.executable.is_absolute()
+            || (!publication.executable_sha256.is_empty()
+                && publication.executable_sha256.len() != 64)
             || !publication.config_path.is_absolute()
             || !publication.store_root.is_absolute()
         {
@@ -338,6 +345,20 @@ impl RuntimeInstance {
                 RuntimeDiscoveryErrorCode::PublicationIdentityInvalid,
                 "runtime identity, PID, executable, config, or store root is invalid".to_owned(),
             ));
+        }
+        if !publication.executable_sha256.is_empty() {
+            let observed = sha256_file(&publication.executable).map_err(|error| {
+                mismatch(
+                    RuntimeDiscoveryErrorCode::PublicationIdentityInvalid,
+                    format!("cannot hash published runtime executable: {error:#}"),
+                )
+            })?;
+            if observed != publication.executable_sha256 {
+                return Err(mismatch(
+                    RuntimeDiscoveryErrorCode::PublicationIdentityInvalid,
+                    "runtime executable SHA-256 differs from its publication".to_owned(),
+                ));
+            }
         }
         if path_identity(&publication.auth_ref) != path_identity(&self.authentication_path()) {
             return Err(mismatch(
@@ -351,6 +372,12 @@ impl RuntimeInstance {
         }
         Ok(())
     }
+}
+
+pub(crate) fn sha256_file(path: &Path) -> Result<String> {
+    let bytes = fs::read(path)
+        .with_context(|| format!("read executable for SHA-256: {}", path.display()))?;
+    Ok(format!("{:x}", Sha256::digest(bytes)))
 }
 
 pub(crate) fn default_config_path() -> Result<PathBuf> {

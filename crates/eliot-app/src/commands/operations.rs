@@ -14,10 +14,31 @@ pub fn run_doctor_report(config_path: &Path) -> Result<()> {
     read_or_generate_doctor_report(config_path).and_then(|report| write_json(&report))
 }
 
-pub fn run_operations_doctor(config_path: &Path) -> Result<()> {
+pub async fn run_operations_doctor(config_path: &Path, instance: Option<&str>) -> Result<()> {
     let root = runtime_root(config_path);
     let surreal = surreal_logical_config(config_path)?;
-    let report = DoctorService::new(&root, repo_root()).operations_report(&surreal)?;
+    let safety = DoctorService::new(&root, repo_root()).operations_report(&surreal)?;
+    let runtime_store =
+        crate::host_runtime::supervised_process::daemon_operation_runtime_handle_for_instance(
+            config_path,
+            instance,
+        )?;
+    let runtime =
+        crate::runtime_integrity::inspect(config_path, &runtime_store, true, instance).await?;
+    let report = serde_json::json!({
+        "component": "operations_doctor",
+        "read_only": true,
+        "safety": safety,
+        "core": runtime.core,
+        "adapters": runtime.adapters,
+        "operations": runtime.operations,
+        "authority_integrity": runtime.authority_integrity,
+        "runtime_integrity": runtime.runtime_integrity,
+        "overall": runtime.overall,
+        "reason": runtime.reason,
+        "provider_dispatch_safe": runtime.provider_dispatch_safe,
+        "integrity_errors": runtime.integrity_errors,
+    });
     write_safety_report(&root, "operations-doctor", "Operations Doctor", &report)?;
     write_json(&report)
 }
@@ -545,6 +566,7 @@ async fn run_daemon_instance(config_path: &Path, instance: &RuntimeInstance) -> 
         &data_root,
         &store_root,
         database_started_pid,
+        Duration::from_millis(config.supervision.watchdog_interval_ms),
     )
     .await;
     let database_result = match database {
@@ -575,12 +597,17 @@ async fn run_daemon_instance(config_path: &Path, instance: &RuntimeInstance) -> 
     }
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "daemon publication keeps startup gating, watchdog ownership, services, and cleanup in one lifecycle transaction"
+)]
 async fn run_published_daemon(
     config_path: &Path,
     instance: &RuntimeInstance,
     data_root: &Path,
     store_root: &Path,
     database_started_pid: Option<u32>,
+    operation_watchdog_interval: Duration,
 ) -> Result<bool> {
     let stop_marker = instance.stop_marker();
     async {
@@ -589,6 +616,51 @@ async fn run_published_daemon(
         let starting_publication =
             instance.read_publication_any_state(named_pipe_ipc::IPC_PROTOCOL_VERSION)?;
         let mcp_daemon = mcp_stdio::McpDaemon::new(config_path, instance, &starting_publication)?;
+        let operation_watchdog_shutdown =
+            eliot_engine::runtime_supervision::CancellationToken::new();
+        let operation_supervisor = std::sync::Arc::new(
+            eliot_engine::runtime_supervision::OperationSupervisor::new(
+                mcp_daemon.operation_runtime_handle(),
+            ),
+        );
+        let operation_watchdog_runtime = mcp_daemon.operation_runtime_handle();
+        let startup_integrity = crate::runtime_integrity::startup_recover_and_report(
+            config_path,
+            &operation_watchdog_runtime,
+            instance
+                .standalone()
+                .then_some(instance.name()),
+        )
+        .await?;
+        tracing::info!(
+            overall = ?startup_integrity.overall,
+            provider_dispatch_safe = startup_integrity.provider_dispatch_safe,
+            "startup runtime integrity gate passed"
+        );
+        let operation_watchdog = std::sync::Arc::clone(&operation_supervisor);
+        let operation_watchdog_shutdown_task = operation_watchdog_shutdown.clone();
+        let operation_watchdog_task = tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    () = operation_watchdog_shutdown_task.cancelled() => {
+                        return Ok::<(), anyhow::Error>(());
+                    }
+                    () = tokio::time::sleep(operation_watchdog_interval) => {
+                        let now = time::OffsetDateTime::now_utc();
+                        if let Err(error) = operation_watchdog.watchdog_once(now).await {
+                            tracing::warn!(%error, "operation watchdog scan failed; next scan remains scheduled");
+                        }
+                        if let Err(error) = crate::host_runtime::supervised_process::recover_stale_job_objects(
+                            &operation_watchdog_runtime,
+                            now,
+                            false,
+                        ).await {
+                            tracing::warn!(%error, "operation process recovery scan failed; next scan remains scheduled");
+                        }
+                    }
+                }
+            }
+        });
         let (ipc_shutdown, ipc_shutdown_rx) = tokio::sync::watch::channel(false);
         let mut supervisor = ServiceSupervisor::new(default_runtime_services());
         supervisor.start_all("daemon").await?;
@@ -637,10 +709,15 @@ async fn run_published_daemon(
             () = wait_for_stop_marker(&stop_marker) => {}
         }
         let _ = ipc_shutdown.send(true);
+        operation_watchdog_shutdown.cancel();
         let joined = tokio::time::timeout(Duration::from_secs(5), ipc_task)
             .await
             .context("named-pipe server shutdown timed out")?;
         joined.context("named-pipe server task failed")??;
+        tokio::time::timeout(Duration::from_secs(5), operation_watchdog_task)
+            .await
+            .context("operation watchdog shutdown timed out")?
+            .context("operation watchdog task failed")??;
         if let Ok(joined) =
             tokio::time::timeout(Duration::from_secs(5), &mut scheduler_task).await
         {
@@ -873,6 +950,39 @@ pub fn run_runtime_report(config_path: &Path) -> Result<()> {
         "module_report": bundle.module_report_path,
         "logs_report": bundle.logs_report_path
     }))
+}
+
+pub async fn run_runtime_supervision_status(
+    config_path: &Path,
+    instance: Option<&str>,
+) -> Result<()> {
+    let runtime_store =
+        crate::host_runtime::supervised_process::daemon_operation_runtime_handle_for_instance(
+            config_path,
+            instance,
+        )?;
+    let report =
+        crate::runtime_integrity::inspect(config_path, &runtime_store, true, instance).await?;
+    crate::runtime_integrity::persist_report(config_path, &report)?;
+    write_json(&report)
+}
+
+pub async fn run_runtime_supervision_reconcile(
+    config_path: &Path,
+    dry_run: bool,
+    instance: Option<&str>,
+) -> Result<()> {
+    if !dry_run {
+        bail!("runtime supervision reconcile is controller-owned and currently requires --dry-run");
+    }
+    let runtime_store =
+        crate::host_runtime::supervised_process::daemon_operation_runtime_handle_for_instance(
+            config_path,
+            instance,
+        )?;
+    let report =
+        crate::runtime_integrity::reconcile_dry_run(config_path, &runtime_store).await?;
+    write_json(&report)
 }
 
 pub fn run_module_list(config_path: &Path) -> Result<()> {

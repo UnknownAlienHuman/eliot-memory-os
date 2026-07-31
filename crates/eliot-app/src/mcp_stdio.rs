@@ -879,7 +879,6 @@ pub(crate) struct McpDaemon {
 }
 
 impl McpDaemon {
-    #[allow(dead_code, reason = "wired by SUP-03 runtime integrity reporting")]
     pub(crate) fn operation_runtime_handle(&self) -> eliot_engine::OperationRuntimeHandle {
         self.host_governor.writer.operation_runtime()
     }

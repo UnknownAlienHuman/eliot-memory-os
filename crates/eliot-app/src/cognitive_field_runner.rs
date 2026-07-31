@@ -3139,7 +3139,6 @@ fn abandon_provider_seal(
     write_seal_record(private_root, record)
 }
 
-#[allow(dead_code, reason = "wired by SUP-03 startup reconciliation")]
 pub(crate) fn recover_incomplete_seal_checkpoint(
     config_path: &Path,
     checkpoint: &SealStagingCheckpoint,

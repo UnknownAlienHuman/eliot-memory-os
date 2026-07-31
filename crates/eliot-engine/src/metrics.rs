@@ -798,6 +798,72 @@ fn builtin_metric_definitions() -> Vec<MetricDefinition> {
             MetricKind::Gauge,
             MetricUnit::Count,
         ),
+        (
+            "eliot_supervised_operations",
+            "runtime_supervision",
+            MetricKind::Gauge,
+            MetricUnit::Count,
+        ),
+        (
+            "eliot_supervised_restarts_total",
+            "runtime_supervision",
+            MetricKind::Counter,
+            MetricUnit::Count,
+        ),
+        (
+            "eliot_supervised_timeouts_total",
+            "runtime_supervision",
+            MetricKind::Counter,
+            MetricUnit::Count,
+        ),
+        (
+            "eliot_supervised_reap_failures_total",
+            "runtime_supervision",
+            MetricKind::Counter,
+            MetricUnit::Count,
+        ),
+        (
+            "eliot_adapter_circuit_state",
+            "runtime_supervision",
+            MetricKind::Gauge,
+            MetricUnit::Count,
+        ),
+        (
+            "eliot_operation_last_progress_age_seconds",
+            "runtime_supervision",
+            MetricKind::Gauge,
+            MetricUnit::Seconds,
+        ),
+        (
+            "eliot_orphan_processes",
+            "runtime_supervision",
+            MetricKind::Gauge,
+            MetricUnit::Count,
+        ),
+        (
+            "eliot_orphaned_role_leases",
+            "runtime_supervision",
+            MetricKind::Gauge,
+            MetricUnit::Count,
+        ),
+        (
+            "eliot_partial_seals",
+            "runtime_supervision",
+            MetricKind::Gauge,
+            MetricUnit::Count,
+        ),
+        (
+            "eliot_authority_revocations_total",
+            "runtime_supervision",
+            MetricKind::Counter,
+            MetricUnit::Count,
+        ),
+        (
+            "eliot_seal_recoveries_total",
+            "runtime_supervision",
+            MetricKind::Counter,
+            MetricUnit::Count,
+        ),
     ]
     .into_iter()
     .map(|(metric_id, component, kind, unit)| metric(metric_id, component, kind, unit))
@@ -882,15 +948,27 @@ fn metric(
 }
 
 fn safe_label_definitions() -> Vec<MetricLabelDefinition> {
-    ["component", "operation", "status", "profile", "provider_id"]
-        .into_iter()
-        .map(|name| MetricLabelDefinition {
-            name: name.to_owned(),
-            allowed_values: Vec::new(),
-            high_cardinality: false,
-            secret_risk: false,
-        })
-        .collect()
+    [
+        "component",
+        "operation",
+        "status",
+        "profile",
+        "provider_id",
+        "class",
+        "state",
+        "reason",
+        "phase",
+        "adapter",
+        "decision",
+    ]
+    .into_iter()
+    .map(|name| MetricLabelDefinition {
+        name: name.to_owned(),
+        allowed_values: Vec::new(),
+        high_cardinality: false,
+        secret_risk: false,
+    })
+    .collect()
 }
 
 fn slo(slo_id: &str, component: &str, objective: SloObjective, threshold: f64) -> SloDefinition {
@@ -1066,5 +1144,46 @@ fn rejected(service: &str, reason: &str) -> EngineError {
     EngineError::ServiceNotReady {
         service: service.to_owned(),
         reason: reason.to_owned(),
+    }
+}
+
+#[cfg(test)]
+mod runtime_supervision_metric_tests {
+    use super::builtin_metric_definitions;
+    use std::collections::BTreeSet;
+
+    #[test]
+    fn runtime_supervision_metrics_are_registered_with_low_cardinality_labels() {
+        let definitions = builtin_metric_definitions();
+        let ids = definitions
+            .iter()
+            .map(|definition| definition.metric_id.as_str())
+            .collect::<BTreeSet<_>>();
+        for required in [
+            "eliot_supervised_operations",
+            "eliot_supervised_restarts_total",
+            "eliot_supervised_timeouts_total",
+            "eliot_supervised_reap_failures_total",
+            "eliot_adapter_circuit_state",
+            "eliot_operation_last_progress_age_seconds",
+            "eliot_orphan_processes",
+            "eliot_orphaned_role_leases",
+            "eliot_partial_seals",
+            "eliot_authority_revocations_total",
+            "eliot_seal_recoveries_total",
+        ] {
+            assert!(ids.contains(required), "missing metric {required}");
+        }
+        for definition in definitions
+            .iter()
+            .filter(|definition| definition.component == "runtime_supervision")
+        {
+            assert!(definition.labels.iter().all(|label| {
+                !matches!(
+                    label.name.as_str(),
+                    "operation_id" | "pid" | "run_id" | "lease_id"
+                )
+            }));
+        }
     }
 }

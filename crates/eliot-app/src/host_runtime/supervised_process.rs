@@ -493,7 +493,6 @@ pub fn run_supervised_process_blocking(
         .map_err(|_| anyhow!("supervised blocking runtime thread panicked"))?
 }
 
-#[allow(dead_code, reason = "wired by SUP-03 startup reconciliation")]
 #[allow(
     clippy::too_many_lines,
     reason = "startup recovery keeps every durable checkpoint transition adjacent to its reap outcome"
@@ -621,7 +620,6 @@ pub async fn recover_stale_job_objects(
     Ok(receipts)
 }
 
-#[allow(dead_code, reason = "wired by SUP-03 startup reconciliation")]
 fn checkpoint_requires_process_recovery(
     checkpoint: &OperationRuntimeCheckpoint,
     now: OffsetDateTime,
@@ -644,7 +642,6 @@ fn checkpoint_requests_process_cancellation(checkpoint: &OperationRuntimeCheckpo
         )
 }
 
-#[allow(dead_code, reason = "wired by SUP-03 startup reconciliation")]
 enum StartupProcessRecovery {
     JobReaped {
         job_name: String,
@@ -660,7 +657,6 @@ enum StartupProcessRecovery {
     IdentityUnproven(String),
 }
 
-#[allow(dead_code, reason = "wired by SUP-03 startup reconciliation")]
 fn recover_checkpoint_process_tree(
     checkpoint: &OperationRuntimeCheckpoint,
     cleanup_grace: Duration,
