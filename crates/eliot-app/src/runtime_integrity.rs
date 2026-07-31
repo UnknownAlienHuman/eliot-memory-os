@@ -835,9 +835,17 @@ async fn adapter_health(
             restart_count_window: window
                 .as_ref()
                 .map_or(0, |window| usize_to_u32(window.restart_timestamps.len())),
-            last_success_at: None,
-            last_failure_at: window.as_ref().map(|window| window.updated_at.clone()),
-            last_failure_class: window.and_then(|window| window.last_failure_class),
+            last_success_at: window
+                .as_ref()
+                .and_then(|window| window.last_success_at.clone()),
+            last_failure_at: window
+                .as_ref()
+                .and_then(|window| window.last_failure_at.clone()),
+            last_failure_class: window
+                .as_ref()
+                .and_then(|window| window.last_failure_class.clone()),
+            last_terminal_operation_ref: window
+                .and_then(|window| window.last_terminal_operation_ref),
         });
     }
     Ok(reports)

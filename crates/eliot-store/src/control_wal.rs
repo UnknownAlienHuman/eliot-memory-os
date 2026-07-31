@@ -823,7 +823,10 @@ mod tests {
             restart_timestamps: vec![now.to_string()],
             circuit_state: AdapterCircuitState::Closed,
             consecutive_failures: 5,
+            last_success_at: None,
+            last_failure_at: Some(now.to_string()),
             last_failure_class: Some("transport".to_owned()),
+            last_terminal_operation_ref: Some("operation:fixture".to_owned()),
             updated_at: now.to_string(),
         };
         let opened = wal.open_circuit(window)?;

@@ -390,7 +390,7 @@ async fn adapter_supervisor_restarts_one_fresh_generation_before_dispatch() -> T
     let result = supervisor.execute("flaky-external", request, None).await?;
     assert_eq!(result.status, AdapterResultStatus::Succeeded);
     let checkpoint = runtime
-        .get_checkpoint(operation_id)
+        .get_checkpoint(operation_id.clone())
         .await?
         .ok_or_else(|| std::io::Error::other("restart checkpoint missing"))?;
     assert_eq!(checkpoint.generation, 2);
@@ -401,6 +401,13 @@ async fn adapter_supervisor_restarts_one_fresh_generation_before_dispatch() -> T
         .await?
         .ok_or_else(|| std::io::Error::other("restart window missing"))?;
     assert_eq!(window.restart_timestamps.len(), 1);
+    assert!(window.last_failure_at.is_some());
+    assert!(window.last_success_at.is_some());
+    assert!(window.last_failure_class.is_some());
+    assert_eq!(
+        window.last_terminal_operation_ref.as_deref(),
+        Some(operation_id.as_str())
+    );
 
     drop(supervisor);
     drop(runtime);

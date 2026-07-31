@@ -477,23 +477,7 @@ pub(crate) async fn host_governor_request(
     method: &str,
     params: Value,
 ) -> Result<Value> {
-    if !matches!(
-        method,
-        "host/role-grant"
-            | "host/operation-scope-open"
-            | "host/operation-scope-close"
-            | "host/observation-record"
-            | "ul/onboard"
-            | "ul/mine-git"
-            | "ul/report"
-            | "ul/maintain"
-            | "ul/dirty-report"
-            | "ul/injection-policy-set"
-            | "ul/exam-run"
-            | "ul/exam-report"
-            | "ul/prediction-sweep"
-            | "runtime/operation"
-    ) {
+    if !private_host_governor_method_allowed(method) {
         anyhow::bail!("unsupported private host Governor RPC method");
     }
     let mut connection = connect_global_client(
@@ -521,6 +505,26 @@ pub(crate) async fn host_governor_request(
         .get("result")
         .cloned()
         .context("host Governor RPC response has no result")
+}
+
+fn private_host_governor_method_allowed(method: &str) -> bool {
+    matches!(
+        method,
+        "host/role-grant"
+            | "host/operation-scope-open"
+            | "host/operation-scope-close"
+            | "host/observation-record"
+            | "ul/onboard"
+            | "ul/mine-git"
+            | "ul/report"
+            | "ul/maintain"
+            | "ul/dirty-report"
+            | "ul/injection-policy-set"
+            | "ul/exam-run"
+            | "ul/exam-report"
+            | "ul/prediction-sweep"
+            | "runtime/operation"
+    )
 }
 
 #[cfg(windows)]
@@ -1292,7 +1296,8 @@ pub(crate) async fn run_stdio_client(
 mod tests {
     use super::{
         ClientProcessAttestation, IPC_PROTOCOL_VERSION, IpcAuthenticationState, IpcClientHandshake,
-        MAX_REPLAY_NONCES, ReplayWindow, allowed_ipc_profile, decode_bounded_line, sha256_file,
+        MAX_REPLAY_NONCES, ReplayWindow, allowed_ipc_profile, decode_bounded_line,
+        private_host_governor_method_allowed, sha256_file,
     };
     use anyhow::{Context as _, Result};
     use tokio::sync::Mutex;
@@ -1302,6 +1307,19 @@ mod tests {
     fn claude_desktop_is_an_authenticated_ipc_profile() {
         assert!(allowed_ipc_profile("claude_desktop"));
         assert!(!allowed_ipc_profile("raw_patch_runner"));
+    }
+
+    #[test]
+    fn named_pipe_ipc_operation_scope_methods_are_private_allowlisted() {
+        assert!(private_host_governor_method_allowed(
+            "host/operation-scope-open"
+        ));
+        assert!(private_host_governor_method_allowed(
+            "host/operation-scope-close"
+        ));
+        assert!(!private_host_governor_method_allowed(
+            "tools/call/operation-scope-open"
+        ));
     }
 
     #[test]

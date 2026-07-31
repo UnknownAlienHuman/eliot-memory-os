@@ -232,12 +232,12 @@ pub(crate) async fn dispatch(
         }
         crate::ExternalAgentCommand::McpSmoke { host, model } => {
             let host = parse_host(&host)?;
-            let report = run_mcp_smoke(config_path, host, &model).await?;
+            let report = Box::pin(run_mcp_smoke(config_path, host, &model)).await?;
             write_json(&report)
         }
         crate::ExternalAgentCommand::McpPreflight { host, model } => {
             let host = parse_host(&host)?;
-            let report = run_mcp_preflight(config_path, host, &model).await?;
+            let report = Box::pin(run_mcp_preflight(config_path, host, &model)).await?;
             write_json(&report)
         }
         crate::ExternalAgentCommand::Inspect { invocation } => {
@@ -963,69 +963,73 @@ async fn run_mcp_preflight(config_path: &Path, host: AgentHostId, model: &str) -
         client_instance_id: preparation.smoke_id.clone(),
         idempotency_key: format!("operation-authority:{}", preparation.smoke_id),
     };
-    let report = with_operation_bound_host_scope(config_path, open, |operation_scope| async move {
-        let mut scope = operation_scope.launch_scope.clone();
-        scope.work_item_id = Some(preparation.work_item_id);
-        scope.planned_verifier_ref = Some(format!(
-            "external-agent-smoke-verifier:{}",
-            preparation.smoke_id
-        ));
-        let preflight = preparation
-            .trace
-            .run(
-                "current_state_preflight",
-                mcp_reference_exchange(
-                    config_path,
-                    if host == AgentHostId::OpenCode {
-                        Some("default")
-                    } else {
-                        Some("external_auditor")
-                    },
-                    Some(host),
-                    Some(&scope),
-                    Some("eliot_current_state"),
-                    Some(&json!({"scope": "memory_free_control"})),
+    let report = Box::pin(with_operation_bound_host_scope(
+        config_path,
+        open,
+        |operation_scope| async move {
+            let mut scope = operation_scope.launch_scope.clone();
+            scope.work_item_id = Some(preparation.work_item_id);
+            scope.planned_verifier_ref = Some(format!(
+                "external-agent-smoke-verifier:{}",
+                preparation.smoke_id
+            ));
+            let preflight = preparation
+                .trace
+                .run(
                     "current_state_preflight",
-                ),
-            )
-            .await?;
-        anyhow::ensure!(
-            preflight
-                .tool_names
-                .iter()
-                .any(|name| name == "eliot_current_state"),
-            "zero-model preflight did not expose eliot_current_state"
-        );
-        let current_state = preflight
-            .tool_call
-            .as_ref()
-            .context("zero-model current_state preflight returned no structured content")?;
-        let memory_revision = current_state
-            .get("memory_revision")
-            .or_else(|| current_state.get("revision"))
-            .and_then(Value::as_u64)
-            .context("zero-model current_state returned no memory revision")?;
-        anyhow::ensure!(
-            operation_scope.instance == host_governor_instance(config_path)?,
-            "operation scope daemon instance changed during preflight"
-        );
-        Ok(json!({
-            "schema_version": "eliot-external-agent-mcp-preflight-v2",
-            "status": "passed",
-            "smoke_id": preparation.smoke_id,
-            "host": host,
-            "model": model,
-            "project_id": preparation.project_id,
-            "task_id": preparation.task_id,
-            "memory_revision": memory_revision,
-            "tool_names": preflight.tool_names,
-            "raw_database_absent": preflight.raw_database_absent,
-            "phase_journal_ref": path_string(preparation.trace.path()),
-            "authority_open_state_hash": operation_scope.open_receipt.state_hash,
-            "provider_calls": 0,
-            "gui_used": false,
-        }))
-    })
+                    mcp_reference_exchange(
+                        config_path,
+                        if host == AgentHostId::OpenCode {
+                            Some("default")
+                        } else {
+                            Some("external_auditor")
+                        },
+                        Some(host),
+                        Some(&scope),
+                        Some("eliot_current_state"),
+                        Some(&json!({"scope": "memory_free_control"})),
+                        "current_state_preflight",
+                    ),
+                )
+                .await?;
+            anyhow::ensure!(
+                preflight
+                    .tool_names
+                    .iter()
+                    .any(|name| name == "eliot_current_state"),
+                "zero-model preflight did not expose eliot_current_state"
+            );
+            let current_state = preflight
+                .tool_call
+                .as_ref()
+                .context("zero-model current_state preflight returned no structured content")?;
+            let memory_revision = current_state
+                .get("memory_revision")
+                .or_else(|| current_state.get("revision"))
+                .and_then(Value::as_u64)
+                .context("zero-model current_state returned no memory revision")?;
+            anyhow::ensure!(
+                operation_scope.instance == host_governor_instance(config_path)?,
+                "operation scope daemon instance changed during preflight"
+            );
+            Ok(json!({
+                "schema_version": "eliot-external-agent-mcp-preflight-v2",
+                "status": "passed",
+                "smoke_id": preparation.smoke_id,
+                "host": host,
+                "model": model,
+                "project_id": preparation.project_id,
+                "task_id": preparation.task_id,
+                "memory_revision": memory_revision,
+                "tool_names": preflight.tool_names,
+                "raw_database_absent": preflight.raw_database_absent,
+                "phase_journal_ref": path_string(preparation.trace.path()),
+                "authority_open_state_hash": operation_scope.open_receipt.state_hash,
+                "provider_calls": 0,
+                "gui_used": false,
+            }))
+        },
+    ))
     .await?;
     atomic_write_json(&report_path, &report)?;
     atomic_write_json(&smoke_report_path, &report)?;
@@ -1078,7 +1082,10 @@ async fn run_mcp_smoke(config_path: &Path, host: AgentHostId, model: &str) -> Re
         client_instance_id: smoke_id.clone(),
         idempotency_key: format!("external-agent-smoke:{smoke_id}"),
     };
-    let report = with_operation_bound_host_scope(config_path, open, |operation_scope| async move {
+    let report = Box::pin(with_operation_bound_host_scope(
+        config_path,
+        open,
+        |operation_scope| async move {
         let mut scope = operation_scope.launch_scope.clone();
         scope.work_item_id = Some(work_item_id);
         scope.planned_verifier_ref = Some(format!("external-agent-smoke-verifier:{smoke_id}"));
@@ -1372,7 +1379,8 @@ async fn run_mcp_smoke(config_path: &Path, host: AgentHostId, model: &str) -> Re
             "operation scope daemon instance changed during provider smoke"
         );
         Ok(report)
-    })
+        },
+    ))
     .await?;
     atomic_write_json(&report_path, &report)?;
     atomic_write_json(&smoke_report_path, &report)?;

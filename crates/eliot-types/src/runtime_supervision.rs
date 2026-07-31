@@ -133,7 +133,13 @@ pub struct OperationRestartWindow {
     pub restart_timestamps: Vec<String>,
     pub circuit_state: AdapterCircuitState,
     pub consecutive_failures: u32,
+    #[serde(default)]
+    pub last_success_at: Option<String>,
+    #[serde(default)]
+    pub last_failure_at: Option<String>,
     pub last_failure_class: Option<String>,
+    #[serde(default)]
+    pub last_terminal_operation_ref: Option<String>,
     pub updated_at: String,
 }
 
@@ -220,6 +226,8 @@ pub struct RuntimeAdapterHealth {
     pub last_success_at: Option<String>,
     pub last_failure_at: Option<String>,
     pub last_failure_class: Option<String>,
+    #[serde(default)]
+    pub last_terminal_operation_ref: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]

@@ -9,6 +9,10 @@
 
 use super::*;
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "the private authenticated daemon method allowlist remains one auditable routing table"
+)]
 pub(super) async fn dispatch_host_governor_method(
     state: &McpState,
     method: &str,

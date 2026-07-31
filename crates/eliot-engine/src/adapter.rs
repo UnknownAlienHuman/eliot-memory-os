@@ -565,7 +565,7 @@ impl AdapterSupervisor {
                 RestartDecision::OpenCircuit => {
                     checkpoint = persisted;
                     if let Some(record) = self.force_open_circuit(adapter_id) {
-                        self.persist_circuit(adapter_id, &record, result.status)
+                        self.persist_circuit(adapter_id, &record, result.status, None)
                             .await?;
                     }
                 }
@@ -586,10 +586,16 @@ impl AdapterSupervisor {
             checkpoint.cancellation_state = OperationCancellationState::Reaped;
         }
         checkpoint.last_error_class = result.error.as_ref().map(|error| error.code.clone());
+        let terminal_operation_ref = checkpoint.operation_id.clone();
         self.runtime_store.put_checkpoint(checkpoint).await?;
         if let Some(record) = self.update_circuit(adapter_id, result.status) {
-            self.persist_circuit(adapter_id, &record, result.status)
-                .await?;
+            self.persist_circuit(
+                adapter_id,
+                &record,
+                result.status,
+                Some(&terminal_operation_ref),
+            )
+            .await?;
         }
         Ok(result)
     }
@@ -615,7 +621,7 @@ impl AdapterSupervisor {
         }
         if let Some(record) = self.set_half_open(adapter_id)
             && let Err(error) = self
-                .persist_circuit(adapter_id, &record, AdapterResultStatus::Unavailable)
+                .persist_circuit(adapter_id, &record, AdapterResultStatus::Unavailable, None)
                 .await
         {
             return match self.registry.adapter(adapter_id) {
@@ -639,7 +645,7 @@ impl AdapterSupervisor {
         if health.healthy {
             if let Some(record) = self.reset_circuit(adapter_id)
                 && let Err(error) = self
-                    .persist_circuit(adapter_id, &record, AdapterResultStatus::Succeeded)
+                    .persist_circuit(adapter_id, &record, AdapterResultStatus::Succeeded, None)
                     .await
             {
                 health.healthy = false;
@@ -830,6 +836,7 @@ impl AdapterSupervisor {
         adapter_id: &str,
         record: &CircuitRecord,
         status: AdapterResultStatus,
+        terminal_operation_ref: Option<&str>,
     ) -> Result<(), EngineError> {
         let now = OffsetDateTime::now_utc();
         let now_epoch = now.unix_timestamp();
@@ -843,7 +850,10 @@ impl AdapterSupervisor {
                 restart_timestamps: Vec::new(),
                 circuit_state: AdapterCircuitState::Closed,
                 consecutive_failures: 0,
+                last_success_at: None,
+                last_failure_at: None,
                 last_failure_class: None,
+                last_terminal_operation_ref: None,
                 updated_at: now_epoch.to_string(),
             });
         window.restart_timestamps.retain(|timestamp| {
@@ -854,12 +864,21 @@ impl AdapterSupervisor {
         match status {
             AdapterResultStatus::Failed | AdapterResultStatus::Timeout => {
                 window.restart_timestamps.push(now_epoch.to_string());
+                window.last_failure_at = Some(now_epoch.to_string());
                 window.last_failure_class = Some(format!("{status:?}").to_ascii_lowercase());
             }
             AdapterResultStatus::Succeeded => {
-                window.last_failure_class = None;
+                window.last_success_at = Some(now_epoch.to_string());
             }
             _ => {}
+        }
+        if matches!(
+            status,
+            AdapterResultStatus::Succeeded
+                | AdapterResultStatus::Failed
+                | AdapterResultStatus::Timeout
+        ) {
+            window.last_terminal_operation_ref = terminal_operation_ref.map(str::to_owned);
         }
         window.consecutive_failures = record.consecutive_failures;
         window.circuit_state = if record.circuit_open {
@@ -894,7 +913,10 @@ impl AdapterSupervisor {
                 restart_timestamps: Vec::new(),
                 circuit_state: AdapterCircuitState::Closed,
                 consecutive_failures: 0,
+                last_success_at: None,
+                last_failure_at: None,
                 last_failure_class: None,
+                last_terminal_operation_ref: None,
                 updated_at: now.to_string(),
             });
         window.restart_timestamps.retain(|timestamp| {
@@ -903,6 +925,7 @@ impl AdapterSupervisor {
                 .is_ok_and(|observed| observed >= now.saturating_sub(60))
         });
         window.restart_timestamps.push(now.to_string());
+        window.last_failure_at = Some(now.to_string());
         window.last_failure_class = Some(reason.to_owned());
         window.updated_at = now.to_string();
         self.runtime_store.put_restart_window(window).await

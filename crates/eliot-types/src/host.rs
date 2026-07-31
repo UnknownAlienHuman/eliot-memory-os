@@ -538,21 +538,21 @@ mod claude_surface_tests {
     use super::{AgentHostId, AuthorityLeaseLifetime, ClaudeSurface};
 
     #[test]
-    fn authority_lifetime_legacy_decode_and_explicit_variants_are_stable() {
+    fn authority_lifetime_legacy_decode_and_explicit_variants_are_stable()
+    -> Result<(), serde_json::Error> {
         assert_eq!(
-            serde_json::from_str::<AuthorityLeaseLifetime>("\"operation_bound\"")
-                .expect("decode operation-bound lifetime"),
+            serde_json::from_str::<AuthorityLeaseLifetime>("\"operation_bound\"")?,
             AuthorityLeaseLifetime::OperationBound
         );
         assert_eq!(
-            serde_json::from_str::<AuthorityLeaseLifetime>("\"seal_bound\"")
-                .expect("decode seal-bound lifetime"),
+            serde_json::from_str::<AuthorityLeaseLifetime>("\"seal_bound\"")?,
             AuthorityLeaseLifetime::SealBound
         );
         assert_eq!(
             AuthorityLeaseLifetime::default(),
             AuthorityLeaseLifetime::Legacy
         );
+        Ok(())
     }
 
     /// One vendor, two packages. The family never becomes two hosts.

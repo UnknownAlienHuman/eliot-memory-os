@@ -948,6 +948,10 @@ impl HostBrokerService {
         })
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one cloned-state activation keeps lifetime validation and lease/controller writes atomic"
+    )]
     pub fn activate_role_grants(
         self,
         state: &mut DelegationState,
@@ -1223,6 +1227,10 @@ impl HostBrokerService {
         report
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one validator keeps every lease lifetime and exact owner rule on the shared admission path"
+    )]
     pub fn validate_active_role_authority(
         self,
         state: &DelegationState,
@@ -1350,6 +1358,10 @@ impl HostBrokerService {
         })
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "enqueue keeps validation, exact operation adoption, and new-job admission in one transaction"
+    )]
     pub fn enqueue(
         self,
         state: &mut DelegationState,
@@ -1552,7 +1564,7 @@ impl HostBrokerService {
         }
         let job = state
             .operation_jobs
-            .iter_mut()
+            .iter()
             .find(|job| job.invocation_id == result.invocation_id)
             .ok_or_else(|| host_broker_error("AgentResultEnvelope has no matching OperationJob"))?;
         if job.host_id != result.host_id {
@@ -1562,33 +1574,26 @@ impl HostBrokerService {
             .agent_invocations
             .iter()
             .find(|invocation| invocation.invocation_id == result.invocation_id)
+            .cloned()
             .ok_or_else(|| host_broker_error("result invocation request is missing"))?;
-        let lease = state
-            .task_role_leases
-            .iter()
-            .find(|lease| lease.role_lease_id == invocation.role_lease_id)
-            .ok_or_else(|| host_broker_error("result role lease is missing"))?;
-        let session_current = state.agent_host_sessions.iter().any(|session| {
-            session.agent_session_id == lease.agent_session_id
-                && session.state == AgentSessionState::Active
-                && session.generation == lease.generation
-                && session.host_identity.host_id == result.host_id
-                && session
-                    .bound_project_id
-                    .is_none_or(|project_id| project_id == invocation.project_id)
-                && session
-                    .bound_task_id
-                    .is_none_or(|task_id| task_id == invocation.task_id)
-        });
-        let current_authority = lease.state == AuthorityLeaseState::Active
-            && session_current
-            && lease.epoch == result.role_lease_epoch
-            && lease.generation == result.operation_generation
-            && invocation.role_lease_epoch == result.role_lease_epoch
+        let current_authority = invocation.role_lease_epoch == result.role_lease_epoch
             && invocation.operation_generation == result.operation_generation
             && job.generation == result.operation_generation
             && job.role_lease_epoch == Some(result.role_lease_epoch)
-            && lease.expires_at > OffsetDateTime::now_utc();
+            && self
+                .validate_active_role_authority(
+                    state,
+                    &ActiveRoleAuthorityCheck {
+                        operation_id: &result.invocation_id,
+                        task_id: invocation.task_id,
+                        role_lease_id: &invocation.role_lease_id,
+                        expected_epoch: result.role_lease_epoch,
+                        generation: result.operation_generation,
+                        host_id: result.host_id,
+                        requested_capabilities: &invocation.requested_capabilities,
+                    },
+                )
+                .is_ok();
         if !current_authority {
             if !state
                 .agent_results
@@ -1599,6 +1604,11 @@ impl HostBrokerService {
             }
             return Ok(AgentResultAdmission::StaleEvidencePreserved(result));
         }
+        let job = state
+            .operation_jobs
+            .iter_mut()
+            .find(|job| job.invocation_id == result.invocation_id)
+            .ok_or_else(|| host_broker_error("AgentResultEnvelope owner job disappeared"))?;
         if job.state != OperationJobState::Running {
             return Err(host_broker_error(
                 "AgentResultEnvelope requires a running OperationJob",
