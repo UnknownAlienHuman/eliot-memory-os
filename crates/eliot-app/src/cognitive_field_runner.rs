@@ -74,6 +74,52 @@ struct RenderedProviderContract {
 
 const CORE_ROLE_EVIDENCE_PLAN_SCHEMA_VERSION: &str = "eliot-core-role-evidence-plan-v1";
 const CORE_ROLE_REUSE_PROJECTION_SCHEMA_VERSION: &str = "eliot-core-role-reuse-projection-v1";
+const LEGACY_EVIDENCE_ADMISSION_SCHEMA_VERSION: &str = "eliot-legacy-evidence-admission-v1";
+const LEGACY_RUNTIME_BINDING_SCHEMA_VERSION: &str =
+    "eliot-cognitive-provider-runtime-legacy-binding-v1";
+const LEGACY_RUNTIME_RECONSTRUCTION_STATUS: &str = "derived_from_immutable_provider_receipt";
+const LEGACY_WORKER_SOURCE_RUN_ID: &str = "cq-core-20260729-003";
+const LEGACY_WORKER_SOURCE_CALL_ID: &str = "6f04e449-ecab-4555-8bd0-4a6bd762c1b4";
+const LEGACY_WORKER_CASE_ID: &str = "U03";
+const LEGACY_WORKER_ACCEPTANCE_RUN_ID: &str = "cq-core-20260730-005";
+const LEGACY_WORKER_MISSING_FIELD: &str = "source_call.canonical_schema_sha256";
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LegacyEvidenceAdmissionRecord {
+    schema_version: String,
+    admitting_run_id: String,
+    source_run_id: String,
+    source_call_id: String,
+    case_id: String,
+    role: CognitiveFieldRole,
+    missing_historical_field: String,
+    accepted_role_evidence_run_id: String,
+    accepted_role_evidence_plan_hash: String,
+    output_schema_sha256: String,
+    historical_runtime_binding_sha256: String,
+    fresh_provider_authority: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LegacyProviderRuntimeBinding {
+    schema_version: String,
+    reconstruction_status: String,
+    source_run_id: String,
+    source_call_id: String,
+    source_commit: String,
+    provider_session_id: String,
+    provider_receipt_ref: String,
+    provider_executable: String,
+    provider_executable_sha256: String,
+    prompt_sha256: String,
+    raw_stdout_sha256: String,
+    raw_stderr_sha256: String,
+    receipt_sha256: String,
+    zero_model_preflight_available: bool,
+    fresh_role_authority: bool,
+}
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -82,6 +128,38 @@ struct CoreRoleEvidencePlan {
     run_id: String,
     sources: Vec<CoreRoleEvidenceSource>,
     plan_hash: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LegacyCoreRoleEvidencePlanV0 {
+    schema_version: String,
+    run_id: String,
+    sources: Vec<LegacyCoreRoleEvidenceSourceV0>,
+    plan_hash: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "source_kind", rename_all = "snake_case", deny_unknown_fields)]
+enum LegacyCoreRoleEvidenceSourceV0 {
+    FreshProviderCall {
+        planned_call_id: String,
+    },
+    AcceptedPriorRoleArtifact {
+        source_run_id: String,
+        source_call_id: String,
+        role: CognitiveFieldRole,
+        case_id: String,
+        provider_session_id: String,
+        source_commit: String,
+        provider_executable_sha256: String,
+        output_schema_sha256: String,
+        artifact_sha256: String,
+        provider_receipt_ref: String,
+        deterministic_receipt_refs: Vec<String>,
+        contamination_receipt_ref: String,
+        worktree_diff_sha256: Option<String>,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -117,6 +195,8 @@ enum CoreRoleEvidenceSource {
         deterministic_receipt_refs: Vec<String>,
         contamination_receipt_ref: String,
         worktree_diff_sha256: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        legacy_evidence_admission: Option<LegacyEvidenceAdmissionRecord>,
     },
 }
 
@@ -3562,15 +3642,203 @@ fn paired_artifact_sha256(outputs: &[(CognitiveFieldExecutionKey, Vec<u8>)]) -> 
     Ok(sha256_bytes(&material))
 }
 
+#[allow(clippy::too_many_arguments)]
+fn validate_legacy_evidence_admission_record(
+    admission: &LegacyEvidenceAdmissionRecord,
+    admitting_run_id: &str,
+    source_run_id: &str,
+    source_call_id: &str,
+    role: CognitiveFieldRole,
+    case_id: &str,
+    output_schema_sha256: &str,
+    runtime_binding_sha256: &str,
+) -> Result<()> {
+    ensure!(
+        admission.schema_version == LEGACY_EVIDENCE_ADMISSION_SCHEMA_VERSION
+            && admission.admitting_run_id == admitting_run_id
+            && admission.source_run_id == LEGACY_WORKER_SOURCE_RUN_ID
+            && admission.source_run_id == source_run_id
+            && admission.source_call_id == LEGACY_WORKER_SOURCE_CALL_ID
+            && admission.source_call_id == source_call_id
+            && admission.case_id == LEGACY_WORKER_CASE_ID
+            && admission.case_id == case_id
+            && admission.role == CognitiveFieldRole::CodexWorker
+            && admission.role == role
+            && admission.missing_historical_field == LEGACY_WORKER_MISSING_FIELD
+            && admission.accepted_role_evidence_run_id == LEGACY_WORKER_ACCEPTANCE_RUN_ID
+            && !admission.accepted_role_evidence_plan_hash.is_empty()
+            && admission.output_schema_sha256 == output_schema_sha256
+            && admission.historical_runtime_binding_sha256 == runtime_binding_sha256
+            && is_sha256(&admission.output_schema_sha256)
+            && is_sha256(&admission.historical_runtime_binding_sha256)
+            && !admission.fresh_provider_authority,
+        "legacy evidence admission is outside the one frozen historical Worker tuple"
+    );
+    Ok(())
+}
+
+fn verify_legacy_worker_acceptance_plan(
+    report_root: &Path,
+    private_root: &Path,
+    admission: &LegacyEvidenceAdmissionRecord,
+    source: &CoreRoleEvidenceSource,
+) -> Result<()> {
+    let CoreRoleEvidenceSource::AcceptedPriorRoleArtifact {
+        source_run_id,
+        source_call_id,
+        role,
+        case_id,
+        provider_session_id,
+        source_commit,
+        provider_executable_sha256,
+        output_schema_sha256,
+        artifact_sha256,
+        provider_receipt_ref,
+        deterministic_receipt_refs,
+        contamination_receipt_ref,
+        worktree_diff_sha256,
+        ..
+    } = source
+    else {
+        bail!("legacy evidence admission cannot authorize a fresh provider call");
+    };
+    let (accepted_report_root, _) =
+        source_run_roots(report_root, private_root, LEGACY_WORKER_ACCEPTANCE_RUN_ID)?;
+    let accepted_plan_path = accepted_report_root.join("role-evidence-plan.json");
+    let mut historical_plan: LegacyCoreRoleEvidencePlanV0 = read_json(&accepted_plan_path)?;
+    let recorded_historical_plan_hash = historical_plan.plan_hash.clone();
+    historical_plan.plan_hash.clear();
+    let expected_historical_plan_hash = CognitiveFieldGradingService::hash_json(&historical_plan)?;
+    ensure!(
+        historical_plan.schema_version == CORE_ROLE_EVIDENCE_PLAN_SCHEMA_VERSION
+            && historical_plan.run_id == LEGACY_WORKER_ACCEPTANCE_RUN_ID
+            && recorded_historical_plan_hash == expected_historical_plan_hash
+            && admission.accepted_role_evidence_plan_hash == recorded_historical_plan_hash,
+        "legacy evidence admission differs from the immutable run005 role-evidence plan"
+    );
+    let accepted_plan: CoreRoleEvidencePlan = read_json(&accepted_plan_path)?;
+    ensure!(
+        accepted_plan.schema_version == CORE_ROLE_EVIDENCE_PLAN_SCHEMA_VERSION
+            && accepted_plan.run_id == LEGACY_WORKER_ACCEPTANCE_RUN_ID
+            && accepted_plan.plan_hash == recorded_historical_plan_hash,
+        "legacy evidence admission differs from the immutable run005 role-evidence plan"
+    );
+    let accepted_source = accepted_plan
+        .sources
+        .iter()
+        .find(|candidate| {
+            matches!(
+                candidate,
+                CoreRoleEvidenceSource::AcceptedPriorRoleArtifact {
+                    source_run_id: candidate_run_id,
+                    source_call_id: candidate_call_id,
+                    role: CognitiveFieldRole::CodexWorker,
+                    case_id: candidate_case_id,
+                    ..
+                } if candidate_run_id == LEGACY_WORKER_SOURCE_RUN_ID
+                    && candidate_call_id == LEGACY_WORKER_SOURCE_CALL_ID
+                    && candidate_case_id == LEGACY_WORKER_CASE_ID
+            )
+        })
+        .context("run005 role-evidence plan lacks the accepted legacy Worker binding")?;
+    let CoreRoleEvidenceSource::AcceptedPriorRoleArtifact {
+        source_run_id: accepted_source_run_id,
+        source_call_id: accepted_source_call_id,
+        role: accepted_role,
+        case_id: accepted_case_id,
+        provider_session_id: accepted_provider_session_id,
+        source_commit: accepted_source_commit,
+        provider_executable_sha256: accepted_provider_executable_sha256,
+        output_schema_sha256: accepted_output_schema_sha256,
+        artifact_sha256: accepted_artifact_sha256,
+        provider_receipt_ref: accepted_provider_receipt_ref,
+        deterministic_receipt_refs: accepted_deterministic_receipt_refs,
+        contamination_receipt_ref: accepted_contamination_receipt_ref,
+        worktree_diff_sha256: accepted_worktree_diff_sha256,
+        legacy_evidence_admission: accepted_admission,
+        ..
+    } = accepted_source
+    else {
+        unreachable!("filtered accepted prior role");
+    };
+    ensure!(
+        accepted_source_run_id == source_run_id
+            && accepted_source_call_id == source_call_id
+            && accepted_role == role
+            && accepted_case_id == case_id
+            && accepted_provider_session_id == provider_session_id
+            && accepted_source_commit == source_commit
+            && accepted_provider_executable_sha256 == provider_executable_sha256
+            && accepted_output_schema_sha256 == output_schema_sha256
+            && accepted_artifact_sha256 == artifact_sha256
+            && accepted_provider_receipt_ref == provider_receipt_ref
+            && accepted_deterministic_receipt_refs == deterministic_receipt_refs
+            && accepted_contamination_receipt_ref == contamination_receipt_ref
+            && accepted_worktree_diff_sha256 == worktree_diff_sha256
+            && accepted_admission.is_none(),
+        "legacy Worker dependency differs from the binding already accepted by run005"
+    );
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn verify_legacy_provider_runtime_binding(
+    current_private_root: &Path,
+    source_private_root: &Path,
+    source_run_id: &str,
+    source_call_id: &str,
+    source_commit: &str,
+    provider_session_id: &str,
+    provider_receipt_ref: &str,
+    provider_executable_sha256: &str,
+    prompt_sha256: &str,
+    runtime_binding_sha256: &str,
+    receipt_path: &Path,
+    receipt: &CognitiveFieldProviderEvidenceReceipt,
+) -> Result<()> {
+    let relative = format!("historical-runtime-bindings/{source_call_id}.json");
+    let binding_path = private_relative_file(
+        current_private_root,
+        &relative,
+        "historical runtime binding",
+    )?;
+    let binding_bytes = fs::read(&binding_path)?;
+    ensure!(
+        sha256_bytes(&binding_bytes) == runtime_binding_sha256,
+        "historical runtime binding hash differs from the exact role dependency"
+    );
+    let binding: LegacyProviderRuntimeBinding = serde_json::from_slice(&binding_bytes)?;
+    ensure!(
+        binding.schema_version == LEGACY_RUNTIME_BINDING_SCHEMA_VERSION
+            && binding.reconstruction_status == LEGACY_RUNTIME_RECONSTRUCTION_STATUS
+            && binding.source_run_id == source_run_id
+            && binding.source_call_id == source_call_id
+            && binding.source_commit == source_commit
+            && binding.provider_session_id == provider_session_id
+            && binding.provider_receipt_ref == provider_receipt_ref
+            && binding.provider_executable == receipt.provider_executable
+            && binding.provider_executable_sha256 == provider_executable_sha256
+            && binding.prompt_sha256 == prompt_sha256
+            && binding.raw_stdout_sha256 == receipt.raw_stdout_sha256
+            && binding.raw_stderr_sha256 == receipt.raw_stderr_sha256
+            && binding.receipt_sha256 == sha256_bytes(&fs::read(receipt_path)?)
+            && receipt_path.starts_with(source_private_root)
+            && !binding.zero_model_preflight_available
+            && !binding.fresh_role_authority,
+        "historical runtime binding is not an immutable receipt-derived non-authority record"
+    );
+    Ok(())
+}
+
 #[allow(clippy::too_many_lines)]
 fn find_prior_provider_receipt(
     source_private_root: &Path,
     source_call_id: &str,
-) -> Result<CognitiveFieldProviderEvidenceReceipt> {
+) -> Result<(CognitiveFieldProviderEvidenceReceipt, PathBuf)> {
     fn visit(
         directory: &Path,
         source_call_id: &str,
-        matches: &mut Vec<CognitiveFieldProviderEvidenceReceipt>,
+        matches: &mut Vec<(CognitiveFieldProviderEvidenceReceipt, PathBuf)>,
         depth: u8,
     ) -> Result<()> {
         ensure!(
@@ -3586,7 +3854,7 @@ fn find_prior_provider_receipt(
                 && let Ok(receipt) = read_json::<CognitiveFieldProviderEvidenceReceipt>(&path)
                 && receipt.call_id == source_call_id
             {
-                matches.push(receipt);
+                matches.push((receipt, fs::canonicalize(path)?));
             }
         }
         Ok(())
@@ -3628,6 +3896,7 @@ fn verify_accepted_prior_role(
         deterministic_receipt_refs,
         contamination_receipt_ref,
         worktree_diff_sha256,
+        legacy_evidence_admission,
         ..
     } = source
     else {
@@ -3684,13 +3953,32 @@ fn verify_accepted_prior_role(
     );
     let (canonical_schema, _) = role_schema_contracts(*role)?;
     ensure!(
-        canonical_schema.sha256 == *output_schema_sha256
-            && source_call
-                .get("canonical_schema_sha256")
-                .and_then(Value::as_str)
-                == Some(output_schema_sha256),
+        canonical_schema.sha256 == *output_schema_sha256,
         "accepted prior output schema differs from the current Rust contract"
     );
+    match source_call.get("canonical_schema_sha256") {
+        Some(Value::String(source_schema_sha256)) => ensure!(
+            source_schema_sha256 == output_schema_sha256 && legacy_evidence_admission.is_none(),
+            "accepted prior output schema differs from the current Rust contract"
+        ),
+        None => {
+            let admission = legacy_evidence_admission.as_ref().context(
+                "missing historical source_call.canonical_schema_sha256 lacks typed admission",
+            )?;
+            validate_legacy_evidence_admission_record(
+                admission,
+                &contract.run_id,
+                source_run_id,
+                source_call_id,
+                *role,
+                case_id,
+                output_schema_sha256,
+                runtime_contract_sha256,
+            )?;
+            verify_legacy_worker_acceptance_plan(report_root, private_root, admission, source)?;
+        }
+        Some(_) => bail!("accepted prior canonical schema field is present but is not a string"),
+    }
     let prompt_ref = source_call
         .get("prompt_ref")
         .and_then(Value::as_str)
@@ -3748,12 +4036,11 @@ fn verify_accepted_prior_role(
             && projection.contract_hash == source_contract.contract_hash
             && source_plan.get("plan_hash").and_then(Value::as_str)
                 == Some(projection.provider_plan_hash.as_str())
-            && projection.outputs.len() == executions.len()
-            && (projection.runtime_contract_sha256.is_empty()
-                || projection.runtime_contract_sha256 == *runtime_contract_sha256),
+            && projection.outputs.len() == executions.len(),
         "accepted prior provider projection differs from the sealed dependency"
     );
-    let receipt = find_prior_provider_receipt(&source_private_root, source_call_id)?;
+    let (receipt, receipt_path) =
+        find_prior_provider_receipt(&source_private_root, source_call_id)?;
     ensure!(
         receipt.run_id == *source_run_id
             && receipt.call_id == *source_call_id
@@ -3769,9 +4056,7 @@ fn verify_accepted_prior_role(
             && receipt.exit_code == 0
             && !receipt.timed_out
             && !receipt.unknown_outcome
-            && !receipt.controller_substitution
-            && (receipt.runtime_contract_sha256.is_empty()
-                || receipt.runtime_contract_sha256 == *runtime_contract_sha256),
+            && !receipt.controller_substitution,
         "accepted prior provider receipt is not one known successful invocation"
     );
     let receipt_executions = receipt
@@ -3783,6 +4068,31 @@ fn verify_accepted_prior_role(
         receipt_executions == executions.iter().cloned().collect(),
         "accepted prior receipt executions differ from the role dependency"
     );
+    match (
+        projection.runtime_contract_sha256.is_empty(),
+        receipt.runtime_contract_sha256.is_empty(),
+    ) {
+        (false, false) => ensure!(
+            projection.runtime_contract_sha256 == *runtime_contract_sha256
+                && receipt.runtime_contract_sha256 == *runtime_contract_sha256,
+            "accepted prior runtime contract differs from the exact role dependency"
+        ),
+        (true, true) => verify_legacy_provider_runtime_binding(
+            private_root,
+            &source_private_root,
+            source_run_id,
+            source_call_id,
+            source_commit,
+            provider_session_id,
+            provider_receipt_ref,
+            provider_executable_sha256,
+            prompt_sha256,
+            runtime_contract_sha256,
+            &receipt_path,
+            &receipt,
+        )?,
+        _ => bail!("accepted prior runtime dependency is only partially recorded"),
+    }
 
     let mut outputs = Vec::new();
     let mut observed_deterministic_hashes = Vec::new();
@@ -4989,16 +5299,19 @@ fn print_json<T: Serialize>(value: &T) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        CognitiveHarnessOnlyEquivalence, CoreRoleEvidenceSource, READER_SCHEMA_JSON_PLACEHOLDER,
+        CognitiveHarnessOnlyEquivalence, CoreRoleEvidenceSource,
+        LEGACY_EVIDENCE_ADMISSION_SCHEMA_VERSION, LEGACY_WORKER_ACCEPTANCE_RUN_ID,
+        LEGACY_WORKER_CASE_ID, LEGACY_WORKER_MISSING_FIELD, LEGACY_WORKER_SOURCE_CALL_ID,
+        LEGACY_WORKER_SOURCE_RUN_ID, LegacyEvidenceAdmissionRecord, READER_SCHEMA_JSON_PLACEHOLDER,
         READER_SCHEMA_SHA256_PLACEHOLDER, canonical_path, codex_cognitive_runtime_contract,
         computed_runtime_contract_sha256, execution_conditions, generated_oracle,
         provider_compatible_reader_schema, provider_plan_without_hash, record_provider,
         render_provider_contract, render_reader_prompt, role_schema_contracts,
         schema_validation_projection, seal_runtime_contract, sha256_bytes,
         validate_deterministic_receipt, validate_governor_product_provenance,
-        validate_json_schema_instance, validate_provider_calls,
-        validate_provider_calls_with_sources, validate_provider_receipt_envelope,
-        validate_reader_output, write_new_or_same_json,
+        validate_json_schema_instance, validate_legacy_evidence_admission_record,
+        validate_provider_calls, validate_provider_calls_with_sources,
+        validate_provider_receipt_envelope, validate_reader_output, write_new_or_same_json,
     };
     use eliot_engine::CognitiveFieldGradingService;
     use eliot_types::{
@@ -5143,6 +5456,7 @@ mod tests {
                 ],
                 contamination_receipt_ref: "contamination:worker".to_owned(),
                 worktree_diff_sha256: Some("f".repeat(64)),
+                legacy_evidence_admission: None,
             },
             CoreRoleEvidenceSource::AcceptedPriorRoleArtifact {
                 source_run_id: "cq-core-20260730-005".to_owned(),
@@ -5164,6 +5478,7 @@ mod tests {
                 deterministic_receipt_refs: vec!["treatment#sha256=".to_owned() + &"c".repeat(64)],
                 contamination_receipt_ref: "contamination:treatment-reader".to_owned(),
                 worktree_diff_sha256: None,
+                legacy_evidence_admission: None,
             },
             CoreRoleEvidenceSource::AcceptedPriorRoleArtifact {
                 source_run_id: "cq-core-20260730-005".to_owned(),
@@ -5185,6 +5500,7 @@ mod tests {
                 deterministic_receipt_refs: vec!["control#sha256=".to_owned() + &"d".repeat(64)],
                 contamination_receipt_ref: "contamination:control-reader".to_owned(),
                 worktree_diff_sha256: None,
+                legacy_evidence_admission: None,
             },
             CoreRoleEvidenceSource::AcceptedPriorRoleArtifact {
                 source_run_id: "cq-core-20260730-005".to_owned(),
@@ -5209,8 +5525,108 @@ mod tests {
                 ],
                 contamination_receipt_ref: "contamination:judge".to_owned(),
                 worktree_diff_sha256: None,
+                legacy_evidence_admission: None,
             },
         ])
+    }
+
+    fn legacy_worker_admission(
+        admitting_run_id: &str,
+        output_schema_sha256: &str,
+        runtime_binding_sha256: &str,
+    ) -> LegacyEvidenceAdmissionRecord {
+        LegacyEvidenceAdmissionRecord {
+            schema_version: LEGACY_EVIDENCE_ADMISSION_SCHEMA_VERSION.to_owned(),
+            admitting_run_id: admitting_run_id.to_owned(),
+            source_run_id: LEGACY_WORKER_SOURCE_RUN_ID.to_owned(),
+            source_call_id: LEGACY_WORKER_SOURCE_CALL_ID.to_owned(),
+            case_id: LEGACY_WORKER_CASE_ID.to_owned(),
+            role: CognitiveFieldRole::CodexWorker,
+            missing_historical_field: LEGACY_WORKER_MISSING_FIELD.to_owned(),
+            accepted_role_evidence_run_id: LEGACY_WORKER_ACCEPTANCE_RUN_ID.to_owned(),
+            accepted_role_evidence_plan_hash: "blake3:accepted-run005-plan".to_owned(),
+            output_schema_sha256: output_schema_sha256.to_owned(),
+            historical_runtime_binding_sha256: runtime_binding_sha256.to_owned(),
+            fresh_provider_authority: false,
+        }
+    }
+
+    #[test]
+    fn legacy_worker_schema_admission_accepts_only_the_frozen_tuple()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let run_id = "cq-core-20260730-006";
+        let (worker_schema, _) = role_schema_contracts(CognitiveFieldRole::CodexWorker)?;
+        let runtime_binding_sha256 = "3".repeat(64);
+        let admission =
+            legacy_worker_admission(run_id, &worker_schema.sha256, &runtime_binding_sha256);
+        validate_legacy_evidence_admission_record(
+            &admission,
+            run_id,
+            LEGACY_WORKER_SOURCE_RUN_ID,
+            LEGACY_WORKER_SOURCE_CALL_ID,
+            CognitiveFieldRole::CodexWorker,
+            LEGACY_WORKER_CASE_ID,
+            &worker_schema.sha256,
+            &runtime_binding_sha256,
+        )?;
+        Ok(())
+    }
+
+    #[test]
+    fn legacy_worker_schema_admission_rejects_tuple_or_authority_drift()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let run_id = "cq-core-20260730-006";
+        let (worker_schema, _) = role_schema_contracts(CognitiveFieldRole::CodexWorker)?;
+        let runtime_binding_sha256 = "3".repeat(64);
+        let admission =
+            legacy_worker_admission(run_id, &worker_schema.sha256, &runtime_binding_sha256);
+        let mut wrong_tuple = admission.clone();
+        wrong_tuple.source_call_id = "fresh-call".to_owned();
+        assert!(
+            validate_legacy_evidence_admission_record(
+                &wrong_tuple,
+                run_id,
+                LEGACY_WORKER_SOURCE_RUN_ID,
+                LEGACY_WORKER_SOURCE_CALL_ID,
+                CognitiveFieldRole::CodexWorker,
+                LEGACY_WORKER_CASE_ID,
+                &worker_schema.sha256,
+                &runtime_binding_sha256,
+            )
+            .is_err()
+        );
+        let mut fresh_authority = admission.clone();
+        fresh_authority.fresh_provider_authority = true;
+        assert!(
+            validate_legacy_evidence_admission_record(
+                &fresh_authority,
+                run_id,
+                LEGACY_WORKER_SOURCE_RUN_ID,
+                LEGACY_WORKER_SOURCE_CALL_ID,
+                CognitiveFieldRole::CodexWorker,
+                LEGACY_WORKER_CASE_ID,
+                &worker_schema.sha256,
+                &runtime_binding_sha256,
+            )
+            .is_err()
+        );
+        let mut wrong_missing_field = admission;
+        wrong_missing_field.missing_historical_field =
+            "provider_receipt.runtime_contract_sha256".to_owned();
+        assert!(
+            validate_legacy_evidence_admission_record(
+                &wrong_missing_field,
+                run_id,
+                LEGACY_WORKER_SOURCE_RUN_ID,
+                LEGACY_WORKER_SOURCE_CALL_ID,
+                CognitiveFieldRole::CodexWorker,
+                LEGACY_WORKER_CASE_ID,
+                &worker_schema.sha256,
+                &runtime_binding_sha256,
+            )
+            .is_err()
+        );
+        Ok(())
     }
 
     #[test]
