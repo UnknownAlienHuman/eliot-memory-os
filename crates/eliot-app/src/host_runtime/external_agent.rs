@@ -22,12 +22,18 @@ use eliot_types::{
 };
 use std::collections::BTreeMap;
 use std::ffi::OsStr;
+use std::future::Future;
 use std::process::{Command, Stdio};
-use tokio::io::AsyncWriteExt as _;
+use std::sync::{Arc, Mutex};
+use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWriteExt as _};
 
 const MAX_PROVIDER_OUTPUT_BYTES: u64 = 1_048_576;
+const MAX_MCP_REFERENCE_OUTPUT_BYTES: u64 = 1_048_576;
+const MCP_REFERENCE_TIMEOUT: Duration = Duration::from_secs(20);
+const MCP_SMOKE_PRE_PROVIDER_TIMEOUT: Duration = Duration::from_secs(60);
 const PROVIDER_CLEANUP_GRACE_SECONDS: u64 = 15;
 const EXTERNAL_ADAPTER_VERSION: &str = "eliot-external-agent-adapter-v1";
+const MCP_SMOKE_PHASE_SCHEMA_VERSION: &str = "eliot-external-agent-smoke-phase-v1";
 const SAFE_INHERITED_ENVIRONMENT: &[&str] = &[
     "SystemRoot",
     "WINDIR",
@@ -170,24 +176,31 @@ pub(crate) async fn dispatch(
             let adapter_id = adapter_id(host);
             let health = supervisor.health_probe(adapter_id).await;
             let manifest = supervisor.registry().inspect(adapter_id)?;
-            let mcp_preflight =
-                mcp_reference_exchange(config_path, None, Some(host), None, None, None)
-                    .await
-                    .map_or_else(
-                        |error| {
-                            json!({
-                                "passed": false,
-                                "error": error.to_string(),
-                            })
-                        },
-                        |value| {
-                            json!({
-                                "passed": true,
-                                "tool_names": value.tool_names,
-                                "raw_database_absent": value.raw_database_absent,
-                            })
-                        },
-                    );
+            let mcp_preflight = mcp_reference_exchange(
+                config_path,
+                None,
+                Some(host),
+                None,
+                None,
+                None,
+                "doctor_mcp",
+            )
+            .await
+            .map_or_else(
+                |error| {
+                    json!({
+                        "passed": false,
+                        "error": error.to_string(),
+                    })
+                },
+                |value| {
+                    json!({
+                        "passed": true,
+                        "tool_names": value.tool_names,
+                        "raw_database_absent": value.raw_database_absent,
+                    })
+                },
+            );
             write_json(&json!({
                 "schema_version": "eliot-external-agent-doctor-v1",
                 "host": host,
@@ -214,6 +227,11 @@ pub(crate) async fn dispatch(
             let report = run_mcp_smoke(config_path, host, &model).await?;
             write_json(&report)
         }
+        crate::ExternalAgentCommand::McpPreflight { host, model } => {
+            let host = parse_host(&host)?;
+            let report = run_mcp_preflight(config_path, host, &model).await?;
+            write_json(&report)
+        }
         crate::ExternalAgentCommand::Inspect { invocation } => {
             anyhow::ensure!(
                 !invocation.trim().is_empty()
@@ -238,6 +256,133 @@ struct McpReferenceExchange {
     tool_call: Option<Value>,
 }
 
+#[derive(Debug)]
+struct CappedRead {
+    bytes: Vec<u8>,
+    overflowed: bool,
+}
+
+async fn read_and_drain_capped<R>(
+    mut reader: R,
+    max_bytes: u64,
+    stream_name: &'static str,
+) -> Result<CappedRead>
+where
+    R: AsyncRead + Unpin,
+{
+    let max_bytes = usize::try_from(max_bytes).context("MCP output cap exceeds usize")?;
+    let mut bytes = Vec::new();
+    let mut overflowed = false;
+    let mut chunk = [0_u8; 8_192];
+    loop {
+        let read = reader
+            .read(&mut chunk)
+            .await
+            .with_context(|| format!("read MCP reference {stream_name}"))?;
+        if read == 0 {
+            break;
+        }
+        let keep = max_bytes.saturating_sub(bytes.len()).min(read);
+        bytes.extend_from_slice(&chunk[..keep]);
+        overflowed |= keep != read;
+    }
+    Ok(CappedRead { bytes, overflowed })
+}
+
+async fn run_bounded_mcp_child(
+    mut command: tokio::process::Command,
+    request_bytes: Vec<u8>,
+    phase: &str,
+    timeout: Duration,
+) -> Result<std::process::Output> {
+    command.kill_on_drop(true);
+    let mut child = command
+        .spawn()
+        .with_context(|| format!("start Rust MCP reference exchange phase={phase}"))?;
+    let pid = child.id().unwrap_or_default();
+    let mut stdin = child
+        .stdin
+        .take()
+        .context("MCP reference stdin is absent")?;
+    let stdout = child
+        .stdout
+        .take()
+        .context("MCP reference stdout is absent")?;
+    let stderr = child
+        .stderr
+        .take()
+        .context("MCP reference stderr is absent")?;
+
+    let writer = tokio::spawn(async move {
+        stdin
+            .write_all(&request_bytes)
+            .await
+            .context("write MCP reference requests")?;
+        stdin
+            .shutdown()
+            .await
+            .context("shutdown MCP reference stdin")?;
+        Ok::<(), anyhow::Error>(())
+    });
+    let stdout_reader = tokio::spawn(read_and_drain_capped(
+        stdout,
+        MAX_MCP_REFERENCE_OUTPUT_BYTES,
+        "stdout",
+    ));
+    let stderr_reader = tokio::spawn(read_and_drain_capped(
+        stderr,
+        MAX_MCP_REFERENCE_OUTPUT_BYTES,
+        "stderr",
+    ));
+
+    let deadline = tokio::time::sleep(timeout);
+    tokio::pin!(deadline);
+    let status = tokio::select! {
+        status = child.wait() => Some(status.context("wait for Rust MCP reference exchange")?),
+        () = &mut deadline => None,
+    };
+    let Some(status) = status else {
+        let kill_error = child.kill().await.err();
+        let reap_error = child.wait().await.err();
+        writer.abort();
+        stdout_reader.abort();
+        stderr_reader.abort();
+        drop(writer.await);
+        drop(stdout_reader.await);
+        drop(stderr_reader.await);
+        anyhow::ensure!(
+            kill_error.is_none() && reap_error.is_none(),
+            "Rust MCP reference exchange phase={phase} exceeded {} seconds; pid={pid}; kill_error={kill_error:?}; reap_error={reap_error:?}",
+            timeout.as_secs_f64()
+        );
+        anyhow::bail!(
+            "Rust MCP reference exchange phase={phase} exceeded {} seconds; pid={pid}; child killed and reaped",
+            timeout.as_secs_f64()
+        );
+    };
+
+    writer.await.context("join MCP reference stdin writer")??;
+    let stdout = stdout_reader
+        .await
+        .context("join MCP reference stdout reader")??;
+    let stderr = stderr_reader
+        .await
+        .context("join MCP reference stderr reader")??;
+    anyhow::ensure!(
+        !stdout.overflowed,
+        "Rust MCP reference exchange phase={phase} stdout exceeded {MAX_MCP_REFERENCE_OUTPUT_BYTES} bytes"
+    );
+    anyhow::ensure!(
+        !stderr.overflowed,
+        "Rust MCP reference exchange phase={phase} stderr exceeded {MAX_MCP_REFERENCE_OUTPUT_BYTES} bytes"
+    );
+    Ok(std::process::Output {
+        status,
+        stdout: stdout.bytes,
+        stderr: stderr.bytes,
+    })
+}
+
 #[allow(
     clippy::too_many_lines,
     reason = "the reference exchange keeps one auditable MCP process lifecycle"
@@ -249,6 +394,7 @@ async fn mcp_reference_exchange(
     scope: Option<&HostLaunchScope>,
     tool_name: Option<&str>,
     tool_arguments: Option<&Value>,
+    phase: &str,
 ) -> Result<McpReferenceExchange> {
     let executable =
         std::env::var_os("ELIOT_GOVERNOR_EXE").map_or(std::env::current_exe()?, PathBuf::from);
@@ -298,13 +444,6 @@ async fn mcp_reference_exchange(
             command.env("ELIOT_ROLE_LEASE_ID", value);
         }
     }
-    let mut child = command
-        .spawn()
-        .context("start Rust MCP reference exchange")?;
-    let mut stdin = child
-        .stdin
-        .take()
-        .context("MCP reference stdin is absent")?;
     let mut requests = vec![
         json!({
             "jsonrpc": "2.0",
@@ -337,27 +476,20 @@ async fn mcp_reference_exchange(
             }
         }));
     }
+    let mut request_bytes = Vec::new();
     for (index, request) in requests.iter().enumerate() {
-        stdin
-            .write_all(&serde_json::to_vec(request)?)
-            .await
-            .context("write MCP reference request")?;
-        stdin.write_all(b"\n").await?;
+        request_bytes.extend_from_slice(&serde_json::to_vec(request)?);
+        request_bytes.push(b'\n');
         if index == 0 {
-            stdin
-                .write_all(&serde_json::to_vec(&json!({
-                    "jsonrpc": "2.0",
-                    "method": "notifications/initialized"
-                }))?)
-                .await?;
-            stdin.write_all(b"\n").await?;
+            request_bytes.extend_from_slice(&serde_json::to_vec(&json!({
+                "jsonrpc": "2.0",
+                "method": "notifications/initialized"
+            }))?);
+            request_bytes.push(b'\n');
         }
     }
-    stdin.shutdown().await?;
-    drop(stdin);
-    let output = tokio::time::timeout(Duration::from_secs(20), child.wait_with_output())
-        .await
-        .context("Rust MCP reference exchange exceeded 20 seconds")??;
+    let output =
+        run_bounded_mcp_child(command, request_bytes, phase, MCP_REFERENCE_TIMEOUT).await?;
     anyhow::ensure!(
         output.status.success(),
         "Rust MCP reference exchange failed: {}",
@@ -418,282 +550,613 @@ fn response_by_id(responses: &[Value], id: u64) -> Result<&Value> {
         .with_context(|| format!("MCP response {id} is absent"))
 }
 
-#[allow(clippy::too_many_lines)]
-async fn run_mcp_smoke(config_path: &Path, host: AgentHostId, model: &str) -> Result<Value> {
+#[derive(Clone)]
+struct SmokePhaseTrace {
+    path: PathBuf,
+    smoke_id: String,
+    active: Arc<Mutex<Option<ActiveSmokePhase>>>,
+}
+
+struct ActiveSmokePhase {
+    name: String,
+    started: Instant,
+}
+
+impl SmokePhaseTrace {
+    fn new(smoke_root: &Path, smoke_id: &str) -> Result<Self> {
+        std::fs::create_dir_all(smoke_root)?;
+        Ok(Self {
+            path: smoke_root.join("phases.jsonl"),
+            smoke_id: smoke_id.to_owned(),
+            active: Arc::new(Mutex::new(None)),
+        })
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+
+    fn append(
+        &self,
+        phase: &str,
+        status: &str,
+        elapsed: Duration,
+        detail: Option<&str>,
+    ) -> Result<()> {
+        let elapsed_ms = u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX);
+        let entry = json!({
+            "schema_version": MCP_SMOKE_PHASE_SCHEMA_VERSION,
+            "smoke_id": self.smoke_id,
+            "phase": phase,
+            "status": status,
+            "elapsed_ms": elapsed_ms,
+            "observed_at": OffsetDateTime::now_utc(),
+            "diagnostic_only": true,
+            "host_broker_receipt": false,
+            "detail": detail,
+        });
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.path)
+            .with_context(|| format!("open smoke phase journal {}", self.path.display()))?;
+        serde_json::to_writer(&mut file, &entry)?;
+        file.write_all(b"\n")?;
+        file.sync_data()?;
+        Ok(())
+    }
+
+    fn start(&self, phase: &str) -> Result<()> {
+        {
+            let mut active = self
+                .active
+                .lock()
+                .map_err(|_| anyhow::anyhow!("smoke phase mutex is poisoned"))?;
+            anyhow::ensure!(
+                active.is_none(),
+                "cannot start smoke phase {phase}; another phase is active"
+            );
+            *active = Some(ActiveSmokePhase {
+                name: phase.to_owned(),
+                started: Instant::now(),
+            });
+        }
+        if let Err(error) = self.append(phase, "started", Duration::ZERO, None) {
+            let mut active = self
+                .active
+                .lock()
+                .map_err(|_| anyhow::anyhow!("smoke phase mutex is poisoned"))?;
+            *active = None;
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    fn finish(&self, phase: &str, status: &str, detail: Option<&str>) -> Result<()> {
+        let active = self
+            .active
+            .lock()
+            .map_err(|_| anyhow::anyhow!("smoke phase mutex is poisoned"))?
+            .take()
+            .context("no active smoke phase to finish")?;
+        anyhow::ensure!(
+            active.name == phase,
+            "smoke phase mismatch: active={} finished={phase}",
+            active.name
+        );
+        self.append(phase, status, active.started.elapsed(), detail)
+    }
+
+    async fn run<T, F>(&self, phase: &str, future: F) -> Result<T>
+    where
+        F: Future<Output = Result<T>>,
+    {
+        self.start(phase)?;
+        match future.await {
+            Ok(value) => {
+                self.finish(phase, "passed", None)?;
+                Ok(value)
+            }
+            Err(error) => {
+                let detail = error.to_string();
+                self.finish(phase, "failed", Some(&detail))?;
+                Err(error)
+            }
+        }
+    }
+
+    fn run_sync<T, F>(&self, phase: &str, operation: F) -> Result<T>
+    where
+        F: FnOnce() -> Result<T>,
+    {
+        self.start(phase)?;
+        match operation() {
+            Ok(value) => {
+                self.finish(phase, "passed", None)?;
+                Ok(value)
+            }
+            Err(error) => {
+                let detail = error.to_string();
+                self.finish(phase, "failed", Some(&detail))?;
+                Err(error)
+            }
+        }
+    }
+
+    fn abort_active(&self, detail: &str) -> Result<()> {
+        let active = self
+            .active
+            .lock()
+            .map_err(|_| anyhow::anyhow!("smoke phase mutex is poisoned"))?
+            .take();
+        if let Some(active) = active {
+            self.append(
+                &active.name,
+                "aborted",
+                active.started.elapsed(),
+                Some(detail),
+            )?;
+        }
+        Ok(())
+    }
+}
+
+struct McpSmokePreparation {
+    smoke_id: String,
+    smoke_root: PathBuf,
+    workspace: PathBuf,
+    project_id: ProjectId,
+    task_id: TaskId,
+    scope: HostLaunchScope,
+    work_item_id: WorkItemId,
+    memory_revision: u64,
+    preflight: McpReferenceExchange,
+    trace: SmokePhaseTrace,
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "the bounded preparation keeps phase attribution and canonical identity setup together"
+)]
+async fn prepare_mcp_smoke(
+    config_path: &Path,
+    host: AgentHostId,
+    model: &str,
+) -> Result<McpSmokePreparation> {
     anyhow::ensure!(
         host != AgentHostId::Codex,
         "Codex is not an external adapter"
     );
     anyhow::ensure!(
         !model.trim().is_empty(),
-        "mcp-smoke requires an exact non-empty model"
+        "MCP smoke preparation requires an exact non-empty model"
     );
     let smoke_id = format!("external-agent-smoke-{}-{}", host.as_str(), Uuid::now_v7());
     let smoke_root = runtime_root(config_path)
         .join("external-agent-smokes")
         .join(&smoke_id);
     let workspace = smoke_root.join("workspace");
-    std::fs::create_dir_all(&workspace)?;
+    let trace = SmokePhaseTrace::new(&smoke_root, &smoke_id)?;
 
-    let identity = mcp_reference_exchange(
-        config_path,
-        Some("codex_controller"),
-        None,
-        None,
-        Some("eliot_project_identity"),
-        Some(&json!({"project_key": path_string(&workspace)})),
-    )
-    .await?;
-    let identity = identity
-        .tool_call
-        .context("project identity tool returned no structured content")?;
-    let project_id = identity
-        .get("project_id")
-        .or_else(|| identity.pointer("/tool_call/project_id"))
-        .and_then(Value::as_str)
-        .context("project identity returned no project_id")
-        .and_then(|value| ProjectId::from_str(value).context("parse smoke project_id"))?;
-    let task_id = TaskId::new_v7();
-    let task_create = mcp_reference_exchange(
-        config_path,
-        Some("codex_controller"),
-        None,
-        None,
-        Some("eliot_task_contract_create"),
-        Some(&json!({
-            "project_id": project_id,
-            "task_id": task_id,
-            "write_id": Uuid::now_v7(),
-            "title": format!("{} production adapter current_state smoke", host.as_str()),
-            "acceptance_items": [
-                {
-                    "item_id": "headless_transport",
-                    "description": "official headless provider invokes exactly one Governor MCP server",
-                    "required_evidence": "observation"
-                },
-                {
-                    "item_id": "current_state",
-                    "description": "provider returns the canonical bound project/task revision",
-                    "required_evidence": "verification"
-                }
-            ]
-        })),
-    )
-    .await?;
-    anyhow::ensure!(
-        task_create
+    let preparation = async {
+        trace
+            .run("workspace_create", async {
+                std::fs::create_dir_all(&workspace)?;
+                Ok(())
+            })
+            .await?;
+        let identity = trace
+            .run(
+                "project_identity",
+                mcp_reference_exchange(
+                    config_path,
+                    Some("codex_controller"),
+                    None,
+                    None,
+                    Some("eliot_project_identity"),
+                    Some(&json!({"project_key": path_string(&workspace)})),
+                    "project_identity",
+                ),
+            )
+            .await?;
+        let identity = identity
+            .tool_call
+            .context("project identity tool returned no structured content")?;
+        let project_id = identity
+            .get("project_id")
+            .or_else(|| identity.pointer("/tool_call/project_id"))
+            .and_then(Value::as_str)
+            .context("project identity returned no project_id")
+            .and_then(|value| ProjectId::from_str(value).context("parse smoke project_id"))?;
+        let task_id = TaskId::new_v7();
+        let task_create = trace
+            .run(
+                "task_contract_create",
+                mcp_reference_exchange(
+                    config_path,
+                    Some("codex_controller"),
+                    None,
+                    None,
+                    Some("eliot_task_contract_create"),
+                    Some(&json!({
+                        "project_id": project_id,
+                        "task_id": task_id,
+                        "write_id": Uuid::now_v7(),
+                        "title": format!("{} production adapter current_state smoke", host.as_str()),
+                        "acceptance_items": [
+                            {
+                                "item_id": "headless_transport",
+                                "description": "official headless provider invokes exactly one Governor MCP server",
+                                "required_evidence": "observation"
+                            },
+                            {
+                                "item_id": "current_state",
+                                "description": "provider returns the canonical bound project/task revision",
+                                "required_evidence": "verification"
+                            }
+                        ]
+                    })),
+                    "task_contract_create",
+                ),
+            )
+            .await?;
+        anyhow::ensure!(
+            task_create
+                .tool_call
+                .as_ref()
+                .is_some_and(|value| value.get("task_contract").is_some()),
+            "smoke task contract was not created canonically"
+        );
+        let session_id = SessionId::new_v7();
+        let mut scope = trace
+            .run(
+                "ul_auditor_scope",
+                prepare_ul_auditor_scope(
+                    config_path,
+                    host,
+                    project_id,
+                    task_id,
+                    session_id,
+                    &smoke_id,
+                ),
+            )
+            .await?;
+        let work_item_id = WorkItemId::new_v7();
+        scope.work_item_id = Some(work_item_id);
+        scope.planned_verifier_ref = Some(format!("external-agent-smoke-verifier:{smoke_id}"));
+
+        let preflight = trace
+            .run(
+                "current_state_preflight",
+                mcp_reference_exchange(
+                    config_path,
+                    if host == AgentHostId::OpenCode {
+                        Some("default")
+                    } else {
+                        Some("external_auditor")
+                    },
+                    Some(host),
+                    Some(&scope),
+                    Some("eliot_current_state"),
+                    Some(&json!({"scope": "memory_free_control"})),
+                    "current_state_preflight",
+                ),
+            )
+            .await?;
+        anyhow::ensure!(
+            preflight
+                .tool_names
+                .iter()
+                .any(|name| name == "eliot_current_state"),
+            "zero-model preflight did not expose eliot_current_state"
+        );
+        let current_state = preflight
             .tool_call
             .as_ref()
-            .is_some_and(|value| value.get("task_contract").is_some()),
-        "smoke task contract was not created canonically"
-    );
-    let session_id = SessionId::new_v7();
-    let mut scope = prepare_ul_auditor_scope(
-        config_path,
-        host,
-        project_id,
-        task_id,
-        session_id,
-        &smoke_id,
-    )
-    .await?;
-    let work_item_id = WorkItemId::new_v7();
-    scope.work_item_id = Some(work_item_id);
-    scope.planned_verifier_ref = Some(format!("external-agent-smoke-verifier:{smoke_id}"));
-
-    let preflight = mcp_reference_exchange(
-        config_path,
-        if host == AgentHostId::OpenCode {
-            Some("default")
-        } else {
-            Some("external_auditor")
-        },
-        Some(host),
-        Some(&scope),
-        Some("eliot_current_state"),
-        Some(&json!({"scope": "memory_free_control"})),
-    )
-    .await?;
-    anyhow::ensure!(
-        preflight
-            .tool_names
-            .iter()
-            .any(|name| name == "eliot_current_state"),
-        "zero-model preflight did not expose eliot_current_state"
-    );
-    let current_state = preflight
-        .tool_call
-        .context("zero-model current_state preflight returned no structured content")?;
-    let memory_revision = current_state
-        .get("memory_revision")
-        .or_else(|| current_state.get("revision"))
-        .and_then(Value::as_u64)
-        .context("zero-model current_state returned no memory revision")?;
-
-    let schema = json!({
-        "type": "object",
-        "additionalProperties": false,
-        "required": ["project_id", "task_id", "memory_revision", "resolved_model"],
-        "properties": {
-            "project_id": {"const": project_id.to_string()},
-            "task_id": {"const": task_id.to_string()},
-            "memory_revision": {"const": memory_revision},
-            "resolved_model": {"const": model}
-        }
-    });
-    let prompt = format!(
-        "Use the configured ELIOT MCP server. Call eliot_current_state exactly once with scope memory_free_control. Return only the schema-bound project_id, task_id, memory_revision and resolved_model={model}. Do not edit files."
-    );
-    let prompt_path = smoke_root.join("prompt.txt");
-    let schema_path = smoke_root.join("schema.json");
-    atomic_write_bytes(&prompt_path, prompt.as_bytes())?;
-    atomic_write_json(&schema_path, &schema)?;
-    let agent_session_id = scope
-        .agent_session_id
-        .context("smoke scope has no AgentSession")?;
-    let role_lease_id = scope
-        .role_lease_id
-        .clone()
-        .context("smoke scope has no TaskRoleLease")?;
-    let mut launch_contract = eliot_types::HostLaunchContract {
-        invocation_id: smoke_id.clone(),
-        host_profile_ref: format!("external-agent-adapter:{}", host.as_str()),
-        mode: HostMode::Supervised,
-        project_id: Some(project_id),
-        agent_session_id: Some(agent_session_id),
-        task_id: Some(task_id),
-        work_item_id: Some(work_item_id),
-        role_lease_id: Some(role_lease_id.clone()),
-        work_lease_id: None,
-        worktree_lease_id: None,
-        planned_verifier_ref: scope.planned_verifier_ref.clone(),
-        cwd_or_worktree: path_string(&workspace),
-        baseline_commit: None,
-        allowed_paths: Vec::new(),
-        forbidden_paths: vec![
-            "truth-promotion".to_owned(),
-            "raw-database".to_owned(),
-            "provider-credential-roots".to_owned(),
-        ],
-        integration_bundle_ref: path_string(&smoke_root),
-        mcp_config_ref: path_string(&smoke_root.join("provider-mcp.json")),
-        skill_bundle_ref: path_string(&smoke_root.join("skills")),
-        lifecycle_bridge_ref: "external-agent-adapter".to_owned(),
-        environment_allowlist: SAFE_INHERITED_ENVIRONMENT
-            .iter()
-            .map(|name| (*name).to_owned())
-            .collect(),
-        permission_profile: "external_auditor".to_owned(),
-        model_route_if_selected: Some(model.to_owned()),
-        max_turns_or_steps: Some(4),
-        wall_clock_budget_seconds: 120,
-        cost_budget_if_supported: None,
-        session_id: None,
-        resume_policy: "fresh_only".to_owned(),
-        structured_output_schema_ref: Some(path_string(&schema_path)),
-        stdout_stderr_spool: path_string(&smoke_root.join("spool")),
-        artifact_manifest_ref: path_string(&smoke_root.join("artifacts.json")),
-        idempotency_key: format!("external-agent-smoke:{smoke_id}"),
-        expected_result_kind: "provider_execution_evidence".to_owned(),
-        contract_hash: String::new(),
-    };
-    launch_contract.contract_hash = blake3::hash(&serde_json::to_vec(&launch_contract)?)
-        .to_hex()
-        .to_string();
-    let invocation = eliot_types::AgentInvocationRequest {
-        invocation_id: smoke_id.clone(),
-        project_id,
-        task_id,
-        work_item_id,
-        requested_capabilities: vec![
-            "emit_candidate_observation".to_owned(),
-            "request_controller_review".to_owned(),
-        ],
-        role_lease_id,
-        work_lease_id: None,
-        packet_refs: Vec::new(),
-        expected_result_kind: "provider_execution_evidence".to_owned(),
-        verifier_ref: format!("external-agent-smoke-verifier:{smoke_id}"),
-        idempotency_key: format!("external-agent-smoke:{smoke_id}"),
-    };
-    let execution = ExternalAgentExecutionRequest {
-        invocation,
-        launch_contract,
-        purpose: ExternalAgentPurpose::UnderstandingReader,
-        prompt_ref: path_string(&prompt_path),
-        prompt_sha256: sha256_bytes(prompt.as_bytes()),
-        output_schema_ref: path_string(&schema_path),
-        output_schema_sha256: sha256_bytes(&std::fs::read(&schema_path)?),
-        requested_model: model.to_owned(),
-        max_turns_or_steps: 4,
-        timeout_profile_ref: format!("provider-timeout:{}-smoke-120s", host.as_str()),
-        allowed_provider_tools: provider_allowed_tools(host),
-        denied_provider_tools: vec![
-            "Bash".to_owned(),
-            "Edit".to_owned(),
-            "Write".to_owned(),
-            "NotebookEdit".to_owned(),
-            "WebFetch".to_owned(),
-            "WebSearch".to_owned(),
-        ],
-        expected_mcp_tool_names: vec!["eliot_current_state".to_owned()],
-        forbidden_mcp_server_names: vec!["eliot_surrealdb".to_owned(), "surrealdb".to_owned()],
-        read_only: true,
-        candidate_only: true,
-    };
-    let adapter_request = AdapterRequest {
-        request_id: format!("adapter-request:{smoke_id}"),
-        adapter_id: adapter_id(host).to_owned(),
-        requested_capability: AdapterCapability::EmitCandidateObservation,
-        context: eliot_types::AdapterContext {
+            .context("zero-model current_state preflight returned no structured content")?;
+        let memory_revision = current_state
+            .get("memory_revision")
+            .or_else(|| current_state.get("revision"))
+            .and_then(Value::as_u64)
+            .context("zero-model current_state returned no memory revision")?;
+        Ok(McpSmokePreparation {
+            smoke_id,
+            smoke_root,
+            workspace,
             project_id,
             task_id,
-            session_id: Some(agent_session_id),
-            trace_id: format!("external-agent-smoke:{smoke_id}"),
-            created_at: OffsetDateTime::now_utc(),
-        },
-        input: serde_json::to_value(execution)?,
-    };
-    let supervisor = production_external_agent_supervisor(config_path)?;
-    let result = supervisor
-        .execute(adapter_id(host), adapter_request, None)
-        .await?;
-    let evidence = result
-        .output
-        .get("provider_execution_evidence")
-        .with_context(|| {
-            format!(
-                "adapter smoke returned no ProviderExecutionEvidence; status={:?}; error={:?}; output={}",
-                result.status, result.error, result.output
-            )
-        })?;
-    let structured = evidence
-        .get("structured_output")
-        .context("adapter smoke returned no structured output")?;
-    let observed_tool_names = evidence
-        .get("observed_mcp_tool_names")
-        .and_then(Value::as_array)
-        .context("adapter smoke returned no observed MCP tool-name array")?;
-    let observed_current_state = observed_tool_names.iter().any(|name| {
-        name.as_str().is_some_and(|name| {
-            name == "eliot_current_state"
-                || name.ends_with("__eliot_current_state")
-                || name.ends_with("/eliot_current_state")
+            scope,
+            work_item_id,
+            memory_revision,
+            preflight,
+            trace: trace.clone(),
         })
+    };
+    let Ok(result) = tokio::time::timeout(MCP_SMOKE_PRE_PROVIDER_TIMEOUT, preparation).await else {
+        trace.abort_active("whole pre-provider deadline exceeded")?;
+        anyhow::bail!(
+            "MCP smoke pre-provider preparation exceeded {} seconds; phase journal={}",
+            MCP_SMOKE_PRE_PROVIDER_TIMEOUT.as_secs(),
+            trace.path().display()
+        )
+    };
+    result
+}
+
+async fn run_mcp_preflight(config_path: &Path, host: AgentHostId, model: &str) -> Result<Value> {
+    let preparation = prepare_mcp_smoke(config_path, host, model).await?;
+    let report = json!({
+        "schema_version": "eliot-external-agent-mcp-preflight-v1",
+        "status": "passed",
+        "smoke_id": preparation.smoke_id,
+        "host": host,
+        "model": model,
+        "project_id": preparation.project_id,
+        "task_id": preparation.task_id,
+        "memory_revision": preparation.memory_revision,
+        "tool_names": preparation.preflight.tool_names,
+        "raw_database_absent": preparation.preflight.raw_database_absent,
+        "phase_journal_ref": path_string(preparation.trace.path()),
+        "provider_calls": 0,
+        "gui_used": false,
     });
-    anyhow::ensure!(
-        result.status == AdapterResultStatus::Succeeded
-            && observed_current_state
-            && structured.get("project_id").and_then(Value::as_str)
+    let report_path = runtime_root(config_path)
+        .join("reports")
+        .join("external-agent-smokes")
+        .join(format!("{}-preflight-latest.json", host.as_str()));
+    atomic_write_json(&report_path, &report)?;
+    atomic_write_json(
+        &preparation.smoke_root.join("preflight-report.json"),
+        &report,
+    )?;
+    Ok(report)
+}
+
+fn mcp_smoke_prompt(model: &str) -> String {
+    format!(
+        "Use the configured ELIOT MCP server. Call eliot_current_state exactly once with the sole argument {{\"scope\":\"memory_free_control\"}}; do not pass project_id or task_id because the Governor binds them. Return one plain JSON object, without Markdown fences or prose, containing only the schema-bound project_id, task_id, memory_revision and resolved_model={model}. Do not edit files."
+    )
+}
+
+fn memory_revision_within_execution_window(
+    preflight_revision: u64,
+    observed_revision: u64,
+    postflight_revision: u64,
+) -> bool {
+    observed_revision >= preflight_revision && observed_revision <= postflight_revision
+}
+
+#[allow(clippy::too_many_lines)]
+async fn run_mcp_smoke(config_path: &Path, host: AgentHostId, model: &str) -> Result<Value> {
+    let McpSmokePreparation {
+        smoke_id,
+        smoke_root,
+        workspace,
+        project_id,
+        task_id,
+        scope,
+        work_item_id,
+        memory_revision,
+        preflight,
+        trace,
+    } = prepare_mcp_smoke(config_path, host, model).await?;
+
+    let (_schema, prompt, prompt_path, schema_path) = trace.run_sync("prompt_build", || {
+        let schema = json!({
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["project_id", "task_id", "memory_revision", "resolved_model"],
+            "properties": {
+                "project_id": {"const": project_id.to_string()},
+                "task_id": {"const": task_id.to_string()},
+                "memory_revision": {
+                    "type": "integer",
+                    "minimum": memory_revision
+                },
+                "resolved_model": {"const": model}
+            }
+        });
+        let prompt = mcp_smoke_prompt(model);
+        let prompt_path = smoke_root.join("prompt.txt");
+        let schema_path = smoke_root.join("schema.json");
+        atomic_write_bytes(&prompt_path, prompt.as_bytes())?;
+        atomic_write_json(&schema_path, &schema)?;
+        Ok((schema, prompt, prompt_path, schema_path))
+    })?;
+    let (agent_session_id, adapter_request) = trace.run_sync("launch_contract", || {
+        let agent_session_id = scope
+            .agent_session_id
+            .context("smoke scope has no AgentSession")?;
+        let role_lease_id = scope
+            .role_lease_id
+            .clone()
+            .context("smoke scope has no TaskRoleLease")?;
+        let mut launch_contract = eliot_types::HostLaunchContract {
+            invocation_id: smoke_id.clone(),
+            host_profile_ref: format!("external-agent-adapter:{}", host.as_str()),
+            mode: HostMode::Supervised,
+            project_id: Some(project_id),
+            agent_session_id: Some(agent_session_id),
+            task_id: Some(task_id),
+            work_item_id: Some(work_item_id),
+            role_lease_id: Some(role_lease_id.clone()),
+            work_lease_id: None,
+            worktree_lease_id: None,
+            planned_verifier_ref: scope.planned_verifier_ref.clone(),
+            cwd_or_worktree: path_string(&workspace),
+            baseline_commit: None,
+            allowed_paths: Vec::new(),
+            forbidden_paths: vec![
+                "truth-promotion".to_owned(),
+                "raw-database".to_owned(),
+                "provider-credential-roots".to_owned(),
+            ],
+            integration_bundle_ref: path_string(&smoke_root),
+            mcp_config_ref: path_string(&smoke_root.join("provider-mcp.json")),
+            skill_bundle_ref: path_string(&smoke_root.join("skills")),
+            lifecycle_bridge_ref: "external-agent-adapter".to_owned(),
+            environment_allowlist: SAFE_INHERITED_ENVIRONMENT
+                .iter()
+                .map(|name| (*name).to_owned())
+                .collect(),
+            permission_profile: "external_auditor".to_owned(),
+            model_route_if_selected: Some(model.to_owned()),
+            max_turns_or_steps: Some(4),
+            wall_clock_budget_seconds: 120,
+            cost_budget_if_supported: None,
+            session_id: None,
+            resume_policy: "fresh_only".to_owned(),
+            structured_output_schema_ref: Some(path_string(&schema_path)),
+            stdout_stderr_spool: path_string(&smoke_root.join("spool")),
+            artifact_manifest_ref: path_string(&smoke_root.join("artifacts.json")),
+            idempotency_key: format!("external-agent-smoke:{smoke_id}"),
+            expected_result_kind: "provider_execution_evidence".to_owned(),
+            contract_hash: String::new(),
+        };
+        launch_contract.contract_hash = blake3::hash(&serde_json::to_vec(&launch_contract)?)
+            .to_hex()
+            .to_string();
+        let invocation = eliot_types::AgentInvocationRequest {
+            invocation_id: smoke_id.clone(),
+            project_id,
+            task_id,
+            work_item_id,
+            requested_capabilities: vec![
+                "emit_candidate_observation".to_owned(),
+                "request_controller_review".to_owned(),
+            ],
+            role_lease_id,
+            work_lease_id: None,
+            packet_refs: Vec::new(),
+            expected_result_kind: "provider_execution_evidence".to_owned(),
+            verifier_ref: format!("external-agent-smoke-verifier:{smoke_id}"),
+            idempotency_key: format!("external-agent-smoke:{smoke_id}"),
+        };
+        let execution = ExternalAgentExecutionRequest {
+            invocation,
+            launch_contract,
+            purpose: ExternalAgentPurpose::UnderstandingReader,
+            prompt_ref: path_string(&prompt_path),
+            prompt_sha256: sha256_bytes(prompt.as_bytes()),
+            output_schema_ref: path_string(&schema_path),
+            output_schema_sha256: sha256_bytes(&std::fs::read(&schema_path)?),
+            requested_model: model.to_owned(),
+            max_turns_or_steps: 4,
+            timeout_profile_ref: format!("provider-timeout:{}-smoke-120s", host.as_str()),
+            allowed_provider_tools: provider_allowed_tools(host),
+            denied_provider_tools: vec![
+                "Bash".to_owned(),
+                "Edit".to_owned(),
+                "Write".to_owned(),
+                "NotebookEdit".to_owned(),
+                "WebFetch".to_owned(),
+                "WebSearch".to_owned(),
+            ],
+            expected_mcp_tool_names: vec!["eliot_current_state".to_owned()],
+            forbidden_mcp_server_names: vec!["eliot_surrealdb".to_owned(), "surrealdb".to_owned()],
+            read_only: true,
+            candidate_only: true,
+        };
+        let adapter_request = AdapterRequest {
+            request_id: format!("adapter-request:{smoke_id}"),
+            adapter_id: adapter_id(host).to_owned(),
+            requested_capability: AdapterCapability::EmitCandidateObservation,
+            context: eliot_types::AdapterContext {
+                project_id,
+                task_id,
+                session_id: Some(agent_session_id),
+                trace_id: format!("external-agent-smoke:{smoke_id}"),
+                created_at: OffsetDateTime::now_utc(),
+            },
+            input: serde_json::to_value(execution)?,
+        };
+        Ok((agent_session_id, adapter_request))
+    })?;
+    let supervisor = production_external_agent_supervisor(config_path)?;
+    let result = trace
+        .run("provider_dispatch", async {
+            supervisor
+                .execute(adapter_id(host), adapter_request, None)
+                .await
+                .map_err(|error| anyhow::anyhow!(error.to_string()))
+        })
+        .await?;
+    let postflight = trace
+        .run(
+            "current_state_postflight",
+            mcp_reference_exchange(
+                config_path,
+                if host == AgentHostId::OpenCode {
+                    Some("default")
+                } else {
+                    Some("external_auditor")
+                },
+                Some(host),
+                Some(&scope),
+                Some("eliot_current_state"),
+                Some(&json!({"scope": "memory_free_control"})),
+                "current_state_postflight",
+            ),
+        )
+        .await?;
+    let postflight_memory_revision = postflight
+        .tool_call
+        .as_ref()
+        .and_then(|value| {
+            value
+                .get("memory_revision")
+                .or_else(|| value.get("revision"))
+        })
+        .and_then(Value::as_u64)
+        .context("zero-model current_state postflight returned no memory revision")?;
+    trace.run_sync("provider_result_validation", || {
+        let evidence = result
+            .output
+            .get("provider_execution_evidence")
+            .with_context(|| {
+                format!(
+                    "adapter smoke returned no ProviderExecutionEvidence; status={:?}; error={:?}; output={}",
+                    result.status, result.error, result.output
+                )
+            })?;
+        let structured = evidence
+            .get("structured_output")
+            .context("adapter smoke returned no structured output")?;
+        let observed_tool_names = evidence
+            .get("observed_mcp_tool_names")
+            .and_then(Value::as_array)
+            .context("adapter smoke returned no observed MCP tool-name array")?;
+        let observed_current_state = observed_tool_names.iter().any(|name| {
+            name.as_str().is_some_and(|name| {
+                name == "eliot_current_state"
+                    || name == "eliot-governor_eliot_current_state"
+                    || name.ends_with("__eliot_current_state")
+                    || name.ends_with("/eliot_current_state")
+            })
+        });
+        let observed_memory_revision = structured
+            .get("memory_revision")
+            .and_then(Value::as_u64)
+            .context("adapter smoke returned no unsigned memory_revision")?;
+        anyhow::ensure!(
+            result.status == AdapterResultStatus::Succeeded
+                && observed_current_state
+                && structured.get("project_id").and_then(Value::as_str)
                 == Some(project_id.to_string().as_str())
-            && structured.get("task_id").and_then(Value::as_str)
-                == Some(task_id.to_string().as_str())
-            && structured.get("memory_revision").and_then(Value::as_u64) == Some(memory_revision)
-            && structured.get("resolved_model").and_then(Value::as_str) == Some(model),
-        "{} adapter smoke returned a noncanonical result: {}",
-        host.as_str(),
-        result.output
-    );
+                && structured.get("task_id").and_then(Value::as_str)
+                    == Some(task_id.to_string().as_str())
+                && memory_revision_within_execution_window(
+                    memory_revision,
+                    observed_memory_revision,
+                    postflight_memory_revision,
+                )
+                && structured.get("resolved_model").and_then(Value::as_str) == Some(model),
+            "{} adapter smoke returned a noncanonical result: {}",
+            host.as_str(),
+            result.output
+        );
+        Ok(())
+    })?;
     let report = json!({
         "schema_version": "eliot-external-agent-mcp-smoke-v1",
         "status": "passed",
@@ -708,6 +1171,12 @@ async fn run_mcp_smoke(config_path: &Path, host: AgentHostId, model: &str) -> Re
             "raw_database_absent": preflight.raw_database_absent,
             "memory_revision": memory_revision,
         },
+        "zero_model_postflight": {
+            "tool_names": postflight.tool_names,
+            "raw_database_absent": postflight.raw_database_absent,
+            "memory_revision": postflight_memory_revision,
+        },
+        "phase_journal_ref": path_string(trace.path()),
         "adapter_result": result,
         "provider_calls": 1,
         "gui_used": false,
@@ -717,6 +1186,7 @@ async fn run_mcp_smoke(config_path: &Path, host: AgentHostId, model: &str) -> Re
         .join("external-agent-smokes")
         .join(format!("{}-latest.json", host.as_str()));
     atomic_write_json(&report_path, &report)?;
+    atomic_write_json(&smoke_root.join("smoke-report.json"), &report)?;
     Ok(report)
 }
 
@@ -2697,4 +3167,125 @@ pub(super) fn canonical_external_result_contract_fixture() -> Result<Value> {
             .is_some(),
         "changed_replay_rejected": changed_replay_rejected,
     }))
+}
+
+#[cfg(test)]
+mod mcp_smoke_tests {
+    use super::*;
+
+    #[test]
+    fn smoke_prompt_requires_the_bound_scope_only() {
+        let prompt = mcp_smoke_prompt("opencode/mimo-v2.5-free");
+        assert!(
+            prompt.contains(
+                "exactly once with the sole argument {\"scope\":\"memory_free_control\"}"
+            )
+        );
+        assert!(!prompt.contains("{\"project_id\""));
+        assert!(!prompt.contains("{\"task_id\""));
+        assert!(prompt.contains("without Markdown fences or prose"));
+        assert!(prompt.contains("resolved_model=opencode/mimo-v2.5-free"));
+    }
+
+    #[test]
+    fn provider_revision_may_advance_inside_the_execution_window() {
+        assert!(memory_revision_within_execution_window(3, 6, 8));
+        assert!(memory_revision_within_execution_window(3, 3, 3));
+        assert!(!memory_revision_within_execution_window(3, 2, 8));
+        assert!(!memory_revision_within_execution_window(3, 9, 8));
+    }
+
+    #[test]
+    fn phase_trace_attributes_an_aborted_phase() -> Result<()> {
+        let root = std::env::temp_dir().join(format!("eliot-smoke-phase-test-{}", Uuid::now_v7()));
+        let trace = SmokePhaseTrace::new(&root, "phase-test")?;
+        trace.start("current_state_preflight")?;
+        trace.abort_active("test deadline")?;
+        let entries = std::fs::read_to_string(trace.path())?
+            .lines()
+            .map(serde_json::from_str::<Value>)
+            .collect::<Result<Vec<_>, _>>()?;
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0]["status"], "started");
+        assert_eq!(entries[1]["status"], "aborted");
+        assert_eq!(entries[1]["phase"], "current_state_preflight");
+        assert_eq!(entries[1]["detail"], "test deadline");
+        std::fs::remove_dir_all(&root)?;
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    fn powershell_child(script: &str) -> tokio::process::Command {
+        let mut command = tokio::process::Command::new("powershell.exe");
+        command
+            .args([
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                script,
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        command
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn bounded_child_drains_output_while_writing_input() -> Result<()> {
+        let command = powershell_child(
+            "$s = 'x' * 131072; [Console]::Out.Write($s); [Console]::Error.Write($s); $null = [Console]::In.ReadToEnd()",
+        );
+        let output = run_bounded_mcp_child(
+            command,
+            vec![b'i'; 262_144],
+            "flood_regression",
+            Duration::from_secs(10),
+        )
+        .await?;
+        assert!(output.status.success());
+        assert_eq!(output.stdout.len(), 131_072);
+        assert_eq!(output.stderr.len(), 131_072);
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn bounded_child_kills_and_reaps_a_hang() -> Result<()> {
+        let started = Instant::now();
+        let error = run_bounded_mcp_child(
+            powershell_child("Start-Sleep -Seconds 30"),
+            Vec::new(),
+            "hang_regression",
+            Duration::from_millis(300),
+        )
+        .await
+        .expect_err("hanging child must be bounded");
+        assert!(started.elapsed() < Duration::from_secs(5));
+        let message = error.to_string();
+        assert!(message.contains("phase=hang_regression"));
+        assert!(message.contains("child killed and reaped"));
+        let pid = message
+            .split("pid=")
+            .nth(1)
+            .and_then(|tail| tail.split(';').next())
+            .context("timeout error did not expose the child PID")?;
+        let probe = Command::new("powershell.exe")
+            .args([
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                &format!(
+                    "if (Get-Process -Id {pid} -ErrorAction SilentlyContinue) {{ exit 1 }} else {{ exit 0 }}"
+                ),
+            ])
+            .output()?;
+        assert!(
+            probe.status.success(),
+            "timed-out MCP child PID {pid} still exists"
+        );
+        Ok(())
+    }
 }

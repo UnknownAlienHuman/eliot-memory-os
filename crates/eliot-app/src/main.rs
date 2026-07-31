@@ -1661,6 +1661,13 @@ enum ExternalAgentCommand {
         #[arg(long)]
         model: String,
     },
+    /// Exercise all canonical MCP preparation phases without dispatching a provider.
+    McpPreflight {
+        #[arg(long)]
+        host: String,
+        #[arg(long)]
+        model: String,
+    },
     Inspect {
         #[arg(long)]
         invocation: String,

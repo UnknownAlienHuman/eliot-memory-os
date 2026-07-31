@@ -8,6 +8,21 @@ use eliot_types::ProviderStructuredOutputMode;
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 
+fn parse_structured_text(text: &str) -> Option<Value> {
+    let text = text.trim();
+    if let Ok(value) = serde_json::from_str(text) {
+        return Some(value);
+    }
+    let fenced = text
+        .strip_prefix("```json")
+        .or_else(|| text.strip_prefix("```JSON"))?
+        .strip_suffix("```")?
+        .trim();
+    (!fenced.contains("```"))
+        .then(|| serde_json::from_str(fenced).ok())
+        .flatten()
+}
+
 #[derive(Clone, Debug)]
 pub struct OpenCodeCommandInput {
     pub requested_model: String,
@@ -135,7 +150,7 @@ pub fn parse_opencode_stream(
                 })
                 .flatten()
         })
-        .filter_map(|text| serde_json::from_str::<Value>(text).ok())
+        .filter_map(parse_structured_text)
         .collect::<Vec<_>>();
     if outputs.len() != 1 {
         return rejected(format!(
@@ -157,7 +172,7 @@ pub fn parse_opencode_stream(
 
 #[cfg(test)]
 mod tests {
-    use super::parse_opencode_stream;
+    use super::{parse_opencode_stream, parse_structured_text};
     use serde_json::json;
 
     #[test]
@@ -188,6 +203,38 @@ mod tests {
     }
 
     #[test]
+    fn current_state_revision_may_advance_after_preflight() {
+        let stdout = concat!(
+            "{\"type\":\"step_start\",\"sessionID\":\"ses_mimo\",\"part\":{\"type\":\"step-start\"}}\n",
+            "{\"type\":\"tool_use\",\"sessionID\":\"ses_mimo\",\"part\":{\"type\":\"tool\",\"tool\":\"eliot-governor_eliot_current_state\",\"state\":{\"status\":\"completed\",\"input\":{\"scope\":\"memory_free_control\"},\"output\":\"{\\\"memory_revision\\\":6}\"}}}\n",
+            "{\"type\":\"text\",\"sessionID\":\"ses_mimo\",\"part\":{\"type\":\"text\",\"text\":\"{\\\"memory_revision\\\":6}\"}}\n",
+            "{\"type\":\"step_finish\",\"sessionID\":\"ses_mimo\",\"part\":{\"type\":\"step-finish\",\"reason\":\"stop\"}}\n",
+        );
+        let parsed = parse_opencode_stream(
+            stdout.as_bytes(),
+            "opencode/mimo-v2.5-free",
+            &json!({
+                "type": "object",
+                "properties": {
+                    "memory_revision": {
+                        "type": "integer",
+                        "minimum": 3
+                    }
+                },
+                "required": ["memory_revision"],
+                "additionalProperties": false
+            }),
+        )
+        .expect("revision advanced by governed dispatch bookkeeping must remain admissible");
+
+        assert_eq!(parsed.structured_output, json!({"memory_revision": 6}));
+        assert_eq!(
+            parsed.observed_tool_names,
+            vec!["eliot-governor_eliot_current_state"]
+        );
+    }
+
+    #[test]
     fn provider_error_event_surfaces_the_actual_failure() {
         let stdout = br#"{"type":"error","timestamp":1,"sessionID":"ses_401","error":{"name":"UnknownError","data":{"message":"Token refresh failed: 401"}}}"#;
         let error = parse_opencode_stream(stdout, "openai/gpt-5.4", &json!(true))
@@ -197,6 +244,22 @@ mod tests {
             error
                 .to_string()
                 .contains("OpenCode provider error: Token refresh failed: 401")
+        );
+    }
+
+    #[test]
+    fn exact_json_fence_is_accepted_but_surrounding_prose_is_not() {
+        assert_eq!(
+            parse_structured_text("```json\n{\"memory_revision\":3}\n```"),
+            Some(json!({"memory_revision": 3}))
+        );
+        assert_eq!(
+            parse_structured_text("result:\n```json\n{\"memory_revision\":3}\n```"),
+            None
+        );
+        assert_eq!(
+            parse_structured_text("```json\n{\"memory_revision\":3}\n```\nextra"),
+            None
         );
     }
 }
