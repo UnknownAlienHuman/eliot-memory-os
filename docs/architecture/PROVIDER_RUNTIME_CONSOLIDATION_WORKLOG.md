@@ -715,3 +715,26 @@ This log preserves the ordered implementation evidence for
   cognitive contract 3/3 PASS (0.68 s / 0.960 s), CLI 2/2 PASS (0.09 s / 0.340 s), and final
   `eliot-app` all-target Clippy with warnings denied passed in 12.692 s. The CLI help regression now
   explicitly requires `supersede-seal` and passed in 1.555 s wall.
+
+### Attested supersession candidate and live dry-run
+
+- Committed and pushed the generic supersession repair as
+  `dde14e3903197f30377152152786d9b805ff0ad4`
+  (`C7-02R2: supersede drifted published provider seals`). A new isolated release build took
+  259.788 s and produced
+  `C:\Users\kleym\AppData\Local\Eliot\builds\seal-supersession-dde14e3-target\release\eliot-governor.exe`,
+  55,707,136 bytes, SHA-256
+  `ff6a1806054432cb1e18ace79758fb8c9623fafc0ee3d952b1759a9492a8cbab`; the exact 40-character
+  source commit is embedded. The CLI has no `version`/`--version` surface, so two unsuccessful
+  diagnostic invocations were stopped and the embedded value was verified directly in the binary.
+- With operations, reconciliation, cleanup and orphan-process counts all zero, PID 85320 was
+  stopped cooperatively. The candidate started hidden as PID 55564 and published ready with the
+  exact path/SHA. Runtime supervision then entered the intentionally narrow recovery-only state:
+  sole error `published_seal_runtime_drift`, provider dispatch blocked, four active generation-3
+  leases, no missing/extra authority, and exact observed/expected candidate SHA.
+- The real generation-3 supersession dry-run classified
+  `SUPERSEDE_PUBLISHED_SEAL_RUNTIME_DRIFT` in 2.904 s with exact plan and authority, zero
+  reservations, results, journal attempts, provider artifacts, nonterminal operations, incomplete
+  seals or integrity errors. All 16 drift fields are the four permitted Governor binding/derived
+  hash fields across the four external Reader calls. Full before/after SHA-256 inventories were
+  byte-identical: 23 public files and 1,600 private files, both with zero differences.
