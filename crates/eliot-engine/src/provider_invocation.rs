@@ -12,6 +12,7 @@ use eliot_types::{
 use time::{Duration, OffsetDateTime};
 
 use crate::EngineError;
+use crate::antigravity::ProviderProcessOutcome;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProviderOutputCapture {
@@ -156,17 +157,132 @@ impl ProviderInvocationJournal {
                 "invalid provider invocation transition {current:?} -> {next:?}"
             )));
         }
-        let index = attempt.state_transitions.len();
-        attempt
+        let mut updated = attempt.clone();
+        let index = updated.state_transitions.len();
+        updated
             .state_transitions
             .push(ProviderInvocationTransition {
-                transition_id: format!("{}:transition:{index}", attempt.invocation_attempt_id),
+                transition_id: format!("{}:transition:{index}", updated.invocation_attempt_id),
                 from: Some(current),
                 to: next,
                 recorded_at: OffsetDateTime::now_utc(),
                 evidence_refs,
             });
-        self.persist(attempt)
+        self.persist(&updated)?;
+        *attempt = updated;
+        Ok(())
+    }
+
+    pub fn record_process_terminal(
+        &self,
+        attempt: &mut ProviderInvocationAttempt,
+        process: &ProviderProcessOutcome,
+    ) -> Result<(), EngineError> {
+        let mut terminal = attempt.clone();
+        terminal.process_started_at = Some(process.process_started_at);
+        terminal.first_output_at = process.first_output_at;
+        terminal.last_output_at = process.last_output_at;
+        terminal.process_exit_at = process.process_exit_at;
+        terminal.cleanup_completed_at = Some(process.cleanup_completed_at);
+        terminal.exit_code_or_signal = Some(process.exit_code.map_or_else(
+            || {
+                if process.reap_receipt.forced_termination {
+                    "forced_termination".to_owned()
+                } else if process.cancelled {
+                    "cancelled_without_exit_code".to_owned()
+                } else if process.timed_out {
+                    format!("timeout:{:?}", process.timeout_class)
+                } else {
+                    "unknown_without_exit_code".to_owned()
+                }
+            },
+            |code| format!("exit_code:{code}"),
+        ));
+        let root_pid = process
+            .reap_receipt
+            .root_pid
+            .map_or_else(|| "unknown".to_owned(), |pid| pid.to_string());
+        terminal.process_or_job_identity = Some(format!(
+            "pid:{};job={};reap_complete={};observed_processes={}",
+            root_pid,
+            process.reap_receipt.job_object_name,
+            process.reap_receipt.proves_complete_reap(),
+            process.observed_processes.len()
+        ));
+        terminal.timeout_class = process.timeout_class;
+        terminal.process_reap_receipt = Some(process.reap_receipt.clone());
+        terminal.process_timed_out = Some(process.timed_out);
+        terminal.process_cancelled = Some(process.cancelled);
+        terminal
+            .process_worker_error
+            .clone_from(&process.worker_error);
+        terminal.stdout_total_bytes = Some(process.stdout_total_bytes);
+        terminal.stderr_total_bytes = Some(process.stderr_total_bytes);
+        terminal.stdout_truncated = Some(process.stdout_truncated);
+        terminal.stderr_truncated = Some(process.stderr_truncated);
+        let evidence_refs = vec![
+            format!("job_object:{}", process.reap_receipt.job_object_name),
+            format!("exit_code:{:?}", process.exit_code),
+            format!("timeout_class:{:?}", process.timeout_class),
+            format!(
+                "reap_complete:{}",
+                process.reap_receipt.proves_complete_reap()
+            ),
+        ];
+        if let Err(error) = self.transition(
+            &mut terminal,
+            ProviderInvocationState::ProcessTerminal,
+            evidence_refs,
+        ) {
+            return match self.persist_terminal_reconciliation(&terminal, process, &error) {
+                Ok(reconciliation_ref) => Err(EngineError::WriteRejected(format!(
+                    "provider process outcome returned but terminal journal persistence failed; provider redispatch is forbidden; reconciliation required at {reconciliation_ref}: {error}"
+                ))),
+                Err(sidecar_error) => Err(EngineError::WriteRejected(format!(
+                    "provider process outcome returned but both terminal journal and reconciliation sidecar persistence failed; provider redispatch is forbidden; journal_error={error}; sidecar_error={sidecar_error}"
+                ))),
+            };
+        }
+        *attempt = terminal;
+        Ok(())
+    }
+
+    pub fn record_post_dispatch_failure(
+        &self,
+        attempt: &mut ProviderInvocationAttempt,
+        mut evidence_refs: Vec<String>,
+    ) -> Result<(), EngineError> {
+        evidence_refs.push("provider_redispatch_forbidden:true".to_owned());
+        if let Err(error) = self.transition(
+            attempt,
+            ProviderInvocationState::TimeoutPendingReconciliation,
+            evidence_refs.clone(),
+        ) {
+            return match self.persist_post_dispatch_reconciliation(attempt, &evidence_refs, &error)
+            {
+                Ok(reconciliation_ref) => Err(EngineError::WriteRejected(format!(
+                    "post-dispatch provider failure could not be journaled; provider redispatch is forbidden; reconciliation required at {reconciliation_ref}: {error}"
+                ))),
+                Err(sidecar_error) => Err(EngineError::WriteRejected(format!(
+                    "post-dispatch provider failure could not be journaled and its reconciliation sidecar also failed; provider redispatch is forbidden; journal_error={error}; sidecar_error={sidecar_error}"
+                ))),
+            };
+        }
+        Ok(())
+    }
+
+    pub fn record_captured_output(
+        &self,
+        attempt: &mut ProviderInvocationAttempt,
+        stdout: BlobRef,
+        stderr: BlobRef,
+    ) -> Result<(), EngineError> {
+        let mut updated = attempt.clone();
+        updated.stdout_blob_or_hash = Some(stdout);
+        updated.stderr_blob_or_hash = Some(stderr);
+        self.persist(&updated)?;
+        *attempt = updated;
+        Ok(())
     }
 
     pub fn persist(&self, attempt: &ProviderInvocationAttempt) -> Result<(), EngineError> {
@@ -179,6 +295,73 @@ impl ProviderInvocationJournal {
         self.root
             .join("runtime/provider-invocations")
             .join(format!("{}.json", safe_component(attempt_id)))
+    }
+
+    fn persist_terminal_reconciliation(
+        &self,
+        attempt: &ProviderInvocationAttempt,
+        process: &ProviderProcessOutcome,
+        persistence_error: &EngineError,
+    ) -> Result<String, EngineError> {
+        let relative_path = format!(
+            "runtime/provider-invocation-reconciliation/{}.json",
+            safe_component(&attempt.invocation_attempt_id)
+        );
+        let value = serde_json::json!({
+            "schema_version": "provider-terminal-reconciliation-v1",
+            "invocation_attempt_id": attempt.invocation_attempt_id,
+            "reconciliation_required": true,
+            "provider_redispatch_forbidden": true,
+            "process_started_at": process.process_started_at,
+            "first_output_at": process.first_output_at,
+            "last_output_at": process.last_output_at,
+            "process_exit_at": process.process_exit_at,
+            "cleanup_completed_at": process.cleanup_completed_at,
+            "exit_code": process.exit_code,
+            "timed_out": process.timed_out,
+            "timeout_class": process.timeout_class,
+            "cancelled": process.cancelled,
+            "worker_error": process.worker_error,
+            "stdout_total_bytes": process.stdout_total_bytes,
+            "stderr_total_bytes": process.stderr_total_bytes,
+            "stdout_truncated": process.stdout_truncated,
+            "stderr_truncated": process.stderr_truncated,
+            "reap_receipt": process.reap_receipt,
+            "journal_persistence_error": persistence_error.to_string(),
+            "recorded_at": OffsetDateTime::now_utc(),
+        });
+        atomic_write(
+            &self.root.join(&relative_path),
+            &serde_json::to_vec_pretty(&value)?,
+        )?;
+        Ok(relative_path)
+    }
+
+    fn persist_post_dispatch_reconciliation(
+        &self,
+        attempt: &ProviderInvocationAttempt,
+        evidence_refs: &[String],
+        persistence_error: &EngineError,
+    ) -> Result<String, EngineError> {
+        let relative_path = format!(
+            "runtime/provider-invocation-reconciliation/{}.json",
+            safe_component(&attempt.invocation_attempt_id)
+        );
+        let value = serde_json::json!({
+            "schema_version": "provider-post-dispatch-reconciliation-v1",
+            "invocation_attempt_id": attempt.invocation_attempt_id,
+            "reconciliation_required": true,
+            "provider_redispatch_forbidden": true,
+            "last_durable_state": attempt.state_transitions.last().map(|transition| transition.to),
+            "evidence_refs": evidence_refs,
+            "journal_persistence_error": persistence_error.to_string(),
+            "recorded_at": OffsetDateTime::now_utc(),
+        });
+        atomic_write(
+            &self.root.join(&relative_path),
+            &serde_json::to_vec_pretty(&value)?,
+        )?;
+        Ok(relative_path)
     }
 }
 
@@ -199,11 +382,15 @@ impl ProviderInvocationLifecycleService {
                 )
                 | (
                     State::DispatchStarting,
-                    State::Dispatched | State::DispatchAckUnknown | State::PreDispatchAborted
+                    State::Dispatched
+                        | State::ProcessTerminal
+                        | State::DispatchAckUnknown
+                        | State::PreDispatchAborted
                 )
                 | (
                     State::Dispatched,
                     State::Running
+                        | State::ProcessTerminal
                         | State::TimeoutPendingReconciliation
                         | State::ProcessExitedNonzero
                         | State::CancelledAfterDispatch
@@ -211,6 +398,10 @@ impl ProviderInvocationLifecycleService {
                 )
                 | (
                     State::Running,
+                    State::ProcessTerminal | State::TimeoutPendingReconciliation
+                )
+                | (
+                    State::ProcessTerminal,
                     State::OutputObserved
                         | State::CompletedCaptured
                         | State::TimeoutPendingReconciliation
@@ -218,6 +409,8 @@ impl ProviderInvocationLifecycleService {
                         | State::CancelledAfterDispatch
                         | State::LocalCaptureFailed
                         | State::ProtocolParseFailed
+                        | State::CleanupFailedAfterComplete
+                        | State::NonReconcilableUnknown
                 )
                 | (
                     State::OutputObserved,
@@ -227,6 +420,7 @@ impl ProviderInvocationLifecycleService {
                         | State::CancelledAfterDispatch
                         | State::LocalCaptureFailed
                         | State::ProtocolParseFailed
+                        | State::CleanupFailedAfterComplete
                 )
                 | (
                     State::CompletedCaptured,

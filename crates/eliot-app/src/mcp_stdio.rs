@@ -640,7 +640,10 @@ fn resolve_effective_profile(
     match (host, requested_profile) {
         (None, requested) => McpAccessProfile::parse(requested),
         (Some("claude" | "claude-desktop"), "default") => Ok(McpAccessProfile::ClaudeGoverned),
-        (Some("claude"), "external_auditor") => Ok(McpAccessProfile::ExternalAuditor),
+        (Some("claude" | "opencode"), "external_auditor")
+        | (Some("antigravity"), "external_auditor" | "antigravity-auditor") => {
+            Ok(McpAccessProfile::ExternalAuditor)
+        }
         (Some("claude" | "antigravity" | "opencode"), "cognitive_child") => {
             Ok(McpAccessProfile::CognitiveChild)
         }
@@ -649,10 +652,6 @@ fn resolve_effective_profile(
         | (Some("antigravity"), "dynamic_agent" | "agent_host") => {
             Ok(McpAccessProfile::DynamicAgent)
         }
-        (Some("antigravity"), "external_auditor" | "antigravity-auditor") => {
-            Ok(McpAccessProfile::ExternalAuditor)
-        }
-        (Some("opencode"), "external_auditor") => Ok(McpAccessProfile::ExternalAuditor),
         (Some(host), requested) => anyhow::bail!(
             "UNSUPPORTED_HOST_PROFILE_PAIR: host={host} requested_profile={requested}"
         ),

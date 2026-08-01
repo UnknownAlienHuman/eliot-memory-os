@@ -6,11 +6,8 @@ type TestResult = Result<(), Box<dyn std::error::Error>>;
 fn same_route_and_budget_produce_byte_identical_policy() -> TestResult {
     let budget =
         ProviderDeclaredBudget::new(120_000, 1_048_576).with_idle_output_deadline_ms(Some(30_000));
-    let first = ProviderRoutePolicy::for_route(
-        AgentHostId::Antigravity,
-        "external-agent-smoke",
-        budget.clone(),
-    );
+    let first =
+        ProviderRoutePolicy::for_route(AgentHostId::Antigravity, "external-agent-smoke", budget);
     let second =
         ProviderRoutePolicy::for_route(AgentHostId::Antigravity, "external-agent-smoke", budget);
 

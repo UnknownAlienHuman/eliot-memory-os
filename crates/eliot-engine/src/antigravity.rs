@@ -29,8 +29,9 @@ use eliot_types::{
     AntigravityWorkdirPolicy, BlobRef, CandidateDiff, ExternalOutputSchemaKind,
     ExternalReviewBudget, ExternalReviewJob, ExternalReviewJobStatus, ExternalReviewRequest,
     ExternalReviewRole, ProcessReapReceipt, ProjectId, ProviderInvocationAttempt,
-    ProviderInvocationState, ProviderRoutePolicy, TaintClass, TaskId, WorkLease, WorkLeaseId,
-    WorktreeLease, WorktreeLeaseId, WorktreeLeaseState, WriteId, inspect_secret_bytes,
+    ProviderInvocationState, ProviderRoutePolicy, ProviderTimeoutClass, TaintClass, TaskId,
+    WorkLease, WorkLeaseId, WorktreeLease, WorktreeLeaseId, WorktreeLeaseState, WriteId,
+    inspect_secret_bytes,
 };
 use serde_json::{Value, json};
 use std::collections::BTreeSet;
@@ -109,6 +110,7 @@ pub struct ProviderProcessOutcome {
     pub stdout_truncated: bool,
     pub stderr_truncated: bool,
     pub timed_out: bool,
+    pub timeout_class: Option<ProviderTimeoutClass>,
     pub cancelled: bool,
     pub worker_error: Option<String>,
     pub observed_processes: Vec<eliot_windows_ipc::ProcessImageIdentity>,
@@ -2426,6 +2428,7 @@ impl AntigravityRunner {
         let output = match execution {
             Ok(output) => output,
             Err(error) => {
+                let error_text = error.to_string();
                 let state = attempt
                     .state_transitions
                     .last()
@@ -2441,41 +2444,83 @@ impl AntigravityRunner {
                         vec![error.to_string()],
                     )?;
                 } else {
-                    let _ =
-                        reservation_owner.mark_unknown_outcome(reservation_id, &error.to_string());
-                    journal.transition(
+                    let _ = reservation_owner.mark_unknown_outcome(reservation_id, &error_text);
+                    if let Err(journal_error) = journal.record_post_dispatch_failure(
                         attempt,
-                        ProviderInvocationState::DispatchAckUnknown,
-                        vec![error.to_string()],
-                    )?;
+                        vec![format!("supervisor_error:{error_text}")],
+                    ) {
+                        return Err(EngineError::WriteRejected(format!(
+                            "Antigravity process failed after dispatch and reconciliation journaling failed; provider redispatch is forbidden; supervisor_error={error_text}; journal_error={journal_error}"
+                        )));
+                    }
                 }
                 return Err(error);
             }
         };
-        attempt.process_or_job_identity = Some(format!(
-            "pid:{};job={};reap_complete={}",
-            output.reap_receipt.root_pid.unwrap_or_default(),
-            output.reap_receipt.job_object_name,
-            output.reap_receipt.proves_complete_reap()
-        ));
+        if let Err(error) = journal.record_process_terminal(attempt, &output) {
+            let _ = reservation_owner.mark_unknown_outcome(
+                reservation_id,
+                "process reaped but terminal journal persistence requires reconciliation",
+            );
+            return Err(error);
+        }
+
         let stdout_capture = ProviderOutputSpool.capture(
             data_root,
             &attempt.invocation_attempt_id,
             "stdout",
             std::io::Cursor::new(output.stdout.clone()),
             DEFAULT_MAX_OUTPUT_BYTES as u64,
-        )?;
+        );
+        let stdout_capture = match stdout_capture {
+            Ok(capture) => capture,
+            Err(error) => {
+                let _ = journal.transition(
+                    attempt,
+                    ProviderInvocationState::LocalCaptureFailed,
+                    vec![format!("stdout_capture_failed:{error}")],
+                );
+                let _ = reservation_owner.fail_after_dispatch(
+                    reservation_id,
+                    "Antigravity stdout capture failed after terminal process facts",
+                );
+                return Err(error);
+            }
+        };
         let stderr_capture = ProviderOutputSpool.capture(
             data_root,
             &attempt.invocation_attempt_id,
             "stderr",
             std::io::Cursor::new(output.stderr.clone()),
             DEFAULT_MAX_OUTPUT_BYTES as u64,
-        )?;
+        );
+        let stderr_capture = match stderr_capture {
+            Ok(capture) => capture,
+            Err(error) => {
+                let _ = journal.transition(
+                    attempt,
+                    ProviderInvocationState::LocalCaptureFailed,
+                    vec![format!("stderr_capture_failed:{error}")],
+                );
+                let _ = reservation_owner.fail_after_dispatch(
+                    reservation_id,
+                    "Antigravity stderr capture failed after terminal process facts",
+                );
+                return Err(error);
+            }
+        };
+        if let Err(error) = journal.record_captured_output(
+            attempt,
+            stdout_capture.blob_ref.clone(),
+            stderr_capture.blob_ref.clone(),
+        ) {
+            let _ = reservation_owner.mark_unknown_outcome(
+                reservation_id,
+                "captured Antigravity output refs could not be journaled",
+            );
+            return Err(error);
+        }
         if stdout_capture.output_observed || stderr_capture.output_observed {
-            attempt.first_output_at = output.first_output_at;
-            attempt.last_output_at = output.last_output_at;
-            journal.persist(attempt)?;
             journal.transition(
                 attempt,
                 ProviderInvocationState::OutputObserved,
@@ -2486,15 +2531,54 @@ impl AntigravityRunner {
         let stderr_text = String::from_utf8_lossy(&output.stderr).into_owned();
         let combined = output_text(stdout_text.as_bytes(), stderr_text.as_bytes());
         let normalized = AntigravityTextOutputNormalizer.normalize_text(request, &combined);
+        let structured_bytes = match serde_json::to_vec(&normalized) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                let _ = journal.transition(
+                    attempt,
+                    ProviderInvocationState::LocalCaptureFailed,
+                    vec![format!("structured_serialization_failed:{error}")],
+                );
+                let _ = reservation_owner.fail_after_dispatch(
+                    reservation_id,
+                    "Antigravity structured serialization failed after terminal process facts",
+                );
+                return Err(error.into());
+            }
+        };
         let structured_capture = ProviderOutputSpool.capture(
             data_root,
             &attempt.invocation_attempt_id,
             "structured",
-            std::io::Cursor::new(serde_json::to_vec(&normalized)?),
+            std::io::Cursor::new(structured_bytes),
             DEFAULT_MAX_OUTPUT_BYTES as u64,
-        )?;
+        );
+        let structured_capture = match structured_capture {
+            Ok(capture) => capture,
+            Err(error) => {
+                let _ = journal.transition(
+                    attempt,
+                    ProviderInvocationState::LocalCaptureFailed,
+                    vec![format!("structured_capture_failed:{error}")],
+                );
+                let _ = reservation_owner.fail_after_dispatch(
+                    reservation_id,
+                    "Antigravity structured capture failed after terminal process facts",
+                );
+                return Err(error);
+            }
+        };
+        attempt.structured_output_blob_or_hash = Some(structured_capture.blob_ref.clone());
+        if let Err(error) = journal.persist(attempt) {
+            let _ = reservation_owner.mark_unknown_outcome(
+                reservation_id,
+                "captured Antigravity structured output ref could not be journaled",
+            );
+            return Err(error);
+        }
         let exit_success = output.exit_code == Some(0);
         let capture_complete = output.reap_receipt.proves_complete_reap()
+            && output.worker_error.is_none()
             && !output.stdout_truncated
             && !output.stderr_truncated
             && !stdout_capture.truncation_detected
@@ -2511,32 +2595,27 @@ impl AntigravityRunner {
             AntigravityRunState::Failed
         };
         let completed_at = output.cleanup_completed_at;
-        attempt.process_exit_at = output.process_exit_at;
-        attempt.cleanup_completed_at = Some(output.cleanup_completed_at);
-        attempt.stdout_blob_or_hash = Some(stdout_capture.blob_ref.clone());
-        attempt.stderr_blob_or_hash = Some(stderr_capture.blob_ref.clone());
-        attempt.structured_output_blob_or_hash = Some(structured_capture.blob_ref);
-        attempt.exit_code_or_signal = Some(output.exit_code.map_or_else(
-            || "terminated_without_exit_code".to_owned(),
-            |code| format!("exit_code:{code}"),
-        ));
-        journal.persist(attempt)?;
-        let terminal_state = if !capture_complete {
-            ProviderInvocationState::LocalCaptureFailed
-        } else if output.timed_out || stderr_text.contains("timeout waiting for response") {
-            ProviderInvocationState::TimeoutPendingReconciliation
-        } else if exit_success {
-            ProviderInvocationState::CompletedCaptured
-        } else {
-            ProviderInvocationState::ProcessExitedNonzero
-        };
+        let terminal_state =
+            if output.worker_error.is_some() || !output.reap_receipt.proves_complete_reap() {
+                ProviderInvocationState::CleanupFailedAfterComplete
+            } else if !capture_complete {
+                ProviderInvocationState::LocalCaptureFailed
+            } else if output.timed_out || stderr_text.contains("timeout waiting for response") {
+                ProviderInvocationState::TimeoutPendingReconciliation
+            } else if exit_success {
+                ProviderInvocationState::CompletedCaptured
+            } else {
+                ProviderInvocationState::ProcessExitedNonzero
+            };
         journal.transition(
             attempt,
             terminal_state,
             vec![format!(
-                "exit_success={exit_success};timed_out={};reap_complete={};stdout_truncated={};stderr_truncated={}",
+                "exit_success={exit_success};timed_out={};timeout_class={:?};reap_complete={};worker_error={:?};stdout_truncated={};stderr_truncated={}",
                 output.timed_out,
+                output.timeout_class,
                 output.reap_receipt.proves_complete_reap(),
+                output.worker_error,
                 output.stdout_truncated,
                 output.stderr_truncated
             )],

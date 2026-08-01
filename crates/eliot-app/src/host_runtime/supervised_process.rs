@@ -6,7 +6,7 @@ use eliot_engine::{
 use eliot_types::{
     OPERATION_RUNTIME_CHECKPOINT_SCHEMA_VERSION, OperationCancellationState, OperationPhase,
     OperationReconciliationState, OperationRuntimeCheckpoint, ProcessReapReceipt,
-    ProviderDispatchState, ProviderTimeoutProfile,
+    ProviderDispatchState, ProviderTimeoutClass, ProviderTimeoutProfile,
 };
 use eliot_windows_ipc::SuspendedJobChild;
 use sha2::{Digest as _, Sha256};
@@ -98,6 +98,7 @@ pub struct SupervisedProcessOutput {
     pub stdout_truncated: bool,
     pub stderr_truncated: bool,
     pub timed_out: bool,
+    pub timeout_class: Option<ProviderTimeoutClass>,
     pub cancelled: bool,
     pub worker_error: Option<String>,
     pub observed_processes: Vec<eliot_windows_ipc::ProcessImageIdentity>,
@@ -296,7 +297,7 @@ impl ProviderProcessRunner for SupervisedWindowsProcessRunner {
             .await
             .map_err(|error| {
                 eliot_engine::EngineError::RuntimeSupervision(format!(
-                    "supervised provider execution failed before process identity: {error:#}"
+                    "supervised provider execution failed: {error:#}"
                 ))
             })?;
             Ok(ProviderProcessOutcome {
@@ -308,6 +309,7 @@ impl ProviderProcessRunner for SupervisedWindowsProcessRunner {
                 stdout_truncated: result.stdout_truncated,
                 stderr_truncated: result.stderr_truncated,
                 timed_out: result.timed_out,
+                timeout_class: result.timeout_class,
                 cancelled: result.cancelled,
                 worker_error: result.worker_error,
                 observed_processes: result.observed_processes,
@@ -1111,6 +1113,7 @@ fn run_worker(
     let mut max_process_count = initial_count;
     let mut last_process_count = initial_count;
     let mut timed_out = false;
+    let mut timeout_class = None;
     let mut forced_termination = false;
     let mut cancellation_seen_at = None;
     let mut exit_code = None;
@@ -1143,6 +1146,7 @@ fn run_worker(
         let now = Instant::now();
         if now >= absolute_deadline {
             timed_out = true;
+            timeout_class.get_or_insert(ProviderTimeoutClass::AbsoluteRuntimeTimeout);
             record_worker_error(&mut worker_error, "absolute runtime deadline exceeded");
             cancellation.cancel();
         }
@@ -1154,6 +1158,7 @@ fn run_worker(
             && started.elapsed() >= first_output_deadline
         {
             timed_out = true;
+            timeout_class.get_or_insert(ProviderTimeoutClass::FirstOutputTimeout);
             record_worker_error(&mut worker_error, "first output deadline exceeded");
             cancellation.cancel();
         }
@@ -1162,6 +1167,7 @@ fn run_worker(
             && last_at.elapsed() >= idle_output_deadline
         {
             timed_out = true;
+            timeout_class.get_or_insert(ProviderTimeoutClass::IdleOutputTimeout);
             record_worker_error(&mut worker_error, "idle output deadline exceeded");
             cancellation.cancel();
         }
@@ -1278,6 +1284,7 @@ fn run_worker(
             stdout: stdout_capture.bytes,
             stderr: stderr_capture.bytes,
             timed_out,
+            timeout_class,
             cancelled: cancellation.is_cancelled(),
             worker_error,
             observed_processes,
@@ -1785,6 +1792,7 @@ mod tests {
             stdout_truncated: false,
             stderr_truncated: false,
             timed_out: false,
+            timeout_class: None,
             cancelled: true,
             worker_error: None,
             observed_processes: Vec::new(),

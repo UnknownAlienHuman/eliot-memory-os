@@ -5,13 +5,15 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use eliot_engine::{
     ExternalResultCompletenessService, ProviderCompletenessInput, ProviderInvocationJournal,
-    ProviderInvocationLifecycleService, ProviderOutputSpool, ProviderReadinessInput,
-    ProviderReconciliationInput, ProviderReconciliationService, ProviderRouteReadinessService,
+    ProviderInvocationLifecycleService, ProviderOutputSpool, ProviderProcessOutcome,
+    ProviderReadinessInput, ProviderReconciliationInput, ProviderReconciliationService,
+    ProviderRouteReadinessService,
 };
 use eliot_types::{
-    ExternalResultCompletenessReceipt, ProviderIdentityCheck, ProviderInvocationAttempt,
-    ProviderInvocationOutcomeClass, ProviderInvocationState, ProviderReconciliationMethod,
-    ProviderResultCompleteness, ProviderRouteReadinessVerdict, ProviderTimeoutClass,
+    ExternalResultCompletenessReceipt, ProcessReapReceipt, ProviderIdentityCheck,
+    ProviderInvocationAttempt, ProviderInvocationOutcomeClass, ProviderInvocationState,
+    ProviderReconciliationMethod, ProviderResultCompleteness, ProviderRouteReadinessVerdict,
+    ProviderTimeoutClass,
 };
 use time::OffsetDateTime;
 
@@ -61,6 +63,190 @@ fn pre_dispatch_abort_is_terminal_and_does_not_prove_dispatch() -> TestResult {
         ProviderInvocationState::PreDispatchAborted,
         ProviderInvocationState::DispatchStarting
     ));
+    cleanup(&root);
+    Ok(())
+}
+
+#[test]
+fn process_facts_terminalize_before_local_output_admission() -> TestResult {
+    let root = temp_root("process-terminal");
+    let journal = ProviderInvocationJournal::new(&root);
+    let mut current = journal.create(attempt("process-terminal"))?;
+    for state in [
+        ProviderInvocationState::Reserved,
+        ProviderInvocationState::DispatchStarting,
+        ProviderInvocationState::Dispatched,
+        ProviderInvocationState::Running,
+    ] {
+        journal.transition(&mut current, state, Vec::new())?;
+    }
+
+    let process_started_at = OffsetDateTime::UNIX_EPOCH;
+    let process_exit_at = process_started_at + time::Duration::milliseconds(40);
+    let cleanup_completed_at = process_exit_at + time::Duration::milliseconds(5);
+    journal.record_process_terminal(
+        &mut current,
+        &ProviderProcessOutcome {
+            exit_code: Some(0),
+            stdout: b"not-yet-admitted".to_vec(),
+            stderr: Vec::new(),
+            stdout_total_bytes: 16,
+            stderr_total_bytes: 0,
+            stdout_truncated: false,
+            stderr_truncated: false,
+            timed_out: false,
+            timeout_class: None,
+            cancelled: false,
+            worker_error: None,
+            observed_processes: Vec::new(),
+            process_started_at,
+            first_output_at: Some(process_started_at + time::Duration::milliseconds(10)),
+            last_output_at: Some(process_started_at + time::Duration::milliseconds(20)),
+            process_exit_at: Some(process_exit_at),
+            cleanup_completed_at,
+            reap_receipt: complete_reap_receipt(),
+        },
+    )?;
+
+    let reloaded = journal.load("process-terminal")?;
+    assert_eq!(
+        reloaded
+            .state_transitions
+            .last()
+            .map(|transition| transition.to),
+        Some(ProviderInvocationState::ProcessTerminal)
+    );
+    assert_eq!(reloaded.process_exit_at, Some(process_exit_at));
+    assert_eq!(reloaded.cleanup_completed_at, Some(cleanup_completed_at));
+    assert!(
+        reloaded
+            .process_reap_receipt
+            .as_ref()
+            .is_some_and(ProcessReapReceipt::proves_complete_reap)
+    );
+    assert!(reloaded.stdout_blob_or_hash.is_none());
+    assert!(reloaded.stderr_blob_or_hash.is_none());
+    cleanup(&root);
+    Ok(())
+}
+
+#[test]
+fn legacy_attempt_without_route_policy_remains_loadable() -> TestResult {
+    let root = temp_root("legacy-load");
+    let path = root.join("runtime/provider-invocations/legacy-load.json");
+    fs::create_dir_all(path.parent().ok_or("legacy attempt parent missing")?)?;
+    let mut value = serde_json::to_value(attempt("legacy-load"))?;
+    let object = value
+        .as_object_mut()
+        .ok_or("attempt did not serialize as an object")?;
+    object.remove("provider_route_policy");
+    object.remove("process_reap_receipt");
+    object.remove("process_timed_out");
+    object.remove("process_cancelled");
+    object.remove("process_worker_error");
+    object.remove("stdout_total_bytes");
+    object.remove("stderr_total_bytes");
+    object.remove("stdout_truncated");
+    object.remove("stderr_truncated");
+    fs::write(&path, serde_json::to_vec_pretty(&value)?)?;
+
+    let loaded = ProviderInvocationJournal::new(&root).load("legacy-load")?;
+    assert!(loaded.provider_route_policy.is_none());
+    assert!(loaded.process_reap_receipt.is_none());
+    cleanup(&root);
+    Ok(())
+}
+
+#[test]
+fn post_dispatch_runner_error_never_leaves_running() -> TestResult {
+    let root = temp_root("post-dispatch-error");
+    let journal = ProviderInvocationJournal::new(&root);
+    let mut current = journal.create(attempt("post-dispatch-error"))?;
+    for state in [
+        ProviderInvocationState::Reserved,
+        ProviderInvocationState::DispatchStarting,
+        ProviderInvocationState::Dispatched,
+        ProviderInvocationState::Running,
+    ] {
+        journal.transition(&mut current, state, Vec::new())?;
+    }
+    journal
+        .record_post_dispatch_failure(&mut current, vec!["supervisor_error:fixture".to_owned()])?;
+    assert_eq!(
+        current
+            .state_transitions
+            .last()
+            .map(|transition| transition.to),
+        Some(ProviderInvocationState::TimeoutPendingReconciliation)
+    );
+    assert!(current.state_transitions.last().is_some_and(|transition| {
+        transition
+            .evidence_refs
+            .contains(&"provider_redispatch_forbidden:true".to_owned())
+    }));
+    cleanup(&root);
+    Ok(())
+}
+
+#[test]
+fn missing_root_pid_is_recorded_as_unknown_not_zero() -> TestResult {
+    let root = temp_root("unknown-pid");
+    let journal = ProviderInvocationJournal::new(&root);
+    let mut current = journal.create(attempt("unknown-pid"))?;
+    for state in [
+        ProviderInvocationState::Reserved,
+        ProviderInvocationState::DispatchStarting,
+        ProviderInvocationState::Dispatched,
+        ProviderInvocationState::Running,
+    ] {
+        journal.transition(&mut current, state, Vec::new())?;
+    }
+    let mut outcome = terminal_process_outcome();
+    outcome.reap_receipt.root_pid = None;
+    journal.record_process_terminal(&mut current, &outcome)?;
+    let identity = current
+        .process_or_job_identity
+        .as_deref()
+        .unwrap_or_default();
+    assert!(identity.contains("pid:unknown"));
+    assert!(!identity.contains("pid:0"));
+    cleanup(&root);
+    Ok(())
+}
+
+#[test]
+fn double_persistence_failure_preserves_running_and_forbids_redispatch() -> TestResult {
+    let root = temp_root("double-persist-failure");
+    let journal = ProviderInvocationJournal::new(&root);
+    let mut current = journal.create(attempt("double-persist-failure"))?;
+    for state in [
+        ProviderInvocationState::Reserved,
+        ProviderInvocationState::DispatchStarting,
+        ProviderInvocationState::Dispatched,
+        ProviderInvocationState::Running,
+    ] {
+        journal.transition(&mut current, state, Vec::new())?;
+    }
+    let attempts = root.join("runtime/provider-invocations");
+    fs::remove_dir_all(&attempts)?;
+    fs::write(&attempts, b"block journal directory")?;
+    let reconciliations = root.join("runtime/provider-invocation-reconciliation");
+    fs::write(&reconciliations, b"block reconciliation directory")?;
+
+    let Err(error) = journal.record_post_dispatch_failure(&mut current, vec!["fixture".to_owned()])
+    else {
+        return Err(std::io::Error::other("both persistence paths unexpectedly succeeded").into());
+    };
+    let message = error.to_string();
+    assert!(message.contains("sidecar also failed"));
+    assert!(message.contains("provider redispatch is forbidden"));
+    assert_eq!(
+        current
+            .state_transitions
+            .last()
+            .map(|transition| transition.to),
+        Some(ProviderInvocationState::Running)
+    );
     cleanup(&root);
     Ok(())
 }
@@ -228,6 +414,7 @@ fn restart_matrix_never_adds_a_second_dispatch() -> TestResult {
             ProviderInvocationState::DispatchStarting,
             ProviderInvocationState::Dispatched,
             ProviderInvocationState::Running,
+            ProviderInvocationState::ProcessTerminal,
             ProviderInvocationState::OutputObserved,
         ],
         vec![
@@ -235,6 +422,7 @@ fn restart_matrix_never_adds_a_second_dispatch() -> TestResult {
             ProviderInvocationState::DispatchStarting,
             ProviderInvocationState::Dispatched,
             ProviderInvocationState::Running,
+            ProviderInvocationState::ProcessTerminal,
             ProviderInvocationState::CompletedCaptured,
         ],
         vec![
@@ -242,6 +430,7 @@ fn restart_matrix_never_adds_a_second_dispatch() -> TestResult {
             ProviderInvocationState::DispatchStarting,
             ProviderInvocationState::Dispatched,
             ProviderInvocationState::Running,
+            ProviderInvocationState::ProcessTerminal,
             ProviderInvocationState::TimeoutPendingReconciliation,
         ],
         vec![
@@ -249,6 +438,7 @@ fn restart_matrix_never_adds_a_second_dispatch() -> TestResult {
             ProviderInvocationState::DispatchStarting,
             ProviderInvocationState::Dispatched,
             ProviderInvocationState::Running,
+            ProviderInvocationState::ProcessTerminal,
             ProviderInvocationState::CompletedCaptured,
             ProviderInvocationState::CleanupFailedAfterComplete,
         ],
@@ -426,10 +616,10 @@ fn attempt(id: &str) -> ProviderInvocationAttempt {
         cwd: Some("fixture".to_owned()),
         environment_fingerprint: Some("fixture".to_owned()),
         timeout_profile_id: "timeout:test".to_owned(),
-        provider_route_policy: eliot_types::ProviderRoutePolicyBinding {
+        provider_route_policy: Some(eliot_types::ProviderRoutePolicyBinding {
             policy_id: "policy:test".to_owned(),
             policy_hash_blake3: "0".repeat(64),
-        },
+        }),
         state_transitions: Vec::new(),
         dispatch_started_at: None,
         process_started_at: None,
@@ -443,6 +633,15 @@ fn attempt(id: &str) -> ProviderInvocationAttempt {
         structured_output_blob_or_hash: None,
         exit_code_or_signal: None,
         process_or_job_identity: None,
+        timeout_class: None,
+        process_reap_receipt: None,
+        process_timed_out: None,
+        process_cancelled: None,
+        process_worker_error: None,
+        stdout_total_bytes: None,
+        stderr_total_bytes: None,
+        stdout_truncated: None,
+        stderr_truncated: None,
         quota_or_cost_if_known: None,
         original_closeout_ref: None,
     }
@@ -541,6 +740,49 @@ fn readiness_input() -> ProviderReadinessInput {
 
 fn historical_call_count() -> u32 {
     3
+}
+
+fn complete_reap_receipt() -> ProcessReapReceipt {
+    ProcessReapReceipt {
+        operation_id: "provider-process-terminal-test".to_owned(),
+        generation: 1,
+        job_object_name: "eliot-provider-test-job".to_owned(),
+        root_pid: Some(42),
+        process_count_before: 1,
+        process_count_after: 0,
+        graceful_attempted: true,
+        forced_termination: false,
+        stdout_closed: true,
+        stderr_closed: true,
+        all_tasks_joined: true,
+        elapsed_ms: 45,
+        terminal_error_codes: Vec::new(),
+    }
+}
+
+fn terminal_process_outcome() -> ProviderProcessOutcome {
+    let process_started_at = OffsetDateTime::UNIX_EPOCH;
+    let process_exit_at = process_started_at + time::Duration::milliseconds(40);
+    ProviderProcessOutcome {
+        exit_code: Some(0),
+        stdout: Vec::new(),
+        stderr: Vec::new(),
+        stdout_total_bytes: 0,
+        stderr_total_bytes: 0,
+        stdout_truncated: false,
+        stderr_truncated: false,
+        timed_out: false,
+        timeout_class: None,
+        cancelled: false,
+        worker_error: None,
+        observed_processes: Vec::new(),
+        process_started_at,
+        first_output_at: None,
+        last_output_at: None,
+        process_exit_at: Some(process_exit_at),
+        cleanup_completed_at: process_exit_at + time::Duration::milliseconds(5),
+        reap_receipt: complete_reap_receipt(),
+    }
 }
 
 fn temp_root(label: &str) -> PathBuf {

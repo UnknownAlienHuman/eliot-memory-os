@@ -2,7 +2,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 
-use crate::{AgentHostId, BlobRef};
+use crate::{AgentHostId, BlobRef, ProcessReapReceipt};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
@@ -12,6 +12,7 @@ pub enum ProviderInvocationState {
     DispatchStarting,
     Dispatched,
     Running,
+    ProcessTerminal,
     OutputObserved,
     CompletedCaptured,
     ReviewNormalized,
@@ -126,7 +127,8 @@ pub struct ProviderInvocationAttempt {
     pub cwd: Option<String>,
     pub environment_fingerprint: Option<String>,
     pub timeout_profile_id: String,
-    pub provider_route_policy: ProviderRoutePolicyBinding,
+    #[serde(default)]
+    pub provider_route_policy: Option<ProviderRoutePolicyBinding>,
     pub state_transitions: Vec<ProviderInvocationTransition>,
     #[serde(with = "time::serde::rfc3339::option")]
     pub dispatch_started_at: Option<OffsetDateTime>,
@@ -147,6 +149,24 @@ pub struct ProviderInvocationAttempt {
     pub structured_output_blob_or_hash: Option<BlobRef>,
     pub exit_code_or_signal: Option<String>,
     pub process_or_job_identity: Option<String>,
+    #[serde(default)]
+    pub timeout_class: Option<ProviderTimeoutClass>,
+    #[serde(default)]
+    pub process_reap_receipt: Option<ProcessReapReceipt>,
+    #[serde(default)]
+    pub process_timed_out: Option<bool>,
+    #[serde(default)]
+    pub process_cancelled: Option<bool>,
+    #[serde(default)]
+    pub process_worker_error: Option<String>,
+    #[serde(default)]
+    pub stdout_total_bytes: Option<u64>,
+    #[serde(default)]
+    pub stderr_total_bytes: Option<u64>,
+    #[serde(default)]
+    pub stdout_truncated: Option<bool>,
+    #[serde(default)]
+    pub stderr_truncated: Option<bool>,
     pub quota_or_cost_if_known: Option<String>,
     pub original_closeout_ref: Option<String>,
 }
@@ -158,7 +178,7 @@ pub struct ProviderRoutePolicyBinding {
     pub policy_hash_blake3: String,
 }
 
-#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProviderDeclaredBudget {
     absolute_runtime_deadline_ms: u64,

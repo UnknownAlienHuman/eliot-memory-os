@@ -1706,6 +1706,13 @@ enum ExternalAgentCommand {
         #[arg(long)]
         invocation: String,
     },
+    /// Reconcile one historical post-dispatch provider attempt without provider access.
+    Reconcile {
+        #[arg(long)]
+        invocation: String,
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -2281,7 +2288,7 @@ async fn dispatch_command(
         Command::ExternalReview { command } => {
             dispatch_external_review_command(config, command).await
         }
-        Command::Delegate { command } => dispatch_delegate_command(config, command).await,
+        Command::Delegate { command } => Box::pin(dispatch_delegate_command(config, command)).await,
         Command::DelegationCalibration { command } => {
             dispatch_delegation_calibration_command(config, command)
         }

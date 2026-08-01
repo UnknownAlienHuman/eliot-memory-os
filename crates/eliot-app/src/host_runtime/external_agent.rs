@@ -10,7 +10,8 @@ use eliot_engine::{
     ExternalResultCompletenessService, OpenCodeCommandInput, ProviderCallCampaignRequest,
     ProviderCallReservationDecision, ProviderCallReservationOwner, ProviderCallReservationRequest,
     ProviderCommandPlan, ProviderCompletenessInput, ProviderInvocationJournal, ProviderOutputSpool,
-    ProviderProcessOutcome, ProviderProcessRunner, ProviderProcessSpec, ProviderTerminalResult,
+    ProviderProcessOutcome, ProviderProcessRunner, ProviderProcessSpec,
+    ProviderReconciliationInput, ProviderReconciliationService, ProviderTerminalResult,
     build_antigravity_command, build_claude_code_command, build_opencode_command,
     parse_antigravity_output, parse_claude_code_stream, parse_opencode_stream,
     seal_provider_runtime_contract, validate_external_agent_execution_request,
@@ -20,9 +21,10 @@ use eliot_types::{
     AdapterLimits, AdapterObservation, AdapterRequest, AdapterResult, AdapterResultStatus,
     AdapterState, AgentResultEnvelope, AgentResultStatus, AgentRole, ExternalAgentExecutionRequest,
     ExternalAgentPurpose, OperationJobState, PROVIDER_RUNTIME_CONTRACT_SCHEMA_VERSION,
-    ProcessExecutionPolicy, ProviderExecutionEvidence, ProviderInvocationAttempt,
-    ProviderInvocationState, ProviderMcpServerContract, ProviderRuntimeContract,
-    ProviderStructuredOutputMode, TaintClass,
+    ProcessExecutionPolicy, ProviderCallLedger, ProviderCallReservationState,
+    ProviderExecutionEvidence, ProviderIdentityCheck, ProviderInvocationAttempt,
+    ProviderInvocationState, ProviderMcpServerContract, ProviderReconciliationMethod,
+    ProviderRuntimeContract, ProviderStructuredOutputMode, ProviderTimeoutClass, TaintClass,
 };
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
@@ -296,7 +298,649 @@ pub(crate) async fn dispatch(
                 .or_else(|_| journal.load(&format!("external-agent-attempt-{invocation}")))?;
             write_json(&attempt)
         }
+        crate::ExternalAgentCommand::Reconcile {
+            invocation,
+            dry_run,
+        } => {
+            let result =
+                reconcile_historical_provider_attempt(config_path, &invocation, dry_run).await?;
+            write_json(&result)
+        }
     }
+}
+
+async fn reconcile_historical_provider_attempt(
+    config_path: &Path,
+    invocation: &str,
+    dry_run: bool,
+) -> Result<Value> {
+    validate_invocation_component(invocation)?;
+    let root = runtime_root(config_path);
+    let journal = ProviderInvocationJournal::new(&root);
+    let mut attempt = journal
+        .load(invocation)
+        .or_else(|_| journal.load(&format!("external-agent-attempt-{invocation}")))?;
+    anyhow::ensure!(
+        attempt.provider == "antigravity",
+        "historical provider reconciliation is bounded to Antigravity"
+    );
+    ensure_historical_process_facts_absent(&attempt)?;
+    let attempt_path = root.join("runtime/provider-invocations").join(format!(
+        "{}.json",
+        safe_component(&attempt.invocation_attempt_id)
+    ));
+    let resolution_relative = format!(
+        "runtime/provider-invocation-reconciliation/{}.resolution.json",
+        safe_component(&attempt.invocation_attempt_id)
+    );
+    let resolution_path = root.join(&resolution_relative);
+    if resolution_path.exists() {
+        let resolution = read_json_value(&resolution_path)?;
+        validate_existing_resolution(&resolution, &attempt.invocation_attempt_id)?;
+        if dry_run {
+            return Ok(json!({
+                "status": "dry_run_existing_resolution",
+                "provider_calls": 0,
+                "provider_redispatch_forbidden": true,
+                "resolution_ref": resolution_relative,
+                "resolution": resolution,
+                "attempt": attempt,
+            }));
+        }
+        finalize_historical_attempt(&journal, &mut attempt, &resolution_relative)?;
+        return Ok(json!({
+            "status": "idempotent_replay",
+            "provider_calls": 0,
+            "provider_redispatch_forbidden": true,
+            "resolution_ref": resolution_relative,
+            "resolution": resolution,
+            "attempt": attempt,
+        }));
+    }
+
+    let source_attempt_bytes = std::fs::read(&attempt_path)?;
+    let evidence = collect_historical_reconciliation_evidence(
+        config_path,
+        &root,
+        &attempt,
+        &source_attempt_bytes,
+    )
+    .await?;
+    let resolution = build_historical_resolution(&attempt, &source_attempt_bytes, &evidence)?;
+    if dry_run {
+        return Ok(json!({
+            "status": "dry_run",
+            "provider_calls": 0,
+            "provider_redispatch_forbidden": true,
+            "would_write_resolution_ref": resolution_relative,
+            "would_transition_to": "NON_RECONCILABLE_UNKNOWN",
+            "resolution": resolution,
+            "attempt": attempt,
+        }));
+    }
+    crate::runtime_instance::atomic_write_json(&resolution_path, &resolution)?;
+    finalize_historical_attempt(&journal, &mut attempt, &resolution_relative)?;
+    Ok(json!({
+        "status": "reconciled",
+        "provider_calls": 0,
+        "provider_redispatch_forbidden": true,
+        "resolution_ref": resolution_relative,
+        "resolution": resolution,
+        "attempt": attempt,
+    }))
+}
+
+fn build_historical_resolution(
+    attempt: &ProviderInvocationAttempt,
+    source_attempt_bytes: &[u8],
+    evidence: &Value,
+) -> Result<Value> {
+    let completeness = ExternalResultCompletenessService.evaluate(ProviderCompletenessInput {
+        receipt_id: format!(
+            "provider-completeness:historical:{}",
+            attempt.invocation_attempt_id
+        ),
+        invocation_attempt_ref: attempt.invocation_attempt_id.clone(),
+        raw_output_ref: None,
+        expected_schema: "unknown_historical_provider_output".to_owned(),
+        terminal_marker_or_protocol_status: None,
+        required_fields_present: false,
+        truncation_detected: false,
+        stream_closed_cleanly: false,
+        process_exit_success: false,
+    });
+    let evidence_refs = reconciliation_evidence_refs(evidence)?;
+    let result = ProviderReconciliationService.reconcile(ProviderReconciliationInput {
+        reconciliation_id: format!(
+            "provider-reconciliation:historical:{}",
+            attempt.invocation_attempt_id
+        ),
+        outcome_id: format!(
+            "provider-outcome:historical:{}",
+            attempt.invocation_attempt_id
+        ),
+        invocation_attempt_ref: attempt.invocation_attempt_id.clone(),
+        methods_attempted: vec![
+            ProviderReconciliationMethod::LocalWal,
+            ProviderReconciliationMethod::RawOutputSpool,
+            ProviderReconciliationMethod::ProcessExitRecord,
+            ProviderReconciliationMethod::JobObjectRecord,
+            ProviderReconciliationMethod::AdapterLog,
+        ],
+        identity_checks: historical_identity_checks(attempt, evidence)?,
+        recovered_artifacts: Vec::new(),
+        mismatched_artifacts_quarantined: Vec::new(),
+        completeness,
+        recovered_review_id: None,
+        terminal_failure_proven: false,
+        terminal_failure_class: None,
+        dispatch_proven: true,
+        slot_consumed: true,
+        raw_output_preserved: false,
+        timeout_class: Some(ProviderTimeoutClass::FirstOutputTimeout),
+        exact_failure_evidence_refs: evidence_refs.clone(),
+        unresolved_questions: vec![
+            "historical process exit timestamp was not persisted".to_owned(),
+            "historical cleanup timestamp and ProcessReapReceipt were not persisted".to_owned(),
+            "provider-side outcome and output remain unknown".to_owned(),
+        ],
+        verifier_refs: evidence_refs,
+        started_at: OffsetDateTime::now_utc(),
+        completed_at: OffsetDateTime::now_utc(),
+    });
+    anyhow::ensure!(
+        result.outcome.effective_state == ProviderInvocationState::NonReconcilableUnknown
+            && !result.record.provider_generating_call_performed
+            && !result.outcome.retry_same_campaign_allowed
+            && result.record.review_id_if_recovered.is_none(),
+        "historical reconciliation did not resolve fail-closed"
+    );
+    Ok(json!({
+        "schema_version": "provider-historical-reconciliation-v1",
+        "invocation_attempt_id": attempt.invocation_attempt_id,
+        "source_attempt_sha256": sha256_bytes(source_attempt_bytes),
+        "provider_redispatch_forbidden": true,
+        "provider_calls": 0,
+        "process_facts_synthesized": false,
+        "reconciliation": result.record,
+        "outcome": result.outcome,
+        "evidence": evidence,
+    }))
+}
+
+fn validate_invocation_component(invocation: &str) -> Result<()> {
+    anyhow::ensure!(
+        !invocation.trim().is_empty()
+            && !invocation.contains(['/', '\\'])
+            && invocation != "."
+            && invocation != "..",
+        "invalid external-agent invocation ID"
+    );
+    Ok(())
+}
+
+fn ensure_historical_process_facts_absent(attempt: &ProviderInvocationAttempt) -> Result<()> {
+    anyhow::ensure!(
+        matches!(
+            attempt
+                .state_transitions
+                .last()
+                .map(|transition| transition.to),
+            Some(
+                ProviderInvocationState::Running
+                    | ProviderInvocationState::TimeoutPendingReconciliation
+                    | ProviderInvocationState::NonReconcilableUnknown
+            )
+        ),
+        "attempt is not a historical post-dispatch unknown outcome"
+    );
+    anyhow::ensure!(
+        attempt.first_output_at.is_none()
+            && attempt.last_output_at.is_none()
+            && attempt.process_exit_at.is_none()
+            && attempt.cleanup_completed_at.is_none()
+            && attempt.stdout_blob_or_hash.is_none()
+            && attempt.stderr_blob_or_hash.is_none()
+            && attempt.structured_output_blob_or_hash.is_none()
+            && attempt.exit_code_or_signal.is_none()
+            && attempt.process_reap_receipt.is_none()
+            && attempt.process_timed_out.is_none()
+            && attempt.process_cancelled.is_none()
+            && attempt.process_worker_error.is_none()
+            && attempt.stdout_total_bytes.is_none()
+            && attempt.stderr_total_bytes.is_none()
+            && attempt.stdout_truncated.is_none()
+            && attempt.stderr_truncated.is_none(),
+        "attempt contains process or output facts and requires a different reconciliation path"
+    );
+    Ok(())
+}
+
+async fn collect_historical_reconciliation_evidence(
+    config_path: &Path,
+    root: &Path,
+    attempt: &ProviderInvocationAttempt,
+    source_attempt_bytes: &[u8],
+) -> Result<Value> {
+    let pid = historical_attempt_pid(attempt)?;
+    let process_alive = eliot_windows_ipc::process_is_alive(pid)?;
+    anyhow::ensure!(
+        !process_alive,
+        "historical provider PID {pid} is still alive"
+    );
+    let smoke_id = attempt
+        .external_invocation_ref
+        .as_deref()
+        .and_then(|value| value.strip_prefix("external-agent-attempt-"))
+        .context("historical attempt has no exact external invocation reference")?;
+    let ledger = historical_ledger_evidence(root, attempt)?;
+    let (broker, authority) = historical_broker_evidence(root, smoke_id)?;
+    let adapter_log = historical_adapter_log_evidence(root, smoke_id)?;
+    let spool_path = root
+        .join("spool/provider-invocations")
+        .join(safe_component(&attempt.invocation_attempt_id));
+    anyhow::ensure!(
+        !directory_contains_file(&spool_path)?,
+        "historical attempt has raw spool artifacts and requires exact output reconciliation"
+    );
+
+    let runtime_value = historical_runtime_snapshot(config_path).await?;
+    Ok(json!({
+        "source_attempt": {
+            "path": relative_evidence_path(root, &root.join("runtime/provider-invocations").join(format!("{}.json", safe_component(&attempt.invocation_attempt_id))))?,
+            "sha256": sha256_bytes(source_attempt_bytes),
+            "last_transition": attempt.state_transitions.last(),
+        },
+        "provider_call_ledger": ledger,
+        "host_broker": broker,
+        "authority_revocation": authority,
+        "adapter_log": adapter_log,
+        "raw_output_spool": {
+            "path": relative_evidence_path(root, &spool_path)?,
+            "artifacts_present": false,
+        },
+        "process_exit_record": {
+            "pid": pid,
+            "alive_at_reconciliation": false,
+            "exit_timestamp_known": false,
+            "exit_code_known": false,
+            "captured_at": OffsetDateTime::now_utc(),
+        },
+        "job_object_record": {
+            "historical_receipt_present": false,
+            "process_reap_receipt_synthesized": false,
+        },
+        "runtime_supervision_snapshot": runtime_value,
+    }))
+}
+
+fn historical_ledger_evidence(root: &Path, attempt: &ProviderInvocationAttempt) -> Result<Value> {
+    let path = root.join("runtime/provider-call-ledger.json");
+    let bytes = std::fs::read(&path)?;
+    let ledger: ProviderCallLedger = serde_json::from_slice(&bytes)?;
+    let reservation = ledger
+        .reservations
+        .into_iter()
+        .find(|reservation| reservation.reservation_id == attempt.reservation_id)
+        .context("historical provider reservation is absent")?;
+    anyhow::ensure!(
+        reservation.state == ProviderCallReservationState::UnknownOutcome
+            && reservation.consumes_budget
+            && reservation.terminal_at.is_some()
+            && reservation.external_invocation_ref.as_deref()
+                == attempt.external_invocation_ref.as_deref(),
+        "historical provider reservation is not a consumed terminal unknown outcome"
+    );
+    Ok(json!({
+        "path": relative_evidence_path(root, &path)?,
+        "sha256": sha256_bytes(&bytes),
+        "reservation": reservation,
+    }))
+}
+
+fn historical_broker_evidence(root: &Path, smoke_id: &str) -> Result<(Value, Value)> {
+    let path = root.join("reports/host-broker/latest.json");
+    let bytes = std::fs::read(&path)?;
+    let broker = serde_json::from_slice::<Value>(&bytes)?;
+    let operation_job = find_array_object(&broker, "operation_jobs", "job_id", smoke_id)?;
+    anyhow::ensure!(
+        operation_job["state"] == "failed"
+            && operation_job["phase"] == "failed"
+            && operation_job["restart_count"] == 0,
+        "historical HostBroker operation is not a non-restarted terminal failure"
+    );
+    let host_session = find_array_object(&broker, "host_sessions", "owner_operation_id", smoke_id)?;
+    anyhow::ensure!(
+        host_session["state"] == "retired",
+        "historical HostBroker session is not retired"
+    );
+    let role_lease_id = operation_job["role_lease_id"]
+        .as_str()
+        .context("historical operation has no role lease")?;
+    let authority = find_authority_revocation(root, role_lease_id, smoke_id)?;
+    Ok((
+        json!({
+            "path": relative_evidence_path(root, &path)?,
+            "sha256": sha256_bytes(&bytes),
+            "operation_job": operation_job,
+            "host_session": host_session,
+        }),
+        authority,
+    ))
+}
+
+fn historical_adapter_log_evidence(root: &Path, smoke_id: &str) -> Result<Value> {
+    let path = root
+        .join("external-agent-smokes")
+        .join(smoke_id)
+        .join("phases.jsonl");
+    let bytes = std::fs::read(&path)?;
+    let (line, entry) = historical_timeout_phase(&bytes)?;
+    Ok(json!({
+        "path": relative_evidence_path(root, &path)?,
+        "sha256": sha256_bytes(&bytes),
+        "line": line,
+        "entry": entry,
+    }))
+}
+
+async fn historical_runtime_snapshot(config_path: &Path) -> Result<Value> {
+    let runtime_store = super::supervised_process::daemon_operation_runtime_handle(config_path)?;
+    let report = crate::runtime_integrity::inspect(config_path, &runtime_store, true, None).await?;
+    let value = serde_json::to_value(report)?;
+    for field in [
+        "active",
+        "stuck",
+        "awaiting_reconciliation",
+        "cleanup_pending",
+        "orphan_processes",
+    ] {
+        anyhow::ensure!(
+            value["operations"][field] == 0,
+            "runtime supervision is not clean at field {field}"
+        );
+    }
+    anyhow::ensure!(
+        value["runtime_integrity"]["clean"] == true,
+        "runtime integrity is not clean"
+    );
+    Ok(value)
+}
+
+fn historical_attempt_pid(attempt: &ProviderInvocationAttempt) -> Result<u32> {
+    let identity = attempt
+        .process_or_job_identity
+        .as_deref()
+        .context("historical attempt has no process identity")?;
+    identity
+        .strip_prefix("pid:")
+        .and_then(|value| value.split(';').next())
+        .context("historical attempt process identity is malformed")?
+        .parse()
+        .context("historical attempt PID is malformed")
+}
+
+fn find_array_object(value: &Value, array: &str, key: &str, expected: &str) -> Result<Value> {
+    value[array]
+        .as_array()
+        .and_then(|items| {
+            items
+                .iter()
+                .find(|item| item[key].as_str() == Some(expected))
+        })
+        .cloned()
+        .with_context(|| format!("{array} has no exact {key}={expected}"))
+}
+
+fn find_authority_revocation(root: &Path, role_lease_id: &str, smoke_id: &str) -> Result<Value> {
+    let authority_root = root.join("reports/role-lease-authority");
+    let mut paths = std::fs::read_dir(&authority_root)?
+        .filter_map(std::result::Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.extension()
+                .is_some_and(|extension| extension == "json")
+        })
+        .collect::<Vec<_>>();
+    paths.sort();
+    for path in paths {
+        let bytes = std::fs::read(&path)?;
+        let value = serde_json::from_slice::<Value>(&bytes)?;
+        if value["role_lease_id"].as_str() == Some(role_lease_id)
+            && value["close_idempotency_key"]
+                .as_str()
+                .is_some_and(|key| key.contains(smoke_id))
+            && value["canonical_revoked_role_receipt"].is_object()
+            && value["canonical_retired_binding_receipt"].is_object()
+            && value["canonical_terminal_job_receipt"].is_object()
+        {
+            return Ok(json!({
+                "path": relative_evidence_path(root, &path)?,
+                "sha256": sha256_bytes(&bytes),
+                "receipt": value,
+            }));
+        }
+    }
+    anyhow::bail!("canonical authority revocation receipt is absent")
+}
+
+fn historical_timeout_phase(bytes: &[u8]) -> Result<(usize, Value)> {
+    String::from_utf8_lossy(bytes)
+        .lines()
+        .enumerate()
+        .find_map(|(index, line)| {
+            let value = serde_json::from_str::<Value>(line).ok()?;
+            let detail = value["detail"].as_str().unwrap_or_default();
+            (value["status"] == "failed"
+                && detail.contains("first output deadline exceeded")
+                && detail.contains("no ProviderExecutionEvidence"))
+            .then_some((index + 1, value))
+        })
+        .context("historical first-output timeout adapter evidence is absent")
+}
+
+fn directory_contains_file(path: &Path) -> Result<bool> {
+    if !path.exists() {
+        return Ok(false);
+    }
+    for entry in std::fs::read_dir(path)? {
+        let entry = entry?;
+        if entry.file_type()?.is_file() || entry.file_type()?.is_dir() {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn relative_evidence_path(root: &Path, path: &Path) -> Result<String> {
+    Ok(path
+        .strip_prefix(root)
+        .with_context(|| format!("evidence path {} escaped runtime root", path.display()))?
+        .to_string_lossy()
+        .replace('\\', "/"))
+}
+
+fn reconciliation_evidence_refs(evidence: &Value) -> Result<Vec<String>> {
+    let mut refs = Vec::new();
+    for key in [
+        "source_attempt",
+        "provider_call_ledger",
+        "host_broker",
+        "authority_revocation",
+        "adapter_log",
+        "raw_output_spool",
+    ] {
+        let path = evidence[key]["path"]
+            .as_str()
+            .with_context(|| format!("reconciliation evidence {key} has no path"))?;
+        refs.push(path.to_owned());
+    }
+    refs.push("embedded:process_exit_record:attempted-and-absent".to_owned());
+    refs.push("embedded:job_object_record:attempted-and-absent".to_owned());
+    refs.push("embedded:runtime_supervision_snapshot".to_owned());
+    Ok(refs)
+}
+
+fn historical_identity_checks(
+    attempt: &ProviderInvocationAttempt,
+    evidence: &Value,
+) -> Result<Vec<ProviderIdentityCheck>> {
+    let reservation = &evidence["provider_call_ledger"]["reservation"];
+    let job = &evidence["host_broker"]["operation_job"];
+    let check = |field: &str, expected: String, observed: String, evidence_ref: &str| {
+        ProviderIdentityCheck {
+            field: field.to_owned(),
+            matched: Some(expected == observed),
+            expected: Some(expected),
+            observed: Some(observed),
+            evidence_ref: evidence_ref.to_owned(),
+        }
+    };
+    let mut checks = vec![
+        check(
+            "provider",
+            attempt.provider.clone(),
+            reservation["provider"]
+                .as_str()
+                .context("reservation provider missing")?
+                .to_owned(),
+            "provider_call_ledger",
+        ),
+        check(
+            "reservation_id",
+            attempt.reservation_id.clone(),
+            reservation["reservation_id"]
+                .as_str()
+                .context("reservation ID missing")?
+                .to_owned(),
+            "provider_call_ledger",
+        ),
+        check(
+            "campaign_id",
+            attempt.campaign_id.clone(),
+            reservation["campaign_id"]
+                .as_str()
+                .context("campaign ID missing")?
+                .to_owned(),
+            "provider_call_ledger",
+        ),
+        check(
+            "idempotency_key",
+            attempt.idempotency_key.clone(),
+            reservation["idempotency_key"]
+                .as_str()
+                .context("idempotency key missing")?
+                .to_owned(),
+            "provider_call_ledger",
+        ),
+        check(
+            "external_invocation_ref",
+            attempt
+                .external_invocation_ref
+                .clone()
+                .context("external invocation ref missing")?,
+            reservation["external_invocation_ref"]
+                .as_str()
+                .context("reservation external invocation missing")?
+                .to_owned(),
+            "provider_call_ledger",
+        ),
+        check(
+            "broker_invocation",
+            attempt
+                .external_invocation_ref
+                .as_deref()
+                .and_then(|value| value.strip_prefix("external-agent-attempt-"))
+                .context("broker invocation identity missing")?
+                .to_owned(),
+            job["invocation_id"]
+                .as_str()
+                .context("broker invocation missing")?
+                .to_owned(),
+            "host_broker",
+        ),
+    ];
+    for field in ["raw_output_checksum", "time_window"] {
+        checks.push(ProviderIdentityCheck {
+            field: field.to_owned(),
+            expected: None,
+            observed: None,
+            matched: None,
+            evidence_ref: "not-persisted".to_owned(),
+        });
+    }
+    anyhow::ensure!(
+        checks
+            .iter()
+            .all(|identity| identity.matched != Some(false)),
+        "historical reconciliation identity mismatch"
+    );
+    Ok(checks)
+}
+
+fn validate_existing_resolution(resolution: &Value, attempt_id: &str) -> Result<()> {
+    anyhow::ensure!(
+        resolution["schema_version"] == "provider-historical-reconciliation-v1"
+            && resolution["invocation_attempt_id"] == attempt_id
+            && resolution["provider_redispatch_forbidden"] == true
+            && resolution["provider_calls"] == 0
+            && resolution["process_facts_synthesized"] == false
+            && resolution["reconciliation"]["provider_generating_call_performed"] == false
+            && resolution["outcome"]["effective_state"] == "NON_RECONCILABLE_UNKNOWN",
+        "existing provider reconciliation record is invalid or conflicting"
+    );
+    Ok(())
+}
+
+fn finalize_historical_attempt(
+    journal: &ProviderInvocationJournal,
+    attempt: &mut ProviderInvocationAttempt,
+    resolution_ref: &str,
+) -> Result<()> {
+    let current = attempt
+        .state_transitions
+        .last()
+        .map(|transition| transition.to)
+        .context("historical attempt has no state")?;
+    if current == ProviderInvocationState::Running {
+        journal.transition(
+            attempt,
+            ProviderInvocationState::TimeoutPendingReconciliation,
+            vec![resolution_ref.to_owned()],
+        )?;
+    }
+    let current = attempt
+        .state_transitions
+        .last()
+        .map(|transition| transition.to)
+        .context("historical attempt has no state")?;
+    if matches!(
+        current,
+        ProviderInvocationState::TimeoutPendingReconciliation
+            | ProviderInvocationState::ProcessTerminal
+    ) {
+        journal.transition(
+            attempt,
+            ProviderInvocationState::NonReconcilableUnknown,
+            vec![
+                resolution_ref.to_owned(),
+                "provider_redispatch_forbidden:true".to_owned(),
+            ],
+        )?;
+    }
+    anyhow::ensure!(
+        attempt
+            .state_transitions
+            .last()
+            .map(|transition| transition.to)
+            == Some(ProviderInvocationState::NonReconcilableUnknown),
+        "historical attempt did not reach NonReconcilableUnknown"
+    );
+    ensure_historical_process_facts_absent(attempt)
+}
+
+fn read_json_value(path: &Path) -> Result<Value> {
+    Ok(serde_json::from_slice(&std::fs::read(path)?)?)
 }
 
 #[derive(Clone, Debug)]
@@ -1867,7 +2511,7 @@ impl ExternalAgentAdapterCore {
             cwd: Some(path_string(&cwd)),
             environment_fingerprint: Some(sha256_bytes(&serde_json::to_vec(&environment)?)),
             timeout_profile_id: execution.provider_route_policy.policy_id().to_owned(),
-            provider_route_policy: execution.provider_route_policy.binding(),
+            provider_route_policy: Some(execution.provider_route_policy.binding()),
             state_transitions: Vec::new(),
             dispatch_started_at: None,
             process_started_at: None,
@@ -1881,6 +2525,15 @@ impl ExternalAgentAdapterCore {
             structured_output_blob_or_hash: None,
             exit_code_or_signal: None,
             process_or_job_identity: None,
+            timeout_class: None,
+            process_reap_receipt: None,
+            process_timed_out: None,
+            process_cancelled: None,
+            process_worker_error: None,
+            stdout_total_bytes: None,
+            stderr_total_bytes: None,
+            stdout_truncated: None,
+            stderr_truncated: None,
             quota_or_cost_if_known: None,
             original_closeout_ref: Some(path_string(&execution_request_path)),
         })?;
@@ -2021,6 +2674,7 @@ impl ExternalAgentAdapterCore {
         let process = match process {
             Ok(process) => process,
             Err(error) => {
+                let error_text = error.to_string();
                 let state = attempt
                     .state_transitions
                     .last()
@@ -2040,23 +2694,27 @@ impl ExternalAgentAdapterCore {
                         &reservation.reservation_id,
                         "managed process failed after dispatch",
                     );
+                    if let Err(journal_error) = journal.record_post_dispatch_failure(
+                        &mut attempt,
+                        vec![format!("supervisor_error:{error_text}")],
+                    ) {
+                        return Err(eliot_engine::EngineError::WriteRejected(format!(
+                            "managed provider process failed after dispatch and reconciliation journaling failed; provider redispatch is forbidden; supervisor_error={error_text}; journal_error={journal_error}"
+                        )));
+                    }
                 }
                 return Err(eliot_engine::EngineError::WriteRejected(format!(
-                    "managed provider process failed: {error}"
+                    "managed provider process failed: {error_text}"
                 )));
             }
         };
-        attempt.process_started_at = Some(process.process_started_at);
-        attempt.process_exit_at = process.process_exit_at;
-        attempt.cleanup_completed_at = Some(process.cleanup_completed_at);
-        attempt.exit_code_or_signal = process.exit_code.map(|code| code.to_string());
-        attempt.process_or_job_identity = Some(format!(
-            "pid:{};job={};terminated={};observed={}",
-            process.reap_receipt.root_pid.unwrap_or_default(),
-            process.reap_receipt.job_object_name,
-            process.reap_receipt.proves_complete_reap(),
-            process.observed_processes.len()
-        ));
+        if let Err(error) = journal.record_process_terminal(&mut attempt, &process) {
+            let _ = reservation_owner.mark_unknown_outcome(
+                &reservation.reservation_id,
+                "process reaped but terminal journal persistence requires reconciliation",
+            );
+            return Err(error);
+        }
 
         let stdout_capture = ProviderOutputSpool.capture(
             &runtime_root,
@@ -2064,19 +2722,56 @@ impl ExternalAgentAdapterCore {
             "stdout",
             process.stdout.as_slice(),
             MAX_PROVIDER_OUTPUT_BYTES,
-        )?;
+        );
+        let stdout_capture = match stdout_capture {
+            Ok(capture) => capture,
+            Err(error) => {
+                let _ = journal.transition(
+                    &mut attempt,
+                    ProviderInvocationState::LocalCaptureFailed,
+                    vec![format!("stdout_capture_failed:{error}")],
+                );
+                let _ = reservation_owner.fail_after_dispatch(
+                    &reservation.reservation_id,
+                    "provider stdout capture failed after terminal process facts",
+                );
+                return Err(error);
+            }
+        };
         let stderr_capture = ProviderOutputSpool.capture(
             &runtime_root,
             &attempt_id,
             "stderr",
             process.stderr.as_slice(),
             MAX_PROVIDER_OUTPUT_BYTES,
-        )?;
-        attempt.stdout_blob_or_hash = Some(stdout_capture.blob_ref.clone());
-        attempt.stderr_blob_or_hash = Some(stderr_capture.blob_ref.clone());
+        );
+        let stderr_capture = match stderr_capture {
+            Ok(capture) => capture,
+            Err(error) => {
+                let _ = journal.transition(
+                    &mut attempt,
+                    ProviderInvocationState::LocalCaptureFailed,
+                    vec![format!("stderr_capture_failed:{error}")],
+                );
+                let _ = reservation_owner.fail_after_dispatch(
+                    &reservation.reservation_id,
+                    "provider stderr capture failed after terminal process facts",
+                );
+                return Err(error);
+            }
+        };
+        if let Err(error) = journal.record_captured_output(
+            &mut attempt,
+            stdout_capture.blob_ref.clone(),
+            stderr_capture.blob_ref.clone(),
+        ) {
+            let _ = reservation_owner.mark_unknown_outcome(
+                &reservation.reservation_id,
+                "captured output refs could not be journaled",
+            );
+            return Err(error);
+        }
         if stdout_capture.output_observed {
-            attempt.first_output_at = Some(OffsetDateTime::now_utc());
-            attempt.last_output_at = attempt.first_output_at;
             journal.transition(
                 &mut attempt,
                 ProviderInvocationState::OutputObserved,
@@ -2086,6 +2781,36 @@ impl ExternalAgentAdapterCore {
         let worktree_after = worktree_snapshot_if_git(&cwd)?;
         let read_only_mutation = execution.read_only && worktree_before != worktree_after;
 
+        if process.worker_error.is_some() || !process.reap_receipt.proves_complete_reap() {
+            journal.transition(
+                &mut attempt,
+                ProviderInvocationState::CleanupFailedAfterComplete,
+                vec![format!("worker_error:{:?}", process.worker_error)],
+            )?;
+            reservation_owner.mark_unknown_outcome(
+                &reservation.reservation_id,
+                "provider process cleanup or supervision failed after dispatch",
+            )?;
+            return self
+                .terminal_result(
+                    &request,
+                    &execution,
+                    &runtime_contract,
+                    &process,
+                    &stdout_capture,
+                    &stderr_capture,
+                    None,
+                    None,
+                    AgentResultStatus::UnknownOutcome,
+                    AdapterResultStatus::Failed,
+                    true,
+                    Some(
+                        "provider process cleanup was incomplete; reconciliation required"
+                            .to_owned(),
+                    ),
+                )
+                .await;
+        }
         if process.timed_out {
             journal.transition(
                 &mut attempt,
@@ -2094,7 +2819,10 @@ impl ExternalAgentAdapterCore {
             )?;
             reservation_owner.mark_unknown_outcome(
                 &reservation.reservation_id,
-                "provider absolute runtime timeout requires reconciliation",
+                &format!(
+                    "provider {:?} timeout requires reconciliation",
+                    process.timeout_class
+                ),
             )?;
             journal.transition(
                 &mut attempt,
@@ -2201,7 +2929,22 @@ impl ExternalAgentAdapterCore {
             "structured",
             structured_bytes.as_slice(),
             MAX_PROVIDER_OUTPUT_BYTES,
-        )?;
+        );
+        let structured_capture = match structured_capture {
+            Ok(capture) => capture,
+            Err(error) => {
+                let _ = journal.transition(
+                    &mut attempt,
+                    ProviderInvocationState::LocalCaptureFailed,
+                    vec![format!("structured_capture_failed:{error}")],
+                );
+                let _ = reservation_owner.fail_after_dispatch(
+                    &reservation.reservation_id,
+                    "provider structured capture failed after terminal process facts",
+                );
+                return Err(error);
+            }
+        };
         attempt.structured_output_blob_or_hash = Some(structured_capture.blob_ref.clone());
         attempt
             .quota_or_cost_if_known
@@ -2218,6 +2961,15 @@ impl ExternalAgentAdapterCore {
             process_exit_success: true,
         });
         if !completeness.result_complete {
+            let _ = journal.transition(
+                &mut attempt,
+                ProviderInvocationState::ProtocolParseFailed,
+                vec!["provider_completeness_rejected".to_owned()],
+            );
+            let _ = reservation_owner.fail_after_dispatch(
+                &reservation.reservation_id,
+                "provider completeness service rejected terminal result",
+            );
             return Err(eliot_engine::EngineError::WriteRejected(
                 "provider completeness service rejected a parsed terminal result".to_owned(),
             ));

@@ -94,3 +94,38 @@ This log preserves the ordered implementation evidence for
   - `cargo test -p eliot-engine --test antigravity_runtime mcp_`: 7/7 passed; 19.61 s, test bodies 0.03 s.
   - An incorrect `--exact` app test filter selected zero tests after 90.86 s of duplicate-main compilation. It is excluded from evidence; the corrected one-test result above is evidence and the compile penalty is tracked for ARCH-04.
 - Source inventory: no adapter hard-coded `max_calls: 16`, no reservation `campaign_closed`, and no provider-maintained auditor/legacy MCP list remains.
+
+## ARCH-03 — terminal process facts and provider-free historical reconciliation
+
+- Added the durable `ProcessTerminal` lifecycle state and made `ProviderInvocationJournal::record_process_terminal` the first operation after a successful `ProviderProcessRunner` return in both the normal external-agent route and the recorded Antigravity route.
+- The journal now persists actual process start/exit/cleanup, first/last output, exit/forced-termination classification, timeout class, PID/Job Object identity, `ProcessReapReceipt`, worker/cancellation/timeout facts, byte counts and truncation facts before output admission, secret inspection, parsing or schema validation.
+- Journal state mutation is copy-on-success: transition/output methods persist a cloned attempt and update caller memory only after the atomic write succeeds. This prevents a later unrelated persist from committing terminal facts under an older state.
+- Terminal journal failure writes a provider-redispatch-forbidden reconciliation sidecar. If both the attempt write and sidecar write fail, the returned error preserves both failures and the no-redispatch assertion.
+- Post-dispatch runner `Err` no longer leaves `Running`: external-agent and Antigravity routes persist `TimeoutPendingReconciliation`; the lifecycle now explicitly admits `Running -> TimeoutPendingReconciliation`.
+- Fixed an invalid Antigravity error transition that tried `Running -> DispatchAckUnknown`, and removed the false supervisor error label that classified every runner error as pre-identity.
+- Made historical attempt loading schema-tolerant without inventing current policy: `provider_route_policy` is `Option` with a legacy `None`, while all new attempts bind `Some(exact policy)`. The two historical Antigravity JSON attempts now load through the real `external-agent inspect` path with their old null process fields intact.
+- Added typed `external-agent reconcile --invocation ... [--dry-run]`. It has no route to `ProviderProcessRunner`; it binds exact attempt, ledger, HostBroker job/session, canonical authority-close, phase log, raw-spool absence, OS PID-absence and current supervision evidence into an immutable resolution, then closes only `Running -> TimeoutPendingReconciliation -> NonReconcilableUnknown`. It explicitly preserves unknown exit/cleanup/output/reap fields and never releases the consumed slot.
+- The immutable resolution is written before attempt transitions. A crash between files is resumable: rerun validates the existing resolution and completes missing transitions without rewriting the record. A completed replay is byte-identical and provider-free.
+
+### Opus 5 escalation
+
+- Escalation trigger: two safe evidence-source hypotheses were falsified. Neither the historical runtime files nor current supervision status retained the old `ProcessReapReceipt`; synthesizing it would falsely satisfy `proves_complete_reap`.
+- One fresh read-only Claude Code consultation used exact `claude-opus-5`, effort `max`, only Read/Grep/Glob, no GUI and no provider/tool mutation. Session `92385daa-eb32-42ea-bfb5-f125c4cf54d0`; 401.2 s wall, 394.1 s API time, USD 2.776321 reported by Claude CLI.
+- Accepted decisions: never synthesize process timestamps/reap receipt; classify both attempts `NonReconcilableUnknown`, not `ReconciledFailed`; keep all missing output/process facts null; write a separate immutable record plus append-only attempt transitions; bind attempted-but-absent ProcessExit/JobObject records; prohibit provider redispatch.
+- Opus also found and source inspection confirmed the still-live post-dispatch `Err` branch, invalid Antigravity transition, legacy JSON load incompatibility, `pid:0` ambiguity, lossy sidecar failure and non-atomic in-memory transition mutation. All were repaired before the ARCH-03 gate.
+
+### Historical reconciliation attempts and staging boundary
+
+- First live dry-run stopped before mutation because the canonical role-authority report is a flat v2 close record rather than a recursively embedded revocation event. The parser was corrected from the actual two report schemas; no provider call and no file write occurred.
+- Second live dry-run passed attempt/ledger/broker/authority/phase/OS checks but the unpublished debug binary was correctly rejected by daemon IPC as `unattested_cognitive_governor`. This is the intended authority boundary, not bypassed. Actual live reconciliation is deferred until the final versioned candidate is built, attested and activated.
+- Both old attempt files remained byte-identical through the dry-runs. Provider calls: 0. GUI calls: 0. `external-agent inspect` now loads the legacy record and confirms `provider_route_policy=null`, `process_exit_at=null`, `cleanup_completed_at=null`.
+
+### Focused results and timings
+
+- `cargo check -p eliot-app --bin eliot-governor`: PASS, 19.2 s after initial implementation; later incremental PASS in 7.5 s.
+- `cargo test -p eliot-engine --test provider_timeout_reconciliation`: initial run exposed the stale `Running -> OutputObserved` test matrix; corrected to include `ProcessTerminal`. Final 18/18 PASS, 21.70 s wall, 0.19 s test bodies.
+- Added regression coverage for legacy JSON load, immediate process terminal facts, post-dispatch runner error, unknown PID rendering, double persistence failure and restart/no-replay behavior.
+- Focused Clippy for app/engine/types all targets: final PASS with `-D warnings`, 24.47 s. Intermediate iterations exposed and repaired a Copy-only declared budget, duplicate MCP match arms, oversized dispatch future and two functions grown by earlier runner migration; no lint suppression was added.
+- `cargo test -p eliot-app --bin eliot-governor external_agent`: 3/3 PASS, 76.73 s wall, 0.02 s bodies. The 76 s compile/enumeration penalty is duplicate-main evidence for ARCH-04.
+- `cargo test -p eliot-types provider_route_policy` selected zero tests and is excluded from evidence. Corrected `cargo test -p eliot-types --test provider_route_policy`: 2/2 PASS, 0.50 s wall, 0.00 s bodies.
+- `git diff --check`: PASS.

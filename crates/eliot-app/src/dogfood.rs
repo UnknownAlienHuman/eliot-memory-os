@@ -398,6 +398,49 @@ pub(crate) async fn run_codex(root: &Path) -> Result<()> {
     )?;
     require_safe_optional_output(&launch.plan.jsonl_stdout_path, "Codex JSONL output")?;
 
+    let (codex, process) = run_codex_provider(&manifest, &launch).await?;
+    anyhow::ensure!(
+        process.worker_error.is_none() && process.reap_receipt.proves_complete_reap(),
+        "Codex dogfood process cleanup failed: {:?}",
+        process.worker_error
+    );
+    fs::write(&launch.plan.jsonl_stdout_path, &process.stdout)
+        .context("write planned Codex JSONL stdout path")?;
+    let stderr_path = launch.plan.jsonl_stdout_path.with_file_name("stderr.log");
+    fs::write(&stderr_path, &process.stderr).context("write Codex stderr log")?;
+    let child_success = process.exit_code == Some(0) && !process.timed_out;
+
+    let result = json!({
+        "component": "dogfood_run_codex",
+        "status": if child_success { "completed" } else { "failed" },
+        "codex_executable": codex,
+        "worktree_root": launch.worktree,
+        "branch": launch.branch,
+        "commit": launch.commit,
+        "exit_code": process.exit_code,
+        "timed_out": process.timed_out,
+        "reap_receipt": process.reap_receipt,
+        "events_path": launch.plan.jsonl_stdout_path,
+        "stderr_path": stderr_path,
+        "last_message_path": launch.plan.output_last_message_path,
+        "provider_kill_switch": true
+    });
+    let latest_path = root.join("reports").join("live-codex").join("latest.json");
+    write_json_file_atomic(&latest_path, &result)?;
+    write_json(&result)?;
+    if !child_success {
+        bail!(
+            "Codex exited non-zero; launch result preserved at {}",
+            latest_path.display()
+        );
+    }
+    Ok(())
+}
+
+async fn run_codex_provider(
+    manifest: &DogfoodManifest,
+    launch: &ValidatedCodexLaunch,
+) -> Result<(PathBuf, eliot_engine::ProviderProcessOutcome)> {
     let prompt = fs::read_to_string(&launch.plan.prompt_source_path)
         .context("read fixed Codex prompt source")?;
     let codex = find_codex_cli().context("locate installed codex.exe")?;
@@ -409,7 +452,6 @@ pub(crate) async fn run_codex(root: &Path) -> Result<()> {
     {
         bail!("resolved Codex CLI is not an installed codex.exe regular file");
     }
-
     let blocked_environment = [
         "SURREAL_USER",
         "SURREAL_PASS",
@@ -466,42 +508,7 @@ pub(crate) async fn run_codex(root: &Path) -> Result<()> {
     )
     .await
     .map_err(|error| anyhow::anyhow!(error.to_string()))?;
-    anyhow::ensure!(
-        process.worker_error.is_none() && process.reap_receipt.proves_complete_reap(),
-        "Codex dogfood process cleanup failed: {:?}",
-        process.worker_error
-    );
-    fs::write(&launch.plan.jsonl_stdout_path, &process.stdout)
-        .context("write planned Codex JSONL stdout path")?;
-    let stderr_path = launch.plan.jsonl_stdout_path.with_file_name("stderr.log");
-    fs::write(&stderr_path, &process.stderr).context("write Codex stderr log")?;
-    let child_success = process.exit_code == Some(0) && !process.timed_out;
-
-    let result = json!({
-        "component": "dogfood_run_codex",
-        "status": if child_success { "completed" } else { "failed" },
-        "codex_executable": codex,
-        "worktree_root": launch.worktree,
-        "branch": launch.branch,
-        "commit": launch.commit,
-        "exit_code": process.exit_code,
-        "timed_out": process.timed_out,
-        "reap_receipt": process.reap_receipt,
-        "events_path": launch.plan.jsonl_stdout_path,
-        "stderr_path": stderr_path,
-        "last_message_path": launch.plan.output_last_message_path,
-        "provider_kill_switch": true
-    });
-    let latest_path = root.join("reports").join("live-codex").join("latest.json");
-    write_json_file_atomic(&latest_path, &result)?;
-    write_json(&result)?;
-    if !child_success {
-        bail!(
-            "Codex exited non-zero; launch result preserved at {}",
-            latest_path.display()
-        );
-    }
-    Ok(())
+    Ok((codex, process))
 }
 
 pub(crate) async fn status(root: &Path) -> Result<()> {
