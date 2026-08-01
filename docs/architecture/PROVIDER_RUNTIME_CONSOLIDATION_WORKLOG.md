@@ -548,3 +548,25 @@ This log preserves the ordered implementation evidence for
   boundary 5/5 PASS. Behavior bodies were 0.76 s or less. Format PASS, workspace all-target check
   PASS in 21.56 s. First Clippy pass found four test-only `assigning_clones`; all were corrected
   with `clone_from` and no suppression. Final all-target Clippy PASS; diff-check PASS.
+
+### Generation-3 candidate and pre-activation proof
+
+- Committed and pushed the reused-Judge repair as
+  `051d89b3acc1e2eb4573f082e9f14f567fa9e91c` (`C7-02R2: bind reused Judge deterministic
+  provenance`). Built a new clean-tree immutable release in 216.65 s under
+  `C:\Users\kleym\AppData\Local\Eliot\builds\cognitive-judge-051d89b-target`; size 55,578,624
+  bytes, SHA-256 `e40994cb5f4c3735489edb80f7f614c0809d8529ad03e0faaf4437d852663a25`, exact source commit
+  embedded.
+- Pre-cutover runtime was quiescent and dispatch-safe. Cooperatively stopped PID 68272 and started
+  the new candidate hidden as PID 17052. Publication path/SHA match the immutable candidate.
+- Commit-bound zero-model preflight passed in 4.301 s internal / 4.588 s wall. Runtime contract hash
+  is `e1df0d56fba0b386cb7386781c4ba33a8f7f549e053bf8125d75c0b14f372835`; Governor MCP initialized,
+  the exact seven-tool Codex Worker surface was present, raw SurrealDB was disabled and scoped status
+  read passed. Provider/model calls: zero.
+- Generation-3 dry-run passed in 6.306 s after re-validating source/current U03 deterministic
+  equivalence before authority activation. It planned seal
+  `provider-plan-seal:seal-1836b600695333ba-g3`, plan hash
+  `blake3:5f888363479263c2fbe8c39a3f15037ca3fd3ccc3d9ca8268e895855d30f8687` and manifest SHA-256
+  `c1e09424ad08821fd759db844e28a0748d1ffb8553dcc040bfda25dd73fcfad3`.
+  `authority_side_effects=0`; public 16/16 and private 1587/1587 file SHA inventories were identical
+  before/after.
