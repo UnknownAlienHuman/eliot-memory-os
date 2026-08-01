@@ -1135,9 +1135,17 @@ fn scan_seal_inventory(
                 .get("published_root")
                 .and_then(Value::as_str)
                 .map(PathBuf::from);
-            let plan_present = published_root
+            let provider_plan_sha256 = value
+                .get("provider_plan_sha256")
+                .and_then(Value::as_str)
+                .filter(|sha256| !sha256.is_empty());
+            let plan_current = published_root
                 .as_ref()
-                .is_some_and(|root| root.join("provider-plan.json").is_file());
+                .zip(provider_plan_sha256)
+                .is_some_and(|(root, expected_sha256)| {
+                    sha256_file(&root.join("candidate-provider-plan.json"))
+                        .is_ok_and(|actual_sha256| actual_sha256 == expected_sha256)
+                });
             let lease_ids = value
                 .get("role_lease_ids")
                 .and_then(Value::as_array)
@@ -1153,7 +1161,7 @@ fn scan_seal_inventory(
                             && lease.generation == generation
                     })
                 });
-            if !plan_present || !authority_current {
+            if !plan_current || !authority_current {
                 inventory.published_without_authority =
                     inventory.published_without_authority.saturating_add(1);
             }
@@ -1259,7 +1267,10 @@ fn usize_to_u32(value: usize) -> u32 {
 
 #[cfg(test)]
 mod tests {
-    use super::{authority_owner_issue, bounded_seal_files, inspect, reconcile_dry_run};
+    use super::{
+        authority_owner_issue, bounded_seal_files, inspect, reconcile_dry_run, scan_seal_inventory,
+        sha256_file,
+    };
     use eliot_engine::{WriterActor, WriterConfig};
     use eliot_store::{CanonicalStore, ControlWal};
     use eliot_types::{
@@ -1345,6 +1356,68 @@ mod tests {
 
         let files = bounded_seal_files(&root, 8, 16, 1)?;
         assert_eq!(files, [seal]);
+
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn seal_inventory_binds_published_candidate_plan_and_exact_authority()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root = std::env::temp_dir().join(format!("eliot-seal-integrity-{}", Uuid::new_v4()));
+        let config_path = root.join("config/governor.toml");
+        let seal_records = root.join("cognitive-field/run/seal-records");
+        let published_root = root.join("cognitive-field/run/sealed/3");
+        fs::create_dir_all(&seal_records)?;
+        fs::create_dir_all(&published_root)?;
+        let candidate_plan = published_root.join("candidate-provider-plan.json");
+        fs::write(&candidate_plan, b"{\"plan_hash\":\"test-plan\"}\n")?;
+
+        let now = OffsetDateTime::now_utc();
+        let lease = TaskRoleLease {
+            role_lease_id: "role-lease:published-plan".to_owned(),
+            task_id: TaskId::new_v7(),
+            agent_session_id: AgentSessionId::new_v7(),
+            role: AgentRole::Implementer,
+            capability_scope: vec!["candidate_only".to_owned()],
+            expires_at: now + time::Duration::minutes(5),
+            epoch: 1,
+            state: AuthorityLeaseState::Active,
+            lifetime: AuthorityLeaseLifetime::SealBound,
+            owner_operation_id: None,
+            seal_attempt_id: Some("provider-plan-seal:test-g3".to_owned()),
+            generation: 3,
+            issued_at: Some(now),
+            activated_at: Some(now),
+            consumed_at: None,
+            revoked_at: None,
+            revoke_reason: None,
+            superseded_by_epoch: None,
+        };
+        let broker = DelegationState {
+            task_role_leases: vec![lease],
+            ..DelegationState::default()
+        };
+        let seal = serde_json::json!({
+            "seal_attempt_id": "provider-plan-seal:test-g3",
+            "generation": 3,
+            "state": "published",
+            "published_root": published_root,
+            "provider_plan_sha256": sha256_file(&candidate_plan)?,
+            "role_lease_ids": ["role-lease:published-plan"],
+        });
+        fs::write(
+            seal_records.join("provider-plan-seal_test-g3.json"),
+            serde_json::to_vec_pretty(&seal)?,
+        )?;
+
+        let inventory = scan_seal_inventory(&config_path, &broker)?;
+        assert_eq!(inventory.published_without_authority, 0);
+        assert_eq!(inventory.authority_without_published, 0);
+
+        fs::write(&candidate_plan, b"{\"plan_hash\":\"tampered\"}\n")?;
+        let tampered = scan_seal_inventory(&config_path, &broker)?;
+        assert_eq!(tampered.published_without_authority, 1);
 
         fs::remove_dir_all(root)?;
         Ok(())

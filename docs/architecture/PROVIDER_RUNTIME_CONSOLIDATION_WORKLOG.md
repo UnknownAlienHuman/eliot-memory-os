@@ -570,3 +570,53 @@ This log preserves the ordered implementation evidence for
   `c1e09424ad08821fd759db844e28a0748d1ffb8553dcc040bfda25dd73fcfad3`.
   `authority_side_effects=0`; public 16/16 and private 1587/1587 file SHA inventories were identical
   before/after.
+
+### Generation-3 publication and A1-A16 readback
+
+- The real generation-3 seal succeeded in 10.704 s. It published exactly eight fresh provider
+  calls and four reused roles, with zero smoke calls. Seal ID, plan hash and manifest SHA-256 are
+  byte-identical to the dry-run values above. Seal status reports generation 3 as `published`;
+  generations 1 and 2 remain abandoned, and no provider reservation or provider result existed at
+  publication time.
+- Post-publication A1-A16 readback passed. The historical run005 29-file inventory remained
+  byte-identical with digest
+  `48286eb2546b7e124903dacfab7e3fe321857c7a26de9eab4aa0e324dd9e3bea`. Every U03 scenario has
+  exactly three reused-role projections: Worker is byte-equal to run003, Reader and Judge are
+  byte-equal to run005. The treatment/current deterministic hash is
+  `blake3:1cd2e52...` versus source/Judge `blake3:c7b991f...`; control/current is
+  `blake3:804317ce...` versus source/Judge `blake3:f7cf1db...`. In both scenarios the projected
+  source byte SHA, current binding and re-derived equivalence are true. The only normalized
+  differences are `report_hash` and run-scoped `hard_gate_evidence.evidence_refs`. Provider result
+  count remained zero.
+- The exact eight fresh calls are: Codex Worker and Judge for U06; Antigravity Reader treatment and
+  control for U06 using `gemini-3.6-flash-high`; Codex Worker and Judge for U11; and OpenCode Reader
+  treatment and control for U11 using `openai/gpt-5.4`. Run006 contains no Claude call.
+
+### Runtime-integrity pre-dispatch failure and repair
+
+- The first external attempt targeted the U06 Antigravity treatment call
+  `063d32a3-7779-44e8-90c7-b6a8cc83b44f`. It failed before provider dispatch in 3.874 s adapter /
+  4.864 s wall with
+  `write rejected: runtime integrity blocks external provider dispatch: published_plans_without_authority`.
+  No provider process, session, reservation, result or call-budget consumption occurred; the
+  outcome is a known retryable pre-dispatch failure, so it must not be retried until integrity is
+  repaired.
+- Runtime supervision reproduced the failure with core ready, the expected commit-bound candidate
+  still running as PID 17052, zero active/stuck/reconciliation/cleanup operations, zero orphan
+  processes, four active generation-3 role leases, zero pending/orphan leases and zero partial
+  seals. The sole failing counter was `published_plans_without_authority=1`; provider dispatch was
+  correctly fail-closed.
+- Exact record/lease correlation disproved missing authority: the published generation-3 seal
+  contains exactly the same four active lease IDs. Root cause is a filename/provenance defect in
+  `scan_seal_inventory`: it searched for `provider-plan.json` inside the private immutable
+  `published_root`, while the seal protocol atomically publishes that root with the canonical
+  artifact name `candidate-provider-plan.json`; the public `provider-plan.json` is a separate
+  projection. Thus every correct new seal was classified as missing its plan.
+- The repair validates the actual immutable `candidate-provider-plan.json` and requires its byte
+  SHA-256 to equal the seal record's `provider_plan_sha256`; mere file presence is no longer
+  accepted. A focused regression proves the exact published candidate plus active generation lease
+  is clean, then byte-tampers the candidate and proves fail-closed detection. The behavior body
+  took 0.02 s; first compile/test wall time was 24.487 s. The complete runtime-integrity module
+  passed 5/5 in 0.05 s behavior / 0.280 s wall, format passed, and package binary Clippy with
+  warnings denied passed in 27.983 s. No Opus call was spent because the exact local cause and
+  bounded systemic correction were unambiguous.
