@@ -620,3 +620,15 @@ This log preserves the ordered implementation evidence for
   passed 5/5 in 0.05 s behavior / 0.280 s wall, format passed, and package binary Clippy with
   warnings denied passed in 27.983 s. No Opus call was spent because the exact local cause and
   bounded systemic correction were unambiguous.
+- Committed and pushed the repair as `2e6db2adca2d7418bbc33a6f30bf9d8fca7592f9`
+  (`C7-02R2: bind seal integrity to immutable plan`). A clean-tree isolated release build took
+  217.870 s and produced
+  `C:\Users\kleym\AppData\Local\Eliot\builds\runtime-integrity-2e6db2a-target\release\eliot-governor.exe`,
+  55,529,472 bytes, SHA-256
+  `781c9b352b96ac344c4c867e37dbde81873a716516292c4ce8a8ca985c4c7ab3`; the exact 40-character
+  source commit is embedded.
+- With operations and orphans still zero, PID 17052 was stopped cooperatively and the new binary
+  started hidden as PID 85320. Publication and doctor are ready with the exact expected path/SHA.
+  Runtime supervision then reported `overall=ready`, `provider_dispatch_safe=true`, clean runtime
+  integrity, the same four active generation-3 leases, and both
+  `published_plans_without_authority=0` and `authority_without_published_plan=0` in 3.574 s.
