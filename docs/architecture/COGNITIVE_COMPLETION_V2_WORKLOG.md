@@ -713,3 +713,101 @@ For each next step, record:
 - any Claude or Antigravity model actually resolved and why the call was worth
   its quota;
 - corresponding candidate-only Eliot writeback receipt before final reporting.
+
+## 2026-08-01 Task 03 retrieval hot-path investigation
+
+- Recovery Task 03 resumed from the terminal R01 evidence without weakening the
+  100,000-record corpus, 5,000-history fixture, 75/150 ms SLOs, or 2-second
+  per-query timeout. Baseline store retrieval remained 5/5 green before the
+  change.
+- Root cause was confirmed in source: normal L0 paged six record kinds in
+  128-row RPCs, scanned as many as 65,536 candidates, then decoded and ranked
+  the entire set in Rust. The old audit path is now isolated behind
+  `lifecycle_audit`; normal recall uses a derived projection.
+- Added `memory_search_projection`, `memory_search_token`,
+  `memory_search_state`, and `memory_search_outbox` with composite project,
+  handle, lifecycle, token, and revision indexes. Canonical writes commit first,
+  leave a pending outbox record, then idempotently replace the handle's posting
+  set and advance the derived-state revision. A failed derived dispatch is
+  repaired by replaying the same canonical write. Canonical rows remain truth.
+- Added deterministic rebuild from canonical rows, revision equality checks
+  before normal recall, exact-handle lookup, bounded 256-handle candidate load,
+  Rust final ranking, an index-plan probe, and rebuild/restart determinism
+  coverage. Lifecycle audit continues to use the historical paged loader.
+- A live unique-index failure proved that colon-bearing strings such as
+  `claim:<uuid>` were being coerced by SurrealDB into record identities. The
+  established character-fragment transport boundary was applied to handles and
+  record references. A second live failure proved that one-row subqueries may
+  unwrap to objects in SurrealDB 3.1.4; every affected result is normalized with
+  a wrapper/flatten/filter before array operations, and final row order is
+  restored from an authoritative handle list in Rust.
+- The first focused isolated runs failed 2/5 and then 2/5 for those two exact
+  transport/query-shape causes. After the repairs, the broad focused test passed
+  1/1 and the real retrieval suite passed 5/5 in 35.744 s. The added EXPLAIN and
+  deterministic rebuild assertions then passed 1/1 in 10.740 s.
+- PF1 was first accidentally interrupted by a 60-second outer shell limit, not
+  by the test's 600-second guardian. The exact owned Surreal guardian and child
+  were stopped through their own stop file. The interrupted temp/secret roots
+  remain at run id `ec58419dc22849e1aa6d1a96ef5d798d` because a later exact
+  recursive cleanup command was blocked by the host policy; no process from the
+  run remains.
+- The retained PF1 evidence for the correctness-first projection is 10,000
+  logical records, 500 historical updates, four kinds, seed 48,732 ms, measured
+  L0 680.3451 ms, L2 486.3797 ms, and query wall 1,166 ms. PF1 passed its
+  2-second readiness timeout but missed the eventual SLO by a wide margin.
+- A bounded per-term posting experiment reduced the same PF1 to seed 55,620 ms,
+  L0 236.7372 ms, L2 80.1493 ms, and query wall 316 ms. Its retained evidence is
+  `%LOCALAPPDATA%/Eliot/cognitive-field/recovery-v3-task03/pf1-bounded-postings.json`.
+  It was not retained in product state because removing the ambient small-corpus
+  fill exposed neutral-paraphrase recall regressions.
+- A conditional bigram/trigram primary plus unigram fallback was rejected. It
+  improved the suite from 2/5 to 3/5 but still suppressed a provider/argv/opaque
+  identifier paraphrase, and long n-gram posting sets could evict unigram
+  postings under the per-row cap. A subsequent concurrent Rust-union prototype
+  also failed that neutral case. Both experiments were rolled back.
+- Two quota-worthy consultations used the existing Claude Code session
+  `703f5a06-7b30-4783-bce1-e74d4de580ba` headlessly with exact model
+  `claude-opus-5`, max effort, plan mode, strict empty MCP, and read-only tools.
+  The first (117.4 s wall / 114.102 s API; CLI-reported USD 2.342597) confirmed
+  the scalar/array normalization and order-preservation repair. The second
+  (144.2 s wall / 141.458 s API; CLI-reported USD 2.449322) rejected conditional
+  fallback and recommended an always-on <=12-term union, concurrent posting
+  pages, Rust aggregation, deterministic content-only posting selection, and
+  advisory recomputed DF. Neither call used web, MCP, writes, or permissions.
+- The performance branches were stopped after repeated cognitive regressions,
+  per the two-attempt rule. The repository was restored to the last
+  correctness-proven projection. SurrealQL validation, `cargo check -p
+  eliot-store`, and the isolated real retrieval suite then passed 5/5 in 36.756
+  s (54.786 s end to end).
+- Task 03 disposition is therefore `BLOCKED / SLO_NOT_MET`, not complete. PF2,
+  PF3, and exact R01 were not run because PF1 already failed the readiness
+  threshold. The next bounded experiment must first preserve the complete
+  neutral-paraphrase set while separating posting-page, aggregate/rank, and
+  final-row-fetch timings. Stop if the final 256-row fetch alone exceeds about
+  50 ms or capped lookup still scales approximately linearly with corpus size.
+- Eliot handoff was completed through the live sealed daemon and exact named-pipe
+  MCP path. Candidate `claim:b0c14f5f-569d-42ca-8966-32f71bf5dc28` committed at
+  revision 12 with explicit file cues and remained `candidate_only`; detailed
+  observation `observation:7b319d25-6a2a-4945-a6ca-1d23b6cf0727` committed at
+  revision 13. Exact `eliot_fetch_l2` readback returned both handles and the
+  expected full payloads. A preceding L0 probe with `scope=candidate_only`
+  produced an honest scope mismatch and was not treated as failed persistence.
+- The writeback used existing product project/task scope
+  `461b9de3-26e9-8f15-89b1-fb3944e22941` /
+  `019fbc2c-9872-7ac3-9112-766c57674ed8`. Recovery Task 03 had not created a
+  separate canonical product task. The raw global Surreal MCP tool was not
+  exposed, so no competing embedded owner was started and `.eliot/` was not
+  modified or staged.
+- Final `clippy -D warnings` exposed a 20-positional-argument retrieval-row
+  constructor. It was replaced with named `RecallCandidateInput` fields; narrow
+  documented lint exceptions remain only for the exhaustive enum-to-SQL table
+  and the scale harness's machine-readable stdout contract. Final clippy passed
+  in 0.812 s, fmt plus diff check passed in 2.200 s, and all six touched SurrealQL
+  files validated in 1.790 s.
+- A first post-refactor isolated invocation spawned a child PowerShell that
+  rejected the script under ExecutionPolicy in 0.623 s before tests started.
+  Running in the already authorized host passed all 5 retrieval tests in 36.049
+  s / 48.394 s end to end, made zero provider calls, removed its exact temp and
+  secret roots, and left no owned process or cleanup failure.
+- The final check bundle was stored and read back exactly as
+  `observation:e445da7f-9a3e-40ab-bf6a-7da4bb8a5b59` at memory revision 14.

@@ -878,3 +878,38 @@ This log preserves the ordered implementation evidence for
   A focused test fixes the classification boundary between caller intent and external generated
   fields; changed Codex runtime binding remains direct intent, while external consumed input remains
   bound separately by the sealed request.
+- The replay repair was committed and pushed as
+  `cfe38bed10eaa418927ec1eaed3f608d49c23a70`. Its isolated release build took 306.618 s and
+  produced a 56,017,408-byte binary with SHA-256
+  `9bcbc69228fbc80388c17f21da73e64fcde33c277d40c89017b6881a07791845` and the exact embedded
+  commit. After cooperative cutover, the published daemon ran this candidate as PID 53172.
+- A live dry replay completed in 1.683 s with zero public and private inventory changes and retained
+  the known orphan staging tree, proving that dry replay is read-only. The following live non-dry
+  replay completed in 2.778 s with zero public changes and exactly 13 private removals, all beneath
+  the proven orphan `seal-staging/seal-b5bbfbca42d32a7d-g5`; broker and work-state hashes were
+  unchanged. Both commands returned the exact original generation-5 Published response.
+- A second live non-dry replay completed in 1.597 s with byte-identical inventories (23 public and
+  1,631 private files) and the exact original response. This verifies stable idempotency after
+  self-healing and closes the generation-5 seal/replay chain before provider execution.
+
+### Degraded Codex route and independent Task 03 continuation
+
+- A first `execute-provider` attempt used the wrong reader shape and failed in 0.034 s before any
+  provider process, reservation, or model call. The private controller was then corrected to read
+  the sealed prompt/run inputs and retain only an empty isolated provider root.
+- The real headless Codex worker still terminated before thread/model start because its required
+  Eliot MCP could not initialize against the running published daemon. Direct zero-model MCP
+  evidence was: `Eliot daemon pid 53172 is alive but authenticated IPC is not ready; refusing
+  competing startup`. The attempt lasted 2.721 s, emitted no model/thread receipt, and consumed no
+  provider call cap.
+- One headless `claude-opus-5` architecture consultation concluded that downgrading the current
+  daemon to the Task-01 binary was unsafe because newer durable state fields could be lost. It
+  recommended superseding generation 5 only after honest product/harness equivalence.
+- `supersede-seal --dry-run` completed in 6.023 s and proved zero reservations/results/journals,
+  exact plan/authority bindings, and runtime drift only in the four external governor fields.
+  However, Task-01 to current `cfe38be` equivalence was rejected: 81 files and 33,595 insertions /
+  2,795 deletions crossed MCP, store, writer, and product surfaces, far beyond the runtime-only
+  provenance allowlist. No equivalence record or superseding seal was fabricated.
+- Per consolidation contract section 11, the Codex route is degraded rather than terminal.
+  Independent recovery Tasks 03/04 may proceed, but Task 02 provider grading and Task 05 remain
+  blocked until a current-runtime-bound seal can be produced honestly.

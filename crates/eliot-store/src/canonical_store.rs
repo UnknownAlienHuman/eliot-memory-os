@@ -22,7 +22,7 @@ use eliot_types::{
     ReplayAudit, ReplayRun, SealedReplayCaseRecord, SealedReplayInputSnapshotRecord,
     SealedReplaySetRecord, SleepCandidateArtifact, SleepConsolidationBundle, SleepConsolidationRun,
     SurrealServerConfig, TaintClass, TaskContract, TaskId, ToolObservation, TruncationInfo,
-    VerificationId, VerificationRun, Visibility, WriteId, WriteReceipt,
+    VerificationId, VerificationRun, Visibility, WriteId, WriteReceipt, WriteStatus,
 };
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
@@ -81,8 +81,12 @@ const RECALL_CANDIDATE_KINDS: &[&str] = &[
     "artifact",
 ];
 const MAX_RECALL_RESULTS: usize = 12;
+const MAX_MEMORY_SEARCH_CANDIDATES: usize = 256;
+const MAX_MEMORY_SEARCH_QUERY_TERMS: usize = 12;
+const MAX_MEMORY_SEARCH_POSTINGS_PER_ROW: usize = 128;
+const MEMORY_SEARCH_DISPATCH_BATCH_SIZE: usize = 512;
 
-#[derive(Clone, Debug, serde::Deserialize)]
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
 #[allow(clippy::struct_excessive_bools)]
 struct RecallCandidateRow {
     #[serde(default)]
@@ -126,6 +130,17 @@ struct RecallCandidateRow {
 #[derive(Debug, serde::Deserialize)]
 struct RecallCandidateLoad {
     at_revision: MemoryRevision,
+    candidates: Vec<RecallCandidateRow>,
+    truncated: bool,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct MemorySearchCandidateLoad {
+    at_revision: MemoryRevision,
+    #[serde(default)]
+    projection_revision: Option<MemoryRevision>,
+    #[serde(default)]
+    ordered_handles: Vec<String>,
     candidates: Vec<RecallCandidateRow>,
     truncated: bool,
 }
@@ -978,6 +993,505 @@ fn collapse_recall_candidates(
     (deduplicated, traces)
 }
 
+fn serialized_name<T: serde::Serialize>(value: T) -> String {
+    serde_json::to_value(value)
+        .ok()
+        .and_then(|value| value.as_str().map(str::to_owned))
+        .unwrap_or_default()
+}
+
+fn searchable_value(value: &Value) -> String {
+    match value {
+        Value::Null => String::new(),
+        Value::String(value) => value.clone(),
+        _ => serde_json::to_string(value).unwrap_or_default(),
+    }
+}
+
+fn searchable_field(value: &Value, field: &str) -> String {
+    value.get(field).map_or_else(String::new, searchable_value)
+}
+
+fn joined_search_fields(value: &Value, fields: &[&str]) -> String {
+    fields
+        .iter()
+        .map(|field| searchable_field(value, field))
+        .filter(|value| !value.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn payload_bool(payload: &Value, field: &str) -> bool {
+    payload.get(field).and_then(Value::as_bool).unwrap_or(false)
+}
+
+fn payload_i32(payload: &Value, field: &str) -> i32 {
+    payload
+        .get(field)
+        .and_then(Value::as_i64)
+        .and_then(|value| i32::try_from(value).ok())
+        .unwrap_or(0)
+}
+
+fn normalized_memory_lifecycle(status: LifecycleStatus) -> eliot_types::MemoryLifecycleState {
+    use eliot_types::MemoryLifecycleState as Memory;
+    match status {
+        LifecycleStatus::Active => Memory::Active,
+        LifecycleStatus::Dormant => Memory::Dormant,
+        LifecycleStatus::Suppressed => Memory::Suppressed,
+        LifecycleStatus::Archived => Memory::Archived,
+        LifecycleStatus::Quarantined => Memory::Quarantined,
+        LifecycleStatus::Forgotten => Memory::Forgotten,
+        LifecycleStatus::Restored => Memory::Restored,
+        LifecycleStatus::HardDeleted | LifecycleStatus::Deleted => Memory::HardDeleted,
+        LifecycleStatus::Superseded => Memory::Superseded,
+        LifecycleStatus::Stale => Memory::Stale,
+    }
+}
+
+struct RecallCandidateInput<'a> {
+    record_ref: String,
+    handle: String,
+    record_type: String,
+    preview: String,
+    search_text: String,
+    cue_text: String,
+    scope_text: String,
+    concept_text: String,
+    task_id: Option<TaskId>,
+    status: String,
+    lifecycle_state: eliot_types::MemoryLifecycleState,
+    authority_rank: i32,
+    negative_memory: bool,
+    memory_revision: MemoryRevision,
+    project_sequence: ProjectSequence,
+    verification_value: i32,
+    known_decision_delta: i32,
+    prior_beneficial_use: i32,
+    contradiction_signal: bool,
+    payload: &'a Value,
+}
+
+fn recall_candidate(input: RecallCandidateInput<'_>) -> RecallCandidateRow {
+    RecallCandidateRow {
+        record_ref: input.record_ref,
+        handle: input.handle,
+        record_type: input.record_type,
+        preview: input.preview,
+        search_text: input.search_text,
+        cue_text: input.cue_text,
+        scope_text: input.scope_text,
+        concept_text: input.concept_text,
+        task_id: input.task_id,
+        status: input.status,
+        lifecycle_state: Some(input.lifecycle_state),
+        authority_rank: input.authority_rank,
+        negative_memory: input.negative_memory,
+        memory_revision: Some(input.memory_revision),
+        project_sequence: Some(input.project_sequence),
+        verification_value: input.verification_value,
+        known_decision_delta: input.known_decision_delta,
+        prior_beneficial_use: input.prior_beneficial_use,
+        contradiction_signal: input.contradiction_signal,
+        harm_signal: payload_bool(input.payload, "harmful"),
+        repetition_signal: payload_bool(input.payload, "repeated"),
+        distraction_signal: payload_bool(input.payload, "distraction"),
+    }
+}
+
+fn projection_row(
+    project_id: ProjectId,
+    row: &RecallCandidateRow,
+    updated_revision: MemoryRevision,
+) -> Result<Value, StoreError> {
+    let mut value =
+        serde_json::to_value(row).map_err(|error| StoreError::Decode(error.to_string()))?;
+    let object = value.as_object_mut().ok_or_else(|| {
+        StoreError::Decode("memory search projection row was not an object".to_owned())
+    })?;
+    object.remove("handle");
+    object.remove("record_ref");
+    let lifecycle = object.remove("lifecycle_state").unwrap_or(Value::Null);
+    object.insert(
+        "projection_id".to_owned(),
+        Value::String(derived_row_key(&format!("{project_id}:{}", row.handle))),
+    );
+    object.insert(
+        "record_kind".to_owned(),
+        Value::String(row.record_type.clone()),
+    );
+    object.insert(
+        "handle_parts".to_owned(),
+        json!(string_fragments(&row.handle)),
+    );
+    object.insert(
+        "record_ref_parts".to_owned(),
+        json!(string_fragments(&row.record_ref)),
+    );
+    object.insert("lifecycle".to_owned(), lifecycle);
+    object.insert("updated_revision".to_owned(), json!(updated_revision));
+    object.insert(
+        "visible".to_owned(),
+        Value::Bool(is_default_visible_lifecycle(row.lifecycle_state)),
+    );
+
+    let posting_text = [
+        row.handle.as_str(),
+        row.preview.as_str(),
+        row.search_text.as_str(),
+        row.cue_text.as_str(),
+        row.scope_text.as_str(),
+        row.concept_text.as_str(),
+    ]
+    .join(" ");
+    let postings = memory_search_posting_terms(&posting_text)
+        .into_iter()
+        .take(MAX_MEMORY_SEARCH_POSTINGS_PER_ROW)
+        .map(|token| {
+            json!({
+                "posting_id": derived_row_key(&format!("{project_id}:{token}:{}", row.handle)),
+                "token": token,
+            })
+        })
+        .collect::<Vec<_>>();
+    object.insert("postings".to_owned(), Value::Array(postings));
+    Ok(value)
+}
+
+#[allow(clippy::too_many_lines)]
+fn envelope_projection_rows(
+    envelope: &MemoryWriteEnvelope,
+    receipt: &WriteReceipt,
+) -> Result<Vec<Value>, StoreError> {
+    let memory_revision = receipt.memory_revision.ok_or_else(|| {
+        StoreError::PolicyViolation(
+            "committed write receipt omitted the memory revision required by the search projection"
+                .to_owned(),
+        )
+    })?;
+    let project_sequence = receipt.project_sequence.ok_or_else(|| {
+        StoreError::PolicyViolation(
+            "committed write receipt omitted the project sequence required by the search projection"
+                .to_owned(),
+        )
+    })?;
+    let lifecycle = normalized_memory_lifecycle(envelope.lifecycle.status);
+    let mut rows = Vec::with_capacity(
+        envelope.claims.len()
+            + envelope.evidence_atoms.len()
+            + envelope.verification_runs.len()
+            + envelope.tool_observations.len() * 2
+            + envelope.failures.len(),
+    );
+
+    for claim in &envelope.claims {
+        let status = serialized_name(claim.status);
+        let row = recall_candidate(RecallCandidateInput {
+            record_ref: format!("claim_card:{}", claim.claim_id),
+            handle: format!("claim:{}", claim.claim_id),
+            record_type: "claim_card".to_owned(),
+            preview: claim.statement.clone(),
+            search_text: format!(
+                "{} {} {}",
+                claim.statement,
+                joined_search_fields(
+                    &claim.payload,
+                    &[
+                        "topic",
+                        "where_applicable",
+                        "where_not_applicable",
+                        "negative_constraints",
+                        "freshness_rule",
+                    ],
+                ),
+                searchable_value(&claim.payload),
+            ),
+            cue_text: joined_search_fields(
+                &claim.payload,
+                &["path", "symbol", "error", "task_class"],
+            ),
+            scope_text: envelope.scope.clone(),
+            concept_text: joined_search_fields(
+                &claim.payload,
+                &["concept_id", "concept_refs", "subsystem"],
+            ),
+            task_id: envelope.task_id,
+            status: status.clone(),
+            lifecycle_state: lifecycle,
+            authority_rank: match claim.status {
+                EpistemicStatus::Verified => 80,
+                EpistemicStatus::Supported => 50,
+                EpistemicStatus::Candidate => 10,
+                _ => 0,
+            },
+            negative_memory: false,
+            memory_revision,
+            project_sequence,
+            verification_value: 0,
+            known_decision_delta: i32::from(payload_bool(&claim.payload, "changed_outcome")),
+            prior_beneficial_use: payload_i32(&claim.payload, "beneficial_use_count"),
+            contradiction_signal: matches!(
+                claim.status,
+                EpistemicStatus::Contested | EpistemicStatus::Rejected
+            ),
+            payload: &claim.payload,
+        });
+        rows.push(projection_row(envelope.project_id, &row, memory_revision)?);
+    }
+
+    for evidence in &envelope.evidence_atoms {
+        let row = recall_candidate(RecallCandidateInput {
+            record_ref: format!("evidence_atom:{}", evidence.evidence_id),
+            handle: format!("evidence:{}", evidence.evidence_id),
+            record_type: "evidence_atom".to_owned(),
+            preview: evidence.summary.clone(),
+            search_text: format!(
+                "{} {} {}",
+                evidence.summary,
+                searchable_value(&evidence.payload),
+                evidence.source_id,
+            ),
+            cue_text: joined_search_fields(
+                &evidence.payload,
+                &["path", "symbol", "error", "task_class"],
+            ),
+            scope_text: envelope.scope.clone(),
+            concept_text: joined_search_fields(&evidence.payload, &["concept_id", "concept_refs"]),
+            task_id: envelope.task_id,
+            status: "observed".to_owned(),
+            lifecycle_state: lifecycle,
+            authority_rank: 35,
+            negative_memory: false,
+            memory_revision,
+            project_sequence,
+            verification_value: 25,
+            known_decision_delta: i32::from(payload_bool(&evidence.payload, "changed_outcome")),
+            prior_beneficial_use: payload_i32(&evidence.payload, "beneficial_use_count"),
+            contradiction_signal: false,
+            payload: &evidence.payload,
+        });
+        rows.push(projection_row(envelope.project_id, &row, memory_revision)?);
+    }
+
+    for verification in &envelope.verification_runs {
+        let status = serialized_name(verification.result);
+        let row = recall_candidate(RecallCandidateInput {
+            record_ref: format!("verification_run:{}", verification.verification_id),
+            handle: format!("verification:{}", verification.verification_id),
+            record_type: "verification_run".to_owned(),
+            preview: verification.summary.clone(),
+            search_text: format!(
+                "{} {} {} {} {}",
+                verification.summary,
+                verification.verifier,
+                status,
+                verification
+                    .claim_id
+                    .map_or_else(String::new, |id| id.to_string()),
+                searchable_value(&verification.payload),
+            ),
+            cue_text: joined_search_fields(
+                &verification.payload,
+                &["path", "symbol", "error", "task_class"],
+            ),
+            scope_text: envelope.scope.clone(),
+            concept_text: joined_search_fields(
+                &verification.payload,
+                &["concept_id", "concept_refs"],
+            ),
+            task_id: envelope.task_id,
+            status,
+            lifecycle_state: lifecycle,
+            authority_rank: match verification.result {
+                eliot_types::VerificationResult::Passed => 70,
+                eliot_types::VerificationResult::Failed => 60,
+                eliot_types::VerificationResult::Inconclusive => 20,
+            },
+            negative_memory: verification.result == eliot_types::VerificationResult::Failed,
+            memory_revision,
+            project_sequence,
+            verification_value: match verification.result {
+                eliot_types::VerificationResult::Passed => 80,
+                eliot_types::VerificationResult::Failed => 60,
+                eliot_types::VerificationResult::Inconclusive => 10,
+            },
+            known_decision_delta: i32::from(payload_bool(&verification.payload, "changed_outcome")),
+            prior_beneficial_use: payload_i32(&verification.payload, "beneficial_use_count"),
+            contradiction_signal: verification.result == eliot_types::VerificationResult::Failed,
+            payload: &verification.payload,
+        });
+        rows.push(projection_row(envelope.project_id, &row, memory_revision)?);
+    }
+
+    for observation in &envelope.tool_observations {
+        let row = recall_candidate(RecallCandidateInput {
+            record_ref: format!("tool_observation:{}", observation.observation_id),
+            handle: format!("observation:{}", observation.observation_id),
+            record_type: "tool_observation".to_owned(),
+            preview: observation.observation.clone(),
+            search_text: format!(
+                "{} {} {}",
+                observation.observation,
+                observation.tool_name,
+                searchable_value(&observation.payload),
+            ),
+            cue_text: joined_search_fields(
+                &observation.payload,
+                &["path", "symbol", "error", "task_class"],
+            ),
+            scope_text: envelope.scope.clone(),
+            concept_text: joined_search_fields(
+                &observation.payload,
+                &["concept_id", "concept_refs"],
+            ),
+            task_id: envelope.task_id,
+            status: "observed".to_owned(),
+            lifecycle_state: lifecycle,
+            authority_rank: 20,
+            negative_memory: false,
+            memory_revision,
+            project_sequence,
+            verification_value: 10,
+            known_decision_delta: i32::from(payload_bool(&observation.payload, "changed_outcome")),
+            prior_beneficial_use: payload_i32(&observation.payload, "beneficial_use_count"),
+            contradiction_signal: false,
+            payload: &observation.payload,
+        });
+        rows.push(projection_row(envelope.project_id, &row, memory_revision)?);
+
+        let Some(receipt_kind) = observation
+            .payload
+            .get("receipt_kind")
+            .and_then(Value::as_str)
+        else {
+            continue;
+        };
+        let Some(body) = observation.payload.get("receipt_body") else {
+            continue;
+        };
+        let (prefix, identity_field) = match receipt_kind {
+            "module_card" => ("card", "card_id"),
+            "subsystem_capsule" => ("capsule", "capsule_id"),
+            "project_charter" => ("charter", "charter_id"),
+            "system_map" => ("map", "map_id"),
+            _ => continue,
+        };
+        let Some(identity) = body.get(identity_field).and_then(Value::as_str) else {
+            continue;
+        };
+        let artifact_status = body
+            .get("status")
+            .and_then(Value::as_str)
+            .unwrap_or("supported")
+            .to_owned();
+        let artifact_lifecycle = body
+            .get("lifecycle")
+            .cloned()
+            .and_then(|value| serde_json::from_value(value).ok())
+            .unwrap_or(eliot_types::MemoryLifecycleState::Active);
+        let artifact = recall_candidate(RecallCandidateInput {
+            record_ref: format!("canonical_record:{}", observation.observation_id),
+            handle: format!("{prefix}:{identity}"),
+            record_type: receipt_kind.to_owned(),
+            preview: searchable_field(body, "body_md"),
+            search_text: joined_search_fields(
+                body,
+                &[
+                    "body_md",
+                    "path",
+                    "concept_id",
+                    "source_refs",
+                    "concept_refs",
+                    "subsystem_concept_refs",
+                ],
+            ),
+            cue_text: joined_search_fields(body, &["path", "symbol", "error", "task_class"]),
+            scope_text: searchable_field(body, "path"),
+            concept_text: joined_search_fields(
+                body,
+                &["concept_id", "concept_refs", "subsystem_concept_refs"],
+            ),
+            task_id: envelope.task_id,
+            status: artifact_status.clone(),
+            lifecycle_state: artifact_lifecycle,
+            authority_rank: match artifact_status.as_str() {
+                "verified" => 80,
+                "candidate" => 10,
+                _ => 50,
+            },
+            negative_memory: false,
+            memory_revision,
+            project_sequence,
+            verification_value: 30,
+            known_decision_delta: i32::from(payload_bool(body, "changed_outcome")),
+            prior_beneficial_use: payload_i32(body, "beneficial_use_count"),
+            contradiction_signal: matches!(artifact_status.as_str(), "contested" | "rejected"),
+            payload: body,
+        });
+        rows.push(projection_row(
+            envelope.project_id,
+            &artifact,
+            memory_revision,
+        )?);
+    }
+
+    for failure in &envelope.failures {
+        let row = recall_candidate(RecallCandidateInput {
+            record_ref: format!("failure_fingerprint:{}", failure.fingerprint),
+            handle: format!("failure:{}", failure.fingerprint),
+            record_type: "failure_fingerprint".to_owned(),
+            preview: failure.summary.clone(),
+            search_text: format!("{} {}", failure.summary, searchable_value(&failure.payload)),
+            cue_text: joined_search_fields(
+                &failure.payload,
+                &["path", "symbol", "error", "task_class"],
+            ),
+            scope_text: envelope.scope.clone(),
+            concept_text: joined_search_fields(&failure.payload, &["concept_id", "concept_refs"]),
+            task_id: envelope.task_id,
+            status: "observed".to_owned(),
+            lifecycle_state: lifecycle,
+            authority_rank: 50,
+            negative_memory: true,
+            memory_revision,
+            project_sequence,
+            verification_value: 35,
+            known_decision_delta: 1,
+            prior_beneficial_use: payload_i32(&failure.payload, "beneficial_use_count"),
+            contradiction_signal: false,
+            payload: &failure.payload,
+        });
+        rows.push(projection_row(envelope.project_id, &row, memory_revision)?);
+    }
+    Ok(rows)
+}
+
+fn memory_search_terms(request: &RecallL0Request) -> Vec<String> {
+    std::iter::once(request.query.as_str())
+        .chain(request.task_class_cues.iter().map(String::as_str))
+        .chain(request.concept_refs.iter().map(String::as_str))
+        .flat_map(eliot_types::normalize_query_tokens)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .take(MAX_MEMORY_SEARCH_QUERY_TERMS)
+        .collect()
+}
+
+fn memory_search_posting_terms(text: &str) -> Vec<String> {
+    eliot_types::normalize_query_tokens(text)
+        .into_iter()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .take(MAX_MEMORY_SEARCH_POSTINGS_PER_ROW)
+        .collect()
+}
+
+fn exact_memory_search_handle(query: &str) -> Option<String> {
+    let query = query.trim();
+    (!query.is_empty() && query.contains(':') && !query.chars().any(char::is_whitespace))
+        .then(|| query.to_owned())
+}
+
 #[derive(Clone, Debug)]
 pub struct CanonicalStore {
     config: SurrealServerConfig,
@@ -1076,6 +1590,7 @@ impl CanonicalStore {
             NamedSurqlOp::SchemaMigrateUlMeasurement,
             NamedSurqlOp::SchemaMigrateUlDependencyActivation,
             NamedSurqlOp::SchemaMigrateUlTokenPolicy,
+            NamedSurqlOp::SchemaMigrateMemorySearch,
         ] {
             value = self.migrate_schema_op(op).await?;
         }
@@ -1198,7 +1713,63 @@ impl CanonicalStore {
                 }),
             )
             .await?;
-        decode_value(NamedSurqlOp::ApplyWriteEnvelope, value)
+        let receipt: WriteReceipt = decode_value(NamedSurqlOp::ApplyWriteEnvelope, value)?;
+        if matches!(
+            receipt.status,
+            WriteStatus::Committed | WriteStatus::IdempotentReplay
+        ) {
+            let rows = envelope_projection_rows(envelope, &receipt)?;
+            self.dispatch_memory_search_projection(
+                envelope.project_id,
+                envelope.write_id,
+                receipt.memory_revision.ok_or_else(|| {
+                    StoreError::PolicyViolation(
+                        "committed write receipt omitted the search projection revision".to_owned(),
+                    )
+                })?,
+                &rows,
+            )
+            .await?;
+        }
+        Ok(receipt)
+    }
+
+    async fn dispatch_memory_search_projection(
+        &self,
+        project_id: ProjectId,
+        write_id: WriteId,
+        updated_revision: MemoryRevision,
+        rows: &[Value],
+    ) -> Result<(), StoreError> {
+        if rows.is_empty() {
+            self.execute_value(
+                NamedSurqlOp::UpsertMemorySearchProjection,
+                json!({
+                    "project_id": project_id,
+                    "write_id": write_id,
+                    "updated_revision": updated_revision,
+                    "rows": [],
+                    "advance_state": true,
+                }),
+            )
+            .await?;
+            return Ok(());
+        }
+        let chunk_count = rows.len().div_ceil(MEMORY_SEARCH_DISPATCH_BATCH_SIZE);
+        for (index, chunk) in rows.chunks(MEMORY_SEARCH_DISPATCH_BATCH_SIZE).enumerate() {
+            self.execute_value(
+                NamedSurqlOp::UpsertMemorySearchProjection,
+                json!({
+                    "project_id": project_id,
+                    "write_id": write_id,
+                    "updated_revision": updated_revision,
+                    "rows": chunk,
+                    "advance_state": index + 1 == chunk_count,
+                }),
+            )
+            .await?;
+        }
+        Ok(())
     }
 
     pub async fn apply_observability(
@@ -1445,6 +2016,72 @@ impl CanonicalStore {
         &self,
         request: &RecallL0Request,
     ) -> Result<RecallL0Response, StoreError> {
+        if request.lifecycle_audit {
+            return self.recall_l0_paged(request).await;
+        }
+        for _attempt in 0..RECALL_REVISION_RESTART_ATTEMPTS {
+            let value = self
+                .execute_value(
+                    NamedSurqlOp::LoadMemorySearchCandidates,
+                    json!({
+                        "project_id": request.project_id,
+                        "exact_handle_parts": exact_memory_search_handle(&request.query)
+                            .map(|handle| string_fragments(&handle)),
+                        "tokens": memory_search_terms(request),
+                        "candidate_limit": MAX_MEMORY_SEARCH_CANDIDATES,
+                    }),
+                )
+                .await?;
+            let mut load: MemorySearchCandidateLoad =
+                decode_value(NamedSurqlOp::LoadMemorySearchCandidates, value)?;
+            if load.projection_revision != Some(load.at_revision) {
+                self.rebuild_memory_search_projection(request.project_id)
+                    .await?;
+                continue;
+            }
+            let positions = load
+                .ordered_handles
+                .iter()
+                .enumerate()
+                .map(|(position, handle)| (handle.as_str(), position))
+                .collect::<BTreeMap<_, _>>();
+            load.candidates.sort_by_key(|row| {
+                positions
+                    .get(row.handle.as_str())
+                    .copied()
+                    .unwrap_or(usize::MAX)
+            });
+            return Ok(rank_recall_candidates(
+                request,
+                RecallCandidateLoad {
+                    at_revision: load.at_revision,
+                    candidates: load.candidates,
+                    truncated: load.truncated,
+                },
+            ));
+        }
+        Err(StoreError::PolicyViolation(
+            "memory search projection could not catch up to a stable project revision after 3 attempts"
+                .to_owned(),
+        ))
+    }
+
+    async fn recall_l0_paged(
+        &self,
+        request: &RecallL0Request,
+    ) -> Result<RecallL0Response, StoreError> {
+        let load = self
+            .load_paged_recall_candidates(request.project_id, true, MAX_RECALL_SCAN_CANDIDATES)
+            .await?;
+        Ok(rank_recall_candidates(request, load))
+    }
+
+    async fn load_paged_recall_candidates(
+        &self,
+        project_id: ProjectId,
+        lifecycle_audit: bool,
+        max_candidates: usize,
+    ) -> Result<RecallCandidateLoad, StoreError> {
         for _attempt in 0..RECALL_REVISION_RESTART_ATTEMPTS {
             let mut at_revision = None;
             let mut candidates = Vec::new();
@@ -1457,11 +2094,11 @@ impl CanonicalStore {
                         .execute_value(
                             NamedSurqlOp::LoadRecallCandidates,
                             json!({
-                                "project_id": request.project_id,
+                                "project_id": project_id,
                                 "kind": kind,
                                 "start": start,
                                 "limit": RECALL_CANDIDATE_PAGE_SIZE,
-                                "lifecycle_audit": request.lifecycle_audit,
+                                "lifecycle_audit": lifecycle_audit,
                             }),
                         )
                         .await?;
@@ -1473,7 +2110,7 @@ impl CanonicalStore {
                     }
                     at_revision.get_or_insert(page.at_revision);
                     let page_len = page.candidates.len();
-                    let remaining = MAX_RECALL_SCAN_CANDIDATES.saturating_sub(candidates.len());
+                    let remaining = max_candidates.saturating_sub(candidates.len());
                     if page_len > remaining {
                         page.candidates.truncate(remaining);
                         scan_truncated = true;
@@ -1501,11 +2138,11 @@ impl CanonicalStore {
                 .execute_value(
                     NamedSurqlOp::LoadRecallCandidates,
                     json!({
-                        "project_id": request.project_id,
+                        "project_id": project_id,
                         "kind": "head",
                         "start": 0,
                         "limit": 1,
-                        "lifecycle_audit": request.lifecycle_audit,
+                        "lifecycle_audit": lifecycle_audit,
                     }),
                 )
                 .await?;
@@ -1514,19 +2151,75 @@ impl CanonicalStore {
             if at_revision.is_some_and(|revision| revision != head.at_revision) {
                 continue;
             }
-            return Ok(rank_recall_candidates(
-                request,
-                RecallCandidateLoad {
-                    at_revision: head.at_revision,
-                    candidates,
-                    truncated: scan_truncated,
-                },
-            ));
+            return Ok(RecallCandidateLoad {
+                at_revision: head.at_revision,
+                candidates,
+                truncated: scan_truncated,
+            });
         }
         Err(StoreError::PolicyViolation(
             "recall candidate projection could not obtain a stable project revision after 3 attempts"
                 .to_owned(),
         ))
+    }
+
+    /// Rebuilds the derived search projection from canonical rows. Canonical
+    /// tables remain the source of truth; a revision drift leaves the state
+    /// marker behind the head so the next read retries instead of trusting a
+    /// mixed snapshot.
+    pub async fn rebuild_memory_search_projection(
+        &self,
+        project_id: ProjectId,
+    ) -> Result<MemoryRevision, StoreError> {
+        const MAX_REBUILD_CANDIDATES: usize = 250_000;
+        let load = self
+            .load_paged_recall_candidates(project_id, true, MAX_REBUILD_CANDIDATES)
+            .await?;
+        if load.truncated {
+            return Err(StoreError::PolicyViolation(format!(
+                "memory search rebuild exceeded the {MAX_REBUILD_CANDIDATES} candidate safety cap"
+            )));
+        }
+        let rows = load
+            .candidates
+            .iter()
+            .map(|row| projection_row(project_id, row, load.at_revision))
+            .collect::<Result<Vec<_>, _>>()?;
+        self.execute_value(
+            NamedSurqlOp::ResetMemorySearchProjection,
+            json!({ "project_id": project_id }),
+        )
+        .await?;
+        self.dispatch_memory_search_projection(
+            project_id,
+            WriteId::new_v7(),
+            load.at_revision,
+            &rows,
+        )
+        .await?;
+        Ok(load.at_revision)
+    }
+
+    pub async fn memory_search_query_plan(
+        &self,
+        project_id: ProjectId,
+        query: &str,
+    ) -> Result<Value, StoreError> {
+        let tokens = eliot_types::normalize_query_tokens(query)
+            .into_iter()
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .take(MAX_MEMORY_SEARCH_QUERY_TERMS)
+            .collect::<Vec<_>>();
+        self.execute_value(
+            NamedSurqlOp::ExplainMemorySearchPostings,
+            json!({
+                "project_id": project_id,
+                "tokens": tokens,
+                "candidate_limit": MAX_MEMORY_SEARCH_CANDIDATES,
+            }),
+        )
+        .await
     }
 
     pub async fn fetch_atoms_l2(

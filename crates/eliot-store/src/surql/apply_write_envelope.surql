@@ -377,6 +377,14 @@ UPSERT type::record('memory_transition', $envelope.write_id) CONTENT {
   created_at: time::now()
 };
 
+UPSERT type::record('memory_search_outbox', $envelope.write_id) CONTENT {
+  write_id: $envelope.write_id,
+  project_id: $envelope.project_id,
+  updated_revision: $revision,
+  status: 'pending',
+  created_at: time::now(),
+};
+
 UPSERT type::record('write_receipt', $receipt_id) CONTENT {
   receipt_id: $receipt_id,
   write_id: $envelope.write_id,

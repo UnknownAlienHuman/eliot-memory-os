@@ -11,6 +11,7 @@ pub enum NamedSurqlOp {
     SchemaMigrateUlMeasurement,
     SchemaMigrateUlDependencyActivation,
     SchemaMigrateUlTokenPolicy,
+    SchemaMigrateMemorySearch,
     AssignUlExperimentArm,
     LoadUlExperimentAssignment,
     LoadUlTaskClassLedgers,
@@ -38,6 +39,10 @@ pub enum NamedSurqlOp {
     ObservabilityRecordsByKind,
     CurrentState,
     LoadRecallCandidates,
+    UpsertMemorySearchProjection,
+    ResetMemorySearchProjection,
+    LoadMemorySearchCandidates,
+    ExplainMemorySearchPostings,
     FetchAtomsL2,
     FetchAtomsL2Legacy,
     GraphHealthCapabilities,
@@ -76,6 +81,7 @@ impl NamedSurqlOp {
             Self::SchemaMigrateUlMeasurement => "006_ul_measurement",
             Self::SchemaMigrateUlDependencyActivation => "007_ul_dependency_activation",
             Self::SchemaMigrateUlTokenPolicy => "008_ul_token_policy",
+            Self::SchemaMigrateMemorySearch => "009_memory_search",
             Self::AssignUlExperimentArm => "assign_ul_experiment_arm",
             Self::LoadUlExperimentAssignment => "load_ul_experiment_assignment",
             Self::LoadUlTaskClassLedgers => "load_ul_task_class_ledgers",
@@ -103,6 +109,10 @@ impl NamedSurqlOp {
             Self::ObservabilityRecordsByKind => "observability_records_by_kind",
             Self::CurrentState => "current_state",
             Self::LoadRecallCandidates => "load_recall_candidates",
+            Self::UpsertMemorySearchProjection => "upsert_memory_search_projection",
+            Self::ResetMemorySearchProjection => "reset_memory_search_projection",
+            Self::LoadMemorySearchCandidates => "load_memory_search_candidates",
+            Self::ExplainMemorySearchPostings => "explain_memory_search_postings",
             Self::FetchAtomsL2 => "fetch_atoms_l2",
             Self::FetchAtomsL2Legacy => "fetch_atoms_l2_legacy",
             Self::GraphHealthCapabilities => "graph_health_capabilities",
@@ -130,6 +140,9 @@ impl NamedSurqlOp {
         }
     }
 
+    // This exhaustive table deliberately keeps every operation adjacent to its
+    // embedded SQL resource; splitting it would weaken the enum-to-template audit.
+    #[allow(clippy::too_many_lines)]
     pub const fn template(self) -> &'static str {
         match self {
             Self::SchemaMigrate => include_str!("surql/000_schema.surql"),
@@ -145,6 +158,7 @@ impl NamedSurqlOp {
                 include_str!("surql/007_ul_dependency_activation.surql")
             }
             Self::SchemaMigrateUlTokenPolicy => include_str!("surql/008_ul_token_policy.surql"),
+            Self::SchemaMigrateMemorySearch => include_str!("surql/009_memory_search.surql"),
             Self::AssignUlExperimentArm => include_str!("surql/assign_ul_experiment_arm.surql"),
             Self::LoadUlExperimentAssignment => {
                 include_str!("surql/load_ul_experiment_assignment.surql")
@@ -186,6 +200,18 @@ impl NamedSurqlOp {
             }
             Self::CurrentState => include_str!("surql/current_state.surql"),
             Self::LoadRecallCandidates => include_str!("surql/load_recall_candidates.surql"),
+            Self::UpsertMemorySearchProjection => {
+                include_str!("surql/upsert_memory_search_projection.surql")
+            }
+            Self::ResetMemorySearchProjection => {
+                include_str!("surql/reset_memory_search_projection.surql")
+            }
+            Self::LoadMemorySearchCandidates => {
+                include_str!("surql/load_memory_search_candidates.surql")
+            }
+            Self::ExplainMemorySearchPostings => {
+                include_str!("surql/explain_memory_search_postings.surql")
+            }
             Self::FetchAtomsL2 => include_str!("surql/fetch_atoms_l2.surql"),
             Self::FetchAtomsL2Legacy => include_str!("surql/fetch_atoms_l2_legacy.surql"),
             Self::GraphHealthCapabilities => {
@@ -264,7 +290,7 @@ impl Default for SurqlTemplateRegistry {
 }
 
 #[allow(clippy::too_many_lines)]
-fn foundational_templates() -> [SurqlTemplate; 42] {
+fn foundational_templates() -> [SurqlTemplate; 47] {
     [
         template(
             NamedSurqlOp::SchemaMigrate,
@@ -318,6 +344,12 @@ fn foundational_templates() -> [SurqlTemplate; 42] {
             NamedSurqlOp::SchemaMigrateUlTokenPolicy,
             "SchemaMigrateUlTokenPolicyInput",
             "SchemaMigrateUlTokenPolicyOutput",
+            64 * 1024,
+        ),
+        template(
+            NamedSurqlOp::SchemaMigrateMemorySearch,
+            "SchemaMigrateMemorySearchInput",
+            "SchemaMigrateMemorySearchOutput",
             64 * 1024,
         ),
         template(
@@ -481,6 +513,30 @@ fn foundational_templates() -> [SurqlTemplate; 42] {
             "LoadRecallCandidatesInput",
             "LoadRecallCandidatesOutput",
             512 * 1024,
+        ),
+        template(
+            NamedSurqlOp::UpsertMemorySearchProjection,
+            "UpsertMemorySearchProjectionInput",
+            "UpsertMemorySearchProjectionOutput",
+            128 * 1024,
+        ),
+        template(
+            NamedSurqlOp::ResetMemorySearchProjection,
+            "ResetMemorySearchProjectionInput",
+            "ResetMemorySearchProjectionOutput",
+            64 * 1024,
+        ),
+        template(
+            NamedSurqlOp::LoadMemorySearchCandidates,
+            "LoadMemorySearchCandidatesInput",
+            "LoadMemorySearchCandidatesOutput",
+            2 * 1024 * 1024,
+        ),
+        template(
+            NamedSurqlOp::ExplainMemorySearchPostings,
+            "ExplainMemorySearchPostingsInput",
+            "ExplainMemorySearchPostingsOutput",
+            128 * 1024,
         ),
         template(
             NamedSurqlOp::FetchAtomsL2,
