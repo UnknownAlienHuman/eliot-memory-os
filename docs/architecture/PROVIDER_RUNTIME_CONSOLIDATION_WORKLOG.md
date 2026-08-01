@@ -833,3 +833,48 @@ This log preserves the ordered implementation evidence for
   is rewritten. Its existing ordinary/verbatim regression now also covers a raw displayed verbatim
   expected string. Cognitive runner remained 29/29 green (1.03 s behavior), and package Clippy with
   warnings denied passed.
+
+### Generation-5 publication and Published replay repair
+
+- The path-normalization repair was committed/pushed as
+  `b1c1d0c776f56b92165aef7ea219ef843396afb6`. Its isolated release build took 269.282 s and
+  produced a 56,132,096-byte binary, SHA-256
+  `069552c4d824cde73f44f29caeb5744daa4fe99b31412e45cd98eaf69aadb0cb`, with the exact embedded
+  commit. Quiescence passed, PID 75572 stopped cooperatively, and the candidate started hidden as
+  PID 109592. Publication, doctor, and supervision were ready/clean with exact path/SHA and zero
+  operations, orphans, partial seals, or leases before sealing.
+- The corrected generation-5 dry-run passed in 12.399 s. It proved carried first-binding plan
+  `blake3:5f888363...`, the dense skipped chain `[4]`, generation 5 attempt
+  `provider-plan-seal:seal-b5bbfbca42d32a7d-g5`, binding SHA-256 `c011acae...`, manifest SHA-256
+  `e49e55a5...`, and zero authority side effects. Full inventories stayed byte-identical: 22 public
+  and 1,617 private files, zero differences.
+- The real generation-5 seal completed in 17.206 s: 8 fresh calls, 4 accepted reused roles, no
+  smokes, plan `blake3:d60d948f...`, the same manifest, and Published status. Both existing
+  `reused-roles.json` files were byte-identical before/after. This closes the original immutable
+  projection collision.
+- An immediate identical seal replay then exposed a second acceptance defect. Public state stayed
+  byte-identical (23 files), but the command failed after 13.657 s with
+  `existing sealed provider plan differs from the requested call plan` and left 13 staging files.
+  Exact diff showed only the four external execution requests changing: the create renderer read its
+  own active generation-5 leases and advanced `role_lease_epoch` (for example 9 -> 11). That changed
+  launch-contract hashes, execution-request hashes, manifest hashes, and the plan hash. Runtime
+  supervision remained ready/clean; no new authority or seal record was created.
+- Escalated once to the existing headless Opus 5 architecture session
+  `703f5a06-7b30-4783-bce1-e74d4de580ba`. The focused follow-up used 11 turns, 338.490 s wall /
+  333.544 s API, USD 2.9569875, with no permission denial, write, MCP, or web access. It confirmed
+  the architectural ordering error: Published replay was decided only after non-idempotent create
+  rendering and staging.
+- Replay is now a separate early verify-only path. It runs before staging, does not render runtime
+  contracts, allocate epochs, or mint authority. It validates the Published record; byte-exact
+  public/private candidate plan; self-consistent manifest and exact manifested generation tree with
+  no extras; caller call intent after clearing only external generated fields; the consumed caller
+  `runtime_contract_sha256` through each sealed execution request; prompt/schema hashes; exact
+  active seal-bound lease/session/job/work sets; and the role-reuse binding. Runtime currency remains
+  owned by seal-status/supersession rather than replay, avoiding a second source of non-idempotency.
+- Only after every replay check passes, a non-dry replay may remove a staging root proven orphaned
+  by the coexisting Published record and absence of Staged/Activated authority. This self-heals the
+  13-file residue; dry-run remains entirely read-only. A pre-activation staging guard now cleans all
+  create-preparation error returns until the durable runtime checkpoint assumes recovery ownership.
+  A focused test fixes the classification boundary between caller intent and external generated
+  fields; changed Codex runtime binding remains direct intent, while external consumed input remains
+  bound separately by the sealed request.

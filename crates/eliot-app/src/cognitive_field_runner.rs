@@ -563,6 +563,29 @@ struct RoleReusePlan {
     carried_pair: Option<(String, OffsetDateTime)>,
 }
 
+struct PreActivationStagingGuard {
+    root: PathBuf,
+    armed: bool,
+}
+
+impl PreActivationStagingGuard {
+    fn new(root: PathBuf) -> Self {
+        Self { root, armed: true }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for PreActivationStagingGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = fs::remove_dir_all(&self.root);
+        }
+    }
+}
+
 type StagedProviderPlanValidation = (
     Option<CoreRoleEvidencePlan>,
     Option<RoleReusePlan>,
@@ -2536,6 +2559,226 @@ fn provider_plan_seal_response(
     })
 }
 
+fn provider_call_intent(call: &CognitiveFieldProviderCallPlan) -> CognitiveFieldProviderCallPlan {
+    let mut intent = call.clone();
+    if intent.host != AgentHostId::Codex {
+        intent.adapter_id.clear();
+        intent.adapter_version.clear();
+        intent.execution_request_ref.clear();
+        intent.execution_request_sha256.clear();
+        intent.runtime_contract_ref.clear();
+        intent.expected_provider_executable_sha256.clear();
+        intent.runtime_contract_sha256.clear();
+    }
+    intent
+}
+
+fn validated_published_seal_manifest(
+    private_root: &Path,
+    record: &ProviderPlanSealRecord,
+    plan: &CognitiveFieldProviderPlan,
+) -> Result<SealArtifactManifest> {
+    let sealed_root = private_root
+        .join("sealed")
+        .join(record.generation.to_string());
+    ensure!(
+        sealed_root.is_dir() && contract_path_matches(&sealed_root, &record.published_root),
+        "Published seal root differs from its deterministic generation root"
+    );
+    let manifest_path = sealed_root.join("artifact-manifest.json");
+    let manifest_bytes = fs::read(&manifest_path)?;
+    let manifest: SealArtifactManifest = serde_json::from_slice(&manifest_bytes)?;
+    ensure!(
+        manifest.schema_version == SEAL_ARTIFACT_MANIFEST_SCHEMA_VERSION
+            && manifest.run_id == plan.run_id
+            && manifest.generation == plan.seal_generation
+            && manifest.seal_attempt_id == record.seal_attempt_id
+            && seal_manifest_hash(&manifest)? == manifest.manifest_sha256
+            && manifest.manifest_sha256 == record.staged_manifest_sha256
+            && plan.runtime_manifest_sha256.as_deref() == Some(manifest.manifest_sha256.as_str())
+            && plan.artifact_manifest_sha256.as_deref() == Some(manifest.manifest_sha256.as_str()),
+        "Published seal manifest differs from its record or provider plan"
+    );
+    let sealed_root = fs::canonicalize(&sealed_root)?;
+    let mut expected_tree = BTreeMap::new();
+    for entry in &manifest.entries {
+        let path =
+            private_relative_file(private_root, &entry.relative_path, "sealed manifest entry")?;
+        ensure!(
+            path.starts_with(&sealed_root),
+            "sealed manifest entry escaped its generation root"
+        );
+        let bytes = fs::read(&path)?;
+        let relative = path
+            .strip_prefix(&sealed_root)?
+            .to_string_lossy()
+            .replace('\\', "/");
+        ensure!(
+            sha256_bytes(&bytes) == entry.sha256
+                && u64::try_from(bytes.len())? == entry.size_bytes
+                && expected_tree
+                    .insert(relative, (entry.sha256.clone(), entry.size_bytes))
+                    .is_none(),
+            "sealed manifest entry differs from its published bytes"
+        );
+    }
+    for relative in ["artifact-manifest.json", "candidate-provider-plan.json"] {
+        let bytes = fs::read(sealed_root.join(relative))?;
+        ensure!(
+            expected_tree
+                .insert(
+                    relative.to_owned(),
+                    (sha256_bytes(&bytes), u64::try_from(bytes.len())?),
+                )
+                .is_none(),
+            "sealed manifest reserved artifact is duplicated"
+        );
+    }
+    let actual_tree = quarantine_tree_manifest(&sealed_root)?
+        .into_iter()
+        .map(|entry| (entry.relative_path, (entry.sha256, entry.size_bytes)))
+        .collect::<BTreeMap<_, _>>();
+    ensure!(
+        actual_tree == expected_tree,
+        "Published seal generation contains missing or unmanifested artifacts"
+    );
+    Ok(manifest)
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    reason = "published replay verifies one exact sealed run without reconstructing authority"
+)]
+fn replay_published_provider_plan(
+    config_path: &Path,
+    contract: &CognitiveFieldRunContract,
+    report_root: &Path,
+    private_root: &Path,
+    caller_calls: &[CognitiveFieldProviderCallPlan],
+    existing: &CognitiveFieldProviderPlan,
+    dry_run: bool,
+) -> Result<()> {
+    validate_provider_plan_hash(existing)?;
+    ensure!(
+        existing.run_id == contract.run_id && existing.contract_hash == contract.contract_hash,
+        "Published provider plan differs from the sealed run contract"
+    );
+    let seal_attempt_id = existing
+        .seal_attempt_id
+        .as_deref()
+        .context("Published provider plan has no seal attempt ID")?;
+    let record: ProviderPlanSealRecord =
+        read_json(&seal_record_path(private_root, seal_attempt_id))?;
+    ensure!(
+        record.state == ProviderPlanSealState::Published
+            && record.run_id == contract.run_id
+            && record.generation == existing.seal_generation
+            && record.seal_attempt_id == seal_attempt_id,
+        "Published provider plan has no exact Published seal record"
+    );
+    let public_plan_path = report_root.join("provider-plan.json");
+    let public_bytes = fs::read(&public_plan_path)?;
+    let candidate_path = private_root
+        .join("sealed")
+        .join(existing.seal_generation.to_string())
+        .join("candidate-provider-plan.json");
+    let candidate_bytes = fs::read(&candidate_path)?;
+    ensure!(
+        public_bytes == candidate_bytes
+            && public_bytes == encode_pretty_json(existing)?
+            && record.provider_plan_sha256.as_deref() == Some(sha256_bytes(&public_bytes).as_str()),
+        "Published provider plan bytes differ from their seal record or immutable candidate"
+    );
+    let manifest = validated_published_seal_manifest(private_root, &record, existing)?;
+    ensure!(
+        caller_calls.len() == existing.calls.len()
+            && caller_calls.iter().zip(&existing.calls).all(
+                |(caller, sealed)| provider_call_intent(caller) == provider_call_intent(sealed)
+            ),
+        "replayed provider call intent differs from the Published provider plan"
+    );
+    let provider_schema_bytes = fs::read(private_root.join("schemas/reader-provider.json"))?;
+    for (caller, sealed) in caller_calls.iter().zip(&existing.calls) {
+        if caller.host == AgentHostId::Codex {
+            continue;
+        }
+        let prompt_path =
+            private_relative_file(private_root, &caller.prompt_ref, "provider prompt")?;
+        ensure!(
+            sha256_bytes(&fs::read(prompt_path)?) == caller.prompt_sha256
+                && sha256_bytes(&provider_schema_bytes) == caller.provider_schema_sha256,
+            "replayed provider input material differs from its caller binding"
+        );
+        let request_path = private_relative_file(
+            private_root,
+            &sealed.execution_request_ref,
+            "sealed provider execution request",
+        )?;
+        let request_bytes = fs::read(&request_path)?;
+        let request: ExternalAgentExecutionRequest = serde_json::from_slice(&request_bytes)?;
+        ensure!(
+            sha256_bytes(&request_bytes) == sealed.execution_request_sha256
+                && request.invocation.runtime_contract_sha256.as_deref()
+                    == Some(caller.runtime_contract_sha256.as_str())
+                && request.invocation.role_lease_epoch == request.launch_contract.role_lease_epoch
+                && request.invocation.role_lease_id
+                    == request
+                        .launch_contract
+                        .role_lease_id
+                        .as_deref()
+                        .context("sealed execution request lacks its role lease")?
+                && record
+                    .role_lease_ids
+                    .contains(&request.invocation.role_lease_id)
+                && request
+                    .launch_contract
+                    .agent_session_id
+                    .is_some_and(|session| record.session_ids.contains(&session)),
+            "replayed provider consumed input or authority differs from its sealed request"
+        );
+    }
+    ensure!(
+        published_seal_authority_exact(config_path, &record)?,
+        "Published provider-plan authority is missing or stale; recovery is required"
+    );
+    if existing.planned_reused_roles > 0 {
+        ensure!(
+            load_validated_role_reuse_binding(existing, report_root, private_root)?.is_some(),
+            "Published provider plan lacks its valid role reuse binding"
+        );
+    }
+    let staging_root = private_root
+        .join("seal-staging")
+        .join(seal_attempt_component(
+            &contract.run_id,
+            existing.seal_generation,
+        ));
+    if !dry_run && staging_root.exists() {
+        let conflicting = load_seal_records(private_root)?
+            .into_iter()
+            .any(|candidate| {
+                candidate.seal_attempt_id == record.seal_attempt_id
+                    && matches!(
+                        candidate.state,
+                        ProviderPlanSealState::Staged | ProviderPlanSealState::Activated
+                    )
+            });
+        ensure!(
+            !conflicting,
+            "orphan staging cannot be removed while incomplete seal authority exists"
+        );
+        fs::remove_dir_all(staging_root)?;
+    }
+    print_json(&provider_plan_seal_response(
+        &contract.run_id,
+        seal_attempt_id,
+        existing.seal_generation,
+        existing,
+        &manifest.manifest_sha256,
+    ))
+}
+
 #[allow(clippy::too_many_lines)]
 pub async fn seal_provider_plan_with_mode(
     config_path: &Path,
@@ -2606,6 +2849,18 @@ pub async fn seal_provider_plan_with_mode(
                 .all(|record| record.seal_attempt_id == seal_attempt_id),
         "an incomplete provider-plan seal requires recovery before a new generation"
     );
+    let calls: Vec<CognitiveFieldProviderCallPlan> = read_json(&calls_path)?;
+    if let Some(existing) = &existing {
+        return replay_published_provider_plan(
+            config_path,
+            &contract,
+            &report_root,
+            &private_root,
+            &calls,
+            existing,
+            dry_run,
+        );
+    }
     let staging_component = seal_attempt_component(&contract.run_id, generation);
     let staging_prefix = format!("seal-staging/{staging_component}");
     let final_prefix = format!("sealed/{generation}");
@@ -2616,10 +2871,8 @@ pub async fn seal_provider_plan_with_mode(
         "seal staging root already exists and must be recovered before sealing: {}",
         staging_root.display()
     );
-    if existing.is_none() {
-        validate_new_seal_generation(&private_root, &contract.run_id, generation)?;
-    }
-    let mut calls: Vec<CognitiveFieldProviderCallPlan> = read_json(&calls_path)?;
+    validate_new_seal_generation(&private_root, &contract.run_id, generation)?;
+    let mut calls = calls;
     let (authority, mut private_artifacts) = render_external_provider_calls(
         config_path,
         &suite,
@@ -2631,6 +2884,7 @@ pub async fn seal_provider_plan_with_mode(
         &mut calls,
     )?;
     stage_artifacts_with_cleanup(&private_root, &staging_root, &private_artifacts, None)?;
+    let mut staging_guard = PreActivationStagingGuard::new(staging_root.clone());
     let validation = (|| -> Result<StagedProviderPlanValidation> {
         let role_evidence_plan =
             load_core_role_evidence_plan(&suite, &contract, &report_root, &private_root, &calls)?;
@@ -2869,39 +3123,6 @@ pub async fn seal_provider_plan_with_mode(
         &staging_root.join("candidate-provider-plan.json"),
         &encode_pretty_json(&prepared.plan)?,
     )?;
-    if let Some(existing) = existing {
-        ensure!(
-            existing == plan,
-            "existing sealed provider plan differs from the requested call plan"
-        );
-        let broker = crate::delegation_runtime::load_state(
-            &crate::delegation_runtime::root_from_config(config_path),
-        )?;
-        let current_authority = prepared.record.role_lease_ids.iter().all(|role_lease_id| {
-            broker.task_role_leases.iter().any(|lease| {
-                lease.role_lease_id == *role_lease_id
-                    && lease.state == AuthorityLeaseState::Active
-                    && lease.generation == generation
-                    && broker.agent_host_sessions.iter().any(|session| {
-                        session.agent_session_id == lease.agent_session_id
-                            && session.state == AgentSessionState::Active
-                            && session.generation == generation
-                    })
-            })
-        });
-        ensure!(
-            current_authority,
-            "Published provider-plan authority is missing or stale; recovery is required"
-        );
-        fs::remove_dir_all(&staging_root)?;
-        return print_json(&provider_plan_seal_response(
-            &contract.run_id,
-            &seal_attempt_id,
-            generation,
-            &existing,
-            &prepared.manifest.manifest_sha256,
-        ));
-    }
     if dry_run {
         fs::remove_dir_all(&staging_root)?;
         let role_reuse_binding_sha256 = role_reuse_binding
@@ -2950,6 +3171,7 @@ pub async fn seal_provider_plan_with_mode(
         let _ = fs::remove_dir_all(&staging_root);
         return Err(error).context("persist staged provider-plan seal checkpoint");
     }
+    staging_guard.disarm();
     if let Err(error) = write_seal_record(&private_root, &record) {
         let _ = fs::remove_dir_all(&staging_root);
         let _ = runtime_store
@@ -4525,6 +4747,91 @@ async fn prove_carried_role_reuse_binding(
     })
 }
 
+fn published_seal_authority_exact(
+    config_path: &Path,
+    seal_record: &ProviderPlanSealRecord,
+) -> Result<bool> {
+    let root = crate::delegation_runtime::root_from_config(config_path);
+    let broker = crate::delegation_runtime::load_state(&root)?;
+    let work = crate::delegation_runtime::load_work_state(&root)?;
+    let now = OffsetDateTime::now_utc();
+    let expected_leases = seal_record
+        .role_lease_ids
+        .iter()
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let expected_sessions = seal_record
+        .session_ids
+        .iter()
+        .copied()
+        .collect::<BTreeSet<_>>();
+    let expected_jobs = seal_record
+        .operation_job_ids
+        .iter()
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let expected_work = seal_record
+        .work_item_ids
+        .iter()
+        .copied()
+        .collect::<BTreeSet<_>>();
+    let scoped_leases = broker
+        .task_role_leases
+        .iter()
+        .filter(|lease| {
+            lease.generation == seal_record.generation
+                && lease.seal_attempt_id.as_deref() == Some(seal_record.seal_attempt_id.as_str())
+        })
+        .map(|lease| lease.role_lease_id.clone())
+        .collect::<BTreeSet<_>>();
+    let leases_exact = !expected_leases.is_empty()
+        && expected_leases.len() == seal_record.role_lease_ids.len()
+        && expected_leases == scoped_leases
+        && seal_record.role_lease_ids.iter().all(|role_lease_id| {
+            broker.task_role_leases.iter().any(|lease| {
+                lease.role_lease_id == *role_lease_id
+                    && lease.state == AuthorityLeaseState::Active
+                    && lease.expires_at > now
+                    && lease.lifetime == AuthorityLeaseLifetime::SealBound
+                    && lease.generation == seal_record.generation
+                    && lease.seal_attempt_id.as_deref()
+                        == Some(seal_record.seal_attempt_id.as_str())
+                    && expected_sessions.contains(&lease.agent_session_id)
+            })
+        });
+    let scoped_sessions = broker
+        .agent_host_sessions
+        .iter()
+        .filter(|session| {
+            session.state == AgentSessionState::Active
+                && session.generation == seal_record.generation
+        })
+        .map(|session| session.agent_session_id)
+        .collect::<BTreeSet<_>>();
+    let sessions_exact = !expected_sessions.is_empty()
+        && expected_sessions.len() == seal_record.session_ids.len()
+        && expected_sessions.len() == expected_leases.len()
+        && expected_sessions == scoped_sessions;
+    let jobs_exact = expected_jobs.len() == seal_record.operation_job_ids.len()
+        && seal_record.operation_job_ids.iter().all(|job_id| {
+            broker.operation_jobs.iter().any(|job| {
+                job.job_id == *job_id
+                    && job.generation == seal_record.generation
+                    && job.state == OperationJobState::Queued
+                    && job.phase == OperationPhase::Published
+                    && job.attempt == 0
+                    && job.result_ref.is_none()
+            })
+        });
+    let work_exact = expected_work.len() == seal_record.work_item_ids.len()
+        && seal_record.work_item_ids.iter().all(|work_item_id| {
+            work.work_items.iter().any(|item| {
+                item.work_item_id == *work_item_id && item.status == WorkItemStatus::Open
+            })
+        });
+    Ok(leases_exact && sessions_exact && jobs_exact && work_exact)
+}
+
 #[allow(
     clippy::too_many_lines,
     reason = "published-seal inspection intentionally classifies every zero-dispatch and authority fence in one read-only pass"
@@ -4586,72 +4893,7 @@ async fn inspect_published_seal_supersession(
         && seal_record.seal_attempt_id == seal_attempt_id
         && seal_record.provider_plan_sha256.as_deref() == Some(provider_plan_sha256.as_str())
         && public_bytes == candidate_bytes;
-    let root = crate::delegation_runtime::root_from_config(config_path);
-    let broker = crate::delegation_runtime::load_state(&root)?;
-    let work = crate::delegation_runtime::load_work_state(&root)?;
-    let now = OffsetDateTime::now_utc();
-    let expected_leases = seal_record
-        .role_lease_ids
-        .iter()
-        .cloned()
-        .collect::<BTreeSet<_>>();
-    let expected_sessions = seal_record
-        .session_ids
-        .iter()
-        .copied()
-        .collect::<BTreeSet<_>>();
-    let scoped_leases = broker
-        .task_role_leases
-        .iter()
-        .filter(|lease| {
-            lease.generation == seal_record.generation
-                && lease.seal_attempt_id.as_deref() == Some(seal_attempt_id.as_str())
-        })
-        .map(|lease| lease.role_lease_id.clone())
-        .collect::<BTreeSet<_>>();
-    let leases_exact = !expected_leases.is_empty()
-        && expected_leases.len() == seal_record.role_lease_ids.len()
-        && expected_leases == scoped_leases
-        && seal_record.role_lease_ids.iter().all(|role_lease_id| {
-            broker.task_role_leases.iter().any(|lease| {
-                lease.role_lease_id == *role_lease_id
-                    && lease.state == AuthorityLeaseState::Active
-                    && lease.expires_at > now
-                    && lease.lifetime == AuthorityLeaseLifetime::SealBound
-                    && lease.generation == seal_record.generation
-                    && lease.seal_attempt_id.as_deref() == Some(seal_attempt_id.as_str())
-                    && expected_sessions.contains(&lease.agent_session_id)
-            })
-        });
-    let scoped_sessions = broker
-        .agent_host_sessions
-        .iter()
-        .filter(|session| {
-            session.state == AgentSessionState::Active
-                && session.generation == seal_record.generation
-        })
-        .map(|session| session.agent_session_id)
-        .collect::<BTreeSet<_>>();
-    let sessions_exact = !expected_sessions.is_empty()
-        && expected_sessions.len() == seal_record.session_ids.len()
-        && expected_sessions.len() == expected_leases.len()
-        && expected_sessions == scoped_sessions;
-    let jobs_exact = seal_record.operation_job_ids.iter().all(|job_id| {
-        broker.operation_jobs.iter().any(|job| {
-            job.job_id == *job_id
-                && job.generation == seal_record.generation
-                && job.state == OperationJobState::Queued
-                && job.phase == OperationPhase::Published
-                && job.attempt == 0
-                && job.result_ref.is_none()
-        })
-    });
-    let work_exact = seal_record.work_item_ids.iter().all(|work_item_id| {
-        work.work_items
-            .iter()
-            .any(|item| item.work_item_id == *work_item_id && item.status == WorkItemStatus::Open)
-    });
-    let authority_exact = leases_exact && sessions_exact && jobs_exact && work_exact;
+    let authority_exact = published_seal_authority_exact(config_path, &seal_record)?;
     let call_ids = plan
         .calls
         .iter()
@@ -10291,6 +10533,61 @@ mod tests {
         );
         assert!(first.get("idempotent").is_none());
         Ok(())
+    }
+
+    #[test]
+    fn published_replay_separates_external_call_intent_from_generated_binding() {
+        let execution = CognitiveFieldExecutionKey {
+            case_id: "U06".to_owned(),
+            memory_condition: CognitiveMemoryCondition::Treatment,
+        };
+        let caller = CognitiveFieldProviderCallPlan {
+            call_number: 1,
+            call_id: "reader-call".to_owned(),
+            role: CognitiveFieldRole::UnderstandingReader,
+            host: AgentHostId::Antigravity,
+            requested_model: "gemini-3.6-flash-high".to_owned(),
+            expected_provider_executable_sha256: "a".repeat(64),
+            prompt_ref: "prompts/reader.txt".to_owned(),
+            prompt_sha256: "b".repeat(64),
+            canonical_schema_sha256: "c".repeat(64),
+            provider_schema_sha256: "d".repeat(64),
+            provider_smoke: false,
+            counts_against_cap: true,
+            executions: vec![execution],
+            runtime_contract_ref: "caller-runtime.json".to_owned(),
+            runtime_contract_sha256: "e".repeat(64),
+            adapter_id: "caller-adapter".to_owned(),
+            adapter_version: "caller-version".to_owned(),
+            execution_request_ref: "caller-request.json".to_owned(),
+            execution_request_sha256: "f".repeat(64),
+        };
+        let mut sealed = caller.clone();
+        sealed.expected_provider_executable_sha256 = "1".repeat(64);
+        sealed.runtime_contract_ref = "sealed/5/runtime/contract.json".to_owned();
+        sealed.runtime_contract_sha256 = "2".repeat(64);
+        sealed.adapter_id = "external-agent:antigravity".to_owned();
+        sealed.adapter_version = "eliot-external-agent-adapter-v1".to_owned();
+        sealed.execution_request_ref = "sealed/5/runtime/request.json".to_owned();
+        sealed.execution_request_sha256 = "3".repeat(64);
+        assert_eq!(
+            super::provider_call_intent(&caller),
+            super::provider_call_intent(&sealed)
+        );
+        sealed.requested_model = "gemini-3.6-pro".to_owned();
+        assert_ne!(
+            super::provider_call_intent(&caller),
+            super::provider_call_intent(&sealed)
+        );
+
+        let mut codex = caller;
+        codex.host = AgentHostId::Codex;
+        let mut changed_codex = codex.clone();
+        changed_codex.runtime_contract_sha256 = "4".repeat(64);
+        assert_ne!(
+            super::provider_call_intent(&codex),
+            super::provider_call_intent(&changed_codex)
+        );
     }
 
     #[test]
