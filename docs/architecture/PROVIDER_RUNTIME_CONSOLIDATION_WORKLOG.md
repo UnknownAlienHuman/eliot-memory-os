@@ -738,3 +738,80 @@ This log preserves the ordered implementation evidence for
   seals or integrity errors. All 16 drift fields are the four permitted Governor binding/derived
   hash fields across the four external Reader calls. Full before/after SHA-256 inventories were
   byte-identical: 23 public files and 1,600 private files, both with zero differences.
+
+### Live supersession, generation-4 collision, and immutable reuse repair
+
+- The generation-3 supersession apply completed in 9.055 s without a provider call. It revoked all
+  four role leases, retired the seal sessions, abandoned the zero-attempt operation jobs, revoked
+  the work items, marked the seal Abandoned, and digest-verified/quarantined both the immutable
+  generation root and public plan. A replay returned `ALREADY_SUPERSEDED` in 0.023 s. The public
+  and private trees were byte-identical across replay (22 and 1,602 files respectively), and the
+  runtime returned to `ready` with zero active leases and zero operations.
+- The replacement generation-4 seal dry-run passed in 5.820 s with no mutation. The real seal then
+  failed after 12.734 s at publication with
+  `sealed output already exists with different content: .../evidence/U03/memory_free_control/reused-roles.json`.
+  Compensation completed: generation 4 is Abandoned, authority is revoked, its candidate is
+  quarantined, active/pending leases and operations are zero, and the durable abandon record is
+  `abandoned-seals/seal-fd9bb12f939b7b9d-g4.json` with replacement generation 5.
+- Root cause: `reused-roles.json` is a public immutable projection, but its old materializer
+  regenerated generation-specific `provider_plan_hash` and `recorded_at`. The dry-run returned
+  before this materialization, so it did not predict the collision; the generation collision gate
+  also ran after part of seal preparation. Rewriting the old projection or weakening immutable
+  publication was rejected.
+- The first architecture review was sent headless to the bundled Claude Code CLI as exact
+  `claude-opus-5`, max effort, read-only plan mode, strict empty MCP, and Read/Grep/Glob only.
+  Session `703f5a06-7b30-4783-bce1-e74d4de580ba` used 30 turns and completed in 426.037 s wall /
+  423.871 s API, USD 2.7685645, with no denial, web, MCP, or write. Its initial proposal contained
+  a plan-hash/manifest-hash cycle. Local review caught the cycle; one resumed follow-up used five
+  turns, 266.630 s wall / 263.250 s API, USD 1.114218, and corrected the design. An unnecessary GUI
+  discovery attempt had occurred before the bundled CLI path was identified; it submitted no
+  Claude prompt and changed no project/runtime state. All later Claude reviews use the headless
+  executable directly.
+- Adopted design: existing `reused-roles.json` bytes retain their first-binding plan hash and
+  timestamp forever. Each new seal contains a generation-scoped, manifest-covered
+  `role-reuse-binding.json` over a material projection that deliberately clears only those two
+  carved first-binding fields. The binding has no current plan or manifest hash, preventing a hash
+  cycle. A carried binding is admitted only after exact completed supersession proof, a dense chain
+  of uniquely Abandoned skipped generations, digest-exact quarantined candidate plans, unchanged
+  material digests, and live zero-dispatch evidence for all relevant call/lease identities.
+- Seal planning now runs the full reuse write-set comparison before dry-run returns, rejects
+  partial or non-bijective prior projection sets, verifies every already-present byte, stages the
+  binding in the sealed manifest, validates generation collisions before activation, and cleans
+  staging if lineage proof fails. Grading validates plan -> artifact manifest -> role-reuse binding
+  -> all materialized projection digests. It checks carved fields against the current plan for a
+  genesis binding or against the carried first-binding pair after supersession. The obsolete
+  `planned_reused_roles <= 1` completion check is replaced by a required valid binding; Task-02R2
+  already requires exactly four accepted U03 role sources.
+
+### Verification, Claude zero-tool route, and test-duration issue
+
+- The new role-reuse negative-path test proves that changing only first-binding fields leaves the
+  material digest stable, that the sealed manifest binds exactly one generation binding, and that
+  changing any non-carved projection field is rejected. Cognitive runner tests passed 29/29 in
+  0.71 s behavior / 1.317 s warm wall; the focused new test passed in 0.03 s behavior / 14.4 s
+  compile/lock wall. `eliot-app` all-target Clippy with warnings denied passed in 27.921 s.
+- The first full `eliot-app` run exposed an existing B6 matrix failure for
+  `Claude/MemoryFreeControl`: the intentionally empty `cognitive_control` tool profile was rejected
+  as `Claude Code command input is incomplete`. It reproduced twice. A focused headless Opus 5
+  review (`4dcecf58-d084-46f8-b4b2-a88f8b3b931e`) completed over 19 turns in 311.031 s wall /
+  307.449 s API, USD 1.86438525, with no denials, web, MCP, or writes. It confirmed that an empty
+  allow set is a legal deny-all profile and that emitting `--allowedTools ""` would be ambiguous.
+- The systemic repair is confined to the Claude command builder: an empty allow set is accepted and
+  the `--allowedTools` pair is omitted; non-empty routes retain byte-identical argument ordering.
+  A new engine test covers zero tools, no empty argv tokens, strict MCP and deny flags, while the
+  original test now pins the non-empty flag/value. Blank model, MCP config, prompt, and zero turns
+  remain rejected. Engine external-agent tests passed 7/7; the full 12-cell B6 host/purpose matrix
+  passed. Combined compile-dominated wall time was 73.302 s.
+- Opus also identified a separate pre-existing hardening gap: the builder does not emit an explicit
+  Claude `--permission-mode`; built-in read-only tools are therefore constrained by the caller's
+  deny list rather than this flag. The zero-tool repair does not widen the MCP surface because the
+  route still uses strict sealed MCP config, empty catalog, and sealed deny data. The permission
+  mode gap is recorded for a separate bounded task and was not mixed into this repair.
+- A subsequent full package run passed the 218-test unit binary but the parallel
+  `multi_agent_access` integration binary timed out four tests waiting for changed
+  `auth_generation`. Serial isolation took 88.446 s: three active tests passed and only
+  `initialize_cannot_widen_the_authenticated_profile` repeated the same timeout; four provisioned
+  tests remained ignored. Per the two-attempt limit and the explicit instruction not to turn this
+  task into test-harness research, investigation stopped. This is an unrelated slow/flaky harness
+  fingerprint, not evidence against the focused seal/Claude fixes, and must be recorded in Eliot
+  and the final report.

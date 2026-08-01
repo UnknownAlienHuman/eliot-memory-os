@@ -101,6 +101,7 @@ const PROVIDER_PLAN_SEAL_RECORD_SCHEMA_VERSION: &str = "eliot-provider-plan-seal
 const SEAL_ARTIFACT_MANIFEST_SCHEMA_VERSION: &str = "eliot-seal-artifact-manifest-v1";
 const ABANDONED_SEAL_ATTEMPT_SCHEMA_VERSION: &str = "eliot-abandoned-seal-attempt-v1";
 const PUBLISHED_SEAL_SUPERSESSION_SCHEMA_VERSION: &str = "eliot-published-seal-supersession-v1";
+const ROLE_REUSE_BINDING_SCHEMA_VERSION: &str = "eliot-role-reuse-binding-v1";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -526,6 +527,67 @@ struct CoreRoleReuseProjection {
     #[serde(default)]
     source_deterministic_bindings: Vec<CoreRoleSourceDeterministicBinding>,
     recorded_at: OffsetDateTime,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CarriedRoleReuseBinding {
+    provider_plan_hash: String,
+    recorded_at: OffsetDateTime,
+    superseded_generation: u64,
+    supersession_record_ref: String,
+    skipped_generations: Vec<u64>,
+    skipped_generation_abandon_refs: Vec<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RoleReuseBinding {
+    schema_version: String,
+    run_id: String,
+    contract_hash: String,
+    seal_generation: u64,
+    seal_attempt_id: String,
+    role_evidence_plan_hash: String,
+    planned_reused_roles: u8,
+    projection_material_digests: BTreeMap<String, String>,
+    carried_binding: Option<CarriedRoleReuseBinding>,
+}
+
+#[derive(Clone, Debug)]
+struct RoleReusePlan {
+    writes: BTreeMap<PathBuf, Vec<u8>>,
+    projections_by_root: BTreeMap<PathBuf, Vec<CoreRoleReuseProjection>>,
+    deterministic_guards: BTreeMap<PathBuf, Vec<u8>>,
+    projection_material_digests: BTreeMap<String, String>,
+    carried_pair: Option<(String, OffsetDateTime)>,
+}
+
+type StagedProviderPlanValidation = (
+    Option<CoreRoleEvidencePlan>,
+    Option<RoleReusePlan>,
+    u8,
+    u8,
+    u8,
+);
+
+#[derive(Clone, Debug, Default)]
+struct ProviderDispatchEvidence {
+    reservation_count: usize,
+    result_count: usize,
+    journal_paths: Vec<String>,
+    artifact_paths: Vec<String>,
+    nonterminal_operation_ids: Vec<String>,
+}
+
+impl ProviderDispatchEvidence {
+    fn is_empty(&self) -> bool {
+        self.reservation_count == 0
+            && self.result_count == 0
+            && self.journal_paths.is_empty()
+            && self.artifact_paths.is_empty()
+            && self.nonterminal_operation_ids.is_empty()
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -2299,6 +2361,84 @@ fn next_seal_generation(
         + 1)
 }
 
+fn validate_new_seal_generation(private_root: &Path, run_id: &str, generation: u64) -> Result<()> {
+    let records = load_seal_records(private_root)?
+        .into_iter()
+        .filter(|record| record.run_id == run_id)
+        .collect::<Vec<_>>();
+    ensure!(
+        !records.iter().any(|record| record.generation == generation),
+        "provider-plan seal generation already has a record"
+    );
+    ensure!(
+        !private_root
+            .join("sealed")
+            .join(generation.to_string())
+            .exists(),
+        "immutable seal generation root already exists"
+    );
+    ensure!(
+        !private_root
+            .join("quarantine")
+            .join(seal_attempt_component(run_id, generation))
+            .exists(),
+        "provider-plan seal generation already has a quarantine root"
+    );
+    for prior_generation in 1..generation {
+        let matching = records
+            .iter()
+            .filter(|record| record.generation == prior_generation)
+            .collect::<Vec<_>>();
+        ensure!(
+            matching.len() == 1,
+            "provider-plan seal generation chain is missing or duplicated at generation {prior_generation}"
+        );
+        let record = matching[0];
+        ensure!(
+            record.state == ProviderPlanSealState::Abandoned,
+            "prior provider-plan seal generation is not retired"
+        );
+        let failure_ref = record
+            .failure_ref
+            .as_deref()
+            .context("retired provider-plan seal lacks a recovery reference")?;
+        let recovery_path = private_relative_file(
+            private_root,
+            failure_ref,
+            "retired provider-plan seal recovery",
+        )?;
+        if failure_ref.starts_with("superseded-seals/") {
+            let recovery: PublishedSealSupersessionRecord = read_json(&recovery_path)?;
+            ensure!(
+                recovery.schema_version == PUBLISHED_SEAL_SUPERSESSION_SCHEMA_VERSION
+                    && recovery.recovery_state == SealRecoveryRecordState::Complete
+                    && recovery.decision
+                        == PublishedSealSupersessionDecision::SupersedePublishedSealRuntimeDrift
+                    && recovery.run_id == run_id
+                    && recovery.generation == prior_generation
+                    && recovery.seal_attempt_id == record.seal_attempt_id,
+                "prior published seal supersession is incomplete or mismatched"
+            );
+        } else {
+            ensure!(
+                failure_ref.starts_with("abandoned-seals/"),
+                "retired provider-plan seal has an unknown recovery kind"
+            );
+            let recovery: AbandonedSealAttemptRecord = read_json(&recovery_path)?;
+            ensure!(
+                recovery.schema_version == ABANDONED_SEAL_ATTEMPT_SCHEMA_VERSION
+                    && recovery.recovery_state == SealRecoveryRecordState::Complete
+                    && recovery.run_id == run_id
+                    && recovery.generation == prior_generation
+                    && recovery.seal_attempt_id == record.seal_attempt_id
+                    && recovery.replacement_generation == Some(prior_generation + 1),
+                "prior abandoned seal recovery is incomplete or mismatched"
+            );
+        }
+    }
+    Ok(())
+}
+
 fn encode_pretty_json<T: Serialize>(value: &T) -> Result<Vec<u8>> {
     let mut bytes = serde_json::to_vec_pretty(value)?;
     bytes.push(b'\n');
@@ -2476,6 +2616,9 @@ pub async fn seal_provider_plan_with_mode(
         "seal staging root already exists and must be recovered before sealing: {}",
         staging_root.display()
     );
+    if existing.is_none() {
+        validate_new_seal_generation(&private_root, &contract.run_id, generation)?;
+    }
     let mut calls: Vec<CognitiveFieldProviderCallPlan> = read_json(&calls_path)?;
     let (authority, mut private_artifacts) = render_external_provider_calls(
         config_path,
@@ -2488,7 +2631,7 @@ pub async fn seal_provider_plan_with_mode(
         &mut calls,
     )?;
     stage_artifacts_with_cleanup(&private_root, &staging_root, &private_artifacts, None)?;
-    let validation = (|| -> Result<(Option<CoreRoleEvidencePlan>, u8, u8, u8)> {
+    let validation = (|| -> Result<StagedProviderPlanValidation> {
         let role_evidence_plan =
             load_core_role_evidence_plan(&suite, &contract, &report_root, &private_root, &calls)?;
         let role_sources = role_evidence_plan
@@ -2498,21 +2641,69 @@ pub async fn seal_provider_plan_with_mode(
             validate_provider_calls_with_sources(&suite, &calls, &private_root, role_sources)?;
         let planned_reused_roles = u8::try_from(prior_role_sources(role_sources).count())
             .context("reused role count exceeds u8")?;
+        let initial_binding = existing
+            .as_ref()
+            .map(|plan| (plan.plan_hash.as_str(), plan.sealed_at));
+        let role_reuse_plan = role_evidence_plan
+            .as_ref()
+            .map(|role_plan| {
+                plan_role_reuse(
+                    &suite,
+                    &contract,
+                    role_plan,
+                    &report_root,
+                    &private_root,
+                    initial_binding,
+                )
+            })
+            .transpose()?;
         Ok((
             role_evidence_plan,
+            role_reuse_plan,
             planned_provider_calls,
             planned_smoke_calls,
             planned_reused_roles,
         ))
     })();
-    let (role_evidence_plan, planned_provider_calls, planned_smoke_calls, planned_reused_roles) =
-        match validation {
-            Ok(validated) => validated,
-            Err(error) => {
-                let _ = fs::remove_dir_all(&staging_root);
-                return Err(error.context("validate staged provider-plan artifacts"));
-            }
-        };
+    let (
+        role_evidence_plan,
+        role_reuse_plan,
+        planned_provider_calls,
+        planned_smoke_calls,
+        planned_reused_roles,
+    ) = match validation {
+        Ok(validated) => validated,
+        Err(error) => {
+            let _ = fs::remove_dir_all(&staging_root);
+            return Err(error.context("validate staged provider-plan artifacts"));
+        }
+    };
+    let carried_binding_result = if let Some(role_reuse) = &role_reuse_plan
+        && let Some(carried_pair) = &role_reuse.carried_pair
+    {
+        Some(
+            prove_carried_role_reuse_binding(
+                config_path,
+                &private_root,
+                &contract,
+                generation,
+                carried_pair,
+                &role_reuse.projection_material_digests,
+            )
+            .await
+            .context("prove carried role reuse lineage"),
+        )
+    } else {
+        None
+    };
+    let carried_binding = match carried_binding_result {
+        Some(Ok(binding)) => Some(binding),
+        None => None,
+        Some(Err(error)) => {
+            let _ = fs::remove_dir_all(&staging_root);
+            return Err(error);
+        }
+    };
     for call in &mut calls {
         if let Some(relative) = call.execution_request_ref.strip_prefix(&staging_prefix) {
             call.execution_request_ref = format!("{final_prefix}{relative}");
@@ -2532,6 +2723,33 @@ pub async fn seal_provider_plan_with_mode(
             "role_evidence_plan".to_owned(),
             format!("{staging_prefix}/role-evidence-plan.json"),
             encode_pretty_json(role_plan)?,
+        ));
+    }
+    let role_reuse_binding = role_reuse_plan
+        .as_ref()
+        .map(|role_reuse| {
+            Ok::<_, anyhow::Error>(RoleReuseBinding {
+                schema_version: ROLE_REUSE_BINDING_SCHEMA_VERSION.to_owned(),
+                run_id: contract.run_id.clone(),
+                contract_hash: contract.contract_hash.clone(),
+                seal_generation: generation,
+                seal_attempt_id: seal_attempt_id.clone(),
+                role_evidence_plan_hash: role_evidence_plan
+                    .as_ref()
+                    .context("role reuse lacks its evidence plan")?
+                    .plan_hash
+                    .clone(),
+                planned_reused_roles,
+                projection_material_digests: role_reuse.projection_material_digests.clone(),
+                carried_binding: carried_binding.clone(),
+            })
+        })
+        .transpose()?;
+    if let Some(binding) = &role_reuse_binding {
+        private_artifacts.push((
+            "role_reuse_binding".to_owned(),
+            format!("{staging_prefix}/role-reuse-binding.json"),
+            encode_pretty_json(binding)?,
         ));
     }
     private_artifacts.sort_by(|left, right| left.1.cmp(&right.1));
@@ -2686,6 +2904,11 @@ pub async fn seal_provider_plan_with_mode(
     }
     if dry_run {
         fs::remove_dir_all(&staging_root)?;
+        let role_reuse_binding_sha256 = role_reuse_binding
+            .as_ref()
+            .map(encode_pretty_json)
+            .transpose()?
+            .map(|bytes| sha256_bytes(&bytes));
         return print_json(&json!({
             "status": "provider_plan_seal_dry_run",
             "run_id": contract.run_id,
@@ -2694,6 +2917,15 @@ pub async fn seal_provider_plan_with_mode(
             "provider_plan_hash": plan.plan_hash,
             "staged_manifest_sha256": prepared.manifest.manifest_sha256,
             "authority_side_effects": 0,
+            "carried_binding_provider_plan_hash": role_reuse_binding
+                .as_ref()
+                .and_then(|binding| binding.carried_binding.as_ref())
+                .map(|binding| binding.provider_plan_hash.clone()),
+            "skipped_generations": role_reuse_binding
+                .as_ref()
+                .and_then(|binding| binding.carried_binding.as_ref())
+                .map_or_else(Vec::new, |binding| binding.skipped_generations.clone()),
+            "role_reuse_binding_sha256": role_reuse_binding_sha256,
             "planned_sessions": prepared.record.session_ids,
             "planned_role_leases": prepared.record.role_lease_ids,
             "planned_work_items": prepared.record.work_item_ids,
@@ -2794,14 +3026,10 @@ pub async fn seal_provider_plan_with_mode(
         fs::rename(&staging_root, &published_root)?;
         if let Some(role_plan) = &prepared.role_evidence_plan {
             write_new_or_same_json(&report_root.join("role-evidence-plan.json"), role_plan)?;
-            materialize_accepted_prior_roles(
-                &suite,
-                &contract,
-                &plan,
-                role_plan,
-                &report_root,
-                &private_root,
-            )?;
+            let role_reuse = role_reuse_plan
+                .as_ref()
+                .context("provider seal role evidence lacks its reuse plan")?;
+            materialize_role_reuse(role_reuse, &plan)?;
         }
         write_new_or_same_json(&plan_path, &plan)?;
         Ok(())
@@ -4001,6 +4229,302 @@ fn published_provider_artifact_paths(
     Ok(paths)
 }
 
+async fn provider_dispatch_evidence(
+    config_path: &Path,
+    private_root: &Path,
+    run_id: &str,
+    call_ids: &[String],
+    invocation_ids: &[String],
+    role_lease_ids: &[String],
+) -> Result<ProviderDispatchEvidence> {
+    let root = crate::delegation_runtime::root_from_config(config_path);
+    let broker = crate::delegation_runtime::load_state(&root)?;
+    let provider_ledger = ProviderCallReservationOwner::new(&root).snapshot_read_only()?;
+    let idempotency_keys = call_ids
+        .iter()
+        .map(|call_id| format!("cognitive-field:{run_id}:{call_id}"))
+        .collect::<BTreeSet<_>>();
+    let expected_leases = role_lease_ids.iter().cloned().collect::<BTreeSet<_>>();
+    let runtime_store =
+        crate::host_runtime::supervised_process::daemon_operation_runtime_handle(config_path)?;
+    Ok(ProviderDispatchEvidence {
+        reservation_count: provider_ledger
+            .reservations
+            .iter()
+            .filter(|reservation| idempotency_keys.contains(&reservation.idempotency_key))
+            .count(),
+        result_count: broker
+            .agent_results
+            .iter()
+            .filter(|result| invocation_ids.contains(&result.invocation_id))
+            .count(),
+        journal_paths: matching_provider_journal_paths(&root, invocation_ids, call_ids)?,
+        artifact_paths: published_provider_artifact_paths(private_root, call_ids)?,
+        nonterminal_operation_ids: runtime_store
+            .list_nonterminal_checkpoints()
+            .await?
+            .into_iter()
+            .filter(|checkpoint| {
+                invocation_ids.iter().any(|id| {
+                    checkpoint.operation_id.contains(id)
+                        || checkpoint.invocation_id.as_deref() == Some(id.as_str())
+                }) || checkpoint
+                    .role_lease_id
+                    .as_ref()
+                    .is_some_and(|id| expected_leases.contains(id))
+            })
+            .map(|checkpoint| checkpoint.operation_id)
+            .collect(),
+    })
+}
+
+fn quarantined_candidate_plan(
+    quarantine_root: &Path,
+) -> Result<(PathBuf, CognitiveFieldProviderPlan)> {
+    let matches = recursive_files(quarantine_root)?
+        .into_iter()
+        .filter(|path| {
+            path.file_name()
+                .is_some_and(|name| name == "candidate-provider-plan.json")
+        })
+        .collect::<Vec<_>>();
+    ensure!(
+        matches.len() == 1,
+        "seal quarantine must contain exactly one candidate provider plan"
+    );
+    let candidate_path = matches[0].clone();
+    let relative = candidate_path
+        .strip_prefix(quarantine_root)
+        .context("quarantined candidate escaped its recovery root")?;
+    let tree_component = relative
+        .components()
+        .next()
+        .context("quarantined candidate has no tree component")?
+        .as_os_str();
+    let tree_root = quarantine_root.join(tree_component);
+    let manifest_path = quarantine_root.join(format!(
+        "{}-manifest.json",
+        tree_component.to_string_lossy()
+    ));
+    let manifest: Vec<SealArtifactEntry> = read_json(&manifest_path)?;
+    ensure!(
+        manifest == quarantine_tree_manifest(&tree_root)?,
+        "quarantined candidate tree differs from its recovery manifest"
+    );
+    let plan: CognitiveFieldProviderPlan = read_json(&candidate_path)?;
+    validate_provider_plan_hash(&plan)?;
+    Ok((candidate_path, plan))
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "carried role reuse is admitted only after one bounded proof over supersession, skipped seals, and live zero-dispatch evidence"
+)]
+async fn prove_carried_role_reuse_binding(
+    config_path: &Path,
+    private_root: &Path,
+    contract: &CognitiveFieldRunContract,
+    generation: u64,
+    carried_pair: &(String, OffsetDateTime),
+    projection_material_digests: &BTreeMap<String, String>,
+) -> Result<CarriedRoleReuseBinding> {
+    let supersession_root = private_root.join("superseded-seals");
+    ensure!(
+        supersession_root.is_dir(),
+        "carried role reuse has no published-seal supersession history"
+    );
+    let mut matches = Vec::new();
+    for path in fs::read_dir(&supersession_root)?
+        .map(|entry| entry.map(|entry| entry.path()))
+        .collect::<std::io::Result<Vec<_>>>()?
+    {
+        if path.extension().is_none_or(|extension| extension != "json") {
+            continue;
+        }
+        let record: PublishedSealSupersessionRecord = read_json(&path)?;
+        if record.run_id != contract.run_id
+            || record.recovery_state != SealRecoveryRecordState::Complete
+            || record.decision
+                != PublishedSealSupersessionDecision::SupersedePublishedSealRuntimeDrift
+        {
+            continue;
+        }
+        let quarantine_root = PathBuf::from(&record.quarantine_root);
+        let expected_root = private_root
+            .join("quarantine")
+            .join(seal_attempt_component(&contract.run_id, record.generation));
+        ensure!(
+            contract_path_matches(&expected_root, &record.quarantine_root),
+            "published supersession quarantine root differs from its deterministic identity"
+        );
+        let generation_root = quarantine_root.join(format!("generation-{}", record.generation));
+        ensure!(
+            quarantine_tree_manifest(&generation_root)? == record.published_manifest,
+            "published supersession generation differs from its immutable manifest"
+        );
+        let candidate_path = generation_root.join("candidate-provider-plan.json");
+        let candidate_bytes = fs::read(&candidate_path)?;
+        let public_bytes = fs::read(quarantine_root.join("public/provider-plan.json"))?;
+        ensure!(
+            candidate_bytes == public_bytes
+                && sha256_bytes(&candidate_bytes) == record.provider_plan_sha256
+                && sha256_bytes(&public_bytes) == record.public_plan_sha256
+                && record.published_manifest.iter().any(|entry| {
+                    entry.relative_path == "candidate-provider-plan.json"
+                        && entry.sha256 == record.provider_plan_sha256
+                        && entry.size_bytes
+                            == u64::try_from(candidate_bytes.len()).unwrap_or(u64::MAX)
+                }),
+            "published supersession provider plan is not digest-exact"
+        );
+        let plan: CognitiveFieldProviderPlan = serde_json::from_slice(&candidate_bytes)?;
+        validate_provider_plan_hash(&plan)?;
+        if plan.plan_hash == carried_pair.0 && plan.sealed_at == carried_pair.1 {
+            ensure!(
+                plan.run_id == contract.run_id
+                    && plan.contract_hash == contract.contract_hash
+                    && plan.seal_generation == record.generation
+                    && plan.seal_attempt_id.as_deref() == Some(record.seal_attempt_id.as_str())
+                    && record.replacement_generation == record.generation + 1,
+                "carried role reuse supersession lineage is mismatched"
+            );
+            matches.push((path, record, plan, generation_root));
+        }
+    }
+    ensure!(
+        matches.len() == 1,
+        "carried role reuse first binding is not uniquely proven by a completed supersession"
+    );
+    let (supersession_path, supersession, superseded_plan, superseded_root) =
+        matches.pop().context("missing carried supersession")?;
+    if superseded_root.join("role-reuse-binding.json").is_file() {
+        let prior: RoleReuseBinding = read_json(&superseded_root.join("role-reuse-binding.json"))?;
+        ensure!(
+            prior.projection_material_digests == *projection_material_digests,
+            "role reuse material differs from the prior sealed binding"
+        );
+    }
+    let superseded_call_ids = superseded_plan
+        .calls
+        .iter()
+        .map(|call| call.call_id.clone())
+        .collect::<Vec<_>>();
+    let superseded_invocations = superseded_call_ids
+        .iter()
+        .map(|call_id| format!("cognitive-field-{}-{call_id}", contract.run_id))
+        .collect::<Vec<_>>();
+    ensure!(
+        provider_dispatch_evidence(
+            config_path,
+            private_root,
+            &contract.run_id,
+            &superseded_call_ids,
+            &superseded_invocations,
+            &supersession.role_lease_ids,
+        )
+        .await?
+        .is_empty(),
+        "superseded first-binding generation has provider dispatch evidence"
+    );
+    let records = load_seal_records(private_root)?;
+    let mut skipped_generations = Vec::new();
+    let mut skipped_generation_abandon_refs = Vec::new();
+    for skipped in supersession.replacement_generation..generation {
+        let matching = records
+            .iter()
+            .filter(|record| record.run_id == contract.run_id && record.generation == skipped)
+            .collect::<Vec<_>>();
+        ensure!(
+            matching.len() == 1 && matching[0].state == ProviderPlanSealState::Abandoned,
+            "skipped replacement generation is not uniquely abandoned"
+        );
+        let seal_record = matching[0];
+        let abandon_ref = seal_record
+            .failure_ref
+            .as_deref()
+            .context("skipped replacement generation lacks an abandon reference")?;
+        ensure!(
+            abandon_ref.starts_with("abandoned-seals/"),
+            "skipped replacement generation was not abandoned pre-dispatch"
+        );
+        let abandon_path = private_relative_file(
+            private_root,
+            abandon_ref,
+            "skipped replacement abandon record",
+        )?;
+        let abandoned: AbandonedSealAttemptRecord = read_json(&abandon_path)?;
+        ensure!(
+            abandoned.schema_version == ABANDONED_SEAL_ATTEMPT_SCHEMA_VERSION
+                && abandoned.recovery_state == SealRecoveryRecordState::Complete
+                && abandoned.run_id == contract.run_id
+                && abandoned.generation == skipped
+                && abandoned.seal_attempt_id == seal_record.seal_attempt_id
+                && matches!(
+                    abandoned.failed_phase,
+                    ProviderPlanSealState::Staged | ProviderPlanSealState::Activated
+                )
+                && abandoned.replacement_generation == Some(skipped + 1)
+                && !private_root
+                    .join("sealed")
+                    .join(skipped.to_string())
+                    .exists(),
+            "skipped replacement abandon chain is incomplete or dispatch-capable"
+        );
+        let quarantine_root = private_root.join(&abandoned.quarantine_manifest_ref);
+        ensure!(
+            private_relative_ref(private_root, &quarantine_root)?
+                == abandoned.quarantine_manifest_ref,
+            "skipped replacement quarantine escaped its private root"
+        );
+        let (_candidate_path, skipped_plan) = quarantined_candidate_plan(&quarantine_root)?;
+        ensure!(
+            skipped_plan.run_id == contract.run_id
+                && skipped_plan.contract_hash == contract.contract_hash
+                && skipped_plan.seal_generation == skipped
+                && skipped_plan.seal_attempt_id.as_deref()
+                    == Some(seal_record.seal_attempt_id.as_str()),
+            "skipped replacement quarantined plan is mismatched"
+        );
+        let call_ids = skipped_plan
+            .calls
+            .iter()
+            .map(|call| call.call_id.clone())
+            .collect::<Vec<_>>();
+        let invocation_ids = call_ids
+            .iter()
+            .map(|call_id| format!("cognitive-field-{}-{call_id}", contract.run_id))
+            .collect::<Vec<_>>();
+        ensure!(
+            provider_dispatch_evidence(
+                config_path,
+                private_root,
+                &contract.run_id,
+                &call_ids,
+                &invocation_ids,
+                &abandoned.created_role_lease_ids,
+            )
+            .await?
+            .is_empty(),
+            "skipped replacement generation has provider dispatch evidence"
+        );
+        skipped_generations.push(skipped);
+        skipped_generation_abandon_refs.push(abandon_ref.to_owned());
+    }
+    ensure!(
+        supersession.replacement_generation + u64::try_from(skipped_generations.len())?
+            == generation,
+        "carried role reuse skipped-generation chain is not dense"
+    );
+    Ok(CarriedRoleReuseBinding {
+        provider_plan_hash: carried_pair.0.clone(),
+        recorded_at: carried_pair.1,
+        superseded_generation: supersession.generation,
+        supersession_record_ref: private_relative_ref(private_root, &supersession_path)?,
+        skipped_generations,
+        skipped_generation_abandon_refs,
+    })
+}
+
 #[allow(
     clippy::too_many_lines,
     reason = "published-seal inspection intentionally classifies every zero-dispatch and authority fence in one read-only pass"
@@ -4137,41 +4661,22 @@ async fn inspect_published_seal_supersession(
         .iter()
         .map(|call_id| format!("cognitive-field-{run_id}-{call_id}"))
         .collect::<Vec<_>>();
-    let provider_ledger = ProviderCallReservationOwner::new(&root).snapshot_read_only()?;
-    let idempotency_keys = call_ids
-        .iter()
-        .map(|call_id| format!("cognitive-field:{run_id}:{call_id}"))
-        .collect::<BTreeSet<_>>();
-    let provider_reservation_count = provider_ledger
-        .reservations
-        .iter()
-        .filter(|reservation| idempotency_keys.contains(&reservation.idempotency_key))
-        .count();
-    let provider_result_count = broker
-        .agent_results
-        .iter()
-        .filter(|result| invocation_ids.contains(&result.invocation_id))
-        .count();
-    let provider_journal_paths =
-        matching_provider_journal_paths(&root, &invocation_ids, &call_ids)?;
-    let provider_artifact_paths = published_provider_artifact_paths(private_root, &call_ids)?;
+    let dispatch_evidence = provider_dispatch_evidence(
+        config_path,
+        private_root,
+        run_id,
+        &call_ids,
+        &invocation_ids,
+        &seal_record.role_lease_ids,
+    )
+    .await?;
+    let provider_reservation_count = dispatch_evidence.reservation_count;
+    let provider_result_count = dispatch_evidence.result_count;
+    let provider_journal_paths = dispatch_evidence.journal_paths;
+    let provider_artifact_paths = dispatch_evidence.artifact_paths;
     let runtime_store =
         crate::host_runtime::supervised_process::daemon_operation_runtime_handle(config_path)?;
-    let nonterminal_operation_ids = runtime_store
-        .list_nonterminal_checkpoints()
-        .await?
-        .into_iter()
-        .filter(|checkpoint| {
-            invocation_ids.iter().any(|id| {
-                checkpoint.operation_id.contains(id)
-                    || checkpoint.invocation_id.as_deref() == Some(id.as_str())
-            }) || checkpoint
-                .role_lease_id
-                .as_ref()
-                .is_some_and(|id| expected_leases.contains(id))
-        })
-        .map(|checkpoint| checkpoint.operation_id)
-        .collect::<Vec<_>>();
+    let nonterminal_operation_ids = dispatch_evidence.nonterminal_operation_ids;
     let incomplete_seal_ids = runtime_store
         .load_incomplete_seal_staging()
         .await?
@@ -5589,6 +6094,11 @@ pub fn grade(report_root: &Path, private_root: &Path) -> Result<()> {
     } else {
         None
     };
+    let role_reuse_binding = provider_plan
+        .as_ref()
+        .map(|plan| load_validated_role_reuse_binding(plan, &report_root, &private_root))
+        .transpose()?
+        .flatten();
     let provider_invocations = load_provider_projections(&report_root)?;
     let actual_provider_calls = provider_invocations
         .values()
@@ -5611,7 +6121,7 @@ pub fn grade(report_root: &Path, private_root: &Path) -> Result<()> {
         planned == recorded
             && actual_provider_calls == usize::from(plan.planned_provider_calls)
             && actual_smoke_calls == usize::from(plan.planned_smoke_calls)
-            && plan.planned_reused_roles <= 1
+            && (plan.planned_reused_roles == 0 || role_reuse_binding.is_some())
             && actual_provider_calls <= usize::from(contract.hard_provider_call_cap)
     });
 
@@ -5681,6 +6191,7 @@ pub fn grade(report_root: &Path, private_root: &Path) -> Result<()> {
                     .as_ref()
                     .context("provider plan disappeared")?,
                 role_plan.as_ref(),
+                role_reuse_binding.as_ref(),
                 &provider_invocations,
                 &evidence_root,
                 &execution,
@@ -5818,10 +6329,112 @@ fn load_provider_projections(
     Ok(projections)
 }
 
+fn load_validated_role_reuse_binding(
+    plan: &CognitiveFieldProviderPlan,
+    report_root: &Path,
+    private_root: &Path,
+) -> Result<Option<RoleReuseBinding>> {
+    if plan.planned_reused_roles == 0 {
+        return Ok(None);
+    }
+    ensure!(
+        plan.planned_reused_roles == 4,
+        "Task-02R2 role reuse binding requires exactly four accepted roles"
+    );
+    let expected_attempt_id = format!(
+        "provider-plan-seal:{}",
+        seal_attempt_component(&plan.run_id, plan.seal_generation)
+    );
+    ensure!(
+        plan.seal_attempt_id.as_deref() == Some(expected_attempt_id.as_str()),
+        "provider plan seal attempt id does not match its run and generation"
+    );
+    let sealed_root = private_root
+        .join("sealed")
+        .join(plan.seal_generation.to_string());
+    let binding_path = sealed_root.join("role-reuse-binding.json");
+    let binding_bytes = fs::read(&binding_path)
+        .with_context(|| format!("read sealed role reuse binding {}", binding_path.display()))?;
+    let binding: RoleReuseBinding = serde_json::from_slice(&binding_bytes)?;
+    ensure!(
+        binding.schema_version == ROLE_REUSE_BINDING_SCHEMA_VERSION
+            && binding.run_id == plan.run_id
+            && binding.contract_hash == plan.contract_hash
+            && binding.seal_generation == plan.seal_generation
+            && binding.seal_attempt_id == expected_attempt_id
+            && plan.role_evidence_plan_hash.as_deref()
+                == Some(binding.role_evidence_plan_hash.as_str())
+            && binding.planned_reused_roles == plan.planned_reused_roles,
+        "sealed role reuse binding differs from the provider plan"
+    );
+
+    let manifest_path = sealed_root.join("artifact-manifest.json");
+    let manifest: SealArtifactManifest = read_json(&manifest_path)?;
+    ensure!(
+        manifest.schema_version == SEAL_ARTIFACT_MANIFEST_SCHEMA_VERSION
+            && manifest.run_id == plan.run_id
+            && manifest.generation == plan.seal_generation
+            && manifest.seal_attempt_id == expected_attempt_id
+            && seal_manifest_hash(&manifest)? == manifest.manifest_sha256
+            && plan.runtime_manifest_sha256.as_deref() == Some(manifest.manifest_sha256.as_str())
+            && plan.artifact_manifest_sha256.as_deref() == Some(manifest.manifest_sha256.as_str()),
+        "sealed role reuse manifest differs from the provider plan"
+    );
+    let expected_relative_path = format!("sealed/{}/role-reuse-binding.json", plan.seal_generation);
+    let binding_entries = manifest
+        .entries
+        .iter()
+        .filter(|entry| entry.logical_kind == "role_reuse_binding")
+        .collect::<Vec<_>>();
+    ensure!(
+        binding_entries.len() == 1
+            && binding_entries[0].relative_path == expected_relative_path
+            && binding_entries[0].sha256 == sha256_bytes(&binding_bytes)
+            && binding_entries[0].size_bytes
+                == u64::try_from(binding_bytes.len()).context("role reuse binding is too large")?,
+        "sealed manifest does not bind exactly one role reuse binding artifact"
+    );
+
+    let evidence_root = report_root.join("evidence");
+    let mut material_digests = BTreeMap::new();
+    for path in recursive_files(&evidence_root)? {
+        if path.file_name().and_then(|name| name.to_str()) != Some("reused-roles.json") {
+            continue;
+        }
+        let projections: Vec<CoreRoleReuseProjection> = read_json(&path)?;
+        let relative_root = path
+            .parent()
+            .context("role reuse projection has no evidence directory")?
+            .strip_prefix(&evidence_root)
+            .context("role reuse projection escaped the report evidence directory")?
+            .to_string_lossy()
+            .replace('\\', "/");
+        ensure!(
+            material_digests
+                .insert(
+                    relative_root,
+                    sha256_bytes(&serde_json::to_vec(&role_reuse_material(&projections))?),
+                )
+                .is_none(),
+            "duplicate role reuse projection evidence directory"
+        );
+    }
+    ensure!(
+        material_digests == binding.projection_material_digests,
+        "role reuse projection material differs from its sealed binding"
+    );
+    ensure!(
+        !material_digests.is_empty(),
+        "role reuse binding has no materialized projection evidence"
+    );
+    Ok(Some(binding))
+}
+
 #[allow(clippy::too_many_lines)]
 fn provider_role_errors(
     plan: &CognitiveFieldProviderPlan,
     role_plan: Option<&CoreRoleEvidencePlan>,
+    role_reuse_binding: Option<&RoleReuseBinding>,
     invocations: &BTreeMap<String, CognitiveFieldProviderProjection>,
     evidence_root: &Path,
     execution: &CognitiveFieldExecutionKey,
@@ -5913,10 +6526,22 @@ fn provider_role_errors(
                     role,
                     &projection,
                 );
+                let first_binding_matches = role_reuse_binding.is_some_and(|binding| {
+                    binding.carried_binding.as_ref().map_or_else(
+                        || {
+                            projection.provider_plan_hash == plan.plan_hash
+                                && projection.recorded_at == plan.sealed_at
+                        },
+                        |carried| {
+                            projection.provider_plan_hash == carried.provider_plan_hash
+                                && projection.recorded_at == carried.recorded_at
+                        },
+                    )
+                });
                 if projection.schema_version != CORE_ROLE_REUSE_PROJECTION_SCHEMA_VERSION
                     || projection.run_id != plan.run_id
                     || projection.contract_hash != plan.contract_hash
-                    || projection.provider_plan_hash != plan.plan_hash
+                    || !first_binding_matches
                     || projection.case_id != execution.case_id
                     || plan.planned_reused_roles != 4
                     || plan.role_evidence_plan_hash.is_none()
@@ -7827,15 +8452,57 @@ fn reused_role_deterministic_binding_is_valid(
     .is_ok()
 }
 
-#[allow(clippy::too_many_lines)]
-fn materialize_accepted_prior_roles(
+fn role_reuse_projection_key(
+    projection: &CoreRoleReuseProjection,
+) -> (CognitiveFieldRole, &str, &str, &str) {
+    (
+        projection.role,
+        projection.source_run_id.as_str(),
+        projection.source_call_id.as_str(),
+        projection.case_id.as_str(),
+    )
+}
+
+fn plan_new_or_same(
+    writes: &mut BTreeMap<PathBuf, Vec<u8>>,
+    path: PathBuf,
+    bytes: Vec<u8>,
+) -> Result<()> {
+    if path.is_file() {
+        ensure!(
+            fs::read(&path)? == bytes,
+            "sealed output already exists with different content: {}",
+            path.display()
+        );
+    }
+    match writes.entry(path) {
+        std::collections::btree_map::Entry::Vacant(entry) => {
+            entry.insert(bytes);
+        }
+        std::collections::btree_map::Entry::Occupied(entry) => {
+            ensure!(
+                *entry.get() == bytes,
+                "role reuse planned conflicting bytes"
+            );
+        }
+    }
+    Ok(())
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "role reuse planning validates every accepted source and precomputes an immutable write set"
+)]
+fn plan_role_reuse(
     suite: &CognitiveFieldSuite,
     contract: &CognitiveFieldRunContract,
-    provider_plan: &CognitiveFieldProviderPlan,
     role_plan: &CoreRoleEvidencePlan,
     report_root: &Path,
     private_root: &Path,
-) -> Result<()> {
+    initial_binding: Option<(&str, OffsetDateTime)>,
+) -> Result<RoleReusePlan> {
+    let mut writes = BTreeMap::new();
+    let mut deterministic_guards = BTreeMap::new();
     let mut projections_by_execution = BTreeMap::<PathBuf, Vec<CoreRoleReuseProjection>>::new();
     for source in prior_role_sources(&role_plan.sources) {
         let verified =
@@ -7876,25 +8543,31 @@ fn materialize_accepted_prior_roles(
             .collect::<Vec<_>>();
         let reuse_root = private_root.join("reused").join(artifact_sha256);
         for (execution, bytes) in &verified.outputs {
-            write_new_or_same(
-                &reuse_root.join(format!(
+            plan_new_or_same(
+                &mut writes,
+                reuse_root.join(format!(
                     "{}-{}.json",
                     condition_name(execution.memory_condition),
                     role_name(*role),
                 )),
-                bytes,
+                bytes.clone(),
             )?;
         }
         if let Some(candidate_diff) = &verified.candidate_diff {
-            write_new_or_same(&reuse_root.join("candidate.diff"), candidate_diff)?;
+            plan_new_or_same(
+                &mut writes,
+                reuse_root.join("candidate.diff"),
+                candidate_diff.clone(),
+            )?;
         }
-        write_new_or_same_json(
-            &reuse_root.join("source-private-root.json"),
-            &json!({
+        plan_new_or_same(
+            &mut writes,
+            reuse_root.join("source-private-root.json"),
+            encode_pretty_json(&json!({
                 "source_private_root_sha256":
                     sha256_bytes(canonical_path(&verified.source_private_root).as_bytes()),
                 "source_run_id": source_run_id,
-            }),
+            }))?,
         )?;
         let mut source_deterministic_bindings = Vec::new();
         if *role == CognitiveFieldRole::CodexJudge {
@@ -7913,14 +8586,12 @@ fn materialize_accepted_prior_roles(
                 );
                 let equivalence =
                     deterministic_equivalence_record(&current, &source_report.report)?;
-                write_new_or_same(
-                    &evidence_root.join("source-deterministic.json"),
-                    &source_report.bytes,
+                plan_new_or_same(
+                    &mut writes,
+                    evidence_root.join("source-deterministic.json"),
+                    source_report.bytes.clone(),
                 )?;
-                ensure!(
-                    fs::read(&current_path)? == current_bytes,
-                    "reused Judge materialization changed current deterministic truth"
-                );
+                deterministic_guards.insert(current_path, current_bytes);
                 source_deterministic_bindings.push(CoreRoleSourceDeterministicBinding {
                     execution: source_report.execution.clone(),
                     source_report_hash: source_report.report.report_hash.clone(),
@@ -7941,7 +8612,8 @@ fn materialize_accepted_prior_roles(
             schema_version: CORE_ROLE_REUSE_PROJECTION_SCHEMA_VERSION.to_owned(),
             run_id: contract.run_id.clone(),
             contract_hash: contract.contract_hash.clone(),
-            provider_plan_hash: provider_plan.plan_hash.clone(),
+            provider_plan_hash: initial_binding
+                .map_or_else(String::new, |binding| binding.0.to_owned()),
             source_run_id: source_run_id.clone(),
             source_call_id: source_call_id.clone(),
             role: *role,
@@ -7962,7 +8634,7 @@ fn materialize_accepted_prior_roles(
             worktree_diff_sha256: worktree_diff_sha256.clone(),
             outputs,
             source_deterministic_bindings,
-            recorded_at: provider_plan.sealed_at,
+            recorded_at: initial_binding.map_or(OffsetDateTime::UNIX_EPOCH, |binding| binding.1),
         };
         for (execution, bytes) in verified.outputs {
             let evidence_root = report_root
@@ -8014,19 +8686,121 @@ fn materialize_accepted_prior_roles(
                     "judge.json"
                 }
             };
-            write_new_or_same(&evidence_root.join(target), &bytes)?;
+            plan_new_or_same(&mut writes, evidence_root.join(target), bytes)?;
             projections_by_execution
                 .entry(evidence_root)
                 .or_default()
                 .push(projection.clone());
         }
     }
-    for (evidence_root, mut projections) in projections_by_execution {
+    let existing_projection_roots = projections_by_execution
+        .keys()
+        .filter(|root| root.join("reused-roles.json").is_file())
+        .count();
+    ensure!(
+        existing_projection_roots == 0
+            || existing_projection_roots == projections_by_execution.len(),
+        "role reuse projections are only partially materialized"
+    );
+    let mut carried_pair = None;
+    let mut projection_material_digests = BTreeMap::new();
+    for (evidence_root, projections) in &mut projections_by_execution {
         projections.sort_by(|left, right| {
             (left.role, left.source_call_id.as_str())
                 .cmp(&(right.role, right.source_call_id.as_str()))
         });
+        let reuse_path = evidence_root.join("reused-roles.json");
+        if reuse_path.is_file() {
+            let existing_bytes = fs::read(&reuse_path)?;
+            let mut existing: Vec<CoreRoleReuseProjection> =
+                serde_json::from_slice(&existing_bytes)?;
+            existing.sort_by(|left, right| {
+                (left.role, left.source_call_id.as_str())
+                    .cmp(&(right.role, right.source_call_id.as_str()))
+            });
+            ensure!(
+                existing.len() == projections.len()
+                    && existing
+                        .iter()
+                        .zip(projections.iter())
+                        .all(|(left, right)| {
+                            role_reuse_projection_key(left) == role_reuse_projection_key(right)
+                        }),
+                "existing role reuse projection set is not a bijective carry-forward"
+            );
+            for (prior, fresh) in existing.iter().zip(projections.iter_mut()) {
+                ensure!(
+                    prior.schema_version == CORE_ROLE_REUSE_PROJECTION_SCHEMA_VERSION
+                        && prior.run_id == contract.run_id
+                        && prior.contract_hash == contract.contract_hash,
+                    "existing role reuse projection scope differs from the current contract"
+                );
+                let pair = (prior.provider_plan_hash.clone(), prior.recorded_at);
+                if let Some(expected) = &carried_pair {
+                    ensure!(
+                        *expected == pair,
+                        "role reuse projections contain multiple first-binding identities"
+                    );
+                } else {
+                    carried_pair = Some(pair.clone());
+                }
+                fresh.provider_plan_hash = pair.0;
+                fresh.recorded_at = pair.1;
+            }
+            ensure!(
+                existing == *projections && encode_pretty_json(projections)? == existing_bytes,
+                "existing role reuse projection differs outside its first-binding fields"
+            );
+        }
+        let relative_root = evidence_root
+            .strip_prefix(report_root.join("evidence"))
+            .context("role reuse evidence root escaped the report evidence directory")?
+            .to_string_lossy()
+            .replace('\\', "/");
+        projection_material_digests.insert(
+            relative_root,
+            sha256_bytes(&serde_json::to_vec(&role_reuse_material(projections))?),
+        );
+    }
+    if let (Some(pair), Some(initial)) = (&carried_pair, initial_binding)
+        && pair.0 == initial.0
+        && pair.1 == initial.1
+    {
+        carried_pair = None;
+    }
+    Ok(RoleReusePlan {
+        writes,
+        projections_by_root: projections_by_execution,
+        deterministic_guards,
+        projection_material_digests,
+        carried_pair,
+    })
+}
+
+fn materialize_role_reuse(
+    role_reuse: &RoleReusePlan,
+    provider_plan: &CognitiveFieldProviderPlan,
+) -> Result<()> {
+    for (path, bytes) in &role_reuse.writes {
+        write_new_or_same(path, bytes)?;
+    }
+    for (evidence_root, planned) in &role_reuse.projections_by_root {
+        let mut projections = planned.clone();
+        for projection in &mut projections {
+            if projection.provider_plan_hash.is_empty() {
+                projection
+                    .provider_plan_hash
+                    .clone_from(&provider_plan.plan_hash);
+                projection.recorded_at = provider_plan.sealed_at;
+            }
+        }
         write_new_or_same_json(&evidence_root.join("reused-roles.json"), &projections)?;
+    }
+    for (path, bytes) in &role_reuse.deterministic_guards {
+        ensure!(
+            fs::read(path)? == *bytes,
+            "reused Judge materialization changed current deterministic truth"
+        );
     }
     Ok(())
 }
@@ -8734,6 +9508,15 @@ fn provider_plan_without_hash(plan: &CognitiveFieldProviderPlan) -> CognitiveFie
     material
 }
 
+fn role_reuse_material(projections: &[CoreRoleReuseProjection]) -> Vec<CoreRoleReuseProjection> {
+    let mut material = projections.to_vec();
+    for projection in &mut material {
+        projection.provider_plan_hash.clear();
+        projection.recorded_at = OffsetDateTime::UNIX_EPOCH;
+    }
+    material
+}
+
 fn git_commit(repository: &Path) -> Result<String> {
     let output = Command::new("git")
         .args(["-C"])
@@ -8960,21 +9743,24 @@ mod tests {
         LEGACY_WORKER_SOURCE_RUN_ID, LegacyEvidenceAdmissionRecord, ProviderPlanSealRecord,
         ProviderPlanSealState, PublishedSealRuntimeComparison, PublishedSealSupersessionDecision,
         PublishedSealSupersessionRecord, READER_SCHEMA_JSON_PLACEHOLDER,
-        READER_SCHEMA_SHA256_PLACEHOLDER, SealRecoveryDecision, SealRecoveryRecordState,
-        SealedPromptBinding, StagedSealAuthority, abandon_provider_seal, canonical_path,
-        codex_cognitive_runtime_contract, cognitive_external_execution_request,
-        deterministic_equivalence_record, execution_conditions, generated_oracle,
-        governor_runtime_drift_fields, inspect_seal_recovery, load_seal_records,
+        READER_SCHEMA_SHA256_PLACEHOLDER, ROLE_REUSE_BINDING_SCHEMA_VERSION, RoleReuseBinding,
+        SEAL_ARTIFACT_MANIFEST_SCHEMA_VERSION, SealArtifactEntry, SealArtifactManifest,
+        SealRecoveryDecision, SealRecoveryRecordState, SealedPromptBinding, StagedSealAuthority,
+        abandon_provider_seal, canonical_path, codex_cognitive_runtime_contract,
+        cognitive_external_execution_request, deterministic_equivalence_record, encode_pretty_json,
+        execution_conditions, generated_oracle, governor_runtime_drift_fields,
+        inspect_seal_recovery, load_seal_records, load_validated_role_reuse_binding,
         persist_published_supersession_record, provider_compatible_reader_schema,
         provider_plan_seal_response, provider_plan_without_hash, record_provider, recover_seal,
         render_provider_contract, render_reader_prompt, resolve_judge_deterministic_binding,
-        resume_published_seal_supersession, role_schema_contracts, schema_validation_projection,
-        seal_attempt_component, seal_provider_runtime_contract, sha256_bytes,
-        stage_artifacts_with_cleanup, validate_deterministic_receipt,
-        validate_governor_product_provenance, validate_json_schema_instance,
-        validate_legacy_evidence_admission_record, validate_provider_calls,
-        validate_provider_calls_with_sources, validate_provider_receipt_envelope,
-        validate_reader_output, write_new_or_same_json, write_seal_record,
+        resume_published_seal_supersession, role_reuse_material, role_schema_contracts,
+        schema_validation_projection, seal_attempt_component, seal_manifest_hash,
+        seal_provider_runtime_contract, sha256_bytes, stage_artifacts_with_cleanup,
+        validate_deterministic_receipt, validate_governor_product_provenance,
+        validate_json_schema_instance, validate_legacy_evidence_admission_record,
+        validate_provider_calls, validate_provider_calls_with_sources,
+        validate_provider_receipt_envelope, validate_reader_output, write_new_or_same_json,
+        write_seal_record,
     };
     use eliot_engine::{CognitiveFieldGradingService, computed_provider_runtime_contract_sha256};
     use eliot_types::{
@@ -9504,6 +10290,140 @@ mod tests {
             Some("provider_plan_sealed")
         );
         assert!(first.get("idempotent").is_none());
+        Ok(())
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn role_reuse_binding_is_manifest_bound_and_rejects_material_drift()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root =
+            std::env::temp_dir().join(format!("eliot-role-reuse-binding-{}", Uuid::new_v4()));
+        let report_root = root.join("report");
+        let private_root = root.join("private");
+        fs::create_dir_all(report_root.join("evidence/U03/treatment"))?;
+        fs::create_dir_all(private_root.join("sealed/5"))?;
+        let report_root = fs::canonicalize(report_root)?;
+        let private_root = fs::canonicalize(private_root)?;
+        let recorded_at = OffsetDateTime::from_unix_timestamp(1_700_000_000)?;
+        let execution = CognitiveFieldExecutionKey {
+            case_id: "U03".to_owned(),
+            memory_condition: CognitiveMemoryCondition::Treatment,
+        };
+        let projection = CoreRoleReuseProjection {
+            schema_version: CORE_ROLE_REUSE_PROJECTION_SCHEMA_VERSION.to_owned(),
+            run_id: "run006".to_owned(),
+            contract_hash: "a".repeat(64),
+            provider_plan_hash: "b".repeat(64),
+            source_run_id: "run005".to_owned(),
+            source_call_id: "reader-call".to_owned(),
+            role: CognitiveFieldRole::UnderstandingReader,
+            case_id: execution.case_id.clone(),
+            provider_session_id: "reader-session".to_owned(),
+            provider_receipt_ref: "receipt:reader".to_owned(),
+            provider_executable_sha256: "c".repeat(64),
+            output_schema_sha256: "d".repeat(64),
+            artifact_sha256: "e".repeat(64),
+            prompt_sha256: "f".repeat(64),
+            oracle_sha256: "1".repeat(64),
+            runtime_contract_sha256: "2".repeat(64),
+            input_artifact_sha256s: vec!["3".repeat(64)],
+            deterministic_report_sha256s: vec!["4".repeat(64)],
+            executions: vec![execution.clone()],
+            deterministic_receipt_refs: vec!["receipt:deterministic".to_owned()],
+            contamination_receipt_ref: "receipt:contamination".to_owned(),
+            worktree_diff_sha256: None,
+            outputs: vec![CognitiveFieldProviderOutputProjection {
+                execution,
+                output_sha256: "5".repeat(64),
+            }],
+            source_deterministic_bindings: Vec::new(),
+            recorded_at,
+        };
+        let material_sha256 = sha256_bytes(&serde_json::to_vec(&role_reuse_material(
+            std::slice::from_ref(&projection),
+        ))?);
+        let mut rebound = projection.clone();
+        rebound.provider_plan_hash = "6".repeat(64);
+        rebound.recorded_at = recorded_at + time::Duration::seconds(1);
+        assert_eq!(
+            material_sha256,
+            sha256_bytes(&serde_json::to_vec(&role_reuse_material(&[rebound]))?)
+        );
+        write_new_or_same_json(
+            &report_root.join("evidence/U03/treatment/reused-roles.json"),
+            &vec![projection.clone()],
+        )?;
+
+        let role_plan_hash = "7".repeat(64);
+        let attempt_id = format!("provider-plan-seal:{}", seal_attempt_component("run006", 5));
+        let binding = RoleReuseBinding {
+            schema_version: ROLE_REUSE_BINDING_SCHEMA_VERSION.to_owned(),
+            run_id: "run006".to_owned(),
+            contract_hash: "a".repeat(64),
+            seal_generation: 5,
+            seal_attempt_id: attempt_id.clone(),
+            role_evidence_plan_hash: role_plan_hash.clone(),
+            planned_reused_roles: 4,
+            projection_material_digests: BTreeMap::from([(
+                "U03/treatment".to_owned(),
+                material_sha256,
+            )]),
+            carried_binding: None,
+        };
+        let binding_bytes = encode_pretty_json(&binding)?;
+        fs::write(
+            private_root.join("sealed/5/role-reuse-binding.json"),
+            &binding_bytes,
+        )?;
+        let mut manifest = SealArtifactManifest {
+            schema_version: SEAL_ARTIFACT_MANIFEST_SCHEMA_VERSION.to_owned(),
+            seal_attempt_id: attempt_id.clone(),
+            run_id: "run006".to_owned(),
+            generation: 5,
+            entries: vec![SealArtifactEntry {
+                logical_kind: "role_reuse_binding".to_owned(),
+                relative_path: "sealed/5/role-reuse-binding.json".to_owned(),
+                sha256: sha256_bytes(&binding_bytes),
+                size_bytes: u64::try_from(binding_bytes.len())?,
+            }],
+            manifest_sha256: String::new(),
+        };
+        manifest.manifest_sha256 = seal_manifest_hash(&manifest)?;
+        write_new_or_same_json(
+            &private_root.join("sealed/5/artifact-manifest.json"),
+            &manifest,
+        )?;
+        let plan = CognitiveFieldProviderPlan {
+            schema_version: COGNITIVE_FIELD_PROVIDER_PLAN_SCHEMA_VERSION.to_owned(),
+            run_id: "run006".to_owned(),
+            contract_hash: "a".repeat(64),
+            calls: Vec::new(),
+            planned_provider_calls: 0,
+            planned_smoke_calls: 0,
+            planned_reused_roles: 4,
+            role_evidence_plan_hash: Some(role_plan_hash),
+            seal_attempt_id: Some(attempt_id),
+            seal_generation: 5,
+            authority_activation_ref: None,
+            runtime_manifest_sha256: Some(manifest.manifest_sha256.clone()),
+            artifact_manifest_sha256: Some(manifest.manifest_sha256.clone()),
+            plan_hash: "b".repeat(64),
+            sealed_at: recorded_at,
+        };
+        assert_eq!(
+            load_validated_role_reuse_binding(&plan, &report_root, &private_root)?,
+            Some(binding)
+        );
+
+        let mut drifted = projection;
+        drifted.prompt_sha256 = "8".repeat(64);
+        fs::write(
+            report_root.join("evidence/U03/treatment/reused-roles.json"),
+            encode_pretty_json(&vec![drifted])?,
+        )?;
+        assert!(load_validated_role_reuse_binding(&plan, &report_root, &private_root).is_err());
+        fs::remove_dir_all(root)?;
         Ok(())
     }
 

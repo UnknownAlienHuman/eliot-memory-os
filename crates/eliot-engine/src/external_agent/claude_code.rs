@@ -24,7 +24,6 @@ pub fn build_claude_code_command(
 ) -> Result<ProviderCommandPlan, EngineError> {
     if input.requested_model.trim().is_empty()
         || input.mcp_config_path.trim().is_empty()
-        || input.allowed_tools.is_empty()
         || input.max_turns == 0
         || input.prompt.trim().is_empty()
     {
@@ -43,9 +42,10 @@ pub fn build_claude_code_command(
         "--mcp-config".to_owned(),
         input.mcp_config_path.clone(),
         "--strict-mcp-config".to_owned(),
-        "--allowedTools".to_owned(),
-        input.allowed_tools.join(","),
     ];
+    if !input.allowed_tools.is_empty() {
+        argv.extend(["--allowedTools".to_owned(), input.allowed_tools.join(",")]);
+    }
     if !input.denied_tools.is_empty() {
         argv.extend(["--disallowedTools".to_owned(), input.denied_tools.join(",")]);
     }

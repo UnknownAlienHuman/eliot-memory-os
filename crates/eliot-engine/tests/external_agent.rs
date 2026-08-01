@@ -93,6 +93,9 @@ fn claude_command_and_terminal_parser_are_exact_and_fail_closed() -> TestResult 
         1
     );
     assert!(plan.argv.iter().any(|arg| arg == "--strict-mcp-config"));
+    assert!(plan.argv.windows(2).any(|pair| {
+        pair[0] == "--allowedTools" && pair[1] == "mcp__eliot-governor__current_state"
+    }));
     assert!(plan.argv.iter().any(|arg| arg == "--disallowedTools"));
     assert!(!plan.argv.iter().any(|arg| arg.contains("Claude.exe")));
 
@@ -109,6 +112,49 @@ fn claude_command_and_terminal_parser_are_exact_and_fail_closed() -> TestResult 
     assert!(parse_claude_code_stream(unknown.as_bytes(), "claude-opus-5", &schema).is_err());
     let wrong_schema = stream.replace("\"ready\"", "\"not-ready\"");
     assert!(parse_claude_code_stream(wrong_schema.as_bytes(), "claude-opus-5", &schema).is_err());
+    Ok(())
+}
+
+#[test]
+fn claude_command_accepts_zero_tool_profile_without_ambiguous_empty_argument() -> TestResult {
+    let input = ClaudeCodeCommandInput {
+        requested_model: "claude-opus-5".to_owned(),
+        output_schema: json!({"type": "object"}),
+        mcp_config_path: r"C:\runtime\mcp.json".to_owned(),
+        allowed_tools: Vec::new(),
+        denied_tools: vec!["Bash".to_owned()],
+        max_turns: 2,
+        prompt: "Return the schema-valid result without tools.".to_owned(),
+    };
+    let plan = build_claude_code_command(&input)?;
+    assert!(!plan.argv.iter().any(|arg| arg == "--allowedTools"));
+    assert!(plan.argv.iter().all(|arg| !arg.is_empty()));
+    assert!(plan.argv.iter().any(|arg| arg == "--strict-mcp-config"));
+    assert_eq!(
+        plan.argv
+            .windows(2)
+            .filter(|pair| pair[0] == "--mcp-config")
+            .count(),
+        1
+    );
+    assert!(
+        plan.argv
+            .windows(2)
+            .any(|pair| { pair[0] == "--disallowedTools" && pair[1] == "Bash" })
+    );
+
+    let mut incomplete = input.clone();
+    incomplete.requested_model.clear();
+    assert!(build_claude_code_command(&incomplete).is_err());
+    incomplete = input.clone();
+    incomplete.mcp_config_path.clear();
+    assert!(build_claude_code_command(&incomplete).is_err());
+    incomplete = input.clone();
+    incomplete.max_turns = 0;
+    assert!(build_claude_code_command(&incomplete).is_err());
+    incomplete = input;
+    incomplete.prompt.clear();
+    assert!(build_claude_code_command(&incomplete).is_err());
     Ok(())
 }
 
