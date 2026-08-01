@@ -597,13 +597,14 @@ fn raw_agy_mcp_not_exposed() {
 
 #[test]
 fn agy_mcp_audit_does_not_expose_raw_tools() {
-    assert!(AntigravityMcpBoundaryService.exposes_only_governed(&[
+    let catalog_tools = [
         "eliot_antigravity_visibility",
         "eliot_antigravity_mcp_status",
         "eliot_antigravity_plugin_status",
         "eliot_antigravity_live_smoke_status",
         "eliot_antigravity_real_report",
-    ]));
+    ];
+    assert!(AntigravityMcpBoundaryService.exposes_only_governed(&catalog_tools, &catalog_tools));
 }
 
 #[test]

@@ -15,7 +15,7 @@ use super::{
     worktree_review_schema, worktree_status_schema,
 };
 use anyhow::{Context as _, Result};
-use eliot_types::ClaudeSurface;
+use eliot_types::{ClaudeSurface, ProviderMcpToolProfileBinding};
 use serde_json::{Value, json};
 
 pub(super) fn prompt_definitions() -> Vec<Value> {
@@ -564,7 +564,19 @@ pub(crate) fn claude_surface_catalog(surface: ClaudeSurface) -> Value {
     })
 }
 
-pub(super) fn tool_definitions_for_profile(profile: McpAccessProfile) -> Vec<Value> {
+pub(crate) fn provider_mcp_tool_profile(
+    profile: McpAccessProfile,
+) -> ProviderMcpToolProfileBinding {
+    let mut tool_names = tool_definitions_for_profile(profile)
+        .into_iter()
+        .filter_map(|tool| tool.get("name").and_then(Value::as_str).map(str::to_owned))
+        .collect::<Vec<_>>();
+    tool_names.sort();
+    tool_names.dedup();
+    ProviderMcpToolProfileBinding::new(profile.as_str(), tool_names)
+}
+
+pub(crate) fn tool_definitions_for_profile(profile: McpAccessProfile) -> Vec<Value> {
     tool_definitions()
         .into_iter()
         .filter_map(|mut definition| {

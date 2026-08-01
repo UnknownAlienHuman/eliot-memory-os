@@ -171,14 +171,19 @@ impl DelegationBudgetService {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProviderCallCampaignRequest {
+    pub campaign_id: String,
+    pub max_calls: u32,
+    pub closed: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProviderCallReservationRequest {
     pub campaign_id: String,
     pub task_id: TaskId,
     pub provider: String,
     pub idempotency_key: String,
     pub gate_decision_ref: String,
-    pub max_calls: u32,
-    pub campaign_closed: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -199,6 +204,52 @@ impl ProviderCallReservationOwner {
         Self { root: root.into() }
     }
 
+    pub fn open_campaign(
+        &self,
+        request: ProviderCallCampaignRequest,
+    ) -> Result<ProviderCallBudgetState, EngineError> {
+        if request.campaign_id.trim().is_empty() {
+            return Err(rejected("provider campaign ID must not be empty"));
+        }
+        if request.max_calls == 0 {
+            return Err(rejected(
+                "provider call budget must allow at least one call",
+            ));
+        }
+        self.mutate(|ledger| {
+            if let Some(budget) = ledger
+                .budgets
+                .iter_mut()
+                .find(|budget| budget.campaign_id == request.campaign_id)
+            {
+                if budget.max_calls != request.max_calls {
+                    return Err(rejected("provider call budget maximum is immutable"));
+                }
+                if request.closed && !budget.closed {
+                    budget.closed = true;
+                    budget.revision = budget.revision.saturating_add(1);
+                    budget.updated_at = OffsetDateTime::now_utc();
+                }
+                return Ok(budget.clone());
+            }
+            let budget = ProviderCallBudgetState {
+                campaign_id: request.campaign_id,
+                schema_version: "provider-call-campaign-v1".to_owned(),
+                max_calls: request.max_calls,
+                next_slot_index: 1,
+                reserved_slots: 0,
+                dispatched_slots: 0,
+                terminal_slots: 0,
+                remaining_calls: request.max_calls,
+                revision: 0,
+                closed: request.closed,
+                updated_at: OffsetDateTime::now_utc(),
+            };
+            ledger.budgets.push(budget.clone());
+            Ok(budget)
+        })
+    }
+
     pub fn reserve(
         &self,
         request: ProviderCallReservationRequest,
@@ -212,8 +263,8 @@ impl ProviderCallReservationOwner {
                     existing.clone(),
                 ));
             }
-            let budget_index = ensure_provider_call_budget(ledger, &request)?;
-            if request.campaign_closed || ledger.budgets[budget_index].closed {
+            let budget_index = provider_call_budget_index(ledger, &request.campaign_id)?;
+            if ledger.budgets[budget_index].closed {
                 return Ok(ProviderCallReservationDecision::CampaignClosed);
             }
             refresh_provider_call_budget(ledger, budget_index);
@@ -444,39 +495,15 @@ impl ProviderCallReservationOwner {
     }
 }
 
-fn ensure_provider_call_budget(
-    ledger: &mut ProviderCallLedger,
-    request: &ProviderCallReservationRequest,
+fn provider_call_budget_index(
+    ledger: &ProviderCallLedger,
+    campaign_id: &str,
 ) -> Result<usize, EngineError> {
-    if request.max_calls == 0 {
-        return Err(rejected(
-            "provider call budget must allow at least one call",
-        ));
-    }
-    if let Some(index) = ledger
+    ledger
         .budgets
         .iter()
-        .position(|budget| budget.campaign_id == request.campaign_id)
-    {
-        if ledger.budgets[index].max_calls != request.max_calls {
-            return Err(rejected("provider call budget maximum is immutable"));
-        }
-        return Ok(index);
-    }
-    ledger.budgets.push(ProviderCallBudgetState {
-        campaign_id: request.campaign_id.clone(),
-        schema_version: "provider-budget-recovery-1".to_owned(),
-        max_calls: request.max_calls,
-        next_slot_index: 1,
-        reserved_slots: 0,
-        dispatched_slots: 0,
-        terminal_slots: 0,
-        remaining_calls: request.max_calls,
-        revision: 0,
-        closed: request.campaign_closed,
-        updated_at: OffsetDateTime::now_utc(),
-    });
-    Ok(ledger.budgets.len() - 1)
+        .position(|budget| budget.campaign_id == campaign_id)
+        .ok_or_else(|| rejected("provider campaign must be opened before reservation"))
 }
 
 fn refresh_provider_call_budget(ledger: &mut ProviderCallLedger, budget_index: usize) {

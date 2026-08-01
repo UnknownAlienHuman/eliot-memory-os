@@ -803,6 +803,7 @@ fn write_antigravity_mcp_invocation_receipt(state: &McpState, tool_name: &str) -
         tool_name,
         true,
         Some(&audit_event_ref),
+        state.profile.allows(tool_name),
     )?;
     write_antigravity_mcp_report(
         state,
@@ -881,7 +882,8 @@ fn parse_antigravity_mode(value: &str) -> Result<AntigravityReviewMode> {
 }
 
 fn mcp_antigravity_tools_governed_only() -> bool {
-    AntigravityMcpBoundaryService.exposes_only_governed(governed_tool_names())
+    let catalog_tools = governed_tool_names();
+    AntigravityMcpBoundaryService.exposes_only_governed(catalog_tools, catalog_tools)
 }
 
 fn parse_external_review_role(value: &str) -> Result<ExternalReviewRole> {

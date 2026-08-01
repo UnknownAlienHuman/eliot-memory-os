@@ -190,7 +190,7 @@ mod verification;
 use cognition::*;
 #[allow(clippy::wildcard_imports)]
 use verification::*;
-mod catalog;
+pub(crate) mod catalog;
 mod delegation;
 mod dispatch;
 mod evaluation;
@@ -544,7 +544,7 @@ fn require_canonical_controller_authority(state: &McpState) -> Result<()> {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum McpAccessProfile {
+pub(crate) enum McpAccessProfile {
     CognitiveGovernor,
     HostGovernor,
     CognitiveChild,
@@ -582,7 +582,7 @@ impl McpAccessProfile {
         }
     }
 
-    const fn as_str(self) -> &'static str {
+    pub(crate) const fn as_str(self) -> &'static str {
         match self {
             Self::CognitiveGovernor => "cognitive_governor",
             Self::HostGovernor => "host_governor",
@@ -599,7 +599,7 @@ impl McpAccessProfile {
         }
     }
 
-    fn allows(self, name: &str) -> bool {
+    pub(crate) fn allows(self, name: &str) -> bool {
         match self {
             Self::CognitiveChild => matches!(
                 name,
@@ -641,6 +641,9 @@ fn resolve_effective_profile(
         (None, requested) => McpAccessProfile::parse(requested),
         (Some("claude" | "claude-desktop"), "default") => Ok(McpAccessProfile::ClaudeGoverned),
         (Some("claude"), "external_auditor") => Ok(McpAccessProfile::ExternalAuditor),
+        (Some("claude" | "antigravity" | "opencode"), "cognitive_child") => {
+            Ok(McpAccessProfile::CognitiveChild)
+        }
         (Some("codex"), "default" | "codex_worker") => Ok(McpAccessProfile::CodexWorker),
         (Some("antigravity" | "opencode"), "default")
         | (Some("antigravity"), "dynamic_agent" | "agent_host") => {
@@ -649,6 +652,7 @@ fn resolve_effective_profile(
         (Some("antigravity"), "external_auditor" | "antigravity-auditor") => {
             Ok(McpAccessProfile::ExternalAuditor)
         }
+        (Some("opencode"), "external_auditor") => Ok(McpAccessProfile::ExternalAuditor),
         (Some(host), requested) => anyhow::bail!(
             "UNSUPPORTED_HOST_PROFILE_PAIR: host={host} requested_profile={requested}"
         ),

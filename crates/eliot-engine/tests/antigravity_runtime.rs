@@ -309,25 +309,26 @@ fn mcp_config_denies_antigravity_recursion_and_non_status_tools() {
     );
     assert!(
         AntigravityMcpBoundaryService
-            .invocation_receipt("external_auditor", "eliot_antigravity_request", true)
+            .invocation_receipt("external_auditor", "eliot_antigravity_request", true, false)
             .is_err()
     );
     assert!(
         AntigravityMcpBoundaryService
-            .invocation_receipt("default", "eliot_antigravity_visibility", true)
+            .invocation_receipt("default", "eliot_current_state", true, true)
             .is_err()
     );
     assert!(
         AntigravityMcpBoundaryService
-            .invocation_receipt("external_auditor", "eliot_antigravity_visibility", true)
+            .invocation_receipt("external_auditor", "eliot_current_state", true, true)
             .is_err()
     );
     let receipt = AntigravityMcpBoundaryService
         .invocation_receipt_with_audit(
             "external_auditor",
-            "eliot_antigravity_visibility",
+            "eliot_current_state",
             true,
             Some("reports/antigravity-mcp-invocations/latest.json"),
+            true,
         )
         .expect("matching audit event permits receipt");
     assert!(receipt.matching_audit_event);
@@ -441,9 +442,10 @@ fn skill_visibility_requires_installed_or_loaded_skill() -> TestResult {
 fn mcp_discovery_is_not_invocation_success() {
     let receipt = AntigravityMcpBoundaryService.invocation_receipt_with_audit(
         "external_auditor",
-        "eliot_antigravity_visibility",
+        "eliot_current_state",
         true,
         None,
+        true,
     );
     assert!(receipt.is_err());
 }
@@ -452,16 +454,23 @@ fn mcp_discovery_is_not_invocation_success() {
 fn mcp_invocation_receipt_requires_matching_eliot_audit_event() {
     assert!(
         AntigravityMcpBoundaryService
-            .invocation_receipt_with_audit("external_auditor", "eliot_runtime_status", true, None,)
+            .invocation_receipt_with_audit(
+                "external_auditor",
+                "eliot_current_state",
+                true,
+                None,
+                true,
+            )
             .is_err()
     );
     assert!(
         AntigravityMcpBoundaryService
             .invocation_receipt_with_audit(
                 "external_auditor",
-                "eliot_runtime_status",
+                "eliot_current_state",
                 true,
                 Some("reports/antigravity-mcp-invocations/latest.json"),
+                true,
             )
             .is_ok()
     );
@@ -525,19 +534,10 @@ fn official_plugin_schema_and_status_are_detected_without_installing() -> TestRe
 
 #[test]
 fn public_antigravity_mcp_surface_is_status_only() {
-    let tools = AntigravityMcpBoundaryService.safe_tools();
-    assert_eq!(
-        tools,
-        [
-            "eliot_antigravity_visibility",
-            "eliot_antigravity_mcp_status",
-            "eliot_antigravity_plugin_status",
-            "eliot_antigravity_live_smoke_status",
-            "eliot_antigravity_real_report",
-        ]
-    );
-    assert!(AntigravityMcpBoundaryService.exposes_only_governed(tools));
-    assert!(AntigravityMcpBoundaryService.no_raw_agy_tools(tools));
+    let tools = ["eliot_current_state", "eliot_recall_l0"];
+    let catalog_tools = ["eliot_current_state", "eliot_recall_l0", "eliot_fetch_l2"];
+    assert!(AntigravityMcpBoundaryService.exposes_only_governed(&tools, &catalog_tools));
+    assert!(AntigravityMcpBoundaryService.no_raw_agy_tools(&tools));
 }
 
 #[test]

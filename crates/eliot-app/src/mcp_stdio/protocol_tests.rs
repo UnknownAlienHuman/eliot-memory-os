@@ -618,6 +618,7 @@ fn antigravity_live_status_reads_user_config_and_plugin_instead_of_cached_report
         "eliot_recall_l0",
         true,
         Some("reports/antigravity-mcp-invocations/events/test.json"),
+        McpAccessProfile::ExternalAuditor.allows("eliot_recall_l0"),
     )?;
     let mcp = antigravity_mcp_live_status(&home, Some(&invocation));
     assert_eq!(mcp.get("registered").and_then(Value::as_bool), Some(true));
@@ -1218,6 +1219,24 @@ fn bounded_catalog() {
     ] {
         assert!(!profile.allows(denied), "{denied} must remain unavailable");
     }
+}
+
+#[test]
+fn provider_tool_profiles_are_catalog_derived_and_hash_stable() {
+    let auditor = catalog::provider_mcp_tool_profile(McpAccessProfile::ExternalAuditor);
+    let replay = catalog::provider_mcp_tool_profile(McpAccessProfile::ExternalAuditor);
+    let child = catalog::provider_mcp_tool_profile(McpAccessProfile::CognitiveChild);
+    assert_eq!(auditor, replay);
+    assert!(auditor.hash_is_valid());
+    assert!(child.hash_is_valid());
+    assert_eq!(auditor.tool_names.len(), PART_E_WORKER_TOOLS.len());
+    assert_ne!(auditor.profile_hash_blake3, child.profile_hash_blake3);
+    assert!(
+        auditor
+            .tool_names
+            .iter()
+            .all(|name| McpAccessProfile::ExternalAuditor.allows(name))
+    );
 }
 
 #[test]

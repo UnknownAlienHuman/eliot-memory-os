@@ -1851,6 +1851,10 @@ fn cognitive_external_execution_request(
     let invocation_id = format!("cognitive-field-{}-{}", contract.run_id, call.call_id);
     let idempotency_key = format!("cognitive-field:{}:{}", contract.run_id, call.call_id);
     let expected_tools = cognitive_expected_mcp_tools(call);
+    let mcp_tool_profile = eliot_types::ProviderMcpToolProfileBinding::new(
+        "legacy-cognitive-reader",
+        expected_tools.clone(),
+    );
     let allowed_provider_tools = cognitive_allowed_provider_tools(call.host, &expected_tools);
     let mut launch_contract = HostLaunchContract {
         invocation_id: invocation_id.clone(),
@@ -1923,7 +1927,9 @@ fn cognitive_external_execution_request(
     let execution = ExternalAgentExecutionRequest {
         invocation,
         launch_contract,
+        campaign_id: format!("cognitive-field:{}:{}", contract.run_id, call.call_id),
         purpose: ExternalAgentPurpose::UnderstandingReader,
+        mcp_tool_profile,
         prompt_ref: canonical_path(prompt_path),
         prompt_sha256: call.prompt_sha256.clone(),
         output_schema_ref: canonical_path(&output_schema_path),

@@ -8,10 +8,10 @@ use eliot_engine::{
     DelegationBudgetService, DelegationCalibrationCampaignService, DelegationExecutionService,
     DelegationHealth, DelegationOutcomeService, DelegationPolicyContext, DelegationPolicyService,
     DelegationReportService, ExternalResultCompletenessService, ExternalReviewJobService,
-    IncidentService, ProviderCallReservationDecision, ProviderCallReservationOwner,
-    ProviderCallReservationRequest, ProviderCompletenessInput, ProviderInvocationJournal,
-    WorkState, antigravity_plan_route_policy, antigravity_review_request, external_review_request,
-    work_lease_is_active,
+    IncidentService, ProviderCallCampaignRequest, ProviderCallReservationDecision,
+    ProviderCallReservationOwner, ProviderCallReservationRequest, ProviderCompletenessInput,
+    ProviderInvocationJournal, WorkState, antigravity_plan_route_policy,
+    antigravity_review_request, external_review_request, work_lease_is_active,
 };
 use eliot_types::{
     AntigravityBinaryResolutionStatus, AntigravityEnablementScope, AntigravityEnablementState,
@@ -370,6 +370,11 @@ pub async fn review(
                         .constraints
                         .push("campaign_scope_or_provider_route_mismatch".to_owned());
                 } else {
+                    reservation_owner.open_campaign(ProviderCallCampaignRequest {
+                        campaign_id: campaign.campaign_id.clone(),
+                        max_calls: campaign.budget.max_provider_calls,
+                        closed: DelegationCalibrationCampaignService::is_terminal(campaign.state),
+                    })?;
                     let reservation_decision =
                         reservation_owner.reserve(ProviderCallReservationRequest {
                             campaign_id: campaign.campaign_id.clone(),
@@ -377,10 +382,6 @@ pub async fn review(
                             provider: "antigravity".to_owned(),
                             idempotency_key: idempotency_key.to_owned(),
                             gate_decision_ref: decision.decision_id.clone(),
-                            max_calls: campaign.budget.max_provider_calls,
-                            campaign_closed: DelegationCalibrationCampaignService::is_terminal(
-                                campaign.state,
-                            ),
                         })?;
                     match reservation_decision {
                         ProviderCallReservationDecision::Reserved(reservation) => {

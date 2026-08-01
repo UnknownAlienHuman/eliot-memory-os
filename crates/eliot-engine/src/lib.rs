@@ -93,8 +93,8 @@ pub use delegation::{
     DelegationBudgetReservation, DelegationBudgetService, DelegationDoctorIntegration,
     DelegationExecutionService, DelegationHealth, DelegationHealthService,
     DelegationOutcomeService, DelegationPolicyContext, DelegationPolicyService,
-    DelegationReportService, ProviderCallReservationDecision, ProviderCallReservationOwner,
-    ProviderCallReservationRequest,
+    DelegationReportService, ProviderCallCampaignRequest, ProviderCallReservationDecision,
+    ProviderCallReservationOwner, ProviderCallReservationRequest,
 };
 pub use delegation_calibration::{
     CalibrationEvidenceGapService, CampaignIntegrityReconciliationService,

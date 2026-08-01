@@ -57,55 +57,6 @@ const MINIMUM_AGY_VERSION_TEXT: &str = "1.1.1";
 const ELIOT_MCP_SERVER_NAME: &str = "eliot-governor";
 const OFFICIAL_PLUGIN_SCHEMA: &str = "https://antigravity.google/schemas/v1/plugin.json";
 const OFFICIAL_PLUGIN_NAME: &str = "eliot-antigravity";
-const SAFE_MCP_TOOLS: &[&str] = &[
-    "eliot_antigravity_visibility",
-    "eliot_antigravity_mcp_status",
-    "eliot_antigravity_plugin_status",
-    "eliot_antigravity_live_smoke_status",
-    "eliot_antigravity_real_report",
-];
-const SAFE_AUDITOR_MCP_TOOLS: &[&str] = &[
-    "eliot_agent_candidate_submit",
-    "eliot_agent_result",
-    "eliot_host_session_status",
-    "eliot_project_identity",
-    "eliot_task_state",
-    "eliot_current_state",
-    "eliot_recall_l0",
-    "eliot_fetch_l2",
-    "eliot_compile_packet_l3",
-    "eliot_memory_influence_trace",
-    "eliot_task_meaning",
-    "eliot_experience_recall",
-    "eliot_skill_list",
-    "eliot_skill_inspect",
-    "eliot_memory_curation_preview",
-    "eliot_codecortex_latest",
-    "eliot_external_review_report",
-    "eliot_antigravity_visibility",
-    "eliot_antigravity_mcp_status",
-    "eliot_antigravity_plugin_status",
-    "eliot_antigravity_live_smoke_status",
-    "eliot_antigravity_real_report",
-    "eliot_runtime_status",
-    "eliot_runtime_health",
-    "eliot_doctor_report",
-];
-const LEGACY_GOVERNED_MCP_TOOLS: &[&str] = &[
-    "eliot_antigravity_status",
-    "eliot_antigravity_doctor",
-    "eliot_antigravity_request",
-    "eliot_antigravity_job_status",
-    "eliot_antigravity_result",
-    "eliot_antigravity_report",
-    "eliot_antigravity_skills",
-    "eliot_antigravity_plugin",
-    "eliot_antigravity_auth_status",
-    "eliot_antigravity_enablement_status",
-    "eliot_antigravity_live_smoke_status",
-    "eliot_antigravity_real_report",
-];
-
 #[derive(Clone, Copy, Debug, Default)]
 pub struct AntigravityBinaryResolver;
 
@@ -2929,15 +2880,8 @@ impl AntigravityDoctorIntegration {
 }
 
 impl AntigravityMcpBoundaryService {
-    pub fn safe_tools(&self) -> &'static [&'static str] {
-        SAFE_MCP_TOOLS
-    }
-
-    pub fn exposes_only_governed(&self, tools: &[&str]) -> bool {
-        tools
-            .iter()
-            .filter(|tool| tool.contains("antigravity") || tool.contains("agy"))
-            .all(|tool| SAFE_MCP_TOOLS.contains(tool) || LEGACY_GOVERNED_MCP_TOOLS.contains(tool))
+    pub fn exposes_only_governed(&self, tools: &[&str], catalog_tools: &[&str]) -> bool {
+        tools.iter().all(|tool| catalog_tools.contains(tool)) && self.no_raw_agy_tools(tools)
     }
 
     pub fn no_raw_agy_tools(&self, tools: &[&str]) -> bool {
@@ -2955,8 +2899,9 @@ impl AntigravityMcpBoundaryService {
         profile: &str,
         tool_name: &str,
         succeeded: bool,
+        profile_allows_tool: bool,
     ) -> Result<AntigravityMcpInvocationReceipt, EngineError> {
-        self.invocation_receipt_with_audit(profile, tool_name, succeeded, None)
+        self.invocation_receipt_with_audit(profile, tool_name, succeeded, None, profile_allows_tool)
     }
 
     pub fn invocation_receipt_with_audit(
@@ -2965,8 +2910,9 @@ impl AntigravityMcpBoundaryService {
         tool_name: &str,
         succeeded: bool,
         audit_event_ref: Option<&str>,
+        profile_allows_tool: bool,
     ) -> Result<AntigravityMcpInvocationReceipt, EngineError> {
-        if profile != "external_auditor" || !SAFE_AUDITOR_MCP_TOOLS.contains(&tool_name) {
+        if profile != "external_auditor" || !profile_allows_tool {
             return Err(rejected(
                 "Antigravity MCP recursion or non-status tool invocation denied",
             ));
@@ -4194,6 +4140,7 @@ mod security_tests {
                         tool,
                         true,
                         Some("audit:l16"),
+                        true,
                     )
                     .is_ok(),
                 "external auditor is missing required delivery tool {tool}"
@@ -4211,6 +4158,7 @@ mod security_tests {
                         tool,
                         true,
                         Some("audit:l16"),
+                        false,
                     )
                     .is_err(),
                 "external auditor unexpectedly received mutating tool {tool}"

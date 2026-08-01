@@ -10,7 +10,7 @@ use serde_json::Value;
 use std::collections::BTreeMap;
 use time::OffsetDateTime;
 
-pub const PROVIDER_RUNTIME_CONTRACT_SCHEMA_VERSION: &str = "eliot-provider-runtime-v1";
+pub const PROVIDER_RUNTIME_CONTRACT_SCHEMA_VERSION: &str = "eliot-provider-runtime-v2";
 pub const PROVIDER_RUNTIME_PREFLIGHT_SCHEMA_VERSION: &str = "eliot-provider-runtime-preflight-v1";
 pub const LEGACY_COGNITIVE_PROVIDER_RUNTIME_SCHEMA_VERSION: &str =
     "eliot-cognitive-provider-runtime-v1";
@@ -145,6 +145,33 @@ pub struct ProviderMcpServerContract {
 
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct ProviderMcpToolProfileBinding {
+    pub profile_id: String,
+    pub profile_hash_blake3: String,
+    pub tool_names: Vec<String>,
+}
+
+impl ProviderMcpToolProfileBinding {
+    pub fn new(profile_id: impl Into<String>, mut tool_names: Vec<String>) -> Self {
+        let profile_id = profile_id.into();
+        tool_names.sort();
+        tool_names.dedup();
+        let canonical = format!("{}\n{}", profile_id, tool_names.join("\n"));
+        Self {
+            profile_id,
+            profile_hash_blake3: blake3::hash(canonical.as_bytes()).to_hex().to_string(),
+            tool_names,
+        }
+    }
+
+    pub fn hash_is_valid(&self) -> bool {
+        Self::new(self.profile_id.clone(), self.tool_names.clone()).profile_hash_blake3
+            == self.profile_hash_blake3
+    }
+}
+
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ProviderRuntimeContract {
     pub schema_version: String,
     #[schemars(with = "String")]
@@ -167,6 +194,7 @@ pub struct ProviderRuntimeContract {
     pub nonsecret_environment: BTreeMap<String, String>,
 
     pub mcp_servers: Vec<ProviderMcpServerContract>,
+    pub mcp_tool_profile: ProviderMcpToolProfileBinding,
     pub expected_mcp_tool_names: Vec<String>,
     pub forbidden_mcp_server_names: Vec<String>,
 
@@ -244,7 +272,10 @@ pub struct ExternalAgentExecutionRequest {
     pub invocation: AgentInvocationRequest,
     #[schemars(with = "Value")]
     pub launch_contract: HostLaunchContract,
+    #[serde(default)]
+    pub campaign_id: String,
     pub purpose: ExternalAgentPurpose,
+    pub mcp_tool_profile: ProviderMcpToolProfileBinding,
 
     pub prompt_ref: String,
     pub prompt_sha256: String,

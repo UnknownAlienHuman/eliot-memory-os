@@ -1,6 +1,6 @@
 use eliot_engine::{
-    EngineError, ProviderCallReservationDecision, ProviderCallReservationOwner,
-    ProviderCallReservationRequest,
+    EngineError, ProviderCallCampaignRequest, ProviderCallReservationDecision,
+    ProviderCallReservationOwner, ProviderCallReservationRequest,
 };
 use eliot_types::{ProjectId, ProviderCallReservationState, TaskId};
 use std::fs;
@@ -39,9 +39,20 @@ fn request(campaign: &str, key: &str) -> ProviderCallReservationRequest {
         provider: "antigravity".to_owned(),
         idempotency_key: key.to_owned(),
         gate_decision_ref: "delegation-decision:test".to_owned(),
-        max_calls: 1,
-        campaign_closed: false,
     }
+}
+
+fn open_campaign(
+    owner: &ProviderCallReservationOwner,
+    campaign_id: &str,
+    max_calls: u32,
+) -> TestResult {
+    owner.open_campaign(ProviderCallCampaignRequest {
+        campaign_id: campaign_id.to_owned(),
+        max_calls,
+        closed: false,
+    })?;
+    Ok(())
 }
 
 fn reserved(decision: ProviderCallReservationDecision) -> TestResult<String> {
@@ -65,9 +76,27 @@ fn join_decisions(
 }
 
 #[test]
+fn reservation_cannot_create_or_size_its_campaign() -> TestResult {
+    let root = TempRoot::new("controller-owned")?;
+    let owner = ProviderCallReservationOwner::new(root.path());
+    assert!(
+        owner
+            .reserve(request("campaign:controller-owned", "first"))
+            .is_err()
+    );
+    open_campaign(&owner, "campaign:controller-owned", 1)?;
+    assert!(matches!(
+        owner.reserve(request("campaign:controller-owned", "first"))?,
+        ProviderCallReservationDecision::Reserved(_)
+    ));
+    Ok(())
+}
+
+#[test]
 fn concurrent_distinct_requests_cannot_exceed_campaign_limit() -> TestResult {
     let root = TempRoot::new("concurrent-distinct")?;
     let owner = Arc::new(ProviderCallReservationOwner::new(root.path()));
+    open_campaign(&owner, "campaign:concurrent", 1)?;
     let barrier = Arc::new(Barrier::new(16));
     let handles = (0..16)
         .map(|index| {
@@ -104,6 +133,7 @@ fn concurrent_distinct_requests_cannot_exceed_campaign_limit() -> TestResult {
 fn concurrent_same_key_is_one_reservation_and_idempotent_replay() -> TestResult {
     let root = TempRoot::new("concurrent-idempotent")?;
     let owner = Arc::new(ProviderCallReservationOwner::new(root.path()));
+    open_campaign(&owner, "campaign:idempotent", 1)?;
     let barrier = Arc::new(Barrier::new(12));
     let handles = (0..12)
         .map(|_| {
@@ -141,6 +171,7 @@ fn concurrent_same_key_is_one_reservation_and_idempotent_replay() -> TestResult 
 fn unknown_dispatch_outcome_consumes_slot_and_forbids_blind_retry() -> TestResult {
     let root = TempRoot::new("unknown-outcome")?;
     let owner = ProviderCallReservationOwner::new(root.path());
+    open_campaign(&owner, "campaign:unknown", 1)?;
     let reservation_id = reserved(owner.reserve(request("campaign:unknown", "first"))?)?;
     owner.mark_dispatching(&reservation_id)?;
     owner.mark_dispatched(&reservation_id, "external-invocation:test")?;
@@ -163,6 +194,7 @@ fn unknown_dispatch_outcome_consumes_slot_and_forbids_blind_retry() -> TestResul
 fn proven_pre_dispatch_failure_releases_slot() -> TestResult {
     let root = TempRoot::new("release")?;
     let owner = ProviderCallReservationOwner::new(root.path());
+    open_campaign(&owner, "campaign:release", 1)?;
     let reservation_id = reserved(owner.reserve(request("campaign:release", "first"))?)?;
     owner.mark_dispatching(&reservation_id)?;
     let released = owner.release_pre_dispatch(&reservation_id, "provider process not started")?;
@@ -182,6 +214,7 @@ fn proven_pre_dispatch_failure_releases_slot() -> TestResult {
 fn campaign_close_blocks_reserved_slot_from_entering_dispatch() -> TestResult {
     let root = TempRoot::new("close-race")?;
     let owner = ProviderCallReservationOwner::new(root.path());
+    open_campaign(&owner, "campaign:closed", 1)?;
     let reservation_id = reserved(owner.reserve(request("campaign:closed", "first"))?)?;
     owner.close_campaign("campaign:closed")?;
     assert!(owner.mark_dispatching(&reservation_id).is_err());
@@ -198,6 +231,7 @@ fn completed_reservation_survives_restart_and_replays_review() -> TestResult {
     let root = TempRoot::new("completed-restart")?;
     let reservation_id = {
         let owner = ProviderCallReservationOwner::new(root.path());
+        open_campaign(&owner, "campaign:complete", 1)?;
         let reservation_id = reserved(owner.reserve(request("campaign:complete", "stable"))?)?;
         owner.mark_dispatching(&reservation_id)?;
         owner.mark_dispatched(&reservation_id, "external-invocation:complete")?;
@@ -225,6 +259,7 @@ fn dispatching_reservation_survives_restart_without_refund() -> TestResult {
     let root = TempRoot::new("dispatching-restart")?;
     let reservation_id = {
         let owner = ProviderCallReservationOwner::new(root.path());
+        open_campaign(&owner, "campaign:restart", 1)?;
         let reservation_id = reserved(owner.reserve(request("campaign:restart", "first"))?)?;
         owner.mark_dispatching(&reservation_id)?;
         reservation_id
@@ -243,10 +278,17 @@ fn dispatching_reservation_survives_restart_without_refund() -> TestResult {
 fn immutable_campaign_max_rejects_late_budget_expansion() -> TestResult {
     let root = TempRoot::new("immutable-max")?;
     let owner = ProviderCallReservationOwner::new(root.path());
+    open_campaign(&owner, "campaign:immutable", 1)?;
     let _ = owner.reserve(request("campaign:immutable", "first"))?;
-    let mut expanded = request("campaign:immutable", "second");
-    expanded.max_calls = 2;
-    assert!(owner.reserve(expanded).is_err());
+    assert!(
+        owner
+            .open_campaign(ProviderCallCampaignRequest {
+                campaign_id: "campaign:immutable".to_owned(),
+                max_calls: 2,
+                closed: false,
+            })
+            .is_err()
+    );
     assert_eq!(owner.snapshot()?.budgets[0].max_calls, 1);
     Ok(())
 }

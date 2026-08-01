@@ -1,7 +1,8 @@
 use eliot_types::{
     CognitiveProviderRuntimeContract, ExternalAgentPurpose,
     LEGACY_COGNITIVE_PROVIDER_RUNTIME_SCHEMA_VERSION, PROVIDER_RUNTIME_CONTRACT_SCHEMA_VERSION,
-    ProviderMcpServerContract, ProviderRuntimeContract, ProviderStructuredOutputMode,
+    ProviderMcpServerContract, ProviderMcpToolProfileBinding, ProviderRuntimeContract,
+    ProviderStructuredOutputMode,
 };
 use serde_json::json;
 use std::collections::BTreeMap;
@@ -56,6 +57,10 @@ fn external_agent_generic_runtime_serializes_source_owned_schema() -> TestResult
             executable_sha256: "b".repeat(64),
             build_source_commit: None,
         }],
+        mcp_tool_profile: ProviderMcpToolProfileBinding::new(
+            "external_auditor",
+            vec!["eliot_host_session_status".to_owned()],
+        ),
         expected_mcp_tool_names: vec!["eliot_host_session_status".to_owned()],
         forbidden_mcp_server_names: vec!["eliot_surrealdb".to_owned()],
         allowed_provider_tools: vec!["mcp__eliot-governor__eliot_host_session_status".to_owned()],

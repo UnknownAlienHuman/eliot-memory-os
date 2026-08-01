@@ -188,7 +188,8 @@ pub use external_agent::{
     OperationAuthorityOpenRequest, OperationAuthorityTerminalOutcome,
     PROVIDER_RUNTIME_CONTRACT_SCHEMA_VERSION, PROVIDER_RUNTIME_PREFLIGHT_SCHEMA_VERSION,
     ProviderAuthenticationState, ProviderExecutionEvidence, ProviderMcpServerContract,
-    ProviderRuntimeContract, ProviderRuntimePreflightReceipt, ProviderStructuredOutputMode,
+    ProviderMcpToolProfileBinding, ProviderRuntimeContract, ProviderRuntimePreflightReceipt,
+    ProviderStructuredOutputMode,
 };
 pub use external_review::{
     ExternalCitationStatus, ExternalClaimStatus, ExternalEvidenceCitation, ExternalFindingSeverity,

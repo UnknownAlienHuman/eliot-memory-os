@@ -6,7 +6,8 @@ use eliot_engine::{
 };
 use eliot_types::{
     AgentHostId, ExternalAgentPurpose, PROVIDER_RUNTIME_CONTRACT_SCHEMA_VERSION,
-    ProviderMcpServerContract, ProviderRuntimeContract, ProviderStructuredOutputMode,
+    ProviderMcpServerContract, ProviderMcpToolProfileBinding, ProviderRuntimeContract,
+    ProviderStructuredOutputMode,
 };
 use serde_json::json;
 use std::collections::BTreeMap;
@@ -235,6 +236,10 @@ fn fixture() -> ProviderRuntimeContract {
             executable_sha256: "b".repeat(64),
             build_source_commit: None,
         }],
+        mcp_tool_profile: ProviderMcpToolProfileBinding::new(
+            "external_auditor",
+            vec!["eliot_host_session_status".to_owned()],
+        ),
         expected_mcp_tool_names: vec!["eliot_host_session_status".to_owned()],
         forbidden_mcp_server_names: vec!["eliot_surrealdb".to_owned()],
         allowed_provider_tools: vec!["mcp__eliot-governor__eliot_host_session_status".to_owned()],

@@ -7,9 +7,9 @@ use eliot_engine::adapter::BoxAdapterFuture;
 use eliot_engine::runtime_supervision::AdapterExecutionContext;
 use eliot_engine::{
     Adapter, AdapterRegistry, AdapterSupervisor, AntigravityCommandInput, ClaudeCodeCommandInput,
-    ExternalResultCompletenessService, OpenCodeCommandInput, ProviderCallReservationDecision,
-    ProviderCallReservationOwner, ProviderCallReservationRequest, ProviderCommandPlan,
-    ProviderCompletenessInput, ProviderInvocationJournal, ProviderOutputSpool,
+    ExternalResultCompletenessService, OpenCodeCommandInput, ProviderCallCampaignRequest,
+    ProviderCallReservationDecision, ProviderCallReservationOwner, ProviderCallReservationRequest,
+    ProviderCommandPlan, ProviderCompletenessInput, ProviderInvocationJournal, ProviderOutputSpool,
     ProviderProcessOutcome, ProviderProcessRunner, ProviderProcessSpec, ProviderTerminalResult,
     build_antigravity_command, build_claude_code_command, build_opencode_command,
     parse_antigravity_output, parse_claude_code_stream, parse_opencode_stream,
@@ -1261,10 +1261,15 @@ async fn run_mcp_smoke(config_path: &Path, host: AgentHostId, model: &str) -> Re
             "external-agent-smoke",
             eliot_types::ProviderDeclaredBudget::new(120_000, MAX_PROVIDER_OUTPUT_BYTES),
         );
+        let mcp_tool_profile = crate::mcp_stdio::catalog::provider_mcp_tool_profile(
+            provider_mcp_access_profile(ExternalAgentPurpose::UnderstandingReader),
+        );
         let execution = ExternalAgentExecutionRequest {
             invocation,
             launch_contract,
+            campaign_id: format!("external-agent-smoke:{smoke_id}"),
             purpose: ExternalAgentPurpose::UnderstandingReader,
+            mcp_tool_profile: mcp_tool_profile.clone(),
             prompt_ref: path_string(&prompt_path),
             prompt_sha256: sha256_bytes(prompt.as_bytes()),
             output_schema_ref: path_string(&schema_path),
@@ -1273,7 +1278,7 @@ async fn run_mcp_smoke(config_path: &Path, host: AgentHostId, model: &str) -> Re
             max_turns_or_steps: 4,
             timeout_profile_ref: provider_route_policy.policy_id().to_owned(),
             provider_route_policy,
-            allowed_provider_tools: provider_allowed_tools(host),
+            allowed_provider_tools: provider_allowed_tools(host, &mcp_tool_profile.tool_names),
             denied_provider_tools: vec![
                 "Bash".to_owned(),
                 "Edit".to_owned(),
@@ -1282,11 +1287,18 @@ async fn run_mcp_smoke(config_path: &Path, host: AgentHostId, model: &str) -> Re
                 "WebFetch".to_owned(),
                 "WebSearch".to_owned(),
             ],
-            expected_mcp_tool_names: vec!["eliot_current_state".to_owned()],
+            expected_mcp_tool_names: mcp_tool_profile.tool_names,
             forbidden_mcp_server_names: vec!["eliot_surrealdb".to_owned(), "surrealdb".to_owned()],
             read_only: true,
             candidate_only: true,
         };
+        ProviderCallReservationOwner::new(runtime_root(config_path)).open_campaign(
+            ProviderCallCampaignRequest {
+                campaign_id: execution.campaign_id.clone(),
+                max_calls: 1,
+                closed: false,
+            },
+        )?;
         let adapter_request = AdapterRequest {
             request_id: format!("adapter-request:{smoke_id}"),
             adapter_id: adapter_id(host).to_owned(),
@@ -1429,16 +1441,28 @@ async fn run_mcp_smoke(config_path: &Path, host: AgentHostId, model: &str) -> Re
     Ok(report)
 }
 
-fn provider_allowed_tools(host: AgentHostId) -> Vec<String> {
+fn provider_allowed_tools(host: AgentHostId, tool_names: &[String]) -> Vec<String> {
     match host {
-        AgentHostId::Claude => vec![
-            "mcp__eliot-governor__eliot_current_state".to_owned(),
-            "mcp__eliot_governor__eliot_current_state".to_owned(),
-        ],
-        AgentHostId::Antigravity | AgentHostId::OpenCode => {
-            vec!["eliot_current_state".to_owned()]
-        }
+        AgentHostId::Claude => tool_names
+            .iter()
+            .flat_map(|name| {
+                [
+                    format!("mcp__eliot-governor__{name}"),
+                    format!("mcp__eliot_governor__{name}"),
+                ]
+            })
+            .collect(),
+        AgentHostId::Antigravity | AgentHostId::OpenCode => tool_names.to_vec(),
         AgentHostId::Codex => Vec::new(),
+    }
+}
+
+fn provider_mcp_access_profile(
+    purpose: ExternalAgentPurpose,
+) -> crate::mcp_stdio::McpAccessProfile {
+    match purpose {
+        ExternalAgentPurpose::CognitiveWorker => crate::mcp_stdio::McpAccessProfile::CognitiveChild,
+        _ => crate::mcp_stdio::McpAccessProfile::ExternalAuditor,
     }
 }
 
@@ -1830,7 +1854,7 @@ impl ExternalAgentAdapterCore {
         let mut attempt = journal.create(ProviderInvocationAttempt {
             invocation_attempt_id: attempt_id.clone(),
             provider: self.host.as_str().to_owned(),
-            campaign_id: provider_campaign_id(&execution),
+            campaign_id: execution.campaign_id.clone(),
             preregistration_id: execution.invocation.verifier_ref.clone(),
             reservation_id: "pending".to_owned(),
             idempotency_key: execution.invocation.idempotency_key.clone(),
@@ -1863,13 +1887,11 @@ impl ExternalAgentAdapterCore {
 
         let reservation_owner = ProviderCallReservationOwner::new(&runtime_root);
         let reservation = match reservation_owner.reserve(ProviderCallReservationRequest {
-            campaign_id: provider_campaign_id(&execution),
+            campaign_id: execution.campaign_id.clone(),
             task_id: execution.invocation.task_id,
             provider: self.host.as_str().to_owned(),
             idempotency_key: execution.invocation.idempotency_key.clone(),
             gate_decision_ref: execution.invocation.verifier_ref.clone(),
-            max_calls: 16,
-            campaign_closed: false,
         })? {
             ProviderCallReservationDecision::Reserved(reservation) => reservation,
             ProviderCallReservationDecision::IdempotentReplay(reservation) => {
@@ -2281,6 +2303,14 @@ impl ExternalAgentAdapterCore {
         &self,
         execution: &ExternalAgentExecutionRequest,
     ) -> Result<PreparedExternalAgentExecution, eliot_engine::EngineError> {
+        let catalog_profile = crate::mcp_stdio::catalog::provider_mcp_tool_profile(
+            provider_mcp_access_profile(execution.purpose),
+        );
+        if execution.mcp_tool_profile != catalog_profile {
+            return Err(eliot_engine::EngineError::WriteRejected(
+                "provider MCP tool profile differs from the canonical catalog".to_owned(),
+            ));
+        }
         let executable = self.executable.as_deref().ok_or_else(|| {
             eliot_engine::EngineError::ServiceNotReady {
                 service: self.adapter_id.clone(),
@@ -2364,6 +2394,7 @@ impl ExternalAgentAdapterCore {
             provider_argv: plan.argv.clone(),
             nonsecret_environment: environment.clone(),
             mcp_servers: vec![mcp.contract],
+            mcp_tool_profile: execution.mcp_tool_profile.clone(),
             expected_mcp_tool_names: execution.expected_mcp_tool_names.clone(),
             forbidden_mcp_server_names: execution.forbidden_mcp_server_names.clone(),
             allowed_provider_tools: execution.allowed_provider_tools.clone(),
@@ -2823,10 +2854,7 @@ fn materialize_provider_mcp(
 ) -> Result<MaterializedMcp, eliot_engine::EngineError> {
     let governor = std::fs::canonicalize(governor)?;
     let governor_sha256 = engine_anyhow(sha256_file(&governor))?;
-    let profile = match (host, execution.purpose) {
-        (AgentHostId::OpenCode, _) | (_, ExternalAgentPurpose::CognitiveWorker) => "default",
-        _ => "external_auditor",
-    };
+    let profile = execution.mcp_tool_profile.profile_id.as_str();
     let args = vec![
         "mcp".to_owned(),
         "stdio".to_owned(),
@@ -3321,13 +3349,6 @@ fn adapter_id(host: AgentHostId) -> &'static str {
         AgentHostId::OpenCode => "external-agent:opencode",
         AgentHostId::Codex => "external-agent:codex-forbidden",
     }
-}
-
-fn provider_campaign_id(execution: &ExternalAgentExecutionRequest) -> String {
-    format!(
-        "external-agent:{}:{}",
-        execution.invocation.task_id, execution.requested_model
-    )
 }
 
 fn safe_component(value: &str) -> String {

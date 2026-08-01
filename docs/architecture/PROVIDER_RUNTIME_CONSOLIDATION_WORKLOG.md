@@ -75,3 +75,22 @@ This log preserves the ordered implementation evidence for
   - `cargo test -p eliot-engine --test adapters adapter`: 21 passed, 1 authenticated-SurrealDB test ignored; 9.32 s including compilation, 0.23 s test bodies.
   - One initial exact-name test invocation selected zero tests and consumed 97.30 s compiling the binary. It is explicitly excluded from evidence; the corrected nonzero filter above is the acceptance evidence.
 - Source inventory after ARCH-02: no removed executor name remains; provider `SupervisedProcessSpec` construction exists only inside `SupervisedWindowsProcessRunner`; the remaining `RestartStrategy::OneForOne` call is the local Governor MCP preflight, not a provider executable.
+
+## Campaign and MCP ownership consolidation
+
+- Split campaign creation from reservation. `ProviderCallReservationRequest` now carries only campaign ID, task/provider identity, idempotency key and gate evidence; it has no `max_calls` or closed-state fields.
+- Added controller-only `ProviderCallReservationOwner::open_campaign`. The owner persists one immutable maximum, retains historical ledgers, may close but never reopen a campaign, and rejects reservation if the controller did not pre-create the budget.
+- The normal external-agent smoke controller opens an explicit unique one-call campaign before adapter dispatch. The adapter only reserves against the supplied campaign ID and therefore cannot size or reopen it.
+- Delegation opens/reconciles the provider-call campaign from the already-controller-owned calibration campaign before reservation; terminal calibration state closes the call campaign.
+- Moved provider MCP tool selection to `mcp_stdio/catalog.rs`. Catalog-derived `ProviderMcpToolProfileBinding` carries the profile ID, stable BLAKE3 hash and sorted exact tool names.
+- Bound the catalog profile into `ExternalAgentExecutionRequest` and provider runtime contract v2. Runtime preparation recomputes the selected Reader/Worker profile from the catalog and rejects any mismatch; contract validation checks the hash and exact tool-name equality.
+- Removed `SAFE_AUDITOR_MCP_TOOLS`, `LEGACY_GOVERNED_MCP_TOOLS` and the Antigravity-local status list. Antigravity receipt logic now consumes the central profile authorization decision instead of maintaining another allowlist.
+- Reader/auditor routes use the bounded `external_auditor` catalog profile; cognitive Worker routes use the separate `cognitive_child` profile. Operator/doctor tools are absent from both.
+- Focused timings and results:
+  - `cargo test -p eliot-engine --test provider_budget_integrity`: 9/9 passed; 40.31 s including compilation, 0.21 s test bodies.
+  - `provider_tool_profiles_are_catalog_derived_and_hash_stable`: 1/1 passed; 0.23 s, 0.01 s test body.
+  - `cargo test -p eliot-types --test external_agent`: 2/2 passed; 25.28 s, test bodies 0.00 s.
+  - `cargo test -p eliot-engine --test external_agent`: 6/6 passed; 2.11 s, test bodies 0.00 s.
+  - `cargo test -p eliot-engine --test antigravity_runtime mcp_`: 7/7 passed; 19.61 s, test bodies 0.03 s.
+  - An incorrect `--exact` app test filter selected zero tests after 90.86 s of duplicate-main compilation. It is excluded from evidence; the corrected one-test result above is evidence and the compile penalty is tracked for ARCH-04.
+- Source inventory: no adapter hard-coded `max_calls: 16`, no reservation `campaign_closed`, and no provider-maintained auditor/legacy MCP list remains.

@@ -2016,7 +2016,8 @@ fn parse_antigravity_mode(value: &str) -> Result<AntigravityReviewMode> {
 }
 
 fn antigravity_mcp_tools_governed_only() -> bool {
-    AntigravityMcpBoundaryService.exposes_only_governed(mcp_stdio::governed_tool_names())
+    let catalog_tools = mcp_stdio::governed_tool_names();
+    AntigravityMcpBoundaryService.exposes_only_governed(catalog_tools, catalog_tools)
 }
 
 fn parse_external_review_role(value: &str) -> Result<ExternalReviewRole> {

@@ -58,6 +58,7 @@ pub fn normalize_provider_runtime_contract(contract: &mut ProviderRuntimeContrac
     contract
         .mcp_servers
         .sort_by(|left, right| left.name.cmp(&right.name));
+    sort_dedup(&mut contract.mcp_tool_profile.tool_names);
     sort_dedup(&mut contract.expected_mcp_tool_names);
     sort_dedup(&mut contract.forbidden_mcp_server_names);
     sort_dedup(&mut contract.allowed_provider_tools);
@@ -112,6 +113,9 @@ pub fn validate_provider_runtime_contract(
         || contract.timeout_profile_ref.trim().is_empty()
         || contract.provider_route_policy.policy_id.trim().is_empty()
         || contract.provider_route_policy.policy_hash_blake3.len() != 64
+        || contract.mcp_tool_profile.profile_id.trim().is_empty()
+        || !contract.mcp_tool_profile.hash_is_valid()
+        || contract.expected_mcp_tool_names != contract.mcp_tool_profile.tool_names
         || contract.timeout_profile_ref != contract.provider_route_policy.policy_id
         || contract.process_containment.trim().is_empty()
         || contract.permission_profile.trim().is_empty()
@@ -189,6 +193,10 @@ pub fn validate_external_agent_execution_request(
             .is_empty()
         || launch.role_lease_epoch == 0
         || launch.operation_generation == 0
+        || request.campaign_id.trim().is_empty()
+        || request.mcp_tool_profile.profile_id.trim().is_empty()
+        || !request.mcp_tool_profile.hash_is_valid()
+        || request.expected_mcp_tool_names != request.mcp_tool_profile.tool_names
         || request.prompt_ref.trim().is_empty()
         || request.output_schema_ref.trim().is_empty()
         || !is_sha256(&request.prompt_sha256)
