@@ -589,6 +589,7 @@ pub(crate) fn tool_definitions_for_profile(profile: McpAccessProfile) -> Vec<Val
                 McpAccessProfile::DynamicAgent
                     | McpAccessProfile::ClaudeGoverned
                     | McpAccessProfile::CodexWorker
+                    | McpAccessProfile::UnderstandingReader
                     | McpAccessProfile::ExternalAuditor
             ) {
                 let defaulted_fields = [

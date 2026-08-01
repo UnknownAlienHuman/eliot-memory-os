@@ -1006,6 +1006,27 @@ async fn cargo_workspace_check_registry_runs_fixed_offline_command() -> Result<(
 }
 
 #[test]
+fn cognitive_reader_profiles_are_exact_and_control_is_empty() {
+    let treatment = catalog::provider_mcp_tool_profile(McpAccessProfile::UnderstandingReader);
+    assert_eq!(treatment.profile_id, "understanding_reader");
+    assert_eq!(
+        treatment.tool_names,
+        vec![
+            "eliot_current_state".to_owned(),
+            "eliot_fetch_l2".to_owned(),
+            "eliot_memory_influence_trace".to_owned(),
+            "eliot_recall_l0".to_owned(),
+        ]
+    );
+    assert!(treatment.hash_is_valid());
+
+    let control = catalog::provider_mcp_tool_profile(McpAccessProfile::CognitiveControl);
+    assert_eq!(control.profile_id, "cognitive_control");
+    assert!(control.tool_names.is_empty());
+    assert!(control.hash_is_valid());
+}
+
+#[test]
 fn dynamic_agent_profile_is_host_neutral_and_proactive() -> Result<()> {
     let profile = McpAccessProfile::parse("dynamic_agent")?;
     assert_eq!(profile, McpAccessProfile::DynamicAgent);
@@ -1038,6 +1059,7 @@ fn bound_part_e_catalog_marks_server_defaulted_scope_fields_optional() -> Result
         McpAccessProfile::DynamicAgent,
         McpAccessProfile::ClaudeGoverned,
         McpAccessProfile::CodexWorker,
+        McpAccessProfile::UnderstandingReader,
         McpAccessProfile::ExternalAuditor,
     ] {
         let current_state = tool_definitions_for_profile(profile)

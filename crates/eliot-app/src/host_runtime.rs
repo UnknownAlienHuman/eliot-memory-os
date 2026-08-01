@@ -55,7 +55,7 @@ const CLAUDE_DESKTOP_HOST: &str = "claude-desktop";
 
 mod claude;
 mod external_agent;
-pub(crate) use external_agent::half_open_external_agent_circuit;
+pub(crate) use external_agent::{half_open_external_agent_circuit, provider_mcp_access_profile};
 mod integration;
 mod managed;
 mod provider_runtime;

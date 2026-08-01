@@ -390,3 +390,83 @@ This log preserves the ordered implementation evidence for
   details is outside autonomous repository authority. After the operator confirms the page, the
   next bounded action is a read-only search of OneDrive's recycle history for the three exact run
   roots, followed by create-only restoration if found.
+
+## Automatic continuation — Task 02R2 projection restoration and runtime-profile repair
+
+### Provenance-preserving projection restoration
+
+- After the operator completed Microsoft's account-security confirmation, OneDrive Recycle Bin
+  contained exactly one deleted `cognitive-field` folder at the original
+  `eliot-memory-os/reports` path (3.23 MB). The exact row was restored through the authenticated
+  OneDrive UI; OneDrive reported `Restored 1 item` and the recycle row count became zero.
+- Local sync restored the original public projections without reconstruction: run003 has 14
+  files, run005 has 29 files and run006 has 11 files. Ten SHA-256 references extracted from
+  run006 `core-role-evidence.json` all resolve and match exactly (10/10), including the reused
+  run003/run005 verifier receipts and private exposure receipts.
+- Exact-root `seal-status` passed in 1.387 s with `ALREADY_ABANDONED`, zero provider artifacts,
+  zero provider results and generation 1 still abandoned. A first invocation used the parent
+  report/private roots and failed in 0.024 s with OS error 2; correcting the CLI path shape to the
+  exact run roots resolved it without data changes.
+
+### Canonical MCP-profile defect and bounded Opus consultation
+
+- Generation-2 `seal --dry-run` against the prior clean candidate failed in 1.188 s with
+  `write rejected: provider MCP tool profile differs from the canonical catalog`. ARCH-02B had
+  hard-coded `legacy-cognitive-reader` in the cognitive runner while the consolidated provider
+  boundary recomputed the catalog-owned profile from purpose.
+- An initial local correction proved incomplete: assigning external Readers to
+  `ExternalAuditor` admitted a seven-tool profile with write-capable candidate/packet tools, and
+  assigning the Codex runtime to `CognitiveChild` failed the exact runtime binding because its
+  four-tool profile differs from the seven-tool Codex Worker contract.
+- Escalated once to Claude Code `claude-opus-5` at `max`, read-only plan mode, strict empty MCP and
+  only Read/Grep/Glob. Session `10c8dc86-596f-406d-a11b-15c617370e68` completed in 399.6 s over
+  30 turns, cost USD 2.7921415, with no permission denial and no write. Opus approved canonical
+  `CodexWorker`, rejected `ExternalAuditor` as the treatment/control fix and identified the exact
+  tool-set mismatch. It left the treatment/control profile split as the controller decision.
+- Implemented the systemic split: catalog-owned `understanding_reader` exposes exactly
+  `eliot_current_state`, `eliot_fetch_l2`, `eliot_memory_influence_trace` and `eliot_recall_l0`;
+  `MemoryFreeControl` resolves to the existing empty `cognitive_control` profile and sets
+  `ELIOT_COGNITIVE_CONTROL=1`; Codex resolves to canonical `codex_worker`. Purpose is the sole
+  central profile selector and `prepare_governed` retains strict profile equality.
+
+### Dry-run side-effect defect and repair
+
+- The first repaired candidate (`ADE4E38BA70633FE34D4496055C8302ACD26E0C9D735223DD7E781F38D9AB6BC`)
+  passed generation-2 dry-run in 5.835 s with `authority_side_effects=0`, but a complete before/after
+  SHA inventory detected one private mutation: Antigravity `.agents/mcp_config.json` was
+  overwritten during preview. Public files were 11/11 identical; the private count stayed 1561
+  but hashes differed. Real sealing and all providers remained fenced.
+- Root cause: runtime preview and dispatch called the same MCP materialization path. Preview could
+  write Claude/OpenCode runtime configs, Antigravity workspace config, global permission changes
+  and a permission receipt before the later `dry_run` branch.
+- Split preparation into `Preview` and `Dispatch` modes. Both compute the identical sealed paths,
+  command and runtime contract, but only Dispatch may create directories, materialize provider MCP
+  files or merge Antigravity permissions. The regression test proves Antigravity preview preserves
+  an existing governed config byte-for-byte and creates no invocation root.
+- Rebuilt provisional release SHA
+  `B68D75641582F628DB49E01B94CA2865F274DDD2A3EBAB7910A0A7BDBA4FDA7B` and repeated the exact
+  run006 generation-2 dry-run in 6.539 s. Result: PASS, `authority_side_effects=0`, public 11/11
+  identical and private 1561/1561 identical. The planned seal ID is
+  `provider-plan-seal:seal-d30199d14e30e6a9-g2`; no provider call was made.
+
+### Focused verification and duration evidence
+
+- Profile/runtime focused tests: six requested checks passed. The combined cold command took
+  121 s; the first app compile/link consumed about 91 s while the longest behavior body was
+  0.44 s. Public-enum compatibility added 2/2 PASS in 13.04 s compile-dominated wall time.
+- Preview side-effect regression: 1/1 PASS; 36.80 s wall with 35.87 s compilation and 0.05 s body.
+  Clean isolated release build took 213.36 s; incremental rebuilds took 121.68 s. These timings
+  indicate Rust compile/link cost, not slow cognitive behavior.
+- Task02R2 contract gates: cognitive field contract 2/2 PASS (1.322 s), secret boundary 5/5 PASS
+  (12.475 s enumeration/compile), cognitive grading 4/4 PASS (1.921 s), cognitive CLI 2/2 PASS
+  (0.977 s), format PASS (1.782 s), workspace all-target check PASS (36.069 s), workspace all-target
+  Clippy with warnings denied PASS (50.365 s), diff-check PASS (0.074 s).
+- The literal recovery-document command `cargo test -p eliot-app --test cognitive_field_runner`
+  fails immediately because that integration target does not exist and has never existed in Git.
+  No empty compatibility target was fabricated. The real same-named binary unit module was run as
+  `cargo test -p eliot-app --bin eliot-governor cognitive_field_runner::tests::`: 25/25 PASS,
+  0.927 s wall and 0.60 s bodies. This is recorded as a recovery-document command defect, not a
+  product-test failure.
+- Two tool invocations were prematurely killed by an accidentally short orchestration timeout
+  before useful results (one release build start and one focused-test start). Both were rerun with
+  bounded explicit limits; neither was a code/test failure and neither consumed a provider call.

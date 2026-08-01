@@ -20,6 +20,7 @@ pub enum ExternalAgentPurpose {
     ExternalAudit,
     CognitiveWorker,
     UnderstandingReader,
+    MemoryFreeControl,
     CognitiveJudge,
     ReasoningJob,
     CapsuleRefinement,

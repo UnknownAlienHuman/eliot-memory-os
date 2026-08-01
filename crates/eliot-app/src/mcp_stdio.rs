@@ -549,6 +549,7 @@ pub(crate) enum McpAccessProfile {
     HostGovernor,
     CognitiveChild,
     CognitiveControl,
+    UnderstandingReader,
     DynamicAgent,
     ClaudeGoverned,
     CodexController,
@@ -566,6 +567,7 @@ impl McpAccessProfile {
             "host_governor" => Ok(Self::HostGovernor),
             "cognitive_child" => Ok(Self::CognitiveChild),
             "cognitive_control" => Ok(Self::CognitiveControl),
+            "understanding_reader" => Ok(Self::UnderstandingReader),
             "dynamic_agent" | "agent_host" => Ok(Self::DynamicAgent),
             // `claude_desktop` is the retired spelling. Claude Code shares this
             // profile with Claude Desktop, so naming it after one UI product
@@ -588,6 +590,7 @@ impl McpAccessProfile {
             Self::HostGovernor => "host_governor",
             Self::CognitiveChild => "cognitive_child",
             Self::CognitiveControl => "cognitive_control",
+            Self::UnderstandingReader => "understanding_reader",
             Self::DynamicAgent => "dynamic_agent",
             Self::ClaudeGoverned => "claude_governed",
             Self::CodexController => "codex_controller",
@@ -607,6 +610,13 @@ impl McpAccessProfile {
                     | "eliot_agent_candidate_submit"
                     | "eliot_recall_l0"
                     | "eliot_fetch_l2"
+            ),
+            Self::UnderstandingReader => matches!(
+                name,
+                "eliot_current_state"
+                    | "eliot_recall_l0"
+                    | "eliot_fetch_l2"
+                    | "eliot_memory_influence_trace"
             ),
             Self::CognitiveGovernor | Self::HostGovernor | Self::CognitiveControl => false,
             Self::DynamicAgent
@@ -646,6 +656,9 @@ fn resolve_effective_profile(
         }
         (Some("claude" | "antigravity" | "opencode"), "cognitive_child") => {
             Ok(McpAccessProfile::CognitiveChild)
+        }
+        (Some("claude" | "antigravity" | "opencode"), "understanding_reader") => {
+            Ok(McpAccessProfile::UnderstandingReader)
         }
         (Some("codex"), "default" | "codex_worker") => Ok(McpAccessProfile::CodexWorker),
         (Some("antigravity" | "opencode"), "default")
@@ -871,6 +884,7 @@ pub(crate) struct McpDaemon {
     host_governor: McpState,
     cognitive_child: McpState,
     cognitive_control: McpState,
+    understanding_reader: McpState,
     dynamic_agent: McpState,
     claude_desktop: McpState,
     codex_controller: McpState,
@@ -996,6 +1010,24 @@ impl McpDaemon {
                 control_wal: config.control_wal.clone(),
                 blob_store: config.blob_store.clone(),
                 profile: McpAccessProfile::CognitiveControl,
+                writer: writer.clone(),
+                pipe_name: pipe_name.clone(),
+                instance_name: publication.instance_name.clone(),
+                runtime_id: publication.runtime_id.clone(),
+                auth_generation: publication.auth_generation.clone(),
+                cursor_signing_key,
+                cognitive_runtime: Arc::clone(&cognitive_runtime),
+                cognitive_principals: Arc::clone(&cognitive_principals),
+            },
+            understanding_reader: McpState {
+                root: root.clone(),
+                config_path: config_path.to_path_buf(),
+                store: store.clone(),
+                ul: Arc::clone(&ul),
+                schema_ready: OnceCell::new(),
+                control_wal: config.control_wal.clone(),
+                blob_store: config.blob_store.clone(),
+                profile: McpAccessProfile::UnderstandingReader,
                 writer: writer.clone(),
                 pipe_name: pipe_name.clone(),
                 instance_name: publication.instance_name.clone(),
@@ -1171,6 +1203,7 @@ impl McpDaemon {
             McpAccessProfile::HostGovernor => &self.host_governor,
             McpAccessProfile::CognitiveChild => &self.cognitive_child,
             McpAccessProfile::CognitiveControl => &self.cognitive_control,
+            McpAccessProfile::UnderstandingReader => &self.understanding_reader,
             McpAccessProfile::DynamicAgent => &self.dynamic_agent,
             McpAccessProfile::ClaudeGoverned => &self.claude_desktop,
             McpAccessProfile::CodexController => &self.codex_controller,

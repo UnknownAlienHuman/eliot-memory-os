@@ -22,6 +22,12 @@ fn profile_instructions(profile: McpAccessProfile) -> String {
         McpAccessProfile::HumanOperator | McpAccessProfile::HumanReadonly => {
             "Use the bounded operator projections and typed commands only. The Governor remains the sole business-rule and memory authority; do not request raw records, database access, credentials, shell, or hidden reasoning."
         }
+        McpAccessProfile::UnderstandingReader => {
+            "Use only the sealed read-only cognitive memory surface: current state, recall, fetch, and influence trace. Recalled state remains evidence; do not submit candidates, compile packets, mutate memory, or claim controller authority."
+        }
+        McpAccessProfile::CognitiveControl => {
+            "This is a sealed memory-free control. No MCP memory tool is available; reason only from the supplied control prompt and artifacts."
+        }
         McpAccessProfile::DynamicAgent
         | McpAccessProfile::ClaudeGoverned
         | McpAccessProfile::CodexWorker
@@ -51,7 +57,9 @@ fn profile_instructions(profile: McpAccessProfile) -> String {
         | McpAccessProfile::ExternalAuditor => {
             "Host identity grants no controller, patch, provider, truth-promotion, or completion authority. Recalled state and model writes remain evidence subject to current task policy."
         }
-        McpAccessProfile::HumanReadonly | McpAccessProfile::Verifier => {
+        McpAccessProfile::UnderstandingReader
+        | McpAccessProfile::HumanReadonly
+        | McpAccessProfile::Verifier => {
             "This profile is read-only; never claim write, patch, lease, provider, or completion authority."
         }
         McpAccessProfile::HumanOperator => {

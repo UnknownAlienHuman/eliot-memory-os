@@ -247,7 +247,9 @@ pub fn validate_external_agent_execution_request(
     }
     if matches!(
         request.purpose,
-        ExternalAgentPurpose::UnderstandingReader | ExternalAgentPurpose::CognitiveJudge
+        ExternalAgentPurpose::UnderstandingReader
+            | ExternalAgentPurpose::MemoryFreeControl
+            | ExternalAgentPurpose::CognitiveJudge
     ) && (!request.read_only || !launch.allowed_paths.is_empty())
     {
         return rejected("Reader and Judge execution must be read-only");

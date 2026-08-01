@@ -179,6 +179,12 @@ struct PreparedExternalAgentExecution {
     runtime_contract: ProviderRuntimeContract,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RuntimePreparationMode {
+    Preview,
+    Dispatch,
+}
+
 struct CanonicalAgentResultWrite {
     key: String,
     receipt_kind: &'static str,
@@ -264,7 +270,7 @@ pub(crate) fn prepare_external_agent_runtime(
         &resolved_governor_executable()?,
         process_runner,
     )?;
-    let prepared = core.prepare_governed(execution)?;
+    let prepared = core.prepare_governed(execution, RuntimePreparationMode::Preview)?;
     Ok(ExternalAgentRuntimePreview {
         adapter_id: core.adapter_id,
         adapter_version: core.manifest.version,
@@ -2143,11 +2149,17 @@ fn provider_allowed_tools(host: AgentHostId, tool_names: &[String]) -> Vec<Strin
     }
 }
 
-fn provider_mcp_access_profile(
+pub(crate) fn provider_mcp_access_profile(
     purpose: ExternalAgentPurpose,
 ) -> crate::mcp_stdio::McpAccessProfile {
     match purpose {
         ExternalAgentPurpose::CognitiveWorker => crate::mcp_stdio::McpAccessProfile::CognitiveChild,
+        ExternalAgentPurpose::UnderstandingReader => {
+            crate::mcp_stdio::McpAccessProfile::UnderstandingReader
+        }
+        ExternalAgentPurpose::MemoryFreeControl => {
+            crate::mcp_stdio::McpAccessProfile::CognitiveControl
+        }
         _ => crate::mcp_stdio::McpAccessProfile::ExternalAuditor,
     }
 }
@@ -2539,7 +2551,7 @@ impl ExternalAgentAdapterCore {
             plan,
             environment,
             runtime_contract,
-        } = self.prepare_governed(&execution)?;
+        } = self.prepare_governed(&execution, RuntimePreparationMode::Dispatch)?;
 
         let runtime_root = runtime_root(&self.config_path);
         let attempt_id = format!(
@@ -3109,6 +3121,7 @@ impl ExternalAgentAdapterCore {
     fn prepare_governed(
         &self,
         execution: &ExternalAgentExecutionRequest,
+        mode: RuntimePreparationMode,
     ) -> Result<PreparedExternalAgentExecution, eliot_engine::EngineError> {
         let catalog_profile = crate::mcp_stdio::catalog::provider_mcp_tool_profile(
             provider_mcp_access_profile(execution.purpose),
@@ -3163,7 +3176,6 @@ impl ExternalAgentAdapterCore {
         let invocation_root = runtime_root(&self.config_path)
             .join("external-agent")
             .join(safe_component(&execution.invocation.invocation_id));
-        std::fs::create_dir_all(&invocation_root)?;
         let mcp = materialize_provider_mcp(
             self.host,
             &self.governor_executable,
@@ -3171,6 +3183,7 @@ impl ExternalAgentAdapterCore {
             &cwd,
             &invocation_root,
             execution,
+            mode,
         )?;
         let plan = provider_command_plan(
             self.host,
@@ -3659,6 +3672,7 @@ fn materialize_provider_mcp(
     cwd: &Path,
     invocation_root: &Path,
     execution: &ExternalAgentExecutionRequest,
+    mode: RuntimePreparationMode,
 ) -> Result<MaterializedMcp, eliot_engine::EngineError> {
     let governor = std::fs::canonicalize(governor)?;
     let governor_sha256 = engine_anyhow(sha256_file(&governor))?;
@@ -3683,14 +3697,14 @@ fn materialize_provider_mcp(
     let provider_config_path = match host {
         AgentHostId::Claude => {
             let path = invocation_root.join("claude-mcp.json");
-            atomic_write_json(&path, &json!({"mcpServers": {"eliot-governor": server}}))
-                .map_err(anyhow_engine)?;
+            if mode == RuntimePreparationMode::Dispatch {
+                atomic_write_json(&path, &json!({"mcpServers": {"eliot-governor": server}}))
+                    .map_err(anyhow_engine)?;
+            }
             path
         }
         AgentHostId::Antigravity => {
-            ensure_antigravity_permissions(invocation_root)?;
             let agents = cwd.join(".agents");
-            std::fs::create_dir_all(&agents)?;
             let path = agents.join("mcp_config.json");
             if path.exists() {
                 let current: Value = serde_json::from_slice(&std::fs::read(&path)?)?;
@@ -3709,36 +3723,44 @@ fn materialize_provider_mcp(
                     ));
                 }
             }
-            atomic_write_json(&path, &json!({"mcpServers": {"eliot-governor": server}}))
-                .map_err(anyhow_engine)?;
+            if mode == RuntimePreparationMode::Dispatch {
+                ensure_antigravity_permissions(invocation_root)?;
+                std::fs::create_dir_all(&agents)?;
+                atomic_write_json(&path, &json!({"mcpServers": {"eliot-governor": server}}))
+                    .map_err(anyhow_engine)?;
+            }
             path
         }
         AgentHostId::OpenCode => {
             let config_dir = invocation_root.join("opencode-config");
-            std::fs::create_dir_all(&config_dir)?;
             let path = config_dir.join("opencode.json");
             let command = std::iter::once(path_string(&governor))
                 .chain(args.iter().cloned())
                 .collect::<Vec<_>>();
-            atomic_write_json(
-                &path,
-                &json!({
-                    "$schema": "https://opencode.ai/config.json",
-                    "mcp": {
-                        "eliot-governor": {
-                            "type": "local",
-                            "command": command,
-                            "enabled": true,
-                            "timeout": 30000,
-                            "environment": scope_environment
+            if mode == RuntimePreparationMode::Dispatch {
+                std::fs::create_dir_all(&config_dir)?;
+                atomic_write_json(
+                    &path,
+                    &json!({
+                        "$schema": "https://opencode.ai/config.json",
+                        "mcp": {
+                            "eliot-governor": {
+                                "type": "local",
+                                "command": command,
+                                "enabled": true,
+                                "timeout": 30000,
+                                "environment": scope_environment
+                            }
                         }
-                    }
-                }),
-            )
-            .map_err(anyhow_engine)?;
+                    }),
+                )
+                .map_err(anyhow_engine)?;
+            }
             extra_environment.insert("OPENCODE_CONFIG_DIR".to_owned(), path_string(&config_dir));
             let xdg = invocation_root.join("opencode-xdg");
-            std::fs::create_dir_all(&xdg)?;
+            if mode == RuntimePreparationMode::Dispatch {
+                std::fs::create_dir_all(&xdg)?;
+            }
             extra_environment.insert("XDG_CONFIG_HOME".to_owned(), path_string(&xdg));
             path
         }
@@ -3941,7 +3963,7 @@ fn provider_environment(
     {
         environment.insert(
             "ELIOT_MCP_ACCESS_PROFILE".to_owned(),
-            "external_auditor".to_owned(),
+            execution.mcp_tool_profile.profile_id.clone(),
         );
     }
     environment
@@ -3970,6 +3992,9 @@ fn scoped_environment(execution: &ExternalAgentExecutionRequest) -> BTreeMap<Str
     );
     if let Some(lease) = execution.invocation.work_lease_id {
         environment.insert("ELIOT_WORK_LEASE_ID".to_owned(), lease.to_string());
+    }
+    if execution.purpose == ExternalAgentPurpose::MemoryFreeControl {
+        environment.insert("ELIOT_COGNITIVE_CONTROL".to_owned(), "1".to_owned());
     }
     environment
 }
@@ -4768,6 +4793,43 @@ mod provider_runtime_tests {
         Ok(ProviderInvocationJournal::new(root).load(attempt_id)?)
     }
 
+    #[test]
+    fn provider_runtime_preview_does_not_materialize_antigravity_workspace_config() -> Result<()> {
+        let fixture = route_fixture_for(
+            AgentHostId::Antigravity,
+            ExternalAgentPurpose::UnderstandingReader,
+            Vec::new(),
+            Duration::ZERO,
+            false,
+        )?;
+        let execution: ExternalAgentExecutionRequest =
+            serde_json::from_value(fixture.request.input.clone())?;
+        let cwd = PathBuf::from(&execution.launch_contract.cwd_or_worktree);
+        let agents = cwd.join(".agents");
+        std::fs::create_dir_all(&agents)?;
+        let config = agents.join("mcp_config.json");
+        let sentinel = b"{\"mcpServers\":{\"eliot-governor\":{\"sentinel\":true}}}\n";
+        std::fs::write(&config, sentinel)?;
+        let invocation_root = fixture.root.join("preview-runtime");
+        let governor = fixture.root.join("eliot-governor.exe").canonicalize()?;
+
+        let preview = materialize_provider_mcp(
+            AgentHostId::Antigravity,
+            &governor,
+            &fixture.root.join("config/governor.toml"),
+            &cwd,
+            &invocation_root,
+            &execution,
+            RuntimePreparationMode::Preview,
+        )?;
+
+        assert_eq!(preview.provider_config_path, config);
+        assert_eq!(std::fs::read(&config)?, sentinel);
+        assert!(!invocation_root.exists());
+        std::fs::remove_dir_all(fixture.root)?;
+        Ok(())
+    }
+
     #[tokio::test(start_paused = true)]
     async fn provider_runtime_b1_delayed_output_survives_scaled_former_boundary() -> Result<()> {
         let fixture = route_fixture(
@@ -4962,6 +5024,7 @@ mod provider_runtime_tests {
         let purposes = [
             ExternalAgentPurpose::CognitiveWorker,
             ExternalAgentPurpose::UnderstandingReader,
+            ExternalAgentPurpose::MemoryFreeControl,
             ExternalAgentPurpose::CognitiveJudge,
         ];
         for host in hosts {
@@ -4978,10 +5041,11 @@ mod provider_runtime_tests {
                 let expected_profile = crate::mcp_stdio::catalog::provider_mcp_tool_profile(
                     provider_mcp_access_profile(purpose),
                 );
-                let expected_profile_id = if purpose == ExternalAgentPurpose::CognitiveWorker {
-                    "cognitive_child"
-                } else {
-                    "external_auditor"
+                let expected_profile_id = match purpose {
+                    ExternalAgentPurpose::CognitiveWorker => "cognitive_child",
+                    ExternalAgentPurpose::UnderstandingReader => "understanding_reader",
+                    ExternalAgentPurpose::MemoryFreeControl => "cognitive_control",
+                    _ => "external_auditor",
                 };
                 assert_eq!(expected_profile.profile_id, expected_profile_id);
                 assert!(expected_profile.hash_is_valid());

@@ -31,10 +31,10 @@ use eliot_types::{
     ExternalAgentExecutionRequest, ExternalAgentPurpose, HostLaunchContract, HostMode,
     OperationJob, OperationJobState, OperationPhase, PROVIDER_RUNTIME_CONTRACT_SCHEMA_VERSION,
     PROVIDER_RUNTIME_PREFLIGHT_SCHEMA_VERSION, ProjectId, ProviderDeclaredBudget,
-    ProviderExecutionEvidence, ProviderMcpServerContract, ProviderMcpToolProfileBinding,
-    ProviderRoutePolicy, ProviderRuntimeContract, ProviderRuntimePreflightReceipt,
-    ProviderStructuredOutputMode, SEAL_STAGING_CHECKPOINT_SCHEMA_VERSION, SealStagingCheckpoint,
-    SealStagingState, TaskId, TaskIntentOracle, WorkItem, WorkItemId, WorkItemStatus, WorkScope,
+    ProviderExecutionEvidence, ProviderMcpServerContract, ProviderRoutePolicy,
+    ProviderRuntimeContract, ProviderRuntimePreflightReceipt, ProviderStructuredOutputMode,
+    SEAL_STAGING_CHECKPOINT_SCHEMA_VERSION, SealStagingCheckpoint, SealStagingState, TaskId,
+    TaskIntentOracle, WorkItem, WorkItemId, WorkItemStatus, WorkScope,
     cognitive_judge_result_schema, cognitive_understanding_answer_schema,
     cognitive_worker_result_schema, inspect_secret_bytes,
 };
@@ -662,9 +662,8 @@ fn codex_cognitive_runtime_contract(
                 build_source_commit: None,
             },
         ],
-        mcp_tool_profile: ProviderMcpToolProfileBinding::new(
-            "codex_worker",
-            expected_mcp_tool_names.clone(),
+        mcp_tool_profile: crate::mcp_stdio::catalog::provider_mcp_tool_profile(
+            crate::mcp_stdio::McpAccessProfile::CodexWorker,
         ),
         expected_mcp_tool_names,
         forbidden_mcp_server_names: vec!["eliot_surrealdb".to_owned()],
@@ -1888,9 +1887,14 @@ fn cognitive_external_execution_request(
     let invocation_id = format!("cognitive-field-{}-{}", contract.run_id, call.call_id);
     let idempotency_key = format!("cognitive-field:{}:{}", contract.run_id, call.call_id);
     let expected_tools = cognitive_expected_mcp_tools(call);
-    let mcp_tool_profile = eliot_types::ProviderMcpToolProfileBinding::new(
-        "legacy-cognitive-reader",
-        expected_tools.clone(),
+    let purpose =
+        if call.executions[0].memory_condition == CognitiveMemoryCondition::MemoryFreeControl {
+            ExternalAgentPurpose::MemoryFreeControl
+        } else {
+            ExternalAgentPurpose::UnderstandingReader
+        };
+    let mcp_tool_profile = crate::mcp_stdio::catalog::provider_mcp_tool_profile(
+        crate::host_runtime::provider_mcp_access_profile(purpose),
     );
     let allowed_provider_tools = cognitive_allowed_provider_tools(call.host, &expected_tools);
     let mut launch_contract = HostLaunchContract {
@@ -1965,7 +1969,7 @@ fn cognitive_external_execution_request(
         invocation,
         launch_contract,
         campaign_id: format!("cognitive-field:{}:{}", contract.run_id, call.call_id),
-        purpose: ExternalAgentPurpose::UnderstandingReader,
+        purpose,
         mcp_tool_profile,
         prompt_ref: canonical_path(prompt_path),
         prompt_sha256: call.prompt_sha256.clone(),
@@ -2014,7 +2018,14 @@ fn validate_execution_request_binding(
             && execution.output_schema_ref == canonical_path(&schema_path)
             && execution.output_schema_sha256 == call.provider_schema_sha256
             && execution.requested_model == call.requested_model
-            && execution.purpose == ExternalAgentPurpose::UnderstandingReader
+            && execution.purpose
+                == if call.executions[0].memory_condition
+                    == CognitiveMemoryCondition::MemoryFreeControl
+                {
+                    ExternalAgentPurpose::MemoryFreeControl
+                } else {
+                    ExternalAgentPurpose::UnderstandingReader
+                }
             && execution.read_only
             && execution.candidate_only,
         "stored external execution request differs from the sealed cognitive call"
@@ -8105,6 +8116,36 @@ mod tests {
                 &prompt_path,
                 &authority,
             )?;
+            assert_eq!(
+                execution.mcp_tool_profile,
+                crate::mcp_stdio::catalog::provider_mcp_tool_profile(
+                    crate::mcp_stdio::McpAccessProfile::UnderstandingReader,
+                )
+            );
+            if index == 0 {
+                let mut control_call = call.clone();
+                control_call.executions[0].memory_condition =
+                    CognitiveMemoryCondition::MemoryFreeControl;
+                let control_execution = cognitive_external_execution_request(
+                    &contract,
+                    &private_root,
+                    &control_call,
+                    &binding,
+                    &prompt_path,
+                    &authority,
+                )?;
+                assert_eq!(
+                    control_execution.purpose,
+                    ExternalAgentPurpose::MemoryFreeControl
+                );
+                assert_eq!(
+                    control_execution.mcp_tool_profile,
+                    crate::mcp_stdio::catalog::provider_mcp_tool_profile(
+                        crate::mcp_stdio::McpAccessProfile::CognitiveControl,
+                    )
+                );
+                assert!(control_execution.expected_mcp_tool_names.is_empty());
+            }
             crate::runtime_instance::atomic_write_json(
                 &runtime_root.join(format!("{call_id}-execution-request.json")),
                 &execution,
@@ -8718,6 +8759,12 @@ mod tests {
             &governor,
             Some("0123456789abcdef0123456789abcdef01234567"),
         )?;
+        assert_eq!(
+            contract.mcp_tool_profile,
+            crate::mcp_stdio::catalog::provider_mcp_tool_profile(
+                crate::mcp_stdio::McpAccessProfile::CodexWorker,
+            )
+        );
         let argv = contract.provider_argv.join("\n");
         assert!(argv.contains("mcp_servers.eliot-governor.command="));
         assert!(argv.contains("mcp_servers.eliot-governor.args="));
