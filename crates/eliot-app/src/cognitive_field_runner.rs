@@ -4,7 +4,8 @@ use crate::host_runtime::supervised_process::{
 };
 use anyhow::{Context, Result, bail, ensure};
 use eliot_engine::{
-    CognitiveFieldGradingService, HostBrokerService, seal_provider_runtime_contract,
+    CognitiveFieldGradingService, HostBrokerService, ProviderCallCampaignRequest,
+    ProviderCallReservationOwner, seal_provider_runtime_contract,
     validate_external_agent_execution_request, validate_provider_runtime_contract,
 };
 use eliot_types::external_agent::legacy::{
@@ -13,7 +14,8 @@ use eliot_types::external_agent::legacy::{
 use eliot_types::{
     AdapterCapability, AdapterContext, AdapterRequest, AdapterResultStatus,
     AgentCapabilityEnvelope, AgentHostId, AgentInvocationRequest, AgentRole, AgentSessionState,
-    AuthorityLeaseState, COGNITIVE_CORE_CONTINUATION_EXPECTED_PROVIDER_CALLS,
+    AuthorityLeaseLifetime, AuthorityLeaseState,
+    COGNITIVE_CORE_CONTINUATION_EXPECTED_PROVIDER_CALLS,
     COGNITIVE_CORE_CONTINUATION_MAX_PROVIDER_CALLS, COGNITIVE_CORE_QUALIFICATION_HARNESS_VERSION,
     COGNITIVE_CORE_QUALIFICATION_PROVIDER_CALLS, COGNITIVE_DETERMINISTIC_EVIDENCE_SCHEMA_VERSION,
     COGNITIVE_DETERMINISTIC_REPORT_SCHEMA_VERSION, COGNITIVE_FIELD_CONTRACT_SCHEMA_VERSION,
@@ -98,6 +100,7 @@ const LEGACY_WORKER_MISSING_FIELD: &str = "source_call.canonical_schema_sha256";
 const PROVIDER_PLAN_SEAL_RECORD_SCHEMA_VERSION: &str = "eliot-provider-plan-seal-v1";
 const SEAL_ARTIFACT_MANIFEST_SCHEMA_VERSION: &str = "eliot-seal-artifact-manifest-v1";
 const ABANDONED_SEAL_ATTEMPT_SCHEMA_VERSION: &str = "eliot-abandoned-seal-attempt-v1";
+const PUBLISHED_SEAL_SUPERSESSION_SCHEMA_VERSION: &str = "eliot-published-seal-supersession-v1";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -279,6 +282,72 @@ enum SealRecoveryDecision {
     AlreadyAbandoned,
     BlockedProviderEvidence,
     BlockedIntegrityMismatch,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+enum PublishedSealSupersessionDecision {
+    SupersedePublishedSealRuntimeDrift,
+    AlreadySuperseded,
+    BlockedProviderEvidence,
+    BlockedAuthorityMismatch,
+    BlockedNotRuntimeDrift,
+    BlockedIntegrityMismatch,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum PublishedSealRuntimeComparison {
+    Current,
+    GovernorBindingDrift(Vec<String>),
+    Incompatible(Vec<String>),
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PublishedSealSupersessionInspection {
+    schema_version: String,
+    run_id: String,
+    generation: u64,
+    seal_attempt_id: String,
+    decision: PublishedSealSupersessionDecision,
+    plan_binding_exact: bool,
+    authority_exact: bool,
+    runtime_drift_fields: Vec<String>,
+    provider_reservation_count: usize,
+    provider_result_count: usize,
+    provider_journal_paths: Vec<String>,
+    provider_artifact_paths: Vec<String>,
+    nonterminal_operation_ids: Vec<String>,
+    incomplete_seal_ids: Vec<String>,
+    integrity_errors: Vec<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PublishedSealSupersessionRecord {
+    schema_version: String,
+    recovery_state: SealRecoveryRecordState,
+    decision: PublishedSealSupersessionDecision,
+    run_id: String,
+    seal_attempt_id: String,
+    generation: u64,
+    provider_plan_sha256: String,
+    published_root: String,
+    public_plan_path: String,
+    quarantine_root: String,
+    published_manifest: Vec<SealArtifactEntry>,
+    public_plan_sha256: String,
+    session_ids: Vec<eliot_types::AgentSessionId>,
+    role_lease_ids: Vec<String>,
+    work_item_ids: Vec<WorkItemId>,
+    operation_job_ids: Vec<String>,
+    invocation_ids: Vec<String>,
+    runtime_drift_fields: Vec<String>,
+    recovery_steps: Vec<SealRecoveryStep>,
+    authority_revocation_refs: Vec<String>,
+    replacement_generation: u64,
+    #[serde(with = "time::serde::rfc3339")]
+    recorded_at: OffsetDateTime,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -2923,30 +2992,69 @@ fn activate_provider_seal_authority(
         "seal authority activation did not activate every prepared lease"
     );
     for entry in authority {
-        if !next_broker
+        let invocation = AgentInvocationRequest {
+            invocation_id: entry.invocation_id.clone(),
+            project_id: entry.project_id,
+            task_id: entry.task_id,
+            work_item_id: entry.work_item_id,
+            requested_capabilities: entry.capability_scope.clone(),
+            role_lease_id: entry.role_lease_id.clone(),
+            role_lease_epoch: entry.role_lease_epoch,
+            operation_generation: entry.operation_generation,
+            runtime_contract_sha256: Some(entry.runtime_contract_sha256.clone()),
+            work_lease_id: None,
+            packet_refs: Vec::new(),
+            expected_result_kind: "provider_execution_evidence".to_owned(),
+            verifier_ref: format!(
+                "cognitive-field-provider-verifier:{}:{}",
+                contract.run_id, entry.call_id
+            ),
+            idempotency_key: format!("cognitive-field:{}:{}", contract.run_id, entry.call_id),
+        };
+        if let Some(index) = next_broker
             .agent_invocations
             .iter()
-            .any(|invocation| invocation.invocation_id == entry.invocation_id)
+            .position(|candidate| candidate.invocation_id == entry.invocation_id)
         {
-            next_broker.agent_invocations.push(AgentInvocationRequest {
-                invocation_id: entry.invocation_id.clone(),
-                project_id: entry.project_id,
-                task_id: entry.task_id,
-                work_item_id: entry.work_item_id,
-                requested_capabilities: entry.capability_scope.clone(),
-                role_lease_id: entry.role_lease_id.clone(),
-                role_lease_epoch: entry.role_lease_epoch,
-                operation_generation: entry.operation_generation,
-                runtime_contract_sha256: Some(entry.runtime_contract_sha256.clone()),
-                work_lease_id: None,
-                packet_refs: Vec::new(),
-                expected_result_kind: "provider_execution_evidence".to_owned(),
-                verifier_ref: format!(
-                    "cognitive-field-provider-verifier:{}:{}",
-                    contract.run_id, entry.call_id
-                ),
-                idempotency_key: format!("cognitive-field:{}:{}", contract.run_id, entry.call_id),
-            });
+            if next_broker.agent_invocations[index] != invocation {
+                let prior_generation = next_broker.agent_invocations[index].operation_generation;
+                let prior_jobs = next_broker
+                    .operation_jobs
+                    .iter()
+                    .filter(|job| {
+                        job.invocation_id == entry.invocation_id
+                            && job.generation < entry.operation_generation
+                    })
+                    .collect::<Vec<_>>();
+                let prior_jobs_safe = !prior_jobs.is_empty()
+                    && prior_jobs.iter().all(|job| {
+                        job.state == OperationJobState::Abandoned
+                            && job.phase == OperationPhase::Abandoned
+                            && job.attempt == 0
+                            && job
+                                .result_ref
+                                .as_deref()
+                                .is_some_and(|result| result.starts_with("abandoned:"))
+                            && job.role_lease_id.as_ref().is_some_and(|role_lease_id| {
+                                next_broker.task_role_leases.iter().any(|lease| {
+                                    lease.role_lease_id == *role_lease_id
+                                        && lease.state == AuthorityLeaseState::Revoked
+                                })
+                            })
+                    });
+                ensure!(
+                    prior_generation < entry.operation_generation
+                        && prior_jobs_safe
+                        && !next_broker
+                            .agent_results
+                            .iter()
+                            .any(|result| result.invocation_id == entry.invocation_id),
+                    "stale AgentInvocationRequest cannot be superseded without exact pre-dispatch authority proof"
+                );
+                next_broker.agent_invocations[index].clone_from(&invocation);
+            }
+        } else {
+            next_broker.agent_invocations.push(invocation);
         }
         if !next_broker
             .operation_jobs
@@ -3705,13 +3813,14 @@ fn inspect_seal_recovery(
         .iter()
         .map(|call| call.call_id.as_str())
         .collect::<Vec<_>>();
-    let provider_reservation_count = broker
-        .provider_call_reservations
+    let provider_ledger = ProviderCallReservationOwner::new(&root).snapshot_read_only()?;
+    let provider_reservation_count = provider_ledger
+        .reservations
         .iter()
         .filter(|reservation| {
-            serde_json::to_string(reservation)
-                .ok()
-                .is_some_and(|value| call_ids.iter().any(|call_id| value.contains(call_id)))
+            call_ids.iter().any(|call_id| {
+                reservation.idempotency_key == format!("cognitive-field:{run_id}:{call_id}")
+            })
         })
         .count();
     let provider_result_count = broker
@@ -3813,6 +3922,776 @@ fn inspect_seal_recovery(
             }
         }),
     })
+}
+
+fn published_supersession_record_path(
+    private_root: &Path,
+    run_id: &str,
+    generation: u64,
+) -> PathBuf {
+    private_root.join("superseded-seals").join(format!(
+        "{}.json",
+        seal_attempt_component(run_id, generation)
+    ))
+}
+
+fn matching_provider_journal_paths(
+    runtime_root: &Path,
+    invocation_ids: &[String],
+    call_ids: &[String],
+) -> Result<Vec<String>> {
+    let mut matches = Vec::new();
+    for relative_root in [
+        "runtime/provider-invocations",
+        "runtime/provider-invocation-reconciliation",
+    ] {
+        let root = runtime_root.join(relative_root);
+        if !root.is_dir() {
+            continue;
+        }
+        for path in recursive_files(&root)? {
+            let display = path.display().to_string();
+            let file_name = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or_default();
+            let path_match = invocation_ids
+                .iter()
+                .chain(call_ids)
+                .any(|id| file_name.contains(id));
+            let content_match = fs::read(&path).is_ok_and(|bytes| {
+                invocation_ids
+                    .iter()
+                    .chain(call_ids)
+                    .any(|id| bytes_contain(&bytes, id.as_bytes()))
+            });
+            if path_match || content_match {
+                matches.push(display);
+            }
+        }
+    }
+    matches.sort();
+    matches.dedup();
+    Ok(matches)
+}
+
+fn published_provider_artifact_paths(
+    private_root: &Path,
+    call_ids: &[String],
+) -> Result<Vec<String>> {
+    let mut paths = recursive_files(private_root)?
+        .into_iter()
+        .filter_map(|path| {
+            let relative = path
+                .strip_prefix(private_root)
+                .ok()?
+                .to_string_lossy()
+                .replace('\\', "/");
+            let call_bound = call_ids.iter().any(|call_id| relative.contains(call_id));
+            let generated = relative.starts_with("receipts/provider-")
+                || relative.starts_with("provider-invocations/")
+                || relative.starts_with("outputs/")
+                || relative.starts_with("raw/")
+                || relative.contains("/spool/");
+            (call_bound && generated).then_some(relative)
+        })
+        .collect::<Vec<_>>();
+    paths.sort();
+    paths.dedup();
+    Ok(paths)
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "published-seal inspection intentionally classifies every zero-dispatch and authority fence in one read-only pass"
+)]
+async fn inspect_published_seal_supersession(
+    config_path: &Path,
+    run_id: &str,
+    report_root: &Path,
+    private_root: &Path,
+) -> Result<PublishedSealSupersessionInspection> {
+    let latest_generation = load_seal_records(private_root)?
+        .into_iter()
+        .filter(|record| record.run_id == run_id)
+        .map(|record| record.generation)
+        .max();
+    let completed_path = latest_generation
+        .map(|generation| published_supersession_record_path(private_root, run_id, generation))
+        .filter(|path| path.is_file());
+    if let Some(path) = completed_path {
+        let record: PublishedSealSupersessionRecord = read_json(&path)?;
+        if record.recovery_state == SealRecoveryRecordState::Complete {
+            return Ok(PublishedSealSupersessionInspection {
+                schema_version: "eliot-published-seal-supersession-inspection-v1".to_owned(),
+                run_id: run_id.to_owned(),
+                generation: record.generation,
+                seal_attempt_id: record.seal_attempt_id,
+                decision: PublishedSealSupersessionDecision::AlreadySuperseded,
+                plan_binding_exact: true,
+                authority_exact: true,
+                runtime_drift_fields: record.runtime_drift_fields,
+                provider_reservation_count: 0,
+                provider_result_count: 0,
+                provider_journal_paths: Vec::new(),
+                provider_artifact_paths: Vec::new(),
+                nonterminal_operation_ids: Vec::new(),
+                incomplete_seal_ids: Vec::new(),
+                integrity_errors: Vec::new(),
+            });
+        }
+    }
+    let plan_path = report_root.join("provider-plan.json");
+    ensure!(plan_path.is_file(), "published provider plan is absent");
+    let plan: CognitiveFieldProviderPlan = read_json(&plan_path)?;
+    validate_provider_plan_hash(&plan)?;
+    let seal_attempt_id = plan
+        .seal_attempt_id
+        .clone()
+        .context("published provider plan has no seal attempt ID")?;
+    let seal_record: ProviderPlanSealRecord =
+        read_json(&seal_record_path(private_root, &seal_attempt_id))?;
+    let published_root = PathBuf::from(&seal_record.published_root);
+    let candidate_path = published_root.join("candidate-provider-plan.json");
+    let public_bytes = fs::read(&plan_path)?;
+    let candidate_bytes = fs::read(&candidate_path).unwrap_or_default();
+    let provider_plan_sha256 = sha256_bytes(&public_bytes);
+    let plan_binding_exact = seal_record.state == ProviderPlanSealState::Published
+        && seal_record.run_id == run_id
+        && seal_record.generation == plan.seal_generation
+        && seal_record.seal_attempt_id == seal_attempt_id
+        && seal_record.provider_plan_sha256.as_deref() == Some(provider_plan_sha256.as_str())
+        && public_bytes == candidate_bytes;
+    let root = crate::delegation_runtime::root_from_config(config_path);
+    let broker = crate::delegation_runtime::load_state(&root)?;
+    let work = crate::delegation_runtime::load_work_state(&root)?;
+    let now = OffsetDateTime::now_utc();
+    let expected_leases = seal_record
+        .role_lease_ids
+        .iter()
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let expected_sessions = seal_record
+        .session_ids
+        .iter()
+        .copied()
+        .collect::<BTreeSet<_>>();
+    let scoped_leases = broker
+        .task_role_leases
+        .iter()
+        .filter(|lease| {
+            lease.generation == seal_record.generation
+                && lease.seal_attempt_id.as_deref() == Some(seal_attempt_id.as_str())
+        })
+        .map(|lease| lease.role_lease_id.clone())
+        .collect::<BTreeSet<_>>();
+    let leases_exact = !expected_leases.is_empty()
+        && expected_leases.len() == seal_record.role_lease_ids.len()
+        && expected_leases == scoped_leases
+        && seal_record.role_lease_ids.iter().all(|role_lease_id| {
+            broker.task_role_leases.iter().any(|lease| {
+                lease.role_lease_id == *role_lease_id
+                    && lease.state == AuthorityLeaseState::Active
+                    && lease.expires_at > now
+                    && lease.lifetime == AuthorityLeaseLifetime::SealBound
+                    && lease.generation == seal_record.generation
+                    && lease.seal_attempt_id.as_deref() == Some(seal_attempt_id.as_str())
+                    && expected_sessions.contains(&lease.agent_session_id)
+            })
+        });
+    let scoped_sessions = broker
+        .agent_host_sessions
+        .iter()
+        .filter(|session| {
+            session.state == AgentSessionState::Active
+                && session.generation == seal_record.generation
+        })
+        .map(|session| session.agent_session_id)
+        .collect::<BTreeSet<_>>();
+    let sessions_exact = !expected_sessions.is_empty()
+        && expected_sessions.len() == seal_record.session_ids.len()
+        && expected_sessions.len() == expected_leases.len()
+        && expected_sessions == scoped_sessions;
+    let jobs_exact = seal_record.operation_job_ids.iter().all(|job_id| {
+        broker.operation_jobs.iter().any(|job| {
+            job.job_id == *job_id
+                && job.generation == seal_record.generation
+                && job.state == OperationJobState::Queued
+                && job.phase == OperationPhase::Published
+                && job.attempt == 0
+                && job.result_ref.is_none()
+        })
+    });
+    let work_exact = seal_record.work_item_ids.iter().all(|work_item_id| {
+        work.work_items
+            .iter()
+            .any(|item| item.work_item_id == *work_item_id && item.status == WorkItemStatus::Open)
+    });
+    let authority_exact = leases_exact && sessions_exact && jobs_exact && work_exact;
+    let call_ids = plan
+        .calls
+        .iter()
+        .map(|call| call.call_id.clone())
+        .collect::<Vec<_>>();
+    let invocation_ids = call_ids
+        .iter()
+        .map(|call_id| format!("cognitive-field-{run_id}-{call_id}"))
+        .collect::<Vec<_>>();
+    let provider_ledger = ProviderCallReservationOwner::new(&root).snapshot_read_only()?;
+    let idempotency_keys = call_ids
+        .iter()
+        .map(|call_id| format!("cognitive-field:{run_id}:{call_id}"))
+        .collect::<BTreeSet<_>>();
+    let provider_reservation_count = provider_ledger
+        .reservations
+        .iter()
+        .filter(|reservation| idempotency_keys.contains(&reservation.idempotency_key))
+        .count();
+    let provider_result_count = broker
+        .agent_results
+        .iter()
+        .filter(|result| invocation_ids.contains(&result.invocation_id))
+        .count();
+    let provider_journal_paths =
+        matching_provider_journal_paths(&root, &invocation_ids, &call_ids)?;
+    let provider_artifact_paths = published_provider_artifact_paths(private_root, &call_ids)?;
+    let runtime_store =
+        crate::host_runtime::supervised_process::daemon_operation_runtime_handle(config_path)?;
+    let nonterminal_operation_ids = runtime_store
+        .list_nonterminal_checkpoints()
+        .await?
+        .into_iter()
+        .filter(|checkpoint| {
+            invocation_ids.iter().any(|id| {
+                checkpoint.operation_id.contains(id)
+                    || checkpoint.invocation_id.as_deref() == Some(id.as_str())
+            }) || checkpoint
+                .role_lease_id
+                .as_ref()
+                .is_some_and(|id| expected_leases.contains(id))
+        })
+        .map(|checkpoint| checkpoint.operation_id)
+        .collect::<Vec<_>>();
+    let incomplete_seal_ids = runtime_store
+        .load_incomplete_seal_staging()
+        .await?
+        .into_iter()
+        .filter(|checkpoint| checkpoint.run_id == run_id)
+        .map(|checkpoint| checkpoint.seal_attempt_id)
+        .collect::<Vec<_>>();
+    let runtime_comparison = if plan_binding_exact {
+        compare_published_seal_runtime(config_path, &published_root)?
+    } else {
+        PublishedSealRuntimeComparison::Incompatible(vec!["plan_binding".to_owned()])
+    };
+    let (runtime_drift_fields, runtime_drift_exact) = match runtime_comparison {
+        PublishedSealRuntimeComparison::GovernorBindingDrift(fields) => (fields, true),
+        PublishedSealRuntimeComparison::Current => (Vec::new(), false),
+        PublishedSealRuntimeComparison::Incompatible(fields) => (fields, false),
+    };
+    let provider_evidence = provider_reservation_count > 0
+        || provider_result_count > 0
+        || !provider_journal_paths.is_empty()
+        || !provider_artifact_paths.is_empty()
+        || !nonterminal_operation_ids.is_empty()
+        || !incomplete_seal_ids.is_empty();
+    let decision = if provider_evidence {
+        PublishedSealSupersessionDecision::BlockedProviderEvidence
+    } else if !plan_binding_exact {
+        PublishedSealSupersessionDecision::BlockedIntegrityMismatch
+    } else if !authority_exact {
+        PublishedSealSupersessionDecision::BlockedAuthorityMismatch
+    } else if !runtime_drift_exact {
+        PublishedSealSupersessionDecision::BlockedNotRuntimeDrift
+    } else {
+        PublishedSealSupersessionDecision::SupersedePublishedSealRuntimeDrift
+    };
+    let mut integrity_errors = Vec::new();
+    if !plan_binding_exact {
+        integrity_errors
+            .push("public/private provider-plan binding differs from Published seal".to_owned());
+    }
+    if !authority_exact {
+        integrity_errors
+            .push("Published seal authority/session/job/work sets are not exact".to_owned());
+    }
+    if provider_evidence {
+        integrity_errors
+            .push("provider evidence is nonzero or a nonterminal operation exists".to_owned());
+    }
+    if !runtime_drift_exact {
+        integrity_errors.push("runtime difference is not exact Governor binding drift".to_owned());
+    }
+    Ok(PublishedSealSupersessionInspection {
+        schema_version: "eliot-published-seal-supersession-inspection-v1".to_owned(),
+        run_id: run_id.to_owned(),
+        generation: seal_record.generation,
+        seal_attempt_id,
+        decision,
+        plan_binding_exact,
+        authority_exact,
+        runtime_drift_fields,
+        provider_reservation_count,
+        provider_result_count,
+        provider_journal_paths,
+        provider_artifact_paths,
+        nonterminal_operation_ids,
+        incomplete_seal_ids,
+        integrity_errors,
+    })
+}
+
+fn persist_published_supersession_record(
+    private_root: &Path,
+    record: &PublishedSealSupersessionRecord,
+) -> Result<()> {
+    let path = published_supersession_record_path(private_root, &record.run_id, record.generation);
+    fs::create_dir_all(
+        path.parent()
+            .context("published supersession record has no parent")?,
+    )?;
+    crate::runtime_instance::atomic_write_json(&path, record)
+}
+
+fn append_supersession_step(
+    private_root: &Path,
+    record: &mut PublishedSealSupersessionRecord,
+    step: &str,
+    detail: &str,
+) -> Result<()> {
+    if !record.recovery_steps.iter().any(|item| item.step == step) {
+        record.recovery_steps.push(SealRecoveryStep {
+            step: step.to_owned(),
+            outcome: "complete".to_owned(),
+            detail: detail.to_owned(),
+            recorded_at: OffsetDateTime::now_utc(),
+        });
+    }
+    persist_published_supersession_record(private_root, record)
+}
+
+fn superseded_job_is_exact(job: &OperationJob, generation: u64) -> bool {
+    job.generation == generation
+        && job.state == OperationJobState::Abandoned
+        && job.phase == OperationPhase::Abandoned
+        && job.attempt == 0
+        && job
+            .result_ref
+            .as_deref()
+            .is_some_and(|result| result == "abandoned:published_seal_superseded_runtime_drift")
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "published-seal supersession is an ordered resumable state machine with a fresh-reload postcondition"
+)]
+fn resume_published_seal_supersession(
+    config_path: &Path,
+    private_root: &Path,
+    record: &mut PublishedSealSupersessionRecord,
+    fail_after_step: Option<usize>,
+) -> Result<()> {
+    const REASON: &str = "published_seal_superseded_runtime_drift";
+    let record_path =
+        published_supersession_record_path(private_root, &record.run_id, record.generation);
+    let root = crate::delegation_runtime::root_from_config(config_path);
+    if !record
+        .recovery_steps
+        .iter()
+        .any(|step| step.step == "authority_fenced")
+    {
+        let mut broker = crate::delegation_runtime::load_state(&root)?;
+        let mut work = crate::delegation_runtime::load_work_state(&root)?;
+        for role_lease_id in &record.role_lease_ids {
+            let lease = broker
+                .task_role_leases
+                .iter()
+                .find(|lease| lease.role_lease_id == *role_lease_id)
+                .cloned()
+                .context("published supersession role lease disappeared")?;
+            match lease.state {
+                AuthorityLeaseState::Active => {
+                    HostBrokerService.revoke_role(
+                        &mut broker,
+                        role_lease_id,
+                        lease.epoch,
+                        REASON,
+                        Some(lease.epoch.saturating_add(1)),
+                    )?;
+                }
+                AuthorityLeaseState::Revoked if lease.revoke_reason.as_deref() == Some(REASON) => {}
+                _ => bail!("published supersession role lease is not Active or exactly Revoked"),
+            }
+        }
+        for session_id in &record.session_ids {
+            let session = broker
+                .agent_host_sessions
+                .iter()
+                .find(|session| session.agent_session_id == *session_id)
+                .context("published supersession session disappeared")?;
+            if session.state != AgentSessionState::Retired {
+                HostBrokerService.retire_session(&mut broker, *session_id, REASON)?;
+            }
+        }
+        for operation_job_id in &record.operation_job_ids {
+            let job = broker
+                .operation_jobs
+                .iter()
+                .find(|job| job.job_id == *operation_job_id)
+                .cloned()
+                .context("published supersession operation job disappeared")?;
+            if !superseded_job_is_exact(&job, record.generation) {
+                ensure!(
+                    job.generation == record.generation
+                        && job.state == OperationJobState::Queued
+                        && job.phase == OperationPhase::Published
+                        && job.attempt == 0
+                        && job.result_ref.is_none(),
+                    "published supersession operation job is not exact pre-dispatch authority"
+                );
+                HostBrokerService.abandon_operation(&mut broker, operation_job_id, REASON)?;
+            }
+        }
+        for work_item_id in &record.work_item_ids {
+            let item = work
+                .work_items
+                .iter_mut()
+                .find(|item| item.work_item_id == *work_item_id)
+                .context("published supersession WorkItem disappeared")?;
+            ensure!(
+                matches!(item.status, WorkItemStatus::Open | WorkItemStatus::Revoked),
+                "published supersession WorkItem is not exact pre-dispatch work"
+            );
+            item.status = WorkItemStatus::Revoked;
+            item.updated_at = OffsetDateTime::now_utc();
+        }
+        crate::delegation_runtime::save_work_state(&root, &work)?;
+        crate::delegation_runtime::save_host_broker_state(&root, &broker)?;
+        append_supersession_step(
+            private_root,
+            record,
+            "authority_fenced",
+            "leases revoked, sessions retired, jobs abandoned and work revoked before artifact movement",
+        )?;
+    }
+    if fail_after_step == Some(1) {
+        bail!("test-only failure after published supersession authority fence");
+    }
+    if !record
+        .recovery_steps
+        .iter()
+        .any(|step| step.step == "seal_abandoned")
+    {
+        let mut seal_record: ProviderPlanSealRecord =
+            read_json(&seal_record_path(private_root, &record.seal_attempt_id))?;
+        if seal_record.state == ProviderPlanSealState::Published {
+            seal_record.state = ProviderPlanSealState::Abandoned;
+            seal_record.abandoned_at = Some(OffsetDateTime::now_utc());
+            seal_record.failure_ref = Some(private_relative_ref(private_root, &record_path)?);
+            write_seal_record(private_root, &seal_record)?;
+        } else {
+            ensure!(
+                seal_record.state == ProviderPlanSealState::Abandoned
+                    && seal_record.failure_ref.as_deref()
+                        == Some(private_relative_ref(private_root, &record_path)?.as_str()),
+                "published supersession seal record changed outside the recovery transaction"
+            );
+        }
+        append_supersession_step(
+            private_root,
+            record,
+            "seal_abandoned",
+            "Published seal record changed to Abandoned before quarantine",
+        )?;
+    }
+    if fail_after_step == Some(2) {
+        bail!("test-only failure after published supersession seal transition");
+    }
+    let published_root = PathBuf::from(&record.published_root);
+    let quarantine_root = PathBuf::from(&record.quarantine_root);
+    let quarantined_generation = quarantine_root.join(format!("generation-{}", record.generation));
+    if !record
+        .recovery_steps
+        .iter()
+        .any(|step| step.step == "generation_quarantined")
+    {
+        if published_root.exists() {
+            ensure!(
+                !quarantined_generation.exists(),
+                "published supersession quarantine target already exists beside source"
+            );
+            ensure!(
+                quarantine_tree_manifest(&published_root)? == record.published_manifest,
+                "published generation bytes changed after supersession intent"
+            );
+            fs::create_dir_all(&quarantine_root)?;
+            fs::rename(&published_root, &quarantined_generation)?;
+        }
+        ensure!(
+            quarantine_tree_manifest(&quarantined_generation)? == record.published_manifest,
+            "quarantined generation differs from the immutable intent manifest"
+        );
+        append_supersession_step(
+            private_root,
+            record,
+            "generation_quarantined",
+            "immutable generation root moved and digest-verified",
+        )?;
+    }
+    if fail_after_step == Some(3) {
+        bail!("test-only failure after published supersession generation quarantine");
+    }
+    let public_plan_path = PathBuf::from(&record.public_plan_path);
+    let quarantined_plan = quarantine_root.join("public/provider-plan.json");
+    if !record
+        .recovery_steps
+        .iter()
+        .any(|step| step.step == "public_plan_quarantined")
+    {
+        if public_plan_path.exists() {
+            ensure!(
+                !quarantined_plan.exists(),
+                "published supersession public-plan target already exists beside source"
+            );
+            ensure!(
+                sha256_bytes(&fs::read(&public_plan_path)?) == record.public_plan_sha256,
+                "public provider plan changed after supersession intent"
+            );
+            fs::create_dir_all(
+                quarantined_plan
+                    .parent()
+                    .context("quarantined public plan has no parent")?,
+            )?;
+            fs::rename(&public_plan_path, &quarantined_plan)?;
+        }
+        ensure!(
+            sha256_bytes(&fs::read(&quarantined_plan)?) == record.public_plan_sha256,
+            "quarantined public provider plan differs from the intent digest"
+        );
+        append_supersession_step(
+            private_root,
+            record,
+            "public_plan_quarantined",
+            "public provider-plan projection moved and digest-verified",
+        )?;
+    }
+    if fail_after_step == Some(4) {
+        bail!("test-only failure after published supersession public-plan quarantine");
+    }
+    let broker = crate::delegation_runtime::load_state(&root)?;
+    let work = crate::delegation_runtime::load_work_state(&root)?;
+    ensure!(
+        record
+            .role_lease_ids
+            .iter()
+            .all(|id| broker.task_role_leases.iter().any(|lease| {
+                lease.role_lease_id == *id
+                    && lease.state == AuthorityLeaseState::Revoked
+                    && lease.revoke_reason.as_deref() == Some(REASON)
+            }))
+            && record.session_ids.iter().all(|id| broker
+                .agent_host_sessions
+                .iter()
+                .any(|session| session.agent_session_id == *id
+                    && session.state == AgentSessionState::Retired))
+            && record
+                .operation_job_ids
+                .iter()
+                .all(|id| broker.operation_jobs.iter().any(
+                    |job| job.job_id == *id && superseded_job_is_exact(job, record.generation)
+                ))
+            && record.work_item_ids.iter().all(|id| work
+                .work_items
+                .iter()
+                .any(|item| item.work_item_id == *id && item.status == WorkItemStatus::Revoked))
+            && !published_root.exists()
+            && !public_plan_path.exists(),
+        "published supersession fresh-reload postcondition failed"
+    );
+    record.authority_revocation_refs = broker
+        .authority_revocation_receipts
+        .iter()
+        .filter(|receipt| record.role_lease_ids.contains(&receipt.role_lease_id))
+        .map(|receipt| receipt.receipt_id.clone())
+        .collect();
+    record.authority_revocation_refs.sort();
+    record.authority_revocation_refs.dedup();
+    record.recovery_state = SealRecoveryRecordState::Complete;
+    append_supersession_step(
+        private_root,
+        record,
+        "postcondition_verified",
+        "fresh stores and quarantine digests prove complete idempotent supersession",
+    )
+}
+
+pub async fn supersede_published_seal(
+    config_path: &Path,
+    run_id: &str,
+    report_root: Option<&Path>,
+    private_root: Option<&Path>,
+    dry_run: bool,
+    apply: bool,
+) -> Result<()> {
+    supersede_published_seal_with_failpoint(
+        config_path,
+        run_id,
+        report_root,
+        private_root,
+        dry_run,
+        apply,
+        None,
+    )
+    .await
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "the operator command keeps intent creation, resume routing and immutable preconditions in one bounded transaction entrypoint"
+)]
+async fn supersede_published_seal_with_failpoint(
+    config_path: &Path,
+    run_id: &str,
+    report_root: Option<&Path>,
+    private_root: Option<&Path>,
+    dry_run: bool,
+    apply: bool,
+    fail_after_step: Option<usize>,
+) -> Result<()> {
+    ensure!(
+        dry_run ^ apply,
+        "supersede-seal requires exactly one of --dry-run or --apply"
+    );
+    let (report_root, private_root) =
+        resolve_cognitive_run_roots(run_id, report_root, private_root)?;
+    let records = load_seal_records(&private_root)?;
+    let generation = records
+        .iter()
+        .filter(|record| record.run_id == run_id)
+        .map(|record| record.generation)
+        .max()
+        .context("no seal record exists for published supersession")?;
+    let supersession_path = published_supersession_record_path(&private_root, run_id, generation);
+    if supersession_path.is_file() {
+        let mut record: PublishedSealSupersessionRecord = read_json(&supersession_path)?;
+        if record.recovery_state == SealRecoveryRecordState::Complete {
+            return print_json(&json!({
+                "status": "ALREADY_SUPERSEDED",
+                "run_id": run_id,
+                "generation": record.generation,
+                "replacement_generation": record.replacement_generation,
+                "provider_calls": 0,
+                "record": record,
+            }));
+        }
+        ensure!(
+            apply,
+            "an in-progress supersession requires --apply to resume"
+        );
+        resume_published_seal_supersession(
+            config_path,
+            &private_root,
+            &mut record,
+            fail_after_step,
+        )?;
+        return print_json(&json!({
+            "status": "PUBLISHED_SEAL_SUPERSEDED",
+            "run_id": run_id,
+            "generation": record.generation,
+            "replacement_generation": record.replacement_generation,
+            "provider_calls": 0,
+            "record": record,
+        }));
+    }
+    let inspection =
+        inspect_published_seal_supersession(config_path, run_id, &report_root, &private_root)
+            .await?;
+    if dry_run || inspection.decision == PublishedSealSupersessionDecision::AlreadySuperseded {
+        return print_json(&inspection);
+    }
+    ensure!(
+        inspection.decision
+            == PublishedSealSupersessionDecision::SupersedePublishedSealRuntimeDrift,
+        "published seal supersession is not safe to apply: {:?}",
+        inspection.decision
+    );
+    let seal_record: ProviderPlanSealRecord = read_json(&seal_record_path(
+        &private_root,
+        &inspection.seal_attempt_id,
+    ))?;
+    let plan_path = report_root.join("provider-plan.json");
+    let public_plan_bytes = fs::read(&plan_path)?;
+    let published_root = PathBuf::from(&seal_record.published_root);
+    let root = crate::delegation_runtime::root_from_config(config_path);
+    let broker = crate::delegation_runtime::load_state(&root)?;
+    let invocation_ids = seal_record
+        .operation_job_ids
+        .iter()
+        .map(|job_id| {
+            broker
+                .operation_jobs
+                .iter()
+                .find(|job| job.job_id == *job_id)
+                .map(|job| job.invocation_id.clone())
+                .with_context(|| format!("operation job {job_id} disappeared before intent"))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let quarantine_root = private_root
+        .join("quarantine")
+        .join(seal_attempt_component(run_id, inspection.generation));
+    ensure!(
+        !quarantine_root.exists(),
+        "published supersession quarantine root already exists without an intent record"
+    );
+    let mut record = PublishedSealSupersessionRecord {
+        schema_version: PUBLISHED_SEAL_SUPERSESSION_SCHEMA_VERSION.to_owned(),
+        recovery_state: SealRecoveryRecordState::InProgress,
+        decision: inspection.decision,
+        run_id: run_id.to_owned(),
+        seal_attempt_id: inspection.seal_attempt_id,
+        generation: inspection.generation,
+        provider_plan_sha256: sha256_bytes(&public_plan_bytes),
+        published_root: published_root.display().to_string(),
+        public_plan_path: plan_path.display().to_string(),
+        quarantine_root: quarantine_root.display().to_string(),
+        published_manifest: quarantine_tree_manifest(&published_root)?,
+        public_plan_sha256: sha256_bytes(&public_plan_bytes),
+        session_ids: seal_record.session_ids,
+        role_lease_ids: seal_record.role_lease_ids,
+        work_item_ids: seal_record.work_item_ids,
+        operation_job_ids: seal_record.operation_job_ids,
+        invocation_ids,
+        runtime_drift_fields: inspection.runtime_drift_fields,
+        recovery_steps: vec![SealRecoveryStep {
+            step: "intent_recorded".to_owned(),
+            outcome: "complete".to_owned(),
+            detail: "zero-dispatch evidence, exact authority and Governor-only drift were recorded before mutation".to_owned(),
+            recorded_at: OffsetDateTime::now_utc(),
+        }],
+        authority_revocation_refs: Vec::new(),
+        replacement_generation: inspection.generation.saturating_add(1),
+        recorded_at: OffsetDateTime::now_utc(),
+    };
+    ensure!(
+        record.provider_plan_sha256
+            == seal_record
+                .provider_plan_sha256
+                .context("Published seal record has no provider-plan SHA")?,
+        "supersession intent provider-plan SHA differs from the seal record"
+    );
+    persist_published_supersession_record(&private_root, &record)?;
+    if fail_after_step == Some(0) {
+        bail!("test-only failure after published supersession intent");
+    }
+    resume_published_seal_supersession(config_path, &private_root, &mut record, fail_after_step)?;
+    print_json(&json!({
+        "status": "PUBLISHED_SEAL_SUPERSEDED",
+        "run_id": run_id,
+        "generation": record.generation,
+        "replacement_generation": record.replacement_generation,
+        "provider_calls": 0,
+        "record": record,
+    }))
 }
 
 pub fn seal_status(
@@ -4235,6 +5114,12 @@ pub async fn execute_provider(
         },
         input: serde_json::to_value(&execution)?,
     };
+    ProviderCallReservationOwner::new(crate::delegation_runtime::root_from_config(config_path))
+        .open_campaign(ProviderCallCampaignRequest {
+            campaign_id: execution.campaign_id.clone(),
+            max_calls: 1,
+            closed: false,
+        })?;
     let supervisor = crate::host_runtime::production_external_agent_supervisor(config_path)?;
     let result = supervisor
         .execute(&call.adapter_id, adapter_request, None)
@@ -5451,6 +6336,160 @@ fn provider_runtime_contract(
         );
     }
     Ok(binding)
+}
+
+fn governor_runtime_drift_fields(
+    sealed: &ProviderRuntimeContract,
+    observed: &ProviderRuntimeContract,
+) -> PublishedSealRuntimeComparison {
+    if sealed == observed {
+        return PublishedSealRuntimeComparison::Current;
+    }
+    let mut normalized = observed.clone();
+    let mut fields = Vec::new();
+    match (
+        sealed.nonsecret_environment.get("ELIOT_GOVERNOR_EXE"),
+        normalized
+            .nonsecret_environment
+            .get_mut("ELIOT_GOVERNOR_EXE"),
+    ) {
+        (Some(sealed_value), Some(observed_value)) if sealed_value != observed_value => {
+            observed_value.clone_from(sealed_value);
+            fields.push("nonsecret_environment.ELIOT_GOVERNOR_EXE".to_owned());
+        }
+        (Some(_), Some(_)) => {}
+        _ => {
+            return PublishedSealRuntimeComparison::Incompatible(vec![
+                "nonsecret_environment.ELIOT_GOVERNOR_EXE".to_owned(),
+            ]);
+        }
+    }
+    let sealed_governors = sealed
+        .mcp_servers
+        .iter()
+        .filter(|server| server.name == "eliot-governor")
+        .collect::<Vec<_>>();
+    let observed_governor_indices = normalized
+        .mcp_servers
+        .iter()
+        .enumerate()
+        .filter_map(|(index, server)| (server.name == "eliot-governor").then_some(index))
+        .collect::<Vec<_>>();
+    if sealed_governors.len() != 1 || observed_governor_indices.len() != 1 {
+        return PublishedSealRuntimeComparison::Incompatible(vec![
+            "mcp_servers.eliot-governor.cardinality".to_owned(),
+        ]);
+    }
+    let sealed_governor = sealed_governors[0];
+    let observed_governor = &mut normalized.mcp_servers[observed_governor_indices[0]];
+    if sealed_governor.command != observed_governor.command {
+        observed_governor
+            .command
+            .clone_from(&sealed_governor.command);
+        fields.push("mcp_servers.eliot-governor.command".to_owned());
+    }
+    if sealed_governor.executable_sha256 != observed_governor.executable_sha256 {
+        observed_governor
+            .executable_sha256
+            .clone_from(&sealed_governor.executable_sha256);
+        fields.push("mcp_servers.eliot-governor.executable_sha256".to_owned());
+    }
+    if sealed_governor.build_source_commit != observed_governor.build_source_commit {
+        observed_governor
+            .build_source_commit
+            .clone_from(&sealed_governor.build_source_commit);
+        fields.push("mcp_servers.eliot-governor.build_source_commit".to_owned());
+    }
+    if sealed.runtime_contract_sha256 != normalized.runtime_contract_sha256 {
+        normalized
+            .runtime_contract_sha256
+            .clone_from(&sealed.runtime_contract_sha256);
+        fields.push("runtime_contract_sha256".to_owned());
+    }
+    fields.sort();
+    fields.dedup();
+    if !fields.is_empty() && normalized == *sealed {
+        PublishedSealRuntimeComparison::GovernorBindingDrift(fields)
+    } else {
+        PublishedSealRuntimeComparison::Incompatible(vec![
+            "non_governor_runtime_contract_fields".to_owned(),
+        ])
+    }
+}
+
+pub(crate) fn compare_published_seal_runtime(
+    config_path: &Path,
+    published_root: &Path,
+) -> Result<PublishedSealRuntimeComparison> {
+    let private_root = published_root
+        .parent()
+        .and_then(Path::parent)
+        .context("published seal root has no private certification root")?;
+    let plan: CognitiveFieldProviderPlan =
+        read_json(&published_root.join("candidate-provider-plan.json"))?;
+    validate_provider_plan_hash(&plan)?;
+    let mut all_drift_fields = Vec::new();
+    let mut incompatible = Vec::new();
+    for call in plan
+        .calls
+        .iter()
+        .filter(|call| call.host != AgentHostId::Codex)
+    {
+        let ProviderRuntimeBinding::Current(sealed_runtime) =
+            provider_runtime_contract(private_root, call)?
+        else {
+            incompatible.push(format!("{}:legacy_runtime", call.call_id));
+            continue;
+        };
+        let request_path = private_relative_file(
+            private_root,
+            &call.execution_request_ref,
+            "external execution request",
+        )?;
+        let execution: ExternalAgentExecutionRequest = read_json(&request_path)?;
+        let preview = crate::host_runtime::prepare_external_agent_runtime(
+            config_path,
+            call.host,
+            &execution,
+        )?;
+        if preview.adapter_id != call.adapter_id {
+            incompatible.push(format!("{}:adapter_id", call.call_id));
+        }
+        if preview.adapter_version != call.adapter_version {
+            incompatible.push(format!("{}:adapter_version", call.call_id));
+        }
+        match governor_runtime_drift_fields(&sealed_runtime, &preview.runtime_contract) {
+            PublishedSealRuntimeComparison::Current => {}
+            PublishedSealRuntimeComparison::GovernorBindingDrift(fields) => {
+                all_drift_fields.extend(
+                    fields
+                        .into_iter()
+                        .map(|field| format!("{}:{field}", call.call_id)),
+                );
+            }
+            PublishedSealRuntimeComparison::Incompatible(fields) => {
+                incompatible.extend(
+                    fields
+                        .into_iter()
+                        .map(|field| format!("{}:{field}", call.call_id)),
+                );
+            }
+        }
+    }
+    incompatible.sort();
+    incompatible.dedup();
+    if !incompatible.is_empty() {
+        return Ok(PublishedSealRuntimeComparison::Incompatible(incompatible));
+    }
+    all_drift_fields.sort();
+    all_drift_fields.dedup();
+    if all_drift_fields.is_empty() {
+        Ok(PublishedSealRuntimeComparison::Current)
+    } else {
+        Ok(PublishedSealRuntimeComparison::GovernorBindingDrift(
+            all_drift_fields,
+        ))
+    }
 }
 
 fn accepted_prior_executions(
@@ -7919,19 +8958,23 @@ mod tests {
         LEGACY_EVIDENCE_ADMISSION_SCHEMA_VERSION, LEGACY_WORKER_ACCEPTANCE_RUN_ID,
         LEGACY_WORKER_CASE_ID, LEGACY_WORKER_MISSING_FIELD, LEGACY_WORKER_SOURCE_CALL_ID,
         LEGACY_WORKER_SOURCE_RUN_ID, LegacyEvidenceAdmissionRecord, ProviderPlanSealRecord,
-        ProviderPlanSealState, READER_SCHEMA_JSON_PLACEHOLDER, READER_SCHEMA_SHA256_PLACEHOLDER,
-        SealRecoveryDecision, SealedPromptBinding, StagedSealAuthority, abandon_provider_seal,
-        canonical_path, codex_cognitive_runtime_contract, cognitive_external_execution_request,
+        ProviderPlanSealState, PublishedSealRuntimeComparison, PublishedSealSupersessionDecision,
+        PublishedSealSupersessionRecord, READER_SCHEMA_JSON_PLACEHOLDER,
+        READER_SCHEMA_SHA256_PLACEHOLDER, SealRecoveryDecision, SealRecoveryRecordState,
+        SealedPromptBinding, StagedSealAuthority, abandon_provider_seal, canonical_path,
+        codex_cognitive_runtime_contract, cognitive_external_execution_request,
         deterministic_equivalence_record, execution_conditions, generated_oracle,
-        inspect_seal_recovery, load_seal_records, provider_compatible_reader_schema,
+        governor_runtime_drift_fields, inspect_seal_recovery, load_seal_records,
+        persist_published_supersession_record, provider_compatible_reader_schema,
         provider_plan_seal_response, provider_plan_without_hash, record_provider, recover_seal,
         render_provider_contract, render_reader_prompt, resolve_judge_deterministic_binding,
-        role_schema_contracts, schema_validation_projection, seal_attempt_component,
-        seal_provider_runtime_contract, sha256_bytes, stage_artifacts_with_cleanup,
-        validate_deterministic_receipt, validate_governor_product_provenance,
-        validate_json_schema_instance, validate_legacy_evidence_admission_record,
-        validate_provider_calls, validate_provider_calls_with_sources,
-        validate_provider_receipt_envelope, validate_reader_output, write_new_or_same_json,
+        resume_published_seal_supersession, role_schema_contracts, schema_validation_projection,
+        seal_attempt_component, seal_provider_runtime_contract, sha256_bytes,
+        stage_artifacts_with_cleanup, validate_deterministic_receipt,
+        validate_governor_product_provenance, validate_json_schema_instance,
+        validate_legacy_evidence_admission_record, validate_provider_calls,
+        validate_provider_calls_with_sources, validate_provider_receipt_envelope,
+        validate_reader_output, write_new_or_same_json, write_seal_record,
     };
     use eliot_engine::{CognitiveFieldGradingService, computed_provider_runtime_contract_sha256};
     use eliot_types::{
@@ -7960,6 +9003,332 @@ mod tests {
     use std::path::Path;
     use time::OffsetDateTime;
     use uuid::Uuid;
+
+    #[test]
+    fn runtime_drift_classification_allows_only_governor_binding() {
+        let route_policy = ProviderRoutePolicy::for_route(
+            AgentHostId::Antigravity,
+            "runtime-drift-test",
+            ProviderDeclaredBudget::new(10_000, 1_048_576),
+        );
+        let mut environment = BTreeMap::new();
+        environment.insert(
+            "ELIOT_GOVERNOR_EXE".to_owned(),
+            "C:/governor/old.exe".to_owned(),
+        );
+        let mut sealed = ProviderRuntimeContract {
+            schema_version: PROVIDER_RUNTIME_CONTRACT_SCHEMA_VERSION.to_owned(),
+            host: AgentHostId::Antigravity,
+            purpose: ExternalAgentPurpose::UnderstandingReader,
+            provider_executable: "C:/provider/agy.exe".to_owned(),
+            provider_executable_sha256: "a".repeat(64),
+            provider_version: "fixture".to_owned(),
+            requested_model: "gemini-fixture".to_owned(),
+            model_selection_mechanism: "cli_flag".to_owned(),
+            provider_cwd: "C:/worktree".to_owned(),
+            provider_argv: vec!["--print".to_owned()],
+            nonsecret_environment: environment,
+            mcp_servers: vec![ProviderMcpServerContract {
+                name: "eliot-governor".to_owned(),
+                command: "C:/governor/old.exe".to_owned(),
+                args: vec!["mcp".to_owned()],
+                cwd: "C:/worktree".to_owned(),
+                required: true,
+                enabled: true,
+                executable_sha256: "b".repeat(64),
+                build_source_commit: Some("c".repeat(40)),
+            }],
+            mcp_tool_profile: ProviderMcpToolProfileBinding::new(
+                "understanding_reader",
+                vec!["eliot_current_state".to_owned()],
+            ),
+            expected_mcp_tool_names: vec!["eliot_current_state".to_owned()],
+            forbidden_mcp_server_names: vec!["eliot_surrealdb".to_owned()],
+            allowed_provider_tools: vec!["eliot_current_state".to_owned()],
+            denied_provider_tools: vec!["Write".to_owned()],
+            permission_profile: "external_auditor".to_owned(),
+            structured_output_mode: ProviderStructuredOutputMode::NativeJsonSchema,
+            output_schema_sha256: "d".repeat(64),
+            timeout_profile_ref: route_policy.policy_id().to_owned(),
+            provider_route_policy: route_policy.binding(),
+            process_containment: "windows-job".to_owned(),
+            candidate_only: true,
+            runtime_contract_sha256: "e".repeat(64),
+        };
+        let mut observed = sealed.clone();
+        observed.nonsecret_environment.insert(
+            "ELIOT_GOVERNOR_EXE".to_owned(),
+            "C:/governor/new.exe".to_owned(),
+        );
+        observed.mcp_servers[0].command = "C:/governor/new.exe".to_owned();
+        observed.mcp_servers[0].executable_sha256 = "f".repeat(64);
+        observed.mcp_servers[0].build_source_commit = Some("1".repeat(40));
+        observed.runtime_contract_sha256 = "2".repeat(64);
+        let PublishedSealRuntimeComparison::GovernorBindingDrift(fields) =
+            governor_runtime_drift_fields(&sealed, &observed)
+        else {
+            panic!("Governor-only binding change was not classified as recoverable drift");
+        };
+        assert_eq!(fields.len(), 5);
+
+        observed.requested_model = "different-model".to_owned();
+        assert!(matches!(
+            governor_runtime_drift_fields(&sealed, &observed),
+            PublishedSealRuntimeComparison::Incompatible(_)
+        ));
+        sealed.requested_model = observed.requested_model.clone();
+        assert!(!matches!(
+            governor_runtime_drift_fields(&sealed, &observed),
+            PublishedSealRuntimeComparison::Current
+        ));
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the supersession fixture verifies crash resume, authority fencing and immutable-byte replay"
+    )]
+    fn published_supersession_resumes_and_replays_byte_identically()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let run_id = "run-supersession";
+        let generation = 3;
+        let root =
+            std::env::temp_dir().join(format!("eliot-published-supersession-{}", Uuid::new_v4()));
+        let config_path = root.join("config/governor.toml");
+        let private_root = root.join("cognitive-field").join(run_id);
+        let report_root = root.join("reports").join(run_id);
+        let published_root = private_root.join("sealed/3");
+        fs::create_dir_all(
+            config_path
+                .parent()
+                .ok_or_else(|| std::io::Error::other("config path has no parent"))?,
+        )?;
+        fs::create_dir_all(&published_root)?;
+        fs::create_dir_all(&report_root)?;
+        fs::write(&config_path, b"# supersession fixture\n")?;
+        let plan_bytes = b"{\"plan_hash\":\"fixture\"}\n";
+        fs::write(
+            published_root.join("candidate-provider-plan.json"),
+            plan_bytes,
+        )?;
+        fs::write(published_root.join("artifact.json"), b"immutable\n")?;
+        let public_plan_path = report_root.join("provider-plan.json");
+        fs::write(&public_plan_path, plan_bytes)?;
+        let private_root = fs::canonicalize(private_root)?;
+        let published_root = private_root.join("sealed/3");
+        let report_root = fs::canonicalize(report_root)?;
+        let public_plan_path = report_root.join("provider-plan.json");
+        let quarantine_root = private_root.join("quarantine/seal-supersession-g3");
+
+        let project_id = ProjectId::new_v7();
+        let task_id = TaskId::new_v7();
+        let session_id = AgentSessionId::new_v7();
+        let work_item_id = WorkItemId::new_v7();
+        let now = OffsetDateTime::now_utc();
+        let role_lease_id = "role-lease:supersession".to_owned();
+        let job_id = "operation-job:supersession".to_owned();
+        let seal_attempt_id = "provider-plan-seal:supersession-g3".to_owned();
+        let mut broker = eliot_types::DelegationState::default();
+        broker.agent_host_sessions.push(AgentSessionHostBinding {
+            agent_session_id: session_id,
+            host_identity: AgentHostIdentity {
+                host_id: AgentHostId::Antigravity,
+                implementation_name: "antigravity".to_owned(),
+                client_instance_id: "supersession-g3".to_owned(),
+            },
+            capability_envelope: AgentCapabilityEnvelope {
+                capabilities: vec!["emit_candidate_observation".to_owned()],
+                structured_output: true,
+                resumable: true,
+                interactive: false,
+                supervised: true,
+            },
+            bound_project_id: Some(project_id),
+            bound_task_id: Some(task_id),
+            task_role_lease_refs: vec![role_lease_id.clone()],
+            state: AgentSessionState::Active,
+            generation,
+            owner_operation_id: Some(job_id.clone()),
+            disconnected_at: None,
+            disconnect_reason: None,
+        });
+        broker.task_role_leases.push(TaskRoleLease {
+            role_lease_id: role_lease_id.clone(),
+            task_id,
+            agent_session_id: session_id,
+            role: AgentRole::Auditor,
+            capability_scope: vec!["emit_candidate_observation".to_owned()],
+            expires_at: now + time::Duration::minutes(30),
+            epoch: 3,
+            state: AuthorityLeaseState::Active,
+            lifetime: eliot_types::AuthorityLeaseLifetime::SealBound,
+            owner_operation_id: Some(job_id.clone()),
+            seal_attempt_id: Some(seal_attempt_id.clone()),
+            generation,
+            issued_at: Some(now),
+            activated_at: Some(now),
+            consumed_at: None,
+            revoked_at: None,
+            revoke_reason: None,
+            superseded_by_epoch: None,
+        });
+        broker.operation_jobs.push(OperationJob {
+            job_id: job_id.clone(),
+            invocation_id: "invocation:supersession".to_owned(),
+            host_id: AgentHostId::Antigravity,
+            state: OperationJobState::Queued,
+            attempt: 0,
+            resume_session_id: None,
+            result_ref: None,
+            idempotency_key: "idempotency:supersession".to_owned(),
+            created_at: now,
+            updated_at: now,
+            generation,
+            phase: OperationPhase::Published,
+            phase_started_at: Some(now),
+            last_progress_at: Some(now),
+            phase_deadline_at: None,
+            absolute_deadline_at: None,
+            restart_count: 0,
+            runtime_contract_sha256: Some("a".repeat(64)),
+            role_lease_id: Some(role_lease_id.clone()),
+            role_lease_epoch: Some(3),
+        });
+        crate::delegation_runtime::save_host_broker_state(&root, &broker)?;
+        let mut work = eliot_engine::WorkState::default();
+        work.work_items.push(WorkItem {
+            work_item_id,
+            project_id,
+            task_id,
+            project: "supersession-fixture".to_owned(),
+            task: "supersede published seal".to_owned(),
+            goal: "prove crash-resumable immutable supersession".to_owned(),
+            scope: WorkScope {
+                repo_root: root.display().to_string(),
+                read_set: vec![root.display().to_string()],
+                write_set: Vec::new(),
+                verifier_set: vec!["verifier:supersession".to_owned()],
+                authority: eliot_types::AuthorityProfile::read_only(),
+                risk_tier: eliot_types::RiskTier::Low,
+                max_files: 0,
+                requires_active_work_lease: false,
+            },
+            status: WorkItemStatus::Open,
+            required: true,
+            allowed_roles: vec![AgentRole::Auditor],
+            required_verifiers: Vec::new(),
+            created_by: session_id,
+            active_lease_id: None,
+            lease_refs: Vec::new(),
+            conflict_refs: Vec::new(),
+            created_at: now,
+            updated_at: now,
+            completed_at: None,
+            write_receipt: None,
+        });
+        crate::delegation_runtime::save_work_state(&root, &work)?;
+
+        let plan_sha256 = sha256_bytes(plan_bytes);
+        write_seal_record(
+            &private_root,
+            &ProviderPlanSealRecord {
+                schema_version: "eliot-provider-plan-seal-v1".to_owned(),
+                seal_attempt_id: seal_attempt_id.clone(),
+                run_id: run_id.to_owned(),
+                generation,
+                state: ProviderPlanSealState::Published,
+                contract_sha256: "b".repeat(64),
+                role_evidence_plan_sha256: "c".repeat(64),
+                staged_manifest_sha256: "d".repeat(64),
+                provider_plan_sha256: Some(plan_sha256.clone()),
+                session_ids: vec![session_id],
+                role_lease_ids: vec![role_lease_id.clone()],
+                work_item_ids: vec![work_item_id],
+                operation_job_ids: vec![job_id.clone()],
+                staging_root: private_root.join("seal-staging/g3").display().to_string(),
+                published_root: published_root.display().to_string(),
+                activated_at: Some(now),
+                published_at: Some(now),
+                abandoned_at: None,
+                failure_ref: None,
+            },
+        )?;
+        let mut supersession = PublishedSealSupersessionRecord {
+            schema_version: "eliot-published-seal-supersession-v1".to_owned(),
+            recovery_state: SealRecoveryRecordState::InProgress,
+            decision: PublishedSealSupersessionDecision::SupersedePublishedSealRuntimeDrift,
+            run_id: run_id.to_owned(),
+            seal_attempt_id,
+            generation,
+            provider_plan_sha256: plan_sha256.clone(),
+            published_root: published_root.display().to_string(),
+            public_plan_path: public_plan_path.display().to_string(),
+            quarantine_root: quarantine_root.display().to_string(),
+            published_manifest: super::quarantine_tree_manifest(&published_root)?,
+            public_plan_sha256: plan_sha256,
+            session_ids: vec![session_id],
+            role_lease_ids: vec![role_lease_id],
+            work_item_ids: vec![work_item_id],
+            operation_job_ids: vec![job_id],
+            invocation_ids: vec!["invocation:supersession".to_owned()],
+            runtime_drift_fields: vec!["mcp_servers.eliot-governor.command".to_owned()],
+            recovery_steps: vec![super::SealRecoveryStep {
+                step: "intent_recorded".to_owned(),
+                outcome: "complete".to_owned(),
+                detail: "fixture".to_owned(),
+                recorded_at: now,
+            }],
+            authority_revocation_refs: Vec::new(),
+            replacement_generation: 4,
+            recorded_at: now,
+        };
+        persist_published_supersession_record(&private_root, &supersession)?;
+        assert!(
+            resume_published_seal_supersession(
+                &config_path,
+                &private_root,
+                &mut supersession,
+                Some(2),
+            )
+            .is_err()
+        );
+        assert!(published_root.exists());
+        assert!(public_plan_path.exists());
+        assert_eq!(
+            load_seal_records(&private_root)?
+                .into_iter()
+                .find(|record| record.generation == generation)
+                .ok_or("superseded seal record is missing")?
+                .state,
+            ProviderPlanSealState::Abandoned
+        );
+
+        resume_published_seal_supersession(&config_path, &private_root, &mut supersession, None)?;
+        assert_eq!(
+            supersession.recovery_state,
+            SealRecoveryRecordState::Complete
+        );
+        assert!(!published_root.exists());
+        assert!(!public_plan_path.exists());
+        assert_eq!(
+            fs::read(quarantine_root.join("generation-3/artifact.json"))?,
+            b"immutable\n"
+        );
+        let broker_before = fs::read(root.join("reports/delegation-state/latest.json"))?;
+        let work_before = fs::read(root.join("reports/work/state.json"))?;
+        let supersession_path =
+            super::published_supersession_record_path(&private_root, run_id, generation);
+        let supersession_before = fs::read(&supersession_path)?;
+        resume_published_seal_supersession(&config_path, &private_root, &mut supersession, None)?;
+        assert_eq!(
+            fs::read(root.join("reports/delegation-state/latest.json"))?,
+            broker_before
+        );
+        assert_eq!(fs::read(root.join("reports/work/state.json"))?, work_before);
+        assert_eq!(fs::read(supersession_path)?, supersession_before);
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
 
     #[test]
     fn seal_stage_failure_cleans_private_root_and_retry_succeeds_without_authority()

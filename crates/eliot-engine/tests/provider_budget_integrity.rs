@@ -76,14 +76,31 @@ fn join_decisions(
 }
 
 #[test]
+fn read_only_snapshot_does_not_create_or_rewrite_ledger_files() -> TestResult {
+    let root = TempRoot::new("read-only-snapshot")?;
+    let owner = ProviderCallReservationOwner::new(root.path());
+    assert_eq!(owner.snapshot_read_only()?.budgets.len(), 0);
+    assert!(!root.path().join("runtime").exists());
+
+    open_campaign(&owner, "campaign:read-only", 1)?;
+    let ledger_path = root.path().join("runtime/provider-call-ledger.json");
+    let lock_path = root.path().join("runtime/provider-call-ledger.lock");
+    let ledger_before = fs::read(&ledger_path)?;
+    let lock_before = fs::read(&lock_path)?;
+    assert_eq!(owner.snapshot_read_only()?.budgets.len(), 1);
+    assert_eq!(fs::read(ledger_path)?, ledger_before);
+    assert_eq!(fs::read(lock_path)?, lock_before);
+    Ok(())
+}
+
+#[test]
 fn reservation_cannot_create_or_size_its_campaign() -> TestResult {
     let root = TempRoot::new("controller-owned")?;
     let owner = ProviderCallReservationOwner::new(root.path());
-    assert!(
-        owner
-            .reserve(request("campaign:controller-owned", "first"))
-            .is_err()
-    );
+    assert!(matches!(
+        owner.reserve(request("campaign:controller-owned", "first"))?,
+        ProviderCallReservationDecision::CampaignClosed
+    ));
     open_campaign(&owner, "campaign:controller-owned", 1)?;
     assert!(matches!(
         owner.reserve(request("campaign:controller-owned", "first"))?,

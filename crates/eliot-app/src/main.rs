@@ -1783,6 +1783,18 @@ enum CognitiveFieldCommand {
         #[arg(long, conflicts_with = "dry_run")]
         apply: bool,
     },
+    SupersedeSeal {
+        #[arg(long)]
+        run: String,
+        #[arg(long)]
+        report_root: Option<PathBuf>,
+        #[arg(long)]
+        private_root: Option<PathBuf>,
+        #[arg(long, conflicts_with = "apply")]
+        dry_run: bool,
+        #[arg(long, conflicts_with = "dry_run")]
+        apply: bool,
+    },
     CodexRuntimePreflight {
         #[arg(long)]
         provider_executable: PathBuf,
@@ -2495,6 +2507,23 @@ async fn dispatch_cognitive_field_command(
             dry_run,
             apply,
         ),
+        CognitiveFieldCommand::SupersedeSeal {
+            run,
+            report_root,
+            private_root,
+            dry_run,
+            apply,
+        } => {
+            cognitive_field_runner::supersede_published_seal(
+                config,
+                &run,
+                report_root.as_deref(),
+                private_root.as_deref(),
+                dry_run,
+                apply,
+            )
+            .await
+        }
         CognitiveFieldCommand::CodexRuntimePreflight {
             provider_executable,
             worktree,

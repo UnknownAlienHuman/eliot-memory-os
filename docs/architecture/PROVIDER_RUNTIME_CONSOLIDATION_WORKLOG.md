@@ -663,3 +663,55 @@ This log preserves the ordered implementation evidence for
   unless replay is generation-exact under a strict zero-attempt supersession fence. Call IDs and
   idempotency keys must remain stable across generation 4 so the durable double-spend guard stays
   armed; leases, sessions, jobs, epochs, seal IDs and runtime hashes must be re-minted.
+
+### Supersession implementation and verification checkpoint
+
+- Source verification confirmed both latent defects. One Opus detail was corrected against current
+  code: `abandon_operation` intentionally writes `result_ref=abandoned:<reason>`, not `None`.
+  Generation replay therefore requires `Abandoned`, `attempt=0`, an exact typed abandoned result,
+  and the referenced lease already `Revoked`; attempted, unknown-outcome, result-bearing or
+  non-revoked prior authority remains blocked.
+- Added `cognitive-field supersede-seal --dry-run|--apply`. Its read-only classification requires
+  byte-identical public/private plan bindings, exact Published seal/session/lease/job/work sets,
+  zero authoritative ledger reservations, zero results, zero provider journal/reconciliation
+  attempts, zero private provider artifacts, zero nonterminal operation checkpoints, zero
+  incomplete seal staging and runtime differences limited to the Governor MCP command/SHA/source
+  binding plus derived runtime hash.
+- Apply first writes a typed `eliot-published-seal-supersession-v1` intent, then resumably revokes
+  leases, retires sessions, abandons zero-attempt jobs, revokes WorkItems, marks the old seal
+  Abandoned, digest-verifies and moves the immutable generation root and public plan to quarantine,
+  fresh-reloads every store, and marks the intent Complete. Failpoints cover intent, authority,
+  seal-state, generation-move and public-plan steps. Reused role projections remain in place. A
+  separate later seal creates generation 4.
+- Runtime supervision now classifies `published_seal_runtime_drift`, blocks provider dispatch, but
+  permits the daemon to boot in this single recovery-only state. Exact dispatch runtime equality is
+  unchanged. `ProviderCallReservationOwner::snapshot_read_only` avoids creating a ledger/lock on a
+  dry-run; legacy recovery now also reads this authoritative ledger instead of the broker mirror.
+- Generation-exact HostBroker replay preserves stable logical call/idempotency keys only when all
+  lower-generation jobs are exact abandoned zero-attempt authority with revoked leases and no
+  result. Seal activation updates a stale `AgentInvocationRequest` only under the same fence.
+  Cognitive external execution now opens its sealed one-call campaign before adapter reservation;
+  without this missing controller step the next real call would have failed `CampaignClosed`.
+- Focused tests: cognitive runner 28/28 PASS (0.97 s behavior / 43.588 s compile-dominated wall),
+  runtime integrity 5/5 PASS (0.64 s / 1.435 s), provider ledger 10/10 PASS (0.82 s / 3.690 s),
+  host integration 13/13 PASS (0.02 s / 3.289 s), cognitive CLI 2/2 PASS (1.84 s / 58.816 s).
+  The new crash test fails after seal-state transition, resumes to complete digest-verified
+  quarantine, then proves a byte-identical replay; its behavior took 0.14 s. Engine generation
+  replay and Governor-only drift classification each pass.
+- The first workspace Clippy pass found only the transaction entrypoint's `too_many_lines`; a local
+  reasoned annotation was added, with no warning suppression outside that state machine. Final
+  workspace all-target Clippy with warnings denied passed in 28.056 s; format and check pass.
+- One old ledger test expected an error for a missing campaign even though the typed API has long
+  returned `Ok(CampaignClosed)`; the expectation was corrected without changing runtime behavior.
+  One PowerShell timing wrapper accidentally invoked bare `cargo --help` five times and was not
+  counted as testing. Two attempts to run the new real dry-run from an uncommitted debug binary
+  failed before inspection with `unattested_cognitive_governor`; both public/private SHA inventories
+  remained byte-identical (23 and 1600 files). No attestation bypass was added; live proof waits for
+  a commit-bound candidate.
+- Final inspection hardening additionally requires every seal-bound lease to be unexpired, maps
+  every lease to an exact seal session, rejects duplicate lease/session IDs, rejects any extra
+  active session in the same generation, and requires one session per lease. After this change the
+  cognitive runner remained 28/28 PASS (0.70 s behavior / 59.276 s compile-dominated wall),
+  cognitive contract 3/3 PASS (0.68 s / 0.960 s), CLI 2/2 PASS (0.09 s / 0.340 s), and final
+  `eliot-app` all-target Clippy with warnings denied passed in 12.692 s. The CLI help regression now
+  explicitly requires `supersede-seal` and passed in 1.555 s wall.

@@ -27,6 +27,7 @@ const EXTERNAL_ADAPTER_IDS: [&str; 3] = [
 struct SealInventory {
     partial_ids: BTreeSet<String>,
     published_without_authority: u32,
+    published_runtime_drift: u32,
     authority_without_published: u32,
     quarantine_records: u32,
     errors: Vec<String>,
@@ -378,6 +379,7 @@ pub(crate) async fn inspect(
         stale_epoch_results: usize_to_u32(stale_epoch_results),
         partial_seals: usize_to_u32(seal_inventory.partial_ids.len()),
         published_plans_without_authority: seal_inventory.published_without_authority,
+        published_seal_runtime_drift: seal_inventory.published_runtime_drift,
         authority_without_published_plan: seal_inventory.authority_without_published,
     };
 
@@ -393,6 +395,9 @@ pub(crate) async fn inspect(
     }
     if authority_integrity.published_plans_without_authority > 0 {
         integrity_errors.push("published_plans_without_authority".to_owned());
+    }
+    if authority_integrity.published_seal_runtime_drift > 0 {
+        integrity_errors.push("published_seal_runtime_drift".to_owned());
     }
     if authority_integrity.authority_without_published_plan > 0 {
         integrity_errors.push("authority_without_published_plan".to_owned());
@@ -432,6 +437,7 @@ pub(crate) async fn inspect(
         && authority_integrity.orphaned_role_leases == 0
         && authority_integrity.partial_seals == 0
         && authority_integrity.published_plans_without_authority == 0
+        && authority_integrity.published_seal_runtime_drift == 0
         && authority_integrity.authority_without_published_plan == 0;
     let (overall, reason) = if !core.ready {
         (RuntimeOverallStatus::NotReady, "core_not_ready".to_owned())
@@ -845,7 +851,21 @@ pub(crate) async fn startup_recover_and_report(
                     | "orphan_or_cleanup_processes"
             )
         });
-    if !report.provider_dispatch_safe && !canonical_close_recovery_only {
+    let published_seal_runtime_recovery_only = report.core.ready
+        && report.operations.active == 0
+        && report.operations.stuck == 0
+        && report.operations.awaiting_reconciliation == 0
+        && report.operations.cleanup_pending == 0
+        && report.operations.orphan_processes == 0
+        && report.authority_integrity.published_seal_runtime_drift > 0
+        && report
+            .integrity_errors
+            .iter()
+            .all(|error| error == "published_seal_runtime_drift");
+    if !report.provider_dispatch_safe
+        && !canonical_close_recovery_only
+        && !published_seal_runtime_recovery_only
+    {
         bail!(
             "runtime integrity blocks provider dispatch: {}",
             report.integrity_errors.join(", ")
@@ -860,7 +880,7 @@ pub(crate) fn persist_report(config_path: &Path, report: &RuntimeSupervisionRepo
     std::fs::create_dir_all(&report_root)?;
     atomic_write_json(&report_root.join("latest.json"), report)?;
     let markdown = format!(
-        "# Runtime supervision\n\n- overall: `{:?}`\n- reason: `{}`\n- provider dispatch safe: `{}`\n- active operations: `{}`\n- orphan processes: `{}`\n- orphaned role leases: `{}`\n- partial seals: `{}`\n",
+        "# Runtime supervision\n\n- overall: `{:?}`\n- reason: `{}`\n- provider dispatch safe: `{}`\n- active operations: `{}`\n- orphan processes: `{}`\n- orphaned role leases: `{}`\n- partial seals: `{}`\n- published seal runtime drift: `{}`\n",
         report.overall,
         report.reason,
         report.provider_dispatch_safe,
@@ -868,6 +888,7 @@ pub(crate) fn persist_report(config_path: &Path, report: &RuntimeSupervisionRepo
         report.operations.orphan_processes,
         report.authority_integrity.orphaned_role_leases,
         report.authority_integrity.partial_seals,
+        report.authority_integrity.published_seal_runtime_drift,
     );
     crate::runtime_instance::atomic_write_bytes(&report_root.join("latest.md"), markdown.as_bytes())
 }
@@ -1161,6 +1182,32 @@ fn scan_seal_inventory(
                             && lease.generation == generation
                     })
                 });
+            if plan_current
+                && authority_current
+                && let Some(root) = published_root.as_deref()
+            {
+                match crate::cognitive_field_runner::compare_published_seal_runtime(
+                    config_path,
+                    root,
+                ) {
+                    Ok(crate::cognitive_field_runner::PublishedSealRuntimeComparison::Current) => {}
+                    Ok(
+                        crate::cognitive_field_runner::PublishedSealRuntimeComparison::GovernorBindingDrift(_),
+                    ) => {
+                        inventory.published_runtime_drift =
+                            inventory.published_runtime_drift.saturating_add(1);
+                    }
+                    Ok(
+                        crate::cognitive_field_runner::PublishedSealRuntimeComparison::Incompatible(fields),
+                    ) => inventory.errors.push(format!(
+                        "published_seal_runtime_incompatible:{}",
+                        fields.join("|")
+                    )),
+                    Err(error) => inventory
+                        .errors
+                        .push(format!("published_seal_runtime_unreadable:{error}")),
+                }
+            }
             if !plan_current || !authority_current {
                 inventory.published_without_authority =
                     inventory.published_without_authority.saturating_add(1);

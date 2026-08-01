@@ -53,6 +53,7 @@ fn cognitive_field_help_exposes_validation_preparation_recording_and_grade() -> 
         "prepare",
         "record-deterministic",
         "seal-provider-plan",
+        "supersede-seal",
         "record-provider",
         "grade",
     ] {

@@ -675,6 +675,118 @@ impl HostEventService {
 #[derive(Clone, Copy, Debug, Default)]
 pub struct HostBrokerService;
 
+fn prior_idempotency_job_is_superseded_predispatch(
+    state: &DelegationState,
+    job: &OperationJob,
+    request: &AgentInvocationRequest,
+) -> bool {
+    job.invocation_id == request.invocation_id
+        && job.generation < request.operation_generation
+        && job.state == OperationJobState::Abandoned
+        && job.phase == OperationPhase::Abandoned
+        && job.attempt == 0
+        && job
+            .result_ref
+            .as_deref()
+            .is_some_and(|result| result.starts_with("abandoned:"))
+        && job.role_lease_id.as_ref().is_some_and(|role_lease_id| {
+            state.task_role_leases.iter().any(|lease| {
+                lease.role_lease_id == *role_lease_id && lease.state == AuthorityLeaseState::Revoked
+            })
+        })
+}
+
+#[cfg(test)]
+mod generation_replay_tests {
+    use super::prior_idempotency_job_is_superseded_predispatch;
+    use eliot_types::{
+        AgentHostId, AgentInvocationRequest, AgentRole, AgentSessionId, AuthorityLeaseLifetime,
+        AuthorityLeaseState, DelegationState, OperationJob, OperationJobState, OperationPhase,
+        ProjectId, TaskId, TaskRoleLease, WorkItemId,
+    };
+    use time::OffsetDateTime;
+
+    #[test]
+    fn prior_generation_requires_exact_zero_attempt_supersession() {
+        let now = OffsetDateTime::now_utc();
+        let task_id = TaskId::new_v7();
+        let session_id = AgentSessionId::new_v7();
+        let lease_id = "role-lease:prior-generation".to_owned();
+        let invocation_id = "invocation:stable".to_owned();
+        let mut state = DelegationState::default();
+        state.task_role_leases.push(TaskRoleLease {
+            role_lease_id: lease_id.clone(),
+            task_id,
+            agent_session_id: session_id,
+            role: AgentRole::Auditor,
+            capability_scope: vec!["emit_candidate_observation".to_owned()],
+            expires_at: now + time::Duration::minutes(5),
+            epoch: 2,
+            state: AuthorityLeaseState::Revoked,
+            lifetime: AuthorityLeaseLifetime::SealBound,
+            owner_operation_id: Some("operation-job:prior".to_owned()),
+            seal_attempt_id: Some("seal:prior".to_owned()),
+            generation: 2,
+            issued_at: Some(now),
+            activated_at: Some(now),
+            consumed_at: None,
+            revoked_at: Some(now),
+            revoke_reason: Some("published_seal_superseded_runtime_drift".to_owned()),
+            superseded_by_epoch: Some(3),
+        });
+        let mut job = OperationJob {
+            job_id: "operation-job:prior".to_owned(),
+            invocation_id: invocation_id.clone(),
+            host_id: AgentHostId::Antigravity,
+            state: OperationJobState::Abandoned,
+            attempt: 0,
+            resume_session_id: None,
+            result_ref: Some("abandoned:published_seal_superseded_runtime_drift".to_owned()),
+            idempotency_key: "idempotency:stable".to_owned(),
+            created_at: now,
+            updated_at: now,
+            generation: 2,
+            phase: OperationPhase::Abandoned,
+            phase_started_at: Some(now),
+            last_progress_at: Some(now),
+            phase_deadline_at: None,
+            absolute_deadline_at: None,
+            restart_count: 0,
+            runtime_contract_sha256: Some("a".repeat(64)),
+            role_lease_id: Some(lease_id),
+            role_lease_epoch: Some(2),
+        };
+        let request = AgentInvocationRequest {
+            invocation_id,
+            project_id: ProjectId::new_v7(),
+            task_id,
+            work_item_id: WorkItemId::new_v7(),
+            requested_capabilities: vec!["emit_candidate_observation".to_owned()],
+            role_lease_id: "role-lease:current".to_owned(),
+            role_lease_epoch: 3,
+            operation_generation: 3,
+            runtime_contract_sha256: Some("b".repeat(64)),
+            work_lease_id: None,
+            packet_refs: Vec::new(),
+            expected_result_kind: "provider_execution_evidence".to_owned(),
+            verifier_ref: "verifier:stable".to_owned(),
+            idempotency_key: "idempotency:stable".to_owned(),
+        };
+        assert!(prior_idempotency_job_is_superseded_predispatch(
+            &state, &job, &request
+        ));
+        job.attempt = 1;
+        assert!(!prior_idempotency_job_is_superseded_predispatch(
+            &state, &job, &request
+        ));
+        job.attempt = 0;
+        job.state = OperationJobState::UnknownOutcome;
+        assert!(!prior_idempotency_job_is_superseded_predispatch(
+            &state, &job, &request
+        ));
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum AgentResultAdmission {
     Accepted(AgentResultEnvelope),
@@ -1433,11 +1545,10 @@ impl HostBrokerService {
             }
             return Ok(adopted.clone());
         }
-        if let Some(existing) = state
-            .operation_jobs
-            .iter()
-            .find(|job| job.idempotency_key == request.idempotency_key)
-        {
+        if let Some(existing) = state.operation_jobs.iter().find(|job| {
+            job.idempotency_key == request.idempotency_key
+                && job.generation == request.operation_generation
+        }) {
             if existing.invocation_id != request.invocation_id {
                 return Err(host_broker_error(
                     "idempotency key is already bound to a different invocation",
@@ -1454,6 +1565,37 @@ impl HostBrokerService {
                 ));
             }
             return Ok(existing.clone());
+        }
+        let prior_jobs = state
+            .operation_jobs
+            .iter()
+            .filter(|job| job.idempotency_key == request.idempotency_key)
+            .collect::<Vec<_>>();
+        if !prior_jobs.is_empty() {
+            let prior_safe = prior_jobs
+                .iter()
+                .all(|job| prior_idempotency_job_is_superseded_predispatch(state, job, request))
+                && !state
+                    .agent_results
+                    .iter()
+                    .any(|result| result.invocation_id == request.invocation_id);
+            if !prior_safe {
+                return Err(host_broker_error(
+                    "idempotency key has prior authority without exact pre-dispatch supersession",
+                ));
+            }
+            if let Some(persisted) = state
+                .agent_invocations
+                .iter_mut()
+                .find(|item| item.invocation_id == request.invocation_id)
+            {
+                if persisted.operation_generation >= request.operation_generation {
+                    return Err(host_broker_error(
+                        "idempotency replay did not advance the invocation generation",
+                    ));
+                }
+                persisted.clone_from(request);
+            }
         }
         let job = OperationJob {
             job_id: uuid_like("operation-job"),
@@ -1477,7 +1619,13 @@ impl HostBrokerService {
             role_lease_id: Some(request.role_lease_id.clone()),
             role_lease_epoch: Some(request.role_lease_epoch),
         };
-        state.agent_invocations.push(request.clone());
+        if !state
+            .agent_invocations
+            .iter()
+            .any(|item| item.invocation_id == request.invocation_id)
+        {
+            state.agent_invocations.push(request.clone());
+        }
         state.operation_jobs.push(job.clone());
         Ok(job)
     }

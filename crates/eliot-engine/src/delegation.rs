@@ -429,6 +429,36 @@ impl ProviderCallReservationOwner {
         self.with_lock(load_provider_call_ledger)
     }
 
+    pub fn snapshot_read_only(&self) -> Result<ProviderCallLedger, EngineError> {
+        let runtime = self.root.join("runtime");
+        let ledger_path = runtime.join("provider-call-ledger.json");
+        if ![
+            ledger_path.clone(),
+            ledger_path.with_extension("json.next"),
+            ledger_path.with_extension("json.bak"),
+        ]
+        .iter()
+        .any(|path| path.is_file())
+        {
+            return Ok(ProviderCallLedger::default());
+        }
+        let lock_path = runtime.join("provider-call-ledger.lock");
+        let lock = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+            .map_err(|error| {
+                EngineError::WriteRejected(format!(
+                    "provider ledger exists without an openable read-only lock {}: {error}",
+                    lock_path.display()
+                ))
+            })?;
+        lock.lock()?;
+        let result = load_provider_call_ledger(&ledger_path);
+        drop(lock);
+        result
+    }
+
     fn transition<F>(
         &self,
         reservation_id: &str,

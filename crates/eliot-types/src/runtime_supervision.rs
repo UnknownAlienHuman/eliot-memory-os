@@ -272,6 +272,7 @@ pub struct RuntimeAuthorityIntegrity {
     pub stale_epoch_results: u32,
     pub partial_seals: u32,
     pub published_plans_without_authority: u32,
+    pub published_seal_runtime_drift: u32,
     pub authority_without_published_plan: u32,
 }
 
