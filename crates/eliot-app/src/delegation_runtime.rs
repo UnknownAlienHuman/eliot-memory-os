@@ -740,12 +740,12 @@ async fn execute_real(
     let mut g2_job = ExternalReviewJobService.create_job(&g2_request);
     decision.external_review_request_ref = Some(g2_request.request_id.clone());
 
-    let runner =
-        crate::host_runtime::supervised_process::SupervisedWindowsProcessRunner::new(config_path)?;
+    let provider_runtime = crate::host_runtime::ProviderRuntime::production(config_path)?;
+    let runner = provider_runtime.runner();
     let resolution =
         AntigravityBinaryResolver.resolve(&AntigravityBinaryResolver::default_config());
     let probe = AntigravityCapabilityProbeService
-        .probe_from_resolution_supervised(&resolution, &runner)
+        .probe_from_resolution_supervised(&resolution, runner.as_ref())
         .await;
     let contract = AntigravityCommandContractService.build(&resolution, &probe);
     let previous_state = AntigravityEnablementService.state_from_probe(&probe, None);
@@ -860,7 +860,7 @@ async fn execute_real(
             reservation_id,
             &journal,
             &mut attempt,
-            &runner,
+            runner.as_ref(),
         )
         .await;
     let run = match run_result {

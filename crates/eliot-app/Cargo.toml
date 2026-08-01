@@ -31,5 +31,8 @@ uuid.workspace = true
 eliot-windows-ipc.workspace = true
 windows-service.workspace = true
 
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
+
 [lints]
 workspace = true

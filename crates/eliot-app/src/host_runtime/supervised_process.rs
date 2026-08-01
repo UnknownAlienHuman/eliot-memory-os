@@ -16,6 +16,8 @@ use std::fs::File;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+#[cfg(test)]
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc as std_mpsc;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -236,13 +238,7 @@ pub struct SupervisedWindowsProcessRunner {
 }
 
 impl SupervisedWindowsProcessRunner {
-    pub fn new(config_path: &Path) -> Result<Self> {
-        Ok(Self {
-            runtime_store: daemon_operation_runtime_handle(config_path)?,
-        })
-    }
-
-    pub fn from_runtime_store(runtime_store: eliot_engine::OperationRuntimeHandle) -> Self {
+    pub(super) fn from_runtime_store(runtime_store: eliot_engine::OperationRuntimeHandle) -> Self {
         Self { runtime_store }
     }
 }
@@ -327,14 +323,39 @@ impl ProviderProcessRunner for SupervisedWindowsProcessRunner {
 #[cfg(test)]
 pub struct ScriptedProviderProcessRunner {
     outcomes: Mutex<std::collections::VecDeque<ProviderProcessOutcome>>,
+    specs: Mutex<Vec<ProviderProcessSpec>>,
+    completion_delay: Duration,
+    calls: AtomicUsize,
 }
 
 #[cfg(test)]
 impl ScriptedProviderProcessRunner {
     pub fn new(outcomes: impl IntoIterator<Item = ProviderProcessOutcome>) -> Self {
+        Self::with_delay(outcomes, Duration::ZERO)
+    }
+
+    pub fn with_delay(
+        outcomes: impl IntoIterator<Item = ProviderProcessOutcome>,
+        completion_delay: Duration,
+    ) -> Self {
         Self {
             outcomes: Mutex::new(outcomes.into_iter().collect()),
+            specs: Mutex::new(Vec::new()),
+            completion_delay,
+            calls: AtomicUsize::new(0),
         }
+    }
+
+    pub fn call_count(&self) -> usize {
+        self.calls.load(Ordering::SeqCst)
+    }
+
+    pub fn specs(&self) -> Result<Vec<ProviderProcessSpec>, eliot_engine::EngineError> {
+        self.specs.lock().map(|specs| specs.clone()).map_err(|_| {
+            eliot_engine::EngineError::RuntimeSupervision(
+                "scripted provider process spec lock is poisoned".to_owned(),
+            )
+        })
     }
 }
 
@@ -342,10 +363,19 @@ impl ScriptedProviderProcessRunner {
 impl ProviderProcessRunner for ScriptedProviderProcessRunner {
     fn run<'a>(
         &'a self,
-        _spec: ProviderProcessSpec,
+        spec: ProviderProcessSpec,
         on_spawned: &'a mut (dyn FnMut(u32) -> Result<(), eliot_engine::EngineError> + Send),
     ) -> BoxProviderProcessFuture<'a> {
         Box::pin(async move {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.specs
+                .lock()
+                .map_err(|_| {
+                    eliot_engine::EngineError::RuntimeSupervision(
+                        "scripted provider process spec lock is poisoned".to_owned(),
+                    )
+                })?
+                .push(spec);
             let outcome = self
                 .outcomes
                 .lock()
@@ -373,6 +403,7 @@ impl ProviderProcessRunner for ScriptedProviderProcessRunner {
                 );
                 return Ok(outcome);
             }
+            tokio::time::sleep(self.completion_delay).await;
             Ok(outcome)
         })
     }

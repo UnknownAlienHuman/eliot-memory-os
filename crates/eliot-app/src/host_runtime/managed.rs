@@ -1077,9 +1077,66 @@ pub(super) fn remaining_to_deadline(deadline: Instant) -> Duration {
     deadline.saturating_duration_since(Instant::now())
 }
 
+pub(super) fn managed_provider_process_spec(
+    command: &Command,
+    contract: &eliot_types::HostLaunchContract,
+) -> Result<eliot_engine::ProviderProcessSpec> {
+    let wall_clock = Duration::from_secs(contract.wall_clock_budget_seconds);
+    let raw_command = command.as_std();
+    Ok(eliot_engine::ProviderProcessSpec {
+        operation_id: format!("managed-provider-{}", contract.invocation_id),
+        invocation_id: Some(contract.invocation_id.clone()),
+        executable: raw_command.get_program().into(),
+        args: raw_command
+            .get_args()
+            .map(std::ffi::OsString::from)
+            .collect(),
+        cwd: raw_command
+            .get_current_dir()
+            .map(ToOwned::to_owned)
+            .map_or_else(std::env::current_dir, Ok)?,
+        environment: raw_command
+            .get_envs()
+            .filter_map(|(name, value)| {
+                value.map(|value| {
+                    (
+                        std::ffi::OsString::from(name),
+                        std::ffi::OsString::from(value),
+                    )
+                })
+            })
+            .collect(),
+        stdin_payload: None,
+        route_policy: eliot_types::ProviderRoutePolicy::for_route(
+            eliot_types::AgentHostId::Antigravity,
+            "managed-provider",
+            eliot_types::ProviderDeclaredBudget::new(
+                u64::try_from(wall_clock.as_millis()).unwrap_or(u64::MAX),
+                u64::try_from(MAX_SECRET_BOUNDARY_BYTES).unwrap_or(u64::MAX),
+            )
+            .with_first_output_deadline_ms(None),
+        ),
+        cancellation: eliot_engine::runtime_supervision::CancellationToken::new(),
+        deadline: tokio::time::Instant::now() + wall_clock,
+        runtime_contract_sha256: Some(contract.contract_hash.clone()),
+        role_lease_id: contract.role_lease_id.clone(),
+        role_lease_epoch: Some(contract.role_lease_epoch),
+    })
+}
+
+pub(super) async fn dispatch_managed_provider(
+    provider_runtime: &super::ProviderRuntime,
+    spec: eliot_engine::ProviderProcessSpec,
+) -> Result<eliot_engine::ProviderProcessOutcome, eliot_engine::EngineError> {
+    let runner = provider_runtime.runner();
+    let mut on_spawned = |_| Ok(());
+    eliot_engine::ProviderProcessRunner::run(runner.as_ref(), spec, &mut on_spawned).await
+}
+
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 pub(super) async fn run_managed_antigravity(
     config_path: &Path,
+    provider_runtime: &super::ProviderRuntime,
     command: Command,
     contract: &eliot_types::HostLaunchContract,
     profile: &eliot_types::AgentHostRuntimeProfile,
@@ -1147,57 +1204,8 @@ pub(super) async fn run_managed_antigravity(
     mark_managed_broker_running(config_path, &broker).await?;
     write_provider_start_marker(invocation_root, &attempt.attempt_hash)?;
 
-    let wall_clock = Duration::from_secs(contract.wall_clock_budget_seconds);
-    let raw_command = command.as_std();
-    let provider_spec = eliot_engine::ProviderProcessSpec {
-        operation_id: format!("managed-provider-{}", contract.invocation_id),
-        invocation_id: Some(contract.invocation_id.clone()),
-        executable: raw_command.get_program().into(),
-        args: raw_command
-            .get_args()
-            .map(std::ffi::OsString::from)
-            .collect(),
-        cwd: raw_command
-            .get_current_dir()
-            .map(ToOwned::to_owned)
-            .map_or_else(std::env::current_dir, Ok)?,
-        environment: raw_command
-            .get_envs()
-            .filter_map(|(name, value)| {
-                value.map(|value| {
-                    (
-                        std::ffi::OsString::from(name),
-                        std::ffi::OsString::from(value),
-                    )
-                })
-            })
-            .collect(),
-        stdin_payload: None,
-        route_policy: eliot_types::ProviderRoutePolicy::for_route(
-            eliot_types::AgentHostId::Antigravity,
-            "managed-provider",
-            eliot_types::ProviderDeclaredBudget::new(
-                u64::try_from(wall_clock.as_millis()).unwrap_or(u64::MAX),
-                u64::try_from(MAX_SECRET_BOUNDARY_BYTES).unwrap_or(u64::MAX),
-            )
-            .with_first_output_deadline_ms(None),
-        ),
-        cancellation: eliot_engine::runtime_supervision::CancellationToken::new(),
-        deadline: tokio::time::Instant::now() + wall_clock,
-        runtime_contract_sha256: Some(contract.contract_hash.clone()),
-        role_lease_id: contract.role_lease_id.clone(),
-        role_lease_epoch: Some(contract.role_lease_epoch),
-    };
-    let provider_runner =
-        super::supervised_process::SupervisedWindowsProcessRunner::new(config_path)?;
-    let mut on_spawned = |_| Ok(());
-    let process = match eliot_engine::ProviderProcessRunner::run(
-        &provider_runner,
-        provider_spec,
-        &mut on_spawned,
-    )
-    .await
-    {
+    let provider_spec = managed_provider_process_spec(&command, contract)?;
+    let process = match dispatch_managed_provider(provider_runtime, provider_spec).await {
         Ok(process) => process,
         Err(error) => {
             let reason = format!("failed to start official agy CLI: {error}");

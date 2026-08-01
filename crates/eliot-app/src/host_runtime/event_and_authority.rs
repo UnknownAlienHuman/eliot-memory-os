@@ -609,6 +609,7 @@ async fn launch(
     } else {
         None
     };
+    let provider_runtime = ProviderRuntime::production(config_path)?;
     if managed_antigravity {
         let authority = canonical_authority
             .managed
@@ -616,6 +617,7 @@ async fn launch(
             .context("managed Antigravity launch lost canonical authority")?;
         return run_managed_antigravity(
             config_path,
+            &provider_runtime,
             command,
             &contract,
             &profile,
@@ -712,7 +714,7 @@ async fn launch(
     let spawned = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let spawned_in_hook = std::sync::Arc::clone(&spawned);
     let invocation_root_for_hook = invocation_root.clone();
-    let provider_runner = supervised_process::SupervisedWindowsProcessRunner::new(config_path)?;
+    let provider_runner = provider_runtime.runner();
     let mut on_spawned = move |_| {
         spawned_in_hook.store(true, std::sync::atomic::Ordering::Release);
         if antigravity_containment {
@@ -739,7 +741,7 @@ async fn launch(
         Ok(())
     };
     let process = match eliot_engine::ProviderProcessRunner::run(
-        &provider_runner,
+        provider_runner.as_ref(),
         provider_spec,
         &mut on_spawned,
     ).await {

@@ -263,7 +263,13 @@ impl ProviderCallReservationOwner {
                     existing.clone(),
                 ));
             }
-            let budget_index = provider_call_budget_index(ledger, &request.campaign_id)?;
+            let Some(budget_index) = ledger
+                .budgets
+                .iter()
+                .position(|budget| budget.campaign_id == request.campaign_id)
+            else {
+                return Ok(ProviderCallReservationDecision::CampaignClosed);
+            };
             if ledger.budgets[budget_index].closed {
                 return Ok(ProviderCallReservationDecision::CampaignClosed);
             }
@@ -493,17 +499,6 @@ impl ProviderCallReservationOwner {
         drop(lock);
         result
     }
-}
-
-fn provider_call_budget_index(
-    ledger: &ProviderCallLedger,
-    campaign_id: &str,
-) -> Result<usize, EngineError> {
-    ledger
-        .budgets
-        .iter()
-        .position(|budget| budget.campaign_id == campaign_id)
-        .ok_or_else(|| rejected("provider campaign must be opened before reservation"))
 }
 
 fn refresh_provider_call_budget(ledger: &mut ProviderCallLedger, budget_index: usize) {

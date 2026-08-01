@@ -6,10 +6,7 @@
     clippy::too_many_lines
 )]
 
-use crate::{
-    host_runtime::supervised_process::SupervisedWindowsProcessRunner, named_pipe_ipc,
-    runtime_bootstrap, runtime_instance::RuntimeInstance,
-};
+use crate::{named_pipe_ipc, runtime_bootstrap, runtime_instance::RuntimeInstance};
 use anyhow::{Context, Result};
 use eliot_types::{
     AgentHostId, CognitiveExecutionSeal, CognitiveHostObservation, CognitiveInvocationRole,
@@ -1303,10 +1300,12 @@ async fn run_managed_process(
         )
         .with_first_output_deadline_ms(None),
     );
-    let runner = SupervisedWindowsProcessRunner::from_runtime_store(operation_runtime);
+    let provider_runtime =
+        crate::host_runtime::ProviderRuntime::from_runtime_store(operation_runtime);
+    let runner = provider_runtime.runner();
     let mut on_spawned = |_| Ok(());
     let output = eliot_engine::ProviderProcessRunner::run(
-        &runner,
+        runner.as_ref(),
         eliot_engine::ProviderProcessSpec {
             operation_id,
             invocation_id: Some(call_id.to_owned()),

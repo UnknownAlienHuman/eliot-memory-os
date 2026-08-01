@@ -58,6 +58,7 @@ mod external_agent;
 pub(crate) use external_agent::half_open_external_agent_circuit;
 mod integration;
 mod managed;
+mod provider_runtime;
 mod provider_terminalization;
 pub(crate) mod supervised_process;
 #[cfg(test)]
@@ -83,6 +84,7 @@ use managed::{
 };
 #[cfg(test)]
 use managed::{remaining_to_deadline, validate_managed_result_integrity};
+pub(crate) use provider_runtime::ProviderRuntime;
 const CLAUDE_DESKTOP_MANIFEST: &str = "integrations/claude/claude-desktop/mcpb/manifest.json";
 const MAX_MANAGED_LAUNCH_SECONDS: u64 = 900;
 const MANAGED_ATTEMPT_SCHEMA_V4: &str = "eliot-managed-host-attempt-v4";

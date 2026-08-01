@@ -475,12 +475,11 @@ async fn run_codex_provider(
         .map(std::ffi::OsString::from)
         .collect::<Vec<_>>();
     args.push(prompt.into());
-    let runner = crate::host_runtime::supervised_process::SupervisedWindowsProcessRunner::new(
-        &manifest.config_path,
-    )?;
+    let provider_runtime = crate::host_runtime::ProviderRuntime::production(&manifest.config_path)?;
+    let runner = provider_runtime.runner();
     let mut on_spawned = |_| Ok(());
     let process = eliot_engine::ProviderProcessRunner::run(
-        &runner,
+        runner.as_ref(),
         eliot_engine::ProviderProcessSpec {
             operation_id: format!("dogfood-codex-{}", uuid::Uuid::now_v7()),
             invocation_id: None,

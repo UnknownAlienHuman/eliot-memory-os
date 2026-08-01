@@ -1,4 +1,4 @@
-use std::fs::{self, File};
+use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
@@ -129,7 +129,7 @@ impl ProviderInvocationJournal {
             evidence_refs: Vec::new(),
         };
         attempt.state_transitions.push(transition);
-        self.persist(&attempt)?;
+        self.persist_new(&attempt)?;
         Ok(attempt)
     }
 
@@ -289,6 +289,28 @@ impl ProviderInvocationJournal {
         let path = self.attempt_path(&attempt.invocation_attempt_id);
         let bytes = serde_json::to_vec_pretty(attempt)?;
         atomic_write(&path, &bytes)
+    }
+
+    fn persist_new(&self, attempt: &ProviderInvocationAttempt) -> Result<(), EngineError> {
+        let path = self.attempt_path(&attempt.invocation_attempt_id);
+        let parent = path.parent().ok_or_else(|| {
+            EngineError::WriteRejected("provider attempt path has no parent".to_owned())
+        })?;
+        fs::create_dir_all(parent)?;
+        let bytes = serde_json::to_vec_pretty(attempt)?;
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .map_err(|error| {
+                EngineError::WriteRejected(format!(
+                    "provider invocation attempt create-only CAS failed at {}: {error}",
+                    path.display()
+                ))
+            })?;
+        file.write_all(&bytes)?;
+        file.sync_all()?;
+        Ok(())
     }
 
     fn attempt_path(&self, attempt_id: &str) -> PathBuf {

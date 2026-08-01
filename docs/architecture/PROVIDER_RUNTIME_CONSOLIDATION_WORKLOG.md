@@ -148,3 +148,121 @@ This log preserves the ordered implementation evidence for
   - `cargo test -p eliot-types --test external_agent`: 2/2 PASS, 24.67 s compile, 0.00 s bodies.
   - `cargo test -p eliot-app --bin eliot-governor cognitive_field_runner::tests`: 25/25 PASS, 39.4 s wall, 37.93 s compile, 0.50 s bodies. This confirms removal of the duplicate target while retaining one heavy binary compilation.
   - Focused strict Clippy for `eliot-types` and `eliot-app` all targets: PASS, 24.9 s wall on the final run; `cargo fmt --all -- --check` and `git diff --check`: PASS.
+
+## ARCH-05 / TEST-01 — one composition owner and exact production-route behavior
+
+- Added `host_runtime::ProviderRuntime` as the provider-runtime composition owner. It owns one
+  `Arc<dyn ProviderProcessRunner>` and the matching `OperationRuntimeHandle`; production
+  construction of `SupervisedWindowsProcessRunner` occurs only in this module. External-agent,
+  managed host, cognitive, delegation, dogfood and Antigravity command paths now obtain the runner
+  from this owner instead of independently constructing it.
+- Deleted the public ad-hoc `SupervisedWindowsProcessRunner::new` constructor. The remaining
+  production constructor is module-restricted and is called once by `ProviderRuntime`.
+- Split managed Antigravity composition into `managed_provider_process_spec` and
+  `dispatch_managed_provider`. The production authority prologue, attempt write and terminal
+  closeout remain on the managed path; the shared composition owner supplies the process runner.
+  The managed route is intentionally not sent through `AdapterSupervisor`, because doing so would
+  duplicate HostBroker/campaign ownership.
+- Added a bounded `ExternalAgentAuthorityBoundary` injection seam. Production still performs the
+  exact integrity, enqueue, start and canonical-result writes; behavior tests replace only that
+  authority boundary while retaining the real adapter preparation, campaign reservation,
+  terminalization, capture, parser and result normalization path.
+- Extended the test-only `ScriptedProviderProcessRunner` with outcome queues, virtual delay, call
+  count and exact `ProviderProcessSpec` capture. No real model or subprocess is used by B1-B8.
+- Made `ProviderInvocationJournal::create` create-only (`create_new` plus file sync). B3 exposed
+  that a repeated identical adapter request previously overwrote the original terminal attempt
+  with a fresh `Prepared` record before the reservation owner rejected redispatch. The journal now
+  preserves the original terminal process evidence and fails closed on duplicate creation.
+- Missing pre-created provider campaigns now resolve to the typed `CampaignClosed` reservation
+  decision. This lets the adapter durably transition the already-created attempt to
+  `PreDispatchAborted`; previously the owner returned an untyped error and left a nonterminal
+  prepared attempt even though the runner was correctly blocked.
+
+### Opus 5 consultation
+
+- Escalation trigger: B2 showed that one runner implementation still had eight independent
+  production constructions, and the managed route created its runner inside the function under
+  test. This was an owner/abstraction decision, so it met section 10 rather than being guessed
+  locally.
+- One fresh read-only Claude Code consultation used exact `claude-opus-5`, effort `max`, only
+  Read/Grep/Glob, no GUI, no writes and no provider dispatch. Wall time: 432.2 s.
+- Accepted: a small `ProviderRuntime` composition owner, shared injection into both external and
+  managed routes, a production-exact managed process-spec/dispatch split, and Tokio virtual time
+  for B1.
+- Accepted with verification: B2 proves the external half through
+  `AdapterRegistry -> AdapterSupervisor -> adapter` and the managed half through the exact
+  production managed helper while sharing the same injected owner/runner.
+- Rejected as architecturally incorrect: routing managed execution through `AdapterSupervisor`;
+  that would double-book broker and campaign authority. Opus explicitly called this out and source
+  inspection confirmed it.
+- Deferred cleanup only: moving the authority seam out of the large external-agent file may improve
+  layout later, but it is not a second runtime owner and is not required for the bounded task.
+
+### B1-B8 attempts, problems and results
+
+- The first combined B1/B3/B4/B5 attempt failed before dispatch because the fixture created a
+  different `work_item_id` in invocation and launch authority. The fixture was corrected to bind
+  one ID; product validation was not weakened.
+- The first B1 retry hit the outer supervisor deadline because 200 ms of scaled absolute time was
+  shorter than real preparation/file-system work. Added Tokio `test-util` only as a dev feature and
+  used paused virtual time: the scripted provider advances six virtual seconds while the route
+  retains an eight-second first-output and ten-second absolute policy.
+- The first B3 retry exposed the journal overwrite defect described above. After create-only CAS,
+  the second request performs zero provider calls and preserves `NonReconcilableUnknown` plus the
+  complete reap receipt.
+- B1/B3/B4/B5 corrected run: 4/4 PASS, 19.5 s wall including about 16 s compilation, 0.32 s test
+  bodies. B2 corrected run: 1/1 PASS, 26.4 s wall including about 23 s compilation, 0.12 s body.
+- The first full 8-case run selected exactly eight tests: 5 passed and 3 failed. Wall 41.12 s,
+  compile 39.32 s, bodies 1.09 s. The failures were all actionable:
+  - B6 compared the sealed, sorted/deduplicated Claude tool aliases with request-order aliases;
+    the test now compares against the same canonical exact set while retaining profile hash checks.
+  - B7 expected a raw `Err`, but `AdapterSupervisor` correctly normalized the adapter error into a
+    failed `AdapterResult`. The test now checks the public result and led to the real missing-campaign
+    terminalization repair above.
+  - B8 scanned its own string literals and counted the legacy struct definition/impl as runtime
+    construction. The source gate now excludes its own test module and distinguishes the one type
+    definition from forbidden struct literals.
+- Corrected individual B6/B7 results: PASS in 2.38 s and 0.07 s bodies. B8 required two assertion
+  precision corrections, then passed in 0.01 s body; these were source-gate mistakes, not product
+  regressions.
+- Final combined `cargo test -p eliot-app --bin eliot-governor provider_runtime`: 8/8 PASS,
+  1.70 s wall, 1.47 s bodies, 203 unrelated tests filtered out.
+- B1 proves delayed valid Antigravity output beyond the former five-second boundary. B2 proves one
+  injected runner and policy owner across external and managed routes. B3 proves terminal timeout,
+  reap and no replay. B4 proves invalid exit-0 JSON is terminal `ProtocolParseFailed`. B5 proves one
+  canonical result with forced complete reap. B6 runs all nine Claude/Antigravity/OpenCode ×
+  Worker/Reader/Judge combinations through the normal adapter chain and checks exact policy/profile
+  IDs, hashes, tools and runner specs. B7 proves no adapter-owned campaign maximum and zero runner
+  calls without controller pre-creation. B8 proves the bounded source inventory.
+- Performance observation: the final eight behavior bodies are far below the task's ten-second
+  target. The recurring 10–40 s cost is Rust binary-test compilation/linking, not the scripted
+  cognitive behavior. No evidence currently justifies a separate test-performance investigation.
+
+### Section 9 focused gate
+
+- `cargo test -p eliot-types provider_route_policy`: command exited successfully but selected zero
+  tests across all targets after 22.25 s compilation/enumeration. Per the task contract it is not
+  acceptance evidence. Corrected `cargo test -p eliot-types --test provider_route_policy`: 2/2
+  PASS, 0.14 s wall, 0.00 s bodies.
+- `cargo test -p eliot-engine provider_invocation`: 1/1 matching unit test PASS; 73.28 s wall,
+  approximately 61 s compilation plus enumeration of every integration-test executable. The
+  behavior body was 0.00 s. This filter shape is a test-infrastructure cost worth retaining in the
+  report; it is not a slow provider-runtime behavior.
+- `cargo test -p eliot-engine adapter`: 23 matching tests across targets, 22 PASS and one
+  authenticated-SurrealDB test ignored; 3.52 s wall. The principal adapter target ran 21 PASS and
+  one ignored in 0.10 s.
+- `cargo test -p eliot-app --bin eliot-governor provider_runtime`: 8/8 PASS, 1.70 s wall and 1.47 s
+  bodies.
+- `cargo test -p eliot-app --bin eliot-governor external_agent`: 11/11 PASS, 1.68 s wall and 1.45 s
+  bodies.
+- `cargo test -p eliot-app --bin eliot-governor managed`: 17 PASS and one environment-dependent
+  daemon test ignored, 5.10 s wall and 4.27 s bodies.
+- `cargo test -p eliot-windows-ipc supervised_process`: 3/3 PASS, 3.66 s wall including 2.92 s
+  compilation, 0.43 s bodies.
+- `cargo fmt --all -- --check`: PASS, 1.85 s. `cargo check --workspace --all-targets`: PASS,
+  31.59 s.
+- First workspace Clippy run failed after 36.47 s on three new test-only `expect_used` findings:
+  two poisoned mutex locks and one fixture length conversion. They were replaced with poisoned
+  guard recovery and a non-panicking conversion; no lint suppression was added. Corrected
+  `cargo clippy --workspace --all-targets -- -D warnings`: PASS, 22.19 s.
+- Final `cargo fmt --all -- --check`: PASS, 1.70 s. `git diff --check`: PASS, 0.07 s.

@@ -68,6 +68,83 @@ struct ExternalAgentAdapterCore {
     config_path: PathBuf,
     manifest: eliot_types::CapabilityManifest,
     process_runner: Arc<dyn ProviderProcessRunner>,
+    authority_boundary: Arc<dyn ExternalAgentAuthorityBoundary>,
+}
+
+trait ExternalAgentAuthorityBoundary: Send + Sync {
+    fn ensure_dispatch_safe<'a>(&'a self, config_path: &'a Path) -> BoxAdapterFuture<'a, ()>;
+
+    fn enqueue<'a>(
+        &'a self,
+        config_path: &'a Path,
+        host: AgentHostId,
+        execution: &'a ExternalAgentExecutionRequest,
+    ) -> BoxAdapterFuture<'a, String>;
+
+    fn start<'a>(&'a self, config_path: &'a Path, job_id: &'a str) -> BoxAdapterFuture<'a, ()>;
+
+    fn canonicalize<'a>(
+        &'a self,
+        config_path: &'a Path,
+        execution: &'a ExternalAgentExecutionRequest,
+        result: AgentResultEnvelope,
+    ) -> BoxAdapterFuture<'a, AgentResultEnvelope>;
+}
+
+struct ProductionExternalAgentAuthorityBoundary;
+
+impl ExternalAgentAuthorityBoundary for ProductionExternalAgentAuthorityBoundary {
+    fn ensure_dispatch_safe<'a>(&'a self, config_path: &'a Path) -> BoxAdapterFuture<'a, ()> {
+        Box::pin(async move {
+            let runtime_store =
+                super::supervised_process::daemon_operation_runtime_handle_for_instance(
+                    config_path,
+                    Some(DEFAULT_INSTANCE_NAME),
+                )
+                .map_err(anyhow_engine)?;
+            let runtime_integrity =
+                crate::runtime_integrity::inspect(config_path, &runtime_store, true, None)
+                    .await
+                    .map_err(anyhow_engine)?;
+            if !runtime_integrity.provider_dispatch_safe {
+                return Err(eliot_engine::EngineError::WriteRejected(format!(
+                    "runtime integrity blocks external provider dispatch: {}",
+                    runtime_integrity.integrity_errors.join(", ")
+                )));
+            }
+            Ok(())
+        })
+    }
+
+    fn enqueue<'a>(
+        &'a self,
+        config_path: &'a Path,
+        host: AgentHostId,
+        execution: &'a ExternalAgentExecutionRequest,
+    ) -> BoxAdapterFuture<'a, String> {
+        Box::pin(enqueue_external_agent_broker_invocation(
+            config_path,
+            host,
+            execution,
+        ))
+    }
+
+    fn start<'a>(&'a self, config_path: &'a Path, job_id: &'a str) -> BoxAdapterFuture<'a, ()> {
+        Box::pin(start_external_agent_broker_job(config_path, job_id))
+    }
+
+    fn canonicalize<'a>(
+        &'a self,
+        config_path: &'a Path,
+        execution: &'a ExternalAgentExecutionRequest,
+        result: AgentResultEnvelope,
+    ) -> BoxAdapterFuture<'a, AgentResultEnvelope> {
+        Box::pin(canonicalize_external_agent_broker_result(
+            config_path,
+            execution,
+            result,
+        ))
+    }
 }
 
 #[derive(Clone)]
@@ -111,9 +188,16 @@ struct CanonicalAgentResultWrite {
 pub(crate) fn production_external_agent_supervisor(
     config_path: &Path,
 ) -> Result<AdapterSupervisor> {
+    let provider_runtime = super::ProviderRuntime::production(config_path)?;
+    external_agent_supervisor(config_path, &provider_runtime)
+}
+
+fn external_agent_supervisor(
+    config_path: &Path,
+    provider_runtime: &super::ProviderRuntime,
+) -> Result<AdapterSupervisor> {
     let governor_executable = resolved_governor_executable()?;
-    let process_runner: Arc<dyn ProviderProcessRunner> =
-        Arc::new(super::supervised_process::SupervisedWindowsProcessRunner::new(config_path)?);
+    let process_runner = provider_runtime.runner();
     let mut registry = AdapterRegistry::new();
     registry.register(ClaudeCodeCliAdapter::new(
         config_path,
@@ -132,7 +216,7 @@ pub(crate) fn production_external_agent_supervisor(
     )?)?;
     Ok(AdapterSupervisor::with_runtime(
         registry,
-        super::supervised_process::daemon_operation_runtime_handle(config_path)?,
+        provider_runtime.operation_runtime(),
     ))
 }
 
@@ -173,8 +257,7 @@ pub(crate) fn prepare_external_agent_runtime(
         "Codex does not use an external-agent adapter"
     );
     validate_external_agent_execution_request(execution)?;
-    let process_runner: Arc<dyn ProviderProcessRunner> =
-        Arc::new(super::supervised_process::SupervisedWindowsProcessRunner::new(config_path)?);
+    let process_runner = super::ProviderRuntime::production(config_path)?.runner();
     let core = ExternalAgentAdapterCore::new(
         host,
         config_path,
@@ -2083,8 +2166,7 @@ async fn run_auth_smoke(config_path: &Path, host: AgentHostId, model: &str) -> R
         "auth-smoke requires an exact non-empty model"
     );
     let governor = std::env::current_exe()?.canonicalize()?;
-    let process_runner: Arc<dyn ProviderProcessRunner> =
-        Arc::new(super::supervised_process::SupervisedWindowsProcessRunner::new(config_path)?);
+    let process_runner = super::ProviderRuntime::production(config_path)?.runner();
     let core =
         ExternalAgentAdapterCore::new(host, config_path, &governor, Arc::clone(&process_runner))?;
     let executable = core
@@ -2357,6 +2439,33 @@ impl ExternalAgentAdapterCore {
             config_path: config_path.to_path_buf(),
             manifest,
             process_runner,
+            authority_boundary: Arc::new(ProductionExternalAgentAuthorityBoundary),
+        })
+    }
+
+    #[cfg(test)]
+    fn for_test(
+        host: AgentHostId,
+        config_path: &Path,
+        governor_executable: &Path,
+        executable: &Path,
+        process_runner: Arc<dyn ProviderProcessRunner>,
+        authority_boundary: Arc<dyn ExternalAgentAuthorityBoundary>,
+    ) -> Result<Self> {
+        let executable = validate_provider_binary(host, executable)?;
+        let version = Some(format!("executable-sha256:{}", sha256_file(&executable)?));
+        let adapter_id = adapter_id(host).to_owned();
+        let manifest = provider_manifest(host, &adapter_id, Some(&executable));
+        Ok(Self {
+            host,
+            adapter_id,
+            executable: Some(executable),
+            version,
+            governor_executable: governor_executable.to_path_buf(),
+            config_path: config_path.to_path_buf(),
+            manifest,
+            process_runner,
+            authority_boundary,
         })
     }
 
@@ -2408,22 +2517,9 @@ impl ExternalAgentAdapterCore {
                     "AdapterContext differs from sealed external-agent authority".to_owned(),
                 ));
             }
-            let runtime_store =
-                super::supervised_process::daemon_operation_runtime_handle_for_instance(
-                    &self.config_path,
-                    Some(DEFAULT_INSTANCE_NAME),
-                )
-                .map_err(anyhow_engine)?;
-            let runtime_integrity =
-                crate::runtime_integrity::inspect(&self.config_path, &runtime_store, true, None)
-                    .await
-                    .map_err(anyhow_engine)?;
-            if !runtime_integrity.provider_dispatch_safe {
-                return Err(eliot_engine::EngineError::WriteRejected(format!(
-                    "runtime integrity blocks external provider dispatch: {}",
-                    runtime_integrity.integrity_errors.join(", ")
-                )));
-            }
+            self.authority_boundary
+                .ensure_dispatch_safe(&self.config_path)
+                .await?;
             self.execute_governed(request, execution, context).await
         })
     }
@@ -2552,12 +2648,10 @@ impl ExternalAgentAdapterCore {
             )],
         )?;
 
-        let broker_job_id = match enqueue_external_agent_broker_invocation(
-            &self.config_path,
-            self.host,
-            &execution,
-        )
-        .await
+        let broker_job_id = match self
+            .authority_boundary
+            .enqueue(&self.config_path, self.host, &execution)
+            .await
         {
             Ok(job_id) => job_id,
             Err(error) => {
@@ -2573,7 +2667,10 @@ impl ExternalAgentAdapterCore {
                 return Err(error);
             }
         };
-        if let Err(error) = start_external_agent_broker_job(&self.config_path, &broker_job_id).await
+        if let Err(error) = self
+            .authority_boundary
+            .start(&self.config_path, &broker_job_id)
+            .await
         {
             let _ = reservation_owner.release_pre_dispatch(
                 &reservation.reservation_id,
@@ -3248,9 +3345,10 @@ impl ExternalAgentAdapterCore {
             provider_output_hash: evidence.structured_output_sha256.clone(),
             canonical_receipt: None,
         };
-        let agent_result =
-            canonicalize_external_agent_broker_result(&self.config_path, execution, agent_result)
-                .await?;
+        let agent_result = self
+            .authority_boundary
+            .canonicalize(&self.config_path, execution, agent_result)
+            .await?;
         let output = json!({
             "agent_result": agent_result,
             "provider_execution_evidence": evidence,
@@ -4253,6 +4351,810 @@ mod mcp_smoke_tests {
         assert_eq!(entries[1]["phase"], "current_state_preflight");
         assert_eq!(entries[1]["detail"], "test deadline");
         std::fs::remove_dir_all(&root)?;
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod provider_runtime_tests {
+    use super::*;
+    use crate::host_runtime::supervised_process::ScriptedProviderProcessRunner;
+    use eliot_types::{
+        AdapterContext, AgentSessionId, HostLaunchContract, ProcessReapReceipt,
+        ProviderDeclaredBudget, ProviderRoutePolicy, ReceiptId, WorkItemId, WorkLeaseId, WriteId,
+    };
+
+    #[derive(Default)]
+    struct RecordingAuthorityBoundary {
+        phases: Mutex<Vec<&'static str>>,
+    }
+
+    impl RecordingAuthorityBoundary {
+        fn phases(&self) -> Vec<&'static str> {
+            self.phases
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()
+        }
+
+        fn record(&self, phase: &'static str) {
+            self.phases
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(phase);
+        }
+    }
+
+    impl ExternalAgentAuthorityBoundary for RecordingAuthorityBoundary {
+        fn ensure_dispatch_safe<'a>(&'a self, _config_path: &'a Path) -> BoxAdapterFuture<'a, ()> {
+            Box::pin(async move {
+                self.record("integrity");
+                Ok(())
+            })
+        }
+
+        fn enqueue<'a>(
+            &'a self,
+            _config_path: &'a Path,
+            _host: AgentHostId,
+            execution: &'a ExternalAgentExecutionRequest,
+        ) -> BoxAdapterFuture<'a, String> {
+            Box::pin(async move {
+                self.record("enqueue");
+                Ok(execution.invocation.invocation_id.clone())
+            })
+        }
+
+        fn start<'a>(
+            &'a self,
+            _config_path: &'a Path,
+            _job_id: &'a str,
+        ) -> BoxAdapterFuture<'a, ()> {
+            Box::pin(async move {
+                self.record("start");
+                Ok(())
+            })
+        }
+
+        fn canonicalize<'a>(
+            &'a self,
+            _config_path: &'a Path,
+            _execution: &'a ExternalAgentExecutionRequest,
+            mut result: AgentResultEnvelope,
+        ) -> BoxAdapterFuture<'a, AgentResultEnvelope> {
+            Box::pin(async move {
+                self.record("canonicalize");
+                result.canonical_receipt = Some(eliot_types::WriteReceiptRef {
+                    receipt_id: ReceiptId::new_v7(),
+                    write_id: WriteId::new_v7(),
+                });
+                Ok(result)
+            })
+        }
+    }
+
+    struct RouteFixture {
+        root: PathBuf,
+        supervisor: AdapterSupervisor,
+        runner: Arc<ScriptedProviderProcessRunner>,
+        provider_runtime: super::super::ProviderRuntime,
+        authority: Arc<RecordingAuthorityBoundary>,
+        request: AdapterRequest,
+        attempt_id: String,
+    }
+
+    fn antigravity_native_output() -> Vec<u8> {
+        concat!(
+            "{\"event\":\"init\",\"conversation_id\":\"agy-route-test\",",
+            "\"init\":{\"model\":\"gemini-3.6-flash-high\"}}\n",
+            "{\"event\":\"step_update\",\"step_update\":{\"step_type\":\"tool\",",
+            "\"tool_name\":\"call_mcp_tool\",\"tool_info\":{\"parameters\":{",
+            "\"ServerName\":\"eliot-governor\",\"ToolName\":\"eliot_current_state\"}}}}\n",
+            "{\"event\":\"result\",\"result\":{\"conversation_id\":\"agy-route-test\",",
+            "\"status\":\"SUCCESS\",\"structured_output\":{\"status\":\"ready\",",
+            "\"resolved_model\":\"gemini-3.6-flash-high\"}}}\n"
+        )
+        .as_bytes()
+        .to_vec()
+    }
+
+    fn provider_model(host: AgentHostId) -> &'static str {
+        match host {
+            AgentHostId::Claude => "claude-opus-5",
+            AgentHostId::Antigravity => "gemini-3.6-flash-high",
+            AgentHostId::OpenCode => "opencode/mimo-v2.5-free",
+            AgentHostId::Codex => unreachable!("Codex has no external provider route"),
+        }
+    }
+
+    fn provider_executable_name(host: AgentHostId) -> &'static str {
+        match host {
+            AgentHostId::Claude => "claude.exe",
+            AgentHostId::Antigravity => "agy.exe",
+            AgentHostId::OpenCode => "opencode-headless.cmd",
+            AgentHostId::Codex => unreachable!("Codex has no external provider route"),
+        }
+    }
+
+    fn provider_native_output(host: AgentHostId) -> Vec<u8> {
+        match host {
+            AgentHostId::Claude => concat!(
+                "{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"tool_use\",",
+                "\"name\":\"mcp__eliot-governor__eliot_current_state\"}]}}\n",
+                "{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,",
+                "\"session_id\":\"claude-route-test\",\"model\":\"claude-opus-5\",",
+                "\"structured_output\":{\"status\":\"ready\",",
+                "\"resolved_model\":\"claude-opus-5\"}}\n"
+            )
+            .as_bytes()
+            .to_vec(),
+            AgentHostId::Antigravity => antigravity_native_output(),
+            AgentHostId::OpenCode => concat!(
+                "{\"type\":\"step_start\",\"sessionID\":\"opencode-route-test\",",
+                "\"part\":{\"type\":\"step-start\"}}\n",
+                "{\"type\":\"tool_use\",\"sessionID\":\"opencode-route-test\",",
+                "\"part\":{\"type\":\"tool\",\"tool\":\"eliot_current_state\",",
+                "\"state\":{\"status\":\"completed\"}}}\n",
+                "{\"type\":\"text\",\"sessionID\":\"opencode-route-test\",",
+                "\"part\":{\"type\":\"text\",\"text\":",
+                "\"{\\\"status\\\":\\\"ready\\\",\\\"resolved_model\\\":",
+                "\\\"opencode/mimo-v2.5-free\\\"}\"}}\n",
+                "{\"type\":\"step_finish\",\"sessionID\":\"opencode-route-test\",",
+                "\"part\":{\"type\":\"step-finish\",\"reason\":\"stop\"}}\n"
+            )
+            .as_bytes()
+            .to_vec(),
+            AgentHostId::Codex => unreachable!("Codex has no external provider route"),
+        }
+    }
+
+    fn scripted_outcome(
+        stdout: Vec<u8>,
+        timed_out: bool,
+        forced_termination: bool,
+    ) -> ProviderProcessOutcome {
+        let now = OffsetDateTime::now_utc();
+        let stdout_len = u64::try_from(stdout.len()).unwrap_or(u64::MAX);
+        ProviderProcessOutcome {
+            exit_code: (!timed_out).then_some(0),
+            stdout,
+            stderr: Vec::new(),
+            stdout_total_bytes: stdout_len,
+            stderr_total_bytes: 0,
+            stdout_truncated: false,
+            stderr_truncated: false,
+            timed_out,
+            timeout_class: timed_out.then_some(ProviderTimeoutClass::FirstOutputTimeout),
+            cancelled: timed_out,
+            worker_error: None,
+            observed_processes: Vec::new(),
+            process_started_at: now,
+            first_output_at: (!timed_out).then_some(now),
+            last_output_at: (!timed_out).then_some(now),
+            process_exit_at: Some(now),
+            cleanup_completed_at: now,
+            reap_receipt: ProcessReapReceipt {
+                operation_id: "scripted-provider-route".to_owned(),
+                generation: 1,
+                job_object_name: "scripted-job".to_owned(),
+                root_pid: Some(42_424),
+                process_count_before: 1,
+                process_count_after: 0,
+                graceful_attempted: true,
+                forced_termination,
+                stdout_closed: true,
+                stderr_closed: true,
+                all_tasks_joined: true,
+                elapsed_ms: 20,
+                terminal_error_codes: Vec::new(),
+            },
+        }
+    }
+
+    fn route_fixture(
+        outcomes: Vec<ProviderProcessOutcome>,
+        completion_delay: Duration,
+    ) -> Result<RouteFixture> {
+        route_fixture_for(
+            AgentHostId::Antigravity,
+            ExternalAgentPurpose::UnderstandingReader,
+            outcomes,
+            completion_delay,
+            true,
+        )
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn route_fixture_for(
+        host: AgentHostId,
+        purpose: ExternalAgentPurpose,
+        outcomes: Vec<ProviderProcessOutcome>,
+        completion_delay: Duration,
+        open_campaign: bool,
+    ) -> Result<RouteFixture> {
+        let root = std::env::temp_dir().join(format!("eliot-provider-route-{}", Uuid::now_v7()));
+        let config_path = root.join("config/governor.toml");
+        let cwd = root.join("workspace");
+        std::fs::create_dir_all(config_path.parent().context("config parent")?)?;
+        std::fs::create_dir_all(&cwd)?;
+        std::fs::write(&config_path, b"# provider route fixture\n")?;
+        let executable = root.join(provider_executable_name(host));
+        let governor = root.join("eliot-governor.exe");
+        std::fs::write(
+            &executable,
+            format!("scripted {} executable", host.as_str()),
+        )?;
+        std::fs::write(&governor, b"scripted governor executable")?;
+        let executable = std::fs::canonicalize(executable)?;
+        let governor = std::fs::canonicalize(governor)?;
+        let cwd = std::fs::canonicalize(cwd)?;
+        let prompt_path = root.join("prompt.txt");
+        let schema_path = root.join("schema.json");
+        let prompt = "Return the exact schema-valid result.";
+        let model = provider_model(host);
+        let schema = json!({
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["status", "resolved_model"],
+            "properties": {
+                "status": {"const": "ready"},
+                "resolved_model": {"const": model}
+            }
+        });
+        std::fs::write(&prompt_path, prompt)?;
+        std::fs::write(&schema_path, serde_json::to_vec(&schema)?)?;
+        let prompt_path = std::fs::canonicalize(prompt_path)?;
+        let schema_path = std::fs::canonicalize(schema_path)?;
+        let project_id = ProjectId::new_v7();
+        let task_id = TaskId::new_v7();
+        let agent_session_id = AgentSessionId::new_v7();
+        let work_item_id = WorkItemId::new_v7();
+        let invocation_id = format!("provider-route-{}", Uuid::now_v7());
+        let route_policy = ProviderRoutePolicy::for_route(
+            host,
+            "provider-runtime-test",
+            ProviderDeclaredBudget::new(10_000, MAX_PROVIDER_OUTPUT_BYTES)
+                .with_first_output_deadline_ms(Some(8_000))
+                .with_cancellation_grace_ms(10)
+                .with_cleanup_grace_ms(10),
+        );
+        let mcp_access_profile = provider_mcp_access_profile(purpose);
+        let mcp_tool_profile =
+            crate::mcp_stdio::catalog::provider_mcp_tool_profile(mcp_access_profile);
+        let worker = purpose == ExternalAgentPurpose::CognitiveWorker;
+        let work_lease_id = worker.then(WorkLeaseId::new_v7);
+        let launch_contract = HostLaunchContract {
+            invocation_id: invocation_id.clone(),
+            host_profile_ref: format!("test:{}", host.as_str()),
+            mode: HostMode::Supervised,
+            project_id: Some(project_id),
+            agent_session_id: Some(agent_session_id),
+            task_id: Some(task_id),
+            work_item_id: Some(work_item_id),
+            role_lease_id: Some("provider-route-role".to_owned()),
+            role_lease_epoch: 1,
+            operation_generation: 1,
+            work_lease_id,
+            worktree_lease_id: None,
+            planned_verifier_ref: Some("provider-route-verifier".to_owned()),
+            cwd_or_worktree: path_string(&cwd),
+            baseline_commit: None,
+            allowed_paths: worker.then(|| path_string(&cwd)).into_iter().collect(),
+            forbidden_paths: vec!["raw-database".to_owned()],
+            integration_bundle_ref: path_string(&root),
+            mcp_config_ref: path_string(&root.join("provider-mcp.json")),
+            skill_bundle_ref: path_string(&root.join("skills")),
+            lifecycle_bridge_ref: "external-agent-adapter".to_owned(),
+            environment_allowlist: SAFE_INHERITED_ENVIRONMENT
+                .iter()
+                .map(|value| (*value).to_owned())
+                .collect(),
+            permission_profile: if worker {
+                "cognitive_child"
+            } else {
+                "external_auditor"
+            }
+            .to_owned(),
+            model_route_if_selected: Some(model.to_owned()),
+            max_turns_or_steps: Some(4),
+            wall_clock_budget_seconds: 1,
+            cost_budget_if_supported: None,
+            session_id: None,
+            resume_policy: "fresh_only".to_owned(),
+            structured_output_schema_ref: Some(path_string(&schema_path)),
+            stdout_stderr_spool: path_string(&root.join("spool")),
+            artifact_manifest_ref: path_string(&root.join("artifacts.json")),
+            idempotency_key: invocation_id.clone(),
+            expected_result_kind: "provider_execution_evidence".to_owned(),
+            contract_hash: "a".repeat(64),
+        };
+        let execution = ExternalAgentExecutionRequest {
+            invocation: eliot_types::AgentInvocationRequest {
+                invocation_id: invocation_id.clone(),
+                project_id,
+                task_id,
+                work_item_id,
+                requested_capabilities: vec!["emit_candidate_observation".to_owned()],
+                role_lease_id: "provider-route-role".to_owned(),
+                role_lease_epoch: 1,
+                operation_generation: 1,
+                runtime_contract_sha256: Some("a".repeat(64)),
+                work_lease_id,
+                packet_refs: Vec::new(),
+                expected_result_kind: "provider_execution_evidence".to_owned(),
+                verifier_ref: "provider-route-verifier".to_owned(),
+                idempotency_key: invocation_id.clone(),
+            },
+            launch_contract,
+            campaign_id: format!("campaign:{invocation_id}"),
+            purpose,
+            mcp_tool_profile: mcp_tool_profile.clone(),
+            prompt_ref: path_string(&prompt_path),
+            prompt_sha256: sha256_bytes(prompt.as_bytes()),
+            output_schema_ref: path_string(&schema_path),
+            output_schema_sha256: sha256_bytes(&std::fs::read(&schema_path)?),
+            requested_model: model.to_owned(),
+            max_turns_or_steps: 4,
+            timeout_profile_ref: route_policy.policy_id().to_owned(),
+            provider_route_policy: route_policy,
+            allowed_provider_tools: provider_allowed_tools(host, &mcp_tool_profile.tool_names),
+            denied_provider_tools: vec!["raw_shell".to_owned()],
+            expected_mcp_tool_names: mcp_tool_profile.tool_names,
+            forbidden_mcp_server_names: vec!["eliot_surrealdb".to_owned()],
+            read_only: !worker,
+            candidate_only: true,
+        };
+        if open_campaign {
+            ProviderCallReservationOwner::new(&root).open_campaign(
+                ProviderCallCampaignRequest {
+                    campaign_id: execution.campaign_id.clone(),
+                    max_calls: 1,
+                    closed: false,
+                },
+            )?;
+        }
+        let request = AdapterRequest {
+            request_id: format!("adapter-request:{invocation_id}"),
+            adapter_id: adapter_id(host).to_owned(),
+            requested_capability: AdapterCapability::EmitCandidateObservation,
+            context: AdapterContext {
+                project_id,
+                task_id,
+                session_id: Some(agent_session_id),
+                trace_id: format!("trace:{invocation_id}"),
+                created_at: OffsetDateTime::now_utc(),
+                role_lease_id: Some("provider-route-role".to_owned()),
+                role_lease_epoch: Some(1),
+                operation_generation: Some(1),
+                runtime_contract_sha256: Some("a".repeat(64)),
+            },
+            input: serde_json::to_value(&execution)?,
+        };
+        let runner = Arc::new(ScriptedProviderProcessRunner::with_delay(
+            outcomes,
+            completion_delay,
+        ));
+        let authority = Arc::new(RecordingAuthorityBoundary::default());
+        let provider_runtime = super::super::ProviderRuntime::scripted(runner.clone());
+        let core = ExternalAgentAdapterCore::for_test(
+            host,
+            &config_path,
+            &governor,
+            &executable,
+            runner.clone(),
+            authority.clone(),
+        )?;
+        let mut registry = AdapterRegistry::new();
+        match host {
+            AgentHostId::Claude => registry.register(ClaudeCodeCliAdapter { core })?,
+            AgentHostId::Antigravity => registry.register(AntigravityCliAdapter { core })?,
+            AgentHostId::OpenCode => registry.register(OpenCodeCliAdapter { core })?,
+            AgentHostId::Codex => unreachable!("Codex has no external provider route"),
+        }
+        let supervisor =
+            AdapterSupervisor::with_runtime(registry, provider_runtime.operation_runtime());
+        Ok(RouteFixture {
+            root,
+            supervisor,
+            runner,
+            provider_runtime,
+            authority,
+            request,
+            attempt_id: format!("external-agent-attempt-{invocation_id}"),
+        })
+    }
+
+    fn final_attempt_state(root: &Path, attempt_id: &str) -> Result<ProviderInvocationAttempt> {
+        Ok(ProviderInvocationJournal::new(root).load(attempt_id)?)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn provider_runtime_b1_delayed_output_survives_scaled_former_boundary() -> Result<()> {
+        let fixture = route_fixture(
+            vec![scripted_outcome(antigravity_native_output(), false, false)],
+            Duration::from_secs(6),
+        )?;
+        let result = fixture
+            .supervisor
+            .execute(&fixture.request.adapter_id, fixture.request.clone(), None)
+            .await?;
+        assert_eq!(
+            result.status,
+            AdapterResultStatus::Succeeded,
+            "{:?}",
+            result.error
+        );
+        assert_eq!(fixture.runner.call_count(), 1);
+        assert_eq!(
+            fixture.authority.phases(),
+            ["integrity", "enqueue", "start", "canonicalize"]
+        );
+        let attempt = final_attempt_state(&fixture.root, &fixture.attempt_id)?;
+        assert_eq!(
+            attempt
+                .state_transitions
+                .last()
+                .map(|transition| transition.to),
+            Some(ProviderInvocationState::ReviewNormalized)
+        );
+        std::fs::remove_dir_all(fixture.root)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn provider_runtime_b2_managed_and_external_share_runner_and_policy_owner() -> Result<()>
+    {
+        let fixture = route_fixture(
+            vec![
+                scripted_outcome(antigravity_native_output(), false, false),
+                scripted_outcome(Vec::new(), false, false),
+            ],
+            Duration::ZERO,
+        )?;
+        let external = fixture
+            .supervisor
+            .execute(&fixture.request.adapter_id, fixture.request.clone(), None)
+            .await?;
+        assert_eq!(external.status, AdapterResultStatus::Succeeded);
+        let execution: ExternalAgentExecutionRequest =
+            serde_json::from_value(fixture.request.input.clone())?;
+        let mut command =
+            tokio::process::Command::new(fixture.root.join("agy.exe").canonicalize()?);
+        command.current_dir(&execution.launch_contract.cwd_or_worktree);
+        let managed_spec = super::super::managed::managed_provider_process_spec(
+            &command,
+            &execution.launch_contract,
+        )?;
+        super::super::managed::dispatch_managed_provider(&fixture.provider_runtime, managed_spec)
+            .await?;
+        assert_eq!(fixture.runner.call_count(), 2);
+        let specs = fixture.runner.specs()?;
+        assert_eq!(specs.len(), 2);
+        assert_eq!(
+            specs[0].route_policy, execution.provider_route_policy,
+            "external adapter changed the request-owned policy"
+        );
+        let expected_managed = ProviderRoutePolicy::for_route(
+            AgentHostId::Antigravity,
+            "managed-provider",
+            ProviderDeclaredBudget::new(
+                1_000,
+                u64::try_from(eliot_types::MAX_SECRET_BOUNDARY_BYTES)?,
+            )
+            .with_first_output_deadline_ms(None),
+        );
+        assert_eq!(specs[1].route_policy, expected_managed);
+        std::fs::remove_dir_all(fixture.root)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn provider_runtime_b3_first_output_timeout_reaps_and_never_replays() -> Result<()> {
+        let fixture = route_fixture(
+            vec![scripted_outcome(Vec::new(), true, true)],
+            Duration::ZERO,
+        )?;
+        let first = fixture
+            .supervisor
+            .execute(&fixture.request.adapter_id, fixture.request.clone(), None)
+            .await?;
+        assert_eq!(
+            first.status,
+            AdapterResultStatus::Timeout,
+            "{:?}",
+            first.error
+        );
+        let _second = fixture
+            .supervisor
+            .execute(&fixture.request.adapter_id, fixture.request.clone(), None)
+            .await?;
+        assert_eq!(fixture.runner.call_count(), 1);
+        let attempt = final_attempt_state(&fixture.root, &fixture.attempt_id)?;
+        assert_eq!(
+            attempt
+                .state_transitions
+                .last()
+                .map(|transition| transition.to),
+            Some(ProviderInvocationState::NonReconcilableUnknown)
+        );
+        assert!(
+            attempt
+                .process_reap_receipt
+                .as_ref()
+                .is_some_and(ProcessReapReceipt::proves_complete_reap)
+        );
+        std::fs::remove_dir_all(fixture.root)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn provider_runtime_b4_invalid_json_is_terminal_rejected() -> Result<()> {
+        let fixture = route_fixture(
+            vec![scripted_outcome(b"not-json".to_vec(), false, false)],
+            Duration::ZERO,
+        )?;
+        let result = fixture
+            .supervisor
+            .execute(&fixture.request.adapter_id, fixture.request.clone(), None)
+            .await?;
+        assert_eq!(
+            result.status,
+            AdapterResultStatus::Failed,
+            "{:?}",
+            result.error
+        );
+        let attempt = final_attempt_state(&fixture.root, &fixture.attempt_id)?;
+        assert_eq!(
+            attempt
+                .state_transitions
+                .last()
+                .map(|transition| transition.to),
+            Some(ProviderInvocationState::ProtocolParseFailed)
+        );
+        assert_ne!(
+            attempt
+                .state_transitions
+                .last()
+                .map(|transition| transition.to),
+            Some(ProviderInvocationState::Running)
+        );
+        std::fs::remove_dir_all(fixture.root)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn provider_runtime_b5_terminal_output_then_hang_yields_one_forced_reap_result()
+    -> Result<()> {
+        let fixture = route_fixture(
+            vec![scripted_outcome(antigravity_native_output(), false, true)],
+            Duration::ZERO,
+        )?;
+        let result = fixture
+            .supervisor
+            .execute(&fixture.request.adapter_id, fixture.request.clone(), None)
+            .await?;
+        assert_eq!(
+            result.status,
+            AdapterResultStatus::Succeeded,
+            "{:?}",
+            result.error
+        );
+        assert_eq!(fixture.runner.call_count(), 1);
+        let attempt = final_attempt_state(&fixture.root, &fixture.attempt_id)?;
+        assert!(
+            attempt
+                .process_reap_receipt
+                .as_ref()
+                .is_some_and(|receipt| receipt.forced_termination && receipt.proves_complete_reap())
+        );
+        std::fs::remove_dir_all(fixture.root)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn provider_runtime_b6_all_hosts_and_cognitive_purposes_bind_exact_hashes() -> Result<()>
+    {
+        let hosts = [
+            AgentHostId::Claude,
+            AgentHostId::Antigravity,
+            AgentHostId::OpenCode,
+        ];
+        let purposes = [
+            ExternalAgentPurpose::CognitiveWorker,
+            ExternalAgentPurpose::UnderstandingReader,
+            ExternalAgentPurpose::CognitiveJudge,
+        ];
+        for host in hosts {
+            for purpose in purposes {
+                let fixture = route_fixture_for(
+                    host,
+                    purpose,
+                    vec![scripted_outcome(provider_native_output(host), false, false)],
+                    Duration::ZERO,
+                    true,
+                )?;
+                let execution: ExternalAgentExecutionRequest =
+                    serde_json::from_value(fixture.request.input.clone())?;
+                let expected_profile = crate::mcp_stdio::catalog::provider_mcp_tool_profile(
+                    provider_mcp_access_profile(purpose),
+                );
+                let expected_profile_id = if purpose == ExternalAgentPurpose::CognitiveWorker {
+                    "cognitive_child"
+                } else {
+                    "external_auditor"
+                };
+                assert_eq!(expected_profile.profile_id, expected_profile_id);
+                assert!(expected_profile.hash_is_valid());
+                assert_eq!(execution.mcp_tool_profile, expected_profile);
+                assert_eq!(
+                    execution.allowed_provider_tools,
+                    provider_allowed_tools(host, &expected_profile.tool_names)
+                );
+
+                let result = fixture
+                    .supervisor
+                    .execute(&fixture.request.adapter_id, fixture.request.clone(), None)
+                    .await?;
+                assert_eq!(
+                    result.status,
+                    AdapterResultStatus::Succeeded,
+                    "route {host:?}/{purpose:?} failed: {:?}",
+                    result.error
+                );
+                assert_eq!(
+                    result.output.pointer("/provider_runtime_contract/host"),
+                    Some(&json!(host))
+                );
+                assert_eq!(
+                    result.output.pointer("/provider_runtime_contract/purpose"),
+                    Some(&json!(purpose))
+                );
+                assert_eq!(
+                    result
+                        .output
+                        .pointer("/provider_runtime_contract/provider_route_policy/policy_id"),
+                    Some(&json!(execution.provider_route_policy.policy_id()))
+                );
+                assert_eq!(
+                    result.output.pointer(
+                        "/provider_runtime_contract/provider_route_policy/policy_hash_blake3"
+                    ),
+                    Some(&json!(execution.provider_route_policy.policy_hash_blake3()))
+                );
+                assert_eq!(
+                    result.output.pointer(
+                        "/provider_execution_evidence/provider_route_policy/policy_hash_blake3"
+                    ),
+                    Some(&json!(execution.provider_route_policy.policy_hash_blake3()))
+                );
+                assert_eq!(
+                    result
+                        .output
+                        .pointer("/provider_runtime_contract/mcp_tool_profile/profile_hash_blake3"),
+                    Some(&json!(&expected_profile.profile_hash_blake3))
+                );
+                let mut normalized_allowed_tools = execution.allowed_provider_tools.clone();
+                normalized_allowed_tools.sort();
+                normalized_allowed_tools.dedup();
+                assert_eq!(
+                    result
+                        .output
+                        .pointer("/provider_runtime_contract/allowed_provider_tools"),
+                    Some(&json!(normalized_allowed_tools))
+                );
+                let specs = fixture.runner.specs()?;
+                assert_eq!(specs.len(), 1);
+                assert_eq!(specs[0].route_policy, execution.provider_route_policy);
+                assert_eq!(fixture.runner.call_count(), 1);
+                std::fs::remove_dir_all(fixture.root)?;
+            }
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn provider_runtime_b7_adapter_cannot_create_or_size_campaign() -> Result<()> {
+        let fixture = route_fixture_for(
+            AgentHostId::Antigravity,
+            ExternalAgentPurpose::UnderstandingReader,
+            vec![scripted_outcome(antigravity_native_output(), false, false)],
+            Duration::ZERO,
+            false,
+        )?;
+        assert!(fixture.request.input.get("max_calls").is_none());
+        let result = fixture
+            .supervisor
+            .execute(&fixture.request.adapter_id, fixture.request.clone(), None)
+            .await?;
+        assert_eq!(result.status, AdapterResultStatus::Failed);
+        assert!(
+            result
+                .error
+                .as_ref()
+                .is_some_and(|error| error.message.contains("provider campaign is closed"))
+        );
+        assert_eq!(fixture.runner.call_count(), 0);
+        assert_eq!(fixture.authority.phases(), ["integrity"]);
+        let attempt = final_attempt_state(&fixture.root, &fixture.attempt_id)?;
+        assert_eq!(
+            attempt
+                .state_transitions
+                .last()
+                .map(|transition| transition.to),
+            Some(ProviderInvocationState::PreDispatchAborted)
+        );
+        std::fs::remove_dir_all(fixture.root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn provider_runtime_b8_source_gate_has_one_owner_and_no_compatibility_path() -> Result<()> {
+        let workspace = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let read = |relative: &str| -> Result<String> {
+            Ok(std::fs::read_to_string(workspace.join(relative))?)
+        };
+        let provider_owner = read("crates/eliot-app/src/host_runtime/provider_runtime.rs")?;
+        assert_eq!(
+            provider_owner
+                .matches("SupervisedWindowsProcessRunner::from_runtime_store")
+                .count(),
+            1
+        );
+        let external_agent = read("crates/eliot-app/src/host_runtime/external_agent.rs")?;
+        let test_boundary = external_agent
+            .find("mod provider_runtime_tests")
+            .context("provider runtime test-module source anchor")?;
+        let mut route_sources = external_agent[..test_boundary].to_owned();
+        for relative in [
+            "crates/eliot-app/src/host_runtime/managed.rs",
+            "crates/eliot-app/src/cognitive_runner.rs",
+            "crates/eliot-app/src/delegation_runtime.rs",
+            "crates/eliot-app/src/commands/antigravity.rs",
+        ] {
+            route_sources.push('\n');
+            route_sources.push_str(&read(relative)?);
+        }
+        for forbidden in [
+            "SupervisedWindowsProcessRunner::from_runtime_store",
+            "SupervisedWindowsProcessRunner::new",
+            "ProviderTimeoutProfile {",
+            "AntigravityProcessExecutor",
+            "SharedAntigravityProcessExecutor",
+            "run_external_agent_process",
+            ".spawn(",
+        ] {
+            assert!(
+                !route_sources.contains(forbidden),
+                "provider route still contains forbidden source fragment {forbidden}"
+            );
+        }
+        let timeout_owner = read("crates/eliot-types/src/provider_invocation.rs")?;
+        assert_eq!(
+            timeout_owner
+                .matches("let timeout_profile = ProviderTimeoutProfile {")
+                .count(),
+            1
+        );
+        let external_types = read("crates/eliot-types/src/external_agent.rs")?;
+        assert_eq!(
+            external_types
+                .lines()
+                .filter(|line| line.contains("CognitiveProviderRuntimeContract {"))
+                .map(str::trim)
+                .collect::<Vec<_>>(),
+            ["pub struct CognitiveProviderRuntimeContract {"]
+        );
+        let cargo = read("crates/eliot-app/Cargo.toml")?;
+        assert!(!cargo.contains("[[test]]"));
+        assert!(!cargo.contains("cognitive_field_runner"));
+        let managed = read("crates/eliot-app/src/host_runtime/managed.rs")?;
+        let attempt_write = managed
+            .find("atomic_write_json(&attempt_path, &attempt)")
+            .context("managed attempt write source anchor")?;
+        let dispatch = managed
+            .find("dispatch_managed_provider(provider_runtime, provider_spec)")
+            .context("managed provider dispatch source anchor")?;
+        assert!(attempt_write < dispatch);
         Ok(())
     }
 }
