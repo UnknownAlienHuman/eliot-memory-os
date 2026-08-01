@@ -815,3 +815,21 @@ This log preserves the ordered implementation evidence for
   task into test-harness research, investigation stopped. This is an unrelated slow/flaky harness
   fingerprint, not evidence against the focused seal/Claude fixes, and must be recorded in Eliot
   and the final report.
+- Product commit `3fe0a48d5e582abc056d269781f5c05f76a86a33` was pushed. Its isolated release
+  build took 280.437 s and produced a 56,131,072-byte binary with SHA-256
+  `42bf2353d945a6a4006d76e3bea38d9a9c607c24cbf18f402b2501427ce62d5f` and the exact embedded
+  commit. After a clean quiescence check, PID 55564 stopped cooperatively and this candidate started
+  hidden as PID 75572. Publication, doctor, and supervision all reported ready, exact path/SHA,
+  dispatch safe, and zero operations, orphans, partial seals, or active/pending leases. The cutover
+  wrapper itself compared publication field `status` instead of the actual `state`, so it emitted a
+  false post-start error after the candidate was already ready; direct doctor/supervision removed
+  the ambiguity.
+- The first real generation-5 dry-run with that candidate failed closed in 10.532 s at carried
+  lineage proof: `published supersession quarantine root differs from its deterministic identity`.
+  Before/after inventories were identical (22 public and 1,617 private files, zero differences).
+  Exact evidence showed a Windows representation mismatch only: the durable supersession record
+  contains raw `\\?\C:\...` from `Path::display`, while the comparator normalized only the live
+  side to slash form. The generic comparator now normalizes both `Path` identities; no durable data
+  is rewritten. Its existing ordinary/verbatim regression now also covers a raw displayed verbatim
+  expected string. Cognitive runner remained 29/29 green (1.03 s behavior), and package Clippy with
+  warnings denied passed.

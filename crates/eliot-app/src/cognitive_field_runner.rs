@@ -9661,7 +9661,7 @@ fn legacy_canonical_path(path: &Path) -> String {
 }
 
 fn contract_path_matches(path: &Path, expected: &str) -> bool {
-    canonical_path(path) == expected || legacy_canonical_path(path) == expected
+    canonical_path(path) == canonical_path(Path::new(expected))
 }
 
 fn contract_private_root_matches(path: &Path, expected_sha256: &str) -> bool {
@@ -11839,6 +11839,10 @@ mod tests {
         assert!(super::contract_path_matches(
             verbatim,
             &super::canonical_path(ordinary)
+        ));
+        assert!(super::contract_path_matches(
+            ordinary,
+            &verbatim.display().to_string()
         ));
     }
 
