@@ -10,6 +10,7 @@ RETURN SELECT
   observation_ids,
   verification_ids,
   verification_scopes,
+  completion_proof,
   completion_write_id,
   memory_revision,
   project_sequence,

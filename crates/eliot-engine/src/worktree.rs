@@ -666,8 +666,17 @@ impl crate::CompletionGate {
         if candidate_diff.capture_status != CandidateDiffStatus::AcceptedForPatchRunner {
             reasons.push("candidate_diff_not_accepted_for_patchrunner".to_owned());
         }
+        if candidate_diff.write_receipt.is_none() {
+            reasons.push("candidate_diff_missing_canonical_receipt".to_owned());
+        }
+        if candidate_review.candidate_diff_id != candidate_diff.candidate_diff_id {
+            reasons.push("candidate_review_diff_mismatch".to_owned());
+        }
         if candidate_review.decision != CandidateReviewDecision::AcceptForPatchRunner {
             reasons.push("candidate_review_not_accepted".to_owned());
+        }
+        if candidate_review.write_receipt.is_none() {
+            reasons.push("candidate_review_missing_canonical_receipt".to_owned());
         }
         if !proof
             .evidence
@@ -675,6 +684,13 @@ impl crate::CompletionGate {
             .any(|evidence| evidence.contains(&candidate_diff.candidate_diff_id.to_string()))
         {
             reasons.push("completion_proof_missing_candidate_diff_ref".to_owned());
+        }
+        if !proof
+            .evidence
+            .iter()
+            .any(|evidence| evidence.contains(&candidate_review.review_id))
+        {
+            reasons.push("completion_proof_missing_candidate_review_ref".to_owned());
         }
         if context
             .verifier_runs

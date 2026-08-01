@@ -375,6 +375,7 @@ pub(super) async fn dispatch_operator_snapshot(
             verifier_need: packet.decision_locality_suffix.verifier.clone(),
             ..TaskMeaningFrame::default()
         });
+        let completion_proof = task.completion_proof.clone();
         task_cognition.push(TaskCognitionView {
             task_contract: task,
             task_meaning,
@@ -426,7 +427,7 @@ pub(super) async fn dispatch_operator_snapshot(
                 .as_ref()
                 .and_then(|packet| packet.packet_quality.clone()),
             understanding_outcomes: outcomes,
-            completion_proof: None,
+            completion_proof,
         });
         memory_inspector = Some(MemoryInspectorView {
             project_id,

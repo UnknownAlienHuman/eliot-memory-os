@@ -285,6 +285,8 @@ pub struct TaskContractInput {
     pub verification_ids: Vec<VerificationId>,
     #[serde(default)]
     pub verification_scopes: Vec<VerifierArtifactScope>,
+    #[serde(default)]
+    pub completion_proof: Option<CompletionProof>,
     pub completion_write_id: Option<WriteId>,
 }
 
@@ -311,6 +313,8 @@ pub struct TaskContract {
     pub verification_ids: Vec<VerificationId>,
     #[serde(default)]
     pub verification_scopes: Vec<VerifierArtifactScope>,
+    #[serde(default)]
+    pub completion_proof: Option<CompletionProof>,
     pub completion_write_id: Option<WriteId>,
     pub memory_revision: MemoryRevision,
     pub project_sequence: ProjectSequence,
@@ -851,7 +855,8 @@ pub struct WriterStatusResponse {
     pub latest_memory_revision: Option<MemoryRevision>,
     pub project_heads: Vec<ProjectRevisionSummary>,
     pub last_receipts: Vec<WriteReceipt>,
-    pub final_status: String,
+    #[serde(rename = "final_status")]
+    pub operation_status: OperationStatus,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1543,6 +1548,33 @@ pub enum CompletionStatus {
     UnsafeToFinish,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum OperationStatus {
+    OperationCompleted,
+    Active,
+    Blocked,
+    Failed,
+}
+
+impl OperationStatus {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::OperationCompleted => "OPERATION_COMPLETED",
+            Self::Active => "ACTIVE",
+            Self::Blocked => "BLOCKED",
+            Self::Failed => "FAILED",
+        }
+    }
+}
+
+impl std::fmt::Display for OperationStatus {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct CompletionGateDecision {
     pub task_id: String,
@@ -1587,7 +1619,8 @@ pub struct CodeCortexReport {
     pub evidence_sources: Vec<CodeEvidenceSource>,
     pub adapter_notes: Vec<String>,
     pub memory_receipt: Option<WriteReceiptRef>,
-    pub final_status: String,
+    #[serde(rename = "final_status")]
+    pub operation_status: OperationStatus,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
@@ -1794,6 +1827,10 @@ pub struct WorkItem {
     pub required: bool,
     pub allowed_roles: Vec<AgentRole>,
     pub required_verifiers: Vec<VerifierRequirement>,
+    #[serde(default)]
+    pub verifier_run_refs: Vec<VerifierRunRef>,
+    #[serde(default)]
+    pub candidate_review_refs: Vec<String>,
     pub created_by: AgentSessionId,
     pub active_lease_id: Option<WorkLeaseId>,
     pub lease_refs: Vec<WorkLeaseId>,

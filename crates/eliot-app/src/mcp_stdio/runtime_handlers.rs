@@ -448,6 +448,7 @@ async fn dispatch_task_contract_create(
         observation_ids: Vec::new(),
         verification_ids: Vec::new(),
         verification_scopes: Vec::new(),
+        completion_proof: None,
         completion_write_id: None,
     };
     let (receipt, contract) = submit_task_transition(

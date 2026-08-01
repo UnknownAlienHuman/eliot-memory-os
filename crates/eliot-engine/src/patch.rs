@@ -562,6 +562,9 @@ impl CompletionGate {
         if patch_run.status != PatchRunStatus::AppliedVerifierPassed {
             reasons.push(format!("patch_not_verified:{:?}", patch_run.status));
         }
+        if patch_run.write_receipt.is_none() {
+            reasons.push("patch_run_missing_canonical_receipt".to_owned());
+        }
         if proof.changed_files.iter().any(|file| {
             !patch_run
                 .changed_files
@@ -570,9 +573,22 @@ impl CompletionGate {
         }) {
             reasons.push("proof_file_not_in_patch_run".to_owned());
         }
-        if !required_verifiers_passed(verifier_runs) {
+        let required_verifier_runs = verifier_runs
+            .iter()
+            .filter(|run| run.required_for_done)
+            .collect::<Vec<_>>();
+        if required_verifier_runs.is_empty() {
+            reasons.push("missing_required_verifier_run".to_owned());
+        } else if !required_verifiers_passed(verifier_runs) {
             reasons.push("required_verifier_failed".to_owned());
             return completion_decision(proof, CompletionStatus::FailedVerifier, reasons);
+        }
+        if required_verifier_runs.iter().any(|run| {
+            run.project_id != patch_run.project_id
+                || run.task_id != patch_run.task_id
+                || run.write_receipt.is_none()
+        }) {
+            reasons.push("required_verifier_missing_canonical_scope_or_receipt".to_owned());
         }
         if !proof
             .evidence

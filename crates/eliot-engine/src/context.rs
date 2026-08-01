@@ -2,22 +2,25 @@ use crate::project_understanding::ProjectUnderstandingCompiler;
 use crate::task_execution::TaskExecutionClassifier;
 use crate::{
     EngineError, ReadService, SkillActivationContext, SkillCuratorService,
-    SkillDistractorFilterService, WriteAdmissionService, WriterHandle,
+    SkillDistractorFilterService, StopCoordinationGate, WorkState, WriteAdmissionService,
+    WriterHandle,
 };
 use eliot_types::memory::{
     CurrentGitScopeView, GovernedGitScope, MemoryApplicabilityDecision,
     MemoryApplicabilityDisposition, MemoryApplicabilityPacketView, MemoryProvenanceView,
 };
 use eliot_types::{
-    ClaimCard, CodeCortexPacketView, CodeCortexReport, CognitiveGateDecision, CognitiveGateOutcome,
-    CognitiveGateReason, CognitiveGateRequest, CompilePacketL3Request, CompletionGateDecision,
-    CompletionProof, CompletionStatus, ContextPacketL3, CurrentStateRequest, CurrentStateResponse,
+    CandidateDiffStatus, CandidateReviewDecision, ClaimCard, CodeCortexPacketView,
+    CodeCortexReport, CognitiveGateDecision, CognitiveGateOutcome, CognitiveGateReason,
+    CognitiveGateRequest, CompilePacketL3Request, CompletionGateDecision, CompletionProof,
+    CompletionStatus, ContextPacketL3, CurrentStateRequest, CurrentStateResponse,
     CurrentTruthSnapshot, DecisionLocalitySuffix, EpistemicPacketState, EpistemicStatus,
     FetchAtomsL2Request, FetchAtomsL2Response, MaterialPacketFrame, MemoryAdmissionDecision,
     MemoryDecisionReceipt, MemoryLifecyclePacketView, MemoryRevision, PacketQualityReport,
-    PacketQualityResult, ReadConsistencyMode, RecallL0Request, RecallL0Response, SkillCardV2,
-    TaskId, TokenBudgetReport, TruncationInfo, UnderstandingProof, UnderstandingProofReceipt,
-    VerifierArtifactRef, WorkItem, WorkItemStatus, WorkLease, WorkLeaseState,
+    PacketQualityResult, ProjectId, ReadConsistencyMode, RecallL0Request, RecallL0Response,
+    SkillCardV2, TaskId, TokenBudgetReport, TruncationInfo, UnderstandingProof,
+    UnderstandingProofReceipt, VerifierArtifactRef, VerifierStatus, WorkItem, WorkItemStatus,
+    WorkLease, WorkLeaseState,
 };
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::str::FromStr;
@@ -1213,6 +1216,9 @@ impl CompletionGate {
         if proof.checks_run.is_empty() {
             reasons.push("missing_verifier_runs".to_owned());
         }
+        if proof.acceptance_items.is_empty() {
+            reasons.push("missing_acceptance_items".to_owned());
+        }
         if !proof.checks_not_run.is_empty() {
             reasons.push("checks_not_run_present".to_owned());
         }
@@ -1275,8 +1281,47 @@ impl CompletionGate {
         let mut reasons = base.reasons;
         match work_item {
             Some(item) => {
+                if proof.project_id != item.project_id || proof.task_id != item.task_id.to_string()
+                {
+                    reasons.push("work_item_completion_proof_scope_mismatch".to_owned());
+                }
                 if item.required && item.status != WorkItemStatus::Completed {
                     reasons.push("work_item_not_satisfied".to_owned());
+                }
+                if item.required && item.status == WorkItemStatus::Completed {
+                    for requirement in item
+                        .required_verifiers
+                        .iter()
+                        .filter(|requirement| requirement.required_for_done)
+                    {
+                        let matching = item
+                            .verifier_run_refs
+                            .iter()
+                            .filter(|reference| reference.name == requirement.name)
+                            .collect::<Vec<_>>();
+                        if matching.is_empty() {
+                            reasons.push(format!(
+                                "work_item_required_verifier_missing:{}",
+                                requirement.name
+                            ));
+                        }
+                        for reference in matching {
+                            if reference.status != VerifierStatus::Passed {
+                                reasons.push(format!(
+                                    "work_item_required_verifier_failed:{}",
+                                    requirement.name
+                                ));
+                            }
+                            if !proof.evidence.iter().any(|evidence| {
+                                evidence.contains(&reference.verifier_run_id.to_string())
+                            }) {
+                                reasons.push(format!(
+                                    "completion_proof_missing_work_verifier_ref:{}",
+                                    reference.verifier_run_id
+                                ));
+                            }
+                        }
+                    }
                 }
             }
             None => reasons.push("missing_work_item".to_owned()),
@@ -1311,6 +1356,212 @@ impl CompletionGate {
             project_id: proof.project_id,
             final_status,
             reasons,
+        }
+    }
+
+    /// Applies the existing completion owner to the canonical task's runtime
+    /// evidence. This is intentionally a `CompletionGate` method: coordination,
+    /// work, and candidate state constrain one task decision instead of
+    /// creating another finish authority.
+    pub fn decide_for_task(
+        proof: &CompletionProof,
+        project_id: ProjectId,
+        task_id: TaskId,
+        work_state: &WorkState,
+        incident_lockdown_active: bool,
+    ) -> CompletionGateDecision {
+        let base = Self::decide_with_incident_context(proof, incident_lockdown_active);
+        let mut reasons = base.reasons;
+
+        if proof.project_id != project_id || proof.task_id != task_id.to_string() {
+            reasons.push("completion_proof_task_scope_mismatch".to_owned());
+        }
+
+        let coordination =
+            StopCoordinationGate.evaluate(work_state, Some(project_id), Some(task_id));
+        if !coordination.allow {
+            reasons.extend(
+                coordination
+                    .reasons
+                    .into_iter()
+                    .map(|reason| format!("stop_coordination:{reason}")),
+            );
+        }
+
+        append_required_work_completion_reasons(
+            proof,
+            project_id,
+            task_id,
+            work_state,
+            &mut reasons,
+        );
+        append_candidate_completion_reasons(proof, project_id, task_id, work_state, &mut reasons);
+
+        let final_status = if base.final_status == CompletionStatus::UnsafeToFinish {
+            CompletionStatus::UnsafeToFinish
+        } else if base.final_status == CompletionStatus::FailedVerifier
+            || reasons
+                .iter()
+                .any(|reason| reason.starts_with("required_work_item_verifier_failed:"))
+        {
+            CompletionStatus::FailedVerifier
+        } else if reasons.is_empty() {
+            CompletionStatus::DoneVerified
+        } else {
+            CompletionStatus::PartialProgress
+        };
+
+        CompletionGateDecision {
+            task_id: proof.task_id.clone(),
+            project_id: proof.project_id,
+            final_status,
+            reasons,
+        }
+    }
+}
+
+fn append_required_work_completion_reasons(
+    proof: &CompletionProof,
+    project_id: ProjectId,
+    task_id: TaskId,
+    work_state: &WorkState,
+    reasons: &mut Vec<String>,
+) {
+    for item in work_state
+        .work_items
+        .iter()
+        .filter(|item| item.project_id == project_id && item.task_id == task_id && item.required)
+    {
+        if item.status != WorkItemStatus::Completed {
+            reasons.push(format!(
+                "required_work_item_not_completed:{}",
+                item.work_item_id
+            ));
+            continue;
+        }
+        if !proof
+            .evidence
+            .iter()
+            .any(|evidence| evidence.contains(&item.work_item_id.to_string()))
+        {
+            reasons.push(format!(
+                "completion_proof_missing_work_item_ref:{}",
+                item.work_item_id
+            ));
+        }
+        for requirement in item
+            .required_verifiers
+            .iter()
+            .filter(|requirement| requirement.required_for_done)
+        {
+            let matching = item
+                .verifier_run_refs
+                .iter()
+                .filter(|reference| reference.name == requirement.name)
+                .collect::<Vec<_>>();
+            if matching.is_empty() {
+                reasons.push(format!(
+                    "required_work_item_verifier_missing:{}:{}",
+                    item.work_item_id, requirement.name
+                ));
+                continue;
+            }
+            if matching
+                .iter()
+                .any(|reference| reference.status != VerifierStatus::Passed)
+            {
+                reasons.push(format!(
+                    "required_work_item_verifier_failed:{}:{}",
+                    item.work_item_id, requirement.name
+                ));
+            }
+            for reference in matching {
+                if !proof
+                    .evidence
+                    .iter()
+                    .any(|evidence| evidence.contains(&reference.verifier_run_id.to_string()))
+                {
+                    reasons.push(format!(
+                        "completion_proof_missing_work_verifier_ref:{}",
+                        reference.verifier_run_id
+                    ));
+                }
+            }
+        }
+    }
+}
+
+fn append_candidate_completion_reasons(
+    proof: &CompletionProof,
+    project_id: ProjectId,
+    task_id: TaskId,
+    work_state: &WorkState,
+    reasons: &mut Vec<String>,
+) {
+    let mut latest_candidate_by_work_item = BTreeMap::new();
+    for candidate in work_state.candidate_diffs.iter().filter(|candidate| {
+        candidate.project_id == project_id
+            && candidate.task_id == task_id
+            && candidate.file_count > 0
+            && !candidate.changed_files.is_empty()
+    }) {
+        latest_candidate_by_work_item
+            .entry(candidate.work_item_id)
+            .and_modify(|current: &mut &eliot_types::CandidateDiff| {
+                if candidate.created_at > current.created_at {
+                    *current = candidate;
+                }
+            })
+            .or_insert(candidate);
+    }
+    for candidate in latest_candidate_by_work_item.into_values() {
+        if candidate.capture_status != CandidateDiffStatus::AcceptedForPatchRunner
+            || candidate.write_receipt.is_none()
+        {
+            reasons.push(format!(
+                "candidate_diff_not_accepted:{}",
+                candidate.candidate_diff_id
+            ));
+        }
+        if !proof
+            .evidence
+            .iter()
+            .any(|evidence| evidence.contains(&candidate.candidate_diff_id.to_string()))
+        {
+            reasons.push(format!(
+                "completion_proof_missing_candidate_diff_ref:{}",
+                candidate.candidate_diff_id
+            ));
+        }
+        let latest_review = work_state
+            .candidate_reviews
+            .iter()
+            .filter(|review| review.candidate_diff_id == candidate.candidate_diff_id)
+            .max_by_key(|review| review.created_at);
+        match latest_review {
+            Some(review)
+                if review.decision == CandidateReviewDecision::AcceptForPatchRunner
+                    && review.write_receipt.is_some() =>
+            {
+                if !proof
+                    .evidence
+                    .iter()
+                    .any(|evidence| evidence.contains(&review.review_id))
+                {
+                    reasons.push(format!(
+                        "completion_proof_missing_candidate_review_ref:{}",
+                        review.review_id
+                    ));
+                }
+            }
+            Some(review) => reasons.push(format!(
+                "candidate_review_not_accepted:{}",
+                review.review_id
+            )),
+            None => reasons.push(format!(
+                "missing_candidate_review:{}",
+                candidate.candidate_diff_id
+            )),
         }
     }
 }

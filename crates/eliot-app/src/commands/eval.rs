@@ -203,10 +203,12 @@ pub fn run_eval_smoke(config_path: &Path, suite: &str) -> Result<()> {
             "valid_receipt": artifacts.integrity_receipt,
             "mismatch_receipt": artifacts.mismatch_receipt
         },
-        "final_status": if artifacts.verdict.status == EvalVerdictStatus::Pass {
-            CompletionStatus::DoneVerified
-        } else {
-            CompletionStatus::PartialProgress
+        "operation_status": match artifacts.verdict.status {
+            EvalVerdictStatus::Pass => OperationStatus::OperationCompleted,
+            EvalVerdictStatus::Fail => OperationStatus::Failed,
+            EvalVerdictStatus::Inconclusive | EvalVerdictStatus::Blocked => {
+                OperationStatus::Blocked
+            }
         },
         "generated_at": time::OffsetDateTime::now_utc()
     });
@@ -372,12 +374,12 @@ pub fn run_eval_integration_smoke(config_path: &Path) -> Result<()> {
         "trend": artifacts.trend,
         "stability": artifacts.stability,
         "doctor_status": artifacts.doctor_status,
-        "final_status": if artifacts.gate_decision.decision == EvalGateDecisionKind::Allow
+        "operation_status": if artifacts.gate_decision.decision == EvalGateDecisionKind::Allow
             && artifacts.critical_gate_decision.decision == EvalGateDecisionKind::Block
         {
-            CompletionStatus::DoneVerified
+            OperationStatus::OperationCompleted
         } else {
-            CompletionStatus::PartialProgress
+            OperationStatus::Failed
         },
         "generated_at": time::OffsetDateTime::now_utc()
     });

@@ -9,11 +9,12 @@ use eliot_types::{
     CodeEvidenceSource, CognitiveGateDecision, CognitiveGateOutcome, CognitiveGateReason,
     CompletionAcceptanceItem, CompletionProof, CompletionStatus, DiagnosticEvidence,
     FileChangeIntent, FileChangeKind, FileEvidence, InvariantCard, LeaseDecision, LeaseDenyReason,
-    LeaseStatus, PatchRequest, PatchRequestId, PatchRunStatus, ProjectId, SymbolChangeIntent,
-    SymbolEvidence, TaskId, UnderstandingProof, UnderstandingProofReceipt, UnifiedDiff,
-    VerifierCommandKind, VerifierEvidence, VerifierPlan, VerifierRequirement, WorkItemId,
-    WorkItemStatus, WorkLease, WorkLeaseDecision, WorkLeaseDecisionKind, WorkLeaseDecisionReason,
-    WorkLeaseId, WorkLeaseState,
+    LeaseStatus, OperationStatus, PatchRequest, PatchRequestId, PatchRunStatus, ProjectId,
+    ReceiptId, SymbolChangeIntent, SymbolEvidence, TaskId, UnderstandingProof,
+    UnderstandingProofReceipt, UnifiedDiff, VerifierCommandKind, VerifierEvidence, VerifierPlan,
+    VerifierRequirement, VerifierRun, VerifierRunId, VerifierStatus, WorkItemId, WorkItemStatus,
+    WorkLease, WorkLeaseDecision, WorkLeaseDecisionKind, WorkLeaseDecisionReason, WorkLeaseId,
+    WorkLeaseState, WriteId, WriteReceiptRef,
 };
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -337,10 +338,34 @@ fn completion_requires_work_item_satisfied() -> TestResult {
 }
 
 #[test]
+fn work_item_completion_requires_receipted_required_verifier() {
+    let mut fixture = WorkFixture::new("src/lib.rs");
+    let _ = fixture.claim(AgentRole::Implementer);
+
+    let missing = WorkQueueService.complete_verified(&mut fixture.state, fixture.item_id, &[]);
+    assert!(missing.is_err());
+    assert_ne!(
+        fixture.state.work_items[0].status,
+        WorkItemStatus::Completed
+    );
+
+    let mut unreceipted = passed_verifier_run(&fixture.state.work_items[0]);
+    unreceipted.write_receipt = None;
+    let invalid =
+        WorkQueueService.complete_verified(&mut fixture.state, fixture.item_id, &[unreceipted]);
+    assert!(invalid.is_err());
+    assert_ne!(
+        fixture.state.work_items[0].status,
+        WorkItemStatus::Completed
+    );
+}
+
+#[test]
 fn revoked_work_lease_cannot_complete() -> TestResult {
     let mut fixture = WorkFixture::new("src/lib.rs");
     let lease_id = granted_lease_id(&fixture.claim(AgentRole::Implementer))?;
-    let _ = WorkQueueService.complete(&mut fixture.state, fixture.item_id);
+    let verifier = passed_verifier_run(&fixture.state.work_items[0]);
+    WorkQueueService.complete_verified(&mut fixture.state, fixture.item_id, &[verifier])?;
     let mut lease = find_lease(&fixture.state, lease_id)?.clone();
     lease.state = WorkLeaseState::Revoked;
     let item = &fixture.state.work_items[0];
@@ -352,7 +377,23 @@ fn revoked_work_lease_cannot_complete() -> TestResult {
 }
 
 #[test]
-fn work_status_reports_active_blocked_completed() {
+fn work_status_reports_active_blocked_completed() -> TestResult {
+    let empty = WorkQueueService.status_report(&WorkState::default(), "fixture", "task");
+    assert_eq!(empty.operation_status, OperationStatus::OperationCompleted);
+
+    let active = WorkFixture::new("src/active.rs");
+    let active_report = WorkQueueService.status_report(&active.state, "fixture", "task");
+    assert_eq!(active_report.operation_status, OperationStatus::Active);
+
+    let mut completed = WorkFixture::new("src/completed.rs");
+    let verifier = passed_verifier_run(&completed.state.work_items[0]);
+    WorkQueueService.complete_verified(&mut completed.state, completed.item_id, &[verifier])?;
+    let completed_report = WorkQueueService.status_report(&completed.state, "fixture", "task");
+    assert_eq!(
+        completed_report.operation_status,
+        OperationStatus::OperationCompleted
+    );
+
     let mut fixture = WorkFixture::new("src/lib.rs");
     let _ = fixture.claim(AgentRole::Implementer);
     let blocked_item = fixture.create_item("src/lib.rs");
@@ -365,8 +406,15 @@ fn work_status_reports_active_blocked_completed() {
             ttl_minutes: default_lease_ttl_minutes(),
         },
     );
-    let _ = WorkQueueService.complete(&mut fixture.state, fixture.item_id);
+    let verifier = passed_verifier_run(&fixture.state.work_items[0]);
+    WorkQueueService.complete_verified(&mut fixture.state, fixture.item_id, &[verifier])?;
     let report = WorkQueueService.status_report(&fixture.state, "fixture", "task");
+
+    assert_eq!(report.operation_status, OperationStatus::Blocked);
+    let serialized = serde_json::to_value(&report)?;
+    assert_eq!(serialized["final_status"], "BLOCKED");
+    assert!(serialized.get("operation_status").is_none());
+    assert!(!serialized.to_string().contains("DONE_VERIFIED"));
 
     assert!(
         report
@@ -381,6 +429,7 @@ fn work_status_reports_active_blocked_completed() {
             .iter()
             .any(|item| item.status == WorkItemStatus::Blocked)
     );
+    Ok(())
 }
 
 #[test]
@@ -765,6 +814,39 @@ fn verifier_plan() -> VerifierPlan {
     }
 }
 
+fn passed_verifier_run(item: &eliot_types::WorkItem) -> VerifierRun {
+    let Some(requirement) = item
+        .required_verifiers
+        .iter()
+        .find(|requirement| requirement.required_for_done)
+    else {
+        panic!("fixture has a required verifier");
+    };
+    let now = time::OffsetDateTime::now_utc();
+    VerifierRun {
+        verifier_run_id: VerifierRunId::new_v7(),
+        project_id: item.project_id,
+        task_id: item.task_id,
+        agent_id: AgentId::new_v7(),
+        name: requirement.name.clone(),
+        command_kind: requirement.command_kind,
+        command_display: requirement.command_display.clone(),
+        status: VerifierStatus::Passed,
+        exit_code: Some(0),
+        duration_ms: 1,
+        stdout_blob: None,
+        stderr_blob: None,
+        summary: "fixture verifier passed".to_owned(),
+        required_for_done: true,
+        write_receipt: Some(WriteReceiptRef {
+            receipt_id: ReceiptId::new_v7(),
+            write_id: WriteId::new_v7(),
+        }),
+        started_at: now,
+        finished_at: now,
+    }
+}
+
 fn report(repo_root: &str, git_head: Option<String>) -> CodeCortexReport {
     let file = FileEvidence {
         path: "src/lib.rs".to_owned(),
@@ -823,11 +905,18 @@ fn report(repo_root: &str, git_head: Option<String>) -> CodeCortexReport {
         evidence_sources: vec![CodeEvidenceSource::Rg],
         adapter_notes: Vec::new(),
         memory_receipt: None,
-        final_status: "ready".to_owned(),
+        operation_status: OperationStatus::OperationCompleted,
     }
 }
 
 fn completion_proof(item: &eliot_types::WorkItem) -> CompletionProof {
+    let evidence = std::iter::once(format!("work_item:{}", item.work_item_id))
+        .chain(
+            item.verifier_run_refs
+                .iter()
+                .map(|reference| format!("verifier_run:{}", reference.verifier_run_id)),
+        )
+        .collect::<Vec<_>>();
     CompletionProof {
         task_id: item.task_id.to_string(),
         project_id: item.project_id,
@@ -843,7 +932,7 @@ fn completion_proof(item: &eliot_types::WorkItem) -> CompletionProof {
             verifier: "cargo-check".to_owned(),
             residual_uncertainty: "none".to_owned(),
         }],
-        evidence: vec![format!("work_item:{}", item.work_item_id)],
+        evidence,
         skill_refs: Vec::new(),
         skill_execution_proof_refs: Vec::new(),
         residual_uncertainty: "none".to_owned(),

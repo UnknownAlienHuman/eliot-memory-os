@@ -1,13 +1,14 @@
 use crate::{EngineError, WriteAdmissionService, WriterHandle};
 use eliot_types::{
     ActionLease, AgentId, AgentRole, AgentRun, AgentSession, AgentSessionId, AgentSessionStatus,
-    AgentTransport, AuthorityProfile, BlackboardItem, CandidateDiff, CandidateReview,
-    CollectiveTrace, CommandContext, LifecycleStatus, LostAgentRecoveryRecord, MailboxMessage,
-    ProjectId, RiskTier, SemanticCommand, TaintClass, TaskId, ToolObservationRecordCommand,
-    VerifierRequirement, Visibility, WorkConflict, WorkConflictKind, WorkConflictResolution,
-    WorkItem, WorkItemId, WorkItemStatus, WorkLease, WorkLeaseDecision, WorkLeaseDecisionKind,
-    WorkLeaseDecisionReason, WorkLeaseId, WorkLeaseState, WorkScope, WorktreeLease, WriteId,
-    WriteReceiptRef,
+    AgentTransport, AuthorityProfile, BlackboardItem, CandidateDiff, CandidateDiffStatus,
+    CandidateReview, CandidateReviewDecision, CollectiveTrace, CommandContext, LifecycleStatus,
+    LostAgentRecoveryRecord, MailboxMessage, OperationStatus, ProjectId, RiskTier, SemanticCommand,
+    TaintClass, TaskId, ToolObservationRecordCommand, VerifierRequirement, VerifierRun,
+    VerifierRunRef, VerifierStatus, Visibility, WorkConflict, WorkConflictKind,
+    WorkConflictResolution, WorkItem, WorkItemId, WorkItemStatus, WorkLease, WorkLeaseDecision,
+    WorkLeaseDecisionKind, WorkLeaseDecisionReason, WorkLeaseId, WorkLeaseState, WorkScope,
+    WorktreeLease, WriteId, WriteReceiptRef,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
@@ -54,7 +55,8 @@ pub struct WorkStatusReport {
     pub worktree_leases: Vec<WorktreeLease>,
     pub candidate_diffs: Vec<CandidateDiff>,
     pub candidate_reviews: Vec<CandidateReview>,
-    pub final_status: String,
+    #[serde(rename = "final_status")]
+    pub operation_status: OperationStatus,
 }
 
 #[derive(Clone, Debug)]
@@ -226,6 +228,8 @@ impl WorkQueueService {
                 AgentRole::Verifier,
             ],
             required_verifiers: request.required_verifiers,
+            verifier_run_refs: Vec::new(),
+            candidate_review_refs: Vec::new(),
             created_by: request.created_by,
             active_lease_id: None,
             lease_refs: Vec::new(),
@@ -239,16 +243,98 @@ impl WorkQueueService {
         item
     }
 
-    pub fn complete(&self, state: &mut WorkState, work_item_id: WorkItemId) -> Option<WorkItem> {
+    pub fn complete_verified(
+        &self,
+        state: &mut WorkState,
+        work_item_id: WorkItemId,
+        verifier_runs: &[VerifierRun],
+    ) -> Result<WorkItem, EngineError> {
+        let item = state
+            .work_items
+            .iter()
+            .find(|item| item.work_item_id == work_item_id)
+            .cloned()
+            .ok_or_else(|| EngineError::WriteRejected("work item not found".to_owned()))?;
+        let mut verifier_run_refs = Vec::new();
+        for requirement in item
+            .required_verifiers
+            .iter()
+            .filter(|requirement| requirement.required_for_done)
+        {
+            let run = verifier_runs.iter().find(|run| {
+                run.project_id == item.project_id
+                    && run.task_id == item.task_id
+                    && run.name == requirement.name
+                    && run.command_kind == requirement.command_kind
+                    && run.command_display == requirement.command_display
+                    && run.required_for_done
+                    && run.status == VerifierStatus::Passed
+                    && run.write_receipt.is_some()
+            });
+            let Some(run) = run else {
+                return Err(EngineError::WriteRejected(format!(
+                    "required verifier evidence is missing or invalid: {}",
+                    requirement.name
+                )));
+            };
+            verifier_run_refs.push(VerifierRunRef {
+                verifier_run_id: run.verifier_run_id,
+                name: run.name.clone(),
+                status: run.status,
+            });
+        }
+
+        let latest_candidate = state
+            .candidate_diffs
+            .iter()
+            .filter(|candidate| {
+                candidate.work_item_id == work_item_id
+                    && candidate.file_count > 0
+                    && !candidate.changed_files.is_empty()
+            })
+            .max_by_key(|candidate| candidate.created_at);
+        let mut candidate_review_refs = Vec::new();
+        if let Some(candidate) = latest_candidate {
+            if candidate.capture_status != CandidateDiffStatus::AcceptedForPatchRunner
+                || candidate.write_receipt.is_none()
+            {
+                return Err(EngineError::WriteRejected(
+                    "candidate code is not accepted for PatchRunner".to_owned(),
+                ));
+            }
+            let review = state
+                .candidate_reviews
+                .iter()
+                .filter(|review| review.candidate_diff_id == candidate.candidate_diff_id)
+                .max_by_key(|review| review.created_at)
+                .filter(|review| {
+                    review.decision == CandidateReviewDecision::AcceptForPatchRunner
+                        && review.write_receipt.is_some()
+                })
+                .ok_or_else(|| {
+                    EngineError::WriteRejected(
+                        "candidate code requires an accepted canonical CandidateReview".to_owned(),
+                    )
+                })?;
+            candidate_review_refs.push(review.review_id.clone());
+        }
+
         let now = OffsetDateTime::now_utc();
         let item = state
             .work_items
             .iter_mut()
-            .find(|item| item.work_item_id == work_item_id)?;
+            .find(|item| item.work_item_id == work_item_id)
+            .ok_or_else(|| {
+                EngineError::WriteRejected(
+                    "work item disappeared before verified completion".to_owned(),
+                )
+            })?;
         item.status = WorkItemStatus::Completed;
+        item.verifier_run_refs = verifier_run_refs;
+        item.candidate_review_refs = candidate_review_refs;
         item.updated_at = now;
         item.completed_at = Some(now);
-        Some(item.clone())
+        Ok(item.clone())
     }
 
     #[must_use]
@@ -286,24 +372,23 @@ impl WorkQueueService {
             .filter(|conflict| item_ids.contains(&conflict.work_item_id))
             .cloned()
             .collect::<Vec<_>>();
-        let final_status = if work_items.is_empty() {
-            "NO_WORK"
+        let operation_status = if work_items.is_empty() {
+            OperationStatus::OperationCompleted
         } else if work_items.iter().any(|item| {
             matches!(
                 item.status,
-                WorkItemStatus::Blocked | WorkItemStatus::Expired
+                WorkItemStatus::Blocked | WorkItemStatus::Revoked | WorkItemStatus::Expired
             )
         }) {
-            "PARTIAL_PROGRESS"
+            OperationStatus::Blocked
         } else if work_items
             .iter()
             .all(|item| !item.required || item.status == WorkItemStatus::Completed)
         {
-            "DONE_VERIFIED"
+            OperationStatus::OperationCompleted
         } else {
-            "ACTIVE"
-        }
-        .to_owned();
+            OperationStatus::Active
+        };
         WorkStatusReport {
             component: "work".to_owned(),
             project: project.to_owned(),
@@ -336,7 +421,7 @@ impl WorkQueueService {
                 })
                 .cloned()
                 .collect(),
-            final_status,
+            operation_status,
         }
     }
 }

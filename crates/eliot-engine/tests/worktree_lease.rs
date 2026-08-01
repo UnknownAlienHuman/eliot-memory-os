@@ -11,10 +11,10 @@ use eliot_types::{
     ActionLease, ActionScope, AgentRole, AgentSessionId, CandidateDiffId, CandidateDiffStatus,
     CandidateReviewDecision, CodeCortexReport, CodeEvidenceSource, CompletionAcceptanceItem,
     CompletionProof, CompletionStatus, DiagnosticEvidence, FileEvidence, InvariantCard,
-    LeaseDecision, LeaseStatus, PatchRunStatus, ProjectId, SymbolEvidence, TaskId,
+    LeaseDecision, LeaseStatus, PatchRunStatus, ProjectId, ReceiptId, SymbolEvidence, TaskId,
     VerifierCommandKind, VerifierEvidence, VerifierPlan, VerifierRequirement, VerifierRun,
     VerifierStatus, WorkLeaseDecisionKind, WorktreeLeaseRequest, WorktreeLeaseRequestId,
-    WorktreeLeaseState,
+    WorktreeLeaseState, WriteId, WriteReceiptRef,
 };
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -549,7 +549,7 @@ async fn completion_requires_candidate_patch_verifiers() -> TestResult {
         .last()
         .expect("candidate review")
         .clone();
-    let proof = completion_proof(&patch_run, &verifier_runs, &candidate_diff);
+    let proof = completion_proof(&patch_run, &verifier_runs, &candidate_diff, &review);
     let decision = CompletionGate::decide_with_candidate_context(
         &proof,
         CandidateCompletionContext {
@@ -950,6 +950,18 @@ impl Bundle {
     )> {
         let diff = self.valid_candidate_diff().await?;
         let review = self.accept(diff.candidate_diff_id)?;
+        self.state
+            .candidate_diffs
+            .iter_mut()
+            .find(|candidate| candidate.candidate_diff_id == diff.candidate_diff_id)
+            .expect("accepted candidate diff")
+            .write_receipt = Some(receipt_ref());
+        self.state
+            .candidate_reviews
+            .iter_mut()
+            .find(|candidate_review| candidate_review.review_id == review.review_id)
+            .expect("accepted candidate review")
+            .write_receipt = Some(receipt_ref());
         let accepted_diff = self
             .state
             .candidate_diffs
@@ -969,7 +981,7 @@ impl Bundle {
         })?;
         let runner = PatchRunner::new(&self.repo_root, None);
         let verifier = VerifierHarness::new(&self.repo_root, None);
-        let (patch_run, verifier_runs) = runner
+        let (mut patch_run, mut verifier_runs) = runner
             .apply(
                 &PatchRunnerInput {
                     request: &request,
@@ -982,6 +994,10 @@ impl Bundle {
                 &verifier,
             )
             .await?;
+        patch_run.write_receipt = Some(receipt_ref());
+        for verifier_run in &mut verifier_runs {
+            verifier_run.write_receipt = Some(receipt_ref());
+        }
         Ok((patch_run, verifier_runs, accepted_diff))
     }
 
@@ -1120,7 +1136,7 @@ fn report(repo_root: &Path) -> TestResult<CodeCortexReport> {
         evidence_sources: vec![CodeEvidenceSource::Rg, CodeEvidenceSource::Diagnostics],
         adapter_notes: Vec::new(),
         memory_receipt: None,
-        final_status: "ready".to_owned(),
+        operation_status: eliot_types::OperationStatus::OperationCompleted,
     })
 }
 
@@ -1143,6 +1159,7 @@ fn completion_proof(
     patch_run: &eliot_types::PatchRun,
     verifier_runs: &[VerifierRun],
     candidate_diff: &eliot_types::CandidateDiff,
+    candidate_review: &eliot_types::CandidateReview,
 ) -> CompletionProof {
     CompletionProof {
         task_id: patch_run.task_id.to_string(),
@@ -1170,6 +1187,10 @@ fn completion_proof(
             "patch_run:{}",
             patch_run.patch_run_id
         )))
+        .chain(std::iter::once(format!(
+            "candidate_review:{}",
+            candidate_review.review_id
+        )))
         .chain(
             verifier_runs
                 .iter()
@@ -1180,6 +1201,13 @@ fn completion_proof(
         skill_execution_proof_refs: Vec::new(),
         residual_uncertainty: "none".to_owned(),
         known_risks: Vec::new(),
+    }
+}
+
+fn receipt_ref() -> WriteReceiptRef {
+    WriteReceiptRef {
+        receipt_id: ReceiptId::new_v7(),
+        write_id: WriteId::new_v7(),
     }
 }
 

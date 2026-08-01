@@ -995,6 +995,21 @@ pub(super) fn autonomy_action_denied_response(
     })
 }
 
+pub(super) fn autonomy_stop_coordination_denial_reason(
+    work_state: &WorkState,
+    project_id: ProjectId,
+    task_id: TaskId,
+) -> Option<String> {
+    let decision =
+        eliot_engine::StopCoordinationGate.evaluate(work_state, Some(project_id), Some(task_id));
+    (!decision.allow).then(|| {
+        format!(
+            "StopCoordinationGate denied terminal autonomy completion: {}",
+            decision.reasons.join(", ")
+        )
+    })
+}
+
 pub(super) fn autonomy_approval_denied_response(reason: impl std::fmt::Display) -> Value {
     json!({
         "accepted": false,
@@ -1964,6 +1979,16 @@ pub(super) async fn dispatch_autonomy_runtime_action_locked(
                 ));
             }
             loaded.graph.host_result_chains = terminal_chains;
+            let canonical_work = delegation_runtime::load_work_state(&state.root)?;
+            if let Some(reason) =
+                autonomy_stop_coordination_denial_reason(&canonical_work, project_id, task_id)
+            {
+                return Ok(autonomy_action_denied_response(
+                    &loaded,
+                    action_name,
+                    reason,
+                ));
+            }
             let exact_action_hash =
                 autonomy_completion_approval_hash(&AutonomyCompletionApprovalInput {
                     project_id,

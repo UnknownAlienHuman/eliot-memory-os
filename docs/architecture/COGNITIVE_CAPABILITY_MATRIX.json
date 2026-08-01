@@ -1,0 +1,340 @@
+{
+  "schema_version": "1.0",
+  "contract": {
+    "name": "ELIOT_COGNITIVE_COMPLETION_ULTRA_MASTER_FINAL",
+    "version": "4.1 FINAL",
+    "sha256": "3579eca01e2118ce80fb9735d833363d25e282dc9fbb903ebe51cce7ced16627"
+  },
+  "snapshot": {
+    "date": "2026-08-01",
+    "baseline_commit": "88a5f049d71a9c535f51811eb7da273416c27118",
+    "branch": "codex/cognitive-completion-v2",
+    "phase": "phase_0_accepted",
+    "phase_0_completion_repair": "accepted_by_provider_free_local_gate",
+    "provider_calls_allowed": false,
+    "truth_note": "This is a capability snapshot, not completion evidence. Source, canonical receipts, focused behavior tests, scale evidence, and field evidence remain authoritative."
+  },
+  "field_meanings": {
+    "implemented": "The required owner and mechanism exist in current product source, rather than only as a type, fixture, report, or plan.",
+    "production_connected": "A normal production route reaches the mechanism without a test-only or controller substitute.",
+    "behavior_verified": "Focused repository evidence verifies the stated behavior. This does not imply scale or field certification.",
+    "field_certified": "The capability has applicable production-route, scale, isolation, or blind-transfer evidence accepted by the controlling contract.",
+    "hot_or_cold": "hot means request or event path, cold means scheduled or maintenance path, and mixed means both.",
+    "known_gap": "The smallest material gap between current evidence and the v4.1 contract."
+  },
+  "capabilities": [
+    {
+      "capability": "canonical_truth_and_single_write_authority",
+      "implemented": true,
+      "production_connected": true,
+      "behavior_verified": true,
+      "field_certified": true,
+      "owner": "CanonicalStore plus daemon-owned WriterActor",
+      "hot_or_cold": "mixed",
+      "evidence": [
+        "docs/architecture/ELIOT_Rust_Governor_Production_Architecture_v1_0.md",
+        "crates/eliot-engine/src/writer.rs::WriterActor",
+        "crates/eliot-store/src/canonical_store.rs",
+        "reports/cognitive-field/COGNITIVE_COMPLETION_RECOVERY_TASK03_BLOCKED_20260801.md#eliot-writeback-and-exact-readback"
+      ],
+      "known_gap": "No baseline gap is reopened by v4.1; cognitive projections must remain derived and Governor-written."
+    },
+    {
+      "capability": "consolidated_provider_route_and_process_runtime",
+      "implemented": true,
+      "production_connected": true,
+      "behavior_verified": true,
+      "field_certified": true,
+      "owner": "ProviderRoutePolicy plus ProviderProcessRunner",
+      "hot_or_cold": "hot",
+      "evidence": [
+        "crates/eliot-types/src/provider_invocation.rs::ProviderRoutePolicy",
+        "crates/eliot-engine/src/antigravity.rs::ProviderProcessRunner",
+        "crates/eliot-app/src/host_runtime/provider_runtime.rs",
+        "docs/architecture/PROVIDER_RUNTIME_CONSOLIDATION_WORKLOG.md"
+      ],
+      "known_gap": "No second provider runner or route owner may be introduced by cognitive work."
+    },
+    {
+      "capability": "windows_process_supervision_and_terminalization",
+      "implemented": true,
+      "production_connected": true,
+      "behavior_verified": true,
+      "field_certified": true,
+      "owner": "SupervisedWindowsProcessRunner plus Windows Job Object primitives",
+      "hot_or_cold": "hot",
+      "evidence": [
+        "crates/eliot-app/src/host_runtime/supervised_process.rs",
+        "crates/eliot-windows-ipc/src/lib.rs",
+        "crates/eliot-engine/tests/runtime_supervision.rs",
+        "reports/authority-lifecycle-02/AUTHORITY_LIFECYCLE_02_WORKLOG.md"
+      ],
+      "known_gap": "No baseline gap is reopened; all future provider probes must preserve process-fact terminalization and exact cleanup evidence."
+    },
+    {
+      "capability": "operation_bound_authority_lifecycle",
+      "implemented": true,
+      "production_connected": true,
+      "behavior_verified": true,
+      "field_certified": true,
+      "owner": "HostBroker authority lifecycle plus daemon-owned WriterActor",
+      "hot_or_cold": "mixed",
+      "evidence": [
+        "crates/eliot-engine/src/host.rs",
+        "crates/eliot-app/src/host_runtime/event_and_authority.rs",
+        "crates/eliot-app/src/runtime_integrity.rs",
+        "reports/authority-lifecycle-02/AUTHORITY_LIFECYCLE_02_WORKLOG.md"
+      ],
+      "known_gap": "Cognitive work must reuse operation, epoch, generation, and reconciliation fencing rather than minting authority."
+    },
+    {
+      "capability": "transactional_provider_plan_seal",
+      "implemented": true,
+      "production_connected": true,
+      "behavior_verified": true,
+      "field_certified": true,
+      "owner": "ProviderPlanSeal state machine in cognitive_field_runner",
+      "hot_or_cold": "cold",
+      "evidence": [
+        "crates/eliot-app/src/cognitive_field_runner.rs::ProviderPlanSealRecord",
+        "crates/eliot-app/tests/cognitive_field_cli.rs",
+        "docs/architecture/PROVIDER_RUNTIME_CONSOLIDATION_WORKLOG.md"
+      ],
+      "known_gap": "The seal is an accepted baseline owner; later cognitive certification may consume it but may not duplicate it."
+    },
+    {
+      "capability": "revision_bound_search_projection_correctness",
+      "implemented": true,
+      "production_connected": true,
+      "behavior_verified": true,
+      "field_certified": false,
+      "owner": "CanonicalStore memory search projection and outbox",
+      "hot_or_cold": "mixed",
+      "evidence": [
+        "crates/eliot-store/src/canonical_store.rs::dispatch_memory_search_projection",
+        "crates/eliot-store/src/canonical_store.rs::rebuild_memory_search_projection",
+        "crates/eliot-store/src/surql/009_memory_search.surql",
+        "crates/eliot-store/tests/memory_retrieval.rs",
+        "reports/cognitive-field/COGNITIVE_COMPLETION_RECOVERY_TASK03_BLOCKED_20260801.md"
+      ],
+      "known_gap": "Neutral retrieval is 5/5, but retained PF1 misses the L0 and L2 SLOs; PF2, PF3, R01, and 16-reader certification are not complete."
+    },
+    {
+      "capability": "persistent_daemon_db_client_set",
+      "implemented": false,
+      "production_connected": false,
+      "behavior_verified": false,
+      "field_certified": false,
+      "owner": "not implemented; Phase 1 assigns ownership to one daemon-owned DbClientSet shared by CanonicalStore clones",
+      "hot_or_cold": "hot",
+      "evidence": [
+        "No DbClientSet symbol exists at the baseline commit.",
+        "reports/cognitive-field/COGNITIVE_COMPLETION_RECOVERY_TASK03_BLOCKED_20260801.md#next-bounded-work-package"
+      ],
+      "known_gap": "Add a fixed read pool, ordered write transport, admin transport, bounded reconnect, and idempotent shutdown; prove bounded sessions under warm and concurrent reads."
+    },
+    {
+      "capability": "surrealdb_fulltext_candidate_generation",
+      "implemented": false,
+      "production_connected": false,
+      "behavior_verified": false,
+      "field_certified": false,
+      "owner": "not implemented; Phase 1 retains CanonicalStore as the retrieval owner",
+      "hot_or_cold": "hot",
+      "evidence": [
+        "crates/eliot-store/src/surql/009_memory_search.surql currently defines memory_search_token postings.",
+        "crates/eliot-store/src/surql/load_memory_search_candidates.surql currently queries manual token postings."
+      ],
+      "known_gap": "Prove a SurrealDB 3.1.4 analyzer, FULLTEXT index, bound OR query, index-backed EXPLAIN, Unicode and opaque-ID correctness, and project isolation before cutting over and deleting manual postings."
+    },
+    {
+      "capability": "unified_cognitive_projection_coordination",
+      "implemented": false,
+      "production_connected": false,
+      "behavior_verified": false,
+      "field_certified": false,
+      "owner": "not implemented; Phase 1 extends the existing search outbox into CognitiveProjectionCoordinator",
+      "hot_or_cold": "mixed",
+      "evidence": [
+        "The baseline has memory_search_outbox but no CognitiveProjectionCoordinator symbol.",
+        "crates/eliot-store/src/canonical_store.rs"
+      ],
+      "known_gap": "Search, cue, dependency/dirty, and utility projections do not yet share one recoverable coordinator and atomic revision-bound shard publication."
+    },
+    {
+      "capability": "bounded_cue_activation_and_pending_injection",
+      "implemented": true,
+      "production_connected": true,
+      "behavior_verified": true,
+      "field_certified": false,
+      "owner": "app-owned UlRuntime over CueIndexService, ActivationEngine, and InjectionPlanner",
+      "hot_or_cold": "hot",
+      "evidence": [
+        "crates/eliot-app/src/mcp_stdio/ul.rs::UlRuntime",
+        "crates/eliot-engine/src/ul/activation.rs",
+        "crates/eliot-engine/src/ul/injection.rs",
+        "crates/eliot-engine/tests/ul_cue_firing.rs",
+        "crates/eliot-engine/tests/ul_touched_injection.rs"
+      ],
+      "known_gap": "The runtime is not daemon-owned, activation still defaults to a 500-edge enable gate, and the v4.1 zero-edge, no-DB PreToolUse, restart, and p95 budgets are not certified."
+    },
+    {
+      "capability": "single_daemon_owned_understanding_runtime",
+      "implemented": false,
+      "production_connected": false,
+      "behavior_verified": false,
+      "field_certified": false,
+      "owner": "not implemented; current owner is app-local UlRuntime",
+      "hot_or_cold": "hot",
+      "evidence": [
+        "crates/eliot-app/src/mcp_stdio.rs constructs UlRuntime.",
+        "crates/eliot-app/src/mcp_stdio/ul.rs defines UlRuntime.",
+        "No UnderstandingRuntime symbol exists at the baseline commit."
+      ],
+      "known_gap": "Migrate rather than duplicate UlRuntime; own immutable revision-bound snapshots and atomically swap only affected shards."
+    },
+    {
+      "capability": "single_causal_context_and_understanding_compiler",
+      "implemented": false,
+      "production_connected": false,
+      "behavior_verified": false,
+      "field_certified": false,
+      "owner": "not consolidated; current logic is split between engine compilation and app-layer assembly",
+      "hot_or_cold": "hot",
+      "evidence": [
+        "crates/eliot-engine/src/context.rs::ContextCompiler",
+        "crates/eliot-engine/src/project_understanding.rs",
+        "crates/eliot-types/src/project_understanding.rs::ProjectUnderstandingModel",
+        "crates/eliot-engine/src/context.rs::compile_with_skills",
+        "crates/eliot-engine/src/context.rs::compile_with_lifecycle_influence"
+      ],
+      "known_gap": "Remove the provisional compile plus app overwrite, replace fixed first-item six-hop paths with bounded evidence-backed graph paths, and fence truth, search, pyramid, activation, and task revisions together."
+    },
+    {
+      "capability": "pyramid_and_semantic_memory_primitives",
+      "implemented": true,
+      "production_connected": true,
+      "behavior_verified": true,
+      "field_certified": false,
+      "owner": "engine UL pyramid and semantic-memory services behind canonical write authority",
+      "hot_or_cold": "mixed",
+      "evidence": [
+        "crates/eliot-engine/src/ul/pyramid.rs",
+        "crates/eliot-engine/src/semantic_memory.rs",
+        "crates/eliot-engine/tests/ul_pyramid.rs",
+        "crates/eliot-engine/tests/semantic_memory.rs"
+      ],
+      "known_gap": "Phase 4 must remove build-ID parity routing, distinguish structural freshness from semantic quality, finish maintenance paging, and prevent no-op reasoning from promotion or dirty-state clearance."
+    },
+    {
+      "capability": "experience_and_skill_governance_primitives",
+      "implemented": true,
+      "production_connected": true,
+      "behavior_verified": true,
+      "field_certified": false,
+      "owner": "SemanticMemoryService, SkillRepository, and SkillCuratorService",
+      "hot_or_cold": "cold",
+      "evidence": [
+        "crates/eliot-types/src/semantic_memory.rs::ExperienceCase",
+        "crates/eliot-engine/src/semantic_memory.rs",
+        "crates/eliot-engine/src/skill.rs",
+        "crates/eliot-engine/src/skill_curator.rs",
+        "crates/eliot-engine/tests/semantic_memory.rs",
+        "crates/eliot-engine/tests/skill_lifecycle.rs"
+      ],
+      "known_gap": "Verified task completion does not yet drive one complete trace-to-episode-to-case loop, and mature scoped cases/skills are not yet integrated into the single compiler with near-miss rejection."
+    },
+    {
+      "capability": "utility_distillation_forgetting_and_sleep_primitives",
+      "implemented": true,
+      "production_connected": true,
+      "behavior_verified": true,
+      "field_certified": false,
+      "owner": "UlLedgerService, memory lifecycle, distillation, and replay/sleep services",
+      "hot_or_cold": "cold",
+      "evidence": [
+        "crates/eliot-engine/src/ul/ledger.rs",
+        "crates/eliot-engine/src/memory_distillation.rs",
+        "crates/eliot-engine/src/memory_lifecycle.rs",
+        "crates/eliot-engine/tests/memory_distillation.rs",
+        "crates/eliot-engine/tests/replay_and_sleep.rs"
+      ],
+      "known_gap": "The connected scheduled loop, outcome-attributed utility, measured reconstruction delta, complete-trace parsing, grounded no-op behavior, reversible restore/regret, and compression replay gate remain incomplete."
+    },
+    {
+      "capability": "prediction_and_subsystem_calibration_primitives",
+      "implemented": true,
+      "production_connected": true,
+      "behavior_verified": true,
+      "field_certified": false,
+      "owner": "PredictionService plus canonical prediction and calibration records",
+      "hot_or_cold": "mixed",
+      "evidence": [
+        "crates/eliot-engine/src/ul/prediction.rs::PredictionService",
+        "crates/eliot-engine/tests/ul_prediction.rs",
+        "crates/eliot-app/tests/ul_mvp_done.rs"
+      ],
+      "known_gap": "Remove fabricated diagnostic predictions, bind expectations to packet/action lease/verifier, complete partial blast scoring and calibration metrics, and replace live odd/even control assignment with explicit Production, ShadowEvaluation, and Certification modes."
+    },
+    {
+      "capability": "truthful_task_completion_and_operation_reporting",
+      "implemented": true,
+      "production_connected": true,
+      "behavior_verified": true,
+      "field_certified": false,
+      "owner": "CompletionGate plus CompletionProof on the canonical MCP task-completion route",
+      "hot_or_cold": "hot",
+      "evidence": [
+        "crates/eliot-engine/src/context.rs::CompletionGate",
+        "crates/eliot-types/src/memory.rs::CompletionProof",
+        "crates/eliot-engine/src/collective.rs::StopCoordinationGate",
+        "crates/eliot-app/src/mcp_stdio/task.rs::dispatch_task_completion",
+        "crates/eliot-engine/src/work.rs::WorkQueueService::complete_verified",
+        "crates/eliot-engine/tests/phase0_completion_truth.rs: 7/7 provider-free behavior cases passed",
+        "crates/eliot-app/src/mcp_stdio/protocol_tests.rs: 5/5 exact nested CompletionProof cases passed",
+        "crates/eliot-types/tests/operation_status.rs verifies the separate operation-status vocabulary"
+      ],
+      "known_gap": "The Phase 0 local behavior gate is accepted. Provider-free connected-system certification remains a Phase 6 responsibility and field certification remains a Phase 7 responsibility."
+    },
+    {
+      "capability": "provider_free_connected_behavior_gate",
+      "implemented": false,
+      "production_connected": false,
+      "behavior_verified": false,
+      "field_certified": false,
+      "owner": "not yet assembled; Phase 6 owns one bounded suite over normal daemon, plugin, and MCP routes",
+      "hot_or_cold": "cold",
+      "evidence": [
+        "Existing focused suites verify mechanisms separately, but the Phase 6 connected suite has not run."
+      ],
+      "known_gap": "Run at most 18 provider-free cases only after Phases 0 through 5 pass, including restart, negative memory, truthful completion, and bounded concurrent readers/writers."
+    },
+    {
+      "capability": "ultra_field_certification_and_blind_transfer",
+      "implemented": false,
+      "production_connected": false,
+      "behavior_verified": false,
+      "field_certified": false,
+      "owner": "Ultra field-certification harness through existing consolidated provider routes",
+      "hot_or_cold": "cold",
+      "evidence": [
+        "docs/architecture/UNDERSTANDING_LAYER_STATUS.md records earlier evidence but does not satisfy the superseding v4.1 final gate.",
+        "reports/cognitive-field/cognitive-field-04b18c7/report.md records earlier mechanisms-complete field blockage."
+      ],
+      "known_gap": "After provider-free PASS, run three pilots and two-way isolated blind transfer on the final product head with exact scope, provider-owned influence, treatment/control, cleanup, and zero unknown or substituted outcomes."
+    },
+    {
+      "capability": "cognitive_completion_ultra_release",
+      "implemented": false,
+      "production_connected": false,
+      "behavior_verified": false,
+      "field_certified": false,
+      "owner": "Ultra release gate",
+      "hot_or_cold": "cold",
+      "evidence": [
+        "Phase 0 is accepted by its local provider-free gate; Phases 1 through 8 are not accepted."
+      ],
+      "known_gap": "Complete the ordered commit chain, deletion gate, final workspace gate, PR, independent review, CI, merge, and independent main-SHA CI."
+    }
+  ]
+}

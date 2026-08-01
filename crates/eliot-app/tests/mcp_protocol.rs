@@ -1819,6 +1819,7 @@ fn canonical_m2_stale_trace_fails_closed_after_task_revision_advances() -> TestR
             "task_id": task_id,
             "write_id": uuid::Uuid::new_v4().to_string(),
             "expected_revision": fixture.task_revision,
+            "completion_proof": completion_proof_for_task_contract(&fixture.task_contract)?,
             "acceptance_item_ids": ["observed", "verified"],
             "observation_ids": [fixture.observation_id],
             "verification_ids": [fixture.verification_id]
@@ -3350,7 +3351,8 @@ fn bounded_autonomy_runtime_is_durable_scoped_and_verifier_gated() -> TestResult
                 "eliot_worktree_cleanup",
                 &json!({"worktree_lease": chain.worktree_lease_id}),
             )?;
-            assert_eq!(cleanup["final_status"], "DONE_VERIFIED");
+            assert_eq!(cleanup["operation_status"], "OPERATION_COMPLETED");
+            assert!(cleanup.get("final_status").is_none());
         }
         for (offset, lease_id) in retired_worktree_leases.iter().enumerate() {
             let cleanup = durable.tool_call(
@@ -3358,7 +3360,8 @@ fn bounded_autonomy_runtime_is_durable_scoped_and_verifier_gated() -> TestResult
                 "eliot_worktree_cleanup",
                 &json!({"worktree_lease": lease_id}),
             )?;
-            assert_eq!(cleanup["final_status"], "DONE_VERIFIED");
+            assert_eq!(cleanup["operation_status"], "OPERATION_COMPLETED");
+            assert!(cleanup.get("final_status").is_none());
         }
         completion_action
     };
@@ -4291,11 +4294,13 @@ fn task_completion_and_managed_finalization_race_has_one_serialized_authority_or
         .iter()
         .map(|item| required_test_string(item, "/item_id"))
         .collect::<Result<Vec<_>, _>>()?;
+    let completion_proof = completion_proof_for_task_contract(task)?;
     let completion_request = json!({
         "project_id": fixture.project_id,
         "task_id": fixture.task_id,
         "write_id": uuid::Uuid::new_v4().to_string(),
         "expected_revision": required_test_u64(task, "/memory_revision")?,
+        "completion_proof": completion_proof,
         "acceptance_item_ids": acceptance_item_ids,
         "observation_ids": task["observation_ids"],
         "verification_ids": task["verification_ids"],
@@ -5737,6 +5742,7 @@ fn seed_m3_verified_task(
 
 struct M2TraceFixture {
     task_revision: u64,
+    task_contract: Value,
     observation_id: String,
     verification_id: String,
     trace_refs: [String; 2],
@@ -5766,6 +5772,10 @@ fn seed_m2_trace_fixture(
         &json!({"project_id": project_id, "task_id": task_id}),
     )?;
     let task_revision = required_test_u64(&task_state, "/task_contract/memory_revision")?;
+    let task_contract = task_state
+        .pointer("/task_contract")
+        .cloned()
+        .ok_or_else(|| std::io::Error::other("seeded M2 task contract missing"))?;
     let observation_id = required_test_string(&task_state, "/task_contract/observation_ids/0")?;
     let artifact_ref = required_test_string(
         &task_state,
@@ -5799,6 +5809,7 @@ fn seed_m2_trace_fixture(
     }
     Ok(M2TraceFixture {
         task_revision,
+        task_contract,
         observation_id,
         verification_id,
         trace_refs,
@@ -6302,6 +6313,96 @@ fn required_test_u64(value: &Value, pointer: &str) -> TestResult<u64> {
         .pointer(pointer)
         .and_then(Value::as_u64)
         .ok_or_else(|| format!("missing u64 {pointer} in {value}").into())
+}
+
+fn completion_proof_for_task_contract(task: &Value) -> TestResult<Value> {
+    let task_id = required_test_string(task, "/task_id")?;
+    let project_id = required_test_string(task, "/project_id")?;
+    let goal = required_test_string(task, "/title")?;
+    let changed_files = task
+        .pointer("/action_provenance/source_scope/artifact_paths")
+        .and_then(Value::as_array)
+        .cloned()
+        .ok_or_else(|| std::io::Error::other("task action provenance artifact paths missing"))?;
+    let task_items = task
+        .pointer("/acceptance_items")
+        .and_then(Value::as_array)
+        .ok_or_else(|| std::io::Error::other("task acceptance items missing"))?;
+    let scopes = task
+        .pointer("/verification_scopes")
+        .and_then(Value::as_array)
+        .ok_or_else(|| std::io::Error::other("task verification scopes missing"))?;
+
+    let mut acceptance_items = Vec::with_capacity(task_items.len());
+    let mut checks_run = Vec::new();
+    let mut evidence = Vec::new();
+    for item in task_items {
+        let item_id = required_test_string(item, "/item_id")?;
+        let evidence_kind = required_test_string(item, "/required_evidence")?;
+        match evidence_kind.as_str() {
+            "observation" => {
+                let observation_id = required_test_string(item, "/observation_id")?;
+                evidence.push(Value::String(observation_id.clone()));
+                acceptance_items.push(json!({
+                    "item": item_id,
+                    "status": "verified",
+                    "evidence": observation_id,
+                    "verifier": "canonical-observation",
+                    "residual_uncertainty": "none"
+                }));
+            }
+            "verification" => {
+                let verification_id = required_test_string(item, "/verification_id")?;
+                let scope = scopes
+                    .iter()
+                    .find(|scope| {
+                        scope.get("verification_id").and_then(Value::as_str)
+                            == Some(verification_id.as_str())
+                    })
+                    .ok_or_else(|| {
+                        std::io::Error::other(format!(
+                            "verification scope {verification_id} missing from task contract"
+                        ))
+                    })?;
+                let verifier_id = required_test_string(scope, "/verifier_id")?;
+                let scope_hash = required_test_string(scope, "/canonical_scope_hash")?;
+                if !checks_run.contains(&verifier_id) {
+                    checks_run.push(verifier_id.clone());
+                }
+                evidence.push(Value::String(format!("verification:{verification_id}")));
+                evidence.push(Value::String(scope_hash));
+                acceptance_items.push(json!({
+                    "item": item_id,
+                    "status": "verified",
+                    "evidence": verification_id,
+                    "verifier": verifier_id,
+                    "residual_uncertainty": "none"
+                }));
+            }
+            other => {
+                return Err(std::io::Error::other(format!(
+                    "unsupported task acceptance evidence kind {other}"
+                ))
+                .into());
+            }
+        }
+    }
+
+    Ok(json!({
+        "task_id": task_id,
+        "project_id": project_id,
+        "goal": goal,
+        "changed_files": changed_files,
+        "memory_refs_used": [],
+        "checks_run": checks_run,
+        "checks_not_run": [],
+        "acceptance_items": acceptance_items,
+        "evidence": evidence,
+        "skill_refs": [],
+        "skill_execution_proof_refs": [],
+        "residual_uncertainty": "none",
+        "known_risks": []
+    }))
 }
 
 #[test]

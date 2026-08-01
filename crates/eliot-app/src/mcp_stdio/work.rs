@@ -281,7 +281,11 @@ pub(super) fn dispatch_work_conflicts(state: &McpState, arguments: Value) -> Res
         "project": input.project,
         "task": input.task,
         "conflicts": report.conflicts,
-        "final_status": if report.conflicts.is_empty() { "DONE_VERIFIED" } else { "PARTIAL_PROGRESS" }
+        "operation_status": if report.conflicts.is_empty() {
+            OperationStatus::OperationCompleted
+        } else {
+            OperationStatus::Blocked
+        }
     }))
 }
 
@@ -330,7 +334,7 @@ pub(super) async fn dispatch_worktree_create(state: &McpState, arguments: Value)
     Ok(json!({
         "component": "worktree_create",
         "worktree_lease": lease,
-        "final_status": "DONE_VERIFIED"
+        "operation_status": OperationStatus::OperationCompleted
     }))
 }
 
@@ -354,7 +358,11 @@ pub(super) fn dispatch_worktree_status(state: &McpState, arguments: Value) -> Re
         "component": "worktree_status",
         "requested_worktree_lease": requested,
         "worktree_lease": lease,
-        "final_status": if lease.is_some() { "DONE_VERIFIED" } else { "NO_WORKTREE" }
+        "operation_status": if lease.is_some() {
+            OperationStatus::Active
+        } else {
+            OperationStatus::Blocked
+        }
     }))
 }
 
@@ -413,15 +421,15 @@ pub(super) async fn dispatch_worktree_capture_diff(
     work_state.leases[work_lease_index] = work_lease;
     replace_worktree_lease(&mut work_state, lease);
     save_worktree_state_and_reports(&state.root, &work_state)?;
-    let final_status = if diff.capture_status == CandidateDiffStatus::Captured {
-        "DONE_VERIFIED"
+    let operation_status = if diff.capture_status == CandidateDiffStatus::Captured {
+        OperationStatus::OperationCompleted
     } else {
-        "PARTIAL_PROGRESS"
+        OperationStatus::Blocked
     };
     Ok(json!({
         "component": "worktree_capture_diff",
         "candidate_diff": diff,
-        "final_status": final_status
+        "operation_status": operation_status
     }))
 }
 
@@ -480,16 +488,16 @@ pub(super) async fn dispatch_worktree_review(
     replace_candidate_diff(&mut work_state, diff.clone());
     replace_candidate_review(&mut work_state, review.clone());
     save_worktree_state_and_reports(&state.root, &work_state)?;
-    let final_status = if review.decision == CandidateReviewDecision::AcceptForPatchRunner {
-        "DONE_VERIFIED"
+    let operation_status = if review.decision == CandidateReviewDecision::AcceptForPatchRunner {
+        OperationStatus::OperationCompleted
     } else {
-        "PARTIAL_PROGRESS"
+        OperationStatus::Blocked
     };
     Ok(json!({
         "component": "worktree_review",
         "candidate_review": review,
         "candidate_diff": diff,
-        "final_status": final_status
+        "operation_status": operation_status
     }))
 }
 
@@ -513,6 +521,6 @@ pub(super) async fn dispatch_worktree_cleanup(state: &McpState, arguments: Value
     Ok(json!({
         "component": "worktree_cleanup",
         "worktree_lease": lease,
-        "final_status": "DONE_VERIFIED"
+        "operation_status": OperationStatus::OperationCompleted
     }))
 }

@@ -2034,7 +2034,7 @@ pub(super) fn verifier_latest_path(root: &Path) -> PathBuf {
 
 pub(super) fn candidate_diff_report_markdown(report: &Value) -> String {
     format!(
-        "# Candidate Diff\n\n- candidate_diff_count: `{}`\n- candidate_review_count: `{}`\n- final_status: `{}`\n",
+        "# Candidate Diff\n\n- candidate_diff_count: `{}`\n- candidate_review_count: `{}`\n- operation_status: `{}`\n",
         report
             .get("candidate_diff_count")
             .and_then(Value::as_u64)
@@ -2044,7 +2044,7 @@ pub(super) fn candidate_diff_report_markdown(report: &Value) -> String {
             .and_then(Value::as_u64)
             .unwrap_or_default(),
         report
-            .get("final_status")
+            .get("operation_status")
             .and_then(Value::as_str)
             .unwrap_or("unknown")
     )

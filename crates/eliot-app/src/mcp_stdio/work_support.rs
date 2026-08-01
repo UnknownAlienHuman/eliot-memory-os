@@ -180,7 +180,7 @@ fn blackboard_report_value(state: &WorkState, project: &str, task: &str) -> Valu
         "task": task,
         "items": items,
         "blackboard_candidate_not_truth": true,
-        "final_status": "DONE_VERIFIED"
+        "operation_status": OperationStatus::OperationCompleted
     })
 }
 
@@ -204,7 +204,7 @@ fn mailbox_report_value(state: &WorkState, project: &str, task: &str) -> Value {
         "task": task,
         "messages": messages,
         "mailbox_grants_no_authority": true,
-        "final_status": "DONE_VERIFIED"
+        "operation_status": OperationStatus::OperationCompleted
     })
 }
 
@@ -228,7 +228,7 @@ fn recovery_report_value(state: &WorkState, project: &str, task: &str) -> Value 
         "task": task,
         "records": records,
         "silent_candidate_promotion": false,
-        "final_status": "DONE_VERIFIED"
+        "operation_status": OperationStatus::OperationCompleted
     })
 }
 
@@ -251,16 +251,16 @@ fn collective_report_value(state: &WorkState, project: &str, task: &str) -> Valu
         "project": project,
         "task": task,
         "traces": traces,
-        "final_status": "DONE_VERIFIED"
+        "operation_status": OperationStatus::OperationCompleted
     })
 }
 
 fn collective_report_markdown(title: &str, report: &Value) -> String {
     let status = report
-        .get("final_status")
+        .get("operation_status")
         .and_then(Value::as_str)
         .unwrap_or("UNKNOWN");
-    format!("# {title}\n\n- final_status: `{status}`\n")
+    format!("# {title}\n\n- operation_status: `{status}`\n")
 }
 
 fn replace_worktree_lease(state: &mut WorkState, replacement: WorktreeLease) {
@@ -1156,7 +1156,11 @@ fn work_report_markdown(report: &eliot_engine::WorkStatusReport) -> String {
     let _ = writeln!(output, "- work_items: `{}`", report.work_items.len());
     let _ = writeln!(output, "- active_leases: `{}`", report.active_leases.len());
     let _ = writeln!(output, "- conflicts: `{}`", report.conflicts.len());
-    let _ = writeln!(output, "- final_status: `{}`", report.final_status);
+    let _ = writeln!(
+        output,
+        "- operation_status: `{}`",
+        report.operation_status
+    );
     output
 }
 

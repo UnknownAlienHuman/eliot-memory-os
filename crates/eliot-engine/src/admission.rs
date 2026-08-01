@@ -1,9 +1,10 @@
-use crate::EngineError;
+use crate::{CompletionGate, EngineError};
 use eliot_types::{
-    ClaimCardInput, EpistemicStatus, EvidenceAtomInput, FailureFingerprintInput,
+    ClaimCardInput, CompletionStatus, EpistemicStatus, EvidenceAtomInput, FailureFingerprintInput,
     IdempotencyOptions, LifecycleWriteOptions, MemoryWriteEnvelope, OperationId, RelationInput,
-    RelationType, SemanticCommand, SourceSnapshotInput, TaskContractInput, ToolObservationInput,
-    UlArtifact, VerificationResult, VerificationRunInput, WriteRejectReason, normalize_bindings,
+    RelationType, SemanticCommand, SourceSnapshotInput, TaskContractInput, TaskContractStatus,
+    ToolObservationInput, UlArtifact, VerificationResult, VerificationRunInput, WriteRejectReason,
+    normalize_bindings,
 };
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -84,6 +85,27 @@ fn admit_command(command: &SemanticCommand) -> Result<AdmittedCommand, EngineErr
             }
             if body.contract.acceptance_items.is_empty() {
                 return reject("TaskContract requires acceptance items");
+            }
+            if body.contract.status == TaskContractStatus::DoneVerified {
+                let proof = body.contract.completion_proof.as_ref().ok_or_else(|| {
+                    EngineError::WriteRejected(
+                        "DONE_VERIFIED TaskContract requires CompletionProof".to_owned(),
+                    )
+                })?;
+                if proof.project_id != body.context.project_id
+                    || proof.task_id != body.contract.task_id.to_string()
+                {
+                    return reject("CompletionProof scope must match TaskContract");
+                }
+                if body.contract.completion_write_id != Some(body.context.write_id) {
+                    return reject(
+                        "DONE_VERIFIED TaskContract completion_write_id must match write context",
+                    );
+                }
+                let decision = CompletionGate::decide(proof);
+                if decision.final_status != CompletionStatus::DoneVerified {
+                    return reject("CompletionGate rejected TaskContract DONE_VERIFIED");
+                }
             }
             admitted.task_contracts.push(body.contract.clone());
             if let Some(observation) = &body.observation {

@@ -2,8 +2,8 @@ use crate::{EngineError, WriteAdmissionService, WriterHandle};
 use eliot_types::{
     AgentId, BlastRadiusView, CodeCortexReport, CodeCortexRequest, CodeCortexScopeBinding,
     CodeEvidenceSource, CommandContext, DiagnosticEvidence, FileEvidence, InvariantCard,
-    LifecycleStatus, ProjectId, SemanticCommand, SymbolEvidence, TaintClass, TaskId,
-    ToolObservationRecordCommand, VerifierEvidence, Visibility, WriteId, WriteReceiptRef,
+    LifecycleStatus, OperationStatus, ProjectId, SemanticCommand, SymbolEvidence, TaintClass,
+    TaskId, ToolObservationRecordCommand, VerifierEvidence, Visibility, WriteId, WriteReceiptRef,
 };
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
@@ -136,10 +136,10 @@ impl CodeCortexService {
         let blast_radius = blast_radius(&file_evidence, &symbol_evidence);
         let invariant_cards = invariant_cards();
         let evidence_sources = evidence_sources(&verifier_evidence);
-        let final_status = if core_adapters_ready(&verifier_evidence) {
-            "ready"
+        let operation_status = if core_adapters_ready(&verifier_evidence) {
+            OperationStatus::OperationCompleted
         } else {
-            "partial_progress"
+            OperationStatus::Blocked
         };
 
         Ok(CodeCortexReport {
@@ -168,7 +168,7 @@ impl CodeCortexService {
                 "domain API adapter is disabled by default in D1".to_owned(),
             ],
             memory_receipt: None,
-            final_status: final_status.to_owned(),
+            operation_status,
         })
     }
 }

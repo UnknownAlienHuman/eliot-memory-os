@@ -137,6 +137,7 @@ FOR $task IN $envelope.task_contracts {
     observation_ids: $task.observation_ids,
     verification_ids: $task.verification_ids,
     verification_scopes: $task.verification_scopes,
+    completion_proof: $task.completion_proof,
     completion_write_id: $task.completion_write_id,
     memory_revision: $revision,
     project_sequence: $sequence,

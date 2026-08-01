@@ -103,10 +103,12 @@ pub(super) fn dispatch_eval_smoke(state: &McpState, arguments: Value) -> Result<
         "manifest": artifacts.manifest,
         "run": artifacts.run,
         "verdict": artifacts.verdict,
-        "final_status": if artifacts.verdict.status == EvalVerdictStatus::Pass {
-            "DONE_VERIFIED"
-        } else {
-            "PARTIAL_PROGRESS"
+        "operation_status": match artifacts.verdict.status {
+            EvalVerdictStatus::Pass => OperationStatus::OperationCompleted,
+            EvalVerdictStatus::Fail => OperationStatus::Failed,
+            EvalVerdictStatus::Inconclusive | EvalVerdictStatus::Blocked => {
+                OperationStatus::Blocked
+            }
         }
     }))
     .map_err(Into::into)

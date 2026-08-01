@@ -8,9 +8,9 @@ use eliot_store::{CanonicalStore, ControlWal};
 use eliot_types::{
     ActionKind, ActionLeaseRecord, ActionRequest, AgentId, AgentRole, AgentSessionId, ChangePlan,
     CodeCortexReport, CognitiveGateRequest, ControlWalConfig, FileChangeIntent, FileChangeKind,
-    LeaseDecision, SymbolChangeIntent, TaskId, UnderstandingProof, VerifierCommandKind,
-    VerifierPlan, VerifierRequirement, WorkItemId, WorkLease, WorkLeaseDecision,
-    WorkLeaseDecisionKind, WorkLeaseDecisionReason, WorkLeaseId, WorkLeaseState,
+    LeaseDecision, OperationStatus, SymbolChangeIntent, TaskId, UnderstandingProof,
+    VerifierCommandKind, VerifierPlan, VerifierRequirement, WorkItemId, WorkLease,
+    WorkLeaseDecision, WorkLeaseDecisionKind, WorkLeaseDecisionReason, WorkLeaseId, WorkLeaseState,
 };
 use serde_json::{Value, json};
 use std::fmt::Write as _;
@@ -163,10 +163,10 @@ pub fn action_lease_report_value(
         "task": task,
         "goal": goal,
         "record": record,
-        "final_status": if record.lease.decision == LeaseDecision::Deny {
-            "PARTIAL_PROGRESS"
+        "operation_status": if record.lease.decision == LeaseDecision::Deny {
+            OperationStatus::Blocked
         } else {
-            "DONE_VERIFIED"
+            OperationStatus::OperationCompleted
         }
     })
 }
@@ -312,7 +312,7 @@ fn action_understanding_proof(
 
 fn action_lease_markdown(report: &Value) -> String {
     let mut output = String::from("# ActionLease Report\n\n");
-    for key in ["project", "task", "goal", "final_status"] {
+    for key in ["project", "task", "goal", "operation_status"] {
         let value = report.get(key).and_then(Value::as_str).unwrap_or("unknown");
         let _ = writeln!(output, "- {key}: `{value}`");
     }

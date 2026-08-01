@@ -515,7 +515,11 @@ pub fn run_work_conflicts(config_path: &Path, project: &str, task: &str) -> Resu
         "project": project,
         "task": task,
         "conflicts": report.conflicts,
-        "final_status": if report.conflicts.is_empty() { "DONE_VERIFIED" } else { "PARTIAL_PROGRESS" }
+        "operation_status": if report.conflicts.is_empty() {
+            OperationStatus::OperationCompleted
+        } else {
+            OperationStatus::Blocked
+        }
     }))
 }
 
@@ -571,7 +575,7 @@ pub async fn run_blackboard_add(
             .blackboard_items
             .iter()
             .find(|candidate| candidate.blackboard_item_id == item.blackboard_item_id),
-        "final_status": "DONE_VERIFIED"
+        "operation_status": OperationStatus::OperationCompleted
     }))
 }
 
@@ -652,7 +656,7 @@ pub async fn run_mailbox_send(
             .mailbox_messages
             .iter()
             .find(|candidate| candidate.message_id == message.message_id),
-        "final_status": "DONE_VERIFIED"
+        "operation_status": OperationStatus::OperationCompleted
     }))
 }
 
@@ -696,7 +700,7 @@ pub async fn run_mailbox_ack(config_path: &Path, message_id: &str) -> Result<()>
             .mailbox_messages
             .iter()
             .find(|candidate| candidate.message_id == message.message_id),
-        "final_status": "DONE_VERIFIED"
+        "operation_status": OperationStatus::OperationCompleted
     }))
 }
 
@@ -832,7 +836,7 @@ pub async fn run_worktree_create(config_path: &Path, work_lease_id: &str) -> Res
     write_json(&serde_json::json!({
         "component": "worktree_create",
         "worktree_lease": lease,
-        "final_status": "DONE_VERIFIED"
+        "operation_status": OperationStatus::OperationCompleted
     }))
 }
 
@@ -852,7 +856,11 @@ pub fn run_worktree_status(config_path: &Path, worktree_lease: &str) -> Result<(
         "component": "worktree_status",
         "requested_worktree_lease": worktree_lease,
         "worktree_lease": lease,
-        "final_status": if lease.is_some() { "DONE_VERIFIED" } else { "NO_WORKTREE" }
+        "operation_status": if lease.is_some() {
+            OperationStatus::Active
+        } else {
+            OperationStatus::Blocked
+        }
     }))
 }
 
@@ -885,15 +893,15 @@ pub async fn run_worktree_capture_diff(config_path: &Path, worktree_lease: &str)
     write_worktree_records(config_path, None, Some(&mut diff), None, Some(agent_id)).await?;
     replace_candidate_diff(&mut state, diff.clone());
     save_worktree_state_and_reports(&root, &state)?;
-    let final_status = if diff.capture_status == CandidateDiffStatus::Captured {
-        "DONE_VERIFIED"
+    let operation_status = if diff.capture_status == CandidateDiffStatus::Captured {
+        OperationStatus::OperationCompleted
     } else {
-        "PARTIAL_PROGRESS"
+        OperationStatus::Blocked
     };
     write_json(&serde_json::json!({
         "component": "worktree_capture_diff",
         "candidate_diff": diff,
-        "final_status": final_status
+        "operation_status": operation_status
     }))
 }
 
@@ -937,16 +945,16 @@ pub async fn run_worktree_review(
     write_worktree_records(config_path, None, None, Some((&mut review, &diff)), None).await?;
     replace_candidate_review(&mut state, review.clone());
     save_worktree_state_and_reports(&root, &state)?;
-    let final_status = if review.decision == CandidateReviewDecision::AcceptForPatchRunner {
-        "DONE_VERIFIED"
+    let operation_status = if review.decision == CandidateReviewDecision::AcceptForPatchRunner {
+        OperationStatus::OperationCompleted
     } else {
-        "PARTIAL_PROGRESS"
+        OperationStatus::Blocked
     };
     write_json(&serde_json::json!({
         "component": "worktree_review",
         "candidate_review": review,
         "candidate_diff": diff,
-        "final_status": final_status
+        "operation_status": operation_status
     }))
 }
 
@@ -964,7 +972,7 @@ pub async fn run_worktree_cleanup(config_path: &Path, worktree_lease: &str) -> R
     write_json(&serde_json::json!({
         "component": "worktree_cleanup",
         "worktree_lease": lease,
-        "final_status": "DONE_VERIFIED"
+        "operation_status": OperationStatus::OperationCompleted
     }))
 }
 

@@ -834,7 +834,11 @@ fn work_report_markdown(report: &eliot_engine::WorkStatusReport) -> String {
         report.candidate_diffs.len()
     );
     let _ = writeln!(output, "- conflicts: `{}`", report.conflicts.len());
-    let _ = writeln!(output, "- final_status: `{}`", report.final_status);
+    let _ = writeln!(
+        output,
+        "- operation_status: `{}`",
+        report.operation_status
+    );
     output
 }
 
@@ -849,7 +853,11 @@ fn save_worktree_state_and_reports(root: &Path, state: &WorkState) -> Result<()>
         "component": "worktree",
         "worktree_lease_count": state.worktree_leases.len(),
         "latest_worktree_lease": state.worktree_leases.last(),
-        "final_status": if state.worktree_leases.is_empty() { "NO_WORKTREE" } else { "DONE_VERIFIED" }
+        "operation_status": if state.worktree_leases.is_empty() {
+            OperationStatus::OperationCompleted
+        } else {
+            OperationStatus::Active
+        }
     });
     write_report_pair(
         &root.join("reports").join("worktree").join("latest.json"),
@@ -863,7 +871,11 @@ fn save_worktree_state_and_reports(root: &Path, state: &WorkState) -> Result<()>
         "candidate_review_count": state.candidate_reviews.len(),
         "latest_candidate_diff": state.candidate_diffs.last(),
         "latest_candidate_review": state.candidate_reviews.last(),
-        "final_status": if state.candidate_diffs.is_empty() { "NO_CANDIDATE_DIFF" } else { "DONE_VERIFIED" }
+        "operation_status": if state.candidate_diffs.is_empty() {
+            OperationStatus::Active
+        } else {
+            OperationStatus::OperationCompleted
+        }
     });
     write_report_pair(
         &root
@@ -881,13 +893,13 @@ fn save_worktree_state_and_reports(root: &Path, state: &WorkState) -> Result<()>
 
 fn worktree_report_markdown(report: &serde_json::Value) -> String {
     format!(
-        "# Worktree\n\n- worktree_lease_count: `{}`\n- final_status: `{}`\n",
+        "# Worktree\n\n- worktree_lease_count: `{}`\n- operation_status: `{}`\n",
         report
             .get("worktree_lease_count")
             .and_then(serde_json::Value::as_u64)
             .unwrap_or_default(),
         report
-            .get("final_status")
+            .get("operation_status")
             .and_then(serde_json::Value::as_str)
             .unwrap_or("unknown")
     )
@@ -895,7 +907,7 @@ fn worktree_report_markdown(report: &serde_json::Value) -> String {
 
 fn candidate_diff_report_markdown(report: &serde_json::Value) -> String {
     format!(
-        "# Candidate Diff\n\n- candidate_diff_count: `{}`\n- candidate_review_count: `{}`\n- final_status: `{}`\n",
+        "# Candidate Diff\n\n- candidate_diff_count: `{}`\n- candidate_review_count: `{}`\n- operation_status: `{}`\n",
         report
             .get("candidate_diff_count")
             .and_then(serde_json::Value::as_u64)
@@ -905,7 +917,7 @@ fn candidate_diff_report_markdown(report: &serde_json::Value) -> String {
             .and_then(serde_json::Value::as_u64)
             .unwrap_or_default(),
         report
-            .get("final_status")
+            .get("operation_status")
             .and_then(serde_json::Value::as_str)
             .unwrap_or("unknown")
     )
@@ -994,7 +1006,7 @@ async fn run_blackboard_status_change(
             .blackboard_items
             .iter()
             .find(|candidate| candidate.blackboard_item_id == item.blackboard_item_id),
-        "final_status": "DONE_VERIFIED"
+        "operation_status": OperationStatus::OperationCompleted
     }))
 }
 
@@ -1110,7 +1122,7 @@ fn blackboard_report_value(state: &WorkState, project: &str, task: &str) -> serd
         "task": task,
         "items": items,
         "blackboard_candidate_not_truth": true,
-        "final_status": "DONE_VERIFIED"
+        "operation_status": OperationStatus::OperationCompleted
     })
 }
 
@@ -1134,7 +1146,7 @@ fn mailbox_report_value(state: &WorkState, project: &str, task: &str) -> serde_j
         "task": task,
         "messages": messages,
         "mailbox_grants_no_authority": true,
-        "final_status": "DONE_VERIFIED"
+        "operation_status": OperationStatus::OperationCompleted
     })
 }
 
@@ -1158,7 +1170,7 @@ fn recovery_report_value(state: &WorkState, project: &str, task: &str) -> serde_
         "task": task,
         "records": records,
         "silent_candidate_promotion": false,
-        "final_status": "DONE_VERIFIED"
+        "operation_status": OperationStatus::OperationCompleted
     })
 }
 
@@ -1181,7 +1193,7 @@ fn collective_report_value(state: &WorkState, project: &str, task: &str) -> serd
         "project": project,
         "task": task,
         "traces": traces,
-        "final_status": "DONE_VERIFIED"
+        "operation_status": OperationStatus::OperationCompleted
     })
 }
 
@@ -2498,7 +2510,7 @@ fn patch_report_value(patch_run: &PatchRun, verifier_runs: &[VerifierRun]) -> se
         "component": "patch",
         "patch_run": patch_run,
         "verifier_runs": verifier_runs,
-        "final_status": patch_run_final_status(patch_run)
+        "operation_status": patch_run_operation_status(patch_run)
     })
 }
 
@@ -2507,31 +2519,39 @@ fn verifier_report_value(plan_ref: &str, verifier_runs: &[VerifierRun]) -> serde
         "component": "verifier",
         "plan_ref": plan_ref,
         "verifier_runs": verifier_runs,
-        "final_status": verifier_runs_final_status(verifier_runs)
+        "operation_status": verifier_runs_operation_status(verifier_runs)
     })
 }
 
-fn patch_run_final_status(patch_run: &PatchRun) -> &'static str {
+fn patch_run_operation_status(patch_run: &PatchRun) -> OperationStatus {
     match patch_run.status {
-        PatchRunStatus::AppliedVerifierPassed | PatchRunStatus::PreflightPassed => "DONE_VERIFIED",
-        PatchRunStatus::RollbackFailed => "UNSAFE_TO_FINISH",
-        PatchRunStatus::AppliedVerifierFailed | PatchRunStatus::RolledBack => "FAILED_VERIFIER",
-        PatchRunStatus::Denied => "PARTIAL_PROGRESS",
+        PatchRunStatus::AppliedVerifierPassed | PatchRunStatus::PreflightPassed => {
+            OperationStatus::OperationCompleted
+        }
+        PatchRunStatus::Denied => OperationStatus::Blocked,
+        PatchRunStatus::AppliedVerifierFailed
+        | PatchRunStatus::RolledBack
+        | PatchRunStatus::RollbackFailed => OperationStatus::Failed,
     }
 }
 
-fn verifier_runs_final_status(verifier_runs: &[VerifierRun]) -> &'static str {
+fn verifier_runs_operation_status(verifier_runs: &[VerifierRun]) -> OperationStatus {
     if verifier_runs.is_empty() {
-        return "NOT_RUN";
+        return OperationStatus::Active;
     }
     if verifier_runs
         .iter()
         .filter(|run| run.required_for_done)
         .all(|run| run.status == VerifierStatus::Passed)
     {
-        "DONE_VERIFIED"
+        OperationStatus::OperationCompleted
+    } else if verifier_runs.iter().any(|run| {
+        run.required_for_done
+            && matches!(run.status, VerifierStatus::Failed | VerifierStatus::TimedOut)
+    }) {
+        OperationStatus::Failed
     } else {
-        "FAILED_VERIFIER"
+        OperationStatus::Blocked
     }
 }
 
@@ -2549,11 +2569,11 @@ fn patch_report_markdown(report: &serde_json::Value) -> String {
         let _ = writeln!(output, "- patch_run_id: `{patch_run_id}`");
         let _ = writeln!(output, "- status: `{status}`");
     }
-    let final_status = report
-        .get("final_status")
+    let operation_status = report
+        .get("operation_status")
         .and_then(serde_json::Value::as_str)
         .unwrap_or("UNKNOWN");
-    let _ = writeln!(output, "- final_status: `{final_status}`");
+    let _ = writeln!(output, "- operation_status: `{operation_status}`");
     output
 }
 
@@ -2561,7 +2581,11 @@ fn codecortex_report_markdown(report: &CodeCortexReport) -> String {
     let mut output = String::from("# CodeCortex D1 Report\n\n");
     let _ = writeln!(output, "- project: `{}`", report.project);
     let _ = writeln!(output, "- task: `{}`", report.task);
-    let _ = writeln!(output, "- final_status: `{}`", report.final_status);
+    let _ = writeln!(
+        output,
+        "- operation_status: `{}`",
+        report.operation_status
+    );
     let _ = writeln!(output, "- repo_root: `{}`", report.repo_root);
     let _ = writeln!(
         output,
@@ -2615,7 +2639,7 @@ fn writer_status_markdown(report: &eliot_types::WriterStatusResponse) -> String 
             "- unknown_commit_count: `{}`\n",
             "- idempotent_replay_count: `{}`\n",
             "- idempotency_conflict_count: `{}`\n",
-            "- final_status: `{}`\n"
+            "- operation_status: `{}`\n"
         ),
         report.transport_status,
         report.db_version,
@@ -2627,7 +2651,7 @@ fn writer_status_markdown(report: &eliot_types::WriterStatusResponse) -> String 
         report.unknown_commit_count,
         report.idempotent_replay_count,
         report.idempotency_conflict_count,
-        report.final_status
+        report.operation_status
     )
 }
 
@@ -2676,10 +2700,11 @@ fn report_markdown(title: &str, report: &serde_json::Value) -> String {
         }
     }
     let status = report
-        .get("final_status")
+        .get("operation_status")
+        .or_else(|| report.get("final_status"))
         .and_then(serde_json::Value::as_str)
         .unwrap_or("UNKNOWN");
-    let _ = writeln!(output, "\n- final_status: `{status}`");
+    let _ = writeln!(output, "\n- operation_status: `{status}`");
     output
 }
 
@@ -2952,11 +2977,12 @@ fn value_report_markdown(title: &str, value: &serde_json::Value) -> String {
     if let Some(status) = value.get("status").and_then(serde_json::Value::as_str) {
         let _ = writeln!(output, "- status: `{status}`");
     }
-    if let Some(final_status) = value
-        .get("final_status")
+    if let Some(operation_status) = value
+        .get("operation_status")
+        .or_else(|| value.get("final_status"))
         .and_then(serde_json::Value::as_str)
     {
-        let _ = writeln!(output, "- final_status: `{final_status}`");
+        let _ = writeln!(output, "- operation_status: `{operation_status}`");
     }
     if let Some(replay_allowed) = value
         .get("replay_allowed")

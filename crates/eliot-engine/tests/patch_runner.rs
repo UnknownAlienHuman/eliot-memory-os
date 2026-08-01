@@ -8,9 +8,10 @@ use eliot_types::{
     CodeCortexReport, CodeEvidenceSource, CompletionAcceptanceItem, CompletionProof,
     CompletionStatus, DiagnosticEvidence, FileEvidence, GovernorConfig, InvariantCard,
     LeaseDecision, LeaseStatus, PatchRequest, PatchRequestId, PatchRun, PatchRunStatus, ProjectId,
-    SymbolEvidence, TaskId, UnifiedDiff, VerifierCommandKind, VerifierEvidence, VerifierPlan,
-    VerifierRequirement, VerifierRun, VerifierStatus, WorkItemId, WorkLease, WorkLeaseDecision,
-    WorkLeaseDecisionKind, WorkLeaseDecisionReason, WorkLeaseId, WorkLeaseState,
+    ReceiptId, SymbolEvidence, TaskId, UnifiedDiff, VerifierCommandKind, VerifierEvidence,
+    VerifierPlan, VerifierRequirement, VerifierRun, VerifierStatus, WorkItemId, WorkLease,
+    WorkLeaseDecision, WorkLeaseDecisionKind, WorkLeaseDecisionReason, WorkLeaseId, WorkLeaseState,
+    WriteId, WriteReceiptRef,
 };
 use std::fs::{self, OpenOptions};
 use std::io::ErrorKind;
@@ -307,10 +308,22 @@ impl Bundle {
     }
 
     async fn apply(&self) -> TestResult<(PatchRun, Vec<VerifierRun>)> {
-        self.runner()
+        let (mut patch_run, mut verifier_runs) = self
+            .runner()
             .apply(&self.input(Some(&self.lease)), &self.verifier())
-            .await
-            .map_err(Into::into)
+            .await?;
+        patch_run.write_receipt = Some(receipt_ref());
+        for verifier_run in &mut verifier_runs {
+            verifier_run.write_receipt = Some(receipt_ref());
+        }
+        Ok((patch_run, verifier_runs))
+    }
+}
+
+fn receipt_ref() -> WriteReceiptRef {
+    WriteReceiptRef {
+        receipt_id: ReceiptId::new_v7(),
+        write_id: WriteId::new_v7(),
     }
 }
 
@@ -500,7 +513,7 @@ fn report(repo_root: &Path) -> TestResult<CodeCortexReport> {
         evidence_sources: vec![CodeEvidenceSource::Rg, CodeEvidenceSource::Diagnostics],
         adapter_notes: Vec::new(),
         memory_receipt: None,
-        final_status: "ready".to_owned(),
+        operation_status: eliot_types::OperationStatus::OperationCompleted,
     })
 }
 

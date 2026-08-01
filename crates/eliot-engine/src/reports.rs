@@ -1,6 +1,6 @@
 use crate::EngineError;
 use eliot_store::{CanonicalStore, ControlWal};
-use eliot_types::WriterStatusResponse;
+use eliot_types::{OperationStatus, WriterStatusResponse};
 use time::OffsetDateTime;
 
 pub struct WriterReportService {
@@ -19,6 +19,11 @@ impl WriterReportService {
             |error| format!("surrealdb-error: {error}"),
             |_| "surrealdb-ready".to_owned(),
         );
+        let operation_status = if db_version == "surrealdb-ready" {
+            OperationStatus::OperationCompleted
+        } else {
+            OperationStatus::Failed
+        };
         let finished_at = OffsetDateTime::now_utc();
         let project_heads = self.wal.project_heads()?;
         let latest_project_sequence = project_heads.iter().map(|head| head.project_sequence).max();
@@ -43,7 +48,7 @@ impl WriterReportService {
             latest_memory_revision,
             project_heads,
             last_receipts: self.wal.last_receipts(20)?,
-            final_status: "ready".to_owned(),
+            operation_status,
         })
     }
 }

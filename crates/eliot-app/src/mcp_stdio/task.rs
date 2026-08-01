@@ -641,6 +641,15 @@ pub(super) async fn dispatch_task_completion(
             && receipt.project_id == project_id
             && receipt.task_id == Some(task_id)
         {
+            let stored_proof = task
+                .completion_proof
+                .as_ref()
+                .context("completed task is missing its CompletionProof")?;
+            if canonical_struct_hash(stored_proof)?
+                != canonical_struct_hash(&input.completion_proof)?
+            {
+                anyhow::bail!("completion replay proof does not match the stored proof");
+            }
             let agent_result_receipt = submit_completion_agent_result(
                 state,
                 context,
@@ -815,6 +824,7 @@ pub(super) async fn dispatch_task_completion(
             uncovered.push(format!("verification:{id}"));
         }
     }
+    uncovered.extend(task_completion_proof_gaps(&task, &input.completion_proof));
     if !uncovered.is_empty() {
         return Ok(json!({
             "status": "denied_incomplete",
@@ -824,7 +834,34 @@ pub(super) async fn dispatch_task_completion(
         }));
     }
 
+    let work_state = load_work_state(&state.root)?;
+    let completion_decision = CompletionGate::decide_for_task(
+        &input.completion_proof,
+        project_id,
+        task_id,
+        &work_state,
+        IncidentService::new(&state.root).lockdown_active()?,
+    );
+    write_json_report(
+        &state
+            .root
+            .join("reports")
+            .join("completion-gate")
+            .join("latest.json"),
+        &completion_decision,
+    )?;
+    if completion_decision.final_status != CompletionStatus::DoneVerified {
+        return Ok(json!({
+            "status": "denied_incomplete",
+            "decision": "deny",
+            "completion_status": completion_decision.final_status,
+            "uncovered_items": completion_decision.reasons,
+            "write_receipt": Value::Null
+        }));
+    }
+
     task.status = TaskContractStatus::DoneVerified;
+    task.completion_proof = Some(input.completion_proof.clone());
     task.completion_write_id = Some(write_id);
     let contract = task_input(&task, Some(MemoryRevision::new(input.expected_revision)));
     let (receipt, task) = submit_task_transition(
@@ -852,6 +889,123 @@ pub(super) async fn dispatch_task_completion(
         "agent_result_receipt": agent_result_receipt,
         "memory_outcome": completion_memory_outcome(input.memory.as_ref())
     }))
+}
+
+pub(super) fn task_completion_proof_gaps(
+    task: &TaskContract,
+    proof: &CompletionProof,
+) -> Vec<String> {
+    let mut gaps = Vec::new();
+    append_completion_proof_header_gaps(task, proof, &mut gaps);
+
+    if proof.acceptance_items.len() != task.acceptance_items.len() {
+        gaps.push("completion_proof:acceptance_mapping_not_exact".to_owned());
+    }
+    for task_item in &task.acceptance_items {
+        let matching = proof
+            .acceptance_items
+            .iter()
+            .filter(|proof_item| {
+                proof_item.item == task_item.item_id || proof_item.item == task_item.description
+            })
+            .collect::<Vec<_>>();
+        if matching.len() != 1 {
+            gaps.push(format!(
+                "completion_proof:acceptance_item:{}:not_exact",
+                task_item.item_id
+            ));
+            continue;
+        }
+        let proof_item = matching[0];
+        match task_item.required_evidence {
+            TaskAcceptanceEvidenceKind::Observation => {
+                let Some(observation_id) = task_item.observation_id.as_deref() else {
+                    gaps.push(format!(
+                        "completion_proof:acceptance_item:{}:missing_observation",
+                        task_item.item_id
+                    ));
+                    continue;
+                };
+                if !proof_item.evidence.contains(observation_id)
+                    || !proof
+                        .evidence
+                        .iter()
+                        .any(|evidence| evidence.contains(observation_id))
+                {
+                    gaps.push(format!(
+                        "completion_proof:acceptance_item:{}:observation_not_bound",
+                        task_item.item_id
+                    ));
+                }
+            }
+            TaskAcceptanceEvidenceKind::Verification => {
+                let Some(verification_id) = task_item.verification_id else {
+                    gaps.push(format!(
+                        "completion_proof:acceptance_item:{}:missing_verification",
+                        task_item.item_id
+                    ));
+                    continue;
+                };
+                let Some(scope) = task
+                    .verification_scopes
+                    .iter()
+                    .find(|scope| scope.verification_id == verification_id)
+                else {
+                    gaps.push(format!(
+                        "completion_proof:acceptance_item:{}:missing_verification_scope",
+                        task_item.item_id
+                    ));
+                    continue;
+                };
+                let verification_ref = format!("verification:{verification_id}");
+                if proof_item.verifier != scope.verifier_id
+                    || !proof_item.evidence.contains(&verification_id.to_string())
+                    || !proof.evidence.contains(&verification_ref)
+                    || !proof.evidence.contains(&scope.canonical_scope_hash)
+                    || !proof
+                        .checks_run
+                        .iter()
+                        .any(|check| check.eq_ignore_ascii_case(&scope.verifier_id))
+                {
+                    gaps.push(format!(
+                        "completion_proof:acceptance_item:{}:verification_not_bound",
+                        task_item.item_id
+                    ));
+                }
+            }
+        }
+    }
+    gaps
+}
+
+fn append_completion_proof_header_gaps(
+    task: &TaskContract,
+    proof: &CompletionProof,
+    gaps: &mut Vec<String>,
+) {
+    if proof.project_id != task.project_id || proof.task_id != task.task_id.to_string() {
+        gaps.push("completion_proof:task_scope_mismatch".to_owned());
+    }
+    if proof.goal.trim() != task.title.trim() {
+        gaps.push("completion_proof:goal_mismatch".to_owned());
+    }
+
+    if let Some(provenance) = &task.action_provenance {
+        let proof_files = proof
+            .changed_files
+            .iter()
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>();
+        let provenance_files = provenance
+            .source_scope
+            .artifact_paths
+            .iter()
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>();
+        if proof_files != provenance_files || proof_files.len() != proof.changed_files.len() {
+            gaps.push("completion_proof:changed_files_not_exact".to_owned());
+        }
+    }
 }
 
 #[derive(Default)]
@@ -945,6 +1099,7 @@ pub(super) fn task_input(
         observation_ids: task.observation_ids.clone(),
         verification_ids: task.verification_ids.clone(),
         verification_scopes: task.verification_scopes.clone(),
+        completion_proof: task.completion_proof.clone(),
         completion_write_id: task.completion_write_id,
     }
 }

@@ -577,7 +577,7 @@ fn report() -> CodeCortexReport {
         evidence_sources: vec![CodeEvidenceSource::Rg, CodeEvidenceSource::Diagnostics],
         adapter_notes: Vec::new(),
         memory_receipt: None,
-        final_status: "ready".to_owned(),
+        operation_status: eliot_types::OperationStatus::OperationCompleted,
     }
 }
 

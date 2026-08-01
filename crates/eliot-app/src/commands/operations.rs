@@ -1684,7 +1684,8 @@ struct AdapterExecutionReport {
     blackboard_items: Vec<BlackboardItem>,
     mailbox_messages: Vec<MailboxMessage>,
     trace_id: String,
-    final_status: CompletionStatus,
+    #[serde(rename = "final_status")]
+    operation_status: OperationStatus,
 }
 
 async fn execute_adapter_test(config_path: &Path, adapter: &str) -> Result<AdapterExecutionReport> {
@@ -1741,10 +1742,14 @@ async fn execute_adapter_test(config_path: &Path, adapter: &str) -> Result<Adapt
         format!("adapter {adapter} emitted tainted observation"),
         Some(result.trace_id.clone()),
     ))?;
-    let final_status = if matches!(result.status, AdapterResultStatus::Succeeded) {
-        CompletionStatus::DoneVerified
-    } else {
-        CompletionStatus::PartialProgress
+    let operation_status = match result.status {
+        AdapterResultStatus::Succeeded => OperationStatus::OperationCompleted,
+        AdapterResultStatus::Rejected
+        | AdapterResultStatus::CircuitOpen
+        | AdapterResultStatus::Unavailable => OperationStatus::Blocked,
+        AdapterResultStatus::Failed
+        | AdapterResultStatus::Timeout
+        | AdapterResultStatus::OutputTooLarge => OperationStatus::Failed,
     };
     Ok(AdapterExecutionReport {
         component: "adapter_execute_test".to_owned(),
@@ -1754,7 +1759,7 @@ async fn execute_adapter_test(config_path: &Path, adapter: &str) -> Result<Adapt
         observations,
         blackboard_items,
         mailbox_messages,
-        final_status,
+        operation_status,
     })
 }
 

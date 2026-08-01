@@ -171,6 +171,7 @@ fn task_contract_command(
             observation_ids: Vec::new(),
             verification_ids: Vec::new(),
             verification_scopes: Vec::new(),
+            completion_proof: None,
             completion_write_id: None,
         },
         observation: None,

@@ -1125,7 +1125,11 @@ fn save_worktree_state_and_reports(root: &Path, state: &WorkState) -> Result<()>
         "component": "worktree",
         "worktree_lease_count": state.worktree_leases.len(),
         "latest_worktree_lease": state.worktree_leases.last(),
-        "final_status": if state.worktree_leases.is_empty() { "NO_WORKTREE" } else { "DONE_VERIFIED" }
+        "operation_status": if state.worktree_leases.is_empty() {
+            OperationStatus::OperationCompleted
+        } else {
+            OperationStatus::Active
+        }
     });
     write_json_report(
         &root.join("reports").join("worktree").join("latest.json"),
@@ -1142,7 +1146,11 @@ fn save_worktree_state_and_reports(root: &Path, state: &WorkState) -> Result<()>
         "candidate_review_count": state.candidate_reviews.len(),
         "latest_candidate_diff": state.candidate_diffs.last(),
         "latest_candidate_review": state.candidate_reviews.last(),
-        "final_status": if state.candidate_diffs.is_empty() { "NO_CANDIDATE_DIFF" } else { "DONE_VERIFIED" }
+        "operation_status": if state.candidate_diffs.is_empty() {
+            OperationStatus::Active
+        } else {
+            OperationStatus::OperationCompleted
+        }
     });
     write_json_report(
         &root
@@ -1178,13 +1186,13 @@ fn typed_report_markdown<T: serde::Serialize>(title: &str, report: &T) -> Result
 
 fn worktree_report_markdown(report: &Value) -> String {
     format!(
-        "# Worktree\n\n- worktree_lease_count: `{}`\n- final_status: `{}`\n",
+        "# Worktree\n\n- worktree_lease_count: `{}`\n- operation_status: `{}`\n",
         report
             .get("worktree_lease_count")
             .and_then(Value::as_u64)
             .unwrap_or_default(),
         report
-            .get("final_status")
+            .get("operation_status")
             .and_then(Value::as_str)
             .unwrap_or("unknown")
     )

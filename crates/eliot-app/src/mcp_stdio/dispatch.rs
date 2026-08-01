@@ -1015,7 +1015,7 @@ pub(super) async fn dispatch_tool(
         "eliot_replay_case_create" | "eliot_replay_set_create" => anyhow::bail!(
             "legacy report-only replay fixture path is disabled; register a trace and call eliot_replay_run"
         ),
-        "eliot_replay_run" => dispatch_replay_run(state, context, arguments).await?,
+        "eliot_replay_run" => Box::pin(dispatch_replay_run(state, context, arguments)).await?,
         "eliot_replay_report" => dispatch_replay_report(state),
         "eliot_sleep_run" => dispatch_sleep_run(state, context, arguments).await?,
         "eliot_sleep_report" => dispatch_latest_report(state, "sleep")?,

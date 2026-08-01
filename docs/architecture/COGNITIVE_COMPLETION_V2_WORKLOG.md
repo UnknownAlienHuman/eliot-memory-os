@@ -811,3 +811,90 @@ For each next step, record:
   secret roots, and left no owned process or cleanup failure.
 - The final check bundle was stored and read back exactly as
   `observation:e445da7f-9a3e-40ab-bf6a-7da4bb8a5b59` at memory revision 14.
+
+## Ultra Master v4.1 continuation
+
+### 2026-08-01 Phase 0 start
+
+- The controlling contract is now
+  `ELIOT_COGNITIVE_COMPLETION_ULTRA_MASTER_FINAL_v4_1.md`, SHA-256
+  `3579eca01e2118ce80fb9735d833363d25e282dc9fbb903ebe51cce7ced16627`.
+  It supersedes the earlier Task03R and unstarted Task04/Task05 repair prompts.
+- The verified starting point is branch `codex/cognitive-completion-v2` at
+  `88a5f049d71a9c535f51811eb7da273416c27118`; the only pre-existing untracked
+  path is operator-owned `.eliot/`, which remains out of scope.
+- Archive ref `archive/cognitive-completion-ultra-pre-v4-88a5f04` was created
+  locally and pushed to `origin` at the exact starting commit. The first push
+  command made no repository change because PowerShell parsed an unbraced
+  variable adjacent to `:`; the corrected explicit refspec succeeded.
+- The installed child-agent surface exposes spawn, message, follow-up,
+  interrupt, list, and wait operations. A no-write child audit completed and
+  confirmed the contract ordering. The orchestration response does not expose
+  the resolved child model or reasoning effort, so those values remain
+  explicitly unverified rather than inferred.
+- Current code graph and exact source anchors show the Phase 0 defect:
+  canonical MCP task completion performs receipt/scope checks and then mutates
+  the task directly to `DoneVerified`, bypassing `CompletionGate`,
+  `CompletionProof`, coordination state, WorkItem verifier evidence, and
+  CandidateReview acceptance.
+- Cached rust-analyzer diagnostics were empty for the candidate types, engine,
+  worktree, coordination, and MCP task files before editing.
+- An initial structural-search invocation used an unsupported `sg scan --lang`
+  form; the supported `sg run -l rust -p` form then produced the bounded
+  hard-coded `DONE_VERIFIED` inventory. This was a command-syntax issue, not a
+  product failure.
+- Phase 0 implementation is constrained to the existing completion owners:
+  canonical evidence is assembled into `CompletionProof`, the existing
+  `CompletionGate` makes the sole task-level decision, coordination/work/review
+  state becomes required evidence, and subordinate reports use operation-level
+  statuses rather than task-level `DONE_VERIFIED`.
+
+### 2026-08-01 Phase 0 acceptance
+
+- `TaskContract` now persists a nested `CompletionProof`; the canonical MCP
+  completion route validates exact project/task, goal, changed-artifact,
+  acceptance-item, observation, verifier, and scope bindings before delegating
+  the only task-level terminal decision to `CompletionGate`. Canonical replay
+  requires the same proof hash instead of accepting a different proof for an
+  already completed task.
+- `CompletionGate::decide_for_task` now combines the existing incident and
+  completion owners with exact-scope `StopCoordinationGate` state, all required
+  `WorkItem` verifier receipts, and the latest non-empty candidate diff plus an
+  accepted receipted `CandidateReview`. `WorkQueueService::complete_verified`
+  records the verifier/review references and has no unchecked completion path.
+  Write admission remains the fail-closed storage backstop.
+- Suboperation and report state now uses typed `OperationStatus` values
+  `OPERATION_COMPLETED`, `ACTIVE`, `BLOCKED`, and `FAILED`. A bounded literal
+  audit left `DONE_VERIFIED` only on true task completion and explicit
+  guard/replay probes; no ad-hoc JSON `final_status` literals remain.
+- Provider-free Phase 0 behavior passed after the final refactor: completion
+  truth 7/7 in 7.524 s, work/lease 19/19 in 3.289 s, nested task proof 5/5 in
+  34.841 s, and exact-scope stop coordination 1/1 in 0.297 s. Earlier
+  post-hardening patch and worktree completion checks passed 1/1 in 5.543 s
+  and 1/1 in 5.133 s. The complete positive proof and negatives cover empty
+  acceptance, missing verifier evidence, pending controller acknowledgement,
+  open blocker, unresolved conflict, and missing/rejected/unreceipted review.
+- The affected-package all-target `cargo check` passed in 9.959 s. The first
+  `clippy -D warnings` exposed three local quality defects in the new code; a
+  second pass advanced to test `expect` calls, one 101-line validator, and an
+  unboxed dispatcher future; a third reached two fixture-only style findings.
+  These finite findings were fixed without lint suppression. The final
+  all-target clippy passed in 0.703 s on a warm cache. `cargo fmt --check`,
+  both changed SurrealQL validations, capability-matrix JSON parsing, and
+  `git diff --check` passed.
+- Test duration remains dominated by Cargo compilation/build-lock overhead on
+  this Ryzen 9 9950X host: the final app proof test body reported 0.00 s while
+  wall time was 34.841 s. Earlier tiny focused tests took 31.073 s, 48.066 s,
+  and 112.615 s wall; one incorrect exact-name filter consumed 116.750 s and
+  ran zero tests, so it is explicitly not evidence. This is a later harness
+  investigation candidate, not part of the Phase 0 product repair.
+- A candidate-only Eliot checkpoint was staged as
+  `%USERPROFILE%\OneDrive\Documents\MCP\.eliot\inbox\2026-08-01T190033-0400_eliot_memory_os_ultra_v4_phase0_checkpoint.surql`
+  and passed `surreal validate` in 0.7 s. The native `eliot_surrealdb` MCP tool
+  is not exposed in this Codex task, while the sealed SurrealKV owner is already
+  running; no competing embedded owner was started. The checkpoint therefore
+  remains honestly staged, not applied or read back.
+- Phase 0 is accepted locally and unlocks Phase 1 only after the exact commit
+  `COG-00: make cognitive capability and completion evidence truthful` is
+  created and pushed. No provider cognition or Claude/Antigravity quota was
+  used because no repeated architecture uncertainty remained.

@@ -679,7 +679,7 @@ pub async fn run_skill_create(config_path: &Path, project: &str, name: &str) -> 
         "project_id": project_id,
         "skill": skill,
         "write_receipt": receipt,
-        "final_status": "CANDIDATE_CREATED"
+        "operation_status": OperationStatus::OperationCompleted
     });
     write_skill_report_pair(&root, "skills", "Skills", &report)?;
     write_json(&report)
@@ -701,7 +701,7 @@ pub fn run_skill_list(config_path: &Path, project: &str) -> Result<()> {
         "skills": skills,
         "normal_recall_included": normal.skills_included,
         "normal_recall_removed": normal.distractors_removed,
-        "final_status": "OK"
+        "operation_status": OperationStatus::OperationCompleted
     });
     write_skill_report_pair(&root, "skills", "Skills", &report)?;
     write_json(&report)
@@ -732,7 +732,7 @@ pub fn run_skill_activate(config_path: &Path, skill: &str) -> Result<()> {
         "component": "skill_activate",
         "skill": activated,
         "lifecycle_record": record,
-        "final_status": "ACTIVE"
+        "operation_status": OperationStatus::OperationCompleted
     });
     write_skill_report_pair(&root, "skill-lifecycle", "Skill Lifecycle", &report)?;
     write_json(&report)
@@ -965,7 +965,7 @@ pub async fn run_skill_curator_apply(config_path: &Path, proposal_id: &str) -> R
         "proposal": proposal,
         "gate_decision": decision,
         "receipt": receipt,
-        "final_status": "APPLIED_WITH_RECEIPT"
+        "operation_status": OperationStatus::OperationCompleted
     });
     write_skill_report_pair(&root, "skill-curation-gate", "Skill Curation Gate", &report)?;
     write_json(&report)

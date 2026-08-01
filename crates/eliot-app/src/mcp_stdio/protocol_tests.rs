@@ -803,6 +803,7 @@ fn completion_task_fixture() -> TaskContract {
             expires_or_invalidates_on: vec!["commit change".to_owned()],
             canonical_scope_hash: "scope-hash".to_owned(),
         }],
+        completion_proof: None,
         completion_write_id: None,
         memory_revision: MemoryRevision::new(2),
         project_sequence: eliot_types::ProjectSequence::new(2),
@@ -810,16 +811,172 @@ fn completion_task_fixture() -> TaskContract {
     }
 }
 
+fn bound_completion_proof_fixture() -> (TaskContract, CompletionProof) {
+    let mut task = completion_task_fixture();
+    let observation_id = task.observation_ids[0].clone();
+    let verification_id = task.verification_ids[0];
+    let scope = task.verification_scopes[0].clone();
+    task.acceptance_items = vec![
+        TaskAcceptanceItem {
+            item_id: "observed".to_owned(),
+            description: "canonical observation is bound".to_owned(),
+            required_evidence: TaskAcceptanceEvidenceKind::Observation,
+            satisfied: true,
+            observation_id: Some(observation_id.clone()),
+            verification_id: None,
+            verification_scope_hash: None,
+        },
+        TaskAcceptanceItem {
+            item_id: "verified".to_owned(),
+            description: "canonical verifier is bound".to_owned(),
+            required_evidence: TaskAcceptanceEvidenceKind::Verification,
+            satisfied: true,
+            observation_id: None,
+            verification_id: Some(verification_id),
+            verification_scope_hash: Some(scope.canonical_scope_hash.clone()),
+        },
+    ];
+    task.verification_scopes[0].acceptance_item_ids = vec!["verified".to_owned()];
+
+    let proof = CompletionProof {
+        task_id: task.task_id.to_string(),
+        project_id: task.project_id,
+        goal: task.title.clone(),
+        changed_files: task
+            .action_provenance
+            .as_ref()
+            .map_or_else(Vec::new, |provenance| {
+                provenance.source_scope.artifact_paths.clone()
+            }),
+        memory_refs_used: Vec::new(),
+        checks_run: vec![scope.verifier_id.clone()],
+        checks_not_run: Vec::new(),
+        acceptance_items: vec![
+            eliot_types::CompletionAcceptanceItem {
+                item: "observed".to_owned(),
+                status: "verified".to_owned(),
+                evidence: observation_id.clone(),
+                verifier: "canonical-observation".to_owned(),
+                residual_uncertainty: "none".to_owned(),
+            },
+            eliot_types::CompletionAcceptanceItem {
+                item: "verified".to_owned(),
+                status: "verified".to_owned(),
+                evidence: verification_id.to_string(),
+                verifier: scope.verifier_id.clone(),
+                residual_uncertainty: "none".to_owned(),
+            },
+        ],
+        evidence: vec![
+            observation_id,
+            format!("verification:{verification_id}"),
+            scope.canonical_scope_hash.clone(),
+        ],
+        skill_refs: Vec::new(),
+        skill_execution_proof_refs: Vec::new(),
+        residual_uncertainty: "none".to_owned(),
+        known_risks: Vec::new(),
+    };
+    (task, proof)
+}
+
+#[test]
+fn canonical_task_completion_proof_binds_exact_contract() {
+    let (task, proof) = bound_completion_proof_fixture();
+    assert!(task_completion_proof_gaps(&task, &proof).is_empty());
+    assert_eq!(
+        CompletionGate::decide(&proof).final_status,
+        CompletionStatus::DoneVerified
+    );
+}
+
+#[test]
+fn canonical_task_completion_proof_rejects_goal_mismatch() {
+    let (task, mut proof) = bound_completion_proof_fixture();
+    proof.goal = "different goal".to_owned();
+    assert!(
+        task_completion_proof_gaps(&task, &proof)
+            .contains(&"completion_proof:goal_mismatch".to_owned())
+    );
+}
+
+#[test]
+fn canonical_task_completion_proof_rejects_scope_mismatch() {
+    let (task, mut proof) = bound_completion_proof_fixture();
+    proof.task_id = TaskId::new_v7().to_string();
+    assert!(
+        task_completion_proof_gaps(&task, &proof)
+            .contains(&"completion_proof:task_scope_mismatch".to_owned())
+    );
+}
+
+#[test]
+fn canonical_task_completion_proof_rejects_acceptance_mapping_mismatch() {
+    let (task, mut proof) = bound_completion_proof_fixture();
+    proof.acceptance_items[0].item = "unrelated-item".to_owned();
+    assert!(
+        task_completion_proof_gaps(&task, &proof)
+            .iter()
+            .any(|gap| gap == "completion_proof:acceptance_item:observed:not_exact")
+    );
+}
+
+#[test]
+fn canonical_task_completion_proof_rejects_verifier_mismatch() {
+    let (task, mut proof) = bound_completion_proof_fixture();
+    proof.acceptance_items[1].verifier = "unrelated-verifier".to_owned();
+    assert!(
+        task_completion_proof_gaps(&task, &proof)
+            .iter()
+            .any(|gap| gap == "completion_proof:acceptance_item:verified:verification_not_bound")
+    );
+}
+
+#[test]
+fn task_completion_input_requires_and_preserves_nested_proof() -> Result<()> {
+    let (task, proof) = bound_completion_proof_fixture();
+    let request = json!({
+        "project_id": task.project_id,
+        "task_id": task.task_id,
+        "write_id": uuid::Uuid::from_u128(5),
+        "expected_revision": task.memory_revision.value(),
+        "completion_proof": proof,
+        "acceptance_item_ids": ["observed", "verified"],
+        "observation_ids": task.observation_ids,
+        "verification_ids": task.verification_ids,
+    });
+    let parsed = serde_json::from_value::<TaskCompletionToolInput>(request.clone())?;
+    assert_eq!(
+        canonical_struct_hash(&parsed.completion_proof)?,
+        canonical_struct_hash(&proof)?
+    );
+    let replay = serde_json::from_value::<TaskCompletionToolInput>(request.clone())?;
+    assert_eq!(
+        canonical_struct_hash(&parsed.completion_proof)?,
+        canonical_struct_hash(&replay.completion_proof)?
+    );
+
+    let mut missing_proof = request;
+    missing_proof
+        .as_object_mut()
+        .context("completion request must be an object")?
+        .remove("completion_proof");
+    assert!(serde_json::from_value::<TaskCompletionToolInput>(missing_proof).is_err());
+    Ok(())
+}
+
 #[test]
 fn completion_memory_rejects_caller_authored_scope() {
+    let (task, proof) = bound_completion_proof_fixture();
     let parsed = serde_json::from_value::<TaskCompletionToolInput>(json!({
-        "project_id": uuid::Uuid::from_u128(1),
-        "task_id": uuid::Uuid::from_u128(2),
+        "project_id": task.project_id,
+        "task_id": task.task_id,
         "write_id": uuid::Uuid::from_u128(5),
         "expected_revision": 2,
-        "acceptance_item_ids": [],
-        "observation_ids": [],
-        "verification_ids": [],
+        "completion_proof": proof,
+        "acceptance_item_ids": ["observed", "verified"],
+        "observation_ids": task.observation_ids,
+        "verification_ids": task.verification_ids,
         "memory": {
             "outcome": "save_decision",
             "statement": "store this decision",
@@ -2314,6 +2471,36 @@ fn m3_missing_host_chain_denial_has_no_receipt() -> Result<()> {
         Some(0)
     );
     Ok(())
+}
+
+#[test]
+fn m3_complete_run_denies_pending_coordination_for_exact_scope() {
+    let project_id = ProjectId::new_v7();
+    let task_id = TaskId::new_v7();
+    let unrelated_task_id = TaskId::new_v7();
+    let mut work = WorkState::default();
+    let _ = MailboxService.send(
+        &mut work,
+        MailboxSendInput {
+            message_id: None,
+            project_id,
+            task_id,
+            sender_session_id: AgentSessionId::new_v7(),
+            recipient: MailboxRecipient::Controller,
+            kind: MailboxMessageKind::AckRequired,
+            payload_ref: "coordination:pending".to_owned(),
+            requires_ack: Some(true),
+            expires_at: None,
+        },
+    );
+
+    let Some(denial) = autonomy_stop_coordination_denial_reason(&work, project_id, task_id) else {
+        panic!("the target task must be denied while acknowledgement is pending");
+    };
+    assert!(denial.contains("unacknowledged_control_messages"));
+    assert!(
+        autonomy_stop_coordination_denial_reason(&work, project_id, unrelated_task_id).is_none()
+    );
 }
 
 #[tokio::test]
