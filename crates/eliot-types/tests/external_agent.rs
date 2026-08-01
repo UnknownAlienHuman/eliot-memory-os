@@ -1,8 +1,9 @@
+use eliot_types::external_agent::legacy::{
+    COGNITIVE_PROVIDER_RUNTIME_SCHEMA_VERSION, CognitiveProviderRuntimeContract,
+};
 use eliot_types::{
-    CognitiveProviderRuntimeContract, ExternalAgentPurpose,
-    LEGACY_COGNITIVE_PROVIDER_RUNTIME_SCHEMA_VERSION, PROVIDER_RUNTIME_CONTRACT_SCHEMA_VERSION,
-    ProviderMcpServerContract, ProviderMcpToolProfileBinding, ProviderRuntimeContract,
-    ProviderStructuredOutputMode,
+    ExternalAgentPurpose, PROVIDER_RUNTIME_CONTRACT_SCHEMA_VERSION, ProviderMcpServerContract,
+    ProviderMcpToolProfileBinding, ProviderRuntimeContract, ProviderStructuredOutputMode,
 };
 use serde_json::json;
 use std::collections::BTreeMap;
@@ -13,7 +14,7 @@ type TestResult = Result<(), Box<dyn Error>>;
 #[test]
 fn external_agent_legacy_cognitive_runtime_remains_readable() -> TestResult {
     let legacy = json!({
-        "schema_version": LEGACY_COGNITIVE_PROVIDER_RUNTIME_SCHEMA_VERSION,
+        "schema_version": COGNITIVE_PROVIDER_RUNTIME_SCHEMA_VERSION,
         "host": "codex",
         "provider_executable": "C:\\tools\\codex.exe",
         "provider_executable_sha256": "a".repeat(64),
@@ -28,7 +29,7 @@ fn external_agent_legacy_cognitive_runtime_remains_readable() -> TestResult {
     let decoded: CognitiveProviderRuntimeContract = serde_json::from_value(legacy)?;
     assert_eq!(
         decoded.schema_version,
-        LEGACY_COGNITIVE_PROVIDER_RUNTIME_SCHEMA_VERSION
+        COGNITIVE_PROVIDER_RUNTIME_SCHEMA_VERSION
     );
     Ok(())
 }

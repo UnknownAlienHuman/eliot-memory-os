@@ -4,8 +4,11 @@ use crate::host_runtime::supervised_process::{
 };
 use anyhow::{Context, Result, bail, ensure};
 use eliot_engine::{
-    CognitiveFieldGradingService, HostBrokerService, validate_external_agent_execution_request,
-    validate_provider_runtime_contract,
+    CognitiveFieldGradingService, HostBrokerService, seal_provider_runtime_contract,
+    validate_external_agent_execution_request, validate_provider_runtime_contract,
+};
+use eliot_types::external_agent::legacy::{
+    COGNITIVE_PROVIDER_RUNTIME_SCHEMA_VERSION, CognitiveProviderRuntimeContract,
 };
 use eliot_types::{
     AdapterCapability, AdapterContext, AdapterRequest, AdapterResultStatus,
@@ -17,7 +20,6 @@ use eliot_types::{
     COGNITIVE_FIELD_ORACLE_SCHEMA_VERSION, COGNITIVE_FIELD_PLAN_SCHEMA_VERSION,
     COGNITIVE_FIELD_PROVIDER_EVIDENCE_SCHEMA_VERSION, COGNITIVE_FIELD_PROVIDER_PLAN_SCHEMA_VERSION,
     COGNITIVE_FIELD_PROVIDER_PROJECTION_SCHEMA_VERSION, COGNITIVE_FIELD_WORKER_SCHEMA_VERSION,
-    COGNITIVE_PROVIDER_RUNTIME_SCHEMA_VERSION, COGNITIVE_RUNTIME_PREFLIGHT_SCHEMA_VERSION,
     CognitiveDeterministicEvidenceReceipt, CognitiveDeterministicReport, CognitiveFieldCase,
     CognitiveFieldExecutionKey, CognitiveFieldPlan, CognitiveFieldPlanItem,
     CognitiveFieldProviderCallPlan, CognitiveFieldProviderEvidenceReceipt,
@@ -25,11 +27,13 @@ use eliot_types::{
     CognitiveFieldProviderPlan, CognitiveFieldProviderProjection, CognitiveFieldRole,
     CognitiveFieldRunContract, CognitiveFieldSuite, CognitiveFieldValidationReport,
     CognitiveHardGateEvidence, CognitiveHardGateKind, CognitiveJudgeResult,
-    CognitiveMemoryCondition, CognitiveProviderMcpServer, CognitiveProviderRuntimeContract,
-    CognitiveRuntimePreflightReceipt, CognitiveUnderstandingAnswer, CognitiveWorkerResult,
+    CognitiveMemoryCondition, CognitiveUnderstandingAnswer, CognitiveWorkerResult,
     ExternalAgentExecutionRequest, ExternalAgentPurpose, HostLaunchContract, HostMode,
-    OperationJob, OperationJobState, OperationPhase, ProjectId, ProviderExecutionEvidence,
-    ProviderRuntimeContract, SEAL_STAGING_CHECKPOINT_SCHEMA_VERSION, SealStagingCheckpoint,
+    OperationJob, OperationJobState, OperationPhase, PROVIDER_RUNTIME_CONTRACT_SCHEMA_VERSION,
+    PROVIDER_RUNTIME_PREFLIGHT_SCHEMA_VERSION, ProjectId, ProviderDeclaredBudget,
+    ProviderExecutionEvidence, ProviderMcpServerContract, ProviderMcpToolProfileBinding,
+    ProviderRoutePolicy, ProviderRuntimeContract, ProviderRuntimePreflightReceipt,
+    ProviderStructuredOutputMode, SEAL_STAGING_CHECKPOINT_SCHEMA_VERSION, SealStagingCheckpoint,
     SealStagingState, TaskId, TaskIntentOracle, WorkItem, WorkItemId, WorkItemStatus, WorkScope,
     cognitive_judge_result_schema, cognitive_understanding_answer_schema,
     cognitive_worker_result_schema, inspect_secret_bytes,
@@ -551,12 +555,43 @@ const APPROVED_HARNESS_PATHS: &[&str] = &[
     "crates/eliot-types/src/secret_boundary.rs",
 ];
 
+fn codex_provider_argv(
+    provider_cwd: &str,
+    governor_executable: &str,
+    governor_args: &[String],
+) -> Result<Vec<String>> {
+    Ok(vec![
+        "exec".to_owned(),
+        "--cd".to_owned(),
+        provider_cwd.to_owned(),
+        "-c".to_owned(),
+        format!(
+            "mcp_servers.eliot-governor.command={}",
+            serde_json::to_string(governor_executable)?
+        ),
+        "-c".to_owned(),
+        format!(
+            "mcp_servers.eliot-governor.args={}",
+            serde_json::to_string(governor_args)?
+        ),
+        "-c".to_owned(),
+        format!(
+            "mcp_servers.eliot-governor.cwd={}",
+            serde_json::to_string(provider_cwd)?
+        ),
+        "-c".to_owned(),
+        "mcp_servers.eliot-governor.required=true".to_owned(),
+        "-c".to_owned(),
+        "mcp_servers.eliot_surrealdb.enabled=false".to_owned(),
+    ])
+}
+
 fn codex_cognitive_runtime_contract(
     provider_executable: &Path,
     worktree: &Path,
     governor_executable: &Path,
     governor_build_source_commit: Option<&str>,
-) -> Result<CognitiveProviderRuntimeContract> {
+) -> Result<ProviderRuntimeContract> {
     let provider_executable = canonical_file(provider_executable, "Codex provider executable")?;
     let worktree = canonical_directory(worktree, "isolated cognitive worktree")?;
     let governor_executable = canonical_file(governor_executable, "Eliot Governor executable")?;
@@ -580,40 +615,33 @@ fn codex_cognitive_runtime_contract(
         "--instance".to_owned(),
         "default".to_owned(),
     ];
-    let provider_argv = vec![
-        "exec".to_owned(),
-        "--cd".to_owned(),
-        provider_cwd.clone(),
-        "-c".to_owned(),
-        format!(
-            "mcp_servers.eliot-governor.command={}",
-            serde_json::to_string(&governor_executable_path)?
-        ),
-        "-c".to_owned(),
-        format!(
-            "mcp_servers.eliot-governor.args={}",
-            serde_json::to_string(&governor_args)?
-        ),
-        "-c".to_owned(),
-        format!(
-            "mcp_servers.eliot-governor.cwd={}",
-            serde_json::to_string(&provider_cwd)?
-        ),
-        "-c".to_owned(),
-        "mcp_servers.eliot-governor.required=true".to_owned(),
-        "-c".to_owned(),
-        "mcp_servers.eliot_surrealdb.enabled=false".to_owned(),
-    ];
-    let mut contract = CognitiveProviderRuntimeContract {
-        schema_version: COGNITIVE_PROVIDER_RUNTIME_SCHEMA_VERSION.to_owned(),
+    let provider_argv =
+        codex_provider_argv(&provider_cwd, &governor_executable_path, &governor_args)?;
+    let expected_mcp_tool_names = CODEX_COGNITIVE_EXPECTED_TOOLS
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>();
+    let route_policy = ProviderRoutePolicy::for_route(
+        AgentHostId::Codex,
+        "cognitive-field",
+        ProviderDeclaredBudget::new(1_200_000, 4 * 1024 * 1024),
+    );
+    let output_schema_sha256 =
+        sha256_bytes(&serde_json::to_vec(&cognitive_worker_result_schema()?)?);
+    let mut contract = ProviderRuntimeContract {
+        schema_version: PROVIDER_RUNTIME_CONTRACT_SCHEMA_VERSION.to_owned(),
         host: AgentHostId::Codex,
+        purpose: ExternalAgentPurpose::CognitiveWorker,
         provider_executable: provider_executable.clone(),
         provider_executable_sha256: sha256_bytes(&fs::read(&provider_executable)?),
+        provider_version: "executable-sha256-bound".to_owned(),
+        requested_model: "task-selected".to_owned(),
+        model_selection_mechanism: "codex-cli-model-argument".to_owned(),
         provider_cwd: provider_cwd.clone(),
         provider_argv,
         nonsecret_environment: BTreeMap::new(),
         mcp_servers: vec![
-            CognitiveProviderMcpServer {
+            ProviderMcpServerContract {
                 name: "eliot-governor".to_owned(),
                 command: governor_executable_path,
                 args: governor_args,
@@ -623,7 +651,7 @@ fn codex_cognitive_runtime_contract(
                 executable_sha256: sha256_bytes(&fs::read(&governor_executable)?),
                 build_source_commit: governor_build_source_commit.map(str::to_owned),
             },
-            CognitiveProviderMcpServer {
+            ProviderMcpServerContract {
                 name: "eliot_surrealdb".to_owned(),
                 command: String::new(),
                 args: Vec::new(),
@@ -634,18 +662,31 @@ fn codex_cognitive_runtime_contract(
                 build_source_commit: None,
             },
         ],
-        expected_mcp_tool_names: CODEX_COGNITIVE_EXPECTED_TOOLS
-            .iter()
-            .map(ToString::to_string)
-            .collect(),
+        mcp_tool_profile: ProviderMcpToolProfileBinding::new(
+            "codex_worker",
+            expected_mcp_tool_names.clone(),
+        ),
+        expected_mcp_tool_names,
         forbidden_mcp_server_names: vec!["eliot_surrealdb".to_owned()],
+        allowed_provider_tools: CODEX_COGNITIVE_EXPECTED_TOOLS
+            .iter()
+            .map(|tool| format!("mcp__eliot-governor__{tool}"))
+            .collect(),
+        denied_provider_tools: vec!["raw_database".to_owned()],
+        permission_profile: "cognitive-candidate-only".to_owned(),
+        structured_output_mode: ProviderStructuredOutputMode::NativeJsonSchema,
+        output_schema_sha256,
+        timeout_profile_ref: route_policy.policy_id().to_owned(),
+        provider_route_policy: route_policy.binding(),
+        process_containment: "windows_job_object".to_owned(),
+        candidate_only: true,
         runtime_contract_sha256: String::new(),
     };
-    seal_runtime_contract(&mut contract)?;
+    seal_provider_runtime_contract(&mut contract)?;
     Ok(contract)
 }
 
-fn runtime_contract_without_hash(
+fn legacy_runtime_contract_without_hash(
     contract: &CognitiveProviderRuntimeContract,
 ) -> CognitiveProviderRuntimeContract {
     let mut material = contract.clone();
@@ -653,7 +694,7 @@ fn runtime_contract_without_hash(
     material
 }
 
-fn normalize_runtime_contract(contract: &mut CognitiveProviderRuntimeContract) {
+fn normalize_legacy_runtime_contract(contract: &mut CognitiveProviderRuntimeContract) {
     contract
         .mcp_servers
         .sort_by(|left, right| left.name.cmp(&right.name));
@@ -667,26 +708,21 @@ fn normalize_runtime_contract(contract: &mut CognitiveProviderRuntimeContract) {
     contract.forbidden_mcp_server_names.dedup();
 }
 
-fn seal_runtime_contract(contract: &mut CognitiveProviderRuntimeContract) -> Result<()> {
-    normalize_runtime_contract(contract);
-    contract.runtime_contract_sha256.clear();
-    contract.runtime_contract_sha256 = computed_runtime_contract_sha256(contract)?;
-    validate_runtime_contract(contract)
-}
-
-fn computed_runtime_contract_sha256(contract: &CognitiveProviderRuntimeContract) -> Result<String> {
-    let mut material = runtime_contract_without_hash(contract);
-    normalize_runtime_contract(&mut material);
+fn computed_legacy_runtime_contract_sha256(
+    contract: &CognitiveProviderRuntimeContract,
+) -> Result<String> {
+    let mut material = legacy_runtime_contract_without_hash(contract);
+    normalize_legacy_runtime_contract(&mut material);
     Ok(sha256_bytes(&serde_json::to_vec(&material)?))
 }
 
-fn validate_runtime_contract(contract: &CognitiveProviderRuntimeContract) -> Result<()> {
+fn validate_legacy_runtime_contract(contract: &CognitiveProviderRuntimeContract) -> Result<()> {
     ensure!(
         contract.schema_version == COGNITIVE_PROVIDER_RUNTIME_SCHEMA_VERSION,
         "provider runtime schema version is invalid"
     );
     let mut normalized = contract.clone();
-    normalize_runtime_contract(&mut normalized);
+    normalize_legacy_runtime_contract(&mut normalized);
     ensure!(
         normalized == *contract,
         "provider runtime unordered fields must be sorted and deduplicated"
@@ -694,7 +730,8 @@ fn validate_runtime_contract(contract: &CognitiveProviderRuntimeContract) -> Res
     ensure!(
         is_sha256(&contract.provider_executable_sha256)
             && is_sha256(&contract.runtime_contract_sha256)
-            && computed_runtime_contract_sha256(contract)? == contract.runtime_contract_sha256,
+            && computed_legacy_runtime_contract_sha256(contract)?
+                == contract.runtime_contract_sha256,
         "provider runtime hashes are invalid"
     );
     let provider_executable = canonical_file(
@@ -779,7 +816,7 @@ fn validate_runtime_contract(contract: &CognitiveProviderRuntimeContract) -> Res
 }
 
 fn validate_governor_product_provenance(
-    contract: &CognitiveProviderRuntimeContract,
+    contract: &ProviderRuntimeContract,
     product_source_commit: &str,
     equivalence: Option<&CognitiveHarnessOnlyEquivalence>,
 ) -> Result<()> {
@@ -820,7 +857,7 @@ fn validate_governor_product_provenance(
     Ok(())
 }
 
-fn codex_mcp_list_argv(contract: &CognitiveProviderRuntimeContract) -> Result<Vec<String>> {
+fn codex_mcp_list_argv(contract: &ProviderRuntimeContract) -> Result<Vec<String>> {
     let (subcommand, runtime_args) = contract
         .provider_argv
         .split_first()
@@ -974,11 +1011,11 @@ fn json_rpc_response_by_id(responses: &[Value], id: u64) -> Result<&Value> {
 #[allow(clippy::too_many_lines)]
 fn preflight_codex_cognitive_runtime(
     config_path: &Path,
-    contract: &CognitiveProviderRuntimeContract,
+    contract: &ProviderRuntimeContract,
     scoped_environment: &BTreeMap<String, String>,
-) -> Result<CognitiveRuntimePreflightReceipt> {
+) -> Result<ProviderRuntimePreflightReceipt> {
     let started = Instant::now();
-    validate_runtime_contract(contract)?;
+    validate_provider_runtime_contract(contract)?;
     ensure!(
         contract.host == AgentHostId::Codex,
         "Codex runtime preflight requires a Codex contract"
@@ -1038,7 +1075,7 @@ fn preflight_codex_cognitive_runtime(
                 "capabilities": {},
                 "clientInfo": {
                     "name": "eliot-cognitive-runtime-preflight",
-                    "version": COGNITIVE_RUNTIME_PREFLIGHT_SCHEMA_VERSION,
+                    "version": PROVIDER_RUNTIME_PREFLIGHT_SCHEMA_VERSION,
                 },
             },
         }),
@@ -1126,8 +1163,8 @@ fn preflight_codex_cognitive_runtime(
         started.elapsed() <= COGNITIVE_RUNTIME_PREFLIGHT_LIMIT,
         "Governor MCP preflight exceeded 20 seconds"
     );
-    Ok(CognitiveRuntimePreflightReceipt {
-        schema_version: COGNITIVE_RUNTIME_PREFLIGHT_SCHEMA_VERSION.to_owned(),
+    Ok(ProviderRuntimePreflightReceipt {
+        schema_version: PROVIDER_RUNTIME_PREFLIGHT_SCHEMA_VERSION.to_owned(),
         runtime_contract_sha256: contract.runtime_contract_sha256.clone(),
         config_list_passed: true,
         mcp_process_started: true,
@@ -5317,7 +5354,7 @@ fn provider_runtime_contract(
         ProviderRuntimeBinding::Current(Box::new(contract))
     } else {
         let contract: CognitiveProviderRuntimeContract = serde_json::from_value(value)?;
-        validate_runtime_contract(&contract)?;
+        validate_legacy_runtime_contract(&contract)?;
         ProviderRuntimeBinding::Legacy(Box::new(contract))
     };
     ensure!(
@@ -7619,18 +7656,17 @@ mod tests {
         READER_SCHEMA_SHA256_PLACEHOLDER, SealRecoveryDecision, SealedPromptBinding,
         StagedSealAuthority, abandon_provider_seal, canonical_path,
         codex_cognitive_runtime_contract, cognitive_external_execution_request,
-        computed_runtime_contract_sha256, execution_conditions, generated_oracle,
-        inspect_seal_recovery, load_seal_records, provider_compatible_reader_schema,
-        provider_plan_seal_response, provider_plan_without_hash, record_provider, recover_seal,
-        render_provider_contract, render_reader_prompt, role_schema_contracts,
-        schema_validation_projection, seal_attempt_component, seal_runtime_contract, sha256_bytes,
-        stage_artifacts_with_cleanup, validate_deterministic_receipt,
-        validate_governor_product_provenance, validate_json_schema_instance,
-        validate_legacy_evidence_admission_record, validate_provider_calls,
-        validate_provider_calls_with_sources, validate_provider_receipt_envelope,
-        validate_reader_output, write_new_or_same_json,
+        execution_conditions, generated_oracle, inspect_seal_recovery, load_seal_records,
+        provider_compatible_reader_schema, provider_plan_seal_response, provider_plan_without_hash,
+        record_provider, recover_seal, render_provider_contract, render_reader_prompt,
+        role_schema_contracts, schema_validation_projection, seal_attempt_component,
+        seal_provider_runtime_contract, sha256_bytes, stage_artifacts_with_cleanup,
+        validate_deterministic_receipt, validate_governor_product_provenance,
+        validate_json_schema_instance, validate_legacy_evidence_admission_record,
+        validate_provider_calls, validate_provider_calls_with_sources,
+        validate_provider_receipt_envelope, validate_reader_output, write_new_or_same_json,
     };
-    use eliot_engine::CognitiveFieldGradingService;
+    use eliot_engine::{CognitiveFieldGradingService, computed_provider_runtime_contract_sha256};
     use eliot_types::{
         AgentCapabilityEnvelope, AgentHostId, AgentHostIdentity, AgentInvocationRequest, AgentRole,
         AgentSessionHostBinding, AgentSessionId, AgentSessionState, AuthorityLeaseState,
@@ -7638,16 +7674,17 @@ mod tests {
         COGNITIVE_DETERMINISTIC_EVIDENCE_SCHEMA_VERSION,
         COGNITIVE_DETERMINISTIC_REPORT_SCHEMA_VERSION, COGNITIVE_FIELD_CONTRACT_SCHEMA_VERSION,
         COGNITIVE_FIELD_PROVIDER_EVIDENCE_SCHEMA_VERSION,
-        COGNITIVE_FIELD_PROVIDER_PLAN_SCHEMA_VERSION, COGNITIVE_PROVIDER_RUNTIME_SCHEMA_VERSION,
-        CognitiveDeterministicEvidenceReceipt, CognitiveDeterministicReport,
-        CognitiveFieldExecutionKey, CognitiveFieldProviderCallPlan,
+        COGNITIVE_FIELD_PROVIDER_PLAN_SCHEMA_VERSION, CognitiveDeterministicEvidenceReceipt,
+        CognitiveDeterministicReport, CognitiveFieldExecutionKey, CognitiveFieldProviderCallPlan,
         CognitiveFieldProviderEvidenceReceipt, CognitiveFieldProviderOutputReceipt,
         CognitiveFieldProviderPlan, CognitiveFieldRole, CognitiveFieldRunContract,
         CognitiveFieldSuite, CognitiveHardGateEvidence, CognitiveMemoryCondition,
-        CognitiveProviderMcpServer, CognitiveProviderRuntimeContract, CognitiveUnderstandingAnswer,
-        CognitiveVerifierCommandReceipt, OperationJob, OperationJobState, OperationPhase,
-        ProjectId, TaskId, TaskRoleLease, WorkItem, WorkItemId, WorkItemStatus, WorkScope,
-        cognitive_understanding_answer_schema, minimal_cognitive_understanding_answer,
+        CognitiveUnderstandingAnswer, CognitiveVerifierCommandReceipt, ExternalAgentPurpose,
+        OperationJob, OperationJobState, OperationPhase, PROVIDER_RUNTIME_CONTRACT_SCHEMA_VERSION,
+        ProjectId, ProviderDeclaredBudget, ProviderMcpServerContract,
+        ProviderMcpToolProfileBinding, ProviderRoutePolicy, ProviderRuntimeContract,
+        ProviderStructuredOutputMode, TaskId, TaskRoleLease, WorkItem, WorkItemId, WorkItemStatus,
+        WorkScope, cognitive_understanding_answer_schema, minimal_cognitive_understanding_answer,
     };
     use serde_json::{Value, json};
     use std::collections::{BTreeMap, BTreeSet};
@@ -8340,15 +8377,24 @@ mod tests {
                 Some("0123456789abcdef0123456789abcdef01234567"),
             )?
         } else {
-            let mut contract = CognitiveProviderRuntimeContract {
-                schema_version: COGNITIVE_PROVIDER_RUNTIME_SCHEMA_VERSION.to_owned(),
+            let route_policy = ProviderRoutePolicy::for_route(
                 host,
+                "cognitive-field-test",
+                ProviderDeclaredBudget::new(10_000, 1_048_576),
+            );
+            ProviderRuntimeContract {
+                schema_version: PROVIDER_RUNTIME_CONTRACT_SCHEMA_VERSION.to_owned(),
+                host,
+                purpose: ExternalAgentPurpose::CognitiveWorker,
                 provider_executable: canonical_path(&executable),
                 provider_executable_sha256: sha256_bytes(&fs::read(&executable)?),
+                provider_version: "synthetic-test-provider".to_owned(),
+                requested_model: "synthetic-test-model".to_owned(),
+                model_selection_mechanism: "test-fixture".to_owned(),
                 provider_cwd: canonical_path(&private_root),
                 provider_argv: vec!["synthetic-provider-run".to_owned()],
                 nonsecret_environment: BTreeMap::new(),
-                mcp_servers: vec![CognitiveProviderMcpServer {
+                mcp_servers: vec![ProviderMcpServerContract {
                     name: "eliot_surrealdb".to_owned(),
                     command: String::new(),
                     args: Vec::new(),
@@ -8358,14 +8404,25 @@ mod tests {
                     executable_sha256: String::new(),
                     build_source_commit: None,
                 }],
+                mcp_tool_profile: ProviderMcpToolProfileBinding::new(
+                    "synthetic-cognitive-worker",
+                    Vec::new(),
+                ),
                 expected_mcp_tool_names: Vec::new(),
                 forbidden_mcp_server_names: vec!["eliot_surrealdb".to_owned()],
+                allowed_provider_tools: Vec::new(),
+                denied_provider_tools: vec!["raw_database".to_owned()],
+                permission_profile: "synthetic-candidate-only".to_owned(),
+                structured_output_mode: ProviderStructuredOutputMode::NativeJsonSchema,
+                output_schema_sha256: "c".repeat(64),
+                timeout_profile_ref: route_policy.policy_id().to_owned(),
+                provider_route_policy: route_policy.binding(),
+                process_containment: "windows_job_object".to_owned(),
+                candidate_only: true,
                 runtime_contract_sha256: String::new(),
-            };
-            seal_runtime_contract(&mut contract)?;
-            contract
+            }
         };
-        seal_runtime_contract(&mut contract)?;
+        seal_provider_runtime_contract(&mut contract)?;
         let runtime_ref = format!("provider-runtime/{call_id}.json");
         write_new_or_same_json(&private_root.join(&runtime_ref), &contract)?;
         Ok((
@@ -8609,7 +8666,7 @@ mod tests {
             Some("0123456789abcdef0123456789abcdef01234567"),
         )?;
         let baseline = contract.runtime_contract_sha256.clone();
-        let mutations: Vec<Box<dyn Fn(&mut CognitiveProviderRuntimeContract)>> = vec![
+        let mutations: Vec<Box<dyn Fn(&mut ProviderRuntimeContract)>> = vec![
             Box::new(|value| value.provider_executable.push_str(".changed")),
             Box::new(|value| value.provider_argv.push("--changed".to_owned())),
             Box::new(|value| value.provider_cwd.push_str("/changed")),
@@ -8635,7 +8692,10 @@ mod tests {
         for mutate in mutations {
             let mut changed = contract.clone();
             mutate(&mut changed);
-            assert_ne!(computed_runtime_contract_sha256(&changed)?, baseline);
+            assert_ne!(
+                computed_provider_runtime_contract_sha256(&changed)?,
+                baseline
+            );
         }
         fs::remove_dir_all(root)?;
         Ok(())

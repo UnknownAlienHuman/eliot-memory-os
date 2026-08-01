@@ -5,10 +5,6 @@ use serde_json::Value;
 use std::collections::BTreeMap;
 use time::OffsetDateTime;
 
-pub use crate::external_agent::{
-    CognitiveProviderMcpServer, CognitiveProviderRuntimeContract, CognitiveRuntimePreflightReceipt,
-};
-
 pub const COGNITIVE_FIELD_SUITE_SCHEMA_VERSION: &str = "eliot-cognitive-field-suite-v2";
 pub const COGNITIVE_FIELD_V2_HARNESS_VERSION: &str = "cognitive-field-v2";
 pub const COGNITIVE_CORE_QUALIFICATION_HARNESS_VERSION: &str = "cognitive-core-qualification-v1";
@@ -30,8 +26,6 @@ pub const COGNITIVE_FIELD_PROVIDER_EVIDENCE_SCHEMA_VERSION: &str =
     "eliot-cognitive-field-provider-evidence-v1";
 pub const COGNITIVE_FIELD_PROVIDER_PROJECTION_SCHEMA_VERSION: &str =
     "eliot-cognitive-field-provider-projection-v1";
-pub const COGNITIVE_PROVIDER_RUNTIME_SCHEMA_VERSION: &str = "eliot-cognitive-provider-runtime-v1";
-pub const COGNITIVE_RUNTIME_PREFLIGHT_SCHEMA_VERSION: &str = "eliot-cognitive-runtime-preflight-v1";
 pub const COGNITIVE_FIELD_WORKER_SCHEMA_VERSION: &str = "eliot-cognitive-worker-result-v1";
 pub const COGNITIVE_FIELD_MAX_PROVIDER_CALLS: u8 = 24;
 

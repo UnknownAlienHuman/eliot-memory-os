@@ -1,3 +1,7 @@
+use super::provider_terminalization::{
+    record_post_dispatch_supervisor_failure, record_terminal_process,
+    terminalize_historical_unknown,
+};
 use super::supervised_process::{
     ChildCriticality, ProcessRestartPolicy, RestartStrategy, SupervisedChildKind,
     SupervisedProcessSpec, run_supervised_process,
@@ -347,7 +351,8 @@ async fn reconcile_historical_provider_attempt(
                 "attempt": attempt,
             }));
         }
-        finalize_historical_attempt(&journal, &mut attempt, &resolution_relative)?;
+        terminalize_historical_unknown(&journal, &mut attempt, &resolution_relative)?;
+        ensure_historical_process_facts_absent(&attempt)?;
         return Ok(json!({
             "status": "idempotent_replay",
             "provider_calls": 0,
@@ -379,7 +384,8 @@ async fn reconcile_historical_provider_attempt(
         }));
     }
     crate::runtime_instance::atomic_write_json(&resolution_path, &resolution)?;
-    finalize_historical_attempt(&journal, &mut attempt, &resolution_relative)?;
+    terminalize_historical_unknown(&journal, &mut attempt, &resolution_relative)?;
+    ensure_historical_process_facts_absent(&attempt)?;
     Ok(json!({
         "status": "reconciled",
         "provider_calls": 0,
@@ -890,53 +896,6 @@ fn validate_existing_resolution(resolution: &Value, attempt_id: &str) -> Result<
         "existing provider reconciliation record is invalid or conflicting"
     );
     Ok(())
-}
-
-fn finalize_historical_attempt(
-    journal: &ProviderInvocationJournal,
-    attempt: &mut ProviderInvocationAttempt,
-    resolution_ref: &str,
-) -> Result<()> {
-    let current = attempt
-        .state_transitions
-        .last()
-        .map(|transition| transition.to)
-        .context("historical attempt has no state")?;
-    if current == ProviderInvocationState::Running {
-        journal.transition(
-            attempt,
-            ProviderInvocationState::TimeoutPendingReconciliation,
-            vec![resolution_ref.to_owned()],
-        )?;
-    }
-    let current = attempt
-        .state_transitions
-        .last()
-        .map(|transition| transition.to)
-        .context("historical attempt has no state")?;
-    if matches!(
-        current,
-        ProviderInvocationState::TimeoutPendingReconciliation
-            | ProviderInvocationState::ProcessTerminal
-    ) {
-        journal.transition(
-            attempt,
-            ProviderInvocationState::NonReconcilableUnknown,
-            vec![
-                resolution_ref.to_owned(),
-                "provider_redispatch_forbidden:true".to_owned(),
-            ],
-        )?;
-    }
-    anyhow::ensure!(
-        attempt
-            .state_transitions
-            .last()
-            .map(|transition| transition.to)
-            == Some(ProviderInvocationState::NonReconcilableUnknown),
-        "historical attempt did not reach NonReconcilableUnknown"
-    );
-    ensure_historical_process_facts_absent(attempt)
 }
 
 fn read_json_value(path: &Path) -> Result<Value> {
@@ -2694,10 +2653,9 @@ impl ExternalAgentAdapterCore {
                         &reservation.reservation_id,
                         "managed process failed after dispatch",
                     );
-                    if let Err(journal_error) = journal.record_post_dispatch_failure(
-                        &mut attempt,
-                        vec![format!("supervisor_error:{error_text}")],
-                    ) {
+                    if let Err(journal_error) =
+                        record_post_dispatch_supervisor_failure(&journal, &mut attempt, &error_text)
+                    {
                         return Err(eliot_engine::EngineError::WriteRejected(format!(
                             "managed provider process failed after dispatch and reconciliation journaling failed; provider redispatch is forbidden; supervisor_error={error_text}; journal_error={journal_error}"
                         )));
@@ -2708,7 +2666,7 @@ impl ExternalAgentAdapterCore {
                 )));
             }
         };
-        if let Err(error) = journal.record_process_terminal(&mut attempt, &process) {
+        if let Err(error) = record_terminal_process(&journal, &mut attempt, &process) {
             let _ = reservation_owner.mark_unknown_outcome(
                 &reservation.reservation_id,
                 "process reaped but terminal journal persistence requires reconciliation",

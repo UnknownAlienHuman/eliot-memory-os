@@ -12,9 +12,6 @@ use time::OffsetDateTime;
 
 pub const PROVIDER_RUNTIME_CONTRACT_SCHEMA_VERSION: &str = "eliot-provider-runtime-v2";
 pub const PROVIDER_RUNTIME_PREFLIGHT_SCHEMA_VERSION: &str = "eliot-provider-runtime-preflight-v1";
-pub const LEGACY_COGNITIVE_PROVIDER_RUNTIME_SCHEMA_VERSION: &str =
-    "eliot-cognitive-provider-runtime-v1";
-
 #[derive(Clone, Copy, Debug, Default, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ExternalAgentPurpose {
@@ -221,28 +218,6 @@ pub struct ProviderRuntimeContract {
     pub runtime_contract_sha256: String,
 }
 
-/// Legacy report shape retained only for decoding pre-HOST-CLI cognitive evidence.
-///
-/// New product executions must use [`ProviderRuntimeContract`].
-#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct CognitiveProviderRuntimeContract {
-    pub schema_version: String,
-    #[schemars(with = "String")]
-    pub host: AgentHostId,
-    pub provider_executable: String,
-    pub provider_executable_sha256: String,
-    pub provider_cwd: String,
-    pub provider_argv: Vec<String>,
-    pub nonsecret_environment: BTreeMap<String, String>,
-    pub mcp_servers: Vec<ProviderMcpServerContract>,
-    pub expected_mcp_tool_names: Vec<String>,
-    pub forbidden_mcp_server_names: Vec<String>,
-    pub runtime_contract_sha256: String,
-}
-
-pub type CognitiveProviderMcpServer = ProviderMcpServerContract;
-
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 #[allow(clippy::struct_excessive_bools)]
@@ -263,7 +238,41 @@ pub struct ProviderRuntimePreflightReceipt {
     pub elapsed_ms: u64,
 }
 
-pub type CognitiveRuntimePreflightReceipt = ProviderRuntimePreflightReceipt;
+/// Report-only compatibility surface for evidence created before the unified
+/// provider runtime contract. Product runtime code must not construct these
+/// values; it may only decode them when reading historical evidence.
+pub mod legacy {
+    use super::{ProviderMcpServerContract, ProviderRuntimePreflightReceipt};
+    use crate::AgentHostId;
+    use schemars::JsonSchema;
+    use serde::{Deserialize, Serialize};
+    use std::collections::BTreeMap;
+
+    pub const COGNITIVE_PROVIDER_RUNTIME_SCHEMA_VERSION: &str =
+        "eliot-cognitive-provider-runtime-v1";
+    pub const COGNITIVE_RUNTIME_PREFLIGHT_SCHEMA_VERSION: &str =
+        "eliot-cognitive-runtime-preflight-v1";
+
+    #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    pub struct CognitiveProviderRuntimeContract {
+        pub schema_version: String,
+        #[schemars(with = "String")]
+        pub host: AgentHostId,
+        pub provider_executable: String,
+        pub provider_executable_sha256: String,
+        pub provider_cwd: String,
+        pub provider_argv: Vec<String>,
+        pub nonsecret_environment: BTreeMap<String, String>,
+        pub mcp_servers: Vec<ProviderMcpServerContract>,
+        pub expected_mcp_tool_names: Vec<String>,
+        pub forbidden_mcp_server_names: Vec<String>,
+        pub runtime_contract_sha256: String,
+    }
+
+    pub type CognitiveProviderMcpServer = ProviderMcpServerContract;
+    pub type CognitiveRuntimePreflightReceipt = ProviderRuntimePreflightReceipt;
+}
 
 #[derive(Clone, Debug, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

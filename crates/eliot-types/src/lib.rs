@@ -94,8 +94,7 @@ pub use cognitive_field::{
     COGNITIVE_FIELD_PROVIDER_PLAN_SCHEMA_VERSION,
     COGNITIVE_FIELD_PROVIDER_PROJECTION_SCHEMA_VERSION, COGNITIVE_FIELD_SUITE_SCHEMA_VERSION,
     COGNITIVE_FIELD_V2_HARNESS_VERSION, COGNITIVE_FIELD_WORKER_SCHEMA_VERSION,
-    COGNITIVE_JUDGE_SCHEMA_VERSION, COGNITIVE_PROVIDER_RUNTIME_SCHEMA_VERSION,
-    COGNITIVE_RUNTIME_PREFLIGHT_SCHEMA_VERSION, COGNITIVE_UNDERSTANDING_SCHEMA_VERSION,
+    COGNITIVE_JUDGE_SCHEMA_VERSION, COGNITIVE_UNDERSTANDING_SCHEMA_VERSION,
     CognitiveDeterministicEvidenceReceipt, CognitiveDeterministicReport, CognitiveFieldCase,
     CognitiveFieldCaseGrade, CognitiveFieldCausalHop, CognitiveFieldExecutionKey,
     CognitiveFieldFamily, CognitiveFieldPlan, CognitiveFieldPlanItem,
@@ -106,10 +105,9 @@ pub use cognitive_field::{
     CognitiveFieldValidationReport, CognitiveHardGateEvidence, CognitiveHardGateKind,
     CognitiveJudgeDiscrepancy, CognitiveJudgeResult, CognitiveJudgeScores,
     CognitiveMemoryCondition, CognitiveOracleLeakFinding, CognitiveOracleLeakReport,
-    CognitiveProviderMcpServer, CognitiveProviderRuntimeContract, CognitiveRepositoryCondition,
-    CognitiveRuntimePreflightReceipt, CognitiveSecondRepositoryPolicy,
-    CognitiveUnderstandingAnswer, CognitiveVerifierCommandReceipt, CognitiveWorkerResult,
-    TaskIntentOracle, cognitive_judge_result_schema, cognitive_understanding_answer_schema,
+    CognitiveRepositoryCondition, CognitiveSecondRepositoryPolicy, CognitiveUnderstandingAnswer,
+    CognitiveVerifierCommandReceipt, CognitiveWorkerResult, TaskIntentOracle,
+    cognitive_judge_result_schema, cognitive_understanding_answer_schema,
     cognitive_worker_result_schema, minimal_cognitive_judge_result,
     minimal_cognitive_understanding_answer,
 };
@@ -182,8 +180,7 @@ pub use eval::{
     MetaPolicyExecutionReceipt, ReplayThresholdPolicyV1,
 };
 pub use external_agent::{
-    ExternalAgentExecutionRequest, ExternalAgentPurpose,
-    LEGACY_COGNITIVE_PROVIDER_RUNTIME_SCHEMA_VERSION, OPERATION_AUTHORITY_SCHEMA_VERSION,
+    ExternalAgentExecutionRequest, ExternalAgentPurpose, OPERATION_AUTHORITY_SCHEMA_VERSION,
     OperationAuthorityCloseReceipt, OperationAuthorityCloseRequest, OperationAuthorityOpenReceipt,
     OperationAuthorityOpenRequest, OperationAuthorityTerminalOutcome,
     PROVIDER_RUNTIME_CONTRACT_SCHEMA_VERSION, PROVIDER_RUNTIME_PREFLIGHT_SCHEMA_VERSION,

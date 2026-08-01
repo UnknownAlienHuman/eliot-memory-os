@@ -129,3 +129,22 @@ This log preserves the ordered implementation evidence for
 - `cargo test -p eliot-app --bin eliot-governor external_agent`: 3/3 PASS, 76.73 s wall, 0.02 s bodies. The 76 s compile/enumeration penalty is duplicate-main evidence for ARCH-04.
 - `cargo test -p eliot-types provider_route_policy` selected zero tests and is excluded from evidence. Corrected `cargo test -p eliot-types --test provider_route_policy`: 2/2 PASS, 0.50 s wall, 0.00 s bodies.
 - `git diff --check`: PASS.
+
+## ARCH-04 — remove compatibility construction and duplicate test path
+
+- Moved the pre-unification cognitive provider contract, its MCP/preflight aliases and both legacy schema constants under `eliot_types::external_agent::legacy`. They are no longer re-exported from the crate root or cognitive-field module.
+- Preserved historical evidence readback: the cognitive evidence loader may deserialize and validate the legacy contract, but no product or test path constructs a `CognitiveProviderRuntimeContract` value.
+- Migrated Codex cognitive preflight and all new cognitive runtime fixtures to the sealed `ProviderRuntimeContract` v2, including exact provider executable hash, MCP tool-profile hash, route-policy hash, output-schema hash, candidate-only scope and Windows Job Object containment.
+- Removed the duplicate `[[test]] cognitive_field_runner = src/main.rs` target. The supported path is the single binary test target: `cargo test -p eliot-app --bin eliot-governor cognitive_field_runner::tests`.
+- Added the focused `host_runtime::provider_terminalization` owner. The large external-agent orchestrator now delegates post-dispatch supervisor failure, immediate terminal-process persistence and provider-free historical unknown finalization to that owner; process execution remains owned by `supervised_process`, and route-policy construction remains owned by `ProviderRoutePolicy`.
+- Source inventory after migration: compatibility provider executors/runners = 0; legacy provider contract struct literals outside its type definition = 0; duplicate main test targets = 0; no new `too_many_lines` allowance was added.
+- Problems found and repaired:
+  - The first compile exposed an attempted hash of `Result<Value, serde_json::Error>` rather than the resolved schema; the schema is now resolved before serialization and hashing.
+  - The first binary-test compile exposed a stale test import from the parent module after moving the current hash helper to `eliot_engine`; the test now imports the canonical helper directly.
+  - Strict Clippy rejected a wildcard import inside the new legacy namespace; it was replaced with explicit report-only dependencies.
+  - Moving v2 construction into the former legacy builder grew it to 113 lines. The provider argv construction was extracted as a bounded helper instead of adding a new lint allowance.
+- Focused results and timings:
+  - `cargo check -p eliot-app --bin eliot-governor`: PASS, 22.8 s wall after the schema-hash repair (14.64 s compiler time in the combined run was an earlier successful increment).
+  - `cargo test -p eliot-types --test external_agent`: 2/2 PASS, 24.67 s compile, 0.00 s bodies.
+  - `cargo test -p eliot-app --bin eliot-governor cognitive_field_runner::tests`: 25/25 PASS, 39.4 s wall, 37.93 s compile, 0.50 s bodies. This confirms removal of the duplicate target while retaining one heavy binary compilation.
+  - Focused strict Clippy for `eliot-types` and `eliot-app` all targets: PASS, 24.9 s wall on the final run; `cargo fmt --all -- --check` and `git diff --check`: PASS.

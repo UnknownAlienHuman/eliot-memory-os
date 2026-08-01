@@ -58,6 +58,7 @@ mod external_agent;
 pub(crate) use external_agent::half_open_external_agent_circuit;
 mod integration;
 mod managed;
+mod provider_terminalization;
 pub(crate) mod supervised_process;
 #[cfg(test)]
 use claude::registry_entry_by_manifest;
