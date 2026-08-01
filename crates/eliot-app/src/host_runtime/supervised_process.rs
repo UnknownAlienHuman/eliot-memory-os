@@ -1,7 +1,6 @@
 use anyhow::{Context, Result, anyhow, bail};
 use eliot_engine::{
-    AntigravityProcessExecutor, AntigravitySupervisedProcessOutput,
-    AntigravitySupervisedProcessSpec,
+    BoxProviderProcessFuture, ProviderProcessOutcome, ProviderProcessRunner, ProviderProcessSpec,
     runtime_supervision::{AdapterExecutionContext, CancellationToken},
 };
 use eliot_types::{
@@ -53,7 +52,6 @@ pub enum ChildCriticality {
 pub enum RestartStrategy {
     Never,
     OneForOne,
-    RestForOne,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -103,6 +101,11 @@ pub struct SupervisedProcessOutput {
     pub cancelled: bool,
     pub worker_error: Option<String>,
     pub observed_processes: Vec<eliot_windows_ipc::ProcessImageIdentity>,
+    pub process_started_at: OffsetDateTime,
+    pub first_output_at: Option<OffsetDateTime>,
+    pub last_output_at: Option<OffsetDateTime>,
+    pub process_exit_at: Option<OffsetDateTime>,
+    pub cleanup_completed_at: OffsetDateTime,
     pub reap_receipt: ProcessReapReceipt,
 }
 
@@ -227,130 +230,148 @@ fn daemon_operation_runtime_handle_for_runtime_instance(
     }))
 }
 
-pub struct SharedAntigravityProcessExecutor {
+pub struct SupervisedWindowsProcessRunner {
     runtime_store: eliot_engine::OperationRuntimeHandle,
 }
 
-impl SharedAntigravityProcessExecutor {
+impl SupervisedWindowsProcessRunner {
     pub fn new(config_path: &Path) -> Result<Self> {
         Ok(Self {
             runtime_store: daemon_operation_runtime_handle(config_path)?,
         })
     }
+
+    pub fn from_runtime_store(runtime_store: eliot_engine::OperationRuntimeHandle) -> Self {
+        Self { runtime_store }
+    }
 }
 
-fn antigravity_timeout_profile(timeout_ms: u64, cleanup_grace_ms: u64) -> ProviderTimeoutProfile {
-    eliot_types::ProviderRoutePolicy::for_route(
-        eliot_types::AgentHostId::Antigravity,
-        "provider",
-        eliot_types::ProviderDeclaredBudget::new(timeout_ms, u64::MAX)
-            .with_idle_output_deadline_ms(Some(timeout_ms))
-            .with_cleanup_grace_ms(cleanup_grace_ms)
-            .with_reconciliation_window_ms(cleanup_grace_ms),
-    )
-    .timeout_profile()
-    .clone()
-}
-
-impl AntigravityProcessExecutor for SharedAntigravityProcessExecutor {
-    #[allow(
-        clippy::too_many_lines,
-        reason = "the adapter keeps one contiguous mapping into and out of the supervised lifecycle"
-    )]
-    fn execute(
-        &self,
-        spec: AntigravitySupervisedProcessSpec,
-        on_spawned: &mut (
-                 dyn FnMut(u32) -> std::result::Result<(), eliot_engine::EngineError> + Send
-             ),
-    ) -> std::result::Result<AntigravitySupervisedProcessOutput, eliot_engine::EngineError> {
-        let timeout = Duration::from_millis(spec.timeout_ms);
-        let cleanup_grace_ms = 5_000;
-        let operation_id = spec.operation_id.clone();
-        let process_spec = SupervisedProcessSpec {
-            operation_id: spec.operation_id,
-            invocation_id: None,
-            generation: 1,
-            child_kind: SupervisedChildKind::Provider,
-            criticality: ChildCriticality::InvocationDependency,
-            restart_policy: ProcessRestartPolicy {
-                strategy: RestartStrategy::RestForOne,
-                max_restarts: 1,
-                restart_window_seconds: 60,
-                base_backoff_ms: 250,
-                pre_dispatch_only: true,
-            },
-            executable: spec.executable,
-            args: spec.args.into_iter().map(OsString::from).collect(),
-            cwd: spec.cwd,
-            environment: spec
-                .environment
-                .into_iter()
-                .map(|(name, value)| (OsString::from(name), OsString::from(value)))
-                .collect(),
-            stdin_payload: None,
-            stdout_limit_bytes: spec.max_output_bytes,
-            stderr_limit_bytes: spec.max_output_bytes,
-            timeout_profile: antigravity_timeout_profile(spec.timeout_ms, cleanup_grace_ms),
-            runtime_contract_sha256: None,
-            role_lease_id: None,
-            role_lease_epoch: None,
-        };
-        let context = AdapterExecutionContext {
-            operation_id,
-            generation: 1,
-            cancellation: CancellationToken::new(),
-            deadline: tokio::time::Instant::now() + timeout,
-            runtime_store: self.runtime_store.clone(),
-            role_lease_id: None,
-            role_lease_epoch: None,
-            runtime_contract_sha256: None,
-        };
-        let result = std::thread::scope(|scope| {
-            scope
-                .spawn(|| {
-                    tokio::runtime::Builder::new_current_thread()
-                        .enable_all()
-                        .build()
-                        .context("build Antigravity supervised Tokio runtime")?
-                        .block_on(run_supervised_process_with_spawn_hook(
-                            process_spec,
-                            context,
-                            |pid| on_spawned(pid).map_err(|error| anyhow!(error.to_string())),
-                        ))
-                })
-                .join()
+impl ProviderProcessRunner for SupervisedWindowsProcessRunner {
+    fn run<'a>(
+        &'a self,
+        spec: ProviderProcessSpec,
+        on_spawned: &'a mut (dyn FnMut(u32) -> Result<(), eliot_engine::EngineError> + Send),
+    ) -> BoxProviderProcessFuture<'a> {
+        Box::pin(async move {
+            let operation_id = spec.operation_id.clone();
+            let route_policy = spec.route_policy;
+            let process_spec = SupervisedProcessSpec {
+                operation_id: spec.operation_id,
+                invocation_id: spec.invocation_id,
+                generation: 1,
+                child_kind: SupervisedChildKind::Provider,
+                criticality: ChildCriticality::InvocationDependency,
+                restart_policy: ProcessRestartPolicy {
+                    strategy: RestartStrategy::Never,
+                    max_restarts: 0,
+                    restart_window_seconds: 60,
+                    base_backoff_ms: 0,
+                    pre_dispatch_only: false,
+                },
+                executable: spec.executable,
+                args: spec.args,
+                cwd: spec.cwd,
+                environment: spec.environment.into_iter().collect(),
+                stdin_payload: spec.stdin_payload,
+                stdout_limit_bytes: route_policy.output_limit_bytes(),
+                stderr_limit_bytes: route_policy.output_limit_bytes(),
+                timeout_profile: route_policy.timeout_profile().clone(),
+                runtime_contract_sha256: spec.runtime_contract_sha256.clone(),
+                role_lease_id: spec.role_lease_id.clone(),
+                role_lease_epoch: spec.role_lease_epoch,
+            };
+            let context = AdapterExecutionContext {
+                operation_id,
+                generation: 1,
+                cancellation: spec.cancellation,
+                deadline: spec.deadline,
+                runtime_store: self.runtime_store.clone(),
+                role_lease_id: spec.role_lease_id,
+                role_lease_epoch: spec.role_lease_epoch,
+                runtime_contract_sha256: spec.runtime_contract_sha256,
+            };
+            let result = run_supervised_process_with_spawn_hook(process_spec, context, |pid| {
+                on_spawned(pid).map_err(|error| anyhow!(error.to_string()))
+            })
+            .await
+            .map_err(|error| {
+                eliot_engine::EngineError::RuntimeSupervision(format!(
+                    "supervised provider execution failed before process identity: {error:#}"
+                ))
+            })?;
+            Ok(ProviderProcessOutcome {
+                exit_code: result.exit_code,
+                stdout: result.stdout,
+                stderr: result.stderr,
+                stdout_total_bytes: result.stdout_total_bytes,
+                stderr_total_bytes: result.stderr_total_bytes,
+                stdout_truncated: result.stdout_truncated,
+                stderr_truncated: result.stderr_truncated,
+                timed_out: result.timed_out,
+                cancelled: result.cancelled,
+                worker_error: result.worker_error,
+                observed_processes: result.observed_processes,
+                process_started_at: result.process_started_at,
+                first_output_at: result.first_output_at,
+                last_output_at: result.last_output_at,
+                process_exit_at: result.process_exit_at,
+                cleanup_completed_at: result.cleanup_completed_at,
+                reap_receipt: result.reap_receipt,
+            })
         })
-        .map_err(|_| {
-            eliot_engine::EngineError::RuntimeSupervision(
-                "Antigravity supervised runtime thread panicked".to_owned(),
-            )
-        })?
-        .map_err(|error| {
-            eliot_engine::EngineError::RuntimeSupervision(format!(
-                "Antigravity supervised execution failed: {error:#}"
-            ))
-        })?;
-        let root_pid = result.reap_receipt.root_pid.ok_or_else(|| {
-            eliot_engine::EngineError::RuntimeSupervision(
-                "Antigravity supervised process produced no root PID".to_owned(),
-            )
-        })?;
-        if let Some(error) = result.worker_error {
-            return Err(eliot_engine::EngineError::RuntimeSupervision(format!(
-                "Antigravity supervised worker failed: {error}"
-            )));
+    }
+}
+
+#[cfg(test)]
+pub struct ScriptedProviderProcessRunner {
+    outcomes: Mutex<std::collections::VecDeque<ProviderProcessOutcome>>,
+}
+
+#[cfg(test)]
+impl ScriptedProviderProcessRunner {
+    pub fn new(outcomes: impl IntoIterator<Item = ProviderProcessOutcome>) -> Self {
+        Self {
+            outcomes: Mutex::new(outcomes.into_iter().collect()),
         }
-        Ok(AntigravitySupervisedProcessOutput {
-            exit_code: result.exit_code,
-            stdout: result.stdout,
-            stderr: result.stderr,
-            stdout_truncated: result.stdout_truncated,
-            stderr_truncated: result.stderr_truncated,
-            timed_out: result.timed_out,
-            root_pid,
-            job_object_name: result.reap_receipt.job_object_name.clone(),
-            reap_complete: result.reap_receipt.proves_complete_reap(),
+    }
+}
+
+#[cfg(test)]
+impl ProviderProcessRunner for ScriptedProviderProcessRunner {
+    fn run<'a>(
+        &'a self,
+        _spec: ProviderProcessSpec,
+        on_spawned: &'a mut (dyn FnMut(u32) -> Result<(), eliot_engine::EngineError> + Send),
+    ) -> BoxProviderProcessFuture<'a> {
+        Box::pin(async move {
+            let outcome = self
+                .outcomes
+                .lock()
+                .map_err(|_| {
+                    eliot_engine::EngineError::RuntimeSupervision(
+                        "scripted provider process outcome lock is poisoned".to_owned(),
+                    )
+                })?
+                .pop_front()
+                .ok_or_else(|| {
+                    eliot_engine::EngineError::RuntimeSupervision(
+                        "scripted provider process outcome is exhausted before spawn".to_owned(),
+                    )
+                })?;
+            let pid = outcome.reap_receipt.root_pid.ok_or_else(|| {
+                eliot_engine::EngineError::RuntimeSupervision(
+                    "scripted provider process outcome has no process identity".to_owned(),
+                )
+            })?;
+            if let Err(error) = on_spawned(pid) {
+                let mut outcome = outcome;
+                record_worker_error(
+                    &mut outcome.worker_error,
+                    format!("post-spawn scripted callback failed: {error}"),
+                );
+                return Ok(outcome);
+            }
+            Ok(outcome)
         })
     }
 }
@@ -427,10 +448,12 @@ where
             "supervised process worker ended before reporting spawn state"
         )),
     };
-    if spawn_callback.is_ok() {
+    let spawn_callback_succeeded = spawn_callback.is_ok();
+    if spawn_callback_succeeded {
         let _ = progress_tx.send(ProcessProgress::DispatchProven);
     }
-    let _ = admission_tx.send(spawn_callback.is_ok());
+    let _ = admission_tx.send(spawn_callback_succeeded);
+    let spawn_callback_error = spawn_callback.err().map(|error| error.to_string());
     let mut persistence_error = None;
     let mut cancellation_poll = tokio::time::interval(Duration::from_millis(250));
     cancellation_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -438,7 +461,7 @@ where
     loop {
         tokio::select! {
             outcome = &mut worker => {
-                let outcome = outcome.context("supervised process worker panicked")??;
+                let mut outcome = outcome.context("supervised process worker panicked")??;
                 while let Ok(progress) = progress_rx.try_recv() {
                     if persistence_error.is_none()
                         && let Err(error) =
@@ -448,13 +471,28 @@ where
                         persistence_error = Some(error);
                     }
                 }
-                spawn_callback?;
-                if let Some(error) = persistence_error {
-                    return Err(error.context(
-                        "runtime checkpoint persistence failed; supervised child was cancelled and reaped",
-                    ));
+                if let Some(error) = spawn_callback_error {
+                    record_worker_error(
+                        &mut outcome.output.worker_error,
+                        format!("post-spawn admission callback failed: {error}"),
+                    );
                 }
-                persist_terminal(&runtime_store, &progress_operation_id, &outcome.output).await?;
+                if let Some(error) = persistence_error {
+                    record_worker_error(
+                        &mut outcome.output.worker_error,
+                        format!(
+                            "runtime checkpoint persistence failed after spawn; child was cancelled and reaped: {error:#}"
+                        ),
+                    );
+                }
+                if let Err(error) =
+                    persist_terminal(&runtime_store, &progress_operation_id, &outcome.output).await
+                {
+                    record_worker_error(
+                        &mut outcome.output.worker_error,
+                        format!("persist terminal supervised process checkpoint: {error:#}"),
+                    );
+                }
                 return Ok(outcome.output);
             }
             progress = progress_rx.recv() => {
@@ -770,10 +808,7 @@ fn validate_spec(spec: &SupervisedProcessSpec) -> Result<()> {
     }
     if spec.restart_policy.max_restarts > 0
         && spec.restart_policy.pre_dispatch_only
-        && !matches!(
-            spec.restart_policy.strategy,
-            RestartStrategy::OneForOne | RestartStrategy::RestForOne
-        )
+        && !matches!(spec.restart_policy.strategy, RestartStrategy::OneForOne)
     {
         bail!("pre-dispatch-only restart requires a restart strategy");
     }
@@ -931,6 +966,7 @@ fn run_worker(
     admission_rx: &std_mpsc::Receiver<bool>,
 ) -> Result<WorkerOutput> {
     let started = Instant::now();
+    let wall_started_at = OffsetDateTime::now_utc();
     let job_name = job_object_name(&spec.operation_id, spec.generation);
     let mut command = Command::new(&spec.executable);
     command.args(&spec.args).current_dir(&spec.cwd).env_clear();
@@ -943,6 +979,7 @@ fn run_worker(
             bail!(detail);
         }
     };
+    let process_started_at = OffsetDateTime::now_utc();
     cancellation.register_reap_required();
 
     let mut worker_error = None;
@@ -1077,6 +1114,7 @@ fn run_worker(
     let mut forced_termination = false;
     let mut cancellation_seen_at = None;
     let mut exit_code = None;
+    let mut process_exit_at = None;
 
     loop {
         match child.active_process_count() {
@@ -1088,6 +1126,7 @@ fn run_worker(
                 }
                 if count == 0 {
                     exit_code = child.try_wait().unwrap_or(None);
+                    process_exit_at = Some(OffsetDateTime::now_utc());
                     send_progress(progress_tx, ProcessProgress::Exited);
                     break;
                 }
@@ -1161,7 +1200,10 @@ fn run_worker(
     let process_count_after = child.active_process_count().unwrap_or(u32::MAX);
     if exit_code.is_none() {
         match child.wait_timeout(remaining(cleanup_deadline)) {
-            Ok(code) => exit_code = code,
+            Ok(code) => {
+                exit_code = code;
+                process_exit_at = code.map(|_| OffsetDateTime::now_utc());
+            }
             Err(error) => record_worker_error(
                 &mut worker_error,
                 format!("wait for supervised root process exit: {error}"),
@@ -1211,6 +1253,18 @@ fn run_worker(
     } else if worker_error.is_none() {
         worker_error = Some("process reap receipt is incomplete".to_owned());
     }
+    let (first_output_at, last_output_at) =
+        output_activity.lock().map_or((None, None), |activity| {
+            (
+                activity
+                    .first_at
+                    .map(|observed| elapsed_timestamp(wall_started_at, started, observed)),
+                activity
+                    .last_at
+                    .map(|observed| elapsed_timestamp(wall_started_at, started, observed)),
+            )
+        });
+    let cleanup_completed_at = OffsetDateTime::now_utc();
 
     Ok(WorkerOutput {
         output: SupervisedProcessOutput {
@@ -1227,9 +1281,25 @@ fn run_worker(
             cancelled: cancellation.is_cancelled(),
             worker_error,
             observed_processes,
+            process_started_at,
+            first_output_at,
+            last_output_at,
+            process_exit_at,
+            cleanup_completed_at,
             reap_receipt: receipt,
         },
     })
+}
+
+fn elapsed_timestamp(
+    wall_started_at: OffsetDateTime,
+    started: Instant,
+    observed: Instant,
+) -> OffsetDateTime {
+    wall_started_at
+        + time::Duration::milliseconds(
+            i64::try_from(observed.duration_since(started).as_millis()).unwrap_or(i64::MAX),
+        )
 }
 
 fn sha256_file(path: &std::path::Path) -> std::io::Result<String> {
@@ -1445,17 +1515,17 @@ fn send_progress(sender: &mpsc::UnboundedSender<ProcessProgress>, progress: Proc
 #[cfg(test)]
 mod tests {
     use super::{
-        ChildCriticality, ProcessRestartPolicy, RestartStrategy, SharedAntigravityProcessExecutor,
-        SupervisedChildKind, SupervisedProcessSpec, antigravity_timeout_profile,
+        ChildCriticality, ProcessRestartPolicy, RestartStrategy, ScriptedProviderProcessRunner,
+        SupervisedChildKind, SupervisedProcessSpec, SupervisedWindowsProcessRunner,
         checkpoint_requests_process_cancellation, checkpoint_requires_process_recovery,
         default_daemon_runtime_instance, operation_checkpoint, run_supervised_process,
     };
     use anyhow::{Result, anyhow, bail};
     use eliot_engine::{
-        AntigravityProcessExecutor, AntigravitySupervisedProcessSpec, OperationRuntimeHandle,
+        OperationRuntimeHandle, ProviderProcessRunner, ProviderProcessSpec,
         runtime_supervision::{AdapterExecutionContext, CancellationToken},
     };
-    use eliot_types::{OperationCancellationState, ProviderTimeoutProfile};
+    use eliot_types::{OperationCancellationState, ProcessReapReceipt};
     use std::collections::BTreeMap;
     use std::ffi::OsString;
     use std::io::{Read, Write};
@@ -1483,12 +1553,17 @@ mod tests {
     }
 
     #[test]
-    fn antigravity_timeout_profile_does_not_invent_dispatch_ack() {
-        let profile = antigravity_timeout_profile(120_000, 5_000);
+    fn provider_route_policy_does_not_invent_dispatch_ack() {
+        let policy = eliot_types::ProviderRoutePolicy::for_route(
+            eliot_types::AgentHostId::Antigravity,
+            "provider-runner-fixture",
+            eliot_types::ProviderDeclaredBudget::new(120_000, 32 * 1024),
+        );
+        let profile = policy.timeout_profile();
 
-        assert_eq!(profile.dispatch_ack_deadline_ms, None);
-        assert_eq!(profile.first_output_deadline_ms, Some(120_000));
-        assert_eq!(profile.absolute_runtime_deadline_ms, 120_000);
+        assert_eq!(profile.dispatch_ack_deadline_ms(), None);
+        assert_eq!(profile.first_output_deadline_ms(), Some(120_000));
+        assert_eq!(profile.absolute_runtime_deadline_ms(), 120_000);
     }
 
     #[test]
@@ -1643,11 +1718,11 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn antigravity_executor_uses_shared_job_primitive_and_reports_spawn() -> Result<()> {
+    #[tokio::test]
+    async fn provider_runner_uses_shared_job_primitive_and_reports_spawn() -> Result<()> {
         let executable = std::env::current_exe()?;
         let cwd = std::env::current_dir()?;
-        let executor = SharedAntigravityProcessExecutor {
+        let runner = SupervisedWindowsProcessRunner {
             runtime_store: OperationRuntimeHandle::disabled(),
         };
         let mut spawned_pid = None;
@@ -1655,29 +1730,119 @@ mod tests {
             spawned_pid = Some(pid);
             Ok(())
         };
-        let output = executor.execute(
-            AntigravitySupervisedProcessSpec {
-                operation_id: format!("antigravity-shared-supervisor-{}", std::process::id()),
-                executable,
-                args: vec![
-                    "--exact".to_owned(),
-                    "host_runtime::supervised_process::tests::supervised_process_native_fixture"
-                        .to_owned(),
-                    "--nocapture".to_owned(),
-                ],
-                cwd,
-                environment: vec![(FIXTURE_ENV.to_owned(), "antigravity-executor".to_owned())],
-                timeout_ms: 5_000,
-                max_output_bytes: 32 * 1024,
-            },
-            &mut on_spawned,
-        )?;
-        assert_eq!(spawned_pid, Some(output.root_pid));
+        let output = runner
+            .run(
+                ProviderProcessSpec {
+                    operation_id: format!("antigravity-shared-supervisor-{}", std::process::id()),
+                    invocation_id: None,
+                    executable,
+                    args: vec![
+                        OsString::from("--exact"),
+                        OsString::from(
+                            "host_runtime::supervised_process::tests::supervised_process_native_fixture",
+                        ),
+                        OsString::from("--nocapture"),
+                    ],
+                    cwd,
+                    environment: vec![(
+                        OsString::from(FIXTURE_ENV),
+                        OsString::from("antigravity-executor"),
+                    )],
+                    stdin_payload: None,
+                    route_policy: eliot_types::ProviderRoutePolicy::for_route(
+                        eliot_types::AgentHostId::Antigravity,
+                        "provider-runner-fixture",
+                        eliot_types::ProviderDeclaredBudget::new(5_000, 32 * 1024),
+                    ),
+                    cancellation: CancellationToken::new(),
+                    deadline: Instant::now() + Duration::from_secs(5),
+                    runtime_contract_sha256: None,
+                    role_lease_id: None,
+                    role_lease_epoch: None,
+                },
+                &mut on_spawned,
+            )
+            .await?;
+        assert_eq!(spawned_pid, output.reap_receipt.root_pid);
         assert_eq!(output.exit_code, Some(0));
         assert!(output.stdout_truncated);
         assert!(output.stderr_truncated);
-        assert!(output.reap_complete);
-        assert!(!output.job_object_name.is_empty());
+        assert!(output.reap_receipt.proves_complete_reap());
+        assert!(!output.reap_receipt.job_object_name.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn scripted_provider_runner_returns_post_spawn_callback_failure_as_outcome() -> Result<()>
+    {
+        let now = time::OffsetDateTime::now_utc();
+        let scripted = ScriptedProviderProcessRunner::new([eliot_engine::ProviderProcessOutcome {
+            exit_code: Some(0),
+            stdout: b"complete".to_vec(),
+            stderr: Vec::new(),
+            stdout_total_bytes: 8,
+            stderr_total_bytes: 0,
+            stdout_truncated: false,
+            stderr_truncated: false,
+            timed_out: false,
+            cancelled: true,
+            worker_error: None,
+            observed_processes: Vec::new(),
+            process_started_at: now,
+            first_output_at: Some(now),
+            last_output_at: Some(now),
+            process_exit_at: Some(now),
+            cleanup_completed_at: now,
+            reap_receipt: ProcessReapReceipt {
+                operation_id: "scripted-provider".to_owned(),
+                generation: 1,
+                job_object_name: "scripted-job".to_owned(),
+                root_pid: Some(41),
+                process_count_before: 1,
+                process_count_after: 0,
+                graceful_attempted: false,
+                forced_termination: true,
+                stdout_closed: true,
+                stderr_closed: true,
+                all_tasks_joined: true,
+                elapsed_ms: 1,
+                terminal_error_codes: Vec::new(),
+            },
+        }]);
+        let spec = ProviderProcessSpec {
+            operation_id: "scripted-provider".to_owned(),
+            invocation_id: None,
+            executable: std::env::current_exe()?,
+            args: Vec::new(),
+            cwd: std::env::current_dir()?,
+            environment: Vec::new(),
+            stdin_payload: None,
+            route_policy: eliot_types::ProviderRoutePolicy::for_route(
+                eliot_types::AgentHostId::Claude,
+                "scripted-provider",
+                eliot_types::ProviderDeclaredBudget::new(100, 1_024),
+            ),
+            cancellation: CancellationToken::new(),
+            deadline: Instant::now() + Duration::from_millis(100),
+            runtime_contract_sha256: None,
+            role_lease_id: None,
+            role_lease_epoch: None,
+        };
+        let mut callback = |_| {
+            Err(eliot_engine::EngineError::RuntimeSupervision(
+                "journal unavailable".to_owned(),
+            ))
+        };
+
+        let outcome = scripted.run(spec, &mut callback).await?;
+
+        assert!(outcome.reap_receipt.proves_complete_reap());
+        assert!(
+            outcome
+                .worker_error
+                .as_deref()
+                .is_some_and(|error| error.contains("journal unavailable"))
+        );
         Ok(())
     }
 

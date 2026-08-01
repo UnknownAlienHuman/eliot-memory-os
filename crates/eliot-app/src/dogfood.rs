@@ -4,7 +4,10 @@ use crate::named_pipe_ipc::{
 };
 use anyhow::{Context, Result, bail};
 use eliot_store::SurrealServerSupervisor;
-use eliot_types::{CredentialProviderKind, GovernorConfig, SCHEMA_VERSION};
+use eliot_types::{
+    AgentHostId, CredentialProviderKind, GovernorConfig, ProviderDeclaredBudget,
+    ProviderRoutePolicy, SCHEMA_VERSION,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::env;
@@ -22,6 +25,8 @@ use std::os::windows::process::CommandExt as _;
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 const MANIFEST_VERSION: &str = "eliot-dogfood-l3-v1";
 const PROVIDER_KILL_SWITCH: &str = "ELIOT_DISABLE_REAL_PROVIDER";
+const DOGFOOD_PROVIDER_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+const DOGFOOD_PROVIDER_OUTPUT_LIMIT_BYTES: u64 = 64 * 1024 * 1024;
 const DOGFOOD_CODEX_ENABLED_TOOLS: &[&str] = &[
     "eliot_task_state",
     "eliot_task_action_request",
@@ -405,51 +410,92 @@ pub(crate) async fn run_codex(root: &Path) -> Result<()> {
         bail!("resolved Codex CLI is not an installed codex.exe regular file");
     }
 
-    let events = OpenOptions::new()
-        .create(true)
-        .truncate(true)
-        .write(true)
-        .open(&launch.plan.jsonl_stdout_path)
-        .context("open planned Codex JSONL stdout path")?;
-    let mut command = Command::new(&codex);
-    command
-        .current_dir(&launch.worktree)
-        .args(&launch.plan.argv_before_prompt)
-        .arg(&prompt)
-        .env(PROVIDER_KILL_SWITCH, "1")
-        .stdin(Stdio::null())
-        .stdout(Stdio::from(events))
-        .stderr(Stdio::inherit());
-    for variable in [
+    let blocked_environment = [
         "SURREAL_USER",
         "SURREAL_PASS",
         "ELIOT_TEST_SURREAL_BIND",
         "ELIOT_TEST_SURREAL_ENDPOINT",
         "ELIOT_TEST_SURREAL_PASSWORD_FILE",
         "ELIOT_TEST_SURREAL_STORAGE",
-    ] {
-        command.env_remove(variable);
-    }
-    let child_status = command
-        .status()
-        .context("launch installed Codex from validated dogfood contract")?;
+    ];
+    let mut environment = std::env::vars_os()
+        .filter(|(name, _)| {
+            !blocked_environment
+                .iter()
+                .any(|blocked| name.eq_ignore_ascii_case(blocked))
+        })
+        .collect::<Vec<_>>();
+    environment.push((PROVIDER_KILL_SWITCH.into(), "1".into()));
+    let mut args = launch
+        .plan
+        .argv_before_prompt
+        .iter()
+        .map(std::ffi::OsString::from)
+        .collect::<Vec<_>>();
+    args.push(prompt.into());
+    let runner = crate::host_runtime::supervised_process::SupervisedWindowsProcessRunner::new(
+        &manifest.config_path,
+    )?;
+    let mut on_spawned = |_| Ok(());
+    let process = eliot_engine::ProviderProcessRunner::run(
+        &runner,
+        eliot_engine::ProviderProcessSpec {
+            operation_id: format!("dogfood-codex-{}", uuid::Uuid::now_v7()),
+            invocation_id: None,
+            executable: codex.clone(),
+            args,
+            cwd: launch.worktree.clone(),
+            environment,
+            stdin_payload: None,
+            route_policy: ProviderRoutePolicy::for_route(
+                AgentHostId::Codex,
+                "dogfood-live-codex",
+                ProviderDeclaredBudget::new(
+                    u64::try_from(DOGFOOD_PROVIDER_TIMEOUT.as_millis()).unwrap_or(u64::MAX),
+                    DOGFOOD_PROVIDER_OUTPUT_LIMIT_BYTES,
+                )
+                .with_first_output_deadline_ms(None),
+            ),
+            cancellation: eliot_engine::runtime_supervision::CancellationToken::new(),
+            deadline: tokio::time::Instant::now() + DOGFOOD_PROVIDER_TIMEOUT,
+            runtime_contract_sha256: None,
+            role_lease_id: None,
+            role_lease_epoch: None,
+        },
+        &mut on_spawned,
+    )
+    .await
+    .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+    anyhow::ensure!(
+        process.worker_error.is_none() && process.reap_receipt.proves_complete_reap(),
+        "Codex dogfood process cleanup failed: {:?}",
+        process.worker_error
+    );
+    fs::write(&launch.plan.jsonl_stdout_path, &process.stdout)
+        .context("write planned Codex JSONL stdout path")?;
+    let stderr_path = launch.plan.jsonl_stdout_path.with_file_name("stderr.log");
+    fs::write(&stderr_path, &process.stderr).context("write Codex stderr log")?;
+    let child_success = process.exit_code == Some(0) && !process.timed_out;
 
     let result = json!({
         "component": "dogfood_run_codex",
-        "status": if child_status.success() { "completed" } else { "failed" },
+        "status": if child_success { "completed" } else { "failed" },
         "codex_executable": codex,
         "worktree_root": launch.worktree,
         "branch": launch.branch,
         "commit": launch.commit,
-        "exit_code": child_status.code(),
+        "exit_code": process.exit_code,
+        "timed_out": process.timed_out,
+        "reap_receipt": process.reap_receipt,
         "events_path": launch.plan.jsonl_stdout_path,
+        "stderr_path": stderr_path,
         "last_message_path": launch.plan.output_last_message_path,
         "provider_kill_switch": true
     });
     let latest_path = root.join("reports").join("live-codex").join("latest.json");
     write_json_file_atomic(&latest_path, &result)?;
     write_json(&result)?;
-    if !child_status.success() {
+    if !child_success {
         bail!(
             "Codex exited non-zero; launch result preserved at {}",
             latest_path.display()

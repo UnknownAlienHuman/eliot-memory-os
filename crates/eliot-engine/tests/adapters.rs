@@ -8,9 +8,10 @@ use eliot_engine::{
 use eliot_store::{BlobStore, CanonicalStore, ControlWal};
 use eliot_types::{
     AdapterAuthorityProfile, AdapterCapability, AdapterClass, AdapterResult, AdapterResultStatus,
-    AdapterState, BlackboardItemKind, BlobStoreConfig, CapabilityManifest, ControlWalConfig,
-    GovernorConfig, MailboxMessageKind, ModuleAuthorityProfile, ModuleCapability, OperationPhase,
-    OperationReconciliationState, ProviderDispatchState, TaintClass,
+    AdapterState, AgentHostId, BlackboardItemKind, BlobStoreConfig, CapabilityManifest,
+    ControlWalConfig, GovernorConfig, MailboxMessageKind, ModuleAuthorityProfile, ModuleCapability,
+    OperationPhase, OperationReconciliationState, ProviderDeclaredBudget, ProviderDispatchState,
+    ProviderRoutePolicy, TaintClass,
 };
 use std::fs::{self, OpenOptions};
 use std::io::ErrorKind;
@@ -138,6 +139,19 @@ fn external_test_manifest(adapter_id: &str, timeout_ms: u64) -> CapabilityManife
     manifest.adapter_class = AdapterClass::ExternalCandidate;
     manifest.limits.timeout_ms = timeout_ms;
     manifest
+}
+
+fn external_test_request(adapter_id: &str, timeout_ms: u64) -> eliot_types::AdapterRequest {
+    let mut request = test_request(adapter_id, AdapterCapability::ExecuteTest);
+    let route_policy = ProviderRoutePolicy::for_route(
+        AgentHostId::Antigravity,
+        "adapter-supervisor-test",
+        ProviderDeclaredBudget::new(timeout_ms, 64 * 1024)
+            .with_cancellation_grace_ms(1)
+            .with_cleanup_grace_ms(1),
+    );
+    request.input = serde_json::json!({"provider_route_policy": route_policy});
+    request
 }
 
 #[test]
@@ -372,7 +386,7 @@ async fn adapter_supervisor_hydrates_durable_open_circuit() -> TestResult {
 }
 
 #[tokio::test]
-async fn adapter_supervisor_restarts_one_fresh_generation_before_dispatch() -> TestResult {
+async fn adapter_supervisor_does_not_redispatch_before_provider_dispatch() -> TestResult {
     let root = test_root("adapter-pre-dispatch-restart")?;
     let wal = ControlWal::open(&ControlWalConfig {
         path: root.join("control.redb").display().to_string(),
@@ -384,25 +398,25 @@ async fn adapter_supervisor_restarts_one_fresh_generation_before_dispatch() -> T
     let mut registry = AdapterRegistry::new();
     registry.register(FlakyExternalAdapter::new())?;
     let supervisor = AdapterSupervisor::with_runtime(registry, runtime.clone());
-    let request = test_request("flaky-external", AdapterCapability::ExecuteTest);
+    let request = external_test_request("flaky-external", 100);
     let operation_id = format!("adapter:flaky-external:{}", request.request_id);
 
     let result = supervisor.execute("flaky-external", request, None).await?;
-    assert_eq!(result.status, AdapterResultStatus::Succeeded);
+    assert_eq!(result.status, AdapterResultStatus::Failed);
     let checkpoint = runtime
         .get_checkpoint(operation_id.clone())
         .await?
         .ok_or_else(|| std::io::Error::other("restart checkpoint missing"))?;
-    assert_eq!(checkpoint.generation, 2);
-    assert_eq!(checkpoint.restart_count, 1);
-    assert_eq!(checkpoint.phase, OperationPhase::Completed);
+    assert_eq!(checkpoint.generation, 1);
+    assert_eq!(checkpoint.restart_count, 0);
+    assert_eq!(checkpoint.phase, OperationPhase::Failed);
     let window = runtime
         .load_restart_window("flaky-external")
         .await?
         .ok_or_else(|| std::io::Error::other("restart window missing"))?;
-    assert_eq!(window.restart_timestamps.len(), 1);
+    assert!(window.restart_timestamps.is_empty());
     assert!(window.last_failure_at.is_some());
-    assert!(window.last_success_at.is_some());
+    assert!(window.last_success_at.is_none());
     assert!(window.last_failure_class.is_some());
     assert_eq!(
         window.last_terminal_operation_ref.as_deref(),
@@ -469,7 +483,7 @@ async fn adapter_supervisor_never_restarts_after_dispatch_proof() -> TestResult 
     let mut registry = AdapterRegistry::new();
     registry.register(PostDispatchHangAdapter::new(Arc::clone(&executions)))?;
     let supervisor = AdapterSupervisor::with_runtime(registry, runtime.clone());
-    let request = test_request("post-dispatch-hang", AdapterCapability::ExecuteTest);
+    let request = external_test_request("post-dispatch-hang", 50);
     let operation_id = format!("adapter:post-dispatch-hang:{}", request.request_id);
 
     let result = supervisor

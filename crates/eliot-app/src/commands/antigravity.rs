@@ -701,7 +701,14 @@ pub async fn run_antigravity_live_smoke(config_path: &Path, mode: &str) -> Resul
     let root = runtime_root(config_path);
     let project_root = project_root_from_config(config_path).canonicalize()?;
     let mode = parse_antigravity_live_smoke_mode(mode)?;
-    let (resolution, probe, contract) = antigravity_resolution_probe_contract();
+    let runner =
+        crate::host_runtime::supervised_process::SupervisedWindowsProcessRunner::new(config_path)?;
+    let resolution =
+        AntigravityBinaryResolver.resolve(&AntigravityBinaryResolver::default_config());
+    let probe = AntigravityCapabilityProbeService
+        .probe_from_resolution_supervised(&resolution, &runner)
+        .await;
+    let contract = AntigravityCommandContractService.build(&resolution, &probe);
     let auth = latest_antigravity_auth(&root)?.unwrap_or_else(|| {
         AntigravityAuthCheckService.help_only(
             &probe,
@@ -791,17 +798,16 @@ pub async fn run_antigravity_live_smoke(config_path: &Path, mode: &str) -> Resul
         write_antigravity_report_pair(&root, "antigravity-runs", "Antigravity Run", &run)?;
         AntigravityLiveSmokeService.result_from_run(&smoke, &run)
     } else {
-        let executor =
-            crate::host_runtime::supervised_process::SharedAntigravityProcessExecutor::new(
-                config_path,
-            )?;
-        match AntigravityRunner.run_real_supervised(
-            &request,
-            &contract,
-            &worktree_lease,
-            &worktree_path,
-            &executor,
-        ) {
+        match AntigravityRunner
+            .run_real_supervised(
+                &request,
+                &contract,
+                &worktree_lease,
+                &worktree_path,
+                &runner,
+            )
+            .await
+        {
             Ok(run) => {
                 let inferred_auth = AntigravityAuthCheckService.from_probe_output(
                     &format!("{}\n{}", run.stdout_excerpt, run.stderr_excerpt),

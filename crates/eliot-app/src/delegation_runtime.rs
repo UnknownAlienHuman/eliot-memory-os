@@ -739,7 +739,14 @@ async fn execute_real(
     let mut g2_job = ExternalReviewJobService.create_job(&g2_request);
     decision.external_review_request_ref = Some(g2_request.request_id.clone());
 
-    let (resolution, probe, contract) = antigravity_contract();
+    let runner =
+        crate::host_runtime::supervised_process::SupervisedWindowsProcessRunner::new(config_path)?;
+    let resolution =
+        AntigravityBinaryResolver.resolve(&AntigravityBinaryResolver::default_config());
+    let probe = AntigravityCapabilityProbeService
+        .probe_from_resolution_supervised(&resolution, &runner)
+        .await;
+    let contract = AntigravityCommandContractService.build(&resolution, &probe);
     let previous_state = AntigravityEnablementService.state_from_probe(&probe, None);
     let enablement = AntigravityEnablementService.enable(
         previous_state,
@@ -832,21 +839,20 @@ async fn execute_real(
         ProviderInvocationState::Reserved,
         vec![format!("reservation:{reservation_id}")],
     )?;
-    let executor = crate::host_runtime::supervised_process::SharedAntigravityProcessExecutor::new(
-        config_path,
-    )?;
-    let run_result = AntigravityRunner.run_real_recorded_supervised(
-        &provider_request,
-        &contract,
-        &worktree,
-        &worktree_path,
-        root,
-        reservation_owner,
-        reservation_id,
-        &journal,
-        &mut attempt,
-        &executor,
-    );
+    let run_result = AntigravityRunner
+        .run_real_recorded_supervised(
+            &provider_request,
+            &contract,
+            &worktree,
+            &worktree_path,
+            root,
+            reservation_owner,
+            reservation_id,
+            &journal,
+            &mut attempt,
+            &runner,
+        )
+        .await;
     let run = match run_result {
         Ok(run) => run,
         Err(error) => {
@@ -1289,18 +1295,6 @@ async fn cleanup_failed_worktree(work_state: &mut WorkState, id: eliot_types::Wo
     let _ = eliot_engine::WorktreeCleanupService
         .cleanup(work_state, id)
         .await;
-}
-
-fn antigravity_contract() -> (
-    eliot_types::AntigravityBinaryResolution,
-    eliot_types::AntigravityCapabilityProbe,
-    eliot_types::AntigravityCommandContract,
-) {
-    let resolution =
-        AntigravityBinaryResolver.resolve(&AntigravityBinaryResolver::default_config());
-    let probe = AntigravityCapabilityProbeService.probe_from_resolution(&resolution);
-    let contract = AntigravityCommandContractService.build(&resolution, &probe);
-    (resolution, probe, contract)
 }
 
 fn default_origin_chain(origin: DelegationOrigin) -> DelegationOriginChain {

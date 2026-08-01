@@ -7,12 +7,8 @@
 )]
 
 use crate::{
-    host_runtime::supervised_process::{
-        ChildCriticality, ProcessRestartPolicy, RestartStrategy, SupervisedChildKind,
-        SupervisedProcessSpec, run_supervised_process_blocking,
-    },
-    named_pipe_ipc, runtime_bootstrap,
-    runtime_instance::RuntimeInstance,
+    host_runtime::supervised_process::SupervisedWindowsProcessRunner, named_pipe_ipc,
+    runtime_bootstrap, runtime_instance::RuntimeInstance,
 };
 use anyhow::{Context, Result};
 use eliot_types::{
@@ -25,7 +21,6 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
-use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
@@ -543,20 +538,17 @@ pub(crate) async fn run(
     let command_bundle_sha256 = execution.bundle_sha256.clone();
     let operation_runtime =
         crate::host_runtime::supervised_process::daemon_operation_runtime_handle(config_path)?;
-    let managed = tokio::task::spawn_blocking(move || {
-        run_managed_process(
-            &command_request,
-            &command_environment,
-            &command_call_id,
-            &command_launcher_sha256,
-            &command_provider_sha256,
-            &command_bundle_sha256,
-            execution_authority,
-            operation_runtime,
-        )
-    })
-    .await
-    .context("join cognitive managed process")??;
+    let managed = run_managed_process(
+        &command_request,
+        &command_environment,
+        &command_call_id,
+        &command_launcher_sha256,
+        &command_provider_sha256,
+        &command_bundle_sha256,
+        execution_authority,
+        operation_runtime,
+    )
+    .await?;
 
     write_output_json(
         &request.output_root.join("process.json"),
@@ -1282,7 +1274,7 @@ fn write_output_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {
     clippy::too_many_arguments,
     reason = "the managed execution boundary receives independently pinned authority and hash inputs"
 )]
-fn run_managed_process(
+async fn run_managed_process(
     request: &CognitiveRunnerRequest,
     environment: &BTreeMap<String, String>,
     call_id: &str,
@@ -1302,56 +1294,46 @@ fn run_managed_process(
     let started = Instant::now();
     let timeout = Duration::from_secs(request.timeout_seconds);
     let operation_id = format!("cognitive-{call_id}");
-    let output = run_supervised_process_blocking(
-        SupervisedProcessSpec {
-            operation_id: operation_id.clone(),
+    let route_policy = eliot_types::ProviderRoutePolicy::for_route(
+        request.host,
+        "cognitive-field",
+        eliot_types::ProviderDeclaredBudget::new(
+            u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX),
+            u64::try_from(MAX_SECRET_BOUNDARY_BYTES).unwrap_or(u64::MAX),
+        )
+        .with_first_output_deadline_ms(None),
+    );
+    let runner = SupervisedWindowsProcessRunner::from_runtime_store(operation_runtime);
+    let mut on_spawned = |_| Ok(());
+    let output = eliot_engine::ProviderProcessRunner::run(
+        &runner,
+        eliot_engine::ProviderProcessSpec {
+            operation_id,
             invocation_id: Some(call_id.to_owned()),
-            generation: 1,
-            child_kind: SupervisedChildKind::Provider,
-            criticality: ChildCriticality::InvocationDependency,
-            restart_policy: ProcessRestartPolicy {
-                strategy: RestartStrategy::RestForOne,
-                max_restarts: 1,
-                restart_window_seconds: 60,
-                base_backoff_ms: 250,
-                pre_dispatch_only: true,
-            },
             executable: request.executable.clone(),
-            args: request.argv.iter().map(OsString::from).collect(),
+            args: request.argv.iter().map(std::ffi::OsString::from).collect(),
             cwd: request.cwd.clone(),
             environment: environment
                 .iter()
-                .map(|(name, value)| (OsString::from(name), OsString::from(value)))
+                .map(|(name, value)| {
+                    (
+                        std::ffi::OsString::from(name),
+                        std::ffi::OsString::from(value),
+                    )
+                })
                 .collect(),
             stdin_payload: None,
-            stdout_limit_bytes: u64::try_from(MAX_SECRET_BOUNDARY_BYTES).unwrap_or(u64::MAX),
-            stderr_limit_bytes: u64::try_from(MAX_SECRET_BOUNDARY_BYTES).unwrap_or(u64::MAX),
-            timeout_profile: eliot_types::ProviderRoutePolicy::for_route(
-                request.host,
-                "cognitive-field",
-                eliot_types::ProviderDeclaredBudget::new(
-                    u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX),
-                    u64::try_from(MAX_SECRET_BOUNDARY_BYTES).unwrap_or(u64::MAX),
-                )
-                .with_first_output_deadline_ms(None),
-            )
-            .timeout_profile()
-            .clone(),
-            runtime_contract_sha256: Some(expected_bundle_sha256.to_owned()),
-            role_lease_id: None,
-            role_lease_epoch: None,
-        },
-        eliot_engine::runtime_supervision::AdapterExecutionContext {
-            operation_id,
-            generation: 1,
+            route_policy,
             cancellation: eliot_engine::runtime_supervision::CancellationToken::new(),
             deadline: tokio::time::Instant::now() + timeout,
-            runtime_store: operation_runtime,
+            runtime_contract_sha256: Some(expected_bundle_sha256.to_owned()),
             role_lease_id: None,
             role_lease_epoch: None,
-            runtime_contract_sha256: Some(expected_bundle_sha256.to_owned()),
         },
-    )?;
+        &mut on_spawned,
+    )
+    .await
+    .map_err(|error| anyhow::anyhow!(error.to_string()))?;
     anyhow::ensure!(
         output.worker_error.is_none() && output.reap_receipt.proves_complete_reap(),
         "cognitive provider process cleanup failed: {:?}",

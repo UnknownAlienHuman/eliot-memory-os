@@ -56,7 +56,6 @@ const CLAUDE_DESKTOP_HOST: &str = "claude-desktop";
 mod claude;
 mod external_agent;
 pub(crate) use external_agent::half_open_external_agent_circuit;
-mod external_agent_process;
 mod integration;
 mod managed;
 pub(crate) mod supervised_process;

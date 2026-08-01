@@ -1,6 +1,4 @@
-use crate::runtime_supervision::{
-    AdapterExecutionContext, CancellationToken, RestartDecision, classify_restart,
-};
+use crate::runtime_supervision::{AdapterExecutionContext, CancellationToken};
 use crate::{
     BlackboardAddInput, BlackboardService, EngineError, MailboxSendInput, MailboxService,
     OperationRuntimeHandle, WorkState, WriteAdmissionService, WriterHandle,
@@ -10,12 +8,12 @@ use eliot_types::{
     AdapterAuthorityProfile, AdapterCapability, AdapterCircuitState, AdapterClass, AdapterContext,
     AdapterError, AdapterHealth, AdapterLimits, AdapterObservation, AdapterRequest, AdapterResult,
     AdapterResultStatus, AdapterState, BlackboardItem, BlackboardItemKind, BlackboardScope,
-    CapabilityManifest, CommandContext, ConfidenceLevel, ExternalAgentExecutionRequest,
-    LifecycleStatus, MailboxMessage, MailboxMessageKind, MailboxRecipient, ModuleHealth,
-    ModuleManifest, ModuleTransport, OPERATION_RESTART_WINDOW_SCHEMA_VERSION,
-    OPERATION_RUNTIME_CHECKPOINT_SCHEMA_VERSION, OperationCancellationState, OperationPhase,
-    OperationReconciliationState, OperationRestartWindow, OperationRuntimeCheckpoint,
-    ProcessExecutionPolicy, ProviderDispatchState, SemanticCommand, ServiceHealthState, TaintClass,
+    CapabilityManifest, CommandContext, ConfidenceLevel, LifecycleStatus, MailboxMessage,
+    MailboxMessageKind, MailboxRecipient, ModuleHealth, ModuleManifest, ModuleTransport,
+    OPERATION_RESTART_WINDOW_SCHEMA_VERSION, OPERATION_RUNTIME_CHECKPOINT_SCHEMA_VERSION,
+    OperationCancellationState, OperationPhase, OperationReconciliationState,
+    OperationRestartWindow, OperationRuntimeCheckpoint, ProcessExecutionPolicy,
+    ProviderDispatchState, ProviderRoutePolicy, SemanticCommand, ServiceHealthState, TaintClass,
     ToolObservationRecordCommand, Visibility, WriteId, WriteReceiptRef,
 };
 use serde::{Deserialize, Serialize};
@@ -357,9 +355,15 @@ impl AdapterSupervisor {
         };
         let started = Instant::now();
         let timeout_ms = if adapter.manifest().adapter_class == AdapterClass::ExternalCandidate {
-            let execution =
-                serde_json::from_value::<ExternalAgentExecutionRequest>(request.input.clone())?;
-            let timeout = execution.provider_route_policy.timeout_profile();
+            let route_policy = request
+                .input
+                .get("provider_route_policy")
+                .cloned()
+                .ok_or_else(|| {
+                    adapter_rejected("external adapter request has no provider route policy")
+                })?;
+            let route_policy = serde_json::from_value::<ProviderRoutePolicy>(route_policy)?;
+            let timeout = route_policy.timeout_profile();
             timeout
                 .absolute_runtime_deadline_ms()
                 .saturating_add(timeout.cancellation_grace_ms())
@@ -425,7 +429,7 @@ impl AdapterSupervisor {
             result = &mut adapter_future => Some(result),
             () = tokio::time::sleep_until(deadline) => None,
         };
-        let (mut result, mut timed_out, mut cleanup_completed) = match result {
+        let (mut result, timed_out, cleanup_completed) = match result {
             Some(Ok(result)) => (result, false, true),
             Some(Err(error)) => (
                 rejected_result(
@@ -471,117 +475,18 @@ impl AdapterSupervisor {
             }
         };
         if adapter.manifest().adapter_class == AdapterClass::ExternalCandidate
-            && self.runtime_store.is_enabled()
-            && context.role_lease_id.is_none()
             && matches!(
                 result.status,
                 AdapterResultStatus::Failed | AdapterResultStatus::Timeout
             )
-            && let Some(mut persisted) = self
+            && let Some(persisted) = self
                 .runtime_store
                 .get_checkpoint(checkpoint.operation_id.clone())
                 .await?
         {
-            match classify_restart(&persisted, None, false) {
-                RestartDecision::RestartFreshGeneration if persisted.restart_count == 0 => {
-                    persisted.generation = persisted.generation.saturating_add(1);
-                    persisted.restart_count = 1;
-                    persisted.phase = OperationPhase::Prepared;
-                    persisted.dispatch_state = ProviderDispatchState::NotStarted;
-                    persisted.cancellation_state = OperationCancellationState::NotRequested;
-                    persisted.reconciliation_state = OperationReconciliationState::NotRequired;
-                    persisted.root_pid = None;
-                    persisted.root_process_start_ticks = None;
-                    persisted.root_executable_sha256 = None;
-                    persisted.job_object_name = None;
-                    persisted.active_process_count = 0;
-                    persisted.stdin_bytes = 0;
-                    persisted.stdout_bytes = 0;
-                    persisted.stderr_bytes = 0;
-                    persisted.last_error_class = Some("pre_dispatch_restart".to_owned());
-                    persisted.last_progress_at = OffsetDateTime::now_utc();
-                    persisted.phase_started_at = persisted.last_progress_at;
-                    self.runtime_store.put_checkpoint(persisted.clone()).await?;
-                    self.persist_safe_restart(adapter_id, "pre_dispatch_transport")
-                        .await?;
-                    sleep(Duration::from_millis(250)).await;
-
-                    let retry_cancellation = CancellationToken::new();
-                    let retry_context = AdapterExecutionContext {
-                        operation_id: checkpoint.operation_id.clone(),
-                        generation: persisted.generation,
-                        cancellation: retry_cancellation.clone(),
-                        deadline,
-                        runtime_store: self.runtime_store.clone(),
-                        role_lease_id: context.role_lease_id.clone(),
-                        role_lease_epoch: context.role_lease_epoch,
-                        runtime_contract_sha256: context.runtime_contract_sha256.clone(),
-                    };
-                    let retry_future = adapter.execute(request.clone(), retry_context);
-                    tokio::pin!(retry_future);
-                    let retry = tokio::select! {
-                        result = &mut retry_future => Some(result),
-                        () = tokio::time::sleep_until(deadline) => None,
-                    };
-                    (result, timed_out, cleanup_completed) = match retry {
-                        Some(Ok(result)) => (result, false, true),
-                        Some(Err(error)) => (
-                            rejected_result(
-                                &request,
-                                AdapterResultStatus::Failed,
-                                "adapter_error",
-                                &error.to_string(),
-                            ),
-                            false,
-                            true,
-                        ),
-                        None => {
-                            retry_cancellation.cancel();
-                            let cleanup = retry_future.await;
-                            let cleanup_completed = retry_cancellation.reap_completed();
-                            let detail = match (cleanup, cleanup_completed) {
-                                (Ok(_), true) => {
-                                    "adapter restart timed out; cancellation and reap completed"
-                                }
-                                (Err(_), true) => {
-                                    "adapter restart timed out; child reaped and returned an error"
-                                }
-                                (Ok(_) | Err(_), false) => {
-                                    "adapter restart timed out; process reap receipt is incomplete"
-                                }
-                            };
-                            (
-                                rejected_result(
-                                    &request,
-                                    AdapterResultStatus::Timeout,
-                                    "timeout",
-                                    detail,
-                                ),
-                                true,
-                                cleanup_completed,
-                            )
-                        }
-                    };
-                    checkpoint = self
-                        .runtime_store
-                        .get_checkpoint(checkpoint.operation_id.clone())
-                        .await?
-                        .unwrap_or(persisted);
-                }
-                RestartDecision::ReconcileBeforeAnyRetry => {
-                    persisted.reconciliation_state = OperationReconciliationState::Pending;
-                    checkpoint = persisted;
-                }
-                RestartDecision::OpenCircuit => {
-                    checkpoint = persisted;
-                    if let Some(record) = self.force_open_circuit(adapter_id) {
-                        self.persist_circuit(adapter_id, &record, result.status, None)
-                            .await?;
-                    }
-                }
-                RestartDecision::AcceptCapturedTerminalThenReap
-                | RestartDecision::RestartFreshGeneration
-                | RestartDecision::TerminalFailure => {}
+            checkpoint = persisted;
+            if checkpoint.dispatch_state != ProviderDispatchState::NotStarted {
+                checkpoint.reconciliation_state = OperationReconciliationState::Pending;
             }
         }
         result.duration_ms = millis(started.elapsed());
@@ -785,14 +690,6 @@ impl AdapterSupervisor {
         Some(record.clone())
     }
 
-    fn force_open_circuit(&self, adapter_id: &str) -> Option<CircuitRecord> {
-        let mut circuits = self.circuits.lock().ok()?;
-        let record = circuits.entry(adapter_id.to_owned()).or_default();
-        record.circuit_open = true;
-        record.state = AdapterState::CircuitOpen;
-        Some(record.clone())
-    }
-
     async fn hydrate_circuit(&self, adapter_id: &str) -> Result<(), EngineError> {
         if self
             .hydrated_circuits
@@ -873,7 +770,6 @@ impl AdapterSupervisor {
         });
         match status {
             AdapterResultStatus::Failed | AdapterResultStatus::Timeout => {
-                window.restart_timestamps.push(now_epoch.to_string());
                 window.last_failure_at = Some(now_epoch.to_string());
                 window.last_failure_class = Some(format!("{status:?}").to_ascii_lowercase());
             }
@@ -904,40 +800,6 @@ impl AdapterSupervisor {
             AdapterCircuitState::Closed
         };
         window.updated_at = now_epoch.to_string();
-        self.runtime_store.put_restart_window(window).await
-    }
-
-    async fn persist_safe_restart(
-        &self,
-        adapter_id: &str,
-        reason: &str,
-    ) -> Result<(), EngineError> {
-        let now = OffsetDateTime::now_utc().unix_timestamp();
-        let mut window = self
-            .runtime_store
-            .load_restart_window(adapter_id)
-            .await?
-            .unwrap_or_else(|| OperationRestartWindow {
-                schema_version: OPERATION_RESTART_WINDOW_SCHEMA_VERSION.to_owned(),
-                key: adapter_id.to_owned(),
-                restart_timestamps: Vec::new(),
-                circuit_state: AdapterCircuitState::Closed,
-                consecutive_failures: 0,
-                last_success_at: None,
-                last_failure_at: None,
-                last_failure_class: None,
-                last_terminal_operation_ref: None,
-                updated_at: now.to_string(),
-            });
-        window.restart_timestamps.retain(|timestamp| {
-            timestamp
-                .parse::<i64>()
-                .is_ok_and(|observed| observed >= now.saturating_sub(60))
-        });
-        window.restart_timestamps.push(now.to_string());
-        window.last_failure_at = Some(now.to_string());
-        window.last_failure_class = Some(reason.to_owned());
-        window.updated_at = now.to_string();
         self.runtime_store.put_restart_window(window).await
     }
 }

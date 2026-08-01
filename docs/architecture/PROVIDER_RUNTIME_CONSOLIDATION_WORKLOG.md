@@ -56,3 +56,22 @@ This log preserves the ordered implementation evidence for
   - `cargo test -p eliot-types --test provider_route_policy`: 31.17 s including compilation; 2/2 tests, test bodies 0.00 s.
   - Related schema and reconciliation tests: 21/21, 52.50 s including compilation; test bodies 0.23 s total.
 - Source inventory after ARCH-01: `ProviderTimeoutProfile { ... }` appears only in `eliot-types/src/provider_invocation.rs`; no `dispatch_ack_deadline_ms: Some(...)` remains.
+
+## ARCH-02 — one production process runner and no automatic provider retry
+
+- Generalized the existing Antigravity executor seam into `ProviderProcessRunner`, with exactly two implementations: production `SupervisedWindowsProcessRunner` and test-only `ScriptedProviderProcessRunner`.
+- Removed `AntigravityProcessExecutor`, `AntigravitySupervisedProcessSpec/Output`, `SharedAntigravityProcessExecutor`, the independent `run_external_agent_process` lifecycle, and the disabled duplicate unsupervised Antigravity executor bodies.
+- Routed external-agent Claude/Antigravity/OpenCode, cognitive Worker/Reader/Judge, managed Antigravity, generic supervised host provider launches, Antigravity delegation/live smoke, supervised Antigravity version/help probes, and dogfood Codex through `SupervisedWindowsProcessRunner`.
+- Preserved Windows `OsString` arguments and environment values in `ProviderProcessSpec`; the shared runner is the only production conversion into `SupervisedProcessSpec`.
+- The runner fixes provider generation to 1, `RestartStrategy::Never`, zero restarts, one Job Object, concurrent stdin/stdout/stderr drains and a complete reap receipt.
+- Removed `AdapterSupervisor` external-provider redispatch and restart persistence. It retains concurrency/circuit state only; a post-dispatch failure is marked for reconciliation and never replayed below the campaign/controller.
+- Corrected a semantic defect exposed by the no-redispatch test: ordinary failures had been appended to `restart_timestamps`, incorrectly opening the restart window even without a restart. Failures now update circuit state without fabricating restart evidence.
+- All post-spawn callback and runtime-checkpoint persistence failures are returned as `ProviderProcessOutcome.worker_error` after process cleanup; `Err` remains the validation/spawn-before-identity boundary.
+- Removed direct provider version execution from external-adapter composition. Pre-dispatch runtime identity is now the immutable executable SHA-256, avoiding a hidden provider subprocess during a zero-call preview.
+- Non-provider Governor MCP reference exchanges retain the generic supervised child primitive and its pre-dispatch-only restart policy. Compatibility-only blocking helpers are deferred to ARCH-04 with the duplicate main test removal.
+- Focused timings and results:
+  - `cargo check -p eliot-app --bin eliot-governor`: successive successful incremental checks 4.26 s, 6.10 s, 3.77 s and 5.28 s while migrating all call sites.
+  - `cargo test -p eliot-app --bin eliot-governor provider_runner`: 2/2 passed; 34.14 s including compilation, 0.83 s test bodies.
+  - `cargo test -p eliot-engine --test adapters adapter`: 21 passed, 1 authenticated-SurrealDB test ignored; 9.32 s including compilation, 0.23 s test bodies.
+  - One initial exact-name test invocation selected zero tests and consumed 97.30 s compiling the binary. It is explicitly excluded from evidence; the corrected nonzero filter above is the acceptance evidence.
+- Source inventory after ARCH-02: no removed executor name remains; provider `SupervisedProcessSpec` construction exists only inside `SupervisedWindowsProcessRunner`; the remaining `RestartStrategy::OneForOne` call is the local Governor MCP preflight, not a provider executable.

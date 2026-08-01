@@ -669,29 +669,18 @@ async fn launch(
     }
     let wall_clock = Duration::from_secs(contract.wall_clock_budget_seconds);
     let raw_command = command.as_std();
-    let supervised_context = eliot_engine::runtime_supervision::AdapterExecutionContext {
+    let provider_route_policy = eliot_types::ProviderRoutePolicy::for_route(
+        host,
+        "host-launch",
+        eliot_types::ProviderDeclaredBudget::new(
+            u64::try_from(wall_clock.as_millis()).unwrap_or(u64::MAX),
+            u64::try_from(MAX_SECRET_BOUNDARY_BYTES).unwrap_or(u64::MAX),
+        )
+        .with_first_output_deadline_ms(None),
+    );
+    let provider_spec = eliot_engine::ProviderProcessSpec {
         operation_id: format!("host-provider-{}", contract.invocation_id),
-        generation: 1,
-        cancellation: eliot_engine::runtime_supervision::CancellationToken::new(),
-        deadline: tokio::time::Instant::now() + wall_clock,
-        runtime_store: supervised_process::daemon_operation_runtime_handle(config_path)?,
-        role_lease_id: contract.role_lease_id.clone(),
-        role_lease_epoch: Some(contract.role_lease_epoch),
-        runtime_contract_sha256: Some(contract.contract_hash.clone()),
-    };
-    let supervised_spec = supervised_process::SupervisedProcessSpec {
-        operation_id: supervised_context.operation_id.clone(),
         invocation_id: Some(contract.invocation_id.clone()),
-        generation: supervised_context.generation,
-        child_kind: supervised_process::SupervisedChildKind::Provider,
-        criticality: supervised_process::ChildCriticality::InvocationDependency,
-        restart_policy: supervised_process::ProcessRestartPolicy {
-            strategy: supervised_process::RestartStrategy::RestForOne,
-            max_restarts: 1,
-            restart_window_seconds: 60,
-            base_backoff_ms: 250,
-            pre_dispatch_only: true,
-        },
         executable: raw_command.get_program().into(),
         args: raw_command
             .get_args()
@@ -713,32 +702,21 @@ async fn launch(
             })
             .collect(),
         stdin_payload: None,
-        stdout_limit_bytes: u64::try_from(MAX_SECRET_BOUNDARY_BYTES).unwrap_or(u64::MAX),
-        stderr_limit_bytes: u64::try_from(MAX_SECRET_BOUNDARY_BYTES).unwrap_or(u64::MAX),
-        timeout_profile: eliot_types::ProviderRoutePolicy::for_route(
-            host,
-            "host-launch",
-            eliot_types::ProviderDeclaredBudget::new(
-                u64::try_from(wall_clock.as_millis()).unwrap_or(u64::MAX),
-                u64::try_from(MAX_SECRET_BOUNDARY_BYTES).unwrap_or(u64::MAX),
-            )
-            .with_first_output_deadline_ms(None),
-        )
-        .timeout_profile()
-        .clone(),
+        route_policy: provider_route_policy,
+        cancellation: eliot_engine::runtime_supervision::CancellationToken::new(),
+        deadline: tokio::time::Instant::now() + wall_clock,
         runtime_contract_sha256: Some(contract.contract_hash.clone()),
         role_lease_id: contract.role_lease_id.clone(),
-        role_lease_epoch: None,
+        role_lease_epoch: Some(contract.role_lease_epoch),
     };
     let spawned = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let spawned_in_hook = std::sync::Arc::clone(&spawned);
     let invocation_root_for_hook = invocation_root.clone();
-    let process = match supervised_process::run_supervised_process_with_spawn_hook(
-        supervised_spec,
-        supervised_context,
-        move |_| {
-            spawned_in_hook.store(true, std::sync::atomic::Ordering::Release);
-            if antigravity_containment {
+    let provider_runner = supervised_process::SupervisedWindowsProcessRunner::new(config_path)?;
+    let mut on_spawned = move |_| {
+        spawned_in_hook.store(true, std::sync::atomic::Ordering::Release);
+        if antigravity_containment {
+            let validation = (|| -> Result<()> {
                 validate_contained_antigravity_attempt(
                     &read_contained_antigravity_attempt(
                         &invocation_root_for_hook.join("attempt.json"),
@@ -750,12 +728,21 @@ async fn launch(
                 .context(
                     "provider dispatched: contained Antigravity attempt journal became invalid; outcome is unknown",
                 )?;
-            }
-            Ok(())
-        },
-    )
-    .await
-    {
+                Ok(())
+            })();
+            validation.map_err(|error| {
+                eliot_engine::EngineError::RuntimeSupervision(format!(
+                    "contained Antigravity post-spawn validation failed: {error:#}"
+                ))
+            })?;
+        }
+        Ok(())
+    };
+    let process = match eliot_engine::ProviderProcessRunner::run(
+        &provider_runner,
+        provider_spec,
+        &mut on_spawned,
+    ).await {
         Ok(process) => process,
         Err(error) => {
             if antigravity_containment

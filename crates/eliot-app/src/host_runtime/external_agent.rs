@@ -1,4 +1,3 @@
-use super::external_agent_process::{ManagedExternalAgentOutput, run_external_agent_process};
 use super::supervised_process::{
     ChildCriticality, ProcessRestartPolicy, RestartStrategy, SupervisedChildKind,
     SupervisedProcessSpec, run_supervised_process,
@@ -11,10 +10,10 @@ use eliot_engine::{
     ExternalResultCompletenessService, OpenCodeCommandInput, ProviderCallReservationDecision,
     ProviderCallReservationOwner, ProviderCallReservationRequest, ProviderCommandPlan,
     ProviderCompletenessInput, ProviderInvocationJournal, ProviderOutputSpool,
-    ProviderTerminalResult, build_antigravity_command, build_claude_code_command,
-    build_opencode_command, parse_antigravity_output, parse_claude_code_stream,
-    parse_opencode_stream, seal_provider_runtime_contract,
-    validate_external_agent_execution_request,
+    ProviderProcessOutcome, ProviderProcessRunner, ProviderProcessSpec, ProviderTerminalResult,
+    build_antigravity_command, build_claude_code_command, build_opencode_command,
+    parse_antigravity_output, parse_claude_code_stream, parse_opencode_stream,
+    seal_provider_runtime_contract, validate_external_agent_execution_request,
 };
 use eliot_types::{
     AdapterAuthorityProfile, AdapterCapability, AdapterClass, AdapterError, AdapterHealth,
@@ -62,6 +61,7 @@ struct ExternalAgentAdapterCore {
     governor_executable: PathBuf,
     config_path: PathBuf,
     manifest: eliot_types::CapabilityManifest,
+    process_runner: Arc<dyn ProviderProcessRunner>,
 }
 
 #[derive(Clone)]
@@ -106,16 +106,24 @@ pub(crate) fn production_external_agent_supervisor(
     config_path: &Path,
 ) -> Result<AdapterSupervisor> {
     let governor_executable = resolved_governor_executable()?;
+    let process_runner: Arc<dyn ProviderProcessRunner> =
+        Arc::new(super::supervised_process::SupervisedWindowsProcessRunner::new(config_path)?);
     let mut registry = AdapterRegistry::new();
     registry.register(ClaudeCodeCliAdapter::new(
         config_path,
         &governor_executable,
+        Arc::clone(&process_runner),
     )?)?;
     registry.register(AntigravityCliAdapter::new(
         config_path,
         &governor_executable,
+        Arc::clone(&process_runner),
     )?)?;
-    registry.register(OpenCodeCliAdapter::new(config_path, &governor_executable)?)?;
+    registry.register(OpenCodeCliAdapter::new(
+        config_path,
+        &governor_executable,
+        process_runner,
+    )?)?;
     Ok(AdapterSupervisor::with_runtime(
         registry,
         super::supervised_process::daemon_operation_runtime_handle(config_path)?,
@@ -159,7 +167,14 @@ pub(crate) fn prepare_external_agent_runtime(
         "Codex does not use an external-agent adapter"
     );
     validate_external_agent_execution_request(execution)?;
-    let core = ExternalAgentAdapterCore::new(host, config_path, &resolved_governor_executable()?)?;
+    let process_runner: Arc<dyn ProviderProcessRunner> =
+        Arc::new(super::supervised_process::SupervisedWindowsProcessRunner::new(config_path)?);
+    let core = ExternalAgentAdapterCore::new(
+        host,
+        config_path,
+        &resolved_governor_executable()?,
+        process_runner,
+    )?;
     let prepared = core.prepare_governed(execution)?;
     Ok(ExternalAgentRuntimePreview {
         adapter_id: core.adapter_id,
@@ -357,7 +372,7 @@ async fn run_bounded_mcp_child(
                 base_backoff_ms: 100,
                 pre_dispatch_only: true,
             },
-            executable,
+            executable: executable.clone(),
             args,
             cwd,
             environment,
@@ -1441,7 +1456,10 @@ async fn run_auth_smoke(config_path: &Path, host: AgentHostId, model: &str) -> R
         "auth-smoke requires an exact non-empty model"
     );
     let governor = std::env::current_exe()?.canonicalize()?;
-    let core = ExternalAgentAdapterCore::new(host, config_path, &governor)?;
+    let process_runner: Arc<dyn ProviderProcessRunner> =
+        Arc::new(super::supervised_process::SupervisedWindowsProcessRunner::new(config_path)?);
+    let core =
+        ExternalAgentAdapterCore::new(host, config_path, &governor, Arc::clone(&process_runner))?;
     let executable = core
         .executable
         .context("headless provider executable is not installed")?;
@@ -1523,36 +1541,38 @@ async fn run_auth_smoke(config_path: &Path, host: AgentHostId, model: &str) -> R
         environment.insert("OPENCODE_CONFIG_DIR".to_owned(), path_string(&config_dir));
         environment.insert("XDG_CONFIG_HOME".to_owned(), path_string(&xdg));
     }
-    let mut command = Command::new(&executable);
-    command
-        .args(&plan.argv)
-        .current_dir(&workspace)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .env_clear();
-    for (name, value) in &environment {
-        command.env(name, value);
-    }
     let operation_id = format!("auth-smoke-{auth_id}");
-    let output = run_external_agent_process(
-        command,
-        operation_id.clone(),
-        Duration::from_secs(120),
-        Duration::from_secs(PROVIDER_CLEANUP_GRACE_SECONDS),
-        Some(AdapterExecutionContext {
-            operation_id,
-            generation: 1,
-            cancellation: eliot_engine::runtime_supervision::CancellationToken::new(),
-            deadline: tokio::time::Instant::now() + Duration::from_secs(120),
-            runtime_store: super::supervised_process::daemon_operation_runtime_handle(config_path)?,
-            role_lease_id: None,
-            role_lease_epoch: None,
-            runtime_contract_sha256: None,
-        }),
-        |_| Ok(()),
-    )
-    .await?;
+    let route_policy = eliot_types::ProviderRoutePolicy::for_route(
+        host,
+        "external-agent-auth-smoke",
+        eliot_types::ProviderDeclaredBudget::new(120_000, MAX_PROVIDER_OUTPUT_BYTES)
+            .with_cleanup_grace_ms(PROVIDER_CLEANUP_GRACE_SECONDS * 1_000),
+    );
+    let mut on_spawned = |_| Ok(());
+    let output = process_runner
+        .run(
+            ProviderProcessSpec {
+                operation_id,
+                invocation_id: Some(auth_id.clone()),
+                executable,
+                args: plan.argv.into_iter().map(OsString::from).collect(),
+                cwd: workspace,
+                environment: environment
+                    .into_iter()
+                    .map(|(name, value)| (OsString::from(name), OsString::from(value)))
+                    .collect(),
+                stdin_payload: None,
+                route_policy,
+                cancellation: eliot_engine::runtime_supervision::CancellationToken::new(),
+                deadline: tokio::time::Instant::now() + Duration::from_secs(120),
+                runtime_contract_sha256: None,
+                role_lease_id: None,
+                role_lease_epoch: None,
+            },
+            &mut on_spawned,
+        )
+        .await
+        .map_err(|error| anyhow::anyhow!(error.to_string()))?;
     anyhow::ensure!(
         output.exit_code == Some(0) && !output.timed_out,
         "{}; login command: {}",
@@ -1580,7 +1600,7 @@ async fn run_auth_smoke(config_path: &Path, host: AgentHostId, model: &str) -> R
         "provider_calls": 1,
         "stdout_sha256": sha256_bytes(&output.stdout),
         "stderr_sha256": sha256_bytes(&output.stderr),
-        "process_tree_terminated": output.process_tree_terminated,
+        "process_tree_terminated": output.reap_receipt.proves_complete_reap(),
         "reap_receipt": output.reap_receipt,
         "gui_used": false,
     });
@@ -1602,36 +1622,51 @@ fn provider_login_command(host: AgentHostId) -> &'static str {
 }
 
 impl ClaudeCodeCliAdapter {
-    fn new(config_path: &Path, governor_executable: &Path) -> Result<Self> {
+    fn new(
+        config_path: &Path,
+        governor_executable: &Path,
+        process_runner: Arc<dyn ProviderProcessRunner>,
+    ) -> Result<Self> {
         Ok(Self {
             core: ExternalAgentAdapterCore::new(
                 AgentHostId::Claude,
                 config_path,
                 governor_executable,
+                process_runner,
             )?,
         })
     }
 }
 
 impl AntigravityCliAdapter {
-    fn new(config_path: &Path, governor_executable: &Path) -> Result<Self> {
+    fn new(
+        config_path: &Path,
+        governor_executable: &Path,
+        process_runner: Arc<dyn ProviderProcessRunner>,
+    ) -> Result<Self> {
         Ok(Self {
             core: ExternalAgentAdapterCore::new(
                 AgentHostId::Antigravity,
                 config_path,
                 governor_executable,
+                process_runner,
             )?,
         })
     }
 }
 
 impl OpenCodeCliAdapter {
-    fn new(config_path: &Path, governor_executable: &Path) -> Result<Self> {
+    fn new(
+        config_path: &Path,
+        governor_executable: &Path,
+        process_runner: Arc<dyn ProviderProcessRunner>,
+    ) -> Result<Self> {
         Ok(Self {
             core: ExternalAgentAdapterCore::new(
                 AgentHostId::OpenCode,
                 config_path,
                 governor_executable,
+                process_runner,
             )?,
         })
     }
@@ -1672,13 +1707,18 @@ impl_external_adapter!(AntigravityCliAdapter);
 impl_external_adapter!(OpenCodeCliAdapter);
 
 impl ExternalAgentAdapterCore {
-    fn new(host: AgentHostId, config_path: &Path, governor_executable: &Path) -> Result<Self> {
+    fn new(
+        host: AgentHostId,
+        config_path: &Path,
+        governor_executable: &Path,
+        process_runner: Arc<dyn ProviderProcessRunner>,
+    ) -> Result<Self> {
         let executable = discover_provider_binary(host)?;
         let version = executable
             .as_deref()
-            .map(provider_version)
+            .map(sha256_file)
             .transpose()?
-            .filter(|value| !value.trim().is_empty());
+            .map(|sha256| format!("executable-sha256:{sha256}"));
         let adapter_id = adapter_id(host).to_owned();
         let manifest = provider_manifest(host, &adapter_id, executable.as_deref());
         Ok(Self {
@@ -1689,6 +1729,7 @@ impl ExternalAgentAdapterCore {
             governor_executable: governor_executable.to_path_buf(),
             config_path: config_path.to_path_buf(),
             manifest,
+            process_runner,
         })
     }
 
@@ -1912,57 +1953,49 @@ impl ExternalAgentAdapterCore {
             return Err(error);
         }
         let worktree_before = worktree_snapshot_if_git(&cwd)?;
-        let mut command = Command::new(&executable);
-        command
-            .args(&plan.argv)
-            .current_dir(&cwd)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .env_clear();
-        for (name, value) in &environment {
-            command.env(name, value);
-        }
         reservation_owner.mark_dispatching(&reservation.reservation_id)?;
         journal.transition(
             &mut attempt,
             ProviderInvocationState::DispatchStarting,
             vec![runtime_contract.runtime_contract_sha256.clone()],
         )?;
-        let absolute_timeout =
-            Duration::from_secs(execution.launch_contract.wall_clock_budget_seconds.max(1));
-        let process = run_external_agent_process(
-            command,
-            context.operation_id.clone(),
-            absolute_timeout,
-            Duration::from_secs(PROVIDER_CLEANUP_GRACE_SECONDS),
-            Some(context),
-            |pid| {
-                reservation_owner
-                    .mark_dispatched(&reservation.reservation_id, &attempt_id)
-                    .map_err(|error| anyhow::anyhow!(error.to_string()))?;
-                let now = OffsetDateTime::now_utc();
-                attempt.dispatch_started_at = Some(now);
-                attempt.process_started_at = Some(now);
-                attempt.external_invocation_ref = Some(attempt_id.clone());
-                attempt.process_or_job_identity = Some(format!("pid:{pid}"));
-                journal
-                    .transition(
-                        &mut attempt,
-                        ProviderInvocationState::Dispatched,
-                        vec![format!("pid:{pid}")],
-                    )
-                    .map_err(|error| anyhow::anyhow!(error.to_string()))?;
-                journal
-                    .transition(
-                        &mut attempt,
-                        ProviderInvocationState::Running,
-                        vec![format!("pid:{pid}")],
-                    )
-                    .map_err(|error| anyhow::anyhow!(error.to_string()))
-            },
-        )
-        .await;
+        let process_spec = ProviderProcessSpec {
+            operation_id: context.operation_id.clone(),
+            invocation_id: Some(attempt_id.clone()),
+            executable: executable.clone(),
+            args: plan.argv.iter().map(OsString::from).collect(),
+            cwd: cwd.clone(),
+            environment: environment
+                .iter()
+                .map(|(name, value)| (OsString::from(name), OsString::from(value)))
+                .collect(),
+            stdin_payload: None,
+            route_policy: execution.provider_route_policy.clone(),
+            cancellation: context.cancellation.clone(),
+            deadline: context.deadline,
+            runtime_contract_sha256: context.runtime_contract_sha256.clone(),
+            role_lease_id: context.role_lease_id.clone(),
+            role_lease_epoch: context.role_lease_epoch,
+        };
+        let mut on_spawned = |pid| {
+            reservation_owner.mark_dispatched(&reservation.reservation_id, &attempt_id)?;
+            let now = OffsetDateTime::now_utc();
+            attempt.dispatch_started_at = Some(now);
+            attempt.process_started_at = Some(now);
+            attempt.external_invocation_ref = Some(attempt_id.clone());
+            attempt.process_or_job_identity = Some(format!("pid:{pid}"));
+            journal.transition(
+                &mut attempt,
+                ProviderInvocationState::Dispatched,
+                vec![format!("pid:{pid}")],
+            )?;
+            journal.transition(
+                &mut attempt,
+                ProviderInvocationState::Running,
+                vec![format!("pid:{pid}")],
+            )
+        };
+        let process = self.process_runner.run(process_spec, &mut on_spawned).await;
         let process = match process {
             Ok(process) => process,
             Err(error) => {
@@ -1991,15 +2024,16 @@ impl ExternalAgentAdapterCore {
                 )));
             }
         };
-        attempt.process_exit_at = Some(OffsetDateTime::now_utc());
-        attempt.cleanup_completed_at = Some(OffsetDateTime::now_utc());
+        attempt.process_started_at = Some(process.process_started_at);
+        attempt.process_exit_at = process.process_exit_at;
+        attempt.cleanup_completed_at = Some(process.cleanup_completed_at);
         attempt.exit_code_or_signal = process.exit_code.map(|code| code.to_string());
         attempt.process_or_job_identity = Some(format!(
             "pid:{};job={};terminated={};observed={}",
-            process.root_pid,
+            process.reap_receipt.root_pid.unwrap_or_default(),
             process.reap_receipt.job_object_name,
-            process.process_tree_terminated,
-            process.observed_processes.join("|")
+            process.reap_receipt.proves_complete_reap(),
+            process.observed_processes.len()
         ));
 
         let stdout_capture = ProviderOutputSpool.capture(
@@ -2365,7 +2399,7 @@ impl ExternalAgentAdapterCore {
         request: &AdapterRequest,
         execution: &ExternalAgentExecutionRequest,
         runtime_contract: &ProviderRuntimeContract,
-        process: &ManagedExternalAgentOutput,
+        process: &ProviderProcessOutcome,
         stdout: &eliot_engine::ProviderOutputCapture,
         stderr: &eliot_engine::ProviderOutputCapture,
         structured: Option<&eliot_engine::ProviderOutputCapture>,
@@ -2427,7 +2461,7 @@ impl ExternalAgentAdapterCore {
             token_or_cost_telemetry: parsed
                 .as_ref()
                 .and_then(|parsed| parsed.token_or_cost_telemetry.clone()),
-            duration_ms: process.duration_ms,
+            duration_ms: process.reap_receipt.elapsed_ms,
         };
         let agent_result = AgentResultEnvelope {
             result_id: deterministic_external_result_id(execution),
@@ -2528,7 +2562,7 @@ impl ExternalAgentAdapterCore {
                 message,
                 retryable: false,
             }),
-            duration_ms: process.duration_ms,
+            duration_ms: process.reap_receipt.elapsed_ms,
             trace_id: request.context.trace_id.clone(),
             created_at: OffsetDateTime::now_utc(),
         })
@@ -3251,19 +3285,6 @@ fn validate_provider_binary(host: AgentHostId, path: &Path) -> Result<PathBuf> {
     Ok(path)
 }
 
-fn provider_version(path: &Path) -> Result<String> {
-    let output = Command::new(path).arg("--version").output()?;
-    anyhow::ensure!(
-        output.status.success(),
-        "{} --version exited {}",
-        path.display(),
-        output.status
-    );
-    let version = String::from_utf8_lossy(&output.stdout).trim().to_owned();
-    anyhow::ensure!(!version.is_empty(), "provider --version returned no text");
-    Ok(version)
-}
-
 fn canonical_bound_file(value: &str, label: &str) -> Result<PathBuf, eliot_engine::EngineError> {
     let path = Path::new(value);
     if !path.is_absolute() {
@@ -3374,7 +3395,7 @@ fn worktree_snapshot_if_git(
     )))
 }
 
-fn provider_failure_message(process: &ManagedExternalAgentOutput) -> String {
+fn provider_failure_message(process: &ProviderProcessOutcome) -> String {
     let stderr = String::from_utf8_lossy(&process.stderr);
     if stderr
         .to_ascii_lowercase()

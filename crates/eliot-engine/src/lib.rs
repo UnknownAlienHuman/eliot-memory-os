@@ -59,12 +59,12 @@ pub use antigravity::{
     AntigravityEnablementService, AntigravityEnvPolicyService, AntigravityExecutionGate,
     AntigravityGuiProcessProbeService, AntigravityLiveSmokeService, AntigravityMcpBoundaryService,
     AntigravityMcpConfigService, AntigravityOfficialCliInstallerService,
-    AntigravityOfficialPluginService, AntigravityProcessExecutor, AntigravityRealExecutionDoctor,
-    AntigravityRollbackService, AntigravityRunner, AntigravitySafetyPolicy,
-    AntigravitySupervisedProcessOutput, AntigravitySupervisedProcessSpec,
-    AntigravityTelemetryService, AntigravityTextOutputNormalizer, AntigravityVersionGateService,
-    AntigravityVisibilityService, AntigravityWindowsInstallDiscoveryService,
-    antigravity_real_report, antigravity_report, antigravity_review_request,
+    AntigravityOfficialPluginService, AntigravityRealExecutionDoctor, AntigravityRollbackService,
+    AntigravityRunner, AntigravitySafetyPolicy, AntigravityTelemetryService,
+    AntigravityTextOutputNormalizer, AntigravityVersionGateService, AntigravityVisibilityService,
+    AntigravityWindowsInstallDiscoveryService, BoxProviderProcessFuture, ProviderProcessOutcome,
+    ProviderProcessRunner, ProviderProcessSpec, antigravity_real_report, antigravity_report,
+    antigravity_review_request,
 };
 pub use codecortex::{CodeCortexMemoryWriter, CodeCortexService};
 pub use cognition::{

@@ -28,17 +28,20 @@ use eliot_types::{
     AntigravityVersionGateStatus, AntigravityVisibilityReport, AntigravityWindowsInstallDiscovery,
     AntigravityWorkdirPolicy, BlobRef, CandidateDiff, ExternalOutputSchemaKind,
     ExternalReviewBudget, ExternalReviewJob, ExternalReviewJobStatus, ExternalReviewRequest,
-    ExternalReviewRole, ProjectId, ProviderInvocationAttempt, ProviderInvocationState, TaintClass,
-    TaskId, WorkLease, WorkLeaseId, WorktreeLease, WorktreeLeaseId, WorktreeLeaseState, WriteId,
-    inspect_secret_bytes,
+    ExternalReviewRole, ProcessReapReceipt, ProjectId, ProviderInvocationAttempt,
+    ProviderInvocationState, ProviderRoutePolicy, TaintClass, TaskId, WorkLease, WorkLeaseId,
+    WorktreeLease, WorktreeLeaseId, WorktreeLeaseState, WriteId, inspect_secret_bytes,
 };
 use serde_json::{Value, json};
 use std::collections::BTreeSet;
+use std::ffi::OsString;
 use std::fs::{self, OpenOptions};
+use std::future::Future;
 use std::io::Write;
 #[cfg(test)]
 use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::process::{Command as ProcessCommand, Stdio};
 use std::time::{Duration as StdDuration, Instant};
 use time::{Duration, OffsetDateTime};
@@ -124,15 +127,21 @@ pub struct AntigravityExecutionGate;
 #[derive(Clone, Copy, Debug, Default)]
 pub struct AntigravityRunner;
 
-#[derive(Clone, Debug)]
-pub struct AntigravitySupervisedProcessSpec {
+#[derive(Clone)]
+pub struct ProviderProcessSpec {
     pub operation_id: String,
+    pub invocation_id: Option<String>,
     pub executable: PathBuf,
-    pub args: Vec<String>,
+    pub args: Vec<OsString>,
     pub cwd: PathBuf,
-    pub environment: Vec<(String, String)>,
-    pub timeout_ms: u64,
-    pub max_output_bytes: u64,
+    pub environment: Vec<(OsString, OsString)>,
+    pub stdin_payload: Option<Vec<u8>>,
+    pub route_policy: ProviderRoutePolicy,
+    pub cancellation: crate::runtime_supervision::CancellationToken,
+    pub deadline: tokio::time::Instant,
+    pub runtime_contract_sha256: Option<String>,
+    pub role_lease_id: Option<String>,
+    pub role_lease_epoch: Option<u64>,
 }
 
 #[derive(Clone, Debug)]
@@ -140,24 +149,35 @@ pub struct AntigravitySupervisedProcessSpec {
     clippy::struct_excessive_bools,
     reason = "the process result records independent bounded-cleanup outcomes"
 )]
-pub struct AntigravitySupervisedProcessOutput {
+pub struct ProviderProcessOutcome {
     pub exit_code: Option<i32>,
     pub stdout: Vec<u8>,
     pub stderr: Vec<u8>,
+    pub stdout_total_bytes: u64,
+    pub stderr_total_bytes: u64,
     pub stdout_truncated: bool,
     pub stderr_truncated: bool,
     pub timed_out: bool,
-    pub root_pid: u32,
-    pub job_object_name: String,
-    pub reap_complete: bool,
+    pub cancelled: bool,
+    pub worker_error: Option<String>,
+    pub observed_processes: Vec<eliot_windows_ipc::ProcessImageIdentity>,
+    pub process_started_at: OffsetDateTime,
+    pub first_output_at: Option<OffsetDateTime>,
+    pub last_output_at: Option<OffsetDateTime>,
+    pub process_exit_at: Option<OffsetDateTime>,
+    pub cleanup_completed_at: OffsetDateTime,
+    pub reap_receipt: ProcessReapReceipt,
 }
 
-pub trait AntigravityProcessExecutor {
-    fn execute(
-        &self,
-        spec: AntigravitySupervisedProcessSpec,
-        on_spawned: &mut (dyn FnMut(u32) -> Result<(), EngineError> + Send),
-    ) -> Result<AntigravitySupervisedProcessOutput, EngineError>;
+pub type BoxProviderProcessFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<ProviderProcessOutcome, EngineError>> + Send + 'a>>;
+
+pub trait ProviderProcessRunner: Send + Sync {
+    fn run<'a>(
+        &'a self,
+        spec: ProviderProcessSpec,
+        on_spawned: &'a mut (dyn FnMut(u32) -> Result<(), EngineError> + Send),
+    ) -> BoxProviderProcessFuture<'a>;
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -596,6 +616,61 @@ impl AntigravityVersionGateService {
             },
         }
     }
+
+    pub async fn probe_supervised(
+        &self,
+        binary: &Path,
+        runner: &dyn ProviderProcessRunner,
+    ) -> AntigravityVersionGateResult {
+        match run_supervised_provider_probe(
+            binary,
+            "--version",
+            "antigravity-version-probe",
+            VERSION_PROBE_TIMEOUT_MS,
+            runner,
+        )
+        .await
+        {
+            Ok((output, true, _)) => AntigravityVersionGateResult {
+                component: "antigravity_version_gate".to_owned(),
+                command: format!("{} --version", path_for_record(binary)),
+                raw_output: truncate_text(&output, 2_000),
+                parsed_version: None,
+                minimum_version: MINIMUM_AGY_VERSION_TEXT.to_owned(),
+                status: AntigravityVersionGateStatus::ProbeTimedOut,
+                allowed: false,
+                reasons: vec!["Antigravity CLI version probe timed out".to_owned()],
+                checked_at: OffsetDateTime::now_utc(),
+            },
+            Ok((output, false, true)) => {
+                let mut result = self.evaluate_output(&output);
+                result.command = format!("{} --version", path_for_record(binary));
+                result
+            }
+            Ok((output, false, false)) => AntigravityVersionGateResult {
+                component: "antigravity_version_gate".to_owned(),
+                command: format!("{} --version", path_for_record(binary)),
+                raw_output: truncate_text(&output, 2_000),
+                parsed_version: None,
+                minimum_version: MINIMUM_AGY_VERSION_TEXT.to_owned(),
+                status: AntigravityVersionGateStatus::ProbeFailed,
+                allowed: false,
+                reasons: vec!["Antigravity CLI version probe returned failure".to_owned()],
+                checked_at: OffsetDateTime::now_utc(),
+            },
+            Err(error) => AntigravityVersionGateResult {
+                component: "antigravity_version_gate".to_owned(),
+                command: format!("{} --version", path_for_record(binary)),
+                raw_output: String::new(),
+                parsed_version: None,
+                minimum_version: MINIMUM_AGY_VERSION_TEXT.to_owned(),
+                status: AntigravityVersionGateStatus::ProbeFailed,
+                allowed: false,
+                reasons: vec![format!("Antigravity CLI version probe failed: {error}")],
+                checked_at: OffsetDateTime::now_utc(),
+            },
+        }
+    }
 }
 
 impl AntigravityOfficialCliInstallerService {
@@ -654,6 +729,55 @@ impl AntigravityCapabilityProbeService {
                     self.probe_from_help(binary_path, &text)
                 }
             }
+            Err(error) => AntigravityCapabilityProbe {
+                provider_state: AntigravityProviderState::Incompatible,
+                binary_path: Some(binary_path.clone()),
+                help_probe_command: Some(format!("{binary_path} --help")),
+                capabilities: AntigravityCapabilities::default(),
+                timeout_enforced: true,
+                plain_agy_invoked: false,
+                install_attempted: false,
+                output_excerpt: String::new(),
+                message: format!("Antigravity help probe failed: {error}"),
+                probed_at: OffsetDateTime::now_utc(),
+            },
+        }
+    }
+
+    pub async fn probe_from_resolution_supervised(
+        &self,
+        resolution: &AntigravityBinaryResolution,
+        runner: &dyn ProviderProcessRunner,
+    ) -> AntigravityCapabilityProbe {
+        let Some(binary_path) = &resolution.selected_path else {
+            return Self::disabled_probe(
+                resolution,
+                AntigravityProviderState::NotInstalled,
+                "no Antigravity CLI binary selected",
+            );
+        };
+        match run_supervised_provider_probe(
+            Path::new(binary_path),
+            "--help",
+            "antigravity-help-probe",
+            HELP_PROBE_TIMEOUT_MS,
+            runner,
+        )
+        .await
+        {
+            Ok((text, true, _)) => AntigravityCapabilityProbe {
+                provider_state: AntigravityProviderState::Incompatible,
+                binary_path: Some(binary_path.clone()),
+                help_probe_command: Some(format!("{binary_path} --help")),
+                capabilities: AntigravityCapabilities::default(),
+                timeout_enforced: true,
+                plain_agy_invoked: false,
+                install_attempted: false,
+                output_excerpt: truncate_text(&text, 2_000),
+                message: "Antigravity help probe timed out".to_owned(),
+                probed_at: OffsetDateTime::now_utc(),
+            },
+            Ok((text, false, _)) => self.probe_from_help(binary_path, &text),
             Err(error) => AntigravityCapabilityProbe {
                 provider_state: AntigravityProviderState::Incompatible,
                 binary_path: Some(binary_path.clone()),
@@ -2056,540 +2180,6 @@ impl AntigravityRealExecutionDoctor {
 }
 
 impl AntigravityRunner {
-    #[cfg(any())]
-    #[allow(clippy::too_many_lines)]
-    pub fn run_real(
-        &self,
-        request: &AntigravityReviewRequest,
-        contract: &AntigravityCommandContract,
-        worktree_lease: &WorktreeLease,
-        effective_cwd: &Path,
-    ) -> Result<AntigravityRun, EngineError> {
-        if std::env::var_os("ELIOT_DISABLE_REAL_PROVIDER").is_some() {
-            return Err(rejected(
-                "real Antigravity execution is disabled for provider-free verification",
-            ));
-        }
-        inspect_secret_bytes(request.question.as_bytes()).map_err(|violation| {
-            rejected(&format!(
-                "secret boundary rejected provider input: {}",
-                violation.rule
-            ))
-        })?;
-        let effective_cwd = validate_real_worktree(request, worktree_lease, effective_cwd)?;
-        let argv =
-            AntigravityCommandContractService.typed_review_argv(contract, &request.question)?;
-        let binary = argv
-            .first()
-            .ok_or_else(|| rejected("Antigravity real run has no binary argv"))?;
-        let version_gate = AntigravityVersionGateService.probe(Path::new(binary));
-        if !version_gate.allowed {
-            return Err(rejected(&format!(
-                "Antigravity version gate blocked real execution: {}",
-                version_gate.reasons.join("; ")
-            )));
-        }
-        let source_env = std::env::vars().collect::<Vec<_>>();
-        let mut process_env = AntigravityEnvPolicyService.minimal_windows_env(&source_env);
-        for fixed in &contract.env_policy.fixed_vars {
-            if !process_env.iter().any(|(name, _)| name == &fixed.0) {
-                process_env.push(fixed.clone());
-            }
-        }
-        let dropped_names = AntigravityEnvPolicyService.minimal_windows_dropped_names(&source_env);
-        let mut command = ProcessCommand::new(binary);
-        command
-            .args(argv.iter().skip(1))
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .current_dir(&effective_cwd)
-            .env_clear();
-        for (name, value) in &process_env {
-            command.env(name, value);
-        }
-        let started = OffsetDateTime::now_utc();
-        let mut child = command.spawn()?;
-        let deadline = Instant::now() + StdDuration::from_millis(DEFAULT_TIMEOUT_MS);
-        let (stdout, stderr, timed_out, exit_success) = loop {
-            if let Some(status) = child.try_wait()? {
-                let output = child.wait_with_output()?;
-                break (
-                    String::from_utf8_lossy(&output.stdout).into_owned(),
-                    String::from_utf8_lossy(&output.stderr).into_owned(),
-                    false,
-                    status.success(),
-                );
-            }
-            if Instant::now() >= deadline {
-                terminate_process_tree(&mut child);
-                let output = child.wait_with_output()?;
-                break (
-                    String::from_utf8_lossy(&output.stdout).into_owned(),
-                    String::from_utf8_lossy(&output.stderr).into_owned(),
-                    true,
-                    false,
-                );
-            }
-            std::thread::sleep(StdDuration::from_millis(25));
-        };
-        if let Some(violation) = inspect_secret_bytes(stdout.as_bytes())
-            .err()
-            .or_else(|| inspect_secret_bytes(stderr.as_bytes()).err())
-        {
-            return Err(rejected(&format!(
-                "secret boundary rejected provider output: {}",
-                violation.rule
-            )));
-        }
-        let redacted_stdout = redact_output(&stdout);
-        let redacted_stderr = redact_output(&stderr);
-        let redaction_receipt =
-            merge_redaction_receipts(&redacted_stdout.receipt, &redacted_stderr.receipt);
-        let combined = output_text(
-            redacted_stdout.text.as_bytes(),
-            redacted_stderr.text.as_bytes(),
-        );
-        let normalized = AntigravityTextOutputNormalizer.normalize_text(request, &combined);
-        let state = if timed_out {
-            AntigravityRunState::TimedOut
-        } else if exit_success {
-            AntigravityRunState::Succeeded
-        } else {
-            AntigravityRunState::Failed
-        };
-        let (receipt_argv, prompt_hash_blake3) = safety_argv_receipt(&argv, &request.question);
-        Ok(AntigravityRun {
-            run_id: new_id("antigravity-run"),
-            request_id: request.request_id.clone(),
-            state,
-            provider_state: if exit_success {
-                AntigravityProviderState::ReadyEnabled
-            } else {
-                AntigravityProviderState::DetectedDisabled
-            },
-            dry_run: false,
-            fixture_runner: false,
-            binary_path: contract.binary_path.clone(),
-            effective_cwd: path_for_record(&effective_cwd),
-            stdout_blob_ref: Some(blob_ref(
-                "antigravity/stdout.txt",
-                redacted_stdout.text.len(),
-            )),
-            stderr_blob_ref: Some(blob_ref(
-                "antigravity/stderr.txt",
-                redacted_stderr.text.len(),
-            )),
-            log_blob_ref: Some(blob_ref("antigravity/log.txt", combined.len())),
-            stdout_excerpt: truncate_text(&redacted_stdout.text, 2_000),
-            stderr_excerpt: truncate_text(&redacted_stderr.text, 2_000),
-            safety_receipt: AntigravitySafetyReceipt {
-                typed_argv: receipt_argv,
-                prompt_hash_blake3,
-                shell_false: true,
-                stdin_devnull: true,
-                process_group_kill_on_timeout: true,
-                timeout_ms: DEFAULT_TIMEOUT_MS,
-                max_output_bytes: DEFAULT_MAX_OUTPUT_BYTES,
-                effective_cwd: path_for_record(&effective_cwd),
-                env_fixed_vars: process_env,
-                env_dropped_names: dropped_names,
-            },
-            redaction_receipt,
-            normalized_result: Some(normalized),
-            message: if timed_out {
-                "real Antigravity run timed out and process was killed".to_owned()
-            } else if exit_success {
-                "real Antigravity run completed through governed connector".to_owned()
-            } else {
-                "real Antigravity run failed; output captured for auth/provider mapping".to_owned()
-            },
-            created_at: started,
-            completed_at: Some(OffsetDateTime::now_utc()),
-        })
-    }
-
-    #[cfg(any())]
-    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
-    pub fn run_real_recorded(
-        &self,
-        request: &AntigravityReviewRequest,
-        contract: &AntigravityCommandContract,
-        worktree_lease: &WorktreeLease,
-        effective_cwd: &Path,
-        data_root: &Path,
-        reservation_owner: &ProviderCallReservationOwner,
-        reservation_id: &str,
-        journal: &ProviderInvocationJournal,
-        attempt: &mut ProviderInvocationAttempt,
-    ) -> Result<AntigravityRun, EngineError> {
-        if std::env::var_os("ELIOT_DISABLE_REAL_PROVIDER").is_some() {
-            return Err(rejected(
-                "real Antigravity execution is disabled for provider-free verification",
-            ));
-        }
-        inspect_secret_bytes(request.question.as_bytes()).map_err(|violation| {
-            rejected(&format!(
-                "secret boundary rejected provider input: {}",
-                violation.rule
-            ))
-        })?;
-        let effective_cwd = validate_real_worktree(request, worktree_lease, effective_cwd)?;
-        let argv =
-            AntigravityCommandContractService.typed_review_argv(contract, &request.question)?;
-        let binary = argv
-            .first()
-            .ok_or_else(|| rejected("Antigravity real run has no binary argv"))?;
-        let version_gate = AntigravityVersionGateService.probe(Path::new(binary));
-        if !version_gate.allowed {
-            return Err(rejected(&format!(
-                "Antigravity version gate blocked real execution: {}",
-                version_gate.reasons.join("; ")
-            )));
-        }
-        let source_env = std::env::vars().collect::<Vec<_>>();
-        let mut process_env = AntigravityEnvPolicyService.minimal_windows_env(&source_env);
-        for fixed in &contract.env_policy.fixed_vars {
-            if !process_env.iter().any(|(name, _)| name == &fixed.0) {
-                process_env.push(fixed.clone());
-            }
-        }
-        let dropped_names = AntigravityEnvPolicyService.minimal_windows_dropped_names(&source_env);
-        let mut command = ProcessCommand::new(binary);
-        command
-            .args(argv.iter().skip(1))
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .current_dir(&effective_cwd)
-            .env_clear();
-        for (name, value) in &process_env {
-            command.env(name, value);
-        }
-
-        journal.transition(
-            attempt,
-            ProviderInvocationState::DispatchStarting,
-            vec!["durable dispatch-starting receipt precedes process spawn".to_owned()],
-        )?;
-        let started = OffsetDateTime::now_utc();
-        let mut child = match command.spawn() {
-            Ok(child) => child,
-            Err(error) => {
-                let reason = format!("provider process spawn failed: {error}");
-                let _ = reservation_owner.mark_unknown_outcome(reservation_id, &reason);
-                journal.transition(
-                    attempt,
-                    ProviderInvocationState::DispatchAckUnknown,
-                    vec![reason],
-                )?;
-                return Err(error.into());
-            }
-        };
-        attempt.process_started_at = Some(started);
-        attempt.process_or_job_identity = Some(format!("pid:{};process_tree=taskkill", child.id()));
-        if let Err(error) = reservation_owner.mark_dispatched(reservation_id, &request.request_id) {
-            terminate_process_tree(&mut child);
-            let reason = format!("provider started but dispatch receipt failed: {error}");
-            let _ = reservation_owner.mark_unknown_outcome(reservation_id, &reason);
-            journal.transition(
-                attempt,
-                ProviderInvocationState::DispatchAckUnknown,
-                vec![reason],
-            )?;
-            return Err(error);
-        }
-        attempt.dispatch_started_at = Some(started);
-        attempt.external_invocation_ref = Some(request.request_id.clone());
-        abort_spawned_on_record_error(
-            journal.persist(attempt),
-            &mut child,
-            reservation_owner,
-            reservation_id,
-            "persisting dispatch receipt",
-        )?;
-        abort_spawned_on_record_error(
-            journal.transition(
-                attempt,
-                ProviderInvocationState::Dispatched,
-                vec![format!("external_invocation_ref:{}", request.request_id)],
-            ),
-            &mut child,
-            reservation_owner,
-            reservation_id,
-            "recording dispatched state",
-        )?;
-        abort_spawned_on_record_error(
-            journal.transition(
-                attempt,
-                ProviderInvocationState::Running,
-                vec![format!("pid:{}", child.id())],
-            ),
-            &mut child,
-            reservation_owner,
-            reservation_id,
-            "recording running state",
-        )?;
-
-        let Some(stdout) = child.stdout.take() else {
-            terminate_process_tree(&mut child);
-            let reason = "provider stdout pipe was not created".to_owned();
-            let _ = reservation_owner.mark_unknown_outcome(reservation_id, &reason);
-            journal.transition(
-                attempt,
-                ProviderInvocationState::LocalCaptureFailed,
-                vec![reason.clone()],
-            )?;
-            return Err(rejected(&reason));
-        };
-        let Some(stderr) = child.stderr.take() else {
-            terminate_process_tree(&mut child);
-            let reason = "provider stderr pipe was not created".to_owned();
-            let _ = reservation_owner.mark_unknown_outcome(reservation_id, &reason);
-            journal.transition(
-                attempt,
-                ProviderInvocationState::LocalCaptureFailed,
-                vec![reason.clone()],
-            )?;
-            return Err(rejected(&reason));
-        };
-        let stdout_root = data_root.to_path_buf();
-        let stderr_root = data_root.to_path_buf();
-        let stdout_attempt = attempt.invocation_attempt_id.clone();
-        let stderr_attempt = attempt.invocation_attempt_id.clone();
-        let stdout_handle = std::thread::spawn(move || {
-            ProviderOutputSpool.capture(
-                &stdout_root,
-                &stdout_attempt,
-                "stdout",
-                stdout,
-                DEFAULT_MAX_OUTPUT_BYTES as u64,
-            )
-        });
-        let stderr_handle = std::thread::spawn(move || {
-            ProviderOutputSpool.capture(
-                &stderr_root,
-                &stderr_attempt,
-                "stderr",
-                stderr,
-                DEFAULT_MAX_OUTPUT_BYTES as u64,
-            )
-        });
-        let safe_attempt = safe_invocation_component(&attempt.invocation_attempt_id);
-        let stdout_path = data_root.join(format!(
-            "spool/provider-invocations/{safe_attempt}/stdout.bin"
-        ));
-        let stderr_path = data_root.join(format!(
-            "spool/provider-invocations/{safe_attempt}/stderr.bin"
-        ));
-        let deadline = Instant::now() + StdDuration::from_millis(DEFAULT_TIMEOUT_MS);
-        let mut timed_out = false;
-        let mut output_recorded = false;
-        let mut last_observed_bytes = 0_u64;
-        let status_result = loop {
-            let observed_bytes = file_len(&stdout_path).saturating_add(file_len(&stderr_path));
-            if observed_bytes > last_observed_bytes {
-                let now = OffsetDateTime::now_utc();
-                attempt.last_output_at = Some(now);
-                let record_result = if output_recorded {
-                    journal.persist(attempt)
-                } else {
-                    attempt.first_output_at = Some(now);
-                    journal.persist(attempt).and_then(|()| {
-                        journal.transition(
-                            attempt,
-                            ProviderInvocationState::OutputObserved,
-                            vec!["bounded redacted spool received first bytes".to_owned()],
-                        )
-                    })
-                };
-                if let Err(error) = record_result {
-                    let reason = format!("recording provider output failed: {error}");
-                    let _ = reservation_owner.mark_unknown_outcome(reservation_id, &reason);
-                    terminate_process_tree(&mut child);
-                    let _ = child.wait();
-                    break Err(error);
-                }
-                output_recorded = true;
-                last_observed_bytes = observed_bytes;
-            }
-            match child.try_wait() {
-                Ok(Some(status)) => break Ok(status),
-                Ok(None) => {}
-                Err(error) => {
-                    let reason = format!("polling provider process failed: {error}");
-                    let _ = reservation_owner.mark_unknown_outcome(reservation_id, &reason);
-                    terminate_process_tree(&mut child);
-                    let _ = child.wait();
-                    break Err(error.into());
-                }
-            }
-            if Instant::now() >= deadline {
-                timed_out = true;
-                terminate_process_tree(&mut child);
-                break child.wait().map_err(EngineError::from);
-            }
-            std::thread::sleep(StdDuration::from_millis(25));
-        };
-        let stdout_capture = stdout_handle
-            .join()
-            .map_err(|_| rejected("provider stdout spool thread panicked"))?;
-        let stderr_capture = stderr_handle
-            .join()
-            .map_err(|_| rejected("provider stderr spool thread panicked"))?;
-        let (stdout_capture, stderr_capture) = match (stdout_capture, stderr_capture) {
-            (Ok(stdout), Ok(stderr)) => (stdout, stderr),
-            (stdout, stderr) => {
-                let reason = stdout.err().or_else(|| stderr.err()).map_or_else(
-                    || "provider output capture failed closed".to_owned(),
-                    |error| error.to_string(),
-                );
-                let _ = reservation_owner.mark_unknown_outcome(reservation_id, &reason);
-                journal.transition(
-                    attempt,
-                    ProviderInvocationState::LocalCaptureFailed,
-                    vec![reason.clone()],
-                )?;
-                return Err(rejected(&reason));
-            }
-        };
-        let status = status_result?;
-        if stdout_capture.output_observed || stderr_capture.output_observed {
-            let now = OffsetDateTime::now_utc();
-            attempt.last_output_at = Some(now);
-            if !output_recorded {
-                attempt.first_output_at = Some(now);
-                journal.persist(attempt)?;
-                journal.transition(
-                    attempt,
-                    ProviderInvocationState::OutputObserved,
-                    vec!["bounded redacted spool captured output before process exit".to_owned()],
-                )?;
-            }
-        }
-        let stdout_text = String::from_utf8_lossy(&fs::read(
-            data_root.join(&stdout_capture.blob_ref.relative_path),
-        )?)
-        .into_owned();
-        let stderr_text = String::from_utf8_lossy(&fs::read(
-            data_root.join(&stderr_capture.blob_ref.relative_path),
-        )?)
-        .into_owned();
-        let combined = output_text(stdout_text.as_bytes(), stderr_text.as_bytes());
-        let normalized = AntigravityTextOutputNormalizer.normalize_text(request, &combined);
-        let structured_capture = ProviderOutputSpool.capture(
-            data_root,
-            &attempt.invocation_attempt_id,
-            "structured",
-            std::io::Cursor::new(serde_json::to_vec(&normalized)?),
-            DEFAULT_MAX_OUTPUT_BYTES as u64,
-        )?;
-        let exit_success = status.success();
-        let capture_complete = !stdout_capture.truncation_detected
-            && !stderr_capture.truncation_detected
-            && !structured_capture.truncation_detected
-            && stdout_capture.stream_closed_cleanly
-            && stderr_capture.stream_closed_cleanly
-            && structured_capture.stream_closed_cleanly;
-        let state = if timed_out {
-            AntigravityRunState::TimedOut
-        } else if exit_success && capture_complete {
-            AntigravityRunState::Succeeded
-        } else {
-            AntigravityRunState::Failed
-        };
-        let completed_at = OffsetDateTime::now_utc();
-        attempt.process_exit_at = Some(completed_at);
-        attempt.stdout_blob_or_hash = Some(stdout_capture.blob_ref.clone());
-        attempt.stderr_blob_or_hash = Some(stderr_capture.blob_ref.clone());
-        attempt.structured_output_blob_or_hash = Some(structured_capture.blob_ref);
-        attempt.exit_code_or_signal = Some(status.code().map_or_else(
-            || "terminated_without_exit_code".to_owned(),
-            |code| format!("exit_code:{code}"),
-        ));
-        journal.persist(attempt)?;
-        let terminal_state = if !capture_complete {
-            ProviderInvocationState::LocalCaptureFailed
-        } else if timed_out || stderr_text.contains("timeout waiting for response") {
-            ProviderInvocationState::TimeoutPendingReconciliation
-        } else if exit_success {
-            ProviderInvocationState::CompletedCaptured
-        } else {
-            ProviderInvocationState::ProcessExitedNonzero
-        };
-        journal.transition(
-            attempt,
-            terminal_state,
-            vec![format!(
-                "exit_success={exit_success};timed_out={timed_out};stdout_truncated={};stderr_truncated={}",
-                stdout_capture.truncation_detected, stderr_capture.truncation_detected
-            )],
-        )?;
-        let redaction_receipt = AntigravityOutputRedactionReceipt {
-            redacted: false,
-            redacted_markers: Vec::new(),
-            original_bytes: usize::try_from(
-                stdout_capture
-                    .blob_ref
-                    .size_bytes
-                    .saturating_add(stderr_capture.blob_ref.size_bytes),
-            )
-            .unwrap_or(usize::MAX),
-            retained_bytes: usize::try_from(
-                stdout_capture
-                    .blob_ref
-                    .size_bytes
-                    .saturating_add(stderr_capture.blob_ref.size_bytes),
-            )
-            .unwrap_or(usize::MAX),
-        };
-        let (receipt_argv, prompt_hash_blake3) = safety_argv_receipt(&argv, &request.question);
-        Ok(AntigravityRun {
-            run_id: new_id("antigravity-run"),
-            request_id: request.request_id.clone(),
-            state,
-            provider_state: if exit_success && capture_complete {
-                AntigravityProviderState::ReadyEnabled
-            } else {
-                AntigravityProviderState::DetectedDisabled
-            },
-            dry_run: false,
-            fixture_runner: false,
-            binary_path: contract.binary_path.clone(),
-            effective_cwd: path_for_record(&effective_cwd),
-            stdout_blob_ref: Some(stdout_capture.blob_ref),
-            stderr_blob_ref: Some(stderr_capture.blob_ref),
-            log_blob_ref: Some(blob_ref("antigravity/log.txt", combined.len())),
-            stdout_excerpt: truncate_text(&stdout_text, 2_000),
-            stderr_excerpt: truncate_text(&stderr_text, 2_000),
-            safety_receipt: AntigravitySafetyReceipt {
-                typed_argv: receipt_argv,
-                prompt_hash_blake3,
-                shell_false: true,
-                stdin_devnull: true,
-                process_group_kill_on_timeout: true,
-                timeout_ms: DEFAULT_TIMEOUT_MS,
-                max_output_bytes: DEFAULT_MAX_OUTPUT_BYTES,
-                effective_cwd: path_for_record(&effective_cwd),
-                env_fixed_vars: process_env,
-                env_dropped_names: dropped_names,
-            },
-            redaction_receipt,
-            normalized_result: Some(normalized),
-            message: if timed_out {
-                "real Antigravity run hit the governor absolute deadline; output was durably spooled"
-                    .to_owned()
-            } else if exit_success {
-                "real Antigravity run completed with durable incremental capture".to_owned()
-            } else {
-                "real Antigravity run exited nonzero; durable output is pending reconciliation"
-                    .to_owned()
-            },
-            created_at: started,
-            completed_at: Some(completed_at),
-        })
-    }
-
     pub fn run_real(
         &self,
         _request: &AntigravityReviewRequest,
@@ -2606,13 +2196,13 @@ impl AntigravityRunner {
         clippy::too_many_lines,
         reason = "provider execution is one ordered security and supervision transaction"
     )]
-    pub fn run_real_supervised(
+    pub async fn run_real_supervised(
         &self,
         request: &AntigravityReviewRequest,
         contract: &AntigravityCommandContract,
         worktree_lease: &WorktreeLease,
         effective_cwd: &Path,
-        executor: &dyn AntigravityProcessExecutor,
+        runner: &dyn ProviderProcessRunner,
     ) -> Result<AntigravityRun, EngineError> {
         if std::env::var_os("ELIOT_DISABLE_REAL_PROVIDER").is_some() {
             return Err(rejected(
@@ -2631,7 +2221,9 @@ impl AntigravityRunner {
         let binary = argv
             .first()
             .ok_or_else(|| rejected("Antigravity real run has no binary argv"))?;
-        let version_gate = AntigravityVersionGateService.probe(Path::new(binary));
+        let version_gate = AntigravityVersionGateService
+            .probe_supervised(Path::new(binary), runner)
+            .await;
         if !version_gate.allowed {
             return Err(rejected(&format!(
                 "Antigravity version gate blocked real execution: {}",
@@ -2647,19 +2239,39 @@ impl AntigravityRunner {
         }
         let dropped_names = AntigravityEnvPolicyService.minimal_windows_dropped_names(&source_env);
         let started = OffsetDateTime::now_utc();
-        let output = executor.execute(
-            AntigravitySupervisedProcessSpec {
-                operation_id: new_id("antigravity-process"),
-                executable: PathBuf::from(binary),
-                args: argv.iter().skip(1).cloned().collect(),
-                cwd: effective_cwd.clone(),
-                environment: process_env.clone(),
-                timeout_ms: DEFAULT_TIMEOUT_MS,
-                max_output_bytes: DEFAULT_MAX_OUTPUT_BYTES as u64,
-            },
-            &mut |_| Ok(()),
-        )?;
-        if !output.reap_complete {
+        let route_policy = ProviderRoutePolicy::for_route(
+            eliot_types::AgentHostId::Antigravity,
+            "antigravity-real-review",
+            eliot_types::ProviderDeclaredBudget::new(
+                DEFAULT_TIMEOUT_MS,
+                DEFAULT_MAX_OUTPUT_BYTES as u64,
+            ),
+        );
+        let output = runner
+            .run(
+                ProviderProcessSpec {
+                    operation_id: new_id("antigravity-process"),
+                    invocation_id: Some(request.request_id.clone()),
+                    executable: PathBuf::from(binary),
+                    args: argv.iter().skip(1).map(OsString::from).collect(),
+                    cwd: effective_cwd.clone(),
+                    environment: process_env
+                        .iter()
+                        .map(|(name, value)| (OsString::from(name), OsString::from(value)))
+                        .collect(),
+                    stdin_payload: None,
+                    route_policy,
+                    cancellation: crate::runtime_supervision::CancellationToken::new(),
+                    deadline: tokio::time::Instant::now()
+                        + std::time::Duration::from_millis(DEFAULT_TIMEOUT_MS),
+                    runtime_contract_sha256: None,
+                    role_lease_id: None,
+                    role_lease_epoch: None,
+                },
+                &mut |_| Ok(()),
+            )
+            .await?;
+        if !output.reap_receipt.proves_complete_reap() {
             return Err(rejected(
                 "supervised Antigravity process returned an incomplete reap receipt",
             ));
@@ -2763,7 +2375,7 @@ impl AntigravityRunner {
     }
 
     #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
-    pub fn run_real_recorded_supervised(
+    pub async fn run_real_recorded_supervised(
         &self,
         request: &AntigravityReviewRequest,
         contract: &AntigravityCommandContract,
@@ -2774,7 +2386,7 @@ impl AntigravityRunner {
         reservation_id: &str,
         journal: &ProviderInvocationJournal,
         attempt: &mut ProviderInvocationAttempt,
-        executor: &dyn AntigravityProcessExecutor,
+        runner: &dyn ProviderProcessRunner,
     ) -> Result<AntigravityRun, EngineError> {
         if std::env::var_os("ELIOT_DISABLE_REAL_PROVIDER").is_some() {
             return Err(rejected(
@@ -2793,7 +2405,9 @@ impl AntigravityRunner {
         let binary = argv
             .first()
             .ok_or_else(|| rejected("Antigravity real run has no binary argv"))?;
-        let version_gate = AntigravityVersionGateService.probe(Path::new(binary));
+        let version_gate = AntigravityVersionGateService
+            .probe_supervised(Path::new(binary), runner)
+            .await;
         if !version_gate.allowed {
             return Err(rejected(&format!(
                 "Antigravity version gate blocked real execution: {}",
@@ -2814,17 +2428,28 @@ impl AntigravityRunner {
             vec!["durable dispatch-starting receipt precedes supervised spawn".to_owned()],
         )?;
         let started = OffsetDateTime::now_utc();
-        let process_spec = AntigravitySupervisedProcessSpec {
+        let route_policy = crate::antigravity_plan_route_policy();
+        let process_spec = ProviderProcessSpec {
             operation_id: format!(
                 "antigravity-recorded-{}",
                 safe_invocation_component(&attempt.invocation_attempt_id)
             ),
+            invocation_id: Some(attempt.invocation_attempt_id.clone()),
             executable: PathBuf::from(binary),
-            args: argv.iter().skip(1).cloned().collect(),
+            args: argv.iter().skip(1).map(OsString::from).collect(),
             cwd: effective_cwd.clone(),
-            environment: process_env.clone(),
-            timeout_ms: DEFAULT_TIMEOUT_MS,
-            max_output_bytes: DEFAULT_MAX_OUTPUT_BYTES as u64,
+            environment: process_env
+                .iter()
+                .map(|(name, value)| (OsString::from(name), OsString::from(value)))
+                .collect(),
+            stdin_payload: None,
+            route_policy,
+            cancellation: crate::runtime_supervision::CancellationToken::new(),
+            deadline: tokio::time::Instant::now()
+                + std::time::Duration::from_millis(DEFAULT_TIMEOUT_MS),
+            runtime_contract_sha256: None,
+            role_lease_id: None,
+            role_lease_epoch: None,
         };
         let execution = {
             let mut on_spawned = |pid| {
@@ -2845,7 +2470,7 @@ impl AntigravityRunner {
                     vec![format!("pid:{pid}")],
                 )
             };
-            executor.execute(process_spec, &mut on_spawned)
+            runner.run(process_spec, &mut on_spawned).await
         };
         let output = match execution {
             Ok(output) => output,
@@ -2878,7 +2503,9 @@ impl AntigravityRunner {
         };
         attempt.process_or_job_identity = Some(format!(
             "pid:{};job={};reap_complete={}",
-            output.root_pid, output.job_object_name, output.reap_complete
+            output.reap_receipt.root_pid.unwrap_or_default(),
+            output.reap_receipt.job_object_name,
+            output.reap_receipt.proves_complete_reap()
         ));
         let stdout_capture = ProviderOutputSpool.capture(
             data_root,
@@ -2895,9 +2522,8 @@ impl AntigravityRunner {
             DEFAULT_MAX_OUTPUT_BYTES as u64,
         )?;
         if stdout_capture.output_observed || stderr_capture.output_observed {
-            let now = OffsetDateTime::now_utc();
-            attempt.first_output_at = Some(now);
-            attempt.last_output_at = Some(now);
+            attempt.first_output_at = output.first_output_at;
+            attempt.last_output_at = output.last_output_at;
             journal.persist(attempt)?;
             journal.transition(
                 attempt,
@@ -2917,7 +2543,7 @@ impl AntigravityRunner {
             DEFAULT_MAX_OUTPUT_BYTES as u64,
         )?;
         let exit_success = output.exit_code == Some(0);
-        let capture_complete = output.reap_complete
+        let capture_complete = output.reap_receipt.proves_complete_reap()
             && !output.stdout_truncated
             && !output.stderr_truncated
             && !stdout_capture.truncation_detected
@@ -2933,8 +2559,9 @@ impl AntigravityRunner {
         } else {
             AntigravityRunState::Failed
         };
-        let completed_at = OffsetDateTime::now_utc();
-        attempt.process_exit_at = Some(completed_at);
+        let completed_at = output.cleanup_completed_at;
+        attempt.process_exit_at = output.process_exit_at;
+        attempt.cleanup_completed_at = Some(output.cleanup_completed_at);
         attempt.stdout_blob_or_hash = Some(stdout_capture.blob_ref.clone());
         attempt.stderr_blob_or_hash = Some(stderr_capture.blob_ref.clone());
         attempt.structured_output_blob_or_hash = Some(structured_capture.blob_ref);
@@ -2958,7 +2585,7 @@ impl AntigravityRunner {
             vec![format!(
                 "exit_success={exit_success};timed_out={};reap_complete={};stdout_truncated={};stderr_truncated={}",
                 output.timed_out,
-                output.reap_complete,
+                output.reap_receipt.proves_complete_reap(),
                 output.stdout_truncated,
                 output.stderr_truncated
             )],
@@ -3459,6 +3086,61 @@ fn where_command_hits(name: &str) -> Vec<PathBuf> {
         .filter(|line| !line.is_empty())
         .map(PathBuf::from)
         .collect()
+}
+
+async fn run_supervised_provider_probe(
+    path: &Path,
+    arg: &str,
+    operation_class: &str,
+    timeout_ms: u64,
+    runner: &dyn ProviderProcessRunner,
+) -> Result<(String, bool, bool), EngineError> {
+    let source_env = std::env::vars().collect::<Vec<_>>();
+    let process_env = AntigravityEnvPolicyService.minimal_windows_env(&source_env);
+    let route_policy = ProviderRoutePolicy::for_route(
+        eliot_types::AgentHostId::Antigravity,
+        operation_class,
+        eliot_types::ProviderDeclaredBudget::new(timeout_ms, 2_000)
+            .with_idle_output_deadline_ms(Some(timeout_ms)),
+    );
+    let mut on_spawned = |_| Ok(());
+    let output = runner
+        .run(
+            ProviderProcessSpec {
+                operation_id: new_id(operation_class),
+                invocation_id: None,
+                executable: path.to_owned(),
+                args: vec![OsString::from(arg)],
+                cwd: std::env::current_dir()?,
+                environment: process_env
+                    .into_iter()
+                    .map(|(name, value)| (OsString::from(name), OsString::from(value)))
+                    .collect(),
+                stdin_payload: None,
+                route_policy,
+                cancellation: crate::runtime_supervision::CancellationToken::new(),
+                deadline: tokio::time::Instant::now()
+                    + std::time::Duration::from_millis(timeout_ms),
+                runtime_contract_sha256: None,
+                role_lease_id: None,
+                role_lease_epoch: None,
+            },
+            &mut on_spawned,
+        )
+        .await?;
+    if !output.reap_receipt.proves_complete_reap() {
+        return Err(rejected(
+            "provider probe returned an incomplete reap receipt",
+        ));
+    }
+    if let Some(error) = output.worker_error {
+        return Err(rejected(&format!("provider probe cleanup failed: {error}")));
+    }
+    Ok((
+        output_text(&output.stdout, &output.stderr),
+        output.timed_out,
+        output.exit_code == Some(0),
+    ))
 }
 
 fn run_help_probe(path: &Path, timeout_ms: u64) -> Result<(String, bool), EngineError> {

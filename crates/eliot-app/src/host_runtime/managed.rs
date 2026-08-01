@@ -1149,29 +1149,9 @@ pub(super) async fn run_managed_antigravity(
 
     let wall_clock = Duration::from_secs(contract.wall_clock_budget_seconds);
     let raw_command = command.as_std();
-    let managed_context = eliot_engine::runtime_supervision::AdapterExecutionContext {
+    let provider_spec = eliot_engine::ProviderProcessSpec {
         operation_id: format!("managed-provider-{}", contract.invocation_id),
-        generation: 1,
-        cancellation: eliot_engine::runtime_supervision::CancellationToken::new(),
-        deadline: tokio::time::Instant::now() + wall_clock,
-        runtime_store: super::supervised_process::daemon_operation_runtime_handle(config_path)?,
-        role_lease_id: contract.role_lease_id.clone(),
-        role_lease_epoch: Some(contract.role_lease_epoch),
-        runtime_contract_sha256: Some(contract.contract_hash.clone()),
-    };
-    let managed_spec = super::supervised_process::SupervisedProcessSpec {
-        operation_id: managed_context.operation_id.clone(),
         invocation_id: Some(contract.invocation_id.clone()),
-        generation: managed_context.generation,
-        child_kind: super::supervised_process::SupervisedChildKind::Provider,
-        criticality: super::supervised_process::ChildCriticality::InvocationDependency,
-        restart_policy: super::supervised_process::ProcessRestartPolicy {
-            strategy: super::supervised_process::RestartStrategy::RestForOne,
-            max_restarts: 1,
-            restart_window_seconds: 60,
-            base_backoff_ms: 250,
-            pre_dispatch_only: true,
-        },
         executable: raw_command.get_program().into(),
         args: raw_command
             .get_args()
@@ -1193,9 +1173,7 @@ pub(super) async fn run_managed_antigravity(
             })
             .collect(),
         stdin_payload: None,
-        stdout_limit_bytes: u64::try_from(MAX_SECRET_BOUNDARY_BYTES).unwrap_or(u64::MAX),
-        stderr_limit_bytes: u64::try_from(MAX_SECRET_BOUNDARY_BYTES).unwrap_or(u64::MAX),
-        timeout_profile: eliot_types::ProviderRoutePolicy::for_route(
+        route_policy: eliot_types::ProviderRoutePolicy::for_route(
             eliot_types::AgentHostId::Antigravity,
             "managed-provider",
             eliot_types::ProviderDeclaredBudget::new(
@@ -1203,16 +1181,20 @@ pub(super) async fn run_managed_antigravity(
                 u64::try_from(MAX_SECRET_BOUNDARY_BYTES).unwrap_or(u64::MAX),
             )
             .with_first_output_deadline_ms(None),
-        )
-        .timeout_profile()
-        .clone(),
+        ),
+        cancellation: eliot_engine::runtime_supervision::CancellationToken::new(),
+        deadline: tokio::time::Instant::now() + wall_clock,
         runtime_contract_sha256: Some(contract.contract_hash.clone()),
         role_lease_id: contract.role_lease_id.clone(),
-        role_lease_epoch: None,
+        role_lease_epoch: Some(contract.role_lease_epoch),
     };
-    let process = match super::supervised_process::run_supervised_process(
-        managed_spec,
-        managed_context,
+    let provider_runner =
+        super::supervised_process::SupervisedWindowsProcessRunner::new(config_path)?;
+    let mut on_spawned = |_| Ok(());
+    let process = match eliot_engine::ProviderProcessRunner::run(
+        &provider_runner,
+        provider_spec,
+        &mut on_spawned,
     )
     .await
     {
