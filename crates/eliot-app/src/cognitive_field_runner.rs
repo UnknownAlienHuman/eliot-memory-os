@@ -454,13 +454,42 @@ struct CoreRoleReuseProjection {
     contamination_receipt_ref: String,
     worktree_diff_sha256: Option<String>,
     outputs: Vec<CognitiveFieldProviderOutputProjection>,
+    #[serde(default)]
+    source_deterministic_bindings: Vec<CoreRoleSourceDeterministicBinding>,
     recorded_at: OffsetDateTime,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CoreRoleSourceDeterministicBinding {
+    execution: CognitiveFieldExecutionKey,
+    source_report_hash: String,
+    source_report_sha256: String,
+    source_report_ref: String,
+    current_report_hash: String,
+    equivalence: CoreRoleDeterministicEquivalence,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CoreRoleDeterministicEquivalence {
+    equivalent: bool,
+    compared_fields: Vec<String>,
+    allowed_run_scoped_differences: Vec<String>,
+}
+
+#[derive(Debug)]
+struct VerifiedSourceDeterministicReport {
+    execution: CognitiveFieldExecutionKey,
+    bytes: Vec<u8>,
+    report: CognitiveDeterministicReport,
 }
 
 #[derive(Debug)]
 struct VerifiedPriorRole {
     source_private_root: PathBuf,
     outputs: Vec<(CognitiveFieldExecutionKey, Vec<u8>)>,
+    source_deterministic_reports: Vec<VerifiedSourceDeterministicReport>,
     candidate_diff: Option<Vec<u8>>,
 }
 
@@ -4788,15 +4817,23 @@ pub fn grade(report_root: &Path, private_root: &Path) -> Result<()> {
                     .join("oracles")
                     .join(format!("{}.json", case.case_id)),
             )?;
+            let bound_deterministic =
+                resolve_judge_deterministic_binding(&evidence_root, &execution, &deterministic)?;
             validate_worker_output(&worker, &execution, case, &deterministic)?;
             validate_reader_output(&reader, &execution, &deterministic)?;
-            validate_judge_output(&judge, &execution, &oracle, &deterministic)?;
+            validate_judge_output(
+                &judge,
+                &execution,
+                &oracle,
+                bound_deterministic.as_ref().unwrap_or(&deterministic),
+            )?;
             let grade = CognitiveFieldGradingService::grade_case(
                 &suite,
                 case,
                 &oracle,
                 &reader,
                 &deterministic,
+                bound_deterministic.as_ref(),
                 &judge,
             );
             if grade.passed {
@@ -4985,6 +5022,12 @@ fn provider_role_errors(
                             && projection.worktree_diff_sha256 == *worktree_diff_sha256
                     })
                 });
+                let deterministic_binding_matches = reused_role_deterministic_binding_is_valid(
+                    evidence_root,
+                    execution,
+                    role,
+                    &projection,
+                );
                 if projection.schema_version != CORE_ROLE_REUSE_PROJECTION_SCHEMA_VERSION
                     || projection.run_id != plan.run_id
                     || projection.contract_hash != plan.contract_hash
@@ -4994,6 +5037,7 @@ fn provider_role_errors(
                     || plan.role_evidence_plan_hash.is_none()
                     || !source_matches
                     || !output_hash_matches
+                    || !deterministic_binding_matches
                     || evidence_root
                         .join(format!("provider-{}.json", role_name(role)))
                         .is_file()
@@ -6456,6 +6500,7 @@ fn verify_accepted_prior_role(
 
     let mut outputs = Vec::new();
     let mut observed_deterministic_hashes = Vec::new();
+    let mut source_deterministic_reports = Vec::new();
     for output in &receipt.outputs {
         let output_path = fs::canonicalize(&output.output_path)?;
         ensure!(
@@ -6512,11 +6557,30 @@ fn verify_accepted_prior_role(
             CognitiveFieldRole::CodexJudge => {
                 let judge: CognitiveJudgeResult = serde_json::from_slice(&bytes)?;
                 validate_judge_output(&judge, &output.execution, &source_oracle, &deterministic)?;
+                let current_deterministic: CognitiveDeterministicReport = read_json(
+                    &report_root
+                        .join("evidence")
+                        .join(&output.execution.case_id)
+                        .join(condition_name(output.execution.memory_condition))
+                        .join("deterministic.json"),
+                )?;
+                ensure!(
+                    deterministic_report_is_valid(&current_deterministic)?
+                        && current_deterministic.source_commit == contract.source_commit,
+                    "current deterministic truth is invalid for reused Judge"
+                );
+                deterministic_equivalence_record(&current_deterministic, &deterministic)?;
             }
         }
+        source_deterministic_reports.push(VerifiedSourceDeterministicReport {
+            execution: output.execution.clone(),
+            bytes: deterministic_bytes,
+            report: deterministic,
+        });
         outputs.push((output.execution.clone(), bytes));
     }
     outputs.sort_by(|left, right| left.0.cmp(&right.0));
+    source_deterministic_reports.sort_by(|left, right| left.execution.cmp(&right.execution));
     observed_deterministic_hashes.sort();
     observed_deterministic_hashes.dedup();
     ensure!(
@@ -6583,8 +6647,145 @@ fn verify_accepted_prior_role(
     Ok(VerifiedPriorRole {
         source_private_root,
         outputs,
+        source_deterministic_reports,
         candidate_diff,
     })
+}
+
+fn deterministic_equivalence_record(
+    current: &CognitiveDeterministicReport,
+    source: &CognitiveDeterministicReport,
+) -> Result<CoreRoleDeterministicEquivalence> {
+    let errors = CognitiveFieldGradingService::deterministic_report_reuse_errors(current, source);
+    ensure!(
+        errors.is_empty(),
+        "source deterministic report is not reuse-equivalent: {}",
+        errors.join("; ")
+    );
+    Ok(CoreRoleDeterministicEquivalence {
+        equivalent: true,
+        compared_fields: [
+            "schema_version",
+            "case_id",
+            "project_id",
+            "task_id",
+            "source_commit",
+            "verifier_refs",
+            "hard_gate_evidence.gate",
+            "hard_gate_evidence.passed",
+            "hard_gate_evidence.explanation",
+            "controller_provider_calls",
+            "truth_revision_before",
+            "truth_revision_after_observability",
+            "passed",
+        ]
+        .map(str::to_owned)
+        .to_vec(),
+        allowed_run_scoped_differences: ["report_hash", "hard_gate_evidence.evidence_refs"]
+            .map(str::to_owned)
+            .to_vec(),
+    })
+}
+
+fn verified_source_deterministic_report(
+    evidence_root: &Path,
+    execution: &CognitiveFieldExecutionKey,
+    current: &CognitiveDeterministicReport,
+    projection: &CoreRoleReuseProjection,
+) -> Result<CognitiveDeterministicReport> {
+    let bindings = projection
+        .source_deterministic_bindings
+        .iter()
+        .filter(|binding| binding.execution == *execution)
+        .collect::<Vec<_>>();
+    ensure!(
+        bindings.len() == 1,
+        "reused Judge requires exactly one source deterministic binding"
+    );
+    let binding = bindings[0];
+    ensure!(
+        binding.source_report_ref == "source-deterministic.json"
+            && binding.current_report_hash == current.report_hash,
+        "reused Judge deterministic projection binding is invalid"
+    );
+    let evidence_root = fs::canonicalize(evidence_root)?;
+    let path = fs::canonicalize(evidence_root.join(&binding.source_report_ref))?;
+    ensure!(
+        path.starts_with(&evidence_root) && path.is_file(),
+        "reused Judge source deterministic report escaped its evidence root"
+    );
+    let bytes = fs::read(&path)?;
+    let source: CognitiveDeterministicReport = serde_json::from_slice(&bytes)?;
+    let equivalence = deterministic_equivalence_record(current, &source)?;
+    ensure!(
+        sha256_bytes(&bytes) == binding.source_report_sha256
+            && source.report_hash == binding.source_report_hash
+            && CognitiveFieldGradingService::deterministic_report_hash_is_valid(&source)
+            && binding.equivalence == equivalence,
+        "reused Judge source deterministic provenance is invalid"
+    );
+    Ok(source)
+}
+
+fn resolve_judge_deterministic_binding(
+    evidence_root: &Path,
+    execution: &CognitiveFieldExecutionKey,
+    current: &CognitiveDeterministicReport,
+) -> Result<Option<CognitiveDeterministicReport>> {
+    let reuse_path = evidence_root.join("reused-roles.json");
+    let provenance_exists = evidence_root.join("source-deterministic.json").is_file();
+    if !reuse_path.is_file() {
+        ensure!(
+            !provenance_exists,
+            "source deterministic provenance exists without a reuse projection"
+        );
+        return Ok(None);
+    }
+    let projections: Vec<CoreRoleReuseProjection> = read_json(&reuse_path)?;
+    let judge = projections.iter().find(|projection| {
+        projection.role == CognitiveFieldRole::CodexJudge
+            && projection
+                .outputs
+                .iter()
+                .any(|output| output.execution == *execution)
+    });
+    let Some(judge) = judge else {
+        ensure!(
+            !provenance_exists,
+            "source deterministic provenance exists without a reused Judge"
+        );
+        return Ok(None);
+    };
+    Ok(Some(verified_source_deterministic_report(
+        evidence_root,
+        execution,
+        current,
+        judge,
+    )?))
+}
+
+fn reused_role_deterministic_binding_is_valid(
+    evidence_root: &Path,
+    execution: &CognitiveFieldExecutionKey,
+    role: CognitiveFieldRole,
+    projection: &CoreRoleReuseProjection,
+) -> bool {
+    if role != CognitiveFieldRole::CodexJudge {
+        return projection.source_deterministic_bindings.is_empty();
+    }
+    (|| -> Result<()> {
+        let current: CognitiveDeterministicReport =
+            read_json(&evidence_root.join("deterministic.json"))?;
+        let source =
+            verified_source_deterministic_report(evidence_root, execution, &current, projection)?;
+        let judge: CognitiveJudgeResult = read_json(&evidence_root.join("judge.json"))?;
+        ensure!(
+            judge.deterministic_report_hash == source.report_hash,
+            "reused Judge is not bound to its source deterministic report"
+        );
+        Ok(())
+    })()
+    .is_ok()
 }
 
 #[allow(clippy::too_many_lines)]
@@ -6656,6 +6857,47 @@ fn materialize_accepted_prior_roles(
                 "source_run_id": source_run_id,
             }),
         )?;
+        let mut source_deterministic_bindings = Vec::new();
+        if *role == CognitiveFieldRole::CodexJudge {
+            for source_report in &verified.source_deterministic_reports {
+                let evidence_root = report_root
+                    .join("evidence")
+                    .join(&source_report.execution.case_id)
+                    .join(condition_name(source_report.execution.memory_condition));
+                let current_path = evidence_root.join("deterministic.json");
+                let current_bytes = fs::read(&current_path)?;
+                let current: CognitiveDeterministicReport = serde_json::from_slice(&current_bytes)?;
+                ensure!(
+                    deterministic_report_is_valid(&current)?
+                        && current.source_commit == contract.source_commit,
+                    "current deterministic truth is invalid before reused Judge materialization"
+                );
+                let equivalence =
+                    deterministic_equivalence_record(&current, &source_report.report)?;
+                write_new_or_same(
+                    &evidence_root.join("source-deterministic.json"),
+                    &source_report.bytes,
+                )?;
+                ensure!(
+                    fs::read(&current_path)? == current_bytes,
+                    "reused Judge materialization changed current deterministic truth"
+                );
+                source_deterministic_bindings.push(CoreRoleSourceDeterministicBinding {
+                    execution: source_report.execution.clone(),
+                    source_report_hash: source_report.report.report_hash.clone(),
+                    source_report_sha256: sha256_bytes(&source_report.bytes),
+                    source_report_ref: "source-deterministic.json".to_owned(),
+                    current_report_hash: current.report_hash,
+                    equivalence,
+                });
+            }
+            source_deterministic_bindings
+                .sort_by(|left, right| left.execution.cmp(&right.execution));
+            ensure!(
+                source_deterministic_bindings.len() == executions.len(),
+                "reused Judge lacks exact source deterministic provenance"
+            );
+        }
         let projection = CoreRoleReuseProjection {
             schema_version: CORE_ROLE_REUSE_PROJECTION_SCHEMA_VERSION.to_owned(),
             run_id: contract.run_id.clone(),
@@ -6680,6 +6922,7 @@ fn materialize_accepted_prior_roles(
             contamination_receipt_ref: contamination_receipt_ref.clone(),
             worktree_diff_sha256: worktree_diff_sha256.clone(),
             outputs,
+            source_deterministic_bindings,
             recorded_at: provider_plan.sealed_at,
         };
         for (execution, bytes) in verified.outputs {
@@ -6717,7 +6960,18 @@ fn materialize_accepted_prior_roles(
                             .join("oracles")
                             .join(format!("{}.json", execution.case_id)),
                     )?;
-                    validate_judge_output(&judge, &execution, &oracle, &deterministic)?;
+                    let source_deterministic = verified
+                        .source_deterministic_reports
+                        .iter()
+                        .find(|report| report.execution == execution)
+                        .context("reused Judge source deterministic report is missing")?;
+                    deterministic_equivalence_record(&deterministic, &source_deterministic.report)?;
+                    validate_judge_output(
+                        &judge,
+                        &execution,
+                        &oracle,
+                        &source_deterministic.report,
+                    )?;
                     "judge.json"
                 }
             };
@@ -7659,17 +7913,19 @@ fn print_json<T: Serialize>(value: &T) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        AbandonedSealAttemptRecord, CognitiveHarnessOnlyEquivalence, CoreRoleEvidenceSource,
-        ExternalAgentExecutionRequest, LEGACY_EVIDENCE_ADMISSION_SCHEMA_VERSION,
-        LEGACY_WORKER_ACCEPTANCE_RUN_ID, LEGACY_WORKER_CASE_ID, LEGACY_WORKER_MISSING_FIELD,
-        LEGACY_WORKER_SOURCE_CALL_ID, LEGACY_WORKER_SOURCE_RUN_ID, LegacyEvidenceAdmissionRecord,
-        ProviderPlanSealRecord, ProviderPlanSealState, READER_SCHEMA_JSON_PLACEHOLDER,
-        READER_SCHEMA_SHA256_PLACEHOLDER, SealRecoveryDecision, SealedPromptBinding,
-        StagedSealAuthority, abandon_provider_seal, canonical_path,
-        codex_cognitive_runtime_contract, cognitive_external_execution_request,
-        execution_conditions, generated_oracle, inspect_seal_recovery, load_seal_records,
-        provider_compatible_reader_schema, provider_plan_seal_response, provider_plan_without_hash,
-        record_provider, recover_seal, render_provider_contract, render_reader_prompt,
+        AbandonedSealAttemptRecord, CORE_ROLE_REUSE_PROJECTION_SCHEMA_VERSION,
+        CognitiveHarnessOnlyEquivalence, CoreRoleDeterministicEquivalence, CoreRoleEvidenceSource,
+        CoreRoleReuseProjection, CoreRoleSourceDeterministicBinding, ExternalAgentExecutionRequest,
+        LEGACY_EVIDENCE_ADMISSION_SCHEMA_VERSION, LEGACY_WORKER_ACCEPTANCE_RUN_ID,
+        LEGACY_WORKER_CASE_ID, LEGACY_WORKER_MISSING_FIELD, LEGACY_WORKER_SOURCE_CALL_ID,
+        LEGACY_WORKER_SOURCE_RUN_ID, LegacyEvidenceAdmissionRecord, ProviderPlanSealRecord,
+        ProviderPlanSealState, READER_SCHEMA_JSON_PLACEHOLDER, READER_SCHEMA_SHA256_PLACEHOLDER,
+        SealRecoveryDecision, SealedPromptBinding, StagedSealAuthority, abandon_provider_seal,
+        canonical_path, codex_cognitive_runtime_contract, cognitive_external_execution_request,
+        deterministic_equivalence_record, execution_conditions, generated_oracle,
+        inspect_seal_recovery, load_seal_records, provider_compatible_reader_schema,
+        provider_plan_seal_response, provider_plan_without_hash, record_provider, recover_seal,
+        render_provider_contract, render_reader_prompt, resolve_judge_deterministic_binding,
         role_schema_contracts, schema_validation_projection, seal_attempt_component,
         seal_provider_runtime_contract, sha256_bytes, stage_artifacts_with_cleanup,
         validate_deterministic_receipt, validate_governor_product_provenance,
@@ -7687,15 +7943,16 @@ mod tests {
         COGNITIVE_FIELD_PROVIDER_EVIDENCE_SCHEMA_VERSION,
         COGNITIVE_FIELD_PROVIDER_PLAN_SCHEMA_VERSION, CognitiveDeterministicEvidenceReceipt,
         CognitiveDeterministicReport, CognitiveFieldExecutionKey, CognitiveFieldProviderCallPlan,
-        CognitiveFieldProviderEvidenceReceipt, CognitiveFieldProviderOutputReceipt,
-        CognitiveFieldProviderPlan, CognitiveFieldRole, CognitiveFieldRunContract,
-        CognitiveFieldSuite, CognitiveHardGateEvidence, CognitiveMemoryCondition,
-        CognitiveUnderstandingAnswer, CognitiveVerifierCommandReceipt, ExternalAgentPurpose,
-        OperationJob, OperationJobState, OperationPhase, PROVIDER_RUNTIME_CONTRACT_SCHEMA_VERSION,
-        ProjectId, ProviderDeclaredBudget, ProviderMcpServerContract,
-        ProviderMcpToolProfileBinding, ProviderRoutePolicy, ProviderRuntimeContract,
-        ProviderStructuredOutputMode, TaskId, TaskRoleLease, WorkItem, WorkItemId, WorkItemStatus,
-        WorkScope, cognitive_understanding_answer_schema, minimal_cognitive_understanding_answer,
+        CognitiveFieldProviderEvidenceReceipt, CognitiveFieldProviderOutputProjection,
+        CognitiveFieldProviderOutputReceipt, CognitiveFieldProviderPlan, CognitiveFieldRole,
+        CognitiveFieldRunContract, CognitiveFieldSuite, CognitiveHardGateEvidence,
+        CognitiveHardGateKind, CognitiveMemoryCondition, CognitiveUnderstandingAnswer,
+        CognitiveVerifierCommandReceipt, ExternalAgentPurpose, OperationJob, OperationJobState,
+        OperationPhase, PROVIDER_RUNTIME_CONTRACT_SCHEMA_VERSION, ProjectId,
+        ProviderDeclaredBudget, ProviderMcpServerContract, ProviderMcpToolProfileBinding,
+        ProviderRoutePolicy, ProviderRuntimeContract, ProviderStructuredOutputMode, TaskId,
+        TaskRoleLease, WorkItem, WorkItemId, WorkItemStatus, WorkScope,
+        cognitive_understanding_answer_schema, minimal_cognitive_understanding_answer,
     };
     use serde_json::{Value, json};
     use std::collections::{BTreeMap, BTreeSet};
@@ -7739,6 +7996,102 @@ mod tests {
         assert!(staging_root.join("runtime/request.json").is_file());
         assert!(staging_root.join("runtime/runtime.json").is_file());
         fs::remove_dir_all(&private_root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn reused_judge_resolves_source_deterministic_without_overwriting_current()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root = std::env::temp_dir().join(format!(
+            "eliot-reused-judge-deterministic-{}",
+            Uuid::new_v4()
+        ));
+        fs::create_dir_all(&root)?;
+        let execution = CognitiveFieldExecutionKey {
+            case_id: "U03".to_owned(),
+            memory_condition: CognitiveMemoryCondition::Treatment,
+        };
+        let project_id = ProjectId::new_v7();
+        let task_id = TaskId::new_v7();
+        let mut current = CognitiveDeterministicReport {
+            schema_version: COGNITIVE_DETERMINISTIC_REPORT_SCHEMA_VERSION.to_owned(),
+            case_id: execution.case_id.clone(),
+            project_id,
+            task_id,
+            source_commit: "9e6d9161a133d7e501c163a6cc69a3da86713e7a".to_owned(),
+            verifier_refs: vec!["cargo:test:fixture".to_owned()],
+            hard_gate_evidence: vec![CognitiveHardGateEvidence {
+                gate: CognitiveHardGateKind::InvalidBinding,
+                passed: true,
+                evidence_refs: vec!["receipt:current".to_owned(), "contract:current".to_owned()],
+                explanation: "exact deterministic fixture passed".to_owned(),
+            }],
+            controller_provider_calls: 0,
+            truth_revision_before: "git:fixture".to_owned(),
+            truth_revision_after_observability: "git:fixture".to_owned(),
+            report_hash: String::new(),
+            passed: true,
+        };
+        CognitiveFieldGradingService::seal_deterministic_report(&mut current)?;
+        let mut source = current.clone();
+        source.hard_gate_evidence[0].evidence_refs =
+            vec!["receipt:source".to_owned(), "contract:source".to_owned()];
+        CognitiveFieldGradingService::seal_deterministic_report(&mut source)?;
+        assert_ne!(current.report_hash, source.report_hash);
+
+        write_new_or_same_json(&root.join("deterministic.json"), &current)?;
+        write_new_or_same_json(&root.join("source-deterministic.json"), &source)?;
+        let current_bytes = fs::read(root.join("deterministic.json"))?;
+        let source_bytes = fs::read(root.join("source-deterministic.json"))?;
+        let equivalence: CoreRoleDeterministicEquivalence =
+            deterministic_equivalence_record(&current, &source)?;
+        let projection = CoreRoleReuseProjection {
+            schema_version: CORE_ROLE_REUSE_PROJECTION_SCHEMA_VERSION.to_owned(),
+            run_id: "run006".to_owned(),
+            contract_hash: "contract:run006".to_owned(),
+            provider_plan_hash: "plan:run006".to_owned(),
+            source_run_id: "run005".to_owned(),
+            source_call_id: "judge-call".to_owned(),
+            role: CognitiveFieldRole::CodexJudge,
+            case_id: execution.case_id.clone(),
+            provider_session_id: "judge-session".to_owned(),
+            provider_receipt_ref: "judge-receipt".to_owned(),
+            provider_executable_sha256: "a".repeat(64),
+            output_schema_sha256: "b".repeat(64),
+            artifact_sha256: "c".repeat(64),
+            prompt_sha256: "d".repeat(64),
+            oracle_sha256: "e".repeat(64),
+            runtime_contract_sha256: "f".repeat(64),
+            input_artifact_sha256s: vec!["1".repeat(64)],
+            deterministic_report_sha256s: vec![sha256_bytes(&source_bytes)],
+            executions: vec![execution.clone()],
+            deterministic_receipt_refs: vec!["receipt:deterministic".to_owned()],
+            contamination_receipt_ref: "receipt:contamination".to_owned(),
+            worktree_diff_sha256: None,
+            outputs: vec![CognitiveFieldProviderOutputProjection {
+                execution: execution.clone(),
+                output_sha256: "2".repeat(64),
+            }],
+            source_deterministic_bindings: vec![CoreRoleSourceDeterministicBinding {
+                execution: execution.clone(),
+                source_report_hash: source.report_hash.clone(),
+                source_report_sha256: sha256_bytes(&source_bytes),
+                source_report_ref: "source-deterministic.json".to_owned(),
+                current_report_hash: current.report_hash.clone(),
+                equivalence,
+            }],
+            recorded_at: OffsetDateTime::now_utc(),
+        };
+        write_new_or_same_json(&root.join("reused-roles.json"), &vec![projection])?;
+
+        let resolved = resolve_judge_deterministic_binding(&root, &execution, &current)?
+            .ok_or("reused Judge binding was not resolved")?;
+        assert_eq!(resolved, source);
+        assert_eq!(fs::read(root.join("deterministic.json"))?, current_bytes);
+
+        fs::write(root.join("source-deterministic.json"), b"{}\n")?;
+        assert!(resolve_judge_deterministic_binding(&root, &execution, &current).is_err());
+        fs::remove_dir_all(root)?;
         Ok(())
     }
 

@@ -123,7 +123,7 @@ fn hard_failure_or_memory_free_contamination_cannot_be_overridden_by_judge() -> 
     let mut oracle = oracle();
     CognitiveFieldGradingService::seal_oracle(&mut oracle)?;
     let mut reader = minimal_cognitive_understanding_answer();
-    reader.case_id = case.case_id.clone();
+    reader.case_id.clone_from(&case.case_id);
     reader.project_id = ProjectId::new_v7();
     reader.task_id = TaskId::new_v7();
     reader.memory_condition = CognitiveMemoryCondition::MemoryFreeControl;
@@ -136,8 +136,8 @@ fn hard_failure_or_memory_free_contamination_cannot_be_overridden_by_judge() -> 
     );
     CognitiveFieldGradingService::seal_deterministic_report(&mut deterministic)?;
     let mut judge = minimal_cognitive_judge_result();
-    judge.case_id = case.case_id.clone();
-    judge.oracle_hash = oracle.oracle_hash.clone();
+    judge.case_id.clone_from(&case.case_id);
+    judge.oracle_hash.clone_from(&oracle.oracle_hash);
     judge.reader_output_hash = CognitiveFieldGradingService::hash_json(&reader)?;
     judge.deterministic_report_hash = deterministic.report_hash.clone();
 
@@ -147,6 +147,7 @@ fn hard_failure_or_memory_free_contamination_cannot_be_overridden_by_judge() -> 
         &oracle,
         &reader,
         &deterministic,
+        None,
         &judge,
     );
     assert!(grade.passed, "{:?}", grade.errors);
@@ -162,6 +163,7 @@ fn hard_failure_or_memory_free_contamination_cannot_be_overridden_by_judge() -> 
         &oracle,
         &reader,
         &deterministic,
+        None,
         &judge,
     );
     assert!(!contaminated.passed);
@@ -185,6 +187,7 @@ fn hard_failure_or_memory_free_contamination_cannot_be_overridden_by_judge() -> 
         &oracle,
         &reader,
         &deterministic,
+        None,
         &judge,
     );
     assert!(!hard_failed.passed);
@@ -196,6 +199,119 @@ fn hard_failure_or_memory_free_contamination_cannot_be_overridden_by_judge() -> 
             .any(|error| error.contains("deterministic hard gate"))
     );
     Ok(())
+}
+
+#[test]
+fn grade_case_accepts_reused_judge_bound_to_equivalent_source_report() -> TestResult {
+    let (suite, case, oracle, reader, current, source, judge) = reused_judge_fixture()?;
+    let grade = CognitiveFieldGradingService::grade_case(
+        &suite,
+        &case,
+        &oracle,
+        &reader,
+        &current,
+        Some(&source),
+        &judge,
+    );
+    assert!(grade.passed, "{:?}", grade.errors);
+    assert_ne!(current.report_hash, source.report_hash);
+    Ok(())
+}
+
+#[test]
+fn grade_case_rejects_reused_judge_bound_to_divergent_source_report() -> TestResult {
+    let (suite, case, oracle, reader, current, mut source, mut judge) = reused_judge_fixture()?;
+    source.verifier_refs.push("verifier:foreign".to_owned());
+    CognitiveFieldGradingService::seal_deterministic_report(&mut source)?;
+    judge
+        .deterministic_report_hash
+        .clone_from(&source.report_hash);
+    let grade = CognitiveFieldGradingService::grade_case(
+        &suite,
+        &case,
+        &oracle,
+        &reader,
+        &current,
+        Some(&source),
+        &judge,
+    );
+    assert!(!grade.passed);
+    assert!(
+        grade
+            .errors
+            .iter()
+            .any(|error| error.contains("differ outside report_hash and run-scoped evidence refs"))
+    );
+    Ok(())
+}
+
+#[test]
+fn grade_case_rejects_reused_judge_when_binding_is_absent() -> TestResult {
+    let (suite, case, oracle, reader, current, _source, judge) = reused_judge_fixture()?;
+    let grade = CognitiveFieldGradingService::grade_case(
+        &suite, &case, &oracle, &reader, &current, None, &judge,
+    );
+    assert!(!grade.passed);
+    assert!(
+        grade
+            .errors
+            .iter()
+            .any(|error| error.contains("judge deterministic-report hash is invalid"))
+    );
+    Ok(())
+}
+
+#[allow(clippy::type_complexity)]
+fn reused_judge_fixture() -> Result<
+    (
+        CognitiveFieldSuite,
+        eliot_types::CognitiveFieldCase,
+        TaskIntentOracle,
+        eliot_types::CognitiveUnderstandingAnswer,
+        CognitiveDeterministicReport,
+        CognitiveDeterministicReport,
+        eliot_types::CognitiveJudgeResult,
+    ),
+    Box<dyn std::error::Error>,
+> {
+    let suite = suite()?;
+    let case = suite
+        .cases
+        .iter()
+        .find(|case| case.case_id == "U01")
+        .ok_or("U01 is missing")?
+        .clone();
+    let mut oracle = oracle();
+    CognitiveFieldGradingService::seal_oracle(&mut oracle)?;
+    let mut reader = minimal_cognitive_understanding_answer();
+    reader.case_id.clone_from(&case.case_id);
+    reader.project_id = ProjectId::new_v7();
+    reader.task_id = TaskId::new_v7();
+    reader.memory_condition = CognitiveMemoryCondition::Treatment;
+    let mut current = deterministic_report(
+        &suite,
+        &case,
+        reader.project_id,
+        reader.task_id,
+        &oracle.source_commit,
+    );
+    for evidence in &mut current.hard_gate_evidence {
+        evidence.evidence_refs = vec!["receipt:current".to_owned(), "contract:current".to_owned()];
+    }
+    CognitiveFieldGradingService::seal_deterministic_report(&mut current)?;
+    let mut source = current.clone();
+    for evidence in &mut source.hard_gate_evidence {
+        evidence.evidence_refs = vec!["receipt:source".to_owned(), "contract:source".to_owned()];
+    }
+    CognitiveFieldGradingService::seal_deterministic_report(&mut source)?;
+    let mut judge = minimal_cognitive_judge_result();
+    judge.case_id.clone_from(&case.case_id);
+    judge.oracle_hash.clone_from(&oracle.oracle_hash);
+    judge.reader_output_hash = CognitiveFieldGradingService::hash_json(&reader)?;
+    judge
+        .deterministic_report_hash
+        .clone_from(&source.report_hash);
+    Ok((suite, case, oracle, reader, current, source, judge))
 }
 
 fn deterministic_report(

@@ -501,3 +501,50 @@ This log preserves the ordered implementation evidence for
   Plan hash is `blake3:38c3fc794e802f34fb871b9f0563fe25f9b4daa834ce1814daf15058759e87b7`;
   staged manifest SHA-256 is
   `4d6e579ee13cd6d133e3147b2dc4d9196a097e083c0f2ae589f6358ffe3d08db`.
+
+### Generation-2 activated failure and reused-Judge repair
+
+- The real generation-2 seal failed after 15.044 s during publication with the exact error
+  `Judge output binding is invalid`. No provider process was started. Transactional compensation
+  completed: generation 2 is `abandoned`, all four minted leases were revoked, all four work items
+  and operation jobs were terminalized, the plan was not published, provider reservations/results/
+  artifacts remain zero, partial seals remain zero and replacement generation 3 is authorized.
+  The typed failure receipt is `abandoned-seals/seal-d30199d14e30e6a9-g2.json`; it is preserved.
+- Generation-2 residue is bounded and explicit: byte-identical reused Worker/Reader files exist in
+  both U03 execution roots; `judge.json`, `reused-roles.json` and `source-deterministic.json` do not.
+  Current run006 deterministic SHA-256 values remain
+  `8854ad77a8b5932878cced8a37c8133216271461c584bb71f0f3e547867c9ef6` (treatment) and
+  `907770e564185ee3fe8fca415b900583947f9908e092f2a42585ef8fa4af4d3f` (control).
+  The 29-file run005 public inventory snapshot digest is
+  `48286eb2546b7e124903dacfab7e3fe321857c7a26de9eab4aa0e324dd9e3bea`.
+- Root cause: deterministic report hashes are intentionally run-scoped because every hard-gate
+  record binds the current run's contract and deterministic receipt. The immutable run005 Judge
+  correctly binds the run005 source deterministic hashes, while publication incorrectly assumed
+  every Judge must bind the current run006 hashes. Source evidence was valid; the harness lacked a
+  typed cross-run binding.
+- Escalated this single architectural contradiction to Claude Code `claude-opus-5` at `max`, with
+  read-only plan permission, strict empty MCP and only Read/Grep/Glob. Session
+  `8ad52c31-8199-45bb-9c5f-c3727258640d` completed in 384.6 s / 381.2 s API time over 23 turns,
+  cost USD 2.14080075, with no permission denial, MCP, write or provider call. A first CLI start
+  received no prompt and exited locally in 2.4 s before any API request; it consumed no quota.
+- Opus confirmed a product/harness contradiction, not corrupt evidence, and approved generation 3
+  with zero repair provider calls. Rejected fixes include rewriting Judge bytes, copying source
+  deterministic truth over run006, weakening hash checks, accepting arbitrary prior hashes,
+  transplanting grades or rerunning U03.
+- Implemented a typed reused-Judge deterministic binding. Run006 keeps its freshly derived
+  `deterministic.json` as sole current truth. Exact source bytes are published separately as
+  `source-deterministic.json`; the reuse projection records source/current hashes, source byte
+  SHA-256 and an auditable field-equivalence record. Equivalence requires full report identity
+  after normalizing only `report_hash` and non-empty run-scoped `hard_gate_evidence.evidence_refs`.
+  Engine grading re-derives equivalence from bytes and never trusts the projection's verdict.
+- Added pre-authority validation to `verify_accepted_prior_role`, closing the dry-run coverage gap:
+  a non-equivalent reused Judge now fails before authority activation. Materialization preserves
+  current deterministic bytes with a before/after assertion; missing, foreign or tampered source
+  provenance fails closed. `CognitiveJudgeResult`, its schema and historical run005 files are
+  unchanged.
+- Focused verification after the repair: engine grading 7/7 PASS (including equivalent, divergent
+  and missing binding cases); runner module 26/26 PASS (including different run-scoped hashes,
+  current-truth immutability and tamper rejection); CLI 2/2 PASS; types contract 2/2 PASS; secret
+  boundary 5/5 PASS. Behavior bodies were 0.76 s or less. Format PASS, workspace all-target check
+  PASS in 21.56 s. First Clippy pass found four test-only `assigning_clones`; all were corrected
+  with `clone_from` and no suppression. Final all-target Clippy PASS; diff-check PASS.

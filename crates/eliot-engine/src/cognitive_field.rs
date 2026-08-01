@@ -309,6 +309,55 @@ impl CognitiveFieldGradingService {
         }
     }
 
+    pub fn deterministic_report_hash_is_valid(report: &CognitiveDeterministicReport) -> bool {
+        let mut material = report.clone();
+        material.report_hash.clear();
+        Self::hash_json(&material).is_ok_and(|expected| expected == report.report_hash)
+    }
+
+    pub fn deterministic_report_reuse_errors(
+        current: &CognitiveDeterministicReport,
+        bound: &CognitiveDeterministicReport,
+    ) -> Vec<String> {
+        let mut errors = Vec::new();
+        if !Self::deterministic_report_hash_is_valid(current) {
+            errors.push("current deterministic report hash is invalid".to_owned());
+        }
+        if !Self::deterministic_report_hash_is_valid(bound) {
+            errors.push("bound deterministic report hash is invalid".to_owned());
+        }
+        if current
+            .hard_gate_evidence
+            .iter()
+            .chain(&bound.hard_gate_evidence)
+            .any(|evidence| evidence.evidence_refs.is_empty())
+        {
+            errors.push("deterministic reuse evidence refs must remain non-empty".to_owned());
+        }
+
+        let mut normalized_current = current.clone();
+        let mut normalized_bound = bound.clone();
+        normalized_current.report_hash.clear();
+        normalized_bound.report_hash.clear();
+        for evidence in &mut normalized_current.hard_gate_evidence {
+            if !evidence.evidence_refs.is_empty() {
+                evidence.evidence_refs = vec!["run-scoped-evidence".to_owned()];
+            }
+        }
+        for evidence in &mut normalized_bound.hard_gate_evidence {
+            if !evidence.evidence_refs.is_empty() {
+                evidence.evidence_refs = vec!["run-scoped-evidence".to_owned()];
+            }
+        }
+        if normalized_current != normalized_bound {
+            errors.push(
+                "deterministic reports differ outside report_hash and run-scoped evidence refs"
+                    .to_owned(),
+            );
+        }
+        errors
+    }
+
     #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
     pub fn grade_case(
         suite: &CognitiveFieldSuite,
@@ -316,6 +365,7 @@ impl CognitiveFieldGradingService {
         oracle: &TaskIntentOracle,
         reader: &CognitiveUnderstandingAnswer,
         deterministic: &CognitiveDeterministicReport,
+        bound_deterministic: Option<&CognitiveDeterministicReport>,
         judge: &CognitiveJudgeResult,
     ) -> CognitiveFieldCaseGrade {
         let mut errors = Vec::new();
@@ -405,13 +455,21 @@ impl CognitiveFieldGradingService {
         {
             errors.push("a deterministic hard gate failed or lacks evidence".to_owned());
         }
+        let judge_deterministic = bound_deterministic.unwrap_or(deterministic);
+        if bound_deterministic.is_some() {
+            errors.extend(
+                Self::deterministic_report_reuse_errors(deterministic, judge_deterministic)
+                    .into_iter()
+                    .map(|error| format!("reused Judge deterministic binding: {error}")),
+            );
+        }
         let deterministic_pass = deterministic.passed
             && deterministic.schema_version == COGNITIVE_DETERMINISTIC_REPORT_SCHEMA_VERSION
-            && deterministic_report_hash_is_valid(deterministic)
+            && Self::deterministic_report_hash_is_valid(deterministic)
             && !errors
                 .iter()
                 .any(|error| error.contains("deterministic") || error.contains("controller"));
-        if !deterministic_report_hash_is_valid(deterministic) {
+        if !Self::deterministic_report_hash_is_valid(deterministic) {
             errors.push("deterministic report hash is invalid".to_owned());
         }
 
@@ -426,7 +484,7 @@ impl CognitiveFieldGradingService {
             Ok(_) => errors.push("judge reader-output hash is invalid".to_owned()),
             Err(error) => errors.push(format!("reader-output hash failed: {error}")),
         }
-        if judge.deterministic_report_hash != deterministic.report_hash {
+        if judge.deterministic_report_hash != judge_deterministic.report_hash {
             errors.push("judge deterministic-report hash is invalid".to_owned());
         }
         let scores = judge.scores.values();
@@ -518,11 +576,4 @@ fn oracle_validation_errors(oracle: &TaskIntentOracle) -> Vec<String> {
         }
     }
     errors
-}
-
-fn deterministic_report_hash_is_valid(report: &CognitiveDeterministicReport) -> bool {
-    let mut material = report.clone();
-    material.report_hash.clear();
-    CognitiveFieldGradingService::hash_json(&material)
-        .is_ok_and(|expected| expected == report.report_hash)
 }
