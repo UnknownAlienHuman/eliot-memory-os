@@ -239,6 +239,29 @@ impl SharedAntigravityProcessExecutor {
     }
 }
 
+fn antigravity_timeout_profile(timeout_ms: u64, cleanup_grace_ms: u64) -> ProviderTimeoutProfile {
+    ProviderTimeoutProfile {
+        profile_id: "antigravity-shared-supervisor-v1".to_owned(),
+        provider: "antigravity".to_owned(),
+        route_or_operation_class: "provider".to_owned(),
+        spawn_deadline_ms: Some(5_000),
+        // agy has no distinct dispatch-ack signal. Its first observable event is provider output.
+        dispatch_ack_deadline_ms: None,
+        first_output_deadline_ms: Some(timeout_ms),
+        idle_output_deadline_ms: Some(timeout_ms),
+        absolute_runtime_deadline_ms: timeout_ms,
+        cancellation_grace_ms: 100,
+        cleanup_grace_ms,
+        reconciliation_window_ms: cleanup_grace_ms,
+        output_heartbeat_supported: true,
+        status_lookup_supported: false,
+        evidence_basis: vec!["Antigravity governed command contract wall-clock budget".to_owned()],
+        assumptions: Vec::new(),
+        hard_upper_bounds: vec!["absolute runtime and cleanup grace".to_owned()],
+        policy_version: "runtime-supervision-v1".to_owned(),
+    }
+}
+
 impl AntigravityProcessExecutor for SharedAntigravityProcessExecutor {
     #[allow(
         clippy::too_many_lines,
@@ -278,27 +301,7 @@ impl AntigravityProcessExecutor for SharedAntigravityProcessExecutor {
             stdin_payload: None,
             stdout_limit_bytes: spec.max_output_bytes,
             stderr_limit_bytes: spec.max_output_bytes,
-            timeout_profile: ProviderTimeoutProfile {
-                profile_id: "antigravity-shared-supervisor-v1".to_owned(),
-                provider: "antigravity".to_owned(),
-                route_or_operation_class: "provider".to_owned(),
-                spawn_deadline_ms: Some(5_000),
-                dispatch_ack_deadline_ms: Some(5_000),
-                first_output_deadline_ms: Some(spec.timeout_ms),
-                idle_output_deadline_ms: Some(spec.timeout_ms),
-                absolute_runtime_deadline_ms: spec.timeout_ms,
-                cancellation_grace_ms: 100,
-                cleanup_grace_ms,
-                reconciliation_window_ms: cleanup_grace_ms,
-                output_heartbeat_supported: true,
-                status_lookup_supported: false,
-                evidence_basis: vec![
-                    "Antigravity governed command contract wall-clock budget".to_owned(),
-                ],
-                assumptions: Vec::new(),
-                hard_upper_bounds: vec!["absolute runtime and cleanup grace".to_owned()],
-                policy_version: "runtime-supervision-v1".to_owned(),
-            },
+            timeout_profile: antigravity_timeout_profile(spec.timeout_ms, cleanup_grace_ms),
             runtime_contract_sha256: None,
             role_lease_id: None,
             role_lease_epoch: None,
@@ -1453,9 +1456,9 @@ fn send_progress(sender: &mpsc::UnboundedSender<ProcessProgress>, progress: Proc
 mod tests {
     use super::{
         ChildCriticality, ProcessRestartPolicy, RestartStrategy, SharedAntigravityProcessExecutor,
-        SupervisedChildKind, SupervisedProcessSpec, checkpoint_requests_process_cancellation,
-        checkpoint_requires_process_recovery, default_daemon_runtime_instance,
-        operation_checkpoint, run_supervised_process,
+        SupervisedChildKind, SupervisedProcessSpec, antigravity_timeout_profile,
+        checkpoint_requests_process_cancellation, checkpoint_requires_process_recovery,
+        default_daemon_runtime_instance, operation_checkpoint, run_supervised_process,
     };
     use anyhow::{Result, anyhow, bail};
     use eliot_engine::{
@@ -1487,6 +1490,15 @@ mod tests {
                 .ends_with(Path::new("instances/default/runtime/publication.json"))
         );
         Ok(())
+    }
+
+    #[test]
+    fn antigravity_timeout_profile_does_not_invent_dispatch_ack() {
+        let profile = antigravity_timeout_profile(120_000, 5_000);
+
+        assert_eq!(profile.dispatch_ack_deadline_ms, None);
+        assert_eq!(profile.first_output_deadline_ms, Some(120_000));
+        assert_eq!(profile.absolute_runtime_deadline_ms, 120_000);
     }
 
     #[test]
