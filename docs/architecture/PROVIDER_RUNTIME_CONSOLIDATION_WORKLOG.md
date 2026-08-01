@@ -266,3 +266,77 @@ This log preserves the ordered implementation evidence for
   guard recovery and a non-panicking conversion; no lint suppression was added. Corrected
   `cargo clippy --workspace --all-targets -- -D warnings`: PASS, 22.19 s.
 - Final `cargo fmt --all -- --check`: PASS, 1.70 s. `git diff --check`: PASS, 0.07 s.
+
+## Section 11 — versioned candidate, historical reconciliation and live routes
+
+### Candidate activation and integrity
+
+- Committed and pushed ARCH-05 as `e18811953451138e3d6647f0d389c4edc7ca8447` on
+  `codex/cognitive-completion-v2`. The pre-existing untracked `.eliot/` directory remained
+  untouched and was not staged.
+- Built a clean-tree release candidate into the new immutable target
+  `C:\Users\kleym\AppData\Local\Eliot\builds\provider-runtime-e188119-target`.
+  Full release build: 203.70 s. Binary size: 55,431,680 bytes. SHA-256:
+  `9c98d96a1aa6b1982e1236117fd928283cabf805dda4486f5e6f99a24e71e87c`.
+- Verified the exact 40-character source commit is embedded in the candidate image. Before
+  switching, the old `authority-lc-7bb7c8f` daemon reported `overall=ready`,
+  `provider_dispatch_safe=true`, zero active/awaiting/cleanup/orphan operations and clean runtime
+  and authority integrity.
+- Stopped the prior PID 57380 through `daemon stop --instance default`, then started the candidate
+  hidden through the normal standalone daemon route. New PID: 18336. Publication path and SHA
+  exactly match the candidate; daemon status/doctor are ready.
+- Post-activation `runtime supervision status` reported `overall=ready`,
+  `provider_dispatch_safe=true`, active/awaiting/cleanup/orphan counts all zero, clean locked
+  binary SHA equality, zero orphan/pending role leases and zero partial seals.
+- Provider-free Antigravity MCP preflight passed with `provider_calls=0`, GUI unused and the exact
+  seven-tool `external_auditor` catalog surface. This also proved that preparation and authority
+  close work on the activated candidate before spending a model call.
+
+### Historical Antigravity reconciliation
+
+- Reconciled these two pre-ARCH-03 attempts:
+  - `external-agent-attempt-external-agent-smoke-antigravity-019fba9d-aa12-7cc2-a528-9d07fbfd2db8`;
+  - `external-agent-attempt-external-agent-smoke-antigravity-019fbaa6-ed08-7963-8414-121454c64021`.
+- Both dry-runs returned `provider_calls=0`, redispatch forbidden and proposed
+  `NON_RECONCILABLE_UNKNOWN`; the attempts remained `RUNNING` with null exit, cleanup and reap
+  fields. The provider-call ledger SHA stayed
+  `2bc9b982b32f4fd49236c7f03bbc89afcab6b925e9b6af68362c6bb671c54573`.
+- Apply wrote one immutable resolution per attempt and transitioned each through
+  `TimeoutPendingReconciliation` to `NonReconcilableUnknown`. No process fact was synthesized;
+  exit/cleanup/reap remain null, provider calls remain zero and the consumed ledger is byte
+  unchanged.
+- A second apply returned `idempotent_replay` for both. Attempt and resolution SHA-256 values were
+  byte-identical to their first applied state.
+
+### Current-state live smokes
+
+- Claude `claude-opus-5`: PASS, one provider call, 54.89 s wall. Smoke
+  `external-agent-smoke-claude-019fbc29-55b6-7e83-8f98-8c2e12d93242`; policy ID
+  `provider-route-policy-v1:claude:external-agent-smoke:962880c74cb36693`, policy hash
+  `962880c74cb366930f835a58ade7c3b9dda132dbd71d91670312ac0dcb956d59`.
+  PID 76312, process elapsed 12,852 ms, real exit/cleanup timestamps, Job Object process count
+  43 -> 0, complete reap and terminal `ReviewNormalized`.
+- Antigravity `gemini-3.6-flash-high`: PASS, one provider call, 63.03 s wall. Smoke
+  `external-agent-smoke-antigravity-019fbc2b-42d2-7243-9976-6bb354eb0066`; policy ID
+  `provider-route-policy-v1:antigravity:external-agent-smoke:feedec7571425763`, policy hash
+  `feedec7571425763dbe32d4a79d98aff739afa256019a65e28229bb6397793db`.
+  PID 78464, process elapsed 21,835 ms, real exit/cleanup, complete reap and terminal
+  `ReviewNormalized`.
+- OpenCode `opencode/mimo-v2.5-free`: PASS, one provider call, 62.16 s wall. Smoke
+  `external-agent-smoke-opencode-019fbc2c-8da4-7441-8277-faba2be54f22`; policy ID
+  `provider-route-policy-v1:opencode:external-agent-smoke:372d93a825f8905f`, policy hash
+  `372d93a825f8905f064e687d9047e5bf928016b5ad7fc8cec01fec9c5956dd47`.
+  PID 13200, process elapsed 12,783 ms, real exit/cleanup, complete reap and terminal
+  `ReviewNormalized`.
+- All three resolved the exact requested model, invoked provider-owned `eliot_current_state`,
+  returned schema-valid project/task/revision/model JSON and bound the same catalog-owned
+  `external_auditor` profile/hash
+  `8980ad8052aef150d6c36a782e349444c9d8c39634c368fc938a97775962a6e3`.
+- All three used first-output/absolute deadlines 120,000/120,000 ms, cancellation grace 100 ms and
+  cleanup grace 5,000 ms. Contract/evidence policy hashes match exactly. Each authority report has
+  canonical revoked-role, retired-binding and terminal-job receipts.
+- Repaired retries used: zero for Claude, Antigravity and OpenCode.
+- Final operations doctor after the three calls: `overall=ready`, runtime clean, expected/observed
+  governor SHA equal, active/awaiting/cleanup/orphan operations all zero, active/pending/orphan role
+  leases zero and partial seals zero. Provider root PIDs 76312, 78464 and 13200 are absent from the
+  OS process table.
