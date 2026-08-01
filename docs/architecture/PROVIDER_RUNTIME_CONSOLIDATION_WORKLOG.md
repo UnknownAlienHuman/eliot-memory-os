@@ -340,3 +340,53 @@ This log preserves the ordered implementation evidence for
   governor SHA equal, active/awaiting/cleanup/orphan operations all zero, active/pending/orphan role
   leases zero and partial seals zero. Provider root PIDs 76312, 78464 and 13200 are absent from the
   OS process table.
+
+## Automatic continuation — Task 02R2 recovery checkpoint
+
+- Re-read the Recovery Plan v3.0 checkpoint and current source history. The old execution report
+  stops at the P009 legacy-admission blocker, but source commit `8d2db4a` already contains the
+  tuple-exact U03 repair and the later runtime-supervision work contains the typed partial-seal
+  recovery. No duplicate P009 implementation was started.
+- Inspected `cq-core-20260730-006` without modifying its evidence. Generation 1 is explicitly
+  `abandoned`; recovery state is `complete`; all four sessions and leases were retired, all eight
+  staged files were hash-preservingly quarantined, fresh state reload found no matching live
+  authority, and the receipt authorizes replacement generation 2. Fresh run006 provider calls
+  remain zero.
+- Reused the existing Opus 5 decisions instead of spending a duplicate consultation. Those
+  decisions required staged publication, typed authority compensation, explicit non-projection
+  proofs and generation-2 continuation of run006 when no provider evidence exists. The applied
+  recovery receipt satisfies those conditions.
+- Found a new projection-recovery issue before sealing: the ignored public report roots for
+  `cq-core-20260729-003`, `cq-core-20260730-005` and `cq-core-20260730-006` are absent from the
+  working copy and from every Git/archive ref, while the complete private roots and run006's
+  abandoned-seal record remain present. Run006's role-evidence plan still binds absolute public
+  verifier/report references, so sealing must fail closed until those projections are restored or
+  a typed private-evidence recovery path is implemented.
+- Ran a zero-provider, zero-authority reconstruction probe using `cognitive-field prepare` against
+  a new scratch report root. It passed in 2.841 s and produced the expected three-case suite and
+  9e6d916 product worktree bindings. This proves the public prepare projection is reproducible,
+  but the generated contract has a new output root/timestamp/hash and therefore is not accepted as
+  recovery evidence for the immutable original run. No provider session or model call was made.
+- Next action: establish a provenance-preserving recovery design for the missing public projections
+  before generation-2 dry-run seal. Ad-hoc recreation or weakening role-evidence checks is
+  forbidden.
+- Escalated the projection-loss decision once to Claude Code `claude-opus-5` at `max`, with only
+  Read/Grep/Glob, plan permission mode and a strict empty MCP configuration. Session
+  `57aae3d9-c309-474e-9728-49fa6bd63d63` completed in 388.2 s wall / 385.3 s API time and reported
+  USD 1.692341. No write, MCP or provider tool was available to the consultation.
+- Opus classified this as recoverable projection loss only when every published byte is checked
+  against a surviving pre-loss commitment. The existing verifier must remain unchanged;
+  restoration must be typed, staged, create-only, idempotent and fresh-read verified. It confirmed
+  run006 generation 2 remains conditionally valid after exact restoration.
+- Opus identified one hard gap: historical `preflight.json` carries a contamination-clean claim
+  but no known independent pre-loss digest. Regenerating it from the current binary would be a
+  self-certification loop. Unless an independent digest-bound copy/attestation can be recovered,
+  the U03 reuse chain remains blocked. The next recovery probe is therefore exact-byte recovery
+  from the OneDrive deletion history, not code that admits reconstructed evidence.
+- The local Recycle Bin and all local/Git/archive references contained no copy of the public roots.
+  The OneDrive web route is authenticated in Chrome, but Microsoft interrupted navigation with the
+  account-security confirmation page (`Is your security info still accurate?`). No account action
+  was taken. The exact tab was left as a user handoff because confirming account recovery/security
+  details is outside autonomous repository authority. After the operator confirms the page, the
+  next bounded action is a read-only search of OneDrive's recycle history for the three exact run
+  roots, followed by create-only restoration if found.
