@@ -470,3 +470,34 @@ This log preserves the ordered implementation evidence for
 - Two tool invocations were prematurely killed by an accidentally short orchestration timeout
   before useful results (one release build start and one focused-test start). Both were rerun with
   bounded explicit limits; neither was a code/test failure and neither consumed a provider call.
+
+### Commit-bound candidate and zero-model cutover
+
+- Committed and pushed the runtime/profile repair as
+  `69d5fb966d97e239b2567ac520659ac149ed7730` with the required subject
+  `C7-02R2: bind cognitive provider runtime and resumable role evidence`. The pre-existing untracked
+  `.eliot/` directory remained unstaged and untouched.
+- Built a clean-tree immutable release under
+  `C:\Users\kleym\AppData\Local\Eliot\builds\cognitive-profile-69d5fb9-target` in 220.60 s.
+  Binary size is 55,439,872 bytes; SHA-256 is
+  `25b435e3b0add2dabab2c6292d877b85dfd75d5ca06cb5f810cee5836a4148fb`; the full 40-character
+  source commit is embedded in the image.
+- First zero-model preflight attempt failed closed in 0.772 s with
+  `unattested_cognitive_governor`: the standalone daemon still locked the prior `e188119`
+  candidate. Pre-cutover runtime supervision was ready/clean, dispatch-safe and had zero
+  active, stuck, awaiting-reconciliation, cleanup-pending or orphan operations.
+- Cooperatively stopped old PID 18336 and started the commit-bound candidate hidden through the
+  normal standalone daemon route. New PID 68272 published the exact expected path/SHA. Doctor is
+  ready; runtime integrity is clean; expected and observed SHA match; partial seals, orphan
+  processes and pending/orphan role leases remain zero; provider dispatch is safe.
+- Second real zero-model preflight passed in 6.251 s internal / 6.532 s command wall. It proved
+  Codex configuration listing, Governor MCP process start and initialize, exact seven-tool
+  `codex_worker` surface, absent/disabled raw SurrealDB and a scoped status read. Runtime contract
+  hash is `ca119c16fb008fe87dd2450e880abafccc4e6b7b83c6b05ea03b81e064094b63`; receipt file SHA-256 is
+  `11d6c78a8da0644439b9adf5b89f48d7e3ecffec5cdb6c909ad9a8147c3d5118`. No provider session,
+  provider call or model token was consumed.
+- Final commit-bound run006 generation-2 dry-run passed in 5.280 s. Public 11/11 and private
+  1561/1561 SHA inventories were byte-identical before/after, and `authority_side_effects=0`.
+  Plan hash is `blake3:38c3fc794e802f34fb871b9f0563fe25f9b4daa834ce1814daf15058759e87b7`;
+  staged manifest SHA-256 is
+  `4d6e579ee13cd6d133e3147b2dc4d9196a097e083c0f2ae589f6358ffe3d08db`.
