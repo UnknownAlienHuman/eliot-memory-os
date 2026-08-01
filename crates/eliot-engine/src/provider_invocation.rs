@@ -7,7 +7,7 @@ use eliot_types::{
     ProviderInvocationOutcome, ProviderInvocationOutcomeClass, ProviderInvocationState,
     ProviderInvocationTransition, ProviderReconciliationMethod, ProviderReconciliationRecord,
     ProviderResultCompleteness, ProviderRouteReadinessGate, ProviderRouteReadinessVerdict,
-    ProviderTimeoutClass, ProviderTimeoutProfile,
+    ProviderTimeoutClass,
 };
 use time::{Duration, OffsetDateTime};
 
@@ -515,37 +515,17 @@ impl ProviderRouteReadinessService {
     }
 }
 
-pub fn antigravity_plan_timeout_profile() -> ProviderTimeoutProfile {
-    ProviderTimeoutProfile {
-        profile_id: "provider-timeout-profile:antigravity-plan-print-1".to_owned(),
-        provider: "antigravity".to_owned(),
-        route_or_operation_class: "agy plan print audit".to_owned(),
-        spawn_deadline_ms: None,
-        dispatch_ack_deadline_ms: None,
-        first_output_deadline_ms: None,
-        idle_output_deadline_ms: None,
-        absolute_runtime_deadline_ms: 310_000,
-        cancellation_grace_ms: 5_000,
-        cleanup_grace_ms: 45_000,
-        reconciliation_window_ms: 86_400_000,
-        output_heartbeat_supported: false,
-        status_lookup_supported: false,
-        evidence_basis: vec![
-            "delegation-provider-run safety_receipt.timeout_ms=310000".to_owned(),
-            "typed argv pins --print-timeout=300s".to_owned(),
-            "recorded elapsed runtime is approximately 301 seconds".to_owned(),
-        ],
-        assumptions: vec![
-            "spawn, dispatch-ack, first-output and idle deadlines were not independently recorded"
-                .to_owned(),
-        ],
-        hard_upper_bounds: vec![
-            "absolute_runtime_deadline_ms=310000".to_owned(),
-            "no automatic retry".to_owned(),
-            "no infinite wait".to_owned(),
-        ],
-        policy_version: "antigravity-plan-timeout-1".to_owned(),
-    }
+pub fn antigravity_plan_route_policy() -> eliot_types::ProviderRoutePolicy {
+    eliot_types::ProviderRoutePolicy::for_route(
+        eliot_types::AgentHostId::Antigravity,
+        "agy plan print audit",
+        eliot_types::ProviderDeclaredBudget::new(310_000, 8 * 1024 * 1024)
+            .with_spawn_deadline_ms(None)
+            .with_first_output_deadline_ms(None)
+            .with_cancellation_grace_ms(5_000)
+            .with_cleanup_grace_ms(45_000)
+            .with_reconciliation_window_ms(86_400_000),
+    )
 }
 
 fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), EngineError> {

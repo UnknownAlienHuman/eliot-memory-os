@@ -10,12 +10,12 @@ use eliot_types::{
     AdapterAuthorityProfile, AdapterCapability, AdapterCircuitState, AdapterClass, AdapterContext,
     AdapterError, AdapterHealth, AdapterLimits, AdapterObservation, AdapterRequest, AdapterResult,
     AdapterResultStatus, AdapterState, BlackboardItem, BlackboardItemKind, BlackboardScope,
-    CapabilityManifest, CommandContext, ConfidenceLevel, LifecycleStatus, MailboxMessage,
-    MailboxMessageKind, MailboxRecipient, ModuleHealth, ModuleManifest, ModuleTransport,
-    OPERATION_RESTART_WINDOW_SCHEMA_VERSION, OPERATION_RUNTIME_CHECKPOINT_SCHEMA_VERSION,
-    OperationCancellationState, OperationPhase, OperationReconciliationState,
-    OperationRestartWindow, OperationRuntimeCheckpoint, ProcessExecutionPolicy,
-    ProviderDispatchState, SemanticCommand, ServiceHealthState, TaintClass,
+    CapabilityManifest, CommandContext, ConfidenceLevel, ExternalAgentExecutionRequest,
+    LifecycleStatus, MailboxMessage, MailboxMessageKind, MailboxRecipient, ModuleHealth,
+    ModuleManifest, ModuleTransport, OPERATION_RESTART_WINDOW_SCHEMA_VERSION,
+    OPERATION_RUNTIME_CHECKPOINT_SCHEMA_VERSION, OperationCancellationState, OperationPhase,
+    OperationReconciliationState, OperationRestartWindow, OperationRuntimeCheckpoint,
+    ProcessExecutionPolicy, ProviderDispatchState, SemanticCommand, ServiceHealthState, TaintClass,
     ToolObservationRecordCommand, Visibility, WriteId, WriteReceiptRef,
 };
 use serde::{Deserialize, Serialize};
@@ -356,7 +356,17 @@ impl AdapterSupervisor {
             ));
         };
         let started = Instant::now();
-        let timeout_ms = adapter.manifest().limits.timeout_ms;
+        let timeout_ms = if adapter.manifest().adapter_class == AdapterClass::ExternalCandidate {
+            let execution =
+                serde_json::from_value::<ExternalAgentExecutionRequest>(request.input.clone())?;
+            let timeout = execution.provider_route_policy.timeout_profile();
+            timeout
+                .absolute_runtime_deadline_ms()
+                .saturating_add(timeout.cancellation_grace_ms())
+                .saturating_add(timeout.cleanup_grace_ms())
+        } else {
+            adapter.manifest().limits.timeout_ms
+        };
         let deadline = started
             .checked_add(Duration::from_millis(timeout_ms))
             .unwrap_or(started);

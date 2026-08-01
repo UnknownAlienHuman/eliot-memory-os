@@ -7,7 +7,10 @@ use eliot_engine::{
     OperationRuntimeHandle,
     runtime_supervision::{AdapterExecutionContext, CancellationToken},
 };
-use eliot_types::{MAX_SECRET_BOUNDARY_BYTES, ProcessReapReceipt, ProviderTimeoutProfile};
+use eliot_types::{
+    AgentHostId, MAX_SECRET_BOUNDARY_BYTES, ProcessReapReceipt, ProviderDeclaredBudget,
+    ProviderRoutePolicy,
+};
 use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::process::Command;
@@ -82,25 +85,19 @@ where
         stdin_payload: None,
         stdout_limit_bytes: u64::try_from(MAX_SECRET_BOUNDARY_BYTES).unwrap_or(u64::MAX),
         stderr_limit_bytes: u64::try_from(MAX_SECRET_BOUNDARY_BYTES).unwrap_or(u64::MAX),
-        timeout_profile: ProviderTimeoutProfile {
-            profile_id: "managed-provider-default-v1".to_owned(),
-            provider: "managed-external-agent".to_owned(),
-            route_or_operation_class: "provider".to_owned(),
-            spawn_deadline_ms: Some(5_000),
-            dispatch_ack_deadline_ms: Some(5_000),
-            first_output_deadline_ms: None,
-            idle_output_deadline_ms: None,
-            absolute_runtime_deadline_ms,
-            cancellation_grace_ms: 100,
-            cleanup_grace_ms,
-            reconciliation_window_ms: cleanup_grace_ms,
-            output_heartbeat_supported: false,
-            status_lookup_supported: false,
-            evidence_basis: vec!["governed launch contract wall-clock budget".to_owned()],
-            assumptions: Vec::new(),
-            hard_upper_bounds: vec!["absolute runtime and cleanup grace".to_owned()],
-            policy_version: "runtime-supervision-v1".to_owned(),
-        },
+        timeout_profile: ProviderRoutePolicy::for_route(
+            AgentHostId::Codex,
+            "legacy-external-agent-process",
+            ProviderDeclaredBudget::new(
+                absolute_runtime_deadline_ms,
+                u64::try_from(MAX_SECRET_BOUNDARY_BYTES).unwrap_or(u64::MAX),
+            )
+            .with_first_output_deadline_ms(None)
+            .with_cleanup_grace_ms(cleanup_grace_ms)
+            .with_reconciliation_window_ms(cleanup_grace_ms),
+        )
+        .timeout_profile()
+        .clone(),
         runtime_contract_sha256: context.runtime_contract_sha256.clone(),
         role_lease_id: context.role_lease_id.clone(),
         role_lease_epoch: context.role_lease_epoch,

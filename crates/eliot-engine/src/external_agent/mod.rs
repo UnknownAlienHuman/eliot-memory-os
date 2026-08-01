@@ -110,6 +110,9 @@ pub fn validate_provider_runtime_contract(
         || contract.requested_model.trim().is_empty()
         || contract.model_selection_mechanism.trim().is_empty()
         || contract.timeout_profile_ref.trim().is_empty()
+        || contract.provider_route_policy.policy_id.trim().is_empty()
+        || contract.provider_route_policy.policy_hash_blake3.len() != 64
+        || contract.timeout_profile_ref != contract.provider_route_policy.policy_id
         || contract.process_containment.trim().is_empty()
         || contract.permission_profile.trim().is_empty()
     {
@@ -192,6 +195,23 @@ pub fn validate_external_agent_execution_request(
         || !is_sha256(&request.output_schema_sha256)
         || request.requested_model.trim().is_empty()
         || request.timeout_profile_ref.trim().is_empty()
+        || request.provider_route_policy.policy_id().is_empty()
+        || request.provider_route_policy.policy_hash_blake3().len() != 64
+        || request.timeout_profile_ref != request.provider_route_policy.policy_id()
+        || !launch
+            .host_profile_ref
+            .ends_with(request.provider_route_policy.host().as_str())
+        || request
+            .provider_route_policy
+            .timeout_profile()
+            .dispatch_ack_deadline_ms()
+            .is_some()
+        || request
+            .provider_route_policy
+            .timeout_profile()
+            .absolute_runtime_deadline_ms()
+            == 0
+        || request.provider_route_policy.output_limit_bytes() == 0
         || request.max_turns_or_steps == 0
     {
         return rejected("execution request is missing a required sealed binding");

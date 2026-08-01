@@ -240,26 +240,16 @@ impl SharedAntigravityProcessExecutor {
 }
 
 fn antigravity_timeout_profile(timeout_ms: u64, cleanup_grace_ms: u64) -> ProviderTimeoutProfile {
-    ProviderTimeoutProfile {
-        profile_id: "antigravity-shared-supervisor-v1".to_owned(),
-        provider: "antigravity".to_owned(),
-        route_or_operation_class: "provider".to_owned(),
-        spawn_deadline_ms: Some(5_000),
-        // agy has no distinct dispatch-ack signal. Its first observable event is provider output.
-        dispatch_ack_deadline_ms: None,
-        first_output_deadline_ms: Some(timeout_ms),
-        idle_output_deadline_ms: Some(timeout_ms),
-        absolute_runtime_deadline_ms: timeout_ms,
-        cancellation_grace_ms: 100,
-        cleanup_grace_ms,
-        reconciliation_window_ms: cleanup_grace_ms,
-        output_heartbeat_supported: true,
-        status_lookup_supported: false,
-        evidence_basis: vec!["Antigravity governed command contract wall-clock budget".to_owned()],
-        assumptions: Vec::new(),
-        hard_upper_bounds: vec!["absolute runtime and cleanup grace".to_owned()],
-        policy_version: "runtime-supervision-v1".to_owned(),
-    }
+    eliot_types::ProviderRoutePolicy::for_route(
+        eliot_types::AgentHostId::Antigravity,
+        "provider",
+        eliot_types::ProviderDeclaredBudget::new(timeout_ms, u64::MAX)
+            .with_idle_output_deadline_ms(Some(timeout_ms))
+            .with_cleanup_grace_ms(cleanup_grace_ms)
+            .with_reconciliation_window_ms(cleanup_grace_ms),
+    )
+    .timeout_profile()
+    .clone()
 }
 
 impl AntigravityProcessExecutor for SharedAntigravityProcessExecutor {
@@ -769,10 +759,10 @@ fn validate_spec(spec: &SupervisedProcessSpec) -> Result<()> {
             spec.cwd.display()
         );
     }
-    if spec.timeout_profile.absolute_runtime_deadline_ms == 0 {
+    if spec.timeout_profile.absolute_runtime_deadline_ms() == 0 {
         bail!("absolute runtime deadline must be non-zero");
     }
-    if spec.timeout_profile.cleanup_grace_ms == 0 {
+    if spec.timeout_profile.cleanup_grace_ms() == 0 {
         bail!("cleanup grace must be non-zero");
     }
     if spec.restart_policy.max_restarts > 0 && spec.restart_policy.restart_window_seconds == 0 {
@@ -802,12 +792,12 @@ fn operation_checkpoint(spec: &SupervisedProcessSpec) -> OperationRuntimeCheckpo
     let now = OffsetDateTime::now_utc();
     let phase_deadline_at = now
         + time::Duration::milliseconds(
-            i64::try_from(spec.timeout_profile.spawn_deadline_ms.unwrap_or(5_000))
+            i64::try_from(spec.timeout_profile.spawn_deadline_ms().unwrap_or(5_000))
                 .unwrap_or(i64::MAX),
         );
     let absolute_deadline_at = now
         + time::Duration::milliseconds(
-            i64::try_from(spec.timeout_profile.absolute_runtime_deadline_ms).unwrap_or(i64::MAX),
+            i64::try_from(spec.timeout_profile.absolute_runtime_deadline_ms()).unwrap_or(i64::MAX),
         );
     OperationRuntimeCheckpoint {
         schema_version: OPERATION_RUNTIME_CHECKPOINT_SCHEMA_VERSION.to_owned(),
@@ -995,7 +985,7 @@ fn run_worker(
     );
     let _ = spawned_tx.send(Ok(root_pid));
     let spawn_admission_timeout =
-        Duration::from_millis(spec.timeout_profile.spawn_deadline_ms.unwrap_or(5_000));
+        Duration::from_millis(spec.timeout_profile.spawn_deadline_ms().unwrap_or(5_000));
     if !admission_rx
         .recv_timeout(spawn_admission_timeout)
         .unwrap_or(false)
@@ -1061,15 +1051,15 @@ fn run_worker(
 
     let profile_absolute_deadline = started
         .checked_add(Duration::from_millis(
-            spec.timeout_profile.absolute_runtime_deadline_ms,
+            spec.timeout_profile.absolute_runtime_deadline_ms(),
         ))
         .unwrap_or(started);
     let absolute_deadline = context_deadline.map_or(profile_absolute_deadline, |deadline| {
         profile_absolute_deadline.min(deadline)
     });
     let first_output_deadline = [
-        spec.timeout_profile.dispatch_ack_deadline_ms,
-        spec.timeout_profile.first_output_deadline_ms,
+        spec.timeout_profile.dispatch_ack_deadline_ms(),
+        spec.timeout_profile.first_output_deadline_ms(),
     ]
     .into_iter()
     .flatten()
@@ -1077,10 +1067,10 @@ fn run_worker(
     .map(Duration::from_millis);
     let idle_output_deadline = spec
         .timeout_profile
-        .idle_output_deadline_ms
+        .idle_output_deadline_ms()
         .map(Duration::from_millis);
-    let cancellation_grace = Duration::from_millis(spec.timeout_profile.cancellation_grace_ms);
-    let cleanup_grace = Duration::from_millis(spec.timeout_profile.cleanup_grace_ms);
+    let cancellation_grace = Duration::from_millis(spec.timeout_profile.cancellation_grace_ms());
+    let cleanup_grace = Duration::from_millis(spec.timeout_profile.cleanup_grace_ms());
     let mut max_process_count = initial_count;
     let mut last_process_count = initial_count;
     let mut timed_out = false;
@@ -1592,25 +1582,18 @@ mod tests {
             stdin_payload: Some(vec![b'i'; 96 * 1024]),
             stdout_limit_bytes: 32 * 1024,
             stderr_limit_bytes: 32 * 1024,
-            timeout_profile: ProviderTimeoutProfile {
-                profile_id: "fixture".to_owned(),
-                provider: "fixture".to_owned(),
-                route_or_operation_class: "supervised-process".to_owned(),
-                spawn_deadline_ms: Some(1_000),
-                dispatch_ack_deadline_ms: None,
-                first_output_deadline_ms: None,
-                idle_output_deadline_ms: None,
-                absolute_runtime_deadline_ms: runtime_ms,
-                cancellation_grace_ms: 20,
-                cleanup_grace_ms: 2_000,
-                reconciliation_window_ms: 0,
-                output_heartbeat_supported: false,
-                status_lookup_supported: false,
-                evidence_basis: vec!["native fixture".to_owned()],
-                assumptions: Vec::new(),
-                hard_upper_bounds: Vec::new(),
-                policy_version: "test-v1".to_owned(),
-            },
+            timeout_profile: eliot_types::ProviderRoutePolicy::for_route(
+                eliot_types::AgentHostId::Codex,
+                "supervised-process-fixture",
+                eliot_types::ProviderDeclaredBudget::new(runtime_ms, 32 * 1024)
+                    .with_spawn_deadline_ms(Some(1_000))
+                    .with_first_output_deadline_ms(None)
+                    .with_cancellation_grace_ms(20)
+                    .with_cleanup_grace_ms(2_000)
+                    .with_reconciliation_window_ms(0),
+            )
+            .timeout_profile()
+            .clone(),
             runtime_contract_sha256: None,
             role_lease_id: None,
             role_lease_epoch: None,
@@ -1736,8 +1719,19 @@ mod tests {
     async fn supervised_process_idle_output_deadline_cancels_and_reaps() -> Result<()> {
         let mut spec = fixture_spec("idle-output", 5_000)?;
         spec.stdin_payload = Some(Vec::new());
-        spec.timeout_profile.first_output_deadline_ms = Some(3_000);
-        spec.timeout_profile.idle_output_deadline_ms = Some(100);
+        spec.timeout_profile = eliot_types::ProviderRoutePolicy::for_route(
+            eliot_types::AgentHostId::Codex,
+            "supervised-process-idle-output-fixture",
+            eliot_types::ProviderDeclaredBudget::new(5_000, 32 * 1024)
+                .with_spawn_deadline_ms(Some(1_000))
+                .with_first_output_deadline_ms(Some(3_000))
+                .with_idle_output_deadline_ms(Some(100))
+                .with_cancellation_grace_ms(20)
+                .with_cleanup_grace_ms(2_000)
+                .with_reconciliation_window_ms(0),
+        )
+        .timeout_profile()
+        .clone();
         let output = run_supervised_process(spec, context(5_000)).await?;
         assert!(output.timed_out);
         assert!(

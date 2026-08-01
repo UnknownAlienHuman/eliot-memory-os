@@ -364,25 +364,19 @@ async fn run_bounded_mcp_child(
             stdin_payload: Some(request_bytes),
             stdout_limit_bytes: MAX_MCP_REFERENCE_OUTPUT_BYTES,
             stderr_limit_bytes: MAX_MCP_REFERENCE_OUTPUT_BYTES,
-            timeout_profile: eliot_types::ProviderTimeoutProfile {
-                profile_id: "mcp-preflight-v1".to_owned(),
-                provider: "eliot-governor".to_owned(),
-                route_or_operation_class: phase.to_owned(),
-                spawn_deadline_ms: Some(5_000),
-                dispatch_ack_deadline_ms: None,
-                first_output_deadline_ms: Some(timeout_ms),
-                idle_output_deadline_ms: Some(timeout_ms),
-                absolute_runtime_deadline_ms: timeout_ms,
-                cancellation_grace_ms: 25,
-                cleanup_grace_ms: 5_000,
-                reconciliation_window_ms: 0,
-                output_heartbeat_supported: true,
-                status_lookup_supported: false,
-                evidence_basis: vec!["bounded local MCP reference exchange".to_owned()],
-                assumptions: Vec::new(),
-                hard_upper_bounds: vec!["absolute runtime deadline".to_owned()],
-                policy_version: "runtime-supervision-v1".to_owned(),
-            },
+            timeout_profile: eliot_types::ProviderRoutePolicy::for_route(
+                AgentHostId::Codex,
+                phase,
+                eliot_types::ProviderDeclaredBudget::new(
+                    timeout_ms,
+                    MAX_MCP_REFERENCE_OUTPUT_BYTES,
+                )
+                .with_idle_output_deadline_ms(Some(timeout_ms))
+                .with_cancellation_grace_ms(25)
+                .with_reconciliation_window_ms(0),
+            )
+            .timeout_profile()
+            .clone(),
             runtime_contract_sha256: None,
             role_lease_id: None,
             role_lease_epoch: None,
@@ -1247,6 +1241,11 @@ async fn run_mcp_smoke(config_path: &Path, host: AgentHostId, model: &str) -> Re
             verifier_ref: format!("external-agent-smoke-verifier:{smoke_id}"),
             idempotency_key: format!("external-agent-smoke:{smoke_id}"),
         };
+        let provider_route_policy = eliot_types::ProviderRoutePolicy::for_route(
+            host,
+            "external-agent-smoke",
+            eliot_types::ProviderDeclaredBudget::new(120_000, MAX_PROVIDER_OUTPUT_BYTES),
+        );
         let execution = ExternalAgentExecutionRequest {
             invocation,
             launch_contract,
@@ -1257,7 +1256,8 @@ async fn run_mcp_smoke(config_path: &Path, host: AgentHostId, model: &str) -> Re
             output_schema_sha256: sha256_bytes(&std::fs::read(&schema_path)?),
             requested_model: model.to_owned(),
             max_turns_or_steps: 4,
-            timeout_profile_ref: format!("provider-timeout:{}-smoke-120s", host.as_str()),
+            timeout_profile_ref: provider_route_policy.policy_id().to_owned(),
+            provider_route_policy,
             allowed_provider_tools: provider_allowed_tools(host),
             denied_provider_tools: vec![
                 "Bash".to_owned(),
@@ -1801,7 +1801,8 @@ impl ExternalAgentAdapterCore {
             executable_or_transport: Some(path_string(&executable)),
             cwd: Some(path_string(&cwd)),
             environment_fingerprint: Some(sha256_bytes(&serde_json::to_vec(&environment)?)),
-            timeout_profile_id: execution.timeout_profile_ref.clone(),
+            timeout_profile_id: execution.provider_route_policy.policy_id().to_owned(),
+            provider_route_policy: execution.provider_route_policy.binding(),
             state_transitions: Vec::new(),
             dispatch_started_at: None,
             process_started_at: None,
@@ -2337,6 +2338,7 @@ impl ExternalAgentAdapterCore {
             structured_output_mode: plan.structured_output_mode,
             output_schema_sha256: execution.output_schema_sha256.clone(),
             timeout_profile_ref: execution.timeout_profile_ref.clone(),
+            provider_route_policy: execution.provider_route_policy.binding(),
             process_containment: "windows-suspended-kill-on-close-job-object-v1".to_owned(),
             candidate_only: true,
             runtime_contract_sha256: String::new(),
@@ -2378,6 +2380,7 @@ impl ExternalAgentAdapterCore {
             .map(|parsed| parsed.structured_output.clone());
         let evidence = ProviderExecutionEvidence {
             runtime_contract_sha256: runtime_contract.runtime_contract_sha256.clone(),
+            provider_route_policy: execution.provider_route_policy.binding(),
             requested_model: execution.requested_model.clone(),
             resolved_model: parsed
                 .as_ref()

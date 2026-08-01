@@ -918,25 +918,16 @@ fn supervised_preflight_command(
             stdin_payload,
             stdout_limit_bytes: 4 * 1024 * 1024,
             stderr_limit_bytes: 4 * 1024 * 1024,
-            timeout_profile: eliot_types::ProviderTimeoutProfile {
-                profile_id: "cognitive-preflight-v1".to_owned(),
-                provider: "eliot-governor".to_owned(),
-                route_or_operation_class: "cognitive-preflight".to_owned(),
-                spawn_deadline_ms: Some(5_000),
-                dispatch_ack_deadline_ms: None,
-                first_output_deadline_ms: Some(timeout_ms),
-                idle_output_deadline_ms: Some(timeout_ms),
-                absolute_runtime_deadline_ms: timeout_ms,
-                cancellation_grace_ms: 25,
-                cleanup_grace_ms: 5_000,
-                reconciliation_window_ms: 0,
-                output_heartbeat_supported: true,
-                status_lookup_supported: false,
-                evidence_basis: vec!["bounded cognitive runtime preflight".to_owned()],
-                assumptions: Vec::new(),
-                hard_upper_bounds: vec!["20 second preflight limit".to_owned()],
-                policy_version: "runtime-supervision-v1".to_owned(),
-            },
+            timeout_profile: eliot_types::ProviderRoutePolicy::for_route(
+                AgentHostId::Codex,
+                "cognitive-preflight",
+                eliot_types::ProviderDeclaredBudget::new(timeout_ms, 4 * 1024 * 1024)
+                    .with_idle_output_deadline_ms(Some(timeout_ms))
+                    .with_cancellation_grace_ms(25)
+                    .with_reconciliation_window_ms(0),
+            )
+            .timeout_profile()
+            .clone(),
             runtime_contract_sha256: None,
             role_lease_id: None,
             role_lease_epoch: None,
@@ -1924,6 +1915,11 @@ fn cognitive_external_execution_request(
         verifier_ref: planned_verifier_ref,
         idempotency_key,
     };
+    let provider_route_policy = eliot_types::ProviderRoutePolicy::for_route(
+        call.host,
+        "cognitive-field-reader",
+        eliot_types::ProviderDeclaredBudget::new(900_000, 1_048_576),
+    );
     let execution = ExternalAgentExecutionRequest {
         invocation,
         launch_contract,
@@ -1934,7 +1930,8 @@ fn cognitive_external_execution_request(
         output_schema_sha256: call.provider_schema_sha256.clone(),
         requested_model: call.requested_model.clone(),
         max_turns_or_steps: 24,
-        timeout_profile_ref: format!("cognitive-field-{}-900s", call.host.as_str()),
+        timeout_profile_ref: provider_route_policy.policy_id().to_owned(),
+        provider_route_policy,
         allowed_provider_tools,
         denied_provider_tools: vec![
             "Bash".to_owned(),

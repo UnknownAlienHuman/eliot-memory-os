@@ -1,7 +1,8 @@
 use crate::{
     AgentHostId, AgentInvocationRequest, AgentRole, AgentSessionHostBinding, AgentSessionId,
     AuthorityRevocationReceipt, HostLaunchContract, HostLaunchScope, OperationJob,
-    OperationJobState, ProjectId, TaskId, TaskRoleLease, WriteReceiptRef,
+    OperationJobState, ProjectId, ProviderRoutePolicy, ProviderRoutePolicyBinding, TaskId,
+    TaskRoleLease, WriteReceiptRef,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -183,6 +184,7 @@ pub struct ProviderRuntimeContract {
 
     #[serde(default)]
     pub timeout_profile_ref: String,
+    pub provider_route_policy: ProviderRoutePolicyBinding,
     #[serde(default)]
     pub process_containment: String,
     #[serde(default)]
@@ -252,6 +254,7 @@ pub struct ExternalAgentExecutionRequest {
     pub requested_model: String,
     pub max_turns_or_steps: u32,
     pub timeout_profile_ref: String,
+    pub provider_route_policy: ProviderRoutePolicy,
 
     pub allowed_provider_tools: Vec<String>,
     pub denied_provider_tools: Vec<String>,
@@ -266,6 +269,7 @@ pub struct ExternalAgentExecutionRequest {
 #[serde(deny_unknown_fields)]
 pub struct ProviderExecutionEvidence {
     pub runtime_contract_sha256: String,
+    pub provider_route_policy: ProviderRoutePolicyBinding,
 
     pub requested_model: String,
     pub resolved_model: String,

@@ -10,8 +10,8 @@ use eliot_engine::{
     DelegationReportService, ExternalResultCompletenessService, ExternalReviewJobService,
     IncidentService, ProviderCallReservationDecision, ProviderCallReservationOwner,
     ProviderCallReservationRequest, ProviderCompletenessInput, ProviderInvocationJournal,
-    WorkState, antigravity_plan_timeout_profile, antigravity_review_request,
-    external_review_request, work_lease_is_active,
+    WorkState, antigravity_plan_route_policy, antigravity_review_request, external_review_request,
+    work_lease_is_active,
 };
 use eliot_types::{
     AntigravityBinaryResolutionStatus, AntigravityEnablementScope, AntigravityEnablementState,
@@ -782,8 +782,8 @@ async fn execute_real(
             gate.reasons
         );
     }
-    let timeout_profile = antigravity_plan_timeout_profile();
-    crate::calibration_runtime::write_pair(root, "provider-timeout-profile", &timeout_profile)?;
+    let route_policy = antigravity_plan_route_policy();
+    crate::calibration_runtime::write_pair(root, "provider-route-policy", &route_policy)?;
     let journal = ProviderInvocationJournal::new(root);
     let mut attempt = journal.create(ProviderInvocationAttempt {
         invocation_attempt_id: format!(
@@ -809,7 +809,8 @@ async fn execute_real(
                 .to_hex()
                 .to_string(),
         ),
-        timeout_profile_id: timeout_profile.profile_id.clone(),
+        timeout_profile_id: route_policy.timeout_profile().profile_id().to_owned(),
+        provider_route_policy: route_policy.binding(),
         state_transitions: Vec::new(),
         dispatch_started_at: None,
         process_started_at: None,

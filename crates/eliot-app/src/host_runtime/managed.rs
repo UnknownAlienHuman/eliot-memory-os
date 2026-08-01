@@ -1195,25 +1195,17 @@ pub(super) async fn run_managed_antigravity(
         stdin_payload: None,
         stdout_limit_bytes: u64::try_from(MAX_SECRET_BOUNDARY_BYTES).unwrap_or(u64::MAX),
         stderr_limit_bytes: u64::try_from(MAX_SECRET_BOUNDARY_BYTES).unwrap_or(u64::MAX),
-        timeout_profile: eliot_types::ProviderTimeoutProfile {
-            profile_id: "managed-antigravity-v1".to_owned(),
-            provider: "antigravity".to_owned(),
-            route_or_operation_class: "managed-provider".to_owned(),
-            spawn_deadline_ms: Some(5_000),
-            dispatch_ack_deadline_ms: None,
-            first_output_deadline_ms: None,
-            idle_output_deadline_ms: None,
-            absolute_runtime_deadline_ms: u64::try_from(wall_clock.as_millis()).unwrap_or(u64::MAX),
-            cancellation_grace_ms: 100,
-            cleanup_grace_ms: 5_000,
-            reconciliation_window_ms: 5_000,
-            output_heartbeat_supported: false,
-            status_lookup_supported: false,
-            evidence_basis: vec!["sealed HostLaunchContract wall-clock budget".to_owned()],
-            assumptions: Vec::new(),
-            hard_upper_bounds: vec!["absolute managed provider runtime".to_owned()],
-            policy_version: "runtime-supervision-v1".to_owned(),
-        },
+        timeout_profile: eliot_types::ProviderRoutePolicy::for_route(
+            eliot_types::AgentHostId::Antigravity,
+            "managed-provider",
+            eliot_types::ProviderDeclaredBudget::new(
+                u64::try_from(wall_clock.as_millis()).unwrap_or(u64::MAX),
+                u64::try_from(MAX_SECRET_BOUNDARY_BYTES).unwrap_or(u64::MAX),
+            )
+            .with_first_output_deadline_ms(None),
+        )
+        .timeout_profile()
+        .clone(),
         runtime_contract_sha256: Some(contract.contract_hash.clone()),
         role_lease_id: contract.role_lease_id.clone(),
         role_lease_epoch: None,

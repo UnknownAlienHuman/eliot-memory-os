@@ -1039,25 +1039,16 @@ fn run_cross_agent_supervised(
             stdin_payload: None,
             stdout_limit_bytes: 8 * 1024 * 1024,
             stderr_limit_bytes: 8 * 1024 * 1024,
-            timeout_profile: eliot_types::ProviderTimeoutProfile {
-                profile_id: "ul-cross-agent-process-v1".to_owned(),
-                provider: "eliot-governor".to_owned(),
-                route_or_operation_class: operation_class.to_owned(),
-                spawn_deadline_ms: Some(5_000),
-                dispatch_ack_deadline_ms: None,
-                first_output_deadline_ms: Some(timeout_ms),
-                idle_output_deadline_ms: Some(timeout_ms),
-                absolute_runtime_deadline_ms: timeout_ms,
-                cancellation_grace_ms: 25,
-                cleanup_grace_ms: 5_000,
-                reconciliation_window_ms: 0,
-                output_heartbeat_supported: true,
-                status_lookup_supported: false,
-                evidence_basis: vec!["bounded UL cross-agent helper".to_owned()],
-                assumptions: Vec::new(),
-                hard_upper_bounds: vec!["caller-supplied timeout".to_owned()],
-                policy_version: "runtime-supervision-v1".to_owned(),
-            },
+            timeout_profile: eliot_types::ProviderRoutePolicy::for_route(
+                eliot_types::AgentHostId::Codex,
+                operation_class,
+                eliot_types::ProviderDeclaredBudget::new(timeout_ms, 8 * 1024 * 1024)
+                    .with_idle_output_deadline_ms(Some(timeout_ms))
+                    .with_cancellation_grace_ms(25)
+                    .with_reconciliation_window_ms(0),
+            )
+            .timeout_profile()
+            .clone(),
             runtime_contract_sha256: None,
             role_lease_id: None,
             role_lease_epoch: None,

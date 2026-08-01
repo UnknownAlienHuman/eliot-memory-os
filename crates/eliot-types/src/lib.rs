@@ -297,10 +297,11 @@ pub use project_understanding::{
     ProjectUnderstandingModel, ProjectUnderstandingSystem,
 };
 pub use provider_invocation::{
-    ExternalResultCompletenessReceipt, ProviderFailureIncident, ProviderIdentityCheck,
-    ProviderInvocationAttempt, ProviderInvocationOutcome, ProviderInvocationOutcomeClass,
-    ProviderInvocationState, ProviderInvocationTransition, ProviderReconciliationMethod,
-    ProviderReconciliationRecord, ProviderResultCompleteness, ProviderRootCauseStatus,
+    ExternalResultCompletenessReceipt, ProviderDeclaredBudget, ProviderFailureIncident,
+    ProviderIdentityCheck, ProviderInvocationAttempt, ProviderInvocationOutcome,
+    ProviderInvocationOutcomeClass, ProviderInvocationState, ProviderInvocationTransition,
+    ProviderReconciliationMethod, ProviderReconciliationRecord, ProviderResultCompleteness,
+    ProviderRootCauseStatus, ProviderRoutePolicy, ProviderRoutePolicyBinding,
     ProviderRouteReadinessGate, ProviderRouteReadinessVerdict, ProviderTimeoutClass,
     ProviderTimeoutProfile,
 };

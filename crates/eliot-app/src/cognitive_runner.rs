@@ -1326,26 +1326,17 @@ fn run_managed_process(
             stdin_payload: None,
             stdout_limit_bytes: u64::try_from(MAX_SECRET_BOUNDARY_BYTES).unwrap_or(u64::MAX),
             stderr_limit_bytes: u64::try_from(MAX_SECRET_BOUNDARY_BYTES).unwrap_or(u64::MAX),
-            timeout_profile: eliot_types::ProviderTimeoutProfile {
-                profile_id: "cognitive-provider-v1".to_owned(),
-                provider: request.host.as_str().to_owned(),
-                route_or_operation_class: "cognitive-field".to_owned(),
-                spawn_deadline_ms: Some(5_000),
-                dispatch_ack_deadline_ms: None,
-                first_output_deadline_ms: None,
-                idle_output_deadline_ms: None,
-                absolute_runtime_deadline_ms: u64::try_from(timeout.as_millis())
-                    .unwrap_or(u64::MAX),
-                cancellation_grace_ms: 100,
-                cleanup_grace_ms: 5_000,
-                reconciliation_window_ms: 5_000,
-                output_heartbeat_supported: false,
-                status_lookup_supported: false,
-                evidence_basis: vec!["sealed cognitive run timeout".to_owned()],
-                assumptions: Vec::new(),
-                hard_upper_bounds: vec!["absolute cognitive call runtime".to_owned()],
-                policy_version: "runtime-supervision-v1".to_owned(),
-            },
+            timeout_profile: eliot_types::ProviderRoutePolicy::for_route(
+                request.host,
+                "cognitive-field",
+                eliot_types::ProviderDeclaredBudget::new(
+                    u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX),
+                    u64::try_from(MAX_SECRET_BOUNDARY_BYTES).unwrap_or(u64::MAX),
+                )
+                .with_first_output_deadline_ms(None),
+            )
+            .timeout_profile()
+            .clone(),
             runtime_contract_sha256: Some(expected_bundle_sha256.to_owned()),
             role_lease_id: None,
             role_lease_epoch: None,

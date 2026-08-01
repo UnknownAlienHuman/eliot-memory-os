@@ -426,6 +426,10 @@ fn attempt(id: &str) -> ProviderInvocationAttempt {
         cwd: Some("fixture".to_owned()),
         environment_fingerprint: Some("fixture".to_owned()),
         timeout_profile_id: "timeout:test".to_owned(),
+        provider_route_policy: eliot_types::ProviderRoutePolicyBinding {
+            policy_id: "policy:test".to_owned(),
+            policy_hash_blake3: "0".repeat(64),
+        },
         state_transitions: Vec::new(),
         dispatch_started_at: None,
         process_started_at: None,

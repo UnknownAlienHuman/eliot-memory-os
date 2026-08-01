@@ -64,6 +64,10 @@ fn external_agent_generic_runtime_serializes_source_owned_schema() -> TestResult
         structured_output_mode: ProviderStructuredOutputMode::NativeJsonSchema,
         output_schema_sha256: "c".repeat(64),
         timeout_profile_ref: "provider-timeout:claude".to_owned(),
+        provider_route_policy: eliot_types::ProviderRoutePolicyBinding {
+            policy_id: "provider-timeout:claude".to_owned(),
+            policy_hash_blake3: "e".repeat(64),
+        },
         process_containment: "windows_job_object".to_owned(),
         candidate_only: true,
         runtime_contract_sha256: "d".repeat(64),
