@@ -632,3 +632,34 @@ This log preserves the ordered implementation evidence for
   Runtime supervision then reported `overall=ready`, `provider_dispatch_safe=true`, clean runtime
   integrity, the same four active generation-3 leases, and both
   `published_plans_without_authority=0` and `authority_without_published_plan=0` in 3.574 s.
+
+### Published-seal runtime drift and Opus supersession decision
+
+- With generation 3 still published, reservation/result counts still zero and runtime supervision
+  clean, the same Antigravity call `063d32a3-7779-44e8-90c7-b6a8cc83b44f` was retried once. It
+  failed before provider launch in 0.412 s with
+  `production adapter preview differs from the sealed cognitive runtime`. No provider process,
+  reservation, result or quota-bearing model call occurred.
+- Exact comparison explains the fail-closed result: generation 3 immutably seals the former
+  Governor path/SHA (`cognitive-judge-051d89b-target`, `e40994cb...`), including
+  `ELIOT_GOVERNOR_EXE` and the MCP server executable binding. Production preview correctly sees
+  the repaired active candidate (`runtime-integrity-2e6db2a-target`, `781c9b35...`). Reverting to
+  the old daemon restores the known integrity defect; weakening equality or rewriting the
+  generation-3 artifacts is forbidden.
+- Escalated this post-seal transaction contradiction once to Claude Code `claude-opus-5` at
+  `max`, read-only plan mode, strict empty MCP and only Read/Grep/Glob. Session
+  `087e8571-fb33-433e-9cef-84a3b1f71fb5` completed in 604.6 s / 599.4 s API over 39 turns, cost
+  USD 4.273312, with no permission denial, write, MCP, web or provider action.
+- Opus selected one generic repair: an operator-authorized, fail-closed pre-dispatch Published-seal
+  supersession transaction. It is admissible only after authoritative proof of zero reservations,
+  results, journal attempts, receipts, artifacts and non-terminal operations; exact active
+  generation authority; byte-exact plan/seal bindings; and runtime drift limited to the Governor
+  executable binding. It revokes authority, retires sessions/jobs/work, marks generation 3
+  abandoned, digest-verifies and moves immutable seal/public-plan bytes into quarantine, then
+  permits a separate generation-4 seal. Exact runtime equality remains unchanged.
+- Two latent prerequisites were identified for source verification: recovery inspection currently
+  reads the broker reservation mirror rather than the authoritative reservation ledger; and the
+  generation-independent invocation/idempotency keys can select an abandoned older job/request
+  unless replay is generation-exact under a strict zero-attempt supersession fence. Call IDs and
+  idempotency keys must remain stable across generation 4 so the durable double-spend guard stays
+  armed; leases, sessions, jobs, epochs, seal IDs and runtime hashes must be re-minted.
