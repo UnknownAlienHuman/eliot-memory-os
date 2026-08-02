@@ -85,7 +85,9 @@ const MAX_RECALL_RESULTS: usize = 12;
 const MAX_MEMORY_SEARCH_CANDIDATES: usize = 256;
 const MAX_MEMORY_SEARCH_QUERY_TERMS: usize = 12;
 const MAX_MEMORY_SEARCH_POSTINGS_PER_ROW: usize = 128;
+const MAX_MEMORY_SEARCH_DOCUMENT_TERMS: usize = 2048;
 const MEMORY_SEARCH_DISPATCH_BATCH_SIZE: usize = 512;
+const MEMORY_SEARCH_FTS_PROJECTION_FORMAT: &str = "fts_v1";
 
 #[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
 #[allow(clippy::struct_excessive_bools)]
@@ -140,6 +142,8 @@ struct MemorySearchCandidateLoad {
     at_revision: MemoryRevision,
     #[serde(default)]
     projection_revision: Option<MemoryRevision>,
+    #[serde(default)]
+    projection_format: Option<String>,
     #[serde(default)]
     ordered_handles: Vec<String>,
     candidates: Vec<RecallCandidateRow>,
@@ -1136,16 +1140,12 @@ fn projection_row(
         Value::Bool(is_default_visible_lifecycle(row.lifecycle_state)),
     );
 
-    let posting_text = [
-        row.handle.as_str(),
-        row.preview.as_str(),
-        row.search_text.as_str(),
-        row.cue_text.as_str(),
-        row.scope_text.as_str(),
-        row.concept_text.as_str(),
-    ]
-    .join(" ");
-    let postings = memory_search_posting_terms(&posting_text)
+    let document_terms = memory_search_document_terms(row);
+    object.insert(
+        "search_document".to_owned(),
+        Value::String(document_terms.join(" ")),
+    );
+    let postings = document_terms
         .into_iter()
         .take(MAX_MEMORY_SEARCH_POSTINGS_PER_ROW)
         .map(|token| {
@@ -1467,30 +1467,104 @@ fn envelope_projection_rows(
     Ok(rows)
 }
 
-fn memory_search_terms(request: &RecallL0Request) -> Vec<String> {
-    std::iter::once(request.query.as_str())
-        .chain(request.task_class_cues.iter().map(String::as_str))
-        .chain(request.concept_refs.iter().map(String::as_str))
-        .flat_map(eliot_types::normalize_query_tokens)
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .take(MAX_MEMORY_SEARCH_QUERY_TERMS)
-        .collect()
+fn ordered_memory_search_terms<'a>(
+    sources: impl IntoIterator<Item = &'a str>,
+    limit: usize,
+) -> Vec<String> {
+    let mut terms = Vec::with_capacity(limit);
+    let mut seen = HashSet::with_capacity(limit);
+    for source in sources {
+        if terms.len() == limit {
+            break;
+        }
+        for term in eliot_types::normalize_query_tokens(source) {
+            if seen.insert(term.clone()) {
+                terms.push(term);
+                if terms.len() == limit {
+                    break;
+                }
+            }
+        }
+    }
+    terms
 }
 
-fn memory_search_posting_terms(text: &str) -> Vec<String> {
-    eliot_types::normalize_query_tokens(text)
-        .into_iter()
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .take(MAX_MEMORY_SEARCH_POSTINGS_PER_ROW)
-        .collect()
+fn memory_search_terms(request: &RecallL0Request) -> Vec<String> {
+    ordered_memory_search_terms(
+        std::iter::once(request.query.as_str())
+            .chain(request.task_class_cues.iter().map(String::as_str))
+            .chain(request.concept_refs.iter().map(String::as_str)),
+        MAX_MEMORY_SEARCH_QUERY_TERMS,
+    )
+}
+
+fn memory_search_query_text(request: &RecallL0Request) -> String {
+    memory_search_terms(request).join(" ")
+}
+
+fn memory_search_document_terms(row: &RecallCandidateRow) -> Vec<String> {
+    ordered_memory_search_terms(
+        [
+            row.handle.as_str(),
+            row.record_ref.as_str(),
+            row.cue_text.as_str(),
+            row.concept_text.as_str(),
+            row.preview.as_str(),
+            row.search_text.as_str(),
+            row.scope_text.as_str(),
+        ],
+        MAX_MEMORY_SEARCH_DOCUMENT_TERMS,
+    )
+}
+
+fn rank_memory_search_candidates(
+    request: &RecallL0Request,
+    mut load: MemorySearchCandidateLoad,
+) -> RecallL0Response {
+    let positions = load
+        .ordered_handles
+        .iter()
+        .enumerate()
+        .map(|(position, handle)| (handle.as_str(), position))
+        .collect::<BTreeMap<_, _>>();
+    load.candidates.sort_by_key(|row| {
+        positions
+            .get(row.handle.as_str())
+            .copied()
+            .unwrap_or(usize::MAX)
+    });
+    rank_recall_candidates(
+        request,
+        RecallCandidateLoad {
+            at_revision: load.at_revision,
+            candidates: load.candidates,
+            truncated: load.truncated,
+        },
+    )
 }
 
 fn exact_memory_search_handle(query: &str) -> Option<String> {
     let query = query.trim();
     (!query.is_empty() && query.contains(':') && !query.chars().any(char::is_whitespace))
         .then(|| query.to_owned())
+}
+
+fn memory_search_projection_dispatch_vars(
+    project_id: ProjectId,
+    write_id: WriteId,
+    updated_revision: MemoryRevision,
+    rows: &[Value],
+    advance_state: bool,
+    projection_format: Option<&str>,
+) -> Value {
+    json!({
+        "project_id": project_id,
+        "write_id": write_id,
+        "updated_revision": updated_revision,
+        "rows": rows,
+        "advance_state": advance_state,
+        "projection_format": projection_format,
+    })
 }
 
 #[derive(Clone, Debug)]
@@ -1603,6 +1677,7 @@ impl CanonicalStore {
             NamedSurqlOp::SchemaMigrateUlDependencyActivation,
             NamedSurqlOp::SchemaMigrateUlTokenPolicy,
             NamedSurqlOp::SchemaMigrateMemorySearch,
+            NamedSurqlOp::SchemaMigrateMemorySearchFts,
         ] {
             value = self.migrate_schema_op(op).await?;
         }
@@ -1762,6 +1837,7 @@ impl CanonicalStore {
                     )
                 })?,
                 &rows,
+                None,
             )
             .await?;
         }
@@ -1774,17 +1850,19 @@ impl CanonicalStore {
         write_id: WriteId,
         updated_revision: MemoryRevision,
         rows: &[Value],
+        projection_format: Option<&str>,
     ) -> Result<(), StoreError> {
         if rows.is_empty() {
             self.execute_value(
                 NamedSurqlOp::UpsertMemorySearchProjection,
-                json!({
-                    "project_id": project_id,
-                    "write_id": write_id,
-                    "updated_revision": updated_revision,
-                    "rows": [],
-                    "advance_state": true,
-                }),
+                memory_search_projection_dispatch_vars(
+                    project_id,
+                    write_id,
+                    updated_revision,
+                    &[],
+                    true,
+                    projection_format,
+                ),
             )
             .await?;
             return Ok(());
@@ -1793,13 +1871,14 @@ impl CanonicalStore {
         for (index, chunk) in rows.chunks(MEMORY_SEARCH_DISPATCH_BATCH_SIZE).enumerate() {
             self.execute_value(
                 NamedSurqlOp::UpsertMemorySearchProjection,
-                json!({
-                    "project_id": project_id,
-                    "write_id": write_id,
-                    "updated_revision": updated_revision,
-                    "rows": chunk,
-                    "advance_state": index + 1 == chunk_count,
-                }),
+                memory_search_projection_dispatch_vars(
+                    project_id,
+                    write_id,
+                    updated_revision,
+                    chunk,
+                    index + 1 == chunk_count,
+                    projection_format,
+                ),
             )
             .await?;
         }
@@ -2062,42 +2141,61 @@ impl CanonicalStore {
                         "exact_handle_parts": exact_memory_search_handle(&request.query)
                             .map(|handle| string_fragments(&handle)),
                         "tokens": memory_search_terms(request),
+                        "query_text": memory_search_query_text(request),
                         "candidate_limit": MAX_MEMORY_SEARCH_CANDIDATES,
                     }),
                 )
                 .await?;
-            let mut load: MemorySearchCandidateLoad =
+            let load: MemorySearchCandidateLoad =
                 decode_value(NamedSurqlOp::LoadMemorySearchCandidates, value)?;
             if load.projection_revision != Some(load.at_revision) {
                 self.rebuild_memory_search_projection(request.project_id)
                     .await?;
                 continue;
             }
-            let positions = load
-                .ordered_handles
-                .iter()
-                .enumerate()
-                .map(|(position, handle)| (handle.as_str(), position))
-                .collect::<BTreeMap<_, _>>();
-            load.candidates.sort_by_key(|row| {
-                positions
-                    .get(row.handle.as_str())
-                    .copied()
-                    .unwrap_or(usize::MAX)
-            });
-            return Ok(rank_recall_candidates(
-                request,
-                RecallCandidateLoad {
-                    at_revision: load.at_revision,
-                    candidates: load.candidates,
-                    truncated: load.truncated,
-                },
-            ));
+            return Ok(rank_memory_search_candidates(request, load));
         }
         Err(StoreError::PolicyViolation(
             "memory search projection could not catch up to a stable project revision after 3 attempts"
                 .to_owned(),
         ))
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    async fn recall_l0_fts_candidate(
+        &self,
+        request: &RecallL0Request,
+    ) -> Result<RecallL0Response, StoreError> {
+        if request.lifecycle_audit {
+            return Err(StoreError::PolicyViolation(
+                "the FTS candidate path does not serve lifecycle-audit recall".to_owned(),
+            ));
+        }
+        let value = self
+            .execute_value(
+                NamedSurqlOp::LoadMemorySearchFtsCandidates,
+                json!({
+                    "project_id": request.project_id,
+                    "exact_handle_parts": exact_memory_search_handle(&request.query)
+                        .map(|handle| string_fragments(&handle)),
+                    "query_text": memory_search_query_text(request),
+                    "candidate_limit": MAX_MEMORY_SEARCH_CANDIDATES,
+                }),
+            )
+            .await?;
+        let load: MemorySearchCandidateLoad =
+            decode_value(NamedSurqlOp::LoadMemorySearchFtsCandidates, value)?;
+        if load.projection_format.as_deref() != Some(MEMORY_SEARCH_FTS_PROJECTION_FORMAT) {
+            return Err(StoreError::PolicyViolation(
+                "the FTS candidate path requires an explicit fts_v1 full rebuild".to_owned(),
+            ));
+        }
+        if load.projection_revision != Some(load.at_revision) {
+            return Err(StoreError::PolicyViolation(
+                "the FTS candidate projection is not at the current project revision".to_owned(),
+            ));
+        }
+        Ok(rank_memory_search_candidates(request, load))
     }
 
     async fn recall_l0_paged(
@@ -2229,6 +2327,7 @@ impl CanonicalStore {
             WriteId::new_v7(),
             load.at_revision,
             &rows,
+            Some(MEMORY_SEARCH_FTS_PROJECTION_FORMAT),
         )
         .await?;
         Ok(load.at_revision)
@@ -2241,15 +2340,36 @@ impl CanonicalStore {
     ) -> Result<Value, StoreError> {
         let tokens = eliot_types::normalize_query_tokens(query)
             .into_iter()
+            .take(MAX_MEMORY_SEARCH_QUERY_TERMS)
             .collect::<BTreeSet<_>>()
             .into_iter()
-            .take(MAX_MEMORY_SEARCH_QUERY_TERMS)
             .collect::<Vec<_>>();
         self.execute_value(
             NamedSurqlOp::ExplainMemorySearchPostings,
             json!({
                 "project_id": project_id,
                 "tokens": tokens,
+                "candidate_limit": MAX_MEMORY_SEARCH_CANDIDATES,
+            }),
+        )
+        .await
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    async fn memory_search_fts_query_plan(
+        &self,
+        project_id: ProjectId,
+        query: &str,
+    ) -> Result<Value, StoreError> {
+        let query_text =
+            ordered_memory_search_terms([query], MAX_MEMORY_SEARCH_QUERY_TERMS).join(" ");
+        self.execute_value(
+            NamedSurqlOp::ExplainMemorySearchFts,
+            json!({
+                "project_id": project_id,
+                "exact_handle_parts": exact_memory_search_handle(query)
+                    .map(|handle| string_fragments(&handle)),
+                "query_text": query_text,
                 "candidate_limit": MAX_MEMORY_SEARCH_CANDIDATES,
             }),
         )
@@ -3915,4 +4035,173 @@ where
 
 fn derived_row_key(value: &str) -> String {
     blake3::hash(value.as_bytes()).to_hex().to_string()
+}
+
+#[cfg(test)]
+mod fts_live_tests;
+
+#[cfg(test)]
+mod memory_search_selector_tests {
+    use super::*;
+
+    fn recall_request() -> RecallL0Request {
+        RecallL0Request {
+            project_id: ProjectId::new_v7(),
+            query: "zeta alpha shared".to_owned(),
+            consistency: eliot_types::ReadConsistencyMode::Latest,
+            at_least_revision: None,
+            lifecycle_audit: false,
+            task_id: None,
+            task_class_cues: vec!["shared omega beta".to_owned(), "gamma".to_owned()],
+            scope_refs: Vec::new(),
+            concept_refs: vec![
+                "concept0 beta concept1 concept2".to_owned(),
+                "concept3 concept4 concept5 concept6".to_owned(),
+            ],
+        }
+    }
+
+    fn candidate_row() -> RecallCandidateRow {
+        RecallCandidateRow {
+            record_ref: "claim_card:Opaque-ID".to_owned(),
+            handle: "claim:Opaque-ID".to_owned(),
+            record_type: "claim_card".to_owned(),
+            preview: "Preview path".to_owned(),
+            search_text: "Remaining Preview".to_owned(),
+            cue_text: "path Symbol".to_owned(),
+            scope_text: "Scope Remaining".to_owned(),
+            concept_text: "Concept Symbol".to_owned(),
+            task_id: None,
+            status: "supported".to_owned(),
+            lifecycle_state: Some(eliot_types::MemoryLifecycleState::Active),
+            authority_rank: 100,
+            negative_memory: false,
+            memory_revision: Some(MemoryRevision::new(7)),
+            project_sequence: Some(ProjectSequence::new(9)),
+            verification_value: 1,
+            known_decision_delta: 2,
+            prior_beneficial_use: 3,
+            contradiction_signal: false,
+            harm_signal: false,
+            repetition_signal: false,
+            distraction_signal: false,
+        }
+    }
+
+    #[test]
+    fn query_selector_is_stable_priority_ordered_deduplicated_and_capped() {
+        let request = recall_request();
+        let expected = vec![
+            "zeta", "alpha", "shared", "omega", "beta", "gamma", "concept0", "concept1",
+            "concept2", "concept3", "concept4", "concept5",
+        ];
+
+        assert_eq!(memory_search_terms(&request), expected);
+        assert_eq!(memory_search_query_text(&request), expected.join(" "));
+    }
+
+    #[test]
+    fn document_selector_preserves_field_priority_and_projection_persists_it()
+    -> Result<(), StoreError> {
+        let row = candidate_row();
+        let expected = vec![
+            "claim",
+            "opaque",
+            "id",
+            "card",
+            "path",
+            "symbol",
+            "concept",
+            "preview",
+            "remaining",
+            "scope",
+        ];
+
+        assert_eq!(memory_search_document_terms(&row), expected);
+        let projection = projection_row(ProjectId::new_v7(), &row, MemoryRevision::new(7))?;
+        let expected_document = expected.join(" ");
+        assert_eq!(
+            projection.get("search_document").and_then(Value::as_str),
+            Some(expected_document.as_str())
+        );
+        let posting_tokens = projection
+            .get("postings")
+            .and_then(Value::as_array)
+            .and_then(|postings| {
+                postings
+                    .iter()
+                    .map(|posting| posting.get("token").and_then(Value::as_str))
+                    .collect::<Option<Vec<_>>>()
+            });
+        assert_eq!(posting_tokens, Some(expected));
+        Ok(())
+    }
+
+    #[test]
+    fn document_selector_caps_after_higher_priority_fields() {
+        let mut row = candidate_row();
+        row.search_text = (0..MAX_MEMORY_SEARCH_DOCUMENT_TERMS)
+            .map(|index| format!("search{index:04}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        row.scope_text = "scope_tail".to_owned();
+
+        let terms = memory_search_document_terms(&row);
+
+        assert_eq!(terms.len(), MAX_MEMORY_SEARCH_DOCUMENT_TERMS);
+        assert_eq!(
+            &terms[..8],
+            [
+                "claim", "opaque", "id", "card", "path", "symbol", "concept", "preview",
+            ]
+        );
+        assert_eq!(terms[8], "search0000");
+        assert!(!terms.iter().any(|term| term == "scope" || term == "tail"));
+    }
+
+    #[test]
+    fn projection_format_is_explicit_only_for_full_rebuild_dispatch() {
+        let project_id = ProjectId::new_v7();
+        let write_id = WriteId::new_v7();
+        let revision = MemoryRevision::new(11);
+        let incremental =
+            memory_search_projection_dispatch_vars(project_id, write_id, revision, &[], true, None);
+        let full_rebuild = memory_search_projection_dispatch_vars(
+            project_id,
+            write_id,
+            revision,
+            &[],
+            true,
+            Some(MEMORY_SEARCH_FTS_PROJECTION_FORMAT),
+        );
+
+        assert_eq!(incremental["projection_format"], Value::Null);
+        assert_eq!(
+            full_rebuild["projection_format"],
+            MEMORY_SEARCH_FTS_PROJECTION_FORMAT
+        );
+    }
+
+    #[test]
+    fn fts_candidate_load_decodes_projection_format() -> Result<(), serde_json::Error> {
+        let load: MemorySearchCandidateLoad = serde_json::from_value(json!({
+            "at_revision": 13,
+            "projection_revision": 13,
+            "projection_format": MEMORY_SEARCH_FTS_PROJECTION_FORMAT,
+            "ordered_handles": [],
+            "candidates": [],
+            "truncated": false,
+        }))?;
+
+        assert_eq!(
+            load.projection_format.as_deref(),
+            Some(MEMORY_SEARCH_FTS_PROJECTION_FORMAT)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn fts_candidate_helper_is_phase_wired() {
+        let _ = CanonicalStore::recall_l0_fts_candidate;
+    }
 }

@@ -19,6 +19,7 @@ FOR $row IN $rows {
         record_ref: $record_ref,
         preview: $row.preview,
         search_text: $row.search_text,
+        search_document: $row.search_document,
         cue_text: $row.cue_text,
         scope_text: $row.scope_text,
         concept_text: $row.concept_text,
@@ -60,11 +61,21 @@ IF $advance_state {
   LET $state_id = type::record('memory_search_state', $project_id);
   LET $state = SELECT * FROM ONLY $state_id;
   IF $state == NONE OR $state.applied_revision <= $updated_revision {
-    UPSERT $state_id CONTENT {
-      project_id: $project_id,
-      applied_revision: $updated_revision,
-      source_write_id: $write_id,
-      updated_at: time::now(),
+    IF $projection_format == NONE OR $projection_format == NULL {
+      UPSERT $state_id MERGE {
+        project_id: $project_id,
+        applied_revision: $updated_revision,
+        source_write_id: $write_id,
+        updated_at: time::now(),
+      };
+    } ELSE {
+      UPSERT $state_id MERGE {
+        project_id: $project_id,
+        applied_revision: $updated_revision,
+        projection_format: $projection_format,
+        source_write_id: $write_id,
+        updated_at: time::now(),
+      };
     };
   };
 

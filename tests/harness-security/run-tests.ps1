@@ -62,6 +62,8 @@ try {
 
     if ($process.ExitCode -ne 97 -or
         $report.workspace_test_exit_code -ne 97 -or
+        $report.operation_status -cne 'FAILED' -or
+        $report.PSObject.Properties.Name -contains 'final_status' -or
         -not $report.bounded_failure_exercised -or
         -not $report.secret_reparse_checked -or
         -not $report.secret_acl_restricted -or

@@ -6,6 +6,8 @@ use eliot_types::{
 use std::collections::BTreeSet;
 use std::path::Path;
 
+const TASK_EXECUTION_FALLBACK_TOKEN_LIMIT: usize = 12;
+
 pub struct TaskExecutionClassifier;
 
 impl TaskExecutionClassifier {
@@ -71,6 +73,7 @@ impl TaskExecutionClassifier {
 
         let fallback_tokens = normalize_query_tokens(&request.goal)
             .into_iter()
+            .take(TASK_EXECUTION_FALLBACK_TOKEN_LIMIT)
             .collect::<BTreeSet<_>>();
         let artifact = explicit_artifact
             .or(path_artifact)

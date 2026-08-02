@@ -97,6 +97,19 @@ fn t03_normalizers_are_stable() {
 }
 
 #[test]
+fn query_tokenizer_is_uncapped_and_preserves_first_occurrence() {
+    assert_eq!(
+        normalize_query_tokens(
+            "Zulu alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu nu xi omicron alpha zulu",
+        ),
+        [
+            "zulu", "alpha", "beta", "gamma", "delta", "epsilon", "zeta", "eta", "theta", "iota",
+            "kappa", "lambda", "mu", "nu", "xi", "omicron",
+        ]
+    );
+}
+
+#[test]
 fn t03_candidate_schema_roundtrip() -> Result<(), Box<dyn std::error::Error>> {
     let input = AgentCandidateSubmitInput {
         project_id: "00000000-0000-7000-8000-000000000001".to_owned(),

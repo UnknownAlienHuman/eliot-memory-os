@@ -11,7 +11,7 @@
     "branch": "codex/cognitive-completion-v2",
     "phase": "phase_1_in_progress",
     "phase_0_completion_repair": "accepted_by_provider_free_local_gate",
-    "phase_1_progress": "C7-03A persistent daemon database clients accepted by provider-free local gate",
+    "phase_1_progress": "C7-03A persistent daemon database clients and C7-03B ordered tokenizer/SurrealDB FTS candidate path accepted by provider-free local gates",
     "provider_calls_allowed": false,
     "truth_note": "This is a capability snapshot, not completion evidence. Source, canonical receipts, focused behavior tests, scale evidence, and field evidence remain authoritative."
   },
@@ -138,17 +138,21 @@
     },
     {
       "capability": "surrealdb_fulltext_candidate_generation",
-      "implemented": false,
+      "implemented": true,
       "production_connected": false,
-      "behavior_verified": false,
+      "behavior_verified": true,
       "field_certified": false,
-      "owner": "not implemented; Phase 1 retains CanonicalStore as the retrieval owner",
+      "owner": "CanonicalStore private C7-03B FTS candidate path plus existing Rust rank; public recall remains on the legacy path until C7-03C",
       "hot_or_cold": "hot",
       "evidence": [
-        "crates/eliot-store/src/surql/009_memory_search.surql currently defines memory_search_token postings.",
-        "crates/eliot-store/src/surql/load_memory_search_candidates.surql currently queries manual token postings."
+        "crates/eliot-types/src/ul/normalize.rs::normalize_query_tokens",
+        "crates/eliot-store/src/canonical_store.rs::recall_l0_fts_candidate",
+        "crates/eliot-store/src/canonical_store/fts_live_tests.rs",
+        "crates/eliot-store/src/surql/010_memory_search_fts.surql",
+        "crates/eliot-store/src/surql/load_memory_search_fts_candidates.surql",
+        "docs/architecture/COGNITIVE_COMPLETION_V2_WORKLOG.md#2026-08-01-c7-03b-acceptance"
       ],
-      "known_gap": "Prove a SurrealDB 3.1.4 analyzer, FULLTEXT index, bound OR query, index-backed EXPLAIN, Unicode and opaque-ID correctness, and project isolation before cutting over and deleting manual postings."
+      "known_gap": "C7-03B proves the additive private FTS candidate path but does not claim production cutover. C7-03C must route public L0 through one FTS query, add the recoverable unified projection coordinator, remove request-path full rebuild and delete manual postings/ambient fill before scale certification."
     },
     {
       "capability": "unified_cognitive_projection_coordination",

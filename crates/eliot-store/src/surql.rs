@@ -19,6 +19,7 @@ pub enum NamedSurqlOp {
     SchemaMigrateUlDependencyActivation,
     SchemaMigrateUlTokenPolicy,
     SchemaMigrateMemorySearch,
+    SchemaMigrateMemorySearchFts,
     AssignUlExperimentArm,
     LoadUlExperimentAssignment,
     LoadUlTaskClassLedgers,
@@ -50,6 +51,8 @@ pub enum NamedSurqlOp {
     ResetMemorySearchProjection,
     LoadMemorySearchCandidates,
     ExplainMemorySearchPostings,
+    LoadMemorySearchFtsCandidates,
+    ExplainMemorySearchFts,
     FetchAtomsL2,
     FetchAtomsL2Legacy,
     GraphHealthCapabilities,
@@ -89,7 +92,9 @@ impl NamedSurqlOp {
             | Self::SchemaMigrateUlDependencyActivation
             | Self::SchemaMigrateUlTokenPolicy
             | Self::SchemaMigrateMemorySearch
+            | Self::SchemaMigrateMemorySearchFts
             | Self::ExplainMemorySearchPostings
+            | Self::ExplainMemorySearchFts
             | Self::GraphHealthCapabilities
             | Self::GraphHealth
             | Self::BlobReferenceScan => SurqlAccessClass::Admin,
@@ -123,6 +128,7 @@ impl NamedSurqlOp {
             | Self::CurrentState
             | Self::LoadRecallCandidates
             | Self::LoadMemorySearchCandidates
+            | Self::LoadMemorySearchFtsCandidates
             | Self::FetchAtomsL2
             | Self::FetchAtomsL2Legacy
             | Self::WriterReceipts
@@ -159,6 +165,7 @@ impl NamedSurqlOp {
             Self::SchemaMigrateUlDependencyActivation => "007_ul_dependency_activation",
             Self::SchemaMigrateUlTokenPolicy => "008_ul_token_policy",
             Self::SchemaMigrateMemorySearch => "009_memory_search",
+            Self::SchemaMigrateMemorySearchFts => "010_memory_search_fts",
             Self::AssignUlExperimentArm => "assign_ul_experiment_arm",
             Self::LoadUlExperimentAssignment => "load_ul_experiment_assignment",
             Self::LoadUlTaskClassLedgers => "load_ul_task_class_ledgers",
@@ -190,6 +197,8 @@ impl NamedSurqlOp {
             Self::ResetMemorySearchProjection => "reset_memory_search_projection",
             Self::LoadMemorySearchCandidates => "load_memory_search_candidates",
             Self::ExplainMemorySearchPostings => "explain_memory_search_postings",
+            Self::LoadMemorySearchFtsCandidates => "load_memory_search_fts_candidates",
+            Self::ExplainMemorySearchFts => "explain_memory_search_fts",
             Self::FetchAtomsL2 => "fetch_atoms_l2",
             Self::FetchAtomsL2Legacy => "fetch_atoms_l2_legacy",
             Self::GraphHealthCapabilities => "graph_health_capabilities",
@@ -236,6 +245,9 @@ impl NamedSurqlOp {
             }
             Self::SchemaMigrateUlTokenPolicy => include_str!("surql/008_ul_token_policy.surql"),
             Self::SchemaMigrateMemorySearch => include_str!("surql/009_memory_search.surql"),
+            Self::SchemaMigrateMemorySearchFts => {
+                include_str!("surql/010_memory_search_fts.surql")
+            }
             Self::AssignUlExperimentArm => include_str!("surql/assign_ul_experiment_arm.surql"),
             Self::LoadUlExperimentAssignment => {
                 include_str!("surql/load_ul_experiment_assignment.surql")
@@ -288,6 +300,12 @@ impl NamedSurqlOp {
             }
             Self::ExplainMemorySearchPostings => {
                 include_str!("surql/explain_memory_search_postings.surql")
+            }
+            Self::LoadMemorySearchFtsCandidates => {
+                include_str!("surql/load_memory_search_fts_candidates.surql")
+            }
+            Self::ExplainMemorySearchFts => {
+                include_str!("surql/explain_memory_search_fts.surql")
             }
             Self::FetchAtomsL2 => include_str!("surql/fetch_atoms_l2.surql"),
             Self::FetchAtomsL2Legacy => include_str!("surql/fetch_atoms_l2_legacy.surql"),
@@ -367,7 +385,7 @@ impl Default for SurqlTemplateRegistry {
 }
 
 #[allow(clippy::too_many_lines)]
-fn foundational_templates() -> [SurqlTemplate; 47] {
+fn foundational_templates() -> [SurqlTemplate; 50] {
     [
         template(
             NamedSurqlOp::SchemaMigrate,
@@ -427,6 +445,12 @@ fn foundational_templates() -> [SurqlTemplate; 47] {
             NamedSurqlOp::SchemaMigrateMemorySearch,
             "SchemaMigrateMemorySearchInput",
             "SchemaMigrateMemorySearchOutput",
+            64 * 1024,
+        ),
+        template(
+            NamedSurqlOp::SchemaMigrateMemorySearchFts,
+            "SchemaMigrateMemorySearchFtsInput",
+            "SchemaMigrateMemorySearchFtsOutput",
             64 * 1024,
         ),
         template(
@@ -613,6 +637,18 @@ fn foundational_templates() -> [SurqlTemplate; 47] {
             NamedSurqlOp::ExplainMemorySearchPostings,
             "ExplainMemorySearchPostingsInput",
             "ExplainMemorySearchPostingsOutput",
+            128 * 1024,
+        ),
+        template(
+            NamedSurqlOp::LoadMemorySearchFtsCandidates,
+            "LoadMemorySearchFtsCandidatesInput",
+            "LoadMemorySearchFtsCandidatesOutput",
+            2 * 1024 * 1024,
+        ),
+        template(
+            NamedSurqlOp::ExplainMemorySearchFts,
+            "ExplainMemorySearchFtsInput",
+            "ExplainMemorySearchFtsOutput",
             128 * 1024,
         ),
         template(
@@ -811,8 +847,8 @@ mod tests {
             }
         }
 
-        assert_eq!(registry.templates.len(), 65);
-        assert_eq!(counts, [39, 12, 14]);
+        assert_eq!(registry.templates.len(), 68);
+        assert_eq!(counts, [40, 12, 16]);
     }
 
     #[test]
@@ -827,6 +863,14 @@ mod tests {
         );
         assert_eq!(
             NamedSurqlOp::SchemaMigrateMemorySearch.access_class(),
+            SurqlAccessClass::Admin
+        );
+        assert_eq!(
+            NamedSurqlOp::LoadMemorySearchFtsCandidates.access_class(),
+            SurqlAccessClass::Read
+        );
+        assert_eq!(
+            NamedSurqlOp::ExplainMemorySearchFts.access_class(),
             SurqlAccessClass::Admin
         );
         assert_eq!(
@@ -878,6 +922,60 @@ mod tests {
         assert!(!template.contains("string::words"));
         assert!(!template.contains("string::slug"));
         assert!(!template.contains("relevance_score"));
+    }
+
+    #[test]
+    fn memory_search_fts_is_versioned_bounded_project_scoped_and_additive() {
+        let schema = NamedSurqlOp::SchemaMigrateMemorySearchFts.template();
+        assert!(schema.contains("DEFINE ANALYZER IF NOT EXISTS eliot_memory_search_v1"));
+        assert!(schema.contains("TOKENIZERS class"));
+        assert!(schema.contains("idx_memory_search_projection_fts_v1"));
+        assert!(schema.contains("FIELDS search_document"));
+        assert!(schema.contains("FULLTEXT ANALYZER eliot_memory_search_v1 BM25"));
+        assert!(schema.contains("projection_format: 'fts_v1'"));
+        assert!(!schema.contains("OVERWRITE"));
+        assert!(!schema.contains("REMOVE"));
+        assert!(!schema.contains("memory_search_token"));
+
+        let load = NamedSurqlOp::LoadMemorySearchFtsCandidates.template();
+        for binding in [
+            "$project_id",
+            "$exact_handle_parts",
+            "$query_text",
+            "$candidate_limit",
+        ] {
+            assert!(load.contains(binding), "missing FTS binding {binding}");
+        }
+        assert!(load.contains("search_document @OR@ $query_text"));
+        assert!(!load.contains("search::score"));
+        assert!(load.contains("ORDER BY authority_rank DESC, handle ASC"));
+        assert!(load.contains("project_id = $project_id"));
+        assert!(load.contains("$candidate_limit > 256"));
+        assert!(load.contains("$bounded_candidate_limit + 1"));
+        assert!(load.contains("LIMIT $candidate_limit_plus_one"));
+        assert!(load.contains("LIMIT $bounded_candidate_limit"));
+        assert!(load.contains("array::len($exact_handles) > 0"));
+        assert!(load.contains("projection_format"));
+        assert!(!load.contains("memory_search_token"));
+        assert!(!load.contains("ambient"));
+
+        let explain = NamedSurqlOp::ExplainMemorySearchFts.template();
+        assert!(explain.contains("search_document @OR@ $query_text"));
+        assert!(!explain.contains("search::score"));
+        assert!(explain.contains("project_id = $project_id"));
+        assert!(explain.contains("LIMIT $candidate_limit_plus_one"));
+        assert!(explain.contains("EXPLAIN FULL"));
+        assert!(!explain.contains("memory_search_token"));
+    }
+
+    #[test]
+    fn memory_search_projection_format_advances_only_when_explicitly_supplied() {
+        let upsert = NamedSurqlOp::UpsertMemorySearchProjection.template();
+
+        assert!(upsert.contains("$projection_format == NONE"));
+        assert!(upsert.contains("$projection_format == NULL"));
+        assert!(upsert.contains("projection_format: $projection_format"));
+        assert!(upsert.contains("UPSERT $state_id MERGE"));
     }
 
     #[test]

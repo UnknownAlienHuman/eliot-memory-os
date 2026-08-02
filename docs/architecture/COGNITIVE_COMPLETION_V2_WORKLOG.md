@@ -1013,3 +1013,69 @@ For each next step, record:
   explicitly retry a reconciled write with the same receipt/id; this is a
   governed application decision and is distinct from forbidden silent
   transport replay of the current call.
+
+### 2026-08-01 C7-03B acceptance
+
+- The base `normalize_query_tokens` is now genuinely uncapped and retains the
+  first occurrence without sorting. The three non-retrieval consumers whose
+  prior behavior depended on the old hidden cap now state their own local
+  twelve-token boundary: fallback task classification, distillation identity,
+  and UL fallback matching. Focused tokenizer/consumer gates passed 4/4,
+  4/4, 8/8 and the two local-cap cases; their test bodies were 0.00-0.06 s,
+  while cold/shared-build wall times ranged from 0.208 s to 79.763 s.
+- Retrieval now has stable ordered selectors. Query candidates are selected in
+  query, task-cue, concept order and capped at 12 after deduplication. Projection
+  documents select handle/record ref, cues, concepts, preview and remaining
+  search/scope text in that order and cap at 2,048. Six selector, persistence
+  and format-fence unit tests passed in a 4.481 s compile/run wall.
+- Additive migration 010 defines versioned `eliot_memory_search_v1` and
+  `idx_memory_search_projection_fts_v1` with `IF NOT EXISTS`, so routine daemon
+  migration does not rebuild an unchanged index. The typed read binds
+  `search_document @OR@ $query_text`, filters by project before its 257-handle
+  sentinel limit, returns at most 256 compact rows and delegates every final
+  relevance decision to the existing Rust ranker. All four changed/new SurQL
+  resources validated on exact SurrealDB 3.1.4 in 0.500 s; registry tests
+  passed 18/18.
+- The format fence is explicit: ordinary incremental dispatch supplies no
+  projection format and therefore cannot promote a partially upgraded legacy
+  project. Only a completed full rebuild records `fts_v1`; the private FTS
+  loader requires both that format and exact head revision. The public legacy
+  recall and its posting EXPLAIN remain unchanged until C7-03C. This avoids a
+  test-only cutover and preserves rollback while C7-03B proves the additive
+  production implementation.
+- The real provider-free FTS gate used one external guardian, one daemon-owned
+  `DbClientSet`, two typed project envelopes, complete format-fenced rebuilds
+  and the existing Rust rank. It passed all five cases: English target amid
+  distractors, Unicode, opaque exact handle, empty/missing terms yielding
+  `no_useful_memory`, and a local hit despite 260 foreign same-term records.
+  EXPLAIN contained `FullTextScan` and the versioned index. Final v2 test body
+  was 5.746 s and harness wall 17.385 s; provider calls and host changes were
+  zero, all roots/processes cleaned, and evidence SHA-256 is
+  `f98947e31cae7a922b1c523fdf9a2477b10dd32c044f14a8bc2c56988a8b1c65`.
+- The changed legacy retrieval regression suite passed 5/5 in 14.904 s body
+  and 20.966 s harness wall, proving the additive phase did not alter public
+  recall before cutover. Harness security passed in 1.570 s. Final affected-
+  crate all-target `cargo check` passed in 13.378 s and strict Clippy in
+  20.690 s; format, JSON, PowerShell parser and diff checks passed.
+- Two issues were corrected before acceptance. The first compile of the new
+  live module exposed one concrete `Box<StoreError>`/`Box<dyn Error>` branch
+  mismatch; the explicit coercion fixed it and the next run passed. Independent
+  audit then found that repointing the public query-plan diagnostic would make
+  legacy behavior and its test disagree; the public diagnostic was restored
+  and the FTS EXPLAIN kept private until cutover.
+- The live harness also exposed a Phase 0 evidence-report residue:
+  `run-isolated-tests.ps1` still emitted a raw subordinate
+  `final_status=DONE_VERIFIED`. It now emits typed
+  `operation_status=OPERATION_COMPLETED|FAILED`, and the harness-security gate
+  rejects any returned `final_status`. The first otherwise-passing FTS log is
+  retained only as diagnostic history; the accepted v2 evidence was generated
+  after this repair. Similar task-level wording in two subagent chat summaries
+  was treated as non-authoritative tool text and was not persisted as product
+  completion evidence.
+- An independent no-edit audit returned `ACCEPT`: no public/raw SQL seam, no
+  partial-state promotion, no database final ranking and no premature C7-03C
+  deletion/cutover remain. No provider cognition was used. C7-03B is accepted
+  for the exact commit `C7-03B: prove ordered SurrealDB FTS candidates`.
+- The final fast CodeCortex refresh completed without a repository artifact at
+  20,462 nodes and 94,109 edges. The only unrelated untracked path remains the
+  operator-owned `.eliot/`, which was not staged, modified or deleted.

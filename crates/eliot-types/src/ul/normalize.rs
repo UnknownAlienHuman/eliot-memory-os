@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashSet};
 
 const STOP_EN: &[&str] = &[
     "a", "an", "the", "and", "or", "of", "to", "in", "on", "for", "is", "are", "was", "were", "be",
@@ -186,7 +186,7 @@ pub fn normalize_symbol(raw: &str) -> String {
 #[must_use]
 pub fn normalize_query_tokens(raw: &str) -> Vec<String> {
     let lower = normalize_unicode_lowercase(raw);
-    let mut seen = BTreeSet::new();
+    let mut seen = HashSet::new();
     lower
         .split(|character: char| !character.is_alphanumeric())
         .filter(|token| {
@@ -195,7 +195,6 @@ pub fn normalize_query_tokens(raw: &str) -> Vec<String> {
                 && !STOP_RU.contains(token)
                 && seen.insert((*token).to_owned())
         })
-        .take(12)
         .map(ToOwned::to_owned)
         .collect()
 }

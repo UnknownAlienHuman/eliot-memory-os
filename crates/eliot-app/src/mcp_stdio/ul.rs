@@ -16,6 +16,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 const PACKET_PYRAMID_BUDGET: u32 = 1_500;
+const UL_FALLBACK_MATCH_TOKEN_LIMIT: usize = 12;
 
 pub(super) struct PyramidPacketEnrichment {
     pub understanding: Value,
@@ -288,9 +289,7 @@ impl UlRuntime {
         let subsystem_concept_id =
             MetacognitionService::concept_for_paths(&concept_list, touched_paths);
 
-        let fallback = eliot_types::normalize_query_tokens(fallback_text)
-            .into_iter()
-            .collect::<BTreeSet<_>>();
+        let fallback = bounded_fallback_match_tokens(fallback_text);
         let mut ranked = concepts
             .into_values()
             .filter_map(|concept| {
@@ -306,14 +305,12 @@ impl UlRuntime {
                     })
                     .max()
                     .unwrap_or_default();
-                let concept_tokens = eliot_types::normalize_query_tokens(&format!(
+                let concept_tokens = bounded_fallback_match_tokens(&format!(
                     "{} {} {}",
                     concept.name,
                     concept.purpose,
                     concept.boundary_paths.join(" ")
-                ))
-                .into_iter()
-                .collect::<BTreeSet<_>>();
+                ));
                 let fallback_match = !fallback.is_disjoint(&concept_tokens);
                 (path_score > 0 || fallback_match).then_some((path_score, fallback_match, concept))
             })
@@ -563,6 +560,13 @@ where
         .collect()
 }
 
+fn bounded_fallback_match_tokens(value: &str) -> BTreeSet<String> {
+    eliot_types::normalize_query_tokens(value)
+        .into_iter()
+        .take(UL_FALLBACK_MATCH_TOKEN_LIMIT)
+        .collect()
+}
+
 fn concept_bridge(task_id: &str, concept: &ConceptNode) -> Vec<CausalBridgeHop> {
     let concept_ref = format!("concept:{}", concept.concept_id);
     let evidence = concept.source_refs.first().cloned().or_else(|| {
@@ -586,4 +590,21 @@ fn concept_bridge(task_id: &str, concept: &ConceptNode) -> Vec<CausalBridgeHop> 
         });
     }
     bridge
+}
+
+#[cfg(test)]
+mod tests {
+    use super::bounded_fallback_match_tokens;
+
+    #[test]
+    fn ul_fallback_matching_keeps_its_twelve_token_boundary() {
+        let tokens = bounded_fallback_match_tokens(
+            "zulu alpha beta gamma delta epsilon zeta eta theta iota kappa lambda memory",
+        );
+
+        assert_eq!(tokens.len(), 12);
+        assert!(tokens.contains("zulu"));
+        assert!(tokens.contains("lambda"));
+        assert!(!tokens.contains("memory"));
+    }
 }

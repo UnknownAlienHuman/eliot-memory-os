@@ -14,6 +14,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use time::OffsetDateTime;
 
 pub const MEMORY_DISTILLATION_RULESET_VERSION: &str = "eliot-c4-distillation-v1";
+const MEMORY_DISTILLATION_NORMALIZATION_TOKEN_LIMIT: usize = 12;
 
 #[derive(Clone, Debug, Default)]
 pub struct MemoryDistillationService;
@@ -928,7 +929,11 @@ fn payload_u64(value: &Value, key: &str) -> Option<u64> {
 }
 
 fn normalize(value: &str) -> String {
-    eliot_types::normalize_query_tokens(value).join(" ")
+    eliot_types::normalize_query_tokens(value)
+        .into_iter()
+        .take(MEMORY_DISTILLATION_NORMALIZATION_TOKEN_LIMIT)
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn normalized_set(values: &[String]) -> BTreeSet<String> {
@@ -938,4 +943,15 @@ fn normalized_set(values: &[String]) -> BTreeSet<String> {
 fn stable_id(prefix: &str, value: &impl Serialize) -> Result<String, EngineError> {
     let encoded = serde_json::to_vec(value)?;
     Ok(format!("{prefix}:{}", blake3::hash(&encoded).to_hex()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::normalize;
+
+    #[test]
+    fn semantic_normalization_keeps_its_twelve_token_identity_boundary() {
+        let twelve = "zulu alpha beta gamma delta epsilon zeta eta theta iota kappa lambda";
+        assert_eq!(normalize(&format!("{twelve} memory")), twelve);
+    }
 }

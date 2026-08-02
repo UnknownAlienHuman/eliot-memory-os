@@ -818,7 +818,7 @@ foreach ($name in @('LOCALAPPDATA', 'APPDATA', 'USERPROFILE', 'HOME')) {
 
 $report = [ordered]@{
     component = 'isolated_workspace_tests'
-    final_status = if ($testExit -eq 0) { 'DONE_VERIFIED' } else { 'FAILED_VERIFIER' }
+    operation_status = if ($testExit -eq 0) { 'OPERATION_COMPLETED' } else { 'FAILED' }
     harness_probe = $HarnessProbe
     provider_calls = 0
     historical_provider_total_expected = 3

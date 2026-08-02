@@ -100,3 +100,17 @@ fn codecortex_attachment_is_disposed_by_the_evidence_contract() {
         &ambiguous_class,
     ));
 }
+
+#[test]
+fn fallback_classification_keeps_its_explicit_twelve_token_boundary() {
+    let request = request(
+        "alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu code",
+        &[],
+    );
+    let class = TaskExecutionClassifier::classify(&request, None, &[], &[]);
+
+    assert_eq!(class.source, TaskExecutionClassSource::Fallback);
+    assert_eq!(class.domain, TaskExecutionDomain::Mixed);
+    assert_eq!(class.artifact, TaskExecutionArtifact::Mixed);
+    assert_eq!(class.action, TaskExecutionAction::MultiFile);
+}
