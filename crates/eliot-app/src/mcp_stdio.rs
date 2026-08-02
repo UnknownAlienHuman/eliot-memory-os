@@ -1,7 +1,7 @@
+#[cfg(test)]
+use crate::config::load_config;
 use crate::{
-    action_plan, calibration_runtime,
-    config::load_config,
-    delegation_runtime, named_pipe_ipc,
+    action_plan, calibration_runtime, delegation_runtime, named_pipe_ipc,
     runtime_instance::{RuntimeInstance, RuntimePublication, atomic_write_json},
 };
 use anyhow::{Context, Result};
@@ -920,16 +920,37 @@ impl McpDaemon {
 }
 
 impl McpDaemon {
-    #[allow(clippy::too_many_lines)]
+    #[cfg(test)]
     pub(crate) fn new(
         config_path: &Path,
         instance: &RuntimeInstance,
         publication: &RuntimePublication,
     ) -> Result<Arc<Self>> {
         let config = load_config(config_path)?;
+        let store = CanonicalStore::new(config.db.surreal.clone());
+        Self::build(config_path, instance, publication, config, store)
+    }
+
+    pub(crate) fn new_with_config_and_store(
+        config_path: &Path,
+        instance: &RuntimeInstance,
+        publication: &RuntimePublication,
+        config: eliot_types::GovernorConfig,
+        store: CanonicalStore,
+    ) -> Result<Arc<Self>> {
+        Self::build(config_path, instance, publication, config, store)
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn build(
+        config_path: &Path,
+        instance: &RuntimeInstance,
+        publication: &RuntimePublication,
+        config: eliot_types::GovernorConfig,
+        store: CanonicalStore,
+    ) -> Result<Arc<Self>> {
         let root = runtime_root(config_path);
         let pipe_name = instance.pipe_name();
-        let store = CanonicalStore::new(config.db.surreal.clone());
         let wal = ControlWal::open(&config.control_wal)?;
         let (writer, actor) = WriterActor::channel(wal, store.clone(), &WriterConfig::default());
         let ul = Arc::new(UlRuntime::new(

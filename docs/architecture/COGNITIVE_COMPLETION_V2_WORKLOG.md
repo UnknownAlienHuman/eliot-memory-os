@@ -898,3 +898,118 @@ For each next step, record:
   `COG-00: make cognitive capability and completion evidence truthful` is
   created and pushed. No provider cognition or Claude/Antigravity quota was
   used because no repeated architecture uncertainty remained.
+
+### 2026-08-01 Phase 1 start
+
+- Phase 0 was committed and pushed as
+  `77b1b876ff8a9da37f430c05942baba1496fffe6` with the exact required subject;
+  `ls-remote` returned the same SHA. The only remaining worktree path was the
+  pre-existing operator-owned untracked `.eliot/`.
+- Two independent read-only preflights confirmed the C7-03A defect. The daemon
+  owns a long-lived `ReadySurrealServer`, but `McpDaemon` builds a separate
+  config-only `CanonicalStore`; each of its 50 direct `execute_value` paths
+  creates, authenticates, and shuts down a new transport. The accepted repair
+  is one daemon-owned shared `DbClientSet`: one server lease/generation, four
+  read transports, one FIFO write transport, and one admin/health transport.
+  Fatal connections are invalidated without replaying the current request;
+  reconnect is bounded and applies only to a later request. Shutdown is
+  explicit/idempotent and preserves an external server.
+- Local `surreal.exe` reports exact version 3.1.4. A bounded ephemeral in-memory
+  probe passed analyzer/FULLTEXT/BM25 creation, bound `@OR@`, Unicode, opaque
+  identifiers, logical project isolation, and EXPLAIN `FullTextScan`. The owned
+  probe stopped and port 19471 was independently verified closed. EXPLAIN
+  applies the project filter after the global FTS scan, so multi-project scale
+  remains a measured gate rather than an assumed property.
+- Exact C7-03B/C gaps are also located: the base tokenizer incorrectly caps at
+  12; `BTreeSet` sorts before both caps; manual token postings, aggregation,
+  posting EXPLAIN, and ambient fill remain active; `recall_l0` may rebuild a
+  whole project synchronously; and the scale harness reseeds stages instead of
+  reusing one verified 100k corpus. Rust final ranking remains the required
+  owner after FTS candidate generation.
+- No provider was called. The local FTS proof and matching static architecture
+  leave no two-option ambiguity. Claude escalation is reserved for a failed
+  real 5/5, restart determinism, R01, or a genuine recovery-policy conflict.
+
+### 2026-08-01 C7-03A pre-commit audit
+
+- The first persistent-client implementation passed compile, strict Clippy,
+  four FIFO/no-replay/shutdown unit cases, two exhaustive access-class cases,
+  and one isolated real-database case. The live case retained six sessions
+  across 100 warm reads, bounded 16 delayed readers to a peak of four, kept two
+  project filters isolated, returned one stable outcome to concurrent shutdown
+  callers, and preserved the external guardian PID and TCP endpoint.
+- Acceptance was intentionally withheld after an independent audit found four
+  boundary defects: caller-supplied raw SQL could forge its access class; the
+  bootstrap admin socket had a second strong owner; daemon construction loaded
+  config twice; and cancellation/partial-start failure could discard the only
+  owned-server cleanup authority.
+- The systemic repair removes public raw execution, transfers the bootstrap
+  transport out of the lease owner, derives `CanonicalStore` configuration from
+  `DbClientSet`, passes one immutable config snapshot into `McpDaemon`, and
+  makes owned cleanup cancellation-safe while retaining cleanup errors. The
+  isolated harness gains a library-target route so the delayed raw probe stays
+  private test code.
+- CodeCortex surfaced the existing `no_public_raw_sql_or_direct_transport`
+  invariant while confirming the affected daemon/lease anchors. These are
+  bounded local corrections, so no Claude or Antigravity call was warranted.
+- Re-audit confirmed those four repairs, but correctly kept C7-03A blocked on a
+  deeper pre-`ReadySurrealServer` branch: after spawning a detached child,
+  PID-receipt, `try_wait`, timeout-finalization, or Ready-construction failure
+  could drop Tokio's `Child` without terminating the process. The accepted
+  repair is one post-spawn finalizer which kills/waits the exact child and
+  preserves primary plus cleanup errors; a real PID-write failure injection on
+  a fresh root/port must prove that no child or listener survives.
+
+### 2026-08-01 C7-03A acceptance
+
+- `DbClientSet` now owns one database lease/generation, four fixed read
+  transports, one FIFO write transport and one admin/health transport. Named
+  operations derive their exhaustive access class internally; raw classified
+  execution is private test code. Fatal transport results invalidate their slot
+  without replaying the current request; reconnect is available only to a later
+  request and remains bounded.
+- `CanonicalStore` clones share the one client set and derive their database
+  configuration from it. Daemon construction passes the same already-loaded
+  Governor config snapshot to `McpDaemon`, eliminating a mixed-generation
+  config race. Explicit shutdown is detached single-flight and idempotent;
+  start adoption and shutdown waiters are cancellation-safe.
+- `ReadySurrealServer` transfers the bootstrap admin socket instead of retaining
+  a second strong owner. Its post-spawn guard covers process identity, PID
+  receipt, readiness, and Ready/client-lease creation; every error kills and
+  bounded-waits the exact child and preserves cleanup failures. Successful
+  readiness explicitly disarms the guard. The rare cold-start future is boxed
+  at its single call boundary to prevent its state size from propagating into
+  hot/scale futures.
+- Focused final unit evidence: client ownership/FIFO/no-current-replay cases
+  6/6 in 3.848 s; Ready lifecycle 6/6 in 0.227 s; exhaustive access classes 2/2
+  in 0.8 s; repository no-public-raw-SQL invariant 1/1 in 50.3 s wall with a
+  zero-second test body (49.30 s compilation).
+- Real external-server gate passed 1/1 with a 2.344 s body and 39.393 s wall:
+  the production path `Arc<DbClientSet> -> CanonicalStore::from_client_set ->
+  migrate -> cloned typed read` retained six sessions; 100 warm reads created
+  no new sessions; 16 delayed readers reached exactly four; project-filtered
+  rows did not mix; concurrent/late shutdown agreed; external PID/TCP survived.
+  Evidence SHA-256:
+  `e693f1ac0d9469acc3e4a8318608eb1613c9dc884cbe486257a7ac822d683a9b`.
+- Real post-spawn failure injection passed 1/1 with a 3.636 s body and 21.628 s
+  harness wall. Making `tmp/surreal.pid` a directory forced PID-receipt failure
+  after spawn; the exact parsed PID was dead, the fresh port was closed and the
+  runtime root was removable. Evidence SHA-256:
+  `593179b9973a51aa34048b795b191214c607fabaf038bd5c5dd17ec2b040d231`.
+- Both live harnesses removed temporary and secret roots, reported empty
+  cleanup failure/pending arrays, stopped every owned guardian and made zero
+  host configuration changes. The system Eliot MCP process was never touched.
+  Two independent audit passes ended in `ACCEPT`. Provider calls remained zero.
+- Final affected-crate verification after the post-spawn finalizer passed:
+  `cargo check -p eliot-store -p eliot-app --all-targets` in 22.608 s wall and
+  strict `cargo clippy` for the same targets in 29.689 s wall. Formatting,
+  capability-matrix JSON parsing and `git diff --check` also passed.
+- The post-change fast CodeCortex refresh completed without a repository
+  artifact: 20,462 nodes and 94,109 edges. The only untracked repository path
+  remains the pre-existing operator-owned `.eliot/`; it was not read as task
+  truth, modified, staged or deleted.
+- C7-03A is therefore accepted for the exact commit
+  `C7-03A: persist daemon database clients`. A higher-level writer may
+  explicitly retry a reconciled write with the same receipt/id; this is a
+  governed application decision and is distinct from forbidden silent
+  transport replay of the current call.

@@ -9,8 +9,9 @@
     "date": "2026-08-01",
     "baseline_commit": "88a5f049d71a9c535f51811eb7da273416c27118",
     "branch": "codex/cognitive-completion-v2",
-    "phase": "phase_0_accepted",
+    "phase": "phase_1_in_progress",
     "phase_0_completion_repair": "accepted_by_provider_free_local_gate",
+    "phase_1_progress": "C7-03A persistent daemon database clients accepted by provider-free local gate",
     "provider_calls_allowed": false,
     "truth_note": "This is a capability snapshot, not completion evidence. Source, canonical receipts, focused behavior tests, scale evidence, and field evidence remain authoritative."
   },
@@ -121,17 +122,19 @@
     },
     {
       "capability": "persistent_daemon_db_client_set",
-      "implemented": false,
-      "production_connected": false,
-      "behavior_verified": false,
+      "implemented": true,
+      "production_connected": true,
+      "behavior_verified": true,
       "field_certified": false,
-      "owner": "not implemented; Phase 1 assigns ownership to one daemon-owned DbClientSet shared by CanonicalStore clones",
+      "owner": "one daemon-owned DbClientSet shared by CanonicalStore clones",
       "hot_or_cold": "hot",
       "evidence": [
-        "No DbClientSet symbol exists at the baseline commit.",
-        "reports/cognitive-field/COGNITIVE_COMPLETION_RECOVERY_TASK03_BLOCKED_20260801.md#next-bounded-work-package"
+        "crates/eliot-store/src/db_client_set.rs",
+        "crates/eliot-store/src/db_client_set/live_tests.rs",
+        "crates/eliot-app/src/commands/operations.rs::run_daemon_instance",
+        "docs/architecture/COGNITIVE_COMPLETION_V2_WORKLOG.md#2026-08-01-c7-03a-acceptance"
       ],
-      "known_gap": "Add a fixed read pool, ordered write transport, admin transport, bounded reconnect, and idempotent shutdown; prove bounded sessions under warm and concurrent reads."
+      "known_gap": "C7-03A is locally accepted; Phase 1 still requires the C7-03B FTS proof, C7-03C cutover/coordinator, correctness and scale gates, one exact R01, and final C7-03 certification."
     },
     {
       "capability": "surrealdb_fulltext_candidate_generation",

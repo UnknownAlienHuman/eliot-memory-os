@@ -4,6 +4,7 @@ pub mod blob_store;
 pub mod canonical_projection;
 pub mod canonical_store;
 pub mod control_wal;
+pub mod db_client_set;
 pub mod error;
 pub mod migration;
 pub mod surql;
@@ -24,9 +25,10 @@ pub use canonical_store::{
 pub use control_wal::{
     ControlWal, WalDeadLetter, WalFailedWrite, WalPendingWrite, WalProjectHead, WalWriteState,
 };
+pub use db_client_set::{DEFAULT_DB_READ_POOL_SIZE, DbClientSet, DbClientSetMetrics};
 pub use error::StoreError;
 pub use migration::{CompiledMigration, MigrationRunner};
-pub use surql::{NamedSurqlOp, SurqlTemplate, SurqlTemplateRegistry};
+pub use surql::{NamedSurqlOp, SurqlAccessClass, SurqlTemplate, SurqlTemplateRegistry};
 pub use surreal_server::{
     CredentialRotationReport, ReadySurrealServer, SurrealServerSupervisor, SurrealShutdown,
 };

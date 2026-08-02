@@ -4,6 +4,7 @@ param(
     [string]$TestPackage = 'eliot-app',
     [string]$TestBinary,
     [string]$BinTarget,
+    [switch]$LibTarget,
     [string]$TestName,
     [string]$TestFilterExpression,
     [switch]$RunIgnored,
@@ -538,6 +539,12 @@ migrations_dir = "$migrationsPath"
     }
     elseif ($TestBinary) {
         $nextestArgs += @('-p', $TestPackage, '--test', $TestBinary)
+        if ($TestName) {
+            $nextestArgs += $TestName
+        }
+    }
+    elseif ($LibTarget) {
+        $nextestArgs += @('-p', $TestPackage, '--lib')
         if ($TestName) {
             $nextestArgs += $TestName
         }

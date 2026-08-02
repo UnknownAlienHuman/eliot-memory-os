@@ -1,6 +1,13 @@
 use std::collections::HashMap;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum SurqlAccessClass {
+    Read,
+    Write,
+    Admin,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum NamedSurqlOp {
     SchemaMigrate,
     SchemaMigrateObservability,
@@ -70,6 +77,76 @@ pub enum NamedSurqlOp {
 }
 
 impl NamedSurqlOp {
+    pub const fn access_class(self) -> SurqlAccessClass {
+        match self {
+            Self::SchemaMigrate
+            | Self::SchemaMigrateObservability
+            | Self::SchemaMigrateUl
+            | Self::SchemaMigrateUlDelivery
+            | Self::SchemaMigrateUlArtifacts
+            | Self::SchemaMigrateUlPyramid
+            | Self::SchemaMigrateUlMeasurement
+            | Self::SchemaMigrateUlDependencyActivation
+            | Self::SchemaMigrateUlTokenPolicy
+            | Self::SchemaMigrateMemorySearch
+            | Self::ExplainMemorySearchPostings
+            | Self::GraphHealthCapabilities
+            | Self::GraphHealth
+            | Self::BlobReferenceScan => SurqlAccessClass::Admin,
+            Self::AssignUlExperimentArm
+            | Self::UpsertUlTaskClassPolicy
+            | Self::ReplaceUlReverseDependencies
+            | Self::UpsertUlArtifactDirty
+            | Self::ClearUlArtifactDirty
+            | Self::UpsertCueRows
+            | Self::DeleteCueRows
+            | Self::UpsertUlTaskLedger
+            | Self::ApplyWriteEnvelope
+            | Self::ApplyObservability
+            | Self::UpsertMemorySearchProjection
+            | Self::ResetMemorySearchProjection => SurqlAccessClass::Write,
+            Self::LoadUlExperimentAssignment
+            | Self::LoadUlTaskClassLedgers
+            | Self::LoadUlTaskClassPolicy
+            | Self::LoadUlReverseDependents
+            | Self::LoadUlArtifactDirty
+            | Self::LoadUlActivationGraph
+            | Self::LoadCueRows
+            | Self::LoadCueRecords
+            | Self::LoadInjectionReceipts
+            | Self::LoadUlArtifacts
+            | Self::LoadPredictions
+            | Self::LoadUlMetrics
+            | Self::LoadUlReadiness
+            | Self::ObservabilityReceiptById
+            | Self::ObservabilityRecordsByKind
+            | Self::CurrentState
+            | Self::LoadRecallCandidates
+            | Self::LoadMemorySearchCandidates
+            | Self::FetchAtomsL2
+            | Self::FetchAtomsL2Legacy
+            | Self::WriterReceipts
+            | Self::WriteReceiptById
+            | Self::ToolObservationByWriteId
+            | Self::LatestAuthorityObservationsByEntity
+            | Self::TaskContractById
+            | Self::ToolObservationById
+            | Self::ToolObservationsByKind
+            | Self::ExperiencePatternRevisionsById
+            | Self::SemanticRecordsByKind
+            | Self::ClaimCardById
+            | Self::VerificationRunById
+            | Self::CanonicalRecords
+            | Self::CanonicalRecordPage
+            | Self::CurationRecordPage
+            | Self::CanonicalRecordByWriteId
+            | Self::CanonicalRecordsBySubjectRef
+            | Self::CanonicalTraceByTraceRef
+            | Self::MetaPolicyActionsByCandidate
+            | Self::SleepCandidates => SurqlAccessClass::Read,
+        }
+    }
+
     pub const fn name(self) -> &'static str {
         match self {
             Self::SchemaMigrate => "000_schema",
@@ -719,7 +796,44 @@ fn template(
 
 #[cfg(test)]
 mod tests {
-    use super::NamedSurqlOp;
+    use super::{NamedSurqlOp, SurqlAccessClass, SurqlTemplateRegistry};
+
+    #[test]
+    fn access_classes_are_exhaustive_and_have_expected_counts() {
+        let registry = SurqlTemplateRegistry::default();
+        let mut counts = [0_usize; 3];
+
+        for op in registry.templates.keys() {
+            match op.access_class() {
+                SurqlAccessClass::Read => counts[0] += 1,
+                SurqlAccessClass::Write => counts[1] += 1,
+                SurqlAccessClass::Admin => counts[2] += 1,
+            }
+        }
+
+        assert_eq!(registry.templates.len(), 65);
+        assert_eq!(counts, [39, 12, 14]);
+    }
+
+    #[test]
+    fn access_classes_cover_representative_operations() {
+        assert_eq!(
+            NamedSurqlOp::TaskContractById.access_class(),
+            SurqlAccessClass::Read
+        );
+        assert_eq!(
+            NamedSurqlOp::ApplyWriteEnvelope.access_class(),
+            SurqlAccessClass::Write
+        );
+        assert_eq!(
+            NamedSurqlOp::SchemaMigrateMemorySearch.access_class(),
+            SurqlAccessClass::Admin
+        );
+        assert_eq!(
+            NamedSurqlOp::BlobReferenceScan.access_class(),
+            SurqlAccessClass::Admin
+        );
+    }
 
     #[test]
     fn ordered_tool_observation_projection_contains_order_fields() {

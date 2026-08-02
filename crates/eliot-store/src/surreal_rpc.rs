@@ -105,6 +105,22 @@ impl SurrealRpcTransport {
         self.request("query", json!([sql, bound_vars])).await
     }
 
+    pub async fn close(&self) -> Result<(), StoreError> {
+        timeout(self.request_timeout, async {
+            self.socket
+                .lock()
+                .await
+                .send(Message::Close(None))
+                .await
+                .map_err(|error| StoreError::WebSocket(error.to_string()))
+        })
+        .await
+        .map_err(|_| StoreError::Timeout {
+            op: "surreal rpc close".to_owned(),
+            ms: millis_u64(self.request_timeout),
+        })?
+    }
+
     async fn request(&self, method: &str, params: Value) -> Result<Value, StoreError> {
         let id = Uuid::new_v4().to_string();
         let expected_id = Value::String(id.clone());

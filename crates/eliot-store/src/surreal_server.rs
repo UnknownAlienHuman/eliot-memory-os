@@ -10,9 +10,10 @@ use std::fs::{self, OpenOptions};
 use std::io::{ErrorKind, Write};
 use std::path::{Component, Path, PathBuf};
 use std::process::{self, Stdio};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::process::Command;
-use tokio::time::sleep;
+use tokio::process::{Child, Command};
+use tokio::time::{sleep, timeout};
 use uuid::Uuid;
 
 #[cfg(windows)]
@@ -29,7 +30,7 @@ pub struct SurrealServerSupervisor {
 
 #[derive(Debug)]
 pub struct ReadySurrealServer {
-    transport: SurrealRpcTransport,
+    transport: Option<Arc<SurrealRpcTransport>>,
     started_pid: Option<u32>,
     lease_path: Option<PathBuf>,
     supervisor: SurrealServerSupervisor,
@@ -85,6 +86,102 @@ struct StartLock {
     _file: fs::File,
 }
 
+/// Owns the exact child handle from the moment `SurrealDB` is spawned until a
+/// ready runtime takes responsibility for its pid. Every ordinary error after
+/// spawn is routed through [`Self::finalize_error`]; cancellation still gets a
+/// best-effort synchronous kill signal from [`Drop`].
+struct SpawnedServerFinalizer<'a> {
+    supervisor: &'a SurrealServerSupervisor,
+    child: Option<Child>,
+    pid: Option<u32>,
+}
+
+impl<'a> SpawnedServerFinalizer<'a> {
+    fn new(supervisor: &'a SurrealServerSupervisor, child: Child, pid: Option<u32>) -> Self {
+        Self {
+            supervisor,
+            child: Some(child),
+            pid,
+        }
+    }
+
+    const fn pid(&self) -> Option<u32> {
+        self.pid
+    }
+
+    fn child_mut(&mut self) -> Result<&mut Child, StoreError> {
+        self.child
+            .as_mut()
+            .ok_or_else(|| StoreError::Process("spawned server finalizer was disarmed".to_owned()))
+    }
+
+    /// Transfers process ownership to `ReadySurrealServer` without terminating
+    /// the detached server when this guard is dropped.
+    fn disarm(mut self) {
+        let _detached_child = self.child.take();
+    }
+
+    async fn finalize_error(mut self, primary: StoreError) -> StoreError {
+        let mut cleanup_failures = Vec::new();
+
+        if let Some(child) = self.child.as_mut() {
+            let child_is_live = match child.try_wait() {
+                Ok(Some(_status)) => {
+                    // `try_wait` returned the exit status and reaped this exact
+                    // child, so there is no live process left to kill.
+                    false
+                }
+                Ok(None) => true,
+                Err(error) => {
+                    cleanup_failures.push(format!("exact child status probe: {error}"));
+                    true
+                }
+            };
+            if child_is_live {
+                if let Err(error) = child.start_kill() {
+                    cleanup_failures.push(format!("exact child kill: {error}"));
+                }
+                let wait_bound =
+                    Duration::from_millis(self.supervisor.config.startup_timeout_ms.max(1_000));
+                match timeout(wait_bound, child.wait()).await {
+                    Ok(Ok(_status)) => {}
+                    Ok(Err(error)) => {
+                        cleanup_failures.push(format!("exact child wait: {error}"));
+                    }
+                    Err(_elapsed) => cleanup_failures.push(format!(
+                        "exact child wait exceeded {}ms",
+                        wait_bound.as_millis()
+                    )),
+                }
+            }
+        }
+        self.child.take();
+
+        if let Some(pid) = self.pid
+            && let Err(error) = self.supervisor.remove_pid_file_if_matches(pid)
+        {
+            cleanup_failures.push(format!("owned pid receipt removal: {error}"));
+        }
+
+        if cleanup_failures.is_empty() {
+            primary
+        } else {
+            StoreError::ServerStartFailed(format!(
+                "primary post-spawn failure: {primary}; cleanup failures: {}",
+                cleanup_failures.join("; ")
+            ))
+        }
+    }
+}
+
+impl Drop for SpawnedServerFinalizer<'_> {
+    fn drop(&mut self) {
+        if let Some(child) = self.child.as_mut() {
+            let _kill_result = child.start_kill();
+        }
+    }
+}
+
 impl SurrealServerSupervisor {
     pub const fn new(config: SurrealServerConfig) -> Self {
         Self { config }
@@ -124,7 +221,7 @@ impl SurrealServerSupervisor {
                     Err(error @ StoreError::ServerAuthFailed(_)) => return Err(error),
                     Err(_connection_error) => {}
                 }
-                return self.spawn_and_wait(password).await;
+                return Box::pin(self.spawn_and_wait(password)).await;
             }
 
             match self.read_existing_password()? {
@@ -263,66 +360,79 @@ impl SurrealServerSupervisor {
         &self,
         password: SecretString,
     ) -> Result<ReadySurrealServer, StoreError> {
-        let mut child = self.spawn_server(&password)?;
+        let child = self.spawn_server(&password)?;
         let pid = child.id();
-        if let Some(pid) = pid {
+        let mut spawned = SpawnedServerFinalizer::new(self, child, pid);
+
+        let startup = async {
+            let pid = spawned.pid().ok_or_else(|| {
+                StoreError::ServerStartFailed(
+                    "spawned SurrealDB process did not expose a process id".to_owned(),
+                )
+            })?;
+
             // The executable was resolved before the spawn. Confirm the image
             // the kernel actually loaded is that same file, so a substitution
             // landing in the window between resolution and exec cannot pass
             // itself off as the canonical server -- and is never recorded as
             // an owned pid this runtime would later terminate.
-            if let Err(error) = self.verify_owned_process_identity(pid) {
-                let _ = child.kill().await;
-                return Err(error);
-            }
+            self.verify_owned_process_identity(pid)?;
             let pid_path = self.pid_path();
             if let Some(parent) = pid_path.parent() {
                 fs::create_dir_all(parent)?;
             }
-            fs::write(pid_path, pid.to_string())?;
-        }
+            fs::write(&pid_path, pid.to_string()).map_err(|error| {
+                StoreError::ServerStartFailed(format!(
+                    "cannot write owned pid receipt for pid {pid} at {}: {error}",
+                    pid_path.display()
+                ))
+            })?;
 
-        let deadline = Instant::now() + Duration::from_millis(self.config.startup_timeout_ms);
-        let mut backoff = Duration::from_millis(self.config.restart_backoff_ms.max(50));
-        let max_backoff = Duration::from_millis(self.config.max_restart_backoff_ms.max(50));
-        let mut last_error = String::from("connection not attempted");
+            let deadline = Instant::now() + Duration::from_millis(self.config.startup_timeout_ms);
+            let mut backoff = Duration::from_millis(self.config.restart_backoff_ms.max(50));
+            let max_backoff = Duration::from_millis(self.config.max_restart_backoff_ms.max(50));
+            let mut last_error = String::from("connection not attempted");
 
-        while Instant::now() < deadline {
-            if let Some(status) = child
-                .try_wait()
-                .map_err(|error| StoreError::Process(error.to_string()))?
-            {
-                if let Some(pid) = pid {
-                    self.remove_pid_file_if_matches(pid)?;
+            while Instant::now() < deadline {
+                if let Some(status) = spawned
+                    .child_mut()?
+                    .try_wait()
+                    .map_err(|error| StoreError::Process(error.to_string()))?
+                {
+                    return Err(StoreError::ServerStartFailed(format!(
+                        "process exited before readiness with status {status}; last error: {last_error}"
+                    )));
                 }
-                return Err(StoreError::ServerStartFailed(format!(
-                    "process exited before readiness with status {status}; last error: {last_error}"
-                )));
+
+                match self
+                    .connect_and_auth(&password, self.config.restart_backoff_ms.max(250))
+                    .await
+                {
+                    Ok(transport) => return Ok((transport, pid)),
+                    Err(error) => last_error = error.to_string(),
+                }
+
+                sleep(backoff).await;
+                backoff = backoff.saturating_mul(2).min(max_backoff);
             }
 
-            match self
-                .connect_and_auth(&password, self.config.restart_backoff_ms.max(250))
-                .await
-            {
-                Ok(transport) => {
-                    return self.ready_server(transport, pid);
+            Err(StoreError::ServerStartFailed(format!(
+                "readiness timeout after {}ms; last error: {last_error}",
+                self.config.startup_timeout_ms
+            )))
+        }
+        .await;
+
+        match startup {
+            Ok((transport, pid)) => match self.ready_server(transport, Some(pid)) {
+                Ok(ready) => {
+                    spawned.disarm();
+                    Ok(ready)
                 }
-                Err(error) => last_error = error.to_string(),
-            }
-
-            sleep(backoff).await;
-            backoff = backoff.saturating_mul(2).min(max_backoff);
+                Err(error) => Err(spawned.finalize_error(error).await),
+            },
+            Err(error) => Err(spawned.finalize_error(error).await),
         }
-
-        if let Some(pid) = pid {
-            stop_pid(pid).await?;
-            self.remove_pid_file_if_matches(pid)?;
-        }
-
-        Err(StoreError::ServerStartFailed(format!(
-            "readiness timeout after {}ms; last error: {last_error}",
-            self.config.startup_timeout_ms
-        )))
     }
 
     fn spawn_server(&self, password: &SecretString) -> Result<tokio::process::Child, StoreError> {
@@ -509,6 +619,18 @@ impl SurrealServerSupervisor {
         Ok(transport)
     }
 
+    pub(crate) async fn connect_authenticated_sibling(
+        &self,
+        connect_timeout_ms: u64,
+    ) -> Result<SurrealRpcTransport, StoreError> {
+        let password = self.read_existing_password()?.ok_or_else(|| {
+            StoreError::ServerStartFailed(
+                "cannot connect a sibling transport before credentials are initialized".to_owned(),
+            )
+        })?;
+        self.connect_and_auth(&password, connect_timeout_ms).await
+    }
+
     fn pid_path(&self) -> PathBuf {
         self.runtime_root().join("tmp").join("surreal.pid")
     }
@@ -620,7 +742,7 @@ impl SurrealServerSupervisor {
         started_pid: Option<u32>,
     ) -> Result<ReadySurrealServer, StoreError> {
         Ok(ReadySurrealServer {
-            transport,
+            transport: Some(Arc::new(transport)),
             started_pid,
             lease_path: Some(self.create_client_lease()?),
             supervisor: self.clone(),
@@ -927,8 +1049,20 @@ fn restrict_secret_path(_path: &Path, _directory: bool) -> Result<(), StoreError
 }
 
 impl ReadySurrealServer {
-    pub(crate) const fn transport(&self) -> &SurrealRpcTransport {
-        &self.transport
+    pub(crate) fn transport(&self) -> Result<&SurrealRpcTransport, StoreError> {
+        self.transport.as_deref().ok_or_else(|| {
+            StoreError::PolicyViolation(
+                "ready server transport was already transferred to its client set".to_owned(),
+            )
+        })
+    }
+
+    pub(crate) fn take_transport_handle(&mut self) -> Result<Arc<SurrealRpcTransport>, StoreError> {
+        self.transport.take().ok_or_else(|| {
+            StoreError::PolicyViolation(
+                "ready server transport was already transferred to its client set".to_owned(),
+            )
+        })
     }
 
     pub const fn started_pid(&self) -> Option<u32> {
@@ -948,15 +1082,28 @@ impl ReadySurrealServer {
     /// Returns an error when the owned process cannot be identified, refuses to
     /// stop, or when pid/lease bookkeeping cannot be updated.
     pub async fn shutdown_if_spawned(mut self) -> Result<SurrealShutdown, StoreError> {
-        self.release_client_lease()?;
+        let mut cleanup_failures = Vec::new();
+        if let Err(error) = self.release_client_lease() {
+            cleanup_failures.push(format!("client lease release: {error}"));
+        }
         let Some(pid) = self.started_pid.take() else {
             // Connected to a pre-existing server. It is not ours to stop.
-            return Ok(SurrealShutdown::not_owned());
+            return if cleanup_failures.is_empty() {
+                Ok(SurrealShutdown::not_owned())
+            } else {
+                Err(StoreError::Process(cleanup_failures.join("; ")))
+            };
         };
 
         // Best-effort: a start lock held by another starter must not strand the
         // process this runtime owns.
-        let lock = self.supervisor.acquire_start_lock().await.ok();
+        let lock = match self.supervisor.acquire_start_lock().await {
+            Ok(lock) => Some(lock),
+            Err(error) => {
+                cleanup_failures.push(format!("shutdown coordination lock: {error}"));
+                None
+            }
+        };
         let drain_incomplete = self
             .supervisor
             .wait_for_client_leases_to_drain()
@@ -965,14 +1112,27 @@ impl ReadySurrealServer {
 
         let stop = self.supervisor.stop_owned_process(pid).await;
         drop(lock);
-        let already_exited = stop?;
+        let already_exited = match stop {
+            Ok(already_exited) => already_exited,
+            Err(error) => {
+                cleanup_failures.push(format!("owned process stop: {error}"));
+                return Err(StoreError::Process(cleanup_failures.join("; ")));
+            }
+        };
 
-        self.supervisor.remove_pid_file_if_matches(pid)?;
-        Ok(SurrealShutdown {
+        if let Err(error) = self.supervisor.remove_pid_file_if_matches(pid) {
+            cleanup_failures.push(format!("owned pid receipt removal: {error}"));
+        }
+        let outcome = SurrealShutdown {
             stopped_owned_process: true,
             drain_incomplete,
             already_exited,
-        })
+        };
+        if cleanup_failures.is_empty() {
+            Ok(outcome)
+        } else {
+            Err(StoreError::Process(cleanup_failures.join("; ")))
+        }
     }
 
     fn release_client_lease(&mut self) -> Result<(), StoreError> {
@@ -1404,6 +1564,65 @@ mod lifecycle_tests {
         assert!(supervisor.stop_owned_process(exited_pid()?).await?);
 
         fs::remove_dir_all(&root)?;
+        Ok(())
+    }
+
+    /// Forces a failure after the real detached process has spawned but before
+    /// its ownership receipt can be persisted. The exact child must be reaped;
+    /// neither a live pid, a listening port, nor locked runtime files may remain.
+    #[cfg(windows)]
+    #[tokio::test]
+    #[ignore = "requires the isolated-test harness and a real SurrealDB executable"]
+    async fn a_pid_receipt_write_failure_reaps_the_exact_spawned_child()
+    -> Result<(), Box<dyn std::error::Error>> {
+        if std::env::var("ELIOT_DISABLE_REAL_PROVIDER").as_deref() != Ok("1") {
+            return Err("ELIOT_DISABLE_REAL_PROVIDER=1 is required".into());
+        }
+        let exe = std::env::var("ELIOT_SURREAL_EXE")?;
+        let password_file = std::env::var("ELIOT_TEST_SURREAL_PASSWORD_FILE")?;
+        let root = test_root("pid-receipt-write")?;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+        let bind = listener.local_addr()?;
+        drop(listener);
+
+        let mut config = supervisor_for(&exe, &root).config;
+        config.bind = bind.to_string();
+        config.endpoint = format!("ws://{bind}/rpc");
+        config.password_file = password_file;
+        config.credential_provider = CredentialProviderKind::LegacyPasswordFile;
+        config.startup_timeout_ms = 5_000;
+        let supervisor = SurrealServerSupervisor::new(config);
+
+        let pid_path = root.join("tmp").join("surreal.pid");
+        fs::create_dir(&pid_path)?;
+
+        let failure = match supervisor.start_or_connect().await {
+            Err(error) => error,
+            Ok(ready) => {
+                let shutdown = ready.shutdown_if_spawned().await;
+                return Err(format!(
+                    "the pid receipt directory did not make its file write fail; shutdown: {shutdown:?}"
+                )
+                .into());
+            }
+        };
+        let failure = failure.to_string();
+        let pid_text = failure
+            .split_once("cannot write owned pid receipt for pid ")
+            .and_then(|(_, suffix)| suffix.split_once(" at ").map(|(pid, _)| pid))
+            .ok_or_else(|| format!("failure did not reach the injected pid write: {failure}"))?;
+        let pid = pid_text.parse::<u32>()?;
+
+        assert!(
+            !process_is_alive(pid)?,
+            "post-spawn failure left pid {pid} alive"
+        );
+        assert!(
+            std::net::TcpStream::connect(bind).is_err(),
+            "post-spawn failure left {bind} accepting connections"
+        );
+        fs::remove_dir_all(&root)?;
+        assert!(!root.exists(), "runtime root was not removable");
         Ok(())
     }
 

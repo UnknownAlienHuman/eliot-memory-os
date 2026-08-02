@@ -4,7 +4,7 @@ Status: normative for `ELIOT_COGNITIVE_COMPLETION_ULTRA_MASTER_FINAL_v4_1.md`
 
 Baseline: `88a5f049d71a9c535f51811eb7da273416c27118`
 
-Current gate: Phase 0 accepted; Phase 1 unlocked; provider cognition is forbidden
+Current gate: Phase 0 and C7-03A accepted; Phase 1 active; provider cognition is forbidden
 
 This document fixes ownership and acceptance constraints. It does not claim
 that every invariant is already enforced. Current enforcement and evidence are
@@ -67,7 +67,7 @@ receipts, focused tests, measurements, and field artifacts remain the truth.
 
 ## 3. Storage, retrieval, and projections
 
-1. **CRI-020 — one daemon database lease.** The eventual `DbClientSet` owns one
+1. **CRI-020 — one daemon database lease.** The current `DbClientSet` owns one
    database-server lease and generation, a fixed read pool, one ordered write
    transport, and one admin/health transport shared by `CanonicalStore` clones.
    Acquisition and reconnect are bounded; shutdown is explicit and idempotent;
@@ -183,7 +183,7 @@ pass its focused behavior gate, and be pushed before the next phase begins.
 | Phase | Current state | Required gate before advancement |
 | --- | --- | --- |
 | 0 — truthful capability/completion | `ACCEPTED` | Archive ref exists; matrix and invariants exist; only `CompletionGate` plus `CompletionProof` can complete a task; verifier/review/coordination negatives and complete-proof positive pass. |
-| 1 — storage/retrieval | `UNLOCKED` | Phase 0 accepted; persistent clients, FTS candidate path, cutover/deletion, 5/5 correctness, PF1/PF2/PF3, one exact R01, and bounded 16-reader isolation pass without providers. |
+| 1 — storage/retrieval | `IN_PROGRESS_C7_03A_ACCEPTED` | Phase 0 accepted; persistent clients are locally accepted; FTS candidate path, cutover/deletion, 5/5 correctness, PF1/PF2/PF3, one exact R01, and final bounded isolation remain provider-free gates. |
 | 2 — hot understanding runtime | `LOCKED` | Phase 1 accepted; one daemon runtime, projection recovery, zero-edge direct fire, no PreToolUse I/O, restart behavior, and p95 budgets pass without providers. |
 | 3 — context compiler | `LOCKED` | Phase 2 accepted; one engine compiler, graph-derived causal paths, real scoped cues/cases, one revision fence, and bounded degraded staleness pass without providers. |
 | 4 — learning/distillation | `LOCKED` | Phase 3 accepted; grounded episode/case/skill learning, real utility attribution, reversible forgetting/compression, and grounded/no-op sleep pass without providers. |

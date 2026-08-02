@@ -40,7 +40,7 @@ impl SurrealStore {
         let server = SurrealServerSupervisor::new(self.config.clone())
             .start_or_connect()
             .await?;
-        let version_result = server.transport().version().await;
+        let version_result = server.transport()?.version().await;
         let shutdown_result = server.shutdown_if_spawned().await;
         let version_value = version_result?;
         shutdown_result?;
@@ -62,7 +62,7 @@ impl SurrealStore {
             .start_or_connect()
             .await?;
         let raw_result = server
-            .transport()
+            .transport()?
             .query(sql, Value::Object(serde_json::Map::new()))
             .await;
         let shutdown_result = server.shutdown_if_spawned().await;
@@ -83,7 +83,7 @@ impl SurrealStore {
             .await?;
         let server_started = server.started_pid().is_some();
         let report_result = async {
-            let transport = server.transport();
+            let transport = server.transport()?;
             let version_value = transport.version().await?;
             let version = version_string(&version_value);
 

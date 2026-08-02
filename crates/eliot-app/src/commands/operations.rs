@@ -538,7 +538,6 @@ pub async fn run_daemon(config_path: &Path, instance: Option<&str>) -> Result<()
 
 async fn run_daemon_instance(config_path: &Path, instance: &RuntimeInstance) -> Result<()> {
     let config = load_config(config_path)?;
-    let data_root = runtime_root(config_path);
     let root = instance.publication_root().to_path_buf();
     let lifecycle = LifecycleService::new(&root);
     let lock = lifecycle.acquire_single_instance()?;
@@ -546,36 +545,26 @@ async fn run_daemon_instance(config_path: &Path, instance: &RuntimeInstance) -> 
     if stop_marker.is_file() {
         std::fs::remove_file(&stop_marker)?;
     }
-    let database = if instance.standalone() {
-        Some(
-            SurrealServerSupervisor::new(config.db.surreal.clone())
-                .start_or_connect()
-                .await
-                .context("start or connect the standalone instance-owned SurrealDB server")?,
-        )
-    } else {
-        None
-    };
-    let database_started_pid = database
-        .as_ref()
-        .and_then(eliot_store::ReadySurrealServer::started_pid);
-    let store_root = store_root_from_storage(&config.db.surreal.storage);
+    let database = std::sync::Arc::new(
+        DbClientSet::start(config.db.surreal.clone())
+            .await
+            .context("start the daemon-owned persistent SurrealDB client set")?,
+    );
+    let database_started_pid = database.started_pid();
+    let store = CanonicalStore::from_client_set(std::sync::Arc::clone(&database));
+    let operation_watchdog_interval =
+        Duration::from_millis(config.supervision.watchdog_interval_ms);
     let runtime_result = run_published_daemon(
         config_path,
         instance,
-        &data_root,
-        &store_root,
+        config,
+        store,
         database_started_pid,
-        Duration::from_millis(config.supervision.watchdog_interval_ms),
+        operation_watchdog_interval,
     )
     .await;
-    let database_result = match database {
-        Some(database) => database
-            .shutdown_if_spawned()
-            .await
-            .map_err(anyhow::Error::from),
-        None => Ok(eliot_store::SurrealShutdown::not_owned()),
-    };
+    let database_result = database.shutdown().await.map_err(anyhow::Error::from);
+    let database_metrics = database.metrics();
     match (runtime_result, database_result) {
         (Ok(publication_cleaned), Ok(database)) => {
             lock.mark_clean_shutdown()?;
@@ -584,6 +573,12 @@ async fn run_daemon_instance(config_path: &Path, instance: &RuntimeInstance) -> 
                 database_stopped = database.stopped_owned_process,
                 database_drain_incomplete = database.drain_incomplete,
                 database_already_exited = database.already_exited,
+                database_generation = %database_metrics.generation_id,
+                database_sessions_opened = database_metrics.sessions_opened,
+                database_reconnects = database_metrics.reconnect_successes,
+                database_invalidations = database_metrics.transport_invalidations,
+                database_peak_readers = database_metrics.peak_readers,
+                database_pool_size = database_metrics.read_pool_size,
                 publication_cleaned,
                 "owned runtime resources released"
             );
@@ -604,18 +599,26 @@ async fn run_daemon_instance(config_path: &Path, instance: &RuntimeInstance) -> 
 async fn run_published_daemon(
     config_path: &Path,
     instance: &RuntimeInstance,
-    data_root: &Path,
-    store_root: &Path,
+    config: eliot_types::GovernorConfig,
+    store: CanonicalStore,
     database_started_pid: Option<u32>,
     operation_watchdog_interval: Duration,
 ) -> Result<bool> {
+    let data_root = runtime_root(config_path);
+    let store_root = store_root_from_storage(&config.db.surreal.storage);
     let stop_marker = instance.stop_marker();
     async {
-        let mut ipc_server = named_pipe_ipc::IpcServer::bind(config_path, instance, store_root)?;
+        let mut ipc_server = named_pipe_ipc::IpcServer::bind(config_path, instance, &store_root)?;
         let pipe_name = ipc_server.name().to_owned();
         let starting_publication =
             instance.read_publication_any_state(named_pipe_ipc::IPC_PROTOCOL_VERSION)?;
-        let mcp_daemon = mcp_stdio::McpDaemon::new(config_path, instance, &starting_publication)?;
+        let mcp_daemon = mcp_stdio::McpDaemon::new_with_config_and_store(
+            config_path,
+            instance,
+            &starting_publication,
+            config,
+            store,
+        )?;
         let operation_watchdog_shutdown =
             eliot_engine::runtime_supervision::CancellationToken::new();
         let operation_supervisor = std::sync::Arc::new(

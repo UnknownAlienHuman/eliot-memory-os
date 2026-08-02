@@ -69,6 +69,15 @@ pub enum StoreError {
     #[error("SurrealDB transport policy violation: {0}")]
     PolicyViolation(String),
 
+    #[error("SurrealDB client set is shutting down")]
+    ClientSetShuttingDown,
+
+    #[error("SurrealDB client set startup failed: {0}")]
+    ClientSetStartupFailed(String),
+
+    #[error("SurrealDB client set shutdown failed: {0}")]
+    ClientSetShutdownFailed(String),
+
     #[error("observability write_id conflicts with a different payload")]
     ObservabilityConflict,
 
@@ -77,4 +86,16 @@ pub enum StoreError {
 
     #[error("process control error: {0}")]
     Process(String),
+}
+
+impl StoreError {
+    /// A fatal transport error makes the RPC session unusable. The current
+    /// operation is never replayed; its slot reconnects only when a later
+    /// operation acquires it.
+    pub(crate) const fn invalidates_rpc_transport(&self) -> bool {
+        matches!(
+            self,
+            Self::ConnectionClosed | Self::Timeout { .. } | Self::Decode(_) | Self::WebSocket(_)
+        )
+    }
 }

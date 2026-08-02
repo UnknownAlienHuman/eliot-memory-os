@@ -1,8 +1,8 @@
-use crate::surreal_server::SurrealServerSupervisor;
+use crate::surreal_server::{ReadySurrealServer, SurrealServerSupervisor};
 use crate::{
     CanonicalAutonomyRunView, CanonicalLifecycleView, CanonicalRecord, CanonicalReplayView,
-    CanonicalSleepView, MAX_CANONICAL_RECORDS, NamedSurqlOp, SleepCandidatesResponse, StoreError,
-    SurqlTemplateRegistry,
+    CanonicalSleepView, DbClientSet, MAX_CANONICAL_RECORDS, NamedSurqlOp, SleepCandidatesResponse,
+    StoreError, SurqlTemplateRegistry,
 };
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD_NO_PAD;
@@ -28,6 +28,7 @@ use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
 use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::sync::Arc;
 use time::OffsetDateTime;
 use tokio::time::{Duration, sleep};
 
@@ -1496,6 +1497,7 @@ fn exact_memory_search_handle(query: &str) -> Option<String> {
 pub struct CanonicalStore {
     config: SurrealServerConfig,
     registry: SurqlTemplateRegistry,
+    client_set: Option<Arc<DbClientSet>>,
 }
 
 #[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
@@ -1575,6 +1577,16 @@ impl CanonicalStore {
         Self {
             config,
             registry: SurqlTemplateRegistry::default(),
+            client_set: None,
+        }
+    }
+
+    #[must_use]
+    pub fn from_client_set(client_set: Arc<DbClientSet>) -> Self {
+        Self {
+            config: client_set.config().clone(),
+            registry: SurqlTemplateRegistry::default(),
+            client_set: Some(client_set),
         }
     }
 
@@ -1621,7 +1633,11 @@ impl CanonicalStore {
     /// and credential material never leave the store boundary.
     pub async fn privileged_secret_scan(&self) -> Result<CanonicalSecretScanReport, StoreError> {
         let supervisor = SurrealServerSupervisor::new(self.config.clone());
-        let server = supervisor.start_or_connect().await?;
+        let server = if self.client_set.is_some() {
+            None
+        } else {
+            Some(supervisor.start_or_connect().await?)
+        };
         let report_result = async {
             let mut report = CanonicalSecretScanReport {
                 schema_version: "eliot-canonical-secret-scan-v1".to_owned(),
@@ -1639,10 +1655,7 @@ impl CanonicalStore {
                     let sql = format!(
                         "SELECT * FROM {table} LIMIT {SECRET_SCAN_PAGE_SIZE} START {start};"
                     );
-                    let raw = server
-                        .transport()
-                        .query(&sql, Value::Object(serde_json::Map::new()))
-                        .await?;
+                    let raw = self.secret_scan_query(server.as_ref(), &sql).await?;
                     let records = secret_scan_query_records(table, &raw)?;
                     if records.is_empty() {
                         break;
@@ -1691,10 +1704,31 @@ impl CanonicalStore {
             Ok::<CanonicalSecretScanReport, StoreError>(report)
         }
         .await;
-        let shutdown_result = server.shutdown_if_spawned().await;
-        let report = report_result?;
-        shutdown_result?;
-        Ok(report)
+        if let Some(server) = server {
+            let shutdown_result = server.shutdown_if_spawned().await;
+            let report = report_result?;
+            shutdown_result?;
+            Ok(report)
+        } else {
+            report_result
+        }
+    }
+
+    async fn secret_scan_query(
+        &self,
+        transient_server: Option<&ReadySurrealServer>,
+        sql: &str,
+    ) -> Result<Value, StoreError> {
+        let vars = Value::Object(serde_json::Map::new());
+        if let Some(client_set) = self.client_set.as_ref() {
+            return client_set.execute_admin_sql(sql, vars).await;
+        }
+        let server = transient_server.ok_or_else(|| {
+            StoreError::PolicyViolation(
+                "secret scan has neither persistent nor transient admin transport".to_owned(),
+            )
+        })?;
+        server.transport()?.query(sql, vars).await
     }
 
     pub async fn apply_write_envelope(
@@ -3459,13 +3493,18 @@ impl CanonicalStore {
             .registry
             .get(op)
             .ok_or_else(|| StoreError::ConfigMessage(format!("missing template {}", op.name())))?;
-        let server = SurrealServerSupervisor::new(self.config.clone())
-            .start_or_connect()
-            .await?;
-        let raw_result = server.transport().query(template.sql, vars).await;
-        let shutdown_result = server.shutdown_if_spawned().await;
-        let raw = raw_result?;
-        shutdown_result?;
+        let raw = if let Some(client_set) = self.client_set.as_ref() {
+            client_set.execute_named(op, vars).await?
+        } else {
+            let server = SurrealServerSupervisor::new(self.config.clone())
+                .start_or_connect()
+                .await?;
+            let raw_result = server.transport()?.query(template.sql, vars).await;
+            let shutdown_result = server.shutdown_if_spawned().await;
+            let raw = raw_result?;
+            shutdown_result?;
+            raw
+        };
         let bytes =
             serde_json::to_vec(&raw).map_err(|error| StoreError::Decode(error.to_string()))?;
         if bytes.len() > template.max_result_bytes {

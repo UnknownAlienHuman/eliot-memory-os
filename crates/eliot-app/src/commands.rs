@@ -59,8 +59,8 @@ use eliot_engine::{
     hash_secret, shutdown_deadline_after, test_request,
 };
 use eliot_store::{
-    BlobStore, CanonicalRecord, CanonicalStore, ControlWal, NamedSurqlOp, SurrealServerSupervisor,
-    SurrealStore,
+    BlobStore, CanonicalRecord, CanonicalStore, ControlWal, DbClientSet, NamedSurqlOp,
+    SurrealServerSupervisor, SurrealStore,
 };
 use eliot_types::{
     ActionKind, ActionLease, AdapterCapability, AdapterObservation, AdapterResult,
