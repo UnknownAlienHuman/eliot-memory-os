@@ -932,6 +932,7 @@ fn wait_for_changed_json(
 
 fn write_test_config(runtime: &Path, config_path: &Path, port: u16) -> TestResult {
     fs::create_dir_all(config_path.parent().ok_or("config parent missing")?)?;
+    fs::create_dir_all(runtime.join("cognitive-field"))?;
     let secret_root = test_secret_root(runtime)?;
     let password_file = secret_root
         .join("secrets")

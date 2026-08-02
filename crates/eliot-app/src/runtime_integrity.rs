@@ -911,9 +911,7 @@ async fn recover_unowned_staging(
         if checkpoint.state == SealStagingState::Staged && !has_authority {
             let staging_root = PathBuf::from(&checkpoint.staging_root);
             if staging_root.exists() {
-                let allowed = allowed_root
-                    .as_ref()
-                    .is_some_and(|allowed| staging_root.starts_with(allowed));
+                let allowed = staging_root.starts_with(&allowed_root);
                 if !allowed {
                     bail!(
                         "refuse to remove staging root outside cognitive root: {}",
@@ -1095,9 +1093,7 @@ fn scan_seal_inventory(
     config_path: &Path,
     broker: &eliot_types::DelegationState,
 ) -> Result<SealInventory> {
-    let Some(root) = cognitive_root(config_path) else {
-        return Ok(SealInventory::default());
-    };
+    let root = cognitive_root(config_path);
     if !root.is_dir() {
         return Ok(SealInventory::default());
     }
@@ -1287,15 +1283,9 @@ fn bounded_seal_files(
     Ok(files)
 }
 
-fn cognitive_root(config_path: &Path) -> Option<PathBuf> {
+fn cognitive_root(config_path: &Path) -> PathBuf {
     let runtime_root = crate::delegation_runtime::root_from_config(config_path);
-    let colocated = runtime_root.join("cognitive-field");
-    if colocated.is_dir() {
-        return Some(colocated);
-    }
-    std::env::var_os("LOCALAPPDATA")
-        .map(PathBuf::from)
-        .map(|root| root.join("Eliot/cognitive-field"))
+    runtime_root.join("cognitive-field")
 }
 
 fn byte_stream_state(bytes: u64, terminal: bool) -> String {
@@ -1315,8 +1305,8 @@ fn usize_to_u32(value: usize) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::{
-        authority_owner_issue, bounded_seal_files, inspect, reconcile_dry_run, scan_seal_inventory,
-        sha256_file,
+        authority_owner_issue, bounded_seal_files, cognitive_root, inspect, reconcile_dry_run,
+        scan_seal_inventory, sha256_file,
     };
     use eliot_engine::{WriterActor, WriterConfig};
     use eliot_store::{CanonicalStore, ControlWal};
@@ -1329,6 +1319,14 @@ mod tests {
     use std::fs;
     use time::OffsetDateTime;
     use uuid::Uuid;
+
+    #[test]
+    fn cognitive_root_is_bound_to_the_config_runtime_before_it_exists() {
+        let root = std::env::temp_dir().join(format!("eliot-cognitive-root-{}", Uuid::new_v4()));
+        let config_path = root.join("config/governor.toml");
+
+        assert_eq!(cognitive_root(&config_path), root.join("cognitive-field"));
+    }
 
     #[test]
     fn operation_bound_runtime_integrity_requires_one_live_exact_owner() {
