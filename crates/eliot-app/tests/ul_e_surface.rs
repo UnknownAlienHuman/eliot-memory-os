@@ -153,7 +153,7 @@ fn codex_system_artifact_has_controller_mcp_and_default_policy() -> TestResult {
     assert_eq!(
         mcp.pointer("/mcpServers/eliot/required")
             .and_then(Value::as_bool),
-        Some(true)
+        Some(false)
     );
     let hooks: Value = serde_json::from_slice(&std::fs::read(package.join("hooks/hooks.json"))?)?;
     for event in [
@@ -162,8 +162,20 @@ fn codex_system_artifact_has_controller_mcp_and_default_policy() -> TestResult {
         "PostToolUse",
         "PreCompact",
         "PostCompact",
+        "Stop",
     ] {
-        assert!(hooks.pointer(&format!("/hooks/{event}")).is_some());
+        let handler = hooks
+            .pointer(&format!("/hooks/{event}/0/hooks/0"))
+            .ok_or_else(|| format!("missing canonical {event} command hook"))?;
+        assert!(
+            handler
+                .get("command")
+                .and_then(Value::as_str)
+                .is_some_and(|command| command
+                    .starts_with("\"${PLUGIN_ROOT}\\bin\\eliot-governor.exe\" hook "))
+        );
+        assert!(handler.get("args").is_none());
+        assert!(handler.get("async").is_none());
     }
     Ok(())
 }
@@ -225,14 +237,13 @@ impl CodexInstalledPlugin {
         }
         let executable = root.join("bin/eliot-governor.exe");
         fs::write(&executable, b"installed-governor-fixture")?;
-        let command = executable.to_string_lossy().replace('\\', "/");
         fs::write(
             root.join(".mcp.json"),
             serde_json::to_vec_pretty(&serde_json::json!({
                 "mcpServers": {
                     "eliot": {
                         "type": "stdio",
-                        "command": command,
+                        "command": "bin/eliot-governor.exe",
                         "cwd": ".",
                         "args": [
                             "mcp",
@@ -243,7 +254,7 @@ impl CodexInstalledPlugin {
                             "default"
                         ],
                         "enabled": true,
-                        "required": true
+                        "required": false
                     }
                 }
             }))?,

@@ -91,10 +91,10 @@ use integration::{
     codex_legacy_mcp_is_owned, codex_manifest_plugin_source_hash, codex_marketplace_entry,
     codex_materialized_plugin_version, codex_owned_lifecycle_requires_refresh,
     codex_plugin_installed_enabled, codex_plugin_metadata_matches, codex_plugin_path_is_restored,
-    codex_runtime_cache_path, materialize_codex_hook_commands, materialize_codex_mcp_config,
-    materialize_codex_plugin_version, merge_codex_marketplace, merge_opencode_mcp_config,
-    parse_opencode_jsonc, reconcile_codex_cache_tree, remove_codex_marketplace_entry,
-    remove_opencode_mcp_config, select_codex_original_plugin_hash,
+    codex_runtime_cache_path, materialize_codex_mcp_config, materialize_codex_plugin_version,
+    merge_codex_marketplace, merge_opencode_mcp_config, parse_opencode_jsonc,
+    reconcile_codex_cache_tree, remove_codex_marketplace_entry, remove_opencode_mcp_config,
+    select_codex_original_plugin_hash, validate_codex_hook_commands,
     validate_codex_install_journal_schema,
 };
 use integration::{install, sha256_file, uninstall};

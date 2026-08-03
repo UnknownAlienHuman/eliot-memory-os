@@ -196,7 +196,7 @@ pub fn run_ul_doctor(host: UlDoctorHostArg) -> Result<()> {
                     "bin/eliot-governor.exe",
                 ),
                 format!(
-                    "keep one required `eliot` controller entry without `--host` in {}",
+                    "keep one enabled fail-open `eliot` controller entry without `--host` in {}",
                     package.join(".mcp.json").display()
                 ),
             ));
@@ -491,7 +491,7 @@ fn codex_mcp_server_matches(path: &Path, command_name: &str, expected_command: &
                     ])
                 })
             && server.get("enabled").and_then(Value::as_bool) == Some(true)
-            && server.get("required").and_then(Value::as_bool) == Some(true)
+            && server.get("required").and_then(Value::as_bool) == Some(false)
     })
 }
 
@@ -501,12 +501,11 @@ fn normalized_codex_path(path: &str) -> String {
 
 fn codex_installed_plugin_matches(root: &Path) -> bool {
     let executable = root.join("bin/eliot-governor.exe");
-    let expected_command = executable.to_string_lossy();
     codex_plugin_manifest_matches(&root.join(".codex-plugin/plugin.json"))
         && codex_mcp_server_matches(
             &root.join(".mcp.json"),
             "eliot-governor.exe",
-            &expected_command,
+            "bin/eliot-governor.exe",
         )
         && executable.is_file()
         && ["eliot-work", "eliot-remember", "eliot-recover", "eliot-finish"]

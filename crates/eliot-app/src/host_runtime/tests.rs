@@ -16,16 +16,16 @@ use super::{
     invocation_root, invocation_status, invoke_ul_scoped_reasoning, is_claude_desktop_host,
     latest_canonical_authority_observation, launch_argv, lock_antigravity_executable_snapshot,
     managed_attempt_hash, managed_launch_boundary_attestation, managed_launch_boundary_is_current,
-    managed_sandbox_root, materialize_codex_hook_commands, materialize_codex_mcp_config,
-    materialize_codex_plugin_version, merge_codex_marketplace, merge_opencode_mcp_config,
-    normalize_relative_path, parse_opencode_jsonc, parse_structured_host_output,
-    persist_and_parse_structured_host_output, prepare_antigravity_executable_snapshot,
-    provider_start_marker_path, receipt_ref_from_option, reconcile_codex_cache_tree,
-    reconcile_existing_managed_invocation, registry_entry_by_manifest, remaining_to_deadline,
-    remove_codex_marketplace_entry, remove_opencode_mcp_config, sanitize_managed_output,
-    select_codex_original_plugin_hash, stable_invocation_id, uses_managed_antigravity_containment,
-    uses_managed_antigravity_launch, validate_antigravity_scope, validate_attempt_journal,
-    validate_bounded_auditor_shape, validate_canonical_observation_identity,
+    managed_sandbox_root, materialize_codex_mcp_config, materialize_codex_plugin_version,
+    merge_codex_marketplace, merge_opencode_mcp_config, normalize_relative_path,
+    parse_opencode_jsonc, parse_structured_host_output, persist_and_parse_structured_host_output,
+    prepare_antigravity_executable_snapshot, provider_start_marker_path, receipt_ref_from_option,
+    reconcile_codex_cache_tree, reconcile_existing_managed_invocation, registry_entry_by_manifest,
+    remaining_to_deadline, remove_codex_marketplace_entry, remove_opencode_mcp_config,
+    sanitize_managed_output, select_codex_original_plugin_hash, stable_invocation_id,
+    uses_managed_antigravity_containment, uses_managed_antigravity_launch,
+    validate_antigravity_scope, validate_attempt_journal, validate_bounded_auditor_shape,
+    validate_canonical_observation_identity, validate_codex_hook_commands,
     validate_codex_install_journal_schema, validate_contained_antigravity_attempt,
     validate_managed_result_integrity,
 };
@@ -2069,7 +2069,7 @@ fn codex_personal_marketplace_restores_a_preexisting_entry_at_the_same_index() -
 }
 
 #[test]
-fn codex_plugin_materialization_uses_absolute_controller_governor() -> anyhow::Result<()> {
+fn codex_plugin_materialization_uses_self_contained_controller_governor() -> anyhow::Result<()> {
     let governor = Path::new(r"C:\Program Files\Eliot\eliot-governor.exe");
     let mut mcp = json!({
         "mcpServers": {
@@ -2083,7 +2083,7 @@ fn codex_plugin_materialization_uses_absolute_controller_governor() -> anyhow::R
     materialize_codex_mcp_config(&mut mcp, governor)?;
     assert_eq!(
         mcp["mcpServers"]["eliot"]["command"],
-        governor.to_string_lossy().as_ref()
+        "bin/eliot-governor.exe"
     );
     assert_eq!(
         mcp["mcpServers"]["eliot"]["args"],
@@ -2097,25 +2097,38 @@ fn codex_plugin_materialization_uses_absolute_controller_governor() -> anyhow::R
         ])
     );
 
-    let mut hooks = json!({
+    let hooks = json!({
         "hooks": {
             "SessionStart": [{
-                "hooks": [{ "type": "command", "command": "eliot-governor.exe", "args": ["hook", "session-start"] }]
+                "hooks": [{ "type": "command", "command": "\"${PLUGIN_ROOT}\\bin\\eliot-governor.exe\" hook session-start" }]
             }],
             "Stop": [{
-                "hooks": [{ "type": "command", "command": "eliot-governor.exe", "args": ["hook", "stop"] }]
+                "hooks": [{ "type": "command", "command": "\"${PLUGIN_ROOT}\\bin\\eliot-governor.exe\" hook stop" }]
             }]
         }
     });
-    assert_eq!(materialize_codex_hook_commands(&mut hooks, governor)?, 2);
+    assert_eq!(validate_codex_hook_commands(&hooks)?, 2);
     assert_eq!(
         hooks["hooks"]["SessionStart"][0]["hooks"][0]["command"],
-        governor.to_string_lossy().as_ref()
+        "\"${PLUGIN_ROOT}\\bin\\eliot-governor.exe\" hook session-start"
     );
     assert_eq!(
         hooks["hooks"]["Stop"][0]["hooks"][0]["command"],
-        governor.to_string_lossy().as_ref()
+        "\"${PLUGIN_ROOT}\\bin\\eliot-governor.exe\" hook stop"
     );
+    let unsupported = json!({
+        "hooks": {
+            "PostToolUse": [{
+                "hooks": [{
+                    "type": "command",
+                    "command": "eliot-governor.exe",
+                    "args": ["hook", "post-tool-use"],
+                    "async": true
+                }]
+            }]
+        }
+    });
+    assert!(validate_codex_hook_commands(&unsupported).is_err());
     Ok(())
 }
 
@@ -2202,6 +2215,17 @@ fn codex_cli_migration_accepts_only_known_eliot_identities() {
         codex_plugin_installed_enabled(&list, "eliot-governor@personal"),
         Some((true, true))
     );
+    let disabled = json!({
+        "installed": [{
+            "pluginId": "eliot-governor@personal",
+            "installed": true,
+            "enabled": false
+        }]
+    });
+    assert_eq!(
+        codex_plugin_installed_enabled(&disabled, "eliot-governor@personal"),
+        Some((true, false))
+    );
     let fresh_entry = json!({
         "pluginId": "eliot-governor@personal",
         "name": "eliot-governor",
@@ -2245,6 +2269,14 @@ fn codex_missing_historical_preinstall_becomes_eliot_owned_when_readded() {
     assert!(codex_effective_plugin_installed_before(
         None,
         Some((true, true))
+    ));
+    assert!(codex_effective_plugin_installed_before(
+        Some(true),
+        Some((true, false))
+    ));
+    assert!(codex_effective_plugin_installed_before(
+        None,
+        Some((true, false))
     ));
 }
 
@@ -2397,7 +2429,7 @@ fn codex_v1_manifest_reinstall_preserves_original_plugin_and_lifecycle_ownership
 }
 
 #[test]
-fn codex_cache_contract_ignores_only_the_nonexecuting_cached_governor() -> anyhow::Result<()> {
+fn codex_cache_contract_includes_the_executing_cached_governor() -> anyhow::Result<()> {
     let root =
         std::env::temp_dir().join(format!("eliot-codex-cache-contract-{}", TaskId::new_v7()));
     std::fs::create_dir_all(root.join(".codex-plugin"))?;
@@ -2411,7 +2443,7 @@ fn codex_cache_contract_ignores_only_the_nonexecuting_cached_governor() -> anyho
 
     let initial = codex_cache_contract_hash(&root)?;
     std::fs::write(&cached_governor, b"governor-v2")?;
-    assert_eq!(codex_cache_contract_hash(&root)?, initial);
+    assert_ne!(codex_cache_contract_hash(&root)?, initial);
 
     std::fs::write(root.join("hooks").join("hooks.json"), b"hooks-v2")?;
     assert_ne!(codex_cache_contract_hash(&root)?, initial);
@@ -2439,7 +2471,8 @@ fn codex_materialized_version_is_content_addressed_and_replaces_one_suffix() -> 
 }
 
 #[test]
-fn codex_content_version_ignores_external_governor_and_prior_suffix() -> anyhow::Result<()> {
+fn codex_content_version_changes_with_the_bundled_governor_and_replaces_prior_suffix()
+-> anyhow::Result<()> {
     let root =
         std::env::temp_dir().join(format!("eliot-codex-version-content-{}", TaskId::new_v7()));
     std::fs::create_dir_all(root.join(".codex-plugin"))?;
@@ -2461,15 +2494,15 @@ fn codex_content_version_ignores_external_governor_and_prior_suffix() -> anyhow:
     std::fs::write(root.join("bin").join("eliot-governor.exe"), b"governor-v2")?;
     materialize_codex_plugin_version(&root, "0.1.0")?;
     let binary_update_contract = codex_cache_contract_hash(&root)?;
-    assert_eq!(binary_update_contract, first_contract);
-    assert_eq!(
+    assert_ne!(binary_update_contract, first_contract);
+    assert_ne!(
         codex_materialized_plugin_version("0.1.0+codex.old", &binary_update_contract)?,
         first_version
     );
 
     materialize_codex_plugin_version(&root, "0.1.0+codex.different")?;
     materialize_codex_plugin_version(&root, "0.1.0")?;
-    assert_eq!(codex_cache_contract_hash(&root)?, first_contract);
+    assert_eq!(codex_cache_contract_hash(&root)?, binary_update_contract);
     std::fs::remove_dir_all(root)?;
     Ok(())
 }
@@ -2500,7 +2533,7 @@ fn codex_partial_locked_cache_is_reconciled_without_replacing_its_root() -> anyh
     )?;
     std::fs::write(
         cache.join("bin").join("eliot-governor.exe"),
-        b"locked-binary",
+        b"source-binary",
     )?;
     std::fs::write(cache.join("stale.json"), b"stale")?;
 
@@ -2511,8 +2544,13 @@ fn codex_partial_locked_cache_is_reconciled_without_replacing_its_root() -> anyh
     assert!(!cache.join("stale.json").exists());
     assert_eq!(
         std::fs::read(cache.join("bin").join("eliot-governor.exe"))?,
-        b"locked-binary"
+        b"source-binary"
     );
+    std::fs::write(
+        cache.join("bin").join("eliot-governor.exe"),
+        b"corrupt-binary",
+    )?;
+    assert!(reconcile_codex_cache_tree(&source, &cache, &expected).is_err());
     std::fs::remove_dir_all(root)?;
     Ok(())
 }
@@ -2520,11 +2558,6 @@ fn codex_partial_locked_cache_is_reconciled_without_replacing_its_root() -> anyh
 #[test]
 fn codex_runtime_cache_contract_uses_live_mcp_cwd() {
     let home = Path::new(r"C:\Users\example");
-    let governor = home
-        .join("plugins")
-        .join("eliot-governor")
-        .join("bin")
-        .join("eliot-governor.exe");
     let cache = home
         .join(".codex")
         .join("plugins")
@@ -2538,7 +2571,7 @@ fn codex_runtime_cache_contract_uses_live_mcp_cwd() {
         "enabled": true,
         "transport": {
             "type": "stdio",
-            "command": governor,
+            "command": "bin/eliot-governor.exe",
             "args": ["mcp", "stdio", "--profile", "codex_controller", "--instance", "default"],
             "env": Value::Null,
             "env_vars": [],
@@ -2546,16 +2579,17 @@ fn codex_runtime_cache_contract_uses_live_mcp_cwd() {
         }
     });
     assert_eq!(
-        codex_runtime_cache_path(&runtime, home, &governor),
+        codex_runtime_cache_path(&runtime, home),
         Some(cache.clone())
     );
 
     let mut materialized_cwd = runtime.clone();
     materialized_cwd["transport"]["cwd"] = json!(home.join("plugins").join("eliot-governor"));
-    assert!(codex_runtime_cache_path(&materialized_cwd, home, &governor).is_none());
+    assert!(codex_runtime_cache_path(&materialized_cwd, home).is_none());
     let mut wrong_command = runtime;
-    wrong_command["transport"]["command"] = json!(cache.join("bin").join("eliot-governor.exe"));
-    assert!(codex_runtime_cache_path(&wrong_command, home, &governor).is_none());
+    wrong_command["transport"]["command"] =
+        json!(home.join("plugins/eliot-governor/bin/eliot-governor.exe"));
+    assert!(codex_runtime_cache_path(&wrong_command, home).is_none());
 }
 
 #[test]

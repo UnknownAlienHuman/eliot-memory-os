@@ -6,11 +6,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "eliot-governor.exe",
-            "args": [
-              "hook",
-              "session-start"
-            ],
+            "command": "\"${PLUGIN_ROOT}\\bin\\eliot-governor.exe\" hook session-start",
             "timeout": 10
           }
         ]
@@ -22,11 +18,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "eliot-governor.exe",
-            "args": [
-              "hook",
-              "pre-tool-use"
-            ],
+            "command": "\"${PLUGIN_ROOT}\\bin\\eliot-governor.exe\" hook pre-tool-use",
             "timeout": 10
           }
         ]
@@ -38,13 +30,8 @@
         "hooks": [
           {
             "type": "command",
-            "command": "eliot-governor.exe",
-            "args": [
-              "hook",
-              "post-tool-use"
-            ],
-            "timeout": 10,
-            "async": true
+            "command": "\"${PLUGIN_ROOT}\\bin\\eliot-governor.exe\" hook post-tool-use",
+            "timeout": 10
           }
         ]
       }
@@ -54,11 +41,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "eliot-governor.exe",
-            "args": [
-              "hook",
-              "pre-compact"
-            ],
+            "command": "\"${PLUGIN_ROOT}\\bin\\eliot-governor.exe\" hook pre-compact",
             "timeout": 10
           }
         ]
@@ -69,13 +52,8 @@
         "hooks": [
           {
             "type": "command",
-            "command": "eliot-governor.exe",
-            "args": [
-              "hook",
-              "post-compact"
-            ],
-            "timeout": 10,
-            "async": true
+            "command": "\"${PLUGIN_ROOT}\\bin\\eliot-governor.exe\" hook post-compact",
+            "timeout": 10
           }
         ]
       }
@@ -85,11 +63,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "eliot-governor.exe",
-            "args": [
-              "hook",
-              "stop"
-            ],
+            "command": "\"${PLUGIN_ROOT}\\bin\\eliot-governor.exe\" hook stop",
             "timeout": 10
           }
         ]

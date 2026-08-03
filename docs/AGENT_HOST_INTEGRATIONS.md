@@ -71,18 +71,21 @@ Repository and release artifacts retain the cache-neutral plugin base version
 without `+codex` metadata. The installer copies that immutable artifact into its
 ELIOT-owned personal-plugin staging directory and gives only the installed copy
 one version of the form `<base-version>+codex.<deterministic-content-token>`.
-The deterministic token is stable for the normalized cache contract and changes
-when MCP, hooks, skills, or plugin metadata change, so reinstall remains
-idempotent while Codex receives a fresh cache key for a real cache update. The
-nonexecuting cached Governor is excluded: the executable at the installed source
-path is verified separately, so a binary-only update does not churn the active
-cache. A prior suffix is replaced, never stacked.
+The deterministic token is stable for the complete cache contract and changes
+when the bundled Governor, MCP, hooks, skills, or plugin metadata change, so
+reinstall remains idempotent while Codex receives a fresh cache key for every
+real update. Codex executes the verified Governor inside that immutable cache;
+a binary-only update therefore receives a new add-only version. A prior suffix
+is replaced, never stacked.
 
 `host install --host codex` is the unattended install, update, reinstall, and
 recovery entrypoint. It never removes the active plugin during those operations:
 new cache contracts use add-only versioned installation, identical partial caches
 are repaired in place, and a durable ELIOT-owned recovery marker carries ownership
-across a crash until exact lifecycle readback and manifest commit succeed.
+across a crash until exact lifecycle readback and manifest commit succeed. An
+installed-but-disabled artifact may be repaired only when its source, version,
+and recorded hash prove that ELIOT owns it; the official add lifecycle then
+enables the verified replacement.
 Install receipts and doctor output distinguish `codex_plugin_base_version` from
 the materialized installed version and require their base prefixes to match.
 

@@ -835,40 +835,17 @@ pub(crate) async fn startup_recover_and_report(
     recover_unowned_staging(config_path, runtime_store).await?;
     let report = inspect(config_path, runtime_store, true, instance).await?;
     persist_report(config_path, &report)?;
-    let canonical_close_recovery_only = report.core.ready
-        && report.operations.active == 0
-        && report.operations.stuck == 0
-        && report.operations.orphan_processes == 0
-        && report
-            .integrity_errors
-            .iter()
-            .any(|error| error == "partial_operation_close_canonical_proof")
-        && report.integrity_errors.iter().all(|error| {
-            matches!(
-                error.as_str(),
-                "partial_operation_close_canonical_proof"
-                    | "operations_awaiting_reconciliation"
-                    | "orphan_or_cleanup_processes"
-            )
-        });
-    let published_seal_runtime_recovery_only = report.core.ready
-        && report.operations.active == 0
-        && report.operations.stuck == 0
-        && report.operations.awaiting_reconciliation == 0
-        && report.operations.cleanup_pending == 0
-        && report.operations.orphan_processes == 0
-        && report.authority_integrity.published_seal_runtime_drift > 0
-        && report
-            .integrity_errors
-            .iter()
-            .all(|error| error == "published_seal_runtime_drift");
-    if !report.provider_dispatch_safe
-        && !canonical_close_recovery_only
-        && !published_seal_runtime_recovery_only
-    {
+    if !report.core.ready {
         bail!(
-            "runtime integrity blocks provider dispatch: {}",
+            "runtime core is not ready: {}",
             report.integrity_errors.join(", ")
+        );
+    }
+    if !report.provider_dispatch_safe {
+        tracing::warn!(
+            reason = %report.reason,
+            integrity_errors = ?report.integrity_errors,
+            "Eliot core is ready; external provider dispatch remains quarantined"
         );
     }
     Ok(report)
@@ -1306,7 +1283,7 @@ fn usize_to_u32(value: usize) -> u32 {
 mod tests {
     use super::{
         authority_owner_issue, bounded_seal_files, cognitive_root, inspect, reconcile_dry_run,
-        scan_seal_inventory, sha256_file,
+        scan_seal_inventory, sha256_file, startup_recover_and_report,
     };
     use eliot_engine::{WriterActor, WriterConfig};
     use eliot_store::{CanonicalStore, ControlWal};
@@ -1464,6 +1441,63 @@ mod tests {
         let tampered = scan_seal_inventory(&config_path, &broker)?;
         assert_eq!(tampered.published_without_authority, 1);
 
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn startup_keeps_core_ready_while_published_plan_without_authority_is_quarantined()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root = std::env::temp_dir().join(format!(
+            "eliot-startup-provider-quarantine-{}",
+            Uuid::new_v4()
+        ));
+        let config_path = root.join("config/governor.toml");
+        let seal_records = root.join("cognitive-field/run/seal-records");
+        let published_root = root.join("cognitive-field/run/sealed/7");
+        fs::create_dir_all(&seal_records)?;
+        fs::create_dir_all(&published_root)?;
+        let candidate_plan = published_root.join("candidate-provider-plan.json");
+        fs::write(&candidate_plan, b"{\"plan_hash\":\"quarantined-plan\"}\n")?;
+        crate::delegation_runtime::save_host_broker_state(&root, &DelegationState::default())?;
+        let seal = serde_json::json!({
+            "seal_attempt_id": "provider-plan-seal:quarantined-g7",
+            "generation": 7,
+            "state": "published",
+            "published_root": published_root,
+            "provider_plan_sha256": sha256_file(&candidate_plan)?,
+            "role_lease_ids": ["missing-role-lease"],
+        });
+        fs::write(
+            seal_records.join("provider-plan-seal_quarantined-g7.json"),
+            serde_json::to_vec_pretty(&seal)?,
+        )?;
+
+        let wal = ControlWal::open(&ControlWalConfig {
+            path: root.join("control.redb").display().to_string(),
+        })?;
+        let store = CanonicalStore::new(GovernorConfig::default().db.surreal);
+        let (writer, actor) = WriterActor::channel(wal, store, &WriterConfig::default());
+        let runtime = writer.operation_runtime();
+        let actor_task = tokio::spawn(actor.run());
+
+        let report = startup_recover_and_report(&config_path, &runtime, None).await?;
+        assert!(report.core.ready);
+        assert!(!report.provider_dispatch_safe);
+        assert_eq!(
+            report.authority_integrity.published_plans_without_authority,
+            1
+        );
+        assert!(
+            report
+                .integrity_errors
+                .iter()
+                .any(|error| error == "published_plans_without_authority")
+        );
+
+        drop(runtime);
+        drop(writer);
+        actor_task.await?;
         fs::remove_dir_all(root)?;
         Ok(())
     }

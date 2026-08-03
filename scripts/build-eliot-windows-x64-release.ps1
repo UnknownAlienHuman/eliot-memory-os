@@ -248,8 +248,8 @@ function Test-ReleaseBundle([string]$Path) {
         [string]$server.command -ne 'bin/eliot-governor.exe' -or
         [string]$server.cwd -ne '.' -or
         $server.enabled -ne $true -or
-        $server.required -ne $true) {
-        throw 'release Codex MCP server transport is not the required local plugin binary'
+        $server.required -ne $false) {
+        throw 'release Codex MCP server transport is not the enabled fail-open local plugin binary'
     }
     $expectedArgs = @('mcp', 'stdio', '--profile', 'codex_controller', '--instance', 'default')
     $actualArgs = @($server.args)

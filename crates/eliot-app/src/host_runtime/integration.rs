@@ -10,6 +10,8 @@
 
 use super::*;
 
+const CODEX_PLUGIN_GOVERNOR: &str = "bin/eliot-governor.exe";
+
 struct CodexOperationGuard {
     _file: File,
 }
@@ -430,7 +432,7 @@ pub(super) fn remove_codex_marketplace_entry(
     Ok(value)
 }
 
-pub(super) fn materialize_codex_mcp_config(config: &mut Value, governor: &Path) -> Result<()> {
+pub(super) fn materialize_codex_mcp_config(config: &mut Value, _governor: &Path) -> Result<()> {
     let server = config
         .get_mut("mcpServers")
         .and_then(Value::as_object_mut)
@@ -440,7 +442,7 @@ pub(super) fn materialize_codex_mcp_config(config: &mut Value, governor: &Path) 
     server.insert("type".to_owned(), Value::String("stdio".to_owned()));
     server.insert(
         "command".to_owned(),
-        Value::String(governor.to_string_lossy().into_owned()),
+        Value::String(CODEX_PLUGIN_GOVERNOR.to_owned()),
     );
     server.insert(
         "args".to_owned(),
@@ -453,37 +455,50 @@ pub(super) fn materialize_codex_mcp_config(config: &mut Value, governor: &Path) 
             "default"
         ]),
     );
+    server.insert("cwd".to_owned(), Value::String(".".to_owned()));
+    server.insert("enabled".to_owned(), Value::Bool(true));
+    server.insert("required".to_owned(), Value::Bool(false));
     Ok(())
 }
 
-pub(super) fn materialize_codex_hook_commands(hooks: &mut Value, governor: &Path) -> Result<usize> {
-    fn visit(value: &mut Value, governor: &str) -> usize {
+pub(super) fn validate_codex_hook_commands(hooks: &Value) -> Result<usize> {
+    fn visit(value: &Value) -> Result<usize> {
         match value {
             Value::Object(object) => {
-                let mut replaced = 0;
-                if object.get("type").and_then(Value::as_str) == Some("command")
-                    && object.contains_key("command")
-                {
-                    object.insert("command".to_owned(), Value::String(governor.to_owned()));
-                    replaced = 1;
+                let mut validated = 0;
+                if object.get("type").and_then(Value::as_str) == Some("command") {
+                    let command = object
+                        .get("command")
+                        .and_then(Value::as_str)
+                        .context("Codex command hook has no command string")?;
+                    ensure!(
+                        command.starts_with("\"${PLUGIN_ROOT}\\bin\\eliot-governor.exe\" hook ")
+                            && !command.ends_with(" hook "),
+                        "Codex hook must invoke the bundled Governor through PLUGIN_ROOT"
+                    );
+                    ensure!(
+                        !object.contains_key("args") && !object.contains_key("async"),
+                        "Codex command hooks use one command string and may not use unsupported args/async fields"
+                    );
+                    validated = 1;
                 }
-                replaced
-                    + object
-                        .values_mut()
-                        .map(|child| visit(child, governor))
-                        .sum::<usize>()
+                object
+                    .values()
+                    .try_fold(validated, |count, child| Ok(count + visit(child)?))
             }
-            Value::Array(values) => values.iter_mut().map(|child| visit(child, governor)).sum(),
-            _ => 0,
+            Value::Array(values) => values
+                .iter()
+                .try_fold(0, |count, child| Ok(count + visit(child)?)),
+            _ => Ok(0),
         }
     }
 
-    let replaced = visit(hooks, &governor.to_string_lossy());
+    let validated = visit(hooks)?;
     ensure!(
-        replaced > 0,
+        validated > 0,
         "Codex plugin hooks.json contains no command hooks"
     );
-    Ok(replaced)
+    Ok(validated)
 }
 
 fn codex_cli_json(codex: &Path, args: &[&str]) -> Result<Value> {
@@ -712,7 +727,7 @@ pub(super) fn codex_effective_plugin_installed_before(
     current_state: Option<(bool, bool)>,
 ) -> bool {
     match historical_preinstalled {
-        Some(true) | None => current_state == Some((true, true)),
+        Some(true) | None => current_state.is_some_and(|(installed, _)| installed),
         Some(false) => false,
     }
 }
@@ -749,7 +764,6 @@ fn codex_plugin_entry_has_owned_identity(
         && entry.get("name").and_then(Value::as_str) == Some(CODEX_PLUGIN_NAME)
         && entry.get("marketplaceName").and_then(Value::as_str) == Some(CODEX_MARKETPLACE_NAME)
         && entry.get("installed").and_then(Value::as_bool) == Some(true)
-        && entry.get("enabled").and_then(Value::as_bool) == Some(true)
         && entry.pointer("/source/source").and_then(Value::as_str) == Some("local")
         && entry
             .pointer("/source/path")
@@ -767,19 +781,21 @@ pub(super) fn codex_plugin_metadata_matches(
         && entry.get("version").and_then(Value::as_str) == Some(version)
 }
 
-pub(super) fn codex_runtime_cache_path(
-    registration: &Value,
-    home: &Path,
-    installed_governor: &Path,
-) -> Option<PathBuf> {
+pub(super) fn codex_runtime_cache_path(registration: &Value, home: &Path) -> Option<PathBuf> {
     if registration.get("name").and_then(Value::as_str) != Some("eliot")
         || registration.get("enabled").and_then(Value::as_bool) != Some(true)
     {
         return None;
     }
     let transport = registration.get("transport")?;
-    let command = transport.get("command").and_then(Value::as_str)?;
+    let command = PathBuf::from(transport.get("command").and_then(Value::as_str)?);
     let cwd = PathBuf::from(transport.get("cwd").and_then(Value::as_str)?);
+    let resolved_command = if command.is_absolute() {
+        command
+    } else {
+        cwd.join(command)
+    };
+    let cached_governor = cwd.join(CODEX_PLUGIN_GOVERNOR);
     let approved_cache_root = home
         .join(".codex")
         .join("plugins")
@@ -787,7 +803,7 @@ pub(super) fn codex_runtime_cache_path(
         .join(CODEX_MARKETPLACE_NAME)
         .join(CODEX_PLUGIN_NAME);
     (transport.get("type").and_then(Value::as_str) == Some("stdio")
-        && path_identity(Path::new(command)) == path_identity(installed_governor)
+        && path_identity(&resolved_command) == path_identity(&cached_governor)
         && transport.get("args")
             == Some(&json!([
                 "mcp",
@@ -832,7 +848,9 @@ fn codex_cached_plugin_payload_is_fresh(
         .pointer("/mcpServers/eliot/command")
         .and_then(Value::as_str)
         .is_some_and(|command| {
-            path_identity(Path::new(command)) == path_identity(expected.installed_governor)
+            command
+                .replace('\\', "/")
+                .eq_ignore_ascii_case(CODEX_PLUGIN_GOVERNOR)
         });
     let args_match = mcp.pointer("/mcpServers/eliot/args")
         == Some(&json!([
@@ -856,13 +874,16 @@ fn codex_cached_plugin_payload_is_fresh(
         && mcp
             .pointer("/mcpServers/eliot/required")
             .and_then(Value::as_bool)
-            == Some(true);
+            == Some(false);
+    let cached_governor = cache_path.join(CODEX_PLUGIN_GOVERNOR);
     Ok(command_matches
         && args_match
         && cached_cwd_matches
         && cached_transport_matches
         && expected.installed_governor.is_file()
-        && sha256_file(expected.installed_governor)? == expected.installed_governor_sha256)
+        && sha256_file(expected.installed_governor)? == expected.installed_governor_sha256
+        && cached_governor.is_file()
+        && sha256_file(&cached_governor)? == expected.installed_governor_sha256)
 }
 
 fn codex_plugin_lifecycle_is_fresh(
@@ -873,20 +894,20 @@ fn codex_plugin_lifecycle_is_fresh(
     let Some(entry) = codex_plugin_entry(list, expected.selector) else {
         return Ok(false);
     };
-    if !codex_plugin_metadata_matches(
-        entry,
-        expected.selector,
-        expected.version,
-        expected.source_path,
-    ) {
+    if entry.get("enabled").and_then(Value::as_bool) != Some(true)
+        || !codex_plugin_metadata_matches(
+            entry,
+            expected.selector,
+            expected.version,
+            expected.source_path,
+        )
+    {
         return Ok(false);
     }
     let Some(runtime) = codex_mcp_get(codex, "eliot")? else {
         return Ok(false);
     };
-    let Some(cache_path) =
-        codex_runtime_cache_path(&runtime, &user_home()?, expected.installed_governor)
-    else {
+    let Some(cache_path) = codex_runtime_cache_path(&runtime, &user_home()?) else {
         return Ok(false);
     };
     codex_cached_plugin_payload_is_fresh(&cache_path, expected)
@@ -953,9 +974,6 @@ pub(super) fn reconcile_codex_cache_tree(
     let mut cached_files = Vec::new();
     collect_owned_files(cache_path, cache_path, &mut cached_files)?;
     for (relative, source_file) in &source_files {
-        if relative.eq_ignore_ascii_case("bin/eliot-governor.exe") {
-            continue;
-        }
         let destination = cache_path.join(Path::new(&relative));
         ensure_child(cache_path, &destination)?;
         std::fs::create_dir_all(
@@ -963,7 +981,14 @@ pub(super) fn reconcile_codex_cache_tree(
                 .parent()
                 .context("Codex cache file has no parent")?,
         )?;
-        std::fs::copy(&source_file, &destination).with_context(|| {
+        if relative.eq_ignore_ascii_case(CODEX_PLUGIN_GOVERNOR) && destination.is_file() {
+            ensure!(
+                sha256_file(source_file)? == sha256_file(&destination)?,
+                "Codex cached Governor differs from its content-addressed source artifact"
+            );
+            continue;
+        }
+        std::fs::copy(source_file, &destination).with_context(|| {
             format!(
                 "reconcile Codex cache file {} -> {}",
                 source_file.display(),
@@ -972,9 +997,6 @@ pub(super) fn reconcile_codex_cache_tree(
         })?;
     }
     for (relative, cached) in cached_files {
-        if relative.eq_ignore_ascii_case("bin/eliot-governor.exe") {
-            continue;
-        }
         if !source_files
             .iter()
             .any(|(source_relative, _)| source_relative.eq_ignore_ascii_case(&relative))
@@ -1011,7 +1033,9 @@ fn install_codex_plugin_lifecycle(
             "Codex plugin {} already exists but its version/source/cache is not the desired ELIOT artifact",
             expected.selector
         );
-        if entry.get("version").and_then(Value::as_str) == Some(expected.version) {
+        if entry.get("version").and_then(Value::as_str) == Some(expected.version)
+            && entry.get("enabled").and_then(Value::as_bool) == Some(true)
+        {
             reconcile_codex_cache_in_place(expected)?;
         } else {
             let _ = codex_cli_json(codex, &["plugin", "add", expected.selector, "--json"])?;
@@ -1495,10 +1519,6 @@ pub(super) fn install_codex_global(
     let plugin_selector = format!("{CODEX_PLUGIN_NAME}@{CODEX_MARKETPLACE_NAME}");
     let plugin_list_before = codex_plugin_list(&codex)?;
     let plugin_state_before = codex_plugin_installed_enabled(&plugin_list_before, &plugin_selector);
-    ensure!(
-        !matches!(plugin_state_before, Some((true, false))),
-        "Codex plugin {plugin_selector} is installed but disabled; refusing to overwrite user state"
-    );
     let plugin_installed_before = !recovered_owned_lifecycle
         && codex_effective_plugin_installed_before(
             previous.map(|manifest| manifest.plugin_installed_before),
@@ -1539,10 +1559,10 @@ pub(super) fn install_codex_global(
     let mut mcp_config: Value =
         serde_json::from_reader(std::fs::File::open(source.join(".mcp.json"))?)?;
     materialize_codex_mcp_config(&mut mcp_config, &installed_governor)?;
-    let mut hooks: Value = serde_json::from_reader(std::fs::File::open(
+    let hooks: Value = serde_json::from_reader(std::fs::File::open(
         source.join("hooks").join("hooks.json"),
     )?)?;
-    materialize_codex_hook_commands(&mut hooks, &installed_governor)?;
+    validate_codex_hook_commands(&hooks)?;
 
     let config = load_config(config_path)?;
     let local_app_data =
@@ -1685,14 +1705,29 @@ pub(super) fn install_codex_global(
             && current_plugin_hash.as_deref()
                 == Some(manifest.installed_plugin.installed_hash.as_str())
     });
+    if plugin_state_before == Some((true, false)) {
+        let manifest = previous.context(
+            "disabled Codex Eliot plugin has no ELIOT ownership manifest; refusing update",
+        )?;
+        let entry = codex_plugin_entry(&plugin_list_before, &plugin_selector)
+            .context("disabled Codex Eliot plugin disappeared during ownership validation")?;
+        ensure!(
+            continuing_owned_plugin
+                && codex_plugin_entry_has_owned_identity(entry, &plugin_selector, &plugin_path)
+                && entry.get("version").and_then(Value::as_str)
+                    == Some(manifest.plugin_version.as_str()),
+            "disabled Codex Eliot plugin is not the exact artifact owned by ELIOT"
+        );
+    }
     let previous_cache_contract_hash = previous
         .filter(|_| continuing_owned_plugin)
         .map(|manifest| codex_manifest_cache_contract_hash(manifest, &plugin_path))
         .transpose()?;
     let original_plugin_before_hash =
         codex_original_plugin_hash(previous, current_plugin_hash.as_deref())?;
-    let plugin_lifecycle_owned_before =
-        previous.is_some() && !plugin_installed_before && plugin_state_before == Some((true, true));
+    let plugin_lifecycle_owned_before = previous.is_some()
+        && !plugin_installed_before
+        && plugin_state_before.is_some_and(|(installed, _)| installed);
     let previous_owned_lifecycle = if plugin_lifecycle_owned_before {
         Some(previous.context("owned Codex lifecycle requires its prior manifest")?)
     } else {
@@ -1723,7 +1758,8 @@ pub(super) fn install_codex_global(
                     && version_is_proven
                     && sha256_file(&manifest.installed_governor_path)?
                         == manifest.installed_governor_sha256
-                    && manifest.plugin_version != plugin_version,
+                    && (manifest.plugin_version != plugin_version
+                        || plugin_state_before == Some((true, false))),
                 "existing stale Codex lifecycle is not proven to be the before/after artifact owned by ELIOT"
             );
         }
@@ -2815,7 +2851,6 @@ pub(super) fn codex_cache_contract_hash(path: &Path) -> Result<String> {
     );
     let mut files = Vec::new();
     collect_owned_files(path, path, &mut files)?;
-    files.retain(|(relative, _)| !relative.eq_ignore_ascii_case("bin/eliot-governor.exe"));
     files.sort_by(|left, right| left.0.cmp(&right.0));
     let mut hasher = blake3::Hasher::new();
     for (relative, file) in files {

@@ -13,7 +13,7 @@
         "default"
       ],
       "enabled": true,
-      "required": true
+      "required": false
     }
   }
 }
