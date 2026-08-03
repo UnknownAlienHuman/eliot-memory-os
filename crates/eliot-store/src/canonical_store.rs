@@ -16,16 +16,18 @@ use eliot_types::{
     CurrentStateRequest, CurrentStateResponse, EpistemicStatus, ExperimentalMetaPolicyCandidate,
     FetchAtomsL2Request, FetchAtomsL2Response, GraphHealthResponse, HarnessExperimentRecord,
     InjectionReceipt, L0CollapsedDuplicateTrace, L0FeatureScore, L0RankTrace, L0SuppressionTrace,
-    LifecycleStatus, MemoryConfidence, MemoryHandlePreview, MemoryInfluenceTrace, MemoryRevision,
-    MemoryStateTransition, MemoryTrajectoryCorrectness, MemoryWriteEnvelope,
-    MetaIsolationRejectionRecord, MetaPolicyExecutionAction, MetaPolicyExecutionReceipt,
-    MinorityPressureRecord, ObservabilityKind, ObservabilityWriteEnvelope,
-    ObservabilityWriteReceipt, ObservabilityWriteStatus, ProjectId, ProjectSequence,
-    RecallL0Request, RecallL0Response, ReplayAudit, ReplayRun, SealedReplayCaseRecord,
-    SealedReplayInputSnapshotRecord, SealedReplaySetRecord, SleepCandidateArtifact,
-    SleepConsolidationBundle, SleepConsolidationRun, SurrealServerConfig, TaintClass, TaskContract,
-    TaskId, ToolObservation, TruncationInfo, VerificationId, VerificationRun, Visibility, WriteId,
-    WriteReceipt, WriteStatus, cue_binding_page_id,
+    LifecycleStatus, MAX_DURABLE_PENDING_INJECTIONS_PER_SESSION, MemoryConfidence,
+    MemoryHandlePreview, MemoryInfluenceTrace, MemoryRevision, MemoryStateTransition,
+    MemoryTrajectoryCorrectness, MemoryWriteEnvelope, MetaIsolationRejectionRecord,
+    MetaPolicyExecutionAction, MetaPolicyExecutionReceipt, MinorityPressureRecord,
+    ObservabilityKind, ObservabilityWriteEnvelope, ObservabilityWriteReceipt,
+    ObservabilityWriteStatus, PENDING_INJECTION_BATCH_SCHEMA_VERSION, PendingInjectionBatch,
+    PendingInjectionItem, ProjectId, ProjectSequence, RecallL0Request, RecallL0Response,
+    ReplayAudit, ReplayRun, SealedReplayCaseRecord, SealedReplayInputSnapshotRecord,
+    SealedReplaySetRecord, SleepCandidateArtifact, SleepConsolidationBundle, SleepConsolidationRun,
+    SurrealServerConfig, TaintClass, TaskContract, TaskId, ToolObservation, TruncationInfo,
+    VerificationId, VerificationRun, Visibility, WriteId, WriteReceipt, WriteStatus,
+    cue_binding_page_id, pending_injection_batch_write_id, pending_injection_write_id,
 };
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
@@ -65,6 +67,7 @@ const SECRET_SCAN_TABLES: &[&str] = &[
     "canonical_record",
     "trace_span",
     "context_packet_receipt",
+    "pending_injection",
     "supports",
     "verified_by",
     "contradicts",
@@ -2248,8 +2251,7 @@ impl CanonicalStore {
                         break;
                     }
                     for (page_index, record) in records.iter().enumerate() {
-                        let bytes = serde_json::to_vec(record)
-                            .map_err(|error| StoreError::Decode(error.to_string()))?;
+                        let bytes = secret_scan_record_bytes(table, record)?;
                         report.records_scanned = report.records_scanned.saturating_add(1);
                         report.bytes_scanned = report
                             .bytes_scanned
@@ -2661,6 +2663,50 @@ impl CanonicalStore {
         updated_revision: MemoryRevision,
         families: &[CognitiveProjectionFamily],
     ) -> Result<CognitiveProjectionIntentReceipt, StoreError> {
+        self.enqueue_cognitive_projection_intent_inner(
+            project_id,
+            event_id,
+            updated_revision,
+            families,
+            false,
+        )
+        .await
+    }
+
+    /// Re-arms an already-applied, exact same-head recovery row. This is used
+    /// only when a fresh process has no in-memory understanding snapshot; it
+    /// preserves one durable recovery identity instead of accumulating a new
+    /// outbox row on every restart.
+    pub async fn rearm_cognitive_projection_recovery_intent(
+        &self,
+        project_id: ProjectId,
+        event_id: &str,
+        updated_revision: MemoryRevision,
+        families: &[CognitiveProjectionFamily],
+    ) -> Result<CognitiveProjectionIntentReceipt, StoreError> {
+        if !event_id.starts_with("recovery:") {
+            return Err(StoreError::PolicyViolation(
+                "only a project recovery event may re-arm an applied projection intent".to_owned(),
+            ));
+        }
+        self.enqueue_cognitive_projection_intent_inner(
+            project_id,
+            event_id,
+            updated_revision,
+            families,
+            true,
+        )
+        .await
+    }
+
+    async fn enqueue_cognitive_projection_intent_inner(
+        &self,
+        project_id: ProjectId,
+        event_id: &str,
+        updated_revision: MemoryRevision,
+        families: &[CognitiveProjectionFamily],
+        rearm_applied: bool,
+    ) -> Result<CognitiveProjectionIntentReceipt, StoreError> {
         let event_id = event_id.trim();
         if event_id.is_empty() || event_id.len() > 512 {
             return Err(StoreError::PolicyViolation(
@@ -2696,6 +2742,7 @@ impl CanonicalStore {
                     "updated_revision": updated_revision,
                     "families": family_names,
                     "mark_dependency_dirty_stale": mark_dependency_dirty_stale,
+                    "rearm_applied": rearm_applied,
                     "dependency_state_id": derived_row_key(&format!(
                         "{project_id}:{}",
                         CognitiveProjectionFamily::DependencyDirty.as_str()
@@ -3029,33 +3076,51 @@ impl CanonicalStore {
         &self,
         envelope: &ObservabilityWriteEnvelope,
     ) -> Result<ObservabilityWriteReceipt, StoreError> {
-        let injection_payload = if envelope.kind == ObservabilityKind::InjectionReceipt {
-            let receipt: InjectionReceipt = serde_json::from_value(envelope.payload.clone())
-                .map_err(|error| StoreError::Decode(error.to_string()))?;
-            json!({
-                "injection_id_parts": cue_string_parts(&receipt.injection_id),
-                "session_id_parts": vec![receipt.session_id.to_string()],
-                "task_id_parts": receipt
-                    .task_id
-                    .map(|task_id| vec![task_id.to_string()]),
-                "surface_parts": cue_string_parts(&receipt.surface),
-                "item_ref_parts": cue_string_parts(&receipt.item_ref),
-                "render_form_parts": cue_string_parts(&receipt.render_form),
-                "fired_cues": receipt.fired_cues.iter().map(|cue| json!({
-                    "kind": cue.kind,
-                    "value_parts": cue_string_parts(&cue.value),
-                })).collect::<Vec<_>>(),
-                "token_cost": receipt.token_cost,
-                "source_fingerprint_parts": cue_string_parts(&receipt.source_fingerprint),
-                "outcome_parts": cue_string_parts(&receipt.outcome),
-                "policy_reason_parts": receipt
-                    .policy_reason
-                    .as_deref()
-                    .map(cue_string_parts),
-            })
-        } else {
-            Value::Null
-        };
+        let (injection_payload, pending_injection_record_id) =
+            if envelope.kind == ObservabilityKind::InjectionReceipt {
+                let receipt: InjectionReceipt = serde_json::from_value(envelope.payload.clone())
+                    .map_err(|error| StoreError::Decode(error.to_string()))?;
+                if envelope.session_id != Some(receipt.session_id) {
+                    return Err(StoreError::PolicyViolation(
+                        "injection receipt session does not match its envelope".to_owned(),
+                    ));
+                }
+                let pending_id = pending_injection_write_id(
+                    envelope.project_id,
+                    receipt.session_id,
+                    &receipt.item_ref,
+                    &receipt.source_fingerprint,
+                );
+                (
+                    json!({
+                        "injection_id_parts": cue_string_parts(&receipt.injection_id),
+                        "session_id_parts": vec![receipt.session_id.to_string()],
+                        "task_id_parts": receipt
+                            .task_id
+                            .map(|task_id| vec![task_id.to_string()]),
+                        "surface_parts": cue_string_parts(&receipt.surface),
+                        "item_ref_parts": cue_string_parts(&receipt.item_ref),
+                        "render_form_parts": cue_string_parts(&receipt.render_form),
+                        "fired_cues": receipt.fired_cues.iter().map(|cue| json!({
+                            "kind": cue.kind,
+                            "value_parts": cue_string_parts(&cue.value),
+                        })).collect::<Vec<_>>(),
+                        "token_cost": receipt.token_cost,
+                        "source_fingerprint_parts": cue_string_parts(&receipt.source_fingerprint),
+                        "outcome_parts": cue_string_parts(&receipt.outcome),
+                        "policy_reason_parts": receipt
+                            .policy_reason
+                            .as_deref()
+                            .map(cue_string_parts),
+                    }),
+                    json!(pending_id),
+                )
+            } else {
+                (Value::Null, Value::Null)
+            };
+        if envelope.kind == ObservabilityKind::PendingInjection {
+            validate_pending_injection_envelope(envelope)?;
+        }
         let memory_influence_payload = if envelope.kind == ObservabilityKind::MemoryInfluenceTrace {
             let trace: MemoryInfluenceTrace = serde_json::from_value(envelope.payload.clone())
                 .map_err(|error| StoreError::Decode(error.to_string()))?;
@@ -3092,12 +3157,90 @@ impl CanonicalStore {
                     "envelope": envelope,
                     "target_table": envelope.kind.table_name(),
                     "injection_payload": injection_payload,
+                    "pending_injection_record_id": pending_injection_record_id,
                     "memory_influence_payload": memory_influence_payload,
                 }),
             )
             .await?;
         let receipt =
             decode_value::<ObservabilityWriteReceipt>(NamedSurqlOp::ApplyObservability, value)?;
+        if receipt.status == ObservabilityWriteStatus::Rejected {
+            return Err(StoreError::ObservabilityConflict);
+        }
+        Ok(receipt)
+    }
+
+    pub async fn apply_pending_injection_batch(
+        &self,
+        batch: &PendingInjectionBatch,
+    ) -> Result<ObservabilityWriteReceipt, StoreError> {
+        if batch.schema_version != PENDING_INJECTION_BATCH_SCHEMA_VERSION {
+            return Err(StoreError::PolicyViolation(
+                "unsupported pending injection batch schema".to_owned(),
+            ));
+        }
+        if batch.items.len() > MAX_DURABLE_PENDING_INJECTIONS_PER_SESSION {
+            return Err(StoreError::PolicyViolation(format!(
+                "pending injection batch exceeded the {MAX_DURABLE_PENDING_INJECTIONS_PER_SESSION} item session cap"
+            )));
+        }
+        let expected = PendingInjectionBatch::new(
+            batch.project_id,
+            batch.task_id,
+            batch.session_id,
+            batch.items.clone(),
+            batch.created_at,
+        )
+        .map_err(|error| StoreError::Decode(error.to_string()))?;
+        if batch.input_hash != expected.input_hash
+            || batch.write_id
+                != pending_injection_batch_write_id(
+                    batch.project_id,
+                    batch.session_id,
+                    &batch.input_hash,
+                )
+        {
+            return Err(StoreError::PolicyViolation(
+                "pending injection batch identity does not match its exact queue".to_owned(),
+            ));
+        }
+        let mut item_refs = BTreeSet::new();
+        let mut rows = Vec::with_capacity(batch.items.len());
+        for item in &batch.items {
+            if !item_refs.insert(item.item_ref.clone()) {
+                return Err(StoreError::PolicyViolation(
+                    "pending injection batch contains duplicate item_ref owners".to_owned(),
+                ));
+            }
+            let record_id = pending_injection_write_id(
+                batch.project_id,
+                batch.session_id,
+                &item.item_ref,
+                &item.source_fingerprint,
+            );
+            let payload = serde_json::to_value(item)
+                .map_err(|error| StoreError::Decode(error.to_string()))?;
+            let encoded = serde_json::to_vec(&payload)
+                .map_err(|error| StoreError::Decode(error.to_string()))?;
+            rows.push(json!({
+                "record_id": record_id,
+                "input_hash": blake3::hash(&encoded).to_hex().to_string(),
+                "payload_b64": STANDARD_NO_PAD.encode(&encoded),
+            }));
+        }
+        let value = self
+            .execute_value(
+                NamedSurqlOp::ApplyPendingInjectionBatch,
+                json!({
+                    "batch": batch,
+                    "rows": rows,
+                }),
+            )
+            .await?;
+        let receipt = decode_value::<ObservabilityWriteReceipt>(
+            NamedSurqlOp::ApplyPendingInjectionBatch,
+            value,
+        )?;
         if receipt.status == ObservabilityWriteStatus::Rejected {
             return Err(StoreError::ObservabilityConflict);
         }
@@ -3253,6 +3396,42 @@ impl CanonicalStore {
             StoreError::Decode("injection receipt response omitted receipts".to_owned())
         })?;
         serde_json::from_value(receipts).map_err(|error| StoreError::Decode(error.to_string()))
+    }
+
+    pub async fn load_pending_injections(
+        &self,
+        project_id: ProjectId,
+        session_id: eliot_types::SessionId,
+    ) -> Result<Vec<PendingInjectionItem>, StoreError> {
+        let value = self
+            .execute_value(
+                NamedSurqlOp::LoadPendingInjections,
+                json!({
+                    "project_id": project_id,
+                    "session_id": session_id,
+                }),
+            )
+            .await?;
+        if value.get("truncated").and_then(Value::as_bool) == Some(true) {
+            return Err(StoreError::PolicyViolation(format!(
+                "pending injections exceeded the {MAX_DURABLE_PENDING_INJECTIONS_PER_SESSION} item session cap"
+            )));
+        }
+        let pending = value.get("pending").cloned().ok_or_else(|| {
+            StoreError::Decode("pending injection response omitted items".to_owned())
+        })?;
+        let encoded: Vec<String> = serde_json::from_value(pending)
+            .map_err(|error| StoreError::Decode(error.to_string()))?;
+        encoded
+            .into_iter()
+            .map(|item| {
+                let bytes = STANDARD_NO_PAD
+                    .decode(item)
+                    .map_err(|error| StoreError::Decode(error.to_string()))?;
+                serde_json::from_slice(&bytes)
+                    .map_err(|error| StoreError::Decode(error.to_string()))
+            })
+            .collect()
     }
 
     pub async fn current_state(
@@ -5156,6 +5335,28 @@ fn cue_string_parts(value: &str) -> Vec<&str> {
     value.split(':').collect()
 }
 
+fn validate_pending_injection_envelope(
+    envelope: &ObservabilityWriteEnvelope,
+) -> Result<(), StoreError> {
+    let item: PendingInjectionItem = serde_json::from_value(envelope.payload.clone())
+        .map_err(|error| StoreError::Decode(error.to_string()))?;
+    let session_id = envelope.session_id.ok_or_else(|| {
+        StoreError::PolicyViolation("pending injection requires a durable session scope".to_owned())
+    })?;
+    let expected = pending_injection_write_id(
+        envelope.project_id,
+        session_id,
+        &item.item_ref,
+        &item.source_fingerprint,
+    );
+    if envelope.write_id != expected || envelope.record_id != expected.to_string() {
+        return Err(StoreError::PolicyViolation(
+            "pending injection identity does not match its exact delivery item".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
 fn cue_record_ref_key(value: &str) -> String {
     blake3::hash(value.as_bytes()).to_hex().to_string()
 }
@@ -5669,6 +5870,21 @@ fn secret_scan_query_records(table: &str, raw: &Value) -> Result<Vec<Value>, Sto
         }
     }
     Ok(records)
+}
+
+fn secret_scan_record_bytes(table: &str, record: &Value) -> Result<Vec<u8>, StoreError> {
+    let mut bytes =
+        serde_json::to_vec(record).map_err(|error| StoreError::Decode(error.to_string()))?;
+    if table == "pending_injection"
+        && let Some(encoded) = record.get("payload_b64").and_then(Value::as_str)
+    {
+        bytes.extend(
+            STANDARD_NO_PAD
+                .decode(encoded)
+                .map_err(|error| StoreError::Decode(error.to_string()))?,
+        );
+    }
+    Ok(bytes)
 }
 
 fn last_query_result(op: NamedSurqlOp, raw: &Value) -> Result<Value, StoreError> {

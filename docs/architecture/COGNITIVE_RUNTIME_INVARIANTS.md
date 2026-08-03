@@ -1,11 +1,15 @@
 # Cognitive runtime invariants
 
-Status: normative for `ELIOT_COGNITIVE_COMPLETION_ULTRA_MASTER_FINAL_v4_1.md`
+Status: normative for `ELIOT_COGNITIVE_COMPLETION_EXECUTION_FINAL.md`
+(SHA-256 `c3aabee002ec209e7640746d3b1ca5e6e8568c24c2fdd334148fb98cce4562fa`)
 
 Baseline: `88a5f049d71a9c535f51811eb7da273416c27118`
 
-Current gate: Phases 0 and 1, including C7-03A through C7-03C, accepted;
-Phase 2 / Block B1 active; provider cognition is forbidden
+Execution committed base: `97e842042d5d3ab6830ad23a52129a87326a483d`;
+C7-04A parent: `bf2695d172c3795ec1501b54f81a7b7aef651ee2`
+
+Current gate: Phases 0 and 1 accepted; C7-04A has a non-accepted implementation
+checkpoint and Block B1 remains active; provider cognition is forbidden
 
 This document fixes ownership and acceptance constraints. It does not claim
 that every invariant is already enforced. Current enforcement and evidence are
@@ -104,14 +108,18 @@ receipts, focused tests, measurements, and field artifacts remain the truth.
    daemon-owned `UnderstandingRuntime`. The current app-owned `UlRuntime` is
    migrated into it; both may not remain constructible production owners.
 2. **CRI-031 — immutable revision-bound snapshots.** The runtime owns immutable
-   cue, summary, concept/pyramid, activation, dependency/dirty, utility, and
-   pending-injection snapshots. Projection updates replace only affected
-   shards and publish an internally consistent revision.
+   project snapshots containing revisions/freshness, cue records and handles,
+   bounded pyramid artifacts, activation, dependency/dirty and projection
+   health. Its session snapshots contain touched cues/paths, pending and
+   delivered fingerprints, active concepts, packet revision and execution mode.
+   Projection updates publish an internally consistent revision; durable
+   pending batches and receipts remain Writer/Store-owned restart sources.
 3. **CRI-032 — bounded post-tool activation.** `PostToolUse` normalizes cues,
    performs direct firing, performs at most depth-two bounded activation,
    stages pending injection, and queues trace persistence asynchronously.
-   Direct firing works with zero graph edges; spread uses whatever valid edges
-   exist. A 500-edge enable threshold is forbidden.
+   Direct firing works with zero graph edges. Spread remains gated by the
+   configured activation-edge threshold (500 by default); that threshold may
+   never suppress direct matches or be changed silently.
 4. **CRI-033 — PreToolUse is memory-resident.** `PreToolUse` drains prepared
    injection and applies the negative-memory gate. It performs no database,
    network, process, or model call and no synchronous projection write.
@@ -187,7 +195,7 @@ pass its focused behavior gate, and be pushed before the next phase begins.
 | --- | --- | --- |
 | 0 — truthful capability/completion | `ACCEPTED` | Archive ref exists; matrix and invariants exist; only `CompletionGate` plus `CompletionProof` can complete a task; verifier/review/coordination negatives and complete-proof positive pass. |
 | 1 — storage/retrieval | `ACCEPTED_C7_03A_THROUGH_C7_03C` | Phase 0 accepted; persistent clients, lossless bounded retrieval, projection ownership and single-pass packet persistence passed focused provider-free gates. PF1/PF2/PF3, one exact R01 and final bounded isolation remain later certification evidence, not Phase 1 advancement gates. |
-| 2 — hot understanding runtime | `IN_PROGRESS_B1` | Phase 1 accepted; one engine-owned runtime, projection recovery, zero-edge direct fire, no PreToolUse I/O, restart behavior and p95 budgets must pass without providers. |
+| 2 — hot understanding runtime | `IN_PROGRESS_B1_CHECKPOINT_NOT_ACCEPTED` | The C7-04A checkpoint has one engine-owned bounded runtime, snapshots, recovery and zero-edge direct fire, but audit still requires eviction-safe hydration/commit locking, delivered-pending cleanup before admission, and WriterActor replay cleanup. C7-04B is locked. |
 | 3 — context compiler | `LOCKED` | Phase 2 accepted; one engine compiler, graph-derived causal paths, real scoped cues/cases, one revision fence, and bounded degraded staleness pass without providers. |
 | 4 — learning/distillation | `LOCKED` | Phase 3 accepted; grounded episode/case/skill learning, real utility attribution, reversible forgetting/compression, and grounded/no-op sleep pass without providers. |
 | 5 — prediction/policy | `LOCKED` | Phase 4 accepted; verifier-bound predictions, subsystem calibration, explicit modes, and comparable token/action evaluation pass without providers. |
@@ -212,7 +220,8 @@ pilot evidence, not blind-transfer certification.
 - Scale fixtures are reused; unchanged scale runs and unchanged provider
   retries are forbidden.
 - After cutover, manual search postings, request-path project rebuild, database
-  work in PreToolUse/firing, the 500-edge gate, app-layer duplicate compilation,
+  work in PreToolUse/firing, any activation gate that suppresses zero-edge direct
+  matches, app-layer duplicate compilation,
   full experience scans, unused compiler stubs, build-ID parity routing,
   unchanged-fallback promotion, default production control assignment,
   fabricated diagnostic predictions, generic sleep boilerplate, hard-coded

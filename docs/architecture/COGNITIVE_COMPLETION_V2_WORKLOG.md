@@ -1136,3 +1136,65 @@ For each next step, record:
 
 **Block A result: PASS.** The next allowed implementation item is Block B1,
 engine-owned `UnderstandingRuntime`, from the exact aggregate head.
+
+## 2026-08-03 — C7-04A / Block B1 implementation checkpoint
+
+### Ownership and production cutover
+
+- Kept one engine `UnderstandingRuntime`, the existing
+  `CognitiveProjectionCoordinator`, and Writer/CanonicalStore as the durable
+  restart authority. Deleted the constructible app `UlRuntime` owner and
+  `McpState.ul`; `McpDaemon` now constructs and shares one runtime.
+- Project snapshots are immutable, revision-fenced and bounded to 64 MiB of
+  conservatively charged requested allocations. Cue keys, all handles and
+  mandatory negative/invariant payloads remain hot; optional bodies are
+  deterministically elided before an explicit mandatory-minimum rejection.
+- `CueIndexService` keeps only a weak routing alias after runtime adoption.
+  Runtime eviction releases the active hot cue allocation, and every rejected,
+  failed or superseded candidate releases the service's staged strong owner.
+
+### Hot semantics and restart authority
+
+- Cue firing, bounded activation and injection selection consume immutable
+  snapshots and return deterministic plans without owning Store or Writer.
+  Direct cues fire with zero edges; depth-two spread remains gated at the
+  unchanged 500-edge threshold. Tier-T remains bounded to 3 items / 400 units.
+- Pending injection is one deterministic, bounded, failure-atomic WriterActor
+  batch. SurrealDB stores exact base64 payload bytes, rejects conflicting batch
+  reuse, reloads at most 256 items, and atomically deletes only the exact
+  `(item_ref, fingerprint)` acknowledged by an injection receipt.
+- App dispatch persists the exact candidate queue before installing that same
+  queue in the session mirror. Restart and `max_sessions=1` eviction hydrate
+  pending items plus delivered receipts and preserve effects-once behavior.
+  Freshness, request-time novelty, packet revision and mutation staleness remain
+  snapshot/session-owned and revision-fenced.
+
+### Verification evidence
+
+- Strict Clippy passed for `eliot-types`, `eliot-store`, `eliot-engine` and
+  `eliot-app`; format and diff checks passed.
+- Engine runtime passed 15/15, injection selection 4/4, cue ownership/budget
+  3/3 and coordinator units 7/7 (one isolated guardian intentionally ignored by
+  ordinary Cargo). Store SurQL contracts passed 27/27; the live atomic pending
+  batch/restart/exact-dequeue test passed 1/1.
+- App cutover passed 3/3, full push 4/4 and pyramid delivery 5/5. Isolated
+  projection lease/retry/block, full-wake recovery and same-revision dirty-fence
+  guardians each passed 1/1 with `provider_calls=0`, no timeout, no cleanup
+  failure and no retained run-owned process or secret root.
+
+### Acceptance blockers found by final audit
+
+- Hydration and tool execution are not covered by the same pending-commit
+  critical section. A concurrent `max_sessions` eviction can recreate an empty
+  mirror and atomically replace an older durable pending queue with only the new
+  plan.
+- Candidate admission retains already delivered/stale entries until later
+  selection. They can consume the mandatory cap and create a false overflow or
+  a runtime/durable mismatch.
+- WriterActor short-circuits an idempotent observability receipt before the
+  store transaction, so replay of an injection receipt can bypass the exact
+  pending-row cleanup performed by `apply_observability.surql`.
+
+**C7-04A result: CHECKPOINT — NOT ACCEPTED.** The implementation and recorded
+tests are committed for preservation, but Block B1 remains open and C7-04B must
+not start until these three production paths have focused regressions and pass.

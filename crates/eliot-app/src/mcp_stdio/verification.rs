@@ -284,9 +284,8 @@ fn auto_candidate_bindings(
     input: &AgentCandidateSubmitInput,
 ) -> Result<Vec<eliot_types::CueBinding>> {
     let recent = state
-        .ul
-        .touched
-        .recent_cues(project_id, context.session_id, 16);
+        .understanding
+        .recent_cues(project_id, context.session_id, 16)?;
     let corpus = [
         input.topic.as_str(),
         input.statement.as_str(),
@@ -911,7 +910,6 @@ pub(super) async fn dispatch_task_verification_run(
     .await?;
     let verification_ref = format!("verification:{verification_id}");
     let mut prediction_resolution = match state
-        .ul
         .prediction
         .resolve(
             project_id,
@@ -942,7 +940,6 @@ pub(super) async fn dispatch_task_verification_run(
         .map(|artifact| artifact.resource_ref.clone())
         .collect::<Vec<_>>();
     let blast_resolution = match state
-        .ul
         .prediction
         .resolve_blast(
             project_id,

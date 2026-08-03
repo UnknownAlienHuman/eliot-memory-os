@@ -7,9 +7,9 @@ use eliot_types::{
     CognitiveRunContract, CognitiveRunTerminal, CognitiveSharedGateBinding, MemoryLifecycleState,
     MemoryStateTransition, MemoryWriteEnvelope, ObservabilityWriteEnvelope,
     ObservabilityWriteReceipt, ObservabilityWriteStatus, OperationRestartWindow,
-    OperationRuntimeCheckpoint, ProjectId, ProjectRevisionSummary, ProjectSequence,
-    SealStagingCheckpoint, SessionId, TaskId, WriteId, WriteReceipt, WriteReceiptRef,
-    WriteRejectReason, WriteStatus,
+    OperationRuntimeCheckpoint, PendingInjectionBatch, ProjectId, ProjectRevisionSummary,
+    ProjectSequence, SealStagingCheckpoint, SessionId, TaskId, WriteId, WriteReceipt,
+    WriteReceiptRef, WriteRejectReason, WriteStatus,
 };
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
@@ -55,6 +55,10 @@ enum WriterMessage {
         envelope: ObservabilityWriteEnvelope,
         response_tx: oneshot::Sender<Result<ObservabilityWriteReceipt, EngineError>>,
     },
+    PendingInjectionBatch {
+        batch: PendingInjectionBatch,
+        response_tx: oneshot::Sender<Result<ObservabilityWriteReceipt, EngineError>>,
+    },
     CognitiveBegin {
         envelope: Box<MemoryWriteEnvelope>,
         precondition: CognitiveBeginPrecondition,
@@ -72,6 +76,7 @@ impl WriterMessage {
         match self {
             Self::Write(request) => request.envelope.project_id,
             Self::Observability { envelope, .. } => envelope.project_id,
+            Self::PendingInjectionBatch { batch, .. } => batch.project_id,
             Self::CognitiveBegin { envelope, .. } | Self::CognitiveTerminal { envelope, .. } => {
                 envelope.project_id
             }
@@ -82,6 +87,7 @@ impl WriterMessage {
         match self {
             Self::Write(request) => request.envelope.write_id,
             Self::Observability { envelope, .. } => envelope.write_id,
+            Self::PendingInjectionBatch { batch, .. } => batch.write_id,
             Self::CognitiveBegin { envelope, .. } | Self::CognitiveTerminal { envelope, .. } => {
                 envelope.write_id
             }
@@ -93,7 +99,8 @@ impl WriterMessage {
             Self::Write(request) => {
                 let _ = request.response_tx.send(Err(error));
             }
-            Self::Observability { response_tx, .. } => {
+            Self::Observability { response_tx, .. }
+            | Self::PendingInjectionBatch { response_tx, .. } => {
                 let _ = response_tx.send(Err(error));
             }
             Self::CognitiveBegin { response_tx, .. }
@@ -1650,6 +1657,17 @@ impl WriterWorker {
                     project_pause: None,
                 }
             }
+            WriterMessage::PendingInjectionBatch { batch, response_tx } => {
+                let write_id = batch.write_id;
+                let result = self.apply_pending_injection_batch(batch).await;
+                let succeeded = result.is_ok();
+                let _ = response_tx.send(result);
+                ProjectJobOutcome::Complete {
+                    write_id,
+                    succeeded,
+                    project_pause: None,
+                }
+            }
             WriterMessage::CognitiveBegin {
                 envelope,
                 precondition,
@@ -2238,6 +2256,45 @@ impl WriterWorker {
         }
     }
 
+    async fn apply_pending_injection_batch(
+        &self,
+        batch: PendingInjectionBatch,
+    ) -> Result<ObservabilityWriteReceipt, EngineError> {
+        let boundary_bytes = serde_json::to_vec(&batch)?;
+        if let Err(violation) = eliot_types::inspect_secret_bytes(&boundary_bytes) {
+            return Err(EngineError::WriteRejected(format!(
+                "secret boundary rejected pending injection ingress: {}",
+                violation.rule
+            )));
+        }
+        if batch.input_hash.trim().is_empty() {
+            return Err(EngineError::WriteRejected(
+                "pending injection batch input_hash is required".to_owned(),
+            ));
+        }
+        if let Some(mut existing) = self.store.observability_receipt(batch.write_id).await? {
+            if existing.input_hash == batch.input_hash {
+                existing.status = ObservabilityWriteStatus::IdempotentReplay;
+                return Ok(existing);
+            }
+            return Err(EngineError::ObservabilityConflict);
+        }
+        match self.store.apply_pending_injection_batch(&batch).await {
+            Ok(receipt) => Ok(receipt),
+            Err(StoreError::ObservabilityConflict) => Err(EngineError::ObservabilityConflict),
+            Err(error) if is_ambiguous_commit_error(&error) => {
+                if let Some(existing) = self.store.observability_receipt(batch.write_id).await? {
+                    if existing.input_hash == batch.input_hash {
+                        return Ok(existing);
+                    }
+                    return Err(EngineError::ObservabilityConflict);
+                }
+                Err(error.into())
+            }
+            Err(error) => Err(error.into()),
+        }
+    }
+
     async fn handle_store_receipt(
         &self,
         envelope: &MemoryWriteEnvelope,
@@ -2407,6 +2464,15 @@ impl WriterHandle {
             envelope,
             response_tx,
         })?;
+        response_rx.await.map_err(|_| EngineError::WriterClosed)?
+    }
+
+    pub async fn submit_pending_injection_batch(
+        &self,
+        batch: PendingInjectionBatch,
+    ) -> Result<ObservabilityWriteReceipt, EngineError> {
+        let (response_tx, response_rx) = oneshot::channel();
+        self.enqueue(WriterMessage::PendingInjectionBatch { batch, response_tx })?;
         response_rx.await.map_err(|_| EngineError::WriterClosed)?
     }
 

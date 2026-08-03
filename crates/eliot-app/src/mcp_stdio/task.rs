@@ -242,7 +242,6 @@ async fn resolve_observation_predictions(
     } else {
         prediction_resolution_json(
             state
-                .ul
                 .prediction
                 .resolve_diagnostic_delta(
                     project_id,
@@ -260,7 +259,6 @@ async fn resolve_observation_predictions(
     } else {
         prediction_resolution_json(
             state
-                .ul
                 .prediction
                 .resolve_blast(
                     project_id,

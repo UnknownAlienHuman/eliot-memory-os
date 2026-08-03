@@ -52,6 +52,13 @@ FROM tool_observation
 WHERE <string> project_id = <string> $project_id
   AND payload.receipt_body.cue_bindings != NONE
   AND payload.receipt_kind != 'cue_binding_page'
+  AND payload.receipt_kind NOT IN [
+    'module_card',
+    'concept_node',
+    'project_charter',
+    'system_map',
+    'subsystem_capsule'
+  ]
 LIMIT 10001;
 
 LET $canonical = SELECT

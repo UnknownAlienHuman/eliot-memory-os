@@ -1,7 +1,11 @@
-use crate::{CueKind, MemoryInfluenceClass, SessionId, TaskId};
+use crate::{CueKind, MemoryInfluenceClass, ProjectId, SessionId, TaskId, WriteId};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use time::OffsetDateTime;
+
+pub const PENDING_INJECTION_BATCH_SCHEMA_VERSION: &str = "eliot-pending-injection-batch-v1";
+pub const MAX_DURABLE_PENDING_INJECTIONS_PER_SESSION: usize = 256;
 
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 pub struct ObservedCue {
@@ -24,6 +28,92 @@ pub struct PendingInjectionItem {
     pub activation_trace_ref: Option<String>,
     #[serde(default)]
     pub activation_score_milli: Option<u16>,
+}
+
+/// Stable identity for one exact pending-delivery item. The same identity is
+/// used by enqueue persistence and receipt cleanup, so receipt replay can
+/// remove only the item it actually delivered.
+#[must_use]
+pub fn pending_injection_write_id(
+    project_id: ProjectId,
+    session_id: SessionId,
+    item_ref: &str,
+    source_fingerprint: &str,
+) -> WriteId {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"eliot-pending-injection-v1");
+    for part in [
+        project_id.as_uuid().as_bytes().as_slice(),
+        session_id.as_uuid().as_bytes().as_slice(),
+        item_ref.as_bytes(),
+        source_fingerprint.as_bytes(),
+    ] {
+        hasher.update(&u64::try_from(part.len()).unwrap_or(u64::MAX).to_le_bytes());
+        hasher.update(part);
+    }
+    let digest = hasher.finalize();
+    let mut bytes = [0_u8; 16];
+    bytes.copy_from_slice(&digest.as_bytes()[..16]);
+    bytes[6] = (bytes[6] & 0x0f) | 0x50;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    WriteId::from_uuid(uuid::Uuid::from_bytes(bytes))
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PendingInjectionBatch {
+    pub schema_version: String,
+    pub write_id: WriteId,
+    pub project_id: ProjectId,
+    pub task_id: Option<TaskId>,
+    pub session_id: SessionId,
+    pub items: Vec<PendingInjectionItem>,
+    pub input_hash: String,
+    #[serde(with = "time::serde::rfc3339")]
+    pub created_at: OffsetDateTime,
+}
+
+impl PendingInjectionBatch {
+    pub fn new(
+        project_id: ProjectId,
+        task_id: Option<TaskId>,
+        session_id: SessionId,
+        items: Vec<PendingInjectionItem>,
+        created_at: OffsetDateTime,
+    ) -> Result<Self, serde_json::Error> {
+        let identity = serde_json::to_vec(&(
+            PENDING_INJECTION_BATCH_SCHEMA_VERSION,
+            project_id,
+            task_id,
+            session_id,
+            &items,
+        ))?;
+        let input_hash = blake3::hash(&identity).to_hex().to_string();
+        let write_id = pending_injection_batch_write_id(project_id, session_id, &input_hash);
+        Ok(Self {
+            schema_version: PENDING_INJECTION_BATCH_SCHEMA_VERSION.to_owned(),
+            write_id,
+            project_id,
+            task_id,
+            session_id,
+            items,
+            input_hash,
+            created_at,
+        })
+    }
+}
+
+#[must_use]
+pub fn pending_injection_batch_write_id(
+    project_id: ProjectId,
+    session_id: SessionId,
+    input_hash: &str,
+) -> WriteId {
+    pending_injection_write_id(
+        project_id,
+        session_id,
+        "pending-injection-batch",
+        input_hash,
+    )
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

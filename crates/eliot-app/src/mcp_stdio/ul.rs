@@ -1,98 +1,87 @@
+use super::McpState;
+use anyhow::{Context, Result};
 use eliot_engine::{
-    CognitiveProjectionCoordinatorHandle, CueIndexService, InjectionPlanner, MetacognitionService,
-    PredictionService, TouchedSetRegistry, UlDependencyService, UlLedgerService,
-    UlTokenPolicyService, WriterHandle, capsule_freshness, render_capsule_with_dirty,
+    DeliveredFingerprint, InjectionPlan, InjectionSelectionPolicy, PacketUnderstandingRequest,
+    PendingRestoreSource, RestoredSession, UnderstandingExecutionMode, deterministic_write_id,
+    is_mutation_tool,
 };
-use eliot_store::{CanonicalRecord, CanonicalStore};
 use eliot_types::{
-    CapsuleFreshness, CausalBridgeHop, ConceptNode, CoverageClass, HotspotScore, ModuleCard,
-    ProjectCharter, ProjectId, ProjectUnderstandingEvidence, SessionId, SubsystemCapsule,
-    SystemMap, TaskId, UlExperimentArm, UlInjectionMode, UlMetacognitionView,
-    UlTaskExperimentAssignment, path_matches_boundary, ul_token_estimate,
+    ActivationTrace, InjectionReceipt, OBSERVABILITY_SCHEMA_VERSION, ObservabilityKind,
+    ObservabilityWriteEnvelope, ObservabilityWriteStatus, ObservedCue, PendingInjectionBatch,
+    PendingInjectionItem, ProjectId, SessionId, TaskId, UlExperimentArm, UlFiredBlock, UlFiredItem,
+    UlInjectionMode, UlTaskExperimentAssignment, WriteId, ul_token_estimate,
 };
 use serde_json::{Value, json};
-use std::collections::{BTreeMap, BTreeSet};
-use std::path::{Path, PathBuf};
-use std::sync::Arc;
 
-const PACKET_PYRAMID_BUDGET: u32 = 1_500;
-const UL_FALLBACK_MATCH_TOKEN_LIMIT: usize = 12;
+pub(super) use eliot_engine::PyramidPacketEnrichment;
 
-pub(super) struct PyramidPacketEnrichment {
-    pub understanding: Value,
-    pub bridge: Vec<CausalBridgeHop>,
-    pub meta: UlMetacognitionView,
-    pub coverage: CoverageClass,
-    pub blind_target: Option<String>,
-    pub recommended_probe: Option<String>,
-    pub subsystem_concept_id: Option<String>,
-    pub resolved_concept_ids: Vec<String>,
-    pub required_invariant_refs: Vec<String>,
-    pub project_evidence: ProjectUnderstandingEvidence,
-}
+const SHIPPED_MAX_ITEMS: usize = 3;
+const SHIPPED_MAX_TOTAL_UNITS: u32 = 400;
+const SHIPPED_MAX_NEGATIVE_PAYLOADS: usize = 3;
+const BOOT_PAYLOAD_BUDGET: u32 = 1_200;
 
-pub(super) struct UlRuntime {
-    pub touched: Arc<TouchedSetRegistry>,
-    pub planner: Arc<InjectionPlanner>,
-    _dependency: Arc<UlDependencyService>,
-    pub ledger: Arc<UlLedgerService>,
-    pub token_policy: Arc<UlTokenPolicyService>,
-    pub prediction: Arc<PredictionService>,
-    projection: CognitiveProjectionCoordinatorHandle,
-    store: CanonicalStore,
-    project_root: PathBuf,
-    runtime_root: PathBuf,
-}
-
-impl UlRuntime {
-    pub fn new(
-        store: CanonicalStore,
-        writer: WriterHandle,
-        runtime_root: &Path,
-        activation_enable_min_edges: u32,
-        cue_index: Arc<CueIndexService>,
-        dependency: Arc<UlDependencyService>,
-        projection: CognitiveProjectionCoordinatorHandle,
-    ) -> Self {
-        let touched = Arc::new(TouchedSetRegistry::new());
-        let project_root = eliot_engine::canonical_project_root(runtime_root);
-        let planner = Arc::new(
-            InjectionPlanner::with_project_root_and_activation_min_edges(
-                cue_index,
-                store.clone(),
-                writer.clone(),
-                Arc::clone(&touched),
-                project_root.clone(),
-                activation_enable_min_edges,
-            ),
-        );
-        let ledger = Arc::new(UlLedgerService::with_runtime_root(
-            store.clone(),
-            runtime_root,
-        ));
-        let token_policy = Arc::new(UlTokenPolicyService::with_runtime_root(
-            store.clone(),
-            runtime_root,
-        ));
-        let prediction = Arc::new(PredictionService::new(store.clone(), writer));
-        Self {
-            touched,
-            planner,
-            _dependency: dependency,
-            ledger,
-            token_policy,
-            prediction,
-            projection,
-            store,
-            project_root,
-            runtime_root: runtime_root.to_path_buf(),
-        }
+impl McpState {
+    pub(super) fn ledger_service(&self) -> &eliot_engine::UlLedgerService {
+        &self.ul_ledger
     }
 
-    pub async fn production_injection_mode(
+    pub(super) async fn ensure_understanding_session(
+        &self,
+        project_id: ProjectId,
+        session_id: SessionId,
+    ) -> Result<()> {
+        if self
+            .understanding
+            .session_snapshot(project_id, session_id)?
+            .is_some()
+        {
+            return Ok(());
+        }
+
+        let pending = self
+            .store
+            .load_pending_injections(project_id, session_id)
+            .await?;
+        let receipts = self
+            .store
+            .load_injection_receipts(project_id, session_id)
+            .await?;
+        let delivered = receipts
+            .iter()
+            .map(|receipt| DeliveredFingerprint {
+                item_ref: receipt.item_ref.clone(),
+                source_fingerprint: receipt.source_fingerprint.clone(),
+            })
+            .collect();
+        let boot_not_onboarded = receipts
+            .iter()
+            .any(|receipt| receipt.item_ref == "ul_boot:not_onboarded");
+        let boot_charter = receipts
+            .iter()
+            .any(|receipt| receipt.item_ref.starts_with("charter:"));
+        let boot_map = receipts
+            .iter()
+            .any(|receipt| receipt.item_ref.starts_with("system-map:"));
+        self.understanding
+            .restore_session_if_absent(RestoredSession {
+                project_id,
+                session_id,
+                source: PendingRestoreSource::PendingInjectionAndReceipts,
+                touched_cues: Vec::new(),
+                pending,
+                delivered,
+                active_concepts: Vec::new(),
+                packet_revision: None,
+                execution_mode: UnderstandingExecutionMode::Production,
+                boot_sent: boot_not_onboarded || (boot_charter && boot_map),
+            })?;
+        Ok(())
+    }
+
+    pub(super) async fn production_injection_mode(
         &self,
         assignment: &UlTaskExperimentAssignment,
-    ) -> anyhow::Result<Option<UlInjectionMode>> {
+    ) -> Result<Option<UlInjectionMode>> {
         let policy = self
             .store
             .load_ul_task_class_policy(assignment.project_id, &assignment.task_class.key())
@@ -102,68 +91,51 @@ impl UlRuntime {
         })))
     }
 
-    pub async fn effective_injection_mode(
+    pub(super) async fn effective_injection_mode(
         &self,
         project_id: ProjectId,
+        session_id: SessionId,
         task_id: Option<TaskId>,
         explicit_control: bool,
-    ) -> anyhow::Result<(Option<UlInjectionMode>, Option<UlTaskExperimentAssignment>)> {
+    ) -> Result<(Option<UlInjectionMode>, Option<UlTaskExperimentAssignment>)> {
         let assignment = if let Some(task_id) = task_id {
-            self.token_policy
+            self.ul_token_policy
                 .load_assignment(project_id, task_id)
                 .await?
         } else {
             None
         };
-        let mode = if explicit_control {
-            None
+        let (mode, execution_mode) = if explicit_control {
+            (None, UnderstandingExecutionMode::Control)
         } else if let Some(assignment) = assignment.as_ref() {
             if assignment.arm == UlExperimentArm::Control {
-                None
+                (None, UnderstandingExecutionMode::Control)
             } else {
-                self.token_policy.effective_mode(assignment).await?
+                (
+                    self.ul_token_policy.effective_mode(assignment).await?,
+                    UnderstandingExecutionMode::Treatment,
+                )
             }
         } else {
-            Some(UlInjectionMode::Payload)
+            (
+                Some(UlInjectionMode::Payload),
+                UnderstandingExecutionMode::Production,
+            )
         };
+        self.understanding
+            .set_execution_mode(project_id, session_id, execution_mode)?;
         Ok((mode, assignment))
     }
 
-    pub fn record_packet_gate(
-        &self,
-        project_id: ProjectId,
-        session_id: SessionId,
-        task_id: Option<TaskId>,
-        gate: Option<&Value>,
-    ) -> anyhow::Result<()> {
-        self.touched
-            .set_packet_gate(project_id, session_id, gate.cloned());
-        let directory = self.runtime_root.join("reports").join("ul-gates");
-        std::fs::create_dir_all(&directory)?;
-        let path = directory.join(format!("{session_id}.json"));
-        if let Some(gate) = gate {
-            let report = json!({
-                "project_id": project_id,
-                "session_id": session_id,
-                "task_id": task_id,
-                "gate": gate,
-            });
-            serde_json::to_writer_pretty(std::fs::File::create(path)?, &report)?;
-        } else if path.is_file() {
-            std::fs::remove_file(path)?;
-        }
-        Ok(())
-    }
-
-    pub async fn observe_successful_tool(
+    pub(super) async fn observe_successful_tool(
         &self,
         project_id: ProjectId,
         session_id: SessionId,
         tool_name: &str,
         arguments: &Value,
-        observed_cues: &[eliot_types::ObservedCue],
-    ) -> anyhow::Result<()> {
-        if !eliot_engine::is_mutation_tool(tool_name, arguments) {
+        observed_cues: &[ObservedCue],
+    ) -> Result<()> {
+        if !is_mutation_tool(tool_name, arguments) {
             return Ok(());
         }
         let changed_paths = observed_cues
@@ -171,410 +143,532 @@ impl UlRuntime {
             .filter(|cue| cue.kind == eliot_types::CueKind::FilePath)
             .map(|cue| cue.value.clone())
             .collect::<Vec<_>>();
-        let event_ref = format!("tool:{tool_name}:{session_id}");
         self.projection
-            .enqueue_dependency_dirty(project_id, &event_ref, &changed_paths)
+            .enqueue_dependency_dirty(
+                project_id,
+                &format!("tool:{tool_name}:{session_id}"),
+                &changed_paths,
+            )
             .await?;
         Ok(())
     }
 
-    #[allow(clippy::too_many_lines)]
-    pub async fn packet_enrichment(
+    pub(super) async fn persist_activation_trace(
+        &self,
+        trace: Option<&ActivationTrace>,
+    ) -> Result<()> {
+        let Some(trace) = trace else {
+            return Ok(());
+        };
+        let write_id = WriteId::from_uuid(
+            uuid::Uuid::parse_str(&trace.trace_id)
+                .context("activation trace must have a canonical write id")?,
+        );
+        self.commit_observability(
+            write_id,
+            trace.project_id,
+            trace.task_id,
+            Some(trace.session_id),
+            ObservabilityKind::ActivationTrace,
+            trace.trace_id.clone(),
+            serde_json::to_value(trace)?,
+        )
+        .await
+    }
+
+    pub(super) async fn persist_pending_injection_candidate(
+        &self,
+        project_id: ProjectId,
+        task_id: Option<TaskId>,
+        session_id: SessionId,
+        candidate: Vec<PendingInjectionItem>,
+    ) -> Result<Vec<PendingInjectionItem>> {
+        let batch = PendingInjectionBatch::new(
+            project_id,
+            task_id,
+            session_id,
+            candidate,
+            time::OffsetDateTime::now_utc(),
+        )?;
+        self.writer
+            .submit_pending_injection_batch(batch.clone())
+            .await?;
+        Ok(batch.items)
+    }
+
+    pub(super) async fn attach_understanding(
+        &self,
+        project_id: ProjectId,
+        task_id: Option<TaskId>,
+        session_id: SessionId,
+        response: &mut Value,
+        effective_mode: Option<UlInjectionMode>,
+        plan: Option<&InjectionPlan>,
+    ) -> Result<Vec<InjectionReceipt>> {
+        let Some(effective_mode) = effective_mode else {
+            return Ok(Vec::new());
+        };
+        // Project snapshots recover in the coordinator's background loop. An
+        // absent snapshot means "not published yet", not "not onboarded".
+        // Leave boot/session delivery state untouched and retry next call.
+        if self
+            .understanding
+            .project_snapshot(project_id)?
+            .is_none_or(|snapshot| !snapshot.is_fully_published())
+        {
+            return Ok(Vec::new());
+        }
+        response_object_mut(response)?;
+        let mut committed = self
+            .attach_understanding_boot(project_id, task_id, session_id, response, effective_mode)
+            .await?;
+        if self
+            .understanding
+            .project_snapshot(project_id)?
+            .is_none_or(|snapshot| !snapshot.is_fully_published())
+        {
+            return Ok(committed);
+        }
+        let selection = self.understanding.select_pending_with_policy(
+            project_id,
+            session_id,
+            effective_mode,
+            InjectionSelectionPolicy {
+                max_items: SHIPPED_MAX_ITEMS,
+                max_token_units: SHIPPED_MAX_TOTAL_UNITS,
+                max_negative_payloads: SHIPPED_MAX_NEGATIVE_PAYLOADS,
+            },
+        )?;
+        let candidate_count = selection.items.len();
+        let mut delivered_items = Vec::new();
+        let mut delivered_fingerprints = Vec::new();
+        for item in selection.items {
+            let prepared = prepare_injection(item, session_id, task_id, effective_mode);
+            if self
+                .commit_injection_receipt(project_id, task_id, &prepared.receipt)
+                .await
+                .is_err()
+            {
+                continue;
+            }
+            delivered_fingerprints.push(prepared.fingerprint);
+            committed.push(prepared.receipt);
+            delivered_items.push(prepared.fired);
+        }
+
+        if !delivered_items.is_empty() {
+            self.understanding.acknowledge_delivered(
+                project_id,
+                session_id,
+                &delivered_fingerprints,
+            )?;
+            response_object_mut(response)?.insert(
+                "ul_fired".to_owned(),
+                serde_json::to_value(UlFiredBlock {
+                    items: delivered_items,
+                    overflow: selection
+                        .overflow
+                        .saturating_add(plan.map_or(0, |plan| plan.overflow)),
+                })?,
+            );
+        } else if candidate_count > 0 {
+            response_object_mut(response)?.insert(
+                "ul_warning".to_owned(),
+                json!({"code": "INJECTION_RECEIPT_FAILED"}),
+            );
+        }
+        Ok(committed)
+    }
+
+    async fn attach_understanding_boot(
+        &self,
+        project_id: ProjectId,
+        task_id: Option<TaskId>,
+        session_id: SessionId,
+        response: &mut Value,
+        effective_mode: UlInjectionMode,
+    ) -> Result<Vec<InjectionReceipt>> {
+        if self.understanding.boot_sent(project_id, session_id)? {
+            return Ok(Vec::new());
+        }
+        let revision = response
+            .get("at_revision")
+            .or_else(|| response.get("memory_revision"))
+            .cloned()
+            .unwrap_or(Value::Null);
+        let snapshot = self.understanding.project_snapshot(project_id)?;
+        let Some(snapshot) = snapshot else {
+            return Ok(Vec::new());
+        };
+        if !snapshot.is_fully_published() {
+            return Ok(Vec::new());
+        }
+        let (Some(charter), Some(system_map)) = (snapshot.charter(), snapshot.system_map()) else {
+            return self
+                .attach_not_onboarded_boot(
+                    project_id,
+                    task_id,
+                    session_id,
+                    response,
+                    effective_mode,
+                    revision,
+                )
+                .await;
+        };
+        let bodies_available = charter.body_md.is_some() && system_map.body_md.is_some();
+        let content_units = charter
+            .body_md
+            .as_deref()
+            .map_or(0, ul_token_estimate)
+            .saturating_add(system_map.body_md.as_deref().map_or(0, ul_token_estimate));
+        let handles_only = !bodies_available
+            || content_units > BOOT_PAYLOAD_BUDGET
+            || effective_mode == UlInjectionMode::HandlesOnly;
+        let charter_delivery = if handles_only {
+            json!({"ref": charter.handle})
+        } else {
+            json!({"ref": charter.handle, "body_md": charter.body_md})
+        };
+        let map_delivery = if handles_only {
+            json!({"ref": system_map.handle})
+        } else {
+            json!({"ref": system_map.handle, "body_md": system_map.body_md})
+        };
+        let mut boot = json!({
+            "status": "ready",
+            "revision": revision,
+            "charter": charter_delivery,
+            "system_map": map_delivery,
+            "coverage": snapshot.boot_coverage(),
+        });
+        if handles_only {
+            boot["warning"] = Value::String(
+                "UL_BOOT_BUDGET_EXCEEDED: payload omitted; use artifact handles".to_owned(),
+            );
+        }
+        let render_form = if handles_only { "handle" } else { "payload" };
+        let charter_receipt = boot_receipt(
+            session_id,
+            task_id,
+            &charter.handle,
+            boot.get("charter").context("boot charter delivery")?,
+            render_form,
+            effective_mode,
+        )?;
+        let map_receipt = boot_receipt(
+            session_id,
+            task_id,
+            &system_map.handle,
+            boot.get("system_map").context("boot system map delivery")?,
+            render_form,
+            effective_mode,
+        )?;
+        self.commit_injection_receipt(project_id, task_id, &charter_receipt)
+            .await?;
+        self.commit_injection_receipt(project_id, task_id, &map_receipt)
+            .await?;
+        self.understanding.mark_boot_sent(project_id, session_id)?;
+        response_object_mut(response)?.insert("ul_boot".to_owned(), boot);
+        Ok(vec![charter_receipt, map_receipt])
+    }
+
+    async fn attach_not_onboarded_boot(
+        &self,
+        project_id: ProjectId,
+        task_id: Option<TaskId>,
+        session_id: SessionId,
+        response: &mut Value,
+        effective_mode: UlInjectionMode,
+        revision: Value,
+    ) -> Result<Vec<InjectionReceipt>> {
+        let boot = if effective_mode == UlInjectionMode::HandlesOnly {
+            json!({
+                "status": "not_onboarded",
+                "revision": revision,
+                "ref": "ul_boot:not_onboarded",
+                "handle_only": true,
+            })
+        } else {
+            json!({
+                "status": "not_onboarded",
+                "revision": revision,
+                "message": "project understanding artifacts are not built yet; cue firing is active",
+            })
+        };
+        let serialized = serde_json::to_vec(&boot)?;
+        let fingerprint = blake3::hash(&serialized).to_hex().to_string();
+        let receipt = InjectionReceipt {
+            injection_id: injection_write_id(
+                session_id,
+                task_id,
+                "ul_boot:not_onboarded",
+                &fingerprint,
+                "mcp_auto_boot",
+            )
+            .to_string(),
+            session_id,
+            task_id,
+            surface: "mcp_auto_boot".to_owned(),
+            item_ref: "ul_boot:not_onboarded".to_owned(),
+            render_form: if effective_mode == UlInjectionMode::HandlesOnly {
+                "handle"
+            } else {
+                "payload"
+            }
+            .to_owned(),
+            fired_cues: Vec::new(),
+            token_cost: ul_token_estimate(&String::from_utf8_lossy(&serialized)),
+            source_fingerprint: fingerprint,
+            outcome: "delivered".to_owned(),
+            policy_reason: (effective_mode == UlInjectionMode::HandlesOnly)
+                .then(|| "task_class_handles_only".to_owned()),
+        };
+        self.commit_injection_receipt(project_id, task_id, &receipt)
+            .await?;
+        self.understanding.mark_boot_sent(project_id, session_id)?;
+        response_object_mut(response)?.insert("ul_boot".to_owned(), boot);
+        Ok(vec![receipt])
+    }
+
+    async fn commit_injection_receipt(
+        &self,
+        project_id: ProjectId,
+        task_id: Option<TaskId>,
+        receipt: &InjectionReceipt,
+    ) -> Result<()> {
+        let write_id = WriteId::from_uuid(
+            uuid::Uuid::parse_str(&receipt.injection_id)
+                .context("injection receipt must have a canonical write id")?,
+        );
+        self.commit_observability(
+            write_id,
+            project_id,
+            task_id,
+            Some(receipt.session_id),
+            ObservabilityKind::InjectionReceipt,
+            receipt.injection_id.clone(),
+            serde_json::to_value(receipt)?,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn commit_observability(
+        &self,
+        write_id: WriteId,
+        project_id: ProjectId,
+        task_id: Option<TaskId>,
+        session_id: Option<SessionId>,
+        kind: ObservabilityKind,
+        record_id: String,
+        payload: Value,
+    ) -> Result<()> {
+        let input_hash = blake3::hash(&serde_json::to_vec(&payload)?)
+            .to_hex()
+            .to_string();
+        let receipt = self
+            .writer
+            .submit_observability(ObservabilityWriteEnvelope {
+                schema_version: OBSERVABILITY_SCHEMA_VERSION.to_owned(),
+                write_id,
+                project_id,
+                task_id,
+                session_id,
+                kind,
+                record_id,
+                payload,
+                input_hash,
+                created_at: time::OffsetDateTime::now_utc(),
+            })
+            .await?;
+        anyhow::ensure!(
+            receipt.status != ObservabilityWriteStatus::Rejected,
+            "observability write id conflicts with an existing payload"
+        );
+        Ok(())
+    }
+
+    pub(super) fn packet_enrichment(
         &self,
         project_id: ProjectId,
         task_id: &str,
         touched_paths: &[String],
         fallback_text: &str,
-    ) -> anyhow::Result<PyramidPacketEnrichment> {
-        let charter = latest_by(
-            self.store
-                .load_ul_artifacts::<ProjectCharter>(project_id, &["project_charter"], 32)
-                .await?,
-            |charter| charter.project_id.to_string(),
-        )
-        .remove(&project_id.to_string());
-        let system_map = latest_by(
-            self.store
-                .load_ul_artifacts::<SystemMap>(project_id, &["system_map"], 32)
-                .await?,
-            |map| map.project_id.to_string(),
-        )
-        .remove(&project_id.to_string());
-        let concepts = latest_by(
-            self.store
-                .load_ul_artifacts::<ConceptNode>(project_id, &["concept_node"], 128)
-                .await?,
-            |concept| concept.concept_id.clone(),
+    ) -> Result<(eliot_types::MemoryRevision, PyramidPacketEnrichment)> {
+        let snapshot = self
+            .understanding
+            .project_snapshot(project_id)?
+            .with_context(|| format!("project snapshot {project_id} is not published"))?;
+        anyhow::ensure!(
+            snapshot.is_fully_published(),
+            "project snapshot {project_id} has stale or unpublished projection families"
         );
-        let capsules = latest_by(
-            self.store
-                .load_ul_artifacts::<SubsystemCapsule>(project_id, &["subsystem_capsule"], 128)
-                .await?,
-            |capsule| capsule.concept_id.clone(),
-        );
-        let concept_list = concepts.values().cloned().collect::<Vec<_>>();
-        let capsule_list = capsules.values().cloned().collect::<Vec<_>>();
-        let cards = latest_by(
-            self.store
-                .load_ul_artifacts::<ModuleCard>(project_id, &["module_card"], 512)
-                .await?,
-            |card| card.card_id.clone(),
-        )
-        .into_values()
-        .collect::<Vec<_>>();
-        let hotspots = latest_by(
-            self.store
-                .load_ul_artifacts::<HotspotScore>(project_id, &["hotspot_score"], 512)
-                .await?,
-            |hotspot| hotspot.hotspot_id.clone(),
-        )
-        .into_values()
-        .collect::<Vec<_>>();
-        let cue_sources = self.store.load_cue_records(project_id).await?;
-        let dirty_capsules = self
-            .store
-            .load_ul_dirty_artifacts(project_id, 512)
-            .await?
-            .into_iter()
-            .filter(|state| state.target_kind == eliot_types::PyramidTargetKind::SubsystemCapsule)
-            .map(|state| (state.target_id.clone(), state))
-            .collect::<BTreeMap<_, _>>();
-        let mut meta = MetacognitionService::evaluate(
-            &self.project_root,
-            &concept_list,
-            &capsule_list,
-            &cards,
-            &hotspots,
-            &cue_sources,
-            touched_paths,
-        );
-        let (mut coverage, mut blind_target) =
-            MetacognitionService::coverage_for_paths(&concept_list, &meta, touched_paths);
-        let recommended_probe = MetacognitionService::recommended_probe(&cards, touched_paths);
-        let subsystem_concept_id =
-            MetacognitionService::concept_for_paths(&concept_list, touched_paths);
-
-        let fallback = bounded_fallback_match_tokens(fallback_text);
-        let mut ranked = concepts
-            .into_values()
-            .filter_map(|concept| {
-                let path_score = touched_paths
-                    .iter()
-                    .filter_map(|path| {
-                        concept
-                            .boundary_paths
-                            .iter()
-                            .filter(|boundary| path_matches_boundary(path, boundary))
-                            .map(String::len)
-                            .max()
-                    })
-                    .max()
-                    .unwrap_or_default();
-                let concept_tokens = bounded_fallback_match_tokens(&format!(
-                    "{} {} {}",
-                    concept.name,
-                    concept.purpose,
-                    concept.boundary_paths.join(" ")
-                ));
-                let fallback_match = !fallback.is_disjoint(&concept_tokens);
-                (path_score > 0 || fallback_match).then_some((path_score, fallback_match, concept))
-            })
-            .collect::<Vec<_>>();
-        if ranked.iter().any(|(path_score, _, _)| *path_score > 0) {
-            ranked.retain(|(path_score, _, _)| *path_score > 0);
-        }
-        ranked.sort_by(|left, right| {
-            right
-                .0
-                .cmp(&left.0)
-                .then_with(|| right.1.cmp(&left.1))
-                .then_with(|| left.2.concept_id.cmp(&right.2.concept_id))
+        let revision = snapshot
+            .revisions()
+            .canonical
+            .context("project snapshot has no canonical revision fence")?;
+        let enrichment = snapshot.plan_packet_understanding(&PacketUnderstandingRequest {
+            task_id: task_id.to_owned(),
+            touched_paths: touched_paths.to_vec(),
+            fallback_text: fallback_text.to_owned(),
         });
-        ranked.truncate(3);
+        Ok((revision, enrichment))
+    }
 
-        let mut concept_values = Vec::new();
-        let mut capsule_values = Vec::new();
-        let mut danger = BTreeSet::new();
-        let mut required_invariant_refs = BTreeSet::new();
-        let mut stale_target = None;
-        let mut units = 0_u32;
-        for (_, _, concept) in &ranked {
-            let concept_value = json!({
-                "ref": format!("concept:{}", concept.concept_id),
-                "name": concept.name,
-                "purpose": concept.purpose,
-                "boundary_paths": concept.boundary_paths,
-            });
-            units = units.saturating_add(ul_token_estimate(&concept_value.to_string()));
-            concept_values.push(concept_value);
-            danger.extend(concept.hotspot_refs.iter().cloned());
-            danger.extend(concept.invariant_refs.iter().cloned());
-            let Some(capsule) = capsules.get(&concept.concept_id) else {
-                continue;
-            };
-            let freshness = capsule_freshness(capsule, &self.project_root);
-            let dirty = dirty_capsules.get(&capsule.concept_id);
-            let capsule_stale = freshness != CapsuleFreshness::Fresh || dirty.is_some();
-            if capsule_stale {
-                stale_target.get_or_insert_with(|| concept.concept_id.clone());
-            } else {
-                required_invariant_refs.extend(concept.invariant_refs.iter().cloned());
-            }
-            let freshness_name = if capsule_stale { "stale" } else { "fresh" };
-            let rendered = render_capsule_with_dirty(capsule, &self.project_root, dirty);
-            let payload_units = ul_token_estimate(&rendered);
-            let mut value = json!({
-                "ref": format!("capsule:{}", capsule.capsule_id),
-                "freshness": freshness_name,
-            });
-            if units.saturating_add(payload_units) <= PACKET_PYRAMID_BUDGET {
-                value["body_md"] = Value::String(rendered);
-                units = units.saturating_add(payload_units);
-            } else {
-                value["handle_only"] = Value::Bool(true);
-            }
-            capsule_values.push(value);
-        }
-        let covered_paths = touched_paths
-            .iter()
-            .filter(|path| {
-                ranked.iter().any(|(_, _, concept)| {
-                    concept
-                        .boundary_paths
-                        .iter()
-                        .any(|boundary| path_matches_boundary(path, boundary))
-                })
-            })
-            .count();
-        if let Some(target) = stale_target {
-            coverage = CoverageClass::Blind;
-            blind_target = Some(target.clone());
-            if let Some(subsystem) = meta
-                .coverage
-                .iter_mut()
-                .find(|subsystem| subsystem.concept_id == target)
-            {
-                subsystem.capsule_fresh = false;
-                subsystem.coverage = CoverageClass::Blind;
-            }
-        }
-        let legacy_coverage = if coverage == CoverageClass::Blind || ranked.is_empty() {
-            "blind"
-        } else if touched_paths.is_empty()
-            || (covered_paths == touched_paths.len() && capsule_values.len() == ranked.len())
+    pub(super) fn record_packet_gate(
+        &self,
+        project_id: ProjectId,
+        session_id: SessionId,
+        task_id: Option<TaskId>,
+        gate: Option<&Value>,
+    ) -> Result<()> {
+        // Startup outbox recovery may replay a gate before any request has
+        // hydrated the session's durable delivery receipts. Do not create an
+        // unhydrated hot session from that replay; normal in-session commits
+        // update the already-restored snapshot here.
+        if self
+            .understanding
+            .session_snapshot(project_id, session_id)?
+            .is_some()
         {
-            "covered"
-        } else {
-            "thin"
-        };
-        let bridge = ranked
-            .first()
-            .map(|(_, _, concept)| concept_bridge(task_id, concept))
-            .unwrap_or_default();
-        let project_evidence = project_understanding_evidence(
-            charter.as_ref(),
-            system_map.as_ref(),
-            &ranked,
-            &cards,
-            touched_paths,
-            &capsule_values,
-            &danger,
-            &required_invariant_refs,
-        );
-        let resolved_concept_ids = ranked
-            .iter()
-            .map(|(_, _, concept)| concept.concept_id.clone())
-            .collect();
-        Ok(PyramidPacketEnrichment {
-            understanding: json!({
-                "concepts": concept_values,
-                "capsules": capsule_values,
-                "danger": danger.into_iter().collect::<Vec<_>>(),
-                "coverage": legacy_coverage,
-            }),
-            bridge,
-            meta,
-            coverage,
-            blind_target,
-            recommended_probe,
-            subsystem_concept_id,
-            resolved_concept_ids,
-            required_invariant_refs: required_invariant_refs.into_iter().collect(),
-            project_evidence,
-        })
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn project_understanding_evidence(
-    charter: Option<&ProjectCharter>,
-    system_map: Option<&SystemMap>,
-    ranked: &[(usize, bool, ConceptNode)],
-    cards: &[ModuleCard],
-    touched_paths: &[String],
-    capsule_values: &[Value],
-    danger: &BTreeSet<String>,
-    invariant_refs: &BTreeSet<String>,
-) -> ProjectUnderstandingEvidence {
-    let subsystem_refs = ranked
-        .iter()
-        .map(|(_, _, concept)| format!("concept:{}", concept.concept_id))
-        .collect::<Vec<_>>();
-    let owner_modules = cards
-        .iter()
-        .filter(|card| {
-            touched_paths
-                .iter()
-                .any(|path| path_matches_boundary(path, &card.path))
-        })
-        .map(|card| card.path.clone())
-        .collect();
-    let entrypoint_refs = ranked
-        .iter()
-        .flat_map(|(_, _, concept)| concept.entrypoint_refs.iter().cloned())
-        .collect();
-    let mut artifact_refs = ranked
-        .iter()
-        .map(|(_, _, concept)| format!("concept:{}", concept.concept_id))
-        .collect::<Vec<_>>();
-    artifact_refs.extend(
-        capsule_values
-            .iter()
-            .filter_map(|value| value.get("ref").and_then(Value::as_str).map(str::to_owned)),
-    );
-    if let Some(charter) = charter {
-        artifact_refs.push(format!("charter:{}", charter.charter_id));
-    }
-    if let Some(map) = system_map {
-        artifact_refs.push(format!("system-map:{}", map.map_id));
-    }
-    ProjectUnderstandingEvidence {
-        project_purpose: charter
-            .and_then(|charter| first_content_line(&charter.body_md))
-            .unwrap_or_default(),
-        subsystem_refs,
-        owner_modules,
-        entrypoint_refs,
-        invariant_refs: invariant_refs.iter().cloned().collect(),
-        danger_refs: danger.iter().cloned().collect(),
-        artifact_refs,
-        flow_evidence_refs: system_map.map_or_else(Vec::new, |map| {
-            map.flow_edges
-                .iter()
-                .map(|flow| flow.evidence_ref.clone())
-                .collect()
-        }),
-        non_goals: charter.map_or_else(Vec::new, |charter| {
-            markdown_section_items(&charter.body_md, &["non-goal", "не цел"])
-        }),
-    }
-}
-
-fn first_content_line(markdown: &str) -> Option<String> {
-    markdown
-        .lines()
-        .map(str::trim)
-        .find(|line| !line.is_empty() && !line.starts_with('#'))
-        .map(|line| line.trim_start_matches(['-', '*', ' ']).to_owned())
-}
-
-fn markdown_section_items(markdown: &str, headings: &[&str]) -> Vec<String> {
-    let mut active = false;
-    let mut items = Vec::new();
-    for line in markdown.lines().map(str::trim) {
-        if line.starts_with('#') {
-            let normalized = eliot_types::normalize_unicode_lowercase(line);
-            active = headings.iter().any(|heading| normalized.contains(heading));
-            continue;
+            self.understanding
+                .set_packet_gate(project_id, session_id, gate.cloned())?;
         }
-        if active && let Some(item) = line.strip_prefix("- ").or_else(|| line.strip_prefix("* ")) {
-            items.push(item.to_owned());
+        let directory = self.root.join("reports").join("ul-gates");
+        std::fs::create_dir_all(&directory)?;
+        let path = directory.join(format!("{session_id}.json"));
+        if let Some(gate) = gate {
+            serde_json::to_writer_pretty(
+                std::fs::File::create(path)?,
+                &json!({
+                    "project_id": project_id,
+                    "session_id": session_id,
+                    "task_id": task_id,
+                    "gate": gate,
+                }),
+            )?;
+        } else if path.is_file() {
+            std::fs::remove_file(path)?;
         }
+        Ok(())
     }
-    items
 }
 
-fn latest_by<T, F>(records: Vec<CanonicalRecord<T>>, key: F) -> BTreeMap<String, T>
-where
-    F: Fn(&T) -> String,
-{
-    let mut selected = BTreeMap::<String, CanonicalRecord<T>>::new();
-    for record in records {
-        let identity = key(&record.receipt_body);
-        let candidate_order = (
-            record
-                .memory_revision
-                .map_or(0, eliot_types::MemoryRevision::value),
-            record
-                .project_sequence
-                .map_or(0, eliot_types::ProjectSequence::value),
-        );
-        let replace = selected.get(&identity).is_none_or(|current| {
-            candidate_order
-                > (
-                    current
-                        .memory_revision
-                        .map_or(0, eliot_types::MemoryRevision::value),
-                    current
-                        .project_sequence
-                        .map_or(0, eliot_types::ProjectSequence::value),
-                )
-        });
-        if replace {
-            selected.insert(identity, record);
-        }
-    }
-    selected
-        .into_iter()
-        .map(|(key, record)| (key, record.receipt_body))
-        .collect()
+struct PreparedInjection {
+    receipt: InjectionReceipt,
+    fingerprint: DeliveredFingerprint,
+    fired: UlFiredItem,
 }
 
-fn bounded_fallback_match_tokens(value: &str) -> BTreeSet<String> {
-    eliot_types::normalize_query_tokens(value)
-        .into_iter()
-        .take(UL_FALLBACK_MATCH_TOKEN_LIMIT)
-        .collect()
+fn prepare_injection(
+    item: PendingInjectionItem,
+    session_id: SessionId,
+    task_id: Option<TaskId>,
+    effective_mode: UlInjectionMode,
+) -> PreparedInjection {
+    let render_form = if item.payload.is_some() {
+        "payload"
+    } else {
+        "handle"
+    };
+    let receipt = InjectionReceipt {
+        injection_id: injection_write_id(
+            session_id,
+            task_id,
+            &item.item_ref,
+            &item.source_fingerprint,
+            "mcp_response_piggyback",
+        )
+        .to_string(),
+        session_id,
+        task_id,
+        surface: "mcp_response_piggyback".to_owned(),
+        item_ref: item.item_ref.clone(),
+        render_form: render_form.to_owned(),
+        fired_cues: item.fired_cues.clone(),
+        token_cost: item.token_estimate,
+        source_fingerprint: item.source_fingerprint.clone(),
+        outcome: "delivered".to_owned(),
+        policy_reason: (effective_mode == UlInjectionMode::HandlesOnly)
+            .then(|| "task_class_handles_only".to_owned()),
+    };
+    PreparedInjection {
+        fingerprint: DeliveredFingerprint {
+            item_ref: item.item_ref.clone(),
+            source_fingerprint: item.source_fingerprint.clone(),
+        },
+        fired: UlFiredItem {
+            item_ref: item.item_ref.clone(),
+            kind: item.record_kind,
+            line: item.preview,
+            uri: format!("eliot://memory/{}", item.item_ref),
+            payload: item.payload,
+            activation_trace_ref: item.activation_trace_ref,
+            activation_score_milli: item.activation_score_milli,
+        },
+        receipt,
+    }
 }
 
-fn concept_bridge(task_id: &str, concept: &ConceptNode) -> Vec<CausalBridgeHop> {
-    let concept_ref = format!("concept:{}", concept.concept_id);
-    let evidence = concept.source_refs.first().cloned().or_else(|| {
-        concept
-            .boundary_paths
-            .first()
-            .map(|path| format!("file:{path}"))
-    });
-    let mut bridge = vec![CausalBridgeHop {
-        from: format!("intent:{task_id}"),
-        relation: "scoped_to".to_owned(),
-        to: concept_ref.clone(),
-        evidence_ref: evidence,
-    }];
-    if let Some(entrypoint) = concept.entrypoint_refs.first() {
-        bridge.push(CausalBridgeHop {
-            from: concept_ref,
-            relation: "implemented_by".to_owned(),
-            to: entrypoint.clone(),
-            evidence_ref: Some(entrypoint.clone()),
-        });
-    }
-    bridge
+fn boot_receipt(
+    session_id: SessionId,
+    task_id: Option<TaskId>,
+    item_ref: &str,
+    delivery: &Value,
+    render_form: &str,
+    effective_mode: UlInjectionMode,
+) -> Result<InjectionReceipt> {
+    let rendered_bytes = serde_json::to_vec(delivery)?;
+    let source_fingerprint = blake3::hash(&rendered_bytes).to_hex().to_string();
+    Ok(InjectionReceipt {
+        injection_id: injection_write_id(
+            session_id,
+            task_id,
+            item_ref,
+            &source_fingerprint,
+            "mcp_auto_boot",
+        )
+        .to_string(),
+        session_id,
+        task_id,
+        surface: "mcp_auto_boot".to_owned(),
+        item_ref: item_ref.to_owned(),
+        render_form: render_form.to_owned(),
+        fired_cues: Vec::new(),
+        token_cost: ul_token_estimate(&String::from_utf8_lossy(&rendered_bytes)),
+        source_fingerprint,
+        outcome: "delivered".to_owned(),
+        policy_reason: (effective_mode == UlInjectionMode::HandlesOnly)
+            .then(|| "task_class_handles_only".to_owned()),
+    })
+}
+
+fn injection_write_id(
+    session_id: SessionId,
+    task_id: Option<TaskId>,
+    item_ref: &str,
+    source_fingerprint: &str,
+    surface: &str,
+) -> WriteId {
+    deterministic_write_id(&format!(
+        "injection|{session_id}|{}|{item_ref}|{source_fingerprint}|{surface}",
+        task_id.map_or_else(|| "none".to_owned(), |task_id| task_id.to_string())
+    ))
+}
+
+fn response_object_mut(response: &mut Value) -> Result<&mut serde_json::Map<String, Value>> {
+    response
+        .as_object_mut()
+        .context("MCP tool response must be an object before understanding injection")
 }
 
 #[cfg(test)]
 mod tests {
-    use super::bounded_fallback_match_tokens;
+    use super::{SHIPPED_MAX_ITEMS, SHIPPED_MAX_TOTAL_UNITS};
 
     #[test]
-    fn ul_fallback_matching_keeps_its_twelve_token_boundary() {
-        let tokens = bounded_fallback_match_tokens(
-            "zulu alpha beta gamma delta epsilon zeta eta theta iota kappa lambda memory",
-        );
-
-        assert_eq!(tokens.len(), 12);
-        assert!(tokens.contains("zulu"));
-        assert!(tokens.contains("lambda"));
-        assert!(!tokens.contains("memory"));
+    fn shipped_piggyback_selection_limits_remain_bounded() {
+        assert_eq!(SHIPPED_MAX_ITEMS, 3);
+        assert_eq!(SHIPPED_MAX_TOTAL_UNITS, 400);
     }
 }

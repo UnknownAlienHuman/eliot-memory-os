@@ -1,17 +1,20 @@
 {
   "schema_version": "1.0",
   "contract": {
-    "name": "ELIOT_COGNITIVE_COMPLETION_ULTRA_MASTER_FINAL",
-    "version": "4.1 FINAL",
-    "sha256": "3579eca01e2118ce80fb9735d833363d25e282dc9fbb903ebe51cce7ced16627"
+    "name": "ELIOT_COGNITIVE_COMPLETION_EXECUTION_FINAL",
+    "version": "FINAL EXECUTION TASK",
+    "sha256": "c3aabee002ec209e7640746d3b1ca5e6e8568c24c2fdd334148fb98cce4562fa"
   },
   "snapshot": {
-    "date": "2026-08-02",
+    "date": "2026-08-03",
     "baseline_commit": "88a5f049d71a9c535f51811eb7da273416c27118",
+    "execution_committed_base": "97e842042d5d3ab6830ad23a52129a87326a483d",
+    "c7_04a_parent_commit": "bf2695d172c3795ec1501b54f81a7b7aef651ee2",
     "branch": "codex/cognitive-completion-v2",
-    "phase": "phase_2_block_b1_in_progress",
+    "phase": "phase_2_block_b1_checkpoint_not_accepted",
     "phase_0_completion_repair": "accepted_by_provider_free_local_gate",
-    "phase_1_progress": "C7-03A through C7-03C accepted by focused provider-free local gates; Block B1 is active; PF1/PF2/PF3, one exact R01, final bounded isolation, and field certification remain later gates",
+    "phase_1_progress": "C7-03A through C7-03C accepted by focused provider-free local gates",
+    "phase_2_progress": "C7-04A implementation checkpoint exists and focused gates pass, but acceptance is withheld for audited session-eviction, delivered-pending cleanup, and receipt-replay defects; C7-04B is not started",
     "provider_calls_allowed": false,
     "truth_note": "This is a capability snapshot, not completion evidence. Source, canonical receipts, focused behavior tests, scale evidence, and field evidence remain authoritative."
   },
@@ -28,7 +31,7 @@
       "capability": "canonical_truth_and_single_write_authority",
       "implemented": true,
       "production_connected": true,
-      "behavior_verified": true,
+      "behavior_verified": false,
       "field_certified": true,
       "owner": "CanonicalStore plus daemon-owned WriterActor",
       "hot_or_cold": "mixed",
@@ -195,31 +198,38 @@
       "production_connected": true,
       "behavior_verified": true,
       "field_certified": false,
-      "owner": "app-owned UlRuntime over CueIndexService, ActivationEngine, and InjectionPlanner",
+      "owner": "engine-owned UnderstandingRuntime over immutable bounded project/session snapshots; WriterActor and CanonicalStore own durable pending-injection batches and receipts",
       "hot_or_cold": "hot",
       "evidence": [
-        "crates/eliot-app/src/mcp_stdio/ul.rs::UlRuntime",
+        "crates/eliot-engine/src/ul/understanding.rs::UnderstandingRuntime",
+        "crates/eliot-engine/src/ul/cue_index.rs",
         "crates/eliot-engine/src/ul/activation.rs",
         "crates/eliot-engine/src/ul/injection.rs",
-        "crates/eliot-engine/tests/ul_cue_firing.rs",
-        "crates/eliot-engine/tests/ul_touched_injection.rs"
+        "crates/eliot-engine/src/writer.rs::WriterHandle::submit_pending_injection_batch",
+        "crates/eliot-store/src/canonical_store.rs::CanonicalStore::apply_pending_injection_batch",
+        "crates/eliot-store/src/canonical_store.rs::CanonicalStore::load_pending_injections",
+        "crates/eliot-engine/tests/ul_understanding_runtime.rs",
+        "crates/eliot-engine/tests/ul_injection_selection.rs",
+        "crates/eliot-store/tests/ul_observability_store.rs::b1_pending_batch_is_atomic_restart_safe_and_exactly_dequeued"
       ],
-      "known_gap": "The runtime is not daemon-owned, activation still defaults to a 500-edge enable gate, and the v4.1 zero-edge, no-DB PreToolUse, restart, and p95 budgets are not certified."
+      "known_gap": "C7-04A is not accepted: an in-flight session eviction can replace durable pending from an empty mirror, delivered/stale pending is not removed before candidate admission, and WriterActor receipt replay can bypass exact pending cleanup."
     },
     {
       "capability": "single_daemon_owned_understanding_runtime",
-      "implemented": false,
-      "production_connected": false,
-      "behavior_verified": false,
+      "implemented": true,
+      "production_connected": true,
+      "behavior_verified": true,
       "field_certified": false,
-      "owner": "not implemented; current owner is app-local UlRuntime",
+      "owner": "One Arc<UnderstandingRuntime> is constructed by McpDaemon, shared with CognitiveProjectionCoordinator, and owns bounded project/session snapshots; no constructible app UlRuntime or McpState.ul remains.",
       "hot_or_cold": "hot",
       "evidence": [
-        "crates/eliot-app/src/mcp_stdio.rs constructs UlRuntime.",
-        "crates/eliot-app/src/mcp_stdio/ul.rs defines UlRuntime.",
-        "No UnderstandingRuntime symbol exists at the baseline commit."
+        "crates/eliot-app/src/mcp_stdio.rs constructs and shares one UnderstandingRuntime",
+        "crates/eliot-engine/src/cognitive_projection.rs publishes admitted snapshots into that runtime",
+        "crates/eliot-engine/src/ul/understanding.rs owns the bounded runtime",
+        "crates/eliot-app/tests/ul_runtime_cutover.rs",
+        "crates/eliot-engine/tests/ul_understanding_runtime.rs"
       ],
-      "known_gap": "Migrate rather than duplicate UlRuntime; own immutable revision-bound snapshots and atomically swap only affected shards."
+      "known_gap": "C7-04B must connect prepared-memory delivery through every required host tier without adding a second runtime owner."
     },
     {
       "capability": "single_causal_context_and_understanding_compiler",
@@ -360,7 +370,7 @@
       "owner": "Ultra release gate",
       "hot_or_cold": "cold",
       "evidence": [
-        "Phase 0 is accepted by its local provider-free gate; Phases 1 through 8 are not accepted."
+        "Phases 0 and 1 are accepted; Phase 2 has a non-accepted C7-04A implementation checkpoint; C7-04B and every later phase/release gate remain unaccepted."
       ],
       "known_gap": "Complete the ordered commit chain, deletion gate, final workspace gate, PR, independent review, CI, merge, and independent main-SHA CI."
     }

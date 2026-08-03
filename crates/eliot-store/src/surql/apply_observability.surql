@@ -115,6 +115,13 @@ LET $result = IF $existing_receipt != NONE {
   };
   SELECT * FROM ONLY type::record('observability_receipt', $receipt_id)
 };
+LET $pending_cleanup = IF $envelope.kind = 'injection_receipt'
+  AND $result.status != 'rejected' {
+  DELETE type::record('pending_injection', $pending_injection_record_id);
+  true
+} ELSE {
+  false
+};
 
 COMMIT TRANSACTION;
 RETURN $result;

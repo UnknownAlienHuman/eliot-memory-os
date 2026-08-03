@@ -144,7 +144,7 @@ async fn prepare_packet_measurement(
     let effective_injection_mode = if memory_free_control {
         None
     } else {
-        state.ul.production_injection_mode(&assignment).await?
+        state.production_injection_mode(&assignment).await?
     };
     Ok(PreparedPacketMeasurement {
         assignment,
@@ -236,7 +236,6 @@ async fn dispatch_compile_packet_l3(
             &touched_paths,
             &fallback_text,
         )
-        .await
         {
             Ok((at_revision, pyramid)) => {
                 let resolved_concept_ids = pyramid.resolved_concept_ids.clone();
@@ -448,75 +447,16 @@ async fn dispatch_compile_packet_l3(
     Ok(stored_intent.response)
 }
 
-async fn revision_bound_packet_enrichment(
+fn revision_bound_packet_enrichment(
     state: &McpState,
     project_id: ProjectId,
     task_id: &str,
     touched_paths: &[String],
     fallback_text: &str,
 ) -> Result<(MemoryRevision, ul::PyramidPacketEnrichment)> {
-    let request = CurrentStateRequest {
-        project_id,
-        consistency: ReadConsistencyMode::Latest,
-        at_least_revision: None,
-    };
-    let mut last_mismatch = "projection fence was not evaluated".to_owned();
-    for attempt in 0..3 {
-        let before = state.store.current_state(&request).await?;
-        let family_before = packet_enrichment_family_fence(
-            state
-                .store
-                .cognitive_projection_family_states(project_id)
-                .await?,
-            before.memory_revision,
-        );
-        let family_before = match family_before {
-            Ok(family_before) => family_before,
-            Err(error) => {
-                last_mismatch = error.to_string();
-                if attempt < 2 {
-                    tokio::time::sleep(std::time::Duration::from_millis(25_u64 << (attempt * 2)))
-                        .await;
-                }
-                continue;
-            }
-        };
-        let enrichment = state
-            .ul
-            .packet_enrichment(project_id, task_id, touched_paths, fallback_text)
-            .await?;
-        let family_after = packet_enrichment_family_fence(
-            state
-                .store
-                .cognitive_projection_family_states(project_id)
-                .await?,
-            before.memory_revision,
-        );
-        let after = state.store.current_state(&request).await?;
-        match family_after {
-            Ok(family_after)
-                if after.memory_revision == before.memory_revision
-                    && family_after == family_before =>
-            {
-                return Ok((before.memory_revision, enrichment));
-            }
-            Ok(_) => {
-                last_mismatch = format!(
-                    "canonical or derived family state changed: before={}, after={}",
-                    before.memory_revision.value(),
-                    after.memory_revision.value(),
-                );
-            }
-            Err(error) => last_mismatch = error.to_string(),
-        }
-        if attempt < 2 {
-            tokio::time::sleep(std::time::Duration::from_millis(25_u64 << (attempt * 2))).await;
-        }
-    }
-    Err(PacketEnrichmentUnavailable(format!(
-        "Cue/DependencyDirty projection fence did not stabilize after 3 attempts: {last_mismatch}"
-    ))
-    .into())
+    state
+        .packet_enrichment(project_id, task_id, touched_paths, fallback_text)
+        .map_err(|error| PacketEnrichmentUnavailable(error.to_string()).into())
 }
 
 #[derive(Debug)]
@@ -529,46 +469,6 @@ impl std::fmt::Display for PacketEnrichmentUnavailable {
 }
 
 impl std::error::Error for PacketEnrichmentUnavailable {}
-
-fn packet_enrichment_family_fence(
-    states: Vec<eliot_store::CognitiveProjectionFamilyState>,
-    revision: MemoryRevision,
-) -> Result<Vec<eliot_store::CognitiveProjectionFamilyState>> {
-    use eliot_store::{CognitiveProjectionFamily, CognitiveProjectionPublicationStatus};
-
-    let mut relevant = states
-        .into_iter()
-        .filter(|state| {
-            matches!(
-                state.family,
-                CognitiveProjectionFamily::Cue | CognitiveProjectionFamily::DependencyDirty
-            )
-        })
-        .collect::<Vec<_>>();
-    relevant.sort_by_key(|state| state.family);
-    for family in [
-        CognitiveProjectionFamily::Cue,
-        CognitiveProjectionFamily::DependencyDirty,
-    ] {
-        let state = relevant
-            .iter()
-            .find(|state| state.family == family)
-            .with_context(|| format!("{family:?} projection family has no publication state"))?;
-        anyhow::ensure!(
-            state.status == CognitiveProjectionPublicationStatus::Published
-                && state.target_revision >= revision
-                && state
-                    .applied_revision
-                    .is_some_and(|applied| applied >= revision),
-            "{family:?} projection is not published through revision {}: status={}, target={}, applied={:?}",
-            revision.value(),
-            state.status.as_str(),
-            state.target_revision.value(),
-            state.applied_revision.map(MemoryRevision::value),
-        );
-    }
-    Ok(relevant)
-}
 
 fn material_frame_required_edits(frame: &MaterialPacketFrame) -> Vec<&'static str> {
     let mut fields = Vec::new();
@@ -648,19 +548,15 @@ async fn dispatch_memory_influence_trace(
                 .context("minimal influence acknowledgement requires project_id when unbound")?;
             let task_id = context
                 .bound_task_id
-                .or_else(|| {
-                    state
-                        .ul
-                        .touched
-                        .last_task_id(project_id, context.session_id)
-                })
+                .or(state
+                    .understanding
+                    .last_task_id(project_id, context.session_id)?)
                 .context(
                     "MISSING_PROJECT_PACKET_CONTEXT: minimal influence acknowledgement requires an explicit bound task and a same-session L3 packet or exact fetch context",
                 )?;
             let (packet_id, packet_handles) = state
-                .ul
-                .touched
-                .packet_context(project_id, context.session_id);
+                .understanding
+                .packet_context(project_id, context.session_id)?;
             let packet_id = packet_id.context(
                 "MISSING_PROJECT_PACKET_CONTEXT: minimal influence acknowledgement requires an explicit bound task and a same-session L3 packet or exact fetch context",
             )?;
@@ -1652,7 +1548,6 @@ async fn apply_packet_post_commit_intent(
                 if let Some(task_id) = parsed_task_id {
                     for prediction in &intent.material.prediction_intents {
                         if let Err(error) = state
-                            .ul
                             .prediction
                             .capture_packet_intent(
                                 intent.material.project_id,
@@ -1700,7 +1595,7 @@ async fn apply_packet_post_commit_intent(
                 }
             }
             PacketPostCommitEffect::GateProjection => {
-                if let Err(error) = state.ul.record_packet_gate(
+                if let Err(error) = state.record_packet_gate(
                     intent.material.project_id,
                     intent.material.effect_session_id,
                     parsed_task_id,
@@ -2678,36 +2573,6 @@ mod packet_commit_unit_tests {
             after_number - before_number,
         );
         validation.expect("reread packet post-commit intent must retain its response hash");
-    }
-
-    #[test]
-    fn packet_family_fence_requires_cue_and_dependency_dirty_at_revision() {
-        use eliot_store::{CognitiveProjectionFamily, CognitiveProjectionPublicationStatus};
-
-        let project_id = ProjectId::new_v7();
-        let revision = MemoryRevision::new(9);
-        let state = |family| eliot_store::CognitiveProjectionFamilyState {
-            project_id,
-            family,
-            target_revision: revision,
-            applied_revision: Some(revision),
-            status: CognitiveProjectionPublicationStatus::Published,
-            last_error: None,
-            updated_at: time::OffsetDateTime::now_utc(),
-        };
-        let fence = packet_enrichment_family_fence(
-            vec![
-                state(CognitiveProjectionFamily::DependencyDirty),
-                state(CognitiveProjectionFamily::Cue),
-            ],
-            revision,
-        )
-        .expect("complete family fence");
-        assert_eq!(fence.len(), 2);
-        assert!(
-            packet_enrichment_family_fence(vec![state(CognitiveProjectionFamily::Cue)], revision)
-                .is_err()
-        );
     }
 
     #[test]

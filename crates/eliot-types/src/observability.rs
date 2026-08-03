@@ -12,6 +12,7 @@ pub const OBSERVABILITY_SCHEMA_VERSION: &str = "eliot-observability-v1";
 #[serde(rename_all = "snake_case")]
 pub enum ObservabilityKind {
     MemoryInfluenceTrace,
+    PendingInjection,
     InjectionReceipt,
     ActivationTrace,
     PredictionRecord,
@@ -22,6 +23,7 @@ impl ObservabilityKind {
     pub const fn table_name(self) -> &'static str {
         match self {
             Self::MemoryInfluenceTrace => "memory_influence_trace",
+            Self::PendingInjection => "pending_injection",
             Self::InjectionReceipt => "injection_receipt",
             Self::ActivationTrace => "activation_trace",
             Self::PredictionRecord => "prediction_record",

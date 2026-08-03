@@ -437,8 +437,10 @@ pub use ul::exam::{
 };
 pub use ul::guard::{TextEncodingViolation, inspect_text_encoding, mojibake};
 pub use ul::injection::{
-    InjectionReceipt, MemoryInfluenceAckInput, ObservedCue, PendingInjectionItem, UlFiredBlock,
-    UlFiredItem,
+    InjectionReceipt, MAX_DURABLE_PENDING_INJECTIONS_PER_SESSION, MemoryInfluenceAckInput,
+    ObservedCue, PENDING_INJECTION_BATCH_SCHEMA_VERSION, PendingInjectionBatch,
+    PendingInjectionItem, UlFiredBlock, UlFiredItem, pending_injection_batch_write_id,
+    pending_injection_write_id,
 };
 pub use ul::measurement::{
     UL_FIELD_VALIDATION_BASELINE_COMMIT, UL_FIELD_VALIDATION_SCHEMA_VERSION, UlArtifactInventory,

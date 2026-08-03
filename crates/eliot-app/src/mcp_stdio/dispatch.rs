@@ -85,7 +85,7 @@ pub(super) async fn dispatch_host_governor_method(
             crate::commands::run_ul_report_from_daemon(
                 &state.root,
                 &state.store,
-                &state.ul.ledger,
+                state.ledger_service(),
                 params,
             )
             .await,
@@ -369,12 +369,6 @@ pub(super) async fn call_tool(
     let arguments = enforce_bound_tool_scope(context, name, arguments)?;
     let ul_input_bytes = u64::try_from(serde_json::to_vec(&arguments)?.len()).unwrap_or(u64::MAX);
     let (ul_project_id, ul_task_id) = ul_scope(context, &arguments);
-    let observed_arguments = ul_project_id.map_or_else(Vec::new, |project_id| {
-        state
-            .ul
-            .touched
-            .observe_arguments(project_id, context.session_id, name, &arguments)
-    });
     let argument_memory_free_control = name == "eliot_compile_packet_l3"
         && arguments.get("memory_mode").and_then(Value::as_str) == Some("memory_free_control");
     let cognitive_claims = if state.profile == McpAccessProfile::CognitiveChild {
@@ -422,6 +416,16 @@ pub(super) async fn call_tool(
     }
 
     state.ensure_schema().await?;
+    let observed_arguments = if let Some(project_id) = ul_project_id {
+        state
+            .ensure_understanding_session(project_id, context.session_id)
+            .await?;
+        state
+            .understanding
+            .observe_arguments(project_id, context.session_id, name, &arguments)?
+    } else {
+        Vec::new()
+    };
 
     let observation_arguments = arguments.clone();
     let mut dispatch_arguments = arguments;
@@ -458,12 +462,12 @@ pub(super) async fn call_tool(
                 u64::try_from(serde_json::to_vec(&structured)?.len()).unwrap_or(u64::MAX);
             let mut newly_observed = observed_arguments;
             if let Some(project_id) = ul_project_id {
-                newly_observed.extend(state.ul.touched.observe_result(
+                newly_observed.extend(state.understanding.observe_result(
                     project_id,
                     context.session_id,
                     name,
                     &structured,
-                ));
+                )?);
             }
             newly_observed.sort_by(|left, right| {
                 left.kind
@@ -481,8 +485,12 @@ pub(super) async fn call_tool(
             let mut ul_assignment = None;
             if let Some(project_id) = ul_project_id {
                 let (effective_injection_mode, assignment) = state
-                    .ul
-                    .effective_injection_mode(project_id, ul_task_id, memory_free_control)
+                    .effective_injection_mode(
+                        project_id,
+                        context.session_id,
+                        ul_task_id,
+                        memory_free_control,
+                    )
                     .await?;
                 ul_assignment = assignment;
                 if let (Some(assignment), Some(mode)) =
@@ -490,8 +498,56 @@ pub(super) async fn call_tool(
                 {
                     assignment.injection_mode = mode;
                 }
+                let _pending_commit = state.understanding.acquire_pending_commit().await;
+                let plan = if effective_injection_mode.is_some()
+                    && state
+                        .understanding
+                        .project_snapshot(project_id)?
+                        .is_some_and(|snapshot| snapshot.is_fully_published())
+                {
+                    let plan = state.understanding.plan_cues(
+                        project_id,
+                        context.session_id,
+                        ul_task_id,
+                        &newly_observed,
+                    )?;
+                    state
+                        .persist_activation_trace(plan.activation_trace.as_ref())
+                        .await?;
+                    let candidate = state.understanding.prepare_pending_candidate(
+                        project_id,
+                        context.session_id,
+                        &plan,
+                    )?;
+                    let committed = state
+                        .persist_pending_injection_candidate(
+                            project_id,
+                            ul_task_id,
+                            context.session_id,
+                            candidate,
+                        )
+                        .await?;
+                    state.understanding.install_pending_candidate(
+                        project_id,
+                        context.session_id,
+                        committed,
+                        &plan,
+                    )?;
+                    Some(plan)
+                } else {
+                    None
+                };
+                injection_receipts = state
+                    .attach_understanding(
+                        project_id,
+                        ul_task_id,
+                        context.session_id,
+                        &mut structured,
+                        effective_injection_mode,
+                        plan.as_ref(),
+                    )
+                    .await?;
                 state
-                    .ul
                     .observe_successful_tool(
                         project_id,
                         context.session_id,
@@ -500,29 +556,10 @@ pub(super) async fn call_tool(
                         &newly_observed,
                     )
                     .await?;
-                if effective_injection_mode.is_some() {
-                    state
-                        .ul
-                        .planner
-                        .plan_after_tool(project_id, context.session_id, &newly_observed)
-                        .await?;
-                }
-                injection_receipts = state
-                    .ul
-                    .planner
-                    .attach(
-                        project_id,
-                        ul_task_id,
-                        context.session_id,
-                        &mut structured,
-                        effective_injection_mode,
-                    )
-                    .await?;
             }
             if let (Some(project_id), Some(task_id)) = (ul_project_id, ul_task_id) {
                 let _ = state
-                    .ul
-                    .ledger
+                    .ledger_service()
                     .record_call(
                         eliot_engine::UlToolMeasurement {
                             project_id,
