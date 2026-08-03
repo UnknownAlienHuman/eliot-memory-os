@@ -90,6 +90,38 @@ impl Harness {
         PreparedHarness::prepare(name)
     }
 
+    pub fn stop_daemon(&mut self) -> TestResult {
+        self.client.stop()?;
+        self.daemon.stop()?;
+        Ok(())
+    }
+
+    pub fn restart_daemon(&mut self) -> TestResult {
+        self.stop_daemon()?;
+        let daemon_lock = self.runtime.path().join("runtime").join("daemon.lock");
+        match fs::remove_file(&daemon_lock) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        let daemon = start_daemon(&self.config_path)?;
+        wait_for_runtime_pid(
+            &self
+                .runtime
+                .path()
+                .join("reports")
+                .join("runtime")
+                .join("latest.json"),
+            daemon.id()?,
+            Duration::from_secs(30),
+        )?;
+        let mut client = McpClient::start(&self.config_path)?;
+        client.initialize()?;
+        self.daemon = daemon;
+        self.client = client;
+        Ok(())
+    }
+
     fn wait_for_bootstrap_projections(
         &self,
         bootstrap_heads: &BTreeMap<ProjectId, MemoryRevision>,

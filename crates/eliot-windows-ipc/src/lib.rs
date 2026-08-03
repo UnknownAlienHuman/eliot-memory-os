@@ -1704,8 +1704,8 @@ pub fn process_is_alive(pid: u32) -> io::Result<bool> {
 /// Returns an error when either path is invalid or Windows cannot complete the
 /// replacement.
 pub fn atomic_replace_file(source: &Path, destination: &Path) -> io::Result<()> {
-    let source = nul_terminated_wide(source.as_os_str())?;
-    let destination = nul_terminated_wide(destination.as_os_str())?;
+    let source = nul_terminated_wide_file_path(source)?;
+    let destination = nul_terminated_wide_file_path(destination)?;
     for attempt in 0..=40 {
         // SAFETY: both buffers are NUL-terminated and remain alive for the complete
         // call. MoveFileExW does not retain either pointer.
@@ -1732,6 +1732,27 @@ pub fn atomic_replace_file(source: &Path, destination: &Path) -> io::Result<()> 
         std::thread::sleep(Duration::from_millis(25));
     }
     unreachable!("bounded atomic replacement loop always returns")
+}
+
+fn nul_terminated_wide_file_path(path: &Path) -> io::Result<Vec<u16>> {
+    let absolute = std::path::absolute(path)?;
+    let parent = absolute.parent().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Windows file path has no parent directory",
+        )
+    })?;
+    let file_name = absolute.file_name().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Windows file path has no file name",
+        )
+    })?;
+    // `canonicalize` returns an extended-length path on Windows. Resolve only
+    // the parent so replacing the destination entry never follows a leaf
+    // symlink and paths beyond MAX_PATH remain valid for `MoveFileExW`.
+    let extended = std::fs::canonicalize(parent)?.join(file_name);
+    nul_terminated_wide(extended.as_os_str())
 }
 
 fn nul_terminated_wide(value: &OsStr) -> io::Result<Vec<u16>> {
@@ -2698,6 +2719,27 @@ mod tests {
         fs::write(&source, b"new")?;
         fs::write(&destination, b"old")?;
         atomic_replace_file(&source, &destination)?;
+        assert_eq!(fs::read(&destination)?, b"new");
+        assert!(!source.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn atomic_replace_supports_extended_length_paths() -> Result<(), Box<dyn std::error::Error>> {
+        let root = OwnedTestRoot::new("eliot-atomic-replace-long-path")?;
+        let mut parent = root.to_path_buf();
+        for index in 0..10 {
+            parent.push(format!("segment-{index:02}-abcdefghijklmnop"));
+        }
+        fs::create_dir_all(&parent)?;
+        let source = parent.join("source.tmp");
+        let destination = parent.join("destination.json");
+        assert!(destination.to_string_lossy().len() > 260);
+        fs::write(&source, b"new")?;
+        fs::write(&destination, b"old")?;
+
+        atomic_replace_file(&source, &destination)?;
+
         assert_eq!(fs::read(&destination)?, b"new");
         assert!(!source.exists());
         Ok(())

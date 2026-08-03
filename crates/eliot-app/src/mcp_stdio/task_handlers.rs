@@ -7,6 +7,8 @@ fn canonical_struct_hash<T: serde::Serialize>(value: &T) -> Result<String> {
 const PACKET_POST_COMMIT_OPERATION_KIND: &str = "eliot.packet.post_commit";
 const PACKET_POST_COMMIT_SCHEMA_VERSION: &str = "eliot-packet-post-commit-v3";
 const PACKET_ACTIVE_AUTHORITY_SCHEMA_VERSION: &str = "eliot-packet-active-authority-v2";
+const PACKET_OUTBOX_REPLAY_LIMIT: usize = 32;
+const PACKET_OUTBOX_RECOVERY_ERROR_SAMPLE_LIMIT: usize = 16;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -185,19 +187,13 @@ async fn dispatch_compile_packet_l3(
     let packet_serializer = packet_task_serializer(&request.task_id);
     let _packet_guard = packet_serializer.lock().await;
     let parsed_task_id = TaskId::from_str(&request.task_id).ok();
-    if let Some(task_id) = parsed_task_id {
-        let task_commit_guard = task_commit_serializer().lock().await;
-        let task_process_guard = acquire_task_transition_process_lock(&state.root, task_id).await?;
-        drop(task_commit_guard);
-        let replay_result =
-            replay_packet_post_commit_outbox_for_task(state, &request.task_id, true).await;
-        drop(task_process_guard);
-        replay_result?;
-    } else {
-        // Legacy non-canonical task handles remain local-only. Do not invent a
-        // TaskId merely to participate in the canonical process-lock domain.
-        replay_packet_post_commit_outbox_for_task(state, &request.task_id, true).await?;
-    }
+    replay_packet_post_commit_outbox_with_transition_lock(
+        state,
+        &request.task_id,
+        parsed_task_id,
+        true,
+    )
+    .await?;
     let packet_task = if let Some(packet_task_id) = parsed_task_id {
         state.store.task_contract_by_id(packet_task_id).await?
     } else {
@@ -1171,10 +1167,15 @@ fn read_active_packet_authority(
     task_id: &str,
 ) -> Result<Option<ActivePacketAuthority>> {
     let path = active_packet_authority_path(state, task_id);
-    if !path.is_file() {
-        return Ok(None);
-    }
-    let authority: ActivePacketAuthority = serde_json::from_reader(std::fs::File::open(&path)?)?;
+    let file = match std::fs::File::open(&path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("open active packet authority at {}", path.display()));
+        }
+    };
+    let authority: ActivePacketAuthority = serde_json::from_reader(file)?;
     anyhow::ensure!(
         authority.schema_version == PACKET_ACTIVE_AUTHORITY_SCHEMA_VERSION,
         "unsupported active packet authority schema at {}",
@@ -1738,36 +1739,80 @@ fn repair_active_packet_projections(
     errors
 }
 
+struct PendingPacketPostCommitOutbox {
+    outbox_root: PathBuf,
+    intent: PacketPostCommitIntent,
+    status: PacketPostCommitStatus,
+    errors: Vec<String>,
+}
+
+fn pending_packet_post_commit_outbox(
+    state: &McpState,
+    task_id: &str,
+) -> Result<Option<PendingPacketPostCommitOutbox>> {
+    let Some(authority) = read_active_packet_authority(state, task_id)? else {
+        return Ok(None);
+    };
+    let outbox_root = packet_post_commit_outbox_path(state, task_id, &authority.operation_id);
+    let intent_path = packet_post_commit_intent_path(&outbox_root);
+    let intent: PacketPostCommitIntent = serde_json::from_reader(
+        std::fs::File::open(&intent_path).with_context(|| {
+            format!(
+                "open active packet outbox intent for {task_id} at {}",
+                intent_path.display()
+            )
+        })?,
+    )?;
+    validate_packet_post_commit_intent(&intent)?;
+    let current = latest_packet_post_commit_event(&outbox_root, &intent)?.with_context(|| {
+        format!(
+            "active packet outbox for {task_id} has no durable state event at {}",
+            outbox_root.display()
+        )
+    })?;
+    anyhow::ensure!(
+        packet_post_commit_authority_identity_matches(
+            &authority.operation_id,
+            authority.material.effect_session_id,
+            &authority.material.packet_id,
+            &intent,
+        ),
+        "active packet authority/outbox identity mismatch for {task_id} at {}",
+        outbox_root.display()
+    );
+    if current.status == PacketPostCommitStatus::Complete {
+        return Ok(None);
+    }
+    Ok(Some(PendingPacketPostCommitOutbox {
+        outbox_root,
+        intent,
+        status: current.status,
+        errors: current.errors,
+    }))
+}
+
 async fn replay_packet_post_commit_outbox_for_task(
     state: &McpState,
     task_id: &str,
     require_completion: bool,
 ) -> Result<bool> {
-    let Some(authority) = read_active_packet_authority(state, task_id)? else {
+    let Some(PendingPacketPostCommitOutbox {
+        outbox_root,
+        intent,
+        status,
+        errors: _,
+    }) = pending_packet_post_commit_outbox(state, task_id)?
+    else {
         return Ok(false);
     };
-    let outbox_root = packet_post_commit_outbox_path(state, task_id, &authority.operation_id);
-    let intent_path = packet_post_commit_intent_path(&outbox_root);
-    if !intent_path.is_file() {
-        return Ok(false);
+    if status != PacketPostCommitStatus::CommittedPending {
+        transition_packet_post_commit_outbox(
+            &outbox_root,
+            &intent,
+            PacketPostCommitStatus::CommittedPending,
+            &[],
+        )?;
     }
-    let intent: PacketPostCommitIntent =
-        serde_json::from_reader(std::fs::File::open(intent_path)?)?;
-    validate_packet_post_commit_intent(&intent)?;
-    let Some(current) = latest_packet_post_commit_event(&outbox_root, &intent)? else {
-        return Ok(false);
-    };
-    if current.status == PacketPostCommitStatus::Complete
-        || !packet_post_commit_intent_is_active(state, &intent)?
-    {
-        return Ok(false);
-    }
-    transition_packet_post_commit_outbox(
-        &outbox_root,
-        &intent,
-        PacketPostCommitStatus::CommittedPending,
-        &[],
-    )?;
     ensure_packet_post_commit_intent_is_active(state, &intent)?;
     let mut errors = repair_active_packet_projections(state, &intent);
     errors.extend(apply_packet_post_commit_intent(state, &intent).await);
@@ -1780,6 +1825,261 @@ async fn replay_packet_post_commit_outbox_for_task(
         );
     }
     Ok(true)
+}
+
+async fn replay_packet_post_commit_outbox_with_transition_lock(
+    state: &McpState,
+    task_handle: &str,
+    parsed_task_id: Option<TaskId>,
+    require_completion: bool,
+) -> Result<bool> {
+    if let Some(task_id) = parsed_task_id {
+        let task_commit_guard = task_commit_serializer().lock().await;
+        let task_process_guard = acquire_task_transition_process_lock(&state.root, task_id).await?;
+        drop(task_commit_guard);
+        let replay_result =
+            replay_packet_post_commit_outbox_for_task(state, task_handle, require_completion).await;
+        drop(task_process_guard);
+        replay_result
+    } else {
+        // Legacy non-canonical task handles remain local-only. Do not invent a
+        // TaskId merely to participate in the canonical process-lock domain.
+        replay_packet_post_commit_outbox_for_task(state, task_handle, require_completion).await
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PacketPostCommitRecoveryEntry {
+    directory_name: String,
+    authority_path: PathBuf,
+}
+
+#[derive(Debug, Default, Eq, PartialEq)]
+struct PacketPostCommitRecoveryReport {
+    inspected: usize,
+    attempted: usize,
+    replayed: usize,
+    residual_pending: usize,
+    error_count: usize,
+    error_samples: Vec<String>,
+    residual_samples: Vec<String>,
+}
+
+impl PacketPostCommitRecoveryReport {
+    fn claim_replay_slot(&mut self) -> bool {
+        if self.attempted >= PACKET_OUTBOX_REPLAY_LIMIT {
+            return false;
+        }
+        self.attempted = self.attempted.saturating_add(1);
+        true
+    }
+
+    fn record_error(&mut self, error: impl Into<String>) {
+        self.error_count = self.error_count.saturating_add(1);
+        if self.error_samples.len() < PACKET_OUTBOX_RECOVERY_ERROR_SAMPLE_LIMIT {
+            self.error_samples.push(error.into());
+        }
+    }
+
+    fn record_residual(
+        &mut self,
+        task_handle: &str,
+        pending: &PendingPacketPostCommitOutbox,
+    ) {
+        self.residual_pending = self.residual_pending.saturating_add(1);
+        if self.residual_samples.len() < PACKET_OUTBOX_RECOVERY_ERROR_SAMPLE_LIMIT {
+            self.residual_samples.push(format!(
+                "{task_handle}: status={:?}, errors={:?}",
+                pending.status, pending.errors
+            ));
+        }
+    }
+
+    fn requires_attention(&self) -> bool {
+        self.residual_pending > 0 || self.error_count > 0
+    }
+}
+
+fn packet_post_commit_recovery_inventory(
+    tasks_root: &Path,
+    report: &mut PacketPostCommitRecoveryReport,
+) -> Vec<PacketPostCommitRecoveryEntry> {
+    match std::fs::metadata(tasks_root) {
+        Ok(metadata) if metadata.is_dir() => {}
+        Ok(_) => {
+            report.record_error(format!(
+                "packet recovery inventory root is not a directory: {}",
+                tasks_root.display()
+            ));
+            return Vec::new();
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
+        Err(error) => {
+            report.record_error(format!(
+                "inspect packet recovery inventory root at {}: {error}",
+                tasks_root.display()
+            ));
+            return Vec::new();
+        }
+    }
+    let entries = match std::fs::read_dir(tasks_root) {
+        Ok(entries) => entries,
+        Err(error) => {
+            report.record_error(format!(
+                "read packet recovery inventory at {}: {error}",
+                tasks_root.display()
+            ));
+            return Vec::new();
+        }
+    };
+    let mut inventory = Vec::new();
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                report.record_error(format!(
+                    "read packet recovery inventory entry at {}: {error}",
+                    tasks_root.display()
+                ));
+                continue;
+            }
+        };
+        let file_type = match entry.file_type() {
+            Ok(file_type) => file_type,
+            Err(error) => {
+                report.record_error(format!(
+                    "read packet recovery entry type at {}: {error}",
+                    entry.path().display()
+                ));
+                continue;
+            }
+        };
+        if !file_type.is_dir() {
+            continue;
+        }
+        let directory_name = match entry.file_name().into_string() {
+            Ok(directory_name) => directory_name,
+            Err(name) => {
+                report.record_error(format!(
+                    "packet recovery directory name is not Unicode: {}",
+                    name.to_string_lossy()
+                ));
+                continue;
+            }
+        };
+        let authority_path = entry.path().join("active").join("authority.json");
+        match std::fs::metadata(&authority_path) {
+            Ok(metadata) if metadata.is_file() => {
+                inventory.push(PacketPostCommitRecoveryEntry {
+                    directory_name,
+                    authority_path,
+                });
+            }
+            Ok(_) => report.record_error(format!(
+                "packet recovery authority is not a file: {}",
+                authority_path.display()
+            )),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => report.record_error(format!(
+                "inspect packet recovery authority at {}: {error}",
+                authority_path.display()
+            )),
+        }
+    }
+    inventory.sort_by(|left, right| left.directory_name.cmp(&right.directory_name));
+    inventory
+}
+
+fn validate_packet_recovery_directory_key(
+    directory_name: &str,
+    task_handle: &str,
+) -> Result<()> {
+    let expected = task_packet_key(task_handle);
+    anyhow::ensure!(
+        directory_name == expected,
+        "packet recovery authority directory mismatch: expected {expected}, observed {directory_name}"
+    );
+    Ok(())
+}
+
+fn packet_recovery_task_handle(entry: &PacketPostCommitRecoveryEntry) -> Result<String> {
+    let authority: ActivePacketAuthority =
+        serde_json::from_reader(std::fs::File::open(&entry.authority_path)?)?;
+    let task_handle = authority.material.task_id;
+    validate_packet_recovery_directory_key(&entry.directory_name, &task_handle)?;
+    Ok(task_handle)
+}
+
+async fn recover_packet_post_commit_outboxes(
+    state: &McpState,
+) -> PacketPostCommitRecoveryReport {
+    let tasks_root = state
+        .root
+        .join("reports")
+        .join("context-packets")
+        .join("tasks");
+    let mut report = PacketPostCommitRecoveryReport::default();
+    let inventory = packet_post_commit_recovery_inventory(&tasks_root, &mut report);
+    for entry in inventory {
+        report.inspected = report.inspected.saturating_add(1);
+        let task_handle = match packet_recovery_task_handle(&entry) {
+            Ok(task_handle) => task_handle,
+            Err(error) => {
+                report.record_error(format!(
+                    "inspect packet recovery authority at {}: {error:#}",
+                    entry.authority_path.display()
+                ));
+                continue;
+            }
+        };
+        let packet_serializer = packet_task_serializer(&task_handle);
+        let _packet_guard = packet_serializer.lock().await;
+        let pending = match pending_packet_post_commit_outbox(state, &task_handle) {
+            Ok(Some(pending)) => pending,
+            Ok(None) => continue,
+            Err(error) => {
+                report.residual_pending = report.residual_pending.saturating_add(1);
+                report.record_error(format!(
+                    "inspect active packet outbox for {task_handle}: {error:#}"
+                ));
+                continue;
+            }
+        };
+        if !report.claim_replay_slot() {
+            report.record_residual(&task_handle, &pending);
+            continue;
+        }
+        match replay_packet_post_commit_outbox_with_transition_lock(
+            state,
+            &task_handle,
+            TaskId::from_str(&task_handle).ok(),
+            false,
+        )
+        .await
+        {
+            Ok(true) => {
+                report.replayed = report.replayed.saturating_add(1);
+                match pending_packet_post_commit_outbox(state, &task_handle) {
+                    Ok(Some(pending)) => report.record_residual(&task_handle, &pending),
+                    Ok(None) => {}
+                    Err(error) => {
+                        report.residual_pending = report.residual_pending.saturating_add(1);
+                        report.record_error(format!(
+                            "inspect replayed packet outbox for {task_handle}: {error:#}"
+                        ));
+                    }
+                }
+            }
+            Ok(false) => {}
+            Err(error) => {
+                report.record_residual(&task_handle, &pending);
+                report.record_error(format!(
+                    "replay packet outbox for {task_handle}: {error:#}"
+                ));
+            }
+        }
+    }
+    report
 }
 
 #[cfg(test)]
@@ -2408,6 +2708,80 @@ mod packet_commit_unit_tests {
             packet_enrichment_family_fence(vec![state(CognitiveProjectionFamily::Cue)], revision)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn packet_startup_inventory_is_name_ordered_and_complete_beyond_the_old_window() {
+        let fixture_root = std::env::temp_dir().join(format!(
+            "eliot-packet-recovery-inventory-{}",
+            WriteId::new_v7()
+        ));
+        for index in (0..300).rev() {
+            let active = fixture_root
+                .join(format!("task-{index:04}"))
+                .join("active");
+            std::fs::create_dir_all(&active).expect("create recovery inventory entry");
+            std::fs::write(active.join("authority.json"), b"{}").expect("write authority marker");
+        }
+
+        let mut report = PacketPostCommitRecoveryReport::default();
+        let inventory = packet_post_commit_recovery_inventory(&fixture_root, &mut report);
+
+        assert_eq!(inventory.len(), 300);
+        assert_eq!(inventory[0].directory_name, "task-0000");
+        assert_eq!(inventory[299].directory_name, "task-0299");
+        assert_eq!(report.error_count, 0);
+        std::fs::remove_dir_all(fixture_root).expect("remove recovery inventory fixture");
+    }
+
+    #[test]
+    fn packet_startup_inventory_binds_canonical_and_legacy_handles_to_their_directory() {
+        let canonical = TaskId::new_v7().to_string();
+        let legacy = "legacy-packet-task";
+
+        validate_packet_recovery_directory_key(&canonical, &canonical)
+            .expect("canonical task directory");
+        validate_packet_recovery_directory_key(&task_packet_key(legacy), legacy)
+            .expect("legacy task directory");
+        assert!(validate_packet_recovery_directory_key("misplaced", legacy).is_err());
+    }
+
+    #[test]
+    fn packet_startup_recovery_error_samples_are_bounded_but_counts_are_exact() {
+        let mut report = PacketPostCommitRecoveryReport::default();
+        for index in 0..(PACKET_OUTBOX_RECOVERY_ERROR_SAMPLE_LIMIT + 5) {
+            report.record_error(format!("error-{index}"));
+        }
+
+        assert_eq!(
+            report.error_count,
+            PACKET_OUTBOX_RECOVERY_ERROR_SAMPLE_LIMIT + 5
+        );
+        assert_eq!(
+            report.error_samples.len(),
+            PACKET_OUTBOX_RECOVERY_ERROR_SAMPLE_LIMIT
+        );
+        assert!(report.requires_attention());
+    }
+
+    #[test]
+    fn packet_startup_recovery_caps_slots_before_failing_replay_attempts() {
+        let mut report = PacketPostCommitRecoveryReport::default();
+        let mut admitted = 0;
+        for index in 0..(PACKET_OUTBOX_REPLAY_LIMIT + 5) {
+            if report.claim_replay_slot() {
+                admitted += 1;
+                report.record_error(format!("forced-replay-failure-{index}"));
+            } else {
+                report.residual_pending = report.residual_pending.saturating_add(1);
+            }
+        }
+
+        assert_eq!(admitted, PACKET_OUTBOX_REPLAY_LIMIT);
+        assert_eq!(report.attempted, PACKET_OUTBOX_REPLAY_LIMIT);
+        assert_eq!(report.error_count, PACKET_OUTBOX_REPLAY_LIMIT);
+        assert_eq!(report.residual_pending, 5);
+        assert!(!report.claim_replay_slot());
     }
 }
 

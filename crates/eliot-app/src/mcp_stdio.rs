@@ -918,6 +918,20 @@ impl McpDaemon {
             .recover()
             .await
             .context("recover cognitive projection coordinator before READY")?;
+        self.codex_controller.ensure_schema().await?;
+        let packet_recovery = recover_packet_post_commit_outboxes(&self.codex_controller).await;
+        if packet_recovery.requires_attention() {
+            tracing::warn!(
+                inspected = packet_recovery.inspected,
+                attempted = packet_recovery.attempted,
+                replayed = packet_recovery.replayed,
+                residual_pending = packet_recovery.residual_pending,
+                error_count = packet_recovery.error_count,
+                error_samples = ?packet_recovery.error_samples,
+                residual_samples = ?packet_recovery.residual_samples,
+                "packet post-commit startup recovery completed with residual work"
+            );
+        }
         Ok(())
     }
 

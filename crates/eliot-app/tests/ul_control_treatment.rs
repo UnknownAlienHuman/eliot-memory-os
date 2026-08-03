@@ -411,6 +411,219 @@ fn u9_6_invariant_gate_prefills_requires_and_accepts_an_explicit_waiver() -> Tes
     Ok(())
 }
 
+#[test]
+#[allow(clippy::too_many_lines)]
+fn u9_8_packet_startup_recovery_is_complete_isolated_and_effects_once() -> TestResult {
+    let _guard = test_guard();
+    if rerun_with_credential_gate(
+        "u9_8_packet_startup_recovery_is_complete_isolated_and_effects_once",
+    )? {
+        return Ok(());
+    }
+    let mut harness = Harness::start("packet-startup-recovery")?;
+    let project_id = ProjectId::new_v7();
+    let task_id = TaskId::new_v7();
+    harness.create_task(40, project_id, task_id)?;
+    let frame = material_frame(&[], &[]);
+    let canonical_response = compile(
+        &mut harness,
+        41,
+        project_id,
+        task_id,
+        Some(frame.clone()),
+        "src/invariant/lib.rs",
+    )?;
+    assert_eq!(
+        canonical_response["packet_admission"]["active_allowed"],
+        true
+    );
+
+    let legacy_task_handle = "legacy-packet-startup-recovery";
+    let mut legacy_frame = frame;
+    legacy_frame["expected_observable"] = json!("observe packet startup recovery");
+    let legacy_response = harness.client.tool_call(
+        42,
+        "eliot_compile_packet_l3",
+        &json!({
+            "project_id": project_id,
+            "task_id": legacy_task_handle,
+            "goal": "change src/invariant/lib.rs",
+            "candidate_handles": ["file:src/invariant/lib.rs"],
+            "max_tokens": 1_200,
+            "memory_mode": "include_case_candidates",
+            "material_frame": legacy_frame,
+        }),
+    )?;
+    assert_eq!(legacy_response["packet_admission"]["active_allowed"], true);
+
+    let tasks_root = harness
+        .runtime_path()
+        .join("reports")
+        .join("context-packets")
+        .join("tasks");
+    let canonical_task_root = tasks_root.join(task_id.to_string());
+    let legacy_task_root = tasks_root.join(
+        blake3::hash(legacy_task_handle.as_bytes())
+            .to_hex()
+            .to_string(),
+    );
+    let canonical_authority_path = canonical_task_root.join("active").join("authority.json");
+    let legacy_authority_path = legacy_task_root.join("active").join("authority.json");
+    let canonical_authority_bytes = std::fs::read(&canonical_authority_path)?;
+    let legacy_authority_bytes = std::fs::read(&legacy_authority_path)?;
+    let canonical_authority: Value = serde_json::from_slice(&canonical_authority_bytes)?;
+    let legacy_authority: Value = serde_json::from_slice(&legacy_authority_bytes)?;
+    let canonical_operation_id = canonical_authority["operation_id"]
+        .as_str()
+        .ok_or("canonical authority operation_id missing")?;
+    let legacy_operation_id = legacy_authority["operation_id"]
+        .as_str()
+        .ok_or("legacy authority operation_id missing")?;
+    let canonical_outbox = canonical_task_root
+        .join("outbox")
+        .join(canonical_operation_id);
+    let legacy_outbox = legacy_task_root.join("outbox").join(legacy_operation_id);
+    let canonical_intent: Value =
+        serde_json::from_slice(&std::fs::read(canonical_outbox.join("intent.json"))?)?;
+    let canonical_response_bytes = serde_json::to_vec_pretty(&canonical_intent["response"])?;
+    let canonical_latest_path = canonical_task_root.join("active").join("latest.json");
+    let canonical_revision_path =
+        canonical_task_root
+            .join("active")
+            .join("revisions")
+            .join(format!(
+                "{}-{canonical_operation_id}.json",
+                canonical_authority["material"]["at_revision"]
+                    .as_u64()
+                    .ok_or("canonical authority revision missing")?
+            ));
+    let baseline_assignment = harness.ul_assignment(project_id, task_id)?;
+    let baseline_predictions: Vec<eliot_types::PredictionRecord> = harness.observability_records(
+        project_id,
+        Some(task_id),
+        ObservabilityKind::PredictionRecord,
+    )?;
+    let baseline_revision = harness.current_revision(project_id)?;
+
+    harness.stop_daemon()?;
+    remove_terminal_packet_event(&canonical_outbox.join("events"))?;
+    remove_terminal_packet_event(&legacy_outbox.join("events"))?;
+    std::fs::remove_file(&canonical_latest_path)?;
+    std::fs::remove_file(&canonical_revision_path)?;
+    for index in 0..300 {
+        let corrupt_authority = tasks_root
+            .join(format!("0000-corrupt-authority-{index:04}"))
+            .join("active")
+            .join("authority.json");
+        std::fs::create_dir_all(
+            corrupt_authority
+                .parent()
+                .ok_or("corrupt authority parent missing")?,
+        )?;
+        std::fs::write(corrupt_authority, b"{not-json")?;
+    }
+    let last_corrupt_authority = tasks_root
+        .join("0000-corrupt-authority-0299")
+        .join("active")
+        .join("authority.json");
+    let misplaced_task_root = tasks_root.join("0001-misplaced-authority");
+    let misplaced_authority = misplaced_task_root.join("active").join("authority.json");
+    std::fs::create_dir_all(
+        misplaced_authority
+            .parent()
+            .ok_or("misplaced authority parent missing")?,
+    )?;
+    std::fs::write(&misplaced_authority, &canonical_authority_bytes)?;
+
+    harness.restart_daemon()?;
+
+    assert_eq!(
+        std::fs::read(&canonical_authority_path)?,
+        canonical_authority_bytes
+    );
+    assert_eq!(
+        std::fs::read(&legacy_authority_path)?,
+        legacy_authority_bytes
+    );
+    assert_eq!(
+        std::fs::read(&canonical_latest_path)?,
+        canonical_response_bytes
+    );
+    assert_eq!(
+        std::fs::read(&canonical_revision_path)?,
+        canonical_response_bytes
+    );
+    let canonical_events = packet_event_snapshot(&canonical_outbox.join("events"))?;
+    let legacy_events = packet_event_snapshot(&legacy_outbox.join("events"))?;
+    assert_eq!(canonical_events.len(), 3);
+    assert_eq!(legacy_events.len(), 3);
+    assert_eq!(
+        serde_json::from_slice::<Value>(&canonical_events[2].1)?["status"],
+        "complete"
+    );
+    let legacy_terminal: Value = serde_json::from_slice(&legacy_events[2].1)?;
+    assert_eq!(
+        legacy_terminal["status"], "complete",
+        "legacy terminal replay event: {legacy_terminal:#}"
+    );
+    assert_eq!(
+        packet_outbox_operation_count(&canonical_task_root.join("outbox"))?,
+        1
+    );
+    assert_eq!(
+        packet_outbox_operation_count(&legacy_task_root.join("outbox"))?,
+        1
+    );
+    assert_eq!(
+        harness.ul_assignment(project_id, task_id)?,
+        baseline_assignment
+    );
+    let recovered_predictions: Vec<eliot_types::PredictionRecord> = harness.observability_records(
+        project_id,
+        Some(task_id),
+        ObservabilityKind::PredictionRecord,
+    )?;
+    assert_eq!(recovered_predictions, baseline_predictions);
+    assert_eq!(harness.current_revision(project_id)?, baseline_revision);
+
+    harness.restart_daemon()?;
+
+    assert_eq!(
+        packet_event_snapshot(&canonical_outbox.join("events"))?,
+        canonical_events
+    );
+    assert_eq!(
+        packet_event_snapshot(&legacy_outbox.join("events"))?,
+        legacy_events
+    );
+    assert_eq!(
+        std::fs::read(&canonical_authority_path)?,
+        canonical_authority_bytes
+    );
+    assert_eq!(
+        std::fs::read(&legacy_authority_path)?,
+        legacy_authority_bytes
+    );
+    assert_eq!(
+        harness.ul_assignment(project_id, task_id)?,
+        baseline_assignment
+    );
+    let replayed_predictions: Vec<eliot_types::PredictionRecord> = harness.observability_records(
+        project_id,
+        Some(task_id),
+        ObservabilityKind::PredictionRecord,
+    )?;
+    assert_eq!(replayed_predictions, baseline_predictions);
+    assert_eq!(harness.current_revision(project_id)?, baseline_revision);
+    assert!(last_corrupt_authority.is_file());
+    assert_eq!(
+        std::fs::read(&misplaced_authority)?,
+        canonical_authority_bytes
+    );
+    assert!(!misplaced_task_root.join("outbox").exists());
+    Ok(())
+}
+
 fn compile(
     harness: &mut Harness,
     request_id: u64,
@@ -481,6 +694,17 @@ fn packet_outbox_operation_count(root: &std::path::Path) -> TestResult<usize> {
         }
     }
     Ok(count)
+}
+
+fn remove_terminal_packet_event(events_root: &std::path::Path) -> TestResult {
+    let events = packet_event_snapshot(events_root)?;
+    let (file_name, bytes) = events.last().ok_or("packet terminal event missing")?;
+    let terminal: Value = serde_json::from_slice(bytes)?;
+    if terminal["status"] != "complete" {
+        return Err("packet terminal event is not complete".into());
+    }
+    std::fs::remove_file(events_root.join(file_name))?;
+    Ok(())
 }
 
 fn canonical_json_hash(value: &Value) -> TestResult<String> {
