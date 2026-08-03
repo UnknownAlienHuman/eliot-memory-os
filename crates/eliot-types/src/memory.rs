@@ -3,7 +3,7 @@ use crate::cognition::{
     MemoryDecisionReceipt, PacketQualityReport,
 };
 use crate::lifecycle::{MemoryLifecyclePacketView, MemoryLifecycleState};
-use crate::records::BlobRef;
+use crate::records::{BlobRef, CanonicalMemoryL2Page};
 use crate::semantic_memory::{ExperienceBrief, MemoryNeedDecision};
 use crate::skill::{ProceduralSkillPacketView, SkillActivationRecord};
 use crate::ul::artifact::UlArtifact;
@@ -668,6 +668,10 @@ pub struct RecallL0Request {
 pub struct RecallL0Response {
     pub project_id: ProjectId,
     pub at_revision: MemoryRevision,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub projection_revision: Option<MemoryRevision>,
+    #[serde(default)]
+    pub projection_state: CognitiveProjectionReadState,
     pub handles: Vec<MemoryHandlePreview>,
     #[serde(default)]
     pub memory_confidence: MemoryConfidence,
@@ -675,6 +679,23 @@ pub struct RecallL0Response {
     #[serde(default)]
     pub rank_trace: L0RankTrace,
     pub truncation: TruncationInfo,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CognitiveProjectionReadState {
+    Published,
+    Stale,
+    Blocked,
+    #[default]
+    Unavailable,
+}
+
+impl CognitiveProjectionReadState {
+    #[must_use]
+    pub const fn is_published(self) -> bool {
+        matches!(self, Self::Published)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
@@ -787,6 +808,8 @@ pub struct FetchAtomsL2Response {
     pub failure_fingerprints: Vec<FailureFingerprint>,
     #[serde(default)]
     pub ul_artifacts: Vec<UlMemoryArtifact>,
+    #[serde(default)]
+    pub canonical_memory_pages: Vec<CanonicalMemoryL2Page>,
     pub relations: Vec<RelationSummary>,
     #[serde(default)]
     pub requested_handles: Vec<String>,

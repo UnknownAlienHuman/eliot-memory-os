@@ -24,10 +24,12 @@ IF $exact_handle != '' {
 } ELSE {
   SELECT
     handle,
-    authority_rank
+    math::max(authority_rank) AS authority_rank,
+    math::max(search::score(0)) AS relevance_score
   FROM memory_search_projection
-  WHERE project_id = $project_id AND search_document @OR@ $query_text
-  ORDER BY authority_rank DESC, handle ASC
+  WHERE project_id = $project_id AND search_document @0,OR@ $query_text
+  GROUP BY handle
+  ORDER BY relevance_score DESC, authority_rank DESC, handle ASC
   LIMIT $candidate_limit_plus_one
   EXPLAIN FULL
 };

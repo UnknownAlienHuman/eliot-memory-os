@@ -99,16 +99,10 @@ async fn t03_candidate_persists_normalized_bindings() -> TestResult {
         .claim_card_by_id(project_id, claim_id)
         .await?
         .ok_or("candidate claim missing")?;
-    let bindings: Vec<CueBinding> = serde_json::from_value(claim.payload["cue_bindings"].clone())?;
+    drop(writer);
+    actor.await?;
     CueIndexService::new(harness.store.clone())
-        .replace_record_bindings(
-            project_id,
-            &format!("claim:{claim_id}"),
-            "claim",
-            &claim.statement,
-            &bindings,
-            false,
-        )
+        .rebuild(project_id)
         .await?;
     let rows = harness.store.load_cue_rows(project_id).await?;
 
@@ -120,8 +114,6 @@ async fn t03_candidate_persists_normalized_bindings() -> TestResult {
     assert_eq!(rows[0].cue_value_norm, "crates/eliot-store/src/lib.rs");
     assert_eq!(rows[0].record_ref, format!("claim:{claim_id}"));
 
-    drop(writer);
-    actor.await?;
     Ok(())
 }
 

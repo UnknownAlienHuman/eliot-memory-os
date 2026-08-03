@@ -60,10 +60,10 @@ fn isolated_config() -> Option<SurrealServerConfig> {
 #[allow(clippy::print_stdout, clippy::too_many_lines)]
 async fn r01_large_corpus_retrieval_meets_target_workstation_slos() -> Result<(), Box<dyn Error>> {
     match std::env::var("ELIOT_COGNITIVE_FIELD_SCALE_STAGE").as_deref() {
-        Ok("pf1") => run_pf1().await,
-        Ok("pf2") => run_pf2().await,
-        Ok("pf3") => run_pf3().await,
-        Ok("r01") => run_r01().await,
+        Ok("pf1") => Box::pin(run_pf1()).await,
+        Ok("pf2") => Box::pin(run_pf2()).await,
+        Ok("pf3") => Box::pin(run_pf3()).await,
+        Ok("r01") => Box::pin(run_r01()).await,
         Ok(stage) => Err(format!(
             "unknown ELIOT_COGNITIVE_FIELD_SCALE_STAGE {stage:?}; expected pf1, pf2, pf3, or r01"
         )
@@ -77,21 +77,21 @@ async fn r01_large_corpus_retrieval_meets_target_workstation_slos() -> Result<()
 
 async fn run_pf1() -> Result<(), Box<dyn Error>> {
     let fixture = seed_fixture(PF1_LOGICAL_RECORDS, PF1_HISTORICAL_VERSIONS).await?;
-    let measurements = measure_queries(&fixture, 1, 1).await?;
+    let measurements = Box::pin(measure_queries(&fixture, 1, 1)).await?;
     emit_stage_result("pf1", &fixture, &measurements)?;
     Ok(())
 }
 
 async fn run_pf2() -> Result<(), Box<dyn Error>> {
     let fixture = seed_fixture(LOGICAL_RECORDS, HISTORICAL_VERSIONS).await?;
-    let measurements = measure_queries(&fixture, 1, 1).await?;
+    let measurements = Box::pin(measure_queries(&fixture, 1, 1)).await?;
     emit_stage_result("pf2", &fixture, &measurements)?;
     Ok(())
 }
 
 async fn run_pf3() -> Result<(), Box<dyn Error>> {
     let fixture = seed_fixture(LOGICAL_RECORDS, HISTORICAL_VERSIONS).await?;
-    let measurements = measure_queries(&fixture, 5, PF3_SAMPLE_COUNT).await?;
+    let measurements = Box::pin(measure_queries(&fixture, 5, PF3_SAMPLE_COUNT)).await?;
     let l0_p95_ms = percentile_95(&mut measurements.l0_ms.clone());
     let l2_p95_ms = percentile_95(&mut measurements.l2_ms.clone());
     emit_stage_result("pf3", &fixture, &measurements)?;
@@ -108,7 +108,7 @@ async fn run_pf3() -> Result<(), Box<dyn Error>> {
 
 async fn run_r01() -> Result<(), Box<dyn Error>> {
     let fixture = seed_fixture(LOGICAL_RECORDS, HISTORICAL_VERSIONS).await?;
-    let measurements = measure_queries(&fixture, 5, SAMPLE_COUNT).await?;
+    let measurements = Box::pin(measure_queries(&fixture, 5, SAMPLE_COUNT)).await?;
     let mut l0_ms = measurements.l0_ms.clone();
     let mut l2_ms = measurements.l2_ms.clone();
     let l0_p95_ms = percentile_95(&mut l0_ms);
@@ -263,7 +263,11 @@ async fn measure_queries(
     );
     for _ in 0..warmup_count {
         let _ = query_with_timeout("warm L0", fixture.store.recall_l0(&query)).await?;
-        let _ = query_with_timeout("warm L2", fixture.store.fetch_atoms_l2(&l2)).await?;
+        let _ = Box::pin(query_with_timeout(
+            "warm L2",
+            fixture.store.fetch_atoms_l2(&l2),
+        ))
+        .await?;
     }
     let wall_started = Instant::now();
     let mut l0_ms = Vec::with_capacity(sample_count);
@@ -288,10 +292,10 @@ async fn measure_queries(
         );
 
         let started = Instant::now();
-        let expanded = query_with_timeout(
+        let expanded = Box::pin(query_with_timeout(
             &format!("L2 sample {sample}"),
             fixture.store.fetch_atoms_l2(&l2),
-        )
+        ))
         .await?;
         l2_ms.push(started.elapsed().as_secs_f64() * 1_000.0);
         l2_claims_returned.push(expanded.claims.len());

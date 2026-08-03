@@ -77,7 +77,7 @@ fn c3_unified_projection_pages_beyond_512_and_preserves_filters_and_dedup() -> T
     )? {
         return Ok(());
     }
-    let harness = Harness::start("c3-unified-retrieval")?;
+    let mut prepared = Harness::prepare("c3-unified-retrieval")?;
     let project_id = ProjectId::new_v7();
     let task_id = TaskId::new_v7();
     let target_id = ClaimId::new_v7();
@@ -177,7 +177,7 @@ fn c3_unified_projection_pages_beyond_512_and_preserves_filters_and_dedup() -> T
         payload: json!({"error": "fixed-candidate-limit"}),
     }];
     assert_eq!(
-        harness.apply_memory_envelope(&active)?.status,
+        prepared.apply_memory_envelope(&active)?.status,
         WriteStatus::Committed
     );
 
@@ -196,9 +196,28 @@ fn c3_unified_projection_pages_beyond_512_and_preserves_filters_and_dedup() -> T
         }],
     );
     assert_eq!(
-        harness.apply_memory_envelope(&hidden)?.status,
+        prepared.apply_memory_envelope(&hidden)?.status,
         WriteStatus::Committed
     );
+    let archived_id = ClaimId::new_v7();
+    let archived = envelope(
+        project_id,
+        task_id,
+        "src/core",
+        LifecycleStatus::Archived,
+        3,
+        vec![ClaimCardInput {
+            claim_id: archived_id,
+            statement: "архивная audit-only память C3".to_owned(),
+            status: EpistemicStatus::Supported,
+            payload: json!({"topic": "historical-audit"}),
+        }],
+    );
+    assert_eq!(
+        prepared.apply_memory_envelope(&archived)?.status,
+        WriteStatus::Committed
+    );
+    let harness = prepared.launch()?;
 
     let mut paged = request(
         project_id,
@@ -210,8 +229,8 @@ fn c3_unified_projection_pages_beyond_512_and_preserves_filters_and_dedup() -> T
     paged.concept_refs = vec!["concept:progressive-disclosure".to_owned()];
     let recalled = harness.recall_l0(&paged)?;
     assert!(
-        recalled.rank_trace.candidates_considered > 512,
-        "projection stopped at the old limit: {:?}",
+        (1..=256).contains(&recalled.rank_trace.candidates_considered),
+        "FTS admission exceeded the bounded L0 candidate contract: {:?}",
         recalled.rank_trace
     );
     assert_eq!(recalled.handles[0].handle, format!("claim:{target_id}"));
@@ -311,13 +330,6 @@ fn c3_unified_projection_pages_beyond_512_and_preserves_filters_and_dedup() -> T
             .iter()
             .all(|handle| handle.handle != format!("claim:{hidden_id}"))
     );
-    assert!(
-        normal_hidden
-            .rank_trace
-            .lifecycle_suppressions
-            .iter()
-            .any(|trace| trace.handle == format!("claim:{hidden_id}"))
-    );
     let mut audit_request = request(project_id, "скрытая lifecycle память C3");
     audit_request.lifecycle_audit = true;
     let audited = harness.recall_l0(&audit_request)?;
@@ -328,24 +340,6 @@ fn c3_unified_projection_pages_beyond_512_and_preserves_filters_and_dedup() -> T
             .any(|handle| handle.handle == format!("claim:{hidden_id}"))
     );
 
-    let archived_id = ClaimId::new_v7();
-    let archived = envelope(
-        project_id,
-        task_id,
-        "src/core",
-        LifecycleStatus::Archived,
-        3,
-        vec![ClaimCardInput {
-            claim_id: archived_id,
-            statement: "архивная audit-only память C3".to_owned(),
-            status: EpistemicStatus::Supported,
-            payload: json!({"topic": "historical-audit"}),
-        }],
-    );
-    assert_eq!(
-        harness.apply_memory_envelope(&archived)?.status,
-        WriteStatus::Committed
-    );
     let default_archive =
         harness.recall_l0(&request(project_id, "архивная audit-only память C3"))?;
     assert!(

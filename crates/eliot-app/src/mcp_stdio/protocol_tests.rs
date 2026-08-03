@@ -1597,6 +1597,8 @@ fn operator_memory_projection_exposes_rank_suppression_and_exact_resolution_fiel
     let l0 = RecallL0Response {
         project_id,
         at_revision: MemoryRevision::new(19),
+        projection_revision: Some(MemoryRevision::new(19)),
+        projection_state: eliot_types::CognitiveProjectionReadState::Published,
         handles: vec![eliot_types::MemoryHandlePreview {
             handle: active_handle.clone(),
             record_type: "claim_card".to_owned(),
@@ -1688,6 +1690,7 @@ fn operator_memory_projection_exposes_rank_suppression_and_exact_resolution_fiel
         tool_observations: Vec::new(),
         failure_fingerprints: Vec::new(),
         ul_artifacts: Vec::new(),
+        canonical_memory_pages: Vec::new(),
         relations: Vec::new(),
         requested_handles: vec![format!("claim:{active_id}"), "claim:missing".to_owned()],
         returned_handles: vec![format!("claim:{active_id}")],
@@ -1732,6 +1735,8 @@ fn operator_memory_projection_surfaces_no_useful_memory() {
     let response = RecallL0Response {
         project_id: ProjectId::new_v7(),
         at_revision: MemoryRevision::new(7),
+        projection_revision: Some(MemoryRevision::new(7)),
+        projection_state: eliot_types::CognitiveProjectionReadState::Published,
         handles: Vec::new(),
         memory_confidence: eliot_types::MemoryConfidence::None,
         query_mode: "query_aware_semantic_lexical_relational_v2".to_owned(),

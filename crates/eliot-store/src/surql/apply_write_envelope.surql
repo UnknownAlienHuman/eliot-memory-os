@@ -1,3 +1,5 @@
+BEGIN TRANSACTION;
+
 LET $revision = $envelope.project_sequence_hint;
 LET $sequence = $envelope.project_sequence_hint;
 LET $receipt_id = $envelope.write_id;
@@ -63,7 +65,10 @@ LET $canonical_kinds = [
   'project_charter',
   'system_map',
   'subsystem_capsule',
-  'capsule_build'
+  'capsule_build',
+  'memory_blob_segment',
+  'cue_binding_page',
+  'memory_blob_manifest'
 ];
 LET $existing_receipt = SELECT * FROM ONLY type::record('write_receipt', $receipt_id);
 LET $idempotency_result = IF $existing_receipt != NONE {
@@ -246,9 +251,67 @@ FOR $observation IN $envelope.tool_observations {
       $canonical_payload.cue_preview_fragments.map(|$fragment| <string> $fragment),
       ''
     );
+    LET $canonical_record_id = <string> array::join(
+      $canonical_payload.canonical_record_id_fragments.map(|$fragment| <string> $fragment),
+      ''
+    );
+    LET $existing_canonical = SELECT *
+      FROM ONLY type::record('canonical_record', $canonical_record_id);
+    IF $observation.payload.receipt_kind IN ['memory_blob_segment', 'cue_binding_page', 'memory_blob_manifest']
+      AND $existing_canonical != NONE
+      AND $existing_canonical.receipt_body_json_b64 != <string> $canonical_payload.receipt_body_json_b64 {
+      THROW 'canonical_capacity_immutable_record_conflict';
+    };
+    IF $observation.payload.receipt_kind = 'memory_blob_manifest' {
+      LET $segment_ordinals = SELECT VALUE receipt_body.ordinal
+        FROM canonical_record
+        WHERE project_id = $envelope.project_id
+          AND receipt_kind = 'memory_blob_segment'
+          AND receipt_body.parent_handle = $body.memory_handle
+          AND receipt_body.logical_kind = $body.logical_kind
+          AND receipt_body.segment_count = $body.segment_count
+          AND receipt_body.segment_set_hash_blake3 = $body.segment_set_hash_blake3
+          AND receipt_body.blob.algorithm = $body.blob.algorithm
+          AND receipt_body.blob.digest_hex = $body.blob.digest_hex
+          AND receipt_body.blob.size_bytes = $body.blob.size_bytes
+          AND receipt_body.blob.relative_path = $body.blob.relative_path;
+      LET $distinct_segment_ordinals = array::distinct(array::flatten([$segment_ordinals]));
+      LET $invalid_segment_ordinals = $distinct_segment_ordinals.filter(|$ordinal| {
+        $ordinal < 0 OR $ordinal >= $body.segment_count
+      });
+      IF array::len(array::flatten([$segment_ordinals])) != $body.segment_count
+        OR array::len($distinct_segment_ordinals) != $body.segment_count
+        OR array::len($invalid_segment_ordinals) > 0 {
+        THROW 'canonical_capacity_parent_before_complete_segments';
+      };
+      LET $cue_page_ordinals = SELECT VALUE receipt_body.page_ordinal
+        FROM canonical_record
+        WHERE project_id = $envelope.project_id
+          AND receipt_kind = 'cue_binding_page'
+          AND receipt_body.parent_handle = $body.memory_handle
+          AND receipt_body.blob.algorithm = $body.blob.algorithm
+          AND receipt_body.blob.digest_hex = $body.blob.digest_hex
+          AND receipt_body.blob.size_bytes = $body.blob.size_bytes
+          AND receipt_body.blob.relative_path = $body.blob.relative_path
+          AND receipt_body.page_count = $body.cue_page_count
+          AND receipt_body.page_set_hash_blake3 = $body.cue_page_set_hash_blake3;
+      LET $distinct_cue_page_ordinals = array::distinct(array::flatten([$cue_page_ordinals]));
+      LET $invalid_cue_page_ordinals = $distinct_cue_page_ordinals.filter(|$ordinal| {
+        $ordinal < 0 OR $ordinal >= $body.cue_page_count
+      });
+      IF array::len(array::flatten([$cue_page_ordinals])) != $body.cue_page_count
+        OR array::len($distinct_cue_page_ordinals) != $body.cue_page_count
+        OR array::len($invalid_cue_page_ordinals) > 0 {
+        THROW 'canonical_capacity_parent_before_complete_cue_pages';
+      };
+    };
 
-    UPSERT type::record('canonical_record', $observation.observation_id) CONTENT {
-      record_id: $observation.observation_id,
+    IF !(
+      $observation.payload.receipt_kind IN ['memory_blob_segment', 'cue_binding_page', 'memory_blob_manifest']
+      AND $existing_canonical != NONE
+    ) {
+    UPSERT type::record('canonical_record', $canonical_record_id) CONTENT {
+      record_id: $canonical_record_id,
       receipt_kind: $observation.payload.receipt_kind,
       project_id: $envelope.project_id,
       task_id: $envelope.task_id,
@@ -269,6 +332,7 @@ FOR $observation IN $envelope.tool_observations {
       input_hash: $envelope.input_hash,
       created_at: $envelope.created_at,
       updated_at: $envelope.created_at
+    };
     };
   };
 };
@@ -378,12 +442,20 @@ UPSERT type::record('memory_transition', $envelope.write_id) CONTENT {
   created_at: time::now()
 };
 
+IF $fail_before_projection_outbox {
+  THROW 'failure_injection:before_cognitive_projection_outbox';
+};
+
 UPSERT type::record('memory_search_outbox', $envelope.write_id) CONTENT {
-  write_id: $envelope.write_id,
+  write_id: <string> $envelope.write_id,
   project_id: $envelope.project_id,
   updated_revision: $revision,
+  families: ['search', 'cue', 'dependency_dirty'],
   status: 'pending',
-  created_at: time::now(),
+  attempt_count: 0,
+  next_attempt_at: <datetime> $now,
+  created_at: <datetime> $now,
+  updated_at: <datetime> $now,
 };
 
 UPSERT type::record('write_receipt', $receipt_id) CONTENT {
@@ -402,7 +474,12 @@ UPSERT type::record('write_receipt', $receipt_id) CONTENT {
     $envelope.evidence_atoms.*.evidence_id,
     $envelope.tool_observations.*.observation_id,
     $envelope.tool_observations[WHERE payload.receipt_kind IN $canonical_kinds].map(|$observation| {
-      string::concat('canonical_record:', <string> $observation.observation_id)
+      RETURN <string> array::join(
+        $canonical_payloads.filter(|$payload| {
+          <string> $payload.observation_id = <string> $observation.observation_id
+        })[0].canonical_record_ref_fragments.map(|$fragment| <string> $fragment),
+        ''
+      );
     }),
     $envelope.claims.*.claim_id,
     $envelope.verification_runs.*.verification_id
@@ -416,6 +493,7 @@ UPSERT type::record('write_receipt', $receipt_id) CONTENT {
 
 };
 
+COMMIT TRANSACTION;
 RETURN IF $idempotency_result != NONE {
   $idempotency_result
 } ELSE {

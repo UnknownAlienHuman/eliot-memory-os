@@ -1,8 +1,8 @@
 use eliot_engine::{CueIndexService, ObservedCue};
 use eliot_store::CanonicalStore;
 use eliot_types::{
-    CredentialProviderKind, CueIndexRow, CueKind, CueMatchMode, CueStrength, GovernorConfig,
-    ProjectId, cue_row_id, ul_token_estimate,
+    CognitiveProjectionReadState, CredentialProviderKind, CueIndexRow, CueKind, CueMatchMode,
+    CueStrength, GovernorConfig, MemoryRevision, ProjectId, cue_row_id, ul_token_estimate,
 };
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -62,9 +62,15 @@ async fn t03_firing_order_and_cap() -> TestResult {
             .await?;
     }
 
-    let result = CueIndexService::new(harness.store.clone())
-        .fire(project, &[file_cue()])
-        .await?;
+    let service = CueIndexService::new(harness.store.clone());
+    let unavailable = service.fire(project, &[file_cue()]).await?;
+    assert_eq!(
+        unavailable.projection_state,
+        CognitiveProjectionReadState::Unavailable
+    );
+    assert!(unavailable.fired.is_empty());
+    service.load_persisted_projection(project).await?;
+    let result = service.fire(project, &[file_cue()]).await?;
     let refs = result
         .fired
         .iter()
@@ -81,6 +87,17 @@ async fn t03_firing_order_and_cap() -> TestResult {
         refs.iter().position(|item| *item == "claim:a")
             < refs.iter().position(|item| *item == "claim:b")
     );
+    service.rebuild(project).await?;
+    let cleared = service.fire(project, &[file_cue()]).await?;
+    assert_eq!(
+        cleared.projection_state,
+        CognitiveProjectionReadState::Published
+    );
+    assert!(cleared.fired.is_empty());
+    service.mark_stale(project, MemoryRevision::new(1))?;
+    let stale = service.fire(project, &[file_cue()]).await?;
+    assert_eq!(stale.projection_state, CognitiveProjectionReadState::Stale);
+    assert!(stale.fired.is_empty());
     Ok(())
 }
 
@@ -108,11 +125,12 @@ async fn t03_rebuild_after_restart_is_identical() -> TestResult {
         .await?;
 
     let first_service = CueIndexService::new(harness.store.clone());
+    first_service.load_persisted_projection(project).await?;
     let first = first_service.fire(project, &[file_cue()]).await?;
     drop(first_service);
-    let second = CueIndexService::new(harness.store.clone())
-        .fire(project, &[file_cue()])
-        .await?;
+    let second_service = CueIndexService::new(harness.store.clone());
+    second_service.load_persisted_projection(project).await?;
+    let second = second_service.fire(project, &[file_cue()]).await?;
     assert_eq!(serde_json::to_vec(&first)?, serde_json::to_vec(&second)?);
     Ok(())
 }
@@ -158,9 +176,9 @@ async fn t03_no_cross_project_or_stale_leak() -> TestResult {
         )
         .await?;
 
-    let result = CueIndexService::new(harness.store.clone())
-        .fire(project_a, &[file_cue()])
-        .await?;
+    let service = CueIndexService::new(harness.store.clone());
+    service.load_persisted_projection(project_a).await?;
+    let result = service.fire(project_a, &[file_cue()]).await?;
     assert_eq!(result.matched, 2);
     assert_eq!(result.deduplicated, 0);
     assert_eq!(result.suppressed, 1);
@@ -192,7 +210,13 @@ fn row(
     lifecycle: &str,
 ) -> CueIndexRow {
     CueIndexRow {
-        row_id: cue_row_id(project_id, CueKind::FilePath, PATH_CUE, record_ref),
+        row_id: cue_row_id(
+            project_id,
+            CueKind::FilePath,
+            CueMatchMode::Exact,
+            PATH_CUE,
+            record_ref,
+        ),
         project_id,
         cue_kind: CueKind::FilePath,
         cue_value_norm: PATH_CUE.to_owned(),

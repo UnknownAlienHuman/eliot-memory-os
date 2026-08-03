@@ -1,4 +1,7 @@
-use crate::{EngineError, resolve_canonical_case_dispositions};
+use crate::{
+    EngineError, cognitive_projection::CognitiveProjectionCoordinatorHandle,
+    resolve_canonical_case_dispositions,
+};
 use eliot_store::{CanonicalStore, ControlWal, StoreError, WalPendingWrite, WalWriteState};
 use eliot_types::{
     CognitiveRunContract, CognitiveRunTerminal, CognitiveSharedGateBinding, MemoryLifecycleState,
@@ -288,6 +291,7 @@ struct ControlWalHandle {
 pub struct ControlWalActor {
     wal: ControlWal,
     rx: mpsc::Receiver<ControlWalMessage>,
+    shutdown_rx: Option<oneshot::Receiver<()>>,
     staging_batch_size: usize,
 }
 
@@ -297,12 +301,22 @@ impl ControlWalActor {
         queue_capacity: usize,
         staging_batch_size: usize,
     ) -> (ControlWalHandle, Self) {
+        Self::channel_inner(wal, queue_capacity, staging_batch_size, None)
+    }
+
+    fn channel_inner(
+        wal: ControlWal,
+        queue_capacity: usize,
+        staging_batch_size: usize,
+        shutdown_rx: Option<oneshot::Receiver<()>>,
+    ) -> (ControlWalHandle, Self) {
         let (tx, rx) = mpsc::channel(queue_capacity.max(1));
         (
             ControlWalHandle { tx },
             Self {
                 wal,
                 rx,
+                shutdown_rx,
                 staging_batch_size: staging_batch_size.max(1),
             },
         )
@@ -311,11 +325,25 @@ impl ControlWalActor {
     #[allow(clippy::too_many_lines)]
     async fn run(mut self) {
         let mut deferred = VecDeque::new();
+        let mut shutdown = self.shutdown_rx.take();
+        let mut shutdown_armed = shutdown.is_some();
         loop {
             let message = if let Some(message) = deferred.pop_front() {
                 Some(message)
             } else {
-                self.rx.recv().await
+                tokio::select! {
+                    biased;
+                    () = async {
+                        if let Some(receiver) = shutdown.as_mut() {
+                            let _ = receiver.await;
+                        }
+                    }, if shutdown_armed => {
+                        self.rx.close();
+                        shutdown_armed = false;
+                        self.rx.recv().await
+                    }
+                    message = self.rx.recv() => message,
+                }
             };
             let Some(message) = message else {
                 break;
@@ -1118,10 +1146,23 @@ pub struct WriterHandle {
 pub struct WriterActor {
     wal_actor: ControlWalActor,
     wal_handle: ControlWalHandle,
+    wal_shutdown_tx: Option<oneshot::Sender<()>>,
     store: CanonicalStore,
     rx: mpsc::Receiver<WriterMessage>,
+    shutdown_rx: Option<oneshot::Receiver<()>>,
+    projection_notifier: Option<CognitiveProjectionCoordinatorHandle>,
     config: WriterConfig,
     metrics: Arc<WriterRuntimeMetrics>,
+}
+
+pub struct WriterShutdownHandle {
+    shutdown_tx: oneshot::Sender<()>,
+}
+
+impl WriterShutdownHandle {
+    pub fn shutdown(self) {
+        let _ = self.shutdown_tx.send(());
+    }
 }
 
 impl WriterActor {
@@ -1130,15 +1171,57 @@ impl WriterActor {
         store: CanonicalStore,
         config: &WriterConfig,
     ) -> (WriterHandle, Self) {
+        Self::channel_inner(wal, store, config, None, None)
+    }
+
+    pub fn channel_with_projection_notifier(
+        wal: ControlWal,
+        store: CanonicalStore,
+        config: &WriterConfig,
+        projection_notifier: CognitiveProjectionCoordinatorHandle,
+    ) -> (WriterHandle, Self, WriterShutdownHandle) {
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let (handle, actor) = Self::channel_inner(
+            wal,
+            store,
+            config,
+            Some(projection_notifier),
+            Some(shutdown_rx),
+        );
+        (handle, actor, WriterShutdownHandle { shutdown_tx })
+    }
+
+    fn channel_inner(
+        wal: ControlWal,
+        store: CanonicalStore,
+        config: &WriterConfig,
+        projection_notifier: Option<CognitiveProjectionCoordinatorHandle>,
+        shutdown_rx: Option<oneshot::Receiver<()>>,
+    ) -> (WriterHandle, Self) {
         let queue_capacity = config.queue_capacity.max(1);
         let lane_count = config.lane_count.max(1).min(queue_capacity);
         let (tx, rx) = mpsc::channel(queue_capacity);
         let metrics = Arc::new(WriterRuntimeMetrics::new(lane_count));
-        let (wal_handle, wal_actor) = ControlWalActor::channel(
-            wal,
-            config.control_wal_queue_capacity,
-            config.control_wal_staging_batch_size,
-        );
+        let (wal_shutdown_tx, wal_shutdown_rx) = if shutdown_rx.is_some() {
+            let (tx, rx) = oneshot::channel();
+            (Some(tx), Some(rx))
+        } else {
+            (None, None)
+        };
+        let (wal_handle, wal_actor) = if let Some(wal_shutdown_rx) = wal_shutdown_rx {
+            ControlWalActor::channel_inner(
+                wal,
+                config.control_wal_queue_capacity,
+                config.control_wal_staging_batch_size,
+                Some(wal_shutdown_rx),
+            )
+        } else {
+            ControlWalActor::channel(
+                wal,
+                config.control_wal_queue_capacity,
+                config.control_wal_staging_batch_size,
+            )
+        };
         (
             WriterHandle {
                 tx,
@@ -1151,8 +1234,11 @@ impl WriterActor {
             Self {
                 wal_actor,
                 wal_handle,
+                wal_shutdown_tx,
                 store,
                 rx,
+                shutdown_rx,
+                projection_notifier,
                 config: WriterConfig {
                     queue_capacity,
                     lane_count,
@@ -1170,8 +1256,11 @@ impl WriterActor {
         let Self {
             wal_actor,
             wal_handle,
+            wal_shutdown_tx,
             store,
             rx,
+            shutdown_rx,
+            projection_notifier,
             config,
             metrics,
         } = self;
@@ -1179,17 +1268,22 @@ impl WriterActor {
         let worker = WriterWorker {
             wal: wal_handle,
             store,
+            projection_notifier,
             retry_limit: config.unknown_commit_retry_limit,
             retry_delay: config.unknown_commit_retry_delay,
         };
         WriterCoordinator {
             ingress: rx,
+            shutdown: shutdown_rx,
             worker,
             config,
             metrics,
         }
         .run()
         .await;
+        if let Some(shutdown_tx) = wal_shutdown_tx {
+            let _ = shutdown_tx.send(());
+        }
         let _ = wal_task.await;
     }
 }
@@ -1268,6 +1362,7 @@ struct LaneCompletion {
 /// unrelated projects assigned to the same lane.
 pub struct WriterCoordinator {
     ingress: mpsc::Receiver<WriterMessage>,
+    shutdown: Option<oneshot::Receiver<()>>,
     worker: WriterWorker,
     config: WriterConfig,
     metrics: Arc<WriterRuntimeMetrics>,
@@ -1314,6 +1409,8 @@ impl WriterCoordinator {
         let mut active_projects = HashSet::<ProjectId>::new();
         let mut paused_projects = ProjectPauseTable::default();
         let mut delayed_count = 0usize;
+        let mut shutdown = self.shutdown.take();
+        let mut shutdown_armed = shutdown.is_some();
 
         loop {
             while let Some(lane_index) = idle_lanes.pop_front() {
@@ -1362,6 +1459,14 @@ impl WriterCoordinator {
             }
 
             tokio::select! {
+                () = async {
+                    if let Some(receiver) = shutdown.as_mut() {
+                        let _ = receiver.await;
+                    }
+                }, if shutdown_armed => {
+                    self.ingress.close();
+                    shutdown_armed = false;
+                }
                 message = self.ingress.recv(), if ingress_open => {
                     let Some(message) = message else {
                         ingress_open = false;
@@ -1469,6 +1574,7 @@ impl WriterCoordinator {
 struct WriterWorker {
     wal: ControlWalHandle,
     store: CanonicalStore,
+    projection_notifier: Option<CognitiveProjectionCoordinatorHandle>,
     retry_limit: u8,
     retry_delay: Duration,
 }
@@ -1928,7 +2034,9 @@ impl WriterWorker {
                     if receipt.input_hash == envelope.input_hash
                         && receipt.project_id == envelope.project_id =>
                 {
-                    return Ok(WriteApplyOutcome::complete(Ok(idempotent_replay(*receipt))));
+                    let receipt = idempotent_replay(*receipt);
+                    self.notify_projection_committed(&envelope, &receipt);
+                    return Ok(WriteApplyOutcome::complete(Ok(receipt)));
                 }
                 WalWriteState::Committed(_) => {
                     return Ok(WriteApplyOutcome::complete(Err(
@@ -1946,7 +2054,11 @@ impl WriterWorker {
                         match self.store.write_receipt_by_id(&envelope.write_id).await {
                             Ok(Some(receipt)) if receipt.input_hash == envelope.input_hash => {
                                 return Ok(WriteApplyOutcome::complete(
-                                    self.handle_store_receipt(idempotent_replay(receipt)).await,
+                                    self.handle_store_receipt(
+                                        &envelope,
+                                        idempotent_replay(receipt),
+                                    )
+                                    .await,
                                 ));
                             }
                             Ok(Some(receipt)) => {
@@ -2009,7 +2121,9 @@ impl WriterWorker {
                     if receipt.input_hash == envelope.input_hash
                         && receipt.project_id == envelope.project_id =>
                 {
-                    return Ok(WriteApplyOutcome::complete(Ok(idempotent_replay(*receipt))));
+                    let receipt = idempotent_replay(*receipt);
+                    self.notify_projection_committed(&envelope, &receipt);
+                    return Ok(WriteApplyOutcome::complete(Ok(receipt)));
                 }
                 WalWriteState::Pending(pending)
                     if pending.envelope.input_hash == envelope.input_hash
@@ -2038,7 +2152,7 @@ impl WriterWorker {
 
         match self.store.apply_write_envelope(&envelope).await {
             Ok(receipt) => Ok(WriteApplyOutcome::complete(
-                self.handle_store_receipt(receipt).await,
+                self.handle_store_receipt(&envelope, receipt).await,
             )),
             Err(error) => {
                 if is_ambiguous_commit_error(&error) {
@@ -2126,6 +2240,7 @@ impl WriterWorker {
 
     async fn handle_store_receipt(
         &self,
+        envelope: &MemoryWriteEnvelope,
         receipt: WriteReceipt,
     ) -> Result<WriteReceipt, EngineError> {
         if receipt.status == WriteStatus::Rejected {
@@ -2137,7 +2252,14 @@ impl WriterWorker {
             return Err(EngineError::WriteRejected(reason));
         }
         self.wal.mark_committed(receipt.clone()).await?;
+        self.notify_projection_committed(envelope, &receipt);
         Ok(receipt)
+    }
+
+    fn notify_projection_committed(&self, envelope: &MemoryWriteEnvelope, receipt: &WriteReceipt) {
+        if let Some(notifier) = &self.projection_notifier {
+            notifier.notify_committed(envelope.clone(), receipt.clone());
+        }
     }
 
     async fn reconcile_unknown_commit(
@@ -2152,7 +2274,8 @@ impl WriterWorker {
         match self.store.write_receipt_by_id(&envelope.write_id).await {
             Ok(Some(receipt)) if receipt.input_hash == envelope.input_hash => {
                 Ok(WriteApplyOutcome::complete(
-                    self.handle_store_receipt(idempotent_replay(receipt)).await,
+                    self.handle_store_receipt(&envelope, idempotent_replay(receipt))
+                        .await,
                 ))
             }
             Ok(Some(receipt)) => {
@@ -2318,7 +2441,10 @@ impl WriterHandle {
 
 #[cfg(test)]
 mod tests {
-    use super::{ControlWalActor, ProjectPauseTable, WriterConfig, default_writer_lane_count};
+    use super::{
+        ControlWalActor, ProjectPauseTable, WriterActor, WriterConfig, WriterMessage,
+        WriterRequest, WriterShutdownHandle, default_writer_lane_count,
+    };
     use eliot_store::{CanonicalStore, ControlWal};
     use eliot_types::{
         AgentId, ControlWalConfig, GovernorConfig, IdempotencyOptions, LifecycleStatus,
@@ -2326,6 +2452,8 @@ mod tests {
         TaintClass, Visibility, WriteId,
     };
     use time::OffsetDateTime;
+    use tokio::sync::oneshot;
+    use tokio::time::Duration;
 
     #[test]
     fn default_lane_count_is_cpu_bounded() {
@@ -2419,6 +2547,77 @@ mod tests {
         actor_task.await.map_err(|error| {
             crate::EngineError::WriteRejected(format!("writer actor join failed: {error}"))
         })?;
+        let wal = ControlWal::open(&ControlWalConfig {
+            path: path.display().to_string(),
+        })?;
+        assert_eq!(wal.pending_count()?, 0);
+        drop(wal);
+        let _ = std::fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn explicit_shutdown_closes_ingress_and_drains_buffered_writes()
+    -> Result<(), crate::EngineError> {
+        let root = std::env::temp_dir().join(format!(
+            "eliot-c7-writer-drain-shutdown-{}",
+            WriteId::new_v7()
+        ));
+        let path = root.join("control.redb");
+        let wal = ControlWal::open(&ControlWalConfig {
+            path: path.display().to_string(),
+        })?;
+        let store = CanonicalStore::new(GovernorConfig::default().db.surreal);
+        let config = WriterConfig {
+            queue_capacity: 4,
+            lane_count: 2,
+            ..WriterConfig::default()
+        };
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let (handle, actor) =
+            WriterActor::channel_inner(wal, store, &config, None, Some(shutdown_rx));
+        let mut responses = Vec::new();
+        for ordinal in 0..3 {
+            let (response_tx, response_rx) = oneshot::channel();
+            let mut envelope = envelope(
+                WriteId::new_v7(),
+                ProjectId::new_v7(),
+                &format!("shutdown-{ordinal}"),
+            );
+            envelope.authority =
+                format!("Authorization: Bearer synthetic-shutdown-secret-{ordinal}");
+            handle.enqueue(WriterMessage::Write(WriterRequest {
+                envelope,
+                response_tx,
+            }))?;
+            responses.push(response_rx);
+        }
+
+        WriterShutdownHandle { shutdown_tx }.shutdown();
+        let actor_task = tokio::spawn(actor.run());
+        for response in responses {
+            let result = tokio::time::timeout(Duration::from_secs(2), response)
+                .await
+                .map_err(|_| {
+                    crate::EngineError::WriteRejected(
+                        "buffered writer response timed out during shutdown".to_owned(),
+                    )
+                })?
+                .map_err(|_| crate::EngineError::WriterClosed)?;
+            assert!(matches!(result, Err(crate::EngineError::WriteRejected(_))));
+        }
+        tokio::time::timeout(Duration::from_secs(2), actor_task)
+            .await
+            .map_err(|_| {
+                crate::EngineError::WriteRejected(
+                    "writer actor did not join after explicit shutdown".to_owned(),
+                )
+            })?
+            .map_err(|error| {
+                crate::EngineError::WriteRejected(format!("writer actor join failed: {error}"))
+            })?;
+
+        drop(handle);
         let wal = ControlWal::open(&ControlWalConfig {
             path: path.display().to_string(),
         })?;

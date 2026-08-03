@@ -16,7 +16,7 @@ use serde_json::{Value, json};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
-use support::{Harness, TestResult, rerun_with_credential_gate, test_guard};
+use support::{Harness, PreparedHarness, TestResult, rerun_with_credential_gate, test_guard};
 
 #[test]
 fn t06_boot_delivers_charter_map_once() -> TestResult {
@@ -36,9 +36,10 @@ fn t06_boot_delivers_charter_map_once() -> TestResult {
     assert!(ipc_source.contains("\"ul/onboard\""));
     assert!(dispatch_source.contains("run_ul_onboard_from_daemon"));
 
-    let mut harness = Harness::start("t06-boot")?;
     let project_id = ProjectId::new_v7();
-    seed_pyramid(&harness, project_id)?;
+    let mut prepared = Harness::prepare("t06-boot")?;
+    seed_pyramid(&mut prepared, project_id)?;
+    let mut harness = prepared.launch()?;
     let first = current_state(&mut harness, 600, project_id, "src/a/lib.rs")?;
     let second = current_state(&mut harness, 601, project_id, "src/a/lib.rs")?;
     let control = harness.client.tool_call(
@@ -90,9 +91,10 @@ fn t06_packet_delivers_relevant_capsule() -> TestResult {
     if rerun_with_credential_gate("t06_packet_delivers_relevant_capsule")? {
         return Ok(());
     }
-    let mut harness = Harness::start("t06-packet")?;
     let project_id = ProjectId::new_v7();
-    seed_pyramid(&harness, project_id)?;
+    let mut prepared = Harness::prepare("t06-packet")?;
+    seed_pyramid(&mut prepared, project_id)?;
+    let mut harness = prepared.launch()?;
     let response = harness.client.tool_call(
         610,
         "eliot_compile_packet_l3",
@@ -147,11 +149,12 @@ fn h1_boot_and_delivery_dedup_are_project_scoped() -> TestResult {
     if rerun_with_credential_gate("h1_boot_and_delivery_dedup_are_project_scoped")? {
         return Ok(());
     }
-    let mut harness = Harness::start("h1-project-boot")?;
     let project_a = ProjectId::new_v7();
     let project_b = ProjectId::new_v7();
-    seed_pyramid(&harness, project_a)?;
-    seed_pyramid(&harness, project_b)?;
+    let mut prepared = Harness::prepare("h1-project-boot")?;
+    seed_pyramid(&mut prepared, project_a)?;
+    seed_pyramid(&mut prepared, project_b)?;
+    let mut harness = prepared.launch()?;
 
     let first_a = current_state(&mut harness, 620, project_a, "src/a/lib.rs")?;
     let first_b = current_state(&mut harness, 621, project_b, "src/a/lib.rs")?;
@@ -190,13 +193,13 @@ fn h3_custom_root_freshness_and_dot_boundary_reach_runtime_packet() -> TestResul
     {
         return Ok(());
     }
-    let mut harness = Harness::start("h3-custom-root")?;
     let project_root = TempProjectRoot::new("h3-custom-root")?;
     let source_path = project_root.path().join("src").join("lib.rs");
     fs::create_dir_all(source_path.parent().ok_or("source parent missing")?)?;
     fs::write(&source_path, "pub fn before() {}\n")?;
     let project_id = ProjectId::new_v7();
-    seed_pyramid(&harness, project_id)?;
+    let mut prepared = Harness::prepare("h3-custom-root")?;
+    seed_pyramid(&mut prepared, project_id)?;
     let root_concept = ConceptNode {
         entrypoint_refs: vec!["file:src/lib.rs".to_owned()],
         ..concept(project_id, "concept-root", "root", ".")
@@ -230,7 +233,7 @@ fn h3_custom_root_freshness_and_dot_boundary_reach_runtime_packet() -> TestResul
         &module_card,
         &promoted.artifact,
     )?;
-    harness.seed(&ul_command(
+    prepared.seed(&ul_command(
         project_id,
         vec![UlArtifact::ConceptNode(root_concept.clone())],
         vec![RelationInput {
@@ -240,7 +243,7 @@ fn h3_custom_root_freshness_and_dot_boundary_reach_runtime_packet() -> TestResul
         }],
     ))?;
     let capsule_id = promoted.artifact.capsule_id.clone();
-    harness.seed(&ul_command(
+    prepared.seed(&ul_command(
         project_id,
         vec![
             UlArtifact::SubsystemCapsule(promoted.artifact),
@@ -252,6 +255,7 @@ fn h3_custom_root_freshness_and_dot_boundary_reach_runtime_packet() -> TestResul
             to: format!("concept:{}", root_concept.concept_id),
         }],
     ))?;
+    let mut harness = prepared.launch()?;
 
     let fresh = compile_packet(&mut harness, 624, project_id, "src/lib.rs")?;
     let fresh_capsule = fresh["ul_understanding"]["capsules"]
@@ -325,7 +329,6 @@ fn h7_inconclusive_predictions_and_handle_boot_receipts_are_truthful() -> TestRe
     )? {
         return Ok(());
     }
-    let mut harness = Harness::start("h7-handle-boot")?;
     let project_id = ProjectId::new_v7();
     let charter_body = format!(
         "WHAT\n{}\n\nFOR WHOM\nagents\n\nTOP INVARIANTS\n- exact receipts\n\nNON-GOALS\n- payload boot\n\nVOCABULARY\n- handle",
@@ -335,7 +338,9 @@ fn h7_inconclusive_predictions_and_handle_boot_receipts_are_truthful() -> TestRe
         "SYSTEMS\n{}\n\nFLOWS\n- handle-only delivery",
         "system ".repeat(1_400)
     );
-    seed_boot_artifacts(&harness, project_id, &charter_body, &map_body)?;
+    let mut prepared = Harness::prepare("h7-handle-boot")?;
+    seed_boot_artifacts(&mut prepared, project_id, &charter_body, &map_body)?;
+    let mut harness = prepared.launch()?;
     let response = current_state(&mut harness, 626, project_id, "src/lib.rs")?;
     let receipts: Vec<InjectionReceipt> =
         harness.observability_records(project_id, None, ObservabilityKind::InjectionReceipt)?;
@@ -440,7 +445,7 @@ fn assert_fv1_root_boundary_consistency(
 }
 
 #[allow(clippy::too_many_lines)]
-fn seed_pyramid(harness: &Harness, project_id: ProjectId) -> TestResult {
+fn seed_pyramid(prepared: &mut PreparedHarness, project_id: ProjectId) -> TestResult {
     let project_suffix = project_id.to_string();
     let concepts = [
         concept(
@@ -456,7 +461,7 @@ fn seed_pyramid(harness: &Harness, project_id: ProjectId) -> TestResult {
             "src/b",
         ),
     ];
-    harness.seed(&ul_command(
+    prepared.seed(&ul_command(
         project_id,
         concepts
             .iter()
@@ -502,7 +507,7 @@ fn seed_pyramid(harness: &Harness, project_id: ProjectId) -> TestResult {
             500,
             ul_token_estimate(&capsule.body_md),
         );
-        harness.seed(&ul_command(
+        prepared.seed(&ul_command(
             project_id,
             vec![
                 UlArtifact::SubsystemCapsule(capsule),
@@ -536,7 +541,7 @@ fn seed_pyramid(harness: &Harness, project_id: ProjectId) -> TestResult {
         600,
         ul_token_estimate(&map.body_md),
     );
-    harness.seed(&ul_command(
+    prepared.seed(&ul_command(
         project_id,
         vec![
             UlArtifact::SystemMap(map),
@@ -564,7 +569,7 @@ fn seed_pyramid(harness: &Harness, project_id: ProjectId) -> TestResult {
         200,
         ul_token_estimate(&charter.body_md),
     );
-    harness.seed(&ul_command(
+    prepared.seed(&ul_command(
         project_id,
         vec![
             UlArtifact::ProjectCharter(charter),
@@ -576,7 +581,7 @@ fn seed_pyramid(harness: &Harness, project_id: ProjectId) -> TestResult {
 }
 
 fn seed_boot_artifacts(
-    harness: &Harness,
+    prepared: &mut PreparedHarness,
     project_id: ProjectId,
     charter_body: &str,
     map_body: &str,
@@ -600,7 +605,7 @@ fn seed_boot_artifacts(
         build_id: "build-charter-over-budget".to_owned(),
         cue_bindings: cue("test project"),
     };
-    harness.seed(&ul_command(
+    prepared.seed(&ul_command(
         project_id,
         vec![
             UlArtifact::SystemMap(map.clone()),
@@ -615,7 +620,7 @@ fn seed_boot_artifacts(
         ],
         Vec::new(),
     ))?;
-    harness.seed(&ul_command(
+    prepared.seed(&ul_command(
         project_id,
         vec![
             UlArtifact::ProjectCharter(charter.clone()),

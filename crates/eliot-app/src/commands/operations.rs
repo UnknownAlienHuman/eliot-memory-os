@@ -618,7 +618,10 @@ async fn run_published_daemon(
             &starting_publication,
             config,
             store,
-        )?;
+        )
+        .await?;
+        let daemon_result = async {
+        mcp_daemon.recover_memory_runtime().await?;
         let operation_watchdog_shutdown =
             eliot_engine::runtime_supervision::CancellationToken::new();
         let operation_supervisor = std::sync::Arc::new(
@@ -673,7 +676,10 @@ async fn run_published_daemon(
             std::sync::Arc::clone(&mcp_daemon),
             ipc_shutdown_rx.clone(),
         ));
-        let ipc_task = tokio::spawn(ipc_server.serve(mcp_daemon, ipc_shutdown_rx));
+        let ipc_task = tokio::spawn(ipc_server.serve(
+            std::sync::Arc::clone(&mcp_daemon),
+            ipc_shutdown_rx,
+        ));
         let bundle = write_runtime_bundle(
             config_path,
             supervisor.service_statuses(),
@@ -730,6 +736,7 @@ async fn run_published_daemon(
             let _ = scheduler_task.await;
             tracing::warn!("aborted in-flight UL weekly exam during daemon shutdown");
         }
+        mcp_daemon.shutdown_memory_runtime().await?;
         supervisor
             .shutdown_all(shutdown_deadline_after(Duration::from_secs(5)))
             .await?;
@@ -744,6 +751,17 @@ async fn run_published_daemon(
             Some("daemon-run".to_owned()),
         ))?;
         Ok(publication_cleaned)
+        }
+        .await;
+        let memory_shutdown = mcp_daemon.shutdown_memory_runtime().await;
+        match (daemon_result, memory_shutdown) {
+            (Ok(publication_cleaned), Ok(())) => Ok(publication_cleaned),
+            (Err(runtime_error), Ok(())) => Err(runtime_error),
+            (Ok(_), Err(shutdown_error)) => Err(shutdown_error),
+            (Err(runtime_error), Err(shutdown_error)) => Err(runtime_error.context(format!(
+                "memory runtime cleanup also failed: {shutdown_error:#}"
+            ))),
+        }
     }
     .await
 }

@@ -377,6 +377,8 @@ fn l0_fixture() -> RecallL0Response {
     RecallL0Response {
         project_id: ProjectId::new_v7(),
         at_revision: MemoryRevision::new(1),
+        projection_revision: Some(MemoryRevision::new(1)),
+        projection_state: eliot_types::CognitiveProjectionReadState::Published,
         handles: vec![
             handle("claim:active", MemoryLifecycleState::Active),
             handle("claim:suppressed", MemoryLifecycleState::Suppressed),

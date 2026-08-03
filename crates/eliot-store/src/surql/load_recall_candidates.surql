@@ -170,6 +170,9 @@ LET $raw = IF $kind = 'claim' {
     IF payload.distraction = true { true } ELSE { false } AS distraction_signal
   FROM tool_observation
   WHERE project_id = $project_id
+    AND payload.receipt_kind NOT IN [
+      'memory_blob_segment', 'cue_binding_page', 'memory_blob_manifest'
+    ]
     AND ($lifecycle_audit OR lifecycle_status NOT IN [
       'archived', 'quarantined', 'forgotten', 'hard_deleted'
     ])
@@ -224,40 +227,77 @@ LET $raw = IF $kind = 'claim' {
       string::concat('capsule:', <string> receipt_body.capsule_id)
     } ELSE IF receipt_kind = 'project_charter' {
       string::concat('charter:', <string> receipt_body.charter_id)
+    } ELSE IF receipt_kind = 'memory_blob_segment' {
+      <string> receipt_body.parent_handle
     } ELSE {
       string::concat('map:', <string> receipt_body.map_id)
     } AS handle,
     <string> receipt_kind AS record_type,
-    <string> receipt_body.body_md AS preview,
-    string::concat(
-      <string> receipt_body.body_md, ' ', <string> receipt_body.path, ' ',
-      <string> receipt_body.concept_id, ' ', <string> receipt_body.source_refs,
-      ' ', <string> receipt_body.concept_refs, ' ',
-      <string> receipt_body.subsystem_concept_refs
-    ) AS search_text,
-    string::concat(
-      <string> receipt_body.path, ' ', <string> receipt_body.symbol,
-      ' ', <string> receipt_body.error, ' ', <string> receipt_body.task_class
-    ) AS cue_text,
-    <string> receipt_body.path AS scope_text,
-    string::concat(
-      <string> receipt_body.concept_id, ' ', <string> receipt_body.concept_refs,
-      ' ', <string> receipt_body.subsystem_concept_refs
-    ) AS concept_text,
+    IF receipt_kind = 'memory_blob_segment' {
+      <string> receipt_body.preview_text
+    } ELSE {
+      <string> receipt_body.body_md
+    } AS preview,
+    IF receipt_kind = 'memory_blob_segment' {
+      <string> receipt_body.search_text
+    } ELSE {
+      string::concat(
+        <string> receipt_body.body_md, ' ', <string> receipt_body.path, ' ',
+        <string> receipt_body.concept_id, ' ', <string> receipt_body.source_refs,
+        ' ', <string> receipt_body.concept_refs, ' ',
+        <string> receipt_body.subsystem_concept_refs
+      )
+    } AS search_text,
+    IF receipt_kind = 'memory_blob_segment' {
+      ''
+    } ELSE {
+      string::concat(
+        <string> receipt_body.path, ' ', <string> receipt_body.symbol,
+        ' ', <string> receipt_body.error, ' ', <string> receipt_body.task_class
+      )
+    } AS cue_text,
+    IF receipt_kind = 'memory_blob_segment' { '' }
+      ELSE { <string> receipt_body.path } AS scope_text,
+    IF receipt_kind = 'memory_blob_segment' {
+      ''
+    } ELSE {
+      string::concat(
+        <string> receipt_body.concept_id, ' ', <string> receipt_body.concept_refs,
+        ' ', <string> receipt_body.subsystem_concept_refs
+      )
+    } AS concept_text,
     task_id,
-    IF receipt_body.status != NONE {
+    IF receipt_kind = 'memory_blob_segment' {
+      'observed'
+    } ELSE IF receipt_body.status != NONE {
       <string> receipt_body.status
     } ELSE { 'supported' } AS status,
-    IF receipt_body.lifecycle != NONE {
+    IF receipt_kind = 'memory_blob_segment' {
+      'active'
+    } ELSE IF receipt_body.lifecycle != NONE {
       receipt_body.lifecycle
     } ELSE { 'active' } AS lifecycle_state,
-    IF receipt_body.status = 'verified' { 80 }
+    IF receipt_kind = 'memory_blob_segment' { 35 }
+      ELSE IF receipt_body.status = 'verified' { 80 }
       ELSE IF receipt_body.status = 'candidate' { 10 }
       ELSE { 50 } AS authority_rank,
     false AS negative_memory,
     memory_revision,
     project_sequence,
-    30 AS verification_value,
+    IF receipt_kind = 'memory_blob_segment' { 20 } ELSE { 30 }
+      AS verification_value,
+    IF receipt_kind = 'memory_blob_segment' {
+      <int> receipt_body.ordinal
+    } ELSE { NONE } AS source_segment_ordinal,
+    IF receipt_kind = 'memory_blob_segment' {
+      <int> receipt_body.segment_count
+    } ELSE { NONE } AS source_segment_count,
+    IF receipt_kind = 'memory_blob_segment' {
+      <int> receipt_body.byte_start
+    } ELSE { NONE } AS source_byte_start,
+    IF receipt_kind = 'memory_blob_segment' {
+      <int> receipt_body.byte_end_exclusive
+    } ELSE { NONE } AS source_byte_end_exclusive,
     IF receipt_body.changed_outcome = true { 1 } ELSE { 0 } AS known_decision_delta,
     IF receipt_body.beneficial_use_count != NONE {
       <int> receipt_body.beneficial_use_count
@@ -269,8 +309,30 @@ LET $raw = IF $kind = 'claim' {
   FROM canonical_record
   WHERE project_id = $project_id
     AND receipt_kind IN [
-      'module_card', 'subsystem_capsule', 'project_charter', 'system_map'
+      'module_card', 'subsystem_capsule', 'project_charter', 'system_map',
+      'memory_blob_segment'
     ]
+    AND (
+      receipt_kind != 'memory_blob_segment'
+      OR receipt_body.blob.digest_hex = array::first(
+        SELECT VALUE receipt_body.blob.digest_hex
+        FROM canonical_record
+        WHERE project_id = $parent.project_id
+          AND receipt_kind = 'memory_blob_manifest'
+          AND subject_ref = $parent.subject_ref
+        ORDER BY memory_revision DESC, project_sequence DESC, record_id DESC
+        LIMIT 1
+      )
+      AND receipt_body.segment_set_hash_blake3 = array::first(
+        SELECT VALUE receipt_body.segment_set_hash_blake3
+        FROM canonical_record
+        WHERE project_id = $parent.project_id
+          AND receipt_kind = 'memory_blob_manifest'
+          AND subject_ref = $parent.subject_ref
+        ORDER BY memory_revision DESC, project_sequence DESC, record_id DESC
+        LIMIT 1
+      )
+    )
     AND ($lifecycle_audit
       OR receipt_body.lifecycle = NONE
       OR receipt_body.lifecycle NOT IN [

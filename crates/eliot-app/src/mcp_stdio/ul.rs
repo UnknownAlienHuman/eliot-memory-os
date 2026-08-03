@@ -1,7 +1,7 @@
 use eliot_engine::{
-    CueIndexService, InjectionPlanner, MetacognitionService, PredictionService, TouchedSetRegistry,
-    UlDependencyService, UlLedgerService, UlTokenPolicyService, WriterHandle, capsule_freshness,
-    render_capsule_with_dirty,
+    CognitiveProjectionCoordinatorHandle, CueIndexService, InjectionPlanner, MetacognitionService,
+    PredictionService, TouchedSetRegistry, UlDependencyService, UlLedgerService,
+    UlTokenPolicyService, WriterHandle, capsule_freshness, render_capsule_with_dirty,
 };
 use eliot_store::{CanonicalRecord, CanonicalStore};
 use eliot_types::{
@@ -11,9 +11,9 @@ use eliot_types::{
     UlTaskExperimentAssignment, path_matches_boundary, ul_token_estimate,
 };
 use serde_json::{Value, json};
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 const PACKET_PYRAMID_BUDGET: u32 = 1_500;
 const UL_FALLBACK_MATCH_TOKEN_LIMIT: usize = 12;
@@ -32,17 +32,16 @@ pub(super) struct PyramidPacketEnrichment {
 }
 
 pub(super) struct UlRuntime {
-    pub cue_index: Arc<CueIndexService>,
     pub touched: Arc<TouchedSetRegistry>,
     pub planner: Arc<InjectionPlanner>,
-    pub dependency: Arc<UlDependencyService>,
+    _dependency: Arc<UlDependencyService>,
     pub ledger: Arc<UlLedgerService>,
     pub token_policy: Arc<UlTokenPolicyService>,
     pub prediction: Arc<PredictionService>,
+    projection: CognitiveProjectionCoordinatorHandle,
     store: CanonicalStore,
     project_root: PathBuf,
     runtime_root: PathBuf,
-    dependency_ready: Mutex<HashSet<ProjectId>>,
 }
 
 impl UlRuntime {
@@ -51,13 +50,15 @@ impl UlRuntime {
         writer: WriterHandle,
         runtime_root: &Path,
         activation_enable_min_edges: u32,
+        cue_index: Arc<CueIndexService>,
+        dependency: Arc<UlDependencyService>,
+        projection: CognitiveProjectionCoordinatorHandle,
     ) -> Self {
-        let cue_index = Arc::new(CueIndexService::new(store.clone()));
         let touched = Arc::new(TouchedSetRegistry::new());
         let project_root = eliot_engine::canonical_project_root(runtime_root);
         let planner = Arc::new(
             InjectionPlanner::with_project_root_and_activation_min_edges(
-                Arc::clone(&cue_index),
+                cue_index,
                 store.clone(),
                 writer.clone(),
                 Arc::clone(&touched),
@@ -65,7 +66,6 @@ impl UlRuntime {
                 activation_enable_min_edges,
             ),
         );
-        let dependency = Arc::new(UlDependencyService::new(store.clone()));
         let ledger = Arc::new(UlLedgerService::with_runtime_root(
             store.clone(),
             runtime_root,
@@ -76,17 +76,16 @@ impl UlRuntime {
         ));
         let prediction = Arc::new(PredictionService::new(store.clone(), writer));
         Self {
-            cue_index,
             touched,
             planner,
-            dependency,
+            _dependency: dependency,
             ledger,
             token_policy,
             prediction,
+            projection,
             store,
             project_root,
             runtime_root: runtime_root.to_path_buf(),
-            dependency_ready: Mutex::new(HashSet::new()),
         }
     }
 
@@ -102,6 +101,7 @@ impl UlRuntime {
             policy.injection_mode
         })))
     }
+
     pub async fn effective_injection_mode(
         &self,
         project_id: ProjectId,
@@ -155,24 +155,6 @@ impl UlRuntime {
         Ok(())
     }
 
-    pub async fn ensure_dependency_state(&self, project_id: ProjectId) -> anyhow::Result<()> {
-        if self
-            .dependency_ready
-            .lock()
-            .map_err(|_| anyhow::anyhow!("UL dependency readiness lock poisoned"))?
-            .contains(&project_id)
-        {
-            return Ok(());
-        }
-        self.dependency.rebuild_index(project_id).await?;
-        self.dependency.scan_project(project_id).await?;
-        self.dependency_ready
-            .lock()
-            .map_err(|_| anyhow::anyhow!("UL dependency readiness lock poisoned"))?
-            .insert(project_id);
-        Ok(())
-    }
-
     pub async fn observe_successful_tool(
         &self,
         project_id: ProjectId,
@@ -181,7 +163,6 @@ impl UlRuntime {
         arguments: &Value,
         observed_cues: &[eliot_types::ObservedCue],
     ) -> anyhow::Result<()> {
-        self.ensure_dependency_state(project_id).await?;
         if !eliot_engine::is_mutation_tool(tool_name, arguments) {
             return Ok(());
         }
@@ -190,12 +171,9 @@ impl UlRuntime {
             .filter(|cue| cue.kind == eliot_types::CueKind::FilePath)
             .map(|cue| cue.value.clone())
             .collect::<Vec<_>>();
-        self.dependency
-            .mark_paths_dirty(
-                project_id,
-                &changed_paths,
-                &format!("tool:{tool_name}:{session_id}"),
-            )
+        let event_ref = format!("tool:{tool_name}:{session_id}");
+        self.projection
+            .enqueue_dependency_dirty(project_id, &event_ref, &changed_paths)
             .await?;
         Ok(())
     }

@@ -1,8 +1,9 @@
 use crate::{EngineError, MemoryLifecycleService};
 use eliot_store::CanonicalStore;
 use eliot_types::{
-    CurrentStateRequest, CurrentStateResponse, FetchAtomsL2Request, FetchAtomsL2Response,
-    GraphHealthResponse, MemoryRevision, ReadConsistencyMode, RecallL0Request, RecallL0Response,
+    CognitiveProjectionReadState, CurrentStateRequest, CurrentStateResponse, FetchAtomsL2Request,
+    FetchAtomsL2Response, GraphHealthResponse, MemoryRevision, ReadConsistencyMode,
+    RecallL0Request, RecallL0Response,
 };
 use std::collections::HashSet;
 use tokio::time::{Duration, Instant, sleep};
@@ -44,13 +45,27 @@ impl ReadService {
         let started = Instant::now();
         loop {
             let response = self.store.recall_l0(request).await?;
-            if revision_satisfies(response.at_revision, target) {
+            let projection_revision = if request.lifecycle_audit {
+                Some(response.at_revision)
+            } else {
+                response.projection_revision
+            };
+            let projection_published = request.lifecycle_audit
+                || response.projection_state == CognitiveProjectionReadState::Published;
+            if projection_published
+                && projection_revision.is_some_and(|revision| revision_satisfies(revision, target))
+            {
                 return Ok(MemoryLifecycleService::filter_l0_response(
                     response,
                     request.lifecycle_audit,
                 ));
             }
-            ensure_can_wait(started, target, response.at_revision)?;
+            if target.is_none() || started.elapsed() >= STALE_READ_TIMEOUT {
+                return Ok(MemoryLifecycleService::filter_l0_response(
+                    response,
+                    request.lifecycle_audit,
+                ));
+            }
             sleep(STALE_READ_POLL).await;
         }
     }
@@ -102,6 +117,9 @@ pub fn filter_required_exact_l2_response(response: &mut FetchAtomsL2Response, ha
     response
         .ul_artifacts
         .retain(|artifact| handles.contains(normalized_public_handle(&artifact.handle)));
+    response
+        .canonical_memory_pages
+        .retain(|page| handles.contains(normalized_public_handle(&page.requested_handle)));
     response.relations.retain(|relation| {
         handles.contains(normalized_public_handle(&relation.from))
             && handles.contains(normalized_public_handle(&relation.to))
@@ -112,6 +130,7 @@ pub fn filter_required_exact_l2_response(response: &mut FetchAtomsL2Response, ha
         + response.tool_observations.len()
         + response.failure_fingerprints.len()
         + response.ul_artifacts.len()
+        + response.canonical_memory_pages.len()
         + response.relations.len();
 }
 
@@ -192,8 +211,9 @@ mod tests {
         filter_exact_l2_response, filter_required_exact_l2_response, normalized_public_handle,
     };
     use eliot_types::{
-        ClaimCard, ClaimId, EpistemicStatus, EvidenceAtom, EvidenceId, FetchAtomsL2Response,
-        MemoryRevision, ProjectId, RelationSummary, RelationType, TruncationInfo,
+        CanonicalMemoryL2Page, ClaimCard, ClaimId, EpistemicStatus, EvidenceAtom, EvidenceId,
+        FetchAtomsL2Response, MemoryRevision, ProjectId, RelationSummary, RelationType,
+        TruncationInfo,
     };
     use serde_json::json;
 
@@ -221,6 +241,7 @@ mod tests {
                 tool_observations: Vec::new(),
                 failure_fingerprints: Vec::new(),
                 ul_artifacts: Vec::new(),
+                canonical_memory_pages: Vec::new(),
                 relations: vec![RelationSummary {
                     relation_type: RelationType::Supports,
                     from: claim_handle.clone(),
@@ -294,5 +315,25 @@ mod tests {
             &["file:src/a.rs".to_owned(), "file:src/b.rs".to_owned()],
         );
         assert_eq!(response.relations.len(), 1);
+    }
+
+    #[test]
+    fn canonical_memory_pages_obey_required_exact_scope() {
+        let (mut response, _) = scoped_response();
+        let memory_handle = "memory:large-parent".to_owned();
+        response.canonical_memory_pages = vec![CanonicalMemoryL2Page {
+            requested_handle: memory_handle.clone(),
+            resolved_parent_handle: Some(memory_handle.clone()),
+            requested_segment_id: None,
+            manifest: None,
+            segments: Vec::new(),
+            continuation: None,
+            truncated: false,
+        }];
+
+        filter_required_exact_l2_response(&mut response, std::slice::from_ref(&memory_handle));
+
+        assert_eq!(response.canonical_memory_pages.len(), 1);
+        assert_eq!(response.truncation.returned, 1);
     }
 }

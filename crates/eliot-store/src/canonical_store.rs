@@ -1,35 +1,39 @@
+use crate::blob_store::verify_canonical_memory_child_set;
 use crate::surreal_server::{ReadySurrealServer, SurrealServerSupervisor};
 use crate::{
-    CanonicalAutonomyRunView, CanonicalLifecycleView, CanonicalRecord, CanonicalReplayView,
-    CanonicalSleepView, DbClientSet, MAX_CANONICAL_RECORDS, NamedSurqlOp, SleepCandidatesResponse,
-    StoreError, SurqlTemplateRegistry,
+    BlobStore, CanonicalAutonomyRunView, CanonicalLifecycleView, CanonicalRecord,
+    CanonicalReplayView, CanonicalSleepView, DbClientSet, MAX_CANONICAL_RECORDS, NamedSurqlOp,
+    SleepCandidatesResponse, StoreError, SurqlTemplateRegistry,
 };
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD_NO_PAD;
 use eliot_types::{
     AutonomyRunContract, AutonomyRunTransitionReceipt, BlobReachabilityRef, BlobReferenceSnapshot,
-    BlobRetentionClass, BlobRetentionRef, CanonicalMetaMetricEvidence,
-    CanonicalReplayExecutionRecord, CanonicalTraceCompletenessContract, ClaimId, CueIndexRow,
-    CueRecordSource, CurrentStateRequest, CurrentStateResponse, EpistemicStatus,
-    ExperimentalMetaPolicyCandidate, FetchAtomsL2Request, FetchAtomsL2Response,
-    GraphHealthResponse, HarnessExperimentRecord, InjectionReceipt, L0CollapsedDuplicateTrace,
-    L0FeatureScore, L0RankTrace, L0SuppressionTrace, LifecycleStatus, MemoryConfidence,
-    MemoryHandlePreview, MemoryInfluenceTrace, MemoryRevision, MemoryStateTransition,
-    MemoryTrajectoryCorrectness, MemoryWriteEnvelope, MetaIsolationRejectionRecord,
-    MetaPolicyExecutionAction, MetaPolicyExecutionReceipt, MinorityPressureRecord,
-    ObservabilityKind, ObservabilityWriteEnvelope, ObservabilityWriteReceipt,
-    ObservabilityWriteStatus, ProjectId, ProjectSequence, RecallL0Request, RecallL0Response,
-    ReplayAudit, ReplayRun, SealedReplayCaseRecord, SealedReplayInputSnapshotRecord,
-    SealedReplaySetRecord, SleepCandidateArtifact, SleepConsolidationBundle, SleepConsolidationRun,
-    SurrealServerConfig, TaintClass, TaskContract, TaskId, ToolObservation, TruncationInfo,
-    VerificationId, VerificationRun, Visibility, WriteId, WriteReceipt, WriteStatus,
+    BlobRetentionClass, BlobRetentionRef, CanonicalMemoryL2Page, CanonicalMemoryManifest,
+    CanonicalMemorySegment, CanonicalMemorySegmentRef, CanonicalMetaMetricEvidence,
+    CanonicalReplayExecutionRecord, CanonicalTraceCompletenessContract, ClaimId,
+    CognitiveProjectionReadState, CueBindingPage, CueIndexRow, CueRecordSource,
+    CurrentStateRequest, CurrentStateResponse, EpistemicStatus, ExperimentalMetaPolicyCandidate,
+    FetchAtomsL2Request, FetchAtomsL2Response, GraphHealthResponse, HarnessExperimentRecord,
+    InjectionReceipt, L0CollapsedDuplicateTrace, L0FeatureScore, L0RankTrace, L0SuppressionTrace,
+    LifecycleStatus, MemoryConfidence, MemoryHandlePreview, MemoryInfluenceTrace, MemoryRevision,
+    MemoryStateTransition, MemoryTrajectoryCorrectness, MemoryWriteEnvelope,
+    MetaIsolationRejectionRecord, MetaPolicyExecutionAction, MetaPolicyExecutionReceipt,
+    MinorityPressureRecord, ObservabilityKind, ObservabilityWriteEnvelope,
+    ObservabilityWriteReceipt, ObservabilityWriteStatus, ProjectId, ProjectSequence,
+    RecallL0Request, RecallL0Response, ReplayAudit, ReplayRun, SealedReplayCaseRecord,
+    SealedReplayInputSnapshotRecord, SealedReplaySetRecord, SleepCandidateArtifact,
+    SleepConsolidationBundle, SleepConsolidationRun, SurrealServerConfig, TaintClass, TaskContract,
+    TaskId, ToolObservation, TruncationInfo, VerificationId, VerificationRun, Visibility, WriteId,
+    WriteReceipt, WriteStatus, cue_binding_page_id,
 };
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::sync::Arc;
-use time::OffsetDateTime;
+use time::format_description::well_known::Rfc3339;
+use time::{Duration as TimeDuration, OffsetDateTime};
 use tokio::time::{Duration, sleep};
 
 const SCHEMA_MIGRATE_RETRY_ATTEMPTS: u8 = 30;
@@ -39,6 +43,12 @@ const MAX_BLOB_REFERENCE_RECORDS: u16 = 512;
 const MAX_EXACT_L2_HANDLES: usize = 64;
 const MAX_EXACT_L2_REQUEST_HANDLES: usize = 512;
 const MAX_EXACT_L2_HANDLE_BYTES: usize = 512;
+const CANONICAL_MEMORY_L2_PAGE_SIZE: u16 = 32;
+const CANONICAL_MEMORY_L2_MANIFEST_PAGE_SIZE: u16 = 1;
+const CANONICAL_MEMORY_L2_MAX_SCANNED_ROWS: u64 = 4_096;
+const CANONICAL_MEMORY_ADMISSION_PAGE_SIZE: u16 = 1;
+const CANONICAL_MEMORY_ADMISSION_MAX_SCANNED_ROWS: u64 = 4_096;
+const CANONICAL_MEMORY_CHILD_BODY_MAX_BYTES: usize = 128 * 1024;
 const SECRET_SCAN_PAGE_SIZE: usize = 50;
 const SECRET_SCAN_MAX_RECORDS_PER_TABLE: usize = 10_000;
 const SECRET_SCAN_TABLES: &[&str] = &[
@@ -84,10 +94,12 @@ const RECALL_CANDIDATE_KINDS: &[&str] = &[
 const MAX_RECALL_RESULTS: usize = 12;
 const MAX_MEMORY_SEARCH_CANDIDATES: usize = 256;
 const MAX_MEMORY_SEARCH_QUERY_TERMS: usize = 12;
-const MAX_MEMORY_SEARCH_POSTINGS_PER_ROW: usize = 128;
 const MAX_MEMORY_SEARCH_DOCUMENT_TERMS: usize = 2048;
 const MEMORY_SEARCH_DISPATCH_BATCH_SIZE: usize = 512;
 const MEMORY_SEARCH_FTS_PROJECTION_FORMAT: &str = "fts_v1";
+const MAX_COGNITIVE_PROJECTION_LEASE_ROWS: u16 = 512;
+const MAX_COGNITIVE_PROJECTION_LEASE_SECONDS: u64 = 3_600;
+const COGNITIVE_PROJECTION_PROJECT_PAGE_SIZE: usize = 100;
 
 #[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
 #[allow(clippy::struct_excessive_bools)]
@@ -114,6 +126,14 @@ struct RecallCandidateRow {
     memory_revision: Option<MemoryRevision>,
     #[serde(default)]
     project_sequence: Option<ProjectSequence>,
+    #[serde(default)]
+    source_segment_ordinal: Option<u64>,
+    #[serde(default)]
+    source_segment_count: Option<u64>,
+    #[serde(default)]
+    source_byte_start: Option<u64>,
+    #[serde(default)]
+    source_byte_end_exclusive: Option<u64>,
     #[serde(default)]
     verification_value: i32,
     #[serde(default)]
@@ -145,15 +165,184 @@ struct MemorySearchCandidateLoad {
     #[serde(default)]
     projection_format: Option<String>,
     #[serde(default)]
+    projection_status: Option<CognitiveProjectionPublicationStatus>,
+    #[serde(default)]
+    family_target_revision: Option<MemoryRevision>,
+    #[serde(default)]
+    family_applied_revision: Option<MemoryRevision>,
+    #[serde(default)]
     ordered_handles: Vec<String>,
     candidates: Vec<RecallCandidateRow>,
     truncated: bool,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct CanonicalMemoryL2Load {
+    #[serde(default)]
+    requested_segment_body_b64: Option<String>,
+    #[serde(default)]
+    manifest_bodies_b64: Vec<String>,
+    truncated: bool,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct CanonicalMemoryAdmissionChildLoad {
+    #[serde(default)]
+    bodies_b64: Vec<String>,
+    truncated: bool,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct CanonicalMemoryProjectionRecord {
+    record_id: String,
+    receipt_body: CanonicalMemorySegment,
+}
+
+#[derive(
+    Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, serde::Deserialize, serde::Serialize,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum CognitiveProjectionFamily {
+    Search,
+    Cue,
+    DependencyDirty,
+    Utility,
+}
+
+impl CognitiveProjectionFamily {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Search => "search",
+            Self::Cue => "cue",
+            Self::DependencyDirty => "dependency_dirty",
+            Self::Utility => "utility",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+pub struct CognitiveProjectionIntentReceipt {
+    pub event_id: String,
+    pub project_id: ProjectId,
+    pub updated_revision: MemoryRevision,
+    pub families: Vec<CognitiveProjectionFamily>,
+    pub status: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+pub struct CognitiveProjectionLease {
+    pub lease_id: String,
+    pub lease_owner: String,
+    pub project_id: ProjectId,
+    pub through_revision: MemoryRevision,
+    pub write_ids: Vec<String>,
+    pub families: Vec<CognitiveProjectionFamily>,
+    pub claimed_rows: usize,
+    pub max_attempt_count: u32,
+    #[serde(with = "time::serde::rfc3339")]
+    pub lease_expires_at: OffsetDateTime,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+pub struct CognitiveProjectionFamilyCounts {
+    pub search: u64,
+    pub cue: u64,
+    pub dependency_dirty: u64,
+    pub utility: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+pub struct CognitiveProjectionBacklog {
+    pub pending: u64,
+    pub leased: u64,
+    pub retryable: u64,
+    pub blocked: u64,
+    #[serde(default, with = "time::serde::rfc3339::option")]
+    pub oldest_created_at: Option<OffsetDateTime>,
+    pub family_counts: CognitiveProjectionFamilyCounts,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+pub struct CognitiveProjectionProject {
+    pub project_id: ProjectId,
+    pub head_revision: MemoryRevision,
+    pub search_applied_revision: Option<MemoryRevision>,
+    pub search_projection_format: Option<String>,
+    #[serde(default)]
+    pub pending: u64,
+    #[serde(default)]
+    pub leased: u64,
+    #[serde(default)]
+    pub retryable: u64,
+    #[serde(default)]
+    pub blocked: u64,
+    #[serde(default, with = "time::serde::rfc3339::option")]
+    pub oldest_pending_created_at: Option<OffsetDateTime>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+pub struct CognitiveProjectionProjectPage {
+    pub projects: Vec<CognitiveProjectionProject>,
+    pub truncated: bool,
+    pub next_start: Option<usize>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CognitiveProjectionPublicationStatus {
+    Published,
+    Stale,
+    Blocked,
+    Unavailable,
+}
+
+impl CognitiveProjectionPublicationStatus {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Published => "published",
+            Self::Stale => "stale",
+            Self::Blocked => "blocked",
+            Self::Unavailable => "unavailable",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+pub struct CognitiveProjectionFamilyState {
+    pub project_id: ProjectId,
+    pub family: CognitiveProjectionFamily,
+    pub target_revision: MemoryRevision,
+    pub applied_revision: Option<MemoryRevision>,
+    pub status: CognitiveProjectionPublicationStatus,
+    pub last_error: Option<String>,
+    #[serde(with = "time::serde::rfc3339")]
+    pub updated_at: OffsetDateTime,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct CognitiveProjectionOutboxRow {
+    write_id: String,
+    project_id: ProjectId,
+    updated_revision: MemoryRevision,
+    families: Vec<CognitiveProjectionFamily>,
+    attempt_count: u32,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct CognitiveProjectionClaimLoad {
+    rows: Vec<CognitiveProjectionOutboxRow>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct CognitiveProjectionMutationResult {
+    rows_updated: usize,
 }
 
 #[derive(Clone)]
 struct RankedRecallCandidate {
     row: RecallCandidateRow,
     score: L0FeatureScore,
+    retrieval_admitted: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
@@ -179,6 +368,7 @@ pub struct CanonicalSecretScanReport {
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 enum L2HandleKind {
     Any,
+    CanonicalMemory,
     File,
     Claim,
     Evidence,
@@ -214,6 +404,12 @@ struct ExactL2Bindings {
 
 fn parse_l2_selector(raw: &str) -> (L2HandleKind, &str, &'static str) {
     for (prefix, kind, canonical) in [
+        (
+            "memory-segment:",
+            L2HandleKind::CanonicalMemory,
+            "memory-segment:",
+        ),
+        ("memory:", L2HandleKind::CanonicalMemory, "memory:"),
         ("file:", L2HandleKind::File, "file:"),
         ("claim:", L2HandleKind::Claim, "claim:"),
         ("claim_card:", L2HandleKind::Claim, "claim:"),
@@ -365,11 +561,14 @@ fn l2_selector_identities(selectors: &[L2Selector], kind: L2HandleKind) -> Vec<S
 fn l2_relation_identities(selectors: &[L2Selector]) -> Vec<String> {
     let mut relation_ids = BTreeSet::new();
     for selector in selectors {
-        relation_ids.insert(selector.public_handle.clone());
-        relation_ids.insert(selector.identity.clone());
-        if selector.kind == L2HandleKind::File {
+        if matches!(
+            selector.kind,
+            L2HandleKind::File | L2HandleKind::CanonicalMemory
+        ) {
             continue;
         }
+        relation_ids.insert(selector.public_handle.clone());
+        relation_ids.insert(selector.identity.clone());
         for prefix in [
             "claim:",
             "claim_card:",
@@ -424,6 +623,7 @@ fn finalize_exact_l2_response(
         + response.tool_observations.len()
         + response.failure_fingerprints.len()
         + response.ul_artifacts.len()
+        + response.canonical_memory_pages.len()
         + response.relations.len();
 }
 
@@ -468,6 +668,13 @@ fn sort_exact_l2_response(response: &mut FetchAtomsL2Response, selectors: &[L2Se
             record.handle.clone(),
         )
     });
+    response.canonical_memory_pages.sort_by_cached_key(|page| {
+        let (kind, identity, _) = parse_l2_selector(&page.requested_handle);
+        (
+            selector_position(selectors, kind, identity),
+            page.requested_handle.clone(),
+        )
+    });
     response.relations.sort_by_key(|relation| {
         (
             relation.from.clone(),
@@ -488,6 +695,18 @@ fn resolved_exact_l2_handles(response: &FetchAtomsL2Response) -> HashSet<(L2Hand
     for artifact in &response.ul_artifacts {
         let (kind, identity, _) = parse_l2_selector(&artifact.handle);
         resolved.insert((kind, identity.to_owned()));
+    }
+    for page in &response.canonical_memory_pages {
+        if page.manifest.is_some()
+            && (!page.requested_handle.starts_with("memory-segment:")
+                || page
+                    .segments
+                    .iter()
+                    .any(|segment| segment.segment_id == page.requested_handle))
+        {
+            let (_, identity, _) = parse_l2_selector(&page.requested_handle);
+            resolved.insert((L2HandleKind::CanonicalMemory, identity.to_owned()));
+        }
     }
     resolved.extend(
         response
@@ -563,6 +782,7 @@ fn classify_exact_l2_handles(response: &mut FetchAtomsL2Response, selectors: &[L
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn rank_recall_candidates(
     request: &RecallL0Request,
     load: RecallCandidateLoad,
@@ -596,10 +816,13 @@ fn rank_recall_candidates(
         };
         filtered.push((row, scope_fit));
     }
-    let (collapsed, collapsed_duplicates) = collapse_recall_candidates(filtered);
+    let (capacity_segments, ordinary): (Vec<_>, Vec<_>) = filtered
+        .into_iter()
+        .partition(|(row, _)| row.record_type == "memory_blob_segment");
+    let (collapsed, mut collapsed_duplicates) = collapse_recall_candidates(ordinary);
     let mut admitted = collapsed
         .into_iter()
-        .filter_map(|(row, scope_fit)| {
+        .map(|(row, scope_fit)| {
             rank_recall_candidate(
                 row,
                 scope_fit,
@@ -610,7 +833,25 @@ fn rank_recall_candidates(
                 &exact_query,
             )
         })
+        .filter(|candidate| candidate.retrieval_admitted)
         .collect::<Vec<_>>();
+    admitted.extend(capacity_segments.into_iter().map(|(row, scope_fit)| {
+        rank_recall_candidate(
+            row,
+            scope_fit,
+            request,
+            load.at_revision,
+            &query_tokens,
+            &normalized_query,
+            &exact_query,
+        )
+    }));
+    let (deduplicated_segments, segment_traces) = collapse_ranked_capacity_segments(admitted);
+    admitted = deduplicated_segments
+        .into_iter()
+        .filter(|candidate| candidate.retrieval_admitted)
+        .collect();
+    collapsed_duplicates.extend(segment_traces);
     admitted.sort_by(|left, right| {
         right
             .score
@@ -643,6 +884,8 @@ fn rank_recall_candidates(
     RecallL0Response {
         project_id: request.project_id,
         at_revision: load.at_revision,
+        projection_revision: Some(load.at_revision),
+        projection_state: CognitiveProjectionReadState::Published,
         handles,
         memory_confidence,
         query_mode: query_mode.clone(),
@@ -666,6 +909,53 @@ fn rank_recall_candidates(
     }
 }
 
+fn collapse_ranked_capacity_segments(
+    candidates: Vec<RankedRecallCandidate>,
+) -> (Vec<RankedRecallCandidate>, Vec<L0CollapsedDuplicateTrace>) {
+    let mut ordinary = Vec::new();
+    let mut by_parent = BTreeMap::<String, Vec<RankedRecallCandidate>>::new();
+    for candidate in candidates {
+        if candidate.row.record_type == "memory_blob_segment" {
+            by_parent
+                .entry(candidate.row.handle.clone())
+                .or_default()
+                .push(candidate);
+        } else {
+            ordinary.push(candidate);
+        }
+    }
+    let mut traces = Vec::new();
+    for (parent_handle, mut segments) in by_parent {
+        segments.sort_by(|left, right| {
+            right
+                .score
+                .total
+                .cmp(&left.score.total)
+                .then_with(|| right.row.authority_rank.cmp(&left.row.authority_rank))
+                .then_with(|| {
+                    left.row
+                        .source_segment_ordinal
+                        .unwrap_or_default()
+                        .cmp(&right.row.source_segment_ordinal.unwrap_or_default())
+                })
+                .then_with(|| left.row.record_ref.cmp(&right.row.record_ref))
+        });
+        let authoritative = segments.remove(0);
+        if !segments.is_empty() {
+            traces.push(L0CollapsedDuplicateTrace {
+                authoritative_handle: parent_handle,
+                collapsed_record_refs: segments
+                    .iter()
+                    .map(|segment| segment.row.record_ref.clone())
+                    .collect(),
+                reason: "parent_segment_dedup_after_scoring".to_owned(),
+            });
+        }
+        ordinary.push(authoritative);
+    }
+    (ordinary, traces)
+}
+
 #[allow(clippy::too_many_lines)]
 fn rank_recall_candidate(
     row: RecallCandidateRow,
@@ -675,7 +965,7 @@ fn rank_recall_candidate(
     query_tokens: &[String],
     normalized_query: &str,
     exact_query: &str,
-) -> Option<RankedRecallCandidate> {
+) -> RankedRecallCandidate {
     let candidate_tokens = eliot_types::normalize_query_tokens(&row.search_text);
     let preview_tokens = eliot_types::normalize_query_tokens(&row.preview);
     let cue_tokens = eliot_types::normalize_query_tokens(&row.cue_text);
@@ -788,9 +1078,7 @@ fn rank_recall_candidate(
         || preview_contains > 0
         || exact_cue > 0
         || concept_relation > 0;
-    if exact_identifier == 0 && (!retrieval_signal || total < 80) {
-        return None;
-    }
+    let retrieval_admitted = exact_identifier != 0 || (retrieval_signal && total >= 80);
     let mut reasons = Vec::new();
     if exact_identifier > 0 {
         reasons.push("exact_handle".to_owned());
@@ -846,7 +1134,7 @@ fn rank_recall_candidate(
     if distraction_penalty < 0 {
         reasons.push("distraction_penalty".to_owned());
     }
-    Some(RankedRecallCandidate {
+    RankedRecallCandidate {
         score: L0FeatureScore {
             handle: row.handle.clone(),
             exact_identifier,
@@ -874,7 +1162,8 @@ fn rank_recall_candidate(
             reasons,
         },
         row,
-    })
+        retrieval_admitted,
+    }
 }
 
 fn is_default_visible_lifecycle(state: Option<eliot_types::MemoryLifecycleState>) -> bool {
@@ -1094,6 +1383,10 @@ fn recall_candidate(input: RecallCandidateInput<'_>) -> RecallCandidateRow {
         negative_memory: input.negative_memory,
         memory_revision: Some(input.memory_revision),
         project_sequence: Some(input.project_sequence),
+        source_segment_ordinal: None,
+        source_segment_count: None,
+        source_byte_start: None,
+        source_byte_end_exclusive: None,
         verification_value: input.verification_value,
         known_decision_delta: input.known_decision_delta,
         prior_beneficial_use: input.prior_beneficial_use,
@@ -1104,11 +1397,34 @@ fn recall_candidate(input: RecallCandidateInput<'_>) -> RecallCandidateRow {
     }
 }
 
-fn projection_row(
+#[derive(Clone, Copy, Debug)]
+struct ProjectionSegmentSource {
+    source_ordinal: u64,
+    source_count: u64,
+    byte_start: Option<u64>,
+    byte_end_exclusive: Option<u64>,
+}
+
+fn projection_rows(
     project_id: ProjectId,
     row: &RecallCandidateRow,
     updated_revision: MemoryRevision,
-) -> Result<Value, StoreError> {
+) -> Result<Vec<Value>, StoreError> {
+    let source = ProjectionSegmentSource {
+        source_ordinal: row.source_segment_ordinal.unwrap_or_default(),
+        source_count: row.source_segment_count.unwrap_or(1),
+        byte_start: row.source_byte_start,
+        byte_end_exclusive: row.source_byte_end_exclusive,
+    };
+    projection_rows_for_source(project_id, row, updated_revision, source)
+}
+
+fn projection_rows_for_source(
+    project_id: ProjectId,
+    row: &RecallCandidateRow,
+    updated_revision: MemoryRevision,
+    source: ProjectionSegmentSource,
+) -> Result<Vec<Value>, StoreError> {
     let mut value =
         serde_json::to_value(row).map_err(|error| StoreError::Decode(error.to_string()))?;
     let object = value.as_object_mut().ok_or_else(|| {
@@ -1117,10 +1433,6 @@ fn projection_row(
     object.remove("handle");
     object.remove("record_ref");
     let lifecycle = object.remove("lifecycle_state").unwrap_or(Value::Null);
-    object.insert(
-        "projection_id".to_owned(),
-        Value::String(derived_row_key(&format!("{project_id}:{}", row.handle))),
-    );
     object.insert(
         "record_kind".to_owned(),
         Value::String(row.record_type.clone()),
@@ -1133,6 +1445,27 @@ fn projection_row(
         "record_ref_parts".to_owned(),
         json!(string_fragments(&row.record_ref)),
     );
+    object.insert(
+        "parent_handle_parts".to_owned(),
+        json!(string_fragments(&row.handle)),
+    );
+    object.insert(
+        "source_record_ref_parts".to_owned(),
+        json!(string_fragments(&row.record_ref)),
+    );
+    object.insert(
+        "source_segment_ordinal".to_owned(),
+        json!(source.source_ordinal),
+    );
+    object.insert(
+        "source_segment_count".to_owned(),
+        json!(source.source_count),
+    );
+    object.insert("source_byte_start".to_owned(), json!(source.byte_start));
+    object.insert(
+        "source_byte_end_exclusive".to_owned(),
+        json!(source.byte_end_exclusive),
+    );
     object.insert("lifecycle".to_owned(), lifecycle);
     object.insert("updated_revision".to_owned(), json!(updated_revision));
     object.insert(
@@ -1141,22 +1474,44 @@ fn projection_row(
     );
 
     let document_terms = memory_search_document_terms(row);
-    object.insert(
-        "search_document".to_owned(),
-        Value::String(document_terms.join(" ")),
-    );
-    let postings = document_terms
+    let fts_segment_count = document_terms
+        .len()
+        .div_ceil(MAX_MEMORY_SEARCH_DOCUMENT_TERMS)
+        .max(1);
+    let term_chunks = if document_terms.is_empty() {
+        vec![&[][..]]
+    } else {
+        document_terms
+            .chunks(MAX_MEMORY_SEARCH_DOCUMENT_TERMS)
+            .collect::<Vec<_>>()
+    };
+    term_chunks
         .into_iter()
-        .take(MAX_MEMORY_SEARCH_POSTINGS_PER_ROW)
-        .map(|token| {
-            json!({
-                "posting_id": derived_row_key(&format!("{project_id}:{token}:{}", row.handle)),
-                "token": token,
-            })
+        .enumerate()
+        .map(|(fts_ordinal, terms)| {
+            let fts_ordinal_u64 =
+                u64::try_from(fts_ordinal).map_err(|_| StoreError::BlobTooLarge)?;
+            let term_start = fts_ordinal.saturating_mul(MAX_MEMORY_SEARCH_DOCUMENT_TERMS);
+            let term_end_exclusive = term_start.saturating_add(terms.len());
+            let mut segment = value.clone();
+            let segment_object = segment.as_object_mut().ok_or_else(|| {
+                StoreError::Decode("memory search projection segment was not an object".to_owned())
+            })?;
+            segment_object.insert(
+                "projection_id".to_owned(),
+                Value::String(derived_row_key(&format!(
+                    "{project_id}:{}:{}:{fts_ordinal_u64}",
+                    row.handle, source.source_ordinal
+                ))),
+            );
+            segment_object.insert("fts_segment_ordinal".to_owned(), json!(fts_ordinal_u64));
+            segment_object.insert("fts_segment_count".to_owned(), json!(fts_segment_count));
+            segment_object.insert("term_start".to_owned(), json!(term_start));
+            segment_object.insert("term_end_exclusive".to_owned(), json!(term_end_exclusive));
+            segment_object.insert("search_document".to_owned(), Value::String(terms.join(" ")));
+            Ok(segment)
         })
-        .collect::<Vec<_>>();
-    object.insert("postings".to_owned(), Value::Array(postings));
-    Ok(value)
+        .collect()
 }
 
 #[allow(clippy::too_many_lines)]
@@ -1237,7 +1592,7 @@ fn envelope_projection_rows(
             ),
             payload: &claim.payload,
         });
-        rows.push(projection_row(envelope.project_id, &row, memory_revision)?);
+        rows.extend(projection_rows(envelope.project_id, &row, memory_revision)?);
     }
 
     for evidence in &envelope.evidence_atoms {
@@ -1271,7 +1626,7 @@ fn envelope_projection_rows(
             contradiction_signal: false,
             payload: &evidence.payload,
         });
-        rows.push(projection_row(envelope.project_id, &row, memory_revision)?);
+        rows.extend(projection_rows(envelope.project_id, &row, memory_revision)?);
     }
 
     for verification in &envelope.verification_runs {
@@ -1321,10 +1676,20 @@ fn envelope_projection_rows(
             contradiction_signal: verification.result == eliot_types::VerificationResult::Failed,
             payload: &verification.payload,
         });
-        rows.push(projection_row(envelope.project_id, &row, memory_revision)?);
+        rows.extend(projection_rows(envelope.project_id, &row, memory_revision)?);
     }
 
     for observation in &envelope.tool_observations {
+        let receipt_kind = observation
+            .payload
+            .get("receipt_kind")
+            .and_then(Value::as_str);
+        if matches!(
+            receipt_kind,
+            Some("memory_blob_segment" | "memory_blob_manifest" | "cue_binding_page")
+        ) {
+            continue;
+        }
         let row = recall_candidate(RecallCandidateInput {
             record_ref: format!("tool_observation:{}", observation.observation_id),
             handle: format!("observation:{}", observation.observation_id),
@@ -1358,7 +1723,7 @@ fn envelope_projection_rows(
             contradiction_signal: false,
             payload: &observation.payload,
         });
-        rows.push(projection_row(envelope.project_id, &row, memory_revision)?);
+        rows.extend(projection_rows(envelope.project_id, &row, memory_revision)?);
 
         let Some(receipt_kind) = observation
             .payload
@@ -1429,7 +1794,7 @@ fn envelope_projection_rows(
             contradiction_signal: matches!(artifact_status.as_str(), "contested" | "rejected"),
             payload: body,
         });
-        rows.push(projection_row(
+        rows.extend(projection_rows(
             envelope.project_id,
             &artifact,
             memory_revision,
@@ -1462,7 +1827,7 @@ fn envelope_projection_rows(
             contradiction_signal: false,
             payload: &failure.payload,
         });
-        rows.push(projection_row(envelope.project_id, &row, memory_revision)?);
+        rows.extend(projection_rows(envelope.project_id, &row, memory_revision)?);
     }
     Ok(rows)
 }
@@ -1471,8 +1836,9 @@ fn ordered_memory_search_terms<'a>(
     sources: impl IntoIterator<Item = &'a str>,
     limit: usize,
 ) -> Vec<String> {
-    let mut terms = Vec::with_capacity(limit);
-    let mut seen = HashSet::with_capacity(limit);
+    let initial_capacity = limit.min(MAX_MEMORY_SEARCH_DOCUMENT_TERMS);
+    let mut terms = Vec::with_capacity(initial_capacity);
+    let mut seen = HashSet::with_capacity(initial_capacity);
     for source in sources {
         if terms.len() == limit {
             break;
@@ -1513,7 +1879,7 @@ fn memory_search_document_terms(row: &RecallCandidateRow) -> Vec<String> {
             row.search_text.as_str(),
             row.scope_text.as_str(),
         ],
-        MAX_MEMORY_SEARCH_DOCUMENT_TERMS,
+        usize::MAX,
     )
 }
 
@@ -1521,6 +1887,7 @@ fn rank_memory_search_candidates(
     request: &RecallL0Request,
     mut load: MemorySearchCandidateLoad,
 ) -> RecallL0Response {
+    let projection_revision = load.projection_revision;
     let positions = load
         .ordered_handles
         .iter()
@@ -1533,20 +1900,138 @@ fn rank_memory_search_candidates(
             .copied()
             .unwrap_or(usize::MAX)
     });
-    rank_recall_candidates(
+    let mut response = rank_recall_candidates(
         request,
         RecallCandidateLoad {
             at_revision: load.at_revision,
             candidates: load.candidates,
             truncated: load.truncated,
         },
-    )
+    );
+    response.projection_revision = projection_revision;
+    response
 }
 
 fn exact_memory_search_handle(query: &str) -> Option<String> {
     let query = query.trim();
     (!query.is_empty() && query.contains(':') && !query.chars().any(char::is_whitespace))
         .then(|| query.to_owned())
+}
+
+fn parse_canonical_memory_l2_continuation(
+    memory_handle: &str,
+    continuation: Option<&str>,
+) -> Result<(u64, Option<String>), StoreError> {
+    let Some(continuation) = continuation else {
+        return Ok((0, None));
+    };
+    let mut parts = continuation.split(':');
+    let prefix = parts.next();
+    let start = parts.next().and_then(|value| value.parse::<u64>().ok());
+    let fence = parts.next();
+    if prefix != Some("memory-l2")
+        || start.is_none()
+        || fence.is_none()
+        || parts.next().is_some()
+        || fence.is_some_and(|value| {
+            value.len() != 16 || !value.bytes().all(|byte| byte.is_ascii_hexdigit())
+        })
+    {
+        return Err(StoreError::PolicyViolation(
+            "canonical memory L2 continuation is malformed".to_owned(),
+        ));
+    }
+    let _ = memory_handle;
+    Ok((start.unwrap_or_default(), fence.map(str::to_owned)))
+}
+
+fn canonical_memory_l2_fence(
+    memory_handle: &str,
+    manifest: &CanonicalMemoryManifest,
+    start: u64,
+) -> String {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(memory_handle.as_bytes());
+    hasher.update(manifest.manifest_id.as_bytes());
+    hasher.update(&start.to_le_bytes());
+    hasher.finalize().to_hex()[..16].to_owned()
+}
+
+fn decode_canonical_memory_body_b64<T>(encoded: &str, label: &str) -> Result<T, StoreError>
+where
+    T: DeserializeOwned,
+{
+    let bytes = STANDARD_NO_PAD.decode(encoded).map_err(|error| {
+        StoreError::Decode(format!(
+            "canonical memory {label} body base64 was invalid: {error}"
+        ))
+    })?;
+    if bytes.len() > CANONICAL_MEMORY_CHILD_BODY_MAX_BYTES {
+        return Err(StoreError::Decode(format!(
+            "canonical memory {label} body exceeded the {CANONICAL_MEMORY_CHILD_BODY_MAX_BYTES}-byte lossless transport bound"
+        )));
+    }
+    serde_json::from_slice(&bytes).map_err(|error| {
+        StoreError::Decode(format!(
+            "canonical memory {label} body JSON was invalid: {error}"
+        ))
+    })
+}
+
+fn canonical_memory_manifest_matches_segment(
+    manifest: &CanonicalMemoryManifest,
+    segment: &CanonicalMemorySegment,
+) -> bool {
+    manifest.memory_handle == segment.parent_handle
+        && manifest.logical_kind == segment.logical_kind
+        && manifest.blob == segment.blob
+        && manifest.segment_count == segment.segment_count
+        && manifest.segment_set_hash_blake3 == segment.segment_set_hash_blake3
+}
+
+fn unresolved_canonical_memory_l2_page(requested_handle: &str) -> CanonicalMemoryL2Page {
+    CanonicalMemoryL2Page {
+        requested_handle: requested_handle.to_owned(),
+        resolved_parent_handle: None,
+        requested_segment_id: None,
+        manifest: None,
+        segments: Vec::new(),
+        continuation: None,
+        truncated: false,
+    }
+}
+
+fn validate_canonical_memory_l2_page(
+    manifest: Option<&CanonicalMemoryManifest>,
+    start: u64,
+    segments: &[CanonicalMemorySegmentRef],
+) -> Result<(), StoreError> {
+    let Some(manifest) = manifest else {
+        if segments.is_empty() {
+            return Ok(());
+        }
+        return Err(StoreError::Decode(
+            "canonical memory L2 returned segments without a manifest".to_owned(),
+        ));
+    };
+    for (offset, segment) in segments.iter().enumerate() {
+        let expected_ordinal =
+            start.saturating_add(u64::try_from(offset).map_err(|_| StoreError::BlobTooLarge)?);
+        if segment.parent_handle != manifest.memory_handle
+            || segment.blob != manifest.blob
+            || segment.segment_count != manifest.segment_count
+            || segment.segment_set_hash_blake3 != manifest.segment_set_hash_blake3
+            || segment.ordinal != expected_ordinal
+            || segment.byte_end_exclusive < segment.byte_start
+            || segment.byte_end_exclusive > manifest.blob.size_bytes
+            || !is_lower_blake3_hex(&segment.segment_hash_blake3)
+        {
+            return Err(StoreError::Decode(
+                "canonical memory L2 segment metadata is inconsistent".to_owned(),
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn memory_search_projection_dispatch_vars(
@@ -1567,11 +2052,28 @@ fn memory_search_projection_dispatch_vars(
     })
 }
 
+fn bounded_projection_detail<'a>(value: &'a str, label: &str) -> Result<&'a str, StoreError> {
+    let value = value.trim();
+    if value.is_empty() || value.len() > 2_048 {
+        return Err(StoreError::PolicyViolation(format!(
+            "{label} must contain 1..=2048 bytes"
+        )));
+    }
+    Ok(value)
+}
+
+fn surreal_datetime_binding(value: OffsetDateTime, label: &str) -> Result<String, StoreError> {
+    value.format(&Rfc3339).map_err(|error| {
+        StoreError::ConfigMessage(format!("could not encode {label} as RFC3339: {error}"))
+    })
+}
+
 #[derive(Clone, Debug)]
 pub struct CanonicalStore {
     config: SurrealServerConfig,
     registry: SurqlTemplateRegistry,
     client_set: Option<Arc<DbClientSet>>,
+    blob_store: Option<BlobStore>,
 }
 
 #[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
@@ -1652,6 +2154,7 @@ impl CanonicalStore {
             config,
             registry: SurqlTemplateRegistry::default(),
             client_set: None,
+            blob_store: None,
         }
     }
 
@@ -1661,7 +2164,16 @@ impl CanonicalStore {
             config: client_set.config().clone(),
             registry: SurqlTemplateRegistry::default(),
             client_set: Some(client_set),
+            blob_store: None,
         }
+    }
+
+    /// Attaches the process-owned content-addressed store so canonical-memory
+    /// parent admission verifies both declared metadata and the actual bytes.
+    #[must_use]
+    pub fn with_blob_store(mut self, blob_store: BlobStore) -> Self {
+        self.blob_store = Some(blob_store);
+        self
     }
 
     pub async fn migrate_schema(&self) -> Result<Value, StoreError> {
@@ -1810,8 +2322,21 @@ impl CanonicalStore {
         &self,
         envelope: &MemoryWriteEnvelope,
     ) -> Result<WriteReceipt, StoreError> {
+        self.apply_write_envelope_bound(envelope, false).await
+    }
+
+    async fn apply_write_envelope_bound(
+        &self,
+        envelope: &MemoryWriteEnvelope,
+        fail_before_projection_outbox: bool,
+    ) -> Result<WriteReceipt, StoreError> {
         let canonical_payloads = canonical_payloads(envelope)?;
         let relation_payloads = relation_payloads(envelope);
+        for manifest in capacity_manifests(envelope)? {
+            self.verify_canonical_memory_manifest_children(envelope.project_id, &manifest)
+                .await?;
+        }
+        let now = surreal_datetime_binding(OffsetDateTime::now_utc(), "canonical outbox time")?;
         let value = self
             .execute_value(
                 NamedSurqlOp::ApplyWriteEnvelope,
@@ -1819,29 +2344,270 @@ impl CanonicalStore {
                     "envelope": envelope,
                     "canonical_payloads": canonical_payloads,
                     "relation_payloads": relation_payloads,
+                    "fail_before_projection_outbox": fail_before_projection_outbox,
+                    "now": now,
                 }),
             )
             .await?;
-        let receipt: WriteReceipt = decode_value(NamedSurqlOp::ApplyWriteEnvelope, value)?;
-        if matches!(
-            receipt.status,
-            WriteStatus::Committed | WriteStatus::IdempotentReplay
-        ) {
-            let rows = envelope_projection_rows(envelope, &receipt)?;
-            self.dispatch_memory_search_projection(
-                envelope.project_id,
-                envelope.write_id,
-                receipt.memory_revision.ok_or_else(|| {
-                    StoreError::PolicyViolation(
-                        "committed write receipt omitted the search projection revision".to_owned(),
-                    )
-                })?,
-                &rows,
-                None,
+        decode_value(NamedSurqlOp::ApplyWriteEnvelope, value)
+    }
+
+    async fn verify_canonical_memory_manifest_children(
+        &self,
+        project_id: ProjectId,
+        manifest: &CanonicalMemoryManifest,
+    ) -> Result<(), StoreError> {
+        let segment_bodies = self
+            .load_canonical_memory_admission_children(
+                project_id,
+                manifest,
+                "segment",
+                CANONICAL_MEMORY_ADMISSION_PAGE_SIZE,
             )
             .await?;
+        let segments = segment_bodies
+            .into_iter()
+            .map(|body| {
+                serde_json::from_value(body).map_err(|error| StoreError::Decode(error.to_string()))
+            })
+            .collect::<Result<Vec<CanonicalMemorySegment>, _>>()?
+            .into_iter()
+            .filter(|segment| {
+                segment.segment_set_hash_blake3 == manifest.segment_set_hash_blake3
+                    && segment.blob == manifest.blob
+            })
+            .collect::<Vec<_>>();
+        let cue_page_bodies = self
+            .load_canonical_memory_admission_children(
+                project_id,
+                manifest,
+                "cue_page",
+                CANONICAL_MEMORY_ADMISSION_PAGE_SIZE,
+            )
+            .await?;
+        let cue_pages = cue_page_bodies
+            .into_iter()
+            .map(|body| {
+                serde_json::from_value(body).map_err(|error| StoreError::Decode(error.to_string()))
+            })
+            .collect::<Result<Vec<CueBindingPage>, _>>()?
+            .into_iter()
+            .filter(|page| {
+                page.page_set_hash_blake3 == manifest.cue_page_set_hash_blake3
+                    && page.blob == manifest.blob
+            })
+            .collect::<Vec<_>>();
+        verify_canonical_memory_child_set(self.blob_store.as_ref(), manifest, &segments, &cue_pages)
+    }
+
+    async fn load_canonical_memory_admission_children(
+        &self,
+        project_id: ProjectId,
+        manifest: &CanonicalMemoryManifest,
+        child_kind: &'static str,
+        page_limit: u16,
+    ) -> Result<Vec<Value>, StoreError> {
+        let mut start = 0u64;
+        let mut bodies = Vec::new();
+        loop {
+            let value = self
+                .execute_value(
+                    NamedSurqlOp::LoadCanonicalMemoryAdmissionChildren,
+                    json!({
+                        "project_id": project_id,
+                        "memory_handle_parts": string_fragments(&manifest.memory_handle),
+                        "child_kind": child_kind,
+                        "start": start,
+                        "limit": page_limit,
+                    }),
+                )
+                .await?;
+            let page: CanonicalMemoryAdmissionChildLoad =
+                decode_value(NamedSurqlOp::LoadCanonicalMemoryAdmissionChildren, value)?;
+            let page_len =
+                u64::try_from(page.bodies_b64.len()).map_err(|_| StoreError::BlobTooLarge)?;
+            if page.truncated && page_len == 0 {
+                return Err(StoreError::Decode(
+                    "canonical memory child page claimed truncation without rows".to_owned(),
+                ));
+            }
+            for encoded in page.bodies_b64 {
+                bodies.push(decode_canonical_memory_body_b64(&encoded, child_kind)?);
+            }
+            if !page.truncated {
+                return Ok(bodies);
+            }
+            start = start
+                .checked_add(page_len)
+                .ok_or(StoreError::BlobTooLarge)?;
+            if start >= CANONICAL_MEMORY_ADMISSION_MAX_SCANNED_ROWS {
+                return Err(StoreError::PolicyViolation(format!(
+                    "canonical memory handle {} exceeds the {}-row admission scan bound for {child_kind}",
+                    manifest.memory_handle, CANONICAL_MEMORY_ADMISSION_MAX_SCANNED_ROWS
+                )));
+            }
         }
-        Ok(receipt)
+    }
+
+    #[cfg(test)]
+    async fn apply_write_envelope_with_outbox_failure(
+        &self,
+        envelope: &MemoryWriteEnvelope,
+    ) -> Result<WriteReceipt, StoreError> {
+        self.apply_write_envelope_bound(envelope, true).await
+    }
+
+    /// Applies the search delta retained in a committed envelope. This is a
+    /// coordinator-only derived write; canonical commit success never depends
+    /// on this projection succeeding.
+    pub async fn apply_memory_search_projection_for_envelope(
+        &self,
+        envelope: &MemoryWriteEnvelope,
+        receipt: &WriteReceipt,
+    ) -> Result<MemoryRevision, StoreError> {
+        if !matches!(
+            receipt.status,
+            WriteStatus::Committed | WriteStatus::IdempotentReplay
+        ) || receipt.write_id != envelope.write_id
+            || receipt.project_id != envelope.project_id
+        {
+            return Err(StoreError::PolicyViolation(
+                "search projection dispatch requires the matching committed write receipt"
+                    .to_owned(),
+            ));
+        }
+        let updated_revision = receipt.memory_revision.ok_or_else(|| {
+            StoreError::PolicyViolation(
+                "committed write receipt omitted the search projection revision".to_owned(),
+            )
+        })?;
+        let mut rows = envelope_projection_rows(envelope, receipt)?;
+        for manifest in capacity_manifests(envelope)? {
+            rows.extend(
+                self.canonical_memory_projection_rows(envelope, receipt, &manifest)
+                    .await?,
+            );
+        }
+        self.dispatch_memory_search_projection(
+            envelope.project_id,
+            envelope.write_id,
+            updated_revision,
+            &rows,
+            None,
+            true,
+        )
+        .await?;
+        Ok(updated_revision)
+    }
+
+    #[allow(clippy::too_many_lines)]
+    async fn canonical_memory_projection_rows(
+        &self,
+        envelope: &MemoryWriteEnvelope,
+        receipt: &WriteReceipt,
+        manifest: &CanonicalMemoryManifest,
+    ) -> Result<Vec<Value>, StoreError> {
+        let memory_revision = receipt.memory_revision.ok_or_else(|| {
+            StoreError::PolicyViolation(
+                "committed capacity manifest omitted its memory revision".to_owned(),
+            )
+        })?;
+        let project_sequence = receipt.project_sequence.ok_or_else(|| {
+            StoreError::PolicyViolation(
+                "committed capacity manifest omitted its project sequence".to_owned(),
+            )
+        })?;
+        let lifecycle = normalized_memory_lifecycle(envelope.lifecycle.status);
+        let mut start = 0u64;
+        let mut expected_ordinal = 0u64;
+        let mut rows = Vec::new();
+        loop {
+            let value = self
+                .execute_value(
+                    NamedSurqlOp::LoadCanonicalMemoryProjectionSegments,
+                    json!({
+                        "project_id": envelope.project_id,
+                        "memory_handle_parts": string_fragments(&manifest.memory_handle),
+                        "blob_digest_parts": string_fragments(&manifest.blob.digest_hex),
+                        "blob_relative_path_parts": string_fragments(&manifest.blob.relative_path),
+                        "blob_size_bytes": manifest.blob.size_bytes,
+                        "logical_kind_parts": string_fragments(&manifest.logical_kind),
+                        "segment_count": manifest.segment_count,
+                        "segment_set_hash_parts": string_fragments(
+                            &manifest.segment_set_hash_blake3
+                        ),
+                        "start": start,
+                        "limit": CANONICAL_MEMORY_L2_PAGE_SIZE,
+                    }),
+                )
+                .await?;
+            let page: Vec<CanonicalMemoryProjectionRecord> =
+                decode_value(NamedSurqlOp::LoadCanonicalMemoryProjectionSegments, value)?;
+            if page.is_empty() {
+                break;
+            }
+            for record in page {
+                let segment = record.receipt_body;
+                if segment.parent_handle != manifest.memory_handle
+                    || segment.blob != manifest.blob
+                    || segment.logical_kind != manifest.logical_kind
+                    || segment.segment_count != manifest.segment_count
+                    || segment.segment_set_hash_blake3 != manifest.segment_set_hash_blake3
+                    || segment.ordinal != expected_ordinal
+                {
+                    return Err(StoreError::Decode(
+                        "canonical capacity projection segment sequence is inconsistent".to_owned(),
+                    ));
+                }
+                let payload = serde_json::to_value(&segment)
+                    .map_err(|error| StoreError::Decode(error.to_string()))?;
+                let row = recall_candidate(RecallCandidateInput {
+                    record_ref: format!("canonical_record:{}", record.record_id),
+                    handle: segment.parent_handle.clone(),
+                    record_type: "memory_blob_segment".to_owned(),
+                    preview: segment.preview_text.clone(),
+                    search_text: segment.search_text.clone(),
+                    cue_text: String::new(),
+                    scope_text: envelope.scope.clone(),
+                    concept_text: String::new(),
+                    task_id: envelope.task_id,
+                    status: "observed".to_owned(),
+                    lifecycle_state: lifecycle,
+                    authority_rank: 35,
+                    negative_memory: false,
+                    memory_revision,
+                    project_sequence,
+                    verification_value: 20,
+                    known_decision_delta: 0,
+                    prior_beneficial_use: 0,
+                    contradiction_signal: false,
+                    payload: &payload,
+                });
+                rows.extend(projection_rows_for_source(
+                    envelope.project_id,
+                    &row,
+                    memory_revision,
+                    ProjectionSegmentSource {
+                        source_ordinal: segment.ordinal,
+                        source_count: segment.segment_count,
+                        byte_start: Some(segment.byte_start),
+                        byte_end_exclusive: Some(segment.byte_end_exclusive),
+                    },
+                )?);
+                expected_ordinal = expected_ordinal.saturating_add(1);
+            }
+            start = expected_ordinal;
+            if start >= manifest.segment_count {
+                break;
+            }
+        }
+        if expected_ordinal != manifest.segment_count {
+            return Err(StoreError::Decode(format!(
+                "canonical capacity projection loaded {expected_ordinal} of {} admitted segments",
+                manifest.segment_count
+            )));
+        }
+        Ok(rows)
     }
 
     async fn dispatch_memory_search_projection(
@@ -1851,6 +2617,7 @@ impl CanonicalStore {
         updated_revision: MemoryRevision,
         rows: &[Value],
         projection_format: Option<&str>,
+        advance_state_at_end: bool,
     ) -> Result<(), StoreError> {
         if rows.is_empty() {
             self.execute_value(
@@ -1860,7 +2627,7 @@ impl CanonicalStore {
                     write_id,
                     updated_revision,
                     &[],
-                    true,
+                    advance_state_at_end,
                     projection_format,
                 ),
             )
@@ -1876,13 +2643,386 @@ impl CanonicalStore {
                     write_id,
                     updated_revision,
                     chunk,
-                    index + 1 == chunk_count,
+                    advance_state_at_end && index + 1 == chunk_count,
                     projection_format,
                 ),
             )
             .await?;
         }
         Ok(())
+    }
+
+    /// Persists a minimal non-canonical projection intent. Exact changed paths
+    /// remain an in-memory optimization; restart recovery is project-scoped.
+    pub async fn enqueue_cognitive_projection_intent(
+        &self,
+        project_id: ProjectId,
+        event_id: &str,
+        updated_revision: MemoryRevision,
+        families: &[CognitiveProjectionFamily],
+    ) -> Result<CognitiveProjectionIntentReceipt, StoreError> {
+        let event_id = event_id.trim();
+        if event_id.is_empty() || event_id.len() > 512 {
+            return Err(StoreError::PolicyViolation(
+                "cognitive projection event_id must contain 1..=512 bytes".to_owned(),
+            ));
+        }
+        let families = families.iter().copied().collect::<BTreeSet<_>>();
+        if families.is_empty() {
+            return Err(StoreError::PolicyViolation(
+                "cognitive projection intent requires at least one family".to_owned(),
+            ));
+        }
+        if families.contains(&CognitiveProjectionFamily::Utility) {
+            return Err(StoreError::PolicyViolation(
+                "utility projection intents remain unavailable until the utility projection is materialized"
+                    .to_owned(),
+            ));
+        }
+        let family_names = families
+            .into_iter()
+            .map(CognitiveProjectionFamily::as_str)
+            .collect::<Vec<_>>();
+        let mark_dependency_dirty_stale = event_id.starts_with("dependency-dirty:")
+            && family_names.contains(&CognitiveProjectionFamily::DependencyDirty.as_str());
+        let now = surreal_datetime_binding(OffsetDateTime::now_utc(), "projection intent time")?;
+        let value = self
+            .execute_value(
+                NamedSurqlOp::EnqueueCognitiveProjectionIntent,
+                json!({
+                    "intent_id": derived_row_key(&format!("{project_id}:{event_id}")),
+                    "event_id_parts": string_fragments(event_id),
+                    "project_id": project_id,
+                    "updated_revision": updated_revision,
+                    "families": family_names,
+                    "mark_dependency_dirty_stale": mark_dependency_dirty_stale,
+                    "dependency_state_id": derived_row_key(&format!(
+                        "{project_id}:{}",
+                        CognitiveProjectionFamily::DependencyDirty.as_str()
+                    )),
+                    "now": now,
+                }),
+            )
+            .await?;
+        decode_value(NamedSurqlOp::EnqueueCognitiveProjectionIntent, value)
+    }
+
+    /// Claims the one strict per-project head row. An older blocked,
+    /// not-yet-due retry or active lease is a barrier; an expired head lease is
+    /// eligible for deterministic reclaim. The input limit is retained for API
+    /// compatibility while contiguous-prefix batching remains unimplemented.
+    pub async fn claim_cognitive_projection_project(
+        &self,
+        lease_owner: &str,
+        lease_seconds: u64,
+        batch_limit: u16,
+    ) -> Result<Option<CognitiveProjectionLease>, StoreError> {
+        let lease_owner = lease_owner.trim();
+        if lease_owner.is_empty() || lease_owner.len() > 256 {
+            return Err(StoreError::PolicyViolation(
+                "cognitive projection lease_owner must contain 1..=256 bytes".to_owned(),
+            ));
+        }
+        let now = OffsetDateTime::now_utc();
+        let lease_seconds = lease_seconds.clamp(1, MAX_COGNITIVE_PROJECTION_LEASE_SECONDS);
+        let lease_seconds = i64::try_from(lease_seconds).map_err(|error| {
+            StoreError::ConfigMessage(format!("invalid projection lease duration: {error}"))
+        })?;
+        let lease_expires_at = now + TimeDuration::seconds(lease_seconds);
+        let now_binding = surreal_datetime_binding(now, "projection claim time")?;
+        let lease_expires_at_binding =
+            surreal_datetime_binding(lease_expires_at, "projection lease expiry")?;
+        let lease_id = WriteId::new_v7().to_string();
+        let value = self
+            .execute_value(
+                NamedSurqlOp::ClaimCognitiveProjectionProject,
+                json!({
+                    "lease_id": lease_id,
+                    "lease_owner": lease_owner,
+                    "lease_expires_at": lease_expires_at_binding,
+                    "batch_limit": batch_limit.clamp(1, MAX_COGNITIVE_PROJECTION_LEASE_ROWS),
+                    "now": now_binding,
+                }),
+            )
+            .await?;
+        let load: CognitiveProjectionClaimLoad =
+            decode_value(NamedSurqlOp::ClaimCognitiveProjectionProject, value)?;
+        let Some(first) = load.rows.first() else {
+            return Ok(None);
+        };
+        if load
+            .rows
+            .iter()
+            .any(|row| row.project_id != first.project_id)
+        {
+            return Err(StoreError::PolicyViolation(
+                "cognitive projection claim crossed project boundaries".to_owned(),
+            ));
+        }
+        let project_id = first.project_id;
+        let through_revision = load
+            .rows
+            .iter()
+            .map(|row| row.updated_revision)
+            .max()
+            .ok_or_else(|| StoreError::Decode("projection claim omitted revision".to_owned()))?;
+        let families = load
+            .rows
+            .iter()
+            .flat_map(|row| row.families.iter().copied())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        let write_ids = load
+            .rows
+            .iter()
+            .map(|row| row.write_id.clone())
+            .collect::<Vec<_>>();
+        let max_attempt_count = load
+            .rows
+            .iter()
+            .map(|row| row.attempt_count)
+            .max()
+            .unwrap_or(0);
+        Ok(Some(CognitiveProjectionLease {
+            lease_id,
+            lease_owner: lease_owner.to_owned(),
+            project_id,
+            through_revision,
+            claimed_rows: write_ids.len(),
+            write_ids,
+            families,
+            max_attempt_count,
+            lease_expires_at,
+        }))
+    }
+
+    pub async fn complete_cognitive_projection_through(
+        &self,
+        lease: &CognitiveProjectionLease,
+    ) -> Result<usize, StoreError> {
+        self.mutate_cognitive_projection_lease(
+            NamedSurqlOp::CompleteCognitiveProjectionThrough,
+            lease,
+            json!({}),
+        )
+        .await
+    }
+
+    pub async fn fail_cognitive_projection_retryable(
+        &self,
+        lease: &CognitiveProjectionLease,
+        error: &str,
+        retry_after_seconds: u64,
+    ) -> Result<usize, StoreError> {
+        let error = bounded_projection_detail(error, "retryable projection error")?;
+        let now = OffsetDateTime::now_utc();
+        let retry_after_seconds =
+            i64::try_from(retry_after_seconds.clamp(1, 86_400)).map_err(|conversion_error| {
+                StoreError::ConfigMessage(format!(
+                    "invalid projection retry duration: {conversion_error}"
+                ))
+            })?;
+        let next_attempt_at = surreal_datetime_binding(
+            now + TimeDuration::seconds(retry_after_seconds),
+            "projection retry time",
+        )?;
+        self.mutate_cognitive_projection_lease(
+            NamedSurqlOp::FailCognitiveProjectionRetryable,
+            lease,
+            json!({
+                "error": error,
+                "next_attempt_at": next_attempt_at,
+            }),
+        )
+        .await
+    }
+
+    pub async fn block_cognitive_projection(
+        &self,
+        lease: &CognitiveProjectionLease,
+        reason: &str,
+    ) -> Result<usize, StoreError> {
+        let reason = bounded_projection_detail(reason, "projection block reason")?;
+        self.mutate_cognitive_projection_lease(
+            NamedSurqlOp::BlockCognitiveProjection,
+            lease,
+            json!({ "reason": reason }),
+        )
+        .await
+    }
+
+    async fn mutate_cognitive_projection_lease(
+        &self,
+        op: NamedSurqlOp,
+        lease: &CognitiveProjectionLease,
+        extra: Value,
+    ) -> Result<usize, StoreError> {
+        if lease.write_ids.is_empty() || lease.claimed_rows != lease.write_ids.len() {
+            return Err(StoreError::PolicyViolation(
+                "cognitive projection lease has an inconsistent claimed row set".to_owned(),
+            ));
+        }
+        let now = surreal_datetime_binding(OffsetDateTime::now_utc(), "projection mutation time")?;
+        let mut vars = json!({
+            "project_id": lease.project_id,
+            "lease_id": lease.lease_id,
+            "lease_owner": lease.lease_owner,
+            "through_revision": lease.through_revision,
+            "write_id_parts": lease
+                .write_ids
+                .iter()
+                .map(|write_id| string_fragments(write_id))
+                .collect::<Vec<_>>(),
+            "families": lease
+                .families
+                .iter()
+                .copied()
+                .map(CognitiveProjectionFamily::as_str)
+                .collect::<Vec<_>>(),
+            "dependency_state_id": derived_row_key(&format!(
+                "{}:{}",
+                lease.project_id,
+                CognitiveProjectionFamily::DependencyDirty.as_str()
+            )),
+            "now": now,
+        });
+        let vars_object = vars.as_object_mut().ok_or_else(|| {
+            StoreError::Decode("projection lease bindings were not an object".to_owned())
+        })?;
+        let extra_object = extra.as_object().ok_or_else(|| {
+            StoreError::Decode("projection lease extra bindings were not an object".to_owned())
+        })?;
+        vars_object.extend(extra_object.clone());
+        let value = self.execute_value(op, vars).await?;
+        let result: CognitiveProjectionMutationResult = decode_value(op, value)?;
+        if result.rows_updated != lease.claimed_rows {
+            return Err(StoreError::PolicyViolation(format!(
+                "cognitive projection lease mutated {} of {} claimed rows",
+                result.rows_updated, lease.claimed_rows
+            )));
+        }
+        Ok(result.rows_updated)
+    }
+
+    pub async fn cognitive_projection_backlog(
+        &self,
+    ) -> Result<CognitiveProjectionBacklog, StoreError> {
+        let value = self
+            .execute_value(
+                NamedSurqlOp::LoadCognitiveProjectionBacklog,
+                Value::Object(serde_json::Map::new()),
+            )
+            .await?;
+        decode_value(NamedSurqlOp::LoadCognitiveProjectionBacklog, value)
+    }
+
+    pub async fn load_cognitive_projection_projects(
+        &self,
+        start: usize,
+        limit: usize,
+    ) -> Result<CognitiveProjectionProjectPage, StoreError> {
+        let value = self
+            .execute_value(
+                NamedSurqlOp::LoadCognitiveProjectionProjects,
+                json!({
+                    "start": start,
+                    "limit": limit.clamp(1, COGNITIVE_PROJECTION_PROJECT_PAGE_SIZE),
+                }),
+            )
+            .await?;
+        decode_value(NamedSurqlOp::LoadCognitiveProjectionProjects, value)
+    }
+
+    /// Persists independent family publication truth. For search this mirrors
+    /// `memory_search_state` for observability and is never a second read fence.
+    pub async fn publish_cognitive_projection_family_state(
+        &self,
+        project_id: ProjectId,
+        family: CognitiveProjectionFamily,
+        target_revision: MemoryRevision,
+        applied_revision: Option<MemoryRevision>,
+        status: CognitiveProjectionPublicationStatus,
+        last_error: Option<&str>,
+    ) -> Result<CognitiveProjectionFamilyState, StoreError> {
+        if status == CognitiveProjectionPublicationStatus::Published
+            && applied_revision != Some(target_revision)
+        {
+            return Err(StoreError::PolicyViolation(
+                "published cognitive projection state requires applied_revision == target_revision"
+                    .to_owned(),
+            ));
+        }
+        let last_error = last_error
+            .map(|detail| bounded_projection_detail(detail, "projection state error"))
+            .transpose()?;
+        let now = surreal_datetime_binding(OffsetDateTime::now_utc(), "projection state time")?;
+        let value = self
+            .execute_value(
+                NamedSurqlOp::PublishCognitiveProjectionFamilyState,
+                json!({
+                    "state_id": derived_row_key(&format!("{project_id}:{}", family.as_str())),
+                    "project_id": project_id,
+                    "family": family.as_str(),
+                    "target_revision": target_revision,
+                    "applied_revision": applied_revision,
+                    "status": status.as_str(),
+                    "last_error": last_error,
+                    "now": now,
+                }),
+            )
+            .await?;
+        decode_value(NamedSurqlOp::PublishCognitiveProjectionFamilyState, value)
+    }
+
+    pub async fn cognitive_projection_family_states(
+        &self,
+        project_id: ProjectId,
+    ) -> Result<Vec<CognitiveProjectionFamilyState>, StoreError> {
+        let value = self
+            .execute_value(
+                NamedSurqlOp::LoadCognitiveProjectionFamilyStates,
+                json!({ "project_id": project_id }),
+            )
+            .await?;
+        decode_value(NamedSurqlOp::LoadCognitiveProjectionFamilyStates, value)
+    }
+
+    /// Explicit offline Admin cutover. It pages every project first and refuses
+    /// to remove postings unless each authoritative search projection is `fts_v1`
+    /// at the current head; the Admin template repeats the gate transactionally.
+    pub async fn cutover_legacy_memory_search_postings(&self) -> Result<Value, StoreError> {
+        let mut start = 0usize;
+        loop {
+            let page = self
+                .load_cognitive_projection_projects(start, COGNITIVE_PROJECTION_PROJECT_PAGE_SIZE)
+                .await?;
+            for project in &page.projects {
+                if project.search_projection_format.as_deref()
+                    != Some(MEMORY_SEARCH_FTS_PROJECTION_FORMAT)
+                    || project.search_applied_revision != Some(project.head_revision)
+                {
+                    return Err(StoreError::PolicyViolation(format!(
+                        "memory search cutover refused stale project {}",
+                        project.project_id
+                    )));
+                }
+            }
+            let Some(next_start) = page.next_start else {
+                break;
+            };
+            if !page.truncated || next_start <= start {
+                return Err(StoreError::PolicyViolation(
+                    "cognitive projection project inventory did not advance".to_owned(),
+                ));
+            }
+            start = next_start;
+        }
+        self.execute_value(
+            NamedSurqlOp::CutoverLegacyMemorySearchPostings,
+            Value::Object(serde_json::Map::new()),
+        )
+        .await
     }
 
     pub async fn apply_observability(
@@ -2132,45 +3272,6 @@ impl CanonicalStore {
         if request.lifecycle_audit {
             return self.recall_l0_paged(request).await;
         }
-        for _attempt in 0..RECALL_REVISION_RESTART_ATTEMPTS {
-            let value = self
-                .execute_value(
-                    NamedSurqlOp::LoadMemorySearchCandidates,
-                    json!({
-                        "project_id": request.project_id,
-                        "exact_handle_parts": exact_memory_search_handle(&request.query)
-                            .map(|handle| string_fragments(&handle)),
-                        "tokens": memory_search_terms(request),
-                        "query_text": memory_search_query_text(request),
-                        "candidate_limit": MAX_MEMORY_SEARCH_CANDIDATES,
-                    }),
-                )
-                .await?;
-            let load: MemorySearchCandidateLoad =
-                decode_value(NamedSurqlOp::LoadMemorySearchCandidates, value)?;
-            if load.projection_revision != Some(load.at_revision) {
-                self.rebuild_memory_search_projection(request.project_id)
-                    .await?;
-                continue;
-            }
-            return Ok(rank_memory_search_candidates(request, load));
-        }
-        Err(StoreError::PolicyViolation(
-            "memory search projection could not catch up to a stable project revision after 3 attempts"
-                .to_owned(),
-        ))
-    }
-
-    #[cfg_attr(not(test), allow(dead_code))]
-    async fn recall_l0_fts_candidate(
-        &self,
-        request: &RecallL0Request,
-    ) -> Result<RecallL0Response, StoreError> {
-        if request.lifecycle_audit {
-            return Err(StoreError::PolicyViolation(
-                "the FTS candidate path does not serve lifecycle-audit recall".to_owned(),
-            ));
-        }
         let value = self
             .execute_value(
                 NamedSurqlOp::LoadMemorySearchFtsCandidates,
@@ -2183,19 +3284,40 @@ impl CanonicalStore {
                 }),
             )
             .await?;
-        let load: MemorySearchCandidateLoad =
+        let mut load: MemorySearchCandidateLoad =
             decode_value(NamedSurqlOp::LoadMemorySearchFtsCandidates, value)?;
-        if load.projection_format.as_deref() != Some(MEMORY_SEARCH_FTS_PROJECTION_FORMAT) {
-            return Err(StoreError::PolicyViolation(
-                "the FTS candidate path requires an explicit fts_v1 full rebuild".to_owned(),
-            ));
+        let projection_state = match load.projection_status {
+            Some(CognitiveProjectionPublicationStatus::Blocked) => {
+                CognitiveProjectionReadState::Blocked
+            }
+            Some(CognitiveProjectionPublicationStatus::Unavailable) => {
+                CognitiveProjectionReadState::Unavailable
+            }
+            Some(CognitiveProjectionPublicationStatus::Stale) => {
+                CognitiveProjectionReadState::Stale
+            }
+            None => CognitiveProjectionReadState::Unavailable,
+            _ if load.projection_format.as_deref() != Some(MEMORY_SEARCH_FTS_PROJECTION_FORMAT) => {
+                CognitiveProjectionReadState::Unavailable
+            }
+            _ if load.projection_revision != Some(load.at_revision)
+                || load.family_target_revision != Some(load.at_revision)
+                || load.family_applied_revision != Some(load.at_revision) =>
+            {
+                CognitiveProjectionReadState::Stale
+            }
+            Some(CognitiveProjectionPublicationStatus::Published) => {
+                CognitiveProjectionReadState::Published
+            }
+        };
+        if !projection_state.is_published() {
+            load.ordered_handles.clear();
+            load.candidates.clear();
+            load.truncated = false;
         }
-        if load.projection_revision != Some(load.at_revision) {
-            return Err(StoreError::PolicyViolation(
-                "the FTS candidate projection is not at the current project revision".to_owned(),
-            ));
-        }
-        Ok(rank_memory_search_candidates(request, load))
+        let mut response = rank_memory_search_candidates(request, load);
+        response.projection_state = projection_state;
+        Ok(response)
     }
 
     async fn recall_l0_paged(
@@ -2206,6 +3328,29 @@ impl CanonicalStore {
             .load_paged_recall_candidates(request.project_id, true, MAX_RECALL_SCAN_CANDIDATES)
             .await?;
         Ok(rank_recall_candidates(request, load))
+    }
+
+    async fn load_recall_projection_page(
+        &self,
+        project_id: ProjectId,
+        kind: &str,
+        start: usize,
+        limit: usize,
+        lifecycle_audit: bool,
+    ) -> Result<RecallCandidateLoad, StoreError> {
+        let value = self
+            .execute_value(
+                NamedSurqlOp::LoadRecallCandidates,
+                json!({
+                    "project_id": project_id,
+                    "kind": kind,
+                    "start": start,
+                    "limit": limit,
+                    "lifecycle_audit": lifecycle_audit,
+                }),
+            )
+            .await?;
+        decode_value(NamedSurqlOp::LoadRecallCandidates, value)
     }
 
     async fn load_paged_recall_candidates(
@@ -2222,20 +3367,15 @@ impl CanonicalStore {
             'projection: for kind in RECALL_CANDIDATE_KINDS {
                 let mut start = 0;
                 loop {
-                    let value = self
-                        .execute_value(
-                            NamedSurqlOp::LoadRecallCandidates,
-                            json!({
-                                "project_id": project_id,
-                                "kind": kind,
-                                "start": start,
-                                "limit": RECALL_CANDIDATE_PAGE_SIZE,
-                                "lifecycle_audit": lifecycle_audit,
-                            }),
+                    let mut page = self
+                        .load_recall_projection_page(
+                            project_id,
+                            kind,
+                            start,
+                            RECALL_CANDIDATE_PAGE_SIZE,
+                            lifecycle_audit,
                         )
                         .await?;
-                    let mut page: RecallCandidateLoad =
-                        decode_value(NamedSurqlOp::LoadRecallCandidates, value)?;
                     if at_revision.is_some_and(|revision| revision != page.at_revision) {
                         revision_drift = true;
                         break 'projection;
@@ -2266,20 +3406,9 @@ impl CanonicalStore {
             if revision_drift {
                 continue;
             }
-            let head_value = self
-                .execute_value(
-                    NamedSurqlOp::LoadRecallCandidates,
-                    json!({
-                        "project_id": project_id,
-                        "kind": "head",
-                        "start": 0,
-                        "limit": 1,
-                        "lifecycle_audit": lifecycle_audit,
-                    }),
-                )
+            let head = self
+                .load_recall_projection_page(project_id, "head", 0, 1, lifecycle_audit)
                 .await?;
-            let head: RecallCandidateLoad =
-                decode_value(NamedSurqlOp::LoadRecallCandidates, head_value)?;
             if at_revision.is_some_and(|revision| revision != head.at_revision) {
                 continue;
             }
@@ -2303,60 +3432,99 @@ impl CanonicalStore {
         &self,
         project_id: ProjectId,
     ) -> Result<MemoryRevision, StoreError> {
-        const MAX_REBUILD_CANDIDATES: usize = 250_000;
-        let load = self
-            .load_paged_recall_candidates(project_id, true, MAX_REBUILD_CANDIDATES)
+        for _attempt in 0..RECALL_REVISION_RESTART_ATTEMPTS {
+            let head = self
+                .load_recall_projection_page(project_id, "head", 0, 1, true)
+                .await?;
+            let target_revision = head.at_revision;
+            self.execute_value(
+                NamedSurqlOp::ResetMemorySearchProjection,
+                json!({ "project_id": project_id }),
+            )
             .await?;
-        if load.truncated {
-            return Err(StoreError::PolicyViolation(format!(
-                "memory search rebuild exceeded the {MAX_REBUILD_CANDIDATES} candidate safety cap"
-            )));
+            let rebuild_write_id = WriteId::new_v7();
+            let mut revision_drift = false;
+            'kinds: for kind in RECALL_CANDIDATE_KINDS {
+                let mut start = 0usize;
+                loop {
+                    let page = self
+                        .load_recall_projection_page(
+                            project_id,
+                            kind,
+                            start,
+                            RECALL_CANDIDATE_PAGE_SIZE,
+                            true,
+                        )
+                        .await?;
+                    if page.at_revision != target_revision {
+                        revision_drift = true;
+                        break 'kinds;
+                    }
+                    let page_len = page.candidates.len();
+                    let rows = page
+                        .candidates
+                        .iter()
+                        .map(|row| projection_rows(project_id, row, target_revision))
+                        .collect::<Result<Vec<_>, _>>()?
+                        .into_iter()
+                        .flatten()
+                        .collect::<Vec<_>>();
+                    self.dispatch_memory_search_projection(
+                        project_id,
+                        rebuild_write_id,
+                        target_revision,
+                        &rows,
+                        None,
+                        false,
+                    )
+                    .await?;
+                    if !page.truncated {
+                        break;
+                    }
+                    if page_len == 0 {
+                        return Err(StoreError::PolicyViolation(
+                            "memory search rebuild returned an empty truncated page".to_owned(),
+                        ));
+                    }
+                    start = start.saturating_add(page_len);
+                }
+            }
+            if revision_drift {
+                continue;
+            }
+            let final_head = self
+                .load_recall_projection_page(project_id, "head", 0, 1, true)
+                .await?;
+            if final_head.at_revision != target_revision {
+                continue;
+            }
+            self.dispatch_memory_search_projection(
+                project_id,
+                rebuild_write_id,
+                target_revision,
+                &[],
+                Some(MEMORY_SEARCH_FTS_PROJECTION_FORMAT),
+                true,
+            )
+            .await?;
+            self.publish_cognitive_projection_family_state(
+                project_id,
+                CognitiveProjectionFamily::Search,
+                target_revision,
+                Some(target_revision),
+                CognitiveProjectionPublicationStatus::Published,
+                None,
+            )
+            .await?;
+            return Ok(target_revision);
         }
-        let rows = load
-            .candidates
-            .iter()
-            .map(|row| projection_row(project_id, row, load.at_revision))
-            .collect::<Result<Vec<_>, _>>()?;
-        self.execute_value(
-            NamedSurqlOp::ResetMemorySearchProjection,
-            json!({ "project_id": project_id }),
-        )
-        .await?;
-        self.dispatch_memory_search_projection(
-            project_id,
-            WriteId::new_v7(),
-            load.at_revision,
-            &rows,
-            Some(MEMORY_SEARCH_FTS_PROJECTION_FORMAT),
-        )
-        .await?;
-        Ok(load.at_revision)
+        Err(StoreError::PolicyViolation(
+            "memory search rebuild could not obtain a stable project revision after 3 attempts"
+                .to_owned(),
+        ))
     }
 
     pub async fn memory_search_query_plan(
-        &self,
-        project_id: ProjectId,
-        query: &str,
-    ) -> Result<Value, StoreError> {
-        let tokens = eliot_types::normalize_query_tokens(query)
-            .into_iter()
-            .take(MAX_MEMORY_SEARCH_QUERY_TERMS)
-            .collect::<BTreeSet<_>>()
-            .into_iter()
-            .collect::<Vec<_>>();
-        self.execute_value(
-            NamedSurqlOp::ExplainMemorySearchPostings,
-            json!({
-                "project_id": project_id,
-                "tokens": tokens,
-                "candidate_limit": MAX_MEMORY_SEARCH_CANDIDATES,
-            }),
-        )
-        .await
-    }
-
-    #[cfg_attr(not(test), allow(dead_code))]
-    async fn memory_search_fts_query_plan(
         &self,
         project_id: ProjectId,
         query: &str,
@@ -2376,6 +3544,258 @@ impl CanonicalStore {
         .await
     }
 
+    async fn load_canonical_memory_l2_identity(
+        &self,
+        project_id: ProjectId,
+        requested_handle: &str,
+        requested_segment_record_id: Option<&str>,
+        start: u64,
+    ) -> Result<CanonicalMemoryL2Load, StoreError> {
+        let requested_is_segment = requested_segment_record_id.is_some();
+        let value = self
+            .execute_value(
+                NamedSurqlOp::LoadCanonicalMemoryL2,
+                json!({
+                    "project_id": project_id,
+                    "memory_handle_parts": string_fragments(requested_handle),
+                    "requested_segment_record_id_parts": requested_segment_record_id
+                        .map_or_else(Vec::new, string_fragments),
+                    "requested_is_segment": requested_is_segment,
+                    "start": start,
+                    "limit": CANONICAL_MEMORY_L2_MANIFEST_PAGE_SIZE,
+                }),
+            )
+            .await?;
+        decode_value(NamedSurqlOp::LoadCanonicalMemoryL2, value)
+    }
+
+    async fn load_exact_canonical_memory_segment(
+        &self,
+        project_id: ProjectId,
+        segment_id: &str,
+    ) -> Result<Option<CanonicalMemorySegment>, StoreError> {
+        let record_id = format!(
+            "capacity:{}",
+            derived_row_key(&format!("{project_id}:{segment_id}"))
+        );
+        let load = self
+            .load_canonical_memory_l2_identity(project_id, segment_id, Some(&record_id), 0)
+            .await?;
+        if load.truncated || !load.manifest_bodies_b64.is_empty() {
+            return Err(StoreError::Decode(
+                "canonical memory exact-segment lookup returned manifest pagination state"
+                    .to_owned(),
+            ));
+        }
+        let Some(encoded) = load.requested_segment_body_b64 else {
+            return Ok(None);
+        };
+        let segment: CanonicalMemorySegment =
+            decode_canonical_memory_body_b64(&encoded, "segment")?;
+        if segment.segment_id != segment_id {
+            return Err(StoreError::Decode(
+                "canonical memory exact-segment lookup resolved a different segment".to_owned(),
+            ));
+        }
+        Ok(Some(segment))
+    }
+
+    async fn load_canonical_memory_manifest(
+        &self,
+        project_id: ProjectId,
+        parent_handle: &str,
+        matching_segment: Option<&CanonicalMemorySegment>,
+    ) -> Result<Option<CanonicalMemoryManifest>, StoreError> {
+        let mut start = 0u64;
+        loop {
+            let load = self
+                .load_canonical_memory_l2_identity(project_id, parent_handle, None, start)
+                .await?;
+            if load.requested_segment_body_b64.is_some() {
+                return Err(StoreError::Decode(
+                    "canonical memory manifest lookup returned segment state".to_owned(),
+                ));
+            }
+            let page_len = u64::try_from(load.manifest_bodies_b64.len())
+                .map_err(|_| StoreError::BlobTooLarge)?;
+            if load.truncated && page_len == 0 {
+                return Err(StoreError::Decode(
+                    "canonical memory manifest page claimed truncation without rows".to_owned(),
+                ));
+            }
+            for encoded in load.manifest_bodies_b64 {
+                let manifest: CanonicalMemoryManifest =
+                    decode_canonical_memory_body_b64(&encoded, "manifest")?;
+                if manifest.memory_handle != parent_handle {
+                    return Err(StoreError::Decode(
+                        "canonical memory manifest lookup resolved a different parent".to_owned(),
+                    ));
+                }
+                if matching_segment.is_none_or(|segment| {
+                    canonical_memory_manifest_matches_segment(&manifest, segment)
+                }) {
+                    return Ok(Some(manifest));
+                }
+            }
+            if !load.truncated {
+                return Ok(None);
+            }
+            start = start
+                .checked_add(page_len)
+                .ok_or(StoreError::BlobTooLarge)?;
+            if start >= CANONICAL_MEMORY_L2_MAX_SCANNED_ROWS {
+                return Err(StoreError::PolicyViolation(format!(
+                    "canonical memory handle {parent_handle} exceeds the {CANONICAL_MEMORY_L2_MAX_SCANNED_ROWS}-row manifest scan bound"
+                )));
+            }
+        }
+    }
+
+    async fn load_canonical_memory_segment_set(
+        &self,
+        project_id: ProjectId,
+        manifest: &CanonicalMemoryManifest,
+    ) -> Result<Vec<CanonicalMemorySegmentRef>, StoreError> {
+        let segment_bodies = self
+            .load_canonical_memory_admission_children(
+                project_id,
+                manifest,
+                "segment",
+                CANONICAL_MEMORY_ADMISSION_PAGE_SIZE,
+            )
+            .await?;
+        let mut segments = segment_bodies
+            .into_iter()
+            .map(|body| {
+                serde_json::from_value::<CanonicalMemorySegment>(body)
+                    .map_err(|error| StoreError::Decode(error.to_string()))
+            })
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .filter(|segment| canonical_memory_manifest_matches_segment(manifest, segment))
+            .map(|segment| CanonicalMemorySegmentRef::from(&segment))
+            .collect::<Vec<_>>();
+        segments.sort_by_key(|segment| segment.ordinal);
+        if u64::try_from(segments.len()).map_err(|_| StoreError::BlobTooLarge)?
+            != manifest.segment_count
+        {
+            return Err(StoreError::Decode(
+                "canonical memory L2 could not resolve the manifest's complete segment set"
+                    .to_owned(),
+            ));
+        }
+        validate_canonical_memory_l2_page(Some(manifest), 0, &segments)?;
+        Ok(segments)
+    }
+
+    /// Metadata-only exact-L2 expansion for a large canonical memory handle.
+    /// Raw blob bytes never cross this response; callers page deterministic
+    /// range/hash references and expand them locally through `BlobStore`.
+    pub async fn canonical_memory_l2(
+        &self,
+        project_id: ProjectId,
+        memory_handle: &str,
+        continuation: Option<&str>,
+    ) -> Result<CanonicalMemoryL2Page, StoreError> {
+        let memory_handle = memory_handle.trim();
+        if memory_handle.is_empty() || memory_handle.len() > MAX_EXACT_L2_HANDLE_BYTES {
+            return Err(StoreError::PolicyViolation(
+                "canonical memory L2 handle must contain 1..=512 bytes".to_owned(),
+            ));
+        }
+        let segment_request = memory_handle.starts_with("memory-segment:");
+        if segment_request && continuation.is_some() {
+            return Err(StoreError::PolicyViolation(
+                "canonical memory segment L2 requests do not accept continuation tokens".to_owned(),
+            ));
+        }
+        let (start, continuation_fence) =
+            parse_canonical_memory_l2_continuation(memory_handle, continuation)?;
+        let requested_segment = if segment_request {
+            self.load_exact_canonical_memory_segment(project_id, memory_handle)
+                .await?
+        } else {
+            None
+        };
+        if segment_request && requested_segment.is_none() {
+            return Ok(unresolved_canonical_memory_l2_page(memory_handle));
+        }
+        let resolved_parent_handle = requested_segment
+            .as_ref()
+            .map_or(memory_handle, |segment| segment.parent_handle.as_str());
+        let manifest = self
+            .load_canonical_memory_manifest(
+                project_id,
+                resolved_parent_handle,
+                requested_segment.as_ref(),
+            )
+            .await?;
+        let Some(manifest) = manifest else {
+            if continuation.is_some() {
+                return Err(StoreError::PolicyViolation(
+                    "canonical memory L2 continuation lost its manifest".to_owned(),
+                ));
+            }
+            return Ok(unresolved_canonical_memory_l2_page(memory_handle));
+        };
+        if let Some(expected) = continuation_fence.as_deref()
+            && expected != canonical_memory_l2_fence(memory_handle, &manifest, start)
+        {
+            return Err(StoreError::PolicyViolation(
+                "canonical memory L2 continuation is stale".to_owned(),
+            ));
+        }
+
+        if let Some(segment) = requested_segment {
+            let segment = CanonicalMemorySegmentRef::from(&segment);
+            validate_canonical_memory_l2_page(
+                Some(&manifest),
+                segment.ordinal,
+                std::slice::from_ref(&segment),
+            )?;
+            return Ok(CanonicalMemoryL2Page {
+                requested_handle: memory_handle.to_owned(),
+                resolved_parent_handle: Some(manifest.memory_handle.clone()),
+                requested_segment_id: Some(segment.segment_id.clone()),
+                manifest: Some(manifest),
+                segments: vec![segment],
+                continuation: None,
+                truncated: false,
+            });
+        }
+
+        let all_segments = self
+            .load_canonical_memory_segment_set(project_id, &manifest)
+            .await?;
+        let start_index = usize::try_from(start).map_err(|_| StoreError::BlobTooLarge)?;
+        let segments = all_segments
+            .into_iter()
+            .skip(start_index)
+            .take(usize::from(CANONICAL_MEMORY_L2_PAGE_SIZE))
+            .collect::<Vec<_>>();
+        validate_canonical_memory_l2_page(Some(&manifest), start, &segments)?;
+        let next_start = start
+            .saturating_add(u64::try_from(segments.len()).map_err(|_| StoreError::BlobTooLarge)?);
+        let truncated = next_start < manifest.segment_count;
+        let next = if truncated {
+            Some(format!(
+                "memory-l2:{next_start}:{}",
+                canonical_memory_l2_fence(memory_handle, &manifest, next_start)
+            ))
+        } else {
+            None
+        };
+        Ok(CanonicalMemoryL2Page {
+            requested_handle: memory_handle.to_owned(),
+            resolved_parent_handle: Some(manifest.memory_handle.clone()),
+            requested_segment_id: None,
+            manifest: Some(manifest),
+            segments,
+            continuation: next,
+            truncated,
+        })
+    }
+
     pub async fn fetch_atoms_l2(
         &self,
         request: &FetchAtomsL2Request,
@@ -2390,8 +3810,19 @@ impl CanonicalStore {
         let value = self
             .execute_value(op, json!({ "request": request, "exact": exact }))
             .await?;
-        let mut response = decode_value(op, value)?;
+        let mut response: FetchAtomsL2Response = decode_value(op, value)?;
         if !selectors.is_empty() {
+            for selector in selectors
+                .iter()
+                .filter(|selector| selector.kind == L2HandleKind::CanonicalMemory)
+            {
+                let page = self
+                    .canonical_memory_l2(request.project_id, &selector.public_handle, None)
+                    .await?;
+                if page.manifest.is_some() {
+                    response.canonical_memory_pages.push(page);
+                }
+            }
             finalize_exact_l2_response(&mut response, &selectors, continuation);
         }
         Ok(response)
@@ -2838,6 +4269,26 @@ impl CanonicalStore {
         Ok(())
     }
 
+    /// Cold project rebuild boundary. The coordinator must publish the
+    /// `dependency_dirty` family as stale before invoking this reset.
+    pub async fn reset_ul_reverse_dependency_project(
+        &self,
+        project_id: ProjectId,
+    ) -> Result<(), StoreError> {
+        let value = self
+            .execute_value(
+                NamedSurqlOp::ResetUlReverseDependencyProject,
+                json!({ "project_id": project_id }),
+            )
+            .await?;
+        if value.get("reset").and_then(Value::as_bool) != Some(true) {
+            return Err(StoreError::Decode(
+                "reverse dependency project reset omitted confirmation".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
     pub async fn load_ul_reverse_dependents(
         &self,
         project_id: ProjectId,
@@ -2937,6 +4388,26 @@ impl CanonicalStore {
                 }),
             )
             .await?;
+        Ok(())
+    }
+
+    /// Cold project scan boundary for the derived dirty projection. This does
+    /// not alter canonical artifacts or dependency records.
+    pub async fn reset_ul_artifact_dirty_project(
+        &self,
+        project_id: ProjectId,
+    ) -> Result<(), StoreError> {
+        let value = self
+            .execute_value(
+                NamedSurqlOp::ResetUlArtifactDirtyProject,
+                json!({ "project_id": project_id }),
+            )
+            .await?;
+        if value.get("reset").and_then(Value::as_bool) != Some(true) {
+            return Err(StoreError::Decode(
+                "artifact dirty project reset omitted confirmation".to_owned(),
+            ));
+        }
         Ok(())
     }
 
@@ -3077,6 +4548,7 @@ impl CanonicalStore {
             .await?;
         decode_value(NamedSurqlOp::UpsertUlExperimentAssignmentExplicit, value)
     }
+
     pub async fn load_ul_experiment_assignment(
         &self,
         project_id: ProjectId,
@@ -3892,18 +5364,42 @@ fn canonical_payloads(envelope: &MemoryWriteEnvelope) -> Result<Vec<Value>, Stor
                 .map(|body| (observation, body))
         })
         .map(|(observation, body)| {
+            let receipt_kind = observation
+                .payload
+                .get("receipt_kind")
+                .and_then(Value::as_str);
+            validate_capacity_receipt(receipt_kind, body)?;
             let body_bytes =
                 serde_json::to_vec(body).map_err(|error| StoreError::Decode(error.to_string()))?;
-            let subject_ref = canonical_subject_ref(
-                observation
-                    .payload
-                    .get("receipt_kind")
-                    .and_then(Value::as_str),
-                body,
-            )
-            .unwrap_or(&observation.observation_id);
+            if matches!(
+                receipt_kind,
+                Some(
+                    "memory_blob_segment" | "cue_binding_page" | "memory_blob_manifest"
+                )
+            ) && body_bytes.len() > CANONICAL_MEMORY_CHILD_BODY_MAX_BYTES
+            {
+                return Err(StoreError::PolicyViolation(format!(
+                    "canonical memory child body is {} bytes; admission transport allows {CANONICAL_MEMORY_CHILD_BODY_MAX_BYTES}",
+                    body_bytes.len()
+                )));
+            }
+            let subject_ref =
+                canonical_subject_ref(receipt_kind, body).unwrap_or(&observation.observation_id);
+            let canonical_record_id = capacity_record_id(receipt_kind, body).map_or_else(
+                || observation.observation_id.clone(),
+                |capacity_id| {
+                    format!(
+                        "capacity:{}",
+                        derived_row_key(&format!("{}:{capacity_id}", envelope.project_id))
+                    )
+                },
+            );
             Ok(json!({
                 "observation_id": observation.observation_id,
+                "canonical_record_id_fragments": string_fragments(&canonical_record_id),
+                "canonical_record_ref_fragments": string_fragments(
+                    &format!("canonical_record:{canonical_record_id}")
+                ),
                 "receipt_body_json_b64": STANDARD_NO_PAD.encode(body_bytes),
                 "subject_ref_fragments": string_fragments(subject_ref),
                 "trace_ref_fragments": canonical_field_fragments(body, "trace_ref"),
@@ -3911,6 +5407,38 @@ fn canonical_payloads(envelope: &MemoryWriteEnvelope) -> Result<Vec<Value>, Stor
                 "action_fragments": canonical_field_fragments(body, "action"),
                 "cue_preview_fragments": canonical_field_fragments(body, "body_md"),
             }))
+        })
+        .collect()
+}
+
+fn capacity_record_id<'a>(receipt_kind: Option<&str>, body: &'a Value) -> Option<&'a str> {
+    match receipt_kind {
+        Some("memory_blob_segment") => body.get("segment_id").and_then(Value::as_str),
+        Some("cue_binding_page") => body.get("page_id").and_then(Value::as_str),
+        Some("memory_blob_manifest") => body.get("manifest_id").and_then(Value::as_str),
+        _ => None,
+    }
+}
+
+fn capacity_manifests(
+    envelope: &MemoryWriteEnvelope,
+) -> Result<Vec<CanonicalMemoryManifest>, StoreError> {
+    envelope
+        .tool_observations
+        .iter()
+        .filter(|observation| {
+            observation
+                .payload
+                .get("receipt_kind")
+                .and_then(Value::as_str)
+                == Some("memory_blob_manifest")
+        })
+        .map(|observation| {
+            let body = observation.payload.get("receipt_body").ok_or_else(|| {
+                StoreError::Decode("capacity manifest omitted receipt_body".to_owned())
+            })?;
+            serde_json::from_value(body.clone())
+                .map_err(|error| StoreError::Decode(error.to_string()))
         })
         .collect()
 }
@@ -3951,6 +5479,8 @@ fn canonical_subject_ref<'a>(receipt_kind: Option<&str>, body: &'a Value) -> Opt
             Some("finalization_id")
         }
         Some("cognitive_tool_observation") => Some("call_subject_ref"),
+        Some("memory_blob_segment" | "cue_binding_page") => Some("parent_handle"),
+        Some("memory_blob_manifest") => Some("memory_handle"),
         Some(
             "cognitive_run_contract"
             | "cognitive_run_attempt"
@@ -3981,6 +5511,125 @@ fn canonical_subject_ref<'a>(receipt_kind: Option<&str>, body: &'a Value) -> Opt
     ]
     .into_iter()
     .find_map(|field| body.get(field).and_then(Value::as_str))
+}
+
+fn validate_capacity_receipt(receipt_kind: Option<&str>, body: &Value) -> Result<(), StoreError> {
+    match receipt_kind {
+        Some("memory_blob_manifest") => {
+            let manifest: CanonicalMemoryManifest = serde_json::from_value(body.clone())
+                .map_err(|error| StoreError::Decode(error.to_string()))?;
+            if manifest.schema_version != eliot_types::CANONICAL_MEMORY_SCHEMA_VERSION
+                || manifest.memory_handle.trim().is_empty()
+                || manifest.memory_handle.len() > 512
+                || manifest.logical_kind.trim().is_empty()
+                || manifest.media_type.trim().is_empty()
+                || manifest.segment_count == 0
+                || usize::try_from(manifest.segment_target_bytes).ok()
+                    != Some(eliot_types::CANONICAL_MEMORY_SEGMENT_TARGET_BYTES)
+                || !is_lower_blake3_hex(&manifest.segment_set_hash_blake3)
+                || !is_lower_blake3_hex(&manifest.cue_page_set_hash_blake3)
+            {
+                return Err(StoreError::PolicyViolation(
+                    "canonical memory manifest failed typed validation".to_owned(),
+                ));
+            }
+            validate_capacity_blob_ref(&manifest.blob)?;
+        }
+        Some("memory_blob_segment") => {
+            let segment: CanonicalMemorySegment = serde_json::from_value(body.clone())
+                .map_err(|error| StoreError::Decode(error.to_string()))?;
+            validate_capacity_blob_ref(&segment.blob)?;
+            let range_len = segment
+                .byte_end_exclusive
+                .checked_sub(segment.byte_start)
+                .ok_or_else(|| {
+                    StoreError::PolicyViolation(
+                        "canonical memory segment range is reversed".to_owned(),
+                    )
+                })?;
+            let expected_id = capacity_segment_id(&segment);
+            if segment.schema_version != eliot_types::CANONICAL_MEMORY_SCHEMA_VERSION
+                || segment.parent_handle.trim().is_empty()
+                || segment.parent_handle.len() > 512
+                || segment.logical_kind.trim().is_empty()
+                || segment.segment_count == 0
+                || segment.ordinal >= segment.segment_count
+                || !is_lower_blake3_hex(&segment.segment_set_hash_blake3)
+                || segment.byte_end_exclusive > segment.blob.size_bytes
+                || range_len
+                    > u64::try_from(eliot_types::CANONICAL_MEMORY_SEGMENT_TARGET_BYTES)
+                        .unwrap_or(u64::MAX)
+                || segment.search_text.len() > eliot_types::CANONICAL_MEMORY_SEGMENT_TARGET_BYTES
+                || segment.preview_text.len() > eliot_types::CANONICAL_MEMORY_SEGMENT_TARGET_BYTES
+                || !is_lower_blake3_hex(&segment.segment_hash_blake3)
+                || segment.segment_id != expected_id
+            {
+                return Err(StoreError::PolicyViolation(
+                    "canonical memory segment failed typed validation".to_owned(),
+                ));
+            }
+        }
+        Some("cue_binding_page") => {
+            let page: CueBindingPage = serde_json::from_value(body.clone())
+                .map_err(|error| StoreError::Decode(error.to_string()))?;
+            validate_capacity_blob_ref(&page.blob)?;
+            if page.schema_version != "eliot-cue-binding-page-v1"
+                || page.parent_handle.trim().is_empty()
+                || page.parent_handle.len() > 512
+                || page.page_count == 0
+                || page.page_ordinal >= page.page_count
+                || !is_lower_blake3_hex(&page.page_set_hash_blake3)
+                || page.cue_bindings.is_empty()
+                || page.cue_bindings.len() > eliot_types::MAX_CUE_BINDINGS_PER_PAGE
+                || page.page_id
+                    != cue_binding_page_id(
+                        &page.parent_handle,
+                        &page.blob,
+                        page.page_ordinal,
+                        &page.cue_bindings,
+                    )
+            {
+                return Err(StoreError::PolicyViolation(
+                    "canonical cue binding page failed typed validation".to_owned(),
+                ));
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn validate_capacity_blob_ref(blob: &eliot_types::BlobRef) -> Result<(), StoreError> {
+    if blob.algorithm != "blake3" || !is_lower_blake3_hex(&blob.digest_hex) {
+        return Err(StoreError::PolicyViolation(
+            "canonical memory blob reference failed algorithm/digest validation".to_owned(),
+        ));
+    }
+    let expected_path = format!("{}/{}.blob", &blob.digest_hex[..2], &blob.digest_hex[2..]);
+    if blob.relative_path.replace('\\', "/") != expected_path {
+        return Err(StoreError::PolicyViolation(
+            "canonical memory blob reference is not content-addressed".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn is_lower_blake3_hex(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn capacity_segment_id(segment: &CanonicalMemorySegment) -> String {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(segment.parent_handle.as_bytes());
+    hasher.update(segment.blob.digest_hex.as_bytes());
+    hasher.update(&segment.ordinal.to_le_bytes());
+    hasher.update(&segment.byte_start.to_le_bytes());
+    hasher.update(&segment.byte_end_exclusive.to_le_bytes());
+    hasher.update(segment.segment_hash_blake3.as_bytes());
+    format!("memory-segment:{}", hasher.finalize().to_hex())
 }
 
 fn string_fragments(value: &str) -> Vec<String> {
@@ -4066,9 +5715,98 @@ fn derived_row_key(value: &str) -> String {
 }
 
 #[cfg(test)]
+mod canonical_capacity_unit_tests {
+    use super::{
+        CANONICAL_MEMORY_ADMISSION_PAGE_SIZE, CANONICAL_MEMORY_CHILD_BODY_MAX_BYTES,
+        CANONICAL_MEMORY_L2_MANIFEST_PAGE_SIZE, canonical_memory_manifest_matches_segment,
+    };
+    use eliot_types::{BlobRef, CanonicalMemoryManifest, CanonicalMemorySegment};
+
+    #[test]
+    fn admission_transport_budget_covers_body_and_lookahead() {
+        const BASE64_BODY_BYTES: usize = (CANONICAL_MEMORY_CHILD_BODY_MAX_BYTES * 4).div_ceil(3);
+        const RESPONSE_OVERHEAD_BUDGET: usize = 16 * 1024;
+
+        assert_eq!(BASE64_BODY_BYTES, 174_763);
+        assert!(
+            (usize::from(CANONICAL_MEMORY_ADMISSION_PAGE_SIZE) + 1) * BASE64_BODY_BYTES
+                + RESPONSE_OVERHEAD_BUDGET
+                <= 512 * 1024
+        );
+    }
+
+    #[test]
+    fn normal_l2_transport_budget_covers_manifest_and_lookahead() {
+        const BASE64_BODY_BYTES: usize = (CANONICAL_MEMORY_CHILD_BODY_MAX_BYTES * 4).div_ceil(3);
+        const RESPONSE_OVERHEAD_BUDGET: usize = 16 * 1024;
+
+        assert_eq!(CANONICAL_MEMORY_L2_MANIFEST_PAGE_SIZE, 1);
+        assert!(
+            (usize::from(CANONICAL_MEMORY_L2_MANIFEST_PAGE_SIZE) + 1) * BASE64_BODY_BYTES
+                + RESPONSE_OVERHEAD_BUDGET
+                <= 512 * 1024
+        );
+    }
+
+    #[test]
+    fn normal_l2_generation_match_binds_set_hash_and_blob_ref() {
+        let blob = BlobRef {
+            algorithm: "blake3".to_owned(),
+            digest_hex: "1".repeat(64),
+            size_bytes: 64,
+            relative_path: "blake3/11/blob".to_owned(),
+        };
+        let manifest = CanonicalMemoryManifest {
+            schema_version: eliot_types::CANONICAL_MEMORY_SCHEMA_VERSION.to_owned(),
+            manifest_id: "manifest:generation-a".to_owned(),
+            memory_handle: "memory:parent".to_owned(),
+            logical_kind: "source".to_owned(),
+            media_type: "text/plain".to_owned(),
+            blob: blob.clone(),
+            segment_count: 1,
+            segment_target_bytes: 24 * 1024,
+            segment_set_hash_blake3: "2".repeat(64),
+            cue_page_count: 0,
+            cue_page_set_hash_blake3: "3".repeat(64),
+        };
+        let segment = CanonicalMemorySegment {
+            schema_version: eliot_types::CANONICAL_MEMORY_SCHEMA_VERSION.to_owned(),
+            segment_id: "memory-segment:generation-a:0".to_owned(),
+            parent_handle: manifest.memory_handle.clone(),
+            logical_kind: manifest.logical_kind.clone(),
+            blob,
+            ordinal: 0,
+            segment_count: 1,
+            segment_set_hash_blake3: manifest.segment_set_hash_blake3.clone(),
+            byte_start: 0,
+            byte_end_exclusive: 64,
+            segment_hash_blake3: "4".repeat(64),
+            search_text: String::new(),
+            preview_text: String::new(),
+        };
+
+        assert!(canonical_memory_manifest_matches_segment(
+            &manifest, &segment
+        ));
+        let mut other_set = manifest.clone();
+        other_set.segment_set_hash_blake3 = "5".repeat(64);
+        assert!(!canonical_memory_manifest_matches_segment(
+            &other_set, &segment
+        ));
+        let mut other_blob = manifest;
+        other_blob.blob.digest_hex = "6".repeat(64);
+        assert!(!canonical_memory_manifest_matches_segment(
+            &other_blob,
+            &segment
+        ));
+    }
+}
+
+#[cfg(test)]
 mod fts_live_tests;
 
 #[cfg(test)]
+#[allow(clippy::expect_used)]
 mod memory_search_selector_tests {
     use super::*;
 
@@ -4106,6 +5844,10 @@ mod memory_search_selector_tests {
             negative_memory: false,
             memory_revision: Some(MemoryRevision::new(7)),
             project_sequence: Some(ProjectSequence::new(9)),
+            source_segment_ordinal: None,
+            source_segment_count: None,
+            source_byte_start: None,
+            source_byte_end_exclusive: None,
             verification_value: 1,
             known_decision_delta: 2,
             prior_beneficial_use: 3,
@@ -4129,6 +5871,28 @@ mod memory_search_selector_tests {
     }
 
     #[test]
+    fn exact_l2_capacity_selectors_preserve_parent_and_segment_handles() {
+        let selectors = normalize_l2_selectors(&[
+            "memory:capacity-parent".to_owned(),
+            format!("memory-segment:{}", "a".repeat(64)),
+        ])
+        .expect("capacity selectors");
+
+        assert_eq!(selectors.len(), 2);
+        assert!(
+            selectors
+                .iter()
+                .all(|selector| selector.kind == L2HandleKind::CanonicalMemory)
+        );
+        assert_eq!(selectors[0].public_handle, "memory:capacity-parent");
+        assert_eq!(
+            selectors[1].public_handle,
+            format!("memory-segment:{}", "a".repeat(64))
+        );
+        assert!(l2_relation_identities(&selectors).is_empty());
+    }
+
+    #[test]
     fn document_selector_preserves_field_priority_and_projection_persists_it()
     -> Result<(), StoreError> {
         let row = candidate_row();
@@ -4146,27 +5910,20 @@ mod memory_search_selector_tests {
         ];
 
         assert_eq!(memory_search_document_terms(&row), expected);
-        let projection = projection_row(ProjectId::new_v7(), &row, MemoryRevision::new(7))?;
+        let projections = projection_rows(ProjectId::new_v7(), &row, MemoryRevision::new(7))?;
+        assert_eq!(projections.len(), 1);
+        let projection = &projections[0];
         let expected_document = expected.join(" ");
         assert_eq!(
             projection.get("search_document").and_then(Value::as_str),
             Some(expected_document.as_str())
         );
-        let posting_tokens = projection
-            .get("postings")
-            .and_then(Value::as_array)
-            .and_then(|postings| {
-                postings
-                    .iter()
-                    .map(|posting| posting.get("token").and_then(Value::as_str))
-                    .collect::<Option<Vec<_>>>()
-            });
-        assert_eq!(posting_tokens, Some(expected));
+        assert!(projection.get("postings").is_none());
         Ok(())
     }
 
     #[test]
-    fn document_selector_caps_after_higher_priority_fields() {
+    fn fts_capacity_segments_without_losing_lower_priority_tail() -> Result<(), StoreError> {
         let mut row = candidate_row();
         row.search_text = (0..MAX_MEMORY_SEARCH_DOCUMENT_TERMS)
             .map(|index| format!("search{index:04}"))
@@ -4176,7 +5933,7 @@ mod memory_search_selector_tests {
 
         let terms = memory_search_document_terms(&row);
 
-        assert_eq!(terms.len(), MAX_MEMORY_SEARCH_DOCUMENT_TERMS);
+        assert_eq!(terms.len(), MAX_MEMORY_SEARCH_DOCUMENT_TERMS + 10);
         assert_eq!(
             &terms[..8],
             [
@@ -4184,7 +5941,139 @@ mod memory_search_selector_tests {
             ]
         );
         assert_eq!(terms[8], "search0000");
-        assert!(!terms.iter().any(|term| term == "scope" || term == "tail"));
+        assert!(terms.iter().any(|term| term == "scope"));
+        assert!(terms.iter().any(|term| term == "tail"));
+
+        let projections = projection_rows(ProjectId::new_v7(), &row, MemoryRevision::new(7))?;
+        assert_eq!(projections.len(), 2);
+        let persisted_terms = projections
+            .iter()
+            .flat_map(|projection| {
+                projection["search_document"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .split_whitespace()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(persisted_terms, terms);
+        assert!(projections.iter().all(|projection| {
+            projection["search_document"]
+                .as_str()
+                .unwrap_or_default()
+                .split_whitespace()
+                .count()
+                <= MAX_MEMORY_SEARCH_DOCUMENT_TERMS
+        }));
+        Ok(())
+    }
+
+    #[test]
+    fn fts_capacity_projects_every_bounded_segment_with_exact_ranges() -> Result<(), StoreError> {
+        let mut row = candidate_row();
+        row.handle = "memory:projection-capacity".to_owned();
+        row.record_ref = "canonical_record:segment-2".to_owned();
+        row.search_text = (0..5_000)
+            .map(|index| format!("unique{index:04}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let all_terms = memory_search_document_terms(&row);
+        let projections = projection_rows_for_source(
+            ProjectId::new_v7(),
+            &row,
+            MemoryRevision::new(9),
+            ProjectionSegmentSource {
+                source_ordinal: 2,
+                source_count: 4,
+                byte_start: Some(49_152),
+                byte_end_exclusive: Some(73_728),
+            },
+        )?;
+
+        assert_eq!(projections.len(), all_terms.len().div_ceil(2_048));
+        assert!(projections.len() >= 3);
+        let mut projected_terms = Vec::new();
+        for (ordinal, projection) in projections.iter().enumerate() {
+            assert_eq!(projection["source_segment_ordinal"], 2);
+            assert_eq!(projection["source_segment_count"], 4);
+            assert_eq!(projection["source_byte_start"], 49_152);
+            assert_eq!(projection["source_byte_end_exclusive"], 73_728);
+            assert_eq!(projection["fts_segment_ordinal"], ordinal);
+            assert_eq!(projection["term_start"], ordinal * 2_048);
+            let terms = projection["search_document"]
+                .as_str()
+                .unwrap_or_default()
+                .split_whitespace()
+                .collect::<Vec<_>>();
+            assert!(terms.len() <= MAX_MEMORY_SEARCH_DOCUMENT_TERMS);
+            projected_terms.extend(terms);
+        }
+        assert_eq!(projected_terms, all_terms);
+        assert_eq!(
+            projections
+                .iter()
+                .filter_map(|projection| projection["projection_id"].as_str())
+                .collect::<HashSet<_>>()
+                .len(),
+            projections.len()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn fallback_capacity_scores_tail_segment_before_parent_dedup() {
+        let project_id = ProjectId::new_v7();
+        let request = RecallL0Request {
+            project_id,
+            query: "tailneedle".to_owned(),
+            consistency: eliot_types::ReadConsistencyMode::Latest,
+            at_least_revision: None,
+            lifecycle_audit: false,
+            task_id: None,
+            task_class_cues: Vec::new(),
+            scope_refs: Vec::new(),
+            concept_refs: Vec::new(),
+        };
+        let mut head = candidate_row();
+        head.handle = "memory:fallback-tail".to_owned();
+        head.record_ref = "canonical_record:head-segment".to_owned();
+        head.record_type = "memory_blob_segment".to_owned();
+        head.preview = "head segment".to_owned();
+        head.search_text = "unrelated beginning".to_owned();
+        head.cue_text.clear();
+        head.concept_text.clear();
+        head.source_segment_ordinal = Some(0);
+        head.source_segment_count = Some(2);
+        head.memory_revision = Some(MemoryRevision::new(12));
+
+        let mut tail = head.clone();
+        tail.record_ref = "canonical_record:tail-segment".to_owned();
+        tail.preview = "tail segment".to_owned();
+        tail.search_text = "tailneedle decisive evidence".to_owned();
+        tail.source_segment_ordinal = Some(1);
+        tail.memory_revision = Some(MemoryRevision::new(11));
+
+        let response = rank_recall_candidates(
+            &request,
+            RecallCandidateLoad {
+                at_revision: MemoryRevision::new(13),
+                candidates: vec![head, tail],
+                truncated: false,
+            },
+        );
+        assert_eq!(response.handles.len(), 1);
+        assert_eq!(response.handles[0].handle, "memory:fallback-tail");
+        assert_eq!(response.handles[0].preview, "tail segment");
+        assert!(response.rank_trace.feature_scores[0].lexical_overlap > 0);
+        assert!(
+            response
+                .rank_trace
+                .collapsed_duplicates
+                .iter()
+                .any(|trace| {
+                    trace.reason == "parent_segment_dedup_after_scoring"
+                        && trace.collapsed_record_refs == ["canonical_record:head-segment"]
+                })
+        );
     }
 
     #[test]
@@ -4211,6 +6100,25 @@ mod memory_search_selector_tests {
     }
 
     #[test]
+    fn cold_rebuild_capacity_streams_every_page_without_semantic_cap() {
+        let source = include_str!("canonical_store.rs");
+        let start = source
+            .find("pub async fn rebuild_memory_search_projection")
+            .expect("rebuild source anchor");
+        let tail = &source[start..];
+        let end = tail
+            .find("pub async fn memory_search_query_plan")
+            .expect("rebuild end anchor");
+        let rebuild = &tail[..end];
+        assert!(rebuild.contains("for kind in RECALL_CANDIDATE_KINDS"));
+        assert!(rebuild.contains("RECALL_CANDIDATE_PAGE_SIZE"));
+        assert!(rebuild.contains("start = start.saturating_add(page_len)"));
+        assert!(rebuild.contains("target_revision"));
+        assert!(!rebuild.contains("250_000"));
+        assert!(!rebuild.contains("MAX_REBUILD_CANDIDATES"));
+    }
+
+    #[test]
     fn fts_candidate_load_decodes_projection_format() -> Result<(), serde_json::Error> {
         let load: MemorySearchCandidateLoad = serde_json::from_value(json!({
             "at_revision": 13,
@@ -4229,7 +6137,7 @@ mod memory_search_selector_tests {
     }
 
     #[test]
-    fn fts_candidate_helper_is_phase_wired() {
-        let _ = CanonicalStore::recall_l0_fts_candidate;
+    fn public_recall_is_phase_wired() {
+        let _ = CanonicalStore::recall_l0;
     }
 }

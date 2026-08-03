@@ -2,8 +2,8 @@ use super::capsule::{
     CapsuleEvidence, PyramidBuilder, PyramidDecision, PyramidDependency, PyramidFailure,
 };
 use super::{
-    CueIndexService, GitMiningArtifacts, GitMiningService, ModuleCardService,
-    UlArtifactWriterService, failure_bindings_by_path,
+    GitMiningArtifacts, GitMiningService, ModuleCardService, UlArtifactWriterService,
+    failure_bindings_by_path,
 };
 use crate::codecortex::run_process;
 use crate::{EngineError, WriteAdmissionService, WriterHandle};
@@ -38,7 +38,6 @@ pub struct ConceptSeedResult {
 pub struct OnboardingService {
     store: CanonicalStore,
     writer: WriterHandle,
-    cue_index: CueIndexService,
     pyramid: PyramidBuilder,
 }
 
@@ -46,7 +45,6 @@ impl OnboardingService {
     #[must_use]
     pub fn new(store: CanonicalStore, writer: WriterHandle) -> Self {
         Self {
-            cue_index: CueIndexService::new(store.clone()),
             store,
             writer,
             pyramid: PyramidBuilder,
@@ -296,18 +294,6 @@ impl OnboardingService {
                     &seed.concept_dependencies,
                 )
                 .await?;
-            for concept in &seed.concepts {
-                self.cue_index
-                    .replace_record_bindings(
-                        project_id,
-                        &format!("concept:{}", concept.concept_id),
-                        "concept_node",
-                        &concept.purpose,
-                        &concept.cue_bindings,
-                        false,
-                    )
-                    .await?;
-            }
             checkpoint.completed_artifact_refs.extend(
                 seed.concepts
                     .iter()
@@ -345,16 +331,6 @@ impl OnboardingService {
                         promoted.build,
                     )
                     .await?;
-                    self.cue_index
-                        .replace_record_bindings(
-                            project_id,
-                            &format!("capsule:{}", promoted.artifact.capsule_id),
-                            "subsystem_capsule",
-                            &promoted.artifact.body_md,
-                            &promoted.artifact.cue_bindings,
-                            false,
-                        )
-                        .await?;
                     checkpoint
                         .completed_artifact_refs
                         .push(format!("capsule:{}", promoted.artifact.capsule_id));
@@ -381,16 +357,6 @@ impl OnboardingService {
             promoted_map.build,
         )
         .await?;
-        self.cue_index
-            .replace_record_bindings(
-                project_id,
-                &format!("system-map:{}", promoted_map.artifact.map_id),
-                "system_map",
-                &promoted_map.artifact.body_md,
-                &promoted_map.artifact.cue_bindings,
-                false,
-            )
-            .await?;
         checkpoint.stage = OnboardingStage::SystemMap;
         checkpoint
             .completed_artifact_refs
@@ -417,16 +383,6 @@ impl OnboardingService {
             promoted_charter.build,
         )
         .await?;
-        self.cue_index
-            .replace_record_bindings(
-                project_id,
-                &format!("charter:{}", promoted_charter.artifact.charter_id),
-                "project_charter",
-                &promoted_charter.artifact.body_md,
-                &promoted_charter.artifact.cue_bindings,
-                false,
-            )
-            .await?;
         checkpoint.stage = OnboardingStage::Complete;
         checkpoint
             .completed_artifact_refs
@@ -525,18 +481,6 @@ impl OnboardingService {
                     &cards,
                 )
                 .await?;
-            for card in &cards {
-                self.cue_index
-                    .replace_record_bindings(
-                        mining.run.project_id,
-                        &format!("card:{}", card.card_id),
-                        "module_card",
-                        &card.body_md,
-                        &card.cue_bindings,
-                        false,
-                    )
-                    .await?;
-            }
         }
         Ok(cards)
     }

@@ -243,9 +243,9 @@ pub use memory::{
     ClaimCardInput, ClaimProposeCommand, ClaimSummary, ClaimSupportCommand, ClaimVerifyCommand,
     CodeCortexPacketView, CodeCortexReport, CodeCortexRequest, CodeCortexScopeBinding,
     CodeEvidenceSource, CognitiveGateDecision, CognitiveGateOutcome, CognitiveGateReason,
-    CognitiveGateRequest, CollectiveTrace, CommandContext, CompilePacketL3Request,
-    CompletionAcceptanceItem, CompletionDecisionMemory, CompletionGateDecision,
-    CompletionMemoryAdmission, CompletionMemoryRequest, CompletionProof,
+    CognitiveGateRequest, CognitiveProjectionReadState, CollectiveTrace, CommandContext,
+    CompilePacketL3Request, CompletionAcceptanceItem, CompletionDecisionMemory,
+    CompletionGateDecision, CompletionMemoryAdmission, CompletionMemoryRequest, CompletionProof,
     CompletionProofSubmitCommand, CompletionStatus, ConfidenceLevel, ContextPacketL3,
     ContributionEffect, ControllerCommitHandoff, CountByName, CurrentStateRequest,
     CurrentStateResponse, DiagnosticBatchRecordCommand, DiagnosticEvidence, EliotHookEvent,
@@ -303,7 +303,11 @@ pub use provider_invocation::{
     ProviderRouteReadinessGate, ProviderRouteReadinessVerdict, ProviderTimeoutClass,
     ProviderTimeoutProfile,
 };
-pub use records::{BlobRef, HealthRecord, MigrationRecord};
+pub use records::{
+    BlobRef, CANONICAL_MEMORY_SCHEMA_VERSION, CANONICAL_MEMORY_SEGMENT_TARGET_BYTES,
+    CanonicalMemoryL2Page, CanonicalMemoryManifest, CanonicalMemorySegment,
+    CanonicalMemorySegmentRef, HealthRecord, MigrationRecord,
+};
 pub use replay::{
     CANONICAL_TRACE_EVIDENCE_PART_COUNT, CanonicalReplayAuthority, CanonicalReplayExecutionRecord,
     CanonicalReplayObservationEvidence, CanonicalTraceCompletenessContract,
@@ -418,8 +422,10 @@ pub use ul::cross_agent::{
     ul_cross_agent_dispatch_decision,
 };
 pub use ul::cue::{
-    CueBinding, CueBindingError, CueIndexRow, CueKind, CueMatchMode, CueRecordSource, CueStrength,
-    cue_row_id, normalize_binding, normalize_bindings, ul_token_estimate,
+    CueBinding, CueBindingError, CueBindingPage, CueIndexRow, CueKind, CueMatchMode,
+    CueRecordSource, CueStrength, MAX_CUE_BINDING_PAGE_BYTES, MAX_CUE_BINDINGS_PER_PAGE,
+    cue_binding_page_id, cue_binding_page_set_hash, cue_row_id, normalize_binding,
+    normalize_binding_pages, normalize_bindings, ul_token_estimate,
 };
 pub use ul::dependency::{
     UlArtifactDirtyState, UlDependencyKind, UlDependencyRebuildReport, UlDependencyRef,

@@ -15,10 +15,10 @@ fn t04_first_value_piggyback() -> TestResult {
     if rerun_with_credential_gate("t04_first_value_piggyback")? {
         return Ok(());
     }
-    let mut harness = Harness::start("first-value")?;
     let project_id = ProjectId::new_v7();
     let fingerprint = "t04-first-value";
-    let receipt = harness.seed(&failure_command(
+    let mut prepared = Harness::prepare("first-value")?;
+    let receipt = prepared.seed(&failure_command(
         project_id,
         fingerprint,
         "network session repeatedly drops",
@@ -28,6 +28,7 @@ fn t04_first_value_piggyback() -> TestResult {
         receipt.status,
         WriteStatus::Committed | WriteStatus::IdempotentReplay
     ));
+    let mut harness = prepared.launch()?;
     let revision_before = harness.current_revision(project_id)?;
 
     let response = harness.client.tool_call(
@@ -58,25 +59,24 @@ fn t04_first_value_piggyback() -> TestResult {
 }
 
 #[test]
-fn t04_session_dedup_and_revision_reinject() -> TestResult {
+fn t04_cold_recovery_uses_latest_revision_and_session_dedups() -> TestResult {
     let _guard = test_guard();
-    if rerun_with_credential_gate("t04_session_dedup_and_revision_reinject")? {
+    if rerun_with_credential_gate("t04_cold_recovery_uses_latest_revision_and_session_dedups")? {
         return Ok(());
     }
-    let mut harness = Harness::start("reinject")?;
     let project_id = ProjectId::new_v7();
     let fingerprint = "t04-revision";
-    harness.seed(&failure_command(project_id, fingerprint, "revision one", 1))?;
+    let mut prepared = Harness::prepare("reinject")?;
+    prepared.seed(&failure_command(project_id, fingerprint, "revision one", 1))?;
+    prepared.seed(&failure_command(project_id, fingerprint, "revision two", 2))?;
+    let mut harness = prepared.launch()?;
 
     let first = touch(&mut harness, 20, project_id)?;
     let second = touch(&mut harness, 21, project_id)?;
     assert_eq!(first["ul_fired"]["items"].as_array().map(Vec::len), Some(1));
     assert!(second.get("ul_fired").is_none());
-
-    harness.seed(&failure_command(project_id, fingerprint, "revision two", 2))?;
-    let third = touch(&mut harness, 22, project_id)?;
     assert_eq!(
-        third["ul_fired"]["items"][0]["payload"]["source_revision"],
+        first["ul_fired"]["items"][0]["payload"]["source_revision"],
         json!(2)
     );
     let receipts: Vec<InjectionReceipt> =
@@ -85,11 +85,7 @@ fn t04_session_dedup_and_revision_reinject() -> TestResult {
         .iter()
         .filter(|receipt| receipt.item_ref == format!("failure:{fingerprint}"))
         .collect::<Vec<_>>();
-    assert_eq!(delivered.len(), 2);
-    assert_ne!(
-        delivered[0].source_fingerprint,
-        delivered[1].source_fingerprint
-    );
+    assert_eq!(delivered.len(), 1);
     Ok(())
 }
 

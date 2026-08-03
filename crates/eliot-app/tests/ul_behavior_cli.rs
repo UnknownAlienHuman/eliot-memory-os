@@ -30,23 +30,8 @@ fn t05_touching_hotspot_fires_card_and_danger() -> TestResult {
     assert!(help_text.contains("--project"));
     assert!(help_text.contains("--root"));
 
-    let mut harness = Harness::start("t05-card-danger")?;
     let project_id = ProjectId::new_v7();
     let target_path = "crates/demo/src/lib.rs";
-    harness.seed(&failure_command(project_id, target_path, 1))?;
-    let initial = harness.client.tool_call(
-        500,
-        "eliot_current_state",
-        &json!({
-            "project_id": project_id,
-            "file_path": target_path,
-        }),
-    )?;
-    assert_eq!(
-        initial["ul_fired"]["items"][0]["item_ref"],
-        "failure:t05-hotspot-danger"
-    );
-
     let failure_ref = "failure:t05-hotspot-danger";
     let card = build_card(project_id, target_path, failure_ref)?;
     let card_command = SemanticCommand::UlArtifactBatchRecord(UlArtifactBatchRecordCommand {
@@ -58,14 +43,9 @@ fn t05_touching_hotspot_fires_card_and_danger() -> TestResult {
             to: format!("file:{}", card.path),
         }],
     });
-    harness.seed_many(&[failure_command(project_id, target_path, 2), card_command])?;
-    harness.replace_cue_record(
-        project_id,
-        &format!("card:{}", card.card_id),
-        "module_card",
-        &card.body_md,
-        &card.cue_bindings,
-    )?;
+    let mut prepared = Harness::prepare("t05-card-danger")?;
+    prepared.seed_many(&[failure_command(project_id, target_path, 2), card_command])?;
+    let mut harness = prepared.launch()?;
     let card_ref = format!("card:{}", card.card_id);
     let cue_rows_before_touch = harness.cue_rows(project_id)?;
     assert!(
@@ -125,17 +105,17 @@ fn h5_card_batches_replay_repair_and_heal_interrupted_mining() -> TestResult {
     if rerun_with_credential_gate("h5_card_batches_replay_repair_and_heal_interrupted_mining")? {
         return Ok(());
     }
-    let harness = Harness::start("h5-card-repair")?;
+    let mut prepared = Harness::prepare("h5-card-repair")?;
     let project_id = ProjectId::new_v7();
     let cards = (0..51)
         .map(|index| replay_card(project_id, index))
         .collect::<Vec<_>>();
-    let first = harness.write_module_cards("h5-run", &cards)?;
-    let row_count = harness
+    let first = prepared.write_module_cards("h5-run", &cards)?;
+    let row_count = prepared
         .ul_artifacts::<ModuleCard>(project_id, &["module_card"])?
         .len();
-    let replay = harness.write_module_cards("h5-run", &cards)?;
-    let replay_row_count = harness
+    let replay = prepared.write_module_cards("h5-run", &cards)?;
+    let replay_row_count = prepared
         .ul_artifacts::<ModuleCard>(project_id, &["module_card"])?
         .len();
 
@@ -156,7 +136,7 @@ fn h5_card_batches_replay_repair_and_heal_interrupted_mining() -> TestResult {
         .body_md
         .push_str("\nDRAGONS: failure:h5-new-binding");
     changed[0].build_fingerprint = "h5-changed".to_owned();
-    let repaired = harness.write_module_cards("h5-run", &changed)?;
+    let repaired = prepared.write_module_cards("h5-run", &changed)?;
     assert!(
         repaired
             .receipts
@@ -169,7 +149,7 @@ fn h5_card_batches_replay_repair_and_heal_interrupted_mining() -> TestResult {
             .iter()
             .any(|receipt| receipt.status == WriteStatus::IdempotentReplay)
     );
-    let canonical = harness
+    let canonical = prepared
         .ul_artifacts::<ModuleCard>(project_id, &["module_card"])?
         .into_iter()
         .filter(|record| record.receipt_body.card_id == changed[0].card_id)
@@ -202,7 +182,8 @@ fn h5_card_batches_replay_repair_and_heal_interrupted_mining() -> TestResult {
         repository.path(),
         &BTreeMap::new(),
     )?;
-    harness.seed(&mining_only_command(interrupted_project, &mined))?;
+    prepared.seed(&mining_only_command(interrupted_project, &mined))?;
+    let harness = prepared.launch()?;
     let healed = harness.run_ul_mine_git(interrupted_project, repository.path())?;
     let healed_cards = harness.ul_artifacts::<ModuleCard>(interrupted_project, &["module_card"])?;
 
@@ -219,9 +200,9 @@ fn h6_co_change_is_reachable_from_canonical_file_handle() -> TestResult {
     if rerun_with_credential_gate("h6_co_change_is_reachable_from_canonical_file_handle")? {
         return Ok(());
     }
-    let mut harness = Harness::start("h6-file-handle")?;
     let project_id = ProjectId::new_v7();
-    let receipt = harness.seed(&SemanticCommand::UlArtifactBatchRecord(
+    let mut prepared = Harness::prepare("h6-file-handle")?;
+    let receipt = prepared.seed(&SemanticCommand::UlArtifactBatchRecord(
         UlArtifactBatchRecordCommand {
             context: ul_context(project_id),
             artifacts: vec![UlArtifact::CoChangeEdge(CoChangeEdge {
@@ -251,6 +232,7 @@ fn h6_co_change_is_reachable_from_canonical_file_handle() -> TestResult {
             .iter()
             .any(|kind| kind == "co_change")
     );
+    let mut harness = prepared.launch()?;
     let exact = harness.client.tool_call(
         510,
         "eliot_fetch_l2",

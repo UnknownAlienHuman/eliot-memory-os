@@ -1,9 +1,9 @@
 use crate::EngineError;
 use eliot_store::CanonicalStore;
 use eliot_types::{
-    CueBinding, CueIndexRow, CueKind, CueRecordSource, CueStrength, CurrentStateRequest,
-    MemoryRevision, ObservedCue, ProjectId, ReadConsistencyMode, cue_row_id, normalize_binding,
-    normalize_path, normalize_symbol, ul_token_estimate,
+    CognitiveProjectionReadState, CueIndexRow, CueKind, CueRecordSource, CueStrength,
+    CurrentStateRequest, MemoryRevision, ObservedCue, ProjectId, ReadConsistencyMode, cue_row_id,
+    normalize_binding, normalize_path, normalize_symbol, ul_token_estimate,
 };
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
@@ -24,6 +24,8 @@ pub struct FiredMemory {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct FiringResult {
+    pub projection_revision: Option<MemoryRevision>,
+    pub projection_state: CognitiveProjectionReadState,
     pub matched: usize,
     pub deduplicated: usize,
     pub suppressed: usize,
@@ -37,9 +39,21 @@ struct ProjectCueShard {
     dir_prefix: Vec<CueIndexRow>,
 }
 
+pub(crate) struct StagedCueProjection {
+    project_id: ProjectId,
+    shard: ProjectCueShard,
+}
+
+impl StagedCueProjection {
+    pub(crate) const fn revision(&self) -> MemoryRevision {
+        self.shard.memory_revision
+    }
+}
+
 pub struct CueIndexService {
     store: CanonicalStore,
     shards: RwLock<HashMap<ProjectId, Arc<ProjectCueShard>>>,
+    target_revisions: RwLock<HashMap<ProjectId, MemoryRevision>>,
 }
 
 impl CueIndexService {
@@ -48,22 +62,29 @@ impl CueIndexService {
         Self {
             store,
             shards: RwLock::new(HashMap::new()),
+            target_revisions: RwLock::new(HashMap::new()),
         }
     }
 
-    pub async fn rebuild(&self, project_id: ProjectId) -> Result<(), EngineError> {
+    pub async fn rebuild(&self, project_id: ProjectId) -> Result<MemoryRevision, EngineError> {
+        let staged = self.stage_rebuild(project_id).await?;
+        self.install_staged(staged)
+    }
+
+    /// Builds and persists a stable shard without making it visible. The
+    /// coordinator publishes the durable family fence before installation.
+    pub(crate) async fn stage_rebuild(
+        &self,
+        project_id: ProjectId,
+    ) -> Result<StagedCueProjection, EngineError> {
         for _attempt in 0..4 {
             let start_revision = self.current_revision(project_id).await?;
-            let shard = self.build_shard(project_id, start_revision).await?;
+            let shard = self.build_shard(project_id, start_revision, true).await?;
             let end_revision = self.current_revision(project_id).await?;
             if start_revision != end_revision {
                 continue;
             }
-            self.shards
-                .write()
-                .map_err(|_| lock_error())?
-                .insert(project_id, Arc::new(shard));
-            return Ok(());
+            return Ok(StagedCueProjection { project_id, shard });
         }
         Err(EngineError::ServiceNotReady {
             service: "cue_index".to_owned(),
@@ -71,15 +92,28 @@ impl CueIndexService {
         })
     }
 
+    pub(crate) fn install_staged(
+        &self,
+        staged: StagedCueProjection,
+    ) -> Result<MemoryRevision, EngineError> {
+        let revision = staged.revision();
+        self.shards
+            .write()
+            .map_err(|_| lock_error())?
+            .insert(staged.project_id, Arc::new(staged.shard));
+        self.advance_target_revision(staged.project_id, revision)?;
+        Ok(revision)
+    }
+
     async fn build_shard(
         &self,
         project_id: ProjectId,
         memory_revision: MemoryRevision,
+        rebuild_from_canonical: bool,
     ) -> Result<ProjectCueShard, EngineError> {
-        let mut rows = self.store.load_cue_rows(project_id).await?;
-        let sources = self.store.load_cue_records(project_id).await?;
-        if !sources.is_empty() {
-            rows.clear();
+        let rows = if rebuild_from_canonical {
+            let sources = self.store.load_cue_records(project_id).await?;
+            let mut rows = Vec::new();
             for source in &sources {
                 rows.extend(rows_for_source(project_id, source)?);
             }
@@ -88,7 +122,10 @@ impl CueIndexService {
             self.store
                 .replace_project_cue_rows(project_id, &rows)
                 .await?;
-        }
+            rows
+        } else {
+            self.store.load_cue_rows(project_id).await?
+        };
 
         let mut shard = ProjectCueShard {
             memory_revision,
@@ -114,6 +151,59 @@ impl CueIndexService {
         Ok(shard)
     }
 
+    /// Loads an already-published durable cue projection into the in-memory
+    /// shard without deriving or repairing canonical project state. Cold
+    /// rebuild/recovery must use [`Self::rebuild`] instead.
+    pub async fn load_persisted_projection(
+        &self,
+        project_id: ProjectId,
+    ) -> Result<MemoryRevision, EngineError> {
+        let revision = self.current_revision(project_id).await?;
+        self.load_persisted_projection_at(project_id, revision)
+            .await?;
+        Ok(revision)
+    }
+
+    pub async fn load_persisted_projection_at(
+        &self,
+        project_id: ProjectId,
+        published_revision: MemoryRevision,
+    ) -> Result<(), EngineError> {
+        let shard = self
+            .build_shard(project_id, published_revision, false)
+            .await?;
+        self.shards
+            .write()
+            .map_err(|_| lock_error())?
+            .insert(project_id, Arc::new(shard));
+        self.advance_target_revision(project_id, published_revision)?;
+        Ok(())
+    }
+
+    /// Marks the project target synchronously before a fallible coordinator
+    /// notification. Firing can therefore reject a stale shard even when the
+    /// bounded notification queue is full and recovery must use the outbox.
+    pub fn mark_stale(
+        &self,
+        project_id: ProjectId,
+        target_revision: MemoryRevision,
+    ) -> Result<(), EngineError> {
+        self.advance_target_revision(project_id, target_revision)
+    }
+
+    fn advance_target_revision(
+        &self,
+        project_id: ProjectId,
+        target_revision: MemoryRevision,
+    ) -> Result<(), EngineError> {
+        let mut targets = self.target_revisions.write().map_err(|_| lock_error())?;
+        let target = targets.entry(project_id).or_insert(target_revision);
+        if *target < target_revision {
+            *target = target_revision;
+        }
+        Ok(())
+    }
+
     async fn current_revision(&self, project_id: ProjectId) -> Result<MemoryRevision, EngineError> {
         Ok(self
             .store
@@ -126,32 +216,6 @@ impl CueIndexService {
             .memory_revision)
     }
 
-    pub async fn replace_record_bindings(
-        &self,
-        project_id: ProjectId,
-        record_ref: &str,
-        record_kind: &str,
-        preview_text: &str,
-        bindings: &[CueBinding],
-        negative_memory: bool,
-    ) -> Result<(), EngineError> {
-        let source = CueRecordSource {
-            record_ref: record_ref.to_owned(),
-            record_kind: record_kind.to_owned(),
-            preview_text: preview_text.to_owned(),
-            payload: None,
-            cue_bindings: bindings.to_vec(),
-            negative_memory,
-            lifecycle: "active".to_owned(),
-        };
-        let rows = rows_for_source(project_id, &source)?;
-        self.store
-            .replace_cue_rows(project_id, record_ref, &rows)
-            .await?;
-        self.invalidate(project_id)?;
-        Ok(())
-    }
-
     pub fn invalidate(&self, project_id: ProjectId) -> Result<(), EngineError> {
         self.shards
             .write()
@@ -160,36 +224,48 @@ impl CueIndexService {
         Ok(())
     }
 
+    // Keep the stable async service boundary while the implementation reads
+    // only the already-installed in-memory shard.
+    #[allow(clippy::unused_async)]
     pub async fn fire(
         &self,
         project_id: ProjectId,
         cues: &[ObservedCue],
     ) -> Result<FiringResult, EngineError> {
-        let current_revision = self
-            .store
-            .current_state(&CurrentStateRequest {
-                project_id,
-                consistency: ReadConsistencyMode::Latest,
-                at_least_revision: None,
-            })
-            .await?
-            .memory_revision;
-        let refresh_required = self
-            .shards
-            .read()
-            .map_err(|_| lock_error())?
-            .get(&project_id)
-            .is_none_or(|shard| shard.memory_revision != current_revision);
-        if refresh_required {
-            self.rebuild(project_id).await?;
-        }
         let shard = self
             .shards
             .read()
             .map_err(|_| lock_error())?
             .get(&project_id)
-            .cloned()
-            .ok_or_else(lock_error)?;
+            .cloned();
+        let Some(shard) = shard else {
+            return Ok(FiringResult {
+                projection_revision: None,
+                projection_state: CognitiveProjectionReadState::Unavailable,
+                matched: 0,
+                deduplicated: 0,
+                suppressed: 0,
+                fired: Vec::new(),
+                overflow: 0,
+            });
+        };
+        let target_revision = self
+            .target_revisions
+            .read()
+            .map_err(|_| lock_error())?
+            .get(&project_id)
+            .copied();
+        if target_revision.is_some_and(|target| shard.memory_revision < target) {
+            return Ok(FiringResult {
+                projection_revision: Some(shard.memory_revision),
+                projection_state: CognitiveProjectionReadState::Stale,
+                matched: 0,
+                deduplicated: 0,
+                suppressed: 0,
+                fired: Vec::new(),
+                overflow: 0,
+            });
+        }
 
         let hits = matching_rows(&shard, cues);
         let matched = hits.len();
@@ -236,6 +312,8 @@ impl CueIndexService {
         let overflow = fired.len().saturating_sub(MAX_FIRED_MEMORIES);
         fired.truncate(MAX_FIRED_MEMORIES);
         Ok(FiringResult {
+            projection_revision: Some(shard.memory_revision),
+            projection_state: CognitiveProjectionReadState::Published,
             matched,
             deduplicated,
             suppressed,
@@ -296,6 +374,7 @@ fn rows_for_source(
                 row_id: cue_row_id(
                     project_id,
                     binding.cue_kind,
+                    binding.match_mode,
                     &binding.cue_value,
                     &source.record_ref,
                 ),

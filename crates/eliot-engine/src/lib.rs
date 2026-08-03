@@ -8,6 +8,7 @@ pub mod codecortex;
 pub mod cognition;
 pub mod cognitive_disposition;
 pub mod cognitive_field;
+pub mod cognitive_projection;
 pub mod collective;
 pub mod context;
 pub mod control_plane;
@@ -73,6 +74,11 @@ pub use cognition::{
 };
 pub use cognitive_disposition::resolve_canonical_case_dispositions;
 pub use cognitive_field::CognitiveFieldGradingService;
+pub use cognitive_projection::{
+    CognitiveProjectionCoordinator, CognitiveProjectionCoordinatorConfig,
+    CognitiveProjectionCoordinatorHandle, CognitiveProjectionMetrics,
+    CognitiveProjectionMetricsSnapshot, CognitiveProjectionShutdownHandle,
+};
 pub use collective::{
     BlackboardAddInput, BlackboardService, CollectiveMemoryWriter, CollectiveTraceService,
     LostAgentRecoveryService, MailboxSendInput, MailboxService, StopCoordinationDecision,
@@ -267,5 +273,6 @@ pub use worktree::{
 pub use writer::{
     CognitiveBeginPrecondition, CognitiveTerminalPrecondition, OperationRuntimeHandle,
     OperationRuntimeProxy, OperationRuntimeRequest, OperationRuntimeResponse, WriterActor,
-    WriterConfig, WriterHandle, WriterMetricsSnapshot, WriterRequest, default_writer_lane_count,
+    WriterConfig, WriterHandle, WriterMetricsSnapshot, WriterRequest, WriterShutdownHandle,
+    default_writer_lane_count,
 };

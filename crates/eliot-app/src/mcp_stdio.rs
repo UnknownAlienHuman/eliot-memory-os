@@ -20,11 +20,13 @@ use eliot_engine::{
     CanonicalR3ApprovalAuthorization, CanonicalReplayExecutionInput,
     CanonicalTraceCompletenessInput, CodeCortexMemoryWriter, CodeCortexService,
     CognitiveBeginPrecondition, CognitiveGate, CognitiveMemoryWriter,
+    CognitiveProjectionCoordinator, CognitiveProjectionCoordinatorConfig,
+    CognitiveProjectionCoordinatorHandle, CognitiveProjectionShutdownHandle,
     CognitiveTerminalPrecondition, CognitiveTransferLabService, CollectiveMemoryWriter,
     CollectiveTraceService, CompletionGate, ContextCompiler, ContextReinstatementService,
     ContourRouteRequest, ContourRoutingService, ContrastiveAbstractionService, CorpusProfileInput,
-    CorpusProfileService, CostLedgerService, CredentialProviderService, DataRootService,
-    DoctorService, EvalBaselineService, EvalCaseService, EvalComparisonService,
+    CorpusProfileService, CostLedgerService, CredentialProviderService, CueIndexService,
+    DataRootService, DoctorService, EvalBaselineService, EvalCaseService, EvalComparisonService,
     EvalCoverageService, EvalDatasetManifestService, EvalGateProfileService,
     EvalRegressionGateService, EvalRunInput, EvalRunnerService, EvalSuiteInput, EvalSuiteService,
     EvalTrendService, EvalVerdictService, ExperienceFormationService, ExperienceRetrievalService,
@@ -51,16 +53,17 @@ use eliot_engine::{
     SkillRegistryService, SleepConsolidationService, SleepRunInput, SloService,
     StatefulDbTestIsolationService, TaskExecutionClassifier, TaskMeaningService, TestCostService,
     TestInventoryService, TraceCompletenessService, TransferValidationEvidence,
-    UnderstandingProofValidator, VerificationDoctorIntegration, VerificationPlannerService,
-    VerificationProfileService, VerificationRunnerService, VerificationVerdictService,
-    VerifierHarness, WindowsServiceManager, WorkClaimRequest, WorkCreateRequest, WorkLeaseService,
-    WorkMemoryWriter, WorkQueueService, WorkState, WorktreeCleanupService, WorktreeCreateInput,
-    WorktreeLeaseService, WorktreeMemoryWriter, WriteAdmissionService, WriterActor, WriterConfig,
-    WriterHandle, antigravity_real_report, antigravity_report, antigravity_review_request,
-    builtin_manifests, deduplicate_experience_cases, deduplicate_experience_patterns,
-    default_lease_ttl_minutes, default_work_scope, external_review_request,
-    filter_required_exact_l2_response, harness_experiment_record,
-    resolve_canonical_case_dispositions, resolve_packet_scope_paths, test_request,
+    UlDependencyService, UnderstandingProofValidator, VerificationDoctorIntegration,
+    VerificationPlannerService, VerificationProfileService, VerificationRunnerService,
+    VerificationVerdictService, VerifierHarness, WindowsServiceManager, WorkClaimRequest,
+    WorkCreateRequest, WorkLeaseService, WorkMemoryWriter, WorkQueueService, WorkState,
+    WorktreeCleanupService, WorktreeCreateInput, WorktreeLeaseService, WorktreeMemoryWriter,
+    WriteAdmissionService, WriterActor, WriterConfig, WriterHandle, antigravity_real_report,
+    antigravity_report, antigravity_review_request, builtin_manifests,
+    deduplicate_experience_cases, deduplicate_experience_patterns, default_lease_ttl_minutes,
+    default_work_scope, external_review_request, filter_required_exact_l2_response,
+    harness_experiment_record, resolve_canonical_case_dispositions, resolve_packet_scope_paths,
+    test_request, writer::WriterShutdownHandle,
 };
 use eliot_store::{BlobStore, CanonicalClaimCard, CanonicalRecord, CanonicalStore, ControlWal};
 use eliot_types::{
@@ -879,8 +882,17 @@ fn validate_canonical_host_scope(
     Ok(())
 }
 
+struct McpMemoryRuntime {
+    writer_shutdown: WriterShutdownHandle,
+    writer_task: tokio::task::JoinHandle<()>,
+    projection_shutdown: CognitiveProjectionShutdownHandle,
+    projection_task: tokio::task::JoinHandle<Result<(), eliot_engine::EngineError>>,
+}
+
 pub(crate) struct McpDaemon {
     host_governor_authority: Mutex<()>,
+    projection: CognitiveProjectionCoordinatorHandle,
+    memory_runtime: Mutex<Option<McpMemoryRuntime>>,
     cognitive_governor: McpState,
     host_governor: McpState,
     cognitive_child: McpState,
@@ -899,6 +911,58 @@ pub(crate) struct McpDaemon {
 impl McpDaemon {
     pub(crate) fn operation_runtime_handle(&self) -> eliot_engine::OperationRuntimeHandle {
         self.host_governor.writer.operation_runtime()
+    }
+
+    pub(crate) async fn recover_memory_runtime(&self) -> Result<()> {
+        self.projection
+            .recover()
+            .await
+            .context("recover cognitive projection coordinator before READY")?;
+        Ok(())
+    }
+
+    pub(crate) async fn shutdown_memory_runtime(&self) -> Result<()> {
+        let Some(runtime) = self.memory_runtime.lock().await.take() else {
+            return Ok(());
+        };
+        let McpMemoryRuntime {
+            writer_shutdown,
+            writer_task,
+            projection_shutdown,
+            projection_task,
+        } = runtime;
+        let mut shutdown_error = None;
+
+        writer_shutdown.shutdown();
+        if let Err(error) = writer_task
+            .await
+            .context("writer actor task failed during shutdown")
+        {
+            shutdown_error = Some(error);
+        }
+
+        projection_shutdown.shutdown();
+        match projection_task
+            .await
+            .context("cognitive projection task failed during shutdown")
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                if shutdown_error.is_none() {
+                    shutdown_error = Some(error.into());
+                }
+            }
+            Err(error) => {
+                if shutdown_error.is_none() {
+                    shutdown_error = Some(error);
+                }
+            }
+        }
+
+        if let Some(error) = shutdown_error {
+            return Err(error);
+        }
+        Ok(())
     }
 
     pub(crate) async fn run_scheduled_ul_exam(
@@ -929,17 +993,40 @@ impl McpDaemon {
     ) -> Result<Arc<Self>> {
         let config = load_config(config_path)?;
         let store = CanonicalStore::new(config.db.surreal.clone());
-        Self::build(config_path, instance, publication, config, store)
+        let schema_ready = Arc::new(OnceCell::new());
+        Self::build(
+            config_path,
+            instance,
+            publication,
+            config,
+            store,
+            &schema_ready,
+        )
     }
 
-    pub(crate) fn new_with_config_and_store(
+    pub(crate) async fn new_with_config_and_store(
         config_path: &Path,
         instance: &RuntimeInstance,
         publication: &RuntimePublication,
         config: eliot_types::GovernorConfig,
         store: CanonicalStore,
     ) -> Result<Arc<Self>> {
-        Self::build(config_path, instance, publication, config, store)
+        store
+            .migrate_schema()
+            .await
+            .context("migrate canonical schema before daemon READY")?;
+        let schema_ready = Arc::new(OnceCell::new());
+        schema_ready
+            .set(())
+            .map_err(|_| anyhow::anyhow!("initialize shared daemon schema gate"))?;
+        Self::build(
+            config_path,
+            instance,
+            publication,
+            config,
+            store,
+            &schema_ready,
+        )
     }
 
     #[allow(clippy::too_many_lines)]
@@ -949,16 +1036,34 @@ impl McpDaemon {
         publication: &RuntimePublication,
         config: eliot_types::GovernorConfig,
         store: CanonicalStore,
+        schema_ready: &Arc<OnceCell<()>>,
     ) -> Result<Arc<Self>> {
         let root = runtime_root(config_path);
         let pipe_name = instance.pipe_name();
         let wal = ControlWal::open(&config.control_wal)?;
-        let (writer, actor) = WriterActor::channel(wal, store.clone(), &WriterConfig::default());
+        let cue_index = Arc::new(CueIndexService::new(store.clone()));
+        let dependency = Arc::new(UlDependencyService::new(store.clone()));
+        let (projection, projection_actor, projection_shutdown) =
+            CognitiveProjectionCoordinator::channel(
+                store.clone(),
+                Arc::clone(&cue_index),
+                Arc::clone(&dependency),
+                CognitiveProjectionCoordinatorConfig::default(),
+            );
+        let (writer, actor, writer_shutdown) = WriterActor::channel_with_projection_notifier(
+            wal,
+            store.clone(),
+            &WriterConfig::default(),
+            projection.clone(),
+        );
         let ul = Arc::new(UlRuntime::new(
             store.clone(),
             writer.clone(),
             &root,
             config.ul.activation.enable_min_edges,
+            cue_index,
+            dependency,
+            projection.clone(),
         ));
         let cursor_signing_key = load_or_create_operator_cursor_signing_key(instance)?;
         let cognitive_runtime = Arc::new(CognitiveRuntimePaths {
@@ -966,15 +1071,23 @@ impl McpDaemon {
             publication_path: instance.publication_path(),
         });
         let cognitive_principals = Arc::new(Mutex::new(HashMap::new()));
-        tokio::spawn(actor.run());
+        let projection_task = tokio::spawn(projection_actor.run());
+        let writer_task = tokio::spawn(actor.run());
         Ok(Arc::new(Self {
             host_governor_authority: Mutex::new(()),
+            projection,
+            memory_runtime: Mutex::new(Some(McpMemoryRuntime {
+                writer_shutdown,
+                writer_task,
+                projection_shutdown,
+                projection_task,
+            })),
             cognitive_governor: McpState {
                 root: root.clone(),
                 config_path: config_path.to_path_buf(),
                 store: store.clone(),
                 ul: Arc::clone(&ul),
-                schema_ready: OnceCell::new(),
+                schema_ready: Arc::clone(schema_ready),
                 control_wal: config.control_wal.clone(),
                 blob_store: config.blob_store.clone(),
                 profile: McpAccessProfile::CognitiveGovernor,
@@ -992,7 +1105,7 @@ impl McpDaemon {
                 config_path: config_path.to_path_buf(),
                 store: store.clone(),
                 ul: Arc::clone(&ul),
-                schema_ready: OnceCell::new(),
+                schema_ready: Arc::clone(schema_ready),
                 control_wal: config.control_wal.clone(),
                 blob_store: config.blob_store.clone(),
                 profile: McpAccessProfile::HostGovernor,
@@ -1010,7 +1123,7 @@ impl McpDaemon {
                 config_path: config_path.to_path_buf(),
                 store: store.clone(),
                 ul: Arc::clone(&ul),
-                schema_ready: OnceCell::new(),
+                schema_ready: Arc::clone(schema_ready),
                 control_wal: config.control_wal.clone(),
                 blob_store: config.blob_store.clone(),
                 profile: McpAccessProfile::CognitiveChild,
@@ -1028,7 +1141,7 @@ impl McpDaemon {
                 config_path: config_path.to_path_buf(),
                 store: store.clone(),
                 ul: Arc::clone(&ul),
-                schema_ready: OnceCell::new(),
+                schema_ready: Arc::clone(schema_ready),
                 control_wal: config.control_wal.clone(),
                 blob_store: config.blob_store.clone(),
                 profile: McpAccessProfile::CognitiveControl,
@@ -1046,7 +1159,7 @@ impl McpDaemon {
                 config_path: config_path.to_path_buf(),
                 store: store.clone(),
                 ul: Arc::clone(&ul),
-                schema_ready: OnceCell::new(),
+                schema_ready: Arc::clone(schema_ready),
                 control_wal: config.control_wal.clone(),
                 blob_store: config.blob_store.clone(),
                 profile: McpAccessProfile::UnderstandingReader,
@@ -1064,7 +1177,7 @@ impl McpDaemon {
                 config_path: config_path.to_path_buf(),
                 store: store.clone(),
                 ul: Arc::clone(&ul),
-                schema_ready: OnceCell::new(),
+                schema_ready: Arc::clone(schema_ready),
                 control_wal: config.control_wal.clone(),
                 blob_store: config.blob_store.clone(),
                 profile: McpAccessProfile::DynamicAgent,
@@ -1082,7 +1195,7 @@ impl McpDaemon {
                 config_path: config_path.to_path_buf(),
                 store: store.clone(),
                 ul: Arc::clone(&ul),
-                schema_ready: OnceCell::new(),
+                schema_ready: Arc::clone(schema_ready),
                 control_wal: config.control_wal.clone(),
                 blob_store: config.blob_store.clone(),
                 profile: McpAccessProfile::ClaudeGoverned,
@@ -1100,7 +1213,7 @@ impl McpDaemon {
                 config_path: config_path.to_path_buf(),
                 store: store.clone(),
                 ul: Arc::clone(&ul),
-                schema_ready: OnceCell::new(),
+                schema_ready: Arc::clone(schema_ready),
                 control_wal: config.control_wal.clone(),
                 blob_store: config.blob_store.clone(),
                 profile: McpAccessProfile::CodexController,
@@ -1118,7 +1231,7 @@ impl McpDaemon {
                 config_path: config_path.to_path_buf(),
                 store: store.clone(),
                 ul: Arc::clone(&ul),
-                schema_ready: OnceCell::new(),
+                schema_ready: Arc::clone(schema_ready),
                 control_wal: config.control_wal.clone(),
                 blob_store: config.blob_store.clone(),
                 profile: McpAccessProfile::CodexWorker,
@@ -1136,7 +1249,7 @@ impl McpDaemon {
                 config_path: config_path.to_path_buf(),
                 store: store.clone(),
                 ul: Arc::clone(&ul),
-                schema_ready: OnceCell::new(),
+                schema_ready: Arc::clone(schema_ready),
                 control_wal: config.control_wal.clone(),
                 blob_store: config.blob_store.clone(),
                 profile: McpAccessProfile::ExternalAuditor,
@@ -1154,7 +1267,7 @@ impl McpDaemon {
                 config_path: config_path.to_path_buf(),
                 store: store.clone(),
                 ul: Arc::clone(&ul),
-                schema_ready: OnceCell::new(),
+                schema_ready: Arc::clone(schema_ready),
                 control_wal: config.control_wal.clone(),
                 blob_store: config.blob_store.clone(),
                 profile: McpAccessProfile::Verifier,
@@ -1172,7 +1285,7 @@ impl McpDaemon {
                 config_path: config_path.to_path_buf(),
                 store: store.clone(),
                 ul: Arc::clone(&ul),
-                schema_ready: OnceCell::new(),
+                schema_ready: Arc::clone(schema_ready),
                 control_wal: config.control_wal.clone(),
                 blob_store: config.blob_store.clone(),
                 profile: McpAccessProfile::HumanOperator,
@@ -1190,7 +1303,7 @@ impl McpDaemon {
                 config_path: config_path.to_path_buf(),
                 store,
                 ul,
-                schema_ready: OnceCell::new(),
+                schema_ready: Arc::clone(schema_ready),
                 control_wal: config.control_wal,
                 blob_store: config.blob_store,
                 profile: McpAccessProfile::HumanReadonly,
@@ -2664,7 +2777,7 @@ struct McpState {
     config_path: PathBuf,
     store: CanonicalStore,
     ul: Arc<UlRuntime>,
-    schema_ready: OnceCell<()>,
+    schema_ready: Arc<OnceCell<()>>,
     control_wal: ControlWalConfig,
     blob_store: BlobStoreConfig,
     profile: McpAccessProfile,

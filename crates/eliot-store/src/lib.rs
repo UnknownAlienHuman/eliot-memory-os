@@ -12,7 +12,10 @@ mod surreal_rpc;
 pub mod surreal_server;
 pub mod surreal_store;
 
-pub use blob_store::BlobStore;
+pub use blob_store::{
+    BlobStore, CANONICAL_MEMORY_TRANSPORT_MAX_BYTES, CanonicalMemoryIngressPlan,
+    CanonicalMemoryStagedRecord, CanonicalMemoryWritePlan,
+};
 pub use canonical_projection::{
     CanonicalAutonomyRunView, CanonicalLifecycleView, CanonicalRecord, CanonicalReplayView,
     CanonicalSleepView, CanonicalTruncation, MAX_CANONICAL_RECORDS, MAX_CURRENT_UL_ARTIFACTS,
@@ -20,7 +23,10 @@ pub use canonical_projection::{
 };
 pub use canonical_store::{
     CanonicalClaimCard, CanonicalSecretScanFinding, CanonicalSecretScanReport, CanonicalStore,
-    CanonicalToolObservation,
+    CanonicalToolObservation, CognitiveProjectionBacklog, CognitiveProjectionFamily,
+    CognitiveProjectionFamilyCounts, CognitiveProjectionFamilyState,
+    CognitiveProjectionIntentReceipt, CognitiveProjectionLease, CognitiveProjectionProject,
+    CognitiveProjectionProjectPage, CognitiveProjectionPublicationStatus,
 };
 pub use control_wal::{
     ControlWal, WalDeadLetter, WalFailedWrite, WalPendingWrite, WalProjectHead, WalWriteState,

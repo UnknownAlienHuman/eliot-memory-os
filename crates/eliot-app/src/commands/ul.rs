@@ -618,7 +618,6 @@ pub(crate) async fn run_ul_mine_git_from_daemon(
             .await?
     };
 
-    refresh_card_cues(store, project_id, &cards).await?;
     refresh_card_dependencies(store, project_id, &cards).await?;
     let card_committed = card_report
         .receipts
@@ -1491,25 +1490,4 @@ fn ul_daemon_instance(config_path: &Path) -> Result<RuntimeInstance> {
         anyhow::bail!("UL daemon config does not match the requested config");
     }
     Ok(isolated)
-}
-
-async fn refresh_card_cues(
-    store: &CanonicalStore,
-    project_id: ProjectId,
-    cards: &[eliot_types::ModuleCard],
-) -> Result<()> {
-    let cue_index = eliot_engine::CueIndexService::new(store.clone());
-    for card in cards {
-        cue_index
-            .replace_record_bindings(
-                project_id,
-                &format!("card:{}", card.card_id),
-                "module_card",
-                &card.body_md,
-                &card.cue_bindings,
-                false,
-            )
-            .await?;
-    }
-    Ok(())
 }

@@ -1,6 +1,6 @@
 use super::{
-    CapsuleEvidence, CueIndexService, ModuleCardService, OnboardingService, PyramidBuilder,
-    PyramidFailure, UlArtifactWriterService, UlDependencyService, failure_bindings_by_path,
+    CapsuleEvidence, ModuleCardService, OnboardingService, PyramidBuilder, PyramidFailure,
+    UlArtifactWriterService, UlDependencyService, failure_bindings_by_path,
 };
 use crate::{EngineError, WriteAdmissionService, WriterHandle};
 use eliot_store::{CanonicalRecord, CanonicalStore};
@@ -16,7 +16,6 @@ pub struct UlMaintenanceService {
     writer: WriterHandle,
     dependency: UlDependencyService,
     _onboarding: OnboardingService,
-    cue_index: CueIndexService,
 }
 
 impl UlMaintenanceService {
@@ -25,7 +24,6 @@ impl UlMaintenanceService {
         Self {
             dependency: UlDependencyService::new(store.clone()),
             _onboarding: OnboardingService::new(store.clone(), writer.clone()),
-            cue_index: CueIndexService::new(store.clone()),
             store,
             writer,
         }
@@ -154,16 +152,6 @@ impl UlMaintenanceService {
             )
             .await?;
         self.dependency.index_card(&card).await?;
-        self.cue_index
-            .replace_record_bindings(
-                state.project_id,
-                &format!("card:{}", card.card_id),
-                "module_card",
-                &card.body_md,
-                &card.cue_bindings,
-                false,
-            )
-            .await?;
         self.store
             .clear_ul_artifact_dirty(
                 state.project_id,
@@ -241,16 +229,6 @@ impl UlMaintenanceService {
             )
             .await?;
         self.dependency.index_capsule(&promoted.artifact).await?;
-        self.cue_index
-            .replace_record_bindings(
-                state.project_id,
-                &format!("capsule:{}", promoted.artifact.capsule_id),
-                "subsystem_capsule",
-                &promoted.artifact.body_md,
-                &promoted.artifact.cue_bindings,
-                false,
-            )
-            .await?;
         self.store
             .clear_ul_artifact_dirty(
                 state.project_id,

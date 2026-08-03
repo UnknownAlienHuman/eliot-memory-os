@@ -1,9 +1,10 @@
-use eliot_store::CanonicalStore;
+use eliot_store::{BlobStore, CanonicalStore};
 use eliot_types::{
-    AgentId, ClaimCardInput, ClaimId, EpistemicStatus, EvidenceAtomInput, EvidenceId,
-    FailureFingerprintInput, FetchAtomsL2Request, GovernorConfig, IdempotencyOptions,
-    LifecycleStatus, LifecycleWriteOptions, MemoryConfidence, MemoryWriteEnvelope, OperationId,
-    ProjectId, ProjectSequence, ReadConsistencyMode, RecallL0Request, RelationInput, RelationType,
+    AgentId, BlobStoreConfig, ClaimCardInput, ClaimId, CueBinding, CueKind, CueMatchMode,
+    CueStrength, EpistemicStatus, EvidenceAtomInput, EvidenceId, FailureFingerprintInput,
+    FetchAtomsL2Request, GovernorConfig, IdempotencyOptions, LifecycleStatus,
+    LifecycleWriteOptions, MemoryConfidence, MemoryWriteEnvelope, OperationId, ProjectId,
+    ProjectSequence, ReadConsistencyMode, RecallL0Request, RelationInput, RelationType,
     SemanticCommandKind, SurrealServerConfig, TaintClass, TaskId, ToolObservationInput, Visibility,
     WriteId, WriteStatus,
 };
@@ -102,6 +103,131 @@ fn l2_request(project_id: ProjectId, handles: Vec<String>) -> FetchAtomsL2Reques
         consistency: ReadConsistencyMode::Latest,
         at_least_revision: None,
     }
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn canonical_capacity_parent_and_tail_segment_are_reachable_through_normal_l2()
+-> Result<(), Box<dyn Error>> {
+    let Some(config) = isolated_config() else {
+        return Ok(());
+    };
+    let blob_root = std::env::temp_dir().join(format!(
+        "eliot-capacity-l2-{}",
+        uuid::Uuid::new_v4().as_simple()
+    ));
+    let blob_store = BlobStore::open(&BlobStoreConfig {
+        root: blob_root.display().to_string(),
+    })?;
+    let store = CanonicalStore::new(config).with_blob_store(blob_store.clone());
+    store.migrate_schema().await?;
+
+    let project_id = ProjectId::new_v7();
+    let task_id = TaskId::new_v7();
+    let memory_handle = format!("memory:capacity-l2-{}", uuid::Uuid::new_v4().as_simple());
+    let payload = (0..45_000)
+        .map(|index| format!("capacity-token-{index:05}"))
+        .collect::<Vec<_>>()
+        .join(" ")
+        .into_bytes();
+    let plan = blob_store.stage_canonical_memory(
+        &memory_handle,
+        "synthetic_evidence",
+        "text/plain; charset=utf-8",
+        &payload,
+        vec![CueBinding {
+            cue_kind: CueKind::Concept,
+            cue_value: "capacity-l2-tail".to_owned(),
+            match_mode: CueMatchMode::Exact,
+            strength: CueStrength::Primary,
+            expected_reuse_note: "normal exact-L2 expansion".to_owned(),
+        }],
+        None,
+    )?;
+    assert!(plan.segments.len() > 32);
+
+    for record in plan.records_in_commit_order() {
+        let receipt_kind = record.receipt_kind();
+        let record_id = record.record_id().to_owned();
+        let receipt_body = record.receipt_body()?;
+        let mut envelope =
+            retrieval_envelope(project_id, task_id, Vec::new(), Vec::new(), Vec::new())?;
+        envelope.command_kind = SemanticCommandKind::ToolObservationRecord;
+        envelope.tool_observations = vec![ToolObservationInput {
+            observation_id: record_id.clone(),
+            tool_name: "eliot_canonical_memory_ingress".to_owned(),
+            observation: format!("canonical memory {receipt_kind} {record_id}"),
+            payload: json!({
+                "receipt_kind": receipt_kind,
+                "receipt_body": receipt_body,
+            }),
+        }];
+        envelope.input_hash = blake3::hash(&serde_json::to_vec(&envelope.tool_observations)?)
+            .to_hex()
+            .to_string();
+        assert_eq!(
+            store.apply_write_envelope(&envelope).await?.status,
+            WriteStatus::Committed
+        );
+    }
+
+    let parent = store
+        .fetch_atoms_l2(&l2_request(project_id, vec![memory_handle.clone()]))
+        .await?;
+    assert_eq!(
+        parent.returned_handles.as_slice(),
+        std::slice::from_ref(&memory_handle)
+    );
+    assert_eq!(parent.canonical_memory_pages.len(), 1);
+    let first_page = &parent.canonical_memory_pages[0];
+    assert_eq!(first_page.requested_handle, memory_handle);
+    assert_eq!(
+        first_page.resolved_parent_handle.as_deref(),
+        Some(memory_handle.as_str())
+    );
+    assert_eq!(first_page.segments.len(), 32);
+    assert!(first_page.truncated);
+    assert!(first_page.continuation.is_some());
+    assert!(!serde_json::to_string(first_page)?.contains("search_text"));
+
+    let second_page = store
+        .canonical_memory_l2(
+            project_id,
+            &memory_handle,
+            first_page.continuation.as_deref(),
+        )
+        .await?;
+    assert_eq!(second_page.segments[0].ordinal, 32);
+
+    let tail_segment_id = plan
+        .segments
+        .last()
+        .ok_or("capacity plan omitted its tail segment")?
+        .segment_id
+        .clone();
+    let tail = store
+        .fetch_atoms_l2(&l2_request(project_id, vec![tail_segment_id.clone()]))
+        .await?;
+    assert_eq!(
+        tail.returned_handles.as_slice(),
+        std::slice::from_ref(&tail_segment_id)
+    );
+    assert_eq!(tail.canonical_memory_pages.len(), 1);
+    assert_eq!(
+        tail.canonical_memory_pages[0]
+            .requested_segment_id
+            .as_deref(),
+        Some(tail_segment_id.as_str())
+    );
+    assert_eq!(tail.canonical_memory_pages[0].segments.len(), 1);
+    assert_eq!(
+        tail.canonical_memory_pages[0].segments[0].segment_id,
+        tail_segment_id
+    );
+
+    drop(store);
+    std::fs::remove_dir_all(blob_root)?;
+    Ok(())
 }
 
 #[tokio::test]
@@ -484,8 +610,12 @@ async fn query_aware_l0_and_exact_l2_are_bounded_scoped_and_restart_deterministi
         .await?;
     let query_plan_json = serde_json::to_string(&query_plan)?;
     assert!(
-        query_plan_json.contains("idx_memory_search_token_posting"),
-        "posting lookup did not use its composite index: {query_plan_json}"
+        query_plan_json.contains("FullTextScan"),
+        "native FTS lookup did not select FullTextScan: {query_plan_json}"
+    );
+    assert!(
+        query_plan_json.contains("idx_memory_search_projection_fts_v1"),
+        "native FTS lookup did not use its projection index: {query_plan_json}"
     );
     let rebuilt_revision = restarted
         .rebuild_memory_search_projection(project_id)

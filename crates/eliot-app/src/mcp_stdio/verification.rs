@@ -238,32 +238,25 @@ pub(super) async fn dispatch_agent_candidate_submit(
         .writer
         .submit(WriteAdmissionService.admit(&command)?)
         .await?;
-    let cue_projection_status = if matches!(
-        receipt.status,
-        WriteStatus::Committed | WriteStatus::IdempotentReplay
-    ) {
-        if state
-            .ul
-            .cue_index
-            .replace_record_bindings(
-                project_id,
-                &format!("claim:{claim_id}"),
-                "claim",
-                &statement,
-                &input.cue_bindings,
-                false,
-            )
-            .await
-            .is_ok()
-        {
-            "ready"
-        } else {
-            let _ = state.ul.cue_index.invalidate(project_id);
-            "rebuild_required"
-        }
-    } else {
-        "not_committed"
-    };
+    let cue_projection_status = state
+        .store
+        .cognitive_projection_family_states(project_id)
+        .await?
+        .into_iter()
+        .find(|family| family.family == eliot_store::CognitiveProjectionFamily::Cue)
+        .map_or("unavailable", |family| {
+            if family.status == eliot_store::CognitiveProjectionPublicationStatus::Published
+                && receipt.memory_revision.is_some_and(|revision| {
+                    family
+                        .applied_revision
+                        .is_none_or(|applied| applied < revision)
+                })
+            {
+                "stale"
+            } else {
+                family.status.as_str()
+            }
+        });
     Ok(json!({
         "status": "candidate_committed",
         "candidate_only": true,

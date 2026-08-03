@@ -27,10 +27,12 @@ pub enum NamedSurqlOp {
     UpsertUlTaskClassPolicy,
     LoadUlTaskClassPolicy,
     ReplaceUlReverseDependencies,
+    ResetUlReverseDependencyProject,
     LoadUlReverseDependents,
     UpsertUlArtifactDirty,
     LoadUlArtifactDirty,
     ClearUlArtifactDirty,
+    ResetUlArtifactDirtyProject,
     LoadUlActivationGraph,
     UpsertCueRows,
     DeleteCueRows,
@@ -50,10 +52,18 @@ pub enum NamedSurqlOp {
     LoadRecallCandidates,
     UpsertMemorySearchProjection,
     ResetMemorySearchProjection,
-    LoadMemorySearchCandidates,
-    ExplainMemorySearchPostings,
     LoadMemorySearchFtsCandidates,
     ExplainMemorySearchFts,
+    EnqueueCognitiveProjectionIntent,
+    ClaimCognitiveProjectionProject,
+    CompleteCognitiveProjectionThrough,
+    FailCognitiveProjectionRetryable,
+    BlockCognitiveProjection,
+    LoadCognitiveProjectionBacklog,
+    LoadCognitiveProjectionProjects,
+    PublishCognitiveProjectionFamilyState,
+    LoadCognitiveProjectionFamilyStates,
+    CutoverLegacyMemorySearchPostings,
     FetchAtomsL2,
     FetchAtomsL2Legacy,
     GraphHealthCapabilities,
@@ -74,6 +84,9 @@ pub enum NamedSurqlOp {
     CurationRecordPage,
     CanonicalRecordByWriteId,
     CanonicalRecordsBySubjectRef,
+    LoadCanonicalMemoryAdmissionChildren,
+    LoadCanonicalMemoryL2,
+    LoadCanonicalMemoryProjectionSegments,
     CanonicalTraceByTraceRef,
     MetaPolicyActionsByCandidate,
     SleepCandidates,
@@ -94,8 +107,8 @@ impl NamedSurqlOp {
             | Self::SchemaMigrateUlTokenPolicy
             | Self::SchemaMigrateMemorySearch
             | Self::SchemaMigrateMemorySearchFts
-            | Self::ExplainMemorySearchPostings
             | Self::ExplainMemorySearchFts
+            | Self::CutoverLegacyMemorySearchPostings
             | Self::GraphHealthCapabilities
             | Self::GraphHealth
             | Self::BlobReferenceScan => SurqlAccessClass::Admin,
@@ -103,15 +116,23 @@ impl NamedSurqlOp {
             | Self::UpsertUlExperimentAssignmentExplicit
             | Self::UpsertUlTaskClassPolicy
             | Self::ReplaceUlReverseDependencies
+            | Self::ResetUlReverseDependencyProject
             | Self::UpsertUlArtifactDirty
             | Self::ClearUlArtifactDirty
+            | Self::ResetUlArtifactDirtyProject
             | Self::UpsertCueRows
             | Self::DeleteCueRows
             | Self::UpsertUlTaskLedger
             | Self::ApplyWriteEnvelope
             | Self::ApplyObservability
             | Self::UpsertMemorySearchProjection
-            | Self::ResetMemorySearchProjection => SurqlAccessClass::Write,
+            | Self::ResetMemorySearchProjection
+            | Self::EnqueueCognitiveProjectionIntent
+            | Self::ClaimCognitiveProjectionProject
+            | Self::CompleteCognitiveProjectionThrough
+            | Self::FailCognitiveProjectionRetryable
+            | Self::BlockCognitiveProjection
+            | Self::PublishCognitiveProjectionFamilyState => SurqlAccessClass::Write,
             Self::LoadUlExperimentAssignment
             | Self::LoadUlTaskClassLedgers
             | Self::LoadUlTaskClassPolicy
@@ -129,8 +150,10 @@ impl NamedSurqlOp {
             | Self::ObservabilityRecordsByKind
             | Self::CurrentState
             | Self::LoadRecallCandidates
-            | Self::LoadMemorySearchCandidates
             | Self::LoadMemorySearchFtsCandidates
+            | Self::LoadCognitiveProjectionBacklog
+            | Self::LoadCognitiveProjectionProjects
+            | Self::LoadCognitiveProjectionFamilyStates
             | Self::FetchAtomsL2
             | Self::FetchAtomsL2Legacy
             | Self::WriterReceipts
@@ -149,6 +172,9 @@ impl NamedSurqlOp {
             | Self::CurationRecordPage
             | Self::CanonicalRecordByWriteId
             | Self::CanonicalRecordsBySubjectRef
+            | Self::LoadCanonicalMemoryAdmissionChildren
+            | Self::LoadCanonicalMemoryL2
+            | Self::LoadCanonicalMemoryProjectionSegments
             | Self::CanonicalTraceByTraceRef
             | Self::MetaPolicyActionsByCandidate
             | Self::SleepCandidates => SurqlAccessClass::Read,
@@ -177,10 +203,12 @@ impl NamedSurqlOp {
             Self::UpsertUlTaskClassPolicy => "upsert_ul_task_class_policy",
             Self::LoadUlTaskClassPolicy => "load_ul_task_class_policy",
             Self::ReplaceUlReverseDependencies => "replace_ul_reverse_dependencies",
+            Self::ResetUlReverseDependencyProject => "reset_ul_reverse_dependency_project",
             Self::LoadUlReverseDependents => "load_ul_reverse_dependents",
             Self::UpsertUlArtifactDirty => "upsert_ul_artifact_dirty",
             Self::LoadUlArtifactDirty => "load_ul_artifact_dirty",
             Self::ClearUlArtifactDirty => "clear_ul_artifact_dirty",
+            Self::ResetUlArtifactDirtyProject => "reset_ul_artifact_dirty_project",
             Self::LoadUlActivationGraph => "load_ul_activation_graph",
             Self::UpsertCueRows => "upsert_cue_rows",
             Self::DeleteCueRows => "delete_cues_for_record",
@@ -200,10 +228,20 @@ impl NamedSurqlOp {
             Self::LoadRecallCandidates => "load_recall_candidates",
             Self::UpsertMemorySearchProjection => "upsert_memory_search_projection",
             Self::ResetMemorySearchProjection => "reset_memory_search_projection",
-            Self::LoadMemorySearchCandidates => "load_memory_search_candidates",
-            Self::ExplainMemorySearchPostings => "explain_memory_search_postings",
             Self::LoadMemorySearchFtsCandidates => "load_memory_search_fts_candidates",
             Self::ExplainMemorySearchFts => "explain_memory_search_fts",
+            Self::EnqueueCognitiveProjectionIntent => "enqueue_cognitive_projection_intent",
+            Self::ClaimCognitiveProjectionProject => "claim_cognitive_projection_project",
+            Self::CompleteCognitiveProjectionThrough => "complete_cognitive_projection_through",
+            Self::FailCognitiveProjectionRetryable => "fail_cognitive_projection_retryable",
+            Self::BlockCognitiveProjection => "block_cognitive_projection",
+            Self::LoadCognitiveProjectionBacklog => "load_cognitive_projection_backlog",
+            Self::LoadCognitiveProjectionProjects => "load_cognitive_projection_projects",
+            Self::PublishCognitiveProjectionFamilyState => {
+                "publish_cognitive_projection_family_state"
+            }
+            Self::LoadCognitiveProjectionFamilyStates => "load_cognitive_projection_family_states",
+            Self::CutoverLegacyMemorySearchPostings => "cutover_legacy_memory_search_postings",
             Self::FetchAtomsL2 => "fetch_atoms_l2",
             Self::FetchAtomsL2Legacy => "fetch_atoms_l2_legacy",
             Self::GraphHealthCapabilities => "graph_health_capabilities",
@@ -224,6 +262,13 @@ impl NamedSurqlOp {
             Self::CurationRecordPage => "curation_record_page",
             Self::CanonicalRecordByWriteId => "canonical_record_by_write_id",
             Self::CanonicalRecordsBySubjectRef => "canonical_records_by_subject_ref",
+            Self::LoadCanonicalMemoryAdmissionChildren => {
+                "load_canonical_memory_admission_children"
+            }
+            Self::LoadCanonicalMemoryL2 => "load_canonical_memory_l2",
+            Self::LoadCanonicalMemoryProjectionSegments => {
+                "load_canonical_memory_projection_segments"
+            }
             Self::CanonicalTraceByTraceRef => "canonical_trace_by_trace_ref",
             Self::MetaPolicyActionsByCandidate => "meta_policy_actions_by_candidate",
             Self::SleepCandidates => "sleep_candidates",
@@ -268,12 +313,18 @@ impl NamedSurqlOp {
             Self::ReplaceUlReverseDependencies => {
                 include_str!("surql/replace_ul_reverse_dependencies.surql")
             }
+            Self::ResetUlReverseDependencyProject => {
+                include_str!("surql/reset_ul_reverse_dependency_project.surql")
+            }
             Self::LoadUlReverseDependents => {
                 include_str!("surql/load_ul_reverse_dependents.surql")
             }
             Self::UpsertUlArtifactDirty => include_str!("surql/upsert_ul_artifact_dirty.surql"),
             Self::LoadUlArtifactDirty => include_str!("surql/load_ul_artifact_dirty.surql"),
             Self::ClearUlArtifactDirty => include_str!("surql/clear_ul_artifact_dirty.surql"),
+            Self::ResetUlArtifactDirtyProject => {
+                include_str!("surql/reset_ul_artifact_dirty_project.surql")
+            }
             Self::LoadUlActivationGraph => include_str!("surql/load_ul_activation_graph.surql"),
             Self::UpsertCueRows => include_str!("surql/upsert_cue_rows.surql"),
             Self::DeleteCueRows => include_str!("surql/delete_cues_for_record.surql"),
@@ -303,17 +354,41 @@ impl NamedSurqlOp {
             Self::ResetMemorySearchProjection => {
                 include_str!("surql/reset_memory_search_projection.surql")
             }
-            Self::LoadMemorySearchCandidates => {
-                include_str!("surql/load_memory_search_candidates.surql")
-            }
-            Self::ExplainMemorySearchPostings => {
-                include_str!("surql/explain_memory_search_postings.surql")
-            }
             Self::LoadMemorySearchFtsCandidates => {
                 include_str!("surql/load_memory_search_fts_candidates.surql")
             }
             Self::ExplainMemorySearchFts => {
                 include_str!("surql/explain_memory_search_fts.surql")
+            }
+            Self::EnqueueCognitiveProjectionIntent => {
+                include_str!("surql/enqueue_cognitive_projection_intent.surql")
+            }
+            Self::ClaimCognitiveProjectionProject => {
+                include_str!("surql/claim_cognitive_projection_project.surql")
+            }
+            Self::CompleteCognitiveProjectionThrough => {
+                include_str!("surql/complete_cognitive_projection_through.surql")
+            }
+            Self::FailCognitiveProjectionRetryable => {
+                include_str!("surql/fail_cognitive_projection_retryable.surql")
+            }
+            Self::BlockCognitiveProjection => {
+                include_str!("surql/block_cognitive_projection.surql")
+            }
+            Self::LoadCognitiveProjectionBacklog => {
+                include_str!("surql/load_cognitive_projection_backlog.surql")
+            }
+            Self::LoadCognitiveProjectionProjects => {
+                include_str!("surql/load_cognitive_projection_projects.surql")
+            }
+            Self::PublishCognitiveProjectionFamilyState => {
+                include_str!("surql/publish_cognitive_projection_family_state.surql")
+            }
+            Self::LoadCognitiveProjectionFamilyStates => {
+                include_str!("surql/load_cognitive_projection_family_states.surql")
+            }
+            Self::CutoverLegacyMemorySearchPostings => {
+                include_str!("surql/cutover_legacy_memory_search_postings.surql")
             }
             Self::FetchAtomsL2 => include_str!("surql/fetch_atoms_l2.surql"),
             Self::FetchAtomsL2Legacy => include_str!("surql/fetch_atoms_l2_legacy.surql"),
@@ -350,6 +425,15 @@ impl NamedSurqlOp {
             }
             Self::CanonicalRecordsBySubjectRef => {
                 include_str!("surql/canonical_records_by_subject_ref.surql")
+            }
+            Self::LoadCanonicalMemoryAdmissionChildren => {
+                include_str!("surql/load_canonical_memory_admission_children.surql")
+            }
+            Self::LoadCanonicalMemoryL2 => {
+                include_str!("surql/load_canonical_memory_l2.surql")
+            }
+            Self::LoadCanonicalMemoryProjectionSegments => {
+                include_str!("surql/load_canonical_memory_projection_segments.surql")
             }
             Self::CanonicalTraceByTraceRef => {
                 include_str!("surql/canonical_trace_by_trace_ref.surql")
@@ -393,7 +477,7 @@ impl Default for SurqlTemplateRegistry {
 }
 
 #[allow(clippy::too_many_lines)]
-fn foundational_templates() -> [SurqlTemplate; 51] {
+fn foundational_templates() -> [SurqlTemplate; 61] {
     [
         template(
             NamedSurqlOp::SchemaMigrate,
@@ -504,6 +588,12 @@ fn foundational_templates() -> [SurqlTemplate; 51] {
             2 * 1024 * 1024,
         ),
         template(
+            NamedSurqlOp::ResetUlReverseDependencyProject,
+            "ResetUlReverseDependencyProjectInput",
+            "ResetUlReverseDependencyProjectOutput",
+            64 * 1024,
+        ),
+        template(
             NamedSurqlOp::LoadUlReverseDependents,
             "LoadUlReverseDependentsInput",
             "LoadUlReverseDependentsOutput",
@@ -526,6 +616,12 @@ fn foundational_templates() -> [SurqlTemplate; 51] {
             "ClearUlArtifactDirtyInput",
             "ClearUlArtifactDirtyOutput",
             256 * 1024,
+        ),
+        template(
+            NamedSurqlOp::ResetUlArtifactDirtyProject,
+            "ResetUlArtifactDirtyProjectInput",
+            "ResetUlArtifactDirtyProjectOutput",
+            64 * 1024,
         ),
         template(
             NamedSurqlOp::LoadUlActivationGraph,
@@ -642,18 +738,6 @@ fn foundational_templates() -> [SurqlTemplate; 51] {
             64 * 1024,
         ),
         template(
-            NamedSurqlOp::LoadMemorySearchCandidates,
-            "LoadMemorySearchCandidatesInput",
-            "LoadMemorySearchCandidatesOutput",
-            2 * 1024 * 1024,
-        ),
-        template(
-            NamedSurqlOp::ExplainMemorySearchPostings,
-            "ExplainMemorySearchPostingsInput",
-            "ExplainMemorySearchPostingsOutput",
-            128 * 1024,
-        ),
-        template(
             NamedSurqlOp::LoadMemorySearchFtsCandidates,
             "LoadMemorySearchFtsCandidatesInput",
             "LoadMemorySearchFtsCandidatesOutput",
@@ -664,6 +748,66 @@ fn foundational_templates() -> [SurqlTemplate; 51] {
             "ExplainMemorySearchFtsInput",
             "ExplainMemorySearchFtsOutput",
             128 * 1024,
+        ),
+        template(
+            NamedSurqlOp::EnqueueCognitiveProjectionIntent,
+            "EnqueueCognitiveProjectionIntentInput",
+            "EnqueueCognitiveProjectionIntentOutput",
+            64 * 1024,
+        ),
+        template(
+            NamedSurqlOp::ClaimCognitiveProjectionProject,
+            "ClaimCognitiveProjectionProjectInput",
+            "ClaimCognitiveProjectionProjectOutput",
+            256 * 1024,
+        ),
+        template(
+            NamedSurqlOp::CompleteCognitiveProjectionThrough,
+            "CompleteCognitiveProjectionThroughInput",
+            "CompleteCognitiveProjectionThroughOutput",
+            64 * 1024,
+        ),
+        template(
+            NamedSurqlOp::FailCognitiveProjectionRetryable,
+            "FailCognitiveProjectionRetryableInput",
+            "FailCognitiveProjectionRetryableOutput",
+            64 * 1024,
+        ),
+        template(
+            NamedSurqlOp::BlockCognitiveProjection,
+            "BlockCognitiveProjectionInput",
+            "BlockCognitiveProjectionOutput",
+            64 * 1024,
+        ),
+        template(
+            NamedSurqlOp::LoadCognitiveProjectionBacklog,
+            "LoadCognitiveProjectionBacklogInput",
+            "LoadCognitiveProjectionBacklogOutput",
+            64 * 1024,
+        ),
+        template(
+            NamedSurqlOp::LoadCognitiveProjectionProjects,
+            "LoadCognitiveProjectionProjectsInput",
+            "LoadCognitiveProjectionProjectsOutput",
+            128 * 1024,
+        ),
+        template(
+            NamedSurqlOp::PublishCognitiveProjectionFamilyState,
+            "PublishCognitiveProjectionFamilyStateInput",
+            "PublishCognitiveProjectionFamilyStateOutput",
+            64 * 1024,
+        ),
+        template(
+            NamedSurqlOp::LoadCognitiveProjectionFamilyStates,
+            "LoadCognitiveProjectionFamilyStatesInput",
+            "LoadCognitiveProjectionFamilyStatesOutput",
+            64 * 1024,
+        ),
+        template(
+            NamedSurqlOp::CutoverLegacyMemorySearchPostings,
+            "CutoverLegacyMemorySearchPostingsInput",
+            "CutoverLegacyMemorySearchPostingsOutput",
+            64 * 1024,
         ),
         template(
             NamedSurqlOp::FetchAtomsL2,
@@ -705,7 +849,7 @@ fn foundational_templates() -> [SurqlTemplate; 51] {
 }
 
 #[allow(clippy::too_many_lines)]
-fn canonical_templates() -> [SurqlTemplate; 17] {
+fn canonical_templates() -> [SurqlTemplate; 20] {
     [
         template(
             NamedSurqlOp::ToolObservationByWriteId,
@@ -786,6 +930,24 @@ fn canonical_templates() -> [SurqlTemplate; 17] {
             1024 * 1024,
         ),
         template(
+            NamedSurqlOp::LoadCanonicalMemoryAdmissionChildren,
+            "LoadCanonicalMemoryAdmissionChildrenRequest",
+            "LoadCanonicalMemoryAdmissionChildrenResponse",
+            512 * 1024,
+        ),
+        template(
+            NamedSurqlOp::LoadCanonicalMemoryL2,
+            "LoadCanonicalMemoryL2Request",
+            "LoadCanonicalMemoryL2Response",
+            512 * 1024,
+        ),
+        template(
+            NamedSurqlOp::LoadCanonicalMemoryProjectionSegments,
+            "LoadCanonicalMemoryProjectionSegmentsRequest",
+            "LoadCanonicalMemoryProjectionSegmentsResponse",
+            2 * 1024 * 1024,
+        ),
+        template(
             NamedSurqlOp::CanonicalTraceByTraceRef,
             "CanonicalTraceByTraceRefRequest",
             "CanonicalTraceByTraceRefResponse",
@@ -845,6 +1007,7 @@ fn template(
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used)]
 mod tests {
     use super::{NamedSurqlOp, SurqlAccessClass, SurqlTemplateRegistry};
 
@@ -861,8 +1024,8 @@ mod tests {
             }
         }
 
-        assert_eq!(registry.templates.len(), 68);
-        assert_eq!(counts, [40, 12, 16]);
+        assert_eq!(registry.templates.len(), 82);
+        assert_eq!(counts, [45, 21, 16]);
     }
 
     #[test]
@@ -960,22 +1123,42 @@ mod tests {
         ] {
             assert!(load.contains(binding), "missing FTS binding {binding}");
         }
-        assert!(load.contains("search_document @OR@ $query_text"));
-        assert!(!load.contains("search::score"));
-        assert!(load.contains("ORDER BY authority_rank DESC, handle ASC"));
+        assert!(load.contains("search_document @0,OR@ $query_text"));
+        assert!(load.contains("math::max(search::score(0)) AS relevance_score"));
+        assert!(load.contains("GROUP BY handle"));
+        assert!(load.contains("$capped_handles.map"));
+        assert!(load.contains("array::flatten($rows_nested)"));
+        assert!(!load.contains("array::flatten([$rows_nested])"));
+        assert!(load.contains("ORDER BY relevance_score DESC, authority_rank DESC, handle ASC"));
+        assert_eq!(load.matches("search::score").count(), 2);
+        assert!(load.contains("search::score(0) AS segment_relevance_score"));
+        assert!(load.contains("OR search_document @0,OR@ $query_text"));
+        assert!(load.contains("segment_relevance_score DESC"));
+        let return_shape = load
+            .rsplit_once("RETURN {")
+            .expect("FTS loader must expose one typed return object")
+            .1;
+        assert!(!return_shape.contains("relevance_score"));
         assert!(load.contains("project_id = $project_id"));
         assert!(load.contains("$candidate_limit > 256"));
         assert!(load.contains("$bounded_candidate_limit + 1"));
         assert!(load.contains("LIMIT $candidate_limit_plus_one"));
-        assert!(load.contains("LIMIT $bounded_candidate_limit"));
+        assert!(load.contains("array::slice($ordered_handles, 0, $bounded_candidate_limit)"));
         assert!(load.contains("array::len($exact_handles) > 0"));
         assert!(load.contains("projection_format"));
+        assert!(load.contains("$family_state[0].status = 'published'"));
+        assert!(load.contains("$family_state[0].target_revision = $head.memory_revision"));
+        assert!(load.contains("$family_state[0].applied_revision = $head.memory_revision"));
+        assert!(load.contains("IF $projection_ready AND $exact_handle != ''"));
+        assert!(load.contains("IF !$projection_ready"));
         assert!(!load.contains("memory_search_token"));
         assert!(!load.contains("ambient"));
 
         let explain = NamedSurqlOp::ExplainMemorySearchFts.template();
-        assert!(explain.contains("search_document @OR@ $query_text"));
-        assert!(!explain.contains("search::score"));
+        assert!(explain.contains("search_document @0,OR@ $query_text"));
+        assert!(explain.contains("math::max(search::score(0)) AS relevance_score"));
+        assert!(explain.contains("GROUP BY handle"));
+        assert!(explain.contains("ORDER BY relevance_score DESC, authority_rank DESC, handle ASC"));
         assert!(explain.contains("project_id = $project_id"));
         assert!(explain.contains("LIMIT $candidate_limit_plus_one"));
         assert!(explain.contains("EXPLAIN FULL"));
@@ -990,6 +1173,181 @@ mod tests {
         assert!(upsert.contains("$projection_format == NULL"));
         assert!(upsert.contains("projection_format: $projection_format"));
         assert!(upsert.contains("UPSERT $state_id MERGE"));
+        assert!(!upsert.contains("memory_search_outbox"));
+        assert!(!upsert.contains("memory_search_token"));
+    }
+
+    #[test]
+    fn canonical_write_and_projection_intent_are_one_failure_atomic_transaction() {
+        let write = NamedSurqlOp::ApplyWriteEnvelope.template();
+        let Some(transaction) = write.find("BEGIN TRANSACTION;") else {
+            panic!("canonical write transaction start is missing");
+        };
+        let Some(canonical) = write.find("UPSERT type::record('memory_transition'") else {
+            panic!("canonical memory transition is missing");
+        };
+        let Some(failure) = write.find("IF $fail_before_projection_outbox") else {
+            panic!("canonical transaction failure injection is missing");
+        };
+        let Some(outbox) = write.find("UPSERT type::record('memory_search_outbox'") else {
+            panic!("cognitive projection outbox write is missing");
+        };
+        let Some(commit) = write.rfind("COMMIT TRANSACTION;") else {
+            panic!("canonical write transaction commit is missing");
+        };
+
+        assert!(transaction < canonical);
+        assert!(canonical < failure && failure < outbox);
+        assert!(outbox < commit);
+        assert!(write.contains("families: ['search', 'cue', 'dependency_dirty']"));
+        assert!(write.contains("write_id: <string> $envelope.write_id"));
+        assert!(!write.contains("'utility']"));
+    }
+
+    #[test]
+    fn cognitive_projection_claim_is_reclaimable_and_never_crosses_an_older_project_barrier() {
+        let claim = NamedSurqlOp::ClaimCognitiveProjectionProject.template();
+
+        assert!(claim.contains("LIMIT 1"));
+        assert!(claim.contains("lease_expires_at <= <datetime> $now"));
+        assert!(claim.contains("lease_expires_at > <datetime> $now"));
+        assert!(claim.contains("AND array::len(("));
+        assert!(claim.contains("AND status != 'applied'"));
+        assert!(claim.contains("updated_revision < $parent.updated_revision"));
+        assert!(claim.contains("created_at < $parent.created_at"));
+        assert!(claim.contains("<string> write_id < <string> $parent.write_id"));
+        assert!(claim.contains("LET $leased = UPDATE $candidate"));
+        assert!(claim.contains("lease_id = $lease_id"));
+        assert!(claim.contains("attempt_count = (attempt_count ?? 0) + 1"));
+        assert!(claim.contains("write_id: <string> $row.write_id"));
+
+        let enqueue = NamedSurqlOp::EnqueueCognitiveProjectionIntent.template();
+        assert!(enqueue.contains("LET $event_id = <string> array::join("));
+        assert!(enqueue.contains("$event_id_parts.map(|$fragment| <string> $fragment)"));
+
+        for op in [
+            NamedSurqlOp::CompleteCognitiveProjectionThrough,
+            NamedSurqlOp::FailCognitiveProjectionRetryable,
+            NamedSurqlOp::BlockCognitiveProjection,
+        ] {
+            let template = op.template();
+            assert!(template.contains("LET $owned = SELECT *"));
+            assert!(template.contains("lease_id = $lease_id"));
+            assert!(template.contains("lease_owner = $lease_owner"));
+            assert!(template.contains("<string> $row.write_id IN $bound_write_ids"));
+            assert!(template.contains("lease_expires_at > <datetime> $now"));
+            assert!(template.contains("LET $owned_rows = $owned ?? []"));
+            assert!(template.contains("LET $write_ids = ($write_id_parts ?? []).map(|$parts|"));
+            assert!(template.contains("$parts.map(|$fragment| <string> $fragment)"));
+            assert!(template.contains(
+                "LET $bound_write_ids = ($write_ids ?? []).map(|$write_id| <string> $write_id)"
+            ));
+            assert!(
+                template.contains(
+                    "LET $owned_revisions = $owned_rows.map(|$row| $row.updated_revision)"
+                )
+            );
+            assert!(template.contains("math::max($owned_revisions) != $through_revision"));
+            assert!(template.contains("$owned_rows.map(|$row| $row.families ?? [])"));
+            assert!(template.contains("!($family IN $bound_families)"));
+            assert!(template.contains("!($family IN $owned_families)"));
+            assert!(template.contains("cognitive_projection_lease_mismatch:owned_count"));
+            assert!(template.contains("cognitive_projection_lease_mismatch:row_set"));
+            assert!(template.contains("cognitive_projection_lease_mismatch:through_revision"));
+            assert!(template.contains("cognitive_projection_lease_mismatch:family_set"));
+            assert!(template.contains("THROW $lease_mismatch"));
+        }
+    }
+
+    #[test]
+    fn projection_family_state_is_per_family_revision_fenced_and_utility_can_be_unavailable() {
+        let schema = NamedSurqlOp::SchemaMigrateMemorySearch.template();
+        let publish = NamedSurqlOp::PublishCognitiveProjectionFamilyState.template();
+        let enqueue = NamedSurqlOp::EnqueueCognitiveProjectionIntent.template();
+        let complete = NamedSurqlOp::CompleteCognitiveProjectionThrough.template();
+        let fail = NamedSurqlOp::FailCognitiveProjectionRetryable.template();
+        let block = NamedSurqlOp::BlockCognitiveProjection.template();
+
+        assert!(schema.contains("cognitive_projection_state"));
+        assert!(schema.contains("project_id, family UNIQUE"));
+        assert!(publish.contains("$target_revision > $existing.target_revision"));
+        assert!(publish.contains("$incoming_applied >= $existing_applied"));
+        assert!(publish.contains("$effective_status = 'published'"));
+        assert!(publish.contains("string::starts_with(<string> write_id, 'dependency-dirty:')"));
+        assert!(publish.contains("family: $family"));
+        assert!(publish.contains("last_error: $effective_error"));
+        assert!(enqueue.contains("IF $mark_dependency_dirty_stale"));
+        assert!(enqueue.contains("family: 'dependency_dirty'"));
+        assert!(enqueue.contains("'stale'"));
+        assert!(complete.contains("LET $remaining = SELECT status, updated_revision"));
+        assert!(complete.contains("status: 'published'"));
+        assert!(fail.contains("$state.status = 'blocked'"));
+        assert!(fail.contains("$state.last_error"));
+        assert!(block.contains("status: 'blocked'"));
+    }
+
+    #[test]
+    fn projection_inventory_is_paged_and_legacy_postings_have_one_explicit_admin_cutover() {
+        let backlog = NamedSurqlOp::LoadCognitiveProjectionBacklog.template();
+        let inventory = NamedSurqlOp::LoadCognitiveProjectionProjects.template();
+        let cutover = NamedSurqlOp::CutoverLegacyMemorySearchPostings.template();
+
+        assert_eq!(backlog.matches("count(id) AS count").count(), 8);
+        assert!(!backlog.contains("count() AS count"));
+        assert!(inventory.contains("$limit > 100"));
+        assert!(inventory.contains("START $start"));
+        assert!(inventory.contains("LIMIT $bounded_limit + 1"));
+        assert!(inventory.contains("search_applied_revision"));
+        assert!(inventory.contains("search_projection_format"));
+        assert!(inventory.contains("status = 'pending'"));
+        assert!(inventory.contains("status = 'leased'"));
+        assert!(inventory.contains("status = 'retryable'"));
+        assert!(inventory.contains("status = 'blocked'"));
+        assert!(inventory.contains("oldest_pending_created_at"));
+        assert_eq!(inventory.matches("count(id) AS count").count(), 4);
+        assert!(!inventory.contains("count() AS count"));
+        assert_eq!(
+            inventory.matches("project_id = $parent.project_id").count(),
+            5
+        );
+        assert!(cutover.contains("projection_format != 'fts_v1'"));
+        assert!(cutover.contains("applied_revision != $head.memory_revision"));
+        assert!(cutover.contains("REMOVE TABLE IF EXISTS memory_search_token"));
+        assert_eq!(
+            NamedSurqlOp::CutoverLegacyMemorySearchPostings.access_class(),
+            SurqlAccessClass::Admin
+        );
+
+        for op in [
+            NamedSurqlOp::SchemaMigrateMemorySearch,
+            NamedSurqlOp::UpsertMemorySearchProjection,
+            NamedSurqlOp::ResetMemorySearchProjection,
+            NamedSurqlOp::LoadMemorySearchFtsCandidates,
+            NamedSurqlOp::ExplainMemorySearchFts,
+        ] {
+            assert!(!op.template().contains("memory_search_token"));
+        }
+    }
+
+    #[test]
+    fn cold_projection_resets_are_project_scoped_and_generic_migration_is_non_destructive() {
+        for op in [
+            NamedSurqlOp::ResetUlReverseDependencyProject,
+            NamedSurqlOp::ResetUlArtifactDirtyProject,
+        ] {
+            let template = op.template();
+            assert!(template.contains("WHERE project_id = $project_id"));
+            assert!(template.contains("BEGIN TRANSACTION;"));
+            assert_eq!(op.access_class(), SurqlAccessClass::Write);
+        }
+        let cues = NamedSurqlOp::UpsertCueRows.template();
+        assert!(cues.contains("IF $replace_project"));
+        assert!(cues.contains("DELETE cue_index"));
+        assert!(
+            !NamedSurqlOp::SchemaMigrateUlArtifacts
+                .template()
+                .contains("DELETE cue_index")
+        );
     }
 
     #[test]
@@ -1028,6 +1386,116 @@ mod tests {
             assert!(readiness.contains(&format!("FROM {table}")));
         }
         assert!(!readiness.contains("type::table"));
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn canonical_capacity_is_parent_last_paged_and_segment_deduplicated() {
+        let write = NamedSurqlOp::ApplyWriteEnvelope.template();
+        for marker in [
+            "'memory_blob_segment'",
+            "'cue_binding_page'",
+            "'memory_blob_manifest'",
+            "canonical_capacity_parent_before_complete_segments",
+            "canonical_capacity_parent_before_complete_cue_pages",
+            "canonical_capacity_immutable_record_conflict",
+        ] {
+            assert!(write.contains(marker), "missing capacity marker {marker}");
+        }
+        for exact_child_binding in [
+            "receipt_body.logical_kind = $body.logical_kind",
+            "receipt_body.segment_count = $body.segment_count",
+            "receipt_body.segment_set_hash_blake3 = $body.segment_set_hash_blake3",
+            "receipt_body.blob.algorithm = $body.blob.algorithm",
+            "receipt_body.blob.digest_hex = $body.blob.digest_hex",
+            "receipt_body.blob.size_bytes = $body.blob.size_bytes",
+            "receipt_body.blob.relative_path = $body.blob.relative_path",
+            "receipt_body.page_count = $body.cue_page_count",
+            "receipt_body.page_set_hash_blake3 = $body.cue_page_set_hash_blake3",
+        ] {
+            assert!(
+                write.contains(exact_child_binding),
+                "parent admission omitted exact child binding {exact_child_binding}"
+            );
+        }
+        let l2 = NamedSurqlOp::LoadCanonicalMemoryL2.template();
+        for marker in [
+            "project_id = $project_id",
+            "requested_segment_record_id_parts",
+            "type::record('canonical_record', $requested_segment_record_id)",
+            "subject_ref = $requested_handle",
+            "SELECT VALUE receipt_body_json_b64",
+            "$requested_is_segment",
+            "requested_segment_body_b64",
+            "manifest_bodies_b64",
+            "ORDER BY memory_revision DESC, project_sequence DESC, record_id DESC",
+            "START $start",
+            "LIMIT $limit_plus_one",
+            "$limit > 1",
+            "canonical_l2_segment_body_not_lossless",
+            "canonical_l2_manifest_body_not_lossless",
+        ] {
+            assert!(l2.contains(marker), "normal L2 loader omitted {marker}");
+        }
+        assert!(!l2.contains("receipt_body."));
+        assert!(!l2.contains("search_text"));
+        let admission = NamedSurqlOp::LoadCanonicalMemoryAdmissionChildren.template();
+        for marker in [
+            "$child_kind = 'segment'",
+            "$child_kind != 'cue_page'",
+            "project_id = $project_id",
+            "subject_ref = <string> $memory_handle",
+            "SELECT VALUE receipt_body_json_b64",
+            "START $start",
+            "LIMIT $limit_plus_one",
+        ] {
+            assert!(
+                admission.contains(marker),
+                "admission child loader omitted {marker}"
+            );
+        }
+        for forbidden_prefilter in [
+            "segment_set_hash_blake3 =",
+            "page_set_hash_blake3 =",
+            "blob.digest_hex =",
+            "segment_count =",
+            "page_count =",
+            "receipt_body.parent_handle =",
+        ] {
+            assert!(
+                !admission.contains(forbidden_prefilter),
+                "admission loader must not hide mismatched children behind {forbidden_prefilter}"
+            );
+        }
+        assert!(admission.contains("canonical_capacity_unknown_child_kind"));
+        assert!(admission.contains("canonical_capacity_child_body_not_lossless"));
+        assert!(admission.contains("ORDER BY record_id ASC"));
+        assert!(!admission.contains("ORDER BY receipt_body"));
+        assert!(admission.contains("$limit > 1"));
+        assert!(!admission.contains(".filter(|$row| $row != NONE AND $row != NULL)"));
+        let capacity_projection = NamedSurqlOp::LoadCanonicalMemoryProjectionSegments.template();
+        assert!(capacity_projection.contains("receipt_kind = 'memory_blob_segment'"));
+        assert!(capacity_projection.contains("receipt_body.blob.digest_hex = $blob_digest_hex"));
+        assert!(
+            capacity_projection
+                .contains("receipt_body.segment_set_hash_blake3 = $segment_set_hash_blake3")
+        );
+        assert!(capacity_projection.contains("ORDER BY receipt_body.ordinal ASC"));
+        assert!(capacity_projection.contains("START $start"));
+
+        let rebuild = NamedSurqlOp::LoadRecallCandidates.template();
+        assert!(rebuild.contains("receipt_kind = 'memory_blob_manifest'"));
+        assert!(rebuild.contains("subject_ref = $parent.subject_ref"));
+        assert!(rebuild.contains("source_segment_ordinal"));
+
+        let projection = NamedSurqlOp::UpsertMemorySearchProjection.template();
+        assert!(projection.contains("source_segment_ordinal"));
+        assert!(projection.contains("fts_segment_ordinal"));
+        assert!(projection.contains("source_segment_ordinal ?? 0"));
+        let load = NamedSurqlOp::LoadMemorySearchFtsCandidates.template();
+        assert!(load.contains("GROUP BY handle"));
+        assert!(load.contains("$capped_handles.map"));
+        assert!(load.contains("array::flatten($rows_nested)"));
     }
 
     #[test]

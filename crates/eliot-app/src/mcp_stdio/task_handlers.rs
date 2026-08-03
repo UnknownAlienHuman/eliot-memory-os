@@ -464,28 +464,61 @@ async fn revision_bound_packet_enrichment(
         consistency: ReadConsistencyMode::Latest,
         at_least_revision: None,
     };
-    let mut last_mismatch = "canonical revision fence was not evaluated".to_owned();
+    let mut last_mismatch = "projection fence was not evaluated".to_owned();
     for attempt in 0..3 {
         let before = state.store.current_state(&request).await?;
+        let family_before = packet_enrichment_family_fence(
+            state
+                .store
+                .cognitive_projection_family_states(project_id)
+                .await?,
+            before.memory_revision,
+        );
+        let family_before = match family_before {
+            Ok(family_before) => family_before,
+            Err(error) => {
+                last_mismatch = error.to_string();
+                if attempt < 2 {
+                    tokio::time::sleep(std::time::Duration::from_millis(25_u64 << (attempt * 2)))
+                        .await;
+                }
+                continue;
+            }
+        };
         let enrichment = state
             .ul
             .packet_enrichment(project_id, task_id, touched_paths, fallback_text)
             .await?;
-        let after = state.store.current_state(&request).await?;
-        if after.memory_revision == before.memory_revision {
-            return Ok((before.memory_revision, enrichment));
-        }
-        last_mismatch = format!(
-            "canonical revision changed: before={}, after={}",
-            before.memory_revision.value(),
-            after.memory_revision.value(),
+        let family_after = packet_enrichment_family_fence(
+            state
+                .store
+                .cognitive_projection_family_states(project_id)
+                .await?,
+            before.memory_revision,
         );
+        let after = state.store.current_state(&request).await?;
+        match family_after {
+            Ok(family_after)
+                if after.memory_revision == before.memory_revision
+                    && family_after == family_before =>
+            {
+                return Ok((before.memory_revision, enrichment));
+            }
+            Ok(_) => {
+                last_mismatch = format!(
+                    "canonical or derived family state changed: before={}, after={}",
+                    before.memory_revision.value(),
+                    after.memory_revision.value(),
+                );
+            }
+            Err(error) => last_mismatch = error.to_string(),
+        }
         if attempt < 2 {
             tokio::time::sleep(std::time::Duration::from_millis(25_u64 << (attempt * 2))).await;
         }
     }
     Err(PacketEnrichmentUnavailable(format!(
-        "canonical revision fence did not stabilize after 3 attempts: {last_mismatch}"
+        "Cue/DependencyDirty projection fence did not stabilize after 3 attempts: {last_mismatch}"
     ))
     .into())
 }
@@ -500,6 +533,46 @@ impl std::fmt::Display for PacketEnrichmentUnavailable {
 }
 
 impl std::error::Error for PacketEnrichmentUnavailable {}
+
+fn packet_enrichment_family_fence(
+    states: Vec<eliot_store::CognitiveProjectionFamilyState>,
+    revision: MemoryRevision,
+) -> Result<Vec<eliot_store::CognitiveProjectionFamilyState>> {
+    use eliot_store::{CognitiveProjectionFamily, CognitiveProjectionPublicationStatus};
+
+    let mut relevant = states
+        .into_iter()
+        .filter(|state| {
+            matches!(
+                state.family,
+                CognitiveProjectionFamily::Cue | CognitiveProjectionFamily::DependencyDirty
+            )
+        })
+        .collect::<Vec<_>>();
+    relevant.sort_by_key(|state| state.family);
+    for family in [
+        CognitiveProjectionFamily::Cue,
+        CognitiveProjectionFamily::DependencyDirty,
+    ] {
+        let state = relevant
+            .iter()
+            .find(|state| state.family == family)
+            .with_context(|| format!("{family:?} projection family has no publication state"))?;
+        anyhow::ensure!(
+            state.status == CognitiveProjectionPublicationStatus::Published
+                && state.target_revision >= revision
+                && state
+                    .applied_revision
+                    .is_some_and(|applied| applied >= revision),
+            "{family:?} projection is not published through revision {}: status={}, target={}, applied={:?}",
+            revision.value(),
+            state.status.as_str(),
+            state.target_revision.value(),
+            state.applied_revision.map(MemoryRevision::value),
+        );
+    }
+    Ok(relevant)
+}
 
 fn material_frame_required_edits(frame: &MaterialPacketFrame) -> Vec<&'static str> {
     let mut fields = Vec::new();
@@ -2307,6 +2380,35 @@ mod packet_commit_unit_tests {
         validation.expect("reread packet post-commit intent must retain its response hash");
     }
 
+    #[test]
+    fn packet_family_fence_requires_cue_and_dependency_dirty_at_revision() {
+        use eliot_store::{CognitiveProjectionFamily, CognitiveProjectionPublicationStatus};
+
+        let project_id = ProjectId::new_v7();
+        let revision = MemoryRevision::new(9);
+        let state = |family| eliot_store::CognitiveProjectionFamilyState {
+            project_id,
+            family,
+            target_revision: revision,
+            applied_revision: Some(revision),
+            status: CognitiveProjectionPublicationStatus::Published,
+            last_error: None,
+            updated_at: time::OffsetDateTime::now_utc(),
+        };
+        let fence = packet_enrichment_family_fence(
+            vec![
+                state(CognitiveProjectionFamily::DependencyDirty),
+                state(CognitiveProjectionFamily::Cue),
+            ],
+            revision,
+        )
+        .expect("complete family fence");
+        assert_eq!(fence.len(), 2);
+        assert!(
+            packet_enrichment_family_fence(vec![state(CognitiveProjectionFamily::Cue)], revision)
+                .is_err()
+        );
+    }
 }
 
 fn persist_rejected_context_attempt(

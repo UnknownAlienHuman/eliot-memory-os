@@ -398,9 +398,10 @@ fn d06_bound_path_pushes_memory_once_with_receipt() -> TestResult {
     if rerun_with_credential_gate("d06_bound_path_pushes_memory_once_with_receipt")? {
         return Ok(());
     }
-    let mut harness = Harness::start("done-d06")?;
     let project_id = ProjectId::new_v7();
-    harness.seed(&failure_command(project_id, "done-d06"))?;
+    let mut prepared = Harness::prepare("done-d06")?;
+    prepared.seed(&failure_command(project_id, "done-d06"))?;
+    let mut harness = prepared.launch()?;
     let first = harness.client.tool_call(
         50,
         "eliot_current_state",

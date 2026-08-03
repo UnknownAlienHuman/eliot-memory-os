@@ -1,10 +1,13 @@
 #![allow(dead_code)]
 
 use eliot_engine::{
-    CueIndexService, UlArtifactWriteReport, UlArtifactWriterService, WriteAdmissionService,
-    WriterActor, WriterConfig,
+    UlArtifactWriteReport, UlArtifactWriterService, WriteAdmissionService, WriterActor,
+    WriterConfig, WriterHandle,
 };
-use eliot_store::{CanonicalStore, ControlWal};
+use eliot_store::{
+    CanonicalStore, CognitiveProjectionFamily, CognitiveProjectionFamilyState,
+    CognitiveProjectionProject, CognitiveProjectionPublicationStatus, ControlWal,
+};
 use eliot_types::{
     ControlWalConfig, CredentialProviderKind, CurrentStateRequest, GovernorConfig, MemoryRevision,
     MemoryWriteEnvelope, ObservabilityKind, ProjectId, ReadConsistencyMode, RecallL0Request,
@@ -12,6 +15,7 @@ use eliot_types::{
 };
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
+use std::collections::BTreeMap;
 use std::fs;
 use std::io::{BufRead as _, Write as _};
 use std::path::{Path, PathBuf};
@@ -61,49 +65,94 @@ pub struct Harness {
     store_runtime: tokio::runtime::Runtime,
 }
 
+pub struct PreparedHarness {
+    port: u16,
+    config_path: PathBuf,
+    bootstrap_writer: WriterHandle,
+    bootstrap_actor: tokio::task::JoinHandle<()>,
+    store: CanonicalStore,
+    store_runtime: tokio::runtime::Runtime,
+    bootstrap_heads: BTreeMap<ProjectId, MemoryRevision>,
+    surreal: OwnedChild,
+    runtime: OwnedRuntime,
+}
+
 impl Harness {
     pub fn runtime_path(&self) -> &Path {
         self.runtime.path()
     }
 
     pub fn start(name: &str) -> TestResult<Self> {
-        let runtime = OwnedRuntime::new(name)?;
-        let port = test_port()?;
-        let surreal_exe = pinned_surreal_exe()?;
-        let password_file = runtime.path().join("secrets").join("surreal-root.txt");
-        fs::create_dir_all(password_file.parent().ok_or("password parent missing")?)?;
-        fs::write(&password_file, "ul-t04-test-secret")?;
-        let config_path = runtime.path().join("config").join("governor.toml");
-        write_test_config(runtime.path(), &config_path, port, &surreal_exe)?;
-        let surreal = start_surreal(&surreal_exe, port)?;
-        wait_for_tcp(port, Duration::from_secs(20))?;
-        let daemon = start_daemon(&config_path)?;
-        wait_for_runtime_pid(
-            &runtime
-                .path()
-                .join("reports")
-                .join("runtime")
-                .join("latest.json"),
-            daemon.id()?,
-            Duration::from_secs(30),
-        )?;
-        let mut client = McpClient::start(&config_path)?;
-        client.initialize()?;
-        let store = CanonicalStore::new(store_config(runtime.path(), port, &surreal_exe)?);
-        let store_runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()?;
-        store_runtime.block_on(store.migrate_schema())?;
-        Ok(Self {
-            runtime,
-            port,
-            config_path,
-            client,
-            daemon,
-            surreal,
-            store,
-            store_runtime,
-        })
+        Self::prepare(name)?.launch()
+    }
+
+    pub fn prepare(name: &str) -> TestResult<PreparedHarness> {
+        PreparedHarness::prepare(name)
+    }
+
+    fn wait_for_bootstrap_projections(
+        &self,
+        bootstrap_heads: &BTreeMap<ProjectId, MemoryRevision>,
+        timeout: Duration,
+    ) -> TestResult {
+        for (&project_id, &bootstrap_head) in bootstrap_heads {
+            let deadline = Instant::now() + timeout;
+            let mut last_observed = "projection state was not read".to_owned();
+            let mut ready = false;
+            while Instant::now() < deadline {
+                let states = self
+                    .store_runtime
+                    .block_on(self.store.cognitive_projection_family_states(project_id))?;
+                let project = self.cognitive_projection_project(project_id)?;
+                let search_ready =
+                    family_published_at(&states, CognitiveProjectionFamily::Search, bootstrap_head);
+                let cue_ready =
+                    family_published_at(&states, CognitiveProjectionFamily::Cue, bootstrap_head);
+                let backlog_clear = project.as_ref().is_some_and(|project| {
+                    project.pending == 0
+                        && project.leased == 0
+                        && project.retryable == 0
+                        && project.blocked == 0
+                });
+                if search_ready && cue_ready && backlog_clear {
+                    ready = true;
+                    break;
+                }
+                last_observed = format!("states={states:#?}; project={project:#?}");
+                thread::sleep(Duration::from_millis(25));
+            }
+            if !ready {
+                return Err(format!(
+                    "bootstrap projection fence timed out for {project_id} at revision {}: {last_observed}",
+                    bootstrap_head.value()
+                )
+                .into());
+            }
+        }
+        Ok(())
+    }
+
+    fn cognitive_projection_project(
+        &self,
+        project_id: ProjectId,
+    ) -> TestResult<Option<CognitiveProjectionProject>> {
+        let mut start = 0;
+        loop {
+            let page = self
+                .store_runtime
+                .block_on(self.store.load_cognitive_projection_projects(start, 128))?;
+            if let Some(project) = page
+                .projects
+                .into_iter()
+                .find(|project| project.project_id == project_id)
+            {
+                return Ok(Some(project));
+            }
+            let Some(next_start) = page.next_start else {
+                return Ok(None);
+            };
+            start = next_start;
+        }
     }
 
     pub fn create_task(
@@ -136,109 +185,12 @@ impl Harness {
         )
     }
 
-    pub fn seed(&self, command: &SemanticCommand) -> TestResult<WriteReceipt> {
-        let wal_path = self
-            .runtime
-            .path()
-            .join(format!("seed-{}.redb", command.context().write_id));
-        self.store_runtime.block_on(async {
-            let wal = ControlWal::open(&ControlWalConfig {
-                path: slash(&wal_path),
-            })?;
-            let (writer, actor) =
-                WriterActor::channel(wal, self.store.clone(), &WriterConfig::default());
-            let actor = tokio::spawn(actor.run());
-            let receipt = writer.submit(WriteAdmissionService.admit(command)?).await?;
-            drop(writer);
-            actor.await?;
-            Ok(receipt)
-        })
-    }
-
-    pub fn seed_many(&self, commands: &[SemanticCommand]) -> TestResult<Vec<WriteReceipt>> {
-        let first_write_id = commands
-            .first()
-            .map(|command| command.context().write_id)
-            .ok_or("seed_many requires at least one command")?;
-        let wal_path = self
-            .runtime
-            .path()
-            .join(format!("seed-many-{first_write_id}.redb"));
-        self.store_runtime.block_on(async {
-            let wal = ControlWal::open(&ControlWalConfig {
-                path: slash(&wal_path),
-            })?;
-            let (writer, actor) =
-                WriterActor::channel(wal, self.store.clone(), &WriterConfig::default());
-            let actor = tokio::spawn(actor.run());
-            let mut receipts = Vec::with_capacity(commands.len());
-            for command in commands {
-                receipts.push(writer.submit(WriteAdmissionService.admit(command)?).await?);
-            }
-            drop(writer);
-            actor.await?;
-            Ok(receipts)
-        })
-    }
-
-    pub fn apply_memory_envelope(
-        &self,
-        envelope: &MemoryWriteEnvelope,
-    ) -> TestResult<WriteReceipt> {
-        Ok(self
-            .store_runtime
-            .block_on(self.store.apply_write_envelope(envelope))?)
-    }
-
     pub fn recall_l0(&self, request: &RecallL0Request) -> TestResult<RecallL0Response> {
         Ok(self.store_runtime.block_on(self.store.recall_l0(request))?)
     }
 
-    pub fn write_module_cards(
-        &self,
-        run_id: &str,
-        cards: &[eliot_types::ModuleCard],
-    ) -> TestResult<UlArtifactWriteReport> {
-        let wal_path = self.runtime.path().join(format!(
-            "module-cards-{}.redb",
-            eliot_types::WriteId::new_v7()
-        ));
-        self.store_runtime.block_on(async {
-            let wal = ControlWal::open(&ControlWalConfig {
-                path: slash(&wal_path),
-            })?;
-            let (writer, actor) =
-                WriterActor::channel(wal, self.store.clone(), &WriterConfig::default());
-            let actor = tokio::spawn(actor.run());
-            let report = UlArtifactWriterService
-                .write_module_cards(&writer, &WriteAdmissionService, run_id, cards)
-                .await?;
-            drop(writer);
-            actor.await?;
-            Ok(report)
-        })
-    }
-
     pub fn current_revision(&self, project_id: ProjectId) -> TestResult<MemoryRevision> {
-        Ok(self
-            .store_runtime
-            .block_on(self.store.current_state(&CurrentStateRequest {
-                project_id,
-                consistency: ReadConsistencyMode::Latest,
-                at_least_revision: None,
-            }))?
-            .memory_revision)
-    }
-
-    pub fn ul_assignment(
-        &self,
-        project_id: ProjectId,
-        task_id: TaskId,
-    ) -> TestResult<Option<eliot_types::UlTaskExperimentAssignment>> {
-        Ok(self.store_runtime.block_on(
-            self.store
-                .load_ul_experiment_assignment(project_id, task_id),
-        )?)
+        current_revision(&self.store_runtime, &self.store, project_id)
     }
 
     pub fn observability_records<T: DeserializeOwned>(
@@ -258,17 +210,24 @@ impl Harness {
         project_id: ProjectId,
         receipt_kinds: &[&str],
     ) -> TestResult<Vec<eliot_store::CanonicalRecord<T>>> {
-        Ok(self.store_runtime.block_on(self.store.load_ul_artifacts(
-            project_id,
-            receipt_kinds,
-            512,
-        ))?)
+        load_ul_artifacts(&self.store_runtime, &self.store, project_id, receipt_kinds)
     }
 
     pub fn ul_metrics(&self, project_id: ProjectId) -> TestResult<Vec<eliot_types::UlTaskLedger>> {
         Ok(self
             .store_runtime
             .block_on(self.store.load_ul_metrics(project_id))?)
+    }
+
+    pub fn ul_assignment(
+        &self,
+        project_id: ProjectId,
+        task_id: TaskId,
+    ) -> TestResult<Option<eliot_types::UlTaskExperimentAssignment>> {
+        Ok(self.store_runtime.block_on(
+            self.store
+                .load_ul_experiment_assignment(project_id, task_id),
+        )?)
     }
 
     pub fn upsert_ul_task_class_policy(
@@ -361,26 +320,200 @@ impl Harness {
             .store_runtime
             .block_on(self.store.load_cue_records(project_id))?)
     }
+}
 
-    pub fn replace_cue_record(
+impl PreparedHarness {
+    fn prepare(name: &str) -> TestResult<Self> {
+        let runtime = OwnedRuntime::new(name)?;
+        let port = test_port()?;
+        let surreal_exe = pinned_surreal_exe()?;
+        let password_file = runtime.path().join("secrets").join("surreal-root.txt");
+        fs::create_dir_all(password_file.parent().ok_or("password parent missing")?)?;
+        fs::write(&password_file, "ul-t04-test-secret")?;
+        let config_path = runtime.path().join("config").join("governor.toml");
+        write_test_config(runtime.path(), &config_path, port, &surreal_exe)?;
+        let surreal = start_surreal(&surreal_exe, port)?;
+        wait_for_tcp(port, Duration::from_secs(20))?;
+        let store = CanonicalStore::new(store_config(runtime.path(), port, &surreal_exe)?);
+        let store_runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
+        store_runtime.block_on(store.migrate_schema())?;
+        let wal = ControlWal::open(&ControlWalConfig {
+            path: slash(&runtime.path().join("control").join("control.redb")),
+        })?;
+        let (bootstrap_writer, bootstrap_actor) =
+            WriterActor::channel(wal, store.clone(), &WriterConfig::default());
+        let bootstrap_actor = store_runtime.spawn(bootstrap_actor.run());
+        Ok(Self {
+            runtime,
+            port,
+            config_path,
+            surreal,
+            bootstrap_writer,
+            bootstrap_actor,
+            store,
+            store_runtime,
+            bootstrap_heads: BTreeMap::new(),
+        })
+    }
+
+    pub fn launch(self) -> TestResult<Harness> {
+        let Self {
+            runtime,
+            port,
+            config_path,
+            surreal,
+            bootstrap_writer,
+            bootstrap_actor,
+            store,
+            store_runtime,
+            bootstrap_heads,
+        } = self;
+        drop(bootstrap_writer);
+        store_runtime.block_on(bootstrap_actor)?;
+        let daemon = start_daemon(&config_path)?;
+        wait_for_runtime_pid(
+            &runtime
+                .path()
+                .join("reports")
+                .join("runtime")
+                .join("latest.json"),
+            daemon.id()?,
+            Duration::from_secs(30),
+        )?;
+        let mut client = McpClient::start(&config_path)?;
+        client.initialize()?;
+        let harness = Harness {
+            runtime,
+            port,
+            config_path,
+            client,
+            daemon,
+            surreal,
+            store,
+            store_runtime,
+        };
+        harness.wait_for_bootstrap_projections(&bootstrap_heads, Duration::from_secs(30))?;
+        Ok(harness)
+    }
+
+    pub fn seed(&mut self, command: &SemanticCommand) -> TestResult<WriteReceipt> {
+        let receipt = self.store_runtime.block_on(
+            self.bootstrap_writer
+                .submit(WriteAdmissionService.admit(command)?),
+        )?;
+        self.record_bootstrap_receipts(std::slice::from_ref(&receipt));
+        Ok(receipt)
+    }
+
+    pub fn seed_many(&mut self, commands: &[SemanticCommand]) -> TestResult<Vec<WriteReceipt>> {
+        if commands.is_empty() {
+            return Err("seed_many requires at least one command".into());
+        }
+        let receipts = self.store_runtime.block_on(async {
+            let mut receipts = Vec::with_capacity(commands.len());
+            for command in commands {
+                receipts.push(
+                    self.bootstrap_writer
+                        .submit(WriteAdmissionService.admit(command)?)
+                        .await?,
+                );
+            }
+            Ok::<Vec<WriteReceipt>, Box<dyn std::error::Error + Send + Sync>>(receipts)
+        })?;
+        self.record_bootstrap_receipts(&receipts);
+        Ok(receipts)
+    }
+
+    pub fn apply_memory_envelope(
+        &mut self,
+        envelope: &MemoryWriteEnvelope,
+    ) -> TestResult<WriteReceipt> {
+        let receipt = self
+            .store_runtime
+            .block_on(self.bootstrap_writer.submit(envelope.clone()))?;
+        self.record_bootstrap_receipts(std::slice::from_ref(&receipt));
+        Ok(receipt)
+    }
+
+    pub fn write_module_cards(
+        &mut self,
+        run_id: &str,
+        cards: &[eliot_types::ModuleCard],
+    ) -> TestResult<UlArtifactWriteReport> {
+        let report = self
+            .store_runtime
+            .block_on(UlArtifactWriterService.write_module_cards(
+                &self.bootstrap_writer,
+                &WriteAdmissionService,
+                run_id,
+                cards,
+            ))?;
+        self.record_bootstrap_receipts(&report.receipts);
+        Ok(report)
+    }
+
+    pub fn current_revision(&self, project_id: ProjectId) -> TestResult<MemoryRevision> {
+        current_revision(&self.store_runtime, &self.store, project_id)
+    }
+
+    pub fn ul_artifacts<T: DeserializeOwned>(
         &self,
         project_id: ProjectId,
-        record_ref: &str,
-        record_kind: &str,
-        preview_text: &str,
-        bindings: &[eliot_types::CueBinding],
-    ) -> TestResult {
-        Ok(self.store_runtime.block_on(
-            CueIndexService::new(self.store.clone()).replace_record_bindings(
-                project_id,
-                record_ref,
-                record_kind,
-                preview_text,
-                bindings,
-                false,
-            ),
-        )?)
+        receipt_kinds: &[&str],
+    ) -> TestResult<Vec<eliot_store::CanonicalRecord<T>>> {
+        load_ul_artifacts(&self.store_runtime, &self.store, project_id, receipt_kinds)
     }
+
+    fn record_bootstrap_receipts(&mut self, receipts: &[WriteReceipt]) {
+        for receipt in receipts {
+            let Some(memory_revision) = receipt.memory_revision else {
+                continue;
+            };
+            self.bootstrap_heads
+                .entry(receipt.project_id)
+                .and_modify(|head| *head = (*head).max(memory_revision))
+                .or_insert(memory_revision);
+        }
+    }
+}
+
+fn current_revision(
+    store_runtime: &tokio::runtime::Runtime,
+    store: &CanonicalStore,
+    project_id: ProjectId,
+) -> TestResult<MemoryRevision> {
+    Ok(store_runtime
+        .block_on(store.current_state(&CurrentStateRequest {
+            project_id,
+            consistency: ReadConsistencyMode::Latest,
+            at_least_revision: None,
+        }))?
+        .memory_revision)
+}
+
+fn load_ul_artifacts<T: DeserializeOwned>(
+    store_runtime: &tokio::runtime::Runtime,
+    store: &CanonicalStore,
+    project_id: ProjectId,
+    receipt_kinds: &[&str],
+) -> TestResult<Vec<eliot_store::CanonicalRecord<T>>> {
+    Ok(store_runtime.block_on(store.load_ul_artifacts(project_id, receipt_kinds, 512))?)
+}
+
+fn family_published_at(
+    states: &[CognitiveProjectionFamilyState],
+    family: CognitiveProjectionFamily,
+    bootstrap_head: MemoryRevision,
+) -> bool {
+    states.iter().any(|state| {
+        state.family == family
+            && state.status == CognitiveProjectionPublicationStatus::Published
+            && state
+                .applied_revision
+                .is_some_and(|revision| revision >= bootstrap_head)
+    })
 }
 
 impl Drop for Harness {

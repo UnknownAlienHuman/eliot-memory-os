@@ -10,7 +10,7 @@ use eliot_types::{
     Visibility, WriteId, ul_token_estimate,
 };
 use serde_json::{Value, json};
-use support::{Harness, TestResult, rerun_with_credential_gate, test_guard};
+use support::{Harness, PreparedHarness, TestResult, rerun_with_credential_gate, test_guard};
 
 #[test]
 fn u9_2_control_assignment_forces_a_memory_free_compile() -> TestResult {
@@ -18,12 +18,13 @@ fn u9_2_control_assignment_forces_a_memory_free_compile() -> TestResult {
     if rerun_with_credential_gate("u9_2_control_assignment_forces_a_memory_free_compile")? {
         return Ok(());
     }
-    let mut harness = Harness::start("u9-control")?;
+    let mut prepared = Harness::prepare("u9-control")?;
     let project_id = ProjectId::new_v7();
     let task_id = TaskId::new_v7();
+    prepared.seed(&failure_command(project_id))?;
+    prepared.seed(&claim_command(project_id, ClaimId::new_v7()))?;
+    let mut harness = prepared.launch()?;
     harness.create_task(10, project_id, task_id)?;
-    harness.seed(&failure_command(project_id))?;
-    harness.seed(&claim_command(project_id, ClaimId::new_v7()))?;
     let before: Vec<InjectionReceipt> = harness.observability_records(
         project_id,
         Some(task_id),
@@ -83,15 +84,16 @@ fn u9_5_handles_only_policy_strips_negative_and_normal_payloads() -> TestResult 
     if rerun_with_credential_gate("u9_5_handles_only_policy_strips_negative_and_normal_payloads")? {
         return Ok(());
     }
-    let mut harness = Harness::start("u9-handles")?;
+    let mut prepared = Harness::prepare("u9-handles")?;
     let project_id = ProjectId::new_v7();
     let control_task = TaskId::new_v7();
     let treatment_task = TaskId::new_v7();
+    prepared.seed(&failure_command(project_id))?;
+    let claim_id = ClaimId::new_v7();
+    prepared.seed(&claim_command(project_id, claim_id))?;
+    let mut harness = prepared.launch()?;
     harness.create_task(20, project_id, control_task)?;
     harness.create_task(21, project_id, treatment_task)?;
-    harness.seed(&failure_command(project_id))?;
-    let claim_id = ClaimId::new_v7();
-    harness.seed(&claim_command(project_id, claim_id))?;
 
     let control = compile(
         &mut harness,
@@ -180,9 +182,10 @@ fn u9_6_invariant_gate_prefills_requires_and_accepts_an_explicit_waiver() -> Tes
     )? {
         return Ok(());
     }
-    let mut harness = Harness::start("u9-invariant")?;
+    let mut prepared = Harness::prepare("u9-invariant")?;
     let project_id = ProjectId::new_v7();
-    seed_invariant_capsule(&harness, project_id)?;
+    seed_invariant_capsule(&mut prepared, project_id)?;
+    let mut harness = prepared.launch()?;
     let control_task = TaskId::new_v7();
     let treatment_task = TaskId::new_v7();
     harness.create_task(30, project_id, control_task)?;
@@ -570,7 +573,7 @@ fn claim_command(project_id: ProjectId, claim_id: ClaimId) -> SemanticCommand {
     })
 }
 
-fn seed_invariant_capsule(harness: &Harness, project_id: ProjectId) -> TestResult {
+fn seed_invariant_capsule(prepared: &mut PreparedHarness, project_id: ProjectId) -> TestResult {
     let concept_id = format!("concept-invariant-{project_id}");
     let capsule_id = format!("capsule-invariant-{project_id}");
     let build_id = format!("build-invariant-{project_id}");
@@ -626,7 +629,7 @@ fn seed_invariant_capsule(harness: &Harness, project_id: ProjectId) -> TestResul
         status: PyramidBuildStatus::Promoted,
         previous_build_id: None,
     };
-    harness.seed(&SemanticCommand::UlArtifactBatchRecord(
+    prepared.seed(&SemanticCommand::UlArtifactBatchRecord(
         UlArtifactBatchRecordCommand {
             context: CommandContext {
                 write_id: WriteId::new_v7(),

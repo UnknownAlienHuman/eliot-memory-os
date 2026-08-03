@@ -82,13 +82,15 @@ fn t04_minimal_ack_derives_full_trace() -> TestResult {
     if rerun_with_credential_gate("t04_minimal_ack_derives_full_trace")? {
         return Ok(());
     }
-    let mut harness = Harness::start("minimal-ack")?;
     let project_id = ProjectId::new_v7();
-    let task_id = create_treatment_task(&mut harness, 50, project_id)?;
+    let task_id = TaskId::new_v7();
     let claim_id = ClaimId::new_v7();
     let handle = format!("claim:{claim_id}");
-    harness.seed(&claim_propose(project_id, task_id, claim_id))?;
-    harness.seed(&claim_verify(project_id, task_id, claim_id))?;
+    let mut prepared = Harness::prepare("minimal-ack")?;
+    prepared.seed(&claim_propose(project_id, task_id, claim_id))?;
+    prepared.seed(&claim_verify(project_id, task_id, claim_id))?;
+    let mut harness = prepared.launch()?;
+    create_treatment_task_with_id(&mut harness, 50, project_id, task_id)?;
     let packet = harness.client.tool_call(
         53,
         "eliot_compile_packet_l3",
@@ -301,6 +303,15 @@ fn create_treatment_task(
     request_id: u64,
     project_id: ProjectId,
 ) -> TestResult<TaskId> {
+    create_treatment_task_with_id(harness, request_id, project_id, TaskId::new_v7())
+}
+
+fn create_treatment_task_with_id(
+    harness: &mut Harness,
+    request_id: u64,
+    project_id: ProjectId,
+    treatment_task_id: TaskId,
+) -> TestResult<TaskId> {
     let control_task_id = TaskId::new_v7();
     harness.create_task(request_id, project_id, control_task_id)?;
     harness.client.tool_call(
@@ -314,7 +325,6 @@ fn create_treatment_task(
             "max_tokens": 1200
         }),
     )?;
-    let treatment_task_id = TaskId::new_v7();
     harness.create_task(request_id + 2, project_id, treatment_task_id)?;
     Ok(treatment_task_id)
 }

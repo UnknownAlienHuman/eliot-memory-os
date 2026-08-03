@@ -4152,7 +4152,7 @@ mod current_git_scope_tests {
             config.db.surreal,
         )));
 
-        let result = compiler.compile_plan(plan).await?;
+        let result = Box::pin(compiler.compile_plan(plan)).await?;
 
         assert_eq!(result.read_audit, PacketSourceReadAudit::default());
         assert_eq!(
@@ -4224,7 +4224,10 @@ mod current_git_scope_tests {
                 config_hash: "test-policy-v1".to_owned(),
             }),
         };
-        validate_packet_compile_plan(&plan).expect("typed unavailable source is valid input");
+        assert!(
+            validate_packet_compile_plan(&plan).is_ok(),
+            "typed unavailable source must be valid input"
+        );
         let packet = ContextCompiler::compile_control_unfinalized(&request, &[], None, None).packet;
         let gate = packet_gate_candidate(
             &plan.pyramid_source,
@@ -4273,10 +4276,11 @@ mod current_git_scope_tests {
             invariant_ref: "invariant:preserve-order".to_owned(),
             reason: "bounded fixture waiver".to_owned(),
         });
-        assert_eq!(
-            packet_prediction_source_frame_hash(&explicit).expect("explicit frame must hash"),
-            packet_prediction_source_frame_hash(&waived).expect("waived frame must hash")
-        );
+        let explicit_hash = packet_prediction_source_frame_hash(&explicit);
+        let waived_hash = packet_prediction_source_frame_hash(&waived);
+        assert!(explicit_hash.is_ok());
+        assert!(waived_hash.is_ok());
+        assert_eq!(explicit_hash.ok(), waived_hash.ok());
     }
 
     #[test]

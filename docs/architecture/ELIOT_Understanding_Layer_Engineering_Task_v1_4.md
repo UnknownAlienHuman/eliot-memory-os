@@ -140,7 +140,9 @@ copy of project truth.
 
 - Memory text is data, never ambient instruction.
 - Tainted provider/user content cannot become policy through cue binding.
-- Cue cardinality, activation depth, packet size, and mining work are bounded.
+- Cue transport is bounded to 12 inline bindings per envelope; additional valid
+  bindings persist losslessly in deterministic ordered overflow pages, while
+  activation depth, packet size, and mining work remain bounded (ADR 0009).
 - Paths are normalized within the project root; aliases and stale identities are
   rejected or reconciled explicitly.
 - Dirty, contradictory, suppressed, quarantined, or expired records remain

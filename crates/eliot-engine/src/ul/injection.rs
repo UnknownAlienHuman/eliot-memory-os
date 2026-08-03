@@ -196,7 +196,7 @@ impl InjectionPlanner {
             .attach_boot(project_id, task_id, session_id, response, effective_mode)
             .await?;
 
-        let mut batch = self
+        let batch = self
             .pending
             .lock()
             .map_err(|_| planner_lock_error("pending"))?
@@ -205,19 +205,12 @@ impl InjectionPlanner {
                 session_id,
             })
             .unwrap_or_default();
+        let mut batch = retain_undelivered_items(&self.touched, project_id, session_id, batch);
         batch.items.sort_by(compare_pending);
 
         let mut selected = Vec::new();
         let mut total_units = 0_u32;
         for item in batch.items {
-            if self.touched.was_delivered(
-                project_id,
-                session_id,
-                &item.item_ref,
-                &item.source_fingerprint,
-            ) {
-                continue;
-            }
             let line = truncate_utf8(item.preview.trim(), MAX_LINE_BYTES);
             let mut payload = if effective_mode == UlInjectionMode::HandlesOnly {
                 None
@@ -674,6 +667,23 @@ pub fn deterministic_write_id(key: &str) -> WriteId {
     WriteId::from_uuid(Uuid::from_bytes(bytes))
 }
 
+fn retain_undelivered_items(
+    touched: &TouchedSetRegistry,
+    project_id: ProjectId,
+    session_id: SessionId,
+    mut batch: PendingBatch,
+) -> PendingBatch {
+    batch.items.retain(|item| {
+        !touched.was_delivered(
+            project_id,
+            session_id,
+            &item.item_ref,
+            &item.source_fingerprint,
+        )
+    });
+    batch
+}
+
 fn compare_pending(left: &PendingInjectionItem, right: &PendingInjectionItem) -> Ordering {
     pending_rank(left)
         .cmp(&pending_rank(right))
@@ -912,5 +922,70 @@ mod tests {
             Some(format!("activation:{}", trace.trace_id).as_str())
         );
         Ok(())
+    }
+
+    #[test]
+    fn c7_03c_equal_source_fingerprint_is_suppressed_but_changed_source_is_deliverable() {
+        let project_id = ProjectId::new_v7();
+        let session_id = SessionId::new_v7();
+        let touched = TouchedSetRegistry::new();
+        touched.mark_delivered(project_id, session_id, "failure:revision", "revision-one");
+
+        let filtered = retain_undelivered_items(
+            &touched,
+            project_id,
+            session_id,
+            PendingBatch {
+                items: vec![
+                    pending_item("failure:revision", "revision-one"),
+                    pending_item("failure:revision", "revision-two"),
+                ],
+                overflow: 0,
+            },
+        );
+
+        assert_eq!(filtered.items.len(), 1);
+        assert_eq!(filtered.items[0].source_fingerprint, "revision-two");
+    }
+
+    #[test]
+    fn c7_03c_restored_delivery_suppression_preserves_existing_overflow() {
+        let project_id = ProjectId::new_v7();
+        let session_id = SessionId::new_v7();
+        let touched = TouchedSetRegistry::new();
+        touched.restore_delivered(project_id, session_id, "card:restored", "stable-card");
+
+        let filtered = retain_undelivered_items(
+            &touched,
+            project_id,
+            session_id,
+            PendingBatch {
+                items: vec![
+                    pending_item("card:restored", "stable-card"),
+                    pending_item("failure:fresh", "fresh-failure"),
+                ],
+                overflow: 2,
+            },
+        );
+
+        assert_eq!(filtered.overflow, 2);
+        assert_eq!(filtered.items.len(), 1);
+        assert_eq!(filtered.items[0].item_ref, "failure:fresh");
+    }
+
+    fn pending_item(item_ref: &str, source_fingerprint: &str) -> PendingInjectionItem {
+        PendingInjectionItem {
+            item_ref: item_ref.to_owned(),
+            record_kind: "failure".to_owned(),
+            preview: item_ref.to_owned(),
+            payload: None,
+            source_fingerprint: source_fingerprint.to_owned(),
+            fired_cues: Vec::new(),
+            negative_memory: true,
+            invariant: false,
+            token_estimate: 1,
+            activation_trace_ref: None,
+            activation_score_milli: None,
+        }
     }
 }
