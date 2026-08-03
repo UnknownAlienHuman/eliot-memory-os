@@ -10,17 +10,89 @@
 
 use super::*;
 
+struct CodexOperationGuard {
+    _file: File,
+}
+
+fn acquire_codex_operation_lock() -> Result<CodexOperationGuard> {
+    let path = codex_operation_lock_path()?;
+    std::fs::create_dir_all(
+        path.parent()
+            .context("Codex operation lock has no parent")?,
+    )?;
+    if path.exists() {
+        ensure!(
+            !std::fs::symlink_metadata(&path)?.file_type().is_symlink(),
+            "Codex operation lock may not be a symlink: {}",
+            path.display()
+        );
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt as _;
+
+        let mut options = OpenOptions::new();
+        options.read(true).write(true).create(true).share_mode(0);
+        let file = options.open(&path).with_context(|| {
+            format!(
+                "acquire exclusive Codex install/uninstall lock {}; another operation may be active",
+                path.display()
+            )
+        })?;
+        ensure!(
+            file.metadata()?.is_file(),
+            "Codex operation lock is not a regular file: {}",
+            path.display()
+        );
+        Ok(CodexOperationGuard { _file: file })
+    }
+    #[cfg(not(windows))]
+    {
+        bail!("Codex global integration locking is supported only on Windows")
+    }
+}
+
+fn cleanup_codex_uninstall_tombstone(dry_run: bool) -> Result<bool> {
+    let base = install_base()?;
+    let tombstone = codex_uninstall_tombstone_path()?;
+    ensure_child(&base, &tombstone)?;
+    if !tombstone.exists() {
+        return Ok(false);
+    }
+    ensure!(
+        !dry_run,
+        "an interrupted Codex uninstall requires tombstone cleanup; rerun without --dry-run"
+    );
+    let metadata = std::fs::symlink_metadata(&tombstone)?;
+    ensure!(
+        !metadata.file_type().is_symlink() && metadata.is_dir(),
+        "Codex uninstall tombstone must be an owned regular directory: {}",
+        tombstone.display()
+    );
+    std::fs::remove_dir_all(&tombstone)?;
+    Ok(true)
+}
+
 #[allow(clippy::too_many_lines)]
 pub(super) fn install(
     config_path: &Path,
     host: AgentHostId,
     dry_run: bool,
 ) -> Result<HostIntegrationReceipt> {
-    ensure_l7_host(host)?;
+    ensure_installable_host(host)?;
     let repo = repo_root(config_path);
     let source = bundle_root(&repo, host);
     let base = install_base()?;
     let target = base.join(host.as_str());
+    let _codex_lock = (host == AgentHostId::Codex)
+        .then(acquire_codex_operation_lock)
+        .transpose()?;
+    let recovered_codex_owned_lifecycle = if host == AgentHostId::Codex {
+        cleanup_codex_uninstall_tombstone(dry_run)?;
+        recover_codex_install_transaction(&target, dry_run)?
+    } else {
+        false
+    };
     let staging = base.join(format!(".{}-{}-staging", host.as_str(), Uuid::new_v4()));
     let source_hash = bundle_hash(&source, host)?;
     let governor = std::env::current_exe().context("resolve Eliot integration executable")?;
@@ -42,11 +114,15 @@ pub(super) fn install(
         .then(|| read_claude_global_manifest(&target))
         .transpose()?
         .flatten();
+    let previous_codex_global = (host == AgentHostId::Codex)
+        .then(|| read_codex_global_manifest(&target))
+        .transpose()?
+        .flatten();
     let mut backup_refs = Vec::new();
     let mut modified_files = Vec::new();
     let needs_bundle_update = before_hash.as_deref() != Some(source_hash.as_str())
         || before_governor_hash.as_deref() != Some(governor_hash.as_str());
-    if !dry_run && needs_bundle_update {
+    if host != AgentHostId::Codex && !dry_run && needs_bundle_update {
         std::fs::create_dir_all(&base)?;
         copy_tree(&source, &staging, host)?;
         std::fs::create_dir_all(staging.join("bin"))?;
@@ -87,8 +163,28 @@ pub(super) fn install(
         installed_paths.extend(global.installed_paths);
         modified_files.extend(global.modified_files);
         backup_refs.extend(global.backup_refs);
+    } else if host == AgentHostId::Codex {
+        let global = install_codex_global(
+            config_path,
+            &source,
+            &target,
+            &governor,
+            previous_codex_global.as_ref(),
+            recovered_codex_owned_lifecycle,
+            dry_run,
+        )?;
+        installed_paths.extend(global.installed_paths);
+        modified_files.extend(global.modified_files);
+        backup_refs.extend(global.backup_refs);
     }
-    let profile = HostProfileService.probe(host)?;
+    let host_version = if host == AgentHostId::Codex {
+        HostProfileService
+            .probe(host)
+            .map(|profile| profile.version)
+            .unwrap_or_else(|_| "codex-personal-marketplace".to_owned())
+    } else {
+        HostProfileService.probe(host)?.version
+    };
     let skills = SkillPackService.lint(&repo)?;
     let (mcp, lifecycle) = integration_refs(&source, host);
     let mut after_hashes = vec![source_hash.clone(), governor_hash];
@@ -98,10 +194,11 @@ pub(super) fn install(
     let receipt = HostIntegrationReceipt {
         receipt_id: format!("host-install:{}", Uuid::new_v4()),
         host_id: host,
-        host_version: profile.version,
+        host_version,
         scope: match host {
             AgentHostId::OpenCode => "user-local Eliot bundle plus additive OpenCode global discovery; provider/auth and unrelated config preserved".to_owned(),
             AgentHostId::Claude => "user-local Eliot bundle packaged into a local marketplace and installed through the official Claude Code plugin lifecycle; provider/auth and unrelated settings preserved".to_owned(),
+            AgentHostId::Codex => "user-global Codex personal-marketplace plugin with the controller MCP enabled by default; project config, provider/auth, and unrelated marketplace entries preserved".to_owned(),
             _ => "user-local Eliot integration bundle; host auth/config untouched".to_owned(),
         },
         installed_paths,
@@ -185,6 +282,1701 @@ pub(super) fn read_claude_global_manifest(
     Ok(Some(serde_json::from_reader(std::fs::File::open(
         recovered,
     )?)?))
+}
+
+pub(super) fn read_codex_global_manifest(
+    target: &Path,
+) -> Result<Option<CodexGlobalInstallManifest>> {
+    let current = target.join(CODEX_GLOBAL_MANIFEST);
+    if !current.is_file() {
+        return Ok(None);
+    }
+    Ok(Some(serde_json::from_reader(std::fs::File::open(
+        current,
+    )?)?))
+}
+
+pub(super) struct CodexMarketplaceMerge {
+    pub(super) value: Value,
+    pub(super) bytes: Vec<u8>,
+    pub(super) plugins_field_existed_before: bool,
+    pub(super) entry_before: Option<Value>,
+    pub(super) entry_before_index: Option<usize>,
+    pub(super) continuing_owned: bool,
+}
+
+pub(super) fn codex_marketplace_entry() -> Value {
+    json!({
+        "name": CODEX_PLUGIN_NAME,
+        "source": {
+            "source": "local",
+            "path": "./plugins/eliot-governor"
+        },
+        "policy": {
+            "installation": "INSTALLED_BY_DEFAULT",
+            "authentication": "ON_INSTALL"
+        },
+        "category": "Developer Tools"
+    })
+}
+
+fn default_codex_marketplace() -> Value {
+    json!({
+        "name": CODEX_MARKETPLACE_NAME,
+        "interface": { "displayName": "Personal" },
+        "plugins": []
+    })
+}
+
+fn codex_plugin_indices(plugins: &[Value]) -> Vec<usize> {
+    plugins
+        .iter()
+        .enumerate()
+        .filter_map(|(index, entry)| {
+            (entry.get("name").and_then(Value::as_str) == Some(CODEX_PLUGIN_NAME)).then_some(index)
+        })
+        .collect()
+}
+
+pub(super) fn merge_codex_marketplace(
+    existing: Option<&[u8]>,
+    previous: Option<&CodexGlobalInstallManifest>,
+) -> Result<CodexMarketplaceMerge> {
+    let mut value = existing.map_or_else(
+        || Ok(default_codex_marketplace()),
+        |bytes| serde_json::from_slice(bytes).context("parse Codex personal marketplace"),
+    )?;
+    let root = value
+        .as_object_mut()
+        .context("Codex personal marketplace root must be an object")?;
+    let plugins_field_existed_before = root.contains_key("plugins");
+    if !plugins_field_existed_before {
+        root.insert("plugins".to_owned(), Value::Array(Vec::new()));
+    }
+    let plugins = root
+        .get_mut("plugins")
+        .and_then(Value::as_array_mut)
+        .context("Codex personal marketplace plugins must be an array")?;
+    let indices = codex_plugin_indices(plugins);
+    ensure!(
+        indices.len() <= 1,
+        "Codex personal marketplace contains duplicate {CODEX_PLUGIN_NAME} entries"
+    );
+    let current_index = indices.first().copied();
+    let current_entry = current_index.map(|index| plugins[index].clone());
+    let continuing_owned = previous
+        .is_some_and(|manifest| current_entry.as_ref() == Some(&manifest.marketplace_entry_after));
+    let (entry_before, entry_before_index, original_plugins_field) = if continuing_owned {
+        let manifest = previous.context("continuing Codex ownership requires a manifest")?;
+        (
+            manifest.marketplace_entry_before.clone(),
+            manifest.marketplace_entry_before_index,
+            manifest.marketplace_plugins_field_existed_before,
+        )
+    } else {
+        (current_entry, current_index, plugins_field_existed_before)
+    };
+    let entry_after = codex_marketplace_entry();
+    if let Some(index) = current_index {
+        plugins[index] = entry_after;
+    } else {
+        plugins.push(entry_after);
+    }
+    let bytes = serde_json::to_vec_pretty(&value)?;
+    Ok(CodexMarketplaceMerge {
+        value,
+        bytes,
+        plugins_field_existed_before: original_plugins_field,
+        entry_before,
+        entry_before_index,
+        continuing_owned,
+    })
+}
+
+pub(super) fn remove_codex_marketplace_entry(
+    mut value: Value,
+    expected_entry: &Value,
+    entry_before: Option<&Value>,
+    entry_before_index: Option<usize>,
+    plugins_field_existed_before: bool,
+) -> Result<Value> {
+    let root = value
+        .as_object_mut()
+        .context("Codex personal marketplace root must be an object")?;
+    let plugins = root
+        .get_mut("plugins")
+        .and_then(Value::as_array_mut)
+        .context("Codex personal marketplace plugins must be an array")?;
+    let indices = codex_plugin_indices(plugins);
+    ensure!(
+        indices.len() == 1,
+        "Codex personal marketplace must contain exactly one owned {CODEX_PLUGIN_NAME} entry"
+    );
+    let current_index = indices[0];
+    ensure!(
+        &plugins[current_index] == expected_entry,
+        "Codex personal marketplace {CODEX_PLUGIN_NAME} entry changed after install; refusing to overwrite it"
+    );
+    plugins.remove(current_index);
+    if let Some(entry) = entry_before {
+        let index = entry_before_index
+            .unwrap_or(plugins.len())
+            .min(plugins.len());
+        plugins.insert(index, entry.clone());
+    }
+    if !plugins_field_existed_before && plugins.is_empty() {
+        root.remove("plugins");
+    }
+    Ok(value)
+}
+
+pub(super) fn materialize_codex_mcp_config(config: &mut Value, governor: &Path) -> Result<()> {
+    let server = config
+        .get_mut("mcpServers")
+        .and_then(Value::as_object_mut)
+        .and_then(|servers| servers.get_mut("eliot"))
+        .and_then(Value::as_object_mut)
+        .context("Codex plugin .mcp.json must define mcpServers.eliot")?;
+    server.insert("type".to_owned(), Value::String("stdio".to_owned()));
+    server.insert(
+        "command".to_owned(),
+        Value::String(governor.to_string_lossy().into_owned()),
+    );
+    server.insert(
+        "args".to_owned(),
+        json!([
+            "mcp",
+            "stdio",
+            "--profile",
+            "codex_controller",
+            "--instance",
+            "default"
+        ]),
+    );
+    Ok(())
+}
+
+pub(super) fn materialize_codex_hook_commands(hooks: &mut Value, governor: &Path) -> Result<usize> {
+    fn visit(value: &mut Value, governor: &str) -> usize {
+        match value {
+            Value::Object(object) => {
+                let mut replaced = 0;
+                if object.get("type").and_then(Value::as_str) == Some("command")
+                    && object.contains_key("command")
+                {
+                    object.insert("command".to_owned(), Value::String(governor.to_owned()));
+                    replaced = 1;
+                }
+                replaced
+                    + object
+                        .values_mut()
+                        .map(|child| visit(child, governor))
+                        .sum::<usize>()
+            }
+            Value::Array(values) => values.iter_mut().map(|child| visit(child, governor)).sum(),
+            _ => 0,
+        }
+    }
+
+    let replaced = visit(hooks, &governor.to_string_lossy());
+    ensure!(
+        replaced > 0,
+        "Codex plugin hooks.json contains no command hooks"
+    );
+    Ok(replaced)
+}
+
+fn codex_cli_json(codex: &Path, args: &[&str]) -> Result<Value> {
+    let output = StdCommand::new(codex)
+        .args(args)
+        .output()
+        .with_context(|| format!("run {} {}", codex.display(), args.join(" ")))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!(
+            "Codex CLI command failed ({}): {}",
+            args.join(" "),
+            stderr.trim()
+        );
+    }
+    serde_json::from_slice(&output.stdout)
+        .with_context(|| format!("parse Codex CLI JSON for {}", args.join(" ")))
+}
+
+fn codex_mcp_get(codex: &Path, name: &str) -> Result<Option<Value>> {
+    let output = StdCommand::new(codex)
+        .args(["mcp", "get", name, "--json"])
+        .output()
+        .with_context(|| format!("inspect Codex MCP registration {name}"))?;
+    if output.status.success() {
+        let value: Value = serde_json::from_slice(&output.stdout)
+            .with_context(|| format!("parse Codex MCP registration {name}"))?;
+        ensure!(
+            value.get("name").and_then(Value::as_str) == Some(name),
+            "Codex CLI returned the wrong MCP identity while inspecting {name}"
+        );
+        return Ok(Some(value));
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if stderr.contains(&format!("No MCP server named '{name}' found")) {
+        return Ok(None);
+    }
+    bail!(
+        "Codex CLI could not inspect MCP registration {name}: {}",
+        stderr.trim()
+    )
+}
+
+pub(super) struct CodexLegacyMcpApproval {
+    pub(super) governor_paths: Vec<PathBuf>,
+    pub(super) governor_packages_root: PathBuf,
+    pub(super) surreal_executable: PathBuf,
+    pub(super) surreal_namespace: String,
+    pub(super) surreal_database: String,
+    pub(super) surreal_storage: String,
+}
+
+fn codex_stdio_transport_is_plain(transport: &Value) -> bool {
+    transport.get("type").and_then(Value::as_str) == Some("stdio")
+        && transport.get("env").is_none_or(|value| {
+            value.is_null() || value.as_object().is_some_and(serde_json::Map::is_empty)
+        })
+        && transport
+            .get("env_vars")
+            .is_none_or(|value| value.as_array().is_some_and(Vec::is_empty))
+        && transport.get("cwd").is_none_or(Value::is_null)
+}
+
+fn path_is_within(path: &Path, root: &Path) -> bool {
+    let path = path_identity(path);
+    let root = path_identity(root);
+    path == root || path.starts_with(&format!("{root}\\"))
+}
+
+pub(super) fn codex_legacy_mcp_is_owned(
+    name: &str,
+    value: &Value,
+    approval: &CodexLegacyMcpApproval,
+) -> bool {
+    let Some(transport) = value.get("transport") else {
+        return false;
+    };
+    if value.get("name").and_then(Value::as_str) != Some(name)
+        || !codex_stdio_transport_is_plain(transport)
+    {
+        return false;
+    }
+    let Some(command) = transport.get("command").and_then(Value::as_str) else {
+        return false;
+    };
+    let command = Path::new(command);
+    let Some(args) = transport
+        .get("args")
+        .and_then(Value::as_array)
+        .and_then(|args| args.iter().map(Value::as_str).collect::<Option<Vec<_>>>())
+    else {
+        return false;
+    };
+    match name {
+        "eliot-governor" => {
+            let exact_args =
+                args == [
+                    "mcp",
+                    "stdio",
+                    "--profile",
+                    "codex_controller",
+                    "--instance",
+                    "default",
+                ] || args
+                    == [
+                        "mcp",
+                        "stdio",
+                        "--host",
+                        "codex",
+                        "--profile",
+                        "codex_worker",
+                        "--instance",
+                        "default",
+                    ];
+            let approved_path = approval
+                .governor_paths
+                .iter()
+                .any(|approved| path_identity(command) == path_identity(approved))
+                || path_is_within(command, &approval.governor_packages_root);
+            exact_args
+                && approved_path
+                && command
+                    .file_name()
+                    .and_then(|file| file.to_str())
+                    .is_some_and(|file| file.eq_ignore_ascii_case("eliot-governor.exe"))
+        }
+        "eliot_surrealdb" => {
+            args == [
+                "mcp",
+                "--ns",
+                approval.surreal_namespace.as_str(),
+                "--db",
+                approval.surreal_database.as_str(),
+                approval.surreal_storage.as_str(),
+            ] && path_identity(command) == path_identity(&approval.surreal_executable)
+        }
+        _ => false,
+    }
+}
+
+fn inspect_codex_legacy_direct_mcp(
+    codex: &Path,
+    approval: &CodexLegacyMcpApproval,
+) -> Result<Vec<CodexLegacyMcpRegistration>> {
+    let mut found = Vec::new();
+    for name in ["eliot-governor", "eliot_surrealdb"] {
+        let Some(value) = codex_mcp_get(codex, name)? else {
+            continue;
+        };
+        let command = value
+            .pointer("/transport/command")
+            .and_then(Value::as_str)
+            .map(Path::new)
+            .context("Codex MCP registration has no command path")?;
+        ensure!(
+            command.is_absolute()
+                && command.is_file()
+                && !std::fs::symlink_metadata(command)?.file_type().is_symlink(),
+            "Codex MCP registration {name} does not resolve to an approved regular executable"
+        );
+        ensure!(
+            codex_legacy_mcp_is_owned(name, &value, approval),
+            "Codex MCP registration {name} conflicts with ELIOT's reserved identity but does not match a known ELIOT command; refusing migration"
+        );
+        let exact_config_hash = bytes_hash(&serde_json::to_vec(&value)?);
+        found.push(CodexLegacyMcpRegistration {
+            name: name.to_owned(),
+            exact_config: value,
+            exact_config_hash,
+        });
+    }
+    Ok(found)
+}
+
+fn remove_codex_legacy_direct_mcp(
+    codex: &Path,
+    registration: &CodexLegacyMcpRegistration,
+) -> Result<()> {
+    let name = &registration.name;
+    if let Some(current) = codex_mcp_get(codex, name)? {
+        ensure!(
+            bytes_hash(&serde_json::to_vec(&current)?) == registration.exact_config_hash
+                && current == registration.exact_config,
+            "Codex MCP registration {name} changed after inspection; refusing removal"
+        );
+        let output = StdCommand::new(codex)
+            .args(["mcp", "remove", name])
+            .output()
+            .with_context(|| format!("remove legacy Codex MCP registration {name}"))?;
+        ensure!(
+            output.status.success(),
+            "Codex CLI could not remove legacy MCP registration {name}: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+        ensure!(
+            codex_mcp_get(codex, name)?.is_none(),
+            "Codex CLI reported success but legacy MCP registration {name} is still present"
+        );
+    }
+    Ok(())
+}
+
+pub(super) fn codex_plugin_installed_enabled(list: &Value, selector: &str) -> Option<(bool, bool)> {
+    list.get("installed")
+        .and_then(Value::as_array)
+        .and_then(|plugins| {
+            plugins.iter().find_map(|plugin| {
+                (plugin.get("pluginId").and_then(Value::as_str) == Some(selector)).then(|| {
+                    (
+                        plugin
+                            .get("installed")
+                            .and_then(Value::as_bool)
+                            .unwrap_or(false),
+                        plugin
+                            .get("enabled")
+                            .and_then(Value::as_bool)
+                            .unwrap_or(false),
+                    )
+                })
+            })
+        })
+}
+
+pub(super) fn codex_effective_plugin_installed_before(
+    historical_preinstalled: Option<bool>,
+    current_state: Option<(bool, bool)>,
+) -> bool {
+    match historical_preinstalled {
+        Some(true) | None => current_state == Some((true, true)),
+        Some(false) => false,
+    }
+}
+
+fn codex_plugin_list(codex: &Path) -> Result<Value> {
+    codex_cli_json(codex, &["plugin", "list", "--json"])
+}
+
+struct CodexPluginExpectation<'a> {
+    selector: &'a str,
+    version: &'a str,
+    source_path: &'a Path,
+    cache_contract_hash: &'a str,
+    installed_governor: &'a Path,
+    installed_governor_sha256: &'a str,
+}
+
+fn codex_plugin_entry<'a>(list: &'a Value, selector: &str) -> Option<&'a Value> {
+    list.get("installed")
+        .and_then(Value::as_array)
+        .and_then(|plugins| {
+            plugins
+                .iter()
+                .find(|plugin| plugin.get("pluginId").and_then(Value::as_str) == Some(selector))
+        })
+}
+
+fn codex_plugin_entry_has_owned_identity(
+    entry: &Value,
+    selector: &str,
+    source_path: &Path,
+) -> bool {
+    entry.get("pluginId").and_then(Value::as_str) == Some(selector)
+        && entry.get("name").and_then(Value::as_str) == Some(CODEX_PLUGIN_NAME)
+        && entry.get("marketplaceName").and_then(Value::as_str) == Some(CODEX_MARKETPLACE_NAME)
+        && entry.get("installed").and_then(Value::as_bool) == Some(true)
+        && entry.get("enabled").and_then(Value::as_bool) == Some(true)
+        && entry.pointer("/source/source").and_then(Value::as_str) == Some("local")
+        && entry
+            .pointer("/source/path")
+            .and_then(Value::as_str)
+            .is_some_and(|path| path_identity(Path::new(path)) == path_identity(source_path))
+}
+
+pub(super) fn codex_plugin_metadata_matches(
+    entry: &Value,
+    selector: &str,
+    version: &str,
+    source_path: &Path,
+) -> bool {
+    codex_plugin_entry_has_owned_identity(entry, selector, source_path)
+        && entry.get("version").and_then(Value::as_str) == Some(version)
+}
+
+pub(super) fn codex_runtime_cache_path(
+    registration: &Value,
+    home: &Path,
+    installed_governor: &Path,
+) -> Option<PathBuf> {
+    if registration.get("name").and_then(Value::as_str) != Some("eliot")
+        || registration.get("enabled").and_then(Value::as_bool) != Some(true)
+    {
+        return None;
+    }
+    let transport = registration.get("transport")?;
+    let command = transport.get("command").and_then(Value::as_str)?;
+    let cwd = PathBuf::from(transport.get("cwd").and_then(Value::as_str)?);
+    let approved_cache_root = home
+        .join(".codex")
+        .join("plugins")
+        .join("cache")
+        .join(CODEX_MARKETPLACE_NAME)
+        .join(CODEX_PLUGIN_NAME);
+    (transport.get("type").and_then(Value::as_str) == Some("stdio")
+        && path_identity(Path::new(command)) == path_identity(installed_governor)
+        && transport.get("args")
+            == Some(&json!([
+                "mcp",
+                "stdio",
+                "--profile",
+                "codex_controller",
+                "--instance",
+                "default"
+            ]))
+        && transport.get("env") == Some(&Value::Null)
+        && transport.get("env_vars") == Some(&json!([]))
+        && cwd.is_absolute()
+        && path_is_within(&cwd, &approved_cache_root)
+        && path_identity(&cwd) != path_identity(&approved_cache_root))
+    .then_some(cwd)
+}
+
+fn codex_cached_plugin_payload_is_fresh(
+    cache_path: &Path,
+    expected: &CodexPluginExpectation<'_>,
+) -> Result<bool> {
+    if !cache_path.is_dir()
+        || std::fs::symlink_metadata(cache_path)?
+            .file_type()
+            .is_symlink()
+    {
+        return Ok(false);
+    }
+    if codex_cache_contract_hash(cache_path)? != expected.cache_contract_hash {
+        return Ok(false);
+    }
+    let manifest: Value = serde_json::from_reader(std::fs::File::open(
+        cache_path.join(".codex-plugin").join("plugin.json"),
+    )?)?;
+    if manifest.get("name").and_then(Value::as_str) != Some(CODEX_PLUGIN_NAME)
+        || manifest.get("version").and_then(Value::as_str) != Some(expected.version)
+    {
+        return Ok(false);
+    }
+    let mcp: Value = serde_json::from_reader(std::fs::File::open(cache_path.join(".mcp.json"))?)?;
+    let command_matches = mcp
+        .pointer("/mcpServers/eliot/command")
+        .and_then(Value::as_str)
+        .is_some_and(|command| {
+            path_identity(Path::new(command)) == path_identity(expected.installed_governor)
+        });
+    let args_match = mcp.pointer("/mcpServers/eliot/args")
+        == Some(&json!([
+            "mcp",
+            "stdio",
+            "--profile",
+            "codex_controller",
+            "--instance",
+            "default"
+        ]));
+    let cached_cwd_matches =
+        mcp.pointer("/mcpServers/eliot/cwd").and_then(Value::as_str) == Some(".");
+    let cached_transport_matches = mcp
+        .pointer("/mcpServers/eliot/type")
+        .and_then(Value::as_str)
+        == Some("stdio")
+        && mcp
+            .pointer("/mcpServers/eliot/enabled")
+            .and_then(Value::as_bool)
+            == Some(true)
+        && mcp
+            .pointer("/mcpServers/eliot/required")
+            .and_then(Value::as_bool)
+            == Some(true);
+    Ok(command_matches
+        && args_match
+        && cached_cwd_matches
+        && cached_transport_matches
+        && expected.installed_governor.is_file()
+        && sha256_file(expected.installed_governor)? == expected.installed_governor_sha256)
+}
+
+fn codex_plugin_lifecycle_is_fresh(
+    codex: &Path,
+    list: &Value,
+    expected: &CodexPluginExpectation<'_>,
+) -> Result<bool> {
+    let Some(entry) = codex_plugin_entry(list, expected.selector) else {
+        return Ok(false);
+    };
+    if !codex_plugin_metadata_matches(
+        entry,
+        expected.selector,
+        expected.version,
+        expected.source_path,
+    ) {
+        return Ok(false);
+    }
+    let Some(runtime) = codex_mcp_get(codex, "eliot")? else {
+        return Ok(false);
+    };
+    let Some(cache_path) =
+        codex_runtime_cache_path(&runtime, &user_home()?, expected.installed_governor)
+    else {
+        return Ok(false);
+    };
+    codex_cached_plugin_payload_is_fresh(&cache_path, expected)
+}
+
+fn codex_cache_path_for_version(version: &str) -> Result<PathBuf> {
+    ensure!(
+        !version.is_empty()
+            && version != "."
+            && version != ".."
+            && !version.contains('/')
+            && !version.contains('\\')
+            && !version.contains(':'),
+        "Codex plugin version is not a safe cache path component: {version}"
+    );
+    Ok(user_home()?
+        .join(".codex")
+        .join("plugins")
+        .join("cache")
+        .join(CODEX_MARKETPLACE_NAME)
+        .join(CODEX_PLUGIN_NAME)
+        .join(version))
+}
+
+fn reconcile_codex_cache_in_place(expected: &CodexPluginExpectation<'_>) -> Result<()> {
+    let cache_path = codex_cache_path_for_version(expected.version)?;
+    let cache_root = user_home()?
+        .join(".codex")
+        .join("plugins")
+        .join("cache")
+        .join(CODEX_MARKETPLACE_NAME)
+        .join(CODEX_PLUGIN_NAME);
+    ensure_child(&cache_root, &cache_path)?;
+    ensure!(
+        expected.source_path.is_dir(),
+        "Codex plugin source is missing during cache reconciliation: {}",
+        expected.source_path.display()
+    );
+    if cache_path.exists() {
+        let metadata = std::fs::symlink_metadata(&cache_path)?;
+        ensure!(
+            metadata.is_dir() && !metadata.file_type().is_symlink(),
+            "Codex plugin cache must be an owned regular directory: {}",
+            cache_path.display()
+        );
+    } else {
+        std::fs::create_dir_all(&cache_path)?;
+    }
+
+    reconcile_codex_cache_tree(
+        expected.source_path,
+        &cache_path,
+        expected.cache_contract_hash,
+    )
+}
+
+pub(super) fn reconcile_codex_cache_tree(
+    source_path: &Path,
+    cache_path: &Path,
+    expected_cache_contract_hash: &str,
+) -> Result<()> {
+    let mut source_files = Vec::new();
+    collect_owned_files(source_path, source_path, &mut source_files)?;
+    let mut cached_files = Vec::new();
+    collect_owned_files(cache_path, cache_path, &mut cached_files)?;
+    for (relative, source_file) in &source_files {
+        if relative.eq_ignore_ascii_case("bin/eliot-governor.exe") {
+            continue;
+        }
+        let destination = cache_path.join(Path::new(&relative));
+        ensure_child(cache_path, &destination)?;
+        std::fs::create_dir_all(
+            destination
+                .parent()
+                .context("Codex cache file has no parent")?,
+        )?;
+        std::fs::copy(&source_file, &destination).with_context(|| {
+            format!(
+                "reconcile Codex cache file {} -> {}",
+                source_file.display(),
+                destination.display()
+            )
+        })?;
+    }
+    for (relative, cached) in cached_files {
+        if relative.eq_ignore_ascii_case("bin/eliot-governor.exe") {
+            continue;
+        }
+        if !source_files
+            .iter()
+            .any(|(source_relative, _)| source_relative.eq_ignore_ascii_case(&relative))
+        {
+            std::fs::remove_file(&cached)
+                .with_context(|| format!("remove stale Codex cache file {}", cached.display()))?;
+        }
+    }
+    ensure!(
+        codex_cache_contract_hash(cache_path)? == expected_cache_contract_hash,
+        "Codex plugin cache reconciliation did not produce the expected content contract"
+    );
+    Ok(())
+}
+
+fn install_codex_plugin_lifecycle(
+    codex: &Path,
+    expected: &CodexPluginExpectation<'_>,
+    may_refresh_owned: bool,
+    force_refresh_owned: bool,
+) -> Result<()> {
+    let list = codex_plugin_list(codex)?;
+    if !force_refresh_owned && codex_plugin_lifecycle_is_fresh(codex, &list, expected)? {
+        return Ok(());
+    }
+    if let Some(entry) = codex_plugin_entry(&list, expected.selector) {
+        ensure!(
+            may_refresh_owned
+                && codex_plugin_entry_has_owned_identity(
+                    entry,
+                    expected.selector,
+                    expected.source_path,
+                ),
+            "Codex plugin {} already exists but its version/source/cache is not the desired ELIOT artifact",
+            expected.selector
+        );
+        if entry.get("version").and_then(Value::as_str) == Some(expected.version) {
+            reconcile_codex_cache_in_place(expected)?;
+        } else {
+            let _ = codex_cli_json(codex, &["plugin", "add", expected.selector, "--json"])?;
+        }
+    } else {
+        let _ = codex_cli_json(codex, &["plugin", "add", expected.selector, "--json"])?;
+    }
+    ensure!(
+        codex_plugin_lifecycle_is_fresh(codex, &codex_plugin_list(codex)?, expected)?,
+        "Codex plugin lifecycle did not install the expected fresh artifact for {}",
+        expected.selector
+    );
+    Ok(())
+}
+
+fn remove_codex_plugin_lifecycle(codex: &Path, selector: &str) -> Result<()> {
+    if codex_plugin_installed_enabled(&codex_plugin_list(codex)?, selector).is_some() {
+        let _ = codex_cli_json(codex, &["plugin", "remove", selector, "--json"])?;
+    }
+    ensure!(
+        codex_plugin_installed_enabled(&codex_plugin_list(codex)?, selector).is_none(),
+        "Codex plugin lifecycle still reports {selector} installed after removal"
+    );
+    Ok(())
+}
+
+fn create_codex_install_journal(journal: &CodexInstallJournal) -> Result<()> {
+    let path = codex_install_journal_path()?;
+    ensure!(
+        !path.exists(),
+        "another Codex install transaction is active at {}",
+        path.display()
+    );
+    std::fs::create_dir_all(path.parent().context("Codex journal has no parent")?)?;
+    let bytes = serde_json::to_vec_pretty(journal)?;
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+        .with_context(|| format!("create exclusive Codex install journal {}", path.display()))?;
+    file.write_all(&bytes)?;
+    file.sync_all()?;
+    Ok(())
+}
+
+fn persist_codex_owned_lifecycle_recovery(journal: &CodexInstallJournal) -> Result<()> {
+    let mut owned_versions = Vec::new();
+    if let Some(version) = &journal.plugin_lifecycle_version_before {
+        owned_versions.push(version.clone());
+    }
+    if !owned_versions.contains(&journal.plugin_version) {
+        owned_versions.push(journal.plugin_version.clone());
+    }
+    ensure!(
+        !owned_versions.is_empty(),
+        "Codex owned lifecycle recovery requires at least one version"
+    );
+    atomic_write_json(
+        &codex_owned_lifecycle_recovery_path()?,
+        &CodexOwnedLifecycleRecovery {
+            schema_version: CODEX_OWNED_LIFECYCLE_RECOVERY_SCHEMA_V1.to_owned(),
+            transaction_id: journal.transaction_id.clone(),
+            plugin_selector: journal.plugin_selector.clone(),
+            plugin_path: journal.plugin_path.clone(),
+            codex_cli_path: journal.codex_cli_path.clone(),
+            owned_versions,
+            created_at: OffsetDateTime::now_utc().to_string(),
+        },
+    )
+}
+
+fn codex_owned_lifecycle_recovery_is_valid() -> Result<bool> {
+    let path = codex_owned_lifecycle_recovery_path()?;
+    if !path.exists() {
+        return Ok(false);
+    }
+    let metadata = std::fs::symlink_metadata(&path)?;
+    ensure!(
+        metadata.is_file() && !metadata.file_type().is_symlink(),
+        "Codex owned lifecycle recovery marker must be a regular file"
+    );
+    let marker: CodexOwnedLifecycleRecovery = serde_json::from_reader(std::fs::File::open(&path)?)?;
+    ensure!(
+        marker.schema_version == CODEX_OWNED_LIFECYCLE_RECOVERY_SCHEMA_V1
+            && !marker.transaction_id.is_empty()
+            && marker.plugin_selector == format!("{CODEX_PLUGIN_NAME}@{CODEX_MARKETPLACE_NAME}")
+            && marker.plugin_path == codex_plugin_root()?
+            && path_identity(&marker.codex_cli_path)
+                == path_identity(
+                    &crate::dogfood::find_codex_cli()
+                        .context("locate installed Codex CLI for lifecycle recovery")?,
+                )
+            && !marker.owned_versions.is_empty(),
+        "Codex owned lifecycle recovery marker has an unexpected identity"
+    );
+    for version in &marker.owned_versions {
+        let _ = codex_cache_path_for_version(version)?;
+    }
+    let plugin_list = codex_plugin_list(&marker.codex_cli_path)?;
+    if let Some(entry) = codex_plugin_entry(&plugin_list, &marker.plugin_selector) {
+        ensure!(
+            codex_plugin_entry_has_owned_identity(
+                entry,
+                &marker.plugin_selector,
+                &marker.plugin_path,
+            ) && entry
+                .get("version")
+                .and_then(Value::as_str)
+                .is_some_and(|version| marker.owned_versions.iter().any(|owned| owned == version)),
+            "Codex owned lifecycle recovery marker does not match the live plugin entry"
+        );
+    }
+    Ok(true)
+}
+
+fn clear_codex_owned_lifecycle_recovery() -> Result<()> {
+    let path = codex_owned_lifecycle_recovery_path()?;
+    if path.exists() {
+        std::fs::remove_file(path)?;
+    }
+    Ok(())
+}
+
+fn rollback_codex_owned_path(
+    path: &Path,
+    before_hash: Option<&str>,
+    after_hash: &str,
+    backup: Option<&PathBuf>,
+) -> Result<()> {
+    if path.exists() {
+        let current = hash_owned_path(path)?;
+        if Some(current.as_str()) == before_hash {
+            return Ok(());
+        }
+        ensure!(
+            current == after_hash,
+            "Codex transaction path changed concurrently: {}",
+            path.display()
+        );
+        remove_owned_path(path)?;
+    }
+    if let Some(before_hash) = before_hash {
+        let backup = backup.context("Codex transaction lost its required backup reference")?;
+        ensure!(
+            backup.exists(),
+            "Codex transaction backup is missing: {}",
+            backup.display()
+        );
+        std::fs::rename(backup, path)?;
+        ensure!(
+            hash_owned_path(path)? == before_hash,
+            "Codex transaction restored the wrong content at {}",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+fn remove_codex_transaction_backup(
+    transaction_backup: Option<&PathBuf>,
+    persistent_backup: Option<&PathBuf>,
+) -> Result<()> {
+    let Some(transaction_backup) = transaction_backup else {
+        return Ok(());
+    };
+    if persistent_backup
+        .is_some_and(|persistent| path_identity(persistent) == path_identity(transaction_backup))
+    {
+        return Ok(());
+    }
+    if transaction_backup.exists() {
+        ensure!(
+            !std::fs::symlink_metadata(transaction_backup)?
+                .file_type()
+                .is_symlink(),
+            "Codex transaction backup may not be a symlink: {}",
+            transaction_backup.display()
+        );
+        remove_owned_path(transaction_backup)?;
+    }
+    Ok(())
+}
+
+pub(super) fn select_codex_original_plugin_hash(
+    previous_schema_version: Option<&str>,
+    recorded_before_hash: Option<&str>,
+    legacy_backup_hash: Option<&str>,
+    current_pre_mutation_hash: Option<&str>,
+) -> Result<Option<String>> {
+    match previous_schema_version {
+        None => Ok(current_pre_mutation_hash.map(str::to_owned)),
+        Some(CODEX_GLOBAL_MANIFEST_SCHEMA_V2) => Ok(recorded_before_hash.map(str::to_owned)),
+        Some(CODEX_GLOBAL_MANIFEST_SCHEMA_V1) => Ok(legacy_backup_hash.map(str::to_owned)),
+        Some(schema) => bail!("unsupported Codex global install manifest schema: {schema}"),
+    }
+}
+
+fn validated_legacy_codex_plugin_backup_hash(
+    manifest: &CodexGlobalInstallManifest,
+) -> Result<Option<String>> {
+    if manifest.schema_version != CODEX_GLOBAL_MANIFEST_SCHEMA_V1 {
+        return Ok(None);
+    }
+    let Some(backup) = manifest.installed_plugin.backup_ref.as_ref() else {
+        return Ok(None);
+    };
+    let backup_root = install_base()?.join("global-backups");
+    ensure_child(&backup_root, backup)?;
+    let metadata = std::fs::symlink_metadata(backup)
+        .with_context(|| format!("inspect legacy Codex plugin backup {}", backup.display()))?;
+    ensure!(
+        !metadata.file_type().is_symlink() && (metadata.is_dir() || metadata.is_file()),
+        "legacy Codex plugin backup must be a regular owned path: {}",
+        backup.display()
+    );
+    Ok(Some(hash_owned_path(backup)?))
+}
+
+fn codex_original_plugin_hash(
+    previous: Option<&CodexGlobalInstallManifest>,
+    current_pre_mutation_hash: Option<&str>,
+) -> Result<Option<String>> {
+    let legacy_backup_hash = previous
+        .map(validated_legacy_codex_plugin_backup_hash)
+        .transpose()?
+        .flatten();
+    select_codex_original_plugin_hash(
+        previous.map(|manifest| manifest.schema_version.as_str()),
+        previous.and_then(|manifest| manifest.plugin_before_hash.as_deref()),
+        legacy_backup_hash.as_deref(),
+        current_pre_mutation_hash,
+    )
+}
+
+pub(super) fn codex_manifest_plugin_source_hash(manifest: &CodexGlobalInstallManifest) -> &str {
+    if manifest.plugin_source_hash.is_empty() {
+        &manifest.installed_plugin.installed_hash
+    } else {
+        &manifest.plugin_source_hash
+    }
+}
+
+fn codex_manifest_cache_contract_hash(
+    manifest: &CodexGlobalInstallManifest,
+    plugin_path: &Path,
+) -> Result<String> {
+    if manifest.cache_contract_hash.is_empty() {
+        codex_cache_contract_hash(plugin_path)
+    } else {
+        Ok(manifest.cache_contract_hash.clone())
+    }
+}
+
+pub(super) fn codex_materialized_plugin_version(
+    source_version: &str,
+    payload_hash: &str,
+) -> Result<String> {
+    let base_version = source_version
+        .split_once('+')
+        .map_or(source_version, |(base, _)| base)
+        .trim();
+    ensure!(
+        !base_version.is_empty(),
+        "Codex plugin base version may not be empty"
+    );
+    let digest = payload_hash
+        .strip_prefix("blake3:")
+        .context("Codex plugin payload hash must use the blake3 prefix")?;
+    ensure!(
+        digest.len() >= 32 && digest.bytes().all(|byte| byte.is_ascii_hexdigit()),
+        "Codex plugin payload hash must contain at least 32 hexadecimal digits"
+    );
+    Ok(format!(
+        "{base_version}+codex.artifact-{}",
+        &digest[..32].to_ascii_lowercase()
+    ))
+}
+
+pub(super) fn materialize_codex_plugin_version(root: &Path, version: &str) -> Result<()> {
+    let manifest_path = root.join(".codex-plugin").join("plugin.json");
+    let mut manifest: Value = serde_json::from_reader(
+        std::fs::File::open(&manifest_path)
+            .with_context(|| format!("read {}", manifest_path.display()))?,
+    )?;
+    let object = manifest
+        .as_object_mut()
+        .context("Codex plugin manifest root must be an object")?;
+    object.insert("version".to_owned(), Value::String(version.to_owned()));
+    atomic_write_json(&manifest_path, &manifest)
+}
+
+pub(super) fn codex_owned_lifecycle_requires_refresh(
+    has_previous_manifest: bool,
+    plugin_installed_before: bool,
+    previous_cache_contract_hash: Option<&str>,
+    desired_cache_contract_hash: &str,
+) -> bool {
+    has_previous_manifest
+        && !plugin_installed_before
+        && previous_cache_contract_hash != Some(desired_cache_contract_hash)
+}
+
+pub(super) fn codex_plugin_path_is_restored(
+    current_hash: Option<&str>,
+    original_hash: Option<&str>,
+) -> bool {
+    current_hash == original_hash
+}
+
+pub(super) fn validate_codex_install_journal_schema(value: &Value) -> Result<()> {
+    let schema = value
+        .get("schema_version")
+        .and_then(Value::as_str)
+        .context("Codex install journal schema_version is missing")?;
+    ensure!(
+        schema == CODEX_INSTALL_JOURNAL_SCHEMA_V2,
+        "unsupported Codex install journal schema: {schema}"
+    );
+    Ok(())
+}
+
+fn recover_codex_install_transaction(target: &Path, dry_run: bool) -> Result<bool> {
+    let journal_path = codex_install_journal_path()?;
+    if !journal_path.exists() {
+        return codex_owned_lifecycle_recovery_is_valid();
+    }
+    ensure!(
+        !std::fs::symlink_metadata(&journal_path)?
+            .file_type()
+            .is_symlink(),
+        "Codex install journal may not be a symlink"
+    );
+    ensure!(
+        !dry_run,
+        "an interrupted Codex install requires recovery; rerun without --dry-run"
+    );
+    let journal_value: Value = serde_json::from_reader(std::fs::File::open(&journal_path)?)?;
+    validate_codex_install_journal_schema(&journal_value)?;
+    let journal: CodexInstallJournal = serde_json::from_value(journal_value)?;
+    ensure!(
+        journal.target_path == target
+            && journal.plugin_path == codex_plugin_root()?
+            && journal.marketplace_path == codex_marketplace_path()?,
+        "Codex install journal contains unexpected ownership paths"
+    );
+    let base = install_base()?;
+    ensure_child(&base, &journal.target_path)?;
+    ensure_child(&base, &journal.target_staging)?;
+    let plugins_root = user_home()?.join("plugins");
+    ensure_child(&plugins_root, &journal.plugin_path)?;
+    ensure_child(&plugins_root, &journal.plugin_staging)?;
+    if let Some(backup) = &journal.target_backup_ref {
+        ensure_child(&base, backup)?;
+    }
+    if let Some(backup) = &journal.plugin_backup_ref {
+        ensure_child(&base.join("global-backups"), backup)?;
+    }
+    if let Some(backup) = &journal.marketplace_backup_ref {
+        ensure_child(&base.join("global-backups"), backup)?;
+    }
+    let manifest_path = target.join(CODEX_GLOBAL_MANIFEST);
+    let committed_manifest = if manifest_path.is_file() {
+        Some(serde_json::from_reader::<_, CodexGlobalInstallManifest>(
+            std::fs::File::open(&manifest_path)?,
+        )?)
+    } else {
+        None
+    };
+    if let Some(manifest) = committed_manifest
+        .as_ref()
+        .filter(|manifest| manifest.transaction_id == journal.transaction_id)
+    {
+        for staging in [&journal.target_staging, &journal.plugin_staging] {
+            if staging.exists() {
+                remove_owned_path(staging)?;
+            }
+        }
+        remove_codex_transaction_backup(
+            journal.plugin_backup_ref.as_ref(),
+            manifest.installed_plugin.backup_ref.as_ref(),
+        )?;
+        remove_codex_transaction_backup(
+            journal.marketplace_backup_ref.as_ref(),
+            manifest.marketplace_backup_ref.as_ref(),
+        )?;
+        remove_codex_transaction_backup(journal.target_backup_ref.as_ref(), None)?;
+        std::fs::remove_file(journal_path)?;
+        clear_codex_owned_lifecycle_recovery()?;
+        return Ok(false);
+    }
+
+    if journal.marketplace_path.exists() {
+        let current_bytes = std::fs::read(&journal.marketplace_path)?;
+        let current_hash = bytes_hash(&current_bytes);
+        if Some(current_hash.as_str()) != journal.marketplace_before_hash.as_deref() {
+            ensure!(
+                current_hash == journal.marketplace_after_hash,
+                "Codex marketplace changed concurrently during install recovery"
+            );
+            if journal.marketplace_existed_before {
+                let backup = journal
+                    .marketplace_backup_ref
+                    .as_ref()
+                    .context("Codex marketplace recovery requires a backup")?;
+                ensure!(backup.is_file(), "Codex marketplace backup is missing");
+                atomic_write_bytes(&journal.marketplace_path, &std::fs::read(backup)?)?;
+            } else {
+                std::fs::remove_file(&journal.marketplace_path)?;
+            }
+        }
+    } else if journal.marketplace_existed_before {
+        let backup = journal
+            .marketplace_backup_ref
+            .as_ref()
+            .context("Codex marketplace recovery requires a backup")?;
+        atomic_write_bytes(&journal.marketplace_path, &std::fs::read(backup)?)?;
+    }
+    rollback_codex_owned_path(
+        &journal.plugin_path,
+        journal.plugin_before_hash.as_deref(),
+        &journal.plugin_after_hash,
+        journal.plugin_backup_ref.as_ref(),
+    )?;
+    rollback_codex_owned_path(
+        &journal.target_path,
+        journal.target_before_hash.as_deref(),
+        &journal.target_after_hash,
+        journal.target_backup_ref.as_ref(),
+    )?;
+    let mut recovered_owned_lifecycle = false;
+    if journal.plugin_lifecycle_owned_before || !journal.plugin_installed_before {
+        let plugin_list = codex_plugin_list(&journal.codex_cli_path)?;
+        if let Some(entry) = codex_plugin_entry(&plugin_list, &journal.plugin_selector) {
+            let current_version = entry.get("version").and_then(Value::as_str);
+            let version_is_owned = current_version == Some(journal.plugin_version.as_str())
+                || journal.plugin_lifecycle_version_before.as_deref() == current_version;
+            ensure!(
+                codex_plugin_entry_has_owned_identity(
+                    entry,
+                    &journal.plugin_selector,
+                    &journal.plugin_path,
+                ) && version_is_owned,
+                "interrupted Codex transaction found a foreign plugin lifecycle entry"
+            );
+            recovered_owned_lifecycle = true;
+            // Never remove or downgrade an active Codex plugin during recovery. The
+            // immediately following install materializes a content-addressed
+            // cachebuster and either performs an add-only upgrade or repairs that
+            // exact owned cache in place.
+        }
+    }
+    for staging in [&journal.target_staging, &journal.plugin_staging] {
+        if staging.exists() {
+            remove_owned_path(staging)?;
+        }
+    }
+    if recovered_owned_lifecycle {
+        persist_codex_owned_lifecycle_recovery(&journal)?;
+    }
+    std::fs::remove_file(journal_path)?;
+    Ok(recovered_owned_lifecycle)
+}
+
+#[allow(clippy::too_many_lines)]
+pub(super) fn install_codex_global(
+    config_path: &Path,
+    source: &Path,
+    target: &Path,
+    governor: &Path,
+    previous: Option<&CodexGlobalInstallManifest>,
+    recovered_owned_lifecycle: bool,
+    dry_run: bool,
+) -> Result<GlobalInstallOutcome> {
+    let home = user_home()?;
+    let base = install_base()?;
+    let plugins_root = home.join("plugins");
+    let plugin_path = codex_plugin_root()?;
+    let marketplace_path = codex_marketplace_path()?;
+    let codex = crate::dogfood::find_codex_cli()
+        .context("locate installed Codex CLI for the official personal-marketplace lifecycle")?;
+    let plugin_selector = format!("{CODEX_PLUGIN_NAME}@{CODEX_MARKETPLACE_NAME}");
+    let plugin_list_before = codex_plugin_list(&codex)?;
+    let plugin_state_before = codex_plugin_installed_enabled(&plugin_list_before, &plugin_selector);
+    ensure!(
+        !matches!(plugin_state_before, Some((true, false))),
+        "Codex plugin {plugin_selector} is installed but disabled; refusing to overwrite user state"
+    );
+    let plugin_installed_before = !recovered_owned_lifecycle
+        && codex_effective_plugin_installed_before(
+            previous.map(|manifest| manifest.plugin_installed_before),
+            plugin_state_before,
+        );
+    ensure_child(&plugins_root, &plugin_path)?;
+    ensure!(
+        source.is_dir(),
+        "Codex plugin source is missing: {}",
+        source.display()
+    );
+
+    let plugin_manifest_path = source.join(".codex-plugin").join("plugin.json");
+    let plugin_manifest: Value = serde_json::from_reader(
+        std::fs::File::open(&plugin_manifest_path)
+            .with_context(|| format!("read {}", plugin_manifest_path.display()))?,
+    )?;
+    ensure!(
+        plugin_manifest.get("name").and_then(Value::as_str) == Some(CODEX_PLUGIN_NAME),
+        "Codex plugin manifest must identify {CODEX_PLUGIN_NAME}"
+    );
+    let plugin_source_version = plugin_manifest
+        .get("version")
+        .and_then(Value::as_str)
+        .context("Codex plugin manifest version is missing")?
+        .to_owned();
+    let plugin_base_version = plugin_source_version
+        .split_once('+')
+        .map_or(plugin_source_version.as_str(), |(base, _)| base)
+        .trim()
+        .to_owned();
+    ensure!(
+        !plugin_base_version.is_empty(),
+        "Codex plugin base version may not be empty"
+    );
+    let installed_governor = plugin_path.join("bin").join("eliot-governor.exe");
+    let installed_governor_sha256 = sha256_file(governor)?;
+    let mut mcp_config: Value =
+        serde_json::from_reader(std::fs::File::open(source.join(".mcp.json"))?)?;
+    materialize_codex_mcp_config(&mut mcp_config, &installed_governor)?;
+    let mut hooks: Value = serde_json::from_reader(std::fs::File::open(
+        source.join("hooks").join("hooks.json"),
+    )?)?;
+    materialize_codex_hook_commands(&mut hooks, &installed_governor)?;
+
+    let config = load_config(config_path)?;
+    let local_app_data =
+        PathBuf::from(std::env::var_os("LOCALAPPDATA").context("LOCALAPPDATA is not set")?);
+    let mut approved_governors = vec![governor.to_path_buf()];
+    if let Some(previous) = previous {
+        approved_governors.push(previous.installed_governor_path.clone());
+    }
+    let approval = CodexLegacyMcpApproval {
+        governor_paths: approved_governors,
+        governor_packages_root: local_app_data.join("Eliot").join("packages"),
+        surreal_executable: PathBuf::from(&config.db.surreal.exe),
+        surreal_namespace: config.db.surreal.ns.clone(),
+        surreal_database: config.db.surreal.db.clone(),
+        surreal_storage: config.db.surreal.storage.clone(),
+    };
+    let legacy_direct_mcp = inspect_codex_legacy_direct_mcp(&codex, &approval)?;
+
+    if marketplace_path.exists() {
+        let metadata = std::fs::symlink_metadata(&marketplace_path)?;
+        ensure!(
+            !metadata.file_type().is_symlink() && metadata.is_file(),
+            "Codex personal marketplace must be a regular file: {}",
+            marketplace_path.display()
+        );
+    }
+    if plugin_path.exists() {
+        ensure!(
+            !std::fs::symlink_metadata(&plugin_path)?
+                .file_type()
+                .is_symlink(),
+            "Codex plugin destination may not be a symlink: {}",
+            plugin_path.display()
+        );
+    }
+    let marketplace_existed_now = marketplace_path.is_file();
+    let marketplace_before_bytes = marketplace_existed_now
+        .then(|| std::fs::read(&marketplace_path))
+        .transpose()?;
+    let marketplace_before_hash_now = marketplace_before_bytes.as_deref().map(bytes_hash);
+    let merged = merge_codex_marketplace(marketplace_before_bytes.as_deref(), previous)?;
+    let (marketplace_existed_before, marketplace_before_hash, marketplace_backup_ref) = if merged
+        .continuing_owned
+    {
+        let manifest = previous.context("continuing Codex ownership requires a manifest")?;
+        (
+            manifest.marketplace_existed_before,
+            manifest.marketplace_before_hash.clone(),
+            manifest.marketplace_backup_ref.clone(),
+        )
+    } else {
+        (
+            marketplace_existed_now,
+            marketplace_before_hash_now.clone(),
+            marketplace_existed_now
+                .then(|| {
+                    global_backup_path("codex-personal-marketplace", marketplace_path.extension())
+                })
+                .transpose()?,
+        )
+    };
+
+    let mut outcome = GlobalInstallOutcome::default();
+    outcome
+        .installed_paths
+        .push(plugin_path.to_string_lossy().into_owned());
+    outcome
+        .installed_paths
+        .push(marketplace_path.to_string_lossy().into_owned());
+    outcome
+        .installed_paths
+        .push(format!("official-plugin:{plugin_selector}"));
+    if marketplace_before_bytes.as_deref() != Some(merged.bytes.as_slice()) {
+        outcome
+            .modified_files
+            .push(marketplace_path.to_string_lossy().into_owned());
+    }
+    if let Some(backup) = &marketplace_backup_ref {
+        outcome
+            .backup_refs
+            .push(backup.to_string_lossy().into_owned());
+    }
+    if dry_run {
+        outcome
+            .modified_files
+            .push(plugin_path.to_string_lossy().into_owned());
+        if plugin_state_before != Some((true, true)) {
+            outcome
+                .modified_files
+                .push(format!("official-plugin:{plugin_selector}"));
+        }
+        outcome.modified_files.extend(
+            legacy_direct_mcp
+                .iter()
+                .map(|registration| format!("legacy-direct-mcp:{}", registration.name)),
+        );
+        return Ok(outcome);
+    }
+
+    std::fs::create_dir_all(&base)?;
+    std::fs::create_dir_all(&plugins_root)?;
+    let transaction_id = Uuid::new_v4().to_string();
+    let target_staging = base.join(format!(".codex-{transaction_id}-staging"));
+    let plugin_staging =
+        plugins_root.join(format!(".{CODEX_PLUGIN_NAME}-{transaction_id}-staging"));
+    ensure_child(&base, &target_staging)?;
+    ensure_child(&plugins_root, &plugin_staging)?;
+    copy_tree(source, &target_staging, AgentHostId::Codex)?;
+    std::fs::create_dir_all(target_staging.join("bin"))?;
+    std::fs::copy(
+        governor,
+        target_staging.join("bin").join("eliot-governor.exe"),
+    )?;
+    copy_tree(source, &plugin_staging, AgentHostId::Codex)?;
+    std::fs::create_dir_all(plugin_staging.join("bin"))?;
+    std::fs::copy(
+        governor,
+        plugin_staging.join("bin").join("eliot-governor.exe"),
+    )?;
+    atomic_write_json(&plugin_staging.join(".mcp.json"), &mcp_config)?;
+    atomic_write_json(&plugin_staging.join("hooks").join("hooks.json"), &hooks)?;
+    materialize_codex_plugin_version(&plugin_staging, &plugin_base_version)?;
+    let pre_version_payload_hash = codex_cache_contract_hash(&plugin_staging)?;
+    let plugin_version =
+        codex_materialized_plugin_version(&plugin_base_version, &pre_version_payload_hash)?;
+    materialize_codex_plugin_version(&plugin_staging, &plugin_version)?;
+    let desired_target_hash = hash_owned_path(&target_staging)?;
+    let desired_plugin_hash = hash_owned_path(&plugin_staging)?;
+    let desired_cache_contract_hash = codex_cache_contract_hash(&plugin_staging)?;
+    let target_before_hash = target
+        .exists()
+        .then(|| hash_owned_path(target))
+        .transpose()?;
+    let current_plugin_hash = plugin_path
+        .exists()
+        .then(|| hash_owned_path(&plugin_path))
+        .transpose()?;
+    let continuing_owned_plugin = previous.is_some_and(|manifest| {
+        manifest.installed_plugin.path == plugin_path
+            && current_plugin_hash.as_deref()
+                == Some(manifest.installed_plugin.installed_hash.as_str())
+    });
+    let previous_cache_contract_hash = previous
+        .filter(|_| continuing_owned_plugin)
+        .map(|manifest| codex_manifest_cache_contract_hash(manifest, &plugin_path))
+        .transpose()?;
+    let original_plugin_before_hash =
+        codex_original_plugin_hash(previous, current_plugin_hash.as_deref())?;
+    let plugin_lifecycle_owned_before =
+        previous.is_some() && !plugin_installed_before && plugin_state_before == Some((true, true));
+    let previous_owned_lifecycle = if plugin_lifecycle_owned_before {
+        Some(previous.context("owned Codex lifecycle requires its prior manifest")?)
+    } else {
+        None
+    };
+    if let Some(manifest) = previous_owned_lifecycle {
+        let previous_expected = CodexPluginExpectation {
+            selector: &plugin_selector,
+            version: &manifest.plugin_version,
+            source_path: &plugin_path,
+            cache_contract_hash: previous_cache_contract_hash
+                .as_deref()
+                .context("owned Codex lifecycle lacks its prior cache contract")?,
+            installed_governor: &manifest.installed_governor_path,
+            installed_governor_sha256: &manifest.installed_governor_sha256,
+        };
+        let previous_lifecycle_is_fresh =
+            codex_plugin_lifecycle_is_fresh(&codex, &plugin_list_before, &previous_expected)?;
+        if !previous_lifecycle_is_fresh {
+            let entry = codex_plugin_entry(&plugin_list_before, &plugin_selector)
+                .context("owned Codex lifecycle disappeared during install preflight")?;
+            let entry_version = entry.get("version").and_then(Value::as_str);
+            let version_is_proven = entry_version == Some(manifest.plugin_version.as_str())
+                || (recovered_owned_lifecycle && entry_version == Some(plugin_version.as_str()));
+            ensure!(
+                continuing_owned_plugin
+                    && codex_plugin_entry_has_owned_identity(entry, &plugin_selector, &plugin_path,)
+                    && version_is_proven
+                    && sha256_file(&manifest.installed_governor_path)?
+                        == manifest.installed_governor_sha256
+                    && manifest.plugin_version != plugin_version,
+                "existing stale Codex lifecycle is not proven to be the before/after artifact owned by ELIOT"
+            );
+        }
+    }
+    let force_refresh_owned = codex_owned_lifecycle_requires_refresh(
+        previous.is_some(),
+        plugin_installed_before,
+        previous_cache_contract_hash.as_deref(),
+        &desired_cache_contract_hash,
+    );
+    let persistent_plugin_backup_ref = if continuing_owned_plugin {
+        previous.and_then(|manifest| manifest.installed_plugin.backup_ref.clone())
+    } else if plugin_path.exists() {
+        Some(global_backup_path(CODEX_PLUGIN_NAME, None)?)
+    } else {
+        None
+    };
+    let transaction_plugin_backup = if plugin_path.exists() {
+        if continuing_owned_plugin {
+            Some(global_backup_path("codex-transaction-plugin", None)?)
+        } else {
+            persistent_plugin_backup_ref.clone()
+        }
+    } else {
+        None
+    };
+    let target_backup = target
+        .exists()
+        .then(|| base.join(format!(".codex-{transaction_id}-backup")));
+    let transaction_marketplace_backup = if marketplace_existed_now {
+        if merged.continuing_owned {
+            Some(global_backup_path(
+                "codex-transaction-marketplace",
+                marketplace_path.extension(),
+            )?)
+        } else {
+            marketplace_backup_ref.clone()
+        }
+    } else {
+        None
+    };
+    let journal = CodexInstallJournal {
+        schema_version: CODEX_INSTALL_JOURNAL_SCHEMA_V2.to_owned(),
+        transaction_id: transaction_id.clone(),
+        target_path: target.to_path_buf(),
+        target_existed_before: target.exists(),
+        target_before_hash: target_before_hash.clone(),
+        target_after_hash: desired_target_hash.clone(),
+        target_backup_ref: target_backup.clone(),
+        target_staging: target_staging.clone(),
+        plugin_path: plugin_path.clone(),
+        plugin_existed_before: plugin_path.exists(),
+        plugin_before_hash: current_plugin_hash.clone(),
+        plugin_after_hash: desired_plugin_hash.clone(),
+        plugin_backup_ref: transaction_plugin_backup.clone(),
+        plugin_staging: plugin_staging.clone(),
+        marketplace_path: marketplace_path.clone(),
+        marketplace_existed_before: marketplace_existed_now,
+        marketplace_before_hash: marketplace_before_hash_now.clone(),
+        marketplace_after_hash: bytes_hash(&merged.bytes),
+        marketplace_backup_ref: transaction_marketplace_backup.clone(),
+        marketplace_plugins_field_existed_before: merged.plugins_field_existed_before,
+        marketplace_entry_before: merged.entry_before.clone(),
+        marketplace_entry_before_index: merged.entry_before_index,
+        marketplace_entry_after: codex_marketplace_entry(),
+        codex_cli_path: codex.clone(),
+        plugin_selector: plugin_selector.clone(),
+        plugin_installed_before,
+        plugin_lifecycle_owned_before,
+        plugin_lifecycle_version_before: previous_owned_lifecycle
+            .map(|manifest| manifest.plugin_version.clone()),
+        plugin_lifecycle_source_hash_before: previous_owned_lifecycle
+            .map(|manifest| codex_manifest_plugin_source_hash(manifest).to_owned()),
+        plugin_cache_contract_hash_before: previous_cache_contract_hash
+            .clone()
+            .filter(|_| plugin_lifecycle_owned_before),
+        plugin_cache_contract_hash_after: desired_cache_contract_hash.clone(),
+        installed_governor_sha256_before: previous_owned_lifecycle
+            .map(|manifest| manifest.installed_governor_sha256.clone()),
+        plugin_version: plugin_version.clone(),
+        installed_governor_path: installed_governor.clone(),
+        installed_governor_sha256: installed_governor_sha256.clone(),
+        created_at: OffsetDateTime::now_utc().to_string(),
+    };
+    create_codex_install_journal(&journal)?;
+    let mutation = (|| -> Result<()> {
+        if let Some(backup) = &transaction_marketplace_backup {
+            std::fs::create_dir_all(
+                backup
+                    .parent()
+                    .context("marketplace backup has no parent")?,
+            )?;
+            std::fs::copy(&marketplace_path, backup)?;
+        }
+        if let Some(backup) = &target_backup {
+            std::fs::rename(target, backup)?;
+        }
+        std::fs::rename(&target_staging, target)?;
+        if let Some(backup) = &transaction_plugin_backup {
+            std::fs::create_dir_all(backup.parent().context("plugin backup has no parent")?)?;
+            std::fs::rename(&plugin_path, backup)?;
+        }
+        std::fs::rename(&plugin_staging, &plugin_path)?;
+        if marketplace_before_bytes.as_deref() != Some(merged.bytes.as_slice()) {
+            atomic_write_json(&marketplace_path, &merged.value)?;
+        }
+        let expected = CodexPluginExpectation {
+            selector: &plugin_selector,
+            version: &plugin_version,
+            source_path: &plugin_path,
+            cache_contract_hash: &desired_cache_contract_hash,
+            installed_governor: &installed_governor,
+            installed_governor_sha256: &installed_governor_sha256,
+        };
+        install_codex_plugin_lifecycle(
+            &codex,
+            &expected,
+            (previous.is_some() || recovered_owned_lifecycle) && !plugin_installed_before,
+            force_refresh_owned,
+        )?;
+        Ok(())
+    })();
+    if let Err(error) = mutation {
+        return match recover_codex_install_transaction(target, false) {
+            Ok(true) if !recovered_owned_lifecycle => install_codex_global(
+                config_path,
+                source,
+                target,
+                governor,
+                previous,
+                true,
+                false,
+            )
+            .with_context(|| {
+                format!(
+                    "Codex install retry after owned lifecycle recovery; initial failure: {error:#}"
+                )
+            }),
+            Ok(_) => Err(error.context("Codex install transaction rolled back")),
+            Err(recovery) => {
+                Err(error.context(format!("Codex rollback also failed: {recovery:#}")))
+            }
+        };
+    }
+    outcome
+        .modified_files
+        .push(target.to_string_lossy().into_owned());
+    outcome
+        .modified_files
+        .push(plugin_path.to_string_lossy().into_owned());
+    if let Some(backup) = &persistent_plugin_backup_ref {
+        outcome
+            .backup_refs
+            .push(backup.to_string_lossy().into_owned());
+    }
+    ensure!(
+        hash_owned_path(&plugin_path)? == desired_plugin_hash,
+        "installed Codex plugin hash does not match the staged plugin"
+    );
+    ensure!(
+        sha256_file(&installed_governor)? == installed_governor_sha256,
+        "installed Codex Eliot executable hash does not match current release"
+    );
+    let mut legacy_prior = previous
+        .map(|manifest| manifest.legacy_direct_mcp_prior.clone())
+        .unwrap_or_default();
+    for registration in &legacy_direct_mcp {
+        if !legacy_prior
+            .iter()
+            .any(|prior| prior.name == registration.name)
+        {
+            legacy_prior.push(registration.clone());
+        }
+    }
+    let mut legacy_removed = previous
+        .map(|manifest| manifest.legacy_direct_mcp_removed.clone())
+        .unwrap_or_default();
+    for prior in &legacy_prior {
+        ensure!(
+            matches!(prior.name.as_str(), "eliot-governor" | "eliot_surrealdb"),
+            "Codex manifest contains an unknown legacy MCP identity: {}",
+            prior.name
+        );
+        if !legacy_removed.contains(&prior.name)
+            && !legacy_direct_mcp
+                .iter()
+                .any(|registration| registration.name == prior.name)
+        {
+            legacy_removed.push(prior.name.clone());
+        }
+    }
+    let mut manifest = CodexGlobalInstallManifest {
+        schema_version: CODEX_GLOBAL_MANIFEST_SCHEMA_V2.to_owned(),
+        transaction_id,
+        source_plugin_path: source.to_path_buf(),
+        source_bundle_hash: bundle_hash(source, AgentHostId::Codex)?,
+        installed_plugin: OpenCodeOwnedPath {
+            path: plugin_path.clone(),
+            installed_hash: desired_plugin_hash.clone(),
+            backup_ref: persistent_plugin_backup_ref,
+        },
+        plugin_before_hash: original_plugin_before_hash,
+        installed_governor_path: installed_governor.clone(),
+        installed_governor_sha256: installed_governor_sha256.clone(),
+        marketplace_path: marketplace_path.clone(),
+        marketplace_existed_before,
+        marketplace_before_hash,
+        marketplace_after_hash: bytes_hash(&merged.bytes),
+        marketplace_backup_ref,
+        marketplace_plugins_field_existed_before: merged.plugins_field_existed_before,
+        marketplace_entry_before: merged.entry_before,
+        marketplace_entry_before_index: merged.entry_before_index,
+        marketplace_entry_after: codex_marketplace_entry(),
+        marketplace_name: CODEX_MARKETPLACE_NAME.to_owned(),
+        plugin_version,
+        plugin_source_hash: desired_plugin_hash,
+        cache_contract_hash: desired_cache_contract_hash,
+        codex_cli_path: codex.clone(),
+        plugin_selector: plugin_selector.clone(),
+        plugin_installed_before,
+        plugin_installed_enabled_after: true,
+        legacy_direct_mcp_prior: legacy_prior,
+        legacy_direct_mcp_removed: legacy_removed,
+        generated_at: OffsetDateTime::now_utc().to_string(),
+    };
+    atomic_write_json(&target.join(CODEX_GLOBAL_MANIFEST), &manifest)?;
+    remove_codex_transaction_backup(
+        transaction_plugin_backup.as_ref(),
+        manifest.installed_plugin.backup_ref.as_ref(),
+    )?;
+    remove_codex_transaction_backup(
+        transaction_marketplace_backup.as_ref(),
+        manifest.marketplace_backup_ref.as_ref(),
+    )?;
+    remove_codex_transaction_backup(target_backup.as_ref(), None)?;
+    std::fs::remove_file(codex_install_journal_path()?)?;
+    clear_codex_owned_lifecycle_recovery()?;
+    for registration in &legacy_direct_mcp {
+        remove_codex_legacy_direct_mcp(&codex, registration)?;
+        if !manifest
+            .legacy_direct_mcp_removed
+            .contains(&registration.name)
+        {
+            manifest
+                .legacy_direct_mcp_removed
+                .push(registration.name.clone());
+            atomic_write_json(&target.join(CODEX_GLOBAL_MANIFEST), &manifest)?;
+        }
+        outcome
+            .modified_files
+            .push(format!("legacy-direct-mcp:{}", registration.name));
+    }
+    Ok(outcome)
 }
 
 #[allow(clippy::too_many_lines)]
@@ -1015,6 +2807,26 @@ pub(super) fn hash_owned_path(path: &Path) -> Result<String> {
     Ok(format!("blake3:{}", hasher.finalize().to_hex()))
 }
 
+pub(super) fn codex_cache_contract_hash(path: &Path) -> Result<String> {
+    ensure!(
+        path.is_dir(),
+        "Codex cache contract root must be a directory: {}",
+        path.display()
+    );
+    let mut files = Vec::new();
+    collect_owned_files(path, path, &mut files)?;
+    files.retain(|(relative, _)| !relative.eq_ignore_ascii_case("bin/eliot-governor.exe"));
+    files.sort_by(|left, right| left.0.cmp(&right.0));
+    let mut hasher = blake3::Hasher::new();
+    for (relative, file) in files {
+        hasher.update(relative.as_bytes());
+        hasher.update(&[0]);
+        hasher.update(&std::fs::read(file)?);
+        hasher.update(&[0]);
+    }
+    Ok(format!("blake3:{}", hasher.finalize().to_hex()))
+}
+
 pub(super) fn collect_owned_files(
     root: &Path,
     directory: &Path,
@@ -1044,6 +2856,204 @@ pub(super) fn collect_owned_files(
 
 pub(super) fn bytes_hash(bytes: &[u8]) -> String {
     format!("blake3:{}", blake3::hash(bytes).to_hex())
+}
+
+pub(super) fn uninstall_codex_global(
+    manifest: &CodexGlobalInstallManifest,
+    dry_run: bool,
+) -> Result<Value> {
+    let plugin_path = codex_plugin_root()?;
+    let marketplace_path = codex_marketplace_path()?;
+    ensure!(
+        manifest.installed_plugin.path == plugin_path,
+        "Codex install manifest does not own {}",
+        plugin_path.display()
+    );
+    ensure!(
+        manifest.installed_governor_path == plugin_path.join("bin").join("eliot-governor.exe"),
+        "Codex install manifest contains an unexpected Governor path"
+    );
+    ensure!(
+        manifest.marketplace_path == marketplace_path,
+        "Codex install manifest contains an unexpected marketplace path"
+    );
+    let original_plugin_before_hash = codex_original_plugin_hash(Some(manifest), None)?;
+    let plugin_current_hash = plugin_path
+        .exists()
+        .then(|| hash_owned_path(&plugin_path))
+        .transpose()?;
+    let plugin_is_installed =
+        plugin_current_hash.as_deref() == Some(manifest.installed_plugin.installed_hash.as_str());
+    let plugin_is_restored = codex_plugin_path_is_restored(
+        plugin_current_hash.as_deref(),
+        original_plugin_before_hash.as_deref(),
+    );
+    let validated_plugin_backup = if original_plugin_before_hash.is_some()
+        && (plugin_is_installed || plugin_current_hash.is_none())
+    {
+        let backup = manifest
+            .installed_plugin
+            .backup_ref
+            .as_ref()
+            .context("Codex plugin restore requires its ownership backup")?;
+        let backup_root = install_base()?.join("global-backups");
+        ensure_child(&backup_root, backup)?;
+        let metadata = std::fs::symlink_metadata(backup)
+            .with_context(|| format!("inspect Codex plugin backup {}", backup.display()))?;
+        ensure!(
+            !metadata.file_type().is_symlink() && (metadata.is_dir() || metadata.is_file()),
+            "Codex plugin backup must be a regular owned path: {}",
+            backup.display()
+        );
+        ensure!(
+            Some(hash_owned_path(backup)?.as_str()) == original_plugin_before_hash.as_deref(),
+            "Codex plugin backup does not match the pre-install hash"
+        );
+        Some(backup)
+    } else {
+        None
+    };
+    ensure!(
+        plugin_is_installed || plugin_is_restored || validated_plugin_backup.is_some(),
+        "Codex plugin path contains unknown content; refusing uninstall"
+    );
+    if plugin_is_installed {
+        ensure!(
+            sha256_file(&manifest.installed_governor_path)? == manifest.installed_governor_sha256,
+            "installed Codex Governor changed after install; refusing to remove it"
+        );
+    }
+
+    let mut marketplace_owned = false;
+    let mut marketplace_already_restored =
+        !marketplace_path.exists() && !manifest.marketplace_existed_before;
+    let mut restored_marketplace = None;
+    let mut exact_marketplace_state = false;
+    if marketplace_path.exists() {
+        let metadata = std::fs::symlink_metadata(&marketplace_path)?;
+        ensure!(
+            !metadata.file_type().is_symlink() && metadata.is_file(),
+            "Codex personal marketplace must be a regular file"
+        );
+        let bytes = std::fs::read(&marketplace_path)?;
+        exact_marketplace_state = bytes_hash(&bytes) == manifest.marketplace_after_hash;
+        let marketplace: Value =
+            serde_json::from_slice(&bytes).context("parse Codex personal marketplace")?;
+        let current_entry = marketplace
+            .get("plugins")
+            .and_then(Value::as_array)
+            .and_then(|plugins| {
+                let indices = codex_plugin_indices(plugins);
+                (indices.len() == 1).then(|| plugins[indices[0]].clone())
+            });
+        marketplace_owned = current_entry.as_ref() == Some(&manifest.marketplace_entry_after);
+        marketplace_already_restored = current_entry.as_ref()
+            == manifest.marketplace_entry_before.as_ref()
+            || (current_entry.is_none() && manifest.marketplace_entry_before.is_none());
+        ensure!(
+            marketplace_owned || marketplace_already_restored,
+            "Codex marketplace entry contains unknown content; refusing uninstall"
+        );
+        if marketplace_owned {
+            restored_marketplace = Some(remove_codex_marketplace_entry(
+                marketplace,
+                &manifest.marketplace_entry_after,
+                manifest.marketplace_entry_before.as_ref(),
+                manifest.marketplace_entry_before_index,
+                manifest.marketplace_plugins_field_existed_before,
+            )?);
+        }
+    }
+    ensure!(
+        marketplace_path.exists() || !manifest.marketplace_existed_before,
+        "Codex marketplace that existed before install is missing; refusing uninstall"
+    );
+    let codex = if manifest.codex_cli_path.is_file() {
+        manifest.codex_cli_path.clone()
+    } else {
+        crate::dogfood::find_codex_cli()
+            .context("locate installed Codex CLI for official plugin uninstall")?
+    };
+    ensure!(
+        codex
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.eq_ignore_ascii_case("codex.exe")),
+        "Codex plugin lifecycle executable must be codex.exe"
+    );
+    let plugin_lifecycle_state =
+        codex_plugin_installed_enabled(&codex_plugin_list(&codex)?, &manifest.plugin_selector);
+    if !manifest.plugin_installed_before && plugin_lifecycle_state.is_some() {
+        let cache_contract_hash =
+            codex_manifest_cache_contract_hash(manifest, &manifest.installed_plugin.path)?;
+        let expected = CodexPluginExpectation {
+            selector: &manifest.plugin_selector,
+            version: &manifest.plugin_version,
+            source_path: &manifest.installed_plugin.path,
+            cache_contract_hash: &cache_contract_hash,
+            installed_governor: &manifest.installed_governor_path,
+            installed_governor_sha256: &manifest.installed_governor_sha256,
+        };
+        ensure!(
+            codex_plugin_lifecycle_is_fresh(&codex, &codex_plugin_list(&codex)?, &expected)?,
+            "Codex lifecycle entry changed after install; refusing removal"
+        );
+    }
+    if dry_run {
+        return Ok(json!({
+            "schema_version": "eliot-codex-global-uninstall-v1",
+            "dry_run": true,
+            "plugin_path": plugin_path,
+            "marketplace_path": marketplace_path,
+            "exact_marketplace_state": exact_marketplace_state,
+            "plugin_selector": manifest.plugin_selector,
+            "plugin_will_be_removed": !manifest.plugin_installed_before && plugin_lifecycle_state.is_some(),
+            "plugin_files_already_restored": plugin_is_restored,
+            "marketplace_already_restored": marketplace_already_restored,
+            "legacy_direct_mcp_will_be_restored": false,
+            "provider_auth_modified": false,
+            "project_config_modified": false,
+            "unrelated_config_preserved": true
+        }));
+    }
+
+    if !manifest.plugin_installed_before {
+        remove_codex_plugin_lifecycle(&codex, &manifest.plugin_selector)?;
+    }
+    if marketplace_owned {
+        if !manifest.marketplace_existed_before && exact_marketplace_state {
+            std::fs::remove_file(&marketplace_path)?;
+        } else if let Some(restored) = restored_marketplace {
+            atomic_write_json(&marketplace_path, &restored)?;
+        }
+    }
+    if plugin_is_installed {
+        remove_owned_path(&plugin_path)?;
+    }
+    if original_plugin_before_hash.is_some() && !plugin_path.exists() {
+        let backup = validated_plugin_backup
+            .context("Codex plugin restore requires its validated ownership backup")?;
+        std::fs::rename(backup, &plugin_path)?;
+        let restored_hash = hash_owned_path(&plugin_path)?;
+        ensure!(
+            Some(restored_hash.as_str()) == original_plugin_before_hash.as_deref(),
+            "restored Codex plugin does not match its pre-install hash"
+        );
+    }
+    Ok(json!({
+        "schema_version": "eliot-codex-global-uninstall-v1",
+        "dry_run": false,
+        "plugin_path": plugin_path,
+        "marketplace_path": marketplace_path,
+        "exact_marketplace_restore": !manifest.marketplace_existed_before && exact_marketplace_state,
+        "preexisting_plugin_restored": manifest.installed_plugin.backup_ref.is_some(),
+        "plugin_selector": manifest.plugin_selector,
+        "plugin_lifecycle_removed": !manifest.plugin_installed_before,
+        "legacy_direct_mcp_restored": false,
+        "provider_auth_modified": false,
+        "project_config_modified": false,
+        "unrelated_config_preserved": true
+    }))
 }
 
 pub(super) fn uninstall_claude_global(
@@ -1298,10 +3308,20 @@ pub(super) fn uninstall_opencode_global(
 }
 
 pub(super) fn uninstall(config_path: &Path, host: AgentHostId, dry_run: bool) -> Result<Value> {
-    ensure_l7_host(host)?;
+    ensure_installable_host(host)?;
     let base = install_base()?;
     let target = base.join(host.as_str());
     ensure_child(&base, &target)?;
+    let _codex_lock = (host == AgentHostId::Codex)
+        .then(acquire_codex_operation_lock)
+        .transpose()?;
+    let codex_tombstone_recovered = if host == AgentHostId::Codex {
+        let recovered = cleanup_codex_uninstall_tombstone(dry_run)?;
+        let _ = recover_codex_install_transaction(&target, dry_run)?;
+        recovered
+    } else {
+        false
+    };
     let receipt_path = install_receipt_path(config_path, host);
     let recorded: HostIntegrationReceipt = serde_json::from_reader(
         std::fs::File::open(&receipt_path)
@@ -1330,11 +3350,38 @@ pub(super) fn uninstall(config_path: &Path, host: AgentHostId, dry_run: bool) ->
             )?;
             Some(uninstall_claude_global(&manifest, dry_run)?)
         }
+        AgentHostId::Codex => {
+            if target.exists() {
+                let manifest = read_codex_global_manifest(&target)?.context(
+                    "Codex install receipt predates personal-marketplace ownership; reinstall before uninstall",
+                )?;
+                Some(uninstall_codex_global(&manifest, dry_run)?)
+            } else {
+                Some(json!({
+                    "schema_version": "eliot-codex-global-uninstall-v1",
+                    "dry_run": dry_run,
+                    "already_removed": true,
+                    "legacy_direct_mcp_restored": false
+                }))
+            }
+        }
         _ => None,
     };
     let existed = target.is_dir();
     if existed && !dry_run {
-        std::fs::remove_dir_all(&target)?;
+        if host == AgentHostId::Codex {
+            let tombstone = codex_uninstall_tombstone_path()?;
+            ensure_child(&base, &tombstone)?;
+            ensure!(
+                !tombstone.exists(),
+                "Codex uninstall tombstone unexpectedly exists: {}",
+                tombstone.display()
+            );
+            std::fs::rename(&target, &tombstone)?;
+            std::fs::remove_dir_all(&tombstone)?;
+        } else {
+            std::fs::remove_dir_all(&target)?;
+        }
     }
     Ok(json!({
         "schema_version": "eliot-host-uninstall-v1",
@@ -1343,6 +3390,7 @@ pub(super) fn uninstall(config_path: &Path, host: AgentHostId, dry_run: bool) ->
         "existed": existed,
         "removed": existed && !dry_run,
         "dry_run": dry_run,
+        "codex_tombstone_recovered": codex_tombstone_recovered,
         "global_uninstall": global_uninstall,
         "provider_auth_modified": false,
         "unrelated_config_preserved": true

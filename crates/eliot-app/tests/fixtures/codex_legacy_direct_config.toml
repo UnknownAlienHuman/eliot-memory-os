@@ -1,0 +1,21 @@
+[mcp_servers.codebase_memory]
+command = "C:/fixture/codebase-memory-mcp.exe"
+enabled = true
+
+[mcp_servers.context7]
+url = "https://mcp.context7.com/mcp"
+enabled = true
+
+[mcp_servers.eliot_surrealdb]
+command = "C:/Tools/SurrealDB/surreal.exe"
+args = [
+  "mcp",
+  "--ns",
+  "eliot",
+  "--db",
+  "system",
+  "surrealkv://legacy",
+]
+
+[plugins."other-tool@personal"]
+enabled = true

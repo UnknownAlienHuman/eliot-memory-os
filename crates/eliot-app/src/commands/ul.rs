@@ -159,44 +159,69 @@ pub fn run_ul_doctor(host: UlDoctorHostArg) -> Result<()> {
     match host {
         UlDoctorHostArg::Codex => {
             let package = root.join("plugin/eliot-governor");
-            let registration = std::env::var_os("ELIOT_DOCTOR_CODEX_CONFIG")
-                .map_or_else(|| root.join(".codex/config.toml"), PathBuf::from);
+            let canonical_marketplace = root.join("integrations/codex/marketplace.json");
+            let user_home = codex_user_home()
+                .unwrap_or_else(|| PathBuf::from("<missing-codex-user-home>"));
+            let personal_marketplace = std::env::var_os("ELIOT_DOCTOR_CODEX_MARKETPLACE")
+                .map_or_else(
+                    || user_home.join(".agents/plugins/marketplace.json"),
+                    PathBuf::from,
+                );
+            let installed_plugin = std::env::var_os("ELIOT_DOCTOR_CODEX_PLUGIN")
+                .map_or_else(
+                    || user_home.join("plugins/eliot-governor"),
+                    PathBuf::from,
+                );
+            let global_config = std::env::var_os("ELIOT_DOCTOR_CODEX_CONFIG")
+                .map_or_else(|| user_home.join(".codex/config.toml"), PathBuf::from);
             checks.push((
                 "plugin-package",
-                package.join(".codex-plugin/plugin.json").is_file(),
+                codex_plugin_manifest_matches(&package.join(".codex-plugin/plugin.json"))
+                    && codex_marketplace_matches(
+                        &canonical_marketplace,
+                        "eliot-system",
+                        true,
+                    ),
                 format!(
-                    "restore {}",
-                    package.join(".codex-plugin/plugin.json").display()
+                    "restore the canonical Codex plugin and marketplace under {} and {}",
+                    package.display(),
+                    canonical_marketplace.display()
                 ),
             ));
             checks.push((
                 "single-registration",
-                mcp_server_matches(
+                codex_mcp_server_matches(
                     &package.join(".mcp.json"),
-                    "eliot",
                     "eliot-governor.exe",
-                    &[
-                        "mcp",
-                        "stdio",
-                        "--host",
-                        "codex",
-                        "--profile",
-                        "codex_worker",
-                        "--instance",
-                        "default",
-                    ],
+                    "bin/eliot-governor.exe",
                 ),
                 format!(
-                    "keep one `eliot` entry with codex_worker in {}",
+                    "keep one required `eliot` controller entry without `--host` in {}",
                     package.join(".mcp.json").display()
                 ),
             ));
             checks.push((
-                "installed-registration",
-                codex_overlay_matches(&registration),
+                "personal-marketplace",
+                codex_marketplace_matches(&personal_marketplace, "personal", false),
                 format!(
-                    "keep one live codex_worker registration in {}",
-                    registration.display()
+                    "install the ELIOT entry with INSTALLED_BY_DEFAULT policy in {}",
+                    personal_marketplace.display()
+                ),
+            ));
+            checks.push((
+                "installed-plugin",
+                codex_installed_plugin_matches(&installed_plugin),
+                format!(
+                    "install the system ELIOT plugin under {}",
+                    installed_plugin.display()
+                ),
+            ));
+            checks.push((
+                "no-direct-registration",
+                codex_config_has_no_direct_eliot(&global_config),
+                format!(
+                    "remove direct ELIOT MCP entries from {}; preserve unrelated MCP servers",
+                    global_config.display()
                 ),
             ));
             checks.push(hook_check(
@@ -337,17 +362,21 @@ pub fn run_ul_doctor(host: UlDoctorHostArg) -> Result<()> {
 }
 
 fn hook_check(path: &Path, required_events: &[&str]) -> (&'static str, bool, String) {
-    let valid = std::fs::read_to_string(path).ok().is_some_and(|text| {
-        let lower = text.to_ascii_lowercase();
-        required_events.iter().all(|event| text.contains(event))
-            && !lower.contains("eliot_agent_candidate_submit")
-            && !lower.contains("eliot_memory_influence_trace")
-    });
+    let valid = hook_file_matches(path, required_events);
     (
         "hooks-boundary",
         valid,
         format!("restore bounded lifecycle hooks in {}", path.display()),
     )
+}
+
+fn hook_file_matches(path: &Path, required_events: &[&str]) -> bool {
+    std::fs::read_to_string(path).ok().is_some_and(|text| {
+        let lower = text.to_ascii_lowercase();
+        required_events.iter().all(|event| text.contains(event))
+            && !lower.contains("eliot_agent_candidate_submit")
+            && !lower.contains("eliot_memory_influence_trace")
+    })
 }
 
 fn mcp_server_matches(path: &Path, key: &str, command: &str, args: &[&str]) -> bool {
@@ -372,47 +401,147 @@ fn mcp_server_matches(path: &Path, key: &str, command: &str, args: &[&str]) -> b
         })
 }
 
-fn codex_overlay_matches(path: &Path) -> bool {
+fn codex_user_home() -> Option<PathBuf> {
+    std::env::var_os("USERPROFILE")
+        .or_else(|| std::env::var_os("HOME"))
+        .map(PathBuf::from)
+}
+
+fn codex_plugin_manifest_matches(path: &Path) -> bool {
+    read_json_file(path).is_some_and(|manifest| {
+        manifest.get("name").and_then(Value::as_str) == Some("eliot-governor")
+            && manifest.get("skills").and_then(Value::as_str) == Some("./skills/")
+            && manifest.get("mcpServers").and_then(Value::as_str) == Some("./.mcp.json")
+            && manifest.get("hooks").is_none()
+            && manifest
+                .pointer("/interface/category")
+                .and_then(Value::as_str)
+                == Some("Developer Tools")
+    })
+}
+
+fn codex_marketplace_matches(path: &Path, expected_name: &str, eliot_only: bool) -> bool {
+    let Some(marketplace) = read_json_file(path) else {
+        return false;
+    };
+    if marketplace.get("name").and_then(Value::as_str) != Some(expected_name) {
+        return false;
+    }
+    let Some(plugins) = marketplace.get("plugins").and_then(Value::as_array) else {
+        return false;
+    };
+    if eliot_only && plugins.len() != 1 {
+        return false;
+    }
+    let mut matches = plugins.iter().filter(|plugin| {
+        plugin.get("name").and_then(Value::as_str) == Some("eliot-governor")
+    });
+    let Some(plugin) = matches.next() else {
+        return false;
+    };
+    matches.next().is_none()
+        && plugin.pointer("/source/source").and_then(Value::as_str) == Some("local")
+        && plugin.pointer("/source/path").and_then(Value::as_str)
+            == Some("./plugins/eliot-governor")
+        && plugin
+            .pointer("/policy/installation")
+            .and_then(Value::as_str)
+            == Some("INSTALLED_BY_DEFAULT")
+        && plugin
+            .pointer("/policy/authentication")
+            .and_then(Value::as_str)
+            == Some("ON_INSTALL")
+        && plugin.get("category").and_then(Value::as_str) == Some("Developer Tools")
+}
+
+fn codex_mcp_server_matches(path: &Path, command_name: &str, expected_command: &str) -> bool {
+    let Some(value) = read_json_file(path) else {
+        return false;
+    };
+    let Some(servers) = value.get("mcpServers").and_then(Value::as_object) else {
+        return false;
+    };
+    if servers.len() != 1 {
+        return false;
+    }
+    servers.get("eliot").is_some_and(|server| {
+        server.get("type").and_then(Value::as_str) == Some("stdio")
+            && server
+                .get("command")
+                .and_then(Value::as_str)
+                .is_some_and(|actual| {
+                    normalized_codex_path(actual) == normalized_codex_path(expected_command)
+                        && actual
+                            .replace('\\', "/")
+                            .to_ascii_lowercase()
+                            .ends_with(command_name)
+                })
+            && server.get("cwd").and_then(Value::as_str) == Some(".")
+            && server
+                .get("args")
+                .and_then(Value::as_array)
+                .is_some_and(|args| {
+                    args.iter().filter_map(Value::as_str).eq([
+                        "mcp",
+                        "stdio",
+                        "--profile",
+                        "codex_controller",
+                        "--instance",
+                        "default",
+                    ])
+                })
+            && server.get("enabled").and_then(Value::as_bool) == Some(true)
+            && server.get("required").and_then(Value::as_bool) == Some(true)
+    })
+}
+
+fn normalized_codex_path(path: &str) -> String {
+    path.replace('\\', "/").to_ascii_lowercase()
+}
+
+fn codex_installed_plugin_matches(root: &Path) -> bool {
+    let executable = root.join("bin/eliot-governor.exe");
+    let expected_command = executable.to_string_lossy();
+    codex_plugin_manifest_matches(&root.join(".codex-plugin/plugin.json"))
+        && codex_mcp_server_matches(
+            &root.join(".mcp.json"),
+            "eliot-governor.exe",
+            &expected_command,
+        )
+        && executable.is_file()
+        && ["eliot-work", "eliot-remember", "eliot-recover", "eliot-finish"]
+            .iter()
+            .all(|skill| root.join("skills").join(skill).join("SKILL.md").is_file())
+        && hook_file_matches(&root.join("hooks/hooks.json"), &[
+            "SessionStart",
+            "PreToolUse",
+            "PostToolUse",
+            "PreCompact",
+            "PostCompact",
+            "Stop",
+        ])
+}
+
+fn codex_config_has_no_direct_eliot(path: &Path) -> bool {
+    if !path.is_file() {
+        return true;
+    }
     let Ok(text) = std::fs::read_to_string(path) else {
         return false;
     };
     let Ok(value) = toml::from_str::<toml::Value>(&text) else {
         return false;
     };
-    let Some(servers) = value.get("mcp_servers").and_then(toml::Value::as_table) else {
-        return false;
-    };
-    if servers.len() != 1 {
-        return false;
-    }
-    servers
-        .get("eliot-governor")
+    value
+        .get("mcp_servers")
         .and_then(toml::Value::as_table)
-        .is_some_and(|server| {
-            server
-                .get("command")
-                .and_then(toml::Value::as_str)
-                .is_some_and(|command| {
-                    command
-                        .replace('\\', "/")
-                        .to_ascii_lowercase()
-                        .ends_with("/eliot-governor.exe")
-                })
-                && server
-                    .get("args")
-                    .and_then(toml::Value::as_array)
-                    .is_some_and(|args| {
-                        args.iter().filter_map(toml::Value::as_str).eq([
-                            "mcp",
-                            "stdio",
-                            "--host",
-                            "codex",
-                            "--profile",
-                            "codex_worker",
-                            "--instance",
-                            "default",
-                        ])
-                    })
+        .is_none_or(|servers| {
+            servers.keys().all(|name| {
+                !name
+                    .replace('-', "_")
+                    .to_ascii_lowercase()
+                    .starts_with("eliot")
+            })
         })
 }
 

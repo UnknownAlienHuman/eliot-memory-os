@@ -2,17 +2,18 @@
   "mcpServers": {
     "eliot": {
       "type": "stdio",
-      "command": "eliot-governor.exe",
+      "command": "bin/eliot-governor.exe",
+      "cwd": ".",
       "args": [
         "mcp",
         "stdio",
-        "--host",
-        "codex",
         "--profile",
-        "codex_worker",
+        "codex_controller",
         "--instance",
         "default"
-      ]
+      ],
+      "enabled": true,
+      "required": true
     }
   }
 }

@@ -186,6 +186,16 @@ function Test-ReleaseBundle([string]$Path) {
         'operator/Eliot.Operator.exe',
         'config',
         'integrations',
+        'integrations/codex/marketplace.json',
+        'integrations/codex/plugins/eliot-governor/.codex-plugin/plugin.json',
+        'integrations/codex/plugins/eliot-governor/.mcp.json',
+        'integrations/codex/plugins/eliot-governor/README.md',
+        'integrations/codex/plugins/eliot-governor/bin/eliot-governor.exe',
+        'integrations/codex/plugins/eliot-governor/hooks/hooks.json',
+        'integrations/codex/plugins/eliot-governor/skills/eliot-finish/SKILL.md',
+        'integrations/codex/plugins/eliot-governor/skills/eliot-recover/SKILL.md',
+        'integrations/codex/plugins/eliot-governor/skills/eliot-remember/SKILL.md',
+        'integrations/codex/plugins/eliot-governor/skills/eliot-work/SKILL.md',
         'skills',
         'migrations',
         'docs/operations',
@@ -199,7 +209,64 @@ function Test-ReleaseBundle([string]$Path) {
             throw "release bundle is missing required asset: $relative"
         }
     }
+
+    $codexRoot = Join-Path $resolved 'integrations/codex'
+    $codexPluginRoot = Join-Path $codexRoot 'plugins/eliot-governor'
+    $marketplace = Get-Content -LiteralPath (Join-Path $codexRoot 'marketplace.json') -Raw | ConvertFrom-Json
+    $marketplacePlugins = @($marketplace.plugins)
+    if ([string]$marketplace.name -ne 'eliot-system' -or
+        $marketplacePlugins.Count -ne 1 -or
+        [string]$marketplacePlugins[0].name -ne 'eliot-governor' -or
+        [string]$marketplacePlugins[0].source.source -ne 'local' -or
+        [string]$marketplacePlugins[0].source.path -ne './plugins/eliot-governor' -or
+        [string]$marketplacePlugins[0].policy.installation -ne 'INSTALLED_BY_DEFAULT' -or
+        [string]$marketplacePlugins[0].policy.authentication -ne 'ON_INSTALL' -or
+        [string]$marketplacePlugins[0].category -ne 'Developer Tools') {
+        throw 'release Codex marketplace does not expose exactly one installed-by-default ELIOT plugin'
+    }
+
     $release = Get-Content -LiteralPath (Join-Path $resolved 'RELEASE.json') -Raw | ConvertFrom-Json
+    $plugin = Get-Content -LiteralPath (Join-Path $codexPluginRoot '.codex-plugin/plugin.json') -Raw | ConvertFrom-Json
+    if ([string]$plugin.name -ne 'eliot-governor' -or
+        [string]$plugin.version -notmatch '^[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?$' -or
+        [string]$plugin.version -ne [string]$release.codex_plugin_base_version -or
+        [string]$plugin.author.name -ne 'ELIOT' -or
+        [string]$plugin.skills -ne './skills/' -or
+        [string]$plugin.mcpServers -ne './.mcp.json' -or
+        [string]$plugin.interface.displayName -ne 'ELIOT Governor' -or
+        $plugin.PSObject.Properties.Name -contains 'hooks') {
+        throw 'release Codex plugin manifest does not match the canonical cache-neutral base contract'
+    }
+
+    $mcp = Get-Content -LiteralPath (Join-Path $codexPluginRoot '.mcp.json') -Raw | ConvertFrom-Json
+    $serverProperties = @($mcp.mcpServers.PSObject.Properties)
+    if ($serverProperties.Count -ne 1 -or $serverProperties[0].Name -ne 'eliot') {
+        throw 'release Codex plugin must expose exactly one MCP server named eliot'
+    }
+    $server = $serverProperties[0].Value
+    if ([string]$server.type -ne 'stdio' -or
+        [string]$server.command -ne 'bin/eliot-governor.exe' -or
+        [string]$server.cwd -ne '.' -or
+        $server.enabled -ne $true -or
+        $server.required -ne $true) {
+        throw 'release Codex MCP server transport is not the required local plugin binary'
+    }
+    $expectedArgs = @('mcp', 'stdio', '--profile', 'codex_controller', '--instance', 'default')
+    $actualArgs = @($server.args)
+    if ($actualArgs.Count -ne $expectedArgs.Count) {
+        throw 'release Codex MCP server has the wrong argument count'
+    }
+    for ($index = 0; $index -lt $expectedArgs.Count; $index++) {
+        if ([string]$actualArgs[$index] -ne $expectedArgs[$index]) {
+            throw "release Codex MCP server argument $index is not canonical"
+        }
+    }
+    $rootGovernorHash = (Get-FileHash -LiteralPath (Join-Path $resolved 'eliot-governor.exe') -Algorithm SHA256).Hash
+    $pluginGovernorHash = (Get-FileHash -LiteralPath (Join-Path $codexPluginRoot 'bin/eliot-governor.exe') -Algorithm SHA256).Hash
+    if ($rootGovernorHash -ne $pluginGovernorHash) {
+        throw 'release Codex plugin binary differs from the release Governor binary'
+    }
+
     $manifest = Get-Content -LiteralPath (Join-Path $resolved 'SHA256SUMS.json') -Raw | ConvertFrom-Json
     if ([string]$release.source_commit -notmatch '^[0-9a-f]{40}$' -or $release.source_commit -ne $manifest.source_commit) {
         throw 'release source commit is missing, malformed, or differs from the checksum manifest'
@@ -263,6 +330,14 @@ $sourceCommit = (& git -C $repo rev-parse HEAD 2>$null | Out-String).Trim()
 if ($LASTEXITCODE -ne 0 -or $sourceCommit -notmatch '^[0-9a-f]{40}$') {
     throw 'failed to resolve the release source commit'
 }
+$codexPluginSource = Join-Path $repo 'plugin/eliot-governor'
+$codexPluginManifestPath = Join-Path $codexPluginSource '.codex-plugin/plugin.json'
+$codexPluginManifest = Get-Content -LiteralPath $codexPluginManifestPath -Raw | ConvertFrom-Json
+$codexPluginBaseVersion = [string]$codexPluginManifest.version
+if ([string]$codexPluginManifest.name -ne 'eliot-governor' -or
+    $codexPluginBaseVersion -notmatch '^[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?$') {
+    throw 'Codex release source must use a cache-neutral base SemVer without +codex metadata'
+}
 $plan = [ordered]@{
     component = 'eliot_windows_x64_release'
     version = $Version
@@ -274,7 +349,11 @@ $plan = [ordered]@{
     output = $bundle
     governor = $governorPath
     operator_source = $OperatorSource
-    includes = @('governor', 'operator', 'config', 'integrations', 'skills', 'migrations', 'operations-runbooks')
+    codex_marketplace_source = (Join-Path $repo 'integrations/codex/marketplace.json')
+    codex_plugin_source = $codexPluginSource
+    codex_plugin_base_version = $codexPluginBaseVersion
+    codex_mcp_profile = 'codex_controller'
+    includes = @('governor', 'operator', 'config', 'integrations', 'codex-marketplace', 'codex-plugin', 'skills', 'migrations', 'operations-runbooks')
     signing_required_before_public_distribution = $true
 }
 
@@ -322,6 +401,11 @@ try {
     Copy-Item -LiteralPath $governor -Destination $bundle
     Copy-TrackedTree $repo $sourceCommit 'config' (Join-Path $bundle 'config')
     Copy-TrackedTree $repo $sourceCommit 'integrations' (Join-Path $bundle 'integrations')
+    $codexPluginRoot = Join-Path $bundle 'integrations/codex/plugins/eliot-governor'
+    Copy-TrackedTree $repo $sourceCommit 'plugin/eliot-governor' $codexPluginRoot
+    $codexPluginBin = Join-Path $codexPluginRoot 'bin'
+    New-Item -ItemType Directory -Path $codexPluginBin -Force | Out-Null
+    Copy-Item -LiteralPath $governor -Destination (Join-Path $codexPluginBin 'eliot-governor.exe')
     Copy-TrackedTree $repo $sourceCommit 'plugin/eliot-antigravity-official' (Join-Path $bundle 'integrations/antigravity/official-plugin')
     Copy-TrackedTree $repo $sourceCommit 'integrations/agent-skills' (Join-Path $bundle 'skills')
     Copy-TrackedTree $repo $sourceCommit 'migrations' (Join-Path $bundle 'migrations')
@@ -349,6 +433,7 @@ try {
         operator_schema_version = $schemaVersion
         operator_protocol_version = $protocolVersion
         operator_protocol_hash = $protocolHash
+        codex_plugin_base_version = $codexPluginBaseVersion
         architecture = 'windows-x64'
         signed = $false
         public_distribution_ready = $false

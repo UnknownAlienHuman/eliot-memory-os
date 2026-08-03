@@ -16,10 +16,17 @@ fn repo_root(config_path: &Path) -> PathBuf {
         candidate.join("Cargo.toml").is_file()
             && candidate.join("integrations/agent-skills").is_dir()
     };
+    let is_packaged_root = |candidate: &Path| {
+        candidate.join("integrations").is_dir()
+            && (candidate.join("eliot-governor.exe").is_file()
+                || candidate.join("bin").join("eliot-governor.exe").is_file())
+    };
+    let is_runtime_root =
+        |candidate: &Path| is_source_tree(candidate) || is_packaged_root(candidate);
     if let Ok(current) = std::env::current_dir()
         && let Some(root) = current
             .ancestors()
-            .find(|candidate| is_source_tree(candidate))
+            .find(|candidate| is_runtime_root(candidate))
     {
         return root.to_path_buf();
     }
@@ -28,7 +35,7 @@ fn repo_root(config_path: &Path) -> PathBuf {
     // cache; the first case is worth finding, the second correctly finds
     // nothing.
     if let Ok(exe) = std::env::current_exe()
-        && let Some(root) = exe.ancestors().find(|candidate| is_source_tree(candidate))
+        && let Some(root) = exe.ancestors().find(|candidate| is_runtime_root(candidate))
     {
         return root.to_path_buf();
     }
@@ -54,7 +61,10 @@ fn integration_refs(bundle: &Path, host: AgentHostId) -> (PathBuf, PathBuf) {
             bundle.join("hooks").join("hooks.json"),
         ),
         AgentHostId::Antigravity => (bundle.join("integration.json"), bundle.join("README.md")),
-        AgentHostId::Codex => (bundle.join("README.md"), bundle.join("README.md")),
+        AgentHostId::Codex => (
+            bundle.join(".mcp.json"),
+            bundle.join("hooks").join("hooks.json"),
+        ),
     }
 }
 
@@ -115,6 +125,49 @@ fn install_base() -> Result<PathBuf> {
             .join("Eliot")
             .join("host-integrations"),
     )
+}
+
+fn user_home() -> Result<PathBuf> {
+    let home = std::env::var_os("USERPROFILE")
+        .or_else(|| std::env::var_os("HOME"))
+        .context("USERPROFILE and HOME are not set")?;
+    let home = PathBuf::from(home);
+    ensure!(home.is_absolute(), "user home must be an absolute path");
+    Ok(home)
+}
+
+fn codex_plugin_root_from_home(home: &Path) -> PathBuf {
+    home.join("plugins").join(CODEX_PLUGIN_NAME)
+}
+
+fn codex_marketplace_path_from_home(home: &Path) -> PathBuf {
+    home.join(".agents")
+        .join("plugins")
+        .join("marketplace.json")
+}
+
+fn codex_plugin_root() -> Result<PathBuf> {
+    Ok(codex_plugin_root_from_home(&user_home()?))
+}
+
+fn codex_marketplace_path() -> Result<PathBuf> {
+    Ok(codex_marketplace_path_from_home(&user_home()?))
+}
+
+fn codex_install_journal_path() -> Result<PathBuf> {
+    Ok(install_base()?.join(CODEX_INSTALL_JOURNAL))
+}
+
+fn codex_owned_lifecycle_recovery_path() -> Result<PathBuf> {
+    Ok(install_base()?.join(CODEX_OWNED_LIFECYCLE_RECOVERY))
+}
+
+fn codex_operation_lock_path() -> Result<PathBuf> {
+    Ok(install_base()?.join(CODEX_OPERATION_LOCK))
+}
+
+fn codex_uninstall_tombstone_path() -> Result<PathBuf> {
+    Ok(install_base()?.join(CODEX_UNINSTALL_TOMBSTONE))
 }
 
 fn install_receipt_path(config_path: &Path, host: AgentHostId) -> PathBuf {

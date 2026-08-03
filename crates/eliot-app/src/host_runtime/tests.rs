@@ -1,24 +1,32 @@
 use super::{
     BoundedAuditorCanonicalAuthority, CONTAINED_ANTIGRAVITY_ATTEMPT_SCHEMA_V1,
-    CanonicalAuthorityBody, CanonicalBodyNormalization, ContainedAntigravityAttemptJournal,
+    CanonicalAuthorityBody, CanonicalBodyNormalization, CodexGlobalInstallManifest,
+    CodexInstallJournal, CodexLegacyMcpApproval, ContainedAntigravityAttemptJournal,
     ExistingManagedInvocation, MANAGED_ATTEMPT_SCHEMA_V4, ManagedHostAttemptJournal,
     ManagedInvocationLock, ManagedInvocationLockRecord, ManagedLaunchBoundaryAttestation,
     ManagedSanitizedEnvironment, ManagedWorktreeSnapshot, antigravity_permission_profile,
     assert_managed_path_is_local_and_private, candidate_unified_diff_hash,
-    configure_antigravity_environment, configure_standard_managed_environment,
-    contained_antigravity_attempt_hash, encode_managed_invocation_lock, hash_bytes,
-    hash_file_content, hash_json, integration_refs, invocation_root, invocation_status,
-    invoke_ul_scoped_reasoning, is_claude_desktop_host, latest_canonical_authority_observation,
-    launch_argv, lock_antigravity_executable_snapshot, managed_attempt_hash,
-    managed_launch_boundary_attestation, managed_launch_boundary_is_current, managed_sandbox_root,
-    merge_opencode_mcp_config, normalize_relative_path, parse_opencode_jsonc,
-    parse_structured_host_output, persist_and_parse_structured_host_output,
-    prepare_antigravity_executable_snapshot, provider_start_marker_path, receipt_ref_from_option,
+    codex_cache_contract_hash, codex_effective_plugin_installed_before, codex_legacy_mcp_is_owned,
+    codex_manifest_plugin_source_hash, codex_marketplace_entry, codex_marketplace_path_from_home,
+    codex_materialized_plugin_version, codex_owned_lifecycle_requires_refresh,
+    codex_plugin_installed_enabled, codex_plugin_metadata_matches, codex_plugin_path_is_restored,
+    codex_plugin_root_from_home, codex_runtime_cache_path, configure_antigravity_environment,
+    configure_standard_managed_environment, contained_antigravity_attempt_hash,
+    encode_managed_invocation_lock, hash_bytes, hash_file_content, hash_json, integration_refs,
+    invocation_root, invocation_status, invoke_ul_scoped_reasoning, is_claude_desktop_host,
+    latest_canonical_authority_observation, launch_argv, lock_antigravity_executable_snapshot,
+    managed_attempt_hash, managed_launch_boundary_attestation, managed_launch_boundary_is_current,
+    managed_sandbox_root, materialize_codex_hook_commands, materialize_codex_mcp_config,
+    materialize_codex_plugin_version, merge_codex_marketplace, merge_opencode_mcp_config,
+    normalize_relative_path, parse_opencode_jsonc, parse_structured_host_output,
+    persist_and_parse_structured_host_output, prepare_antigravity_executable_snapshot,
+    provider_start_marker_path, receipt_ref_from_option, reconcile_codex_cache_tree,
     reconcile_existing_managed_invocation, registry_entry_by_manifest, remaining_to_deadline,
-    remove_opencode_mcp_config, sanitize_managed_output, stable_invocation_id,
-    uses_managed_antigravity_containment, uses_managed_antigravity_launch,
-    validate_antigravity_scope, validate_attempt_journal, validate_bounded_auditor_shape,
-    validate_canonical_observation_identity, validate_contained_antigravity_attempt,
+    remove_codex_marketplace_entry, remove_opencode_mcp_config, sanitize_managed_output,
+    select_codex_original_plugin_hash, stable_invocation_id, uses_managed_antigravity_containment,
+    uses_managed_antigravity_launch, validate_antigravity_scope, validate_attempt_journal,
+    validate_bounded_auditor_shape, validate_canonical_observation_identity,
+    validate_codex_install_journal_schema, validate_contained_antigravity_attempt,
     validate_managed_result_integrity,
 };
 use crate::runtime_instance::{atomic_write_bytes, atomic_write_json};
@@ -1990,6 +1998,583 @@ fn claude_desktop_registry_lookup_uses_manifest_identity() {
     assert!(is_claude_desktop_host("Claude-Desktop"));
     assert!(is_claude_desktop_host("claude_desktop"));
     assert!(!is_claude_desktop_host("claude"));
+}
+
+#[test]
+fn codex_personal_marketplace_merge_and_rollback_preserve_unrelated_entries() -> anyhow::Result<()>
+{
+    let original = json!({
+        "name": "personal",
+        "interface": { "displayName": "My Marketplace" },
+        "plugins": [
+            {
+                "name": "unrelated",
+                "source": { "source": "local", "path": "./plugins/unrelated" }
+            }
+        ],
+        "custom": { "preserve": true }
+    });
+    let bytes = serde_json::to_vec_pretty(&original)?;
+    let merged = merge_codex_marketplace(Some(&bytes), None)?;
+    assert_eq!(merged.value["plugins"][0]["name"], "unrelated");
+    assert_eq!(merged.value["plugins"][1], codex_marketplace_entry());
+    assert_eq!(
+        merged.value["plugins"][1]["policy"]["installation"],
+        "INSTALLED_BY_DEFAULT"
+    );
+    assert_eq!(merged.value["custom"], json!({ "preserve": true }));
+    assert!(merged.plugins_field_existed_before);
+    assert!(merged.entry_before.is_none());
+
+    let restored = remove_codex_marketplace_entry(
+        merged.value,
+        &codex_marketplace_entry(),
+        merged.entry_before.as_ref(),
+        merged.entry_before_index,
+        merged.plugins_field_existed_before,
+    )?;
+    assert_eq!(restored, original);
+    Ok(())
+}
+
+#[test]
+fn codex_personal_marketplace_restores_a_preexisting_entry_at_the_same_index() -> anyhow::Result<()>
+{
+    let original_entry = json!({
+        "name": "eliot-governor",
+        "source": { "source": "local", "path": "./plugins/eliot-custom" },
+        "policy": { "installation": "AVAILABLE", "authentication": "ON_USE" }
+    });
+    let original = json!({
+        "name": "personal",
+        "plugins": [
+            { "name": "before", "source": { "source": "local", "path": "./before" } },
+            original_entry.clone(),
+            { "name": "after", "source": { "source": "local", "path": "./after" } }
+        ]
+    });
+    let bytes = serde_json::to_vec_pretty(&original)?;
+    let merged = merge_codex_marketplace(Some(&bytes), None)?;
+    assert_eq!(merged.entry_before.as_ref(), Some(&original_entry));
+    assert_eq!(merged.entry_before_index, Some(1));
+    let restored = remove_codex_marketplace_entry(
+        merged.value,
+        &codex_marketplace_entry(),
+        merged.entry_before.as_ref(),
+        merged.entry_before_index,
+        merged.plugins_field_existed_before,
+    )?;
+    assert_eq!(restored, original);
+    Ok(())
+}
+
+#[test]
+fn codex_plugin_materialization_uses_absolute_controller_governor() -> anyhow::Result<()> {
+    let governor = Path::new(r"C:\Program Files\Eliot\eliot-governor.exe");
+    let mut mcp = json!({
+        "mcpServers": {
+            "eliot": {
+                "type": "stdio",
+                "command": "eliot-governor.exe",
+                "args": ["mcp", "stdio", "--host", "codex", "--profile", "codex_worker"]
+            }
+        }
+    });
+    materialize_codex_mcp_config(&mut mcp, governor)?;
+    assert_eq!(
+        mcp["mcpServers"]["eliot"]["command"],
+        governor.to_string_lossy().as_ref()
+    );
+    assert_eq!(
+        mcp["mcpServers"]["eliot"]["args"],
+        json!([
+            "mcp",
+            "stdio",
+            "--profile",
+            "codex_controller",
+            "--instance",
+            "default"
+        ])
+    );
+
+    let mut hooks = json!({
+        "hooks": {
+            "SessionStart": [{
+                "hooks": [{ "type": "command", "command": "eliot-governor.exe", "args": ["hook", "session-start"] }]
+            }],
+            "Stop": [{
+                "hooks": [{ "type": "command", "command": "eliot-governor.exe", "args": ["hook", "stop"] }]
+            }]
+        }
+    });
+    assert_eq!(materialize_codex_hook_commands(&mut hooks, governor)?, 2);
+    assert_eq!(
+        hooks["hooks"]["SessionStart"][0]["hooks"][0]["command"],
+        governor.to_string_lossy().as_ref()
+    );
+    assert_eq!(
+        hooks["hooks"]["Stop"][0]["hooks"][0]["command"],
+        governor.to_string_lossy().as_ref()
+    );
+    Ok(())
+}
+
+#[test]
+fn codex_cli_migration_accepts_only_known_eliot_identities() {
+    let approval = CodexLegacyMcpApproval {
+        governor_paths: vec![PathBuf::from(r"C:\Eliot\eliot-governor.exe")],
+        governor_packages_root: PathBuf::from(r"C:\Users\example\AppData\Local\Eliot\packages"),
+        surreal_executable: PathBuf::from(r"C:\Tools\SurrealDB\surreal.exe"),
+        surreal_namespace: "eliot".to_owned(),
+        surreal_database: "system".to_owned(),
+        surreal_storage: "surrealkv://legacy".to_owned(),
+    };
+    let governor = json!({
+        "name": "eliot-governor",
+        "transport": {
+            "type": "stdio",
+            "command": r"C:\Eliot\eliot-governor.exe",
+            "args": ["mcp", "stdio", "--profile", "codex_controller", "--instance", "default"]
+        }
+    });
+    let surreal = json!({
+        "name": "eliot_surrealdb",
+        "transport": {
+            "type": "stdio",
+            "command": r"C:\Tools\SurrealDB\surreal.exe",
+            "args": ["mcp", "--ns", "eliot", "--db", "system", "surrealkv://legacy"]
+        }
+    });
+    let conflict = json!({
+        "name": "eliot-governor",
+        "transport": {
+            "type": "stdio",
+            "command": r"C:\Other\server.exe",
+            "args": ["mcp", "stdio"]
+        }
+    });
+    assert!(codex_legacy_mcp_is_owned(
+        "eliot-governor",
+        &governor,
+        &approval
+    ));
+    assert!(codex_legacy_mcp_is_owned(
+        "eliot_surrealdb",
+        &surreal,
+        &approval
+    ));
+    assert!(!codex_legacy_mcp_is_owned(
+        "eliot-governor",
+        &conflict,
+        &approval
+    ));
+    assert!(!codex_legacy_mcp_is_owned("other", &governor, &approval));
+    let mut wrong_args = governor.clone();
+    wrong_args["transport"]["args"] = json!([
+        "mcp",
+        "stdio",
+        "--profile",
+        "codex_controller",
+        "--instance",
+        "other"
+    ]);
+    assert!(!codex_legacy_mcp_is_owned(
+        "eliot-governor",
+        &wrong_args,
+        &approval
+    ));
+    let mut with_env = governor.clone();
+    with_env["transport"]["env"] = json!({ "ELIOT_OVERRIDE": "foreign" });
+    assert!(!codex_legacy_mcp_is_owned(
+        "eliot-governor",
+        &with_env,
+        &approval
+    ));
+
+    let list = json!({
+        "installed": [{
+            "pluginId": "eliot-governor@personal",
+            "installed": true,
+            "enabled": true
+        }]
+    });
+    assert_eq!(
+        codex_plugin_installed_enabled(&list, "eliot-governor@personal"),
+        Some((true, true))
+    );
+    let fresh_entry = json!({
+        "pluginId": "eliot-governor@personal",
+        "name": "eliot-governor",
+        "marketplaceName": "personal",
+        "version": "0.1.0",
+        "installed": true,
+        "enabled": true,
+        "source": { "source": "local", "path": r"C:\Users\example\plugins\eliot-governor" }
+    });
+    assert!(codex_plugin_metadata_matches(
+        &fresh_entry,
+        "eliot-governor@personal",
+        "0.1.0",
+        Path::new(r"C:\Users\example\plugins\eliot-governor")
+    ));
+    let mut stale_entry = fresh_entry;
+    stale_entry["version"] = json!("0.0.9");
+    assert!(!codex_plugin_metadata_matches(
+        &stale_entry,
+        "eliot-governor@personal",
+        "0.1.0",
+        Path::new(r"C:\Users\example\plugins\eliot-governor")
+    ));
+    assert_eq!(
+        codex_plugin_installed_enabled(&list, "other@personal"),
+        None
+    );
+}
+
+#[test]
+fn codex_missing_historical_preinstall_becomes_eliot_owned_when_readded() {
+    assert!(codex_effective_plugin_installed_before(
+        Some(true),
+        Some((true, true))
+    ));
+    assert!(!codex_effective_plugin_installed_before(Some(true), None));
+    assert!(!codex_effective_plugin_installed_before(
+        Some(false),
+        Some((true, true))
+    ));
+    assert!(codex_effective_plugin_installed_before(
+        None,
+        Some((true, true))
+    ));
+}
+
+#[test]
+fn codex_install_journal_rejects_v1_and_unknown_schemas() {
+    assert!(
+        validate_codex_install_journal_schema(&json!({
+            "schema_version": "eliot-codex-install-transaction-v2"
+        }))
+        .is_ok()
+    );
+    for value in [
+        json!({ "schema_version": "eliot-codex-install-transaction-v1" }),
+        json!({ "schema_version": "future" }),
+        json!({}),
+    ] {
+        assert!(validate_codex_install_journal_schema(&value).is_err());
+    }
+}
+
+#[test]
+fn codex_live_v2_journal_without_cache_contract_fields_still_deserializes() -> anyhow::Result<()> {
+    let journal: CodexInstallJournal = serde_json::from_value(json!({
+        "schema_version": "eliot-codex-install-transaction-v2",
+        "transaction_id": "ce34f037-live-v2",
+        "target_path": r"C:\Users\example\AppData\Local\Eliot\host-integrations\codex",
+        "target_existed_before": true,
+        "target_before_hash": "blake3:target-before",
+        "target_after_hash": "blake3:target-after",
+        "target_backup_ref": r"C:\Users\example\AppData\Local\Eliot\host-integrations\.codex-backup",
+        "target_staging": r"C:\Users\example\AppData\Local\Eliot\host-integrations\.codex-staging",
+        "plugin_path": r"C:\Users\example\plugins\eliot-governor",
+        "plugin_existed_before": true,
+        "plugin_before_hash": "blake3:plugin-before",
+        "plugin_after_hash": "blake3:plugin-after",
+        "plugin_backup_ref": r"C:\Users\example\AppData\Local\Eliot\host-integrations\global-backups\plugin",
+        "plugin_staging": r"C:\Users\example\plugins\.eliot-governor-staging",
+        "marketplace_path": r"C:\Users\example\.agents\plugins\marketplace.json",
+        "marketplace_existed_before": true,
+        "marketplace_before_hash": "blake3:marketplace-before",
+        "marketplace_after_hash": "blake3:marketplace-after",
+        "marketplace_backup_ref": r"C:\Users\example\AppData\Local\Eliot\host-integrations\global-backups\marketplace",
+        "marketplace_plugins_field_existed_before": true,
+        "marketplace_entry_before": Value::Null,
+        "marketplace_entry_before_index": Value::Null,
+        "marketplace_entry_after": codex_marketplace_entry(),
+        "codex_cli_path": r"C:\Program Files\Codex\codex.exe",
+        "plugin_selector": "eliot-governor@personal",
+        "plugin_installed_before": false,
+        "plugin_lifecycle_owned_before": true,
+        "plugin_lifecycle_version_before": "0.1.0",
+        "plugin_lifecycle_source_hash_before": "blake3:plugin-before",
+        "installed_governor_sha256_before": "sha256-before",
+        "plugin_version": "0.2.0",
+        "installed_governor_path": r"C:\Users\example\plugins\eliot-governor\bin\eliot-governor.exe",
+        "installed_governor_sha256": "sha256-after",
+        "created_at": "2026-08-03T00:00:00Z"
+    }))?;
+    assert!(journal.plugin_cache_contract_hash_before.is_none());
+    assert!(journal.plugin_cache_contract_hash_after.is_empty());
+    Ok(())
+}
+
+#[test]
+fn codex_v1_manifest_reinstall_preserves_original_plugin_and_lifecycle_ownership()
+-> anyhow::Result<()> {
+    let owned_hash = "blake3:owned-eliot-plugin";
+    let legacy: CodexGlobalInstallManifest = serde_json::from_value(json!({
+        "schema_version": "eliot-codex-global-install-v1",
+        "source_plugin_path": r"C:\release\eliot-governor",
+        "source_bundle_hash": "blake3:bundle",
+        "installed_plugin": {
+            "path": r"C:\Users\example\plugins\eliot-governor",
+            "installed_hash": owned_hash,
+            "backup_ref": Value::Null
+        },
+        "installed_governor_path": r"C:\Users\example\plugins\eliot-governor\bin\eliot-governor.exe",
+        "installed_governor_sha256": "governor-sha256",
+        "marketplace_path": r"C:\Users\example\.agents\plugins\marketplace.json",
+        "marketplace_existed_before": false,
+        "marketplace_before_hash": Value::Null,
+        "marketplace_after_hash": "blake3:marketplace",
+        "marketplace_backup_ref": Value::Null,
+        "marketplace_plugins_field_existed_before": false,
+        "marketplace_entry_before": Value::Null,
+        "marketplace_entry_before_index": Value::Null,
+        "marketplace_entry_after": codex_marketplace_entry(),
+        "marketplace_name": "personal",
+        "plugin_version": "0.1.0",
+        "codex_cli_path": r"C:\Program Files\Codex\codex.exe",
+        "plugin_selector": "eliot-governor@personal",
+        "plugin_installed_before": false,
+        "plugin_installed_enabled_after": true,
+        "legacy_direct_mcp_removed": [],
+        "generated_at": "2026-08-03T00:00:00Z"
+    }))?;
+    assert!(legacy.transaction_id.is_empty());
+    assert!(legacy.plugin_before_hash.is_none());
+    assert!(legacy.plugin_source_hash.is_empty());
+    assert!(legacy.legacy_direct_mcp_prior.is_empty());
+    assert_eq!(codex_manifest_plugin_source_hash(&legacy), owned_hash);
+
+    let without_preinstall = select_codex_original_plugin_hash(
+        Some(&legacy.schema_version),
+        legacy.plugin_before_hash.as_deref(),
+        None,
+        Some(owned_hash),
+    )?;
+    assert_eq!(without_preinstall, None);
+    assert!(codex_plugin_path_is_restored(
+        None,
+        without_preinstall.as_deref()
+    ));
+    assert!(!codex_plugin_path_is_restored(
+        Some(owned_hash),
+        without_preinstall.as_deref()
+    ));
+
+    let recovered_preinstall = select_codex_original_plugin_hash(
+        Some(&legacy.schema_version),
+        None,
+        Some("blake3:user-plugin"),
+        Some(owned_hash),
+    )?;
+    assert_eq!(recovered_preinstall.as_deref(), Some("blake3:user-plugin"));
+    assert!(codex_plugin_path_is_restored(
+        Some("blake3:user-plugin"),
+        recovered_preinstall.as_deref()
+    ));
+
+    assert!(codex_owned_lifecycle_requires_refresh(
+        true, false, None, owned_hash
+    ));
+    assert!(codex_owned_lifecycle_requires_refresh(
+        true,
+        false,
+        Some("blake3:old-cache"),
+        owned_hash
+    ));
+    assert!(!codex_owned_lifecycle_requires_refresh(
+        true,
+        false,
+        Some("blake3:cache-contract"),
+        "blake3:cache-contract"
+    ));
+    assert!(!codex_owned_lifecycle_requires_refresh(
+        true, true, None, owned_hash
+    ));
+    Ok(())
+}
+
+#[test]
+fn codex_cache_contract_ignores_only_the_nonexecuting_cached_governor() -> anyhow::Result<()> {
+    let root =
+        std::env::temp_dir().join(format!("eliot-codex-cache-contract-{}", TaskId::new_v7()));
+    std::fs::create_dir_all(root.join(".codex-plugin"))?;
+    std::fs::create_dir_all(root.join("hooks"))?;
+    std::fs::create_dir_all(root.join("bin"))?;
+    std::fs::write(root.join(".codex-plugin").join("plugin.json"), b"plugin")?;
+    std::fs::write(root.join(".mcp.json"), b"mcp")?;
+    std::fs::write(root.join("hooks").join("hooks.json"), b"hooks-v1")?;
+    let cached_governor = root.join("bin").join("eliot-governor.exe");
+    std::fs::write(&cached_governor, b"governor-v1")?;
+
+    let initial = codex_cache_contract_hash(&root)?;
+    std::fs::write(&cached_governor, b"governor-v2")?;
+    assert_eq!(codex_cache_contract_hash(&root)?, initial);
+
+    std::fs::write(root.join("hooks").join("hooks.json"), b"hooks-v2")?;
+    assert_ne!(codex_cache_contract_hash(&root)?, initial);
+    std::fs::remove_dir_all(root)?;
+    Ok(())
+}
+
+#[test]
+fn codex_materialized_version_is_content_addressed_and_replaces_one_suffix() -> anyhow::Result<()> {
+    let first_hash = format!("blake3:{}", "a".repeat(64));
+    let second_hash = format!("blake3:{}", "b".repeat(64));
+    let first = codex_materialized_plugin_version("0.1.0", &first_hash)?;
+    assert_eq!(first, format!("0.1.0+codex.artifact-{}", "a".repeat(32)));
+    assert_eq!(
+        codex_materialized_plugin_version("0.1.0+codex.old", &first_hash)?,
+        first
+    );
+    assert_ne!(
+        codex_materialized_plugin_version("0.1.0", &second_hash)?,
+        first
+    );
+    assert!(codex_materialized_plugin_version("+codex.old", &first_hash).is_err());
+    assert!(codex_materialized_plugin_version("0.1.0", "sha256:not-blake3").is_err());
+    Ok(())
+}
+
+#[test]
+fn codex_content_version_ignores_external_governor_and_prior_suffix() -> anyhow::Result<()> {
+    let root =
+        std::env::temp_dir().join(format!("eliot-codex-version-content-{}", TaskId::new_v7()));
+    std::fs::create_dir_all(root.join(".codex-plugin"))?;
+    std::fs::create_dir_all(root.join("hooks"))?;
+    std::fs::create_dir_all(root.join("bin"))?;
+    std::fs::write(
+        root.join(".codex-plugin").join("plugin.json"),
+        br#"{"name":"eliot-governor","version":"0.1.0+codex.previous"}"#,
+    )?;
+    std::fs::write(root.join(".mcp.json"), b"mcp")?;
+    std::fs::write(root.join("hooks").join("hooks.json"), b"hooks")?;
+    std::fs::write(root.join("bin").join("eliot-governor.exe"), b"governor-v1")?;
+
+    materialize_codex_plugin_version(&root, "0.1.0")?;
+    let first_contract = codex_cache_contract_hash(&root)?;
+    let first_version = codex_materialized_plugin_version("0.1.0", &first_contract)?;
+
+    materialize_codex_plugin_version(&root, &first_version)?;
+    std::fs::write(root.join("bin").join("eliot-governor.exe"), b"governor-v2")?;
+    materialize_codex_plugin_version(&root, "0.1.0")?;
+    let binary_update_contract = codex_cache_contract_hash(&root)?;
+    assert_eq!(binary_update_contract, first_contract);
+    assert_eq!(
+        codex_materialized_plugin_version("0.1.0+codex.old", &binary_update_contract)?,
+        first_version
+    );
+
+    materialize_codex_plugin_version(&root, "0.1.0+codex.different")?;
+    materialize_codex_plugin_version(&root, "0.1.0")?;
+    assert_eq!(codex_cache_contract_hash(&root)?, first_contract);
+    std::fs::remove_dir_all(root)?;
+    Ok(())
+}
+
+#[test]
+fn codex_partial_locked_cache_is_reconciled_without_replacing_its_root() -> anyhow::Result<()> {
+    let root =
+        std::env::temp_dir().join(format!("eliot-codex-cache-reconcile-{}", TaskId::new_v7()));
+    let source = root.join("source");
+    let cache = root.join("cache");
+    for directory in [
+        source.join(".codex-plugin"),
+        source.join("hooks"),
+        source.join("bin"),
+        cache.join("bin"),
+    ] {
+        std::fs::create_dir_all(directory)?;
+    }
+    std::fs::write(
+        source.join(".codex-plugin").join("plugin.json"),
+        br#"{"name":"eliot-governor","version":"0.1.0+codex.artifact-test"}"#,
+    )?;
+    std::fs::write(source.join(".mcp.json"), b"mcp-contract")?;
+    std::fs::write(source.join("hooks").join("hooks.json"), b"hooks-contract")?;
+    std::fs::write(
+        source.join("bin").join("eliot-governor.exe"),
+        b"source-binary",
+    )?;
+    std::fs::write(
+        cache.join("bin").join("eliot-governor.exe"),
+        b"locked-binary",
+    )?;
+    std::fs::write(cache.join("stale.json"), b"stale")?;
+
+    let expected = codex_cache_contract_hash(&source)?;
+    reconcile_codex_cache_tree(&source, &cache, &expected)?;
+
+    assert_eq!(codex_cache_contract_hash(&cache)?, expected);
+    assert!(!cache.join("stale.json").exists());
+    assert_eq!(
+        std::fs::read(cache.join("bin").join("eliot-governor.exe"))?,
+        b"locked-binary"
+    );
+    std::fs::remove_dir_all(root)?;
+    Ok(())
+}
+
+#[test]
+fn codex_runtime_cache_contract_uses_live_mcp_cwd() {
+    let home = Path::new(r"C:\Users\example");
+    let governor = home
+        .join("plugins")
+        .join("eliot-governor")
+        .join("bin")
+        .join("eliot-governor.exe");
+    let cache = home
+        .join(".codex")
+        .join("plugins")
+        .join("cache")
+        .join("personal")
+        .join("eliot-governor")
+        .join("0.1.0")
+        .join(".");
+    let runtime = json!({
+        "name": "eliot",
+        "enabled": true,
+        "transport": {
+            "type": "stdio",
+            "command": governor,
+            "args": ["mcp", "stdio", "--profile", "codex_controller", "--instance", "default"],
+            "env": Value::Null,
+            "env_vars": [],
+            "cwd": cache
+        }
+    });
+    assert_eq!(
+        codex_runtime_cache_path(&runtime, home, &governor),
+        Some(cache.clone())
+    );
+
+    let mut materialized_cwd = runtime.clone();
+    materialized_cwd["transport"]["cwd"] = json!(home.join("plugins").join("eliot-governor"));
+    assert!(codex_runtime_cache_path(&materialized_cwd, home, &governor).is_none());
+    let mut wrong_command = runtime;
+    wrong_command["transport"]["command"] = json!(cache.join("bin").join("eliot-governor.exe"));
+    assert!(codex_runtime_cache_path(&wrong_command, home, &governor).is_none());
+}
+
+#[test]
+fn codex_personal_paths_and_integration_refs_are_user_global() {
+    let home = Path::new(r"C:\Users\example");
+    assert_eq!(
+        codex_plugin_root_from_home(home),
+        home.join("plugins").join("eliot-governor")
+    );
+    assert_eq!(
+        codex_marketplace_path_from_home(home),
+        home.join(".agents")
+            .join("plugins")
+            .join("marketplace.json")
+    );
+    let bundle = Path::new(r"C:\release\integrations\codex\plugins\eliot-governor");
+    let (mcp, hooks) = integration_refs(bundle, AgentHostId::Codex);
+    assert_eq!(mcp, bundle.join(".mcp.json"));
+    assert_eq!(hooks, bundle.join("hooks").join("hooks.json"));
 }
 
 #[test]

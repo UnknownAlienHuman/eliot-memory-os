@@ -3682,3 +3682,14 @@ fn ensure_l7_host(host: AgentHostId) -> Result<()> {
         bail!("{} is not an L7 managed integration target", host.as_str())
     }
 }
+
+fn ensure_installable_host(host: AgentHostId) -> Result<()> {
+    if matches!(
+        host,
+        AgentHostId::OpenCode | AgentHostId::Claude | AgentHostId::Codex
+    ) {
+        Ok(())
+    } else {
+        bail!("{} is not an installable integration target", host.as_str())
+    }
+}

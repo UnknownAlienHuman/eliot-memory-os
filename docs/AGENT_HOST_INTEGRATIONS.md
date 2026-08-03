@@ -26,7 +26,7 @@ must remain byte-identical.
 
 | Host | Product integration | Installation authority |
 |---|---|---|
-| Codex | Native ELIOT plugin with one MCP server, four canonical skills, and bounded lifecycle hooks | Codex plugin lifecycle and MCP configuration |
+| Codex | Native system ELIOT plugin with one MCP server, four canonical skills, and bounded lifecycle hooks | Personal Codex marketplace with `INSTALLED_BY_DEFAULT` policy |
 | Antigravity | Official ELIOT plugin plus a governed MCP registration | Antigravity plugin directory and GUI MCP config |
 | OpenCode | Additive JSONC configuration, lifecycle plugin, four skills | Governor ownership manifest |
 | Claude Code | Official local-marketplace plugin with MCP, hooks, and four skills | `claude plugin` lifecycle |
@@ -47,6 +47,44 @@ $governor = Join-Path $target 'release\eliot-governor.exe'
 ```
 
 ## Inspect, install, and activate
+
+The Windows release carries the Codex marketplace at
+`integrations/codex/marketplace.json` and the self-contained plugin at
+`integrations/codex/plugins/eliot-governor`. The marketplace points to
+`./plugins/eliot-governor` and marks it `INSTALLED_BY_DEFAULT`, making the same
+ELIOT MCP surface available to every Codex project rather than requiring a
+project-local `.codex/config.toml` registration. The plugin contains the release
+Governor at `bin/eliot-governor.exe`; its sole `eliot` server runs:
+
+```text
+eliot-governor.exe mcp stdio --profile codex_controller --instance default
+```
+
+The command has no `--host` override. Host identity comes from the live session
+binding, while `codex_controller` selects the controller tool surface. Codex
+discovers `hooks/hooks.json` from the standard plugin layout; `plugin.json`
+therefore contains `skills` and `mcpServers` paths but no unsupported `hooks`
+field. A project-level or second global ELIOT MCP registration is a duplicate,
+not part of the supported installation.
+
+Repository and release artifacts retain the cache-neutral plugin base version
+without `+codex` metadata. The installer copies that immutable artifact into its
+ELIOT-owned personal-plugin staging directory and gives only the installed copy
+one version of the form `<base-version>+codex.<deterministic-content-token>`.
+The deterministic token is stable for the normalized cache contract and changes
+when MCP, hooks, skills, or plugin metadata change, so reinstall remains
+idempotent while Codex receives a fresh cache key for a real cache update. The
+nonexecuting cached Governor is excluded: the executable at the installed source
+path is verified separately, so a binary-only update does not churn the active
+cache. A prior suffix is replaced, never stacked.
+
+`host install --host codex` is the unattended install, update, reinstall, and
+recovery entrypoint. It never removes the active plugin during those operations:
+new cache contracts use add-only versioned installation, identical partial caches
+are repaired in place, and a durable ELIOT-owned recovery marker carries ownership
+across a crash until exact lifecycle readback and manifest commit succeed.
+Install receipts and doctor output distinguish `codex_plugin_base_version` from
+the materialized installed version and require their base prefixes to match.
 
 ```powershell
 & $governor daemon health --instance default

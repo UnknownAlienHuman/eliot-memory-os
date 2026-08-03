@@ -51,6 +51,17 @@ use uuid::Uuid;
 const OPENCODE_GLOBAL_MANIFEST: &str = "eliot-global-install.json";
 const CLAUDE_GLOBAL_MANIFEST: &str = "INSTALL-MANIFEST.json";
 const CLAUDE_LEGACY_GLOBAL_MANIFEST: &str = "eliot-global-install.json";
+const CODEX_GLOBAL_MANIFEST: &str = "CODEX-INSTALL-MANIFEST.json";
+const CODEX_INSTALL_JOURNAL: &str = ".codex-install-transaction.json";
+const CODEX_OWNED_LIFECYCLE_RECOVERY: &str = ".codex-owned-lifecycle-recovery.json";
+const CODEX_OPERATION_LOCK: &str = ".codex-operation.lock";
+const CODEX_UNINSTALL_TOMBSTONE: &str = ".codex-uninstall-tombstone";
+const CODEX_GLOBAL_MANIFEST_SCHEMA_V1: &str = "eliot-codex-global-install-v1";
+const CODEX_GLOBAL_MANIFEST_SCHEMA_V2: &str = "eliot-codex-global-install-v2";
+const CODEX_INSTALL_JOURNAL_SCHEMA_V2: &str = "eliot-codex-install-transaction-v2";
+const CODEX_OWNED_LIFECYCLE_RECOVERY_SCHEMA_V1: &str = "eliot-codex-owned-lifecycle-recovery-v1";
+const CODEX_PLUGIN_NAME: &str = "eliot-governor";
+const CODEX_MARKETPLACE_NAME: &str = "personal";
 const CLAUDE_DESKTOP_HOST: &str = "claude-desktop";
 
 mod claude;
@@ -74,9 +85,19 @@ pub(crate) use external_agent::{
     dispatch as dispatch_external_agent, external_agent_blob_path, prepare_external_agent_runtime,
     production_external_agent_supervisor,
 };
-use integration::{install, sha256_file, uninstall};
 #[cfg(test)]
-use integration::{merge_opencode_mcp_config, parse_opencode_jsonc, remove_opencode_mcp_config};
+use integration::{
+    CodexLegacyMcpApproval, codex_cache_contract_hash, codex_effective_plugin_installed_before,
+    codex_legacy_mcp_is_owned, codex_manifest_plugin_source_hash, codex_marketplace_entry,
+    codex_materialized_plugin_version, codex_owned_lifecycle_requires_refresh,
+    codex_plugin_installed_enabled, codex_plugin_metadata_matches, codex_plugin_path_is_restored,
+    codex_runtime_cache_path, materialize_codex_hook_commands, materialize_codex_mcp_config,
+    materialize_codex_plugin_version, merge_codex_marketplace, merge_opencode_mcp_config,
+    parse_opencode_jsonc, reconcile_codex_cache_tree, remove_codex_marketplace_entry,
+    remove_opencode_mcp_config, select_codex_original_plugin_hash,
+    validate_codex_install_journal_schema,
+};
+use integration::{install, sha256_file, uninstall};
 pub(crate) use managed::load_managed_controller_candidate;
 use managed::{
     invocation_status, managed_request_hash, reconcile_existing_managed_invocation,
@@ -161,6 +182,103 @@ struct ClaudeGlobalInstallManifest {
     claude_executable: PathBuf,
     #[serde(default)]
     claude_version: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct CodexGlobalInstallManifest {
+    schema_version: String,
+    #[serde(default)]
+    transaction_id: String,
+    source_plugin_path: PathBuf,
+    source_bundle_hash: String,
+    installed_plugin: OpenCodeOwnedPath,
+    #[serde(default)]
+    plugin_before_hash: Option<String>,
+    installed_governor_path: PathBuf,
+    installed_governor_sha256: String,
+    marketplace_path: PathBuf,
+    marketplace_existed_before: bool,
+    marketplace_before_hash: Option<String>,
+    marketplace_after_hash: String,
+    marketplace_backup_ref: Option<PathBuf>,
+    marketplace_plugins_field_existed_before: bool,
+    marketplace_entry_before: Option<Value>,
+    marketplace_entry_before_index: Option<usize>,
+    marketplace_entry_after: Value,
+    marketplace_name: String,
+    plugin_version: String,
+    #[serde(default)]
+    plugin_source_hash: String,
+    #[serde(default)]
+    cache_contract_hash: String,
+    codex_cli_path: PathBuf,
+    plugin_selector: String,
+    plugin_installed_before: bool,
+    plugin_installed_enabled_after: bool,
+    #[serde(default)]
+    legacy_direct_mcp_prior: Vec<CodexLegacyMcpRegistration>,
+    legacy_direct_mcp_removed: Vec<String>,
+    generated_at: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct CodexLegacyMcpRegistration {
+    name: String,
+    exact_config: Value,
+    exact_config_hash: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct CodexInstallJournal {
+    schema_version: String,
+    transaction_id: String,
+    target_path: PathBuf,
+    target_existed_before: bool,
+    target_before_hash: Option<String>,
+    target_after_hash: String,
+    target_backup_ref: Option<PathBuf>,
+    target_staging: PathBuf,
+    plugin_path: PathBuf,
+    plugin_existed_before: bool,
+    plugin_before_hash: Option<String>,
+    plugin_after_hash: String,
+    plugin_backup_ref: Option<PathBuf>,
+    plugin_staging: PathBuf,
+    marketplace_path: PathBuf,
+    marketplace_existed_before: bool,
+    marketplace_before_hash: Option<String>,
+    marketplace_after_hash: String,
+    marketplace_backup_ref: Option<PathBuf>,
+    marketplace_plugins_field_existed_before: bool,
+    marketplace_entry_before: Option<Value>,
+    marketplace_entry_before_index: Option<usize>,
+    marketplace_entry_after: Value,
+    codex_cli_path: PathBuf,
+    plugin_selector: String,
+    plugin_installed_before: bool,
+    plugin_lifecycle_owned_before: bool,
+    plugin_lifecycle_version_before: Option<String>,
+    plugin_lifecycle_source_hash_before: Option<String>,
+    #[serde(default)]
+    plugin_cache_contract_hash_before: Option<String>,
+    #[serde(default)]
+    plugin_cache_contract_hash_after: String,
+    installed_governor_sha256_before: Option<String>,
+    plugin_version: String,
+    installed_governor_path: PathBuf,
+    installed_governor_sha256: String,
+    created_at: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct CodexOwnedLifecycleRecovery {
+    schema_version: String,
+    transaction_id: String,
+    plugin_selector: String,
+    plugin_path: PathBuf,
+    codex_cli_path: PathBuf,
+    owned_versions: Vec<String>,
+    created_at: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]

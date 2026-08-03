@@ -1,0 +1,10 @@
+[mcp_servers.codebase_memory]
+command = "C:/fixture/codebase-memory-mcp.exe"
+enabled = true
+
+[mcp_servers.context7]
+url = "https://mcp.context7.com/mcp"
+enabled = true
+
+[plugins."other-tool@personal"]
+enabled = true

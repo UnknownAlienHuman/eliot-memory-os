@@ -1,7 +1,7 @@
 {
   "name": "eliot-governor",
   "version": "0.1.0",
-  "description": "Connects Codex to the ELIOT Memory OS task and memory surface.",
+  "description": "Connects every Codex project to the system ELIOT Memory OS controller surface.",
   "author": {
     "name": "ELIOT"
   },
@@ -17,8 +17,8 @@
   "mcpServers": "./.mcp.json",
   "interface": {
     "displayName": "ELIOT Governor",
-    "shortDescription": "Bounded project memory for Codex",
-    "longDescription": "Connects Codex to ELIOT project memory, task context, observations, and verification receipts.",
+    "shortDescription": "System ELIOT memory and governance for Codex",
+    "longDescription": "Provides every Codex project with the ELIOT controller surface for governed memory, task context, observations, and verification receipts.",
     "developerName": "ELIOT",
     "category": "Developer Tools",
     "capabilities": [

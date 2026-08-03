@@ -604,9 +604,13 @@ fn launch_integration_refs(
         ),
         AgentHostId::Codex => (
             bundle.to_string_lossy().into_owned(),
-            bundle.join("README.md").to_string_lossy().into_owned(),
+            bundle.join(".mcp.json").to_string_lossy().into_owned(),
             bundle.join("skills").to_string_lossy().into_owned(),
-            bundle.join("README.md").to_string_lossy().into_owned(),
+            bundle
+                .join("hooks")
+                .join("hooks.json")
+                .to_string_lossy()
+                .into_owned(),
         ),
     }
 }
@@ -1927,7 +1931,14 @@ pub fn bundle_root(repo_root: &Path, host_id: AgentHostId) -> PathBuf {
     match host_id {
         AgentHostId::OpenCode => repo_root.join("integrations/opencode"),
         AgentHostId::Claude => repo_root.join("integrations/claude/eliot"),
-        AgentHostId::Codex => repo_root.join("integrations/codex"),
+        AgentHostId::Codex => {
+            let source_plugin = repo_root.join("plugin/eliot-governor");
+            if source_plugin.is_dir() {
+                source_plugin
+            } else {
+                repo_root.join("integrations/codex/plugins/eliot-governor")
+            }
+        }
         AgentHostId::Antigravity => repo_root.join("integrations/antigravity"),
     }
 }

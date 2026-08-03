@@ -1332,7 +1332,7 @@ fn command_version(executable: impl AsRef<std::ffi::OsStr>, args: &[&str]) -> Va
         .map_or(Value::Null, |text| Value::String(text.trim().to_owned()))
 }
 
-fn find_codex_cli() -> Option<PathBuf> {
+pub(crate) fn find_codex_cli() -> Option<PathBuf> {
     let bin_root = PathBuf::from(env::var_os("LOCALAPPDATA")?)
         .join("OpenAI")
         .join("Codex")
