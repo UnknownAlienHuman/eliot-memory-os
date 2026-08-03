@@ -38,11 +38,12 @@ use eliot_engine::{
     MemoryLifecycleMemoryWriter, MemoryLifecycleService, MemoryNeedService, MetaDispositionRequest,
     MetaDispositionService, MetaExperimentAssessment, MetaHarnessService, MetaPolicyExecutor,
     MetricRecorderService, MetricRegistryService, MetricRollupService, MetricsDoctorIntegration,
-    ModuleRegistryService, NegativeTransferService, PatchMemoryWriter, PatchRunner,
-    PatchRunnerInput, ProductionReadinessService, ProjectContinuityService,
-    ProjectUnderstandingCompiler, QualitySignalService, ReadService, ReadinessFixture,
-    ReplayCaseInput, ReplayCaseService, ReplayRunnerService, ReplaySealInput, ReplaySealService,
-    ReplaySetInput, ReplaySetService, ReplayVerdictService, RestoreService,
+    ModuleRegistryService, NegativeTransferService, PacketBudgetPolicy, PacketCompileMode,
+    PacketCompilePlan, PacketExperienceSource, PacketMeasurementView, PacketPyramidSnapshot,
+    PacketPyramidSource, PacketResolvedCues, PacketTaskReceiptMetadata, PatchMemoryWriter,
+    PatchRunner, PatchRunnerInput, ProductionReadinessService, QualitySignalService, ReadService,
+    ReadinessFixture, ReplayCaseInput, ReplayCaseService, ReplayRunnerService, ReplaySealInput,
+    ReplaySealService, ReplaySetInput, ReplaySetService, ReplayVerdictService, RestoreService,
     RuntimeDashboardService, SkillActivationContext, SkillCurationGate, SkillCurationReport,
     SkillCurationReportService, SkillCuratorMemoryWriter, SkillCuratorRunInput,
     SkillCuratorService, SkillDistractorFilterService, SkillExecutionProofService,
@@ -58,8 +59,8 @@ use eliot_engine::{
     WriterHandle, antigravity_real_report, antigravity_report, antigravity_review_request,
     builtin_manifests, deduplicate_experience_cases, deduplicate_experience_patterns,
     default_lease_ttl_minutes, default_work_scope, external_review_request,
-    filter_required_exact_l2_response, harness_experiment_record, refinalize_compiled_packet,
-    resolve_canonical_case_dispositions, test_request,
+    filter_required_exact_l2_response, harness_experiment_record,
+    resolve_canonical_case_dispositions, resolve_packet_scope_paths, test_request,
 };
 use eliot_store::{BlobStore, CanonicalClaimCard, CanonicalRecord, CanonicalStore, ControlWal};
 use eliot_types::{

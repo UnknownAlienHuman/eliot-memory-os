@@ -21,6 +21,7 @@ pub enum NamedSurqlOp {
     SchemaMigrateMemorySearch,
     SchemaMigrateMemorySearchFts,
     AssignUlExperimentArm,
+    UpsertUlExperimentAssignmentExplicit,
     LoadUlExperimentAssignment,
     LoadUlTaskClassLedgers,
     UpsertUlTaskClassPolicy,
@@ -99,6 +100,7 @@ impl NamedSurqlOp {
             | Self::GraphHealth
             | Self::BlobReferenceScan => SurqlAccessClass::Admin,
             Self::AssignUlExperimentArm
+            | Self::UpsertUlExperimentAssignmentExplicit
             | Self::UpsertUlTaskClassPolicy
             | Self::ReplaceUlReverseDependencies
             | Self::UpsertUlArtifactDirty
@@ -167,6 +169,9 @@ impl NamedSurqlOp {
             Self::SchemaMigrateMemorySearch => "009_memory_search",
             Self::SchemaMigrateMemorySearchFts => "010_memory_search_fts",
             Self::AssignUlExperimentArm => "assign_ul_experiment_arm",
+            Self::UpsertUlExperimentAssignmentExplicit => {
+                "upsert_ul_experiment_assignment_explicit"
+            }
             Self::LoadUlExperimentAssignment => "load_ul_experiment_assignment",
             Self::LoadUlTaskClassLedgers => "load_ul_task_class_ledgers",
             Self::UpsertUlTaskClassPolicy => "upsert_ul_task_class_policy",
@@ -249,6 +254,9 @@ impl NamedSurqlOp {
                 include_str!("surql/010_memory_search_fts.surql")
             }
             Self::AssignUlExperimentArm => include_str!("surql/assign_ul_experiment_arm.surql"),
+            Self::UpsertUlExperimentAssignmentExplicit => {
+                include_str!("surql/upsert_ul_experiment_assignment_explicit.surql")
+            }
             Self::LoadUlExperimentAssignment => {
                 include_str!("surql/load_ul_experiment_assignment.surql")
             }
@@ -385,7 +393,7 @@ impl Default for SurqlTemplateRegistry {
 }
 
 #[allow(clippy::too_many_lines)]
-fn foundational_templates() -> [SurqlTemplate; 50] {
+fn foundational_templates() -> [SurqlTemplate; 51] {
     [
         template(
             NamedSurqlOp::SchemaMigrate,
@@ -457,6 +465,12 @@ fn foundational_templates() -> [SurqlTemplate; 50] {
             NamedSurqlOp::AssignUlExperimentArm,
             "AssignUlExperimentArmInput",
             "AssignUlExperimentArmOutput",
+            64 * 1024,
+        ),
+        template(
+            NamedSurqlOp::UpsertUlExperimentAssignmentExplicit,
+            "UpsertUlExperimentAssignmentExplicitInput",
+            "UpsertUlExperimentAssignmentExplicitOutput",
             64 * 1024,
         ),
         template(

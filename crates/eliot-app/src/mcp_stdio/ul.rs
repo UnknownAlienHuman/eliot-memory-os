@@ -26,6 +26,7 @@ pub(super) struct PyramidPacketEnrichment {
     pub blind_target: Option<String>,
     pub recommended_probe: Option<String>,
     pub subsystem_concept_id: Option<String>,
+    pub resolved_concept_ids: Vec<String>,
     pub required_invariant_refs: Vec<String>,
     pub project_evidence: ProjectUnderstandingEvidence,
 }
@@ -89,32 +90,18 @@ impl UlRuntime {
         }
     }
 
-    pub async fn resolve_concept_ids(
+    pub async fn production_injection_mode(
         &self,
-        project_id: ProjectId,
-        touched_paths: &[String],
-    ) -> anyhow::Result<Vec<String>> {
-        let mut concepts = self
+        assignment: &UlTaskExperimentAssignment,
+    ) -> anyhow::Result<Option<UlInjectionMode>> {
+        let policy = self
             .store
-            .load_ul_artifacts::<ConceptNode>(project_id, &["concept_node"], 128)
-            .await?
-            .into_iter()
-            .filter(|record| {
-                touched_paths.iter().any(|path| {
-                    record
-                        .receipt_body
-                        .boundary_paths
-                        .iter()
-                        .any(|boundary| path_matches_boundary(path, boundary))
-                })
-            })
-            .map(|record| record.receipt_body.concept_id)
-            .collect::<Vec<_>>();
-        concepts.sort();
-        concepts.dedup();
-        Ok(concepts)
+            .load_ul_task_class_policy(assignment.project_id, &assignment.task_class.key())
+            .await?;
+        Ok(Some(policy.map_or(assignment.injection_mode, |policy| {
+            policy.injection_mode
+        })))
     }
-
     pub async fn effective_injection_mode(
         &self,
         project_id: ProjectId,
@@ -416,6 +403,10 @@ impl UlRuntime {
             &danger,
             &required_invariant_refs,
         );
+        let resolved_concept_ids = ranked
+            .iter()
+            .map(|(_, _, concept)| concept.concept_id.clone())
+            .collect();
         Ok(PyramidPacketEnrichment {
             understanding: json!({
                 "concepts": concept_values,
@@ -429,6 +420,7 @@ impl UlRuntime {
             blind_target,
             recommended_probe,
             subsystem_concept_id,
+            resolved_concept_ids,
             required_invariant_refs: required_invariant_refs.into_iter().collect(),
             project_evidence,
         })

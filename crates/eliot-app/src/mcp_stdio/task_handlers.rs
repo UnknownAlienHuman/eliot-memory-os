@@ -4,6 +4,152 @@ fn canonical_struct_hash<T: serde::Serialize>(value: &T) -> Result<String> {
         .to_string())
 }
 
+const PACKET_POST_COMMIT_OPERATION_KIND: &str = "eliot.packet.post_commit";
+const PACKET_POST_COMMIT_SCHEMA_VERSION: &str = "eliot-packet-post-commit-v3";
+const PACKET_ACTIVE_AUTHORITY_SCHEMA_VERSION: &str = "eliot-packet-active-authority-v2";
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+enum PacketPostCommitStatus {
+    Prepared,
+    CommittedPending,
+    Complete,
+    PendingRetry,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+enum PacketPostCommitEffect {
+    CodecortexProjection,
+    PredictionCapture,
+    ExperimentMeasurement,
+    GateProjection,
+}
+
+/// Immutable packet-commit/effect authority. Response bytes remain separate
+/// inspection data. `CodeCortex` `generated_at`, `repo_root`, and
+/// `memory_receipt` are the only current projection ephemera excluded here.
+#[derive(Clone, Debug, PartialEq, serde::Deserialize, serde::Serialize)]
+struct PacketCommitMaterial {
+    operation_kind: String,
+    schema_version: String,
+    project_id: ProjectId,
+    task_id: String,
+    effect_session_id: SessionId,
+    packet_id: String,
+    at_revision: MemoryRevision,
+    codecortex_projection_hash: Option<String>,
+    prediction_intents: Vec<eliot_engine::PacketPredictionIntent>,
+    measurement: Option<eliot_types::UlTaskExperimentAssignment>,
+    gate_projection: Option<Value>,
+    effects: Vec<PacketPostCommitEffect>,
+}
+
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
+struct PacketCommitProvenance {
+    request_session_id: SessionId,
+    #[serde(with = "time::serde::rfc3339")]
+    prepared_at: time::OffsetDateTime,
+}
+
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
+struct PacketPostCommitIntent {
+    operation_id: String,
+    material: PacketCommitMaterial,
+    provenance: PacketCommitProvenance,
+    response_hash_blake3: String,
+    response: Value,
+    codecortex_projection: Option<CodeCortexReport>,
+}
+
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
+struct PacketPostCommitEvent {
+    schema_version: String,
+    event_id: WriteId,
+    operation_id: String,
+    request_session_id: SessionId,
+    sequence: u64,
+    status: PacketPostCommitStatus,
+    errors: Vec<String>,
+    #[serde(with = "time::serde::rfc3339")]
+    recorded_at: time::OffsetDateTime,
+}
+
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
+struct ActivePacketAuthority {
+    schema_version: String,
+    operation_id: String,
+    material: PacketCommitMaterial,
+    packet: ContextPacketL3,
+    response_hash_blake3: String,
+    response: Value,
+}
+
+#[derive(Clone, Debug)]
+struct TaskPacketCommitFence {
+    task_contract_hash: String,
+    previous_active_fingerprint: Option<String>,
+}
+
+static PACKET_TASK_SERIALIZERS: StdOnceLock<
+    StdMutex<HashMap<String, std::sync::Weak<tokio::sync::Mutex<()>>>>,
+> = StdOnceLock::new();
+
+fn packet_task_serializer(task_id: &str) -> Arc<tokio::sync::Mutex<()>> {
+    let serializers = PACKET_TASK_SERIALIZERS.get_or_init(|| StdMutex::new(HashMap::new()));
+    let mut serializers = serializers
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let key = task_packet_key(task_id);
+    if let Some(serializer) = serializers.get(&key).and_then(std::sync::Weak::upgrade) {
+        return serializer;
+    }
+    let serializer = Arc::new(tokio::sync::Mutex::new(()));
+    serializers.insert(key, Arc::downgrade(&serializer));
+    serializer
+}
+
+#[derive(Clone, Debug)]
+struct PreparedPacketMeasurement {
+    assignment: eliot_types::UlTaskExperimentAssignment,
+    effective_injection_mode: Option<eliot_types::UlInjectionMode>,
+}
+
+async fn prepare_packet_measurement(
+    state: &McpState,
+    project_id: ProjectId,
+    task_id: TaskId,
+    task_class: eliot_types::UlTaskClass,
+    memory_free_control: bool,
+) -> Result<PreparedPacketMeasurement> {
+    let config_hash = blake3::hash(b"ul-token-policy-v1").to_hex().to_string();
+    let arm = if memory_free_control {
+        eliot_types::UlExperimentArm::Control
+    } else {
+        eliot_types::UlExperimentArm::Treatment
+    };
+    let assignment = eliot_types::UlTaskExperimentAssignment {
+        project_id,
+        task_id,
+        task_class: task_class.clone(),
+        // Live odd/even allocation is a post-admission measurement write and
+        // is deliberately absent from packet semantics.
+        ordinal: 0,
+        arm,
+        injection_mode: eliot_types::UlInjectionMode::Payload,
+        config_hash: config_hash.clone(),
+    };
+    let effective_injection_mode = if memory_free_control {
+        None
+    } else {
+        state.ul.production_injection_mode(&assignment).await?
+    };
+    Ok(PreparedPacketMeasurement {
+        assignment,
+        effective_injection_mode,
+    })
+}
+
 #[allow(clippy::too_many_lines)]
 async fn dispatch_compile_packet_l3(
     state: &McpState,
@@ -13,6 +159,7 @@ async fn dispatch_compile_packet_l3(
     let input = input_validation::decode_compile_packet_input(arguments)?;
     let requested_memory_free_control =
         input.memory_mode == Some(MemoryExposureMode::MemoryFreeControl);
+    let effective_memory_mode = input.memory_mode.unwrap_or_default();
     if let Some(frame) = input.material_frame.as_ref() {
         let invalid = material_frame_required_edits(frame)
             .into_iter()
@@ -34,539 +181,325 @@ async fn dispatch_compile_packet_l3(
         }
     }
     let request = input.request;
+    let material_frame = input.material_frame;
+    let packet_serializer = packet_task_serializer(&request.task_id);
+    let _packet_guard = packet_serializer.lock().await;
     let parsed_task_id = TaskId::from_str(&request.task_id).ok();
+    if let Some(task_id) = parsed_task_id {
+        let task_commit_guard = task_commit_serializer().lock().await;
+        let task_process_guard = acquire_task_transition_process_lock(&state.root, task_id).await?;
+        drop(task_commit_guard);
+        let replay_result =
+            replay_packet_post_commit_outbox_for_task(state, &request.task_id, true).await;
+        drop(task_process_guard);
+        replay_result?;
+    } else {
+        // Legacy non-canonical task handles remain local-only. Do not invent a
+        // TaskId merely to participate in the canonical process-lock domain.
+        replay_packet_post_commit_outbox_for_task(state, &request.task_id, true).await?;
+    }
     let packet_task = if let Some(packet_task_id) = parsed_task_id {
         state.store.task_contract_by_id(packet_task_id).await?
     } else {
         None
     };
-    let previous_packet = parsed_task_id
-        .map(|task_id| latest_task_packet(state, task_id))
-        .transpose()?
-        .flatten();
-    let codecortex_reports =
-        fresh_codecortex_reports(state, &request, input.material_frame.as_ref()).await?;
-    let current_git_scope =
-        resolve_governed_packet_git_scope(&request, packet_task.as_ref(), &codecortex_reports)
-            .await?;
-    let compiler = ContextCompiler::new(ReadService::new(state.store.clone()));
-    let mut packet = match (current_git_scope.as_ref(), input.material_frame.as_ref()) {
-        (Some(scope), Some(frame)) => {
-            Box::pin(compiler.compile_material_with_governed_git_scope(
-                &request,
-                &codecortex_reports,
-                scope,
-                frame,
-            ))
-            .await?
-        }
-        (Some(scope), None) => {
-            Box::pin(compiler.compile_with_governed_git_scope(&request, &codecortex_reports, scope))
-                .await?
-        }
-        (None, Some(frame)) => {
-            Box::pin(compiler.compile_material(&request, &codecortex_reports, frame)).await?
-        }
-        (None, None) => {
-            Box::pin(compiler.compile_with_codecortex(&request, &codecortex_reports)).await?
-        }
+    let commit_fence = TaskPacketCommitFence {
+        task_contract_hash: canonical_struct_hash(&packet_task)?,
+        previous_active_fingerprint: active_packet_fingerprint(state, &request.task_id)?,
     };
-    ProjectContinuityService::restore(&mut packet, previous_packet.as_ref());
-    let touched_paths = packet_scope_paths(&packet, input.material_frame.as_ref(), &request);
-    let resolved_concept_ids = if packet_task.is_some() {
-        state
-            .ul
-            .resolve_concept_ids(request.project_id, &touched_paths)
-            .await?
+    // Certification control is explicit. Hidden experiment assignment must never
+    // decide production memory exposure or cause a memory read before this point.
+    let previous_packet = if requested_memory_free_control {
+        None
     } else {
-        Vec::new()
+        parsed_task_id
+            .map(|task_id| latest_task_packet(state, task_id))
+            .transpose()?
+            .flatten()
     };
-    let assignment = if let (Some(task_id), Some(task)) = (parsed_task_id, packet_task.as_ref()) {
-        let task_class = eliot_engine::UlTokenPolicyService::classify(
-            Some(task),
-            input.material_frame.as_ref(),
-            &resolved_concept_ids,
+    let codecortex_batch = fresh_codecortex_reports(state, &request, material_frame.as_ref())?;
+    let codecortex_reports = &codecortex_batch.reports;
+    let current_git_scope =
+        resolve_governed_packet_git_scope(&request, packet_task.as_ref(), codecortex_reports)
+            .await?;
+    let touched_paths =
+        resolve_packet_scope_paths(&request, material_frame.as_ref(), codecortex_reports);
+    let fallback_text = format!("{} {}", request.goal, request.candidate_handles.join(" "));
+    let (pyramid_source, resolved_concept_ids, experience_source) = if requested_memory_free_control
+    {
+        (
+            PacketPyramidSource::Forbidden,
+            Vec::new(),
+            PacketExperienceSource::Forbidden,
+        )
+    } else {
+        match revision_bound_packet_enrichment(
+            state,
+            request.project_id,
+            &request.task_id,
             &touched_paths,
-        );
-        let config_hash = blake3::hash(b"ul-token-policy-v1").to_hex();
-        Some(
-            state
-                .ul
-                .token_policy
-                .assignment(
+            &fallback_text,
+        )
+        .await
+        {
+            Ok((at_revision, pyramid)) => {
+                let resolved_concept_ids = pyramid.resolved_concept_ids.clone();
+                let snapshot = PacketPyramidSnapshot {
+                    at_revision,
+                    understanding: pyramid.understanding,
+                    bridge: pyramid.bridge,
+                    metacognition: pyramid.meta,
+                    coverage: pyramid.coverage,
+                    blind_target: pyramid.blind_target,
+                    recommended_probe: pyramid.recommended_probe,
+                    subsystem_concept_id: pyramid.subsystem_concept_id,
+                    required_invariant_refs: pyramid.required_invariant_refs,
+                    project_evidence: pyramid.project_evidence,
+                };
+                let cases = semantic_records::<ExperienceCase>(
+                    state,
+                    request.project_id,
+                    "experience_case",
+                )
+                .await?;
+                (
+                    PacketPyramidSource::Resolved(Box::new(snapshot)),
+                    resolved_concept_ids,
+                    PacketExperienceSource::Cases(cases),
+                )
+            }
+            Err(error) => {
+                let Some(unavailable) = error.downcast_ref::<PacketEnrichmentUnavailable>() else {
+                    return Err(error);
+                };
+                (
+                    PacketPyramidSource::Unavailable {
+                        reason: unavailable.0.clone(),
+                    },
+                    Vec::new(),
+                    PacketExperienceSource::Cases(Vec::new()),
+                )
+            }
+        }
+    };
+    let task_class = eliot_engine::UlTokenPolicyService::classify(
+        packet_task.as_ref(),
+        material_frame.as_ref(),
+        &resolved_concept_ids,
+        &touched_paths,
+    );
+    let resolved_cues = if requested_memory_free_control {
+        PacketResolvedCues::default()
+    } else {
+        PacketResolvedCues {
+            task_class_cues: vec![task_class.key()],
+            scope_refs: touched_paths.clone(),
+            concept_refs: resolved_concept_ids,
+        }
+    };
+    let task_receipt_metadata = if let Some(task) = packet_task.as_ref() {
+        let receipt = state
+            .store
+            .write_receipt_by_id(&task.write_id)
+            .await?
+            .context("current TaskContract WriteReceipt does not resolve")?;
+        Some(PacketTaskReceiptMetadata {
+            exact_evidence_refs: vec![receipt.receipt_id.to_string()],
+            registered_verifiers: RegisteredTaskVerifier::ALL
+                .into_iter()
+                .map(RegisteredTaskVerifier::descriptor)
+                .collect(),
+        })
+    } else {
+        None
+    };
+    let compile_mode = match effective_memory_mode {
+        MemoryExposureMode::MemoryFreeControl => PacketCompileMode::CertificationControl,
+        MemoryExposureMode::IncludeCaseCandidates => PacketCompileMode::CertificationTreatment,
+        MemoryExposureMode::FullAudit => PacketCompileMode::ShadowEvaluation,
+        MemoryExposureMode::CurrentTruthOnly | MemoryExposureMode::MatureExperienceOnly => {
+            PacketCompileMode::Production
+        }
+    };
+    let prepared_measurement = if matches!(
+        compile_mode,
+        PacketCompileMode::CertificationControl | PacketCompileMode::CertificationTreatment
+    ) {
+        if let Some(task_id) = parsed_task_id {
+            Some(
+                prepare_packet_measurement(
+                    state,
                     request.project_id,
                     task_id,
-                    &task_class,
-                    config_hash.as_ref(),
+                    task_class.clone(),
+                    requested_memory_free_control,
                 )
                 .await?,
-        )
-    } else {
-        None
-    };
-    let experiment_control = assignment
-        .as_ref()
-        .is_some_and(|assignment| assignment.arm == eliot_types::UlExperimentArm::Control);
-    let memory_free_control = requested_memory_free_control || experiment_control;
-    let effective_memory_mode = if memory_free_control {
-        MemoryExposureMode::MemoryFreeControl
-    } else {
-        input.memory_mode.unwrap_or_default()
-    };
-    if memory_free_control {
-        enforce_memory_free_control(&mut packet, input.material_frame.as_ref());
-        eliot_engine::PacketQualityService::finalize(&mut packet, input.material_frame.as_ref())?;
-    }
-    let task_frame = TaskMeaningFrame {
-        task_id: request.task_id.clone(),
-        user_goal: request.goal.clone(),
-        normalized_goal: eliot_types::normalize_unicode_lowercase(&request.goal),
-        execution_class: Some(packet.task_execution_class.clone()),
-        task_or_action_type: "governed_task".to_owned(),
-        desired_state_transition: request.goal.clone(),
-        problem_or_failure_signature: packet.open_questions.join(" "),
-        project_module_boundary: packet
-            .codecortex
-            .as_ref()
-            .map_or_else(Vec::new, |view| view.report_refs.clone()),
-        files_symbols_config: packet.codecortex.as_ref().map_or_else(Vec::new, |view| {
-            view.file_evidence
-                .iter()
-                .map(|evidence| evidence.path.clone())
-                .collect()
-        }),
-        control_data_state_path: packet
-            .causal_bridge
-            .iter()
-            .map(|hop| format!("{} -> {} -> {}", hop.from, hop.relation, hop.to))
-            .collect(),
-        constraints: input
-            .material_frame
-            .as_ref()
-            .map_or_else(Vec::new, |frame| frame.killed_paths.clone()),
-        invariants: input
-            .material_frame
-            .as_ref()
-            .map_or_else(Vec::new, |frame| frame.acceptance_items.clone()),
-        current_evidence: packet.exact_handles.clone(),
-        material_unknowns: packet.open_questions.clone(),
-        expected_artifact: input
-            .material_frame
-            .as_ref()
-            .map_or_else(String::new, |frame| frame.next_allowed_action.clone()),
-        predicted_observable: input
-            .material_frame
-            .as_ref()
-            .map_or_else(String::new, |frame| frame.expected_observable.clone()),
-        verifier_need: input
-            .material_frame
-            .as_ref()
-            .map_or_else(String::new, |frame| frame.verifier.clone()),
-        abstraction_level_needed: "auto".to_owned(),
-        codecortex_report_ref: codecortex_reports
-            .first()
-            .map(|report| format!("codecortex:{}:{}", report.project, report.task)),
-        ..TaskMeaningFrame::default()
-    };
-    let memory_need = MemoryNeedService::decide(&task_frame, None);
-    let cases = deduplicate_experience_cases(
-        semantic_records::<ExperienceCase>(state, request.project_id, "experience_case").await?,
-    );
-    let exposure_policy = MemoryExposurePolicy {
-        mode: effective_memory_mode,
-        packet_cache_partition: format!(
-            "{:?}:{}",
-            effective_memory_mode,
-            request.task_id
-        )
-        .to_ascii_lowercase(),
-        ..MemoryExposurePolicy::default()
-    };
-    let experience = ExperienceRetrievalService::recall(
-        &ExperienceRecallRequest {
-            project_id: request.project_id,
-            task_frame,
-            need: memory_need.clone(),
-            exposure_policy,
-        },
-        &cases,
-    );
-    packet.memory_need_decision = Some(memory_need);
-    packet.experience_priors = experience.experience_priors;
-    if let Some(task) = &packet_task {
-        packet.memory_applicability.inclusion_reasons.push(format!(
-            "eliot/task/{}@{}:canonical_task_state",
-            task.task_id,
-            task.memory_revision.value()
-        ));
-        packet.memory_applicability.inclusion_reasons.sort();
-        packet.memory_applicability.inclusion_reasons.dedup();
-    }
-    let fallback_text = format!(
-        "{} {} {}",
-        request.goal,
-        request.candidate_handles.join(" "),
-        packet.exact_handles.join(" ")
-    );
-    let pyramid = if memory_free_control {
-        None
-    } else {
-        Some(
-            state
-                .ul
-                .packet_enrichment(
-                    request.project_id,
-                    &request.task_id,
-                    &touched_paths,
-                    &fallback_text,
-                )
-                .await?,
-        )
-    };
-    if packet.causal_bridge.is_empty()
-        && let Some(pyramid) = &pyramid
-    {
-        packet.causal_bridge.clone_from(&pyramid.bridge);
-    }
-    let project_evidence = pyramid
-        .as_ref()
-        .map_or_else(eliot_types::ProjectUnderstandingEvidence::default, |pyramid| {
-            pyramid.project_evidence.clone()
-        });
-    packet.project_understanding = Some(ProjectUnderstandingCompiler::compile(
-        &packet,
-        input.material_frame.as_ref(),
-        packet_task.as_ref(),
-        &project_evidence,
-    ));
-    refinalize_compiled_packet(
-        &mut packet,
-        input.material_frame.as_ref(),
-        request.max_tokens,
-        &request.candidate_handles,
-    )?;
-    persist_context_packet(state, &packet)?;
-    let required_invariant_refs = pyramid
-        .as_ref()
-        .map_or_else(Vec::new, |pyramid| pyramid.required_invariant_refs.clone());
-    let frame_stub =
-        material_frame_stub(&packet, packet_task.as_ref(), &required_invariant_refs);
-    let packet_id = packet.packet_id.clone();
-    let mut value = serde_json::to_value(packet)?;
-    if let Some(pyramid) = &pyramid {
-        value["ul_understanding"] = pyramid.understanding.clone();
-        let coverage = serde_json::to_value(pyramid.coverage)?
-            .as_str()
-            .unwrap_or("blind")
-            .to_owned();
-        value["ul_meta"] = json!({
-            "coverage": coverage,
-            "novelty_percent": pyramid.meta.novelty_percent,
-            "danger": pyramid.meta.danger_paths,
-            "recommended_probe": pyramid.recommended_probe,
-            "blind_target": pyramid.blind_target,
-            "scope_paths": touched_paths,
-        });
-        let material_risk = input.material_frame.is_some();
-        if let Some(frame) = input.material_frame.as_ref() {
-            let missing_invariant_refs =
-                missing_invariant_refs(&pyramid.required_invariant_refs, frame);
-            if !missing_invariant_refs.is_empty() {
-                value["ul_gate"] = json!({
-                    "status": "require_packet_refresh",
-                    "reason": "missing_capsule_invariants",
-                    "missing_invariant_refs": missing_invariant_refs,
-                });
-            }
-        }
-        if material_risk
-            && pyramid.coverage == eliot_types::CoverageClass::Blind
-            && value.get("ul_gate").is_none()
-        {
-            let suggested_probe = pyramid
-                .recommended_probe
-                .clone()
-                .or_else(|| {
-                    input
-                        .material_frame
-                        .as_ref()
-                        .map(|frame| frame.verifier.clone())
-                })
-                .unwrap_or_else(|| frame_stub.verifier.clone());
-            value["ul_gate"] = json!({
-                "status": "require_probe",
-                "reason": "blind_subsystem",
-                "concept_or_path": pyramid
-                    .blind_target
-                    .clone()
-                    .or_else(|| touched_paths.first().cloned())
-                    .unwrap_or_else(|| "unknown".to_owned()),
-                "suggested_probe": suggested_probe,
-            });
-        }
-    }
-    if let Some(frame) = input.material_frame.as_ref() {
-        let source_frame_hash = canonical_struct_hash(frame)?;
-        if let Ok(task_id) = TaskId::from_str(&request.task_id) {
-            let diagnostic_prediction = frame
-                .cheapest_discriminative_probes
-                .first()
-                .map(|probe| {
-                    (
-                        probe.clone(),
-                        eliot_types::DiagnosticExpectation::Appears,
-                    )
-                });
-            let captures = state
-                .ul
-                .prediction
-                .capture_frame(eliot_engine::PredictionFrameCaptureInput {
-                    base: eliot_engine::PredictionCaptureInput {
-                        project_id: request.project_id,
-                        task_id,
-                        session_id: context.session_id,
-                        subsystem_concept_id: pyramid
-                            .as_ref()
-                            .and_then(|value| value.subsystem_concept_id.clone()),
-                        packet_id: packet_id.clone(),
-                        expected_observable: frame.expected_observable.clone(),
-                        source_frame_hash,
-                    },
-                    confidence: frame.prediction_confidence,
-                    predicted_changed_paths: frame.predicted_changed_paths.clone(),
-                    predicted_failing_verifiers: frame.predicted_failing_verifiers.clone(),
-                    diagnostic_prediction,
-                })
-                .await?;
-            if !captures.is_empty() {
-                value["prediction_refs"] = serde_json::to_value(
-                    captures
-                        .iter()
-                        .map(|capture| capture.prediction_ref.clone())
-                        .collect::<Vec<_>>(),
-                )?;
-                value["prediction_ref"] = Value::String(captures[0].prediction_ref.clone());
-            }
-        }
-        if eliot_engine::parse_expected_observable(&frame.expected_observable).is_none()
-            && frame.predicted_changed_paths.is_empty()
-            && frame.predicted_failing_verifiers.is_empty()
-        {
-            value["ul_prediction"] = json!({"status": "not_machine_checkable"});
-        }
-    }
-    let frame_stub_required_edits = material_frame_required_edits(&frame_stub);
-    value["frame_stub"] = serde_json::to_value(frame_stub)?;
-    value["frame_stub_ready"] = Value::Bool(frame_stub_required_edits.is_empty());
-    value["frame_stub_required_edits"] = serde_json::to_value(frame_stub_required_edits)?;
-    if let Some(task) = packet_task.as_ref() {
-        enrich_packet_with_task(state, &mut value, task).await?;
-    }
-    if let Some(assignment) = assignment {
-        let effective_injection_mode = if assignment.arm == eliot_types::UlExperimentArm::Control {
-            None
+            )
         } else {
-            state.ul.token_policy.effective_mode(&assignment).await?
-        };
-        value["ul_experiment"] = json!({
-            "project_id": assignment.project_id,
-            "task_id": assignment.task_id,
-            "task_class": assignment.task_class,
-            "ordinal": assignment.ordinal,
-            "arm": assignment.arm,
-            "assignment_injection_mode": assignment.injection_mode,
-            "effective_injection_mode": effective_injection_mode,
-            "effective_memory_mode": if memory_free_control {
-                "memory_free_control"
-            } else {
-                "configured"
-            },
-            "config_hash": assignment.config_hash,
-        });
+            None
+        }
+    } else {
+        None
+    };
+    let plan = PacketCompilePlan {
+        request: request.clone(),
+        session_id: context.session_id,
+        compile_mode,
+        memory_exposure: effective_memory_mode,
+        task_contract: packet_task.clone(),
+        task_receipt_metadata,
+        previous_packet,
+        material_frame: material_frame.clone(),
+        codecortex_reports: codecortex_batch.reports.clone(),
+        current_git_scope,
+        touched_paths,
+        resolved_cues,
+        pyramid_source,
+        experience_source,
+        budget_policy: PacketBudgetPolicy::governor_default(request.max_tokens),
+        measurement_view: prepared_measurement
+            .as_ref()
+            .map(|measurement| PacketMeasurementView {
+                task_class: measurement.assignment.task_class.clone(),
+                assignment_injection_mode: measurement.assignment.injection_mode,
+                effective_injection_mode: measurement.effective_injection_mode,
+                config_hash: measurement.assignment.config_hash.clone(),
+            }),
+    };
+    let context_compiler = ContextCompiler::new(ReadService::new(state.store.clone()));
+    let compiled = Box::pin(context_compiler.compile_plan(plan)).await?;
+    let packet = compiled.packet;
+    let packet_id = packet.packet_id.clone();
+    let mut value = serde_json::to_value(&packet)?;
+    let Value::Object(supplement) = compiled.response_supplement else {
+        unreachable!("semantic packet supplement is always an object")
+    };
+    let Value::Object(value_object) = &mut value else {
+        unreachable!("serialized context packet is always an object")
+    };
+    value_object.extend(supplement);
+    value["packet_budget_decision"] = serde_json::to_value(&compiled.budget)?;
+    value["compile_audit"] = serde_json::to_value(&compiled.compile_audit)?;
+    if !compiled.admission.active_allowed {
+        persist_rejected_context_attempt(state, &packet, &value)?;
+        return Ok(value);
     }
-    state.ul.record_packet_gate(
-        request.project_id,
-        context.session_id,
-        parsed_task_id,
-        value.get("ul_gate"),
+    // Commit identity covers the handler-owned response. The outer dispatcher's
+    // session-scoped `ul_fired` delivery decoration is deliberately not authority.
+    let response_hash_blake3 = canonical_struct_hash(&value)?;
+    let codecortex_projection = codecortex_batch.pending_persistence;
+    let mut material = PacketCommitMaterial {
+        operation_kind: PACKET_POST_COMMIT_OPERATION_KIND.to_owned(),
+        schema_version: PACKET_POST_COMMIT_SCHEMA_VERSION.to_owned(),
+        project_id: request.project_id,
+        task_id: request.task_id.clone(),
+        effect_session_id: context.session_id,
+        packet_id,
+        at_revision: packet.at_revision,
+        codecortex_projection_hash: codecortex_projection
+            .as_ref()
+            .map(codecortex_projection_hash)
+            .transpose()?,
+        prediction_intents: compiled.prediction_intents,
+        measurement: prepared_measurement.map(|measurement| measurement.assignment),
+        gate_projection: value.get("ul_gate").cloned(),
+        effects: Vec::new(),
+    };
+    material.effects = packet_post_commit_effect_plan(&material);
+    let operation_id = packet_post_commit_operation_id(&material)?;
+    let outbox_intent = PacketPostCommitIntent {
+        operation_id,
+        material,
+        provenance: PacketCommitProvenance {
+            request_session_id: context.session_id,
+            prepared_at: time::OffsetDateTime::now_utc(),
+        },
+        response_hash_blake3,
+        response: value.clone(),
+        codecortex_projection,
+    };
+    let task_commit_guard = task_commit_serializer().lock().await;
+    let _task_process_guard = if let Some(task_id) = parsed_task_id {
+        Some(acquire_task_transition_process_lock(&state.root, task_id).await?)
+    } else {
+        None
+    };
+    ensure_packet_commit_fence(state, parsed_task_id, &request.task_id, &commit_fence).await?;
+    let (outbox_root, stored_intent, staged_event) =
+        stage_packet_post_commit_outbox(state, &outbox_intent)?;
+    if staged_event.status == PacketPostCommitStatus::Complete
+        && completed_packet_post_commit_replay_is_idempotent(
+            staged_event.status,
+            packet_post_commit_intent_is_active(state, &stored_intent)?,
+            &stored_intent.operation_id,
+        )?
+    {
+        drop(task_commit_guard);
+        return Ok(stored_intent.response);
+    }
+    let mut post_commit_errors = commit_active_context_packet(state, &stored_intent)?;
+    transition_packet_post_commit_outbox(
+        &outbox_root,
+        &stored_intent,
+        PacketPostCommitStatus::CommittedPending,
+        &post_commit_errors,
     )?;
-    Ok(value)
+    drop(task_commit_guard);
+    ensure_packet_post_commit_intent_is_active(state, &stored_intent)?;
+    post_commit_errors.extend(apply_packet_post_commit_intent(state, &stored_intent).await);
+    finish_packet_post_commit_outbox(&outbox_root, &stored_intent, &post_commit_errors)?;
+    Ok(stored_intent.response)
 }
 
-fn enforce_memory_free_control(
-    packet: &mut ContextPacketL3,
-    frame: Option<&MaterialPacketFrame>,
-) {
-    packet.current_truth.clear();
-    packet.relevant_verified_claims.clear();
-    packet.relevant_supported_claims.clear();
-    packet.weak_claims_warning.clear();
-    packet.negative_memory.clear();
-    packet.recent_failures.clear();
-    packet.known_decisions.clear();
-    packet.open_questions.clear();
-    packet.exact_handles.clear();
-    packet.source_receipts.clear();
-    packet.epistemic_state = eliot_types::EpistemicPacketState::default();
-    packet.memory_decisions.clear();
-    packet.experience_priors.clear();
-    packet.memory_need_decision = None;
-    packet.memory_confidence = eliot_types::MemoryConfidence::None;
-    packet.memory_applicability.decisions.clear();
-    packet.memory_applicability.inclusion_reasons.clear();
-    packet.memory_applicability.suppression_reasons =
-        vec!["memory_free_control".to_owned()];
-    packet.memory_applicability.revalidation_reasons.clear();
-    packet.historical_memory.clear();
-    packet.memory_lifecycle.suppressed_refs.clear();
-    packet.memory_lifecycle.demoted_refs.clear();
-    packet.memory_lifecycle.superseded_refs.clear();
-    packet.memory_lifecycle.archived_refs.clear();
-    packet.memory_lifecycle.minority_preserved_refs.clear();
-    packet.memory_lifecycle.lifecycle_warnings =
-        vec!["memory_free_control".to_owned()];
-    packet.decision_locality_suffix.exact_load_bearing_atoms =
-        frame.map_or_else(Vec::new, |frame| frame.exact_load_bearing_atoms.clone());
-    packet.decision_locality_suffix.open_unknowns.clear();
-    packet.truncation.truncated = false;
-    packet.truncation.returned = 0;
-}
-
-fn packet_scope_paths(
-    packet: &ContextPacketL3,
-    frame: Option<&MaterialPacketFrame>,
-    request: &CompilePacketL3Request,
-) -> Vec<String> {
-    let mut values = BTreeSet::new();
-    if let Some(frame) = frame {
-        for atom in &frame.exact_load_bearing_atoms {
-            insert_path_tokens(&mut values, atom);
-        }
-        for hop in &frame.causal_bridge {
-            insert_path_tokens(&mut values, &hop.from);
-            insert_path_tokens(&mut values, &hop.to);
-            if let Some(reference) = &hop.evidence_ref {
-                insert_path_tokens(&mut values, reference);
-            }
-        }
-    }
-    for handle in &request.candidate_handles {
-        insert_path_tokens(&mut values, handle);
-    }
-    insert_path_tokens(&mut values, &request.goal);
-    if values.is_empty() {
-        if let Some(codecortex) = &packet.codecortex {
-            for evidence in &codecortex.file_evidence {
-                insert_path_tokens(&mut values, &evidence.path);
-            }
-        }
-        for hop in &packet.causal_bridge {
-            insert_path_tokens(&mut values, &hop.from);
-            insert_path_tokens(&mut values, &hop.to);
-            if let Some(reference) = &hop.evidence_ref {
-                insert_path_tokens(&mut values, reference);
-            }
-        }
-    }
-    values.into_iter().collect()
-}
-
-fn insert_path_tokens(paths: &mut BTreeSet<String>, value: &str) {
-    for token in eliot_types::path_cue_tokens(value) {
-        paths.insert(token);
-    }
-}
-
-fn material_frame_stub(
-    packet: &ContextPacketL3,
-    task: Option<&TaskContract>,
-    required_invariant_refs: &[String],
-) -> MaterialPacketFrame {
-    let next_action = if packet
-        .decision_locality_suffix
-        .next_allowed_action
-        .trim()
-        .is_empty()
-    {
-        "inspect responsible boundary".to_owned()
-    } else {
-        packet.decision_locality_suffix.next_allowed_action.clone()
+async fn revision_bound_packet_enrichment(
+    state: &McpState,
+    project_id: ProjectId,
+    task_id: &str,
+    touched_paths: &[String],
+    fallback_text: &str,
+) -> Result<(MemoryRevision, ul::PyramidPacketEnrichment)> {
+    let request = CurrentStateRequest {
+        project_id,
+        consistency: ReadConsistencyMode::Latest,
+        at_least_revision: None,
     };
-    let verifier = if packet.decision_locality_suffix.verifier.trim().is_empty() {
-        "cargo test --workspace".to_owned()
-    } else {
-        packet.decision_locality_suffix.verifier.clone()
-    };
-    let stop_condition = if packet
-        .decision_locality_suffix
-        .stop_condition
-        .trim()
-        .is_empty()
-    {
-        "stop on verifier failure".to_owned()
-    } else {
-        packet.decision_locality_suffix.stop_condition.clone()
-    };
-    MaterialPacketFrame {
-        acceptance_items: task.map_or_else(Vec::new, |task| {
-            task.acceptance_items
-                .iter()
-                .map(|item| item.description.clone())
-                .collect()
-        }),
-        environment: packet
-            .current_truth_snapshot
-            .as_ref()
-            .map_or_else(Vec::new, |snapshot| snapshot.environment.clone()),
-        active_plan: vec![next_action.clone()],
-        completed_work: task.map_or_else(Vec::new, |task| {
-            task.acceptance_items
-                .iter()
-                .filter(|item| item.satisfied)
-                .map(|item| item.description.clone())
-                .collect()
-        }),
-        killed_paths: packet.killed_paths.clone(),
-        causal_bridge: packet.causal_bridge.clone(),
-        negative_memory_checked: !packet.negative_memory.is_empty()
-            || packet
-                .memory_decisions
-                .iter()
-                .any(|decision| decision.memory_handle.contains("failure")),
-        exact_load_bearing_atoms: packet.exact_handles.clone(),
-        cheapest_discriminative_probes: packet
-            .decision_locality_suffix
-            .cheapest_discriminative_probes
-            .clone(),
-        responsibility_contour_route_refs: packet
-            .decision_locality_suffix
-            .responsibility_contour_route_refs
-            .clone(),
-        next_allowed_action: next_action,
-        expected_observable: String::new(),
-        verifier: verifier.clone(),
-        stop_condition,
-        tool_schema_bytes_visible: packet
-            .packet_quality
-            .as_ref()
-            .map_or(0, |quality| quality.tool_schema_bytes_visible),
-        instruction_hotset_size: packet
-            .packet_quality
-            .as_ref()
-            .map_or(0, |quality| quality.instruction_hotset_size),
-        invariant_refs: required_invariant_refs.to_vec(),
-        waived_invariants: Vec::new(),
-        prediction_confidence: None,
-        predicted_changed_paths: packet
-            .exact_handles
-            .iter()
-            .flat_map(|handle| eliot_types::path_cue_tokens(handle))
-            .collect::<BTreeSet<_>>()
-            .into_iter()
-            .collect(),
-        predicted_failing_verifiers: Vec::new(),
+    let mut last_mismatch = "canonical revision fence was not evaluated".to_owned();
+    for attempt in 0..3 {
+        let before = state.store.current_state(&request).await?;
+        let enrichment = state
+            .ul
+            .packet_enrichment(project_id, task_id, touched_paths, fallback_text)
+            .await?;
+        let after = state.store.current_state(&request).await?;
+        if after.memory_revision == before.memory_revision {
+            return Ok((before.memory_revision, enrichment));
+        }
+        last_mismatch = format!(
+            "canonical revision changed: before={}, after={}",
+            before.memory_revision.value(),
+            after.memory_revision.value(),
+        );
+        if attempt < 2 {
+            tokio::time::sleep(std::time::Duration::from_millis(25_u64 << (attempt * 2))).await;
+        }
+    }
+    Err(PacketEnrichmentUnavailable(format!(
+        "canonical revision fence did not stabilize after 3 attempts: {last_mismatch}"
+    ))
+    .into())
+}
+
+#[derive(Debug)]
+struct PacketEnrichmentUnavailable(String);
+
+impl std::fmt::Display for PacketEnrichmentUnavailable {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
     }
 }
+
+impl std::error::Error for PacketEnrichmentUnavailable {}
 
 fn material_frame_required_edits(frame: &MaterialPacketFrame) -> Vec<&'static str> {
     let mut fields = Vec::new();
@@ -597,25 +530,6 @@ fn material_frame_required_edit_reason(field: &str) -> &'static str {
         "material_frame.stop_condition" => "material work requires an explicit stop condition",
         _ => "material work requires this load-bearing field",
     }
-}
-
-fn missing_invariant_refs(
-    required_invariant_refs: &[String],
-    frame: &MaterialPacketFrame,
-) -> Vec<String> {
-    let mut covered = frame.invariant_refs.iter().cloned().collect::<BTreeSet<_>>();
-    covered.extend(frame.waived_invariants.iter().filter_map(|waiver| {
-        let reason = waiver.reason.trim();
-        (!reason.is_empty() && reason.len() <= 240).then(|| waiver.invariant_ref.clone())
-    }));
-    let mut missing = required_invariant_refs
-        .iter()
-        .filter(|invariant| !covered.contains(*invariant))
-        .cloned()
-        .collect::<Vec<_>>();
-    missing.sort();
-    missing.dedup();
-    missing
 }
 
 async fn dispatch_understanding_outcome_record(
@@ -681,9 +595,7 @@ async fn dispatch_memory_influence_trace(
             let packet_id = packet_id.context(
                 "MISSING_PROJECT_PACKET_CONTEXT: minimal influence acknowledgement requires an explicit bound task and a same-session L3 packet or exact fetch context",
             )?;
-            if packet_id.starts_with("retrieval:")
-                && !packet_handles.contains(&ack.memory_handle)
-            {
+            if packet_id.starts_with("retrieval:") && !packet_handles.contains(&ack.memory_handle) {
                 anyhow::bail!(
                     "EXACT_FETCH_CONTEXT_MISMATCH: minimal influence acknowledgement must name a handle returned by the same-session exact fetch"
                 );
@@ -1091,15 +1003,22 @@ async fn dispatch_negative_transfer_record(
     Ok(value)
 }
 
-async fn fresh_codecortex_reports(
+struct CodeCortexCompileBatch {
+    reports: Vec<CodeCortexReport>,
+    pending_persistence: Option<CodeCortexReport>,
+}
+
+fn fresh_codecortex_reports(
     state: &McpState,
     request: &CompilePacketL3Request,
     frame: Option<&MaterialPacketFrame>,
-) -> Result<Vec<CodeCortexReport>> {
-    let class =
-        TaskExecutionClassifier::classify(request, frame, &[], &request.candidate_handles);
+) -> Result<CodeCortexCompileBatch> {
+    let class = TaskExecutionClassifier::classify(request, frame, &[], &request.candidate_handles);
     if !TaskExecutionClassifier::should_attach_codecortex(request, frame, &[], &class) {
-        return Ok(Vec::new());
+        return Ok(CodeCortexCompileBatch {
+            reports: Vec::new(),
+            pending_persistence: None,
+        });
     }
     let mut exact_patterns = request.candidate_handles.clone();
     if let Some(frame) = frame {
@@ -1123,31 +1042,1369 @@ async fn fresh_codecortex_reports(
     if let Some(report) = latest_codecortex_report(&state.root)?
         && service.report_is_fresh(&report, &codecortex_request)?
     {
-        return Ok(vec![report]);
+        return Ok(CodeCortexCompileBatch {
+            reports: vec![report],
+            pending_persistence: None,
+        });
     }
-    let mut report = service.scan(&codecortex_request)?;
-    write_codecortex_report_to_memory(state, &mut report).await?;
-    write_json_report(&codecortex_latest_path(&state.root), &report)?;
-    Ok(vec![report])
+    let report = service.scan(&codecortex_request)?;
+    Ok(CodeCortexCompileBatch {
+        reports: vec![report.clone()],
+        pending_persistence: Some(report),
+    })
 }
 
-fn persist_context_packet(state: &McpState, packet: &ContextPacketL3) -> Result<()> {
-    let root = state.root.join("reports").join("context-packets");
-    write_json_report(&root.join("latest.json"), packet)?;
-    let task_root = root.join("tasks").join(task_packet_key(&packet.task_id));
-    write_json_report(&task_root.join("latest.json"), packet)?;
-    let packet_suffix = packet
-        .packet_id
-        .rsplit('/')
-        .next()
-        .unwrap_or("unidentified");
-    write_json_report(
-        &task_root.join("revisions").join(format!(
-            "{}-{packet_suffix}.json",
-            packet.at_revision.value()
-        )),
-        packet,
+fn persist_pending_codecortex_projection(
+    state: &McpState,
+    pending: &mut Option<CodeCortexReport>,
+) -> Result<()> {
+    let Some(report) = pending.as_ref() else {
+        return Ok(());
+    };
+    if latest_codecortex_report(&state.root)?
+        .is_some_and(|current| current.generated_at >= report.generated_at)
+    {
+        *pending = None;
+        return Ok(());
+    }
+    atomic_write_json(&codecortex_latest_path(&state.root), &report)?;
+    *pending = None;
+    Ok(())
+}
+
+fn packet_task_root(state: &McpState, task_id: &str) -> PathBuf {
+    state
+        .root
+        .join("reports")
+        .join("context-packets")
+        .join("tasks")
+        .join(task_packet_key(task_id))
+}
+
+fn active_packet_authority_path(state: &McpState, task_id: &str) -> PathBuf {
+    packet_task_root(state, task_id)
+        .join("active")
+        .join("authority.json")
+}
+
+fn active_packet_latest_path(state: &McpState, task_id: &str) -> PathBuf {
+    packet_task_root(state, task_id)
+        .join("active")
+        .join("latest.json")
+}
+
+fn read_active_packet_authority(
+    state: &McpState,
+    task_id: &str,
+) -> Result<Option<ActivePacketAuthority>> {
+    let path = active_packet_authority_path(state, task_id);
+    if !path.is_file() {
+        return Ok(None);
+    }
+    let authority: ActivePacketAuthority = serde_json::from_reader(std::fs::File::open(&path)?)?;
+    anyhow::ensure!(
+        authority.schema_version == PACKET_ACTIVE_AUTHORITY_SCHEMA_VERSION,
+        "unsupported active packet authority schema at {}",
+        path.display()
+    );
+    anyhow::ensure!(
+        canonical_struct_hash(&authority.response)? == authority.response_hash_blake3,
+        "active packet authority response hash mismatch at {}",
+        path.display()
+    );
+    let response_packet: ContextPacketL3 = serde_json::from_value(authority.response.clone())
+        .with_context(|| {
+            format!(
+                "active packet authority response does not contain a ContextPacketL3 at {}",
+                path.display()
+            )
+        })?;
+    anyhow::ensure!(
+        canonical_struct_hash(&response_packet)? == canonical_struct_hash(&authority.packet)?,
+        "active packet authority packet/response mismatch at {}",
+        path.display()
+    );
+    validate_packet_commit_material(&authority.material)?;
+    anyhow::ensure!(
+        task_id == authority.material.task_id
+            && task_id == authority.packet.task_id
+            && authority.packet.project_id == authority.material.project_id
+            && authority.packet.task_id == authority.material.task_id
+            && authority.packet.packet_id == authority.material.packet_id
+            && authority.packet.at_revision == authority.material.at_revision,
+        "active packet authority packet binding mismatch at {}",
+        path.display()
+    );
+    anyhow::ensure!(
+        packet_post_commit_operation_id(&authority.material)? == authority.operation_id,
+        "active packet authority operation identity mismatch at {}",
+        path.display()
+    );
+    Ok(Some(authority))
+}
+
+fn active_packet_fingerprint(state: &McpState, task_id: &str) -> Result<Option<String>> {
+    if let Some(authority) = read_active_packet_authority(state, task_id)? {
+        return Ok(Some(format!("authority:{}", authority.operation_id)));
+    }
+    let latest = active_packet_latest_path(state, task_id);
+    if !latest.is_file() {
+        return Ok(None);
+    }
+    // A legacy response projection has no canonical operation authority. Its
+    // existence remains a fence, but its inspection bytes never become one.
+    Ok(Some("legacy-latest:present".to_owned()))
+}
+
+async fn ensure_packet_commit_fence(
+    state: &McpState,
+    parsed_task_id: Option<TaskId>,
+    task_id: &str,
+    expected: &TaskPacketCommitFence,
+) -> Result<()> {
+    let current_task = if let Some(task_id) = parsed_task_id {
+        state.store.task_contract_by_id(task_id).await?
+    } else {
+        None
+    };
+    let current_task_hash = canonical_struct_hash(&current_task)?;
+    anyhow::ensure!(
+        current_task_hash == expected.task_contract_hash,
+        "PACKET_COMMIT_CONFLICT: TaskContract changed while the packet was compiled"
+    );
+    anyhow::ensure!(
+        active_packet_fingerprint(state, task_id)? == expected.previous_active_fingerprint,
+        "PACKET_COMMIT_CONFLICT: previous active packet changed while the packet was compiled"
+    );
+    Ok(())
+}
+
+fn codecortex_projection_hash(report: &CodeCortexReport) -> Result<String> {
+    let mut value = serde_json::to_value(report)?;
+    let object = value
+        .as_object_mut()
+        .context("CodeCortex projection must serialize as an object")?;
+    for ephemeral_field in ["generated_at", "repo_root", "memory_receipt"] {
+        object.remove(ephemeral_field);
+    }
+    canonical_struct_hash(&value)
+}
+
+fn packet_post_commit_effect_plan(material: &PacketCommitMaterial) -> Vec<PacketPostCommitEffect> {
+    let mut effects = Vec::with_capacity(4);
+    if material.codecortex_projection_hash.is_some() {
+        effects.push(PacketPostCommitEffect::CodecortexProjection);
+    }
+    if !material.prediction_intents.is_empty() {
+        effects.push(PacketPostCommitEffect::PredictionCapture);
+    }
+    if material.measurement.is_some() {
+        effects.push(PacketPostCommitEffect::ExperimentMeasurement);
+    }
+    // The gate effect also deletes stale per-session state when the payload is
+    // absent, so it is always part of the ordered effect plan.
+    effects.push(PacketPostCommitEffect::GateProjection);
+    effects
+}
+
+fn validate_packet_commit_material(material: &PacketCommitMaterial) -> Result<()> {
+    anyhow::ensure!(
+        material.operation_kind == PACKET_POST_COMMIT_OPERATION_KIND,
+        "unsupported packet post-commit operation kind"
+    );
+    anyhow::ensure!(
+        material.schema_version == PACKET_POST_COMMIT_SCHEMA_VERSION,
+        "unsupported packet post-commit schema"
+    );
+    anyhow::ensure!(
+        material.effects == packet_post_commit_effect_plan(material),
+        "packet post-commit ordered effect plan mismatch"
+    );
+    Ok(())
+}
+
+fn packet_post_commit_operation_id(material: &PacketCommitMaterial) -> Result<String> {
+    validate_packet_commit_material(material)?;
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(PACKET_POST_COMMIT_OPERATION_KIND.as_bytes());
+    hasher.update(&[0]);
+    hasher.update(PACKET_POST_COMMIT_SCHEMA_VERSION.as_bytes());
+    hasher.update(&[0]);
+    hasher.update(&serde_json::to_vec(material)?);
+    Ok(hasher.finalize().to_hex().to_string())
+}
+
+fn packet_revision_archive_path(
+    state: &McpState,
+    task_id: &str,
+    at_revision: MemoryRevision,
+    operation_id: &str,
+) -> PathBuf {
+    packet_task_root(state, task_id)
+        .join("active")
+        .join("revisions")
+        .join(format!("{}-{operation_id}.json", at_revision.value()))
+}
+
+/// Atomically advances the active authority pointer. `latest.json` and the
+/// immutable revision archive are projections of that authority and can be
+/// repaired by the bounded outbox replayer.
+fn commit_active_context_packet(
+    state: &McpState,
+    intent: &PacketPostCommitIntent,
+) -> Result<Vec<String>> {
+    let packet = validate_packet_post_commit_intent(intent)?;
+    let authority = ActivePacketAuthority {
+        schema_version: PACKET_ACTIVE_AUTHORITY_SCHEMA_VERSION.to_owned(),
+        operation_id: intent.operation_id.clone(),
+        material: intent.material.clone(),
+        packet: packet.clone(),
+        response_hash_blake3: intent.response_hash_blake3.clone(),
+        response: intent.response.clone(),
+    };
+    atomic_write_json_create_or_replace(
+        &active_packet_authority_path(state, &packet.task_id),
+        &authority,
+    )?;
+    let mut errors = Vec::new();
+    if let Err(error) = atomic_write_json_create_or_replace(
+        &active_packet_latest_path(state, &packet.task_id),
+        &intent.response,
+    ) {
+        errors.push(format!("active_latest_projection: {error:#}"));
+    }
+    if let Err(error) = persist_immutable_json_path(
+        &packet_revision_archive_path(
+            state,
+            &packet.task_id,
+            packet.at_revision,
+            &intent.operation_id,
+        ),
+        &intent.response,
+    ) {
+        errors.push(format!("active_revision_archive: {error:#}"));
+    }
+    Ok(errors)
+}
+
+fn packet_post_commit_outbox_path(state: &McpState, task_id: &str, operation_id: &str) -> PathBuf {
+    packet_task_root(state, task_id)
+        .join("outbox")
+        .join(operation_id)
+}
+
+fn packet_post_commit_intent_path(outbox_root: &Path) -> PathBuf {
+    outbox_root.join("intent.json")
+}
+
+fn packet_post_commit_events_root(outbox_root: &Path) -> PathBuf {
+    outbox_root.join("events")
+}
+
+fn stage_packet_post_commit_outbox(
+    state: &McpState,
+    intent: &PacketPostCommitIntent,
+) -> Result<(PathBuf, PacketPostCommitIntent, PacketPostCommitEvent)> {
+    let outbox_root =
+        packet_post_commit_outbox_path(state, &intent.material.task_id, &intent.operation_id);
+    let (stored, current) = stage_packet_post_commit_outbox_at_root(&outbox_root, intent)?;
+    Ok((outbox_root, stored, current))
+}
+
+fn stage_packet_post_commit_outbox_at_root(
+    outbox_root: &Path,
+    intent: &PacketPostCommitIntent,
+) -> Result<(PacketPostCommitIntent, PacketPostCommitEvent)> {
+    validate_packet_post_commit_intent(intent)?;
+    let intent_path = packet_post_commit_intent_path(outbox_root);
+    if !intent_path.is_file() {
+        // A concurrent equivalent request may win immutable publication with
+        // different provenance. Once a file exists, its validated canonical
+        // material is authoritative and every caller drives that stored intent.
+        if let Err(error) = persist_immutable_json_path(&intent_path, intent)
+            && !intent_path.is_file()
+        {
+            return Err(error);
+        }
+    }
+    let stored: PacketPostCommitIntent =
+        serde_json::from_reader(std::fs::File::open(&intent_path)?)?;
+    validate_packet_post_commit_intent(&stored)?;
+    anyhow::ensure!(
+        stored.operation_id == intent.operation_id
+            && serde_json::to_vec(&stored.material)? == serde_json::to_vec(&intent.material)?,
+        "PACKET_COMMIT_IDEMPOTENCY_MISMATCH: immutable packet intent differs at {}",
+        intent_path.display()
+    );
+    let current = if let Some(current) = latest_packet_post_commit_event(outbox_root, &stored)? {
+        current
+    } else {
+        append_packet_post_commit_event(
+            outbox_root,
+            &stored,
+            PacketPostCommitStatus::Prepared,
+            &[],
+        )?
+    };
+    Ok((stored, current))
+}
+
+fn validate_packet_post_commit_intent(intent: &PacketPostCommitIntent) -> Result<ContextPacketL3> {
+    validate_packet_commit_material(&intent.material)?;
+    anyhow::ensure!(
+        canonical_struct_hash(&intent.response)? == intent.response_hash_blake3,
+        "packet post-commit response hash mismatch"
+    );
+    let packet: ContextPacketL3 = serde_json::from_value(intent.response.clone())
+        .context("packet post-commit response does not contain a ContextPacketL3")?;
+    anyhow::ensure!(
+        packet.project_id == intent.material.project_id
+            && packet.task_id == intent.material.task_id
+            && packet.packet_id == intent.material.packet_id
+            && packet.at_revision == intent.material.at_revision,
+        "packet post-commit response does not match canonical packet material"
+    );
+    let codecortex_projection_hash = intent
+        .codecortex_projection
+        .as_ref()
+        .map(codecortex_projection_hash)
+        .transpose()?;
+    anyhow::ensure!(
+        codecortex_projection_hash == intent.material.codecortex_projection_hash,
+        "packet post-commit CodeCortex projection hash mismatch"
+    );
+    anyhow::ensure!(
+        packet_post_commit_operation_id(&intent.material)? == intent.operation_id,
+        "packet post-commit operation identity mismatch"
+    );
+    Ok(packet)
+}
+
+fn latest_packet_post_commit_event(
+    outbox_root: &Path,
+    intent: &PacketPostCommitIntent,
+) -> Result<Option<PacketPostCommitEvent>> {
+    let events_root = packet_post_commit_events_root(outbox_root);
+    if !events_root.is_dir() {
+        return Ok(None);
+    }
+    let mut latest = None::<PacketPostCommitEvent>;
+    for entry in std::fs::read_dir(events_root)? {
+        let entry = entry?;
+        if !entry.path().is_file()
+            || entry.path().extension().and_then(|value| value.to_str()) != Some("json")
+        {
+            continue;
+        }
+        let event: PacketPostCommitEvent =
+            serde_json::from_reader(std::fs::File::open(entry.path())?)?;
+        anyhow::ensure!(
+            event.schema_version == PACKET_POST_COMMIT_SCHEMA_VERSION
+                && event.operation_id == intent.operation_id,
+            "packet outbox event identity mismatch"
+        );
+        let replace = latest.as_ref().is_none_or(|current| {
+            (
+                event.sequence,
+                event.recorded_at,
+                event.event_id.to_string(),
+            ) > (
+                current.sequence,
+                current.recorded_at,
+                current.event_id.to_string(),
+            )
+        });
+        if replace {
+            latest = Some(event);
+        }
+    }
+    Ok(latest)
+}
+
+fn append_packet_post_commit_event(
+    outbox_root: &Path,
+    intent: &PacketPostCommitIntent,
+    status: PacketPostCommitStatus,
+    errors: &[String],
+) -> Result<PacketPostCommitEvent> {
+    let sequence = latest_packet_post_commit_event(outbox_root, intent)?
+        .map_or(0, |event| event.sequence.saturating_add(1));
+    let event = PacketPostCommitEvent {
+        schema_version: PACKET_POST_COMMIT_SCHEMA_VERSION.to_owned(),
+        event_id: WriteId::new_v7(),
+        operation_id: intent.operation_id.clone(),
+        request_session_id: intent.provenance.request_session_id,
+        sequence,
+        status,
+        errors: errors.to_vec(),
+        recorded_at: time::OffsetDateTime::now_utc(),
+    };
+    persist_immutable_json_path(
+        &packet_post_commit_events_root(outbox_root).join(format!("{}.json", event.event_id)),
+        &event,
+    )?;
+    Ok(event)
+}
+
+fn transition_packet_post_commit_outbox(
+    outbox_root: &Path,
+    expected: &PacketPostCommitIntent,
+    next_status: PacketPostCommitStatus,
+    errors: &[String],
+) -> Result<()> {
+    let current_intent: PacketPostCommitIntent = serde_json::from_reader(std::fs::File::open(
+        packet_post_commit_intent_path(outbox_root),
+    )?)?;
+    let current = latest_packet_post_commit_event(outbox_root, &current_intent)?
+        .context("packet outbox has no prepared event")?;
+    validate_packet_post_commit_intent(&current_intent)?;
+    anyhow::ensure!(
+        current_intent.operation_id == expected.operation_id
+            && serde_json::to_vec(&current_intent.material)?
+                == serde_json::to_vec(&expected.material)?,
+        "PACKET_COMMIT_IDEMPOTENCY_MISMATCH: packet outbox transition differs at {}",
+        outbox_root.display()
+    );
+    if current.status == PacketPostCommitStatus::Complete {
+        return Ok(());
+    }
+    let allowed = matches!(
+        (current.status, next_status),
+        (
+            PacketPostCommitStatus::Prepared | PacketPostCommitStatus::PendingRetry,
+            PacketPostCommitStatus::CommittedPending
+        ) | (
+            PacketPostCommitStatus::CommittedPending,
+            PacketPostCommitStatus::Complete | PacketPostCommitStatus::PendingRetry
+        ) | (
+            PacketPostCommitStatus::PendingRetry,
+            PacketPostCommitStatus::PendingRetry
+        )
+    ) || current.status == next_status;
+    anyhow::ensure!(allowed, "invalid packet outbox status transition");
+    append_packet_post_commit_event(outbox_root, &current_intent, next_status, errors)?;
+    Ok(())
+}
+
+fn finish_packet_post_commit_outbox(
+    outbox_root: &Path,
+    staged: &PacketPostCommitIntent,
+    errors: &[String],
+) -> Result<()> {
+    transition_packet_post_commit_outbox(
+        outbox_root,
+        staged,
+        if errors.is_empty() {
+            PacketPostCommitStatus::Complete
+        } else {
+            PacketPostCommitStatus::PendingRetry
+        },
+        errors,
     )
+}
+
+fn packet_post_commit_intent_is_active(
+    state: &McpState,
+    intent: &PacketPostCommitIntent,
+) -> Result<bool> {
+    let Some(authority) = read_active_packet_authority(state, &intent.material.task_id)? else {
+        return Ok(false);
+    };
+    Ok(packet_post_commit_authority_identity_matches(
+        &authority.operation_id,
+        authority.material.effect_session_id,
+        &authority.packet.packet_id,
+        intent,
+    ))
+}
+
+fn packet_post_commit_authority_identity_matches(
+    operation_id: &str,
+    session_id: SessionId,
+    packet_id: &str,
+    intent: &PacketPostCommitIntent,
+) -> bool {
+    operation_id == intent.operation_id
+        && session_id == intent.material.effect_session_id
+        && packet_id == intent.material.packet_id
+}
+
+fn completed_packet_post_commit_replay_is_idempotent(
+    status: PacketPostCommitStatus,
+    active_authority_matches: bool,
+    operation_id: &str,
+) -> Result<bool> {
+    if status != PacketPostCommitStatus::Complete {
+        return Ok(false);
+    }
+    anyhow::ensure!(
+        active_authority_matches,
+        "PACKET_POST_COMMIT_SUPERSEDED: completed operation {operation_id} is no longer the active packet authority"
+    );
+    Ok(true)
+}
+
+fn ensure_packet_post_commit_intent_is_active(
+    state: &McpState,
+    intent: &PacketPostCommitIntent,
+) -> Result<()> {
+    anyhow::ensure!(
+        packet_post_commit_intent_is_active(state, intent)?,
+        "PACKET_POST_COMMIT_SUPERSEDED: operation {} is no longer the active packet authority",
+        intent.operation_id
+    );
+    Ok(())
+}
+
+async fn apply_packet_post_commit_intent(
+    state: &McpState,
+    intent: &PacketPostCommitIntent,
+) -> Vec<String> {
+    let mut errors = Vec::new();
+    let parsed_task_id = TaskId::from_str(&intent.material.task_id).ok();
+    for effect in &intent.material.effects {
+        match effect {
+            PacketPostCommitEffect::CodecortexProjection => {
+                if let Some(report) = intent.codecortex_projection.as_ref() {
+                    let mut pending = Some(report.clone());
+                    if let Err(error) = persist_pending_codecortex_projection(state, &mut pending) {
+                        errors.push(format!("codecortex_projection: {error:#}"));
+                    }
+                } else {
+                    errors.push("codecortex_projection: canonical payload is absent".to_owned());
+                }
+            }
+            PacketPostCommitEffect::PredictionCapture => {
+                if let Some(task_id) = parsed_task_id {
+                    for prediction in &intent.material.prediction_intents {
+                        if let Err(error) = state
+                            .ul
+                            .prediction
+                            .capture_packet_intent(
+                                intent.material.project_id,
+                                task_id,
+                                intent.material.effect_session_id,
+                                &intent.material.packet_id,
+                                prediction,
+                            )
+                            .await
+                        {
+                            errors.push(format!(
+                                "prediction_projection {}: {error}",
+                                prediction.prediction_ref
+                            ));
+                        }
+                    }
+                } else {
+                    errors.push("prediction_projection: task_id is not canonical".to_owned());
+                }
+            }
+            PacketPostCommitEffect::ExperimentMeasurement => {
+                if let Some(assignment) = intent.material.measurement.as_ref() {
+                    match state
+                        .store
+                        .upsert_ul_experiment_assignment_explicit(
+                            assignment.project_id,
+                            assignment.task_id,
+                            &assignment.task_class,
+                            assignment.arm,
+                            assignment.injection_mode,
+                            &assignment.config_hash,
+                        )
+                        .await
+                    {
+                        Ok(persisted) if persisted == *assignment => {}
+                        Ok(persisted) => errors.push(format!(
+                            "experiment_measurement: explicit assignment mismatch: expected={assignment:?}, persisted={persisted:?}"
+                        )),
+                        Err(error) => {
+                            errors.push(format!("experiment_measurement: {error}"));
+                        }
+                    }
+                } else {
+                    errors.push("experiment_measurement: canonical payload is absent".to_owned());
+                }
+            }
+            PacketPostCommitEffect::GateProjection => {
+                if let Err(error) = state.ul.record_packet_gate(
+                    intent.material.project_id,
+                    intent.material.effect_session_id,
+                    parsed_task_id,
+                    intent.material.gate_projection.as_ref(),
+                ) {
+                    errors.push(format!("gate_projection: {error:#}"));
+                }
+            }
+        }
+    }
+    errors
+}
+
+fn repair_active_packet_projections(
+    state: &McpState,
+    intent: &PacketPostCommitIntent,
+) -> Vec<String> {
+    let mut errors = Vec::new();
+    if let Err(error) = atomic_write_json_create_or_replace(
+        &active_packet_latest_path(state, &intent.material.task_id),
+        &intent.response,
+    ) {
+        errors.push(format!("active_latest_projection: {error:#}"));
+    }
+    if let Err(error) = persist_immutable_json_path(
+        &packet_revision_archive_path(
+            state,
+            &intent.material.task_id,
+            intent.material.at_revision,
+            &intent.operation_id,
+        ),
+        &intent.response,
+    ) {
+        errors.push(format!("active_revision_archive: {error:#}"));
+    }
+    errors
+}
+
+async fn replay_packet_post_commit_outbox_for_task(
+    state: &McpState,
+    task_id: &str,
+    require_completion: bool,
+) -> Result<bool> {
+    let Some(authority) = read_active_packet_authority(state, task_id)? else {
+        return Ok(false);
+    };
+    let outbox_root = packet_post_commit_outbox_path(state, task_id, &authority.operation_id);
+    let intent_path = packet_post_commit_intent_path(&outbox_root);
+    if !intent_path.is_file() {
+        return Ok(false);
+    }
+    let intent: PacketPostCommitIntent =
+        serde_json::from_reader(std::fs::File::open(intent_path)?)?;
+    validate_packet_post_commit_intent(&intent)?;
+    let Some(current) = latest_packet_post_commit_event(&outbox_root, &intent)? else {
+        return Ok(false);
+    };
+    if current.status == PacketPostCommitStatus::Complete
+        || !packet_post_commit_intent_is_active(state, &intent)?
+    {
+        return Ok(false);
+    }
+    transition_packet_post_commit_outbox(
+        &outbox_root,
+        &intent,
+        PacketPostCommitStatus::CommittedPending,
+        &[],
+    )?;
+    ensure_packet_post_commit_intent_is_active(state, &intent)?;
+    let mut errors = repair_active_packet_projections(state, &intent);
+    errors.extend(apply_packet_post_commit_intent(state, &intent).await);
+    finish_packet_post_commit_outbox(&outbox_root, &intent, &errors)?;
+    if require_completion && !errors.is_empty() {
+        anyhow::bail!(
+            "PACKET_POST_COMMIT_REPLAY_PENDING: active operation {} remains incomplete: {}",
+            intent.operation_id,
+            errors.join("; ")
+        );
+    }
+    Ok(true)
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod packet_commit_unit_tests {
+    use super::*;
+
+    fn packet_response(
+        project_id: ProjectId,
+        task_id: TaskId,
+        packet_id: &str,
+        at_revision: MemoryRevision,
+        additions: Value,
+    ) -> Value {
+        let mut response = json!({
+            "packet_id": packet_id,
+            "project_id": project_id,
+            "task_id": task_id,
+            "goal": "unit packet commit",
+            "at_revision": at_revision,
+            "current_truth": [],
+            "relevant_verified_claims": [],
+            "relevant_supported_claims": [],
+            "weak_claims_warning": [],
+            "negative_memory": [],
+            "recent_failures": [],
+            "known_decisions": [],
+            "open_questions": [],
+            "exact_handles": [],
+            "source_receipts": [],
+            "token_budget_report": {
+                "max_tokens": 512,
+                "estimated_tokens": 64,
+                "truncated": false,
+                "sections_truncated": []
+            },
+            "truncation": {
+                "truncated": false,
+                "limit": 512,
+                "returned": 1
+            }
+        });
+        if let (Value::Object(response), Value::Object(additions)) = (&mut response, additions) {
+            response.extend(additions);
+        }
+        response["packet_id"] = json!(packet_id);
+        response["project_id"] = json!(project_id);
+        response["task_id"] = json!(task_id);
+        response["at_revision"] = json!(at_revision);
+        response
+    }
+
+    fn outbox_intent(session_id: SessionId, additions: Value) -> PacketPostCommitIntent {
+        let project_id = ProjectId::new_v7();
+        let task_id = TaskId::new_v7();
+        let packet_id = "eliot/packet/unit";
+        let at_revision = MemoryRevision::new(7);
+        let response = packet_response(project_id, task_id, packet_id, at_revision, additions);
+        let response_hash_blake3 = canonical_struct_hash(&response).expect("hash response");
+        let mut material = PacketCommitMaterial {
+            operation_kind: PACKET_POST_COMMIT_OPERATION_KIND.to_owned(),
+            schema_version: PACKET_POST_COMMIT_SCHEMA_VERSION.to_owned(),
+            project_id,
+            task_id: task_id.to_string(),
+            effect_session_id: session_id,
+            packet_id: packet_id.to_owned(),
+            at_revision,
+            codecortex_projection_hash: None,
+            prediction_intents: Vec::new(),
+            measurement: None,
+            gate_projection: None,
+            effects: Vec::new(),
+        };
+        material.effects = packet_post_commit_effect_plan(&material);
+        PacketPostCommitIntent {
+            operation_id: packet_post_commit_operation_id(&material).expect("hash material"),
+            material,
+            provenance: PacketCommitProvenance {
+                request_session_id: session_id,
+                prepared_at: time::OffsetDateTime::UNIX_EPOCH,
+            },
+            response_hash_blake3,
+            response,
+            codecortex_projection: None,
+        }
+    }
+
+    fn refresh_operation_id(intent: &mut PacketPostCommitIntent) {
+        intent.material.effects = packet_post_commit_effect_plan(&intent.material);
+        intent.operation_id =
+            packet_post_commit_operation_id(&intent.material).expect("hash material");
+    }
+
+    fn prediction_intent() -> eliot_engine::PacketPredictionIntent {
+        eliot_engine::PacketPredictionIntent {
+            prediction_ref: "prediction/unit".to_owned(),
+            prediction: eliot_types::UlPrediction::VerifierVerdict {
+                verifier: "cargo test -p eliot-app packet_commit_unit_tests".to_owned(),
+                expected: eliot_types::PredictionExpectation::Pass,
+            },
+            confidence: Some(eliot_types::PredictionConfidence::High),
+            subsystem_concept_id: Some("concept/packet-commit".to_owned()),
+            source_frame_hash: "frame-hash".to_owned(),
+        }
+    }
+
+    fn measurement(material: &PacketCommitMaterial) -> eliot_types::UlTaskExperimentAssignment {
+        eliot_types::UlTaskExperimentAssignment {
+            project_id: material.project_id,
+            task_id: TaskId::from_str(&material.task_id).expect("canonical task id"),
+            task_class: eliot_types::UlTaskClass {
+                action_class: "compile".to_owned(),
+                subsystem: "packet-commit".to_owned(),
+                artifact_class: "context-packet".to_owned(),
+            },
+            ordinal: 0,
+            arm: eliot_types::UlExperimentArm::Treatment,
+            injection_mode: eliot_types::UlInjectionMode::Payload,
+            config_hash: "config-hash".to_owned(),
+        }
+    }
+
+    fn codecortex_report(generated_at: time::OffsetDateTime) -> CodeCortexReport {
+        CodeCortexReport {
+            project: "eliot-memory-os".to_owned(),
+            task: "packet-commit".to_owned(),
+            goal: "bind the post-commit intent".to_owned(),
+            generated_at,
+            repo_root: "C:/repo".to_owned(),
+            git_head: Some("deadbeef".to_owned()),
+            dirty: false,
+            scope_binding: eliot_types::CodeCortexScopeBinding::default(),
+            tracked_files: Vec::new(),
+            workspace_members: Vec::new(),
+            crates: vec!["eliot-app".to_owned()],
+            targets: Vec::new(),
+            file_evidence: Vec::new(),
+            symbol_evidence: Vec::new(),
+            diagnostic_evidence: Vec::new(),
+            verifier_evidence: Vec::new(),
+            blast_radius: eliot_types::BlastRadiusView {
+                files: Vec::new(),
+                crates: vec!["eliot-app".to_owned()],
+                reasons: vec!["unit fixture".to_owned()],
+            },
+            invariant_cards: Vec::new(),
+            evidence_sources: Vec::new(),
+            adapter_notes: Vec::new(),
+            memory_receipt: None,
+            operation_status: OperationStatus::OperationCompleted,
+        }
+    }
+
+    #[test]
+    fn packet_operation_identity_binds_effect_session_but_not_provenance() {
+        let original = outbox_intent(SessionId::new_v7(), json!({"packet": "same"}));
+        let mut effect_session_changed = original.clone();
+        effect_session_changed.material.effect_session_id = SessionId::new_v7();
+        refresh_operation_id(&mut effect_session_changed);
+        assert_ne!(original.operation_id, effect_session_changed.operation_id);
+
+        let mut provenance_changed = original.clone();
+        provenance_changed.provenance.request_session_id = SessionId::new_v7();
+        provenance_changed.provenance.prepared_at =
+            time::OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(1);
+        assert_eq!(original.operation_id, provenance_changed.operation_id);
+        validate_packet_post_commit_intent(&provenance_changed)
+            .expect("provenance is outside canonical identity");
+
+        let mut response_changed = original.clone();
+        response_changed.response["inspection_only"] = json!("different bytes");
+        response_changed.response_hash_blake3 =
+            canonical_struct_hash(&response_changed.response).expect("hash changed response");
+        assert_ne!(
+            original.response_hash_blake3,
+            response_changed.response_hash_blake3
+        );
+        assert_eq!(original.operation_id, response_changed.operation_id);
+        validate_packet_post_commit_intent(&response_changed)
+            .expect("response inspection bytes are outside canonical identity");
+    }
+
+    #[test]
+    fn codecortex_identity_excludes_ephemera_but_binds_semantics() {
+        let report = codecortex_report(time::OffsetDateTime::UNIX_EPOCH);
+        let report_hash = codecortex_projection_hash(&report).expect("hash CodeCortex report");
+        let mut original = outbox_intent(SessionId::new_v7(), json!({}));
+        original.material.codecortex_projection_hash = Some(report_hash.clone());
+        original.codecortex_projection = Some(report.clone());
+        refresh_operation_id(&mut original);
+
+        let mut ephemeral = report.clone();
+        ephemeral.generated_at = time::OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(30);
+        ephemeral.repo_root = "D:/different-checkout".to_owned();
+        ephemeral.memory_receipt = Some(WriteReceiptRef {
+            receipt_id: ReceiptId::new_v7(),
+            write_id: WriteId::new_v7(),
+        });
+        assert_eq!(
+            codecortex_projection_hash(&ephemeral).expect("hash ephemeral variant"),
+            report_hash
+        );
+        let mut ephemeral_intent = original.clone();
+        ephemeral_intent.codecortex_projection = Some(ephemeral);
+        assert_eq!(ephemeral_intent.operation_id, original.operation_id);
+        validate_packet_post_commit_intent(&ephemeral_intent)
+            .expect("all prohibited CodeCortex ephemera are outside identity");
+
+        let mut semantic = report;
+        semantic.scope_binding.dirty_state_hash = "semantic-change".to_owned();
+        let semantic_hash = codecortex_projection_hash(&semantic).expect("hash semantic variant");
+        assert_ne!(semantic_hash, report_hash);
+        let mut semantic_intent = original.clone();
+        semantic_intent.material.codecortex_projection_hash = Some(semantic_hash);
+        semantic_intent.codecortex_projection = Some(semantic);
+        refresh_operation_id(&mut semantic_intent);
+        assert_ne!(semantic_intent.operation_id, original.operation_id);
+        validate_packet_post_commit_intent(&semantic_intent)
+            .expect("semantic CodeCortex content remains bound");
+    }
+
+    #[test]
+    fn packet_operation_identity_binds_every_effect_material_class() {
+        let original = outbox_intent(SessionId::new_v7(), json!({"packet": "same"}));
+
+        let mut codecortex = original.clone();
+        codecortex.material.codecortex_projection_hash = Some("codecortex-hash".to_owned());
+        refresh_operation_id(&mut codecortex);
+
+        let mut prediction = original.clone();
+        prediction
+            .material
+            .prediction_intents
+            .push(prediction_intent());
+        refresh_operation_id(&mut prediction);
+
+        let mut experiment = original.clone();
+        experiment.material.measurement = Some(measurement(&experiment.material));
+        refresh_operation_id(&mut experiment);
+
+        let mut gate = original.clone();
+        gate.material.gate_projection = Some(json!({"status": "allowed"}));
+        refresh_operation_id(&mut gate);
+
+        for changed in [&codecortex, &prediction, &experiment, &gate] {
+            assert_ne!(original.operation_id, changed.operation_id);
+        }
+    }
+
+    #[test]
+    fn packet_material_contains_no_provenance_ephemera() {
+        let intent = outbox_intent(SessionId::new_v7(), json!({"packet": "same"}));
+        let keys = serde_json::to_value(&intent.material)
+            .expect("serialize material")
+            .as_object()
+            .expect("material object")
+            .keys()
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            keys,
+            BTreeSet::from([
+                "at_revision".to_owned(),
+                "codecortex_projection_hash".to_owned(),
+                "effect_session_id".to_owned(),
+                "effects".to_owned(),
+                "gate_projection".to_owned(),
+                "measurement".to_owned(),
+                "operation_kind".to_owned(),
+                "packet_id".to_owned(),
+                "prediction_intents".to_owned(),
+                "project_id".to_owned(),
+                "schema_version".to_owned(),
+                "task_id".to_owned(),
+            ])
+        );
+        assert!(!keys.contains("response_hash_blake3"));
+        assert!(!keys.contains("request_session_id"));
+        assert!(!keys.contains("prepared_at"));
+        assert!(!keys.contains("generated_at"));
+    }
+
+    #[test]
+    fn packet_effect_plan_is_ordered_and_validated() {
+        let mut intent = outbox_intent(SessionId::new_v7(), json!({"packet": "same"}));
+        intent.material.codecortex_projection_hash = Some("codecortex-hash".to_owned());
+        intent.material.prediction_intents.push(prediction_intent());
+        intent.material.measurement = Some(measurement(&intent.material));
+        refresh_operation_id(&mut intent);
+        assert_eq!(
+            intent.material.effects,
+            vec![
+                PacketPostCommitEffect::CodecortexProjection,
+                PacketPostCommitEffect::PredictionCapture,
+                PacketPostCommitEffect::ExperimentMeasurement,
+                PacketPostCommitEffect::GateProjection,
+            ]
+        );
+        intent.material.effects.swap(0, 1);
+        assert!(validate_packet_commit_material(&intent.material).is_err());
+        assert!(packet_post_commit_operation_id(&intent.material).is_err());
+    }
+
+    #[test]
+    fn packet_active_identity_guard_rejects_superseded_intent() {
+        let stale = outbox_intent(SessionId::new_v7(), json!({"packet": "stale"}));
+        let replacement = outbox_intent(SessionId::new_v7(), json!({"packet": "replacement"}));
+        assert!(packet_post_commit_authority_identity_matches(
+            &stale.operation_id,
+            stale.material.effect_session_id,
+            &stale.material.packet_id,
+            &stale,
+        ));
+        assert!(!packet_post_commit_authority_identity_matches(
+            &replacement.operation_id,
+            replacement.material.effect_session_id,
+            &replacement.material.packet_id,
+            &stale,
+        ));
+    }
+
+    #[test]
+    fn completed_packet_cannot_reactivate_after_a_new_authority_supersedes_it() {
+        assert!(
+            completed_packet_post_commit_replay_is_idempotent(
+                PacketPostCommitStatus::Complete,
+                true,
+                "operation-a",
+            )
+            .expect("the still-active terminal operation is an exact no-op")
+        );
+        let superseded = completed_packet_post_commit_replay_is_idempotent(
+            PacketPostCommitStatus::Complete,
+            false,
+            "operation-a",
+        )
+        .expect_err("completed A must not reactivate after B becomes active");
+        assert!(
+            format!("{superseded:#}").contains("PACKET_POST_COMMIT_SUPERSEDED"),
+            "unexpected terminal replay error: {superseded:#}"
+        );
+        assert!(
+            !completed_packet_post_commit_replay_is_idempotent(
+                PacketPostCommitStatus::PendingRetry,
+                false,
+                "operation-a",
+            )
+            .expect("nonterminal operations continue through commit")
+        );
+    }
+
+    #[test]
+    fn immutable_packet_publication_never_clobbers_concurrent_winner() {
+        let fixture_root =
+            std::env::temp_dir().join(format!("eliot-packet-immutable-race-{}", WriteId::new_v7()));
+        let destination = fixture_root.join("winner.json");
+        let barrier = Arc::new(std::sync::Barrier::new(3));
+        let handles = [b"first-writer".to_vec(), b"second-writer".to_vec()].map(|bytes| {
+            let destination = destination.clone();
+            let barrier = Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                barrier.wait();
+                let result = persist_immutable_bytes(&destination, &bytes);
+                (bytes, result)
+            })
+        });
+        barrier.wait();
+        let outcomes = handles.map(|handle| handle.join().expect("immutable writer joined"));
+        let winner = outcomes
+            .iter()
+            .find_map(|(bytes, result)| result.is_ok().then_some(bytes.clone()))
+            .expect("one immutable writer must publish");
+        let loser = outcomes
+            .iter()
+            .find_map(|(bytes, result)| result.is_err().then_some(bytes.clone()))
+            .expect("distinct concurrent bytes must collide");
+        assert_eq!(
+            outcomes.iter().filter(|(_, result)| result.is_ok()).count(),
+            1
+        );
+        assert_eq!(std::fs::read(&destination).expect("read winner"), winner);
+        assert!(persist_immutable_bytes(&destination, &loser).is_err());
+        assert_eq!(
+            std::fs::read(&destination).expect("reread immutable winner"),
+            winner
+        );
+        assert!(
+            std::fs::read_dir(&fixture_root)
+                .expect("read immutable fixture")
+                .all(|entry| !entry
+                    .expect("read fixture entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .ends_with(".tmp")),
+            "immutable publication must remove every temporary file"
+        );
+        std::fs::remove_dir_all(fixture_root).expect("remove immutable fixture");
+    }
+
+    #[test]
+    fn packet_outbox_replay_drives_the_original_stored_intent() {
+        let mut original = outbox_intent(SessionId::new_v7(), json!({"packet": "unit"}));
+        let original_report = codecortex_report(time::OffsetDateTime::UNIX_EPOCH);
+        original.material.codecortex_projection_hash =
+            Some(codecortex_projection_hash(&original_report).expect("hash CodeCortex projection"));
+        original.codecortex_projection = Some(original_report);
+        refresh_operation_id(&mut original);
+
+        let mut replay = original.clone();
+        replay.provenance.request_session_id = SessionId::new_v7();
+        replay.provenance.prepared_at =
+            time::OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(1);
+        replay
+            .codecortex_projection
+            .as_mut()
+            .expect("CodeCortex projection")
+            .generated_at = time::OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(2);
+        replay.response["inspection_only"] = json!({"request": "later"});
+        replay.response_hash_blake3 =
+            canonical_struct_hash(&replay.response).expect("hash replay response");
+        assert_ne!(original.response_hash_blake3, replay.response_hash_blake3);
+        assert_eq!(original.operation_id, replay.operation_id);
+        validate_packet_post_commit_intent(&replay)
+            .expect("response inspection bytes and CodeCortex ephemera are outside identity");
+
+        let outbox_root =
+            std::env::temp_dir().join(format!("eliot-packet-stored-{}", WriteId::new_v7()));
+        let (first_stored, first_event) =
+            stage_packet_post_commit_outbox_at_root(&outbox_root, &original)
+                .expect("stage original intent");
+        let (replay_stored, replay_event) =
+            stage_packet_post_commit_outbox_at_root(&outbox_root, &replay)
+                .expect("stage equivalent replay");
+
+        assert_eq!(first_event.sequence, 0);
+        assert_eq!(replay_event.sequence, 0);
+        assert_eq!(
+            serde_json::to_value(&first_stored).expect("serialize first stored intent"),
+            serde_json::to_value(&original).expect("serialize original intent")
+        );
+        assert_eq!(
+            serde_json::to_value(&replay_stored).expect("serialize replay stored intent"),
+            serde_json::to_value(&original).expect("serialize original intent")
+        );
+        assert_eq!(
+            replay_event.request_session_id,
+            original.provenance.request_session_id
+        );
+        assert_eq!(
+            std::fs::read_dir(packet_post_commit_events_root(&outbox_root))
+                .expect("read outbox events")
+                .count(),
+            1,
+            "exact replay must not append a second prepared event"
+        );
+        std::fs::remove_dir_all(outbox_root).expect("remove stored-intent fixture");
+    }
+
+    #[test]
+    fn packet_response_integrity_corruption_is_rejected() {
+        let mut intent = outbox_intent(SessionId::new_v7(), json!({}));
+        intent.response["goal"] = json!("corrupted after hashing");
+        let error = validate_packet_post_commit_intent(&intent)
+            .expect_err("response bytes must match the stored inspection hash");
+        assert!(
+            format!("{error:#}").contains("packet post-commit response hash mismatch"),
+            "unexpected response integrity error: {error:#}"
+        );
+
+        let mut rebound = outbox_intent(SessionId::new_v7(), json!({}));
+        rebound.response["packet_id"] = json!("eliot/packet/different");
+        rebound.response_hash_blake3 =
+            canonical_struct_hash(&rebound.response).expect("rehash rebound response");
+        let error = validate_packet_post_commit_intent(&rebound)
+            .expect_err("a hash-valid response must still bind canonical packet material");
+        assert!(
+            format!("{error:#}")
+                .contains("packet post-commit response does not match canonical packet material"),
+            "unexpected packet binding error: {error:#}"
+        );
+    }
+
+    #[test]
+    fn packet_outbox_enforces_ordered_terminal_transition() {
+        let intent = outbox_intent(SessionId::new_v7(), json!({"packet": "unit"}));
+        let outbox_root =
+            std::env::temp_dir().join(format!("eliot-packet-outbox-{}", WriteId::new_v7()));
+        persist_immutable_json_path(&packet_post_commit_intent_path(&outbox_root), &intent)
+            .expect("stage intent");
+        append_packet_post_commit_event(
+            &outbox_root,
+            &intent,
+            PacketPostCommitStatus::Prepared,
+            &[],
+        )
+        .expect("stage prepared event");
+        transition_packet_post_commit_outbox(
+            &outbox_root,
+            &intent,
+            PacketPostCommitStatus::CommittedPending,
+            &[],
+        )
+        .expect("mark committed pending");
+        finish_packet_post_commit_outbox(&outbox_root, &intent, &[]).expect("finish outbox");
+        transition_packet_post_commit_outbox(
+            &outbox_root,
+            &intent,
+            PacketPostCommitStatus::CommittedPending,
+            &["must not downgrade".to_owned()],
+        )
+        .expect("terminal replay is idempotent");
+        let stored = latest_packet_post_commit_event(&outbox_root, &intent)
+            .expect("read event log")
+            .expect("terminal event");
+        assert_eq!(stored.status, PacketPostCommitStatus::Complete);
+        assert_eq!(stored.sequence, 2);
+        assert!(stored.errors.is_empty());
+        assert_eq!(
+            std::fs::read_dir(packet_post_commit_events_root(&outbox_root))
+                .expect("read terminal events")
+                .count(),
+            3,
+            "terminal replay must not schedule post-commit effects again"
+        );
+        std::fs::remove_dir_all(outbox_root).expect("remove outbox fixture");
+    }
+
+    #[test]
+    fn packet_post_commit_intent_pretty_roundtrip_preserves_response_hash() {
+        let project_id = ProjectId::new_v7();
+        let task_id = TaskId::new_v7();
+        let packet_id = "eliot/packet/float-roundtrip";
+        let packet_quality = eliot_types::PacketQualityReport {
+            packet_id: packet_id.to_owned(),
+            task_id: task_id.to_string(),
+            revision_fence: MemoryRevision::new(7),
+            structured_bytes: 1_723,
+            estimated_tokens: 431,
+            task_frame_present: true,
+            current_truth_coverage: 1.0_f32 / 3.0_f32,
+            causal_bridge_hops: 2,
+            causal_bridge_missing_hops: Vec::new(),
+            negative_memory_checked: true,
+            exact_atoms_count: 3,
+            material_unknowns: 0,
+            verifier_present: true,
+            stale_items_suppressed: 0,
+            wrong_scope_items_suppressed: 0,
+            tool_schema_bytes_visible: 512,
+            instruction_hotset_size: 4,
+            signal_density: (3.0_f32 * 128.0_f32 / 1_723.0_f32).min(1.0_f32),
+            result: eliot_types::PacketQualityResult::Sufficient,
+        };
+        // This is an upstream serde_json f64 regression value. Packet responses
+        // are heterogeneous Values, so their integrity hash must also survive
+        // non-packet-quality numeric supplements without a one-ULP drift.
+        let response = json!({
+            "packet_id": packet_id,
+            "project_id": project_id,
+            "task_id": task_id,
+            "packet_quality": packet_quality,
+            "compile_audit": {
+                "response_integrity_probe": 51.248_178_375_505_404_f64
+            },
+            "packet_admission": { "status": "admitted" }
+        });
+        let intent = outbox_intent(SessionId::new_v7(), response);
+        let outbox_root = std::env::temp_dir().join(format!(
+            "eliot-packet-intent-float-roundtrip-{}",
+            WriteId::new_v7()
+        ));
+        let intent_path = packet_post_commit_intent_path(&outbox_root);
+        persist_immutable_json_path(&intent_path, &intent).expect("persist pretty intent");
+        let reread: PacketPostCommitIntent =
+            serde_json::from_reader(std::fs::File::open(&intent_path).expect("open intent"))
+                .expect("read pretty intent");
+        let before_bytes = serde_json::to_vec(&intent.response).expect("serialize before response");
+        let after_bytes = serde_json::to_vec(&reread.response).expect("serialize after response");
+        let before_number = intent.response["compile_audit"]["response_integrity_probe"]
+            .as_f64()
+            .expect("before numeric probe");
+        let after_number = reread.response["compile_audit"]["response_integrity_probe"]
+            .as_f64()
+            .expect("after numeric probe");
+        let validation = validate_packet_post_commit_intent(&reread);
+        std::fs::remove_dir_all(&outbox_root).expect("remove float roundtrip fixture");
+
+        assert_eq!(
+            before_bytes,
+            after_bytes,
+            "packet response changed across pretty persistence: before={} ({:#018x}), after={} ({:#018x}), delta={}",
+            String::from_utf8_lossy(&before_bytes),
+            before_number.to_bits(),
+            String::from_utf8_lossy(&after_bytes),
+            after_number.to_bits(),
+            after_number - before_number,
+        );
+        validation.expect("reread packet post-commit intent must retain its response hash");
+    }
+
+}
+
+fn persist_rejected_context_attempt(
+    state: &McpState,
+    packet: &ContextPacketL3,
+    response: &Value,
+) -> Result<()> {
+    let task_root = state
+        .root
+        .join("reports")
+        .join("context-packets")
+        .join("tasks")
+        .join(task_packet_key(&packet.task_id));
+    let bytes = serde_json::to_vec_pretty(response)?;
+    let attempt_hash = blake3::hash(&bytes).to_hex();
+    let path = task_root
+        .join("attempts")
+        .join(format!("{attempt_hash}.json"));
+    persist_immutable_bytes(&path, &bytes)
+}
+
+fn persist_immutable_json_path<T: serde::Serialize>(path: &Path, value: &T) -> Result<()> {
+    persist_immutable_bytes(path, &serde_json::to_vec_pretty(value)?)
+}
+
+fn persist_immutable_bytes(path: &Path, bytes: &[u8]) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    if path.is_file() {
+        let existing = std::fs::read(path)?;
+        anyhow::ensure!(
+            existing == bytes,
+            "immutable context packet collision at {}",
+            path.display()
+        );
+        return Ok(());
+    }
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("packet");
+    let temporary = path.with_file_name(format!(".{file_name}.{}.tmp", WriteId::new_v7()));
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temporary)?;
+    let write_result = (|| -> Result<()> {
+        file.write_all(bytes)?;
+        file.flush()?;
+        file.sync_all()?;
+        Ok(())
+    })();
+    drop(file);
+    if let Err(error) = write_result {
+        let _ = std::fs::remove_file(&temporary);
+        return Err(error);
+    }
+
+    // A hard link publishes the fully-fsynced inode without ever replacing an
+    // existing destination. `rename` on Windows is not a no-clobber primitive.
+    let publication = std::fs::hard_link(&temporary, path);
+    let cleanup = std::fs::remove_file(&temporary);
+    if let Err(error) = cleanup
+        && error.kind() != std::io::ErrorKind::NotFound
+    {
+        return Err(error).with_context(|| {
+            format!(
+                "remove immutable context packet temporary {}",
+                temporary.display()
+            )
+        });
+    }
+    match publication {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            let existing = std::fs::read(path)?;
+            anyhow::ensure!(
+                existing == bytes,
+                "immutable context packet collision at {}",
+                path.display()
+            );
+            Ok(())
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn atomic_write_json_create_or_replace<T: serde::Serialize>(path: &Path, value: &T) -> Result<()> {
+    if path.is_file() {
+        return atomic_write_json(path, value);
+    }
+    let bytes = serde_json::to_vec_pretty(value)?;
+    match persist_immutable_bytes(path, &bytes) {
+        Ok(()) => Ok(()),
+        Err(error) if path.is_file() => atomic_write_json(path, value).context(error),
+        Err(error) => Err(error),
+    }
 }
 
 fn task_packet_key(task_id: &str) -> String {
@@ -1158,21 +2415,14 @@ fn task_packet_key(task_id: &str) -> String {
 }
 
 fn latest_task_packet(state: &McpState, task_id: TaskId) -> Result<Option<ContextPacketL3>> {
-    let root = state.root.join("reports").join("context-packets");
-    let task_path = root
-        .join("tasks")
-        .join(task_packet_key(&task_id.to_string()))
-        .join("latest.json");
-    let legacy_path = root.join("latest.json");
-    let path = if task_path.is_file() {
-        task_path
-    } else {
-        legacy_path
-    };
-    if !path.is_file() {
+    if let Some(authority) = read_active_packet_authority(state, &task_id.to_string())? {
+        return Ok((authority.packet.task_id == task_id.to_string()).then_some(authority.packet));
+    }
+    let task_path = active_packet_latest_path(state, &task_id.to_string());
+    if !task_path.is_file() {
         return Ok(None);
     }
-    let packet: ContextPacketL3 = serde_json::from_reader(std::fs::File::open(path)?)?;
+    let packet: ContextPacketL3 = serde_json::from_reader(std::fs::File::open(task_path)?)?;
     Ok((packet.task_id == task_id.to_string()).then_some(packet))
 }
 
@@ -2223,64 +3473,4 @@ async fn resolve_governed_packet_git_scope(
         anyhow::bail!("task-matched CodeCortex report is stale for the resolved Git scope");
     }
     Ok(Some(scope))
-}
-
-async fn enrich_packet_with_task(
-    state: &McpState,
-    value: &mut Value,
-    task: &TaskContract,
-) -> Result<()> {
-    let Value::Object(object) = value else {
-        return Ok(());
-    };
-    let refs = canonical_packet_refs(state, task).await?;
-    let current_receipt = state
-        .store
-        .write_receipt_by_id(&task.write_id)
-        .await?
-        .context("current TaskContract WriteReceipt does not resolve")?;
-    object.insert("task_contract".to_owned(), serde_json::to_value(task)?);
-    object.insert(
-        "task_truth_status".to_owned(),
-        Value::String("current_canonical".to_owned()),
-    );
-    object.insert(
-        "task_revision_fence".to_owned(),
-        serde_json::to_value(task.memory_revision)?,
-    );
-    object.insert(
-        "packet_revision_fence".to_owned(),
-        serde_json::to_value(refs.packet_revision_fence)?,
-    );
-    object.insert("packet_id".to_owned(), Value::String(refs.packet_id));
-    object.insert(
-        "task_contract_ref".to_owned(),
-        Value::String(refs.task_contract_ref.clone()),
-    );
-    object.insert(
-        "current_truth_refs".to_owned(),
-        json!([refs.task_contract_ref]),
-    );
-    object.insert(
-        "exact_evidence_refs".to_owned(),
-        json!([current_receipt.receipt_id]),
-    );
-    object.insert(
-        "negative_memory_check_ref".to_owned(),
-        Value::String(refs.negative_memory_check_ref),
-    );
-    object.insert(
-        "negative_stale_exclusions".to_owned(),
-        json!(["candidate observations are not verifier authority"]),
-    );
-    object.insert(
-        "registered_verifiers".to_owned(),
-        Value::Array(
-            RegisteredTaskVerifier::ALL
-                .into_iter()
-                .map(RegisteredTaskVerifier::descriptor)
-                .collect(),
-        ),
-    );
-    Ok(())
 }

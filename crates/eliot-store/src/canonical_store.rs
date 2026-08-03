@@ -3049,6 +3049,34 @@ impl CanonicalStore {
         decode_value(NamedSurqlOp::AssignUlExperimentArm, value)
     }
 
+    pub async fn upsert_ul_experiment_assignment_explicit(
+        &self,
+        project_id: ProjectId,
+        task_id: TaskId,
+        task_class: &eliot_types::UlTaskClass,
+        arm: eliot_types::UlExperimentArm,
+        injection_mode: eliot_types::UlInjectionMode,
+        config_hash: &str,
+    ) -> Result<eliot_types::UlTaskExperimentAssignment, StoreError> {
+        let task_class_key = task_class.key();
+        let assignment_key = derived_row_key(&format!("ul-experiment|{project_id}|{task_id}"));
+        let value = self
+            .execute_value(
+                NamedSurqlOp::UpsertUlExperimentAssignmentExplicit,
+                json!({
+                    "assignment_key": assignment_key,
+                    "project_id": project_id,
+                    "task_id": task_id,
+                    "task_class": task_class,
+                    "task_class_key": task_class_key,
+                    "arm": arm,
+                    "injection_mode": injection_mode,
+                    "config_hash": config_hash,
+                }),
+            )
+            .await?;
+        decode_value(NamedSurqlOp::UpsertUlExperimentAssignmentExplicit, value)
+    }
     pub async fn load_ul_experiment_assignment(
         &self,
         project_id: ProjectId,

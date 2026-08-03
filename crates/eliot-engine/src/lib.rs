@@ -79,8 +79,19 @@ pub use collective::{
     StopCoordinationGate,
 };
 pub use context::{
-    CognitiveGate, CompletionGate, ContextCompiler, PacketQualityService,
-    UnderstandingProofValidator, codecortex_report_ref, refinalize_compiled_packet,
+    CognitiveGate, CompletionGate, ContextCompiler, DEFAULT_PACKET_HARD_CEILING_TOKENS,
+    PacketAdmissionDecision, PacketAdmissionStatus, PacketBudgetDecision, PacketBudgetPolicy,
+    PacketCandidateOutcome, PacketCompileAudit, PacketCompileAuditContext,
+    PacketCompileAuditReport, PacketCompileError, PacketCompileMode, PacketCompilePlan,
+    PacketCompilePlanInvalid, PacketCompileResult, PacketExperienceSource, PacketGateCandidate,
+    PacketGateReason, PacketGateStatus, PacketHardCeilingExceeded, PacketMeasurementView,
+    PacketPredictionIntent, PacketPyramidSnapshot, PacketPyramidSource, PacketQualityService,
+    PacketRenderMode, PacketRenderOutcome, PacketResolvedCues, PacketSourceReadAudit,
+    PacketTaskReceiptMetadata, UnderstandingProofValidator, codecortex_report_ref,
+    finalize_packet_candidate, finalize_packet_candidate_with_policy,
+    finalize_packet_candidate_with_policy_and_audit_context, packet_return_metadata_tokens,
+    packet_section_accounting, refinalize_compiled_packet, resolve_packet_scope_paths,
+    serialized_supplement_tokens,
 };
 pub use control_plane::{
     AutonomyBudgetDecision, AutonomyBudgetLedger, AutonomyLeaseBinding, AutonomyRecoveryAction,

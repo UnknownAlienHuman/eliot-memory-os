@@ -62,6 +62,10 @@ pub struct Harness {
 }
 
 impl Harness {
+    pub fn runtime_path(&self) -> &Path {
+        self.runtime.path()
+    }
+
     pub fn start(name: &str) -> TestResult<Self> {
         let runtime = OwnedRuntime::new(name)?;
         let port = test_port()?;
@@ -224,6 +228,17 @@ impl Harness {
                 at_least_revision: None,
             }))?
             .memory_revision)
+    }
+
+    pub fn ul_assignment(
+        &self,
+        project_id: ProjectId,
+        task_id: TaskId,
+    ) -> TestResult<Option<eliot_types::UlTaskExperimentAssignment>> {
+        Ok(self.store_runtime.block_on(
+            self.store
+                .load_ul_experiment_assignment(project_id, task_id),
+        )?)
     }
 
     pub fn observability_records<T: DeserializeOwned>(

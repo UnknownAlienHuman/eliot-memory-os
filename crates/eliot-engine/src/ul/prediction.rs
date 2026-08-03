@@ -1,4 +1,4 @@
-use crate::{EngineError, WriterHandle};
+use crate::{EngineError, PacketPredictionIntent, WriterHandle};
 use eliot_store::CanonicalStore;
 use eliot_types::{
     BlastScore, DiagnosticExpectation, OBSERVABILITY_SCHEMA_VERSION, ObservabilityKind,
@@ -118,6 +118,49 @@ impl PredictionService {
             }
         }
         Ok(captures)
+    }
+
+    /// Persists the exact prediction intent already finalized by the packet
+    /// compiler. No material-frame fields are reinterpreted here: the
+    /// compiler-owned prediction, confidence and source hash are the write
+    /// authority. A mismatched reference fails before any write.
+    pub async fn capture_packet_intent(
+        &self,
+        project_id: ProjectId,
+        task_id: TaskId,
+        session_id: SessionId,
+        packet_id: &str,
+        intent: &PacketPredictionIntent,
+    ) -> Result<PredictionCapture, EngineError> {
+        let prediction_id = prediction_id_for(
+            project_id,
+            task_id,
+            session_id,
+            packet_id,
+            &intent.prediction,
+            &intent.source_frame_hash,
+        );
+        let derived_ref = format!("prediction:{prediction_id}");
+        if derived_ref != intent.prediction_ref {
+            return Err(EngineError::WriteRejected(format!(
+                "packet prediction intent ref mismatch: compiled={} derived={derived_ref}",
+                intent.prediction_ref
+            )));
+        }
+        self.capture_prediction(
+            &PredictionCaptureInput {
+                project_id,
+                task_id,
+                session_id,
+                subsystem_concept_id: intent.subsystem_concept_id.clone(),
+                packet_id: packet_id.to_owned(),
+                expected_observable: String::new(),
+                source_frame_hash: intent.source_frame_hash.clone(),
+            },
+            intent.prediction.clone(),
+            intent.confidence,
+        )
+        .await
     }
 
     async fn capture_prediction(
