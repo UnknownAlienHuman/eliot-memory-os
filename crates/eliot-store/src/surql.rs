@@ -1057,6 +1057,24 @@ mod tests {
     }
 
     #[test]
+    fn explicit_ul_assignment_is_idempotent_conflict_checked_and_counter_free() {
+        let template = NamedSurqlOp::UpsertUlExperimentAssignmentExplicit.template();
+
+        assert_eq!(
+            NamedSurqlOp::UpsertUlExperimentAssignmentExplicit.access_class(),
+            SurqlAccessClass::Write
+        );
+        assert!(template.contains("ordinal: 0"));
+        assert!(template.contains("ul_explicit_assignment_conflict"));
+        assert!(template.contains("$existing.task_class != $task_class"));
+        assert!(template.contains("$existing.arm != $arm"));
+        assert!(template.contains("$existing.injection_mode != $injection_mode"));
+        assert!(template.contains("$existing.config_hash != $config_hash"));
+        assert!(!template.contains("ul_ab_counter"));
+        assert!(!template.contains("% 2"));
+    }
+
+    #[test]
     fn ordered_tool_observation_projection_contains_order_fields() {
         let template = NamedSurqlOp::ToolObservationsByKind.template();
 

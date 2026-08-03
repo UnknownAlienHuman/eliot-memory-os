@@ -1079,3 +1079,60 @@ For each next step, record:
 - The final fast CodeCortex refresh completed without a repository artifact at
   20,462 nodes and 94,109 edges. The only unrelated untracked path remains the
   operator-owned `.eliot/`, which was not staged, modified or deleted.
+
+## 2026-08-02 — C7-03C final execution / Block A closure
+
+| Slice | Commit | Accepted result |
+|---|---|---|
+| C0 | `53817fa4c42be07889fda689496a5ba3460be9d8` | Acceptance daemon runtime state is isolated from host authority state. |
+| C1 | `545d0858a8ccbda7e8bf517a03ea655c21ab6631` | Response provenance is separate from immutable packet-commit identity; exact replay uses the original stored effects. |
+| C2 | `3b6ebbc04e114e2ebdf48de4d564fd2b2e776c25` | Lossless parent/page/segment memory, native FTS admission, complete cue overflow, and one durable projection owner are finalized. |
+| C3 | `a4ffaa20e0e7e9fc809b74806ca6c5135eee6787` | Packet persistence is append-only, restart-recoverable, bounded, effects-once, and supports canonical plus legacy task handles. |
+
+### Closed architecture
+
+- Packet content identity, response provenance and state-changing operation
+  identity are distinct domains.
+- Immutable intent plus append-only state events is the sole packet outbox
+  authority. Startup recovery inventories every task deterministically, attempts
+  at most 32 pending replays, isolates corrupt neighbors and reports residuals.
+- Canonical task replay preserves the string serializer, global task mutex and
+  cross-process transition lock order. Legacy handles remain local-only.
+- Canonical memory pages and cue overflow are lossless. SurrealDB FTS/BM25 only
+  admits bounded candidates; deterministic Rust ranking remains final.
+- `ProjectionCoordinator` is the single lifecycle owner for focused projection
+  builders. It arms recovery before daemon READY; inventory and rebuild work
+  then drains on its owned background task.
+- Windows atomic replacement now canonicalizes only the parent into
+  extended-length form, preserving leaf and `MoveFileExW` replacement semantics.
+
+### Acceptance evidence
+
+- C1 focused U9.6 regression passed with stable packet/operation identities,
+  byte/hash-identical replay, no repeated `ul_fired`, and unchanged authority,
+  intent, event history, effects, receipts and revision.
+- C2 focused source/unit gates passed; live store and app gates covered FTS,
+  lossless L2, projection lease barriers, cue firing, 512+ retrieval, cold
+  recovery and session dedup. Provider calls were zero and cleanup was clean.
+- C3 packet units passed 17/17. Windows atomic replacement passed 3/3,
+  including an extended-length path.
+- C3 U9.8 passed with canonical and legacy recovery, byte-identical projection
+  repair, exactly three outbox events ending in `complete`, effects-once across
+  a second restart, 300 corrupt predecessors, and a misplaced authority.
+- App checks, strict affected-target Clippy, format and diff checks passed.
+  Focused isolated gates reported `provider_calls=0`, no timeout, no cleanup
+  failure and no retained run-owned process or secret root.
+
+### Escalation and exclusions
+
+- Claude Code Opus 5 at Max effort was used read-only for the ambiguous packet
+  identity/recovery decisions. Its rulings were accepted only where current
+  source and deterministic verification supported them.
+- No provider cognition, full workspace verification, release build, final
+  scale ladder or 48-case evaluation was used as Block A evidence.
+- Preserved drafts for hot understanding/admission, utility/distillation and
+  final scale certification are explicitly excluded from this closure and are
+  not acceptance evidence.
+
+**Block A result: PASS.** The next allowed implementation item is Block B1,
+engine-owned `UnderstandingRuntime`, from the exact aggregate head.

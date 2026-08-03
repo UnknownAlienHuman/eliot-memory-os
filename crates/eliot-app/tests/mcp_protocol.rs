@@ -9215,12 +9215,14 @@ fn codecortex_report_ref(report: &Value) -> TestResult<String> {
         .get("git_head")
         .and_then(Value::as_str)
         .unwrap_or("unknown");
-    let write_id = report
-        .get("memory_receipt")
-        .and_then(|receipt| receipt.get("write_id"))
+    let dirty_state_hash = report
+        .get("scope_binding")
+        .and_then(|binding| binding.get("dirty_state_hash"))
         .and_then(Value::as_str)
-        .unwrap_or("unwritten");
-    Ok(format!("codecortex_report:{task}:{git_head}:{write_id}"))
+        .unwrap_or("unknown");
+    Ok(format!(
+        "codecortex_report:{task}:{git_head}:{dirty_state_hash}"
+    ))
 }
 
 fn codecortex_file_ref(report: &Value) -> TestResult<String> {

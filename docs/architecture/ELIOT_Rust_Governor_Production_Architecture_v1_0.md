@@ -107,6 +107,21 @@ A pre-existing server is left running. Crash recovery reconnects when identity
 and endpoint remain valid; stale ownership metadata alone never authorizes a
 kill. Restart tests preserve canonical data across the stop/start boundary.
 
+### Cognitive projection and packet durability
+
+Canonical memory ingress preserves complete logical bodies through typed
+parent/page/segment records and lossless cue-overflow pages. Native FTS/BM25
+admits a bounded candidate set; deterministic Rust scoring remains final.
+Focused builders publish through one durable `ProjectionCoordinator`, which
+arms recovery before daemon READY and drains inventory and rebuild work on its
+owned background task.
+
+Active packet authority is separate from response provenance. Immutable packet
+intent and append-only state events drive ordered post-commit effects. Startup
+recovery inventories all authorities deterministically, bounds actual replay
+attempts, isolates corrupt entries, repairs projections from stored intent and
+never replays completed effects.
+
 ## 6. IPC and protocol
 
 Local control uses current-user authenticated Windows named pipes with runtime

@@ -4,7 +4,8 @@ Status: normative for `ELIOT_COGNITIVE_COMPLETION_ULTRA_MASTER_FINAL_v4_1.md`
 
 Baseline: `88a5f049d71a9c535f51811eb7da273416c27118`
 
-Current gate: Phase 0, C7-03A and C7-03B accepted; Phase 1 active; provider cognition is forbidden
+Current gate: Phases 0 and 1, including C7-03A through C7-03C, accepted;
+Phase 2 / Block B1 active; provider cognition is forbidden
 
 This document fixes ownership and acceptance constraints. It does not claim
 that every invariant is already enforced. Current enforcement and evidence are
@@ -80,10 +81,12 @@ receipts, focused tests, measurements, and field artifacts remain the truth.
    query, task cues, concepts; document terms in the order identity/reference,
    cues, concepts, preview, remaining text. Deduplication preserves first
    occurrence; sorting cannot precede the cap.
-4. **CRI-023 — FTS proposes, Rust decides.** SurrealDB 3.1.4 FULLTEXT may only
-   generate bounded candidates. The existing Rust ranker remains final.
+4. **CRI-023 — FTS proposes, Rust decides.** SurrealDB 3.1.4 FULLTEXT may use
+   BM25 relevance only to order bounded candidate admission; authority is a
+   deterministic tie-breaker and remains a feature of the final Rust ranker.
    Project isolation, Unicode, opaque identifiers, bound query parameters, and
-   an index-backed `EXPLAIN` are required before cutover.
+   an index-backed `EXPLAIN` are required before cutover. The database score is
+   never exposed in the recall response or copied into `L0FeatureScore`.
 5. **CRI-024 — bounded reads never repair an entire project inline.** Normal L0
    performs an exact-handle lookup or one FTS query, admits at most 257 handles,
    loads at most 256 compact rows, returns at most 12 previews, and returns
@@ -183,8 +186,8 @@ pass its focused behavior gate, and be pushed before the next phase begins.
 | Phase | Current state | Required gate before advancement |
 | --- | --- | --- |
 | 0 — truthful capability/completion | `ACCEPTED` | Archive ref exists; matrix and invariants exist; only `CompletionGate` plus `CompletionProof` can complete a task; verifier/review/coordination negatives and complete-proof positive pass. |
-| 1 — storage/retrieval | `IN_PROGRESS_C7_03A_C7_03B_ACCEPTED` | Phase 0 accepted; persistent clients and the additive FTS candidate path are locally accepted; C7-03C cutover/coordinator/deletion, PF1/PF2/PF3, one exact R01, and final bounded isolation remain provider-free gates. |
-| 2 — hot understanding runtime | `LOCKED` | Phase 1 accepted; one daemon runtime, projection recovery, zero-edge direct fire, no PreToolUse I/O, restart behavior, and p95 budgets pass without providers. |
+| 1 — storage/retrieval | `ACCEPTED_C7_03A_THROUGH_C7_03C` | Phase 0 accepted; persistent clients, lossless bounded retrieval, projection ownership and single-pass packet persistence passed focused provider-free gates. PF1/PF2/PF3, one exact R01 and final bounded isolation remain later certification evidence, not Phase 1 advancement gates. |
+| 2 — hot understanding runtime | `IN_PROGRESS_B1` | Phase 1 accepted; one engine-owned runtime, projection recovery, zero-edge direct fire, no PreToolUse I/O, restart behavior and p95 budgets must pass without providers. |
 | 3 — context compiler | `LOCKED` | Phase 2 accepted; one engine compiler, graph-derived causal paths, real scoped cues/cases, one revision fence, and bounded degraded staleness pass without providers. |
 | 4 — learning/distillation | `LOCKED` | Phase 3 accepted; grounded episode/case/skill learning, real utility attribution, reversible forgetting/compression, and grounded/no-op sleep pass without providers. |
 | 5 — prediction/policy | `LOCKED` | Phase 4 accepted; verifier-bound predictions, subsystem calibration, explicit modes, and comparable token/action evaluation pass without providers. |
@@ -192,10 +195,13 @@ pass its focused behavior gate, and be pushed before the next phase begins.
 | 7 — field certification | `LOCKED` | Phase 6 accepted; three pilots and reciprocal isolated blind transfer pass through consolidated routes with zero unknown outcomes and zero controller substitution. |
 | 8 — release | `LOCKED` | Phase 7 accepted; deletion gate, final single-run workspace checks, PR, independent review, CI, merge, and independent main-SHA CI pass. |
 
-Provider cognition is forbidden through Phase 6. Phase 7 may use providers only
-after the local provider-free gate passes and only through the existing sealed,
-supervised, authority-bound routes. Internal related-context agents are pilot
-evidence, not blind-transfer certification.
+Provider cognition in product/runtime paths and provider-generated acceptance
+evidence are forbidden through Phase 6. A read-only architecture consultation
+is advisory only: it may identify questions, but cannot execute a product route,
+receive authority or count as acceptance evidence. Phase 7 may use providers
+only after the local provider-free gate passes and only through the existing
+sealed, supervised, authority-bound routes. Internal related-context agents are
+pilot evidence, not blind-transfer certification.
 
 ## 8. Acceptance and deletion discipline
 

@@ -1,39 +1,40 @@
 #![cfg(windows)]
 
 use eliot_types::{ProjectId, TaskId, WriteId};
+use eliot_windows_ipc::ProcessTreeGuard;
 use serde_json::Value;
 use std::fs;
-use std::io::{BufRead as _, Write as _};
+use std::io::{BufRead as _, Read as _, Seek as _, SeekFrom, Write as _};
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStdin, Command, Stdio};
+use std::process::{Child, ChildStdin, Command, ExitStatus, Stdio};
 use std::sync::mpsc::{self, Receiver};
+use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::thread;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 type TestResult<T = ()> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
+// Debug builds on the certification host normally publish READY within seconds. Thirty
+// seconds leaves cold-start headroom while keeping a wedged fixture bounded and actionable.
+const DAEMON_READY_TIMEOUT: Duration = Duration::from_secs(30);
+const DIAGNOSTIC_TAIL_BYTES: u64 = 8 * 1024;
+static DAEMON_RUNTIME_LEASE: Mutex<()> = Mutex::new(());
+
 #[test]
 fn facade_and_daemon_resolve_one_runtime_across_windows_path_spellings() -> TestResult {
+    let _runtime_lease = daemon_runtime_lease();
     let runtime = OwnedRuntime::new()?;
     let config_path = runtime.path().join("config").join("governor.toml");
     write_test_config(runtime.path(), &config_path, free_local_port()?)?;
 
-    let mut daemon = OwnedChild::spawn(
-        governor_command(runtime.path())
-            .arg("--config")
-            .arg(&config_path)
-            .args(["daemon", "run"])
-            .env("ELIOT_DISABLE_REAL_PROVIDER", "1")
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null()),
-    )?;
+    let mut daemon = start_daemon(&config_path)?;
     wait_for_changed_json(
+        &mut daemon,
         &runtime.path().join("runtime").join("publication.json"),
         "auth_generation",
         "",
-        Duration::from_secs(10),
+        DAEMON_READY_TIMEOUT,
     )?;
 
     let canonical_config = config_path.canonicalize()?;
@@ -92,15 +93,17 @@ fn facade_and_daemon_resolve_one_runtime_across_windows_path_spellings() -> Test
 
 #[test]
 fn doctor_and_facade_name_the_exact_authentication_mismatch() -> TestResult {
+    let _runtime_lease = daemon_runtime_lease();
     let runtime = OwnedRuntime::new()?;
     let config_path = runtime.path().join("config").join("governor.toml");
     write_test_config(runtime.path(), &config_path, free_local_port()?)?;
     let mut daemon = start_daemon(&config_path)?;
     wait_for_changed_json(
+        &mut daemon,
         &runtime.path().join("runtime").join("publication.json"),
         "auth_generation",
         "",
-        Duration::from_secs(10),
+        DAEMON_READY_TIMEOUT,
     )?;
 
     let authentication_path = runtime.path().join("runtime").join("ipc-auth.json");
@@ -151,15 +154,17 @@ fn doctor_and_facade_name_the_exact_authentication_mismatch() -> TestResult {
 
 #[test]
 fn initialize_cannot_widen_the_authenticated_profile() -> TestResult {
+    let _runtime_lease = daemon_runtime_lease();
     let runtime = OwnedRuntime::new()?;
     let config_path = runtime.path().join("config").join("governor.toml");
     write_test_config(runtime.path(), &config_path, free_local_port()?)?;
     let mut daemon = start_daemon(&config_path)?;
     wait_for_changed_json(
+        &mut daemon,
         &runtime.path().join("runtime").join("publication.json"),
         "auth_generation",
         "",
-        Duration::from_secs(10),
+        DAEMON_READY_TIMEOUT,
     )?;
 
     let request = serde_json::json!({
@@ -195,15 +200,17 @@ fn initialize_cannot_widen_the_authenticated_profile() -> TestResult {
 
 #[test]
 fn canonical_profiles_publish_bounded_tool_sets() -> TestResult {
+    let _runtime_lease = daemon_runtime_lease();
     let runtime = OwnedRuntime::new()?;
     let config_path = runtime.path().join("config").join("governor.toml");
     write_test_config(runtime.path(), &config_path, free_local_port()?)?;
     let mut daemon = start_daemon(&config_path)?;
     wait_for_changed_json(
+        &mut daemon,
         &runtime.path().join("runtime").join("publication.json"),
         "auth_generation",
         "",
-        Duration::from_secs(10),
+        DAEMON_READY_TIMEOUT,
     )?;
 
     for profile in [
@@ -308,6 +315,7 @@ fn default_instance_bootstrap_is_stable_and_outside_the_repository() -> TestResu
 #[test]
 #[ignore = "requires a provisioned SurrealDB executable"]
 fn standalone_startup_failure_stops_its_owned_database_and_publishes_failed() -> TestResult {
+    let _runtime_lease = daemon_runtime_lease();
     let runtime = OwnedRuntime::new()?;
     let config_path = runtime.path().join("config").join("governor.toml");
     let port = free_local_port()?;
@@ -346,27 +354,20 @@ fn standalone_startup_failure_stops_its_owned_database_and_publishes_failed() ->
 #[allow(clippy::too_many_lines)]
 #[ignore = "requires a provisioned local Governor runtime: a running daemon, an authenticated SurrealDB and a git identity"]
 fn external_candidate_is_shared_without_authority_widening() -> TestResult {
+    let _runtime_lease = daemon_runtime_lease();
     let runtime = OwnedRuntime::new()?;
     let config_path = runtime.path().join("config").join("governor.toml");
     let port = free_local_port()?;
     write_test_config(runtime.path(), &config_path, port)?;
     let mut database = start_surreal(runtime.path(), port)?;
     wait_for_tcp(port, Duration::from_secs(15))?;
-    let mut daemon = OwnedChild::spawn(
-        governor_command(runtime.path())
-            .arg("--config")
-            .arg(&config_path)
-            .args(["daemon", "run"])
-            .env("ELIOT_DISABLE_REAL_PROVIDER", "1")
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null()),
-    )?;
+    let mut daemon = start_daemon(&config_path)?;
     wait_for_changed_json(
+        &mut daemon,
         &runtime.path().join("runtime").join("publication.json"),
         "auth_generation",
         "",
-        Duration::from_secs(15),
+        DAEMON_READY_TIMEOUT,
     )?;
 
     let project_id = "eliot-governor";
@@ -543,6 +544,7 @@ fn external_candidate_is_shared_without_authority_widening() -> TestResult {
 #[allow(clippy::too_many_lines)]
 #[ignore = "requires a provisioned local Governor runtime: a running daemon, an authenticated SurrealDB and a git identity"]
 fn facade_reconnects_after_rotation_and_replay_does_not_duplicate_memory() -> TestResult {
+    let _runtime_lease = daemon_runtime_lease();
     let runtime = OwnedRuntime::new()?;
     let config_path = runtime.path().join("config").join("governor.toml");
     let port = free_local_port()?;
@@ -553,10 +555,11 @@ fn facade_reconnects_after_rotation_and_replay_does_not_duplicate_memory() -> Te
     let mut first_daemon = start_daemon(&config_path)?;
     let publication_path = runtime.path().join("runtime").join("publication.json");
     let first_publication = wait_for_changed_json(
+        &mut first_daemon,
         &publication_path,
         "auth_generation",
         "",
-        Duration::from_secs(15),
+        DAEMON_READY_TIMEOUT,
     )?;
     let first_generation = first_publication["auth_generation"]
         .as_str()
@@ -633,10 +636,11 @@ fn facade_reconnects_after_rotation_and_replay_does_not_duplicate_memory() -> Te
     first_daemon.wait_for_exit(Duration::from_secs(15))?;
     let mut second_daemon = start_daemon(&config_path)?;
     let second_publication = wait_for_changed_json(
+        &mut second_daemon,
         &publication_path,
         "auth_generation",
         &first_generation,
-        Duration::from_secs(15),
+        DAEMON_READY_TIMEOUT,
     )?;
     assert_ne!(
         second_publication["runtime_id"],
@@ -733,21 +737,33 @@ fn run_facade_requests(
         .collect()
 }
 
+fn daemon_runtime_lease() -> MutexGuard<'static, ()> {
+    DAEMON_RUNTIME_LEASE
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+}
+
 fn start_daemon(config_path: &Path) -> TestResult<OwnedChild> {
+    let fixture_root = config_path
+        .parent()
+        .and_then(Path::parent)
+        .unwrap_or(config_path);
+    let runtime_dir = fixture_root.join("runtime");
+    fs::create_dir_all(&runtime_dir)?;
+    let stderr = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(runtime_dir.join("daemon.stderr.log"))?;
     OwnedChild::spawn(
-        governor_command(
-            config_path
-                .parent()
-                .and_then(Path::parent)
-                .unwrap_or(config_path),
-        )
-        .arg("--config")
-        .arg(config_path)
-        .args(["daemon", "run"])
-        .env("ELIOT_DISABLE_REAL_PROVIDER", "1")
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null()),
+        governor_command(fixture_root)
+            .arg("--config")
+            .arg(config_path)
+            .args(["daemon", "run"])
+            .env("ELIOT_DISABLE_REAL_PROVIDER", "1")
+            .env("RUST_LOG", "info")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::from(stderr)),
     )
 }
 
@@ -861,24 +877,40 @@ impl Drop for OwnedRuntime {
     }
 }
 
-struct OwnedChild(Option<Child>);
+struct OwnedChild {
+    child: Option<Child>,
+    process_tree: Option<ProcessTreeGuard>,
+}
 
 impl OwnedChild {
     fn spawn(command: &mut Command) -> TestResult<Self> {
-        Ok(Self(Some(command.spawn()?)))
+        let mut child = command.spawn()?;
+        let process_tree = match ProcessTreeGuard::attach(child.id()) {
+            Ok(process_tree) => process_tree,
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(error.into());
+            }
+        };
+        Ok(Self {
+            child: Some(child),
+            process_tree: Some(process_tree),
+        })
     }
 
     fn wait_for_exit(&mut self, timeout: Duration) -> TestResult {
         let deadline = Instant::now() + timeout;
         while Instant::now() < deadline {
             if self
-                .0
+                .child
                 .as_mut()
                 .ok_or("owned child already consumed")?
                 .try_wait()?
                 .is_some()
             {
-                self.0.take();
+                self.child.take();
+                self.process_tree.take();
                 return Ok(());
             }
             thread::sleep(Duration::from_millis(25));
@@ -886,8 +918,18 @@ impl OwnedChild {
         Err("owned child did not stop before deadline".into())
     }
 
+    fn try_wait(&mut self) -> TestResult<Option<ExitStatus>> {
+        self.child
+            .as_mut()
+            .ok_or_else(|| "owned child already consumed".into())
+            .and_then(|child| child.try_wait().map_err(Into::into))
+    }
+
     fn stop(&mut self) -> TestResult {
-        if let Some(mut child) = self.0.take() {
+        if let Some(process_tree) = self.process_tree.take() {
+            let _ = process_tree.terminate(1);
+        }
+        if let Some(mut child) = self.child.take() {
             if child.try_wait()?.is_none() {
                 child.kill()?;
             }
@@ -899,35 +941,113 @@ impl OwnedChild {
 
 impl Drop for OwnedChild {
     fn drop(&mut self) {
-        if let Some(mut child) = self.0.take() {
+        if let Some(process_tree) = self.process_tree.take() {
+            let _ = process_tree.terminate(1);
+        }
+        if let Some(mut child) = self.child.take() {
             let _ = child.kill();
             let _ = child.wait();
         }
     }
 }
 
+#[allow(
+    clippy::print_stderr,
+    reason = "the integration harness emits measured READY latency under --nocapture"
+)]
 fn wait_for_changed_json(
+    daemon: &mut OwnedChild,
     path: &Path,
     field: &str,
     previous: &str,
     timeout: Duration,
 ) -> TestResult<Value> {
-    let deadline = Instant::now() + timeout;
+    let started = Instant::now();
+    let deadline = started + timeout;
     while Instant::now() < deadline {
-        if let Ok(bytes) = fs::read(path)
-            && let Ok(value) = serde_json::from_slice::<Value>(&bytes)
+        let publication = fs::read(path)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok());
+        if let Some(value) = publication.as_ref()
+            && value["state"] == "failed"
+        {
+            let status = daemon
+                .try_wait()?
+                .map_or_else(|| "running".to_owned(), |status| status.to_string());
+            return Err(daemon_startup_error(
+                path,
+                &format!("daemon published FAILED (child status: {status}): {value}"),
+            )
+            .into());
+        }
+        if let Some(status) = daemon.try_wait()? {
+            return Err(daemon_startup_error(
+                path,
+                &format!("daemon exited before READY with status {status}"),
+            )
+            .into());
+        }
+        if let Some(value) = publication
             && value.get(field).and_then(Value::as_str) != Some(previous)
             && value["state"] == "ready"
         {
+            eprintln!(
+                "daemon READY after {:.3}s ({})",
+                started.elapsed().as_secs_f64(),
+                path.display()
+            );
             return Ok(value);
         }
         thread::sleep(Duration::from_millis(25));
     }
-    Err(format!(
-        "timed out waiting for changed {field} in {}",
-        path.display()
+    let status = daemon
+        .try_wait()?
+        .map_or_else(|| "running".to_owned(), |status| status.to_string());
+    Err(daemon_startup_error(
+        path,
+        &format!(
+            "timed out after {:.3}s waiting for changed {field} in {} (child status: {status})",
+            started.elapsed().as_secs_f64(),
+            path.display()
+        ),
     )
     .into())
+}
+
+fn daemon_startup_error(publication_path: &Path, reason: &str) -> String {
+    let runtime_dir = publication_path.parent().unwrap_or(publication_path);
+    let fixture_root = runtime_dir.parent().unwrap_or(runtime_dir);
+    let stderr_path = runtime_dir.join("daemon.stderr.log");
+    let startup_diagnostic_path = fixture_root
+        .join("reports")
+        .join("startup")
+        .join("latest.json");
+    format!(
+        "{reason}\ndaemon stderr tail ({}):\n{}\nstartup diagnostic tail ({}):\n{}",
+        stderr_path.display(),
+        bounded_file_tail(&stderr_path),
+        startup_diagnostic_path.display(),
+        bounded_file_tail(&startup_diagnostic_path)
+    )
+}
+
+fn bounded_file_tail(path: &Path) -> String {
+    let mut file = match fs::File::open(path) {
+        Ok(file) => file,
+        Err(error) => return format!("<unavailable: {error}>"),
+    };
+    let len = match file.metadata() {
+        Ok(metadata) => metadata.len(),
+        Err(error) => return format!("<metadata unavailable: {error}>"),
+    };
+    if let Err(error) = file.seek(SeekFrom::Start(len.saturating_sub(DIAGNOSTIC_TAIL_BYTES))) {
+        return format!("<seek failed: {error}>");
+    }
+    let mut bytes = Vec::new();
+    if let Err(error) = file.take(DIAGNOSTIC_TAIL_BYTES).read_to_end(&mut bytes) {
+        return format!("<read failed: {error}>");
+    }
+    String::from_utf8_lossy(&bytes).into_owned()
 }
 
 fn write_test_config(runtime: &Path, config_path: &Path, port: u16) -> TestResult {
