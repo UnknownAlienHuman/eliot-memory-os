@@ -442,7 +442,6 @@ pub fn ul_token_estimate(text: &str) -> u32 {
 }
 
 #[cfg(test)]
-#[allow(clippy::expect_used)]
 mod tests {
     use super::{
         CueBinding, CueBindingError, CueKind, CueMatchMode, CueStrength,

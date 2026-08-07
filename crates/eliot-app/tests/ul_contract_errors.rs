@@ -140,7 +140,7 @@ fn t01_packet_content_regression() -> TestResult {
     let _guard = test_guard();
     let mut harness = Harness::start("packet-content")?;
     let (project_id, control_task_id) = harness.create_task(30)?;
-    let below_floor = harness.client.tool_call_response(
+    let expanded_floor = harness.client.tool_call(
         31,
         "eliot_compile_packet_l3",
         &json!({
@@ -148,15 +148,24 @@ fn t01_packet_content_regression() -> TestResult {
             "task_id": control_task_id,
             "goal": "reserve the deterministic memory-free control arm",
             "candidate_handles": [],
-            "max_tokens": 500
+            "max_tokens": 500,
+            "memory_mode": "memory_free_control"
         }),
     )?;
-    assert_eq!(below_floor["error"]["code"], -32602);
     assert_eq!(
-        below_floor["error"]["data"]["code"],
-        "PACKET_FLOOR_EXCEEDS_BUDGET"
+        expanded_floor["packet_budget_decision"]["preferred_tokens"],
+        500
     );
-    assert_eq!(below_floor["error"]["data"]["max_tokens"], 500);
+    assert_eq!(
+        expanded_floor["packet_budget_decision"]["hard_ceiling_tokens"],
+        4_096
+    );
+    assert!(
+        expanded_floor["packet_budget_decision"]["effective_tokens"]
+            .as_u64()
+            .is_some_and(|effective| effective >= 500),
+        "{expanded_floor}"
+    );
     harness.client.tool_call(
         32,
         "eliot_compile_packet_l3",
@@ -165,7 +174,8 @@ fn t01_packet_content_regression() -> TestResult {
             "task_id": control_task_id,
             "goal": "reserve the deterministic memory-free control arm",
             "candidate_handles": [],
-            "max_tokens": 1200
+            "max_tokens": 1200,
+            "memory_mode": "memory_free_control"
         }),
     )?;
     let task_id = harness.create_task_in_project(33, project_id)?;

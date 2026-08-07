@@ -25,7 +25,6 @@ pub fn compile_packet_minimal_example() -> Value {
         "task_id": "task-example",
         "goal": "Describe the required change",
         "candidate_handles": [],
-        "max_tokens": 1200,
         "memory_mode": "include_case_candidates",
         "material_frame": {
             "acceptance_items": [],

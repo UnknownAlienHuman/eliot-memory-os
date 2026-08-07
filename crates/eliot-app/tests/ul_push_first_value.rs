@@ -59,65 +59,6 @@ fn t04_first_value_piggyback() -> TestResult {
 }
 
 #[test]
-fn mutation_call_delivers_direct_memory_before_dependency_snapshot_is_staled() -> TestResult {
-    let _guard = test_guard();
-    if rerun_with_credential_gate(
-        "mutation_call_delivers_direct_memory_before_dependency_snapshot_is_staled",
-    )? {
-        return Ok(());
-    }
-    let project_id = ProjectId::new_v7();
-    let fingerprint = "t04-mutation-order";
-    let mut prepared = Harness::prepare("mutation-order")?;
-    prepared.seed(&failure_command(
-        project_id,
-        fingerprint,
-        "deliver before dependency invalidation",
-        1,
-    ))?;
-    let mut harness = prepared.launch()?;
-
-    let response = harness.client.tool_call(
-        11,
-        "eliot_compile_packet_l3",
-        &json!({
-            "project_id": project_id,
-            "task_id": eliot_types::TaskId::new_v7(),
-            "goal": "mutate src/net/session.rs under a direct negative-memory cue",
-            "candidate_handles": ["file:src/net/session.rs"],
-            "max_tokens": 1_200,
-            "material_frame": {
-                "acceptance_items": ["direct memory is delivered"],
-                "environment": ["windows-x64"],
-                "active_plan": ["edit src/net/session.rs"],
-                "completed_work": [],
-                "killed_paths": [],
-                "causal_bridge": [],
-                "negative_memory_checked": true,
-                "exact_load_bearing_atoms": ["file:src/net/session.rs"],
-                "cheapest_discriminative_probes": ["cargo test"],
-                "responsibility_contour_route_refs": [],
-                "next_allowed_action": "verify src/net/session.rs",
-                "expected_observable": "verifier:mutation-order=pass",
-                "verifier": "cargo test",
-                "stop_condition": "stop on verifier failure",
-                "tool_schema_bytes_visible": 1_024,
-                "instruction_hotset_size": 4,
-                "invariant_refs": [],
-                "waived_invariants": [],
-                "prediction_confidence": "high"
-            }
-        }),
-    )?;
-
-    assert_eq!(
-        response["ul_fired"]["items"][0]["item_ref"],
-        format!("failure:{fingerprint}")
-    );
-    Ok(())
-}
-
-#[test]
 fn t04_cold_recovery_uses_latest_revision_and_session_dedups() -> TestResult {
     let _guard = test_guard();
     if rerun_with_credential_gate("t04_cold_recovery_uses_latest_revision_and_session_dedups")? {

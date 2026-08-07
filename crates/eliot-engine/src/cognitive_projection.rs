@@ -1,24 +1,13 @@
-use crate::{
-    ActivationProjection, CueIndexService, DependencyProjection, DirtyArtifactProjection,
-    EngineError, FreshArtifact, MetacognitionService, ProjectProjectionFamily,
-    ProjectProjectionHealth, ProjectRevisions, ProjectSnapshot, ProjectSnapshotBuilder,
-    ProjectSnapshotInput, ProjectionFamilyHealth, SnapshotFreshness, UlDependencyService,
-    UnderstandingRuntime, render_capsule_with_dirty,
-};
+use crate::{CueIndexService, EngineError, UlDependencyService};
 use eliot_store::{
-    CanonicalRecord, CanonicalStore, CognitiveProjectionFamily, CognitiveProjectionFamilyState,
+    CanonicalStore, CognitiveProjectionFamily, CognitiveProjectionFamilyState,
     CognitiveProjectionLease, CognitiveProjectionPublicationStatus, StoreError,
 };
 use eliot_types::{
-    CognitiveProjectionReadState, ConceptNode, CurrentStateRequest, DependencyManifest,
-    HotspotScore, MemoryRevision, MemoryWriteEnvelope, ModuleCard, ProjectCharter, ProjectId,
-    PyramidTargetKind, ReadConsistencyMode, SubsystemCapsule, SystemMap, UlActivationGraphRows,
-    UlArtifactDirtyState, UlDependencyKind, UlDependencyRef, UlReverseDependencyRow, WriteReceipt,
-    WriteStatus,
+    CurrentStateRequest, MemoryRevision, MemoryWriteEnvelope, ProjectId, ReadConsistencyMode,
+    WriteReceipt, WriteStatus,
 };
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::io::Read as _;
-use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
@@ -30,28 +19,6 @@ const DEFAULT_BATCH_LIMIT: u16 = 64;
 const DEFAULT_MAX_ATTEMPTS: u32 = 5;
 const DEFAULT_PROJECT_PAGE_SIZE: usize = 100;
 const MAX_DELTA_CACHE_ENTRIES: usize = 1_024;
-const MAX_SNAPSHOT_FENCE_ATTEMPTS: usize = 4;
-const SNAPSHOT_CHARTER_MAP_PAGE_SIZE: u16 = 32;
-const SNAPSHOT_CONCEPT_CAPSULE_PAGE_SIZE: u16 = 128;
-const SNAPSHOT_CARD_HOTSPOT_PAGE_SIZE: u16 = 512;
-const SNAPSHOT_DIRTY_LIMIT: u16 = 512;
-
-struct SnapshotMaterial {
-    records: Vec<eliot_types::CueRecordSource>,
-    charters: Vec<CanonicalRecord<ProjectCharter>>,
-    maps: Vec<CanonicalRecord<SystemMap>>,
-    concepts: Vec<CanonicalRecord<ConceptNode>>,
-    capsules: Vec<CanonicalRecord<SubsystemCapsule>>,
-    cards: Vec<CanonicalRecord<ModuleCard>>,
-    hotspots: Vec<CanonicalRecord<HotspotScore>>,
-    activation_graph: UlActivationGraphRows,
-    dirty: Vec<UlArtifactDirtyState>,
-}
-
-struct StagedUnderstandingSnapshot {
-    revision: MemoryRevision,
-    snapshot: ProjectSnapshot,
-}
 
 #[derive(Clone, Copy, Debug)]
 pub struct CognitiveProjectionCoordinatorConfig {
@@ -121,7 +88,6 @@ pub struct CognitiveProjectionCoordinatorHandle {
     sender: mpsc::Sender<ProjectionCommand>,
     store: CanonicalStore,
     cue_index: Arc<CueIndexService>,
-    understanding: Arc<UnderstandingRuntime>,
     metrics: CognitiveProjectionMetrics,
 }
 
@@ -161,8 +127,7 @@ impl CognitiveProjectionCoordinatorHandle {
         }
         let revision = current_revision(&self.store, project_id).await?;
         let event_id = dependency_event_id(project_id, revision, event_ref, &paths);
-        let intent = self
-            .store
+        self.store
             .enqueue_cognitive_projection_intent(
                 project_id,
                 &event_id,
@@ -170,15 +135,6 @@ impl CognitiveProjectionCoordinatorHandle {
                 &[CognitiveProjectionFamily::DependencyDirty],
             )
             .await?;
-        if !projection_intent_needs_wake(&intent.status) {
-            return Ok(());
-        }
-        let _ = self.understanding.mark_project_stale(
-            project_id,
-            ProjectProjectionFamily::Dependency,
-            revision,
-            Some("dependency mutation awaits background snapshot publication".to_owned()),
-        );
         self.metrics
             .inner
             .wake_hints
@@ -221,16 +177,8 @@ impl CognitiveProjectionCoordinatorHandle {
             return;
         };
         // This synchronous fence is deliberately before the fallible wake
-        // hint: a full queue must not make an old cue or understanding
-        // snapshot look current.
+        // hint: a full queue must not make an old cue shard look current.
         let _ = self.cue_index.mark_stale(envelope.project_id, revision);
-        if invalidates_understanding_snapshot(receipt.status) {
-            let _ = self.understanding.mark_project_stale_all(
-                envelope.project_id,
-                revision,
-                Some("canonical commit awaits background snapshot publication"),
-            );
-        }
         self.metrics
             .inner
             .wake_hints
@@ -270,8 +218,6 @@ pub struct CognitiveProjectionCoordinator {
     store: CanonicalStore,
     cue_index: Arc<CueIndexService>,
     dependency: Arc<UlDependencyService>,
-    understanding: Arc<UnderstandingRuntime>,
-    project_root: PathBuf,
     receiver: mpsc::Receiver<ProjectionCommand>,
     shutdown: oneshot::Receiver<()>,
     config: CognitiveProjectionCoordinatorConfig,
@@ -288,8 +234,6 @@ impl CognitiveProjectionCoordinator {
         store: CanonicalStore,
         cue_index: Arc<CueIndexService>,
         dependency: Arc<UlDependencyService>,
-        understanding: Arc<UnderstandingRuntime>,
-        project_root: PathBuf,
         config: CognitiveProjectionCoordinatorConfig,
     ) -> (
         CognitiveProjectionCoordinatorHandle,
@@ -303,15 +247,12 @@ impl CognitiveProjectionCoordinator {
             sender,
             store: store.clone(),
             cue_index: Arc::clone(&cue_index),
-            understanding: Arc::clone(&understanding),
             metrics: metrics.clone(),
         };
         let coordinator = Self {
             store,
             cue_index,
             dependency,
-            understanding,
-            project_root,
             receiver,
             shutdown,
             config,
@@ -357,7 +298,7 @@ impl CognitiveProjectionCoordinator {
                 delay = Duration::from_secs(86_400);
                 continue;
             }
-            match Box::pin(self.background_step()).await {
+            match self.background_step().await {
                 Ok(BackgroundStep::Progress) => {
                     delay = Duration::from_millis(10);
                 }
@@ -446,7 +387,7 @@ impl CognitiveProjectionCoordinator {
             )
             .await?
         {
-            Box::pin(self.process_claimed_lease(&lease)).await;
+            self.process_claimed_lease(&lease).await;
             return Ok(BackgroundStep::Progress);
         }
         let backlog = self.store.cognitive_projection_backlog().await?;
@@ -464,40 +405,18 @@ impl CognitiveProjectionCoordinator {
             .await?;
         for project in &page.projects {
             let event_id = recovery_event_id(project.project_id, project.head_revision);
-            let snapshot_is_current = self
-                .understanding
-                .project_snapshot(project.project_id)?
-                .is_some_and(|snapshot| {
-                    snapshot.revisions().canonical == Some(project.head_revision)
-                        && snapshot.is_fully_published()
-                });
-            if snapshot_is_current {
-                self.store
-                    .enqueue_cognitive_projection_intent(
-                        project.project_id,
-                        &event_id,
-                        project.head_revision,
-                        &[
-                            CognitiveProjectionFamily::Search,
-                            CognitiveProjectionFamily::Cue,
-                            CognitiveProjectionFamily::DependencyDirty,
-                        ],
-                    )
-                    .await?;
-            } else {
-                self.store
-                    .rearm_cognitive_projection_recovery_intent(
-                        project.project_id,
-                        &event_id,
-                        project.head_revision,
-                        &[
-                            CognitiveProjectionFamily::Search,
-                            CognitiveProjectionFamily::Cue,
-                            CognitiveProjectionFamily::DependencyDirty,
-                        ],
-                    )
-                    .await?;
-            }
+            self.store
+                .enqueue_cognitive_projection_intent(
+                    project.project_id,
+                    &event_id,
+                    project.head_revision,
+                    &[
+                        CognitiveProjectionFamily::Search,
+                        CognitiveProjectionFamily::Cue,
+                        CognitiveProjectionFamily::DependencyDirty,
+                    ],
+                )
+                .await?;
             self.store
                 .publish_cognitive_projection_family_state(
                     project.project_id,
@@ -540,73 +459,25 @@ impl CognitiveProjectionCoordinator {
 
         for family in &lease.families {
             if let Err(error) = self.process_family(*family, lease, &states).await {
-                let error = self.release_rejected_cue_owner(lease.project_id, error);
                 self.persist_failure(lease, Some(*family), error, &states)
                     .await;
                 return;
             }
         }
-        let staged_snapshot = match Box::pin(self.stage_understanding_snapshot(lease)).await {
-            Ok(snapshot) => snapshot,
-            Err(error) => {
-                let error = self.release_rejected_cue_owner(lease.project_id, error);
-                self.persist_failure(lease, None, error, &states).await;
-                return;
-            }
-        };
-        if let Err(error) = self
+        if self
             .store
             .complete_cognitive_projection_through(lease)
             .await
+            .is_ok()
         {
-            let error = self.release_rejected_cue_owner(lease.project_id, error.into());
-            self.persist_failure(lease, None, error, &states).await;
-            return;
-        }
-        match staged_snapshot {
-            Some(staged_snapshot) => {
-                // A newer canonical or same-head dependency intent safely
-                // supersedes this candidate. The newer outbox row owns the
-                // next publication; the old runtime snapshot remains stale.
-                let adopted = matches!(
-                    Box::pin(self.finalize_understanding_snapshot(staged_snapshot)).await,
-                    Ok(true)
-                );
-                if !adopted {
-                    // Completion is durable, so recover with a new bounded
-                    // project inventory pass rather than mutating the old
-                    // lease or retaining an unadopted hot cue owner.
-                    let _ = self.cue_index.release_strong_owner(lease.project_id);
-                    self.recovery_cursor = Some(0);
-                    self.metrics
-                        .inner
-                        .retryable_failures
-                        .fetch_add(1, Ordering::Relaxed);
-                }
+            for write_id in &lease.write_ids {
+                self.committed.remove(write_id);
+                self.dirty.remove(write_id);
             }
-            None => {
-                // The lease was superseded before a snapshot could be staged.
-                // Drop any service-only candidate installed while processing
-                // its durable cue family; a later inventory pass reloads it.
-                let _ = self.cue_index.release_strong_owner(lease.project_id);
-            }
-        }
-        for write_id in &lease.write_ids {
-            self.committed.remove(write_id);
-            self.dirty.remove(write_id);
-        }
-        self.metrics
-            .inner
-            .completed_leases
-            .fetch_add(1, Ordering::Relaxed);
-    }
-
-    fn release_rejected_cue_owner(&self, project_id: ProjectId, error: EngineError) -> EngineError {
-        match self.cue_index.release_strong_owner(project_id) {
-            Ok(()) => error,
-            Err(cleanup_error) => coordinator_unavailable(&format!(
-                "{error}; failed to release rejected cue candidate: {cleanup_error}"
-            )),
+            self.metrics
+                .inner
+                .completed_leases
+                .fetch_add(1, Ordering::Relaxed);
         }
     }
 
@@ -708,14 +579,12 @@ impl CognitiveProjectionCoordinator {
         state: Option<&CognitiveProjectionFamilyState>,
     ) -> Result<(), EngineError> {
         if family_published_through(state, lease.through_revision) {
-            let revision = state
-                .and_then(|state| state.applied_revision)
-                .ok_or_else(|| {
-                    coordinator_unavailable("published cue state omitted its applied revision")
-                })?;
-            let cached = self.cue_index.snapshot(lease.project_id)?;
-            if !self.warmed_cues.contains(&lease.project_id) || cached.revision() != Some(revision)
-            {
+            if !self.warmed_cues.contains(&lease.project_id) {
+                let revision = state
+                    .and_then(|state| state.applied_revision)
+                    .ok_or_else(|| {
+                        coordinator_unavailable("published cue state omitted its applied revision")
+                    })?;
                 self.cue_index
                     .load_persisted_projection_at(lease.project_id, revision)
                     .await?;
@@ -857,338 +726,6 @@ impl CognitiveProjectionCoordinator {
         ))
     }
 
-    /// Builds and admission-checks one immutable candidate while the lease is
-    /// still fail-able. Visibility is deferred until lease completion makes
-    /// every required durable family Published.
-    async fn stage_understanding_snapshot(
-        &self,
-        lease: &CognitiveProjectionLease,
-    ) -> Result<Option<StagedUnderstandingSnapshot>, EngineError> {
-        let allow_dependency_stale = lease
-            .write_ids
-            .iter()
-            .any(|write_id| write_id.starts_with("dependency-dirty:"));
-        for _attempt in 0..MAX_SNAPSHOT_FENCE_ATTEMPTS {
-            let start_revision = current_revision(&self.store, lease.project_id).await?;
-            if start_revision < lease.through_revision {
-                return Err(coordinator_unavailable(
-                    "canonical head is behind the claimed snapshot revision",
-                ));
-            }
-            if start_revision > lease.through_revision {
-                // A newer durable outbox row owns publication at the advanced
-                // head. Completing this superseded lease avoids pinning the
-                // project while the old revision can no longer be fenced.
-                return Ok(None);
-            }
-            let states = self
-                .store
-                .cognitive_projection_family_states(lease.project_id)
-                .await?;
-            if let Err(error) =
-                require_snapshot_families_ready(&states, start_revision, allow_dependency_stale)
-            {
-                let dependency_only = lease
-                    .families
-                    .iter()
-                    .all(|family| *family == CognitiveProjectionFamily::DependencyDirty);
-                if dependency_only
-                    && self
-                        .understanding
-                        .project_snapshot(lease.project_id)?
-                        .is_none()
-                {
-                    // A derived-only event may precede the first canonical
-                    // project snapshot. It must not fabricate Search/Cue
-                    // publication or block its own durable lease.
-                    return Ok(None);
-                }
-                return Err(error);
-            }
-
-            let cue_projection = self.cue_index.snapshot(lease.project_id)?;
-            if cue_projection.revision() != Some(start_revision)
-                || cue_projection.projection_state() != CognitiveProjectionReadState::Published
-            {
-                return Err(coordinator_unavailable(
-                    "published cue shard does not match the canonical snapshot fence",
-                ));
-            }
-
-            let material = Box::pin(self.load_snapshot_material(lease.project_id)).await?;
-            let dependency_refs = dirty_dependency_refs(&material.dirty);
-            let reverse_dependencies = if dependency_refs.is_empty() {
-                Vec::new()
-            } else {
-                self.store
-                    .load_ul_reverse_dependents(lease.project_id, &dependency_refs)
-                    .await?
-            };
-
-            let end_states = self
-                .store
-                .cognitive_projection_family_states(lease.project_id)
-                .await?;
-            let end_revision = current_revision(&self.store, lease.project_id).await?;
-            if end_revision != start_revision
-                || !snapshot_family_fence_matches(
-                    &states,
-                    &end_states,
-                    start_revision,
-                    allow_dependency_stale,
-                )
-            {
-                continue;
-            }
-
-            let project_root = self.project_root.clone();
-            let project_id = lease.project_id;
-            let snapshot = tokio::task::spawn_blocking(move || {
-                Self::build_understanding_snapshot(
-                    &project_root,
-                    project_id,
-                    start_revision,
-                    &end_states,
-                    allow_dependency_stale,
-                    cue_projection,
-                    material,
-                    &reverse_dependencies,
-                )
-            })
-            .await
-            .map_err(|error| {
-                coordinator_unavailable(&format!(
-                    "understanding snapshot builder task failed: {error}"
-                ))
-            })??;
-            return Ok(Some(StagedUnderstandingSnapshot {
-                revision: start_revision,
-                snapshot,
-            }));
-        }
-        Err(coordinator_unavailable(
-            "canonical revision changed during four understanding snapshot attempts",
-        ))
-    }
-
-    async fn finalize_understanding_snapshot(
-        &self,
-        staged: StagedUnderstandingSnapshot,
-    ) -> Result<bool, EngineError> {
-        let states = self
-            .store
-            .cognitive_projection_family_states(staged.snapshot.project_id())
-            .await?;
-        let revision = current_revision(&self.store, staged.snapshot.project_id()).await?;
-        if revision != staged.revision
-            || require_snapshot_families_published(&states, staged.revision).is_err()
-        {
-            return Ok(false);
-        }
-        let cue_projection = self.cue_index.snapshot(staged.snapshot.project_id())?;
-        if cue_projection.revision() != Some(staged.revision)
-            || cue_projection.projection_state() != CognitiveProjectionReadState::Published
-        {
-            return Ok(false);
-        }
-        if self
-            .understanding
-            .project_snapshot(staged.snapshot.project_id())?
-            .is_some_and(|current| {
-                current.revisions() == staged.snapshot.revisions()
-                    && current.health() == staged.snapshot.health()
-                    && current.health().cue.state == CognitiveProjectionReadState::Published
-                    && current.health().pyramid.state == CognitiveProjectionReadState::Published
-                    && current.health().activation.state == CognitiveProjectionReadState::Published
-                    && current.health().dependency.state == CognitiveProjectionReadState::Published
-            })
-        {
-            self.cue_index
-                .release_strong_owner(staged.snapshot.project_id())?;
-            return Ok(true);
-        }
-        self.understanding.install_project(staged.snapshot)?;
-        self.cue_index
-            .release_strong_owner(cue_projection.project_id())?;
-
-        // Close the install race. Notifications synchronously stale a later
-        // commit/dirty intent, while this recheck covers a change that landed
-        // between the pre-install proof and the Arc swap.
-        let post_states = self
-            .store
-            .cognitive_projection_family_states(cue_projection.project_id())
-            .await?;
-        let post_revision = current_revision(&self.store, cue_projection.project_id()).await?;
-        if post_revision != staged.revision
-            || !snapshot_family_fence_matches(&states, &post_states, staged.revision, false)
-        {
-            mark_understanding_stale(
-                &self.understanding,
-                cue_projection.project_id(),
-                post_revision,
-                "projection family changed during snapshot installation",
-            );
-        }
-        Ok(true)
-    }
-
-    async fn load_snapshot_material(
-        &self,
-        project_id: ProjectId,
-    ) -> Result<SnapshotMaterial, EngineError> {
-        let (records, charters, maps, concepts, capsules, cards, hotspots, activation_graph, dirty) =
-            tokio::try_join!(
-                self.store.load_cue_records(project_id),
-                self.store.load_ul_artifacts::<ProjectCharter>(
-                    project_id,
-                    &["project_charter"],
-                    SNAPSHOT_CHARTER_MAP_PAGE_SIZE,
-                ),
-                self.store.load_ul_artifacts::<SystemMap>(
-                    project_id,
-                    &["system_map"],
-                    SNAPSHOT_CHARTER_MAP_PAGE_SIZE,
-                ),
-                self.store.load_ul_artifacts::<ConceptNode>(
-                    project_id,
-                    &["concept_node"],
-                    SNAPSHOT_CONCEPT_CAPSULE_PAGE_SIZE,
-                ),
-                self.store.load_ul_artifacts::<SubsystemCapsule>(
-                    project_id,
-                    &["subsystem_capsule"],
-                    SNAPSHOT_CONCEPT_CAPSULE_PAGE_SIZE,
-                ),
-                self.store.load_ul_artifacts::<ModuleCard>(
-                    project_id,
-                    &["module_card"],
-                    SNAPSHOT_CARD_HOTSPOT_PAGE_SIZE,
-                ),
-                self.store.load_ul_artifacts::<HotspotScore>(
-                    project_id,
-                    &["hotspot_score"],
-                    SNAPSHOT_CARD_HOTSPOT_PAGE_SIZE,
-                ),
-                self.store.load_ul_activation_graph(project_id),
-                self.store
-                    .load_ul_dirty_artifacts(project_id, SNAPSHOT_DIRTY_LIMIT),
-            )?;
-        Ok(SnapshotMaterial {
-            records,
-            charters,
-            maps,
-            concepts,
-            capsules,
-            cards,
-            hotspots,
-            activation_graph,
-            dirty,
-        })
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn build_understanding_snapshot(
-        project_root: &Path,
-        project_id: ProjectId,
-        revision: MemoryRevision,
-        states: &[CognitiveProjectionFamilyState],
-        allow_dependency_stale: bool,
-        cue_projection: crate::CueIndexSnapshot,
-        material: SnapshotMaterial,
-        reverse_dependencies: &[UlReverseDependencyRow],
-    ) -> Result<ProjectSnapshot, EngineError> {
-        let charter = latest_artifact(material.charters, |artifact| {
-            artifact.project_id.to_string()
-        });
-        let system_map = latest_artifact(material.maps, |artifact| artifact.project_id.to_string());
-        let concepts = latest_artifacts(material.concepts, |artifact| artifact.concept_id.clone())
-            .into_values()
-            .collect::<Vec<_>>();
-        let capsules = latest_artifacts(material.capsules, |artifact| artifact.concept_id.clone())
-            .into_values()
-            .collect::<Vec<_>>();
-        let cards = latest_artifacts(material.cards, |artifact| artifact.card_id.clone())
-            .into_values()
-            .collect::<Vec<_>>();
-        let hotspots = latest_artifacts(material.hotspots, |artifact| artifact.hotspot_id.clone())
-            .into_values()
-            .collect::<Vec<_>>();
-        let target_handles =
-            artifact_target_handles(charter.as_ref(), system_map.as_ref(), &capsules, &cards);
-        let dirty_targets = material
-            .dirty
-            .iter()
-            .filter(|state| state.dirty)
-            .map(|state| ((state.target_kind, state.target_id.clone()), state))
-            .collect::<BTreeMap<_, _>>();
-        let fresh_capsules = capsules
-            .iter()
-            .cloned()
-            .map(|mut artifact| {
-                let dirty = dirty_targets
-                    .get(&(
-                        PyramidTargetKind::SubsystemCapsule,
-                        artifact.concept_id.clone(),
-                    ))
-                    .filter(|state| state.build_id == artifact.build_id)
-                    .copied();
-                let freshness =
-                    artifact_freshness(&artifact.dependency_manifest, project_root, dirty);
-                artifact.body_md = render_capsule_with_dirty(&artifact, project_root, dirty);
-                FreshArtifact {
-                    artifact,
-                    freshness,
-                }
-            })
-            .collect::<Vec<_>>();
-        let fresh_cards = cards
-            .iter()
-            .cloned()
-            .map(|artifact| FreshArtifact {
-                freshness: artifact_freshness(
-                    &artifact.dependency_manifest,
-                    project_root,
-                    dirty_targets
-                        .get(&(PyramidTargetKind::ModuleCard, artifact.path.clone()))
-                        .filter(|state| state.build_id == artifact.build_fingerprint)
-                        .copied(),
-                ),
-                artifact,
-            })
-            .collect::<Vec<_>>();
-        let metacognition = MetacognitionService::evaluate(
-            project_root,
-            &concepts,
-            &capsules,
-            &cards,
-            &hotspots,
-            &material.records,
-            &[],
-        );
-        ProjectSnapshotBuilder::default().build(ProjectSnapshotInput {
-            project_id,
-            revisions: ProjectRevisions {
-                canonical: Some(revision),
-                cue: Some(revision),
-                pyramid: Some(revision),
-                activation: Some(revision),
-                dependency: Some(revision),
-            },
-            health: snapshot_health(states, revision, allow_dependency_stale)?,
-            cue_projection,
-            records: material.records,
-            charter,
-            system_map,
-            concepts,
-            capsules: fresh_capsules,
-            cards: fresh_cards,
-            activation_projection: ActivationProjection::from_graph(&material.activation_graph),
-            dirty: dirty_artifact_projection(&material.dirty, &target_handles),
-            dependencies: dependency_projection(reverse_dependencies, &target_handles),
-            metacognition,
-        })
-    }
-
     async fn persist_failure(
         &self,
         lease: &CognitiveProjectionLease,
@@ -1238,334 +775,6 @@ impl CognitiveProjectionCoordinator {
                 .await;
         }
     }
-}
-
-fn require_snapshot_families_published(
-    states: &[CognitiveProjectionFamilyState],
-    revision: MemoryRevision,
-) -> Result<(), EngineError> {
-    require_snapshot_families_ready(states, revision, false)
-}
-
-fn require_snapshot_families_ready(
-    states: &[CognitiveProjectionFamilyState],
-    revision: MemoryRevision,
-    allow_dependency_stale: bool,
-) -> Result<(), EngineError> {
-    for family in [
-        CognitiveProjectionFamily::Search,
-        CognitiveProjectionFamily::Cue,
-        CognitiveProjectionFamily::DependencyDirty,
-    ] {
-        let state = states.iter().find(|state| state.family == family);
-        if !state.is_some_and(|state| {
-            let acceptable_status = state.status == CognitiveProjectionPublicationStatus::Published
-                || (allow_dependency_stale
-                    && family == CognitiveProjectionFamily::DependencyDirty
-                    && state.status == CognitiveProjectionPublicationStatus::Stale);
-            acceptable_status
-                && state.target_revision == revision
-                && state.applied_revision == Some(revision)
-        }) {
-            return Err(coordinator_unavailable(&format!(
-                "{family:?} is not durably published at snapshot revision {}",
-                revision.value()
-            )));
-        }
-    }
-    Ok(())
-}
-
-fn snapshot_family_fence_matches(
-    before: &[CognitiveProjectionFamilyState],
-    after: &[CognitiveProjectionFamilyState],
-    revision: MemoryRevision,
-    allow_dependency_stale: bool,
-) -> bool {
-    if require_snapshot_families_ready(before, revision, allow_dependency_stale).is_err()
-        || require_snapshot_families_ready(after, revision, allow_dependency_stale).is_err()
-    {
-        return false;
-    }
-    [
-        CognitiveProjectionFamily::Search,
-        CognitiveProjectionFamily::Cue,
-        CognitiveProjectionFamily::DependencyDirty,
-    ]
-    .into_iter()
-    .all(|family| {
-        let before = before.iter().find(|state| state.family == family);
-        let after = after.iter().find(|state| state.family == family);
-        before == after
-    })
-}
-
-fn snapshot_health(
-    states: &[CognitiveProjectionFamilyState],
-    revision: MemoryRevision,
-    allow_dependency_stale: bool,
-) -> Result<ProjectProjectionHealth, EngineError> {
-    require_snapshot_families_ready(states, revision, allow_dependency_stale)?;
-    let family_health = |family| {
-        let state = states.iter().find(|state| state.family == family);
-        ProjectionFamilyHealth {
-            state: state.map_or(CognitiveProjectionReadState::Unavailable, |state| {
-                publication_read_state(state.status)
-            }),
-            revision: state.and_then(|state| state.applied_revision),
-            detail: state.and_then(|state| state.last_error.clone()),
-        }
-    };
-    Ok(ProjectProjectionHealth {
-        cue: family_health(CognitiveProjectionFamily::Cue),
-        pyramid: ProjectionFamilyHealth {
-            state: CognitiveProjectionReadState::Published,
-            revision: Some(revision),
-            detail: None,
-        },
-        activation: ProjectionFamilyHealth {
-            state: CognitiveProjectionReadState::Published,
-            revision: Some(revision),
-            detail: None,
-        },
-        dependency: if allow_dependency_stale {
-            ProjectionFamilyHealth {
-                state: CognitiveProjectionReadState::Published,
-                revision: Some(revision),
-                detail: None,
-            }
-        } else {
-            family_health(CognitiveProjectionFamily::DependencyDirty)
-        },
-    })
-}
-
-const fn publication_read_state(
-    status: CognitiveProjectionPublicationStatus,
-) -> CognitiveProjectionReadState {
-    match status {
-        CognitiveProjectionPublicationStatus::Published => CognitiveProjectionReadState::Published,
-        CognitiveProjectionPublicationStatus::Stale => CognitiveProjectionReadState::Stale,
-        CognitiveProjectionPublicationStatus::Blocked => CognitiveProjectionReadState::Blocked,
-        CognitiveProjectionPublicationStatus::Unavailable => {
-            CognitiveProjectionReadState::Unavailable
-        }
-    }
-}
-
-fn latest_artifact<T, F>(records: Vec<CanonicalRecord<T>>, key: F) -> Option<T>
-where
-    F: Fn(&T) -> String,
-{
-    latest_artifacts(records, key).into_values().next()
-}
-
-fn latest_artifacts<T, F>(records: Vec<CanonicalRecord<T>>, key: F) -> BTreeMap<String, T>
-where
-    F: Fn(&T) -> String,
-{
-    let mut selected = BTreeMap::<String, CanonicalRecord<T>>::new();
-    for record in records {
-        let identity = key(&record.receipt_body);
-        let candidate_order = (
-            record.memory_revision.map_or(0, MemoryRevision::value),
-            record
-                .project_sequence
-                .map_or(0, eliot_types::ProjectSequence::value),
-        );
-        let replace = selected.get(&identity).is_none_or(|current| {
-            candidate_order
-                > (
-                    current.memory_revision.map_or(0, MemoryRevision::value),
-                    current
-                        .project_sequence
-                        .map_or(0, eliot_types::ProjectSequence::value),
-                )
-        });
-        if replace {
-            selected.insert(identity, record);
-        }
-    }
-    selected
-        .into_iter()
-        .map(|(key, record)| (key, record.receipt_body))
-        .collect()
-}
-
-fn artifact_freshness(
-    manifest: &DependencyManifest,
-    fallback_project_root: &Path,
-    dirty: Option<&UlArtifactDirtyState>,
-) -> SnapshotFreshness {
-    if dirty.is_some_and(|state| state.dirty) {
-        return SnapshotFreshness::Stale;
-    }
-    let project_root = if manifest.project_root.trim().is_empty() {
-        fallback_project_root.to_path_buf()
-    } else {
-        PathBuf::from(&manifest.project_root)
-    };
-    for dependency in &manifest.file_deps {
-        let path = project_root.join(&dependency.path);
-        if file_blake3(&path).as_deref() != Some(dependency.blake3.as_str()) {
-            return SnapshotFreshness::Stale;
-        }
-    }
-    SnapshotFreshness::Fresh
-}
-
-fn file_blake3(path: &Path) -> Option<String> {
-    let mut file = std::fs::File::open(path).ok()?;
-    let mut hasher = blake3::Hasher::new();
-    let mut buffer = vec![0_u8; 64 * 1024];
-    loop {
-        let read = file.read(&mut buffer).ok()?;
-        if read == 0 {
-            return Some(hasher.finalize().to_hex().to_string());
-        }
-        hasher.update(&buffer[..read]);
-    }
-}
-
-fn dirty_dependency_refs(states: &[UlArtifactDirtyState]) -> Vec<UlDependencyRef> {
-    let mut refs = states
-        .iter()
-        .flat_map(|state| state.reasons.iter().map(|reason| reason.dependency.clone()))
-        .collect::<Vec<_>>();
-    refs.sort();
-    refs.dedup();
-    refs
-}
-
-fn artifact_target_handles(
-    charter: Option<&ProjectCharter>,
-    system_map: Option<&SystemMap>,
-    capsules: &[SubsystemCapsule],
-    cards: &[ModuleCard],
-) -> BTreeMap<(PyramidTargetKind, String), String> {
-    let mut handles = BTreeMap::new();
-    if let Some(charter) = charter {
-        handles.insert(
-            (
-                PyramidTargetKind::ProjectCharter,
-                charter.project_id.to_string(),
-            ),
-            format!("charter:{}", charter.charter_id),
-        );
-    }
-    if let Some(system_map) = system_map {
-        handles.insert(
-            (
-                PyramidTargetKind::SystemMap,
-                system_map.project_id.to_string(),
-            ),
-            format!("system-map:{}", system_map.map_id),
-        );
-    }
-    handles.extend(capsules.iter().map(|capsule| {
-        (
-            (
-                PyramidTargetKind::SubsystemCapsule,
-                capsule.concept_id.clone(),
-            ),
-            format!("capsule:{}", capsule.capsule_id),
-        )
-    }));
-    handles.extend(cards.iter().map(|card| {
-        (
-            (PyramidTargetKind::ModuleCard, card.path.clone()),
-            format!("card:{}", card.card_id),
-        )
-    }));
-    handles
-}
-
-fn dirty_artifact_projection(
-    states: &[UlArtifactDirtyState],
-    target_handles: &BTreeMap<(PyramidTargetKind, String), String>,
-) -> Vec<DirtyArtifactProjection> {
-    let mut projection = states
-        .iter()
-        .filter(|state| state.dirty)
-        .map(|state| {
-            let mut changed_dependencies = state
-                .reasons
-                .iter()
-                .map(|reason| dependency_ref(&reason.dependency))
-                .collect::<Vec<_>>();
-            changed_dependencies.sort();
-            changed_dependencies.dedup();
-            DirtyArtifactProjection {
-                artifact_ref: target_handles
-                    .get(&(state.target_kind, state.target_id.clone()))
-                    .cloned()
-                    .unwrap_or_else(|| pyramid_artifact_ref(state.target_kind, &state.target_id)),
-                changed_dependencies,
-            }
-        })
-        .collect::<Vec<_>>();
-    projection.sort_by(|left, right| left.artifact_ref.cmp(&right.artifact_ref));
-    projection.dedup_by(|left, right| left.artifact_ref == right.artifact_ref);
-    projection
-}
-
-fn dependency_projection(
-    rows: &[UlReverseDependencyRow],
-    target_handles: &BTreeMap<(PyramidTargetKind, String), String>,
-) -> Vec<DependencyProjection> {
-    let mut by_dependency = BTreeMap::<String, Vec<String>>::new();
-    for row in rows {
-        by_dependency
-            .entry(dependency_ref(&row.dependency))
-            .or_default()
-            .push(
-                target_handles
-                    .get(&(row.target_kind, row.target_id.clone()))
-                    .cloned()
-                    .unwrap_or_else(|| pyramid_artifact_ref(row.target_kind, &row.target_id)),
-            );
-    }
-    by_dependency
-        .into_iter()
-        .map(|(dependency_ref, mut dependent_artifact_refs)| {
-            dependent_artifact_refs.sort();
-            dependent_artifact_refs.dedup();
-            DependencyProjection {
-                dependency_ref,
-                dependent_artifact_refs,
-            }
-        })
-        .collect()
-}
-
-fn dependency_ref(dependency: &UlDependencyRef) -> String {
-    let kind = match dependency.kind {
-        UlDependencyKind::File => "file",
-        UlDependencyKind::Claim => "claim",
-        UlDependencyKind::Decision => "decision",
-        UlDependencyKind::Edge => "edge",
-        UlDependencyKind::Report => "report",
-    };
-    format!("{kind}:{}", dependency.key)
-}
-
-fn pyramid_artifact_ref(kind: PyramidTargetKind, target_id: &str) -> String {
-    let prefix = match kind {
-        PyramidTargetKind::ModuleCard => "card",
-        PyramidTargetKind::SubsystemCapsule => "capsule",
-        PyramidTargetKind::SystemMap => "system-map",
-        PyramidTargetKind::ProjectCharter => "charter",
-    };
-    format!("{prefix}:{target_id}")
-}
-
-fn mark_understanding_stale(
-    understanding: &UnderstandingRuntime,
-    project_id: ProjectId,
-    revision: MemoryRevision,
-    detail: &str,
-) {
-    let _ = understanding.mark_project_stale_all(project_id, revision, Some(detail));
 }
 
 #[derive(Clone)]
@@ -1652,14 +861,6 @@ fn recovery_event_id(project_id: ProjectId, revision: MemoryRevision) -> String 
     format!("recovery:{project_id}:{}", revision.value())
 }
 
-const fn invalidates_understanding_snapshot(status: WriteStatus) -> bool {
-    matches!(status, WriteStatus::Committed)
-}
-
-fn projection_intent_needs_wake(status: &str) -> bool {
-    matches!(status, "pending" | "retryable" | "leased")
-}
-
 fn coordinator_unavailable(reason: &str) -> EngineError {
     EngineError::ServiceNotReady {
         service: "cognitive_projection".to_owned(),
@@ -1700,14 +901,11 @@ mod tests {
     use super::{
         CognitiveProjectionCoordinator, CognitiveProjectionCoordinatorConfig,
         CognitiveProjectionPublicationStatus, ProjectionCommand, dependency_event_id,
-        invalidates_understanding_snapshot, projection_intent_needs_wake, recovery_event_id,
-        require_snapshot_families_published, require_snapshot_families_ready, retry_delay_seconds,
-        snapshot_family_fence_matches,
+        recovery_event_id, retry_delay_seconds,
     };
     use crate::{
-        CueIndexService, DeliveredFingerprint, InjectionSelectionPolicy, UlDependencyService,
-        UnderstandingRuntime, UnderstandingRuntimeConfig, WriteAdmissionService, WriterActor,
-        WriterConfig, WriterShutdownHandle,
+        CueIndexService, InjectionPlanner, TouchedSetRegistry, UlDependencyService,
+        WriteAdmissionService, WriterActor, WriterConfig, WriterShutdownHandle,
     };
     use eliot_store::{CanonicalStore, ControlWal, DbClientSet};
     use eliot_types::{
@@ -1775,69 +973,15 @@ mod tests {
         );
     }
 
-    #[test]
-    fn idempotent_replay_does_not_invalidate_understanding_snapshot() {
-        assert!(invalidates_understanding_snapshot(WriteStatus::Committed));
-        assert!(!invalidates_understanding_snapshot(
-            WriteStatus::IdempotentReplay
-        ));
-    }
-
-    #[test]
-    fn applied_dependency_intent_does_not_reinvalidate_understanding_snapshot() {
-        assert!(projection_intent_needs_wake("pending"));
-        assert!(projection_intent_needs_wake("retryable"));
-        assert!(projection_intent_needs_wake("leased"));
-        assert!(!projection_intent_needs_wake("applied"));
-        assert!(!projection_intent_needs_wake("blocked"));
-    }
-
-    #[test]
-    fn same_head_dependency_snapshot_waits_for_lease_completion() {
-        let project_id = ProjectId::new_v7();
-        let revision = MemoryRevision::new(7);
-        let now = OffsetDateTime::now_utc();
-        let mut states = [
-            super::CognitiveProjectionFamily::Search,
-            super::CognitiveProjectionFamily::Cue,
-            super::CognitiveProjectionFamily::DependencyDirty,
-        ]
-        .into_iter()
-        .map(|family| super::CognitiveProjectionFamilyState {
-            project_id,
-            family,
-            target_revision: revision,
-            applied_revision: Some(revision),
-            status: CognitiveProjectionPublicationStatus::Published,
-            last_error: None,
-            updated_at: now,
-        })
-        .collect::<Vec<_>>();
-        states[2].status = CognitiveProjectionPublicationStatus::Stale;
-
-        assert!(require_snapshot_families_ready(&states, revision, true).is_ok());
-        assert!(require_snapshot_families_published(&states, revision).is_err());
-
-        let mut completed = states.clone();
-        completed[2].status = CognitiveProjectionPublicationStatus::Published;
-        assert!(require_snapshot_families_published(&completed, revision).is_ok());
-        assert!(!snapshot_family_fence_matches(
-            &states, &completed, revision, true
-        ));
-    }
-
     #[tokio::test]
     async fn recovery_acknowledges_without_a_store_round_trip() -> TestResult {
         let store = CanonicalStore::new(GovernorConfig::default().db.surreal);
         let cue_index = Arc::new(CueIndexService::new(store.clone()));
         let dependency = Arc::new(UlDependencyService::new(store.clone()));
-        let understanding = Arc::new(UnderstandingRuntime::default());
         let (_handle, mut coordinator, _shutdown) = CognitiveProjectionCoordinator::channel(
             store,
             cue_index,
             dependency,
-            understanding,
-            PathBuf::new(),
             CognitiveProjectionCoordinatorConfig::default(),
         );
         let (reply, response) = tokio::sync::oneshot::channel();
@@ -1869,17 +1013,11 @@ mod tests {
         store.migrate_schema().await?;
         let cue_index = Arc::new(CueIndexService::new(store.clone()));
         let dependency = Arc::new(UlDependencyService::new(store.clone()));
-        let understanding = Arc::new(UnderstandingRuntime::new(UnderstandingRuntimeConfig {
-            activation_enable_min_edges: u32::MAX,
-            ..UnderstandingRuntimeConfig::default()
-        }));
         let (projection, coordinator, projection_shutdown) =
             CognitiveProjectionCoordinator::channel(
                 store.clone(),
                 Arc::clone(&cue_index),
                 dependency,
-                Arc::clone(&understanding),
-                owned_root.clone(),
                 CognitiveProjectionCoordinatorConfig {
                     queue_capacity: 1,
                     lease_seconds: 60,
@@ -1898,6 +1036,15 @@ mod tests {
             store.clone(),
             &WriterConfig::default(),
             projection.clone(),
+        );
+        let touched = Arc::new(TouchedSetRegistry::new());
+        let injection = InjectionPlanner::with_project_root_and_activation_min_edges(
+            Arc::clone(&cue_index),
+            store.clone(),
+            writer.clone(),
+            Arc::clone(&touched),
+            owned_root.clone(),
+            u32::MAX,
         );
         let mut writer_shutdown = Some(writer_shutdown);
         let mut projection_shutdown = Some(projection_shutdown);
@@ -1976,10 +1123,6 @@ mod tests {
                 store.cognitive_projection_backlog().await?.pending == 4,
                 "public L0 mutated the projection outbox",
             )?;
-            require(
-                understanding.project_snapshot(project_id)?.is_none(),
-                "understanding snapshot became visible before durable family publication",
-            )?;
 
             let coordinator = coordinator
                 .take()
@@ -2025,17 +1168,6 @@ mod tests {
                         .any(|handle| handle.handle == expected_handle),
                 "recovered FTS projection did not serve the committed target",
             )?;
-            let published_snapshot = understanding
-                .project_snapshot(project_id)?
-                .ok_or("understanding snapshot was unavailable after family publication")?;
-            require(
-                published_snapshot.revisions().canonical == Some(expected_revision)
-                    && published_snapshot.revisions().cue == Some(expected_revision)
-                    && published_snapshot.revisions().pyramid == Some(expected_revision)
-                    && published_snapshot.revisions().activation == Some(expected_revision)
-                    && published_snapshot.revisions().dependency == Some(expected_revision),
-                "understanding snapshot did not preserve its exact canonical revision fence",
-            )?;
             let metrics = projection.metrics().snapshot();
             require(
                 metrics.completed_leases >= 1 && metrics.cold_rebuilds >= 3,
@@ -2074,8 +1206,6 @@ mod tests {
                 .memory_revision
                 .ok_or("revision-one card receipt omitted its memory revision")?;
             wait_for_cue_publication(&store, injection_project_id, first_head).await?;
-            wait_for_understanding_snapshot(&understanding, injection_project_id, first_head)
-                .await?;
 
             let observed_cues = [ObservedCue {
                 kind: CueKind::FilePath,
@@ -2097,66 +1227,56 @@ mod tests {
                         .any(|item| item.record_ref == card_ref),
                 "published revision-one cue shard did not fire the failure/card pair",
             )?;
-            let first_plan = understanding.plan_cues(
-                injection_project_id,
-                injection_session_id,
-                None,
-                &observed_cues,
-            )?;
-            understanding.enqueue_plan(injection_project_id, injection_session_id, &first_plan)?;
-            let first_failure_position = first_plan
-                .items
+            let first_planned = injection
+                .plan_after_tool(injection_project_id, injection_session_id, &observed_cues)
+                .await?;
+            let first_failure_position = first_planned
                 .iter()
                 .position(|item| item.item_ref == failure_ref)
                 .ok_or("revision-one failure was not planned")?;
-            let first_card_position = first_plan
-                .items
+            let first_card_position = first_planned
                 .iter()
                 .position(|item| item.item_ref == card_ref)
                 .ok_or("revision-one card was not planned")?;
             require(
-                first_plan.items.len() == 2 && first_failure_position < first_card_position,
+                first_planned.len() == 2 && first_failure_position < first_card_position,
                 "revision-one planner did not preserve danger-before-card ordering",
             )?;
-            let first_failure_source = first_plan.items[first_failure_position]
+            let first_failure_source = first_planned[first_failure_position]
                 .source_fingerprint
                 .clone();
-            let first_card_source = first_plan.items[first_card_position]
+            let first_card_source = first_planned[first_card_position]
                 .source_fingerprint
                 .clone();
-            let first_selection = understanding.select_pending_with_policy(
-                injection_project_id,
-                injection_session_id,
-                UlInjectionMode::Payload,
-                InjectionSelectionPolicy {
-                    max_items: 3,
-                    max_token_units: 400,
-                    max_negative_payloads: 3,
-                },
-            )?;
-            let first_items = &first_selection.items;
+            let mut first_response = json!({"at_revision": first_head.value()});
+            let first_injection_receipts = injection
+                .attach(
+                    injection_project_id,
+                    None,
+                    injection_session_id,
+                    &mut first_response,
+                    Some(UlInjectionMode::Payload),
+                )
+                .await?;
+            let first_items = first_response
+                .pointer("/ul_fired/items")
+                .and_then(Value::as_array)
+                .ok_or("revision-one attach omitted ul_fired.items")?;
             require(
                 first_items.len() == 2
-                    && first_items[0].item_ref == failure_ref
-                    && first_items[1].item_ref == card_ref
-                    && first_items[0]
-                        .payload
-                        .as_ref()
-                        .and_then(|payload| payload.get("source_revision"))
-                        .and_then(Value::as_u64)
-                        == Some(1),
-                "revision-one selection did not deliver the ordered failure/card payload",
+                    && first_items[0]["item_ref"] == failure_ref
+                    && first_items[1]["item_ref"] == card_ref
+                    && first_items[0]["payload"]["source_revision"] == 1,
+                "revision-one attach did not deliver the ordered failure/card payload",
             )?;
-            understanding.acknowledge_delivered(
-                injection_project_id,
-                injection_session_id,
-                &first_items
-                    .iter()
-                    .map(|item| DeliveredFingerprint {
-                        item_ref: item.item_ref.clone(),
-                        source_fingerprint: item.source_fingerprint.clone(),
-                    })
-                    .collect::<Vec<_>>(),
+            require(
+                first_injection_receipts.iter().any(|receipt| {
+                    receipt.item_ref == failure_ref
+                        && receipt.source_fingerprint == first_failure_source
+                }) && first_injection_receipts.iter().any(|receipt| {
+                    receipt.item_ref == card_ref && receipt.source_fingerprint == first_card_source
+                }),
+                "revision-one delivery ledger omitted a planned source fingerprint",
             )?;
 
             let second_failure_receipt = writer
@@ -2175,22 +1295,14 @@ mod tests {
                 .memory_revision
                 .ok_or("revision-two failure receipt omitted its memory revision")?;
             wait_for_cue_publication(&store, injection_project_id, second_head).await?;
-            wait_for_understanding_snapshot(&understanding, injection_project_id, second_head)
+            let second_planned = injection
+                .plan_after_tool(injection_project_id, injection_session_id, &observed_cues)
                 .await?;
-            let second_plan = understanding.plan_cues(
-                injection_project_id,
-                injection_session_id,
-                None,
-                &observed_cues,
-            )?;
-            understanding.enqueue_plan(injection_project_id, injection_session_id, &second_plan)?;
-            let second_failure = second_plan
-                .items
+            let second_failure = second_planned
                 .iter()
                 .find(|item| item.item_ref == failure_ref)
                 .ok_or("revision-two failure was not planned")?;
-            let second_card = second_plan
-                .items
+            let second_card = second_planned
                 .iter()
                 .find(|item| item.item_ref == card_ref)
                 .ok_or("unchanged revision-two card was not planned")?;
@@ -2200,32 +1312,33 @@ mod tests {
                 "revision-two source fingerprints did not distinguish changed from unchanged",
             )?;
             let second_failure_source = second_failure.source_fingerprint.clone();
-            let second_selection = understanding.select_pending_with_policy(
-                injection_project_id,
-                injection_session_id,
-                UlInjectionMode::Payload,
-                InjectionSelectionPolicy {
-                    max_items: 3,
-                    max_token_units: 400,
-                    max_negative_payloads: 3,
-                },
-            )?;
-            let second_items = &second_selection.items;
+            let mut second_response = json!({"at_revision": second_head.value()});
+            let second_injection_receipts = injection
+                .attach(
+                    injection_project_id,
+                    None,
+                    injection_session_id,
+                    &mut second_response,
+                    Some(UlInjectionMode::Payload),
+                )
+                .await?;
+            let second_items = second_response
+                .pointer("/ul_fired/items")
+                .and_then(Value::as_array)
+                .ok_or("revision-two attach omitted ul_fired.items")?;
             require(
                 second_items.len() == 1
-                    && second_items[0].item_ref == failure_ref
-                    && second_items[0]
-                        .payload
-                        .as_ref()
-                        .and_then(|payload| payload.get("source_revision"))
-                        .and_then(Value::as_u64)
-                        == Some(2),
-                "revision-two selection did not redeliver only the changed failure",
+                    && second_items[0]["item_ref"] == failure_ref
+                    && second_items[0]["payload"]["source_revision"] == 2,
+                "revision-two attach did not redeliver only the changed failure",
             )?;
             require(
-                second_items.iter().any(|item| {
-                    item.item_ref == failure_ref && item.source_fingerprint == second_failure_source
-                }) && !second_items.iter().any(|item| item.item_ref == card_ref),
+                second_injection_receipts.iter().any(|receipt| {
+                    receipt.item_ref == failure_ref
+                        && receipt.source_fingerprint == second_failure_source
+                }) && !second_injection_receipts
+                    .iter()
+                    .any(|receipt| receipt.item_ref == card_ref),
                 "same-session ledger did not redeliver the changed failure and suppress the card",
             )?;
 
@@ -2246,65 +1359,6 @@ mod tests {
                 shutdown_receipt.status == WriteStatus::Committed,
                 "accepted successful write did not commit while writer drained",
             )?;
-            wait_for_empty_projection_backlog(&store).await?;
-            let applied_recovery = store
-                .enqueue_cognitive_projection_intent(
-                    same_head_project,
-                    &recovery_event_id(same_head_project, expected_revision),
-                    expected_revision,
-                    &[
-                        super::CognitiveProjectionFamily::Search,
-                        super::CognitiveProjectionFamily::Cue,
-                        super::CognitiveProjectionFamily::DependencyDirty,
-                    ],
-                )
-                .await?;
-            require(
-                applied_recovery.status == "applied",
-                "cold restart fixture did not begin from an applied deterministic recovery row",
-            )?;
-            require(
-                understanding
-                    .project_snapshot(same_head_project)?
-                    .is_some_and(|snapshot| snapshot.is_fully_published()),
-                "first coordinator did not publish the cold restart fixture snapshot",
-            )?;
-            stop_projection(&mut projection_shutdown, &mut projection_task).await?;
-
-            let cold_cue_index = Arc::new(CueIndexService::new(store.clone()));
-            let cold_understanding =
-                Arc::new(UnderstandingRuntime::new(UnderstandingRuntimeConfig {
-                    activation_enable_min_edges: u32::MAX,
-                    ..UnderstandingRuntimeConfig::default()
-                }));
-            let (cold_projection, cold_coordinator, cold_shutdown) =
-                CognitiveProjectionCoordinator::channel(
-                    store.clone(),
-                    cold_cue_index,
-                    Arc::new(UlDependencyService::new(store.clone())),
-                    Arc::clone(&cold_understanding),
-                    owned_root.clone(),
-                    CognitiveProjectionCoordinatorConfig {
-                        queue_capacity: 1,
-                        lease_seconds: 60,
-                        ..CognitiveProjectionCoordinatorConfig::default()
-                    },
-                );
-            projection_shutdown = Some(cold_shutdown);
-            projection_task = Some(tokio::spawn(cold_coordinator.run()));
-            require(
-                cold_understanding
-                    .project_snapshot(same_head_project)?
-                    .is_none(),
-                "fresh process fixture unexpectedly retained an understanding snapshot",
-            )?;
-            cold_projection.recover().await?;
-            wait_for_understanding_snapshot(
-                &cold_understanding,
-                same_head_project,
-                expected_revision,
-            )
-            .await?;
             wait_for_empty_projection_backlog(&store).await?;
             stop_projection(&mut projection_shutdown, &mut projection_task).await?;
             // The writer handle intentionally remains alive across explicit
@@ -2377,35 +1431,6 @@ mod tests {
             if Instant::now() >= deadline {
                 return Err(format!(
                     "cue projection did not publish revision {}: {states:?}",
-                    expected_revision.value()
-                )
-                .into());
-            }
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
-    }
-
-    async fn wait_for_understanding_snapshot(
-        understanding: &UnderstandingRuntime,
-        project_id: ProjectId,
-        expected_revision: MemoryRevision,
-    ) -> TestResult {
-        let deadline = Instant::now() + Duration::from_secs(30);
-        loop {
-            if understanding
-                .project_snapshot(project_id)?
-                .is_some_and(|snapshot| {
-                    snapshot.revisions().canonical == Some(expected_revision)
-                        && snapshot.health().cue.state == CognitiveProjectionReadState::Published
-                        && snapshot.health().dependency.state
-                            == CognitiveProjectionReadState::Published
-                })
-            {
-                return Ok(());
-            }
-            if Instant::now() >= deadline {
-                return Err(format!(
-                    "understanding snapshot did not publish revision {}",
                     expected_revision.value()
                 )
                 .into());

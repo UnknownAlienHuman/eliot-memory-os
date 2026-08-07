@@ -1,20 +1,17 @@
 {
   "schema_version": "1.0",
   "contract": {
-    "name": "ELIOT_COGNITIVE_COMPLETION_EXECUTION_FINAL",
-    "version": "FINAL EXECUTION TASK",
-    "sha256": "c3aabee002ec209e7640746d3b1ca5e6e8568c24c2fdd334148fb98cce4562fa"
+    "name": "ELIOT_COGNITIVE_COMPLETION_ULTRA_MASTER_FINAL",
+    "version": "4.1 FINAL",
+    "sha256": "3579eca01e2118ce80fb9735d833363d25e282dc9fbb903ebe51cce7ced16627"
   },
   "snapshot": {
-    "date": "2026-08-03",
+    "date": "2026-08-01",
     "baseline_commit": "88a5f049d71a9c535f51811eb7da273416c27118",
-    "execution_committed_base": "97e842042d5d3ab6830ad23a52129a87326a483d",
-    "c7_04a_parent_commit": "bf2695d172c3795ec1501b54f81a7b7aef651ee2",
     "branch": "codex/cognitive-completion-v2",
-    "phase": "phase_2_block_b1_checkpoint_not_accepted",
+    "phase": "phase_1_in_progress",
     "phase_0_completion_repair": "accepted_by_provider_free_local_gate",
-    "phase_1_progress": "C7-03A through C7-03C accepted by focused provider-free local gates",
-    "phase_2_progress": "C7-04A implementation checkpoint exists and focused gates pass, but acceptance is withheld for audited session-eviction, delivered-pending cleanup, and receipt-replay defects; C7-04B is not started",
+    "phase_1_progress": "C7-03A persistent daemon database clients and C7-03B ordered tokenizer/SurrealDB FTS candidate path accepted by provider-free local gates",
     "provider_calls_allowed": false,
     "truth_note": "This is a capability snapshot, not completion evidence. Source, canonical receipts, focused behavior tests, scale evidence, and field evidence remain authoritative."
   },
@@ -31,7 +28,7 @@
       "capability": "canonical_truth_and_single_write_authority",
       "implemented": true,
       "production_connected": true,
-      "behavior_verified": false,
+      "behavior_verified": true,
       "field_certified": true,
       "owner": "CanonicalStore plus daemon-owned WriterActor",
       "hot_or_cold": "mixed",
@@ -112,16 +109,16 @@
       "production_connected": true,
       "behavior_verified": true,
       "field_certified": false,
-      "owner": "CognitiveProjectionCoordinator owns the search lifecycle; CanonicalStore owns typed projection persistence and rebuild",
+      "owner": "CanonicalStore memory search projection and outbox",
       "hot_or_cold": "mixed",
       "evidence": [
-        "crates/eliot-engine/src/cognitive_projection.rs::CognitiveProjectionCoordinator",
+        "crates/eliot-store/src/canonical_store.rs::dispatch_memory_search_projection",
         "crates/eliot-store/src/canonical_store.rs::rebuild_memory_search_projection",
-        "crates/eliot-store/src/surql/load_memory_search_fts_candidates.surql",
+        "crates/eliot-store/src/surql/009_memory_search.surql",
         "crates/eliot-store/tests/memory_retrieval.rs",
-        "docs/architecture/COGNITIVE_COMPLETION_V2_WORKLOG.md#2026-08-02-c7-03c-final-execution-block-a-closure"
+        "reports/cognitive-field/COGNITIVE_COMPLETION_RECOVERY_TASK03_BLOCKED_20260801.md"
       ],
-      "known_gap": "PF1/PF2/PF3, one exact R01, final bounded isolation, and field certification remain outstanding; they are not Phase 1 advancement gates."
+      "known_gap": "Neutral retrieval is 5/5, but retained PF1 misses the L0 and L2 SLOs; PF2, PF3, R01, and 16-reader certification are not complete."
     },
     {
       "capability": "persistent_daemon_db_client_set",
@@ -137,60 +134,39 @@
         "crates/eliot-app/src/commands/operations.rs::run_daemon_instance",
         "docs/architecture/COGNITIVE_COMPLETION_V2_WORKLOG.md#2026-08-01-c7-03a-acceptance"
       ],
-      "known_gap": "C7-03A remains accepted; PF1/PF2/PF3, one exact R01, final bounded isolation, and field certification remain later evidence."
+      "known_gap": "C7-03A is locally accepted; Phase 1 still requires the C7-03B FTS proof, C7-03C cutover/coordinator, correctness and scale gates, one exact R01, and final C7-03 certification."
     },
     {
       "capability": "surrealdb_fulltext_candidate_generation",
       "implemented": true,
-      "production_connected": true,
+      "production_connected": false,
       "behavior_verified": true,
       "field_certified": false,
-      "owner": "CanonicalStore::recall_l0 uses typed SurrealDB FTS/BM25 only for bounded admission; deterministic Rust ranking remains final",
+      "owner": "CanonicalStore private C7-03B FTS candidate path plus existing Rust rank; public recall remains on the legacy path until C7-03C",
       "hot_or_cold": "hot",
       "evidence": [
         "crates/eliot-types/src/ul/normalize.rs::normalize_query_tokens",
-        "crates/eliot-store/src/canonical_store.rs::recall_l0",
+        "crates/eliot-store/src/canonical_store.rs::recall_l0_fts_candidate",
         "crates/eliot-store/src/canonical_store/fts_live_tests.rs",
-        "crates/eliot-store/tests/memory_retrieval.rs",
         "crates/eliot-store/src/surql/010_memory_search_fts.surql",
         "crates/eliot-store/src/surql/load_memory_search_fts_candidates.surql",
-        "crates/eliot-store/src/surql/cutover_legacy_memory_search_postings.surql",
-        "docs/architecture/COGNITIVE_COMPLETION_V2_WORKLOG.md#2026-08-02-c7-03c-final-execution-block-a-closure"
+        "docs/architecture/COGNITIVE_COMPLETION_V2_WORKLOG.md#2026-08-01-c7-03b-acceptance"
       ],
-      "known_gap": "Production FTS cutover and legacy-posting deletion are accepted; PF1/PF2/PF3, one exact R01, final bounded isolation, and field certification remain later evidence."
+      "known_gap": "C7-03B proves the additive private FTS candidate path but does not claim production cutover. C7-03C must route public L0 through one FTS query, add the recoverable unified projection coordinator, remove request-path full rebuild and delete manual postings/ambient fill before scale certification."
     },
     {
       "capability": "unified_cognitive_projection_coordination",
-      "implemented": true,
-      "production_connected": true,
-      "behavior_verified": true,
+      "implemented": false,
+      "production_connected": false,
+      "behavior_verified": false,
       "field_certified": false,
-      "owner": "Daemon-owned CognitiveProjectionCoordinator is the single lifecycle owner for search, cue, dependency/dirty, and utility projection families",
+      "owner": "not implemented; Phase 1 extends the existing search outbox into CognitiveProjectionCoordinator",
       "hot_or_cold": "mixed",
       "evidence": [
-        "crates/eliot-engine/src/cognitive_projection.rs::CognitiveProjectionCoordinator",
-        "crates/eliot-engine/src/writer.rs::WriterActor::channel_with_projection_notifier",
-        "crates/eliot-app/src/mcp_stdio.rs::McpDaemon::recover_memory_runtime",
-        "docs/architecture/COGNITIVE_COMPLETION_V2_WORKLOG.md#2026-08-02-c7-03c-final-execution-block-a-closure"
+        "The baseline has memory_search_outbox but no CognitiveProjectionCoordinator symbol.",
+        "crates/eliot-store/src/canonical_store.rs"
       ],
-      "known_gap": "Phase 1 ownership, recovery arming, and focused projection behavior are accepted; cold p95, PF/R01/final bounded isolation, and field certification remain later evidence."
-    },
-    {
-      "capability": "single_pass_packet_persistence_and_recovery",
-      "implemented": true,
-      "production_connected": true,
-      "behavior_verified": true,
-      "field_certified": false,
-      "owner": "McpDaemon immutable packet intent and append-only packet state events under canonical task transition authority",
-      "hot_or_cold": "mixed",
-      "evidence": [
-        "crates/eliot-app/src/mcp_stdio.rs::recover_memory_runtime",
-        "crates/eliot-app/src/mcp_stdio/task_handlers.rs::recover_packet_post_commit_outboxes",
-        "crates/eliot-app/tests/ul_control_treatment.rs::u9_6_invariant_gate_prefills_requires_and_accepts_an_explicit_waiver",
-        "crates/eliot-app/tests/ul_control_treatment.rs::u9_8_packet_startup_recovery_is_complete_isolated_and_effects_once",
-        "docs/architecture/COGNITIVE_COMPLETION_V2_WORKLOG.md#2026-08-02-c7-03c-final-execution-block-a-closure"
-      ],
-      "known_gap": "Focused canonical and legacy restart recovery is accepted; final scale, aggregate certification, and release evidence remain later gates."
+      "known_gap": "Search, cue, dependency/dirty, and utility projections do not yet share one recoverable coordinator and atomic revision-bound shard publication."
     },
     {
       "capability": "bounded_cue_activation_and_pending_injection",
@@ -198,38 +174,31 @@
       "production_connected": true,
       "behavior_verified": true,
       "field_certified": false,
-      "owner": "engine-owned UnderstandingRuntime over immutable bounded project/session snapshots; WriterActor and CanonicalStore own durable pending-injection batches and receipts",
+      "owner": "app-owned UlRuntime over CueIndexService, ActivationEngine, and InjectionPlanner",
       "hot_or_cold": "hot",
       "evidence": [
-        "crates/eliot-engine/src/ul/understanding.rs::UnderstandingRuntime",
-        "crates/eliot-engine/src/ul/cue_index.rs",
+        "crates/eliot-app/src/mcp_stdio/ul.rs::UlRuntime",
         "crates/eliot-engine/src/ul/activation.rs",
         "crates/eliot-engine/src/ul/injection.rs",
-        "crates/eliot-engine/src/writer.rs::WriterHandle::submit_pending_injection_batch",
-        "crates/eliot-store/src/canonical_store.rs::CanonicalStore::apply_pending_injection_batch",
-        "crates/eliot-store/src/canonical_store.rs::CanonicalStore::load_pending_injections",
-        "crates/eliot-engine/tests/ul_understanding_runtime.rs",
-        "crates/eliot-engine/tests/ul_injection_selection.rs",
-        "crates/eliot-store/tests/ul_observability_store.rs::b1_pending_batch_is_atomic_restart_safe_and_exactly_dequeued"
+        "crates/eliot-engine/tests/ul_cue_firing.rs",
+        "crates/eliot-engine/tests/ul_touched_injection.rs"
       ],
-      "known_gap": "C7-04A is not accepted: an in-flight session eviction can replace durable pending from an empty mirror, delivered/stale pending is not removed before candidate admission, and WriterActor receipt replay can bypass exact pending cleanup."
+      "known_gap": "The runtime is not daemon-owned, activation still defaults to a 500-edge enable gate, and the v4.1 zero-edge, no-DB PreToolUse, restart, and p95 budgets are not certified."
     },
     {
       "capability": "single_daemon_owned_understanding_runtime",
-      "implemented": true,
-      "production_connected": true,
-      "behavior_verified": true,
+      "implemented": false,
+      "production_connected": false,
+      "behavior_verified": false,
       "field_certified": false,
-      "owner": "One Arc<UnderstandingRuntime> is constructed by McpDaemon, shared with CognitiveProjectionCoordinator, and owns bounded project/session snapshots; no constructible app UlRuntime or McpState.ul remains.",
+      "owner": "not implemented; current owner is app-local UlRuntime",
       "hot_or_cold": "hot",
       "evidence": [
-        "crates/eliot-app/src/mcp_stdio.rs constructs and shares one UnderstandingRuntime",
-        "crates/eliot-engine/src/cognitive_projection.rs publishes admitted snapshots into that runtime",
-        "crates/eliot-engine/src/ul/understanding.rs owns the bounded runtime",
-        "crates/eliot-app/tests/ul_runtime_cutover.rs",
-        "crates/eliot-engine/tests/ul_understanding_runtime.rs"
+        "crates/eliot-app/src/mcp_stdio.rs constructs UlRuntime.",
+        "crates/eliot-app/src/mcp_stdio/ul.rs defines UlRuntime.",
+        "No UnderstandingRuntime symbol exists at the baseline commit."
       ],
-      "known_gap": "C7-04B must connect prepared-memory delivery through every required host tier without adding a second runtime owner."
+      "known_gap": "Migrate rather than duplicate UlRuntime; own immutable revision-bound snapshots and atomically swap only affected shards."
     },
     {
       "capability": "single_causal_context_and_understanding_compiler",
@@ -370,7 +339,7 @@
       "owner": "Ultra release gate",
       "hot_or_cold": "cold",
       "evidence": [
-        "Phases 0 and 1 are accepted; Phase 2 has a non-accepted C7-04A implementation checkpoint; C7-04B and every later phase/release gate remain unaccepted."
+        "Phase 0 is accepted by its local provider-free gate; Phases 1 through 8 are not accepted."
       ],
       "known_gap": "Complete the ordered commit chain, deletion gate, final workspace gate, PR, independent review, CI, merge, and independent main-SHA CI."
     }

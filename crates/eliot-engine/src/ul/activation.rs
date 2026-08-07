@@ -1,111 +1,73 @@
-use crate::EngineError;
+use crate::{EngineError, WriterHandle};
+use eliot_store::CanonicalStore;
 use eliot_types::{
     ACTIVATION_SCALE, ACTIVATION_THRESHOLD, ActivationEdgeKind, ActivationNode, ActivationTrace,
-    ProjectId, SessionId, SuppressedActivation, TaskId, UlActivationGraphRows,
+    OBSERVABILITY_SCHEMA_VERSION, ObservabilityKind, ObservabilityWriteEnvelope,
+    ObservabilityWriteStatus, ProjectId, SessionId, SuppressedActivation, TaskId,
+    UlActivationGraphRows, WriteId,
 };
 use std::collections::{BTreeMap, BTreeSet};
-use std::mem::size_of;
-use std::sync::Arc;
+use time::OffsetDateTime;
 use uuid::Uuid;
 
 const DEPTH_LIMIT: u8 = 2;
 const FANOUT_CAP: usize = 20;
 const MAX_ACTIVATED: usize = 128;
 const MAX_SUPPRESSED: usize = 256;
-pub const DEFAULT_ACTIVATION_ENABLE_MIN_EDGES: u32 = 500;
 
-/// Immutable, store-free activation projection prepared by the background coordinator.
-#[derive(Clone, Debug)]
-pub struct ActivationProjection {
-    enabled_edge_count: u32,
-    adjacency: Arc<BTreeMap<String, Vec<WeightedEdge>>>,
-    estimated_bytes: usize,
-}
-
-impl ActivationProjection {
-    #[must_use]
-    pub fn from_graph(graph: &UlActivationGraphRows) -> Self {
-        let (adjacency, enabled_edge_count) = weighted_adjacency(graph);
-        let estimated_bytes = adjacency
-            .iter()
-            .map(|(from, edges)| {
-                ACTIVATION_MAP_ENTRY_OVERHEAD_BYTES
-                    .saturating_add(size_of::<(String, Vec<WeightedEdge>)>())
-                    .saturating_add(from.capacity())
-                    .saturating_add(ACTIVATION_ALLOCATION_OVERHEAD_BYTES)
-                    .saturating_add(
-                        edges
-                            .capacity()
-                            .saturating_mul(size_of::<WeightedEdge>())
-                            .saturating_add(ACTIVATION_ALLOCATION_OVERHEAD_BYTES),
-                    )
-                    .saturating_add(edges.iter().fold(0_usize, |total, edge| {
-                        total
-                            .saturating_add(edge.to_ref.capacity())
-                            .saturating_add(ACTIVATION_ALLOCATION_OVERHEAD_BYTES)
-                    }))
-            })
-            .fold(
-                size_of::<ActivationProjection>()
-                    .saturating_add(ACTIVATION_ALLOCATION_OVERHEAD_BYTES),
-                usize::saturating_add,
-            );
-        Self {
-            enabled_edge_count,
-            adjacency: Arc::new(adjacency),
-            estimated_bytes,
-        }
-    }
-
-    #[must_use]
-    pub const fn enabled_edge_count(&self) -> u32 {
-        self.enabled_edge_count
-    }
-
-    #[must_use]
-    pub const fn estimated_bytes(&self) -> usize {
-        self.estimated_bytes
-    }
-}
-
-const ACTIVATION_ALLOCATION_OVERHEAD_BYTES: usize = 32;
-const ACTIVATION_MAP_ENTRY_OVERHEAD_BYTES: usize = 256;
-
-impl Default for ActivationProjection {
-    fn default() -> Self {
-        Self::from_graph(&UlActivationGraphRows::default())
-    }
-}
-
-/// Pure activation planner. Persistence of the returned trace belongs to the coordinator.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone)]
 pub struct ActivationEngine {
+    store: CanonicalStore,
+    writer: WriterHandle,
     enable_min_edges: u32,
 }
 
 impl ActivationEngine {
     #[must_use]
-    pub const fn new(enable_min_edges: u32) -> Self {
-        Self { enable_min_edges }
+    pub const fn new(store: CanonicalStore, writer: WriterHandle, enable_min_edges: u32) -> Self {
+        Self {
+            store,
+            writer,
+            enable_min_edges,
+        }
     }
 
-    #[must_use]
-    pub const fn spread_enabled(&self, projection: &ActivationProjection) -> bool {
-        projection.enabled_edge_count >= self.enable_min_edges
-    }
-
-    pub fn plan(
+    pub async fn activate(
         &self,
         project_id: ProjectId,
         session_id: SessionId,
         task_id: Option<TaskId>,
         seed_refs: &[String],
-        projection: &ActivationProjection,
     ) -> Result<Option<ActivationTrace>, EngineError> {
-        if !self.spread_enabled(projection) {
+        let inventory = self.store.load_ul_readiness_inventory(project_id).await?;
+        if inventory.total_ul_edges < self.enable_min_edges {
             return Ok(None);
         }
-        Self::compute_projection(project_id, session_id, task_id, seed_refs, projection).map(Some)
+        let graph = self.store.load_ul_activation_graph(project_id).await?;
+        let trace = Self::compute(project_id, session_id, task_id, seed_refs, &graph)?;
+        let payload = serde_json::to_value(&trace)?;
+        let payload_bytes = serde_json::to_vec(&payload)?;
+        let write_uuid = Uuid::parse_str(&trace.trace_id)
+            .map_err(|error| EngineError::WriteRejected(error.to_string()))?;
+        let receipt = self
+            .writer
+            .submit_observability(ObservabilityWriteEnvelope {
+                schema_version: OBSERVABILITY_SCHEMA_VERSION.to_owned(),
+                write_id: WriteId::from_uuid(write_uuid),
+                project_id,
+                task_id,
+                session_id: Some(session_id),
+                kind: ObservabilityKind::ActivationTrace,
+                record_id: trace.trace_id.clone(),
+                payload,
+                input_hash: blake3::hash(&payload_bytes).to_hex().to_string(),
+                created_at: OffsetDateTime::now_utc(),
+            })
+            .await?;
+        if receipt.status == ObservabilityWriteStatus::Rejected {
+            return Err(EngineError::ObservabilityConflict);
+        }
+        Ok(Some(trace))
     }
 
     pub fn compute(
@@ -115,17 +77,6 @@ impl ActivationEngine {
         seed_refs: &[String],
         graph: &UlActivationGraphRows,
     ) -> Result<ActivationTrace, EngineError> {
-        let projection = ActivationProjection::from_graph(graph);
-        Self::compute_projection(project_id, session_id, task_id, seed_refs, &projection)
-    }
-
-    pub fn compute_projection(
-        project_id: ProjectId,
-        session_id: SessionId,
-        task_id: Option<TaskId>,
-        seed_refs: &[String],
-        projection: &ActivationProjection,
-    ) -> Result<ActivationTrace, EngineError> {
         let mut seeds = seed_refs
             .iter()
             .map(|seed| seed.trim().to_owned())
@@ -134,15 +85,15 @@ impl ActivationEngine {
         seeds.sort();
         seeds.dedup();
         let seed_set = seeds.iter().cloned().collect::<BTreeSet<_>>();
-        let (activated, suppressed) =
-            propagate_activation(&seeds, &seed_set, &projection.adjacency);
+        let (adjacency, enabled_edge_count) = weighted_adjacency(graph);
+        let (activated, suppressed) = propagate_activation(&seeds, &seed_set, &adjacency);
 
         let identity = serde_json::to_vec(&(
             project_id,
             session_id,
             task_id,
             &seeds,
-            projection.enabled_edge_count,
+            enabled_edge_count,
             &activated,
             &suppressed,
         ))?;
@@ -153,7 +104,7 @@ impl ActivationEngine {
             session_id,
             task_id,
             seed_refs: seeds,
-            enabled_edge_count: projection.enabled_edge_count,
+            enabled_edge_count,
             depth_limit: DEPTH_LIMIT,
             fanout_cap: u8::try_from(FANOUT_CAP).unwrap_or(u8::MAX),
             threshold_milli: ACTIVATION_THRESHOLD,
@@ -163,13 +114,7 @@ impl ActivationEngine {
     }
 }
 
-impl Default for ActivationEngine {
-    fn default() -> Self {
-        Self::new(DEFAULT_ACTIVATION_ENABLE_MIN_EDGES)
-    }
-}
-
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 struct WeightedEdge {
     to_ref: String,
     kind: ActivationEdgeKind,

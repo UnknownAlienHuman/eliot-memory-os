@@ -13,14 +13,15 @@ use serde_json::{Value, json};
 use support::{Harness, PreparedHarness, TestResult, rerun_with_credential_gate, test_guard};
 
 #[test]
-fn u9_2_control_assignment_forces_a_memory_free_compile() -> TestResult {
+fn u9_2_explicit_control_is_memory_free_before_any_cognitive_read() -> TestResult {
     let _guard = test_guard();
-    if rerun_with_credential_gate("u9_2_control_assignment_forces_a_memory_free_compile")? {
+    if rerun_with_credential_gate("u9_2_explicit_control_is_memory_free_before_any_cognitive_read")?
+    {
         return Ok(());
     }
-    let mut prepared = Harness::prepare("u9-control")?;
     let project_id = ProjectId::new_v7();
     let task_id = TaskId::new_v7();
+    let mut prepared = Harness::prepare("u9-control")?;
     prepared.seed(&failure_command(project_id))?;
     prepared.seed(&claim_command(project_id, ClaimId::new_v7()))?;
     let mut harness = prepared.launch()?;
@@ -31,13 +32,14 @@ fn u9_2_control_assignment_forces_a_memory_free_compile() -> TestResult {
         ObservabilityKind::InjectionReceipt,
     )?;
 
-    let response = compile(
+    let response = compile_with_memory_mode(
         &mut harness,
         11,
         project_id,
         task_id,
         None,
         "src/net/session.rs",
+        "memory_free_control",
     )?;
     let after: Vec<InjectionReceipt> = harness.observability_records(
         project_id,
@@ -53,6 +55,24 @@ fn u9_2_control_assignment_forces_a_memory_free_compile() -> TestResult {
     assert!(response.get("ul_understanding").is_none());
     assert!(response.get("ul_boot").is_none());
     assert!(response.get("ul_fired").is_none());
+    assert_eq!(response["compile_audit"]["stages"][0], "plan_resolved");
+    assert_eq!(
+        response["compile_audit"]["source_reads"]["current_state_reads"],
+        0
+    );
+    assert_eq!(response["compile_audit"]["source_reads"]["l0_reads"], 0);
+    assert_eq!(response["compile_audit"]["source_reads"]["l2_reads"], 0);
+    for counter in ["l0", "l2", "pyramid", "experience", "skill"] {
+        assert_eq!(
+            response["compile_audit"]["read_counters"][counter], 0,
+            "control read counter {counter} was not zero"
+        );
+    }
+    assert_eq!(
+        response["compile_audit"]["semantic"]["project_understanding_compiles"],
+        1
+    );
+    assert_eq!(response["compile_audit"]["semantic"]["budget_renders"], 1);
     for memory_field in [
         "current_truth",
         "relevant_verified_claims",
@@ -84,24 +104,25 @@ fn u9_5_handles_only_policy_strips_negative_and_normal_payloads() -> TestResult 
     if rerun_with_credential_gate("u9_5_handles_only_policy_strips_negative_and_normal_payloads")? {
         return Ok(());
     }
-    let mut prepared = Harness::prepare("u9-handles")?;
     let project_id = ProjectId::new_v7();
     let control_task = TaskId::new_v7();
     let treatment_task = TaskId::new_v7();
-    prepared.seed(&failure_command(project_id))?;
     let claim_id = ClaimId::new_v7();
+    let mut prepared = Harness::prepare("u9-handles")?;
+    prepared.seed(&failure_command(project_id))?;
     prepared.seed(&claim_command(project_id, claim_id))?;
     let mut harness = prepared.launch()?;
     harness.create_task(20, project_id, control_task)?;
     harness.create_task(21, project_id, treatment_task)?;
 
-    let control = compile(
+    let control = compile_with_memory_mode(
         &mut harness,
         22,
         project_id,
         control_task,
         None,
         "src/net/session.rs",
+        "memory_free_control",
     )?;
     assert_eq!(control["ul_experiment"]["arm"], "control");
     let task_class = control["ul_experiment"]["task_class"]
@@ -140,9 +161,18 @@ fn u9_5_handles_only_policy_strips_negative_and_normal_payloads() -> TestResult 
         "src/net/session.rs",
     )?;
     assert_eq!(treatment["ul_experiment"]["arm"], "treatment");
-    let items = treatment["ul_fired"]["items"]
+    assert!(
+        treatment.get("ul_fired").is_none(),
+        "compile_packet_l3 is the sealed, budgeted cognitive surface; generic UL delivery must remain pending"
+    );
+    let delivery = harness.client.tool_call(
+        24,
+        "eliot_task_state",
+        &json!({"project_id": project_id, "task_id": treatment_task}),
+    )?;
+    let items = delivery["ul_fired"]["items"]
         .as_array()
-        .ok_or("treatment ul_fired.items missing")?;
+        .ok_or("pending treatment ul_fired.items missing from the next tool response")?;
     for item_ref in [
         "failure:u9-handles-negative".to_owned(),
         format!("claim:{claim_id}"),
@@ -174,7 +204,6 @@ fn u9_5_handles_only_policy_strips_negative_and_normal_payloads() -> TestResult 
 }
 
 #[test]
-#[allow(clippy::too_many_lines)]
 fn u9_6_invariant_gate_prefills_requires_and_accepts_an_explicit_waiver() -> TestResult {
     let _guard = test_guard();
     if rerun_with_credential_gate(
@@ -182,8 +211,8 @@ fn u9_6_invariant_gate_prefills_requires_and_accepts_an_explicit_waiver() -> Tes
     )? {
         return Ok(());
     }
-    let mut prepared = Harness::prepare("u9-invariant")?;
     let project_id = ProjectId::new_v7();
+    let mut prepared = Harness::prepare("u9-invariant")?;
     seed_invariant_capsule(&mut prepared, project_id)?;
     let mut harness = prepared.launch()?;
     let control_task = TaskId::new_v7();
@@ -201,78 +230,37 @@ fn u9_6_invariant_gate_prefills_requires_and_accepts_an_explicit_waiver() -> Tes
         "memory_free_control",
     )?;
     assert_eq!(control["ul_experiment"]["arm"], "control");
-    assert_eq!(
-        control["ul_experiment"]["effective_memory_mode"],
-        "memory_free_control"
-    );
-
-    let task_root = harness
+    assert_eq!(control["packet_admission"]["active_allowed"], true);
+    let active_path = harness
         .runtime_path()
         .join("reports")
         .join("context-packets")
         .join("tasks")
-        .join(treatment_task.to_string());
-    let active_latest_path = task_root.join("active").join("latest.json");
-    let active_authority_path = task_root.join("active").join("authority.json");
-    assert!(!active_latest_path.exists());
+        .join(treatment_task.to_string())
+        .join("active")
+        .join("latest.json");
+    assert!(!active_path.exists());
 
-    let waived_frame = material_frame(
-        &[],
-        &[json!({
-            "invariant_ref": "invariant:preserve-order",
-            "reason": "verified by the focused deterministic fixture"
-        })],
-    );
     let baseline = compile(
         &mut harness,
         33,
         project_id,
         treatment_task,
-        Some(waived_frame.clone()),
+        Some(material_frame(
+            &[],
+            &[json!({
+                "invariant_ref": "invariant:preserve-order",
+                "reason": "verified by the focused deterministic fixture"
+            })],
+        )),
         "src/invariant/lib.rs",
     )?;
     assert_eq!(baseline["packet_admission"]["status"], "admitted_degraded");
-    assert_eq!(baseline["packet_admission"]["active_allowed"], true);
-    let baseline_latest = std::fs::read(&active_latest_path)?;
-    let baseline_authority = std::fs::read(&active_authority_path)?;
-    let authority: Value = serde_json::from_slice(&baseline_authority)?;
-    let operation_id = authority["operation_id"]
-        .as_str()
-        .ok_or("active packet authority operation_id missing")?
-        .to_owned();
-    let outbox_root = task_root.join("outbox").join(&operation_id);
-    let intent_path = outbox_root.join("intent.json");
-    let events_root = outbox_root.join("events");
-    let baseline_intent = std::fs::read(&intent_path)?;
-    let baseline_intent_value: Value = serde_json::from_slice(&baseline_intent)?;
-    let baseline_events = packet_event_snapshot(&events_root)?;
-    assert_eq!(baseline_events.len(), 3);
-    let terminal_event: Value = serde_json::from_slice(
-        &baseline_events
-            .last()
-            .ok_or("packet terminal event missing")?
-            .1,
-    )?;
-    assert_eq!(terminal_event["status"], "complete");
-    assert_eq!(packet_outbox_operation_count(&task_root.join("outbox"))?, 1);
-    let baseline_assignment = harness.ul_assignment(project_id, treatment_task)?;
-    let baseline_predictions: Vec<eliot_types::PredictionRecord> = harness.observability_records(
-        project_id,
-        Some(treatment_task),
-        ObservabilityKind::PredictionRecord,
-    )?;
-    let baseline_injection_receipts: Vec<InjectionReceipt> = harness.observability_records(
-        project_id,
-        Some(treatment_task),
-        ObservabilityKind::InjectionReceipt,
-    )?;
-    assert_eq!(baseline_injection_receipts.len(), 1);
-    assert_eq!(
-        baseline_injection_receipts[0].surface,
-        "mcp_response_piggyback"
-    );
-    let baseline_injection_receipts = serde_json::to_vec(&baseline_injection_receipts)?;
-    let baseline_revision = harness.current_revision(project_id)?;
+    assert!(active_path.is_file());
+    let baseline_active = std::fs::read(&active_path)?;
+    let baseline_assignment = harness
+        .ul_assignment(project_id, treatment_task)?
+        .ok_or("admitted baseline did not persist its post-commit measurement")?;
 
     let rejected = compile(
         &mut harness,
@@ -283,131 +271,172 @@ fn u9_6_invariant_gate_prefills_requires_and_accepts_an_explicit_waiver() -> Tes
         "src/invariant/lib.rs",
     )?;
     assert_eq!(rejected["ul_experiment"]["arm"], "treatment");
+    assert_eq!(
+        rejected["ul_experiment"]["assignment_status"],
+        "not_assigned_rejected"
+    );
+    assert_eq!(rejected["packet_admission"]["status"], "rejected");
+    assert_eq!(rejected["packet_admission"]["active_allowed"], false);
     assert_eq!(rejected["ul_gate"]["status"], "require_packet_refresh");
     assert_eq!(
         rejected["ul_gate"]["missing_invariant_refs"],
         json!(["invariant:preserve-order"])
     );
-    assert_eq!(
-        rejected["frame_stub"]["invariant_refs"],
-        json!(["invariant:preserve-order"])
-    );
-    assert_eq!(std::fs::read(&active_latest_path)?, baseline_latest);
-    assert_eq!(std::fs::read(&active_authority_path)?, baseline_authority);
-    assert_eq!(std::fs::read(&intent_path)?, baseline_intent);
-    assert_eq!(packet_event_snapshot(&events_root)?, baseline_events);
-    assert_eq!(packet_outbox_operation_count(&task_root.join("outbox"))?, 1);
+    assert_eq!(std::fs::read(&active_path)?, baseline_active);
     assert_eq!(
         harness.ul_assignment(project_id, treatment_task)?,
-        baseline_assignment
+        Some(baseline_assignment.clone()),
+        "a rejected packet changed the prior admitted measurement"
     );
-    let rejected_predictions: Vec<eliot_types::PredictionRecord> = harness.observability_records(
-        project_id,
-        Some(treatment_task),
-        ObservabilityKind::PredictionRecord,
-    )?;
-    assert_eq!(rejected_predictions, baseline_predictions);
-    assert_eq!(harness.current_revision(project_id)?, baseline_revision);
+    let attempts_root = active_path
+        .parent()
+        .and_then(std::path::Path::parent)
+        .ok_or("task packet root missing")?
+        .join("attempts");
+    assert_eq!(std::fs::read_dir(&attempts_root)?.count(), 1);
 
-    let replay = compile(
+    let rejected_replay = compile(
         &mut harness,
         35,
         project_id,
         treatment_task,
-        Some(waived_frame),
+        Some(material_frame(&[], &[])),
         "src/invariant/lib.rs",
     )?;
-    let baseline_object = baseline
-        .as_object()
-        .ok_or("baseline response object missing")?;
-    let replay_object = replay.as_object().ok_or("replay response object missing")?;
-    let mut different_keys = baseline_object
-        .keys()
-        .chain(replay_object.keys())
-        .filter(|key| baseline_object.get(*key) != replay_object.get(*key))
-        .cloned()
-        .collect::<Vec<_>>();
-    different_keys.sort();
-    different_keys.dedup();
-    assert_eq!(different_keys, vec!["ul_fired"]);
-
-    let mut baseline_commit_response = baseline.clone();
-    assert!(
-        baseline_commit_response
-            .as_object_mut()
-            .ok_or("baseline response object missing")?
-            .remove("ul_fired")
-            .is_some(),
-        "the admitted baseline must deliver the pending session injection"
-    );
-    assert!(
-        replay.get("ul_fired").is_none(),
-        "an exact packet replay must not redeliver session injection ephemera"
-    );
-    let stored_response = baseline_intent_value
-        .get("response")
-        .ok_or("packet intent response missing")?;
+    assert_eq!(rejected_replay["packet_id"], rejected["packet_id"]);
     assert_eq!(
-        serde_json::to_vec(&baseline_commit_response)?,
-        serde_json::to_vec(stored_response)?
+        rejected_replay["packet_budget_decision"]["mandatory_floor_tokens"],
+        rejected["packet_budget_decision"]["mandatory_floor_tokens"]
     );
-    assert_eq!(
-        serde_json::to_vec(&replay)?,
-        serde_json::to_vec(stored_response)?
-    );
-    assert_eq!(
-        canonical_json_hash(&replay)?,
-        baseline_intent_value["response_hash_blake3"]
-            .as_str()
-            .ok_or("packet intent response hash missing")?
-    );
-    assert_eq!(replay["packet_id"], baseline["packet_id"]);
-    let replay_authority = std::fs::read(&active_authority_path)?;
-    let replay_authority_value: Value = serde_json::from_slice(&replay_authority)?;
-    assert_eq!(replay_authority_value["operation_id"], operation_id);
-    assert_eq!(std::fs::read(&active_latest_path)?, baseline_latest);
-    assert_eq!(replay_authority, baseline_authority);
-    assert_eq!(std::fs::read(&intent_path)?, baseline_intent);
-    assert_eq!(packet_event_snapshot(&events_root)?, baseline_events);
-    assert_eq!(packet_outbox_operation_count(&task_root.join("outbox"))?, 1);
+    assert_eq!(rejected_replay["exact_handles"], rejected["exact_handles"]);
+    assert_eq!(std::fs::read(&active_path)?, baseline_active);
+    assert_eq!(std::fs::read_dir(&attempts_root)?.count(), 1);
     assert_eq!(
         harness.ul_assignment(project_id, treatment_task)?,
-        baseline_assignment
+        Some(baseline_assignment),
+        "replaying a rejected packet changed the prior admitted measurement"
     );
-    let replay_predictions: Vec<eliot_types::PredictionRecord> = harness.observability_records(
-        project_id,
-        Some(treatment_task),
-        ObservabilityKind::PredictionRecord,
-    )?;
-    assert_eq!(replay_predictions, baseline_predictions);
-    let replay_injection_receipts: Vec<InjectionReceipt> = harness.observability_records(
-        project_id,
-        Some(treatment_task),
-        ObservabilityKind::InjectionReceipt,
-    )?;
     assert_eq!(
-        serde_json::to_vec(&replay_injection_receipts)?,
-        baseline_injection_receipts
+        rejected["frame_stub"]["invariant_refs"],
+        json!(["invariant:preserve-order"])
     );
-    assert_eq!(harness.current_revision(project_id)?, baseline_revision);
-    assert_eq!(replay["ul_gate"]["status"], "require_probe");
-    assert_eq!(replay["ul_gate"]["reason"], "blind_subsystem");
+
+    let accepted = compile(
+        &mut harness,
+        36,
+        project_id,
+        treatment_task,
+        Some(material_frame(
+            &[],
+            &[json!({
+                "invariant_ref": "invariant:preserve-order",
+                "reason": "verified by the focused deterministic fixture"
+            })],
+        )),
+        "src/invariant/lib.rs",
+    )?;
+    assert_eq!(accepted["packet_admission"]["status"], "admitted_degraded");
+    assert!(active_path.is_file());
+    assert_eq!(accepted["ul_gate"]["status"], "require_probe");
+    assert_eq!(accepted["ul_gate"]["reason"], "blind_subsystem");
     assert!(
-        replay["ul_gate"].get("missing_invariant_refs").is_none(),
+        accepted["ul_gate"].get("missing_invariant_refs").is_none(),
         "the explicit bounded waiver must clear only the invariant gate"
     );
     assert!(
-        replay["ul_gate"]["suggested_probe"]
+        accepted["ul_gate"]["suggested_probe"]
             .as_str()
             .is_some_and(|probe| !probe.trim().is_empty()),
         "blind subsystem coverage still requires a discriminative probe"
     );
 
-    let schema = harness.tool_schema(36, "eliot_compile_packet_l3")?;
+    let schema = harness.tool_schema(37, "eliot_compile_packet_l3")?;
     let serialized = serde_json::to_string(&schema)?;
     assert!(serialized.contains("invariant_refs"));
     assert!(serialized.contains("waived_invariants"));
     assert!(serialized.contains("prediction_confidence"));
+    Ok(())
+}
+
+#[test]
+fn u9_7_hard_ceiling_failure_has_zero_authoritative_writes() -> TestResult {
+    let _guard = test_guard();
+    if rerun_with_credential_gate("u9_7_hard_ceiling_failure_has_zero_authoritative_writes")? {
+        return Ok(());
+    }
+    let project_id = ProjectId::new_v7();
+    let task_id = TaskId::new_v7();
+    let mut harness = Harness::prepare("u9-hard-ceiling")?.launch()?;
+    harness.create_task(40, project_id, task_id)?;
+    let before_revision = harness.current_revision(project_id)?;
+    let before_predictions: Vec<eliot_types::PredictionRecord> = harness.observability_records(
+        project_id,
+        Some(task_id),
+        ObservabilityKind::PredictionRecord,
+    )?;
+    let task_root = harness
+        .runtime_path()
+        .join("reports")
+        .join("context-packets")
+        .join("tasks")
+        .join(task_id.to_string());
+    let codecortex_latest = harness
+        .runtime_path()
+        .join("reports")
+        .join("codecortex")
+        .join("latest.json");
+    assert!(!task_root.exists());
+    assert!(!codecortex_latest.exists());
+    assert!(harness.ul_assignment(project_id, task_id)?.is_none());
+
+    let mut frame = material_frame(&[], &[]);
+    frame["killed_paths"] = Value::Array(
+        (0..192)
+            .map(|index| {
+                Value::String(format!(
+                    "src/forbidden/{index:03}/{}",
+                    "load-bearing-hard-ceiling-evidence-".repeat(5)
+                ))
+            })
+            .collect(),
+    );
+    let response = harness.client.tool_call_response(
+        41,
+        "eliot_compile_packet_l3",
+        &json!({
+            "project_id": project_id,
+            "task_id": task_id,
+            "goal": "change src/hard_ceiling.rs without crossing the Governor ceiling",
+            "candidate_handles": ["file:src/hard_ceiling.rs"],
+            "max_tokens": 4_000,
+            "memory_mode": "include_case_candidates",
+            "material_frame": frame,
+        }),
+    )?;
+    assert_eq!(response["error"]["code"], -32602, "{response}");
+    assert_eq!(
+        response["error"]["data"]["code"], "PACKET_HARD_CEILING_EXCEEDED",
+        "{response}"
+    );
+    assert!(
+        response["error"]["data"]["mandatory_floor_tokens"]
+            .as_u64()
+            .is_some_and(|floor| floor > 4_096),
+        "{response}"
+    );
+
+    let after_revision = harness.current_revision(project_id)?;
+    let after_predictions: Vec<eliot_types::PredictionRecord> = harness.observability_records(
+        project_id,
+        Some(task_id),
+        ObservabilityKind::PredictionRecord,
+    )?;
+    assert_eq!(after_revision, before_revision);
+    assert_eq!(after_predictions.len(), before_predictions.len());
+    assert!(harness.ul_assignment(project_id, task_id)?.is_none());
+    assert!(!task_root.join("active").exists());
+    assert!(!task_root.join("attempts").exists());
+    assert!(!codecortex_latest.exists());
     Ok(())
 }
 
@@ -705,12 +734,6 @@ fn remove_terminal_packet_event(events_root: &std::path::Path) -> TestResult {
     }
     std::fs::remove_file(events_root.join(file_name))?;
     Ok(())
-}
-
-fn canonical_json_hash(value: &Value) -> TestResult<String> {
-    Ok(blake3::hash(&serde_json::to_vec(value)?)
-        .to_hex()
-        .to_string())
 }
 
 fn material_frame(invariant_refs: &[String], waived_invariants: &[Value]) -> Value {

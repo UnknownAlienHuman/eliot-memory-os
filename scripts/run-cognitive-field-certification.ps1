@@ -106,7 +106,8 @@ function Assert-ResumableBatchReceipt {
     param(
         [Parameter(Mandatory)]$Receipt,
         [Parameter(Mandatory)][string]$ExpectedSourceCommit,
-        [Parameter(Mandatory)][string]$ExpectedArgumentsSha256
+        [Parameter(Mandatory)][string]$ExpectedArgumentsSha256,
+        [AllowNull()][string]$ExpectedResultArtifactPath
     )
     if ($Receipt.schema_version -cne 'eliot-cognitive-verifier-command-v1' -or
         $Receipt.source_commit -cne $ExpectedSourceCommit -or
@@ -124,13 +125,24 @@ function Assert-ResumableBatchReceipt {
             throw "Existing verifier $stream evidence failed exact readback."
         }
     }
+    if (-not [string]::IsNullOrWhiteSpace($ExpectedResultArtifactPath)) {
+        $expected = [IO.Path]::GetFullPath($ExpectedResultArtifactPath)
+        $actual = [IO.Path]::GetFullPath([string]$Receipt.result_artifact_path)
+        if ($actual -ine $expected -or
+            -not $actual.StartsWith($PrivateRoot, [StringComparison]::OrdinalIgnoreCase) -or
+            -not (Test-Path -LiteralPath $actual -PathType Leaf) -or
+            (Get-FileSha256 $actual) -cne [string]$Receipt.result_artifact_sha256) {
+            throw 'Existing scale result artifact failed exact durable readback.'
+        }
+    }
 }
 
 function Invoke-VerifierBatch {
     param(
         [Parameter(Mandatory)][string]$BatchId,
         [Parameter(Mandatory)][string]$Program,
-        [Parameter(Mandatory)][string[]]$Arguments
+        [Parameter(Mandatory)][string[]]$Arguments,
+        [string]$ResultArtifactPath
     )
     $batchRoot = Join-Path $PrivateRoot "verifiers\$BatchId"
     [IO.Directory]::CreateDirectory($batchRoot) | Out-Null
@@ -139,9 +151,15 @@ function Invoke-VerifierBatch {
     $receiptPath = Join-Path $batchRoot 'receipt.json'
     $argumentsMaterial = "$Program`0$($Arguments -join "`0")"
     $argumentsSha256 = Get-Sha256Text $argumentsMaterial
+    $resolvedResultArtifact = if ([string]::IsNullOrWhiteSpace($ResultArtifactPath)) {
+        $null
+    }
+    else {
+        [IO.Path]::GetFullPath($ResultArtifactPath)
+    }
     if (Test-Path -LiteralPath $receiptPath -PathType Leaf) {
         $receipt = Get-Content -LiteralPath $receiptPath -Raw | ConvertFrom-Json
-        Assert-ResumableBatchReceipt $receipt $sourceCommit $argumentsSha256
+        Assert-ResumableBatchReceipt $receipt $sourceCommit $argumentsSha256 $resolvedResultArtifact
         return $receipt
     }
     if ((Test-Path -LiteralPath $stdoutPath) -or (Test-Path -LiteralPath $stderrPath)) {
@@ -151,6 +169,10 @@ function Invoke-VerifierBatch {
     & $Program @Arguments 1> $stdoutPath 2> $stderrPath
     $exitCode = $LASTEXITCODE
     $stopwatch.Stop()
+    if ($exitCode -eq 0 -and $null -ne $resolvedResultArtifact -and
+        -not (Test-Path -LiteralPath $resolvedResultArtifact -PathType Leaf)) {
+        throw "Verifier batch $BatchId completed without its required result artifact: $resolvedResultArtifact"
+    }
     $receipt = [ordered]@{
         schema_version = 'eliot-cognitive-verifier-command-v1'
         source_commit = $sourceCommit
@@ -162,6 +184,13 @@ function Invoke-VerifierBatch {
         stdout_sha256 = Get-FileSha256 $stdoutPath
         stderr_path = [IO.Path]::GetFullPath($stderrPath)
         stderr_sha256 = Get-FileSha256 $stderrPath
+        result_artifact_path = $resolvedResultArtifact
+        result_artifact_sha256 = if ($null -eq $resolvedResultArtifact) {
+            $null
+        }
+        else {
+            Get-FileSha256 $resolvedResultArtifact
+        }
     }
     Write-NewOrSameJson $receiptPath $receipt
     if ($exitCode -ne 0) {
@@ -225,14 +254,20 @@ function Invoke-DeterministicCorpus {
         '-TestBinary', 'write_idempotency_and_recovery',
         '-TestTimeoutSeconds', [string]$TestTimeoutSeconds
     )
-    $batches['r01-100k-scale'] = Invoke-VerifierBatch 'r01-100k-scale' $currentPowerShell @(
-        '-NoProfile', '-File', $isolated,
-        '-TestPackage', 'eliot-store',
-        '-TestBinary', 'cognitive_field_scale',
-        '-TestName', 'r01_large_corpus_retrieval_meets_target_workstation_slos',
-        '-RunIgnored',
-        '-TestTimeoutSeconds', [string]$TestTimeoutSeconds
-    )
+    $scaleResultPath = Join-Path $PrivateRoot 'verifiers\r01-100k-scale\scale-result.json'
+    $batches['r01-100k-scale'] = Invoke-VerifierBatch `
+        -BatchId 'r01-100k-scale' `
+        -Program $currentPowerShell `
+        -Arguments @(
+            '-NoProfile', '-File', $isolated,
+            '-TestPackage', 'eliot-store',
+            '-TestBinary', 'cognitive_field_scale',
+            '-TestName', 'r01_large_corpus_retrieval_meets_target_workstation_slos',
+            '-RunIgnored',
+            '-ResultArtifactPath', $scaleResultPath,
+            '-TestTimeoutSeconds', [string]$TestTimeoutSeconds
+        ) `
+        -ResultArtifactPath $scaleResultPath
 
     $suite = Get-Content -LiteralPath $suitePath -Raw | ConvertFrom-Json
     foreach ($case in $suite.cases) {
@@ -255,6 +290,8 @@ function Invoke-DeterministicCorpus {
                     stdout_sha256 = [string]$batch.stdout_sha256
                     stderr_path = [string]$batch.stderr_path
                     stderr_sha256 = [string]$batch.stderr_sha256
+                    result_artifact_path = $batch.result_artifact_path
+                    result_artifact_sha256 = $batch.result_artifact_sha256
                 }
             }
             $receipt = [ordered]@{

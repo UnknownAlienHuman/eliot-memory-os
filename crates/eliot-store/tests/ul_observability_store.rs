@@ -1,9 +1,7 @@
 use eliot_store::{CanonicalStore, StoreError};
 use eliot_types::{
-    CredentialProviderKind, CueKind, GovernorConfig, InjectionReceipt,
-    OBSERVABILITY_SCHEMA_VERSION, ObservabilityKind, ObservabilityWriteEnvelope,
-    ObservabilityWriteStatus, ObservedCue, PendingInjectionBatch, PendingInjectionItem, ProjectId,
-    SessionId, TaskId, WriteId,
+    CredentialProviderKind, GovernorConfig, OBSERVABILITY_SCHEMA_VERSION, ObservabilityKind,
+    ObservabilityWriteEnvelope, ObservabilityWriteStatus, ProjectId, SessionId, TaskId, WriteId,
 };
 use serde_json::{Value, json};
 use std::fs;
@@ -85,104 +83,6 @@ async fn t02_store_conflict_preserves_original() -> TestResult {
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn b1_pending_batch_is_atomic_restart_safe_and_exactly_dequeued() -> TestResult {
-    if rerun_with_isolated_credential_backend(
-        "b1_pending_batch_is_atomic_restart_safe_and_exactly_dequeued",
-    )? {
-        return Ok(());
-    }
-    let harness = Harness::start("pending-batch").await?;
-    let project_id = ProjectId::new_v7();
-    let session_id = SessionId::new_v7();
-    let task_id = Some(TaskId::new_v7());
-    let first = pending_item("failure:network:session", "fingerprint:first");
-    let second = pending_item("invariant:writer:authority", "fingerprint:second");
-    let batch = PendingInjectionBatch::new(
-        project_id,
-        task_id,
-        session_id,
-        vec![first.clone(), second.clone()],
-        time::OffsetDateTime::now_utc(),
-    )?;
-
-    let committed = harness.store.apply_pending_injection_batch(&batch).await?;
-    let replay = harness.store.apply_pending_injection_batch(&batch).await?;
-    assert_eq!(committed.status, ObservabilityWriteStatus::Committed);
-    assert_eq!(replay.status, ObservabilityWriteStatus::IdempotentReplay);
-    assert_eq!(
-        serde_json::to_value(
-            harness
-                .store
-                .load_pending_injections(project_id, session_id)
-                .await?
-        )?,
-        serde_json::to_value([first.clone(), second.clone()])?
-    );
-
-    let mut duplicate = second.clone();
-    duplicate.source_fingerprint = "fingerprint:conflict".to_owned();
-    let rejected = PendingInjectionBatch::new(
-        project_id,
-        task_id,
-        session_id,
-        vec![second.clone(), duplicate],
-        time::OffsetDateTime::now_utc(),
-    )?;
-    assert!(
-        harness
-            .store
-            .apply_pending_injection_batch(&rejected)
-            .await
-            .is_err()
-    );
-    assert_eq!(
-        serde_json::to_value(
-            harness
-                .store
-                .load_pending_injections(project_id, session_id)
-                .await?
-        )?,
-        serde_json::to_value([first.clone(), second.clone()])?
-    );
-
-    let wrong_receipt = injection_receipt_envelope(
-        project_id,
-        task_id,
-        session_id,
-        &first.item_ref,
-        "fingerprint:wrong",
-    )?;
-    harness.store.apply_observability(&wrong_receipt).await?;
-    assert_eq!(
-        harness
-            .store
-            .load_pending_injections(project_id, session_id)
-            .await?
-            .len(),
-        2
-    );
-    let exact_receipt = injection_receipt_envelope(
-        project_id,
-        task_id,
-        session_id,
-        &first.item_ref,
-        &first.source_fingerprint,
-    )?;
-    harness.store.apply_observability(&exact_receipt).await?;
-    harness.store.apply_observability(&exact_receipt).await?;
-    assert_eq!(
-        serde_json::to_value(
-            harness
-                .store
-                .load_pending_injections(project_id, session_id)
-                .await?
-        )?,
-        serde_json::to_value([second])?
-    );
-    Ok(())
-}
-
 fn envelope(payload: Value) -> ObservabilityWriteEnvelope {
     let write_id = WriteId::new_v7();
     ObservabilityWriteEnvelope {
@@ -203,61 +103,6 @@ fn payload_hash(payload: &Value) -> String {
     blake3::hash(payload.to_string().as_bytes())
         .to_hex()
         .to_string()
-}
-
-fn pending_item(item_ref: &str, source_fingerprint: &str) -> PendingInjectionItem {
-    PendingInjectionItem {
-        item_ref: item_ref.to_owned(),
-        record_kind: "failure_fingerprint".to_owned(),
-        preview: "colon-bearing durable item".to_owned(),
-        payload: Some(json!({"handle": "claim:quartz:exact"})),
-        source_fingerprint: source_fingerprint.to_owned(),
-        fired_cues: vec![ObservedCue {
-            kind: CueKind::FilePath,
-            value: "src/net:session.rs".to_owned(),
-        }],
-        negative_memory: true,
-        invariant: false,
-        token_estimate: 7,
-        activation_trace_ref: Some("activation:trace:1".to_owned()),
-        activation_score_milli: Some(900),
-    }
-}
-
-fn injection_receipt_envelope(
-    project_id: ProjectId,
-    task_id: Option<TaskId>,
-    session_id: SessionId,
-    item_ref: &str,
-    source_fingerprint: &str,
-) -> TestResult<ObservabilityWriteEnvelope> {
-    let write_id = WriteId::new_v7();
-    let receipt = InjectionReceipt {
-        injection_id: write_id.to_string(),
-        session_id,
-        task_id,
-        surface: "mcp:response:piggyback".to_owned(),
-        item_ref: item_ref.to_owned(),
-        render_form: "payload".to_owned(),
-        fired_cues: Vec::new(),
-        token_cost: 7,
-        source_fingerprint: source_fingerprint.to_owned(),
-        outcome: "delivered".to_owned(),
-        policy_reason: None,
-    };
-    let payload = serde_json::to_value(receipt)?;
-    Ok(ObservabilityWriteEnvelope {
-        schema_version: OBSERVABILITY_SCHEMA_VERSION.to_owned(),
-        write_id,
-        project_id,
-        task_id,
-        session_id: Some(session_id),
-        kind: ObservabilityKind::InjectionReceipt,
-        record_id: write_id.to_string(),
-        input_hash: payload_hash(&payload),
-        payload,
-        created_at: time::OffsetDateTime::now_utc(),
-    })
 }
 
 fn rerun_with_isolated_credential_backend(test_name: &str) -> TestResult<bool> {
@@ -401,7 +246,6 @@ fn test_port(name: &str) -> TestResult<u16> {
     let port = match name {
         "replay" => 8601,
         "conflict" => 8602,
-        "pending-batch" => 8603,
         other => return Err(format!("unknown UL-02 store test {other}").into()),
     };
     let listener = std::net::TcpListener::bind(("127.0.0.1", port))

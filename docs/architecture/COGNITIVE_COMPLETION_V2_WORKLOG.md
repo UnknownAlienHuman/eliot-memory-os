@@ -1080,121 +1080,765 @@ For each next step, record:
   20,462 nodes and 94,109 edges. The only unrelated untracked path remains the
   operator-owned `.eliot/`, which was not staged, modified or deleted.
 
-## 2026-08-02 — C7-03C final execution / Block A closure
+### 2026-08-01 C7-03C architecture decision
 
-| Slice | Commit | Accepted result |
-|---|---|---|
-| C0 | `53817fa4c42be07889fda689496a5ba3460be9d8` | Acceptance daemon runtime state is isolated from host authority state. |
-| C1 | `545d0858a8ccbda7e8bf517a03ea655c21ab6631` | Response provenance is separate from immutable packet-commit identity; exact replay uses the original stored effects. |
-| C2 | `3b6ebbc04e114e2ebdf48de4d564fd2b2e776c25` | Lossless parent/page/segment memory, native FTS admission, complete cue overflow, and one durable projection owner are finalized. |
-| C3 | `a4ffaa20e0e7e9fc809b74806ca6c5135eee6787` | Packet persistence is append-only, restart-recoverable, bounded, effects-once, and supports canonical plus legacy task handles. |
+- Three bounded local preflights mapped the exact legacy deletion surface,
+  invalid four-corpus scale harness, daemon lifecycle, and current projection
+  owners. They found a hard ownership/recovery question: the current outbox is
+  minimal and cannot replay an envelope after crash, while read paths still
+  perform synchronous repair and the writer can mark an already committed
+  canonical write failed when derived projection dispatch fails.
+- The issue was escalated once through the existing headless Claude Code CLI,
+  not GUI. Exact `claude-opus-5`, Max, safe/read-only plan mode, strict empty
+  MCP and Read/Grep/Glob only completed successfully in 573.4 s wall /
+  571.747 s API. Session `47d7b126-ef0d-4586-a5e3-0b2e35609f1c`; no denial,
+  write, web or MCP action. The external raw archive SHA-256 is
+  `9A856D8A8CA4463966E86219252D8AC2AB9A6684CC527B23C0BAC621B6F21009`.
+- Accepted architecture: one engine-owned `CognitiveProjectionCoordinator`,
+  minimal durable outbox rows with leases/retry/blocked status, per-project
+  ordering, in-memory incremental notification after durable commit, and one
+  coalesced cold rebuild on missed notification/restart. Projection failures
+  never falsify the successful canonical receipt. Public reads never rebuild.
+- The canonical write/outbox boundary will become an explicit transaction and
+  receive failure-injection evidence. Startup gains a non-destructive migration
+  and coordinator recovery seam before READY; READY itself remains bounded.
+  Shutdown joins the coordinator before `DbClientSet::shutdown`. Destructive
+  token cleanup is an explicit typed Admin cutover, never generic lazy schema
+  migration, and is one-way without DB restore for an old binary.
+- A single four-family atomic fence was rejected for this phase as unsupported
+  by current truth: only search has persisted revision state. C7-03C establishes
+  coordinator ownership and truthful per-family state; Phase 2 builds the
+  revision-bound hot UnderstandingRuntime and atomic affected-shard snapshot.
+  Utility currently has no persisted incremental projection, so its bounded
+  unavailable/incomplete residue must remain explicit until that next phase.
 
-### Closed architecture
+### 2026-08-01 C7-03C implementation checkpoint
 
-- Packet content identity, response provenance and state-changing operation
-  identity are distinct domains.
-- Immutable intent plus append-only state events is the sole packet outbox
-  authority. Startup recovery inventories every task deterministically, attempts
-  at most 32 pending replays, isolates corrupt neighbors and reports residuals.
-- Canonical task replay preserves the string serializer, global task mutex and
-  cross-process transition lock order. Legacy handles remain local-only.
-- Canonical memory pages and cue overflow are lossless. SurrealDB FTS/BM25 only
-  admits bounded candidates; deterministic Rust ranking remains final.
-- `ProjectionCoordinator` is the single lifecycle owner for focused projection
-  builders. It arms recovery before daemon READY; inventory and rebuild work
-  then drains on its owned background task.
-- Windows atomic replacement now canonicalizes only the parent into
-  extended-length form, preserving leaf and `MoveFileExW` replacement semantics.
+- The store slice is integrated but not yet committed. Canonical data, receipt
+  and the minimal search/cue/dependency outbox row now share one explicit
+  transaction; public L0 is FTS-only and gated by the exact head plus the
+  published search-family state. Durable claim/reclaim/complete/retry/block,
+  paged recovery inventory, per-family publication truth, explicit Admin
+  legacy-token cutover and project-scoped dependency resets are present.
+- Store verification passed: `cargo check` 1.919 s; 55 unit tests with three
+  ignored 5.948 s; all test targets compiled 39.212 s including lock wait;
+  format plus SurrealDB 3.1.4 validation 0.445 s; strict all-target Clippy
+  2.635 s. One first-pass test-only unwrap warning was corrected.
+- The engine-owned coordinator is now implemented with one bounded wake queue,
+  exact per-project leases, committed-envelope delta caching, coalesced cold
+  recovery, stable cue installation, destructive-derived dependency rebuild,
+  bounded retry and deterministic block. A replay receipt is wake-only and is
+  never trusted as a fresh delta. Queue loss cannot fail the canonical write;
+  the durable outbox remains recovery truth. Initial engine check passed in
+  1.91 s; strict lint fixes are in progress with daemon integration.
+- Writer integration notifies only after `wal.mark_committed`, preserves the
+  legacy channel constructor, and adds explicit drain-and-join shutdown for
+  both writer lanes and the control-WAL actor even while daemon handle clones
+  remain alive. Six focused writer tests passed in 0.09 s body / 13.193 s wall.
+- The rewritten scale ladder is staged but the expensive run remains unspent:
+  one client set and growing corpus, one reused 25-sample set, foreign canary,
+  16-reader isolation/session proof, explicit shutdown and create-new durable
+  checkpoint. Focused compile 7.0 s, unit target 2.3 s, strict Clippy 35.9 s,
+  PowerShell parse 0.8 s and harness security 1.6 s passed.
+- App lifecycle wiring and the combined provider-free gates remain open. No
+  Antigravity or certification provider call has been made.
 
-### Acceptance evidence
+### 2026-08-01 C7-03C lease live-gate stop
 
-- C1 focused U9.6 regression passed with stable packet/operation identities,
-  byte/hash-identical replay, no repeated `ul_fired`, and unchanged authority,
-  intent, event history, effects, receipts and revision.
-- C2 focused source/unit gates passed; live store and app gates covered FTS,
-  lossless L2, projection lease barriers, cue firing, 512+ retrieval, cold
-  recovery and session dedup. Provider calls were zero and cleanup was clean.
-- C3 packet units passed 17/17. Windows atomic replacement passed 3/3,
-  including an extended-length path.
-- C3 U9.8 passed with canonical and legacy recovery, byte-identical projection
-  repair, exactly three outbox events ending in `complete`, effects-once across
-  a second restart, 300 corrupt predecessors, and a misplaced authority.
-- App checks, strict affected-target Clippy, format and diff checks passed.
-  Focused isolated gates reported `provider_calls=0`, no timeout, no cleanup
-  failure and no retained run-owned process or secret root.
+- The first isolated lease/barrier proof completed its body in 4.226 s and
+  failed only at the final global-backlog assertion. The durable state was
+  `pending=13, leased=0, retryable=0, blocked=7, search=2`; exact nextest log
+  SHA-256 `40075051F97EDA217274462EDF2B83922E50F0BC552DF463D1E07A53A116C87F`.
+- A diagnostic rerun reproduced the same state in 4.689 s, log SHA-256
+  `553EBE403FA75AC2EAB168EFFF4615B23295837E0511557E96A8BE3EB7C077D7`.
+  A baseline-delta assertion was then attempted once and also reproduced the
+  state in 4.461 s, log SHA-256
+  `2AE3DDA283059412A2A5B1CC9C067B9CD5FFE0BB46B42B5BE958C5EFB98596D1`.
+  Every harness run reported zero provider calls, no timeout, exact guardian
+  cleanup, and no ambient-root mutation.
+- Source inspection identified the root cause without another execution: the
+  test uses static global outbox `write_id` values such as `lease-oldest`,
+  while `enqueue_cognitive_projection_intent.surql` derives the record ID from
+  that value and the schema has a global unique `write_id` index. The isolated
+  harness preserves the test database across these invocations, so reruns
+  overwrite prior records under new project IDs instead of creating the
+  expected per-run delta. This invalidates the test-isolation assumption; it
+  does not yet disprove lease ordering or exact-set mutation.
+- Per the two-consecutive-failure stop rule, no fourth live run was made. The
+  recommended next correction is to bind every proof write ID to its fresh
+  project UUID, retain the baseline-delta assertion, and rerun once. Broader
+  alternatives are a fresh namespace/database per invocation or a project-
+  scoped inspection API; neither should hide the global-ID collision.
+- C7-03C remains unaccepted and uncommitted. The same-revision, coordinator,
+  FTS/rollback, and scale live gates remain unspent. No Claude or Antigravity
+  quota was used for this locally proven test-fixture defect.
+- Candidate-only Eliot writeback was staged as
+  `2026-08-01T230723-0400_eliot_memory_os_ultra_v4_c7_03c_lease_live_stop.surql`;
+  SurrealDB 3.1.4 validation passed in 0.176 s, SHA-256
+  `E35EC271F23C4E39042FEF6417362DB7D900EA68E07EA62DC2B2E0733D66CD6D`.
+  It was not applied or promoted because the live Eliot MCP owner is external.
 
-### Escalation and exclusions
+### 2026-08-02 C7-03C transport repair and workspace-gate diagnosis
 
-- Claude Code Opus 5 at Max effort was used read-only for the ambiguous packet
-  identity/recovery decisions. Its rulings were accepted only where current
-  source and deterministic verification supported them.
-- No provider cognition, full workspace verification, release build, final
-  scale ladder or 48-case evaluation was used as Block A evidence.
-- Preserved drafts for hot understanding/admission, utility/distillation and
-  final scale certification are explicitly excluded from this closure and are
-  not acceptance evidence.
+- Subsequent inspection proved that SurrealDB 3.1.4 JSON-RPC parameter coercion
+  converts a recovery-looking string such as
+  `recovery:019fc0bf-ee1b-...:2` into a record and truncates the remainder before
+  SurrealQL can cast it. The controlled discriminator failed as intended in
+  2.213 s test body / 10.585 s harness wall, with zero provider calls and exact
+  cleanup. Its log is
+  `evidence/c7-03c-bound-string-type-discriminator.log`, SHA-256
+  `D137368EB22B19FF2D439020969967030A238FD65A630543743C92DA2F6CC132`.
+- Two economical continuations of the existing headless Opus 5 session were
+  used for that hard boundary. The first identified the coercion but proposed
+  an insufficient boundary cast; a concrete counterexample showed that the
+  lost suffix could not be recovered after binding. Opus accepted the
+  correction and selected the repository's existing transport-safe
+  `string_fragments` encoding: send character arrays, reassemble inside
+  SurrealQL, and persist/return explicit strings. No GUI, web, MCP, write or
+  fallback model was used.
+- The corrected implementation now transports enqueue event IDs and all nested
+  lease write IDs as fragments; canonical UUID write IDs and claim results are
+  explicitly strings. The live proof now covers two recovery IDs with the same
+  coercible prefix, exact round-trip, replay/conflict, claim/complete,
+  retry/block and a fresh-table string-type invariant.
+- Accepted live evidence after the transport repair: lease/transport 1/1 in
+  4.335 s body / 18.539 s wall, SHA-256
+  `7B37AC05C377C91A3508E5E044E729FDD8AF487A74A711D6EBEF22C8F4CFAB4F`;
+  full coordinator wake 2.754 s / 5.290 s,
+  `639CA804986F9EBDCEB245C875C03447A4BD97504B149AB229107B50D49D9519`;
+  FTS/rollback 3.039 s / 5.770 s,
+  `F59FE6D6F59FA45ADA8096C4DAFFFBD1DD3998F9D5BDED70F80025A88DD75219`;
+  dependency dirty race 2.216 s / 4.684 s,
+  `9B0E5F46820FABA8B4AF405FAFB2A679A8E42AA59604E1B7F37089C8ECCFB215`.
+  All reported zero provider calls and exact cleanup. Six affected SurrealQL
+  templates validated; format, workspace all-target check and strict Clippy
+  passed in 2.9 s, 0.631 s and 0.946 s respectively.
+- The first consolidated `just verify` failed after 215.4 s. Isolation proved
+  that all preceding Rust test binaries passed and only the four active tests
+  in `eliot-app --test multi_agent_access` timed out at their READY waiter.
+  Parallel execution failed in 10.10 s; serial execution reproduced all four
+  failures in 40.19 s test body / 137.822 s outer shell. Repeated diagnostics
+  exposed a harness ownership defect: 32 exact test-owned detached SurrealDB
+  processes accumulated. They were stopped with an executable-and-fixture-path
+  predicate; the unrelated global Eliot MCP PID was preserved.
+- The repeated failure was escalated through the same exact `claude-opus-5`
+  read-only session. Opus required one bounded test with visible daemon stderr,
+  a diagnostic-only 120 s waiter and a kill-on-close Windows Job Object. That
+  run failed in 120.02 s body / 121.819 s wall, but proved the daemon exited
+  immediately with `published_plans_without_authority`; the waiter, not the
+  daemon, consumed the remaining time. Test-owned SurrealDB count was zero both
+  before and after, proving the Job Object cleanup.
+- The exact contamination boundary is now known: the temp config has an empty
+  fixture broker, but `runtime_integrity::cognitive_root` falls back to ambient
+  `%LOCALAPPDATA%/Eliot/cognitive-field` when the fixture has not created its
+  own `cognitive-field` directory. Ambient published seals are therefore
+  compared with unrelated fixture authority. The integrity gate behaved
+  correctly on the wrong root; it must not be disabled. A corrected Opus
+  decision on fixture/root isolation, immediate recovery acknowledgement and
+  permanent waiter diagnostics is in progress. C7-03C remains uncommitted and
+  the expensive scale ladder remains unspent.
 
-**Block A result: PASS.** The next allowed implementation item is Block B1,
-engine-owned `UnderstandingRuntime`, from the exact aggregate head.
+### 2026-08-02 C7-03C startup repair, test ownership, and next workspace failure
 
-## 2026-08-03 — C7-04A / Block B1 implementation checkpoint
+- The corrected headless Opus 5 continuation accepted three product/harness
+  decisions after being given the captured immediate daemon failure: bind the
+  cognitive-field root unconditionally to the config-derived runtime root;
+  acknowledge `Recover` without a store round trip and perform inventory on
+  the coordinator task; and permanently make the integration waiter fail fast
+  on process exit or a FAILED publication while a Windows Job Object owns the
+  entire fixture process tree. The call used the same exact
+  `claude-opus-5`/Max/read-only session and completed in 129.635 s wall. No GUI,
+  web, MCP, write action, denial, or fallback model was used.
+- `runtime_integrity::cognitive_root` now derives only
+  `<config-runtime>/cognitive-field`; an existence test can no longer redirect
+  a fresh isolated fixture into ambient operator state. A unit test proves the
+  path identity before the directory exists. The harness also creates the
+  empty fixture directory as defence in depth; no integrity condition was
+  disabled or weakened.
+- `ProjectionCommand::Recover` now records recovery cursor zero, arms the
+  worker and acknowledges immediately. A unit test proves that the ACK does
+  not depend on a store round trip. The existing background step owns paged
+  inventory and cold reconstruction, so READY remains bounded without losing
+  durable recovery.
+- `multi_agent_access` now owns daemon descendants with `ProcessTreeGuard`,
+  records fixture-local stderr, detects early exit/FAILED publication, emits
+  bounded 8 KiB diagnostic tails and measures READY latency. The exact path-
+  identity case passed in 15.49 s body / 15.927 s wall with READY at 10.002 s;
+  the full serial binary passed 4 active and 4 ignored in 90.21 s body /
+  90.547 s wall. Test-owned Surreal processes remained zero and the unrelated
+  global Eliot MCP process remained one.
+- The next workspace gate showed that the four DB-owning cases were sound in
+  isolation but contended when the Rust test harness launched them together.
+  A further bounded Opus 5 continuation completed in 96.434 s wall and accepted
+  one file-local static `Mutex<()>` as an explicit external-resource lease for
+  exactly the seven daemon/database-owning cases, held from the first fixture
+  action through teardown with poison recovery. It rejected global test-thread
+  configuration and timeout inflation. The default-parallel binary then passed
+  4 active and 4 ignored in 90.97 s body / 92.311 s wall, with READY latencies
+  10.003/10.647/10.102/10.080 s and exact zero-owned-process cleanup.
+- Final targeted formatting and strict Clippy for app/engine passed in 1.973 s
+  and 0.756 s. One initial format-only chain and one `unused_async` finding on
+  the now-synchronous cache path were fixed; a documented test-only stderr
+  print allowance preserves measured READY evidence.
+- The second consolidated `just verify` ran for 153.134 s. It passed the repaired
+  multi-agent binary and advanced to a new, independent failure in
+  `eliot-app --test ul_behavior_cli`: `t05_touching_hotspot_fires_card_and_danger`
+  received `ul_fired.items[0].item_ref = null` instead of
+  `failure:t05-hotspot-danger`. Source inspection shows the fixture writes
+  canonical commands through a separate legacy `WriterActor` after daemon
+  startup and directly edits cue rows through another `CueIndexService`; those
+  paths cannot notify or populate the daemon-owned memory-only cue shard. The
+  pre-C7-03C request-path rebuild used to mask this ownership violation.
+- No retry of `ul_behavior_cli` has been spent. The next action is one precise
+  Opus 5 architecture ruling after mapping every fixture use and available
+  daemon-owned governed write surface. Public request-path rebuild, a raw wake
+  tool, sleeps, and wider timeouts are not candidate fixes. C7-03C remains
+  uncommitted and the expensive scale ladder remains unspent.
 
-### Ownership and production cutover
+### 2026-08-02 C7-03C UL fixture consultation interruption
 
-- Kept one engine `UnderstandingRuntime`, the existing
-  `CognitiveProjectionCoordinator`, and Writer/CanonicalStore as the durable
-  restart authority. Deleted the constructible app `UlRuntime` owner and
-  `McpState.ul`; `McpDaemon` now constructs and shares one runtime.
-- Project snapshots are immutable, revision-fenced and bounded to 64 MiB of
-  conservatively charged requested allocations. Cue keys, all handles and
-  mandatory negative/invariant payloads remain hot; optional bodies are
-  deterministically elided before an explicit mandatory-minimum rejection.
-- `CueIndexService` keeps only a weak routing alias after runtime adoption.
-  Runtime eviction releases the active hot cue allocation, and every rejected,
-  failed or superseded candidate releases the service's staged strong owner.
+- A precise continuation was sent to the existing exact headless Opus 5
+  session with the failing assertion, CRI-002/024/025, all known fixture and
+  product cue owners, five candidate repairs and an explicit STOP question.
+  Claude read for 8 turns and 116.679 s API / 120.073 s wall, used only the
+  requested model and no web/MCP/write action or denied permission, then
+  returned HTTP 429: `session limit`, reset 02:40 America/New_York. There is no
+  final architecture ruling to accept yet; the same prompt/session will be
+  resumed once after the stated reset rather than replaced with a weaker model.
+- Independent bounded source review agrees on the immediate failure mechanism:
+  startup recovery becomes dormant before the fixture's foreign legacy writer
+  appends its outbox row; the direct replacement helper populates only its own
+  temporary cue service. The daemon's memory-only shard therefore remains
+  truthfully Unavailable. No product or test code was changed on this incomplete
+  consultation.
+- The leading bounded candidate remains an explicit fixture-only offline seed
+  followed by daemon cold recovery and an exact cue-family/head-revision fence.
+  Periodic polling, a generic raw wake/write surface, lazy read repair and
+  assertion weakening remain rejected locally pending Opus's final ruling.
+  Session continuity for the revision-reinjection test and daemon-local
+  `replace_record_bindings` callers are still open questions; no implementation
+  starts until the final review returns.
+- The failure fingerprint and unresolved ownership decision were staged as a
+  candidate-only Eliot record at
+  `C:\Users\kleym\OneDrive\Documents\MCP\.eliot\inbox\2026-08-02T021245-0400_eliot_memory_os_ultra_v4_c7_03c_ul_fixture_ownership_review.surql`.
+  Native `surreal validate` passed in 0.8 s; SHA-256 is
+  `51EC4AC813695531F413FE361E90CABEEDE31EEDAB0178E06B5FF57361F4D939`.
+  It has not been applied or promoted as current truth.
+- Two bounded read-only scouts completed before the Opus quota reset. The first
+  found no existing post-READY projection recovery/wake route: only the
+  daemon-owned writer's crate-private exact commit/replay notification reaches
+  the coordinator. Host observation, PostToolUse dependency enqueue and an
+  unrelated canonical mutation would be hidden triggers, while an unbound
+  facade reconnect allocates a new session. No raw/test-only route is accepted.
+- The second classified all 23 foreign fixture writes (22 `seed`, one
+  `seed_many`). Most can move to an offline pre-daemon bootstrap followed by a
+  durable family/head fence. The t05 revision-2 update and the push-first-value
+  revision-2 update are genuinely live same-session cases; a blanket restart
+  would invalidate their evidence. The classification and the remaining
+  production `replace_record_bindings` owner bypasses were added to the concise
+  same-session Opus resume prompt. No product/test code or verifier was touched.
 
-### Hot semantics and restart authority
+### 2026-08-02 C7-03C UL ownership ruling
 
-- Cue firing, bounded activation and injection selection consume immutable
-  snapshots and return deterministic plans without owning Store or Writer.
-  Direct cues fire with zero edges; depth-two spread remains gated at the
-  unchanged 500-edge threshold. Tier-T remains bounded to 3 items / 400 units.
-- Pending injection is one deterministic, bounded, failure-atomic WriterActor
-  batch. SurrealDB stores exact base64 payload bytes, rejects conflicting batch
-  reuse, reloads at most 256 items, and atomically deletes only the exact
-  `(item_ref, fingerprint)` acknowledged by an injection receipt.
-- App dispatch persists the exact candidate queue before installing that same
-  queue in the session mirror. Restart and `max_sessions=1` eviction hydrate
-  pending items plus delivered receipts and preserve effects-once behavior.
-  Freshness, request-time novelty, packet revision and mutation staleness remain
-  snapshot/session-owned and revision-fenced.
+- After the stated quota reset, the exact same headless Opus 5/Max/read-only
+  session completed in one turn: 107.652 s API / 109.287 s wall, USD 0.802834,
+  zero permission denials, empty stderr and no model fallback. Result JSON
+  SHA-256 is
+  `57A0BD360710C3C4243CAFDF2B5BDAEF1323C63C02805C0F114C8066B4D762AF`;
+  the recopied full session JSONL SHA-256 is
+  `71BCA363D6941CF861655F24BEEC06DC30E097DC62FADC4B30A55B8B726C3E66`.
+- Final ruling: `CONTINUE`. The coordinator is behaving correctly; the failure
+  is a fixture writer outside the daemon notification topology plus a separate
+  production owner violation where verification, UL CLI, onboarding and
+  maintenance directly replace cue projection rows. `load_cue_records.surql`
+  covers every affected record kind, clearing the derivation STOP condition.
+- Accepted repair: delete all four production replacement paths, expose the
+  verification handler's durable `published|stale|blocked|unavailable` state,
+  make direct replacement crate-private, and split fixtures into offline
+  prepare plus daemon launch with a Cue published/head fence. The Harness audit
+  is widened honestly to its foreign module-card writer, direct envelope apply
+  and disposable projection replacement, not only `seed`/`seed_many`.
+- Live same-session revision proof moves into the existing in-crate MCP protocol
+  test boundary using the daemon writer/notifier and one fixed authenticated
+  session. No poller, wake API, hidden RPC, canonical-polluting trigger, restart,
+  sleep or timeout change is permitted. One focused t05, six affected binaries
+  and at most one `just verify` are the accepted verifier ceiling.
 
-### Verification evidence
+### 2026-08-02 C7-03C Opus protocol-proof correction
 
-- Strict Clippy passed for `eliot-types`, `eliot-store`, `eliot-engine` and
-  `eliot-app`; format and diff checks passed.
-- Engine runtime passed 15/15, injection selection 4/4, cue ownership/budget
-  3/3 and coordinator units 7/7 (one isolated guardian intentionally ignored by
-  ordinary Cargo). Store SurQL contracts passed 27/27; the live atomic pending
-  batch/restart/exact-dequeue test passed 1/1.
-- App cutover passed 3/3, full push 4/4 and pyramid delivery 5/5. Isolated
-  projection lease/retry/block, full-wake recovery and same-revision dirty-fence
-  guardians each passed 1/1 with `provider_calls=0`, no timeout, no cleanup
-  failure and no retained run-owned process or secret root.
+- Immediate main-agent source verification found that Opus's asserted
+  `protocol_tests.rs:1601/1738` daemon fixtures do not exist: both anchors are
+  synchronous `RecallL0Response` fields. The file has one `McpDaemon` use, in an
+  ignored external-runtime test. The assigned implementer stopped without an
+  edit rather than inventing a new store/process harness.
+- The exact same Opus 5/Max/read-only session was corrected with those lines.
+  Opus retracted the premise and returned `CONTINUE` in 5 turns, 98.668 s API /
+  100.653 s wall, USD 5.443919, zero denials and empty stderr. Correction result
+  SHA-256 is
+  `596C2C15D30C4050F41F8B26C61B3B4EF37A7351510D952DC5BED0E7E36EA084`;
+  final full-session SHA-256 is
+  `D754E71AD2C4B52E6C3B51B106AC5046294C0F5D2B189F106ED5EDF5C355DCCF`.
+- Corrected proof boundary: extend the existing real coordinator live test with
+  the real `InjectionPlanner`, one `TouchedSetRegistry` and fixed `SessionId` to
+  compose revision-1 delivery, revision-2 fingerprint redelivery and unchanged
+  suppression. Pure overflow/restore edges stay in existing injection unit
+  tests; black-box fixtures prove cold recovery plus transport/tool shape. No
+  new daemon, harness, store backend, RPC, API or competing writer is introduced.
 
-### Acceptance blockers found by final audit
+### 2026-08-02 C7-03C ownership repair implementation and focused proof
 
-- Hydration and tool execution are not covered by the same pending-commit
-  critical section. A concurrent `max_sessions` eviction can recreate an empty
-  mirror and atomically replace an older durable pending queue with only the new
-  plan.
-- Candidate admission retains already delivered/stale entries until later
-  selection. They can consume the mandatory cap and create a false overflow or
-  a runtime/durable mismatch.
-- WriterActor short-circuits an idempotent observability receipt before the
-  store transaction, so replay of an injection receipt can bypass the exact
-  pending-row cleanup performed by `apply_observability.surql`.
+- Production owner cleanup removed nine direct cue replacements: candidate
+  verification, one UL CLI refresh, five onboarding paths and two maintenance
+  paths. Candidate submission now reads the durable Cue family state and reports
+  `published|stale|blocked|unavailable`; a published row older than the commit
+  receipt is truthfully `stale`. Repository search found no consumer of the old
+  false `ready|rebuild_required` strings and no uncovered cue record kind.
+- The shared UL integration fixture now has an explicit typestate boundary.
+  `PreparedHarness` owns the isolated database, migration and all synthetic
+  `seed`, `seed_many`, module-card and direct-envelope bootstrap operations.
+  Consuming `launch` starts the daemon/facade and waits for Search and Cue
+  `Published` at or beyond each recorded bootstrap head plus zero project
+  pending/leased/retryable/blocked rows. Live `Harness` exposes none of those
+  write paths. The disposable cue replacement helper and all integration calls
+  were removed.
+- A full scan corrected the earlier 23-call inventory: three direct envelope
+  applies also existed in `ul_c3_retrieval`, and `ul_cue_candidate` used a
+  disposable derived writer. They were migrated in the same bounded pass. The
+  final affected integration set is eight binaries, not the earlier six.
+- With every caller gone, `replace_record_bindings` and the redundant app-level
+  `UlRuntime.cue_index` field had no owner and produced `dead_code`. They were
+  deleted instead of adding warning exceptions. Coordinator cold recovery still
+  owns `stage_rebuild`, `load_cue_records`, durable publication and staged shard
+  install; no Phase-2 runtime migration was pulled forward.
+- The corrected same-session proof extends the existing isolated coordinator
+  live test with the real writer/notifier, planner, touched registry and one
+  session. It asserts revision-1 failure/card delivery, revision-2 changed
+  failure redelivery and unchanged card suppression. Two pure unit cases cover
+  equal/changed fingerprints and restored-state overflow preservation. Narrow
+  non-live engine tests passed 2/2 with the live test ignored in 0.8 s.
+- App all-tests compile passed in 9.533 s before dead-owner deletion and 9.073 s
+  after; the final one-line unused import was removed. Formatting passed in
+  1.949 s. Focused `t05` passed 1/1 in 15.69 s body / 59.46 s wall, including
+  43.33 s compile. Its stdout/stderr SHA-256 values are
+  `303D37C1AA12F0F1EBB7D2C616DA736DBA2F13F3ADB28AF50A98B8866E3C044F` and
+  `A4D2B433A8BBA2DD023CF478A243BE389DAE33D99C40B24A5A6F91A1B2559BB2`;
+  no real matching fixture process remained after the run.
+- The replacement isolated coordinator live proof passed 1/1 in 3.177 s test /
+  16.822 s harness wall with provider calls zero, exact temp/secret cleanup and
+  all three owned process receipts stopped. Evidence SHA-256 is
+  `71044B7DAF35A44C2652F6856FE6384D5FE3FC3070CB61385349CA911518680D`.
+  Its optional result-artifact path was not produced; the harness wrapper JSON
+  records `workspace_test_exit_code=0`, cleanup success and the exact log hash.
 
-**C7-04A result: CHECKPOINT — NOT ACCEPTED.** The implementation and recorded
-tests are committed for preservation, but Block B1 remains open and C7-04B must
-not start until these three production paths have focused regressions and pass.
+### 2026-08-02 C7-03C affected-suite bootstrap sequence finding
+
+- The one affected-binaries command stopped after 84.708 s in its first binary.
+  `t05` and `h6` passed in 14.93 s and 15.11 s child bodies; `h5` failed after
+  45.06 s at the durable bootstrap fence. Observed truth was Cue/Search applied
+  revision 1, canonical project head 1, one blocked outbox target revision 2,
+  with `search rebuild completed behind the claimed revision`. Stdout/stderr
+  SHA-256 values are
+  `6B22B70CB63AFF09A9DC105E58A74819B2F0474D14CF2406CEB624E30973F657` and
+  `898D682F827C3AFA49818066E4D6CAC8F6C37A7F6A3EC7ED77370C6427AEDB54`.
+- No rerun was spent. Source tracing identified the exact remaining fixture
+  ownership defect: typestate prevented a writer concurrent with the daemon,
+  but each bootstrap method still constructed a fresh `WriterActor` and WAL.
+  The h5 sequence (commit two chunks, replay, repair) let the later actor restart
+  its project sequence and regress `scope_head` to 1 while the replay receipt
+  retained revision 2. The coordinator correctly blocked the impossible target.
+- Bounded correction: `PreparedHarness` owns exactly one persistent bootstrap
+  writer for its entire lifetime. Seed, seed-many, module-card and direct
+  envelope operations all submit through that handle; it is dropped and joined
+  before daemon launch. This removes both the sequential multi-writer topology
+  and the last direct store-envelope bypass rather than weakening the fence.
+
+### 2026-08-02 C7-03C persistent bootstrap writer and C3 relevance repair
+
+- `PreparedHarness::prepare` now opens one `control/control.redb`, starts exactly
+  one `WriterActor`, and retains its handle/task for the complete bootstrap
+  lifetime. All four bootstrap entry points submit through that handle. Launch
+  drops the handle, synchronously joins the drained actor/WAL task, then starts
+  the daemon. Exact scan found one `WriterActor::channel` and zero direct store
+  envelope applies; narrow app-test compilation passed in 2.03 s and 0.37 s on
+  recheck.
+- The single permitted h5 retry passed 1/1 in 21.11 s body / 25.447 s wall.
+  No matching test-owned process remained. Evidence SHA-256 is
+  `B4189C4355BC5796A03AEBDC00A91DE3C9796148ABADD02E9C3AA5A05455BC65`.
+- The next affected-suite command reached `ul_c3_retrieval` first and stopped in
+  24.975 s wall. Its first assertion still required more than 512 Rust-ranked
+  candidates, contradicting the accepted L0 bound of at most 256 compact rows;
+  the target written after 520 distractors was already ranked first. The failed
+  log SHA-256 is
+  `D0F63FB169B25902A280E00A1F4C51254B260C2FB545CCC8D13BBE0F1E6DEC10`.
+- After correcting only that stale count assertion, the focused C3 run advanced
+  to a different failure: the low-authority contested semantic counterexample
+  was absent, so one preview remained instead of the expected supported plus
+  contested pair. Body was 15.54 s / wall 18.673 s; log SHA-256 is
+  `0B8E8D560814F53B9BD180C28E6630120472712C5981CCD442C847F45BB3D0DA`.
+  No third assertion edit was attempted.
+- The repeated C3 failure was escalated through the same exact headless
+  `claude-opus-5`/Max/read-only session. Opus inspected both logs, the full test,
+  selector and contract and returned `CONTINUE`: 4 turns, 211.491 s API /
+  213.233 s wall, USD 5.8583915, zero denials, empty stderr and no fallback.
+  Prompt/result SHA-256 values are
+  `31B8DD2A49A1DA6F80968803860FB7DC4AEB86BA6119963834FA10E198EC645A`
+  and
+  `F44ADDF8A25A63233E3302A17FDBF4A55B3FF71928E2CD3882A43E7663A9ED90`.
+- Opus classified the second failure as a product regression: authority-ordered
+  admission let common high-authority scope-token matches evict the relevant
+  contested row before the Rust ranker. The accepted invariant is BM25 relevance
+  for bounded admission only, with authority/handle as deterministic
+  tie-breakers; database score is not returned or copied into `L0FeatureScore`.
+  Candidate and result caps, one-query behavior and final Rust ranking remain
+  unchanged. Opus also identified one predictably unreachable legacy assertion:
+  a suppressed row deleted from the normal FTS projection cannot emit a
+  normal-path lifecycle suppression trace; hidden/default and paged audit
+  behavior still cover the lifecycle boundary.
+- Official SurrealDB documentation and the tagged v3.1.4 language test confirmed
+  numbered OR syntax `@n,OR@`; the exact local 3.1.4 binary confirmed nonzero
+  BM25 ordering. Both changed loader/EXPLAIN templates passed native
+  `surreal validate` in 0.255 s. Probe evidence SHA-256 is
+  `902C24ABF2BA9B76D9CFA3DC513A6CDAF562022CC17043FFEAE1879833E76D04`.
+- The required provider-free FTS gate then passed all 5/5 cases in 4.671 s body /
+  14.024 s wrapper wall, with zero provider calls, all three owned processes
+  stopped, and temp/secret roots removed. Evidence SHA-256 is
+  `974BB98CD70B8D1088CA0BA6E85FA11A948B981001AA5B5ED36951DD28319A0E`.
+  The one Opus-authorized final C3 run passed 1/1 in 16.74 s body / 31.658 s
+  wall; evidence SHA-256 is
+  `06FD6C81F3A882B232F87856A54BF3664C77A4A524788C0793C4EDF5F692ECFD`.
+
+### 2026-08-02 C7-03C STOP — phase-varying u9 packet floor
+
+- The command for the six remaining integration binaries compiled in 5.39 s
+  and reached `ul_control_treatment` first. `u9_2` and `u9_5` passed in 17.07 s
+  and 20.68 s. `u9_6` then failed before its invariant-gate assertions with a
+  truthful `PACKET_FLOOR_EXCEEDS_BUDGET`: 1207 mandatory tokens for a test
+  budget of 1200. The full binary body was 58.29 s and command wall 64.086 s;
+  log SHA-256 is
+  `BB3D9724074D248A8A8F2813355BA8512137734F4B7D94162A3DBD205EEC2162`.
+- A bounded read-only analysis classified 1200 as a stale test input rather than
+  a current contract SLO, and product fail-closed behavior as correct. One
+  test-only attempt used 1300. It advanced farther, then failed again at 1301;
+  `exact_handles` grew from 23 to 57 and mandatory project understanding from
+  751 to 801. Body was 20.45 s / wall 23.702 s; evidence SHA-256 is
+  `9CEC01BF818999864CF8370FD6D87721640493442205C6FA855D3CE341CAE3CF`.
+- The 1300 change was reverted. No third scalar bump, remaining five binaries,
+  Clippy, `just verify`, scale ladder, commit or push followed. This is the
+  explicit repeated-error and broad-change STOP boundary: the test's control,
+  rejected-treatment and waived-treatment phases need one coherent floor
+  contract, not assertion-by-assertion budget churn.
+- Detailed report:
+  `C:\Users\kleym\AppData\Local\Eliot\reports\cognitive-completion-ultra\2026-08-02-C7-03C-STOP-REPORT.md`.
+  Candidate-only Eliot staging:
+  `C:\Users\kleym\OneDrive\Documents\MCP\.eliot\inbox\2026-08-02T034927-0400_eliot_memory_os_ultra_v4_c7_03c_stop_packet_floor.surql`;
+  SurrealDB 3.1.4 validation passed in 0.140 s, SHA-256
+  `B5FF9D2C8DC76149C4229BA0CE1CBB3B9B666EB9CB9A0D1E98BA02777BBA4FC1`.
+  It was not applied or promoted as current truth.
+
+### 2026-08-02 C7-03C v4.2 resume — causal proof before repair
+
+- Binding resume amendment read completely: 542 lines, 14,680 bytes,
+  SHA-256 `661D3AA51A594303884BB96CBFFA52927D9866CE6560B334AFFED649394972F6`.
+  The prior repeated-error STOP is superseded only for continuation rules; its
+  evidence remains immutable. Base/head remains
+  `97e842042d5d3ab6830ad23a52129a87326a483d`; the dirty worktree and unrelated
+  user-owned `.eliot/` directory remain preserved.
+- Current-source and code-graph tracing confirmed the three amendment defects.
+  `dispatch_compile_packet_l3` calls `ContextCompiler` before experiment
+  assignment, so control already performs L0/L2 memory reads. The engine
+  compiles `ProjectUnderstanding` and budgets once, then the app overwrites the
+  understanding and calls `refinalize_compiled_packet`, creating a second
+  budget pass. Finally, `persist_context_packet` writes global/task latest and
+  immutable revision files before missing-invariant and blind-coverage gates
+  are constructed.
+- Accepted repair boundary: introduce one pre-read compile plan; derive control
+  exposure before any compiler memory read; move semantic enrichment,
+  ProjectUnderstanding construction, and budget ownership into
+  `ContextCompiler`; compute admission before active/latest persistence; write
+  rejected attempts to a separate immutable evidence path only. No provider
+  call or test was made during this proof pass.
+- Cargo metadata confirms the actual five-crate workspace and the external
+  target directory at
+  `C:/Users/kleym/AppData/Local/Eliot/build/eliot-memory-os-target`.
+- Capacity inspection found the amendment's permitted Opus escalation
+  boundary: current canonical commands reject payloads above 128 KiB, search
+  projection stores only one first-2048-term row per handle, cue normalization
+  rejects more than 12 bindings, and exact L2 has no parent/segment expansion.
+  One dense exact `claude-opus-5`/Max/headless/read-only request was attempted
+  against the existing C7-03C session. Claude Code rejected it before any API
+  work because OAuth had expired and could not refresh: zero input/output
+  tokens, zero cost, no model usage. Prompt SHA-256 is
+  `D103E06B93D9340624F2829B4804160794E755F7C8B78E920A435EDA95AE35D7`.
+  No provider ruling was accepted; v4.2 continuation proceeds locally, and
+  Antigravity Opus 4.6 is not substituted for the exact-model exception.
+
+### 2026-08-02 C7-03C v4.2 resume — admission lifecycle implementation
+
+- Production exposure is now derived only from the explicit request before the
+  hidden A/B assignment exists. The assignment was moved behind admission and
+  retained as measurement metadata; it no longer suppresses production memory
+  or injection. Explicit `memory_free_control` skips continuity, experience,
+  pyramid and concept reads in the app, while the engine-owned zero-L0/L2
+  candidate path is being integrated.
+- Gate construction now precedes every authoritative write. Missing invariant
+  coverage yields `packet_admission.status=rejected` and writes only a
+  content-addressed immutable attempt under the task `attempts/` namespace.
+  Blind coverage remains admitted-degraded. Only admitted responses may write
+  pending CodeCortex evidence, predictions, experiment measurement state, and
+  `tasks/<task>/active/{revisions,latest}`. Legacy latest fallback was removed.
+- Generic MCP dispatch now returns rejected compile evidence before touched-set
+  observation, injection planning, successful-tool observation, or influence
+  ledger recording. Task enrichment no longer performs a second current-state
+  read or replaces the compiler-owned packet ID.
+- Pyramid enrichment is fenced by the packet revision with current-state reads
+  immediately before and after the bounded enrichment read. Revision drift now
+  fails the attempt before persistence instead of mixing snapshots.
+- A first compile probe used the wrong non-existent `eliot-app --lib` target
+  (0.708 s). The corrected `--bins` probe ran during the delegated engine/store
+  edits and stopped after 33.881 s on explicitly incomplete helper symbols; it
+  is not acceptance evidence and will not be repeated until both bounded edits
+  report coherent completion.
+- The first coherent integrated `eliot-app --bins` check passed in 46.364 s
+  (46.29 s Cargo body), with only one now-removed unused import. The first
+  focused U9 run then compiled behind the concurrent capacity build lock and
+  took 183.871 s wall / 75.19 s test body. P9/P10 hard-ceiling isolation passed;
+  the other three tests exposed exactly two integration defects: Windows
+  first-write use of replace-only atomic file semantics, and a P12 FTS row
+  decoding regression (`map` where the loader expected `string`).
+- Active packet persistence now uses synced temp-file rename for first create,
+  immutable compare-on-replay for revisions/attempts, and atomic replacement
+  only after latest exists. The P12 owner accepted the FTS decode as blocking
+  and is repairing the nested parent-dedup query before any rerun. These are
+  distinct causal repairs, not scalar test churn.
+- Fixed-point budget accounting now includes exact serialized
+  `packet_budget_decision` and `compile_audit` metadata without recompiling
+  ProjectUnderstanding. Engine context tests pass 15/15 in 0.55 s body; P8
+  retains packet floor 1207 while the total response floor separately includes
+  supplements and metering metadata. The post-integration app check passed in
+  23.243 s wall / 23.16 s body.
+- The first repaired exact `u9_6` reached the rejected response and exposed one
+  isolation-envelope bug: the early no-observation return bypassed standard MCP
+  `tool_success`, leaving no `structuredContent`. Switching that return to the
+  normal success envelope retained the isolation boundary. The single exact
+  repair rerun then passed in 36.18 s body / 59.632 s wall.
+- Exact `u9_5` passed in 24.279 s body / 75.753 s harness wall after the stale
+  fixture's first call became explicit certification control. Hidden control is
+  intentionally no longer allowed to consume production semantics; the prior
+  same-session fixture had consumed/deduplicated its own treatment cues. The
+  P11/P12/cue focused set passed 5/5 in 0.19 s body / 10.795 s wall before a
+  final child-set cryptographic binding hardening pass.
+
+### 2026-08-02 C7-03C v4.2 resume — capacity closure and one-owner review
+
+- Capacity hardening is now coherent: each canonical segment shares a
+  deterministic `segment_set_hash_blake3`; cue pages share a page-set hash and
+  full BlobRef; parent admission binds project, parent, logical kind, complete
+  ordinal sets, counts, hashes, and full blob identity. L2/projection/rebuild
+  reads accept only that admitted child set, and a mixed-set tamper fixture is
+  rejected.
+- The final bounded capacity gate passed 5/5. Cargo body was 0.18 s and wrapper
+  wall 35.650 s after 32.57 s of compilation. Six affected SurrealQL templates
+  validated under SurrealDB 3.1.4 in 0.143 s. Scoped rustfmt and diff checks
+  passed. The earlier 10.795 s result is superseded by this strengthened-set
+  result; U9 was not redundantly rerun.
+- Independent read-only review found that the initial packet repair was still
+  not the amendment's single-owner architecture. The app continued to build
+  task meaning, experience, pyramid/gate supplements and budget inputs around
+  an engine candidate. Legacy `compile_context` also retained an independent
+  default-evidence/old-budget path. Accepted correction is a real typed
+  `PacketCompilePlan` consumed by `ContextCompiler`, with engine-owned final
+  packet, ProjectUnderstanding, gate, budget, prediction intents and response
+  supplement.
+- The same review found three further causal defects before acceptance: touched
+  arguments were observed before admission; first CodeCortex use named an
+  `unwritten` receipt and therefore changed identity after persistence; and
+  prediction/experiment response fields were appended after budget accounting
+  while their writes preceded active-packet persistence. Touched observation is
+  now deferred until successful admitted dispatch. The remaining identity,
+  accounting and persistence-order defects are active implementation work, so
+  no acceptance test was started against this known-incomplete state.
+- A final reachability/integrity review also rejected the capacity slice as
+  acceptance-complete despite its green focused unit tests. Large-memory
+  staging and metadata L2 were not routed from a production ingress/fetch path;
+  exact L2 accepted only a parent handle; parent admission trusted declared set
+  hashes without proving contiguous full-blob coverage or BlobStore presence;
+  cue pages were count-bounded rather than serialized-byte-bounded and their
+  row identity omitted match mode. Fallback recall collapsed siblings before
+  query scoring, and cold FTS rebuild stopped at a fixed 250,000 candidates.
+  These are now a reopened capacity implementation slice; the prior 5/5 result
+  remains component evidence, not P11/P12 acceptance.
+
+### 2026-08-02 C7-03C v4.2 resume — one-owner integration checkpoint
+
+- The engine-owned `PacketCompilePlan` is now integrated into the MCP compile
+  path. The compiler owns ProjectUnderstanding, invariant gate/admission,
+  exact prediction intents, response supplements and the fixed-point budget.
+  Generic `planner.attach` is deliberately skipped for an admitted packet and
+  keeps its delivery pending for the next tool, so no unbudgeted app-owned
+  cognitive payload is appended after compilation.
+- Admitted continuity now commits `active/latest.json` before retryable
+  CodeCortex, prediction, experiment and gate projections. Their prepared
+  intents are written to a packet-scoped outbox first. The material-frame hash
+  was moved before this commit boundary so a serialization error cannot turn a
+  committed active packet into an MCP failure.
+- `cargo check -p eliot-app --bins` passed in 48.9 s wall / 48.0 s Cargo body.
+  The two resulting stale-owner warnings were removed. Exact U9.5 then passed
+  after asserting the sealed compile response has no generic `ul_fired` and
+  that handles-only delivery appears on the next task tool: 26.62 s test body,
+  154.4 s wall, including 2m06s compile/link and credential-gate re-execution.
+  This confirms the long duration is harness/build overhead rather than the
+  cognitive assertion itself.
+- OpenCode Eliot was independently repaired without changing repository
+  product files. Its obsolete host Governor was replaced by clean release
+  `cfe38be` through receipt `host-install:dbcb928a-b0d6-4b0b-9bd8-d7eb6f00be38`;
+  all six MCPs connect and `eliot_current_state` reads revision 78. Provider
+  dispatch remains correctly fail-closed on `published_seal_runtime_drift` and
+  will be resealed only through the governed lifecycle. Full external report:
+  `C:\Users\kleym\AppData\Local\Eliot\reports\opencode-eliot-repair-2026-08-02.md`.
+- Capacity production ingress and parent/segment L2 routing are now present,
+  including `FetchAtomsL2Response.canonical_memory_pages`; the engine exact-L2
+  capability filter was extended to include this new surface. Two identical
+  isolated admission failures showed the SQL preflight returning zero children
+  despite committed child receipts. Per the two-failure stop rule, no blind
+  third run was made. The accepted root repair is to load the whole child set by
+  project/kind/parent only and recompute all declared count/hash/range/blob
+  invariants in Rust, rather than letting SQL hide mismatched children.
+
+### 2026-08-02 C7-03C v4.2 resume — lossless admission and Opus 5 consultation
+
+- Repeated live admission forensics isolated a SurrealDB 3.1.4 materialization
+  defect: record-shaped strings inside `receipt_body` were decoded as the
+  shorter record prefix (for example a full `memory:capacity-l2-...` handle
+  became `memory:capacity`). The authoritative child transport was therefore
+  changed to the writer's lossless `receipt_body_json_b64` channel, decoded as
+  exact JSON in Rust. Earlier attempts remain diagnostic failures: empty 0/39
+  loads (~11.7 s twice), 2,341,514-byte and 826,472/262,144-byte result
+  overflows, and exact mismatch probes taking 16.1 s, 27.5 s and 13.8 s.
+- Claude Code was freshly authorized against `claude.ai` Pro. One deliberate
+  `claude-opus-5`, Max-effort, read-only consultation ran for 503.7 s. Opus
+  confirmed the parent-last, subject-ref-scoped, lossless decode plus single
+  Rust verifier architecture and identified four remaining defects: a
+  SQL-side null filter that could hide surplus rows, an unenforced 128 KiB body
+  premise, pagination ordered by lossy/non-total body ordinals, and undefined
+  repeat-generation semantics.
+- The three mandatory defects are repaired: malformed lossless rows now throw;
+  canonical capacity bodies are bounded at serialization; admission uses a
+  one-row page with look-ahead under the 512 KiB result ceiling and orders by
+  unique `record_id`. SurrealDB 3.1.4 validation passed in 0.9 s.
+- Repeat generations use the systemic option recommended by Opus: every scoped
+  row is losslessly decoded in Rust, then partitioned by exact set hash plus
+  BlobRef before the sole full child-set verifier recomputes cardinality,
+  continuity, IDs, hashes and live BlobStore bytes. The scan is capped at 4,096
+  rows. A same-cardinality missing-plus-surplus rejection was added. Final live
+  capacity evidence is pending one bounded rerun.
+- The bounded live rerun took 21.557 s wall (8.462 s nextest body, 3.45 s
+  compile) and proved that parent admission now succeeds. It then failed at the
+  next, previously unreachable boundary: normal exact-L2 returned no parent
+  handle. Inspection found that `load_canonical_memory_l2.surql` still queried
+  and returned the same lossy nested `receipt_body` representation. This is a
+  distinct first failure of the read route, not a recurrence of admission; a
+  bounded lossless L2 repair is in progress before one final rerun.
+- Normal canonical-memory L2 now uses only lossless base64 identity/pages:
+  direct segment identity is derived from the deterministic canonical record
+  key, manifests are scanned under a 4,096-row bound, and all child segments
+  are decoded, generation-filtered, sorted and checked in Rust before a bounded
+  metadata-only page is returned. SurrealDB validate, store check and 5/5
+  focused source/unit checks passed.
+- The single post-repair live rerun passed 1/1: 14.725 s nextest body and
+  24.820 s wall. It proved parent admission, first/continued parent pages and a
+  direct tail-segment handle against real SurrealDB 3.1.4. Provider calls were
+  zero; owned DB/test processes and temporary secrets were fully cleaned.
+
+### 2026-08-02 C7-03C v4.2 resume — append-only outbox stop and identity ruling
+
+- Packet commit lifecycle unit tests passed 3/3 after mutable Windows outbox
+  replacement was removed in favour of immutable intent plus append-only event
+  records: 0.04 s test body / 79.065 s wall, almost entirely compile/link and
+  build-lock overhead. App check passed in 12.339 s.
+- The single repaired `u9_6` rerun failed after 25.15 s test body / 90.692 s
+  wall with `packet post-commit response hash mismatch`. This is the second
+  consecutive focused failure (the first was the Windows sharing race), so the
+  writer stopped without a third patch/test and escalated as required.
+- One read-only `claude-opus-5` Max consultation ran for 917.4 s. Opus rejected
+  reparsed-`Value` identity and recommended immutable exact response bytes as
+  the sole digest authority, a pointer-only active authority, non-replacing OS
+  creation, explicit abandonment of unreachable intents and an authority
+  recheck preventing stale replay resurrection. It also identified the risk
+  that process-local locks do not serialize two true writers.
+- Independent local dependency audit found a narrower discriminating cause:
+  packet quality contains `f32`, while workspace `serde_json 1.0.150` lacks
+  `float_roundtrip`; its parser documents best-effort rather than identical
+  float recovery. Key-order/whitespace explanations are excluded. Because this
+  conflicts with Opus's float-fixpoint premise, no architecture is accepted by
+  authority alone: a full-intent persist/read regression is being run first on
+  the current feature set, then (only if it fails) with `float_roundtrip`.
+- No third `u9_6` run has been started. A separate read-only ownership audit is
+  determining whether MCP facade and daemon are both product writers or one is
+  only an IPC proxy; that evidence controls whether the full schema-v3 outbox
+  rewrite is an acceptance repair or unnecessary churn.
+- The discriminating full-intent test failed on the current dependency exactly
+  as the local serde_json contract predicted: `51.248178375505404`
+  (`0x40499fc44f1b2f60`) reparsed as `51.24817837550541`
+  (`0x40499fc44f1b2f61`), a one-ULP delta. With only the official
+  `float_roundtrip` feature enabled, the identical test passed. App check then
+  passed in 56.501 s. This falsifies Opus's default-parser premise and closes
+  the observed hash cause without weakening validation or rounding metrics.
+- The ownership audit also falsified Opus's UL-T04 topology claim: the MCP
+  facade is an authenticated named-pipe relay and only the daemon executes
+  task handlers. It did confirm a different live route: two named daemon
+  instances may share one config/state root while holding distinct instance
+  lifecycle locks. They can bypass process-local packet mutexes; Windows rename
+  is also not a no-clobber primitive. The bounded repair therefore reuses the
+  existing cross-process TaskTransition lock over fence→commit→effects and
+  publishes immutable files with atomic hard-link creation. Schema-v3 response
+  duplication is not accepted without a remaining failure that requires it.
+
+### 2026-08-02 C7-03C v4.2 resume — final U9.6 stop
+
+- The bounded cross-instance hardening passed its own acceptance: exact packet
+  commit units 6/6 (0.05 s body / 36.916 s wall), `cargo check -p eliot-app`
+  in 6.965 s, and `git diff --check`. The implementation uses the canonical
+  TaskTransition process lock in global→process order, rechecks active authority
+  immediately before normal/replay effects, and publishes immutable files by
+  `fsync(temp) → hard_link(temp, destination) → remove(temp)` with no rename
+  fallback. A concurrent distinct-byte unit proved one winner and no clobber.
+- The one authorized final `u9_6` run failed deterministically after 30.550 s
+  nextest body / 37.162 s wall. It ran one test, skipped three, made zero
+  provider calls, timed out nowhere, and removed its owned process/secret/temp
+  roots. The exact error was `packet outbox operation collision` at the
+  immutable task outbox `intent.json`; nextest evidence SHA-256 is
+  `6aeffac4f62601670f81355948be2ce6b1c400ab7d33434a69041e5016d2009a`.
+- Static causality is bounded and exact. `operation_id` is derived only from
+  `(session_id, response_hash_blake3)`, while an existing intent is accepted as
+  the same operation only when its broader post-commit material hash also
+  matches (revision, CodeCortex projection, prediction intents, measurement and
+  gate projection). U9.6 repeats an admitted response in the same MCP session;
+  the response identity remained equal but at least one side-effect component
+  changed. The code therefore maps distinguishable commit intents onto one
+  operation directory and rejects its own legitimate repeated compile. The
+  error does not identify which material member changed, and the cleaned
+  isolated fixture no longer exists, so that narrower attribution is explicitly
+  unverified.
+- Per the stated final-rerun and repeated-failure stop rule, no fourth patch or
+  U9.6 attempt was made. C7-03C is `BLOCKED`, not certified. The next bounded
+  repair must choose one coherent identity domain: either derive operation
+  identity from the entire immutable commit material or make all side effects a
+  deterministic function of the response identity and reuse the persisted
+  intent on replay. Weakening collision validation or adding randomness to the
+  path is rejected as a workaround.
+- Read-only Phase 2 audit was completed after STOP without edits or tests. Phase
+  2 remains unimplemented: `UlRuntime` is still app-owned; only cue has a
+  revision-bound shard; concept/pyramid, activation, dependency/dirty, utility
+  and session state are not one immutable `UnderstandingRuntime` snapshot;
+  PostToolUse only spools; PreToolUse neither drains prepared injection nor
+  checks negative memory; the 500-edge gate, hot DB/full-graph reads and
+  synchronous activation trace remain. The smallest future slice is a same-cut
+  owner/snapshot cutover that adds engine `UnderstandingRuntime`, moves the
+  shared state into it, replaces `McpState.ul`, and deletes app `UlRuntime`
+  without leaving dual constructible owners.
+- The final required Eliot readback through the repaired OpenCode MCP passed in
+  2.216 s at project revision/sequence 78 with no tool error and seven governed
+  tools. The session had no bound project/task or TaskRoleLease, and the returned
+  `ul_boot` explicitly marked charter/map content stale. No synthetic task or
+  lease was created merely to manufacture a writeback; this worklog and the
+  external principal ledger are the lossless handoff for the governed resume.

@@ -106,7 +106,6 @@ fn l2_request(project_id: ProjectId, handles: Vec<String>) -> FetchAtomsL2Reques
 }
 
 #[tokio::test]
-#[allow(clippy::too_many_lines)]
 async fn canonical_capacity_parent_and_tail_segment_are_reachable_through_normal_l2()
 -> Result<(), Box<dyn Error>> {
     let Some(config) = isolated_config() else {
@@ -174,10 +173,7 @@ async fn canonical_capacity_parent_and_tail_segment_are_reachable_through_normal
     let parent = store
         .fetch_atoms_l2(&l2_request(project_id, vec![memory_handle.clone()]))
         .await?;
-    assert_eq!(
-        parent.returned_handles.as_slice(),
-        std::slice::from_ref(&memory_handle)
-    );
+    assert_eq!(parent.returned_handles, [memory_handle.clone()]);
     assert_eq!(parent.canonical_memory_pages.len(), 1);
     let first_page = &parent.canonical_memory_pages[0];
     assert_eq!(first_page.requested_handle, memory_handle);
@@ -208,10 +204,7 @@ async fn canonical_capacity_parent_and_tail_segment_are_reachable_through_normal
     let tail = store
         .fetch_atoms_l2(&l2_request(project_id, vec![tail_segment_id.clone()]))
         .await?;
-    assert_eq!(
-        tail.returned_handles.as_slice(),
-        std::slice::from_ref(&tail_segment_id)
-    );
+    assert_eq!(tail.returned_handles, [tail_segment_id.clone()]);
     assert_eq!(tail.canonical_memory_pages.len(), 1);
     assert_eq!(
         tail.canonical_memory_pages[0]
@@ -610,12 +603,8 @@ async fn query_aware_l0_and_exact_l2_are_bounded_scoped_and_restart_deterministi
         .await?;
     let query_plan_json = serde_json::to_string(&query_plan)?;
     assert!(
-        query_plan_json.contains("FullTextScan"),
-        "native FTS lookup did not select FullTextScan: {query_plan_json}"
-    );
-    assert!(
-        query_plan_json.contains("idx_memory_search_projection_fts_v1"),
-        "native FTS lookup did not use its projection index: {query_plan_json}"
+        query_plan_json.contains("idx_memory_search_token_posting"),
+        "posting lookup did not use its composite index: {query_plan_json}"
     );
     let rebuilt_revision = restarted
         .rebuild_memory_search_projection(project_id)

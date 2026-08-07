@@ -38,7 +38,6 @@ pub enum NamedSurqlOp {
     DeleteCueRows,
     LoadCueRows,
     LoadCueRecords,
-    LoadPendingInjections,
     LoadInjectionReceipts,
     LoadUlArtifacts,
     UpsertUlTaskLedger,
@@ -47,7 +46,6 @@ pub enum NamedSurqlOp {
     LoadUlReadiness,
     ApplyWriteEnvelope,
     ApplyObservability,
-    ApplyPendingInjectionBatch,
     ObservabilityReceiptById,
     ObservabilityRecordsByKind,
     CurrentState,
@@ -127,7 +125,6 @@ impl NamedSurqlOp {
             | Self::UpsertUlTaskLedger
             | Self::ApplyWriteEnvelope
             | Self::ApplyObservability
-            | Self::ApplyPendingInjectionBatch
             | Self::UpsertMemorySearchProjection
             | Self::ResetMemorySearchProjection
             | Self::EnqueueCognitiveProjectionIntent
@@ -144,7 +141,6 @@ impl NamedSurqlOp {
             | Self::LoadUlActivationGraph
             | Self::LoadCueRows
             | Self::LoadCueRecords
-            | Self::LoadPendingInjections
             | Self::LoadInjectionReceipts
             | Self::LoadUlArtifacts
             | Self::LoadPredictions
@@ -218,7 +214,6 @@ impl NamedSurqlOp {
             Self::DeleteCueRows => "delete_cues_for_record",
             Self::LoadCueRows => "load_cue_rows",
             Self::LoadCueRecords => "load_cue_records",
-            Self::LoadPendingInjections => "load_pending_injections",
             Self::LoadInjectionReceipts => "load_injection_receipts",
             Self::LoadUlArtifacts => "load_ul_artifacts",
             Self::UpsertUlTaskLedger => "upsert_ul_task_ledger",
@@ -227,7 +222,6 @@ impl NamedSurqlOp {
             Self::LoadUlReadiness => "load_ul_readiness",
             Self::ApplyWriteEnvelope => "apply_write_envelope",
             Self::ApplyObservability => "apply_observability",
-            Self::ApplyPendingInjectionBatch => "apply_pending_injection_batch",
             Self::ObservabilityReceiptById => "observability_receipt_by_id",
             Self::ObservabilityRecordsByKind => "observability_records_by_kind",
             Self::CurrentState => "current_state",
@@ -336,9 +330,6 @@ impl NamedSurqlOp {
             Self::DeleteCueRows => include_str!("surql/delete_cues_for_record.surql"),
             Self::LoadCueRows => include_str!("surql/load_cue_rows.surql"),
             Self::LoadCueRecords => include_str!("surql/load_cue_records.surql"),
-            Self::LoadPendingInjections => {
-                include_str!("surql/load_pending_injections.surql")
-            }
             Self::LoadInjectionReceipts => {
                 include_str!("surql/load_injection_receipts.surql")
             }
@@ -349,9 +340,6 @@ impl NamedSurqlOp {
             Self::LoadUlReadiness => include_str!("surql/load_ul_readiness.surql"),
             Self::ApplyWriteEnvelope => include_str!("surql/apply_write_envelope.surql"),
             Self::ApplyObservability => include_str!("surql/apply_observability.surql"),
-            Self::ApplyPendingInjectionBatch => {
-                include_str!("surql/apply_pending_injection_batch.surql")
-            }
             Self::ObservabilityReceiptById => {
                 include_str!("surql/observability_receipt_by_id.surql")
             }
@@ -489,7 +477,7 @@ impl Default for SurqlTemplateRegistry {
 }
 
 #[allow(clippy::too_many_lines)]
-fn foundational_templates() -> [SurqlTemplate; 63] {
+fn foundational_templates() -> [SurqlTemplate; 61] {
     [
         template(
             NamedSurqlOp::SchemaMigrate,
@@ -666,12 +654,6 @@ fn foundational_templates() -> [SurqlTemplate; 63] {
             8 * 1024 * 1024,
         ),
         template(
-            NamedSurqlOp::LoadPendingInjections,
-            "LoadPendingInjectionsInput",
-            "LoadPendingInjectionsOutput",
-            8 * 1024 * 1024,
-        ),
-        template(
             NamedSurqlOp::LoadInjectionReceipts,
             "LoadInjectionReceiptsInput",
             "LoadInjectionReceiptsOutput",
@@ -717,12 +699,6 @@ fn foundational_templates() -> [SurqlTemplate; 63] {
             NamedSurqlOp::ApplyObservability,
             "ApplyObservabilityInput",
             "ApplyObservabilityOutput",
-            64 * 1024,
-        ),
-        template(
-            NamedSurqlOp::ApplyPendingInjectionBatch,
-            "ApplyPendingInjectionBatchInput",
-            "ApplyPendingInjectionBatchOutput",
             64 * 1024,
         ),
         template(
@@ -1031,7 +1007,6 @@ fn template(
 }
 
 #[cfg(test)]
-#[allow(clippy::expect_used)]
 mod tests {
     use super::{NamedSurqlOp, SurqlAccessClass, SurqlTemplateRegistry};
 
@@ -1048,8 +1023,8 @@ mod tests {
             }
         }
 
-        assert_eq!(registry.templates.len(), 84);
-        assert_eq!(counts, [46, 22, 16]);
+        assert_eq!(registry.templates.len(), 82);
+        assert_eq!(counts, [45, 21, 16]);
     }
 
     #[test]
@@ -1319,8 +1294,6 @@ mod tests {
         assert!(publish.contains("family: $family"));
         assert!(publish.contains("last_error: $effective_error"));
         assert!(enqueue.contains("IF $mark_dependency_dirty_stale"));
-        assert!(enqueue.contains("$rearm_applied AND $existing.status = 'applied'"));
-        assert!(enqueue.contains("applied_at = NONE"));
         assert!(enqueue.contains("family: 'dependency_dirty'"));
         assert!(enqueue.contains("'stale'"));
         assert!(complete.contains("LET $remaining = SELECT status, updated_revision"));
@@ -1433,45 +1406,6 @@ mod tests {
     }
 
     #[test]
-    fn cue_records_use_canonical_ul_artifacts_as_the_single_snapshot_source() {
-        let template = NamedSurqlOp::LoadCueRecords.template();
-
-        assert!(template.contains("payload.receipt_kind NOT IN"));
-        for canonical_kind in [
-            "'module_card'",
-            "'concept_node'",
-            "'project_charter'",
-            "'system_map'",
-            "'subsystem_capsule'",
-        ] {
-            assert!(
-                template.contains(canonical_kind),
-                "cue-source exclusion omitted {canonical_kind}"
-            );
-        }
-    }
-
-    #[test]
-    fn pending_injection_batch_is_failure_atomic_bounded_and_receipt_dequeued() {
-        let batch = NamedSurqlOp::ApplyPendingInjectionBatch.template();
-        let load = NamedSurqlOp::LoadPendingInjections.template();
-        let receipt = NamedSurqlOp::ApplyObservability.template();
-
-        assert!(batch.contains("BEGIN TRANSACTION"));
-        assert!(batch.contains("DELETE pending_injection"));
-        assert!(batch.contains("FOR $row IN $rows"));
-        assert!(batch.contains("pending_injection_batch_write_id_conflict"));
-        assert!(batch.contains("COMMIT TRANSACTION"));
-        assert!(load.contains("LIMIT 257"));
-        assert!(load.contains("array::slice($pending, 0, 256)"));
-        assert!(
-            receipt.contains("type::record('pending_injection', $pending_injection_record_id)")
-        );
-        assert!(receipt.contains("$result.status != 'rejected'"));
-    }
-
-    #[test]
-    #[allow(clippy::too_many_lines)]
     fn canonical_capacity_is_parent_last_paged_and_segment_deduplicated() {
         let write = NamedSurqlOp::ApplyWriteEnvelope.template();
         for marker in [

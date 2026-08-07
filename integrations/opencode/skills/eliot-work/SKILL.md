@@ -1,9 +1,22 @@
 ---
 name: eliot-work
-description: "Material code change in an ELIOT project"
+description: "Verify ELIOT work and build governed project memory"
 ---
 
 # ELIOT work
+
+## Meta principle
+
+Every material task produces (1) verified Governor/plugin and system behavior,
+and (2) reusable project data: current facts, history, failures, timings,
+decisions, and procedures, with provenance and freshness.
+
+Use only Governor `eliot_*` tools; never bypass them with raw database access.
+Resolve project identity first. After each write require its receipt plus exact
+`eliot_fetch_l2` at that revision. Record schema/projection/readback failures and
+plugin wall time separately from product/verifier time. Ground data in current
+source and history; label dirty and legacy evidence. Retry once only after a
+changed condition.
 
 Start working; context arrives with the first successful ELIOT call. For a
 material change:

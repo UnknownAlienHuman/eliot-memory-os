@@ -6,13 +6,6 @@
 **Form:** theory and architecture first; problems and solutions second.  
 **Non-goal:** this is not an audit log, version log, benchmark diary, SaaS wrapper plan, prompt-trick list or implementation checklist.
 
-**Standing of the claims below:** this document is the governing product and
-architecture vision. It describes what ELIOT is for and how it is meant to
-work. It does not assert that every mechanism it names is already built, and a
-mechanism described here is not evidence that it exists in the running system.
-For what is actually implemented, read the code, `docs/architecture/ELIOT_Rust_Governor_Production_Architecture_v1_0.md`,
-and the runtime's own doctor output.
-
 ---
 
 # 0. Document contract

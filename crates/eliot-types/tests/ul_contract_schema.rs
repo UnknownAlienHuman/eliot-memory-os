@@ -1,6 +1,7 @@
+use eliot_types::memory::DEFAULT_CONTEXT_PACKET_PREFERRED_TOKENS;
 use eliot_types::{
     CompilePacketL3Request, CompilePacketToolInput, MaterialPacketFrame, MemoryExposureMode,
-    ProjectId, compile_packet_input_schema,
+    ProjectId, compile_packet_input_schema, compile_packet_minimal_example,
 };
 use serde_json::Value;
 
@@ -63,6 +64,44 @@ fn t01_schema_required_set_is_exact() -> Result<(), Box<dyn std::error::Error>> 
             "serialized complete input is missing {field}"
         );
     }
+    Ok(())
+}
+
+#[test]
+fn t02_packet_budget_is_an_optional_preferred_target() -> Result<(), Box<dyn std::error::Error>> {
+    let schema = compile_packet_input_schema();
+    let required = schema
+        .get("required")
+        .and_then(Value::as_array)
+        .ok_or_else(|| std::io::Error::other("compile schema must publish required fields"))?;
+    assert!(!required.iter().any(|field| field == "max_tokens"));
+
+    let budget_schema = schema
+        .pointer("/properties/max_tokens")
+        .ok_or_else(|| std::io::Error::other("max_tokens schema is missing"))?;
+    assert_eq!(
+        budget_schema.get("default").and_then(Value::as_u64),
+        Some(DEFAULT_CONTEXT_PACKET_PREFERRED_TOKENS as u64)
+    );
+    let description = budget_schema
+        .get("description")
+        .and_then(Value::as_str)
+        .ok_or_else(|| std::io::Error::other("max_tokens description is missing"))?;
+    assert!(description.contains("caller-preferred"));
+    assert!(description.contains("hard ceiling"));
+
+    let minimal = compile_packet_minimal_example();
+    assert!(minimal.get("max_tokens").is_none());
+    let decoded: CompilePacketToolInput = serde_json::from_value(minimal.clone())?;
+    assert_eq!(
+        decoded.request.max_tokens,
+        DEFAULT_CONTEXT_PACKET_PREFERRED_TOKENS
+    );
+
+    let mut compatible = minimal;
+    compatible["max_tokens"] = Value::from(1_200);
+    let decoded: CompilePacketToolInput = serde_json::from_value(compatible)?;
+    assert_eq!(decoded.request.max_tokens, 1_200);
     Ok(())
 }
 

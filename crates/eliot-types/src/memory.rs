@@ -992,7 +992,18 @@ pub struct CompilePacketL3Request {
     pub task_id: String,
     pub goal: String,
     pub candidate_handles: Vec<String>,
+    /// Optional caller-preferred target for the complete rendered context
+    /// surface. This is neither a strict cap nor an exact mandatory floor: the
+    /// Governor trims optional sections first and may expand to the computed
+    /// mandatory floor up to its independently owned hard ceiling.
+    #[serde(default = "default_context_packet_preferred_tokens")]
     pub max_tokens: usize,
+}
+
+pub const DEFAULT_CONTEXT_PACKET_PREFERRED_TOKENS: usize = 1_800;
+
+const fn default_context_packet_preferred_tokens() -> usize {
+    DEFAULT_CONTEXT_PACKET_PREFERRED_TOKENS
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

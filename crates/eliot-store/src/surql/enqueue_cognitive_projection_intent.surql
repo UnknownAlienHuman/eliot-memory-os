@@ -25,18 +25,6 @@ IF $existing = NONE {
   OR $existing.updated_revision != $updated_revision
   OR $existing.families != $families {
   THROW 'cognitive_projection_intent_id_conflict';
-} ELSE IF $rearm_applied AND $existing.status = 'applied' {
-  UPDATE $record_id SET
-    status = 'pending',
-    attempt_count = 0,
-    lease_id = NONE,
-    lease_owner = NONE,
-    lease_expires_at = NONE,
-    next_attempt_at = <datetime> $now,
-    last_error = NONE,
-    blocked_reason = NONE,
-    applied_at = NONE,
-    updated_at = <datetime> $now;
 };
 
 LET $result = SELECT * FROM ONLY $record_id;

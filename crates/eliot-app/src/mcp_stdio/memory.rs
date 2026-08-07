@@ -680,7 +680,10 @@ pub(super) fn curation_numeric(value: &Value, name: &str) -> Option<f64> {
 }
 
 const MEMORY_DISTILLATION_SCAN_PAGE_SIZE: u16 = 100;
-const MAX_MEMORY_DISTILLATION_SCAN_RECORDS: usize = 1_000_000;
+// Temporary bounded degraded path until Phase 2 publishes the daemon-owned
+// utility snapshot. `complete=false` is propagated when this explicit limit is
+// reached, so the cap is never represented as a complete project ledger.
+const MAX_MEMORY_DISTILLATION_SCAN_RECORDS: usize = 2_048;
 
 pub(super) async fn canonical_memory_snapshot(
     state: &McpState,

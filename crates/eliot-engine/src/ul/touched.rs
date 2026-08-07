@@ -243,7 +243,14 @@ impl TouchedSetRegistry {
         tool_name: &str,
         value: &Value,
     ) -> Vec<ObservedCue> {
-        let observed = extract_observed_cues(tool_name, value);
+        let mut observed = Vec::new();
+        extract_cues(tool_name, None, value, &mut observed);
+        observed.sort_by(|left, right| {
+            left.kind
+                .cmp(&right.kind)
+                .then_with(|| left.value.cmp(&right.value))
+        });
+        observed.dedup();
         let Ok(mut sessions) = self.sessions.lock() else {
             return Vec::new();
         };
@@ -263,19 +270,7 @@ impl TouchedSetRegistry {
     }
 }
 
-pub(crate) fn extract_observed_cues(tool_name: &str, value: &Value) -> Vec<ObservedCue> {
-    let mut observed = Vec::new();
-    extract_cues(tool_name, None, value, &mut observed);
-    observed.sort_by(|left, right| {
-        left.kind
-            .cmp(&right.kind)
-            .then_with(|| left.value.cmp(&right.value))
-    });
-    observed.dedup();
-    observed
-}
-
-pub(crate) fn exact_fetch_context(
+fn exact_fetch_context(
     project_id: ProjectId,
     session_id: SessionId,
     result: &Value,

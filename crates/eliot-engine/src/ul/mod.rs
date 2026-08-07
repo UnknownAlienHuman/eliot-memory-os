@@ -16,9 +16,8 @@ pub mod readiness;
 pub mod refinement;
 pub mod token_policy;
 pub mod touched;
-pub mod understanding;
 
-pub use activation::{ActivationEngine, ActivationProjection, DEFAULT_ACTIVATION_ENABLE_MIN_EDGES};
+pub use activation::ActivationEngine;
 pub use calibration::{CalibrationService, calibration_trend, confidence_probability_milli};
 pub use capsule::{
     CapsuleEvidence, PromotedPyramid, PyramidBuilder, PyramidDecision, PyramidDependency,
@@ -26,7 +25,7 @@ pub use capsule::{
     render_capsule_with_dirty,
 };
 pub use cards::{ModuleCardService, failure_bindings_by_path};
-pub use cue_index::{CueIndexService, CueIndexSnapshot, FiredMemory, FiringResult};
+pub use cue_index::{CueIndexService, FiredMemory, FiringResult};
 pub use dependency::{UlDependencyService, dependency_refs};
 pub use eliot_types::ObservedCue;
 pub use exam::{
@@ -36,10 +35,7 @@ pub use exam::{
     build_cold_exam_request, build_exam_plan, grade_exam, invoke_reasoner_once,
     normalize_exam_reference, precision_recall_f1, weekly_exam_due, weekly_exam_route,
 };
-pub use injection::{
-    InjectionPlan, InjectionPlanner, InjectionSelection, InjectionSelectionPolicy,
-    deterministic_write_id,
-};
+pub use injection::InjectionPlanner;
 pub use ledger::{
     UlLedgerAccumulator, UlLedgerService, UlToolMeasurement, is_mutation_tool, is_read_class_tool,
 };
@@ -69,12 +65,3 @@ pub use refinement::{
 };
 pub use token_policy::UlTokenPolicyService;
 pub use touched::{TouchedCue, TouchedSetRegistry};
-pub use understanding::{
-    CapsuleSnapshot, CardSnapshot, CharterSnapshot, CompactRecord,
-    DEFAULT_PROJECT_SNAPSHOT_MAX_BYTES, DeliveredFingerprint, DependencyProjection,
-    DirtyArtifactProjection, FreshArtifact, PacketUnderstandingRequest, PendingRestoreSource,
-    ProjectProjectionFamily, ProjectProjectionHealth, ProjectRevisions, ProjectSnapshot,
-    ProjectSnapshotBuilder, ProjectSnapshotInput, ProjectionFamilyHealth, PyramidPacketEnrichment,
-    RestoredSession, SessionSnapshot, SnapshotFreshness, SystemMapSnapshot,
-    UnderstandingExecutionMode, UnderstandingRuntime, UnderstandingRuntimeConfig,
-};

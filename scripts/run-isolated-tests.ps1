@@ -14,6 +14,7 @@ param(
     [string]$HarnessProbe = 'none',
     [switch]$InjectFailureAfterSecretSetup,
     [string]$EvidenceLogPath,
+    [string]$ResultArtifactPath,
     [string]$SurrealExecutable = $env:ELIOT_SURREAL_EXE
 )
 
@@ -267,6 +268,14 @@ if (-not [string]::IsNullOrWhiteSpace($EvidenceLogPath)) {
         throw 'evidence log path must remain outside the run-owned cleanup root'
     }
 }
+$resolvedResultArtifact = $null
+if (-not [string]::IsNullOrWhiteSpace($ResultArtifactPath)) {
+    $resolvedResultArtifact = [IO.Path]::GetFullPath($ResultArtifactPath)
+    if ($resolvedResultArtifact.StartsWith($ownedPrefix, [StringComparison]::OrdinalIgnoreCase)) {
+        throw 'result artifact path must remain outside the run-owned cleanup root'
+    }
+    [IO.Directory]::CreateDirectory((Split-Path -Parent $resolvedResultArtifact)) | Out-Null
+}
 
 $ambientLocalAppData = [Environment]::GetEnvironmentVariable('LOCALAPPDATA', 'Process')
 if ([string]::IsNullOrWhiteSpace($ambientLocalAppData)) {
@@ -283,6 +292,13 @@ if (-not $secretOwnedRoot.StartsWith($secretTestsPrefix, [StringComparison]::Ord
     [IO.Path]::GetFileName($secretOwnedRoot) -cne $runId -or
     [IO.Path]::GetFullPath((Split-Path $secretOwnedRoot -Parent)) -ine $secretTestsRoot) {
     throw "owned test secret root escaped its exact run boundary: $secretOwnedRoot"
+}
+if ($null -ne $resolvedResultArtifact) {
+    $secretOwnedPrefix = $secretOwnedRoot.TrimEnd([IO.Path]::DirectorySeparatorChar) + [IO.Path]::DirectorySeparatorChar
+    if ($resolvedResultArtifact -ieq $secretOwnedRoot -or
+        $resolvedResultArtifact.StartsWith($secretOwnedPrefix, [StringComparison]::OrdinalIgnoreCase)) {
+        throw 'result artifact path must remain outside the run-owned secret cleanup root'
+    }
 }
 $secretRoot = Join-Path $secretOwnedRoot 'secrets'
 $passwordPath = Join-Path $secretRoot 'surreal_root_password.txt'
@@ -338,6 +354,7 @@ foreach ($name in @(
     'ELIOT_TEST_OPERATOR_CURSOR_CREDENTIAL_ROOT',
     'ELIOT_TEST_OPERATOR_CURSOR_CREDENTIAL_TARGET',
     'ELIOT_TEST_ALLOW_LEGACY_OPERATOR_CURSOR_KEY_FILE',
+    'ELIOT_COGNITIVE_FIELD_RESULT_PATH',
     'ELIOT_SURREAL_EXE',
     'SURREAL_USER',
     'SURREAL_PASS'
@@ -448,6 +465,12 @@ migrations_dir = "$migrationsPath"
     $env:ELIOT_TEST_SURREAL_ENDPOINT = "ws://127.0.0.1:$port/rpc"
     $env:ELIOT_TEST_SURREAL_PASSWORD_FILE = $passwordConfigPath
     $env:ELIOT_TEST_SURREAL_STORAGE = "rocksdb:$storagePath"
+    if ($null -ne $resolvedResultArtifact) {
+        $env:ELIOT_COGNITIVE_FIELD_RESULT_PATH = $resolvedResultArtifact
+    }
+    else {
+        Remove-Item Env:ELIOT_COGNITIVE_FIELD_RESULT_PATH -ErrorAction SilentlyContinue
+    }
     $env:ELIOT_SURREAL_EXE = $surrealExePath
     $env:SURREAL_USER = 'root'
     $env:SURREAL_PASS = $password
@@ -844,6 +867,12 @@ $report = [ordered]@{
     nextest_failure_excerpt_bytes = $nextestFailureExcerptBytes
     nextest_failure_excerpt_truncated = $nextestFailureExcerptTruncated
     evidence_log_path = if ($null -eq $resolvedEvidenceLog) { $null } else { $resolvedEvidenceLog.Replace('\', '/') }
+    result_artifact_path = if ($null -eq $resolvedResultArtifact) { $null } else { $resolvedResultArtifact.Replace('\', '/') }
+    result_artifact_exists = $null -ne $resolvedResultArtifact -and (Test-Path -LiteralPath $resolvedResultArtifact -PathType Leaf)
+    result_artifact_sha256 = if ($null -ne $resolvedResultArtifact -and (Test-Path -LiteralPath $resolvedResultArtifact -PathType Leaf)) {
+        (Get-FileHash -LiteralPath $resolvedResultArtifact -Algorithm SHA256).Hash.ToLowerInvariant()
+    }
+    else { $null }
     child_exit_code = $childExit
     terminal_error = $terminalError
     terminal_error_detail = $terminalErrorDetail

@@ -85,7 +85,7 @@ pub(super) async fn dispatch_host_governor_method(
             crate::commands::run_ul_report_from_daemon(
                 &state.root,
                 &state.store,
-                state.ledger_service(),
+                &state.ul.ledger,
                 params,
             )
             .await,
@@ -276,6 +276,22 @@ fn dispatch_error_response(id: &Value, error: &anyhow::Error) -> Value {
             minimal_valid_example: Value::Null,
         };
         error_response_with_data(id, -32602, "observability write_id conflict", &data)
+    } else if let Some(eliot_engine::PacketCompileError::HardCeiling(details)) =
+        error.downcast_ref::<eliot_engine::PacketCompileError>()
+    {
+        error_response_with_data(
+            id,
+            -32602,
+            "context packet hard ceiling exceeded",
+            &serde_json::json!({
+                "code": "PACKET_HARD_CEILING_EXCEEDED",
+                "preferred_tokens": details.preferred_tokens,
+                "hard_ceiling_tokens": details.hard_ceiling_tokens,
+                "mandatory_floor_tokens": details.mandatory_floor_tokens,
+                "section_tokens": details.section_tokens,
+                "expansion_handles": details.expansion_handles,
+            }),
+        )
     } else if let Some(eliot_engine::EngineError::PacketFloorExceedsBudget {
         max_tokens,
         estimated_tokens,
@@ -416,16 +432,6 @@ pub(super) async fn call_tool(
     }
 
     state.ensure_schema().await?;
-    let observed_arguments = if let Some(project_id) = ul_project_id {
-        state
-            .ensure_understanding_session(project_id, context.session_id)
-            .await?;
-        state
-            .understanding
-            .observe_arguments(project_id, context.session_id, name, &arguments)?
-    } else {
-        Vec::new()
-    };
 
     let observation_arguments = arguments.clone();
     let mut dispatch_arguments = arguments;
@@ -458,16 +464,44 @@ pub(super) async fn call_tool(
                 );
                 structured = serde_json::to_value(response)?;
             }
+            let rejected_packet_attempt = name == "eliot_compile_packet_l3"
+                && structured
+                    .get("packet_admission")
+                    .and_then(|admission| admission.get("active_allowed"))
+                    .and_then(Value::as_bool)
+                    == Some(false);
+            if rejected_packet_attempt {
+                // A rejected compile is attempt evidence only. It must not enter
+                // touched/session context, planner injection, or the influence ledger.
+                return tool_success(&structured);
+            }
+            let admitted_packet_compile = name == "eliot_compile_packet_l3"
+                && structured
+                    .get("packet_admission")
+                    .and_then(|admission| admission.get("active_allowed"))
+                    .and_then(Value::as_bool)
+                    == Some(true);
+            // Observation mutates the same-session touched registry. Defer it
+            // until dispatch has succeeded and packet admission is known so a
+            // rejected or failed compile remains side-effect-free.
+            let observed_arguments = ul_project_id.map_or_else(Vec::new, |project_id| {
+                state.ul.touched.observe_arguments(
+                    project_id,
+                    context.session_id,
+                    name,
+                    &observation_arguments,
+                )
+            });
             let ul_output_bytes =
                 u64::try_from(serde_json::to_vec(&structured)?.len()).unwrap_or(u64::MAX);
             let mut newly_observed = observed_arguments;
             if let Some(project_id) = ul_project_id {
-                newly_observed.extend(state.understanding.observe_result(
+                newly_observed.extend(state.ul.touched.observe_result(
                     project_id,
                     context.session_id,
                     name,
                     &structured,
-                )?);
+                ));
             }
             newly_observed.sort_by(|left, right| {
                 left.kind
@@ -484,70 +518,56 @@ pub(super) async fn call_tool(
             let mut injection_receipts = Vec::new();
             let mut ul_assignment = None;
             if let Some(project_id) = ul_project_id {
-                let (effective_injection_mode, assignment) = state
-                    .effective_injection_mode(
-                        project_id,
-                        context.session_id,
-                        ul_task_id,
-                        memory_free_control,
-                    )
-                    .await?;
+                let (effective_injection_mode, assignment) = if admitted_packet_compile {
+                    let assignment = if let Some(experiment) = structured.get("ul_experiment") {
+                        let task_id = ul_task_id.context(
+                            "compiler-owned explicit UL assignment requires a canonical task_id",
+                        )?;
+                        Some(eliot_types::UlTaskExperimentAssignment {
+                            project_id,
+                            task_id,
+                            task_class: serde_json::from_value(experiment["task_class"].clone())
+                                .context("decode compiler-owned UL task class")?,
+                            ordinal: 0,
+                            arm: serde_json::from_value(experiment["arm"].clone())
+                                .context("decode compiler-owned UL experiment arm")?,
+                            injection_mode: serde_json::from_value(
+                                experiment["assignment_injection_mode"].clone(),
+                            )
+                            .context("decode compiler-owned assignment injection mode")?,
+                            config_hash: experiment["config_hash"]
+                                .as_str()
+                                .context("compiler-owned UL config hash is missing")?
+                                .to_owned(),
+                        })
+                    } else {
+                        None
+                    };
+                    let effective = structured
+                        .pointer("/ul_experiment/effective_injection_mode")
+                        .filter(|value| !value.is_null())
+                        .cloned()
+                        .map(serde_json::from_value)
+                        .transpose()
+                        .context("decode compiler-owned effective injection mode")?
+                        .or_else(|| {
+                            (!memory_free_control).then_some(eliot_types::UlInjectionMode::Payload)
+                        });
+                    (effective, assignment)
+                } else {
+                    state
+                        .ul
+                        .effective_injection_mode(project_id, ul_task_id, memory_free_control)
+                        .await?
+                };
                 ul_assignment = assignment;
                 if let (Some(assignment), Some(mode)) =
                     (ul_assignment.as_mut(), effective_injection_mode)
                 {
                     assignment.injection_mode = mode;
                 }
-                let _pending_commit = state.understanding.acquire_pending_commit().await;
-                let plan = if effective_injection_mode.is_some()
-                    && state
-                        .understanding
-                        .project_snapshot(project_id)?
-                        .is_some_and(|snapshot| snapshot.is_fully_published())
-                {
-                    let plan = state.understanding.plan_cues(
-                        project_id,
-                        context.session_id,
-                        ul_task_id,
-                        &newly_observed,
-                    )?;
-                    state
-                        .persist_activation_trace(plan.activation_trace.as_ref())
-                        .await?;
-                    let candidate = state.understanding.prepare_pending_candidate(
-                        project_id,
-                        context.session_id,
-                        &plan,
-                    )?;
-                    let committed = state
-                        .persist_pending_injection_candidate(
-                            project_id,
-                            ul_task_id,
-                            context.session_id,
-                            candidate,
-                        )
-                        .await?;
-                    state.understanding.install_pending_candidate(
-                        project_id,
-                        context.session_id,
-                        committed,
-                        &plan,
-                    )?;
-                    Some(plan)
-                } else {
-                    None
-                };
-                injection_receipts = state
-                    .attach_understanding(
-                        project_id,
-                        ul_task_id,
-                        context.session_id,
-                        &mut structured,
-                        effective_injection_mode,
-                        plan.as_ref(),
-                    )
-                    .await?;
-                state
+                let observation = state
+                    .ul
                     .observe_successful_tool(
                         project_id,
                         context.session_id,
@@ -555,11 +575,46 @@ pub(super) async fn call_tool(
                         &observation_arguments,
                         &newly_observed,
                     )
-                    .await?;
+                    .await;
+                if admitted_packet_compile {
+                    let _ = observation;
+                } else {
+                    observation?;
+                }
+                if effective_injection_mode.is_some() {
+                    let planning = state
+                        .ul
+                        .planner
+                        .plan_after_tool(project_id, context.session_id, &newly_observed)
+                        .await;
+                    if admitted_packet_compile {
+                        let _ = planning;
+                    } else {
+                        planning?;
+                    }
+                }
+                // `eliot_compile_packet_l3` is already the complete,
+                // Governor-budgeted cognitive surface. Keep newly planned UL
+                // items pending for a later tool instead of creating a second
+                // app-owned assembler on the packet response.
+                if !admitted_packet_compile {
+                    injection_receipts = state
+                        .ul
+                        .planner
+                        .attach(
+                            project_id,
+                            ul_task_id,
+                            context.session_id,
+                            &mut structured,
+                            effective_injection_mode,
+                        )
+                        .await?;
+                }
             }
             if let (Some(project_id), Some(task_id)) = (ul_project_id, ul_task_id) {
                 let _ = state
-                    .ledger_service()
+                    .ul
+                    .ledger
                     .record_call(
                         eliot_engine::UlToolMeasurement {
                             project_id,
@@ -576,7 +631,7 @@ pub(super) async fn call_tool(
                     .await;
             }
             if let Some(claims) = cognitive_claims.as_ref() {
-                write_cognitive_tool_observation(
+                let observation = write_cognitive_tool_observation(
                     state,
                     context,
                     claims,
@@ -585,12 +640,24 @@ pub(super) async fn call_tool(
                     &observation_arguments,
                     &structured,
                 )
-                .await?;
+                .await;
+                if admitted_packet_compile {
+                    let _ = observation;
+                } else {
+                    observation?;
+                }
             }
             structured
         }
         Err(error) => {
-            if let Some(claims) = cognitive_claims.as_ref() {
+            let packet_hard_ceiling = name == "eliot_compile_packet_l3"
+                && matches!(
+                    error.downcast_ref::<eliot_engine::PacketCompileError>(),
+                    Some(eliot_engine::PacketCompileError::HardCeiling(_))
+                );
+            if let Some(claims) = cognitive_claims.as_ref()
+                && !packet_hard_ceiling
+            {
                 let observed_error = json!({
                     "error": "dispatch_failed",
                     "message": error.to_string(),
@@ -610,7 +677,18 @@ pub(super) async fn call_tool(
         }
     };
     if state.profile == McpAccessProfile::ExternalAuditor {
-        write_antigravity_mcp_invocation_receipt(state, name)?;
+        let receipt = write_antigravity_mcp_invocation_receipt(state, name);
+        let admitted_packet_compile = name == "eliot_compile_packet_l3"
+            && structured
+                .get("packet_admission")
+                .and_then(|admission| admission.get("active_allowed"))
+                .and_then(Value::as_bool)
+                == Some(true);
+        if admitted_packet_compile {
+            let _ = receipt;
+        } else {
+            receipt?;
+        }
     }
     tool_success(&structured)
 }

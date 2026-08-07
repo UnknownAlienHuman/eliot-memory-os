@@ -317,11 +317,6 @@ async fn run_projection_lease_cases(store: &CanonicalStore, clients: &DbClientSe
         "same-millisecond UUIDv7 recovery fixture did not share its coercible prefix",
     )?;
     let recovery_revision = MemoryRevision::new(1);
-    let recovery_families = [
-        CognitiveProjectionFamily::Search,
-        CognitiveProjectionFamily::Cue,
-        CognitiveProjectionFamily::DependencyDirty,
-    ];
     let first_recovery_id = format!("recovery:{project_id}:{}", recovery_revision.value());
     let second_recovery_id = format!("recovery:{inverted_project}:{}", recovery_revision.value());
     let first_recovery = store
@@ -329,7 +324,11 @@ async fn run_projection_lease_cases(store: &CanonicalStore, clients: &DbClientSe
             project_id,
             &first_recovery_id,
             recovery_revision,
-            &recovery_families,
+            &[
+                CognitiveProjectionFamily::Search,
+                CognitiveProjectionFamily::Cue,
+                CognitiveProjectionFamily::DependencyDirty,
+            ],
         )
         .await?;
     let second_recovery = store
@@ -337,7 +336,11 @@ async fn run_projection_lease_cases(store: &CanonicalStore, clients: &DbClientSe
             inverted_project,
             &second_recovery_id,
             recovery_revision,
-            &recovery_families,
+            &[
+                CognitiveProjectionFamily::Search,
+                CognitiveProjectionFamily::Cue,
+                CognitiveProjectionFamily::DependencyDirty,
+            ],
         )
         .await?;
     require(
@@ -353,7 +356,11 @@ async fn run_projection_lease_cases(store: &CanonicalStore, clients: &DbClientSe
             project_id,
             &first_recovery_id,
             recovery_revision,
-            &recovery_families,
+            &[
+                CognitiveProjectionFamily::Search,
+                CognitiveProjectionFamily::Cue,
+                CognitiveProjectionFamily::DependencyDirty,
+            ],
         )
         .await?;
     require(
@@ -392,82 +399,6 @@ async fn run_projection_lease_cases(store: &CanonicalStore, clients: &DbClientSe
     require(
         leased_recovery_ids == expected_recovery_ids,
         "recovery claims did not preserve both exact transport-safe identifiers",
-    )?;
-
-    let applied_replay = store
-        .enqueue_cognitive_projection_intent(
-            project_id,
-            &first_recovery_id,
-            recovery_revision,
-            &recovery_families,
-        )
-        .await?;
-    let clean_before_rearm = store.cognitive_projection_backlog().await?;
-    require(
-        applied_replay.event_id == first_recovery_id
-            && applied_replay.status == "applied"
-            && clean_before_rearm.pending == 0
-            && clean_before_rearm.leased == 0
-            && clean_before_rearm.retryable == 0
-            && clean_before_rearm.blocked == 0,
-        "generic recovery replay changed an applied intent",
-    )?;
-
-    let rearmed_recovery = store
-        .rearm_cognitive_projection_recovery_intent(
-            project_id,
-            &first_recovery_id,
-            recovery_revision,
-            &recovery_families,
-        )
-        .await?;
-    let rearmed_backlog = store.cognitive_projection_backlog().await?;
-    require(
-        rearmed_recovery.event_id == first_recovery_id
-            && rearmed_recovery.project_id == project_id
-            && rearmed_recovery.updated_revision == recovery_revision
-            && rearmed_recovery.families == recovery_families
-            && rearmed_recovery.status == "pending"
-            && rearmed_backlog.pending == 1
-            && rearmed_backlog.leased == 0
-            && rearmed_backlog.retryable == 0
-            && rearmed_backlog.blocked == 0,
-        "recovery-specific replay did not re-arm the exact applied intent",
-    )?;
-
-    let rearmed_lease = store
-        .claim_cognitive_projection_project("recovery-rearm-proof", 5, 8)
-        .await?
-        .ok_or("re-armed recovery intent was not claimable")?;
-    require(
-        rearmed_lease.project_id == project_id
-            && rearmed_lease.write_ids == [first_recovery_id.as_str()]
-            && rearmed_lease.families == recovery_families
-            && rearmed_lease.claimed_rows == 1
-            && rearmed_lease.max_attempt_count == 1,
-        "re-armed recovery lease did not reset one-cycle attempt state",
-    )?;
-    store
-        .complete_cognitive_projection_through(&rearmed_lease)
-        .await?;
-
-    let applied_after_rearm = store
-        .enqueue_cognitive_projection_intent(
-            project_id,
-            &first_recovery_id,
-            recovery_revision,
-            &recovery_families,
-        )
-        .await?;
-    let clean_after_rearm = store.cognitive_projection_backlog().await?;
-    require(
-        applied_after_rearm.event_id == first_recovery_id
-            && applied_after_rearm.status == "applied"
-            && clean_after_rearm.pending == 0
-            && clean_after_rearm.leased == 0
-            && clean_after_rearm.retryable == 0
-            && clean_after_rearm.blocked == 0,
-        "completed re-armed recovery intent left projection backlog",
     )?;
 
     let oldest_event_id = format!("lease-oldest:{project_id}");

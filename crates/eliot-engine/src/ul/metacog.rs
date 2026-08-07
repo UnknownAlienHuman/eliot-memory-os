@@ -113,34 +113,6 @@ impl MetacognitionService {
         }
     }
 
-    /// Applies request-local path novelty to immutable projection-derived
-    /// coverage and danger evidence. The base view remains reusable across
-    /// requests and no project files or durable state are read on the hot path.
-    #[must_use]
-    pub fn scope_view(
-        concepts: &[ConceptNode],
-        base: &UlMetacognitionView,
-        touched_paths: &[String],
-    ) -> UlMetacognitionView {
-        let mut touched = touched_paths.to_vec();
-        touched.sort();
-        touched.dedup();
-        let novel_paths = touched
-            .iter()
-            .filter(|path| concept_for_path(concepts, path).is_none())
-            .cloned()
-            .collect::<Vec<_>>();
-        let novelty_percent = if touched.is_empty() {
-            0
-        } else {
-            u8::try_from((novel_paths.len() * 100) / touched.len()).unwrap_or(100)
-        };
-        let mut scoped = base.clone();
-        scoped.novel_paths = novel_paths;
-        scoped.novelty_percent = novelty_percent;
-        scoped
-    }
-
     #[must_use]
     pub fn concept_for_paths(concepts: &[ConceptNode], paths: &[String]) -> Option<String> {
         paths

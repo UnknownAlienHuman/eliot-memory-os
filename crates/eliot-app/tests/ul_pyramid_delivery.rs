@@ -15,7 +15,7 @@ use eliot_types::{
 use serde_json::{Value, json};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 use support::{Harness, PreparedHarness, TestResult, rerun_with_credential_gate, test_guard};
 
 #[test]
@@ -269,8 +269,7 @@ fn h3_custom_root_freshness_and_dot_boundary_reach_runtime_packet() -> TestResul
     assert_eq!(fresh_capsule["freshness"], "fresh");
 
     fs::write(&source_path, "pub fn after() {}\n")?;
-    notify_file_mutation(&mut harness, 625, project_id, "src/lib.rs")?;
-    let stale = wait_for_stale_packet(&mut harness, 626, project_id, "src/lib.rs", &capsule_id)?;
+    let stale = compile_packet(&mut harness, 625, project_id, "src/lib.rs")?;
     let stale_capsule = stale["ul_understanding"]["capsules"]
         .as_array()
         .and_then(|capsules| {
@@ -286,77 +285,6 @@ fn h3_custom_root_freshness_and_dot_boundary_reach_runtime_packet() -> TestResul
             .is_some_and(|body| body.contains("[STALE:"))
     );
     Ok(())
-}
-
-fn notify_file_mutation(
-    harness: &mut Harness,
-    id: u64,
-    project_id: ProjectId,
-    path: &str,
-) -> TestResult {
-    harness.client.tool_call(
-        id,
-        "eliot_compile_packet_l3",
-        &json!({
-            "project_id": project_id,
-            "task_id": TaskId::new_v7(),
-            "goal": format!("record a governed mutation of {path}"),
-            "candidate_handles": [format!("file:{path}")],
-            "max_tokens": 1_200,
-            "material_frame": {
-                "acceptance_items": ["changed file is observed"],
-                "environment": ["windows-x64"],
-                "active_plan": [format!("edit {path}")],
-                "completed_work": [],
-                "killed_paths": [],
-                "causal_bridge": [],
-                "negative_memory_checked": true,
-                "exact_load_bearing_atoms": [format!("file:{path}")],
-                "cheapest_discriminative_probes": ["cargo test"],
-                "responsibility_contour_route_refs": [],
-                "next_allowed_action": format!("verify {path}"),
-                "expected_observable": "verifier:custom-root=pass",
-                "verifier": "cargo test",
-                "stop_condition": "stop on verifier failure",
-                "tool_schema_bytes_visible": 1_024,
-                "instruction_hotset_size": 4,
-                "invariant_refs": [],
-                "waived_invariants": [],
-                "prediction_confidence": "high"
-            }
-        }),
-    )?;
-    Ok(())
-}
-
-fn wait_for_stale_packet(
-    harness: &mut Harness,
-    first_id: u64,
-    project_id: ProjectId,
-    path: &str,
-    capsule_id: &str,
-) -> TestResult<Value> {
-    let deadline = Instant::now() + Duration::from_secs(20);
-    let mut id = first_id;
-    loop {
-        let response = compile_packet(harness, id, project_id, path)?;
-        if response["ul_understanding"]["capsules"]
-            .as_array()
-            .and_then(|capsules| {
-                capsules
-                    .iter()
-                    .find(|capsule| capsule["ref"] == format!("capsule:{capsule_id}"))
-            })
-            .is_some_and(|capsule| capsule["freshness"] == "stale")
-        {
-            return Ok(response);
-        }
-        if Instant::now() >= deadline {
-            return Err("dependency-dirty snapshot did not publish a stale capsule".into());
-        }
-        id = id.saturating_add(1);
-        std::thread::sleep(Duration::from_millis(50));
-    }
 }
 
 #[test]
