@@ -82,6 +82,11 @@ fn fence(value: &StateFence, field: &'static str) -> Result<(), SecurityContract
 
 impl SourceAssurance {
     /// Validates origin, taint and effect ceilings without granting authority.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when source identity, effect ceilings, or its state fence
+    /// is invalid.
     pub fn validate(&self) -> Result<(), SecurityContractError> {
         text(&self.source_ref, "source_ref")?;
         text(&self.provenance_ref, "provenance_ref")?;
@@ -104,6 +109,11 @@ impl SourceAssurance {
 
 impl ObservationDomainRef {
     /// Validates opaque domain identity and the policy-facing boundary fields.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a domain identity, policy field, or state fence is
+    /// invalid.
     pub fn validate(&self) -> Result<(), SecurityContractError> {
         text(&self.domain_id, "domain_id")?;
         text(&self.authority_root, "authority_root")?;
@@ -119,6 +129,11 @@ impl ObservationDomainRef {
 
 impl DisclosureDependencyClosure {
     /// Validates explicit disclosure lineage and fence binding.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when lineage references are missing, duplicated, or do
+    /// not share the declared state fence.
     pub fn validate(&self) -> Result<(), SecurityContractError> {
         text(&self.closure_id, "closure_id")?;
         text(&self.subject_ref, "subject_ref")?;
@@ -150,6 +165,11 @@ impl DisclosureDependencyClosure {
 
 impl DeclassificationReceipt {
     /// Validates the non-content proof that permits a closure/taint reduction.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when hashes, references, domain sets, or the state fence
+    /// are invalid.
     pub fn validate(&self) -> Result<(), SecurityContractError> {
         text(&self.input_closure_ref, "input_closure_ref")?;
         text(
@@ -176,6 +196,11 @@ impl DeclassificationReceipt {
 
 impl DisclosureDecision {
     /// Validates that remote disclosure is never inferred from an incomplete closure.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when policy fencing is invalid or a permitted decision has
+    /// incomplete coverage.
     pub fn validate(&self) -> Result<(), SecurityContractError> {
         text(&self.subject_and_closure_ref, "subject_and_closure_ref")?;
         text(
@@ -200,10 +225,10 @@ impl DisclosureDecision {
             || !self.uncovered_domains.is_empty())
         {
             return Err(
-                if self.closure_completeness != ClosureCompleteness::Complete {
-                    SecurityContractError::DisclosureClosureIncomplete
-                } else {
+                if self.closure_completeness == ClosureCompleteness::Complete {
                     SecurityContractError::DisclosureCoverageGap
+                } else {
+                    SecurityContractError::DisclosureClosureIncomplete
                 },
             );
         }
@@ -213,6 +238,11 @@ impl DisclosureDecision {
 
 impl TransformationLineage {
     /// Validates taint conservation across a structural transformation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when transformation references, fencing, or taint
+    /// declassification requirements are invalid.
     pub fn validate(&self) -> Result<(), SecurityContractError> {
         text(&self.transformation_id, "transformation_id")?;
         text(&self.output_ref, "output_ref")?;
@@ -232,6 +262,11 @@ impl TransformationLineage {
 
 impl InfluenceDependencyClosure {
     /// Validates explicit revocation closure and prevents active revoked views.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when dependent references, fencing, or revocation state
+    /// is inconsistent.
     pub fn validate(&self) -> Result<(), SecurityContractError> {
         text(&self.closure_id, "closure_id")?;
         text(&self.root_ref, "root_ref")?;
@@ -254,6 +289,11 @@ impl InfluenceDependencyClosure {
 
 impl PurgeLedgerEntry {
     /// Validates non-revealing purge state and rejects restore resurrection.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when purge identity, tombstone digest, location set, or
+    /// state fencing is invalid.
     pub fn validate(&self) -> Result<(), SecurityContractError> {
         text(&self.purge_id, "purge_id")?;
         text(&self.subject_ref, "subject_ref")?;
@@ -277,6 +317,10 @@ impl PurgeLedgerEntry {
     }
 
     /// A purged entry is terminal for current availability.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the entry is invalid or already purged.
     pub fn validate_restore(&self) -> Result<(), SecurityContractError> {
         self.validate()?;
         if self.state == PurgeState::Purged {
@@ -288,6 +332,11 @@ impl PurgeLedgerEntry {
 
 impl SelectionIntegrityReceipt {
     /// Validates candidate membership and every declared transformation stage.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when candidate membership, stage fencing, or selection
+    /// lineage is invalid.
     pub fn validate(&self) -> Result<(), SecurityContractError> {
         text(&self.selection_id, "selection_id")?;
         if self.initial_candidate_refs.is_empty() {
@@ -355,6 +404,11 @@ impl SelectionIntegrityReceipt {
 }
 
 /// Validates one selection receipt and returns a digest suitable for lineage.
+///
+/// # Errors
+///
+/// Returns an error when selection validation fails or canonical serialization
+/// cannot be produced.
 pub fn validate_selection_pipeline(
     receipt: &SelectionIntegrityReceipt,
 ) -> Result<String, SecurityContractError> {

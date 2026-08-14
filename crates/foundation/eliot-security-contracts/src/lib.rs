@@ -19,6 +19,11 @@ pub const CONTRACT_VERSION: eliot_contracts::ContractVersion =
     eliot_contracts::ContractVersion::new(1, 0, 0);
 
 /// Returns a stable contract identity without assigning any runtime authority.
+///
+/// # Errors
+///
+/// Returns an error when the shared contract identity shape cannot be serialized
+/// canonically.
 pub fn contract_identity() -> Result<eliot_contracts::ContractIdentity, SecurityContractError> {
     #[derive(serde::Serialize)]
     struct Shape {
