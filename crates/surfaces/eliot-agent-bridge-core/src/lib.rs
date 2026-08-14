@@ -10,7 +10,10 @@
 use std::collections::BTreeMap;
 use std::fmt;
 
-pub use eliot_agent_api::{HostEventEnvelope, SessionId, TaskId, WorkUnitId};
+pub use eliot_agent_api::{
+    AttemptId, EventCursor, EventId, HostEventEnvelope, HostEventKind, RouteFingerprint, SessionId,
+    TaskId, WorkUnitId,
+};
 pub use eliot_observation_contracts::{
     BlindInterval, CoverageGap, CoverageInterval, GapDisposition,
 };
