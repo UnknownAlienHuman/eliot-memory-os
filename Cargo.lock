@@ -447,6 +447,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "eliot-test-support"
+version = "0.1.0"
+dependencies = [
+ "eliot-contracts",
+ "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
 name = "eliot-types"
 version = "0.1.0"
 dependencies = [
