@@ -139,6 +139,35 @@ Remaining authority blockers:
 
 Resume condition: make the complete transaction the applied client contract, bind every named operation to its manifest, validate all manifest-digest surfaces and reject duplicate exact-array identities.
 
+### G-08 — problem/conflict/attention state machines
+
+Closed portions: the repair retains the G-08 object family and typed ID/enum hardening with six passing package tests.
+
+Remaining authority blockers:
+
+- Multiple transitions mutate state/evidence before checked revision increment, so overflow returns an error after a partial mutation.
+- Reopen, resolve, satisfy and evidence paths mutate before duplicate/validation checks or permit repeated terminal transitions.
+- Problem acknowledgement changes state without advancing revision; several terminal transitions lack exact owner/terminal guards.
+- Record-level deserialization bypasses ordinary-field validation even though typed IDs reject malformed values.
+- The manifest retains a direct C0-01 dependency beyond the exact C0-03/C0-11 provider set.
+
+Resume condition: compute and validate every transition fully before one infallible mutation sink, make terminal/reopen/idempotency rules exhaustive, advance revisions on every observable change, revalidate record-level serde and seal the direct dependency set.
+
+### G-09 — immutable configuration and policy snapshots
+
+Closed portions: the repair adds generation/source-assurance fields, semantic snapshot deserialization, a pure CAS projection and nine passing package tests.
+
+Remaining authority blockers:
+
+- Intent validation ignores a successful `ApplicabilityResult` whose outcome is `UNSUPPORTED`, allowing a wrong-scope candidate to continue.
+- Active snapshot, applicability context and candidate are not proven to share one machine/scope/fence lineage; only caller-supplied pairs are compared.
+- Snapshot IDs are free strings without canonical content identity and may be reused for changed payload/revision.
+- The CAS result is synthesized from caller projections without publishing/receipt authority or an exact expected active fence/revision.
+- Approval and trigger records are caller-provided labels without authenticated principal, expiry, conditions, pre-authorization or the required Dreamer/problem/maintenance origin binding.
+- Rollback lineage omits exact owner and active applicability coupling.
+
+Resume condition: bind active/context/candidate to one provider-observed identity and exact CAS head, make snapshot identity content-stable, reject every non-applicable outcome, and use authenticated approval/pre-authorization/origin receipts with adversarial cross-machine and replay tests.
+
 ## Work continuing independently
 
 - Independent candidate gates continue for bounded governor/security/store/surface repairs.
