@@ -113,6 +113,80 @@ async fn partial_sse_reconnects_from_last_event_id_without_joining_frames()
 }
 
 #[tokio::test]
+async fn truncated_named_frame_does_not_advance_cursor_or_fabricate_result()
+-> Result<(), Box<dyn std::error::Error>> {
+    let mut responses = preamble(false, &[])?;
+    let message_updated = json!({
+        "type": "message.updated",
+        "properties": {"sessionID": SESSION_ID, "info": {
+            "id": "msg_assistant_reconcile", "sessionID": SESSION_ID,
+            "parentID": MESSAGE_ID, "role": "assistant",
+            "time": {"created": 2, "completed": 3},
+            "providerID": PROVIDER, "modelID": MODEL, "finish": "stop"
+        }}
+    });
+    let mut first_stream = format!("id: evt-1\ndata: {message_updated}\n\n").into_bytes();
+    let truncated = json!({
+        "type": "session.error",
+        "properties": {"sessionID": SESSION_ID, "error": {
+            "name": "fabricated", "message": "must not be dispatched"
+        }}
+    });
+    first_stream.extend_from_slice(
+        format!("event: fabricated\nid: evt-truncated\ndata: {truncated}\n").as_bytes(),
+    );
+    responses.push(chunked_sse(&first_stream));
+    responses.push(no_content());
+    let step_finish = json!({
+        "type": "message.part.updated",
+        "properties": {"sessionID": SESSION_ID, "part": {
+            "sessionID": SESSION_ID, "messageID": "msg_assistant_reconcile",
+            "type": "step-finish", "reason": "stop"
+        }}
+    });
+    let idle = json!({
+        "type": "session.status",
+        "properties": {"sessionID": SESSION_ID, "status": {"type": "idle"}}
+    });
+    responses.push(chunked_sse(
+        format!("id: evt-2\ndata: {step_finish}\n\nid: evt-3\ndata: {idle}\n\n").as_bytes(),
+    ));
+    responses.push(json_response(br#"{"ses_reconcile":{"type":"idle"}}"#));
+    responses.push(messages_response()?);
+    responses.push(json_response(br"[]"));
+
+    let (client, captured) = client_for_with_requests(responses).await?;
+    let result = client.run_read_only(&request(None)?).await?;
+    assert_eq!(result.status, RunStatus::Succeeded);
+    assert_eq!(result.authority, AuthorityCeiling::CandidateOnly);
+    assert!(result.candidate_only);
+    assert_eq!(
+        result
+            .events
+            .iter()
+            .map(|event| event.event_type.as_str())
+            .collect::<Vec<_>>(),
+        ["message.updated", "message.part.updated", "session.status"]
+    );
+    assert!(
+        !result
+            .events
+            .iter()
+            .any(|event| event.event_type == "session.error")
+    );
+
+    let requests = captured.lock().await;
+    let reconnect = requests
+        .get(7)
+        .ok_or("reconnect request was not captured")?;
+    let reconnect = String::from_utf8_lossy(reconnect);
+    assert!(reconnect.starts_with("GET /event?directory=C%3A%5CScratch HTTP/1.1\r\n"));
+    assert_eq!(reconnect.matches("Last-Event-ID: evt-1\r\n").count(), 1);
+    assert!(!reconnect.contains("evt-truncated"));
+    Ok(())
+}
+
+#[tokio::test]
 async fn omitted_idle_status_reconciles_through_bound_session_read()
 -> Result<(), Box<dyn std::error::Error>> {
     let mut responses = preamble(false, &[])?;

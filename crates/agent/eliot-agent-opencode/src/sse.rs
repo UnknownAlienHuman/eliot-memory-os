@@ -351,6 +351,10 @@ impl SseDecoder {
         }
 
         if line.is_empty() {
+            self.cursor.last_event_id = self.event.id.clone();
+            if let Some(retry_ms) = self.event.retry_ms {
+                self.cursor.retry_ms = Some(retry_ms);
+            }
             if self.event.has_data {
                 let event = SseEvent {
                     event: self.event.event.clone(),
@@ -366,9 +370,6 @@ impl SseDecoder {
                         .unwrap_or(&self.event.data)
                         .to_owned(),
                 };
-                if event.retry_ms.is_some() {
-                    self.cursor.retry_ms = event.retry_ms;
-                }
                 events.push(event);
             }
             self.event.reset_for_next_event();
@@ -441,7 +442,6 @@ impl SseDecoder {
             });
         }
         self.event.id = (!value.is_empty()).then(|| value.to_owned());
-        self.cursor.last_event_id = self.event.id.clone();
         Ok(())
     }
 
@@ -458,7 +458,6 @@ impl SseDecoder {
             value: value.to_owned(),
         })?;
         self.event.retry_ms = Some(retry_ms);
-        self.cursor.retry_ms = Some(retry_ms);
         Ok(())
     }
 }
