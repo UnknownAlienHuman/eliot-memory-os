@@ -99,6 +99,20 @@ Remaining platform blockers:
 
 Resume condition: implement the exact Job Object, DPAPI, SCM and reparse-safe publication primitives through real Windows handles; make discovery/file identity fail closed; seal the provider graph; then run combined P-02 IPC/platform crash, restart, impersonation and process-identity gates.
 
+#### P-02 IPC transport
+
+Closed portions: the second candidate rejects oversized frames before buffer growth and adds nominal server-handshake, reserve, replay and cancellation structures with 11 author tests.
+
+Remaining authority/integrity blockers:
+
+- Public `PeerBinding` and `ServerHandshakePolicy` remain caller-implementable/constructible; the pipe handle is never passed into a real platform-owned ACL/SID/session/impersonation/process proof. `GetNamedPipeServerProcessId` is referenced but not executed.
+- The legacy public handshake still copies authority/generation/artifact/nonce/capabilities/privacy/fence directly from `ClientHello`; `Session` itself is publicly constructible/mutable and is not retained or enforced by `NamedPipeTransport` per frame.
+- Frame-size negotiation is not retained, canonical pipe-name validation accepts generic suffixes rather than the exact fixed families, and replay/cancel registries retain public unbound bypasses, split capacity and volatile restart state.
+- Control reserve is not enforced by transport IO and cannot guarantee one maximum control frame. Cancel/timeout may leave a partial frame on a reusable byte stream; receive-side partial prefix/body failures likewise do not fence/close the desynchronized transport.
+- Typed `PLAN_GAP` is checked on only part of the IO surface and can be bypassed through an arbitrary binding. The required sibling Windows provider is absent, the crate remains a private nested workspace outside root metadata, and its direct provider set differs from the sealed Cargo graph.
+
+Resume condition: resume the whole P-02 cell only when the real Windows provider exists; seal handle-bound peer proof and active server authority, remove every legacy/unbound route, bind session limits to every frame, close/fence partial streams, persist bounded replay/cancel state and verify combined crash/restart/saturation behavior in the root workspace.
+
 ### S-04 — blob API and store
 
 Closed portions: the second candidate separates provider-neutral API and filesystem implementation, injects platform/codec/key/AEAD/live-set ports, validates basic identities, models staged publication/recovery and key rotation, and passes 5 API plus 9 implementation tests.
