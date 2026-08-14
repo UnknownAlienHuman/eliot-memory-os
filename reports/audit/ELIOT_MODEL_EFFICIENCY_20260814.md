@@ -87,6 +87,17 @@ Use OpenCode Go Luna for candidate construction with exact file ownership and an
 
 Useful for exact mechanical inventory, manifest normalization and simple bounded edits. It should not own semantic contracts, authority decisions, persistence recovery or acceptance claims.
 
+## Native post-campaign calibration
+
+The later native-only pass strengthened the routing result with bounded independent gates:
+
+- native Luna rejected G-08 despite 6/6 tests by finding non-atomic revision overflow and terminal/idempotency gaps;
+- native Luna rejected Q-01 despite 8/8 tests by finding fail-open unknown threat, unused privacy/use/effect axes and missing verifier/fence binding;
+- native Luna rejected A-10 despite 6/6 tests by finding unsigned fallback authority, incomplete replay identity and false delivery success;
+- native Sol rejected P-02/P-03/C0-06 candidates after green local tests by tracing Windows handle identity, raw launch bypass, duplicate authority models and incomplete causal cursor semantics.
+
+These are qualitative observations, not normalized benchmark scores: the native subagent interface did not expose per-task read/write/cache token accounting. Therefore no native-token comparison against the measured OpenCode Go totals is claimed. The evidence supports using Luna for bounded package review and Sol for cross-contract authority/process gates, with independent review retained for both.
+
 ## Routing rule retained after the campaign
 
 1. Mechanical inventory or exact manifest work: DeepSeek V4 Flash if needed.
