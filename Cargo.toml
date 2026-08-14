@@ -22,6 +22,7 @@ members = [
   "crates/foundation/eliot-security-contracts",
   "crates/foundation/eliot-test-support",
   "crates/governor/eliot-authority",
+  "crates/governor/eliot-budget",
   "crates/governor/eliot-config",
   "crates/governor/eliot-problem",
   "crates/governor/eliot-workscope",
@@ -69,6 +70,7 @@ eliot-runtime-contracts = { path = "crates/foundation/eliot-runtime-contracts", 
 eliot-security-contracts = { path = "crates/foundation/eliot-security-contracts", version = "0.1.0" }
 eliot-test-support = { path = "crates/foundation/eliot-test-support", version = "0.1.0" }
 eliot-authority = { path = "crates/governor/eliot-authority", version = "0.1.0" }
+eliot-budget = { path = "crates/governor/eliot-budget", version = "0.1.0" }
 eliot-config = { path = "crates/governor/eliot-config", version = "0.1.0" }
 eliot-problem = { path = "crates/governor/eliot-problem", version = "0.1.0" }
 eliot-workscope = { path = "crates/governor/eliot-workscope", version = "0.1.0" }

@@ -364,6 +364,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "eliot-budget"
+version = "0.1.0"
+dependencies = [
+ "eliot-authority",
+ "eliot-config",
+ "eliot-contracts",
+ "eliot-evaluation-contracts",
+ "eliot-receipts",
+]
+
+[[package]]
 name = "eliot-campaign-executor"
 version = "0.1.0"
 dependencies = [
