@@ -279,6 +279,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "eliot-agent-bridge-core"
+version = "0.1.0"
+dependencies = [
+ "eliot-agent-api",
+ "eliot-observation-contracts",
+ "eliot-process",
+ "eliot-protocol",
+ "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
 name = "eliot-agent-codex"
 version = "0.1.0"
 dependencies = [

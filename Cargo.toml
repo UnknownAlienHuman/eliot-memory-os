@@ -34,6 +34,7 @@ members = [
   "crates/kernel/eliot-platform",
   "crates/kernel/eliot-process",
   "crates/security/eliot-source-assurance",
+  "crates/surfaces/eliot-agent-bridge-core",
   "crates/surfaces/eliot-cli",
   "crates/surfaces/eliot-mcp",
   "workspace/tools/eliot-runtime-compiler",
@@ -82,6 +83,7 @@ eliot-store-api = { path = "crates/storage/eliot-store-api", version = "0.1.0" }
 eliot-store-memory = { path = "crates/storage/eliot-store-memory", version = "0.1.0" }
 eliot-graph-api = { path = "crates/instrument/eliot-graph-api", version = "0.1.0" }
 eliot-instrument-api = { path = "crates/instrument/eliot-instrument-api", version = "0.1.0" }
+eliot-agent-bridge-core = { path = "crates/surfaces/eliot-agent-bridge-core", version = "0.1.0" }
 eliot-cli = { path = "crates/surfaces/eliot-cli", version = "0.1.0" }
 eliot-mcp = { path = "crates/surfaces/eliot-mcp", version = "0.1.0" }
 eliot-platform = { path = "crates/kernel/eliot-platform", version = "0.1.0" }
