@@ -33,6 +33,7 @@ members = [
   "crates/instrument/eliot-instrument-api",
   "crates/kernel/eliot-platform",
   "crates/kernel/eliot-process",
+  "crates/kernel/eliot-runtime",
   "crates/security/eliot-source-assurance",
   "crates/surfaces/eliot-agent-bridge-core",
   "crates/surfaces/eliot-cli",
@@ -88,6 +89,7 @@ eliot-cli = { path = "crates/surfaces/eliot-cli", version = "0.1.0" }
 eliot-mcp = { path = "crates/surfaces/eliot-mcp", version = "0.1.0" }
 eliot-platform = { path = "crates/kernel/eliot-platform", version = "0.1.0" }
 eliot-process = { path = "crates/kernel/eliot-process", version = "0.1.0" }
+eliot-runtime = { path = "crates/kernel/eliot-runtime", version = "0.1.0" }
 eliot-source-assurance = { path = "crates/security/eliot-source-assurance", version = "0.1.0" }
 futures-util = { version = "0.3.32", features = ["sink"] }
 jsonc-parser = { version = "0.33.0", features = ["cst", "serde_json"] }

@@ -624,6 +624,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "eliot-runtime"
+version = "0.1.0"
+dependencies = [
+ "eliot-observation-contracts",
+ "eliot-platform",
+ "eliot-runtime-contracts",
+ "tokio",
+]
+
+[[package]]
 name = "eliot-runtime-compiler"
 version = "0.1.0"
 dependencies = [

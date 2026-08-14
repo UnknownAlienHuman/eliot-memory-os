@@ -1,15 +1,16 @@
 [package]
 name = "eliot-runtime"
-version = "0.1.0"
-edition = "2024"
-rust-version = "1.89"
-license = "MIT"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
 description = "Framework-neutral bounded task runtime facade"
 
-[workspace]
-
 [dependencies]
-eliot-observation-contracts = { path = "../../foundation/eliot-observation-contracts" }
-eliot-platform = { path = "../eliot-platform" }
-eliot-runtime-contracts = { path = "../../foundation/eliot-runtime-contracts" }
-tokio = { version = "1.52.3", features = ["macros", "rt", "sync", "time"] }
+eliot-observation-contracts.workspace = true
+eliot-platform.workspace = true
+eliot-runtime-contracts.workspace = true
+tokio.workspace = true
+
+[lints]
+workspace = true

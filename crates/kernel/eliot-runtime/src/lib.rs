@@ -196,28 +196,22 @@ impl<T> MailboxReceiver<T> {
     }
 
     fn data_item(&mut self, item: Option<T>) -> Option<MailboxItem<T>> {
-        match item {
-            Some(item) => {
-                self.record(Lane::Data);
-                Some(MailboxItem::Data(item))
-            }
-            None => {
-                self.data_closed = true;
-                None
-            }
+        if let Some(item) = item {
+            self.record(Lane::Data);
+            Some(MailboxItem::Data(item))
+        } else {
+            self.data_closed = true;
+            None
         }
     }
 
     fn control_item(&mut self, item: Option<ControlSignal>) -> Option<MailboxItem<T>> {
-        match item {
-            Some(item) => {
-                self.record(Lane::Control);
-                Some(MailboxItem::Control(item))
-            }
-            None => {
-                self.control_closed = true;
-                None
-            }
+        if let Some(item) = item {
+            self.record(Lane::Control);
+            Some(MailboxItem::Control(item))
+        } else {
+            self.control_closed = true;
+            None
         }
     }
 
@@ -394,7 +388,7 @@ pub enum ObservationDisposition {
 }
 
 fn observe_safely(
-    sink: &Option<Arc<dyn ObservationSink>>,
+    sink: Option<&Arc<dyn ObservationSink>>,
     observation: RuntimeObservation,
 ) -> ObservationDisposition {
     let Some(sink) = sink else {
@@ -488,8 +482,8 @@ impl CancellationInner {
             }
             if let Some(parent) = &self.parent {
                 tokio::select! {
-                    _ = self.local.wait() => {}
-                    _ = parent.wait_boxed() => {}
+                    () = self.local.wait() => {}
+                    () = parent.wait_boxed() => {}
                 }
             } else {
                 self.local.wait().await;
@@ -656,7 +650,7 @@ impl TaskRegistry {
     fn lock_entries(&self) -> MutexGuard<'_, Vec<RegistryEntry>> {
         self.entries
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     fn reserve(self: &Arc<Self>) -> ActiveGuard {
@@ -738,7 +732,7 @@ impl RuntimeShared {
     fn lock_admission(&self) -> MutexGuard<'_, ()> {
         self.admission
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     fn begin_shutdown(&self) -> bool {
@@ -932,16 +926,15 @@ impl Runtime {
         let sink = self.sink.clone();
         let join = self.shared.registry.spawn(async move {
             let permit = tokio::select! {
-                _ = work_token.cancelled() => return Err(TaskFailure::Cancelled),
+                () = work_token.cancelled() => return Err(TaskFailure::Cancelled),
                 permit = permits.acquire_owned() => match permit {
                     Ok(permit) => permit,
                     Err(_) => return Err(TaskFailure::Cancelled),
                 },
             };
             work_token.checkpoint()?;
-            let future = match catch_unwind(AssertUnwindSafe(|| factory(work_token.clone()))) {
-                Ok(future) => future,
-                Err(_) => return Err(TaskFailure::Panicked),
+            let Ok(future) = catch_unwind(AssertUnwindSafe(|| factory(work_token.clone()))) else {
+                return Err(TaskFailure::Panicked);
             };
             let result = match CatchUnwindFuture::new(future).await {
                 Ok(result) => result,
@@ -950,7 +943,7 @@ impl Runtime {
             drop(permit);
             if let Err(error) = &result {
                 observe_safely(
-                    &sink,
+                    sink.as_ref(),
                     RuntimeObservation {
                         kind: ObservationKind::TaskProgress,
                         subject,
@@ -1019,7 +1012,7 @@ impl Runtime {
 
     /// Delivers one optional observation with panic containment and typed status.
     pub fn observe(&self, observation: RuntimeObservation) -> ObservationDisposition {
-        observe_safely(&self.sink, observation)
+        observe_safely(self.sink.as_ref(), observation)
     }
 
     /// Creates a runtime-owned supervisor with explicit restart parameters.
@@ -1109,7 +1102,7 @@ impl Supervisor {
         let supervisor_token = token.clone();
         let join = self.shared.registry.spawn(async move {
             let permit = tokio::select! {
-                _ = supervisor_token.cancelled() => return Err(TaskFailure::Cancelled),
+                () = supervisor_token.cancelled() => return Err(TaskFailure::Cancelled),
                 permit = permits.acquire_owned() => match permit {
                     Ok(permit) => permit,
                     Err(_) => return Err(TaskFailure::Cancelled),
@@ -1120,31 +1113,28 @@ impl Supervisor {
             let result = loop {
                 supervisor_token.checkpoint()?;
                 let attempt_token = supervisor_token.child();
-                let future = match catch_unwind(AssertUnwindSafe(|| factory(attempt_token.clone())))
-                {
-                    Ok(future) => future,
-                    Err(_) => {
-                        if restart_or_quarantine(
-                            &mut failures,
-                            budget,
-                            window,
-                            &sink,
-                            &subject,
-                            class,
-                            TaskFailure::Panicked,
-                        ) {
-                            break Ok(SupervisionOutcome::Quarantined);
-                        }
-                        tokio::select! {
-                            _ = supervisor_token.cancelled() => break Err(TaskFailure::Cancelled),
-                            _ = tokio::time::sleep(delay) => {}
-                        }
-                        delay = delay.saturating_mul(2);
-                        continue;
+                let Ok(future) = catch_unwind(AssertUnwindSafe(|| factory(attempt_token.clone())))
+                else {
+                    if restart_or_quarantine(
+                        &mut failures,
+                        budget,
+                        window,
+                        sink.as_ref(),
+                        &subject,
+                        class,
+                        &TaskFailure::Panicked,
+                    ) {
+                        break Ok(SupervisionOutcome::Quarantined);
                     }
+                    tokio::select! {
+                        () = supervisor_token.cancelled() => break Err(TaskFailure::Cancelled),
+                        () = tokio::time::sleep(delay) => {}
+                    }
+                    delay = delay.saturating_mul(2);
+                    continue;
                 };
                 let attempt_result = tokio::select! {
-                    _ = supervisor_token.cancelled() => Err(TaskFailure::Cancelled),
+                    () = supervisor_token.cancelled() => Err(TaskFailure::Cancelled),
                     value = CatchUnwindFuture::new(future) => match value {
                         Ok(value) => value,
                         Err(()) => Err(TaskFailure::Panicked),
@@ -1158,16 +1148,16 @@ impl Supervisor {
                             &mut failures,
                             budget,
                             window,
-                            &sink,
+                            sink.as_ref(),
                             &subject,
                             class,
-                            error,
+                            &error,
                         ) {
                             break Ok(SupervisionOutcome::Quarantined);
                         }
                         tokio::select! {
-                            _ = supervisor_token.cancelled() => break Err(TaskFailure::Cancelled),
-                            _ = tokio::time::sleep(delay) => {}
+                            () = supervisor_token.cancelled() => break Err(TaskFailure::Cancelled),
+                            () = tokio::time::sleep(delay) => {}
                         }
                         delay = delay.saturating_mul(2);
                     }
@@ -1188,10 +1178,10 @@ fn restart_or_quarantine(
     failures: &mut Vec<Instant>,
     budget: usize,
     window: Duration,
-    sink: &Option<Arc<dyn ObservationSink>>,
+    sink: Option<&Arc<dyn ObservationSink>>,
     subject: &str,
     class: ChildClass,
-    error: TaskFailure,
+    error: &TaskFailure,
 ) -> bool {
     let now = Instant::now();
     failures.retain(|started| now.duration_since(*started) <= window);
@@ -1268,13 +1258,27 @@ mod tests {
         }
     }
 
+    fn must<T, E: std::fmt::Debug>(result: Result<T, E>) -> T {
+        match result {
+            Ok(value) => value,
+            Err(error) => panic!("expected success: {error:?}"),
+        }
+    }
+
+    fn must_some<T>(value: Option<T>) -> T {
+        match value {
+            Some(value) => value,
+            None => panic!("expected value"),
+        }
+    }
+
     fn admitted<H>(disposition: SpawnDisposition<H>) -> H {
-        disposition.into_handle().expect("expected admission")
+        must_some(disposition.into_handle())
     }
 
     #[tokio::test]
     async fn mailbox_fairness_bounds_both_lane_streaks() {
-        let (mailbox, mut receiver) = Mailbox::bounded(8, 8, 2).unwrap();
+        let (mailbox, mut receiver) = must(Mailbox::bounded(8, 8, 2));
         for value in 0..4 {
             assert_eq!(mailbox.try_send(value), SendResult::Accepted);
             assert_eq!(
@@ -1285,7 +1289,7 @@ mod tests {
 
         let mut lanes = Vec::new();
         for _ in 0..8 {
-            lanes.push(match receiver.recv().await.unwrap() {
+            lanes.push(match must_some(receiver.recv().await) {
                 MailboxItem::Data(_) => Lane::Data,
                 MailboxItem::Control(_) => Lane::Control,
             });
@@ -1307,7 +1311,7 @@ mod tests {
 
     #[tokio::test]
     async fn data_saturation_cannot_starve_control_execution_reserve() {
-        let runtime = Runtime::new(config(), None).unwrap();
+        let runtime = must(Runtime::new(config(), None));
         let barrier = Arc::new(Barrier::new(2));
         let first_barrier = barrier.clone();
         let first = admitted(runtime.spawn("data-1", move |_| async move {
@@ -1339,7 +1343,7 @@ mod tests {
 
     #[tokio::test]
     async fn cancellation_is_sticky_even_before_first_poll() {
-        let runtime = Runtime::new(config(), None).unwrap();
+        let runtime = must(Runtime::new(config(), None));
         let handle = admitted(runtime.spawn("early-cancel", |token| async move {
             token.cancelled().await;
             token.checkpoint()
@@ -1353,7 +1357,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn immediate_force_abort_before_first_poll_releases_registration() {
-        let runtime = Runtime::new(config(), None).unwrap();
+        let runtime = must(Runtime::new(config(), None));
         let polled = Arc::new(AtomicBool::new(false));
         let poll_flag = polled.clone();
         let handle = admitted(runtime.spawn("pre-poll-abort", move |_| async move {
@@ -1375,7 +1379,7 @@ mod tests {
 
     #[tokio::test]
     async fn shutdown_is_sticky_and_denies_late_spawn() {
-        let runtime = Runtime::new(config(), None).unwrap();
+        let runtime = must(Runtime::new(config(), None));
         let shutdown = runtime.shutdown_handle();
         assert!(shutdown.request());
         assert!(!shutdown.request());
@@ -1399,7 +1403,7 @@ mod tests {
 
     #[tokio::test]
     async fn supervised_attempt_is_nested_and_shutdown_leaves_no_orphan() {
-        let runtime = Runtime::new(config(), None).unwrap();
+        let runtime = must(Runtime::new(config(), None));
         let dropped = Arc::new(AtomicBool::new(false));
         let drop_flag = dropped.clone();
         let _handle = admitted(runtime.supervisor(SupervisionStrategy::OneForOne).spawn(
@@ -1421,10 +1425,10 @@ mod tests {
 
     #[tokio::test]
     async fn poisoned_registry_is_recovered_without_runtime_panic() {
-        let runtime = Runtime::new(config(), None).unwrap();
+        let runtime = must(Runtime::new(config(), None));
         let registry = runtime.shared.registry.clone();
         let _ = catch_unwind(AssertUnwindSafe(|| {
-            let _guard = registry.entries.lock().unwrap();
+            let _guard = must(registry.entries.lock());
             panic!("poison registry");
         }));
         let task = admitted(runtime.spawn("after-poison", |_| async { Ok(()) }));
@@ -1442,7 +1446,7 @@ mod tests {
 
     #[tokio::test]
     async fn factory_future_and_sink_panics_are_contained_as_typed_outcomes() {
-        let runtime = Runtime::new(config(), Some(Arc::new(PanicSink))).unwrap();
+        let runtime = must(Runtime::new(config(), Some(Arc::new(PanicSink))));
         assert_eq!(
             runtime.observe(RuntimeObservation {
                 kind: ObservationKind::TaskProgress,
@@ -1474,7 +1478,7 @@ mod tests {
 
     #[tokio::test]
     async fn supervision_contains_factory_and_future_panics_then_quarantines() {
-        let runtime = Runtime::new(config(), None).unwrap();
+        let runtime = must(Runtime::new(config(), None));
         let attempts = Arc::new(AtomicUsize::new(0));
         let source = attempts.clone();
         let handle = admitted(runtime.supervisor(SupervisionStrategy::OneForOne).spawn(
@@ -1484,9 +1488,7 @@ mod tests {
                 let attempt = source.fetch_add(1, Ordering::Relaxed);
                 assert_ne!(attempt, 0, "first factory panic");
                 async move {
-                    if attempt == 1 {
-                        panic!("second future panic");
-                    }
+                    assert_ne!(attempt, 1, "second future panic");
                     Err(TaskFailure::Failed("third failure".into()))
                 }
             },
@@ -1499,7 +1501,7 @@ mod tests {
     async fn forced_shutdown_reports_typed_disposition() {
         let mut cfg = config();
         cfg.shutdown_grace = Duration::from_millis(1);
-        let runtime = Runtime::new(cfg, None).unwrap();
+        let runtime = must(Runtime::new(cfg, None));
         let entered = Arc::new(AtomicBool::new(false));
         let entered_flag = entered.clone();
         let _task = admitted(runtime.spawn("blocking-poll", move |_| async move {
@@ -1517,7 +1519,7 @@ mod tests {
 
     #[test]
     fn supervision_scopes_and_contract_projection_are_explicit() {
-        let runtime = Runtime::new(config(), None).unwrap();
+        let runtime = must(Runtime::new(config(), None));
         assert_eq!(runtime.fairness_quantum(), 2);
         assert_eq!(
             platform_result(PortOutcome::known(())),
@@ -1610,7 +1612,7 @@ mod tests {
 
     #[tokio::test]
     async fn mailbox_control_reserve_survives_data_saturation() {
-        let (mailbox, mut receiver) = Mailbox::bounded(1, 1, 1).unwrap();
+        let (mailbox, mut receiver) = must(Mailbox::bounded(1, 1, 1));
         assert_eq!(mailbox.try_send(1), SendResult::Accepted);
         assert_eq!(mailbox.try_send(2), SendResult::Saturated);
         assert_eq!(
@@ -1618,9 +1620,7 @@ mod tests {
             SendResult::Accepted
         );
         assert_eq!(
-            timeout(Duration::from_millis(20), receiver.recv())
-                .await
-                .unwrap(),
+            must(timeout(Duration::from_millis(20), receiver.recv()).await),
             Some(MailboxItem::Control(ControlSignal::Shutdown))
         );
     }
