@@ -1,0 +1,19 @@
+[package]
+name = "eliot-cli"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.89"
+license = "MIT"
+description = "ELIOT canonical generated CLI catalogue and thin client contracts"
+
+[dependencies]
+eliot-observation-contracts = { path = "../../foundation/eliot-observation-contracts", version = "0.1.0" }
+eliot-protocol = { path = "../../foundation/eliot-protocol", version = "0.1.0" }
+eliot-receipts = { path = "../../foundation/eliot-receipts", version = "0.1.0" }
+eliot-runtime-contracts = { path = "../../foundation/eliot-runtime-contracts", version = "0.1.0" }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = { version = "1.0.150", features = ["float_roundtrip"] }
+schemars = { version = "1.2.1", features = ["derive"] }
+thiserror = "2.0.18"
+
+[workspace]
