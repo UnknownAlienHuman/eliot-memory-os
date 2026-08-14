@@ -6,6 +6,21 @@ Integration snapshot: branch `swarm/A-04-cell`, source frontier `763f7e2` when t
 
 ## Paused work
 
+### C0-13 — evaluation evidence and independent verdict contracts
+
+Closed portions: the second candidate adds typed contract/revision/digest, evaluator profile/input/output, artifact, verifier and state-fence projections; separates candidate reports from independent verdicts; rejects unknown serde fields; and passes its package gates plus the `eliot-budget` consumer tests.
+
+Remaining authority blockers:
+
+- The hand-written contract identity/version is unchanged when required wire fields change, and digest/revision values are shape-checked rather than bound to canonical bytes or a revision authority.
+- Evaluator independence remains caller-fabricable; distinct evaluator/verifier strings do not prove an independent route, context, owner or failure domain.
+- `ACHIEVED`/`SATISFIED` accept verdicts without the required success disposition, while `MATURED` can be issued without a bound verdict.
+- Fence, source/contract revision, evaluator profile and artifact bindings are incomplete; artifact equality is ID-only and several report bindings remain optional.
+- Proof ceilings are not bounded by evaluator output, observation evidence can satisfy stronger states, and duplicate/cross-identity validation is incomplete.
+- Trial status and outcome are not a closed valid matrix, allowing contradictory combinations such as succeeded-with-unknown or failed-with-improved.
+
+Resume condition: bind the wire contract to canonical bytes and revision authority, consume provider-issued independence evidence, close the state/outcome matrices and require exact cross-bindings. Then perform a new source revision and independent gate; do not reinterpret this rejected candidate as acceptance evidence.
+
 ### A-01 / A-03 / A-05 — admitted agent launch path
 
 Closed portions: raw launch requests no longer directly enter the Codex/ACP adapter path; identifiers and admitted invocations revalidate after deserialization; C0-12 freshness, integrity, taint, privacy, verifier, epistemic-use, fence and effect checks are present; provider results remain candidate-only.
