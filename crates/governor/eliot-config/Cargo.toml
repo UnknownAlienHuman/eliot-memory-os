@@ -1,0 +1,25 @@
+[package]
+name = "eliot-config"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.89"
+license = "MIT"
+description = "Pure immutable configuration and Human-owned policy governance"
+
+[workspace]
+
+[dependencies]
+eliot-contracts = { path = "../../foundation/eliot-contracts", version = "0.1.0" }
+eliot-runtime-contracts = { path = "../../foundation/eliot-runtime-contracts", version = "0.1.0" }
+eliot-security-contracts = { path = "../../foundation/eliot-security-contracts", version = "0.1.0" }
+schemars = { version = "1.2.1", features = ["derive"] }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = { version = "1.0.150", features = ["float_roundtrip"] }
+thiserror = "2.0.18"
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
