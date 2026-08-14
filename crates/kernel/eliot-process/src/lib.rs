@@ -1145,7 +1145,10 @@ impl ProcessState {
         if self.identity.is_none() {
             return Err(ContractError::MissingIdentity);
         }
-        if matches!(exit.disposition, ExitDisposition::Unknown) {
+        if matches!(exit.disposition, ExitDisposition::Unknown)
+            || !descendants.complete()
+            || !descendants.tree_terminated()
+        {
             self.transition(ProcessLifecycle::UnknownOutcome)?;
         } else {
             self.transition(ProcessLifecycle::Exited)?;
@@ -1168,6 +1171,16 @@ impl ProcessState {
                 status: self.cancellation,
                 lifecycle: self.lifecycle,
                 no_effect_proven: matches!(self.lifecycle, ProcessLifecycle::Created),
+                descendants: self.descendants.clone(),
+            });
+        }
+        if self.lifecycle == ProcessLifecycle::Cancelling {
+            return Ok(CancellationReceipt {
+                operation_id: self.request.operation_id.clone(),
+                request_digest: self.request.invocation_digest.clone(),
+                status: self.cancellation,
+                lifecycle: self.lifecycle,
+                no_effect_proven: false,
                 descendants: self.descendants.clone(),
             });
         }
@@ -1584,6 +1597,38 @@ mod tests {
             DescendantEvidence::new(Vec::new(), true, true, Some("evidence:1".to_owned()))?;
         state.reconcile(evidence)?;
         assert_eq!(state.view().lifecycle(), ProcessLifecycle::Reconciled);
+        Ok(())
+    }
+
+    #[test]
+    fn ordinary_exit_requires_complete_terminated_tree() -> Result<(), Box<dyn Error>> {
+        for descendants in [
+            DescendantEvidence::default(),
+            DescendantEvidence::new(Vec::new(), true, false, None)?,
+        ] {
+            let mut state = ProcessState::new(request()?)?;
+            state.start(identity(state.request())?)?;
+            state.mark_running(ProcessHealth::default())?;
+            state.exit(
+                ExitStatus::new(ExitDisposition::Completed, Some(0), None, 20)?,
+                descendants,
+            )?;
+            assert_eq!(state.view().lifecycle(), ProcessLifecycle::UnknownOutcome);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn repeated_cancel_while_cancelling_is_idempotent() -> Result<(), Box<dyn Error>> {
+        let mut state = ProcessState::new(request()?)?;
+        state.start(identity(state.request())?)?;
+        state.mark_running(ProcessHealth::default())?;
+        let fence = state.request().fence().clone();
+        let first = state.cancel(&fence)?;
+        let second = state.cancel(&fence)?;
+        assert_eq!(first, second);
+        assert_eq!(state.view().lifecycle(), ProcessLifecycle::Cancelling);
+        assert_eq!(state.view().cancellation(), CancellationStatus::InProgress);
         Ok(())
     }
 
