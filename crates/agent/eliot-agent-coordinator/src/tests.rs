@@ -64,7 +64,8 @@ impl ProviderVerifier for TestProvider {
 }
 
 fn rev(value: &str) -> RevisionId {
-    RevisionId::new(value).expect("valid fixture revision")
+    RevisionId::new(value)
+        .unwrap_or_else(|error| panic!("valid fixture revision required: {error}"))
 }
 
 fn config(max_attempts: usize, max_route: usize) -> CoordinatorConfig {
@@ -520,7 +521,7 @@ fn unknown_outcome_retains_writer_until_authenticated_reconciliation() -> TestRe
     assert_eq!(
         coordinator
             .attempt(&lane.attempt_id)
-            .expect("attempt")
+            .unwrap_or_else(|| panic!("admitted attempt must exist"))
             .state,
         crate::CoordinatedAttemptState::UnknownOutcome
     );
@@ -560,6 +561,7 @@ fn unknown_outcome_retains_writer_until_authenticated_reconciliation() -> TestRe
 }
 
 #[test]
+#[allow(clippy::too_many_lines)]
 fn admission_bijection_and_reassignment_capacity_fail_closed() -> TestResult {
     let proofs = [
         "proof-admission-bij",
@@ -683,6 +685,7 @@ fn admission_bijection_and_reassignment_capacity_fail_closed() -> TestResult {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)]
 fn live_capacity_evidence_limits_admission_and_reassignment() -> TestResult {
     let proofs = [
         "proof-admission-cap-old",
@@ -826,13 +829,13 @@ fn explicit_peer_delivery_occurs_only_at_next_boundary() -> TestResult {
         .admitted_lanes
         .iter()
         .find(|lane| lane.work_unit_id.as_str() == "work-sender")
-        .expect("sender")
+        .unwrap_or_else(|| panic!("sender lane must exist"))
         .clone();
     let recipient = admitted
         .admitted_lanes
         .iter()
         .find(|lane| lane.work_unit_id.as_str() == "work-recipient")
-        .expect("recipient")
+        .unwrap_or_else(|| panic!("recipient lane must exist"))
         .clone();
     coordinator.start_attempt(context.clone(), sender.attempt_id.clone())?;
     coordinator.start_attempt(context.clone(), recipient.attempt_id.clone())?;
@@ -849,7 +852,7 @@ fn explicit_peer_delivery_occurs_only_at_next_boundary() -> TestResult {
     assert_eq!(queued.state, LivePeerMessageState::Queued);
     let delivered = coordinator
         .deliver_next_boundary(context.clone(), recipient.attempt_id.clone())?
-        .expect("delivery");
+        .unwrap_or_else(|| panic!("queued message must be delivered"));
     assert_eq!(delivered.state, LivePeerMessageState::Delivered);
 
     let unavailable = peer_message(

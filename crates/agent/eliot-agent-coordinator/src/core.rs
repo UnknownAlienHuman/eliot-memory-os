@@ -37,7 +37,7 @@ pub(crate) enum ProviderProofKind {
 /// Sealed inside this crate so callers cannot implement an "always verified"
 /// provider. A future accepted A-01/G-11 adapter must be added here and bind
 /// its own authenticated receipts. Until then the public constructor installs
-/// only a typed PLAN_GAP verifier.
+/// only a typed `PLAN_GAP` verifier.
 pub(crate) trait ProviderVerifier: Send + Sync {
     fn binding(&self) -> ProviderBindingSnapshot;
     fn minimum_event_sequence(&self) -> u64;
@@ -162,7 +162,8 @@ impl AgentCoordinator {
     }
 
     /// Compiles deterministic candidate staffing. It never admits or starts an
-    /// attempt and remains available while providers are a PLAN_GAP.
+    /// attempt and remains available while providers are a `PLAN_GAP`.
+    #[allow(clippy::too_many_lines)]
     pub fn plan(
         &mut self,
         request: StaffingPlanRequest,
@@ -313,6 +314,7 @@ impl AgentCoordinator {
     }
 
     /// Reconciles only an admission accepted by the sealed verifier.
+    #[allow(clippy::too_many_lines)]
     pub fn admit(
         &mut self,
         mut receipt: ProviderAdmissionReceipt,
@@ -708,6 +710,7 @@ impl AgentCoordinator {
         Ok(result)
     }
 
+    #[allow(clippy::too_many_lines)]
     pub fn reassign(
         &mut self,
         context: ExecutionContext,
@@ -1247,6 +1250,7 @@ impl AgentCoordinator {
         Self::restore(snapshot, live_config, gap)
     }
 
+    #[allow(clippy::needless_pass_by_value)]
     pub(crate) fn restore_with_provider(
         snapshot: CoordinatorSnapshot,
         live_config: CoordinatorConfig,
@@ -1381,7 +1385,7 @@ impl AgentCoordinator {
                 Ok(())
             }
             ProviderBindingSnapshot::Gap { gap } => Err(gap.into()),
-            _ => Err(CoordinatorError::StaleProviderBinding),
+            ProviderBindingSnapshot::Verified { .. } => Err(CoordinatorError::StaleProviderBinding),
         }
     }
 

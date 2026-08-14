@@ -304,6 +304,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "eliot-agent-coordinator"
+version = "0.1.0"
+dependencies = [
+ "eliot-agent-api",
+ "eliot-agent-contracts",
+ "eliot-evaluation-contracts",
+ "eliot-receipts",
+ "eliot-security-contracts",
+ "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
 name = "eliot-agent-opencode"
 version = "0.1.0"
 dependencies = [

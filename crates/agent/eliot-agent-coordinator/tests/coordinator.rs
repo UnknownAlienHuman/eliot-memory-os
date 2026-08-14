@@ -144,7 +144,8 @@ fn route_evidence(route: RouteFingerprint, rank: u16) -> RouteCandidateEvidence 
         route,
         preference_rank: rank,
         capacity_identity: "capacity-a".to_owned(),
-        capacity_revision: RevisionId::new("capacity-rev-1").expect("fixture revision"),
+        capacity_revision: RevisionId::new("capacity-rev-1")
+            .unwrap_or_else(|error| panic!("fixture revision must be valid: {error}")),
         capacity_limit: 2,
         budget_evidence: BudgetEvidence {
             arm_id: format!("route-arm-{rank}"),
