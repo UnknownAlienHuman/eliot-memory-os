@@ -6,6 +6,7 @@ members = [
   "crates/eliot-types",
   "crates/eliot-windows-ipc",
   "workspace/tools/eliot-runtime-compiler",
+  "workspace/tools/eliot-campaign-executor",
 ]
 resolver = "2"
 
