@@ -7,6 +7,7 @@ members = [
   "crates/eliot-windows-ipc",
   "crates/agent/eliot-agent-api",
   "crates/agent/eliot-agent-opencode",
+  "crates/foundation/eliot-contracts",
   "crates/kernel/eliot-process",
   "crates/security/eliot-source-assurance",
   "workspace/tools/eliot-runtime-compiler",
@@ -31,6 +32,7 @@ eliot-store = { path = "crates/eliot-store", version = "0.1.0" }
 eliot-types = { path = "crates/eliot-types", version = "0.1.0" }
 eliot-windows-ipc = { path = "crates/eliot-windows-ipc", version = "0.1.0" }
 eliot-agent-opencode = { path = "crates/agent/eliot-agent-opencode", version = "0.1.0" }
+eliot-contracts = { path = "crates/foundation/eliot-contracts", version = "0.1.0" }
 eliot-process = { path = "crates/kernel/eliot-process", version = "0.1.0" }
 eliot-source-assurance = { path = "crates/security/eliot-source-assurance", version = "0.1.0" }
 futures-util = { version = "0.3.32", features = ["sink"] }
