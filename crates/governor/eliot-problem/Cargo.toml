@@ -1,0 +1,19 @@
+[package]
+name = "eliot-problem"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Deterministic ELIOT problem, conflict and governed-challenge state machines"
+
+[dependencies]
+eliot-contracts = { path = "../../foundation/eliot-contracts", version = "0.1.0" }
+eliot-evidence = { path = "../../foundation/eliot-evidence", version = "0.1.0" }
+eliot-observation-contracts = { path = "../../foundation/eliot-observation-contracts", version = "0.1.0" }
+schemars.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true
