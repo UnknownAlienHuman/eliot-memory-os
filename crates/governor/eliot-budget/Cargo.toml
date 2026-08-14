@@ -1,0 +1,19 @@
+[package]
+name = "eliot-budget"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Pure provider-neutral budget, quota, and reservation state machine"
+
+[dependencies]
+eliot-authority.workspace = true
+eliot-config.workspace = true
+eliot-evaluation-contracts.workspace = true
+eliot-receipts.workspace = true
+
+[dev-dependencies]
+eliot-contracts.workspace = true
+
+[lints]
+workspace = true
