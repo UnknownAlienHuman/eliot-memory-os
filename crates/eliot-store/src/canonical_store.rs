@@ -561,14 +561,14 @@ fn l2_selector_identities(selectors: &[L2Selector], kind: L2HandleKind) -> Vec<S
 fn l2_relation_identities(selectors: &[L2Selector]) -> Vec<String> {
     let mut relation_ids = BTreeSet::new();
     for selector in selectors {
-        if matches!(
-            selector.kind,
-            L2HandleKind::File | L2HandleKind::CanonicalMemory
-        ) {
+        if selector.kind == L2HandleKind::CanonicalMemory {
             continue;
         }
         relation_ids.insert(selector.public_handle.clone());
         relation_ids.insert(selector.identity.clone());
+        if selector.kind == L2HandleKind::File {
+            continue;
+        }
         for prefix in [
             "claim:",
             "claim_card:",
@@ -5889,6 +5889,22 @@ mod memory_search_selector_tests {
             format!("memory-segment:{}", "a".repeat(64))
         );
         assert!(l2_relation_identities(&selectors).is_empty());
+    }
+
+    #[test]
+    fn exact_l2_file_selector_expands_its_relation_identity_only() -> Result<(), StoreError> {
+        let selectors = normalize_l2_selectors(&[
+            "file:src/a.rs".to_owned(),
+            "memory:unrelated-parent".to_owned(),
+        ])?;
+
+        let relation_ids = l2_relation_identities(&selectors);
+
+        assert_eq!(
+            relation_ids,
+            vec!["file:src/a.rs".to_owned(), "src/a.rs".to_owned()]
+        );
+        Ok(())
     }
 
     #[test]
