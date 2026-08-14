@@ -1,0 +1,24 @@
+[package]
+name = "eliot-runtime-contracts"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "ELIOT process, health, generation, cutover and recovery contracts"
+
+[package.metadata.eliot]
+work_id = "C0-04"
+functional_cell = "runtime-contracts"
+lifecycle_owner = "C0-04"
+source_layer = "C0"
+proof_entrypoint = "cargo test -p eliot-runtime-contracts"
+
+[dependencies]
+eliot-contracts.workspace = true
+schemars.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true
