@@ -124,11 +124,7 @@ impl WasmRuntime {
                 InvocationDisposition::Unknown,
                 RuntimeError::UnknownOutcome,
             );
-            self.cache
-                .get_mut(invocation_id)
-                .expect("cached above")
-                .result = result.clone();
-            return Ok(result);
+            return self.replace_cached_result(invocation_id, result);
         };
         let verified = ports
             .process_receipt_verifier
@@ -156,11 +152,7 @@ impl WasmRuntime {
                 },
             )
         };
-        self.cache
-            .get_mut(invocation_id)
-            .expect("cached above")
-            .result = result.clone();
-        Ok(result)
+        self.replace_cached_result(invocation_id, result)
     }
 
     /// Requires independently verified P-03 evidence before engine reconciliation.
@@ -208,10 +200,18 @@ impl WasmRuntime {
             .reconcile(invocation)
             .map_err(|_| RuntimeError::UnknownOutcome)?;
         let result = classify_engine_report(ports, &cached.request, admission, invocation, report);
-        self.cache
-            .get_mut(invocation_id)
-            .expect("cached above")
-            .result = result.clone();
+        self.replace_cached_result(invocation_id, result)
+    }
+
+    fn replace_cached_result(
+        &mut self,
+        invocation_id: &crate::InvocationId,
+        result: InvocationResult,
+    ) -> Result<InvocationResult, RuntimeError> {
+        let Some(cached) = self.cache.get_mut(invocation_id) else {
+            return Err(RuntimeError::UnknownOutcome);
+        };
+        cached.result = result.clone();
         Ok(result)
     }
 

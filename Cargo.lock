@@ -751,6 +751,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "eliot-wasm-runtime"
+version = "0.1.0"
+dependencies = [
+ "eliot-observation-contracts",
+ "eliot-process",
+ "eliot-runtime-contracts",
+ "eliot-security-contracts",
+ "schemars",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror",
+]
+
+[[package]]
 name = "eliot-windows-ipc"
 version = "0.1.0"
 dependencies = [

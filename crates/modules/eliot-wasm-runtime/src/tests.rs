@@ -13,8 +13,29 @@ use serde_json::json;
 
 use crate::*;
 
+fn must<T, E: std::fmt::Debug>(result: Result<T, E>) -> T {
+    match result {
+        Ok(value) => value,
+        Err(error) => panic!("fixture result failed: {error:?}"),
+    }
+}
+
+fn must_some<T>(value: Option<T>) -> T {
+    match value {
+        Some(value) => value,
+        None => panic!("fixture value was unexpectedly absent"),
+    }
+}
+
+fn lock_state(state: &Mutex<MockState>) -> std::sync::MutexGuard<'_, MockState> {
+    match state.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    }
+}
+
 fn digest(character: char) -> Sha256Digest {
-    Sha256Digest::new(character.to_string().repeat(64)).expect("valid digest")
+    must(Sha256Digest::new(character.to_string().repeat(64)))
 }
 
 fn binding() -> EngineBinding {
@@ -29,8 +50,8 @@ fn binding() -> EngineBinding {
 
 fn manifest() -> ComponentManifest {
     ComponentManifest {
-        component_id: CapabilityId::new("component-1").expect("component"),
-        world: CapabilityId::new("eliot:test/world").expect("world"),
+        component_id: must(CapabilityId::new("component-1")),
+        world: must(CapabilityId::new("eliot:test/world")),
         wit_version: "1.0.0".to_owned(),
         guest_target: DEFAULT_GUEST_TARGET.to_owned(),
         artifact_digest: digest('a'),
@@ -38,12 +59,8 @@ fn manifest() -> ComponentManifest {
         source_digest: digest('c'),
         configuration_digest: digest('d'),
         state_contract_digest: digest('e'),
-        imports: [CapabilityId::new("log").expect("import")]
-            .into_iter()
-            .collect(),
-        exports: [CapabilityId::new("run").expect("export")]
-            .into_iter()
-            .collect(),
+        imports: [must(CapabilityId::new("log"))].into_iter().collect(),
+        exports: [must(CapabilityId::new("run"))].into_iter().collect(),
         admitted_privacy_classes: vec![PrivacyClass::Internal],
         required_verifier: "verifier:a12".to_owned(),
         engine: binding(),
@@ -51,7 +68,7 @@ fn manifest() -> ComponentManifest {
 }
 
 fn module_generation() -> ModuleGeneration {
-    serde_json::from_value(json!({
+    must(serde_json::from_value(json!({
         "module_id": "component-1",
         "generation": 1,
         "artifact_id": "a".repeat(64),
@@ -66,20 +83,18 @@ fn module_generation() -> ModuleGeneration {
             "task_revision": 1, "policy_revision": 1,
             "integration_revision": null
         }
-    }))
-    .expect("generation fixture")
+    })))
 }
 
 fn work_scope() -> ObservationScope {
-    serde_json::from_value(json!({
+    must(serde_json::from_value(json!({
         "work_scope": "scope-1", "task_ref": "task-1",
         "attempt_ref": "work-1", "module_or_route_ref": "component-1"
-    }))
-    .expect("scope fixture")
+    })))
 }
 
 fn lease() -> RuntimeLease {
-    serde_json::from_value(json!({
+    must(serde_json::from_value(json!({
         "lease_id": "lease-1", "scope_ref": "scope-1", "authority_epoch": 1,
         "state_fence": {
             "authority_epoch": 1, "resource_generation": 1,
@@ -87,12 +102,11 @@ fn lease() -> RuntimeLease {
             "integration_revision": null
         },
         "state": "ACTIVE"
-    }))
-    .expect("lease fixture")
+    })))
 }
 
 fn source_assurance() -> SourceAssurance {
-    serde_json::from_value(json!({
+    must(serde_json::from_value(json!({
         "source_ref": "source-1", "provenance_ref": "provenance-1",
         "integrity": "VERIFIED", "freshness": "CURRENT",
         "competence": "DOMAIN_VERIFIED", "independence": "INDEPENDENT",
@@ -105,8 +119,7 @@ fn source_assurance() -> SourceAssurance {
             "task_revision": 1, "policy_revision": 1,
             "integration_revision": null
         }
-    }))
-    .expect("source fixture")
+    })))
 }
 
 fn limits() -> InvocationLimits {
@@ -133,17 +146,16 @@ fn limits() -> InvocationLimits {
 }
 
 fn request() -> InvocationRequest {
-    InvocationRequest::new(
-        InvocationId::new("invoke-1").expect("invocation"),
-        CapabilityId::new("component-1").expect("component"),
-        WorkUnitId::new("work-1").expect("work unit"),
-        WorkScopeRef::new("scope-1").expect("scope"),
+    must(InvocationRequest::new(
+        must(InvocationId::new("invoke-1")),
+        must(CapabilityId::new("component-1")),
+        must(WorkUnitId::new("work-1")),
+        must(WorkScopeRef::new("scope-1")),
         ExecutionContour::Conformance,
         vec![1, 2, 3],
         7,
         false,
-    )
-    .expect("request")
+    ))
 }
 
 #[derive(Clone)]
@@ -267,8 +279,8 @@ impl GovernorResolutionPort for GovernorMock {
             manifest: manifest(),
             generation: module_generation(),
             lease: lease(),
-            authority_revision: Revision::new(1).expect("revision"),
-            lifecycle_revision: Revision::new(1).expect("revision"),
+            authority_revision: must(Revision::new(1)),
+            lifecycle_revision: must(Revision::new(1)),
             limits: resolved_limits,
             resolution_receipt_digest: digest('2'),
         })
@@ -285,12 +297,10 @@ impl AuthorityResolutionPort for AuthorityMock {
             return Err(error);
         }
         Ok(AuthorityResolution {
-            owner: OwnerId::new("owner-1").expect("owner"),
-            work_unit: WorkUnitId::new("work-1").expect("work unit"),
+            owner: must(OwnerId::new("owner-1")),
+            work_unit: must(WorkUnitId::new("work-1")),
             work_scope: work_scope(),
-            allowed_host_calls: [CapabilityId::new("log").expect("host call")]
-                .into_iter()
-                .collect(),
+            allowed_host_calls: [must(CapabilityId::new("log"))].into_iter().collect(),
             allowed_effect_proposals: BTreeSet::new(),
             resolution_receipt_digest: digest('3'),
         })
@@ -312,7 +322,7 @@ impl SourceVerificationPort for SourceMock {
         }
         Ok(SourceVerification {
             assurance,
-            verification_revision: Revision::new(1).expect("revision"),
+            verification_revision: must(Revision::new(1)),
             verification_receipt_digest: digest('4'),
         })
     }
@@ -334,10 +344,9 @@ impl PromotionVerificationPort for PromotionMock {
             } else {
                 Sha256Digest::of_bytes(&[4, 5])
             },
-            expected_effect_digest: canonical_digest(&Vec::<EffectProposal>::new())
-                .expect("effect digest"),
+            expected_effect_digest: must(canonical_digest(&Vec::<EffectProposal>::new())),
             expected_state_delta_digest: Sha256Digest::of_bytes(&[6]),
-            verification_revision: Revision::new(1).expect("revision"),
+            verification_revision: must(Revision::new(1)),
             shadow: VerificationVerdict::Verified,
             canary: VerificationVerdict::Verified,
             rollback: VerificationVerdict::Verified,
@@ -366,8 +375,7 @@ impl PromotionVerificationPort for PromotionMock {
             && invocation.promotion_verification_receipt_digest == digest('5')
             && invocation.state_contract_digest == invocation.manifest.state_contract_digest
             && derived.result_digest == Sha256Digest::of_bytes(&report.output)
-            && derived.effect_digest
-                == canonical_digest(&report.proposed_effects).expect("effect digest")
+            && derived.effect_digest == must(canonical_digest(&report.proposed_effects))
             && derived.state_delta_digest == Sha256Digest::of_bytes(&report.observed_state_delta);
         if exact {
             Ok(())
@@ -384,44 +392,43 @@ struct ProcessMock {
 
 impl P03ProcessPort for ProcessMock {
     fn prepare(&mut self, envelope: &ProcessLaunchEnvelope) -> Result<ProcessRequest, PortError> {
-        let generation =
-            Generation::new(envelope.generation.generation.value()).expect("process generation");
+        let generation = must(Generation::new(envelope.generation.generation.value()));
         ProcessRequest::new(
-            OperationId::new(envelope.invocation_id.as_str()).expect("operation"),
-            ProcessTreeId::new(if self.config.process_prepare_invalid {
+            must(OperationId::new(envelope.invocation_id.as_str())),
+            must(ProcessTreeId::new(if self.config.process_prepare_invalid {
                 "wrong-scope"
             } else {
                 "scope-1"
-            })
-            .expect("tree"),
+            })),
             generation,
             "eliot-wasm-host.exe",
             "e".repeat(64),
             Vec::new(),
             "C:\\eliot\\runtime",
-            EnvironmentProjection::new(BTreeMap::new(), Vec::new(), EnvironmentInheritance::None)
-                .expect("environment"),
-            ProcessLimits::new(
+            must(EnvironmentProjection::new(
+                BTreeMap::new(),
+                Vec::new(),
+                EnvironmentInheritance::None,
+            )),
+            must(ProcessLimits::new(
                 envelope.limits.wall_deadline_ms,
                 None,
                 Some(envelope.limits.max_memory_bytes),
                 envelope.limits.max_output_bytes,
                 envelope.limits.max_output_bytes,
                 0,
-            )
-            .expect("process limits"),
-            FencingToken::new(
+            )),
+            must(FencingToken::new(
                 envelope.lease.state_fence.authority_epoch.value(),
                 generation,
                 "fence-1",
-            )
-            .expect("fence"),
+            )),
         )
         .map_err(|_| PortError::Denied)
     }
 
     fn start(&mut self, request: &ProcessRequest) -> Result<ProcessStartReceipt, PortError> {
-        self.state.lock().expect("state").process_start_calls += 1;
+        lock_state(&self.state).process_start_calls += 1;
         if let Some(error) = self.config.process_start_error {
             return Err(error);
         }
@@ -429,7 +436,7 @@ impl P03ProcessPort for ProcessMock {
     }
 
     fn cancel(&mut self, request: &ProcessRequest) -> Result<CancellationReceipt, PortError> {
-        self.state.lock().expect("state").cancel_calls += 1;
+        lock_state(&self.state).cancel_calls += 1;
         let operation_id = if self.config.cancel_receipt_mismatch {
             "different-operation"
         } else {
@@ -579,7 +586,7 @@ impl ComponentEnginePort for EngineMock {
     }
 
     fn invoke(&mut self, invocation: &EngineInvocation) -> Result<EngineReport, PortError> {
-        let mut state = self.state.lock().expect("state");
+        let mut state = lock_state(&self.state);
         state.engine_calls += 1;
         state.last_invocation = Some(invocation.clone());
         Ok(Self::report(invocation, &self.config.report))
@@ -638,8 +645,8 @@ fn caller_request_is_inert_without_ports_and_denial_never_reaches_process() {
     let (mut denied_runtime, state) = runtime(config);
     let denied = denied_runtime.execute(request());
     assert_eq!(denied.receipt.error, Some(RuntimeError::AuthorityDenied));
-    assert_eq!(state.lock().expect("state").process_start_calls, 0);
-    assert_eq!(state.lock().expect("state").engine_calls, 0);
+    assert_eq!(lock_state(&state).process_start_calls, 0);
+    assert_eq!(lock_state(&state).engine_calls, 0);
 }
 
 #[test]
@@ -654,8 +661,8 @@ fn p03_start_and_separate_receipt_verification_precede_engine() {
         result.receipt.error,
         Some(RuntimeError::InvalidProcessBinding)
     );
-    assert_eq!(state.lock().expect("state").process_start_calls, 0);
-    assert_eq!(state.lock().expect("state").engine_calls, 0);
+    assert_eq!(lock_state(&state).process_start_calls, 0);
+    assert_eq!(lock_state(&state).engine_calls, 0);
 
     let config = Config {
         reject_start_receipt: true,
@@ -668,8 +675,8 @@ fn p03_start_and_separate_receipt_verification_precede_engine() {
         result.receipt.error,
         Some(RuntimeError::InvalidProcessReceipt)
     );
-    assert_eq!(state.lock().expect("state").process_start_calls, 1);
-    assert_eq!(state.lock().expect("state").engine_calls, 0);
+    assert_eq!(lock_state(&state).process_start_calls, 1);
+    assert_eq!(lock_state(&state).engine_calls, 0);
 }
 
 #[test]
@@ -679,8 +686,8 @@ fn engine_receives_the_exact_sealed_authority_and_limit_envelope() {
         runtime.execute(request()).receipt.disposition,
         InvocationDisposition::Succeeded
     );
-    let state = state.lock().expect("state");
-    let invocation = state.last_invocation.as_ref().expect("engine invocation");
+    let state = lock_state(&state);
+    let invocation = must_some(state.last_invocation.as_ref());
     assert_eq!(invocation.contour, ExecutionContour::Conformance);
     assert_eq!(invocation.imports, invocation.manifest.imports);
     assert_eq!(invocation.exports, invocation.manifest.exports);
@@ -731,7 +738,7 @@ fn actual_values_are_digested_locally_and_promotion_unavailability_is_plan_gap()
     let (mut unavailable_runtime, state) = runtime(config);
     let unavailable = unavailable_runtime.execute(request());
     assert_eq!(unavailable.receipt.error, Some(RuntimeError::PlanGap));
-    assert_eq!(state.lock().expect("state").process_start_calls, 0);
+    assert_eq!(lock_state(&state).process_start_calls, 0);
 
     let config = Config {
         promotion_mismatch: true,
@@ -772,7 +779,7 @@ fn terminal_success_cannot_be_overwritten_by_cancel_and_replay_is_stable() {
         Err(RuntimeError::TerminalCancellationConflict)
     );
     assert_eq!(runtime.execute(original), success);
-    assert_eq!(state.lock().expect("state").cancel_calls, 0);
+    assert_eq!(lock_state(&state).cancel_calls, 0);
 }
 
 #[test]
@@ -792,9 +799,7 @@ fn cancellation_receipt_must_bind_exact_request_and_fence() {
         runtime.execute(original).receipt.disposition,
         InvocationDisposition::Unknown
     );
-    let cancelled = runtime
-        .cancel(&invocation_id, &request_digest)
-        .expect("typed cancel result");
+    let cancelled = must(runtime.cancel(&invocation_id, &request_digest));
     assert_eq!(
         cancelled.receipt.disposition,
         InvocationDisposition::Unknown
@@ -823,18 +828,18 @@ fn extended_table_instance_stack_epoch_and_artifact_limits_fail_closed() {
         let (mut runtime, state) = runtime(config);
         let result = runtime.execute(request());
         assert_eq!(result.receipt.error, Some(RuntimeError::InvalidLimits));
-        assert_eq!(state.lock().expect("state").process_start_calls, 0);
-        assert_eq!(state.lock().expect("state").engine_calls, 0);
+        assert_eq!(lock_state(&state).process_start_calls, 0);
+        assert_eq!(lock_state(&state).engine_calls, 0);
     }
 
-    let mut invalid_cancellation = serde_json::to_value(limits()).expect("limits serialize");
+    let mut invalid_cancellation = must(serde_json::to_value(limits()));
     invalid_cancellation["epoch"]["cancellation"] = json!("CALLER_CONTROLLED");
     assert!(serde_json::from_value::<InvocationLimits>(invalid_cancellation).is_err());
 }
 
 #[test]
 fn malformed_ids_digests_and_unknown_fields_fail_deserialization() {
-    let value = serde_json::to_value(request()).expect("serialize");
+    let value = must(serde_json::to_value(request()));
     let mut blank_id = value.clone();
     blank_id["invocation_id"] = json!("");
     assert!(serde_json::from_value::<InvocationRequest>(blank_id).is_err());
@@ -853,13 +858,13 @@ fn replay_conflict_is_rejected_without_second_engine_call() {
     let success = runtime.execute(original.clone());
     let mut conflict = original.clone();
     conflict.input.push(9);
-    conflict.refresh_digest().expect("reseal");
+    must(conflict.refresh_digest());
     assert_eq!(
         runtime.execute(conflict).receipt.error,
         Some(RuntimeError::ReplayConflict)
     );
     assert_eq!(runtime.execute(original), success);
-    assert_eq!(state.lock().expect("state").engine_calls, 1);
+    assert_eq!(lock_state(&state).engine_calls, 1);
 }
 
 #[test]
@@ -927,9 +932,7 @@ fn partial_and_post_commit_unknown_reconcile_only_after_p03_evidence() {
             runtime.execute(original.clone()).receipt.disposition,
             InvocationDisposition::Unknown
         );
-        let reconciled = runtime
-            .reconcile(&invocation_id, &request_digest)
-            .expect("reconciled");
+        let reconciled = must(runtime.reconcile(&invocation_id, &request_digest));
         assert_eq!(
             reconciled.receipt.disposition,
             InvocationDisposition::Succeeded
@@ -953,7 +956,7 @@ fn stale_source_forbidden_effect_and_meter_violation_never_succeed() {
     let forbidden = Config {
         report: ReportSpec {
             effects: vec![EffectProposal {
-                effect_kind: CapabilityId::new("network.send").expect("effect"),
+                effect_kind: must(CapabilityId::new("network.send")),
                 payload_digest: digest('6'),
             }],
             ..ReportSpec::success()
@@ -984,12 +987,12 @@ fn stale_source_forbidden_effect_and_meter_violation_never_succeed() {
 fn caller_cancellation_is_checked_before_any_port_effect() {
     let mut cancelled = request();
     cancelled.cancellation_requested = true;
-    cancelled.refresh_digest().expect("reseal");
+    must(cancelled.refresh_digest());
     let (mut runtime, state) = runtime(Config::default());
     assert_eq!(
         runtime.execute(cancelled).receipt.error,
         Some(RuntimeError::Cancelled)
     );
-    assert_eq!(state.lock().expect("state").process_start_calls, 0);
-    assert_eq!(state.lock().expect("state").engine_calls, 0);
+    assert_eq!(lock_state(&state).process_start_calls, 0);
+    assert_eq!(lock_state(&state).engine_calls, 0);
 }
