@@ -602,10 +602,8 @@ pub fn translate_result(
                     .unwrap_or_else(|| "completion event absent".into()),
             ),
         )
-    } else if input.output.is_none() {
-        (ResultDisposition::Partial, input.unknown_reason)
     } else {
-        (ResultDisposition::VerifiedComplete, input.unknown_reason)
+        (ResultDisposition::Partial, input.unknown_reason)
     };
     let result = AgentResult {
         attempt_id: input.attempt_id,
@@ -989,17 +987,21 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn partial_and_missing_completion_are_not_verified() -> TestResult {
-        let a = attached()?;
-        let input = CodexResultInput {
+    fn result_input(
+        attached: &CodexAttachReceipt,
+        output: Option<&str>,
+        completed_event_seen: bool,
+        cancelled: bool,
+        unknown_reason: Option<&str>,
+    ) -> TestResult<CodexResultInput> {
+        Ok(CodexResultInput {
             attempt_id: AttemptId::new("attempt-1")?,
-            route: a.route.clone(),
-            session: a.session.clone(),
-            output: None,
-            completed_event_seen: false,
-            cancelled: false,
-            unknown_reason: None,
+            route: attached.route.clone(),
+            session: attached.session.clone(),
+            output: output.map(str::to_owned),
+            completed_event_seen,
+            cancelled,
+            unknown_reason: unknown_reason.map(str::to_owned),
             usage: UsageReceipt {
                 input_tokens: None,
                 output_tokens: None,
@@ -1011,10 +1013,31 @@ mod tests {
             terminal_at: None,
             continuation: None,
             proposed_effects: Vec::new(),
-        };
-        let result = translate_result(input, &a.authority.effect_ceiling)?;
-        assert_eq!(result.disposition, ResultDisposition::UnknownOutcome);
-        assert!(result.unknown_reason.is_some());
+        })
+    }
+
+    #[test]
+    fn provider_success_stays_candidate_and_terminal_mappings_are_preserved() -> TestResult {
+        let a = attached()?;
+        let success = translate_result(
+            result_input(&a, Some("provider output"), true, false, None)?,
+            &a.authority.effect_ceiling,
+        )?;
+        assert_eq!(success.disposition, ResultDisposition::Partial);
+        assert_ne!(success.disposition, ResultDisposition::VerifiedComplete);
+
+        let cancelled = translate_result(
+            result_input(&a, Some("provider output"), true, true, None)?,
+            &a.authority.effect_ceiling,
+        )?;
+        assert_eq!(cancelled.disposition, ResultDisposition::Cancelled);
+
+        let unknown = translate_result(
+            result_input(&a, None, false, false, None)?,
+            &a.authority.effect_ceiling,
+        )?;
+        assert_eq!(unknown.disposition, ResultDisposition::UnknownOutcome);
+        assert!(unknown.unknown_reason.is_some());
         Ok(())
     }
 
