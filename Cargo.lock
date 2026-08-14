@@ -669,6 +669,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "eliot-skills"
+version = "0.1.0"
+dependencies = [
+ "eliot-evidence",
+ "eliot-receipts",
+ "eliot-rules",
+ "schemars",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror",
+]
+
+[[package]]
 name = "eliot-source-assurance"
 version = "0.1.0"
 dependencies = [

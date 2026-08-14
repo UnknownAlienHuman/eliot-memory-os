@@ -1,39 +1,22 @@
 [package]
 name = "eliot-skills"
-version = "0.1.0"
-edition = "2024"
-rust-version = "1.89"
-license = "MIT"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
 description = "Fail-closed generated Skill and host-package surface contracts"
 
 [dependencies]
-eliot-evidence = { path = "../../foundation/eliot-evidence", version = "0.1.0" }
-eliot-receipts = { path = "../../foundation/eliot-receipts", version = "0.1.0" }
-eliot-rules = { path = "../../foundation/eliot-rules", version = "0.1.0" }
-schemars = { version = "1.2.1", features = ["derive"] }
-serde = { version = "1.0.228", features = ["derive"] }
-sha2 = "0.10.9"
-thiserror = "2.0.18"
+eliot-evidence.workspace = true
+eliot-receipts.workspace = true
+eliot-rules.workspace = true
+schemars.workspace = true
+serde.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
 
 [dev-dependencies]
-serde_json = { version = "1.0.150", features = ["float_roundtrip"] }
+serde_json.workspace = true
 
-[workspace]
-resolver = "3"
-
-[lints.rust]
-unsafe_code = "forbid"
-
-[lints.clippy]
-all = { level = "warn", priority = -1 }
-pedantic = { level = "warn", priority = -1 }
-dbg_macro = "warn"
-expect_used = "warn"
-missing_errors_doc = "allow"
-missing_panics_doc = "allow"
-module_name_repetitions = "allow"
-must_use_candidate = "allow"
-print_stderr = "warn"
-print_stdout = "warn"
-todo = "warn"
-unwrap_used = "warn"
+[lints]
+workspace = true
