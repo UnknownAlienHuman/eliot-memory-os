@@ -99,6 +99,21 @@ Remaining authority blockers:
 
 Resume condition: complete the Kernel and cross-record identities, make clean-marker invalidation exhaustive, bind reconciliation identities to Host epoch, and add the exact corruption/torn/flush/sync recovery corpus. Then rerun the independent P-05 gate.
 
+### P-06 — Operational Recovery State
+
+Closed portions: the second candidate replaces the in-memory mock with one redb coordinator, atomic multi-scope staging, lineage-aware epochs, opaque recovery envelopes, restart reconciliation, duplicate/conflict handling and exact direct provider edges. Six tests and mechanical gates pass.
+
+Remaining recovery blockers:
+
+- Release/expiry deletes a reserved sequence without a canonical disposition or `SequenceGap`, then allows later successors although the canonical ordering head cannot advance across the missing position.
+- Receipt reconciliation accepts generic/partial receipts, lacks exact canonical operation/idempotency binding and incorrectly requires every per-scope head hash to equal one receipt-envelope hash.
+- Recovery pages are output-limited but first scan/materialize the entire reservation set; startup likewise loads all interrupted records, so work and memory are not bounded by the cursor limit.
+- The persisted envelope read path deserializes without semantic `validate`, permitting integrity/version/length/fence/expiry tampering through the only read API.
+- Retention metadata is stored but terminal reconciliation/release/expiry never deletes, archives or schedules bounded cleanup of resolved payloads.
+- Commit ambiguity remains a generic storage string with no crash/fault corpus, and package metadata declares the wrong source layer.
+
+Resume condition: preserve every sequence through canonical gap disposition, bind only exact canonical committed receipts and distinct per-scope heads, make scans/startup truly cursor-bounded, validate persisted bytes on every read, implement terminal retention cleanup and add commit/tamper/concurrency/scale/property fixtures.
+
 ### P-02 — concrete Windows platform adapter
 
 Closed portions: the second candidate exposes typed Windows capability surfaces and its 15 package tests plus mechanical gates pass.
