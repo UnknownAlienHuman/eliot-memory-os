@@ -196,10 +196,28 @@ Remaining authority blockers:
 
 Resume condition: make a provider-issued canonical permit the only executable start capability, remove or seal the raw route, consume one provider-owned fence/revision/lease model, require physical identity before resume/receipt and expose only fail-closed decode paths. Then rerun A-03/A-05 against the unchanged P-03 boundary.
 
+## Active first-gate blockers
+
+### S-03 — SurrealDB canonical-store adapter
+
+Mechanical proof is green: format, check, six unit tests and strict clippy pass. The generated standalone `Cargo.lock` was removed after verification.
+
+The first independent gate rejects terminal acceptance:
+
+- The package explicitly contains no SurrealDB SDK/client, credentials, schema, named parameterized operation implementation or live readiness path. Its own `PLAN_GAP.md` therefore contradicts the cell's required `ADAPTER + real SurrealDB compatibility/crash tests` proof rather than satisfying it.
+- `MigrationGate::Ready` trusts a caller-supplied free-form schema revision. It is not bound to the exact MIG-02 migration receipt, immutable migration checksum, schema snapshot, compatibility decision, migration capability or active provider generation.
+- The transport transaction carries only the incomplete prepared-transition projection and does not prove the complete atomic event/projection/relation/revision/receipt/outbox transaction required by S-01/I5.19.
+- Receipt, revision-head and ordering-head responses are not bound back to the exact requested identity/set and several are returned without validation, uniqueness or completeness checks.
+- The provider-neutral trait collapses unknown and partial write outcomes to `StoreError::Unavailable`, losing the required reconcile-before-replay distinction for normal `CanonicalStoreClient` callers.
+- Health manufactures an operation-manifest digest from the free-form schema revision and marks the store ready from reachability plus that string; it does not prove protocol, contract catalogue, schema generation or named-operation compatibility.
+- The crate is an isolated nested workspace and has no root-workspace integration proof. Its six tests do not exercise real RPC, named reads, migrations, transaction/idempotency, crash/restart, unknown-commit reconciliation, backup/restore or compatibility fixtures.
+
+Repair condition for the one remaining bounded cycle: implement the real sealed S-03 provider boundary behind versioned named parameterized operations, bind MIG-02 and active provider generation exactly, preserve typed unknown/partial recovery, validate every response against the request, and add real isolated compatibility/crash/restart fixtures without exposing vendor types or raw query strings.
+
 ## Work continuing independently
 
 - Independent candidate gates continue for bounded governor/security/store/surface repairs.
-- Candidate reviews pending: G-02, G-08, G-09, Q-01, A-10, A-13, P-02 platform/IPC, S-03.
+- Candidate reviews pending: A-10, A-13, P-02 IPC and one bounded S-03 repair cycle.
 - Accepted and integrated source in this pass: G-17 budget/quota state machine (`a774a01`, workspace integration `763f7e2`) and the supervisor deadline fixture (`7a18ece`).
 
 No paused item may be promoted from package-local green tests alone. Each requires its stated prerequisite, an independent semantic gate, root workspace integration, and the normal workspace verifier.
