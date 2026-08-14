@@ -293,6 +293,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "eliot-agent-contracts"
+version = "0.1.0"
+dependencies = [
+ "eliot-contracts",
+ "schemars",
+ "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
 name = "eliot-agent-opencode"
 version = "0.1.0"
 dependencies = [
