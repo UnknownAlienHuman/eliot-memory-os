@@ -295,6 +295,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "eliot-runtime-compiler"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "serde",
+ "serde_json",
+ "sha2",
+]
+
+[[package]]
 name = "eliot-store"
 version = "0.1.0"
 dependencies = [
