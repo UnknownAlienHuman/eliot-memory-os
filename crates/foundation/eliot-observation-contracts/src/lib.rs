@@ -1034,7 +1034,12 @@ mod tests {
             "unexpected": true
         });
         assert!(serde_json::from_value::<ObservationRecordEnvelope>(malformed).is_err());
-        assert!(!serde_json::to_vec(&schemars::schema_for!(ActiveObservationPlan))?.is_empty());
+        let schema_bytes = serde_json::to_vec(&schemars::schema_for!(ActiveObservationPlan))
+            .map_err(|_| ObservationError::InvalidField {
+                field: "active_observation_plan.schema",
+                reason: "schema serialization failed",
+            })?;
+        assert!(!schema_bytes.is_empty());
         assert!(!contract_identity()?.shape_sha256.is_empty());
         Ok(())
     }
