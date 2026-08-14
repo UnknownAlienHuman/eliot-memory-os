@@ -168,6 +168,34 @@ Remaining authority blockers:
 
 Resume condition: bind active/context/candidate to one provider-observed identity and exact CAS head, make snapshot identity content-stable, reject every non-applicable outcome, and use authenticated approval/pre-authorization/origin receipts with adversarial cross-machine and replay tests.
 
+### C0-06 — non-fresh agent handoff contract
+
+Closed portions: the second contract adds source event/outbox cursor envelopes, in-flight operation/effect dispositions, source fence/epoch, omission/replay/rehydration fields, target routing and complete-versus-partial validation; 15 contract tests and current consumers compile.
+
+Remaining authority blockers:
+
+- Event/outbox/replay cursors remain opaque strings with no ordering/monotonicity or replay-within-source bound.
+- The target attempt is not cryptographically bound to the exact route fingerprint and post-resume revalidation receipt.
+- Nested `PublicReference` digests accept arbitrary nonblank text instead of canonical lowercase SHA-256.
+- Derived serde accepts duplicate/cross-fence/target-invalid semantic payloads unless every caller remembers to invoke `.validate()`.
+
+Resume condition: introduce typed ordered cursor coordinates and bounds, seal target route/receipt identity, make all referenced digests canonical and provide a fail-closed semantic decode path that consumers cannot bypass. Then rerun the unchanged A-01 continuity gate.
+
+### P-03 — provider-neutral process dispatch contract
+
+Closed portions: the second candidate declares the exact C0-04/C0-05/P-01 Cargo edges and models executable/artifact/argv/environment/resource/effect identities, dispatch permits, pre-resume checks, physical process identity and replay conflict with 17 passing local tests.
+
+Remaining authority blockers:
+
+- It defines a second locally constructible AuthorityEpoch/StateFence/revision/lease model instead of consuming provider-owned canonical authority.
+- `DispatchPermit::issue` is public and caller-fabricable; it is not a Kernel-issued capability.
+- The original raw `ProcessExecutor::start(ProcessRequest, sink)` route remains public and is still used by Codex/ACP, bypassing the permit entirely.
+- Physical image/Job/creation identity remains optional on raw process state/receipt paths, so PID/image reuse is not universally fail closed.
+- Several public serde surfaces accept malformed/duplicate arrays unless callers voluntarily invoke constructors/validators.
+- The candidate lock projection was not updated and strict clippy still reports a documentation lint, though these are secondary to the authority bypass.
+
+Resume condition: make a provider-issued canonical permit the only executable start capability, remove or seal the raw route, consume one provider-owned fence/revision/lease model, require physical identity before resume/receipt and expose only fail-closed decode paths. Then rerun A-03/A-05 against the unchanged P-03 boundary.
+
 ## Work continuing independently
 
 - Independent candidate gates continue for bounded governor/security/store/surface repairs.
