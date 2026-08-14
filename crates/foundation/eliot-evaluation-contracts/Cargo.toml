@@ -1,0 +1,20 @@
+[package]
+name = "eliot-evaluation-contracts"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "ELIOT outcome, recovery, spine-proof, evaluation and budget contracts"
+
+[dependencies]
+eliot-contracts = { workspace = true }
+eliot-receipts = { path = "../eliot-receipts", version = "0.1.0" }
+eliot-instrument-api = { path = "../../instrument/eliot-instrument-api", version = "0.1.0" }
+eliot-graph-api = { path = "../../instrument/eliot-graph-api", version = "0.1.0" }
+schemars = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+
+[lints]
+workspace = true

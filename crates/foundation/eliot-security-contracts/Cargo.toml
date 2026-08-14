@@ -1,0 +1,19 @@
+[package]
+name = "eliot-security-contracts"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "ELIOT source assurance, disclosure, influence, erasure and selection contracts"
+
+[dependencies]
+eliot-contracts.workspace = true
+eliot-evidence.workspace = true
+eliot-receipts = { path = "../eliot-receipts", version = "0.1.0" }
+schemars.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true
