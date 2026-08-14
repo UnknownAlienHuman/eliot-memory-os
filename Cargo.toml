@@ -5,7 +5,10 @@ members = [
   "crates/eliot-store",
   "crates/eliot-types",
   "crates/eliot-windows-ipc",
+  "crates/agent/eliot-agent-api",
   "crates/agent/eliot-agent-opencode",
+  "crates/kernel/eliot-process",
+  "crates/security/eliot-source-assurance",
   "workspace/tools/eliot-runtime-compiler",
   "workspace/tools/eliot-campaign-executor",
 ]
@@ -22,11 +25,14 @@ anyhow = "1.0.102"
 base64 = "0.22.1"
 blake3 = "1.8.5"
 clap = { version = "4.6.1", features = ["derive", "env"] }
+eliot-agent-api = { path = "crates/agent/eliot-agent-api", version = "0.1.0" }
 eliot-engine = { path = "crates/eliot-engine", version = "0.1.0" }
 eliot-store = { path = "crates/eliot-store", version = "0.1.0" }
 eliot-types = { path = "crates/eliot-types", version = "0.1.0" }
 eliot-windows-ipc = { path = "crates/eliot-windows-ipc", version = "0.1.0" }
 eliot-agent-opencode = { path = "crates/agent/eliot-agent-opencode", version = "0.1.0" }
+eliot-process = { path = "crates/kernel/eliot-process", version = "0.1.0" }
+eliot-source-assurance = { path = "crates/security/eliot-source-assurance", version = "0.1.0" }
 futures-util = { version = "0.3.32", features = ["sink"] }
 jsonc-parser = { version = "0.33.0", features = ["cst", "serde_json"] }
 redb = "4.1.0"
