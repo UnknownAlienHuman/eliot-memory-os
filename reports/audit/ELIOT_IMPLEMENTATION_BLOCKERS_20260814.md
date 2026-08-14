@@ -56,9 +56,50 @@ Remaining blockers:
 
 Resume condition: construct the cleanup token before spawn and capture it into the future so never-polled abort drops it; add ordinary and supervised regressions; preserve a typed platform failure instead of collapsing it to saturation. Then rerun the independent stress gate.
 
+### A-12 — WASM component runtime facade
+
+Closed portions: the second candidate provides the sealed provider edge set, fail-closed basic IDs/digests, canonical generation/work/lease/fence projections, an injected component-engine port, bounded execution dispositions and honest typed unavailability when no engine/process binding exists. Its package gates pass with 13 tests.
+
+Remaining authority blockers:
+
+- The engine invocation omits exact WIT world/version, state-contract digest, imports/exports and verifier identity, so the engine boundary is not sealed to the claimed component contract.
+- Differential evidence compares adapter-reported digests instead of independently deriving result/effect/state digests from observed execution.
+- Shadow/canary/rollback/cutover evidence is accepted as non-empty caller strings rather than exact generation/epoch/receipt-bound proof.
+- Owner and lifecycle revisions are not coupled to a canonical owner/lease receipt; terminal cancellation may overwrite a completed result, and an unresolved post-commit cancel is incorrectly classified as `CANCELLED`.
+- The accepted P-03 start receipt/image identity is not retained in the A-12 receipt, and exact-array serde silently deduplicates duplicates.
+
+Resume condition: publish the complete component/engine identity and receipt bindings, derive differential proof from observed artifacts, bind promotion to exact receipts, make terminal replay immutable, preserve post-commit unknown, and add duplicate-array/adversarial adapter regressions. Then rerun an independent gate without changing the Runtime oracle.
+
+### P-05 — HostStateJournal
+
+Closed portions: the second candidate provides explicit lineage-aware epochs, typed activation/kernel/dependency/wake/drain records, legal local lifecycle matrices, a prepared transaction backend, stable unknown transaction identities and 17 passing package tests with the exact direct provider set.
+
+Remaining authority blockers:
+
+- The required torn-frame, checksum/corruption, unknown-version, flush-unknown and sync-unknown recovery fixtures are absent.
+- `KernelRecord` omits the approved artifact hash and active/candidate pipe identity, and permits `ACTIVE` without mandatory process identity/readiness proof.
+- Kernel activation is not bound to the current Eliot activation; drain/wake/dependency records share a fence but lack the required cross-record identity, and draining/clean stop can omit `drain_generation`.
+- Observation/epoch-retirement appends do not invalidate the clean marker, leaving a stale clean-shutdown claim after later journal activity.
+- Reconciliation accepts an arbitrary transaction identity without binding it to the current Host epoch.
+
+Resume condition: complete the Kernel and cross-record identities, make clean-marker invalidation exhaustive, bind reconciliation identities to Host epoch, and add the exact corruption/torn/flush/sync recovery corpus. Then rerun the independent P-05 gate.
+
+### S-04 — blob API and store
+
+Closed portions: the second candidate separates provider-neutral API and filesystem implementation, injects platform/codec/key/AEAD/live-set ports, validates basic identities, models staged publication/recovery and key rotation, and passes 5 API plus 9 implementation tests.
+
+Remaining authority blockers:
+
+- A missing key provider is translated to typed `PLAN_GAP` during stage but leaks raw `ProviderUnavailable` during read and verification.
+- Tombstone payload/metadata paths are containment-checked but are not proven to be the canonical paths derived from the tombstone locator, so a corrupted tombstone can delete unrelated in-root files.
+- Recovery journal temp/final paths are not canonically derived from operation identity and metadata locator before publication.
+- Exact operation replay compares locator/policy/plaintext identity but omits the stored request and authority bindings.
+
+Resume condition: make provider-unavailable translation uniform, bind tombstone and journal paths to canonical locator/operation derivation, and require exact request/authority identity on replay with adversarial recovery fixtures. Then rerun the independent S-04 gate.
+
 ## Work continuing independently
 
-- Native Sol repairs: P-05 HostStateJournal, S-04 blob store, A-12 WASM facade.
+- Independent candidate gates continue for bounded governor/security/store/surface repairs.
 - Candidate reviews pending: G-02, G-08, G-09, Q-01, A-10, A-13, P-02 platform/IPC, S-03.
 - Accepted and integrated source in this pass: G-17 budget/quota state machine (`a774a01`, workspace integration `763f7e2`) and the supervisor deadline fixture (`7a18ece`).
 
