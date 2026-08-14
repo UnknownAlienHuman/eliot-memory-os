@@ -7,11 +7,14 @@ license.workspace = true
 description = "Deterministic in-memory reference implementation for the ELIOT store contracts"
 
 [dependencies]
-eliot-store-api = { path = "../eliot-store-api", version = "0.1.0" }
+eliot-store-api = { workspace = true }
 serde.workspace = true
 serde_json.workspace = true
 schemars.workspace = true
 thiserror.workspace = true
+
+[dev-dependencies]
+eliot-contracts = { workspace = true }
 
 [lints]
 workspace = true

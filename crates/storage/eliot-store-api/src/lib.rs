@@ -213,12 +213,11 @@ impl NamedMutationOperation {
     /// Transition family owned by this named mutation.
     pub const fn transition_class(self) -> TransitionClass {
         match self {
-            Self::CaptureObservation => TransitionClass::CaptureCandidate,
+            Self::CaptureObservation | Self::AppendAuditEvent => TransitionClass::CaptureCandidate,
             Self::ApplyEpistemicRevision => TransitionClass::Epistemic,
             Self::UpdateTaskState => TransitionClass::TaskControl,
             Self::ApplyLifecyclePolicy => TransitionClass::LifecyclePolicy,
             Self::ReconcileRecovery => TransitionClass::RecoverySchema,
-            Self::AppendAuditEvent => TransitionClass::CaptureCandidate,
         }
     }
 }
@@ -412,10 +411,10 @@ impl ScopeRevisionView {
 }
 
 fn ensure_same_fence(left: &StateFence, right: &StateFence) -> Result<(), StoreError> {
-    if left != right {
-        Err(StoreError::FenceMismatch)
-    } else {
+    if left == right {
         Ok(())
+    } else {
+        Err(StoreError::FenceMismatch)
     }
 }
 

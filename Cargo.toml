@@ -22,7 +22,10 @@ members = [
   "crates/foundation/eliot-security-contracts",
   "crates/foundation/eliot-test-support",
   "crates/governor/eliot-config",
+  "crates/governor/eliot-problem",
   "crates/governor/eliot-workscope",
+  "crates/storage/eliot-store-api",
+  "crates/storage/eliot-store-memory",
   "crates/instrument/eliot-graph-api",
   "crates/instrument/eliot-instrument-api",
   "crates/kernel/eliot-process",
@@ -64,7 +67,10 @@ eliot-runtime-contracts = { path = "crates/foundation/eliot-runtime-contracts", 
 eliot-security-contracts = { path = "crates/foundation/eliot-security-contracts", version = "0.1.0" }
 eliot-test-support = { path = "crates/foundation/eliot-test-support", version = "0.1.0" }
 eliot-config = { path = "crates/governor/eliot-config", version = "0.1.0" }
+eliot-problem = { path = "crates/governor/eliot-problem", version = "0.1.0" }
 eliot-workscope = { path = "crates/governor/eliot-workscope", version = "0.1.0" }
+eliot-store-api = { path = "crates/storage/eliot-store-api", version = "0.1.0" }
+eliot-store-memory = { path = "crates/storage/eliot-store-memory", version = "0.1.0" }
 eliot-graph-api = { path = "crates/instrument/eliot-graph-api", version = "0.1.0" }
 eliot-instrument-api = { path = "crates/instrument/eliot-instrument-api", version = "0.1.0" }
 eliot-process = { path = "crates/kernel/eliot-process", version = "0.1.0" }

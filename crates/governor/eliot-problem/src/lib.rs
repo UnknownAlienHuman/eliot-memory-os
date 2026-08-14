@@ -417,7 +417,7 @@ impl Problem {
         if !self.state.can_transition_to(next) {
             return Err(ProblemError::IllegalTransition {
                 from: format!("{:?}", self.state),
-                to: format!("{:?}", next),
+                to: format!("{next:?}"),
             });
         }
         self.state = next;
@@ -828,7 +828,7 @@ impl ConciliumRun {
         if !legal {
             return Err(ProblemError::IllegalTransition {
                 from: format!("{:?}", self.stage),
-                to: format!("{:?}", next),
+                to: format!("{next:?}"),
             });
         }
         self.stage = next;

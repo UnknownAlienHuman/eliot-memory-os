@@ -6,7 +6,7 @@
 #![forbid(unsafe_code)]
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::{Mutex, MutexGuard};
+use std::sync::{Mutex, MutexGuard, TryLockError};
 
 use eliot_store_api::{
     CanonicalStoreClient, CommitId, EventId, EventProjectionRelationIntents, NamedReadOperation,
@@ -30,9 +30,9 @@ pub struct MemoryStore {
 
 impl Clone for MemoryStore {
     fn clone(&self) -> Self {
-        let state = match self.lock_state() {
+        let state = match self.state.lock() {
             Ok(guard) => guard.clone(),
-            Err(_) => MemoryState::default(),
+            Err(poisoned) => poisoned.into_inner().clone(),
         };
         Self {
             state: Mutex::new(state),
@@ -54,7 +54,7 @@ impl MemoryStore {
         }
     }
 
-    /// Registers a manifest for optional strict admission checking.
+    /// Registers a manifest for strict admission checking.
     pub fn register_manifest(
         &self,
         manifest: eliot_store_api::NamedOperationManifest,
@@ -72,205 +72,288 @@ impl MemoryStore {
         &self,
         ctx: &RequestMeta,
         transition: PreparedTransition,
-        expected_revision_heads: Vec<RevisionHeadExpectation>,
-        expected_ordering_heads: Vec<OrderingHeadExpectation>,
+        expected_revision_heads: &[RevisionHeadExpectation],
+        expected_ordering_heads: &[OrderingHeadExpectation],
     ) -> Result<WriteReceipt, StoreError> {
-        ctx.validate().map_err(StoreError::Foundation)?;
-        transition.validate()?;
-        if ctx.state_fence != transition.state_fence {
-            return Err(StoreError::FenceMismatch);
-        }
-
-        let canonical_hash = transition.identity.canonical_request_hash.clone();
+        validate_transaction(ctx, &transition)?;
         let operation_key = transition.identity.operation_id.to_string();
-        let idempotency_key = transition.identity.idempotency_key.clone();
         let mut state = self.lock_state()?;
-
-        if let Some(receipt) = state.receipts_by_operation.get(&operation_key) {
-            if receipt.idempotency_key == idempotency_key
-                && receipt.canonical_request_hash == canonical_hash
-            {
-                return Ok(receipt.clone());
-            }
-            return Err(StoreError::IdentityConflict);
-        }
-        if let Some((existing_hash, existing_operation)) =
-            state.receipts_by_idempotency.get(&idempotency_key)
+        let canonical_hash = transition.identity.canonical_request_hash.clone();
+        let idempotency_key = transition.identity.idempotency_key.clone();
+        if let Some(receipt) =
+            existing_receipt(&state, &operation_key, &idempotency_key, &canonical_hash)?
         {
-            if existing_hash == &canonical_hash && existing_operation == &operation_key {
-                if let Some(receipt) = state.receipts_by_operation.get(existing_operation) {
-                    return Ok(receipt.clone());
-                }
-            }
-            return Err(StoreError::IdentityConflict);
+            return Ok(receipt);
         }
-
-        if let Some(existing_fence) = &state.fences {
-            if existing_fence != &transition.state_fence {
-                return Err(StoreError::FenceMismatch);
-            }
-        }
-
-        validate_expected_revisions(&state, &transition.state_fence, &expected_revision_heads)?;
-        validate_expected_ordering(&state, &transition.state_fence, &expected_ordering_heads)?;
-        if let Some(manifest) = state
-            .manifests
-            .get(transition.operation_manifest_digest.as_str())
-        {
-            transition.validate_against_manifest(manifest)?;
-        }
-
-        let revision_keys = revision_keys(&transition)?;
-        let mut revision_before_after = Vec::with_capacity(revision_keys.len());
-        let mut next_revision_heads = Vec::with_capacity(revision_keys.len());
-        for key in revision_keys {
-            let before = state
-                .revision_heads
-                .get(key.as_str())
-                .map_or(1, |head| head.revision);
-            let after = before.saturating_add(1);
-            if after == 0 {
-                return Err(StoreError::InvalidField {
-                    field: "revision",
-                    reason: "revision overflow",
-                });
-            }
-            revision_before_after.push(RevisionDelta {
-                key: key.clone(),
-                before,
-                after,
-            });
-            next_revision_heads.push(RevisionHead {
-                key,
-                revision: after,
-                state_fence: transition.state_fence.clone(),
-            });
-        }
-
-        let mut next_ordering_heads = Vec::with_capacity(transition.ordering_scopes.len());
-        for scope in transition.ordering_scopes.clone() {
-            let before = state
-                .ordering_heads
-                .get(scope.as_str())
-                .map_or(1, |head| head.sequence);
-            let sequence = before.saturating_add(1);
-            if sequence == 0 {
-                return Err(StoreError::InvalidField {
-                    field: "ordering.sequence",
-                    reason: "sequence overflow",
-                });
-            }
-            next_ordering_heads.push(OrderingHead {
-                scope,
-                sequence,
-                state_fence: transition.state_fence.clone(),
-            });
-        }
-
-        let commit_id = CommitId::new(format!("commit-{operation_key}"))?;
-        let event_ids = event_ids(
-            &transition.event_projection_relation_intents,
-            &operation_key,
-        )?;
-        let command_ids = transition
-            .named_operations
-            .iter()
-            .enumerate()
-            .map(|(index, _)| format!("command-{operation_key}-{index}"))
-            .collect::<Vec<_>>();
-        let payload_digest = sha256_hex(
-            &canonical_json_bytes(&transition)
-                .map_err(|error| StoreError::Serialization(error.to_string()))?,
-        );
-        let projection_records = projection_records(
+        validate_transaction_state(
+            &state,
             &transition,
-            &operation_key,
-            &commit_id,
-            &next_revision_heads,
+            expected_revision_heads,
+            expected_ordering_heads,
         )?;
-        let (outbox_records, next_outbox_sequence) = outbox_records(
+        let plan = transaction_plan(&state, &transition, &operation_key)?;
+        let receipt = transaction_receipt(
             &transition,
-            &operation_key,
-            &event_ids,
-            &payload_digest,
-            state.next_outbox_sequence,
-        )?;
-
-        let receipt = WriteReceipt {
-            operation_id: transition.identity.operation_id.clone(),
             idempotency_key,
-            canonical_request_hash: canonical_hash,
-            transition_class: transition.transition_class,
-            status: WriteReceiptStatus::Committed,
-            commit_id: Some(commit_id),
-            state_fence: transition.state_fence.clone(),
-            ordering_sequences: next_ordering_heads.clone(),
-            revision_before_after,
-            applied_command_ids: command_ids,
-            emitted_event_ids: event_ids,
-            projection_refs: projection_records
-                .iter()
-                .map(|record| record.publication_id.clone())
-                .collect(),
-            outbox_refs: outbox_records
-                .iter()
-                .map(|record| record.outbox_id.clone())
-                .collect(),
-            operation_manifest_digest: transition.operation_manifest_digest.clone(),
-            error_code: None,
-            resubmission: Resubmission::None,
-            committed_at: Some(format!(
-                "commit-sequence-{:016}",
-                state.next_commit_sequence
-            )),
-            envelope: None,
-        };
-        receipt.validate()?;
+            canonical_hash,
+            &plan,
+            state.next_commit_sequence,
+        )?;
+        Ok(commit_transaction(
+            &mut state,
+            transition,
+            operation_key,
+            plan,
+            receipt,
+        ))
+    }
+}
 
-        for head in next_revision_heads {
-            state
-                .revision_heads
-                .insert(head.key.as_str().to_owned(), head);
+fn validate_transaction(
+    ctx: &RequestMeta,
+    transition: &PreparedTransition,
+) -> Result<(), StoreError> {
+    ctx.validate().map_err(StoreError::Foundation)?;
+    transition.validate()?;
+    if ctx.state_fence != transition.state_fence {
+        return Err(StoreError::FenceMismatch);
+    }
+    Ok(())
+}
+
+fn existing_receipt(
+    state: &MemoryState,
+    operation_key: &str,
+    idempotency_key: &str,
+    canonical_hash: &str,
+) -> Result<Option<WriteReceipt>, StoreError> {
+    if let Some(receipt) = state.receipts_by_operation.get(operation_key) {
+        if receipt.idempotency_key == idempotency_key
+            && receipt.canonical_request_hash == canonical_hash
+        {
+            return Ok(Some(receipt.clone()));
         }
-        for head in next_ordering_heads {
-            state
-                .ordering_heads
-                .insert(head.scope.as_str().to_owned(), head);
+        return Err(StoreError::IdentityConflict);
+    }
+    if let Some((existing_hash, existing_operation)) =
+        state.receipts_by_idempotency.get(idempotency_key)
+    {
+        if existing_hash == canonical_hash
+            && existing_operation == operation_key
+            && let Some(receipt) = state.receipts_by_operation.get(existing_operation)
+        {
+            return Ok(Some(receipt.clone()));
         }
-        state.next_commit_sequence = state.next_commit_sequence.saturating_add(1);
-        state.next_outbox_sequence = next_outbox_sequence;
-        state
-            .fences
-            .get_or_insert_with(|| transition.state_fence.clone());
-        for record in projection_records {
-            state
-                .projections
-                .insert(record.publication_id.as_str().to_owned(), record);
-        }
-        for record in outbox_records {
-            state
-                .outbox
-                .insert(record.outbox_id.as_str().to_owned(), record);
-        }
-        state
-            .relations
-            .extend(transition.event_projection_relation_intents.relation_kinds);
-        state
-            .named_operations
-            .extend(transition.named_operations.clone());
-        state.receipts_by_idempotency.insert(
-            receipt.idempotency_key.clone(),
-            (
-                receipt.canonical_request_hash.clone(),
-                operation_key.clone(),
-            ),
-        );
-        state
-            .receipts_by_operation
-            .insert(operation_key, receipt.clone());
-        Ok(receipt)
+        return Err(StoreError::IdentityConflict);
+    }
+    Ok(None)
+}
+
+fn validate_transaction_state(
+    state: &MemoryState,
+    transition: &PreparedTransition,
+    expected_revision_heads: &[RevisionHeadExpectation],
+    expected_ordering_heads: &[OrderingHeadExpectation],
+) -> Result<(), StoreError> {
+    if let Some(existing_fence) = &state.fences
+        && existing_fence != &transition.state_fence
+    {
+        return Err(StoreError::FenceMismatch);
+    }
+    validate_expected_revisions(state, &transition.state_fence, expected_revision_heads)?;
+    validate_expected_ordering(state, &transition.state_fence, expected_ordering_heads)?;
+    let manifest = state
+        .manifests
+        .get(transition.operation_manifest_digest.as_str())
+        .ok_or(StoreError::ManifestMismatch)?;
+    transition.validate_against_manifest(manifest)?;
+    Ok(())
+}
+
+struct TransactionPlan {
+    revision_before_after: Vec<RevisionDelta>,
+    next_revision_heads: Vec<RevisionHead>,
+    next_ordering_heads: Vec<OrderingHead>,
+    commit_id: CommitId,
+    event_ids: Vec<EventId>,
+    command_ids: Vec<String>,
+    projection_records: Vec<ProjectionPublicationRecord>,
+    outbox_records: Vec<OutboxIntent>,
+    next_commit_sequence: u64,
+    next_outbox_sequence: u64,
+}
+
+fn transaction_plan(
+    state: &MemoryState,
+    transition: &PreparedTransition,
+    operation_key: &str,
+) -> Result<TransactionPlan, StoreError> {
+    let next_commit_sequence = checked_increment(
+        state.next_commit_sequence,
+        "commit.sequence",
+        "sequence overflow",
+    )?;
+    let revision_keys = revision_keys(transition)?;
+    let mut revision_before_after = Vec::with_capacity(revision_keys.len());
+    let mut next_revision_heads = Vec::with_capacity(revision_keys.len());
+    for key in revision_keys {
+        let before = state
+            .revision_heads
+            .get(key.as_str())
+            .map_or(1, |head| head.revision);
+        let after = checked_increment(before, "revision", "revision overflow")?;
+        revision_before_after.push(RevisionDelta {
+            key: key.clone(),
+            before,
+            after,
+        });
+        next_revision_heads.push(RevisionHead {
+            key,
+            revision: after,
+            state_fence: transition.state_fence.clone(),
+        });
     }
 
+    let mut next_ordering_heads = Vec::with_capacity(transition.ordering_scopes.len());
+    for scope in transition.ordering_scopes.iter().cloned() {
+        let before = state
+            .ordering_heads
+            .get(scope.as_str())
+            .map_or(1, |head| head.sequence);
+        let sequence = checked_increment(before, "ordering.sequence", "sequence overflow")?;
+        next_ordering_heads.push(OrderingHead {
+            scope,
+            sequence,
+            state_fence: transition.state_fence.clone(),
+        });
+    }
+
+    let commit_id = CommitId::new(format!("commit-{operation_key}"))?;
+    let event_ids = event_ids(&transition.event_projection_relation_intents, operation_key)?;
+    let command_ids = transition
+        .named_operations
+        .iter()
+        .enumerate()
+        .map(|(index, _)| format!("command-{operation_key}-{index}"))
+        .collect::<Vec<_>>();
+    let payload_digest = sha256_hex(
+        &canonical_json_bytes(&transition)
+            .map_err(|error| StoreError::Serialization(error.to_string()))?,
+    );
+    let projection_records =
+        projection_records(transition, operation_key, &commit_id, &next_revision_heads)?;
+    let (outbox_records, next_outbox_sequence) = outbox_records(
+        transition,
+        operation_key,
+        &event_ids,
+        &payload_digest,
+        state.next_outbox_sequence,
+    )?;
+    Ok(TransactionPlan {
+        revision_before_after,
+        next_revision_heads,
+        next_ordering_heads,
+        commit_id,
+        event_ids,
+        command_ids,
+        projection_records,
+        outbox_records,
+        next_commit_sequence,
+        next_outbox_sequence,
+    })
+}
+
+fn transaction_receipt(
+    transition: &PreparedTransition,
+    idempotency_key: String,
+    canonical_hash: String,
+    plan: &TransactionPlan,
+    commit_sequence: u64,
+) -> Result<WriteReceipt, StoreError> {
+    let receipt = WriteReceipt {
+        operation_id: transition.identity.operation_id.clone(),
+        idempotency_key,
+        canonical_request_hash: canonical_hash,
+        transition_class: transition.transition_class,
+        status: WriteReceiptStatus::Committed,
+        commit_id: Some(plan.commit_id.clone()),
+        state_fence: transition.state_fence.clone(),
+        ordering_sequences: plan.next_ordering_heads.clone(),
+        revision_before_after: plan.revision_before_after.clone(),
+        applied_command_ids: plan.command_ids.clone(),
+        emitted_event_ids: plan.event_ids.clone(),
+        projection_refs: plan
+            .projection_records
+            .iter()
+            .map(|record| record.publication_id.clone())
+            .collect(),
+        outbox_refs: plan
+            .outbox_records
+            .iter()
+            .map(|record| record.outbox_id.clone())
+            .collect(),
+        operation_manifest_digest: transition.operation_manifest_digest.clone(),
+        error_code: None,
+        resubmission: Resubmission::None,
+        committed_at: Some(format!("commit-sequence-{commit_sequence:016}")),
+        envelope: None,
+    };
+    receipt.validate()?;
+    Ok(receipt)
+}
+
+fn commit_transaction(
+    state: &mut MemoryState,
+    transition: PreparedTransition,
+    operation_key: String,
+    plan: TransactionPlan,
+    receipt: WriteReceipt,
+) -> WriteReceipt {
+    for head in plan.next_revision_heads {
+        state
+            .revision_heads
+            .insert(head.key.as_str().to_owned(), head);
+    }
+    for head in plan.next_ordering_heads {
+        state
+            .ordering_heads
+            .insert(head.scope.as_str().to_owned(), head);
+    }
+    state.next_commit_sequence = plan.next_commit_sequence;
+    state.next_outbox_sequence = plan.next_outbox_sequence;
+    state
+        .fences
+        .get_or_insert_with(|| transition.state_fence.clone());
+    for record in plan.projection_records {
+        state
+            .projections
+            .insert(record.publication_id.as_str().to_owned(), record);
+    }
+    for record in plan.outbox_records {
+        state
+            .outbox
+            .insert(record.outbox_id.as_str().to_owned(), record);
+    }
+    state
+        .relations
+        .extend(transition.event_projection_relation_intents.relation_kinds);
+    state
+        .named_operations
+        .extend(transition.named_operations.clone());
+    state.receipts_by_idempotency.insert(
+        receipt.idempotency_key.clone(),
+        (
+            receipt.canonical_request_hash.clone(),
+            operation_key.clone(),
+        ),
+    );
+    state
+        .receipts_by_operation
+        .insert(operation_key, receipt.clone());
+    receipt
+}
+
+impl MemoryStore {
     /// Returns a deterministic model snapshot.
     pub fn snapshot(&self) -> Result<MemorySnapshot, StoreError> {
         Ok(self.lock_state()?.snapshot())
@@ -290,7 +373,7 @@ impl MemoryStore {
         self.state.lock().map_err(|_| StoreError::Unavailable)
     }
 
-    fn receipt_sync(&self, operation_id: OperationId) -> Result<Option<WriteReceipt>, StoreError> {
+    fn receipt_sync(&self, operation_id: &OperationId) -> Result<Option<WriteReceipt>, StoreError> {
         Ok(self
             .lock_state()?
             .receipts_by_operation
@@ -298,8 +381,8 @@ impl MemoryStore {
             .cloned())
     }
 
-    fn revision_heads_sync(&self, keys: Vec<RevisionKey>) -> Result<Vec<RevisionHead>, StoreError> {
-        ensure_unique_revision_keys(&keys)?;
+    fn revision_heads_sync(&self, keys: &[RevisionKey]) -> Result<Vec<RevisionHead>, StoreError> {
+        ensure_unique_revision_keys(keys)?;
         let state = self.lock_state()?;
         Ok(keys
             .iter()
@@ -309,9 +392,9 @@ impl MemoryStore {
 
     fn ordering_heads_sync(
         &self,
-        scopes: Vec<OrderingScopeId>,
+        scopes: &[OrderingScopeId],
     ) -> Result<Vec<OrderingHead>, StoreError> {
-        ensure_unique_ordering_scopes(&scopes)?;
+        ensure_unique_ordering_scopes(scopes)?;
         let state = self.lock_state()?;
         Ok(scopes
             .iter()
@@ -344,7 +427,10 @@ impl MemoryStore {
         Ok(view)
     }
 
-    fn execute_named_sync(&self, query: NamedReadRequest) -> Result<NamedReadResponse, StoreError> {
+    fn execute_named_sync(
+        &self,
+        query: &NamedReadRequest,
+    ) -> Result<NamedReadResponse, StoreError> {
         query.validate()?;
         let state = self.lock_state()?;
         let fence = match state.fences.clone() {
@@ -408,8 +494,13 @@ impl MemoryStore {
     }
 
     fn health_sync(&self) -> Result<StoreHealth, StoreError> {
+        let status = match self.state.try_lock() {
+            Ok(_guard) => StoreHealthStatus::Ready,
+            Err(TryLockError::WouldBlock) => StoreHealthStatus::Degraded,
+            Err(TryLockError::Poisoned(_)) => StoreHealthStatus::Unavailable,
+        };
         Ok(StoreHealth {
-            status: StoreHealthStatus::Ready,
+            status,
             contract_version: eliot_store_api::CONTRACT_VERSION,
             manifest_digest: OperationManifestDigest::new("memory-reference-v1")?,
         })
@@ -427,20 +518,20 @@ impl CanonicalStoreClient for MemoryStore {
         self.apply_transaction(
             ctx,
             transition,
-            expected_revision_heads,
-            expected_ordering_heads,
+            &expected_revision_heads,
+            &expected_ordering_heads,
         )
     }
 
     async fn receipt(&self, operation_id: OperationId) -> Result<Option<WriteReceipt>, StoreError> {
-        self.receipt_sync(operation_id)
+        self.receipt_sync(&operation_id)
     }
 
     async fn revision_heads(
         &self,
         keys: Vec<RevisionKey>,
     ) -> Result<Vec<RevisionHead>, StoreError> {
-        self.revision_heads_sync(keys)
+        self.revision_heads_sync(&keys)
     }
 
     async fn scope_revision_view(
@@ -454,14 +545,14 @@ impl CanonicalStoreClient for MemoryStore {
         &self,
         scopes: Vec<OrderingScopeId>,
     ) -> Result<Vec<OrderingHead>, StoreError> {
-        self.ordering_heads_sync(scopes)
+        self.ordering_heads_sync(&scopes)
     }
 
     async fn execute_named(
         &self,
         query: NamedReadRequest,
     ) -> Result<NamedReadResponse, StoreError> {
-        self.execute_named_sync(query)
+        self.execute_named_sync(&query)
     }
 
     async fn health(&self) -> Result<StoreHealth, StoreError> {
@@ -652,10 +743,11 @@ fn projection_records(
         .iter()
         .enumerate()
         .map(|(index, kind)| {
-            let source_cursor = match source_revision_heads.iter().map(|head| head.revision).max() {
-                Some(revision) => revision,
-                None => 1,
-            };
+            let source_cursor = source_revision_heads
+                .iter()
+                .map(|head| head.revision)
+                .max()
+                .unwrap_or(1);
             let record = ProjectionPublicationRecord {
                 publication_id: ProjectionPublicationId::new(format!(
                     "projection-{operation_key}-{index}"
@@ -690,13 +782,8 @@ fn outbox_records(
     let mut sequence_cursor = next_sequence;
     for (index, _) in event_ids.iter().enumerate() {
         let sequence = sequence_cursor;
-        sequence_cursor = sequence_cursor.saturating_add(1);
-        if sequence == 0 {
-            return Err(StoreError::InvalidField {
-                field: "outbox.sequence",
-                reason: "sequence overflow",
-            });
-        }
+        sequence_cursor =
+            checked_increment(sequence_cursor, "outbox.sequence", "sequence overflow")?;
         let record = OutboxIntent {
             outbox_id: OutboxId::new(format!("outbox-{operation_key}-{index}"))?,
             operation_id: transition.identity.operation_id.clone(),
@@ -713,13 +800,23 @@ fn outbox_records(
     Ok((records, sequence_cursor))
 }
 
+fn checked_increment(
+    value: u64,
+    field: &'static str,
+    reason: &'static str,
+) -> Result<u64, StoreError> {
+    value
+        .checked_add(1)
+        .ok_or(StoreError::InvalidField { field, reason })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use eliot_contracts::{
         AuthorityEpoch, ClockReading, ProductId, RequestId, ResourceGeneration, SourceId,
     };
-    use eliot_store_api::{EffectClass, TransitionClass};
+    use eliot_store_api::{EffectClass, NamedOperationManifest, TransitionClass};
 
     fn fence() -> StateFence {
         StateFence::new(AuthorityEpoch::genesis(), ResourceGeneration::genesis())
@@ -742,6 +839,24 @@ mod tests {
         })
     }
 
+    fn manifest() -> Result<NamedOperationManifest, StoreError> {
+        NamedOperationManifest::new(
+            "memory-reference-test",
+            eliot_store_api::CONTRACT_VERSION,
+            vec![TransitionClass::CaptureCandidate],
+            EffectClass::Candidate,
+            1_024,
+            1_024,
+            1_000,
+        )
+    }
+
+    fn store() -> Result<MemoryStore, StoreError> {
+        let store = MemoryStore::new();
+        store.register_manifest(manifest()?)?;
+        Ok(store)
+    }
+
     fn transition(
         operation: &str,
         state_fence: &StateFence,
@@ -760,7 +875,7 @@ mod tests {
             transition_class: TransitionClass::CaptureCandidate,
             requested_effect_ceiling: EffectClass::Candidate,
             admission_contract_set_digest: "a".repeat(64),
-            operation_manifest_digest: OperationManifestDigest::new("manifest-1")?,
+            operation_manifest_digest: manifest()?.digest,
             named_operations: vec![eliot_store_api::NamedMutationRequest {
                 operation: eliot_store_api::NamedMutationOperation::CaptureObservation,
                 parameters: BTreeMap::from([(String::from("subject"), json!(operation))]),
@@ -770,7 +885,7 @@ mod tests {
                 projection_kinds: vec![String::from("task_state")],
                 relation_kinds: vec![String::from("causes")],
             },
-            security: Default::default(),
+            security: eliot_store_api::SecurityContext::default(),
             required_proof_and_approval_refs: vec![],
         })
     }
@@ -778,12 +893,12 @@ mod tests {
     #[test]
     fn replay_is_exact_and_does_not_advance_model() -> Result<(), StoreError> {
         let state_fence = fence();
-        let store = MemoryStore::new();
+        let store = store()?;
         let ctx = metadata(&state_fence)?;
         let prepared = transition("op-1", &state_fence)?;
-        let first = store.apply_transaction(&ctx, prepared.clone(), vec![], vec![])?;
+        let first = store.apply_transaction(&ctx, prepared.clone(), &[], &[])?;
         let before = store.snapshot()?;
-        let replay = store.apply_transaction(&ctx, prepared, vec![], vec![])?;
+        let replay = store.apply_transaction(&ctx, prepared, &[], &[])?;
         assert_eq!(first, replay);
         assert_eq!(before, store.snapshot()?);
         Ok(())
@@ -792,9 +907,9 @@ mod tests {
     #[test]
     fn stale_revision_is_typed_and_atomic() -> Result<(), StoreError> {
         let state_fence = fence();
-        let store = MemoryStore::new();
+        let store = store()?;
         let ctx = metadata(&state_fence)?;
-        store.apply_transaction(&ctx, transition("op-1", &state_fence)?, vec![], vec![])?;
+        store.apply_transaction(&ctx, transition("op-1", &state_fence)?, &[], &[])?;
         let before = store.snapshot()?;
         let stale = vec![RevisionHeadExpectation {
             key: RevisionKey::new("scope:scope-1")?,
@@ -804,8 +919,8 @@ mod tests {
         let error = store.apply_transaction(
             &ctx,
             transition("op-2", &state_fence)?,
-            stale,
-            vec![OrderingHeadExpectation {
+            &stale,
+            &[OrderingHeadExpectation {
                 scope: OrderingScopeId::new("scope-1")?,
                 expected_sequence: 2,
                 state_fence,
@@ -821,14 +936,206 @@ mod tests {
         let state_fence = fence();
         let ctx = metadata(&state_fence)?;
         let prepared = transition("op-1", &state_fence)?;
-        let left = MemoryStore::new();
-        let right = MemoryStore::new();
-        let left_receipt = left.apply_transaction(&ctx, prepared.clone(), vec![], vec![])?;
-        let right_receipt = right.apply_transaction(&ctx, prepared, vec![], vec![])?;
+        let left = store()?;
+        let right = store()?;
+        let left_receipt = left.apply_transaction(&ctx, prepared.clone(), &[], &[])?;
+        let right_receipt = right.apply_transaction(&ctx, prepared, &[], &[])?;
         assert_eq!(left_receipt, right_receipt);
         assert_eq!(left.snapshot()?, right.snapshot()?);
         assert_eq!(left.projections()?, right.projections()?);
         assert_eq!(left.outbox()?, right.outbox()?);
+        Ok(())
+    }
+
+    #[test]
+    fn missing_manifest_is_typed_and_atomic() -> Result<(), StoreError> {
+        let state_fence = fence();
+        let store = MemoryStore::new();
+        let before = store.snapshot()?;
+
+        let result = store.apply_transaction(
+            &metadata(&state_fence)?,
+            transition("op-missing-manifest", &state_fence)?,
+            &[],
+            &[],
+        );
+
+        assert_eq!(result, Err(StoreError::ManifestMismatch));
+        assert_eq!(before, store.snapshot()?);
+        Ok(())
+    }
+
+    #[test]
+    fn revision_overflow_is_typed_and_atomic() -> Result<(), StoreError> {
+        let state_fence = fence();
+        let store = store()?;
+        {
+            let mut state = store.lock_state()?;
+            let key = RevisionKey::new("scope:scope-1")?;
+            state.revision_heads.insert(
+                key.as_str().to_owned(),
+                RevisionHead {
+                    key,
+                    revision: u64::MAX,
+                    state_fence: state_fence.clone(),
+                },
+            );
+        }
+        let before = store.snapshot()?;
+
+        let result = store.apply_transaction(
+            &metadata(&state_fence)?,
+            transition("op-revision-overflow", &state_fence)?,
+            &[],
+            &[],
+        );
+
+        assert_eq!(
+            result,
+            Err(StoreError::InvalidField {
+                field: "revision",
+                reason: "revision overflow",
+            })
+        );
+        assert_eq!(before, store.snapshot()?);
+        Ok(())
+    }
+
+    #[test]
+    fn ordering_overflow_is_typed_and_atomic() -> Result<(), StoreError> {
+        let state_fence = fence();
+        let store = store()?;
+        {
+            let mut state = store.lock_state()?;
+            let scope = OrderingScopeId::new("scope-1")?;
+            state.ordering_heads.insert(
+                scope.as_str().to_owned(),
+                OrderingHead {
+                    scope,
+                    sequence: u64::MAX,
+                    state_fence: state_fence.clone(),
+                },
+            );
+        }
+        let before = store.snapshot()?;
+
+        let result = store.apply_transaction(
+            &metadata(&state_fence)?,
+            transition("op-ordering-overflow", &state_fence)?,
+            &[],
+            &[],
+        );
+
+        assert_eq!(
+            result,
+            Err(StoreError::InvalidField {
+                field: "ordering.sequence",
+                reason: "sequence overflow",
+            })
+        );
+        assert_eq!(before, store.snapshot()?);
+        Ok(())
+    }
+
+    #[test]
+    fn outbox_overflow_is_typed_and_atomic() -> Result<(), StoreError> {
+        let state_fence = fence();
+        let store = store()?;
+        store.lock_state()?.next_outbox_sequence = u64::MAX;
+        let before = store.snapshot()?;
+
+        let result = store.apply_transaction(
+            &metadata(&state_fence)?,
+            transition("op-outbox-overflow", &state_fence)?,
+            &[],
+            &[],
+        );
+
+        assert_eq!(
+            result,
+            Err(StoreError::InvalidField {
+                field: "outbox.sequence",
+                reason: "sequence overflow",
+            })
+        );
+        assert_eq!(store.lock_state()?.next_outbox_sequence, u64::MAX);
+        assert_eq!(before, store.snapshot()?);
+        Ok(())
+    }
+
+    #[test]
+    fn commit_overflow_is_typed_and_atomic() -> Result<(), StoreError> {
+        let state_fence = fence();
+        let store = store()?;
+        store.lock_state()?.next_commit_sequence = u64::MAX;
+        let before = store.snapshot()?;
+
+        let result = store.apply_transaction(
+            &metadata(&state_fence)?,
+            transition("op-commit-overflow", &state_fence)?,
+            &[],
+            &[],
+        );
+
+        assert_eq!(
+            result,
+            Err(StoreError::InvalidField {
+                field: "commit.sequence",
+                reason: "sequence overflow",
+            })
+        );
+        assert_eq!(store.lock_state()?.next_commit_sequence, u64::MAX);
+        assert_eq!(before, store.snapshot()?);
+        Ok(())
+    }
+
+    #[test]
+    fn clone_recovers_exact_poisoned_snapshot_without_panicking() -> Result<(), StoreError> {
+        let state_fence = fence();
+        let store = store()?;
+        store.apply_transaction(
+            &metadata(&state_fence)?,
+            transition("op-before-poison", &state_fence)?,
+            &[],
+            &[],
+        )?;
+        let expected = store.snapshot()?;
+
+        let poison_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let Ok(_guard) = store.state.lock() else {
+                panic!("test mutex was unexpectedly poisoned");
+            };
+            panic!("poison memory-store mutex");
+        }));
+        assert!(poison_result.is_err());
+
+        let clone_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| store.clone()));
+        let Ok(cloned) = clone_result else {
+            panic!("cloning a poisoned memory store panicked");
+        };
+        assert_eq!(expected, cloned.snapshot()?);
+        Ok(())
+    }
+
+    #[test]
+    fn health_reflects_lock_contention_and_poisoning() -> Result<(), StoreError> {
+        let store = store()?;
+        assert_eq!(store.health_sync()?.status, StoreHealthStatus::Ready);
+
+        {
+            let guard = store.lock_state()?;
+            assert_eq!(store.health_sync()?.status, StoreHealthStatus::Degraded);
+            drop(guard);
+        }
+
+        let poison_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let Ok(_guard) = store.state.lock() else {
+                panic!("test mutex was unexpectedly poisoned");
+            };
+            panic!("poison memory-store mutex");
+        }));
+        assert!(poison_result.is_err());
+        assert_eq!(store.health_sync()?.status, StoreHealthStatus::Unavailable);
         Ok(())
     }
 }

@@ -467,6 +467,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "eliot-problem"
+version = "0.1.0"
+dependencies = [
+ "eliot-contracts",
+ "eliot-evidence",
+ "eliot-observation-contracts",
+ "schemars",
+ "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
 name = "eliot-process"
 version = "0.1.0"
 dependencies = [
@@ -586,6 +599,33 @@ dependencies = [
  "tokio",
  "tokio-tungstenite",
  "uuid",
+]
+
+[[package]]
+name = "eliot-store-api"
+version = "0.1.0"
+dependencies = [
+ "eliot-contracts",
+ "eliot-evidence",
+ "eliot-receipts",
+ "eliot-security-contracts",
+ "schemars",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror",
+]
+
+[[package]]
+name = "eliot-store-memory"
+version = "0.1.0"
+dependencies = [
+ "eliot-contracts",
+ "eliot-store-api",
+ "schemars",
+ "serde",
+ "serde_json",
+ "thiserror",
 ]
 
 [[package]]

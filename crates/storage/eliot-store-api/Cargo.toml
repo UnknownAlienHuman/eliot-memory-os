@@ -7,9 +7,10 @@ license.workspace = true
 description = "Store-neutral ELIOT canonical storage contracts"
 
 [dependencies]
-eliot-contracts = { path = "../../foundation/eliot-contracts", version = "0.1.0" }
-eliot-receipts = { path = "../../foundation/eliot-receipts", version = "0.1.0" }
-eliot-security-contracts = { path = "../../foundation/eliot-security-contracts", version = "0.1.0" }
+eliot-contracts = { workspace = true }
+eliot-evidence = { workspace = true }
+eliot-receipts = { workspace = true }
+eliot-security-contracts = { workspace = true }
 schemars.workspace = true
 serde.workspace = true
 serde_json.workspace = true
