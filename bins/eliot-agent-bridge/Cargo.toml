@@ -1,14 +1,10 @@
 [package]
 name = "eliot-agent-bridge"
-version = "0.1.0"
-edition = "2024"
-rust-version = "1.89"
-license = "MIT"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
 description = "Thin profile-selected ELIOT agent bridge binary"
-
-# This is a deliberately standalone surface. The parent workspace must not
-# acquire a B-15 member until the composition owner admits the binary.
-[workspace]
 
 [lib]
 path = "src/lib.rs"
@@ -23,19 +19,9 @@ eliot-profile-spine-functional = []
 eliot-profile-full-composition = []
 
 [dependencies]
-eliot-agent-bridge-core = { path = "../../crates/surfaces/eliot-agent-bridge-core", version = "0.1.0" }
-eliot-protocol = { path = "../../crates/foundation/eliot-protocol", version = "0.1.0" }
-eliot-runtime = { path = "../../crates/kernel/eliot-runtime", version = "0.1.0" }
+eliot-agent-bridge-core.workspace = true
+eliot-protocol.workspace = true
+eliot-runtime.workspace = true
 
-[lints.rust]
-unsafe_code = "forbid"
-
-[lints.clippy]
-all = { level = "warn", priority = -1 }
-pedantic = { level = "warn", priority = -1 }
-dbg_macro = "warn"
-expect_used = "warn"
-print_stderr = "warn"
-print_stdout = "warn"
-todo = "warn"
-unwrap_used = "warn"
+[lints]
+workspace = true

@@ -279,6 +279,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "eliot-agent-bridge"
+version = "0.1.0"
+dependencies = [
+ "eliot-agent-bridge-core",
+ "eliot-protocol",
+ "eliot-runtime",
+]
+
+[[package]]
 name = "eliot-agent-bridge-core"
 version = "0.1.0"
 dependencies = [
