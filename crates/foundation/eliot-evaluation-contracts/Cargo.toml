@@ -8,8 +8,8 @@ description = "ELIOT outcome, recovery, spine-proof, evaluation and budget contr
 
 [dependencies]
 eliot-contracts = { workspace = true }
-eliot-receipts = { path = "../eliot-receipts", version = "0.1.0" }
-eliot-instrument-api = { path = "../../instrument/eliot-instrument-api", version = "0.1.0" }
+eliot-receipts = { workspace = true }
+eliot-instrument-api = { workspace = true }
 schemars = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

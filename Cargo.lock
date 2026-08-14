@@ -341,6 +341,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "eliot-bootstrap"
+version = "0.1.0"
+dependencies = [
+ "eliot-contracts",
+ "eliot-protocol",
+ "eliot-rules",
+ "schemars",
+ "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
 name = "eliot-campaign-executor"
 version = "0.1.0"
 dependencies = [
@@ -351,6 +364,19 @@ dependencies = [
  "serde_json",
  "sha2",
  "uuid",
+]
+
+[[package]]
+name = "eliot-config"
+version = "0.1.0"
+dependencies = [
+ "eliot-contracts",
+ "eliot-runtime-contracts",
+ "eliot-security-contracts",
+ "schemars",
+ "serde",
+ "serde_json",
+ "thiserror",
 ]
 
 [[package]]
@@ -379,6 +405,19 @@ dependencies = [
  "time",
  "tokio",
  "uuid",
+]
+
+[[package]]
+name = "eliot-evaluation-contracts"
+version = "0.1.0"
+dependencies = [
+ "eliot-contracts",
+ "eliot-instrument-api",
+ "eliot-receipts",
+ "schemars",
+ "serde",
+ "serde_json",
+ "thiserror",
 ]
 
 [[package]]
@@ -415,10 +454,67 @@ dependencies = [
 ]
 
 [[package]]
+name = "eliot-observation-contracts"
+version = "0.1.0"
+dependencies = [
+ "eliot-contracts",
+ "eliot-receipts",
+ "eliot-runtime-contracts",
+ "schemars",
+ "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
 name = "eliot-process"
 version = "0.1.0"
 dependencies = [
  "blake3",
+ "schemars",
+ "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
+name = "eliot-protocol"
+version = "0.1.0"
+dependencies = [
+ "eliot-agent-contracts",
+ "eliot-contracts",
+ "eliot-evidence",
+ "eliot-instrument-api",
+ "eliot-receipts",
+ "eliot-runtime-contracts",
+ "schemars",
+ "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
+name = "eliot-receipts"
+version = "0.1.0"
+dependencies = [
+ "eliot-contracts",
+ "schemars",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror",
+]
+
+[[package]]
+name = "eliot-rules"
+version = "0.1.0"
+dependencies = [
+ "eliot-agent-contracts",
+ "eliot-contracts",
+ "eliot-evidence",
+ "eliot-instrument-api",
+ "eliot-receipts",
+ "eliot-runtime-contracts",
  "schemars",
  "serde",
  "serde_json",
@@ -434,6 +530,30 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+]
+
+[[package]]
+name = "eliot-runtime-contracts"
+version = "0.1.0"
+dependencies = [
+ "eliot-contracts",
+ "schemars",
+ "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
+name = "eliot-security-contracts"
+version = "0.1.0"
+dependencies = [
+ "eliot-contracts",
+ "eliot-evidence",
+ "eliot-receipts",
+ "schemars",
+ "serde",
+ "serde_json",
+ "thiserror",
 ]
 
 [[package]]
@@ -498,6 +618,17 @@ dependencies = [
  "serde_json",
  "tokio",
  "windows-sys",
+]
+
+[[package]]
+name = "eliot-workscope"
+version = "0.1.0"
+dependencies = [
+ "eliot-security-contracts",
+ "schemars",
+ "serde",
+ "serde_json",
+ "thiserror",
 ]
 
 [[package]]

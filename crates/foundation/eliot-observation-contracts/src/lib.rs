@@ -752,14 +752,13 @@ impl ObservationRecordEnvelope {
     pub fn validate(&self) -> Result<(), ObservationError> {
         text(&self.record_id, "record_id")?;
         match (self.kind, self.event.is_some(), self.coverage_gap.is_some()) {
-            (ObservationRecordKind::CoverageGap, false, true) => {}
+            (ObservationRecordKind::CoverageGap, false, true) | (_, true, false) => {}
             (ObservationRecordKind::CoverageGap, true, _) => {
                 return Err(ObservationError::InvalidField {
                     field: "event",
                     reason: "coverage gap records do not carry ordinary events",
                 });
             }
-            (_, true, false) => {}
             (_, false, false) => {
                 return Err(ObservationError::InvalidField {
                     field: "event",
@@ -941,7 +940,7 @@ mod tests {
     }
 
     #[test]
-    fn record_kind_and_gap_payload_must_match() -> Result<(), ObservationError> {
+    fn record_kind_and_gap_payload_must_match() {
         let envelope = ObservationRecordEnvelope {
             record_id: "record-1".to_owned(),
             kind: ObservationRecordKind::Telemetry,
@@ -959,7 +958,6 @@ mod tests {
             parent_record_id: None,
         };
         assert!(envelope.validate().is_err());
-        Ok(())
     }
 
     #[test]
@@ -980,7 +978,7 @@ mod tests {
     }
 
     #[test]
-    fn malformed_duplicate_profile_values_fail_closed() -> Result<(), ObservationError> {
+    fn malformed_duplicate_profile_values_fail_closed() {
         let profile = ObservationObligationProfile {
             profile_id: "profile-1".to_owned(),
             profile_revision: "rev-1".to_owned(),
@@ -1018,7 +1016,6 @@ mod tests {
             profile.validate(),
             Err(ObservationError::Duplicate { .. })
         ));
-        Ok(())
     }
 
     #[test]

@@ -10,9 +10,19 @@ members = [
   "crates/agent/eliot-agent-contracts",
   "crates/agent/eliot-agent-codex",
   "crates/agent/eliot-agent-opencode",
+  "crates/foundation/eliot-bootstrap",
   "crates/foundation/eliot-contracts",
+  "crates/foundation/eliot-evaluation-contracts",
   "crates/foundation/eliot-evidence",
+  "crates/foundation/eliot-observation-contracts",
+  "crates/foundation/eliot-protocol",
+  "crates/foundation/eliot-receipts",
+  "crates/foundation/eliot-rules",
+  "crates/foundation/eliot-runtime-contracts",
+  "crates/foundation/eliot-security-contracts",
   "crates/foundation/eliot-test-support",
+  "crates/governor/eliot-config",
+  "crates/governor/eliot-workscope",
   "crates/instrument/eliot-graph-api",
   "crates/instrument/eliot-instrument-api",
   "crates/kernel/eliot-process",
@@ -42,9 +52,19 @@ eliot-store = { path = "crates/eliot-store", version = "0.1.0" }
 eliot-types = { path = "crates/eliot-types", version = "0.1.0" }
 eliot-windows-ipc = { path = "crates/eliot-windows-ipc", version = "0.1.0" }
 eliot-agent-opencode = { path = "crates/agent/eliot-agent-opencode", version = "0.1.0" }
+eliot-bootstrap = { path = "crates/foundation/eliot-bootstrap", version = "0.1.0" }
 eliot-contracts = { path = "crates/foundation/eliot-contracts", version = "0.1.0" }
+eliot-evaluation-contracts = { path = "crates/foundation/eliot-evaluation-contracts", version = "0.1.0" }
 eliot-evidence = { path = "crates/foundation/eliot-evidence", version = "0.1.0" }
+eliot-observation-contracts = { path = "crates/foundation/eliot-observation-contracts", version = "0.1.0" }
+eliot-protocol = { path = "crates/foundation/eliot-protocol", version = "0.1.0" }
+eliot-receipts = { path = "crates/foundation/eliot-receipts", version = "0.1.0" }
+eliot-rules = { path = "crates/foundation/eliot-rules", version = "0.1.0" }
+eliot-runtime-contracts = { path = "crates/foundation/eliot-runtime-contracts", version = "0.1.0" }
+eliot-security-contracts = { path = "crates/foundation/eliot-security-contracts", version = "0.1.0" }
 eliot-test-support = { path = "crates/foundation/eliot-test-support", version = "0.1.0" }
+eliot-config = { path = "crates/governor/eliot-config", version = "0.1.0" }
+eliot-workscope = { path = "crates/governor/eliot-workscope", version = "0.1.0" }
 eliot-graph-api = { path = "crates/instrument/eliot-graph-api", version = "0.1.0" }
 eliot-instrument-api = { path = "crates/instrument/eliot-instrument-api", version = "0.1.0" }
 eliot-process = { path = "crates/kernel/eliot-process", version = "0.1.0" }
