@@ -1,0 +1,18 @@
+[package]
+name = "eliot-receipts"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "ELIOT immutable receipt and coordination contracts"
+
+[dependencies]
+eliot-contracts.workspace = true
+schemars.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true
