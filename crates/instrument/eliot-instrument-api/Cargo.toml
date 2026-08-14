@@ -1,0 +1,17 @@
+[package]
+name = "eliot-instrument-api"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "ELIOT instrument invocation, evidence, and verification contracts"
+
+[dependencies]
+eliot-contracts.workspace = true
+schemars.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true

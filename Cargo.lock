@@ -393,6 +393,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "eliot-graph-api"
+version = "0.1.0"
+dependencies = [
+ "eliot-contracts",
+ "schemars",
+ "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
+name = "eliot-instrument-api"
+version = "0.1.0"
+dependencies = [
+ "eliot-contracts",
+ "schemars",
+ "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
 name = "eliot-process"
 version = "0.1.0"
 dependencies = [

@@ -13,6 +13,8 @@ members = [
   "crates/foundation/eliot-contracts",
   "crates/foundation/eliot-evidence",
   "crates/foundation/eliot-test-support",
+  "crates/instrument/eliot-graph-api",
+  "crates/instrument/eliot-instrument-api",
   "crates/kernel/eliot-process",
   "crates/security/eliot-source-assurance",
   "workspace/tools/eliot-runtime-compiler",
@@ -43,6 +45,8 @@ eliot-agent-opencode = { path = "crates/agent/eliot-agent-opencode", version = "
 eliot-contracts = { path = "crates/foundation/eliot-contracts", version = "0.1.0" }
 eliot-evidence = { path = "crates/foundation/eliot-evidence", version = "0.1.0" }
 eliot-test-support = { path = "crates/foundation/eliot-test-support", version = "0.1.0" }
+eliot-graph-api = { path = "crates/instrument/eliot-graph-api", version = "0.1.0" }
+eliot-instrument-api = { path = "crates/instrument/eliot-instrument-api", version = "0.1.0" }
 eliot-process = { path = "crates/kernel/eliot-process", version = "0.1.0" }
 eliot-source-assurance = { path = "crates/security/eliot-source-assurance", version = "0.1.0" }
 futures-util = { version = "0.3.32", features = ["sink"] }
