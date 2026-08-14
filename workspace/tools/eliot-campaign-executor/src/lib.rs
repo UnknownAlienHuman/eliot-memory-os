@@ -20,15 +20,10 @@ use uuid::Uuid;
 pub mod control;
 pub mod coordination;
 
-pub const PLAN_ID: &str = "D-02:plan-v3";
+pub const PLAN_ID: &str = "D-02:plan-v4";
 pub const PRIMARY_OPENCODE_MODEL: &str = "opencode-go/deepseek-v4-flash";
-pub const FALLBACK_OPENCODE_MODEL: &str = "opencode/deepseek-v4-flash-free";
-pub const OPENCODE_RECEIPT_SHA256: &str =
-    "a54e254618036111081c6edd031c06f49f46bcddab5ae7ddd9b29b9589e79353";
-pub const OPENCODE_STDOUT_SHA256: &str =
-    "00bdf57519697a60aae57ef095f1c5c2bfc22aa26253d3cde1415861a902d3fe";
-pub const OPENCODE_STDERR_SHA256: &str =
-    "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+pub const PRIMARY_OPENCODE_PROVIDER_ID: &str = "opencode-go";
+pub const PRIMARY_OPENCODE_MODEL_ID: &str = "deepseek-v4-flash";
 pub const BOOTSTRAP_RECEIPT_SHA256: &str =
     "4d38d4089245a360ce36b6060e0fe1f487affda8aac68206b493c21c6b2fdf18";
 pub const CHECKPOINT0_SHA256: &str =
@@ -45,29 +40,14 @@ pub const EVENT9_HEAD_SHA256: &str =
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct OpenCodeRoutePolicy {
-    pub primary_model: String,
-    pub fallback_model: String,
-    pub primary_receipt_sha256: String,
-    pub event9_head_sha256: String,
+    pub model: String,
 }
 
 impl OpenCodeRoutePolicy {
     pub fn verify(&self) -> Result<()> {
         ensure!(
-            self.primary_model == PRIMARY_OPENCODE_MODEL,
-            "primary OpenCode model differs from the admitted bootstrap route"
-        );
-        ensure!(
-            self.fallback_model == FALLBACK_OPENCODE_MODEL,
-            "fallback OpenCode model differs from the admitted bootstrap route"
-        );
-        ensure!(
-            self.primary_receipt_sha256 == OPENCODE_RECEIPT_SHA256,
-            "primary OpenCode receipt differs from the admitted live proof"
-        );
-        ensure!(
-            self.event9_head_sha256 == EVENT9_HEAD_SHA256,
-            "event-9 head differs from the immutable bootstrap frontier"
+            self.model == PRIMARY_OPENCODE_MODEL,
+            "OpenCode model differs from the only admitted bootstrap route"
         );
         Ok(())
     }
@@ -1043,33 +1023,6 @@ pub struct SlotLaunchReceipt {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub enum OpenCodeAttemptKind {
     Primary,
-    ExplicitFallback,
-}
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-pub enum FallbackTerminalClass {
-    Quota,
-    Readiness,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct FallbackAdmission {
-    pub terminal_class: FallbackTerminalClass,
-    pub route_admitted: bool,
-    pub privacy_admitted: bool,
-    pub budget_admitted: bool,
-}
-
-impl FallbackAdmission {
-    pub fn verify(&self) -> Result<()> {
-        ensure!(self.route_admitted, "fallback route is not admitted");
-        ensure!(
-            self.privacy_admitted,
-            "fallback privacy route is not admitted"
-        );
-        ensure!(self.budget_admitted, "fallback budget is not admitted");
-        Ok(())
-    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -1120,32 +1073,57 @@ pub struct OpenCodeAttempt {
     pub automatic_retry: bool,
 }
 
+/// A route can be disabled without converting an unavailable external
+/// capability into a successful attempt.  The reason is candidate evidence;
+/// it never selects another provider or model.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum OpenCodeRouteState {
+    Available,
+    Unavailable { reason: String },
+    Degraded { reason: String },
+}
+
+impl OpenCodeRouteState {
+    fn validate(&self) -> Result<()> {
+        if let Self::Unavailable { reason } | Self::Degraded { reason } = self {
+            ensure!(
+                !reason.trim().is_empty(),
+                "OpenCode route state reason is required"
+            );
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct OpenCodeLane {
     pub lane_id: String,
+    pub state: OpenCodeRouteState,
     pub primary: Option<OpenCodeAttempt>,
-    pub fallback: Option<OpenCodeAttempt>,
     policy: OpenCodeRoutePolicy,
 }
 
 impl OpenCodeLane {
-    fn new() -> Self {
+    pub fn new() -> Self {
         Self::with_policy(OpenCodeRoutePolicy {
-            primary_model: PRIMARY_OPENCODE_MODEL.to_owned(),
-            fallback_model: FALLBACK_OPENCODE_MODEL.to_owned(),
-            primary_receipt_sha256: OPENCODE_RECEIPT_SHA256.to_owned(),
-            event9_head_sha256: EVENT9_HEAD_SHA256.to_owned(),
+            model: PRIMARY_OPENCODE_MODEL.to_owned(),
         })
     }
     pub fn with_policy(policy: OpenCodeRoutePolicy) -> Self {
         Self {
             lane_id: "opencode-headless-plan".to_owned(),
+            state: OpenCodeRouteState::Available,
             primary: None,
-            fallback: None,
             policy,
         }
     }
     pub fn admit_primary(&mut self) -> Result<OpenCodeAttempt> {
+        self.state.validate()?;
+        ensure!(
+            matches!(self.state, OpenCodeRouteState::Available),
+            "OpenCode route is not available: {:?}",
+            self.state
+        );
         ensure!(
             self.primary.is_none(),
             "OpenCode primary is already admitted"
@@ -1153,35 +1131,41 @@ impl OpenCodeLane {
         let attempt = OpenCodeAttempt {
             attempt_id: format!("{}:primary", self.lane_id),
             kind: OpenCodeAttemptKind::Primary,
-            launch: OpenCodeLaunch::new(&self.lane_id, &self.policy.primary_model),
+            launch: OpenCodeLaunch::new(&self.lane_id, &self.policy.model),
             explicit_admission: true,
             automatic_retry: false,
         };
         self.primary = Some(attempt.clone());
         Ok(attempt)
     }
-    pub fn admit_fallback(&mut self, reason: &str) -> Result<OpenCodeAttempt> {
+    pub fn disable(&mut self, reason: impl Into<String>) -> Result<()> {
+        ensure!(
+            self.primary.is_none(),
+            "cannot disable OpenCode after admission"
+        );
+        let reason = reason.into();
         ensure!(
             !reason.trim().is_empty(),
-            "fallback requires an explicit controller reason"
+            "OpenCode disable reason is required"
         );
+        self.state = OpenCodeRouteState::Unavailable { reason };
+        Ok(())
+    }
+
+    pub fn set_state(&mut self, state: OpenCodeRouteState) -> Result<()> {
         ensure!(
-            self.primary.is_some(),
-            "fallback requires a primary attempt"
+            self.primary.is_none(),
+            "cannot change OpenCode route after admission"
         );
-        ensure!(
-            self.fallback.is_none(),
-            "OpenCode fallback is already admitted"
-        );
-        let attempt = OpenCodeAttempt {
-            attempt_id: format!("{}:fallback", self.lane_id),
-            kind: OpenCodeAttemptKind::ExplicitFallback,
-            launch: OpenCodeLaunch::new(&self.lane_id, &self.policy.fallback_model),
-            explicit_admission: true,
-            automatic_retry: false,
-        };
-        self.fallback = Some(attempt.clone());
-        Ok(attempt)
+        state.validate()?;
+        self.state = state;
+        Ok(())
+    }
+}
+
+impl Default for OpenCodeLane {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -1481,6 +1465,17 @@ impl CampaignExecutor {
                         "OpenCode admission projection mismatch"
                     );
                 }
+                "opencode_route_state" => {
+                    ensure!(
+                        json_value(&payload, &["candidate_only"])? == &Value::Bool(true)
+                            && json_string(&payload, &["authority"])? == "none",
+                        "OpenCode route state is not candidate-only"
+                    );
+                    let state: OpenCodeRouteState =
+                        serde_json::from_value(json_value(&payload, &["state"])?.clone())
+                            .context("replay OpenCode route state")?;
+                    executor.opencode.set_state(state)?;
+                }
                 "opencode_attempt_verified" => {
                     let attempt_id = json_string(&payload, &["attempt_id"])?;
                     let primary = executor
@@ -1490,12 +1485,9 @@ impl CampaignExecutor {
                         .context("OpenCode verification precedes admission")?;
                     ensure!(
                         attempt_id == primary.attempt_id
-                            && json_string(&payload, &["result_sha256"])?
-                                == OPENCODE_RECEIPT_SHA256
-                            && json_string(&payload, &["stdout_sha256"])? == OPENCODE_STDOUT_SHA256
-                            && json_string(&payload, &["stderr_sha256"])? == OPENCODE_STDERR_SHA256
                             && json_value(&payload, &["candidate_only"])? == &Value::Bool(true)
-                            && json_string(&payload, &["authority"])? == "none",
+                            && json_string(&payload, &["authority"])? == "none"
+                            && json_value(&payload, &["actual_route"])?.is_object(),
                         "OpenCode verification projection mismatch"
                     );
                     executor
@@ -1516,10 +1508,7 @@ impl CampaignExecutor {
         recovery: &RecoveryEvidence,
     ) -> Result<AdoptionReceipt> {
         let policy = OpenCodeRoutePolicy {
-            primary_model: PRIMARY_OPENCODE_MODEL.to_owned(),
-            fallback_model: FALLBACK_OPENCODE_MODEL.to_owned(),
-            primary_receipt_sha256: OPENCODE_RECEIPT_SHA256.to_owned(),
-            event9_head_sha256: EVENT9_HEAD_SHA256.to_owned(),
+            model: PRIMARY_OPENCODE_MODEL.to_owned(),
         };
         self.adopt_with_policy(epoch, recovery, &policy)
     }
@@ -1541,7 +1530,7 @@ impl CampaignExecutor {
             "bootstrap adoption requires the exact immutable events 1..9"
         );
         self.ledger
-            .verify_legacy_suffix_with_head(&policy.event9_head_sha256)?;
+            .verify_legacy_suffix_with_head(EVENT9_HEAD_SHA256)?;
         self.ledger.adopt_epoch(epoch)
     }
 
@@ -1840,26 +1829,17 @@ impl CampaignExecutor {
         Ok(attempt)
     }
 
-    pub fn admit_opencode_fallback_admitted(
-        &mut self,
-        reason: &str,
-        admission: &FallbackAdmission,
-    ) -> Result<OpenCodeAttempt> {
-        admission.verify()?;
-        let attempt = self.opencode.admit_fallback(reason)?;
+    pub fn record_opencode_route_state(&mut self, state: &OpenCodeRouteState) -> Result<()> {
+        self.opencode.set_state(state.clone())?;
         self.ledger.append(
-            "opencode_attempt_admitted",
+            "opencode_route_state",
             json!({
-                "attempt_id": attempt.attempt_id,
-                "kind": "explicit_fallback",
-                "model": FALLBACK_OPENCODE_MODEL,
-                "reason": reason,
-                "authority": "none",
+                "state": state,
                 "candidate_only": true,
-                "automatic_retry": false,
+                "authority": "none",
             }),
         )?;
-        Ok(attempt)
+        Ok(())
     }
 
     pub fn verify_opencode_attempt(
@@ -1869,7 +1849,6 @@ impl CampaignExecutor {
     ) -> Result<Value> {
         let admitted = match attempt.kind {
             OpenCodeAttemptKind::Primary => self.opencode.primary.as_ref(),
-            OpenCodeAttemptKind::ExplicitFallback => self.opencode.fallback.as_ref(),
         }
         .context("OpenCode attempt was not admitted by this executor")?;
         ensure!(
@@ -1878,7 +1857,11 @@ impl CampaignExecutor {
         );
         let value = evidence.verify_with_policy(&self.opencode.policy)?;
         ensure!(
-            attempt.launch.model == evidence.contract_model,
+            format!(
+                "{}/{}",
+                evidence.result.actual_route.requested.provider_id,
+                evidence.result.actual_route.requested.model_id
+            ) == attempt.launch.model,
             "OpenCode attempt model differs from verified contract"
         );
         ensure!(
@@ -1890,9 +1873,8 @@ impl CampaignExecutor {
             "opencode_attempt_verified",
             json!({
                 "attempt_id": attempt.attempt_id,
-                "result_sha256": evidence.result.expected_sha256,
-                "stdout_sha256": evidence.stdout.expected_sha256,
-                "stderr_sha256": evidence.stderr.expected_sha256,
+                "actual_route": evidence.result.actual_route,
+                "status": evidence.result.status,
                 "candidate_only": true,
                 "authority": "none",
             }),
@@ -1983,10 +1965,7 @@ pub struct GitFrontierEvidence {
 impl RecoveryEvidence {
     pub fn verify(&self) -> Result<()> {
         self.verify_with_policy(&OpenCodeRoutePolicy {
-            primary_model: PRIMARY_OPENCODE_MODEL.to_owned(),
-            fallback_model: FALLBACK_OPENCODE_MODEL.to_owned(),
-            primary_receipt_sha256: OPENCODE_RECEIPT_SHA256.to_owned(),
-            event9_head_sha256: EVENT9_HEAD_SHA256.to_owned(),
+            model: PRIMARY_OPENCODE_MODEL.to_owned(),
         })
     }
 
@@ -2144,7 +2123,7 @@ impl RecoveryEvidence {
             "event-9 raw-byte hash mismatch"
         );
         ensure!(
-            self.event9_head_sha256 == policy.event9_head_sha256,
+            self.event9_head_sha256 == EVENT9_HEAD_SHA256,
             "event-9 head mismatch"
         );
 
@@ -2245,133 +2224,197 @@ fn normalize_path(path: &Path) -> String {
     path.to_string_lossy().replace('\\', "/")
 }
 
-/// Typed join of the dry-run launch contract and the live result artifacts.
-/// `OpenCode`'s live result need not repeat model or permission, so those facts
-/// are validated from `contract` and only the result-specific facts are read
-/// from the result JSON.
-#[derive(Debug, Clone)]
-pub struct OpenCodeEvidence {
-    pub contract_model: String,
-    pub contract_argv: Vec<String>,
-    pub contract_unscoped_supervised_plan: bool,
-    pub contract_authority_refs_null: bool,
-    pub result: EvidenceFile,
-    pub stdout: EvidenceFile,
-    pub stderr: EvidenceFile,
-    pub expected_exit_code: i32,
-    pub expected_session_events: u32,
-    pub expected_tool_events: u32,
-    pub reap_complete: bool,
+/// The A-04 public HTTP/OpenAPI/SSE route receipt, kept provider-neutral so
+/// D-02 does not depend on A-04's Rust types or perform a live call itself.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct OpenCodeModelIdentity {
+    #[serde(rename = "providerID", alias = "provider_id")]
+    pub provider_id: String,
+    #[serde(rename = "modelID", alias = "model_id")]
+    pub model_id: String,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum OpenCodeActualRouteState {
+    Observed,
+    Unavailable,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct OpenCodeActualRouteReceipt {
+    pub requested: OpenCodeModelIdentity,
+    pub observed: Option<OpenCodeModelIdentity>,
+    pub provider: Option<String>,
+    pub endpoint: Option<String>,
+    pub route_fingerprint: Option<String>,
+    pub session_id: Option<String>,
+    pub directory: Option<String>,
+    pub server_version: Option<String>,
+    pub workspace_id: Option<String>,
+    pub state: OpenCodeActualRouteState,
+}
+
+impl OpenCodeActualRouteReceipt {
+    pub fn validate(&self) -> Result<()> {
+        ensure!(
+            !self.requested.provider_id.trim().is_empty(),
+            "requested provider is required"
+        );
+        ensure!(
+            !self.requested.model_id.trim().is_empty(),
+            "requested model is required"
+        );
+        match self.state {
+            OpenCodeActualRouteState::Observed => {
+                let observed = self
+                    .observed
+                    .as_ref()
+                    .context("observed route identity is missing")?;
+                ensure!(
+                    !observed.provider_id.trim().is_empty(),
+                    "observed provider is required"
+                );
+                ensure!(
+                    !observed.model_id.trim().is_empty(),
+                    "observed model is required"
+                );
+                ensure!(
+                    self.provider.as_deref() == Some(observed.provider_id.as_str()),
+                    "observed provider differs from route identity"
+                );
+                let endpoint = self
+                    .endpoint
+                    .as_deref()
+                    .context("observed endpoint is missing")?;
+                ensure!(
+                    is_loopback_endpoint(endpoint),
+                    "observed endpoint is not loopback"
+                );
+                ensure!(
+                    self.route_fingerprint
+                        .as_deref()
+                        .is_some_and(|v| !v.trim().is_empty()),
+                    "observed route fingerprint is missing"
+                );
+                ensure!(
+                    self.session_id
+                        .as_deref()
+                        .is_some_and(|v| !v.trim().is_empty()),
+                    "observed session identity is missing"
+                );
+                ensure!(
+                    self.directory
+                        .as_deref()
+                        .is_some_and(|v| Path::new(v).is_absolute()),
+                    "observed directory must be absolute"
+                );
+                ensure!(
+                    self.server_version
+                        .as_deref()
+                        .is_some_and(|v| !v.trim().is_empty()),
+                    "observed server version is missing"
+                );
+            }
+            OpenCodeActualRouteState::Unavailable => {
+                ensure!(
+                    self.observed.is_none()
+                        && self.provider.is_none()
+                        && self.endpoint.is_none()
+                        && self.route_fingerprint.is_none()
+                        && self.session_id.is_none()
+                        && self.directory.is_none()
+                        && self.server_version.is_none()
+                        && self.workspace_id.is_none(),
+                    "unavailable route carries observed identity"
+                );
+            }
+        }
+        Ok(())
+    }
+}
+
+fn is_loopback_endpoint(endpoint: &str) -> bool {
+    endpoint.starts_with("http://127.0.0.1:")
+        || endpoint.starts_with("http://localhost:")
+        || endpoint.starts_with("http://[::1]:")
+}
+
+/// Typed candidate-only result emitted by A-04 after HTTP/SSE reconciliation.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct OpenCodeHttpSseResult {
+    pub status: String,
+    pub candidate_only: bool,
+    pub authority: String,
+    pub actual_route: OpenCodeActualRouteReceipt,
+    pub session_id: Option<String>,
+    pub output: Option<Value>,
+    #[serde(default)]
+    pub events: Vec<Value>,
+    #[serde(default)]
+    pub diff: Vec<Value>,
+}
+
+#[derive(Debug, Clone)]
+pub struct OpenCodeEvidence {
+    pub result: OpenCodeHttpSseResult,
+}
+
+pub type OpenCodeHttpSseEvidence = OpenCodeEvidence;
+
 impl OpenCodeEvidence {
+    pub fn from_result(result: OpenCodeHttpSseResult) -> Self {
+        Self { result }
+    }
+
     pub fn verify(&self) -> Result<Value> {
         self.verify_with_policy(&OpenCodeRoutePolicy {
-            primary_model: PRIMARY_OPENCODE_MODEL.to_owned(),
-            fallback_model: FALLBACK_OPENCODE_MODEL.to_owned(),
-            primary_receipt_sha256: OPENCODE_RECEIPT_SHA256.to_owned(),
-            event9_head_sha256: EVENT9_HEAD_SHA256.to_owned(),
+            model: PRIMARY_OPENCODE_MODEL.to_owned(),
         })
     }
 
     pub fn verify_with_policy(&self, policy: &OpenCodeRoutePolicy) -> Result<Value> {
         policy.verify()?;
+        let result = &self.result;
         ensure!(
-            self.contract_model == policy.primary_model,
-            "OpenCode contract model mismatch"
+            result.candidate_only && result.authority == "candidate_only",
+            "OpenCode result must remain candidate-only"
         );
         ensure!(
-            self.contract_argv.len() == 9
-                && self.contract_argv[0] == "run"
-                && self.contract_argv[1] == "--format"
-                && self.contract_argv[2] == "json"
-                && self.contract_argv[3] == "--agent"
-                && self.contract_argv[4] == "plan"
-                && self.contract_argv[5] == "--dir"
-                && !self.contract_argv[6].trim().is_empty()
-                && self.contract_argv[7] == "--model"
-                && self.contract_argv[8] == policy.primary_model,
-            "OpenCode argv differs from the admitted unscoped headless plan route"
+            matches!(
+                result.status.as_str(),
+                "succeeded" | "partial" | "failed" | "cancelled" | "unknown"
+            ),
+            "OpenCode result status is not typed"
         );
+        result.actual_route.validate()?;
         ensure!(
-            self.contract_unscoped_supervised_plan,
-            "OpenCode contract is not unscoped supervised plan"
+            result.actual_route.requested.provider_id == PRIMARY_OPENCODE_PROVIDER_ID
+                && result.actual_route.requested.model_id == PRIMARY_OPENCODE_MODEL_ID,
+            "requested OpenCode provider/model differs from policy"
         );
-        ensure!(
-            self.contract_authority_refs_null,
-            "OpenCode contract carries authority"
-        );
-        ensure!(
-            self.result.expected_sha256 == policy.primary_receipt_sha256
-                && self.stdout.expected_sha256 == OPENCODE_STDOUT_SHA256
-                && self.stderr.expected_sha256 == OPENCODE_STDERR_SHA256,
-            "OpenCode evidence differs from the admitted live proof"
-        );
-        ensure!(
-            self.expected_exit_code == 0
-                && self.expected_session_events == 3
-                && self.expected_tool_events == 0
-                && self.reap_complete,
-            "OpenCode expected outcome weakens the admitted live proof"
-        );
-        let result_bytes = self.result.verify("OpenCode result")?;
-        let stdout = self.stdout.verify("OpenCode stdout")?;
-        let stderr = self.stderr.verify("OpenCode stderr")?;
-        let result: Value =
-            serde_json::from_slice(&result_bytes).context("parse OpenCode result")?;
-        ensure!(
-            json_string(&result, &["schema_version"])? == "eliot-host-launch-result-v1"
-                && json_string(&result, &["host"])? == "opencode"
-                && json_value(&result, &["candidate_only"])? == &Value::Bool(true)
-                && json_value(&result, &["success"])? == &Value::Bool(true)
-                && json_u64(&result, &["exit_status"])? == 0,
-            "OpenCode result identity or terminal outcome mismatch"
-        );
-        ensure!(
-            json_value(&result, &["reap_receipt", "all_tasks_joined"])? == &Value::Bool(true)
-                && json_value(&result, &["reap_receipt", "stdout_closed"])? == &Value::Bool(true)
-                && json_value(&result, &["reap_receipt", "stderr_closed"])? == &Value::Bool(true)
-                && json_u64(&result, &["reap_receipt", "process_count_after"])? == 0,
-            "OpenCode process reap is incomplete"
-        );
-        ensure!(
-            json_string(&result, &["stdout_hash"])? == format!("blake3:{}", blake3(&stdout))
-                && json_string(&result, &["stderr_hash"])? == format!("blake3:{}", blake3(&stderr)),
-            "OpenCode result does not bind stdout/stderr bytes"
-        );
-        ensure!(
-            json_string(&result, &["stdout_ref"])?.replace('\\', "/")
-                == normalize_path(&self.stdout.path)
-                && json_string(&result, &["stderr_ref"])?.replace('\\', "/")
-                    == normalize_path(&self.stderr.path),
-            "OpenCode result references different output artifacts"
-        );
-        let events = std::str::from_utf8(&stdout)
-            .context("OpenCode stdout must be UTF-8 JSONL")?
-            .lines()
-            .filter(|line| !line.trim().is_empty())
-            .map(|line| serde_json::from_str::<Value>(line).context("parse OpenCode stdout event"))
-            .collect::<Result<Vec<_>>>()?;
-        ensure!(
-            events.len() == 3
-                && json_string(&events[0], &["type"])? == "step_start"
-                && json_string(&events[1], &["type"])? == "text"
-                && json_string(&events[2], &["type"])? == "step_finish"
-                && json_string(&events[2], &["part", "reason"])? == "stop",
-            "OpenCode stdout event sequence mismatch"
-        );
-        let session_id = json_string(&events[0], &["sessionID"])?;
-        ensure!(
-            !session_id.trim().is_empty(),
-            "OpenCode session identity is blank"
-        );
-        for event in &events {
+        if let OpenCodeActualRouteState::Observed = result.actual_route.state {
+            let observed = result
+                .actual_route
+                .observed
+                .as_ref()
+                .context("observed route identity is missing")?;
             ensure!(
-                json_string(event, &["sessionID"])? == session_id,
-                "OpenCode stdout crosses session identities"
+                observed.provider_id == PRIMARY_OPENCODE_PROVIDER_ID
+                    && observed.model_id == PRIMARY_OPENCODE_MODEL_ID,
+                "observed OpenCode route differs from policy"
+            );
+            ensure!(
+                result.session_id == result.actual_route.session_id,
+                "result session differs from actual-route receipt"
             );
         }
-        Ok(result)
+        ensure!(
+            result.diff.is_empty(),
+            "OpenCode read-only result contains file diff"
+        );
+        serde_json::to_value(result).context("serialize OpenCode HTTP/SSE result")
     }
 }
 
@@ -2429,9 +2472,8 @@ mod tests {
     }
 
     #[test]
-    fn opencode_fallback_is_explicit_and_unscoped() {
+    fn opencode_lane_is_single_route_and_candidate_only() {
         let mut lane = OpenCodeLane::new();
-        assert!(lane.admit_fallback("automatic").is_err());
         let primary = lane.admit_primary().expect("primary");
         assert_eq!(primary.launch.model, PRIMARY_OPENCODE_MODEL);
         assert!(
@@ -2440,11 +2482,7 @@ mod tests {
                 .get("timeout")
                 .is_none()
         );
-        let fallback = lane
-            .admit_fallback("controller decision")
-            .expect("fallback");
-        assert_eq!(fallback.launch.model, FALLBACK_OPENCODE_MODEL);
-        assert!(!fallback.automatic_retry);
+        assert!(lane.disable("route is unavailable").is_err());
     }
 
     #[test]

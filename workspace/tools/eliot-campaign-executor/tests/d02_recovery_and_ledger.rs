@@ -137,15 +137,12 @@ fn recovery_policy_rejects_route_or_event9_drift_before_reads() {
     let root = temp_root("recovery-policy");
     let evidence = fixed_recovery(&root);
     let policy = OpenCodeRoutePolicy {
-        primary_model: eliot_campaign_executor::PRIMARY_OPENCODE_MODEL.to_owned(),
-        fallback_model: eliot_campaign_executor::FALLBACK_OPENCODE_MODEL.to_owned(),
-        primary_receipt_sha256: eliot_campaign_executor::OPENCODE_RECEIPT_SHA256.to_owned(),
-        event9_head_sha256: "0".repeat(64),
+        model: "opencode-go/other-model".to_owned(),
     };
     let error = evidence
         .verify_with_policy(&policy)
-        .expect_err("event-9 route drift must fail closed");
-    assert!(error.to_string().contains("event-9 head"));
+        .expect_err("event-9 drift must fail closed");
+    assert!(error.to_string().contains("model"));
     let _ = fs::remove_dir_all(root);
 }
 

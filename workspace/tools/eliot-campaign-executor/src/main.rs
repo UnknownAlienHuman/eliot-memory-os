@@ -6,9 +6,8 @@ use clap::{Parser, Subcommand};
 use eliot_campaign_executor::{
     BOOTSTRAP_RECEIPT_SHA256, CHECKPOINT0_SHA256, CHECKPOINT1_SHA256, CampaignExecutor,
     CampaignLedger, CampaignStore, CapabilityProbe, D01_HANDLE_SHA256, D01_REPORT_SHA256,
-    EVENT9_HEAD_SHA256, EpochId, EvidenceFile, OPENCODE_RECEIPT_SHA256, OPENCODE_STDERR_SHA256,
-    OPENCODE_STDOUT_SHA256, OpenCodeEvidence, OpenCodeRoutePolicy, PLAN_ID, PRIMARY_OPENCODE_MODEL,
-    RecoveryEvidence, SlotLaunchReceipt,
+    EVENT9_HEAD_SHA256, EpochId, EvidenceFile, OpenCodeEvidence, OpenCodeRoutePolicy, PLAN_ID,
+    PRIMARY_OPENCODE_MODEL, RecoveryEvidence, SlotLaunchReceipt,
 };
 use serde_json::{Value, json};
 use std::collections::BTreeSet;
@@ -236,23 +235,14 @@ fn contract_argv(
 
 fn opencode_evidence(
     result_path: PathBuf,
-    stdout_path: PathBuf,
-    stderr_path: PathBuf,
-    contract_argv: Vec<String>,
+    _stdout_path: PathBuf,
+    _stderr_path: PathBuf,
+    _contract_argv: Vec<String>,
 ) -> Result<OpenCodeEvidence> {
-    Ok(OpenCodeEvidence {
-        contract_model: PRIMARY_OPENCODE_MODEL.to_owned(),
-        contract_argv,
-        contract_unscoped_supervised_plan: true,
-        contract_authority_refs_null: true,
-        result: evidence_file(result_path, OPENCODE_RECEIPT_SHA256)?,
-        stdout: evidence_file(stdout_path, OPENCODE_STDOUT_SHA256)?,
-        stderr: evidence_file(stderr_path, OPENCODE_STDERR_SHA256)?,
-        expected_exit_code: 0,
-        expected_session_events: 3,
-        expected_tool_events: 0,
-        reap_complete: true,
-    })
+    let bytes = fs::read(&result_path)
+        .with_context(|| format!("read OpenCode HTTP/SSE result: {}", result_path.display()))?;
+    let result = serde_json::from_slice(&bytes).context("parse OpenCode HTTP/SSE result")?;
+    Ok(OpenCodeEvidence::from_result(result))
 }
 
 fn policy(path: &Path) -> Result<OpenCodeRoutePolicy> {
@@ -297,7 +287,7 @@ fn projection_path(before: &BTreeSet<PathBuf>, root: &Path) -> Option<PathBuf> {
 fn ledger_projection(ledger: &CampaignLedger, command: &str, status: &str, detail: Value) -> Value {
     json!({
         "schema_version": "eliot-campaign-executor-projection-v1",
-        "plan": "D-02/plan-v3",
+        "plan": PLAN_ID,
         "plan_id": PLAN_ID,
         "command": command,
         "status": status,
@@ -320,7 +310,7 @@ fn receipt(
 ) -> Value {
     json!({
         "schema_version": "eliot-campaign-executor-receipt-v1",
-        "plan": "D-02/plan-v3",
+        "plan": PLAN_ID,
         "plan_id": PLAN_ID,
         "command": command,
         "status": status,
@@ -405,7 +395,7 @@ fn adopt_bootstrap(
         checkpoint: checkpoint1_evidence,
         event9: event9_evidence,
         repository_root: repository_root.clone(),
-        event9_head_sha256: policy.event9_head_sha256.clone(),
+        event9_head_sha256: EVENT9_HEAD_SHA256.to_owned(),
     };
     recovery.verify_with_policy(&policy)?;
     let epoch = epoch(&epoch_lineage, epoch_sequence)?;
@@ -512,7 +502,7 @@ fn recover(campaign_root: PathBuf) -> Result<(Value, bool)> {
             let before = projection_files(&campaign_root);
             store.write_projection(&json!({
                 "schema_version": "eliot-campaign-executor-projection-v1",
-                "plan": "D-02/plan-v3",
+                "plan": PLAN_ID,
                 "command": "recover",
                 "status": "QUARANTINE",
                 "detail": detail,
@@ -784,11 +774,10 @@ fn bind_opencode_primary(
         json!({
             "refs": refs(object_paths),
             "host_spawn_authority": false,
-            "fallback_admitted": false,
             "candidate_only": true,
         }),
         Vec::new(),
-        "candidate_only; fixed primary verified; no host spawn or fallback authority",
+        "candidate_only; A-04 HTTP/SSE result verified; no host spawn authority",
         None,
     ))
 }
