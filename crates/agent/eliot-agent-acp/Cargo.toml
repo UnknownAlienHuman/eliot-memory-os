@@ -1,0 +1,23 @@
+[package]
+name = "eliot-agent-acp"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Provider-neutral ACP v1 stdio compatibility adapter"
+
+[dependencies]
+blake3.workspace = true
+eliot-agent-api.workspace = true
+eliot-process.workspace = true
+eliot-source-assurance.workspace = true
+schemars.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true
+
+[lints]
+workspace = true
