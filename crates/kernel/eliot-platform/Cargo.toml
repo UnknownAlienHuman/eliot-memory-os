@@ -1,0 +1,21 @@
+[package]
+name = "eliot-platform"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "P-01 platform-neutral capability contracts and deterministic fakes"
+
+[dependencies]
+eliot-contracts.workspace = true
+eliot-runtime-contracts.workspace = true
+eliot-security-contracts.workspace = true
+schemars.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
+
+[lints]
+workspace = true
