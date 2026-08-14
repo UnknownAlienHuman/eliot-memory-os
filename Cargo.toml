@@ -5,6 +5,7 @@ members = [
   "crates/eliot-store",
   "crates/eliot-types",
   "crates/eliot-windows-ipc",
+  "crates/agent/eliot-agent-opencode",
   "workspace/tools/eliot-runtime-compiler",
   "workspace/tools/eliot-campaign-executor",
 ]
@@ -25,6 +26,7 @@ eliot-engine = { path = "crates/eliot-engine", version = "0.1.0" }
 eliot-store = { path = "crates/eliot-store", version = "0.1.0" }
 eliot-types = { path = "crates/eliot-types", version = "0.1.0" }
 eliot-windows-ipc = { path = "crates/eliot-windows-ipc", version = "0.1.0" }
+eliot-agent-opencode = { path = "crates/agent/eliot-agent-opencode", version = "0.1.0" }
 futures-util = { version = "0.3.32", features = ["sink"] }
 jsonc-parser = { version = "0.33.0", features = ["cst", "serde_json"] }
 redb = "4.1.0"
