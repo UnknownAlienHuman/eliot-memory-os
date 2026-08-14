@@ -1,0 +1,19 @@
+[package]
+name = "eliot-bootstrap"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "ELIOT D0 pure bootstrap snapshot, rule, and brief compilers"
+
+[dependencies]
+eliot-contracts.workspace = true
+eliot-protocol = { path = "../eliot-protocol", version = "0.1.0" }
+eliot-rules = { path = "../eliot-rules", version = "0.1.0" }
+schemars.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true
