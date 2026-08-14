@@ -467,6 +467,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "eliot-platform"
+version = "0.1.0"
+dependencies = [
+ "eliot-contracts",
+ "eliot-runtime-contracts",
+ "eliot-security-contracts",
+ "schemars",
+ "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
 name = "eliot-problem"
 version = "0.1.0"
 dependencies = [

@@ -28,6 +28,7 @@ members = [
   "crates/storage/eliot-store-memory",
   "crates/instrument/eliot-graph-api",
   "crates/instrument/eliot-instrument-api",
+  "crates/kernel/eliot-platform",
   "crates/kernel/eliot-process",
   "crates/security/eliot-source-assurance",
   "workspace/tools/eliot-runtime-compiler",
@@ -73,6 +74,7 @@ eliot-store-api = { path = "crates/storage/eliot-store-api", version = "0.1.0" }
 eliot-store-memory = { path = "crates/storage/eliot-store-memory", version = "0.1.0" }
 eliot-graph-api = { path = "crates/instrument/eliot-graph-api", version = "0.1.0" }
 eliot-instrument-api = { path = "crates/instrument/eliot-instrument-api", version = "0.1.0" }
+eliot-platform = { path = "crates/kernel/eliot-platform", version = "0.1.0" }
 eliot-process = { path = "crates/kernel/eliot-process", version = "0.1.0" }
 eliot-source-assurance = { path = "crates/security/eliot-source-assurance", version = "0.1.0" }
 futures-util = { version = "0.3.32", features = ["sink"] }
