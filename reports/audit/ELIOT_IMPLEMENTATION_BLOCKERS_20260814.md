@@ -6,6 +6,21 @@ Integration snapshot: branch `swarm/A-04-cell`, source frontier `763f7e2` when t
 
 ## Paused work
 
+### C0-12 — security, disclosure and influence contracts
+
+Closed portions: the second candidate makes unknown freshness/competence/independence/closure/influence states fail closed when validation is invoked, adds typed digests and more exact declassification and selection-lineage fields, and passes six package tests plus formatting and strict Clippy.
+
+Remaining authority blockers:
+
+- The breaking wire/API revision remains `1.0.0` with a static three-field contract identity, and real reverse consumers `eliot-workscope`, `eliot-config` and the repaired A-01 source no longer compile.
+- Public deserialization and direct construction bypass semantic validation, including the new unknown-state gates.
+- Verifier, source-assurance, release/effect and policy bindings remain caller-mintable; artifact coverage is a superset check and most validation paths require no exact observed artifact.
+- Declassification digests are asserted rather than recomputed from bytes; input closure, removed/preserved domains, provenance, policy authority and residual limitations are not exactly bound.
+- Disclosure coverage is not derived from its dependency closure, and selection lineage admits extra IDs outside the initial partition and leaves stage closure/provenance unbound.
+- Q-01 still defines a separate source-assurance model rather than consuming this canonical contract.
+
+Resume condition: publish a versioned, schema-bound wire revision with fail-closed construction; repair the complete reverse-consumer closure; bind verifier/declassification/disclosure/selection facts to provider-issued evidence and exact artifacts; remove the Q-01 duplicate owner. Then rerun one independent compatibility and semantic gate.
+
 ### C0-13 — evaluation evidence and independent verdict contracts
 
 Closed portions: the second candidate adds typed contract/revision/digest, evaluator profile/input/output, artifact, verifier and state-fence projections; separates candidate reports from independent verdicts; rejects unknown serde fields; and passes its package gates plus the `eliot-budget` consumer tests.
