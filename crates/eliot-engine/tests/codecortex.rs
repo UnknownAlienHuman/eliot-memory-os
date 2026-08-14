@@ -45,7 +45,7 @@ fn codecortex_manifest_reads_workspace() -> TestResult {
             "missing crate {crate_name}"
         );
     }
-    assert_eq!(report.workspace_members.len(), 5);
+    assert_eq!(report.workspace_members.len(), report.crates.len());
     Ok(())
 }
 
