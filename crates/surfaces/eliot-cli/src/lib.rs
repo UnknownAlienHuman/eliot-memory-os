@@ -6,7 +6,7 @@
 
 #![forbid(unsafe_code)]
 
-use std::collections::BTreeSet;
+use std::{collections::BTreeSet, fmt::Write as _};
 
 use eliot_protocol::RequestIdentity;
 use eliot_receipts::{EffectClass, ProofCeiling};
@@ -783,12 +783,14 @@ impl CommandCatalogue {
         self.validate()?;
         let mut output = format!("eliot command catalogue {CATALOGUE_REVISION}\n\nCOMMANDS\n");
         for spec in self.commands() {
-            output.push_str(&format!(
-                "  {}  [{}] {}\n",
+            writeln!(
+                output,
+                "  {}  [{}] {}",
                 spec.usage,
                 availability_code(spec.availability),
                 spec.summary
-            ));
+            )
+            .map_err(|error| CatalogueError::Serialization(error.to_string()))?;
         }
         Ok(output)
     }
@@ -848,7 +850,7 @@ impl CommandCatalogue {
 }
 
 impl CommandResponse {
-    /// Verifies complete RequestIdentity, command, effect, ceiling and result parity.
+    /// Verifies complete `RequestIdentity`, command, effect, ceiling and result parity.
     pub fn validate_for(
         &self,
         catalogue: CommandCatalogue,
@@ -889,7 +891,6 @@ impl CommandResponse {
                         },
                 },
             ) if actual_dependency == dependency && actual_detail == detail => {}
-            (CommandAvailability::Admitted, _) => return Err(CliError::ResultMismatch),
             _ => return Err(CliError::ResultMismatch),
         }
         Ok(())
@@ -1170,10 +1171,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn provider_identity_comes_from_actual_contract_shapes() {
-        let providers = CommandCatalogue::current()
-            .providers()
-            .expect("provider identities");
+    fn provider_identity_comes_from_actual_contract_shapes() -> Result<(), CatalogueError> {
+        let providers = CommandCatalogue::current().providers()?;
         assert_eq!(providers.len(), 4);
         assert!(
             providers
@@ -1185,5 +1184,6 @@ mod tests {
                 .iter()
                 .all(|provider| provider.shape_sha256.len() == 64)
         );
+        Ok(())
     }
 }

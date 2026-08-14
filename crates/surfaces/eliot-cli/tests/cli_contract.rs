@@ -13,7 +13,6 @@ fn must<T, E: std::fmt::Debug>(result: Result<T, E>) -> T {
 
 fn request_json(command: &str) -> Value {
     let arguments = match command {
-        "system-snapshot" => json!({"kind": "system_snapshot"}),
         "ui" => json!({"kind": "ui"}),
         "dashboard" => json!({"kind": "dashboard"}),
         "bootstrap-brief" => json!({"kind": "bootstrap_brief", "work_unit": "work-unit-1"}),
@@ -92,11 +91,13 @@ fn help_and_schema_are_deterministic_projections_of_one_catalogue() {
     assert!(schema_value.get("output_schema").is_some());
     let commands = schema_value.get("commands").and_then(Value::as_array);
     assert!(commands.is_some());
-    let input_branches = schema_value
-        .get("input_schema")
-        .and_then(|schema| schema.get("oneOf"))
-        .and_then(Value::as_array)
-        .expect("executable input schema branches");
+    let input_branches = must(
+        schema_value
+            .get("input_schema")
+            .and_then(|schema| schema.get("oneOf"))
+            .and_then(Value::as_array)
+            .ok_or("executable input schema branches"),
+    );
     assert_eq!(input_branches.len(), catalogue.commands().len());
     for spec in catalogue.commands() {
         assert!(help.contains(spec.usage));
@@ -104,15 +105,17 @@ fn help_and_schema_are_deterministic_projections_of_one_catalogue() {
             rows.iter()
                 .any(|row| row.get("id").and_then(Value::as_str) == Some(spec.id.as_str()))
         }));
-        let branch = input_branches
-            .iter()
-            .find(|branch| {
-                branch
-                    .pointer("/properties/command/const")
-                    .and_then(Value::as_str)
-                    == Some(spec.id.as_str())
-            })
-            .expect("command branch");
+        let branch = must(
+            input_branches
+                .iter()
+                .find(|branch| {
+                    branch
+                        .pointer("/properties/command/const")
+                        .and_then(Value::as_str)
+                        == Some(spec.id.as_str())
+                })
+                .ok_or("command branch"),
+        );
         assert_eq!(
             branch
                 .pointer("/properties/arguments/properties/kind/const")
@@ -120,18 +123,22 @@ fn help_and_schema_are_deterministic_projections_of_one_catalogue() {
             Some(spec.id.as_str().replace('-', "_").as_str())
         );
     }
-    let doctor_branch = input_branches
-        .iter()
-        .find(|branch| {
-            branch
-                .pointer("/properties/command/const")
-                .and_then(Value::as_str)
-                == Some("doctor-integration")
-        })
-        .expect("doctor integration branch");
-    let doctor_arguments = doctor_branch
-        .pointer("/properties/arguments")
-        .expect("doctor integration arguments");
+    let doctor_branch = must(
+        input_branches
+            .iter()
+            .find(|branch| {
+                branch
+                    .pointer("/properties/command/const")
+                    .and_then(Value::as_str)
+                    == Some("doctor-integration")
+            })
+            .ok_or("doctor integration branch"),
+    );
+    let doctor_arguments = must(
+        doctor_branch
+            .pointer("/properties/arguments")
+            .ok_or("doctor integration arguments"),
+    );
     assert!(doctor_arguments.pointer("/properties/profile").is_some());
     assert!(doctor_arguments.pointer("/properties/scope").is_none());
 }

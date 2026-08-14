@@ -402,6 +402,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "eliot-cli"
+version = "0.1.0"
+dependencies = [
+ "eliot-observation-contracts",
+ "eliot-protocol",
+ "eliot-receipts",
+ "eliot-runtime-contracts",
+ "schemars",
+ "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
 name = "eliot-config"
 version = "0.1.0"
 dependencies = [
