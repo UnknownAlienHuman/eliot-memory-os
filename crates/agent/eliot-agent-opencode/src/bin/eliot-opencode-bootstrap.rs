@@ -101,6 +101,13 @@ fn parse_args(args: &[OsString]) -> Result<CliArgs, CliError> {
     })
 }
 
+fn help_requested(args: &[OsString]) -> bool {
+    args.len() == 2
+        && args[1]
+            .to_str()
+            .is_some_and(|argument| matches!(argument, "-h" | "--help"))
+}
+
 fn decode_prompt(bytes: Vec<u8>) -> Result<String, CliError> {
     if bytes.len() > MAX_PROMPT_BYTES {
         return Err(CliError::PromptTooLarge {
@@ -161,6 +168,16 @@ fn model_selection() -> Result<ModelSelection, CliError> {
 
 async fn run() -> Result<(), CliError> {
     let raw_args = std::env::args_os().collect::<Vec<_>>();
+    if help_requested(&raw_args) {
+        let stdout = io::stdout();
+        let mut writer = io::BufWriter::new(stdout.lock());
+        writeln!(writer, "{USAGE}")
+            .map_err(|error| CliError::Output(sanitize_error(&error.to_string(), "")))?;
+        writer
+            .flush()
+            .map_err(|error| CliError::Output(sanitize_error(&error.to_string(), "")))?;
+        return Ok(());
+    }
     let args = parse_args(&raw_args)?;
     let password = std::env::var("OPENCODE_SERVER_PASSWORD")
         .map_err(|_| CliError::Environment("OPENCODE_SERVER_PASSWORD"))?;
@@ -230,7 +247,7 @@ async fn main() -> ExitCode {
 
 #[cfg(test)]
 mod tests {
-    use super::{CliError, MAX_PROMPT_BYTES, decode_prompt, parse_args};
+    use super::{CliError, MAX_PROMPT_BYTES, decode_prompt, help_requested, parse_args};
     use std::ffi::OsString;
 
     #[test]
@@ -247,6 +264,21 @@ mod tests {
             OsString::from(r"C:\prompt.txt"),
         ];
         assert!(parse_args(&valid).is_ok());
+    }
+
+    #[test]
+    fn help_is_recognized_only_as_the_sole_argument() {
+        for flag in ["-h", "--help"] {
+            assert!(help_requested(&[
+                OsString::from("bootstrap"),
+                OsString::from(flag),
+            ]));
+        }
+        assert!(!help_requested(&[
+            OsString::from("bootstrap"),
+            OsString::from("--help"),
+            OsString::from("unexpected"),
+        ]));
     }
 
     #[test]
