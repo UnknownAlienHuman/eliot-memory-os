@@ -1,0 +1,20 @@
+[package]
+name = "eliot-agent-codex"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Bounded Codex App Server stdio/JSONL adapter for ELIOT"
+
+[dependencies]
+blake3.workspace = true
+eliot-agent-api = { path = "../eliot-agent-api" }
+eliot-process = { path = "../../kernel/eliot-process" }
+eliot-source-assurance = { path = "../../security/eliot-source-assurance" }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+
+[lints]
+workspace = true

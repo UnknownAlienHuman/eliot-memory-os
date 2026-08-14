@@ -6,6 +6,7 @@ members = [
   "crates/eliot-types",
   "crates/eliot-windows-ipc",
   "crates/agent/eliot-agent-api",
+  "crates/agent/eliot-agent-codex",
   "crates/agent/eliot-agent-opencode",
   "crates/foundation/eliot-contracts",
   "crates/kernel/eliot-process",
@@ -27,6 +28,7 @@ base64 = "0.22.1"
 blake3 = "1.8.5"
 clap = { version = "4.6.1", features = ["derive", "env"] }
 eliot-agent-api = { path = "crates/agent/eliot-agent-api", version = "0.1.0" }
+eliot-agent-codex = { path = "crates/agent/eliot-agent-codex", version = "0.1.0" }
 eliot-engine = { path = "crates/eliot-engine", version = "0.1.0" }
 eliot-store = { path = "crates/eliot-store", version = "0.1.0" }
 eliot-types = { path = "crates/eliot-types", version = "0.1.0" }

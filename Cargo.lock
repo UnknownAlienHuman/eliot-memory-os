@@ -264,6 +264,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "eliot-agent-codex"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "eliot-agent-api",
+ "eliot-process",
+ "eliot-source-assurance",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+]
+
+[[package]]
 name = "eliot-agent-opencode"
 version = "0.1.0"
 dependencies = [
