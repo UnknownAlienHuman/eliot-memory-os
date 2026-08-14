@@ -331,6 +331,7 @@ impl BlobStore {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn stage_canonical_memory_ingress(
         &self,
         context: &CommandContext,
@@ -536,6 +537,7 @@ pub(crate) fn canonical_segment_set_hash(segments: &[CanonicalMemorySegment]) ->
     hasher.finalize().to_hex().to_string()
 }
 
+#[allow(clippy::too_many_lines)]
 pub(crate) fn verify_canonical_memory_child_set(
     blob_store: Option<&BlobStore>,
     manifest: &CanonicalMemoryManifest,
@@ -547,7 +549,7 @@ pub(crate) fn verify_canonical_memory_child_set(
         || u64::try_from(cue_pages.len()).map_err(|_| StoreError::BlobTooLarge)?
             != manifest.cue_page_count
     {
-        return Err(invalid_blob(&format!(
+        return Err(invalid_blob(format!(
             "canonical memory child cardinality does not match manifest: segments={}/{}, cue_pages={}/{}",
             segments.len(),
             manifest.segment_count,
@@ -738,6 +740,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn canonical_capacity_is_parent_last_and_fully_reconstructable()
     -> Result<(), Box<dyn std::error::Error>> {
         let temp_dir = std::env::temp_dir().join(format!(

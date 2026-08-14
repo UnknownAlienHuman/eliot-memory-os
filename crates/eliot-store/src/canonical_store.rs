@@ -782,6 +782,7 @@ fn classify_exact_l2_handles(response: &mut FetchAtomsL2Response, selectors: &[L
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn rank_recall_candidates(
     request: &RecallL0Request,
     load: RecallCandidateLoad,
@@ -2499,6 +2500,7 @@ impl CanonicalStore {
         Ok(updated_revision)
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn canonical_memory_projection_rows(
         &self,
         envelope: &MemoryWriteEnvelope,
@@ -5873,7 +5875,7 @@ mod memory_search_selector_tests {
             "memory:capacity-parent".to_owned(),
             format!("memory-segment:{}", "a".repeat(64)),
         ])
-        .expect("capacity selectors");
+        .unwrap_or_else(|error| panic!("capacity selectors: {error}"));
 
         assert_eq!(selectors.len(), 2);
         assert!(
@@ -6099,13 +6101,13 @@ mod memory_search_selector_tests {
     #[test]
     fn cold_rebuild_capacity_streams_every_page_without_semantic_cap() {
         let source = include_str!("canonical_store.rs");
-        let start = source
-            .find("pub async fn rebuild_memory_search_projection")
-            .expect("rebuild source anchor");
+        let Some(start) = source.find("pub async fn rebuild_memory_search_projection") else {
+            panic!("rebuild source anchor");
+        };
         let tail = &source[start..];
-        let end = tail
-            .find("pub async fn memory_search_query_plan")
-            .expect("rebuild end anchor");
+        let Some(end) = tail.find("pub async fn memory_search_query_plan") else {
+            panic!("rebuild end anchor");
+        };
         let rebuild = &tail[..end];
         assert!(rebuild.contains("for kind in RECALL_CANDIDATE_KINDS"));
         assert!(rebuild.contains("RECALL_CANDIDATE_PAGE_SIZE"));

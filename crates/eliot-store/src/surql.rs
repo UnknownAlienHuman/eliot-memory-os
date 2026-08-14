@@ -1151,10 +1151,9 @@ mod tests {
         assert!(load.contains("search::score(0) AS segment_relevance_score"));
         assert!(load.contains("OR search_document @0,OR@ $query_text"));
         assert!(load.contains("segment_relevance_score DESC"));
-        let return_shape = load
-            .rsplit_once("RETURN {")
-            .expect("FTS loader must expose one typed return object")
-            .1;
+        let Some((_, return_shape)) = load.rsplit_once("RETURN {") else {
+            panic!("FTS loader must expose one typed return object");
+        };
         assert!(!return_shape.contains("relevance_score"));
         assert!(load.contains("project_id = $project_id"));
         assert!(load.contains("$candidate_limit > 256"));
@@ -1406,6 +1405,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn canonical_capacity_is_parent_last_paged_and_segment_deduplicated() {
         let write = NamedSurqlOp::ApplyWriteEnvelope.template();
         for marker in [

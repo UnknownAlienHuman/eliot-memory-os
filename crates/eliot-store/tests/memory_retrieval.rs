@@ -106,6 +106,7 @@ fn l2_request(project_id: ProjectId, handles: Vec<String>) -> FetchAtomsL2Reques
 }
 
 #[tokio::test]
+#[allow(clippy::too_many_lines)]
 async fn canonical_capacity_parent_and_tail_segment_are_reachable_through_normal_l2()
 -> Result<(), Box<dyn Error>> {
     let Some(config) = isolated_config() else {
@@ -173,7 +174,10 @@ async fn canonical_capacity_parent_and_tail_segment_are_reachable_through_normal
     let parent = store
         .fetch_atoms_l2(&l2_request(project_id, vec![memory_handle.clone()]))
         .await?;
-    assert_eq!(parent.returned_handles, [memory_handle.clone()]);
+    assert_eq!(
+        parent.returned_handles,
+        std::slice::from_ref(&memory_handle)
+    );
     assert_eq!(parent.canonical_memory_pages.len(), 1);
     let first_page = &parent.canonical_memory_pages[0];
     assert_eq!(first_page.requested_handle, memory_handle);
@@ -204,7 +208,10 @@ async fn canonical_capacity_parent_and_tail_segment_are_reachable_through_normal
     let tail = store
         .fetch_atoms_l2(&l2_request(project_id, vec![tail_segment_id.clone()]))
         .await?;
-    assert_eq!(tail.returned_handles, [tail_segment_id.clone()]);
+    assert_eq!(
+        tail.returned_handles,
+        std::slice::from_ref(&tail_segment_id)
+    );
     assert_eq!(tail.canonical_memory_pages.len(), 1);
     assert_eq!(
         tail.canonical_memory_pages[0]

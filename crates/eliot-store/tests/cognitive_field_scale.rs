@@ -190,7 +190,7 @@ async fn r01_large_corpus_retrieval_meets_target_workstation_slos() -> Result<()
     Ok(())
 }
 
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::large_futures, clippy::too_many_lines)]
 async fn run_scale_ladder(
     store: &CanonicalStore,
     clients: &Arc<DbClientSet>,
@@ -719,7 +719,7 @@ struct QueryMeasurements {
     wall_ms: u128,
 }
 
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::large_futures, clippy::too_many_arguments)]
 async fn measure_queries(
     store: &CanonicalStore,
     project_id: ProjectId,
@@ -855,6 +855,7 @@ struct ConcurrentReadEvidence {
     wall_ms: u128,
 }
 
+#[allow(clippy::large_futures)]
 async fn run_concurrent_readers(
     store: &CanonicalStore,
     local_project_id: ProjectId,
