@@ -213,6 +213,22 @@ Resume condition: make a provider-issued canonical permit the only executable st
 
 ## Active first-gate blockers
 
+### A-13 — isolated native worker core
+
+Mechanical proof is green: format, check, eight unit tests and strict clippy pass; the verifier-generated nested lock was removed.
+
+The source candidate is intentionally non-launching and cannot satisfy its `PROCESS + stale epoch/cancel/effect tests` proof yet:
+
+- `admit_invocation_only` always returns the P-03 dispatch-permit `PLAN_GAP`; no process tree is launched, supervised, cancelled, reconciled or proven orphan-free.
+- The candidate consumes the currently rejected A-01 authority envelope and raw P-03 request/receipt surface. A frame binds only a free-form epoch string, not the exact State Fence, task/lease revisions, generation, route/artifact, process tree or provider-issued dispatch permit.
+- Process-receipt validation compares only the numeric generation and does not bind request/operation/tree/fence/artifact/physical process identity.
+- Callers choose `unknown_outcome` as an input boolean; no observed provider/result/reconciliation evidence establishes that disposition.
+- One global lifecycle is shared by all requests and attempts. Cancellation indexes the cancel request ID instead of a stable target operation identity, can emit a cancelled disposition before reap, and may accept cancellation from `Created` without a legal state transition.
+- Replay/idempotency state is volatile and capped without durable restart semantics; sequence increment is unchecked; capability strings and derived serde can silently normalize or admit semantically invalid projections.
+- No actual crash/restart, partial output, stale generation, effect reconciliation, no-orphan or native/WASM differential corpus is executed.
+
+Resume condition: first accept one canonical A-01/G-01 authority and provider-issued P-03 dispatch path; then bind per-attempt lifecycle/cancel/reap/reconcile identities to the exact process tree and observed effect outcome, make decode fail closed and run the required real process corpus.
+
 ### S-03 — SurrealDB canonical-store adapter
 
 Mechanical proof is green: format, check, six unit tests and strict clippy pass. The generated standalone `Cargo.lock` was removed after verification.
@@ -232,7 +248,7 @@ Repair condition for the one remaining bounded cycle: implement the real sealed 
 ## Work continuing independently
 
 - Independent candidate gates continue for bounded governor/security/store/surface repairs.
-- Candidate reviews pending: A-10, A-13, P-02 IPC and one bounded S-03 repair cycle.
+- Candidate reviews pending: A-10, P-02 IPC and one bounded S-03 repair cycle; A-13 is upstream-blocked on A-01/G-01/P-03.
 - Accepted and integrated source in this pass: G-17 budget/quota state machine (`a774a01`, workspace integration `763f7e2`) and the supervisor deadline fixture (`7a18ece`).
 
 No paused item may be promoted from package-local green tests alone. Each requires its stated prerequisite, an independent semantic gate, root workspace integration, and the normal workspace verifier.
