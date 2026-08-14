@@ -441,7 +441,9 @@ mod tests {
         .expect("runtime");
         match WasmHostRunner::new(opposite, runtime, WasmRuntime::new(None)) {
             Err(RuntimeBuildError::ProfileUnavailable(profile)) => assert_eq!(profile, opposite),
-            Err(_) => panic!("wrong construction error"),
+            Err(RuntimeBuildError::Runtime(error)) => {
+                panic!("wrong construction error: {error:?}")
+            }
             Ok(_) => panic!("uncompiled profile was accepted"),
         }
     }

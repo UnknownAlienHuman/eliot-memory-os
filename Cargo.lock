@@ -788,6 +788,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "eliot-wasm-host"
+version = "0.1.0"
+dependencies = [
+ "eliot-runtime",
+ "eliot-wasm-runtime",
+]
+
+[[package]]
 name = "eliot-wasm-runtime"
 version = "0.1.0"
 dependencies = [

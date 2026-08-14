@@ -1,12 +1,10 @@
 [package]
 name = "eliot-wasm-host"
-version = "0.1.0"
-edition = "2024"
-rust-version = "1.89"
-license = "MIT"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
 description = "Thin profile-selected ELIOT WASM component-host composition"
-
-[workspace]
 
 [lib]
 path = "src/lib.rs"
@@ -21,5 +19,8 @@ eliot-profile-d2-operational = []
 eliot-profile-full-composition = []
 
 [dependencies]
-eliot-runtime = { path = "../../crates/kernel/eliot-runtime", version = "0.1.0" }
-eliot-wasm-runtime = { path = "../../crates/modules/eliot-wasm-runtime", version = "0.1.0" }
+eliot-runtime.workspace = true
+eliot-wasm-runtime.workspace = true
+
+[lints]
+workspace = true
