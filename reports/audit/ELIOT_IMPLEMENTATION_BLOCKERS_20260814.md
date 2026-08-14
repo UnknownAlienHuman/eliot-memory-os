@@ -198,6 +198,19 @@ Remaining authority blockers:
 
 Resume condition: make the complete transaction the applied client contract, bind every named operation to its manifest, validate all manifest-digest surfaces and reject duplicate exact-array identities.
 
+### S-02 — in-memory canonical-store reference
+
+Closed portions: the repair validates before the locked mutation sink, handles identity conflicts, fences revisions/order/manifests, checks overflow, plans before commit and makes clone/health poison-aware. Ten tests and mechanical gates pass.
+
+Remaining reference-store blockers:
+
+- `MemoryState` has no canonical event collection; commit records projections/outbox/relations/operations/receipts but only synthesizes event IDs. Snapshot replay therefore cannot prove atomic event history or equality with the S-01 canonical execution contract.
+- Unsupported named-read variants fall through to a generic successful payload rather than `UnknownOperation`.
+- Health reports a hardcoded `memory-reference-v1` manifest digest instead of the registered active operation-manifest digest.
+- Identity-conflict, ordering-conflict and concurrent linearizability stress tests required by the S-02 proof profile remain absent.
+
+Resume condition: carry and atomically persist exact canonical events in the complete S-01 transaction, reject every unimplemented named operation, bind health to the active manifest and add deterministic equality plus concurrent conflict/linearizability tests.
+
 ### G-08 — problem/conflict/attention state machines
 
 Closed portions: the repair retains the G-08 object family and typed ID/enum hardening with six passing package tests.
