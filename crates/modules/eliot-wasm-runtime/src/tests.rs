@@ -1,0 +1,995 @@
+use std::collections::{BTreeMap, BTreeSet};
+use std::sync::{Arc, Mutex};
+
+use eliot_observation_contracts::ObservationScope;
+use eliot_process::{
+    CancellationReceipt, EnvironmentInheritance, EnvironmentProjection, FencingToken, Generation,
+    OperationId, ProcessEvidence, ProcessLifecycle, ProcessRequest, ProcessStartReceipt,
+    ProcessTreeId, ResourceLimits as ProcessLimits,
+};
+use eliot_runtime_contracts::{ModuleGeneration, RuntimeLease};
+use eliot_security_contracts::{PrivacyClass, SourceAssurance};
+use serde_json::json;
+
+use crate::*;
+
+fn digest(character: char) -> Sha256Digest {
+    Sha256Digest::new(character.to_string().repeat(64)).expect("valid digest")
+}
+
+fn binding() -> EngineBinding {
+    EngineBinding {
+        implementation_id: "engine.test.v1".to_owned(),
+        exact_version: "1.2.3".to_owned(),
+        engine_artifact_digest: digest('8'),
+        engine_configuration_digest: digest('9'),
+        wit_interface_digest: digest('b'),
+    }
+}
+
+fn manifest() -> ComponentManifest {
+    ComponentManifest {
+        component_id: CapabilityId::new("component-1").expect("component"),
+        world: CapabilityId::new("eliot:test/world").expect("world"),
+        wit_version: "1.0.0".to_owned(),
+        guest_target: DEFAULT_GUEST_TARGET.to_owned(),
+        artifact_digest: digest('a'),
+        interface_digest: digest('b'),
+        source_digest: digest('c'),
+        configuration_digest: digest('d'),
+        state_contract_digest: digest('e'),
+        imports: [CapabilityId::new("log").expect("import")]
+            .into_iter()
+            .collect(),
+        exports: [CapabilityId::new("run").expect("export")]
+            .into_iter()
+            .collect(),
+        admitted_privacy_classes: vec![PrivacyClass::Internal],
+        required_verifier: "verifier:a12".to_owned(),
+        engine: binding(),
+    }
+}
+
+fn module_generation() -> ModuleGeneration {
+    serde_json::from_value(json!({
+        "module_id": "component-1",
+        "generation": 1,
+        "artifact_id": "a".repeat(64),
+        "state": "READY",
+        "health": {
+            "liveness": "HEALTHY", "readiness": "HEALTHY",
+            "freshness": "HEALTHY", "compatibility": "HEALTHY",
+            "integrity": "HEALTHY", "capacity": "HEALTHY"
+        },
+        "state_fence": {
+            "authority_epoch": 1, "resource_generation": 1,
+            "task_revision": 1, "policy_revision": 1,
+            "integration_revision": null
+        }
+    }))
+    .expect("generation fixture")
+}
+
+fn work_scope() -> ObservationScope {
+    serde_json::from_value(json!({
+        "work_scope": "scope-1", "task_ref": "task-1",
+        "attempt_ref": "work-1", "module_or_route_ref": "component-1"
+    }))
+    .expect("scope fixture")
+}
+
+fn lease() -> RuntimeLease {
+    serde_json::from_value(json!({
+        "lease_id": "lease-1", "scope_ref": "scope-1", "authority_epoch": 1,
+        "state_fence": {
+            "authority_epoch": 1, "resource_generation": 1,
+            "task_revision": 1, "policy_revision": 1,
+            "integration_revision": null
+        },
+        "state": "ACTIVE"
+    }))
+    .expect("lease fixture")
+}
+
+fn source_assurance() -> SourceAssurance {
+    serde_json::from_value(json!({
+        "source_ref": "source-1", "provenance_ref": "provenance-1",
+        "integrity": "VERIFIED", "freshness": "CURRENT",
+        "competence": "DOMAIN_VERIFIED", "independence": "INDEPENDENT",
+        "privacy_class": "INTERNAL", "instruction_taint": "DATA_ONLY",
+        "allowed_epistemic_use": ["VERIFICATION_INPUT"],
+        "allowed_effects": ["NO_EXTERNAL_EFFECT"],
+        "required_verifier": "verifier:a12", "quarantine": "NONE",
+        "state_fence": {
+            "authority_epoch": 1, "resource_generation": 1,
+            "task_revision": 1, "policy_revision": 1,
+            "integration_revision": null
+        }
+    }))
+    .expect("source fixture")
+}
+
+fn limits() -> InvocationLimits {
+    InvocationLimits {
+        max_input_bytes: 128,
+        max_output_bytes: 128,
+        max_host_calls: 4,
+        max_fuel: 1_000,
+        max_memory_bytes: 65_536,
+        max_table_elements: 64,
+        max_instances: 2,
+        max_stack_bytes: 8_192,
+        wall_deadline_ms: 500,
+        epoch: EpochPolicy {
+            deadline_ticks: 50,
+            cancellation: CancellationPolicy::EpochAndFuel,
+        },
+        artifact_access: ArtifactAccessLimits {
+            allowed_digests: [digest('a')].into_iter().collect(),
+            max_reads: 2,
+            max_bytes: 1_024,
+        },
+    }
+}
+
+fn request() -> InvocationRequest {
+    InvocationRequest::new(
+        InvocationId::new("invoke-1").expect("invocation"),
+        CapabilityId::new("component-1").expect("component"),
+        WorkUnitId::new("work-1").expect("work unit"),
+        WorkScopeRef::new("scope-1").expect("scope"),
+        ExecutionContour::Conformance,
+        vec![1, 2, 3],
+        7,
+        false,
+    )
+    .expect("request")
+}
+
+#[derive(Clone)]
+struct ReportSpec {
+    termination: EngineTermination,
+    output: Vec<u8>,
+    effects: Vec<EffectProposal>,
+    state_delta: Vec<u8>,
+    reaped: bool,
+    post_commit_known: bool,
+    over_meter: bool,
+}
+
+impl ReportSpec {
+    fn success() -> Self {
+        Self {
+            termination: EngineTermination::Completed,
+            output: vec![4, 5],
+            effects: Vec::new(),
+            state_delta: vec![6],
+            reaped: true,
+            post_commit_known: true,
+            over_meter: false,
+        }
+    }
+
+    fn terminated(termination: EngineTermination) -> Self {
+        Self {
+            termination,
+            ..Self::success()
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum InvalidLimit {
+    Table,
+    Instance,
+    Stack,
+    Epoch,
+    ArtifactReads,
+    ArtifactBytes,
+    ArtifactDigest,
+}
+
+#[derive(Clone)]
+#[allow(clippy::struct_excessive_bools)]
+struct Config {
+    governor_error: Option<PortError>,
+    authority_error: Option<PortError>,
+    source_error: Option<PortError>,
+    promotion_error: Option<PortError>,
+    execution_verify_error: Option<PortError>,
+    process_prepare_invalid: bool,
+    process_start_error: Option<PortError>,
+    reject_start_receipt: bool,
+    cancel_receipt_mismatch: bool,
+    reject_cancel_receipt: bool,
+    reject_reconcile_evidence: bool,
+    invalid_limit: Option<InvalidLimit>,
+    stale_source: bool,
+    promotion_mismatch: bool,
+    report: ReportSpec,
+    reconcile_report: ReportSpec,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            governor_error: None,
+            authority_error: None,
+            source_error: None,
+            promotion_error: None,
+            execution_verify_error: None,
+            process_prepare_invalid: false,
+            process_start_error: None,
+            reject_start_receipt: false,
+            cancel_receipt_mismatch: false,
+            reject_cancel_receipt: false,
+            reject_reconcile_evidence: false,
+            invalid_limit: None,
+            stale_source: false,
+            promotion_mismatch: false,
+            report: ReportSpec::success(),
+            reconcile_report: ReportSpec::success(),
+        }
+    }
+}
+
+#[derive(Default)]
+struct MockState {
+    process_start_calls: usize,
+    cancel_calls: usize,
+    engine_calls: usize,
+    last_invocation: Option<EngineInvocation>,
+}
+
+struct GovernorMock {
+    config: Config,
+}
+
+impl GovernorResolutionPort for GovernorMock {
+    fn resolve(&mut self, _request: &InvocationRequest) -> Result<GovernorResolution, PortError> {
+        if let Some(error) = self.config.governor_error {
+            return Err(error);
+        }
+        let mut resolved_limits = limits();
+        match self.config.invalid_limit {
+            Some(InvalidLimit::Table) => resolved_limits.max_table_elements = 0,
+            Some(InvalidLimit::Instance) => resolved_limits.max_instances = 0,
+            Some(InvalidLimit::Stack) => resolved_limits.max_stack_bytes = 0,
+            Some(InvalidLimit::Epoch) => resolved_limits.epoch.deadline_ticks = 0,
+            Some(InvalidLimit::ArtifactReads) => resolved_limits.artifact_access.max_reads = 0,
+            Some(InvalidLimit::ArtifactBytes) => resolved_limits.artifact_access.max_bytes = 0,
+            Some(InvalidLimit::ArtifactDigest) => {
+                resolved_limits.artifact_access.allowed_digests.clear();
+            }
+            None => {}
+        }
+        Ok(GovernorResolution {
+            manifest: manifest(),
+            generation: module_generation(),
+            lease: lease(),
+            authority_revision: Revision::new(1).expect("revision"),
+            lifecycle_revision: Revision::new(1).expect("revision"),
+            limits: resolved_limits,
+            resolution_receipt_digest: digest('2'),
+        })
+    }
+}
+
+struct AuthorityMock {
+    config: Config,
+}
+
+impl AuthorityResolutionPort for AuthorityMock {
+    fn resolve(&mut self, _request: &InvocationRequest) -> Result<AuthorityResolution, PortError> {
+        if let Some(error) = self.config.authority_error {
+            return Err(error);
+        }
+        Ok(AuthorityResolution {
+            owner: OwnerId::new("owner-1").expect("owner"),
+            work_unit: WorkUnitId::new("work-1").expect("work unit"),
+            work_scope: work_scope(),
+            allowed_host_calls: [CapabilityId::new("log").expect("host call")]
+                .into_iter()
+                .collect(),
+            allowed_effect_proposals: BTreeSet::new(),
+            resolution_receipt_digest: digest('3'),
+        })
+    }
+}
+
+struct SourceMock {
+    config: Config,
+}
+
+impl SourceVerificationPort for SourceMock {
+    fn verify(&mut self, _request: &InvocationRequest) -> Result<SourceVerification, PortError> {
+        if let Some(error) = self.config.source_error {
+            return Err(error);
+        }
+        let mut assurance = source_assurance();
+        if self.config.stale_source {
+            assurance.state_fence.task_revision = None;
+        }
+        Ok(SourceVerification {
+            assurance,
+            verification_revision: Revision::new(1).expect("revision"),
+            verification_receipt_digest: digest('4'),
+        })
+    }
+}
+
+struct PromotionMock {
+    config: Config,
+}
+
+impl PromotionVerificationPort for PromotionMock {
+    fn verify(&mut self, _query: &PromotionQuery) -> Result<PromotionVerification, PortError> {
+        if let Some(error) = self.config.promotion_error {
+            return Err(error);
+        }
+        Ok(PromotionVerification {
+            corpus_digest: digest('f'),
+            expected_result_digest: if self.config.promotion_mismatch {
+                digest('7')
+            } else {
+                Sha256Digest::of_bytes(&[4, 5])
+            },
+            expected_effect_digest: canonical_digest(&Vec::<EffectProposal>::new())
+                .expect("effect digest"),
+            expected_state_delta_digest: Sha256Digest::of_bytes(&[6]),
+            verification_revision: Revision::new(1).expect("revision"),
+            shadow: VerificationVerdict::Verified,
+            canary: VerificationVerdict::Verified,
+            rollback: VerificationVerdict::Verified,
+            cutover: VerificationVerdict::Verified,
+            verification_receipt_digest: digest('5'),
+        })
+    }
+
+    fn verify_execution(
+        &mut self,
+        invocation: &EngineInvocation,
+        report: &EngineReport,
+        derived: &DerivedExecutionEvidence,
+    ) -> Result<(), PortError> {
+        if let Some(error) = self.config.execution_verify_error {
+            return Err(error);
+        }
+        let exact = invocation.imports == invocation.manifest.imports
+            && invocation.exports == invocation.manifest.exports
+            && invocation.generation.state_fence == invocation.lease.state_fence
+            && invocation.source_assurance.state_fence == invocation.generation.state_fence
+            && invocation.conformance_corpus_digest == digest('f')
+            && invocation.governor_resolution_receipt_digest == digest('2')
+            && invocation.authority_resolution_receipt_digest == digest('3')
+            && invocation.source_verification_receipt_digest == digest('4')
+            && invocation.promotion_verification_receipt_digest == digest('5')
+            && invocation.state_contract_digest == invocation.manifest.state_contract_digest
+            && derived.result_digest == Sha256Digest::of_bytes(&report.output)
+            && derived.effect_digest
+                == canonical_digest(&report.proposed_effects).expect("effect digest")
+            && derived.state_delta_digest == Sha256Digest::of_bytes(&report.observed_state_delta);
+        if exact {
+            Ok(())
+        } else {
+            Err(PortError::Denied)
+        }
+    }
+}
+
+struct ProcessMock {
+    config: Config,
+    state: Arc<Mutex<MockState>>,
+}
+
+impl P03ProcessPort for ProcessMock {
+    fn prepare(&mut self, envelope: &ProcessLaunchEnvelope) -> Result<ProcessRequest, PortError> {
+        let generation =
+            Generation::new(envelope.generation.generation.value()).expect("process generation");
+        ProcessRequest::new(
+            OperationId::new(envelope.invocation_id.as_str()).expect("operation"),
+            ProcessTreeId::new(if self.config.process_prepare_invalid {
+                "wrong-scope"
+            } else {
+                "scope-1"
+            })
+            .expect("tree"),
+            generation,
+            "eliot-wasm-host.exe",
+            "e".repeat(64),
+            Vec::new(),
+            "C:\\eliot\\runtime",
+            EnvironmentProjection::new(BTreeMap::new(), Vec::new(), EnvironmentInheritance::None)
+                .expect("environment"),
+            ProcessLimits::new(
+                envelope.limits.wall_deadline_ms,
+                None,
+                Some(envelope.limits.max_memory_bytes),
+                envelope.limits.max_output_bytes,
+                envelope.limits.max_output_bytes,
+                0,
+            )
+            .expect("process limits"),
+            FencingToken::new(
+                envelope.lease.state_fence.authority_epoch.value(),
+                generation,
+                "fence-1",
+            )
+            .expect("fence"),
+        )
+        .map_err(|_| PortError::Denied)
+    }
+
+    fn start(&mut self, request: &ProcessRequest) -> Result<ProcessStartReceipt, PortError> {
+        self.state.lock().expect("state").process_start_calls += 1;
+        if let Some(error) = self.config.process_start_error {
+            return Err(error);
+        }
+        ProcessStartReceipt::new(request, ProcessLifecycle::Running).map_err(|_| PortError::Denied)
+    }
+
+    fn cancel(&mut self, request: &ProcessRequest) -> Result<CancellationReceipt, PortError> {
+        self.state.lock().expect("state").cancel_calls += 1;
+        let operation_id = if self.config.cancel_receipt_mismatch {
+            "different-operation"
+        } else {
+            request.operation_id().as_str()
+        };
+        serde_json::from_value(json!({
+            "operation_id": operation_id,
+            "request_digest": request.invocation_digest(),
+            "status": "completed",
+            "lifecycle": "exited",
+            "no_effect_proven": true,
+            "descendants": {
+                "process_ids": [], "complete": true, "tree_terminated": true,
+                "evidence_ref": "cancel-evidence-1"
+            }
+        }))
+        .map_err(|_| PortError::UnknownOutcome)
+    }
+
+    fn reconcile(&mut self, request: &ProcessRequest) -> Result<ProcessEvidence, PortError> {
+        serde_json::from_value(json!({
+            "operation_id": request.operation_id().as_str(),
+            "request_digest": request.invocation_digest(),
+            "view": {
+                "operation_id": request.operation_id().as_str(),
+                "process_tree_id": request.process_tree_id().as_str(),
+                "generation": request.generation().get(),
+                "request_digest": request.invocation_digest(),
+                "lifecycle": "reconciled",
+                "health": {"status":"healthy","ready":false,"observed_at_unix_ms":1,"detail":null},
+                "cancellation": "completed", "identity": null, "exit": null,
+                "descendants": {"process_ids":[],"complete":true,"tree_terminated":true,"evidence_ref":"reconcile-1"},
+                "fence": {
+                    "authority_epoch": request.fence().authority_epoch(),
+                    "generation": request.fence().generation().get(),
+                    "nonce": request.fence().nonce()
+                }
+            },
+            "stdout_ref": null, "stderr_ref": null
+        }))
+        .map_err(|_| PortError::UnknownOutcome)
+    }
+}
+
+struct ReceiptVerifierMock {
+    config: Config,
+}
+
+impl P03ReceiptVerifierPort for ReceiptVerifierMock {
+    fn verify_start(
+        &mut self,
+        request: &ProcessRequest,
+        receipt: &ProcessStartReceipt,
+        envelope: &ProcessLaunchEnvelope,
+    ) -> Result<(), PortError> {
+        if self.config.reject_start_receipt
+            || receipt.operation_id() != request.operation_id()
+            || receipt.request_digest() != request.invocation_digest()
+            || request.fence().authority_epoch()
+                != envelope.lease.state_fence.authority_epoch.value()
+        {
+            Err(PortError::Denied)
+        } else {
+            Ok(())
+        }
+    }
+
+    fn verify_cancellation(
+        &mut self,
+        request: &ProcessRequest,
+        receipt: &CancellationReceipt,
+        envelope: &ProcessLaunchEnvelope,
+    ) -> Result<(), PortError> {
+        let value = serde_json::to_value(receipt).map_err(|_| PortError::UnknownOutcome)?;
+        let exact = value["operation_id"] == request.operation_id().as_str()
+            && value["request_digest"] == request.invocation_digest()
+            && request.fence().authority_epoch()
+                == envelope.lease.state_fence.authority_epoch.value();
+        if self.config.reject_cancel_receipt || !exact {
+            Err(PortError::Denied)
+        } else {
+            Ok(())
+        }
+    }
+
+    fn verify_reconciliation(
+        &mut self,
+        request: &ProcessRequest,
+        evidence: &ProcessEvidence,
+        envelope: &ProcessLaunchEnvelope,
+    ) -> Result<(), PortError> {
+        let exact = evidence.operation_id() == request.operation_id()
+            && evidence.request_digest() == request.invocation_digest()
+            && evidence.view().fence().authority_epoch()
+                == envelope.lease.state_fence.authority_epoch.value();
+        if self.config.reject_reconcile_evidence || !exact {
+            Err(PortError::Denied)
+        } else {
+            Ok(())
+        }
+    }
+}
+
+struct EngineMock {
+    config: Config,
+    state: Arc<Mutex<MockState>>,
+    binding: EngineBinding,
+}
+
+impl EngineMock {
+    fn report(invocation: &EngineInvocation, spec: &ReportSpec) -> EngineReport {
+        let output_bytes = if spec.over_meter {
+            invocation.limits.max_output_bytes + 1
+        } else {
+            spec.output.len() as u64
+        };
+        EngineReport {
+            request_digest: invocation.request_digest.clone(),
+            termination: spec.termination,
+            usage: EngineUsage {
+                output_bytes,
+                host_calls: 0,
+                fuel_consumed: 10,
+                peak_memory_bytes: 1_024,
+                table_elements: 1,
+                instances: 1,
+                stack_bytes: 1_024,
+                elapsed_ms: 10,
+                epoch_ticks: 10,
+                artifact_reads: 1,
+                artifact_bytes: 64,
+                accessed_artifact_digests: vec![invocation.manifest.artifact_digest.clone()],
+            },
+            output: spec.output.clone(),
+            host_calls: Vec::new(),
+            proposed_effects: spec.effects.clone(),
+            observed_state_delta: spec.state_delta.clone(),
+            reaped: spec.reaped,
+            post_commit_known: spec.post_commit_known,
+        }
+    }
+}
+
+impl ComponentEnginePort for EngineMock {
+    fn binding(&self) -> &EngineBinding {
+        &self.binding
+    }
+
+    fn invoke(&mut self, invocation: &EngineInvocation) -> Result<EngineReport, PortError> {
+        let mut state = self.state.lock().expect("state");
+        state.engine_calls += 1;
+        state.last_invocation = Some(invocation.clone());
+        Ok(Self::report(invocation, &self.config.report))
+    }
+
+    fn reconcile(&mut self, invocation: &EngineInvocation) -> Result<EngineReport, PortError> {
+        Ok(Self::report(invocation, &self.config.reconcile_report))
+    }
+}
+
+fn runtime(config: Config) -> (WasmRuntime, Arc<Mutex<MockState>>) {
+    let state = Arc::new(Mutex::new(MockState::default()));
+    let ports = RuntimePorts::new(
+        Box::new(GovernorMock {
+            config: config.clone(),
+        }),
+        Box::new(AuthorityMock {
+            config: config.clone(),
+        }),
+        Box::new(SourceMock {
+            config: config.clone(),
+        }),
+        Box::new(PromotionMock {
+            config: config.clone(),
+        }),
+        Box::new(ProcessMock {
+            config: config.clone(),
+            state: Arc::clone(&state),
+        }),
+        Box::new(ReceiptVerifierMock {
+            config: config.clone(),
+        }),
+        Box::new(EngineMock {
+            config,
+            state: Arc::clone(&state),
+            binding: binding(),
+        }),
+    );
+    (WasmRuntime::new(Some(ports)), state)
+}
+
+#[test]
+fn caller_request_is_inert_without_ports_and_denial_never_reaches_process() {
+    let mut no_ports = WasmRuntime::new(None);
+    let unavailable = no_ports.execute(request());
+    assert_eq!(
+        unavailable.receipt.disposition,
+        InvocationDisposition::Unavailable
+    );
+    assert_eq!(unavailable.receipt.error, Some(RuntimeError::PlanGap));
+
+    let config = Config {
+        governor_error: Some(PortError::Denied),
+        ..Config::default()
+    };
+    let (mut denied_runtime, state) = runtime(config);
+    let denied = denied_runtime.execute(request());
+    assert_eq!(denied.receipt.error, Some(RuntimeError::AuthorityDenied));
+    assert_eq!(state.lock().expect("state").process_start_calls, 0);
+    assert_eq!(state.lock().expect("state").engine_calls, 0);
+}
+
+#[test]
+fn p03_start_and_separate_receipt_verification_precede_engine() {
+    let config = Config {
+        process_prepare_invalid: true,
+        ..Config::default()
+    };
+    let (mut invalid_request_runtime, state) = runtime(config);
+    let result = invalid_request_runtime.execute(request());
+    assert_eq!(
+        result.receipt.error,
+        Some(RuntimeError::InvalidProcessBinding)
+    );
+    assert_eq!(state.lock().expect("state").process_start_calls, 0);
+    assert_eq!(state.lock().expect("state").engine_calls, 0);
+
+    let config = Config {
+        reject_start_receipt: true,
+        ..Config::default()
+    };
+    let (mut runtime, state) = runtime(config);
+    let result = runtime.execute(request());
+    assert_eq!(result.receipt.disposition, InvocationDisposition::Unknown);
+    assert_eq!(
+        result.receipt.error,
+        Some(RuntimeError::InvalidProcessReceipt)
+    );
+    assert_eq!(state.lock().expect("state").process_start_calls, 1);
+    assert_eq!(state.lock().expect("state").engine_calls, 0);
+}
+
+#[test]
+fn engine_receives_the_exact_sealed_authority_and_limit_envelope() {
+    let (mut runtime, state) = runtime(Config::default());
+    assert_eq!(
+        runtime.execute(request()).receipt.disposition,
+        InvocationDisposition::Succeeded
+    );
+    let state = state.lock().expect("state");
+    let invocation = state.last_invocation.as_ref().expect("engine invocation");
+    assert_eq!(invocation.contour, ExecutionContour::Conformance);
+    assert_eq!(invocation.imports, invocation.manifest.imports);
+    assert_eq!(invocation.exports, invocation.manifest.exports);
+    assert_eq!(
+        invocation.generation.state_fence,
+        invocation.lease.state_fence
+    );
+    assert_eq!(invocation.work_unit.as_str(), "work-1");
+    assert_eq!(invocation.authority_revision.get(), 1);
+    assert_eq!(invocation.lifecycle_revision.get(), 1);
+    assert_eq!(invocation.source_verification_revision.get(), 1);
+    assert_eq!(invocation.promotion_verification_revision.get(), 1);
+    assert_eq!(
+        invocation.source_assurance.state_fence,
+        invocation.generation.state_fence
+    );
+    assert_eq!(invocation.conformance_corpus_digest, digest('f'));
+    assert_eq!(invocation.governor_resolution_receipt_digest, digest('2'));
+    assert_eq!(invocation.authority_resolution_receipt_digest, digest('3'));
+    assert_eq!(invocation.source_verification_receipt_digest, digest('4'));
+    assert_eq!(
+        invocation.promotion_verification_receipt_digest,
+        digest('5')
+    );
+    assert_eq!(
+        invocation.state_contract_digest,
+        invocation.manifest.state_contract_digest
+    );
+    assert!(invocation.limits.max_table_elements > 0);
+    assert!(invocation.limits.max_instances > 0);
+    assert!(invocation.limits.max_stack_bytes > 0);
+    assert!(invocation.limits.epoch.deadline_ticks > 0);
+    assert!(
+        invocation
+            .limits
+            .artifact_access
+            .allowed_digests
+            .contains(&invocation.manifest.artifact_digest)
+    );
+}
+
+#[test]
+fn actual_values_are_digested_locally_and_promotion_unavailability_is_plan_gap() {
+    let config = Config {
+        promotion_error: Some(PortError::Unavailable),
+        ..Config::default()
+    };
+    let (mut unavailable_runtime, state) = runtime(config);
+    let unavailable = unavailable_runtime.execute(request());
+    assert_eq!(unavailable.receipt.error, Some(RuntimeError::PlanGap));
+    assert_eq!(state.lock().expect("state").process_start_calls, 0);
+
+    let config = Config {
+        promotion_mismatch: true,
+        ..Config::default()
+    };
+    let (mut mismatch_runtime, _) = runtime(config);
+    let mismatch = mismatch_runtime.execute(request());
+    assert_eq!(
+        mismatch.receipt.error,
+        Some(RuntimeError::DifferentialMismatch)
+    );
+
+    let config = Config {
+        execution_verify_error: Some(PortError::Unavailable),
+        ..Config::default()
+    };
+    let (mut post_execution_gap_runtime, _) = runtime(config);
+    let post_execution_gap = post_execution_gap_runtime.execute(request());
+    assert_eq!(
+        post_execution_gap.receipt.disposition,
+        InvocationDisposition::Unknown
+    );
+    assert_eq!(
+        post_execution_gap.receipt.error,
+        Some(RuntimeError::PlanGap)
+    );
+}
+
+#[test]
+fn terminal_success_cannot_be_overwritten_by_cancel_and_replay_is_stable() {
+    let original = request();
+    let invocation_id = original.invocation_id.clone();
+    let request_digest = original.request_digest().clone();
+    let (mut runtime, state) = runtime(Config::default());
+    let success = runtime.execute(original.clone());
+    assert_eq!(
+        runtime.cancel(&invocation_id, &request_digest),
+        Err(RuntimeError::TerminalCancellationConflict)
+    );
+    assert_eq!(runtime.execute(original), success);
+    assert_eq!(state.lock().expect("state").cancel_calls, 0);
+}
+
+#[test]
+fn cancellation_receipt_must_bind_exact_request_and_fence() {
+    let mut partial = ReportSpec::terminated(EngineTermination::Partial);
+    partial.post_commit_known = false;
+    let config = Config {
+        cancel_receipt_mismatch: true,
+        report: partial,
+        ..Config::default()
+    };
+    let original = request();
+    let invocation_id = original.invocation_id.clone();
+    let request_digest = original.request_digest().clone();
+    let (mut runtime, _) = runtime(config);
+    assert_eq!(
+        runtime.execute(original).receipt.disposition,
+        InvocationDisposition::Unknown
+    );
+    let cancelled = runtime
+        .cancel(&invocation_id, &request_digest)
+        .expect("typed cancel result");
+    assert_eq!(
+        cancelled.receipt.disposition,
+        InvocationDisposition::Unknown
+    );
+    assert_eq!(
+        cancelled.receipt.error,
+        Some(RuntimeError::InvalidProcessReceipt)
+    );
+}
+
+#[test]
+fn extended_table_instance_stack_epoch_and_artifact_limits_fail_closed() {
+    for invalid_limit in [
+        InvalidLimit::Table,
+        InvalidLimit::Instance,
+        InvalidLimit::Stack,
+        InvalidLimit::Epoch,
+        InvalidLimit::ArtifactReads,
+        InvalidLimit::ArtifactBytes,
+        InvalidLimit::ArtifactDigest,
+    ] {
+        let config = Config {
+            invalid_limit: Some(invalid_limit),
+            ..Config::default()
+        };
+        let (mut runtime, state) = runtime(config);
+        let result = runtime.execute(request());
+        assert_eq!(result.receipt.error, Some(RuntimeError::InvalidLimits));
+        assert_eq!(state.lock().expect("state").process_start_calls, 0);
+        assert_eq!(state.lock().expect("state").engine_calls, 0);
+    }
+
+    let mut invalid_cancellation = serde_json::to_value(limits()).expect("limits serialize");
+    invalid_cancellation["epoch"]["cancellation"] = json!("CALLER_CONTROLLED");
+    assert!(serde_json::from_value::<InvocationLimits>(invalid_cancellation).is_err());
+}
+
+#[test]
+fn malformed_ids_digests_and_unknown_fields_fail_deserialization() {
+    let value = serde_json::to_value(request()).expect("serialize");
+    let mut blank_id = value.clone();
+    blank_id["invocation_id"] = json!("");
+    assert!(serde_json::from_value::<InvocationRequest>(blank_id).is_err());
+    let mut bad_digest = value.clone();
+    bad_digest["request_digest"] = json!("A".repeat(64));
+    assert!(serde_json::from_value::<InvocationRequest>(bad_digest).is_err());
+    let mut unknown = value;
+    unknown["authority"] = json!({});
+    assert!(serde_json::from_value::<InvocationRequest>(unknown).is_err());
+}
+
+#[test]
+fn replay_conflict_is_rejected_without_second_engine_call() {
+    let original = request();
+    let (mut runtime, state) = runtime(Config::default());
+    let success = runtime.execute(original.clone());
+    let mut conflict = original.clone();
+    conflict.input.push(9);
+    conflict.refresh_digest().expect("reseal");
+    assert_eq!(
+        runtime.execute(conflict).receipt.error,
+        Some(RuntimeError::ReplayConflict)
+    );
+    assert_eq!(runtime.execute(original), success);
+    assert_eq!(state.lock().expect("state").engine_calls, 1);
+}
+
+#[test]
+fn trap_and_all_limit_terminations_remain_typed() {
+    let cases = [
+        (
+            EngineTermination::Trap(TrapClass::GuestTrap),
+            RuntimeError::Trap(TrapClass::GuestTrap),
+        ),
+        (EngineTermination::OutputLimit, RuntimeError::OutputLimit),
+        (
+            EngineTermination::HostCallLimit,
+            RuntimeError::HostCallLimit,
+        ),
+        (
+            EngineTermination::FuelExhausted,
+            RuntimeError::FuelExhausted,
+        ),
+        (EngineTermination::MemoryLimit, RuntimeError::MemoryLimit),
+        (EngineTermination::TableLimit, RuntimeError::TableLimit),
+        (
+            EngineTermination::InstanceLimit,
+            RuntimeError::InstanceLimit,
+        ),
+        (EngineTermination::StackLimit, RuntimeError::StackLimit),
+        (EngineTermination::Deadline, RuntimeError::Deadline),
+        (
+            EngineTermination::EpochDeadline,
+            RuntimeError::EpochDeadline,
+        ),
+        (
+            EngineTermination::ArtifactAccessDenied,
+            RuntimeError::ArtifactAccessDenied,
+        ),
+        (EngineTermination::Cancelled, RuntimeError::Cancelled),
+    ];
+    for (termination, expected) in cases {
+        let config = Config {
+            report: ReportSpec::terminated(termination),
+            ..Config::default()
+        };
+        let (mut runtime, _) = runtime(config);
+        assert_eq!(runtime.execute(request()).receipt.error, Some(expected));
+    }
+}
+
+#[test]
+fn partial_and_post_commit_unknown_reconcile_only_after_p03_evidence() {
+    for termination in [
+        EngineTermination::Partial,
+        EngineTermination::PostCommitUnknown,
+    ] {
+        let mut initial = ReportSpec::terminated(termination);
+        initial.post_commit_known = false;
+        let config = Config {
+            report: initial,
+            reconcile_report: ReportSpec::success(),
+            ..Config::default()
+        };
+        let original = request();
+        let invocation_id = original.invocation_id.clone();
+        let request_digest = original.request_digest().clone();
+        let (mut runtime, _) = runtime(config);
+        assert_eq!(
+            runtime.execute(original.clone()).receipt.disposition,
+            InvocationDisposition::Unknown
+        );
+        let reconciled = runtime
+            .reconcile(&invocation_id, &request_digest)
+            .expect("reconciled");
+        assert_eq!(
+            reconciled.receipt.disposition,
+            InvocationDisposition::Succeeded
+        );
+        assert_eq!(runtime.execute(original), reconciled);
+    }
+}
+
+#[test]
+fn stale_source_forbidden_effect_and_meter_violation_never_succeed() {
+    let stale = Config {
+        stale_source: true,
+        ..Config::default()
+    };
+    let (mut stale_runtime, _) = runtime(stale);
+    assert_eq!(
+        stale_runtime.execute(request()).receipt.error,
+        Some(RuntimeError::StaleFence)
+    );
+
+    let forbidden = Config {
+        report: ReportSpec {
+            effects: vec![EffectProposal {
+                effect_kind: CapabilityId::new("network.send").expect("effect"),
+                payload_digest: digest('6'),
+            }],
+            ..ReportSpec::success()
+        },
+        ..Config::default()
+    };
+    let (mut forbidden_runtime, _) = runtime(forbidden);
+    assert_eq!(
+        forbidden_runtime.execute(request()).receipt.error,
+        Some(RuntimeError::EngineContractViolation)
+    );
+
+    let over_meter = Config {
+        report: ReportSpec {
+            over_meter: true,
+            ..ReportSpec::success()
+        },
+        ..Config::default()
+    };
+    let (mut metered_runtime, _) = runtime(over_meter);
+    assert_eq!(
+        metered_runtime.execute(request()).receipt.error,
+        Some(RuntimeError::EngineContractViolation)
+    );
+}
+
+#[test]
+fn caller_cancellation_is_checked_before_any_port_effect() {
+    let mut cancelled = request();
+    cancelled.cancellation_requested = true;
+    cancelled.refresh_digest().expect("reseal");
+    let (mut runtime, state) = runtime(Config::default());
+    assert_eq!(
+        runtime.execute(cancelled).receipt.error,
+        Some(RuntimeError::Cancelled)
+    );
+    assert_eq!(state.lock().expect("state").process_start_calls, 0);
+    assert_eq!(state.lock().expect("state").engine_calls, 0);
+}
