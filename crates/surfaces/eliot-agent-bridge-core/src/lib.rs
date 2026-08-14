@@ -10,12 +10,13 @@
 use std::collections::BTreeMap;
 use std::fmt;
 
-use eliot_agent_api::{HostEventEnvelope, SessionId};
-use eliot_observation_contracts::{BlindInterval, CoverageGap, CoverageInterval, GapDisposition};
-use eliot_process::{FencingToken, Generation};
-use eliot_protocol::{
-    AckPhase, DeliveryClass, EventAckReceipt, EventDisposition, EventEnvelope, Frame, ReplayLedger,
+pub use eliot_agent_api::{HostEventEnvelope, SessionId, TaskId, WorkUnitId};
+pub use eliot_observation_contracts::{
+    BlindInterval, CoverageGap, CoverageInterval, GapDisposition,
 };
+pub use eliot_process::{FencingToken, Generation};
+pub use eliot_protocol::{AckPhase, DeliveryClass, EventDisposition, EventEnvelope, Frame};
+use eliot_protocol::{EventAckReceipt, ReplayLedger};
 use serde::{Deserialize, Deserializer, Serialize, de};
 use thiserror::Error;
 
@@ -293,6 +294,73 @@ impl AttachRequest {
     }
 }
 
+/// Exact task, work-scope, and admitted-plan revision resolved by the trusted
+/// host activation provider. A-16 exposes this projection read-only and does
+/// not offer a public constructor for it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TaskBinding {
+    task_id: TaskId,
+    work_unit_id: WorkUnitId,
+    work_scope_id: String,
+    task_revision: String,
+    plan_id: String,
+    plan_revision: String,
+}
+
+impl TaskBinding {
+    fn seal(
+        task_id: TaskId,
+        work_unit_id: WorkUnitId,
+        work_scope_id: impl Into<String>,
+        task_revision: impl Into<String>,
+        plan_id: impl Into<String>,
+        plan_revision: impl Into<String>,
+    ) -> Result<Self, BridgeError> {
+        let work_scope_id = work_scope_id.into();
+        let task_revision = task_revision.into();
+        let plan_id = plan_id.into();
+        let plan_revision = plan_revision.into();
+        validate_text(task_id.as_str(), "task_binding.task_id")?;
+        validate_text(work_unit_id.as_str(), "task_binding.work_unit_id")?;
+        validate_text(&work_scope_id, "task_binding.work_scope_id")?;
+        validate_text(&task_revision, "task_binding.task_revision")?;
+        validate_text(&plan_id, "task_binding.plan_id")?;
+        validate_text(&plan_revision, "task_binding.plan_revision")?;
+        Ok(Self {
+            task_id,
+            work_unit_id,
+            work_scope_id,
+            task_revision,
+            plan_id,
+            plan_revision,
+        })
+    }
+
+    pub const fn task_id(&self) -> &TaskId {
+        &self.task_id
+    }
+
+    pub const fn work_unit_id(&self) -> &WorkUnitId {
+        &self.work_unit_id
+    }
+
+    pub fn work_scope_id(&self) -> &str {
+        &self.work_scope_id
+    }
+
+    pub fn task_revision(&self) -> &str {
+        &self.task_revision
+    }
+
+    pub fn plan_id(&self) -> &str {
+        &self.plan_id
+    }
+
+    pub fn plan_revision(&self) -> &str {
+        &self.plan_revision
+    }
+}
+
 /// Authenticated result emitted only by the injected host activation boundary.
 /// It is inert until A-16 validates and seals it into its private grant.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -301,21 +369,38 @@ pub struct ActivationPortResult {
     session_id: SessionId,
     activation_generation: Generation,
     state_fence: FencingToken,
+    task_binding: Box<TaskBinding>,
 }
 
 impl ActivationPortResult {
+    #[allow(clippy::too_many_arguments)]
     pub fn authenticated(
         principal_id: PrincipalId,
         session_id: SessionId,
         activation_generation: Generation,
         state_fence: FencingToken,
+        task_id: TaskId,
+        work_unit_id: WorkUnitId,
+        work_scope_id: impl Into<String>,
+        task_revision: impl Into<String>,
+        plan_id: impl Into<String>,
+        plan_revision: impl Into<String>,
     ) -> Result<Self, BridgeError> {
         validate_authority_binding(&session_id, activation_generation, &state_fence)?;
+        let task_binding = TaskBinding::seal(
+            task_id,
+            work_unit_id,
+            work_scope_id,
+            task_revision,
+            plan_id,
+            plan_revision,
+        )?;
         Ok(Self {
             principal_id,
             session_id,
             activation_generation,
             state_fence,
+            task_binding: Box::new(task_binding),
         })
     }
 }
@@ -326,6 +411,7 @@ struct ActivationGrant {
     session_id: SessionId,
     activation_generation: Generation,
     state_fence: FencingToken,
+    task_binding: TaskBinding,
 }
 
 impl ActivationGrant {
@@ -340,6 +426,7 @@ impl ActivationGrant {
             session_id: result.session_id,
             activation_generation: result.activation_generation,
             state_fence: result.state_fence,
+            task_binding: *result.task_binding,
         })
     }
 }
@@ -447,6 +534,7 @@ pub struct AttachBinding {
     connection_id: ConnectionId,
     activation_generation: Generation,
     state_fence: FencingToken,
+    task_binding: TaskBinding,
 }
 
 impl AttachBinding {
@@ -470,7 +558,22 @@ impl AttachBinding {
         &self.state_fence
     }
 
+    pub const fn task_binding(&self) -> &TaskBinding {
+        &self.task_binding
+    }
+
     fn authority_matches(
+        &self,
+        session_id: &SessionId,
+        generation: Generation,
+        fence: &FencingToken,
+        task_binding: &TaskBinding,
+    ) -> bool {
+        self.transport_authority_matches(session_id, generation, fence)
+            && &self.task_binding == task_binding
+    }
+
+    fn transport_authority_matches(
         &self,
         session_id: &SessionId,
         generation: Generation,
@@ -543,21 +646,25 @@ pub struct ReconciliationPortResult {
     session_id: SessionId,
     activation_generation: Generation,
     state_fence: FencingToken,
+    task_binding: Box<TaskBinding>,
     receipt_ref: ReconciliationReceiptRef,
 }
 
 impl ReconciliationPortResult {
     pub fn reconciled(
-        session_id: SessionId,
-        activation_generation: Generation,
-        state_fence: FencingToken,
+        binding: &AttachBinding,
         receipt_ref: ReconciliationReceiptRef,
     ) -> Result<Self, BridgeError> {
-        validate_authority_binding(&session_id, activation_generation, &state_fence)?;
+        validate_authority_binding(
+            &binding.session_id,
+            binding.activation_generation,
+            &binding.state_fence,
+        )?;
         Ok(Self {
-            session_id,
-            activation_generation,
-            state_fence,
+            session_id: binding.session_id.clone(),
+            activation_generation: binding.activation_generation,
+            state_fence: binding.state_fence.clone(),
+            task_binding: Box::new(binding.task_binding.clone()),
             receipt_ref,
         })
     }
@@ -580,6 +687,7 @@ struct ReconciliationPermit {
     session_id: SessionId,
     activation_generation: Generation,
     state_fence: FencingToken,
+    task_binding: TaskBinding,
     receipt_ref: ReconciliationReceiptRef,
 }
 
@@ -594,6 +702,7 @@ impl ReconciliationPermit {
             session_id: result.session_id,
             activation_generation: result.activation_generation,
             state_fence: result.state_fence,
+            task_binding: *result.task_binding,
             receipt_ref: result.receipt_ref,
         })
     }
@@ -754,6 +863,7 @@ impl AgentBridgeCore {
                     &grant.session_id,
                     grant.activation_generation,
                     &grant.state_fence,
+                    &grant.task_binding,
                 ) {
                     return Err(BridgeError::StaleAuthority);
                 }
@@ -772,6 +882,7 @@ impl AgentBridgeCore {
                 connection_id: request.connection_id,
                 activation_generation: grant.activation_generation,
                 state_fence: grant.state_fence,
+                task_binding: grant.task_binding,
             },
             reconciliation_required: request.attach_kind == AttachKind::External,
             blind_interval: request.pre_attach_blind_interval,
@@ -785,7 +896,7 @@ impl AgentBridgeCore {
 
     pub fn reconnect(&mut self, request: ReconnectRequest) -> Result<AttachView, BridgeError> {
         let active = self.active.as_mut().ok_or(BridgeError::NotAttached)?;
-        if !active.binding.authority_matches(
+        if !active.binding.transport_authority_matches(
             &request.session_id,
             request.activation_generation,
             &request.state_fence,
@@ -825,6 +936,7 @@ impl AgentBridgeCore {
             &permit.session_id,
             permit.activation_generation,
             &permit.state_fence,
+            &permit.task_binding,
         ) {
             return Err(BridgeError::StaleAuthority);
         }

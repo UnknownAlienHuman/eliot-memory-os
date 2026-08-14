@@ -1,17 +1,15 @@
 use std::collections::{BTreeSet, VecDeque};
 use std::sync::{Arc, Mutex};
 
-use eliot_agent_api::{HostEventEnvelope, SessionId};
 use eliot_agent_bridge_core::{
-    ActivationPortOutcome, ActivationPortResult, AgentBridgeCore, AttachRequest, BridgeError,
-    ConnectionId, CursorPolicy, DemandId, EventForwardAck, EventForwardStatus, EventPortOutcome,
-    HostActivationPort, McpForwardingPort, PrincipalId, ProofCeiling, ProviderFailure,
-    ProviderReadiness, ReconciliationPortOutcome, ReconciliationPortResult,
-    ReconciliationReceiptRef, ReconnectRequest, RequiredProvider,
+    AckPhase, ActivationPortOutcome, ActivationPortResult, AgentBridgeCore, AttachBinding,
+    AttachRequest, BlindInterval, BridgeError, ConnectionId, CoverageGap, CoverageInterval,
+    CursorPolicy, DemandId, EventDisposition, EventEnvelope, EventForwardAck, EventForwardStatus,
+    EventPortOutcome, FencingToken, Frame, Generation, HostActivationPort, HostEventEnvelope,
+    McpForwardingPort, PrincipalId, ProofCeiling, ProviderFailure, ProviderReadiness,
+    ReconciliationPortOutcome, ReconciliationPortResult, ReconciliationReceiptRef,
+    ReconnectRequest, RequiredProvider, SessionId, TaskId, WorkUnitId,
 };
-use eliot_observation_contracts::{BlindInterval, CoverageGap, CoverageInterval};
-use eliot_process::{FencingToken, Generation};
-use eliot_protocol::{AckPhase, EventDisposition, EventEnvelope, Frame};
 use serde_json::json;
 
 #[derive(Default)]
@@ -76,7 +74,7 @@ struct FakeForwarder {
 impl McpForwardingPort for FakeForwarder {
     fn forward_frame(
         &mut self,
-        _binding: &eliot_agent_bridge_core::AttachBinding,
+        _binding: &AttachBinding,
         _frame: &Frame,
     ) -> Result<(), ProviderFailure> {
         self.state
@@ -88,7 +86,7 @@ impl McpForwardingPort for FakeForwarder {
 
     fn forward_hook(
         &mut self,
-        _binding: &eliot_agent_bridge_core::AttachBinding,
+        _binding: &AttachBinding,
         _event: &HostEventEnvelope,
     ) -> Result<(), ProviderFailure> {
         self.state
@@ -100,7 +98,7 @@ impl McpForwardingPort for FakeForwarder {
 
     fn forward_event(
         &mut self,
-        _binding: &eliot_agent_bridge_core::AttachBinding,
+        _binding: &AttachBinding,
         _event: &EventEnvelope,
     ) -> Result<EventPortOutcome, ProviderFailure> {
         let mut state = self
@@ -116,7 +114,7 @@ impl McpForwardingPort for FakeForwarder {
 
     fn forward_gap(
         &mut self,
-        _binding: &eliot_agent_bridge_core::AttachBinding,
+        _binding: &AttachBinding,
         gap: &CoverageGap,
     ) -> Result<(), ProviderFailure> {
         self.state
@@ -129,7 +127,7 @@ impl McpForwardingPort for FakeForwarder {
 
     fn reconcile_external(
         &mut self,
-        _binding: &eliot_agent_bridge_core::AttachBinding,
+        _binding: &AttachBinding,
     ) -> Result<ReconciliationPortOutcome, ProviderFailure> {
         self.state
             .lock()
@@ -153,11 +151,24 @@ fn fence(value: u64) -> Result<FencingToken, Box<dyn std::error::Error>> {
 }
 
 fn activation_result(value: u64) -> Result<ActivationPortResult, Box<dyn std::error::Error>> {
+    activation_result_with_binding(value, &value.to_string())
+}
+
+fn activation_result_with_binding(
+    value: u64,
+    binding_tag: &str,
+) -> Result<ActivationPortResult, Box<dyn std::error::Error>> {
     Ok(ActivationPortResult::authenticated(
         PrincipalId::new("principal-1")?,
         SessionId::new(format!("session-{value}"))?,
         generation(value)?,
         fence(value)?,
+        TaskId::new(format!("task-{binding_tag}"))?,
+        WorkUnitId::new(format!("work-unit-{binding_tag}"))?,
+        format!("scope-{binding_tag}"),
+        format!("task-revision-{binding_tag}"),
+        format!("plan-{binding_tag}"),
+        format!("plan-revision-{binding_tag}"),
     )?)
 }
 
@@ -296,6 +307,95 @@ fn attach_binds_authenticated_connection_session_generation_and_fence()
     assert_eq!(binding.activation_generation().get(), 1);
     assert_eq!(binding.state_fence().authority_epoch(), 1);
     assert_eq!(binding.state_fence().generation().get(), 1);
+    assert_eq!(binding.task_binding().task_id().as_str(), "task-1");
+    assert_eq!(
+        binding.task_binding().work_unit_id().as_str(),
+        "work-unit-1"
+    );
+    assert_eq!(binding.task_binding().work_scope_id(), "scope-1");
+    assert_eq!(binding.task_binding().task_revision(), "task-revision-1");
+    assert_eq!(binding.task_binding().plan_id(), "plan-1");
+    assert_eq!(binding.task_binding().plan_revision(), "plan-revision-1");
+    Ok(())
+}
+
+#[test]
+fn same_generation_attach_rejects_a_different_resolved_task_binding()
+-> Result<(), Box<dyn std::error::Error>> {
+    let host = SequencedHost {
+        outcomes: VecDeque::from([
+            ActivationPortOutcome::Authenticated(activation_result_with_binding(1, "first")?),
+            ActivationPortOutcome::Authenticated(activation_result_with_binding(1, "second")?),
+        ]),
+    };
+    let mut bridge = AgentBridgeCore::new(
+        ProviderReadiness::all_admitted(),
+        Some(Box::new(host)),
+        Some(Box::new(FakeForwarder {
+            state: Arc::new(Mutex::new(ForwardState::default())),
+        })),
+        CursorPolicy::new(AckPhase::Durable, AckPhase::Normalized)?,
+    );
+
+    let first = bridge.attach(managed_request_with("demand-1", "connection-1")?)?;
+    assert_eq!(
+        first.binding().task_binding().task_id().as_str(),
+        "task-first"
+    );
+    assert!(matches!(
+        bridge.attach(managed_request_with("demand-2", "connection-1")?),
+        Err(BridgeError::StaleAuthority)
+    ));
+    assert_eq!(
+        bridge
+            .attach_view()
+            .ok_or("missing original attach")?
+            .binding()
+            .task_binding(),
+        first.binding().task_binding()
+    );
+    Ok(())
+}
+
+#[test]
+fn trusted_activation_rejects_empty_task_binding_fields() -> Result<(), Box<dyn std::error::Error>>
+{
+    for empty_field in ["work_scope_id", "task_revision", "plan_id", "plan_revision"] {
+        let work_scope_id = if empty_field == "work_scope_id" {
+            ""
+        } else {
+            "scope"
+        };
+        let task_revision = if empty_field == "task_revision" {
+            ""
+        } else {
+            "task-revision"
+        };
+        let plan_id = if empty_field == "plan_id" { "" } else { "plan" };
+        let plan_revision = if empty_field == "plan_revision" {
+            ""
+        } else {
+            "plan-revision"
+        };
+        assert!(
+            matches!(
+                ActivationPortResult::authenticated(
+                    PrincipalId::new("principal")?,
+                    SessionId::new("session")?,
+                    generation(1)?,
+                    fence(1)?,
+                    TaskId::new("task")?,
+                    WorkUnitId::new("work-unit")?,
+                    work_scope_id,
+                    task_revision,
+                    plan_id,
+                    plan_revision,
+                ),
+                Err(BridgeError::InvalidContract { .. })
+            ),
+            "{empty_field} must fail closed"
+        );
+    }
     Ok(())
 }
 
@@ -307,7 +407,8 @@ fn reconnect_replaces_transport_but_rejects_stale_generation_and_session()
         Arc::new(Mutex::new(HostState::default())),
         Arc::clone(&forward_state),
     )?;
-    bridge.attach(managed_request("connection-1")?)?;
+    let original = bridge.attach(managed_request("connection-1")?)?;
+    let original_task_binding = original.binding().task_binding().clone();
     assert!(matches!(
         bridge.attach(managed_request("connection-2")?),
         Err(BridgeError::InvalidTransition(_))
@@ -332,6 +433,7 @@ fn reconnect_replaces_transport_but_rejects_stale_generation_and_session()
     )?;
     let view = bridge.reconnect(current)?;
     assert_eq!(view.binding().connection_id().as_str(), "connection-2");
+    assert_eq!(view.binding().task_binding(), &original_task_binding);
     assert!(matches!(
         bridge.forward_frame(&frame("connection-1")?),
         Err(BridgeError::StaleTransport)
@@ -621,19 +723,10 @@ fn best_effort_drop_emits_an_explicit_hook_gap_signal() -> Result<(), Box<dyn st
 fn external_attach_stays_candidate_until_reconciled_and_never_promotes_history()
 -> Result<(), Box<dyn std::error::Error>> {
     let forward_state = Arc::new(Mutex::new(ForwardState::default()));
-    forward_state
-        .lock()
-        .map_err(|_| "forward state lock poisoned")?
-        .reconciliations
-        .push_back(ReconciliationPortOutcome::Reconciled(
-            ReconciliationPortResult::reconciled(
-                SessionId::new("session-1")?,
-                generation(1)?,
-                fence(1)?,
-                ReconciliationReceiptRef::new("external-attach-reconciliation-receipt-1")?,
-            )?,
-        ));
-    let mut bridge = bridge(Arc::new(Mutex::new(HostState::default())), forward_state)?;
+    let mut bridge = bridge(
+        Arc::new(Mutex::new(HostState::default())),
+        Arc::clone(&forward_state),
+    )?;
     let request = AttachRequest::external(
         DemandId::new("external-demand")?,
         ConnectionId::new("connection-1")?,
@@ -652,6 +745,16 @@ fn external_attach_stays_candidate_until_reconciled_and_never_promotes_history()
         bridge.forward_hook(&hook()?),
         Err(BridgeError::ExternalAttachReconciliationRequired)
     ));
+    forward_state
+        .lock()
+        .map_err(|_| "forward state lock poisoned")?
+        .reconciliations
+        .push_back(ReconciliationPortOutcome::Reconciled(
+            ReconciliationPortResult::reconciled(
+                view.binding(),
+                ReconciliationReceiptRef::new("external-attach-reconciliation-receipt-1")?,
+            )?,
+        ));
 
     let reconciled = bridge.reconcile_external()?;
     assert!(!reconciled.reconciliation_required());
@@ -660,6 +763,57 @@ fn external_attach_stays_candidate_until_reconciled_and_never_promotes_history()
         Some(ProofCeiling::CandidateOnly)
     );
     bridge.forward_hook(&hook()?)?;
+    Ok(())
+}
+
+#[test]
+fn external_reconciliation_rejects_a_different_resolved_task_binding()
+-> Result<(), Box<dyn std::error::Error>> {
+    let forward_state = Arc::new(Mutex::new(ForwardState::default()));
+    let mut bridge = bridge(
+        Arc::new(Mutex::new(HostState::default())),
+        Arc::clone(&forward_state),
+    )?;
+    bridge.attach(AttachRequest::external(
+        DemandId::new("external-demand")?,
+        ConnectionId::new("connection-1")?,
+        BlindInterval {
+            interval: CoverageInterval::new(1, 2)?,
+            reason_ref: "pre-attach-unobserved".to_owned(),
+        },
+    )?)?;
+
+    let mut other = AgentBridgeCore::new(
+        ProviderReadiness::all_admitted(),
+        Some(Box::new(CoalescingHost {
+            state: Arc::new(Mutex::new(HostState::default())),
+            result: activation_result_with_binding(1, "different")?,
+        })),
+        None,
+        CursorPolicy::new(AckPhase::Durable, AckPhase::Normalized)?,
+    );
+    let other_view = other.attach(managed_request("other-connection")?)?;
+    forward_state
+        .lock()
+        .map_err(|_| "forward state lock poisoned")?
+        .reconciliations
+        .push_back(ReconciliationPortOutcome::Reconciled(
+            ReconciliationPortResult::reconciled(
+                other_view.binding(),
+                ReconciliationReceiptRef::new("wrong-task-binding-receipt")?,
+            )?,
+        ));
+
+    assert!(matches!(
+        bridge.reconcile_external(),
+        Err(BridgeError::StaleAuthority)
+    ));
+    assert!(
+        bridge
+            .attach_view()
+            .ok_or("missing external attach")?
+            .reconciliation_required()
+    );
     Ok(())
 }
 
@@ -843,6 +997,12 @@ fn serde_and_constructors_fail_closed() -> Result<(), Box<dyn std::error::Error>
             SessionId::new("session")?,
             generation(1)?,
             fence(2)?,
+            TaskId::new("task")?,
+            WorkUnitId::new("work-unit")?,
+            "scope",
+            "task-revision",
+            "plan",
+            "plan-revision",
         )
         .is_err()
     );
