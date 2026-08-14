@@ -70,6 +70,21 @@ Remaining authority blockers:
 
 Resume condition: publish the complete component/engine identity and receipt bindings, derive differential proof from observed artifacts, bind promotion to exact receipts, make terminal replay immutable, preserve post-commit unknown, and add duplicate-array/adversarial adapter regressions. Then rerun an independent gate without changing the Runtime oracle.
 
+### A-10 — one-shot notification delivery
+
+Closed portions: the Luna repair enforces lowercase 64-hex shapes, expands process-local replay identity, maps `delivered=false` to failure, keeps the effect ceiling notification-only and passes 11 local tests plus mechanical gates.
+
+Remaining authority blockers:
+
+- Fallback signer/session authorization is entirely caller-fabricable: signatures are shape-checked but never verified, and the alleged signer receipt and authenticated session are derived from caller strings rather than Watchdog/Windows provider evidence.
+- The fallback envelope omits the required incident class, installation identity, timestamp, evidence digest and fixed recovery-status instruction while permitting arbitrary subject/summary/recipient content beyond its minimal privacy ceiling.
+- Request/body hashes are not recomputed from canonical bytes; replay identity omits signer/signature/content/G-08/role evidence, uses unstable debug text for fence identity and fabricates policy/capacity/cancellation facts.
+- P-01 reports only notification identity plus a boolean, but A-10 synthesizes complete success and receipt identities without a C0-02 receipt, current provider generation/fence or cancellation reconciliation.
+- G-08 availability is a caller boolean with untyped optional strings and no provider dependency. Missing envelope evidence is mislabeled as provider `PLAN_GAP`.
+- Serialization failure hashes empty bytes, and several public serde surfaces bypass semantic validation.
+
+Resume condition: introduce authenticated signer/user-session and exact minimal fallback contracts, recompute canonical identities, consume real G-08/P-01 observations and C0-02 receipts, bind current fence/generation/cancel state and expose only fail-closed decode paths; then run real Windows delivery and replay/reconciliation proof.
+
 ### P-05 — HostStateJournal
 
 Closed portions: the second candidate provides explicit lineage-aware epochs, typed activation/kernel/dependency/wake/drain records, legal local lifecycle matrices, a prepared transaction backend, stable unknown transaction identities and 17 passing package tests with the exact direct provider set.
