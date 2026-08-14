@@ -449,7 +449,8 @@ mod tests {
     };
 
     #[test]
-    fn cue_capacity_twenty_nine_are_preserved_as_twelve_twelve_five() {
+    fn cue_capacity_twenty_nine_are_preserved_as_twelve_twelve_five() -> Result<(), CueBindingError>
+    {
         let bindings = (0..29)
             .map(|index| CueBinding {
                 cue_kind: CueKind::Concept,
@@ -473,8 +474,7 @@ mod tests {
             },
             bindings,
             None,
-        )
-        .expect("valid cue pages");
+        )?;
 
         assert_eq!(
             pages
@@ -495,10 +495,12 @@ mod tests {
                 .count(),
             29
         );
+        Ok(())
     }
 
     #[test]
-    fn cue_capacity_pages_are_transport_bounded_and_oversized_binding_fails() {
+    fn cue_capacity_pages_are_transport_bounded_and_oversized_binding_fails()
+    -> Result<(), CueBindingError> {
         let blob = crate::BlobRef {
             algorithm: "blake3".to_owned(),
             digest_hex: "b".repeat(64),
@@ -523,8 +525,7 @@ mod tests {
                 expected_reuse_note: "transport bound".to_owned(),
             })
             .collect();
-        let pages = normalize_binding_pages("memory:byte-bound", &blob, bindings, None)
-            .expect("two valuable bindings should split into bounded pages");
+        let pages = normalize_binding_pages("memory:byte-bound", &blob, bindings, None)?;
         assert_eq!(pages.len(), 2);
         assert!(pages.iter().all(|page| {
             serde_json::to_vec(page)
@@ -542,6 +543,7 @@ mod tests {
             normalize_binding_pages("memory:oversized", &blob, oversized, None),
             Err(CueBindingError::OversizedBinding { .. })
         ));
+        Ok(())
     }
 
     #[test]
