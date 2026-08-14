@@ -30,6 +30,7 @@ pub struct OpenCodeRunPolicy {
     overall_timeout: Duration,
     event_idle_timeout: Duration,
     max_events: usize,
+    max_sse_reconnects: usize,
     max_sse_chunk_bytes: usize,
     sse_limits: SseLimits,
 }
@@ -50,6 +51,7 @@ impl OpenCodeRunPolicy {
             overall_timeout: Duration::from_secs(15 * 60),
             event_idle_timeout: Duration::from_secs(60),
             max_events: 20_000,
+            max_sse_reconnects: 3,
             max_sse_chunk_bytes: 64 * 1024,
             sse_limits: SseLimits::default(),
         })
@@ -91,10 +93,16 @@ impl OpenCodeRunPolicy {
         self
     }
 
+    #[must_use]
+    pub const fn with_sse_reconnect_limit(mut self, max_sse_reconnects: usize) -> Self {
+        self.max_sse_reconnects = max_sse_reconnects;
+        self
+    }
+
     fn validate(&self) -> Result<(), OpenCodeRunError> {
-        if self.max_events == 0 || self.max_sse_chunk_bytes == 0 {
+        if self.max_events == 0 || self.max_sse_reconnects == 0 || self.max_sse_chunk_bytes == 0 {
             return Err(OpenCodeRunError::InvalidPolicy(
-                "OpenCode event limits must be nonzero".to_owned(),
+                "OpenCode event and reconnect limits must be nonzero".to_owned(),
             ));
         }
         if self.overall_timeout.is_zero() || self.event_idle_timeout.is_zero() {
@@ -218,6 +226,7 @@ struct CorrelatedEventState {
     user_message_id: String,
     requested_model: ModelSelection,
     assistant_message_id: Option<String>,
+    assistant_created_at: Option<u64>,
     terminal_part_message_ids: BTreeSet<String>,
     assistant_completed: bool,
     terminal_stop: bool,
@@ -231,6 +240,7 @@ impl CorrelatedEventState {
             user_message_id: user_message_id.to_owned(),
             requested_model: requested_model.clone(),
             assistant_message_id: None,
+            assistant_created_at: None,
             terminal_part_message_ids: BTreeSet::new(),
             assistant_completed: false,
             terminal_stop: false,
@@ -296,18 +306,29 @@ impl CorrelatedEventState {
             return Ok(());
         }
         let assistant_id = required_string(info.get("id"), "assistant message identity")?;
-        if self
-            .assistant_message_id
-            .as_deref()
-            .is_some_and(|known| known != assistant_id)
-        {
-            return Err(OpenCodeRunError::Protocol(
-                "multiple assistant messages claimed one prompt identity".to_owned(),
-            ));
-        }
         attest_message_route(info, &self.requested_model)?;
         if info.get("error").is_some_and(|error| !error.is_null()) {
             return Err(provider_error(info.get("error"), "MessageError"));
+        }
+        let created_at = info
+            .get("time")
+            .and_then(Value::as_object)
+            .and_then(|time| time.get("created"))
+            .and_then(Value::as_u64);
+        if let Some(known) = self.assistant_message_id.as_deref()
+            && known != assistant_id
+        {
+            let strictly_later = self
+                .assistant_created_at
+                .zip(created_at)
+                .is_some_and(|(known_created, observed_created)| observed_created > known_created);
+            if !strictly_later || (self.assistant_completed && self.terminal_stop) {
+                return Err(OpenCodeRunError::Protocol(
+                    "assistant message succession is ambiguous for one prompt identity".to_owned(),
+                ));
+            }
+            self.assistant_completed = false;
+            self.terminal_stop = self.terminal_part_message_ids.contains(&assistant_id);
         }
         self.assistant_completed |= info
             .get("time")
@@ -317,6 +338,7 @@ impl CorrelatedEventState {
             .is_some();
         self.terminal_stop |= info.get("finish").and_then(Value::as_str) == Some("stop")
             || self.terminal_part_message_ids.contains(&assistant_id);
+        self.assistant_created_at = created_at.or(self.assistant_created_at);
         self.assistant_message_id = Some(assistant_id);
         Ok(())
     }
@@ -446,6 +468,7 @@ impl OpenCodeClient {
             path_and_query: path,
             body: Vec::new(),
             accept_sse: false,
+            last_event_id: None,
         };
         let response = self.http.execute(&request).await?;
         if !response.body.is_empty() {
@@ -483,8 +506,7 @@ impl OpenCodeClient {
         self.policy.validate()?;
         let deadline = Instant::now() + self.policy.overall_timeout;
         let prepared = self.prepare_run(request).await?;
-        let event_path = self.project_path("/event", &[])?;
-        let connection = self.http.open_sse(&HttpRequest::sse(event_path)).await?;
+        let connection = self.open_event_stream(None).await?;
 
         if let Err(error) = self
             .prompt_async(&prepared.session.id, &prepared.message_id, request)
@@ -601,46 +623,33 @@ impl OpenCodeClient {
         let mut decoder = SseDecoder::new(self.policy.sse_limits);
         let mut state = CorrelatedEventState::new(session_id, message_id, requested_model);
         let mut events = Vec::<OpenCodeEvent>::new();
+        let mut reconnect_count = 0_usize;
         loop {
-            let now = Instant::now();
-            if now >= deadline {
-                return Err(EventCollectionFailure::reconcilable(
-                    OpenCodeRunError::Timeout {
-                        phase: "overall event wait",
-                    },
-                    events,
-                ));
-            }
-            let wait = self
-                .policy
-                .event_idle_timeout
-                .min(deadline.saturating_duration_since(now));
-            let chunk = match timeout(
-                wait,
-                connection.read_decoded_chunk(self.policy.max_sse_chunk_bytes),
-            )
-            .await
-            {
-                Ok(Ok(Some(chunk))) => chunk,
-                Ok(Ok(None)) => {
-                    return Err(EventCollectionFailure::reconcilable(
-                        OpenCodeRunError::Protocol(
-                            "SSE stream ended before correlated completion".to_owned(),
-                        ),
-                        events,
-                    ));
-                }
-                Ok(Err(error)) => {
-                    return Err(EventCollectionFailure::reconcilable(error.into(), events));
-                }
-                Err(_) => {
-                    return Err(EventCollectionFailure::reconcilable(
-                        OpenCodeRunError::Timeout {
-                            phase: "SSE semantic idle",
-                        },
-                        events,
-                    ));
-                }
+            let chunk_result = self.read_event_chunk(&mut connection, deadline).await;
+            let chunk = match chunk_result {
+                Ok(chunk) => chunk,
+                Err(cause) => match self
+                    .reconnect_event_stream(&decoder, reconnect_count, deadline)
+                    .await
+                {
+                    Ok(Some((resumed_connection, resumed_decoder))) => {
+                        connection = resumed_connection;
+                        decoder = resumed_decoder;
+                        reconnect_count += 1;
+                        continue;
+                    }
+                    Ok(None) => {
+                        return Err(EventCollectionFailure::reconcilable(cause, events));
+                    }
+                    Err(reconnect_error) => {
+                        return Err(EventCollectionFailure::reconcilable(
+                            OpenCodeRunError::Protocol(format!(
+                                "{cause}; SSE reconnect failed: {reconnect_error}"
+                            )),
+                            events,
+                        ));
+                    }
+                },
             };
             let frames = decoder.feed(&chunk).map_err(|error| {
                 EventCollectionFailure::terminal(error.into(), std::mem::take(&mut events))
@@ -693,6 +702,91 @@ impl OpenCodeClient {
                 }
             }
         }
+    }
+
+    async fn read_event_chunk(
+        &self,
+        connection: &mut SseConnection,
+        deadline: Instant,
+    ) -> Result<Vec<u8>, OpenCodeRunError> {
+        let now = Instant::now();
+        if now >= deadline {
+            return Err(OpenCodeRunError::Timeout {
+                phase: "overall event wait",
+            });
+        }
+        let wait = self
+            .policy
+            .event_idle_timeout
+            .min(deadline.saturating_duration_since(now));
+        match timeout(
+            wait,
+            connection.read_decoded_chunk(self.policy.max_sse_chunk_bytes),
+        )
+        .await
+        {
+            Ok(Ok(Some(chunk))) => Ok(chunk),
+            Ok(Ok(None)) => Err(OpenCodeRunError::Protocol(
+                "SSE stream ended before correlated completion".to_owned(),
+            )),
+            Ok(Err(error)) => Err(error.into()),
+            Err(_) => Err(OpenCodeRunError::Timeout {
+                phase: "SSE semantic idle",
+            }),
+        }
+    }
+
+    async fn open_event_stream(
+        &self,
+        last_event_id: Option<&str>,
+    ) -> Result<SseConnection, OpenCodeRunError> {
+        let event_path = self.project_path("/event", &[])?;
+        let request = HttpRequest::sse(event_path).with_last_event_id(last_event_id)?;
+        Ok(self.http.open_sse(&request).await?)
+    }
+
+    async fn reconnect_event_stream(
+        &self,
+        decoder: &SseDecoder,
+        reconnect_count: usize,
+        deadline: Instant,
+    ) -> Result<Option<(SseConnection, SseDecoder)>, OpenCodeRunError> {
+        let cursor = decoder.cursor().clone();
+        let Some(last_event_id) = cursor.last_event_id.as_deref() else {
+            return Ok(None);
+        };
+        if reconnect_count >= self.policy.max_sse_reconnects {
+            return Ok(None);
+        }
+        let now = Instant::now();
+        if now >= deadline {
+            return Err(OpenCodeRunError::Timeout {
+                phase: "SSE reconnect",
+            });
+        }
+        let retry_delay = Duration::from_millis(cursor.retry_ms.unwrap_or(100).min(5_000));
+        let remaining = deadline.saturating_duration_since(now);
+        if !retry_delay.is_zero() {
+            sleep(retry_delay.min(remaining)).await;
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(OpenCodeRunError::Timeout {
+                phase: "SSE reconnect",
+            });
+        }
+        let connection = timeout(
+            self.policy.event_idle_timeout.min(remaining),
+            self.open_event_stream(Some(last_event_id)),
+        )
+        .await
+        .map_err(|_| OpenCodeRunError::Timeout {
+            phase: "SSE reconnect",
+        })??;
+        Ok(Some((
+            connection,
+            SseDecoder::resumed(self.policy.sse_limits, cursor),
+        )))
     }
 
     async fn reconcile_success(
@@ -1495,6 +1589,49 @@ mod tests {
         ] {
             state.observe(&serde_json::from_value::<OpenCodeEvent>(event)?)?;
         }
+        assert!(state.is_complete());
+        Ok(())
+    }
+
+    #[test]
+    fn tool_rounds_may_advance_to_one_later_terminal_assistant()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let model = ModelSelection::new("opencode-go", "deepseek-v4-flash")?;
+        let mut state = CorrelatedEventState::new("ses_1", "msg_user_1", &model);
+        for event in [
+            serde_json::json!({
+                "type": "message.updated",
+                "properties": {"sessionID": "ses_1", "info": {
+                    "id": "msg_assistant_tool", "sessionID": "ses_1", "role": "assistant",
+                    "parentID": "msg_user_1", "providerID": "opencode-go",
+                    "modelID": "deepseek-v4-flash", "time": {"created": 1, "completed": 2}
+                }}
+            }),
+            serde_json::json!({
+                "type": "message.updated",
+                "properties": {"sessionID": "ses_1", "info": {
+                    "id": "msg_assistant_final", "sessionID": "ses_1", "role": "assistant",
+                    "parentID": "msg_user_1", "providerID": "opencode-go",
+                    "modelID": "deepseek-v4-flash", "time": {"created": 3, "completed": 4}
+                }}
+            }),
+            serde_json::json!({
+                "type": "message.part.updated",
+                "properties": {"sessionID": "ses_1", "part": {
+                    "sessionID": "ses_1", "messageID": "msg_assistant_final",
+                    "type": "step-finish", "reason": "stop"
+                }}
+            }),
+            serde_json::json!({
+                "type": "session.idle", "properties": {"sessionID": "ses_1"}
+            }),
+        ] {
+            state.observe(&serde_json::from_value::<OpenCodeEvent>(event)?)?;
+        }
+        assert_eq!(
+            state.assistant_message_id.as_deref(),
+            Some("msg_assistant_final")
+        );
         assert!(state.is_complete());
         Ok(())
     }

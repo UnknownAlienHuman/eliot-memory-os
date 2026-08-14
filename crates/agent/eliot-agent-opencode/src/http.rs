@@ -84,6 +84,7 @@ pub struct HttpRequest {
     pub path_and_query: String,
     pub body: Vec<u8>,
     pub accept_sse: bool,
+    pub last_event_id: Option<String>,
 }
 
 impl fmt::Debug for HttpRequest {
@@ -94,6 +95,10 @@ impl fmt::Debug for HttpRequest {
             .field("path_and_query", &self.path_and_query)
             .field("body_len", &self.body.len())
             .field("accept_sse", &self.accept_sse)
+            .field(
+                "last_event_id",
+                &self.last_event_id.as_deref().map(sanitize_text),
+            )
             .finish()
     }
 }
@@ -106,6 +111,7 @@ impl HttpRequest {
             path_and_query: path_and_query.into(),
             body: Vec::new(),
             accept_sse: false,
+            last_event_id: None,
         }
     }
 
@@ -121,6 +127,7 @@ impl HttpRequest {
             path_and_query: path_and_query.into(),
             body,
             accept_sse: false,
+            last_event_id: None,
         })
     }
 
@@ -131,7 +138,24 @@ impl HttpRequest {
             path_and_query: path_and_query.into(),
             body: Vec::new(),
             accept_sse: true,
+            last_event_id: None,
         }
+    }
+
+    /// Adds the SSE reconnect cursor without exposing a generic caller-owned
+    /// header surface that could shadow authentication or framing headers.
+    pub fn with_last_event_id(
+        mut self,
+        last_event_id: Option<&str>,
+    ) -> Result<Self, LoopbackHttpError> {
+        if !self.accept_sse && last_event_id.is_some() {
+            return Err(LoopbackHttpError::InvalidRequest(
+                "Last-Event-ID is valid only for an SSE request".to_owned(),
+            ));
+        }
+        self.last_event_id = last_event_id.map(str::to_owned);
+        validate_last_event_id(self.last_event_id.as_deref())?;
+        Ok(self)
     }
 }
 
@@ -497,6 +521,29 @@ fn validate_request(request: &HttpRequest) -> Result<(), LoopbackHttpError> {
             "GET request cannot carry a body".to_owned(),
         ));
     }
+    if !request.accept_sse && request.last_event_id.is_some() {
+        return Err(LoopbackHttpError::InvalidRequest(
+            "Last-Event-ID is valid only for an SSE request".to_owned(),
+        ));
+    }
+    validate_last_event_id(request.last_event_id.as_deref())?;
+    Ok(())
+}
+
+fn validate_last_event_id(last_event_id: Option<&str>) -> Result<(), LoopbackHttpError> {
+    let Some(last_event_id) = last_event_id else {
+        return Ok(());
+    };
+    if last_event_id.is_empty()
+        || last_event_id.len() > 8 * 1024
+        || !last_event_id
+            .bytes()
+            .all(|byte| (0x20..=0x7e).contains(&byte))
+    {
+        return Err(LoopbackHttpError::InvalidRequest(
+            "Last-Event-ID must be nonempty bounded printable ASCII".to_owned(),
+        ));
+    }
     Ok(())
 }
 
@@ -514,6 +561,11 @@ fn encode_request(request: &HttpRequest, host: &str, authorization: &str) -> Vec
     );
     if !request.body.is_empty() {
         head.push_str("Content-Type: application/json\r\n");
+    }
+    if let Some(last_event_id) = &request.last_event_id {
+        head.push_str("Last-Event-ID: ");
+        head.push_str(last_event_id);
+        head.push_str("\r\n");
     }
     head.push_str("\r\n");
     let mut encoded = head.into_bytes();
@@ -917,7 +969,7 @@ fn sanitize_text(value: &str) -> String {
 mod tests {
     use super::{
         BasicAuth, HttpRequest, HttpResponse, LoopbackHttpClient, LoopbackHttpError, ResponseHead,
-        response_framing, validate_request,
+        encode_request, response_framing, validate_request,
     };
     use crate::LoopbackEndpoint;
     use secrecy::SecretString;
@@ -1055,6 +1107,25 @@ mod tests {
                 }
             }
         }
+        Ok(())
+    }
+
+    #[test]
+    fn emits_one_bounded_last_event_id_header_and_rejects_injection()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let request = HttpRequest::sse("/event").with_last_event_id(Some("evt-42"))?;
+        let encoded = String::from_utf8(encode_request(&request, "127.0.0.1", "Basic redacted"))?;
+        assert_eq!(encoded.matches("Last-Event-ID: evt-42\r\n").count(), 1);
+        assert!(
+            HttpRequest::sse("/event")
+                .with_last_event_id(Some("evt\r\ninjected: yes"))
+                .is_err()
+        );
+        assert!(
+            HttpRequest::get("/global/health")
+                .with_last_event_id(Some("evt-42"))
+                .is_err()
+        );
         Ok(())
     }
 

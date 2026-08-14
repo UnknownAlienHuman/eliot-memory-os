@@ -234,6 +234,17 @@ impl SseDecoder {
         }
     }
 
+    /// Starts a fresh wire decoder after reconnect while retaining only the
+    /// last fully parsed protocol cursor. Partial bytes from the closed
+    /// connection are deliberately never joined to a new HTTP response.
+    #[must_use]
+    pub(crate) fn resumed(limits: SseLimits, cursor: ReconnectCursor) -> Self {
+        Self {
+            cursor,
+            ..Self::new(limits)
+        }
+    }
+
     /// Returns the immutable limits used by this decoder.
     #[must_use]
     pub fn limits(&self) -> SseLimits {
