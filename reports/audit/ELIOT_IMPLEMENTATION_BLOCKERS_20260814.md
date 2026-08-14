@@ -84,6 +84,21 @@ Remaining authority blockers:
 
 Resume condition: complete the Kernel and cross-record identities, make clean-marker invalidation exhaustive, bind reconciliation identities to Host epoch, and add the exact corruption/torn/flush/sync recovery corpus. Then rerun the independent P-05 gate.
 
+### P-02 — concrete Windows platform adapter
+
+Closed portions: the second candidate exposes typed Windows capability surfaces and its 15 package tests plus mechanical gates pass.
+
+Remaining platform blockers:
+
+- Process supervision still has no real Windows Job Object ownership/kill-on-close implementation.
+- The alleged DPAPI routes are aliases to Credential Manager `CredReadW`, so they neither protect nor unprotect payloads with DPAPI semantics.
+- SCM support is inspection-only; required register/start/stop/control behavior remains unsupported.
+- The staged-file handle is closed before `MoveFileExW`, reopening the reparse/identity TOCTOU window at publication.
+- WTS discovery can publish a `Known` user without a resolved user identity, and file-identity paths collapse relevant Windows errors instead of preserving typed outcomes.
+- Serde/adversarial coverage is incomplete, the manifest retains an extra direct `eliot-contracts` edge, and no combined sibling IPC/platform terminal proof exists.
+
+Resume condition: implement the exact Job Object, DPAPI, SCM and reparse-safe publication primitives through real Windows handles; make discovery/file identity fail closed; seal the provider graph; then run combined P-02 IPC/platform crash, restart, impersonation and process-identity gates.
+
 ### S-04 — blob API and store
 
 Closed portions: the second candidate separates provider-neutral API and filesystem implementation, injects platform/codec/key/AEAD/live-set ports, validates basic identities, models staged publication/recovery and key rotation, and passes 5 API plus 9 implementation tests.
