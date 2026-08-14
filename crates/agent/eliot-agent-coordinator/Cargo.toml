@@ -1,0 +1,22 @@
+[package]
+name = "eliot-agent-coordinator"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.89"
+license = "MIT"
+description = "Deterministic A-02 agent staffing, admission, and attempt reconciliation core"
+
+[workspace]
+
+[dependencies]
+eliot-agent-api = { path = "../eliot-agent-api" }
+eliot-agent-contracts = { path = "../eliot-agent-contracts" }
+eliot-evaluation-contracts = { path = "../../foundation/eliot-evaluation-contracts" }
+eliot-receipts = { path = "../../foundation/eliot-receipts" }
+eliot-security-contracts = { path = "../../foundation/eliot-security-contracts" }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = { version = "1.0.150", features = ["float_roundtrip"] }
+thiserror = "2.0.18"
+
+[lints.rust]
+unsafe_code = "forbid"
