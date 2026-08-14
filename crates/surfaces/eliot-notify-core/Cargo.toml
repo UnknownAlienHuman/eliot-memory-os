@@ -1,26 +1,20 @@
 [package]
 name = "eliot-notify-core"
-version = "0.1.0"
-edition = "2024"
-rust-version = "1.89"
-license = "MIT"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
 description = "A-10 role-filtered one-shot notification delivery core"
 
-[workspace]
-
 [dependencies]
-eliot-observation-contracts = { path = "../../foundation/eliot-observation-contracts", version = "0.1.0" }
-eliot-receipts = { path = "../../foundation/eliot-receipts", version = "0.1.0" }
-eliot-platform = { path = "../../kernel/eliot-platform", version = "0.1.0" }
-schemars = { version = "1.2.1", features = ["derive"] }
-serde = { version = "1.0.228", features = ["derive"] }
-serde_json = { version = "1.0.150", features = ["float_roundtrip"] }
-sha2 = "0.10.9"
-thiserror = "2.0.18"
+eliot-observation-contracts.workspace = true
+eliot-receipts.workspace = true
+eliot-platform.workspace = true
+schemars.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
 
-[lints.rust]
-unsafe_code = "forbid"
-
-[lints.clippy]
-all = "deny"
-pedantic = "deny"
+[lints]
+workspace = true

@@ -539,6 +539,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "eliot-notify-core"
+version = "0.1.0"
+dependencies = [
+ "eliot-observation-contracts",
+ "eliot-platform",
+ "eliot-receipts",
+ "schemars",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror",
+]
+
+[[package]]
 name = "eliot-observation-contracts"
 version = "0.1.0"
 dependencies = [
