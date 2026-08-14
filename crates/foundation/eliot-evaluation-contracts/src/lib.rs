@@ -13,8 +13,7 @@ use eliot_contracts::{
     ArtifactId, ClockReading, ContractId, ContractVersion, ProductId, ReceiptId, RequestId, TaskId,
     TaskRevision,
 };
-use eliot_graph_api::{GraphFreshness, GraphRevision};
-use eliot_instrument_api::{ExecutionStatus, VerificationOutcome};
+use eliot_instrument_api::{EvidenceFreshness, ExecutionStatus, VerificationOutcome};
 use eliot_receipts::ProofCeiling;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -992,8 +991,8 @@ pub mod negative_consumer_fixtures {
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct GraphEvidenceRef {
-    pub revision: GraphRevision,
-    pub freshness: GraphFreshness,
+    pub revision: ArtifactId,
+    pub freshness: EvidenceFreshness,
     pub scope: String,
     pub evidence_refs: Vec<ArtifactId>,
 }
@@ -1134,11 +1133,8 @@ mod tests {
     #[test]
     fn graph_evidence_requires_artifacts() {
         let evidence = GraphEvidenceRef {
-            revision: match GraphRevision::new(1) {
-                Ok(value) => value,
-                Err(error) => panic!("invalid test revision: {error}"),
-            },
-            freshness: GraphFreshness::Current,
+            revision: valid!(ArtifactId, "graph-revision-1"),
+            freshness: EvidenceFreshness::ExactCandidate,
             scope: "crate".to_owned(),
             evidence_refs: vec![],
         };
