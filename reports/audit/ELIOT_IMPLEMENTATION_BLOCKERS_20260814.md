@@ -97,6 +97,48 @@ Remaining authority blockers:
 
 Resume condition: make provider-unavailable translation uniform, bind tombstone and journal paths to canonical locator/operation derivation, and require exact request/authority identity on replay with adversarial recovery fixtures. Then rerun the independent S-04 gate.
 
+### G-02 — WorkScope identity and admission
+
+Closed portions: the repair adds typed scope/root/workspace projections, discovery/onboarding structures and ten passing package tests while retaining the exact direct provider edge to C0-12.
+
+Remaining authority blockers:
+
+- Deserialized candidate sets and candidates reach onboarding without rerunning the constructor invariants.
+- Onboarding checks lease shape/root labels but does not authorize the required discovery read classes.
+- Observed root labels are not bound to the candidate's filesystem/root identity.
+- State-fence resource generation, scope revision and provider-owned revision heads are not coupled; scope ceilings can widen beyond the admitted ceiling.
+- `admit` and `ScopeBindingGuard` compare caller-provided projections without a provider-owned admission/receipt binding.
+- Discovery and workspace identities omit the host/session/filesystem/worktree/freshness/privacy evidence needed to distinguish clones and worktrees safely.
+
+Resume condition: add provider-owned identity/revision evidence, exact root and read-class binding, fail-closed revalidation after serde, subset-only ceiling admission and adversarial clone/worktree fixtures. Until then the API must remain observation-only rather than authority-bearing.
+
+### Q-01 — source assurance admission
+
+Closed portions: the repair adds canonical source-set hashing, typed frontier/revision/scope dispositions and eight passing package tests without breaking current consumers.
+
+Remaining authority blockers:
+
+- `ThreatStatus::Unknown` is not denied, so an unknown threat with otherwise verified caller statuses can be admitted.
+- Verifier/quarantine/receipt evidence remains caller-supplied status text rather than independently bound proof.
+- Privacy class, requested epistemic use and effect ceiling are carried but never enforced during admission.
+- The expected exact StateFence is absent from the admission expectation and nested public serde types do not deny unknown fields.
+- Observation-domain coverage required by the Q-01 execution plan is absent.
+
+Resume condition: make every unknown security axis fail closed, bind independent verifier/quarantine receipts and exact fence, enforce privacy/use/effect and observation domains, and add nested-serde/adversarial admission tests.
+
+### S-01 — provider-neutral store transaction API
+
+Closed portions: the repair makes opaque IDs fail closed after serde, validates the prepared manifest digest, covers ordering scopes and binds outbox operation/fence fields; six package tests pass.
+
+Remaining authority blockers:
+
+- `CanonicalStoreClient::apply_prepared` carries only the prepared transition, so projections and outbox intents in `StoreTransaction` cannot cross the provider boundary atomically.
+- The operation manifest authorizes only transition class/effect and is not bound to each exact named mutation operation.
+- Receipt and health manifest digests are not validated as canonical SHA-256 values.
+- Transaction validation permits duplicate projection IDs, outbox IDs and outbox sequences.
+
+Resume condition: make the complete transaction the applied client contract, bind every named operation to its manifest, validate all manifest-digest surfaces and reject duplicate exact-array identities.
+
 ## Work continuing independently
 
 - Independent candidate gates continue for bounded governor/security/store/surface repairs.
