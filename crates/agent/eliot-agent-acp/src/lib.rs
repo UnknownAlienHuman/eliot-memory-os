@@ -13,8 +13,9 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use eliot_agent_api::{
-    AgentAttempt, AttemptId, AuthorityEnvelope, EffectKind, EventCursor, EventId, HostEventKind,
-    RouteFingerprint, TaskId,
+    ActualRouteReceipt, AgentAttempt, AgentResult, AttemptId, AuthorityEnvelope, EffectKind,
+    EventCursor, EventId, HostEventKind, QuotaKnowledge, ResultDisposition, RouteFingerprint,
+    RouteFingerprintId, TaskId, UsageReceipt,
 };
 use eliot_process::{
     ProcessEvidence, ProcessEvidenceSink, ProcessExecutionError, ProcessExecutor, ProcessRequest,
@@ -987,6 +988,84 @@ pub struct AcpResultEnvelope {
     pub terminal: bool,
 }
 
+/// Outcome supplied by the caller that assembled an ACP result.  ACP payloads
+/// are provider observations and do not, by themselves, establish completion.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum AcpResultOutcome {
+    /// The provider returned a terminal response; verification is still owned
+    /// by A-01/Governor.
+    Completed,
+    /// The operation was cancelled.
+    Cancelled,
+    /// The provider reported a failure.
+    Failed { reason: String },
+    /// The outcome could not be established.
+    Unknown { reason: String },
+}
+
+impl AcpResultEnvelope {
+    /// Projects ACP metadata onto the provider-neutral A-01 result boundary.
+    ///
+    /// The raw payload remains in this envelope.  This projection never turns
+    /// it into evidence or an authorized effect, never claims an observed
+    /// route, and never fabricates usage or a terminal timestamp.
+    pub fn into_agent_result(
+        self,
+        route: RouteFingerprint,
+        route_id: RouteFingerprintId,
+        started_at: impl Into<String>,
+        outcome: AcpResultOutcome,
+    ) -> Result<AgentResult, AcpAdapterError> {
+        let (disposition, unknown_reason) = match outcome {
+            AcpResultOutcome::Completed => (ResultDisposition::DegradedNoProof, None),
+            AcpResultOutcome::Cancelled => (ResultDisposition::Cancelled, None),
+            AcpResultOutcome::Failed { reason } => {
+                (ResultDisposition::FailedVerification, Some(reason))
+            }
+            AcpResultOutcome::Unknown { reason } => {
+                (ResultDisposition::UnknownOutcome, Some(reason))
+            }
+        };
+        let usage = UsageReceipt {
+            input_tokens: None,
+            output_tokens: None,
+            cost_microunits: None,
+            quota: QuotaKnowledge::Unknown,
+        };
+        let result = AgentResult {
+            attempt_id: self.attempt_id,
+            disposition,
+            artifacts: Vec::new(),
+            evidence_refs: Vec::new(),
+            proposed_effects: Vec::new(),
+            effect_receipts: Vec::new(),
+            unresolved_questions: Vec::new(),
+            usage: usage.clone(),
+            actual_route: ActualRouteReceipt {
+                requested: route,
+                observed: None,
+                route_id,
+                usage,
+                started_at: started_at.into(),
+                terminal_at: None,
+            },
+            unknown_reason,
+        };
+        result
+            .actual_route
+            .validate()
+            .map_err(AcpAdapterError::ContractValidation)?;
+        if result.disposition == ResultDisposition::UnknownOutcome
+            && result.unknown_reason.as_deref().is_none_or(str::is_empty)
+        {
+            return Err(AcpAdapterError::ContractValidation(
+                eliot_agent_api::ContractError::MissingUnknownReason,
+            ));
+        }
+        Ok(result)
+    }
+}
+
 /// Short result alias.
 pub type AcpResult = AcpResultEnvelope;
 
@@ -1571,6 +1650,75 @@ mod tests {
         let host = event.into_host_event("digest".into(), "now".into())?;
         assert_eq!(host.sequence, 1);
         assert_eq!(host.attempt_id.as_str(), "attempt");
+        Ok(())
+    }
+
+    fn result_envelope() -> Result<AcpResultEnvelope, eliot_agent_api::ContractError> {
+        Ok(AcpResultEnvelope {
+            operation_id: "operation".into(),
+            attempt_id: AttemptId::new("attempt")?,
+            session_id: Some("session".into()),
+            payload: serde_json::json!({"provider":"candidate"}),
+            terminal: true,
+        })
+    }
+
+    fn project_result(
+        outcome: AcpResultOutcome,
+    ) -> Result<eliot_agent_api::AgentResult, AcpAdapterError> {
+        result_envelope()
+            .map_err(AcpAdapterError::ContractValidation)?
+            .into_agent_result(
+                route(),
+                RouteFingerprintId::new("route").map_err(AcpAdapterError::ContractValidation)?,
+                "started",
+                outcome,
+            )
+    }
+
+    #[test]
+    fn result_projection_is_candidate_only_without_usage_or_route_observation()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let result = project_result(AcpResultOutcome::Completed)?;
+        assert_eq!(result.disposition, ResultDisposition::DegradedNoProof);
+        assert!(result.evidence_refs.is_empty());
+        assert!(result.proposed_effects.is_empty());
+        assert!(result.effect_receipts.is_empty());
+        assert!(result.actual_route.observed.is_none());
+        assert_eq!(result.actual_route.usage.quota, QuotaKnowledge::Unknown);
+        assert!(result.actual_route.usage.input_tokens.is_none());
+        assert!(result.actual_route.usage.output_tokens.is_none());
+        assert!(result.actual_route.usage.cost_microunits.is_none());
+        assert!(result.actual_route.terminal_at.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn result_projection_preserves_cancelled_disposition() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let result = project_result(AcpResultOutcome::Cancelled)?;
+        assert_eq!(result.disposition, ResultDisposition::Cancelled);
+        assert!(result.unknown_reason.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn result_projection_preserves_failed_and_unknown_reasons()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let failed = project_result(AcpResultOutcome::Failed {
+            reason: "provider rejected request".into(),
+        })?;
+        assert_eq!(failed.disposition, ResultDisposition::FailedVerification);
+        assert_eq!(
+            failed.unknown_reason.as_deref(),
+            Some("provider rejected request")
+        );
+
+        let unknown = project_result(AcpResultOutcome::Unknown {
+            reason: "transport closed".into(),
+        })?;
+        assert_eq!(unknown.disposition, ResultDisposition::UnknownOutcome);
+        assert_eq!(unknown.unknown_reason.as_deref(), Some("transport closed"));
         Ok(())
     }
 }
