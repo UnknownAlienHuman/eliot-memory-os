@@ -180,10 +180,10 @@ pub(super) fn install(
         backup_refs.extend(global.backup_refs);
     }
     let host_version = if host == AgentHostId::Codex {
-        HostProfileService
-            .probe(host)
-            .map(|profile| profile.version)
-            .unwrap_or_else(|_| "codex-personal-marketplace".to_owned())
+        HostProfileService.probe(host).map_or_else(
+            |_| "codex-personal-marketplace".to_owned(),
+            |profile| profile.version,
+        )
     } else {
         HostProfileService.probe(host)?.version
     };
@@ -201,7 +201,9 @@ pub(super) fn install(
             AgentHostId::OpenCode => "user-local Eliot bundle plus additive OpenCode global discovery; provider/auth and unrelated config preserved".to_owned(),
             AgentHostId::Claude => "user-local Eliot bundle packaged into a local marketplace and installed through the official Claude Code plugin lifecycle; provider/auth and unrelated settings preserved".to_owned(),
             AgentHostId::Codex => "user-global Codex personal-marketplace plugin with the controller MCP enabled by default; project config, provider/auth, and unrelated marketplace entries preserved".to_owned(),
-            _ => "user-local Eliot integration bundle; host auth/config untouched".to_owned(),
+            AgentHostId::Antigravity => {
+                "user-local Eliot integration bundle; host auth/config untouched".to_owned()
+            }
         },
         installed_paths,
         modified_files,
@@ -1357,6 +1359,7 @@ pub(super) fn validate_codex_install_journal_schema(value: &Value) -> Result<()>
     Ok(())
 }
 
+#[allow(clippy::too_many_lines)]
 fn recover_codex_install_transaction(target: &Path, dry_run: bool) -> Result<bool> {
     let journal_path = codex_install_journal_path()?;
     if !journal_path.exists() {
@@ -2893,6 +2896,7 @@ pub(super) fn bytes_hash(bytes: &[u8]) -> String {
     format!("blake3:{}", blake3::hash(bytes).to_hex())
 }
 
+#[allow(clippy::too_many_lines)]
 pub(super) fn uninstall_codex_global(
     manifest: &CodexGlobalInstallManifest,
     dry_run: bool,
@@ -3400,7 +3404,7 @@ pub(super) fn uninstall(config_path: &Path, host: AgentHostId, dry_run: bool) ->
                 }))
             }
         }
-        _ => None,
+        AgentHostId::Antigravity => None,
     };
     let existed = target.is_dir();
     if existed && !dry_run {

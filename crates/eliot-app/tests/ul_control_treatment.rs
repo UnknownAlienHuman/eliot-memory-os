@@ -203,6 +203,7 @@ fn u9_5_handles_only_policy_strips_negative_and_normal_payloads() -> TestResult 
     Ok(())
 }
 
+#[allow(clippy::too_many_lines)]
 #[test]
 fn u9_6_invariant_gate_prefills_requires_and_accepts_an_explicit_waiver() -> TestResult {
     let _guard = test_guard();

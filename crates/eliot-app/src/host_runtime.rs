@@ -184,6 +184,7 @@ struct ClaudeGlobalInstallManifest {
     claude_version: String,
 }
 
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Clone, Debug, Deserialize, Serialize)]
 struct CodexGlobalInstallManifest {
     schema_version: String,
@@ -228,6 +229,7 @@ struct CodexLegacyMcpRegistration {
     exact_config_hash: String,
 }
 
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Clone, Debug, Deserialize, Serialize)]
 struct CodexInstallJournal {
     schema_version: String,

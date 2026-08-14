@@ -2132,6 +2132,7 @@ fn codex_plugin_materialization_uses_self_contained_controller_governor() -> any
     Ok(())
 }
 
+#[allow(clippy::too_many_lines)]
 #[test]
 fn codex_cli_migration_accepts_only_known_eliot_identities() {
     let approval = CodexLegacyMcpApproval {

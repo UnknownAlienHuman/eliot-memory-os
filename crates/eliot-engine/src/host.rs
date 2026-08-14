@@ -586,7 +586,7 @@ fn launch_integration_refs(
                 .to_string_lossy()
                 .into_owned(),
         ),
-        AgentHostId::Claude => (
+        AgentHostId::Claude | AgentHostId::Codex => (
             bundle.to_string_lossy().into_owned(),
             bundle.join(".mcp.json").to_string_lossy().into_owned(),
             bundle.join("skills").to_string_lossy().into_owned(),
@@ -601,16 +601,6 @@ fn launch_integration_refs(
             "governor://mcp/stdio".to_owned(),
             "governor://skills/eliot-agent".to_owned(),
             "governor://host-invocations/attempt-journal-v1".to_owned(),
-        ),
-        AgentHostId::Codex => (
-            bundle.to_string_lossy().into_owned(),
-            bundle.join(".mcp.json").to_string_lossy().into_owned(),
-            bundle.join("skills").to_string_lossy().into_owned(),
-            bundle
-                .join("hooks")
-                .join("hooks.json")
-                .to_string_lossy()
-                .into_owned(),
         ),
     }
 }

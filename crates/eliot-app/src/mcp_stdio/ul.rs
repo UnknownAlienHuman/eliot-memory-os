@@ -45,6 +45,7 @@ pub(super) struct UlRuntime {
 }
 
 impl UlRuntime {
+    #[allow(clippy::needless_pass_by_value)]
     pub fn new(
         store: CanonicalStore,
         writer: WriterHandle,

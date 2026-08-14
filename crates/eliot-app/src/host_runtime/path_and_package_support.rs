@@ -56,15 +56,11 @@ fn integration_refs(bundle: &Path, host: AgentHostId) -> (PathBuf, PathBuf) {
             bundle.join("opencode.json"),
             bundle.join("plugins").join("eliot.js"),
         ),
-        AgentHostId::Claude => (
+        AgentHostId::Claude | AgentHostId::Codex => (
             bundle.join(".mcp.json"),
             bundle.join("hooks").join("hooks.json"),
         ),
         AgentHostId::Antigravity => (bundle.join("integration.json"), bundle.join("README.md")),
-        AgentHostId::Codex => (
-            bundle.join(".mcp.json"),
-            bundle.join("hooks").join("hooks.json"),
-        ),
     }
 }
 

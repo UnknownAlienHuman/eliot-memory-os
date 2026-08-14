@@ -29,7 +29,7 @@ enum PacketPostCommitEffect {
 }
 
 /// Immutable packet-commit/effect authority. Response bytes remain separate
-/// inspection data. CodeCortex `generated_at`, `repo_root`, and
+/// inspection data. `CodeCortex` `generated_at`, `repo_root`, and
 /// `memory_receipt` are the only current projection ephemera excluded here.
 #[derive(Clone, Debug, PartialEq, serde::Deserialize, serde::Serialize)]
 struct PacketCommitMaterial {
@@ -213,8 +213,7 @@ async fn dispatch_compile_packet_l3(
             .transpose()?
             .flatten()
     };
-    let codecortex_batch =
-        fresh_codecortex_reports(state, &request, material_frame.as_ref()).await?;
+    let codecortex_batch = fresh_codecortex_reports(state, &request, material_frame.as_ref())?;
     let codecortex_reports = &codecortex_batch.reports;
     let current_git_scope =
         resolve_governed_packet_git_scope(&request, packet_task.as_ref(), codecortex_reports)
@@ -364,9 +363,10 @@ async fn dispatch_compile_packet_l3(
                 config_hash: measurement.assignment.config_hash.clone(),
             }),
     };
-    let compiled = ContextCompiler::new(ReadService::new(state.store.clone()))
-        .compile_plan(plan)
-        .await?;
+    let compiled = Box::pin(
+        ContextCompiler::new(ReadService::new(state.store.clone())).compile_plan(plan),
+    )
+    .await?;
     let packet = compiled.packet;
     let packet_id = packet.packet_id.clone();
     let mut value = serde_json::to_value(&packet)?;
@@ -1077,7 +1077,7 @@ struct CodeCortexCompileBatch {
     pending_persistence: Option<CodeCortexReport>,
 }
 
-async fn fresh_codecortex_reports(
+fn fresh_codecortex_reports(
     state: &McpState,
     request: &CompilePacketL3Request,
     frame: Option<&MaterialPacketFrame>,
@@ -1390,7 +1390,7 @@ fn stage_packet_post_commit_outbox_at_root(
     intent: &PacketPostCommitIntent,
 ) -> Result<(PacketPostCommitIntent, PacketPostCommitEvent)> {
     validate_packet_post_commit_intent(intent)?;
-    let intent_path = packet_post_commit_intent_path(&outbox_root);
+    let intent_path = packet_post_commit_intent_path(outbox_root);
     if !intent_path.is_file() {
         // A concurrent equivalent request may win immutable publication with
         // different provenance. Once a file exists, its validated canonical
@@ -1410,11 +1410,11 @@ fn stage_packet_post_commit_outbox_at_root(
         "PACKET_COMMIT_IDEMPOTENCY_MISMATCH: immutable packet intent differs at {}",
         intent_path.display()
     );
-    let current = if let Some(current) = latest_packet_post_commit_event(&outbox_root, &stored)? {
+    let current = if let Some(current) = latest_packet_post_commit_event(outbox_root, &stored)? {
         current
     } else {
         append_packet_post_commit_event(
-            &outbox_root,
+            outbox_root,
             &stored,
             PacketPostCommitStatus::Prepared,
             &[],
@@ -2642,7 +2642,7 @@ mod packet_commit_unit_tests {
             "task_id": task_id,
             "packet_quality": packet_quality,
             "compile_audit": {
-                "response_integrity_probe": 51.248178375505404_f64
+                "response_integrity_probe": 51.248_178_375_505_404_f64
             },
             "packet_admission": { "status": "admitted" }
         });
