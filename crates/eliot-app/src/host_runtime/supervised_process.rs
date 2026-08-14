@@ -1926,7 +1926,7 @@ mod tests {
         spec.timeout_profile = eliot_types::ProviderRoutePolicy::for_route(
             eliot_types::AgentHostId::Codex,
             "supervised-process-idle-output-fixture",
-            eliot_types::ProviderDeclaredBudget::new(5_000, 32 * 1024)
+            eliot_types::ProviderDeclaredBudget::new(30_000, 32 * 1024)
                 .with_spawn_deadline_ms(Some(1_000))
                 .with_first_output_deadline_ms(Some(3_000))
                 .with_idle_output_deadline_ms(Some(100))
@@ -1936,7 +1936,10 @@ mod tests {
         )
         .timeout_profile()
         .clone();
-        let output = run_supervised_process(spec, context(5_000)).await?;
+        // This test asserts the provider profile's idle-output cause.  Keep the
+        // caller-owned wall clock outside the assertion window so scheduler
+        // delay before `spawn_blocking` cannot legitimately win first.
+        let output = run_supervised_process(spec, context(60_000)).await?;
         assert!(output.timed_out);
         assert!(
             output
