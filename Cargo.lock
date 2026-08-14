@@ -371,6 +371,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "eliot-evidence"
+version = "0.1.0"
+dependencies = [
+ "eliot-contracts",
+ "schemars",
+ "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
 name = "eliot-process"
 version = "0.1.0"
 dependencies = [
