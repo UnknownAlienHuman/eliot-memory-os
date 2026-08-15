@@ -1,0 +1,19 @@
+[package]
+name = "eliot-testd-core"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.89"
+license = "MIT"
+description = "Persistent scheduling and state core for the ELIOT instrument test daemon"
+
+[workspace]
+
+[dependencies]
+blake3 = "1.8.5"
+eliot-instrument-api = { path = "../eliot-instrument-api" }
+eliot-process = { path = "../../kernel/eliot-process" }
+redb = "4.1.0"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = { version = "1.0.150", features = ["float_roundtrip"] }
+thiserror = "2.0.18"
+uuid = { version = "1.23.4", features = ["serde", "v4"] }
