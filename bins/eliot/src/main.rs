@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
@@ -40,13 +41,12 @@ fn main() -> Result<()> {
     std::thread::Builder::new()
         .name("eliot-cli-main".to_owned())
         .stack_size(32 * 1024 * 1024)
-        .spawn(run)
+        .spawn(|| run())
         .context("spawn the CLI entrypoint")?
         .join()
         .map_err(|_| anyhow::anyhow!("CLI entrypoint panicked"))?
 }
 
-#[allow(clippy::print_stdout)]
 fn run() -> Result<()> {
     init_tracing();
     let cli = Cli::parse();
@@ -55,12 +55,11 @@ fn run() -> Result<()> {
             println!("eliot {VERSION}");
             Ok(())
         }
-        Command::Catalogue { command } => run_catalogue(&command),
+        Command::Catalogue { command } => run_catalogue(command),
     }
 }
 
-#[allow(clippy::print_stdout)]
-fn run_catalogue(command: &CatalogueCommand) -> Result<()> {
+fn run_catalogue(command: CatalogueCommand) -> Result<()> {
     let catalogue = eliot_cli::CommandCatalogue::current();
     match command {
         CatalogueCommand::Help => println!("{}", catalogue.help_text()?),

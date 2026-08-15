@@ -30,7 +30,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 #[cfg(windows)]
 use eliot_platform_windows::{
     JobObjectIdentity, JobObjectLimits, RunningJobChild, RunningJobObservation, SuspendedJobChild,
-    SuspendedLaunchSpec, SuspendedProcessEvidence, SuspendedValidationError,
+    SuspendedLaunchSpec, SuspendedProcessEvidence, SuspendedValidationError, TerminatedJobChild,
 };
 
 const DEFAULT_CAPTURE_LIMIT: usize = 16 * 1024 * 1024;
@@ -125,7 +125,21 @@ struct Operation;
 pub struct WindowsProcessExecutor {
     authority: Arc<dyn DispatchValidationPort>,
     operations: Mutex<BTreeMap<OperationId, Arc<Mutex<Operation>>>>,
+    reservations: Mutex<std::collections::BTreeSet<OperationId>>,
     capture_limit: usize,
+}
+
+struct OperationReservation<'a> {
+    executor: &'a WindowsProcessExecutor,
+    operation_id: OperationId,
+}
+
+impl Drop for OperationReservation<'_> {
+    fn drop(&mut self) {
+        if let Ok(mut reservations) = self.executor.reservations.lock() {
+            reservations.remove(&self.operation_id);
+        }
+    }
 }
 
 impl WindowsProcessExecutor {
@@ -135,6 +149,7 @@ impl WindowsProcessExecutor {
         Self {
             authority,
             operations: Mutex::new(BTreeMap::new()),
+            reservations: Mutex::new(std::collections::BTreeSet::new()),
             capture_limit: DEFAULT_CAPTURE_LIMIT,
         }
     }
@@ -148,6 +163,7 @@ impl WindowsProcessExecutor {
         Self {
             authority,
             operations: Mutex::new(BTreeMap::new()),
+            reservations: Mutex::new(std::collections::BTreeSet::new()),
             capture_limit: capture_limit.max(1),
         }
     }
@@ -159,6 +175,30 @@ impl WindowsProcessExecutor {
             .get(id)
             .cloned()
             .ok_or(ProcessExecutionError::NotFound)
+    }
+
+    fn reserve_operation(
+        &self,
+        id: OperationId,
+    ) -> Result<OperationReservation<'_>, ProcessExecutionError> {
+        let operations = self
+            .operations
+            .lock()
+            .map_err(|_| unavailable("operation registry lock poisoned"))?;
+        if operations.contains_key(&id) {
+            return Err(unavailable("operation identity already exists"));
+        }
+        let mut reservations = self
+            .reservations
+            .lock()
+            .map_err(|_| unavailable("operation reservation lock poisoned"))?;
+        if !reservations.insert(id.clone()) {
+            return Err(unavailable("operation identity already exists"));
+        }
+        Ok(OperationReservation {
+            executor: self,
+            operation_id: id,
+        })
     }
 
     /// Returns the retained non-authoritative stream projections.
@@ -207,13 +247,12 @@ impl WindowsProcessExecutor {
             let ids = operations
                 .iter()
                 .filter_map(|(id, operation)| {
-                    let guard = operation.lock().ok()?;
-                    guard
-                        .state
-                        .view()
-                        .lifecycle()
-                        .is_terminal()
-                        .then(|| id.clone())
+                    let mut guard = operation.lock().ok()?;
+                    if !guard.state.view().lifecycle().is_terminal() {
+                        return None;
+                    }
+                    join_streams(&mut guard);
+                    Some(id.clone())
                 })
                 .collect::<Vec<_>>();
             let count = ids.len();
@@ -249,6 +288,10 @@ impl WindowsProcessExecutor {
                 join_streams(&mut guard);
             }
             operations.clear();
+            self.reservations
+                .lock()
+                .map_err(|_| unavailable("operation reservation lock poisoned"))?
+                .clear();
             return Ok(());
         }
         #[cfg(not(windows))]
@@ -272,14 +315,7 @@ impl ProcessExecutor for WindowsProcessExecutor {
     ) -> Result<ProcessStartReceipt, ProcessExecutionError> {
         request.validate()?;
         let operation_id = request.operation_id().clone();
-        if self
-            .operations
-            .lock()
-            .map_err(|_| unavailable("operation registry lock poisoned"))?
-            .contains_key(&operation_id)
-        {
-            return Err(unavailable("operation identity already exists"));
-        }
+        let _reservation = self.reserve_operation(operation_id.clone())?;
 
         #[cfg(not(windows))]
         {
@@ -542,9 +578,21 @@ fn finalize_operation(
     let Some(child) = operation.child.take() else {
         return Err(ProcessExecutionError::UnknownOutcome);
     };
+    let observed_root_exit = child
+        .observe()
+        .ok()
+        .and_then(|observation| match observation {
+            RunningJobObservation::RootExited { exit_code, .. }
+            | RunningJobObservation::Exited { exit_code } => Some(exit_code),
+            RunningJobObservation::Running { .. } => None,
+        });
     let termination = child.terminate(JOB_TERMINATION_CODE);
+    let observed_exit_code = termination
+        .as_ref()
+        .ok()
+        .map(TerminatedJobChild::observed_exit_code);
     let history = termination.ok().map(|receipt| receipt.history().clone());
-    let (process_ids, complete, tree_terminated, evidence_ref, code) = history
+    let (process_ids, complete, tree_terminated, evidence_ref) = history
         .as_ref()
         .map(|history| {
             let ids = history
@@ -569,10 +617,9 @@ fn finalize_operation(
                 history.complete(),
                 history.job_empty(),
                 Some(evidence_ref),
-                Some(0),
             )
         })
-        .unwrap_or_else(|| (Vec::new(), false, false, None, None));
+        .unwrap_or_else(|| (Vec::new(), false, false, None));
     let view = operation.state.view();
     let Some(identity) = view.identity() else {
         return Err(ProcessExecutionError::UnknownOutcome);
@@ -587,10 +634,23 @@ fn finalize_operation(
     )?;
     let actual_disposition = if !complete || !tree_terminated {
         ExitDisposition::Unknown
+    } else if observed_root_exit.is_some() {
+        ExitDisposition::Completed
     } else if cancelled {
         ExitDisposition::Cancelled
+    } else if disposition == ExitDisposition::Completed {
+        // A completion request without a root-exit observation cannot be
+        // projected as a successful completion, even when Job termination
+        // itself succeeded.  The adapter's forced-termination code is not a
+        // substitute for the child outcome.
+        ExitDisposition::Unknown
     } else {
         disposition
+    };
+    let code = if actual_disposition == ExitDisposition::Unknown {
+        None
+    } else {
+        observed_root_exit.or(observed_exit_code)
     };
     let exit = ExitStatus::new(actual_disposition, code, None, now_ms())?;
     operation.state.exit(exit, descendants)?;
@@ -611,6 +671,11 @@ fn spawn_deadline_watcher(operation: Arc<Mutex<Operation>>) {
                     return;
                 }
                 if refresh_operation(&mut guard).is_err() {
+                    // A failed observation is an external-state gap, not a
+                    // reason to detach the Job.  Fence the operation as
+                    // unknown and retain it for explicit reconciliation or
+                    // final shutdown cleanup.
+                    let _ = finalize_operation(&mut guard, ExitDisposition::Unknown, false);
                     return;
                 }
             }
