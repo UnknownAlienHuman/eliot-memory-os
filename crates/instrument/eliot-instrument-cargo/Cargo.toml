@@ -1,0 +1,22 @@
+[package]
+name = "eliot-instrument-cargo"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.89"
+license = "MIT"
+description = "Governed Cargo instrumentation adapter over the production process port"
+
+[dependencies]
+eliot-instrument-api = { path = "../eliot-instrument-api", version = "0.1.0" }
+eliot-process = { path = "../../kernel/eliot-process", version = "0.1.0" }
+serde = { version = "1.0.228", features = ["derive"] }
+thiserror = "2.0.18"
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+module_name_repetitions = "allow"
+must_use_candidate = "allow"
