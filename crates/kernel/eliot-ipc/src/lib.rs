@@ -9,7 +9,8 @@ use std::future::Future;
 use std::time::Duration;
 
 use eliot_protocol::{
-    ClientHello, Frame, JsonCodec, ProtocolError, ProtocolRange, ProtocolVersion, negotiate,
+    ClientHello, EncodingProfile, Frame, FrameKind, JsonCodec, MessageType, ProtocolError,
+    ProtocolPayload, ProtocolRange, ProtocolVersion, ServerHello, negotiate,
 };
 use eliot_runtime_contracts::ModuleGeneration;
 use thiserror::Error;
@@ -365,10 +366,142 @@ impl ServerHandshakePolicy {
 #[derive(Clone, Debug, PartialEq)]
 pub struct HandshakeResult {
     pub session: Session,
-    pub server_hello: eliot_protocol::ServerHello,
+    pub server_hello: ServerHello,
     pub capabilities: Vec<String>,
     pub privacy_classes: Vec<String>,
     pub effects: Vec<String>,
+}
+
+/// Encodes the typed ClientHello on the authenticated EBP control lane.
+///
+/// The authentication preface is deliberately separate from this frame. A
+/// caller must first pass the platform identity boundary, then send exactly
+/// one Control/Start frame containing the validated ClientHello JSON.
+pub fn client_hello_frame(
+    connection_id: impl Into<String>,
+    client: &ClientHello,
+) -> Result<Frame, TransportError> {
+    client.validate()?;
+    handshake_frame(
+        connection_id,
+        FrameKind::Control,
+        MessageType::Start,
+        serde_json::to_value(client).map_err(|error| ProtocolError::Json(error.to_string()))?,
+    )
+}
+
+/// Decodes and validates a typed ClientHello from an authenticated EBP frame.
+pub fn decode_client_hello_frame(
+    frame: &Frame,
+    expected_connection_id: &str,
+) -> Result<ClientHello, TransportError> {
+    let payload = validate_handshake_frame(
+        frame,
+        expected_connection_id,
+        FrameKind::Control,
+        MessageType::Start,
+    )?;
+    let client: ClientHello = serde_json::from_value(payload.clone())
+        .map_err(|error| ProtocolError::Json(error.to_string()))?;
+    client.validate()?;
+    Ok(client)
+}
+
+/// Encodes the server-authoritative typed ServerHello on the control lane.
+pub fn server_hello_frame(
+    connection_id: impl Into<String>,
+    server: &ServerHello,
+) -> Result<Frame, TransportError> {
+    server.validate()?;
+    handshake_frame(
+        connection_id,
+        FrameKind::Control,
+        MessageType::Ready,
+        serde_json::to_value(server).map_err(|error| ProtocolError::Json(error.to_string()))?,
+    )
+}
+
+/// Decodes and validates a typed ServerHello from an authenticated EBP frame.
+pub fn decode_server_hello_frame(
+    frame: &Frame,
+    expected_connection_id: &str,
+) -> Result<ServerHello, TransportError> {
+    let payload = validate_handshake_frame(
+        frame,
+        expected_connection_id,
+        FrameKind::Control,
+        MessageType::Ready,
+    )?;
+    let server: ServerHello = serde_json::from_value(payload.clone())
+        .map_err(|error| ProtocolError::Json(error.to_string()))?;
+    server.validate()?;
+    Ok(server)
+}
+
+/// Encodes a typed handshake rejection on the authenticated control lane.
+pub fn handshake_rejection_frame(
+    connection_id: impl Into<String>,
+    reason: impl Into<String>,
+) -> Result<Frame, TransportError> {
+    let reason = reason.into();
+    if reason.trim().is_empty() || reason.chars().any(char::is_control) {
+        return Err(TransportError::Protocol(ProtocolError::InvalidField {
+            field: "rejection_reason",
+            reason: "must be non-blank and free of control characters",
+        }));
+    }
+    handshake_frame(
+        connection_id,
+        FrameKind::Control,
+        MessageType::Fatal,
+        serde_json::json!({"rejection_reason": reason}),
+    )
+}
+
+fn handshake_frame(
+    connection_id: impl Into<String>,
+    kind: FrameKind,
+    message_type: MessageType,
+    payload: serde_json::Value,
+) -> Result<Frame, TransportError> {
+    let frame = Frame {
+        protocol_version: ProtocolVersion::CURRENT,
+        encoding_profile: EncodingProfile::JsonV1,
+        connection_id: connection_id.into(),
+        request_id: None,
+        kind,
+        message_type,
+        request_identity: None,
+        payload: ProtocolPayload::Json(payload),
+        trace_context: std::collections::BTreeMap::new(),
+    };
+    frame.validate()?;
+    Ok(frame)
+}
+
+fn validate_handshake_frame<'a>(
+    frame: &'a Frame,
+    expected_connection_id: &str,
+    expected_kind: FrameKind,
+    expected_message_type: MessageType,
+) -> Result<&'a serde_json::Value, TransportError> {
+    frame.validate()?;
+    if expected_connection_id.trim().is_empty()
+        || frame.connection_id != expected_connection_id
+        || frame.kind != expected_kind
+        || frame.message_type != expected_message_type
+        || frame.request_id.is_some()
+        || frame.request_identity.is_some()
+    {
+        return Err(TransportError::SessionFenced);
+    }
+    match &frame.payload {
+        ProtocolPayload::Json(value) => Ok(value),
+        _ => Err(TransportError::Protocol(ProtocolError::InvalidField {
+            field: "payload",
+            reason: "handshake frames require a JSON payload",
+        })),
+    }
 }
 
 fn validate_unique_texts(values: &[String]) -> Result<(), TransportError> {

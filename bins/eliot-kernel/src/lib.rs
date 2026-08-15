@@ -13,7 +13,9 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use eliot_contracts::{ArtifactId, AuthorityEpoch, ContractId, ResourceGeneration, StateFence};
-use eliot_ipc::{HandshakeResult, PeerIdentity, ServerHandshakePolicy, Session, TransportLimits};
+use eliot_ipc::{
+    HandshakeResult, PeerIdentity, ServerHandshakePolicy, Session, TransportError, TransportLimits,
+};
 use eliot_kernel_core::{GenerationRoute, GenerationRouter, RouteScope};
 use eliot_kernel_service::{
     KernelControlCommand, KernelService, KernelServiceError, KernelServiceState,
@@ -25,6 +27,7 @@ use eliot_process::{
     ProcessExecutionError, ProcessRequest, SuspendedProcessIdentity, ValidatedDispatch,
 };
 use eliot_process_executor::{DispatchValidationPort, WindowsProcessExecutor};
+use eliot_protocol::{EncodingProfile, Frame, FrameKind, MessageType, ProtocolPayload};
 use eliot_runtime::{Runtime, RuntimeConfig, ShutdownOutcome};
 use eliot_runtime_contracts::{HealthVector, ModuleGeneration, ModuleGenerationState};
 use sha2::{Digest as _, Sha256};
@@ -150,6 +153,21 @@ pub struct KernelComposition {
     generations: Mutex<GenerationRouter>,
     front_door_policy: ServerHandshakePolicy,
     process_executor: WindowsProcessExecutor,
+}
+
+/// Result of the closed Kernel semantic gateway for one authenticated frame.
+///
+/// The transport/session loop owns the connection lifetime. This action only
+/// says whether a validated frame may receive a bounded protocol reply, must
+/// fence the session, or requests the one Kernel shutdown path.
+#[derive(Debug)]
+pub enum KernelFrameAction {
+    /// Return a bounded liveness or status reply.
+    Reply(Frame),
+    /// Return the shutdown acknowledgement, then close the connection.
+    ReplyAndShutdown(Frame),
+    /// Return a typed rejection, then fence the connection.
+    Fence(Frame),
 }
 
 /// Fail-closed authority adapter used until the Host handoff supplies the
@@ -313,6 +331,65 @@ impl KernelComposition {
             .bind_session(connection_id, peer, client, &self.front_door_policy)
     }
 
+    /// Runs the currently admitted, deliberately closed semantic gateway.
+    ///
+    /// Heartbeats and explicit shutdown are handled locally. Other validated
+    /// frames are rejected and fenced until the durable execution gateway is
+    /// supplied; this boundary never fabricates execution success.
+    pub fn dispatch_frame(
+        &self,
+        session: &Session,
+        frame: &Frame,
+    ) -> Result<KernelFrameAction, TransportError> {
+        frame.validate()?;
+        if !session.accepts(session.authority_epoch, session.session_epoch)
+            || frame.connection_id != session.connection_id
+            || frame.protocol_version != session.protocol_version
+        {
+            return Err(TransportError::SessionFenced);
+        }
+        if let Some(identity) = &frame.request_identity
+            && !session
+                .module_generation
+                .state_fence
+                .is_compatible_with(&identity.request.state_fence)
+        {
+            return Err(TransportError::SessionFenced);
+        }
+
+        if frame.kind == FrameKind::Heartbeat && frame.message_type == MessageType::Health {
+            return Ok(KernelFrameAction::Reply(status_frame(
+                session,
+                FrameKind::Heartbeat,
+                MessageType::Health,
+                serde_json::json!({
+                    "status": "OPEN",
+                    "authority_epoch": session.authority_epoch,
+                }),
+            )?));
+        }
+
+        if frame.kind == FrameKind::Control
+            && frame.message_type == MessageType::Shutdown
+            && frame.request_id.is_none()
+            && frame.request_identity.is_none()
+        {
+            return Ok(KernelFrameAction::ReplyAndShutdown(status_frame(
+                session,
+                FrameKind::Control,
+                MessageType::Shutdown,
+                serde_json::json!({"status": "SHUTTING_DOWN"}),
+            )?));
+        }
+
+        Ok(KernelFrameAction::Fence(
+            eliot_ipc::handshake_rejection_frame(
+                &session.connection_id,
+                "kernel semantic gateway is closed for this session",
+            )?,
+        ))
+    }
+
     /// Binds the authenticated local Windows front door to the current
     /// installation principal.  The returned server must be retained by the
     /// service loop for the lifetime of the accepted connection.
@@ -381,6 +458,27 @@ impl KernelComposition {
         let _ = self.process_executor.shutdown();
         self.runtime.shutdown().await
     }
+}
+
+fn status_frame(
+    session: &Session,
+    kind: FrameKind,
+    message_type: MessageType,
+    payload: serde_json::Value,
+) -> Result<Frame, TransportError> {
+    let frame = Frame {
+        protocol_version: session.protocol_version,
+        encoding_profile: EncodingProfile::JsonV1,
+        connection_id: session.connection_id.clone(),
+        request_id: None,
+        kind,
+        message_type,
+        request_identity: None,
+        payload: ProtocolPayload::Json(payload),
+        trace_context: std::collections::BTreeMap::new(),
+    };
+    frame.validate()?;
+    Ok(frame)
 }
 
 fn dispatch_key(work_root: &Path) -> [u8; 32] {
