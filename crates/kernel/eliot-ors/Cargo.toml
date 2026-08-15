@@ -1,0 +1,28 @@
+[package]
+name = "eliot-ors"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "P-06 durable non-semantic operational recovery state"
+
+[package.metadata.eliot]
+work_id = "P-06"
+functional_cell = "operational-recovery-state"
+lifecycle_owner = "P-06"
+source_layer = "P"
+proof_entrypoint = "cargo test -p eliot-ors"
+
+[dependencies]
+eliot-platform.workspace = true
+eliot-receipts.workspace = true
+eliot-runtime-contracts.workspace = true
+eliot-security-contracts.workspace = true
+redb.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true
