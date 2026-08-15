@@ -1,0 +1,25 @@
+[package]
+name = "eliot-maintenance"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Deterministic Governor maintenance trigger and durable-job lifecycle contracts"
+
+[package.metadata.eliot]
+work_id = "G-19"
+functional_cell = "maintenance"
+lifecycle_owner = "G-19"
+source_layer = "G"
+proof_entrypoint = "cargo test -p eliot-maintenance"
+
+[dependencies]
+eliot-contracts.workspace = true
+eliot-runtime-contracts.workspace = true
+schemars.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true
