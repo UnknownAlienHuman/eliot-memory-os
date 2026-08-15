@@ -36,6 +36,7 @@ members = [
   "crates/instrument/eliot-instrument-api",
   "crates/kernel/eliot-host-state",
   "crates/kernel/eliot-ipc",
+  "crates/kernel/eliot-ors",
   "crates/kernel/eliot-platform",
   "crates/kernel/eliot-platform-windows",
   "crates/kernel/eliot-process",
@@ -99,6 +100,7 @@ eliot-graph-api = { path = "crates/instrument/eliot-graph-api", version = "0.1.0
 eliot-instrument-api = { path = "crates/instrument/eliot-instrument-api", version = "0.1.0" }
 eliot-host-state = { path = "crates/kernel/eliot-host-state", version = "0.1.0" }
 eliot-ipc = { path = "crates/kernel/eliot-ipc", version = "0.1.0" }
+eliot-ors = { path = "crates/kernel/eliot-ors", version = "0.1.0" }
 eliot-agent-bridge-core = { path = "crates/surfaces/eliot-agent-bridge-core", version = "0.1.0" }
 eliot-agent-bridge = { path = "bins/eliot-agent-bridge", version = "0.1.0" }
 eliot-wasm-host = { path = "bins/eliot-wasm-host", version = "0.1.0" }

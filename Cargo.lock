@@ -623,6 +623,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "eliot-ors"
+version = "0.1.0"
+dependencies = [
+ "eliot-platform",
+ "eliot-receipts",
+ "eliot-runtime-contracts",
+ "eliot-security-contracts",
+ "redb",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror",
+]
+
+[[package]]
 name = "eliot-platform"
 version = "0.1.0"
 dependencies = [
