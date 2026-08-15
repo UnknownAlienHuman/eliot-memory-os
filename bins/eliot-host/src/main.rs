@@ -43,37 +43,43 @@ fn main() {
             std::process::exit(1);
         }
     }
-    run_console();
+    if !run_console() {
+        std::process::exit(1);
+    }
 }
 
-fn run_console() {
+fn run_console() -> bool {
     let mut host = match open_host() {
         Ok(host) => host,
         Err(error) => {
             write_response(Response::Error {
                 error: error.to_string(),
             });
-            return;
+            return false;
         }
     };
     if !write_response(Response::Ready {
         service: SERVICE_NAME,
         protocol: PROTOCOL_VERSION,
     }) {
-        return;
+        return finish_console_shutdown(&mut host, "ready response failed");
     }
     for line in io::stdin().lock().lines() {
-        let response = match line {
+        let (response, terminate) = match line {
             Ok(line) if line.trim().is_empty() => continue,
             Ok(line) => dispatch(&mut host, &line),
-            Err(error) => Response::Error {
-                error: error.to_string(),
-            },
+            Err(error) => (
+                Response::Error {
+                    error: error.to_string(),
+                },
+                true,
+            ),
         };
-        if !write_response(response) || !host.running() {
+        if !write_response(response) || terminate || !host.running() {
             break;
         }
     }
+    finish_console_shutdown(&mut host, "console input ended")
 }
 
 fn open_host() -> Result<HostComposition, HostError> {
@@ -100,27 +106,52 @@ fn state_path() -> Result<PathBuf, HostError> {
         .join("host-state.redb"))
 }
 
-fn dispatch(host: &mut HostComposition, line: &str) -> Response {
+fn dispatch(host: &mut HostComposition, line: &str) -> (Response, bool) {
     match serde_json::from_str::<Request>(line) {
-        Ok(Request::Status) => match host.snapshot() {
-            Ok(state) => Response::State {
-                running: host.running(),
-                active_process: state.active_process.is_some(),
-                managed_dependencies: state.managed_dependencies.len(),
+        Ok(Request::Status) => (
+            match host.snapshot() {
+                Ok(state) => Response::State {
+                    running: host.running(),
+                    active_process: state.active_process.is_some(),
+                    managed_dependencies: state.managed_dependencies.len(),
+                },
+                Err(error) => Response::Error {
+                    error: error.to_string(),
+                },
             },
-            Err(error) => Response::Error {
+            false,
+        ),
+        Ok(Request::Stop) => (
+            match host.stop() {
+                Ok(()) => Response::Stopped,
+                Err(error) => Response::Error {
+                    error: error.to_string(),
+                },
+            },
+            true,
+        ),
+        Err(error) => (
+            Response::Error {
                 error: error.to_string(),
             },
-        },
-        Ok(Request::Stop) => match host.stop() {
-            Ok(()) => Response::Stopped,
-            Err(error) => Response::Error {
-                error: error.to_string(),
-            },
-        },
-        Err(error) => Response::Error {
-            error: error.to_string(),
-        },
+            false,
+        ),
+    }
+}
+
+fn finish_console_shutdown(host: &mut HostComposition, cause: &str) -> bool {
+    if !host.running() {
+        return !host.shutdown_failed();
+    }
+    match host.stop() {
+        Ok(()) | Err(HostError::Stopped) => true,
+        Err(error) => {
+            let _ = writeln!(
+                io::stderr().lock(),
+                "eliot-host: durable shutdown failed after {cause}: {error}"
+            );
+            false
+        }
     }
 }
 
@@ -239,9 +270,19 @@ unsafe extern "system" fn service_main(_argc: u32, _argv: *mut *mut u16) {
     status.dwWaitHint = 10_000;
     // SAFETY: handle is registered and status is initialized.
     unsafe { SetServiceStatus(handle, &raw const status) };
-    let _ = host.stop();
+    let stop_result = host.stop();
     status.dwCurrentState = SERVICE_STOPPED;
     status.dwControlsAccepted = 0;
+    if let Err(error) = stop_result {
+        let _ = writeln!(
+            io::stderr().lock(),
+            "eliot-host: durable SCM shutdown failed; recovery required: {error}"
+        );
+        // SCM receives a stopped state with a non-zero service-specific code,
+        // which is a failed/recovery outcome rather than a clean stop.
+        status.dwWin32ExitCode = 1;
+        status.dwServiceSpecificExitCode = 1;
+    }
     // SAFETY: handle is registered and status is initialized.
     unsafe { SetServiceStatus(handle, &raw const status) };
 }

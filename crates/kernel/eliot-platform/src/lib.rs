@@ -638,7 +638,7 @@ pub struct HostShutdownMarker {
 }
 
 impl HostShutdownMarker {
-    fn validate(&self) -> Result<(), HostStateError> {
+    pub fn validate(&self) -> Result<(), HostStateError> {
         validate_context(&self.context).map_err(|_| HostStateError::InvalidRecord)?;
         validate_text(self.installation.as_str(), "installation")
             .map_err(|_| HostStateError::InvalidRecord)?;

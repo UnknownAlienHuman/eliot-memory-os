@@ -10,12 +10,24 @@ use eliot_platform::{
     HostStateError, HostStateStore, ManagedDependencyReceipt, ManagedDependencyTransition,
     PlatformHandle,
 };
-use redb::{Database, ReadableDatabase, TableDefinition};
+use redb::{Database, ReadOnlyDatabase, ReadableDatabase, TableDefinition};
 
 const STATE: TableDefinition<&str, &[u8]> = TableDefinition::new("eliot_host_state_v1");
 const INSTALLATION: &str = "installation";
 const EPOCH: TableDefinition<&str, &[u8]> = TableDefinition::new("eliot_host_epoch_v1");
 const CURRENT_EPOCH: &str = "current";
+
+/// Read-only admission result for one existing Host state database.
+///
+/// `FirstInstall` is returned only when the database file is absent. An
+/// existing file without a clean marker is never treated as a fresh install;
+/// it requires an explicit recovery marker before Host may mutate epochs.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HostAdmissionState {
+    FirstInstall,
+    Clean,
+    RecoveryRequired,
+}
 
 /// Host-local state store backed by a redb database.
 ///
@@ -26,6 +38,52 @@ pub struct RedbHostStateStore {
 }
 
 impl RedbHostStateStore {
+    /// Inspects existing Host state without creating directories, opening a
+    /// writable database, advancing an epoch, or mutating activation state.
+    pub fn inspect_admission(
+        path: impl AsRef<Path>,
+        installation: &PlatformHandle,
+    ) -> Result<HostAdmissionState, HostStateError> {
+        let path = path.as_ref();
+        match fs::symlink_metadata(path) {
+            Ok(metadata) if metadata.is_file() => {}
+            Ok(_) => return Err(HostStateError::Unavailable),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(HostAdmissionState::FirstInstall);
+            }
+            Err(_) => return Err(HostStateError::Unavailable),
+        }
+        let database = ReadOnlyDatabase::open(path).map_err(|_| HostStateError::Unavailable)?;
+        let state = read_state_from(&database)?.ok_or(HostStateError::Unavailable)?;
+        validate_admission_state(&state, installation)?;
+        if state.active_process.is_some() || state.last_clean_shutdown.is_none() {
+            Ok(HostAdmissionState::RecoveryRequired)
+        } else {
+            Ok(HostAdmissionState::Clean)
+        }
+    }
+
+    /// Opens an existing Host database for an explicit recovery mutation.
+    ///
+    /// Unlike [`Self::open`], this never creates a missing file or installs an
+    /// initial state record. Recovery callers must first acquire the Host
+    /// owner lease and supply a validated shutdown marker.
+    pub fn open_existing(
+        path: impl AsRef<Path>,
+        installation: &PlatformHandle,
+    ) -> Result<Self, HostStateError> {
+        let path = path.as_ref();
+        match fs::symlink_metadata(path) {
+            Ok(metadata) if metadata.is_file() => {}
+            Ok(_) | Err(_) => return Err(HostStateError::Unavailable),
+        }
+        let database = Database::open(path).map_err(|_| HostStateError::Unavailable)?;
+        let store = Self { database };
+        let state = store.read_state()?.ok_or(HostStateError::Unavailable)?;
+        validate_admission_state(&state, installation)?;
+        Ok(store)
+    }
+
     /// Opens or creates a Host state database and installs the initial
     /// installation identity on first use.
     pub fn open(
@@ -132,24 +190,7 @@ impl RedbHostStateStore {
     }
 
     fn read_state(&self) -> Result<Option<HostInstallationState>, HostStateError> {
-        let read = self
-            .database
-            .begin_read()
-            .map_err(|_| HostStateError::Unavailable)?;
-        let table = match read.open_table(STATE) {
-            Ok(table) => table,
-            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
-            Err(_) => return Err(HostStateError::Unavailable),
-        };
-        let Some(value) = table
-            .get(INSTALLATION)
-            .map_err(|_| HostStateError::Unavailable)?
-        else {
-            return Ok(None);
-        };
-        serde_json::from_slice(value.value())
-            .map(Some)
-            .map_err(|_| HostStateError::Unavailable)
+        read_state_from(&self.database)
     }
 
     fn write_state(&self, state: &HostInstallationState) -> Result<(), HostStateError> {
@@ -181,6 +222,46 @@ impl RedbHostStateStore {
         mutation(&mut state)?;
         self.write_state(&state)
     }
+}
+
+fn read_state_from<D: ReadableDatabase>(
+    database: &D,
+) -> Result<Option<HostInstallationState>, HostStateError> {
+    let read = database
+        .begin_read()
+        .map_err(|_| HostStateError::Unavailable)?;
+    let table = match read.open_table(STATE) {
+        Ok(table) => table,
+        Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
+        Err(_) => return Err(HostStateError::Unavailable),
+    };
+    let Some(value) = table
+        .get(INSTALLATION)
+        .map_err(|_| HostStateError::Unavailable)?
+    else {
+        return Ok(None);
+    };
+    serde_json::from_slice(value.value())
+        .map(Some)
+        .map_err(|_| HostStateError::Unavailable)
+}
+
+fn validate_admission_state(
+    state: &HostInstallationState,
+    installation: &PlatformHandle,
+) -> Result<(), HostStateError> {
+    state.validate()?;
+    if state.installation != *installation {
+        return Err(HostStateError::InstallationMismatch);
+    }
+    if state
+        .last_clean_shutdown
+        .as_ref()
+        .is_some_and(|marker| marker.installation != *installation)
+    {
+        return Err(HostStateError::InvalidRecord);
+    }
+    Ok(())
 }
 
 fn next_epoch(
@@ -283,10 +364,7 @@ impl HostStateStore for RedbHostStateStore {
     }
 
     fn mark_clean_shutdown(&self, marker: HostShutdownMarker) -> Result<(), HostStateError> {
-        marker
-            .process
-            .validate()
-            .map_err(|_| HostStateError::InvalidRecord)?;
+        marker.validate()?;
         let installation = marker.installation.clone();
         self.mutate(installation.as_str(), |state| {
             state.active_process = None;

@@ -15,12 +15,12 @@ use eliot_contracts::{
     AuthorityEpoch, ClockReading, ProductId, RequestId, RequestMetadata, ResourceGeneration,
     SourceId, StateFence,
 };
-use eliot_host_state::{HostInstallationEpoch, RedbHostStateStore};
+use eliot_host_state::{HostAdmissionState, HostInstallationEpoch, RedbHostStateStore};
 use eliot_installation::{
     ApprovedGenerationRegistry, CandidateManifest, InstallationError, RedbInstallationRegistry,
 };
-use eliot_platform::{HostInstallationState, HostStateStore, PlatformHandle};
-use eliot_platform_windows::{HostOwnerLease, HostOwnerLeaseError};
+use eliot_platform::{HostInstallationState, HostShutdownMarker, HostStateStore, PlatformHandle};
+use eliot_platform_windows::{HostOwnerLease, HostOwnerLeaseError, HostOwnerLeaseReleaseError};
 use eliot_runtime_contracts::{HealthVector, ServiceProcessRecord, ServiceProcessState};
 use thiserror::Error;
 
@@ -389,6 +389,7 @@ pub struct HostComposition {
     #[cfg(windows)]
     jobs: HostJobBranches,
     owner_lease: HostOwnerLease,
+    shutdown_failed: bool,
 }
 
 impl HostComposition {
@@ -400,6 +401,19 @@ impl HostComposition {
             return Err(HostError::MissingInstallation);
         }
         let owner_lease = HostOwnerLease::acquire(&installation).map_err(owner_lease_error)?;
+        match RedbHostStateStore::inspect_admission(path, &installation).map_err(|error| {
+            HostError::OwnerLeaseRecovery(format!(
+                "durable Host admission inspection failed; recovery required: {error}"
+            ))
+        })? {
+            HostAdmissionState::FirstInstall | HostAdmissionState::Clean => {}
+            HostAdmissionState::RecoveryRequired => {
+                return Err(HostError::OwnerLeaseRecovery(
+                    "durable Host state is unclean or still running; explicit recovery evidence is required"
+                        .to_owned(),
+                ));
+            }
+        }
         let (state_store, host) = RedbHostStateStore::open_epoch(path, installation.clone())?;
         let registry_path = path.with_file_name("installation-registry.redb");
         let registry_store = RedbInstallationRegistry::open(registry_path)?;
@@ -428,6 +442,7 @@ impl HostComposition {
             #[cfg(windows)]
             jobs,
             owner_lease,
+            shutdown_failed: false,
         };
         #[cfg(windows)]
         if composition.registry.active().is_some() {
@@ -436,6 +451,46 @@ impl HostComposition {
             composition.start_approved_contour(kernel, store)?;
         }
         Ok(composition)
+    }
+
+    /// Clears an unclean durable Host admission gate using an explicit,
+    /// caller-supplied shutdown marker. This path does not advance an epoch
+    /// or fabricate a clean marker and is intended for bounded offline
+    /// recovery only.
+    pub fn recover_unclean(
+        path: impl AsRef<Path>,
+        installation: PlatformHandle,
+        marker: HostShutdownMarker,
+    ) -> Result<(), HostError> {
+        if installation.as_str().trim().is_empty() {
+            return Err(HostError::MissingInstallation);
+        }
+        let mut owner_lease = HostOwnerLease::acquire(&installation).map_err(owner_lease_error)?;
+        match RedbHostStateStore::inspect_admission(path.as_ref(), &installation).map_err(
+            |error| {
+                HostError::OwnerLeaseRecovery(format!(
+                    "durable Host admission inspection failed; recovery required: {error}"
+                ))
+            },
+        )? {
+            HostAdmissionState::RecoveryRequired => {}
+            HostAdmissionState::FirstInstall => {
+                return Err(HostError::OwnerLeaseRecovery(
+                    "recovery evidence cannot admit a missing Host state database".to_owned(),
+                ));
+            }
+            HostAdmissionState::Clean => {
+                return Err(HostError::OwnerLeaseRecovery(
+                    "durable Host state is already clean; no recovery mutation was applied"
+                        .to_owned(),
+                ));
+            }
+        }
+        let state_store = RedbHostStateStore::open_existing(path, &installation)?;
+        state_store
+            .mark_clean_shutdown(marker)
+            .map_err(HostError::State)?;
+        owner_lease.release().map_err(owner_lease_release_error)
     }
 
     /// Returns the Host epoch bound to this process.
@@ -675,13 +730,27 @@ impl HostComposition {
                 process,
             })
             .map_err(HostError::State)?;
+        let release = self
+            .owner_lease
+            .release()
+            .map_err(owner_lease_release_error);
         self.running = false;
-        Ok(())
+        if release.is_err() {
+            self.shutdown_failed = true;
+        }
+        release
     }
 
     #[must_use]
     pub const fn running(&self) -> bool {
         self.running
+    }
+
+    /// Returns whether a prior shutdown attempt recorded a release/recovery
+    /// failure. A stopped composition with this flag is not a clean success.
+    #[must_use]
+    pub const fn shutdown_failed(&self) -> bool {
+        self.shutdown_failed
     }
 
     #[cfg(windows)]
@@ -754,6 +823,10 @@ fn lifecycle_context(
 fn owner_lease_error(error: HostOwnerLeaseError) -> HostError {
     match error {
         HostOwnerLeaseError::LiveOwner => HostError::OwnerLeaseHeld,
+        HostOwnerLeaseError::ExistingObject => HostError::OwnerLeaseRecovery(
+            "a pre-existing Host owner object is untrusted; explicit recovery is required"
+                .to_owned(),
+        ),
         HostOwnerLeaseError::AbandonedOwner => HostError::OwnerLeaseRecovery(
             "the previous Host owner abandoned its mutex; inspect durable shutdown state before retrying"
                 .to_owned(),
@@ -768,6 +841,12 @@ fn owner_lease_error(error: HostOwnerLeaseError) -> HostError {
             "Host owner lease is unavailable on this platform; refusing Host admission".to_owned(),
         ),
     }
+}
+
+fn owner_lease_release_error(error: HostOwnerLeaseReleaseError) -> HostError {
+    HostError::OwnerLeaseRecovery(format!(
+        "durable Host shutdown completed but owner release was not classified: {error}"
+    ))
 }
 
 #[cfg(windows)]

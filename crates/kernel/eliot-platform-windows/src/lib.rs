@@ -57,6 +57,8 @@ impl std::error::Error for WindowsAdapterError {}
 pub enum HostOwnerLeaseError {
     /// The named mutex is currently owned by another Host process.
     LiveOwner,
+    /// A pre-existing named object cannot be trusted without a DACL proof.
+    ExistingObject,
     /// The previous owner terminated without completing durable shutdown.
     AbandonedOwner,
     /// Windows could not classify the owner state; recovery is required.
@@ -71,6 +73,9 @@ impl std::fmt::Display for HostOwnerLeaseError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::LiveOwner => formatter.write_str("installation-wide Host owner is live"),
+            Self::ExistingObject => formatter.write_str(
+                "installation-wide Host owner object already exists; refusing unverified ownership",
+            ),
             Self::AbandonedOwner => {
                 formatter.write_str("installation-wide Host owner was abandoned; recovery required")
             }
@@ -94,6 +99,48 @@ impl std::error::Error for HostOwnerLeaseError {}
 /// Prefix for the installation-wide cross-process Host owner mutex.
 pub const HOST_OWNER_MUTEX_PREFIX: &str = "Global\\Eliot-Host-Owner-";
 
+/// Failure returned when an explicit owner release cannot classify its
+/// ReleaseMutex/CloseHandle effects.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HostOwnerLeaseReleaseError {
+    /// Releasing mutex ownership failed, but the handle close was attempted.
+    ReleaseMutex { win32_error: u32 },
+    /// Closing the owner handle failed after ownership was released or was not held.
+    CloseHandle { win32_error: u32 },
+    /// Both release and close failed; the caller must retain recovery evidence.
+    ReleaseAndClose {
+        release_error: u32,
+        close_error: u32,
+    },
+    /// This primitive is intentionally unavailable off Windows.
+    UnsupportedPlatform,
+}
+
+impl std::fmt::Display for HostOwnerLeaseReleaseError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ReleaseMutex { win32_error } => write!(
+                formatter,
+                "Host owner ReleaseMutex failed (Win32 error {win32_error})"
+            ),
+            Self::CloseHandle { win32_error } => write!(
+                formatter,
+                "Host owner CloseHandle failed (Win32 error {win32_error})"
+            ),
+            Self::ReleaseAndClose {
+                release_error,
+                close_error,
+            } => write!(
+                formatter,
+                "Host owner ReleaseMutex and CloseHandle failed (Win32 errors {release_error}, {close_error})"
+            ),
+            Self::UnsupportedPlatform => formatter.write_str("Host owner release requires Windows"),
+        }
+    }
+}
+
+impl std::error::Error for HostOwnerLeaseReleaseError {}
+
 /// Returns the canonical named mutex for one validated installation identity.
 ///
 /// The identity itself never enters the object-manager name.  SHA-256 keeps
@@ -112,9 +159,9 @@ pub fn host_owner_mutex_name(installation: &PlatformHandle) -> String {
 
 /// Process-owned installation-wide Host admission lease.
 ///
-/// The handle remains held for the entire `HostComposition` lifetime.  A
-/// mutex object is not a durable recovery record: an abandoned result is
-/// explicitly rejected and never treated as permission to resume.
+/// The handle remains held for the entire `HostComposition` lifetime. A mutex
+/// object is not a durable recovery record: every pre-existing object is
+/// rejected and never treated as permission to resume.
 pub struct HostOwnerLease {
     #[cfg(windows)]
     handle: windows_sys::Win32::Foundation::HANDLE,
@@ -125,19 +172,19 @@ pub struct HostOwnerLease {
 impl HostOwnerLease {
     /// Acquires the canonical installation-wide Host owner mutex.
     ///
-    /// Existing ownership, abandoned ownership, ACL/access failures, and any
-    /// unclassified wait result are all returned as errors.  The caller may
-    /// proceed only on `Ok`, which means this process owns the mutex.
+    /// Existing ownership, unverified named objects, ACL/access failures, and
+    /// any unclassified Win32 result are all returned as errors. The caller
+    /// may proceed only on `Ok`, which means this process created and owns the
+    /// mutex.
     pub fn acquire(installation: &PlatformHandle) -> Result<Self, HostOwnerLeaseError> {
         let name = host_owner_mutex_name(installation);
         #[cfg(windows)]
         {
             use windows_sys::Win32::Foundation::{
-                ERROR_ALREADY_EXISTS, ERROR_INVALID_PARAMETER, GetLastError, WAIT_ABANDONED,
-                WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT,
+                ERROR_ALREADY_EXISTS, ERROR_INVALID_PARAMETER, GetLastError,
             };
             use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
-            use windows_sys::Win32::System::Threading::{CreateMutexW, WaitForSingleObject};
+            use windows_sys::Win32::System::Threading::CreateMutexW;
 
             let wide_name = nul_terminated_wide(std::ffi::OsStr::new(&name)).map_err(|_| {
                 HostOwnerLeaseError::CreationFailed {
@@ -168,47 +215,33 @@ impl HostOwnerLease {
                     win32_error: creation_error,
                 });
             }
-            let mut lease = Self {
-                handle,
-                owns: creation_error != ERROR_ALREADY_EXISTS,
-                name,
-            };
-            if lease.owns {
-                return Ok(lease);
-            }
-
-            // An existing mutex is returned without ownership even when
-            // `bInitialOwner` is true.  A zero-time wait classifies the live
-            // owner, a cleanly released object, or an abandoned owner.
-            let wait = unsafe { WaitForSingleObject(handle, 0) };
-            match wait {
-                WAIT_OBJECT_0 => {
-                    lease.owns = true;
-                    Ok(lease)
+            match creation_error {
+                0 => Ok(Self {
+                    handle,
+                    owns: true,
+                    name,
+                }),
+                ERROR_ALREADY_EXISTS => {
+                    // Never wait on or join an object we did not create.  Its
+                    // DACL and ownership history are not independently
+                    // verified; a normal clean Host closes the last handle so
+                    // the next start creates a fresh protected object.
+                    if unsafe { windows_sys::Win32::Foundation::CloseHandle(handle) } == 0 {
+                        Err(HostOwnerLeaseError::OwnershipUncertain {
+                            win32_error: unsafe { GetLastError() },
+                        })
+                    } else {
+                        Err(HostOwnerLeaseError::ExistingObject)
+                    }
                 }
-                WAIT_TIMEOUT => {
-                    lease.owns = false;
-                    drop(lease);
-                    Err(HostOwnerLeaseError::LiveOwner)
-                }
-                WAIT_ABANDONED => {
-                    // WAIT_ABANDONED grants ownership to this thread.  Drop
-                    // releases the mutex before returning the recovery error.
-                    lease.owns = true;
-                    Err(HostOwnerLeaseError::AbandonedOwner)
-                }
-                WAIT_FAILED => {
-                    let win32_error = unsafe { GetLastError() };
-                    lease.owns = false;
-                    drop(lease);
-                    Err(HostOwnerLeaseError::OwnershipUncertain { win32_error })
-                }
-                _ => {
-                    lease.owns = false;
-                    drop(lease);
-                    Err(HostOwnerLeaseError::OwnershipUncertain {
-                        win32_error: unsafe { GetLastError() },
-                    })
+                win32_error => {
+                    if unsafe { windows_sys::Win32::Foundation::CloseHandle(handle) } == 0 {
+                        Err(HostOwnerLeaseError::OwnershipUncertain {
+                            win32_error: unsafe { GetLastError() },
+                        })
+                    } else {
+                        Err(HostOwnerLeaseError::OwnershipUncertain { win32_error })
+                    }
                 }
             }
         }
@@ -225,6 +258,50 @@ impl HostOwnerLease {
     pub fn name(&self) -> &str {
         &self.name
     }
+
+    /// Releases the owner mutex after the caller has durably recorded clean
+    /// Host shutdown.  Drop remains a last-resort close for error paths.
+    pub fn release(&mut self) -> Result<(), HostOwnerLeaseReleaseError> {
+        #[cfg(windows)]
+        {
+            use windows_sys::Win32::Foundation::{CloseHandle, GetLastError};
+            use windows_sys::Win32::System::Threading::ReleaseMutex;
+            if self.handle.is_null() {
+                return Ok(());
+            }
+            let release_error = if self.owns && unsafe { ReleaseMutex(self.handle) } == 0 {
+                Some(unsafe { GetLastError() })
+            } else {
+                self.owns = false;
+                None
+            };
+            let close_error = if unsafe { CloseHandle(self.handle) } == 0 {
+                Some(unsafe { GetLastError() })
+            } else {
+                self.handle = std::ptr::null_mut();
+                None
+            };
+            return match (release_error, close_error) {
+                (None, None) => Ok(()),
+                (Some(release_error), None) => Err(HostOwnerLeaseReleaseError::ReleaseMutex {
+                    win32_error: release_error,
+                }),
+                (None, Some(close_error)) => Err(HostOwnerLeaseReleaseError::CloseHandle {
+                    win32_error: close_error,
+                }),
+                (Some(release_error), Some(close_error)) => {
+                    Err(HostOwnerLeaseReleaseError::ReleaseAndClose {
+                        release_error,
+                        close_error,
+                    })
+                }
+            };
+        }
+        #[cfg(not(windows))]
+        {
+            Err(HostOwnerLeaseReleaseError::UnsupportedPlatform)
+        }
+    }
 }
 
 #[cfg(windows)]
@@ -236,8 +313,8 @@ impl Drop for HostOwnerLease {
             return;
         }
         if self.owns {
-            // SAFETY: this process owns the mutex after a successful wait or
-            // fresh creation; the handle remains valid until CloseHandle.
+            // SAFETY: this process owns the mutex after fresh creation; the
+            // handle remains valid until CloseHandle.
             let _ = unsafe { ReleaseMutex(self.handle) };
         }
         // SAFETY: this wrapper uniquely owns the handle until Drop.
