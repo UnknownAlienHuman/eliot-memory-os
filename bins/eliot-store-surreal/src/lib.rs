@@ -143,8 +143,21 @@ impl StoreComposition {
 
     /// Semantic schema readiness observation.  This is not a write authority
     /// verdict and is returned as its own receipt/status surface.
-    pub async fn readiness(&self) -> Result<SemanticReadiness, AdapterError> {
-        self.store.probe_readiness().await
+    pub async fn readiness(&self) -> Result<ReadinessReceipt, StoreError> {
+        let readiness = self
+            .store
+            .probe_readiness()
+            .await
+            .map_err(AdapterError::into_store_error)?;
+        Ok(match readiness {
+            SemanticReadiness::Unavailable => ReadinessReceipt::unavailable(),
+            SemanticReadiness::MigrationRequired { expected, observed } => {
+                ReadinessReceipt::migration_required(expected.to_string(), observed)
+            }
+            SemanticReadiness::Ready { generation } => {
+                ReadinessReceipt::ready(generation.to_string())
+            }
+        })
     }
 
     /// Executes one closed named read from the store API catalogue.
@@ -163,13 +176,11 @@ impl StoreComposition {
         transition: PreparedTransition,
         expected_revision_heads: Vec<RevisionHeadExpectation>,
         expected_ordering_heads: Vec<OrderingHeadExpectation>,
-    ) -> Result<WriteReceipt, AdapterError> {
-        context
-            .validate()
-            .map_err(|error| AdapterError::Store(StoreError::Foundation(error)))?;
-        transition.validate().map_err(AdapterError::Store)?;
+    ) -> Result<WriteReceipt, StoreError> {
+        context.validate().map_err(StoreError::Foundation)?;
+        transition.validate()?;
         if context.state_fence != transition.state_fence {
-            return Err(AdapterError::Store(StoreError::FenceMismatch));
+            return Err(StoreError::FenceMismatch);
         }
         self.store
             .apply_prepared(
@@ -179,14 +190,18 @@ impl StoreComposition {
                 expected_ordering_heads,
             )
             .await
+            .map_err(AdapterError::into_store_error)
     }
 
     /// Reconciles a possibly ambiguous write by exact operation identity.
     pub async fn receipt(
         &self,
         operation_id: OperationId,
-    ) -> Result<Option<WriteReceipt>, AdapterError> {
-        self.store.reconcile(operation_id).await
+    ) -> Result<Option<WriteReceipt>, StoreError> {
+        self.store
+            .reconcile(operation_id)
+            .await
+            .map_err(AdapterError::into_store_error)
     }
 
     /// Reads revision heads through the neutral store boundary.

@@ -8,8 +8,7 @@ use eliot_protocol::{
     ProtocolVersion, ServerHello,
 };
 use eliot_store_api::{
-    CAPABILITIES, EFFECTS, ReadinessReceipt, StateFence, decode_request_frame,
-    response_frame as store_response_frame,
+    CAPABILITIES, EFFECTS, StateFence, decode_request_frame, response_frame as store_response_frame,
 };
 use eliot_store_surreal::{
     PROTOCOL_VERSION, Request, Response, SERVICE_NAME, StoreComposition, load_config,
@@ -234,21 +233,7 @@ async fn dispatch(composition: &StoreComposition, request: Request) -> Response 
             },
         },
         Request::Readiness => match composition.readiness().await {
-            Ok(readiness) => {
-                let receipt = match readiness {
-                    eliot_store_surreal_adapter::SemanticReadiness::Unavailable => {
-                        ReadinessReceipt::unavailable()
-                    }
-                    eliot_store_surreal_adapter::SemanticReadiness::MigrationRequired {
-                        expected,
-                        observed,
-                    } => ReadinessReceipt::migration_required(expected.to_string(), observed),
-                    eliot_store_surreal_adapter::SemanticReadiness::Ready { generation } => {
-                        ReadinessReceipt::ready(generation.to_string())
-                    }
-                };
-                Response::Readiness { receipt }
-            }
+            Ok(receipt) => Response::Readiness { receipt },
             Err(error) => Response::Error {
                 error: error.to_string(),
             },
