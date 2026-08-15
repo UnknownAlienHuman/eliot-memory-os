@@ -1,0 +1,26 @@
+[package]
+name = "eliotd"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "ELIOT production daemon composition root"
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "eliotd"
+path = "src/main.rs"
+
+[dependencies]
+eliot-engine.workspace = true
+eliot-kernel = { path = "../eliot-kernel" }
+eliot-types.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+
+[lints]
+workspace = true
