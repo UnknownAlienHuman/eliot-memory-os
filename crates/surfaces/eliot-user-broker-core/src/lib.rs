@@ -373,7 +373,7 @@ pub struct UserBroker {
     process: Option<Box<dyn ProcessPort>>,
     durable: Option<Box<dyn DurableRegistrationPort>>,
     registration: Option<RegistrationReceipt>,
-    user_broker_epoch: u64,
+    broker_epoch: u64,
     operations: BTreeMap<String, OperationRecord>,
 }
 
@@ -388,7 +388,7 @@ impl UserBroker {
             process,
             durable,
             registration: None,
-            user_broker_epoch: 0,
+            broker_epoch: 0,
             operations: BTreeMap::new(),
         }
     }
@@ -402,7 +402,7 @@ impl UserBroker {
             .map_err(|error| map_port(RequiredProvider::DurableRegistration, error))?
             .ok_or(BrokerError::PlanGap(RequiredProvider::DurableRegistration))?;
         self.registration = snapshot.registration;
-        self.user_broker_epoch = snapshot.user_broker_epoch;
+        self.broker_epoch = snapshot.user_broker_epoch;
         let Some(registration) = self.registration.as_ref() else {
             if snapshot.operation_cursors.is_empty() {
                 self.operations.clear();
@@ -444,6 +444,7 @@ impl UserBroker {
         Ok(())
     }
 
+    #[allow(clippy::needless_pass_by_value)]
     pub fn register(
         &mut self,
         request: RegistrationRequest,
@@ -464,15 +465,16 @@ impl UserBroker {
             .register(&request)
             .map_err(|error| map_port(RequiredProvider::G01Authority, error))?;
         let sealed = seal_registration(&request, &grant)?;
-        if sealed.user_broker_epoch <= self.user_broker_epoch {
+        if sealed.user_broker_epoch <= self.broker_epoch {
             return Err(BrokerError::StaleEpoch);
         }
-        self.user_broker_epoch = sealed.user_broker_epoch;
+        self.broker_epoch = sealed.user_broker_epoch;
         self.registration = Some(sealed.clone());
         self.persist()?;
         Ok(sealed)
     }
 
+    #[allow(clippy::needless_pass_by_value)]
     pub fn heartbeat(
         &mut self,
         request: HeartbeatRequest,
@@ -505,6 +507,7 @@ impl UserBroker {
         })
     }
 
+    #[allow(clippy::needless_pass_by_value)]
     pub fn launch(&mut self, request: LaunchRequest) -> Result<LaunchReceipt, BrokerError> {
         request.validate()?;
         let current = self.active_registration(request.observed_at)?.clone();
@@ -722,7 +725,7 @@ impl UserBroker {
     fn persist(&mut self) -> Result<(), BrokerError> {
         let snapshot = BrokerSnapshot {
             registration: self.registration.clone(),
-            user_broker_epoch: self.user_broker_epoch,
+            user_broker_epoch: self.broker_epoch,
             operation_cursors: self
                 .operations
                 .values()
@@ -1497,7 +1500,7 @@ mod tests {
         let receipt = broker.launch(launch_request()).expect("launch");
         let snapshot = BrokerSnapshot {
             registration: broker.registration.clone(),
-            user_broker_epoch: broker.user_broker_epoch,
+            user_broker_epoch: broker.broker_epoch,
             operation_cursors: broker
                 .operations
                 .values()

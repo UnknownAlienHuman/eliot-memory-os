@@ -1,30 +1,28 @@
 [package]
 name = "eliot-native-worker-core"
-version = "0.1.0"
-edition = "2024"
-rust-version = "1.89"
-license = "MIT"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
 description = "Provider-neutral native worker process-service protocol core"
 
-[workspace]
+[package.metadata.eliot]
+work_id = "A-13"
+functional_cell = "native-worker-core"
+lifecycle_owner = "A-13"
+source_layer = "C3"
+proof_entrypoint = "cargo test -p eliot-native-worker-core --all-targets --all-features"
 
 [dependencies]
-eliot-agent-api = { path = "../../agent/eliot-agent-api", version = "0.1.0" }
-eliot-process = { path = "../../kernel/eliot-process", version = "0.1.0" }
-eliot-receipts = { path = "../../foundation/eliot-receipts", version = "0.1.0" }
-eliot-runtime-contracts = { path = "../../foundation/eliot-runtime-contracts", version = "0.1.0" }
-eliot-security-contracts = { path = "../../foundation/eliot-security-contracts", version = "0.1.0" }
-schemars = { version = "1.2.1", features = ["derive"] }
-serde = { version = "1.0.228", features = ["derive"] }
-serde_json = { version = "1.0.150", features = ["float_roundtrip"] }
-thiserror = "2.0.18"
+eliot-agent-api.workspace = true
+eliot-process.workspace = true
+eliot-receipts.workspace = true
+eliot-runtime-contracts.workspace = true
+eliot-security-contracts.workspace = true
+schemars.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
 
-[lints.rust]
-unsafe_code = "forbid"
-
-[lints.clippy]
-all = { level = "warn", priority = -1 }
-pedantic = { level = "warn", priority = -1 }
-module_name_repetitions = "allow"
-must_use_candidate = "allow"
-missing_errors_doc = "allow"
+[lints]
+workspace = true

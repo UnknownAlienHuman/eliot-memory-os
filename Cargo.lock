@@ -539,6 +539,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "eliot-native-worker-core"
+version = "0.1.0"
+dependencies = [
+ "eliot-agent-api",
+ "eliot-process",
+ "eliot-receipts",
+ "eliot-runtime-contracts",
+ "eliot-security-contracts",
+ "schemars",
+ "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
 name = "eliot-notify-core"
 version = "0.1.0"
 dependencies = [
@@ -785,6 +800,21 @@ dependencies = [
  "thiserror",
  "time",
  "uuid",
+]
+
+[[package]]
+name = "eliot-user-broker-core"
+version = "0.1.0"
+dependencies = [
+ "eliot-process",
+ "eliot-protocol",
+ "eliot-receipts",
+ "eliot-runtime-contracts",
+ "eliot-security-contracts",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror",
 ]
 
 [[package]]
