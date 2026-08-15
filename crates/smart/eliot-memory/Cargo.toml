@@ -1,0 +1,12 @@
+[package]
+name = "eliot-memory"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.89"
+license = "MIT"
+description = "Governed canonical memory-plane owner for ELIOT"
+
+[dependencies]
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = { version = "1.0.150", features = ["float_roundtrip"] }
+thiserror = "2.0.18"
