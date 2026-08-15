@@ -1,0 +1,18 @@
+[package]
+name = "eliot-change-monitor"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Rebuildable ChangeMonitor observations and evolving-anchor resolution"
+
+[dependencies]
+eliot-agent-contracts = { workspace = true }
+eliot-contracts = { workspace = true }
+schemars.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true
