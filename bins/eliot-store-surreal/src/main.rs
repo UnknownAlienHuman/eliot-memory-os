@@ -14,21 +14,17 @@ use eliot_store_surreal::{
 
 const CAPABILITY_HEALTH: &str = "store.health";
 const CAPABILITY_READINESS: &str = "store.readiness";
-const CAPABILITY_MIGRATE: &str = "store.migrate";
 const CAPABILITY_NAMED_READ: &str = "store.named_read";
 const CAPABILITY_APPLY: &str = "store.apply";
 const CAPABILITY_RECEIPT: &str = "store.receipt";
-const CAPABILITY_SHUTDOWN: &str = "store.shutdown";
 const CAPABILITIES: &[&str] = &[
     CAPABILITY_HEALTH,
     CAPABILITY_READINESS,
-    CAPABILITY_MIGRATE,
     CAPABILITY_NAMED_READ,
     CAPABILITY_APPLY,
     CAPABILITY_RECEIPT,
-    CAPABILITY_SHUTDOWN,
 ];
-const EFFECTS: &[&str] = &["read", "migration", "canonical_write"];
+const EFFECTS: &[&str] = &["read", "canonical_write"];
 
 struct Session {
     connection_id: String,
@@ -48,7 +44,7 @@ async fn main() {
             return;
         }
     };
-    let config = match load_config(config_path.as_deref()) {
+    let config = match load_config(Some(&config_path)) {
         Ok(config) => config,
         Err(error) => {
             eprintln!("{SERVICE_NAME}: {error}");
@@ -101,24 +97,22 @@ async fn main() {
             Ok(request) => dispatch(&composition, request).await,
             Err(error) => Response::Error { error },
         };
-        let stop = matches!(response, Response::Stopped);
         let response_frame = response_frame(&session, &frame, response);
         if let Err(error) = write_frame(&mut output, &response_frame, negotiated_limits) {
             eprintln!("{SERVICE_NAME}: EBP response failed: {error}");
             break;
         }
-        if stop {
-            break;
-        }
     }
 }
 
-fn parse_config_path() -> Result<Option<PathBuf>, String> {
+/// The only supported launch form is
+/// eliot-store-surreal --config <explicit .json or .toml path>.
+fn parse_config_path() -> Result<PathBuf, String> {
     let mut args = std::env::args_os().skip(1);
     match args.next() {
-        None => Ok(None),
+        None => Err("--config is required; launch config must be explicit".to_owned()),
         Some(value) if value == "--config" => match args.next() {
-            Some(path) if args.next().is_none() => Ok(Some(PathBuf::from(path))),
+            Some(path) if args.next().is_none() => Ok(PathBuf::from(path)),
             _ => Err("--config requires exactly one path".to_owned()),
         },
         Some(value) => Err(format!("unknown argument: {}", value.to_string_lossy())),
@@ -250,11 +244,9 @@ fn request_capability(request: &Request) -> &'static str {
     match request {
         Request::Health => CAPABILITY_HEALTH,
         Request::Readiness => CAPABILITY_READINESS,
-        Request::Migrate => CAPABILITY_MIGRATE,
         Request::Named { .. } => CAPABILITY_NAMED_READ,
         Request::Apply { .. } => CAPABILITY_APPLY,
         Request::Receipt { .. } => CAPABILITY_RECEIPT,
-        Request::Stop => CAPABILITY_SHUTDOWN,
     }
 }
 
@@ -275,6 +267,7 @@ fn validate_request_fence(
             ..
         } => {
             context.validate().map_err(|error| error.to_string())?;
+            transition.validate().map_err(store_error)?;
             if context != &identity.request.metadata {
                 return Err("apply context does not match request identity metadata".to_owned());
             }
@@ -282,11 +275,7 @@ fn validate_request_fence(
                 return Err("prepared transition fence does not match request identity".to_owned());
             }
         }
-        Request::Health
-        | Request::Readiness
-        | Request::Migrate
-        | Request::Receipt { .. }
-        | Request::Stop => {}
+        Request::Health | Request::Readiness | Request::Receipt { .. } => {}
     }
     Ok(())
 }
@@ -303,14 +292,6 @@ async fn dispatch(composition: &StoreComposition, request: Request) -> Response 
         Request::Readiness => match composition.readiness().await {
             Ok(readiness) => Response::Readiness {
                 receipt: readiness.into(),
-            },
-            Err(error) => Response::Error {
-                error: error.to_string(),
-            },
-        },
-        Request::Migrate => match composition.migrate().await {
-            Ok(receipt) => Response::Migrated {
-                receipt: receipt.into(),
             },
             Err(error) => Response::Error {
                 error: error.to_string(),
@@ -347,7 +328,6 @@ async fn dispatch(composition: &StoreComposition, request: Request) -> Response 
                 error: error.to_string(),
             },
         },
-        Request::Stop => Response::Stopped,
     }
 }
 

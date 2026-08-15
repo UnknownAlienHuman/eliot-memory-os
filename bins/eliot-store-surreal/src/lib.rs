@@ -8,27 +8,82 @@
 //! serializes bounded contract receipts. Blob contributes one process/root
 //! claim identity; it is not a second store or semantic write path.
 
-use std::path::{Component, Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::path::Path;
 
 use eliot_blob::BlobRootOwner;
-use eliot_platform::ClockObservation;
+use eliot_platform_windows::WindowsPlatform;
 use eliot_store_api::{
     CanonicalStoreClient, NamedReadRequest, NamedReadResponse, OperationId,
-    OrderingHeadExpectation, PreparedTransition, RequestMeta, RevisionHeadExpectation,
+    OrderingHeadExpectation, PreparedTransition, RequestMeta, RevisionHeadExpectation, StoreError,
     WriteReceipt,
 };
 use eliot_store_surreal_adapter::{
-    AdapterError, AdapterHealth, MigrationReceipt, PINNED_SURREALDB_MAJOR, SchemaGeneration,
-    SemanticReadiness, SurrealAdapterConfig, SurrealStoreAdapter,
+    AdapterError, AdapterHealth, PINNED_SURREALDB_MAJOR, SchemaGeneration, SemanticReadiness,
+    SurrealAdapterConfig, SurrealStoreAdapter,
 };
-use eliot_types::{CredentialProviderKind, GovernorConfig};
 use secrecy::SecretString;
 use serde::{Deserialize, Serialize};
 
 pub const SERVICE_NAME: &str = "eliot-store-surreal";
 pub const PROTOCOL_VERSION: &str = "eliot.s03.ebp.v1";
-const SCHEMA_GENERATION: &str = "1.0.0";
+
+/// Explicit, target-only process launch configuration.
+///
+/// This is intentionally not the legacy governor configuration.  The process
+/// accepts only the connection coordinates, bounded timeouts, schema
+/// generation, one Blob root, one process identity, and an opaque credential
+/// reference.  Credential bytes are resolved after validation and never cross
+/// this type or the EBP wire surface.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StoreLaunchConfig {
+    pub endpoint: String,
+    pub namespace: String,
+    pub database: String,
+    pub username: String,
+    pub connect_timeout_ms: u64,
+    pub query_timeout_ms: u64,
+    pub schema_generation: String,
+    pub blob_root: String,
+    pub instance_id: String,
+    pub credential_ref: String,
+}
+
+impl StoreLaunchConfig {
+    /// Validates every process-owned launch field before opening a provider or
+    /// claiming the Blob root. No defaults are admitted.
+    pub fn validate(&self) -> Result<(), String> {
+        validate_launch_text(&self.endpoint, "endpoint")?;
+        if !self.endpoint.starts_with("ws://") && !self.endpoint.starts_with("wss://") {
+            return Err("endpoint must start with ws:// or wss://".to_owned());
+        }
+        validate_launch_text(&self.namespace, "namespace")?;
+        validate_launch_text(&self.database, "database")?;
+        validate_launch_text(&self.username, "username")?;
+        validate_launch_text(&self.schema_generation, "schema_generation")?;
+        validate_launch_text(&self.blob_root, "blob_root")?;
+        validate_launch_text(&self.instance_id, "instance_id")?;
+        validate_launch_text(&self.credential_ref, "credential_ref")?;
+        if self.connect_timeout_ms == 0 || self.query_timeout_ms == 0 {
+            return Err("connect_timeout_ms and query_timeout_ms must be non-zero".to_owned());
+        }
+        SchemaGeneration::new(self.schema_generation.as_str())
+            .map_err(|error| format!("invalid schema_generation: {error}"))?;
+        if !Path::new(&self.blob_root).is_absolute() {
+            return Err("blob_root must be an absolute path".to_owned());
+        }
+        Ok(())
+    }
+}
+
+fn validate_launch_text(value: &str, field: &str) -> Result<(), String> {
+    if value.trim().is_empty() || value.chars().any(char::is_control) {
+        return Err(format!(
+            "{field} must be non-blank and contain no control characters"
+        ));
+    }
+    Ok(())
+}
 
 /// Canonical store composition. All provider authority is held by the one
 /// adapter and one process/root Blob claim; Blob does not become a semantic
@@ -49,19 +104,22 @@ impl std::fmt::Debug for StoreComposition {
 }
 
 impl StoreComposition {
-    /// Builds the adapter from the existing process configuration. The
-    /// configured provider is the only credential authority; this process
-    /// never accepts an ambient password environment variable or an empty
-    /// fallback.
-    pub fn new(config: GovernorConfig) -> Result<Self, String> {
-        config.validate().map_err(|error| error.to_string())?;
-        let store = SurrealStoreAdapter::new(adapter_config(&config)?);
+    /// Builds the adapter from the explicit target launch configuration.
+    /// Credential bytes are read only inside this process from the configured
+    /// Windows Credential Manager reference and are retained only by the
+    /// adapter's redacted SecretString configuration.
+    pub fn new(config: StoreLaunchConfig) -> Result<Self, String> {
+        config.validate()?;
         let blob = BlobRootOwner::claim(
-            config.blob_store.root.clone(),
-            format!("store-composition:{}", config.service.instance_id),
+            config.blob_root.clone(),
+            format!("store-composition:{}", config.instance_id),
             std::process::id(),
         )
         .map_err(|error| format!("claim Blob root owner: {error}"))?;
+        let platform = WindowsPlatform::new(config.blob_root.clone())
+            .map_err(|error| format!("validate Blob root for credential access: {error}"))?;
+        let password = resolve_credential(&platform, &config.credential_ref)?;
+        let store = SurrealStoreAdapter::new(adapter_config(&config, password)?);
         Ok(Self { store, blob })
     }
 
@@ -88,17 +146,6 @@ impl StoreComposition {
         self.store.probe_readiness().await
     }
 
-    /// Applies the one admitted schema migration and returns its durable
-    /// migration receipt.  Migration is explicit and never implicit at start.
-    pub async fn migrate(&self) -> Result<MigrationReceipt, AdapterError> {
-        let generation = SchemaGeneration::new(SCHEMA_GENERATION)
-            .map_err(|error| AdapterError::Config(error.to_string()))?;
-        let migration = SurrealStoreAdapter::initial_schema_migration(generation);
-        self.store
-            .apply_migration(&migration, &observed_clock())
-            .await
-    }
-
     /// Executes one closed named read from the store API catalogue.
     pub async fn named(
         &self,
@@ -116,6 +163,13 @@ impl StoreComposition {
         expected_revision_heads: Vec<RevisionHeadExpectation>,
         expected_ordering_heads: Vec<OrderingHeadExpectation>,
     ) -> Result<WriteReceipt, AdapterError> {
+        context
+            .validate()
+            .map_err(|error| AdapterError::Store(StoreError::Foundation(error)))?;
+        transition.validate().map_err(AdapterError::Store)?;
+        if context.state_fence != transition.state_fence {
+            return Err(AdapterError::Store(StoreError::FenceMismatch));
+        }
         self.store
             .apply_prepared(
                 context,
@@ -141,58 +195,35 @@ impl StoreComposition {
     }
 }
 
-fn adapter_config(config: &GovernorConfig) -> Result<SurrealAdapterConfig, String> {
-    let schema_generation =
-        SchemaGeneration::new(SCHEMA_GENERATION).map_err(|error| error.to_string())?;
+fn adapter_config(
+    config: &StoreLaunchConfig,
+    password: SecretString,
+) -> Result<SurrealAdapterConfig, String> {
+    let schema_generation = SchemaGeneration::new(config.schema_generation.as_str())
+        .map_err(|error| error.to_string())?;
     Ok(SurrealAdapterConfig {
-        endpoint: config.db.surreal.endpoint.clone(),
-        namespace: config.db.surreal.ns.clone(),
-        database: config.db.surreal.db.clone(),
-        username: config.db.surreal.user.clone(),
-        password: resolve_surreal_password(config)?,
-        connect_timeout_ms: config.db.surreal.startup_timeout_ms,
-        query_timeout_ms: config.db.surreal.query_timeout_ms,
+        endpoint: config.endpoint.clone(),
+        namespace: config.namespace.clone(),
+        database: config.database.clone(),
+        username: config.username.clone(),
+        password,
+        connect_timeout_ms: config.connect_timeout_ms,
+        query_timeout_ms: config.query_timeout_ms,
         expected_provider_major: PINNED_SURREALDB_MAJOR,
         expected_schema_generation: schema_generation,
     })
 }
 
-fn resolve_surreal_password(config: &GovernorConfig) -> Result<SecretString, String> {
-    let surreal = &config.db.surreal;
-    match surreal.credential_provider {
-        CredentialProviderKind::WindowsCredentialManager => {
-            let bytes = eliot_windows_ipc::credential_read_current_user(&surreal.credential_id)
-                .map_err(|error| format!("read configured Windows credential: {error}"))?
-                .ok_or_else(|| {
-                    format!(
-                        "configured Windows credential is missing: {}",
-                        surreal.credential_id
-                    )
-                })?;
-            let password = String::from_utf8(bytes)
-                .map_err(|_| "configured Windows credential is not UTF-8".to_owned())?;
-            non_empty_secret(password, "configured Windows credential")
-        }
-        CredentialProviderKind::LegacyPasswordFile => {
-            if std::env::var("ELIOT_ALLOW_LEGACY_PASSWORD_FILE_MIGRATION").as_deref() != Ok("1") {
-                return Err(
-                    "legacy SurrealDB password_file requires the explicit migration gate"
-                        .to_owned(),
-                );
-            }
-            let path = resolve_password_path(&surreal.password_file)?;
-            let password = std::fs::read_to_string(&path).map_err(|error| {
-                format!(
-                    "read configured SurrealDB password file {}: {error}",
-                    path.display()
-                )
-            })?;
-            non_empty_secret(password, "configured SurrealDB password file")
-        }
-        provider => Err(format!(
-            "unsupported configured SurrealDB credential provider: {provider:?}"
-        )),
-    }
+fn resolve_credential(
+    platform: &WindowsPlatform,
+    credential_ref: &str,
+) -> Result<SecretString, String> {
+    let credential = platform
+        .read_credential(credential_ref)
+        .map_err(|error| format!("read configured credential reference: {error}"))?;
+    let password = String::from_utf8(credential.expose().to_vec())
+        .map_err(|_| "configured credential is not UTF-8".to_owned())?;
+    non_empty_secret(password, "configured credential")
 }
 
 fn non_empty_secret(value: String, source: &str) -> Result<SecretString, String> {
@@ -203,79 +234,32 @@ fn non_empty_secret(value: String, source: &str) -> Result<SecretString, String>
     Ok(SecretString::new(value.into()))
 }
 
-fn resolve_password_path(configured: &str) -> Result<PathBuf, String> {
-    let prefix = ["%LOCALAPPDATA%/", "%LOCALAPPDATA%\\"]
-        .into_iter()
-        .find(|prefix| {
-            configured
-                .get(..prefix.len())
-                .is_some_and(|value| value.eq_ignore_ascii_case(prefix))
-        })
-        .ok_or_else(|| "db.surreal.password_file must use the %LOCALAPPDATA%/ prefix".to_owned())?;
-    let local_app_data = std::env::var_os("LOCALAPPDATA")
-        .ok_or_else(|| "LOCALAPPDATA is required by db.surreal.password_file".to_owned())?;
-    let local_app_data = PathBuf::from(local_app_data);
-    if !local_app_data.is_absolute() {
-        return Err("LOCALAPPDATA must be absolute for db.surreal.password_file".to_owned());
-    }
-    let relative = &configured[prefix.len()..];
-    let relative_path = Path::new(relative);
-    if relative.is_empty()
-        || configured.ends_with(['/', '\\'])
-        || !relative_path
-            .components()
-            .all(|component| matches!(component, Component::Normal(_)))
-        || relative_path.file_name().is_none()
-    {
-        return Err(
-            "db.surreal.password_file must be a normalized file below LOCALAPPDATA".to_owned(),
-        );
-    }
-    Ok(local_app_data.join(relative_path))
-}
-
-fn observed_clock() -> ClockObservation {
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_millis().min(i64::MAX as u128) as i64)
-        .unwrap_or(0);
-    ClockObservation {
-        valid_time_ms: Some(now),
-        known_time_ms: Some(now),
-        transaction_sequence: None,
-        monotonic_ns: None,
-    }
-}
-
-/// Loads the process's non-secret configuration.  Secret material is resolved
-/// from the configured SecretRef/provider only inside [`StoreComposition::new`].
-pub fn load_config(path: Option<&Path>) -> Result<GovernorConfig, String> {
+/// Loads the process's explicit non-secret launch configuration. Secret
+/// material is resolved from the opaque credential reference only inside
+/// StoreComposition::new. Missing configuration is an error; there is no
+/// default or legacy configuration conversion.
+pub fn load_config(path: Option<&Path>) -> Result<StoreLaunchConfig, String> {
     let Some(path) = path else {
-        return Ok(GovernorConfig::default());
+        return Err("--config is required; launch config must be explicit".to_owned());
     };
     let bytes = std::fs::read(path).map_err(|error| format!("read config: {error}"))?;
     match path.extension().and_then(|extension| extension.to_str()) {
         Some("json") => {
-            serde_json::from_slice(&bytes).map_err(|error| format!("parse JSON config: {error}"))
+            let config = serde_json::from_slice(&bytes)
+                .map_err(|error| format!("parse JSON config: {error}"))?;
+            config.validate()?;
+            Ok(config)
         }
-        _ => toml::from_slice(&bytes).map_err(|error| format!("parse TOML config: {error}")),
-    }
-}
-
-#[derive(Debug, Serialize)]
-pub struct MigrationResponse {
-    pub migration_id: String,
-    pub checksum_sha256: String,
-    pub generation_after: String,
-}
-
-impl From<MigrationReceipt> for MigrationResponse {
-    fn from(receipt: MigrationReceipt) -> Self {
-        Self {
-            migration_id: receipt.migration_id,
-            checksum_sha256: receipt.checksum_sha256,
-            generation_after: receipt.generation_after.to_string(),
+        Some("toml") => {
+            let config =
+                toml::from_slice(&bytes).map_err(|error| format!("parse TOML config: {error}"))?;
+            config.validate()?;
+            Ok(config)
         }
+        Some(extension) => Err(format!(
+            "config extension must be .json or .toml, got .{extension}"
+        )),
+        None => Err("config path must have a .json or .toml extension".to_owned()),
     }
 }
 
@@ -313,11 +297,9 @@ impl From<SemanticReadiness> for ReadinessReceipt {
 pub enum Response {
     Health { record: AdapterHealth },
     Readiness { receipt: ReadinessReceipt },
-    Migrated { receipt: MigrationResponse },
     Named { response: NamedReadResponse },
     Transaction { receipt: WriteReceipt },
     Receipt { receipt: Option<WriteReceipt> },
-    Stopped,
     Error { error: String },
 }
 
@@ -328,7 +310,6 @@ pub enum Response {
 pub enum Request {
     Health,
     Readiness,
-    Migrate,
     Named {
         request: NamedReadRequest,
     },
@@ -341,5 +322,4 @@ pub enum Request {
     Receipt {
         operation_id: OperationId,
     },
-    Stop,
 }

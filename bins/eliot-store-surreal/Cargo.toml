@@ -16,12 +16,10 @@ path = "src/main.rs"
 [dependencies]
 eliot-blob.workspace = true
 eliot-ipc.workspace = true
-eliot-platform.workspace = true
+eliot-platform-windows.workspace = true
 eliot-protocol.workspace = true
 eliot-store-api.workspace = true
 eliot-store-surreal-adapter.workspace = true
-eliot-types.workspace = true
-eliot-windows-ipc.workspace = true
 secrecy.workspace = true
 serde.workspace = true
 serde_json.workspace = true

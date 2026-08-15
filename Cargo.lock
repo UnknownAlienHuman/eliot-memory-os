@@ -1520,12 +1520,10 @@ version = "0.1.0"
 dependencies = [
  "eliot-blob",
  "eliot-ipc",
- "eliot-platform",
+ "eliot-platform-windows",
  "eliot-protocol",
  "eliot-store-api",
  "eliot-store-surreal-adapter",
- "eliot-types",
- "eliot-windows-ipc",
  "secrecy",
  "serde",
  "serde_json",
