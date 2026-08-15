@@ -1,0 +1,18 @@
+[package]
+name = "eliot-understanding"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "ELIOT deterministic project-understanding and context synthesis owner"
+
+[dependencies]
+blake3.workspace = true
+eliot-context = { path = "../eliot-context" }
+eliot-contracts.workspace = true
+schemars.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true
