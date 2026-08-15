@@ -193,6 +193,75 @@ impl WindowsProcessExecutor {
             ))
         }
     }
+
+    /// Removes terminal operations after their descendants and streams have
+    /// been observed.  The executor remains the sole owner of this cleanup;
+    /// callers never receive a raw child or Job handle.
+    pub fn cleanup_finished(&self) -> Result<usize, ProcessExecutionError> {
+        #[cfg(windows)]
+        {
+            let mut operations = self
+                .operations
+                .lock()
+                .map_err(|_| unavailable("operation registry lock poisoned"))?;
+            let ids = operations
+                .iter()
+                .filter_map(|(id, operation)| {
+                    let guard = operation.lock().ok()?;
+                    guard
+                        .state
+                        .view()
+                        .lifecycle()
+                        .is_terminal()
+                        .then(|| id.clone())
+                })
+                .collect::<Vec<_>>();
+            let count = ids.len();
+            for id in ids {
+                operations.remove(&id);
+            }
+            Ok(count)
+        }
+        #[cfg(not(windows))]
+        {
+            Ok(0)
+        }
+    }
+
+    /// Terminates every still-owned child and clears the operation registry.
+    ///
+    /// This is the final physical cleanup contour used during Kernel
+    /// shutdown and Drop; it does not claim a successful process outcome.
+    pub fn shutdown(&self) -> Result<(), ProcessExecutionError> {
+        #[cfg(windows)]
+        {
+            let mut operations = self
+                .operations
+                .lock()
+                .map_err(|_| unavailable("operation registry lock poisoned"))?;
+            for operation in operations.values() {
+                let mut guard = operation
+                    .lock()
+                    .map_err(|_| unavailable("operation lock poisoned"))?;
+                if guard.child.is_some() {
+                    let _ = finalize_operation(&mut guard, ExitDisposition::Unknown, false);
+                }
+                join_streams(&mut guard);
+            }
+            operations.clear();
+            return Ok(());
+        }
+        #[cfg(not(windows))]
+        {
+            Ok(())
+        }
+    }
+}
+
+impl Drop for WindowsProcessExecutor {
+    fn drop(&mut self) {
+        let _ = self.shutdown();
+    }
 }
 
 impl ProcessExecutor for WindowsProcessExecutor {

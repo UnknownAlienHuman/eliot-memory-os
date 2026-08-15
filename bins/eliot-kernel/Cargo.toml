@@ -14,11 +14,20 @@ name = "eliot-kernel"
 path = "src/main.rs"
 
 [dependencies]
+eliot-contracts.workspace = true
+eliot-kernel-core.workspace = true
+eliot-kernel-service.workspace = true
 eliot-ipc.workspace = true
+eliot-ors.workspace = true
+eliot-process-executor.workspace = true
 eliot-protocol.workspace = true
 eliot-platform.workspace = true
 eliot-platform-windows.workspace = true
 eliot-runtime.workspace = true
+eliot-runtime-contracts.workspace = true
+eliot-process.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
 tokio.workspace = true
 
 [lints]

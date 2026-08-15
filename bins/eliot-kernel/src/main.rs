@@ -15,6 +15,16 @@ async fn main() {
         Ok(kernel) => kernel,
         Err(error) => exit_build_error(error),
     };
+    #[cfg(windows)]
+    let mut front_door = match kernel.bind_authenticated_front_door() {
+        Ok(server) => server,
+        Err(error) => exit_build_error(error),
+    };
+    #[cfg(windows)]
+    let principal = match eliot_platform_windows::current_process_named_pipe_expectation() {
+        Ok(expectation) => expectation,
+        Err(error) => exit_error("PRINCIPAL_FAILURE", &error.to_string()),
+    };
     let ready = format!(
         "{{\"service\":\"{SERVICE_NAME}\",\"protocol\":\"{PROTOCOL_VERSION}\",\"ipc\":\"{}\"}}",
         kernel.ipc().name()
@@ -22,6 +32,23 @@ async fn main() {
     if !write_line(&ready) {
         return;
     }
+    #[cfg(windows)]
+    tokio::select! {
+        result = front_door.wait_for_authenticated_client(
+            std::time::Duration::from_secs(86_400),
+            &principal,
+        ) => {
+            if let Err(error) = result {
+                exit_error("FRONT_DOOR_FAILURE", &error.to_string());
+            }
+        }
+        result = tokio::signal::ctrl_c() => {
+            if let Err(error) = result {
+                exit_error("SIGNAL_FAILURE", &error.to_string());
+            }
+        }
+    }
+    #[cfg(not(windows))]
     if let Err(error) = tokio::signal::ctrl_c().await {
         exit_error("SIGNAL_FAILURE", &error.to_string());
     }
@@ -51,8 +78,11 @@ fn exit_build_error(error: KernelBuildError) -> ! {
 }
 
 fn exit_error(code: &str, detail: &str) -> ! {
-    let _ = writeln!(io::stderr().lock(), "{{\"error\":\"{code}\",\"detail\":{detail:?}}}");
-    std::process::exit(78);
+    let _ = writeln!(
+        io::stderr().lock(),
+        "{{\"error\":\"{code}\",\"detail\":{detail:?}}}"
+    );
+    std::process::exit(1);
 }
 
 fn write_line(line: &str) -> bool {

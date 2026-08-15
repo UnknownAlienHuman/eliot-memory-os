@@ -980,11 +980,20 @@ dependencies = [
 name = "eliot-kernel"
 version = "0.1.0"
 dependencies = [
+ "eliot-contracts",
  "eliot-ipc",
+ "eliot-kernel-core",
+ "eliot-kernel-service",
+ "eliot-ors",
  "eliot-platform",
  "eliot-platform-windows",
+ "eliot-process",
+ "eliot-process-executor",
  "eliot-protocol",
  "eliot-runtime",
+ "eliot-runtime-contracts",
+ "serde_json",
+ "sha2",
  "tokio",
 ]
 
