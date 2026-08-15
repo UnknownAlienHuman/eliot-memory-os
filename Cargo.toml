@@ -13,6 +13,7 @@ members = [
   "crates/agent/eliot-agent-contracts",
   "crates/agent/eliot-agent-codex",
   "crates/agent/eliot-agent-opencode",
+  "crates/agent/eliot-swarm",
   "crates/foundation/eliot-bootstrap",
   "crates/foundation/eliot-contracts",
   "crates/foundation/eliot-evaluation-contracts",
@@ -72,6 +73,7 @@ eliot-store = { path = "crates/eliot-store", version = "0.1.0" }
 eliot-types = { path = "crates/eliot-types", version = "0.1.0" }
 eliot-windows-ipc = { path = "crates/eliot-windows-ipc", version = "0.1.0" }
 eliot-agent-opencode = { path = "crates/agent/eliot-agent-opencode", version = "0.1.0" }
+eliot-swarm = { path = "crates/agent/eliot-swarm", version = "0.1.0" }
 eliot-bootstrap = { path = "crates/foundation/eliot-bootstrap", version = "0.1.0" }
 eliot-contracts = { path = "crates/foundation/eliot-contracts", version = "0.1.0" }
 eliot-evaluation-contracts = { path = "crates/foundation/eliot-evaluation-contracts", version = "0.1.0" }
