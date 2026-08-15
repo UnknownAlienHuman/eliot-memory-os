@@ -24,6 +24,15 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
 
+mod wire;
+
+pub use wire::{
+    CAPABILITIES, CAPABILITY_APPLY, CAPABILITY_HEALTH, CAPABILITY_NAMED_READ,
+    CAPABILITY_ORDERING_HEADS, CAPABILITY_READINESS, CAPABILITY_RECEIPT, CAPABILITY_REVISION_HEADS,
+    EFFECTS, ReadinessReceipt, ReadinessStatus, StoreRequest, StoreResponse, StoreWireError,
+    decode_request_frame, decode_response_frame, request_frame, response_frame,
+};
+
 /// Stable identity of this contract surface.
 pub const CONTRACT_NAME: &str = "eliot.storage.store-api";
 /// Current wire revision of this contract surface.
@@ -929,6 +938,15 @@ impl WriteReceipt {
         }
         Ok(())
     }
+
+    /// Requires the signed receipt envelope used by Kernel reconciliation.
+    /// A transport receipt without this envelope is explicitly unknown to the
+    /// reconciler and must never be reported as a successful write.
+    pub fn require_reconciliation_envelope(&self) -> Result<&ReceiptEnvelope, StoreError> {
+        self.envelope
+            .as_ref()
+            .ok_or(StoreError::MissingReceiptEnvelope)
+    }
 }
 
 /// Full transaction intent.  Implementations must commit all members or none.
@@ -996,6 +1014,20 @@ pub struct StoreHealth {
     pub manifest_digest: OperationManifestDigest,
 }
 
+impl StoreHealth {
+    /// Validates the neutral health identity before it crosses the wire.
+    pub fn validate(&self) -> Result<(), StoreError> {
+        if self.contract_version != CONTRACT_VERSION {
+            return Err(StoreError::InvalidField {
+                field: "contract_version",
+                reason: "does not match the store API contract",
+            });
+        }
+        self.manifest_digest.as_str();
+        Ok(())
+    }
+}
+
 /// Store API failure without provider or secret payloads.
 #[derive(Clone, Debug, Error, PartialEq, Eq)]
 pub enum StoreError {
@@ -1038,6 +1070,8 @@ pub enum StoreError {
     IdentityConflict,
     #[error("receipt not found")]
     ReceiptNotFound,
+    #[error("receipt envelope is missing; write outcome is unknown")]
+    MissingReceiptEnvelope,
     #[error("payload exceeds named-operation limit")]
     PayloadTooLarge,
     #[error("store unavailable")]

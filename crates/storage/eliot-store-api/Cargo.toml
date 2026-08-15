@@ -9,6 +9,7 @@ description = "Store-neutral ELIOT canonical storage contracts"
 [dependencies]
 eliot-contracts = { workspace = true }
 eliot-evidence = { workspace = true }
+eliot-protocol = { workspace = true }
 eliot-receipts = { workspace = true }
 eliot-security-contracts = { workspace = true }
 schemars.workspace = true

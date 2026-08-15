@@ -13,16 +13,17 @@ use std::path::Path;
 use eliot_blob::BlobRootOwner;
 use eliot_platform_windows::WindowsPlatform;
 use eliot_store_api::{
-    CanonicalStoreClient, NamedReadRequest, NamedReadResponse, OperationId,
-    OrderingHeadExpectation, PreparedTransition, RequestMeta, RevisionHeadExpectation, StoreError,
-    WriteReceipt,
+    CanonicalStoreClient, NamedReadRequest, NamedReadResponse, OperationId, OrderingHead,
+    OrderingHeadExpectation, OrderingScopeId, PreparedTransition, RequestMeta, RevisionHead,
+    RevisionHeadExpectation, RevisionKey, StoreError, StoreHealth, WriteReceipt,
 };
+pub use eliot_store_api::{ReadinessReceipt, StoreRequest as Request, StoreResponse as Response};
 use eliot_store_surreal_adapter::{
-    AdapterError, AdapterHealth, PINNED_SURREALDB_MAJOR, SchemaGeneration, SemanticReadiness,
+    AdapterError, PINNED_SURREALDB_MAJOR, SchemaGeneration, SemanticReadiness,
     SurrealAdapterConfig, SurrealStoreAdapter,
 };
 use secrecy::SecretString;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 
 pub const SERVICE_NAME: &str = "eliot-store-surreal";
 pub const PROTOCOL_VERSION: &str = "eliot.s03.ebp.v1";
@@ -136,8 +137,8 @@ impl StoreComposition {
     }
 
     /// Bounded adapter/provider health observation.
-    pub async fn health(&self) -> AdapterHealth {
-        self.store.adapter_health().await
+    pub async fn health(&self) -> Result<StoreHealth, StoreError> {
+        self.store.health().await
     }
 
     /// Semantic schema readiness observation.  This is not a write authority
@@ -186,6 +187,22 @@ impl StoreComposition {
         operation_id: OperationId,
     ) -> Result<Option<WriteReceipt>, AdapterError> {
         self.store.reconcile(operation_id).await
+    }
+
+    /// Reads revision heads through the neutral store boundary.
+    pub async fn revision_heads(
+        &self,
+        keys: Vec<RevisionKey>,
+    ) -> Result<Vec<RevisionHead>, StoreError> {
+        self.store.revision_heads(keys).await
+    }
+
+    /// Reads ordering heads through the neutral store boundary.
+    pub async fn ordering_heads(
+        &self,
+        scopes: Vec<OrderingScopeId>,
+    ) -> Result<Vec<OrderingHead>, StoreError> {
+        self.store.ordering_heads(scopes).await
     }
 
     /// Returns the immutable closed operation manifest digest for the ready
@@ -261,65 +278,4 @@ pub fn load_config(path: Option<&Path>) -> Result<StoreLaunchConfig, String> {
         )),
         None => Err("config path must have a .json or .toml extension".to_owned()),
     }
-}
-
-#[derive(Debug, Serialize)]
-pub struct ReadinessReceipt {
-    pub status: &'static str,
-    pub expected_generation: Option<String>,
-    pub observed_generation: Option<String>,
-}
-
-impl From<SemanticReadiness> for ReadinessReceipt {
-    fn from(readiness: SemanticReadiness) -> Self {
-        match readiness {
-            SemanticReadiness::Unavailable => Self {
-                status: "unavailable",
-                expected_generation: None,
-                observed_generation: None,
-            },
-            SemanticReadiness::MigrationRequired { expected, observed } => Self {
-                status: "migration_required",
-                expected_generation: Some(expected.to_string()),
-                observed_generation: observed,
-            },
-            SemanticReadiness::Ready { generation } => Self {
-                status: "ready",
-                expected_generation: Some(generation.to_string()),
-                observed_generation: Some(generation.to_string()),
-            },
-        }
-    }
-}
-
-#[derive(Debug, Serialize)]
-#[serde(tag = "status", rename_all = "snake_case")]
-pub enum Response {
-    Health { record: AdapterHealth },
-    Readiness { receipt: ReadinessReceipt },
-    Named { response: NamedReadResponse },
-    Transaction { receipt: WriteReceipt },
-    Receipt { receipt: Option<WriteReceipt> },
-    Error { error: String },
-}
-
-/// Closed process request catalogue.  No provider SDK, table, query string or
-/// credential is representable on this wire surface.
-#[derive(Debug, Deserialize)]
-#[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
-pub enum Request {
-    Health,
-    Readiness,
-    Named {
-        request: NamedReadRequest,
-    },
-    Apply {
-        context: RequestMeta,
-        transition: PreparedTransition,
-        expected_revision_heads: Vec<RevisionHeadExpectation>,
-        expected_ordering_heads: Vec<OrderingHeadExpectation>,
-    },
-    Receipt {
-        operation_id: OperationId,
-    },
 }

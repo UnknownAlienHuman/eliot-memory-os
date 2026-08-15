@@ -7,24 +7,13 @@ use eliot_protocol::{
     ClientHello, EncodingProfile, Frame, FrameKind, MessageType, ProtocolPayload, ProtocolRange,
     ProtocolVersion, ServerHello,
 };
-use eliot_store_api::{StateFence, StoreError};
+use eliot_store_api::{
+    CAPABILITIES, EFFECTS, ReadinessReceipt, StateFence, decode_request_frame,
+    response_frame as store_response_frame,
+};
 use eliot_store_surreal::{
     PROTOCOL_VERSION, Request, Response, SERVICE_NAME, StoreComposition, load_config,
 };
-
-const CAPABILITY_HEALTH: &str = "store.health";
-const CAPABILITY_READINESS: &str = "store.readiness";
-const CAPABILITY_NAMED_READ: &str = "store.named_read";
-const CAPABILITY_APPLY: &str = "store.apply";
-const CAPABILITY_RECEIPT: &str = "store.receipt";
-const CAPABILITIES: &[&str] = &[
-    CAPABILITY_HEALTH,
-    CAPABILITY_READINESS,
-    CAPABILITY_NAMED_READ,
-    CAPABILITY_APPLY,
-    CAPABILITY_RECEIPT,
-];
-const EFFECTS: &[&str] = &["read", "canonical_write"];
 
 struct Session {
     connection_id: String,
@@ -97,7 +86,18 @@ async fn main() {
             Ok(request) => dispatch(&composition, request).await,
             Err(error) => Response::Error { error },
         };
-        let response_frame = response_frame(&session, &frame, response);
+        let response_frame = match store_response_frame(
+            &session.connection_id,
+            session.protocol_version,
+            frame.request_id.clone(),
+            response,
+        ) {
+            Ok(frame) => frame,
+            Err(error) => {
+                eprintln!("{SERVICE_NAME}: invalid EBP response: {error}");
+                break;
+            }
+        };
         if let Err(error) = write_frame(&mut output, &response_frame, negotiated_limits) {
             eprintln!("{SERVICE_NAME}: EBP response failed: {error}");
             break;
@@ -204,101 +204,51 @@ fn read_handshake<R: Read>(
 fn validate_request_frame(session: &mut Session, frame: &Frame) -> Result<Request, String> {
     if frame.protocol_version != session.protocol_version
         || frame.connection_id != session.connection_id
-        || frame.kind != FrameKind::Request
-        || frame.message_type != MessageType::Execute
     {
         return Err("request frame is outside the negotiated EBP session".to_owned());
     }
-    let identity = frame
-        .request_identity
-        .as_ref()
-        .ok_or_else(|| "request identity is required".to_owned())?;
+    let (request_id, identity, request) =
+        decode_request_frame(frame).map_err(|error| error.to_string())?;
     if identity.request.state_fence != session.state_fence {
         return Err("request identity state fence does not match the handshake fence".to_owned());
     }
-    let request_id = frame
-        .request_id
-        .as_ref()
-        .ok_or_else(|| "request_id is required".to_owned())?
-        .to_string();
-    match session.replay.observe(request_id, frame) {
+    match session.replay.observe(request_id.to_string(), frame) {
         ReplayDisposition::Conflict => {
             return Err("request identity conflicts with a prior frame".to_owned());
         }
         ReplayDisposition::New | ReplayDisposition::Duplicate => {}
     }
-    let ProtocolPayload::Json(payload) = &frame.payload else {
-        return Err("request payload must use json-v1".to_owned());
-    };
-    let request: Request = serde_json::from_value(payload.clone())
-        .map_err(|error| format!("decode store request: {error}"))?;
-    let capability = request_capability(&request);
+    let capability = request.capability();
     if !session.capabilities.contains(capability) {
         return Err(format!("capability is not admitted: {capability}"));
     }
-    validate_request_fence(&request, identity)?;
     Ok(request)
-}
-
-fn request_capability(request: &Request) -> &'static str {
-    match request {
-        Request::Health => CAPABILITY_HEALTH,
-        Request::Readiness => CAPABILITY_READINESS,
-        Request::Named { .. } => CAPABILITY_NAMED_READ,
-        Request::Apply { .. } => CAPABILITY_APPLY,
-        Request::Receipt { .. } => CAPABILITY_RECEIPT,
-    }
-}
-
-fn validate_request_fence(
-    request: &Request,
-    identity: &eliot_protocol::RequestIdentity,
-) -> Result<(), String> {
-    match request {
-        Request::Named { request } => {
-            request.validate().map_err(store_error)?;
-            if request.state_fence != identity.request.state_fence {
-                return Err("named request fence does not match request identity".to_owned());
-            }
-        }
-        Request::Apply {
-            context,
-            transition,
-            ..
-        } => {
-            context.validate().map_err(|error| error.to_string())?;
-            transition.validate().map_err(store_error)?;
-            if context != &identity.request.metadata {
-                return Err("apply context does not match request identity metadata".to_owned());
-            }
-            if identity.idempotency_key != transition.identity.idempotency_key {
-                return Err(
-                    "prepared transition idempotency key does not match request identity"
-                        .to_owned(),
-                );
-            }
-            if transition.state_fence != identity.request.state_fence {
-                return Err("prepared transition fence does not match request identity".to_owned());
-            }
-        }
-        Request::Health | Request::Readiness | Request::Receipt { .. } => {}
-    }
-    Ok(())
-}
-
-fn store_error(error: StoreError) -> String {
-    error.to_string()
 }
 
 async fn dispatch(composition: &StoreComposition, request: Request) -> Response {
     match request {
-        Request::Health => Response::Health {
-            record: composition.health().await,
+        Request::Health => match composition.health().await {
+            Ok(record) => Response::Health { record },
+            Err(error) => Response::Error {
+                error: error.to_string(),
+            },
         },
         Request::Readiness => match composition.readiness().await {
-            Ok(readiness) => Response::Readiness {
-                receipt: readiness.into(),
-            },
+            Ok(readiness) => {
+                let receipt = match readiness {
+                    eliot_store_surreal_adapter::SemanticReadiness::Unavailable => {
+                        ReadinessReceipt::unavailable()
+                    }
+                    eliot_store_surreal_adapter::SemanticReadiness::MigrationRequired {
+                        expected,
+                        observed,
+                    } => ReadinessReceipt::migration_required(expected.to_string(), observed),
+                    eliot_store_surreal_adapter::SemanticReadiness::Ready { generation } => {
+                        ReadinessReceipt::ready(generation.to_string())
+                    }
+                };
+                Response::Readiness { receipt }
+            }
             Err(error) => Response::Error {
                 error: error.to_string(),
             },
@@ -323,13 +273,25 @@ async fn dispatch(composition: &StoreComposition, request: Request) -> Response 
             )
             .await
         {
-            Ok(receipt) => Response::Transaction { receipt },
+            Ok(receipt) => Response::from_transaction_receipt(receipt),
             Err(error) => Response::Error {
                 error: error.to_string(),
             },
         },
         Request::Receipt { operation_id } => match composition.receipt(operation_id).await {
-            Ok(receipt) => Response::Receipt { receipt },
+            Ok(receipt) => Response::from_receipt(receipt),
+            Err(error) => Response::Error {
+                error: error.to_string(),
+            },
+        },
+        Request::RevisionHeads { keys } => match composition.revision_heads(keys).await {
+            Ok(heads) => Response::RevisionHeads { heads },
+            Err(error) => Response::Error {
+                error: error.to_string(),
+            },
+        },
+        Request::OrderingHeads { scopes } => match composition.ordering_heads(scopes).await {
+            Ok(heads) => Response::OrderingHeads { heads },
             Err(error) => Response::Error {
                 error: error.to_string(),
             },
@@ -352,22 +314,6 @@ fn control_frame(
         message_type,
         request_identity: None,
         payload: ProtocolPayload::Json(payload),
-        trace_context: std::collections::BTreeMap::new(),
-    }
-}
-
-fn response_frame(session: &Session, request: &Frame, response: Response) -> Frame {
-    Frame {
-        protocol_version: session.protocol_version,
-        encoding_profile: EncodingProfile::JsonV1,
-        connection_id: session.connection_id.clone(),
-        request_id: request.request_id.clone(),
-        kind: FrameKind::Response,
-        message_type: MessageType::Result,
-        request_identity: None,
-        payload: ProtocolPayload::Json(
-            serde_json::to_value(response).expect("store response is serializable"),
-        ),
         trace_context: std::collections::BTreeMap::new(),
     }
 }
