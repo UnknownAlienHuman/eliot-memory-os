@@ -366,8 +366,16 @@ pub trait DurableRegistrationPort: Send {
 /// the exact one-shot invocation without transporting sealed P-03 authority.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ProcessStartOutcome {
-    Started(ProcessStartReceipt),
-    Unknown { request_digest: String },
+    Started {
+        /// Digest returned by the provider for the sealed one-shot request.
+        /// Core compares it with the independently precommitted digest before
+        /// accepting the receipt.
+        request_digest: String,
+        receipt: ProcessStartReceipt,
+    },
+    Unknown {
+        request_digest: String,
+    },
 }
 
 /// P-04 adapter boundary owned by the interactive broker composition.
@@ -377,10 +385,19 @@ pub enum ProcessStartOutcome {
 /// request locally; `ProcessRequest` and `ValidatedDispatch` never cross the
 /// broker or IPC boundary.
 pub trait ProcessPort: Send {
+    /// Prepares the exact sealed request without crossing the physical start
+    /// boundary.  The returned digest is durably recorded before `start` is
+    /// called, so a crash cannot orphan an effect with no recovery cursor.
+    fn prepare_start(
+        &mut self,
+        grant: &LaunchGrant,
+        registration: &RegistrationReceipt,
+    ) -> Result<String, PortError>;
     fn start(
         &mut self,
         grant: &LaunchGrant,
         registration: &RegistrationReceipt,
+        expected_request_digest: &str,
     ) -> Result<ProcessStartOutcome, PortError>;
     fn inspect(&mut self, operation_id: &OperationId) -> Result<ProcessExecutionView, PortError>;
     fn cancel(&mut self, operation_id: &OperationId) -> Result<CancellationReceipt, PortError>;
@@ -573,18 +590,38 @@ impl UserBroker {
         let process_operation_id = grant.approved.operation_id.clone();
         let process_generation = grant.approved.generation;
         let permit = permit_from_grant(&grant, &current, &request_digest);
-        let mut cursor = cursor_from_grant(
+        let expected_process_request_digest = self
+            .process
+            .as_mut()
+            .ok_or(BrokerError::PlanGap(RequiredProvider::P03Process))?
+            .prepare_start(&grant, &current)
+            .map_err(|error| map_port(RequiredProvider::P03Process, error))?;
+        hex_digest(&expected_process_request_digest, "process_request_digest")?;
+        let cursor = cursor_from_grant(
             &grant,
             &current,
             &request_digest,
-            "",
+            &expected_process_request_digest,
             OperationState::Unknown,
         );
+        let unknown_record = OperationRecord {
+            cursor: cursor.clone(),
+            permit: permit.clone(),
+            receipt: None,
+        };
+        self.operations.insert(
+            request.approved.idempotency_key.clone(),
+            unknown_record.clone(),
+        );
+        // This is the last durable boundary before the provider can create a
+        // process.  Any save error leaves the exact Unknown cursor in memory
+        // and prevents crossing the physical start boundary.
+        self.persist()?;
         let outcome = self
             .process
             .as_mut()
             .ok_or(BrokerError::PlanGap(RequiredProvider::P03Process))?
-            .start(&grant, &current)
+            .start(&grant, &current, &expected_process_request_digest)
             .map_err(|error| {
                 if matches!(error, PortError::Unknown) {
                     BrokerError::UnknownOutcome
@@ -593,26 +630,25 @@ impl UserBroker {
                 }
             })?;
         let receipt = match outcome {
-            ProcessStartOutcome::Started(receipt) => receipt,
+            ProcessStartOutcome::Started {
+                request_digest,
+                receipt,
+            } => {
+                if request_digest != expected_process_request_digest
+                    || receipt.request_digest() != expected_process_request_digest
+                {
+                    return Err(BrokerError::ProcessBindingMismatch);
+                }
+                receipt
+            }
             ProcessStartOutcome::Unknown { request_digest } => {
-                text(&request_digest, "process_request_digest")?;
-                cursor.process_request_digest = request_digest;
-                self.operations.insert(
-                    request.approved.idempotency_key.clone(),
-                    OperationRecord {
-                        cursor,
-                        permit,
-                        receipt: None,
-                    },
-                );
-                self.persist()?;
+                if request_digest != expected_process_request_digest {
+                    return Err(BrokerError::ProcessBindingMismatch);
+                }
                 return Err(BrokerError::UnknownOutcome);
             }
         };
-        let process_request_digest = receipt.request_digest().to_owned();
-        cursor.process_request_digest = process_request_digest.clone();
         if receipt.operation_id() != &process_operation_id
-            || receipt.request_digest() != process_request_digest
             || receipt.accepted_generation() != process_generation
         {
             return Err(BrokerError::ProcessBindingMismatch);
@@ -623,8 +659,9 @@ impl UserBroker {
             .ok_or(BrokerError::PlanGap(RequiredProvider::P03Process))?
             .inspect(&process_operation_id)
             .map_err(|error| map_port(RequiredProvider::P03Process, error))?;
-        verify_cursor_lineage(&cursor, &view)?;
-        cursor.state = OperationState::Active;
+        verify_cursor_lineage(&unknown_record.cursor, &view)?;
+        let mut active_cursor = unknown_record.cursor.clone();
+        active_cursor.state = OperationState::Active;
         let launch_receipt = LaunchReceipt {
             operation_id: process_operation_id,
             request_digest,
@@ -640,12 +677,19 @@ impl UserBroker {
         self.operations.insert(
             request.approved.idempotency_key.clone(),
             OperationRecord {
-                cursor,
+                cursor: active_cursor,
                 permit,
                 receipt: Some(launch_receipt.clone()),
             },
         );
-        self.persist()?;
+        if let Err(error) = self.persist() {
+            // The physical start is already real but the Active publication
+            // was not durably acknowledged.  Restore the pre-effect Unknown
+            // cursor so restart/reconciliation cannot lose the lineage.
+            self.operations
+                .insert(request.approved.idempotency_key, unknown_record);
+            return Err(error);
+        }
         Ok(launch_receipt)
     }
 
@@ -1015,6 +1059,10 @@ mod tests {
         FencingToken, KernelDispatchKey, PermitIssuance, ProcessHealth, ProcessId, ProcessIntent,
         ProcessRequest, ProcessState, SuspendedProcessIdentity,
     };
+    use std::sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    };
 
     #[derive(Clone, Copy)]
     enum Tamper {
@@ -1162,6 +1210,26 @@ mod tests {
         }
     }
 
+    struct OrderingDurable {
+        snapshot: Arc<Mutex<Option<BrokerSnapshot>>>,
+    }
+
+    impl DurableRegistrationPort for OrderingDurable {
+        fn load(&mut self) -> Result<Option<BrokerSnapshot>, PortError> {
+            self.snapshot
+                .lock()
+                .map_err(|_| PortError::Unknown)
+                .map(|snapshot| snapshot.clone())
+        }
+
+        fn save(&mut self, snapshot: &BrokerSnapshot) -> Result<(), PortError> {
+            self.snapshot
+                .lock()
+                .map_err(|_| PortError::Unknown)
+                .map(|mut current| *current = Some(snapshot.clone()))
+        }
+    }
+
     struct FakeProcess {
         state: Option<ProcessState>,
         unknown: bool,
@@ -1169,13 +1237,22 @@ mod tests {
     }
 
     impl ProcessPort for FakeProcess {
+        fn prepare_start(
+            &mut self,
+            grant: &LaunchGrant,
+            _registration: &RegistrationReceipt,
+        ) -> Result<String, PortError> {
+            let (request, _authority) = process_request_for_test(grant, false)?;
+            Ok(request.invocation_digest().to_owned())
+        }
+
         fn start(
             &mut self,
             grant: &LaunchGrant,
             _registration: &RegistrationReceipt,
+            expected_request_digest: &str,
         ) -> Result<ProcessStartOutcome, PortError> {
             let (request, mut authority) = process_request_for_test(grant, self.wrong_receipt)?;
-            let request_digest = request.invocation_digest().to_owned();
             let observed = SuspendedProcessIdentity::new(
                 ProcessId::new("pid-1").expect("pid"),
                 request.process_tree_id().clone(),
@@ -1198,10 +1275,15 @@ mod tests {
                 .map_err(|error| PortError::Invalid(error.to_string()))?;
             self.state = Some(state);
             if self.unknown {
-                return Ok(ProcessStartOutcome::Unknown { request_digest });
+                return Ok(ProcessStartOutcome::Unknown {
+                    request_digest: expected_request_digest.to_owned(),
+                });
             }
             ProcessStartReceipt::new(self.state.as_ref().expect("state"))
-                .map(ProcessStartOutcome::Started)
+                .map(|receipt| ProcessStartOutcome::Started {
+                    request_digest: expected_request_digest.to_owned(),
+                    receipt,
+                })
                 .map_err(|error| PortError::Invalid(error.to_string()))
         }
 
@@ -1224,6 +1306,97 @@ mod tests {
             state
                 .cancel(&request)
                 .map_err(|error| PortError::Invalid(error.to_string()))
+        }
+    }
+
+    struct OrderingProcess {
+        inner: FakeProcess,
+        snapshot: Arc<Mutex<Option<BrokerSnapshot>>>,
+        observed_unknown_before_start: Arc<AtomicBool>,
+    }
+
+    impl ProcessPort for OrderingProcess {
+        fn prepare_start(
+            &mut self,
+            grant: &LaunchGrant,
+            registration: &RegistrationReceipt,
+        ) -> Result<String, PortError> {
+            self.inner.prepare_start(grant, registration)
+        }
+
+        fn start(
+            &mut self,
+            grant: &LaunchGrant,
+            registration: &RegistrationReceipt,
+            expected_request_digest: &str,
+        ) -> Result<ProcessStartOutcome, PortError> {
+            let persisted = self
+                .snapshot
+                .lock()
+                .map_err(|_| PortError::Unknown)?
+                .as_ref()
+                .and_then(|snapshot| {
+                    snapshot.operation_cursors.iter().find(|cursor| {
+                        cursor.operation_id == grant.approved.operation_id
+                            && cursor.state == OperationState::Unknown
+                            && cursor.process_request_digest == expected_request_digest
+                    })
+                })
+                .is_some();
+            self.observed_unknown_before_start
+                .store(persisted, Ordering::SeqCst);
+            self.inner
+                .start(grant, registration, expected_request_digest)
+        }
+
+        fn inspect(
+            &mut self,
+            operation_id: &OperationId,
+        ) -> Result<ProcessExecutionView, PortError> {
+            self.inner.inspect(operation_id)
+        }
+
+        fn cancel(&mut self, operation_id: &OperationId) -> Result<CancellationReceipt, PortError> {
+            self.inner.cancel(operation_id)
+        }
+    }
+
+    struct InspectFailureProcess {
+        inner: FakeProcess,
+        fail_inspect: Arc<AtomicBool>,
+    }
+
+    impl ProcessPort for InspectFailureProcess {
+        fn prepare_start(
+            &mut self,
+            grant: &LaunchGrant,
+            registration: &RegistrationReceipt,
+        ) -> Result<String, PortError> {
+            self.inner.prepare_start(grant, registration)
+        }
+
+        fn start(
+            &mut self,
+            grant: &LaunchGrant,
+            registration: &RegistrationReceipt,
+            expected_request_digest: &str,
+        ) -> Result<ProcessStartOutcome, PortError> {
+            self.inner
+                .start(grant, registration, expected_request_digest)
+        }
+
+        fn inspect(
+            &mut self,
+            operation_id: &OperationId,
+        ) -> Result<ProcessExecutionView, PortError> {
+            if self.fail_inspect.load(Ordering::SeqCst) {
+                return Err(PortError::Unknown);
+            }
+            self.inner.inspect(operation_id)
+        }
+
+        fn cancel(&mut self, operation_id: &OperationId) -> Result<CancellationReceipt, PortError> {
+            self.inner.cancel(operation_id)
         }
     }
 
@@ -1605,6 +1778,88 @@ mod tests {
         assert_eq!(
             wrong.launch(launch_request()),
             Err(BrokerError::ProcessBindingMismatch)
+        );
+        let wrong_cursor = wrong
+            .operations
+            .get("idem-1")
+            .expect("precommitted wrong-receipt cursor");
+        assert_eq!(wrong_cursor.cursor.state, OperationState::Unknown);
+        assert!(!wrong_cursor.cursor.process_request_digest.is_empty());
+    }
+
+    #[test]
+    fn launch_persists_unknown_cursor_before_process_start_effect() {
+        let snapshot = Arc::new(Mutex::new(None));
+        let observed_unknown_before_start = Arc::new(AtomicBool::new(false));
+        let mut broker = UserBroker::new(
+            Some(Box::new(FakeAuthority::new())),
+            Some(Box::new(OrderingProcess {
+                inner: FakeProcess {
+                    state: None,
+                    unknown: false,
+                    wrong_receipt: false,
+                },
+                snapshot: snapshot.clone(),
+                observed_unknown_before_start: observed_unknown_before_start.clone(),
+            })),
+            Some(Box::new(OrderingDurable {
+                snapshot: snapshot.clone(),
+            })),
+        );
+        broker
+            .register(registration_request())
+            .expect("registration");
+        broker.launch(launch_request()).expect("launch");
+        assert!(observed_unknown_before_start.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn inspect_failure_keeps_unknown_cursor_for_later_reconcile() {
+        let fail_inspect = Arc::new(AtomicBool::new(true));
+        let mut broker = UserBroker::new(
+            Some(Box::new(FakeAuthority::new())),
+            Some(Box::new(InspectFailureProcess {
+                inner: FakeProcess {
+                    state: None,
+                    unknown: false,
+                    wrong_receipt: false,
+                },
+                fail_inspect: fail_inspect.clone(),
+            })),
+            Some(Box::new(FakeDurable { snapshot: None })),
+        );
+        broker
+            .register(registration_request())
+            .expect("registration");
+        assert_eq!(
+            broker.launch(launch_request()),
+            Err(BrokerError::UnknownOutcome)
+        );
+        let permit = broker
+            .operations
+            .get("idem-1")
+            .expect("unknown cursor after inspect failure")
+            .permit
+            .clone();
+        assert_eq!(
+            broker
+                .operations
+                .get("idem-1")
+                .expect("cursor")
+                .cursor
+                .state,
+            OperationState::Unknown
+        );
+        fail_inspect.store(false, Ordering::SeqCst);
+        broker.reconcile(&permit).expect("reconcile");
+        assert_eq!(
+            broker
+                .operations
+                .get("idem-1")
+                .expect("reconciled cursor")
+                .cursor
+                .state,
+            OperationState::Reconciled
         );
     }
 

@@ -377,6 +377,7 @@ struct LocalProcessPort {
     executor: WindowsProcessExecutor,
     runtime: tokio::runtime::Runtime,
     evidence: Arc<Mutex<Vec<ProcessEvidence>>>,
+    pending_requests: BTreeMap<OperationId, ProcessRequest>,
 }
 
 impl LocalProcessPort {
@@ -395,6 +396,7 @@ impl LocalProcessPort {
             executor,
             runtime,
             evidence: Arc::new(Mutex::new(Vec::new())),
+            pending_requests: BTreeMap::new(),
         })
     }
 
@@ -443,18 +445,50 @@ impl LocalProcessPort {
 }
 
 impl ProcessPort for LocalProcessPort {
+    fn prepare_start(
+        &mut self,
+        grant: &LaunchGrant,
+        _registration: &RegistrationReceipt,
+    ) -> Result<String, PortError> {
+        let request = self.request_from_grant(grant)?;
+        let operation_id = request.operation_id().clone();
+        let request_digest = request.invocation_digest().to_owned();
+        if self
+            .pending_requests
+            .insert(operation_id, request)
+            .is_some()
+        {
+            return Err(PortError::Invalid(
+                "duplicate pending process start operation".to_owned(),
+            ));
+        }
+        Ok(request_digest)
+    }
+
     fn start(
         &mut self,
         grant: &LaunchGrant,
         _registration: &RegistrationReceipt,
+        expected_request_digest: &str,
     ) -> Result<ProcessStartOutcome, PortError> {
-        let request = self.request_from_grant(grant)?;
+        let request = self
+            .pending_requests
+            .remove(&grant.approved.operation_id)
+            .ok_or_else(|| PortError::Invalid("process start was not prepared".to_owned()))?;
         let request_digest = request.invocation_digest().to_owned();
+        if request_digest != expected_request_digest {
+            return Err(PortError::Invalid(
+                "prepared process request digest changed".to_owned(),
+            ));
+        }
         let sink = Arc::new(BrokerEvidenceSink {
             records: self.evidence.clone(),
         });
         match self.runtime.block_on(self.executor.start(request, sink)) {
-            Ok(receipt) => Ok(ProcessStartOutcome::Started(receipt)),
+            Ok(receipt) => Ok(ProcessStartOutcome::Started {
+                request_digest,
+                receipt,
+            }),
             Err(ProcessExecutionError::UnknownOutcome) => {
                 Ok(ProcessStartOutcome::Unknown { request_digest })
             }
