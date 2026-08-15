@@ -31,7 +31,10 @@ use eliot_process::{
 use eliot_process_executor::{DispatchValidationPort, WindowsProcessExecutor};
 use eliot_protocol::{EncodingProfile, Frame, FrameKind, MessageType, ProtocolPayload};
 use eliot_runtime::{Runtime, RuntimeConfig, ShutdownOutcome};
-use eliot_runtime_contracts::{HealthVector, ModuleGeneration, ModuleGenerationState};
+use eliot_runtime_contracts::{
+    GenerationCutoverRecord as RuntimeGenerationCutoverRecord, GenerationCutoverState,
+    HealthVector, ModuleGeneration, ModuleGenerationState,
+};
 use sha2::{Digest as _, Sha256};
 
 #[cfg(windows)]
@@ -150,10 +153,11 @@ pub struct KernelComposition {
     runtime: Runtime,
     platform: WindowsPlatform,
     ipc: IpcImplementation,
-    _ors: OrsCoordinator<RedbRecoveryStore>,
+    generation_gateway: OrsGenerationCoordinator,
     service: Mutex<KernelService>,
-    _generations: Mutex<GenerationRouter>,
-    front_door_policy: ServerHandshakePolicy,
+    generations: Mutex<GenerationRouter>,
+    generation_poison: Mutex<Option<String>>,
+    front_door_policy: Mutex<ServerHandshakePolicy>,
     process_executor: WindowsProcessExecutor,
 }
 
@@ -185,6 +189,128 @@ impl DispatchValidationPort for HandoffDispatchPort {
             "Kernel Host handoff has not activated process dispatch authority".to_owned(),
         ))
     }
+}
+
+/// The sole semantic bridge between ORS cutover evidence and the in-memory
+/// route table.  ORS owns the durable linearization point; this type owns no
+/// mutable store escape and publishes only after that point succeeds.
+struct OrsGenerationCoordinator {
+    ors: OrsCoordinator<RedbRecoveryStore>,
+}
+
+impl OrsGenerationCoordinator {
+    fn new(ors: OrsCoordinator<RedbRecoveryStore>) -> Self {
+        Self { ors }
+    }
+
+    fn recover(
+        &self,
+        generations: &mut GenerationRouter,
+        service: &mut KernelService,
+        policy: &mut ServerHandshakePolicy,
+    ) -> Result<(), String> {
+        // A staged candidate is evidence of an interrupted attempt.  Mark it
+        // forward-only before rebuilding routes; never activate staged data.
+        let _ = self
+            .ors
+            .reconcile_staged_generation_cutovers(eliot_ors::MAX_RECOVERY_PAGE)
+            .map_err(|error| error.to_string())?;
+        let snapshots = self
+            .ors
+            .latest_generation_cutovers(eliot_ors::MAX_RECOVERY_PAGE)
+            .map_err(|error| error.to_string())?;
+        if snapshots.is_empty() {
+            return Ok(());
+        }
+
+        let epoch_value = snapshots
+            .iter()
+            .map(|snapshot| snapshot.record().new_epoch.value())
+            .max()
+            .ok_or_else(|| "committed cutover projection was empty".to_owned())?;
+        let epoch = AuthorityEpoch::new(epoch_value).map_err(|error| error.to_string())?;
+        let mut recovered = GenerationRouter::at_epoch(epoch).map_err(|error| error.to_string())?;
+        for snapshot in &snapshots {
+            let record = snapshot.record();
+            if record.state != GenerationCutoverState::Committed || record.new_epoch != epoch {
+                return Err("ORS route projection has inconsistent committed epochs".to_owned());
+            }
+            let scope =
+                RouteScope::new(record.route_scope.clone()).map_err(|error| error.to_string())?;
+            let route = GenerationRoute::new(scope, record.new_generation, epoch)
+                .map_err(|error| error.to_string())?;
+            recovered
+                .register(route)
+                .map_err(|error| error.to_string())?;
+        }
+        service
+            .synchronize_authority_epoch(epoch)
+            .map_err(|error| error.to_string())?;
+        update_handshake_policy(policy, &recovered)?;
+        *generations = recovered;
+        Ok(())
+    }
+
+    fn persist_and_publish(
+        &self,
+        decision: &eliot_kernel_core::CutoverDecision,
+        generations: &mut GenerationRouter,
+        service: &mut KernelService,
+        policy: &mut ServerHandshakePolicy,
+    ) -> Result<(), String> {
+        let mut candidate = generations.clone();
+        candidate
+            .cutover(decision)
+            .map_err(|error| error.to_string())?;
+        let staged = RuntimeGenerationCutoverRecord {
+            cutover_id: decision.cutover_id().to_owned(),
+            route_scope: decision.route_scope().as_str().to_owned(),
+            old_generation: decision.old_generation(),
+            new_generation: decision.new_generation(),
+            old_epoch: decision.old_epoch(),
+            new_epoch: decision.new_epoch(),
+            state: GenerationCutoverState::Armed,
+        };
+        self.ors
+            .stage_generation_cutover(staged.clone())
+            .map_err(|error| error.to_string())?;
+        let committed = self
+            .ors
+            .commit_generation_cutover_state(staged)
+            .map_err(|error| error.to_string())?;
+        if committed.record().state != GenerationCutoverState::Committed {
+            return Err("ORS did not return a committed cutover".to_owned());
+        }
+
+        // No in-memory publication occurs before the durable cutover.  Any
+        // failure below is surfaced to the composition, which poisons the
+        // gateway rather than claiming a partially published transition.
+        service
+            .synchronize_authority_epoch(decision.new_epoch())
+            .map_err(|error| error.to_string())?;
+        update_handshake_policy(policy, &candidate)?;
+        *generations = candidate;
+        Ok(())
+    }
+}
+
+fn update_handshake_policy(
+    policy: &mut ServerHandshakePolicy,
+    generations: &GenerationRouter,
+) -> Result<(), String> {
+    let daemon = RouteScope::new("daemon").map_err(|error| error.to_string())?;
+    if let Ok(route) = generations.route(&daemon) {
+        policy.module_generation.generation = route.active_generation();
+        policy.module_generation.state_fence =
+            StateFence::new(route.authority_epoch(), route.active_generation());
+        policy.config_snapshot = serde_json::json!({
+            "service": SERVICE_NAME,
+            "protocol": PROTOCOL_VERSION,
+            "generation": route.active_generation().value(),
+            "authority_epoch": route.authority_epoch().value(),
+        });
+    }
+    Ok(())
 }
 
 impl KernelComposition {
@@ -291,14 +417,21 @@ impl KernelComposition {
             None,
         )
         .map_err(KernelBuildError::Runtime)?;
+        let generation_gateway = OrsGenerationCoordinator::new(ors);
+        let mut service = service;
+        let mut policy = front_door_policy;
+        generation_gateway
+            .recover(&mut generations, &mut service, &mut policy)
+            .map_err(KernelBuildError::Ors)?;
         Ok(Self {
             runtime,
             platform,
             ipc,
-            _ors: ors,
+            generation_gateway,
             service: Mutex::new(service),
-            _generations: Mutex::new(generations),
-            front_door_policy,
+            generations: Mutex::new(generations),
+            generation_poison: Mutex::new(None),
+            front_door_policy: Mutex::new(policy),
             process_executor: WindowsProcessExecutor::new(authority),
         })
     }
@@ -317,8 +450,11 @@ impl KernelComposition {
 
     /// Returns the server-owned EBP handshake policy.
     #[must_use]
-    pub const fn front_door_policy(&self) -> &ServerHandshakePolicy {
-        &self.front_door_policy
+    pub fn front_door_policy(&self) -> Result<ServerHandshakePolicy, TransportError> {
+        self.front_door_policy
+            .lock()
+            .map(|policy| policy.clone())
+            .map_err(|_| TransportError::SessionFenced)
     }
 
     /// Binds an authenticated local peer to the selected principal/session.
@@ -328,8 +464,11 @@ impl KernelComposition {
         peer: PeerIdentity,
         client: &eliot_protocol::ClientHello,
     ) -> Result<HandshakeResult, eliot_ipc::TransportError> {
-        self.ipc
-            .bind_session(connection_id, peer, client, &self.front_door_policy)
+        let policy = self
+            .front_door_policy
+            .lock()
+            .map_err(|_| TransportError::SessionFenced)?;
+        self.ipc.bind_session(connection_id, peer, client, &policy)
     }
 
     /// Runs the currently admitted, deliberately closed semantic gateway.
@@ -398,6 +537,77 @@ impl KernelComposition {
             .map_err(|error| KernelBuildError::Principal(error.to_string()))?;
         NamedPipeServer::create_additional(self.ipc.name(), &expectation)
             .map_err(|error| KernelBuildError::Principal(error.to_string()))
+    }
+
+    /// Returns a cloned, read-only route projection.  Callers cannot obtain a
+    /// mutable router guard or bypass the ORS transition gateway.
+    pub fn generation_route_snapshot(&self) -> Result<GenerationRouter, KernelServiceError> {
+        if let Some(reason) = self
+            .generation_poison
+            .lock()
+            .map_err(|_| {
+                KernelServiceError::Platform("generation poison lock poisoned".to_owned())
+            })?
+            .clone()
+        {
+            return Err(KernelServiceError::Platform(format!(
+                "generation gateway fenced: {reason}"
+            )));
+        }
+        self.generations
+            .lock()
+            .map(|router| router.clone())
+            .map_err(|_| KernelServiceError::Platform("generation lock poisoned".to_owned()))
+    }
+
+    /// Persists and publishes one epoch-raising generation cutover through the
+    /// sole semantic gateway.  A failed publish permanently fences this
+    /// composition instance until restart/recovery proves a durable route.
+    pub fn apply_generation_cutover(
+        &self,
+        decision: eliot_kernel_core::CutoverDecision,
+    ) -> Result<(), KernelServiceError> {
+        if let Some(reason) = self
+            .generation_poison
+            .lock()
+            .map_err(|_| {
+                KernelServiceError::Platform("generation poison lock poisoned".to_owned())
+            })?
+            .clone()
+        {
+            return Err(KernelServiceError::Platform(format!(
+                "generation gateway fenced: {reason}"
+            )));
+        }
+        let result = (|| {
+            let mut generations = self
+                .generations
+                .lock()
+                .map_err(|_| "generation lock poisoned".to_owned())?;
+            let mut service = self
+                .service
+                .lock()
+                .map_err(|_| "service lock poisoned".to_owned())?;
+            let mut policy = self
+                .front_door_policy
+                .lock()
+                .map_err(|_| "front-door policy lock poisoned".to_owned())?;
+            self.generation_gateway.persist_and_publish(
+                &decision,
+                &mut generations,
+                &mut service,
+                &mut policy,
+            )
+        })();
+        if let Err(reason) = result {
+            if let Ok(mut poison) = self.generation_poison.lock() {
+                *poison = Some(reason.clone());
+            }
+            return Err(KernelServiceError::Platform(format!(
+                "generation cutover fenced: {reason}"
+            )));
+        }
+        Ok(())
     }
 
     /// Applies one lifecycle command through the sole Kernel transition gateway.

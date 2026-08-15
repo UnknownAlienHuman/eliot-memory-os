@@ -3,7 +3,10 @@ use std::path::Path;
 use std::sync::Arc;
 
 use eliot_receipts::{ReceiptDispositionKind, ReceiptEnvelope};
-use eliot_runtime_contracts::{HealthDimension, OperationalRecoveryState};
+use eliot_runtime_contracts::{
+    GenerationCutoverRecord as RuntimeGenerationCutoverRecord, GenerationCutoverState,
+    HealthDimension, OperationalRecoveryState,
+};
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
@@ -15,15 +18,15 @@ use crate::{
     CapabilityGrantRevocation, CapabilityIntroductionActivation, CapabilityIntroductionFence,
     CapabilityIntroductionReceipt, DeliveryAcknowledgement, DeliveryCursorReceipt,
     DeliveryCursorState, EpochIdentity, EpochLineage, GenerationCutoverReceipt,
-    GenerationCutoverRecord, GenerationTransition, GenerationTransitionReceipt, JobCheckpoint,
-    KernelAuthoritySnapshot, OpaqueLabel, OperationalControlProjection, OperationalMutationReceipt,
-    OperationalPhase, OperationalRecordInput, OrsError, OrsSnapshotReceipt, OrsSnapshotRequest,
-    PendingOperationPage, RecoveredAuthoritySnapshot, RecoveryCursor, RecoveryInboxDisposition,
-    RecoveryInboxItem, RecoveryInboxReceipt, RecoveryPage, RecoveryPayloadEnvelope,
-    ReservationRecord, ReservationRequest, ReservationState, ReservedScope, RetryState,
-    ScopeTerminalReceipt, ScopeTerminalView, SessionBindingReceipt, SessionDetach, StageReceipt,
-    StagedOperation, UserBrokerFence, UserBrokerRegistration, UserBrokerRegistrationReceipt,
-    WriterReservationToken,
+    GenerationCutoverRecord, GenerationCutoverSnapshot, GenerationTransition,
+    GenerationTransitionReceipt, JobCheckpoint, KernelAuthoritySnapshot, OpaqueLabel,
+    OperationalControlProjection, OperationalMutationReceipt, OperationalPhase,
+    OperationalRecordInput, OrsError, OrsSnapshotReceipt, OrsSnapshotRequest, PendingOperationPage,
+    RecoveredAuthoritySnapshot, RecoveryCursor, RecoveryInboxDisposition, RecoveryInboxItem,
+    RecoveryInboxReceipt, RecoveryPage, RecoveryPayloadEnvelope, ReservationRecord,
+    ReservationRequest, ReservationState, ReservedScope, RetryState, ScopeTerminalReceipt,
+    ScopeTerminalView, SessionBindingReceipt, SessionDetach, StageReceipt, StagedOperation,
+    UserBrokerFence, UserBrokerRegistration, UserBrokerRegistrationReceipt, WriterReservationToken,
 };
 
 const META: TableDefinition<&str, &str> = TableDefinition::new("ors_meta_v1");
@@ -41,6 +44,10 @@ const OPERATIONAL_HISTORY: TableDefinition<&str, &str> =
 const RECOVERY_INBOX: TableDefinition<&str, &str> = TableDefinition::new("ors_recovery_inbox_v1");
 const RECOVERY_INBOX_HISTORY: TableDefinition<&str, &str> =
     TableDefinition::new("ors_recovery_inbox_history_v1");
+const GENERATION_TRANSITIONS: TableDefinition<&str, &str> =
+    TableDefinition::new("ors_generation_transitions_v1");
+const GENERATION_CUTOVERS: TableDefinition<&str, &str> =
+    TableDefinition::new("ors_generation_cutovers_v1");
 const NEXT_GLOBAL_ORDER: &str = "next_global_order";
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -153,6 +160,13 @@ struct DurableOperationalRecord {
     operation_order: u64,
     terminal_receipt_id: Option<OpaqueLabel>,
     terminal_receipt_sha256: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DurableGenerationCutover {
+    record: RuntimeGenerationCutoverRecord,
+    operation_order: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -360,6 +374,8 @@ impl RedbRecoveryStore {
             drop(write.open_table(OPERATIONAL_HISTORY).map_err(storage)?);
             drop(write.open_table(RECOVERY_INBOX).map_err(storage)?);
             drop(write.open_table(RECOVERY_INBOX_HISTORY).map_err(storage)?);
+            drop(write.open_table(GENERATION_TRANSITIONS).map_err(storage)?);
+            drop(write.open_table(GENERATION_CUTOVERS).map_err(storage)?);
         }
         write.commit().map_err(storage)
     }
@@ -1137,6 +1153,218 @@ impl RedbRecoveryStore {
         }
         refs.sort();
         Ok(refs)
+    }
+
+    /// Persists one candidate transition before the cutover linearization
+    /// point.  A restart may observe this record, but must never activate it.
+    pub fn stage_generation_cutover(
+        &self,
+        record: RuntimeGenerationCutoverRecord,
+    ) -> Result<GenerationCutoverSnapshot, OrsError> {
+        record
+            .validate()
+            .map_err(|error| OrsError::Contract(error.to_string()))?;
+        if !matches!(
+            record.state,
+            GenerationCutoverState::Preparing | GenerationCutoverState::Armed
+        ) {
+            return Err(OrsError::InvalidTransition);
+        }
+        let write = self.database.begin_write().map_err(storage)?;
+        let key = record.cutover_id.clone();
+        if let Some(value) = write
+            .open_table(GENERATION_TRANSITIONS)
+            .map_err(storage)?
+            .get(key.as_str())
+            .map_err(storage)?
+        {
+            let existing: DurableGenerationCutover =
+                decode_named(value.value(), "generation_transition")?;
+            if existing.record == record {
+                return Ok(GenerationCutoverSnapshot::new(
+                    existing.record,
+                    existing.operation_order,
+                ));
+            }
+            return Err(OrsError::DuplicateConflict);
+        }
+        let operation_order = Self::next_operational_order(&write)?;
+        let durable = DurableGenerationCutover {
+            record,
+            operation_order,
+        };
+        let payload = encode(&durable)?;
+        write
+            .open_table(GENERATION_TRANSITIONS)
+            .map_err(storage)?
+            .insert(key.as_str(), payload.as_str())
+            .map_err(storage)?;
+        write.commit().map_err(storage)?;
+        Ok(GenerationCutoverSnapshot::new(
+            durable.record,
+            durable.operation_order,
+        ))
+    }
+
+    /// Commits one staged transition and records the new route atomically.
+    /// The write to `GENERATION_CUTOVERS` is the durable cutover point.
+    pub fn commit_generation_cutover_state(
+        &self,
+        record: RuntimeGenerationCutoverRecord,
+    ) -> Result<GenerationCutoverSnapshot, OrsError> {
+        record
+            .validate()
+            .map_err(|error| OrsError::Contract(error.to_string()))?;
+        if record.state != GenerationCutoverState::Armed {
+            return Err(OrsError::InvalidTransition);
+        }
+        let write = self.database.begin_write().map_err(storage)?;
+        let transition: DurableGenerationCutover = {
+            let table = write.open_table(GENERATION_TRANSITIONS).map_err(storage)?;
+            let value = table
+                .get(record.cutover_id.as_str())
+                .map_err(storage)?
+                .ok_or(OrsError::ReservationNotFound)?;
+            decode_named(value.value(), "generation_transition")?
+        };
+        if transition.record != record {
+            return Err(OrsError::DuplicateConflict);
+        }
+        let route_key = record.route_scope.clone();
+        if let Some(value) = write
+            .open_table(GENERATION_CUTOVERS)
+            .map_err(storage)?
+            .get(route_key.as_str())
+            .map_err(storage)?
+        {
+            let existing: DurableGenerationCutover =
+                decode_named(value.value(), "generation_cutover")?;
+            if existing.record.cutover_id == record.cutover_id
+                && existing.record.state == GenerationCutoverState::Committed
+            {
+                return Ok(GenerationCutoverSnapshot::new(
+                    existing.record,
+                    existing.operation_order,
+                ));
+            }
+            if existing.record.new_epoch != record.old_epoch
+                || Some(existing.record.new_generation) != record.old_generation
+            {
+                return Err(OrsError::InvalidEpochLineage);
+            }
+        }
+        let committed = RuntimeGenerationCutoverRecord {
+            state: GenerationCutoverState::Committed,
+            ..record.clone()
+        };
+        let operation_order = Self::next_operational_order(&write)?;
+        let durable = DurableGenerationCutover {
+            record: committed,
+            operation_order,
+        };
+        let payload = encode(&durable)?;
+        write
+            .open_table(GENERATION_CUTOVERS)
+            .map_err(storage)?
+            .insert(route_key.as_str(), payload.as_str())
+            .map_err(storage)?;
+        write
+            .open_table(GENERATION_TRANSITIONS)
+            .map_err(storage)?
+            .remove(record.cutover_id.as_str())
+            .map_err(storage)?;
+        write.commit().map_err(storage)?;
+        Ok(GenerationCutoverSnapshot::new(
+            durable.record,
+            durable.operation_order,
+        ))
+    }
+
+    /// Returns the bounded latest committed route set used during startup.
+    pub fn latest_generation_cutovers(
+        &self,
+        limit: u16,
+    ) -> Result<Vec<GenerationCutoverSnapshot>, OrsError> {
+        if limit == 0 || limit > crate::MAX_RECOVERY_PAGE {
+            return Err(OrsError::InvalidCursorLimit);
+        }
+        let read = self.database.begin_read().map_err(storage)?;
+        let table = read.open_table(GENERATION_CUTOVERS).map_err(storage)?;
+        let mut records = Vec::new();
+        for row in table.iter().map_err(storage)? {
+            let (_, value) = row.map_err(storage)?;
+            let durable: DurableGenerationCutover =
+                decode_named(value.value(), "generation_cutover")?;
+            if durable.record.state != GenerationCutoverState::Committed {
+                return Err(OrsError::IntegrityProblem {
+                    record_type: "generation_cutover",
+                    reason: "latest route is not committed".to_owned(),
+                });
+            }
+            if records.len() == usize::from(limit) {
+                return Err(OrsError::ProjectionLimitExceeded);
+            }
+            records.push(GenerationCutoverSnapshot::new(
+                durable.record,
+                durable.operation_order,
+            ));
+        }
+        records.sort_by_key(GenerationCutoverSnapshot::operation_order);
+        Ok(records)
+    }
+
+    /// Marks every staged-but-uncommitted transition as requiring a forward
+    /// cutover.  It is evidence of an interrupted attempt, never an active
+    /// route, and therefore cannot revive the old epoch on restart.
+    pub fn reconcile_staged_generation_cutovers(
+        &self,
+        limit: u16,
+    ) -> Result<Vec<GenerationCutoverSnapshot>, OrsError> {
+        if limit == 0 || limit > crate::MAX_RECOVERY_PAGE {
+            return Err(OrsError::InvalidCursorLimit);
+        }
+        let write = self.database.begin_write().map_err(storage)?;
+        let mut keys = Vec::new();
+        {
+            let table = write.open_table(GENERATION_TRANSITIONS).map_err(storage)?;
+            for row in table.iter().map_err(storage)? {
+                let (key, _) = row.map_err(storage)?;
+                if keys.len() == usize::from(limit) {
+                    return Err(OrsError::ProjectionLimitExceeded);
+                }
+                keys.push(key.value().to_owned());
+            }
+        }
+        let mut snapshots = Vec::with_capacity(keys.len());
+        let mut table = write.open_table(GENERATION_TRANSITIONS).map_err(storage)?;
+        for key in keys {
+            let value = table
+                .get(key.as_str())
+                .map_err(storage)?
+                .ok_or(OrsError::ReservationNotFound)?;
+            let prior: DurableGenerationCutover =
+                decode_named(value.value(), "generation_transition")?;
+            drop(value);
+            let record = RuntimeGenerationCutoverRecord {
+                state: GenerationCutoverState::FailedRequiresForwardCutover,
+                ..prior.record
+            };
+            let durable = DurableGenerationCutover {
+                record,
+                operation_order: Self::next_operational_order(&write)?,
+            };
+            let payload = encode(&durable)?;
+            table
+                .insert(key.as_str(), payload.as_str())
+                .map_err(storage)?;
+            snapshots.push(GenerationCutoverSnapshot::new(
+                durable.record,
+                durable.operation_order,
+            ));
+        }
+        drop(table);
+        write.commit().map_err(storage)?;
+        Ok(snapshots)
     }
 }
 
@@ -2294,6 +2522,38 @@ impl OrsCoordinator<RedbRecoveryStore> {
             store: RedbRecoveryStore::open(path)?,
         })
     }
+
+    /// Stages a typed generation transition before route publication.
+    pub fn stage_generation_cutover(
+        &self,
+        record: RuntimeGenerationCutoverRecord,
+    ) -> Result<GenerationCutoverSnapshot, OrsError> {
+        self.store.stage_generation_cutover(record)
+    }
+
+    /// Commits a staged generation cutover at the ORS linearization point.
+    pub fn commit_generation_cutover_state(
+        &self,
+        record: RuntimeGenerationCutoverRecord,
+    ) -> Result<GenerationCutoverSnapshot, OrsError> {
+        self.store.commit_generation_cutover_state(record)
+    }
+
+    /// Reads the bounded route projection used to reconstruct the Kernel.
+    pub fn latest_generation_cutovers(
+        &self,
+        limit: u16,
+    ) -> Result<Vec<GenerationCutoverSnapshot>, OrsError> {
+        self.store.latest_generation_cutovers(limit)
+    }
+
+    /// Reconciles interrupted candidates without activating them.
+    pub fn reconcile_staged_generation_cutovers(
+        &self,
+        limit: u16,
+    ) -> Result<Vec<GenerationCutoverSnapshot>, OrsError> {
+        self.store.reconcile_staged_generation_cutovers(limit)
+    }
 }
 
 impl<S: OperationalRecoveryStore> OrsCoordinator<S> {
@@ -2608,6 +2868,26 @@ impl PersistedValue for ScopeTerminalReceipt {
             return Err(OrsError::IntegrityProblem {
                 record_type: Self::RECORD_TYPE,
                 reason: "invalid terminal sequence or gap disposition".to_owned(),
+            });
+        }
+        Ok(())
+    }
+}
+
+impl PersistedValue for DurableGenerationCutover {
+    const RECORD_TYPE: &'static str = "generation_cutover";
+
+    fn validate_persisted(&self) -> Result<(), OrsError> {
+        self.record
+            .validate()
+            .map_err(|error| OrsError::IntegrityProblem {
+                record_type: Self::RECORD_TYPE,
+                reason: error.to_string(),
+            })?;
+        if self.operation_order == 0 {
+            return Err(OrsError::IntegrityProblem {
+                record_type: Self::RECORD_TYPE,
+                reason: "generation operation order is zero".to_owned(),
             });
         }
         Ok(())

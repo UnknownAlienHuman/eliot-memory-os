@@ -2,6 +2,7 @@ use std::collections::BTreeSet;
 
 use eliot_platform::{PlatformHandle, SecretReference};
 use eliot_receipts::ReceiptEnvelope;
+use eliot_runtime_contracts::GenerationCutoverRecord as RuntimeGenerationCutoverRecord;
 use eliot_security_contracts::PrivacyClass;
 use serde::{Deserialize, Deserializer, Serialize, de};
 use serde_json::{Map, Value};
@@ -628,6 +629,37 @@ operational_input!(CapabilityGrantActivation);
 operational_input!(CapabilityGrantRevocation);
 operational_input!(CapabilityIntroductionActivation);
 operational_input!(CapabilityIntroductionFence);
+
+/// Read-only ORS evidence for one Kernel generation transition or committed
+/// cutover.  The runtime contract is stored as a typed value in the dedicated
+/// generation index; ORS does not grant authority or interpret the route.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GenerationCutoverSnapshot {
+    /// The validated transition/cutover contract.
+    pub record: RuntimeGenerationCutoverRecord,
+    /// Monotonic ORS order at which this value was written.
+    pub operation_order: u64,
+}
+
+impl GenerationCutoverSnapshot {
+    pub(crate) fn new(record: RuntimeGenerationCutoverRecord, operation_order: u64) -> Self {
+        Self {
+            record,
+            operation_order,
+        }
+    }
+
+    /// Returns the typed generation/cutover contract.
+    pub const fn record(&self) -> &RuntimeGenerationCutoverRecord {
+        &self.record
+    }
+
+    /// Returns the ORS ordering value for this evidence.
+    pub const fn operation_order(&self) -> u64 {
+        self.operation_order
+    }
+}
 
 /// Persisted non-semantic phase for a P.4 operational subject.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]

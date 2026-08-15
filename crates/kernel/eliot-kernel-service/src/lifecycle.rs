@@ -336,6 +336,30 @@ impl KernelService {
         Ok(epoch)
     }
 
+    /// Replays the durable epoch lineage before admitting a front-door
+    /// session.  Epochs may only move forward; a durable regression is a
+    /// startup fence rather than an implicit genesis reset.
+    pub fn synchronize_authority_epoch(
+        &mut self,
+        target: AuthorityEpoch,
+    ) -> Result<(), KernelServiceError> {
+        let current = self.authority_epoch();
+        if target.value() < current.value() {
+            return Err(KernelServiceError::HandshakeMismatch {
+                field: "authority_epoch_regression",
+            });
+        }
+        while self.authority_epoch().value() < target.value() {
+            self.advance_authority_epoch()?;
+        }
+        if self.authority_epoch() != target {
+            return Err(KernelServiceError::HandshakeMismatch {
+                field: "authority_epoch",
+            });
+        }
+        Ok(())
+    }
+
     /// Acquires one bounded control lease for a normal admitted operation.
     pub fn acquire_admission(&self) -> Result<AdmissionLease, KernelServiceError> {
         if self.state != KernelServiceState::Ready {
