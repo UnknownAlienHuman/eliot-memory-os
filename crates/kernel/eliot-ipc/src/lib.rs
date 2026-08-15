@@ -397,10 +397,24 @@ pub fn decode_client_hello_frame(
 ) -> Result<ClientHello, TransportError> {
     let payload = validate_handshake_frame(
         frame,
-        expected_connection_id,
+        Some(expected_connection_id),
         FrameKind::Control,
         MessageType::Start,
     )?;
+    let client: ClientHello = serde_json::from_value(payload.clone())
+        .map_err(|error| ProtocolError::Json(error.to_string()))?;
+    client.validate()?;
+    Ok(client)
+}
+
+/// Decodes a ClientHello before its client-selected connection identity has
+/// been admitted by the server.
+///
+/// The authenticated peer and server handshake policy remain independent
+/// authorities. The caller must bind the returned hello and this frame's
+/// non-blank connection identity together before admitting the session.
+pub fn decode_client_hello_frame_unbound(frame: &Frame) -> Result<ClientHello, TransportError> {
+    let payload = validate_handshake_frame(frame, None, FrameKind::Control, MessageType::Start)?;
     let client: ClientHello = serde_json::from_value(payload.clone())
         .map_err(|error| ProtocolError::Json(error.to_string()))?;
     client.validate()?;
@@ -428,7 +442,7 @@ pub fn decode_server_hello_frame(
 ) -> Result<ServerHello, TransportError> {
     let payload = validate_handshake_frame(
         frame,
-        expected_connection_id,
+        Some(expected_connection_id),
         FrameKind::Control,
         MessageType::Ready,
     )?;
@@ -481,13 +495,14 @@ fn handshake_frame(
 
 fn validate_handshake_frame<'a>(
     frame: &'a Frame,
-    expected_connection_id: &str,
+    expected_connection_id: Option<&str>,
     expected_kind: FrameKind,
     expected_message_type: MessageType,
 ) -> Result<&'a serde_json::Value, TransportError> {
     frame.validate()?;
-    if expected_connection_id.trim().is_empty()
-        || frame.connection_id != expected_connection_id
+    if frame.connection_id.trim().is_empty()
+        || expected_connection_id
+            .is_some_and(|expected| expected.trim().is_empty() || frame.connection_id != expected)
         || frame.kind != expected_kind
         || frame.message_type != expected_message_type
         || frame.request_id.is_some()
@@ -1245,16 +1260,33 @@ pub struct NamedPipeServer {
 
 #[cfg(windows)]
 impl NamedPipeServer {
+    /// Creates the first named-pipe instance for a Kernel front door.
     pub fn create(
         name: &str,
         expectation: &eliot_platform_windows::NamedPipePeerExpectation,
+    ) -> Result<Self, TransportError> {
+        Self::create_with_first_instance(name, expectation, true)
+    }
+
+    /// Creates an additional named-pipe instance for a concurrent connection.
+    pub fn create_additional(
+        name: &str,
+        expectation: &eliot_platform_windows::NamedPipePeerExpectation,
+    ) -> Result<Self, TransportError> {
+        Self::create_with_first_instance(name, expectation, false)
+    }
+
+    fn create_with_first_instance(
+        name: &str,
+        expectation: &eliot_platform_windows::NamedPipePeerExpectation,
+        first_pipe_instance: bool,
     ) -> Result<Self, TransportError> {
         use tokio::net::windows::named_pipe::ServerOptions;
         validate_pipe_name(name)?;
         let mut security = PipeSecurityDescriptor::for_principal(expectation)?;
         let inner = unsafe {
             ServerOptions::new()
-                .first_pipe_instance(true)
+                .first_pipe_instance(first_pipe_instance)
                 .reject_remote_clients(true)
                 .create_with_security_attributes_raw(name, security.raw_attributes())
         }

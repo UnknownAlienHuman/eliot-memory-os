@@ -164,8 +164,6 @@ pub struct KernelComposition {
 pub enum KernelFrameAction {
     /// Return a bounded liveness or status reply.
     Reply(Frame),
-    /// Return the shutdown acknowledgement, then close the connection.
-    ReplyAndShutdown(Frame),
     /// Return a typed rejection, then fence the connection.
     Fence(Frame),
 }
@@ -333,9 +331,10 @@ impl KernelComposition {
 
     /// Runs the currently admitted, deliberately closed semantic gateway.
     ///
-    /// Heartbeats and explicit shutdown are handled locally. Other validated
-    /// frames are rejected and fenced until the durable execution gateway is
-    /// supplied; this boundary never fabricates execution success.
+    /// Heartbeats are handled locally. Other validated frames, including
+    /// shutdown requests, are rejected and fenced until the durable
+    /// execution gateway is supplied; this boundary never fabricates
+    /// execution success or accepts a peer-owned shutdown authority.
     pub fn dispatch_frame(
         &self,
         session: &Session,
@@ -369,19 +368,6 @@ impl KernelComposition {
             )?));
         }
 
-        if frame.kind == FrameKind::Control
-            && frame.message_type == MessageType::Shutdown
-            && frame.request_id.is_none()
-            && frame.request_identity.is_none()
-        {
-            return Ok(KernelFrameAction::ReplyAndShutdown(status_frame(
-                session,
-                FrameKind::Control,
-                MessageType::Shutdown,
-                serde_json::json!({"status": "SHUTTING_DOWN"}),
-            )?));
-        }
-
         Ok(KernelFrameAction::Fence(
             eliot_ipc::handshake_rejection_frame(
                 &session.connection_id,
@@ -398,6 +384,16 @@ impl KernelComposition {
         let expectation = eliot_platform_windows::current_process_named_pipe_expectation()
             .map_err(|error| KernelBuildError::Principal(error.to_string()))?;
         NamedPipeServer::create(self.ipc.name(), &expectation)
+            .map_err(|error| KernelBuildError::Principal(error.to_string()))
+    }
+
+    /// Binds one additional authenticated Windows front-door instance for a
+    /// concurrent session while the first instance remains connected.
+    #[cfg(windows)]
+    pub fn bind_authenticated_front_door_next(&self) -> Result<NamedPipeServer, KernelBuildError> {
+        let expectation = eliot_platform_windows::current_process_named_pipe_expectation()
+            .map_err(|error| KernelBuildError::Principal(error.to_string()))?;
+        NamedPipeServer::create_additional(self.ipc.name(), &expectation)
             .map_err(|error| KernelBuildError::Principal(error.to_string()))
     }
 
