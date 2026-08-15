@@ -7,23 +7,25 @@
 
 #![forbid(unsafe_code)]
 
-use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Component, Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
-use eliot_instrument_api::{ExecutionStatus, InstrumentContractError, InstrumentInvocation};
+use eliot_instrument_api::{InstrumentContractError, InstrumentInvocation};
 use eliot_platform_windows::WindowsPlatform;
 use eliot_process::{
-    ProcessEvidence, ProcessEvidenceSink, ProcessExecutionError, ProcessExecutor, ProcessRequest,
+    ProcessEvidenceSink, ProcessExecutionError, ProcessExecutor, ProcessRequest,
     ProcessStartReceipt,
 };
 use eliot_process_executor::{DispatchValidationPort, WindowsProcessExecutor};
 use eliot_testd_core::{
-    Lease, ReceiptBinding, TargetRoots, TestJob, TestdError, TestdStore, validate_running_lease,
+    Lease, TargetRoots, TestJob, TestdError, TestdStore, validate_running_lease,
 };
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use thiserror::Error;
+
+pub use eliot_testd_core::{
+    NormalizedEvidence, RawArtifact, VerificationReceipt, sha256_artifact, sha256_hex,
+};
 
 /// Stable daemon service identity.
 pub const SERVICE_NAME: &str = "eliot-testd";
@@ -38,6 +40,8 @@ pub const MAX_PROFILE_ARGUMENTS: usize = 128;
 pub struct TargetContract {
     /// Source/worktree target, never interpreted as a shell command.
     pub target: String,
+    /// Kernel/Governor-issued external execution contour.
+    pub allowed_contour_root: String,
     /// Dedicated build output root.
     pub build_root: String,
     /// Dedicated dependency/cache root.
@@ -56,6 +60,7 @@ impl TargetContract {
     pub fn validated_roots(&self) -> Result<TargetRoots, TestdError> {
         for (field, value) in [
             ("target", self.target.as_str()),
+            ("allowed_contour_root", self.allowed_contour_root.as_str()),
             ("build_root", self.build_root.as_str()),
             ("cache_root", self.cache_root.as_str()),
             ("process_tree_id", self.process_tree_id.as_str()),
@@ -68,6 +73,19 @@ impl TargetContract {
             }
         }
         let source_root = canonical_existing_root(Path::new(&self.target), "target")?;
+        let contour_root = canonical_existing_root(
+            Path::new(&self.allowed_contour_root),
+            "allowed_contour_root",
+        )?;
+        if declared_paths_overlap(
+            Path::new(&self.target),
+            Path::new(&self.allowed_contour_root),
+        ) {
+            return Err(TestdError::Invalid {
+                field: "allowed_contour_root",
+                reason: "external execution contour must not contain or be contained by target",
+            });
+        }
         if declared_paths_overlap(Path::new(&self.target), Path::new(&self.build_root)) {
             return Err(TestdError::Invalid {
                 field: "build_root",
@@ -100,7 +118,14 @@ impl TargetContract {
                 reason: "must equal the canonical build_root",
             });
         }
+        if !strict_descendant(&target_root, &contour_root) {
+            return Err(TestdError::Invalid {
+                field: "build_root",
+                reason: "must be a strict descendant of the allowed external execution contour",
+            });
+        }
         TargetRoots::new(
+            contour_root.to_string_lossy(),
             source_root.to_string_lossy(),
             target_root.to_string_lossy(),
             cache_root.to_string_lossy(),
@@ -110,6 +135,7 @@ impl TargetContract {
     fn canonicalized(&self, roots: &TargetRoots) -> Self {
         Self {
             target: roots.source_root.clone(),
+            allowed_contour_root: roots.allowed_contour_root.clone(),
             build_root: roots.target_root.clone(),
             cache_root: roots.cache_root.clone(),
             process_tree_id: self.process_tree_id.clone(),
@@ -178,6 +204,24 @@ fn declared_paths_overlap(left: &Path, right: &Path) -> bool {
     #[cfg(not(windows))]
     {
         false
+    }
+}
+
+fn strict_descendant(path: &Path, parent: &Path) -> bool {
+    if path == parent {
+        return false;
+    }
+    #[cfg(windows)]
+    {
+        let path = path.to_string_lossy().replace('/', "\\");
+        let parent = parent.to_string_lossy().replace('/', "\\");
+        let path = path.trim_end_matches('\\').to_ascii_lowercase();
+        let parent = parent.trim_end_matches('\\').to_ascii_lowercase();
+        return path.starts_with(&format!("{parent}\\"));
+    }
+    #[cfg(not(windows))]
+    {
+        path.starts_with(parent)
     }
 }
 
@@ -272,256 +316,11 @@ pub struct TestReceipt {
     pub generation: u64,
     pub authority_epoch: u64,
     pub invocation_digest: String,
+    pub allowed_contour_root: String,
     pub source_root: String,
     pub target_root: String,
     pub cache_root: String,
     pub state: String,
-}
-
-/// A raw process artifact handle retained before normalization.
-#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct RawArtifact {
-    pub handle: String,
-    pub content_type: String,
-    pub bytes: Vec<u8>,
-    pub length: u64,
-    pub sha256: String,
-    pub truncated: bool,
-}
-
-impl RawArtifact {
-    /// Captures immutable bytes and computes the digest over those bytes.
-    pub fn from_bytes(
-        handle: impl Into<String>,
-        content_type: impl Into<String>,
-        bytes: Vec<u8>,
-        truncated: bool,
-    ) -> Result<Self, TestdError> {
-        let artifact = Self {
-            handle: handle.into(),
-            content_type: content_type.into(),
-            length: bytes.len() as u64,
-            sha256: sha256_hex(&bytes),
-            bytes,
-            truncated,
-        };
-        artifact.validate()?;
-        Ok(artifact)
-    }
-
-    /// Revalidates the exact byte/digest/length correspondence.
-    pub fn validate(&self) -> Result<(), TestdError> {
-        if self.handle.trim().is_empty()
-            || self.content_type.trim().is_empty()
-            || self.handle.chars().any(char::is_control)
-            || self.content_type.chars().any(char::is_control)
-        {
-            return Err(TestdError::Invalid {
-                field: "raw_artifact",
-                reason: "handle and content_type must be non-blank and control-free",
-            });
-        }
-        if self.length != self.bytes.len() as u64 || sha256_hex(&self.bytes) != self.sha256 {
-            return Err(TestdError::InvalidBinding);
-        }
-        Ok(())
-    }
-}
-
-/// Observation-only normalized evidence.  It cannot grant verifier or finish
-/// authority and remains bound to one raw process handle.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct NormalizedEvidence {
-    pub kind: String,
-    pub summary: String,
-    pub raw_handles: Vec<String>,
-    pub execution: ExecutionStatus,
-}
-
-/// Candidate verification receipt emitted for an owning verifier to assess.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct VerificationReceipt {
-    pub job_id: String,
-    pub operation_id: String,
-    pub process_tree_id: String,
-    pub generation: u64,
-    pub authority_epoch: u64,
-    pub invocation_id: String,
-    pub invocation_digest: String,
-    pub source_root: String,
-    pub target_root: String,
-    pub cache_root: String,
-    pub execution: ExecutionStatus,
-    pub raw_artifacts: Vec<RawArtifact>,
-    pub normalized: Vec<NormalizedEvidence>,
-}
-
-impl VerificationReceipt {
-    /// Returns the exact durable identity tuple used by TestdStore::finish.
-    pub fn binding(&self) -> ReceiptBinding {
-        ReceiptBinding {
-            job_id: self.job_id.clone(),
-            operation_id: self.operation_id.clone(),
-            process_tree_id: self.process_tree_id.clone(),
-            generation: self.generation,
-            authority_epoch: self.authority_epoch,
-            invocation_id: self.invocation_id.clone(),
-            invocation_digest: self.invocation_digest.clone(),
-            source_root: self.source_root.clone(),
-            target_root: self.target_root.clone(),
-            cache_root: self.cache_root.clone(),
-        }
-    }
-
-    /// Validates identity and exact raw-handle lineage before publication.
-    pub fn validate(&self, job: &TestJob) -> Result<(), TestdError> {
-        job.target_roots.validate()?;
-        let binding = self.binding();
-        if binding.job_id != job.job_id
-            || binding.operation_id != job.process.operation_id
-            || binding.process_tree_id != job.process.process_tree_id
-            || binding.generation != job.process.generation
-            || binding.authority_epoch != job.process.authority_epoch
-            || binding.invocation_id != job.invocation.request.request_id.as_str()
-            || binding.invocation_digest != job.process.invocation_digest
-            || binding.source_root != job.target_roots.source_root
-            || binding.target_root != job.target_roots.target_root
-            || binding.cache_root != job.target_roots.cache_root
-        {
-            return Err(TestdError::InvalidBinding);
-        }
-        let mut artifacts = BTreeMap::new();
-        for artifact in &self.raw_artifacts {
-            artifact.validate()?;
-            if artifacts
-                .insert(artifact.handle.clone(), artifact)
-                .is_some()
-            {
-                return Err(TestdError::InvalidBinding);
-            }
-        }
-        let mut referenced = BTreeSet::new();
-        for evidence in &self.normalized {
-            for handle in &evidence.raw_handles {
-                if !referenced.insert(handle.clone()) || !artifacts.contains_key(handle) {
-                    return Err(TestdError::InvalidBinding);
-                }
-            }
-        }
-        if artifacts.len() != referenced.len() {
-            return Err(TestdError::InvalidBinding);
-        }
-        Ok(())
-    }
-}
-
-/// A bounded evidence sink for one testd operation.
-#[derive(Clone, Default)]
-pub struct EvidenceCollector {
-    records: Arc<Mutex<Vec<ProcessEvidence>>>,
-    raw_artifacts: Arc<Mutex<BTreeMap<String, RawArtifact>>>,
-}
-
-impl EvidenceCollector {
-    /// Returns a stable snapshot for receipt composition.
-    pub fn snapshot(&self) -> Vec<ProcessEvidence> {
-        self.records
-            .lock()
-            .map_or_else(|_| Vec::new(), |items| items.clone())
-    }
-
-    /// Captures bytes before normalization; the digest is always over bytes.
-    pub fn record_raw_artifact(
-        &self,
-        handle: impl Into<String>,
-        content_type: impl Into<String>,
-        bytes: Vec<u8>,
-        truncated: bool,
-    ) -> Result<(), TestdError> {
-        let artifact = RawArtifact::from_bytes(handle, content_type, bytes, truncated)?;
-        let mut artifacts = self
-            .raw_artifacts
-            .lock()
-            .map_err(|_| TestdError::Contract("evidence collector lock poisoned".to_owned()))?;
-        if let Some(existing) = artifacts.get(&artifact.handle) {
-            if existing != &artifact {
-                return Err(TestdError::InvalidBinding);
-            }
-        } else {
-            artifacts.insert(artifact.handle.clone(), artifact);
-        }
-        Ok(())
-    }
-
-    /// Builds an observation-only receipt from captured process handles.
-    pub fn verification_receipt(
-        &self,
-        job: &TestJob,
-        execution: ExecutionStatus,
-    ) -> VerificationReceipt {
-        let records = self.snapshot();
-        let raw = self
-            .raw_artifacts
-            .lock()
-            .map_or_else(|_| BTreeMap::new(), |artifacts| artifacts.clone());
-        let mut raw_artifacts = Vec::new();
-        let mut handles = BTreeSet::new();
-        for record in &records {
-            for handle in [record.stdout_ref(), record.stderr_ref()]
-                .into_iter()
-                .flatten()
-            {
-                if handles.insert(handle.to_owned())
-                    && let Some(artifact) = raw.get(handle)
-                {
-                    raw_artifacts.push(artifact.clone());
-                }
-            }
-        }
-        raw_artifacts.sort_by(|left, right| left.handle.cmp(&right.handle));
-        let normalized = records
-            .iter()
-            .map(|record| NormalizedEvidence {
-                kind: "process.observation".to_owned(),
-                summary: format!("process lifecycle: {:?}", record.view().lifecycle()),
-                raw_handles: [record.stdout_ref(), record.stderr_ref()]
-                    .into_iter()
-                    .flatten()
-                    .map(str::to_owned)
-                    .collect(),
-                execution,
-            })
-            .collect();
-        VerificationReceipt {
-            job_id: job.job_id.clone(),
-            operation_id: job.process.operation_id.clone(),
-            process_tree_id: job.process.process_tree_id.clone(),
-            generation: job.process.generation,
-            authority_epoch: job.process.authority_epoch,
-            invocation_id: job.invocation.request.request_id.as_str().to_owned(),
-            invocation_digest: job.process.invocation_digest.clone(),
-            source_root: job.target_roots.source_root.clone(),
-            target_root: job.target_roots.target_root.clone(),
-            cache_root: job.target_roots.cache_root.clone(),
-            execution,
-            raw_artifacts,
-            normalized,
-        }
-    }
-}
-
-impl ProcessEvidenceSink for EvidenceCollector {
-    fn record(&self, evidence: ProcessEvidence) -> Result<(), eliot_process::EvidenceSinkError> {
-        self.records
-            .lock()
-            .map_err(|_| eliot_process::EvidenceSinkError {
-                message: "evidence collector lock poisoned".to_owned(),
-            })
-            .map(|mut records| records.push(evidence))
-    }
 }
 
 /// Supplies a fresh consuming process request for each physical attempt.
@@ -690,6 +489,7 @@ fn receipt(job: &TestJob) -> TestReceipt {
         generation: job.process.generation,
         authority_epoch: job.process.authority_epoch,
         invocation_digest: job.process.invocation_digest.clone(),
+        allowed_contour_root: job.target_roots.allowed_contour_root.clone(),
         source_root: job.target_roots.source_root.clone(),
         target_root: job.target_roots.target_root.clone(),
         cache_root: job.target_roots.cache_root.clone(),
@@ -703,17 +503,6 @@ fn unix_ms() -> u64 {
         .map_or(0, |duration| {
             duration.as_millis().min(u128::from(u64::MAX)) as u64
         })
-}
-
-/// Stable content digest for a captured artifact handle payload.
-pub fn sha256_hex(bytes: &[u8]) -> String {
-    let mut digest = Sha256::new();
-    digest.update(bytes);
-    digest
-        .finalize()
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect()
 }
 
 /// Binary/protocol errors use the same typed TestdError surface.
@@ -747,6 +536,7 @@ mod tests {
 
         let substituted_cache = TargetContract {
             target: source.to_string_lossy().into_owned(),
+            allowed_contour_root: external.to_string_lossy().into_owned(),
             build_root: external.join("build").to_string_lossy().into_owned(),
             cache_root: external.join("cache").to_string_lossy().into_owned(),
             process_tree_id: "tree-a".to_owned(),
@@ -755,6 +545,7 @@ mod tests {
 
         let contained_build = TargetContract {
             target: source.to_string_lossy().into_owned(),
+            allowed_contour_root: external.to_string_lossy().into_owned(),
             build_root: source.join("build").to_string_lossy().into_owned(),
             cache_root: source.join("build").to_string_lossy().into_owned(),
             process_tree_id: "tree-a".to_owned(),
@@ -772,8 +563,14 @@ mod tests {
             false,
         )
         .unwrap();
-        assert_eq!(artifact.sha256, sha256_hex(b"actual stdout"));
+        assert_eq!(
+            artifact.sha256,
+            sha256_artifact(artifact.length, b"actual stdout")
+        );
         artifact.sha256 = sha256_hex(artifact.handle.as_bytes());
+        assert!(artifact.validate().is_err());
+        artifact.sha256 = sha256_artifact(artifact.length, &artifact.bytes);
+        artifact.length = artifact.length.saturating_add(1);
         assert!(artifact.validate().is_err());
     }
 }

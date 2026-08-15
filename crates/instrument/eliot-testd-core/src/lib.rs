@@ -13,9 +13,11 @@ use eliot_instrument_api::{
 use eliot_process::ProcessRequest;
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::cmp::Ordering;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Component, Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -133,6 +135,8 @@ impl ProcessAdmission {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TargetRoots {
+    /// Kernel/Governor-issued external execution contour.
+    pub allowed_contour_root: String,
     /// Source/worktree root used as the process working directory.
     pub source_root: String,
     /// Dedicated external Cargo target/build root.
@@ -144,11 +148,13 @@ pub struct TargetRoots {
 impl TargetRoots {
     /// Creates and validates a path-identity projection.
     pub fn new(
+        allowed_contour_root: impl Into<String>,
         source_root: impl Into<String>,
         target_root: impl Into<String>,
         cache_root: impl Into<String>,
     ) -> Result<Self, TestdError> {
         let roots = Self {
+            allowed_contour_root: allowed_contour_root.into(),
             source_root: source_root.into(),
             target_root: target_root.into(),
             cache_root: cache_root.into(),
@@ -159,6 +165,7 @@ impl TargetRoots {
 
     /// Revalidates immutable path identity before a later execution stage.
     pub fn validate(&self) -> Result<(), TestdError> {
+        let contour = validate_root_identity(&self.allowed_contour_root, "allowed_contour_root")?;
         let source = validate_root_identity(&self.source_root, "source_root")?;
         let target = validate_root_identity(&self.target_root, "target_root")?;
         let cache = validate_root_identity(&self.cache_root, "cache_root")?;
@@ -166,6 +173,18 @@ impl TargetRoots {
             return Err(TestdError::Invalid {
                 field: "cache_root",
                 reason: "must equal the canonical target_root in the active profile",
+            });
+        }
+        if paths_overlap(&contour, &source) {
+            return Err(TestdError::Invalid {
+                field: "allowed_contour_root",
+                reason: "external execution contour must not contain or be contained by source_root",
+            });
+        }
+        if !is_strict_descendant(&target, &contour) {
+            return Err(TestdError::Invalid {
+                field: "target_root",
+                reason: "must be a strict descendant of the allowed external execution contour",
             });
         }
         if paths_overlap(&source, &target) {
@@ -244,9 +263,253 @@ pub struct ReceiptBinding {
     pub authority_epoch: u64,
     pub invocation_id: String,
     pub invocation_digest: String,
+    pub allowed_contour_root: String,
     pub source_root: String,
     pub target_root: String,
     pub cache_root: String,
+}
+
+/// A raw process artifact captured before any normalization.
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RawArtifact {
+    pub handle: String,
+    pub content_type: String,
+    pub bytes: Vec<u8>,
+    pub length: u64,
+    pub sha256: String,
+    pub truncated: bool,
+}
+
+impl RawArtifact {
+    /// Captures immutable bytes and computes a length-domain-separated digest.
+    pub fn from_bytes(
+        handle: impl Into<String>,
+        content_type: impl Into<String>,
+        bytes: Vec<u8>,
+        truncated: bool,
+    ) -> Result<Self, TestdError> {
+        let length = bytes.len() as u64;
+        let sha256 = sha256_artifact(length, &bytes);
+        let artifact = Self {
+            handle: handle.into(),
+            content_type: content_type.into(),
+            bytes,
+            length,
+            sha256,
+            truncated,
+        };
+        artifact.validate()?;
+        Ok(artifact)
+    }
+
+    /// Revalidates exact bytes, canonical length, and digest correspondence.
+    pub fn validate(&self) -> Result<(), TestdError> {
+        if self.handle.trim().is_empty()
+            || self.content_type.trim().is_empty()
+            || self.handle.chars().any(char::is_control)
+            || self.content_type.chars().any(char::is_control)
+        {
+            return Err(TestdError::Invalid {
+                field: "raw_artifact",
+                reason: "handle and content_type must be non-blank and control-free",
+            });
+        }
+        if self.length != self.bytes.len() as u64
+            || sha256_artifact(self.length, &self.bytes) != self.sha256
+        {
+            return Err(TestdError::InvalidBinding);
+        }
+        Ok(())
+    }
+}
+
+/// Observation-only normalized evidence bound to raw process handles.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NormalizedEvidence {
+    pub kind: String,
+    pub summary: String,
+    pub raw_handles: Vec<String>,
+    pub execution: ExecutionStatus,
+}
+
+/// Candidate verification receipt accepted by the canonical finish boundary.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VerificationReceipt {
+    pub job_id: String,
+    pub operation_id: String,
+    pub process_tree_id: String,
+    pub generation: u64,
+    pub authority_epoch: u64,
+    pub invocation_id: String,
+    pub invocation_digest: String,
+    pub allowed_contour_root: String,
+    pub source_root: String,
+    pub target_root: String,
+    pub cache_root: String,
+    pub execution: ExecutionStatus,
+    pub raw_artifacts: Vec<RawArtifact>,
+    pub normalized: Vec<NormalizedEvidence>,
+}
+
+impl VerificationReceipt {
+    /// Returns the exact durable identity tuple after validation.
+    pub fn binding(&self) -> ReceiptBinding {
+        ReceiptBinding {
+            job_id: self.job_id.clone(),
+            operation_id: self.operation_id.clone(),
+            process_tree_id: self.process_tree_id.clone(),
+            generation: self.generation,
+            authority_epoch: self.authority_epoch,
+            invocation_id: self.invocation_id.clone(),
+            invocation_digest: self.invocation_digest.clone(),
+            allowed_contour_root: self.allowed_contour_root.clone(),
+            source_root: self.source_root.clone(),
+            target_root: self.target_root.clone(),
+            cache_root: self.cache_root.clone(),
+        }
+    }
+
+    /// Validates identity and exact raw-handle lineage before publication.
+    pub fn validate(&self, job: &TestJob) -> Result<(), TestdError> {
+        job.target_roots.validate()?;
+        let binding = self.binding();
+        validate_receipt_binding(job, &binding)?;
+        let mut artifacts = BTreeMap::new();
+        for artifact in &self.raw_artifacts {
+            artifact.validate()?;
+            if artifacts
+                .insert(artifact.handle.clone(), artifact)
+                .is_some()
+            {
+                return Err(TestdError::InvalidBinding);
+            }
+        }
+        let mut referenced = BTreeSet::new();
+        for evidence in &self.normalized {
+            for handle in &evidence.raw_handles {
+                if !referenced.insert(handle.clone()) || !artifacts.contains_key(handle) {
+                    return Err(TestdError::InvalidBinding);
+                }
+            }
+        }
+        if artifacts.len() != referenced.len() {
+            return Err(TestdError::InvalidBinding);
+        }
+        Ok(())
+    }
+}
+
+/// A bounded evidence sink for one testd operation.
+#[derive(Clone, Default)]
+pub struct EvidenceCollector {
+    records: Arc<Mutex<Vec<eliot_process::ProcessEvidence>>>,
+    raw_artifacts: Arc<Mutex<BTreeMap<String, RawArtifact>>>,
+}
+
+impl EvidenceCollector {
+    /// Returns a stable snapshot for receipt composition.
+    pub fn snapshot(&self) -> Vec<eliot_process::ProcessEvidence> {
+        self.records
+            .lock()
+            .map_or_else(|_| Vec::new(), |items| items.clone())
+    }
+
+    /// Captures bytes before normalization; the digest is always over bytes.
+    pub fn record_raw_artifact(
+        &self,
+        handle: impl Into<String>,
+        content_type: impl Into<String>,
+        bytes: Vec<u8>,
+        truncated: bool,
+    ) -> Result<(), TestdError> {
+        let artifact = RawArtifact::from_bytes(handle, content_type, bytes, truncated)?;
+        let mut artifacts = self
+            .raw_artifacts
+            .lock()
+            .map_err(|_| TestdError::Contract("evidence collector lock poisoned".to_owned()))?;
+        if let Some(existing) = artifacts.get(&artifact.handle) {
+            if existing != &artifact {
+                return Err(TestdError::InvalidBinding);
+            }
+        } else {
+            artifacts.insert(artifact.handle.clone(), artifact);
+        }
+        Ok(())
+    }
+
+    /// Builds an observation-only receipt from captured process handles.
+    pub fn verification_receipt(
+        &self,
+        job: &TestJob,
+        execution: ExecutionStatus,
+    ) -> VerificationReceipt {
+        let records = self.snapshot();
+        let raw = self
+            .raw_artifacts
+            .lock()
+            .map_or_else(|_| BTreeMap::new(), |artifacts| artifacts.clone());
+        let mut raw_artifacts = Vec::new();
+        let mut handles = BTreeSet::new();
+        for record in &records {
+            for handle in [record.stdout_ref(), record.stderr_ref()]
+                .into_iter()
+                .flatten()
+            {
+                if handles.insert(handle.to_owned())
+                    && let Some(artifact) = raw.get(handle)
+                {
+                    raw_artifacts.push(artifact.clone());
+                }
+            }
+        }
+        raw_artifacts.sort_by(|left, right| left.handle.cmp(&right.handle));
+        let normalized = records
+            .iter()
+            .map(|record| NormalizedEvidence {
+                kind: "process.observation".to_owned(),
+                summary: format!("process lifecycle: {:?}", record.view().lifecycle()),
+                raw_handles: [record.stdout_ref(), record.stderr_ref()]
+                    .into_iter()
+                    .flatten()
+                    .map(str::to_owned)
+                    .collect(),
+                execution,
+            })
+            .collect();
+        VerificationReceipt {
+            job_id: job.job_id.clone(),
+            operation_id: job.process.operation_id.clone(),
+            process_tree_id: job.process.process_tree_id.clone(),
+            generation: job.process.generation,
+            authority_epoch: job.process.authority_epoch,
+            invocation_id: job.invocation.request.request_id.as_str().to_owned(),
+            invocation_digest: job.process.invocation_digest.clone(),
+            allowed_contour_root: job.target_roots.allowed_contour_root.clone(),
+            source_root: job.target_roots.source_root.clone(),
+            target_root: job.target_roots.target_root.clone(),
+            cache_root: job.target_roots.cache_root.clone(),
+            execution,
+            raw_artifacts,
+            normalized,
+        }
+    }
+}
+
+impl eliot_process::ProcessEvidenceSink for EvidenceCollector {
+    fn record(
+        &self,
+        evidence: eliot_process::ProcessEvidence,
+    ) -> Result<(), eliot_process::EvidenceSinkError> {
+        self.records
+            .lock()
+            .map_err(|_| eliot_process::EvidenceSinkError {
+                message: "evidence collector lock poisoned".to_owned(),
+            })
+            .map(|mut records| records.push(evidence))
+    }
 }
 
 /// Append-only explanation for every durable lifecycle mutation.
@@ -355,6 +618,13 @@ impl TestdStore {
             return Err(TestdError::WrongInstrumentKind);
         }
         if invocation.request.request_id.as_str() != process.operation_id().as_str() {
+            return Err(TestdError::InvalidBinding);
+        }
+        if invocation.request.state_fence.authority_epoch.value()
+            != process.fence().authority_epoch()
+            || invocation.request.state_fence.resource_generation.value()
+                != process.generation().get()
+        {
             return Err(TestdError::InvalidBinding);
         }
         target_roots.validate()?;
@@ -497,7 +767,7 @@ impl TestdStore {
         lease: &Lease,
         execution: ExecutionStatus,
         verification: Option<VerificationRun>,
-        receipt: &ReceiptBinding,
+        receipt: &VerificationReceipt,
         now: u64,
         reason: Option<String>,
     ) -> Result<TestJob, TestdError> {
@@ -512,16 +782,21 @@ impl TestdStore {
         if !lease_matches(&job, lease, now) {
             return Err(TestdError::LeaseRejected(job_id.to_owned()));
         }
-        validate_receipt_binding(&job, receipt)?;
+        receipt.validate(&job)?;
+        if receipt.execution != execution {
+            return Err(TestdError::InvalidBinding);
+        }
+        let binding = receipt.binding();
         if let Some(run) = &verification
-            && run.invocation_id.as_str() != job.invocation.request.request_id.as_str()
+            && (run.invocation_id.as_str() != job.invocation.request.request_id.as_str()
+                || run.state_fence != job.invocation.request.state_fence)
         {
             return Err(TestdError::InvalidBinding);
         }
         let previous = job.state;
         job.execution = Some(execution);
         job.verification = verification;
-        job.receipt = Some(receipt.clone());
+        job.receipt = Some(binding);
         job.lease = None;
         let retryable = matches!(
             execution,
@@ -760,6 +1035,24 @@ fn paths_overlap(left: &Path, right: &Path) -> bool {
     left == right || left.starts_with(right) || right.starts_with(left)
 }
 
+fn is_strict_descendant(path: &Path, parent: &Path) -> bool {
+    if path == parent {
+        return false;
+    }
+    #[cfg(windows)]
+    {
+        let path = path.to_string_lossy().replace('/', "\\");
+        let parent = parent.to_string_lossy().replace('/', "\\");
+        let path = path.trim_end_matches('\\').to_ascii_lowercase();
+        let parent = parent.trim_end_matches('\\').to_ascii_lowercase();
+        return path.starts_with(&format!("{parent}\\"));
+    }
+    #[cfg(not(windows))]
+    {
+        path.starts_with(parent)
+    }
+}
+
 fn validate_receipt_binding(job: &TestJob, receipt: &ReceiptBinding) -> Result<(), TestdError> {
     job.target_roots.validate()?;
     let matches = receipt.job_id == job.job_id
@@ -769,6 +1062,7 @@ fn validate_receipt_binding(job: &TestJob, receipt: &ReceiptBinding) -> Result<(
         && receipt.authority_epoch == job.process.authority_epoch
         && receipt_invocation_matches(receipt, job.invocation.request.request_id.as_str())
         && receipt.invocation_digest == job.process.invocation_digest
+        && receipt.allowed_contour_root == job.target_roots.allowed_contour_root
         && receipt.source_root == job.target_roots.source_root
         && receipt.target_root == job.target_roots.target_root
         && receipt.cache_root == job.target_roots.cache_root;
@@ -885,6 +1179,30 @@ fn append_event(
     Ok(())
 }
 
+/// Computes a lowercase SHA-256 digest over bytes only.
+pub fn sha256_hex(bytes: &[u8]) -> String {
+    let mut output = String::with_capacity(64);
+    for byte in Sha256::digest(bytes) {
+        output.push_str(&format!("{byte:02x}"));
+    }
+    output
+}
+
+/// Computes a length-domain-separated SHA-256 digest for one raw artifact.
+///
+/// The fixed-width big-endian length prefix makes the encoded tuple
+/// unambiguous and prevents a detached length field from being accepted.
+pub fn sha256_artifact(length: u64, bytes: &[u8]) -> String {
+    let mut digest = Sha256::new();
+    digest.update(length.to_be_bytes());
+    digest.update(bytes);
+    let mut output = String::with_capacity(64);
+    for byte in digest.finalize() {
+        output.push_str(&format!("{byte:02x}"));
+    }
+    output
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -934,6 +1252,7 @@ mod tests {
             authority_epoch: 1,
             invocation_id: "invocation-a".to_owned(),
             invocation_digest: "digest".to_owned(),
+            allowed_contour_root: "contour".to_owned(),
             source_root: "source".to_owned(),
             target_root: "target".to_owned(),
             cache_root: "target".to_owned(),
