@@ -109,6 +109,22 @@ fn handle(value: &PlatformHandle, field: &str) -> Result<(), InstallationError> 
     text(value.as_str(), field)
 }
 
+fn sha256_handle(value: &PlatformHandle, field: &str) -> Result<(), InstallationError> {
+    handle(value, field)?;
+    if value.as_str().len() != 64
+        || !value
+            .as_str()
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    {
+        return Err(InstallationError::InvalidField {
+            field: field.to_owned(),
+            reason: "must be a lowercase SHA-256 digest".to_owned(),
+        });
+    }
+    Ok(())
+}
+
 fn handles(
     values: &[PlatformHandle],
     field: &str,
@@ -476,6 +492,8 @@ pub struct CandidateManifest {
     pub license_refs: Vec<PlatformHandle>,
     /// Candidate configuration digest.
     pub config_digest: PlatformHandle,
+    /// Installation-approved public-key fingerprint for supervision leases.
+    pub supervision_key_fingerprint: PlatformHandle,
     /// Signature/approval evidence reference.
     pub signature_ref: PlatformHandle,
 }
@@ -492,7 +510,11 @@ impl CandidateManifest {
             true,
         )?;
         handles(&self.license_refs, "manifest.license_refs", true)?;
-        handle(&self.config_digest, "manifest.config_digest")?;
+        sha256_handle(&self.config_digest, "manifest.config_digest")?;
+        sha256_handle(
+            &self.supervision_key_fingerprint,
+            "manifest.supervision_key_fingerprint",
+        )?;
         handle(&self.signature_ref, "manifest.signature_ref")
     }
 }

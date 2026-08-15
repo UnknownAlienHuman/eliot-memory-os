@@ -38,22 +38,31 @@ fn run_watchdog(stop_signal: Arc<AtomicBool>) -> Result<(), String> {
         .join("Eliot")
         .join("host")
         .join("supervision-lease.json");
+    let admission_config_path = program_data
+        .join("Eliot")
+        .join("host")
+        .join("watchdog-admission.json");
+    let registry_path = program_data
+        .join("Eliot")
+        .join("host")
+        .join("installation-registry.redb");
     // The lease is issued by the Host/Kernel contour.  There is deliberately
     // no genesis/default lease in this process: stale or missing durable bytes
     // fail closed before the watchdog can advertise readiness.
-    let lease = load_supervision_lease(&lease_path).map_err(|error| error.to_string())?;
+    let admission = load_supervision_lease(&lease_path, &admission_config_path, &registry_path)
+        .map_err(|error| error.to_string())?;
     let sensor = Arc::new(
         IndependentKernelSensor::open_program_data(
             PathBuf::from("Eliot")
                 .join("watchdog")
                 .join("protected-spool.jsonl"),
-            lease.watchdog_epoch.value(),
+            admission.watchdog_epoch().value(),
         )
         .map_err(|error| error.to_string())?,
     );
     let composition = WatchdogComposition::start_with_shutdown(
         WatchdogConfig::default(),
-        lease,
+        admission.lease().clone(),
         sensor,
         stop_signal,
     )

@@ -1837,6 +1837,7 @@ name = "eliot-watchdog"
 version = "0.1.0"
 dependencies = [
  "eliot-contracts",
+ "eliot-installation",
  "eliot-runtime",
  "eliot-runtime-contracts",
  "eliot-watchdog-core",

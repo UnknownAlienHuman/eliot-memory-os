@@ -697,6 +697,16 @@ impl VerifiedSupervisionLease {
         &self.0
     }
 
+    /// Returns the authenticated canonical payload digest.
+    pub fn payload_digest(&self) -> Result<String, SupervisionLeaseError> {
+        self.0.digest()
+    }
+
+    /// Returns the authenticated committed ORS lease revision.
+    pub const fn lease_revision(&self) -> u64 {
+        self.0.ors_mirror.lease_revision
+    }
+
     /// Consumes the wrapper and returns the authenticated payload.
     pub fn into_lease(self) -> SupervisionLease {
         self.0
