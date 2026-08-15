@@ -13,12 +13,12 @@ use std::sync::Arc;
 use eliot_instrument_api::{InstrumentContractError, InstrumentInvocation};
 use eliot_platform_windows::WindowsPlatform;
 use eliot_process::{
-    ProcessEvidenceSink, ProcessExecutionError, ProcessExecutor, ProcessRequest,
-    ProcessStartReceipt,
+    ProcessEvidenceSink, ProcessExecutionError, ProcessExecutor, ProcessStartReceipt,
 };
 use eliot_process_executor::{DispatchValidationPort, WindowsProcessExecutor};
 use eliot_testd_core::{
-    Lease, TargetRoots, TestJob, TestdError, TestdStore, validate_running_lease,
+    Lease, ProcessAdmissionPermit, TargetRoots, TestJob, TestdError, TestdStore,
+    validate_running_lease,
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -40,30 +40,25 @@ pub const MAX_PROFILE_ARGUMENTS: usize = 128;
 pub struct TargetContract {
     /// Source/worktree target, never interpreted as a shell command.
     pub target: String,
-    /// Kernel/Governor-issued external execution contour.
-    pub allowed_contour_root: String,
     /// Dedicated build output root.
     pub build_root: String,
     /// Dedicated dependency/cache root.
     pub cache_root: String,
-    /// Process-tree identity assigned by the authority.
-    pub process_tree_id: String,
 }
 
 impl TargetContract {
     /// Validates and canonicalizes the source and isolated external roots.
-    pub fn validate(&self) -> Result<(), TestdError> {
-        self.validated_roots().map(|_| ())
+    pub fn validate(&self, contour_root: &str) -> Result<(), TestdError> {
+        self.validated_roots(contour_root).map(|_| ())
     }
 
     /// Returns the exact roots that are persisted with the durable job.
-    pub fn validated_roots(&self) -> Result<TargetRoots, TestdError> {
+    pub fn validated_roots(&self, contour_root: &str) -> Result<TargetRoots, TestdError> {
         for (field, value) in [
             ("target", self.target.as_str()),
-            ("allowed_contour_root", self.allowed_contour_root.as_str()),
             ("build_root", self.build_root.as_str()),
             ("cache_root", self.cache_root.as_str()),
-            ("process_tree_id", self.process_tree_id.as_str()),
+            ("allowed_contour_root", contour_root),
         ] {
             if value.trim().is_empty() || value.chars().any(char::is_control) {
                 return Err(TestdError::Invalid {
@@ -73,14 +68,9 @@ impl TargetContract {
             }
         }
         let source_root = canonical_existing_root(Path::new(&self.target), "target")?;
-        let contour_root = canonical_existing_root(
-            Path::new(&self.allowed_contour_root),
-            "allowed_contour_root",
-        )?;
-        if declared_paths_overlap(
-            Path::new(&self.target),
-            Path::new(&self.allowed_contour_root),
-        ) {
+        let contour_root =
+            canonical_existing_root(Path::new(contour_root), "allowed_contour_root")?;
+        if declared_paths_overlap(Path::new(&self.target), &contour_root) {
             return Err(TestdError::Invalid {
                 field: "allowed_contour_root",
                 reason: "external execution contour must not contain or be contained by target",
@@ -130,16 +120,6 @@ impl TargetContract {
             target_root.to_string_lossy(),
             cache_root.to_string_lossy(),
         )
-    }
-
-    fn canonicalized(&self, roots: &TargetRoots) -> Self {
-        Self {
-            target: roots.source_root.clone(),
-            allowed_contour_root: roots.allowed_contour_root.clone(),
-            build_root: roots.target_root.clone(),
-            cache_root: roots.cache_root.clone(),
-            process_tree_id: self.process_tree_id.clone(),
-        }
     }
 }
 
@@ -329,7 +309,7 @@ pub trait ProcessRequestIssuer: Send + Sync {
         &self,
         invocation: &InstrumentInvocation,
         target: &TargetContract,
-    ) -> Result<ProcessRequest, TestdError>;
+    ) -> Result<ProcessAdmissionPermit, TestdError>;
 }
 
 /// Explicit failure issuer used by the standalone line protocol until Kernel
@@ -341,7 +321,7 @@ impl ProcessRequestIssuer for UnavailableProcessIssuer {
         &self,
         _invocation: &InstrumentInvocation,
         _target: &TargetContract,
-    ) -> Result<ProcessRequest, TestdError> {
+    ) -> Result<ProcessAdmissionPermit, TestdError> {
         Err(TestdError::Contract(
             "Kernel-issued ProcessRequest is required".to_owned(),
         ))
@@ -368,8 +348,6 @@ impl TestdComposition {
 
     /// Admits one exact typed profile through TestdJob/Fence admission.
     pub fn submit(&self, request: TestdJobRequest) -> Result<TestReceipt, TestdError> {
-        let roots = request.target_contract.validated_roots()?;
-        let target_contract = request.target_contract.canonicalized(&roots);
         request
             .invocation
             .validate()
@@ -380,12 +358,17 @@ impl TestdComposition {
                 reason: "profile argument limit exceeded",
             });
         }
-        let process = self.issuer.issue(&request.invocation, &target_contract)?;
+        let permit = self
+            .issuer
+            .issue(&request.invocation, &request.target_contract)?;
+        let roots = request
+            .target_contract
+            .validated_roots(permit.grant().contour_root())?;
         let job = self.store.submit(
             request.job_id,
             request.project_id,
             request.invocation,
-            process,
+            permit,
             roots,
             request.priority,
             unix_ms(),
@@ -430,7 +413,7 @@ impl TestdComposition {
         job: &TestJob,
         lease: &Lease,
         now: u64,
-        request: ProcessRequest,
+        permit: ProcessAdmissionPermit,
         executor: &E,
         sink: Arc<dyn ProcessEvidenceSink>,
     ) -> Result<ProcessStartReceipt, TestdError> {
@@ -443,9 +426,18 @@ impl TestdComposition {
             })?;
         validate_running_lease(&current, lease, now)?;
         current.target_roots.validate()?;
+        let (request, grant) = permit.into_parts();
         request
             .validate()
             .map_err(|error| TestdError::Contract(error.to_string()))?;
+        grant.validate_for_process(
+            &current.job_id,
+            current.invocation.request.request_id.as_str(),
+            &request,
+        )?;
+        if grant.contour_root() != current.target_roots.allowed_contour_root {
+            return Err(TestdError::InvalidBinding);
+        }
         let operation_id = request.operation_id().clone();
         let request_job_id = request.job_id().as_str().to_owned();
         let process_tree_id = request.process_tree_id().as_str().to_owned();
@@ -536,21 +528,32 @@ mod tests {
 
         let substituted_cache = TargetContract {
             target: source.to_string_lossy().into_owned(),
-            allowed_contour_root: external.to_string_lossy().into_owned(),
             build_root: external.join("build").to_string_lossy().into_owned(),
             cache_root: external.join("cache").to_string_lossy().into_owned(),
-            process_tree_id: "tree-a".to_owned(),
         };
-        assert!(substituted_cache.validated_roots().is_err());
+        assert!(
+            substituted_cache
+                .validated_roots(external.to_string_lossy().as_ref())
+                .is_err()
+        );
 
         let contained_build = TargetContract {
             target: source.to_string_lossy().into_owned(),
-            allowed_contour_root: external.to_string_lossy().into_owned(),
             build_root: source.join("build").to_string_lossy().into_owned(),
             cache_root: source.join("build").to_string_lossy().into_owned(),
-            process_tree_id: "tree-a".to_owned(),
         };
-        assert!(contained_build.validated_roots().is_err());
+        assert!(
+            contained_build
+                .validated_roots(external.to_string_lossy().as_ref())
+                .is_err()
+        );
+        let forged = serde_json::json!({
+            "target": source.to_string_lossy(),
+            "build_root": external.join("build").to_string_lossy(),
+            "cache_root": external.join("build").to_string_lossy(),
+            "allowed_contour_root": source.to_string_lossy(),
+        });
+        assert!(serde_json::from_value::<TargetContract>(forged).is_err());
         std::fs::remove_dir_all(base).unwrap();
     }
 

@@ -131,6 +131,165 @@ impl ProcessAdmission {
     }
 }
 
+/// Governor/Kernel-issued external execution contour grant.
+///
+/// Fields are private and the grant is neither deserializable nor cloneable.
+/// Only the injected issuer boundary can produce the consuming permit that
+/// carries this grant with its one-shot [`ProcessRequest`].
+#[derive(Debug, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExecutionContourGrant {
+    contour_root: String,
+    job_id: String,
+    invocation_id: String,
+    operation_id: String,
+    process_tree_id: String,
+    authority_epoch: u64,
+    resource_generation: u64,
+    grant_id: String,
+    grant_digest: String,
+}
+
+impl ExecutionContourGrant {
+    /// Constructs a grant inside the trusted issuer boundary.
+    ///
+    /// The N4 Kernel/Governor adapter is the only caller. Keeping this seam
+    /// crate-private prevents a deserialized or ordinary caller-owned value
+    /// from minting execution authority.
+    #[allow(dead_code)]
+    pub(crate) fn issue(
+        contour_root: impl Into<String>,
+        job_id: impl Into<String>,
+        invocation_id: impl Into<String>,
+        process: &ProcessRequest,
+        grant_id: impl Into<String>,
+    ) -> Result<Self, TestdError> {
+        let grant = Self {
+            contour_root: contour_root.into(),
+            job_id: job_id.into(),
+            invocation_id: invocation_id.into(),
+            operation_id: process.operation_id().as_str().to_owned(),
+            process_tree_id: process.process_tree_id().as_str().to_owned(),
+            authority_epoch: process.fence().authority_epoch(),
+            resource_generation: process.generation().get(),
+            grant_id: grant_id.into(),
+            grant_digest: String::new(),
+        };
+        grant.with_digest()
+    }
+
+    #[allow(dead_code)]
+    fn with_digest(mut self) -> Result<Self, TestdError> {
+        for (field, value) in [
+            ("contour_root", self.contour_root.as_str()),
+            ("job_id", self.job_id.as_str()),
+            ("invocation_id", self.invocation_id.as_str()),
+            ("operation_id", self.operation_id.as_str()),
+            ("process_tree_id", self.process_tree_id.as_str()),
+            ("grant_id", self.grant_id.as_str()),
+        ] {
+            validate_text(value, field)?;
+        }
+        self.grant_digest = contour_grant_digest(&self);
+        Ok(self)
+    }
+
+    /// Returns the issuer-selected contour root; it grants no authority alone.
+    pub fn contour_root(&self) -> &str {
+        &self.contour_root
+    }
+
+    pub fn validate_for_process(
+        &self,
+        job_id: &str,
+        invocation_id: &str,
+        process: &ProcessRequest,
+    ) -> Result<(), TestdError> {
+        self.validate_integrity()?;
+        if self.job_id != job_id
+            || self.invocation_id != invocation_id
+            || self.operation_id != process.operation_id().as_str()
+            || self.process_tree_id != process.process_tree_id().as_str()
+            || self.authority_epoch != process.fence().authority_epoch()
+            || self.resource_generation != process.generation().get()
+        {
+            return Err(TestdError::InvalidBinding);
+        }
+        Ok(())
+    }
+
+    fn validate_integrity(&self) -> Result<(), TestdError> {
+        for (field, value) in [
+            ("contour_root", self.contour_root.as_str()),
+            ("job_id", self.job_id.as_str()),
+            ("invocation_id", self.invocation_id.as_str()),
+            ("operation_id", self.operation_id.as_str()),
+            ("process_tree_id", self.process_tree_id.as_str()),
+            ("grant_id", self.grant_id.as_str()),
+        ] {
+            validate_text(value, field)?;
+        }
+        if self.grant_digest != contour_grant_digest(self) {
+            return Err(TestdError::InvalidBinding);
+        }
+        Ok(())
+    }
+}
+
+/// One-shot Kernel process permit plus its immutable external-contour grant.
+///
+/// This type intentionally has no `Clone`, `Serialize`, or `Deserialize`
+/// implementation. The issuer is the sole provenance boundary.
+#[derive(Debug)]
+pub struct ProcessAdmissionPermit {
+    request: ProcessRequest,
+    grant: ExecutionContourGrant,
+}
+
+impl ProcessAdmissionPermit {
+    /// Seals the consuming request with the issuer's already-bound grant.
+    ///
+    /// This remains crate-private with the grant constructor so only the
+    /// injected authority adapter can establish permit provenance.
+    #[allow(dead_code)]
+    pub(crate) fn issued(
+        request: ProcessRequest,
+        grant: ExecutionContourGrant,
+    ) -> Result<Self, TestdError> {
+        grant.validate_for_process(request.job_id().as_str(), &grant.invocation_id, &request)?;
+        Ok(Self { request, grant })
+    }
+
+    /// Borrows the consuming request for pre-consumption validation only.
+    pub fn request(&self) -> &ProcessRequest {
+        &self.request
+    }
+
+    /// Borrows the issuer grant without exposing mutable construction.
+    pub fn grant(&self) -> &ExecutionContourGrant {
+        &self.grant
+    }
+
+    pub fn into_parts(self) -> (ProcessRequest, ExecutionContourGrant) {
+        (self.request, self.grant)
+    }
+}
+
+fn contour_grant_digest(grant: &ExecutionContourGrant) -> String {
+    let bytes = serde_json::to_vec(&(
+        &grant.contour_root,
+        &grant.job_id,
+        &grant.invocation_id,
+        &grant.operation_id,
+        &grant.process_tree_id,
+        grant.authority_epoch,
+        grant.resource_generation,
+        &grant.grant_id,
+    ))
+    .unwrap_or_default();
+    blake3::hash(&bytes).to_hex().to_string()
+}
+
 /// Canonical roots bound to one isolated execution job.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -599,7 +758,7 @@ impl TestdStore {
         job_id: impl Into<String>,
         project_id: impl Into<String>,
         invocation: InstrumentInvocation,
-        process: ProcessRequest,
+        permit: ProcessAdmissionPermit,
         target_roots: TargetRoots,
         priority: i32,
         at_ms: u64,
@@ -611,9 +770,11 @@ impl TestdStore {
         invocation
             .validate()
             .map_err(|error| TestdError::Contract(error.to_string()))?;
+        let (process, grant) = permit.into_parts();
         process
             .validate()
             .map_err(|error| TestdError::Contract(error.to_string()))?;
+        grant.validate_for_process(&job_id, invocation.request.request_id.as_str(), &process)?;
         if !matches!(invocation.kind, InstrumentKind::Test) {
             return Err(TestdError::WrongInstrumentKind);
         }
@@ -627,6 +788,8 @@ impl TestdStore {
         {
             return Err(TestdError::InvalidBinding);
         }
+        let mut target_roots = target_roots;
+        target_roots.allowed_contour_root = grant.contour_root.clone();
         target_roots.validate()?;
         let digest = payload_digest(&invocation, &process, &target_roots, priority)?;
         let process = ProcessAdmission::from_request(&process);
@@ -1259,5 +1422,23 @@ mod tests {
         };
         assert!(receipt_invocation_matches(&receipt, "invocation-a"));
         assert!(!receipt_invocation_matches(&receipt, "invocation-b"));
+    }
+
+    #[test]
+    fn forged_contour_cannot_widen_issuer_grant() {
+        let mut grant = ExecutionContourGrant {
+            contour_root: "C:\\approved-contour".to_owned(),
+            job_id: "job".to_owned(),
+            invocation_id: "invocation".to_owned(),
+            operation_id: "operation".to_owned(),
+            process_tree_id: "tree".to_owned(),
+            authority_epoch: 7,
+            resource_generation: 3,
+            grant_id: "grant-1".to_owned(),
+            grant_digest: String::new(),
+        };
+        grant.grant_digest = contour_grant_digest(&grant);
+        grant.contour_root = "C:\\caller-widened-contour".to_owned();
+        assert!(grant.validate_integrity().is_err());
     }
 }
