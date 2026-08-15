@@ -160,6 +160,12 @@ const SPOOL_MAX_BYTES: u64 = 4 * 1024 * 1024;
 const SPOOL_MAX_RECORD_BYTES: usize = 64 * 1024;
 const SPOOL_RELATIVE_PATH: &str = "Eliot/watchdog/watchdog.redb";
 const SPOOL_TABLE: TableDefinition<u64, &[u8]> = TableDefinition::new("eliot_watchdog_spool_v1");
+// The high-water record deliberately lives in a different redb table from
+// the bounded observation records.  A damaged header or record must not be
+// able to make recovery reuse an identity that was already allocated.
+const SPOOL_HIGH_WATER_KEY: u64 = 0;
+const SPOOL_HIGH_WATER_TABLE: TableDefinition<u64, &[u8]> =
+    TableDefinition::new("eliot_watchdog_spool_high_water_v1");
 
 #[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields)]
@@ -169,6 +175,13 @@ struct WatchdogSpoolHeader {
     first_sequence: u64,
     record_count: u64,
     bytes: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+struct WatchdogSpoolHighWater {
+    schema_version: u16,
+    high_water_sequence: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
@@ -270,6 +283,12 @@ impl WatchdogSpool {
             .map_err(|error| SpoolError::Corrupt(format!("invalid spool header: {error}")))?;
         let entries = collect_entries(&table)?;
         validate_header(&header, &entries)?;
+        let high_water = read.open_table(SPOOL_HIGH_WATER_TABLE).map_err(|error| {
+            SpoolError::Corrupt(format!("high-water metadata is unavailable: {error}"))
+        })?;
+        let high_water = read_high_water(&high_water)?
+            .ok_or_else(|| SpoolError::Corrupt("high-water metadata is missing".to_owned()))?;
+        validate_high_water(&header, &entries, high_water)?;
         Ok(entries)
     }
 
@@ -299,12 +318,46 @@ impl WatchdogSpool {
         let parsed_header = header
             .as_ref()
             .and_then(|value| serde_json::from_slice::<WatchdogSpoolHeader>(value.value()).ok());
+        let high_water_table = match read.open_table(SPOOL_HIGH_WATER_TABLE) {
+            Ok(table) => Some(table),
+            Err(redb::TableError::TableDoesNotExist(_)) => None,
+            Err(error) => return Err(SpoolError::Database(error.to_string())),
+        };
+        let parsed_high_water = high_water_table
+            .as_ref()
+            .map(read_high_water)
+            .transpose()?
+            .flatten();
         let valid = parsed_header
             .as_ref()
             .zip(entries.as_ref().ok())
-            .is_some_and(|(header, entries)| validate_header(header, entries).is_ok());
+            .is_some_and(|(header, entries)| {
+                validate_header(header, entries).is_ok()
+                    && parsed_high_water.is_some_and(|high_water| {
+                        validate_high_water(header, entries, high_water).is_ok()
+                    })
+            });
         if valid {
             return Ok(());
+        }
+        // A pre-high-water database can be upgraded only while its original
+        // header and records are still trustworthy.  Once either is damaged,
+        // missing independent metadata means sequence continuity cannot be
+        // proven, so recovery fails closed instead of guessing sequence one.
+        if parsed_high_water.is_none()
+            && parsed_header
+                .as_ref()
+                .zip(entries.as_ref().ok())
+                .is_some_and(|(header, entries)| validate_header(header, entries).is_ok())
+        {
+            let header = parsed_header.expect("header was checked above");
+            let entries = entries.expect("entries were checked above");
+            let high_water = header.next_sequence.saturating_sub(1);
+            validate_high_water(&header, &entries, high_water)?;
+            drop(high_water_table);
+            drop(table);
+            drop(read);
+            return self.write_high_water(high_water);
         }
         let corrupt_digest = header
             .as_ref()
@@ -322,6 +375,8 @@ impl WatchdogSpool {
     fn write_header(&self, header: WatchdogSpoolHeader) -> Result<(), SpoolError> {
         let bytes = serde_json::to_vec(&header)
             .map_err(|error| SpoolError::Serialization(error.to_string()))?;
+        let high_water = header.next_sequence.saturating_sub(1);
+        let high_water_bytes = encode_high_water(high_water)?;
         let write = self
             .database
             .begin_write()
@@ -333,6 +388,34 @@ impl WatchdogSpool {
             table
                 .insert(SPOOL_HEADER_KEY, bytes.as_slice())
                 .map_err(|error| SpoolError::Database(error.to_string()))?;
+            drop(table);
+            let mut high_water_table = write
+                .open_table(SPOOL_HIGH_WATER_TABLE)
+                .map_err(|error| SpoolError::Database(error.to_string()))?;
+            high_water_table
+                .insert(SPOOL_HIGH_WATER_KEY, high_water_bytes.as_slice())
+                .map_err(|error| SpoolError::Database(error.to_string()))?;
+            drop(high_water_table);
+        }
+        write
+            .commit()
+            .map_err(|error| SpoolError::Database(error.to_string()))
+    }
+
+    fn write_high_water(&self, high_water: u64) -> Result<(), SpoolError> {
+        let bytes = encode_high_water(high_water)?;
+        let write = self
+            .database
+            .begin_write()
+            .map_err(|error| SpoolError::Database(error.to_string()))?;
+        {
+            let mut table = write
+                .open_table(SPOOL_HIGH_WATER_TABLE)
+                .map_err(|error| SpoolError::Database(error.to_string()))?;
+            table
+                .insert(SPOOL_HIGH_WATER_KEY, bytes.as_slice())
+                .map_err(|error| SpoolError::Database(error.to_string()))?;
+            drop(table);
         }
         write
             .commit()
@@ -345,9 +428,32 @@ impl WatchdogSpool {
         corrupt_sequence: Option<u64>,
         corrupt_digest: String,
     ) -> Result<(), SpoolError> {
+        let write = self
+            .database
+            .begin_write()
+            .map_err(|error| SpoolError::Database(error.to_string()))?;
+        let mut high_water_table = write.open_table(SPOOL_HIGH_WATER_TABLE).map_err(|error| {
+            SpoolError::Corrupt(format!(
+                "high-water metadata is missing; sequence continuity cannot be proven: {error}"
+            ))
+        })?;
+        let previous_high_water = high_water_table
+            .get(SPOOL_HIGH_WATER_KEY)
+            .map_err(|error| SpoolError::Database(error.to_string()))?
+            .map(|value| value.value().to_vec())
+            .ok_or_else(|| {
+                SpoolError::Corrupt(
+                    "high-water metadata is missing; sequence continuity cannot be proven"
+                        .to_owned(),
+                )
+            })?;
+        let previous_high_water = decode_high_water(&previous_high_water)?;
+        let recovery_sequence = previous_high_water
+            .checked_add(1)
+            .ok_or_else(|| SpoolError::Corrupt("spool sequence exhausted".to_owned()))?;
         let entry = WatchdogSpoolEntry {
             schema_version: SPOOL_SCHEMA_VERSION,
-            sequence: 1,
+            sequence: recovery_sequence,
             observed_at_ms: current_unix_ms()?.max(1),
             payload: WatchdogSpoolPayload::Recovery {
                 service: SERVICE_NAME.to_owned(),
@@ -359,17 +465,15 @@ impl WatchdogSpool {
         let bytes = encode_entry(&entry)?;
         let header = WatchdogSpoolHeader {
             schema_version: SPOOL_SCHEMA_VERSION,
-            next_sequence: 2,
-            first_sequence: 1,
+            next_sequence: recovery_sequence
+                .checked_add(1)
+                .ok_or_else(|| SpoolError::Corrupt("spool sequence exhausted".to_owned()))?,
+            first_sequence: recovery_sequence,
             record_count: 1,
             bytes: bytes.len() as u64,
         };
         let header_bytes = serde_json::to_vec(&header)
             .map_err(|error| SpoolError::Serialization(error.to_string()))?;
-        let write = self
-            .database
-            .begin_write()
-            .map_err(|error| SpoolError::Database(error.to_string()))?;
         {
             let mut table = write
                 .open_table(SPOOL_TABLE)
@@ -382,6 +486,16 @@ impl WatchdogSpool {
                         .map_err(|error| SpoolError::Database(error.to_string()))
                 })
                 .collect::<Result<Vec<_>, _>>()?;
+            if keys
+                .iter()
+                .filter(|key| **key != SPOOL_HEADER_KEY)
+                .any(|key| *key > previous_high_water)
+            {
+                return Err(SpoolError::Corrupt(
+                    "high-water metadata is below a retained sequence; continuity cannot be proven"
+                        .to_owned(),
+                ));
+            }
             for key in keys {
                 table
                     .remove(key)
@@ -393,7 +507,13 @@ impl WatchdogSpool {
             table
                 .insert(entry.sequence, bytes.as_slice())
                 .map_err(|error| SpoolError::Database(error.to_string()))?;
+            let high_water_bytes = encode_high_water(recovery_sequence)?;
+            high_water_table
+                .insert(SPOOL_HIGH_WATER_KEY, high_water_bytes.as_slice())
+                .map_err(|error| SpoolError::Database(error.to_string()))?;
+            drop(table);
         }
+        drop(high_water_table);
         write
             .commit()
             .map_err(|error| SpoolError::Database(error.to_string()))
@@ -407,6 +527,11 @@ impl WatchdogSpool {
         let mut table = write
             .open_table(SPOOL_TABLE)
             .map_err(|error| SpoolError::Database(error.to_string()))?;
+        let mut high_water_table = write.open_table(SPOOL_HIGH_WATER_TABLE).map_err(|error| {
+            SpoolError::Corrupt(format!(
+                "high-water metadata is unavailable; sequence continuity cannot be proven: {error}"
+            ))
+        })?;
         let header_bytes = table
             .get(SPOOL_HEADER_KEY)
             .map_err(|error| SpoolError::Database(error.to_string()))?
@@ -416,7 +541,26 @@ impl WatchdogSpool {
             .map_err(|error| SpoolError::Corrupt(format!("invalid spool header: {error}")))?;
         let entries = collect_entries(&table)?;
         validate_header(&header, &entries)?;
-        let sequence = header.next_sequence;
+        let high_water = high_water_table
+            .get(SPOOL_HIGH_WATER_KEY)
+            .map_err(|error| SpoolError::Database(error.to_string()))?
+            .map(|value| value.value().to_vec())
+            .ok_or_else(|| {
+                SpoolError::Corrupt(
+                    "high-water metadata is missing; sequence continuity cannot be proven"
+                        .to_owned(),
+                )
+            })?;
+        let high_water = decode_high_water(&high_water)?;
+        validate_high_water(&header, &entries, high_water)?;
+        let sequence = high_water
+            .checked_add(1)
+            .ok_or_else(|| SpoolError::Corrupt("spool sequence exhausted".to_owned()))?;
+        if sequence != header.next_sequence {
+            return Err(SpoolError::Corrupt(
+                "spool header next sequence does not match high-water metadata".to_owned(),
+            ));
+        }
         let entry = WatchdogSpoolEntry {
             schema_version: SPOOL_SCHEMA_VERSION,
             sequence,
@@ -464,7 +608,12 @@ impl WatchdogSpool {
         table
             .insert(SPOOL_HEADER_KEY, header_bytes.as_slice())
             .map_err(|error| SpoolError::Database(error.to_string()))?;
+        let high_water_bytes = encode_high_water(sequence)?;
+        high_water_table
+            .insert(SPOOL_HIGH_WATER_KEY, high_water_bytes.as_slice())
+            .map_err(|error| SpoolError::Database(error.to_string()))?;
         drop(table);
+        drop(high_water_table);
         write
             .commit()
             .map_err(|error| SpoolError::Database(error.to_string()))
@@ -480,6 +629,36 @@ fn encode_entry(entry: &WatchdogSpoolEntry) -> Result<Vec<u8>, SpoolError> {
         ));
     }
     Ok(bytes)
+}
+
+fn encode_high_water(sequence: u64) -> Result<Vec<u8>, SpoolError> {
+    serde_json::to_vec(&WatchdogSpoolHighWater {
+        schema_version: SPOOL_SCHEMA_VERSION,
+        high_water_sequence: sequence,
+    })
+    .map_err(|error| SpoolError::Serialization(error.to_string()))
+}
+
+fn decode_high_water(bytes: &[u8]) -> Result<u64, SpoolError> {
+    let high_water: WatchdogSpoolHighWater = serde_json::from_slice(bytes)
+        .map_err(|error| SpoolError::Corrupt(format!("invalid high-water metadata: {error}")))?;
+    if high_water.schema_version != SPOOL_SCHEMA_VERSION {
+        return Err(SpoolError::Corrupt(
+            "high-water metadata schema is unsupported".to_owned(),
+        ));
+    }
+    Ok(high_water.high_water_sequence)
+}
+
+fn read_high_water<T>(table: &T) -> Result<Option<u64>, SpoolError>
+where
+    T: ReadableTable<u64, &'static [u8]>,
+{
+    table
+        .get(SPOOL_HIGH_WATER_KEY)
+        .map_err(|error| SpoolError::Database(error.to_string()))?
+        .map(|value| decode_high_water(value.value()))
+        .transpose()
 }
 
 fn collect_entries<T>(table: &T) -> Result<Vec<WatchdogSpoolEntry>, SpoolError>
@@ -552,6 +731,24 @@ fn validate_header(
     {
         return Err(SpoolError::Corrupt(
             "spool sequence ordering is inconsistent".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_high_water(
+    header: &WatchdogSpoolHeader,
+    entries: &[WatchdogSpoolEntry],
+    high_water: u64,
+) -> Result<(), SpoolError> {
+    let expected = header
+        .next_sequence
+        .checked_sub(1)
+        .ok_or_else(|| SpoolError::Corrupt("spool header next sequence is invalid".to_owned()))?;
+    let last = entries.last().map_or(0, |entry| entry.sequence);
+    if high_water != expected || high_water < last {
+        return Err(SpoolError::Corrupt(
+            "high-water metadata does not bind the spool sequence".to_owned(),
         ));
     }
     Ok(())
@@ -1184,7 +1381,7 @@ mod tests {
     }
 
     #[test]
-    fn redb_spool_corruption_writes_recovery_evidence_before_readback() {
+    fn redb_spool_corruption_writes_recovery_evidence_without_reusing_sequence() {
         let root =
             std::env::temp_dir().join(format!("eliot-watchdog-corrupt-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
@@ -1211,7 +1408,7 @@ mod tests {
                 .open_table(SPOOL_TABLE)
                 .unwrap_or_else(|error| panic!("{error}"));
             table
-                .insert(SPOOL_HEADER_KEY, b"not-json".as_slice())
+                .insert(1, b"not-json".as_slice())
                 .unwrap_or_else(|error| panic!("{error}"));
         }
         write.commit().unwrap_or_else(|error| panic!("{error}"));
@@ -1224,7 +1421,40 @@ mod tests {
             entries.first().map(|entry| &entry.payload),
             Some(WatchdogSpoolPayload::Recovery { .. })
         ));
+        assert_eq!(entries.first().map(|entry| entry.sequence), Some(2));
+        recovered
+            .append(
+                3,
+                WatchdogSpoolPayload::Gap {
+                    service: SERVICE_NAME.to_owned(),
+                    reason: GapRecoveryReason::AdmissionUnavailable,
+                    coverage_claimed: false,
+                },
+            )
+            .unwrap_or_else(|error| panic!("{error}"));
+        let appended = recovered
+            .readback()
+            .unwrap_or_else(|error| panic!("{error}"));
+        assert_eq!(
+            appended
+                .iter()
+                .map(|entry| entry.sequence)
+                .collect::<Vec<_>>(),
+            vec![2, 3]
+        );
         drop(recovered);
+        let reopened = WatchdogSpool::open_test(&path).unwrap_or_else(|error| panic!("{error}"));
+        let reopened_entries = reopened
+            .readback()
+            .unwrap_or_else(|error| panic!("{error}"));
+        assert_eq!(
+            reopened_entries
+                .iter()
+                .map(|entry| entry.sequence)
+                .collect::<Vec<_>>(),
+            vec![2, 3]
+        );
+        drop(reopened);
         let _ = std::fs::remove_dir_all(root);
     }
 }
