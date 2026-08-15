@@ -1,0 +1,13 @@
+[package]
+name = "eliot-instrument-rustc"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+eliot-instrument-api = { workspace = true }
+eliot-process = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
