@@ -631,22 +631,29 @@ operational_input!(CapabilityIntroductionActivation);
 operational_input!(CapabilityIntroductionFence);
 
 /// Read-only ORS evidence for one Kernel generation transition or committed
-/// cutover.  The runtime contract is stored as a typed value in the dedicated
-/// generation index; ORS does not grant authority or interpret the route.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+/// cutover.  The runtime contract and its integrity-bound ORS receipt are
+/// projected from the canonical operational current/history tables; ORS does
+/// not grant authority or interpret the route.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct GenerationCutoverSnapshot {
     /// The validated transition/cutover contract.
     pub record: RuntimeGenerationCutoverRecord,
     /// Monotonic ORS order at which this value was written.
     pub operation_order: u64,
+    /// Receipt over the exact canonical operational record.
+    pub receipt: GenerationCutoverReceipt,
 }
 
 impl GenerationCutoverSnapshot {
-    pub(crate) fn new(record: RuntimeGenerationCutoverRecord, operation_order: u64) -> Self {
+    pub(crate) fn new(
+        record: RuntimeGenerationCutoverRecord,
+        operation_order: u64,
+        receipt: GenerationCutoverReceipt,
+    ) -> Self {
         Self {
             record,
             operation_order,
+            receipt,
         }
     }
 
@@ -658,6 +665,11 @@ impl GenerationCutoverSnapshot {
     /// Returns the ORS ordering value for this evidence.
     pub const fn operation_order(&self) -> u64 {
         self.operation_order
+    }
+
+    /// Returns the integrity-bound receipt for this canonical record.
+    pub const fn receipt(&self) -> &GenerationCutoverReceipt {
+        &self.receipt
     }
 }
 

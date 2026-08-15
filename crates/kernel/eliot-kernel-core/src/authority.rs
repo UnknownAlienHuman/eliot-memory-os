@@ -419,6 +419,25 @@ impl KernelAuthority {
         self.current_epoch = next;
         Ok(next)
     }
+
+    /// Fast-forwards the authority fence to a validated durable epoch.
+    ///
+    /// Recovery must not replay one in-memory increment per persisted epoch:
+    /// the durable epoch is already the linearized value, so synchronizing to
+    /// it directly is both bounded and equivalent for receipt fencing.
+    pub fn synchronize_epoch(
+        &mut self,
+        target: AuthorityEpoch,
+    ) -> Result<AuthorityEpoch, KernelError> {
+        if target.value() < self.current_epoch.value() {
+            return Err(KernelError::StaleEpoch {
+                observed: target.value(),
+                active: self.current_epoch.value(),
+            });
+        }
+        self.current_epoch = target;
+        Ok(target)
+    }
 }
 
 /// Orders the effect classes so `Read` is the weakest and `ExternalEffect` the

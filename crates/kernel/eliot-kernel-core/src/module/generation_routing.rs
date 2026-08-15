@@ -309,13 +309,25 @@ impl GenerationRouter {
                 active: self.epoch.value(),
             });
         }
+        let new_epoch = decision.new_epoch();
         self.epoch = decision.new_epoch();
+        // The authority epoch is global.  A cutover for one scope therefore
+        // re-fences every still-active scope at the same new epoch; keeping an
+        // unaffected route at the old epoch would make recovery and the live
+        // router disagree about the current authority fence.
+        let prior_routes = self.routes.clone();
+        let mut rebound_routes = BTreeMap::new();
+        for (scope, prior) in prior_routes {
+            let route = GenerationRoute::new(scope.clone(), prior.active_generation(), new_epoch)?;
+            rebound_routes.insert(scope, route);
+        }
         let replaced = GenerationRoute::new(
             decision.route_scope().clone(),
             decision.new_generation(),
-            decision.new_epoch(),
+            new_epoch,
         )?;
-        self.routes.insert(decision.route_scope().clone(), replaced);
+        rebound_routes.insert(decision.route_scope().clone(), replaced);
+        self.routes = rebound_routes;
         Ok(())
     }
 }
@@ -385,6 +397,46 @@ mod tests {
                 GenerationCutoverState::Preparing,
             )
             .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn cutover_rebinds_unaffected_scopes_to_global_epoch() -> Result<(), KernelError> {
+        let mut router = router_with_daemon(2, 5)?;
+        router.register(GenerationRoute::new(
+            RouteScope::new("worker")?,
+            ResourceGeneration::new(8)?,
+            AuthorityEpoch::new(2)?,
+        )?)?;
+        let decision = CutoverDecision::new(
+            "cutover-global-epoch",
+            RouteScope::new("daemon")?,
+            Some(ResourceGeneration::new(5)?),
+            ResourceGeneration::new(6)?,
+            AuthorityEpoch::new(2)?,
+            AuthorityEpoch::new(3)?,
+            GenerationCutoverState::Committed,
+        )?;
+        router.cutover(&decision)?;
+        assert_eq!(router.epoch(), AuthorityEpoch::new(3)?);
+        assert_eq!(
+            router
+                .route(&RouteScope::new("daemon")?)?
+                .active_generation()
+                .value(),
+            6
+        );
+        assert_eq!(
+            router
+                .route(&RouteScope::new("worker")?)?
+                .active_generation()
+                .value(),
+            8
+        );
+        assert_eq!(
+            router.route(&RouteScope::new("worker")?)?.authority_epoch(),
+            AuthorityEpoch::new(3)?
         );
         Ok(())
     }

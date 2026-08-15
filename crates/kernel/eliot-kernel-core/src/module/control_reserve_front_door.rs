@@ -335,6 +335,14 @@ impl FrontDoor {
         self.authority.advance_epoch()
     }
 
+    /// Fast-forwards the front-door fence to the durable recovery epoch.
+    pub fn synchronize_epoch(
+        &mut self,
+        target: eliot_contracts::AuthorityEpoch,
+    ) -> Result<eliot_contracts::AuthorityEpoch, KernelError> {
+        self.authority.synchronize_epoch(target)
+    }
+
     /// Returns whether a grant permits an effect without overclaiming proof.
     #[must_use]
     pub fn permits(

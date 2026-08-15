@@ -15,6 +15,10 @@ use thiserror::Error;
 use crate::protocol::{HostKernelHandshake, KernelControlCommand, KernelReadyReceipt};
 use crate::validate_text;
 
+/// Recovery may fast-forward to a durable epoch, but an unbounded value is
+/// treated as corrupt rather than allowed to become an implicit replay loop.
+const MAX_EPOCH_SYNC_GAP: u64 = 4_096;
+
 /// Lifecycle states owned by the Kernel service.
 #[derive(Clone, Copy, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
@@ -141,6 +145,9 @@ pub enum KernelServiceError {
     /// The service is not allowed to admit normal work in its current state.
     #[error("normal admission is closed in Kernel state {0}")]
     AdmissionClosed(KernelServiceState),
+    /// A post-commit publication failure fenced this service instance.
+    #[error("generation authority is fenced until forward recovery")]
+    GenerationFenced,
     /// The one-time restart budget is exhausted.
     #[error("Kernel restart budget exhausted")]
     RestartBudgetExhausted,
@@ -197,6 +204,7 @@ pub struct KernelService {
     handshake: Option<HostKernelHandshake>,
     ready: Option<KernelReadyReceipt>,
     failure: Option<ServiceFailure>,
+    generation_fenced: bool,
 }
 
 impl KernelService {
@@ -217,6 +225,7 @@ impl KernelService {
             handshake: None,
             ready: None,
             failure: None,
+            generation_fenced: false,
         })
     }
 
@@ -250,11 +259,46 @@ impl KernelService {
         self.ready.as_ref()
     }
 
+    /// Returns whether generation publication has fenced this service
+    /// instance pending restart or forward recovery.
+    pub const fn generation_fenced(&self) -> bool {
+        self.generation_fenced
+    }
+
+    /// Closes service admission after a durable generation commit could not
+    /// be published consistently.  The failure is retained as evidence and
+    /// cannot be cleared by an in-process lifecycle command.
+    pub fn fence_generation(
+        &mut self,
+        reason: impl Into<String>,
+    ) -> Result<(), KernelServiceError> {
+        let reason = reason.into();
+        validate_text(&reason, "generation_fence.reason")?;
+        self.generation_fenced = true;
+        self.failure = Some(ServiceFailure::Contract(reason));
+        if matches!(
+            self.state,
+            KernelServiceState::Reconciling
+                | KernelServiceState::ShadowNoAuthority
+                | KernelServiceState::HandoffPrepared
+                | KernelServiceState::Activating
+                | KernelServiceState::Ready
+                | KernelServiceState::Degraded
+                | KernelServiceState::Draining
+        ) {
+            self.transition(KernelServiceState::Failed)?;
+        }
+        Ok(())
+    }
+
     /// Applies one lifecycle command through the single Kernel transition boundary.
     pub fn apply(
         &mut self,
         command: KernelControlCommand,
     ) -> Result<KernelServiceState, KernelServiceError> {
+        if self.generation_fenced {
+            return Err(KernelServiceError::GenerationFenced);
+        }
         match command {
             KernelControlCommand::Reconcile(handshake) => self.reconcile(handshake)?,
             KernelControlCommand::Shadow => {
@@ -284,6 +328,9 @@ impl KernelService {
     /// Reconciles and pins a new Host installation lineage.
     pub fn reconcile(&mut self, handshake: HostKernelHandshake) -> Result<(), KernelServiceError> {
         handshake.validate()?;
+        if self.generation_fenced {
+            return Err(KernelServiceError::GenerationFenced);
+        }
         if self.state == KernelServiceState::Failed && handshake.containment_action.is_none() {
             return Err(KernelServiceError::MissingContainmentEvidence);
         }
@@ -305,6 +352,9 @@ impl KernelService {
 
     /// Publishes a readiness receipt after exact handshake and health checks.
     pub fn mark_ready(&mut self, receipt: KernelReadyReceipt) -> Result<(), KernelServiceError> {
+        if self.generation_fenced {
+            return Err(KernelServiceError::GenerationFenced);
+        }
         let handshake = self
             .handshake
             .as_ref()
@@ -326,6 +376,14 @@ impl KernelService {
 
     /// Raises the Kernel authority epoch, fencing every previously issued receipt.
     pub fn advance_authority_epoch(&mut self) -> Result<AuthorityEpoch, KernelServiceError> {
+        if self.generation_fenced {
+            return Err(KernelServiceError::GenerationFenced);
+        }
+        if self.authority.current_epoch() != self.front_door.epoch() {
+            return Err(KernelServiceError::HandshakeMismatch {
+                field: "authority_epoch",
+            });
+        }
         let epoch = self.front_door.advance_epoch()?;
         let mirrored = self.authority.advance_epoch()?;
         if epoch != mirrored {
@@ -343,16 +401,33 @@ impl KernelService {
         &mut self,
         target: AuthorityEpoch,
     ) -> Result<(), KernelServiceError> {
+        if self.generation_fenced {
+            return Err(KernelServiceError::GenerationFenced);
+        }
         let current = self.authority_epoch();
+        if self.authority.current_epoch() != current {
+            return Err(KernelServiceError::HandshakeMismatch {
+                field: "authority_epoch",
+            });
+        }
         if target.value() < current.value() {
             return Err(KernelServiceError::HandshakeMismatch {
                 field: "authority_epoch_regression",
             });
         }
-        while self.authority_epoch().value() < target.value() {
-            self.advance_authority_epoch()?;
+        let gap = target.value().checked_sub(current.value()).ok_or(
+            KernelServiceError::HandshakeMismatch {
+                field: "authority_epoch_corrupt",
+            },
+        )?;
+        if gap > MAX_EPOCH_SYNC_GAP {
+            return Err(KernelServiceError::HandshakeMismatch {
+                field: "authority_epoch_oversized",
+            });
         }
-        if self.authority_epoch() != target {
+        let front_door_epoch = self.front_door.synchronize_epoch(target)?;
+        let mirrored = self.authority.synchronize_epoch(target)?;
+        if front_door_epoch != mirrored || mirrored != target {
             return Err(KernelServiceError::HandshakeMismatch {
                 field: "authority_epoch",
             });
@@ -362,6 +437,9 @@ impl KernelService {
 
     /// Acquires one bounded control lease for a normal admitted operation.
     pub fn acquire_admission(&self) -> Result<AdmissionLease, KernelServiceError> {
+        if self.generation_fenced {
+            return Err(KernelServiceError::GenerationFenced);
+        }
         if self.state != KernelServiceState::Ready {
             return Err(KernelServiceError::AdmissionClosed(self.state));
         }
@@ -391,6 +469,9 @@ impl KernelService {
         now_ms: i64,
         expiry_ms: Option<i64>,
     ) -> Result<eliot_kernel_core::AuthorityReceipt, KernelServiceError> {
+        if self.generation_fenced {
+            return Err(KernelServiceError::GenerationFenced);
+        }
         if self.state != KernelServiceState::Ready {
             return Err(KernelServiceError::AdmissionClosed(self.state));
         }
@@ -423,3 +504,41 @@ impl KernelService {
 
 // Keep the public surface intentionally small: authority receipts are issued
 // only through the service and never by a transport or platform adapter.
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn durable_epoch_sync_is_direct_and_rejects_oversized_values()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut service = KernelService::new([7; 32], 2, 4)?;
+        service.synchronize_authority_epoch(AuthorityEpoch::new(100)?)?;
+        assert_eq!(service.authority_epoch(), AuthorityEpoch::new(100)?);
+        let oversized = AuthorityEpoch::new(4_300)?;
+        assert!(matches!(
+            service.synchronize_authority_epoch(oversized),
+            Err(KernelServiceError::HandshakeMismatch {
+                field: "authority_epoch_oversized"
+            })
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn generation_fence_blocks_lifecycle_and_admission_until_recovery()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut service = KernelService::new([9; 32], 2, 4)?;
+        service.fence_generation("publication failed")?;
+        assert!(service.generation_fenced());
+        assert!(matches!(
+            service.apply(KernelControlCommand::Shadow),
+            Err(KernelServiceError::GenerationFenced)
+        ));
+        assert!(matches!(
+            service.acquire_admission(),
+            Err(KernelServiceError::GenerationFenced)
+        ));
+        Ok(())
+    }
+}

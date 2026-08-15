@@ -2,8 +2,12 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use eliot_contracts::{AuthorityEpoch, ResourceGeneration};
 use eliot_platform::SecretReference;
 use eliot_receipts::{ReceiptCore, ReceiptEnvelope};
+use eliot_runtime_contracts::{
+    GenerationCutoverRecord as RuntimeGenerationCutoverRecord, GenerationCutoverState,
+};
 use eliot_security_contracts::PrivacyClass;
 use redb::ReadableTable;
 use serde_json::{Value, json};
@@ -1128,6 +1132,134 @@ fn appendix_p4_operational_surface_projects_rollover_and_retains_snapshot() -> T
             .records
             .len(),
         1
+    );
+
+    drop(coordinator);
+    cleanup(&path);
+    Ok(())
+}
+
+#[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one focused fixture covers canonical cutover, multi-scope, projection, and recovery evidence"
+)]
+fn generation_cutover_projection_is_canonical_and_recovery_is_forward_only() -> TestResult {
+    let path = database_path("generation-canonical");
+    cleanup(&path);
+    let coordinator = coordinator(&path)?;
+    let store = coordinator.store();
+    store.commit_authority_snapshot(KernelAuthoritySnapshot::new(operational_input(
+        "generation-authority-1",
+        "generation-authority",
+        epoch("generation-lineage", 1)?,
+        "generation-authority-payload",
+    )?)?)?;
+
+    let first = RuntimeGenerationCutoverRecord {
+        cutover_id: "cutover-canonical-1".to_owned(),
+        route_scope: "daemon".to_owned(),
+        old_generation: None,
+        new_generation: ResourceGeneration::new(2)?,
+        old_epoch: AuthorityEpoch::new(1)?,
+        new_epoch: AuthorityEpoch::new(2)?,
+        state: GenerationCutoverState::Armed,
+    };
+    let staged = store.stage_generation_cutover(first.clone())?;
+    assert_eq!(staged.record().state, GenerationCutoverState::Armed);
+    assert_eq!(
+        staged.receipt().receipt().phase(),
+        OperationalPhase::Applying
+    );
+    assert!(
+        store
+            .latest_generation_cutovers(MAX_RECOVERY_PAGE)?
+            .is_empty()
+    );
+
+    let committed = store.commit_generation_cutover_state(first)?;
+    assert_eq!(committed.record().state, GenerationCutoverState::Committed);
+    let latest = store.latest_generation_cutovers(MAX_RECOVERY_PAGE)?;
+    assert_eq!(latest.len(), 1);
+    assert_eq!(
+        latest[0].receipt().receipt().operation_order(),
+        committed.receipt().receipt().operation_order()
+    );
+    let (control, _) = store.control_projection_page(RecoveryCursor::new(0, 16)?)?;
+    assert!(
+        control
+            .active_generation_refs
+            .contains(&"daemon".to_owned())
+    );
+
+    // A second scope may be cut over at the new global epoch.  Recovery later
+    // rebinds both current route records to the maximum durable epoch.
+    let second = RuntimeGenerationCutoverRecord {
+        cutover_id: "cutover-canonical-2".to_owned(),
+        route_scope: "worker".to_owned(),
+        old_generation: None,
+        new_generation: ResourceGeneration::new(3)?,
+        old_epoch: AuthorityEpoch::new(2)?,
+        new_epoch: AuthorityEpoch::new(3)?,
+        state: GenerationCutoverState::Armed,
+    };
+    store.stage_generation_cutover(second.clone())?;
+    store.commit_generation_cutover_state(second)?;
+    assert_eq!(
+        store.latest_generation_cutovers(MAX_RECOVERY_PAGE)?.len(),
+        2
+    );
+
+    // The selected daemon row is older than the global epoch after the
+    // worker cutover.  A live router re-fences it at epoch three, so ORS must
+    // accept the preserved generation and advance only the selected scope.
+    let daemon_again = RuntimeGenerationCutoverRecord {
+        cutover_id: "cutover-canonical-3".to_owned(),
+        route_scope: "daemon".to_owned(),
+        old_generation: Some(ResourceGeneration::new(2)?),
+        new_generation: ResourceGeneration::new(5)?,
+        old_epoch: AuthorityEpoch::new(3)?,
+        new_epoch: AuthorityEpoch::new(4)?,
+        state: GenerationCutoverState::Armed,
+    };
+    store.stage_generation_cutover(daemon_again.clone())?;
+    store.commit_generation_cutover_state(daemon_again)?;
+
+    let interrupted = RuntimeGenerationCutoverRecord {
+        cutover_id: "cutover-canonical-interrupted".to_owned(),
+        route_scope: "scheduler".to_owned(),
+        old_generation: None,
+        new_generation: ResourceGeneration::new(4)?,
+        old_epoch: AuthorityEpoch::new(4)?,
+        new_epoch: AuthorityEpoch::new(5)?,
+        state: GenerationCutoverState::Armed,
+    };
+    store.stage_generation_cutover(interrupted)?;
+    let (control, _) = store.control_projection_page(RecoveryCursor::new(0, 16)?)?;
+    assert!(
+        control
+            .active_generation_refs
+            .contains(&"scheduler".to_owned())
+    );
+    let reconciled = store.reconcile_staged_generation_cutovers(MAX_RECOVERY_PAGE)?;
+    assert_eq!(reconciled.len(), 1);
+    assert_eq!(
+        reconciled[0].record().state,
+        GenerationCutoverState::FailedRequiresForwardCutover
+    );
+    assert_eq!(
+        reconciled[0].receipt().receipt().phase(),
+        OperationalPhase::Fenced
+    );
+    assert_eq!(
+        store.latest_generation_cutovers(MAX_RECOVERY_PAGE)?.len(),
+        2
+    );
+    let (control, _) = store.control_projection_page(RecoveryCursor::new(0, 16)?)?;
+    assert!(
+        !control
+            .active_generation_refs
+            .contains(&"scheduler".to_owned())
     );
 
     drop(coordinator);

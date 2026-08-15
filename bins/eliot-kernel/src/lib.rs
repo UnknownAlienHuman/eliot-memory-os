@@ -229,12 +229,22 @@ impl OrsGenerationCoordinator {
             .max()
             .ok_or_else(|| "committed cutover projection was empty".to_owned())?;
         let epoch = AuthorityEpoch::new(epoch_value).map_err(|error| error.to_string())?;
+        for snapshot in &snapshots {
+            let record = snapshot.record();
+            if record.state != GenerationCutoverState::Committed
+                || record.new_epoch.value() > epoch_value
+            {
+                return Err("ORS route projection has invalid committed epochs".to_owned());
+            }
+        }
+        // Synchronization is a bounded direct fast-forward.  It rejects a
+        // corrupt/oversized durable epoch before any route becomes visible.
+        service
+            .synchronize_authority_epoch(epoch)
+            .map_err(|error| error.to_string())?;
         let mut recovered = GenerationRouter::at_epoch(epoch).map_err(|error| error.to_string())?;
         for snapshot in &snapshots {
             let record = snapshot.record();
-            if record.state != GenerationCutoverState::Committed || record.new_epoch != epoch {
-                return Err("ORS route projection has inconsistent committed epochs".to_owned());
-            }
             let scope =
                 RouteScope::new(record.route_scope.clone()).map_err(|error| error.to_string())?;
             let route = GenerationRoute::new(scope, record.new_generation, epoch)
@@ -243,9 +253,6 @@ impl OrsGenerationCoordinator {
                 .register(route)
                 .map_err(|error| error.to_string())?;
         }
-        service
-            .synchronize_authority_epoch(epoch)
-            .map_err(|error| error.to_string())?;
         update_handshake_policy(policy, &recovered)?;
         *generations = recovered;
         Ok(())
@@ -451,6 +458,14 @@ impl KernelComposition {
     /// Returns the server-owned EBP handshake policy.
     #[must_use]
     pub fn front_door_policy(&self) -> Result<ServerHandshakePolicy, TransportError> {
+        if self
+            .generation_poison
+            .lock()
+            .map_err(|_| TransportError::SessionFenced)?
+            .is_some()
+        {
+            return Err(TransportError::SessionFenced);
+        }
         self.front_door_policy
             .lock()
             .map(|policy| policy.clone())
@@ -464,6 +479,14 @@ impl KernelComposition {
         peer: PeerIdentity,
         client: &eliot_protocol::ClientHello,
     ) -> Result<HandshakeResult, eliot_ipc::TransportError> {
+        if self
+            .generation_poison
+            .lock()
+            .map_err(|_| TransportError::SessionFenced)?
+            .is_some()
+        {
+            return Err(TransportError::SessionFenced);
+        }
         let policy = self
             .front_door_policy
             .lock()
@@ -482,6 +505,14 @@ impl KernelComposition {
         session: &Session,
         frame: &Frame,
     ) -> Result<KernelFrameAction, TransportError> {
+        if self
+            .generation_poison
+            .lock()
+            .map_err(|_| TransportError::SessionFenced)?
+            .is_some()
+        {
+            return Err(TransportError::SessionFenced);
+        }
         frame.validate()?;
         if !session.accepts(session.authority_epoch, session.session_epoch)
             || frame.connection_id != session.connection_id
@@ -523,6 +554,16 @@ impl KernelComposition {
     /// service loop for the lifetime of the accepted connection.
     #[cfg(windows)]
     pub fn bind_authenticated_front_door(&self) -> Result<NamedPipeServer, KernelBuildError> {
+        if self
+            .generation_poison
+            .lock()
+            .map_err(|_| KernelBuildError::Principal("generation poison lock poisoned".to_owned()))?
+            .is_some()
+        {
+            return Err(KernelBuildError::Principal(
+                "generation gateway fenced; forward recovery is required".to_owned(),
+            ));
+        }
         let expectation = eliot_platform_windows::current_process_named_pipe_expectation()
             .map_err(|error| KernelBuildError::Principal(error.to_string()))?;
         NamedPipeServer::create(self.ipc.name(), &expectation)
@@ -533,6 +574,16 @@ impl KernelComposition {
     /// concurrent session while the first instance remains connected.
     #[cfg(windows)]
     pub fn bind_authenticated_front_door_next(&self) -> Result<NamedPipeServer, KernelBuildError> {
+        if self
+            .generation_poison
+            .lock()
+            .map_err(|_| KernelBuildError::Principal("generation poison lock poisoned".to_owned()))?
+            .is_some()
+        {
+            return Err(KernelBuildError::Principal(
+                "generation gateway fenced; forward recovery is required".to_owned(),
+            ));
+        }
         let expectation = eliot_platform_windows::current_process_named_pipe_expectation()
             .map_err(|error| KernelBuildError::Principal(error.to_string()))?;
         NamedPipeServer::create_additional(self.ipc.name(), &expectation)
@@ -567,14 +618,10 @@ impl KernelComposition {
         &self,
         decision: eliot_kernel_core::CutoverDecision,
     ) -> Result<(), KernelServiceError> {
-        if let Some(reason) = self
-            .generation_poison
-            .lock()
-            .map_err(|_| {
-                KernelServiceError::Platform("generation poison lock poisoned".to_owned())
-            })?
-            .clone()
-        {
+        let mut poison = self.generation_poison.lock().map_err(|_| {
+            KernelServiceError::Platform("generation poison lock poisoned".to_owned())
+        })?;
+        if let Some(reason) = poison.clone() {
             return Err(KernelServiceError::Platform(format!(
                 "generation gateway fenced: {reason}"
             )));
@@ -600,8 +647,9 @@ impl KernelComposition {
             )
         })();
         if let Err(reason) = result {
-            if let Ok(mut poison) = self.generation_poison.lock() {
-                *poison = Some(reason.clone());
+            *poison = Some(reason.clone());
+            if let Ok(mut service) = self.service.lock() {
+                let _ = service.fence_generation(reason.clone());
             }
             return Err(KernelServiceError::Platform(format!(
                 "generation cutover fenced: {reason}"
@@ -615,6 +663,18 @@ impl KernelComposition {
         &self,
         command: KernelControlCommand,
     ) -> Result<KernelServiceState, KernelServiceError> {
+        if let Some(reason) = self
+            .generation_poison
+            .lock()
+            .map_err(|_| {
+                KernelServiceError::Platform("generation poison lock poisoned".to_owned())
+            })?
+            .clone()
+        {
+            return Err(KernelServiceError::Platform(format!(
+                "generation gateway fenced: {reason}"
+            )));
+        }
         self.service
             .lock()
             .map_err(|_| KernelServiceError::Platform("service lock poisoned".to_owned()))?

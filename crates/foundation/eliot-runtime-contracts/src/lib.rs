@@ -319,7 +319,10 @@ impl GenerationCutoverState {
         let legal = matches!(
             (self, next),
             (Self::Preparing, Self::Armed | Self::Failed)
-                | (Self::Armed, Self::Committed | Self::Failed)
+                | (
+                    Self::Armed,
+                    Self::Committed | Self::Failed | Self::Reconciling
+                )
                 | (Self::Committed, Self::Reconciling)
                 | (
                     Self::Reconciling,
