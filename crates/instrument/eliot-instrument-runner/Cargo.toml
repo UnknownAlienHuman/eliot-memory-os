@@ -9,6 +9,7 @@ description = "Bounded provider-neutral instrument runner for ELIOT"
 [dependencies]
 eliot-instrument-api = { path = "../eliot-instrument-api", version = "0.1.0" }
 eliot-process = { path = "../../kernel/eliot-process", version = "0.1.0" }
+serde_json = "1.0.150"
 thiserror = "2.0.18"
 
 [lints.rust]

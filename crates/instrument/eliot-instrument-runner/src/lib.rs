@@ -12,8 +12,9 @@ use std::sync::Arc;
 
 use eliot_instrument_api::{ExecutionStatus, InstrumentInvocation};
 use eliot_process::{
-    CancellationReceipt, OperationId, ProcessEvidence, ProcessEvidenceSink, ProcessExecutionError,
-    ProcessExecutionView, ProcessExecutor, ProcessRequest, ProcessStartReceipt,
+    CancellationReceipt, ExitDisposition, ExitStatus, OperationId, ProcessEvidence,
+    ProcessEvidenceSink, ProcessExecutionError, ProcessExecutionView, ProcessExecutor,
+    ProcessRequest, ProcessStartReceipt,
 };
 use thiserror::Error;
 
@@ -248,13 +249,44 @@ fn execution_status(view: &ProcessExecutionView) -> ExecutionStatus {
             ExecutionStatus::Unknown
         }
         ProcessLifecycle::Reconciled => ExecutionStatus::Partial,
-        ProcessLifecycle::Exited | ProcessLifecycle::Failed => {
-            match view.exit().map(|exit| exit.disposition()) {
-                Some(ExitDisposition::Completed) => ExecutionStatus::Succeeded,
-                Some(ExitDisposition::Cancelled) => ExecutionStatus::Cancelled,
-                Some(ExitDisposition::Unknown) | None => ExecutionStatus::Unknown,
-                _ => ExecutionStatus::Failed,
+        ProcessLifecycle::Exited => match view.exit() {
+            Some(exit) if successful_exit(exit) => ExecutionStatus::Succeeded,
+            Some(exit) if matches!(exit.disposition(), ExitDisposition::Cancelled) => {
+                ExecutionStatus::Cancelled
             }
-        }
+            Some(exit) if matches!(exit.disposition(), ExitDisposition::Unknown) => {
+                ExecutionStatus::Unknown
+            }
+            None => ExecutionStatus::Unknown,
+            _ => ExecutionStatus::Failed,
+        },
+        ProcessLifecycle::Failed => ExecutionStatus::Failed,
+    }
+}
+
+fn successful_exit(exit: &ExitStatus) -> bool {
+    if !matches!(exit.disposition(), ExitDisposition::Completed) {
+        return false;
+    }
+    serde_json::to_value(exit)
+        .ok()
+        .and_then(|value| value.get("code").and_then(serde_json::Value::as_i64))
+        .is_some_and(|code| code == 0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn nonzero_completed_exit_is_failed() {
+        let exit = ExitStatus::new(ExitDisposition::Completed, Some(7), None, 1).unwrap();
+        assert!(!successful_exit(&exit));
+    }
+
+    #[test]
+    fn zero_completed_exit_succeeds() {
+        let exit = ExitStatus::new(ExitDisposition::Completed, Some(0), None, 1).unwrap();
+        assert!(successful_exit(&exit));
     }
 }

@@ -1007,6 +1007,7 @@ dependencies = [
  "eliot-instrument-api",
  "eliot-process",
  "serde",
+ "serde_json",
  "thiserror",
 ]
 
@@ -1037,6 +1038,7 @@ version = "0.1.0"
 dependencies = [
  "eliot-instrument-api",
  "eliot-process",
+ "serde_json",
  "thiserror",
 ]
 
@@ -1726,6 +1728,7 @@ name = "eliot-testd"
 version = "0.1.0"
 dependencies = [
  "eliot-instrument-api",
+ "eliot-platform-windows",
  "eliot-process",
  "eliot-process-executor",
  "eliot-testd-core",

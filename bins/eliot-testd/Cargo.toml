@@ -15,6 +15,7 @@ path = "src/main.rs"
 
 [dependencies]
 eliot-instrument-api.workspace = true
+eliot-platform-windows.workspace = true
 eliot-process.workspace = true
 eliot-process-executor.workspace = true
 eliot-testd-core.workspace = true

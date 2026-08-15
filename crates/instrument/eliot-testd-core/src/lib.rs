@@ -14,7 +14,7 @@ use eliot_process::ProcessRequest;
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
-use std::path::Path;
+use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use thiserror::Error;
 use uuid::Uuid;
@@ -107,20 +107,74 @@ impl JobState {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProcessAdmission {
+    /// Kernel process-job identity bound to the consuming permit.
+    pub job_id: String,
     pub operation_id: String,
     pub process_tree_id: String,
     pub generation: u64,
+    pub authority_epoch: u64,
     pub invocation_digest: String,
 }
 
 impl ProcessAdmission {
     fn from_request(request: &ProcessRequest) -> Self {
         Self {
+            job_id: request.job_id().as_str().to_owned(),
             operation_id: request.operation_id().as_str().to_owned(),
             process_tree_id: request.process_tree_id().as_str().to_owned(),
             generation: request.generation().get(),
+            authority_epoch: request.fence().authority_epoch(),
             invocation_digest: request.invocation_digest().to_owned(),
         }
+    }
+}
+
+/// Canonical roots bound to one isolated execution job.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TargetRoots {
+    /// Source/worktree root used as the process working directory.
+    pub source_root: String,
+    /// Dedicated external Cargo target/build root.
+    pub target_root: String,
+    /// Cache root; D0 requires this to be the same canonical root as target.
+    pub cache_root: String,
+}
+
+impl TargetRoots {
+    /// Creates and validates a path-identity projection.
+    pub fn new(
+        source_root: impl Into<String>,
+        target_root: impl Into<String>,
+        cache_root: impl Into<String>,
+    ) -> Result<Self, TestdError> {
+        let roots = Self {
+            source_root: source_root.into(),
+            target_root: target_root.into(),
+            cache_root: cache_root.into(),
+        };
+        roots.validate()?;
+        Ok(roots)
+    }
+
+    /// Revalidates immutable path identity before a later execution stage.
+    pub fn validate(&self) -> Result<(), TestdError> {
+        let source = validate_root_identity(&self.source_root, "source_root")?;
+        let target = validate_root_identity(&self.target_root, "target_root")?;
+        let cache = validate_root_identity(&self.cache_root, "cache_root")?;
+        if cache != target {
+            return Err(TestdError::Invalid {
+                field: "cache_root",
+                reason: "must equal the canonical target_root in the active profile",
+            });
+        }
+        if paths_overlap(&source, &target) {
+            return Err(TestdError::Invalid {
+                field: "target_root",
+                reason: "external target root must not contain or be contained by source_root",
+            });
+        }
+        Ok(())
     }
 }
 
@@ -137,6 +191,8 @@ pub struct TestJob {
     pub invocation: InstrumentInvocation,
     /// Identity projection of the consuming process contract.
     pub process: ProcessAdmission,
+    /// Canonical roots retained for later execution/reconciliation checks.
+    pub target_roots: TargetRoots,
     /// Scheduling priority; larger values run first among ready heads.
     pub priority: i32,
     /// Durable lifecycle state.
@@ -151,6 +207,8 @@ pub struct TestJob {
     pub execution: Option<ExecutionStatus>,
     /// Verifier output, when a verifier has completed.
     pub verification: Option<VerificationRun>,
+    /// Exact receipt identity retained with a completed attempt.
+    pub receipt: Option<ReceiptBinding>,
     /// Last durable mutation time.
     pub updated_at_ms: u64,
     /// Immutable digest of the submitted contracts and scheduling fields.
@@ -173,6 +231,22 @@ pub struct Lease {
     pub epoch: u64,
     /// Absolute expiry in Unix milliseconds.
     pub expires_at_ms: u64,
+}
+
+/// Exact identity tuple carried by a verifier receipt at finish.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReceiptBinding {
+    pub job_id: String,
+    pub operation_id: String,
+    pub process_tree_id: String,
+    pub generation: u64,
+    pub authority_epoch: u64,
+    pub invocation_id: String,
+    pub invocation_digest: String,
+    pub source_root: String,
+    pub target_root: String,
+    pub cache_root: String,
 }
 
 /// Append-only explanation for every durable lifecycle mutation.
@@ -263,6 +337,7 @@ impl TestdStore {
         project_id: impl Into<String>,
         invocation: InstrumentInvocation,
         process: ProcessRequest,
+        target_roots: TargetRoots,
         priority: i32,
         at_ms: u64,
     ) -> Result<TestJob, TestdError> {
@@ -282,7 +357,8 @@ impl TestdStore {
         if invocation.request.request_id.as_str() != process.operation_id().as_str() {
             return Err(TestdError::InvalidBinding);
         }
-        let digest = payload_digest(&invocation, &process, priority)?;
+        target_roots.validate()?;
+        let digest = payload_digest(&invocation, &process, &target_roots, priority)?;
         let process = ProcessAdmission::from_request(&process);
         let write = self.database.begin_write().map_err(database)?;
         let existing = {
@@ -321,6 +397,7 @@ impl TestdStore {
             project_sequence: sequence,
             invocation,
             process,
+            target_roots,
             priority,
             state: JobState::Queued,
             attempts: 0,
@@ -328,6 +405,7 @@ impl TestdStore {
             lease: None,
             execution: None,
             verification: None,
+            receipt: None,
             updated_at_ms: at_ms,
             payload_digest: digest,
         };
@@ -374,6 +452,7 @@ impl TestdStore {
                 .map_err(|error| TestdError::Corrupt(error.to_string()))?
         };
         job = persisted;
+        job.target_roots.validate()?;
         if !matches!(job.state, JobState::Queued | JobState::RetryWait)
             || job.not_before_ms > now
             || job.lease.is_some()
@@ -418,6 +497,7 @@ impl TestdStore {
         lease: &Lease,
         execution: ExecutionStatus,
         verification: Option<VerificationRun>,
+        receipt: &ReceiptBinding,
         now: u64,
         reason: Option<String>,
     ) -> Result<TestJob, TestdError> {
@@ -432,9 +512,16 @@ impl TestdStore {
         if !lease_matches(&job, lease, now) {
             return Err(TestdError::LeaseRejected(job_id.to_owned()));
         }
+        validate_receipt_binding(&job, receipt)?;
+        if let Some(run) = &verification
+            && run.invocation_id.as_str() != job.invocation.request.request_id.as_str()
+        {
+            return Err(TestdError::InvalidBinding);
+        }
         let previous = job.state;
         job.execution = Some(execution);
         job.verification = verification;
+        job.receipt = Some(receipt.clone());
         job.lease = None;
         let retryable = matches!(
             execution,
@@ -494,11 +581,7 @@ impl TestdStore {
         if job.state.is_terminal() {
             return Ok(job);
         }
-        if let Some(lease) = lease {
-            if !lease_matches(&job, lease, now) {
-                return Err(TestdError::LeaseRejected(job_id.to_owned()));
-            }
-        }
+        validate_cancellation_lease(&job, lease, actor, now)?;
         validate_text(actor, "actor")?;
         let previous = job.state;
         job.state = JobState::Cancelled;
@@ -577,17 +660,180 @@ impl TestdStore {
 fn payload_digest(
     invocation: &InstrumentInvocation,
     process: &ProcessRequest,
+    target_roots: &TargetRoots,
     priority: i32,
 ) -> Result<String, TestdError> {
-    let bytes = serde_json::to_vec(&(invocation, process, priority))
+    let bytes = serde_json::to_vec(&(invocation, process, target_roots, priority))
         .map_err(|error| TestdError::Corrupt(error.to_string()))?;
     Ok(blake3::hash(&bytes).to_hex().to_string())
 }
 
+fn validate_root_identity(value: &str, field: &'static str) -> Result<PathBuf, TestdError> {
+    validate_text(value, field)?;
+    let path = Path::new(value);
+    if !path.is_absolute() {
+        return Err(TestdError::Invalid {
+            field,
+            reason: "must be an absolute path",
+        });
+    }
+    if path
+        .components()
+        .any(|component| matches!(component, Component::ParentDir))
+    {
+        return Err(TestdError::Invalid {
+            field,
+            reason: "parent traversal is forbidden",
+        });
+    }
+    reject_reparse_components(path, field)?;
+    let canonical = std::fs::canonicalize(path).map_err(|_| TestdError::Invalid {
+        field,
+        reason: "must identify an existing canonical root",
+    })?;
+    if !canonical.is_absolute() {
+        return Err(TestdError::Invalid {
+            field,
+            reason: "must resolve to an absolute root",
+        });
+    }
+    let metadata = std::fs::symlink_metadata(&canonical).map_err(|_| TestdError::Invalid {
+        field,
+        reason: "root metadata is unavailable",
+    })?;
+    if !metadata.is_dir() || metadata.file_type().is_symlink() || is_reparse_point(&metadata) {
+        return Err(TestdError::Invalid {
+            field,
+            reason: "must be a non-reparse directory",
+        });
+    }
+    reject_reparse_components(&canonical, field)?;
+    Ok(canonical)
+}
+
+fn reject_reparse_components(path: &Path, field: &'static str) -> Result<(), TestdError> {
+    let mut current = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Prefix(prefix) => current.push(prefix.as_os_str()),
+            Component::RootDir => current.push(component.as_os_str()),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                return Err(TestdError::Invalid {
+                    field,
+                    reason: "parent traversal is forbidden",
+                });
+            }
+            Component::Normal(part) => {
+                current.push(part);
+                let metadata =
+                    std::fs::symlink_metadata(&current).map_err(|_| TestdError::Invalid {
+                        field,
+                        reason: "root traversal contains an unavailable component",
+                    })?;
+                if metadata.file_type().is_symlink() || is_reparse_point(&metadata) {
+                    return Err(TestdError::Invalid {
+                        field,
+                        reason: "symlink or reparse traversal is forbidden",
+                    });
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn is_reparse_point(metadata: &std::fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt;
+
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+    metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+}
+
+#[cfg(not(windows))]
+fn is_reparse_point(metadata: &std::fs::Metadata) -> bool {
+    metadata.file_type().is_symlink()
+}
+
+fn paths_overlap(left: &Path, right: &Path) -> bool {
+    left == right || left.starts_with(right) || right.starts_with(left)
+}
+
+fn validate_receipt_binding(job: &TestJob, receipt: &ReceiptBinding) -> Result<(), TestdError> {
+    job.target_roots.validate()?;
+    let matches = receipt.job_id == job.job_id
+        && receipt.operation_id == job.process.operation_id
+        && receipt.process_tree_id == job.process.process_tree_id
+        && receipt.generation == job.process.generation
+        && receipt.authority_epoch == job.process.authority_epoch
+        && receipt_invocation_matches(receipt, job.invocation.request.request_id.as_str())
+        && receipt.invocation_digest == job.process.invocation_digest
+        && receipt.source_root == job.target_roots.source_root
+        && receipt.target_root == job.target_roots.target_root
+        && receipt.cache_root == job.target_roots.cache_root;
+    if matches {
+        Ok(())
+    } else {
+        Err(TestdError::InvalidBinding)
+    }
+}
+
+fn receipt_invocation_matches(receipt: &ReceiptBinding, invocation_id: &str) -> bool {
+    receipt.invocation_id == invocation_id
+}
+
 fn lease_matches(job: &TestJob, lease: &Lease, now: u64) -> bool {
-    job.lease.as_ref().is_some_and(|current| {
-        current == lease && current.expires_at_ms >= now && job.state == JobState::Running
+    running_lease_matches(job.state, job.lease.as_ref(), lease, now)
+}
+
+fn running_lease_matches(
+    state: JobState,
+    current: Option<&Lease>,
+    supplied: &Lease,
+    now: u64,
+) -> bool {
+    current.is_some_and(|current| {
+        current == supplied && current.expires_at_ms > now && state == JobState::Running
     })
+}
+
+/// Validates the exact current running fence before a consuming request may
+/// start.  This is intentionally pure so protocol/composition callers cannot
+/// accidentally replace it with a local lease check.
+pub fn validate_running_lease(job: &TestJob, lease: &Lease, now: u64) -> Result<(), TestdError> {
+    if lease_matches(job, lease, now) {
+        Ok(())
+    } else {
+        Err(TestdError::LeaseRejected(job.job_id.clone()))
+    }
+}
+
+fn validate_cancellation_lease(
+    job: &TestJob,
+    lease: Option<&Lease>,
+    actor: &str,
+    now: u64,
+) -> Result<(), TestdError> {
+    if !cancellation_lease_matches(job.state, job.lease.as_ref(), lease, actor, now) {
+        return Err(TestdError::LeaseRejected(job.job_id.clone()));
+    }
+    Ok(())
+}
+
+fn cancellation_lease_matches(
+    state: JobState,
+    current: Option<&Lease>,
+    supplied: Option<&Lease>,
+    actor: &str,
+    now: u64,
+) -> bool {
+    match state {
+        JobState::Running => supplied.is_some_and(|lease| {
+            running_lease_matches(state, current, lease, now) && actor == lease.owner
+        }),
+        _ => supplied.is_none_or(|lease| running_lease_matches(state, current, lease, now)),
+    }
 }
 
 fn compare_ready(left: &TestJob, right: &TestJob) -> Ordering {
@@ -637,4 +883,62 @@ fn append_event(
         .insert(key.as_str(), encoded.as_slice())
         .map_err(database)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn lease() -> Lease {
+        Lease {
+            owner: "worker-a".to_owned(),
+            token: "fence-a".to_owned(),
+            epoch: 3,
+            expires_at_ms: 200,
+        }
+    }
+
+    #[test]
+    fn running_cancel_without_exact_fence_is_rejected() {
+        let current = lease();
+        assert!(!cancellation_lease_matches(
+            JobState::Running,
+            Some(&current),
+            None,
+            "worker-a",
+            100,
+        ));
+        assert!(!cancellation_lease_matches(
+            JobState::Running,
+            Some(&current),
+            Some(&current),
+            "other-worker",
+            100,
+        ));
+        assert!(!cancellation_lease_matches(
+            JobState::Running,
+            Some(&current),
+            Some(&current),
+            "worker-a",
+            200,
+        ));
+    }
+
+    #[test]
+    fn receipt_invocation_identity_cannot_be_substituted() {
+        let receipt = ReceiptBinding {
+            job_id: "job".to_owned(),
+            operation_id: "operation".to_owned(),
+            process_tree_id: "tree".to_owned(),
+            generation: 1,
+            authority_epoch: 1,
+            invocation_id: "invocation-a".to_owned(),
+            invocation_digest: "digest".to_owned(),
+            source_root: "source".to_owned(),
+            target_root: "target".to_owned(),
+            cache_root: "target".to_owned(),
+        };
+        assert!(receipt_invocation_matches(&receipt, "invocation-a"));
+        assert!(!receipt_invocation_matches(&receipt, "invocation-b"));
+    }
 }

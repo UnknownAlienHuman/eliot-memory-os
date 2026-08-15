@@ -6,14 +6,29 @@ use eliot_testd::{
     PROTOCOL_VERSION, SERVICE_NAME, TestReceipt, TestdComposition, TestdJobRequest,
     UnavailableProcessIssuer,
 };
+use eliot_testd_core::Lease;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
 enum Request {
-    Submit { request: TestdJobRequest },
-    Status { job_id: String },
-    Cancel { job_id: String },
+    Submit {
+        request: TestdJobRequest,
+    },
+    Status {
+        job_id: String,
+    },
+    Cancel {
+        job_id: String,
+        #[serde(default)]
+        lease: Option<Lease>,
+        #[serde(default = "default_actor")]
+        actor: String,
+    },
+}
+
+fn default_actor() -> String {
+    SERVICE_NAME.to_owned()
 }
 
 #[derive(Debug, Serialize)]
@@ -83,7 +98,11 @@ fn dispatch(daemon: &TestdComposition, line: &str) -> Response {
     let result = match request {
         Request::Submit { request } => daemon.submit(request),
         Request::Status { job_id } => daemon.status(&job_id),
-        Request::Cancel { job_id } => daemon.cancel(&job_id),
+        Request::Cancel {
+            job_id,
+            lease,
+            actor,
+        } => daemon.cancel_with_lease(&job_id, lease.as_ref(), &actor),
     };
     result
         .map(|receipt| Response::Receipt { receipt })
