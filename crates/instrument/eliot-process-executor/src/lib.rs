@@ -22,7 +22,7 @@ use sha2::{Digest as _, Sha256};
 use std::collections::BTreeMap;
 use std::io::Read as _;
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -114,6 +114,7 @@ struct Operation {
     stderr_thread: Option<JoinHandle<()>>,
     deadline: Instant,
     timed_out: bool,
+    cleanup_required: bool,
 }
 
 #[cfg(not(windows))]
@@ -127,6 +128,7 @@ pub struct WindowsProcessExecutor {
     operations: Mutex<BTreeMap<OperationId, Arc<Mutex<Operation>>>>,
     reservations: Mutex<std::collections::BTreeSet<OperationId>>,
     capture_limit: usize,
+    poisoned: Arc<AtomicBool>,
 }
 
 struct OperationReservation<'a> {
@@ -151,6 +153,7 @@ impl WindowsProcessExecutor {
             operations: Mutex::new(BTreeMap::new()),
             reservations: Mutex::new(std::collections::BTreeSet::new()),
             capture_limit: DEFAULT_CAPTURE_LIMIT,
+            poisoned: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -165,6 +168,7 @@ impl WindowsProcessExecutor {
             operations: Mutex::new(BTreeMap::new()),
             reservations: Mutex::new(std::collections::BTreeSet::new()),
             capture_limit: capture_limit.max(1),
+            poisoned: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -251,6 +255,9 @@ impl WindowsProcessExecutor {
                     if !guard.state.view().lifecycle().is_terminal() {
                         return None;
                     }
+                    if guard.cleanup_required {
+                        return None;
+                    }
                     join_streams(&mut guard);
                     Some(id.clone())
                 })
@@ -278,20 +285,27 @@ impl WindowsProcessExecutor {
                 .operations
                 .lock()
                 .map_err(|_| unavailable("operation registry lock poisoned"))?;
+            let mut retain_cleanup_owners = false;
             for operation in operations.values() {
                 let mut guard = operation
                     .lock()
                     .map_err(|_| unavailable("operation lock poisoned"))?;
+                retain_cleanup_owners |= guard.cleanup_required;
                 if guard.child.is_some() {
-                    let _ = finalize_operation(&mut guard, ExitDisposition::Unknown, false);
+                    if finalize_operation(&mut guard, ExitDisposition::Unknown, false).is_err() {
+                        poison_operation(&mut guard, &self.poisoned);
+                        retain_cleanup_owners = true;
+                    }
                 }
                 join_streams(&mut guard);
             }
-            operations.clear();
-            self.reservations
-                .lock()
-                .map_err(|_| unavailable("operation reservation lock poisoned"))?
-                .clear();
+            if !retain_cleanup_owners {
+                operations.clear();
+                self.reservations
+                    .lock()
+                    .map_err(|_| unavailable("operation reservation lock poisoned"))?
+                    .clear();
+            }
             return Ok(());
         }
         #[cfg(not(windows))]
@@ -313,6 +327,9 @@ impl ProcessExecutor for WindowsProcessExecutor {
         request: ProcessRequest,
         sink: Arc<dyn ProcessEvidenceSink>,
     ) -> Result<ProcessStartReceipt, ProcessExecutionError> {
+        if self.poisoned.load(Ordering::Acquire) {
+            return Err(ProcessExecutionError::UnknownOutcome);
+        }
         request.validate()?;
         let operation_id = request.operation_id().clone();
         let _reservation = self.reserve_operation(operation_id.clone())?;
@@ -418,12 +435,13 @@ impl ProcessExecutor for WindowsProcessExecutor {
                     .checked_add(Duration::from_millis(wall_timeout_ms))
                     .ok_or_else(|| unavailable("wall timeout overflows monotonic clock"))?,
                 timed_out: false,
+                cleanup_required: false,
             }));
             self.operations
                 .lock()
                 .map_err(|_| unavailable("operation registry lock poisoned"))?
                 .insert(operation_id, Arc::clone(&operation));
-            spawn_deadline_watcher(operation);
+            spawn_deadline_watcher(operation, Arc::clone(&self.poisoned));
             Ok(receipt)
         }
     }
@@ -434,6 +452,9 @@ impl ProcessExecutor for WindowsProcessExecutor {
     ) -> Result<ProcessExecutionView, ProcessExecutionError> {
         #[cfg(windows)]
         {
+            if self.poisoned.load(Ordering::Acquire) {
+                return Err(ProcessExecutionError::UnknownOutcome);
+            }
             let operation = self.operation(&operation_id)?;
             let mut guard = operation
                 .lock()
@@ -456,6 +477,9 @@ impl ProcessExecutor for WindowsProcessExecutor {
     ) -> Result<CancellationReceipt, ProcessExecutionError> {
         #[cfg(windows)]
         {
+            if self.poisoned.load(Ordering::Acquire) {
+                return Err(ProcessExecutionError::UnknownOutcome);
+            }
             let operation = self.operation(&operation_id)?;
             let mut guard = operation
                 .lock()
@@ -482,6 +506,9 @@ impl ProcessExecutor for WindowsProcessExecutor {
     ) -> Result<ProcessEvidence, ProcessExecutionError> {
         #[cfg(windows)]
         {
+            if self.poisoned.load(Ordering::Acquire) {
+                return Err(ProcessExecutionError::UnknownOutcome);
+            }
             let operation = self.operation(&operation_id)?;
             let mut guard = operation
                 .lock()
@@ -658,7 +685,36 @@ fn finalize_operation(
 }
 
 #[cfg(windows)]
-fn spawn_deadline_watcher(operation: Arc<Mutex<Operation>>) {
+fn fence_unknown(operation: &mut Operation) -> Result<(), ProcessExecutionError> {
+    if operation.state.view().lifecycle() == ProcessLifecycle::UnknownOutcome {
+        return Ok(());
+    }
+    let view = operation.state.view();
+    let identity = view
+        .identity()
+        .ok_or(ProcessExecutionError::UnknownOutcome)?;
+    let descendants = DescendantEvidence::new(
+        view.binding().clone(),
+        identity.process_id().clone(),
+        Vec::new(),
+        false,
+        false,
+        None,
+    )?;
+    let exit = ExitStatus::new(ExitDisposition::Unknown, None, None, now_ms())?;
+    operation.state.exit(exit, descendants)?;
+    Ok(())
+}
+
+#[cfg(windows)]
+fn poison_operation(operation: &mut Operation, poisoned: &AtomicBool) {
+    operation.cleanup_required = true;
+    poisoned.store(true, Ordering::Release);
+    let _ = fence_unknown(operation);
+}
+
+#[cfg(windows)]
+fn spawn_deadline_watcher(operation: Arc<Mutex<Operation>>, poisoned: Arc<AtomicBool>) {
     let _ = thread::Builder::new()
         .name("eliot-p04-deadline".to_owned())
         .spawn(move || {
@@ -675,7 +731,9 @@ fn spawn_deadline_watcher(operation: Arc<Mutex<Operation>>) {
                     // reason to detach the Job.  Fence the operation as
                     // unknown and retain it for explicit reconciliation or
                     // final shutdown cleanup.
-                    let _ = finalize_operation(&mut guard, ExitDisposition::Unknown, false);
+                    if finalize_operation(&mut guard, ExitDisposition::Unknown, false).is_err() {
+                        poison_operation(&mut guard, &poisoned);
+                    }
                     return;
                 }
             }

@@ -20,7 +20,9 @@ use eliot_kernel_core::{GenerationRoute, GenerationRouter, RouteScope};
 use eliot_kernel_service::{
     KernelControlCommand, KernelService, KernelServiceError, KernelServiceState,
 };
-use eliot_ors::{CanonicalEvidenceProvider, OrsCoordinator, RedbRecoveryStore};
+#[cfg(test)]
+use eliot_ors::CanonicalEvidenceProvider;
+use eliot_ors::{OrsCoordinator, RedbRecoveryStore};
 use eliot_platform::PortError;
 use eliot_platform_windows::WindowsPlatform;
 use eliot_process::{
@@ -148,9 +150,9 @@ pub struct KernelComposition {
     runtime: Runtime,
     platform: WindowsPlatform,
     ipc: IpcImplementation,
-    ors: OrsCoordinator<RedbRecoveryStore>,
+    _ors: OrsCoordinator<RedbRecoveryStore>,
     service: Mutex<KernelService>,
-    generations: Mutex<GenerationRouter>,
+    _generations: Mutex<GenerationRouter>,
     front_door_policy: ServerHandshakePolicy,
     process_executor: WindowsProcessExecutor,
 }
@@ -189,8 +191,8 @@ impl KernelComposition {
     /// Builds all lower-layer surfaces once and binds them to one runtime.
     ///
     /// The default authority remains fail-closed until Host performs its
-    /// authenticated handoff.  Integrations with those provider proofs use
-    /// [`Self::new_with_adapters`].
+    /// authenticated handoff. Test-only adapter construction is available
+    /// under the test configuration.
     pub fn new(config: KernelConfig) -> Result<Self, KernelBuildError> {
         let work_root = config.work_root.clone();
         let ors_path = work_root.join(".eliot").join("kernel-ors.redb");
@@ -201,6 +203,7 @@ impl KernelComposition {
 
     /// Builds the production composition with Host-owned canonical evidence
     /// and the active P-07 dispatch authority adapters.
+    #[cfg(test)]
     pub fn new_with_adapters(
         config: KernelConfig,
         authority: Arc<dyn DispatchValidationPort>,
@@ -292,9 +295,9 @@ impl KernelComposition {
             runtime,
             platform,
             ipc,
-            ors,
+            _ors: ors,
             service: Mutex::new(service),
-            generations: Mutex::new(generations),
+            _generations: Mutex::new(generations),
             front_door_policy,
             process_executor: WindowsProcessExecutor::new(authority),
         })
@@ -415,25 +418,6 @@ impl KernelComposition {
             .lock()
             .map_err(|_| KernelServiceError::Platform("service lock poisoned".to_owned()))?
             .state())
-    }
-
-    /// Returns the generation router that owns daemon/child cutovers.
-    pub fn generations(&self) -> Result<std::sync::MutexGuard<'_, GenerationRouter>, String> {
-        self.generations
-            .lock()
-            .map_err(|_| "generation router lock poisoned".to_owned())
-    }
-
-    /// Exposes the transactional ORS bridge without exposing storage internals.
-    #[must_use]
-    pub const fn store_bridge(&self) -> &RedbRecoveryStore {
-        self.ors.store()
-    }
-
-    /// Returns the sole physical ProcessExecutor for child generations.
-    #[must_use]
-    pub const fn process_executor(&self) -> &WindowsProcessExecutor {
-        &self.process_executor
     }
 
     /// Returns the runtime's protected-control capacity.
