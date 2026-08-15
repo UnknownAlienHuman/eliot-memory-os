@@ -540,6 +540,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "eliot-ipc"
+version = "0.1.0"
+dependencies = [
+ "eliot-platform",
+ "eliot-platform-windows",
+ "eliot-protocol",
+ "eliot-runtime-contracts",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "windows-sys",
+]
+
+[[package]]
 name = "eliot-mcp"
 version = "0.1.0"
 dependencies = [
@@ -606,6 +621,19 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror",
+]
+
+[[package]]
+name = "eliot-platform-windows"
+version = "0.1.0"
+dependencies = [
+ "eliot-platform",
+ "eliot-runtime-contracts",
+ "eliot-security-contracts",
+ "schemars",
+ "serde",
+ "serde_json",
+ "windows-sys",
 ]
 
 [[package]]

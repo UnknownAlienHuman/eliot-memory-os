@@ -1,25 +1,23 @@
 [package]
 name = "eliot-ipc"
-version = "0.1.0"
-edition = "2024"
-rust-version = "1.89"
-license = "MIT"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
 description = "Bounded EBP/1 transport contract and Windows named-pipe adapter"
 
-[workspace]
-
 [dependencies]
-eliot-platform = { path = "../eliot-platform" }
-eliot-platform-windows = { path = "../eliot-platform-windows" }
-eliot-protocol = { path = "../../foundation/eliot-protocol" }
-eliot-runtime-contracts = { path = "../../foundation/eliot-runtime-contracts" }
-serde = { version = "1.0.228", features = ["derive"] }
-serde_json = "1.0.150"
-thiserror = "2.0.18"
-tokio = { version = "1.52.3", features = ["io-util", "macros", "net", "rt", "time"] }
+eliot-platform.workspace = true
+eliot-platform-windows.workspace = true
+eliot-protocol.workspace = true
+eliot-runtime-contracts.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_System_Pipes"] }
+windows-sys.workspace = true
 
 [lints.rust]
 unsafe_code = "allow"

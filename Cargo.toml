@@ -34,7 +34,9 @@ members = [
   "crates/storage/eliot-store-memory",
   "crates/instrument/eliot-graph-api",
   "crates/instrument/eliot-instrument-api",
+  "crates/kernel/eliot-ipc",
   "crates/kernel/eliot-platform",
+  "crates/kernel/eliot-platform-windows",
   "crates/kernel/eliot-process",
   "crates/kernel/eliot-runtime",
   "crates/modules/eliot-native-worker-core",
@@ -94,6 +96,7 @@ eliot-store-api = { path = "crates/storage/eliot-store-api", version = "0.1.0" }
 eliot-store-memory = { path = "crates/storage/eliot-store-memory", version = "0.1.0" }
 eliot-graph-api = { path = "crates/instrument/eliot-graph-api", version = "0.1.0" }
 eliot-instrument-api = { path = "crates/instrument/eliot-instrument-api", version = "0.1.0" }
+eliot-ipc = { path = "crates/kernel/eliot-ipc", version = "0.1.0" }
 eliot-agent-bridge-core = { path = "crates/surfaces/eliot-agent-bridge-core", version = "0.1.0" }
 eliot-agent-bridge = { path = "bins/eliot-agent-bridge", version = "0.1.0" }
 eliot-wasm-host = { path = "bins/eliot-wasm-host", version = "0.1.0" }
@@ -104,6 +107,7 @@ eliot-notify-core = { path = "crates/surfaces/eliot-notify-core", version = "0.1
 eliot-skills = { path = "crates/surfaces/eliot-skills", version = "0.1.0" }
 eliot-user-broker-core = { path = "crates/surfaces/eliot-user-broker-core", version = "0.1.0" }
 eliot-platform = { path = "crates/kernel/eliot-platform", version = "0.1.0" }
+eliot-platform-windows = { path = "crates/kernel/eliot-platform-windows", version = "0.1.0" }
 eliot-process = { path = "crates/kernel/eliot-process", version = "0.1.0" }
 eliot-runtime = { path = "crates/kernel/eliot-runtime", version = "0.1.0" }
 eliot-native-worker-core = { path = "crates/modules/eliot-native-worker-core", version = "0.1.0" }

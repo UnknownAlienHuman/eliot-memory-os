@@ -1,36 +1,27 @@
 [package]
 name = "eliot-platform-windows"
-version = "0.1.0"
-edition = "2024"
-rust-version = "1.89"
-license = "MIT"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
 description = "Windows adapters for the provider-neutral ELIOT platform ports"
 
-[workspace]
-
 [dependencies]
-eliot-platform = { path = "../eliot-platform", version = "0.1.0" }
-eliot-runtime-contracts = { path = "../../foundation/eliot-runtime-contracts", version = "0.1.0" }
-eliot-security-contracts = { path = "../../foundation/eliot-security-contracts", version = "0.1.0" }
-schemars = { version = "1.2.1", features = ["derive"] }
-serde = { version = "1.0.228", features = ["derive"] }
-windows-sys = { version = "0.61.2", features = [
-  "Win32_Foundation",
-  "Win32_Security",
-  "Win32_Security_Authorization",
+eliot-platform.workspace = true
+eliot-runtime-contracts.workspace = true
+eliot-security-contracts.workspace = true
+schemars.workspace = true
+serde.workspace = true
+windows-sys = { workspace = true, features = [
   "Win32_Security_Credentials",
   "Win32_Security_Cryptography",
-  "Win32_Storage_FileSystem",
   "Win32_System_Services",
   "Win32_System_RemoteDesktop",
-  "Win32_System_JobObjects",
-  "Win32_System_Pipes",
   "Win32_System_SystemInformation",
-  "Win32_System_Threading",
 ] }
 
 [dev-dependencies]
-serde_json = "1.0.150"
+serde_json.workspace = true
 
 [lints.rust]
 unsafe_code = "allow"
