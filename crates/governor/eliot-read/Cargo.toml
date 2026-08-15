@@ -1,0 +1,25 @@
+[package]
+name = "eliot-read"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Governor read facade with explicit query intent, consistency and provenance contracts"
+
+[package.metadata.eliot]
+work_id = "G-06"
+functional_cell = "governor_read"
+lifecycle_owner = "G-06"
+source_layer = "G"
+proof_entrypoint = "cargo test -p eliot-read"
+
+[dependencies]
+eliot-contracts.workspace = true
+eliot-store-api.workspace = true
+schemars.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true
