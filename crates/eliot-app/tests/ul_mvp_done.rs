@@ -586,6 +586,29 @@ fn d09_prediction_resolves_against_real_verifier() -> TestResult {
     let action_lease_id = required_string(&action, "/action_lease/lease_id")?;
     let provenance_hash = required_string(&action, "/action_lease/provenance_set_hash")?;
     let action_receipt = required_string(&action, "/write_receipt/receipt_id")?;
+    let stale_action = harness.client.tool_call(
+        731,
+        "eliot_task_action_request",
+        &json!({
+            "project_id": project_id,
+            "task_id": task_id,
+            "write_id": WriteId::new_v7(),
+            "expected_revision": action_revision,
+            "packet_id": required_string(&material_packet, "/packet_id")?,
+            "packet_revision_fence": required_u64(&material_packet, "/packet_revision_fence")?,
+            "task_contract_ref": required_string(&material_packet, "/task_contract_ref")?,
+            "current_truth_refs": material_packet["current_truth_refs"].clone(),
+            "provenance_handles": [action_receipt.clone()],
+            "negative_memory_checked": true,
+            "negative_memory_check_ref": required_string(
+                &material_packet,
+                "/negative_memory_check_ref"
+            )?,
+            "planned_action": "attempt action from a superseded packet",
+            "planned_verifier_ref": verifier_ref
+        }),
+    )?;
+    assert_eq!(stale_action["status"], "denied_invalid_provenance");
     let observed = harness.client.tool_call(
         74,
         "eliot_task_observation_record",
@@ -679,10 +702,49 @@ fn d10_memory_free_control_has_zero_ul_fields_and_zero_injection_receipts() -> T
         .filter(|key| key.starts_with("ul_"))
         .collect::<Vec<_>>();
 
-    assert!(
-        ul_fields.is_empty(),
-        "control leaked UL fields: {ul_fields:?}"
+    assert_eq!(
+        ul_fields,
+        ["ul_experiment"],
+        "control exposed memory-derived UL fields: {ul_fields:?}"
     );
+    assert_eq!(response["ul_experiment"]["arm"], "control");
+    assert_eq!(
+        response["ul_experiment"]["effective_memory_mode"],
+        "memory_free_control"
+    );
+    assert_eq!(
+        response["compile_audit"]["source_reads"]["current_state_reads"],
+        0
+    );
+    assert_eq!(response["compile_audit"]["source_reads"]["l0_reads"], 0);
+    assert_eq!(response["compile_audit"]["source_reads"]["l2_reads"], 0);
+    for counter in ["l0", "l2", "pyramid", "experience", "skill"] {
+        assert_eq!(
+            response["compile_audit"]["read_counters"][counter], 0,
+            "control read counter {counter} was not zero"
+        );
+    }
+    for memory_field in [
+        "current_truth",
+        "relevant_verified_claims",
+        "relevant_supported_claims",
+        "weak_claims_warning",
+        "negative_memory",
+        "recent_failures",
+        "known_decisions",
+        "open_questions",
+        "exact_handles",
+        "source_receipts",
+        "memory_decisions",
+        "experience_priors",
+        "historical_memory",
+    ] {
+        assert_eq!(
+            response[memory_field],
+            json!([]),
+            "{memory_field} leaked into the memory-free control"
+        );
+    }
     assert!(response.get("prediction_ref").is_none());
     assert!(receipts.is_empty());
     Ok(())

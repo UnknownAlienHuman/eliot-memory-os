@@ -591,50 +591,87 @@ struct CanonicalPacketRefs {
     packet_id: String,
     packet_revision_fence: MemoryRevision,
     task_contract_ref: String,
+    current_truth_refs: Vec<String>,
     negative_memory_check_ref: String,
 }
 
-async fn canonical_packet_refs(
-    state: &McpState,
-    task: &TaskContract,
-) -> Result<CanonicalPacketRefs> {
-    let current = state
-        .store
-        .current_state(&CurrentStateRequest {
-            project_id: task.project_id,
-            consistency: ReadConsistencyMode::Latest,
-            at_least_revision: None,
-        })
-        .await?;
-    let task_contract_ref = format!(
+fn canonical_packet_refs(state: &McpState, task: &TaskContract) -> Result<CanonicalPacketRefs> {
+    let authority = read_active_packet_authority(state, &task.task_id.to_string())?
+        .context("active packet authority is missing for the current TaskContract")?;
+    anyhow::ensure!(
+        authority.material.project_id == task.project_id
+            && authority.packet.project_id == task.project_id,
+        "active packet authority belongs to another project"
+    );
+
+    let response = authority
+        .response
+        .as_object()
+        .context("active packet authority response is not an object")?;
+    let packet_id = response
+        .get("packet_id")
+        .and_then(Value::as_str)
+        .context("active packet authority omits packet_id")?
+        .to_owned();
+    let packet_revision_fence = MemoryRevision::new(
+        response
+            .get("packet_revision_fence")
+            .and_then(Value::as_u64)
+            .context("active packet authority omits packet_revision_fence")?,
+    );
+    let task_contract_ref = response
+        .get("task_contract_ref")
+        .and_then(Value::as_str)
+        .context("active packet authority omits task_contract_ref")?
+        .to_owned();
+    let current_truth_refs: Vec<String> = serde_json::from_value(
+        response
+            .get("current_truth_refs")
+            .context("active packet authority omits current_truth_refs")?
+            .clone(),
+    )
+    .context("active packet authority current_truth_refs are invalid")?;
+    let negative_memory_check_ref = response
+        .get("negative_memory_check_ref")
+        .and_then(Value::as_str)
+        .context("active packet authority omits negative_memory_check_ref")?
+        .to_owned();
+    let response_task: TaskContract = serde_json::from_value(
+        response
+            .get("task_contract")
+            .context("active packet authority omits task_contract")?
+            .clone(),
+    )
+    .context("active packet authority task_contract is invalid")?;
+
+    let expected_task_contract_ref = format!(
         "eliot/task/{}@{}",
         task.task_id,
         task.memory_revision.value()
     );
-    let material = json!({
-        "project_id": task.project_id,
-        "task_id": task.task_id,
-        "task_revision": task.memory_revision,
-        "task_write_id": task.write_id,
-        "task_status": task.status,
-        "acceptance_items": task.acceptance_items,
-        "task_contract_ref": task_contract_ref,
-        "project_memory_revision": current.memory_revision,
-        "project_sequence": current.project_sequence,
-        "weak_or_candidate": current.weak_or_candidate,
-        "contested_now": current.contested_now,
-        "do_not_use": current.do_not_use,
-        "recent_failures": current.recent_failures
-    });
-    let packet_id = format!(
-        "eliot/packet/{}",
-        blake3::hash(&serde_json::to_vec(&material)?).to_hex()
+    anyhow::ensure!(
+        packet_id == authority.packet.packet_id
+            && packet_id == authority.material.packet_id
+            && packet_revision_fence == authority.packet.at_revision
+            && packet_revision_fence == authority.material.at_revision,
+        "active packet authority identity or revision fence mismatch"
     );
-    let negative_memory_check_ref = format!("eliot/negative-memory/{packet_id}");
+    anyhow::ensure!(
+        canonical_struct_hash(&response_task)? == canonical_struct_hash(task)?
+            && task_contract_ref == expected_task_contract_ref
+            && current_truth_refs == [task_contract_ref.clone()],
+        "active packet authority is stale for the current TaskContract"
+    );
+    anyhow::ensure!(
+        negative_memory_check_ref == format!("eliot/negative-memory/{packet_id}"),
+        "active packet authority negative-memory reference mismatch"
+    );
+
     Ok(CanonicalPacketRefs {
         packet_id,
-        packet_revision_fence: current.memory_revision,
+        packet_revision_fence,
         task_contract_ref,
+        current_truth_refs,
         negative_memory_check_ref,
     })
 }
@@ -889,11 +926,11 @@ async fn resolve_action_provenance(
     action_write_id: WriteId,
     input: &TaskActionToolInput,
 ) -> Result<(ActionProvenanceSet, RegisteredTaskVerifier)> {
-    let packet = canonical_packet_refs(state, task).await?;
+    let packet = canonical_packet_refs(state, task)?;
     if input.packet_id != packet.packet_id
         || input.packet_revision_fence != packet.packet_revision_fence.value()
         || input.task_contract_ref != packet.task_contract_ref
-        || input.current_truth_refs != [packet.task_contract_ref.clone()]
+        || input.current_truth_refs != packet.current_truth_refs
         || input.negative_memory_check_ref != packet.negative_memory_check_ref
     {
         anyhow::bail!("packet or current-truth reference is missing, stale, or fabricated");
@@ -939,7 +976,7 @@ async fn resolve_action_provenance(
         packet_id: packet.packet_id,
         packet_revision_fence: packet.packet_revision_fence,
         task_contract_ref: packet.task_contract_ref.clone(),
-        current_truth_refs: vec![packet.task_contract_ref],
+        current_truth_refs: packet.current_truth_refs,
         exact_evidence_refs,
         negative_memory_check_ref: packet.negative_memory_check_ref,
         planned_verifier_ref: verifier.reference(),
