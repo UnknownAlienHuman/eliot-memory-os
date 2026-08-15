@@ -1,0 +1,18 @@
+[package]
+name = "eliot-verifier"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Deterministic verifier planning, execution coordination, and result normalization"
+
+[dependencies]
+eliot-types.workspace = true
+sha2.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+time.workspace = true
+
+[lints]
+workspace = true
