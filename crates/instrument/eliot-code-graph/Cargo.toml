@@ -1,0 +1,14 @@
+[package]
+name = "eliot-code-graph"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.89"
+license = "MIT"
+description = "Durable, revisioned owner for bounded code-relationship graph projections"
+
+[dependencies]
+eliot-graph-api = { path = "../eliot-graph-api" }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = { version = "1.0.150", features = ["float_roundtrip"] }
+sha2 = "0.10.9"
+thiserror = "2.0.18"
