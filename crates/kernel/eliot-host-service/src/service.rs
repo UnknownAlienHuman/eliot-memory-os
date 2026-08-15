@@ -5,10 +5,11 @@ use std::fmt;
 use eliot_contracts::{RequestId, RequestMetadata};
 use eliot_kernel_service::{HostKernelHandshake, KernelReadyReceipt};
 use eliot_platform::{
-    HostActivationTransition, HostShutdownMarker, HostStateError, HostStateStore, PlatformHandle,
-    PortError, PortOutcome, ServiceObservation, ServiceOperation, ServicePort, ServiceRequest,
-    ServiceState,
+    HostActivationTransition, HostProcessRecoveryBinding, HostShutdownMarker, HostStateError,
+    HostStateStore, PlatformHandle, PortError, PortOutcome, ServiceObservation, ServiceOperation,
+    ServicePort, ServiceRequest, ServiceState,
 };
+use eliot_platform_windows::HostOwnerLease;
 use eliot_runtime_contracts::ServiceProcessRecord;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -77,6 +78,8 @@ pub struct KernelStartReceipt {
     pub service: PlatformHandle,
     /// Exact observed process record persisted by HostStateStore.
     pub process: ServiceProcessRecord,
+    /// Exact PID/image/Job recovery binding committed with the process record.
+    pub process_recovery: HostProcessRecoveryBinding,
     /// Whether the operation reused an already-running process.
     pub reused: bool,
 }
@@ -239,9 +242,11 @@ where
         &mut self,
         context: &RequestMetadata,
         service: PlatformHandle,
+        process_recovery: HostProcessRecoveryBinding,
     ) -> Result<KernelStartReceipt, HostServiceError> {
         validate_context(context)?;
         validate_handle(&service, "kernel.service")?;
+        process_recovery.validate()?;
         self.transition(HostServiceState::Starting)?;
         let inspect = self.execute(
             context,
@@ -303,7 +308,10 @@ where
             installation: self.installation.clone(),
             process: process.clone(),
         };
-        if let Err(error) = self.state_store.commit_activation(transition) {
+        if let Err(error) = self
+            .state_store
+            .commit_activation(transition, process_recovery.clone())
+        {
             self.fail(HostFailure::StateStore(error.to_string()));
             return Err(HostServiceError::StateStore(error));
         }
@@ -312,6 +320,7 @@ where
         Ok(KernelStartReceipt {
             service,
             process,
+            process_recovery,
             reused,
         })
     }
@@ -348,6 +357,8 @@ where
         context: &RequestMetadata,
         prior_service: PlatformHandle,
         candidate_service: PlatformHandle,
+        prior_recovery: HostProcessRecoveryBinding,
+        candidate_recovery: HostProcessRecoveryBinding,
         max_attempts: u32,
     ) -> Result<(BoundedRestartOutcome, KernelStartReceipt), HostServiceError> {
         validate_context(context)?;
@@ -367,13 +378,17 @@ where
             ) {
                 let _ = self.stop_kernel(context, prior_service.clone());
             }
-            match self.start_kernel(context, candidate_service.clone()) {
+            match self.start_kernel(
+                context,
+                candidate_service.clone(),
+                candidate_recovery.clone(),
+            ) {
                 Ok(receipt) => return Ok((BoundedRestartOutcome::CandidateActive, receipt)),
                 Err(error) => last_error = Some(error.to_string()),
             }
         }
         if candidate_service != prior_service {
-            let rollback = self.start_kernel(context, prior_service);
+            let rollback = self.start_kernel(context, prior_service, prior_recovery);
             if let Ok(receipt) = rollback {
                 return Ok((BoundedRestartOutcome::RolledBack, receipt));
             }
@@ -541,10 +556,10 @@ where
     /// Finalizes a previously prepared clean stop after the caller has
     /// released its installation-wide owner capability. The token is retained
     /// when release fails, so a retry cannot bypass the durable pending gate.
-    pub fn finalize_clean_shutdown<F>(&mut self, release_owner: F) -> Result<(), HostServiceError>
-    where
-        F: FnOnce() -> Result<(), HostServiceError>,
-    {
+    pub fn finalize_clean_shutdown(
+        &mut self,
+        owner_lease: &mut HostOwnerLease,
+    ) -> Result<(), HostServiceError> {
         let token = self
             .pending_release
             .take()
@@ -552,8 +567,9 @@ where
                 from: self.state,
                 to: HostServiceState::StoppedClean,
             })?;
-        if let Err(error) = release_owner() {
+        if let Err(error) = owner_lease.release() {
             self.pending_release = Some(token);
+            let error = HostServiceError::KernelHandoff(error.to_string());
             self.fail(HostFailure::Platform(error.to_string()));
             return Err(error);
         }
@@ -600,6 +616,12 @@ where
     }
 
     fn transition(&mut self, next: HostServiceState) -> Result<(), HostServiceError> {
+        if next == HostServiceState::Starting && self.pending_release.is_some() {
+            return Err(HostServiceError::IllegalTransition {
+                from: self.state,
+                to: next,
+            });
+        }
         let legal = matches!(
             (self.state, next),
             (

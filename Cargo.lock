@@ -933,6 +933,7 @@ dependencies = [
  "eliot-contracts",
  "eliot-kernel-service",
  "eliot-platform",
+ "eliot-platform-windows",
  "eliot-runtime-contracts",
  "schemars",
  "serde",

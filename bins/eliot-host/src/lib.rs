@@ -632,7 +632,7 @@ impl HostComposition {
         // projection had no clean marker, this deliberately remains an
         // unclean recovery until stop() writes the shutdown receipt.
         state_store
-            .commit_activation_with_recovery(
+            .commit_activation(
                 eliot_platform::HostActivationTransition {
                     context: lifecycle_context(&host, "host-open")?,
                     installation: host.installation.clone(),
@@ -914,7 +914,7 @@ impl HostComposition {
             let kernel_record = process_record(kernel, "Kernel", &self.host)?;
             let kernel_recovery = self.jobs.kernel_recovery_binding(&generation)?;
             self.state_store
-                .commit_activation_with_recovery(
+                .commit_activation(
                     eliot_platform::HostActivationTransition {
                         context: lifecycle_context(&self.host, "kernel-activation")?,
                         installation: self.host.installation.clone(),

@@ -804,14 +804,14 @@ impl HostInstallationState {
                 }
             }
             HostShutdownDisposition::RecoveryFinalized { marker } => {
-                if marker.installation != self.installation
-                    || self.active_process.is_some()
-                    || self.last_recovery_evidence.as_ref().is_none_or(|evidence| {
-                        evidence.release_marker != *marker
-                            || evidence.stale_active_process != marker.process
-                    })
-                {
+                if marker.installation != self.installation || self.active_process.is_some() {
                     return Err(HostStateError::InvalidRecord);
+                }
+                match self.last_recovery_evidence.as_ref() {
+                    Some(evidence)
+                        if evidence.release_marker == *marker
+                            && evidence.stale_active_process == marker.process => {}
+                    _ => return Err(HostStateError::InvalidRecord),
                 }
             }
             HostShutdownDisposition::Clean => {}
@@ -917,6 +917,7 @@ pub trait HostStateStore: Send + Sync {
     fn commit_activation(
         &self,
         transition: HostActivationTransition,
+        process_recovery: HostProcessRecoveryBinding,
     ) -> Result<HostActivationReceipt, HostStateError>;
     fn record_dependency(
         &self,
@@ -1117,8 +1118,10 @@ impl HostStateStore for FakeHostStateStore {
     fn commit_activation(
         &self,
         transition: HostActivationTransition,
+        process_recovery: HostProcessRecoveryBinding,
     ) -> Result<HostActivationReceipt, HostStateError> {
         transition.validate()?;
+        process_recovery.validate()?;
         let mut state = self
             .state
             .lock()
@@ -1130,7 +1133,7 @@ impl HostStateStore for FakeHostStateStore {
         state.last_clean_shutdown = None;
         state.last_recovery_evidence = None;
         state.disposition = HostShutdownDisposition::Clean;
-        state.active_process_recovery = None;
+        state.active_process_recovery = Some(process_recovery);
         Ok(HostActivationReceipt {
             request_id: transition.context.request_id,
             installation: transition.installation,
@@ -1517,23 +1520,23 @@ mod tests {
         })
         .unwrap_or_else(|_| unreachable!());
         let host = process("host-1", "Host", ServiceProcessState::Ready);
+        let host_recovery = HostProcessRecoveryBinding {
+            process_generation: handle("generation-1"),
+            process_id: 1,
+            image_path: handle("image-1"),
+            job: HostJobDisposition::NotAssigned,
+        };
         let activation = store
-            .commit_activation(HostActivationTransition {
-                context: context("activation"),
-                installation: installation.clone(),
-                process: host.clone(),
-            })
+            .commit_activation(
+                HostActivationTransition {
+                    context: context("activation"),
+                    installation: installation.clone(),
+                    process: host.clone(),
+                },
+                host_recovery.clone(),
+            )
             .unwrap_or_else(|_| unreachable!());
         assert_eq!(activation.process, host);
-        {
-            let mut state = store.state.lock().unwrap_or_else(|_| unreachable!());
-            state.active_process_recovery = Some(HostProcessRecoveryBinding {
-                process_generation: handle("generation-1"),
-                process_id: 1,
-                image_path: handle("image-1"),
-                job: HostJobDisposition::NotAssigned,
-            });
-        }
         let dependency = process("store-1", "CanonicalStore", ServiceProcessState::Ready);
         store
             .record_dependency(ManagedDependencyTransition {
@@ -1550,11 +1553,14 @@ mod tests {
             vec![dependency]
         );
         assert!(matches!(
-            store.commit_activation(HostActivationTransition {
-                context: context("wrong-installation"),
-                installation: handle("installation-2"),
-                process: host.clone(),
-            }),
+            store.commit_activation(
+                HostActivationTransition {
+                    context: context("wrong-installation"),
+                    installation: handle("installation-2"),
+                    process: host.clone(),
+                },
+                host_recovery
+            ),
             Err(HostStateError::InstallationMismatch)
         ));
         let token = store
@@ -1570,6 +1576,63 @@ mod tests {
         let final_state = store.load_installation().unwrap_or_else(|_| unreachable!());
         assert!(final_state.active_process.is_none());
         assert!(final_state.last_clean_shutdown.is_some());
+    }
+
+    #[test]
+    fn activation_rejects_missing_process_recovery_proof() {
+        let installation = handle("installation-binding");
+        let store = FakeHostStateStore::new(HostInstallationState {
+            installation: installation.clone(),
+            active_process: None,
+            managed_dependencies: Vec::new(),
+            last_clean_shutdown: None,
+            disposition: HostShutdownDisposition::Clean,
+            active_process_recovery: None,
+            last_recovery_evidence: None,
+        })
+        .unwrap_or_else(|_| unreachable!());
+        let result = store.commit_activation(
+            HostActivationTransition {
+                context: context("invalid-binding"),
+                installation,
+                process: process("host-binding", "Host", ServiceProcessState::Ready),
+            },
+            HostProcessRecoveryBinding {
+                process_generation: handle("generation-binding"),
+                process_id: 0,
+                image_path: handle("image-binding"),
+                job: HostJobDisposition::NotAssigned,
+            },
+        );
+        assert!(matches!(result, Err(HostStateError::InvalidRecord)));
+    }
+
+    #[test]
+    fn recovery_finalized_requires_exact_recovery_evidence() {
+        let installation = handle("installation-recovery-finalized");
+        let process = process(
+            "host-recovery-finalized",
+            "Host",
+            ServiceProcessState::Ready,
+        );
+        let marker = HostShutdownMarker {
+            context: context("recovery-finalized"),
+            installation: installation.clone(),
+            process,
+        };
+        let state = HostInstallationState {
+            installation,
+            active_process: None,
+            managed_dependencies: Vec::new(),
+            last_clean_shutdown: None,
+            disposition: HostShutdownDisposition::RecoveryFinalized { marker },
+            active_process_recovery: None,
+            last_recovery_evidence: None,
+        };
+        assert!(matches!(
+            state.validate(),
+            Err(HostStateError::InvalidRecord)
+        ));
     }
 
     #[test]

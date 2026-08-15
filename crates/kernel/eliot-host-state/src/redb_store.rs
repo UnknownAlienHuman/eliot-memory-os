@@ -12,7 +12,7 @@ use eliot_platform::{
     PlatformHandle,
 };
 use eliot_runtime_contracts::ServiceProcessRecord;
-use redb::{Database, ReadOnlyDatabase, ReadableDatabase, TableDefinition};
+use redb::{Database, ReadOnlyDatabase, ReadableDatabase, ReadableTable, TableDefinition};
 
 const STATE: TableDefinition<&str, &[u8]> = TableDefinition::new("eliot_host_state_v1");
 const INSTALLATION: &str = "installation";
@@ -192,16 +192,8 @@ impl RedbHostStateStore {
         evidence: HostRecoveryEvidence,
     ) -> Result<RedbHostReleaseToken, HostStateError> {
         evidence.validate()?;
-        let current_epoch = host_epoch_binding(
-            self.read_epoch()?
-                .as_ref()
-                .ok_or(HostStateError::Unavailable)?,
-        )?;
-        if current_epoch != evidence.host_epoch {
-            return Err(HostStateError::InvalidRecord);
-        }
         let installation = evidence.installation.clone();
-        self.mutate(installation.as_str(), |state| {
+        self.mutate_with_epoch(installation.as_str(), &evidence.host_epoch, |state| {
             let exact_existing = state.active_process.as_ref()
                 == Some(&evidence.stale_active_process)
                 && state.active_process_recovery.as_ref() == Some(&evidence.process)
@@ -243,16 +235,8 @@ impl RedbHostStateStore {
             .recovery
             .as_ref()
             .ok_or(HostStateError::InvalidRecord)?;
-        let current_epoch = host_epoch_binding(
-            self.read_epoch()?
-                .as_ref()
-                .ok_or(HostStateError::Unavailable)?,
-        )?;
-        if current_epoch != evidence.host_epoch {
-            return Err(HostStateError::InvalidRecord);
-        }
         let installation = evidence.installation.clone();
-        self.mutate(installation.as_str(), |state| {
+        self.mutate_with_epoch(installation.as_str(), &evidence.host_epoch, |state| {
             if state.active_process.as_ref() != Some(&evidence.stale_active_process)
                 || state.active_process_recovery.as_ref() != Some(&evidence.process)
                 || state.disposition
@@ -278,42 +262,44 @@ impl RedbHostStateStore {
         &self,
         token: RedbHostReleaseToken,
     ) -> Result<(), HostStateError> {
-        let installation = token.marker.installation.clone();
-        self.mutate(installation.as_str(), |state| {
-            match token.recovery {
-                None => {
-                    if state.active_process.as_ref() != Some(&token.marker.process)
-                        || state.active_process_recovery.is_none()
-                        || state.disposition
-                            != (HostShutdownDisposition::ReleasePending {
-                                marker: token.marker.clone(),
-                            })
-                    {
-                        return Err(HostStateError::InvalidRecord);
-                    }
-                    state.active_process = None;
-                    state.active_process_recovery = None;
-                    state.disposition = HostShutdownDisposition::Clean;
-                    state.last_clean_shutdown = Some(token.marker.clone());
-                    state.last_recovery_evidence = None;
+        let marker = token.marker;
+        let installation = marker.installation.clone();
+        match token.recovery {
+            None => self.mutate(installation.as_str(), |state| {
+                if state.active_process.as_ref() != Some(&marker.process)
+                    || state.active_process_recovery.is_none()
+                    || state.disposition
+                        != (HostShutdownDisposition::ReleasePending {
+                            marker: marker.clone(),
+                        })
+                {
+                    return Err(HostStateError::InvalidRecord);
                 }
-                Some(evidence) => {
+                state.active_process = None;
+                state.active_process_recovery = None;
+                state.disposition = HostShutdownDisposition::Clean;
+                state.last_clean_shutdown = Some(marker.clone());
+                state.last_recovery_evidence = None;
+                Ok(())
+            }),
+            Some(evidence) => {
+                self.mutate_with_epoch(installation.as_str(), &evidence.host_epoch, |state| {
                     if state.active_process.is_some()
                         || state.active_process_recovery.is_some()
                         || state.last_recovery_evidence.as_ref() != Some(&evidence)
                         || state.disposition
                             != (HostShutdownDisposition::RecoveryFinalized {
-                                marker: token.marker.clone(),
+                                marker: marker.clone(),
                             })
                     {
                         return Err(HostStateError::InvalidRecord);
                     }
                     state.disposition = HostShutdownDisposition::Clean;
-                    state.last_clean_shutdown = Some(token.marker.clone());
-                }
+                    state.last_clean_shutdown = Some(marker.clone());
+                    Ok(())
+                })
             }
-            Ok(())
-        })
+        }
     }
 
     /// Opens or creates a Host state database and installs the initial
@@ -432,12 +418,88 @@ impl RedbHostStateStore {
     where
         F: FnOnce(&mut HostInstallationState) -> Result<(), HostStateError>,
     {
-        let mut state = self.read_state()?.ok_or(HostStateError::Unavailable)?;
+        let write = self
+            .database
+            .begin_write()
+            .map_err(|_| HostStateError::Unavailable)?;
+        let mut table = write
+            .open_table(STATE)
+            .map_err(|_| HostStateError::Unavailable)?;
+        let mut state: HostInstallationState = table
+            .get(INSTALLATION)
+            .map_err(|_| HostStateError::Unavailable)?
+            .map(|value| {
+                serde_json::from_slice(value.value()).map_err(|_| HostStateError::Unavailable)
+            })
+            .transpose()?
+            .ok_or(HostStateError::Unavailable)?;
+        state.validate()?;
         if state.installation.as_str() != installation {
             return Err(HostStateError::InstallationMismatch);
         }
         mutation(&mut state)?;
-        self.write_state(&state)
+        state.validate()?;
+        let bytes = serde_json::to_vec(&state).map_err(|_| HostStateError::Unavailable)?;
+        table
+            .insert(INSTALLATION, bytes.as_slice())
+            .map_err(|_| HostStateError::Unavailable)?;
+        drop(table);
+        write.commit().map_err(|_| HostStateError::Unavailable)
+    }
+
+    fn mutate_with_epoch<F>(
+        &self,
+        installation: &str,
+        expected_epoch: &HostEpochBinding,
+        mutation: F,
+    ) -> Result<(), HostStateError>
+    where
+        F: FnOnce(&mut HostInstallationState) -> Result<(), HostStateError>,
+    {
+        let write = self
+            .database
+            .begin_write()
+            .map_err(|_| HostStateError::Unavailable)?;
+        let epoch_table = write
+            .open_table(EPOCH)
+            .map_err(|_| HostStateError::Unavailable)?;
+        let epoch: HostInstallationEpoch = epoch_table
+            .get(CURRENT_EPOCH)
+            .map_err(|_| HostStateError::Unavailable)?
+            .map(|value| {
+                serde_json::from_slice(value.value()).map_err(|_| HostStateError::Unavailable)
+            })
+            .transpose()?
+            .ok_or(HostStateError::Unavailable)?;
+        let current_epoch = host_epoch_binding(&epoch)?;
+        if current_epoch != *expected_epoch {
+            return Err(HostStateError::InvalidRecord);
+        }
+        drop(epoch_table);
+
+        let mut state_table = write
+            .open_table(STATE)
+            .map_err(|_| HostStateError::Unavailable)?;
+        let mut state: HostInstallationState = state_table
+            .get(INSTALLATION)
+            .map_err(|_| HostStateError::Unavailable)?
+            .map(|value| {
+                serde_json::from_slice(value.value()).map_err(|_| HostStateError::Unavailable)
+            })
+            .transpose()?
+            .ok_or(HostStateError::Unavailable)?;
+        state.validate()?;
+        if state.installation.as_str() != installation {
+            return Err(HostStateError::InstallationMismatch);
+        }
+        mutation(&mut state)?;
+        state.validate()?;
+        let bytes = serde_json::to_vec(&state).map_err(|_| HostStateError::Unavailable)?;
+        state_table
+            .insert(INSTALLATION, bytes.as_slice())
+            .map_err(|_| HostStateError::Unavailable)?;
+        drop(state_table);
+        write.commit().map_err(|_| HostStateError::Unavailable)
     }
 }
 
@@ -567,7 +629,7 @@ impl RedbHostStateStore {
     /// Commits activation and its exact process/PID/image/job recovery binding
     /// in one redb write transaction. A crash cannot expose only half of this
     /// projection.
-    pub fn commit_activation_with_recovery(
+    fn commit_activation_atomic(
         &self,
         transition: HostActivationTransition,
         process_recovery: HostProcessRecoveryBinding,
@@ -603,13 +665,10 @@ impl HostStateStore for RedbHostStateStore {
 
     fn commit_activation(
         &self,
-        _transition: HostActivationTransition,
+        transition: HostActivationTransition,
+        process_recovery: HostProcessRecoveryBinding,
     ) -> Result<HostActivationReceipt, HostStateError> {
-        // The Redb production store cannot safely admit an active process
-        // without its exact PID/image/job recovery binding. Callers must use
-        // `commit_activation_with_recovery`, which commits both projections in
-        // one transaction.
-        Err(HostStateError::InvalidRecord)
+        self.commit_activation_atomic(transition, process_recovery)
     }
 
     fn record_dependency(
