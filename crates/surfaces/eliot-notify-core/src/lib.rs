@@ -377,12 +377,17 @@ pub enum LedgerCommitOutcome {
 
 /// Durable idempotency/replay owner. A-10 never implements persistence.
 pub trait OneShotLedgerPort {
-    fn reserve(&mut self, intent: &LedgerIntent) -> LedgerReserveOutcome;
+    fn reserve(
+        &mut self,
+        intent: &LedgerIntent,
+        request: &NotificationRequest,
+    ) -> LedgerReserveOutcome;
 
     fn commit(
         &mut self,
         reservation: &LedgerReservation,
         observation: &DeliveryObservation,
+        request: &NotificationRequest,
     ) -> LedgerCommitOutcome;
 }
 
@@ -813,7 +818,7 @@ where
             provider: ProviderId::OneShotLedger,
             reason: "durable one-shot ledger port is missing",
         })?;
-        let reservation = match ledger.reserve(&ledger_intent) {
+        let reservation = match ledger.reserve(&ledger_intent, request) {
             LedgerReserveOutcome::Reserved { reservation } => {
                 if reservation.one_shot_key != one_shot_key
                     || reservation.claim_digest != claim_digest
@@ -924,7 +929,7 @@ where
         };
         observation.validate()?;
 
-        match ledger.commit(&reservation, &observation) {
+        match ledger.commit(&reservation, &observation, request) {
             LedgerCommitOutcome::Committed => Ok(observation),
             LedgerCommitOutcome::Replay {
                 observation: mut replay,
@@ -1650,7 +1655,11 @@ mod tests {
     }
 
     impl OneShotLedgerPort for DurableLedger {
-        fn reserve(&mut self, intent: &LedgerIntent) -> LedgerReserveOutcome {
+        fn reserve(
+            &mut self,
+            intent: &LedgerIntent,
+            _request: &NotificationRequest,
+        ) -> LedgerReserveOutcome {
             let mut state = self.state.lock().unwrap();
             if let Some((claim, observation)) = state.entries.get(&intent.one_shot_key) {
                 if claim != &intent.claim_digest {
@@ -1684,6 +1693,7 @@ mod tests {
             &mut self,
             reservation: &LedgerReservation,
             observation: &DeliveryObservation,
+            _request: &NotificationRequest,
         ) -> LedgerCommitOutcome {
             let mut state = self.state.lock().unwrap();
             let Some((claim, stored)) = state.entries.get_mut(&reservation.one_shot_key) else {
@@ -1705,7 +1715,11 @@ mod tests {
     struct UnavailableLedger;
 
     impl OneShotLedgerPort for UnavailableLedger {
-        fn reserve(&mut self, _intent: &LedgerIntent) -> LedgerReserveOutcome {
+        fn reserve(
+            &mut self,
+            _intent: &LedgerIntent,
+            _request: &NotificationRequest,
+        ) -> LedgerReserveOutcome {
             LedgerReserveOutcome::Unavailable
         }
 
@@ -1713,6 +1727,7 @@ mod tests {
             &mut self,
             _reservation: &LedgerReservation,
             _observation: &DeliveryObservation,
+            _request: &NotificationRequest,
         ) -> LedgerCommitOutcome {
             LedgerCommitOutcome::Unavailable
         }

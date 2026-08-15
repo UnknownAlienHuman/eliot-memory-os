@@ -2,9 +2,7 @@ use std::io::{self, BufRead, Write};
 use std::path::PathBuf;
 
 use eliot_notify::{NotificationComposition, PROTOCOL_VERSION, SERVICE_NAME};
-use eliot_notify_core::{
-    NotificationEnvelope, NotifyError, SignedWatchdogFallbackEnvelope, VerificationPorts,
-};
+use eliot_notify_core::{NotificationEnvelope, NotifyError, SignedWatchdogFallbackEnvelope};
 use eliot_platform::NotificationRequest;
 use serde::{Deserialize, Serialize};
 
@@ -58,16 +56,7 @@ fn main() {
             error.to_string(),
         ),
     };
-    let mut composition = match NotificationComposition::new(
-        root,
-        VerificationPorts {
-            a08: None,
-            g08: None,
-            watchdog: None,
-            delivery_receipt: None,
-            ledger: None,
-        },
-    ) {
+    let mut composition = match NotificationComposition::from_kernel(root) {
         Ok(composition) => composition,
         Err(error) => exit(
             PROVIDER_REJECTED_EXIT,
