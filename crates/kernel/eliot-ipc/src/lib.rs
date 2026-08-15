@@ -241,6 +241,9 @@ fn map_platform_error(error: eliot_platform_windows::WindowsAdapterError) -> Tra
         },
         WindowsAdapterError::Timeout => TransportError::Timeout,
         WindowsAdapterError::InvalidInput => TransportError::InvalidPipeName,
+        WindowsAdapterError::NotFound | WindowsAdapterError::AlreadyExists => {
+            TransportError::Io(error.to_string())
+        }
         WindowsAdapterError::PermissionDenied | WindowsAdapterError::Failed => {
             TransportError::Io(error.to_string())
         }

@@ -17,15 +17,16 @@ mod lifecycle;
 mod protocol;
 
 pub use lifecycle::{
-    AdmissionLease, KernelService, KernelServiceError, KernelServiceState,
-    ServiceFailure,
+    AdmissionLease, KernelService, KernelServiceError, KernelServiceState, ServiceFailure,
 };
 pub use protocol::{
     ContainmentAction, HostKernelHandshake, KernelControlCommand, KernelReadyReceipt,
     ProcessObservation, RestartBudget,
 };
 
-use eliot_contracts::{ContractIdentity, ContractVersion, contract_identity as make_contract_identity};
+use eliot_contracts::{
+    ContractIdentity, ContractVersion, contract_identity as make_contract_identity,
+};
 use thiserror::Error;
 
 /// Stable wire name for the Kernel service boundary.

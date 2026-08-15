@@ -69,17 +69,25 @@ impl KernelServiceState {
                 | (Self::Stopped, Self::Reconciling)
                 | (Self::Failed, Self::Reconciling | Self::ManualRecovery)
                 | (Self::Reconciling, Self::ShadowNoAuthority | Self::Failed)
-                | (Self::ShadowNoAuthority, Self::HandoffPrepared | Self::Failed)
+                | (
+                    Self::ShadowNoAuthority,
+                    Self::HandoffPrepared | Self::Failed
+                )
                 | (Self::HandoffPrepared, Self::Activating | Self::Failed)
-                | (Self::Activating, Self::Ready | Self::Degraded | Self::Failed)
+                | (
+                    Self::Activating,
+                    Self::Ready | Self::Degraded | Self::Failed
+                )
                 | (Self::Ready, Self::Degraded | Self::Draining | Self::Failed)
                 | (Self::Degraded, Self::Ready | Self::Draining | Self::Failed)
                 | (Self::Draining, Self::Stopped | Self::Failed)
         );
-        legal.then_some(next).ok_or(KernelServiceError::IllegalTransition {
-            from: self,
-            to: next,
-        })
+        legal
+            .then_some(next)
+            .ok_or(KernelServiceError::IllegalTransition {
+                from: self,
+                to: next,
+            })
     }
 }
 
@@ -166,6 +174,19 @@ impl AdmissionLease {
         self.authority_epoch
     }
 
+    /// Returns the opaque held permit for transition-gateway instrumentation.
+    #[must_use]
+    pub const fn control_permit(&self) -> &ControlPermit {
+        &self.permit
+    }
+
+    /// Releases the bounded control capacity held by this lease.
+    ///
+    /// Dropping a lease also releases the permit; this explicit operation is
+    /// provided for transition gateways that model release as a named step.
+    pub fn release(self) {
+        drop(self);
+    }
 }
 
 /// The in-process Kernel service owner.
@@ -230,11 +251,18 @@ impl KernelService {
     }
 
     /// Applies one lifecycle command through the single Kernel transition boundary.
-    pub fn apply(&mut self, command: KernelControlCommand) -> Result<KernelServiceState, KernelServiceError> {
+    pub fn apply(
+        &mut self,
+        command: KernelControlCommand,
+    ) -> Result<KernelServiceState, KernelServiceError> {
         match command {
             KernelControlCommand::Reconcile(handshake) => self.reconcile(handshake)?,
-            KernelControlCommand::Shadow => self.transition(KernelServiceState::ShadowNoAuthority)?,
-            KernelControlCommand::PrepareHandoff => self.transition(KernelServiceState::HandoffPrepared)?,
+            KernelControlCommand::Shadow => {
+                self.transition(KernelServiceState::ShadowNoAuthority)?
+            }
+            KernelControlCommand::PrepareHandoff => {
+                self.transition(KernelServiceState::HandoffPrepared)?
+            }
             KernelControlCommand::Activate => self.transition(KernelServiceState::Activating)?,
             KernelControlCommand::Ready(receipt) => self.mark_ready(receipt)?,
             KernelControlCommand::Degrade(reason) => {
@@ -259,7 +287,10 @@ impl KernelService {
         if self.state == KernelServiceState::Failed && handshake.containment_action.is_none() {
             return Err(KernelServiceError::MissingContainmentEvidence);
         }
-        if matches!(self.state, KernelServiceState::Ready | KernelServiceState::Draining) {
+        if matches!(
+            self.state,
+            KernelServiceState::Ready | KernelServiceState::Draining
+        ) {
             return Err(KernelServiceError::IllegalTransition {
                 from: self.state,
                 to: KernelServiceState::Reconciling,
@@ -274,9 +305,12 @@ impl KernelService {
 
     /// Publishes a readiness receipt after exact handshake and health checks.
     pub fn mark_ready(&mut self, receipt: KernelReadyReceipt) -> Result<(), KernelServiceError> {
-        let handshake = self.handshake.as_ref().ok_or(KernelServiceError::HandshakeMismatch {
-            field: "missing_handshake",
-        })?;
+        let handshake = self
+            .handshake
+            .as_ref()
+            .ok_or(KernelServiceError::HandshakeMismatch {
+                field: "missing_handshake",
+            })?;
         if self.state != KernelServiceState::Activating {
             return Err(KernelServiceError::IllegalTransition {
                 from: self.state,
@@ -307,7 +341,10 @@ impl KernelService {
         if self.state != KernelServiceState::Ready {
             return Err(KernelServiceError::AdmissionClosed(self.state));
         }
-        let handshake = self.handshake.as_ref().ok_or(KernelServiceError::AdmissionClosed(self.state))?;
+        let handshake = self
+            .handshake
+            .as_ref()
+            .ok_or(KernelServiceError::AdmissionClosed(self.state))?;
         let permit = self
             .front_door
             .acquire_control()

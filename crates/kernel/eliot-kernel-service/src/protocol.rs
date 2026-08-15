@@ -5,7 +5,6 @@ use eliot_platform::{PlatformHandle, PortError};
 use eliot_runtime_contracts::{HealthVector, ServiceProcessState};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use thiserror::Error;
 
 use crate::{KernelServiceError, validate_text};
 
