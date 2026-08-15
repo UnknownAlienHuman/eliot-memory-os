@@ -56,6 +56,71 @@ members = [
   "crates/surfaces/eliot-notify-core",
   "crates/surfaces/eliot-skills",
   "crates/surfaces/eliot-user-broker-core",
+  "crates/kernel/eliot-host-service",
+  "crates/kernel/eliot-installation",
+  "crates/kernel/eliot-kernel-service",
+  "crates/storage/eliot-backup",
+  "crates/storage/eliot-ecxf",
+  "crates/governor/eliot-canonical",
+  "crates/governor/eliot-change-monitor",
+  "crates/governor/eliot-coordination",
+  "crates/governor/eliot-finish",
+  "crates/governor/eliot-governor",
+  "crates/governor/eliot-maintenance",
+  "crates/governor/eliot-module-registry",
+  "crates/governor/eliot-observation",
+  "crates/governor/eliot-read",
+  "crates/governor/eliot-session",
+  "crates/governor/eliot-skill",
+  "crates/governor/eliot-task",
+  "crates/instrument/eliot-artifact",
+  "crates/instrument/eliot-build-test-graph",
+  "crates/instrument/eliot-code-cortex",
+  "crates/instrument/eliot-code-graph",
+  "crates/instrument/eliot-diagnostic",
+  "crates/instrument/eliot-empirical-profile",
+  "crates/instrument/eliot-instrument-cargo",
+  "crates/instrument/eliot-instrument-dotnet",
+  "crates/instrument/eliot-instrument-nextest",
+  "crates/instrument/eliot-instrument-runner",
+  "crates/instrument/eliot-instrument-rustc",
+  "crates/instrument/eliot-instrument-rustfmt",
+  "crates/instrument/eliot-instrument-scip",
+  "crates/instrument/eliot-observability",
+  "crates/instrument/eliot-product-evaluation",
+  "crates/instrument/eliot-reports",
+  "crates/instrument/eliot-test-selection",
+  "crates/instrument/eliot-testd-core",
+  "crates/instrument/eliot-verifier",
+  "crates/meta/eliot-doctor-core",
+  "crates/meta/eliot-improvement",
+  "crates/security/eliot-erasure",
+  "crates/security/eliot-influence",
+  "crates/smart/eliot-context",
+  "crates/smart/eliot-cues",
+  "crates/smart/eliot-dreamer-core",
+  "crates/smart/eliot-epistemic",
+  "crates/smart/eliot-memory",
+  "crates/smart/eliot-memory-curation",
+  "crates/smart/eliot-system-experience",
+  "crates/smart/eliot-understanding",
+  "crates/supervision/eliot-watchdog-core",
+  "crates/research/eliot-research-exchange",
+  "crates/research/eliot-research-exchange-api",
+  "crates/research/eliot-researcher",
+  "bins/eliot",
+  "bins/eliot-doctor",
+  "bins/eliot-dreamer",
+  "bins/eliot-host",
+  "bins/eliot-kernel",
+  "bins/eliot-mod-research",
+  "bins/eliot-native-worker",
+  "bins/eliot-notify",
+  "bins/eliot-store-surreal",
+  "bins/eliot-testd",
+  "bins/eliot-user-broker",
+  "bins/eliot-watchdog",
+  "bins/eliotd",
   "workspace/tools/eliot-runtime-compiler",
   "workspace/tools/eliot-campaign-executor",
 ]
@@ -128,6 +193,58 @@ eliot-runtime = { path = "crates/kernel/eliot-runtime", version = "0.1.0" }
 eliot-native-worker-core = { path = "crates/modules/eliot-native-worker-core", version = "0.1.0" }
 eliot-wasm-runtime = { path = "crates/modules/eliot-wasm-runtime", version = "0.1.0" }
 eliot-source-assurance = { path = "crates/security/eliot-source-assurance", version = "0.1.0" }
+eliot-host-service = { path = "crates/kernel/eliot-host-service", version = "0.1.0" }
+eliot-installation = { path = "crates/kernel/eliot-installation", version = "0.1.0" }
+eliot-kernel-service = { path = "crates/kernel/eliot-kernel-service", version = "0.1.0" }
+eliot-backup = { path = "crates/storage/eliot-backup", version = "0.1.0" }
+eliot-ecxf = { path = "crates/storage/eliot-ecxf", version = "0.1.0" }
+eliot-canonical = { path = "crates/governor/eliot-canonical", version = "0.1.0" }
+eliot-change-monitor = { path = "crates/governor/eliot-change-monitor", version = "0.1.0" }
+eliot-coordination = { path = "crates/governor/eliot-coordination", version = "0.1.0" }
+eliot-finish = { path = "crates/governor/eliot-finish", version = "0.1.0" }
+eliot-governor = { path = "crates/governor/eliot-governor", version = "0.1.0" }
+eliot-maintenance = { path = "crates/governor/eliot-maintenance", version = "0.1.0" }
+eliot-module-registry = { path = "crates/governor/eliot-module-registry", version = "0.1.0" }
+eliot-observation = { path = "crates/governor/eliot-observation", version = "0.1.0" }
+eliot-read = { path = "crates/governor/eliot-read", version = "0.1.0" }
+eliot-session = { path = "crates/governor/eliot-session", version = "0.1.0" }
+eliot-skill = { path = "crates/governor/eliot-skill", version = "0.1.0" }
+eliot-task = { path = "crates/governor/eliot-task", version = "0.1.0" }
+eliot-artifact = { path = "crates/instrument/eliot-artifact", version = "0.1.0" }
+eliot-build-test-graph = { path = "crates/instrument/eliot-build-test-graph", version = "0.1.0" }
+eliot-code-cortex = { path = "crates/instrument/eliot-code-cortex", version = "0.1.0" }
+eliot-code-graph = { path = "crates/instrument/eliot-code-graph", version = "0.1.0" }
+eliot-diagnostic = { path = "crates/instrument/eliot-diagnostic", version = "0.1.0" }
+eliot-empirical-profile = { path = "crates/instrument/eliot-empirical-profile", version = "0.1.0" }
+eliot-instrument-cargo = { path = "crates/instrument/eliot-instrument-cargo", version = "0.1.0" }
+eliot-instrument-dotnet = { path = "crates/instrument/eliot-instrument-dotnet", version = "0.1.0" }
+eliot-instrument-nextest = { path = "crates/instrument/eliot-instrument-nextest", version = "0.1.0" }
+eliot-instrument-runner = { path = "crates/instrument/eliot-instrument-runner", version = "0.1.0" }
+eliot-instrument-rustc = { path = "crates/instrument/eliot-instrument-rustc", version = "0.1.0" }
+eliot-instrument-rustfmt = { path = "crates/instrument/eliot-instrument-rustfmt", version = "0.1.0" }
+eliot-instrument-scip = { path = "crates/instrument/eliot-instrument-scip", version = "0.1.0" }
+eliot-observability = { path = "crates/instrument/eliot-observability", version = "0.1.0" }
+eliot-product-evaluation = { path = "crates/instrument/eliot-product-evaluation", version = "0.1.0" }
+eliot-reports = { path = "crates/instrument/eliot-reports", version = "0.1.0" }
+eliot-test-selection = { path = "crates/instrument/eliot-test-selection", version = "0.1.0" }
+eliot-testd-core = { path = "crates/instrument/eliot-testd-core", version = "0.1.0" }
+eliot-verifier = { path = "crates/instrument/eliot-verifier", version = "0.1.0" }
+eliot-doctor-core = { path = "crates/meta/eliot-doctor-core", version = "0.1.0" }
+eliot-improvement = { path = "crates/meta/eliot-improvement", version = "0.1.0" }
+eliot-erasure = { path = "crates/security/eliot-erasure", version = "0.1.0" }
+eliot-influence = { path = "crates/security/eliot-influence", version = "0.1.0" }
+eliot-context = { path = "crates/smart/eliot-context", version = "0.1.0" }
+eliot-cues = { path = "crates/smart/eliot-cues", version = "0.1.0" }
+eliot-dreamer-core = { path = "crates/smart/eliot-dreamer-core", version = "0.1.0" }
+eliot-epistemic = { path = "crates/smart/eliot-epistemic", version = "0.1.0" }
+eliot-memory = { path = "crates/smart/eliot-memory", version = "0.1.0" }
+eliot-memory-curation = { path = "crates/smart/eliot-memory-curation", version = "0.1.0" }
+eliot-system-experience = { path = "crates/smart/eliot-system-experience", version = "0.1.0" }
+eliot-understanding = { path = "crates/smart/eliot-understanding", version = "0.1.0" }
+eliot-watchdog-core = { path = "crates/supervision/eliot-watchdog-core", version = "0.1.0" }
+eliot-research-exchange = { path = "crates/research/eliot-research-exchange", version = "0.1.0" }
+eliot-research-exchange-api = { path = "crates/research/eliot-research-exchange-api", version = "0.1.0" }
+eliot-researcher = { path = "crates/research/eliot-researcher", version = "0.1.0" }
 futures-util = { version = "0.3.32", features = ["sink"] }
 jsonc-parser = { version = "0.33.0", features = ["cst", "serde_json"] }
 redb = "4.1.0"
