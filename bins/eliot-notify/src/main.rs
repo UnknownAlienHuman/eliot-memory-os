@@ -16,10 +16,6 @@ enum Request {
         envelope: NotificationEnvelope,
         request: NotificationRequest,
     },
-    DeliverWatchdogFallback {
-        envelope: SignedWatchdogFallbackEnvelope,
-        request: NotificationRequest,
-    },
 }
 
 #[derive(Serialize)]
@@ -37,17 +33,10 @@ enum Response {
 }
 
 fn main() {
-    let root = match parse_root() {
+    let (root, watchdog_fallback) = match parse_launch() {
         Ok(root) => root,
         Err(error) => exit(PROVIDER_REJECTED_EXIT, "NOTIFY_ROOT_REJECTED", error),
     };
-    if let Err(error) = eliot_platform_windows::prepare_protected_directory(&root) {
-        exit(
-            PROVIDER_REJECTED_EXIT,
-            "NOTIFY_PROTECTED_ROOT_REJECTED",
-            error.to_string(),
-        );
-    }
     let root = match std::fs::canonicalize(root) {
         Ok(root) => root,
         Err(error) => exit(
@@ -56,17 +45,32 @@ fn main() {
             error.to_string(),
         ),
     };
-    let mut composition = match NotificationComposition::from_kernel(root) {
-        Ok(composition) => composition,
-        Err(error) => exit(
-            PROVIDER_REJECTED_EXIT,
-            "NOTIFY_COMPOSITION_REJECTED",
-            error.to_string(),
-        ),
-    };
+    if watchdog_fallback {
+        let (envelope, request) = match eliot_notify::load_watchdog_fallback_request() {
+            Ok(value) => value,
+            Err(error) => exit(
+                PROVIDER_REJECTED_EXIT,
+                "WATCHDOG_FALLBACK_REJECTED",
+                error.to_string(),
+            ),
+        };
+        let response = match NotificationComposition::from_fallback(root) {
+            Ok(mut composition) => dispatch_fallback(&mut composition, envelope, request),
+            Err(error) => composition_error(error.to_string()),
+        };
+        let provider_error = matches!(response, Response::Error { code, .. } if code == "NOTIFICATION_PROVIDER_REJECTED");
+        if !write_response(response) {
+            std::process::exit(PROVIDER_REJECTED_EXIT);
+        }
+        if provider_error {
+            std::process::exit(PROVIDER_REJECTED_EXIT);
+        }
+        return;
+    }
 
-    // Notification is intentionally one-shot: no persistent stdin service,
-    // replay loop, or local delivery authority is created here.
+    // Normal notification is intentionally one-shot. The caller selects the
+    // Kernel-backed route through an authenticated provider operation; the
+    // scheduler fallback above has no caller-supplied request authority.
     let line = match io::stdin()
         .lock()
         .lines()
@@ -81,7 +85,12 @@ fn main() {
         ),
     };
     let response = match serde_json::from_str::<Request>(&line) {
-        Ok(request) => dispatch(&mut composition, request),
+        Ok(Request::Deliver { envelope, request }) => {
+            match NotificationComposition::from_kernel(root) {
+                Ok(mut composition) => dispatch_deliver(&mut composition, envelope, request),
+                Err(error) => composition_error(error.to_string()),
+            }
+        }
         Err(error) => Response::Error {
             code: "REQUEST_INVALID",
             detail: error.to_string(),
@@ -96,20 +105,35 @@ fn main() {
     }
 }
 
-fn parse_root() -> Result<PathBuf, String> {
+fn parse_launch() -> Result<(PathBuf, bool), String> {
     let expected = eliot_platform_windows::protected_program_data_path("Eliot/notify")
         .map_err(|error| error.to_string())?;
     let mut args = std::env::args_os().skip(1);
-    match args.next() {
-        None => Ok(expected),
-        Some(value) if value == "--work-root" => {
-            let supplied = args
-                .next()
-                .ok_or_else(|| "--work-root requires exactly one path".to_owned())?;
-            if args.next().is_some() {
-                return Err("--work-root requires exactly one path".to_owned());
+    let mut watchdog_fallback = false;
+    let mut supplied_root = None;
+    while let Some(value) = args.next() {
+        if value == "--watchdog-fallback" {
+            if watchdog_fallback {
+                return Err("--watchdog-fallback may only be supplied once".to_owned());
             }
-            let supplied = PathBuf::from(supplied);
+            watchdog_fallback = true;
+        } else if value == "--work-root" {
+            if supplied_root.is_some() {
+                return Err("--work-root may only be supplied once".to_owned());
+            }
+            supplied_root = Some(
+                args.next()
+                    .ok_or_else(|| "--work-root requires exactly one path".to_owned())?,
+            );
+        } else {
+            return Err(format!("unknown argument: {}", value.to_string_lossy()));
+        }
+    }
+    let supplied_root_given = supplied_root.is_some();
+    let root = supplied_root.map_or_else(
+        || Ok(expected.clone()),
+        |value| {
+            let supplied = PathBuf::from(value);
             if supplied != expected {
                 return Err(
                     "work root must equal the protected ProgramData notification contour"
@@ -117,29 +141,50 @@ fn parse_root() -> Result<PathBuf, String> {
                 );
             }
             Ok(supplied)
-        }
-        Some(value) => Err(format!("unknown argument: {}", value.to_string_lossy())),
+        },
+    )?;
+    if watchdog_fallback && supplied_root_given {
+        // Keep the scheduler mode deterministic: it always resolves the
+        // installer-owned contour and does not accept a caller-selected root.
+        return Err("watchdog fallback does not accept --work-root".to_owned());
     }
+    Ok((root, watchdog_fallback))
 }
 
-fn dispatch(composition: &mut NotificationComposition, request: Request) -> Response {
-    match request {
-        Request::Deliver { envelope, request } => composition
-            .deliver(&envelope, &request)
-            .map(|observation| Response::Delivered {
-                service: SERVICE_NAME,
-                protocol: PROTOCOL_VERSION,
-                observation,
-            })
-            .unwrap_or_else(notify_error),
-        Request::DeliverWatchdogFallback { envelope, request } => composition
-            .deliver_watchdog_fallback(&envelope, &request)
-            .map(|observation| Response::Delivered {
-                service: SERVICE_NAME,
-                protocol: PROTOCOL_VERSION,
-                observation,
-            })
-            .unwrap_or_else(notify_error),
+fn dispatch_deliver(
+    composition: &mut NotificationComposition,
+    envelope: NotificationEnvelope,
+    request: NotificationRequest,
+) -> Response {
+    composition
+        .deliver(&envelope, &request)
+        .map(|observation| Response::Delivered {
+            service: SERVICE_NAME,
+            protocol: PROTOCOL_VERSION,
+            observation,
+        })
+        .unwrap_or_else(notify_error)
+}
+
+fn dispatch_fallback(
+    composition: &mut NotificationComposition,
+    envelope: SignedWatchdogFallbackEnvelope,
+    request: NotificationRequest,
+) -> Response {
+    composition
+        .deliver_watchdog_fallback(&envelope, &request)
+        .map(|observation| Response::Delivered {
+            service: SERVICE_NAME,
+            protocol: PROTOCOL_VERSION,
+            observation,
+        })
+        .unwrap_or_else(notify_error)
+}
+
+fn composition_error(detail: String) -> Response {
+    Response::Error {
+        code: "NOTIFICATION_PROVIDER_REJECTED",
+        detail,
     }
 }
 

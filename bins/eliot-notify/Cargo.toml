@@ -14,6 +14,7 @@ name = "eliot-notify"
 path = "src/main.rs"
 
 [dependencies]
+ed25519-dalek.workspace = true
 eliot-cli.workspace = true
 eliot-contracts.workspace = true
 eliot-notify-core.workspace = true
@@ -23,6 +24,7 @@ eliot-protocol.workspace = true
 eliot-receipts.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
 
 [lints]
 workspace = true

@@ -33,6 +33,18 @@ const A08_OWNER: &str = "A-08";
 const WATCHDOG_OWNER: &str = "X-01";
 const DELIVERY_RECEIPT_OWNER: &str = "delivery-receipt-verifier";
 
+/// Signature algorithm required for the separately registered X-01 route.
+/// The private signing key is held only by Watchdog; A-10 receives only a
+/// public verification key through its protected installer declaration.
+pub const WATCHDOG_SIGNATURE_ALGORITHM: &str = "ED25519";
+
+/// Domain/version included in the signed canonical payload.
+pub const WATCHDOG_SIGNATURE_DOMAIN: &str = "ELIOT/X-01/WATCHDOG-FALLBACK/V1";
+
+/// Fixed product/source identities for the autonomous X-01 route.
+pub const WATCHDOG_PRODUCT_ID: &str = "eliot-notify-watchdog";
+pub const WATCHDOG_SOURCE_ID: &str = "eliot-watchdog";
+
 /// Provider identities used by typed `PLAN_GAP` and provider-failure results.
 #[derive(Clone, Copy, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
@@ -117,19 +129,64 @@ pub struct WatchdogFallbackEnvelope {
     pub recovery_instruction: RecoveryInstruction,
 }
 
-/// Signature bytes are outside the five-field fallback content contract.
+/// Detached signature metadata and bytes for the five-field fallback content.
+///
+/// The signature covers [`watchdog_signature_payload`], which includes the
+/// domain, algorithm, key id, and all five fields of [`WatchdogFallbackEnvelope`].
+/// It is encoded as lowercase hexadecimal so the wire contract stays explicit
+/// and does not depend on an ambient binary/text encoding.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SignedWatchdogFallbackEnvelope {
     pub envelope: WatchdogFallbackEnvelope,
-    pub signature_sha256: String,
+    pub algorithm: String,
+    pub key_id: PlatformHandle,
+    pub domain: String,
+    pub signature: String,
 }
 
 impl SignedWatchdogFallbackEnvelope {
-    fn validate_shape(&self) -> Result<(), NotifyError> {
+    fn validate_metadata_shape(&self) -> Result<(), NotifyError> {
         validate_sha256(&self.envelope.evidence_digest, "evidence_digest")?;
-        validate_sha256(&self.signature_sha256, "signature_sha256")
+        if self.algorithm != WATCHDOG_SIGNATURE_ALGORITHM {
+            return Err(NotifyError::InvalidEnvelope("algorithm"));
+        }
+        if self.domain != WATCHDOG_SIGNATURE_DOMAIN {
+            return Err(NotifyError::InvalidEnvelope("domain"));
+        }
+        validate_text(self.key_id.as_str(), "key_id")?;
+        Ok(())
     }
+
+    fn validate_shape(&self) -> Result<(), NotifyError> {
+        self.validate_metadata_shape()?;
+        validate_hex(&self.signature, 128, "signature")
+    }
+}
+
+/// Returns the canonical bytes signed by Watchdog.
+///
+/// The detached signature itself is intentionally excluded. The enclosing
+/// metadata is included so algorithm, key selection, domain and version are
+/// cryptographically bound to the five-field fallback content.
+pub fn watchdog_signature_payload(
+    signed: &SignedWatchdogFallbackEnvelope,
+) -> Result<Vec<u8>, NotifyError> {
+    signed.validate_metadata_shape()?;
+    #[derive(Serialize)]
+    struct SignaturePayload<'a> {
+        domain: &'a str,
+        algorithm: &'a str,
+        key_id: &'a PlatformHandle,
+        envelope: &'a WatchdogFallbackEnvelope,
+    }
+    eliot_receipts::canonical_json_bytes(&SignaturePayload {
+        domain: &signed.domain,
+        algorithm: &signed.algorithm,
+        key_id: &signed.key_id,
+        envelope: &signed.envelope,
+    })
+    .map_err(|error| NotifyError::Decode(error.to_string()))
 }
 
 /// Returns the canonical request hash for the signed fallback envelope.
@@ -139,7 +196,26 @@ impl SignedWatchdogFallbackEnvelope {
 pub fn watchdog_request_hash(
     envelope: &SignedWatchdogFallbackEnvelope,
 ) -> Result<String, NotifyError> {
-    sha256_serialized(envelope)
+    let bytes = eliot_receipts::canonical_json_bytes(envelope)
+        .map_err(|error| NotifyError::Decode(error.to_string()))?;
+    Ok(sha256_hex(&bytes))
+}
+
+/// Returns the deterministic notification identity bound to the signed
+/// fallback payload. Callers cannot substitute a different notification
+/// handle without invalidating the route before P-01.
+pub fn watchdog_notification_id(
+    envelope: &SignedWatchdogFallbackEnvelope,
+) -> Result<String, NotifyError> {
+    let payload = watchdog_signature_payload(envelope)?;
+    Ok(sha256_hex(&payload))
+}
+
+/// Returns the deterministic request identity for one signed fallback.
+pub fn watchdog_request_id(
+    envelope: &SignedWatchdogFallbackEnvelope,
+) -> Result<String, NotifyError> {
+    Ok(format!("watchdog:{}", watchdog_request_hash(envelope)?))
 }
 
 /// Delivery route. Fallback is available only through the dedicated method.
@@ -311,6 +387,28 @@ pub trait G08NotificationPort {
         envelope: &NotificationEnvelope,
         request: &NotificationRequest,
     ) -> PortOutcome<ReceiptEnvelope>;
+}
+
+/// Neutral P-01 delivery seam consumed by A-10.
+///
+/// An implementation receives the already-admitted [`NotificationRequest`]
+/// and may report only the corresponding [`NotificationObservation`]. It
+/// must preserve `Partial`, `Unknown`, and provider errors from the underlying
+/// user-session delivery mechanism; `Known` is not permission to invent a
+/// receipt. The platform crate's existing [`NotificationPort`] is adapted
+/// below so a native provider can implement that lower-level neutral port
+/// without depending on this surface crate.
+pub trait NotificationDeliveryPort {
+    fn deliver(&mut self, request: &NotificationRequest) -> PortOutcome<NotificationObservation>;
+}
+
+impl<T> NotificationDeliveryPort for T
+where
+    T: NotificationPort + ?Sized,
+{
+    fn deliver(&mut self, request: &NotificationRequest) -> PortOutcome<NotificationObservation> {
+        NotificationPort::deliver(self, request)
+    }
 }
 
 /// X-01 verifies the minimal fallback signature in a trusted boundary.
@@ -634,7 +732,7 @@ pub struct NotifyCore<P> {
 
 impl<P> NotifyCore<P>
 where
-    P: NotificationPort,
+    P: NotificationDeliveryPort,
 {
     #[must_use]
     pub fn new(platform: P, ports: VerificationPorts) -> Self {
@@ -712,8 +810,23 @@ where
         envelope.validate_shape()?;
         validate_platform_request(request)?;
         let expected_hash = watchdog_request_hash(envelope)?;
+        let expected_notification = watchdog_notification_id(envelope)?;
+        let expected_request_id = watchdog_request_id(envelope)?;
         if request.canonical_request_hash.as_str() != expected_hash
             || request.body_digest.as_str() != envelope.envelope.evidence_digest
+            || request.notification.as_str() != expected_notification
+            || request.context.request_id.as_str() != expected_request_id
+            || request.context.product_id.as_str() != WATCHDOG_PRODUCT_ID
+            || request.context.source_id.as_str() != WATCHDOG_SOURCE_ID
+            || request
+                .context
+                .session_id
+                .as_ref()
+                .is_none_or(|session| session.as_str() != request.audience.as_str())
+            || request.context.state_fence.resource_generation.value() != 1
+            || request.context.state_fence.task_revision.is_some()
+            || request.context.state_fence.policy_revision.is_some()
+            || request.context.state_fence.integration_revision.is_some()
         {
             return Err(NotifyError::FallbackMismatch);
         }
@@ -1212,6 +1325,18 @@ fn validate_sha256(value: &str, field: &'static str) -> Result<(), NotifyError> 
     }
 }
 
+fn validate_hex(value: &str, length: usize, field: &'static str) -> Result<(), NotifyError> {
+    if value.len() != length
+        || value
+            .bytes()
+            .any(|byte| !byte.is_ascii_hexdigit() || byte.is_ascii_uppercase())
+    {
+        Err(NotifyError::InvalidEnvelope(field))
+    } else {
+        Ok(())
+    }
+}
+
 fn sha256_serialized<T: Serialize>(value: &T) -> Result<String, NotifyError> {
     let bytes =
         serde_json::to_vec(value).map_err(|error| NotifyError::Decode(error.to_string()))?;
@@ -1575,7 +1700,7 @@ mod tests {
             envelope: &SignedWatchdogFallbackEnvelope,
             request: &NotificationRequest,
         ) -> PortOutcome<ReceiptEnvelope> {
-            if envelope.signature_sha256 != self.expected_signature {
+            if envelope.signature != self.expected_signature {
                 return PortOutcome::Error(PortError::Provider(ProviderError {
                     code: ProviderErrorCode::InvalidRequest,
                     retryable: false,
@@ -2019,13 +2144,28 @@ mod tests {
                 evidence_digest: sha256_hex(b"watchdog-evidence"),
                 recovery_instruction: RecoveryInstruction::EliotRecoveryStatus,
             },
-            signature_sha256: sha256_hex(b"watchdog-signature"),
+            algorithm: WATCHDOG_SIGNATURE_ALGORITHM.to_owned(),
+            key_id: PlatformHandle::new("watchdog-key-1").unwrap(),
+            domain: WATCHDOG_SIGNATURE_DOMAIN.to_owned(),
+            signature: "00".repeat(64),
         };
         let mut request = make_request("request-fallback");
-        request.notification = PlatformHandle::new("watchdog-notification-1").unwrap();
         request.body_digest = PlatformHandle::new(signed.envelope.evidence_digest.clone()).unwrap();
         request.canonical_request_hash =
             PlatformHandle::new(watchdog_request_hash(&signed).unwrap()).unwrap();
+        request.notification =
+            PlatformHandle::new(watchdog_notification_id(&signed).unwrap()).unwrap();
+        request.context.request_id =
+            serde_json::from_value(json!(watchdog_request_id(&signed).unwrap())).unwrap();
+        request.context.product_id = serde_json::from_value(json!(WATCHDOG_PRODUCT_ID)).unwrap();
+        request.context.source_id = serde_json::from_value(json!(WATCHDOG_SOURCE_ID)).unwrap();
+        request.context.session_id =
+            Some(serde_json::from_value(json!(request.audience.as_str())).unwrap());
+        request.context.task_id = None;
+        request.context.state_fence.resource_generation = serde_json::from_value(json!(1)).unwrap();
+        request.context.state_fence.task_revision = None;
+        request.context.state_fence.policy_revision = None;
+        request.context.state_fence.integration_revision = None;
         (signed, request)
     }
 
@@ -2067,8 +2207,8 @@ mod tests {
             delivered: true,
         }));
         let mut bad = signed.clone();
-        bad.signature_sha256 = sha256_hex(b"forged-signature");
-        let expected = signed.signature_sha256.clone();
+        bad.signature = "11".repeat(64);
+        let expected = signed.signature.clone();
         let mut core = NotifyCore::new(
             platform,
             fallback_ports(DurableLedger::default(), expected.clone()),
@@ -2076,6 +2216,8 @@ mod tests {
         let mut bad_request = request.clone();
         bad_request.canonical_request_hash =
             PlatformHandle::new(watchdog_request_hash(&bad).unwrap()).unwrap();
+        bad_request.context.request_id =
+            serde_json::from_value(json!(watchdog_request_id(&bad).unwrap())).unwrap();
         assert_eq!(
             core.deliver_watchdog_fallback(&bad, &bad_request),
             Err(NotifyError::ProviderFailure {
