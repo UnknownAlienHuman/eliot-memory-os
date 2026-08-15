@@ -25,10 +25,10 @@
 use std::collections::BTreeSet;
 use std::fmt;
 use std::fs::{self, OpenOptions};
-use std::io::{Read, Seek, SeekFrom};
+use std::io::{Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::{
-    Arc, Mutex, MutexGuard, OnceLock, RwLock, RwLockReadGuard, RwLockWriteGuard,
+    Arc, Mutex, MutexGuard, OnceLock, RwLock, RwLockReadGuard, RwLockWriteGuard, Weak,
     atomic::{AtomicBool, AtomicU64, Ordering},
 };
 use std::thread::{self, JoinHandle};
@@ -63,18 +63,19 @@ const SHARD_COUNT: usize = 64;
 const ROOT_LEASE_FILE: &str = ".eliot-root.lock";
 const ROOT_LEASE_VERSION: u32 = 1;
 const ROOT_LEASE_HEARTBEAT_MS: u64 = 1_000;
-const ROOT_LEASE_TIMEOUT_MS: u64 = 15_000;
 #[cfg(windows)]
 const WINDOWS_REPARSE_POINT: u32 = 0x400;
+#[cfg(windows)]
+const WINDOWS_FILE_SHARE_READ: u32 = 0x0000_0001;
 
 static ROOT_LEASE_TOKEN_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 /// The process-owned S-04 root claim used by composition roots that do not
 /// expose a second Blob service seam. The claim is backed by an OS-visible
 /// lease file in the canonical root, so a second process cannot silently own
-/// the same root. A bounded heartbeat permits recovery after an owner exits
-/// without dropping the lease; the process-local set below is only a
-/// secondary same-process defense.
+/// the same root. The owner holds the OS file handle for its full lifetime; a
+/// crashed process releases that authority when the OS closes the handle.
+/// The process-local set below is only a secondary same-process defense.
 #[derive(Clone)]
 pub struct BlobRootOwner {
     root_id: String,
@@ -99,6 +100,8 @@ struct RootLeaseState {
     root_id: String,
     lock_path: PathBuf,
     token: String,
+    process_id: u32,
+    lock_file: Mutex<Option<fs::File>>,
     stop: Arc<AtomicBool>,
     heartbeat: Mutex<Option<JoinHandle<()>>>,
 }
@@ -123,7 +126,8 @@ impl Drop for RootLeaseState {
         {
             let _ = handle.join();
         }
-        release_root_lease(&self.lock_path, &self.token);
+        // The OS handle is the authority. Dropping it releases the claim;
+        // never unlink the lock path, which would reintroduce an unlink race.
         remove_process_claim(&self.root_id);
     }
 }
@@ -173,55 +177,59 @@ impl BlobRootOwner {
         }
         let owner_id = BlobId::new(owner_id)?;
         let (canonical_path, root_claim_key) = canonical_root(&configured_root)?;
-        let (lock_path, token) = acquire_root_lease(&canonical_path, &root_claim_key, process_id)?;
+        let (lock_path, token, lock_file) =
+            acquire_root_lease(&canonical_path, &root_claim_key, process_id)?;
         let claims = PROCESS_ROOT_CLAIMS.get_or_init(|| Mutex::new(BTreeSet::new()));
         let mut claims = match claims.lock() {
             Ok(claims) => claims,
             Err(_) => {
-                release_root_lease(&lock_path, &token);
                 return Err(BlobError::Provider(
                     "Blob root claim lock poisoned".to_owned(),
                 ));
             }
         };
         if !claims.insert(root_claim_key.clone()) {
-            release_root_lease(&lock_path, &token);
             return Err(BlobError::OwnerConflict);
         }
 
         let stop = Arc::new(AtomicBool::new(false));
+        let lease = Arc::new(RootLeaseState {
+            root_id: root_claim_key.clone(),
+            lock_path,
+            token: token.clone(),
+            process_id,
+            lock_file: Mutex::new(Some(lock_file)),
+            stop: Arc::clone(&stop),
+            heartbeat: Mutex::new(None),
+        });
+        let heartbeat_lease = Arc::downgrade(&lease);
         let heartbeat_stop = Arc::clone(&stop);
-        let heartbeat_path = lock_path.clone();
-        let heartbeat_token = token.clone();
-        let heartbeat_root = root_claim_key.clone();
         let heartbeat = match thread::Builder::new()
             .name("eliot-blob-root-lease".to_owned())
-            .spawn(move || {
-                heartbeat_root_lease(
-                    heartbeat_path,
-                    heartbeat_token,
-                    heartbeat_root,
-                    heartbeat_stop,
-                )
-            }) {
+            .spawn(move || heartbeat_root_lease(heartbeat_lease, heartbeat_stop))
+        {
             Ok(handle) => handle,
             Err(error) => {
                 claims.remove(&root_claim_key);
-                release_root_lease(&lock_path, &token);
                 return Err(BlobError::Provider(format!(
                     "start Blob root lease heartbeat: {error}"
                 )));
             }
         };
+        let mut heartbeat_slot = match lease.heartbeat.lock() {
+            Ok(slot) => slot,
+            Err(_) => {
+                claims.remove(&root_claim_key);
+                drop(heartbeat);
+                return Err(BlobError::Provider(
+                    "Blob root lease heartbeat lock poisoned".to_owned(),
+                ));
+            }
+        };
+        heartbeat_slot.replace(heartbeat);
+        drop(heartbeat_slot);
         drop(claims);
 
-        let lease = Arc::new(RootLeaseState {
-            root_id: root_claim_key.clone(),
-            lock_path,
-            token: token.clone(),
-            stop,
-            heartbeat: Mutex::new(Some(heartbeat)),
-        });
         let claim_id =
             format!("process:{process_id}:root:{root_claim_key}:owner:{owner_id}:lease:{token}");
         Ok(Self {
@@ -347,50 +355,100 @@ fn acquire_root_lease(
     root: &Path,
     root_id: &str,
     process_id: u32,
-) -> Result<(PathBuf, String), BlobError> {
+) -> Result<(PathBuf, String, fs::File), BlobError> {
     let lock_path = root.join(ROOT_LEASE_FILE);
+    ensure_lock_path_not_reparse(&lock_path)?;
     let token = lease_token(process_id);
-    for attempt in 0..2 {
-        match OpenOptions::new()
-            .create_new(true)
-            .read(true)
-            .write(true)
-            .open(&lock_path)
-        {
-            Ok(mut file) => {
-                let record = RootLeaseRecord {
-                    version: ROOT_LEASE_VERSION,
-                    token: token.clone(),
-                    root_id: root_id.to_owned(),
-                    process_id,
-                    heartbeat_unix_ms: now_unix_ms(),
-                };
-                if let Err(error) = write_lease_record(&mut file, &record) {
-                    let _ = fs::remove_file(&lock_path);
-                    return Err(BlobError::Provider(format!(
-                        "write Blob root lease {}: {error}",
-                        lock_path.display()
-                    )));
-                }
-                return Ok((lock_path, token));
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists && attempt == 0 => {
-                if !reclaim_stale_root_lease(&lock_path)? {
-                    return Err(BlobError::OwnerConflict);
-                }
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                return Err(BlobError::OwnerConflict);
-            }
-            Err(error) => {
-                return Err(BlobError::Provider(format!(
-                    "open Blob root lease {}: {error}",
-                    lock_path.display()
-                )));
-            }
-        }
+    let mut file = open_owned_root_lease(&lock_path)?;
+    let record = RootLeaseRecord {
+        version: ROOT_LEASE_VERSION,
+        token: token.clone(),
+        root_id: root_id.to_owned(),
+        process_id,
+        heartbeat_unix_ms: now_unix_ms(),
+    };
+    write_lease_record(&mut file, &record).map_err(|error| {
+        BlobError::Provider(format!(
+            "write Blob root lease {}: {error}",
+            lock_path.display()
+        ))
+    })?;
+    Ok((lock_path, token, file))
+}
+
+fn ensure_lock_path_not_reparse(lock_path: &Path) -> Result<(), BlobError> {
+    match fs::symlink_metadata(lock_path) {
+        Ok(metadata) if is_reparse_point(&metadata) => Err(BlobError::InvalidContract(
+            "Blob root lease reparse points are not permitted".to_owned(),
+        )),
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(BlobError::Provider(format!(
+            "inspect Blob root lease {}: {error}",
+            lock_path.display()
+        ))),
     }
-    Err(BlobError::OwnerConflict)
+}
+
+#[cfg(windows)]
+fn open_owned_root_lease(lock_path: &Path) -> Result<fs::File, BlobError> {
+    use std::os::windows::fs::OpenOptionsExt;
+
+    let mut options = OpenOptions::new();
+    options
+        .create_new(true)
+        .read(true)
+        .write(true)
+        .share_mode(WINDOWS_FILE_SHARE_READ);
+    match options.open(lock_path) {
+        Ok(file) => Ok(file),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            // A crashed owner leaves the record but not the handle. Opening
+            // the existing path read+write with FILE_SHARE_READ transfers
+            // ownership; a live owner denies this open.
+            let mut existing = OpenOptions::new();
+            existing
+                .read(true)
+                .write(true)
+                .share_mode(WINDOWS_FILE_SHARE_READ);
+            existing.open(lock_path).map_err(|error| {
+                if error.kind() == std::io::ErrorKind::PermissionDenied {
+                    BlobError::OwnerConflict
+                } else {
+                    BlobError::Provider(format!(
+                        "open existing Blob root lease {}: {error}",
+                        lock_path.display()
+                    ))
+                }
+            })
+        }
+        Err(error) => Err(BlobError::Provider(format!(
+            "create Blob root lease {}: {error}",
+            lock_path.display()
+        ))),
+    }
+}
+
+#[cfg(not(windows))]
+fn open_owned_root_lease(lock_path: &Path) -> Result<fs::File, BlobError> {
+    // The production runtime is native Windows. On other targets, fail closed
+    // on an existing path rather than pretending std::fs provides equivalent
+    // cross-process write/delete exclusion.
+    OpenOptions::new()
+        .create_new(true)
+        .read(true)
+        .write(true)
+        .open(lock_path)
+        .map_err(|error| {
+            if error.kind() == std::io::ErrorKind::AlreadyExists {
+                BlobError::OwnerConflict
+            } else {
+                BlobError::Provider(format!(
+                    "create Blob root lease {}: {error}",
+                    lock_path.display()
+                ))
+            }
+        })
 }
 
 fn write_lease_record(file: &mut fs::File, record: &RootLeaseRecord) -> std::io::Result<()> {
@@ -400,86 +458,31 @@ fn write_lease_record(file: &mut fs::File, record: &RootLeaseRecord) -> std::io:
     file.sync_all()
 }
 
-fn reclaim_stale_root_lease(lock_path: &Path) -> Result<bool, BlobError> {
-    let metadata = fs::symlink_metadata(lock_path).map_err(|error| {
-        if error.kind() == std::io::ErrorKind::NotFound {
-            BlobError::OwnerConflict
-        } else {
-            BlobError::Provider(format!(
-                "inspect Blob root lease {}: {error}",
-                lock_path.display()
-            ))
-        }
-    })?;
-    if is_reparse_point(&metadata) {
-        return Err(BlobError::InvalidContract(
-            "Blob root lease reparse points are not permitted".to_owned(),
-        ));
-    }
-    let stale = match fs::read_to_string(lock_path)
-        .ok()
-        .and_then(|raw| serde_json::from_str::<RootLeaseRecord>(&raw).ok())
-    {
-        Some(record) => {
-            now_unix_ms().saturating_sub(record.heartbeat_unix_ms) >= ROOT_LEASE_TIMEOUT_MS
-        }
-        None => metadata
-            .modified()
-            .ok()
-            .and_then(|modified| modified.elapsed().ok())
-            .is_some_and(|age| age >= Duration::from_millis(ROOT_LEASE_TIMEOUT_MS)),
-    };
-    if !stale {
-        return Ok(false);
-    }
-    match fs::remove_file(lock_path) {
-        Ok(()) => Ok(true),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(true),
-        Err(error) => Err(BlobError::Provider(format!(
-            "reclaim stale Blob root lease {}: {error}",
-            lock_path.display()
-        ))),
-    }
-}
-
-fn heartbeat_root_lease(lock_path: PathBuf, token: String, root_id: String, stop: Arc<AtomicBool>) {
+fn heartbeat_root_lease(lease: Weak<RootLeaseState>, stop: Arc<AtomicBool>) {
     while !stop.load(Ordering::Acquire) {
         thread::sleep(Duration::from_millis(ROOT_LEASE_HEARTBEAT_MS));
         if stop.load(Ordering::Acquire) {
             break;
         }
-        let Ok(mut file) = OpenOptions::new().read(true).write(true).open(&lock_path) else {
+        let Some(lease) = lease.upgrade() else {
             break;
         };
-        let mut raw = String::new();
-        if file.read_to_string(&mut raw).is_err() {
-            break;
-        }
-        let Ok(mut record) = serde_json::from_str::<RootLeaseRecord>(&raw) else {
+        let Ok(mut lock_file) = lease.lock_file.lock() else {
             break;
         };
-        if record.version != ROOT_LEASE_VERSION
-            || record.token != token
-            || record.root_id != root_id
-        {
+        let Some(file) = lock_file.as_mut() else {
+            break;
+        };
+        let record = RootLeaseRecord {
+            version: ROOT_LEASE_VERSION,
+            token: lease.token.clone(),
+            root_id: lease.root_id.clone(),
+            process_id: lease.process_id,
+            heartbeat_unix_ms: now_unix_ms(),
+        };
+        if write_lease_record(file, &record).is_err() {
             break;
         }
-        record.heartbeat_unix_ms = now_unix_ms();
-        if write_lease_record(&mut file, &record).is_err() {
-            break;
-        }
-    }
-}
-
-fn release_root_lease(lock_path: &Path, token: &str) {
-    let Ok(raw) = fs::read_to_string(lock_path) else {
-        return;
-    };
-    let Ok(record) = serde_json::from_str::<RootLeaseRecord>(&raw) else {
-        return;
-    };
-    if record.token == token {
-        let _ = fs::remove_file(lock_path);
     }
 }
 
