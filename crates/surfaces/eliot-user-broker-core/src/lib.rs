@@ -10,9 +10,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use eliot_process::{
-    CancellationReceipt, EnvironmentProjection, Generation, OperationId, ProcessExecutionView,
-    ProcessLifecycle, ProcessRequest, ProcessStartReceipt, ProcessTreeId, ResourceLimits,
-    SecretRef,
+    CancellationReceipt, EnvironmentProjection, Generation, ImageId, JobId, OperationId,
+    ProcessExecutionView, ProcessLifecycle, ProcessStartReceipt, ProcessTreeId, ResourceLimits,
+    SecretRef, SessionId,
 };
 use eliot_protocol::ProtocolVersion;
 use eliot_receipts::ProofCeiling;
@@ -179,6 +179,13 @@ pub struct HeartbeatReceipt {
 pub struct ApprovedLaunch {
     pub operation_id: OperationId,
     pub process_tree_id: ProcessTreeId,
+    /// Kernel/N4-owned Job contour identity.  It is never inferred by the
+    /// broker from a path, process id, or caller supplied text.
+    pub job_id: JobId,
+    /// Kernel/N4-owned immutable image identity.
+    pub image_id: ImageId,
+    /// Kernel/N4-owned interactive session identity.
+    pub session_id: SessionId,
     pub request_id: String,
     pub route_fingerprint: String,
     pub artifact_digest: String,
@@ -354,11 +361,35 @@ pub trait DurableRegistrationPort: Send {
     fn save(&mut self, snapshot: &BrokerSnapshot) -> Result<(), PortError>;
 }
 
-/// P-04 adapter boundary.  Every positive start uses exact P-03 types.
+/// One physical start result.  The request digest is retained even when the
+/// external process outcome is unknown, so reconciliation can bind evidence to
+/// the exact one-shot invocation without transporting sealed P-03 authority.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ProcessStartOutcome {
+    Started(ProcessStartReceipt),
+    Unknown { request_digest: String },
+}
+
+/// P-04 adapter boundary owned by the interactive broker composition.
+///
+/// Only the public, serializable grant crosses this surface.  The provider
+/// implementation must validate it and construct/consume the sealed P-03
+/// request locally; `ProcessRequest` and `ValidatedDispatch` never cross the
+/// broker or IPC boundary.
 pub trait ProcessPort: Send {
-    fn start(&mut self, request: ProcessRequest) -> Result<ProcessStartReceipt, PortError>;
+    fn start(
+        &mut self,
+        grant: &LaunchGrant,
+        registration: &RegistrationReceipt,
+    ) -> Result<ProcessStartOutcome, PortError>;
     fn inspect(&mut self, operation_id: &OperationId) -> Result<ProcessExecutionView, PortError>;
     fn cancel(&mut self, operation_id: &OperationId) -> Result<CancellationReceipt, PortError>;
+    /// Reconciliation is a distinct provider operation.  The default keeps
+    /// compatibility with a provider that exposes an already reconciled view;
+    /// production P-04 adapters override it to run their evidence pass first.
+    fn reconcile(&mut self, operation_id: &OperationId) -> Result<ProcessExecutionView, PortError> {
+        self.inspect(operation_id)
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -442,6 +473,14 @@ impl UserBroker {
         }
         self.operations = operations;
         Ok(())
+    }
+
+    /// Returns the currently recovered registration binding without exposing
+    /// any provider authority or mutable registration state.
+    pub fn registration_digest(&self) -> Option<&str> {
+        self.registration
+            .as_ref()
+            .map(|registration| registration.registration_digest.as_str())
     }
 
     #[allow(clippy::needless_pass_by_value)]
@@ -531,39 +570,47 @@ impl UserBroker {
             self.close(RegistrationStatus::Closed)?;
             return Err(error);
         }
-        let process_request = process_request_from_grant(&grant)?;
-        let process_operation_id = process_request.operation_id().clone();
-        let process_request_digest = process_request.invocation_digest().to_owned();
-        let process_generation = process_request.generation();
+        let process_operation_id = grant.approved.operation_id.clone();
+        let process_generation = grant.approved.generation;
         let permit = permit_from_grant(&grant, &current, &request_digest);
         let mut cursor = cursor_from_grant(
             &grant,
             &current,
             &request_digest,
-            &process_request,
+            "",
             OperationState::Unknown,
         );
-        let receipt = self
+        let outcome = self
             .process
             .as_mut()
             .ok_or(BrokerError::PlanGap(RequiredProvider::P03Process))?
-            .start(process_request)
+            .start(&grant, &current)
             .map_err(|error| {
                 if matches!(error, PortError::Unknown) {
-                    self.operations.insert(
-                        request.approved.idempotency_key.clone(),
-                        OperationRecord {
-                            cursor: cursor.clone(),
-                            permit: permit.clone(),
-                            receipt: None,
-                        },
-                    );
-                    let _ = self.persist();
                     BrokerError::UnknownOutcome
                 } else {
                     map_port(RequiredProvider::P03Process, error)
                 }
             })?;
+        let receipt = match outcome {
+            ProcessStartOutcome::Started(receipt) => receipt,
+            ProcessStartOutcome::Unknown { request_digest } => {
+                text(&request_digest, "process_request_digest")?;
+                cursor.process_request_digest = request_digest;
+                self.operations.insert(
+                    request.approved.idempotency_key.clone(),
+                    OperationRecord {
+                        cursor,
+                        permit,
+                        receipt: None,
+                    },
+                );
+                self.persist()?;
+                return Err(BrokerError::UnknownOutcome);
+            }
+        };
+        let process_request_digest = receipt.request_digest().to_owned();
+        cursor.process_request_digest = process_request_digest.clone();
         if receipt.operation_id() != &process_operation_id
             || receipt.request_digest() != process_request_digest
             || receipt.accepted_generation() != process_generation
@@ -625,7 +672,7 @@ impl UserBroker {
             .process
             .as_mut()
             .ok_or(BrokerError::PlanGap(RequiredProvider::P03Process))?
-            .inspect(&operation_id)
+            .reconcile(&operation_id)
             .map_err(|error| map_port(RequiredProvider::P03Process, error))?;
         verify_cursor_lineage(&cursor, &view)?;
         if let Some(record) = self
@@ -845,16 +892,6 @@ fn validate_launch_grant(
     Ok(())
 }
 
-fn process_request_from_grant(grant: &LaunchGrant) -> Result<ProcessRequest, BrokerError> {
-    // Current P-03 deliberately requires a Kernel-issued DispatchPermit and
-    // does not expose a public constructor or Deserialize implementation for
-    // ProcessRequest. A-09 cannot mint one from ApprovedLaunch fields. Keep
-    // the boundary fail-closed until the authority provider returns the exact
-    // consuming ProcessRequest through the N4 application contract.
-    let _ = grant;
-    Err(BrokerError::PlanGap(RequiredProvider::P03Process))
-}
-
 fn permit_from_grant(
     grant: &LaunchGrant,
     registration: &RegistrationReceipt,
@@ -875,7 +912,7 @@ fn cursor_from_grant(
     grant: &LaunchGrant,
     registration: &RegistrationReceipt,
     request_digest: &str,
-    process_request: &ProcessRequest,
+    process_request_digest: &str,
     state: OperationState,
 ) -> OperationCursor {
     OperationCursor {
@@ -890,7 +927,7 @@ fn cursor_from_grant(
         process_tree_id: grant.approved.process_tree_id.clone(),
         generation: grant.approved.generation,
         process_fence_nonce: grant.approved.process_fence_nonce.clone(),
-        process_request_digest: process_request.invocation_digest().to_owned(),
+        process_request_digest: process_request_digest.to_owned(),
         state,
     }
 }
@@ -972,8 +1009,11 @@ pub enum BrokerError {
 #[allow(clippy::expect_used, clippy::unwrap_used)]
 mod tests {
     use super::*;
+    use eliot_platform::ClockObservation;
     use eliot_process::{
-        ProcessHealth, ProcessId, ProcessIdentity, ProcessLifecycle, ProcessState,
+        ActionLeaseRef, DispatchAuthorityId, DispatchPermitAuthority, DispatchValidationContext,
+        FencingToken, KernelDispatchKey, PermitIssuance, ProcessHealth, ProcessId, ProcessIntent,
+        ProcessRequest, ProcessState, SuspendedProcessIdentity,
     };
 
     #[derive(Clone, Copy)]
@@ -1129,46 +1169,39 @@ mod tests {
     }
 
     impl ProcessPort for FakeProcess {
-        fn start(&mut self, request: ProcessRequest) -> Result<ProcessStartReceipt, PortError> {
-            let mut state = ProcessState::new(request.clone())
-                .map_err(|error| PortError::Invalid(error.to_string()))?;
-            let identity = ProcessIdentity::new(
+        fn start(
+            &mut self,
+            grant: &LaunchGrant,
+            _registration: &RegistrationReceipt,
+        ) -> Result<ProcessStartOutcome, PortError> {
+            let (request, mut authority) = process_request_for_test(grant, self.wrong_receipt)?;
+            let request_digest = request.invocation_digest().to_owned();
+            let observed = SuspendedProcessIdentity::new(
                 ProcessId::new("pid-1").expect("pid"),
                 request.process_tree_id().clone(),
+                request.job_id().clone(),
+                request.image_id().clone(),
+                request.session_id().clone(),
                 request.generation(),
                 42,
-                11,
+                100,
                 request.executable_sha256(),
             )
             .map_err(|error| PortError::Invalid(error.to_string()))?;
-            state
-                .start(identity)
+            let current = test_context(grant, 200)?;
+            let validated = authority
+                .validate_and_consume(request, observed, &current)
                 .map_err(|error| PortError::Invalid(error.to_string()))?;
+            let mut state = ProcessState::from_validated(&validated);
             state
-                .mark_running(ProcessHealth::default())
+                .mark_resumed(201, ProcessHealth::default())
                 .map_err(|error| PortError::Invalid(error.to_string()))?;
             self.state = Some(state);
             if self.unknown {
-                return Err(PortError::Unknown);
+                return Ok(ProcessStartOutcome::Unknown { request_digest });
             }
-            if self.wrong_receipt {
-                let other = ProcessRequest::new(
-                    OperationId::new("other-op").expect("operation"),
-                    request.process_tree_id().clone(),
-                    request.generation(),
-                    request.executable().to_owned(),
-                    request.executable_sha256().to_owned(),
-                    request.argv().to_vec(),
-                    request.working_directory().to_owned(),
-                    request.environment().clone(),
-                    *request.resource_limits(),
-                    request.fence().clone(),
-                )
-                .map_err(|error| PortError::Invalid(error.to_string()))?;
-                return ProcessStartReceipt::new(&other, ProcessLifecycle::Running)
-                    .map_err(|error| PortError::Invalid(error.to_string()));
-            }
-            ProcessStartReceipt::new(&request, ProcessLifecycle::Running)
+            ProcessStartReceipt::new(self.state.as_ref().expect("state"))
+                .map(ProcessStartOutcome::Started)
                 .map_err(|error| PortError::Invalid(error.to_string()))
         }
 
@@ -1187,11 +1220,96 @@ mod tests {
             _operation_id: &OperationId,
         ) -> Result<CancellationReceipt, PortError> {
             let state = self.state.as_mut().ok_or(PortError::Unknown)?;
-            let fence = state.request().fence().clone();
+            let request = eliot_process::CancellationRequest::new(state.binding().clone());
             state
-                .cancel(&fence)
+                .cancel(&request)
                 .map_err(|error| PortError::Invalid(error.to_string()))
         }
+    }
+
+    fn test_authority(_grant: &LaunchGrant) -> Result<DispatchPermitAuthority, PortError> {
+        Ok(DispatchPermitAuthority::activate(
+            DispatchAuthorityId::new("broker-test-authority")
+                .map_err(|error| PortError::Invalid(error.to_string()))?,
+            KernelDispatchKey::from_secret_bytes([0x5a; 32])
+                .map_err(|error| PortError::Invalid(error.to_string()))?,
+        ))
+    }
+
+    fn test_context(grant: &LaunchGrant, now: i64) -> Result<DispatchValidationContext, PortError> {
+        let fence = FencingToken::new(
+            grant.authority_epoch,
+            grant.approved.generation,
+            grant.approved.process_fence_nonce.clone(),
+        )
+        .map_err(|error| PortError::Invalid(error.to_string()))?;
+        DispatchValidationContext::new(
+            ClockObservation {
+                valid_time_ms: Some(now),
+                known_time_ms: Some(now),
+                transaction_sequence: None,
+                monotonic_ns: Some(1),
+            },
+            fence,
+            grant.authority_epoch,
+            BTreeMap::from([("broker".to_owned(), "a".repeat(64))]),
+            1,
+        )
+        .map_err(|error| PortError::Invalid(error.to_string()))
+    }
+
+    fn process_request_for_test(
+        grant: &LaunchGrant,
+        other_operation: bool,
+    ) -> Result<(ProcessRequest, DispatchPermitAuthority), PortError> {
+        let operation_id = if other_operation {
+            OperationId::new("other-op")
+        } else {
+            Ok(grant.approved.operation_id.clone())
+        }
+        .map_err(|error| PortError::Invalid(error.to_string()))?;
+        let intent = ProcessIntent::new(
+            operation_id,
+            grant.approved.process_tree_id.clone(),
+            grant.approved.job_id.clone(),
+            grant.approved.image_id.clone(),
+            grant.approved.session_id.clone(),
+            grant.approved.generation,
+            grant.approved.executable.clone(),
+            grant.approved.artifact_digest.clone(),
+            grant.approved.argv.clone(),
+            grant.approved.working_directory.clone(),
+            grant.approved.environment.clone(),
+            grant.approved.resource_limits,
+        )
+        .map_err(|error| PortError::Invalid(error.to_string()))?;
+        let fence = FencingToken::new(
+            grant.authority_epoch,
+            grant.approved.generation,
+            grant.approved.process_fence_nonce.clone(),
+        )
+        .map_err(|error| PortError::Invalid(error.to_string()))?;
+        let mut authority = test_authority(grant)?;
+        let issuance = PermitIssuance::new(
+            ActionLeaseRef::new("broker-test-lease")
+                .map_err(|error| PortError::Invalid(error.to_string()))?,
+            fence,
+            BTreeMap::from([("broker".to_owned(), "a".repeat(64))]),
+            100,
+            1_000,
+            if other_operation {
+                "other-nonce"
+            } else {
+                "launch-nonce"
+            },
+        )
+        .map_err(|error| PortError::Invalid(error.to_string()))?;
+        let permit = authority
+            .issue(&intent, issuance)
+            .map_err(|error| PortError::Invalid(error.to_string()))?;
+        let request = ProcessRequest::new(intent, permit)
+            .map_err(|error| PortError::Invalid(error.to_string()))?;
+        Ok((request, authority))
     }
 
     fn registration_request() -> RegistrationRequest {
@@ -1213,6 +1331,9 @@ mod tests {
         ApprovedLaunch {
             operation_id: OperationId::new("op-1").expect("operation"),
             process_tree_id: ProcessTreeId::new("tree-1").expect("tree"),
+            job_id: JobId::new("job-1").expect("job"),
+            image_id: ImageId::new("image-1").expect("image"),
+            session_id: SessionId::new("session-1").expect("session"),
             request_id: "request-1".to_owned(),
             route_fingerprint: "route-1".to_owned(),
             artifact_digest: "a".repeat(64),
@@ -1298,6 +1419,38 @@ mod tests {
             Err(BrokerError::GrantBindingMismatch)
         );
         assert_eq!(broker.boot_session_changed("boot-2"), Ok(()));
+    }
+
+    #[test]
+    fn heartbeat_refreshes_the_exact_recovered_registration_lineage() {
+        let mut broker = broker(
+            FakeAuthority::new(),
+            FakeProcess {
+                state: None,
+                unknown: false,
+                wrong_receipt: false,
+            },
+        );
+        let mut request = registration_request();
+        request.lease_expires_at = 100;
+        let registered = broker.register(request).expect("registration");
+        let refreshed = broker
+            .heartbeat(HeartbeatRequest {
+                registration_digest: registered.registration_digest.clone(),
+                observed_at: 11,
+            })
+            .expect("heartbeat");
+        assert_eq!(
+            refreshed.registration_digest,
+            registered.registration_digest
+        );
+        assert_eq!(refreshed.user_broker_epoch, registered.user_broker_epoch);
+        assert_eq!(refreshed.fence_id, registered.fence_id);
+        assert_eq!(refreshed.expires_at, registered.expires_at);
+        assert_eq!(
+            broker.registration_digest(),
+            Some(registered.registration_digest.as_str())
+        );
     }
 
     #[test]

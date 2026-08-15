@@ -15,14 +15,19 @@ path = "src/main.rs"
 
 [dependencies]
 eliot-cli.workspace = true
+eliot-instrument-api.workspace = true
+eliot-platform.workspace = true
 eliot-platform-windows.workspace = true
 eliot-process.workspace = true
+eliot-process-executor.workspace = true
 eliot-protocol.workspace = true
 eliot-user-broker-core.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
+tokio.workspace = true
 thiserror.workspace = true
+uuid.workspace = true
 
 [lints]
 workspace = true

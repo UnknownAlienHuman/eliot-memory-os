@@ -1,29 +1,24 @@
 use std::io::{self, BufRead, Write};
 use std::path::PathBuf;
+use std::sync::mpsc::{self, RecvTimeoutError};
+use std::time::{Duration, Instant};
 
-use eliot_protocol::RequestIdentity;
 use eliot_user_broker::{BrokerComposition, BrokerConfig, canonical_root};
-use eliot_user_broker_core::{BrokerError, HeartbeatRequest, LaunchRequest, RegistrationRequest};
+use eliot_user_broker_core::LaunchRequest;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 const PROVIDER_REJECTED_EXIT: i32 = 69;
+// The authenticated registration lease is refreshed while the broker is
+// idle.  This interval is deliberately short and bounded; a failed refresh
+// terminates the broker rather than allowing an expired registration to serve
+// launch requests.
+const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(1);
 
 #[derive(Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
 enum Request {
-    Register {
-        identity: RequestIdentity,
-        request: RegistrationRequest,
-    },
-    Heartbeat {
-        identity: RequestIdentity,
-        request: HeartbeatRequest,
-    },
-    Launch {
-        identity: RequestIdentity,
-        request: LaunchRequest,
-    },
+    Launch { request: LaunchRequest },
     Status,
     Stop,
 }
@@ -32,8 +27,6 @@ enum Request {
 #[serde(tag = "status", rename_all = "snake_case")]
 enum Message {
     Ready { readiness: Value },
-    Registered { receipt: Value },
-    Heartbeat { receipt: Value },
     Launched { receipt: Value },
     Stopped,
     Error { code: &'static str, detail: String },
@@ -72,18 +65,66 @@ fn main() {
             error.to_string(),
         ),
     };
+    if let Err(error) = composition.self_register() {
+        exit(
+            PROVIDER_REJECTED_EXIT,
+            "BROKER_SELF_AUTHENTICATION_REJECTED",
+            error.to_string(),
+        );
+    }
     let readiness = serde_json::to_value(composition.readiness())
         .unwrap_or_else(|error| serde_json::json!({"error": error.to_string()}));
     if !write_message(Message::Ready { readiness }) {
         return;
     }
-    for line in io::stdin().lock().lines() {
-        let response = match line {
+    // Keep stdin as an admitted-role operation stream while the composition
+    // owner retains the only authority-bearing state.  A reader thread lets
+    // the owner service the authenticated heartbeat timer even when no input
+    // arrives; register/heartbeat identities are never accepted from stdin.
+    let (sender, receiver) = mpsc::channel::<Result<String, String>>();
+    std::thread::spawn(move || {
+        for line in io::stdin().lock().lines() {
+            let line = line.map_err(|error| error.to_string());
+            if sender.send(line).is_err() {
+                break;
+            }
+        }
+    });
+    let mut next_heartbeat = Instant::now() + HEARTBEAT_INTERVAL;
+    loop {
+        if Instant::now() >= next_heartbeat {
+            if let Err(error) = composition.heartbeat() {
+                exit(
+                    PROVIDER_REJECTED_EXIT,
+                    "BROKER_HEARTBEAT_REJECTED",
+                    error.to_string(),
+                );
+            }
+            next_heartbeat = Instant::now() + HEARTBEAT_INTERVAL;
+            continue;
+        }
+        let timeout = next_heartbeat.saturating_duration_since(Instant::now());
+        let received = match receiver.recv_timeout(timeout) {
+            Ok(received) => received,
+            Err(RecvTimeoutError::Timeout) => {
+                if let Err(error) = composition.heartbeat() {
+                    exit(
+                        PROVIDER_REJECTED_EXIT,
+                        "BROKER_HEARTBEAT_REJECTED",
+                        error.to_string(),
+                    );
+                }
+                next_heartbeat = Instant::now() + HEARTBEAT_INTERVAL;
+                continue;
+            }
+            Err(RecvTimeoutError::Disconnected) => break,
+        };
+        let response = match received {
             Ok(line) if line.trim().is_empty() => continue,
             Ok(line) => dispatch(&mut composition, &line),
             Err(error) => Message::Error {
                 code: "INPUT_FAILURE",
-                detail: error.to_string(),
+                detail: error,
             },
         };
         let stop = matches!(response, Message::Stopped);
@@ -129,71 +170,27 @@ fn dispatch(composition: &mut BrokerComposition, line: &str) -> Message {
         }
     };
     match request {
-        Request::Register { identity, request } => {
-            if let Err(error) = composition.set_request_identity(identity) {
-                return composition_error(error.to_string());
-            }
-            composition
-                .broker()
-                .register(request)
-                .map(|receipt| Message::Registered {
-                    receipt: serde_json::to_value(receipt)
-                        .unwrap_or_else(|error| serde_json::json!({"error": error.to_string()})),
-                })
-                .unwrap_or_else(broker_error)
-        }
-        Request::Heartbeat { identity, request } => {
-            if let Err(error) = composition.set_request_identity(identity) {
-                return composition_error(error.to_string());
-            }
-            composition
-                .broker()
-                .heartbeat(request)
-                .map(|receipt| Message::Heartbeat {
-                    receipt: serde_json::to_value(receipt)
-                        .unwrap_or_else(|error| serde_json::json!({"error": error.to_string()})),
-                })
-                .unwrap_or_else(broker_error)
-        }
-        Request::Launch { identity, request } => {
-            if let Err(error) = composition.set_request_identity(identity) {
-                return composition_error(error.to_string());
-            }
-            composition
-                .broker()
-                .launch(request)
-                .map(|receipt| Message::Launched {
-                    receipt: serde_json::json!({
-                        "operation_id": receipt.operation_id.as_str(),
-                        "request_digest": receipt.request_digest,
-                        "registration_digest": receipt.registration_digest,
-                        "user_broker_epoch": receipt.user_broker_epoch,
-                        "fence_id": receipt.fence_id,
-                        "process_receipt": receipt.process_receipt,
-                        "proof_ceiling": receipt.proof_ceiling,
-                        "lineage_verified": receipt.lineage_verified,
-                        "disposition": receipt.disposition,
-                    }),
-                })
-                .unwrap_or_else(broker_error)
-        }
+        Request::Launch { request } => composition
+            .launch(request)
+            .map(|receipt| Message::Launched {
+                receipt: serde_json::json!({
+                    "operation_id": receipt.operation_id.as_str(),
+                    "request_digest": receipt.request_digest,
+                    "registration_digest": receipt.registration_digest,
+                    "user_broker_epoch": receipt.user_broker_epoch,
+                    "fence_id": receipt.fence_id,
+                    "process_receipt": receipt.process_receipt,
+                    "proof_ceiling": receipt.proof_ceiling,
+                    "lineage_verified": receipt.lineage_verified,
+                    "disposition": receipt.disposition,
+                }),
+            })
+            .unwrap_or_else(|error| composition_error(error.to_string())),
         Request::Status => Message::Ready {
             readiness: serde_json::to_value(composition.readiness())
                 .unwrap_or_else(|error| serde_json::json!({"error": error.to_string()})),
         },
         Request::Stop => Message::Stopped,
-    }
-}
-
-fn broker_error(error: BrokerError) -> Message {
-    let code = if matches!(error, BrokerError::PlanGap(_)) {
-        "KERNEL_PROVIDER_REJECTED"
-    } else {
-        "BROKER_REQUEST_REJECTED"
-    };
-    Message::Error {
-        code,
-        detail: error.to_string(),
     }
 }
 
@@ -218,4 +215,25 @@ fn exit(code: i32, error_code: &'static str, detail: String) -> ! {
         detail,
     });
     std::process::exit(code);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Request;
+
+    #[test]
+    fn stdin_cannot_supply_registration_or_request_identity_authority() {
+        assert!(
+            serde_json::from_str::<Request>(r#"{"op":"register","identity":{},"request":{}}"#)
+                .is_err()
+        );
+        assert!(
+            serde_json::from_str::<Request>(r#"{"op":"heartbeat","identity":{},"request":{}}"#)
+                .is_err()
+        );
+        assert!(
+            serde_json::from_str::<Request>(r#"{"op":"launch","identity":{},"request":{}}"#)
+                .is_err()
+        );
+    }
 }

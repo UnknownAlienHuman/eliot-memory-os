@@ -338,6 +338,7 @@ pub mod kernel_client {
     use std::collections::BTreeMap;
     use std::time::Duration;
 
+    use eliot_contracts::RequestId;
     use eliot_ipc::{
         DeliveryOutcome, NamedPipeTransport, TransportLimits, client_hello_frame,
         decode_server_hello_frame,
@@ -347,7 +348,7 @@ pub mod kernel_client {
     };
     use eliot_protocol::{
         ClientHello, EncodingProfile, Frame, FrameKind, MessageType, ProtocolPayload,
-        ProtocolVersion, RequestIdentity,
+        ProtocolVersion, RequestIdentity, ServerHello,
     };
     use serde::Deserialize;
     use serde_json::{Value, json};
@@ -358,6 +359,8 @@ pub mod kernel_client {
     const CONFIG_RELATIVE_PATH: &str = "Eliot/kernel/application-client.json";
     const CONFIG_LIMIT: u64 = 64 * 1024;
     const OPERATION_LIMIT: usize = 160;
+    const KERNEL_SERVICE_NAME: &str = "eliot-kernel";
+    const KERNEL_PROTOCOL_VERSION: &str = "eliot.kernel.v1";
 
     /// Protected installation-provided connection declaration.
     #[derive(Clone, Debug, Deserialize)]
@@ -374,6 +377,16 @@ pub mod kernel_client {
         /// SHA-256 of canonical JSON `client_hello` bytes from the approved
         /// installation manifest.
         pub client_hello_sha256: String,
+        /// Protected principal binding selected by the Kernel owner.
+        pub expected_server_principal_binding: String,
+        /// Protected authority epoch for the configured module generation.
+        pub expected_authority_epoch: u64,
+        /// Numeric identity of the expected immutable module generation.
+        pub expected_generation: u64,
+        /// Digest/identity of the expected server artifact.
+        pub expected_artifact_digest: String,
+        /// SHA-256 of the exact canonical JSON `ServerHello.config_snapshot`.
+        pub expected_config_snapshot_sha256: String,
     }
 
     /// Failure at the authenticated application front door.
@@ -391,6 +404,23 @@ pub mod kernel_client {
         /// The authenticated provider rejected or fenced the operation.
         #[error("kernel front door rejected the request: {0}")]
         Rejected(String),
+        /// The request may have reached the provider, but its outcome was not
+        /// proven by an exact typed reply and must be reconciled by operation.
+        #[error("kernel front door outcome is unknown: {0}")]
+        UnknownOutcome(String),
+    }
+
+    /// Exact server-owned configuration snapshot carried by ServerHello.
+    /// This is deliberately closed: a plausible arbitrary JSON object cannot
+    /// stand in for the Kernel's generation, authority and artifact binding.
+    #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+    #[serde(deny_unknown_fields)]
+    struct KernelConfigSnapshot {
+        service: String,
+        protocol: String,
+        generation: u64,
+        authority_epoch: u64,
+        artifact_digest: String,
     }
 
     /// One short-lived authenticated session. It is intentionally not a
@@ -519,8 +549,9 @@ pub mod kernel_client {
                 .receive_frame(limits)
                 .await
                 .map_err(|error| KernelClientError::Rejected(error.to_string()))?;
-            decode_server_hello_frame(&server, &self.config.connection_id)
+            let hello = decode_server_hello_frame(&server, &self.config.connection_id)
                 .map_err(|error| KernelClientError::Rejected(error.to_string()))?;
+            validate_server_hello(&self.config, &hello)?;
             Ok((transport, limits))
         }
 
@@ -545,13 +576,8 @@ pub mod kernel_client {
             let response = transport
                 .receive_frame(limits)
                 .await
-                .map_err(|error| KernelClientError::Rejected(error.to_string()))?;
-            match response.payload {
-                ProtocolPayload::Json(value) => Ok(value),
-                _ => Err(KernelClientError::Rejected(
-                    "Kernel health response was not JSON".to_owned(),
-                )),
-            }
+                .map_err(|error| KernelClientError::UnknownOutcome(error.to_string()))?;
+            validate_health_response(&self.config.connection_id, &response)
         }
 
         #[cfg(windows)]
@@ -562,6 +588,7 @@ pub mod kernel_client {
             identity: RequestIdentity,
         ) -> Result<Value, KernelClientError> {
             let (mut transport, limits) = self.connect().await?;
+            let request_id = identity.request.metadata.request_id.clone();
             let frame = Frame {
                 protocol_version: ProtocolVersion::CURRENT,
                 encoding_profile: EncodingProfile::JsonV1,
@@ -583,13 +610,8 @@ pub mod kernel_client {
             let response = transport
                 .receive_frame(limits)
                 .await
-                .map_err(|error| KernelClientError::Rejected(error.to_string()))?;
-            match response.payload {
-                ProtocolPayload::Json(value) => Ok(value),
-                _ => Err(KernelClientError::Rejected(
-                    "Kernel application response was not JSON".to_owned(),
-                )),
-            }
+                .map_err(|error| KernelClientError::UnknownOutcome(error.to_string()))?;
+            validate_result_response(&self.config.connection_id, &request_id, &response)
         }
     }
 
@@ -635,7 +657,169 @@ pub mod kernel_client {
                 "Kernel client hello digest does not match approved bytes".to_owned(),
             ));
         }
+        if config.expected_server_principal_binding.trim().is_empty()
+            || config
+                .expected_server_principal_binding
+                .chars()
+                .any(char::is_control)
+            || config.expected_artifact_digest.trim().is_empty()
+            || config
+                .expected_artifact_digest
+                .chars()
+                .any(char::is_control)
+            || config.expected_artifact_digest.len() != 64
+            || !config
+                .expected_artifact_digest
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit())
+        {
+            return Err(KernelClientError::Configuration(
+                "Kernel server binding declaration is invalid".to_owned(),
+            ));
+        }
+        if config.expected_authority_epoch == 0
+            || config.expected_generation == 0
+            || config.expected_config_snapshot_sha256.len() != 64
+            || !config
+                .expected_config_snapshot_sha256
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit())
+        {
+            return Err(KernelClientError::Configuration(
+                "Kernel server binding digest/epoch is invalid".to_owned(),
+            ));
+        }
         Ok(())
+    }
+
+    fn validate_server_hello(
+        config: &KernelClientConfig,
+        hello: &ServerHello,
+    ) -> Result<(), KernelClientError> {
+        hello
+            .validate()
+            .map_err(|error| KernelClientError::Rejected(error.to_string()))?;
+        if hello.rejection_reason.is_some()
+            || hello.selected_protocol != ProtocolVersion::CURRENT
+            || hello.session_principal_binding != config.expected_server_principal_binding
+            || hello.authority_epoch.value() != config.expected_authority_epoch
+        {
+            return Err(KernelClientError::Rejected(
+                "Kernel ServerHello is not bound to the protected authority".to_owned(),
+            ));
+        }
+        validate_server_snapshot(
+            hello,
+            config.expected_authority_epoch,
+            config.expected_generation,
+            &config.expected_artifact_digest,
+        )?;
+        let snapshot_bytes = serde_json::to_vec(&hello.config_snapshot)
+            .map_err(|error| KernelClientError::Rejected(error.to_string()))?;
+        let snapshot_digest = format!("{:x}", Sha256::digest(snapshot_bytes));
+        if !snapshot_digest.eq_ignore_ascii_case(&config.expected_config_snapshot_sha256) {
+            return Err(KernelClientError::Rejected(
+                "Kernel ServerHello configuration snapshot digest mismatch".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn validate_server_snapshot(
+        hello: &ServerHello,
+        expected_authority_epoch: u64,
+        expected_generation: u64,
+        expected_artifact_digest: &str,
+    ) -> Result<(), KernelClientError> {
+        let snapshot: KernelConfigSnapshot = serde_json::from_value(hello.config_snapshot.clone())
+            .map_err(|error| {
+                KernelClientError::Rejected(format!(
+                    "Kernel ServerHello configuration snapshot shape is invalid: {error}"
+                ))
+            })?;
+        if snapshot.service != KERNEL_SERVICE_NAME
+            || snapshot.protocol != KERNEL_PROTOCOL_VERSION
+            || snapshot.generation == 0
+            || snapshot.generation != expected_generation
+            || snapshot.authority_epoch != expected_authority_epoch
+            || hello.authority_epoch.value() != snapshot.authority_epoch
+            || snapshot.artifact_digest.len() != 64
+            || !snapshot
+                .artifact_digest
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit())
+            || snapshot.artifact_digest != expected_artifact_digest
+        {
+            return Err(KernelClientError::Rejected(
+                "Kernel ServerHello generation/authority/artifact binding mismatch".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn validate_health_response(
+        connection_id: &str,
+        response: &Frame,
+    ) -> Result<Value, KernelClientError> {
+        response
+            .validate()
+            .map_err(|error| KernelClientError::UnknownOutcome(error.to_string()))?;
+        if response.protocol_version != ProtocolVersion::CURRENT
+            || response.connection_id != connection_id
+            || response.kind != FrameKind::Heartbeat
+            || response.message_type != MessageType::Health
+            || response.request_id.is_some()
+            || response.request_identity.is_some()
+        {
+            return Err(KernelClientError::UnknownOutcome(
+                "Kernel health reply binding mismatch".to_owned(),
+            ));
+        }
+        match &response.payload {
+            ProtocolPayload::Json(value) if !value.get("rejection_reason").is_some() => {
+                Ok(value.clone())
+            }
+            ProtocolPayload::Json(_) => Err(KernelClientError::Rejected(
+                "Kernel health reply was rejected".to_owned(),
+            )),
+            _ => Err(KernelClientError::UnknownOutcome(
+                "Kernel health response was not typed JSON".to_owned(),
+            )),
+        }
+    }
+
+    fn validate_result_response(
+        connection_id: &str,
+        request_id: &RequestId,
+        response: &Frame,
+    ) -> Result<Value, KernelClientError> {
+        response
+            .validate()
+            .map_err(|error| KernelClientError::UnknownOutcome(error.to_string()))?;
+        if response.protocol_version != ProtocolVersion::CURRENT
+            || response.connection_id != connection_id
+            || response.request_id.as_ref() != Some(request_id)
+            || response.kind != FrameKind::Response
+            || response.message_type != MessageType::Result
+            || response.request_identity.is_some()
+        {
+            return Err(KernelClientError::UnknownOutcome(
+                "Kernel result reply binding mismatch".to_owned(),
+            ));
+        }
+        match &response.payload {
+            ProtocolPayload::Json(value) => {
+                if value.get("rejection_reason").is_some() {
+                    return Err(KernelClientError::Rejected(
+                        "Kernel result reply was rejected".to_owned(),
+                    ));
+                }
+                Ok(value.clone())
+            }
+            _ => Err(KernelClientError::UnknownOutcome(
+                "Kernel result response was not typed JSON".to_owned(),
+            )),
+        }
     }
 
     fn validate_operation(operation: &str) -> Result<(), KernelClientError> {
@@ -650,6 +834,65 @@ pub mod kernel_client {
         Ok(())
     }
 
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use eliot_contracts::AuthorityEpoch;
+
+        fn server_hello(snapshot: Value) -> ServerHello {
+            ServerHello {
+                selected_protocol: ProtocolVersion::CURRENT,
+                session_principal_binding: "local-user".to_owned(),
+                allowed_capabilities: vec!["interactive-user-broker".to_owned()],
+                allowed_effects: vec!["REVERSIBLE_MUTATION".to_owned()],
+                config_snapshot: snapshot,
+                heartbeat_ms: 1_000,
+                control_channel: KERNEL_FRONT_DOOR_PIPE.to_owned(),
+                rejection_reason: None,
+                authority_epoch: AuthorityEpoch::new(7).expect("epoch"),
+            }
+        }
+
+        #[test]
+        fn server_hello_fixture_binds_numeric_generation_authority_and_artifact() {
+            let artifact_digest = "a".repeat(64);
+            let hello = server_hello(serde_json::json!({
+                "service": KERNEL_SERVICE_NAME,
+                "protocol": KERNEL_PROTOCOL_VERSION,
+                "generation": 11,
+                "authority_epoch": 7,
+                "artifact_digest": artifact_digest,
+            }));
+            assert_eq!(
+                validate_server_snapshot(&hello, 7, 11, &"a".repeat(64)),
+                Ok(())
+            );
+        }
+
+        #[test]
+        fn server_hello_fixture_rejects_numeric_or_artifact_substitution() {
+            let hello = server_hello(serde_json::json!({
+                "service": KERNEL_SERVICE_NAME,
+                "protocol": KERNEL_PROTOCOL_VERSION,
+                "generation": 11,
+                "authority_epoch": 7,
+                "artifact_digest": "a".repeat(64),
+            }));
+            assert!(validate_server_snapshot(&hello, 7, 12, &"a".repeat(64)).is_err());
+            assert!(validate_server_snapshot(&hello, 7, 11, &"b".repeat(64)).is_err());
+        }
+
+        #[test]
+        fn server_hello_fixture_rejects_current_open_kernel_snapshot_until_n4_binds_artifact() {
+            let hello = server_hello(serde_json::json!({
+                "service": KERNEL_SERVICE_NAME,
+                "protocol": KERNEL_PROTOCOL_VERSION,
+                "generation": 1,
+            }));
+            assert!(validate_server_snapshot(&hello, 1, 1, &"a".repeat(64)).is_err());
+        }
+    }
+
     #[cfg(windows)]
     fn require_delivery(
         result: Result<DeliveryOutcome, eliot_ipc::TransportError>,
@@ -657,10 +900,12 @@ pub mod kernel_client {
     ) -> Result<(), KernelClientError> {
         match result {
             Ok(DeliveryOutcome::Delivered) => Ok(()),
-            Ok(DeliveryOutcome::UnknownOutcome) => Err(KernelClientError::Rejected(format!(
+            Ok(DeliveryOutcome::UnknownOutcome) => Err(KernelClientError::UnknownOutcome(format!(
                 "{operation} delivery outcome is unknown"
             ))),
-            Err(error) => Err(KernelClientError::Rejected(format!("{operation}: {error}"))),
+            Err(error) => Err(KernelClientError::UnknownOutcome(format!(
+                "{operation}: {error}"
+            ))),
         }
     }
 }

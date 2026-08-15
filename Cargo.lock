@@ -633,6 +633,7 @@ dependencies = [
 name = "eliot-cli"
 version = "0.1.0"
 dependencies = [
+ "eliot-contracts",
  "eliot-ipc",
  "eliot-observation-contracts",
  "eliot-platform-windows",
@@ -1825,20 +1826,26 @@ name = "eliot-user-broker"
 version = "0.1.0"
 dependencies = [
  "eliot-cli",
+ "eliot-instrument-api",
+ "eliot-platform",
  "eliot-platform-windows",
  "eliot-process",
+ "eliot-process-executor",
  "eliot-protocol",
  "eliot-user-broker-core",
  "serde",
  "serde_json",
  "sha2 0.10.9",
  "thiserror",
+ "tokio",
+ "uuid",
 ]
 
 [[package]]
 name = "eliot-user-broker-core"
 version = "0.1.0"
 dependencies = [
+ "eliot-platform",
  "eliot-process",
  "eliot-protocol",
  "eliot-receipts",
