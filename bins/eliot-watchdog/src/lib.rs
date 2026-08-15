@@ -328,36 +328,30 @@ impl WatchdogSpool {
             .map(read_high_water)
             .transpose()?
             .flatten();
-        let valid = parsed_header
+        let header_and_entries_valid = parsed_header
             .as_ref()
             .zip(entries.as_ref().ok())
-            .is_some_and(|(header, entries)| {
-                validate_header(header, entries).is_ok()
-                    && parsed_high_water.is_some_and(|high_water| {
+            .is_some_and(|(header, entries)| validate_header(header, entries).is_ok());
+        let valid = header_and_entries_valid
+            && parsed_high_water.is_some_and(|high_water| {
+                parsed_header
+                    .as_ref()
+                    .zip(entries.as_ref().ok())
+                    .is_some_and(|(header, entries)| {
                         validate_high_water(header, entries, high_water).is_ok()
                     })
             });
         if valid {
             return Ok(());
         }
-        // A pre-high-water database can be upgraded only while its original
-        // header and records are still trustworthy.  Once either is damaged,
-        // missing independent metadata means sequence continuity cannot be
-        // proven, so recovery fails closed instead of guessing sequence one.
-        if parsed_high_water.is_none()
-            && parsed_header
-                .as_ref()
-                .zip(entries.as_ref().ok())
-                .is_some_and(|(header, entries)| validate_header(header, entries).is_ok())
-        {
-            let header = parsed_header.expect("header was checked above");
-            let entries = entries.expect("entries were checked above");
-            let high_water = header.next_sequence.saturating_sub(1);
-            validate_high_water(&header, &entries, high_water)?;
-            drop(high_water_table);
-            drop(table);
-            drop(read);
-            return self.write_high_water(high_water);
+        if header_and_entries_valid {
+            if let Some(high_water) = parsed_high_water {
+                let (header, entries) = parsed_header
+                    .as_ref()
+                    .zip(entries.as_ref().ok())
+                    .expect("valid header and entries were checked above");
+                validate_high_water(header, entries, high_water)?;
+            }
         }
         let corrupt_digest = header
             .as_ref()
@@ -396,26 +390,6 @@ impl WatchdogSpool {
                 .insert(SPOOL_HIGH_WATER_KEY, high_water_bytes.as_slice())
                 .map_err(|error| SpoolError::Database(error.to_string()))?;
             drop(high_water_table);
-        }
-        write
-            .commit()
-            .map_err(|error| SpoolError::Database(error.to_string()))
-    }
-
-    fn write_high_water(&self, high_water: u64) -> Result<(), SpoolError> {
-        let bytes = encode_high_water(high_water)?;
-        let write = self
-            .database
-            .begin_write()
-            .map_err(|error| SpoolError::Database(error.to_string()))?;
-        {
-            let mut table = write
-                .open_table(SPOOL_HIGH_WATER_TABLE)
-                .map_err(|error| SpoolError::Database(error.to_string()))?;
-            table
-                .insert(SPOOL_HIGH_WATER_KEY, bytes.as_slice())
-                .map_err(|error| SpoolError::Database(error.to_string()))?;
-            drop(table);
         }
         write
             .commit()
@@ -1377,6 +1351,83 @@ mod tests {
             retained.len()
         );
         drop(reopened);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    fn prepared_spool(name: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+        let root =
+            std::env::temp_dir().join(format!("eliot-watchdog-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir(&root).unwrap_or_else(|_| unreachable!());
+        let path = root.join("watchdog.redb");
+        let spool = WatchdogSpool::open_test(&path).unwrap_or_else(|error| panic!("{error}"));
+        spool
+            .append(
+                1,
+                WatchdogSpoolPayload::Gap {
+                    service: SERVICE_NAME.to_owned(),
+                    reason: GapRecoveryReason::AdmissionUnavailable,
+                    coverage_claimed: false,
+                },
+            )
+            .unwrap_or_else(|error| panic!("{error}"));
+        drop(spool);
+        (root, path)
+    }
+
+    fn replace_high_water(path: &std::path::Path, bytes: Option<&[u8]>) {
+        let database = Database::open(path).unwrap_or_else(|error| panic!("{error}"));
+        let write = database
+            .begin_write()
+            .unwrap_or_else(|error| panic!("{error}"));
+        {
+            let mut table = write
+                .open_table(SPOOL_HIGH_WATER_TABLE)
+                .unwrap_or_else(|error| panic!("{error}"));
+            match bytes {
+                Some(bytes) => table
+                    .insert(SPOOL_HIGH_WATER_KEY, bytes)
+                    .unwrap_or_else(|error| panic!("{error}")),
+                None => table
+                    .remove(SPOOL_HIGH_WATER_KEY)
+                    .unwrap_or_else(|error| panic!("{error}")),
+            };
+        }
+        write.commit().unwrap_or_else(|error| panic!("{error}"));
+        drop(database);
+    }
+
+    #[test]
+    fn redb_spool_missing_high_water_fails_closed() {
+        let (root, path) = prepared_spool("missing-high-water");
+        replace_high_water(&path, None);
+        assert!(matches!(
+            WatchdogSpool::open_test(&path),
+            Err(SpoolError::Corrupt(detail)) if detail.contains("high-water")
+        ));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn redb_spool_malformed_high_water_fails_closed() {
+        let (root, path) = prepared_spool("malformed-high-water");
+        replace_high_water(&path, Some(b"not-json"));
+        assert!(matches!(
+            WatchdogSpool::open_test(&path),
+            Err(SpoolError::Corrupt(detail)) if detail.contains("high-water")
+        ));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn redb_spool_mismatched_high_water_fails_closed() {
+        let (root, path) = prepared_spool("mismatched-high-water");
+        let bytes = encode_high_water(99).unwrap_or_else(|error| panic!("{error}"));
+        replace_high_water(&path, Some(&bytes));
+        assert!(matches!(
+            WatchdogSpool::open_test(&path),
+            Err(SpoolError::Corrupt(detail)) if detail.contains("high-water")
+        ));
         let _ = std::fs::remove_dir_all(root);
     }
 
