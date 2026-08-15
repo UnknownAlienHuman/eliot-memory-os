@@ -1,0 +1,16 @@
+[package]
+name = "eliot-session"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Fenced, durable agent-session lifecycle owner"
+
+[dependencies]
+eliot-contracts.workspace = true
+schemars.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true
