@@ -271,6 +271,12 @@ fn validate_request_fence(
             if context != &identity.request.metadata {
                 return Err("apply context does not match request identity metadata".to_owned());
             }
+            if identity.idempotency_key != transition.identity.idempotency_key {
+                return Err(
+                    "prepared transition idempotency key does not match request identity"
+                        .to_owned(),
+                );
+            }
             if transition.state_fence != identity.request.state_fence {
                 return Err("prepared transition fence does not match request identity".to_owned());
             }
