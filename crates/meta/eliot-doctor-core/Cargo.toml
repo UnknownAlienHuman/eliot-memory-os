@@ -1,0 +1,15 @@
+[package]
+name = "eliot-doctor-core"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.89"
+license = "MIT"
+
+[workspace]
+
+[dependencies]
+blake3 = "1.8.5"
+serde = { version = "1.0.228", features = ["derive"] }
+thiserror = "2.0.17"
+time = { version = "0.3.44", features = ["serde", "formatting", "parsing"] }
+uuid = { version = "1.18.1", features = ["serde", "v7"] }
