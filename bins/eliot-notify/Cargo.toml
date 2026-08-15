@@ -1,0 +1,24 @@
+[package]
+name = "eliot-notify"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "ELIOT governed notification delivery process"
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "eliot-notify"
+path = "src/main.rs"
+
+[dependencies]
+eliot-notify-core.workspace = true
+eliot-platform.workspace = true
+eliot-platform-windows.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[lints]
+workspace = true
