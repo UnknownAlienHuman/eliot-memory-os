@@ -32,10 +32,15 @@ members = [
   "crates/governor/eliot-workscope",
   "crates/storage/eliot-store-api",
   "crates/storage/eliot-store-memory",
+  "crates/storage/eliot-store-surreal-adapter",
+  "crates/storage/eliot-blob-api",
+  "crates/storage/eliot-blob",
   "crates/instrument/eliot-graph-api",
   "crates/instrument/eliot-instrument-api",
+  "crates/instrument/eliot-process-executor",
   "crates/kernel/eliot-host-state",
   "crates/kernel/eliot-ipc",
+  "crates/kernel/eliot-kernel-core",
   "crates/kernel/eliot-ors",
   "crates/kernel/eliot-platform",
   "crates/kernel/eliot-platform-windows",
@@ -67,6 +72,7 @@ anyhow = "1.0.102"
 base64 = "0.22.1"
 blake3 = "1.8.5"
 clap = { version = "4.6.1", features = ["derive", "env"] }
+ed25519-dalek = { version = "=3.0.0", default-features = false, features = ["alloc", "fast"] }
 eliot-agent-api = { path = "crates/agent/eliot-agent-api", version = "0.1.0" }
 eliot-agent-acp = { path = "crates/agent/eliot-agent-acp", version = "0.1.0" }
 eliot-agent-coordinator = { path = "crates/agent/eliot-agent-coordinator", version = "0.1.0" }
@@ -96,10 +102,15 @@ eliot-problem = { path = "crates/governor/eliot-problem", version = "0.1.0" }
 eliot-workscope = { path = "crates/governor/eliot-workscope", version = "0.1.0" }
 eliot-store-api = { path = "crates/storage/eliot-store-api", version = "0.1.0" }
 eliot-store-memory = { path = "crates/storage/eliot-store-memory", version = "0.1.0" }
+eliot-store-surreal-adapter = { path = "crates/storage/eliot-store-surreal-adapter", version = "0.1.0" }
+eliot-blob-api = { path = "crates/storage/eliot-blob-api", version = "0.1.0" }
+eliot-blob = { path = "crates/storage/eliot-blob", version = "0.1.0" }
 eliot-graph-api = { path = "crates/instrument/eliot-graph-api", version = "0.1.0" }
 eliot-instrument-api = { path = "crates/instrument/eliot-instrument-api", version = "0.1.0" }
+eliot-process-executor = { path = "crates/instrument/eliot-process-executor", version = "0.1.0" }
 eliot-host-state = { path = "crates/kernel/eliot-host-state", version = "0.1.0" }
 eliot-ipc = { path = "crates/kernel/eliot-ipc", version = "0.1.0" }
+eliot-kernel-core = { path = "crates/kernel/eliot-kernel-core", version = "0.1.0" }
 eliot-ors = { path = "crates/kernel/eliot-ors", version = "0.1.0" }
 eliot-agent-bridge-core = { path = "crates/surfaces/eliot-agent-bridge-core", version = "0.1.0" }
 eliot-agent-bridge = { path = "bins/eliot-agent-bridge", version = "0.1.0" }
@@ -125,6 +136,7 @@ secrecy = { version = "0.10.3", features = ["serde"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = { version = "1.0.150", features = ["float_roundtrip"] }
 sha2 = "0.10.9"
+surrealdb = { version = "=3.2.3", default-features = false, features = ["protocol-ws", "rustls"] }
 thiserror = "2.0.18"
 time = { version = "0.3.51", features = ["local-offset", "serde", "serde-well-known"] }
 tokio = { version = "1.52.3", features = [

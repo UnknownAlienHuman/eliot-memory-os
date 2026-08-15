@@ -9,11 +9,14 @@
 
 use std::{fmt, str::FromStr};
 
+pub use eliot_contracts::{
+    ContractError, ContractVersion, ErrorCode, OperationId, RequestMetadata, StateFence,
+    canonical_json_bytes, sha256_hex,
+};
 use eliot_contracts::{
-    ArtifactId, AuthorityEpoch, ContractError, ContractId, ContractIdentity, ContractVersion,
-    ErrorCode, OperationId, ProductId, ReceiptId, RequestId, RequestMetadata, ResourceGeneration,
-    SessionId, StateFence, TaskId, TaskRevision, TransactionSequence, canonical_json_bytes,
-    contract_identity as make_contract_identity, sha256_hex,
+    ArtifactId, AuthorityEpoch, ContractId, ContractIdentity, ProductId, ReceiptId, RequestId,
+    ResourceGeneration, SessionId, TaskId, TaskRevision, TransactionSequence,
+    contract_identity as make_contract_identity,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
