@@ -107,6 +107,21 @@ impl StreamCapture {
 }
 
 #[cfg(windows)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct CaptureFailure {
+    stream: &'static str,
+    thread_id: String,
+    disposition: CaptureFailureDisposition,
+}
+
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CaptureFailureDisposition {
+    Timeout,
+    Panicked,
+}
+
+#[cfg(windows)]
 struct Operation {
     state: ProcessState,
     sink: Arc<dyn ProcessEvidenceSink>,
@@ -119,6 +134,7 @@ struct Operation {
     timed_out: bool,
     cleanup_required: bool,
     termination: Option<TerminatedJobChild>,
+    capture_failures: Vec<CaptureFailure>,
 }
 
 #[cfg(not(windows))]
@@ -456,6 +472,7 @@ impl ProcessExecutor for WindowsProcessExecutor {
                 timed_out: false,
                 cleanup_required: false,
                 termination: None,
+                capture_failures: Vec::new(),
             }));
             self.operations
                 .lock()
@@ -726,6 +743,11 @@ fn finalize_operation(
             return Err(error.into());
         }
     };
+    if !join_streams(operation) {
+        operation.termination = Some(termination);
+        operation.cleanup_required = true;
+        return Err(ProcessExecutionError::UnknownOutcome);
+    }
     if let Err(error) = operation.state.exit(exit, descendants) {
         operation.termination = Some(termination);
         operation.cleanup_required = true;
@@ -791,16 +813,29 @@ fn spawn_deadline_watcher(operation: Arc<Mutex<Operation>>, poisoned: Arc<Atomic
 
 #[cfg(windows)]
 fn join_streams(operation: &mut Operation) -> bool {
-    let stdout_joined = join_capture_thread(&mut operation.stdout_thread);
-    let stderr_joined = join_capture_thread(&mut operation.stderr_thread);
-    stdout_joined && stderr_joined
+    let stdout_joined = join_capture_thread(&mut operation.stdout_thread, "stdout");
+    let stderr_joined = join_capture_thread(&mut operation.stderr_thread, "stderr");
+    let failures = [stdout_joined, stderr_joined]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+    for failure in &failures {
+        if !operation.capture_failures.contains(failure) {
+            operation.capture_failures.push(failure.clone());
+        }
+    }
+    failures.is_empty()
 }
 
 #[cfg(windows)]
-fn join_capture_thread(thread_slot: &mut Option<JoinHandle<()>>) -> bool {
+fn join_capture_thread(
+    thread_slot: &mut Option<JoinHandle<()>>,
+    stream: &'static str,
+) -> Option<CaptureFailure> {
     let Some(thread) = thread_slot.as_ref() else {
-        return true;
+        return None;
     };
+    let thread_id = format!("{:?}", thread.thread().id());
     if !thread.is_finished() {
         let _ = cancel_capture_thread_io(thread);
         let deadline = Instant::now()
@@ -811,11 +846,27 @@ fn join_capture_thread(thread_slot: &mut Option<JoinHandle<()>>) -> bool {
         }
     }
     if !thread.is_finished() {
-        return false;
+        return Some(CaptureFailure {
+            stream,
+            thread_id,
+            disposition: CaptureFailureDisposition::Timeout,
+        });
     }
-    thread_slot
-        .take()
-        .is_some_and(|thread| thread.join().is_ok())
+    let Some(thread) = thread_slot.take() else {
+        return Some(CaptureFailure {
+            stream,
+            thread_id,
+            disposition: CaptureFailureDisposition::Panicked,
+        });
+    };
+    if thread.join().is_err() {
+        return Some(CaptureFailure {
+            stream,
+            thread_id,
+            disposition: CaptureFailureDisposition::Panicked,
+        });
+    }
+    None
 }
 
 #[cfg(windows)]
