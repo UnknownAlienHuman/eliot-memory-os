@@ -13,8 +13,8 @@ use eliot_store_api::{
     CAPABILITIES, EFFECTS, StateFence, decode_request_frame, response_frame as store_response_frame,
 };
 use eliot_store_surreal::{
-    PROTOCOL_VERSION, Request, Response, SERVICE_NAME, StoreComposition, StoreLaunchConfig,
-    load_config,
+    PROTOCOL_VERSION, Request, Response, SERVICE_NAME, StoreComposition, StoreCompositionError,
+    StoreLaunchConfig, load_config,
 };
 
 struct Session {
@@ -28,84 +28,38 @@ struct Session {
 
 #[tokio::main]
 async fn main() {
-    #[cfg(not(windows))]
-    {
-        eprintln!(
-            "{SERVICE_NAME}: the production store endpoint requires Windows authenticated named pipes"
-        );
-        return;
+    if let Err(error) = run().await {
+        eprintln!("{SERVICE_NAME}: {error}");
+        std::process::exit(1);
     }
-    #[cfg(windows)]
-    run_windows().await;
 }
 
 #[cfg(windows)]
-async fn run_windows() {
-    let config_path = match parse_config_path() {
-        Ok(path) => path,
-        Err(error) => {
-            eprintln!("{SERVICE_NAME}: {error}");
-            return;
-        }
-    };
-    let config = match load_config(Some(&config_path)) {
-        Ok(config) => config,
-        Err(error) => {
-            eprintln!("{SERVICE_NAME}: {error}");
-            return;
-        }
-    };
-    let composition = match StoreComposition::new(config.clone()) {
-        Ok(composition) => composition,
-        Err(error) => {
-            eprintln!("{SERVICE_NAME}: {error}");
-            return;
-        }
-    };
+async fn run() -> Result<(), String> {
+    let config_path = parse_config_path()?;
+    let config = load_config(Some(&config_path))?;
+    let composition = StoreComposition::new(config.clone())?;
 
     let limits = TransportLimits::default();
-    let expectation = match eliot_platform_windows::NamedPipePeerExpectation::new(
+    let expectation = eliot_platform_windows::NamedPipePeerExpectation::new(
         config.expected_client_sid.clone(),
         config.expected_client_session_id,
-    ) {
-        Ok(value) => value,
-        Err(error) => {
-            eprintln!("{SERVICE_NAME}: invalid peer expectation: {error}");
-            return;
-        }
-    };
-    let mut server = match NamedPipeServer::create(&config.store_pipe, &expectation) {
-        Ok(server) => server,
-        Err(error) => {
-            eprintln!("{SERVICE_NAME}: named-pipe creation failed: {error}");
-            return;
-        }
-    };
-    if let Err(error) = server
+    )
+    .map_err(|error| format!("invalid peer expectation: {error}"))?;
+    let mut server = NamedPipeServer::create(&config.store_pipe, &expectation)
+        .map_err(|error| format!("named-pipe creation failed: {error}"))?;
+    server
         .wait_for_authenticated_client(
             Duration::from_millis(config.connect_timeout_ms),
             &expectation,
         )
         .await
-    {
-        eprintln!("{SERVICE_NAME}: authenticated client admission failed: {error}");
-        return;
-    }
-    let hello_frame = match server.receive_frame(limits).await {
-        Ok(frame) => frame,
-        Err(error) => {
-            eprintln!("{SERVICE_NAME}: EBP hello receive failed: {error}");
-            return;
-        }
-    };
-    let (mut session, server_hello) =
-        match admit_handshake(hello_frame, limits, &composition, &config) {
-            Ok(value) => value,
-            Err(error) => {
-                eprintln!("{SERVICE_NAME}: EBP handshake rejected: {error}");
-                return;
-            }
-        };
+        .map_err(|error| format!("authenticated client admission failed: {error}"))?;
+    let hello_frame = server
+        .receive_frame(limits)
+        .await
+        .map_err(|error| format!("EBP hello receive failed: {error}"))?;
+    let (mut session, server_hello) = admit_handshake(hello_frame, limits, &composition, &config)?;
     let mut negotiated_limits = limits;
     negotiated_limits.max_frame_bytes = session.max_frame_bytes;
     let handshake_frame = control_frame(
@@ -114,40 +68,37 @@ async fn run_windows() {
         MessageType::Ready,
         serde_json::to_value(server_hello).expect("server hello is serializable"),
     );
-    if let Err(error) = server.send_frame(&handshake_frame, negotiated_limits).await {
-        eprintln!("{SERVICE_NAME}: EBP handshake response failed: {error}");
-        return;
-    }
+    server
+        .send_frame(&handshake_frame, negotiated_limits)
+        .await
+        .map_err(|error| format!("EBP handshake response failed: {error}"))?;
 
     loop {
-        let frame = match server.receive_frame(negotiated_limits).await {
-            Ok(frame) => frame,
-            Err(error) => {
-                eprintln!("{SERVICE_NAME}: EBP frame rejected: {error}");
-                break;
-            }
-        };
+        let frame = server
+            .receive_frame(negotiated_limits)
+            .await
+            .map_err(|error| format!("EBP frame rejected: {error}"))?;
         let response = match validate_request_frame(&mut session, &frame) {
             Ok(request) => dispatch(&composition, request).await,
             Err(error) => Response::Error { error },
         };
-        let response_frame = match store_response_frame(
+        let response_frame = store_response_frame(
             &session.connection_id,
             session.protocol_version,
             frame.request_id.clone(),
             response,
-        ) {
-            Ok(frame) => frame,
-            Err(error) => {
-                eprintln!("{SERVICE_NAME}: invalid EBP response: {error}");
-                break;
-            }
-        };
-        if let Err(error) = server.send_frame(&response_frame, negotiated_limits).await {
-            eprintln!("{SERVICE_NAME}: EBP response failed: {error}");
-            break;
-        }
+        )
+        .map_err(|error| format!("invalid EBP response: {error}"))?;
+        server
+            .send_frame(&response_frame, negotiated_limits)
+            .await
+            .map_err(|error| format!("EBP response failed: {error}"))?;
     }
+}
+
+#[cfg(not(windows))]
+async fn run() -> Result<(), String> {
+    Err("the production store endpoint requires Windows authenticated named pipes".to_owned())
 }
 
 /// The only supported launch form is
@@ -192,6 +143,7 @@ fn admit_handshake(
     }
     let artifact_hash = hello.artifact_hash.as_str();
     if artifact_hash != config.approved_artifact_hash
+        || hello.launch_nonce != config.launch_nonce
         || hello.module_generation.generation.value() != config.store_generation
         || hello.authority_epoch.value() != config.authority_epoch
     {
@@ -314,6 +266,13 @@ async fn dispatch(composition: &StoreComposition, request: Request) -> Response 
             .await
         {
             Ok(receipt) => Response::from_transaction_receipt(receipt),
+            Err(StoreCompositionError::UnknownOutcome {
+                operation_id,
+                reason,
+            }) => Response::Unknown {
+                operation_id,
+                reason,
+            },
             Err(error) => Response::Error {
                 error: error.to_string(),
             },

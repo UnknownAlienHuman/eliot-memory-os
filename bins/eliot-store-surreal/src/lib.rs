@@ -11,7 +11,7 @@
 use std::path::Path;
 
 use eliot_blob::BlobRootOwner;
-use eliot_platform_windows::{NamedPipePeerExpectation, WindowsPlatform};
+use eliot_platform_windows::{NamedPipePeerExpectation, WindowsPlatform, read_protected_file};
 use eliot_store_api::{
     CanonicalStoreClient, NamedReadRequest, NamedReadResponse, OperationId, OrderingHead,
     OrderingHeadExpectation, OrderingScopeId, PreparedTransition, RequestMeta, RevisionHead,
@@ -25,9 +25,42 @@ use eliot_store_surreal_adapter::{
 use secrecy::SecretString;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
+use thiserror::Error;
 
 pub const SERVICE_NAME: &str = "eliot-store-surreal";
 pub const PROTOCOL_VERSION: &str = "eliot.s03.ebp.v1";
+const MAX_LAUNCH_CONFIG_BYTES: u64 = 256 * 1024;
+
+/// Error returned by the neutral Store root while preserving an ambiguous
+/// provider write identity for the EBP response boundary.
+#[derive(Debug, Error)]
+pub enum StoreCompositionError {
+    /// A deterministic store/API failure.
+    #[error("store error: {0}")]
+    Store(#[from] StoreError),
+    /// The provider crossed a write boundary without proving its outcome.
+    #[error("provider outcome is unknown for operation {operation_id}: {reason}")]
+    UnknownOutcome {
+        /// Exact operation identity used for receipt reconciliation.
+        operation_id: OperationId,
+        /// Bounded provider reason, not a success claim.
+        reason: String,
+    },
+}
+
+fn map_adapter_error(error: AdapterError) -> StoreCompositionError {
+    match error {
+        AdapterError::UnknownOutcome { operation_id } => match OperationId::new(operation_id) {
+            Ok(operation_id) => StoreCompositionError::UnknownOutcome {
+                operation_id,
+                reason: "provider outcome is unknown; reconcile by exact receipt".to_owned(),
+            },
+            Err(error) => StoreCompositionError::Store(StoreError::Foundation(error)),
+        },
+        AdapterError::Store(error) => StoreCompositionError::Store(error),
+        other => StoreCompositionError::Store(other.into_store_error()),
+    }
+}
 
 /// Explicit, target-only process launch configuration.
 ///
@@ -40,6 +73,8 @@ pub const PROTOCOL_VERSION: &str = "eliot.s03.ebp.v1";
 #[serde(deny_unknown_fields)]
 pub struct StoreLaunchConfig {
     pub store_pipe: String,
+    /// Host-issued nonce for this exact Store process lineage.
+    pub launch_nonce: String,
     /// SID/session the Store pipe must authenticate as its Kernel client.
     pub expected_client_sid: String,
     pub expected_client_session_id: u32,
@@ -64,6 +99,7 @@ impl StoreLaunchConfig {
     /// claiming the Blob root. No defaults are admitted.
     pub fn validate(&self) -> Result<(), String> {
         validate_launch_text(&self.store_pipe, "store_pipe")?;
+        validate_launch_text(&self.launch_nonce, "launch_nonce")?;
         eliot_ipc::validate_pipe_name(&self.store_pipe)
             .map_err(|error| format!("invalid store_pipe: {error}"))?;
         NamedPipePeerExpectation::new(
@@ -111,6 +147,7 @@ pub fn launch_config_digest(config: &StoreLaunchConfig) -> Result<String, String
     #[derive(Serialize)]
     struct OperationalConfig<'a> {
         store_pipe: &'a str,
+        launch_nonce: &'a str,
         expected_client_sid: &'a str,
         expected_client_session_id: u32,
         approved_artifact_hash: &'a str,
@@ -129,6 +166,7 @@ pub fn launch_config_digest(config: &StoreLaunchConfig) -> Result<String, String
     }
     let input = OperationalConfig {
         store_pipe: &config.store_pipe,
+        launch_nonce: &config.launch_nonce,
         expected_client_sid: &config.expected_client_sid,
         expected_client_session_id: config.expected_client_session_id,
         approved_artifact_hash: &config.approved_artifact_hash,
@@ -263,11 +301,16 @@ impl StoreComposition {
         transition: PreparedTransition,
         expected_revision_heads: Vec<RevisionHeadExpectation>,
         expected_ordering_heads: Vec<OrderingHeadExpectation>,
-    ) -> Result<WriteReceipt, StoreError> {
-        context.validate().map_err(StoreError::Foundation)?;
-        transition.validate()?;
+    ) -> Result<WriteReceipt, StoreCompositionError> {
+        context
+            .validate()
+            .map_err(StoreError::Foundation)
+            .map_err(StoreCompositionError::Store)?;
+        transition
+            .validate()
+            .map_err(StoreCompositionError::Store)?;
         if context.state_fence != transition.state_fence {
-            return Err(StoreError::FenceMismatch);
+            return Err(StoreCompositionError::Store(StoreError::FenceMismatch));
         }
         self.store
             .apply_prepared(
@@ -277,7 +320,7 @@ impl StoreComposition {
                 expected_ordering_heads,
             )
             .await
-            .map_err(AdapterError::into_store_error)
+            .map_err(map_adapter_error)
     }
 
     /// Reconciles a possibly ambiguous write by exact operation identity.
@@ -353,15 +396,17 @@ fn non_empty_secret(value: String, source: &str) -> Result<SecretString, String>
     Ok(SecretString::new(value.into()))
 }
 
-/// Loads the process's explicit non-secret launch configuration. Secret
-/// material is resolved from the opaque credential reference only inside
-/// StoreComposition::new. Missing configuration is an error; there is no
-/// default or legacy configuration conversion.
+/// Loads the process's explicit non-secret launch configuration from the
+/// protected ProgramData contour. Secret material is resolved from the opaque
+/// credential reference only inside `StoreComposition::new`. Missing or
+/// out-of-contour configuration is an error; there is no default or legacy
+/// configuration conversion.
 pub fn load_config(path: Option<&Path>) -> Result<StoreLaunchConfig, String> {
     let Some(path) = path else {
         return Err("--config is required; launch config must be explicit".to_owned());
     };
-    let bytes = std::fs::read(path).map_err(|error| format!("read config: {error}"))?;
+    let bytes = read_protected_file(path, MAX_LAUNCH_CONFIG_BYTES)
+        .map_err(|error| format!("read protected config: {error}"))?;
     match path.extension().and_then(|extension| extension.to_str()) {
         Some("json") => {
             let config: StoreLaunchConfig = serde_json::from_slice(&bytes)
@@ -379,5 +424,59 @@ pub fn load_config(path: Option<&Path>) -> Result<StoreLaunchConfig, String> {
             "config extension must be .json or .toml, got .{extension}"
         )),
         None => Err("config path must have a .json or .toml extension".to_owned()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn config() -> StoreLaunchConfig {
+        let mut config = StoreLaunchConfig {
+            store_pipe: r"\\.\pipe\eliot\store-test".to_owned(),
+            launch_nonce: "launch-test".to_owned(),
+            expected_client_sid: "S-1-5-18".to_owned(),
+            expected_client_session_id: 0,
+            approved_artifact_hash: "a".repeat(64),
+            approved_config_hash: String::new(),
+            store_generation: 1,
+            authority_epoch: 1,
+            endpoint: "ws://127.0.0.1:8000".to_owned(),
+            namespace: "eliot".to_owned(),
+            database: "eliot".to_owned(),
+            username: "store".to_owned(),
+            connect_timeout_ms: 1_000,
+            query_timeout_ms: 1_000,
+            schema_generation: "1.0.0".to_owned(),
+            blob_root: r"C:\ProgramData\Eliot\blob".to_owned(),
+            instance_id: "store-test".to_owned(),
+            credential_ref: "eliot/store".to_owned(),
+        };
+        config.approved_config_hash = launch_config_digest(&config).expect("config digest");
+        config
+    }
+
+    #[test]
+    fn launch_nonce_and_operational_fields_are_digest_bound() {
+        let config = config();
+        assert!(config.validate().is_ok());
+        let mut altered = config.clone();
+        altered.launch_nonce = "different-launch".to_owned();
+        assert!(altered.validate().is_err());
+        let mut endpoint_altered = config;
+        endpoint_altered.endpoint = "ws://127.0.0.1:9000".to_owned();
+        assert!(endpoint_altered.validate().is_err());
+    }
+
+    #[test]
+    fn unknown_provider_outcome_keeps_exact_wire_operation() {
+        let error = map_adapter_error(AdapterError::UnknownOutcome {
+            operation_id: "operation-test".to_owned(),
+        });
+        assert!(matches!(
+            error,
+            StoreCompositionError::UnknownOutcome { operation_id, .. }
+                if operation_id.as_str() == "operation-test"
+        ));
     }
 }

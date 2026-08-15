@@ -317,7 +317,13 @@ impl RequestFailure {
         match self {
             Self::Store(error) => error,
             Self::Contract(error) => StoreError::Serialization(error.to_string()),
-            Self::Unknown { reason, .. } => StoreError::Serialization(reason),
+            // Apply paths handle `Unknown` before reaching this conversion and
+            // reconcile by the exact operation id. A standalone readback that
+            // is itself unknown is only an unavailable observation.
+            Self::Unknown { reason, .. } => {
+                let _ = reason;
+                StoreError::Unavailable
+            }
         }
     }
 }
@@ -615,5 +621,369 @@ impl EbpStoreTransport for eliot_ipc::NamedPipeTransport {
         eliot_ipc::NamedPipeTransport::receive_frame(self, limits)
             .await
             .map_err(Into::into)
+    }
+}
+
+#[cfg(all(test, windows))]
+mod windows_e2e_tests {
+    use super::*;
+    use std::collections::BTreeMap;
+    use std::sync::{Arc, atomic::AtomicU64};
+    use std::time::Duration;
+
+    use eliot_contracts::{AuthorityEpoch, ResourceGeneration, StateFence};
+    use eliot_ipc::NamedPipeServer;
+    use eliot_platform::PlatformHandle;
+    use eliot_store_api::{
+        EventProjectionRelationIntents, NamedMutationOperation, NamedMutationRequest,
+        OperationIdentity, OperationManifestDigest, ReadinessReceipt, SecurityContext,
+        StoreResponse, TransitionClass,
+    };
+    use tokio::sync::Mutex;
+
+    fn requirement(pipe: String) -> HostStoreBootstrapRequirement {
+        let fence = StateFence::new(AuthorityEpoch::genesis(), ResourceGeneration::genesis());
+        let expectation = eliot_platform_windows::current_process_named_pipe_expectation()
+            .expect("current process expectation");
+        HostStoreBootstrapRequirement {
+            store_pipe: PlatformHandle::new(pipe).expect("pipe handle"),
+            store_generation: ResourceGeneration::genesis(),
+            schema_generation: PlatformHandle::new("1.0.0").expect("schema handle"),
+            state_fence: fence,
+            launch_nonce: PlatformHandle::new("launch-e2e").expect("launch nonce"),
+            connection_id: PlatformHandle::new("connection-e2e").expect("connection id"),
+            expected_peer_sid: PlatformHandle::new(expectation.expected_sid()).expect("peer sid"),
+            expected_peer_session_id: expectation.expected_session_id(),
+            approved_artifact_hash: PlatformHandle::new("a".repeat(64)).expect("artifact hash"),
+            approved_config_hash: PlatformHandle::new("b".repeat(64)).expect("config hash"),
+        }
+    }
+
+    fn prepared_transition(fence: StateFence) -> PreparedTransition {
+        let mut parameters = BTreeMap::new();
+        parameters.insert("subject".to_owned(), serde_json::json!("e2e"));
+        PreparedTransition {
+            identity: OperationIdentity {
+                operation_id: OperationId::new("operation-e2e").expect("operation id"),
+                idempotency_key: "idempotency-e2e".to_owned(),
+                canonical_request_hash: "c".repeat(64),
+            },
+            state_fence: fence,
+            scope_id: ScopeId::new("scope-e2e").expect("scope"),
+            task_id: None,
+            ordering_scopes: vec![OrderingScopeId::new("scope-e2e").expect("ordering scope")],
+            transition_class: TransitionClass::CaptureCandidate,
+            requested_effect_ceiling: eliot_store_api::EffectClass::Candidate,
+            admission_contract_set_digest: "d".repeat(64),
+            operation_manifest_digest: OperationManifestDigest::new("manifest-e2e")
+                .expect("manifest"),
+            named_operations: vec![NamedMutationRequest {
+                operation: NamedMutationOperation::CaptureObservation,
+                parameters,
+            }],
+            event_projection_relation_intents: EventProjectionRelationIntents {
+                event_ids: Vec::new(),
+                projection_kinds: Vec::new(),
+                relation_kinds: Vec::new(),
+            },
+            security: SecurityContext::default(),
+            required_proof_and_approval_refs: Vec::new(),
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn authenticated_s03_unknown_response_reconciles_exact_operation() {
+        let pipe = format!(
+            r"\\.\pipe\eliot\s03-e2e\{}-{}",
+            std::process::id(),
+            unix_ms()
+        );
+        let requirement = requirement(pipe.clone());
+        let expectation = eliot_platform_windows::current_process_named_pipe_expectation()
+            .expect("current process expectation");
+        let mut server = NamedPipeServer::create(&pipe, &expectation).expect("secured pipe");
+        let server_expectation = expectation.clone();
+        let server_requirement = requirement.clone();
+        let server_task = tokio::spawn(async move {
+            server
+                .wait_for_authenticated_client(Duration::from_secs(5), &server_expectation)
+                .await
+                .map_err(|error| error.to_string())?;
+            let limits = TransportLimits::default();
+            let hello = server
+                .receive_frame(limits)
+                .await
+                .map_err(|error| error.to_string())?;
+            let hello = eliot_ipc::decode_client_hello_frame(
+                &hello,
+                server_requirement.connection_id.as_str(),
+            )
+            .map_err(|error| error.to_string())?;
+            assert_eq!(hello.launch_nonce, server_requirement.launch_nonce.as_str());
+            assert_eq!(
+                hello.artifact_hash.as_str(),
+                server_requirement.approved_artifact_hash.as_str()
+            );
+            let server_hello = ServerHello {
+                selected_protocol: ProtocolVersion::CURRENT,
+                session_principal_binding: "s03-test-server".to_owned(),
+                allowed_capabilities: CAPABILITIES
+                    .iter()
+                    .map(|value| (*value).to_owned())
+                    .collect(),
+                allowed_effects: vec!["read".to_owned(), "canonical_write".to_owned()],
+                config_snapshot: serde_json::json!({
+                    "artifact_hash": server_requirement.approved_artifact_hash.as_str(),
+                    "config_hash": server_requirement.approved_config_hash.as_str(),
+                }),
+                heartbeat_ms: 30_000,
+                control_channel: "named_pipe".to_owned(),
+                rejection_reason: None,
+                authority_epoch: server_requirement.authority_epoch(),
+            };
+            let frame = eliot_ipc::server_hello_frame(
+                server_requirement.connection_id.as_str(),
+                &server_hello,
+            )
+            .map_err(|error| error.to_string())?;
+            server
+                .send_frame(&frame, limits)
+                .await
+                .map_err(|error| error.to_string())?;
+
+            let readiness = server
+                .receive_frame(limits)
+                .await
+                .map_err(|error| error.to_string())?;
+            let (request_id, _, request) = eliot_store_api::decode_request_frame(&readiness)
+                .map_err(|error| error.to_string())?;
+            assert!(matches!(request, StoreRequest::Readiness));
+            let readiness = eliot_store_api::response_frame(
+                server_requirement.connection_id.as_str(),
+                ProtocolVersion::CURRENT,
+                Some(request_id),
+                StoreResponse::Readiness {
+                    receipt: ReadinessReceipt::ready(
+                        server_requirement.schema_generation.as_str().to_owned(),
+                    ),
+                },
+            )
+            .map_err(|error| error.to_string())?;
+            server
+                .send_frame(&readiness, limits)
+                .await
+                .map_err(|error| error.to_string())?;
+
+            let apply = server
+                .receive_frame(limits)
+                .await
+                .map_err(|error| error.to_string())?;
+            let (request_id, _, request) =
+                eliot_store_api::decode_request_frame(&apply).map_err(|error| error.to_string())?;
+            let operation_id = match request {
+                StoreRequest::Apply { transition, .. } => transition.identity.operation_id,
+                other => panic!("expected apply, got {other:?}"),
+            };
+            let unknown = eliot_store_api::response_frame(
+                server_requirement.connection_id.as_str(),
+                ProtocolVersion::CURRENT,
+                Some(request_id),
+                StoreResponse::Unknown {
+                    operation_id: operation_id.clone(),
+                    reason: "test delivery boundary is unknown".to_owned(),
+                },
+            )
+            .map_err(|error| error.to_string())?;
+            server
+                .send_frame(&unknown, limits)
+                .await
+                .map_err(|error| error.to_string())?;
+
+            let receipt_request = server
+                .receive_frame(limits)
+                .await
+                .map_err(|error| error.to_string())?;
+            let (request_id, _, request) = eliot_store_api::decode_request_frame(&receipt_request)
+                .map_err(|error| error.to_string())?;
+            let requested_operation = match request {
+                StoreRequest::Receipt { operation_id } => operation_id,
+                other => panic!("expected receipt reconciliation, got {other:?}"),
+            };
+            assert_eq!(requested_operation, operation_id);
+            let receipt = eliot_store_api::response_frame(
+                server_requirement.connection_id.as_str(),
+                ProtocolVersion::CURRENT,
+                Some(request_id),
+                StoreResponse::Receipt { receipt: None },
+            )
+            .map_err(|error| error.to_string())?;
+            server
+                .send_frame(&receipt, limits)
+                .await
+                .map_err(|error| error.to_string())?;
+            Ok::<OperationId, String>(operation_id)
+        });
+
+        let transport = eliot_ipc::NamedPipeTransport::connect_authenticated(
+            &pipe,
+            Duration::from_secs(5),
+            &expectation,
+        )
+        .await
+        .expect("authenticated client transport");
+        let client = EbpCanonicalStoreClient::connect(transport, requirement.clone())
+            .await
+            .expect("S03 client handshake");
+        let context = client
+            .read_metadata(eliot_contracts::RequestId::new("request-e2e").expect("request id"));
+        let result = client
+            .apply_prepared(
+                &context,
+                prepared_transition(requirement.state_fence),
+                Vec::new(),
+                Vec::new(),
+            )
+            .await;
+        assert!(matches!(result, Err(StoreError::Unavailable)));
+        let operation_id = server_task
+            .await
+            .expect("server task")
+            .expect("server protocol");
+        assert_eq!(operation_id.as_str(), "operation-e2e");
+    }
+
+    #[derive(Clone, Copy)]
+    enum UnknownBoundary {
+        Send,
+        Receive,
+    }
+
+    struct FakeTransport {
+        boundary: UnknownBoundary,
+        applied: Option<OperationId>,
+        reconciled: Option<OperationId>,
+        last_request_id: Option<RequestId>,
+        receive_failed: bool,
+    }
+
+    impl EbpStoreTransport for FakeTransport {
+        fn ensure_authenticated(
+            &self,
+            _requirement: &HostStoreBootstrapRequirement,
+        ) -> Result<(), StoreClientError> {
+            Ok(())
+        }
+
+        async fn send_frame(
+            &mut self,
+            frame: &Frame,
+            _limits: TransportLimits,
+        ) -> Result<DeliveryOutcome, StoreClientError> {
+            let (request_id, _, request) = eliot_store_api::decode_request_frame(frame)
+                .map_err(|error| StoreClientError::Contract(error.to_string()))?;
+            self.last_request_id = Some(request_id);
+            match request {
+                StoreRequest::Apply { transition, .. } => {
+                    self.applied = Some(transition.identity.operation_id);
+                    if matches!(self.boundary, UnknownBoundary::Send) {
+                        Ok(DeliveryOutcome::UnknownOutcome)
+                    } else {
+                        Ok(DeliveryOutcome::Delivered)
+                    }
+                }
+                StoreRequest::Receipt { operation_id } => {
+                    self.reconciled = Some(operation_id);
+                    Ok(DeliveryOutcome::Delivered)
+                }
+                _ => Ok(DeliveryOutcome::Delivered),
+            }
+        }
+
+        async fn receive_frame(
+            &mut self,
+            _limits: TransportLimits,
+        ) -> Result<Frame, StoreClientError> {
+            if matches!(self.boundary, UnknownBoundary::Receive) && !self.receive_failed {
+                self.receive_failed = true;
+                return Err(StoreClientError::Transport(
+                    "test receive crossed an unknown boundary".to_owned(),
+                ));
+            }
+            let request_id = self.last_request_id.clone().ok_or_else(|| {
+                StoreClientError::Contract("receipt was not requested".to_owned())
+            })?;
+            eliot_store_api::response_frame(
+                "connection-e2e",
+                ProtocolVersion::CURRENT,
+                Some(request_id),
+                StoreResponse::Receipt { receipt: None },
+            )
+            .map_err(|error| StoreClientError::Contract(error.to_string()))
+        }
+    }
+
+    async fn apply_with_fake_boundary(
+        boundary: UnknownBoundary,
+    ) -> (StoreError, Option<OperationId>) {
+        let requirement = requirement(format!(
+            r"\\.\pipe\eliot\s03-fake\{}-{}",
+            std::process::id(),
+            unix_ms()
+        ));
+        let transport = FakeTransport {
+            boundary,
+            applied: None,
+            reconciled: None,
+            last_request_id: None,
+            receive_failed: false,
+        };
+        let transport_state = Arc::new(Mutex::new(transport));
+        let client = EbpCanonicalStoreClient {
+            transport: transport_state.clone(),
+            requirement: requirement.clone(),
+            protocol_version: ProtocolVersion::CURRENT,
+            limits: TransportLimits::default(),
+            request_counter: AtomicU64::new(1),
+        };
+        let context = client
+            .read_metadata(eliot_contracts::RequestId::new("request-fake").expect("request id"));
+        let result = client
+            .apply_prepared(
+                &context,
+                prepared_transition(requirement.state_fence),
+                Vec::new(),
+                Vec::new(),
+            )
+            .await
+            .expect_err("unknown boundary must not succeed");
+        let transport = transport_state.lock().await;
+        (result, transport.reconciled.clone())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn unknown_send_preserves_exact_operation_for_receipt_lookup() {
+        let (error, reconciled) = apply_with_fake_boundary(UnknownBoundary::Send).await;
+        assert!(matches!(error, StoreError::Unavailable));
+        assert_eq!(
+            reconciled.expect("reconciliation request").as_str(),
+            "operation-e2e"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn unknown_receive_preserves_exact_operation_for_receipt_lookup() {
+        let (error, reconciled) = apply_with_fake_boundary(UnknownBoundary::Receive).await;
+        assert!(matches!(error, StoreError::Unavailable));
+        assert_eq!(
+            reconciled.expect("reconciliation request").as_str(),
+            "operation-e2e"
+        );
+    }
+
+    fn unix_ms() -> u128 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
     }
 }

@@ -1137,6 +1137,7 @@ dependencies = [
  "eliot-ipc",
  "eliot-kernel-core",
  "eliot-platform",
+ "eliot-platform-windows",
  "eliot-protocol",
  "eliot-receipts",
  "eliot-runtime-contracts",
@@ -1651,6 +1652,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.10.9",
+ "thiserror",
  "tokio",
  "toml",
 ]
