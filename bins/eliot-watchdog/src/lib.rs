@@ -92,6 +92,48 @@ impl VerifiedWatchdogAdmission {
         self.watchdog_epoch
     }
 }
+
+/// Installation-backed admission source.  A composition must call this for
+/// every observation; the returned verified lease is never retained as a
+/// long-lived authority by the watchdog loop.
+pub trait WatchdogAdmissionSource: Send + Sync + 'static {
+    fn reload(&self) -> Result<VerifiedWatchdogAdmission, SpoolError>;
+}
+
+/// File-backed admission source for the Host/Kernel lease and its independent
+/// trust/configuration/registry inputs.
+#[derive(Clone, Debug)]
+pub struct FileWatchdogAdmission {
+    lease_path: PathBuf,
+    admission_config_path: PathBuf,
+    registry_path: PathBuf,
+}
+
+impl FileWatchdogAdmission {
+    #[must_use]
+    pub fn new(
+        lease_path: impl Into<PathBuf>,
+        admission_config_path: impl Into<PathBuf>,
+        registry_path: impl Into<PathBuf>,
+    ) -> Self {
+        Self {
+            lease_path: lease_path.into(),
+            admission_config_path: admission_config_path.into(),
+            registry_path: registry_path.into(),
+        }
+    }
+}
+
+impl WatchdogAdmissionSource for FileWatchdogAdmission {
+    fn reload(&self) -> Result<VerifiedWatchdogAdmission, SpoolError> {
+        load_supervision_lease(
+            &self.lease_path,
+            &self.admission_config_path,
+            &self.registry_path,
+        )
+    }
+}
+
 /// Errors from the independent protected watchdog spool.
 #[derive(Debug, Error)]
 pub enum SpoolError {
@@ -113,13 +155,41 @@ const SPOOL_ROTATIONS: usize = 3;
 #[derive(serde::Serialize)]
 #[serde(deny_unknown_fields)]
 struct Heartbeat<'a> {
+    record_type: &'static str,
     service: &'static str,
-    lease: &'a str,
-    scope: &'a str,
+    lease_id: &'a str,
+    scope_ref: &'a str,
     kernel_epoch: u64,
     watchdog_epoch: u64,
-    lease_digest: &'a str,
+    payload_digest: &'a str,
+    envelope_digest: &'a str,
+    signer_id: &'a str,
+    key_id: &'a str,
+    signature_algorithm: &'a str,
+    signature: &'a str,
+    public_key_fingerprint: &'a str,
     lease_revision: u64,
+}
+
+/// Bounded, non-authoritative record emitted when admission is lost.  A gap
+/// never claims coverage and carries no replacement trust material.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum GapRecoveryReason {
+    AdmissionUnavailable,
+}
+
+/// Bounded recovery disposition written after a failed continuous admission
+/// check.  It is an observation only; a later admission must still reload and
+/// verify the signed lease and independently pinned configuration.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct GapRecoveryDisposition {
+    pub record_type: &'static str,
+    pub service: &'static str,
+    pub observed_at_ms: u64,
+    pub reason: GapRecoveryReason,
+    pub coverage_claimed: bool,
 }
 
 /// Minimal independent sensor surface used by the SCM sibling process.
@@ -149,6 +219,7 @@ impl IndependentKernelSensor {
         fs::create_dir_all(parent)?;
         ensure_non_reparse(parent)?;
         OpenOptions::new().create(true).append(true).open(&spool)?;
+        ensure_non_reparse(&spool)?;
         let watchdog = Watchdog::new(
             eliot_watchdog_core::WatchdogConfig::default(),
             Epoch(watchdog_epoch),
@@ -203,37 +274,56 @@ impl IndependentKernelSensor {
         if epoch.0 == 0 || lease.lease().watchdog_epoch.value() != epoch.0 {
             return Err(KernelWatchdogError::LeaseRejected);
         }
-        lease
-            .lease()
-            .validate()
-            .map_err(|_| KernelWatchdogError::LeaseRejected)?;
+        let now_ms = current_unix_ms().map_err(|_| KernelWatchdogError::LeaseRejected)?;
+        if now_ms < lease.lease().issued_at_ms || now_ms >= lease.lease().expires_at_ms {
+            return Err(KernelWatchdogError::LeaseRejected);
+        }
         let digest = lease
             .payload_digest()
             .map_err(|_| KernelWatchdogError::LeaseRejected)?;
         let line = serde_json::to_vec(&Heartbeat {
+            record_type: "watchdog_heartbeat",
             service: SERVICE_NAME,
-            lease: &lease.lease().lease_id,
-            scope: &lease.lease().scope_ref,
+            lease_id: &lease.lease().lease_id,
+            scope_ref: &lease.lease().scope_ref,
             kernel_epoch: lease.lease().kernel_epoch.value(),
             watchdog_epoch: lease.lease().watchdog_epoch.value(),
-            lease_digest: &digest,
+            payload_digest: &digest,
+            envelope_digest: lease.envelope_digest(),
+            signer_id: lease.signer_id(),
+            key_id: lease.key_id(),
+            signature_algorithm: lease.algorithm(),
+            signature: lease.signature(),
+            public_key_fingerprint: lease.public_key_fingerprint(),
             lease_revision: lease.lease_revision(),
         })
         .map_err(|error| KernelWatchdogError::FailedWithDetail(error.to_string()))?;
-        let mut line = line;
+        self.write_spool_line(line)
+    }
+
+    fn record_gap(&self, disposition: GapRecoveryDisposition) -> Result<(), KernelWatchdogError> {
+        let line = serde_json::to_vec(&disposition)
+            .map_err(|error| KernelWatchdogError::FailedWithDetail(error.to_string()))?;
+        self.write_spool_line(line)
+    }
+
+    fn write_spool_line(&self, mut line: Vec<u8>) -> Result<(), KernelWatchdogError> {
         line.push(b'\n');
         if let Some(parent) = self.spool.parent() {
             ensure_non_reparse(parent).map_err(|_| KernelWatchdogError::Failed)?;
         } else {
             return Err(KernelWatchdogError::Failed);
         }
+        ensure_non_reparse_if_present(&self.spool).map_err(|_| KernelWatchdogError::Failed)?;
         rotate_if_needed(&self.spool, line.len() as u64)
             .map_err(|_| KernelWatchdogError::Failed)?;
+        ensure_non_reparse_if_present(&self.spool).map_err(|_| KernelWatchdogError::Failed)?;
         let mut file = OpenOptions::new()
             .create(true)
             .append(true)
             .open(&self.spool)
             .map_err(|_| KernelWatchdogError::Failed)?;
+        ensure_non_reparse(&self.spool).map_err(|_| KernelWatchdogError::Failed)?;
         file.write_all(&line)
             .and_then(|()| file.flush())
             .and_then(|()| file.sync_all())
@@ -247,6 +337,13 @@ impl KernelWatchdogPort for IndependentKernelSensor {
         lease: &'a VerifiedSupervisionLease,
     ) -> Pin<Box<dyn Future<Output = Result<(), KernelWatchdogError>> + Send + 'a>> {
         Box::pin(async move { self.record_heartbeat(lease) })
+    }
+
+    fn report_gap<'a>(
+        &'a self,
+        disposition: GapRecoveryDisposition,
+    ) -> Pin<Box<dyn Future<Output = Result<(), KernelWatchdogError>> + Send + 'a>> {
+        Box::pin(async move { self.record_gap(disposition) })
     }
 }
 
@@ -307,6 +404,16 @@ pub trait KernelWatchdogPort: Send + Sync + 'static {
         &'a self,
         lease: &'a VerifiedSupervisionLease,
     ) -> Pin<Box<dyn Future<Output = Result<(), KernelWatchdogError>> + Send + 'a>>;
+
+    /// Emits a bounded non-authoritative gap when continuous admission fails.
+    /// Implementations which do not own a durable observation spool may leave
+    /// this as the default no-op; they still receive no lease after failure.
+    fn report_gap<'a>(
+        &'a self,
+        _disposition: GapRecoveryDisposition,
+    ) -> Pin<Box<dyn Future<Output = Result<(), KernelWatchdogError>> + Send + 'a>> {
+        Box::pin(async { Ok(()) })
+    }
 }
 
 /// Non-secret failure returned by the kernel supervision boundary.
@@ -348,7 +455,9 @@ pub struct WatchdogReadiness {
 /// Runtime-owned watchdog composition.
 pub struct WatchdogComposition {
     runtime: Runtime,
-    lease: Arc<VerifiedSupervisionLease>,
+    admission: Arc<dyn WatchdogAdmissionSource>,
+    kernel_epoch: u64,
+    watchdog_epoch: u64,
     config: WatchdogConfig,
     task: eliot_runtime::SupervisedHandle,
     shutdown_requested: Arc<AtomicBool>,
@@ -358,41 +467,82 @@ impl WatchdogComposition {
     /// Builds and admits the watchdog loop against an injected kernel port.
     pub fn start(
         config: WatchdogConfig,
-        lease: VerifiedSupervisionLease,
+        admission: Arc<dyn WatchdogAdmissionSource>,
         kernel: Arc<dyn KernelWatchdogPort>,
     ) -> Result<Self, CompositionError> {
-        Self::start_with_shutdown(config, lease, kernel, Arc::new(AtomicBool::new(false)))
+        Self::start_with_shutdown(config, admission, kernel, Arc::new(AtomicBool::new(false)))
     }
 
     /// Starts the composition with a caller-owned stop flag.  SCM control
     /// handlers use this flag because they execute outside the Tokio runtime.
     pub fn start_with_shutdown(
         config: WatchdogConfig,
-        lease: VerifiedSupervisionLease,
+        admission: Arc<dyn WatchdogAdmissionSource>,
         kernel: Arc<dyn KernelWatchdogPort>,
         shutdown_requested: Arc<AtomicBool>,
     ) -> Result<Self, CompositionError> {
         config.validate()?;
         let runtime = config.runtime()?;
-        let lease = Arc::new(lease);
-        let task_lease = lease.clone();
+        let initial = admission
+            .reload()
+            .map_err(|error| CompositionError::InvalidLease(error.to_string()))?;
+        let kernel_epoch = initial.lease().lease().kernel_epoch.value();
+        let watchdog_epoch = initial.watchdog_epoch().value();
+        let task_admission = admission.clone();
         let interval = config.tick_interval;
         let task = match runtime.supervisor(SupervisionStrategy::OneForOne).spawn(
             SERVICE_NAME,
             ChildClass::Critical,
             move |token| {
                 let kernel = kernel.clone();
-                let lease = task_lease.clone();
+                let admission = task_admission.clone();
                 async move {
                     loop {
                         tokio::select! {
                             () = token.cancelled() => return Ok(()),
                             () = tokio::time::sleep(interval) => {}
                         }
-                        kernel
-                            .supervise(&lease)
-                            .await
-                            .map_err(|error| TaskFailure::Failed(error.to_string()))?;
+                        let admission = match admission.reload() {
+                            Ok(admission) => admission,
+                            Err(error) => {
+                                let disposition = GapRecoveryDisposition {
+                                    record_type: "watchdog_gap",
+                                    service: SERVICE_NAME,
+                                    observed_at_ms: current_unix_ms().unwrap_or(0),
+                                    reason: GapRecoveryReason::AdmissionUnavailable,
+                                    coverage_claimed: false,
+                                };
+                                kernel
+                                    .report_gap(disposition)
+                                    .await
+                                    .map_err(|report_error| {
+                                        TaskFailure::Failed(format!(
+                                            "watchdog admission failed ({error}); gap reporting failed ({report_error})"
+                                        ))
+                                    })?;
+                                return Err(TaskFailure::Failed(format!(
+                                    "watchdog admission failed: {error}"
+                                )));
+                            }
+                        };
+                        if let Err(error) = kernel.supervise(admission.lease()).await {
+                            let disposition = GapRecoveryDisposition {
+                                record_type: "watchdog_gap",
+                                service: SERVICE_NAME,
+                                observed_at_ms: current_unix_ms().unwrap_or(0),
+                                reason: GapRecoveryReason::AdmissionUnavailable,
+                                coverage_claimed: false,
+                            };
+                            kernel
+                                .report_gap(disposition)
+                                .await
+                                .map_err(|report_error| {
+                                    TaskFailure::Failed(format!(
+                                        "watchdog supervision failed ({error}); gap reporting failed ({report_error})"
+                                    ))
+                                })?;
+                            return Err(TaskFailure::Failed(error.to_string()));
+                        }
                     }
                 }
             },
@@ -404,7 +554,9 @@ impl WatchdogComposition {
         };
         Ok(Self {
             runtime,
-            lease,
+            admission,
+            kernel_epoch,
+            watchdog_epoch,
             config,
             task,
             shutdown_requested,
@@ -416,8 +568,8 @@ impl WatchdogComposition {
         WatchdogReadiness {
             service: SERVICE_NAME,
             protocol: PROTOCOL_VERSION,
-            kernel_epoch: self.lease.lease().kernel_epoch.value(),
-            watchdog_epoch: self.lease.lease().watchdog_epoch.value(),
+            kernel_epoch: self.kernel_epoch,
+            watchdog_epoch: self.watchdog_epoch,
             tick_interval_ms: self.config.tick_interval.as_millis(),
         }
     }
@@ -426,10 +578,12 @@ impl WatchdogComposition {
     pub async fn run_until_shutdown(self) -> Result<ShutdownOutcome, TaskFailure> {
         let WatchdogComposition {
             runtime,
+            admission,
             task,
             shutdown_requested,
             ..
         } = self;
+        let _admission_source = admission;
         let mut task_result = Box::pin(task.join());
         tokio::select! {
             result = &mut task_result => {
@@ -644,6 +798,14 @@ fn ensure_non_reparse(path: &std::path::Path) -> Result<(), SpoolError> {
         }
     }
     Ok(())
+}
+
+fn ensure_non_reparse_if_present(path: &std::path::Path) -> Result<(), SpoolError> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => ensure_non_reparse(path),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(SpoolError::Io(error)),
+    }
 }
 
 fn ensure_contained_non_reparse(

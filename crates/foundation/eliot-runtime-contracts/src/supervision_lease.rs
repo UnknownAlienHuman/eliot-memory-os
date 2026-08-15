@@ -96,6 +96,8 @@ pub struct SupervisionGenerationBinding {
 pub struct SupervisionOrsMirrorBinding {
     /// Stable ORS record identity.
     pub record_id: String,
+    /// Exact lease subject represented by this ORS record.
+    pub subject_lease_id: String,
     /// Positive monotonic lease revision in the ORS record.
     pub lease_revision: u64,
     /// SHA-256 of the committed ORS receipt which admitted this revision.
@@ -107,6 +109,7 @@ pub struct SupervisionOrsMirrorBinding {
 impl SupervisionOrsMirrorBinding {
     fn validate(&self) -> Result<(), RuntimeContractError> {
         non_empty_text(&self.record_id, "ors_mirror.record_id")?;
+        non_empty_text(&self.subject_lease_id, "ors_mirror.subject_lease_id")?;
         if self.lease_revision == 0 {
             return Err(invalid_lease_field(
                 "ors_mirror.lease_revision",
@@ -242,6 +245,10 @@ pub struct SupervisionLease {
     pub terminal_disposition: Option<SupervisionLeaseTerminalDisposition>,
     /// Human-readable revocation reason; present only for revoked leases.
     pub revocation_reason: Option<String>,
+    /// Explicit revocation identity when the lease is revoked.
+    pub revocation_id: Option<String>,
+    /// Authority epoch at which revocation took effect.
+    pub revocation_epoch: Option<AuthorityEpoch>,
 }
 
 impl SupervisionLease {
@@ -293,6 +300,12 @@ impl SupervisionLease {
         }
         self.generation_binding.validate()?;
         self.ors_mirror.validate()?;
+        if self.ors_mirror.subject_lease_id != self.lease_id {
+            return Err(invalid_lease_field(
+                "ors_mirror.subject_lease_id",
+                "must identify this lease",
+            ));
+        }
         self.state_fence
             .validate()
             .map_err(|error| invalid_lease_field("state_fence", error.to_string()))?;
@@ -353,10 +366,26 @@ impl SupervisionLease {
                     "is required for revoked leases",
                 ));
             }
+            if self
+                .revocation_id
+                .as_deref()
+                .is_none_or(|id| id.trim().is_empty())
+                || self.revocation_epoch.is_none_or(|epoch| epoch.value() == 0)
+            {
+                return Err(invalid_lease_field(
+                    "revocation_id/revocation_epoch",
+                    "are required for revoked leases",
+                ));
+            }
         } else if self.revocation_reason.is_some() {
             return Err(invalid_lease_field(
                 "revocation_reason",
                 "is only valid for revoked leases",
+            ));
+        } else if self.revocation_id.is_some() || self.revocation_epoch.is_some() {
+            return Err(invalid_lease_field(
+                "revocation_id/revocation_epoch",
+                "are only valid for revoked leases",
             ));
         }
         Ok(())
@@ -442,6 +471,14 @@ impl SignedSupervisionLease {
         }
         decode_hex::<{ SUPERVISION_LEASE_SIGNATURE_BYTES }>(&self.signature, "signature")?;
         Ok(())
+    }
+
+    /// Returns the lowercase SHA-256 digest of the canonical signed envelope.
+    pub fn envelope_digest(&self) -> Result<String, SupervisionLeaseError> {
+        self.validate()?;
+        let bytes = canonical_json_bytes(self)
+            .map_err(|error| SupervisionLeaseError::Canonicalization(error.to_string()))?;
+        Ok(sha256_hex(&bytes))
     }
 }
 
@@ -583,12 +620,52 @@ impl SupervisionTrustAnchor {
     }
 }
 
+/// Independently observed lifecycle state which a consumer must bind before it
+/// admits a signed lease.  Revocation identity and epoch are part of the
+/// state binding so an active lease cannot be replayed after an authority
+/// revokes it.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SupervisionLeaseActiveStateBinding {
+    /// Current lifecycle state selected by the installation authority.
+    pub state: LeaseState,
+    /// Stable revocation identity when the current state is revoked.
+    pub revocation_id: Option<String>,
+    /// Kernel authority epoch at which revocation took effect.
+    pub revocation_epoch: Option<AuthorityEpoch>,
+}
+
+impl SupervisionLeaseActiveStateBinding {
+    fn validate(&self) -> Result<(), SupervisionLeaseError> {
+        if self.state == LeaseState::Revoked {
+            if self
+                .revocation_id
+                .as_deref()
+                .is_none_or(|id| id.trim().is_empty())
+                || self.revocation_epoch.is_none_or(|epoch| epoch.value() == 0)
+            {
+                return Err(SupervisionLeaseError::InvalidContext(
+                    "revoked active-state binding requires revocation identity and epoch"
+                        .to_owned(),
+                ));
+            }
+        } else if self.revocation_id.is_some() || self.revocation_epoch.is_some() {
+            return Err(SupervisionLeaseError::InvalidContext(
+                "revocation identity and epoch are only valid for revoked state".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// Current values a consumer must bind before accepting a verified lease.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SupervisionLeaseVerificationContext {
     /// Current wall-clock time in Unix milliseconds.
     pub now_ms: u64,
+    /// Exact lease identity currently admitted by the installation authority.
+    pub lease_id: String,
     /// Current Host authority epoch.
     pub host_epoch: AuthorityEpoch,
     /// Current activation identity.
@@ -603,6 +680,8 @@ pub struct SupervisionLeaseVerificationContext {
     pub state_fence: StateFence,
     /// Exact current lease scope reference.
     pub scope_ref: String,
+    /// Full observation scope independently selected by admission.
+    pub observation_scope: SupervisionObservationScope,
     /// Exact current target identity.
     pub target_id: String,
     /// Exact current module identity.
@@ -619,6 +698,8 @@ pub struct SupervisionLeaseVerificationContext {
     pub public_key_fingerprint: String,
     /// Exact committed ORS mirror selected by installation admission.
     pub ors_mirror: SupervisionOrsMirrorBinding,
+    /// Exact current active/revocation state selected by admission.
+    pub active_state: SupervisionLeaseActiveStateBinding,
 }
 
 impl SupervisionLeaseVerificationContext {
@@ -629,11 +710,15 @@ impl SupervisionLeaseVerificationContext {
                 "now_ms must be greater than zero".to_owned(),
             ));
         }
+        non_empty_text_for_lease(&self.lease_id, "context.lease_id")?;
         non_empty_text_for_lease(&self.activation_id, "context.activation_id")?;
         non_empty_text_for_lease(&self.scope_ref, "context.scope_ref")?;
         non_empty_text_for_lease(&self.target_id, "context.target_id")?;
         non_empty_text_for_lease(&self.module_id, "context.module_id")?;
         non_empty_text_for_lease(&self.process_id, "context.process_id")?;
+        self.observation_scope
+            .validate()
+            .map_err(|error| SupervisionLeaseError::InvalidContext(error.to_string()))?;
         if self.state_fence.validate().is_err() {
             return Err(SupervisionLeaseError::InvalidContext(
                 "state_fence is invalid".to_owned(),
@@ -657,6 +742,12 @@ impl SupervisionLeaseVerificationContext {
         self.ors_mirror
             .validate()
             .map_err(|error| SupervisionLeaseError::InvalidContext(error.to_string()))?;
+        if self.ors_mirror.subject_lease_id != self.lease_id {
+            return Err(SupervisionLeaseError::InvalidContext(
+                "ORS mirror subject must equal context.lease_id".to_owned(),
+            ));
+        }
+        self.active_state.validate()?;
         for (field, value) in [
             ("context.host_epoch", self.host_epoch.value()),
             (
@@ -684,32 +775,66 @@ impl SupervisionLeaseVerificationContext {
 
 /// Verified lease newtype.  It can only be constructed by a trust-anchor verifier.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct VerifiedSupervisionLease(SupervisionLease);
+pub struct VerifiedSupervisionLease {
+    payload: SupervisionLease,
+    payload_sha256: String,
+    envelope_sha256: String,
+    signer_id: String,
+    key_id: String,
+    algorithm: String,
+    signature: String,
+    public_key_fingerprint: String,
+}
 
 impl VerifiedSupervisionLease {
     /// Returns the authenticated, current payload.
     pub fn payload(&self) -> &SupervisionLease {
-        &self.0
+        &self.payload
     }
 
     /// Returns the authenticated legacy lease projection.
     pub fn lease(&self) -> &SupervisionLease {
-        &self.0
+        &self.payload
     }
 
     /// Returns the authenticated canonical payload digest.
     pub fn payload_digest(&self) -> Result<String, SupervisionLeaseError> {
-        self.0.digest()
+        Ok(self.payload_sha256.clone())
     }
 
     /// Returns the authenticated committed ORS lease revision.
     pub const fn lease_revision(&self) -> u64 {
-        self.0.ors_mirror.lease_revision
+        self.payload.ors_mirror.lease_revision
     }
 
-    /// Consumes the wrapper and returns the authenticated payload.
-    pub fn into_lease(self) -> SupervisionLease {
-        self.0
+    /// Returns the canonical signed-envelope digest.
+    pub fn envelope_digest(&self) -> &str {
+        &self.envelope_sha256
+    }
+
+    /// Returns the authenticated producer identity.
+    pub fn signer_id(&self) -> &str {
+        &self.signer_id
+    }
+
+    /// Returns the authenticated external key reference.
+    pub fn key_id(&self) -> &str {
+        &self.key_id
+    }
+
+    /// Returns the fixed signature algorithm identifier.
+    pub fn algorithm(&self) -> &str {
+        &self.algorithm
+    }
+
+    /// Returns the encoded signature over the canonical payload.
+    pub fn signature(&self) -> &str {
+        &self.signature
+    }
+
+    /// Returns the installation-pinned public-key fingerprint used to verify.
+    pub fn public_key_fingerprint(&self) -> &str {
+        &self.public_key_fingerprint
     }
 }
 
@@ -747,6 +872,9 @@ impl SupervisionLeaseVerifier for SupervisionTrustAnchor {
             ));
         }
         let payload = &envelope.payload;
+        if payload.lease_id != context.lease_id {
+            return Err(SupervisionLeaseError::LeaseIdentityMismatch);
+        }
         if payload.installation_id != self.installation_id {
             return Err(SupervisionLeaseError::TrustAnchorMismatch(
                 "installation_id",
@@ -759,6 +887,7 @@ impl SupervisionLeaseVerifier for SupervisionTrustAnchor {
             || payload.watchdog_epoch != context.watchdog_epoch
             || payload.state_fence != context.state_fence
             || payload.scope_ref != context.scope_ref
+            || payload.observation_scope != context.observation_scope
         {
             return Err(SupervisionLeaseError::EpochOrActivationMismatch);
         }
@@ -774,6 +903,12 @@ impl SupervisionLeaseVerifier for SupervisionTrustAnchor {
         }
         if payload.ors_mirror != context.ors_mirror {
             return Err(SupervisionLeaseError::OrsMirrorMismatch);
+        }
+        if payload.state != context.active_state.state
+            || payload.revocation_id != context.active_state.revocation_id
+            || payload.revocation_epoch != context.active_state.revocation_epoch
+        {
+            return Err(SupervisionLeaseError::ActiveStateMismatch);
         }
         if payload.state != LeaseState::Active || payload.terminal_disposition.is_some() {
             return Err(SupervisionLeaseError::InactiveLease);
@@ -796,7 +931,16 @@ impl SupervisionLeaseVerifier for SupervisionTrustAnchor {
         verifying_key
             .verify_strict(&bytes, &signature)
             .map_err(|error| SupervisionLeaseError::SignatureInvalid(error.to_string()))?;
-        Ok(VerifiedSupervisionLease(payload.clone()))
+        Ok(VerifiedSupervisionLease {
+            payload: payload.clone(),
+            payload_sha256: envelope.payload_sha256.clone(),
+            envelope_sha256: envelope.envelope_digest()?,
+            signer_id: envelope.signer_id.clone(),
+            key_id: envelope.key_id.clone(),
+            algorithm: envelope.algorithm.clone(),
+            signature: envelope.signature.clone(),
+            public_key_fingerprint: self.public_key_fingerprint.clone(),
+        })
     }
 }
 
@@ -842,12 +986,18 @@ pub enum SupervisionLeaseError {
     /// Current epoch or activation identity did not match the signed payload.
     #[error("supervision lease epoch or activation mismatch")]
     EpochOrActivationMismatch,
+    /// Signed lease identity did not match the independently admitted lease.
+    #[error("supervision lease identity mismatch")]
+    LeaseIdentityMismatch,
     /// Current target/module/process generation did not match the signed payload.
     #[error("supervision lease generation mismatch")]
     GenerationMismatch,
     /// Signed ORS mirror did not match the independently admitted revision.
     #[error("supervision lease ORS mirror mismatch")]
     OrsMirrorMismatch,
+    /// Signed lease lifecycle state did not match current admission state.
+    #[error("supervision lease active-state or revocation mismatch")]
+    ActiveStateMismatch,
     /// Lease is not active at the verification boundary.
     #[error("supervision lease is not active")]
     InactiveLease,

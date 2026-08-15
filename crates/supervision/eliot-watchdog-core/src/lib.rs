@@ -9,8 +9,6 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-pub use eliot_runtime_contracts::{LeaseState, SupervisionLease};
-
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct Epoch(pub u64);
 

@@ -23,10 +23,10 @@ pub use supervision_lease::{
     SUPERVISION_LEASE_CONTRACT_VERSION, SUPERVISION_LEASE_PUBLIC_KEY_BYTES,
     SUPERVISION_LEASE_SCHEMA, SUPERVISION_LEASE_SIGNATURE_ALGORITHM,
     SUPERVISION_LEASE_SIGNATURE_BYTES, SignedSupervisionLease, SupervisionGenerationBinding,
-    SupervisionLease, SupervisionLeaseError, SupervisionLeaseSigner,
-    SupervisionLeaseTerminalDisposition, SupervisionLeaseVerificationContext,
-    SupervisionLeaseVerifier, SupervisionObservationScope, SupervisionOrsMirrorBinding,
-    SupervisionTrustAnchor, VerifiedSupervisionLease,
+    SupervisionLease, SupervisionLeaseActiveStateBinding, SupervisionLeaseError,
+    SupervisionLeaseSigner, SupervisionLeaseTerminalDisposition,
+    SupervisionLeaseVerificationContext, SupervisionLeaseVerifier, SupervisionObservationScope,
+    SupervisionOrsMirrorBinding, SupervisionTrustAnchor, VerifiedSupervisionLease,
 };
 
 /// Stable wire name for this contract family.

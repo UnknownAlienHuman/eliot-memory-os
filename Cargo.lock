@@ -1852,9 +1852,6 @@ dependencies = [
 [[package]]
 name = "eliot-watchdog-core"
 version = "0.1.0"
-dependencies = [
- "eliot-runtime-contracts",
-]
 
 [[package]]
 name = "eliot-windows-ipc"

@@ -4,8 +4,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use eliot_watchdog::{
-    IndependentKernelSensor, SERVICE_NAME, WatchdogComposition, WatchdogConfig,
-    load_supervision_lease,
+    FileWatchdogAdmission, IndependentKernelSensor, SERVICE_NAME, WatchdogAdmissionSource,
+    WatchdogComposition, WatchdogConfig,
 };
 
 fn main() {
@@ -48,8 +48,15 @@ fn run_watchdog(stop_signal: Arc<AtomicBool>) -> Result<(), String> {
         .join("installation-registry.redb");
     // The lease is issued by the Host/Kernel contour.  There is deliberately
     // no genesis/default lease in this process: stale or missing durable bytes
-    // fail closed before the watchdog can advertise readiness.
-    let admission = load_supervision_lease(&lease_path, &admission_config_path, &registry_path)
+    // fail closed before the watchdog can advertise readiness.  The source is
+    // retained by the composition and reloaded before every observation.
+    let admission_source = Arc::new(FileWatchdogAdmission::new(
+        lease_path,
+        admission_config_path,
+        registry_path,
+    ));
+    let admission = admission_source
+        .reload()
         .map_err(|error| error.to_string())?;
     let sensor = Arc::new(
         IndependentKernelSensor::open_program_data(
@@ -62,7 +69,7 @@ fn run_watchdog(stop_signal: Arc<AtomicBool>) -> Result<(), String> {
     );
     let composition = WatchdogComposition::start_with_shutdown(
         WatchdogConfig::default(),
-        admission.lease().clone(),
+        admission_source,
         sensor,
         stop_signal,
     )
