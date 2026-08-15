@@ -4,10 +4,12 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-description = "Provider-neutral, authority-free ProcessExecutor contract"
+description = "Provider-neutral, Kernel-authorized ProcessExecutor contract"
 
 [dependencies]
 blake3.workspace = true
+eliot-instrument-api.workspace = true
+eliot-platform.workspace = true
 schemars.workspace = true
 serde.workspace = true
 serde_json.workspace = true

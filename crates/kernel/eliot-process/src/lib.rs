@@ -1,10 +1,16 @@
-//! P-03: the provider-neutral process contract.
+//! P-03: the provider-neutral governed process contract.
 //!
-//! This crate is deliberately pure.  It does not spawn, inspect OS handles,
-//! read credentials, or choose an authority owner.  P-04 supplies the
-//! Windows implementation and the branch owner supplies the effect permit.
+//! P-03 owns immutable invocation, dispatch-permit validation, exact process
+//! identity, lifecycle, cancellation, reconciliation, and evidence binding.
+//! P-04 owns Windows mechanics. In particular, P-02's suspended-launch
+//! typestate carries [`ValidatedDispatch`] only as opaque caller-policy output;
+//! P-02 never issues or validates authority.
+
+#![forbid(unsafe_code)]
 
 use blake3::Hash;
+use eliot_instrument_api::{Assertability, EvidenceAxes, EvidenceStatus};
+use eliot_platform::ClockObservation;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -12,36 +18,84 @@ use std::fmt;
 use std::sync::Arc;
 use thiserror::Error;
 
-pub const PROCESS_CONTRACT_SCHEMA_VERSION: &str = "eliot-process-contract-v1";
+/// Current provider-neutral process contract revision.
+pub const PROCESS_CONTRACT_SCHEMA_VERSION: &str = "eliot-process-contract-v2";
+/// The sole admitted Windows semantic implementation identifier.
 pub const PROCESS_IMPLEMENTATION_ID: &str = "eliot.process.windows.v1";
 
 const MAX_ID_BYTES: usize = 256;
 const MAX_ARGUMENTS: usize = 4096;
 const MAX_ENVIRONMENT_ENTRIES: usize = 512;
 const MAX_DESCENDANTS: usize = 4096;
+const MAX_REVISION_HEADS: usize = 128;
+const MAX_REPLAY_NONCES: usize = 4096;
+const MAX_RECOVERY_OBSERVATION_AGE_MS: u64 = 60_000;
 
-/// An opaque, non-secret operation identity.
-#[derive(
-    Clone, Debug, Eq, Hash, JsonSchema, Ord, PartialEq, PartialOrd, Serialize, Deserialize,
-)]
-#[serde(transparent)]
-pub struct OperationId(String);
+macro_rules! opaque_id {
+    ($name:ident, $field:literal, $doc:literal) => {
+        #[doc = $doc]
+        #[derive(
+            Clone, Debug, Eq, Hash, JsonSchema, Ord, PartialEq, PartialOrd, Serialize, Deserialize,
+        )]
+        #[serde(transparent)]
+        pub struct $name(String);
 
-/// An opaque process-tree identity owned by the caller of the contract.
-#[derive(
-    Clone, Debug, Eq, Hash, JsonSchema, Ord, PartialEq, PartialOrd, Serialize, Deserialize,
-)]
-#[serde(transparent)]
-pub struct ProcessTreeId(String);
+        impl $name {
+            /// Creates a validated opaque identity.
+            pub fn new(value: impl Into<String>) -> Result<Self, ContractError> {
+                validate_opaque_id($field, value.into()).map(Self)
+            }
 
-/// The identity of one physical process generation.
-#[derive(
-    Clone, Debug, Eq, Hash, JsonSchema, Ord, PartialEq, PartialOrd, Serialize, Deserialize,
-)]
-#[serde(transparent)]
-pub struct ProcessId(String);
+            /// Returns the wire value.
+            pub fn as_str(&self) -> &str {
+                &self.0
+            }
 
-/// A reference to a secret provider entry.  It never contains the secret.
+            fn validate(&self) -> Result<(), ContractError> {
+                validate_opaque_id($field, self.0.clone()).map(|_| ())
+            }
+        }
+    };
+}
+
+opaque_id!(
+    OperationId,
+    "operation_id",
+    "One exact external-effect operation."
+);
+opaque_id!(
+    ProcessTreeId,
+    "process_tree_id",
+    "One caller-owned process-tree lineage."
+);
+opaque_id!(ProcessId, "process_id", "One physical process generation.");
+opaque_id!(
+    JobId,
+    "job_id",
+    "One exact operating-system Job/container identity."
+);
+opaque_id!(
+    ImageId,
+    "image_id",
+    "One exact pinned executable image identity."
+);
+opaque_id!(
+    SessionId,
+    "session_id",
+    "One exact host or interactive session identity."
+);
+opaque_id!(
+    ActionLeaseRef,
+    "action_lease_ref",
+    "The Kernel-visible action lease that authorizes one dispatch."
+);
+opaque_id!(
+    DispatchAuthorityId,
+    "dispatch_authority_id",
+    "One activated Kernel dispatch-authority instance."
+);
+
+/// A reference to a secret provider entry. It never contains the secret.
 #[derive(Clone, Debug, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SecretRef {
@@ -49,48 +103,13 @@ pub struct SecretRef {
     key: String,
 }
 
-impl OperationId {
-    /// Creates an opaque operation identity.
-    pub fn new(value: impl Into<String>) -> Result<Self, ContractError> {
-        validate_opaque_id("operation_id", value.into()).map(Self)
-    }
-
-    /// Returns the wire value.
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-impl ProcessTreeId {
-    /// Creates an opaque process-tree identity.
-    pub fn new(value: impl Into<String>) -> Result<Self, ContractError> {
-        validate_opaque_id("process_tree_id", value.into()).map(Self)
-    }
-
-    /// Returns the wire value.
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-impl ProcessId {
-    /// Creates an opaque physical process identity.
-    pub fn new(value: impl Into<String>) -> Result<Self, ContractError> {
-        validate_opaque_id("process_id", value.into()).map(Self)
-    }
-
-    /// Returns the wire value.
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
 impl SecretRef {
     /// Creates a provider/key reference without materialising the secret.
     pub fn new(provider: impl Into<String>, key: impl Into<String>) -> Result<Self, ContractError> {
-        let provider = validate_opaque_id("secret_provider", provider.into())?;
-        let key = validate_opaque_id("secret_key", key.into())?;
-        Ok(Self { provider, key })
+        Ok(Self {
+            provider: validate_opaque_id("secret_provider", provider.into())?,
+            key: validate_opaque_id("secret_key", key.into())?,
+        })
     }
 
     /// Returns the provider identifier.
@@ -130,7 +149,7 @@ impl Generation {
     }
 }
 
-/// An authority/fence snapshot supplied by the owning control plane.
+/// A state-fence snapshot. It is inert data and never grants dispatch authority.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FencingToken {
@@ -140,7 +159,7 @@ pub struct FencingToken {
 }
 
 impl FencingToken {
-    /// Creates a fence token.  The nonce is an opaque non-secret correlation value.
+    /// Creates inert fence data. A valid [`DispatchPermit`] must authenticate it.
     pub fn new(
         authority_epoch: u64,
         generation: Generation,
@@ -174,7 +193,7 @@ impl FencingToken {
         &self.nonce
     }
 
-    /// Checks exact equality with another fence.
+    /// Checks exact fence equality.
     pub fn matches(&self, other: &Self) -> bool {
         self == other
     }
@@ -184,14 +203,14 @@ impl FencingToken {
 #[derive(Clone, Copy, Debug, Default, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EnvironmentInheritance {
-    /// The child receives only values explicitly present in `non_secret`.
+    /// The child receives only explicitly supplied values.
     #[default]
     None,
-    /// The executor may merge a platform allowlist; it may not inherit secrets.
+    /// The executor may merge a platform allowlist, never secrets.
     Allowlisted,
 }
 
-/// A secret-safe environment projection.  Secret material is never serialised here.
+/// A secret-safe environment projection.
 #[derive(Clone, Debug, Default, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct EnvironmentProjection {
@@ -204,7 +223,7 @@ pub struct EnvironmentProjection {
 }
 
 impl EnvironmentProjection {
-    /// Builds a projection and rejects secret-like names in the non-secret map.
+    /// Builds a projection and rejects secret-like material in the plain map.
     pub fn new(
         non_secret: BTreeMap<String, String>,
         secret_refs: Vec<SecretRef>,
@@ -224,9 +243,9 @@ impl EnvironmentProjection {
                 });
             }
         }
-        let mut refs = BTreeSet::new();
+        let mut unique = BTreeSet::new();
         for reference in &secret_refs {
-            if !refs.insert((reference.provider.clone(), reference.key.clone())) {
+            if !unique.insert((reference.provider.clone(), reference.key.clone())) {
                 return Err(ContractError::DuplicateValue {
                     field: "secret_refs",
                 });
@@ -244,7 +263,7 @@ impl EnvironmentProjection {
         &self.non_secret
     }
 
-    /// Returns opaque secret references, never values.
+    /// Returns opaque secret references.
     pub fn secret_refs(&self) -> &[SecretRef] {
         &self.secret_refs
     }
@@ -277,7 +296,7 @@ pub struct ResourceLimits {
 }
 
 impl ResourceLimits {
-    /// Creates bounded resource limits.  Output limits are mandatory and non-zero.
+    /// Creates bounded resource limits.
     pub const fn new(
         wall_timeout_ms: u64,
         cpu_time_ms: Option<u64>,
@@ -292,17 +311,13 @@ impl ResourceLimits {
                 reason: "timeouts and stream limits must be non-zero",
             });
         }
-        if let Some(value) = cpu_time_ms
-            && value == 0
-        {
+        if matches!(cpu_time_ms, Some(0)) {
             return Err(ContractError::InvalidValue {
                 field: "cpu_time_ms",
                 reason: "must be non-zero when present",
             });
         }
-        if let Some(value) = memory_bytes
-            && value == 0
-        {
+        if matches!(memory_bytes, Some(0)) {
             return Err(ContractError::InvalidValue {
                 field: "memory_bytes",
                 reason: "must be non-zero when present",
@@ -323,12 +338,12 @@ impl ResourceLimits {
         self.wall_timeout_ms
     }
 
-    /// Returns the CPU ceiling, if one was supplied.
+    /// Returns the CPU ceiling.
     pub const fn cpu_time_ms(&self) -> Option<u64> {
         self.cpu_time_ms
     }
 
-    /// Returns the memory ceiling, if one was supplied.
+    /// Returns the memory ceiling.
     pub const fn memory_bytes(&self) -> Option<u64> {
         self.memory_bytes
     }
@@ -349,13 +364,15 @@ impl ResourceLimits {
     }
 }
 
-/// Immutable invocation contract consumed by P-04.
+/// Immutable dispatch material before Kernel authority is attached.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct ProcessRequest {
-    schema_version: String,
+pub struct ProcessIntent {
     operation_id: OperationId,
     process_tree_id: ProcessTreeId,
+    job_id: JobId,
+    image_id: ImageId,
+    session_id: SessionId,
     generation: Generation,
     executable: String,
     executable_sha256: String,
@@ -363,16 +380,18 @@ pub struct ProcessRequest {
     working_directory: String,
     environment: EnvironmentProjection,
     resource_limits: ResourceLimits,
-    fence: FencingToken,
-    invocation_digest: String,
+    effect_digest: String,
 }
 
-impl ProcessRequest {
-    /// Creates and seals an immutable process invocation.
+impl ProcessIntent {
+    /// Creates and seals exact launch material without granting authority.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         operation_id: OperationId,
         process_tree_id: ProcessTreeId,
+        job_id: JobId,
+        image_id: ImageId,
+        session_id: SessionId,
         generation: Generation,
         executable: impl Into<String>,
         executable_sha256: impl Into<String>,
@@ -380,12 +399,13 @@ impl ProcessRequest {
         working_directory: impl Into<String>,
         environment: EnvironmentProjection,
         resource_limits: ResourceLimits,
-        fence: FencingToken,
     ) -> Result<Self, ContractError> {
-        let request = Self {
-            schema_version: PROCESS_CONTRACT_SCHEMA_VERSION.to_owned(),
+        let mut intent = Self {
             operation_id,
             process_tree_id,
+            job_id,
+            image_id,
+            session_id,
             generation,
             executable: executable.into(),
             executable_sha256: executable_sha256.into(),
@@ -393,79 +413,72 @@ impl ProcessRequest {
             working_directory: working_directory.into(),
             environment,
             resource_limits,
-            fence,
-            invocation_digest: String::new(),
+            effect_digest: String::new(),
         };
-        request.seal()
+        intent.validate_without_digest()?;
+        intent.effect_digest = intent.compute_effect_digest()?;
+        Ok(intent)
     }
 
-    fn seal(mut self) -> Result<Self, ContractError> {
-        self.validate_without_digest()?;
-        self.invocation_digest = self.compute_digest()?;
-        Ok(self)
-    }
-
-    /// Validates the request and its immutable digest.
+    /// Validates exact launch material and its digest.
     pub fn validate(&self) -> Result<(), ContractError> {
         self.validate_without_digest()?;
-        let expected = self.compute_digest()?;
-        if self.invocation_digest != expected {
-            return Err(ContractError::DigestMismatch {
-                expected,
-                observed: self.invocation_digest.clone(),
-            });
-        }
-        Ok(())
+        validate_stored_digest(
+            "effect_digest",
+            &self.effect_digest,
+            self.compute_effect_digest()?,
+        )
     }
 
     fn validate_without_digest(&self) -> Result<(), ContractError> {
-        if self.schema_version != PROCESS_CONTRACT_SCHEMA_VERSION {
-            return Err(ContractError::SchemaVersion {
-                expected: PROCESS_CONTRACT_SCHEMA_VERSION,
-                observed: self.schema_version.clone(),
-            });
-        }
-        if self.executable.trim().is_empty() {
+        if self.executable.trim().is_empty() || self.working_directory.trim().is_empty() {
             return Err(ContractError::InvalidValue {
-                field: "executable",
-                reason: "must not be empty",
+                field: "launch_path",
+                reason: "executable and working_directory must be non-blank",
             });
         }
-        if self.working_directory.trim().is_empty() {
-            return Err(ContractError::InvalidValue {
-                field: "working_directory",
-                reason: "must not be empty",
-            });
-        }
+        validate_hex_digest("executable_sha256", &self.executable_sha256)?;
         if self.argv.len() > MAX_ARGUMENTS {
             return Err(ContractError::LimitExceeded {
                 field: "argv",
                 limit: MAX_ARGUMENTS,
             });
         }
-        if self.executable_sha256.len() != 64
-            || !self
-                .executable_sha256
-                .bytes()
-                .all(|b| b.is_ascii_hexdigit())
+        if self
+            .argv
+            .iter()
+            .any(|value| value.chars().any(char::is_control))
         {
             return Err(ContractError::InvalidValue {
-                field: "executable_sha256",
-                reason: "must be a 64-character hexadecimal digest",
+                field: "argv",
+                reason: "arguments must not contain control characters",
             });
         }
-        if self.fence.generation != self.generation {
-            return Err(ContractError::FenceMismatch);
-        }
-        self.environment.validate()?;
-        Ok(())
+        self.environment.validate()
     }
 
-    fn compute_digest(&self) -> Result<String, ContractError> {
-        let unsigned = UnsignedRequest {
-            schema_version: &self.schema_version,
+    fn compute_effect_digest(&self) -> Result<String, ContractError> {
+        #[derive(Serialize)]
+        struct EffectMaterial<'a> {
+            operation_id: &'a OperationId,
+            process_tree_id: &'a ProcessTreeId,
+            job_id: &'a JobId,
+            image_id: &'a ImageId,
+            session_id: &'a SessionId,
+            generation: Generation,
+            executable: &'a str,
+            executable_sha256: &'a str,
+            argv: &'a [String],
+            working_directory: &'a str,
+            environment: &'a EnvironmentProjection,
+            resource_limits: ResourceLimits,
+        }
+        hash_serialized(&EffectMaterial {
             operation_id: &self.operation_id,
             process_tree_id: &self.process_tree_id,
+            job_id: &self.job_id,
+            image_id: &self.image_id,
+            session_id: &self.session_id,
             generation: self.generation,
             executable: &self.executable,
             executable_sha256: &self.executable_sha256,
@@ -473,44 +486,50 @@ impl ProcessRequest {
             working_directory: &self.working_directory,
             environment: &self.environment,
             resource_limits: self.resource_limits,
-            fence: &self.fence,
-        };
-        let bytes = serde_json::to_vec(&unsigned)
-            .map_err(|error| ContractError::Serialization(error.to_string()))?;
-        Ok(hash_bytes(&bytes))
-    }
-
-    /// Returns the sealed invocation digest.
-    pub fn invocation_digest(&self) -> &str {
-        &self.invocation_digest
+        })
     }
 
     /// Returns the operation identity.
-    pub fn operation_id(&self) -> &OperationId {
+    pub const fn operation_id(&self) -> &OperationId {
         &self.operation_id
     }
 
-    /// Returns the process tree identity.
-    pub fn process_tree_id(&self) -> &ProcessTreeId {
+    /// Returns the process-tree identity.
+    pub const fn process_tree_id(&self) -> &ProcessTreeId {
         &self.process_tree_id
     }
 
-    /// Returns the requested generation.
+    /// Returns the Job identity.
+    pub const fn job_id(&self) -> &JobId {
+        &self.job_id
+    }
+
+    /// Returns the pinned image identity.
+    pub const fn image_id(&self) -> &ImageId {
+        &self.image_id
+    }
+
+    /// Returns the session identity.
+    pub const fn session_id(&self) -> &SessionId {
+        &self.session_id
+    }
+
+    /// Returns the execution generation.
     pub const fn generation(&self) -> Generation {
         self.generation
     }
 
-    /// Returns the executable path as an opaque string.
+    /// Returns the executable path.
     pub fn executable(&self) -> &str {
         &self.executable
     }
 
-    /// Returns the executable digest.
+    /// Returns the expected executable digest.
     pub fn executable_sha256(&self) -> &str {
         &self.executable_sha256
     }
 
-    /// Returns argv without any secret substitution.
+    /// Returns argv.
     pub fn argv(&self) -> &[String] {
         &self.argv
     }
@@ -530,121 +549,1048 @@ impl ProcessRequest {
         &self.resource_limits
     }
 
-    /// Returns the exact fence supplied by the authority owner.
-    pub const fn fence(&self) -> &FencingToken {
-        &self.fence
+    /// Returns the exact executable/environment/effect digest.
+    pub fn effect_digest(&self) -> &str {
+        &self.effect_digest
     }
 }
 
-/// Compatibility name used by process-plan consumers for the immutable request.
-pub type ProcessSpec = ProcessRequest;
+/// Freshness, lease, fence, and revision material supplied by Kernel at issue time.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PermitIssuance {
+    action_lease_ref: ActionLeaseRef,
+    state_fence: FencingToken,
+    expected_revision_heads: BTreeMap<String, String>,
+    issued_at_unix_ms: u64,
+    expires_at_unix_ms: u64,
+    one_shot_nonce: String,
+}
+
+impl PermitIssuance {
+    /// Creates bounded one-shot permit material.
+    pub fn new(
+        action_lease_ref: ActionLeaseRef,
+        state_fence: FencingToken,
+        expected_revision_heads: BTreeMap<String, String>,
+        issued_at_unix_ms: u64,
+        expires_at_unix_ms: u64,
+        one_shot_nonce: impl Into<String>,
+    ) -> Result<Self, ContractError> {
+        if issued_at_unix_ms == 0 || expires_at_unix_ms <= issued_at_unix_ms {
+            return Err(ContractError::InvalidValue {
+                field: "permit_freshness",
+                reason: "issue time must be non-zero and precede expiry",
+            });
+        }
+        validate_revision_heads(&expected_revision_heads)?;
+        Ok(Self {
+            action_lease_ref,
+            state_fence,
+            expected_revision_heads,
+            issued_at_unix_ms,
+            expires_at_unix_ms,
+            one_shot_nonce: validate_opaque_id("one_shot_nonce", one_shot_nonce.into())?,
+        })
+    }
+}
+
+/// Secret Kernel key material used to authenticate dispatch permits.
+///
+/// Possession of an arbitrary key does not grant authority: the P-04 executor
+/// validates against its Kernel-owned authority instance and active key.
+pub struct KernelDispatchKey([u8; 32]);
+
+impl KernelDispatchKey {
+    /// Imports exact secret bytes obtained through the Kernel credential boundary.
+    pub fn from_secret_bytes(bytes: [u8; 32]) -> Result<Self, ContractError> {
+        if bytes.iter().all(|byte| *byte == 0) {
+            return Err(ContractError::InvalidValue {
+                field: "kernel_dispatch_key",
+                reason: "all-zero keys are forbidden",
+            });
+        }
+        Ok(Self(bytes))
+    }
+}
+
+impl Drop for KernelDispatchKey {
+    fn drop(&mut self) {
+        self.0.fill(0);
+    }
+}
+
+/// Opaque, authenticated, one-shot Kernel dispatch authority.
+///
+/// It deliberately has no public field constructor, `Clone`, or `Deserialize`.
+/// A caller may transport its serialized bytes, but cannot produce a permit
+/// accepted by the executor's active Kernel authority without the matching key.
+#[derive(Debug, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct DispatchPermit {
+    schema_version: String,
+    authority_id: DispatchAuthorityId,
+    operation_id: OperationId,
+    process_tree_id: ProcessTreeId,
+    job_id: JobId,
+    image_id: ImageId,
+    session_id: SessionId,
+    generation: Generation,
+    action_lease_ref: ActionLeaseRef,
+    state_fence: FencingToken,
+    expected_revision_heads: BTreeMap<String, String>,
+    effect_digest: String,
+    issued_at_unix_ms: u64,
+    expires_at_unix_ms: u64,
+    one_shot_nonce: String,
+    authentication_tag: String,
+    permit_digest: String,
+}
 
 #[derive(Serialize)]
-struct UnsignedRequest<'a> {
+struct UnsignedPermit<'a> {
     schema_version: &'a str,
+    authority_id: &'a DispatchAuthorityId,
     operation_id: &'a OperationId,
     process_tree_id: &'a ProcessTreeId,
+    job_id: &'a JobId,
+    image_id: &'a ImageId,
+    session_id: &'a SessionId,
     generation: Generation,
-    executable: &'a str,
-    executable_sha256: &'a str,
-    argv: &'a [String],
-    working_directory: &'a str,
-    environment: &'a EnvironmentProjection,
-    resource_limits: ResourceLimits,
-    fence: &'a FencingToken,
+    action_lease_ref: &'a ActionLeaseRef,
+    state_fence: &'a FencingToken,
+    expected_revision_heads: &'a BTreeMap<String, String>,
+    effect_digest: &'a str,
+    issued_at_unix_ms: u64,
+    expires_at_unix_ms: u64,
+    one_shot_nonce: &'a str,
 }
 
-/// A process identity observed after physical launch.
+impl DispatchPermit {
+    fn unsigned(&self) -> UnsignedPermit<'_> {
+        UnsignedPermit {
+            schema_version: &self.schema_version,
+            authority_id: &self.authority_id,
+            operation_id: &self.operation_id,
+            process_tree_id: &self.process_tree_id,
+            job_id: &self.job_id,
+            image_id: &self.image_id,
+            session_id: &self.session_id,
+            generation: self.generation,
+            action_lease_ref: &self.action_lease_ref,
+            state_fence: &self.state_fence,
+            expected_revision_heads: &self.expected_revision_heads,
+            effect_digest: &self.effect_digest,
+            issued_at_unix_ms: self.issued_at_unix_ms,
+            expires_at_unix_ms: self.expires_at_unix_ms,
+            one_shot_nonce: &self.one_shot_nonce,
+        }
+    }
+
+    fn validate_shape(&self) -> Result<(), ContractError> {
+        if self.schema_version != PROCESS_CONTRACT_SCHEMA_VERSION {
+            return Err(ContractError::SchemaVersion {
+                expected: PROCESS_CONTRACT_SCHEMA_VERSION,
+                observed: self.schema_version.clone(),
+            });
+        }
+        validate_revision_heads(&self.expected_revision_heads)?;
+        validate_hex_digest("effect_digest", &self.effect_digest)?;
+        validate_hex_digest("authentication_tag", &self.authentication_tag)?;
+        validate_hex_digest("permit_digest", &self.permit_digest)?;
+        if self.issued_at_unix_ms == 0 || self.expires_at_unix_ms <= self.issued_at_unix_ms {
+            return Err(ContractError::InvalidValue {
+                field: "permit_freshness",
+                reason: "issue time must be non-zero and precede expiry",
+            });
+        }
+        if self.state_fence.generation != self.generation {
+            return Err(ContractError::FenceMismatch);
+        }
+        let expected_digest = permit_digest(&self.unsigned(), &self.authentication_tag)?;
+        validate_stored_digest("permit_digest", &self.permit_digest, expected_digest)
+    }
+
+    fn matches_intent(&self, intent: &ProcessIntent) -> bool {
+        self.operation_id == intent.operation_id
+            && self.process_tree_id == intent.process_tree_id
+            && self.job_id == intent.job_id
+            && self.image_id == intent.image_id
+            && self.session_id == intent.session_id
+            && self.generation == intent.generation
+            && self.effect_digest == intent.effect_digest
+            && self.state_fence.generation == intent.generation
+    }
+
+    /// Returns the stable digest; all other authority material stays opaque.
+    pub fn digest(&self) -> &str {
+        &self.permit_digest
+    }
+}
+
+/// Kernel-owned issuer/validator state for one active authority key.
+///
+/// P-07 owns the production instance and durable nonce journal. This pure P-03
+/// model makes issue/consume ordering executable without giving P-02 any
+/// authority role.
+pub struct DispatchPermitAuthority {
+    authority_id: DispatchAuthorityId,
+    key: KernelDispatchKey,
+    issued_nonces: BTreeSet<String>,
+    consumed_nonces: BTreeSet<String>,
+    replay_revision: u64,
+}
+
+/// Durable replay-fence state persisted by the Kernel owner, never by P-02.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct ProcessIdentity {
-    process_id: ProcessId,
-    process_tree_id: ProcessTreeId,
-    generation: Generation,
-    pid: u32,
-    started_at_unix_ms: u64,
-    executable_sha256: String,
+pub struct DispatchPermitReplaySnapshot {
+    authority_id: DispatchAuthorityId,
+    issued_nonces: Vec<String>,
+    consumed_nonces: Vec<String>,
+    replay_revision: u64,
 }
 
-impl ProcessIdentity {
-    /// Creates an observed identity.  PID zero is never a valid child identity.
-    pub fn new(
-        process_id: ProcessId,
-        process_tree_id: ProcessTreeId,
-        generation: Generation,
-        pid: u32,
-        started_at_unix_ms: u64,
-        executable_sha256: impl Into<String>,
-    ) -> Result<Self, ContractError> {
-        if pid == 0 {
+impl DispatchPermitReplaySnapshot {
+    /// Validates a durable replay snapshot before it is admitted to Kernel state.
+    ///
+    /// The wire representation deliberately uses vectors: deserialising directly
+    /// into a set would silently discard duplicate entries before they could be
+    /// rejected as corrupt replay state.
+    pub fn validate(&self) -> Result<(), ContractError> {
+        self.authority_id.validate()?;
+        if self.replay_revision == 0 {
             return Err(ContractError::InvalidValue {
-                field: "pid",
+                field: "dispatch_replay_snapshot.replay_revision",
                 reason: "must be non-zero",
             });
         }
-        let executable_sha256 = executable_sha256.into();
-        if executable_sha256.len() != 64
-            || !executable_sha256.bytes().all(|b| b.is_ascii_hexdigit())
+        validate_replay_nonces("issued_nonces", &self.issued_nonces)?;
+        validate_replay_nonces("consumed_nonces", &self.consumed_nonces)?;
+        let issued: BTreeSet<_> = self.issued_nonces.iter().cloned().collect();
+        if !self
+            .consumed_nonces
+            .iter()
+            .all(|nonce| issued.contains(nonce))
         {
             return Err(ContractError::InvalidValue {
-                field: "executable_sha256",
-                reason: "must be a 64-character hexadecimal digest",
+                field: "dispatch_replay_snapshot.consumed_nonces",
+                reason: "consumed nonces must be a subset of issued nonces",
             });
         }
+        Ok(())
+    }
+}
+
+impl DispatchPermitAuthority {
+    /// Activates one authority instance around Kernel-owned secret material.
+    pub fn activate(authority_id: DispatchAuthorityId, key: KernelDispatchKey) -> Self {
+        Self {
+            authority_id,
+            key,
+            issued_nonces: BTreeSet::new(),
+            consumed_nonces: BTreeSet::new(),
+            replay_revision: 1,
+        }
+    }
+
+    /// Restores an exact Kernel-owned replay fence around the active secret key.
+    pub fn recover(
+        expected_authority_id: DispatchAuthorityId,
+        key: KernelDispatchKey,
+        snapshot: DispatchPermitReplaySnapshot,
+    ) -> Result<Self, ContractError> {
+        expected_authority_id.validate()?;
+        snapshot.validate()?;
+        if snapshot.authority_id != expected_authority_id {
+            return Err(ContractError::DispatchAuthorityMismatch);
+        }
         Ok(Self {
-            process_id,
-            process_tree_id,
-            generation,
-            pid,
-            started_at_unix_ms,
-            executable_sha256,
+            authority_id: expected_authority_id,
+            key,
+            issued_nonces: snapshot.issued_nonces.into_iter().collect(),
+            consumed_nonces: snapshot.consumed_nonces.into_iter().collect(),
+            replay_revision: snapshot.replay_revision,
         })
     }
 
-    /// Returns the opaque process identity.
+    /// Returns exact replay state for durable fenced recovery by P-07.
+    pub fn replay_snapshot(&self) -> DispatchPermitReplaySnapshot {
+        DispatchPermitReplaySnapshot {
+            authority_id: self.authority_id.clone(),
+            issued_nonces: self.issued_nonces.iter().cloned().collect(),
+            consumed_nonces: self.consumed_nonces.iter().cloned().collect(),
+            replay_revision: self.replay_revision,
+        }
+    }
+
+    /// Issues one permit bound to the exact immutable intent.
+    pub fn issue(
+        &mut self,
+        intent: &ProcessIntent,
+        issuance: PermitIssuance,
+    ) -> Result<DispatchPermit, ContractError> {
+        intent.validate()?;
+        if issuance.state_fence.generation != intent.generation {
+            return Err(ContractError::FenceMismatch);
+        }
+        if self.issued_nonces.contains(&issuance.one_shot_nonce) {
+            return Err(ContractError::DuplicateValue {
+                field: "one_shot_nonce",
+            });
+        }
+        let mut permit = DispatchPermit {
+            schema_version: PROCESS_CONTRACT_SCHEMA_VERSION.to_owned(),
+            authority_id: self.authority_id.clone(),
+            operation_id: intent.operation_id.clone(),
+            process_tree_id: intent.process_tree_id.clone(),
+            job_id: intent.job_id.clone(),
+            image_id: intent.image_id.clone(),
+            session_id: intent.session_id.clone(),
+            generation: intent.generation,
+            action_lease_ref: issuance.action_lease_ref,
+            state_fence: issuance.state_fence,
+            expected_revision_heads: issuance.expected_revision_heads,
+            effect_digest: intent.effect_digest.clone(),
+            issued_at_unix_ms: issuance.issued_at_unix_ms,
+            expires_at_unix_ms: issuance.expires_at_unix_ms,
+            one_shot_nonce: issuance.one_shot_nonce,
+            authentication_tag: String::new(),
+            permit_digest: String::new(),
+        };
+        permit.authentication_tag = keyed_hash_serialized(&self.key.0, &permit.unsigned())?;
+        permit.permit_digest = permit_digest(&permit.unsigned(), &permit.authentication_tag)?;
+        permit.validate_shape()?;
+        let next_revision =
+            self.replay_revision
+                .checked_add(1)
+                .ok_or(ContractError::InvalidValue {
+                    field: "replay_revision",
+                    reason: "revision overflow",
+                })?;
+        self.issued_nonces.insert(permit.one_shot_nonce.clone());
+        self.replay_revision = next_revision;
+        Ok(permit)
+    }
+
+    /// Validates fresh P-02 launch evidence and consumes a permit exactly once.
+    ///
+    /// All checks happen before the nonce ledger mutates. The returned opaque
+    /// value is suitable as `V` in P-02's `ValidatedSuspendedJobChild<V>`.
+    pub fn validate_and_consume(
+        &mut self,
+        request: ProcessRequest,
+        observed: SuspendedProcessIdentity,
+        current: &DispatchValidationContext,
+    ) -> Result<ValidatedDispatch, ContractError> {
+        request.validate()?;
+        observed.validate()?;
+        current.validate()?;
+
+        let permit = &request.permit;
+        if permit.authority_id != self.authority_id {
+            return Err(ContractError::DispatchAuthenticationFailed);
+        }
+        let expected_tag = keyed_hash_serialized(&self.key.0, &permit.unsigned())?;
+        if expected_tag != permit.authentication_tag {
+            return Err(ContractError::DispatchAuthenticationFailed);
+        }
+        if !self.issued_nonces.contains(&permit.one_shot_nonce) {
+            return Err(ContractError::DispatchPermitRequired);
+        }
+        if self.consumed_nonces.contains(&permit.one_shot_nonce) {
+            return Err(ContractError::DispatchPermitConsumed);
+        }
+        if !permit.state_fence.matches(&current.state_fence) {
+            return Err(ContractError::StaleStateFence);
+        }
+        if permit.state_fence.authority_epoch != current.authority_epoch {
+            return Err(ContractError::StaleAuthorityEpoch);
+        }
+        if permit.expected_revision_heads != current.revision_heads {
+            return Err(ContractError::StaleRevisionHeads);
+        }
+        let now = current.now_unix_ms()?;
+        if now < permit.issued_at_unix_ms || now >= permit.expires_at_unix_ms {
+            return Err(ContractError::ExpiredDispatchPermit);
+        }
+        if !permit.matches_intent(&request.intent)
+            || observed.process_tree_id != request.intent.process_tree_id
+            || observed.job_id != request.intent.job_id
+            || observed.image_id != request.intent.image_id
+            || observed.session_id != request.intent.session_id
+            || observed.generation != request.intent.generation
+            || observed.executable_sha256 != request.intent.executable_sha256
+        {
+            return Err(ContractError::IdentityMismatch);
+        }
+
+        let binding = ProcessExecutionBinding {
+            operation_id: request.intent.operation_id.clone(),
+            process_tree_id: request.intent.process_tree_id.clone(),
+            job_id: request.intent.job_id.clone(),
+            image_id: request.intent.image_id.clone(),
+            session_id: request.intent.session_id.clone(),
+            generation: request.intent.generation,
+            action_lease_ref: permit.action_lease_ref.clone(),
+            authority_id: permit.authority_id.clone(),
+            authority_epoch: permit.state_fence.authority_epoch,
+            state_fence: permit.state_fence.clone(),
+            request_digest: request.invocation_digest.clone(),
+            permit_digest: permit.permit_digest.clone(),
+            effect_digest: request.intent.effect_digest.clone(),
+            validation_revision: current.validation_revision,
+        };
+        let next_revision =
+            self.replay_revision
+                .checked_add(1)
+                .ok_or(ContractError::InvalidValue {
+                    field: "replay_revision",
+                    reason: "revision overflow",
+                })?;
+        let consumed_nonce = permit.one_shot_nonce.clone();
+        self.consumed_nonces.insert(consumed_nonce);
+        self.replay_revision = next_revision;
+        drop(request);
+        Ok(ValidatedDispatch {
+            binding,
+            suspended_identity: observed,
+            validated_at_unix_ms: now,
+        })
+    }
+
+    /// Returns the number of successfully consumed nonces.
+    pub fn consumed_permit_count(&self) -> usize {
+        self.consumed_nonces.len()
+    }
+
+    /// Mints the P-03 half of a P-07-selected recovery capability.
+    ///
+    /// The caller must supply the persisted exact binding and the current
+    /// Kernel observation. This does not duplicate P-07 authority or consume a
+    /// dispatch permit; it only creates a capability that can be used by the
+    /// recovery start seam after a fresh P-02 observation.
+    pub fn issue_recovery_capability(
+        &self,
+        binding: ProcessExecutionBinding,
+        capability_id: impl Into<String>,
+        current: &DispatchValidationContext,
+    ) -> Result<RecoveryCapability, ContractError> {
+        current.validate()?;
+        binding.validate()?;
+        if binding.authority_id != self.authority_id
+            || binding.state_fence != current.state_fence
+            || binding.authority_epoch != current.authority_epoch
+        {
+            return Err(ContractError::RecoveryCapabilityMismatch);
+        }
+        Ok(RecoveryCapability {
+            binding,
+            capability_id: validate_opaque_id("recovery_capability_id", capability_id.into())?,
+            state_fence: current.state_fence.clone(),
+            validation_revision: current.validation_revision,
+        })
+    }
+}
+
+/// Immutable process request consumed by [`ProcessExecutor::start`].
+///
+/// The request cannot be cloned or deserialized. A caller must first obtain an
+/// authenticated [`DispatchPermit`] from the active Kernel authority.
+#[derive(Debug, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProcessRequest {
+    schema_version: String,
+    intent: ProcessIntent,
+    permit: DispatchPermit,
+    invocation_digest: String,
+}
+
+impl ProcessRequest {
+    /// Seals an intent and its consuming Kernel-issued permit.
+    pub fn new(intent: ProcessIntent, permit: DispatchPermit) -> Result<Self, ContractError> {
+        intent.validate()?;
+        permit.validate_shape()?;
+        if !permit.matches_intent(&intent) {
+            return Err(ContractError::DispatchBindingMismatch);
+        }
+        let mut request = Self {
+            schema_version: PROCESS_CONTRACT_SCHEMA_VERSION.to_owned(),
+            intent,
+            permit,
+            invocation_digest: String::new(),
+        };
+        request.invocation_digest = request.compute_digest()?;
+        Ok(request)
+    }
+
+    /// Validates request, intent, permit shape, and immutable digest.
+    pub fn validate(&self) -> Result<(), ContractError> {
+        if self.schema_version != PROCESS_CONTRACT_SCHEMA_VERSION {
+            return Err(ContractError::SchemaVersion {
+                expected: PROCESS_CONTRACT_SCHEMA_VERSION,
+                observed: self.schema_version.clone(),
+            });
+        }
+        self.intent.validate()?;
+        self.permit.validate_shape()?;
+        if !self.permit.matches_intent(&self.intent) {
+            return Err(ContractError::DispatchBindingMismatch);
+        }
+        validate_stored_digest(
+            "invocation_digest",
+            &self.invocation_digest,
+            self.compute_digest()?,
+        )
+    }
+
+    fn compute_digest(&self) -> Result<String, ContractError> {
+        #[derive(Serialize)]
+        struct UnsignedRequest<'a> {
+            schema_version: &'a str,
+            intent: &'a ProcessIntent,
+            permit_digest: &'a str,
+        }
+        hash_serialized(&UnsignedRequest {
+            schema_version: &self.schema_version,
+            intent: &self.intent,
+            permit_digest: &self.permit.permit_digest,
+        })
+    }
+
+    /// Returns the sealed invocation digest.
+    pub fn invocation_digest(&self) -> &str {
+        &self.invocation_digest
+    }
+
+    /// Returns the permit digest without exposing permit authority material.
+    pub fn permit_digest(&self) -> &str {
+        self.permit.digest()
+    }
+
+    /// Returns the immutable non-authoritative intent.
+    pub const fn intent(&self) -> &ProcessIntent {
+        &self.intent
+    }
+
+    /// Returns the operation identity.
+    pub const fn operation_id(&self) -> &OperationId {
+        self.intent.operation_id()
+    }
+
+    /// Returns the process-tree identity.
+    pub const fn process_tree_id(&self) -> &ProcessTreeId {
+        self.intent.process_tree_id()
+    }
+
+    /// Returns the Job identity.
+    pub const fn job_id(&self) -> &JobId {
+        self.intent.job_id()
+    }
+
+    /// Returns the image identity.
+    pub const fn image_id(&self) -> &ImageId {
+        self.intent.image_id()
+    }
+
+    /// Returns the session identity.
+    pub const fn session_id(&self) -> &SessionId {
+        self.intent.session_id()
+    }
+
+    /// Returns the execution generation.
+    pub const fn generation(&self) -> Generation {
+        self.intent.generation()
+    }
+
+    /// Returns the executable named by the non-authoritative intent.
+    pub fn executable(&self) -> &str {
+        self.intent.executable()
+    }
+
+    /// Returns the executable digest named by the non-authoritative intent.
+    pub fn executable_sha256(&self) -> &str {
+        self.intent.executable_sha256()
+    }
+
+    /// Returns the argument vector named by the non-authoritative intent.
+    pub fn argv(&self) -> &[String] {
+        self.intent.argv()
+    }
+
+    /// Returns the working directory named by the non-authoritative intent.
+    pub fn working_directory(&self) -> &str {
+        self.intent.working_directory()
+    }
+
+    /// Returns the environment projection named by the non-authoritative intent.
+    pub const fn environment(&self) -> &EnvironmentProjection {
+        self.intent.environment()
+    }
+
+    /// Returns the resource limits named by the non-authoritative intent.
+    pub const fn resource_limits(&self) -> &ResourceLimits {
+        self.intent.resource_limits()
+    }
+
+    /// Returns the effect digest named by the non-authoritative intent.
+    pub fn effect_digest(&self) -> &str {
+        self.intent.effect_digest()
+    }
+
+    /// Returns the authenticated fence.
+    pub const fn fence(&self) -> &FencingToken {
+        &self.permit.state_fence
+    }
+}
+
+/// Compatibility name for immutable process requests.
+pub type ProcessSpec = ProcessRequest;
+
+/// Current Kernel state used for one freshness-fenced validation round trip.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DispatchValidationContext {
+    clock: ClockObservation,
+    state_fence: FencingToken,
+    authority_epoch: u64,
+    revision_heads: BTreeMap<String, String>,
+    validation_revision: u64,
+}
+
+impl DispatchValidationContext {
+    /// Creates one current Kernel validation snapshot.
+    pub fn new(
+        clock: ClockObservation,
+        state_fence: FencingToken,
+        authority_epoch: u64,
+        revision_heads: BTreeMap<String, String>,
+        validation_revision: u64,
+    ) -> Result<Self, ContractError> {
+        let context = Self {
+            clock,
+            state_fence,
+            authority_epoch,
+            revision_heads,
+            validation_revision,
+        };
+        context.validate()?;
+        Ok(context)
+    }
+
+    fn validate(&self) -> Result<(), ContractError> {
+        self.clock
+            .validate()
+            .map_err(|_| ContractError::InvalidValue {
+                field: "validation_clock",
+                reason: "P-01 clock observation is invalid",
+            })?;
+        let _ = self.now_unix_ms()?;
+        if self.authority_epoch == 0 || self.validation_revision == 0 {
+            return Err(ContractError::InvalidValue {
+                field: "validation_context",
+                reason: "authority epoch and validation revision must be non-zero",
+            });
+        }
+        if self.state_fence.authority_epoch != self.authority_epoch {
+            return Err(ContractError::FenceMismatch);
+        }
+        validate_revision_heads(&self.revision_heads)
+    }
+
+    fn now_unix_ms(&self) -> Result<u64, ContractError> {
+        let value = self
+            .clock
+            .valid_time_ms
+            .ok_or(ContractError::InvalidValue {
+                field: "validation_clock.valid_time_ms",
+                reason: "wall time is required for permit freshness",
+            })?;
+        u64::try_from(value).map_err(|_| ContractError::InvalidValue {
+            field: "validation_clock.valid_time_ms",
+            reason: "must be non-negative",
+        })
+    }
+}
+
+/// Fresh P-02 evidence for a child that is assigned to its Job but still suspended.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SuspendedProcessIdentity {
+    process_id: ProcessId,
+    process_tree_id: ProcessTreeId,
+    job_id: JobId,
+    image_id: ImageId,
+    session_id: SessionId,
+    generation: Generation,
+    pid: u32,
+    created_suspended_at_unix_ms: u64,
+    executable_sha256: String,
+}
+
+impl SuspendedProcessIdentity {
+    /// Creates exact pre-resume identity from fresh retained-handle evidence.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        process_id: ProcessId,
+        process_tree_id: ProcessTreeId,
+        job_id: JobId,
+        image_id: ImageId,
+        session_id: SessionId,
+        generation: Generation,
+        pid: u32,
+        created_suspended_at_unix_ms: u64,
+        executable_sha256: impl Into<String>,
+    ) -> Result<Self, ContractError> {
+        let identity = Self {
+            process_id,
+            process_tree_id,
+            job_id,
+            image_id,
+            session_id,
+            generation,
+            pid,
+            created_suspended_at_unix_ms,
+            executable_sha256: executable_sha256.into(),
+        };
+        identity.validate()?;
+        Ok(identity)
+    }
+
+    fn validate(&self) -> Result<(), ContractError> {
+        self.process_id.validate()?;
+        self.process_tree_id.validate()?;
+        self.job_id.validate()?;
+        self.image_id.validate()?;
+        self.session_id.validate()?;
+        if self.pid == 0 || self.created_suspended_at_unix_ms == 0 {
+            return Err(ContractError::InvalidValue {
+                field: "suspended_process_identity",
+                reason: "PID and creation time must be non-zero",
+            });
+        }
+        validate_hex_digest("executable_sha256", &self.executable_sha256)
+    }
+
+    /// Returns the physical process identity.
     pub const fn process_id(&self) -> &ProcessId {
         &self.process_id
     }
 
-    /// Returns the owning tree.
+    /// Returns the Job identity.
+    pub const fn job_id(&self) -> &JobId {
+        &self.job_id
+    }
+}
+
+/// Exact identity after the validated suspended child was resumed.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProcessIdentity {
+    suspended: SuspendedProcessIdentity,
+    resumed_at_unix_ms: u64,
+}
+
+impl ProcessIdentity {
+    fn after_resume(
+        suspended: SuspendedProcessIdentity,
+        resumed_at_unix_ms: u64,
+    ) -> Result<Self, ContractError> {
+        if resumed_at_unix_ms < suspended.created_suspended_at_unix_ms {
+            return Err(ContractError::InvalidValue {
+                field: "resumed_at_unix_ms",
+                reason: "resume cannot precede suspended creation",
+            });
+        }
+        Ok(Self {
+            suspended,
+            resumed_at_unix_ms,
+        })
+    }
+
+    /// Returns the physical process identity.
+    pub const fn process_id(&self) -> &ProcessId {
+        &self.suspended.process_id
+    }
+
+    /// Returns the process-tree identity.
     pub const fn process_tree_id(&self) -> &ProcessTreeId {
-        &self.process_tree_id
+        &self.suspended.process_tree_id
     }
 
-    /// Returns the process generation.
+    /// Returns the Job identity.
+    pub const fn job_id(&self) -> &JobId {
+        &self.suspended.job_id
+    }
+
+    /// Returns the exact image identity.
+    pub const fn image_id(&self) -> &ImageId {
+        &self.suspended.image_id
+    }
+
+    /// Returns the session identity.
+    pub const fn session_id(&self) -> &SessionId {
+        &self.suspended.session_id
+    }
+
+    /// Returns the generation.
     pub const fn generation(&self) -> Generation {
-        self.generation
+        self.suspended.generation
     }
 
-    /// Returns the observed PID.
+    /// Returns the OS PID lookup value.
     pub const fn pid(&self) -> u32 {
-        self.pid
-    }
-
-    /// Returns the launch timestamp supplied by the platform adapter.
-    pub const fn started_at_unix_ms(&self) -> u64 {
-        self.started_at_unix_ms
+        self.suspended.pid
     }
 
     /// Returns the observed executable digest.
     pub fn executable_sha256(&self) -> &str {
-        &self.executable_sha256
+        &self.suspended.executable_sha256
+    }
+
+    /// Returns the exact resume time.
+    pub const fn resumed_at_unix_ms(&self) -> u64 {
+        self.resumed_at_unix_ms
     }
 }
 
-/// Canonical process lifecycle.  It is intentionally separate from capability readiness.
+/// Exact authority and physical-contour binding repeated in every receipt/evidence path.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProcessExecutionBinding {
+    operation_id: OperationId,
+    process_tree_id: ProcessTreeId,
+    job_id: JobId,
+    image_id: ImageId,
+    session_id: SessionId,
+    generation: Generation,
+    action_lease_ref: ActionLeaseRef,
+    authority_id: DispatchAuthorityId,
+    authority_epoch: u64,
+    state_fence: FencingToken,
+    request_digest: String,
+    permit_digest: String,
+    effect_digest: String,
+    validation_revision: u64,
+}
+
+impl ProcessExecutionBinding {
+    fn validate(&self) -> Result<(), ContractError> {
+        self.operation_id.validate()?;
+        self.process_tree_id.validate()?;
+        self.job_id.validate()?;
+        self.image_id.validate()?;
+        self.session_id.validate()?;
+        self.action_lease_ref.validate()?;
+        self.authority_id.validate()?;
+        if self.authority_epoch == 0 || self.validation_revision == 0 {
+            return Err(ContractError::InvalidValue {
+                field: "process_execution_binding",
+                reason: "authority epoch and validation revision must be non-zero",
+            });
+        }
+        validate_hex_digest("request_digest", &self.request_digest)?;
+        validate_hex_digest("permit_digest", &self.permit_digest)?;
+        validate_hex_digest("effect_digest", &self.effect_digest)?;
+        if self.state_fence.authority_epoch != self.authority_epoch
+            || self.state_fence.generation != self.generation
+        {
+            return Err(ContractError::FenceMismatch);
+        }
+        Ok(())
+    }
+
+    /// Returns the operation identity.
+    pub const fn operation_id(&self) -> &OperationId {
+        &self.operation_id
+    }
+
+    /// Returns the process-tree identity.
+    pub const fn process_tree_id(&self) -> &ProcessTreeId {
+        &self.process_tree_id
+    }
+
+    /// Returns the Job identity.
+    pub const fn job_id(&self) -> &JobId {
+        &self.job_id
+    }
+
+    /// Returns the image identity.
+    pub const fn image_id(&self) -> &ImageId {
+        &self.image_id
+    }
+
+    /// Returns the session identity.
+    pub const fn session_id(&self) -> &SessionId {
+        &self.session_id
+    }
+
+    /// Returns the authenticated state fence.
+    pub const fn state_fence(&self) -> &FencingToken {
+        &self.state_fence
+    }
+
+    /// Returns the permit digest.
+    pub fn permit_digest(&self) -> &str {
+        &self.permit_digest
+    }
+
+    /// Returns the request digest.
+    pub fn request_digest(&self) -> &str {
+        &self.request_digest
+    }
+
+    /// Returns the validation revision.
+    pub const fn validation_revision(&self) -> u64 {
+        self.validation_revision
+    }
+
+    fn matches_identity(&self, identity: &ProcessIdentity) -> bool {
+        self.process_tree_id == *identity.process_tree_id()
+            && self.job_id == *identity.job_id()
+            && self.image_id == *identity.image_id()
+            && self.session_id == *identity.session_id()
+            && self.generation == identity.generation()
+    }
+}
+
+/// Opaque proof produced only by a successful consuming authority validation.
+///
+/// This type has no public constructor, `Clone`, serialization, or
+/// deserialization. P-02 may carry it as policy output but cannot inspect it to
+/// create authority.
+pub struct ValidatedDispatch {
+    binding: ProcessExecutionBinding,
+    suspended_identity: SuspendedProcessIdentity,
+    validated_at_unix_ms: u64,
+}
+
+impl ValidatedDispatch {
+    /// Returns the exact validated binding.
+    pub const fn binding(&self) -> &ProcessExecutionBinding {
+        &self.binding
+    }
+
+    /// Returns fresh pre-resume identity evidence.
+    pub const fn suspended_identity(&self) -> &SuspendedProcessIdentity {
+        &self.suspended_identity
+    }
+
+    /// Returns the Kernel validation time.
+    pub const fn validated_at_unix_ms(&self) -> u64 {
+        self.validated_at_unix_ms
+    }
+}
+
+/// Fresh P-02 observation used by the P-07/P-03 recovery seam.
+///
+/// A persisted receipt or process view is not sufficient: recovery must carry
+/// a newly observed suspended identity and the exact current state fence.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RecoveryObservation {
+    suspended_identity: SuspendedProcessIdentity,
+    state_fence: FencingToken,
+    observed_at_unix_ms: u64,
+}
+
+impl RecoveryObservation {
+    /// Creates a bounded observation retained from a fresh P-02 probe.
+    pub fn new(
+        suspended_identity: SuspendedProcessIdentity,
+        state_fence: FencingToken,
+        observed_at_unix_ms: u64,
+    ) -> Result<Self, ContractError> {
+        suspended_identity.validate()?;
+        if observed_at_unix_ms == 0 {
+            return Err(ContractError::InvalidValue {
+                field: "recovery_observation.observed_at_unix_ms",
+                reason: "must be non-zero",
+            });
+        }
+        if state_fence.generation != suspended_identity.generation {
+            return Err(ContractError::FenceMismatch);
+        }
+        Ok(Self {
+            suspended_identity,
+            state_fence,
+            observed_at_unix_ms,
+        })
+    }
+
+    /// Returns the fresh suspended-child identity.
+    pub const fn suspended_identity(&self) -> &SuspendedProcessIdentity {
+        &self.suspended_identity
+    }
+
+    /// Returns the fence observed by P-02.
+    pub const fn state_fence(&self) -> &FencingToken {
+        &self.state_fence
+    }
+
+    /// Returns the observation time.
+    pub const fn observed_at_unix_ms(&self) -> u64 {
+        self.observed_at_unix_ms
+    }
+}
+
+/// P-03 capability minted after P-07 has selected a durable recovery record.
+///
+/// The fields and constructor remain private. P-07 obtains this value only
+/// from [`DispatchPermitAuthority::issue_recovery_capability`], so a receipt,
+/// replay snapshot, or deserialised view cannot stand in for recovery authority.
+#[derive(Debug, Eq, PartialEq)]
+pub struct RecoveryCapability {
+    binding: ProcessExecutionBinding,
+    capability_id: String,
+    state_fence: FencingToken,
+    validation_revision: u64,
+}
+
+impl RecoveryCapability {
+    fn validate(
+        &self,
+        binding: &ProcessExecutionBinding,
+        current: &DispatchValidationContext,
+    ) -> Result<(), ContractError> {
+        current.validate()?;
+        if self.binding != *binding
+            || self.state_fence != current.state_fence
+            || self.state_fence != binding.state_fence
+            || self.validation_revision != current.validation_revision
+        {
+            return Err(ContractError::RecoveryCapabilityMismatch);
+        }
+        Ok(())
+    }
+
+    /// Returns the durable P-07 capability reference without exposing authority.
+    pub fn capability_id(&self) -> &str {
+        &self.capability_id
+    }
+}
+
+/// Canonical process lifecycle, separate from semantic readiness.
 #[derive(Clone, Copy, Debug, Default, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProcessLifecycle {
+    /// No physical launch has been validated.
     #[default]
     Created,
+    /// A suspended child was validated and awaits/has just completed resume.
     Starting,
+    /// The exact validated child is running.
     Running,
+    /// Tree cancellation is in progress.
     Cancelling,
+    /// Exit and tree closure are proven.
     Exited,
+    /// A known failure is terminal.
     Failed,
+    /// External disposition or tree closure is unknown.
     UnknownOutcome,
+    /// Unknown outcome was reconciled with exact tree closure.
     Reconciled,
+    /// The lineage was fenced for manual recovery.
     Quarantined,
 }
 
@@ -661,38 +1607,41 @@ impl ProcessLifecycle {
     pub const fn can_transition_to(self, next: Self) -> bool {
         matches!(
             (self, next),
-            (
-                Self::Created,
-                Self::Starting | Self::Cancelling | Self::Failed
-            ) | (
-                Self::Starting,
-                Self::Running | Self::Cancelling | Self::Failed | Self::UnknownOutcome
-            ) | (
-                Self::Running,
-                Self::Cancelling | Self::Exited | Self::Failed | Self::UnknownOutcome
-            ) | (
-                Self::Cancelling,
-                Self::Exited | Self::Failed | Self::UnknownOutcome
-            ) | (Self::UnknownOutcome, Self::Reconciled | Self::Quarantined)
+            (Self::Created, Self::Starting | Self::Failed)
+                | (
+                    Self::Starting,
+                    Self::Running | Self::Cancelling | Self::Failed | Self::UnknownOutcome
+                )
+                | (
+                    Self::Running,
+                    Self::Cancelling | Self::Exited | Self::Failed | Self::UnknownOutcome
+                )
+                | (
+                    Self::Cancelling,
+                    Self::Exited | Self::Failed | Self::UnknownOutcome
+                )
+                | (Self::UnknownOutcome, Self::Reconciled | Self::Quarantined)
         )
     }
 }
 
-/// Compatibility name for consumers that call the lifecycle projection a status.
+/// Compatibility name for lifecycle projections.
 pub type ProcessStatus = ProcessLifecycle;
 
-/// The health axis is not inferred from process liveness.
+/// Process health is not inferred from liveness.
 #[derive(Clone, Copy, Debug, Default, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProcessHealthStatus {
+    /// Health is not yet observed.
     #[default]
     Unknown,
+    /// The process is healthy.
     Healthy,
+    /// The process is degraded.
     Degraded,
-    Failed,
 }
 
-/// A bounded health observation.
+/// One bounded process-health observation.
 #[derive(Clone, Debug, Default, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProcessHealth {
@@ -703,17 +1652,15 @@ pub struct ProcessHealth {
 }
 
 impl ProcessHealth {
-    /// Creates an observation.  `detail` is diagnostic text, never a secret channel.
+    /// Creates a bounded health observation.
     pub fn new(
         status: ProcessHealthStatus,
         ready: bool,
         observed_at_unix_ms: u64,
         detail: Option<String>,
     ) -> Result<Self, ContractError> {
-        if detail.as_deref().is_some_and(contains_secret_like_text) {
-            return Err(ContractError::SecretBoundary {
-                field: "health.detail",
-            });
+        if let Some(value) = &detail {
+            validate_opaque_id("health_detail", value.clone())?;
         }
         Ok(Self {
             status,
@@ -728,37 +1675,29 @@ impl ProcessHealth {
         self.status
     }
 
-    /// Returns whether the process passed its readiness observation.
+    /// Returns the readiness observation.
     pub const fn ready(&self) -> bool {
         self.ready
     }
-
-    /// Returns the observation timestamp.
-    pub const fn observed_at_unix_ms(&self) -> u64 {
-        self.observed_at_unix_ms
-    }
-
-    /// Returns the optional diagnostic detail.
-    pub fn detail(&self) -> Option<&str> {
-        self.detail.as_deref()
-    }
 }
 
-/// Why a process terminated.
+/// Physical exit disposition, never a semantic verdict.
 #[derive(Clone, Copy, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ExitDisposition {
+    /// A normal exit code was observed.
     Completed,
-    NonZeroExit,
+    /// A signal/exception termination was observed.
     Signalled,
+    /// A resource limit stopped the tree.
+    ResourceLimit,
+    /// Cancellation stopped the tree.
     Cancelled,
-    TimedOut,
-    Killed,
-    NeverStarted,
+    /// The external outcome cannot be classified.
     Unknown,
 }
 
-/// Immutable observed exit information.
+/// Immutable root-process exit observation.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ExitStatus {
@@ -769,27 +1708,23 @@ pub struct ExitStatus {
 }
 
 impl ExitStatus {
-    /// Creates an exit observation and checks its discriminated fields.
+    /// Creates a structurally valid exit observation.
     pub fn new(
         disposition: ExitDisposition,
         code: Option<i32>,
         signal: Option<i32>,
         observed_at_unix_ms: u64,
     ) -> Result<Self, ContractError> {
-        if matches!(
-            disposition,
-            ExitDisposition::Completed | ExitDisposition::NonZeroExit
-        ) && signal.is_some()
-        {
+        let valid = match disposition {
+            ExitDisposition::Completed => code.is_some() && signal.is_none(),
+            ExitDisposition::Signalled => code.is_none() && signal.is_some(),
+            ExitDisposition::ResourceLimit | ExitDisposition::Cancelled => signal.is_none(),
+            ExitDisposition::Unknown => code.is_none() && signal.is_none(),
+        };
+        if !valid || observed_at_unix_ms == 0 {
             return Err(ContractError::InvalidValue {
-                field: "exit.signal",
-                reason: "signal is not valid for a normal exit",
-            });
-        }
-        if matches!(disposition, ExitDisposition::Signalled) && signal.is_none() {
-            return Err(ContractError::InvalidValue {
-                field: "exit.signal",
-                reason: "signal is required for signalled exit",
+                field: "exit_status",
+                reason: "disposition fields or observation time are invalid",
             });
         }
         Ok(Self {
@@ -800,44 +1735,37 @@ impl ExitStatus {
         })
     }
 
-    /// Returns the termination disposition.
+    /// Returns the physical disposition.
     pub const fn disposition(&self) -> ExitDisposition {
         self.disposition
     }
-
-    /// Returns the process exit code.
-    pub const fn code(&self) -> Option<i32> {
-        self.code
-    }
-
-    /// Returns the platform signal number, when applicable.
-    pub const fn signal(&self) -> Option<i32> {
-        self.signal
-    }
-
-    /// Returns the observation timestamp.
-    pub const fn observed_at_unix_ms(&self) -> u64 {
-        self.observed_at_unix_ms
-    }
 }
 
-/// Cancellation disposition, independent from process liveness.
+/// Cancellation progress independent of lifecycle.
 #[derive(Clone, Copy, Debug, Default, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CancellationStatus {
+    /// No cancellation was requested.
     #[default]
     NotRequested,
+    /// Cancellation was admitted.
     Requested,
+    /// Tree cancellation is executing.
     InProgress,
+    /// Exact tree closure is proven.
     Completed,
+    /// The request fence was stale.
     RejectedStaleFence,
+    /// External cancellation disposition is unknown.
     UnknownOutcome,
 }
 
-/// Evidence that the complete descendant tree was observed and contained.
-#[derive(Clone, Debug, Default, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+/// Exact descendant-tree observation bound to permit and authority identity.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DescendantEvidence {
+    binding: ProcessExecutionBinding,
+    root_process_id: ProcessId,
     process_ids: Vec<ProcessId>,
     complete: bool,
     tree_terminated: bool,
@@ -845,8 +1773,10 @@ pub struct DescendantEvidence {
 }
 
 impl DescendantEvidence {
-    /// Creates a tree observation and rejects duplicate process identities.
+    /// Creates an exact tree observation.
     pub fn new(
+        binding: ProcessExecutionBinding,
+        root_process_id: ProcessId,
         process_ids: Vec<ProcessId>,
         complete: bool,
         tree_terminated: bool,
@@ -858,8 +1788,7 @@ impl DescendantEvidence {
                 limit: MAX_DESCENDANTS,
             });
         }
-        let unique = process_ids.iter().collect::<BTreeSet<_>>();
-        if unique.len() != process_ids.len() {
+        if process_ids.iter().collect::<BTreeSet<_>>().len() != process_ids.len() {
             return Err(ContractError::DuplicateValue {
                 field: "process_ids",
             });
@@ -870,7 +1799,15 @@ impl DescendantEvidence {
                 reason: "tree_terminated requires complete observation",
             });
         }
+        if (complete || tree_terminated) && evidence_ref.as_deref().is_none_or(str::is_empty) {
+            return Err(ContractError::InvalidValue {
+                field: "descendant_evidence.evidence_ref",
+                reason: "closure claims require a raw evidence handle",
+            });
+        }
         Ok(Self {
+            binding,
+            root_process_id,
             process_ids,
             complete,
             tree_terminated,
@@ -878,17 +1815,22 @@ impl DescendantEvidence {
         })
     }
 
-    /// Returns all observed process identities.
+    /// Returns the exact authority/process binding.
+    pub const fn binding(&self) -> &ProcessExecutionBinding {
+        &self.binding
+    }
+
+    /// Returns observed descendant identities.
     pub fn process_ids(&self) -> &[ProcessId] {
         &self.process_ids
     }
 
-    /// Returns whether the tree observation is complete.
+    /// Returns whether observation is complete.
     pub const fn complete(&self) -> bool {
         self.complete
     }
 
-    /// Returns whether all descendants were terminated.
+    /// Returns whether every Job member was terminated/reaped.
     pub const fn tree_terminated(&self) -> bool {
         self.tree_terminated
     }
@@ -897,69 +1839,88 @@ impl DescendantEvidence {
     pub fn evidence_ref(&self) -> Option<&str> {
         self.evidence_ref.as_deref()
     }
+
+    fn matches(&self, binding: &ProcessExecutionBinding, identity: &ProcessIdentity) -> bool {
+        self.binding == *binding && self.root_process_id == *identity.process_id()
+    }
 }
 
-/// A typed process status view.
+/// Typed process execution view.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProcessExecutionView {
-    operation_id: OperationId,
-    process_tree_id: ProcessTreeId,
-    generation: Generation,
-    request_digest: String,
+    binding: ProcessExecutionBinding,
     lifecycle: ProcessLifecycle,
     health: ProcessHealth,
     cancellation: CancellationStatus,
     identity: Option<ProcessIdentity>,
     exit: Option<ExitStatus>,
-    descendants: DescendantEvidence,
-    fence: FencingToken,
+    descendants: Option<DescendantEvidence>,
 }
 
 impl ProcessExecutionView {
-    /// Returns the current lifecycle.
+    /// Returns the exact permit/authority/process contour binding.
+    pub const fn binding(&self) -> &ProcessExecutionBinding {
+        &self.binding
+    }
+
+    /// Returns lifecycle.
     pub const fn lifecycle(&self) -> ProcessLifecycle {
         self.lifecycle
     }
 
-    /// Returns the current health axis.
+    /// Returns health.
     pub const fn health(&self) -> &ProcessHealth {
         &self.health
     }
 
-    /// Returns the cancellation axis.
+    /// Returns cancellation status.
     pub const fn cancellation(&self) -> CancellationStatus {
         self.cancellation
     }
 
-    /// Returns the observed process identity.
+    /// Returns resumed process identity when available.
     pub const fn identity(&self) -> Option<&ProcessIdentity> {
         self.identity.as_ref()
     }
 
-    /// Returns the immutable exit observation.
+    /// Returns exit observation.
     pub const fn exit(&self) -> Option<&ExitStatus> {
         self.exit.as_ref()
     }
 
     /// Returns descendant evidence.
-    pub const fn descendants(&self) -> &DescendantEvidence {
-        &self.descendants
+    pub const fn descendants(&self) -> Option<&DescendantEvidence> {
+        self.descendants.as_ref()
     }
 
-    /// Returns the operation identity.
+    /// Returns operation identity.
     pub const fn operation_id(&self) -> &OperationId {
-        &self.operation_id
+        self.binding.operation_id()
     }
 
-    /// Returns the request digest.
+    /// Returns request digest.
     pub fn request_digest(&self) -> &str {
-        &self.request_digest
+        self.binding.request_digest()
     }
 
-    /// Returns the fence snapshot.
+    /// Returns the authenticated fence.
     pub const fn fence(&self) -> &FencingToken {
-        &self.fence
+        self.binding.state_fence()
+    }
+
+    fn validate_internal(&self) -> Result<(), ContractError> {
+        if let Some(identity) = &self.identity
+            && !self.binding.matches_identity(identity)
+        {
+            return Err(ContractError::EvidenceBindingMismatch);
+        }
+        if let (Some(identity), Some(descendants)) = (&self.identity, &self.descendants)
+            && !descendants.matches(&self.binding, identity)
+        {
+            return Err(ContractError::EvidenceBindingMismatch);
+        }
+        Ok(())
     }
 }
 
@@ -967,43 +1928,51 @@ impl ProcessExecutionView {
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProcessEvidence {
-    operation_id: OperationId,
-    request_digest: String,
     view: ProcessExecutionView,
     stdout_ref: Option<String>,
     stderr_ref: Option<String>,
+    axes: EvidenceAxes,
 }
 
 impl ProcessEvidence {
-    /// Creates evidence only when the view belongs to the same request.
+    /// Creates raw process evidence with C0-05 observation-only axes.
     pub fn new(
-        operation_id: OperationId,
-        request_digest: impl Into<String>,
         view: ProcessExecutionView,
         stdout_ref: Option<String>,
         stderr_ref: Option<String>,
+        axes: EvidenceAxes,
     ) -> Result<Self, ContractError> {
-        let request_digest = request_digest.into();
-        if view.operation_id != operation_id || view.request_digest != request_digest {
-            return Err(ContractError::EvidenceBindingMismatch);
+        view.validate_internal()?;
+        axes.validate().map_err(|_| ContractError::InvalidValue {
+            field: "evidence_axes",
+            reason: "C0-05 evidence axes are invalid",
+        })?;
+        if axes.status != EvidenceStatus::Observed
+            || axes.assertability != Assertability::NonAssertableUnverified
+        {
+            return Err(ContractError::EvidenceAuthorityEscalation);
         }
         Ok(Self {
-            operation_id,
-            request_digest,
             view,
             stdout_ref,
             stderr_ref,
+            axes,
         })
     }
 
-    /// Returns the operation identity.
-    pub const fn operation_id(&self) -> &OperationId {
-        &self.operation_id
+    /// Returns the exact binding through the view.
+    pub const fn binding(&self) -> &ProcessExecutionBinding {
+        self.view.binding()
     }
 
-    /// Returns the request digest.
+    /// Returns operation identity.
+    pub const fn operation_id(&self) -> &OperationId {
+        self.view.operation_id()
+    }
+
+    /// Returns request digest.
     pub fn request_digest(&self) -> &str {
-        &self.request_digest
+        self.view.request_digest()
     }
 
     /// Returns the process view.
@@ -1011,212 +1980,354 @@ impl ProcessEvidence {
         &self.view
     }
 
-    /// Returns the stdout evidence handle.
+    /// Returns stdout evidence handle.
     pub fn stdout_ref(&self) -> Option<&str> {
         self.stdout_ref.as_deref()
     }
 
-    /// Returns the stderr evidence handle.
+    /// Returns stderr evidence handle.
     pub fn stderr_ref(&self) -> Option<&str> {
         self.stderr_ref.as_deref()
     }
+
+    /// Returns C0-05 evidence axes.
+    pub const fn axes(&self) -> EvidenceAxes {
+        self.axes
+    }
 }
 
-/// Cancellation receipt from the implementation.
+/// Exact cancellation command binding.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CancellationRequest {
+    binding: ProcessExecutionBinding,
+}
+
+impl CancellationRequest {
+    /// Binds cancellation to the exact validated dispatch.
+    pub fn new(binding: ProcessExecutionBinding) -> Self {
+        Self { binding }
+    }
+
+    /// Returns the exact binding.
+    pub const fn binding(&self) -> &ProcessExecutionBinding {
+        &self.binding
+    }
+}
+
+/// Cancellation receipt bound to exact permit, authority, process, Job, image, and session.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CancellationReceipt {
-    operation_id: OperationId,
-    request_digest: String,
+    binding: ProcessExecutionBinding,
+    identity: Option<ProcessIdentity>,
     status: CancellationStatus,
     lifecycle: ProcessLifecycle,
     no_effect_proven: bool,
-    descendants: DescendantEvidence,
+    descendants: Option<DescendantEvidence>,
 }
 
 impl CancellationReceipt {
-    /// Returns the cancellation status.
+    /// Returns the exact authority/process binding.
+    pub const fn binding(&self) -> &ProcessExecutionBinding {
+        &self.binding
+    }
+
+    /// Returns cancellation status.
     pub const fn status(&self) -> CancellationStatus {
         self.status
     }
 
-    /// Returns whether no external effect was proven.
+    /// Returns lifecycle.
+    pub const fn lifecycle(&self) -> ProcessLifecycle {
+        self.lifecycle
+    }
+
+    /// Returns whether no physical effect was proven.
     pub const fn no_effect_proven(&self) -> bool {
         self.no_effect_proven
     }
 
     /// Returns descendant cleanup evidence.
-    pub const fn descendants(&self) -> &DescendantEvidence {
-        &self.descendants
+    pub const fn descendants(&self) -> Option<&DescendantEvidence> {
+        self.descendants.as_ref()
     }
 }
 
-/// A pure in-memory process state machine used by contract implementations and tests.
-#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+/// Pure process transition model after successful pre-resume validation.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProcessState {
-    request: ProcessRequest,
+    binding: ProcessExecutionBinding,
+    suspended_identity: SuspendedProcessIdentity,
     lifecycle: ProcessLifecycle,
     health: ProcessHealth,
     cancellation: CancellationStatus,
     identity: Option<ProcessIdentity>,
     exit: Option<ExitStatus>,
-    descendants: DescendantEvidence,
+    descendants: Option<DescendantEvidence>,
 }
 
 impl ProcessState {
-    /// Starts a state machine in `Created` without any physical side effect.
-    pub fn new(request: ProcessRequest) -> Result<Self, ContractError> {
-        request.validate()?;
-        Ok(Self {
-            request,
-            lifecycle: ProcessLifecycle::Created,
+    /// Starts in `Starting` only from an opaque consumed validation result.
+    pub fn from_validated(validated: &ValidatedDispatch) -> Self {
+        Self {
+            binding: validated.binding.clone(),
+            suspended_identity: validated.suspended_identity.clone(),
+            lifecycle: ProcessLifecycle::Starting,
             health: ProcessHealth::default(),
             cancellation: CancellationStatus::NotRequested,
             identity: None,
             exit: None,
-            descendants: DescendantEvidence::default(),
-        })
+            descendants: None,
+        }
     }
 
-    /// Returns the current view.
+    /// Returns a detached exact view.
     pub fn view(&self) -> ProcessExecutionView {
         ProcessExecutionView {
-            operation_id: self.request.operation_id.clone(),
-            process_tree_id: self.request.process_tree_id.clone(),
-            generation: self.request.generation,
-            request_digest: self.request.invocation_digest.clone(),
+            binding: self.binding.clone(),
             lifecycle: self.lifecycle,
             health: self.health.clone(),
             cancellation: self.cancellation,
             identity: self.identity.clone(),
             exit: self.exit.clone(),
             descendants: self.descendants.clone(),
-            fence: self.request.fence.clone(),
         }
     }
 
-    /// Returns the immutable request.
-    pub const fn request(&self) -> &ProcessRequest {
-        &self.request
+    /// Returns the exact validated binding.
+    pub const fn binding(&self) -> &ProcessExecutionBinding {
+        &self.binding
     }
 
-    /// Advances to a valid lifecycle state.
-    pub fn transition(&mut self, next: ProcessLifecycle) -> Result<(), ContractError> {
-        if !self.lifecycle.can_transition_to(next) {
+    /// Completes recovery start only from fresh P-02 evidence and a current
+    /// P-07/P-03 capability. A persisted [`ProcessStartReceipt`] is never
+    /// accepted as a substitute for these inputs.
+    pub fn recover_start(
+        &mut self,
+        observation: RecoveryObservation,
+        capability: &RecoveryCapability,
+        current: &DispatchValidationContext,
+        health: ProcessHealth,
+    ) -> Result<ProcessStartReceipt, ContractError> {
+        if self.lifecycle != ProcessLifecycle::Starting {
             return Err(ContractError::InvalidTransition {
                 from: self.lifecycle,
-                to: next,
+                to: ProcessLifecycle::Running,
             });
         }
-        self.lifecycle = next;
-        Ok(())
+        current.validate()?;
+        capability.validate(&self.binding, current)?;
+        let now = current.now_unix_ms()?;
+        if observation.observed_at_unix_ms > now
+            || now.saturating_sub(observation.observed_at_unix_ms) > MAX_RECOVERY_OBSERVATION_AGE_MS
+        {
+            return Err(ContractError::StaleRecoveryObservation);
+        }
+        if observation.state_fence != current.state_fence
+            || observation.state_fence != self.binding.state_fence
+            || observation.suspended_identity != self.suspended_identity
+        {
+            return Err(ContractError::RecoveryObservationMismatch);
+        }
+        self.mark_resumed(observation.observed_at_unix_ms, health)?;
+        ProcessStartReceipt::new(self)
     }
 
-    /// Records a launch identity and enters `Starting`.
-    pub fn start(&mut self, identity: ProcessIdentity) -> Result<(), ContractError> {
-        if identity.process_tree_id != self.request.process_tree_id
-            || identity.generation != self.request.generation
-            || identity.executable_sha256 != self.request.executable_sha256
-        {
+    /// Records that P-02 resumed the validated child.
+    pub fn mark_resumed(
+        &mut self,
+        resumed_at_unix_ms: u64,
+        health: ProcessHealth,
+    ) -> Result<(), ContractError> {
+        self.ensure_transition(ProcessLifecycle::Running)?;
+        let identity =
+            ProcessIdentity::after_resume(self.suspended_identity.clone(), resumed_at_unix_ms)?;
+        if !self.binding.matches_identity(&identity) {
             return Err(ContractError::IdentityMismatch);
         }
-        self.transition(ProcessLifecycle::Starting)?;
+        self.lifecycle = ProcessLifecycle::Running;
         self.identity = Some(identity);
-        Ok(())
-    }
-
-    /// Marks the process as running after an identity has been recorded.
-    pub fn mark_running(&mut self, health: ProcessHealth) -> Result<(), ContractError> {
-        if self.identity.is_none() {
-            return Err(ContractError::MissingIdentity);
-        }
-        self.transition(ProcessLifecycle::Running)?;
         self.health = health;
         Ok(())
     }
 
-    /// Records an exit and closes the process lifecycle.
+    /// Records a physical exit without overclaiming missing tree closure.
     pub fn exit(
         &mut self,
         exit: ExitStatus,
         descendants: DescendantEvidence,
     ) -> Result<(), ContractError> {
-        if self.identity.is_none() {
-            return Err(ContractError::MissingIdentity);
+        let identity = self
+            .identity
+            .as_ref()
+            .ok_or(ContractError::MissingIdentity)?;
+        if !descendants.matches(&self.binding, identity) {
+            return Err(ContractError::EvidenceBindingMismatch);
         }
-        if matches!(exit.disposition, ExitDisposition::Unknown)
-            || !descendants.complete()
-            || !descendants.tree_terminated()
+        let next = if exit.disposition == ExitDisposition::Unknown
+            || !descendants.complete
+            || !descendants.tree_terminated
         {
-            self.transition(ProcessLifecycle::UnknownOutcome)?;
+            ProcessLifecycle::UnknownOutcome
         } else {
-            self.transition(ProcessLifecycle::Exited)?;
-        }
+            ProcessLifecycle::Exited
+        };
+        self.ensure_transition(next)?;
+        let cancellation = match (self.cancellation, next) {
+            (CancellationStatus::InProgress, ProcessLifecycle::Exited) => {
+                CancellationStatus::Completed
+            }
+            (CancellationStatus::InProgress, ProcessLifecycle::UnknownOutcome) => {
+                CancellationStatus::UnknownOutcome
+            }
+            (status, _) => status,
+        };
+        self.lifecycle = next;
         self.exit = Some(exit);
-        self.descendants = descendants;
+        self.descendants = Some(descendants);
+        self.cancellation = cancellation;
         Ok(())
     }
 
-    /// Requests cancellation under the exact request fence.
-    pub fn cancel(&mut self, fence: &FencingToken) -> Result<CancellationReceipt, ContractError> {
-        if !self.request.fence.matches(fence) {
-            self.cancellation = CancellationStatus::RejectedStaleFence;
-            return Err(ContractError::StaleFence);
+    /// Requests cancellation under the exact validated binding.
+    ///
+    /// Unknown and invalid paths return before any state mutation.
+    pub fn cancel(
+        &mut self,
+        request: &CancellationRequest,
+    ) -> Result<CancellationReceipt, ContractError> {
+        if request.binding != self.binding {
+            return Err(ContractError::StaleStateFence);
         }
-        if self.lifecycle.is_terminal() {
-            return Ok(CancellationReceipt {
-                operation_id: self.request.operation_id.clone(),
-                request_digest: self.request.invocation_digest.clone(),
-                status: self.cancellation,
-                lifecycle: self.lifecycle,
-                no_effect_proven: matches!(self.lifecycle, ProcessLifecycle::Created),
-                descendants: self.descendants.clone(),
-            });
+        if self.lifecycle == ProcessLifecycle::UnknownOutcome {
+            return Err(ContractError::UnknownOutcomeRequiresReconciliation);
         }
-        if self.lifecycle == ProcessLifecycle::Cancelling {
-            return Ok(CancellationReceipt {
-                operation_id: self.request.operation_id.clone(),
-                request_digest: self.request.invocation_digest.clone(),
-                status: self.cancellation,
-                lifecycle: self.lifecycle,
-                no_effect_proven: false,
-                descendants: self.descendants.clone(),
-            });
+        if self.lifecycle.is_terminal() || self.lifecycle == ProcessLifecycle::Cancelling {
+            return Ok(self.cancellation_receipt());
         }
-        self.cancellation = CancellationStatus::Requested;
-        self.transition(ProcessLifecycle::Cancelling)?;
+        self.ensure_transition(ProcessLifecycle::Cancelling)?;
+        self.lifecycle = ProcessLifecycle::Cancelling;
         self.cancellation = CancellationStatus::InProgress;
-        Ok(CancellationReceipt {
-            operation_id: self.request.operation_id.clone(),
-            request_digest: self.request.invocation_digest.clone(),
-            status: self.cancellation,
-            lifecycle: self.lifecycle,
-            no_effect_proven: false,
-            descendants: self.descendants.clone(),
-        })
+        Ok(self.cancellation_receipt())
     }
 
-    /// Marks an unknown external effect reconciled with complete tree evidence.
+    /// Reconciles an unknown outcome only with exact, complete tree termination.
     pub fn reconcile(&mut self, descendants: DescendantEvidence) -> Result<(), ContractError> {
         if self.lifecycle != ProcessLifecycle::UnknownOutcome {
-            return Err(ContractError::InvalidValue {
-                field: "lifecycle",
-                reason: "only unknown outcomes require reconciliation",
-            });
+            return Err(ContractError::UnknownOutcomeRequiresReconciliation);
         }
-        if !descendants.complete() {
+        let identity = self
+            .identity
+            .as_ref()
+            .ok_or(ContractError::MissingIdentity)?;
+        if !descendants.matches(&self.binding, identity) {
+            return Err(ContractError::EvidenceBindingMismatch);
+        }
+        if !descendants.complete || !descendants.tree_terminated {
             return Err(ContractError::IncompleteDescendantEvidence);
         }
-        self.descendants = descendants;
-        self.lifecycle = ProcessLifecycle::Reconciled;
-        if matches!(
+        self.ensure_transition(ProcessLifecycle::Reconciled)?;
+        let cancellation = if matches!(
             self.cancellation,
             CancellationStatus::InProgress | CancellationStatus::UnknownOutcome
         ) {
-            self.cancellation = CancellationStatus::Completed;
-        }
+            CancellationStatus::Completed
+        } else {
+            self.cancellation
+        };
+        self.lifecycle = ProcessLifecycle::Reconciled;
+        self.descendants = Some(descendants);
+        self.cancellation = cancellation;
         Ok(())
+    }
+
+    fn ensure_transition(&self, next: ProcessLifecycle) -> Result<(), ContractError> {
+        if self.lifecycle.can_transition_to(next) {
+            Ok(())
+        } else {
+            Err(ContractError::InvalidTransition {
+                from: self.lifecycle,
+                to: next,
+            })
+        }
+    }
+
+    fn cancellation_receipt(&self) -> CancellationReceipt {
+        CancellationReceipt {
+            binding: self.binding.clone(),
+            identity: self.identity.clone(),
+            status: self.cancellation,
+            lifecycle: self.lifecycle,
+            no_effect_proven: self.lifecycle == ProcessLifecycle::Created,
+            descendants: self.descendants.clone(),
+        }
+    }
+}
+
+/// Receipt returned only after the validated suspended child was resumed.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProcessStartReceipt {
+    binding: ProcessExecutionBinding,
+    identity: ProcessIdentity,
+    lifecycle: ProcessLifecycle,
+}
+
+impl ProcessStartReceipt {
+    /// Creates a receipt from an exact running state.
+    pub fn new(state: &ProcessState) -> Result<Self, ContractError> {
+        if state.lifecycle != ProcessLifecycle::Running {
+            return Err(ContractError::ResumeNotObserved);
+        }
+        let identity = state
+            .identity
+            .clone()
+            .ok_or(ContractError::ResumeNotObserved)?;
+        if !state.binding.matches_identity(&identity) {
+            return Err(ContractError::IdentityMismatch);
+        }
+        Ok(Self {
+            binding: state.binding.clone(),
+            identity,
+            lifecycle: state.lifecycle,
+        })
+    }
+
+    /// Returns the exact authority/process binding.
+    pub const fn binding(&self) -> &ProcessExecutionBinding {
+        &self.binding
+    }
+
+    /// Returns the operation identity.
+    pub const fn operation_id(&self) -> &OperationId {
+        self.binding.operation_id()
+    }
+
+    /// Returns the request digest.
+    pub fn request_digest(&self) -> &str {
+        self.binding.request_digest()
+    }
+
+    /// Returns the permit digest.
+    pub fn permit_digest(&self) -> &str {
+        self.binding.permit_digest()
+    }
+
+    /// Returns the accepted generation.
+    pub const fn accepted_generation(&self) -> Generation {
+        self.binding.generation
+    }
+
+    /// Returns lifecycle.
+    pub const fn lifecycle(&self) -> ProcessLifecycle {
+        self.lifecycle
+    }
+
+    /// Returns exact resumed identity and resume time.
+    pub const fn identity(&self) -> &ProcessIdentity {
+        &self.identity
     }
 }
 
@@ -1226,91 +2337,36 @@ pub trait ProcessEvidenceSink: Send + Sync {
     fn record(&self, evidence: ProcessEvidence) -> Result<(), EvidenceSinkError>;
 }
 
-/// Provider-neutral executor boundary.  P-04 owns the physical implementation.
+/// Provider-neutral executor boundary. P-04 owns the sole Windows implementation.
 #[allow(async_fn_in_trait)]
 pub trait ProcessExecutor: Send + Sync {
-    /// Launches one immutable request through the implementation.
+    /// Launches one consuming request through pre-resume Kernel validation.
     async fn start(
         &self,
         request: ProcessRequest,
         sink: Arc<dyn ProcessEvidenceSink>,
     ) -> Result<ProcessStartReceipt, ProcessExecutionError>;
 
-    /// Inspects one operation without changing its request identity.
+    /// Inspects one operation.
     async fn inspect(
         &self,
         operation_id: OperationId,
     ) -> Result<ProcessExecutionView, ProcessExecutionError>;
 
-    /// Requests cancellation under the implementation's current fence.
+    /// Requests cancellation of one exact stored operation.
     async fn cancel(
         &self,
         operation_id: OperationId,
     ) -> Result<CancellationReceipt, ProcessExecutionError>;
 
-    /// Reconciles an operation after an unknown external result.
+    /// Reconciles one unknown external result.
     async fn reconcile(
         &self,
         operation_id: OperationId,
     ) -> Result<ProcessEvidence, ProcessExecutionError>;
 }
 
-/// Receipt returned after the physical implementation accepts a start.
-#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ProcessStartReceipt {
-    operation_id: OperationId,
-    request_digest: String,
-    accepted_generation: Generation,
-    lifecycle: ProcessLifecycle,
-}
-
-impl ProcessStartReceipt {
-    /// Creates a receipt bound to the exact request.
-    pub fn new(
-        request: &ProcessRequest,
-        lifecycle: ProcessLifecycle,
-    ) -> Result<Self, ContractError> {
-        request.validate()?;
-        if !matches!(
-            lifecycle,
-            ProcessLifecycle::Starting | ProcessLifecycle::Running
-        ) {
-            return Err(ContractError::InvalidValue {
-                field: "lifecycle",
-                reason: "start receipt must be starting or running",
-            });
-        }
-        Ok(Self {
-            operation_id: request.operation_id.clone(),
-            request_digest: request.invocation_digest.clone(),
-            accepted_generation: request.generation,
-            lifecycle,
-        })
-    }
-
-    /// Returns the operation identity.
-    pub const fn operation_id(&self) -> &OperationId {
-        &self.operation_id
-    }
-
-    /// Returns the request digest.
-    pub fn request_digest(&self) -> &str {
-        &self.request_digest
-    }
-
-    /// Returns the accepted generation.
-    pub const fn accepted_generation(&self) -> Generation {
-        self.accepted_generation
-    }
-
-    /// Returns the observed start lifecycle.
-    pub const fn lifecycle(&self) -> ProcessLifecycle {
-        self.lifecycle
-    }
-}
-
-/// Errors that belong to the process contract itself.
+/// Errors belonging to the P-03 process contract.
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
 pub enum ContractError {
     /// A field failed a structural or semantic constraint.
@@ -1321,7 +2377,7 @@ pub enum ContractError {
         /// Stable reason.
         reason: &'static str,
     },
-    /// An opaque value was empty, oversized or contained control bytes.
+    /// An opaque value was invalid.
     #[error("invalid opaque value in {field}")]
     InvalidOpaqueValue {
         /// Field name.
@@ -1335,19 +2391,19 @@ pub enum ContractError {
         /// Maximum accepted count.
         limit: usize,
     },
-    /// A duplicate value would make evidence ambiguous.
+    /// A duplicate value would make identity ambiguous.
     #[error("duplicate value in {field}")]
     DuplicateValue {
         /// Field name.
         field: &'static str,
     },
-    /// Secret material or a secret-like projection crossed the boundary.
+    /// Secret-like material crossed the plain boundary.
     #[error("secret boundary rejected {field}")]
     SecretBoundary {
         /// Field name.
         field: &'static str,
     },
-    /// The contract schema version is not supported.
+    /// Contract schema mismatch.
     #[error("schema version mismatch: expected {expected}, observed {observed}")]
     SchemaVersion {
         /// Expected version.
@@ -1355,18 +2411,47 @@ pub enum ContractError {
         /// Observed version.
         observed: String,
     },
-    /// The immutable request digest does not match its projection.
-    #[error("invocation digest mismatch: expected {expected}, observed {observed}")]
+    /// Immutable digest mismatch.
+    #[error("{field} mismatch: expected {expected}, observed {observed}")]
     DigestMismatch {
+        /// Digest field.
+        field: &'static str,
         /// Recomputed digest.
         expected: String,
         /// Stored digest.
         observed: String,
     },
-    /// Fencing fields disagree.
-    #[error("fencing token does not match request generation")]
+    /// Fence fields disagree.
+    #[error("state fence does not match generation or authority")]
     FenceMismatch,
-    /// The lifecycle transition is not admitted.
+    /// A Kernel-issued permit is required.
+    #[error("DISPATCH_PERMIT_REQUIRED")]
+    DispatchPermitRequired,
+    /// Permit authentication failed.
+    #[error("dispatch permit authentication failed")]
+    DispatchAuthenticationFailed,
+    /// A replay snapshot was recovered under the wrong authority identity.
+    #[error("dispatch authority identity mismatch")]
+    DispatchAuthorityMismatch,
+    /// Permit and immutable request do not bind the same effect.
+    #[error("dispatch permit binding mismatch")]
+    DispatchBindingMismatch,
+    /// A one-shot permit was already consumed.
+    #[error("dispatch permit was already consumed")]
+    DispatchPermitConsumed,
+    /// Permit freshness expired.
+    #[error("dispatch permit expired")]
+    ExpiredDispatchPermit,
+    /// The active State Fence changed.
+    #[error("STALE_STATE_FENCE")]
+    StaleStateFence,
+    /// The active authority epoch changed.
+    #[error("STALE_AUTHORITY_EPOCH")]
+    StaleAuthorityEpoch,
+    /// A required revision head changed.
+    #[error("dispatch permit revision heads are stale")]
+    StaleRevisionHeads,
+    /// Lifecycle transition is not admitted.
     #[error("invalid lifecycle transition from {from:?} to {to:?}")]
     InvalidTransition {
         /// Current state.
@@ -1374,50 +2459,65 @@ pub enum ContractError {
         /// Requested state.
         to: ProcessLifecycle,
     },
-    /// The identity is not compatible with the request.
-    #[error("process identity does not match request")]
+    /// Physical identity differs from the permitted contour.
+    #[error("process, Job, image, session, or generation identity mismatch")]
     IdentityMismatch,
-    /// A physical identity was required but not observed.
+    /// A resumed identity was required.
     #[error("process identity is missing")]
     MissingIdentity,
-    /// Cancellation was attempted under a stale fence.
-    #[error("stale fencing token")]
-    StaleFence,
-    /// Reconciliation did not prove complete descendant observation.
-    #[error("descendant evidence is incomplete")]
+    /// Resume has not been observed.
+    #[error("validated child resume has not been observed")]
+    ResumeNotObserved,
+    /// Recovery capability did not bind to the current P-03 state.
+    #[error("recovery capability does not bind to current process authority")]
+    RecoveryCapabilityMismatch,
+    /// Recovery observation did not bind to the current fence/identity.
+    #[error("recovery observation does not bind to current process state")]
+    RecoveryObservationMismatch,
+    /// Recovery observation is too old or from the future.
+    #[error("recovery observation is stale")]
+    StaleRecoveryObservation,
+    /// Reconciliation lacks complete terminated-tree evidence.
+    #[error("descendant evidence is incomplete or tree termination is unproven")]
     IncompleteDescendantEvidence,
-    /// Evidence was attributed to a different operation/request.
+    /// Evidence belongs to another exact binding.
     #[error("evidence binding mismatch")]
     EvidenceBindingMismatch,
-    /// Stable JSON serialisation failed.
-    #[error("contract serialisation failed: {0}")]
+    /// Raw evidence attempted to claim semantic authority.
+    #[error("process evidence must remain observation-only")]
+    EvidenceAuthorityEscalation,
+    /// Unknown outcomes must be reconciled before another transition.
+    #[error("unknown outcome requires reconciliation")]
+    UnknownOutcomeRequiresReconciliation,
+    /// Stable serialization failed.
+    #[error("contract serialization failed: {0}")]
     Serialization(String),
 }
 
-/// Sink failures are intentionally opaque to the process contract.
+/// Sink failures are opaque to the process contract.
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
 #[error("evidence sink rejected record: {message}")]
 pub struct EvidenceSinkError {
-    /// Stable category/message without raw process output.
+    /// Stable category/message without raw output.
     pub message: String,
 }
 
-/// Errors exposed by a physical `ProcessExecutor` implementation.
+/// Errors exposed by a physical executor.
 #[derive(Debug, Error)]
 pub enum ProcessExecutionError {
-    /// Request failed contract validation before any side effect.
+    /// Contract validation failed before resume.
     #[error(transparent)]
     Contract(#[from] ContractError),
-    /// The operation is not known to the implementation.
+    /// Operation is unknown.
     #[error("operation not found")]
     NotFound,
-    /// A physical executor is unavailable.
+    /// Physical executor is unavailable.
     #[error("process executor unavailable: {0}")]
     Unavailable(String),
-    /// The evidence sink rejected an otherwise valid record.
+    /// Evidence sink rejected a record.
     #[error(transparent)]
     EvidenceSink(#[from] EvidenceSinkError),
-    /// The external effect cannot yet be classified.
+    /// External outcome requires reconciliation.
     #[error("process outcome is unknown and requires reconciliation")]
     UnknownOutcome,
 }
@@ -1436,6 +2536,63 @@ fn validate_environment_name(name: &str) -> Result<(), ContractError> {
         });
     }
     Ok(())
+}
+
+fn validate_revision_heads(heads: &BTreeMap<String, String>) -> Result<(), ContractError> {
+    if heads.is_empty() || heads.len() > MAX_REVISION_HEADS {
+        return Err(ContractError::InvalidValue {
+            field: "revision_heads",
+            reason: "must be non-empty and bounded",
+        });
+    }
+    for (name, digest) in heads {
+        validate_opaque_id("revision_head_name", name.clone())?;
+        validate_hex_digest("revision_head_digest", digest)?;
+    }
+    Ok(())
+}
+
+fn validate_replay_nonces(field: &'static str, nonces: &[String]) -> Result<(), ContractError> {
+    if nonces.len() > MAX_REPLAY_NONCES {
+        return Err(ContractError::LimitExceeded {
+            field,
+            limit: MAX_REPLAY_NONCES,
+        });
+    }
+    let mut unique = BTreeSet::new();
+    for nonce in nonces {
+        validate_opaque_id(field, nonce.clone())?;
+        if !unique.insert(nonce) {
+            return Err(ContractError::DuplicateValue { field });
+        }
+    }
+    Ok(())
+}
+
+fn validate_hex_digest(field: &'static str, value: &str) -> Result<(), ContractError> {
+    if value.len() != 64 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(ContractError::InvalidValue {
+            field,
+            reason: "must be a 64-character hexadecimal digest",
+        });
+    }
+    Ok(())
+}
+
+fn validate_stored_digest(
+    field: &'static str,
+    observed: &str,
+    expected: String,
+) -> Result<(), ContractError> {
+    if observed == expected {
+        Ok(())
+    } else {
+        Err(ContractError::DigestMismatch {
+            field,
+            expected,
+            observed: observed.to_owned(),
+        })
+    }
 }
 
 fn is_secret_like(name: &str) -> bool {
@@ -1458,9 +2615,23 @@ fn looks_like_secret_value(value: &str) -> bool {
     lower.contains("bearer ") || lower.contains("sk-") || lower.contains("-----begin ")
 }
 
-fn contains_secret_like_text(value: &str) -> bool {
-    let lower = value.to_ascii_lowercase();
-    lower.contains("password=") || lower.contains("token=") || lower.contains("secret=")
+fn hash_serialized<T: Serialize>(value: &T) -> Result<String, ContractError> {
+    let bytes = serde_json::to_vec(value)
+        .map_err(|error| ContractError::Serialization(error.to_string()))?;
+    Ok(hash_bytes(&bytes))
+}
+
+fn keyed_hash_serialized<T: Serialize>(key: &[u8; 32], value: &T) -> Result<String, ContractError> {
+    let bytes = serde_json::to_vec(value)
+        .map_err(|error| ContractError::Serialization(error.to_string()))?;
+    Ok(blake3::keyed_hash(key, &bytes).to_hex().to_string())
+}
+
+fn permit_digest<T: Serialize>(
+    unsigned: &T,
+    authentication_tag: &str,
+) -> Result<String, ContractError> {
+    hash_serialized(&(unsigned, authentication_tag))
 }
 
 fn hash_bytes(bytes: &[u8]) -> String {
@@ -1477,182 +2648,460 @@ impl fmt::Display for Generation {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use eliot_instrument_api::{Accessibility, Influence, PhysicalState, TaintState};
     use std::error::Error;
 
-    fn request() -> Result<ProcessRequest, ContractError> {
-        let operation = OperationId::new("op-1")?;
-        let tree = ProcessTreeId::new("tree-1")?;
-        let generation = Generation::new(1)?;
-        let fence = FencingToken::new(1, generation, "nonce-1")?;
-        let environment = EnvironmentProjection::new(
-            BTreeMap::from([(String::from("PATH"), String::from("C:\\Windows"))]),
-            vec![SecretRef::new("credential_manager", "provider/token")?],
-            EnvironmentInheritance::None,
-        )?;
-        ProcessRequest::new(
-            operation,
-            tree,
-            generation,
+    type TestResult<T = ()> = Result<T, Box<dyn Error>>;
+
+    fn revisions() -> BTreeMap<String, String> {
+        BTreeMap::from([
+            ("authority".to_owned(), "a".repeat(64)),
+            ("state".to_owned(), "b".repeat(64)),
+        ])
+    }
+
+    fn intent() -> Result<ProcessIntent, ContractError> {
+        ProcessIntent::new(
+            OperationId::new("op-1")?,
+            ProcessTreeId::new("tree-1")?,
+            JobId::new("job-1")?,
+            ImageId::new("image-file-id-1")?,
+            SessionId::new("session-1")?,
+            Generation::new(1)?,
             "C:\\tools\\worker.exe",
-            "a".repeat(64),
+            "c".repeat(64),
             vec!["--check".to_owned()],
             "C:\\work",
-            environment,
-            ResourceLimits::new(10_000, Some(5_000), Some(1024 * 1024), 4096, 4096, 4)?,
-            fence,
+            EnvironmentProjection::new(
+                BTreeMap::from([("PATH".to_owned(), "C:\\Windows".to_owned())]),
+                vec![SecretRef::new("credential_manager", "provider/token")?],
+                EnvironmentInheritance::None,
+            )?,
+            ResourceLimits::new(10_000, Some(5_000), Some(1_048_576), 4096, 4096, 4)?,
         )
     }
 
-    fn identity(request: &ProcessRequest) -> Result<ProcessIdentity, ContractError> {
-        ProcessIdentity::new(
-            ProcessId::new("pid-1")?,
-            request.process_tree_id.clone(),
-            request.generation,
-            42,
-            10,
-            request.executable_sha256.clone(),
+    fn fence() -> Result<FencingToken, ContractError> {
+        FencingToken::new(7, Generation::new(1)?, "fence-7-1")
+    }
+
+    fn authority() -> Result<DispatchPermitAuthority, ContractError> {
+        Ok(DispatchPermitAuthority::activate(
+            DispatchAuthorityId::new("kernel-authority-7")?,
+            KernelDispatchKey::from_secret_bytes([0x5a; 32])?,
+        ))
+    }
+
+    fn issuance(nonce: &str) -> Result<PermitIssuance, ContractError> {
+        PermitIssuance::new(
+            ActionLeaseRef::new("lease-1")?,
+            fence()?,
+            revisions(),
+            100,
+            200,
+            nonce,
+        )
+    }
+
+    fn context(now: i64) -> Result<DispatchValidationContext, ContractError> {
+        DispatchValidationContext::new(
+            ClockObservation {
+                valid_time_ms: Some(now),
+                known_time_ms: Some(now),
+                transaction_sequence: None,
+                monotonic_ns: Some(1),
+            },
+            fence()?,
+            7,
+            revisions(),
+            41,
+        )
+    }
+
+    fn observed(intent: &ProcessIntent) -> Result<SuspendedProcessIdentity, ContractError> {
+        SuspendedProcessIdentity::new(
+            ProcessId::new("process-1")?,
+            intent.process_tree_id.clone(),
+            intent.job_id.clone(),
+            intent.image_id.clone(),
+            intent.session_id.clone(),
+            intent.generation,
+            4242,
+            120,
+            intent.executable_sha256.clone(),
+        )
+    }
+
+    fn replay(permit: &DispatchPermit) -> DispatchPermit {
+        DispatchPermit {
+            schema_version: permit.schema_version.clone(),
+            authority_id: permit.authority_id.clone(),
+            operation_id: permit.operation_id.clone(),
+            process_tree_id: permit.process_tree_id.clone(),
+            job_id: permit.job_id.clone(),
+            image_id: permit.image_id.clone(),
+            session_id: permit.session_id.clone(),
+            generation: permit.generation,
+            action_lease_ref: permit.action_lease_ref.clone(),
+            state_fence: permit.state_fence.clone(),
+            expected_revision_heads: permit.expected_revision_heads.clone(),
+            effect_digest: permit.effect_digest.clone(),
+            issued_at_unix_ms: permit.issued_at_unix_ms,
+            expires_at_unix_ms: permit.expires_at_unix_ms,
+            one_shot_nonce: permit.one_shot_nonce.clone(),
+            authentication_tag: permit.authentication_tag.clone(),
+            permit_digest: permit.permit_digest.clone(),
+        }
+    }
+
+    fn validated() -> Result<(DispatchPermitAuthority, ValidatedDispatch), ContractError> {
+        let mut authority = authority()?;
+        let intent = intent()?;
+        let permit = authority.issue(&intent, issuance("nonce-1")?)?;
+        let request = ProcessRequest::new(intent.clone(), permit)?;
+        let validated =
+            authority.validate_and_consume(request, observed(&intent)?, &context(150)?)?;
+        Ok((authority, validated))
+    }
+
+    fn running_state() -> Result<ProcessState, ContractError> {
+        let (_, validated) = validated()?;
+        let mut state = ProcessState::from_validated(&validated);
+        state.mark_resumed(
+            151,
+            ProcessHealth::new(ProcessHealthStatus::Healthy, true, 151, None)?,
+        )?;
+        Ok(state)
+    }
+
+    fn descendants(
+        state: &ProcessState,
+        complete: bool,
+        tree_terminated: bool,
+    ) -> Result<DescendantEvidence, ContractError> {
+        let identity = state
+            .identity
+            .as_ref()
+            .ok_or(ContractError::MissingIdentity)?;
+        DescendantEvidence::new(
+            state.binding.clone(),
+            identity.process_id().clone(),
+            vec![ProcessId::new("descendant-1")?],
+            complete,
+            tree_terminated,
+            Some("raw-evidence:tree-1".to_owned()),
         )
     }
 
     #[test]
-    fn request_roundtrips_and_digest_is_stable() -> Result<(), Box<dyn Error>> {
-        let request = request()?;
-        request.validate()?;
-        let json = serde_json::to_string(&request)?;
-        let decoded: ProcessRequest = serde_json::from_str(&json)?;
-        assert_eq!(request, decoded);
-        assert_eq!(request.invocation_digest(), decoded.invocation_digest());
+    fn permit_is_authenticated_consuming_and_single_use() -> TestResult {
+        let mut authority = authority()?;
+        let intent = intent()?;
+        let permit = authority.issue(&intent, issuance("single-use")?)?;
+        let replay = replay(&permit);
+        let first = ProcessRequest::new(intent.clone(), permit)?;
+        let second = ProcessRequest::new(intent.clone(), replay)?;
+        let accepted = authority.validate_and_consume(first, observed(&intent)?, &context(150)?)?;
+        assert_eq!(accepted.binding().validation_revision(), 41);
+        assert_eq!(authority.consumed_permit_count(), 1);
+        assert!(matches!(
+            authority.validate_and_consume(second, observed(&intent)?, &context(150)?),
+            Err(ContractError::DispatchPermitConsumed)
+        ));
+        assert_eq!(authority.consumed_permit_count(), 1);
         Ok(())
     }
 
     #[test]
-    fn tampered_request_digest_is_rejected() -> Result<(), Box<dyn Error>> {
-        let request = request()?;
-        let mut value = serde_json::to_value(request)?;
-        value["argv"] = serde_json::json!(["--tampered"]);
-        let decoded: ProcessRequest = serde_json::from_value(value)?;
+    fn stale_and_tampered_permits_fail_before_nonce_mutation() -> TestResult {
+        let mut authority = authority()?;
+        let intent = intent()?;
+        let mut permit = authority.issue(&intent, issuance("tampered")?)?;
+        let replacement = if permit.authentication_tag.starts_with('0') {
+            "1"
+        } else {
+            "0"
+        };
+        permit.authentication_tag.replace_range(..1, replacement);
         assert!(matches!(
-            decoded.validate(),
-            Err(ContractError::DigestMismatch { .. })
+            ProcessRequest::new(intent.clone(), permit),
+            Err(ContractError::DigestMismatch {
+                field: "permit_digest",
+                ..
+            })
+        ));
+        assert_eq!(authority.consumed_permit_count(), 0);
+
+        let permit = authority.issue(&intent, issuance("expired")?)?;
+        let request = ProcessRequest::new(intent.clone(), permit)?;
+        assert!(matches!(
+            authority.validate_and_consume(request, observed(&intent)?, &context(200)?),
+            Err(ContractError::ExpiredDispatchPermit)
+        ));
+        assert_eq!(authority.consumed_permit_count(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn consumed_nonce_survives_authority_recovery() -> TestResult {
+        let mut authority = authority()?;
+        let intent = intent()?;
+        let permit = authority.issue(&intent, issuance("recoverable")?)?;
+        let replay = replay(&permit);
+        let request = ProcessRequest::new(intent.clone(), permit)?;
+        let _ = authority.validate_and_consume(request, observed(&intent)?, &context(150)?)?;
+        let snapshot = authority.replay_snapshot();
+        drop(authority);
+
+        let mut recovered = DispatchPermitAuthority::recover(
+            DispatchAuthorityId::new("kernel-authority-7")?,
+            KernelDispatchKey::from_secret_bytes([0x5a; 32])?,
+            snapshot,
+        )?;
+        let replay_request = ProcessRequest::new(intent.clone(), replay)?;
+        assert!(matches!(
+            recovered.validate_and_consume(replay_request, observed(&intent)?, &context(150)?),
+            Err(ContractError::DispatchPermitConsumed)
+        ));
+        assert_eq!(recovered.consumed_permit_count(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn replay_snapshot_rejects_duplicate_or_invalid_wire_entries() -> TestResult {
+        let authority = authority()?;
+        let snapshot = authority.replay_snapshot();
+        let mut value = serde_json::to_value(snapshot)?;
+        value["issued_nonces"] = serde_json::json!(["nonce-1", "nonce-1"]);
+        let duplicate: DispatchPermitReplaySnapshot = serde_json::from_value(value)?;
+        assert!(matches!(
+            duplicate.validate(),
+            Err(ContractError::DuplicateValue {
+                field: "issued_nonces"
+            })
+        ));
+
+        let invalid = DispatchPermitReplaySnapshot {
+            authority_id: DispatchAuthorityId("bad\n authority".to_owned()),
+            issued_nonces: vec!["nonce-1".to_owned()],
+            consumed_nonces: vec!["nonce-2".to_owned()],
+            replay_revision: 0,
+        };
+        assert!(matches!(
+            invalid.validate(),
+            Err(ContractError::InvalidOpaqueValue {
+                field: "dispatch_authority_id"
+            })
         ));
         Ok(())
     }
 
     #[test]
-    fn secret_like_environment_is_rejected() {
-        let result = EnvironmentProjection::new(
-            BTreeMap::from([(String::from("ACCESS_TOKEN"), String::from("hidden"))]),
-            Vec::new(),
-            EnvironmentInheritance::None,
+    fn recovery_start_requires_current_capability_fence_and_fresh_p02_observation() -> TestResult {
+        let (authority, validated) = validated()?;
+        let mut state = ProcessState::from_validated(&validated);
+        let current = context(151)?;
+        let capability = authority.issue_recovery_capability(
+            validated.binding().clone(),
+            "p07-recovery-1",
+            &current,
+        )?;
+        let observation = RecoveryObservation::new(
+            validated.suspended_identity().clone(),
+            current.state_fence.clone(),
+            151,
+        )?;
+        let receipt = state.recover_start(
+            observation,
+            &capability,
+            &current,
+            ProcessHealth::new(ProcessHealthStatus::Healthy, true, 151, None)?,
+        )?;
+        assert_eq!(receipt.lifecycle(), ProcessLifecycle::Running);
+        Ok(())
+    }
+
+    #[test]
+    fn identity_mismatch_fails_closed_before_resume() -> TestResult {
+        let mut authority = authority()?;
+        let intent = intent()?;
+        let permit = authority.issue(&intent, issuance("identity")?)?;
+        let request = ProcessRequest::new(intent.clone(), permit)?;
+        let mut wrong = observed(&intent)?;
+        wrong.job_id = JobId::new("other-job")?;
+        assert!(matches!(
+            authority.validate_and_consume(request, wrong, &context(150)?),
+            Err(ContractError::IdentityMismatch)
+        ));
+        assert_eq!(authority.consumed_permit_count(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn start_receipt_binds_permit_revision_and_all_physical_identities() -> TestResult {
+        let (_, validated) = validated()?;
+        let mut state = ProcessState::from_validated(&validated);
+        assert!(matches!(
+            ProcessStartReceipt::new(&state),
+            Err(ContractError::ResumeNotObserved)
+        ));
+        state.mark_resumed(
+            151,
+            ProcessHealth::new(ProcessHealthStatus::Healthy, true, 151, None)?,
+        )?;
+        let receipt = ProcessStartReceipt::new(&state)?;
+        assert_eq!(receipt.binding(), validated.binding());
+        assert_eq!(receipt.identity().job_id(), validated.binding().job_id());
+        assert_eq!(
+            receipt.identity().image_id(),
+            validated.binding().image_id()
         );
-        assert!(matches!(result, Err(ContractError::SecretBoundary { .. })));
-    }
-
-    #[test]
-    fn lifecycle_and_cancellation_are_fenced() -> Result<(), Box<dyn Error>> {
-        let mut state = ProcessState::new(request()?)?;
-        let identity = identity(state.request())?;
-        state.start(identity)?;
-        state.mark_running(ProcessHealth::new(
-            ProcessHealthStatus::Healthy,
-            true,
-            11,
-            None,
-        )?)?;
-        let stale_fence = FencingToken::new(2, state.request().generation, "nonce-2")?;
-        assert!(matches!(
-            state.cancel(&stale_fence),
-            Err(ContractError::StaleFence)
-        ));
-        let fence = state.request().fence().clone();
-        let receipt = state.cancel(&fence)?;
-        assert_eq!(receipt.status(), CancellationStatus::InProgress);
-        assert_eq!(state.view().lifecycle(), ProcessLifecycle::Cancelling);
+        assert_eq!(
+            receipt.identity().session_id(),
+            validated.binding().session_id()
+        );
+        assert_eq!(receipt.identity().resumed_at_unix_ms(), 151);
+        assert_eq!(receipt.binding().validation_revision(), 41);
         Ok(())
     }
 
     #[test]
-    fn invalid_transition_is_rejected() -> Result<(), Box<dyn Error>> {
-        let mut state = ProcessState::new(request()?)?;
+    fn reconcile_requires_complete_terminated_exact_tree() -> TestResult {
+        let mut state = running_state()?;
+        state.exit(
+            ExitStatus::new(ExitDisposition::Unknown, None, None, 160)?,
+            descendants(&state, false, false)?,
+        )?;
+        let before = state.view();
         assert!(matches!(
-            state.transition(ProcessLifecycle::Exited),
-            Err(ContractError::InvalidTransition { .. })
-        ));
-        Ok(())
-    }
-
-    #[test]
-    fn unknown_exit_requires_complete_reconciliation() -> Result<(), Box<dyn Error>> {
-        let mut state = ProcessState::new(request()?)?;
-        let process_identity = identity(state.request())?;
-        state.start(process_identity)?;
-        state.mark_running(ProcessHealth::default())?;
-        let exit = ExitStatus::new(ExitDisposition::Unknown, None, None, 20)?;
-        state.exit(exit, DescendantEvidence::default())?;
-        assert!(matches!(
-            state.reconcile(DescendantEvidence::default()),
+            state.reconcile(descendants(&state, true, false)?),
             Err(ContractError::IncompleteDescendantEvidence)
         ));
-        let evidence =
-            DescendantEvidence::new(Vec::new(), true, true, Some("evidence:1".to_owned()))?;
-        state.reconcile(evidence)?;
+        assert_eq!(state.view(), before);
+        state.reconcile(descendants(&state, true, true)?)?;
         assert_eq!(state.view().lifecycle(), ProcessLifecycle::Reconciled);
         Ok(())
     }
 
     #[test]
-    fn ordinary_exit_requires_complete_terminated_tree() -> Result<(), Box<dyn Error>> {
-        for descendants in [
-            DescendantEvidence::default(),
-            DescendantEvidence::new(Vec::new(), true, false, None)?,
-        ] {
-            let mut state = ProcessState::new(request()?)?;
-            state.start(identity(state.request())?)?;
-            state.mark_running(ProcessHealth::default())?;
-            state.exit(
-                ExitStatus::new(ExitDisposition::Completed, Some(0), None, 20)?,
-                descendants,
-            )?;
-            assert_eq!(state.view().lifecycle(), ProcessLifecycle::UnknownOutcome);
-        }
-        Ok(())
-    }
-
-    #[test]
-    fn repeated_cancel_while_cancelling_is_idempotent() -> Result<(), Box<dyn Error>> {
-        let mut state = ProcessState::new(request()?)?;
-        state.start(identity(state.request())?)?;
-        state.mark_running(ProcessHealth::default())?;
-        let fence = state.request().fence().clone();
-        let first = state.cancel(&fence)?;
-        let second = state.cancel(&fence)?;
-        assert_eq!(first, second);
-        assert_eq!(state.view().lifecycle(), ProcessLifecycle::Cancelling);
-        assert_eq!(state.view().cancellation(), CancellationStatus::InProgress);
-        Ok(())
-    }
-
-    #[test]
-    fn unknown_wire_fields_fail_closed() -> Result<(), Box<dyn Error>> {
-        let mut value = serde_json::to_value(request()?)?;
-        value["secret_value"] = serde_json::json!("must-not-be-accepted");
-        let result = serde_json::from_value::<ProcessRequest>(value);
-        assert!(result.is_err());
-        Ok(())
-    }
-
-    #[test]
-    fn duplicate_descendant_and_invalid_exit_are_rejected() -> Result<(), Box<dyn Error>> {
-        let process_id = ProcessId::new("pid-1")?;
+    fn cancel_unknown_outcome_has_no_partial_state() -> TestResult {
+        let mut state = running_state()?;
+        state.exit(
+            ExitStatus::new(ExitDisposition::Unknown, None, None, 160)?,
+            descendants(&state, false, false)?,
+        )?;
+        let before = state.view();
+        let cancel = CancellationRequest::new(state.binding.clone());
         assert!(matches!(
-            DescendantEvidence::new(vec![process_id.clone(), process_id], true, true, None),
+            state.cancel(&cancel),
+            Err(ContractError::UnknownOutcomeRequiresReconciliation)
+        ));
+        assert_eq!(state.view(), before);
+        Ok(())
+    }
+
+    #[test]
+    fn exact_tree_exit_completes_in_progress_cancellation() -> TestResult {
+        let mut state = running_state()?;
+        let request = CancellationRequest::new(state.binding.clone());
+        assert_eq!(
+            state.cancel(&request)?.status(),
+            CancellationStatus::InProgress
+        );
+        state.exit(
+            ExitStatus::new(ExitDisposition::Cancelled, None, None, 160)?,
+            descendants(&state, true, true)?,
+        )?;
+        assert_eq!(state.view().lifecycle(), ProcessLifecycle::Exited);
+        assert_eq!(state.view().cancellation(), CancellationStatus::Completed);
+        Ok(())
+    }
+
+    #[test]
+    fn incomplete_cancel_exit_becomes_unknown_until_exact_reconciliation() -> TestResult {
+        let mut state = running_state()?;
+        let request = CancellationRequest::new(state.binding.clone());
+        state.cancel(&request)?;
+        state.exit(
+            ExitStatus::new(ExitDisposition::Unknown, None, None, 160)?,
+            descendants(&state, false, false)?,
+        )?;
+        assert_eq!(state.view().lifecycle(), ProcessLifecycle::UnknownOutcome);
+        assert_eq!(
+            state.view().cancellation(),
+            CancellationStatus::UnknownOutcome
+        );
+        state.reconcile(descendants(&state, true, true)?)?;
+        assert_eq!(state.view().lifecycle(), ProcessLifecycle::Reconciled);
+        assert_eq!(state.view().cancellation(), CancellationStatus::Completed);
+        Ok(())
+    }
+
+    #[test]
+    fn mismatched_cancel_and_evidence_fail_without_state_change() -> TestResult {
+        let mut state = running_state()?;
+        let before = state.view();
+        let mut wrong = state.binding.clone();
+        wrong.session_id = SessionId::new("wrong-session")?;
+        assert!(matches!(
+            state.cancel(&CancellationRequest::new(wrong)),
+            Err(ContractError::StaleStateFence)
+        ));
+        assert_eq!(state.view(), before);
+
+        let mut mismatched_view = state.view();
+        mismatched_view.binding.job_id = JobId::new("wrong-job")?;
+        assert!(matches!(
+            ProcessEvidence::new(mismatched_view, None, None, EvidenceAxes::observed()),
+            Err(ContractError::EvidenceBindingMismatch)
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn process_evidence_cannot_promote_itself() -> TestResult {
+        let state = running_state()?;
+        let mut axes = EvidenceAxes::observed();
+        axes.status = EvidenceStatus::Verified;
+        axes.assertability = Assertability::Assertable;
+        assert!(matches!(
+            ProcessEvidence::new(state.view(), None, None, axes),
+            Err(ContractError::EvidenceAuthorityEscalation)
+        ));
+        let evidence = ProcessEvidence::new(
+            state.view(),
+            Some("raw:stdout".to_owned()),
+            Some("raw:stderr".to_owned()),
+            EvidenceAxes {
+                status: EvidenceStatus::Observed,
+                assertability: Assertability::NonAssertableUnverified,
+                accessibility: Accessibility::Available,
+                influence: Influence::Allowed,
+                physical: PhysicalState::Present,
+                taint: TaintState::Clear,
+            },
+        )?;
+        assert_eq!(evidence.binding(), state.binding());
+        Ok(())
+    }
+
+    #[test]
+    fn secret_and_duplicate_boundaries_remain_fail_closed() -> TestResult {
+        assert!(matches!(
+            EnvironmentProjection::new(
+                BTreeMap::from([("ACCESS_TOKEN".to_owned(), "hidden".to_owned())]),
+                Vec::new(),
+                EnvironmentInheritance::None,
+            ),
+            Err(ContractError::SecretBoundary { .. })
+        ));
+        let mut authority = authority()?;
+        let intent = intent()?;
+        let _ = authority.issue(&intent, issuance("duplicate")?)?;
+        assert!(matches!(
+            authority.issue(&intent, issuance("duplicate")?),
             Err(ContractError::DuplicateValue { .. })
         ));
-        assert!(matches!(
-            ExitStatus::new(ExitDisposition::Signalled, Some(1), None, 1),
-            Err(ContractError::InvalidValue { .. })
-        ));
-        assert!(ResourceLimits::new(0, None, None, 1, 1, 0).is_err());
         Ok(())
     }
 }

@@ -18,11 +18,12 @@ use crate::{
     GenerationCutoverRecord, GenerationTransition, GenerationTransitionReceipt, JobCheckpoint,
     KernelAuthoritySnapshot, OpaqueLabel, OperationalControlProjection, OperationalMutationReceipt,
     OperationalPhase, OperationalRecordInput, OrsError, OrsSnapshotReceipt, OrsSnapshotRequest,
-    PendingOperationPage, RecoveryCursor, RecoveryInboxDisposition, RecoveryInboxItem,
-    RecoveryInboxReceipt, RecoveryPage, RecoveryPayloadEnvelope, ReservationRecord,
-    ReservationRequest, ReservationState, ReservedScope, RetryState, ScopeTerminalReceipt,
-    ScopeTerminalView, SessionBindingReceipt, SessionDetach, StageReceipt, StagedOperation,
-    UserBrokerFence, UserBrokerRegistration, UserBrokerRegistrationReceipt, WriterReservationToken,
+    PendingOperationPage, RecoveredAuthoritySnapshot, RecoveryCursor, RecoveryInboxDisposition,
+    RecoveryInboxItem, RecoveryInboxReceipt, RecoveryPage, RecoveryPayloadEnvelope,
+    ReservationRecord, ReservationRequest, ReservationState, ReservedScope, RetryState,
+    ScopeTerminalReceipt, ScopeTerminalView, SessionBindingReceipt, SessionDetach, StageReceipt,
+    StagedOperation, UserBrokerFence, UserBrokerRegistration, UserBrokerRegistrationReceipt,
+    WriterReservationToken,
 };
 
 const META: TableDefinition<&str, &str> = TableDefinition::new("ors_meta_v1");
@@ -220,6 +221,12 @@ pub trait OperationalRecoveryStore: Send + Sync {
         &self,
         snapshot: KernelAuthoritySnapshot,
     ) -> Result<AuthoritySnapshotReceipt, OrsError>;
+    /// Loads one active opaque authority snapshot with fresh ORS integrity
+    /// validation. The returned value is not Kernel authority.
+    fn load_authority_snapshot(
+        &self,
+        subject_id: &crate::OperationIdentity,
+    ) -> Result<Option<RecoveredAuthoritySnapshot>, OrsError>;
     fn revoke_authority(
         &self,
         revocation: AuthorityRevocation,
@@ -1413,6 +1420,37 @@ impl OperationalRecoveryStore for RedbRecoveryStore {
             OperationalPhase::Active,
         )
         .map(AuthoritySnapshotReceipt::from_receipt)
+    }
+
+    fn load_authority_snapshot(
+        &self,
+        subject_id: &crate::OperationIdentity,
+    ) -> Result<Option<RecoveredAuthoritySnapshot>, OrsError> {
+        let key = Self::operational_key(OperationalKind::AuthoritySnapshot, subject_id);
+        let read = self.database.begin_read().map_err(storage)?;
+        let current = read.open_table(OPERATIONAL_CURRENT).map_err(storage)?;
+        let Some(value) = current.get(key.as_str()).map_err(storage)? else {
+            return Ok(None);
+        };
+        let record: DurableOperationalRecord = decode_named(value.value(), "operational_current")?;
+        if record.kind != OperationalKind::AuthoritySnapshot
+            || record.phase != OperationalPhase::Active
+            || &record.input.subject_id != subject_id
+        {
+            return Err(OrsError::IntegrityProblem {
+                record_type: "authority_snapshot",
+                reason: "current authority snapshot key, kind, phase, or subject mismatch"
+                    .to_owned(),
+            });
+        }
+        record.input.validate()?;
+        let receipt = AuthoritySnapshotReceipt::from_receipt(Self::receipt_for(&record)?);
+        let snapshot = KernelAuthoritySnapshot::new(record.input)?;
+        Ok(Some(RecoveredAuthoritySnapshot::from_store(
+            snapshot,
+            record.operation_order,
+            receipt,
+        )))
     }
 
     fn revoke_authority(

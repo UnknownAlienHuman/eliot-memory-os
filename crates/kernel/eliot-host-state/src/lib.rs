@@ -1,7 +1,8 @@
 //! P-05 Host-local operational state and durable journal contract.
 //!
-//! This crate owns no Windows, redb, process-launch, semantic, or authority
-//! implementation. It validates and serializes the one-writer Host journal.
+//! This crate owns the platform-neutral journal state machine and backend
+//! contract. It owns no global storage, process-launch, semantic, or authority
+//! implementation.
 
 #![forbid(unsafe_code)]
 
@@ -21,14 +22,13 @@ pub use journal::{
 };
 pub use model::{
     ActivationState, AppliedOperation, CleanMarker, DependencyLifecycleBudget, DependencyRecord,
-    DependencyState, DrainCommitRecord, DrainRecord, DrainState, EliotActivationRecord,
-    EpochEvidence, EpochIdentity, EpochRetirementRecord, EpochTransition, FailureRecoveryDirective,
-    HostInstallationEpoch, HostKernelStoreLineage, HostObservationRecord, HostState,
-    HostStateRecord, IdempotencyIdentity, ImmutableProcessManifest, JournalManifest, KernelRecord,
-    LifecycleTimestamps, NonceState, OneTimeNonceState, ReadinessEvidence, RecordFence,
-    RecoveryLineageEvidence, RecoveryLineageReason, ServiceSafetyClass, WakeDisposition,
-    WakeRecord,
+    DependencyResourceBudget, DependencyState, DrainCommitRecord, DrainRecord, DrainState,
+    EliotActivationRecord, EpochEvidence, EpochIdentity, EpochRetirementRecord, EpochTransition,
+    FailureRecoveryDirective, HostInstallationEpoch, HostKernelStoreLineage, HostObservationRecord,
+    HostState, HostStateRecord, IdempotencyIdentity, ImmutableProcessManifest, JournalManifest,
+    KernelRecord, LifecycleTimestamps, NonceState, OneTimeNonceState, ReadinessEvidence,
+    RecordFence, RecoveryLineageEvidence, RecoveryLineageReason, ServiceSafetyClass,
+    WakeDisposition, WakeRecord,
 };
-
 #[cfg(test)]
 mod tests;

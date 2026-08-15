@@ -1,16 +1,22 @@
 use eliot_platform::{PlatformHandle, UnknownReason};
+use serde::{Deserialize, Serialize};
 
 use crate::{BackendError, HostInstallationEpoch, IdempotencyIdentity};
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct StoredEpoch {
     pub host: HostInstallationEpoch,
     pub bytes: Vec<u8>,
 }
 
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct DurableImage {
+    /// Lossless, ordered journal bytes partitioned by Host epoch. Backends
+    /// must preserve these bytes exactly; the reducer owns frame semantics.
     pub epochs: Vec<StoredEpoch>,
+    /// Durable observations of transactions that crossed the commit boundary.
+    /// These receipts are required for restart-safe UNKNOWN reconciliation.
+    pub receipts: Vec<CommittedAppend>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -23,7 +29,7 @@ pub struct PreparedAppend {
 }
 
 /// Backend observation for an append that crossed its durable commit boundary.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct CommittedAppend {
     pub transaction_id: PlatformHandle,
     pub host: HostInstallationEpoch,
@@ -33,7 +39,7 @@ pub struct CommittedAppend {
 }
 
 impl CommittedAppend {
-    fn from_prepared(prepared: PreparedAppend) -> Self {
+    pub(crate) fn from_prepared(prepared: PreparedAppend) -> Self {
         Self {
             transaction_id: prepared.transaction_id,
             host: prepared.host,
@@ -43,7 +49,7 @@ impl CommittedAppend {
         }
     }
 
-    fn matches_prepared(&self, prepared: &PreparedAppend) -> bool {
+    pub(crate) fn matches_prepared(&self, prepared: &PreparedAppend) -> bool {
         self.transaction_id == prepared.transaction_id
             && self.host == prepared.host
             && self.operation == prepared.operation
@@ -59,7 +65,9 @@ pub enum BackendReconcileState {
     Committed(Box<CommittedAppend>),
 }
 
-/// Transaction-durable port implemented by P-01 adapters.
+/// Object-safe, transaction-durable port implemented by P-09 persistence
+/// adapters. P-05 owns the semantic reducer; adapters own only the mechanics
+/// of preserving [`DurableImage`] and reporting commit-boundary observations.
 pub trait JournalBackend: Send {
     fn load(&mut self) -> Result<DurableImage, BackendError>;
     fn prepare(&mut self, append: &PreparedAppend) -> Result<(), BackendError>;
@@ -102,7 +110,6 @@ struct StagedAppend {
 pub struct MemoryBackend {
     image: DurableImage,
     staged: Vec<StagedAppend>,
-    committed: Vec<CommittedAppend>,
     fault: Option<FaultPoint>,
 }
 
@@ -135,7 +142,8 @@ impl MemoryBackend {
         checksum: &str,
     ) {
         let committed = self
-            .committed
+            .image
+            .receipts
             .iter_mut()
             .find(|item| &item.transaction_id == transaction_id)
             .unwrap_or_else(|| unreachable!());
@@ -180,7 +188,8 @@ impl JournalBackend for MemoryBackend {
             return Err(BackendError::Unknown(UnknownReason::Indeterminate));
         }
         if let Some(committed) = self
-            .committed
+            .image
+            .receipts
             .iter()
             .find(|item| item.transaction_id == append.transaction_id)
         {
@@ -259,7 +268,8 @@ impl JournalBackend for MemoryBackend {
             return Err(BackendError::Unknown(UnknownReason::Indeterminate));
         }
         if self
-            .committed
+            .image
+            .receipts
             .iter()
             .any(|item| &item.transaction_id == transaction_id)
         {
@@ -288,7 +298,7 @@ impl JournalBackend for MemoryBackend {
                 bytes: staged.bytes,
             });
         }
-        self.committed.push(committed);
+        self.image.receipts.push(committed);
         if self.take_fault(FaultPoint::CommitAfterUnknown) {
             Err(BackendError::Unknown(UnknownReason::Indeterminate))
         } else {
@@ -301,7 +311,8 @@ impl JournalBackend for MemoryBackend {
         transaction_id: &PlatformHandle,
     ) -> Result<BackendReconcileState, BackendError> {
         if let Some(committed) = self
-            .committed
+            .image
+            .receipts
             .iter()
             .find(|item| &item.transaction_id == transaction_id)
         {

@@ -1,8 +1,9 @@
 //! Concrete Windows adapters for the P-01 platform ports.
 //!
 //! Windows implementation details are deliberately kept behind this facade.
-//! The public surface contains P-01 contract values only; handles, provider
-//! records, secret bytes, and IPC/process mechanics never escape this crate.
+//! Public values expose only provider-neutral P-01 results and typed P-02
+//! mechanics evidence. Raw handles, provider records, secret bytes, and Win32
+//! implementation details never escape this crate.
 
 #![deny(unsafe_op_in_unsafe_fn)]
 
@@ -27,6 +28,8 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum WindowsAdapterError {
     InvalidInput,
+    NotFound,
+    AlreadyExists,
     Unavailable,
     PermissionDenied,
     Timeout,
@@ -91,6 +94,245 @@ pub struct ProcessIdentity {
     pub process_id: u32,
     pub start_time_100ns: u64,
     pub image_path: String,
+}
+
+/// Stable name of one owner-scoped Windows Job Object.
+///
+/// This is mechanics identity only. It carries no process-dispatch authority.
+#[cfg(windows)]
+#[derive(
+    Clone, Debug, Eq, Hash, JsonSchema, Ord, PartialEq, PartialOrd, Serialize, Deserialize,
+)]
+#[serde(deny_unknown_fields)]
+pub struct JobObjectIdentity {
+    name: String,
+}
+
+#[cfg(windows)]
+impl JobObjectIdentity {
+    /// Validates one exact Job Object name.
+    ///
+    /// # Errors
+    /// Returns `InvalidInput` for an empty name, embedded NUL, or a name wider
+    /// than the bounded Windows object-manager representation used here.
+    pub fn new(name: impl Into<String>) -> Result<Self, WindowsAdapterError> {
+        let name = name.into();
+        if !valid_job_object_name(&name) {
+            return Err(WindowsAdapterError::InvalidInput);
+        }
+        Ok(Self { name })
+    }
+
+    /// Revalidates shape after deserializing a raw durable binding.
+    ///
+    /// This check grants no authority and does not prove that the named kernel
+    /// object exists. [`RecoverableJobObject::open`] still has to reopen the
+    /// Job and compare a fresh handle-bound root observation.
+    ///
+    /// # Errors
+    /// Returns `InvalidInput` for an invalid or unbounded object-manager name.
+    pub fn validate(&self) -> Result<(), WindowsAdapterError> {
+        if valid_job_object_name(&self.name) {
+            Ok(())
+        } else {
+            Err(WindowsAdapterError::InvalidInput)
+        }
+    }
+
+    /// Returns the exact Windows object-manager name.
+    #[must_use]
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+}
+
+#[cfg(windows)]
+fn valid_job_object_name(name: &str) -> bool {
+    let length = name.encode_utf16().count();
+    length != 0 && length <= 240 && !name.chars().any(char::is_control)
+}
+
+/// Windows Job resource ceilings configured before the first process is
+/// assigned. P-04 maps its provider-neutral P-03 limits into this mechanics
+/// value; the type itself grants no launch authority.
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct JobObjectLimits {
+    cpu_time_ms: Option<u64>,
+    memory_bytes: Option<u64>,
+    active_process_limit: Option<u32>,
+}
+
+#[cfg(windows)]
+impl JobObjectLimits {
+    /// Creates validated optional Job limits.
+    ///
+    /// # Errors
+    /// Returns `InvalidInput` when a supplied ceiling is zero or cannot be
+    /// represented by the Win32 Job Object structures.
+    pub fn new(
+        cpu_time_ms: Option<u64>,
+        memory_bytes: Option<u64>,
+        active_process_limit: Option<u32>,
+    ) -> Result<Self, WindowsAdapterError> {
+        if matches!(cpu_time_ms, Some(0))
+            || matches!(memory_bytes, Some(0))
+            || matches!(active_process_limit, Some(0))
+            || memory_bytes.is_some_and(|value| usize::try_from(value).is_err())
+        {
+            return Err(WindowsAdapterError::InvalidInput);
+        }
+        if let Some(cpu_time_ms) = cpu_time_ms {
+            let ticks = cpu_time_ms
+                .checked_mul(10_000)
+                .ok_or(WindowsAdapterError::InvalidInput)?;
+            i64::try_from(ticks).map_err(|_| WindowsAdapterError::InvalidInput)?;
+        }
+        Ok(Self {
+            cpu_time_ms,
+            memory_bytes,
+            active_process_limit,
+        })
+    }
+}
+
+/// Historical process membership observed from the Job completion port.
+///
+/// `complete` is true only after the kernel reported an empty Job and every
+/// process-announcement event was resolved through a retained process handle.
+#[cfg(windows)]
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProcessObservation {
+    process: ProcessIdentity,
+    executable: FileIdentity,
+}
+
+/// Durable raw binding used only to reopen and revalidate one named Job.
+///
+/// The value is not authority: `RecoverableJobObject::open` must re-observe
+/// the exact root identity before returning a live mechanics handle.
+#[cfg(windows)]
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RecoverableJobBinding {
+    job: JobObjectIdentity,
+    root: ProcessObservation,
+}
+
+#[cfg(windows)]
+impl RecoverableJobBinding {
+    /// Validates only the bounded serialized shape.
+    ///
+    /// The result is not proof of a live process or Job. Callers must pass the
+    /// binding to [`RecoverableJobObject::open`] for fresh kernel revalidation.
+    ///
+    /// # Errors
+    /// Returns `InvalidInput` for malformed Job or root-process identity.
+    pub fn validate(&self) -> Result<(), WindowsAdapterError> {
+        self.job.validate()?;
+        let root = self.root.process();
+        let image_length = root.image_path.encode_utf16().count();
+        if root.process_id == 0
+            || root.start_time_100ns == 0
+            || image_length == 0
+            || image_length > 32_767
+            || root.image_path.chars().any(char::is_control)
+        {
+            return Err(WindowsAdapterError::InvalidInput);
+        }
+        Ok(())
+    }
+
+    /// Returns the bound Job Object identity.
+    #[must_use]
+    pub const fn job_identity(&self) -> &JobObjectIdentity {
+        &self.job
+    }
+
+    /// Returns the exact root process/image observation.
+    #[must_use]
+    pub const fn root(&self) -> &ProcessObservation {
+        &self.root
+    }
+}
+
+#[cfg(windows)]
+impl ProcessObservation {
+    /// Returns the retained-handle process identity.
+    #[must_use]
+    pub const fn process(&self) -> &ProcessIdentity {
+        &self.process
+    }
+
+    /// Returns the file-object identity of the observed executable image.
+    #[must_use]
+    pub const fn executable_file_identity(&self) -> FileIdentity {
+        self.executable
+    }
+
+    fn stable_key(&self) -> String {
+        format!(
+            "{}:volume:{}:file:{}",
+            self.process.stable_key(),
+            self.executable.volume_serial_number,
+            self.executable.file_index
+        )
+    }
+}
+
+/// Why a Job history cannot be claimed complete.
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum JobObservationGap {
+    /// At least one kernel process notification could not be resolved to an
+    /// exact retained process/image identity before the process disappeared.
+    IdentityCaptureFailed,
+}
+
+/// Historical process membership observed from the Job completion port.
+#[cfg(windows)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct JobProcessHistory {
+    processes: Vec<ProcessObservation>,
+    complete: bool,
+    job_empty: bool,
+    capture_gap: Option<JobObservationGap>,
+    resource_limit_triggered: bool,
+}
+
+#[cfg(windows)]
+impl JobProcessHistory {
+    /// Returns all distinct process identities observed during this Job life.
+    #[must_use]
+    pub fn processes(&self) -> &[ProcessObservation] {
+        &self.processes
+    }
+
+    /// Returns whether the historical membership observation is complete.
+    #[must_use]
+    pub const fn complete(&self) -> bool {
+        self.complete
+    }
+
+    /// Returns whether the Job was observed with zero active members.
+    #[must_use]
+    pub const fn job_empty(&self) -> bool {
+        self.job_empty
+    }
+
+    /// Returns the explicit observation gap that prevented completeness.
+    #[must_use]
+    pub const fn capture_gap(&self) -> Option<JobObservationGap> {
+        self.capture_gap
+    }
+
+    /// Returns whether the kernel emitted a CPU, memory, or process-count
+    /// limit notification for this Job.
+    #[must_use]
+    pub const fn resource_limit_triggered(&self) -> bool {
+        self.resource_limit_triggered
+    }
 }
 
 impl ProcessIdentity {
@@ -295,11 +537,94 @@ pub enum ServiceRegistrationOutcome {
     EffectUnknown,
 }
 
-/// RAII wrapper for a Windows Job Object configured to terminate assigned
-/// processes when the owning handle closes.
+#[cfg(windows)]
+static JOB_OBJECT_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+
+#[cfg(windows)]
+struct OwnedKernelHandle(windows_sys::Win32::Foundation::HANDLE);
+
+// SAFETY: Windows kernel handles are process-global. This wrapper uniquely
+// owns and closes its handle, so moving it between threads is sound.
+#[cfg(windows)]
+unsafe impl Send for OwnedKernelHandle {}
+
+#[cfg(windows)]
+impl OwnedKernelHandle {
+    fn new(handle: windows_sys::Win32::Foundation::HANDLE) -> Result<Self, WindowsAdapterError> {
+        if handle.is_null() {
+            Err(last_windows_adapter_error())
+        } else {
+            Ok(Self(handle))
+        }
+    }
+
+    fn into_file(self) -> std::fs::File {
+        use std::os::windows::io::FromRawHandle;
+        let handle = self.0;
+        std::mem::forget(self);
+        // SAFETY: unique ownership of the live handle moves into `File` once.
+        unsafe { std::fs::File::from_raw_handle(handle) }
+    }
+}
+
+#[cfg(windows)]
+impl Drop for OwnedKernelHandle {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            // SAFETY: this wrapper uniquely owns the handle until this Drop.
+            unsafe { windows_sys::Win32::Foundation::CloseHandle(self.0) };
+        }
+    }
+}
+
+#[cfg(windows)]
+struct OwnedSecurityDescriptor {
+    raw: windows_sys::Win32::Security::PSECURITY_DESCRIPTOR,
+}
+
+#[cfg(windows)]
+impl OwnedSecurityDescriptor {
+    fn for_job_owner() -> Result<Self, WindowsAdapterError> {
+        use windows_sys::Win32::Security::Authorization::{
+            ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
+        };
+        let sddl = "D:P(A;;GA;;;SY)(A;;GA;;;OW)"
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect::<Vec<_>>();
+        let mut raw = std::ptr::null_mut();
+        // SAFETY: `sddl` is NUL-terminated and `raw` is a valid out pointer.
+        if unsafe {
+            ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                sddl.as_ptr(),
+                SDDL_REVISION_1,
+                &raw mut raw,
+                std::ptr::null_mut(),
+            )
+        } == 0
+        {
+            return Err(last_windows_adapter_error());
+        }
+        Ok(Self { raw })
+    }
+}
+
+#[cfg(windows)]
+impl Drop for OwnedSecurityDescriptor {
+    fn drop(&mut self) {
+        if !self.raw.is_null() {
+            // SAFETY: Win32 allocated the descriptor and this wrapper owns it.
+            unsafe { windows_sys::Win32::Foundation::LocalFree(self.raw.cast()) };
+        }
+    }
+}
+
+/// RAII wrapper for a named Windows Job Object configured to terminate
+/// assigned processes when the sole owning handle closes.
 #[cfg(windows)]
 pub struct JobObject {
     handle: windows_sys::Win32::Foundation::HANDLE,
+    identity: JobObjectIdentity,
 }
 
 // SAFETY: a Job Object handle is process-global and uniquely owned here.
@@ -313,24 +638,95 @@ impl JobObject {
     /// # Errors
     /// Returns a typed adapter error when creation or configuration fails.
     pub fn new_kill_on_close() -> Result<Self, WindowsAdapterError> {
+        let sequence = JOB_OBJECT_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let identity = JobObjectIdentity::new(format!(
+            "Local\\Eliot-P02-{}-{sequence}",
+            std::process::id()
+        ))?;
+        Self::new_named_kill_on_close(identity)
+    }
+
+    /// Creates a fresh named Job Object and rejects an existing name.
+    ///
+    /// The protected DACL grants full access only to LocalSystem and the
+    /// creating owner. A new generation therefore cannot silently join an
+    /// older Job with the same durable identity.
+    ///
+    /// # Errors
+    /// Returns `AlreadyExists` for a name collision or another typed adapter
+    /// error when Windows rejects creation or limit configuration.
+    pub fn new_named_kill_on_close(
+        identity: JobObjectIdentity,
+    ) -> Result<Self, WindowsAdapterError> {
+        Self::new_named_kill_on_close_with_limits(identity, JobObjectLimits::default())
+    }
+
+    /// Creates a fresh named kill-on-close Job with exact resource ceilings.
+    ///
+    /// All limits are installed before any process can be assigned.
+    ///
+    /// # Errors
+    /// Returns a typed adapter error for name collision, invalid conversion,
+    /// or rejected Job configuration.
+    pub fn new_named_kill_on_close_with_limits(
+        identity: JobObjectIdentity,
+        resource_limits: JobObjectLimits,
+    ) -> Result<Self, WindowsAdapterError> {
+        use windows_sys::Win32::Foundation::{ERROR_ALREADY_EXISTS, GetLastError};
+        use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
         use windows_sys::Win32::System::JobObjects::{
-            CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+            CreateJobObjectW, JOB_OBJECT_LIMIT_ACTIVE_PROCESS, JOB_OBJECT_LIMIT_JOB_MEMORY,
+            JOB_OBJECT_LIMIT_JOB_TIME, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
             JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
             SetInformationJobObject,
         };
-        let handle = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
+        let name = nul_terminated_wide(std::ffi::OsStr::new(identity.name()))
+            .map_err(|error| windows_adapter_from_io(&error))?;
+        let descriptor = OwnedSecurityDescriptor::for_job_owner()?;
+        let attributes = SECURITY_ATTRIBUTES {
+            nLength: u32::try_from(std::mem::size_of::<SECURITY_ATTRIBUTES>())
+                .map_err(|_| WindowsAdapterError::Failed)?,
+            lpSecurityDescriptor: descriptor.raw,
+            bInheritHandle: 0,
+        };
+        // SAFETY: name, descriptor and attributes remain live for the call.
+        let handle = unsafe { CreateJobObjectW(&raw const attributes, name.as_ptr()) };
+        // SAFETY: GetLastError immediately observes the creation disposition.
+        let creation_error = unsafe { GetLastError() };
         if handle.is_null() {
             return Err(last_windows_adapter_error());
         }
-        let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
-        limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-        let length = u32::try_from(std::mem::size_of_val(&limits))
+        if creation_error == ERROR_ALREADY_EXISTS {
+            // SAFETY: this path owns the handle returned for the old object.
+            unsafe { windows_sys::Win32::Foundation::CloseHandle(handle) };
+            return Err(WindowsAdapterError::AlreadyExists);
+        }
+        let mut job_info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+        job_info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        if let Some(cpu_time_ms) = resource_limits.cpu_time_ms {
+            let ticks = cpu_time_ms
+                .checked_mul(10_000)
+                .and_then(|value| i64::try_from(value).ok())
+                .ok_or(WindowsAdapterError::InvalidInput)?;
+            job_info.BasicLimitInformation.PerJobUserTimeLimit = ticks;
+            job_info.BasicLimitInformation.LimitFlags |= JOB_OBJECT_LIMIT_JOB_TIME;
+        }
+        if let Some(memory_bytes) = resource_limits.memory_bytes {
+            job_info.JobMemoryLimit =
+                usize::try_from(memory_bytes).map_err(|_| WindowsAdapterError::InvalidInput)?;
+            job_info.BasicLimitInformation.LimitFlags |= JOB_OBJECT_LIMIT_JOB_MEMORY;
+        }
+        if let Some(active_process_limit) = resource_limits.active_process_limit {
+            job_info.BasicLimitInformation.ActiveProcessLimit = active_process_limit;
+            job_info.BasicLimitInformation.LimitFlags |= JOB_OBJECT_LIMIT_ACTIVE_PROCESS;
+        }
+        let length = u32::try_from(std::mem::size_of_val(&job_info))
             .map_err(|_| WindowsAdapterError::Failed)?;
         let configured = unsafe {
             SetInformationJobObject(
                 handle,
                 JobObjectExtendedLimitInformation,
-                (&raw const limits).cast(),
+                (&raw const job_info).cast(),
                 length,
             )
         } != 0;
@@ -338,7 +734,13 @@ impl JobObject {
             unsafe { windows_sys::Win32::Foundation::CloseHandle(handle) };
             return Err(last_windows_adapter_error());
         }
-        Ok(Self { handle })
+        Ok(Self { handle, identity })
+    }
+
+    /// Returns the durable Job Object identity.
+    #[must_use]
+    pub const fn identity(&self) -> &JobObjectIdentity {
+        &self.identity
     }
 
     /// Assigns an existing process and returns its exact observed identity.
@@ -412,6 +814,135 @@ impl JobObject {
 impl Drop for JobObject {
     fn drop(&mut self) {
         unsafe { windows_sys::Win32::Foundation::CloseHandle(self.handle) };
+    }
+}
+
+/// Handle to an existing named Job Object during restart reconciliation.
+///
+/// Reopening proves only current kernel membership. Historical descendants
+/// must be unioned with the caller-owned durable raw-observation ledger; this
+/// type intentionally exposes no `complete` history claim.
+#[cfg(windows)]
+pub struct RecoverableJobObject {
+    handle: OwnedKernelHandle,
+    binding: RecoverableJobBinding,
+}
+
+#[cfg(windows)]
+impl RecoverableJobObject {
+    /// Opens one existing named Job with query and terminate access.
+    ///
+    /// # Errors
+    /// Returns `NotFound` when kill-on-close already removed the Job, or a
+    /// typed access/platform error otherwise.
+    pub fn open(binding: RecoverableJobBinding) -> Result<Self, WindowsAdapterError> {
+        const JOB_OBJECT_QUERY_ACCESS: u32 = 0x0004;
+        const JOB_OBJECT_TERMINATE_ACCESS: u32 = 0x0008;
+        use windows_sys::Win32::System::JobObjects::OpenJobObjectW;
+        binding.validate()?;
+        let name = nul_terminated_wide(std::ffi::OsStr::new(binding.job_identity().name()))
+            .map_err(|error| windows_adapter_from_io(&error))?;
+        // SAFETY: name is NUL-terminated and the call returns a new handle.
+        let handle = unsafe {
+            OpenJobObjectW(
+                JOB_OBJECT_QUERY_ACCESS | JOB_OBJECT_TERMINATE_ACCESS,
+                0,
+                name.as_ptr(),
+            )
+        };
+        if handle.is_null() {
+            let error = std::io::Error::last_os_error();
+            if matches!(error.kind(), std::io::ErrorKind::NotFound) {
+                return Err(WindowsAdapterError::NotFound);
+            }
+            return Err(windows_adapter_from_io(&error));
+        }
+        let recovered = Self {
+            handle: OwnedKernelHandle::new(handle)?,
+            binding,
+        };
+        let live = recovered.live_processes()?;
+        if !live
+            .iter()
+            .any(|process| process == recovered.binding.root())
+        {
+            return Err(WindowsAdapterError::IdentityMismatch);
+        }
+        Ok(recovered)
+    }
+
+    /// Returns the exact Job identity used to reopen the object.
+    #[must_use]
+    pub const fn identity(&self) -> &JobObjectIdentity {
+        self.binding.job_identity()
+    }
+
+    /// Returns the durable binding revalidated when this handle was opened.
+    #[must_use]
+    pub const fn binding(&self) -> &RecoverableJobBinding {
+        &self.binding
+    }
+
+    /// Returns current live members with PID-reuse-safe process/image identity.
+    ///
+    /// # Errors
+    /// Returns a typed adapter error when membership or identity cannot be read.
+    pub fn live_processes(&self) -> Result<Vec<ProcessObservation>, WindowsAdapterError> {
+        job_process_ids(self.handle.0)
+            .map_err(|error| windows_adapter_from_io(&error))?
+            .into_iter()
+            .map(open_observed_job_process)
+            .map(|result| result.map(|process| process.observation))
+            .collect()
+    }
+
+    /// Returns the current active member count.
+    ///
+    /// # Errors
+    /// Returns a typed adapter error when the Job cannot be queried.
+    pub fn active_process_count(&self) -> Result<u32, WindowsAdapterError> {
+        u32::try_from(
+            job_process_ids(self.handle.0)
+                .map_err(|error| windows_adapter_from_io(&error))?
+                .len(),
+        )
+        .map_err(|_| WindowsAdapterError::Failed)
+    }
+
+    /// Terminates all current members.
+    ///
+    /// # Errors
+    /// Returns a typed adapter error when Windows rejects termination.
+    pub fn terminate(&self, exit_code: u32) -> Result<(), WindowsAdapterError> {
+        // SAFETY: the reopened Job handle remains live for the call.
+        if unsafe {
+            windows_sys::Win32::System::JobObjects::TerminateJobObject(self.handle.0, exit_code)
+        } == 0
+        {
+            Err(last_windows_adapter_error())
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Waits until no live member remains.
+    ///
+    /// # Errors
+    /// Returns a typed adapter error when current membership cannot be read.
+    pub fn wait_for_empty(
+        &self,
+        timeout: std::time::Duration,
+    ) -> Result<bool, WindowsAdapterError> {
+        let started = std::time::Instant::now();
+        loop {
+            if self.active_process_count()? == 0 {
+                return Ok(true);
+            }
+            if started.elapsed() >= timeout {
+                return Ok(false);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
     }
 }
 
@@ -590,6 +1121,7 @@ impl SuspendedLaunchSpec {
 pub struct SuspendedProcessEvidence {
     process: ProcessIdentity,
     executable: FileIdentity,
+    job: JobObjectIdentity,
     requested_executable: PathBuf,
     arguments: Vec<std::ffi::OsString>,
     working_directory: PathBuf,
@@ -608,6 +1140,24 @@ impl SuspendedProcessEvidence {
     #[must_use]
     pub const fn executable_file_identity(&self) -> FileIdentity {
         self.executable
+    }
+
+    /// Returns the fresh, owner-scoped Job Object identity.
+    #[must_use]
+    pub const fn job_identity(&self) -> &JobObjectIdentity {
+        &self.job
+    }
+
+    /// Builds the raw durable binding required for later named-Job recovery.
+    #[must_use]
+    pub fn recoverable_job_binding(&self) -> RecoverableJobBinding {
+        RecoverableJobBinding {
+            job: self.job.clone(),
+            root: ProcessObservation {
+                process: self.process.clone(),
+                executable: self.executable,
+            },
+        }
     }
 
     #[must_use]
@@ -650,6 +1200,436 @@ pub enum SuspendedValidationError<E> {
 }
 
 #[cfg(windows)]
+const JOB_COMPLETION_KEY: usize = 0x454c_494f;
+#[cfg(windows)]
+const JOB_OBSERVER_SHUTDOWN_KEY: usize = 0x454e_4421;
+#[cfg(windows)]
+const JOB_OBJECT_MSG_END_OF_JOB_TIME: u32 = 1;
+#[cfg(windows)]
+const JOB_OBJECT_MSG_END_OF_PROCESS_TIME: u32 = 2;
+#[cfg(windows)]
+const JOB_OBJECT_MSG_ACTIVE_PROCESS_LIMIT: u32 = 3;
+#[cfg(windows)]
+const JOB_OBJECT_MSG_ACTIVE_PROCESS_ZERO: u32 = 4;
+#[cfg(windows)]
+const JOB_OBJECT_MSG_NEW_PROCESS: u32 = 6;
+#[cfg(windows)]
+const JOB_OBJECT_MSG_PROCESS_MEMORY_LIMIT: u32 = 9;
+#[cfg(windows)]
+const JOB_OBJECT_MSG_JOB_MEMORY_LIMIT: u32 = 10;
+
+#[cfg(windows)]
+struct ObservedJobProcess {
+    observation: ProcessObservation,
+    _process: OwnedProcessHandle,
+    _executable: PinnedExecutable,
+}
+
+#[cfg(windows)]
+#[derive(Default)]
+struct JobProcessObserverState {
+    processes: Vec<ObservedJobProcess>,
+    observation_incomplete: bool,
+    active_process_zero: bool,
+    resource_limit_triggered: bool,
+}
+
+#[cfg(windows)]
+struct JobProcessObserver {
+    completion_port: OwnedKernelHandle,
+    state: std::sync::Arc<(
+        std::sync::Mutex<JobProcessObserverState>,
+        std::sync::Condvar,
+    )>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+#[cfg(windows)]
+impl JobProcessObserver {
+    fn attach(job: windows_sys::Win32::Foundation::HANDLE) -> Result<Self, WindowsAdapterError> {
+        use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+        use windows_sys::Win32::System::IO::CreateIoCompletionPort;
+        use windows_sys::Win32::System::JobObjects::{
+            JOBOBJECT_ASSOCIATE_COMPLETION_PORT, JobObjectAssociateCompletionPortInformation,
+            SetInformationJobObject,
+        };
+        // SAFETY: this documented form creates one standalone completion port.
+        let completion_port =
+            unsafe { CreateIoCompletionPort(INVALID_HANDLE_VALUE, std::ptr::null_mut(), 0, 1) };
+        let completion_port = OwnedKernelHandle::new(completion_port)?;
+        let association = JOBOBJECT_ASSOCIATE_COMPLETION_PORT {
+            CompletionKey: JOB_COMPLETION_KEY as *mut std::ffi::c_void,
+            CompletionPort: completion_port.0,
+        };
+        let length = u32::try_from(std::mem::size_of_val(&association))
+            .map_err(|_| WindowsAdapterError::Failed)?;
+        // SAFETY: both handles and the exact association structure are live.
+        if unsafe {
+            SetInformationJobObject(
+                job,
+                JobObjectAssociateCompletionPortInformation,
+                (&raw const association).cast(),
+                length,
+            )
+        } == 0
+        {
+            return Err(last_windows_adapter_error());
+        }
+        let state = std::sync::Arc::new((
+            std::sync::Mutex::new(JobProcessObserverState::default()),
+            std::sync::Condvar::new(),
+        ));
+        let thread_state = std::sync::Arc::clone(&state);
+        let raw_port = completion_port.0 as usize;
+        let thread = std::thread::Builder::new()
+            .name("eliot-p02-job-observer".to_owned())
+            .spawn(move || job_process_observer_loop(raw_port, &thread_state))
+            .map_err(|error| windows_adapter_from_io(&error))?;
+        Ok(Self {
+            completion_port,
+            state,
+            thread: Some(thread),
+        })
+    }
+
+    fn capture_pid(&self, process_id: u32) -> Result<(), WindowsAdapterError> {
+        let process = open_observed_job_process(process_id)?;
+        let (state, _) = &*self.state;
+        let mut state = state.lock().map_err(|_| WindowsAdapterError::Failed)?;
+        if !state
+            .processes
+            .iter()
+            .any(|observed| observed.observation == process.observation)
+        {
+            state.processes.push(process);
+        }
+        Ok(())
+    }
+
+    fn capture_live_members(
+        &self,
+        job: windows_sys::Win32::Foundation::HANDLE,
+    ) -> Result<bool, WindowsAdapterError> {
+        let process_ids = job_process_ids(job).map_err(|error| windows_adapter_from_io(&error))?;
+        for process_id in &process_ids {
+            if self.capture_pid(*process_id).is_err() {
+                let (state, _) = &*self.state;
+                let mut state = state.lock().map_err(|_| WindowsAdapterError::Failed)?;
+                state.observation_incomplete = true;
+            }
+        }
+        Ok(process_ids.is_empty())
+    }
+
+    fn snapshot(
+        &self,
+        job: windows_sys::Win32::Foundation::HANDLE,
+    ) -> Result<JobProcessHistory, WindowsAdapterError> {
+        let job_empty = self.capture_live_members(job)?;
+        self.snapshot_with_empty(job_empty)
+    }
+
+    fn wait_for_empty_history(
+        &self,
+        job: windows_sys::Win32::Foundation::HANDLE,
+        timeout: std::time::Duration,
+    ) -> Result<JobProcessHistory, WindowsAdapterError> {
+        let started = std::time::Instant::now();
+        loop {
+            if self.capture_live_members(job)? {
+                break;
+            }
+            if started.elapsed() >= timeout {
+                return self.snapshot_with_empty(false);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+
+        let (state, notification) = &*self.state;
+        let mut state = state.lock().map_err(|_| WindowsAdapterError::Failed)?;
+        while !state.active_process_zero {
+            let remaining = timeout.saturating_sub(started.elapsed());
+            if remaining.is_zero() {
+                break;
+            }
+            let (next, wait) = notification
+                .wait_timeout(state, remaining)
+                .map_err(|_| WindowsAdapterError::Failed)?;
+            state = next;
+            if wait.timed_out() {
+                break;
+            }
+        }
+        Ok(history_from_observer_state(&state, true))
+    }
+
+    fn snapshot_with_empty(
+        &self,
+        job_empty: bool,
+    ) -> Result<JobProcessHistory, WindowsAdapterError> {
+        let (state, _) = &*self.state;
+        let state = state.lock().map_err(|_| WindowsAdapterError::Failed)?;
+        Ok(history_from_observer_state(&state, job_empty))
+    }
+
+    fn shutdown(&mut self) {
+        if self.thread.is_none() {
+            return;
+        }
+        use windows_sys::Win32::System::IO::PostQueuedCompletionStatus;
+        // SAFETY: the port stays live until the observer thread is joined.
+        let _ = unsafe {
+            PostQueuedCompletionStatus(
+                self.completion_port.0,
+                0,
+                JOB_OBSERVER_SHUTDOWN_KEY,
+                std::ptr::null(),
+            )
+        };
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+#[cfg(windows)]
+impl Drop for JobProcessObserver {
+    fn drop(&mut self) {
+        self.shutdown();
+    }
+}
+
+#[cfg(windows)]
+fn history_from_observer_state(
+    state: &JobProcessObserverState,
+    job_empty: bool,
+) -> JobProcessHistory {
+    let mut processes = state
+        .processes
+        .iter()
+        .map(|observed| observed.observation.clone())
+        .collect::<Vec<_>>();
+    processes.sort_by_key(ProcessObservation::stable_key);
+    processes.dedup();
+    JobProcessHistory {
+        processes,
+        complete: job_empty && state.active_process_zero && !state.observation_incomplete,
+        job_empty,
+        capture_gap: state
+            .observation_incomplete
+            .then_some(JobObservationGap::IdentityCaptureFailed),
+        resource_limit_triggered: state.resource_limit_triggered,
+    }
+}
+
+#[cfg(windows)]
+fn open_observed_job_process(process_id: u32) -> Result<ObservedJobProcess, WindowsAdapterError> {
+    use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
+    if process_id == 0 {
+        return Err(WindowsAdapterError::InvalidInput);
+    }
+    // SAFETY: OpenProcess returns a newly owned handle or null.
+    let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, process_id) };
+    let process = OwnedProcessHandle::new(handle)?;
+    let identity = inspect_process_handle(process_id, process.0)
+        .map_err(|error| windows_adapter_from_io(&error))?;
+    let executable = PinnedExecutable::open(Path::new(&identity.image_path))?;
+    let observation = ProcessObservation {
+        process: identity,
+        executable: executable.identity,
+    };
+    Ok(ObservedJobProcess {
+        observation,
+        _process: process,
+        _executable: executable,
+    })
+}
+
+#[cfg(windows)]
+fn job_process_observer_loop(
+    raw_port: usize,
+    shared: &std::sync::Arc<(
+        std::sync::Mutex<JobProcessObserverState>,
+        std::sync::Condvar,
+    )>,
+) {
+    use windows_sys::Win32::System::IO::GetQueuedCompletionStatus;
+    let completion_port = raw_port as windows_sys::Win32::Foundation::HANDLE;
+    loop {
+        let mut message = 0_u32;
+        let mut completion_key = 0_usize;
+        let mut overlapped = std::ptr::null_mut();
+        // SAFETY: all out pointers are live and the observer owns the port.
+        let dequeued = unsafe {
+            GetQueuedCompletionStatus(
+                completion_port,
+                &raw mut message,
+                &raw mut completion_key,
+                &raw mut overlapped,
+                u32::MAX,
+            )
+        };
+        if completion_key == JOB_OBSERVER_SHUTDOWN_KEY {
+            break;
+        }
+        if dequeued == 0 || completion_key != JOB_COMPLETION_KEY {
+            continue;
+        }
+        let (state, notification) = &**shared;
+        if message == JOB_OBJECT_MSG_ACTIVE_PROCESS_ZERO {
+            if let Ok(mut state) = state.lock() {
+                state.active_process_zero = true;
+                notification.notify_all();
+            }
+            continue;
+        }
+        if matches!(
+            message,
+            JOB_OBJECT_MSG_END_OF_JOB_TIME
+                | JOB_OBJECT_MSG_END_OF_PROCESS_TIME
+                | JOB_OBJECT_MSG_ACTIVE_PROCESS_LIMIT
+                | JOB_OBJECT_MSG_PROCESS_MEMORY_LIMIT
+                | JOB_OBJECT_MSG_JOB_MEMORY_LIMIT
+        ) {
+            if let Ok(mut state) = state.lock() {
+                state.resource_limit_triggered = true;
+                notification.notify_all();
+            }
+            continue;
+        }
+        if message != JOB_OBJECT_MSG_NEW_PROCESS {
+            continue;
+        }
+        let Ok(process_id) = u32::try_from(overlapped as usize) else {
+            if let Ok(mut state) = state.lock() {
+                state.observation_incomplete = true;
+            }
+            continue;
+        };
+        let observed = open_observed_job_process(process_id);
+        if let Ok(mut state) = state.lock() {
+            state.active_process_zero = false;
+            match observed {
+                Ok(process)
+                    if !state
+                        .processes
+                        .iter()
+                        .any(|existing| existing.observation == process.observation) =>
+                {
+                    state.processes.push(process);
+                }
+                Ok(_) => {}
+                Err(_) => state.observation_incomplete = true,
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
+struct ProcThreadAttributeList {
+    _storage: Vec<usize>,
+    list: windows_sys::Win32::System::Threading::LPPROC_THREAD_ATTRIBUTE_LIST,
+}
+
+#[cfg(windows)]
+impl ProcThreadAttributeList {
+    fn for_inherited_handles(
+        handles: &[windows_sys::Win32::Foundation::HANDLE],
+    ) -> Result<Self, WindowsAdapterError> {
+        use windows_sys::Win32::System::Threading::{
+            InitializeProcThreadAttributeList, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
+            UpdateProcThreadAttribute,
+        };
+        let mut bytes = 0_usize;
+        // SAFETY: the documented sizing call writes only `bytes`.
+        unsafe {
+            InitializeProcThreadAttributeList(std::ptr::null_mut(), 1, 0, &raw mut bytes);
+        }
+        if bytes == 0 {
+            return Err(last_windows_adapter_error());
+        }
+        let words = bytes.div_ceil(std::mem::size_of::<usize>());
+        let mut storage = vec![0_usize; words];
+        let list = storage.as_mut_ptr().cast::<std::ffi::c_void>();
+        // SAFETY: storage is aligned, sufficiently large, and retained.
+        if unsafe { InitializeProcThreadAttributeList(list, 1, 0, &raw mut bytes) } == 0 {
+            return Err(last_windows_adapter_error());
+        }
+        let attribute = usize::try_from(PROC_THREAD_ATTRIBUTE_HANDLE_LIST)
+            .map_err(|_| WindowsAdapterError::Failed)?;
+        // SAFETY: list and exact handle slice are live for this call.
+        if unsafe {
+            UpdateProcThreadAttribute(
+                list,
+                0,
+                attribute,
+                handles.as_ptr().cast::<std::ffi::c_void>(),
+                std::mem::size_of_val(handles),
+                std::ptr::null_mut(),
+                std::ptr::null(),
+            )
+        } == 0
+        {
+            let error = last_windows_adapter_error();
+            // SAFETY: list was initialized above.
+            unsafe {
+                windows_sys::Win32::System::Threading::DeleteProcThreadAttributeList(list);
+            }
+            return Err(error);
+        }
+        Ok(Self {
+            _storage: storage,
+            list,
+        })
+    }
+}
+
+#[cfg(windows)]
+impl Drop for ProcThreadAttributeList {
+    fn drop(&mut self) {
+        // SAFETY: list remains initialized and its storage is still live.
+        unsafe {
+            windows_sys::Win32::System::Threading::DeleteProcThreadAttributeList(self.list);
+        }
+    }
+}
+
+#[cfg(windows)]
+fn inheritable_pipe() -> Result<(OwnedKernelHandle, OwnedKernelHandle), WindowsAdapterError> {
+    use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
+    use windows_sys::Win32::System::Pipes::CreatePipe;
+    let mut read = std::ptr::null_mut();
+    let mut write = std::ptr::null_mut();
+    let attributes = SECURITY_ATTRIBUTES {
+        nLength: u32::try_from(std::mem::size_of::<SECURITY_ATTRIBUTES>())
+            .map_err(|_| WindowsAdapterError::Failed)?,
+        lpSecurityDescriptor: std::ptr::null_mut(),
+        bInheritHandle: 1,
+    };
+    // SAFETY: output pointers and security attributes are valid for the call.
+    if unsafe { CreatePipe(&raw mut read, &raw mut write, &raw const attributes, 0) } == 0 {
+        return Err(last_windows_adapter_error());
+    }
+    Ok((
+        OwnedKernelHandle::new(read)?,
+        OwnedKernelHandle::new(write)?,
+    ))
+}
+
+#[cfg(windows)]
+fn make_non_inheritable(
+    handle: windows_sys::Win32::Foundation::HANDLE,
+) -> Result<(), WindowsAdapterError> {
+    use windows_sys::Win32::Foundation::{HANDLE_FLAG_INHERIT, SetHandleInformation};
+    // SAFETY: the live handle is borrowed only for this call.
+    if unsafe { SetHandleInformation(handle, HANDLE_FLAG_INHERIT, 0) } == 0 {
+        Err(last_windows_adapter_error())
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(windows)]
 struct JobChildHandles {
     process: OwnedProcessHandle,
     thread: OwnedProcessHandle,
@@ -658,6 +1638,9 @@ struct JobChildHandles {
     executable: PinnedExecutable,
     spec: SuspendedLaunchSpec,
     command_line_utf16: Vec<u16>,
+    stdout: Option<std::fs::File>,
+    stderr: Option<std::fs::File>,
+    observer: JobProcessObserver,
     terminal: bool,
 }
 
@@ -693,6 +1676,7 @@ impl JobChildHandles {
         Ok(SuspendedProcessEvidence {
             process,
             executable: observed_file,
+            job: self.job.identity().clone(),
             requested_executable: self.spec.executable.clone(),
             arguments: self.spec.arguments.clone(),
             working_directory: self.spec.working_directory.clone(),
@@ -711,6 +1695,18 @@ impl JobChildHandles {
         .map_err(|_| WindowsAdapterError::Failed)
     }
 
+    fn history(&self) -> Result<JobProcessHistory, WindowsAdapterError> {
+        self.observer.snapshot(self.job.handle)
+    }
+
+    fn wait_for_empty_history(
+        &self,
+        timeout: std::time::Duration,
+    ) -> Result<JobProcessHistory, WindowsAdapterError> {
+        self.observer
+            .wait_for_empty_history(self.job.handle, timeout)
+    }
+
     fn root_exit_code(&self) -> Result<Option<i32>, WindowsAdapterError> {
         use windows_sys::Win32::Foundation::{WAIT_OBJECT_0, WAIT_TIMEOUT};
         use windows_sys::Win32::System::Threading::{GetExitCodeProcess, WaitForSingleObject};
@@ -727,7 +1723,10 @@ impl JobChildHandles {
         }
     }
 
-    fn terminate_and_reap(&mut self, requested_exit_code: u32) -> Result<i32, WindowsAdapterError> {
+    fn terminate_and_reap(
+        &mut self,
+        requested_exit_code: u32,
+    ) -> Result<(i32, JobProcessHistory), WindowsAdapterError> {
         use windows_sys::Win32::Foundation::WAIT_OBJECT_0;
         use windows_sys::Win32::System::Threading::WaitForSingleObject;
         self.job.terminate(requested_exit_code)?;
@@ -736,8 +1735,11 @@ impl JobChildHandles {
             return Err(WindowsAdapterError::Timeout);
         }
         let exit_code = self.root_exit_code()?.ok_or(WindowsAdapterError::Failed)?;
+        let history = self
+            .observer
+            .wait_for_empty_history(self.job.handle, std::time::Duration::from_secs(5))?;
         self.terminal = true;
-        Ok(exit_code)
+        Ok((exit_code, history))
     }
 
     fn best_effort_cleanup(&mut self) {
@@ -804,6 +1806,8 @@ pub enum RunningJobObservation {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TerminatedJobChild {
     process: ProcessIdentity,
+    job: JobObjectIdentity,
+    history: JobProcessHistory,
     requested_exit_code: u32,
     observed_exit_code: i32,
     job_empty: bool,
@@ -815,6 +1819,18 @@ impl TerminatedJobChild {
     #[must_use]
     pub fn process(&self) -> &ProcessIdentity {
         &self.process
+    }
+
+    /// Returns the exact Job Object identity consumed by termination.
+    #[must_use]
+    pub const fn job_identity(&self) -> &JobObjectIdentity {
+        &self.job
+    }
+
+    /// Returns the final historical process-membership observation.
+    #[must_use]
+    pub const fn history(&self) -> &JobProcessHistory {
+        &self.history
     }
 
     #[must_use]
@@ -846,9 +1862,44 @@ impl SuspendedJobChild {
     /// Returns a typed adapter error for invalid deterministic material or any
     /// executable pin, process creation, identity, or Job assignment failure.
     pub fn spawn(spec: SuspendedLaunchSpec) -> Result<Self, WindowsAdapterError> {
+        let sequence = JOB_OBJECT_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let identity = JobObjectIdentity::new(format!(
+            "Local\\Eliot-P02-{}-{sequence}",
+            std::process::id()
+        ))?;
+        Self::spawn_named(spec, identity)
+    }
+
+    /// Creates a child suspended in one exact fresh named Job Object.
+    ///
+    /// The Job completion port is attached before assignment, and only the
+    /// child-side standard handles are inheritable. Validation and resume stay
+    /// separate consuming transitions.
+    ///
+    /// # Errors
+    /// Returns a typed adapter error for a Job-name collision or any pipe,
+    /// process, identity, or assignment failure.
+    pub fn spawn_named(
+        spec: SuspendedLaunchSpec,
+        job_identity: JobObjectIdentity,
+    ) -> Result<Self, WindowsAdapterError> {
+        Self::spawn_named_with_limits(spec, job_identity, JobObjectLimits::default())
+    }
+
+    /// Creates a child suspended in a fresh named Job with resource ceilings.
+    ///
+    /// # Errors
+    /// Returns a typed adapter error before resume when any limit, Job, pipe,
+    /// process, identity, or assignment operation fails.
+    pub fn spawn_named_with_limits(
+        spec: SuspendedLaunchSpec,
+        job_identity: JobObjectIdentity,
+        resource_limits: JobObjectLimits,
+    ) -> Result<Self, WindowsAdapterError> {
         use windows_sys::Win32::System::Threading::{
             CREATE_NO_WINDOW, CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, CreateProcessW,
-            PROCESS_INFORMATION, STARTUPINFOW,
+            EXTENDED_STARTUPINFO_PRESENT, PROCESS_INFORMATION, STARTF_USESTDHANDLES,
+            STARTUPINFOEXW,
         };
         let executable = PinnedExecutable::open(&spec.executable)?;
         let application = nul_terminated_wide(spec.executable.as_os_str())
@@ -859,24 +1910,45 @@ impl SuspendedJobChild {
         let mut environment = command_environment(&spec.environment);
         let current_directory = nul_terminated_wide(spec.working_directory.as_os_str())
             .map_err(|error| windows_adapter_from_io(&error))?;
-        let job = JobObject::new_kill_on_close()?;
-        let mut startup = STARTUPINFOW {
-            cb: u32::try_from(std::mem::size_of::<STARTUPINFOW>())
-                .map_err(|_| WindowsAdapterError::Failed)?,
-            ..Default::default()
+        let (stdin_read, stdin_write) = inheritable_pipe()?;
+        let (stdout_read, stdout_write) = inheritable_pipe()?;
+        let (stderr_read, stderr_write) = inheritable_pipe()?;
+        make_non_inheritable(stdin_write.0)?;
+        make_non_inheritable(stdout_read.0)?;
+        make_non_inheritable(stderr_read.0)?;
+        let inherited_handles = [stdin_read.0, stdout_write.0, stderr_write.0];
+        let attributes = ProcThreadAttributeList::for_inherited_handles(&inherited_handles)?;
+        let job = JobObject::new_named_kill_on_close_with_limits(job_identity, resource_limits)?;
+        let observer = JobProcessObserver::attach(job.handle)?;
+        let mut startup = STARTUPINFOEXW {
+            StartupInfo: windows_sys::Win32::System::Threading::STARTUPINFOW {
+                cb: u32::try_from(std::mem::size_of::<STARTUPINFOEXW>())
+                    .map_err(|_| WindowsAdapterError::Failed)?,
+                dwFlags: STARTF_USESTDHANDLES,
+                hStdInput: stdin_read.0,
+                hStdOutput: stdout_write.0,
+                hStdError: stderr_write.0,
+                ..Default::default()
+            },
+            lpAttributeList: attributes.list,
         };
         let mut information = PROCESS_INFORMATION::default();
+        // SAFETY: all buffers and the STARTUPINFOEX attribute list remain live;
+        // handle inheritance is restricted to `inherited_handles`.
         if unsafe {
             CreateProcessW(
                 application.as_ptr(),
                 command_line.as_mut_ptr(),
                 std::ptr::null(),
                 std::ptr::null(),
-                0,
-                CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT | CREATE_NO_WINDOW,
+                1,
+                CREATE_SUSPENDED
+                    | CREATE_UNICODE_ENVIRONMENT
+                    | CREATE_NO_WINDOW
+                    | EXTENDED_STARTUPINFO_PRESENT,
                 environment.as_mut_ptr().cast(),
                 current_directory.as_ptr(),
-                &raw mut startup,
+                &raw mut startup.StartupInfo,
                 &raw mut information,
             )
         } == 0
@@ -909,6 +1981,12 @@ impl SuspendedJobChild {
             }
             return Err(WindowsAdapterError::Failed);
         }
+        // Parent keeps only the read sides. Closing the sole parent stdin
+        // writer gives the child deterministic EOF instead of inherited input.
+        drop(stdin_read);
+        drop(stdin_write);
+        drop(stdout_write);
+        drop(stderr_write);
         let process = OwnedProcessHandle::new(information.hProcess)?;
         let thread = OwnedProcessHandle::new(information.hThread)?;
         let mut cleanup = SuspendedProcessCleanup {
@@ -925,10 +2003,16 @@ impl SuspendedJobChild {
             executable,
             spec,
             command_line_utf16,
+            stdout: Some(stdout_read.into_file()),
+            stderr: Some(stderr_read.into_file()),
+            observer,
             terminal: false,
         };
         cleanup.disarm();
         inner.job.assign_process_handle(inner.process.0)?;
+        inner
+            .observer
+            .capture_pid(inner.spawn_identity.process_id)?;
         if !inner
             .job
             .contains_process(inner.spawn_identity.process_id)?
@@ -1049,6 +2133,24 @@ impl<V> RunningJobChild<V> {
         &self.validation
     }
 
+    /// Returns the exact owner-scoped Job Object identity.
+    #[must_use]
+    pub const fn job_identity(&self) -> &JobObjectIdentity {
+        self.inner.job.identity()
+    }
+
+    /// Transfers ownership of the process stdout read handle exactly once.
+    #[must_use]
+    pub fn take_stdout(&mut self) -> Option<std::fs::File> {
+        self.inner.stdout.take()
+    }
+
+    /// Transfers ownership of the process stderr read handle exactly once.
+    #[must_use]
+    pub fn take_stderr(&mut self) -> Option<std::fs::File> {
+        self.inner.stderr.take()
+    }
+
     /// Returns an idempotent observation without changing typestate.
     ///
     /// # Errors
@@ -1067,18 +2169,51 @@ impl<V> RunningJobChild<V> {
         }
     }
 
-    /// Returns identities of live Job members.
+    /// Returns identities observed in the Job so far, including exited members.
     ///
     /// # Errors
     /// Returns a typed adapter error when membership or identity cannot be read.
     pub fn job_processes(&self) -> Result<Vec<ProcessIdentity>, WindowsAdapterError> {
-        job_process_ids(self.inner.job.handle)
-            .map_err(|error| windows_adapter_from_io(&error))?
-            .into_iter()
-            .map(|pid| {
-                inspect_process_identity(pid).map_err(|error| windows_adapter_from_io(&error))
-            })
-            .collect()
+        Ok(self
+            .inner
+            .history()?
+            .processes()
+            .iter()
+            .map(|process| process.process().clone())
+            .collect())
+    }
+
+    /// Returns the current number of live Job members.
+    ///
+    /// # Errors
+    /// Returns a typed adapter error when Job state cannot be queried.
+    pub fn active_process_count(&self) -> Result<u32, WindowsAdapterError> {
+        self.inner.active_process_count()
+    }
+
+    /// Returns historical membership observed so far.
+    ///
+    /// While the Job is active, `complete` is necessarily false because more
+    /// descendants may still be created.
+    ///
+    /// # Errors
+    /// Returns a typed adapter error when current Job membership cannot be read.
+    pub fn process_history(&self) -> Result<JobProcessHistory, WindowsAdapterError> {
+        self.inner.history()
+    }
+
+    /// Waits for the Job to become empty and returns the final history.
+    ///
+    /// A timed-out or identity-gap result is returned with `complete == false`;
+    /// callers must project that as UNKNOWN rather than tree closure.
+    ///
+    /// # Errors
+    /// Returns a typed adapter error when Job membership cannot be observed.
+    pub fn wait_for_empty_history(
+        &self,
+        timeout: std::time::Duration,
+    ) -> Result<JobProcessHistory, WindowsAdapterError> {
+        self.inner.wait_for_empty_history(timeout)
     }
 
     /// Consumes and terminates the complete Job exactly once.
@@ -1096,9 +2231,11 @@ fn terminalize(
     requested_exit_code: u32,
 ) -> Result<TerminatedJobChild, WindowsAdapterError> {
     let process = inner.spawn_identity.clone();
-    let observed_exit_code = inner.terminate_and_reap(requested_exit_code)?;
+    let (observed_exit_code, history) = inner.terminate_and_reap(requested_exit_code)?;
     Ok(TerminatedJobChild {
         process,
+        job: inner.job.identity().clone(),
+        history,
         requested_exit_code,
         observed_exit_code,
         job_empty: true,
@@ -1975,8 +3112,8 @@ fn windows_adapter_from_io(error: &std::io::Error) -> WindowsAdapterError {
     #[cfg(windows)]
     if let Some(code) = error.raw_os_error() {
         use windows_sys::Win32::Foundation::{
-            ERROR_ACCESS_DENIED, ERROR_FILE_NOT_FOUND, ERROR_NOT_FOUND, ERROR_PATH_NOT_FOUND,
-            ERROR_SERVICE_DOES_NOT_EXIST, ERROR_TIMEOUT,
+            ERROR_ACCESS_DENIED, ERROR_ALREADY_EXISTS, ERROR_FILE_NOT_FOUND, ERROR_NOT_FOUND,
+            ERROR_PATH_NOT_FOUND, ERROR_SERVICE_DOES_NOT_EXIST, ERROR_TIMEOUT,
         };
         if matches!(
             code,
@@ -1986,6 +3123,9 @@ fn windows_adapter_from_io(error: &std::io::Error) -> WindowsAdapterError {
                 || value == ERROR_SERVICE_DOES_NOT_EXIST.cast_signed()
         ) {
             return WindowsAdapterError::Unavailable;
+        }
+        if code == ERROR_ALREADY_EXISTS.cast_signed() {
+            return WindowsAdapterError::AlreadyExists;
         }
         if code == ERROR_ACCESS_DENIED.cast_signed() {
             return WindowsAdapterError::PermissionDenied;
@@ -1999,9 +3139,11 @@ fn windows_adapter_from_io(error: &std::io::Error) -> WindowsAdapterError {
             WindowsAdapterError::InvalidInput
         }
         std::io::ErrorKind::PermissionDenied => WindowsAdapterError::PermissionDenied,
-        std::io::ErrorKind::NotFound
-        | std::io::ErrorKind::ConnectionRefused
-        | std::io::ErrorKind::ConnectionReset => WindowsAdapterError::Unavailable,
+        std::io::ErrorKind::NotFound => WindowsAdapterError::Unavailable,
+        std::io::ErrorKind::AlreadyExists => WindowsAdapterError::AlreadyExists,
+        std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::ConnectionReset => {
+            WindowsAdapterError::Unavailable
+        }
         std::io::ErrorKind::TimedOut => WindowsAdapterError::Timeout,
         _ => WindowsAdapterError::Failed,
     }

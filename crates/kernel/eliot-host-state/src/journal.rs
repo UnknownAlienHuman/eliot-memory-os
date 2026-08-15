@@ -22,9 +22,26 @@ pub enum AppendDisposition {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AppendReceipt {
-    pub sequence: u64,
-    pub disposition: AppendDisposition,
-    pub transaction_id: PlatformHandle,
+    sequence: u64,
+    disposition: AppendDisposition,
+    transaction_id: PlatformHandle,
+}
+
+impl AppendReceipt {
+    /// Sequence assigned by the reducer after durable commit or exact replay.
+    pub const fn sequence(&self) -> u64 {
+        self.sequence
+    }
+
+    /// Whether this call applied a new frame or replayed an existing one.
+    pub const fn disposition(&self) -> AppendDisposition {
+        self.disposition
+    }
+
+    /// Stable transaction identity used for UNKNOWN reconciliation.
+    pub fn transaction_id(&self) -> &PlatformHandle {
+        &self.transaction_id
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -196,6 +213,14 @@ fn apply(
             .as_ref()
             .map(|activation| &activation.fence.activation_generation)
             .ok_or(JournalError::StaleFence)?;
+        let active_activation_id = state
+            .activation
+            .as_ref()
+            .map(|activation| &activation.activation_id)
+            .ok_or(JournalError::StaleFence)?;
+        if &record.fence().activation_id != active_activation_id {
+            return Err(JournalError::StaleFence);
+        }
         if active_generation != &record.fence().activation_generation {
             return Err(JournalError::StaleFence);
         }
@@ -291,6 +316,7 @@ fn apply(
         }
         HostStateRecord::Observation(next) => {
             state.observations.push(next.clone());
+            state.clean_marker = None;
         }
         HostStateRecord::CleanMarker(next) => {
             if next.manifest.schema_version != JOURNAL_VERSION
@@ -321,6 +347,7 @@ fn apply(
                 }
             }
             state.retired_epochs.push(next.retired_host.clone());
+            state.clean_marker = None;
         }
     }
     state.applied_operations.push(AppliedOperation {
@@ -410,7 +437,7 @@ fn state_for_host(
         return Ok(current);
     }
     if image.epochs.is_empty() {
-        if host.epoch.parent.is_some() || host.recovery.is_some() {
+        if host.epoch.parent.is_some() {
             return Err(JournalError::RecoveryRequiresNewEpoch);
         }
         return Ok(HostState::new(host.clone(), Vec::new()));

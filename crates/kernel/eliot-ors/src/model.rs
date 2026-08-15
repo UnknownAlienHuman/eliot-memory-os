@@ -728,6 +728,49 @@ operational_receipt!(AuthorityRevocationReceipt);
 operational_receipt!(AuthorityActivationReceipt);
 operational_receipt!(CapabilityIntroductionReceipt);
 
+/// Integrity-checked active authority snapshot read back from ORS.
+///
+/// This value proves only that P-06 recovered the exact opaque record it had
+/// durably committed. ORS never decrypts or interprets the payload and this
+/// value grants no Kernel or process authority. The P-07 owner must resolve
+/// the payload through its platform secret/artifact port and revalidate the
+/// decoded authority state against the expected active identity and fence.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct RecoveredAuthoritySnapshot {
+    snapshot: KernelAuthoritySnapshot,
+    operation_order: u64,
+    receipt: AuthoritySnapshotReceipt,
+}
+
+impl RecoveredAuthoritySnapshot {
+    pub(crate) const fn from_store(
+        snapshot: KernelAuthoritySnapshot,
+        operation_order: u64,
+        receipt: AuthoritySnapshotReceipt,
+    ) -> Self {
+        Self {
+            snapshot,
+            operation_order,
+            receipt,
+        }
+    }
+
+    /// Returns the validated opaque authority-snapshot record.
+    pub const fn snapshot(&self) -> &KernelAuthoritySnapshot {
+        &self.snapshot
+    }
+
+    /// Returns the monotonic ORS operation order at which it became active.
+    pub const fn operation_order(&self) -> u64 {
+        self.operation_order
+    }
+
+    /// Returns the store-issued integrity receipt for the recovered record.
+    pub const fn receipt(&self) -> &AuthoritySnapshotReceipt {
+        &self.receipt
+    }
+}
+
 /// Signed/hashed recovery-inbox item. ORS verifies bindings and delegates signer trust.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

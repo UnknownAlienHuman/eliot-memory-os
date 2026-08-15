@@ -1,0 +1,31 @@
+[package]
+name = "eliot-kernel-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "P-07 authority activation, fencing, generation routing, control reserve and recovery decision core"
+
+[package.metadata.eliot]
+work_id = "P-07"
+functional_cell = "kernel-core"
+lifecycle_owner = "P-07"
+source_layer = "C1"
+proof_entrypoint = "cargo test -p eliot-kernel-core"
+
+[dependencies]
+eliot-contracts.workspace = true
+eliot-platform.workspace = true
+eliot-ors.workspace = true
+eliot-process.workspace = true
+eliot-receipts.workspace = true
+eliot-runtime-contracts.workspace = true
+blake3.workspace = true
+schemars.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true

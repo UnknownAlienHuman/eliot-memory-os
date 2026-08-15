@@ -168,12 +168,17 @@ impl IdempotencyIdentity {
 #[serde(deny_unknown_fields)]
 pub struct RecordFence {
     pub host: HostInstallationEpoch,
+    /// The Eliot activation that owns this record. Every record in one
+    /// activation generation must carry the same identity; the reducer, not
+    /// a caller, establishes the binding against the activation projection.
+    pub activation_id: PlatformHandle,
     pub activation_generation: EpochTransition,
 }
 
 impl RecordFence {
     fn validate(&self) -> Result<(), JournalError> {
         self.host.validate()?;
+        handle(&self.activation_id, "fence.activation_id")?;
         self.activation_generation.validate()
     }
 }
@@ -301,6 +306,9 @@ impl EliotActivationRecord {
         self.fence.validate()?;
         self.operation.validate()?;
         handle(&self.activation_id, "activation_id")?;
+        if self.fence.activation_id != self.activation_id {
+            return Err(JournalError::StaleFence);
+        }
         handle(&self.trigger_class, "trigger_class")?;
         handles(&self.trigger_evidence, "trigger_evidence", true)?;
         handle(
@@ -314,6 +322,15 @@ impl EliotActivationRecord {
             if drain.current.lineage != self.fence.activation_generation.current.lineage {
                 return Err(JournalError::EpochLineageConflict);
             }
+        }
+        if matches!(
+            self.state,
+            ActivationState::Draining | ActivationState::StoppedClean
+        ) && self.drain_generation.is_none()
+        {
+            return Err(JournalError::Invalid(
+                "draining/clean-stop activation requires drain_generation".into(),
+            ));
         }
         self.lineage.validate(&self.fence.host)?;
         self.readiness.validate()?;
@@ -404,6 +421,9 @@ impl KernelRecord {
         self.fence.validate()?;
         self.operation.validate()?;
         handle(&self.activation_identity, "kernel.activation_identity")?;
+        if self.fence.activation_id != self.activation_identity {
+            return Err(JournalError::StaleFence);
+        }
         handle(
             &self.approved_artifact_hash,
             "kernel.approved_artifact_hash",
@@ -543,6 +563,36 @@ impl DependencyLifecycleBudget {
     }
 }
 
+/// Complete host-enforced resource ceiling for one dependency generation.
+/// The physical P-02/P-09 adapter consumes these values; P-05 persists and
+/// compares the immutable contract on every lifecycle transition.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DependencyResourceBudget {
+    pub budget_identity: PlatformHandle,
+    pub max_cpu_time_ms: u64,
+    pub max_memory_bytes: u64,
+    pub max_process_handles: u32,
+    pub max_io_bytes: u64,
+    pub max_child_processes: u32,
+}
+
+impl DependencyResourceBudget {
+    fn validate(&self) -> Result<(), JournalError> {
+        handle(&self.budget_identity, "resource_budget.budget_identity")?;
+        if self.max_cpu_time_ms == 0
+            || self.max_memory_bytes == 0
+            || self.max_process_handles == 0
+            || self.max_io_bytes == 0
+        {
+            return Err(JournalError::Invalid(
+                "resource_budget ceilings must be positive".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DependencyRecord {
@@ -556,6 +606,7 @@ pub struct DependencyRecord {
     pub outcome: PortOutcome<ServiceProcessRecord>,
     pub pid_job_lineage_refs: Vec<PlatformHandle>,
     pub lifecycle_budget: DependencyLifecycleBudget,
+    pub resource_budget: DependencyResourceBudget,
     pub approved_artifact_hash: PlatformHandle,
     pub approved_config_hash: PlatformHandle,
     pub disposition_evidence: Vec<PlatformHandle>,
@@ -572,6 +623,7 @@ impl DependencyRecord {
         validate_process_outcome(&self.outcome)?;
         handles(&self.pid_job_lineage_refs, "pid_job_lineage_refs", false)?;
         self.lifecycle_budget.validate()?;
+        self.resource_budget.validate()?;
         handle(&self.approved_artifact_hash, "approved_artifact_hash")?;
         handle(&self.approved_config_hash, "approved_config_hash")?;
         handles(&self.disposition_evidence, "disposition_evidence", true)?;
@@ -1122,6 +1174,7 @@ pub(crate) fn dependency_transition(
         || current.approved_artifact_hash != next.approved_artifact_hash
         || current.approved_config_hash != next.approved_config_hash
         || current.lifecycle_budget.budget_identity != next.lifecycle_budget.budget_identity
+        || current.resource_budget != next.resource_budget
     {
         return Err(JournalError::StaleFence);
     }
