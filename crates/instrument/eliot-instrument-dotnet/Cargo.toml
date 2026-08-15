@@ -1,0 +1,20 @@
+[package]
+name = "eliot-instrument-dotnet"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.89"
+license = "MIT"
+description = "Native .NET and MSBuild instrument process adapter"
+
+[workspace]
+
+[dependencies]
+blake3 = "1.8.5"
+eliot-instrument-api = { path = "../eliot-instrument-api" }
+eliot-process = { path = "../../kernel/eliot-process" }
+sha2 = "0.10.9"
+thiserror = "2.0.18"
+tokio = { version = "1.52.3", features = ["io-util", "macros", "process", "rt", "sync", "time"] }
+
+[lints.rust]
+unsafe_code = "forbid"
