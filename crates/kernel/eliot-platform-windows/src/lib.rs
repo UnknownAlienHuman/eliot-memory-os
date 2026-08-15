@@ -107,11 +107,6 @@ pub enum HostOwnerLeaseReleaseError {
     ReleaseMutex { win32_error: u32 },
     /// Closing the owner handle failed after ownership was released or was not held.
     CloseHandle { win32_error: u32 },
-    /// Both release and close failed; the caller must retain recovery evidence.
-    ReleaseAndClose {
-        release_error: u32,
-        close_error: u32,
-    },
     /// This primitive is intentionally unavailable off Windows.
     UnsupportedPlatform,
 }
@@ -126,13 +121,6 @@ impl std::fmt::Display for HostOwnerLeaseReleaseError {
             Self::CloseHandle { win32_error } => write!(
                 formatter,
                 "Host owner CloseHandle failed (Win32 error {win32_error})"
-            ),
-            Self::ReleaseAndClose {
-                release_error,
-                close_error,
-            } => write!(
-                formatter,
-                "Host owner ReleaseMutex and CloseHandle failed (Win32 errors {release_error}, {close_error})"
             ),
             Self::UnsupportedPlatform => formatter.write_str("Host owner release requires Windows"),
         }
@@ -259,8 +247,9 @@ impl HostOwnerLease {
         &self.name
     }
 
-    /// Releases the owner mutex after the caller has durably recorded clean
-    /// Host shutdown.  Drop remains a last-resort close for error paths.
+    /// Releases the owner mutex after the caller has durably recorded a
+    /// release-pending Host disposition. Drop remains a last-resort close for
+    /// error paths; callers must finalize clean state only after `Ok(())`.
     pub fn release(&mut self) -> Result<(), HostOwnerLeaseReleaseError> {
         #[cfg(windows)]
         {
@@ -269,33 +258,22 @@ impl HostOwnerLease {
             if self.handle.is_null() {
                 return Ok(());
             }
-            let release_error = if self.owns && unsafe { ReleaseMutex(self.handle) } == 0 {
-                Some(unsafe { GetLastError() })
-            } else {
-                self.owns = false;
-                None
-            };
-            let close_error = if unsafe { CloseHandle(self.handle) } == 0 {
-                Some(unsafe { GetLastError() })
-            } else {
-                self.handle = std::ptr::null_mut();
-                None
-            };
-            return match (release_error, close_error) {
-                (None, None) => Ok(()),
-                (Some(release_error), None) => Err(HostOwnerLeaseReleaseError::ReleaseMutex {
-                    win32_error: release_error,
-                }),
-                (None, Some(close_error)) => Err(HostOwnerLeaseReleaseError::CloseHandle {
-                    win32_error: close_error,
-                }),
-                (Some(release_error), Some(close_error)) => {
-                    Err(HostOwnerLeaseReleaseError::ReleaseAndClose {
-                        release_error,
-                        close_error,
-                    })
-                }
-            };
+            // A failed ReleaseMutex must retain both ownership state and the
+            // handle. Closing here would abandon the durable admission gate
+            // and make a later retry impossible to classify safely.
+            if self.owns && unsafe { ReleaseMutex(self.handle) } == 0 {
+                return Err(HostOwnerLeaseReleaseError::ReleaseMutex {
+                    win32_error: unsafe { GetLastError() },
+                });
+            }
+            self.owns = false;
+            if unsafe { CloseHandle(self.handle) } == 0 {
+                return Err(HostOwnerLeaseReleaseError::CloseHandle {
+                    win32_error: unsafe { GetLastError() },
+                });
+            }
+            self.handle = std::ptr::null_mut();
+            return Ok(());
         }
         #[cfg(not(windows))]
         {

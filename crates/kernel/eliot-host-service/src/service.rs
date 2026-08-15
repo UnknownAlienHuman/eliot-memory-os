@@ -197,7 +197,9 @@ where
         }
         let state = if snapshot.active_process.is_some() {
             HostServiceState::DegradedRecovery
-        } else if snapshot.last_clean_shutdown.is_some() {
+        } else if snapshot.last_clean_shutdown.is_some()
+            || snapshot.last_recovery_evidence.is_some()
+        {
             HostServiceState::StoppedClean
         } else {
             HostServiceState::Stopped

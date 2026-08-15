@@ -6,10 +6,12 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::{EpochIdentity, EpochTransition, HostInstallationEpoch};
 use eliot_platform::{
-    HostActivationReceipt, HostActivationTransition, HostInstallationState, HostShutdownMarker,
+    HostActivationReceipt, HostActivationTransition, HostEpochBinding, HostInstallationState,
+    HostProcessRecoveryBinding, HostRecoveryEvidence, HostShutdownDisposition, HostShutdownMarker,
     HostStateError, HostStateStore, ManagedDependencyReceipt, ManagedDependencyTransition,
     PlatformHandle,
 };
+use eliot_runtime_contracts::ServiceProcessRecord;
 use redb::{Database, ReadOnlyDatabase, ReadableDatabase, TableDefinition};
 
 const STATE: TableDefinition<&str, &[u8]> = TableDefinition::new("eliot_host_state_v1");
@@ -27,6 +29,16 @@ pub enum HostAdmissionState {
     FirstInstall,
     Clean,
     RecoveryRequired,
+}
+
+/// Exact stale projection returned to an explicit recovery caller.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HostRecoverySnapshot {
+    pub installation: PlatformHandle,
+    pub host_epoch: HostEpochBinding,
+    pub active_process: ServiceProcessRecord,
+    pub process: HostProcessRecoveryBinding,
+    pub disposition: HostShutdownDisposition,
 }
 
 /// Host-local state store backed by a redb database.
@@ -56,18 +68,57 @@ impl RedbHostStateStore {
         let database = ReadOnlyDatabase::open(path).map_err(|_| HostStateError::Unavailable)?;
         let state = read_state_from(&database)?.ok_or(HostStateError::Unavailable)?;
         validate_admission_state(&state, installation)?;
-        if state.active_process.is_some() || state.last_clean_shutdown.is_none() {
+        if state.active_process.is_some()
+            || state.disposition.is_release_pending()
+            || (state.last_clean_shutdown.is_none() && state.last_recovery_evidence.is_none())
+        {
             Ok(HostAdmissionState::RecoveryRequired)
         } else {
             Ok(HostAdmissionState::Clean)
         }
     }
 
+    /// Reads the exact stale projection without mutation. Missing or
+    /// contradictory recovery fields fail closed instead of being inferred.
+    pub fn inspect_recovery(
+        path: impl AsRef<Path>,
+        installation: &PlatformHandle,
+    ) -> Result<HostRecoverySnapshot, HostStateError> {
+        let path = path.as_ref();
+        match fs::symlink_metadata(path) {
+            Ok(metadata) if metadata.is_file() => {}
+            Ok(_) | Err(_) => return Err(HostStateError::Unavailable),
+        }
+        let database = ReadOnlyDatabase::open(path).map_err(|_| HostStateError::Unavailable)?;
+        let state = read_state_from(&database)?.ok_or(HostStateError::Unavailable)?;
+        validate_admission_state(&state, installation)?;
+        let active_process = state
+            .active_process
+            .clone()
+            .ok_or(HostStateError::InvalidRecord)?;
+        let process = state
+            .active_process_recovery
+            .clone()
+            .ok_or(HostStateError::InvalidRecord)?;
+        let host_epoch = host_epoch_binding(
+            read_epoch_from(&database)?
+                .as_ref()
+                .ok_or(HostStateError::Unavailable)?,
+        )?;
+        Ok(HostRecoverySnapshot {
+            installation: installation.clone(),
+            host_epoch,
+            active_process,
+            process,
+            disposition: state.disposition,
+        })
+    }
+
     /// Opens an existing Host database for an explicit recovery mutation.
     ///
     /// Unlike [`Self::open`], this never creates a missing file or installs an
     /// initial state record. Recovery callers must first acquire the Host
-    /// owner lease and supply a validated shutdown marker.
+    /// owner lease and supply exact typed recovery evidence.
     pub fn open_existing(
         path: impl AsRef<Path>,
         installation: &PlatformHandle,
@@ -82,6 +133,110 @@ impl RedbHostStateStore {
         let state = store.read_state()?.ok_or(HostStateError::Unavailable)?;
         validate_admission_state(&state, installation)?;
         Ok(store)
+    }
+
+    /// Persists the release-pending disposition before the process attempts
+    /// to release its cross-process owner lease. The active projection stays
+    /// present so a later recovery decision can bind exact stale identity.
+    pub fn prepare_release_pending(
+        &self,
+        marker: HostShutdownMarker,
+    ) -> Result<(), HostStateError> {
+        marker.validate()?;
+        let installation = marker.installation.clone();
+        self.mutate(installation.as_str(), |state| {
+            if state.active_process.as_ref() != Some(&marker.process)
+                || state.active_process_recovery.is_none()
+            {
+                return Err(HostStateError::InvalidRecord);
+            }
+            if let Some(process) = state.active_process_recovery.as_mut() {
+                process.job = match &process.job {
+                    eliot_platform::HostJobDisposition::Assigned { job } => {
+                        eliot_platform::HostJobDisposition::Terminated { job: job.clone() }
+                    }
+                    disposition => disposition.clone(),
+                };
+            }
+            state.disposition = HostShutdownDisposition::ReleasePending { marker };
+            state.last_recovery_evidence = None;
+            Ok(())
+        })
+    }
+
+    /// Finalizes clean state only when the exact release-pending marker still
+    /// owns the projection. A concurrent recovery mutation therefore cannot
+    /// be overwritten by a late post-release finalizer.
+    pub fn finalize_clean_shutdown(
+        &self,
+        marker: HostShutdownMarker,
+    ) -> Result<(), HostStateError> {
+        marker.validate()?;
+        let installation = marker.installation.clone();
+        self.mutate(installation.as_str(), |state| {
+            if state.active_process.as_ref() != Some(&marker.process)
+                || state.active_process_recovery.is_none()
+            {
+                return Err(HostStateError::InvalidRecord);
+            }
+            match &state.disposition {
+                HostShutdownDisposition::ReleasePending { marker: pending }
+                    if pending == &marker => {}
+                _ => return Err(HostStateError::InvalidRecord),
+            }
+            state.active_process = None;
+            state.active_process_recovery = None;
+            state.disposition = HostShutdownDisposition::Clean;
+            state.last_clean_shutdown = Some(marker);
+            state.last_recovery_evidence = None;
+            Ok(())
+        })
+    }
+
+    /// Clears a stale projection only when every identity in the typed
+    /// evidence matches the current durable state and epoch table.
+    pub fn clear_recovery(&self, evidence: HostRecoveryEvidence) -> Result<(), HostStateError> {
+        evidence.validate()?;
+        let current_epoch = host_epoch_binding(
+            self.read_epoch()?
+                .as_ref()
+                .ok_or(HostStateError::Unavailable)?,
+        )?;
+        if current_epoch != evidence.host_epoch {
+            return Err(HostStateError::InvalidRecord);
+        }
+        let installation = evidence.installation.clone();
+        self.mutate(installation.as_str(), |state| {
+            if state.active_process.as_ref() != Some(&evidence.stale_active_process)
+                || state.active_process_recovery.as_ref() != Some(&evidence.process)
+                || state.disposition != evidence.observed_disposition
+            {
+                return Err(HostStateError::InvalidRecord);
+            }
+            state.active_process = None;
+            state.active_process_recovery = None;
+            state.disposition = HostShutdownDisposition::Clean;
+            state.last_recovery_evidence = Some(evidence);
+            Ok(())
+        })
+    }
+
+    /// Attaches the measured process/PID/image/job projection to an already
+    /// committed activation. A missing projection is intentionally accepted
+    /// only as an incomplete recovery gate, never as healthy admission.
+    pub fn record_active_process_recovery(
+        &self,
+        installation: &PlatformHandle,
+        process: HostProcessRecoveryBinding,
+    ) -> Result<(), HostStateError> {
+        process.validate()?;
+        self.mutate(installation.as_str(), |state| {
+            if state.active_process.is_none() {
+                return Err(HostStateError::InvalidRecord);
+            }
+            state.active_process_recovery = Some(process);
+            Ok(())
+        })
     }
 
     /// Opens or creates a Host state database and installs the initial
@@ -124,6 +279,9 @@ impl RedbHostStateStore {
             active_process: None,
             managed_dependencies: Vec::new(),
             last_clean_shutdown: None,
+            disposition: HostShutdownDisposition::Clean,
+            active_process_recovery: None,
+            last_recovery_evidence: None,
         };
         initial.validate()?;
         if let Some(parent) = path.as_ref().parent() {
@@ -151,42 +309,7 @@ impl RedbHostStateStore {
     }
 
     fn read_epoch(&self) -> Result<Option<HostInstallationEpoch>, HostStateError> {
-        let read = self
-            .database
-            .begin_read()
-            .map_err(|_| HostStateError::Unavailable)?;
-        let table = match read.open_table(EPOCH) {
-            Ok(table) => table,
-            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
-            Err(_) => return Err(HostStateError::Unavailable),
-        };
-        let Some(value) = table
-            .get(CURRENT_EPOCH)
-            .map_err(|_| HostStateError::Unavailable)?
-        else {
-            return Ok(None);
-        };
-        let epoch: HostInstallationEpoch =
-            serde_json::from_slice(value.value()).map_err(|_| HostStateError::Unavailable)?;
-        epoch.validate().map_err(|_| HostStateError::Unavailable)?;
-        Ok(Some(epoch))
-    }
-
-    fn write_epoch(&self, epoch: &HostInstallationEpoch) -> Result<(), HostStateError> {
-        let bytes = serde_json::to_vec(epoch).map_err(|_| HostStateError::Unavailable)?;
-        let write = self
-            .database
-            .begin_write()
-            .map_err(|_| HostStateError::Unavailable)?;
-        {
-            let mut table = write
-                .open_table(EPOCH)
-                .map_err(|_| HostStateError::Unavailable)?;
-            table
-                .insert(CURRENT_EPOCH, bytes.as_slice())
-                .map_err(|_| HostStateError::Unavailable)?;
-        }
-        write.commit().map_err(|_| HostStateError::Unavailable)
+        read_epoch_from(&self.database)
     }
 
     fn read_state(&self) -> Result<Option<HostInstallationState>, HostStateError> {
@@ -211,6 +334,23 @@ impl RedbHostStateStore {
         write.commit().map_err(|_| HostStateError::Unavailable)
     }
 
+    fn write_epoch(&self, epoch: &HostInstallationEpoch) -> Result<(), HostStateError> {
+        let bytes = serde_json::to_vec(epoch).map_err(|_| HostStateError::Unavailable)?;
+        let write = self
+            .database
+            .begin_write()
+            .map_err(|_| HostStateError::Unavailable)?;
+        {
+            let mut table = write
+                .open_table(EPOCH)
+                .map_err(|_| HostStateError::Unavailable)?;
+            table
+                .insert(CURRENT_EPOCH, bytes.as_slice())
+                .map_err(|_| HostStateError::Unavailable)?;
+        }
+        write.commit().map_err(|_| HostStateError::Unavailable)
+    }
+
     fn mutate<F>(&self, installation: &str, mutation: F) -> Result<(), HostStateError>
     where
         F: FnOnce(&mut HostInstallationState) -> Result<(), HostStateError>,
@@ -222,6 +362,43 @@ impl RedbHostStateStore {
         mutation(&mut state)?;
         self.write_state(&state)
     }
+}
+
+fn read_epoch_from<D: ReadableDatabase>(
+    database: &D,
+) -> Result<Option<HostInstallationEpoch>, HostStateError> {
+    let read = database
+        .begin_read()
+        .map_err(|_| HostStateError::Unavailable)?;
+    let table = match read.open_table(EPOCH) {
+        Ok(table) => table,
+        Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
+        Err(_) => return Err(HostStateError::Unavailable),
+    };
+    let Some(value) = table
+        .get(CURRENT_EPOCH)
+        .map_err(|_| HostStateError::Unavailable)?
+    else {
+        return Ok(None);
+    };
+    let epoch: HostInstallationEpoch =
+        serde_json::from_slice(value.value()).map_err(|_| HostStateError::Unavailable)?;
+    epoch.validate().map_err(|_| HostStateError::Unavailable)?;
+    Ok(Some(epoch))
+}
+
+fn host_epoch_binding(epoch: &HostInstallationEpoch) -> Result<HostEpochBinding, HostStateError> {
+    epoch
+        .validate()
+        .map_err(|_| HostStateError::InvalidRecord)?;
+    let binding = HostEpochBinding {
+        installation: epoch.installation.clone(),
+        lineage: epoch.epoch.current.lineage.clone(),
+        sequence: epoch.epoch.current.sequence,
+        nonce: epoch.nonce.clone(),
+    };
+    binding.validate()?;
+    Ok(binding)
 }
 
 fn read_state_from<D: ReadableDatabase>(
@@ -330,6 +507,9 @@ impl HostStateStore for RedbHostStateStore {
         self.mutate(transition.installation.as_str(), |state| {
             state.active_process = Some(transition.process);
             state.last_clean_shutdown = None;
+            state.last_recovery_evidence = None;
+            state.disposition = HostShutdownDisposition::Clean;
+            state.active_process_recovery = None;
             Ok(())
         })?;
         Ok(receipt)
@@ -368,7 +548,10 @@ impl HostStateStore for RedbHostStateStore {
         let installation = marker.installation.clone();
         self.mutate(installation.as_str(), |state| {
             state.active_process = None;
+            state.active_process_recovery = None;
+            state.disposition = HostShutdownDisposition::Clean;
             state.last_clean_shutdown = Some(marker);
+            state.last_recovery_evidence = None;
             Ok(())
         })
     }

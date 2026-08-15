@@ -545,6 +545,179 @@ pub trait InstallationPort {
 }
 
 /// Host-local operational installation/process lineage. It carries no project semantics.
+/// Exact Host epoch identity persisted alongside the operational projection.
+///
+/// This deliberately carries the installation, lineage, sequence and nonce
+/// that an offline recovery decision must match.  A sequence alone is never
+/// sufficient to identify a Host process lineage.
+#[derive(
+    Clone, Debug, Eq, Hash, JsonSchema, Ord, PartialEq, PartialOrd, Serialize, Deserialize,
+)]
+#[serde(deny_unknown_fields)]
+pub struct HostEpochBinding {
+    pub installation: PlatformHandle,
+    pub lineage: PlatformHandle,
+    pub sequence: u64,
+    pub nonce: PlatformHandle,
+}
+
+impl HostEpochBinding {
+    pub fn validate(&self) -> Result<(), HostStateError> {
+        validate_text(self.installation.as_str(), "host_epoch.installation")
+            .map_err(|_| HostStateError::InvalidRecord)?;
+        validate_text(self.lineage.as_str(), "host_epoch.lineage")
+            .map_err(|_| HostStateError::InvalidRecord)?;
+        if self.sequence == 0 {
+            return Err(HostStateError::InvalidRecord);
+        }
+        validate_text(self.nonce.as_str(), "host_epoch.nonce")
+            .map_err(|_| HostStateError::InvalidRecord)
+    }
+}
+
+/// Exact disposition of the process's Host Job Object boundary at recovery.
+#[derive(
+    Clone, Debug, Eq, Hash, JsonSchema, Ord, PartialEq, PartialOrd, Serialize, Deserialize,
+)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum HostJobDisposition {
+    NotAssigned,
+    Assigned { job: PlatformHandle },
+    Terminated { job: PlatformHandle },
+}
+
+impl HostJobDisposition {
+    pub fn validate(&self) -> Result<(), HostStateError> {
+        match self {
+            Self::NotAssigned => Ok(()),
+            Self::Assigned { job } | Self::Terminated { job } => {
+                validate_text(job.as_str(), "process_recovery.job")
+                    .map_err(|_| HostStateError::InvalidRecord)
+            }
+        }
+    }
+}
+
+/// Process identity required to clear a stale Host projection.
+#[derive(
+    Clone, Debug, Eq, Hash, JsonSchema, Ord, PartialEq, PartialOrd, Serialize, Deserialize,
+)]
+#[serde(deny_unknown_fields)]
+pub struct HostProcessRecoveryBinding {
+    pub process_generation: PlatformHandle,
+    pub process_id: u32,
+    pub image_path: PlatformHandle,
+    pub job: HostJobDisposition,
+}
+
+impl HostProcessRecoveryBinding {
+    pub fn validate(&self) -> Result<(), HostStateError> {
+        validate_text(
+            self.process_generation.as_str(),
+            "process_recovery.process_generation",
+        )
+        .map_err(|_| HostStateError::InvalidRecord)?;
+        if self.process_id == 0 {
+            return Err(HostStateError::InvalidRecord);
+        }
+        validate_text(self.image_path.as_str(), "process_recovery.image_path")
+            .map_err(|_| HostStateError::InvalidRecord)?;
+        self.job.validate()
+    }
+}
+
+/// Explicit reason supplied by an operator or an installation authority for
+/// clearing a stale Host projection.
+#[derive(
+    Clone, Copy, Debug, Eq, Hash, JsonSchema, Ord, PartialEq, PartialOrd, Serialize, Deserialize,
+)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum HostRecoveryReason {
+    UncleanExit,
+    OwnerReleaseFailure,
+    ReleaseFinalizationFailure,
+    OperatorApproved,
+}
+
+/// Typed evidence for one exact stale Host projection.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HostRecoveryEvidence {
+    pub installation: PlatformHandle,
+    pub host_epoch: HostEpochBinding,
+    pub stale_active_process: ServiceProcessRecord,
+    pub process: HostProcessRecoveryBinding,
+    pub observed_disposition: HostShutdownDisposition,
+    pub reason: HostRecoveryReason,
+    pub operator_identity: PlatformHandle,
+    pub authority_identity: PlatformHandle,
+    pub evidence_refs: Vec<PlatformHandle>,
+}
+
+impl HostRecoveryEvidence {
+    pub fn validate(&self) -> Result<(), HostStateError> {
+        validate_text(self.installation.as_str(), "recovery.installation")
+            .map_err(|_| HostStateError::InvalidRecord)?;
+        self.host_epoch.validate()?;
+        if self.host_epoch.installation != self.installation {
+            return Err(HostStateError::InstallationMismatch);
+        }
+        self.stale_active_process
+            .validate()
+            .map_err(|_| HostStateError::InvalidRecord)?;
+        self.process.validate()?;
+        self.observed_disposition.validate()?;
+        validate_text(
+            self.operator_identity.as_str(),
+            "recovery.operator_identity",
+        )
+        .map_err(|_| HostStateError::InvalidRecord)?;
+        validate_text(
+            self.authority_identity.as_str(),
+            "recovery.authority_identity",
+        )
+        .map_err(|_| HostStateError::InvalidRecord)?;
+        if self.evidence_refs.is_empty()
+            || self.evidence_refs.iter().any(|reference| {
+                validate_text(reference.as_str(), "recovery.evidence_refs").is_err()
+            })
+        {
+            return Err(HostStateError::InvalidRecord);
+        }
+        Ok(())
+    }
+}
+
+/// Durable Host shutdown disposition. `ReleasePending` is intentionally not
+/// admission-clean: it remains a recovery gate until release and finalization
+/// both succeed.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum HostShutdownDisposition {
+    Clean,
+    ReleasePending { marker: HostShutdownMarker },
+}
+
+impl Default for HostShutdownDisposition {
+    fn default() -> Self {
+        Self::Clean
+    }
+}
+
+impl HostShutdownDisposition {
+    pub fn validate(&self) -> Result<(), HostStateError> {
+        match self {
+            Self::Clean => Ok(()),
+            Self::ReleasePending { marker } => marker.validate(),
+        }
+    }
+
+    #[must_use]
+    pub const fn is_release_pending(&self) -> bool {
+        matches!(self, Self::ReleasePending { .. })
+    }
+}
+
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct HostInstallationState {
@@ -552,6 +725,12 @@ pub struct HostInstallationState {
     pub active_process: Option<ServiceProcessRecord>,
     pub managed_dependencies: Vec<ServiceProcessRecord>,
     pub last_clean_shutdown: Option<HostShutdownMarker>,
+    #[serde(default)]
+    pub disposition: HostShutdownDisposition,
+    #[serde(default)]
+    pub active_process_recovery: Option<HostProcessRecoveryBinding>,
+    #[serde(default)]
+    pub last_recovery_evidence: Option<HostRecoveryEvidence>,
 }
 
 impl HostInstallationState {
@@ -570,6 +749,30 @@ impl HostInstallationState {
         }
         if let Some(marker) = &self.last_clean_shutdown {
             marker.validate()?;
+        }
+        self.disposition.validate()?;
+        match (&self.active_process, &self.active_process_recovery) {
+            (Some(_), Some(recovery)) => recovery.validate()?,
+            // Activation is committed before the platform-specific process
+            // identity is attached. If the process dies in that narrow
+            // window, admission remains recovery-required because the
+            // projection is deliberately incomplete rather than guessed.
+            (Some(_), None) => {}
+            (None, None) => {}
+            _ => return Err(HostStateError::InvalidRecord),
+        }
+        if let Some(evidence) = &self.last_recovery_evidence {
+            evidence.validate()?;
+            if evidence.installation != self.installation {
+                return Err(HostStateError::InstallationMismatch);
+            }
+        }
+        if let HostShutdownDisposition::ReleasePending { marker } = &self.disposition {
+            if marker.installation != self.installation
+                || self.active_process.as_ref() != Some(&marker.process)
+            {
+                return Err(HostStateError::InvalidRecord);
+            }
         }
         Ok(())
     }
@@ -866,6 +1069,9 @@ impl HostStateStore for FakeHostStateStore {
         }
         state.active_process = Some(transition.process.clone());
         state.last_clean_shutdown = None;
+        state.last_recovery_evidence = None;
+        state.disposition = HostShutdownDisposition::Clean;
+        state.active_process_recovery = None;
         Ok(HostActivationReceipt {
             request_id: transition.context.request_id,
             installation: transition.installation,
@@ -913,7 +1119,10 @@ impl HostStateStore for FakeHostStateStore {
             return Err(HostStateError::InstallationMismatch);
         }
         state.active_process = None;
+        state.active_process_recovery = None;
+        state.disposition = HostShutdownDisposition::Clean;
         state.last_clean_shutdown = Some(marker);
+        state.last_recovery_evidence = None;
         Ok(())
     }
 }
@@ -1211,6 +1420,9 @@ mod tests {
             active_process: None,
             managed_dependencies: Vec::new(),
             last_clean_shutdown: None,
+            disposition: HostShutdownDisposition::Clean,
+            active_process_recovery: None,
+            last_recovery_evidence: None,
         })
         .unwrap_or_else(|_| unreachable!());
         let host = process("host-1", "Host", ServiceProcessState::Ready);

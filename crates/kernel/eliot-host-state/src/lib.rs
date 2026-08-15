@@ -31,6 +31,6 @@ pub use model::{
     RecordFence, RecoveryLineageEvidence, RecoveryLineageReason, ServiceSafetyClass,
     WakeDisposition, WakeRecord,
 };
-pub use redb_store::{HostAdmissionState, RedbHostStateStore};
+pub use redb_store::{HostAdmissionState, HostRecoverySnapshot, RedbHostStateStore};
 #[cfg(test)]
 mod tests;

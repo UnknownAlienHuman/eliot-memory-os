@@ -15,11 +15,16 @@ use eliot_contracts::{
     AuthorityEpoch, ClockReading, ProductId, RequestId, RequestMetadata, ResourceGeneration,
     SourceId, StateFence,
 };
-use eliot_host_state::{HostAdmissionState, HostInstallationEpoch, RedbHostStateStore};
+use eliot_host_state::{
+    HostAdmissionState, HostInstallationEpoch, HostRecoverySnapshot, RedbHostStateStore,
+};
 use eliot_installation::{
     ApprovedGenerationRegistry, CandidateManifest, InstallationError, RedbInstallationRegistry,
 };
-use eliot_platform::{HostInstallationState, HostShutdownMarker, HostStateStore, PlatformHandle};
+use eliot_platform::{
+    HostInstallationState, HostJobDisposition, HostProcessRecoveryBinding, HostRecoveryEvidence,
+    HostStateStore, PlatformHandle,
+};
 use eliot_platform_windows::{HostOwnerLease, HostOwnerLeaseError, HostOwnerLeaseReleaseError};
 use eliot_runtime_contracts::{HealthVector, ServiceProcessRecord, ServiceProcessState};
 use thiserror::Error;
@@ -376,6 +381,16 @@ impl HostJobBranches {
     pub fn store_process(&self) -> Option<&ProcessIdentity> {
         self.store.as_ref().map(|child| child.evidence().process())
     }
+
+    fn kernel_recovery_binding(
+        &self,
+        generation: &PlatformHandle,
+    ) -> Result<HostProcessRecoveryBinding, HostError> {
+        let process = self
+            .kernel_process()
+            .ok_or_else(|| HostError::ProcessContour("Kernel process is unavailable".to_owned()))?;
+        process_recovery_binding(process, generation, &self.kernel_identity)
+    }
 }
 
 /// Host-owned lifecycle state and installation activation registry.
@@ -419,6 +434,7 @@ impl HostComposition {
         let registry_store = RedbInstallationRegistry::open(registry_path)?;
         let registry = registry_store.load()?;
         let host_process = host_process_record(&host)?;
+        let host_recovery = host_process_recovery_binding(&host)?;
         // Every Host invocation records an activation boundary.  If a prior
         // projection had no clean marker, this deliberately remains an
         // unclean recovery until stop() writes the shutdown receipt.
@@ -428,6 +444,9 @@ impl HostComposition {
                 installation: host.installation.clone(),
                 process: host_process.clone(),
             })
+            .map_err(HostError::State)?;
+        state_store
+            .record_active_process_recovery(&host.installation, host_recovery)
             .map_err(HostError::State)?;
         #[cfg(windows)]
         let jobs =
@@ -453,44 +472,35 @@ impl HostComposition {
         Ok(composition)
     }
 
-    /// Clears an unclean durable Host admission gate using an explicit,
-    /// caller-supplied shutdown marker. This path does not advance an epoch
-    /// or fabricate a clean marker and is intended for bounded offline
-    /// recovery only.
+    /// Clears an unclean durable Host admission gate using typed evidence that
+    /// exactly matches the inspected stale process, epoch and Job disposition.
+    /// This path does not advance an epoch or fabricate process identity and
+    /// is intended for bounded offline recovery only.
     pub fn recover_unclean(
         path: impl AsRef<Path>,
         installation: PlatformHandle,
-        marker: HostShutdownMarker,
+        evidence: HostRecoveryEvidence,
     ) -> Result<(), HostError> {
         if installation.as_str().trim().is_empty() {
             return Err(HostError::MissingInstallation);
         }
         let mut owner_lease = HostOwnerLease::acquire(&installation).map_err(owner_lease_error)?;
-        match RedbHostStateStore::inspect_admission(path.as_ref(), &installation).map_err(
+        let snapshot = RedbHostStateStore::inspect_recovery(path.as_ref(), &installation).map_err(
             |error| {
                 HostError::OwnerLeaseRecovery(format!(
                     "durable Host admission inspection failed; recovery required: {error}"
                 ))
             },
-        )? {
-            HostAdmissionState::RecoveryRequired => {}
-            HostAdmissionState::FirstInstall => {
-                return Err(HostError::OwnerLeaseRecovery(
-                    "recovery evidence cannot admit a missing Host state database".to_owned(),
-                ));
-            }
-            HostAdmissionState::Clean => {
-                return Err(HostError::OwnerLeaseRecovery(
-                    "durable Host state is already clean; no recovery mutation was applied"
-                        .to_owned(),
-                ));
-            }
-        }
+        )?;
+        validate_recovery_evidence(&snapshot, &evidence)?;
         let state_store = RedbHostStateStore::open_existing(path, &installation)?;
+        owner_lease.release().map_err(owner_lease_release_error)?;
+        // Keep the stale projection untouched until the owner release is
+        // proven. If release fails or this final atomic clear fails, the next
+        // Host start remains recovery-gated.
         state_store
-            .mark_clean_shutdown(marker)
-            .map_err(HostError::State)?;
-        owner_lease.release().map_err(owner_lease_release_error)
+            .clear_recovery(evidence)
+            .map_err(HostError::State)
     }
 
     /// Returns the Host epoch bound to this process.
@@ -690,12 +700,16 @@ impl HostComposition {
         })?;
         let kernel_record = process_record(kernel, "Kernel", &self.host)?;
         let store_record = process_record(store, "Store", &self.host)?;
+        let kernel_recovery = self.jobs.kernel_recovery_binding(&generation)?;
         self.state_store
             .commit_activation(eliot_platform::HostActivationTransition {
                 context: lifecycle_context(&self.host, "kernel-activation")?,
                 installation: self.host.installation.clone(),
                 process: kernel_record,
             })
+            .map_err(HostError::State)?;
+        self.state_store
+            .record_active_process_recovery(&self.host.installation, kernel_recovery)
             .map_err(HostError::State)?;
         self.state_store
             .record_dependency(eliot_platform::ManagedDependencyTransition {
@@ -723,22 +737,39 @@ impl HostComposition {
             self.jobs.terminate_kernel()?;
             self.jobs.terminate_store()?;
         }
+        let marker = eliot_platform::HostShutdownMarker {
+            context: lifecycle_context(&self.host, "host-stop")?,
+            installation: self.host.installation.clone(),
+            process,
+        };
         self.state_store
-            .mark_clean_shutdown(eliot_platform::HostShutdownMarker {
-                context: lifecycle_context(&self.host, "host-stop")?,
-                installation: self.host.installation.clone(),
-                process,
-            })
+            .prepare_release_pending(marker.clone())
             .map_err(HostError::State)?;
-        let release = self
+        if let Err(error) = self
             .owner_lease
             .release()
-            .map_err(owner_lease_release_error);
-        self.running = false;
-        if release.is_err() {
+            .map_err(owner_lease_release_error)
+        {
+            // The durable ReleasePending disposition remains in place and
+            // the owner handle/ownership is retained by the platform adapter
+            // for a bounded retry. Drop must not turn this into Clean.
             self.shutdown_failed = true;
+            return Err(error);
         }
-        release
+        if let Err(error) = self
+            .state_store
+            .finalize_clean_shutdown(marker)
+            .map_err(HostError::State)
+        {
+            // The mutex is already released, so no further process admission
+            // is possible until this pending/recovery projection is cleared.
+            self.shutdown_failed = true;
+            self.running = false;
+            return Err(error);
+        }
+        self.running = false;
+        self.shutdown_failed = false;
+        Ok(())
     }
 
     #[must_use]
@@ -774,6 +805,63 @@ fn host_process_record(host: &HostInstallationEpoch) -> Result<ServiceProcessRec
         health: HealthVector::healthy(),
         authority_epoch,
     })
+}
+
+fn host_process_recovery_binding(
+    host: &HostInstallationEpoch,
+) -> Result<HostProcessRecoveryBinding, HostError> {
+    let image_path = std::env::current_exe()
+        .and_then(|path| std::fs::canonicalize(path))
+        .map_err(|error| {
+            HostError::Platform(format!("Host image identity unavailable: {error}"))
+        })?;
+    Ok(HostProcessRecoveryBinding {
+        process_generation: host.nonce.clone(),
+        process_id: std::process::id(),
+        image_path: PlatformHandle::new(image_path.to_string_lossy().into_owned()).map_err(
+            |error| HostError::Platform(format!("invalid Host image identity: {error}")),
+        )?,
+        job: HostJobDisposition::NotAssigned,
+    })
+}
+
+#[cfg(windows)]
+fn process_recovery_binding(
+    process: &ProcessIdentity,
+    generation: &PlatformHandle,
+    job: &JobObjectIdentity,
+) -> Result<HostProcessRecoveryBinding, HostError> {
+    Ok(HostProcessRecoveryBinding {
+        process_generation: generation.clone(),
+        process_id: process.process_id,
+        image_path: PlatformHandle::new(process.image_path.clone()).map_err(|error| {
+            HostError::ProcessContour(format!("invalid observed image identity: {error}"))
+        })?,
+        job: HostJobDisposition::Assigned {
+            job: PlatformHandle::new(job.name()).map_err(|error| {
+                HostError::ProcessContour(format!("invalid Job identity: {error}"))
+            })?,
+        },
+    })
+}
+
+fn validate_recovery_evidence(
+    snapshot: &HostRecoverySnapshot,
+    evidence: &HostRecoveryEvidence,
+) -> Result<(), HostError> {
+    evidence.validate().map_err(HostError::State)?;
+    if snapshot.installation != evidence.installation
+        || snapshot.host_epoch != evidence.host_epoch
+        || snapshot.active_process != evidence.stale_active_process
+        || snapshot.process != evidence.process
+        || snapshot.disposition != evidence.observed_disposition
+    {
+        return Err(HostError::OwnerLeaseRecovery(
+            "recovery evidence does not exactly match the inspected stale Host projection"
+                .to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(windows)]
@@ -845,7 +933,7 @@ fn owner_lease_error(error: HostOwnerLeaseError) -> HostError {
 
 fn owner_lease_release_error(error: HostOwnerLeaseReleaseError) -> HostError {
     HostError::OwnerLeaseRecovery(format!(
-        "durable Host shutdown completed but owner release was not classified: {error}"
+        "owner release failed; durable recovery remains required: {error}"
     ))
 }
 
