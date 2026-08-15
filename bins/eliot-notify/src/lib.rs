@@ -74,10 +74,10 @@ impl NotificationComposition {
     }
 }
 
-/// Resolves the process WorkScope root from the command line or environment.
+/// Resolves the process WorkScope root from the protected ProgramData contour.
 pub fn default_work_root() -> Result<PathBuf, std::io::Error> {
-    let root = std::env::var_os("ELIOT_WORK_ROOT")
-        .map(PathBuf::from)
-        .unwrap_or(std::env::current_dir()?);
+    let root = eliot_platform_windows::protected_program_data_path("Eliot/notify")
+        .map_err(std::io::Error::other)?;
+    eliot_platform_windows::prepare_protected_directory(&root).map_err(std::io::Error::other)?;
     std::fs::canonicalize(root)
 }

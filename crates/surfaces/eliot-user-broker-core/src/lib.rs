@@ -10,9 +10,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use eliot_process::{
-    CancellationReceipt, EnvironmentProjection, FencingToken, Generation, OperationId,
-    ProcessExecutionView, ProcessLifecycle, ProcessRequest, ProcessStartReceipt, ProcessTreeId,
-    ResourceLimits, SecretRef,
+    CancellationReceipt, EnvironmentProjection, Generation, OperationId, ProcessExecutionView,
+    ProcessLifecycle, ProcessRequest, ProcessStartReceipt, ProcessTreeId, ResourceLimits,
+    SecretRef,
 };
 use eliot_protocol::ProtocolVersion;
 use eliot_receipts::ProofCeiling;
@@ -532,6 +532,9 @@ impl UserBroker {
             return Err(error);
         }
         let process_request = process_request_from_grant(&grant)?;
+        let process_operation_id = process_request.operation_id().clone();
+        let process_request_digest = process_request.invocation_digest().to_owned();
+        let process_generation = process_request.generation();
         let permit = permit_from_grant(&grant, &current, &request_digest);
         let mut cursor = cursor_from_grant(
             &grant,
@@ -544,7 +547,7 @@ impl UserBroker {
             .process
             .as_mut()
             .ok_or(BrokerError::PlanGap(RequiredProvider::P03Process))?
-            .start(process_request.clone())
+            .start(process_request)
             .map_err(|error| {
                 if matches!(error, PortError::Unknown) {
                     self.operations.insert(
@@ -561,9 +564,9 @@ impl UserBroker {
                     map_port(RequiredProvider::P03Process, error)
                 }
             })?;
-        if receipt.operation_id() != process_request.operation_id()
-            || receipt.request_digest() != process_request.invocation_digest()
-            || receipt.accepted_generation() != process_request.generation()
+        if receipt.operation_id() != &process_operation_id
+            || receipt.request_digest() != process_request_digest
+            || receipt.accepted_generation() != process_generation
         {
             return Err(BrokerError::ProcessBindingMismatch);
         }
@@ -571,12 +574,12 @@ impl UserBroker {
             .process
             .as_mut()
             .ok_or(BrokerError::PlanGap(RequiredProvider::P03Process))?
-            .inspect(process_request.operation_id())
+            .inspect(&process_operation_id)
             .map_err(|error| map_port(RequiredProvider::P03Process, error))?;
-        verify_lineage(&process_request, &view)?;
+        verify_cursor_lineage(&cursor, &view)?;
         cursor.state = OperationState::Active;
         let launch_receipt = LaunchReceipt {
-            operation_id: process_request.operation_id().clone(),
+            operation_id: process_operation_id,
             request_digest,
             registration_digest: current.registration_digest.clone(),
             user_broker_epoch: current.user_broker_epoch,
@@ -843,25 +846,13 @@ fn validate_launch_grant(
 }
 
 fn process_request_from_grant(grant: &LaunchGrant) -> Result<ProcessRequest, BrokerError> {
-    let fence = FencingToken::new(
-        grant.authority_epoch,
-        grant.approved.generation,
-        grant.approved.process_fence_nonce.clone(),
-    )
-    .map_err(|error| BrokerError::Provider(error.to_string()))?;
-    ProcessRequest::new(
-        grant.approved.operation_id.clone(),
-        grant.approved.process_tree_id.clone(),
-        grant.approved.generation,
-        grant.approved.executable.clone(),
-        grant.approved.artifact_digest.clone(),
-        grant.approved.argv.clone(),
-        grant.approved.working_directory.clone(),
-        grant.approved.environment.clone(),
-        grant.approved.resource_limits,
-        fence,
-    )
-    .map_err(|error| BrokerError::Provider(error.to_string()))
+    // Current P-03 deliberately requires a Kernel-issued DispatchPermit and
+    // does not expose a public constructor or Deserialize implementation for
+    // ProcessRequest. A-09 cannot mint one from ApprovedLaunch fields. Keep
+    // the boundary fail-closed until the authority provider returns the exact
+    // consuming ProcessRequest through the N4 application contract.
+    let _ = grant;
+    Err(BrokerError::PlanGap(RequiredProvider::P03Process))
 }
 
 fn permit_from_grant(
@@ -914,26 +905,6 @@ fn permit_from_cursor(cursor: &OperationCursor) -> OperationPermit {
         fence_id: cursor.fence_id.clone(),
         lease_expires_at: cursor.lease_expires_at,
     }
-}
-
-fn verify_lineage(
-    request: &ProcessRequest,
-    view: &ProcessExecutionView,
-) -> Result<(), BrokerError> {
-    if view.lifecycle() != ProcessLifecycle::Running {
-        return Err(BrokerError::ProcessLineageMismatch);
-    }
-    let identity = view.identity().ok_or(BrokerError::ProcessLineageMismatch)?;
-    if view.operation_id() != request.operation_id()
-        || view.request_digest() != request.invocation_digest()
-        || view.fence() != request.fence()
-        || identity.process_tree_id() != request.process_tree_id()
-        || identity.generation() != request.generation()
-        || identity.executable_sha256() != request.executable_sha256()
-    {
-        return Err(BrokerError::ProcessLineageMismatch);
-    }
-    Ok(())
 }
 
 fn verify_cursor_lineage(

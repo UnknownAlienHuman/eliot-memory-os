@@ -1,9 +1,15 @@
 use std::io::{self, BufRead, Write};
+use std::path::PathBuf;
 
-use eliot_notify::{default_work_root, NotificationComposition, PROTOCOL_VERSION, SERVICE_NAME};
-use eliot_notify_core::{NotificationEnvelope, SignedWatchdogFallbackEnvelope, VerificationPorts};
+use eliot_notify::{NotificationComposition, PROTOCOL_VERSION, SERVICE_NAME};
+use eliot_notify_core::{
+    NotificationEnvelope, NotifyError, SignedWatchdogFallbackEnvelope, VerificationPorts,
+};
 use eliot_platform::NotificationRequest;
 use serde::{Deserialize, Serialize};
+
+const REQUEST_INVALID_EXIT: i32 = 2;
+const PROVIDER_REJECTED_EXIT: i32 = 69;
 
 #[derive(Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
@@ -16,34 +22,41 @@ enum Request {
         envelope: SignedWatchdogFallbackEnvelope,
         request: NotificationRequest,
     },
-    Stop,
 }
 
 #[derive(Serialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
 enum Response {
-    Ready {
+    Delivered {
         service: &'static str,
         protocol: &'static str,
-    },
-    Delivered {
         observation: eliot_notify_core::DeliveryObservation,
     },
-    Stopped,
     Error {
-        error: String,
+        code: &'static str,
+        detail: String,
     },
 }
 
 fn main() {
     let root = match parse_root() {
         Ok(root) => root,
-        Err(error) => {
-            write_response(Response::Error {
-                error: error.to_string(),
-            });
-            return;
-        }
+        Err(error) => exit(PROVIDER_REJECTED_EXIT, "NOTIFY_ROOT_REJECTED", error),
+    };
+    if let Err(error) = eliot_platform_windows::prepare_protected_directory(&root) {
+        exit(
+            PROVIDER_REJECTED_EXIT,
+            "NOTIFY_PROTECTED_ROOT_REJECTED",
+            error.to_string(),
+        );
+    }
+    let root = match std::fs::canonicalize(root) {
+        Ok(root) => root,
+        Err(error) => exit(
+            PROVIDER_REJECTED_EXIT,
+            "NOTIFY_ROOT_REJECTED",
+            error.to_string(),
+        ),
     };
     let mut composition = match NotificationComposition::new(
         root,
@@ -56,70 +69,100 @@ fn main() {
         },
     ) {
         Ok(composition) => composition,
-        Err(error) => {
-            write_response(Response::Error {
-                error: error.to_string(),
-            });
-            return;
-        }
+        Err(error) => exit(
+            PROVIDER_REJECTED_EXIT,
+            "NOTIFY_COMPOSITION_REJECTED",
+            error.to_string(),
+        ),
     };
-    if !write_response(Response::Ready {
-        service: SERVICE_NAME,
-        protocol: PROTOCOL_VERSION,
-    }) {
-        return;
+
+    // Notification is intentionally one-shot: no persistent stdin service,
+    // replay loop, or local delivery authority is created here.
+    let line = match io::stdin()
+        .lock()
+        .lines()
+        .find_map(Result::ok)
+        .filter(|line| !line.trim().is_empty())
+    {
+        Some(line) => line,
+        None => exit(
+            REQUEST_INVALID_EXIT,
+            "NOTIFICATION_REQUEST_REQUIRED",
+            "one JSON notification request is required".to_owned(),
+        ),
+    };
+    let response = match serde_json::from_str::<Request>(&line) {
+        Ok(request) => dispatch(&mut composition, request),
+        Err(error) => Response::Error {
+            code: "REQUEST_INVALID",
+            detail: error.to_string(),
+        },
+    };
+    let provider_error = matches!(response, Response::Error { code, .. } if code == "NOTIFICATION_PROVIDER_REJECTED");
+    if !write_response(response) {
+        std::process::exit(PROVIDER_REJECTED_EXIT);
     }
-    for line in io::stdin().lock().lines() {
-        let response = match line {
-            Ok(line) if line.trim().is_empty() => continue,
-            Ok(line) => dispatch(&mut composition, &line),
-            Err(error) => Response::Error {
-                error: error.to_string(),
-            },
-        };
-        let stop = matches!(response, Response::Stopped);
-        if !write_response(response) || stop {
-            break;
-        }
+    if provider_error {
+        std::process::exit(PROVIDER_REJECTED_EXIT);
     }
 }
 
-fn parse_root() -> Result<std::path::PathBuf, io::Error> {
+fn parse_root() -> Result<PathBuf, String> {
+    let expected = eliot_platform_windows::protected_program_data_path("Eliot/notify")
+        .map_err(|error| error.to_string())?;
     let mut args = std::env::args_os().skip(1);
     match args.next() {
-        None => default_work_root(),
-        Some(value) if value == "--work-root" => match args.next() {
-            Some(root) if args.next().is_none() => std::fs::canonicalize(root),
-            _ => Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "--work-root requires exactly one path",
-            )),
-        },
-        Some(value) => Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("unknown argument: {}", value.to_string_lossy()),
-        )),
+        None => Ok(expected),
+        Some(value) if value == "--work-root" => {
+            let supplied = args
+                .next()
+                .ok_or_else(|| "--work-root requires exactly one path".to_owned())?;
+            if args.next().is_some() {
+                return Err("--work-root requires exactly one path".to_owned());
+            }
+            let supplied = PathBuf::from(supplied);
+            if supplied != expected {
+                return Err(
+                    "work root must equal the protected ProgramData notification contour"
+                        .to_owned(),
+                );
+            }
+            Ok(supplied)
+        }
+        Some(value) => Err(format!("unknown argument: {}", value.to_string_lossy())),
     }
 }
 
-fn dispatch(composition: &mut NotificationComposition, line: &str) -> Response {
-    match serde_json::from_str::<Request>(line) {
-        Ok(Request::Deliver { envelope, request }) => composition
+fn dispatch(composition: &mut NotificationComposition, request: Request) -> Response {
+    match request {
+        Request::Deliver { envelope, request } => composition
             .deliver(&envelope, &request)
-            .map(|observation| Response::Delivered { observation })
-            .unwrap_or_else(|error| Response::Error {
-                error: error.to_string(),
-            }),
-        Ok(Request::DeliverWatchdogFallback { envelope, request }) => composition
+            .map(|observation| Response::Delivered {
+                service: SERVICE_NAME,
+                protocol: PROTOCOL_VERSION,
+                observation,
+            })
+            .unwrap_or_else(notify_error),
+        Request::DeliverWatchdogFallback { envelope, request } => composition
             .deliver_watchdog_fallback(&envelope, &request)
-            .map(|observation| Response::Delivered { observation })
-            .unwrap_or_else(|error| Response::Error {
-                error: error.to_string(),
-            }),
-        Ok(Request::Stop) => Response::Stopped,
-        Err(error) => Response::Error {
-            error: error.to_string(),
-        },
+            .map(|observation| Response::Delivered {
+                service: SERVICE_NAME,
+                protocol: PROTOCOL_VERSION,
+                observation,
+            })
+            .unwrap_or_else(notify_error),
+    }
+}
+
+fn notify_error(error: NotifyError) -> Response {
+    let code = if matches!(error, NotifyError::PlanGap { .. }) {
+        "NOTIFICATION_PROVIDER_REJECTED"
+    } else {
+        "NOTIFICATION_REQUEST_REJECTED"
+    };
+    Response::Error {
+        code,
+        detail: error.to_string(),
     }
 }
 
@@ -129,4 +172,12 @@ fn write_response(response: Response) -> bool {
     serde_json::to_writer(&mut output, &response).is_ok()
         && output.write_all(b"\n").is_ok()
         && output.flush().is_ok()
+}
+
+fn exit(code: i32, error_code: &'static str, detail: String) -> ! {
+    let _ = write_response(Response::Error {
+        code: error_code,
+        detail,
+    });
+    std::process::exit(code);
 }

@@ -8,15 +8,21 @@
 #![forbid(unsafe_code)]
 
 use std::fmt;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use eliot_agent_bridge_core::{
-    AgentBridgeCore, AttachRequest, AttachView, BridgeError, ConnectionId, CursorPolicy, DemandId,
-    EventForwardStatus, HostActivationPort, HostEventEnvelope, McpForwardingPort,
-    ProviderReadiness, ReconnectRequest,
+    ActivationPortOutcome, ActivationPortResult, AgentBridgeCore, AttachBinding, AttachRequest,
+    AttachView, BridgeError, ConnectionId, CursorPolicy, DemandId, EventForwardAck,
+    EventForwardStatus, EventPortOutcome, FencingToken, Generation, HostActivationPort,
+    HostEventEnvelope, McpForwardingPort, PrincipalId, ProviderFailure, ProviderReadiness,
+    ReconciliationPortOutcome, ReconciliationPortResult, ReconnectRequest, SessionId, TaskId,
+    WorkUnitId,
 };
-use eliot_protocol::{AckPhase, EventEnvelope, Frame};
+use eliot_protocol::{AckPhase, EventDisposition, EventEnvelope, Frame};
 use eliot_runtime::{Runtime, RuntimeConfig};
+use serde::Deserialize;
+use serde_json::{Value, json};
 
 /// The only B-15 composition profiles admitted by the canonical runtime.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -124,6 +130,242 @@ pub struct CliConfig {
     pub transport: Transport,
 }
 
+/// Shared transport session handle used by the binary to bind each request's
+/// independent EBP identity before entering A-16.
+pub type KernelClientHandle = Arc<Mutex<eliot_cli::kernel_client::KernelClient>>;
+type SharedKernelClient = KernelClientHandle;
+
+fn provider_failure() -> ProviderFailure {
+    ProviderFailure::new(
+        "eliot-kernel-front-door",
+        "authenticated Kernel application exchange was rejected",
+    )
+}
+
+fn kernel_call(
+    client: &SharedKernelClient,
+    operation: &str,
+    payload: Value,
+) -> Result<Value, ProviderFailure> {
+    let mut client = client.lock().map_err(|_| provider_failure())?;
+    client
+        .transact_json(operation, payload)
+        .map_err(|_| provider_failure())
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "kind", rename_all = "SCREAMING_SNAKE_CASE", deny_unknown_fields)]
+enum ActivationWireResponse {
+    Authenticated {
+        principal_id: PrincipalId,
+        session_id: SessionId,
+        activation_generation: Generation,
+        state_fence: FencingToken,
+        task_id: TaskId,
+        work_unit_id: WorkUnitId,
+        work_scope_id: String,
+        task_revision: String,
+        plan_id: String,
+        plan_revision: String,
+    },
+    Denied {
+        reason_code: String,
+    },
+}
+
+struct KernelHostActivationPort {
+    client: SharedKernelClient,
+}
+
+impl HostActivationPort for KernelHostActivationPort {
+    fn activate(
+        &mut self,
+        request: &AttachRequest,
+    ) -> Result<ActivationPortOutcome, ProviderFailure> {
+        let response = kernel_call(
+            &self.client,
+            "eliot.agent-bridge.activate",
+            serde_json::to_value(request).map_err(|_| provider_failure())?,
+        )?;
+        match serde_json::from_value(response).map_err(|_| provider_failure())? {
+            ActivationWireResponse::Authenticated {
+                principal_id,
+                session_id,
+                activation_generation,
+                state_fence,
+                task_id,
+                work_unit_id,
+                work_scope_id,
+                task_revision,
+                plan_id,
+                plan_revision,
+            } => Ok(ActivationPortOutcome::Authenticated(
+                ActivationPortResult::authenticated(
+                    principal_id,
+                    session_id,
+                    activation_generation,
+                    state_fence,
+                    task_id,
+                    work_unit_id,
+                    work_scope_id,
+                    task_revision,
+                    plan_id,
+                    plan_revision,
+                )
+                .map_err(|_| provider_failure())?,
+            )),
+            ActivationWireResponse::Denied { reason_code } => {
+                let reason_code: &'static str = match reason_code.as_str() {
+                    "SESSION_NOT_ADMITTED" => "SESSION_NOT_ADMITTED",
+                    "STALE_AUTHORITY" => "STALE_AUTHORITY",
+                    "REQUEST_REJECTED" => "REQUEST_REJECTED",
+                    _ => "KERNEL_DENIED",
+                };
+                Ok(ActivationPortOutcome::Denied { reason_code })
+            }
+        }
+    }
+}
+
+struct KernelMcpForwardingPort {
+    client: SharedKernelClient,
+}
+
+fn binding_value(binding: &AttachBinding) -> Value {
+    json!({
+        "principal_id": binding.principal_id().as_str(),
+        "session_id": binding.session_id().as_str(),
+        "connection_id": binding.connection_id().as_str(),
+        "activation_generation": binding.activation_generation(),
+        "state_fence": binding.state_fence(),
+        "task_binding": {
+            "task_id": binding.task_binding().task_id().as_str(),
+            "work_unit_id": binding.task_binding().work_unit_id().as_str(),
+            "work_scope_id": binding.task_binding().work_scope_id(),
+            "task_revision": binding.task_binding().task_revision(),
+            "plan_id": binding.task_binding().plan_id(),
+            "plan_revision": binding.task_binding().plan_revision(),
+        },
+    })
+}
+
+impl McpForwardingPort for KernelMcpForwardingPort {
+    fn forward_frame(
+        &mut self,
+        binding: &AttachBinding,
+        frame: &Frame,
+    ) -> Result<(), ProviderFailure> {
+        kernel_call(
+            &self.client,
+            "eliot.agent-bridge.forward-frame",
+            json!({ "binding": binding_value(binding), "frame": frame }),
+        )?;
+        Ok(())
+    }
+
+    fn forward_hook(
+        &mut self,
+        binding: &AttachBinding,
+        event: &HostEventEnvelope,
+    ) -> Result<(), ProviderFailure> {
+        kernel_call(
+            &self.client,
+            "eliot.agent-bridge.forward-hook",
+            json!({ "binding": binding_value(binding), "event": event }),
+        )?;
+        Ok(())
+    }
+
+    fn forward_event(
+        &mut self,
+        binding: &AttachBinding,
+        event: &EventEnvelope,
+    ) -> Result<EventPortOutcome, ProviderFailure> {
+        let response = kernel_call(
+            &self.client,
+            "eliot.agent-bridge.forward-event",
+            json!({ "binding": binding_value(binding), "event": event }),
+        )?;
+        #[derive(Deserialize)]
+        #[serde(tag = "kind", rename_all = "SCREAMING_SNAKE_CASE", deny_unknown_fields)]
+        enum Wire {
+            Acknowledged {
+                stream_id: String,
+                event_id: String,
+                phase: AckPhase,
+                disposition: EventDisposition,
+            },
+            BestEffortForwarded,
+            BestEffortDropped {
+                reason_ref: String,
+            },
+        }
+        match serde_json::from_value(response).map_err(|_| provider_failure())? {
+            Wire::Acknowledged {
+                stream_id,
+                event_id,
+                phase,
+                disposition,
+            } => Ok(EventPortOutcome::Acknowledged(
+                EventForwardAck::new(stream_id, event_id, phase, disposition)
+                    .map_err(|_| provider_failure())?,
+            )),
+            Wire::BestEffortForwarded => Ok(EventPortOutcome::BestEffortForwarded),
+            Wire::BestEffortDropped { reason_ref } => {
+                Ok(EventPortOutcome::BestEffortDropped { reason_ref })
+            }
+        }
+    }
+
+    fn forward_gap(
+        &mut self,
+        binding: &AttachBinding,
+        gap: &eliot_agent_bridge_core::CoverageGap,
+    ) -> Result<(), ProviderFailure> {
+        kernel_call(
+            &self.client,
+            "eliot.agent-bridge.forward-gap",
+            json!({ "binding": binding_value(binding), "gap": gap }),
+        )?;
+        Ok(())
+    }
+
+    fn reconcile_external(
+        &mut self,
+        binding: &AttachBinding,
+    ) -> Result<ReconciliationPortOutcome, ProviderFailure> {
+        let response = kernel_call(
+            &self.client,
+            "eliot.agent-bridge.reconcile-external",
+            json!({ "binding": binding_value(binding) }),
+        )?;
+        #[derive(Deserialize)]
+        #[serde(tag = "kind", rename_all = "SCREAMING_SNAKE_CASE", deny_unknown_fields)]
+        enum Wire {
+            Reconciled { receipt_ref: String },
+            Denied { reason_code: String },
+        }
+        match serde_json::from_value(response).map_err(|_| provider_failure())? {
+            Wire::Reconciled { receipt_ref } => Ok(ReconciliationPortOutcome::Reconciled(
+                ReconciliationPortResult::reconciled(
+                    binding,
+                    eliot_agent_bridge_core::ReconciliationReceiptRef::new(receipt_ref)
+                        .map_err(|_| provider_failure())?,
+                )
+                .map_err(|_| provider_failure())?,
+            )),
+            Wire::Denied { reason_code } => {
+                let reason_code: &'static str = match reason_code.as_str() {
+                    "STALE_AUTHORITY" => "STALE_AUTHORITY",
+                    "RECONCILIATION_REQUIRED" => "RECONCILIATION_REQUIRED",
+                    _ => "KERNEL_DENIED",
+                };
+                Ok(ReconciliationPortOutcome::Denied { reason_code })
+            }
+        }
+    }
+}
+
 /// Parses B-15 arguments without a general-purpose command-line dependency.
 ///
 /// # Errors
@@ -191,6 +433,29 @@ pub struct BridgeRunner {
     core: AgentBridgeCore,
 }
 
+/// Builds the production bridge's two injected Kernel-owned provider ports.
+/// The same authenticated client/session binding is shared by activation and
+/// forwarding, while A-16 remains the sole bridge state owner.
+pub fn kernel_ports() -> Result<
+    (
+        KernelClientHandle,
+        Box<dyn HostActivationPort>,
+        Box<dyn McpForwardingPort>,
+    ),
+    RuntimeBuildError,
+> {
+    let client = eliot_cli::kernel_client::KernelClient::load()
+        .map_err(|error| RuntimeBuildError::KernelClient(error.to_string()))?;
+    let client = Arc::new(Mutex::new(client));
+    Ok((
+        client.clone(),
+        Box::new(KernelHostActivationPort {
+            client: client.clone(),
+        }),
+        Box::new(KernelMcpForwardingPort { client }),
+    ))
+}
+
 impl BridgeRunner {
     /// Builds a runner from the three canonical production surfaces and
     /// injected host/MCP ports. The ports remain the sole provider boundary.
@@ -206,7 +471,7 @@ impl BridgeRunner {
         mcp_forwarding: Option<Box<dyn McpForwardingPort>>,
     ) -> Result<Self, RuntimeBuildError> {
         if !profile.is_compiled() {
-            return Err(RuntimeBuildError::ProfileUnavailable(profile));
+            return Err(RuntimeBuildError::ProfileNotCompiled(profile));
         }
         let runtime = Runtime::new(
             RuntimeConfig {
@@ -256,12 +521,18 @@ impl BridgeRunner {
         demand_id: impl Into<String>,
         connection_id: impl Into<String>,
     ) -> Result<AttachView, BridgeError> {
-        self.core.attach(AttachRequest::managed(
+        self.attach(AttachRequest::managed(
             DemandId::new(demand_id)
                 .map_err(|error| BridgeError::ProviderContract(error.to_string()))?,
             ConnectionId::new(connection_id)
                 .map_err(|error| BridgeError::ProviderContract(error.to_string()))?,
         ))
+    }
+
+    /// Attaches an exact managed or externally bounded request through the
+    /// injected Host activation port.
+    pub fn attach(&mut self, request: AttachRequest) -> Result<AttachView, BridgeError> {
+        self.core.attach(request)
     }
 
     /// Rebinds transport while preserving the exact authority binding.
@@ -272,6 +543,12 @@ impl BridgeRunner {
     /// does not match the active session, generation, and fence.
     pub fn reconnect(&mut self, request: ReconnectRequest) -> Result<AttachView, BridgeError> {
         self.core.reconnect(request)
+    }
+
+    /// Completes the externally attached bridge's required Kernel/MCP
+    /// reconciliation exchange.
+    pub fn reconcile_external(&mut self) -> Result<AttachView, BridgeError> {
+        self.core.reconcile_external()
     }
 
     /// Forwards a validated protocol frame through A-06's injected port.
@@ -312,45 +589,30 @@ impl BridgeRunner {
     pub fn attach_view(&self) -> Option<AttachView> {
         self.core.attach_view()
     }
-
-    /// Returns a concise unavailable result for the real binary path. Main
-    /// intentionally supplies no host/kernel providers until composition
-    /// admits them; this method must never be interpreted as launch success.
-    ///
-    /// # Errors
-    ///
-    /// Returns a P-11/A-16 construction error if the fixed composition cannot
-    /// be built.
-    pub fn unavailable(profile: Profile) -> Result<Self, RuntimeBuildError> {
-        Self::new(
-            profile,
-            ProviderReadiness::all_admitted()
-                .with_unavailable(eliot_agent_bridge_core::RequiredProvider::HostActivationPort),
-            None,
-            None,
-        )
-    }
 }
 
 /// Runner construction failures, kept independent from provider state.
 #[derive(Debug)]
 pub enum RuntimeBuildError {
     /// The requested profile was not compiled into this binary.
-    ProfileUnavailable(Profile),
+    ProfileNotCompiled(Profile),
     /// P-11 rejected the explicit bounded runtime configuration.
     Runtime(eliot_runtime::ConfigError),
     /// A-16 rejected the fixed cursor policy.
     BridgeContract(BridgeError),
+    /// The installation-owned authenticated Kernel front door was not composed.
+    KernelClient(String),
 }
 
 impl fmt::Display for RuntimeBuildError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::ProfileUnavailable(profile) => {
-                write!(formatter, "PLAN_GAP:PROFILE_UNAVAILABLE:{profile}")
+            Self::ProfileNotCompiled(profile) => {
+                write!(formatter, "PROFILE_NOT_COMPILED:{profile}")
             }
             Self::Runtime(_) => formatter.write_str("RUNTIME_CONFIG_INVALID"),
             Self::BridgeContract(error) => write!(formatter, "BRIDGE_CONTRACT_INVALID:{error}"),
+            Self::KernelClient(error) => write!(formatter, "KERNEL_CLIENT_REJECTED:{error}"),
         }
     }
 }
@@ -614,16 +876,6 @@ mod tests {
         runner.forward_hook(&hook()).expect("hook forwarding");
         let counts = counts.lock().expect("fixture counts");
         assert_eq!(counts.hooks, 1);
-    }
-
-    #[test]
-    fn unavailable_binary_composition_is_a_typed_plan_gap() {
-        let profile = test_profile();
-        let mut runner = super::BridgeRunner::unavailable(profile).expect("runner");
-        assert!(matches!(
-            runner.demand_start("demand", "connection"),
-            Err(eliot_agent_bridge_core::BridgeError::PlanGap(_))
-        ));
     }
 
     #[test]

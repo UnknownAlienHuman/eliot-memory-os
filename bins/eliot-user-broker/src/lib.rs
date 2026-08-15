@@ -9,17 +9,24 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
+use eliot_process::{
+    CancellationReceipt, OperationId, ProcessExecutionView, ProcessRequest, ProcessStartReceipt,
+};
+use eliot_protocol::RequestIdentity;
 use eliot_user_broker_core::{
-    BrokerError, BrokerSnapshot, DurableRegistrationPort, PortError, RequiredProvider, UserBroker,
+    AuthorityPort, BrokerError, BrokerSnapshot, DurableRegistrationPort, LaunchGrant,
+    LaunchRequest, PortError, ProcessPort, RegistrationGrant, RegistrationReceipt,
+    RegistrationRequest, RequiredProvider, UserBroker,
 };
 use serde::Serialize;
+use serde_json::Value;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 pub const SERVICE_NAME: &str = "eliot-user-broker";
 pub const PROTOCOL_VERSION: &str = "eliot.user-broker.v1";
-pub const PLAN_GAP_EXIT: i32 = 78;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BrokerConfig {
@@ -62,6 +69,133 @@ pub enum CompositionError {
     Encoding(#[from] serde_json::Error),
     #[error("broker recovery: {0}")]
     Recovery(#[source] BrokerError),
+    #[error("Kernel front-door composition: {0}")]
+    Kernel(String),
+    #[error("Kernel front-door lock poisoned")]
+    KernelLock,
+}
+
+type SharedKernelClient = Arc<Mutex<eliot_cli::kernel_client::KernelClient>>;
+
+fn kernel_port_error(error: eliot_cli::kernel_client::KernelClientError) -> PortError {
+    match error {
+        eliot_cli::kernel_client::KernelClientError::FrontDoorClosed(_) => PortError::Unavailable,
+        eliot_cli::kernel_client::KernelClientError::MissingRequestIdentity => {
+            PortError::Invalid("missing authenticated RequestIdentity".to_owned())
+        }
+        eliot_cli::kernel_client::KernelClientError::Configuration(detail)
+        | eliot_cli::kernel_client::KernelClientError::Rejected(detail) => {
+            PortError::Invalid(detail)
+        }
+    }
+}
+
+fn kernel_call(
+    client: &SharedKernelClient,
+    operation: &str,
+    payload: Value,
+) -> Result<Value, PortError> {
+    let mut client = client.lock().map_err(|_| PortError::Unknown)?;
+    client
+        .transact_json(operation, payload)
+        .map_err(kernel_port_error)
+}
+
+struct KernelAuthorityPort {
+    client: SharedKernelClient,
+}
+
+impl AuthorityPort for KernelAuthorityPort {
+    fn register(&mut self, request: &RegistrationRequest) -> Result<RegistrationGrant, PortError> {
+        serde_json::from_value(kernel_call(
+            &self.client,
+            "eliot.user-broker.register",
+            serde_json::to_value(request).map_err(|error| PortError::Invalid(error.to_string()))?,
+        )?)
+        .map_err(|error| PortError::Invalid(format!("decode registration grant: {error}")))
+    }
+
+    fn heartbeat(
+        &mut self,
+        receipt: &RegistrationReceipt,
+        observed_at: u64,
+    ) -> Result<RegistrationGrant, PortError> {
+        kernel_call(
+            &self.client,
+            "eliot.user-broker.heartbeat",
+            serde_json::json!({
+                "registration": receipt,
+                "observed_at": observed_at,
+            }),
+        )
+        .and_then(|value| {
+            serde_json::from_value(value)
+                .map_err(|error| PortError::Invalid(format!("decode heartbeat grant: {error}")))
+        })
+    }
+
+    fn authorize_launch(
+        &mut self,
+        receipt: &RegistrationReceipt,
+        request: &LaunchRequest,
+    ) -> Result<LaunchGrant, PortError> {
+        kernel_call(
+            &self.client,
+            "eliot.user-broker.authorize-launch",
+            serde_json::json!({
+                "registration": receipt,
+                "request": request,
+            }),
+        )
+        .and_then(|value| {
+            serde_json::from_value(value)
+                .map_err(|error| PortError::Invalid(format!("decode launch grant: {error}")))
+        })
+    }
+}
+
+struct KernelProcessPort {
+    client: SharedKernelClient,
+}
+
+impl ProcessPort for KernelProcessPort {
+    fn start(&mut self, request: ProcessRequest) -> Result<ProcessStartReceipt, PortError> {
+        kernel_call(
+            &self.client,
+            "eliot.user-broker.process-start",
+            serde_json::to_value(request)
+                .map_err(|error| PortError::Invalid(format!("encode process request: {error}")))?,
+        )
+        .and_then(|value| {
+            serde_json::from_value(value)
+                .map_err(|error| PortError::Invalid(format!("decode process receipt: {error}")))
+        })
+    }
+
+    fn inspect(&mut self, operation_id: &OperationId) -> Result<ProcessExecutionView, PortError> {
+        kernel_call(
+            &self.client,
+            "eliot.user-broker.process-inspect",
+            serde_json::json!({ "operation_id": operation_id }),
+        )
+        .and_then(|value| {
+            serde_json::from_value(value)
+                .map_err(|error| PortError::Invalid(format!("decode process view: {error}")))
+        })
+    }
+
+    fn cancel(&mut self, operation_id: &OperationId) -> Result<CancellationReceipt, PortError> {
+        kernel_call(
+            &self.client,
+            "eliot.user-broker.process-cancel",
+            serde_json::json!({ "operation_id": operation_id }),
+        )
+        .and_then(|value| {
+            serde_json::from_value(value).map_err(|error| {
+                PortError::Invalid(format!("decode cancellation receipt: {error}"))
+            })
+        })
+    }
 }
 
 struct FileRegistrationStore {
@@ -124,10 +258,40 @@ pub struct BrokerReadiness<'a> {
 pub struct BrokerComposition {
     broker: UserBroker,
     snapshot: PathBuf,
+    kernel_client: Option<SharedKernelClient>,
+    providers_admitted: bool,
 }
 
 impl BrokerComposition {
     pub fn start(config: BrokerConfig) -> Result<Self, CompositionError> {
+        Self::start_with_ports(config, None, None, None)
+    }
+
+    /// Starts the production binary composition with an authenticated Kernel
+    /// front door. The binary never substitutes a local authority/process
+    /// provider when this composition is unavailable.
+    pub fn start_with_kernel(config: BrokerConfig) -> Result<Self, CompositionError> {
+        let client = eliot_cli::kernel_client::KernelClient::load()
+            .map_err(|error| CompositionError::Kernel(error.to_string()))?;
+        let client = Arc::new(Mutex::new(client));
+        Self::start_with_ports(
+            config,
+            Some(Box::new(KernelAuthorityPort {
+                client: client.clone(),
+            })),
+            Some(Box::new(KernelProcessPort {
+                client: client.clone(),
+            })),
+            Some(client),
+        )
+    }
+
+    fn start_with_ports(
+        config: BrokerConfig,
+        authority: Option<Box<dyn AuthorityPort>>,
+        process: Option<Box<dyn ProcessPort>>,
+        kernel_client: Option<SharedKernelClient>,
+    ) -> Result<Self, CompositionError> {
         config.validate()?;
         fs::create_dir_all(&config.data_root).map_err(CompositionError::Durable)?;
         let snapshot = config.data_root.join(config.snapshot_name);
@@ -145,9 +309,15 @@ impl BrokerComposition {
                 })
                 .map_err(|error| CompositionError::InvalidConfiguration(error.to_string()))?;
         }
-        let mut broker = UserBroker::new(None, None, Some(Box::new(durable)));
+        let providers_admitted = authority.is_some() && process.is_some();
+        let mut broker = UserBroker::new(authority, process, Some(Box::new(durable)));
         broker.recover().map_err(CompositionError::Recovery)?;
-        Ok(Self { broker, snapshot })
+        Ok(Self {
+            broker,
+            snapshot,
+            kernel_client,
+            providers_admitted,
+        })
     }
 
     pub fn readiness(&self) -> BrokerReadiness<'_> {
@@ -155,13 +325,32 @@ impl BrokerComposition {
             service: SERVICE_NAME,
             protocol: PROTOCOL_VERSION,
             registration_state: "RECOVERED",
-            missing_providers: vec![RequiredProvider::G01Authority, RequiredProvider::P03Process],
+            missing_providers: if self.providers_admitted {
+                Vec::new()
+            } else {
+                vec![RequiredProvider::G01Authority, RequiredProvider::P03Process]
+            },
             snapshot: self.snapshot.display().to_string(),
         }
     }
 
     pub fn broker(&mut self) -> &mut UserBroker {
         &mut self.broker
+    }
+
+    /// Binds the current EBP request identity before one provider operation.
+    pub fn set_request_identity(
+        &mut self,
+        identity: RequestIdentity,
+    ) -> Result<(), CompositionError> {
+        let client = self.kernel_client.as_ref().ok_or_else(|| {
+            CompositionError::Kernel("Kernel front door is not composed".to_owned())
+        })?;
+        client
+            .lock()
+            .map_err(|_| CompositionError::KernelLock)?
+            .set_request_identity(identity);
+        Ok(())
     }
 }
 

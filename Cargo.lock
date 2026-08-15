@@ -398,6 +398,7 @@ name = "eliot-agent-bridge"
 version = "0.1.0"
 dependencies = [
  "eliot-agent-bridge-core",
+ "eliot-cli",
  "eliot-protocol",
  "eliot-runtime",
  "serde",
@@ -1823,6 +1824,7 @@ name = "eliot-user-broker"
 version = "0.1.0"
 dependencies = [
  "eliot-cli",
+ "eliot-platform-windows",
  "eliot-process",
  "eliot-protocol",
  "eliot-user-broker-core",

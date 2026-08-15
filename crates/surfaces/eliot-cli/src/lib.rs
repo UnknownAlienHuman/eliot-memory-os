@@ -336,14 +336,15 @@ pub enum CommandPortError {
 /// well as the exact EBP `ClientHello` binding.
 pub mod kernel_client {
     use std::collections::BTreeMap;
-    use std::path::PathBuf;
     use std::time::Duration;
 
     use eliot_ipc::{
         DeliveryOutcome, NamedPipeTransport, TransportLimits, client_hello_frame,
         decode_server_hello_frame,
     };
-    use eliot_platform_windows::NamedPipePeerExpectation;
+    use eliot_platform_windows::{
+        NamedPipePeerExpectation, ProtectedPathLease, protected_program_data_path,
+    };
     use eliot_protocol::{
         ClientHello, EncodingProfile, Frame, FrameKind, MessageType, ProtocolPayload,
         ProtocolVersion, RequestIdentity,
@@ -393,6 +394,8 @@ pub mod kernel_client {
     pub struct KernelClient {
         config: KernelClientConfig,
         request_identity: Option<RequestIdentity>,
+        #[cfg(windows)]
+        config_lease: Option<ProtectedPathLease>,
     }
 
     impl KernelClient {
@@ -406,27 +409,13 @@ pub mod kernel_client {
             }
             #[cfg(windows)]
             {
-                let program_data = std::env::var_os("ProgramData").ok_or(
-                    KernelClientError::FrontDoorClosed("ProgramData Kernel client configuration"),
-                )?;
-                let path = PathBuf::from(program_data).join(CONFIG_RELATIVE_PATH);
-                let metadata = std::fs::metadata(&path).map_err(|error| {
-                    KernelClientError::Configuration(format!(
-                        "read protected Kernel client configuration {}: {error}",
-                        path.display()
-                    ))
-                })?;
-                if metadata.len() > CONFIG_LIMIT {
-                    return Err(KernelClientError::Configuration(
-                        "Kernel client configuration exceeds the bounded size".to_owned(),
-                    ));
-                }
-                let bytes = std::fs::read(&path).map_err(|error| {
-                    KernelClientError::Configuration(format!(
-                        "read protected Kernel client configuration {}: {error}",
-                        path.display()
-                    ))
-                })?;
+                let path = protected_program_data_path(CONFIG_RELATIVE_PATH)
+                    .map_err(|error| KernelClientError::Configuration(error.to_string()))?;
+                let lease = ProtectedPathLease::open_existing_absolute(&path)
+                    .map_err(|error| KernelClientError::Configuration(error.to_string()))?;
+                let bytes = lease
+                    .read_bounded(CONFIG_LIMIT)
+                    .map_err(|error| KernelClientError::Configuration(error.to_string()))?;
                 let config: KernelClientConfig =
                     serde_json::from_slice(&bytes).map_err(|error| {
                         KernelClientError::Configuration(format!(
@@ -437,6 +426,7 @@ pub mod kernel_client {
                 Ok(Self {
                     config,
                     request_identity: None,
+                    config_lease: Some(lease),
                 })
             }
         }
@@ -447,6 +437,8 @@ pub mod kernel_client {
             Ok(Self {
                 config,
                 request_identity: None,
+                #[cfg(windows)]
+                config_lease: None,
             })
         }
 
@@ -507,6 +499,12 @@ pub mod kernel_client {
         async fn connect(
             &self,
         ) -> Result<(NamedPipeTransport, TransportLimits), KernelClientError> {
+            if let Some(lease) = &self.config_lease {
+                lease
+                    .verify_stable_identity()
+                    .and_then(|()| lease.verify_path_identity())
+                    .map_err(|error| KernelClientError::Configuration(error.to_string()))?;
+            }
             let expectation = NamedPipePeerExpectation::new(
                 &self.config.expected_kernel_sid,
                 self.config.expected_kernel_session_id,

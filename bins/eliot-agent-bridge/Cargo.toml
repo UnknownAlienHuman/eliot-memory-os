@@ -20,8 +20,11 @@ eliot-profile-full-composition = []
 
 [dependencies]
 eliot-agent-bridge-core.workspace = true
+eliot-cli.workspace = true
 eliot-protocol.workspace = true
 eliot-runtime.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 
 [lints]
 workspace = true

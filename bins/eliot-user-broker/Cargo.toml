@@ -14,6 +14,10 @@ name = "eliot-user-broker"
 path = "src/main.rs"
 
 [dependencies]
+eliot-cli.workspace = true
+eliot-platform-windows.workspace = true
+eliot-process.workspace = true
+eliot-protocol.workspace = true
 eliot-user-broker-core.workspace = true
 serde.workspace = true
 serde_json.workspace = true
