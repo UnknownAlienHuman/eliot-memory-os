@@ -1,0 +1,17 @@
+[package]
+name = "eliot-instrument-nextest"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.89"
+license = "MIT"
+description = "Provider-neutral nextest instrumentation adapter"
+
+[dependencies]
+eliot-contracts = { path = "../../foundation/eliot-contracts" }
+eliot-instrument-api = { path = "../eliot-instrument-api" }
+eliot-process = { path = "../../kernel/eliot-process" }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = { version = "1.0.150", features = ["float_roundtrip"] }
+thiserror = "2.0.18"
+
+[workspace]
