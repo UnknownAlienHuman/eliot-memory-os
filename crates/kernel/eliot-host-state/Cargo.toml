@@ -1,0 +1,28 @@
+[package]
+name = "eliot-host-state"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.89"
+license = "MIT"
+description = "Pure HostStateJournal state machine and persistence port"
+
+[workspace]
+
+[dependencies]
+eliot-observation-contracts = { path = "../../foundation/eliot-observation-contracts" }
+eliot-platform = { path = "../eliot-platform" }
+eliot-runtime-contracts = { path = "../../foundation/eliot-runtime-contracts" }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.150"
+thiserror = "2.0.18"
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+module_name_repetitions = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+must_use_candidate = "allow"
