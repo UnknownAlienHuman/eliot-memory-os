@@ -1,0 +1,23 @@
+[package]
+name = "eliot-mod-research"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.89"
+license = "MIT"
+description = "Thin production entrypoint for the governed ELIOT research exchange"
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "eliot-mod-research"
+path = "src/main.rs"
+
+[dependencies]
+eliot-contracts = { path = "../../crates/foundation/eliot-contracts", version = "0.1.0" }
+eliot-research-exchange = { path = "../../crates/research/eliot-research-exchange", version = "0.1.0" }
+eliot-research-exchange-api = { path = "../../crates/research/eliot-research-exchange-api", version = "0.1.0" }
+eliot-researcher = { path = "../../crates/research/eliot-researcher", version = "0.1.0" }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = { version = "1.0.150", features = ["float_roundtrip"] }
+thiserror = "2.0.18"
