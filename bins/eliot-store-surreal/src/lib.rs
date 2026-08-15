@@ -277,7 +277,7 @@ pub fn load_config(path: Option<&Path>) -> Result<StoreLaunchConfig, String> {
     let bytes = std::fs::read(path).map_err(|error| format!("read config: {error}"))?;
     match path.extension().and_then(|extension| extension.to_str()) {
         Some("json") => {
-            let config = serde_json::from_slice(&bytes)
+            let config: StoreLaunchConfig = serde_json::from_slice(&bytes)
                 .map_err(|error| format!("parse JSON config: {error}"))?;
             config.validate()?;
             Ok(config)
