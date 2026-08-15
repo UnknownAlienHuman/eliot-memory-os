@@ -1,0 +1,17 @@
+[package]
+name = "eliot-epistemic"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "ELIOT current epistemic position and provenance resolution"
+
+[dependencies]
+eliot-contracts.workspace = true
+eliot-evidence.workspace = true
+schemars.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true
