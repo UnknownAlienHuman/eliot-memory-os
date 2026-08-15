@@ -1,0 +1,14 @@
+[package]
+name = "eliot-instrument-rustfmt"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.89"
+license = "MIT"
+description = "Provider-neutral rustfmt instrumentation adapter"
+
+[dependencies]
+eliot-instrument-api = { path = "../eliot-instrument-api" }
+eliot-process = { path = "../../kernel/eliot-process" }
+thiserror = "2.0.18"
+
+[workspace]
