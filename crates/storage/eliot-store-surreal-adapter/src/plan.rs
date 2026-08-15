@@ -9,11 +9,11 @@
 use std::collections::BTreeSet;
 
 use eliot_store_api::{
-    canonical_json_bytes, sha256_hex, CommitId, EventId, EventProjectionRelationIntents,
-    OrderingHead, OrderingScopeId, OutboxId, OutboxIntent, OutboxState, PreparedTransition,
-    ProjectionMode, ProjectionPublicationId, ProjectionPublicationRecord, ProjectionStatus,
-    RequestMeta, Resubmission, RevisionDelta, RevisionHead, RevisionKey, SplitView, StoreError,
-    WriteReceipt, WriteReceiptStatus,
+    CommitId, EventId, EventProjectionRelationIntents, OrderingHead, OrderingScopeId, OutboxId,
+    OutboxIntent, OutboxState, PreparedTransition, ProjectionMode, ProjectionPublicationId,
+    ProjectionPublicationRecord, ProjectionStatus, RequestMeta, Resubmission, RevisionDelta,
+    RevisionHead, RevisionKey, SplitView, StoreError, WriteReceipt, WriteReceiptStatus,
+    canonical_json_bytes, sha256_hex,
 };
 
 use crate::error::AdapterError;
@@ -94,12 +94,8 @@ pub(crate) fn plan_apply(
         &canonical_json_bytes(transition)
             .map_err(|error| StoreError::Serialization(error.to_string()))?,
     );
-    let projection_records = projection_records(
-        transition,
-        &operation_key,
-        &commit_id,
-        &next_revision_heads,
-    )?;
+    let projection_records =
+        projection_records(transition, &operation_key, &commit_id, &next_revision_heads)?;
     let (outbox_records, next_outbox_sequence) = outbox_records(
         transition,
         &operation_key,
@@ -282,11 +278,8 @@ fn outbox_records(
     let mut sequence_cursor = next_sequence;
     for (index, _) in event_ids.iter().enumerate() {
         let sequence = sequence_cursor;
-        sequence_cursor = checked_increment(
-            sequence_cursor,
-            "outbox.sequence",
-            "sequence overflow",
-        )?;
+        sequence_cursor =
+            checked_increment(sequence_cursor, "outbox.sequence", "sequence overflow")?;
         let record = OutboxIntent {
             outbox_id: OutboxId::new(format!("outbox-{operation_key}-{index}"))?,
             operation_id: transition.identity.operation_id.clone(),
