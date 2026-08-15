@@ -351,6 +351,7 @@ pub mod kernel_client {
     };
     use serde::Deserialize;
     use serde_json::{Value, json};
+    use sha2::{Digest, Sha256};
     use thiserror::Error;
 
     const KERNEL_FRONT_DOOR_PIPE: &str = r"\\.\pipe\eliot\kernel\frontdoor";
@@ -370,6 +371,9 @@ pub mod kernel_client {
         pub expected_kernel_session_id: u32,
         /// Exact client handshake declaration approved for this installation.
         pub client_hello: ClientHello,
+        /// SHA-256 of canonical JSON `client_hello` bytes from the approved
+        /// installation manifest.
+        pub client_hello_sha256: String,
     }
 
     /// Failure at the authenticated application front door.
@@ -617,10 +621,34 @@ pub mod kernel_client {
                 "Kernel service SID is invalid".to_owned(),
             ));
         }
+        NamedPipePeerExpectation::new(
+            &config.expected_kernel_sid,
+            config.expected_kernel_session_id,
+        )
+        .map_err(|error| KernelClientError::Configuration(error.to_string()))?;
         config
             .client_hello
             .validate()
-            .map_err(|error| KernelClientError::Configuration(error.to_string()))
+            .map_err(|error| KernelClientError::Configuration(error.to_string()))?;
+        if config.client_hello_sha256.len() != 64
+            || !config
+                .client_hello_sha256
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit())
+        {
+            return Err(KernelClientError::Configuration(
+                "Kernel client hello digest is invalid".to_owned(),
+            ));
+        }
+        let hello_bytes = serde_json::to_vec(&config.client_hello)
+            .map_err(|error| KernelClientError::Configuration(error.to_string()))?;
+        let expected = format!("{:x}", Sha256::digest(hello_bytes));
+        if !config.client_hello_sha256.eq_ignore_ascii_case(&expected) {
+            return Err(KernelClientError::Configuration(
+                "Kernel client hello digest does not match approved bytes".to_owned(),
+            ));
+        }
+        Ok(())
     }
 
     fn validate_operation(operation: &str) -> Result<(), KernelClientError> {
