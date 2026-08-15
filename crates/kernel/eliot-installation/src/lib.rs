@@ -13,13 +13,15 @@ use std::collections::BTreeSet;
 use std::fs;
 use std::path::Path;
 
-use eliot_contracts::{ContractIdentity, ContractVersion, contract_identity as make_contract_identity};
+use eliot_contracts::{
+    ContractIdentity, ContractVersion, contract_identity as make_contract_identity,
+};
 use eliot_platform::{
     InstallationObservation, InstallationPort, InstallationRequest, PlatformHandle, PortError,
     PortOutcome,
 };
-use schemars::JsonSchema;
 use redb::{Database, ReadableDatabase, TableDefinition};
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -66,7 +68,10 @@ pub enum InstallationError {
     Duplicate { kind: String, identity: String },
     /// A state transition is not admitted by the transaction machine.
     #[error("illegal installation transition from {from:?} to {to:?}")]
-    IllegalTransition { from: InstallationStage, to: InstallationStage },
+    IllegalTransition {
+        from: InstallationStage,
+        to: InstallationStage,
+    },
     /// A caller attempted to use a request for another transaction.
     #[error("installation transaction identity conflict")]
     IdentityConflict,
@@ -104,7 +109,11 @@ fn handle(value: &PlatformHandle, field: &str) -> Result<(), InstallationError> 
     text(value.as_str(), field)
 }
 
-fn handles(values: &[PlatformHandle], field: &str, required: bool) -> Result<(), InstallationError> {
+fn handles(
+    values: &[PlatformHandle],
+    field: &str,
+    required: bool,
+) -> Result<(), InstallationError> {
     if required && values.is_empty() {
         return Err(InstallationError::InvalidField {
             field: field.to_owned(),
@@ -189,7 +198,10 @@ impl InstallationRoots {
         let mut identities = BTreeSet::new();
         for (value, field) in values {
             text(value, field)?;
-            let normalized = value.replace('\\', "/").trim_end_matches('/').to_ascii_lowercase();
+            let normalized = value
+                .replace('\\', "/")
+                .trim_end_matches('/')
+                .to_ascii_lowercase();
             if normalized == "."
                 || normalized == ".."
                 || normalized.starts_with("../")
@@ -206,7 +218,11 @@ impl InstallationRoots {
                 ));
             }
         }
-        if !profile.is_disposable() && self.immutable_binaries.eq_ignore_ascii_case(&self.durable_data) {
+        if !profile.is_disposable()
+            && self
+                .immutable_binaries
+                .eq_ignore_ascii_case(&self.durable_data)
+        {
             return Err(InstallationError::ProfileViolation(
                 "production binaries may not share the durable data root".to_owned(),
             ));
@@ -216,7 +232,9 @@ impl InstallationRoots {
 }
 
 /// One installation lineage; sequence is monotonic only within this lineage.
-#[derive(Clone, Debug, Eq, Hash, JsonSchema, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[derive(
+    Clone, Debug, Eq, Hash, JsonSchema, Ord, PartialEq, PartialOrd, Serialize, Deserialize,
+)]
 #[serde(deny_unknown_fields)]
 pub struct InstallationEpoch {
     /// Installation identity.
@@ -426,12 +444,19 @@ impl IntegrationDiscoveryCatalogue {
     }
 
     /// Finds one exact family recipe after validating the catalogue.
-    pub fn entry(&self, family_id: &PlatformHandle) -> Result<&IntegrationDiscoveryCatalogueEntry, InstallationError> {
+    pub fn entry(
+        &self,
+        family_id: &PlatformHandle,
+    ) -> Result<&IntegrationDiscoveryCatalogueEntry, InstallationError> {
         self.validate()?;
         self.entries
             .iter()
             .find(|entry| &entry.family_id == family_id)
-            .ok_or_else(|| InstallationError::IncompleteObservation("catalogue family was not found".to_owned()))
+            .ok_or_else(|| {
+                InstallationError::IncompleteObservation(
+                    "catalogue family was not found".to_owned(),
+                )
+            })
     }
 }
 
@@ -461,7 +486,11 @@ impl CandidateManifest {
         handle(&self.generation, "manifest.generation")?;
         handles(&self.components, "manifest.components", true)?;
         handles(&self.artifact_digests, "manifest.artifact_digests", true)?;
-        handles(&self.dependency_closure_refs, "manifest.dependency_closure_refs", true)?;
+        handles(
+            &self.dependency_closure_refs,
+            "manifest.dependency_closure_refs",
+            true,
+        )?;
         handles(&self.license_refs, "manifest.license_refs", true)?;
         handle(&self.config_digest, "manifest.config_digest")?;
         handle(&self.signature_ref, "manifest.signature_ref")
@@ -518,7 +547,8 @@ impl RedbInstallationRegistry {
     /// Opens or creates the registry database.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, InstallationError> {
         if let Some(parent) = path.as_ref().parent() {
-            fs::create_dir_all(parent).map_err(|error| InstallationError::Platform(error.to_string()))?;
+            fs::create_dir_all(parent)
+                .map_err(|error| InstallationError::Platform(error.to_string()))?;
         }
         let database = Database::create(path)
             .map_err(|error| InstallationError::Platform(error.to_string()))?;
@@ -544,8 +574,13 @@ impl RedbInstallationRegistry {
         else {
             return Ok(ApprovedGenerationRegistry::new());
         };
-        serde_json::from_slice(value.value())
-            .map_err(|error| InstallationError::Platform(error.to_string()))
+        let registry: ApprovedGenerationRegistry = serde_json::from_slice(value.value())
+            .map_err(|error| InstallationError::Platform(error.to_string()))?;
+        // A durable registry is an authority projection, not an opaque cache.
+        // Never allow malformed or contradictory bytes to become an empty or
+        // partially trusted activation decision.
+        registry.validate()?;
+        Ok(registry)
     }
 
     /// Durably stores one complete validated registry projection.
@@ -606,48 +641,75 @@ impl ApprovedGenerationRegistry {
             active: false,
             last_known_good: false,
         });
+        self.validate()?;
         Ok(())
     }
 
     /// Activates an approved generation and records the prior active
     /// generation as last-known-good before crossing the activation boundary.
     pub fn activate(&mut self, generation: &PlatformHandle) -> Result<(), InstallationError> {
+        self.validate()?;
         let selected = self
             .generations
             .iter()
             .position(|item| &item.manifest.generation == generation)
-            .ok_or_else(|| InstallationError::IncompleteObservation(
-                "generation is not approved".to_owned(),
-            ))?;
-        if let Some(previous) = self.active_generation.take() {
-            self.last_known_good_generation = Some(previous.clone());
+            .ok_or_else(|| {
+                InstallationError::IncompleteObservation("generation is not approved".to_owned())
+            })?;
+        if self.active_generation.as_ref() == Some(generation) {
+            // Reactivation is idempotent, but still requires the full
+            // projection to be internally consistent.
+            return Ok(());
+        }
+        let previous = self.active_generation.take();
+        self.last_known_good_generation = previous.clone();
+        for item in &mut self.generations {
+            item.active = false;
+            // A cutover has exactly one LKG: the generation that was active
+            // immediately before this transition.  Clear any stale marker
+            // before setting that projection below.
+            item.last_known_good = false;
+        }
+        if let Some(previous) = previous {
             if let Some(item) = self
                 .generations
                 .iter_mut()
                 .find(|item| item.manifest.generation == previous)
             {
-                item.active = false;
                 item.last_known_good = true;
             }
-        }
-        for item in &mut self.generations {
-            item.active = false;
         }
         self.generations[selected].active = true;
         self.generations[selected].last_known_good = false;
         self.active_generation = Some(generation.clone());
+        self.validate()?;
         Ok(())
     }
 
     /// Activates the last-known-good generation for bounded rollback.
     pub fn rollback(&mut self) -> Result<PlatformHandle, InstallationError> {
-        let generation = self
-            .last_known_good_generation
-            .clone()
-            .ok_or_else(|| InstallationError::IncompleteObservation(
+        let generation = self.last_known_good_generation.clone().ok_or_else(|| {
+            InstallationError::IncompleteObservation(
                 "last-known-good generation is unavailable".to_owned(),
-            ))?;
+            )
+        })?;
+        let prior_active = self.active_generation.clone();
         self.activate(&generation)?;
+        // The generation we just left is the one that failed the cutover; it
+        // must not remain advertised as LKG after rollback.
+        if prior_active.as_ref() != Some(&generation) {
+            if let Some(prior) = prior_active {
+                if let Some(item) = self
+                    .generations
+                    .iter_mut()
+                    .find(|item| item.manifest.generation == prior)
+                {
+                    item.last_known_good = false;
+                }
+            }
+            self.last_known_good_generation = None;
+        }
+        self.validate()?;
         Ok(generation)
     }
 
@@ -664,6 +726,8 @@ impl ApprovedGenerationRegistry {
     /// Validates the complete registry projection and all generation entries.
     pub fn validate(&self) -> Result<(), InstallationError> {
         let mut identities = BTreeSet::new();
+        let mut active_count = 0_usize;
+        let mut lkg_count = 0_usize;
         for generation in &self.generations {
             generation.validate()?;
             if !identities.insert(generation.manifest.generation.as_str()) {
@@ -672,28 +736,59 @@ impl ApprovedGenerationRegistry {
                     identity: generation.manifest.generation.as_str().to_owned(),
                 });
             }
+            if generation.active {
+                active_count += 1;
+            }
+            if generation.last_known_good {
+                lkg_count += 1;
+            }
+        }
+        if active_count > 1 {
+            return Err(InstallationError::IncompleteObservation(
+                "registry contains multiple active generations".to_owned(),
+            ));
+        }
+        if lkg_count > 1 {
+            return Err(InstallationError::IncompleteObservation(
+                "registry contains multiple last-known-good generations".to_owned(),
+            ));
         }
         if let Some(active) = &self.active_generation {
-            if !self
-                .generations
-                .iter()
-                .any(|item| item.active && item.manifest.generation == *active)
+            if active_count != 1
+                || !self
+                    .generations
+                    .iter()
+                    .any(|item| item.active && item.manifest.generation == *active)
             {
                 return Err(InstallationError::IncompleteObservation(
                     "active generation is absent from registry".to_owned(),
                 ));
             }
+        } else if active_count != 0 {
+            return Err(InstallationError::IncompleteObservation(
+                "active generation flag has no registry identity".to_owned(),
+            ));
         }
         if let Some(lkg) = &self.last_known_good_generation {
-            if !self
-                .generations
-                .iter()
-                .any(|item| item.last_known_good && item.manifest.generation == *lkg)
+            if lkg_count != 1
+                || !self
+                    .generations
+                    .iter()
+                    .any(|item| item.last_known_good && item.manifest.generation == *lkg)
             {
                 return Err(InstallationError::IncompleteObservation(
                     "last-known-good generation is absent from registry".to_owned(),
                 ));
             }
+            if self.active_generation.as_ref() == Some(lkg) {
+                return Err(InstallationError::IncompleteObservation(
+                    "active generation cannot also be last-known-good".to_owned(),
+                ));
+            }
+        } else if lkg_count != 0 {
+            return Err(InstallationError::IncompleteObservation(
+                "last-known-good flag has no registry identity".to_owned(),
+            ));
         }
         Ok(())
     }
@@ -905,22 +1000,36 @@ impl InstallationTransaction {
         }
         handles(&self.precondition_evidence, "precondition_evidence", true)?;
         handles(&self.completed_stage_refs, "completed_stage_refs", false)?;
-        handles(&self.pending_external_changes, "pending_external_changes", false)?;
-        handles(&self.observed_postconditions, "observed_postconditions", false)?;
-        if matches!(self.stage, InstallationStage::ActiveVerified | InstallationStage::Completed)
-            && self.observed_postconditions.is_empty()
+        handles(
+            &self.pending_external_changes,
+            "pending_external_changes",
+            false,
+        )?;
+        handles(
+            &self.observed_postconditions,
+            "observed_postconditions",
+            false,
+        )?;
+        if matches!(
+            self.stage,
+            InstallationStage::ActiveVerified | InstallationStage::Completed
+        ) && self.observed_postconditions.is_empty()
         {
             return Err(InstallationError::IncompleteObservation(
                 "active/completed transaction requires postcondition evidence".to_owned(),
             ));
         }
-        if matches!(self.stage, InstallationStage::RollbackRequired) && self.pending_external_changes.is_empty() {
+        if matches!(self.stage, InstallationStage::RollbackRequired)
+            && self.pending_external_changes.is_empty()
+        {
             return Err(InstallationError::IncompleteObservation(
                 "rollback-required transaction must name pending external changes".to_owned(),
             ));
         }
-        if matches!(self.stage, InstallationStage::RolledBack | InstallationStage::Quarantined)
-            && self.pending_external_changes.is_empty()
+        if matches!(
+            self.stage,
+            InstallationStage::RolledBack | InstallationStage::Quarantined
+        ) && self.pending_external_changes.is_empty()
             && self.completed_stage_refs.is_empty()
         {
             return Err(InstallationError::IncompleteObservation(
@@ -931,20 +1040,31 @@ impl InstallationTransaction {
     }
 
     /// Advances one stage using observed evidence and increments the revision.
-    pub fn advance(&mut self, next: InstallationStage, evidence: Vec<PlatformHandle>) -> Result<(), InstallationError> {
+    pub fn advance(
+        &mut self,
+        next: InstallationStage,
+        evidence: Vec<PlatformHandle>,
+    ) -> Result<(), InstallationError> {
         if !self.stage.can_advance(next) {
-            return Err(InstallationError::IllegalTransition { from: self.stage, to: next });
+            return Err(InstallationError::IllegalTransition {
+                from: self.stage,
+                to: next,
+            });
         }
         handles(&evidence, "stage_evidence", true)?;
         self.completed_stage_refs.extend(evidence);
         if next == InstallationStage::ActiveVerified {
-            self.observed_postconditions.extend(self.completed_stage_refs.clone());
+            self.observed_postconditions
+                .extend(self.completed_stage_refs.clone());
         }
         self.stage = next;
-        self.revision = self.revision.checked_add(1).ok_or_else(|| InstallationError::InvalidField {
-            field: "revision".to_owned(),
-            reason: "overflow".to_owned(),
-        })?;
+        self.revision =
+            self.revision
+                .checked_add(1)
+                .ok_or_else(|| InstallationError::InvalidField {
+                    field: "revision".to_owned(),
+                    reason: "overflow".to_owned(),
+                })?;
         self.validate()
     }
 
@@ -959,17 +1079,26 @@ impl InstallationTransaction {
         }
         self.pending_external_changes = pending;
         self.stage = InstallationStage::RollbackRequired;
-        self.revision = self.revision.checked_add(1).ok_or_else(|| InstallationError::InvalidField {
-            field: "revision".to_owned(),
-            reason: "overflow".to_owned(),
-        })?;
+        self.revision =
+            self.revision
+                .checked_add(1)
+                .ok_or_else(|| InstallationError::InvalidField {
+                    field: "revision".to_owned(),
+                    reason: "overflow".to_owned(),
+                })?;
         self.validate()
     }
 
     /// Records a no-return activation boundary after explicit observation.
-    pub fn record_no_return_boundary(&mut self, reference: PlatformHandle) -> Result<(), InstallationError> {
+    pub fn record_no_return_boundary(
+        &mut self,
+        reference: PlatformHandle,
+    ) -> Result<(), InstallationError> {
         handle(&reference, "no_return_boundary")?;
-        if !matches!(self.stage, InstallationStage::Activating | InstallationStage::ActiveVerified) {
+        if !matches!(
+            self.stage,
+            InstallationStage::Activating | InstallationStage::ActiveVerified
+        ) {
             return Err(InstallationError::IllegalTransition {
                 from: self.stage,
                 to: InstallationStage::ActiveVerified,
@@ -1031,7 +1160,11 @@ impl InstallationEffectRequest {
         ] {
             handle(value, field)?;
         }
-        handles(&self.change_refs, "effect.change_refs", self.operation != InstallationEffectOperation::Rollback)
+        handles(
+            &self.change_refs,
+            "effect.change_refs",
+            self.operation != InstallationEffectOperation::Rollback,
+        )
     }
 }
 
@@ -1070,7 +1203,10 @@ impl InstallationEffectObservation {
 /// Object-safe adapter seam for bounded installation effects.
 pub trait InstallationEffectPort: Send {
     /// Executes one operation and reports known, partial or unknown outcome.
-    fn execute(&mut self, request: &InstallationEffectRequest) -> PortOutcome<InstallationEffectObservation>;
+    fn execute(
+        &mut self,
+        request: &InstallationEffectRequest,
+    ) -> PortOutcome<InstallationEffectObservation>;
 }
 
 /// Result of one coordinator step.
@@ -1078,7 +1214,10 @@ pub trait InstallationEffectPort: Send {
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum InstallationStepOutcome {
     /// The effect was observed and the transaction advanced.
-    Applied { stage: InstallationStage, evidence_refs: Vec<PlatformHandle> },
+    Applied {
+        stage: InstallationStage,
+        evidence_refs: Vec<PlatformHandle>,
+    },
     /// The effect changed an object but complete postcondition evidence is absent.
     RollbackRequired { pending_refs: Vec<PlatformHandle> },
     /// Rollback itself is indeterminate and the transaction is quarantined.
@@ -1162,11 +1301,14 @@ where
                     });
                 }
                 transaction.mark_unknown(pending.clone())?;
-                Ok(InstallationStepOutcome::RollbackRequired { pending_refs: pending })
+                Ok(InstallationStepOutcome::RollbackRequired {
+                    pending_refs: pending,
+                })
             }
             PortOutcome::Unknown(reason) => {
-                let pending = vec![PlatformHandle::new(format!("unknown:{reason:?}"))
-                    .map_err(platform_error)?];
+                let pending = vec![
+                    PlatformHandle::new(format!("unknown:{reason:?}")).map_err(platform_error)?,
+                ];
                 if operation == InstallationEffectOperation::Rollback {
                     transaction.advance(InstallationStage::Quarantined, pending.clone())?;
                     return Ok(InstallationStepOutcome::Quarantined {
@@ -1174,7 +1316,9 @@ where
                     });
                 }
                 transaction.mark_unknown(pending.clone())?;
-                Ok(InstallationStepOutcome::RollbackRequired { pending_refs: pending })
+                Ok(InstallationStepOutcome::RollbackRequired {
+                    pending_refs: pending,
+                })
             }
             PortOutcome::Error(error) => Err(platform_error(error)),
         }
@@ -1186,14 +1330,32 @@ fn expected_stage(
     operation: InstallationEffectOperation,
 ) -> Result<InstallationStage, InstallationError> {
     let (expected, allowed) = match operation {
-        InstallationEffectOperation::Stage => (InstallationStage::Staging, matches!(current, InstallationStage::Planned)),
-        InstallationEffectOperation::Register => (InstallationStage::Registering, current == InstallationStage::StaticVerified),
-        InstallationEffectOperation::Activate => (InstallationStage::Activating, current == InstallationStage::Registering),
-        InstallationEffectOperation::Clean => (InstallationStage::Cleaning, current == InstallationStage::ActiveVerified),
-        InstallationEffectOperation::Rollback => (InstallationStage::RolledBack, current == InstallationStage::RollbackRequired),
+        InstallationEffectOperation::Stage => (
+            InstallationStage::Staging,
+            matches!(current, InstallationStage::Planned),
+        ),
+        InstallationEffectOperation::Register => (
+            InstallationStage::Registering,
+            current == InstallationStage::StaticVerified,
+        ),
+        InstallationEffectOperation::Activate => (
+            InstallationStage::Activating,
+            current == InstallationStage::Registering,
+        ),
+        InstallationEffectOperation::Clean => (
+            InstallationStage::Cleaning,
+            current == InstallationStage::ActiveVerified,
+        ),
+        InstallationEffectOperation::Rollback => (
+            InstallationStage::RolledBack,
+            current == InstallationStage::RollbackRequired,
+        ),
     };
     if !allowed {
-        return Err(InstallationError::IllegalTransition { from: current, to: expected });
+        return Err(InstallationError::IllegalTransition {
+            from: current,
+            to: expected,
+        });
     }
     Ok(expected)
 }

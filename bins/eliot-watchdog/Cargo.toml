@@ -22,7 +22,7 @@ serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
-windows-sys = { workspace = true, features = ["Win32_System_Services"] }
+windows-sys = { workspace = true, features = ["Win32_System_Services", "Win32_Storage_FileSystem"] }
 
 [lints.rust]
 unsafe_code = "allow"

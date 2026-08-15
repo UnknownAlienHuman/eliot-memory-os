@@ -8,13 +8,13 @@
 
 use std::fs::{self, OpenOptions};
 use std::future::Future;
-use std::io::Write;
+use std::io::{self, Write};
 use std::path::PathBuf;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use eliot_contracts::AuthorityEpoch;
 use eliot_runtime::{
     ChildClass, Runtime, RuntimeConfig, ShutdownOutcome, SupervisionStrategy, TaskFailure,
 };
@@ -31,6 +31,25 @@ pub enum SpoolError {
     Io(#[from] std::io::Error),
     #[error("watchdog spool path must be absolute")]
     RelativePath,
+    #[error("watchdog spool must be below the canonical ProgramData protected root")]
+    InvalidProtectedRoot,
+    #[error("watchdog spool serialization: {0}")]
+    Serialization(String),
+    #[error("watchdog lease is unavailable or invalid: {0}")]
+    InvalidLease(String),
+}
+
+const SPOOL_LIMIT: u64 = 1024 * 1024;
+const SPOOL_ROTATIONS: usize = 3;
+
+#[derive(serde::Serialize)]
+#[serde(deny_unknown_fields)]
+struct Heartbeat<'a> {
+    service: &'static str,
+    lease: &'a str,
+    scope: &'a str,
+    kernel_epoch: u64,
+    watchdog_epoch: u64,
 }
 
 /// Minimal independent sensor surface used by the SCM sibling process.
@@ -50,9 +69,15 @@ impl IndependentKernelSensor {
         if !spool.is_absolute() {
             return Err(SpoolError::RelativePath);
         }
-        if let Some(parent) = spool.parent() {
-            fs::create_dir_all(parent)?;
-        }
+        let program_data = std::env::var_os("ProgramData")
+            .map(PathBuf::from)
+            .ok_or(SpoolError::InvalidProtectedRoot)?;
+        let root = fs::canonicalize(program_data)?;
+        let parent = spool.parent().ok_or(SpoolError::InvalidProtectedRoot)?;
+        ensure_contained_non_reparse(&root, parent)?;
+        let parent = spool.parent().ok_or(SpoolError::InvalidProtectedRoot)?;
+        fs::create_dir_all(parent)?;
+        ensure_non_reparse(parent)?;
         OpenOptions::new().create(true).append(true).open(&spool)?;
         let watchdog = Watchdog::new(
             eliot_watchdog_core::WatchdogConfig::default(),
@@ -65,21 +90,74 @@ impl IndependentKernelSensor {
         })
     }
 
+    /// Opens the canonical protected watchdog spool below ProgramData.  The
+    /// root is canonicalized and every existing path component is rejected if
+    /// it is a symlink/reparse point, preventing redirection outside the
+    /// service data boundary.
+    pub fn open_program_data(
+        relative_path: impl Into<PathBuf>,
+        watchdog_epoch: u64,
+    ) -> Result<Self, SpoolError> {
+        let program_data = std::env::var_os("ProgramData")
+            .map(PathBuf::from)
+            .ok_or(SpoolError::InvalidProtectedRoot)?;
+        if !program_data.is_absolute() {
+            return Err(SpoolError::InvalidProtectedRoot);
+        }
+        let root = fs::canonicalize(&program_data)?;
+        ensure_non_reparse(&root)?;
+        let relative = relative_path.into();
+        if relative.is_absolute()
+            || relative
+                .components()
+                .any(|component| matches!(component, std::path::Component::ParentDir))
+        {
+            return Err(SpoolError::InvalidProtectedRoot);
+        }
+        let spool = root.join(relative);
+        let parent = spool.parent().ok_or(SpoolError::InvalidProtectedRoot)?;
+        fs::create_dir_all(parent)?;
+        ensure_contained_non_reparse(&root, parent)?;
+        Self::open(spool, watchdog_epoch)
+    }
+
     fn record_heartbeat(&self, lease: &SupervisionLease) -> Result<(), KernelWatchdogError> {
         let watchdog = self
             .watchdog
             .lock()
             .map_err(|_| KernelWatchdogError::Failed)?;
-        let _epoch = watchdog.epoch();
-        let line = format!(
-            "{{\"service\":\"{}\",\"lease\":\"{}\",\"scope\":\"{}\"}}\n",
-            SERVICE_NAME, lease.lease_id, lease.scope_ref
-        );
-        OpenOptions::new()
+        let epoch = watchdog.epoch();
+        if epoch.0 == 0 || lease.watchdog_epoch.value() != epoch.0 {
+            return Err(KernelWatchdogError::LeaseRejected);
+        }
+        lease
+            .validate()
+            .map_err(|_| KernelWatchdogError::LeaseRejected)?;
+        let line = serde_json::to_vec(&Heartbeat {
+            service: SERVICE_NAME,
+            lease: &lease.lease_id,
+            scope: &lease.scope_ref,
+            kernel_epoch: lease.kernel_epoch.value(),
+            watchdog_epoch: lease.watchdog_epoch.value(),
+        })
+        .map_err(|error| KernelWatchdogError::FailedWithDetail(error.to_string()))?;
+        let mut line = line;
+        line.push(b'\n');
+        if let Some(parent) = self.spool.parent() {
+            ensure_non_reparse(parent).map_err(|_| KernelWatchdogError::Failed)?;
+        } else {
+            return Err(KernelWatchdogError::Failed);
+        }
+        rotate_if_needed(&self.spool, line.len() as u64)
+            .map_err(|_| KernelWatchdogError::Failed)?;
+        let mut file = OpenOptions::new()
             .create(true)
             .append(true)
             .open(&self.spool)
-            .and_then(|mut file| file.write_all(line.as_bytes()))
+            .map_err(|_| KernelWatchdogError::Failed)?;
+        file.write_all(&line)
+            .and_then(|()| file.flush())
+            .and_then(|()| file.sync_all())
             .map_err(|_| KernelWatchdogError::Failed)
     }
 }
@@ -161,6 +239,8 @@ pub enum KernelWatchdogError {
     LeaseRejected,
     #[error("kernel supervision failed")]
     Failed,
+    #[error("kernel supervision failed: {0}")]
+    FailedWithDetail(String),
 }
 
 /// Errors raised while composing the watchdog process.
@@ -192,6 +272,7 @@ pub struct WatchdogComposition {
     lease: Arc<SupervisionLease>,
     config: WatchdogConfig,
     task: eliot_runtime::SupervisedHandle,
+    shutdown_requested: Arc<AtomicBool>,
 }
 
 impl WatchdogComposition {
@@ -200,6 +281,17 @@ impl WatchdogComposition {
         config: WatchdogConfig,
         lease: SupervisionLease,
         kernel: Arc<dyn KernelWatchdogPort>,
+    ) -> Result<Self, CompositionError> {
+        Self::start_with_shutdown(config, lease, kernel, Arc::new(AtomicBool::new(false)))
+    }
+
+    /// Starts the composition with a caller-owned stop flag.  SCM control
+    /// handlers use this flag because they execute outside the Tokio runtime.
+    pub fn start_with_shutdown(
+        config: WatchdogConfig,
+        lease: SupervisionLease,
+        kernel: Arc<dyn KernelWatchdogPort>,
+        shutdown_requested: Arc<AtomicBool>,
     ) -> Result<Self, CompositionError> {
         config.validate()?;
         lease
@@ -244,6 +336,7 @@ impl WatchdogComposition {
             lease,
             config,
             task,
+            shutdown_requested,
         })
     }
 
@@ -260,7 +353,12 @@ impl WatchdogComposition {
 
     /// Waits for process termination and performs ordered runtime shutdown.
     pub async fn run_until_shutdown(self) -> Result<ShutdownOutcome, TaskFailure> {
-        let WatchdogComposition { runtime, task, .. } = self;
+        let WatchdogComposition {
+            runtime,
+            task,
+            shutdown_requested,
+            ..
+        } = self;
         let mut task_result = Box::pin(task.join());
         tokio::select! {
             result = &mut task_result => {
@@ -276,22 +374,133 @@ impl WatchdogComposition {
                 let shutdown = runtime.shutdown().await;
                 result.map(|_| shutdown)
             }
+            result = wait_for_shutdown(shutdown_requested) => {
+                if result {
+                    runtime.shutdown_handle().request();
+                    let result = task_result.await;
+                    let shutdown = runtime.shutdown().await;
+                    result.map(|_| shutdown)
+                } else {
+                    Err(TaskFailure::Failed("watchdog shutdown signal failed".to_owned()))
+                }
+            }
         }
+    }
+
+    /// Requests bounded shutdown from an SCM control path.
+    pub fn request_shutdown(&self) {
+        self.shutdown_requested.store(true, Ordering::Release);
     }
 }
 
-/// Constructs the canonical active lease for a process invocation.
-pub fn active_lease(
-    lease_id: impl Into<String>,
-    scope_ref: impl Into<String>,
-    kernel_epoch: AuthorityEpoch,
-    watchdog_epoch: AuthorityEpoch,
-) -> SupervisionLease {
-    SupervisionLease {
-        lease_id: lease_id.into(),
-        scope_ref: scope_ref.into(),
-        kernel_epoch,
-        watchdog_epoch,
-        state: LeaseState::Active,
+async fn wait_for_shutdown(shutdown_requested: Arc<AtomicBool>) -> bool {
+    loop {
+        if shutdown_requested.load(Ordering::Acquire) {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
     }
+}
+
+/// Loads and validates the current Host/Kernel-issued lease.  Missing,
+/// malformed, stale or non-active bytes are a hard startup failure.
+pub fn load_supervision_lease(
+    path: impl AsRef<std::path::Path>,
+) -> Result<SupervisionLease, SpoolError> {
+    let path = path.as_ref();
+    if !path.is_absolute() {
+        return Err(SpoolError::InvalidProtectedRoot);
+    }
+    let program_data = std::env::var_os("ProgramData")
+        .map(PathBuf::from)
+        .ok_or(SpoolError::InvalidProtectedRoot)?;
+    let root = fs::canonicalize(program_data)?;
+    let parent = path.parent().ok_or(SpoolError::InvalidProtectedRoot)?;
+    ensure_contained_non_reparse(&root, parent)?;
+    let bytes = fs::read(path).map_err(|error| SpoolError::InvalidLease(error.to_string()))?;
+    let lease: SupervisionLease = serde_json::from_slice(&bytes)
+        .map_err(|error| SpoolError::InvalidLease(error.to_string()))?;
+    lease
+        .validate()
+        .map_err(|error| SpoolError::InvalidLease(error.to_string()))?;
+    if lease.state != LeaseState::Active
+        || lease.kernel_epoch.value() == 0
+        || lease.watchdog_epoch.value() == 0
+    {
+        return Err(SpoolError::InvalidLease(
+            "lease is not active or carries a zero epoch".to_owned(),
+        ));
+    }
+    Ok(lease)
+}
+
+fn rotate_if_needed(path: &std::path::Path, incoming: u64) -> io::Result<()> {
+    if incoming > SPOOL_LIMIT {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "watchdog heartbeat exceeds spool frame limit",
+        ));
+    }
+    let current = fs::metadata(path)
+        .map(|metadata| metadata.len())
+        .unwrap_or(0);
+    if current.saturating_add(incoming) <= SPOOL_LIMIT {
+        return Ok(());
+    }
+    for index in (1..=SPOOL_ROTATIONS).rev() {
+        let source = if index == 1 {
+            path.to_owned()
+        } else {
+            path.with_extension(format!(
+                "jsonl.{index_minus_one}",
+                index_minus_one = index - 1
+            ))
+        };
+        let destination = path.with_extension(format!("jsonl.{index}"));
+        if destination.exists() {
+            fs::remove_file(&destination)?;
+        }
+        if source.exists() {
+            fs::rename(source, destination)?;
+        }
+    }
+    Ok(())
+}
+
+fn ensure_non_reparse(path: &std::path::Path) -> Result<(), SpoolError> {
+    let metadata = fs::symlink_metadata(path)?;
+    if metadata.file_type().is_symlink() {
+        return Err(SpoolError::InvalidProtectedRoot);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        if metadata.file_attributes()
+            & windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT
+            != 0
+        {
+            return Err(SpoolError::InvalidProtectedRoot);
+        }
+    }
+    Ok(())
+}
+
+fn ensure_contained_non_reparse(
+    root: &std::path::Path,
+    path: &std::path::Path,
+) -> Result<(), SpoolError> {
+    let canonical = fs::canonicalize(path)?;
+    if !canonical.starts_with(root) {
+        return Err(SpoolError::InvalidProtectedRoot);
+    }
+    let mut cursor = root.to_owned();
+    for component in canonical
+        .strip_prefix(root)
+        .unwrap_or(std::path::Path::new(""))
+        .components()
+    {
+        cursor.push(component);
+        ensure_non_reparse(&cursor)?;
+    }
+    Ok(())
 }

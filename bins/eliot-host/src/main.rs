@@ -1,7 +1,7 @@
 use std::io::{self, BufRead, Write};
 use std::path::PathBuf;
 
-use eliot_host::{HostComposition, HostError, PROTOCOL_VERSION, SERVICE_NAME, initial_epoch};
+use eliot_host::{HostComposition, HostError, PROTOCOL_VERSION, SERVICE_NAME};
 use eliot_platform::PlatformHandle;
 use serde::{Deserialize, Serialize};
 
@@ -32,8 +32,16 @@ enum Response {
 
 fn main() {
     #[cfg(windows)]
-    if run_as_scm_service() {
-        return;
+    match run_as_scm_service() {
+        Ok(true) => return,
+        Ok(false) => {}
+        Err(error) => {
+            let _ = writeln!(
+                io::stderr().lock(),
+                "eliot-host: StartServiceCtrlDispatcherW failed with Win32 error {error} (0x{error:08X})"
+            );
+            std::process::exit(1);
+        }
     }
     run_console();
 }
@@ -69,28 +77,30 @@ fn run_console() {
 }
 
 fn open_host() -> Result<HostComposition, HostError> {
-    let installation = std::env::var("ELIOT_INSTALLATION_ID")
-        .ok()
-        .and_then(|value| PlatformHandle::new(value).ok())
-        .unwrap_or_else(|| handle("system"));
-    let path = state_path();
+    let installation_value =
+        std::env::var("ELIOT_INSTALLATION_ID").map_err(|_| HostError::MissingInstallation)?;
+    let installation = PlatformHandle::new(installation_value)
+        .map_err(|error| HostError::Platform(format!("invalid ELIOT_INSTALLATION_ID: {error}")))?;
+    let path = state_path()?;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    HostComposition::open(path, initial_epoch(installation))
+    HostComposition::open(path, installation)
 }
 
-fn state_path() -> PathBuf {
-    std::env::var_os("ProgramData")
+fn state_path() -> Result<PathBuf, HostError> {
+    let program_data = std::env::var_os("ProgramData")
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(r"C:\ProgramData"))
+        .ok_or_else(|| HostError::Platform("ProgramData is not configured".to_owned()))?;
+    if !program_data.is_absolute() {
+        return Err(HostError::Platform(
+            "ProgramData must be an absolute path".to_owned(),
+        ));
+    }
+    Ok(program_data
         .join("Eliot")
         .join("host")
-        .join("host-state.redb")
-}
-
-fn handle(value: &str) -> PlatformHandle {
-    PlatformHandle::new(value).unwrap_or_else(|_| unreachable!())
+        .join("host-state.redb"))
 }
 
 fn dispatch(host: &mut HostComposition, line: &str) -> Response {
@@ -129,10 +139,10 @@ fn write_response(response: Response) -> bool {
 static STOP_REQUESTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 #[cfg(windows)]
-fn run_as_scm_service() -> bool {
+fn run_as_scm_service() -> Result<bool, u32> {
     use std::ffi::OsStr;
     use std::os::windows::ffi::OsStrExt;
-    use windows_sys::Win32::Foundation::GetLastError;
+    use windows_sys::Win32::Foundation::{ERROR_FAILED_SERVICE_CONTROLLER_CONNECT, GetLastError};
     use windows_sys::Win32::System::Services::{SERVICE_TABLE_ENTRYW, StartServiceCtrlDispatcherW};
 
     let name = OsStr::new(SERVICE_NAME)
@@ -152,12 +162,16 @@ fn run_as_scm_service() -> bool {
     // SAFETY: the table and UTF-16 name remain live until SCM returns.
     let connected = unsafe { StartServiceCtrlDispatcherW(table.as_ptr()) } != 0;
     if connected {
-        true
+        Ok(true)
     } else {
-        // ERROR_FAILED_SERVICE_CONTROLLER_CONNECT means an interactive launch;
-        // every other error is still reported through the normal console path.
-        let _ = unsafe { GetLastError() };
-        false
+        let error = unsafe { GetLastError() };
+        if error == ERROR_FAILED_SERVICE_CONTROLLER_CONNECT {
+            // The documented interactive-console case is the only condition
+            // under which the process may enter its stdin/stdout fallback.
+            Ok(false)
+        } else {
+            Err(error)
+        }
     }
 }
 
@@ -168,7 +182,8 @@ unsafe extern "system" fn service_main(_argc: u32, _argv: *mut *mut u16) {
     use std::sync::atomic::Ordering;
     use windows_sys::Win32::System::Services::{
         RegisterServiceCtrlHandlerExW, SERVICE_ACCEPT_SHUTDOWN, SERVICE_ACCEPT_STOP,
-        SERVICE_RUNNING, SERVICE_START_PENDING, SERVICE_STATUS, SERVICE_STOPPED, SetServiceStatus,
+        SERVICE_RUNNING, SERVICE_START_PENDING, SERVICE_STATUS, SERVICE_STOP_PENDING,
+        SERVICE_STOPPED, SetServiceStatus,
     };
 
     let name = OsStr::new(SERVICE_NAME)
@@ -209,8 +224,24 @@ unsafe extern "system" fn service_main(_argc: u32, _argv: *mut *mut u16) {
     // SAFETY: handle is registered and status is initialized.
     unsafe { SetServiceStatus(handle, &raw const status) };
     while !STOP_REQUESTED.load(Ordering::Acquire) && host.running() {
+        if host.has_process_contour() {
+            if let Err(error) = host.reconcile_approved_contour() {
+                let _ = writeln!(
+                    io::stderr().lock(),
+                    "eliot-host: contour reconciliation failed: {error}"
+                );
+                STOP_REQUESTED.store(true, Ordering::Release);
+                break;
+            }
+        }
         std::thread::sleep(std::time::Duration::from_millis(250));
     }
+    status.dwCurrentState = SERVICE_STOP_PENDING;
+    status.dwControlsAccepted = 0;
+    status.dwCheckPoint = 1;
+    status.dwWaitHint = 10_000;
+    // SAFETY: handle is registered and status is initialized.
+    unsafe { SetServiceStatus(handle, &raw const status) };
     let _ = host.stop();
     status.dwCurrentState = SERVICE_STOPPED;
     status.dwControlsAccepted = 0;
