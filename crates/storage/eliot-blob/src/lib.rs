@@ -412,7 +412,10 @@ fn open_owned_root_lease(lock_path: &Path) -> Result<fs::File, BlobError> {
                 .write(true)
                 .share_mode(WINDOWS_FILE_SHARE_READ);
             existing.open(lock_path).map_err(|error| {
-                if error.kind() == std::io::ErrorKind::PermissionDenied {
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::WouldBlock
+                ) {
                     BlobError::OwnerConflict
                 } else {
                     BlobError::Provider(format!(
