@@ -1,0 +1,27 @@
+[package]
+name = "eliot-store-surreal-adapter"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Sole SurrealDB credential and client owner for the ELIOT canonical store"
+
+[dependencies]
+eliot-platform.workspace = true
+eliot-protocol.workspace = true
+eliot-store-api.workspace = true
+futures-util.workspace = true
+schemars.workspace = true
+secrecy.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-tungstenite.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+eliot-contracts.workspace = true
+
+[lints]
+workspace = true

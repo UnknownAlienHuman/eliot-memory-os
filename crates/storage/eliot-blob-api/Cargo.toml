@@ -1,0 +1,20 @@
+[package]
+name = "eliot-blob-api"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Provider-neutral ELIOT S-04 BlobStore contracts"
+
+[dependencies]
+eliot-platform.workspace = true
+eliot-receipts.workspace = true
+eliot-security-contracts.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+blake3.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true

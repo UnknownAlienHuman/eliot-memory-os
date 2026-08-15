@@ -1,0 +1,2187 @@
+//! C3 S-04 blob implementation over injected platform, codec, key, AEAD and
+//! canonical-live-set ports.
+//!
+//! This crate intentionally contains no direct filesystem or cryptographic
+//! implementation. The current P-01 filesystem surface cannot express
+//! durable create/replace/no-replace rename plus Windows reparse containment,
+//! so those exact obligations are represented by [`BlobPlatformPort`]. A
+//! composition lacking that adapter receives a typed `PLAN_GAP`.
+//!
+//! # Ownership and concurrency
+//!
+//! [`BlobStoreService`] claims the root exactly once at construction and holds
+//! the immutable [`RootOwner`] claim behind one `Arc`. Cloned handles never
+//! re-claim a root and never create a second receipt issuer. There is no global
+//! state lock: reads overlap through shared platform/codec/key/AEAD locks, and
+//! same-content or same-operation identities serialize through striped shard
+//! locks. Blocking filesystem/codec work still executes on the calling task
+//! until the P-11 task API is admitted (documented blocker).
+
+#![forbid(unsafe_code)]
+#![allow(clippy::missing_errors_doc)]
+
+use std::sync::{Arc, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
+
+use blake3::Hasher;
+use eliot_blob_api::{
+    BlobError, BlobFuture, BlobGcReceipt, BlobGcRequest, BlobHash, BlobHealth, BlobId,
+    BlobIssuerTrustAnchor, BlobKeyOperation, BlobKeyRecoveryCeiling, BlobLiveSetProof, BlobLocator,
+    BlobPolicyBinding, BlobReachabilityRequest, BlobReachabilityView, BlobReadChunk,
+    BlobReadRequest, BlobReadyReceipt, BlobReceiptBinding, BlobReceiptContext,
+    BlobReferenceObservation, BlobReferenceRequest, BlobRootLease, BlobStageRequest,
+    BlobStoreClient, CompressionDescriptor, CryptoDescriptor, GcState, PublishState,
+    SignedBlobReceiptWire, VerifiedBlobReceipt, metadata_path, payload_path, verify_receipt,
+};
+use eliot_platform::WorkScopePath;
+use eliot_receipts::{
+    ArtifactBinding, ProofCeiling, Receipt, ReceiptCore, ReceiptDisposition, ReceiptKind,
+    contract_identity,
+};
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+
+const FORMAT_ID: &str = "eliot-blob-envelope";
+const FORMAT_VERSION: u32 = 1;
+const PATH_GENERATION: u32 = 1;
+const MAX_BLOB_ENVELOPE_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_BLOB_PLAINTEXT_BYTES: u64 = 32 * 1024 * 1024;
+const MAX_METADATA_BYTES: u64 = 64 * 1024;
+const MAX_JOURNAL_BYTES: u64 = 64 * 1024;
+const SHARD_COUNT: usize = 64;
+
+/// Proof returned only after the adapter has exclusively claimed a root.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RootClaimProof {
+    pub root_id: String,
+    pub owner_id: String,
+    pub lease_id: String,
+    pub root_generation: u64,
+    pub containment_proven: bool,
+    pub permissions_proven: bool,
+}
+
+impl RootClaimProof {
+    fn validate(&self, lease: &BlobRootLease) -> Result<(), BlobError> {
+        if self.root_id != lease.root_id.as_str()
+            || self.owner_id != lease.owner_id.as_str()
+            || self.lease_id != lease.lease_id.as_str()
+            || self.root_generation != lease.root_generation
+        {
+            return Err(BlobError::OwnerConflict);
+        }
+        if !self.containment_proven || !self.permissions_proven {
+            return Err(BlobError::PlanGap(
+                "P-01/P-02 root containment or permission proof unavailable".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// File state observed through the pinned root handle.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BlobPathState {
+    Missing,
+    File { length: u64, modified_unix_ms: u64 },
+    Directory,
+    ReparsePoint,
+    Other,
+}
+
+/// Platform-neutral extension required until P-01 exposes the complete blob
+/// durability and reparse-safe publication surface.
+pub trait BlobPlatformPort: Send + Sync {
+    fn claim_root(&mut self, lease: &BlobRootLease) -> Result<RootClaimProof, BlobError>;
+    fn inspect_root(&self, lease: &BlobRootLease) -> Result<RootClaimProof, BlobError>;
+    fn prove_contained(&self, lease: &BlobRootLease, path: &WorkScopePath)
+    -> Result<(), BlobError>;
+    /// Reads at most `max_bytes`; implementations must reject before allocating
+    /// or returning byte `max_bytes + 1`.
+    fn read_bounded(&self, path: &WorkScopePath, max_bytes: u64) -> Result<Vec<u8>, BlobError>;
+    fn write_new_durable(&mut self, path: &WorkScopePath, bytes: &[u8]) -> Result<(), BlobError>;
+    fn replace_durable(&mut self, path: &WorkScopePath, bytes: &[u8]) -> Result<(), BlobError>;
+    fn rename_no_replace_durable(
+        &mut self,
+        source: &WorkScopePath,
+        destination: &WorkScopePath,
+    ) -> Result<(), BlobError>;
+    fn remove_durable(&mut self, path: &WorkScopePath) -> Result<(), BlobError>;
+    fn stat(&self, path: &WorkScopePath) -> Result<BlobPathState, BlobError>;
+    fn list(&self, prefix: &WorkScopePath) -> Result<Vec<WorkScopePath>, BlobError>;
+    fn now_unix_ms(&mut self) -> Result<u64, BlobError>;
+}
+
+/// Compression provider. `BlobStore` never treats compression as encryption.
+pub trait BlobCompressionPort: Send + Sync {
+    fn descriptor(&mut self) -> Result<CompressionDescriptor, BlobError>;
+    fn compress(&mut self, plaintext: &[u8]) -> Result<Vec<u8>, BlobError>;
+    /// Incrementally decodes and aborts before producing `max_output_bytes + 1`.
+    fn decompress_bounded(
+        &self,
+        descriptor: &CompressionDescriptor,
+        compressed: &[u8],
+        max_output_bytes: u64,
+    ) -> Result<Vec<u8>, BlobError>;
+}
+
+/// Opaque key selection result. Key bytes are not representable.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BlobKeySelection {
+    pub key_ref: BlobId,
+    pub crypto: CryptoDescriptor,
+}
+
+/// Exact injected key-lineage/rotation port.
+pub trait BlobKeyPort: Send + Sync {
+    fn current(&mut self) -> Result<BlobKeySelection, BlobError>;
+    fn resolve(&self, descriptor: &CryptoDescriptor) -> Result<BlobKeySelection, BlobError>;
+}
+
+/// Versioned authenticated-encryption input.
+pub struct AeadSealRequest<'a> {
+    pub key: &'a BlobKeySelection,
+    pub nonce_context: &'a [u8],
+    pub associated_data: &'a [u8],
+    pub plaintext: &'a [u8],
+}
+
+/// Versioned authenticated-decryption input.
+pub struct AeadOpenRequest<'a> {
+    pub key: &'a BlobKeySelection,
+    pub nonce_context: &'a [u8],
+    pub associated_data: &'a [u8],
+    pub ciphertext: &'a [u8],
+}
+
+/// AEAD provider. There is deliberately no plaintext fallback.
+pub trait BlobAeadPort: Send + Sync {
+    fn seal(&mut self, request: AeadSealRequest<'_>) -> Result<Vec<u8>, BlobError>;
+    fn open(&self, request: AeadOpenRequest<'_>) -> Result<Vec<u8>, BlobError>;
+}
+
+/// Canonical-owner revalidation result immediately before destructive GC.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LiveSetRevalidation {
+    pub proof_id: BlobId,
+    pub snapshot_sha256: String,
+    pub revision: u64,
+    pub still_complete_and_current: bool,
+}
+
+/// Runtime port to G-04/S-01 authority. `BlobStore` cannot self-certify reachability.
+pub trait BlobLiveSetPort: Send + Sync {
+    fn revalidate(&mut self, proof: &BlobLiveSetProof) -> Result<LiveSetRevalidation, BlobError>;
+
+    /// Serializes canonical-reference creation against physical deletion and
+    /// invokes `delete` while the same compare-and-delete guard is held.
+    fn compare_and_delete(
+        &mut self,
+        proof: &BlobLiveSetProof,
+        locator: &BlobLocator,
+        delete: &mut dyn FnMut() -> Result<(), BlobError>,
+    ) -> Result<ConditionalDeleteOutcome, BlobError>;
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ConditionalDeleteOutcome {
+    Deleted,
+    RetainedLive,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StoredMetadata {
+    receipt: Receipt,
+    /// Exact immutable receipt envelope bytes approved by the service verifier.
+    receipt_bytes: Vec<u8>,
+    locator: BlobLocator,
+    plaintext_length: u64,
+    stored_length: u64,
+    envelope_length: u64,
+    plaintext_sha256: String,
+    sealed_sha256: String,
+    receipt_binding_sha256: String,
+    format: BlobId,
+    format_version: u32,
+    compression: CompressionDescriptor,
+    crypto: CryptoDescriptor,
+    policy: BlobPolicyBinding,
+    operation_id: String,
+    idempotency_key: String,
+}
+
+impl StoredMetadata {
+    fn validate(&self) -> Result<(), BlobError> {
+        self.receipt
+            .validate()
+            .map_err(|error| BlobError::Receipt(error.to_string()))?;
+        let signed_wire: SignedBlobReceiptWire = serde_json::from_slice(&self.receipt_bytes)
+            .map_err(|error| {
+                BlobError::Receipt(format!("stored receipt wire decode failed: {error}"))
+            })?;
+        let canonical_receipt_bytes = serde_json::to_vec(&signed_wire)
+            .map_err(|error| BlobError::InvalidContract(error.to_string()))?;
+        if canonical_receipt_bytes != self.receipt_bytes || signed_wire.receipt != self.receipt {
+            return Err(BlobError::Receipt(
+                "stored receipt bytes do not match the immutable envelope".to_owned(),
+            ));
+        }
+        self.locator.validate()?;
+        validate_sha256(&self.plaintext_sha256, "plaintext_sha256")?;
+        validate_sha256(&self.sealed_sha256, "sealed_sha256")?;
+        validate_sha256(&self.receipt_binding_sha256, "receipt_binding_sha256")?;
+        if self.stored_length == 0 || self.stored_length != self.envelope_length {
+            return Err(BlobError::MetadataPayloadMismatch);
+        }
+        if self.plaintext_length > MAX_BLOB_PLAINTEXT_BYTES
+            || self.stored_length > MAX_BLOB_ENVELOPE_BYTES
+        {
+            return Err(BlobError::MetadataPayloadMismatch);
+        }
+        if self.format.as_str() != FORMAT_ID || self.format_version != FORMAT_VERSION {
+            return Err(BlobError::MetadataPayloadMismatch);
+        }
+        self.compression.validate()?;
+        self.crypto.validate()?;
+        self.policy.validate()?;
+        let expected = eliot_blob_api::receipt_binding_sha256(
+            &self.format,
+            self.format_version,
+            &self.locator,
+            self.plaintext_length,
+            self.stored_length,
+            &self.plaintext_sha256,
+            &self.sealed_sha256,
+            &self.compression,
+            &self.crypto,
+            &self.policy,
+        )?;
+        if expected != self.receipt_binding_sha256
+            || self.receipt.core.artifacts.len() != 2
+            || self.receipt.core.artifacts[0].sha256 != self.plaintext_sha256
+            || self.receipt.core.artifacts[1].sha256 != self.receipt_binding_sha256
+            || self.receipt.core.operation.operation_id.as_str() != self.operation_id.as_str()
+            || self.receipt.core.operation.idempotency_key != self.idempotency_key
+        {
+            return Err(BlobError::MetadataPayloadMismatch);
+        }
+        Ok(())
+    }
+
+    fn ready(
+        &self,
+        verified: VerifiedBlobReceipt,
+        expected_anchor: &BlobIssuerTrustAnchor,
+        metadata_sha256: String,
+    ) -> Result<BlobReadyReceipt, BlobError> {
+        BlobReadyReceipt::from_verified(
+            verified,
+            expected_anchor,
+            self.locator.clone(),
+            self.plaintext_length,
+            self.stored_length,
+            self.plaintext_sha256.clone(),
+            self.sealed_sha256.clone(),
+            self.receipt_binding_sha256.clone(),
+            metadata_sha256,
+            self.format.clone(),
+            self.format_version,
+            self.compression.clone(),
+            self.crypto.clone(),
+            self.policy.clone(),
+        )
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StageJournal {
+    operation_id: String,
+    idempotency_key: String,
+    state: PublishState,
+    temp_payload: WorkScopePath,
+    temp_metadata: WorkScopePath,
+    final_payload: WorkScopePath,
+    final_metadata: WorkScopePath,
+    expected_payload_sha256: String,
+    expected_metadata_sha256: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OperationCommit {
+    operation_id: String,
+    idempotency_key: String,
+    locator: BlobLocator,
+    metadata_sha256: String,
+}
+
+impl OperationCommit {
+    fn validate(&self) -> Result<(), BlobError> {
+        valid_operation_text(&self.operation_id, "commit.operation_id")?;
+        valid_operation_text(&self.idempotency_key, "commit.idempotency_key")?;
+        self.locator.validate()?;
+        validate_sha256(&self.metadata_sha256, "commit.metadata_sha256")
+    }
+}
+
+impl StageJournal {
+    fn validate(&self) -> Result<(), BlobError> {
+        valid_operation_text(&self.operation_id, "journal.operation_id")?;
+        valid_operation_text(&self.idempotency_key, "journal.idempotency_key")?;
+        validate_sha256(&self.expected_payload_sha256, "journal.payload_sha256")?;
+        validate_sha256(&self.expected_metadata_sha256, "journal.metadata_sha256")
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Tombstone {
+    operation_id: String,
+    proof_id: BlobId,
+    proof_snapshot_sha256: String,
+    locator: BlobLocator,
+    live_set: BlobLiveSetProof,
+    payload: WorkScopePath,
+    metadata: WorkScopePath,
+    state: GcState,
+}
+
+impl Tombstone {
+    fn validate(&self) -> Result<(), BlobError> {
+        valid_operation_text(&self.operation_id, "tombstone.operation_id")?;
+        validate_sha256(&self.proof_snapshot_sha256, "tombstone.snapshot_sha256")?;
+        self.locator.validate()?;
+        self.live_set.validate_complete()?;
+        if self.live_set.proof_id != self.proof_id
+            || self.live_set.snapshot_sha256 != self.proof_snapshot_sha256
+        {
+            return Err(BlobError::IncompleteLiveSet);
+        }
+        Ok(())
+    }
+}
+
+/// Immutable claimed-root state shared by every cloned service handle.
+struct RootOwner {
+    lease: BlobRootLease,
+    claim: RootClaimProof,
+}
+
+/// Striped per-content/per-operation serialization locks. There is no single
+/// global mutex; independent identities contend only on their own stripe.
+struct ShardLocks {
+    locks: [Mutex<()>; SHARD_COUNT],
+}
+
+impl ShardLocks {
+    fn new() -> Self {
+        Self {
+            locks: std::array::from_fn(|_| Mutex::new(())),
+        }
+    }
+}
+
+fn hex_nibble(byte: u8) -> u8 {
+    match byte {
+        b'0'..=b'9' => byte - b'0',
+        b'a'..=b'f' => byte - b'a' + 10,
+        _ => 0,
+    }
+}
+
+fn content_shard(hash: &BlobHash) -> usize {
+    let bytes = hash.as_str().as_bytes();
+    let hi = usize::from(hex_nibble(bytes[0]));
+    let lo = usize::from(hex_nibble(bytes[1]));
+    (hi * 16 + lo) % SHARD_COUNT
+}
+
+fn operation_shard(operation_id: &str, idempotency_key: &str) -> usize {
+    let mut hasher = Hasher::new();
+    hasher.update(operation_id.as_bytes());
+    hasher.update(idempotency_key.as_bytes());
+    let bytes = hasher.finalize();
+    let hi = usize::from(bytes.as_bytes()[0]);
+    let lo = usize::from(bytes.as_bytes()[1]);
+    (hi * 16 + lo) % SHARD_COUNT
+}
+
+struct BlobStoreCore<P, C, K, A, L> {
+    owner: RootOwner,
+    platform: RwLock<P>,
+    compression: RwLock<C>,
+    keys: RwLock<K>,
+    aead: RwLock<A>,
+    live_sets: Mutex<L>,
+    shards: ShardLocks,
+    issuer_anchor: BlobIssuerTrustAnchor,
+}
+
+impl<P, C, K, A, L> BlobStoreCore<P, C, K, A, L>
+where
+    P: BlobPlatformPort,
+    C: BlobCompressionPort,
+    K: BlobKeyPort,
+    A: BlobAeadPort,
+    L: BlobLiveSetPort,
+{
+    fn claim(
+        lease: BlobRootLease,
+        mut platform: P,
+        compression: C,
+        keys: K,
+        aead: A,
+        live_sets: L,
+        issuer_anchor: BlobIssuerTrustAnchor,
+    ) -> Result<Self, BlobError> {
+        lease.validate()?;
+        let claim = platform.claim_root(&lease)?;
+        claim.validate(&lease)?;
+        Ok(Self {
+            owner: RootOwner { lease, claim },
+            platform: RwLock::new(platform),
+            compression: RwLock::new(compression),
+            keys: RwLock::new(keys),
+            aead: RwLock::new(aead),
+            live_sets: Mutex::new(live_sets),
+            shards: ShardLocks::new(),
+            issuer_anchor,
+        })
+    }
+
+    fn lock_shards(&self, indices: &[usize]) -> Result<Vec<MutexGuard<'_, ()>>, BlobError> {
+        let mut unique = indices.to_vec();
+        unique.sort_unstable();
+        unique.dedup();
+        unique
+            .into_iter()
+            .map(|index| {
+                self.shards.locks[index]
+                    .lock()
+                    .map_err(|_| BlobError::Provider("blob shard lock poisoned".to_owned()))
+            })
+            .collect()
+    }
+
+    fn platform_read(&self) -> Result<RwLockReadGuard<'_, P>, BlobError> {
+        self.platform
+            .read()
+            .map_err(|_| BlobError::Provider("blob platform lock poisoned".to_owned()))
+    }
+
+    fn platform_write(&self) -> Result<RwLockWriteGuard<'_, P>, BlobError> {
+        self.platform
+            .write()
+            .map_err(|_| BlobError::Provider("blob platform lock poisoned".to_owned()))
+    }
+
+    fn platform_stat(&self, path: &WorkScopePath) -> Result<BlobPathState, BlobError> {
+        self.platform_read()?.stat(path)
+    }
+
+    fn platform_read_bounded(
+        &self,
+        path: &WorkScopePath,
+        max_bytes: u64,
+    ) -> Result<Vec<u8>, BlobError> {
+        self.platform_read()?.read_bounded(path, max_bytes)
+    }
+
+    fn platform_list(&self, prefix: &WorkScopePath) -> Result<Vec<WorkScopePath>, BlobError> {
+        self.platform_read()?.list(prefix)
+    }
+
+    fn platform_write_new(&self, path: &WorkScopePath, bytes: &[u8]) -> Result<(), BlobError> {
+        self.platform_write()?.write_new_durable(path, bytes)
+    }
+
+    fn platform_replace(&self, path: &WorkScopePath, bytes: &[u8]) -> Result<(), BlobError> {
+        self.platform_write()?.replace_durable(path, bytes)
+    }
+
+    fn platform_rename(
+        &self,
+        source: &WorkScopePath,
+        destination: &WorkScopePath,
+    ) -> Result<(), BlobError> {
+        self.platform_write()?
+            .rename_no_replace_durable(source, destination)
+    }
+
+    fn platform_remove(&self, path: &WorkScopePath) -> Result<(), BlobError> {
+        self.platform_write()?.remove_durable(path)
+    }
+
+    fn platform_now_ms(&self) -> Result<u64, BlobError> {
+        self.platform_write()?.now_unix_ms()
+    }
+
+    fn compression_descriptor(&self) -> Result<CompressionDescriptor, BlobError> {
+        self.compression
+            .write()
+            .map_err(|_| BlobError::Provider("blob compression lock poisoned".to_owned()))?
+            .descriptor()
+    }
+
+    fn compression_compress(&self, plaintext: &[u8]) -> Result<Vec<u8>, BlobError> {
+        self.compression
+            .write()
+            .map_err(|_| BlobError::Provider("blob compression lock poisoned".to_owned()))?
+            .compress(plaintext)
+    }
+
+    fn compression_decompress(
+        &self,
+        descriptor: &CompressionDescriptor,
+        compressed: &[u8],
+        max_output_bytes: u64,
+    ) -> Result<Vec<u8>, BlobError> {
+        self.compression
+            .read()
+            .map_err(|_| BlobError::Provider("blob compression lock poisoned".to_owned()))?
+            .decompress_bounded(descriptor, compressed, max_output_bytes)
+    }
+
+    fn keys_current(&self) -> Result<BlobKeySelection, BlobError> {
+        self.keys
+            .write()
+            .map_err(|_| BlobError::Provider("blob key lock poisoned".to_owned()))?
+            .current()
+    }
+
+    fn keys_resolve(&self, descriptor: &CryptoDescriptor) -> Result<BlobKeySelection, BlobError> {
+        self.keys
+            .read()
+            .map_err(|_| BlobError::Provider("blob key lock poisoned".to_owned()))?
+            .resolve(descriptor)
+    }
+
+    fn aead_seal(&self, request: AeadSealRequest<'_>) -> Result<Vec<u8>, BlobError> {
+        self.aead
+            .write()
+            .map_err(|_| BlobError::Provider("blob AEAD lock poisoned".to_owned()))?
+            .seal(request)
+    }
+
+    fn aead_open(&self, request: AeadOpenRequest<'_>) -> Result<Vec<u8>, BlobError> {
+        self.aead
+            .read()
+            .map_err(|_| BlobError::Provider("blob AEAD lock poisoned".to_owned()))?
+            .open(request)
+    }
+
+    fn live_sets_revalidate(
+        &self,
+        proof: &BlobLiveSetProof,
+    ) -> Result<LiveSetRevalidation, BlobError> {
+        self.live_sets
+            .lock()
+            .map_err(|_| BlobError::Provider("blob live-set lock poisoned".to_owned()))?
+            .revalidate(proof)
+    }
+
+    fn live_sets_compare_and_delete(
+        &self,
+        proof: &BlobLiveSetProof,
+        locator: &BlobLocator,
+        delete: &mut dyn FnMut() -> Result<(), BlobError>,
+    ) -> Result<ConditionalDeleteOutcome, BlobError> {
+        self.live_sets
+            .lock()
+            .map_err(|_| BlobError::Provider("blob live-set lock poisoned".to_owned()))?
+            .compare_and_delete(proof, locator, delete)
+    }
+
+    fn ensure_lease(&self, lease: &BlobRootLease) -> Result<(), BlobError> {
+        lease.validate()?;
+        if lease.root_id != self.owner.lease.root_id
+            || lease.owner_id != self.owner.lease.owner_id
+            || lease.lease_id != self.owner.lease.lease_id
+            || lease.root_generation != self.owner.lease.root_generation
+            || lease.fence_binding.state_fence != self.owner.lease.fence_binding.state_fence
+        {
+            return Err(BlobError::StaleFence);
+        }
+        let observed = self.platform_read()?.inspect_root(lease)?;
+        observed.validate(lease)?;
+        if observed != self.owner.claim {
+            return Err(BlobError::OwnerConflict);
+        }
+        Ok(())
+    }
+
+    fn contained(&self, path: &WorkScopePath) -> Result<(), BlobError> {
+        if path.adapter_input().normalized_identity != path.normalized_identity() {
+            return Err(BlobError::InvalidContract(
+                "P-01 canonical path identity changed".to_owned(),
+            ));
+        }
+        self.platform_read()?
+            .prove_contained(&self.owner.lease, path)
+    }
+
+    fn read_bounded_file(
+        &self,
+        path: &WorkScopePath,
+        hard_ceiling: u64,
+    ) -> Result<Vec<u8>, BlobError> {
+        self.contained(path)?;
+        let BlobPathState::File { length, .. } = self.platform_stat(path)? else {
+            return Err(BlobError::NotFound);
+        };
+        if length > hard_ceiling {
+            return Err(BlobError::InvalidContract(format!(
+                "{} exceeds canonical {} byte ceiling",
+                path.normalized_identity(),
+                hard_ceiling
+            )));
+        }
+        let bytes = self.platform_read_bounded(path, hard_ceiling)?;
+        if bytes.len() as u64 != length || bytes.len() as u64 > hard_ceiling {
+            return Err(BlobError::IntegrityMismatch);
+        }
+        Ok(bytes)
+    }
+
+    fn load_metadata(&self, locator: &BlobLocator) -> Result<(StoredMetadata, Vec<u8>), BlobError> {
+        let path = metadata_path(locator)?;
+        self.contained(&path)?;
+        let bytes = self.read_bounded_file(&path, MAX_METADATA_BYTES)?;
+        let metadata: StoredMetadata =
+            serde_json::from_slice(&bytes).map_err(|_| BlobError::MetadataPayloadMismatch)?;
+        metadata.validate()?;
+        if metadata.locator != *locator {
+            return Err(BlobError::MetadataPayloadMismatch);
+        }
+        Ok((metadata, bytes))
+    }
+
+    fn verify_metadata_receipt(
+        &self,
+        metadata: &StoredMetadata,
+    ) -> Result<VerifiedBlobReceipt, BlobError> {
+        let context = context_from_receipt(&metadata.receipt)?;
+        let binding = BlobReceiptBinding::for_blob(&context, &metadata.locator)?;
+        verify_receipt(&self.issuer_anchor, &metadata.receipt_bytes, binding)
+    }
+
+    fn exact_bytes_at(
+        &self,
+        path: &WorkScopePath,
+        expected_sha256: &str,
+        hard_ceiling: u64,
+    ) -> Result<bool, BlobError> {
+        self.contained(path)?;
+        match self.platform_stat(path)? {
+            BlobPathState::File { .. } => {
+                Ok(sha256_hex(&self.read_bounded_file(path, hard_ceiling)?) == expected_sha256)
+            }
+            BlobPathState::Missing => Ok(false),
+            BlobPathState::ReparsePoint => Err(BlobError::PlanGap(
+                "P-02 reparse-safe containment proof rejected a blob component".to_owned(),
+            )),
+            BlobPathState::Directory | BlobPathState::Other => {
+                Err(BlobError::MetadataPayloadMismatch)
+            }
+        }
+    }
+
+    fn publish_or_verify(
+        &self,
+        source: &WorkScopePath,
+        destination: &WorkScopePath,
+        expected_sha256: &str,
+        hard_ceiling: u64,
+        operation_id: &str,
+        state_before: PublishState,
+    ) -> Result<(), BlobError> {
+        self.contained(source)?;
+        self.contained(destination)?;
+        match self.platform_rename(source, destination) {
+            Ok(()) => {
+                if self.exact_bytes_at(destination, expected_sha256, hard_ceiling)? {
+                    Ok(())
+                } else {
+                    Err(BlobError::UnknownPublishOutcome {
+                        operation_id: operation_id.to_owned(),
+                        state: state_before,
+                    })
+                }
+            }
+            Err(_) if self.exact_bytes_at(destination, expected_sha256, hard_ceiling)? => Ok(()),
+            Err(_) => Err(BlobError::UnknownPublishOutcome {
+                operation_id: operation_id.to_owned(),
+                state: state_before,
+            }),
+        }
+    }
+
+    fn persist_journal(
+        &self,
+        path: &WorkScopePath,
+        journal: &StageJournal,
+        replace: bool,
+    ) -> Result<(), BlobError> {
+        journal.validate()?;
+        self.contained(path)?;
+        let bytes = serde_json::to_vec(journal)
+            .map_err(|error| BlobError::InvalidContract(error.to_string()))?;
+        if replace {
+            self.platform_replace(path, &bytes)
+        } else {
+            self.platform_write_new(path, &bytes)
+        }
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn finish_journal(
+        &self,
+        journal_path: &WorkScopePath,
+        journal: &mut StageJournal,
+    ) -> Result<(), BlobError> {
+        if !self.exact_bytes_at(
+            &journal.final_payload,
+            &journal.expected_payload_sha256,
+            MAX_BLOB_ENVELOPE_BYTES,
+        )? {
+            if !self.exact_bytes_at(
+                &journal.temp_payload,
+                &journal.expected_payload_sha256,
+                MAX_BLOB_ENVELOPE_BYTES,
+            )? {
+                return Err(BlobError::UnknownPublishOutcome {
+                    operation_id: journal.operation_id.clone(),
+                    state: journal.state,
+                });
+            }
+            self.publish_or_verify(
+                &journal.temp_payload,
+                &journal.final_payload,
+                &journal.expected_payload_sha256,
+                MAX_BLOB_ENVELOPE_BYTES,
+                &journal.operation_id,
+                journal.state,
+            )?;
+        }
+        journal.state = PublishState::PayloadDurable;
+        self.persist_journal(journal_path, journal, true)?;
+
+        if !self.exact_bytes_at(
+            &journal.final_metadata,
+            &journal.expected_metadata_sha256,
+            MAX_METADATA_BYTES,
+        )? {
+            if !self.exact_bytes_at(
+                &journal.temp_metadata,
+                &journal.expected_metadata_sha256,
+                MAX_METADATA_BYTES,
+            )? {
+                return Err(BlobError::UnknownPublishOutcome {
+                    operation_id: journal.operation_id.clone(),
+                    state: journal.state,
+                });
+            }
+            self.publish_or_verify(
+                &journal.temp_metadata,
+                &journal.final_metadata,
+                &journal.expected_metadata_sha256,
+                MAX_METADATA_BYTES,
+                &journal.operation_id,
+                journal.state,
+            )?;
+        }
+        journal.state = PublishState::MetadataDurable;
+        self.persist_journal(journal_path, journal, true)?;
+        if !self.exact_bytes_at(
+            &journal.final_payload,
+            &journal.expected_payload_sha256,
+            MAX_BLOB_ENVELOPE_BYTES,
+        )? || !self.exact_bytes_at(
+            &journal.final_metadata,
+            &journal.expected_metadata_sha256,
+            MAX_METADATA_BYTES,
+        )? {
+            return Err(BlobError::UnknownPublishOutcome {
+                operation_id: journal.operation_id.clone(),
+                state: PublishState::MetadataDurable,
+            });
+        }
+        let metadata_bytes = self.read_bounded_file(&journal.final_metadata, MAX_METADATA_BYTES)?;
+        let metadata: StoredMetadata = serde_json::from_slice(&metadata_bytes)
+            .map_err(|_| BlobError::MetadataPayloadMismatch)?;
+        metadata.validate()?;
+        if sha256_hex(&metadata_bytes) != journal.expected_metadata_sha256
+            || metadata.operation_id != journal.operation_id
+            || metadata.idempotency_key != journal.idempotency_key
+        {
+            return Err(BlobError::MetadataPayloadMismatch);
+        }
+        let commit = OperationCommit {
+            operation_id: journal.operation_id.clone(),
+            idempotency_key: journal.idempotency_key.clone(),
+            locator: metadata.locator,
+            metadata_sha256: journal.expected_metadata_sha256.clone(),
+        };
+        commit.validate()?;
+        let commit_path =
+            Self::operation_path_from(&journal.operation_id, &journal.idempotency_key, "commit")?;
+        let commit_bytes = serde_json::to_vec(&commit)
+            .map_err(|error| BlobError::InvalidContract(error.to_string()))?;
+        self.contained(&commit_path)?;
+        match self.platform_write_new(&commit_path, &commit_bytes) {
+            Ok(()) => {}
+            Err(_)
+                if self.exact_bytes_at(
+                    &commit_path,
+                    &sha256_hex(&commit_bytes),
+                    MAX_JOURNAL_BYTES,
+                )? => {}
+            Err(_) => {
+                return Err(BlobError::UnknownPublishOutcome {
+                    operation_id: journal.operation_id.clone(),
+                    state: PublishState::MetadataDurable,
+                });
+            }
+        }
+        journal.state = PublishState::CommitDurable;
+        self.remove_if_present(&journal.temp_payload)?;
+        self.remove_if_present(&journal.temp_metadata)?;
+        self.remove_if_present(journal_path)?;
+        journal.state = PublishState::Cleaned;
+        Ok(())
+    }
+
+    fn remove_if_present(&self, path: &WorkScopePath) -> Result<(), BlobError> {
+        self.contained(path)?;
+        if self.platform_stat(path)? == BlobPathState::Missing {
+            return Ok(());
+        }
+        self.platform_remove(path)
+    }
+
+    fn reconcile_stage_path(&self, path: &WorkScopePath) -> Result<(), BlobError> {
+        self.contained(path)?;
+        let bytes = self.read_bounded_file(path, MAX_JOURNAL_BYTES)?;
+        let mut journal: StageJournal =
+            serde_json::from_slice(&bytes).map_err(|_| BlobError::MetadataPayloadMismatch)?;
+        journal.validate()?;
+        self.finish_journal(path, &mut journal)
+    }
+
+    fn reconcile_tombstone_path(
+        &self,
+        path: &WorkScopePath,
+    ) -> Result<ConditionalDeleteOutcome, BlobError> {
+        self.contained(path)?;
+        let bytes = self.read_bounded_file(path, MAX_JOURNAL_BYTES)?;
+        let tombstone: Tombstone =
+            serde_json::from_slice(&bytes).map_err(|_| BlobError::MetadataPayloadMismatch)?;
+        tombstone.validate()?;
+        // The live-set authority holds its compare-and-delete guard across the
+        // physical effects. Reference creation cannot race between a check and
+        // the remove calls.
+        let payload = tombstone.payload.clone();
+        let metadata = tombstone.metadata.clone();
+        let operation_id = tombstone.operation_id.clone();
+        let mut delete = || -> Result<(), BlobError> {
+            for (target, state) in [
+                (&payload, GcState::PayloadDeleteAttempt),
+                (&metadata, GcState::MetadataDeleteAttempt),
+            ] {
+                self.contained(target)?;
+                if self.platform_stat(target)? != BlobPathState::Missing {
+                    self.platform_remove(target)
+                        .map_err(|_| BlobError::UnknownGcOutcome {
+                            operation_id: operation_id.clone(),
+                            state,
+                        })?;
+                }
+            }
+            Ok(())
+        };
+        let outcome = self.live_sets_compare_and_delete(
+            &tombstone.live_set,
+            &tombstone.locator,
+            &mut delete,
+        )?;
+        self.remove_if_present(path)?;
+        Ok(outcome)
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn stage_locked(
+        &self,
+        request: BlobStageRequest,
+        hash: BlobHash,
+    ) -> Result<BlobReadyReceipt, BlobError> {
+        let locator = BlobLocator {
+            hash,
+            root_generation: request.root_lease.root_generation,
+            path_generation: PATH_GENERATION,
+        };
+        let payload = payload_path(&locator)?;
+        let metadata_path_value = metadata_path(&locator)?;
+        self.contained(&payload)?;
+        self.contained(&metadata_path_value)?;
+
+        let journal_path = Self::operation_path(&request.context, "stage")?;
+        let commit_path = Self::operation_path(&request.context, "commit")?;
+        self.contained(&commit_path)?;
+        if self.platform_stat(&commit_path)? != BlobPathState::Missing {
+            let bytes = self.read_bounded_file(&commit_path, MAX_JOURNAL_BYTES)?;
+            let commit: OperationCommit =
+                serde_json::from_slice(&bytes).map_err(|_| BlobError::MetadataPayloadMismatch)?;
+            commit.validate()?;
+            if commit.operation_id != request.context.operation.operation_id.as_str()
+                || commit.idempotency_key != request.context.operation.idempotency_key
+                || commit.locator != locator
+            {
+                return Err(BlobError::IdempotencyConflict);
+            }
+            let (stored, metadata_bytes) = self.load_metadata(&commit.locator)?;
+            if sha256_hex(&metadata_bytes) != commit.metadata_sha256
+                || stored.policy != request.policy
+                || stored.plaintext_sha256 != sha256_hex(&request.bytes)
+            {
+                return Err(BlobError::IdempotencyConflict);
+            }
+            let verified = self.verify_metadata_receipt(&stored)?;
+            let ready = stored.ready(verified, &self.issuer_anchor, commit.metadata_sha256)?;
+            self.verify_payload(&ready, &request.bytes)?;
+            return Ok(ready);
+        }
+        if self.platform_stat(&journal_path)? != BlobPathState::Missing {
+            self.reconcile_stage_path(&journal_path)?;
+        }
+        let payload_state = self.platform_stat(&payload)?;
+        let metadata_state = self.platform_stat(&metadata_path_value)?;
+        if payload_state != BlobPathState::Missing || metadata_state != BlobPathState::Missing {
+            if !matches!(payload_state, BlobPathState::File { .. })
+                || !matches!(metadata_state, BlobPathState::File { .. })
+            {
+                return Err(BlobError::MetadataPayloadMismatch);
+            }
+            let (stored, metadata_bytes) = self.load_metadata(&locator)?;
+            if stored.operation_id != request.context.operation.operation_id.as_str()
+                || stored.idempotency_key != request.context.operation.idempotency_key
+                || stored.policy != request.policy
+                || stored.plaintext_length != request.bytes.len() as u64
+                || stored.plaintext_sha256 != sha256_hex(&request.bytes)
+            {
+                return Err(BlobError::IdempotencyConflict);
+            }
+            let verified = self.verify_metadata_receipt(&stored)?;
+            let ready = stored.ready(verified, &self.issuer_anchor, sha256_hex(&metadata_bytes))?;
+            self.verify_payload(&ready, &request.bytes)?;
+            return Ok(ready);
+        }
+
+        let compression = self.compression_descriptor()?;
+        compression.validate()?;
+        let compressed = self.compression_compress(&request.bytes)?;
+        if compressed.len() as u64 > MAX_BLOB_ENVELOPE_BYTES {
+            return Err(BlobError::InvalidContract(
+                "compressed blob exceeds canonical envelope ceiling".to_owned(),
+            ));
+        }
+        let key = self.keys_current().map_err(|error| match error {
+            BlobError::ProviderUnavailable(_) | BlobError::NotFound => BlobError::KeyUnavailable {
+                operation: BlobKeyOperation::Stage,
+                key_lineage: None,
+                key_generation: None,
+                recovery: BlobKeyRecoveryCeiling::PlanGap,
+            },
+            other => other,
+        })?;
+        key.crypto.validate()?;
+        let plaintext_sha256 = sha256_hex(&request.bytes);
+        let aad = serde_json::to_vec(&(
+            eliot_blob_api::CONTRACT_VERSION,
+            &locator,
+            &request.policy,
+            &compression,
+            &key.crypto,
+            request.context.request.metadata.request_id.as_str(),
+        ))
+        .map_err(|error| BlobError::InvalidContract(error.to_string()))?;
+        let sealed = self.aead_seal(AeadSealRequest {
+            key: &key,
+            nonce_context: locator.hash.as_str().as_bytes(),
+            associated_data: &aad,
+            plaintext: &compressed,
+        })?;
+        if sealed.is_empty() {
+            return Err(BlobError::ProviderUnavailable(
+                "AEAD provider returned no envelope",
+            ));
+        }
+        if sealed.len() as u64 > MAX_BLOB_ENVELOPE_BYTES {
+            return Err(BlobError::InvalidContract(
+                "sealed blob exceeds canonical envelope ceiling".to_owned(),
+            ));
+        }
+
+        let sealed_sha256 = sha256_hex(&sealed);
+        let format = BlobId::new(FORMAT_ID)?;
+        let receipt_binding_sha256 = eliot_blob_api::receipt_binding_sha256(
+            &format,
+            FORMAT_VERSION,
+            &locator,
+            request.bytes.len() as u64,
+            sealed.len() as u64,
+            &plaintext_sha256,
+            &sealed_sha256,
+            &compression,
+            &key.crypto,
+            &request.policy,
+        )?;
+        let content_artifact = ArtifactBinding {
+            artifact_id: format!("blob-content-{}", locator.hash)
+                .parse()
+                .map_err(|error| BlobError::InvalidContract(format!("{error}")))?,
+            sha256: plaintext_sha256.clone(),
+            role: ReceiptKind::Artifact,
+            source_revision: Some(format!(
+                "root-generation:{};path-generation:{}",
+                locator.root_generation, locator.path_generation
+            )),
+        };
+        let envelope_artifact = ArtifactBinding {
+            artifact_id: format!("blob-envelope-{}", locator.hash)
+                .parse()
+                .map_err(|error| BlobError::InvalidContract(format!("{error}")))?,
+            sha256: receipt_binding_sha256.clone(),
+            role: ReceiptKind::Artifact,
+            source_revision: Some(format!(
+                "{};format-version:{};stored-length:{};sealed-sha256:{}",
+                eliot_blob_api::CONTRACT_VERSION,
+                FORMAT_VERSION,
+                sealed.len(),
+                sealed_sha256
+            )),
+        };
+        let verified_receipt = self.issue_receipt(
+            &request.context,
+            vec![content_artifact, envelope_artifact],
+            ReceiptKind::Artifact,
+            ReceiptDisposition::Success {
+                proof: ProofCeiling::ObservedExternalEffect,
+            },
+            BlobReceiptBinding::for_blob(&request.context, &locator)?,
+        )?;
+        let metadata = StoredMetadata {
+            receipt: verified_receipt.receipt().clone(),
+            receipt_bytes: verified_receipt.receipt_bytes().to_vec(),
+            locator: locator.clone(),
+            plaintext_length: request.bytes.len() as u64,
+            stored_length: sealed.len() as u64,
+            envelope_length: sealed.len() as u64,
+            plaintext_sha256,
+            sealed_sha256,
+            receipt_binding_sha256,
+            format,
+            format_version: FORMAT_VERSION,
+            compression,
+            crypto: key.crypto,
+            policy: request.policy,
+            operation_id: request.context.operation.operation_id.to_string(),
+            idempotency_key: request.context.operation.idempotency_key.clone(),
+        };
+        let metadata_bytes = Self::metadata_bytes(&metadata)?;
+        let metadata_sha256 = sha256_hex(&metadata_bytes);
+        let temp_payload = Self::temp_path(&request.context, "payload")?;
+        let temp_metadata = Self::temp_path(&request.context, "metadata")?;
+        let mut journal = StageJournal {
+            operation_id: request.context.operation.operation_id.to_string(),
+            idempotency_key: request.context.operation.idempotency_key,
+            state: PublishState::JournalPrepared,
+            temp_payload: temp_payload.clone(),
+            temp_metadata: temp_metadata.clone(),
+            final_payload: payload,
+            final_metadata: metadata_path_value,
+            expected_payload_sha256: sha256_hex(&sealed),
+            expected_metadata_sha256: metadata_sha256.clone(),
+        };
+        self.persist_journal(&journal_path, &journal, false)?;
+        self.contained(&temp_payload)?;
+        self.contained(&temp_metadata)?;
+        if let Err(error) = self.platform_write_new(&temp_payload, &sealed) {
+            let _ = self.remove_if_present(&journal_path);
+            return Err(error);
+        }
+        if let Err(error) = self.platform_write_new(&temp_metadata, &metadata_bytes) {
+            let _ = self.remove_if_present(&temp_payload);
+            let _ = self.remove_if_present(&journal_path);
+            return Err(error);
+        }
+        self.finish_journal(&journal_path, &mut journal)?;
+        let verified = self.verify_metadata_receipt(&metadata)?;
+        metadata.ready(verified, &self.issuer_anchor, metadata_sha256)
+    }
+
+    fn verify_payload(
+        &self,
+        ready: &BlobReadyReceipt,
+        expected_plaintext: &[u8],
+    ) -> Result<(), BlobError> {
+        let path = payload_path(ready.locator())?;
+        self.contained(&path)?;
+        let sealed = self.read_bounded_file(&path, MAX_BLOB_ENVELOPE_BYTES)?;
+        if sha256_hex(&sealed) != self.load_metadata(ready.locator())?.0.sealed_sha256 {
+            return Err(BlobError::IntegrityMismatch);
+        }
+        let key = self.keys_resolve(ready.crypto()).map_err(|error| {
+            map_resolve_key_error(error, ready.crypto(), BlobKeyOperation::Recovery)
+        })?;
+        if key.crypto != *ready.crypto() {
+            return Err(BlobError::IntegrityMismatch);
+        }
+        let aad = serde_json::to_vec(&(
+            eliot_blob_api::CONTRACT_VERSION,
+            ready.locator(),
+            ready.policy(),
+            ready.compression(),
+            ready.crypto(),
+            ready.receipt().core.request.metadata.request_id.as_str(),
+        ))
+        .map_err(|error| BlobError::InvalidContract(error.to_string()))?;
+        let compressed = self.aead_open(AeadOpenRequest {
+            key: &key,
+            nonce_context: ready.locator().hash.as_str().as_bytes(),
+            associated_data: &aad,
+            ciphertext: &sealed,
+        })?;
+        let plaintext = self.compression_decompress(
+            ready.compression(),
+            &compressed,
+            MAX_BLOB_PLAINTEXT_BYTES,
+        )?;
+        if plaintext != expected_plaintext
+            || blake3::hash(&plaintext).to_hex().as_str() != ready.locator().hash.as_str()
+            || sha256_hex(&plaintext) != ready.plaintext_sha256()
+        {
+            return Err(BlobError::IntegrityMismatch);
+        }
+        Ok(())
+    }
+
+    fn read_verified(
+        &self,
+        request: &BlobReadRequest,
+    ) -> Result<(BlobReadyReceipt, Vec<u8>), BlobError> {
+        request.validate()?;
+        self.ensure_lease(&request.root_lease)?;
+        let (metadata, metadata_bytes) = self.load_metadata(&request.locator)?;
+        let metadata_sha256 = sha256_hex(&metadata_bytes);
+        if metadata_sha256 != request.expected_metadata_sha256
+            || metadata.receipt.identity.receipt_id.as_str() != request.expected_ready_receipt_id
+        {
+            return Err(BlobError::MetadataPayloadMismatch);
+        }
+        let verified = self.verify_metadata_receipt(&metadata)?;
+        let ready = metadata.ready(verified, &self.issuer_anchor, metadata_sha256)?;
+        let path = payload_path(&request.locator)?;
+        self.contained(&path)?;
+        let decode_ceiling = request.max_bytes.min(MAX_BLOB_PLAINTEXT_BYTES);
+        if request.max_bytes > MAX_BLOB_PLAINTEXT_BYTES {
+            return Err(BlobError::InvalidContract(
+                "read max_bytes exceeds canonical hard ceiling".to_owned(),
+            ));
+        }
+        if metadata.plaintext_length > decode_ceiling {
+            return Err(BlobError::InvalidContract(
+                "blob plaintext exceeds requested max_bytes".to_owned(),
+            ));
+        }
+        let stored_state = self.platform_stat(&path)?;
+        let BlobPathState::File { length, .. } = stored_state else {
+            return Err(BlobError::NotFound);
+        };
+        if length != metadata.stored_length || length != metadata.envelope_length {
+            return Err(BlobError::IntegrityMismatch);
+        }
+        if length > MAX_BLOB_ENVELOPE_BYTES {
+            return Err(BlobError::MetadataPayloadMismatch);
+        }
+        let sealed = self.read_bounded_file(&path, MAX_BLOB_ENVELOPE_BYTES)?;
+        if sha256_hex(&sealed) != metadata.sealed_sha256 {
+            return Err(BlobError::IntegrityMismatch);
+        }
+        let key = self.keys_resolve(&metadata.crypto).map_err(|error| {
+            map_resolve_key_error(error, &metadata.crypto, BlobKeyOperation::Read)
+        })?;
+        if key.crypto != metadata.crypto {
+            return Err(BlobError::IntegrityMismatch);
+        }
+        let aad = serde_json::to_vec(&(
+            eliot_blob_api::CONTRACT_VERSION,
+            &metadata.locator,
+            &metadata.policy,
+            &metadata.compression,
+            &metadata.crypto,
+            metadata.receipt.core.request.metadata.request_id.as_str(),
+        ))
+        .map_err(|error| BlobError::InvalidContract(error.to_string()))?;
+        let compressed = self.aead_open(AeadOpenRequest {
+            key: &key,
+            nonce_context: request.locator.hash.as_str().as_bytes(),
+            associated_data: &aad,
+            ciphertext: &sealed,
+        })?;
+        let plaintext =
+            self.compression_decompress(&metadata.compression, &compressed, decode_ceiling)?;
+        if plaintext.len() as u64 != metadata.plaintext_length
+            || plaintext.len() as u64 > request.max_bytes
+            || sha256_hex(&plaintext) != metadata.plaintext_sha256
+            || blake3::hash(&plaintext).to_hex().as_str() != request.locator.hash.as_str()
+        {
+            return Err(BlobError::IntegrityMismatch);
+        }
+        Ok((ready, plaintext))
+    }
+
+    fn stage_sync(&self, request: BlobStageRequest) -> Result<BlobReadyReceipt, BlobError> {
+        request.validate()?;
+        if request.bytes.len() as u64 > MAX_BLOB_PLAINTEXT_BYTES {
+            return Err(BlobError::InvalidContract(
+                "blob plaintext exceeds canonical hard ceiling".to_owned(),
+            ));
+        }
+        self.ensure_lease(&request.root_lease)?;
+        let hash = BlobHash::new(blake3::hash(&request.bytes).to_hex().to_string())?;
+        let content_idx = content_shard(&hash);
+        let op_idx = operation_shard(
+            request.context.operation.operation_id.as_str(),
+            &request.context.operation.idempotency_key,
+        );
+        let _guards = self.lock_shards(&[content_idx, op_idx])?;
+        self.stage_locked(request, hash)
+    }
+
+    fn read_sync(&self, request: BlobReadRequest) -> Result<BlobReadChunk, BlobError> {
+        let content_idx = content_shard(&request.locator.hash);
+        let _guard = self.lock_shards(&[content_idx])?;
+        let (ready, bytes) = self.read_verified(&request)?;
+        let artifact = ArtifactBinding {
+            artifact_id: format!("blob-read-{}", request.locator.hash)
+                .parse()
+                .map_err(|error| BlobError::InvalidContract(format!("{error}")))?,
+            sha256: ready.plaintext_sha256().to_owned(),
+            role: ReceiptKind::Artifact,
+            source_revision: Some(format!(
+                "{};root-generation:{};path-generation:{}",
+                ready.metadata_sha256(),
+                ready.root_generation(),
+                ready.path_generation()
+            )),
+        };
+        let verified_receipt = self.issue_receipt(
+            &request.context,
+            vec![artifact],
+            ReceiptKind::Operation,
+            ReceiptDisposition::Success {
+                proof: ProofCeiling::ScopedVerification,
+            },
+            BlobReceiptBinding::for_blob(&request.context, &request.locator)?,
+        )?;
+        BlobReadChunk::from_verified(verified_receipt, &self.issuer_anchor, ready, bytes)
+    }
+
+    fn reference(
+        &self,
+        request: BlobReferenceRequest,
+    ) -> Result<BlobReferenceObservation, BlobError> {
+        request.validate()?;
+        self.ensure_lease(&request.root_lease)?;
+        let (metadata, bytes) = self.load_metadata(&request.locator)?;
+        let metadata_sha256 = sha256_hex(&bytes);
+        if metadata_sha256 != request.expected_metadata_sha256 {
+            return Err(BlobError::MetadataPayloadMismatch);
+        }
+        let payload = payload_path(&request.locator)?;
+        let present =
+            self.exact_bytes_at(&payload, &metadata.sealed_sha256, MAX_BLOB_ENVELOPE_BYTES)?;
+        let receipt = self.issue_receipt(
+            &request.context,
+            Vec::new(),
+            ReceiptKind::Operation,
+            ReceiptDisposition::Success {
+                proof: ProofCeiling::Observation,
+            },
+            BlobReceiptBinding::for_blob(&request.context, &request.locator)?,
+        )?;
+        Ok(BlobReferenceObservation {
+            receipt: receipt.receipt().clone(),
+            locator: request.locator,
+            metadata_sha256,
+            present_and_integral: present,
+        })
+    }
+
+    fn reachability(
+        &self,
+        request: BlobReachabilityRequest,
+    ) -> Result<BlobReachabilityView, BlobError> {
+        request.validate()?;
+        self.ensure_lease(&request.root_lease)?;
+        let mut present = Vec::new();
+        let mut missing = Vec::new();
+        for locator in &request.live_set.live {
+            let payload = payload_path(locator)?;
+            let metadata = metadata_path(locator)?;
+            let payload_state = self.platform_stat(&payload)?;
+            let metadata_state = self.platform_stat(&metadata)?;
+            if matches!(payload_state, BlobPathState::File { .. })
+                && matches!(metadata_state, BlobPathState::File { .. })
+            {
+                present.push(locator.clone());
+            } else {
+                missing.push(locator.clone());
+            }
+        }
+        let receipt = self.issue_receipt(
+            &request.context,
+            Vec::new(),
+            ReceiptKind::Operation,
+            ReceiptDisposition::Success {
+                proof: ProofCeiling::Observation,
+            },
+            BlobReceiptBinding::for_operation(
+                &request.context,
+                request.root_lease.root_generation,
+                None,
+                Some(&request.live_set.proof_id),
+            )?,
+        )?;
+        Ok(BlobReachabilityView {
+            receipt: receipt.receipt().clone(),
+            proof_id: request.live_set.proof_id,
+            present,
+            missing,
+        })
+    }
+
+    fn gc(&self, request: BlobGcRequest) -> Result<BlobGcReceipt, BlobError> {
+        request.validate()?;
+        self.ensure_lease(&request.root_lease)?;
+        let observed = self.live_sets_revalidate(&request.live_set)?;
+        Self::validate_revalidation(&request, &observed)?;
+        let now = self.platform_now_ms()?;
+        let mut deleted = Vec::new();
+        let mut retained = Vec::new();
+        for locator in &request.candidates {
+            if request.live_set.contains(locator) {
+                retained.push(locator.clone());
+                continue;
+            }
+            let content_idx = content_shard(&locator.hash);
+            let _guard = self.lock_shards(&[content_idx])?;
+            let payload = payload_path(locator)?;
+            let metadata = metadata_path(locator)?;
+            let modified = match self.platform_stat(&payload)? {
+                BlobPathState::File {
+                    modified_unix_ms, ..
+                } => modified_unix_ms,
+                BlobPathState::Missing => {
+                    retained.push(locator.clone());
+                    continue;
+                }
+                BlobPathState::ReparsePoint => {
+                    return Err(BlobError::PlanGap(
+                        "P-02 rejected a reparse point during GC".to_owned(),
+                    ));
+                }
+                BlobPathState::Directory | BlobPathState::Other => {
+                    return Err(BlobError::MetadataPayloadMismatch);
+                }
+            };
+            if now.saturating_sub(modified) < request.grace_period_seconds.saturating_mul(1_000) {
+                retained.push(locator.clone());
+                continue;
+            }
+            // Revalidate at each destructive boundary, not once per batch.
+            let current = self.live_sets_revalidate(&request.live_set)?;
+            Self::validate_revalidation(&request, &current)?;
+            let tombstone_path = WorkScopePath::new(format!(
+                "tombstones/{}-{}.json",
+                request.context.operation.operation_id.as_str(),
+                locator.hash
+            ))
+            .map_err(|error| BlobError::InvalidContract(error.to_string()))?;
+            let tombstone = Tombstone {
+                operation_id: request.context.operation.operation_id.to_string(),
+                proof_id: request.live_set.proof_id.clone(),
+                proof_snapshot_sha256: request.live_set.snapshot_sha256.clone(),
+                locator: locator.clone(),
+                live_set: request.live_set.clone(),
+                payload,
+                metadata,
+                state: GcState::TombstoneDurable,
+            };
+            tombstone.validate()?;
+            let bytes = serde_json::to_vec(&tombstone)
+                .map_err(|error| BlobError::InvalidContract(error.to_string()))?;
+            self.contained(&tombstone_path)?;
+            match self.platform_write_new(&tombstone_path, &bytes) {
+                Ok(()) => {}
+                Err(_)
+                    if self.exact_bytes_at(
+                        &tombstone_path,
+                        &sha256_hex(&bytes),
+                        MAX_JOURNAL_BYTES,
+                    )? => {}
+                Err(error) => return Err(error),
+            }
+            match self.reconcile_tombstone_path(&tombstone_path)? {
+                ConditionalDeleteOutcome::Deleted => deleted.push(locator.clone()),
+                ConditionalDeleteOutcome::RetainedLive => retained.push(locator.clone()),
+            }
+        }
+        let verified_receipt = self.issue_receipt(
+            &request.context,
+            Vec::new(),
+            ReceiptKind::Operation,
+            ReceiptDisposition::Success {
+                proof: ProofCeiling::ObservedExternalEffect,
+            },
+            BlobReceiptBinding::for_operation(
+                &request.context,
+                request.root_lease.root_generation,
+                None,
+                Some(&request.live_set.proof_id),
+            )?,
+        )?;
+        BlobGcReceipt::from_verified(
+            verified_receipt,
+            &self.issuer_anchor,
+            request.live_set.proof_id,
+            deleted,
+            retained,
+        )
+    }
+
+    fn reconcile(&self, lease: &BlobRootLease) -> Result<(), BlobError> {
+        self.ensure_lease(lease)?;
+        let transactions = WorkScopePath::new("transactions")
+            .map_err(|error| BlobError::InvalidContract(error.to_string()))?;
+        self.contained(&transactions)?;
+        for path in self.platform_list(&transactions)? {
+            if is_stage_path(&path) {
+                self.reconcile_stage_path(&path)?;
+            }
+        }
+        let tombstones = WorkScopePath::new("tombstones")
+            .map_err(|error| BlobError::InvalidContract(error.to_string()))?;
+        self.contained(&tombstones)?;
+        for path in self.platform_list(&tombstones)? {
+            let _ = self.reconcile_tombstone_path(&path)?;
+        }
+        Ok(())
+    }
+
+    fn health(&self) -> Result<BlobHealth, BlobError> {
+        let mut degraded = Vec::new();
+        let (owner_matches, containment_proven, permissions_proven) = match self
+            .platform_read()
+            .and_then(|guard| guard.inspect_root(&self.owner.lease))
+        {
+            Ok(proof) => {
+                let matches =
+                    proof.validate(&self.owner.lease).is_ok() && proof == self.owner.claim;
+                if !matches {
+                    degraded.push("root owner/lease mismatch".to_owned());
+                }
+                (matches, proof.containment_proven, proof.permissions_proven)
+            }
+            Err(error) => {
+                degraded.push(format!("root inspection failed: {error}"));
+                (false, false, false)
+            }
+        };
+        let transactions = WorkScopePath::new("transactions")
+            .map_err(|error| BlobError::InvalidContract(error.to_string()))?;
+        let tombstones = WorkScopePath::new("tombstones")
+            .map_err(|error| BlobError::InvalidContract(error.to_string()))?;
+        let recovery_clean = self.platform_list(&transactions).map_or_else(
+            |error| {
+                degraded.push(format!("transaction scan failed: {error}"));
+                false
+            },
+            |items| !items.iter().any(is_stage_path),
+        ) && self.platform_list(&tombstones).map_or_else(
+            |error| {
+                degraded.push(format!("tombstone scan failed: {error}"));
+                false
+            },
+            |items| items.is_empty(),
+        );
+        if !recovery_clean {
+            degraded.push("pending recovery journal or tombstone".to_owned());
+        }
+        let active_key_available = self.keys_current().map_or_else(
+            |error| {
+                degraded.push(format!("active key unavailable: {error}"));
+                false
+            },
+            |key| key.crypto.validate().is_ok(),
+        );
+        let ready = owner_matches
+            && containment_proven
+            && permissions_proven
+            && recovery_clean
+            && active_key_available
+            && degraded.is_empty();
+        let health = BlobHealth {
+            ready,
+            owner_matches,
+            containment_proven,
+            permissions_proven,
+            recovery_clean,
+            active_key_available,
+            root_generation: self.owner.lease.root_generation,
+            degraded,
+        };
+        health.validate()?;
+        Ok(health)
+    }
+
+    fn operation_path(
+        context: &BlobReceiptContext,
+        suffix: &str,
+    ) -> Result<WorkScopePath, BlobError> {
+        Self::operation_path_from(
+            context.operation.operation_id.as_str(),
+            &context.operation.idempotency_key,
+            suffix,
+        )
+    }
+
+    fn operation_path_from(
+        operation_id: &str,
+        idempotency_key: &str,
+        suffix: &str,
+    ) -> Result<WorkScopePath, BlobError> {
+        let mut hasher = Hasher::new();
+        hasher.update(operation_id.as_bytes());
+        hasher.update(idempotency_key.as_bytes());
+        WorkScopePath::new(format!(
+            "transactions/{}.{}",
+            hasher.finalize().to_hex(),
+            suffix
+        ))
+        .map_err(|error| BlobError::InvalidContract(error.to_string()))
+    }
+
+    fn temp_path(context: &BlobReceiptContext, suffix: &str) -> Result<WorkScopePath, BlobError> {
+        let mut hasher = Hasher::new();
+        hasher.update(context.operation.operation_id.as_str().as_bytes());
+        hasher.update(context.operation.idempotency_key.as_bytes());
+        WorkScopePath::new(format!("staging/{}.{}", hasher.finalize().to_hex(), suffix))
+            .map_err(|error| BlobError::InvalidContract(error.to_string()))
+    }
+
+    fn metadata_bytes(metadata: &StoredMetadata) -> Result<Vec<u8>, BlobError> {
+        metadata.validate()?;
+        serde_json::to_vec(metadata).map_err(|error| BlobError::InvalidContract(error.to_string()))
+    }
+
+    fn validate_revalidation(
+        request: &BlobGcRequest,
+        observed: &LiveSetRevalidation,
+    ) -> Result<(), BlobError> {
+        Self::validate_live_set_revalidation(&request.live_set, observed)
+    }
+
+    fn validate_live_set_revalidation(
+        live_set: &BlobLiveSetProof,
+        observed: &LiveSetRevalidation,
+    ) -> Result<(), BlobError> {
+        if !observed.still_complete_and_current
+            || observed.proof_id != live_set.proof_id
+            || observed.snapshot_sha256 != live_set.snapshot_sha256
+            || observed.revision != live_set.revision
+        {
+            return Err(BlobError::IncompleteLiveSet);
+        }
+        Ok(())
+    }
+
+    fn issue_receipt(
+        &self,
+        context: &BlobReceiptContext,
+        artifacts: Vec<ArtifactBinding>,
+        kind: ReceiptKind,
+        disposition: ReceiptDisposition,
+        binding: BlobReceiptBinding,
+    ) -> Result<VerifiedBlobReceipt, BlobError> {
+        // `Receipt::issue` creates only an untrusted candidate envelope. The
+        // capability boundary is the independent verifier over the exact
+        // serialized bytes below.
+        let receipt = Receipt::issue(ReceiptCore {
+            contract: contract_identity().map_err(|error| BlobError::Receipt(error.to_string()))?,
+            kind,
+            work_scope: context.work_scope.clone(),
+            task: context.task.clone(),
+            session: context.session.clone(),
+            causal: context.causal.clone(),
+            request: context.request.clone(),
+            operation: context.operation.clone(),
+            authority: context.authority.clone(),
+            artifacts,
+            verifier: None,
+            problem: None,
+            coordination: None,
+            disposition,
+        })
+        .map_err(|error| BlobError::Receipt(error.to_string()))?;
+        let receipt_bytes = self.issuer_anchor.sign_receipt(&receipt)?;
+        verify_receipt(&self.issuer_anchor, &receipt_bytes, binding)
+    }
+}
+
+/// One claimed-root S-04 owner. Cloning shares the immutable [`RootOwner`] and
+/// the port state; it never re-claims the root and never creates a second
+/// receipt issuer.
+#[derive(Clone)]
+pub struct BlobStoreService<P, C, K, A, L> {
+    core: Arc<BlobStoreCore<P, C, K, A, L>>,
+}
+
+impl<P, C, K, A, L> BlobStoreService<P, C, K, A, L>
+where
+    P: BlobPlatformPort,
+    C: BlobCompressionPort,
+    K: BlobKeyPort,
+    A: BlobAeadPort,
+    L: BlobLiveSetPort,
+{
+    pub fn new(
+        lease: BlobRootLease,
+        platform: P,
+        compression: C,
+        keys: K,
+        aead: A,
+        live_sets: L,
+        issuer_anchor: BlobIssuerTrustAnchor,
+    ) -> Result<Self, BlobError> {
+        Ok(Self {
+            core: Arc::new(BlobStoreCore::claim(
+                lease,
+                platform,
+                compression,
+                keys,
+                aead,
+                live_sets,
+                issuer_anchor,
+            )?),
+        })
+    }
+
+    /// Typed constructor error for a composition missing the required
+    /// Windows atomic/reparse-safe adapter.
+    #[must_use]
+    pub fn platform_plan_gap() -> BlobError {
+        BlobError::PlanGap(
+            "S-04 requires an injected P-01/P-02 durable no-replace and reparse-safe blob platform port"
+                .to_owned(),
+        )
+    }
+
+    /// Non-canonical observation helper retained for storage diagnostics.
+    pub fn reference(
+        &self,
+        request: BlobReferenceRequest,
+    ) -> Result<BlobReferenceObservation, BlobError> {
+        self.core.reference(request)
+    }
+
+    /// Startup recovery helper; it is not part of the public `BlobStoreClient` contract.
+    pub fn reconcile(&self, lease: &BlobRootLease) -> Result<(), BlobError> {
+        self.core.reconcile(lease)
+    }
+}
+
+impl<P, C, K, A, L> BlobStoreClient for BlobStoreService<P, C, K, A, L>
+where
+    P: BlobPlatformPort,
+    C: BlobCompressionPort,
+    K: BlobKeyPort,
+    A: BlobAeadPort,
+    L: BlobLiveSetPort,
+{
+    fn stage(&self, request: BlobStageRequest) -> BlobFuture<'_, BlobReadyReceipt> {
+        let core = Arc::clone(&self.core);
+        Box::pin(async move { core.stage_sync(request) })
+    }
+
+    fn read(&self, request: BlobReadRequest) -> BlobFuture<'_, BlobReadChunk> {
+        let core = Arc::clone(&self.core);
+        Box::pin(async move { core.read_sync(request) })
+    }
+
+    fn reachability(
+        &self,
+        request: BlobReachabilityRequest,
+    ) -> BlobFuture<'_, BlobReachabilityView> {
+        let core = Arc::clone(&self.core);
+        Box::pin(async move { core.reachability(request) })
+    }
+
+    fn gc(&self, request: BlobGcRequest) -> BlobFuture<'_, BlobGcReceipt> {
+        let core = Arc::clone(&self.core);
+        Box::pin(async move { core.gc(request) })
+    }
+
+    fn health(&self) -> BlobFuture<'_, BlobHealth> {
+        let core = Arc::clone(&self.core);
+        Box::pin(async move { core.health() })
+    }
+}
+
+fn validate_sha256(value: &str, field: &'static str) -> Result<(), BlobError> {
+    if value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    {
+        Ok(())
+    } else {
+        Err(BlobError::InvalidField {
+            field,
+            reason: "must be lowercase SHA-256 hex",
+        })
+    }
+}
+
+fn context_from_receipt(receipt: &Receipt) -> Result<BlobReceiptContext, BlobError> {
+    Ok(BlobReceiptContext {
+        work_scope: receipt.core.work_scope.clone(),
+        task: receipt.core.task.clone(),
+        session: receipt.core.session.clone(),
+        causal: receipt.core.causal.clone(),
+        request: receipt.core.request.clone(),
+        operation: receipt.core.operation.clone(),
+        authority: receipt.core.authority.clone(),
+    })
+}
+
+fn is_stage_path(path: &WorkScopePath) -> bool {
+    std::path::Path::new(path.normalized_identity())
+        .extension()
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("stage"))
+}
+
+fn valid_operation_text(value: &str, field: &'static str) -> Result<(), BlobError> {
+    if value.trim().is_empty() || value.chars().any(char::is_control) {
+        Err(BlobError::InvalidField {
+            field,
+            reason: "must be non-blank and free of control characters",
+        })
+    } else {
+        Ok(())
+    }
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    let digest = Sha256::digest(bytes);
+    let mut output = String::with_capacity(64);
+    for byte in digest {
+        use std::fmt::Write as _;
+        let _ = write!(output, "{byte:02x}");
+    }
+    output
+}
+
+fn map_resolve_key_error(
+    error: BlobError,
+    descriptor: &CryptoDescriptor,
+    operation: BlobKeyOperation,
+) -> BlobError {
+    match error {
+        BlobError::ProviderUnavailable(_) | BlobError::NotFound => BlobError::KeyUnavailable {
+            operation,
+            key_lineage: Some(descriptor.key_lineage.clone()),
+            key_generation: Some(descriptor.key_generation),
+            recovery: BlobKeyRecoveryCeiling::Unavailable,
+        },
+        other => other,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::BTreeMap;
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::task::{Context, Poll, Waker};
+
+    fn block_on<T>(future: impl Future<Output = T>) -> T {
+        let waker = Waker::noop();
+        let mut context = Context::from_waker(waker);
+        let mut future = Pin::from(Box::new(future));
+        loop {
+            match future.as_mut().poll(&mut context) {
+                Poll::Ready(value) => return value,
+                Poll::Pending => std::thread::yield_now(),
+            }
+        }
+    }
+
+    fn test_anchor() -> BlobIssuerTrustAnchor {
+        BlobIssuerTrustAnchor::new("s04-test-issuer", "s04-test-key-v1", vec![0x42; 32])
+            .expect("test anchor")
+    }
+
+    #[derive(Default)]
+    struct MemoryPlatform {
+        files: BTreeMap<String, (Vec<u8>, u64)>,
+        claim: Option<RootClaimProof>,
+        now: u64,
+    }
+
+    impl BlobPlatformPort for MemoryPlatform {
+        fn claim_root(&mut self, lease: &BlobRootLease) -> Result<RootClaimProof, BlobError> {
+            let requested = RootClaimProof {
+                root_id: lease.root_id.as_str().to_owned(),
+                owner_id: lease.owner_id.to_string(),
+                lease_id: lease.lease_id.to_string(),
+                root_generation: lease.root_generation,
+                containment_proven: true,
+                permissions_proven: true,
+            };
+            if self.claim.as_ref().is_some_and(|claim| claim != &requested) {
+                return Err(BlobError::OwnerConflict);
+            }
+            self.claim = Some(requested.clone());
+            Ok(requested)
+        }
+
+        fn inspect_root(&self, _lease: &BlobRootLease) -> Result<RootClaimProof, BlobError> {
+            self.claim.clone().ok_or(BlobError::OwnerConflict)
+        }
+
+        fn prove_contained(
+            &self,
+            _lease: &BlobRootLease,
+            _path: &WorkScopePath,
+        ) -> Result<(), BlobError> {
+            Ok(())
+        }
+
+        fn read_bounded(&self, path: &WorkScopePath, max_bytes: u64) -> Result<Vec<u8>, BlobError> {
+            let bytes = self
+                .files
+                .get(path.normalized_identity())
+                .map(|(bytes, _)| bytes.clone())
+                .ok_or(BlobError::NotFound)?;
+            if bytes.len() as u64 > max_bytes {
+                return Err(BlobError::InvalidContract(
+                    "bounded platform read ceiling exceeded".to_owned(),
+                ));
+            }
+            Ok(bytes)
+        }
+
+        fn write_new_durable(
+            &mut self,
+            path: &WorkScopePath,
+            bytes: &[u8],
+        ) -> Result<(), BlobError> {
+            if self.files.contains_key(path.normalized_identity()) {
+                return Err(BlobError::IdempotencyConflict);
+            }
+            self.files.insert(
+                path.normalized_identity().to_owned(),
+                (bytes.to_vec(), self.now),
+            );
+            Ok(())
+        }
+
+        fn replace_durable(&mut self, path: &WorkScopePath, bytes: &[u8]) -> Result<(), BlobError> {
+            if !self.files.contains_key(path.normalized_identity()) {
+                return Err(BlobError::NotFound);
+            }
+            self.files.insert(
+                path.normalized_identity().to_owned(),
+                (bytes.to_vec(), self.now),
+            );
+            Ok(())
+        }
+
+        fn rename_no_replace_durable(
+            &mut self,
+            source: &WorkScopePath,
+            destination: &WorkScopePath,
+        ) -> Result<(), BlobError> {
+            if self.files.contains_key(destination.normalized_identity()) {
+                return Err(BlobError::IdempotencyConflict);
+            }
+            let value = self
+                .files
+                .remove(source.normalized_identity())
+                .ok_or(BlobError::NotFound)?;
+            self.files
+                .insert(destination.normalized_identity().to_owned(), value);
+            Ok(())
+        }
+
+        fn remove_durable(&mut self, path: &WorkScopePath) -> Result<(), BlobError> {
+            self.files.remove(path.normalized_identity());
+            Ok(())
+        }
+
+        fn stat(&self, path: &WorkScopePath) -> Result<BlobPathState, BlobError> {
+            Ok(self.files.get(path.normalized_identity()).map_or(
+                BlobPathState::Missing,
+                |(bytes, modified)| BlobPathState::File {
+                    length: bytes.len() as u64,
+                    modified_unix_ms: *modified,
+                },
+            ))
+        }
+
+        fn list(&self, prefix: &WorkScopePath) -> Result<Vec<WorkScopePath>, BlobError> {
+            self.files
+                .keys()
+                .filter(|path| path.starts_with(prefix.normalized_identity()))
+                .map(|path| {
+                    WorkScopePath::new(path.clone())
+                        .map_err(|error| BlobError::InvalidContract(error.to_string()))
+                })
+                .collect()
+        }
+
+        fn now_unix_ms(&mut self) -> Result<u64, BlobError> {
+            Ok(self.now)
+        }
+    }
+
+    struct TestCompression;
+
+    impl BlobCompressionPort for TestCompression {
+        fn descriptor(&mut self) -> Result<CompressionDescriptor, BlobError> {
+            Ok(CompressionDescriptor {
+                algorithm: BlobId::new("test-identity-codec")?,
+                version: 1,
+            })
+        }
+
+        fn compress(&mut self, plaintext: &[u8]) -> Result<Vec<u8>, BlobError> {
+            Ok(plaintext.to_vec())
+        }
+
+        fn decompress_bounded(
+            &self,
+            descriptor: &CompressionDescriptor,
+            compressed: &[u8],
+            max_output_bytes: u64,
+        ) -> Result<Vec<u8>, BlobError> {
+            descriptor.validate()?;
+            if compressed.len() as u64 > max_output_bytes {
+                return Err(BlobError::InvalidContract(
+                    "decompression output ceiling exceeded".to_owned(),
+                ));
+            }
+            Ok(compressed.to_vec())
+        }
+    }
+
+    struct TestKeys;
+
+    impl BlobKeyPort for TestKeys {
+        fn current(&mut self) -> Result<BlobKeySelection, BlobError> {
+            Ok(test_key(3))
+        }
+
+        fn resolve(&self, descriptor: &CryptoDescriptor) -> Result<BlobKeySelection, BlobError> {
+            Ok(BlobKeySelection {
+                key_ref: BlobId::new(format!("test-key-{}", descriptor.key_generation))?,
+                crypto: descriptor.clone(),
+            })
+        }
+    }
+
+    fn test_key(generation: u64) -> BlobKeySelection {
+        BlobKeySelection {
+            key_ref: BlobId::new(format!("test-key-{generation}")).expect("key ref"),
+            crypto: CryptoDescriptor {
+                algorithm: BlobId::new("test-only-authenticated-envelope").expect("algorithm"),
+                version: 1,
+                key_lineage: BlobId::new("test-lineage").expect("lineage"),
+                key_generation: generation,
+            },
+        }
+    }
+
+    struct TestAead;
+
+    impl BlobAeadPort for TestAead {
+        fn seal(&mut self, request: AeadSealRequest<'_>) -> Result<Vec<u8>, BlobError> {
+            let mut result = sha256_hex(
+                &[
+                    request.associated_data,
+                    request.nonce_context,
+                    request.plaintext,
+                    request.key.key_ref.as_str().as_bytes(),
+                ]
+                .concat(),
+            )
+            .into_bytes();
+            result.extend_from_slice(request.plaintext);
+            Ok(result)
+        }
+
+        fn open(&self, request: AeadOpenRequest<'_>) -> Result<Vec<u8>, BlobError> {
+            if request.ciphertext.len() < 64 {
+                return Err(BlobError::IntegrityMismatch);
+            }
+            let plaintext = &request.ciphertext[64..];
+            let expected = sha256_hex(
+                &[
+                    request.associated_data,
+                    request.nonce_context,
+                    plaintext,
+                    request.key.key_ref.as_str().as_bytes(),
+                ]
+                .concat(),
+            );
+            if request.ciphertext[..64] != *expected.as_bytes() {
+                return Err(BlobError::IntegrityMismatch);
+            }
+            Ok(plaintext.to_vec())
+        }
+    }
+
+    #[derive(Default)]
+    struct TestLiveSets;
+
+    impl BlobLiveSetPort for TestLiveSets {
+        fn revalidate(
+            &mut self,
+            proof: &BlobLiveSetProof,
+        ) -> Result<LiveSetRevalidation, BlobError> {
+            Ok(LiveSetRevalidation {
+                proof_id: proof.proof_id.clone(),
+                snapshot_sha256: proof.snapshot_sha256.clone(),
+                revision: proof.revision,
+                still_complete_and_current: true,
+            })
+        }
+
+        fn compare_and_delete(
+            &mut self,
+            proof: &BlobLiveSetProof,
+            _locator: &BlobLocator,
+            delete: &mut dyn FnMut() -> Result<(), BlobError>,
+        ) -> Result<ConditionalDeleteOutcome, BlobError> {
+            let observed = self.revalidate(proof)?;
+            if !observed.still_complete_and_current {
+                return Err(BlobError::IncompleteLiveSet);
+            }
+            delete()?;
+            Ok(ConditionalDeleteOutcome::Deleted)
+        }
+    }
+
+    fn context_json(effect: &str, operation: &str, request: &str) -> String {
+        let fence = r#"{"authority_epoch":4,"resource_generation":7,"task_revision":null,"policy_revision":null,"integration_revision":null}"#;
+        let metadata = format!(
+            r#"{{"request_id":"{request}","session_id":null,"task_id":null,"product_id":"product-1","source_id":"source-1","state_fence":{fence},"clock":{{"valid_time_ms":1,"known_time_ms":1,"transaction_sequence":null,"monotonic_ns":1}}}}"#
+        );
+        format!(
+            r#"{{"work_scope":{{"scope_id":"scope-1","product_id":"product-1","resource_generation":7,"state_fence":{fence}}},"task":null,"session":null,"causal":{{"state_fence":{fence},"transaction_sequence":1,"parent_receipt_id":null,"predecessor_receipt_ids":[]}},"request":{{"metadata":{metadata},"state_fence":{fence}}},"operation":{{"operation_id":"{operation}","request_id":"{request}","idempotency_key":"idem-1","operation_kind":"blob-test","effect":"{effect}","state_fence":{fence}}},"authority":{{"authority_id":"authority-1","authority_owner":"test-owner","authority_epoch":4,"state_fence":{fence},"allowed_effect":"{effect}","proof_ceiling":"OBSERVED_EXTERNAL_EFFECT"}}}}"#
+        )
+    }
+
+    fn lease(context: &BlobReceiptContext) -> BlobRootLease {
+        serde_json::from_value(serde_json::json!({
+            "root_id": "root-1",
+            "owner_id": "owner-1",
+            "lease_id": "lease-1",
+            "root_generation": 7,
+            "fence_binding": context.request,
+        }))
+        .expect("lease")
+    }
+
+    fn stage_request(operation: &str, bytes: &[u8]) -> BlobStageRequest {
+        let context: BlobReceiptContext = serde_json::from_str(&context_json(
+            "REVERSIBLE_MUTATION",
+            operation,
+            &format!("request-{operation}"),
+        ))
+        .expect("context");
+        BlobStageRequest {
+            root_lease: lease(&context),
+            context,
+            bytes: bytes.to_vec(),
+            policy: BlobPolicyBinding {
+                privacy_class: eliot_security_contracts::PrivacyClass::Private,
+                retention_class: eliot_blob_api::RetentionClass::Task,
+                policy_ref: eliot_platform::PlatformHandle::new("policy-1").expect("policy"),
+                instruction_taint: eliot_security_contracts::InstructionTaint::DataOnly,
+                effect_ceiling: eliot_security_contracts::EffectCeiling::CandidateOnly,
+            },
+        }
+    }
+
+    fn store() -> BlobStoreService<MemoryPlatform, TestCompression, TestKeys, TestAead, TestLiveSets>
+    {
+        let request = stage_request("bootstrap", b"");
+        BlobStoreService::new(
+            request.root_lease,
+            MemoryPlatform::default(),
+            TestCompression,
+            TestKeys,
+            TestAead,
+            TestLiveSets::default(),
+            test_anchor(),
+        )
+        .expect("store")
+    }
+
+    fn read_request(ready: &BlobReadyReceipt, operation: &str) -> BlobReadRequest {
+        let context: BlobReceiptContext = serde_json::from_str(&context_json(
+            "READ",
+            operation,
+            &format!("request-{operation}"),
+        ))
+        .expect("context");
+        BlobReadRequest {
+            root_lease: lease(&context),
+            context,
+            locator: ready.locator().clone(),
+            expected_metadata_sha256: ready.metadata_sha256().to_owned(),
+            expected_ready_receipt_id: ready.receipt().identity.receipt_id.to_string(),
+            max_bytes: 1024,
+        }
+    }
+
+    #[test]
+    fn object_safe_stage_read_roundtrip() {
+        let store = store();
+        let client: &dyn BlobStoreClient = &store;
+        let ready = block_on(client.stage(stage_request("roundtrip", b"payload"))).expect("stage");
+        let expected_anchor = test_anchor();
+        assert_eq!(ready.anchor_fingerprint(), expected_anchor.fingerprint());
+        assert_eq!(ready.plaintext_length(), 7);
+        let chunk = block_on(client.read(read_request(&ready, "roundtrip-read"))).expect("read");
+        assert_eq!(chunk.bytes(), b"payload");
+        assert_eq!(chunk.anchor_fingerprint(), expected_anchor.fingerprint());
+        assert!(chunk.is_complete());
+        assert!(block_on(client.health()).expect("health").ready);
+    }
+
+    #[test]
+    fn idempotent_replay_is_exact_and_conflict_never_succeeds() {
+        let store = store();
+        let request = stage_request("idem", b"payload");
+        let first = block_on(store.stage(request.clone())).expect("stage");
+        let replay = block_on(store.stage(request)).expect("replay");
+        assert_eq!(first, replay);
+        let conflict = block_on(store.stage(stage_request("idem", b"different")));
+        assert_eq!(conflict, Err(BlobError::IdempotencyConflict));
+    }
+}
