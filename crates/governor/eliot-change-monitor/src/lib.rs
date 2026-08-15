@@ -11,9 +11,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use eliot_agent_contracts::{
-    AnchorReference, AnchorResolution, AnchorResolutionStatus,
-};
+use eliot_agent_contracts::{AnchorReference, AnchorResolution, AnchorResolutionStatus};
 use eliot_contracts::{
     ContractError, ContractIdentity, ContractVersion, StateFence, canonical_json_bytes,
     contract_identity as foundation_contract_identity, sha256_hex,
@@ -96,7 +94,10 @@ fn text(value: &str, field: &'static str) -> Result<(), ChangeMonitorError> {
     Ok(())
 }
 
-fn unique<T: Ord>(values: impl IntoIterator<Item = T>, field: &'static str) -> Result<(), ChangeMonitorError> {
+fn unique<T: Ord>(
+    values: impl IntoIterator<Item = T>,
+    field: &'static str,
+) -> Result<(), ChangeMonitorError> {
     let mut seen = BTreeSet::new();
     if values.into_iter().any(|value| !seen.insert(value)) {
         return Err(ChangeMonitorError::Duplicate { field });
@@ -107,15 +108,14 @@ fn unique<T: Ord>(values: impl IntoIterator<Item = T>, field: &'static str) -> R
 fn is_material_mutation(kind: ChangeKind) -> bool {
     matches!(
         kind,
-        ChangeKind::Created
-            | ChangeKind::Modified
-            | ChangeKind::Deleted
-            | ChangeKind::Renamed
+        ChangeKind::Created | ChangeKind::Modified | ChangeKind::Deleted | ChangeKind::Renamed
     )
 }
 
 /// Origin route for one host/tool observation.
-#[derive(Clone, Copy, Debug, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[derive(
+    Clone, Copy, Debug, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize, Deserialize,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum ChangeOrigin {
     HostEvent,
@@ -128,7 +128,9 @@ pub enum ChangeOrigin {
 }
 
 /// Confidence of attribution, deliberately separate from epistemic truth.
-#[derive(Clone, Copy, Debug, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[derive(
+    Clone, Copy, Debug, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize, Deserialize,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum Attribution {
     Exact,
@@ -139,7 +141,9 @@ pub enum Attribution {
 }
 
 /// Kind of observed resource mutation.
-#[derive(Clone, Copy, Debug, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[derive(
+    Clone, Copy, Debug, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize, Deserialize,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum ChangeKind {
     Created,
@@ -269,7 +273,10 @@ impl ChangeObservation {
             return Err(ChangeMonitorError::NoChangedResource);
         }
         if self.unknown_origin
-            && matches!(self.attribution, Attribution::Exact | Attribution::ReceiptLinked)
+            && matches!(
+                self.attribution,
+                Attribution::Exact | Attribution::ReceiptLinked
+            )
         {
             return Err(ChangeMonitorError::UnknownOriginAttribution);
         }
@@ -289,7 +296,9 @@ impl ChangeObservation {
             text(reference, "change_reference")?;
         }
         unique(
-            self.invalidations.iter().map(|item| item.dependency.clone()),
+            self.invalidations
+                .iter()
+                .map(|item| item.dependency.clone()),
             "invalidations",
         )?;
         for invalidation in &self.invalidations {
@@ -372,6 +381,24 @@ pub struct ChangeMonitor {
 }
 
 impl ChangeMonitor {
+    /// Rebuilds the monitor from canonical immutable observations.
+    pub fn from_snapshot(snapshot: ChangeMonitorSnapshot) -> Result<Self, ChangeMonitorError> {
+        let mut monitor = Self::default();
+        for record in snapshot.observations {
+            let observed = record.observation.clone();
+            if observed.digest()? != record.observation_digest {
+                return Err(ChangeMonitorError::IdentityConflict);
+            }
+            monitor.ingest(observed)?;
+        }
+        if monitor.snapshot().current_resources != snapshot.current_resources
+            || monitor.snapshot().invalidated_dependencies != snapshot.invalidated_dependencies
+        {
+            return Err(ChangeMonitorError::IdentityConflict);
+        }
+        Ok(monitor)
+    }
+
     /// Ingests one observation, treating an identical replay as idempotent.
     pub fn ingest(
         &mut self,
@@ -397,7 +424,8 @@ impl ChangeMonitor {
                     .collect(),
             });
         }
-        let acceptance_blocked = observation.unknown_origin && is_material_mutation(observation.kind);
+        let acceptance_blocked =
+            observation.unknown_origin && is_material_mutation(observation.kind);
         if let Some(after) = &observation.after {
             self.current_resources
                 .insert(after.resource_ref.clone(), after.clone());
@@ -441,7 +469,7 @@ impl ChangeMonitor {
     /// Returns whether any unknown-origin material mutation blocks acceptance.
     pub fn has_unknown_material_change(&self) -> bool {
         self.observations.values().any(|record| {
-                record.observation.unknown_origin && is_material_mutation(record.observation.kind)
+            record.observation.unknown_origin && is_material_mutation(record.observation.kind)
         })
     }
 }
@@ -464,7 +492,9 @@ pub struct AnchorCandidate {
 impl AnchorCandidate {
     /// Validates the public reference and candidate fingerprints.
     pub fn validate(&self) -> Result<(), ChangeMonitorError> {
-        self.reference.validate().map_err(ChangeMonitorError::from)?;
+        self.reference
+            .validate()
+            .map_err(ChangeMonitorError::from)?;
         for digest in [&self.content_digest, &self.structural_digest]
             .into_iter()
             .flatten()
@@ -581,11 +611,10 @@ impl EvolvingAnchorResolver {
             });
         } else if historical_matches.len() > 1 {
             AnchorResolutionStatus::Ambiguous
-        } else if monitor
-            .observations
-            .iter()
-            .any(|record| record.observation.kind == ChangeKind::Deleted && record.observation.resource_ref() == original.target.id.as_str())
-        {
+        } else if monitor.observations.iter().any(|record| {
+            record.observation.kind == ChangeKind::Deleted
+                && record.observation.resource_ref() == original.target.id.as_str()
+        }) {
             AnchorResolutionStatus::Deleted
         } else if candidates.is_empty() {
             AnchorResolutionStatus::Unavailable
@@ -602,7 +631,9 @@ impl EvolvingAnchorResolver {
 }
 
 /// Attribution class for a bidirectional provenance edge.
-#[derive(Clone, Copy, Debug, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[derive(
+    Clone, Copy, Debug, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize, Deserialize,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum ProvenanceAttribution {
     Exact,
@@ -685,12 +716,18 @@ impl ChangeProvenanceView {
 
     /// Returns the reverse-direction edges for a current target.
     pub fn inbound(&self, target: &str) -> Vec<&ProvenanceEdge> {
-        self.edges.iter().filter(|edge| edge.to_ref == target).collect()
+        self.edges
+            .iter()
+            .filter(|edge| edge.to_ref == target)
+            .collect()
     }
 
     /// Returns the forward-direction edges for a historical/public source.
     pub fn outbound(&self, source: &str) -> Vec<&ProvenanceEdge> {
-        self.edges.iter().filter(|edge| edge.from_ref == source).collect()
+        self.edges
+            .iter()
+            .filter(|edge| edge.from_ref == source)
+            .collect()
     }
 }
 

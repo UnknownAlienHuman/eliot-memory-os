@@ -14,13 +14,11 @@ name = "eliotd"
 path = "src/main.rs"
 
 [dependencies]
-eliot-engine.workspace = true
-eliot-kernel = { path = "../eliot-kernel" }
-eliot-types.workspace = true
+eliot-governor.workspace = true
+eliot-platform-windows.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
-tokio.workspace = true
 
 [lints]
 workspace = true

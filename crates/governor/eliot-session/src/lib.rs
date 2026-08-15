@@ -502,8 +502,10 @@ impl SessionLifecycleOwner {
             .expect("session checked above");
         record.heartbeat_at = req.now;
         record.expires_at = req.expires_at;
-        self.requests
-            .insert(req.request_id, RequestResult::Heartbeat(req, event.clone()));
+        self.requests.insert(
+            req.request_id.clone(),
+            RequestResult::Heartbeat(req, event.clone()),
+        );
         Ok(event)
     }
 

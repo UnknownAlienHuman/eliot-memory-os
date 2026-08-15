@@ -19,9 +19,9 @@ pub use eliot_observation_contracts::{
     ActiveObservationPlan, BlindInterval, CaptureMode, CaptureRoute, CoverageAssessment,
     CoverageDisposition, CoverageEvidence, CoverageGap, CoverageInterval, DenominatorSpec,
     Durability, EliotSystemObservationEvent, GapDisposition, GapPolicy, ObservationEventCore,
-    ObservationEventIdentity, ObservationKind, ObservationObligationProfile, ObservationRecordKind,
-    ObservationRecordEnvelope, ObservationScope, ProducerGenerationRef, ProducerTrace,
-    SamplingPolicy, SystemObservationJournalRecord,
+    ObservationEventIdentity, ObservationKind, ObservationObligationProfile,
+    ObservationRecordEnvelope, ObservationRecordKind, ObservationScope, ProducerGenerationRef,
+    ProducerTrace, SamplingPolicy, SystemObservationJournalRecord,
 };
 
 use eliot_contracts::{
@@ -131,7 +131,10 @@ fn digest(value: &str, field: &'static str) -> Result<(), GovernorObservationErr
     Ok(())
 }
 
-fn unique<T: Ord>(values: impl IntoIterator<Item = T>, field: &'static str) -> Result<(), GovernorObservationError> {
+fn unique<T: Ord>(
+    values: impl IntoIterator<Item = T>,
+    field: &'static str,
+) -> Result<(), GovernorObservationError> {
     let mut seen = BTreeSet::new();
     if values.into_iter().any(|value| !seen.insert(value)) {
         return Err(GovernorObservationError::Duplicate { field });
@@ -209,9 +212,15 @@ impl TaskSelectionEvidence {
         }
         digest(&self.acceptance_digest, "task_selection.acceptance_digest")?;
         text(&self.work_scope_ref, "task_selection.work_scope_ref")?;
-        text(&self.selection_source_ref, "task_selection.selection_source_ref")?;
+        text(
+            &self.selection_source_ref,
+            "task_selection.selection_source_ref",
+        )?;
         text(&self.evidence_ref, "task_selection.evidence_ref")?;
-        unique(&self.contamination_flags, "task_selection.contamination_flags")?;
+        unique(
+            &self.contamination_flags,
+            "task_selection.contamination_flags",
+        )?;
         for flag in &self.contamination_flags {
             text(flag, "task_selection.contamination_flag")?;
         }
@@ -354,7 +363,8 @@ impl ObservationSubmission {
 
     /// Computes the canonical request hash used for idempotent admission.
     pub fn request_digest(&self) -> Result<String, GovernorObservationError> {
-        let bytes = canonical_json_bytes(self).map_err(|_| GovernorObservationError::Serialization)?;
+        let bytes =
+            canonical_json_bytes(self).map_err(|_| GovernorObservationError::Serialization)?;
         Ok(sha256_hex(&bytes))
     }
 
@@ -363,9 +373,10 @@ impl ObservationSubmission {
             return None;
         }
         let (disposition, reason_ref) = match &self.task_selection {
-            Some(selection) if selection.is_contaminated() => {
-                (CandidateDisposition::Quarantined, "task-selection-contaminated")
-            }
+            Some(selection) if selection.is_contaminated() => (
+                CandidateDisposition::Quarantined,
+                "task-selection-contaminated",
+            ),
             Some(_) => (CandidateDisposition::TaskBound, "task-selection-bound"),
             None => (CandidateDisposition::Cold, "unbound-capture"),
         };
@@ -377,7 +388,7 @@ impl ObservationSubmission {
             disposition,
             reason_ref: reason_ref.to_owned(),
         };
-        candidate.validate().ok()
+        candidate.validate().ok().map(|()| candidate)
     }
 
     fn candidate_disposition(&self) -> CandidateDisposition {
@@ -471,12 +482,13 @@ impl ObservationAdmissionReceipt {
         }
         if let Some(value) = &self.evidence_digest {
             digest(value, "admission.evidence_digest")?;
-            let evidence = self.evidence.as_ref().ok_or(
-                GovernorObservationError::InvalidField {
-                    field: "admission.evidence_digest",
-                    reason: "requires retained evidence",
-                },
-            )?;
+            let evidence =
+                self.evidence
+                    .as_ref()
+                    .ok_or(GovernorObservationError::InvalidField {
+                        field: "admission.evidence_digest",
+                        reason: "requires retained evidence",
+                    })?;
             let bytes = canonical_json_bytes(evidence)
                 .map_err(|_| GovernorObservationError::Serialization)?;
             if value != &sha256_hex(&bytes) {
@@ -544,9 +556,15 @@ impl ObservationAdmissionRejection {
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "disposition")]
 pub enum ObservationAdmissionResult {
-    Accepted { receipt: ObservationAdmissionReceipt },
-    Replayed { receipt: ObservationAdmissionReceipt },
-    Rejected { rejection: ObservationAdmissionRejection },
+    Accepted {
+        receipt: ObservationAdmissionReceipt,
+    },
+    Replayed {
+        receipt: ObservationAdmissionReceipt,
+    },
+    Rejected {
+        rejection: ObservationAdmissionRejection,
+    },
 }
 
 /// One deterministic journal entry used to rebuild the Governor projection.
@@ -584,17 +602,17 @@ impl ObservationJournal {
                     {
                         return Err(GovernorObservationError::IdentityConflict);
                     }
-                    if journal.record_keys.insert(
-                        receipt.record_id.clone(),
-                        entry.idempotency_key.clone(),
-                    ).is_some()
+                    if journal
+                        .record_keys
+                        .insert(receipt.record_id.clone(), entry.idempotency_key.clone())
+                        .is_some()
                     {
                         return Err(GovernorObservationError::IdentityConflict);
                     }
-                    if journal.operation_keys.insert(
-                        receipt.operation_id.clone(),
-                        entry.idempotency_key.clone(),
-                    ).is_some()
+                    if journal
+                        .operation_keys
+                        .insert(receipt.operation_id.clone(), entry.idempotency_key.clone())
+                        .is_some()
                     {
                         return Err(GovernorObservationError::IdentityConflict);
                     }
@@ -770,7 +788,8 @@ impl ObservationJournal {
             safe_capture_fallback,
             corrected_retry_identity_rule:
                 "corrected payload requires a new operation and idempotency identity".to_owned(),
-            next_allowed_action: "preserve the candidate or correct the bounded contract errors".to_owned(),
+            next_allowed_action: "preserve the candidate or correct the bounded contract errors"
+                .to_owned(),
         };
         ObservationAdmissionResult::Rejected { rejection }
     }

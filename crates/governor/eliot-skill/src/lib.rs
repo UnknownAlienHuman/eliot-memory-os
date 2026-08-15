@@ -305,7 +305,10 @@ impl SkillInteractionView {
         for (values, field) in [
             (&self.conflict_refs, "interaction.conflict_refs"),
             (&self.ordering_refs, "interaction.ordering_refs"),
-            (&self.mutual_exclusion_refs, "interaction.mutual_exclusion_refs"),
+            (
+                &self.mutual_exclusion_refs,
+                "interaction.mutual_exclusion_refs",
+            ),
         ] {
             unique(values.iter().cloned(), field)?;
             for value in values {
@@ -396,6 +399,11 @@ pub struct SkillLifecycleView {
 }
 
 impl SkillLifecycleView {
+    /// Returns the stable skill identity carried by this view.
+    pub fn skill_id(&self) -> &str {
+        self.skill_ref.skill_id()
+    }
+
     pub fn validate(&self) -> Result<(), SkillError> {
         self.skill_ref.validate()?;
         self.scope.validate()?;
@@ -415,10 +423,7 @@ impl SkillLifecycleView {
                 text(value, field)?;
             }
         }
-        unique(
-            self.dependencies.iter().cloned(),
-            "dependencies",
-        )?;
+        unique(self.dependencies.iter().cloned(), "dependencies")?;
         for dependency in &self.dependencies {
             dependency.validate()?;
         }
@@ -445,8 +450,7 @@ impl SkillLifecycleView {
             .execution_evidence
             .iter()
             .filter(|evidence| {
-                evidence.outcome == ExecutionOutcome::Observed
-                    && !evidence.verifier_refs.is_empty()
+                evidence.outcome == ExecutionOutcome::Observed && !evidence.verifier_refs.is_empty()
             })
             .count() as u64;
         if self.counters.executed != observed
@@ -474,7 +478,10 @@ impl SkillLifecycleView {
         }
         match self.status {
             SkillStatus::Stale | SkillStatus::Quarantined
-                if self.stale_or_quarantine_reason.as_deref().is_none_or(str::is_empty) =>
+                if self
+                    .stale_or_quarantine_reason
+                    .as_deref()
+                    .is_none_or(str::is_empty) =>
             {
                 return Err(SkillError::InvalidField {
                     field: "stale_or_quarantine_reason",
@@ -573,7 +580,10 @@ impl SkillCandidate {
                 reason: "a candidate must describe a governed lifecycle change",
             });
         }
-        unique(self.evidence_refs.iter().cloned(), "candidate.evidence_refs")?;
+        unique(
+            self.evidence_refs.iter().cloned(),
+            "candidate.evidence_refs",
+        )?;
         if self.evidence_refs.is_empty() {
             return Err(SkillError::InvalidField {
                 field: "candidate.evidence_refs",
@@ -702,12 +712,24 @@ impl SkillPromotionReceipt {
 
 /// Governor lifecycle owner. Persistence and delivery are delegated to the
 /// canonical store; this state machine never treats installation as usefulness.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SkillRegistry {
     views: BTreeMap<String, SkillLifecycleView>,
 }
 
 impl SkillRegistry {
+    /// Rebuilds the registry from its canonical lifecycle views.
+    pub fn from_snapshot(
+        views: impl IntoIterator<Item = SkillLifecycleView>,
+    ) -> Result<Self, SkillError> {
+        let mut registry = Self::default();
+        for view in views {
+            registry.record_view(view)?;
+        }
+        Ok(registry)
+    }
+
     pub fn record_view(&mut self, view: SkillLifecycleView) -> Result<(), SkillError> {
         view.validate()?;
         let key = view.skill_id().to_owned();

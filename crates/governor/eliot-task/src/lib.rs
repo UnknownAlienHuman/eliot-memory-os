@@ -149,7 +149,10 @@ impl TaskCommand {
             Self::Fail { reason_ref } => text(reason_ref, "reason_ref"),
             Self::MarkPartial { result_ref } => text(result_ref, "result_ref"),
             Self::Reopen { reopen_ref } => text(reopen_ref, "reopen_ref"),
-            Self::Open | Self::BeginExecution | Self::BeginVerification => Ok(()),
+            Self::Open
+            | Self::RequireUnderstanding
+            | Self::BeginExecution
+            | Self::BeginVerification => Ok(()),
         }
     }
 }
@@ -324,7 +327,7 @@ impl TaskLifecycleOwner {
             None,
         );
         self.tasks.insert(
-            proposal.task_id,
+            proposal.task_id.clone(),
             TaskRecord {
                 task_id: proposal.task_id.clone(),
                 project_ref: proposal.project_ref,
@@ -398,7 +401,7 @@ impl TaskLifecycleOwner {
         record.last_sequence = event.sequence;
         record.last_event_id = event.event_id.clone();
         self.requests
-            .insert(context.request_id, (task_id, command, event.clone()));
+            .insert(context.request_id, (task_id, Some(command), event.clone()));
         Ok(event)
     }
 

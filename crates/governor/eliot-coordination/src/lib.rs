@@ -392,6 +392,33 @@ impl CoordinationOwner {
     pub fn new() -> Self {
         Self::default()
     }
+
+    /// Rebuilds one owner from a canonical serialized image.
+    ///
+    /// The image is validated before it can be admitted: event sequences must
+    /// be contiguous, and every event must carry one valid fence.  This keeps
+    /// restart recovery on the canonical read path instead of silently
+    /// replacing state with `Default`.
+    pub fn from_snapshot(snapshot: Self) -> Result<Self, CoordinationError> {
+        if snapshot.events.iter().enumerate().any(|(index, event)| {
+            event.sequence != index as u64 + 1
+                || event.state_fence.validate().is_err()
+                || event.authority_epoch != event.state_fence.authority_epoch
+        }) {
+            return Err(CoordinationError::CausalPredecessorMismatch);
+        }
+        if snapshot.sequence != snapshot.events.len() as u64 {
+            return Err(CoordinationError::CausalPredecessorMismatch);
+        }
+        if snapshot
+            .event_by_request
+            .values()
+            .any(|event| !snapshot.events.contains(event))
+        {
+            return Err(CoordinationError::InvalidState);
+        }
+        Ok(snapshot)
+    }
     pub fn current_sequence(&self) -> u64 {
         self.sequence
     }

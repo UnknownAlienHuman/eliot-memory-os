@@ -892,10 +892,28 @@ dependencies = [
 name = "eliot-governor"
 version = "0.1.0"
 dependencies = [
+ "eliot-authority",
+ "eliot-canonical",
+ "eliot-change-monitor",
+ "eliot-config",
  "eliot-contracts",
+ "eliot-coordination",
+ "eliot-finish",
+ "eliot-maintenance",
+ "eliot-module-registry",
+ "eliot-observation",
+ "eliot-observation-contracts",
+ "eliot-problem",
+ "eliot-receipts",
  "eliot-runtime-contracts",
+ "eliot-session",
+ "eliot-skill",
+ "eliot-store-api",
+ "eliot-task",
+ "eliot-workscope",
  "schemars",
  "serde",
+ "serde_json",
  "thiserror",
 ]
 
@@ -1900,13 +1918,11 @@ dependencies = [
 name = "eliotd"
 version = "0.1.0"
 dependencies = [
- "eliot-engine",
- "eliot-kernel",
- "eliot-types",
+ "eliot-governor",
+ "eliot-platform-windows",
  "serde",
  "serde_json",
  "thiserror",
- "tokio",
 ]
 
 [[package]]

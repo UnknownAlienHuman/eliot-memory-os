@@ -7,10 +7,28 @@ license.workspace = true
 description = "Production Governor orchestration and readiness owner"
 
 [dependencies]
+eliot-authority.workspace = true
+eliot-canonical.workspace = true
+eliot-change-monitor.workspace = true
+eliot-config.workspace = true
+eliot-coordination.workspace = true
 eliot-contracts.workspace = true
+eliot-finish.workspace = true
+eliot-maintenance.workspace = true
+eliot-module-registry.workspace = true
+eliot-observation.workspace = true
+eliot-observation-contracts.workspace = true
+eliot-problem.workspace = true
+eliot-receipts.workspace = true
+eliot-session.workspace = true
+eliot-skill.workspace = true
+eliot-store-api.workspace = true
+eliot-task.workspace = true
+eliot-workscope.workspace = true
 eliot-runtime-contracts.workspace = true
 schemars.workspace = true
 serde.workspace = true
+serde_json.workspace = true
 thiserror.workspace = true
 
 [lints]

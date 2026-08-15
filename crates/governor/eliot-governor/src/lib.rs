@@ -9,6 +9,10 @@
 
 #![forbid(unsafe_code)]
 
+mod composition;
+
+pub use composition::*;
+
 use std::collections::BTreeMap;
 
 use eliot_contracts::{AuthorityEpoch, ResourceGeneration};
