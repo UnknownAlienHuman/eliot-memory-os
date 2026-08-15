@@ -75,6 +75,7 @@ pub struct CapturedStream {
 
 #[derive(Debug)]
 struct StreamCapture {
+    requested: bool,
     bytes: Vec<u8>,
     limit: usize,
     total_bytes: u64,
@@ -84,8 +85,9 @@ struct StreamCapture {
 }
 
 impl StreamCapture {
-    fn new(limit: usize) -> Self {
+    fn new(limit: usize, requested: bool) -> Self {
         Self {
+            requested,
             bytes: Vec::new(),
             limit: limit.max(1),
             total_bytes: 0,
@@ -110,15 +112,17 @@ impl StreamCapture {
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct CaptureFailure {
     stream: &'static str,
-    thread_id: String,
+    thread_id: Option<String>,
     disposition: CaptureFailureDisposition,
 }
 
 #[cfg(windows)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum CaptureFailureDisposition {
+    SpawnFailed,
     Timeout,
     Panicked,
+    Incomplete,
 }
 
 #[cfg(windows)]
@@ -417,6 +421,8 @@ impl ProcessExecutor for WindowsProcessExecutor {
             .map_err(|error| unavailable(error))?;
             let stdout_limit = request.resource_limits().stdout_bytes();
             let stderr_limit = request.resource_limits().stderr_bytes();
+            let stdout_requested = stdout_limit > 0;
+            let stderr_requested = stderr_limit > 0;
             let wall_timeout_ms = request.resource_limits().wall_timeout_ms();
             let sequence = JOB_SEQUENCE.fetch_add(1, Ordering::Relaxed);
             let job_name = JobObjectIdentity::new(format!(
@@ -448,16 +454,48 @@ impl ProcessExecutor for WindowsProcessExecutor {
                 )?,
             )?;
             let receipt = ProcessStartReceipt::new(&state)?;
-            let stdout = Arc::new(Mutex::new(StreamCapture::new(retention(
-                stdout_limit,
-                self.capture_limit,
-            ))));
-            let stderr = Arc::new(Mutex::new(StreamCapture::new(retention(
-                stderr_limit,
-                self.capture_limit,
-            ))));
-            let stdout_thread = spawn_capture(running.take_stdout(), Arc::clone(&stdout));
-            let stderr_thread = spawn_capture(running.take_stderr(), Arc::clone(&stderr));
+            let stdout = Arc::new(Mutex::new(StreamCapture::new(
+                retention(stdout_limit, self.capture_limit),
+                stdout_requested,
+            )));
+            let stderr = Arc::new(Mutex::new(StreamCapture::new(
+                retention(stderr_limit, self.capture_limit),
+                stderr_requested,
+            )));
+            let deadline = Instant::now()
+                .checked_add(Duration::from_millis(wall_timeout_ms))
+                .ok_or_else(|| unavailable("wall timeout overflows monotonic clock"))?;
+            let mut capture_spawn_error = None;
+            let mut capture_failure = None;
+            let stdout_thread =
+                match spawn_capture("stdout", running.take_stdout(), Arc::clone(&stdout)) {
+                    Ok(thread) => thread,
+                    Err(error) => {
+                        capture_spawn_error = Some(error);
+                        capture_failure = Some(CaptureFailure {
+                            stream: "stdout",
+                            thread_id: None,
+                            disposition: CaptureFailureDisposition::SpawnFailed,
+                        });
+                        None
+                    }
+                };
+            let stderr_thread = if capture_spawn_error.is_none() {
+                match spawn_capture("stderr", running.take_stderr(), Arc::clone(&stderr)) {
+                    Ok(thread) => thread,
+                    Err(error) => {
+                        capture_spawn_error = Some(error);
+                        capture_failure = Some(CaptureFailure {
+                            stream: "stderr",
+                            thread_id: None,
+                            disposition: CaptureFailureDisposition::SpawnFailed,
+                        });
+                        None
+                    }
+                }
+            } else {
+                None
+            };
             let operation = Arc::new(Mutex::new(Operation {
                 state,
                 sink,
@@ -466,18 +504,23 @@ impl ProcessExecutor for WindowsProcessExecutor {
                 stderr,
                 stdout_thread,
                 stderr_thread,
-                deadline: Instant::now()
-                    .checked_add(Duration::from_millis(wall_timeout_ms))
-                    .ok_or_else(|| unavailable("wall timeout overflows monotonic clock"))?,
+                deadline,
                 timed_out: false,
                 cleanup_required: false,
                 termination: None,
-                capture_failures: Vec::new(),
+                capture_failures: capture_failure.into_iter().collect(),
             }));
             self.operations
                 .lock()
                 .map_err(|_| unavailable("operation registry lock poisoned"))?
                 .insert(operation_id, Arc::clone(&operation));
+            if let Some(error) = capture_spawn_error {
+                let mut guard = operation
+                    .lock()
+                    .map_err(|_| unavailable("operation lock poisoned"))?;
+                poison_operation(&mut guard, &self.poisoned);
+                return Err(error);
+            }
             spawn_deadline_watcher(operation, Arc::clone(&self.poisoned));
             Ok(receipt)
         }
@@ -813,12 +856,41 @@ fn spawn_deadline_watcher(operation: Arc<Mutex<Operation>>, poisoned: Arc<Atomic
 
 #[cfg(windows)]
 fn join_streams(operation: &mut Operation) -> bool {
-    let stdout_joined = join_capture_thread(&mut operation.stdout_thread, "stdout");
-    let stderr_joined = join_capture_thread(&mut operation.stderr_thread, "stderr");
-    let failures = [stdout_joined, stderr_joined]
-        .into_iter()
-        .flatten()
-        .collect::<Vec<_>>();
+    let stdout_result = join_capture_thread(&mut operation.stdout_thread, "stdout");
+    let stderr_result = join_capture_thread(&mut operation.stderr_thread, "stderr");
+    let mut failures = Vec::new();
+    if let Err(failure) = &stdout_result {
+        failures.push(failure.clone());
+    }
+    if let Err(failure) = &stderr_result {
+        failures.push(failure.clone());
+    }
+    if let Ok(thread_id) = &stdout_result {
+        if !capture_complete(&operation.stdout) {
+            failures.push(CaptureFailure {
+                stream: "stdout",
+                thread_id: thread_id.clone(),
+                disposition: if thread_id.is_some() {
+                    CaptureFailureDisposition::Incomplete
+                } else {
+                    CaptureFailureDisposition::SpawnFailed
+                },
+            });
+        }
+    }
+    if let Ok(thread_id) = &stderr_result {
+        if !capture_complete(&operation.stderr) {
+            failures.push(CaptureFailure {
+                stream: "stderr",
+                thread_id: thread_id.clone(),
+                disposition: if thread_id.is_some() {
+                    CaptureFailureDisposition::Incomplete
+                } else {
+                    CaptureFailureDisposition::SpawnFailed
+                },
+            });
+        }
+    }
     for failure in &failures {
         if !operation.capture_failures.contains(failure) {
             operation.capture_failures.push(failure.clone());
@@ -831,11 +903,11 @@ fn join_streams(operation: &mut Operation) -> bool {
 fn join_capture_thread(
     thread_slot: &mut Option<JoinHandle<()>>,
     stream: &'static str,
-) -> Option<CaptureFailure> {
+) -> Result<Option<String>, CaptureFailure> {
     let Some(thread) = thread_slot.as_ref() else {
-        return None;
+        return Ok(None);
     };
-    let thread_id = format!("{:?}", thread.thread().id());
+    let thread_id = Some(format!("{:?}", thread.thread().id()));
     if !thread.is_finished() {
         let _ = cancel_capture_thread_io(thread);
         let deadline = Instant::now()
@@ -846,41 +918,63 @@ fn join_capture_thread(
         }
     }
     if !thread.is_finished() {
-        return Some(CaptureFailure {
+        return Err(CaptureFailure {
             stream,
             thread_id,
             disposition: CaptureFailureDisposition::Timeout,
         });
     }
     let Some(thread) = thread_slot.take() else {
-        return Some(CaptureFailure {
+        return Err(CaptureFailure {
             stream,
             thread_id,
             disposition: CaptureFailureDisposition::Panicked,
         });
     };
     if thread.join().is_err() {
-        return Some(CaptureFailure {
+        return Err(CaptureFailure {
             stream,
             thread_id,
             disposition: CaptureFailureDisposition::Panicked,
         });
     }
-    None
+    Ok(thread_id)
+}
+
+#[cfg(windows)]
+fn capture_complete(capture: &Arc<Mutex<StreamCapture>>) -> bool {
+    capture
+        .lock()
+        .map(|guard| !guard.requested || guard.complete)
+        .unwrap_or(false)
 }
 
 #[cfg(windows)]
 fn spawn_capture(
+    stream: &'static str,
     file: Option<std::fs::File>,
     capture: Arc<Mutex<StreamCapture>>,
-) -> Option<JoinHandle<()>> {
-    let mut file = file?;
-    if let Ok(mut guard) = capture.lock() {
-        guard.captured = true;
+) -> Result<Option<JoinHandle<()>>, ProcessExecutionError> {
+    let requested = capture
+        .lock()
+        .map_err(|_| unavailable(format!("{stream} capture lock poisoned")))?
+        .requested;
+    if !requested {
+        return Ok(None);
     }
-    thread::Builder::new()
+    let Some(mut file) = file else {
+        return Err(unavailable(format!(
+            "requested {stream} capture reader handle is missing"
+        )));
+    };
+    let thread = thread::Builder::new()
         .name("eliot-p04-stream".to_owned())
         .spawn(move || {
+            if let Ok(mut guard) = capture.lock() {
+                guard.captured = true;
+            } else {
+                return;
+            }
             let mut buffer = [0_u8; STREAM_CHUNK_BYTES];
             loop {
                 match file.read(&mut buffer) {
@@ -904,7 +998,8 @@ fn spawn_capture(
                 guard.complete = true;
             }
         })
-        .ok()
+        .map_err(|error| unavailable(format!("{stream} capture reader spawn failed: {error}")))?;
+    Ok(Some(thread))
 }
 
 #[cfg(windows)]
