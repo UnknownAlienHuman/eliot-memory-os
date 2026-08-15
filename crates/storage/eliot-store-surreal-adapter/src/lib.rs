@@ -27,15 +27,15 @@ mod schema;
 use std::fmt;
 
 pub use config::{
-    ADAPTER_NAME, ConfigError, SchemaGeneration, SchemaGenerationError, SurrealAdapterConfig,
+    ADAPTER_NAME, ConfigError, PINNED_SURREALDB_MAJOR, SchemaGeneration, SchemaGenerationError,
+    SurrealAdapterConfig,
 };
 use eliot_platform::ClockObservation;
 use eliot_store_api::{
-    CONTRACT_VERSION, CanonicalStoreClient, EffectClass, NamedOperationManifest,
-    NamedReadRequest, NamedReadResponse, OperationId, OrderingHead, OrderingHeadExpectation,
-    OrderingScopeId, PreparedTransition, RequestMeta, RevisionHead, RevisionHeadExpectation,
-    RevisionKey, ScopeId, ScopeRevisionView, StoreError, StoreHealth, TransitionClass,
-    WriteReceipt,
+    CONTRACT_VERSION, CanonicalStoreClient, EffectClass, NamedOperationManifest, NamedReadRequest,
+    NamedReadResponse, OperationId, OrderingHead, OrderingHeadExpectation, OrderingScopeId,
+    PreparedTransition, RequestMeta, RevisionHead, RevisionHeadExpectation, RevisionKey, ScopeId,
+    ScopeRevisionView, StoreError, StoreHealth, TransitionClass, WriteReceipt,
 };
 pub use error::AdapterError;
 pub use health::{AdapterAvailability, AdapterHealth, ProviderHealth};
@@ -179,8 +179,8 @@ impl CanonicalStoreClient for SurrealStoreAdapter {
             expected_revision_heads,
             expected_ordering_heads,
         )
-            .await
-            .map_err(AdapterError::into_store_error)
+        .await
+        .map_err(AdapterError::into_store_error)
     }
 
     async fn receipt(&self, operation_id: OperationId) -> Result<Option<WriteReceipt>, StoreError> {
@@ -264,6 +264,7 @@ mod tests {
             password: SecretString::new("test-secret".into()),
             connect_timeout_ms: 1_000,
             query_timeout_ms: 1_000,
+            expected_provider_major: PINNED_SURREALDB_MAJOR,
             expected_schema_generation: SchemaGeneration::new("1.0.0").expect("valid generation"),
         }
     }

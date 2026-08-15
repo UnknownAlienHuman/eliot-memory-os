@@ -859,35 +859,31 @@ async fn write_transaction(
         }
         Err(error) => return Err(error),
     };
-    if !response.take_errors().is_empty() {
-        return Err(AdapterError::UnknownOutcome { operation_id });
-    }
-    // The first statement is the provider-side fence CAS/create.  A matched
-    // zero-row update is a deterministic conflict, not a successful write;
-    // never let a stale pre-read turn into a second commit.
-    let cas_result = response
-        .take::<Vec<Value>>(0)
-        .map_err(|error| AdapterError::Serialization(error.to_string()))?;
-    if cas_result.is_empty() {
-        return Err(AdapterError::ProviderConflict);
-    }
-    let revision_result = response
-        .take::<Vec<Value>>(1)
-        .map_err(|error| AdapterError::Serialization(error.to_string()))?;
-    if revision_result.is_empty() {
-        return Err(AdapterError::ProviderConflict);
-    }
-    let mut result_index = 2;
-    for _ in &plan.next_ordering_heads {
-        let ordering_result = response
-            .take::<Vec<Value>>(result_index)
-            .map_err(|error| AdapterError::Serialization(error.to_string()))?;
-        if ordering_result.is_empty() {
+    let errors = response.take_errors();
+    if !errors.is_empty() {
+        // Fence, revision and ordering cardinality guards THROW before the
+        // receipt and COMMIT statements.  Only those explicit guards are a
+        // deterministic conflict; every other provider error remains
+        // unknown because the transport cannot prove whether COMMIT ran.
+        if errors.iter().any(|error| is_transaction_conflict(error)) {
             return Err(AdapterError::ProviderConflict);
         }
-        result_index += if initial_state { 1 } else { 2 };
+        return Err(AdapterError::UnknownOutcome { operation_id });
     }
     Ok(())
+}
+
+fn is_transaction_conflict(error: &str) -> bool {
+    [
+        "canonical_fence_cas_conflict",
+        "canonical_fence_create_conflict",
+        "revision_head_cas_conflict",
+        "revision_head_create_conflict",
+        "ordering_head_cas_conflict",
+        "ordering_head_create_conflict",
+    ]
+    .iter()
+    .any(|marker| error.contains(marker))
 }
 
 async fn read_revision_heads_inner(

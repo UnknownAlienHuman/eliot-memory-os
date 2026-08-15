@@ -76,17 +76,15 @@ DEFINE INDEX fence_id ON canonical_fence FIELDS id UNIQUE;
 pub(crate) const TX_BEGIN: &str = "BEGIN TRANSACTION;";
 pub(crate) const TX_COMMIT: &str = "COMMIT TRANSACTION;";
 
-/// Upsert of the canonical fence singleton.
-pub(crate) const TX_UPSERT_FENCE: &str = "UPDATE type::record($fence_table, $fence_key) CONTENT $fence WHERE state_fence = $expected_state_fence AND next_commit_sequence = $expected_commit_sequence AND next_outbox_sequence = $expected_outbox_sequence RETURN AFTER;";
-pub(crate) const TX_CREATE_FENCE: &str =
-    "CREATE type::record($fence_table, $fence_key) CONTENT $fence RETURN AFTER;";
-/// Upsert of one revision head. Exactly one revision key exists per transition.
-pub(crate) const TX_UPSERT_REVISION: &str = "UPDATE type::record($revision_table, $revision_key) CONTENT $revision_record WHERE body.revision = $expected_revision AND body.state_fence = $expected_state_fence RETURN AFTER;";
-pub(crate) const TX_CREATE_REVISION: &str =
-    "CREATE type::record($revision_table, $revision_key) CONTENT $revision_record RETURN AFTER;";
-/// Upsert of one ordering head. `{i}` selects the binding index.
-pub(crate) const TX_UPSERT_ORDERING: &str = "LET $ordering_cas{i} = (UPSERT type::record($ordering_table{i}, $ordering_scope{i}) CONTENT $ordering_record{i} WHERE body.sequence = $expected_ordering_sequence{i} AND body.state_fence = $expected_state_fence RETURN AFTER); IF array::len($ordering_cas{i} ?? []) = 0 { THROW 'ordering_head_cas_conflict'; };";
-pub(crate) const TX_CREATE_ORDERING: &str = "CREATE type::record($ordering_table{i}, $ordering_scope{i}) CONTENT $ordering_record{i} RETURN AFTER;";
+/// Compare-and-set update of the canonical fence singleton.
+pub(crate) const TX_UPSERT_FENCE: &str = "LET $fence_cas = (UPDATE type::record($fence_table, $fence_key) CONTENT $fence WHERE state_fence = $expected_state_fence AND next_commit_sequence = $expected_commit_sequence AND next_outbox_sequence = $expected_outbox_sequence RETURN AFTER); IF array::len($fence_cas ?? []) != 1 { THROW 'canonical_fence_cas_conflict'; };";
+pub(crate) const TX_CREATE_FENCE: &str = "LET $fence_create = (CREATE type::record($fence_table, $fence_key) CONTENT $fence RETURN AFTER); IF array::len($fence_create ?? []) != 1 { THROW 'canonical_fence_create_conflict'; };";
+/// Compare-and-set update of one revision head. Exactly one revision key exists per transition.
+pub(crate) const TX_UPSERT_REVISION: &str = "LET $revision_cas = (UPDATE type::record($revision_table, $revision_key) CONTENT $revision_record WHERE body.revision = $expected_revision AND body.state_fence = $expected_state_fence RETURN AFTER); IF array::len($revision_cas ?? []) != 1 { THROW 'revision_head_cas_conflict'; };";
+pub(crate) const TX_CREATE_REVISION: &str = "LET $revision_create = (CREATE type::record($revision_table, $revision_key) CONTENT $revision_record RETURN AFTER); IF array::len($revision_create ?? []) != 1 { THROW 'revision_head_create_conflict'; };";
+/// Compare-and-set update of one ordering head. `{i}` selects the binding index.
+pub(crate) const TX_UPSERT_ORDERING: &str = "LET $ordering_cas{i} = (UPDATE type::record($ordering_table{i}, $ordering_scope{i}) CONTENT $ordering_record{i} WHERE body.sequence = $expected_ordering_sequence{i} AND body.state_fence = $expected_state_fence RETURN AFTER); IF array::len($ordering_cas{i} ?? []) != 1 { THROW 'ordering_head_cas_conflict'; };";
+pub(crate) const TX_CREATE_ORDERING: &str = "LET $ordering_create{i} = (CREATE type::record($ordering_table{i}, $ordering_scope{i}) CONTENT $ordering_record{i} RETURN AFTER); IF array::len($ordering_create{i} ?? []) != 1 { THROW 'ordering_head_create_conflict'; };";
 /// Create of one canonical event (immutable). `{i}` selects the binding index.
 pub(crate) const TX_CREATE_EVENT: &str =
     "CREATE type::record($event_table{i}, $event_id{i}) CONTENT $event{i};";

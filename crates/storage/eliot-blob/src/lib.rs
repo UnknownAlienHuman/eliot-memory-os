@@ -23,7 +23,16 @@
 #![allow(clippy::missing_errors_doc)]
 
 use std::collections::BTreeSet;
-use std::sync::{Arc, Mutex, MutexGuard, OnceLock, RwLock, RwLockReadGuard, RwLockWriteGuard};
+use std::fmt;
+use std::fs::{self, OpenOptions};
+use std::io::{Read, Seek, SeekFrom};
+use std::path::{Path, PathBuf};
+use std::sync::{
+    Arc, Mutex, MutexGuard, OnceLock, RwLock, RwLockReadGuard, RwLockWriteGuard,
+    atomic::{AtomicBool, AtomicU64, Ordering},
+};
+use std::thread::{self, JoinHandle};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use blake3::Hasher;
 use eliot_blob_api::{
@@ -51,20 +60,97 @@ const MAX_BLOB_PLAINTEXT_BYTES: u64 = 32 * 1024 * 1024;
 const MAX_METADATA_BYTES: u64 = 64 * 1024;
 const MAX_JOURNAL_BYTES: u64 = 64 * 1024;
 const SHARD_COUNT: usize = 64;
+const ROOT_LEASE_FILE: &str = ".eliot-root.lock";
+const ROOT_LEASE_VERSION: u32 = 1;
+const ROOT_LEASE_HEARTBEAT_MS: u64 = 1_000;
+const ROOT_LEASE_TIMEOUT_MS: u64 = 15_000;
+#[cfg(windows)]
+const WINDOWS_REPARSE_POINT: u32 = 0x400;
+
+static ROOT_LEASE_TOKEN_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 /// The process-owned S-04 root claim used by composition roots that do not
-/// expose a second Blob service seam. Claiming is process-scoped and
-/// single-use: a second composition for the same process/root identity is
-/// rejected instead of silently creating another root owner.
-#[derive(Clone, Debug, Eq, PartialEq)]
+/// expose a second Blob service seam. The claim is backed by an OS-visible
+/// lease file in the canonical root, so a second process cannot silently own
+/// the same root. A bounded heartbeat permits recovery after an owner exits
+/// without dropping the lease; the process-local set below is only a
+/// secondary same-process defense.
+#[derive(Clone)]
 pub struct BlobRootOwner {
     root_id: String,
     owner_id: BlobId,
     process_id: u32,
     claim_id: String,
+    lease: Arc<RootLeaseState>,
 }
 
 static PROCESS_ROOT_CLAIMS: OnceLock<Mutex<BTreeSet<String>>> = OnceLock::new();
+
+#[derive(Debug, Deserialize, Serialize)]
+struct RootLeaseRecord {
+    version: u32,
+    token: String,
+    root_id: String,
+    process_id: u32,
+    heartbeat_unix_ms: u64,
+}
+
+struct RootLeaseState {
+    root_id: String,
+    lock_path: PathBuf,
+    token: String,
+    stop: Arc<AtomicBool>,
+    heartbeat: Mutex<Option<JoinHandle<()>>>,
+}
+
+impl fmt::Debug for RootLeaseState {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RootLeaseState")
+            .field("root_id", &self.root_id)
+            .field("lock_path", &self.lock_path)
+            .field("token", &"[REDACTED]")
+            .finish()
+    }
+}
+
+impl Drop for RootLeaseState {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Release);
+        if let Ok(mut heartbeat) = self.heartbeat.lock()
+            && let Some(handle) = heartbeat.take()
+            && handle.thread().id() != thread::current().id()
+        {
+            let _ = handle.join();
+        }
+        release_root_lease(&self.lock_path, &self.token);
+        remove_process_claim(&self.root_id);
+    }
+}
+
+impl fmt::Debug for BlobRootOwner {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("BlobRootOwner")
+            .field("root_id", &self.root_id)
+            .field("owner_id", &self.owner_id)
+            .field("process_id", &self.process_id)
+            .field("claim_id", &self.claim_id)
+            .field("lease", &self.lease)
+            .finish()
+    }
+}
+
+impl PartialEq for BlobRootOwner {
+    fn eq(&self, other: &Self) -> bool {
+        self.root_id == other.root_id
+            && self.owner_id == other.owner_id
+            && self.process_id == other.process_id
+            && self.claim_id == other.claim_id
+    }
+}
+
+impl Eq for BlobRootOwner {}
 
 impl BlobRootOwner {
     /// Claims exactly one process/root identity. Physical path containment,
@@ -76,27 +162,74 @@ impl BlobRootOwner {
         owner_id: impl Into<String>,
         process_id: u32,
     ) -> Result<Self, BlobError> {
-        let root_id = root_id.into();
-        if root_id.trim().is_empty() || root_id.chars().any(char::is_control) || process_id == 0 {
+        let configured_root = root_id.into();
+        if configured_root.trim().is_empty()
+            || configured_root.chars().any(char::is_control)
+            || process_id == 0
+        {
             return Err(BlobError::InvalidContract(
                 "Blob root claim requires a non-blank root and process identity".to_owned(),
             ));
         }
         let owner_id = BlobId::new(owner_id)?;
-        let claim_id = format!("process:{process_id}:root:{root_id}:owner:{owner_id}");
-        let root_claim_key = format!("process:{process_id}:root:{root_id}");
+        let (canonical_path, root_claim_key) = canonical_root(&configured_root)?;
+        let (lock_path, token) = acquire_root_lease(&canonical_path, &root_claim_key, process_id)?;
         let claims = PROCESS_ROOT_CLAIMS.get_or_init(|| Mutex::new(BTreeSet::new()));
-        let mut claims = claims
-            .lock()
-            .map_err(|_| BlobError::Provider("Blob root claim lock poisoned".to_owned()))?;
-        if !claims.insert(root_claim_key) {
+        let mut claims = match claims.lock() {
+            Ok(claims) => claims,
+            Err(_) => {
+                release_root_lease(&lock_path, &token);
+                return Err(BlobError::Provider(
+                    "Blob root claim lock poisoned".to_owned(),
+                ));
+            }
+        };
+        if !claims.insert(root_claim_key.clone()) {
+            release_root_lease(&lock_path, &token);
             return Err(BlobError::OwnerConflict);
         }
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let heartbeat_stop = Arc::clone(&stop);
+        let heartbeat_path = lock_path.clone();
+        let heartbeat_token = token.clone();
+        let heartbeat_root = root_claim_key.clone();
+        let heartbeat = match thread::Builder::new()
+            .name("eliot-blob-root-lease".to_owned())
+            .spawn(move || {
+                heartbeat_root_lease(
+                    heartbeat_path,
+                    heartbeat_token,
+                    heartbeat_root,
+                    heartbeat_stop,
+                )
+            }) {
+            Ok(handle) => handle,
+            Err(error) => {
+                claims.remove(&root_claim_key);
+                release_root_lease(&lock_path, &token);
+                return Err(BlobError::Provider(format!(
+                    "start Blob root lease heartbeat: {error}"
+                )));
+            }
+        };
+        drop(claims);
+
+        let lease = Arc::new(RootLeaseState {
+            root_id: root_claim_key.clone(),
+            lock_path,
+            token: token.clone(),
+            stop,
+            heartbeat: Mutex::new(Some(heartbeat)),
+        });
+        let claim_id =
+            format!("process:{process_id}:root:{root_claim_key}:owner:{owner_id}:lease:{token}");
         Ok(Self {
-            root_id,
+            root_id: root_claim_key.clone(),
             owner_id,
             process_id,
             claim_id,
+            lease,
         })
     }
 
@@ -118,6 +251,244 @@ impl BlobRootOwner {
     #[must_use]
     pub fn claim_id(&self) -> &str {
         &self.claim_id
+    }
+}
+
+fn canonical_root(configured_root: &str) -> Result<(PathBuf, String), BlobError> {
+    let configured = PathBuf::from(configured_root);
+    reject_reparse_components(&configured)?;
+    fs::create_dir_all(&configured).map_err(|error| {
+        BlobError::Provider(format!(
+            "create configured Blob root {}: {error}",
+            configured.display()
+        ))
+    })?;
+    let metadata = fs::symlink_metadata(&configured).map_err(|error| {
+        BlobError::Provider(format!(
+            "inspect configured Blob root {}: {error}",
+            configured.display()
+        ))
+    })?;
+    if !metadata.is_dir() {
+        return Err(BlobError::InvalidContract(
+            "Blob root must resolve to a directory".to_owned(),
+        ));
+    }
+    if is_reparse_point(&metadata) {
+        return Err(BlobError::InvalidContract(
+            "Blob root reparse points are not permitted".to_owned(),
+        ));
+    }
+    let canonical = fs::canonicalize(&configured).map_err(|error| {
+        BlobError::Provider(format!(
+            "canonicalize configured Blob root {}: {error}",
+            configured.display()
+        ))
+    })?;
+    reject_reparse_components(&canonical)?;
+    let identity = canonical_identity(&canonical);
+    Ok((canonical, identity))
+}
+
+fn canonical_identity(path: &Path) -> String {
+    let mut identity = path.to_string_lossy().replace('\\', "/");
+    if cfg!(windows) {
+        identity.make_ascii_lowercase();
+    }
+    identity
+}
+
+fn reject_reparse_components(path: &Path) -> Result<(), BlobError> {
+    let mut current = Some(path);
+    while let Some(candidate) = current {
+        if let Ok(metadata) = fs::symlink_metadata(candidate) {
+            if is_reparse_point(&metadata) {
+                return Err(BlobError::InvalidContract(format!(
+                    "Blob root contains reparse component {}",
+                    candidate.display()
+                )));
+            }
+        }
+        current = candidate.parent();
+    }
+    Ok(())
+}
+
+fn is_reparse_point(metadata: &fs::Metadata) -> bool {
+    if metadata.file_type().is_symlink() {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+
+        return metadata.file_attributes() & WINDOWS_REPARSE_POINT != 0;
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
+}
+
+fn now_unix_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| {
+            duration.as_millis().min(u64::MAX as u128) as u64
+        })
+}
+
+fn lease_token(process_id: u32) -> String {
+    let sequence = ROOT_LEASE_TOKEN_COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!("{process_id}-{}-{sequence}", now_unix_ms())
+}
+
+fn acquire_root_lease(
+    root: &Path,
+    root_id: &str,
+    process_id: u32,
+) -> Result<(PathBuf, String), BlobError> {
+    let lock_path = root.join(ROOT_LEASE_FILE);
+    let token = lease_token(process_id);
+    for attempt in 0..2 {
+        match OpenOptions::new()
+            .create_new(true)
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+        {
+            Ok(mut file) => {
+                let record = RootLeaseRecord {
+                    version: ROOT_LEASE_VERSION,
+                    token: token.clone(),
+                    root_id: root_id.to_owned(),
+                    process_id,
+                    heartbeat_unix_ms: now_unix_ms(),
+                };
+                if let Err(error) = write_lease_record(&mut file, &record) {
+                    let _ = fs::remove_file(&lock_path);
+                    return Err(BlobError::Provider(format!(
+                        "write Blob root lease {}: {error}",
+                        lock_path.display()
+                    )));
+                }
+                return Ok((lock_path, token));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists && attempt == 0 => {
+                if !reclaim_stale_root_lease(&lock_path)? {
+                    return Err(BlobError::OwnerConflict);
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                return Err(BlobError::OwnerConflict);
+            }
+            Err(error) => {
+                return Err(BlobError::Provider(format!(
+                    "open Blob root lease {}: {error}",
+                    lock_path.display()
+                )));
+            }
+        }
+    }
+    Err(BlobError::OwnerConflict)
+}
+
+fn write_lease_record(file: &mut fs::File, record: &RootLeaseRecord) -> std::io::Result<()> {
+    file.set_len(0)?;
+    file.seek(SeekFrom::Start(0))?;
+    serde_json::to_writer(&mut *file, record).map_err(std::io::Error::other)?;
+    file.sync_all()
+}
+
+fn reclaim_stale_root_lease(lock_path: &Path) -> Result<bool, BlobError> {
+    let metadata = fs::symlink_metadata(lock_path).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            BlobError::OwnerConflict
+        } else {
+            BlobError::Provider(format!(
+                "inspect Blob root lease {}: {error}",
+                lock_path.display()
+            ))
+        }
+    })?;
+    if is_reparse_point(&metadata) {
+        return Err(BlobError::InvalidContract(
+            "Blob root lease reparse points are not permitted".to_owned(),
+        ));
+    }
+    let stale = match fs::read_to_string(lock_path)
+        .ok()
+        .and_then(|raw| serde_json::from_str::<RootLeaseRecord>(&raw).ok())
+    {
+        Some(record) => {
+            now_unix_ms().saturating_sub(record.heartbeat_unix_ms) >= ROOT_LEASE_TIMEOUT_MS
+        }
+        None => metadata
+            .modified()
+            .ok()
+            .and_then(|modified| modified.elapsed().ok())
+            .is_some_and(|age| age >= Duration::from_millis(ROOT_LEASE_TIMEOUT_MS)),
+    };
+    if !stale {
+        return Ok(false);
+    }
+    match fs::remove_file(lock_path) {
+        Ok(()) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(true),
+        Err(error) => Err(BlobError::Provider(format!(
+            "reclaim stale Blob root lease {}: {error}",
+            lock_path.display()
+        ))),
+    }
+}
+
+fn heartbeat_root_lease(lock_path: PathBuf, token: String, root_id: String, stop: Arc<AtomicBool>) {
+    while !stop.load(Ordering::Acquire) {
+        thread::sleep(Duration::from_millis(ROOT_LEASE_HEARTBEAT_MS));
+        if stop.load(Ordering::Acquire) {
+            break;
+        }
+        let Ok(mut file) = OpenOptions::new().read(true).write(true).open(&lock_path) else {
+            break;
+        };
+        let mut raw = String::new();
+        if file.read_to_string(&mut raw).is_err() {
+            break;
+        }
+        let Ok(mut record) = serde_json::from_str::<RootLeaseRecord>(&raw) else {
+            break;
+        };
+        if record.version != ROOT_LEASE_VERSION
+            || record.token != token
+            || record.root_id != root_id
+        {
+            break;
+        }
+        record.heartbeat_unix_ms = now_unix_ms();
+        if write_lease_record(&mut file, &record).is_err() {
+            break;
+        }
+    }
+}
+
+fn release_root_lease(lock_path: &Path, token: &str) {
+    let Ok(raw) = fs::read_to_string(lock_path) else {
+        return;
+    };
+    let Ok(record) = serde_json::from_str::<RootLeaseRecord>(&raw) else {
+        return;
+    };
+    if record.token == token {
+        let _ = fs::remove_file(lock_path);
+    }
+}
+
+fn remove_process_claim(root_id: &str) {
+    let Some(claims) = PROCESS_ROOT_CLAIMS.get() else {
+        return;
+    };
+    if let Ok(mut claims) = claims.lock() {
+        claims.remove(root_id);
     }
 }
 

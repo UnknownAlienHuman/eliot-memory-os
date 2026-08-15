@@ -12,6 +12,8 @@ use secrecy::SecretString;
 
 /// Stable identity of this adapter surface.
 pub const ADAPTER_NAME: &str = "eliot.storage.store-surreal-adapter";
+/// SurrealDB major version admitted by the pinned adapter/query surface.
+pub const PINNED_SURREALDB_MAJOR: u16 = 3;
 
 /// Non-blank, non-control-character schema generation identifier.
 #[derive(Clone, Debug, Eq, Hash, PartialEq, PartialOrd, Ord)]
@@ -66,6 +68,8 @@ pub struct SurrealAdapterConfig {
     pub connect_timeout_ms: u64,
     /// Query deadline in milliseconds.
     pub query_timeout_ms: u64,
+    /// SurrealDB server major version required by the pinned query surface.
+    pub expected_provider_major: u16,
     /// Schema generation this bridge expects the database to be migrated to.
     pub expected_schema_generation: SchemaGeneration,
 }
@@ -81,6 +85,7 @@ impl fmt::Debug for SurrealAdapterConfig {
             .field("password", &"[REDACTED]")
             .field("connect_timeout_ms", &self.connect_timeout_ms)
             .field("query_timeout_ms", &self.query_timeout_ms)
+            .field("expected_provider_major", &self.expected_provider_major)
             .field(
                 "expected_schema_generation",
                 &self.expected_schema_generation,
@@ -103,6 +108,11 @@ impl SurrealAdapterConfig {
         if self.connect_timeout_ms == 0 || self.query_timeout_ms == 0 {
             return Err(ConfigError::InvalidTimeout);
         }
+        if self.expected_provider_major != PINNED_SURREALDB_MAJOR {
+            return Err(ConfigError::UnsupportedProviderMajor {
+                expected: PINNED_SURREALDB_MAJOR,
+            });
+        }
         Ok(())
     }
 }
@@ -121,6 +131,8 @@ pub enum ConfigError {
     InvalidEndpoint,
     #[error("timeouts must be non-zero")]
     InvalidTimeout,
+    #[error("provider major version must be the pinned SurrealDB {expected}.x line")]
+    UnsupportedProviderMajor { expected: u16 },
     #[error("invalid field {field}")]
     InvalidField { field: &'static str },
 }
@@ -140,6 +152,7 @@ mod tests {
             password: SecretString::new("test-secret".into()),
             connect_timeout_ms: 1_000,
             query_timeout_ms: 1_000,
+            expected_provider_major: PINNED_SURREALDB_MAJOR,
             expected_schema_generation: SchemaGeneration::new("1.0.0").expect("valid generation"),
         }
     }

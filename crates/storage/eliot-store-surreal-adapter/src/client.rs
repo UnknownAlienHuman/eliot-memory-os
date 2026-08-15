@@ -55,6 +55,11 @@ struct RpcErrorBody {
     data: Option<Value>,
 }
 
+#[derive(Debug, Deserialize)]
+struct SurrealVersionResponse {
+    version: String,
+}
+
 /// Decoded results of one parameterized provider query.  Each entry is the
 /// `result` member of one statement in order; provider `ERR` statuses remain
 /// observable to the caller so write paths can classify them as unknown.
@@ -113,7 +118,8 @@ impl RpcResults {
 struct RpcRequest<'a> {
     id: String,
     method: &'a str,
-    params: Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    params: Option<Value>,
 }
 
 impl RpcTransport {
@@ -145,6 +151,9 @@ impl RpcTransport {
             transport.signin(&config.username, &config.password).await?;
             transport
                 .use_ns_db(&config.namespace, &config.database)
+                .await?;
+            transport
+                .verify_provider_version(config.expected_provider_major)
                 .await
         })
         .await
@@ -175,6 +184,39 @@ impl RpcTransport {
         .map(|_| ())
     }
 
+    async fn verify_provider_version(&self, expected_major: u16) -> Result<(), AdapterError> {
+        let value = self
+            .request_without_params("provider.version", "version")
+            .await
+            .map_err(|error| match error {
+                AdapterError::ProviderUnavailable => AdapterError::Config(
+                    "SurrealDB version RPC is required for the pinned 3.x compatibility gate"
+                        .to_owned(),
+                ),
+                error => error,
+            })?;
+        let response: SurrealVersionResponse = serde_json::from_value(value).map_err(|error| {
+            AdapterError::Serialization(format!("invalid SurrealDB version RPC result: {error}"))
+        })?;
+        let major = response
+            .version
+            .split('.')
+            .next()
+            .and_then(|value| value.parse::<u16>().ok())
+            .ok_or_else(|| {
+                AdapterError::Config(format!(
+                    "SurrealDB version RPC returned an invalid version: {}",
+                    response.version
+                ))
+            })?;
+        if major != expected_major {
+            return Err(AdapterError::Config(format!(
+                "SurrealDB server major {major} is incompatible with pinned major {expected_major}"
+            )));
+        }
+        Ok(())
+    }
+
     /// Executes one closed named operation using SurrealDB's parameterized
     /// `query` RPC.  The statement is private schema data; callers provide a
     /// name and bindings rather than a provider client or query result type.
@@ -202,9 +244,38 @@ impl RpcTransport {
     ) -> Result<Value, AdapterError> {
         let id = format!("{RPC_PROTOCOL_VERSION}:{operation}:{}", Uuid::new_v4());
         let expected_id = Value::String(id.clone());
-        let payload = serde_json::to_string(&RpcRequest { id, method, params })
-            .map_err(|error| AdapterError::Serialization(error.to_string()))?;
+        let payload = serde_json::to_string(&RpcRequest {
+            id,
+            method,
+            params: Some(params),
+        })
+        .map_err(|error| AdapterError::Serialization(error.to_string()))?;
 
+        self.request_payload(payload, expected_id).await
+    }
+
+    async fn request_without_params(
+        &self,
+        operation: &'static str,
+        method: &'static str,
+    ) -> Result<Value, AdapterError> {
+        let id = format!("{RPC_PROTOCOL_VERSION}:{operation}:{}", Uuid::new_v4());
+        let expected_id = Value::String(id.clone());
+        let payload = serde_json::to_string(&RpcRequest {
+            id,
+            method,
+            params: None,
+        })
+        .map_err(|error| AdapterError::Serialization(error.to_string()))?;
+
+        self.request_payload(payload, expected_id).await
+    }
+
+    async fn request_payload(
+        &self,
+        payload: String,
+        expected_id: Value,
+    ) -> Result<Value, AdapterError> {
         timeout(self.request_timeout, async {
             let mut socket = self.socket.lock().await;
             socket

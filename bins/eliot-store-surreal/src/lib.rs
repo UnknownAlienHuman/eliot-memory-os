@@ -19,8 +19,8 @@ use eliot_store_api::{
     WriteReceipt,
 };
 use eliot_store_surreal_adapter::{
-    AdapterError, AdapterHealth, MigrationReceipt, SchemaGeneration, SemanticReadiness,
-    SurrealAdapterConfig, SurrealStoreAdapter,
+    AdapterError, AdapterHealth, MigrationReceipt, PINNED_SURREALDB_MAJOR, SchemaGeneration,
+    SemanticReadiness, SurrealAdapterConfig, SurrealStoreAdapter,
 };
 use eliot_types::{CredentialProviderKind, GovernorConfig};
 use secrecy::SecretString;
@@ -152,6 +152,7 @@ fn adapter_config(config: &GovernorConfig) -> Result<SurrealAdapterConfig, Strin
         password: resolve_surreal_password(config)?,
         connect_timeout_ms: config.db.surreal.startup_timeout_ms,
         query_timeout_ms: config.db.surreal.query_timeout_ms,
+        expected_provider_major: PINNED_SURREALDB_MAJOR,
         expected_schema_generation: schema_generation,
     })
 }
