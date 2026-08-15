@@ -10,8 +10,6 @@
 #![warn(missing_docs)]
 
 use std::collections::BTreeSet;
-use std::fs;
-use std::io::Read;
 use std::path::Path;
 
 use eliot_contracts::{
@@ -21,9 +19,7 @@ use eliot_platform::{
     InstallationObservation, InstallationPort, InstallationRequest, PlatformHandle, PortError,
     PortOutcome,
 };
-use eliot_platform_windows::{
-    prepare_protected_directory, require_protected_program_data_path, validate_protected_file,
-};
+use eliot_platform_windows::{ProtectedPathLease, require_protected_program_data_path};
 use redb::{Database, ReadableDatabase, TableDefinition};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -166,58 +162,53 @@ fn approved_path(value: &PlatformHandle, field: &str) -> Result<(), Installation
     Ok(())
 }
 
-/// Canonicalizes one installation-owned file and verifies its complete
-/// contents against an approved lowercase SHA-256 digest.
+const MAX_VERIFIED_FILE_BYTES: u64 = 512 * 1024 * 1024;
+
+/// Opens one installation-owned file through the protected no-follow lease,
+/// hashes bytes from that retained handle, and verifies the approved digest.
 ///
-/// The returned path is the exact canonical path that was hashed. Callers may
-/// use it only as a locator after this verification; the digest remains the
-/// authority for launch admission.
+/// The returned path is only a locator. Callers that need replacement
+/// protection across a launch boundary must retain their own
+/// [`ProtectedPathLease`] and use [`verify_file_digest_with_lease`].
 pub fn verify_file_digest(
     path: impl AsRef<Path>,
     expected: &PlatformHandle,
     field: &str,
 ) -> Result<std::path::PathBuf, InstallationError> {
+    let lease = ProtectedPathLease::open_existing_absolute(path.as_ref()).map_err(|error| {
+        InstallationError::Platform(format!("{field}: protected file open failed: {error}"))
+    })?;
+    verify_file_digest_with_lease(&lease, expected, field)?;
+    Ok(lease.path().to_path_buf())
+}
+
+/// Verifies bytes from an already-retained protected file handle.  No path
+/// open occurs during hashing, so the caller can keep the same identity pinned
+/// through a suspended process resume boundary.
+pub fn verify_file_digest_with_lease(
+    lease: &ProtectedPathLease,
+    expected: &PlatformHandle,
+    field: &str,
+) -> Result<(), InstallationError> {
     sha256_handle(expected, field)?;
-    let path = path.as_ref();
-    let metadata = fs::symlink_metadata(path)
+    lease
+        .verify_stable_identity()
         .map_err(|error| InstallationError::Platform(format!("{field}: {error}")))?;
-    if metadata.file_type().is_symlink() || !metadata.is_file() {
-        return Err(InstallationError::InvalidField {
-            field: field.to_owned(),
-            reason: "must name a regular non-symlink file".to_owned(),
-        });
-    }
-    let canonical = fs::canonicalize(path)
+    lease
+        .verify_path_identity()
         .map_err(|error| InstallationError::Platform(format!("{field}: {error}")))?;
-    let canonical_metadata = fs::metadata(&canonical)
+    let bytes = lease
+        .read_bounded(MAX_VERIFIED_FILE_BYTES)
         .map_err(|error| InstallationError::Platform(format!("{field}: {error}")))?;
-    if !canonical_metadata.is_file() {
-        return Err(InstallationError::InvalidField {
-            field: field.to_owned(),
-            reason: "canonical path is not a regular file".to_owned(),
-        });
-    }
-    let mut file = fs::File::open(&canonical)
-        .map_err(|error| InstallationError::Platform(format!("{field}: {error}")))?;
-    let mut digest = Sha256::new();
-    let mut buffer = [0_u8; 64 * 1024];
-    loop {
-        let read = file
-            .read(&mut buffer)
-            .map_err(|error| InstallationError::Platform(format!("{field}: {error}")))?;
-        if read == 0 {
-            break;
-        }
-        digest.update(&buffer[..read]);
-    }
-    let actual = format!("{:x}", digest.finalize());
+    let digest = Sha256::digest(&bytes);
+    let actual = format!("{:x}", digest);
     if actual != expected.as_str() {
         return Err(InstallationError::InvalidField {
             field: field.to_owned(),
             reason: format!("content digest mismatch (actual {actual})"),
         });
     }
-    Ok(canonical)
+    Ok(())
 }
 
 /// Verifies that a caller-supplied locator resolves to the exact canonical
@@ -236,59 +227,27 @@ pub fn verify_approved_path(
             reason: "approved and supplied paths must be absolute".to_owned(),
         });
     }
-    for (label, value) in [("approved", approved_path), ("supplied", candidate_path)] {
-        let metadata = fs::symlink_metadata(value)
-            .map_err(|error| InstallationError::Platform(format!("{field} {label}: {error}")))?;
-        if metadata.file_type().is_symlink() || !metadata.is_file() {
-            return Err(InstallationError::InvalidField {
-                field: field.to_owned(),
-                reason: format!("{label} path must be a regular non-symlink file"),
-            });
-        }
-        reject_reparse_ancestors(value, field, label)?;
-    }
-    let approved_canonical = fs::canonicalize(approved_path)
+    let approved_lease = ProtectedPathLease::open_existing_absolute(approved_path)
         .map_err(|error| InstallationError::Platform(format!("{field} approved: {error}")))?;
-    let candidate_canonical = fs::canonicalize(candidate_path)
+    let candidate_lease = ProtectedPathLease::open_existing_absolute(candidate_path)
         .map_err(|error| InstallationError::Platform(format!("{field} supplied: {error}")))?;
-    if candidate_canonical != approved_canonical {
+    approved_lease
+        .verify_stable_identity()
+        .and_then(|()| approved_lease.verify_path_identity())
+        .map_err(|error| InstallationError::Platform(format!("{field} approved: {error}")))?;
+    candidate_lease
+        .verify_stable_identity()
+        .and_then(|()| candidate_lease.verify_path_identity())
+        .map_err(|error| InstallationError::Platform(format!("{field} supplied: {error}")))?;
+    if candidate_lease.path() != approved_lease.path()
+        || candidate_lease.identity() != approved_lease.identity()
+    {
         return Err(InstallationError::InvalidField {
             field: field.to_owned(),
             reason: "supplied path is not the approved canonical path".to_owned(),
         });
     }
-    Ok(approved_canonical)
-}
-
-fn reject_reparse_ancestors(
-    path: &Path,
-    field: &str,
-    label: &str,
-) -> Result<(), InstallationError> {
-    for ancestor in path.ancestors() {
-        let metadata = fs::symlink_metadata(ancestor)
-            .map_err(|error| InstallationError::Platform(format!("{field} {label}: {error}")))?;
-        if metadata.file_type().is_symlink() || is_reparse_point(&metadata) {
-            return Err(InstallationError::InvalidField {
-                field: field.to_owned(),
-                reason: format!("{label} path traverses a reparse point"),
-            });
-        }
-    }
-    Ok(())
-}
-
-#[cfg(windows)]
-fn is_reparse_point(metadata: &fs::Metadata) -> bool {
-    use std::os::windows::fs::MetadataExt;
-    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
-
-    metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
-}
-
-#[cfg(not(windows))]
-fn is_reparse_point(_metadata: &fs::Metadata) -> bool {
-    false
+    Ok(approved_lease.path().to_path_buf())
 }
 
 fn handles(
@@ -786,6 +745,7 @@ const REGISTRY_RELATIVE_PATH: &str = "Eliot/host/installation-registry.redb";
 /// Durable redb owner for approved generations and LKG activation state.
 pub struct RedbInstallationRegistry {
     database: Database,
+    _path_lease: ProtectedPathLease,
 }
 
 impl RedbInstallationRegistry {
@@ -794,20 +754,22 @@ impl RedbInstallationRegistry {
         let path = path.as_ref();
         require_protected_program_data_path(path, REGISTRY_RELATIVE_PATH)
             .map_err(|error| InstallationError::Platform(error.to_string()))?;
-        let parent = path
-            .parent()
-            .ok_or_else(|| InstallationError::Platform("registry path has no parent".to_owned()))?;
-        prepare_protected_directory(parent)
+        let path_lease = ProtectedPathLease::open_or_create(REGISTRY_RELATIVE_PATH)
             .map_err(|error| InstallationError::Platform(error.to_string()))?;
-        if fs::symlink_metadata(path).is_ok() {
-            validate_protected_file(path)
-                .map_err(|error| InstallationError::Platform(error.to_string()))?;
+        if path_lease.path() != path {
+            return Err(InstallationError::Platform(
+                "registry path is not the exact protected ProgramData path".to_owned(),
+            ));
         }
-        let database = Database::create(path)
+        let database = Database::create(path_lease.path())
             .map_err(|error| InstallationError::Platform(error.to_string()))?;
-        validate_protected_file(path)
+        path_lease
+            .verify_path_identity()
             .map_err(|error| InstallationError::Platform(error.to_string()))?;
-        Ok(Self { database })
+        Ok(Self {
+            database,
+            _path_lease: path_lease,
+        })
     }
 
     /// Loads the registry, returning an empty value on first use.

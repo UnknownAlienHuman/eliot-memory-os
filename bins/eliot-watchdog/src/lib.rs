@@ -6,7 +6,6 @@
 
 #![forbid(unsafe_code)]
 
-use std::fs;
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
@@ -17,8 +16,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use eliot_contracts::{AuthorityEpoch, sha256_hex};
 use eliot_installation::RedbInstallationRegistry;
 use eliot_platform_windows::{
-    prepare_protected_directory, protected_program_data_path, read_protected_file,
-    require_protected_program_data_path, validate_protected_file,
+    ProtectedPathLease, protected_program_data_path, require_protected_program_data_path,
 };
 use eliot_runtime::{
     ChildClass, Runtime, RuntimeConfig, ShutdownOutcome, SupervisionStrategy, TaskFailure,
@@ -217,13 +215,39 @@ pub struct WatchdogSpoolEntry {
 #[derive(Debug)]
 struct WatchdogSpool {
     database: Database,
+    _path_lease: Option<ProtectedPathLease>,
 }
 
 impl WatchdogSpool {
     fn open(path: &Path) -> Result<Self, SpoolError> {
+        require_protected_program_data_path(path, SPOOL_RELATIVE_PATH)
+            .map_err(|_| SpoolError::InvalidProtectedRoot)?;
+        let path_lease = ProtectedPathLease::open_or_create(SPOOL_RELATIVE_PATH)
+            .map_err(|_| SpoolError::InvalidProtectedRoot)?;
+        if path_lease.path() != path {
+            return Err(SpoolError::InvalidProtectedRoot);
+        }
+        let database = Database::create(path_lease.path())
+            .map_err(|error| SpoolError::Database(error.to_string()))?;
+        path_lease
+            .verify_path_identity()
+            .map_err(|_| SpoolError::InvalidProtectedRoot)?;
+        let spool = Self {
+            database,
+            _path_lease: Some(path_lease),
+        };
+        spool.initialize_or_recover()?;
+        Ok(spool)
+    }
+
+    #[cfg(test)]
+    fn open_test(path: &Path) -> Result<Self, SpoolError> {
         let database =
             Database::create(path).map_err(|error| SpoolError::Database(error.to_string()))?;
-        let spool = Self { database };
+        let spool = Self {
+            database,
+            _path_lease: None,
+        };
         spool.initialize_or_recover()?;
         Ok(spool)
     }
@@ -566,13 +590,7 @@ impl IndependentKernelSensor {
         let spool = path.into();
         require_protected_program_data_path(&spool, SPOOL_RELATIVE_PATH)
             .map_err(|_| SpoolError::InvalidProtectedRoot)?;
-        let parent = spool.parent().ok_or(SpoolError::InvalidProtectedRoot)?;
-        prepare_protected_directory(parent).map_err(|_| SpoolError::InvalidProtectedRoot)?;
-        if fs::symlink_metadata(&spool).is_ok() {
-            validate_protected_file(&spool).map_err(|_| SpoolError::InvalidProtectedRoot)?;
-        }
         let spool_store = WatchdogSpool::open(&spool)?;
-        validate_protected_file(&spool).map_err(|_| SpoolError::InvalidProtectedRoot)?;
         let watchdog = Watchdog::new(
             eliot_watchdog_core::WatchdogConfig::default(),
             Epoch(watchdog_epoch),
@@ -601,10 +619,21 @@ impl IndependentKernelSensor {
         let path = path.as_ref();
         require_protected_program_data_path(path, SPOOL_RELATIVE_PATH)
             .map_err(|_| SpoolError::InvalidProtectedRoot)?;
-        validate_protected_file(path).map_err(|_| SpoolError::InvalidProtectedRoot)?;
-        let database =
-            Database::open(path).map_err(|error| SpoolError::Database(error.to_string()))?;
-        WatchdogSpool { database }.readback()
+        let path_lease = ProtectedPathLease::open_existing(SPOOL_RELATIVE_PATH)
+            .map_err(|_| SpoolError::InvalidProtectedRoot)?;
+        if path_lease.path() != path {
+            return Err(SpoolError::InvalidProtectedRoot);
+        }
+        let database = Database::open(path_lease.path())
+            .map_err(|error| SpoolError::Database(error.to_string()))?;
+        path_lease
+            .verify_path_identity()
+            .map_err(|_| SpoolError::InvalidProtectedRoot)?;
+        WatchdogSpool {
+            database,
+            _path_lease: Some(path_lease),
+        }
+        .readback()
     }
 
     fn record_heartbeat(
@@ -974,7 +1003,6 @@ pub fn load_supervision_lease(
     ] {
         require_protected_program_data_path(path, relative)
             .map_err(|_| SpoolError::InvalidProtectedRoot)?;
-        validate_protected_file(path).map_err(|_| SpoolError::InvalidProtectedRoot)?;
     }
     let installation_id = std::env::var("ELIOT_INSTALLATION_ID")
         .map_err(|_| SpoolError::InvalidLease("installation identity is unavailable".to_owned()))?;
@@ -1046,12 +1074,14 @@ fn current_unix_ms() -> Result<u64, SpoolError> {
 }
 
 fn read_bounded(path: &Path, limit: u64) -> Result<Vec<u8>, SpoolError> {
-    read_protected_file(path, limit).map_err(|error| match error {
-        eliot_platform_windows::ProtectedPathError::SizeExceeded => {
-            SpoolError::InvalidLease("protected admission file exceeds the bounded size".to_owned())
-        }
-        _ => SpoolError::InvalidProtectedRoot,
-    })
+    ProtectedPathLease::open_existing_absolute(path)
+        .and_then(|lease| lease.read_bounded(limit))
+        .map_err(|error| match error {
+            eliot_platform_windows::ProtectedPathError::SizeExceeded => SpoolError::InvalidLease(
+                "protected admission file exceeds the bounded size".to_owned(),
+            ),
+            _ => SpoolError::InvalidProtectedRoot,
+        })
 }
 
 fn validate_text(value: &str, field: &str) -> Result<(), SpoolError> {
@@ -1117,5 +1147,84 @@ mod tests {
         header.record_count = 1;
         header.first_sequence = 3;
         assert!(validate_header(&header, &[entry]).is_err());
+    }
+
+    #[test]
+    fn redb_spool_reopens_and_retains_bounded_records() {
+        let root =
+            std::env::temp_dir().join(format!("eliot-watchdog-spool-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir(&root).unwrap_or_else(|_| unreachable!());
+        let path = root.join("watchdog.redb");
+        let spool = WatchdogSpool::open_test(&path).unwrap_or_else(|error| panic!("{error}"));
+        let bounded_payload = || WatchdogSpoolPayload::Recovery {
+            service: SERVICE_NAME.to_owned(),
+            reason: "x".repeat(16_000),
+            corrupt_sequence: None,
+            corrupt_digest: "digest".to_owned(),
+        };
+        for sequence in 0..300 {
+            spool
+                .append(sequence + 1, bounded_payload())
+                .unwrap_or_else(|error| panic!("{error}"));
+        }
+        let retained = spool.readback().unwrap_or_else(|error| panic!("{error}"));
+        assert!(retained.len() < 300);
+        drop(spool);
+        let reopened = WatchdogSpool::open_test(&path).unwrap_or_else(|error| panic!("{error}"));
+        assert_eq!(
+            reopened
+                .readback()
+                .unwrap_or_else(|error| panic!("{error}"))
+                .len(),
+            retained.len()
+        );
+        drop(reopened);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn redb_spool_corruption_writes_recovery_evidence_before_readback() {
+        let root =
+            std::env::temp_dir().join(format!("eliot-watchdog-corrupt-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir(&root).unwrap_or_else(|_| unreachable!());
+        let path = root.join("watchdog.redb");
+        let spool = WatchdogSpool::open_test(&path).unwrap_or_else(|error| panic!("{error}"));
+        spool
+            .append(
+                1,
+                WatchdogSpoolPayload::Gap {
+                    service: SERVICE_NAME.to_owned(),
+                    reason: GapRecoveryReason::AdmissionUnavailable,
+                    coverage_claimed: false,
+                },
+            )
+            .unwrap_or_else(|error| panic!("{error}"));
+        drop(spool);
+        let database = Database::open(&path).unwrap_or_else(|error| panic!("{error}"));
+        let write = database
+            .begin_write()
+            .unwrap_or_else(|error| panic!("{error}"));
+        {
+            let mut table = write
+                .open_table(SPOOL_TABLE)
+                .unwrap_or_else(|error| panic!("{error}"));
+            table
+                .insert(SPOOL_HEADER_KEY, b"not-json".as_slice())
+                .unwrap_or_else(|error| panic!("{error}"));
+        }
+        write.commit().unwrap_or_else(|error| panic!("{error}"));
+        drop(database);
+        let recovered = WatchdogSpool::open_test(&path).unwrap_or_else(|error| panic!("{error}"));
+        let entries = recovered
+            .readback()
+            .unwrap_or_else(|error| panic!("{error}"));
+        assert!(matches!(
+            entries.first().map(|entry| &entry.payload),
+            Some(WatchdogSpoolPayload::Recovery { .. })
+        ));
+        drop(recovered);
+        let _ = std::fs::remove_dir_all(root);
     }
 }

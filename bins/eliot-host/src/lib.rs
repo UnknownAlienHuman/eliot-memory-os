@@ -21,13 +21,15 @@ use eliot_host_state::{
 };
 use eliot_installation::{
     ApprovedGenerationRegistry, CandidateManifest, InstallationError, RedbInstallationRegistry,
-    verify_approved_path, verify_file_digest,
+    verify_approved_path, verify_file_digest_with_lease,
 };
 use eliot_platform::{
     HostBranchKind, HostBranchRecoveryFence, HostInstallationState, HostJobDisposition,
     HostProcessRecoveryBinding, HostRecoveryEvidence, HostStateStore, PlatformHandle,
 };
-use eliot_platform_windows::{HostOwnerLease, HostOwnerLeaseError, HostOwnerLeaseReleaseError};
+use eliot_platform_windows::{
+    HostOwnerLease, HostOwnerLeaseError, HostOwnerLeaseReleaseError, ProtectedPathLease,
+};
 use eliot_runtime_contracts::{HealthVector, ServiceProcessRecord, ServiceProcessState};
 use thiserror::Error;
 
@@ -69,7 +71,10 @@ pub struct HostJobBranches {
     store_identity: JobObjectIdentity,
     kernel_executable: Option<PathBuf>,
     store_executable: Option<PathBuf>,
+    kernel_lease: Option<ProtectedPathLease>,
+    store_lease: Option<ProtectedPathLease>,
     config_path: Option<PathBuf>,
+    config_lease: Option<ProtectedPathLease>,
     config_pin: Option<PinnedRuntimeFile>,
     kernel_artifact_digest: Option<PlatformHandle>,
     store_artifact_digest: Option<PlatformHandle>,
@@ -112,7 +117,10 @@ impl HostJobBranches {
             store_identity,
             kernel_executable: None,
             store_executable: None,
+            kernel_lease: None,
+            store_lease: None,
             config_path: None,
+            config_lease: None,
             config_pin: None,
             kernel_artifact_digest: None,
             store_artifact_digest: None,
@@ -184,36 +192,62 @@ impl HostJobBranches {
 
     fn launch(
         executable: &Path,
+        executable_lease: &ProtectedPathLease,
         identity: &JobObjectIdentity,
         generation: &PlatformHandle,
         config_digest: &PlatformHandle,
         artifact: &PlatformHandle,
         config_path: &Path,
+        config_lease: &ProtectedPathLease,
         approved_executable_path: &PlatformHandle,
         approved_config_path: &PlatformHandle,
         _config_pin: &PinnedRuntimeFile,
         host: &HostInstallationEpoch,
     ) -> Result<RunningJobChild<PlatformHandle>, HostError> {
-        let executable = verify_approved_path(
+        if executable_lease.path() != executable || config_lease.path() != config_path {
+            return Err(HostError::ProcessContour(
+                "launch locator is not bound to its retained protected file".to_owned(),
+            ));
+        }
+        let approved_executable = verify_approved_path(
             executable,
             approved_executable_path,
             "runtime.approved_executable_path",
         )
-        .and_then(|path| verify_file_digest(path, artifact, "runtime.artifact"))
         .map_err(|error| HostError::ProcessContour(error.to_string()))?;
-        let config_path = verify_approved_path(
+        if approved_executable != executable {
+            return Err(HostError::ProcessContour(
+                "executable locator is not the approved path".to_owned(),
+            ));
+        }
+        let approved_config = verify_approved_path(
             config_path,
             approved_config_path,
             "runtime.approved_config_path",
         )
         .map_err(|error| HostError::ProcessContour(error.to_string()))?;
-        let config_path = verify_file_digest(&config_path, config_digest, "runtime.config")
+        if approved_config != config_path {
+            return Err(HostError::ProcessContour(
+                "config locator is not the approved path".to_owned(),
+            ));
+        }
+        executable_lease
+            .verify_stable_identity()
+            .and_then(|()| executable_lease.verify_path_identity())
+            .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+        config_lease
+            .verify_stable_identity()
+            .and_then(|()| config_lease.verify_path_identity())
+            .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+        verify_file_digest_with_lease(executable_lease, artifact, "runtime.artifact")
+            .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+        verify_file_digest_with_lease(config_lease, config_digest, "runtime.config")
             .map_err(|error| HostError::ProcessContour(error.to_string()))?;
         let working_directory = executable
             .parent()
             .ok_or_else(|| HostError::ProcessContour("approved image has no parent".to_owned()))?;
         let spec = SuspendedLaunchSpec::new(
-            executable.clone(),
+            executable.to_path_buf(),
             Vec::new(),
             working_directory,
             Self::environment(
@@ -221,7 +255,7 @@ impl HostJobBranches {
                 generation,
                 config_digest,
                 artifact,
-                &config_path,
+                config_path,
                 identity,
             ),
         )
@@ -236,20 +270,36 @@ impl HostJobBranches {
                 if observed != expected {
                     return Err("approved image identity changed before resume".to_owned());
                 }
-                verify_approved_path(
+                let observed_executable = verify_approved_path(
                     &observed,
                     approved_executable_path,
                     "runtime.approved_executable_path",
                 )
-                .and_then(|path| verify_file_digest(path, artifact, "runtime.artifact"))
                 .map_err(|error| error.to_string())?;
-                verify_approved_path(
-                    &config_path,
+                if observed_executable != expected {
+                    return Err("approved image path changed before resume".to_owned());
+                }
+                executable_lease
+                    .verify_stable_identity()
+                    .and_then(|()| executable_lease.verify_path_identity())
+                    .map_err(|error| error.to_string())?;
+                verify_file_digest_with_lease(executable_lease, artifact, "runtime.artifact")
+                    .map_err(|error| error.to_string())?;
+                let observed_config = verify_approved_path(
+                    config_path,
                     approved_config_path,
                     "runtime.approved_config_path",
                 )
-                .and_then(|path| verify_file_digest(path, config_digest, "runtime.config"))
                 .map_err(|error| error.to_string())?;
+                if observed_config != config_path {
+                    return Err("approved config path changed before resume".to_owned());
+                }
+                config_lease
+                    .verify_stable_identity()
+                    .and_then(|()| config_lease.verify_path_identity())
+                    .map_err(|error| error.to_string())?;
+                verify_file_digest_with_lease(config_lease, config_digest, "runtime.config")
+                    .map_err(|error| error.to_string())?;
                 Ok(generation.clone())
             })
             .map_err(|error| HostError::ProcessContour(format!("validation failed: {error:?}")))?;
@@ -285,15 +335,21 @@ impl HostJobBranches {
             approved_kernel_path,
             "runtime.approved_kernel_path",
         )
-        .and_then(|path| verify_file_digest(path, kernel_artifact, "runtime.kernel_artifact"))
         .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+        let kernel_lease = ProtectedPathLease::open_existing_absolute(&kernel_executable)
+            .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+        verify_file_digest_with_lease(&kernel_lease, kernel_artifact, "runtime.kernel_artifact")
+            .map_err(|error| HostError::ProcessContour(error.to_string()))?;
         let store_executable = verify_approved_path(
             store_executable,
             approved_store_path,
             "runtime.approved_store_path",
         )
-        .and_then(|path| verify_file_digest(path, store_artifact, "runtime.store_artifact"))
         .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+        let store_lease = ProtectedPathLease::open_existing_absolute(&store_executable)
+            .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+        verify_file_digest_with_lease(&store_lease, store_artifact, "runtime.store_artifact")
+            .map_err(|error| HostError::ProcessContour(error.to_string()))?;
         let config_path = verify_approved_path(
             config_path,
             approved_config_path,
@@ -302,15 +358,19 @@ impl HostJobBranches {
         .map_err(|error| HostError::ProcessContour(error.to_string()))?;
         let config_pin = PinnedRuntimeFile::open(&config_path)
             .map_err(|error| HostError::ProcessContour(error.to_string()))?;
-        let config_path = verify_file_digest(&config_path, config_digest, "runtime.config")
+        let config_lease = ProtectedPathLease::open_existing_absolute(&config_path)
+            .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+        verify_file_digest_with_lease(&config_lease, config_digest, "runtime.config")
             .map_err(|error| HostError::ProcessContour(error.to_string()))?;
         let kernel = Self::launch(
             &kernel_executable,
+            &kernel_lease,
             &self.kernel_identity,
             generation,
             config_digest,
             kernel_artifact,
             &config_path,
+            &config_lease,
             approved_kernel_path,
             approved_config_path,
             &config_pin,
@@ -318,11 +378,13 @@ impl HostJobBranches {
         )?;
         let store = match Self::launch(
             &store_executable,
+            &store_lease,
             &self.store_identity,
             generation,
             config_digest,
             store_artifact,
             &config_path,
+            &config_lease,
             approved_store_path,
             approved_config_path,
             &config_pin,
@@ -336,7 +398,10 @@ impl HostJobBranches {
         };
         self.kernel_executable = Some(kernel_executable);
         self.store_executable = Some(store_executable);
+        self.kernel_lease = Some(kernel_lease);
+        self.store_lease = Some(store_lease);
         self.config_path = Some(config_path);
+        self.config_lease = Some(config_lease);
         self.config_pin = Some(config_pin);
         self.kernel_artifact_digest = Some(kernel_artifact.clone());
         self.store_artifact_digest = Some(store_artifact.clone());
@@ -362,16 +427,25 @@ impl HostJobBranches {
             .kernel_executable
             .clone()
             .ok_or_else(|| HostError::ProcessContour("Kernel image is not recorded".to_owned()))?;
+        let executable_lease = self
+            .kernel_lease
+            .as_ref()
+            .ok_or_else(|| HostError::ProcessContour("Kernel image lease is missing".to_owned()))?;
+        let config_lease = self.config_lease.as_ref().ok_or_else(|| {
+            HostError::ProcessContour("generation config lease is missing".to_owned())
+        })?;
         let config_pin = self.config_pin.as_ref().ok_or_else(|| {
             HostError::ProcessContour("generation config pin is missing".to_owned())
         })?;
         let child = Self::launch(
             &executable,
+            executable_lease,
             &self.kernel_identity,
             generation,
             config_digest,
             artifact,
             config_path,
+            config_lease,
             approved_executable_path,
             approved_config_path,
             config_pin,
@@ -395,16 +469,25 @@ impl HostJobBranches {
             .store_executable
             .clone()
             .ok_or_else(|| HostError::ProcessContour("store image is not recorded".to_owned()))?;
+        let executable_lease = self
+            .store_lease
+            .as_ref()
+            .ok_or_else(|| HostError::ProcessContour("store image lease is missing".to_owned()))?;
+        let config_lease = self.config_lease.as_ref().ok_or_else(|| {
+            HostError::ProcessContour("generation config lease is missing".to_owned())
+        })?;
         let config_pin = self.config_pin.as_ref().ok_or_else(|| {
             HostError::ProcessContour("generation config pin is missing".to_owned())
         })?;
         let child = Self::launch(
             &executable,
+            executable_lease,
             &self.store_identity,
             generation,
             config_digest,
             artifact,
             config_path,
+            config_lease,
             approved_executable_path,
             approved_config_path,
             config_pin,
@@ -463,23 +546,62 @@ impl HostJobBranches {
             approved_config_path,
             "runtime.approved_config_path",
         )
-        .and_then(|path| verify_file_digest(path, config_digest, "runtime.config"))
         .map_err(|error| HostError::ProcessContour(error.to_string()))?;
         if self.config_path.as_ref() != Some(&canonical_config) {
             return Err(HostError::ProcessContour(
                 "generation config path changed outside the approved contour".to_owned(),
             ));
         }
+        let config_lease = self.config_lease.as_ref().ok_or_else(|| {
+            HostError::ProcessContour("generation config lease is missing".to_owned())
+        })?;
+        if config_lease.path() != canonical_config {
+            return Err(HostError::ProcessContour(
+                "generation config lease is not the approved path".to_owned(),
+            ));
+        }
+        config_lease
+            .verify_stable_identity()
+            .and_then(|()| config_lease.verify_path_identity())
+            .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+        verify_file_digest_with_lease(config_lease, config_digest, "runtime.config")
+            .map_err(|error| HostError::ProcessContour(error.to_string()))?;
         if let Some(kernel) = &self.kernel_executable {
-            verify_approved_path(kernel, approved_kernel_path, "runtime.approved_kernel_path")
-                .and_then(|path| {
-                    verify_file_digest(path, kernel_artifact, "runtime.kernel_artifact")
-                })
+            let approved =
+                verify_approved_path(kernel, approved_kernel_path, "runtime.approved_kernel_path")
+                    .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+            let lease = self.kernel_lease.as_ref().ok_or_else(|| {
+                HostError::ProcessContour("Kernel image lease is missing".to_owned())
+            })?;
+            if approved != *kernel || lease.path() != kernel {
+                return Err(HostError::ProcessContour(
+                    "Kernel image lease is not the approved path".to_owned(),
+                ));
+            }
+            lease
+                .verify_stable_identity()
+                .and_then(|()| lease.verify_path_identity())
+                .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+            verify_file_digest_with_lease(lease, kernel_artifact, "runtime.kernel_artifact")
                 .map_err(|error| HostError::ProcessContour(error.to_string()))?;
         }
         if let Some(store) = &self.store_executable {
-            verify_approved_path(store, approved_store_path, "runtime.approved_store_path")
-                .and_then(|path| verify_file_digest(path, store_artifact, "runtime.store_artifact"))
+            let approved =
+                verify_approved_path(store, approved_store_path, "runtime.approved_store_path")
+                    .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+            let lease = self.store_lease.as_ref().ok_or_else(|| {
+                HostError::ProcessContour("store image lease is missing".to_owned())
+            })?;
+            if approved != *store || lease.path() != store {
+                return Err(HostError::ProcessContour(
+                    "store image lease is not the approved path".to_owned(),
+                ));
+            }
+            lease
+                .verify_stable_identity()
+                .and_then(|()| lease.verify_path_identity())
+                .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+            verify_file_digest_with_lease(lease, store_artifact, "runtime.store_artifact")
                 .map_err(|error| HostError::ProcessContour(error.to_string()))?;
         }
         let kernel_dead = Self::branch_dead(self.kernel.as_ref()).unwrap_or(true);
@@ -646,7 +768,10 @@ impl HostJobBranches {
     fn clear_recorded_contour(&mut self) {
         self.kernel_executable = None;
         self.store_executable = None;
+        self.kernel_lease = None;
+        self.store_lease = None;
         self.config_path = None;
+        self.config_lease = None;
         self.config_pin = None;
         self.kernel_artifact_digest = None;
         self.store_artifact_digest = None;
