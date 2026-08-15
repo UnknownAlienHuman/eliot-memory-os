@@ -28,5 +28,9 @@ tokio.workspace = true
 toml.workspace = true
 thiserror.workspace = true
 
+[dev-dependencies]
+eliot-contracts.workspace = true
+eliot-runtime-contracts.workspace = true
+
 [lints]
 workspace = true

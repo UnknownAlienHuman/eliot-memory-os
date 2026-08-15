@@ -8,14 +8,21 @@
 //! serializes bounded contract receipts. Blob contributes one process/root
 //! claim identity; it is not a second store or semantic write path.
 
+use std::collections::BTreeSet;
 use std::path::Path;
 
 use eliot_blob::BlobRootOwner;
+use eliot_ipc::{ReplayDisposition, ReplayLedger, TransportLimits};
 use eliot_platform_windows::{NamedPipePeerExpectation, WindowsPlatform, read_protected_file};
+use eliot_protocol::{
+    ClientHello, EncodingProfile, Frame, FrameKind, MessageType, ProtocolPayload, ProtocolRange,
+    ProtocolVersion, ServerHello,
+};
 use eliot_store_api::{
-    CanonicalStoreClient, NamedReadRequest, NamedReadResponse, OperationId, OrderingHead,
-    OrderingHeadExpectation, OrderingScopeId, PreparedTransition, RequestMeta, RevisionHead,
-    RevisionHeadExpectation, RevisionKey, StoreError, StoreHealth, WriteReceipt,
+    CAPABILITIES, CanonicalStoreClient, EFFECTS, NamedReadRequest, NamedReadResponse, OperationId,
+    OrderingHead, OrderingHeadExpectation, OrderingScopeId, PreparedTransition, RequestMeta,
+    RevisionHead, RevisionHeadExpectation, RevisionKey, StateFence, StoreError, StoreHealth,
+    WriteReceipt, decode_request_frame,
 };
 pub use eliot_store_api::{ReadinessReceipt, StoreRequest as Request, StoreResponse as Response};
 use eliot_store_surreal_adapter::{
@@ -357,6 +364,272 @@ impl StoreComposition {
     }
 }
 
+/// Immutable identity projected into the S-03 ServerHello.  The transport
+/// loop does not get to invent any provider or process authority; it receives
+/// this projection from the one StoreComposition.
+#[derive(Clone, Debug)]
+pub struct StoreHandshakeIdentity {
+    operation_manifest_digest: String,
+    blob_root_owner: serde_json::Value,
+}
+
+impl StoreHandshakeIdentity {
+    /// Creates the bounded identity projection for one admitted composition.
+    #[must_use]
+    pub fn new(
+        operation_manifest_digest: impl Into<String>,
+        blob_root_owner: serde_json::Value,
+    ) -> Self {
+        Self {
+            operation_manifest_digest: operation_manifest_digest.into(),
+            blob_root_owner,
+        }
+    }
+}
+
+/// Authenticated S-03 session state retained by the Store transport loop.
+///
+/// The fields are intentionally private. Callers can obtain only the
+/// negotiated transport values needed to send a response; request admission
+/// remains inside [`validate_request_frame`].
+pub struct StoreEbpSession {
+    connection_id: String,
+    protocol_version: ProtocolVersion,
+    state_fence: StateFence,
+    max_frame_bytes: usize,
+    capabilities: BTreeSet<String>,
+    replay: ReplayLedger,
+}
+
+impl StoreEbpSession {
+    #[must_use]
+    pub fn connection_id(&self) -> &str {
+        &self.connection_id
+    }
+
+    #[must_use]
+    pub const fn protocol_version(&self) -> ProtocolVersion {
+        self.protocol_version
+    }
+
+    #[must_use]
+    pub const fn max_frame_bytes(&self) -> usize {
+        self.max_frame_bytes
+    }
+}
+
+/// Admits the only supported S-03 ClientHello and binds the complete
+/// generation/fence/epoch lineage to the resulting session.
+pub fn admit_handshake(
+    frame: Frame,
+    limits: TransportLimits,
+    config: &StoreLaunchConfig,
+    identity: &StoreHandshakeIdentity,
+) -> Result<(StoreEbpSession, ServerHello), String> {
+    config.validate()?;
+    frame
+        .validate()
+        .map_err(|error| format!("validate EBP hello frame: {error}"))?;
+    if frame.encoding_profile != EncodingProfile::JsonV1
+        || frame.kind != FrameKind::Control
+        || frame.message_type != MessageType::Start
+        || frame.request_id.is_some()
+        || frame.request_identity.is_some()
+    {
+        return Err("first frame must be an uncorrelated json-v1 Control/Start hello".to_owned());
+    }
+    let ProtocolPayload::Json(payload) = frame.payload else {
+        return Err("EBP hello payload must use json-v1".to_owned());
+    };
+    let hello: ClientHello =
+        serde_json::from_value(payload).map_err(|error| format!("decode ClientHello: {error}"))?;
+    hello
+        .validate()
+        .map_err(|error| format!("validate ClientHello: {error}"))?;
+    if hello.module_bridge_identity != SERVICE_NAME {
+        return Err(format!(
+            "ClientHello module_bridge_identity must be {SERVICE_NAME}"
+        ));
+    }
+    let state_fence = &hello.module_generation.state_fence;
+    if hello.artifact_hash.as_str() != config.approved_artifact_hash
+        || hello.launch_nonce != config.launch_nonce
+        || hello.module_generation.generation.value() != config.store_generation
+        || state_fence.resource_generation != hello.module_generation.generation
+        || state_fence.resource_generation.value() != config.store_generation
+        || state_fence.authority_epoch != hello.authority_epoch
+        || state_fence.authority_epoch.value() != config.authority_epoch
+    {
+        return Err(
+            "ClientHello is outside the Host-approved store generation/fence lineage".to_owned(),
+        );
+    }
+    if identity.operation_manifest_digest.trim().is_empty() {
+        return Err("store operation manifest digest is empty".to_owned());
+    }
+    let server_range = ProtocolRange {
+        minimum: ProtocolVersion::CURRENT,
+        maximum: ProtocolVersion::CURRENT,
+    };
+    let protocol_version = hello
+        .protocol_range
+        .select(server_range)
+        .map_err(|error| format!("negotiate EBP version: {error}"))?;
+    if usize::try_from(hello.max_frame).unwrap_or(usize::MAX) > limits.max_frame_bytes {
+        return Err("ClientHello max_frame exceeds the bounded transport limit".to_owned());
+    }
+    let capabilities: Vec<String> = CAPABILITIES
+        .iter()
+        .filter(|capability| hello.capabilities.iter().any(|value| value == **capability))
+        .map(|capability| (*capability).to_owned())
+        .collect();
+    let effects: Vec<String> = EFFECTS.iter().map(|effect| (*effect).to_owned()).collect();
+    let server_hello = ServerHello {
+        selected_protocol: protocol_version,
+        session_principal_binding: format!("{SERVICE_NAME}:{}", std::process::id()),
+        allowed_capabilities: capabilities.clone(),
+        allowed_effects: effects,
+        config_snapshot: serde_json::json!({
+            "service": SERVICE_NAME,
+            "protocol": PROTOCOL_VERSION,
+            "artifact_hash": config.approved_artifact_hash,
+            "config_hash": config.approved_config_hash,
+            "operation_manifest_digest": identity.operation_manifest_digest,
+            "blob_root_owner": identity.blob_root_owner,
+        }),
+        heartbeat_ms: 30_000,
+        control_channel: "named_pipe".to_owned(),
+        rejection_reason: None,
+        authority_epoch: hello.authority_epoch,
+    };
+    server_hello
+        .validate()
+        .map_err(|error| format!("validate ServerHello: {error}"))?;
+    Ok((
+        StoreEbpSession {
+            connection_id: frame.connection_id,
+            protocol_version,
+            state_fence: state_fence.clone(),
+            max_frame_bytes: usize::try_from(hello.max_frame)
+                .map_err(|_| "ClientHello max_frame does not fit usize".to_owned())?,
+            capabilities: capabilities.into_iter().collect(),
+            replay: ReplayLedger::default(),
+        },
+        server_hello,
+    ))
+}
+
+/// Validates one request against the admitted session and replay ledger.
+pub fn validate_request_frame(
+    session: &mut StoreEbpSession,
+    frame: &Frame,
+) -> Result<Request, String> {
+    if frame.protocol_version != session.protocol_version
+        || frame.connection_id != session.connection_id
+    {
+        return Err("request frame is outside the negotiated EBP session".to_owned());
+    }
+    let (request_id, identity, request) =
+        decode_request_frame(frame).map_err(|error| error.to_string())?;
+    if identity.request.state_fence != session.state_fence {
+        return Err("request identity state fence does not match the handshake fence".to_owned());
+    }
+    match session.replay.observe(request_id.to_string(), frame) {
+        ReplayDisposition::Conflict => {
+            return Err("request identity conflicts with a prior frame".to_owned());
+        }
+        ReplayDisposition::New | ReplayDisposition::Duplicate => {}
+    }
+    let capability = request.capability();
+    if !session.capabilities.contains(capability) {
+        return Err(format!("capability is not admitted: {capability}"));
+    }
+    Ok(request)
+}
+
+/// Store backend used by the reusable EBP request dispatch seam.
+#[allow(async_fn_in_trait)]
+pub trait StoreDispatchBackend: Send + Sync {
+    /// Executes one already session-validated closed store request.
+    async fn dispatch_request(&self, request: Request) -> Response;
+}
+
+/// Dispatches through the same production backend seam used by the binary
+/// loop. Tests may provide a bounded fake backend without copying transport,
+/// handshake, replay, or request validation authority.
+pub async fn dispatch<B: StoreDispatchBackend + ?Sized>(backend: &B, request: Request) -> Response {
+    backend.dispatch_request(request).await
+}
+
+impl StoreDispatchBackend for StoreComposition {
+    async fn dispatch_request(&self, request: Request) -> Response {
+        match request {
+            Request::Health => match self.health().await {
+                Ok(record) => Response::Health { record },
+                Err(error) => Response::Error {
+                    error: error.to_string(),
+                },
+            },
+            Request::Readiness => match self.readiness().await {
+                Ok(receipt) => Response::Readiness { receipt },
+                Err(error) => Response::Error {
+                    error: error.to_string(),
+                },
+            },
+            Request::Named { request } => match self.named(request).await {
+                Ok(response) => Response::Named { response },
+                Err(error) => Response::Error {
+                    error: error.to_string(),
+                },
+            },
+            Request::Apply {
+                context,
+                transition,
+                expected_revision_heads,
+                expected_ordering_heads,
+            } => match self
+                .apply(
+                    &context,
+                    transition,
+                    expected_revision_heads,
+                    expected_ordering_heads,
+                )
+                .await
+            {
+                Ok(receipt) => Response::from_transaction_receipt(receipt),
+                Err(StoreCompositionError::UnknownOutcome {
+                    operation_id,
+                    reason,
+                }) => Response::Unknown {
+                    operation_id,
+                    reason,
+                },
+                Err(error) => Response::Error {
+                    error: error.to_string(),
+                },
+            },
+            Request::Receipt { operation_id } => match self.receipt(operation_id).await {
+                Ok(receipt) => Response::from_receipt(receipt),
+                Err(error) => Response::Error {
+                    error: error.to_string(),
+                },
+            },
+            Request::RevisionHeads { keys } => match self.revision_heads(keys).await {
+                Ok(heads) => Response::RevisionHeads { heads },
+                Err(error) => Response::Error {
+                    error: error.to_string(),
+                },
+            },
+            Request::OrderingHeads { scopes } => match self.ordering_heads(scopes).await {
+                Ok(heads) => Response::OrderingHeads { heads },
+                Err(error) => Response::Error {
+                    error: error.to_string(),
+                },
+            },
+        }
+    }
+}
+
 fn adapter_config(
     config: &StoreLaunchConfig,
     password: SecretString,
@@ -430,6 +703,12 @@ pub fn load_config(path: Option<&Path>) -> Result<StoreLaunchConfig, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use eliot_contracts::{
+        ArtifactId, AuthorityEpoch, ContractId, ContractVersion, ResourceGeneration,
+    };
+    use eliot_runtime_contracts::{
+        HealthVector, ModuleContract, ModuleGeneration, ModuleGenerationState,
+    };
 
     fn config() -> StoreLaunchConfig {
         let mut config = StoreLaunchConfig {
@@ -478,5 +757,98 @@ mod tests {
             StoreCompositionError::UnknownOutcome { operation_id, .. }
                 if operation_id.as_str() == "operation-test"
         ));
+    }
+
+    fn client_hello_frame(config: &StoreLaunchConfig) -> Frame {
+        let module_id = ContractId::new(SERVICE_NAME).expect("module id");
+        let artifact_id =
+            ArtifactId::new(config.approved_artifact_hash.as_str()).expect("artifact");
+        let authority_epoch = AuthorityEpoch::new(config.authority_epoch).expect("epoch");
+        let generation = ResourceGeneration::new(config.store_generation).expect("generation");
+        let hello = ClientHello {
+            protocol_range: ProtocolRange {
+                minimum: ProtocolVersion::CURRENT,
+                maximum: ProtocolVersion::CURRENT,
+            },
+            module_bridge_identity: SERVICE_NAME.to_owned(),
+            artifact_hash: artifact_id.clone(),
+            module_contract: ModuleContract {
+                module_id: module_id.clone(),
+                version: ContractVersion::new(1, 0, 0),
+                artifact_id: artifact_id.clone(),
+                protocols: vec![PROTOCOL_VERSION.to_owned()],
+                required_capabilities: vec!["store.readiness".to_owned()],
+                optional_capabilities: Vec::new(),
+                advisory_capabilities: Vec::new(),
+                state_owner: "eliot-kernel".to_owned(),
+                failure_domain: SERVICE_NAME.to_owned(),
+                hot_replace: false,
+            },
+            module_generation: ModuleGeneration {
+                module_id,
+                generation,
+                artifact_id,
+                state: ModuleGenerationState::Active,
+                health: HealthVector::healthy(),
+                state_fence: StateFence::new(authority_epoch, generation),
+            },
+            launch_nonce: config.launch_nonce.clone(),
+            capabilities: CAPABILITIES
+                .iter()
+                .map(|value| (*value).to_owned())
+                .collect(),
+            privacy_classes: vec!["PUBLIC".to_owned()],
+            max_frame: eliot_protocol::MAX_FRAME_BYTES as u32,
+            authority_epoch,
+        };
+        eliot_ipc::client_hello_frame("connection-test", &hello).expect("hello frame")
+    }
+
+    #[test]
+    fn handshake_rejects_partial_generation_or_fence_lineage() {
+        let config = config();
+        let identity = StoreHandshakeIdentity::new("manifest-test", serde_json::json!({}));
+        let frame = client_hello_frame(&config);
+        assert!(
+            admit_handshake(
+                frame.clone(),
+                TransportLimits::default(),
+                &config,
+                &identity,
+            )
+            .is_ok()
+        );
+
+        let ProtocolPayload::Json(payload) = frame.payload else {
+            panic!("hello payload");
+        };
+        let mut hello: ClientHello = serde_json::from_value(payload).expect("client hello");
+        hello.module_generation.state_fence = StateFence::new(
+            AuthorityEpoch::new(config.authority_epoch).expect("epoch"),
+            ResourceGeneration::new(config.store_generation + 1).expect("generation"),
+        );
+        let mismatched =
+            eliot_ipc::client_hello_frame("connection-test", &hello).expect("mismatched hello");
+        assert!(
+            admit_handshake(mismatched, TransportLimits::default(), &config, &identity,).is_err()
+        );
+
+        let mismatched_authority = AuthorityEpoch::new(config.authority_epoch + 1).expect("epoch");
+        hello.authority_epoch = mismatched_authority;
+        hello.module_generation.state_fence = StateFence::new(
+            mismatched_authority,
+            ResourceGeneration::new(config.store_generation).expect("generation"),
+        );
+        let mismatched_epoch = eliot_ipc::client_hello_frame("connection-test", &hello)
+            .expect("mismatched epoch hello");
+        assert!(
+            admit_handshake(
+                mismatched_epoch,
+                TransportLimits::default(),
+                &config,
+                &identity,
+            )
+            .is_err()
+        );
     }
 }

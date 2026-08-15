@@ -30,6 +30,7 @@ thiserror.workspace = true
 
 [dev-dependencies]
 eliot-platform-windows.workspace = true
+eliot-store-surreal = { path = "../../../bins/eliot-store-surreal" }
 
 [lints]
 workspace = true

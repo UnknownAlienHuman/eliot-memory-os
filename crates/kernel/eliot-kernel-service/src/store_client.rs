@@ -5,6 +5,7 @@
 //! authority, or decides completion.  An uncertain apply is reconciled only
 //! by the exact operation identity carried by the prepared transition.
 
+use std::collections::BTreeSet;
 use std::sync::{
     Arc,
     atomic::{AtomicU64, Ordering},
@@ -19,11 +20,11 @@ use eliot_protocol::{
 use eliot_receipts::RequestBinding;
 use eliot_runtime_contracts::{ModuleContract, ModuleGeneration, ModuleGenerationState};
 use eliot_store_api::{
-    CAPABILITIES, CanonicalStoreClient, NamedReadOperation, NamedReadRequest, NamedReadResponse,
-    OperationId, OrderingHead, OrderingHeadExpectation, OrderingScopeId, PreparedTransition,
-    ReadConsistency, RequestMeta, RevisionHead, RevisionHeadExpectation, RevisionKey, ScopeId,
-    ScopeRevisionView, StoreError, StoreHealth, StoreRequest, StoreResponse, StoreWireError,
-    WriteReceipt,
+    CAPABILITIES, CanonicalStoreClient, EFFECTS, NamedReadOperation, NamedReadRequest,
+    NamedReadResponse, OperationId, OrderingHead, OrderingHeadExpectation, OrderingScopeId,
+    PreparedTransition, ReadConsistency, RequestMeta, RevisionHead, RevisionHeadExpectation,
+    RevisionKey, ScopeId, ScopeRevisionView, StoreError, StoreHealth, StoreRequest, StoreResponse,
+    StoreWireError, WriteReceipt,
 };
 use thiserror::Error;
 use tokio::sync::Mutex;
@@ -217,16 +218,26 @@ impl<T: EbpStoreTransport + 'static> EbpCanonicalStoreClient<T> {
             .receive_frame(self.limits)
             .await
             .map_err(|error| RequestFailure::unknown_or_transport(error, operation_id.clone()))?;
-        let (response_id, response) = eliot_store_api::decode_response_frame(&response_frame)
-            .map_err(|error| match operation_id.clone() {
+        let (response_id, response) = eliot_store_api::decode_response_frame(
+            &response_frame,
+            self.requirement.connection_id.as_str(),
+            self.protocol_version,
+        )
+        .map_err(|error| match operation_id.clone() {
+            Some(operation_id) => RequestFailure::Unknown {
+                operation_id,
+                reason: error.to_string(),
+            },
+            None => RequestFailure::Contract(error.into()),
+        })?;
+        if response_id != request_id {
+            return Err(match operation_id {
                 Some(operation_id) => RequestFailure::Unknown {
                     operation_id,
-                    reason: error.to_string(),
+                    reason: "response request_id does not match the sent request".to_owned(),
                 },
-                None => RequestFailure::Contract(error.into()),
-            })?;
-        if response_id != request_id {
-            return Err(RequestFailure::Store(StoreError::IdentityConflict));
+                None => RequestFailure::Store(StoreError::IdentityConflict),
+            });
         }
         response
             .validate()
@@ -557,15 +568,22 @@ fn decode_server_hello(
         .config_snapshot
         .get("artifact_hash")
         .and_then(serde_json::Value::as_str);
+    let expected_capabilities: BTreeSet<&str> = CAPABILITIES.iter().copied().collect();
+    let observed_capabilities: BTreeSet<&str> = server
+        .allowed_capabilities
+        .iter()
+        .map(String::as_str)
+        .collect();
+    let expected_effects: BTreeSet<&str> = EFFECTS.iter().copied().collect();
+    let observed_effects: BTreeSet<&str> =
+        server.allowed_effects.iter().map(String::as_str).collect();
     if server.authority_epoch != requirement.authority_epoch()
+        || server.selected_protocol != ProtocolVersion::CURRENT
+        || server.rejection_reason.is_some()
         || artifact_hash != Some(requirement.approved_artifact_hash.as_str())
         || config_hash != Some(requirement.approved_config_hash.as_str())
-        || !CAPABILITIES.iter().all(|capability| {
-            server
-                .allowed_capabilities
-                .iter()
-                .any(|value| value == capability)
-        })
+        || observed_capabilities != expected_capabilities
+        || observed_effects != expected_effects
     {
         return Err(StoreClientError::Contract(
             "store handshake did not admit the exact authority/fence capability set".to_owned(),
@@ -639,13 +657,18 @@ mod windows_e2e_tests {
         OperationIdentity, OperationManifestDigest, ReadinessReceipt, SecurityContext,
         StoreResponse, TransitionClass,
     };
+    use eliot_store_surreal::{
+        Request as StoreServiceRequest, Response as StoreServiceResponse, StoreDispatchBackend,
+        StoreHandshakeIdentity, StoreLaunchConfig, admit_handshake, dispatch, launch_config_digest,
+        validate_request_frame,
+    };
     use tokio::sync::Mutex;
 
     fn requirement(pipe: String) -> HostStoreBootstrapRequirement {
         let fence = StateFence::new(AuthorityEpoch::genesis(), ResourceGeneration::genesis());
         let expectation = eliot_platform_windows::current_process_named_pipe_expectation()
             .expect("current process expectation");
-        HostStoreBootstrapRequirement {
+        let mut requirement = HostStoreBootstrapRequirement {
             store_pipe: PlatformHandle::new(pipe).expect("pipe handle"),
             store_generation: ResourceGeneration::genesis(),
             schema_generation: PlatformHandle::new("1.0.0").expect("schema handle"),
@@ -655,8 +678,91 @@ mod windows_e2e_tests {
             expected_peer_sid: PlatformHandle::new(expectation.expected_sid()).expect("peer sid"),
             expected_peer_session_id: expectation.expected_session_id(),
             approved_artifact_hash: PlatformHandle::new("a".repeat(64)).expect("artifact hash"),
-            approved_config_hash: PlatformHandle::new("b".repeat(64)).expect("config hash"),
-        }
+            approved_config_hash: PlatformHandle::new("0".repeat(64)).expect("config hash"),
+        };
+        let config = launch_config(&requirement);
+        requirement.approved_config_hash =
+            PlatformHandle::new(config.approved_config_hash).expect("config hash");
+        requirement
+    }
+
+    fn launch_config(requirement: &HostStoreBootstrapRequirement) -> StoreLaunchConfig {
+        let mut config = StoreLaunchConfig {
+            store_pipe: requirement.store_pipe.as_str().to_owned(),
+            launch_nonce: requirement.launch_nonce.as_str().to_owned(),
+            expected_client_sid: requirement.expected_peer_sid.as_str().to_owned(),
+            expected_client_session_id: requirement.expected_peer_session_id,
+            approved_artifact_hash: requirement.approved_artifact_hash.as_str().to_owned(),
+            approved_config_hash: String::new(),
+            store_generation: requirement.store_generation.value(),
+            authority_epoch: requirement.authority_epoch().value(),
+            endpoint: "ws://127.0.0.1:8000".to_owned(),
+            namespace: "eliot".to_owned(),
+            database: "eliot".to_owned(),
+            username: "store".to_owned(),
+            connect_timeout_ms: 5_000,
+            query_timeout_ms: 5_000,
+            schema_generation: requirement.schema_generation.as_str().to_owned(),
+            blob_root: r"C:\ProgramData\Eliot\blob".to_owned(),
+            instance_id: "s03-e2e".to_owned(),
+            credential_ref: "eliot/store".to_owned(),
+        };
+        config.approved_config_hash = launch_config_digest(&config).expect("config digest");
+        config
+    }
+
+    fn server_hello_frame(requirement: &HostStoreBootstrapRequirement) -> Frame {
+        let hello = ServerHello {
+            selected_protocol: ProtocolVersion::CURRENT,
+            session_principal_binding: "s03-test-server".to_owned(),
+            allowed_capabilities: CAPABILITIES
+                .iter()
+                .map(|value| (*value).to_owned())
+                .collect(),
+            allowed_effects: EFFECTS.iter().map(|value| (*value).to_owned()).collect(),
+            config_snapshot: serde_json::json!({
+                "artifact_hash": requirement.approved_artifact_hash.as_str(),
+                "config_hash": requirement.approved_config_hash.as_str(),
+            }),
+            heartbeat_ms: 30_000,
+            control_channel: "named_pipe".to_owned(),
+            rejection_reason: None,
+            authority_epoch: requirement.authority_epoch(),
+        };
+        eliot_ipc::server_hello_frame(requirement.connection_id.as_str(), &hello)
+            .expect("server hello frame")
+    }
+
+    #[test]
+    fn server_hello_rejects_protocol_effect_and_rejection_drift() {
+        let requirement = requirement(r"\\.\pipe\eliot\s03-hello-test".to_owned());
+        let valid = server_hello_frame(&requirement);
+        assert!(decode_server_hello(&valid, &requirement).is_ok());
+
+        let mut protocol =
+            eliot_ipc::decode_server_hello_frame(&valid, requirement.connection_id.as_str())
+                .expect("decode server hello");
+        protocol.selected_protocol.minor = protocol.selected_protocol.minor.saturating_add(1);
+        let protocol_frame =
+            eliot_ipc::server_hello_frame(requirement.connection_id.as_str(), &protocol)
+                .expect("protocol drift frame");
+        assert!(decode_server_hello(&protocol_frame, &requirement).is_err());
+
+        let mut effects = protocol;
+        effects.selected_protocol = ProtocolVersion::CURRENT;
+        effects.allowed_effects.pop();
+        let effects_frame =
+            eliot_ipc::server_hello_frame(requirement.connection_id.as_str(), &effects)
+                .expect("effects drift frame");
+        assert!(decode_server_hello(&effects_frame, &requirement).is_err());
+
+        let mut rejected = effects;
+        rejected.allowed_effects = EFFECTS.iter().map(|value| (*value).to_owned()).collect();
+        rejected.rejection_reason = Some("rejected".to_owned());
+        let rejected_frame =
+            eliot_ipc::server_hello_frame(requirement.connection_id.as_str(), &rejected)
+                .expect("rejection frame");
+        assert!(decode_server_hello(&rejected_frame, &requirement).is_err());
     }
 
     fn prepared_transition(fence: StateFence) -> PreparedTransition {
@@ -691,6 +797,28 @@ mod windows_e2e_tests {
         }
     }
 
+    struct E2eBackend;
+
+    impl StoreDispatchBackend for E2eBackend {
+        async fn dispatch_request(&self, request: StoreServiceRequest) -> StoreServiceResponse {
+            match request {
+                StoreServiceRequest::Readiness => StoreServiceResponse::Readiness {
+                    receipt: ReadinessReceipt::ready("1.0.0".to_owned()),
+                },
+                StoreServiceRequest::Apply { transition, .. } => StoreServiceResponse::Unknown {
+                    operation_id: transition.identity.operation_id,
+                    reason: "test provider delivery is unknown".to_owned(),
+                },
+                StoreServiceRequest::Receipt { .. } => {
+                    StoreServiceResponse::Receipt { receipt: None }
+                }
+                _ => StoreServiceResponse::Error {
+                    error: "unexpected request in bounded S03 E2E".to_owned(),
+                },
+            }
+        }
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn authenticated_s03_unknown_response_reconciles_exact_operation() {
         let pipe = format!(
@@ -714,33 +842,12 @@ mod windows_e2e_tests {
                 .receive_frame(limits)
                 .await
                 .map_err(|error| error.to_string())?;
-            let hello = eliot_ipc::decode_client_hello_frame(
-                &hello,
-                server_requirement.connection_id.as_str(),
-            )
-            .map_err(|error| error.to_string())?;
-            assert_eq!(hello.launch_nonce, server_requirement.launch_nonce.as_str());
-            assert_eq!(
-                hello.artifact_hash.as_str(),
-                server_requirement.approved_artifact_hash.as_str()
+            let config = launch_config(&server_requirement);
+            let identity = StoreHandshakeIdentity::new(
+                "manifest-e2e",
+                serde_json::json!({"owner": "test-store"}),
             );
-            let server_hello = ServerHello {
-                selected_protocol: ProtocolVersion::CURRENT,
-                session_principal_binding: "s03-test-server".to_owned(),
-                allowed_capabilities: CAPABILITIES
-                    .iter()
-                    .map(|value| (*value).to_owned())
-                    .collect(),
-                allowed_effects: vec!["read".to_owned(), "canonical_write".to_owned()],
-                config_snapshot: serde_json::json!({
-                    "artifact_hash": server_requirement.approved_artifact_hash.as_str(),
-                    "config_hash": server_requirement.approved_config_hash.as_str(),
-                }),
-                heartbeat_ms: 30_000,
-                control_channel: "named_pipe".to_owned(),
-                rejection_reason: None,
-                authority_epoch: server_requirement.authority_epoch(),
-            };
+            let (mut session, server_hello) = admit_handshake(hello, limits, &config, &identity)?;
             let frame = eliot_ipc::server_hello_frame(
                 server_requirement.connection_id.as_str(),
                 &server_hello,
@@ -755,18 +862,17 @@ mod windows_e2e_tests {
                 .receive_frame(limits)
                 .await
                 .map_err(|error| error.to_string())?;
-            let (request_id, _, request) = eliot_store_api::decode_request_frame(&readiness)
-                .map_err(|error| error.to_string())?;
-            assert!(matches!(request, StoreRequest::Readiness));
+            let request = validate_request_frame(&mut session, &readiness)?;
+            assert!(matches!(request, StoreServiceRequest::Readiness));
+            let request_id = readiness
+                .request_id
+                .clone()
+                .ok_or_else(|| "readiness request missing correlation".to_owned())?;
             let readiness = eliot_store_api::response_frame(
-                server_requirement.connection_id.as_str(),
-                ProtocolVersion::CURRENT,
+                session.connection_id(),
+                session.protocol_version(),
                 Some(request_id),
-                StoreResponse::Readiness {
-                    receipt: ReadinessReceipt::ready(
-                        server_requirement.schema_generation.as_str().to_owned(),
-                    ),
-                },
+                dispatch(&E2eBackend, request).await,
             )
             .map_err(|error| error.to_string())?;
             server
@@ -778,20 +884,22 @@ mod windows_e2e_tests {
                 .receive_frame(limits)
                 .await
                 .map_err(|error| error.to_string())?;
-            let (request_id, _, request) =
-                eliot_store_api::decode_request_frame(&apply).map_err(|error| error.to_string())?;
-            let operation_id = match request {
-                StoreRequest::Apply { transition, .. } => transition.identity.operation_id,
+            let request = validate_request_frame(&mut session, &apply)?;
+            let operation_id = match &request {
+                StoreServiceRequest::Apply { transition, .. } => {
+                    transition.identity.operation_id.clone()
+                }
                 other => panic!("expected apply, got {other:?}"),
             };
+            let request_id = apply
+                .request_id
+                .clone()
+                .ok_or_else(|| "apply request missing correlation".to_owned())?;
             let unknown = eliot_store_api::response_frame(
-                server_requirement.connection_id.as_str(),
-                ProtocolVersion::CURRENT,
+                session.connection_id(),
+                session.protocol_version(),
                 Some(request_id),
-                StoreResponse::Unknown {
-                    operation_id: operation_id.clone(),
-                    reason: "test delivery boundary is unknown".to_owned(),
-                },
+                dispatch(&E2eBackend, request).await,
             )
             .map_err(|error| error.to_string())?;
             server
@@ -803,18 +911,21 @@ mod windows_e2e_tests {
                 .receive_frame(limits)
                 .await
                 .map_err(|error| error.to_string())?;
-            let (request_id, _, request) = eliot_store_api::decode_request_frame(&receipt_request)
-                .map_err(|error| error.to_string())?;
-            let requested_operation = match request {
-                StoreRequest::Receipt { operation_id } => operation_id,
+            let request = validate_request_frame(&mut session, &receipt_request)?;
+            let requested_operation = match &request {
+                StoreServiceRequest::Receipt { operation_id } => operation_id.clone(),
                 other => panic!("expected receipt reconciliation, got {other:?}"),
             };
             assert_eq!(requested_operation, operation_id);
+            let request_id = receipt_request
+                .request_id
+                .clone()
+                .ok_or_else(|| "receipt request missing correlation".to_owned())?;
             let receipt = eliot_store_api::response_frame(
-                server_requirement.connection_id.as_str(),
-                ProtocolVersion::CURRENT,
+                session.connection_id(),
+                session.protocol_version(),
                 Some(request_id),
-                StoreResponse::Receipt { receipt: None },
+                dispatch(&E2eBackend, request).await,
             )
             .map_err(|error| error.to_string())?;
             server
@@ -856,6 +967,10 @@ mod windows_e2e_tests {
     enum UnknownBoundary {
         Send,
         Receive,
+        Decode,
+        Correlation,
+        Connection,
+        Protocol,
     }
 
     struct FakeTransport {
@@ -864,6 +979,7 @@ mod windows_e2e_tests {
         reconciled: Option<OperationId>,
         last_request_id: Option<RequestId>,
         receive_failed: bool,
+        response_faulted: bool,
     }
 
     impl EbpStoreTransport for FakeTransport {
@@ -912,13 +1028,39 @@ mod windows_e2e_tests {
             let request_id = self.last_request_id.clone().ok_or_else(|| {
                 StoreClientError::Contract("receipt was not requested".to_owned())
             })?;
-            eliot_store_api::response_frame(
+            let mut response = eliot_store_api::response_frame(
                 "connection-e2e",
                 ProtocolVersion::CURRENT,
                 Some(request_id),
                 StoreResponse::Receipt { receipt: None },
             )
-            .map_err(|error| StoreClientError::Contract(error.to_string()))
+            .map_err(|error| StoreClientError::Contract(error.to_string()))?;
+            if self.applied.is_some() && self.reconciled.is_none() && !self.response_faulted {
+                match self.boundary {
+                    UnknownBoundary::Decode => {
+                        response.payload = eliot_protocol::ProtocolPayload::Json(
+                            serde_json::json!({"not": "a store response"}),
+                        );
+                    }
+                    UnknownBoundary::Correlation => {
+                        response.request_id = Some(
+                            RequestId::new("wrong-response-request").expect("test request id"),
+                        );
+                    }
+                    UnknownBoundary::Connection => {
+                        response.connection_id = "wrong-connection".to_owned();
+                    }
+                    UnknownBoundary::Protocol => {
+                        response.protocol_version = ProtocolVersion {
+                            major: ProtocolVersion::CURRENT.major,
+                            minor: ProtocolVersion::CURRENT.minor.saturating_add(1),
+                        };
+                    }
+                    UnknownBoundary::Send | UnknownBoundary::Receive => {}
+                }
+                self.response_faulted = true;
+            }
+            Ok(response)
         }
     }
 
@@ -936,6 +1078,7 @@ mod windows_e2e_tests {
             reconciled: None,
             last_request_id: None,
             receive_failed: false,
+            response_faulted: false,
         };
         let transport_state = Arc::new(Mutex::new(transport));
         let client = EbpCanonicalStoreClient {
@@ -973,6 +1116,46 @@ mod windows_e2e_tests {
     #[tokio::test(flavor = "current_thread")]
     async fn unknown_receive_preserves_exact_operation_for_receipt_lookup() {
         let (error, reconciled) = apply_with_fake_boundary(UnknownBoundary::Receive).await;
+        assert!(matches!(error, StoreError::Unavailable));
+        assert_eq!(
+            reconciled.expect("reconciliation request").as_str(),
+            "operation-e2e"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn malformed_response_preserves_exact_operation_for_receipt_lookup() {
+        let (error, reconciled) = apply_with_fake_boundary(UnknownBoundary::Decode).await;
+        assert!(matches!(error, StoreError::Unavailable));
+        assert_eq!(
+            reconciled.expect("reconciliation request").as_str(),
+            "operation-e2e"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn wrong_correlation_preserves_exact_operation_for_receipt_lookup() {
+        let (error, reconciled) = apply_with_fake_boundary(UnknownBoundary::Correlation).await;
+        assert!(matches!(error, StoreError::Unavailable));
+        assert_eq!(
+            reconciled.expect("reconciliation request").as_str(),
+            "operation-e2e"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn wrong_connection_preserves_exact_operation_for_receipt_lookup() {
+        let (error, reconciled) = apply_with_fake_boundary(UnknownBoundary::Connection).await;
+        assert!(matches!(error, StoreError::Unavailable));
+        assert_eq!(
+            reconciled.expect("reconciliation request").as_str(),
+            "operation-e2e"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn wrong_protocol_preserves_exact_operation_for_receipt_lookup() {
+        let (error, reconciled) = apply_with_fake_boundary(UnknownBoundary::Protocol).await;
         assert!(matches!(error, StoreError::Unavailable));
         assert_eq!(
             reconciled.expect("reconciliation request").as_str(),

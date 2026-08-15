@@ -9,17 +9,20 @@
 
 use std::fmt;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use eliot_contracts::{ArtifactId, AuthorityEpoch, ContractId, ResourceGeneration, StateFence};
+use eliot_contracts::{
+    ArtifactId, AuthorityEpoch, ContractId, RequestMetadata, ResourceGeneration, StateFence,
+};
 use eliot_ipc::{
     HandshakeResult, PeerIdentity, ServerHandshakePolicy, Session, TransportError, TransportLimits,
 };
 use eliot_kernel_core::{GenerationRoute, GenerationRouter, RouteScope};
 use eliot_kernel_service::{
     EbpCanonicalStoreClient, HostStoreBootstrapRequirement, KernelControlCommand, KernelService,
-    KernelServiceError, KernelServiceState, PreparedTransitionGateway, StoreClientError,
+    KernelServiceError, KernelServiceState, StoreClientError,
 };
 #[cfg(test)]
 use eliot_ors::CanonicalEvidenceProvider;
@@ -36,7 +39,10 @@ use eliot_runtime_contracts::{
     GenerationCutoverRecord as RuntimeGenerationCutoverRecord, GenerationCutoverState,
     HealthVector, ModuleGeneration, ModuleGenerationState,
 };
-use eliot_store_api::CanonicalStoreClient;
+use eliot_store_api::{
+    CanonicalStoreClient, OrderingHeadExpectation, PreparedTransition, RevisionHeadExpectation,
+    StoreError, WriteReceipt,
+};
 use sha2::{Digest as _, Sha256};
 
 #[cfg(windows)]
@@ -48,6 +54,8 @@ use eliot_platform_windows::NamedPipePeerExpectation;
 pub const SERVICE_NAME: &str = "eliot-kernel";
 pub const PROTOCOL_VERSION: &str = "eliot.kernel.v1";
 pub const DEFAULT_PIPE_NAME: &str = r"\\.\pipe\eliot\kernel\frontdoor";
+const STORE_BRIDGE_ROUTE: &str = "store_bridge";
+const ACTIVE_DAEMON_CALLER: &str = "eliotd";
 
 /// The only transport implementation admitted by the Windows-first Kernel.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -131,6 +139,8 @@ pub enum KernelBuildError {
     Service(String),
     /// Host has not injected an approved canonical-store bootstrap binding.
     StoreBootstrapRequired,
+    /// This composition already owns its one canonical-store client/gateway.
+    StoreAlreadyConnected,
     /// The platform could not bind the authenticated local front door.
     Principal(String),
 }
@@ -146,6 +156,9 @@ impl fmt::Display for KernelBuildError {
             Self::Service(error) => write!(f, "Kernel service composition failed: {error}"),
             Self::StoreBootstrapRequired => {
                 write!(f, "Host-approved canonical-store bootstrap is required")
+            }
+            Self::StoreAlreadyConnected => {
+                write!(f, "canonical-store client/gateway is already connected")
             }
             Self::Principal(error) => write!(f, "principal composition failed: {error}"),
         }
@@ -166,6 +179,9 @@ pub struct KernelComposition {
     front_door_policy: Mutex<ServerHandshakePolicy>,
     process_executor: WindowsProcessExecutor,
     store_bootstrap: Option<HostStoreBootstrapRequirement>,
+    canonical_store_claimed: AtomicBool,
+    #[cfg(windows)]
+    canonical_store_gateway: Mutex<Option<Arc<KernelStoreGateway>>>,
 }
 
 /// Result of the closed Kernel semantic gateway for one authenticated frame.
@@ -195,6 +211,100 @@ impl DispatchValidationPort for HandoffDispatchPort {
         Err(ProcessExecutionError::Unavailable(
             "Kernel Host handoff has not activated process dispatch authority".to_owned(),
         ))
+    }
+}
+
+/// The concrete, non-generic S-03 gateway retained by one Kernel composition.
+///
+/// There is deliberately no public constructor accepting a client or caller:
+/// [`KernelComposition::connect_canonical_store`] is the only production
+/// construction path and supplies the Host-approved client, fixed
+/// `store_bridge` route, and fixed active daemon caller.
+#[cfg(windows)]
+pub struct KernelStoreGateway {
+    service: Arc<Mutex<KernelService>>,
+    store: Arc<EbpCanonicalStoreClient<NamedPipeTransport>>,
+    route: GenerationRoute,
+}
+
+#[cfg(windows)]
+impl std::fmt::Debug for KernelStoreGateway {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("KernelStoreGateway")
+            .field("route", &self.route)
+            .field("caller", &ACTIVE_DAEMON_CALLER)
+            .finish_non_exhaustive()
+    }
+}
+
+#[cfg(windows)]
+impl KernelStoreGateway {
+    fn new(
+        service: Arc<Mutex<KernelService>>,
+        store: Arc<EbpCanonicalStoreClient<NamedPipeTransport>>,
+        route: GenerationRoute,
+    ) -> Self {
+        Self {
+            service,
+            store,
+            route,
+        }
+    }
+
+    /// Applies one already prepared transition after fixed Kernel admission.
+    pub async fn apply(
+        &self,
+        context: &RequestMetadata,
+        transition: PreparedTransition,
+        expected_revision_heads: Vec<RevisionHeadExpectation>,
+        expected_ordering_heads: Vec<OrderingHeadExpectation>,
+    ) -> Result<WriteReceipt, String> {
+        context.validate().map_err(|error| error.to_string())?;
+        transition.validate().map_err(|error| error.to_string())?;
+        if context.source_id.as_str() != ACTIVE_DAEMON_CALLER {
+            return Err("transition caller is not the active daemon".to_owned());
+        }
+        if transition.state_fence != context.state_fence {
+            return Err("transition state fence does not match request metadata".to_owned());
+        }
+
+        let lease = {
+            let service = self
+                .service
+                .lock()
+                .map_err(|_| "Kernel service lock poisoned".to_owned())?;
+            if service.generation_fenced() {
+                return Err("Kernel generation is fenced".to_owned());
+            }
+            if self.route.authority_epoch() != service.authority_epoch()
+                || self.route.active_generation() != transition.state_fence.resource_generation
+            {
+                return Err(
+                    "canonical-store route is outside the active Kernel generation".to_owned(),
+                );
+            }
+            let lease = service
+                .acquire_admission()
+                .map_err(|error| error.to_string())?;
+            if lease.authority_epoch() != transition.state_fence.authority_epoch {
+                return Err("canonical-store route authority epoch is stale".to_owned());
+            }
+            lease
+        };
+
+        let result = self
+            .store
+            .apply_prepared(
+                context,
+                transition,
+                expected_revision_heads,
+                expected_ordering_heads,
+            )
+            .await
+            .map_err(|error: StoreError| error.to_string());
+        drop(lease);
+        result
     }
 }
 
@@ -463,6 +573,9 @@ impl KernelComposition {
             front_door_policy: Mutex::new(policy),
             process_executor: WindowsProcessExecutor::new(authority),
             store_bootstrap,
+            canonical_store_claimed: AtomicBool::new(false),
+            #[cfg(windows)]
+            canonical_store_gateway: Mutex::new(None),
         })
     }
 
@@ -491,58 +604,27 @@ impl KernelComposition {
         self.store_bootstrap.as_ref()
     }
 
-    /// Binds the sole Kernel transition gateway to an injected canonical store
-    /// client. The caller cannot bypass Host bootstrap or the current route.
-    pub fn prepared_transition_gateway<C: CanonicalStoreClient + 'static>(
-        &self,
-        store: Arc<C>,
-        caller: ContractId,
-    ) -> Result<PreparedTransitionGateway<C>, KernelBuildError> {
-        let requirement = self
-            .store_bootstrap
-            .as_ref()
-            .ok_or(KernelBuildError::StoreBootstrapRequired)?;
-        requirement
-            .validate()
-            .map_err(|error| KernelBuildError::Service(error.to_string()))?;
-        let route_scope = RouteScope::new("store_bridge")
-            .map_err(|error| KernelBuildError::Core(error.to_string()))?;
-        let routes = self
-            .generation_route_snapshot()
-            .map_err(|error| KernelBuildError::Core(error.to_string()))?;
-        let route = routes
-            .route(&route_scope)
-            .map_err(|error| KernelBuildError::Core(error.to_string()))?
-            .clone();
-        if route.authority_epoch() != requirement.authority_epoch()
-            || route.active_generation() != requirement.store_generation
-        {
-            return Err(KernelBuildError::Core(
-                "store bootstrap does not match the active Kernel route".to_owned(),
-            ));
-        }
-        Ok(PreparedTransitionGateway::new(
-            self.service.clone(),
-            store,
-            route,
-            caller,
-        ))
-    }
-
-    /// Connects the Host-approved canonical store through the sole Kernel
-    /// transport/client composition and returns its transition gateway.
-    ///
-    /// The Host requirement is the only source of pipe, peer, generation and
-    /// fence data.  No daemon or caller may construct a second store client.
+    /// Connects and retains the one Host-approved canonical-store client and
+    /// concrete Kernel gateway. The caller and route are fixed by this
+    /// composition; neither can be injected by a daemon or test adapter.
     #[cfg(windows)]
     pub async fn connect_canonical_store(
         &self,
         timeout: Duration,
-        caller: ContractId,
-    ) -> Result<
-        PreparedTransitionGateway<EbpCanonicalStoreClient<NamedPipeTransport>>,
-        KernelBuildError,
-    > {
+    ) -> Result<Arc<KernelStoreGateway>, KernelBuildError> {
+        self.claim_canonical_store_slot()?;
+        let result = self.connect_canonical_store_inner(timeout).await;
+        if result.is_err() {
+            self.canonical_store_claimed.store(false, Ordering::Release);
+        }
+        result
+    }
+
+    #[cfg(windows)]
+    async fn connect_canonical_store_inner(
+        &self,
+        timeout: Duration,
+    ) -> Result<Arc<KernelStoreGateway>, KernelBuildError> {
         let requirement = self
             .store_bootstrap
             .clone()
@@ -562,14 +644,50 @@ impl KernelComposition {
         )
         .await
         .map_err(KernelBuildError::Transport)?;
-        let client = EbpCanonicalStoreClient::connect(transport, requirement)
+        let client = EbpCanonicalStoreClient::connect(transport, requirement.clone())
             .await
             .map_err(|error| match error {
                 StoreClientError::Transport(error) => KernelBuildError::Service(error),
                 StoreClientError::Contract(error) => KernelBuildError::Service(error),
                 StoreClientError::Store(error) => KernelBuildError::Service(error.to_string()),
             })?;
-        self.prepared_transition_gateway(Arc::new(client), caller)
+        let route_scope = RouteScope::new(STORE_BRIDGE_ROUTE)
+            .map_err(|error| KernelBuildError::Core(error.to_string()))?;
+        let routes = self
+            .generation_route_snapshot()
+            .map_err(|error| KernelBuildError::Core(error.to_string()))?;
+        let route = routes
+            .route(&route_scope)
+            .map_err(|error| KernelBuildError::Core(error.to_string()))?
+            .clone();
+        if route.authority_epoch() != requirement.authority_epoch()
+            || route.active_generation() != requirement.store_generation
+        {
+            return Err(KernelBuildError::Core(
+                "store bootstrap does not match the active Kernel store route".to_owned(),
+            ));
+        }
+        let gateway = Arc::new(KernelStoreGateway::new(
+            self.service.clone(),
+            Arc::new(client),
+            route,
+        ));
+        let mut retained = self
+            .canonical_store_gateway
+            .lock()
+            .map_err(|_| KernelBuildError::Service("store gateway lock poisoned".to_owned()))?;
+        if retained.is_some() {
+            return Err(KernelBuildError::StoreAlreadyConnected);
+        }
+        *retained = Some(gateway.clone());
+        Ok(gateway)
+    }
+
+    fn claim_canonical_store_slot(&self) -> Result<(), KernelBuildError> {
+        self.canonical_store_claimed
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .map(|_| ())
+            .map_err(|_| KernelBuildError::StoreAlreadyConnected)
     }
 
     /// Returns the platform surface owned by this composition.
@@ -957,6 +1075,325 @@ mod tests {
             ));
         }
 
+        drop(kernel);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn canonical_store_slot_rejects_a_second_client_or_writer() {
+        let root = std::env::temp_dir().join(format!(
+            "eliot-kernel-store-slot-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).expect("test work root");
+        let kernel = KernelComposition::new(KernelConfig::new(&root)).expect("kernel composition");
+
+        assert!(kernel.claim_canonical_store_slot().is_ok());
+        assert!(matches!(
+            kernel.claim_canonical_store_slot(),
+            Err(KernelBuildError::StoreAlreadyConnected)
+        ));
+
+        drop(kernel);
+        let _ = std::fs::remove_dir_all(root);
+    }
+}
+
+#[cfg(all(test, windows))]
+mod store_gateway_tests {
+    use super::*;
+    use std::collections::BTreeMap;
+    use std::time::Duration;
+
+    use eliot_contracts::{
+        AuthorityEpoch, ProductId, RequestId, ResourceGeneration, SourceId, StateFence,
+    };
+    use eliot_ipc::{NamedPipeServer, TransportLimits};
+    use eliot_kernel_service::{
+        HostKernelHandshake, KernelReadyReceipt, ProcessObservation, RestartBudget,
+    };
+    use eliot_platform::PlatformHandle;
+    use eliot_runtime_contracts::{HealthVector, ServiceProcessState};
+    use eliot_store_api::{
+        EventProjectionRelationIntents, NamedMutationOperation, NamedMutationRequest, OperationId,
+        OperationIdentity, OperationManifestDigest, SecurityContext, TransitionClass,
+    };
+    use eliot_store_surreal::{
+        Request as StoreRequest, Response as StoreResponse, StoreDispatchBackend,
+        StoreHandshakeIdentity, StoreLaunchConfig, admit_handshake, dispatch, launch_config_digest,
+        validate_request_frame,
+    };
+
+    fn requirement(pipe: String) -> HostStoreBootstrapRequirement {
+        let expectation = eliot_platform_windows::current_process_named_pipe_expectation()
+            .expect("current process expectation");
+        let fence = StateFence::new(AuthorityEpoch::genesis(), ResourceGeneration::genesis());
+        let mut config = StoreLaunchConfig {
+            store_pipe: pipe.clone(),
+            launch_nonce: "kernel-store-gateway-test".to_owned(),
+            expected_client_sid: expectation.expected_sid().to_owned(),
+            expected_client_session_id: expectation.expected_session_id(),
+            approved_artifact_hash: "a".repeat(64),
+            approved_config_hash: String::new(),
+            store_generation: fence.resource_generation.value(),
+            authority_epoch: fence.authority_epoch.value(),
+            endpoint: "ws://127.0.0.1:8000".to_owned(),
+            namespace: "eliot".to_owned(),
+            database: "eliot".to_owned(),
+            username: "store".to_owned(),
+            connect_timeout_ms: 5_000,
+            query_timeout_ms: 5_000,
+            schema_generation: "1.0.0".to_owned(),
+            blob_root: r"C:\ProgramData\Eliot\blob".to_owned(),
+            instance_id: "kernel-store-gateway-test".to_owned(),
+            credential_ref: "eliot/store".to_owned(),
+        };
+        config.approved_config_hash = launch_config_digest(&config).expect("config digest");
+        HostStoreBootstrapRequirement {
+            store_pipe: PlatformHandle::new(pipe).expect("store pipe"),
+            store_generation: fence.resource_generation,
+            schema_generation: PlatformHandle::new("1.0.0").expect("schema generation"),
+            state_fence: fence,
+            launch_nonce: PlatformHandle::new(config.launch_nonce).expect("launch nonce"),
+            connection_id: PlatformHandle::new("kernel-store-gateway-connection")
+                .expect("connection id"),
+            expected_peer_sid: PlatformHandle::new(config.expected_client_sid).expect("peer sid"),
+            expected_peer_session_id: config.expected_client_session_id,
+            approved_artifact_hash: PlatformHandle::new(config.approved_artifact_hash)
+                .expect("artifact hash"),
+            approved_config_hash: PlatformHandle::new(config.approved_config_hash)
+                .expect("config hash"),
+        }
+    }
+
+    fn store_config(requirement: &HostStoreBootstrapRequirement) -> StoreLaunchConfig {
+        let mut config = StoreLaunchConfig {
+            store_pipe: requirement.store_pipe.as_str().to_owned(),
+            launch_nonce: requirement.launch_nonce.as_str().to_owned(),
+            expected_client_sid: requirement.expected_peer_sid.as_str().to_owned(),
+            expected_client_session_id: requirement.expected_peer_session_id,
+            approved_artifact_hash: requirement.approved_artifact_hash.as_str().to_owned(),
+            approved_config_hash: String::new(),
+            store_generation: requirement.store_generation.value(),
+            authority_epoch: requirement.authority_epoch().value(),
+            endpoint: "ws://127.0.0.1:8000".to_owned(),
+            namespace: "eliot".to_owned(),
+            database: "eliot".to_owned(),
+            username: "store".to_owned(),
+            connect_timeout_ms: 5_000,
+            query_timeout_ms: 5_000,
+            schema_generation: requirement.schema_generation.as_str().to_owned(),
+            blob_root: r"C:\ProgramData\Eliot\blob".to_owned(),
+            instance_id: "kernel-store-gateway-test".to_owned(),
+            credential_ref: "eliot/store".to_owned(),
+        };
+        config.approved_config_hash = launch_config_digest(&config).expect("config digest");
+        config
+    }
+
+    struct Backend;
+
+    impl StoreDispatchBackend for Backend {
+        async fn dispatch_request(&self, request: StoreRequest) -> StoreResponse {
+            match request {
+                StoreRequest::Readiness => StoreResponse::Readiness {
+                    receipt: eliot_store_api::ReadinessReceipt::ready("1.0.0".to_owned()),
+                },
+                StoreRequest::Apply { transition, .. } => StoreResponse::Unknown {
+                    operation_id: transition.identity.operation_id,
+                    reason: "test provider outcome is unknown".to_owned(),
+                },
+                StoreRequest::Receipt { .. } => StoreResponse::Receipt { receipt: None },
+                _ => StoreResponse::Error {
+                    error: "unexpected request in Kernel gateway E2E".to_owned(),
+                },
+            }
+        }
+    }
+
+    fn prepare_transition(fence: StateFence) -> eliot_store_api::PreparedTransition {
+        let mut parameters = BTreeMap::new();
+        parameters.insert("subject".to_owned(), serde_json::json!("kernel-gateway"));
+        eliot_store_api::PreparedTransition {
+            identity: OperationIdentity {
+                operation_id: OperationId::new("kernel-gateway-operation").expect("operation id"),
+                idempotency_key: "kernel-gateway-idempotency".to_owned(),
+                canonical_request_hash: "c".repeat(64),
+            },
+            state_fence: fence,
+            scope_id: eliot_store_api::ScopeId::new("kernel-gateway-scope").expect("scope"),
+            task_id: None,
+            ordering_scopes: vec![
+                eliot_store_api::OrderingScopeId::new("kernel-gateway-scope")
+                    .expect("ordering scope"),
+            ],
+            transition_class: TransitionClass::CaptureCandidate,
+            requested_effect_ceiling: eliot_store_api::EffectClass::Candidate,
+            admission_contract_set_digest: "d".repeat(64),
+            operation_manifest_digest: OperationManifestDigest::new("manifest-e2e")
+                .expect("manifest"),
+            named_operations: vec![NamedMutationRequest {
+                operation: NamedMutationOperation::CaptureObservation,
+                parameters,
+            }],
+            event_projection_relation_intents: EventProjectionRelationIntents {
+                event_ids: Vec::new(),
+                projection_kinds: Vec::new(),
+                relation_kinds: Vec::new(),
+            },
+            security: SecurityContext::default(),
+            required_proof_and_approval_refs: Vec::new(),
+        }
+    }
+
+    fn ready_kernel(kernel: &KernelComposition) {
+        let handshake = HostKernelHandshake {
+            installation_id: PlatformHandle::new("installation-test").expect("installation"),
+            host_epoch: AuthorityEpoch::genesis(),
+            kernel_epoch: AuthorityEpoch::genesis(),
+            activation_id: PlatformHandle::new("activation-test").expect("activation"),
+            artifact_hash: PlatformHandle::new("kernel-artifact").expect("artifact"),
+            config_hash: PlatformHandle::new("kernel-config").expect("config"),
+            activation_nonce: PlatformHandle::new("activation-nonce").expect("nonce"),
+            job_object_id: PlatformHandle::new("job-test").expect("job"),
+            pipe_identity: PlatformHandle::new("pipe-test").expect("pipe"),
+            restart_budget: RestartBudget::new(1, 1).expect("budget"),
+            containment_action: None,
+        };
+        kernel
+            .apply_control(KernelControlCommand::Reconcile(handshake.clone()))
+            .expect("reconcile");
+        kernel
+            .apply_control(KernelControlCommand::Shadow)
+            .expect("shadow");
+        kernel
+            .apply_control(KernelControlCommand::PrepareHandoff)
+            .expect("handoff");
+        kernel
+            .apply_control(KernelControlCommand::Activate)
+            .expect("activate");
+        let ready = KernelReadyReceipt {
+            activation_id: handshake.activation_id.clone(),
+            activation_nonce: handshake.activation_nonce.clone(),
+            process: ProcessObservation {
+                process_id: PlatformHandle::new("process-test").expect("process"),
+                job_object_id: handshake.job_object_id.clone(),
+                state: ServiceProcessState::Ready,
+                health: HealthVector::healthy(),
+                evidence_refs: vec![PlatformHandle::new("process-evidence").expect("evidence")],
+            },
+            health: HealthVector::healthy(),
+            evidence_refs: vec![PlatformHandle::new("ready-evidence").expect("evidence")],
+        };
+        kernel
+            .apply_control(KernelControlCommand::Ready(ready))
+            .expect("ready");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn kernel_owned_gateway_uses_production_store_admission_and_receipt_path() {
+        let pipe = format!(
+            r"\\.\pipe\eliot\kernel-store-gateway\{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        );
+        let requirement = requirement(pipe.clone());
+        let expectation = eliot_platform_windows::current_process_named_pipe_expectation()
+            .expect("current process expectation");
+        let mut server = NamedPipeServer::create(&pipe, &expectation).expect("secured pipe");
+        let server_requirement = requirement.clone();
+        let server_expectation = expectation.clone();
+        let server_task = tokio::spawn(async move {
+            server
+                .wait_for_authenticated_client(Duration::from_secs(5), &server_expectation)
+                .await
+                .map_err(|error| error.to_string())?;
+            let limits = TransportLimits::default();
+            let hello = server
+                .receive_frame(limits)
+                .await
+                .map_err(|error| error.to_string())?;
+            let config = store_config(&server_requirement);
+            let identity = StoreHandshakeIdentity::new(
+                "manifest-e2e",
+                serde_json::json!({"owner": "kernel-test"}),
+            );
+            let (mut session, server_hello) = admit_handshake(hello, limits, &config, &identity)?;
+            let hello_frame = eliot_ipc::server_hello_frame(session.connection_id(), &server_hello)
+                .map_err(|error| error.to_string())?;
+            server
+                .send_frame(&hello_frame, limits)
+                .await
+                .map_err(|error| error.to_string())?;
+            for _ in 0..3 {
+                let request_frame = server
+                    .receive_frame(limits)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                let request_id = request_frame
+                    .request_id
+                    .clone()
+                    .ok_or_else(|| "request missing correlation".to_owned())?;
+                let request = validate_request_frame(&mut session, &request_frame)?;
+                let response = dispatch(&Backend, request).await;
+                let response_frame = eliot_store_api::response_frame(
+                    session.connection_id(),
+                    session.protocol_version(),
+                    Some(request_id),
+                    response,
+                )
+                .map_err(|error| error.to_string())?;
+                server
+                    .send_frame(&response_frame, limits)
+                    .await
+                    .map_err(|error| error.to_string())?;
+            }
+            Ok::<(), String>(())
+        });
+
+        let root = std::env::temp_dir().join(format!(
+            "eliot-kernel-store-gateway-root-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).expect("test root");
+        let kernel = KernelComposition::new(
+            KernelConfig::new(&root).with_store_bootstrap(requirement.clone()),
+        )
+        .expect("kernel composition");
+        ready_kernel(&kernel);
+        let gateway = kernel
+            .connect_canonical_store(Duration::from_secs(5))
+            .await
+            .expect("Kernel-owned store gateway");
+        let context = RequestMetadata {
+            request_id: RequestId::new("kernel-gateway-request").expect("request id"),
+            session_id: None,
+            task_id: None,
+            product_id: ProductId::new("eliot-kernel").expect("product"),
+            source_id: SourceId::new(ACTIVE_DAEMON_CALLER).expect("source"),
+            state_fence: requirement.state_fence.clone(),
+            clock: Default::default(),
+        };
+        let result = gateway
+            .apply(
+                &context,
+                prepare_transition(requirement.state_fence),
+                Vec::new(),
+                Vec::new(),
+            )
+            .await;
+        assert!(result.is_err(), "unknown apply must not become success");
+        server_task
+            .await
+            .expect("server task")
+            .expect("production S03 server path");
         drop(kernel);
         let _ = std::fs::remove_dir_all(root);
     }

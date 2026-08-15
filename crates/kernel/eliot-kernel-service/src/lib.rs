@@ -14,14 +14,12 @@
 #![warn(missing_docs)]
 
 mod lifecycle;
-mod prepared_transition;
 mod protocol;
 mod store_client;
 
 pub use lifecycle::{
     AdmissionLease, KernelService, KernelServiceError, KernelServiceState, ServiceFailure,
 };
-pub use prepared_transition::{PreparedTransitionError, PreparedTransitionGateway};
 pub use protocol::{
     ContainmentAction, HostKernelHandshake, HostStoreBootstrapRequirement, KernelControlCommand,
     KernelReadyReceipt, ProcessObservation, RestartBudget,

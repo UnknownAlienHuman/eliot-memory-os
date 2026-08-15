@@ -31,5 +31,8 @@ serde_json.workspace = true
 sha2.workspace = true
 tokio.workspace = true
 
+[dev-dependencies]
+eliot-store-surreal = { path = "../eliot-store-surreal" }
+
 [lints]
 workspace = true

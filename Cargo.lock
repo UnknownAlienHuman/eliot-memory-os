@@ -1106,6 +1106,7 @@ dependencies = [
  "eliot-runtime",
  "eliot-runtime-contracts",
  "eliot-store-api",
+ "eliot-store-surreal",
  "serde_json",
  "sha2 0.10.9",
  "tokio",
@@ -1142,6 +1143,7 @@ dependencies = [
  "eliot-receipts",
  "eliot-runtime-contracts",
  "eliot-store-api",
+ "eliot-store-surreal",
  "schemars",
  "serde",
  "serde_json",
@@ -1643,9 +1645,11 @@ name = "eliot-store-surreal"
 version = "0.1.0"
 dependencies = [
  "eliot-blob",
+ "eliot-contracts",
  "eliot-ipc",
  "eliot-platform-windows",
  "eliot-protocol",
+ "eliot-runtime-contracts",
  "eliot-store-api",
  "eliot-store-surreal-adapter",
  "secrecy",

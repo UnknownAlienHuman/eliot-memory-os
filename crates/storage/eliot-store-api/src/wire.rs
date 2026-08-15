@@ -506,11 +506,30 @@ pub fn response_frame(
     Ok(frame)
 }
 
-/// Decodes and validates one correlated Result response frame.
-pub fn decode_response_frame(frame: &Frame) -> Result<(RequestId, StoreResponse), StoreWireError> {
+/// Decodes and validates one correlated Result response frame bound to the
+/// already authenticated EBP session.
+///
+/// Response shape validation alone is not sufficient for an Apply: a frame
+/// from another connection or protocol epoch must remain an unknown outcome
+/// for the exact operation rather than being accepted as a response.
+pub fn decode_response_frame(
+    frame: &Frame,
+    expected_connection_id: &str,
+    expected_protocol: ProtocolVersion,
+) -> Result<(RequestId, StoreResponse), StoreWireError> {
     frame
         .validate()
         .map_err(|error| StoreWireError::Protocol(error.to_string()))?;
+    if frame.connection_id != expected_connection_id {
+        return Err(StoreWireError::Identity(
+            "response connection_id does not match the authenticated session".to_owned(),
+        ));
+    }
+    if frame.protocol_version != expected_protocol {
+        return Err(StoreWireError::Protocol(
+            "response protocol does not match the negotiated session".to_owned(),
+        ));
+    }
     if frame.encoding_profile != EncodingProfile::JsonV1
         || frame.kind != FrameKind::Response
         || frame.message_type != MessageType::Result
