@@ -302,6 +302,10 @@ pub struct JobObject {
     handle: windows_sys::Win32::Foundation::HANDLE,
 }
 
+// SAFETY: a Job Object handle is process-global and uniquely owned here.
+#[cfg(windows)]
+unsafe impl Send for JobObject {}
+
 #[cfg(windows)]
 impl JobObject {
     /// Creates a Job Object with kill-on-close configured before publication.
@@ -343,7 +347,6 @@ impl JobObject {
     /// Returns a typed adapter error for invalid identity, access or assignment failure.
     pub fn assign_process(&self, process_id: u32) -> Result<ProcessIdentity, WindowsAdapterError> {
         use windows_sys::Win32::Foundation::CloseHandle;
-        use windows_sys::Win32::System::JobObjects::AssignProcessToJobObject;
         use windows_sys::Win32::System::Threading::{
             OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SET_QUOTA, PROCESS_TERMINATE,
         };
@@ -360,15 +363,33 @@ impl JobObject {
         if process.is_null() {
             return Err(last_windows_adapter_error());
         }
-        let assigned = unsafe { AssignProcessToJobObject(self.handle, process) } != 0;
-        let result = if assigned {
+        let assigned = self.assign_process_handle(process);
+        let result = if assigned.is_ok() {
             inspect_process_handle(process_id, process)
                 .map_err(|error| windows_adapter_from_io(&error))
         } else {
-            Err(last_windows_adapter_error())
+            Err(assigned.err().unwrap_or(WindowsAdapterError::Failed))
         };
         unsafe { CloseHandle(process) };
         result
+    }
+
+    fn assign_process_handle(
+        &self,
+        process: windows_sys::Win32::Foundation::HANDLE,
+    ) -> Result<(), WindowsAdapterError> {
+        use windows_sys::Win32::System::JobObjects::AssignProcessToJobObject;
+        if unsafe { AssignProcessToJobObject(self.handle, process) } == 0 {
+            Err(last_windows_adapter_error())
+        } else {
+            Ok(())
+        }
+    }
+
+    fn contains_process(&self, process_id: u32) -> Result<bool, WindowsAdapterError> {
+        job_process_ids(self.handle)
+            .map(|processes| processes.into_iter().any(|pid| pid == process_id))
+            .map_err(|error| windows_adapter_from_io(&error))
     }
 
     /// Terminates every process currently assigned to this job.
@@ -392,6 +413,697 @@ impl Drop for JobObject {
     fn drop(&mut self) {
         unsafe { windows_sys::Win32::Foundation::CloseHandle(self.handle) };
     }
+}
+
+#[cfg(windows)]
+struct OwnedProcessHandle(windows_sys::Win32::Foundation::HANDLE);
+
+// SAFETY: Windows kernel handles are process-global. This wrapper retains
+// unique ownership and closes the handle exactly once in Drop.
+#[cfg(windows)]
+unsafe impl Send for OwnedProcessHandle {}
+
+#[cfg(windows)]
+impl OwnedProcessHandle {
+    fn new(handle: windows_sys::Win32::Foundation::HANDLE) -> Result<Self, WindowsAdapterError> {
+        if handle.is_null() {
+            Err(last_windows_adapter_error())
+        } else {
+            Ok(Self(handle))
+        }
+    }
+}
+
+#[cfg(windows)]
+impl Drop for OwnedProcessHandle {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            unsafe { windows_sys::Win32::Foundation::CloseHandle(self.0) };
+        }
+    }
+}
+
+#[cfg(windows)]
+struct SuspendedProcessCleanup {
+    process: windows_sys::Win32::Foundation::HANDLE,
+    armed: bool,
+}
+
+#[cfg(windows)]
+impl SuspendedProcessCleanup {
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+#[cfg(windows)]
+impl Drop for SuspendedProcessCleanup {
+    fn drop(&mut self) {
+        use windows_sys::Win32::System::Threading::{TerminateProcess, WaitForSingleObject};
+        if self.armed && !self.process.is_null() {
+            let _ = unsafe { TerminateProcess(self.process, 0xE1_04) };
+            let _ = unsafe { WaitForSingleObject(self.process, 5_000) };
+        }
+    }
+}
+
+#[cfg(windows)]
+struct PinnedExecutable {
+    _file: std::fs::File,
+    identity: FileIdentity,
+}
+
+#[cfg(windows)]
+impl PinnedExecutable {
+    fn open(path: &Path) -> Result<Self, WindowsAdapterError> {
+        use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Storage::FileSystem::{
+            BY_HANDLE_FILE_INFORMATION, FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_OPEN_REPARSE_POINT,
+            FILE_SHARE_READ, GetFileInformationByHandle,
+        };
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(path)
+            .map_err(|error| windows_adapter_from_io(&error))?;
+        let metadata = file
+            .metadata()
+            .map_err(|error| windows_adapter_from_io(&error))?;
+        if !metadata.is_file() || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err(WindowsAdapterError::InvalidInput);
+        }
+        let mut information = BY_HANDLE_FILE_INFORMATION::default();
+        if unsafe { GetFileInformationByHandle(file.as_raw_handle().cast(), &raw mut information) }
+            == 0
+        {
+            return Err(last_windows_adapter_error());
+        }
+        Ok(Self {
+            _file: file,
+            identity: FileIdentity {
+                volume_serial_number: information.dwVolumeSerialNumber,
+                file_index: (u64::from(information.nFileIndexHigh) << 32)
+                    | u64::from(information.nFileIndexLow),
+            },
+        })
+    }
+}
+
+/// Complete deterministic input to the Windows suspended-launch primitive.
+///
+/// This value contains mechanics only. It is not a dispatch permit and carries
+/// no authority. Environment inheritance is intentionally unavailable: callers
+/// must supply the complete child environment explicitly.
+#[cfg(windows)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SuspendedLaunchSpec {
+    executable: PathBuf,
+    arguments: Vec<std::ffi::OsString>,
+    working_directory: PathBuf,
+    environment: Vec<(std::ffi::OsString, std::ffi::OsString)>,
+}
+
+#[cfg(windows)]
+impl SuspendedLaunchSpec {
+    /// Creates a deterministic launch specification without granting authority.
+    ///
+    /// # Errors
+    /// Returns `InvalidInput` unless the executable and working directory are
+    /// absolute existing paths and all argument/environment material is valid
+    /// Windows UTF-16 without duplicate case-insensitive environment names.
+    pub fn new(
+        executable: impl Into<PathBuf>,
+        arguments: Vec<std::ffi::OsString>,
+        working_directory: impl Into<PathBuf>,
+        environment: Vec<(std::ffi::OsString, std::ffi::OsString)>,
+    ) -> Result<Self, WindowsAdapterError> {
+        let executable = executable.into();
+        let working_directory = working_directory.into();
+        if !executable.is_absolute()
+            || !executable.is_file()
+            || !working_directory.is_absolute()
+            || !working_directory.is_dir()
+            || os_has_nul(executable.as_os_str())
+            || os_has_nul(working_directory.as_os_str())
+            || arguments.iter().any(|argument| os_has_nul(argument))
+        {
+            return Err(WindowsAdapterError::InvalidInput);
+        }
+        validate_complete_environment(&environment)?;
+        Ok(Self {
+            executable,
+            arguments,
+            working_directory,
+            environment,
+        })
+    }
+
+    #[must_use]
+    pub fn executable(&self) -> &Path {
+        &self.executable
+    }
+
+    #[must_use]
+    pub fn arguments(&self) -> &[std::ffi::OsString] {
+        &self.arguments
+    }
+
+    #[must_use]
+    pub fn working_directory(&self) -> &Path {
+        &self.working_directory
+    }
+
+    #[must_use]
+    pub fn environment(&self) -> &[(std::ffi::OsString, std::ffi::OsString)] {
+        &self.environment
+    }
+}
+
+/// Fresh mechanics evidence observed while the process is still suspended.
+///
+/// This type is deliberately non-serializable and non-cloneable. It is never
+/// an authority receipt; only the caller-provided validator can return the
+/// opaque validation token required by the next typestate.
+#[cfg(windows)]
+pub struct SuspendedProcessEvidence {
+    process: ProcessIdentity,
+    executable: FileIdentity,
+    requested_executable: PathBuf,
+    arguments: Vec<std::ffi::OsString>,
+    working_directory: PathBuf,
+    environment: Vec<(std::ffi::OsString, std::ffi::OsString)>,
+    command_line_utf16: Vec<u16>,
+    job_process_count: u32,
+}
+
+#[cfg(windows)]
+impl SuspendedProcessEvidence {
+    #[must_use]
+    pub fn process(&self) -> &ProcessIdentity {
+        &self.process
+    }
+
+    #[must_use]
+    pub const fn executable_file_identity(&self) -> FileIdentity {
+        self.executable
+    }
+
+    #[must_use]
+    pub fn requested_executable(&self) -> &Path {
+        &self.requested_executable
+    }
+
+    #[must_use]
+    pub fn arguments(&self) -> &[std::ffi::OsString] {
+        &self.arguments
+    }
+
+    #[must_use]
+    pub fn working_directory(&self) -> &Path {
+        &self.working_directory
+    }
+
+    #[must_use]
+    pub fn environment(&self) -> &[(std::ffi::OsString, std::ffi::OsString)] {
+        &self.environment
+    }
+
+    #[must_use]
+    pub fn command_line_utf16(&self) -> &[u16] {
+        &self.command_line_utf16
+    }
+
+    #[must_use]
+    pub const fn job_process_count(&self) -> u32 {
+        self.job_process_count
+    }
+}
+
+/// Failure of the consuming caller-owned validation transition.
+#[cfg(windows)]
+#[derive(Debug, Eq, PartialEq)]
+pub enum SuspendedValidationError<E> {
+    Mechanics(WindowsAdapterError),
+    Rejected(E),
+}
+
+#[cfg(windows)]
+struct JobChildHandles {
+    process: OwnedProcessHandle,
+    thread: OwnedProcessHandle,
+    job: JobObject,
+    spawn_identity: ProcessIdentity,
+    executable: PinnedExecutable,
+    spec: SuspendedLaunchSpec,
+    command_line_utf16: Vec<u16>,
+    terminal: bool,
+}
+
+#[cfg(windows)]
+impl JobChildHandles {
+    fn fresh_evidence(&self) -> Result<SuspendedProcessEvidence, WindowsAdapterError> {
+        use windows_sys::Win32::System::Threading::GetProcessId;
+        let process_id = unsafe { GetProcessId(self.process.0) };
+        if process_id == 0 || process_id != self.spawn_identity.process_id {
+            return Err(WindowsAdapterError::IdentityMismatch);
+        }
+        let process = inspect_process_handle(process_id, self.process.0)
+            .map_err(|error| windows_adapter_from_io(&error))?;
+        if process.start_time_100ns != self.spawn_identity.start_time_100ns
+            || !same_windows_path(&process.image_path, &self.spawn_identity.image_path)
+        {
+            return Err(WindowsAdapterError::IdentityMismatch);
+        }
+        let observed_file = file_identity(Path::new(&process.image_path))
+            .map_err(|error| windows_adapter_from_io(&error))?;
+        if observed_file != self.executable.identity || !self.job.contains_process(process_id)? {
+            return Err(WindowsAdapterError::IdentityMismatch);
+        }
+        let count = u32::try_from(
+            job_process_ids(self.job.handle)
+                .map_err(|error| windows_adapter_from_io(&error))?
+                .len(),
+        )
+        .map_err(|_| WindowsAdapterError::Failed)?;
+        if count == 0 {
+            return Err(WindowsAdapterError::IdentityMismatch);
+        }
+        Ok(SuspendedProcessEvidence {
+            process,
+            executable: observed_file,
+            requested_executable: self.spec.executable.clone(),
+            arguments: self.spec.arguments.clone(),
+            working_directory: self.spec.working_directory.clone(),
+            environment: self.spec.environment.clone(),
+            command_line_utf16: self.command_line_utf16.clone(),
+            job_process_count: count,
+        })
+    }
+
+    fn active_process_count(&self) -> Result<u32, WindowsAdapterError> {
+        u32::try_from(
+            job_process_ids(self.job.handle)
+                .map_err(|error| windows_adapter_from_io(&error))?
+                .len(),
+        )
+        .map_err(|_| WindowsAdapterError::Failed)
+    }
+
+    fn root_exit_code(&self) -> Result<Option<i32>, WindowsAdapterError> {
+        use windows_sys::Win32::Foundation::{WAIT_OBJECT_0, WAIT_TIMEOUT};
+        use windows_sys::Win32::System::Threading::{GetExitCodeProcess, WaitForSingleObject};
+        match unsafe { WaitForSingleObject(self.process.0, 0) } {
+            WAIT_TIMEOUT => Ok(None),
+            WAIT_OBJECT_0 => {
+                let mut code = 0_u32;
+                if unsafe { GetExitCodeProcess(self.process.0, &raw mut code) } == 0 {
+                    return Err(last_windows_adapter_error());
+                }
+                Ok(Some(i32::from_ne_bytes(code.to_ne_bytes())))
+            }
+            _ => Err(last_windows_adapter_error()),
+        }
+    }
+
+    fn terminate_and_reap(&mut self, requested_exit_code: u32) -> Result<i32, WindowsAdapterError> {
+        use windows_sys::Win32::Foundation::WAIT_OBJECT_0;
+        use windows_sys::Win32::System::Threading::WaitForSingleObject;
+        self.job.terminate(requested_exit_code)?;
+        wait_for_job_empty(self.job.handle, std::time::Duration::from_secs(5))?;
+        if unsafe { WaitForSingleObject(self.process.0, 5_000) } != WAIT_OBJECT_0 {
+            return Err(WindowsAdapterError::Timeout);
+        }
+        let exit_code = self.root_exit_code()?.ok_or(WindowsAdapterError::Failed)?;
+        self.terminal = true;
+        Ok(exit_code)
+    }
+
+    fn best_effort_cleanup(&mut self) {
+        use windows_sys::Win32::System::Threading::{TerminateProcess, WaitForSingleObject};
+        if self.terminal {
+            return;
+        }
+        let _ = unsafe { TerminateProcess(self.process.0, 0xE1_04) };
+        let _ = self.job.terminate(0xE1_04);
+        let _ = wait_for_job_empty(self.job.handle, std::time::Duration::from_secs(5));
+        let _ = unsafe { WaitForSingleObject(self.process.0, 5_000) };
+        self.terminal = true;
+    }
+}
+
+#[cfg(windows)]
+impl Drop for JobChildHandles {
+    fn drop(&mut self) {
+        self.best_effort_cleanup();
+    }
+}
+
+/// Newly created suspended child. Validation and resume are consuming
+/// typestate transitions, so neither transition can be repeated.
+#[cfg(windows)]
+pub struct SuspendedJobChild {
+    inner: JobChildHandles,
+}
+
+/// Suspended child carrying the opaque token returned by caller-owned policy.
+#[cfg(windows)]
+pub struct ValidatedSuspendedJobChild<V> {
+    inner: JobChildHandles,
+    evidence: SuspendedProcessEvidence,
+    validation: V,
+}
+
+/// Resumed child contained by the same kill-on-close Job Object.
+#[cfg(windows)]
+pub struct RunningJobChild<V> {
+    inner: JobChildHandles,
+    evidence: SuspendedProcessEvidence,
+    validation: V,
+}
+
+/// Typed, idempotent observation of a resumed child.
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RunningJobObservation {
+    Running {
+        active_processes: u32,
+    },
+    RootExited {
+        exit_code: i32,
+        active_processes: u32,
+    },
+    Exited {
+        exit_code: i32,
+    },
+}
+
+/// Terminal receipt produced by one consuming termination transition.
+#[cfg(windows)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TerminatedJobChild {
+    process: ProcessIdentity,
+    requested_exit_code: u32,
+    observed_exit_code: i32,
+    job_empty: bool,
+    root_reaped: bool,
+}
+
+#[cfg(windows)]
+impl TerminatedJobChild {
+    #[must_use]
+    pub fn process(&self) -> &ProcessIdentity {
+        &self.process
+    }
+
+    #[must_use]
+    pub const fn requested_exit_code(&self) -> u32 {
+        self.requested_exit_code
+    }
+
+    #[must_use]
+    pub const fn observed_exit_code(&self) -> i32 {
+        self.observed_exit_code
+    }
+
+    #[must_use]
+    pub const fn job_empty(&self) -> bool {
+        self.job_empty
+    }
+
+    #[must_use]
+    pub const fn root_reaped(&self) -> bool {
+        self.root_reaped
+    }
+}
+
+#[cfg(windows)]
+impl SuspendedJobChild {
+    /// Creates a child suspended in a fresh kill-on-close Job Object.
+    ///
+    /// # Errors
+    /// Returns a typed adapter error for invalid deterministic material or any
+    /// executable pin, process creation, identity, or Job assignment failure.
+    pub fn spawn(spec: SuspendedLaunchSpec) -> Result<Self, WindowsAdapterError> {
+        use windows_sys::Win32::System::Threading::{
+            CREATE_NO_WINDOW, CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, CreateProcessW,
+            PROCESS_INFORMATION, STARTUPINFOW,
+        };
+        let executable = PinnedExecutable::open(&spec.executable)?;
+        let application = nul_terminated_wide(spec.executable.as_os_str())
+            .map_err(|error| windows_adapter_from_io(&error))?;
+        let command_line_utf16 = command_line(&spec.executable, &spec.arguments)
+            .map_err(|error| windows_adapter_from_io(&error))?;
+        let mut command_line = command_line_utf16.clone();
+        let mut environment = command_environment(&spec.environment);
+        let current_directory = nul_terminated_wide(spec.working_directory.as_os_str())
+            .map_err(|error| windows_adapter_from_io(&error))?;
+        let job = JobObject::new_kill_on_close()?;
+        let mut startup = STARTUPINFOW {
+            cb: u32::try_from(std::mem::size_of::<STARTUPINFOW>())
+                .map_err(|_| WindowsAdapterError::Failed)?,
+            ..Default::default()
+        };
+        let mut information = PROCESS_INFORMATION::default();
+        if unsafe {
+            CreateProcessW(
+                application.as_ptr(),
+                command_line.as_mut_ptr(),
+                std::ptr::null(),
+                std::ptr::null(),
+                0,
+                CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT | CREATE_NO_WINDOW,
+                environment.as_mut_ptr().cast(),
+                current_directory.as_ptr(),
+                &raw mut startup,
+                &raw mut information,
+            )
+        } == 0
+        {
+            return Err(last_windows_adapter_error());
+        }
+        if information.hProcess.is_null() || information.hThread.is_null() {
+            use windows_sys::Win32::Foundation::CloseHandle;
+            use windows_sys::Win32::System::Threading::{
+                OpenProcess, PROCESS_TERMINATE, TerminateProcess, WaitForSingleObject,
+            };
+            let cleanup_process = if information.hProcess.is_null() && information.dwProcessId != 0
+            {
+                unsafe { OpenProcess(PROCESS_TERMINATE | 0x0010_0000, 0, information.dwProcessId) }
+            } else {
+                information.hProcess
+            };
+            if !cleanup_process.is_null() {
+                let _ = unsafe { TerminateProcess(cleanup_process, 0xE1_04) };
+                let _ = unsafe { WaitForSingleObject(cleanup_process, 5_000) };
+                if cleanup_process != information.hProcess {
+                    unsafe { CloseHandle(cleanup_process) };
+                }
+            }
+            if !information.hThread.is_null() {
+                unsafe { CloseHandle(information.hThread) };
+            }
+            if !information.hProcess.is_null() {
+                unsafe { CloseHandle(information.hProcess) };
+            }
+            return Err(WindowsAdapterError::Failed);
+        }
+        let process = OwnedProcessHandle::new(information.hProcess)?;
+        let thread = OwnedProcessHandle::new(information.hThread)?;
+        let mut cleanup = SuspendedProcessCleanup {
+            process: process.0,
+            armed: true,
+        };
+        let spawn_identity = inspect_process_handle(information.dwProcessId, process.0)
+            .map_err(|error| windows_adapter_from_io(&error))?;
+        let inner = JobChildHandles {
+            process,
+            thread,
+            job,
+            spawn_identity,
+            executable,
+            spec,
+            command_line_utf16,
+            terminal: false,
+        };
+        cleanup.disarm();
+        inner.job.assign_process_handle(inner.process.0)?;
+        if !inner
+            .job
+            .contains_process(inner.spawn_identity.process_id)?
+        {
+            return Err(WindowsAdapterError::IdentityMismatch);
+        }
+        let observed_file = file_identity(Path::new(&inner.spawn_identity.image_path))
+            .map_err(|error| windows_adapter_from_io(&error))?;
+        if observed_file != inner.executable.identity
+            || !same_windows_path(
+                &inner.spawn_identity.image_path,
+                &inner.spec.executable.to_string_lossy(),
+            )
+        {
+            return Err(WindowsAdapterError::IdentityMismatch);
+        }
+        Ok(Self { inner })
+    }
+
+    #[must_use]
+    pub const fn id(&self) -> u32 {
+        self.inner.spawn_identity.process_id
+    }
+
+    /// Consumes the unvalidated state and requires caller-owned policy to
+    /// return an opaque validation token over fresh P-02 mechanics evidence.
+    ///
+    /// # Errors
+    /// Returns `Mechanics` for failed retained-handle validation or `Rejected`
+    /// with the caller's own policy/permit error. Either path kills and reaps
+    /// the full Job before the error escapes.
+    pub fn validate<V, E, F>(
+        mut self,
+        validator: F,
+    ) -> Result<ValidatedSuspendedJobChild<V>, SuspendedValidationError<E>>
+    where
+        F: FnOnce(&SuspendedProcessEvidence) -> Result<V, E>,
+    {
+        let evidence = match self.inner.fresh_evidence() {
+            Ok(evidence) => evidence,
+            Err(error) => {
+                self.inner.best_effort_cleanup();
+                return Err(SuspendedValidationError::Mechanics(error));
+            }
+        };
+        let validation = match validator(&evidence) {
+            Ok(validation) => validation,
+            Err(error) => {
+                self.inner.best_effort_cleanup();
+                return Err(SuspendedValidationError::Rejected(error));
+            }
+        };
+        Ok(ValidatedSuspendedJobChild {
+            inner: self.inner,
+            evidence,
+            validation,
+        })
+    }
+
+    /// Consumes and terminates an unvalidated child without resuming it.
+    ///
+    /// # Errors
+    /// Returns a typed adapter error when termination or bounded reap fails.
+    pub fn terminate(mut self, exit_code: u32) -> Result<TerminatedJobChild, WindowsAdapterError> {
+        terminalize(&mut self.inner, exit_code)
+    }
+}
+
+#[cfg(windows)]
+impl<V> ValidatedSuspendedJobChild<V> {
+    #[must_use]
+    pub fn evidence(&self) -> &SuspendedProcessEvidence {
+        &self.evidence
+    }
+
+    #[must_use]
+    pub const fn validation(&self) -> &V {
+        &self.validation
+    }
+
+    /// Consumes the validated suspended state and resumes exactly once.
+    ///
+    /// # Errors
+    /// Returns a typed adapter error when Windows rejects `ResumeThread`; the
+    /// error path kills and reaps the full Job.
+    pub fn resume(mut self) -> Result<RunningJobChild<V>, WindowsAdapterError> {
+        use windows_sys::Win32::System::Threading::ResumeThread;
+        if unsafe { ResumeThread(self.inner.thread.0) } == u32::MAX {
+            let error = last_windows_adapter_error();
+            self.inner.best_effort_cleanup();
+            return Err(error);
+        }
+        Ok(RunningJobChild {
+            inner: self.inner,
+            evidence: self.evidence,
+            validation: self.validation,
+        })
+    }
+
+    /// Consumes and terminates a validated child without resuming it.
+    ///
+    /// # Errors
+    /// Returns a typed adapter error when termination or bounded reap fails.
+    pub fn terminate(mut self, exit_code: u32) -> Result<TerminatedJobChild, WindowsAdapterError> {
+        terminalize(&mut self.inner, exit_code)
+    }
+}
+
+#[cfg(windows)]
+impl<V> RunningJobChild<V> {
+    #[must_use]
+    pub fn evidence(&self) -> &SuspendedProcessEvidence {
+        &self.evidence
+    }
+
+    #[must_use]
+    pub const fn validation(&self) -> &V {
+        &self.validation
+    }
+
+    /// Returns an idempotent observation without changing typestate.
+    ///
+    /// # Errors
+    /// Returns a typed adapter error when process or Job state cannot be read.
+    pub fn observe(&self) -> Result<RunningJobObservation, WindowsAdapterError> {
+        let active_processes = self.inner.active_process_count()?;
+        match self.inner.root_exit_code()? {
+            None => Ok(RunningJobObservation::Running { active_processes }),
+            Some(exit_code) if active_processes == 0 => {
+                Ok(RunningJobObservation::Exited { exit_code })
+            }
+            Some(exit_code) => Ok(RunningJobObservation::RootExited {
+                exit_code,
+                active_processes,
+            }),
+        }
+    }
+
+    /// Returns identities of live Job members.
+    ///
+    /// # Errors
+    /// Returns a typed adapter error when membership or identity cannot be read.
+    pub fn job_processes(&self) -> Result<Vec<ProcessIdentity>, WindowsAdapterError> {
+        job_process_ids(self.inner.job.handle)
+            .map_err(|error| windows_adapter_from_io(&error))?
+            .into_iter()
+            .map(|pid| {
+                inspect_process_identity(pid).map_err(|error| windows_adapter_from_io(&error))
+            })
+            .collect()
+    }
+
+    /// Consumes and terminates the complete Job exactly once.
+    ///
+    /// # Errors
+    /// Returns a typed adapter error when termination or bounded reap fails.
+    pub fn terminate(mut self, exit_code: u32) -> Result<TerminatedJobChild, WindowsAdapterError> {
+        terminalize(&mut self.inner, exit_code)
+    }
+}
+
+#[cfg(windows)]
+fn terminalize(
+    inner: &mut JobChildHandles,
+    requested_exit_code: u32,
+) -> Result<TerminatedJobChild, WindowsAdapterError> {
+    let process = inner.spawn_identity.clone();
+    let observed_exit_code = inner.terminate_and_reap(requested_exit_code)?;
+    Ok(TerminatedJobChild {
+        process,
+        requested_exit_code,
+        observed_exit_code,
+        job_empty: true,
+        root_reaped: true,
+    })
 }
 
 /// Windows implementation of the P-01 ports.
@@ -1866,6 +2578,232 @@ fn inspect_process_identity(process_id: u32) -> std::io::Result<ProcessIdentity>
 }
 
 #[cfg(windows)]
+fn job_process_ids(job: windows_sys::Win32::Foundation::HANDLE) -> std::io::Result<Vec<u32>> {
+    use windows_sys::Win32::Foundation::ERROR_MORE_DATA;
+    use windows_sys::Win32::System::JobObjects::{
+        JOBOBJECT_BASIC_PROCESS_ID_LIST, JobObjectBasicProcessIdList, QueryInformationJobObject,
+    };
+    let mut capacity = 16_usize;
+    loop {
+        let bytes = std::mem::size_of::<JOBOBJECT_BASIC_PROCESS_ID_LIST>()
+            .checked_add(
+                capacity
+                    .saturating_sub(1)
+                    .checked_mul(std::mem::size_of::<usize>())
+                    .ok_or_else(|| {
+                        std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "Job process list is too large",
+                        )
+                    })?,
+            )
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "Job process list is too large",
+                )
+            })?;
+        let words = bytes.div_ceil(std::mem::size_of::<usize>());
+        let mut buffer = vec![0_usize; words];
+        let bytes = u32::try_from(buffer.len() * std::mem::size_of::<usize>()).map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "Job process buffer is too large",
+            )
+        })?;
+        let mut returned = 0_u32;
+        let queried = unsafe {
+            QueryInformationJobObject(
+                job,
+                JobObjectBasicProcessIdList,
+                buffer.as_mut_ptr().cast(),
+                bytes,
+                &raw mut returned,
+            )
+        };
+        let header = unsafe { &*buffer.as_ptr().cast::<JOBOBJECT_BASIC_PROCESS_ID_LIST>() };
+        if queried != 0 {
+            let count = usize::try_from(header.NumberOfProcessIdsInList).map_err(|_| {
+                std::io::Error::new(std::io::ErrorKind::InvalidData, "Job process count invalid")
+            })?;
+            if count > capacity {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "Job process list exceeded its supplied buffer",
+                ));
+            }
+            let ids = unsafe { std::slice::from_raw_parts(header.ProcessIdList.as_ptr(), count) };
+            return ids
+                .iter()
+                .copied()
+                .filter(|pid| *pid != 0)
+                .map(|pid| {
+                    u32::try_from(pid).map_err(|_| {
+                        std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "Job PID does not fit u32",
+                        )
+                    })
+                })
+                .collect();
+        }
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() != Some(ERROR_MORE_DATA.cast_signed()) {
+            return Err(error);
+        }
+        let assigned = usize::try_from(header.NumberOfAssignedProcesses).unwrap_or(capacity + 1);
+        capacity = assigned.max(capacity.saturating_mul(2));
+        if capacity > 4_096 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "Job process list exceeded its safety bound",
+            ));
+        }
+    }
+}
+
+#[cfg(windows)]
+fn nul_terminated_wide(value: &std::ffi::OsStr) -> std::io::Result<Vec<u16>> {
+    use std::os::windows::ffi::OsStrExt;
+    let wide = value.encode_wide().collect::<Vec<_>>();
+    if wide.contains(&0) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "Windows string contains an embedded NUL",
+        ));
+    }
+    Ok(wide.into_iter().chain(std::iter::once(0)).collect())
+}
+
+#[cfg(windows)]
+fn os_has_nul(value: &std::ffi::OsStr) -> bool {
+    use std::os::windows::ffi::OsStrExt;
+    value.encode_wide().any(|unit| unit == 0)
+}
+
+#[cfg(windows)]
+fn validate_complete_environment(
+    environment: &[(std::ffi::OsString, std::ffi::OsString)],
+) -> Result<(), WindowsAdapterError> {
+    let mut names = std::collections::BTreeSet::new();
+    for (name, value) in environment {
+        let Some(name_text) = name.to_str() else {
+            return Err(WindowsAdapterError::InvalidInput);
+        };
+        if name_text.is_empty()
+            || name_text.contains('=')
+            || os_has_nul(name)
+            || value.to_str().is_none()
+            || os_has_nul(value)
+            || !names.insert(name_text.to_uppercase())
+        {
+            return Err(WindowsAdapterError::InvalidInput);
+        }
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn same_windows_path(left: &str, right: &str) -> bool {
+    fn normalized(value: &str) -> String {
+        value
+            .strip_prefix(r"\\?\")
+            .unwrap_or(value)
+            .replace('/', "\\")
+            .to_uppercase()
+    }
+    normalized(left) == normalized(right)
+}
+
+#[cfg(windows)]
+fn wait_for_job_empty(
+    job: windows_sys::Win32::Foundation::HANDLE,
+    timeout: std::time::Duration,
+) -> Result<(), WindowsAdapterError> {
+    let started = std::time::Instant::now();
+    loop {
+        if job_process_ids(job)
+            .map_err(|error| windows_adapter_from_io(&error))?
+            .is_empty()
+        {
+            return Ok(());
+        }
+        if started.elapsed() >= timeout {
+            return Err(WindowsAdapterError::Timeout);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
+#[cfg(windows)]
+fn quote_windows_argument(value: &std::ffi::OsStr) -> std::io::Result<Vec<u16>> {
+    use std::os::windows::ffi::OsStrExt;
+    let value = value.encode_wide().collect::<Vec<_>>();
+    if value.contains(&0) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "process argument contains an embedded NUL",
+        ));
+    }
+    // Quote every argument. This is CommandLineToArgvW/CRT compatible and
+    // therefore handles embedded quotes and trailing backslashes even when an
+    // argument contains no whitespace.
+    let mut quoted = vec![u16::from(b'"')];
+    let mut backslashes = 0_usize;
+    for unit in value {
+        if unit == u16::from(b'\\') {
+            backslashes = backslashes.saturating_add(1);
+        } else if unit == u16::from(b'"') {
+            quoted.extend(std::iter::repeat_n(u16::from(b'\\'), backslashes * 2 + 1));
+            quoted.push(unit);
+            backslashes = 0;
+        } else {
+            quoted.extend(std::iter::repeat_n(u16::from(b'\\'), backslashes));
+            quoted.push(unit);
+            backslashes = 0;
+        }
+    }
+    quoted.extend(std::iter::repeat_n(u16::from(b'\\'), backslashes * 2));
+    quoted.push(u16::from(b'"'));
+    Ok(quoted)
+}
+
+#[cfg(windows)]
+fn command_line(executable: &Path, arguments: &[std::ffi::OsString]) -> std::io::Result<Vec<u16>> {
+    let mut line = Vec::new();
+    for (index, argument) in std::iter::once(executable.as_os_str())
+        .chain(arguments.iter().map(std::ffi::OsString::as_os_str))
+        .enumerate()
+    {
+        if index > 0 {
+            line.push(u16::from(b' '));
+        }
+        line.extend(quote_windows_argument(argument)?);
+    }
+    line.push(0);
+    Ok(line)
+}
+
+#[cfg(windows)]
+fn command_environment(environment: &[(std::ffi::OsString, std::ffi::OsString)]) -> Vec<u16> {
+    use std::os::windows::ffi::OsStrExt;
+    let mut entries = environment.to_vec();
+    entries.sort_by_key(|(name, _)| name.to_string_lossy().to_uppercase());
+    let mut block = Vec::new();
+    for (name, value) in entries {
+        block.extend(name.encode_wide());
+        block.push(u16::from(b'='));
+        block.extend(value.encode_wide());
+        block.push(0);
+    }
+    if block.is_empty() {
+        block.push(0);
+    }
+    block.push(0);
+    block
+}
+
+#[cfg(windows)]
 fn inspect_process_handle(
     process_id: u32,
     process: windows_sys::Win32::Foundation::HANDLE,
@@ -2417,6 +3355,330 @@ mod tests {
             .env("ELIOT_P02_JOB_CHILD", "1")
             .spawn()
             .unwrap_or_else(|_| unreachable!())
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn suspended_child_process() {
+        if let Some(marker) = std::env::var_os("ELIOT_P02_SUSPENDED_MARKER") {
+            let _descendant = std::env::var_os("ELIOT_P02_SPAWN_DESCENDANT").map(|_| {
+                std::process::Command::new(
+                    std::env::current_exe().unwrap_or_else(|_| unreachable!()),
+                )
+                .arg("--exact")
+                .arg("tests::job_child_process")
+                .arg("--nocapture")
+                .env("ELIOT_P02_JOB_CHILD", "1")
+                .spawn()
+                .unwrap_or_else(|_| unreachable!())
+            });
+            let body = format!(
+                "cwd={}\nenv={}",
+                std::env::current_dir()
+                    .unwrap_or_else(|_| unreachable!())
+                    .display(),
+                std::env::var("ELIOT_P02_EXACT_ENV").unwrap_or_default()
+            );
+            std::fs::write(marker, body).unwrap_or_else(|_| unreachable!());
+            std::thread::sleep(std::time::Duration::from_secs(30));
+        }
+    }
+
+    #[cfg(windows)]
+    fn complete_test_environment(
+        marker: &Path,
+        spawn_descendant: bool,
+    ) -> Vec<(std::ffi::OsString, std::ffi::OsString)> {
+        let mut environment = std::env::vars_os().collect::<Vec<_>>();
+        for name in [
+            "ELIOT_P02_SUSPENDED_MARKER",
+            "ELIOT_P02_EXACT_ENV",
+            "ELIOT_P02_SPAWN_DESCENDANT",
+        ] {
+            environment.retain(|(key, _)| !key.to_string_lossy().eq_ignore_ascii_case(name));
+        }
+        environment.push((
+            "ELIOT_P02_SUSPENDED_MARKER".into(),
+            marker.as_os_str().to_owned(),
+        ));
+        environment.push(("ELIOT_P02_EXACT_ENV".into(), "exact-value".into()));
+        if spawn_descendant {
+            environment.push(("ELIOT_P02_SPAWN_DESCENDANT".into(), "1".into()));
+        }
+        environment
+    }
+
+    #[cfg(windows)]
+    fn suspended_spec(
+        marker: &Path,
+        working_directory: &Path,
+        spawn_descendant: bool,
+    ) -> SuspendedLaunchSpec {
+        SuspendedLaunchSpec::new(
+            std::env::current_exe().unwrap_or_else(|_| unreachable!()),
+            vec![
+                "--exact".into(),
+                "tests::suspended_child_process".into(),
+                "--nocapture".into(),
+            ],
+            working_directory,
+            complete_test_environment(marker, spawn_descendant),
+        )
+        .unwrap_or_else(|error| panic!("spec failed: {error}"))
+    }
+
+    #[cfg(windows)]
+    fn spawn_suspended_child(
+        marker: &Path,
+        working_directory: &Path,
+        spawn_descendant: bool,
+    ) -> SuspendedJobChild {
+        SuspendedJobChild::spawn(suspended_spec(marker, working_directory, spawn_descendant))
+            .unwrap_or_else(|error| panic!("spawn failed: {error}"))
+    }
+
+    #[cfg(windows)]
+    fn wait_for_process_gone(pid: u32) -> bool {
+        for _ in 0..100 {
+            if inspect_process_identity(pid).is_err() {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        false
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn suspended_launch_does_not_start_before_consuming_validation() {
+        let root = std::env::temp_dir().join(format!("eliot-p02-suspended-{}", unique_suffix()));
+        std::fs::create_dir(&root).unwrap_or_else(|_| unreachable!());
+        let marker = root.join("started");
+        let child = spawn_suspended_child(&marker, &root, false);
+        let pid = child.id();
+        assert!(!marker.exists(), "child must not run before ResumeThread");
+        let terminal = child.terminate(0xE1_05).unwrap_or_else(|_| unreachable!());
+        assert_eq!(terminal.process().process_id, pid);
+        assert_eq!(terminal.requested_exit_code(), 0xE1_05);
+        assert!(terminal.job_empty());
+        assert!(terminal.root_reaped());
+        assert!(wait_for_process_gone(pid));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn consuming_validation_binds_exact_launch_evidence_before_resume() {
+        let root = std::env::temp_dir().join(format!("eliot-p02-evidence-{}", unique_suffix()));
+        std::fs::create_dir(&root).unwrap_or_else(|_| unreachable!());
+        let marker = root.join("started");
+        let expected_image = std::env::current_exe().unwrap_or_else(|_| unreachable!());
+        let child = spawn_suspended_child(&marker, &root, false);
+        let expected_pid = child.id();
+        let validated = child
+            .validate::<&'static str, &'static str, _>(|evidence| {
+                assert_eq!(evidence.process().process_id, expected_pid);
+                assert_ne!(evidence.executable_file_identity().file_index, 0);
+                assert_eq!(evidence.job_process_count(), 1);
+                assert!(same_windows_path(
+                    &evidence.process().image_path,
+                    &expected_image.to_string_lossy()
+                ));
+                assert_eq!(evidence.requested_executable(), expected_image);
+                assert_eq!(evidence.working_directory(), root);
+                assert_eq!(
+                    evidence.arguments(),
+                    [
+                        std::ffi::OsString::from("--exact"),
+                        std::ffi::OsString::from("tests::suspended_child_process"),
+                        std::ffi::OsString::from("--nocapture"),
+                    ]
+                );
+                assert!(evidence.environment().iter().any(|(name, value)| {
+                    name == "ELIOT_P02_EXACT_ENV" && value == "exact-value"
+                }));
+                Ok("validated-by-test-policy")
+            })
+            .unwrap_or_else(|error| panic!("evidence validation failed: {error:?}"));
+        assert!(!marker.exists(), "validation must not resume the child");
+        assert_eq!(*validated.validation(), "validated-by-test-policy");
+        let running = validated.resume().unwrap_or_else(|_| unreachable!());
+        for _ in 0..100 {
+            if marker.exists() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(marker.exists(), "child must run after validated resume");
+        let marker_body = std::fs::read_to_string(&marker).unwrap_or_default();
+        assert!(marker_body.contains(&format!("cwd={}", root.display())));
+        assert!(marker_body.contains("env=exact-value"));
+        let first = running.observe().unwrap_or_else(|_| unreachable!());
+        let second = running.observe().unwrap_or_else(|_| unreachable!());
+        assert_eq!(first, second, "observation is idempotent");
+        running
+            .terminate(0xE1_05)
+            .unwrap_or_else(|_| unreachable!());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn caller_pid_image_mismatch_rejection_kills_and_reaps_job() {
+        let root = std::env::temp_dir().join(format!("eliot-p02-reject-{}", unique_suffix()));
+        std::fs::create_dir(&root).unwrap_or_else(|_| unreachable!());
+        let marker = root.join("started");
+        let child = spawn_suspended_child(&marker, &root, false);
+        let pid = child.id();
+        let result = child.validate::<(), &'static str, _>(|evidence| {
+            if evidence.process().process_id != pid + 1
+                || evidence.process().image_path != "C:\\wrong\\image.exe"
+            {
+                Err("pid-image-mismatch")
+            } else {
+                Ok(())
+            }
+        });
+        assert_eq!(
+            result.err(),
+            Some(SuspendedValidationError::Rejected("pid-image-mismatch"))
+        );
+        assert!(wait_for_process_gone(pid), "rejected child must not leak");
+        assert!(!marker.exists());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn stale_validation_cannot_validate_a_new_process_generation() {
+        let root = std::env::temp_dir().join(format!("eliot-p02-stale-{}", unique_suffix()));
+        std::fs::create_dir(&root).unwrap_or_else(|_| unreachable!());
+        let first_marker = root.join("first");
+        let first = spawn_suspended_child(&first_marker, &root, false);
+        let mut old_key = String::new();
+        let first = first
+            .validate::<(), &'static str, _>(|evidence| {
+                old_key = evidence.process().stable_key();
+                Ok(())
+            })
+            .unwrap_or_else(|_| unreachable!());
+        first.terminate(0xE1_06).unwrap_or_else(|_| unreachable!());
+
+        let second_marker = root.join("second");
+        let second = spawn_suspended_child(&second_marker, &root, false);
+        let second_pid = second.id();
+        let result = second.validate::<(), &'static str, _>(|evidence| {
+            if evidence.process().stable_key() == old_key {
+                Ok(())
+            } else {
+                Err("stale-validation")
+            }
+        });
+        assert_eq!(
+            result.err(),
+            Some(SuspendedValidationError::Rejected("stale-validation"))
+        );
+        assert!(wait_for_process_gone(second_pid));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn validator_panic_still_kills_and_reaps_suspended_job() {
+        let root = std::env::temp_dir().join(format!("eliot-p02-panic-{}", unique_suffix()));
+        std::fs::create_dir(&root).unwrap_or_else(|_| unreachable!());
+        let marker = root.join("started");
+        let child = spawn_suspended_child(&marker, &root, false);
+        let pid = child.id();
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = child.validate::<(), (), _>(|_| panic!("test validator panic"));
+        }));
+        assert!(panic.is_err());
+        assert!(wait_for_process_gone(pid));
+        assert!(!marker.exists());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn resumed_tree_termination_is_consuming_and_reaps_every_member() {
+        let root = std::env::temp_dir().join(format!("eliot-p02-tree-{}", unique_suffix()));
+        std::fs::create_dir(&root).unwrap_or_else(|_| unreachable!());
+        let marker = root.join("started");
+        let child = spawn_suspended_child(&marker, &root, true);
+        let validated = child
+            .validate::<(), &'static str, _>(|_| Ok(()))
+            .unwrap_or_else(|_| unreachable!());
+        let running = validated.resume().unwrap_or_else(|_| unreachable!());
+        for _ in 0..100 {
+            if marker.exists()
+                && running
+                    .job_processes()
+                    .is_ok_and(|processes| processes.len() >= 2)
+            {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let members = running
+            .job_processes()
+            .unwrap_or_else(|error| panic!("membership failed: {error}"));
+        assert!(members.len() >= 2);
+        let pids = members
+            .iter()
+            .map(|process| process.process_id)
+            .collect::<Vec<_>>();
+        let terminal = running
+            .terminate(0xE1_07)
+            .unwrap_or_else(|error| panic!("termination failed: {error}"));
+        assert_eq!(terminal.requested_exit_code(), 0xE1_07);
+        assert!(terminal.job_empty());
+        assert!(terminal.root_reaped());
+        assert!(pids.into_iter().all(wait_for_process_gone));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_argument_quoting_covers_quotes_and_trailing_backslashes() {
+        use std::os::windows::ffi::OsStringExt;
+        let quote = |value: &str| {
+            let units = quote_windows_argument(std::ffi::OsStr::new(value))
+                .unwrap_or_else(|_| unreachable!());
+            std::ffi::OsString::from_wide(&units)
+                .to_string_lossy()
+                .into_owned()
+        };
+        assert_eq!(quote(""), r#""""#);
+        assert_eq!(quote("plain"), r#""plain""#);
+        assert_eq!(quote(r#"a"b"#), r#""a\"b""#);
+        assert_eq!(quote("a\\"), "\"a\\\\\"");
+        assert_eq!(quote(r#"a\"b"#), r#""a\\\"b""#);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn launch_spec_rejects_ambiguous_environment_and_nul_arguments() {
+        let executable = std::env::current_exe().unwrap_or_else(|_| unreachable!());
+        let root = std::env::temp_dir();
+        assert_eq!(
+            SuspendedLaunchSpec::new(
+                &executable,
+                Vec::new(),
+                &root,
+                vec![("Path".into(), "a".into()), ("PATH".into(), "b".into())],
+            ),
+            Err(WindowsAdapterError::InvalidInput)
+        );
+        assert_eq!(
+            SuspendedLaunchSpec::new(
+                executable,
+                vec![std::ffi::OsString::from("bad\0argument")],
+                root,
+                Vec::new(),
+            ),
+            Err(WindowsAdapterError::InvalidInput)
+        );
     }
 
     #[cfg(windows)]
