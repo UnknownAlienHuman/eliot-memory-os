@@ -1,0 +1,14 @@
+[package]
+name = "eliot-diagnostic"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.89"
+license = "MIT"
+description = "Deterministic diagnostic evidence normalization and classification"
+
+[dependencies]
+blake3 = "1.8.5"
+eliot-contracts = { path = "../../foundation/eliot-contracts" }
+schemars = { version = "1.2.1", features = ["derive"] }
+serde = { version = "1.0.228", features = ["derive"] }
+thiserror = "2.0.18"
