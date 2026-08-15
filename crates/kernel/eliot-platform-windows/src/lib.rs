@@ -22,6 +22,7 @@ use eliot_platform::{
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 /// Failure returned by a Windows-only primitive before it can be projected
 /// into a provider-neutral P-01 outcome.
@@ -45,6 +46,204 @@ impl std::fmt::Display for WindowsAdapterError {
 }
 
 impl std::error::Error for WindowsAdapterError {}
+
+/// Canonical failure disposition for the installation-wide Host owner lease.
+///
+/// The lease deliberately distinguishes a live owner from a mutex abandoned
+/// by a terminated owner and from an indeterminate Win32 result.  Host must
+/// fail closed for all three cases; only a clean, immediate acquisition is an
+/// admission decision.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HostOwnerLeaseError {
+    /// The named mutex is currently owned by another Host process.
+    LiveOwner,
+    /// The previous owner terminated without completing durable shutdown.
+    AbandonedOwner,
+    /// Windows could not classify the owner state; recovery is required.
+    OwnershipUncertain { win32_error: u32 },
+    /// Creation/opening failed before ownership could be classified.
+    CreationFailed { win32_error: u32 },
+    /// This primitive is intentionally unavailable off Windows.
+    UnsupportedPlatform,
+}
+
+impl std::fmt::Display for HostOwnerLeaseError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::LiveOwner => formatter.write_str("installation-wide Host owner is live"),
+            Self::AbandonedOwner => {
+                formatter.write_str("installation-wide Host owner was abandoned; recovery required")
+            }
+            Self::OwnershipUncertain { win32_error } => write!(
+                formatter,
+                "installation-wide Host owner state is uncertain (Win32 error {win32_error})"
+            ),
+            Self::CreationFailed { win32_error } => write!(
+                formatter,
+                "installation-wide Host owner mutex creation failed (Win32 error {win32_error})"
+            ),
+            Self::UnsupportedPlatform => {
+                formatter.write_str("installation-wide Host owner lease requires Windows")
+            }
+        }
+    }
+}
+
+impl std::error::Error for HostOwnerLeaseError {}
+
+/// Prefix for the installation-wide cross-process Host owner mutex.
+pub const HOST_OWNER_MUTEX_PREFIX: &str = "Global\\Eliot-Host-Owner-";
+
+/// Returns the canonical named mutex for one validated installation identity.
+///
+/// The identity itself never enters the object-manager name.  SHA-256 keeps
+/// the name deterministic across service and console processes while avoiding
+/// truncation or object-name collisions from user-controlled identity text.
+#[must_use]
+pub fn host_owner_mutex_name(installation: &PlatformHandle) -> String {
+    let digest = Sha256::digest(installation.as_str().as_bytes());
+    let mut suffix = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        use std::fmt::Write as _;
+        let _ = write!(suffix, "{byte:02x}");
+    }
+    format!("{HOST_OWNER_MUTEX_PREFIX}{suffix}")
+}
+
+/// Process-owned installation-wide Host admission lease.
+///
+/// The handle remains held for the entire `HostComposition` lifetime.  A
+/// mutex object is not a durable recovery record: an abandoned result is
+/// explicitly rejected and never treated as permission to resume.
+pub struct HostOwnerLease {
+    #[cfg(windows)]
+    handle: windows_sys::Win32::Foundation::HANDLE,
+    owns: bool,
+    name: String,
+}
+
+impl HostOwnerLease {
+    /// Acquires the canonical installation-wide Host owner mutex.
+    ///
+    /// Existing ownership, abandoned ownership, ACL/access failures, and any
+    /// unclassified wait result are all returned as errors.  The caller may
+    /// proceed only on `Ok`, which means this process owns the mutex.
+    pub fn acquire(installation: &PlatformHandle) -> Result<Self, HostOwnerLeaseError> {
+        let name = host_owner_mutex_name(installation);
+        #[cfg(windows)]
+        {
+            use windows_sys::Win32::Foundation::{
+                ERROR_ALREADY_EXISTS, ERROR_INVALID_PARAMETER, GetLastError, WAIT_ABANDONED,
+                WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT,
+            };
+            use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
+            use windows_sys::Win32::System::Threading::{CreateMutexW, WaitForSingleObject};
+
+            let wide_name = nul_terminated_wide(std::ffi::OsStr::new(&name)).map_err(|_| {
+                HostOwnerLeaseError::CreationFailed {
+                    win32_error: ERROR_INVALID_PARAMETER,
+                }
+            })?;
+            let descriptor = OwnedSecurityDescriptor::for_host_owner().map_err(|_| {
+                HostOwnerLeaseError::CreationFailed {
+                    win32_error: unsafe { GetLastError() },
+                }
+            })?;
+            let attributes = SECURITY_ATTRIBUTES {
+                nLength: u32::try_from(std::mem::size_of::<SECURITY_ATTRIBUTES>()).map_err(
+                    |_| HostOwnerLeaseError::CreationFailed {
+                        win32_error: ERROR_INVALID_PARAMETER,
+                    },
+                )?,
+                lpSecurityDescriptor: descriptor.raw,
+                bInheritHandle: 0,
+            };
+            // SAFETY: `wide_name`, `descriptor`, and `attributes` remain live
+            // for the complete CreateMutexW call.  The returned handle is
+            // transferred to this RAII owner exactly once.
+            let handle = unsafe { CreateMutexW(&raw const attributes, 1, wide_name.as_ptr()) };
+            let creation_error = unsafe { GetLastError() };
+            if handle.is_null() {
+                return Err(HostOwnerLeaseError::CreationFailed {
+                    win32_error: creation_error,
+                });
+            }
+            let mut lease = Self {
+                handle,
+                owns: creation_error != ERROR_ALREADY_EXISTS,
+                name,
+            };
+            if lease.owns {
+                return Ok(lease);
+            }
+
+            // An existing mutex is returned without ownership even when
+            // `bInitialOwner` is true.  A zero-time wait classifies the live
+            // owner, a cleanly released object, or an abandoned owner.
+            let wait = unsafe { WaitForSingleObject(handle, 0) };
+            match wait {
+                WAIT_OBJECT_0 => {
+                    lease.owns = true;
+                    Ok(lease)
+                }
+                WAIT_TIMEOUT => {
+                    lease.owns = false;
+                    drop(lease);
+                    Err(HostOwnerLeaseError::LiveOwner)
+                }
+                WAIT_ABANDONED => {
+                    // WAIT_ABANDONED grants ownership to this thread.  Drop
+                    // releases the mutex before returning the recovery error.
+                    lease.owns = true;
+                    Err(HostOwnerLeaseError::AbandonedOwner)
+                }
+                WAIT_FAILED => {
+                    let win32_error = unsafe { GetLastError() };
+                    lease.owns = false;
+                    drop(lease);
+                    Err(HostOwnerLeaseError::OwnershipUncertain { win32_error })
+                }
+                _ => {
+                    lease.owns = false;
+                    drop(lease);
+                    Err(HostOwnerLeaseError::OwnershipUncertain {
+                        win32_error: unsafe { GetLastError() },
+                    })
+                }
+            }
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = name;
+            let _ = installation;
+            Err(HostOwnerLeaseError::UnsupportedPlatform)
+        }
+    }
+
+    /// Returns the exact canonical mutex name held by this lease.
+    #[must_use]
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+}
+
+#[cfg(windows)]
+impl Drop for HostOwnerLease {
+    fn drop(&mut self) {
+        use windows_sys::Win32::Foundation::CloseHandle;
+        use windows_sys::Win32::System::Threading::ReleaseMutex;
+        if self.handle.is_null() {
+            return;
+        }
+        if self.owns {
+            // SAFETY: this process owns the mutex after a successful wait or
+            // fresh creation; the handle remains valid until CloseHandle.
+            let _ = unsafe { ReleaseMutex(self.handle) };
+        }
+        // SAFETY: this wrapper uniquely owns the handle until Drop.
+        unsafe { CloseHandle(self.handle) };
+    }
+}
 
 /// Stable identity of a Windows file object.
 #[derive(
@@ -585,10 +784,18 @@ struct OwnedSecurityDescriptor {
 #[cfg(windows)]
 impl OwnedSecurityDescriptor {
     fn for_job_owner() -> Result<Self, WindowsAdapterError> {
+        Self::from_sddl("D:P(A;;GA;;;SY)(A;;GA;;;OW)")
+    }
+
+    fn for_host_owner() -> Result<Self, WindowsAdapterError> {
+        Self::from_sddl("D:P(A;;GA;;;SY)(A;;GA;;;OW)")
+    }
+
+    fn from_sddl(sddl: &str) -> Result<Self, WindowsAdapterError> {
         use windows_sys::Win32::Security::Authorization::{
             ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
         };
-        let sddl = "D:P(A;;GA;;;SY)(A;;GA;;;OW)"
+        let sddl = sddl
             .encode_utf16()
             .chain(std::iter::once(0))
             .collect::<Vec<_>>();

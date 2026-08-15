@@ -82,9 +82,6 @@ fn open_host() -> Result<HostComposition, HostError> {
     let installation = PlatformHandle::new(installation_value)
         .map_err(|error| HostError::Platform(format!("invalid ELIOT_INSTALLATION_ID: {error}")))?;
     let path = state_path()?;
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
     HostComposition::open(path, installation)
 }
 

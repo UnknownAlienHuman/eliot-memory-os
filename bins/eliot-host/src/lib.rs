@@ -20,6 +20,7 @@ use eliot_installation::{
     ApprovedGenerationRegistry, CandidateManifest, InstallationError, RedbInstallationRegistry,
 };
 use eliot_platform::{HostInstallationState, HostStateStore, PlatformHandle};
+use eliot_platform_windows::{HostOwnerLease, HostOwnerLeaseError};
 use eliot_runtime_contracts::{HealthVector, ServiceProcessRecord, ServiceProcessState};
 use thiserror::Error;
 
@@ -40,6 +41,10 @@ pub enum HostError {
     MissingInstallation,
     #[error("approved process contour is unavailable: {0}")]
     ProcessContour(String),
+    #[error("another live Host owns this installation")]
+    OwnerLeaseHeld,
+    #[error("Host owner lease recovery is required: {0}")]
+    OwnerLeaseRecovery(String),
 }
 
 #[cfg(windows)]
@@ -383,6 +388,7 @@ pub struct HostComposition {
     running: bool,
     #[cfg(windows)]
     jobs: HostJobBranches,
+    owner_lease: HostOwnerLease,
 }
 
 impl HostComposition {
@@ -393,6 +399,7 @@ impl HostComposition {
         if installation.as_str().trim().is_empty() {
             return Err(HostError::MissingInstallation);
         }
+        let owner_lease = HostOwnerLease::acquire(&installation).map_err(owner_lease_error)?;
         let (state_store, host) = RedbHostStateStore::open_epoch(path, installation.clone())?;
         let registry_path = path.with_file_name("installation-registry.redb");
         let registry_store = RedbInstallationRegistry::open(registry_path)?;
@@ -420,6 +427,7 @@ impl HostComposition {
             running: true,
             #[cfg(windows)]
             jobs,
+            owner_lease,
         };
         #[cfg(windows)]
         if composition.registry.active().is_some() {
@@ -434,6 +442,15 @@ impl HostComposition {
     #[must_use]
     pub const fn host_epoch(&self) -> &HostInstallationEpoch {
         &self.host
+    }
+
+    /// Returns the canonical owner-object name held for this composition.
+    ///
+    /// The handle itself remains private and is released only after durable
+    /// shutdown completion and `HostComposition` drop.
+    #[must_use]
+    pub fn owner_lease_name(&self) -> &str {
+        self.owner_lease.name()
     }
 
     /// Reads the Host-only operational state from redb.
@@ -732,6 +749,25 @@ fn lifecycle_context(
         state_fence: StateFence::new(authority_epoch, ResourceGeneration::genesis()),
         clock: ClockReading::default(),
     })
+}
+
+fn owner_lease_error(error: HostOwnerLeaseError) -> HostError {
+    match error {
+        HostOwnerLeaseError::LiveOwner => HostError::OwnerLeaseHeld,
+        HostOwnerLeaseError::AbandonedOwner => HostError::OwnerLeaseRecovery(
+            "the previous Host owner abandoned its mutex; inspect durable shutdown state before retrying"
+                .to_owned(),
+        ),
+        HostOwnerLeaseError::OwnershipUncertain { win32_error } => HostError::OwnerLeaseRecovery(
+            format!("Windows could not classify the owner mutex (Win32 error {win32_error})"),
+        ),
+        HostOwnerLeaseError::CreationFailed { win32_error } => HostError::Platform(format!(
+            "Host owner mutex could not be created or opened (Win32 error {win32_error})"
+        )),
+        HostOwnerLeaseError::UnsupportedPlatform => HostError::Platform(
+            "Host owner lease is unavailable on this platform; refusing Host admission".to_owned(),
+        ),
+    }
 }
 
 #[cfg(windows)]
