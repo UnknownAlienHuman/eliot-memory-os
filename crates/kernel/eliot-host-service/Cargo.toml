@@ -1,0 +1,26 @@
+[package]
+name = "eliot-host-service"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "External Host Supervisor lifecycle and recovery boundary"
+
+[package.metadata.eliot]
+work_id = "P-05"
+functional_cell = "host-service"
+lifecycle_owner = "P-05"
+source_layer = "C1"
+proof_entrypoint = "cargo test -p eliot-host-service"
+
+[dependencies]
+eliot-contracts.workspace = true
+eliot-kernel-service.workspace = true
+eliot-platform.workspace = true
+eliot-runtime-contracts.workspace = true
+schemars.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true
