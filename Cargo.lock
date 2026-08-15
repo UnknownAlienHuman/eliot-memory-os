@@ -362,6 +362,8 @@ dependencies = [
  "anyhow",
  "clap",
  "eliot-cli",
+ "serde",
+ "serde_json",
  "tracing",
  "tracing-subscriber",
 ]
@@ -398,6 +400,8 @@ dependencies = [
  "eliot-agent-bridge-core",
  "eliot-protocol",
  "eliot-runtime",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -628,7 +632,9 @@ dependencies = [
 name = "eliot-cli"
 version = "0.1.0"
 dependencies = [
+ "eliot-ipc",
  "eliot-observation-contracts",
+ "eliot-platform-windows",
  "eliot-protocol",
  "eliot-receipts",
  "eliot-runtime-contracts",
@@ -636,6 +642,7 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror",
+ "tokio",
 ]
 
 [[package]]
@@ -1815,6 +1822,9 @@ dependencies = [
 name = "eliot-user-broker"
 version = "0.1.0"
 dependencies = [
+ "eliot-cli",
+ "eliot-process",
+ "eliot-protocol",
  "eliot-user-broker-core",
  "serde",
  "serde_json",

@@ -253,9 +253,22 @@ pub enum UnavailableReason {
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "SCREAMING_SNAKE_CASE", deny_unknown_fields)]
 pub enum CommandResult {
-    Help { text: String },
-    Schema { json: String },
-    Unavailable { reason: UnavailableReason },
+    Help {
+        text: String,
+    },
+    Schema {
+        json: String,
+    },
+    /// A response projected by the authenticated Kernel application port.
+    ///
+    /// The payload is an inert projection; this crate never interprets it as
+    /// canonical state or grants authority from it.
+    Forwarded {
+        payload: Value,
+    },
+    Unavailable {
+        reason: UnavailableReason,
+    },
 }
 
 /// Request crossing the public client boundary.
@@ -290,6 +303,353 @@ pub struct CommandResponse {
     pub effect: EffectClass,
     pub proof_ceiling: ProofCeiling,
     pub result: CommandResult,
+}
+
+/// Provider-neutral application front door owned by Kernel composition.
+///
+/// `eliot` is only a caller of this seam. Implementations must authenticate
+/// the transport and return a response bound to the exact request; they may
+/// not widen command arguments, effects, or proof ceilings.
+pub trait CommandPort {
+    /// Dispatches one already-typed command request through the owning front
+    /// door.
+    fn dispatch(&mut self, request: &CommandRequest) -> Result<CommandResponse, CommandPortError>;
+}
+
+/// Failure at the neutral application-port boundary.
+#[derive(Clone, Debug, Eq, Error, PartialEq)]
+pub enum CommandPortError {
+    /// Kernel has not admitted an application front door for this profile.
+    #[error("kernel application front door is closed: {contract}")]
+    FrontDoorClosed { contract: &'static str },
+    /// The owning provider rejected the exact request without a local retry.
+    #[error("kernel application front door rejected the request: {0}")]
+    Rejected(String),
+}
+
+/// Authenticated local Kernel front-door client shared by Stage 7 surfaces.
+///
+/// The client owns only transport/session proof. It does not interpret a
+/// response as authority; callers must validate the response against their
+/// own provider contract. The protected configuration is installed by the
+/// Kernel/installation owner and supplies the expected service SID/session as
+/// well as the exact EBP `ClientHello` binding.
+pub mod kernel_client {
+    use std::collections::BTreeMap;
+    use std::path::PathBuf;
+    use std::time::Duration;
+
+    use eliot_ipc::{
+        DeliveryOutcome, NamedPipeTransport, TransportLimits, client_hello_frame,
+        decode_server_hello_frame,
+    };
+    use eliot_platform_windows::NamedPipePeerExpectation;
+    use eliot_protocol::{
+        ClientHello, EncodingProfile, Frame, FrameKind, MessageType, ProtocolPayload,
+        ProtocolVersion, RequestIdentity,
+    };
+    use serde::Deserialize;
+    use serde_json::{Value, json};
+    use thiserror::Error;
+
+    const KERNEL_FRONT_DOOR_PIPE: &str = r"\\.\pipe\eliot\kernel\frontdoor";
+    const CONFIG_RELATIVE_PATH: &str = "Eliot/kernel/application-client.json";
+    const CONFIG_LIMIT: u64 = 64 * 1024;
+    const OPERATION_LIMIT: usize = 160;
+
+    /// Protected installation-provided connection declaration.
+    #[derive(Clone, Debug, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    pub struct KernelClientConfig {
+        /// Stable connection identity assigned by the Kernel owner.
+        pub connection_id: String,
+        /// SID of the Kernel service process expected at the pipe peer.
+        pub expected_kernel_sid: String,
+        /// Session id of the Kernel service process expected at the pipe peer.
+        pub expected_kernel_session_id: u32,
+        /// Exact client handshake declaration approved for this installation.
+        pub client_hello: ClientHello,
+    }
+
+    /// Failure at the authenticated application front door.
+    #[derive(Clone, Debug, Eq, Error, PartialEq)]
+    pub enum KernelClientError {
+        /// No protected front-door configuration is available on this host.
+        #[error("kernel application front door is closed: {0}")]
+        FrontDoorClosed(&'static str),
+        /// The protected configuration or operation was rejected locally.
+        #[error("kernel client configuration rejected: {0}")]
+        Configuration(String),
+        /// A request lacked the exact EBP identity required by the gateway.
+        #[error("kernel request identity is missing")]
+        MissingRequestIdentity,
+        /// The authenticated provider rejected or fenced the operation.
+        #[error("kernel front door rejected the request: {0}")]
+        Rejected(String),
+    }
+
+    /// One short-lived authenticated session. It is intentionally not a
+    /// durable authority token and reconnects for each operation.
+    pub struct KernelClient {
+        config: KernelClientConfig,
+        request_identity: Option<RequestIdentity>,
+    }
+
+    impl KernelClient {
+        /// Loads the installation-owned protected client declaration.
+        pub fn load() -> Result<Self, KernelClientError> {
+            #[cfg(not(windows))]
+            {
+                return Err(KernelClientError::FrontDoorClosed(
+                    "Windows authenticated Kernel front door",
+                ));
+            }
+            #[cfg(windows)]
+            {
+                let program_data = std::env::var_os("ProgramData").ok_or(
+                    KernelClientError::FrontDoorClosed("ProgramData Kernel client configuration"),
+                )?;
+                let path = PathBuf::from(program_data).join(CONFIG_RELATIVE_PATH);
+                let metadata = std::fs::metadata(&path).map_err(|error| {
+                    KernelClientError::Configuration(format!(
+                        "read protected Kernel client configuration {}: {error}",
+                        path.display()
+                    ))
+                })?;
+                if metadata.len() > CONFIG_LIMIT {
+                    return Err(KernelClientError::Configuration(
+                        "Kernel client configuration exceeds the bounded size".to_owned(),
+                    ));
+                }
+                let bytes = std::fs::read(&path).map_err(|error| {
+                    KernelClientError::Configuration(format!(
+                        "read protected Kernel client configuration {}: {error}",
+                        path.display()
+                    ))
+                })?;
+                let config: KernelClientConfig =
+                    serde_json::from_slice(&bytes).map_err(|error| {
+                        KernelClientError::Configuration(format!(
+                            "decode Kernel client configuration: {error}"
+                        ))
+                    })?;
+                validate_config(&config)?;
+                Ok(Self {
+                    config,
+                    request_identity: None,
+                })
+            }
+        }
+
+        /// Creates a client from an already loaded installation declaration.
+        pub fn from_config(config: KernelClientConfig) -> Result<Self, KernelClientError> {
+            validate_config(&config)?;
+            Ok(Self {
+                config,
+                request_identity: None,
+            })
+        }
+
+        /// Binds the exact caller identity for the next application request.
+        pub fn set_request_identity(&mut self, identity: RequestIdentity) {
+            self.request_identity = Some(identity);
+        }
+
+        /// Performs a bounded authenticated health exchange with Kernel.
+        pub fn probe(&mut self) -> Result<Value, KernelClientError> {
+            #[cfg(not(windows))]
+            {
+                Err(KernelClientError::FrontDoorClosed(
+                    "Windows authenticated Kernel front door",
+                ))
+            }
+            #[cfg(windows)]
+            {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .map_err(|error| KernelClientError::Rejected(error.to_string()))?;
+                runtime.block_on(self.probe_async())
+            }
+        }
+
+        /// Sends one exact provider operation through the authenticated EBP
+        /// Execute seam. The operation string is a contract selector, not a
+        /// local command authority.
+        pub fn transact_json(
+            &mut self,
+            operation: &str,
+            payload: Value,
+        ) -> Result<Value, KernelClientError> {
+            validate_operation(operation)?;
+            let identity = self
+                .request_identity
+                .clone()
+                .ok_or(KernelClientError::MissingRequestIdentity)?;
+            #[cfg(not(windows))]
+            {
+                let _ = (identity, payload);
+                Err(KernelClientError::FrontDoorClosed(
+                    "Windows authenticated Kernel front door",
+                ))
+            }
+            #[cfg(windows)]
+            {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .map_err(|error| KernelClientError::Rejected(error.to_string()))?;
+                runtime.block_on(self.transact_async(operation, payload, identity))
+            }
+        }
+
+        #[cfg(windows)]
+        async fn connect(
+            &self,
+        ) -> Result<(NamedPipeTransport, TransportLimits), KernelClientError> {
+            let expectation = NamedPipePeerExpectation::new(
+                &self.config.expected_kernel_sid,
+                self.config.expected_kernel_session_id,
+            )
+            .map_err(|error| KernelClientError::Configuration(error.to_string()))?;
+            let mut transport = NamedPipeTransport::connect_authenticated(
+                KERNEL_FRONT_DOOR_PIPE,
+                Duration::from_secs(5),
+                &expectation,
+            )
+            .await
+            .map_err(|error| KernelClientError::Rejected(error.to_string()))?;
+            let limits = TransportLimits::default();
+            let hello = client_hello_frame(&self.config.connection_id, &self.config.client_hello)
+                .map_err(|error| KernelClientError::Rejected(error.to_string()))?;
+            require_delivery(
+                transport.send_frame(&hello, limits).await,
+                "Kernel client hello",
+            )?;
+            let server = transport
+                .receive_frame(limits)
+                .await
+                .map_err(|error| KernelClientError::Rejected(error.to_string()))?;
+            decode_server_hello_frame(&server, &self.config.connection_id)
+                .map_err(|error| KernelClientError::Rejected(error.to_string()))?;
+            Ok((transport, limits))
+        }
+
+        #[cfg(windows)]
+        async fn probe_async(&self) -> Result<Value, KernelClientError> {
+            let (mut transport, limits) = self.connect().await?;
+            let frame = Frame {
+                protocol_version: ProtocolVersion::CURRENT,
+                encoding_profile: EncodingProfile::JsonV1,
+                connection_id: self.config.connection_id.clone(),
+                request_id: None,
+                kind: FrameKind::Heartbeat,
+                message_type: MessageType::Health,
+                request_identity: None,
+                payload: ProtocolPayload::Json(json!({"status": "probe"})),
+                trace_context: BTreeMap::new(),
+            };
+            require_delivery(
+                transport.send_frame(&frame, limits).await,
+                "Kernel health probe",
+            )?;
+            let response = transport
+                .receive_frame(limits)
+                .await
+                .map_err(|error| KernelClientError::Rejected(error.to_string()))?;
+            match response.payload {
+                ProtocolPayload::Json(value) => Ok(value),
+                _ => Err(KernelClientError::Rejected(
+                    "Kernel health response was not JSON".to_owned(),
+                )),
+            }
+        }
+
+        #[cfg(windows)]
+        async fn transact_async(
+            &self,
+            operation: &str,
+            payload: Value,
+            identity: RequestIdentity,
+        ) -> Result<Value, KernelClientError> {
+            let (mut transport, limits) = self.connect().await?;
+            let frame = Frame {
+                protocol_version: ProtocolVersion::CURRENT,
+                encoding_profile: EncodingProfile::JsonV1,
+                connection_id: self.config.connection_id.clone(),
+                request_id: Some(identity.request.metadata.request_id.clone()),
+                kind: FrameKind::Request,
+                message_type: MessageType::Execute,
+                request_identity: Some(identity),
+                payload: ProtocolPayload::Json(json!({
+                    "operation": operation,
+                    "payload": payload,
+                })),
+                trace_context: BTreeMap::new(),
+            };
+            require_delivery(
+                transport.send_frame(&frame, limits).await,
+                "Kernel application request",
+            )?;
+            let response = transport
+                .receive_frame(limits)
+                .await
+                .map_err(|error| KernelClientError::Rejected(error.to_string()))?;
+            match response.payload {
+                ProtocolPayload::Json(value) => Ok(value),
+                _ => Err(KernelClientError::Rejected(
+                    "Kernel application response was not JSON".to_owned(),
+                )),
+            }
+        }
+    }
+
+    fn validate_config(config: &KernelClientConfig) -> Result<(), KernelClientError> {
+        if config.connection_id.trim().is_empty()
+            || config.connection_id.chars().any(char::is_control)
+        {
+            return Err(KernelClientError::Configuration(
+                "Kernel connection identity is invalid".to_owned(),
+            ));
+        }
+        if config.expected_kernel_sid.trim().is_empty()
+            || config.expected_kernel_sid.chars().any(char::is_control)
+        {
+            return Err(KernelClientError::Configuration(
+                "Kernel service SID is invalid".to_owned(),
+            ));
+        }
+        config
+            .client_hello
+            .validate()
+            .map_err(|error| KernelClientError::Configuration(error.to_string()))
+    }
+
+    fn validate_operation(operation: &str) -> Result<(), KernelClientError> {
+        if operation.trim().is_empty()
+            || operation.len() > OPERATION_LIMIT
+            || operation.chars().any(char::is_control)
+        {
+            return Err(KernelClientError::Configuration(
+                "Kernel operation selector is invalid".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    fn require_delivery(
+        result: Result<DeliveryOutcome, eliot_ipc::TransportError>,
+        operation: &str,
+    ) -> Result<(), KernelClientError> {
+        match result {
+            Ok(DeliveryOutcome::Delivered) => Ok(()),
+            Ok(DeliveryOutcome::UnknownOutcome) => Err(KernelClientError::Rejected(format!(
+                "{operation} delivery outcome is unknown"
+            ))),
+            Err(error) => Err(KernelClientError::Rejected(format!("{operation}: {error}"))),
+        }
+    }
 }
 
 /// One generated command row.
@@ -705,6 +1065,8 @@ static COMMANDS: &[CommandSpec] = &[
 pub enum CliError {
     #[error("catalogue: {0}")]
     Catalogue(#[from] CatalogueError),
+    #[error("command port: {0}")]
+    Port(#[from] CommandPortError),
     #[error("protocol request identity is invalid: {0}")]
     Protocol(String),
     #[error("unknown command: {0}")]
@@ -847,6 +1209,23 @@ impl CommandCatalogue {
         response.validate_for(self, request)?;
         Ok(response)
     }
+
+    /// Validates and forwards one request through an injected Kernel port.
+    ///
+    /// This method is intentionally separate from [`Self::execute`]: the
+    /// catalogue can describe unavailable rows, but the production client must
+    /// never convert that metadata into local authority or a fake success.
+    pub fn dispatch<P: CommandPort + ?Sized>(
+        self,
+        port: &mut P,
+        request: &CommandRequest,
+    ) -> Result<CommandResponse, CliError> {
+        self.validate()?;
+        request.validate()?;
+        let response = port.dispatch(request).map_err(CliError::Port)?;
+        response.validate_for(self, request)?;
+        Ok(response)
+    }
 }
 
 impl CommandResponse {
@@ -868,6 +1247,7 @@ impl CommandResponse {
             return Err(CliError::ResultMismatch);
         }
         match (&spec.availability, &self.result) {
+            (CommandAvailability::Admitted, CommandResult::Forwarded { .. }) => {}
             (
                 CommandAvailability::PlanGap {
                     missing_work_id,
