@@ -254,6 +254,24 @@ unsafe extern "system" fn service_main(_argc: u32, _argv: *mut *mut u16) {
     // SAFETY: handle is registered and status is initialized.
     unsafe { SetServiceStatus(handle, &raw const status) };
     while !STOP_REQUESTED.load(Ordering::Acquire) && host.running() {
+        match host.has_durable_branch_fence() {
+            Ok(true) => {
+                // A degraded branch has fenced the shared authority in the
+                // durable state store. Keep the healthy sibling alive, but do
+                // not continue claiming or reconciling stale authority.
+                std::thread::sleep(std::time::Duration::from_millis(250));
+                continue;
+            }
+            Ok(false) => {}
+            Err(error) => {
+                let _ = writeln!(
+                    io::stderr().lock(),
+                    "eliot-host: durable authority-fence inspection failed: {error}"
+                );
+                STOP_REQUESTED.store(true, Ordering::Release);
+                break;
+            }
+        }
         if host.has_process_contour() {
             match host.reconcile_approved_contour() {
                 Ok(HostBranchDisposition::Healthy) => {}

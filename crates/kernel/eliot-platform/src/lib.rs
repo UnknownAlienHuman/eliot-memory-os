@@ -599,11 +599,13 @@ impl HostJobDisposition {
 }
 
 /// Process identity required to clear a stale Host projection.
-#[derive(
-    Clone, Debug, Eq, Hash, JsonSchema, Ord, PartialEq, PartialOrd, Serialize, Deserialize,
-)]
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct HostProcessRecoveryBinding {
+    /// Installation identity that owns this process projection.
+    pub installation: PlatformHandle,
+    /// Complete process observation bound to the physical PID/image/Job.
+    pub observed_process: ServiceProcessRecord,
     pub process_generation: PlatformHandle,
     pub process_id: u32,
     pub image_path: PlatformHandle,
@@ -612,6 +614,11 @@ pub struct HostProcessRecoveryBinding {
 
 impl HostProcessRecoveryBinding {
     pub fn validate(&self) -> Result<(), HostStateError> {
+        validate_text(self.installation.as_str(), "process_recovery.installation")
+            .map_err(|_| HostStateError::InvalidRecord)?;
+        self.observed_process
+            .validate()
+            .map_err(|_| HostStateError::InvalidRecord)?;
         validate_text(
             self.process_generation.as_str(),
             "process_recovery.process_generation",
@@ -623,6 +630,69 @@ impl HostProcessRecoveryBinding {
         validate_text(self.image_path.as_str(), "process_recovery.image_path")
             .map_err(|_| HostStateError::InvalidRecord)?;
         self.job.validate()
+    }
+
+    /// Returns whether this physical recovery proof is bound to the exact
+    /// installation and observed service record being persisted.
+    #[must_use]
+    pub fn binds_to(
+        &self,
+        installation: &PlatformHandle,
+        observed_process: &ServiceProcessRecord,
+    ) -> bool {
+        if self.installation != *installation || self.observed_process != *observed_process {
+            return false;
+        }
+        // Production ServiceProcessRecord identities emitted by the Windows
+        // service port begin with the physical PID (`pid:start-time`). Keep
+        // opaque test/provider identities valid, but reject an explicit PID
+        // contradiction whenever the numeric projection is available.
+        observed_process
+            .process_id
+            .split(':')
+            .next()
+            .and_then(|value| value.parse::<u32>().ok())
+            .is_none_or(|pid| pid == self.process_id)
+    }
+}
+
+/// Host-owned process branch whose stale authority can be fenced
+/// independently from its sibling branch.
+#[derive(
+    Clone, Copy, Debug, Eq, Hash, JsonSchema, Ord, PartialEq, PartialOrd, Serialize, Deserialize,
+)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum HostBranchKind {
+    Kernel,
+    Store,
+}
+
+/// Durable fence emitted when one Host-owned branch is absent, dead, or
+/// cannot be re-established within its bounded restart budget.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HostBranchRecoveryFence {
+    pub installation: PlatformHandle,
+    pub generation: PlatformHandle,
+    pub branch: HostBranchKind,
+    pub observed_process: Option<ServiceProcessRecord>,
+    pub reason: PlatformHandle,
+}
+
+impl HostBranchRecoveryFence {
+    pub fn validate(&self) -> Result<(), HostStateError> {
+        validate_text(self.installation.as_str(), "recovery_fence.installation")
+            .map_err(|_| HostStateError::InvalidRecord)?;
+        validate_text(self.generation.as_str(), "recovery_fence.generation")
+            .map_err(|_| HostStateError::InvalidRecord)?;
+        validate_text(self.reason.as_str(), "recovery_fence.reason")
+            .map_err(|_| HostStateError::InvalidRecord)?;
+        if let Some(process) = &self.observed_process {
+            process
+                .validate()
+                .map_err(|_| HostStateError::InvalidRecord)?;
+        }
+        Ok(())
     }
 }
 
@@ -752,6 +822,11 @@ pub struct HostInstallationState {
     pub active_process_recovery: Option<HostProcessRecoveryBinding>,
     #[serde(default)]
     pub last_recovery_evidence: Option<HostRecoveryEvidence>,
+    /// Durable branch-specific recovery fence. A fence prevents stale
+    /// process authority from being re-admitted until fresh observation clears
+    /// it.
+    #[serde(default)]
+    pub recovery_fence: Option<HostBranchRecoveryFence>,
 }
 
 impl HostInstallationState {
@@ -786,6 +861,15 @@ impl HostInstallationState {
             evidence.validate()?;
             if evidence.installation != self.installation {
                 return Err(HostStateError::InstallationMismatch);
+            }
+        }
+        if let Some(fence) = &self.recovery_fence {
+            fence.validate()?;
+            if fence.installation != self.installation {
+                return Err(HostStateError::InstallationMismatch);
+            }
+            if matches!(fence.branch, HostBranchKind::Kernel) && self.active_process.is_some() {
+                return Err(HostStateError::InvalidRecord);
             }
         }
         match &self.disposition {
@@ -911,7 +995,7 @@ pub trait HostStateStore: Send + Sync {
     /// Opaque state-owner capability returned by the pending-release phase.
     /// Implementations keep its marker private and consume it exactly once at
     /// clean finalization.
-    type ReleaseToken: Send;
+    type ReleaseToken: Send + Clone;
 
     fn load_installation(&self) -> Result<HostInstallationState, HostStateError>;
     fn commit_activation(
@@ -923,6 +1007,9 @@ pub trait HostStateStore: Send + Sync {
         &self,
         transition: ManagedDependencyTransition,
     ) -> Result<ManagedDependencyReceipt, HostStateError>;
+    /// Records a durable branch fence and clears the matching stale process
+    /// projection in the same state-owner mutation.
+    fn record_branch_recovery(&self, fence: HostBranchRecoveryFence) -> Result<(), HostStateError>;
     fn prepare_release_pending(
         &self,
         marker: HostShutdownMarker,
@@ -1092,6 +1179,7 @@ pub struct FakeHostStateStore {
 
 /// Opaque pending-release capability used by the deterministic fake store.
 /// Production stores use their own private token type.
+#[derive(Clone)]
 pub struct FakeHostReleaseToken {
     marker: HostShutdownMarker,
 }
@@ -1134,6 +1222,7 @@ impl HostStateStore for FakeHostStateStore {
         state.last_recovery_evidence = None;
         state.disposition = HostShutdownDisposition::Clean;
         state.active_process_recovery = Some(process_recovery);
+        state.recovery_fence = None;
         Ok(HostActivationReceipt {
             request_id: transition.context.request_id,
             installation: transition.installation,
@@ -1164,11 +1253,53 @@ impl HostStateStore for FakeHostStateStore {
                 .managed_dependencies
                 .push(transition.dependency.clone());
         }
+        if state
+            .recovery_fence
+            .as_ref()
+            .is_some_and(|fence| fence.branch == HostBranchKind::Store)
+        {
+            state.recovery_fence = None;
+        }
         Ok(ManagedDependencyReceipt {
             request_id: transition.context.request_id,
             installation: transition.installation,
             dependency: transition.dependency,
         })
+    }
+
+    fn record_branch_recovery(&self, fence: HostBranchRecoveryFence) -> Result<(), HostStateError> {
+        fence.validate()?;
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| HostStateError::Synchronization)?;
+        if state.installation != fence.installation {
+            return Err(HostStateError::InstallationMismatch);
+        }
+        match fence.branch {
+            HostBranchKind::Kernel => {
+                if let Some(process) = &fence.observed_process
+                    && state.active_process.as_ref() != Some(process)
+                {
+                    return Err(HostStateError::InvalidRecord);
+                }
+                state.active_process = None;
+                state.active_process_recovery = None;
+            }
+            HostBranchKind::Store => {
+                if let Some(process) = &fence.observed_process {
+                    state
+                        .managed_dependencies
+                        .retain(|dependency| dependency != process);
+                } else {
+                    state
+                        .managed_dependencies
+                        .retain(|dependency| dependency.owner != "Store");
+                }
+            }
+        }
+        state.recovery_fence = Some(fence);
+        state.validate()
     }
 
     fn prepare_release_pending(
@@ -1517,10 +1648,13 @@ mod tests {
             disposition: HostShutdownDisposition::Clean,
             active_process_recovery: None,
             last_recovery_evidence: None,
+            recovery_fence: None,
         })
         .unwrap_or_else(|_| unreachable!());
         let host = process("host-1", "Host", ServiceProcessState::Ready);
         let host_recovery = HostProcessRecoveryBinding {
+            installation: installation.clone(),
+            observed_process: host.clone(),
             process_generation: handle("generation-1"),
             process_id: 1,
             image_path: handle("image-1"),
@@ -1589,6 +1723,7 @@ mod tests {
             disposition: HostShutdownDisposition::Clean,
             active_process_recovery: None,
             last_recovery_evidence: None,
+            recovery_fence: None,
         })
         .unwrap_or_else(|_| unreachable!());
         let result = store.commit_activation(
@@ -1598,6 +1733,8 @@ mod tests {
                 process: process("host-binding", "Host", ServiceProcessState::Ready),
             },
             HostProcessRecoveryBinding {
+                installation: handle("installation-binding"),
+                observed_process: process("host-binding", "Host", ServiceProcessState::Ready),
                 process_generation: handle("generation-binding"),
                 process_id: 0,
                 image_path: handle("image-binding"),
@@ -1605,6 +1742,67 @@ mod tests {
             },
         );
         assert!(matches!(result, Err(HostStateError::InvalidRecord)));
+    }
+
+    #[test]
+    fn recovery_binding_and_branch_fence_require_exact_projection() {
+        let installation = handle("installation-fence");
+        let kernel_process = process("123:456", "Kernel", ServiceProcessState::Ready);
+        let store = FakeHostStateStore::new(HostInstallationState {
+            installation: installation.clone(),
+            active_process: None,
+            managed_dependencies: Vec::new(),
+            last_clean_shutdown: None,
+            disposition: HostShutdownDisposition::Clean,
+            active_process_recovery: None,
+            last_recovery_evidence: None,
+            recovery_fence: None,
+        })
+        .unwrap_or_else(|_| unreachable!());
+        let binding = HostProcessRecoveryBinding {
+            installation: installation.clone(),
+            observed_process: kernel_process.clone(),
+            process_generation: handle("generation-fence"),
+            process_id: 123,
+            image_path: handle("kernel-image"),
+            job: HostJobDisposition::Assigned {
+                job: handle("kernel-job"),
+            },
+        };
+        assert!(binding.binds_to(&installation, &kernel_process));
+        assert!(!binding.binds_to(&handle("other-installation"), &kernel_process));
+        assert!(!binding.binds_to(
+            &installation,
+            &process("124:456", "Kernel", ServiceProcessState::Ready)
+        ));
+        store
+            .commit_activation(
+                HostActivationTransition {
+                    context: context("fence-activation"),
+                    installation: installation.clone(),
+                    process: kernel_process.clone(),
+                },
+                binding,
+            )
+            .unwrap_or_else(|_| unreachable!());
+        store
+            .record_branch_recovery(HostBranchRecoveryFence {
+                installation: installation.clone(),
+                generation: handle("generation-fence"),
+                branch: HostBranchKind::Kernel,
+                observed_process: Some(kernel_process),
+                reason: handle("restart-exhausted"),
+            })
+            .unwrap_or_else(|_| unreachable!());
+        let state = store.load_installation().unwrap_or_else(|_| unreachable!());
+        assert!(state.active_process.is_none());
+        assert!(matches!(
+            state.recovery_fence,
+            Some(HostBranchRecoveryFence {
+                branch: HostBranchKind::Kernel,
+                ..
+            })
+        ));
     }
 
     #[test]
@@ -1628,6 +1826,7 @@ mod tests {
             disposition: HostShutdownDisposition::RecoveryFinalized { marker },
             active_process_recovery: None,
             last_recovery_evidence: None,
+            recovery_fence: None,
         };
         assert!(matches!(
             state.validate(),

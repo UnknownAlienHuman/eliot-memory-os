@@ -167,6 +167,10 @@ pub enum HostServiceError {
     /// Kernel handoff/readiness was not accepted.
     #[error("Kernel handoff: {0}")]
     KernelHandoff(String),
+    /// The installation-wide Host owner lease could not be acquired or
+    /// released by this service instance.
+    #[error("Host owner lease: {0}")]
+    OwnerLease(String),
 }
 
 /// The external Host Supervisor over a platform service port and host state owner.
@@ -180,6 +184,9 @@ where
     state: HostServiceState,
     failure: Option<HostFailure>,
     pending_release: Option<S::ReleaseToken>,
+    owner_lease: HostOwnerLease,
+    owner_released: bool,
+    admission_closed: bool,
 }
 
 impl<P, S> HostService<P, S>
@@ -198,20 +205,24 @@ where
         installation: PlatformHandle,
     ) -> Result<Self, HostServiceError> {
         validate_handle(&installation, "installation")?;
+        let owner_lease = HostOwnerLease::acquire(&installation)
+            .map_err(|error| HostServiceError::OwnerLease(error.to_string()))?;
         let snapshot = state_store.load_installation()?;
         if snapshot.installation != installation {
             return Err(HostServiceError::IdentityMismatch);
         }
-        let state =
-            if snapshot.active_process.is_some() || snapshot.disposition.is_release_pending() {
-                HostServiceState::DegradedRecovery
-            } else if snapshot.last_clean_shutdown.is_some()
-                || snapshot.last_recovery_evidence.is_some()
-            {
-                HostServiceState::StoppedClean
-            } else {
-                HostServiceState::Stopped
-            };
+        let state = if snapshot.active_process.is_some()
+            || snapshot.disposition.is_release_pending()
+            || snapshot.recovery_fence.is_some()
+        {
+            HostServiceState::DegradedRecovery
+        } else if snapshot.last_clean_shutdown.is_some()
+            || snapshot.last_recovery_evidence.is_some()
+        {
+            HostServiceState::StoppedClean
+        } else {
+            HostServiceState::Stopped
+        };
         Ok(Self {
             platform,
             state_store,
@@ -219,6 +230,11 @@ where
             state,
             failure: None,
             pending_release: None,
+            owner_lease,
+            owner_released: false,
+            admission_closed: snapshot.active_process.is_some()
+                || snapshot.disposition.is_release_pending()
+                || snapshot.recovery_fence.is_some(),
         })
     }
 
@@ -303,6 +319,14 @@ where
                 return Err(HostServiceError::Platform(error));
             }
         };
+        if !process_recovery.binds_to(&self.installation, &process) {
+            self.admission_closed = true;
+            self.fail(HostFailure::IdentityMismatch);
+            if !reused {
+                self.cleanup_started_kernel(context, &service)?;
+            }
+            return Err(HostServiceError::IdentityMismatch);
+        }
         let transition = HostActivationTransition {
             context: derived_context(context, "kernel-activation")?,
             installation: self.installation.clone(),
@@ -312,11 +336,16 @@ where
             .state_store
             .commit_activation(transition, process_recovery.clone())
         {
+            self.admission_closed = true;
+            if !reused {
+                self.cleanup_started_kernel(context, &service)?;
+            }
             self.fail(HostFailure::StateStore(error.to_string()));
             return Err(HostServiceError::StateStore(error));
         }
         self.state = HostServiceState::ControlReady;
         self.failure = None;
+        self.admission_closed = false;
         Ok(KernelStartReceipt {
             service,
             process,
@@ -421,13 +450,16 @@ where
             plan.service.clone(),
             ServiceOperation::Inspect,
         )?;
-        let process = match observation {
+        let (process, reused) = match observation {
             PortOutcome::Known(observation)
                 if is_ready_process(&observation, &plan.service, &plan.expected_owner) =>
             {
-                observation
-                    .process
-                    .ok_or(HostServiceError::ReadinessNotProven)?
+                (
+                    observation
+                        .process
+                        .ok_or(HostServiceError::ReadinessNotProven)?,
+                    true,
+                )
             }
             PortOutcome::Known(observation)
                 if matches!(
@@ -441,7 +473,10 @@ where
                     plan.service.clone(),
                     ServiceOperation::Start,
                 )?;
-                ready_process(started, &plan.service, &plan.expected_owner)?
+                (
+                    ready_process(started, &plan.service, &plan.expected_owner)?,
+                    false,
+                )
             }
             PortOutcome::Known(_) => return Err(HostServiceError::ReadinessNotProven),
             PortOutcome::Partial { .. } => return Err(HostServiceError::IncompleteObservation),
@@ -457,6 +492,15 @@ where
             dependency: process.clone(),
         };
         if let Err(error) = self.state_store.record_dependency(transition) {
+            self.admission_closed = true;
+            if !reused {
+                if let Err(cleanup_error) = self.cleanup_started_service(context, &plan.service) {
+                    self.fail(HostFailure::Platform(format!(
+                        "dependency persistence failed ({error}); cleanup failed: {cleanup_error}"
+                    )));
+                    return Err(cleanup_error);
+                }
+            }
             self.fail(HostFailure::StateStore(error.to_string()));
             return Err(HostServiceError::StateStore(error));
         }
@@ -553,13 +597,10 @@ where
         })
     }
 
-    /// Finalizes a previously prepared clean stop after the caller has
-    /// released its installation-wide owner capability. The token is retained
-    /// when release fails, so a retry cannot bypass the durable pending gate.
-    pub fn finalize_clean_shutdown(
-        &mut self,
-        owner_lease: &mut HostOwnerLease,
-    ) -> Result<(), HostServiceError> {
+    /// Releases this service's installation-wide owner capability and then
+    /// finalizes a previously prepared clean stop. The token is retained when
+    /// either phase fails, so a retry cannot bypass the durable pending gate.
+    pub fn finalize_clean_shutdown(&mut self) -> Result<(), HostServiceError> {
         let token = self
             .pending_release
             .take()
@@ -567,19 +608,70 @@ where
                 from: self.state,
                 to: HostServiceState::StoppedClean,
             })?;
-        if let Err(error) = owner_lease.release() {
+        if !self.owner_lease.is_for_installation(&self.installation) {
             self.pending_release = Some(token);
-            let error = HostServiceError::KernelHandoff(error.to_string());
-            self.fail(HostFailure::Platform(error.to_string()));
-            return Err(error);
+            self.admission_closed = true;
+            return Err(HostServiceError::OwnerLease(
+                "owner capability is bound to another installation".to_owned(),
+            ));
         }
-        if let Err(error) = self.state_store.finalize_clean_shutdown(token) {
+        if !self.owner_released {
+            if let Err(error) = self.owner_lease.release() {
+                self.pending_release = Some(token);
+                let error = HostServiceError::OwnerLease(error.to_string());
+                self.fail(HostFailure::Platform(error.to_string()));
+                self.admission_closed = true;
+                return Err(error);
+            }
+            self.owner_released = true;
+        }
+        if let Err(error) = self.state_store.finalize_clean_shutdown(token.clone()) {
+            self.pending_release = Some(token);
             self.fail(HostFailure::StateStore(error.to_string()));
+            self.admission_closed = true;
             return Err(HostServiceError::StateStore(error));
         }
         self.state = HostServiceState::StoppedClean;
         self.failure = None;
+        self.admission_closed = false;
         Ok(())
+    }
+
+    fn cleanup_started_kernel(
+        &mut self,
+        context: &RequestMetadata,
+        service: &PlatformHandle,
+    ) -> Result<(), HostServiceError> {
+        self.cleanup_started_service(context, service)
+    }
+
+    fn cleanup_started_service(
+        &mut self,
+        context: &RequestMetadata,
+        service: &PlatformHandle,
+    ) -> Result<(), HostServiceError> {
+        let stopped = self.execute(
+            context,
+            "service-cleanup",
+            service.clone(),
+            ServiceOperation::Stop,
+        )?;
+        match stopped {
+            PortOutcome::Known(observation)
+                if observation.service == *service
+                    && matches!(
+                        observation.state,
+                        ServiceState::Stopped | ServiceState::Absent
+                    )
+                    && observation.process.is_none() =>
+            {
+                Ok(())
+            }
+            PortOutcome::Known(_) => Err(HostServiceError::ReadinessNotProven),
+            PortOutcome::Partial { .. } => Err(HostServiceError::IncompleteObservation),
+            PortOutcome::Unknown(_) => Err(HostServiceError::UnknownOutcome),
+            PortOutcome::Error(error) => Err(HostServiceError::Platform(error)),
+        }
     }
 
     fn execute(
@@ -616,7 +708,9 @@ where
     }
 
     fn transition(&mut self, next: HostServiceState) -> Result<(), HostServiceError> {
-        if next == HostServiceState::Starting && self.pending_release.is_some() {
+        if next == HostServiceState::Starting
+            && (self.pending_release.is_some() || self.admission_closed)
+        {
             return Err(HostServiceError::IllegalTransition {
                 from: self.state,
                 to: next,

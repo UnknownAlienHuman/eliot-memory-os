@@ -6,10 +6,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::{EpochIdentity, EpochTransition, HostInstallationEpoch};
 use eliot_platform::{
-    HostActivationReceipt, HostActivationTransition, HostEpochBinding, HostInstallationState,
-    HostProcessRecoveryBinding, HostRecoveryEvidence, HostShutdownDisposition, HostShutdownMarker,
-    HostStateError, HostStateStore, ManagedDependencyReceipt, ManagedDependencyTransition,
-    PlatformHandle,
+    HostActivationReceipt, HostActivationTransition, HostBranchKind, HostBranchRecoveryFence,
+    HostEpochBinding, HostInstallationState, HostProcessRecoveryBinding, HostRecoveryEvidence,
+    HostShutdownDisposition, HostShutdownMarker, HostStateError, HostStateStore,
+    ManagedDependencyReceipt, ManagedDependencyTransition, PlatformHandle,
 };
 use eliot_runtime_contracts::ServiceProcessRecord;
 use redb::{Database, ReadOnlyDatabase, ReadableDatabase, ReadableTable, TableDefinition};
@@ -45,6 +45,7 @@ pub struct HostRecoverySnapshot {
 /// Opaque state-owner capability returned by one exact pending-release or
 /// recovery preparation. The marker/evidence remain private and are consumed
 /// only by clean finalization.
+#[derive(Clone)]
 pub struct RedbHostReleaseToken {
     marker: HostShutdownMarker,
     recovery: Option<HostRecoveryEvidence>,
@@ -79,6 +80,7 @@ impl RedbHostStateStore {
         validate_admission_state(&state, installation)?;
         if state.active_process.is_some()
             || state.disposition.is_release_pending()
+            || state.recovery_fence.is_some()
             || (state.last_clean_shutdown.is_none() && state.last_recovery_evidence.is_none())
         {
             Ok(HostAdmissionState::RecoveryRequired)
@@ -345,6 +347,7 @@ impl RedbHostStateStore {
             disposition: HostShutdownDisposition::Clean,
             active_process_recovery: None,
             last_recovery_evidence: None,
+            recovery_fence: None,
         };
         initial.validate()?;
         if let Some(parent) = path.as_ref().parent() {
@@ -650,6 +653,7 @@ impl RedbHostStateStore {
             state.last_clean_shutdown = None;
             state.last_recovery_evidence = None;
             state.disposition = HostShutdownDisposition::Clean;
+            state.recovery_fence = None;
             Ok(())
         })?;
         Ok(receipt)
@@ -660,7 +664,9 @@ impl HostStateStore for RedbHostStateStore {
     type ReleaseToken = RedbHostReleaseToken;
 
     fn load_installation(&self) -> Result<HostInstallationState, HostStateError> {
-        self.read_state()?.ok_or(HostStateError::Unavailable)
+        let state = self.read_state()?.ok_or(HostStateError::Unavailable)?;
+        state.validate()?;
+        Ok(state)
     }
 
     fn commit_activation(
@@ -694,9 +700,50 @@ impl HostStateStore for RedbHostStateStore {
             } else {
                 state.managed_dependencies.push(transition.dependency);
             }
+            if state
+                .recovery_fence
+                .as_ref()
+                .is_some_and(|fence| fence.branch == HostBranchKind::Store)
+            {
+                state.recovery_fence = None;
+            }
             Ok(())
         })?;
         Ok(receipt)
+    }
+
+    /// Records a branch-specific durable recovery fence while clearing the
+    /// stale process projection that could otherwise be mistaken for healthy
+    /// shared authority.
+    fn record_branch_recovery(&self, fence: HostBranchRecoveryFence) -> Result<(), HostStateError> {
+        fence.validate()?;
+        let installation = fence.installation.clone();
+        self.mutate(installation.as_str(), |state| {
+            match fence.branch {
+                HostBranchKind::Kernel => {
+                    if let Some(process) = &fence.observed_process
+                        && state.active_process.as_ref() != Some(process)
+                    {
+                        return Err(HostStateError::InvalidRecord);
+                    }
+                    state.active_process = None;
+                    state.active_process_recovery = None;
+                }
+                HostBranchKind::Store => {
+                    if let Some(process) = &fence.observed_process {
+                        state
+                            .managed_dependencies
+                            .retain(|dependency| dependency != process);
+                    } else {
+                        state
+                            .managed_dependencies
+                            .retain(|dependency| dependency.owner != "Store");
+                    }
+                }
+            }
+            state.recovery_fence = Some(fence);
+            Ok(())
+        })
     }
 
     fn prepare_release_pending(

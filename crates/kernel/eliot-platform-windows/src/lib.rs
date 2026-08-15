@@ -247,6 +247,13 @@ impl HostOwnerLease {
         &self.name
     }
 
+    /// Returns whether this capability was created for the exact installation
+    /// identity supplied by the caller.
+    #[must_use]
+    pub fn is_for_installation(&self, installation: &PlatformHandle) -> bool {
+        self.name == host_owner_mutex_name(installation)
+    }
+
     /// Releases the owner mutex after the caller has durably recorded a
     /// release-pending Host disposition. Drop remains a last-resort close for
     /// error paths; callers must finalize clean state only after `Ok(())`.
@@ -1300,6 +1307,25 @@ impl PinnedExecutable {
                 file_index: (u64::from(information.nFileIndexHigh) << 32)
                     | u64::from(information.nFileIndexLow),
             },
+        })
+    }
+}
+
+/// Read-pinned protected runtime input retained while a Host contour is
+/// running. The no-follow handle prevents replacement or reparse substitution
+/// after digest verification.
+#[cfg(windows)]
+pub struct PinnedRuntimeFile {
+    _file: PinnedExecutable,
+}
+
+#[cfg(windows)]
+impl PinnedRuntimeFile {
+    /// Opens one regular non-reparse runtime input with replacement-blocking
+    /// sharing semantics.
+    pub fn open(path: &Path) -> Result<Self, WindowsAdapterError> {
+        Ok(Self {
+            _file: PinnedExecutable::open(path)?,
         })
     }
 }

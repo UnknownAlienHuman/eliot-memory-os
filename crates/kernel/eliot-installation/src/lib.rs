@@ -127,6 +127,27 @@ fn sha256_handle(value: &PlatformHandle, field: &str) -> Result<(), Installation
     Ok(())
 }
 
+fn approved_path(value: &PlatformHandle, field: &str) -> Result<(), InstallationError> {
+    handle(value, field)?;
+    let path = Path::new(value.as_str());
+    if !path.is_absolute() {
+        return Err(InstallationError::InvalidField {
+            field: field.to_owned(),
+            reason: "must be an absolute canonical path".to_owned(),
+        });
+    }
+    if path
+        .components()
+        .any(|component| matches!(component, std::path::Component::ParentDir))
+    {
+        return Err(InstallationError::InvalidField {
+            field: field.to_owned(),
+            reason: "must not contain parent-directory traversal".to_owned(),
+        });
+    }
+    Ok(())
+}
+
 /// Canonicalizes one installation-owned file and verifies its complete
 /// contents against an approved lowercase SHA-256 digest.
 ///
@@ -179,6 +200,77 @@ pub fn verify_file_digest(
         });
     }
     Ok(canonical)
+}
+
+/// Verifies that a caller-supplied locator resolves to the exact canonical
+/// path recorded by the installation-owned candidate manifest.
+pub fn verify_approved_path(
+    path: impl AsRef<Path>,
+    approved: &PlatformHandle,
+    field: &str,
+) -> Result<std::path::PathBuf, InstallationError> {
+    handle(approved, field)?;
+    let approved_path = Path::new(approved.as_str());
+    let candidate_path = path.as_ref();
+    if !approved_path.is_absolute() || !candidate_path.is_absolute() {
+        return Err(InstallationError::InvalidField {
+            field: field.to_owned(),
+            reason: "approved and supplied paths must be absolute".to_owned(),
+        });
+    }
+    for (label, value) in [("approved", approved_path), ("supplied", candidate_path)] {
+        let metadata = fs::symlink_metadata(value)
+            .map_err(|error| InstallationError::Platform(format!("{field} {label}: {error}")))?;
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            return Err(InstallationError::InvalidField {
+                field: field.to_owned(),
+                reason: format!("{label} path must be a regular non-symlink file"),
+            });
+        }
+        reject_reparse_ancestors(value, field, label)?;
+    }
+    let approved_canonical = fs::canonicalize(approved_path)
+        .map_err(|error| InstallationError::Platform(format!("{field} approved: {error}")))?;
+    let candidate_canonical = fs::canonicalize(candidate_path)
+        .map_err(|error| InstallationError::Platform(format!("{field} supplied: {error}")))?;
+    if candidate_canonical != approved_canonical {
+        return Err(InstallationError::InvalidField {
+            field: field.to_owned(),
+            reason: "supplied path is not the approved canonical path".to_owned(),
+        });
+    }
+    Ok(approved_canonical)
+}
+
+fn reject_reparse_ancestors(
+    path: &Path,
+    field: &str,
+    label: &str,
+) -> Result<(), InstallationError> {
+    for ancestor in path.ancestors() {
+        let metadata = fs::symlink_metadata(ancestor)
+            .map_err(|error| InstallationError::Platform(format!("{field} {label}: {error}")))?;
+        if metadata.file_type().is_symlink() || is_reparse_point(&metadata) {
+            return Err(InstallationError::InvalidField {
+                field: field.to_owned(),
+                reason: format!("{label} path traverses a reparse point"),
+            });
+        }
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn is_reparse_point(metadata: &fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt;
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+
+    metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+}
+
+#[cfg(not(windows))]
+fn is_reparse_point(_metadata: &fs::Metadata) -> bool {
+    false
 }
 
 fn handles(
@@ -542,6 +634,12 @@ pub struct CandidateManifest {
     pub components: Vec<PlatformHandle>,
     /// Immutable artifact digests.
     pub artifact_digests: Vec<PlatformHandle>,
+    /// Canonical installation-approved Kernel executable path.
+    pub kernel_executable_path: PlatformHandle,
+    /// Canonical installation-approved canonical-store executable path.
+    pub store_executable_path: PlatformHandle,
+    /// Canonical installation-approved generation configuration path.
+    pub config_path: PlatformHandle,
     /// Executable/dependency closure evidence.
     pub dependency_closure_refs: Vec<PlatformHandle>,
     /// License and source assurance evidence.
@@ -575,6 +673,15 @@ impl CandidateManifest {
                 });
             }
         }
+        approved_path(
+            &self.kernel_executable_path,
+            "manifest.kernel_executable_path",
+        )?;
+        approved_path(
+            &self.store_executable_path,
+            "manifest.store_executable_path",
+        )?;
+        approved_path(&self.config_path, "manifest.config_path")?;
         handles(
             &self.dependency_closure_refs,
             "manifest.dependency_closure_refs",
@@ -603,6 +710,16 @@ impl CandidateManifest {
             ));
         }
         Ok((&self.artifact_digests[0], &self.artifact_digests[1]))
+    }
+
+    /// Returns the canonical Kernel, store and configuration paths recorded by
+    /// installation policy.
+    pub fn runtime_paths(&self) -> (&PlatformHandle, &PlatformHandle, &PlatformHandle) {
+        (
+            &self.kernel_executable_path,
+            &self.store_executable_path,
+            &self.config_path,
+        )
     }
 }
 
