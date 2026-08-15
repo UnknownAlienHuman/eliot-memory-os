@@ -90,6 +90,47 @@ pub struct SupervisionGenerationBinding {
     pub process_generation: ResourceGeneration,
 }
 
+/// Signed mirror identity proving which committed ORS revision backed a lease.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SupervisionOrsMirrorBinding {
+    /// Stable ORS record identity.
+    pub record_id: String,
+    /// Positive monotonic lease revision in the ORS record.
+    pub lease_revision: u64,
+    /// SHA-256 of the committed ORS receipt which admitted this revision.
+    pub committed_receipt_sha256: String,
+    /// Optional SHA-256 of the immediately previous revision.
+    pub previous_revision_sha256: Option<String>,
+}
+
+impl SupervisionOrsMirrorBinding {
+    fn validate(&self) -> Result<(), RuntimeContractError> {
+        non_empty_text(&self.record_id, "ors_mirror.record_id")?;
+        if self.lease_revision == 0 {
+            return Err(invalid_lease_field(
+                "ors_mirror.lease_revision",
+                "must be greater than zero",
+            ));
+        }
+        if !is_sha256_hex(&self.committed_receipt_sha256) {
+            return Err(invalid_lease_field(
+                "ors_mirror.committed_receipt_sha256",
+                "must be a lowercase SHA-256 digest",
+            ));
+        }
+        if let Some(previous) = &self.previous_revision_sha256
+            && !is_sha256_hex(previous)
+        {
+            return Err(invalid_lease_field(
+                "ors_mirror.previous_revision_sha256",
+                "must be absent or a lowercase SHA-256 digest",
+            ));
+        }
+        Ok(())
+    }
+}
+
 impl SupervisionGenerationBinding {
     fn validate(&self) -> Result<(), RuntimeContractError> {
         non_empty_text(&self.target_id, "generation_binding.target_id")?;
@@ -185,6 +226,8 @@ pub struct SupervisionLease {
     pub generation_binding: SupervisionGenerationBinding,
     /// State fence captured with the activation.
     pub state_fence: StateFence,
+    /// Committed ORS mirror receipt and revision binding.
+    pub ors_mirror: SupervisionOrsMirrorBinding,
     /// Inclusive issue time in Unix milliseconds.
     pub issued_at_ms: u64,
     /// Exclusive expiry time in Unix milliseconds.
@@ -249,13 +292,14 @@ impl SupervisionLease {
             ));
         }
         self.generation_binding.validate()?;
+        self.ors_mirror.validate()?;
         self.state_fence
             .validate()
             .map_err(|error| invalid_lease_field("state_fence", error.to_string()))?;
-        if self.state_fence.authority_epoch != self.host_epoch {
+        if self.state_fence.authority_epoch != self.kernel_epoch {
             return Err(invalid_lease_field(
                 "state_fence.authority_epoch",
-                "must equal host_epoch",
+                "must equal kernel_epoch",
             ));
         }
         if self.state_fence.resource_generation != self.activation_generation {
@@ -532,6 +576,11 @@ impl SupervisionTrustAnchor {
         .map_err(|error| SupervisionLeaseError::InvalidPublicKey(error.to_string()))?;
         Ok(())
     }
+
+    /// Returns the externally provisioned public-key fingerprint.
+    pub fn public_key_fingerprint(&self) -> &str {
+        &self.public_key_fingerprint
+    }
 }
 
 /// Current values a consumer must bind before accepting a verified lease.
@@ -550,12 +599,26 @@ pub struct SupervisionLeaseVerificationContext {
     pub kernel_epoch: AuthorityEpoch,
     /// Current Watchdog epoch.
     pub watchdog_epoch: AuthorityEpoch,
+    /// Exact current Kernel-owned state fence.
+    pub state_fence: StateFence,
+    /// Exact current lease scope reference.
+    pub scope_ref: String,
+    /// Exact current target identity.
+    pub target_id: String,
+    /// Exact current module identity.
+    pub module_id: String,
+    /// Exact current process lineage identity.
+    pub process_id: String,
     /// Current target generation.
     pub target_generation: ResourceGeneration,
     /// Current module generation.
     pub module_generation: ResourceGeneration,
     /// Current process generation.
     pub process_generation: ResourceGeneration,
+    /// Exact fingerprint independently selected by installation admission.
+    pub public_key_fingerprint: String,
+    /// Exact committed ORS mirror selected by installation admission.
+    pub ors_mirror: SupervisionOrsMirrorBinding,
 }
 
 impl SupervisionLeaseVerificationContext {
@@ -567,6 +630,33 @@ impl SupervisionLeaseVerificationContext {
             ));
         }
         non_empty_text_for_lease(&self.activation_id, "context.activation_id")?;
+        non_empty_text_for_lease(&self.scope_ref, "context.scope_ref")?;
+        non_empty_text_for_lease(&self.target_id, "context.target_id")?;
+        non_empty_text_for_lease(&self.module_id, "context.module_id")?;
+        non_empty_text_for_lease(&self.process_id, "context.process_id")?;
+        if self.state_fence.validate().is_err() {
+            return Err(SupervisionLeaseError::InvalidContext(
+                "state_fence is invalid".to_owned(),
+            ));
+        }
+        if self.state_fence.authority_epoch != self.kernel_epoch {
+            return Err(SupervisionLeaseError::InvalidContext(
+                "state_fence authority must equal kernel_epoch".to_owned(),
+            ));
+        }
+        if self.state_fence.resource_generation != self.activation_generation {
+            return Err(SupervisionLeaseError::InvalidContext(
+                "state_fence generation must equal activation_generation".to_owned(),
+            ));
+        }
+        if !is_sha256_hex(&self.public_key_fingerprint) {
+            return Err(SupervisionLeaseError::InvalidContext(
+                "public_key_fingerprint must be lowercase SHA-256".to_owned(),
+            ));
+        }
+        self.ors_mirror
+            .validate()
+            .map_err(|error| SupervisionLeaseError::InvalidContext(error.to_string()))?;
         for (field, value) in [
             ("context.host_epoch", self.host_epoch.value()),
             (
@@ -641,6 +731,11 @@ impl SupervisionLeaseVerifier for SupervisionTrustAnchor {
         if envelope.algorithm != self.algorithm {
             return Err(SupervisionLeaseError::TrustAnchorMismatch("algorithm"));
         }
+        if self.public_key_fingerprint != context.public_key_fingerprint {
+            return Err(SupervisionLeaseError::TrustAnchorMismatch(
+                "public_key_fingerprint",
+            ));
+        }
         let payload = &envelope.payload;
         if payload.installation_id != self.installation_id {
             return Err(SupervisionLeaseError::TrustAnchorMismatch(
@@ -652,15 +747,23 @@ impl SupervisionLeaseVerifier for SupervisionTrustAnchor {
             || payload.activation_id != context.activation_id
             || payload.kernel_epoch != context.kernel_epoch
             || payload.watchdog_epoch != context.watchdog_epoch
+            || payload.state_fence != context.state_fence
+            || payload.scope_ref != context.scope_ref
         {
             return Err(SupervisionLeaseError::EpochOrActivationMismatch);
         }
         let binding = &payload.generation_binding;
-        if binding.target_generation != context.target_generation
+        if binding.target_id != context.target_id
+            || binding.module_id != context.module_id
+            || binding.process_id != context.process_id
+            || binding.target_generation != context.target_generation
             || binding.module_generation != context.module_generation
             || binding.process_generation != context.process_generation
         {
             return Err(SupervisionLeaseError::GenerationMismatch);
+        }
+        if payload.ors_mirror != context.ors_mirror {
+            return Err(SupervisionLeaseError::OrsMirrorMismatch);
         }
         if payload.state != LeaseState::Active || payload.terminal_disposition.is_some() {
             return Err(SupervisionLeaseError::InactiveLease);
@@ -732,6 +835,9 @@ pub enum SupervisionLeaseError {
     /// Current target/module/process generation did not match the signed payload.
     #[error("supervision lease generation mismatch")]
     GenerationMismatch,
+    /// Signed ORS mirror did not match the independently admitted revision.
+    #[error("supervision lease ORS mirror mismatch")]
+    OrsMirrorMismatch,
     /// Lease is not active at the verification boundary.
     #[error("supervision lease is not active")]
     InactiveLease,
@@ -783,6 +889,13 @@ fn non_empty_text_for_lease(value: &str, field: &str) -> Result<(), SupervisionL
         });
     }
     Ok(())
+}
+
+fn is_sha256_hex(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
 }
 
 fn encode_hex(bytes: &[u8]) -> String {
