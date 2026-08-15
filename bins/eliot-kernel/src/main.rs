@@ -71,7 +71,7 @@ async fn main() {
                     if let Err(error) = result {
                         write_error("FRONT_DOOR_FAILURE", &error.to_string());
                         drop(front_door);
-                        front_door = match kernel.bind_authenticated_front_door() {
+                        front_door = match kernel.bind_authenticated_front_door_next() {
                             Ok(server) => server,
                             Err(bind_error) => {
                                 write_error("FRONT_DOOR_FAILURE", &bind_error.to_string());
@@ -165,8 +165,15 @@ async fn serve_connection(
         return Err(error);
     }
     loop {
-        let Some(frame) = receive_frame_or_shutdown(&mut front_door, limits, &mut shutdown).await?
-        else {
+        let received = match receive_frame_or_shutdown(&mut front_door, limits, &mut shutdown).await
+        {
+            Ok(received) => received,
+            Err(error) => {
+                session.fence();
+                return Err(error);
+            }
+        };
+        let Some(frame) = received else {
             session.fence();
             return Ok(());
         };
