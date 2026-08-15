@@ -328,7 +328,7 @@ impl CapabilityAdmissionPort for FakeAdmission {
             });
         }
         let expires_at_unix_ms = if state.effect_expired {
-            state.observed_at_unix_ms.saturating_sub(1)
+            state.observed_at_unix_ms
         } else {
             state.expires_at_unix_ms
         };
@@ -810,7 +810,7 @@ fn live_lease_revision_expiry_and_revocation_fail_closed() {
             match expected {
                 "lease" => state.stale_lease = true,
                 "revision" => state.stale_revision = true,
-                "expired" => state.observed_at_unix_ms = 20_000,
+                "expired" => state.observed_at_unix_ms = state.expires_at_unix_ms,
                 "revoked" => state.revoked = true,
                 _ => unreachable!(),
             }

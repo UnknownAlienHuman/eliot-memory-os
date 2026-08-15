@@ -1038,7 +1038,7 @@ where
             return Err(WorkerError::StaleRevision);
         }
         if live.expires_at_unix_ms() != grant.expires_at_unix_ms()
-            || live.observed_at_unix_ms() > live.expires_at_unix_ms()
+            || live.observed_at_unix_ms() >= live.expires_at_unix_ms()
         {
             return Err(WorkerError::StaleLease);
         }
@@ -1238,7 +1238,7 @@ fn validate_grant(
             return Err(WorkerError::AdmissionMismatch(field));
         }
     }
-    if grant.observed_at_unix_ms() > grant.expires_at_unix_ms()
+    if grant.observed_at_unix_ms() >= grant.expires_at_unix_ms()
         || grant.observed_at_unix_ms() > hello.deadline_unix_ms
     {
         return Err(WorkerError::StaleLease);
@@ -1385,7 +1385,7 @@ fn validate_effect_grant(
     {
         return Err(WorkerError::StaleRevision);
     }
-    if effect.observed_at_unix_ms() > effect.expires_at_unix_ms()
+    if effect.observed_at_unix_ms() >= effect.expires_at_unix_ms()
         || effect.expires_at_unix_ms() > grant.expires_at_unix_ms()
     {
         return Err(WorkerError::StaleLease);
