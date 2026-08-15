@@ -6,9 +6,12 @@
 
 #![forbid(unsafe_code)]
 
+use std::fs::{self, OpenOptions};
 use std::future::Future;
+use std::io::Write;
+use std::path::PathBuf;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use eliot_contracts::AuthorityEpoch;
@@ -16,11 +19,79 @@ use eliot_runtime::{
     ChildClass, Runtime, RuntimeConfig, ShutdownOutcome, SupervisionStrategy, TaskFailure,
 };
 use eliot_runtime_contracts::{LeaseState, SupervisionLease};
+use eliot_watchdog_core::{Epoch, Watchdog};
 use thiserror::Error;
 
 pub const SERVICE_NAME: &str = "eliot-watchdog";
 pub const PROTOCOL_VERSION: &str = "eliot.watchdog.v1";
-pub const PLAN_GAP_EXIT: i32 = 78;
+/// Errors from the independent protected watchdog spool.
+#[derive(Debug, Error)]
+pub enum SpoolError {
+    #[error("watchdog spool I/O: {0}")]
+    Io(#[from] std::io::Error),
+    #[error("watchdog spool path must be absolute")]
+    RelativePath,
+}
+
+/// Minimal independent sensor surface used by the SCM sibling process.
+///
+/// The spool is append-only and contains only bounded heartbeat observations;
+/// Kernel remains the sole effect owner. The decision core is intentionally
+/// composed here so a sensor tick can never bypass its generation fences.
+pub struct IndependentKernelSensor {
+    watchdog: Mutex<Watchdog>,
+    spool: PathBuf,
+}
+
+impl IndependentKernelSensor {
+    /// Opens a protected spool below the installation's durable data root.
+    pub fn open(path: impl Into<PathBuf>, watchdog_epoch: u64) -> Result<Self, SpoolError> {
+        let spool = path.into();
+        if !spool.is_absolute() {
+            return Err(SpoolError::RelativePath);
+        }
+        if let Some(parent) = spool.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        OpenOptions::new().create(true).append(true).open(&spool)?;
+        let watchdog = Watchdog::new(
+            eliot_watchdog_core::WatchdogConfig::default(),
+            Epoch(watchdog_epoch),
+        )
+        .map_err(|_| SpoolError::RelativePath)?;
+        Ok(Self {
+            watchdog: Mutex::new(watchdog),
+            spool,
+        })
+    }
+
+    fn record_heartbeat(&self, lease: &SupervisionLease) -> Result<(), KernelWatchdogError> {
+        let watchdog = self
+            .watchdog
+            .lock()
+            .map_err(|_| KernelWatchdogError::Failed)?;
+        let _epoch = watchdog.epoch();
+        let line = format!(
+            "{{\"service\":\"{}\",\"lease\":\"{}\",\"scope\":\"{}\"}}\n",
+            SERVICE_NAME, lease.lease_id, lease.scope_ref
+        );
+        OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.spool)
+            .and_then(|mut file| file.write_all(line.as_bytes()))
+            .map_err(|_| KernelWatchdogError::Failed)
+    }
+}
+
+impl KernelWatchdogPort for IndependentKernelSensor {
+    fn supervise<'a>(
+        &'a self,
+        lease: &'a SupervisionLease,
+    ) -> Pin<Box<dyn Future<Output = Result<(), KernelWatchdogError>> + Send + 'a>> {
+        Box::pin(async move { self.record_heartbeat(lease) })
+    }
+}
 
 /// Tunables for the watchdog's bounded control loop.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -106,7 +177,7 @@ pub enum CompositionError {
 }
 
 /// Readiness data emitted by the process entrypoint.
-#[derive(Clone, Debug, Eq, serde::Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
 pub struct WatchdogReadiness {
     pub service: &'static str,
     pub protocol: &'static str,
@@ -143,9 +214,10 @@ impl WatchdogComposition {
         let lease = Arc::new(lease);
         let task_lease = lease.clone();
         let interval = config.tick_interval;
-        let task = match runtime
-            .supervisor(SupervisionStrategy::OneForOne)
-            .spawn(SERVICE_NAME, ChildClass::Critical, move |token| {
+        let task = match runtime.supervisor(SupervisionStrategy::OneForOne).spawn(
+            SERVICE_NAME,
+            ChildClass::Critical,
+            move |token| {
                 let kernel = kernel.clone();
                 let lease = task_lease.clone();
                 async move {
@@ -154,12 +226,14 @@ impl WatchdogComposition {
                             () = token.cancelled() => return Ok(()),
                             () = tokio::time::sleep(interval) => {}
                         }
-                        kernel.supervise(&lease).await.map_err(|error| {
-                            TaskFailure::Failed(error.to_string())
-                        })?;
+                        kernel
+                            .supervise(&lease)
+                            .await
+                            .map_err(|error| TaskFailure::Failed(error.to_string()))?;
                     }
                 }
-            }) {
+            },
+        ) {
             eliot_runtime::SpawnDisposition::Admitted(task) => task,
             eliot_runtime::SpawnDisposition::DeniedShuttingDown => {
                 return Err(CompositionError::AdmissionClosed);
@@ -186,9 +260,7 @@ impl WatchdogComposition {
 
     /// Waits for process termination and performs ordered runtime shutdown.
     pub async fn run_until_shutdown(self) -> Result<ShutdownOutcome, TaskFailure> {
-        let WatchdogComposition {
-            runtime, task, ..
-        } = self;
+        let WatchdogComposition { runtime, task, .. } = self;
         let mut task_result = Box::pin(task.join());
         tokio::select! {
             result = &mut task_result => {

@@ -11,11 +11,18 @@ name = "eliot-host"
 path = "src/main.rs"
 
 [dependencies]
+eliot-installation.workspace = true
 eliot-host-state.workspace = true
 eliot-platform.workspace = true
+eliot-platform-windows.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
+windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_System_Services"] }
 
-[lints]
-workspace = true
+[lints.rust]
+unsafe_code = "allow"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }

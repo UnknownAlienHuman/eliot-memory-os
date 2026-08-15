@@ -10,6 +10,7 @@ mod backend;
 mod error;
 mod journal;
 mod model;
+mod redb_store;
 
 pub use backend::{
     BackendReconcileState, CommittedAppend, DurableImage, FaultPoint, JournalBackend,
@@ -30,5 +31,6 @@ pub use model::{
     RecordFence, RecoveryLineageEvidence, RecoveryLineageReason, ServiceSafetyClass,
     WakeDisposition, WakeRecord,
 };
+pub use redb_store::RedbHostStateStore;
 #[cfg(test)]
 mod tests;

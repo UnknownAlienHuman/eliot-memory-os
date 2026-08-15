@@ -10,6 +10,7 @@ description = "Pure HostStateJournal state machine and persistence port"
 eliot-observation-contracts.workspace = true
 eliot-platform.workspace = true
 eliot-runtime-contracts.workspace = true
+redb.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

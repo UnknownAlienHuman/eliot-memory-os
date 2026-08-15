@@ -15,12 +15,18 @@ path = "src/main.rs"
 
 [dependencies]
 eliot-contracts.workspace = true
+eliot-watchdog-core.workspace = true
 eliot-runtime.workspace = true
 eliot-runtime-contracts.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
+windows-sys = { workspace = true, features = ["Win32_System_Services"] }
 
-[lints]
-workspace = true
+[lints.rust]
+unsafe_code = "allow"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }

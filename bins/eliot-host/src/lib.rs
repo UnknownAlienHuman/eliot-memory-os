@@ -1,15 +1,20 @@
+//! Production Host composition root.
+//!
+//! Host is the outer Windows lifecycle owner. It opens the redb Host state
+//! store under the installation's durable data root, keeps approved
+//! generations separate from semantic state, and owns independent Job Object
+//! branches for Kernel and the canonical store dependency.
+
 #![forbid(unsafe_code)]
 
-use std::fs::{self, File};
-use std::io::{self, Write};
-use std::path::{Path, PathBuf};
+use std::io;
+use std::path::Path;
 
-use eliot_host_state::{
-    BackendError, BackendReconcileState, DurableImage, HostInstallationEpoch, HostState,
-    HostStateJournal, IdempotencyIdentity, JournalBackend, PreparedAppend, StoredEpoch,
+use eliot_host_state::{EpochIdentity, EpochTransition, HostInstallationEpoch, RedbHostStateStore};
+use eliot_installation::{
+    ApprovedGenerationRegistry, CandidateManifest, InstallationError, RedbInstallationRegistry,
 };
-use eliot_platform::PlatformHandle;
-use serde::{Deserialize, Serialize};
+use eliot_platform::{HostInstallationState, HostStateStore, PlatformHandle};
 use thiserror::Error;
 
 pub const SERVICE_NAME: &str = "eliot-host";
@@ -17,192 +22,218 @@ pub const PROTOCOL_VERSION: &str = "eliot.host.v1";
 
 #[derive(Debug, Error)]
 pub enum HostError {
-    #[error("host state journal: {0}")]
-    Journal(#[from] eliot_host_state::JournalError),
-    #[error("backend: {0}")]
-    Backend(#[from] BackendError),
-    #[error("state file: {0}")]
-    Io(#[from] io::Error),
-    #[error("state file encoding: {0}")]
-    Encoding(#[from] serde_json::Error),
+    #[error("host state store: {0}")]
+    State(#[from] eliot_platform::HostStateError),
+    #[error("installation registry: {0}")]
+    Installation(#[from] InstallationError),
+    #[error("host platform: {0}")]
+    Platform(String),
     #[error("host is already stopped")]
     Stopped,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
-struct DiskImage {
-    image: DurableImageWire,
+#[cfg(windows)]
+use eliot_platform_windows::{JobObject, JobObjectIdentity, WindowsAdapterError};
+
+/// The two physical process ownership branches controlled by Host.
+#[cfg(windows)]
+pub struct HostJobBranches {
+    kernel: JobObject,
+    store: JobObject,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
-struct DurableImageWire {
-    epochs: Vec<StoredEpochWire>,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-struct StoredEpochWire {
-    host: HostInstallationEpoch,
-    bytes: Vec<u8>,
-}
-
-impl From<DurableImage> for DurableImageWire {
-    fn from(image: DurableImage) -> Self {
-        Self {
-            epochs: image
-                .epochs
-                .into_iter()
-                .map(|epoch| StoredEpochWire {
-                    host: epoch.host,
-                    bytes: epoch.bytes,
-                })
-                .collect(),
-        }
-    }
-}
-
-impl From<DurableImageWire> for DurableImage {
-    fn from(image: DurableImageWire) -> Self {
-        Self {
-            epochs: image
-                .epochs
-                .into_iter()
-                .map(|epoch| StoredEpoch {
-                    host: epoch.host,
-                    bytes: epoch.bytes,
-                })
-                .collect(),
-        }
-    }
-}
-
-/// A file-backed transaction backend. The journal remains the sole owner of
-/// state transitions; this adapter only supplies atomic durable bytes.
-pub struct FileBackend {
-    path: PathBuf,
-    image: DurableImage,
-    staged: Option<(PreparedAppend, Vec<u8>)>,
-}
-
-impl FileBackend {
-    pub fn open(path: impl Into<PathBuf>) -> Result<Self, HostError> {
-        let path = path.into();
-        let image = if path.exists() {
-            let bytes = fs::read(&path)?;
-            serde_json::from_slice::<DiskImage>(&bytes)?.image.into()
-        } else {
-            DurableImage::default()
-        };
-        Ok(Self {
-            path,
-            image,
-            staged: None,
-        })
+#[cfg(windows)]
+impl HostJobBranches {
+    /// Creates fresh, owner-scoped kill-on-close branches.
+    pub fn new() -> Result<Self, WindowsAdapterError> {
+        let pid = std::process::id();
+        let kernel = JobObject::new_named_kill_on_close(JobObjectIdentity::new(format!(
+            "Local\\Eliot-Host-Kernel-{pid}"
+        ))?)?;
+        let store = JobObject::new_named_kill_on_close(JobObjectIdentity::new(format!(
+            "Local\\Eliot-Host-Store-{pid}"
+        ))?)?;
+        Ok(Self { kernel, store })
     }
 
-    fn persist(&self) -> Result<(), BackendError> {
-        let parent = self.path.parent().unwrap_or_else(|| Path::new("."));
-        fs::create_dir_all(parent).map_err(|error| BackendError::Failed(error.to_string()))?;
-        let temporary = self.path.with_extension("tmp");
-        let bytes = serde_json::to_vec(&DiskImage {
-            image: self.image.clone().into(),
-        })
-        .map_err(|error| BackendError::Failed(error.to_string()))?;
-        let mut file =
-            File::create(&temporary).map_err(|error| BackendError::Failed(error.to_string()))?;
-        file.write_all(&bytes)
-            .and_then(|()| file.sync_all())
-            .map_err(|error| BackendError::Failed(error.to_string()))?;
-        fs::rename(temporary, &self.path).map_err(|error| BackendError::Failed(error.to_string()))
+    /// Assigns the exact Kernel service process to Host's Kernel branch.
+    pub fn assign_kernel(&self, process_id: u32) -> Result<(), WindowsAdapterError> {
+        self.kernel.assign_process(process_id).map(|_| ())
+    }
+
+    /// Assigns the exact store dependency process to the independent store branch.
+    pub fn assign_store(&self, process_id: u32) -> Result<(), WindowsAdapterError> {
+        self.store.assign_process(process_id).map(|_| ())
+    }
+
+    /// Terminates the Kernel branch during bounded rollback or shutdown.
+    pub fn terminate_kernel(&self) -> Result<(), WindowsAdapterError> {
+        self.kernel.terminate(0xE017_0001)
+    }
+
+    /// Terminates the store branch during bounded rollback or shutdown.
+    pub fn terminate_store(&self) -> Result<(), WindowsAdapterError> {
+        self.store.terminate(0xE017_0002)
+    }
+
+    /// Returns the durable mechanics identity of the Kernel branch.
+    #[must_use]
+    pub fn kernel_name(&self) -> &str {
+        self.kernel.identity().name()
+    }
+
+    /// Returns the durable mechanics identity of the store branch.
+    #[must_use]
+    pub fn store_name(&self) -> &str {
+        self.store.identity().name()
     }
 }
 
-impl JournalBackend for FileBackend {
-    fn load(&mut self) -> Result<DurableImage, BackendError> {
-        Ok(self.image.clone())
-    }
-    fn prepare(&mut self, append: &PreparedAppend) -> Result<(), BackendError> {
-        if self.staged.is_some() {
-            return Err(BackendError::Failed("append already staged".into()));
-        }
-        self.staged = Some((append.clone(), Vec::new()));
-        Ok(())
-    }
-    fn append_prepared(
-        &mut self,
-        transaction_id: &PlatformHandle,
-        bytes: &[u8],
-    ) -> Result<(), BackendError> {
-        let Some((append, payload)) = self.staged.as_mut() else {
-            return Err(BackendError::Failed("append not prepared".into()));
-        };
-        if &append.transaction_id != transaction_id {
-            return Err(BackendError::Failed("transaction identity mismatch".into()));
-        }
-        payload.extend_from_slice(bytes);
-        Ok(())
-    }
-    fn flush(&mut self, _: &PlatformHandle) -> Result<(), BackendError> {
-        Ok(())
-    }
-    fn sync(&mut self, _: &PlatformHandle) -> Result<(), BackendError> {
-        Ok(())
-    }
-    fn commit(&mut self, transaction_id: &PlatformHandle) -> Result<(), BackendError> {
-        let Some((append, bytes)) = self.staged.take() else {
-            return Err(BackendError::Failed("append not prepared".into()));
-        };
-        if &append.transaction_id != transaction_id {
-            return Err(BackendError::Failed("transaction identity mismatch".into()));
-        }
-        self.image.epochs.push(StoredEpoch {
-            host: append.host,
-            bytes,
-        });
-        self.persist()
-    }
-    fn reconcile(
-        &mut self,
-        transaction_id: &PlatformHandle,
-    ) -> Result<BackendReconcileState, BackendError> {
-        if self
-            .staged
-            .as_ref()
-            .is_some_and(|(append, _)| &append.transaction_id == transaction_id)
-        {
-            Ok(BackendReconcileState::Prepared)
-        } else {
-            Ok(BackendReconcileState::Absent)
-        }
-    }
-}
-
-/// The Host composition root. It owns one journal and exposes only lifecycle
-/// observations; Kernel remains the authority for service admission.
+/// Host-owned lifecycle state and installation activation registry.
 pub struct HostComposition {
-    journal: HostStateJournal<FileBackend>,
+    state_store: RedbHostStateStore,
+    registry_store: RedbInstallationRegistry,
+    registry: ApprovedGenerationRegistry,
+    host: HostInstallationEpoch,
     running: bool,
+    #[cfg(windows)]
+    jobs: HostJobBranches,
 }
 
 impl HostComposition {
-    pub fn open(path: impl Into<PathBuf>, host: HostInstallationEpoch) -> Result<Self, HostError> {
+    /// Opens the durable Host contour for one installation epoch.
+    pub fn open(path: impl AsRef<Path>, host: HostInstallationEpoch) -> Result<Self, HostError> {
+        let path = path.as_ref();
+        let initial = HostInstallationState {
+            installation: host.installation.clone(),
+            active_process: None,
+            managed_dependencies: Vec::new(),
+            last_clean_shutdown: None,
+        };
+        let state_store = RedbHostStateStore::open(path, initial)?;
+        let registry_path = path.with_file_name("installation-registry.redb");
+        let registry_store = RedbInstallationRegistry::open(registry_path)?;
+        let registry = registry_store.load()?;
+        #[cfg(windows)]
+        let jobs =
+            HostJobBranches::new().map_err(|error| HostError::Platform(error.to_string()))?;
         Ok(Self {
-            journal: HostStateJournal::open(FileBackend::open(path)?, host)?,
+            state_store,
+            registry_store,
+            registry,
+            host,
             running: true,
+            #[cfg(windows)]
+            jobs,
         })
     }
 
-    pub fn snapshot(&self) -> Result<HostState, HostError> {
-        Ok(self.journal.snapshot()?)
+    /// Returns the Host epoch bound to this process.
+    #[must_use]
+    pub const fn host_epoch(&self) -> &HostInstallationEpoch {
+        &self.host
     }
+
+    /// Reads the Host-only operational state from redb.
+    pub fn snapshot(&self) -> Result<HostInstallationState, HostError> {
+        self.state_store
+            .load_installation()
+            .map_err(HostError::State)
+    }
+
+    /// Returns the installation-owned approved-generation registry.
+    #[must_use]
+    pub const fn registry(&self) -> &ApprovedGenerationRegistry {
+        &self.registry
+    }
+
+    /// Approves an immutable generation for a later activation.
+    pub fn approve_generation(
+        &mut self,
+        manifest: CandidateManifest,
+        approval_ref: PlatformHandle,
+    ) -> Result<(), HostError> {
+        self.registry
+            .approve(manifest, approval_ref)
+            .map_err(HostError::Installation)?;
+        self.registry_store
+            .save(&self.registry)
+            .map_err(HostError::Installation)
+    }
+
+    /// Activates an approved generation, preserving the previous one as LKG.
+    pub fn activate_generation(&mut self, generation: &PlatformHandle) -> Result<(), HostError> {
+        self.registry
+            .activate(generation)
+            .map_err(HostError::Installation)?;
+        self.registry_store
+            .save(&self.registry)
+            .map_err(HostError::Installation)
+    }
+
+    /// Rolls back to the registry's last-known-good generation.
+    pub fn rollback_generation(&mut self) -> Result<PlatformHandle, HostError> {
+        let generation = self.registry.rollback().map_err(HostError::Installation)?;
+        self.registry_store
+            .save(&self.registry)
+            .map_err(HostError::Installation)?;
+        Ok(generation)
+    }
+
+    /// Requests a bounded Host stop. SCM owns the sibling Watchdog and is not
+    /// represented by either Host Job Object branch.
     pub fn stop(&mut self) -> Result<(), HostError> {
         if !self.running {
             return Err(HostError::Stopped);
         }
+        #[cfg(windows)]
+        {
+            self.jobs
+                .terminate_kernel()
+                .map_err(|error| HostError::Platform(error.to_string()))?;
+            self.jobs
+                .terminate_store()
+                .map_err(|error| HostError::Platform(error.to_string()))?;
+        }
         self.running = false;
         Ok(())
     }
+
     #[must_use]
     pub const fn running(&self) -> bool {
         self.running
+    }
+
+    #[cfg(windows)]
+    /// Returns the physical Host job branches for service composition.
+    #[must_use]
+    pub const fn jobs(&self) -> &HostJobBranches {
+        &self.jobs
+    }
+}
+
+/// Builds the initial Host epoch from stable installation identity material.
+pub fn initial_epoch(installation: PlatformHandle) -> HostInstallationEpoch {
+    HostInstallationEpoch {
+        installation,
+        epoch: EpochTransition {
+            current: EpochIdentity {
+                lineage: handle("host-lineage"),
+                sequence: 1,
+            },
+            parent: None,
+        },
+        nonce: handle("host-boot"),
+        recovery: None,
+    }
+}
+
+fn handle(value: &str) -> PlatformHandle {
+    PlatformHandle::new(value).unwrap_or_else(|_| unreachable!())
+}
+
+impl From<io::Error> for HostError {
+    fn from(error: io::Error) -> Self {
+        Self::Platform(error.to_string())
     }
 }

@@ -10,6 +10,8 @@
 #![warn(missing_docs)]
 
 use std::collections::BTreeSet;
+use std::fs;
+use std::path::Path;
 
 use eliot_contracts::{ContractIdentity, ContractVersion, contract_identity as make_contract_identity};
 use eliot_platform::{
@@ -17,6 +19,7 @@ use eliot_platform::{
     PortOutcome,
 };
 use schemars::JsonSchema;
+use redb::{Database, ReadableDatabase, TableDefinition};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -46,8 +49,8 @@ pub fn contract_identity() -> Result<ContractIdentity, InstallationError> {
         },
     )
     .map_err(|_| InstallationError::InvalidField {
-        field: "contract_identity",
-        reason: "canonical contract shape could not be serialized",
+        field: "contract_identity".to_owned(),
+        reason: "canonical contract shape could not be serialized".to_owned(),
     })
 }
 
@@ -62,7 +65,7 @@ pub enum InstallationError {
     #[error("{kind} contains duplicate identity {identity}")]
     Duplicate { kind: String, identity: String },
     /// A state transition is not admitted by the transaction machine.
-    #[error("illegal installation transition from {from} to {to}")]
+    #[error("illegal installation transition from {from:?} to {to:?}")]
     IllegalTransition { from: InstallationStage, to: InstallationStage },
     /// A caller attempted to use a request for another transaction.
     #[error("installation transaction identity conflict")]
@@ -462,6 +465,237 @@ impl CandidateManifest {
         handles(&self.license_refs, "manifest.license_refs", true)?;
         handle(&self.config_digest, "manifest.config_digest")?;
         handle(&self.signature_ref, "manifest.signature_ref")
+    }
+}
+
+/// One artifact generation admitted by installation policy.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ApprovedGeneration {
+    /// The complete immutable candidate manifest.
+    pub manifest: CandidateManifest,
+    /// Non-secret approval evidence reference.
+    pub approval_ref: PlatformHandle,
+    /// Whether this generation is currently active.
+    pub active: bool,
+    /// Whether this generation is the last-known-good activation.
+    pub last_known_good: bool,
+}
+
+impl ApprovedGeneration {
+    /// Validates the generation and its approval reference.
+    pub fn validate(&self) -> Result<(), InstallationError> {
+        self.manifest.validate()?;
+        handle(&self.approval_ref, "approved_generation.approval_ref")
+    }
+}
+
+/// Installation-owned approved-generation and last-known-good registry.
+///
+/// The registry admits only complete [`CandidateManifest`] values. Activation
+/// is a bounded state transition: an unknown generation cannot become active,
+/// and rollback selects the previously recorded last-known-good generation.
+#[derive(Clone, Debug, Default, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ApprovedGenerationRegistry {
+    /// Approved generations keyed by their exact generation identity.
+    pub generations: Vec<ApprovedGeneration>,
+    /// Currently active generation identity, when one is active.
+    pub active_generation: Option<PlatformHandle>,
+    /// Last-known-good generation identity, when one is available.
+    pub last_known_good_generation: Option<PlatformHandle>,
+}
+
+const REGISTRY_TABLE: TableDefinition<&str, &[u8]> =
+    TableDefinition::new("eliot_approved_generations_v1");
+
+/// Durable redb owner for approved generations and LKG activation state.
+pub struct RedbInstallationRegistry {
+    database: Database,
+}
+
+impl RedbInstallationRegistry {
+    /// Opens or creates the registry database.
+    pub fn open(path: impl AsRef<Path>) -> Result<Self, InstallationError> {
+        if let Some(parent) = path.as_ref().parent() {
+            fs::create_dir_all(parent).map_err(|error| InstallationError::Platform(error.to_string()))?;
+        }
+        let database = Database::create(path)
+            .map_err(|error| InstallationError::Platform(error.to_string()))?;
+        Ok(Self { database })
+    }
+
+    /// Loads the registry, returning an empty value on first use.
+    pub fn load(&self) -> Result<ApprovedGenerationRegistry, InstallationError> {
+        let read = self
+            .database
+            .begin_read()
+            .map_err(|error| InstallationError::Platform(error.to_string()))?;
+        let table = match read.open_table(REGISTRY_TABLE) {
+            Ok(table) => table,
+            Err(redb::TableError::TableDoesNotExist(_)) => {
+                return Ok(ApprovedGenerationRegistry::new());
+            }
+            Err(error) => return Err(InstallationError::Platform(error.to_string())),
+        };
+        let Some(value) = table
+            .get("registry")
+            .map_err(|error| InstallationError::Platform(error.to_string()))?
+        else {
+            return Ok(ApprovedGenerationRegistry::new());
+        };
+        serde_json::from_slice(value.value())
+            .map_err(|error| InstallationError::Platform(error.to_string()))
+    }
+
+    /// Durably stores one complete validated registry projection.
+    pub fn save(&self, registry: &ApprovedGenerationRegistry) -> Result<(), InstallationError> {
+        registry.validate()?;
+        let bytes = serde_json::to_vec(registry)
+            .map_err(|error| InstallationError::Platform(error.to_string()))?;
+        let write = self
+            .database
+            .begin_write()
+            .map_err(|error| InstallationError::Platform(error.to_string()))?;
+        {
+            let mut table = write
+                .open_table(REGISTRY_TABLE)
+                .map_err(|error| InstallationError::Platform(error.to_string()))?;
+            table
+                .insert("registry", bytes.as_slice())
+                .map_err(|error| InstallationError::Platform(error.to_string()))?;
+        }
+        write
+            .commit()
+            .map_err(|error| InstallationError::Platform(error.to_string()))
+    }
+}
+
+impl ApprovedGenerationRegistry {
+    /// Creates an empty registry.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            generations: Vec::new(),
+            active_generation: None,
+            last_known_good_generation: None,
+        }
+    }
+
+    /// Approves one exact candidate generation.
+    pub fn approve(
+        &mut self,
+        manifest: CandidateManifest,
+        approval_ref: PlatformHandle,
+    ) -> Result<(), InstallationError> {
+        manifest.validate()?;
+        handle(&approval_ref, "approved_generation.approval_ref")?;
+        if self
+            .generations
+            .iter()
+            .any(|generation| generation.manifest.generation == manifest.generation)
+        {
+            return Err(InstallationError::Duplicate {
+                kind: "approved generation".to_owned(),
+                identity: manifest.generation.as_str().to_owned(),
+            });
+        }
+        self.generations.push(ApprovedGeneration {
+            manifest,
+            approval_ref,
+            active: false,
+            last_known_good: false,
+        });
+        Ok(())
+    }
+
+    /// Activates an approved generation and records the prior active
+    /// generation as last-known-good before crossing the activation boundary.
+    pub fn activate(&mut self, generation: &PlatformHandle) -> Result<(), InstallationError> {
+        let selected = self
+            .generations
+            .iter()
+            .position(|item| &item.manifest.generation == generation)
+            .ok_or_else(|| InstallationError::IncompleteObservation(
+                "generation is not approved".to_owned(),
+            ))?;
+        if let Some(previous) = self.active_generation.take() {
+            self.last_known_good_generation = Some(previous.clone());
+            if let Some(item) = self
+                .generations
+                .iter_mut()
+                .find(|item| item.manifest.generation == previous)
+            {
+                item.active = false;
+                item.last_known_good = true;
+            }
+        }
+        for item in &mut self.generations {
+            item.active = false;
+        }
+        self.generations[selected].active = true;
+        self.generations[selected].last_known_good = false;
+        self.active_generation = Some(generation.clone());
+        Ok(())
+    }
+
+    /// Activates the last-known-good generation for bounded rollback.
+    pub fn rollback(&mut self) -> Result<PlatformHandle, InstallationError> {
+        let generation = self
+            .last_known_good_generation
+            .clone()
+            .ok_or_else(|| InstallationError::IncompleteObservation(
+                "last-known-good generation is unavailable".to_owned(),
+            ))?;
+        self.activate(&generation)?;
+        Ok(generation)
+    }
+
+    /// Returns the currently active approved generation.
+    #[must_use]
+    pub fn active(&self) -> Option<&ApprovedGeneration> {
+        self.active_generation.as_ref().and_then(|generation| {
+            self.generations
+                .iter()
+                .find(|item| &item.manifest.generation == generation && item.active)
+        })
+    }
+
+    /// Validates the complete registry projection and all generation entries.
+    pub fn validate(&self) -> Result<(), InstallationError> {
+        let mut identities = BTreeSet::new();
+        for generation in &self.generations {
+            generation.validate()?;
+            if !identities.insert(generation.manifest.generation.as_str()) {
+                return Err(InstallationError::Duplicate {
+                    kind: "approved generation".to_owned(),
+                    identity: generation.manifest.generation.as_str().to_owned(),
+                });
+            }
+        }
+        if let Some(active) = &self.active_generation {
+            if !self
+                .generations
+                .iter()
+                .any(|item| item.active && item.manifest.generation == *active)
+            {
+                return Err(InstallationError::IncompleteObservation(
+                    "active generation is absent from registry".to_owned(),
+                ));
+            }
+        }
+        if let Some(lkg) = &self.last_known_good_generation {
+            if !self
+                .generations
+                .iter()
+                .any(|item| item.last_known_good && item.manifest.generation == *lkg)
+            {
+                return Err(InstallationError::IncompleteObservation(
+                    "last-known-good generation is absent from registry".to_owned(),
+                ));
+            }
+        }
+        Ok(())
     }
 }
 

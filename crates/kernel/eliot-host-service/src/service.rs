@@ -91,6 +91,16 @@ pub struct ServiceStopReceipt {
     pub prior_process: ServiceProcessRecord,
 }
 
+/// Outcome of a bounded candidate-generation restart.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum BoundedRestartOutcome {
+    /// Candidate generation became ready.
+    CandidateActive,
+    /// Candidate failed and the prior generation was restored.
+    RolledBack,
+}
+
 /// Host failure classification without raw provider output.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
@@ -301,6 +311,48 @@ where
         self.state = HostServiceState::Active;
         self.failure = None;
         Ok(())
+    }
+
+    /// Attempts one approved candidate service a bounded number of times and
+    /// restores the prior service when the candidate cannot prove readiness.
+    pub fn restart_kernel_bounded(
+        &mut self,
+        context: &RequestMetadata,
+        prior_service: PlatformHandle,
+        candidate_service: PlatformHandle,
+        max_attempts: u32,
+    ) -> Result<(BoundedRestartOutcome, KernelStartReceipt), HostServiceError> {
+        validate_context(context)?;
+        if max_attempts == 0 {
+            return Err(HostServiceError::KernelHandoff(
+                "restart budget must be non-zero".to_owned(),
+            ));
+        }
+        let mut last_error = None;
+        for _ in 0..max_attempts {
+            if matches!(
+                self.state,
+                HostServiceState::ControlReady
+                    | HostServiceState::Active
+                    | HostServiceState::DegradedRecovery
+                    | HostServiceState::Failed
+            ) {
+                let _ = self.stop_kernel(context, prior_service.clone());
+            }
+            match self.start_kernel(context, candidate_service.clone()) {
+                Ok(receipt) => return Ok((BoundedRestartOutcome::CandidateActive, receipt)),
+                Err(error) => last_error = Some(error.to_string()),
+            }
+        }
+        if candidate_service != prior_service {
+            let rollback = self.start_kernel(context, prior_service);
+            if let Ok(receipt) = rollback {
+                return Ok((BoundedRestartOutcome::RolledBack, receipt));
+            }
+        }
+        Err(HostServiceError::KernelHandoff(
+            last_error.unwrap_or_else(|| "candidate generation did not start".to_owned()),
+        ))
     }
 
     /// Starts one independent managed dependency and records its observed process lineage.

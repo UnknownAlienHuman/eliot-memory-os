@@ -813,10 +813,13 @@ name = "eliot-host"
 version = "0.1.0"
 dependencies = [
  "eliot-host-state",
+ "eliot-installation",
  "eliot-platform",
+ "eliot-platform-windows",
  "serde",
  "serde_json",
  "thiserror",
+ "windows-sys",
 ]
 
 [[package]]
@@ -839,6 +842,7 @@ dependencies = [
  "eliot-observation-contracts",
  "eliot-platform",
  "eliot-runtime-contracts",
+ "redb",
  "serde",
  "serde_json",
  "thiserror",
@@ -872,8 +876,10 @@ version = "0.1.0"
 dependencies = [
  "eliot-contracts",
  "eliot-platform",
+ "redb",
  "schemars",
  "serde",
+ "serde_json",
  "thiserror",
 ]
 
@@ -1728,10 +1734,12 @@ dependencies = [
  "eliot-contracts",
  "eliot-runtime",
  "eliot-runtime-contracts",
+ "eliot-watchdog-core",
  "serde",
  "serde_json",
  "thiserror",
  "tokio",
+ "windows-sys",
 ]
 
 [[package]]

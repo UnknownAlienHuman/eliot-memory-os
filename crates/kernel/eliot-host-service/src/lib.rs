@@ -16,8 +16,8 @@
 mod service;
 
 pub use service::{
-    HostDependencyPlan, HostFailure, HostService, HostServiceError, HostServiceState,
-    KernelStartReceipt, ServiceStopReceipt,
+    BoundedRestartOutcome, HostDependencyPlan, HostFailure, HostService, HostServiceError,
+    HostServiceState, KernelStartReceipt, ServiceStopReceipt,
 };
 
 use eliot_contracts::{ContractIdentity, ContractVersion, contract_identity as make_contract_identity};
