@@ -31,12 +31,15 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use eliot_platform_windows::{
     JobObjectIdentity, JobObjectLimits, RunningJobChild, RunningJobObservation, SuspendedJobChild,
     SuspendedLaunchSpec, SuspendedProcessEvidence, SuspendedValidationError, TerminatedJobChild,
+    cancel_capture_thread_io,
 };
 
 const DEFAULT_CAPTURE_LIMIT: usize = 16 * 1024 * 1024;
 const JOB_TERMINATION_CODE: u32 = 0xE1_04;
 const WATCH_INTERVAL: Duration = Duration::from_millis(25);
 const STREAM_CHUNK_BYTES: usize = 8192;
+const STREAM_JOIN_TIMEOUT: Duration = Duration::from_secs(2);
+const STREAM_JOIN_POLL: Duration = Duration::from_millis(5);
 static JOB_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
 /// P-07's injected process-authority seam.
@@ -249,20 +252,25 @@ impl WindowsProcessExecutor {
                 .operations
                 .lock()
                 .map_err(|_| unavailable("operation registry lock poisoned"))?;
-            let ids = operations
-                .iter()
-                .filter_map(|(id, operation)| {
-                    let mut guard = operation.lock().ok()?;
-                    if !guard.state.view().lifecycle().is_terminal() {
-                        return None;
-                    }
-                    if guard.cleanup_required {
-                        return None;
-                    }
-                    join_streams(&mut guard);
-                    Some(id.clone())
-                })
-                .collect::<Vec<_>>();
+            let mut ids = Vec::new();
+            let mut cleanup_unknown = false;
+            for (id, operation) in operations.iter() {
+                let mut guard = operation
+                    .lock()
+                    .map_err(|_| unavailable("operation lock poisoned"))?;
+                if !guard.state.view().lifecycle().is_terminal() || guard.cleanup_required {
+                    continue;
+                }
+                if !join_streams(&mut guard) {
+                    poison_operation(&mut guard, &self.poisoned);
+                    cleanup_unknown = true;
+                    continue;
+                }
+                ids.push(id.clone());
+            }
+            if cleanup_unknown {
+                return Err(ProcessExecutionError::UnknownOutcome);
+            }
             let count = ids.len();
             for id in ids {
                 operations.remove(&id);
@@ -304,7 +312,10 @@ impl WindowsProcessExecutor {
                         retain_cleanup_owners = true;
                     }
                 }
-                join_streams(&mut guard);
+                if !join_streams(&mut guard) {
+                    poison_operation(&mut guard, &self.poisoned);
+                    retain_cleanup_owners = true;
+                }
             }
             if !retain_cleanup_owners {
                 operations.clear();
@@ -548,7 +559,10 @@ impl ProcessExecutor for WindowsProcessExecutor {
                 }
                 guard.state.reconcile(descendants)?;
             }
-            join_streams(&mut guard);
+            if !join_streams(&mut guard) {
+                poison_operation(&mut guard, &self.poisoned);
+                return Err(ProcessExecutionError::UnknownOutcome);
+            }
             let view = guard.state.view();
             let evidence = ProcessEvidence::new(
                 view,
@@ -776,13 +790,32 @@ fn spawn_deadline_watcher(operation: Arc<Mutex<Operation>>, poisoned: Arc<Atomic
 }
 
 #[cfg(windows)]
-fn join_streams(operation: &mut Operation) {
-    if let Some(thread) = operation.stdout_thread.take() {
-        let _ = thread.join();
+fn join_streams(operation: &mut Operation) -> bool {
+    let stdout_joined = join_capture_thread(&mut operation.stdout_thread);
+    let stderr_joined = join_capture_thread(&mut operation.stderr_thread);
+    stdout_joined && stderr_joined
+}
+
+#[cfg(windows)]
+fn join_capture_thread(thread_slot: &mut Option<JoinHandle<()>>) -> bool {
+    let Some(thread) = thread_slot.as_ref() else {
+        return true;
+    };
+    if !thread.is_finished() {
+        let _ = cancel_capture_thread_io(thread);
+        let deadline = Instant::now()
+            .checked_add(STREAM_JOIN_TIMEOUT)
+            .unwrap_or_else(Instant::now);
+        while !thread.is_finished() && Instant::now() < deadline {
+            thread::sleep(STREAM_JOIN_POLL);
+        }
     }
-    if let Some(thread) = operation.stderr_thread.take() {
-        let _ = thread.join();
+    if !thread.is_finished() {
+        return false;
     }
+    thread_slot
+        .take()
+        .is_some_and(|thread| thread.join().is_ok())
 }
 
 #[cfg(windows)]

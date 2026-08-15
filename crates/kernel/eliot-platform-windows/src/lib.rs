@@ -2237,6 +2237,30 @@ impl<V> RunningJobChild<V> {
     }
 }
 
+/// Cancels one synchronous read issued by a capture reader thread.
+///
+/// `Ok(false)` means that the thread had no pending synchronous I/O when the
+/// cancellation was requested; callers still need to use their bounded wait
+/// policy before joining it.
+#[cfg(windows)]
+pub fn cancel_capture_thread_io(
+    thread: &std::thread::JoinHandle<()>,
+) -> Result<bool, WindowsAdapterError> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Foundation::ERROR_NOT_FOUND;
+    use windows_sys::Win32::System::IO::CancelSynchronousIo;
+
+    if unsafe { CancelSynchronousIo(thread.as_raw_handle()) } != 0 {
+        return Ok(true);
+    }
+    let error = std::io::Error::last_os_error();
+    if error.raw_os_error() == Some(ERROR_NOT_FOUND.cast_signed()) {
+        Ok(false)
+    } else {
+        Err(windows_adapter_from_io(&error))
+    }
+}
+
 #[cfg(windows)]
 fn terminalize(
     inner: &mut JobChildHandles,
