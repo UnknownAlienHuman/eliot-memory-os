@@ -18,7 +18,8 @@ use eliot_ipc::{
 };
 use eliot_kernel_core::{GenerationRoute, GenerationRouter, RouteScope};
 use eliot_kernel_service::{
-    KernelControlCommand, KernelService, KernelServiceError, KernelServiceState,
+    EbpCanonicalStoreClient, HostStoreBootstrapRequirement, KernelControlCommand, KernelService,
+    KernelServiceError, KernelServiceState, PreparedTransitionGateway, StoreClientError,
 };
 #[cfg(test)]
 use eliot_ors::CanonicalEvidenceProvider;
@@ -35,10 +36,13 @@ use eliot_runtime_contracts::{
     GenerationCutoverRecord as RuntimeGenerationCutoverRecord, GenerationCutoverState,
     HealthVector, ModuleGeneration, ModuleGenerationState,
 };
+use eliot_store_api::CanonicalStoreClient;
 use sha2::{Digest as _, Sha256};
 
 #[cfg(windows)]
-use eliot_ipc::NamedPipeServer;
+use eliot_ipc::{NamedPipeServer, NamedPipeTransport};
+#[cfg(windows)]
+use eliot_platform_windows::NamedPipePeerExpectation;
 
 /// Stable Kernel process identity and wire revision.
 pub const SERVICE_NAME: &str = "eliot-kernel";
@@ -87,6 +91,9 @@ pub struct KernelConfig {
     pub work_root: PathBuf,
     /// Local pipe selected once by the composition root.
     pub pipe_name: String,
+    /// Host-approved canonical-store binding. No store gateway is admitted
+    /// until this requirement is injected explicitly.
+    pub store_bootstrap: Option<HostStoreBootstrapRequirement>,
 }
 
 impl KernelConfig {
@@ -95,7 +102,15 @@ impl KernelConfig {
         Self {
             work_root: work_root.into(),
             pipe_name: DEFAULT_PIPE_NAME.to_owned(),
+            store_bootstrap: None,
         }
+    }
+
+    /// Injects the Host-approved canonical-store bootstrap requirement.
+    #[must_use]
+    pub fn with_store_bootstrap(mut self, requirement: HostStoreBootstrapRequirement) -> Self {
+        self.store_bootstrap = Some(requirement);
+        self
     }
 }
 
@@ -114,6 +129,8 @@ pub enum KernelBuildError {
     Core(String),
     /// The Kernel lifecycle gateway could not be initialized.
     Service(String),
+    /// Host has not injected an approved canonical-store bootstrap binding.
+    StoreBootstrapRequired,
     /// The platform could not bind the authenticated local front door.
     Principal(String),
 }
@@ -127,6 +144,9 @@ impl fmt::Display for KernelBuildError {
             Self::Ors(error) => write!(f, "ORS composition failed: {error}"),
             Self::Core(error) => write!(f, "Kernel decision composition failed: {error}"),
             Self::Service(error) => write!(f, "Kernel service composition failed: {error}"),
+            Self::StoreBootstrapRequired => {
+                write!(f, "Host-approved canonical-store bootstrap is required")
+            }
             Self::Principal(error) => write!(f, "principal composition failed: {error}"),
         }
     }
@@ -140,11 +160,12 @@ pub struct KernelComposition {
     platform: WindowsPlatform,
     ipc: IpcImplementation,
     generation_gateway: OrsGenerationCoordinator,
-    service: Mutex<KernelService>,
+    service: Arc<Mutex<KernelService>>,
     generations: Mutex<GenerationRouter>,
     generation_poison: Mutex<Option<String>>,
     front_door_policy: Mutex<ServerHandshakePolicy>,
     process_executor: WindowsProcessExecutor,
+    store_bootstrap: Option<HostStoreBootstrapRequirement>,
 }
 
 /// Result of the closed Kernel semantic gateway for one authenticated frame.
@@ -343,6 +364,7 @@ impl KernelComposition {
         authority: Arc<dyn DispatchValidationPort>,
     ) -> Result<Self, KernelBuildError> {
         let work_root = config.work_root.clone();
+        let store_bootstrap = config.store_bootstrap.clone();
         let platform =
             WindowsPlatform::new(config.work_root).map_err(KernelBuildError::Platform)?;
         let ipc = IpcImplementation::new(config.pipe_name)?;
@@ -353,6 +375,20 @@ impl KernelComposition {
             .register(
                 GenerationRoute::new(
                     RouteScope::new("daemon")
+                        .map_err(|error| KernelBuildError::Core(error.to_string()))?,
+                    generation,
+                    authority_epoch,
+                )
+                .map_err(|error| KernelBuildError::Core(error.to_string()))?,
+            )
+            .map_err(|error| KernelBuildError::Core(error.to_string()))?;
+        // The canonical store bridge has its own route scope.  It starts at
+        // the independent genesis generation and is cut over separately from
+        // the daemon process route.
+        generations
+            .register(
+                GenerationRoute::new(
+                    RouteScope::new("store_bridge")
                         .map_err(|error| KernelBuildError::Core(error.to_string()))?,
                     generation,
                     authority_epoch,
@@ -421,11 +457,12 @@ impl KernelComposition {
             platform,
             ipc,
             generation_gateway,
-            service: Mutex::new(service),
+            service: Arc::new(Mutex::new(service)),
             generations: Mutex::new(generations),
             generation_poison: Mutex::new(None),
             front_door_policy: Mutex::new(policy),
             process_executor: WindowsProcessExecutor::new(authority),
+            store_bootstrap,
         })
     }
 
@@ -446,6 +483,93 @@ impl KernelComposition {
     #[must_use]
     pub const fn ipc_limits(&self) -> TransportLimits {
         self.ipc.limits()
+    }
+
+    /// Returns the Host-approved store bootstrap requirement, if injected.
+    #[must_use]
+    pub fn store_bootstrap(&self) -> Option<&HostStoreBootstrapRequirement> {
+        self.store_bootstrap.as_ref()
+    }
+
+    /// Binds the sole Kernel transition gateway to an injected canonical store
+    /// client. The caller cannot bypass Host bootstrap or the current route.
+    pub fn prepared_transition_gateway<C: CanonicalStoreClient + 'static>(
+        &self,
+        store: Arc<C>,
+        caller: ContractId,
+    ) -> Result<PreparedTransitionGateway<C>, KernelBuildError> {
+        let requirement = self
+            .store_bootstrap
+            .as_ref()
+            .ok_or(KernelBuildError::StoreBootstrapRequired)?;
+        requirement
+            .validate()
+            .map_err(|error| KernelBuildError::Service(error.to_string()))?;
+        let route_scope = RouteScope::new("store_bridge")
+            .map_err(|error| KernelBuildError::Core(error.to_string()))?;
+        let routes = self
+            .generation_route_snapshot()
+            .map_err(|error| KernelBuildError::Core(error.to_string()))?;
+        let route = routes
+            .route(&route_scope)
+            .map_err(|error| KernelBuildError::Core(error.to_string()))?
+            .clone();
+        if route.authority_epoch() != requirement.authority_epoch()
+            || route.active_generation() != requirement.store_generation
+        {
+            return Err(KernelBuildError::Core(
+                "store bootstrap does not match the active Kernel route".to_owned(),
+            ));
+        }
+        Ok(PreparedTransitionGateway::new(
+            self.service.clone(),
+            store,
+            route,
+            caller,
+        ))
+    }
+
+    /// Connects the Host-approved canonical store through the sole Kernel
+    /// transport/client composition and returns its transition gateway.
+    ///
+    /// The Host requirement is the only source of pipe, peer, generation and
+    /// fence data.  No daemon or caller may construct a second store client.
+    #[cfg(windows)]
+    pub async fn connect_canonical_store(
+        &self,
+        timeout: Duration,
+        caller: ContractId,
+    ) -> Result<
+        PreparedTransitionGateway<EbpCanonicalStoreClient<NamedPipeTransport>>,
+        KernelBuildError,
+    > {
+        let requirement = self
+            .store_bootstrap
+            .clone()
+            .ok_or(KernelBuildError::StoreBootstrapRequired)?;
+        requirement
+            .validate()
+            .map_err(|error| KernelBuildError::Service(error.to_string()))?;
+        let expectation = NamedPipePeerExpectation::new(
+            requirement.expected_peer_sid.as_str(),
+            requirement.expected_peer_session_id,
+        )
+        .map_err(|error| KernelBuildError::Principal(error.to_string()))?;
+        let transport = NamedPipeTransport::connect_authenticated(
+            requirement.store_pipe.as_str(),
+            timeout,
+            &expectation,
+        )
+        .await
+        .map_err(KernelBuildError::Transport)?;
+        let client = EbpCanonicalStoreClient::connect(transport, requirement)
+            .await
+            .map_err(|error| match error {
+                StoreClientError::Transport(error) => KernelBuildError::Service(error),
+                StoreClientError::Contract(error) => KernelBuildError::Service(error),
+                StoreClientError::Store(error) => KernelBuildError::Service(error.to_string()),
+            })?;
+        self.prepared_transition_gateway(Arc::new(client), caller)
     }
 
     /// Returns the platform surface owned by this composition.

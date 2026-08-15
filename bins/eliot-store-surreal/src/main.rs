@@ -1,7 +1,9 @@
 use std::collections::BTreeSet;
-use std::io::{self, Read, Write};
 use std::path::PathBuf;
+use std::time::Duration;
 
+#[cfg(windows)]
+use eliot_ipc::NamedPipeServer;
 use eliot_ipc::{ReplayDisposition, ReplayLedger, TransportLimits};
 use eliot_protocol::{
     ClientHello, EncodingProfile, Frame, FrameKind, MessageType, ProtocolPayload, ProtocolRange,
@@ -11,7 +13,8 @@ use eliot_store_api::{
     CAPABILITIES, EFFECTS, StateFence, decode_request_frame, response_frame as store_response_frame,
 };
 use eliot_store_surreal::{
-    PROTOCOL_VERSION, Request, Response, SERVICE_NAME, StoreComposition, load_config,
+    PROTOCOL_VERSION, Request, Response, SERVICE_NAME, StoreComposition, StoreLaunchConfig,
+    load_config,
 };
 
 struct Session {
@@ -25,6 +28,19 @@ struct Session {
 
 #[tokio::main]
 async fn main() {
+    #[cfg(not(windows))]
+    {
+        eprintln!(
+            "{SERVICE_NAME}: the production store endpoint requires Windows authenticated named pipes"
+        );
+        return;
+    }
+    #[cfg(windows)]
+    run_windows().await;
+}
+
+#[cfg(windows)]
+async fn run_windows() {
     let config_path = match parse_config_path() {
         Ok(path) => path,
         Err(error) => {
@@ -39,7 +55,7 @@ async fn main() {
             return;
         }
     };
-    let composition = match StoreComposition::new(config) {
+    let composition = match StoreComposition::new(config.clone()) {
         Ok(composition) => composition,
         Err(error) => {
             eprintln!("{SERVICE_NAME}: {error}");
@@ -48,18 +64,48 @@ async fn main() {
     };
 
     let limits = TransportLimits::default();
-    let stdin = io::stdin();
-    let mut input = stdin.lock();
-    let stdout = io::stdout();
-    let mut output = stdout.lock();
-
-    let (mut session, server_hello) = match read_handshake(&mut input, limits, &composition) {
+    let expectation = match eliot_platform_windows::NamedPipePeerExpectation::new(
+        config.expected_client_sid.clone(),
+        config.expected_client_session_id,
+    ) {
         Ok(value) => value,
         Err(error) => {
-            eprintln!("{SERVICE_NAME}: EBP handshake rejected: {error}");
+            eprintln!("{SERVICE_NAME}: invalid peer expectation: {error}");
             return;
         }
     };
+    let mut server = match NamedPipeServer::create(&config.store_pipe, &expectation) {
+        Ok(server) => server,
+        Err(error) => {
+            eprintln!("{SERVICE_NAME}: named-pipe creation failed: {error}");
+            return;
+        }
+    };
+    if let Err(error) = server
+        .wait_for_authenticated_client(
+            Duration::from_millis(config.connect_timeout_ms),
+            &expectation,
+        )
+        .await
+    {
+        eprintln!("{SERVICE_NAME}: authenticated client admission failed: {error}");
+        return;
+    }
+    let hello_frame = match server.receive_frame(limits).await {
+        Ok(frame) => frame,
+        Err(error) => {
+            eprintln!("{SERVICE_NAME}: EBP hello receive failed: {error}");
+            return;
+        }
+    };
+    let (mut session, server_hello) =
+        match admit_handshake(hello_frame, limits, &composition, &config) {
+            Ok(value) => value,
+            Err(error) => {
+                eprintln!("{SERVICE_NAME}: EBP handshake rejected: {error}");
+                return;
+            }
+        };
     let mut negotiated_limits = limits;
     negotiated_limits.max_frame_bytes = session.max_frame_bytes;
     let handshake_frame = control_frame(
@@ -68,13 +114,13 @@ async fn main() {
         MessageType::Ready,
         serde_json::to_value(server_hello).expect("server hello is serializable"),
     );
-    if let Err(error) = write_frame(&mut output, &handshake_frame, negotiated_limits) {
+    if let Err(error) = server.send_frame(&handshake_frame, negotiated_limits).await {
         eprintln!("{SERVICE_NAME}: EBP handshake response failed: {error}");
         return;
     }
 
     loop {
-        let frame = match read_frame(&mut input, negotiated_limits) {
+        let frame = match server.receive_frame(negotiated_limits).await {
             Ok(frame) => frame,
             Err(error) => {
                 eprintln!("{SERVICE_NAME}: EBP frame rejected: {error}");
@@ -97,7 +143,7 @@ async fn main() {
                 break;
             }
         };
-        if let Err(error) = write_frame(&mut output, &response_frame, negotiated_limits) {
+        if let Err(error) = server.send_frame(&response_frame, negotiated_limits).await {
             eprintln!("{SERVICE_NAME}: EBP response failed: {error}");
             break;
         }
@@ -118,12 +164,12 @@ fn parse_config_path() -> Result<PathBuf, String> {
     }
 }
 
-fn read_handshake<R: Read>(
-    reader: &mut R,
+fn admit_handshake(
+    frame: Frame,
     limits: TransportLimits,
     composition: &StoreComposition,
+    config: &StoreLaunchConfig,
 ) -> Result<(Session, ServerHello), String> {
-    let frame = read_frame(reader, limits)?;
     if frame.kind != FrameKind::Control
         || frame.message_type != MessageType::Start
         || frame.request_id.is_some()
@@ -143,6 +189,13 @@ fn read_handshake<R: Read>(
         return Err(format!(
             "ClientHello module_bridge_identity must be {SERVICE_NAME}"
         ));
+    }
+    let artifact_hash = hello.artifact_hash.as_str();
+    if artifact_hash != config.approved_artifact_hash
+        || hello.module_generation.generation.value() != config.store_generation
+        || hello.authority_epoch.value() != config.authority_epoch
+    {
+        return Err("ClientHello is outside the Host-approved store lineage".to_owned());
     }
     let server_range = ProtocolRange {
         minimum: ProtocolVersion::CURRENT,
@@ -169,6 +222,8 @@ fn read_handshake<R: Read>(
         config_snapshot: serde_json::json!({
             "service": SERVICE_NAME,
             "protocol": PROTOCOL_VERSION,
+            "artifact_hash": config.approved_artifact_hash,
+            "config_hash": config.approved_config_hash,
             "operation_manifest_digest": composition.operation_manifest_digest(),
             "blob_root_owner": {
                 "root_id": composition.blob_owner().root_id(),
@@ -178,7 +233,7 @@ fn read_handshake<R: Read>(
             },
         }),
         heartbeat_ms: 30_000,
-        control_channel: "stdio".to_owned(),
+        control_channel: "named_pipe".to_owned(),
         rejection_reason: None,
         authority_epoch: hello.authority_epoch,
     };
@@ -301,41 +356,4 @@ fn control_frame(
         payload: ProtocolPayload::Json(payload),
         trace_context: std::collections::BTreeMap::new(),
     }
-}
-
-fn read_frame<R: Read>(reader: &mut R, limits: TransportLimits) -> Result<Frame, String> {
-    let mut prefix = [0_u8; 4];
-    reader
-        .read_exact(&mut prefix)
-        .map_err(|error| format!("read frame prefix: {error}"))?;
-    let length = usize::try_from(u32::from_le_bytes(prefix))
-        .map_err(|_| "frame length does not fit usize".to_owned())?;
-    if length == 0 || length > limits.max_frame_bytes {
-        return Err(format!(
-            "frame body length {length} exceeds bounded limit {}",
-            limits.max_frame_bytes
-        ));
-    }
-    let mut wire = Vec::with_capacity(4 + length);
-    wire.extend_from_slice(&prefix);
-    let mut body = vec![0_u8; length];
-    reader
-        .read_exact(&mut body)
-        .map_err(|error| format!("read frame body: {error}"))?;
-    wire.extend_from_slice(&body);
-    eliot_ipc::decode_frame(&wire, limits).map_err(|error| error.to_string())
-}
-
-fn write_frame<W: Write>(
-    writer: &mut W,
-    frame: &Frame,
-    limits: TransportLimits,
-) -> Result<(), String> {
-    let wire = eliot_ipc::encode_frame(frame, limits).map_err(|error| error.to_string())?;
-    writer
-        .write_all(&wire)
-        .map_err(|error| format!("write frame: {error}"))?;
-    writer
-        .flush()
-        .map_err(|error| format!("flush frame: {error}"))
 }

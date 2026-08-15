@@ -14,15 +14,19 @@
 #![warn(missing_docs)]
 
 mod lifecycle;
+mod prepared_transition;
 mod protocol;
+mod store_client;
 
 pub use lifecycle::{
     AdmissionLease, KernelService, KernelServiceError, KernelServiceState, ServiceFailure,
 };
+pub use prepared_transition::{PreparedTransitionError, PreparedTransitionGateway};
 pub use protocol::{
-    ContainmentAction, HostKernelHandshake, KernelControlCommand, KernelReadyReceipt,
-    ProcessObservation, RestartBudget,
+    ContainmentAction, HostKernelHandshake, HostStoreBootstrapRequirement, KernelControlCommand,
+    KernelReadyReceipt, ProcessObservation, RestartBudget,
 };
+pub use store_client::{EbpCanonicalStoreClient, EbpStoreTransport, StoreClientError};
 
 use eliot_contracts::{
     ContractIdentity, ContractVersion, contract_identity as make_contract_identity,

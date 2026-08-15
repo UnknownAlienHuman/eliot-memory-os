@@ -1,6 +1,6 @@
 //! Host↔Kernel protocol records.
 
-use eliot_contracts::AuthorityEpoch;
+use eliot_contracts::{AuthorityEpoch, ResourceGeneration, StateFence};
 use eliot_platform::{PlatformHandle, PortError};
 use eliot_runtime_contracts::{HealthVector, ServiceProcessState};
 use schemars::JsonSchema;
@@ -10,6 +10,96 @@ use crate::{KernelServiceError, validate_text};
 
 fn handle(value: &PlatformHandle, field: &'static str) -> Result<(), KernelServiceError> {
     validate_text(value.as_str(), field)
+}
+
+/// Host-approved canonical-store bootstrap identity.
+///
+/// These values are an admission prerequisite, not caller-supplied store
+/// authority.  The Kernel/store client binds every EBP handshake and request
+/// to the exact pipe, store generation, schema generation, and state fence.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HostStoreBootstrapRequirement {
+    /// Authenticated local store pipe selected by Host.
+    pub store_pipe: PlatformHandle,
+    /// Store module generation selected by Kernel/Host cutover.
+    pub store_generation: ResourceGeneration,
+    /// Canonical schema generation expected at readiness.
+    pub schema_generation: PlatformHandle,
+    /// Authority/resource fence captured for this store binding.
+    pub state_fence: StateFence,
+    /// Host-issued launch nonce for this store lineage.
+    pub launch_nonce: PlatformHandle,
+    /// Transport connection identity selected for this session.
+    pub connection_id: PlatformHandle,
+    /// Expected authenticated peer SID for the store process.
+    pub expected_peer_sid: PlatformHandle,
+    /// Expected authenticated peer session id for the store process.
+    pub expected_peer_session_id: u32,
+    /// Host-approved store artifact digest echoed by the store handshake.
+    pub approved_artifact_hash: PlatformHandle,
+    /// Host-approved store configuration digest echoed by the store handshake.
+    pub approved_config_hash: PlatformHandle,
+}
+
+impl HostStoreBootstrapRequirement {
+    /// Validates the complete Host-approved store binding.
+    pub fn validate(&self) -> Result<(), KernelServiceError> {
+        handle(&self.store_pipe, "store_bootstrap.store_pipe")?;
+        handle(&self.schema_generation, "store_bootstrap.schema_generation")?;
+        handle(&self.launch_nonce, "store_bootstrap.launch_nonce")?;
+        handle(&self.connection_id, "store_bootstrap.connection_id")?;
+        handle(&self.expected_peer_sid, "store_bootstrap.expected_peer_sid")?;
+        handle(
+            &self.approved_artifact_hash,
+            "store_bootstrap.approved_artifact_hash",
+        )?;
+        handle(
+            &self.approved_config_hash,
+            "store_bootstrap.approved_config_hash",
+        )?;
+        for (value, field) in [
+            (
+                &self.approved_artifact_hash,
+                "store_bootstrap.approved_artifact_hash",
+            ),
+            (
+                &self.approved_config_hash,
+                "store_bootstrap.approved_config_hash",
+            ),
+        ] {
+            if value.as_str().len() != 64
+                || !value
+                    .as_str()
+                    .bytes()
+                    .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+            {
+                return Err(KernelServiceError::InvalidField {
+                    field,
+                    reason: "must be a lowercase SHA-256 digest",
+                });
+            }
+        }
+        self.state_fence
+            .validate()
+            .map_err(|error| KernelServiceError::Platform(error.to_string()))?;
+        if self.store_generation.value() == 0
+            || self.store_generation != self.state_fence.resource_generation
+        {
+            return Err(KernelServiceError::HandshakeMismatch {
+                field: "store_generation",
+            });
+        }
+        eliot_ipc::validate_pipe_name(self.store_pipe.as_str())
+            .map_err(|error| KernelServiceError::Platform(error.to_string()))?;
+        Ok(())
+    }
+
+    /// Returns the exact authority epoch bound by this requirement.
+    #[must_use]
+    pub const fn authority_epoch(&self) -> AuthorityEpoch {
+        self.state_fence.authority_epoch
+    }
 }
 
 /// A bounded restart budget owned by Host for one Kernel lineage.
@@ -242,5 +332,46 @@ pub enum KernelControlCommand {
 impl From<PortError> for KernelServiceError {
     fn from(error: PortError) -> Self {
         Self::Platform(error.to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn handle_value(value: &str) -> PlatformHandle {
+        PlatformHandle::new(value).expect("test handle")
+    }
+
+    fn requirement() -> HostStoreBootstrapRequirement {
+        let fence = StateFence::new(AuthorityEpoch::genesis(), ResourceGeneration::genesis());
+        HostStoreBootstrapRequirement {
+            store_pipe: handle_value(r"\\.\pipe\eliot\store"),
+            store_generation: ResourceGeneration::genesis(),
+            schema_generation: handle_value("1.0.0"),
+            state_fence: fence,
+            launch_nonce: handle_value("nonce-1"),
+            connection_id: handle_value("connection-1"),
+            expected_peer_sid: handle_value("S-1-5-18"),
+            expected_peer_session_id: 0,
+            approved_artifact_hash: handle_value(&"a".repeat(64)),
+            approved_config_hash: handle_value(&"b".repeat(64)),
+        }
+    }
+
+    #[test]
+    fn store_bootstrap_accepts_system_session_zero() {
+        assert!(requirement().validate().is_ok());
+    }
+
+    #[test]
+    fn store_bootstrap_rejects_generation_or_digest_substitution() {
+        let mut wrong_generation = requirement();
+        wrong_generation.store_generation = ResourceGeneration::new(2).expect("generation");
+        assert!(wrong_generation.validate().is_err());
+
+        let mut wrong_digest = requirement();
+        wrong_digest.approved_config_hash = handle_value(&"C".repeat(64));
+        assert!(wrong_digest.validate().is_err());
     }
 }

@@ -11,7 +11,7 @@
 use std::path::Path;
 
 use eliot_blob::BlobRootOwner;
-use eliot_platform_windows::WindowsPlatform;
+use eliot_platform_windows::{NamedPipePeerExpectation, WindowsPlatform};
 use eliot_store_api::{
     CanonicalStoreClient, NamedReadRequest, NamedReadResponse, OperationId, OrderingHead,
     OrderingHeadExpectation, OrderingScopeId, PreparedTransition, RequestMeta, RevisionHead,
@@ -23,7 +23,8 @@ use eliot_store_surreal_adapter::{
     SurrealAdapterConfig, SurrealStoreAdapter,
 };
 use secrecy::SecretString;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest as _, Sha256};
 
 pub const SERVICE_NAME: &str = "eliot-store-surreal";
 pub const PROTOCOL_VERSION: &str = "eliot.s03.ebp.v1";
@@ -35,9 +36,17 @@ pub const PROTOCOL_VERSION: &str = "eliot.s03.ebp.v1";
 /// generation, one Blob root, one process identity, and an opaque credential
 /// reference.  Credential bytes are resolved after validation and never cross
 /// this type or the EBP wire surface.
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct StoreLaunchConfig {
+    pub store_pipe: String,
+    /// SID/session the Store pipe must authenticate as its Kernel client.
+    pub expected_client_sid: String,
+    pub expected_client_session_id: u32,
+    pub approved_artifact_hash: String,
+    pub approved_config_hash: String,
+    pub store_generation: u64,
+    pub authority_epoch: u64,
     pub endpoint: String,
     pub namespace: String,
     pub database: String,
@@ -54,6 +63,25 @@ impl StoreLaunchConfig {
     /// Validates every process-owned launch field before opening a provider or
     /// claiming the Blob root. No defaults are admitted.
     pub fn validate(&self) -> Result<(), String> {
+        validate_launch_text(&self.store_pipe, "store_pipe")?;
+        eliot_ipc::validate_pipe_name(&self.store_pipe)
+            .map_err(|error| format!("invalid store_pipe: {error}"))?;
+        NamedPipePeerExpectation::new(
+            self.expected_client_sid.clone(),
+            self.expected_client_session_id,
+        )
+        .map_err(|error| format!("invalid expected peer: {error}"))?;
+        validate_digest(&self.approved_artifact_hash, "approved_artifact_hash")?;
+        validate_digest(&self.approved_config_hash, "approved_config_hash")?;
+        if self.approved_config_hash != launch_config_digest(self)? {
+            return Err(
+                "approved_config_hash does not bind the operational launch configuration"
+                    .to_owned(),
+            );
+        }
+        if self.store_generation == 0 || self.authority_epoch == 0 {
+            return Err("store_generation and authority_epoch must be non-zero".to_owned());
+        }
         validate_launch_text(&self.endpoint, "endpoint")?;
         if !self.endpoint.starts_with("ws://") && !self.endpoint.starts_with("wss://") {
             return Err("endpoint must start with ws:// or wss://".to_owned());
@@ -75,6 +103,65 @@ impl StoreLaunchConfig {
         }
         Ok(())
     }
+}
+
+/// Computes the Host-approved digest over every operational launch field.
+/// The digest field itself is deliberately excluded to prevent self-reference.
+pub fn launch_config_digest(config: &StoreLaunchConfig) -> Result<String, String> {
+    #[derive(Serialize)]
+    struct OperationalConfig<'a> {
+        store_pipe: &'a str,
+        expected_client_sid: &'a str,
+        expected_client_session_id: u32,
+        approved_artifact_hash: &'a str,
+        store_generation: u64,
+        authority_epoch: u64,
+        endpoint: &'a str,
+        namespace: &'a str,
+        database: &'a str,
+        username: &'a str,
+        connect_timeout_ms: u64,
+        query_timeout_ms: u64,
+        schema_generation: &'a str,
+        blob_root: &'a str,
+        instance_id: &'a str,
+        credential_ref: &'a str,
+    }
+    let input = OperationalConfig {
+        store_pipe: &config.store_pipe,
+        expected_client_sid: &config.expected_client_sid,
+        expected_client_session_id: config.expected_client_session_id,
+        approved_artifact_hash: &config.approved_artifact_hash,
+        store_generation: config.store_generation,
+        authority_epoch: config.authority_epoch,
+        endpoint: &config.endpoint,
+        namespace: &config.namespace,
+        database: &config.database,
+        username: &config.username,
+        connect_timeout_ms: config.connect_timeout_ms,
+        query_timeout_ms: config.query_timeout_ms,
+        schema_generation: &config.schema_generation,
+        blob_root: &config.blob_root,
+        instance_id: &config.instance_id,
+        credential_ref: &config.credential_ref,
+    };
+    let bytes =
+        serde_json::to_vec(&input).map_err(|error| format!("serialize launch digest: {error}"))?;
+    Ok(Sha256::digest(bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect())
+}
+
+fn validate_digest(value: &str, field: &str) -> Result<(), String> {
+    if value.len() != 64
+        || !value
+            .bytes()
+            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+    {
+        return Err(format!("{field} must be a lowercase SHA-256 digest"));
+    }
+    Ok(())
 }
 
 fn validate_launch_text(value: &str, field: &str) -> Result<(), String> {

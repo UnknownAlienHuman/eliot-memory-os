@@ -1105,6 +1105,7 @@ dependencies = [
  "eliot-protocol",
  "eliot-runtime",
  "eliot-runtime-contracts",
+ "eliot-store-api",
  "serde_json",
  "sha2 0.10.9",
  "tokio",
@@ -1133,13 +1134,18 @@ name = "eliot-kernel-service"
 version = "0.1.0"
 dependencies = [
  "eliot-contracts",
+ "eliot-ipc",
  "eliot-kernel-core",
  "eliot-platform",
+ "eliot-protocol",
  "eliot-receipts",
  "eliot-runtime-contracts",
+ "eliot-store-api",
  "schemars",
  "serde",
+ "serde_json",
  "thiserror",
+ "tokio",
 ]
 
 [[package]]
@@ -1644,6 +1650,7 @@ dependencies = [
  "secrecy",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "tokio",
  "toml",
 ]
