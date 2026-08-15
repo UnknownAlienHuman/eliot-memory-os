@@ -1,6 +1,8 @@
 use std::io::{self, BufRead, Write};
 use std::path::PathBuf;
 
+#[cfg(windows)]
+use eliot_host::HostBranchDisposition;
 use eliot_host::{HostComposition, HostError, PROTOCOL_VERSION, SERVICE_NAME};
 use eliot_platform::PlatformHandle;
 use serde::{Deserialize, Serialize};
@@ -253,13 +255,22 @@ unsafe extern "system" fn service_main(_argc: u32, _argv: *mut *mut u16) {
     unsafe { SetServiceStatus(handle, &raw const status) };
     while !STOP_REQUESTED.load(Ordering::Acquire) && host.running() {
         if host.has_process_contour() {
-            if let Err(error) = host.reconcile_approved_contour() {
-                let _ = writeln!(
-                    io::stderr().lock(),
-                    "eliot-host: contour reconciliation failed: {error}"
-                );
-                STOP_REQUESTED.store(true, Ordering::Release);
-                break;
+            match host.reconcile_approved_contour() {
+                Ok(HostBranchDisposition::Healthy) => {}
+                Ok(disposition) => {
+                    let _ = writeln!(
+                        io::stderr().lock(),
+                        "eliot-host: independent contour disposition: {disposition:?}"
+                    );
+                }
+                Err(error) => {
+                    let _ = writeln!(
+                        io::stderr().lock(),
+                        "eliot-host: shared contour admission failed: {error}"
+                    );
+                    STOP_REQUESTED.store(true, Ordering::Release);
+                    break;
+                }
             }
         }
         std::thread::sleep(std::time::Duration::from_millis(250));

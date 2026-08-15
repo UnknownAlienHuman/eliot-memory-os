@@ -11,6 +11,7 @@
 
 use std::collections::BTreeSet;
 use std::fs;
+use std::io::Read;
 use std::path::Path;
 
 use eliot_contracts::{
@@ -23,6 +24,7 @@ use eliot_platform::{
 use redb::{Database, ReadableDatabase, TableDefinition};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 /// Stable wire name for the installation contract.
@@ -123,6 +125,60 @@ fn sha256_handle(value: &PlatformHandle, field: &str) -> Result<(), Installation
         });
     }
     Ok(())
+}
+
+/// Canonicalizes one installation-owned file and verifies its complete
+/// contents against an approved lowercase SHA-256 digest.
+///
+/// The returned path is the exact canonical path that was hashed. Callers may
+/// use it only as a locator after this verification; the digest remains the
+/// authority for launch admission.
+pub fn verify_file_digest(
+    path: impl AsRef<Path>,
+    expected: &PlatformHandle,
+    field: &str,
+) -> Result<std::path::PathBuf, InstallationError> {
+    sha256_handle(expected, field)?;
+    let path = path.as_ref();
+    let metadata = fs::symlink_metadata(path)
+        .map_err(|error| InstallationError::Platform(format!("{field}: {error}")))?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(InstallationError::InvalidField {
+            field: field.to_owned(),
+            reason: "must name a regular non-symlink file".to_owned(),
+        });
+    }
+    let canonical = fs::canonicalize(path)
+        .map_err(|error| InstallationError::Platform(format!("{field}: {error}")))?;
+    let canonical_metadata = fs::metadata(&canonical)
+        .map_err(|error| InstallationError::Platform(format!("{field}: {error}")))?;
+    if !canonical_metadata.is_file() {
+        return Err(InstallationError::InvalidField {
+            field: field.to_owned(),
+            reason: "canonical path is not a regular file".to_owned(),
+        });
+    }
+    let mut file = fs::File::open(&canonical)
+        .map_err(|error| InstallationError::Platform(format!("{field}: {error}")))?;
+    let mut digest = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .map_err(|error| InstallationError::Platform(format!("{field}: {error}")))?;
+        if read == 0 {
+            break;
+        }
+        digest.update(&buffer[..read]);
+    }
+    let actual = format!("{:x}", digest.finalize());
+    if actual != expected.as_str() {
+        return Err(InstallationError::InvalidField {
+            field: field.to_owned(),
+            reason: format!("content digest mismatch (actual {actual})"),
+        });
+    }
+    Ok(canonical)
 }
 
 fn handles(
@@ -503,7 +559,22 @@ impl CandidateManifest {
     pub fn validate(&self) -> Result<(), InstallationError> {
         handle(&self.generation, "manifest.generation")?;
         handles(&self.components, "manifest.components", true)?;
-        handles(&self.artifact_digests, "manifest.artifact_digests", true)?;
+        if self.artifact_digests.is_empty() {
+            return Err(InstallationError::InvalidField {
+                field: "manifest.artifact_digests".to_owned(),
+                reason: "must not be empty".to_owned(),
+            });
+        }
+        let mut artifact_identities = BTreeSet::new();
+        for digest in &self.artifact_digests {
+            sha256_handle(digest, "manifest.artifact_digests")?;
+            if !artifact_identities.insert(digest.as_str()) {
+                return Err(InstallationError::Duplicate {
+                    kind: "manifest.artifact_digests".to_owned(),
+                    identity: digest.as_str().to_owned(),
+                });
+            }
+        }
         handles(
             &self.dependency_closure_refs,
             "manifest.dependency_closure_refs",
@@ -516,6 +587,22 @@ impl CandidateManifest {
             "manifest.supervision_key_fingerprint",
         )?;
         handle(&self.signature_ref, "manifest.signature_ref")
+    }
+
+    /// Returns the ordered Kernel and canonical-store artifact digests used by
+    /// the Host process contour. Other artifacts remain installation evidence;
+    /// launch admission rejects an ambiguous runtime list.
+    pub fn runtime_artifact_digests(
+        &self,
+    ) -> Result<(&PlatformHandle, &PlatformHandle), InstallationError> {
+        self.validate()?;
+        if self.artifact_digests.len() != 2 {
+            return Err(InstallationError::IncompleteObservation(
+                "Host runtime admission requires exactly Kernel and store artifact digests"
+                    .to_owned(),
+            ));
+        }
+        Ok((&self.artifact_digests[0], &self.artifact_digests[1]))
     }
 }
 

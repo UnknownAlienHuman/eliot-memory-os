@@ -21,6 +21,7 @@ use eliot_host_state::{
 };
 use eliot_installation::{
     ApprovedGenerationRegistry, CandidateManifest, InstallationError, RedbInstallationRegistry,
+    verify_file_digest,
 };
 use eliot_platform::{
     HostInstallationState, HostJobDisposition, HostProcessRecoveryBinding, HostRecoveryEvidence,
@@ -68,6 +69,26 @@ pub struct HostJobBranches {
     store_identity: JobObjectIdentity,
     kernel_executable: Option<PathBuf>,
     store_executable: Option<PathBuf>,
+    config_path: Option<PathBuf>,
+    kernel_artifact_digest: Option<PlatformHandle>,
+    store_artifact_digest: Option<PlatformHandle>,
+    config_digest: Option<PlatformHandle>,
+    kernel_restart_attempts: u8,
+    store_restart_attempts: u8,
+}
+
+/// Independent branch disposition after one bounded reconciliation pass.
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HostBranchDisposition {
+    /// Both Host-owned process branches are healthy.
+    Healthy,
+    /// Kernel authority is unavailable; the canonical store is not stopped.
+    KernelDegraded,
+    /// Canonical store is unavailable; Kernel is not stopped.
+    StoreDegraded,
+    /// Both process branches are unavailable after their independent bounds.
+    BothDegraded,
 }
 
 #[cfg(windows)]
@@ -90,6 +111,12 @@ impl HostJobBranches {
             store_identity,
             kernel_executable: None,
             store_executable: None,
+            config_path: None,
+            kernel_artifact_digest: None,
+            store_artifact_digest: None,
+            config_digest: None,
+            kernel_restart_attempts: 0,
+            store_restart_attempts: 0,
         })
     }
 
@@ -98,6 +125,7 @@ impl HostJobBranches {
         generation: &PlatformHandle,
         config_digest: &PlatformHandle,
         artifact: &PlatformHandle,
+        config_path: &Path,
         job_identity: &JobObjectIdentity,
     ) -> Vec<(OsString, OsString)> {
         let mut environment = std::env::vars_os()
@@ -107,6 +135,7 @@ impl HostJobBranches {
                     "ELIOT_APPROVED_GENERATION"
                         | "ELIOT_GENERATION_CONFIG_DIGEST"
                         | "ELIOT_APPROVED_ARTIFACT"
+                        | "ELIOT_GENERATION_CONFIG_PATH"
                         | "ELIOT_HOST_INSTALLATION"
                         | "ELIOT_HOST_EPOCH"
                         | "ELIOT_ACTIVATION_NONCE"
@@ -126,6 +155,10 @@ impl HostJobBranches {
             (
                 OsString::from("ELIOT_APPROVED_ARTIFACT"),
                 OsString::from(artifact.as_str()),
+            ),
+            (
+                OsString::from("ELIOT_GENERATION_CONFIG_PATH"),
+                config_path.as_os_str().to_owned(),
             ),
             (
                 OsString::from("ELIOT_HOST_INSTALLATION"),
@@ -153,9 +186,12 @@ impl HostJobBranches {
         generation: &PlatformHandle,
         config_digest: &PlatformHandle,
         artifact: &PlatformHandle,
+        config_path: &Path,
         host: &HostInstallationEpoch,
     ) -> Result<RunningJobChild<PlatformHandle>, HostError> {
-        let executable = std::fs::canonicalize(executable)
+        let executable = verify_file_digest(executable, artifact, "runtime.artifact")
+            .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+        let config_path = verify_file_digest(config_path, config_digest, "runtime.config")
             .map_err(|error| HostError::ProcessContour(error.to_string()))?;
         let working_directory = executable
             .parent()
@@ -164,7 +200,14 @@ impl HostJobBranches {
             executable.clone(),
             Vec::new(),
             working_directory,
-            Self::environment(host, generation, config_digest, artifact, identity),
+            Self::environment(
+                host,
+                generation,
+                config_digest,
+                artifact,
+                &config_path,
+                identity,
+            ),
         )
         .map_err(|error| HostError::ProcessContour(error.to_string()))?;
         let child = SuspendedJobChild::spawn_named(spec, identity.clone())
@@ -177,6 +220,10 @@ impl HostJobBranches {
                 if observed != expected {
                     return Err("approved image identity changed before resume".to_owned());
                 }
+                verify_file_digest(&observed, artifact, "runtime.artifact")
+                    .map_err(|error| error.to_string())?;
+                verify_file_digest(&config_path, config_digest, "runtime.config")
+                    .map_err(|error| error.to_string())?;
                 Ok(generation.clone())
             })
             .map_err(|error| HostError::ProcessContour(format!("validation failed: {error:?}")))?;
@@ -194,7 +241,9 @@ impl HostJobBranches {
         store_executable: &Path,
         generation: &PlatformHandle,
         config_digest: &PlatformHandle,
-        artifact: &PlatformHandle,
+        config_path: &Path,
+        kernel_artifact: &PlatformHandle,
+        store_artifact: &PlatformHandle,
         host: &HostInstallationEpoch,
     ) -> Result<(), HostError> {
         if self.kernel.is_some() || self.store.is_some() {
@@ -202,20 +251,33 @@ impl HostJobBranches {
                 "approved contour is already running".to_owned(),
             ));
         }
-        let kernel = Self::launch(
+        let kernel_executable = verify_file_digest(
             kernel_executable,
+            kernel_artifact,
+            "runtime.kernel_artifact",
+        )
+        .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+        let store_executable =
+            verify_file_digest(store_executable, store_artifact, "runtime.store_artifact")
+                .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+        let config_path = verify_file_digest(config_path, config_digest, "runtime.config")
+            .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+        let kernel = Self::launch(
+            &kernel_executable,
             &self.kernel_identity,
             generation,
             config_digest,
-            artifact,
+            kernel_artifact,
+            &config_path,
             host,
         )?;
         let store = match Self::launch(
-            store_executable,
+            &store_executable,
             &self.store_identity,
             generation,
             config_digest,
-            artifact,
+            store_artifact,
+            &config_path,
             host,
         ) {
             Ok(store) => store,
@@ -224,67 +286,180 @@ impl HostJobBranches {
                 return Err(error);
             }
         };
-        self.kernel_executable = Some(kernel_executable.to_owned());
-        self.store_executable = Some(store_executable.to_owned());
+        self.kernel_executable = Some(kernel_executable);
+        self.store_executable = Some(store_executable);
+        self.config_path = Some(config_path);
+        self.kernel_artifact_digest = Some(kernel_artifact.clone());
+        self.store_artifact_digest = Some(store_artifact.clone());
+        self.config_digest = Some(config_digest.clone());
+        self.kernel_restart_attempts = 0;
+        self.store_restart_attempts = 0;
         self.kernel = Some(kernel);
         self.store = Some(store);
         Ok(())
     }
 
-    /// Reconciles both branches with a bounded restart budget.  If a
-    /// candidate branch exits, the old branch is terminated and relaunched
-    /// only from the stored approved image, never from an observed PID.
+    fn relaunch_kernel(
+        &mut self,
+        generation: &PlatformHandle,
+        config_digest: &PlatformHandle,
+        config_path: &Path,
+        artifact: &PlatformHandle,
+        host: &HostInstallationEpoch,
+    ) -> Result<(), HostError> {
+        let executable = self
+            .kernel_executable
+            .clone()
+            .ok_or_else(|| HostError::ProcessContour("Kernel image is not recorded".to_owned()))?;
+        let child = Self::launch(
+            &executable,
+            &self.kernel_identity,
+            generation,
+            config_digest,
+            artifact,
+            config_path,
+            host,
+        )?;
+        self.kernel = Some(child);
+        Ok(())
+    }
+
+    fn relaunch_store(
+        &mut self,
+        generation: &PlatformHandle,
+        config_digest: &PlatformHandle,
+        config_path: &Path,
+        artifact: &PlatformHandle,
+        host: &HostInstallationEpoch,
+    ) -> Result<(), HostError> {
+        let executable = self
+            .store_executable
+            .clone()
+            .ok_or_else(|| HostError::ProcessContour("store image is not recorded".to_owned()))?;
+        let child = Self::launch(
+            &executable,
+            &self.store_identity,
+            generation,
+            config_digest,
+            artifact,
+            config_path,
+            host,
+        )?;
+        self.store = Some(child);
+        Ok(())
+    }
+
+    fn branch_dead(
+        child: Option<&RunningJobChild<PlatformHandle>>,
+    ) -> Result<bool, WindowsAdapterError> {
+        match child {
+            Some(child) => Ok(!matches!(
+                child.observe()?,
+                eliot_platform_windows::RunningJobObservation::Running { .. }
+            )),
+            None => Ok(true),
+        }
+    }
+
+    /// Reconciles Kernel and store branches independently with one bounded
+    /// restart attempt per branch failure. A failed branch never terminates a
+    /// healthy sibling or reuses an observed PID.
     pub fn reconcile(
         &mut self,
         generation: &PlatformHandle,
         config_digest: &PlatformHandle,
-        artifact: &PlatformHandle,
+        config_path: &Path,
+        kernel_artifact: &PlatformHandle,
+        store_artifact: &PlatformHandle,
         host: &HostInstallationEpoch,
-    ) -> Result<(), HostError> {
-        for attempt in 0..2 {
-            let kernel_dead = self
-                .kernel
+    ) -> Result<HostBranchDisposition, HostError> {
+        if self
+            .kernel_artifact_digest
+            .as_ref()
+            .is_some_and(|digest| digest != kernel_artifact)
+            || self
+                .store_artifact_digest
                 .as_ref()
-                .map(|child| child.observe())
-                .transpose()
-                .map_err(|error| HostError::ProcessContour(error.to_string()))?
-                .is_some_and(|observation| {
-                    !matches!(
-                        observation,
-                        eliot_platform_windows::RunningJobObservation::Running { .. }
-                    )
-                });
-            let store_dead = self
-                .store
+                .is_some_and(|digest| digest != store_artifact)
+            || self
+                .config_digest
                 .as_ref()
-                .map(|child| child.observe())
-                .transpose()
-                .map_err(|error| HostError::ProcessContour(error.to_string()))?
-                .is_some_and(|observation| {
-                    !matches!(
-                        observation,
-                        eliot_platform_windows::RunningJobObservation::Running { .. }
-                    )
-                });
-            if !kernel_dead && !store_dead {
-                return Ok(());
-            }
-            self.terminate_kernel()?;
-            self.terminate_store()?;
-            if attempt == 1 {
-                return Err(HostError::ProcessContour(
-                    "approved contour exceeded bounded restart budget".to_owned(),
-                ));
-            }
-            let kernel = self.kernel_executable.clone().ok_or_else(|| {
-                HostError::ProcessContour("Kernel image is not recorded".to_owned())
-            })?;
-            let store = self.store_executable.clone().ok_or_else(|| {
-                HostError::ProcessContour("store image is not recorded".to_owned())
-            })?;
-            self.start_approved(&kernel, &store, generation, config_digest, artifact, host)?;
+                .is_some_and(|digest| digest != config_digest)
+        {
+            return Err(HostError::ProcessContour(
+                "approved generation material changed; bounded cutover is required".to_owned(),
+            ));
         }
-        Ok(())
+        let canonical_config = verify_file_digest(config_path, config_digest, "runtime.config")
+            .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+        if self.config_path.as_ref() != Some(&canonical_config) {
+            return Err(HostError::ProcessContour(
+                "generation config path changed outside the approved contour".to_owned(),
+            ));
+        }
+        if let Some(kernel) = &self.kernel_executable {
+            verify_file_digest(kernel, kernel_artifact, "runtime.kernel_artifact")
+                .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+        }
+        if let Some(store) = &self.store_executable {
+            verify_file_digest(store, store_artifact, "runtime.store_artifact")
+                .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+        }
+        let kernel_dead = Self::branch_dead(self.kernel.as_ref()).unwrap_or(true);
+        let store_dead = Self::branch_dead(self.store.as_ref()).unwrap_or(true);
+        let mut kernel_degraded = false;
+        let mut store_degraded = false;
+
+        if kernel_dead {
+            if self.terminate_kernel().is_err() {
+                kernel_degraded = true;
+            } else if self.kernel_restart_attempts >= 1 {
+                kernel_degraded = true;
+            } else {
+                self.kernel_restart_attempts += 1;
+                if self
+                    .relaunch_kernel(
+                        generation,
+                        config_digest,
+                        config_path,
+                        kernel_artifact,
+                        host,
+                    )
+                    .is_err()
+                {
+                    kernel_degraded = true;
+                }
+            }
+        }
+
+        if store_dead {
+            if self.terminate_store().is_err() {
+                store_degraded = true;
+            } else if self.store_restart_attempts >= 1 {
+                store_degraded = true;
+            } else {
+                self.store_restart_attempts += 1;
+                if self
+                    .relaunch_store(generation, config_digest, config_path, store_artifact, host)
+                    .is_err()
+                {
+                    store_degraded = true;
+                }
+            }
+        }
+
+        if self.kernel.is_none() {
+            kernel_degraded = true;
+        }
+        if self.store.is_none() {
+            store_degraded = true;
+        }
+        Ok(match (kernel_degraded, store_degraded) {
+            (false, false) => HostBranchDisposition::Healthy,
+            (true, false) => HostBranchDisposition::KernelDegraded,
+            (false, true) => HostBranchDisposition::StoreDegraded,
+            (true, true) => HostBranchDisposition::BothDegraded,
+        })
     }
 
     /// Performs a bounded side-by-side cutover with an explicit rollback
@@ -299,10 +474,14 @@ impl HostJobBranches {
         prior_store: &Path,
         candidate_generation: &PlatformHandle,
         candidate_config_digest: &PlatformHandle,
-        candidate_artifact: &PlatformHandle,
+        candidate_config_path: &Path,
+        candidate_kernel_artifact: &PlatformHandle,
+        candidate_store_artifact: &PlatformHandle,
         prior_generation: &PlatformHandle,
         prior_config_digest: &PlatformHandle,
-        prior_artifact: &PlatformHandle,
+        prior_config_path: &Path,
+        prior_kernel_artifact: &PlatformHandle,
+        prior_store_artifact: &PlatformHandle,
         host: &HostInstallationEpoch,
     ) -> Result<(), HostError> {
         self.terminate_kernel()?;
@@ -312,7 +491,9 @@ impl HostJobBranches {
             candidate_store,
             candidate_generation,
             candidate_config_digest,
-            candidate_artifact,
+            candidate_config_path,
+            candidate_kernel_artifact,
+            candidate_store_artifact,
             host,
         ) {
             Ok(()) => Ok(()),
@@ -323,7 +504,9 @@ impl HostJobBranches {
                         prior_store,
                         prior_generation,
                         prior_config_digest,
-                        prior_artifact,
+                        prior_config_path,
+                        prior_kernel_artifact,
+                        prior_store_artifact,
                         host,
                     )
                     .map_err(|error| {
@@ -381,6 +564,14 @@ impl HostJobBranches {
     #[must_use]
     pub fn store_process(&self) -> Option<&ProcessIdentity> {
         self.store.as_ref().map(|child| child.evidence().process())
+    }
+
+    #[must_use]
+    pub fn has_recorded_contour(&self) -> bool {
+        self.kernel.is_some()
+            || self.store.is_some()
+            || self.kernel_executable.is_some()
+            || self.store_executable.is_some()
     }
 
     fn kernel_recovery_binding(
@@ -600,15 +791,19 @@ impl HostComposition {
             .registry
             .active()
             .ok_or_else(|| HostError::ProcessContour("no approved active generation".to_owned()))?;
-        let artifact = active.manifest.artifact_digests.first().ok_or_else(|| {
-            HostError::ProcessContour("active generation has no artifact".to_owned())
-        })?;
+        let (kernel_artifact, store_artifact) = active
+            .manifest
+            .runtime_artifact_digests()
+            .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+        let config_path = configured_generation_config()?;
         self.jobs.start_approved(
             kernel_executable.as_ref(),
             store_executable.as_ref(),
             &active.manifest.generation,
             &active.manifest.config_digest,
-            artifact,
+            &config_path,
+            kernel_artifact,
+            store_artifact,
             &self.host,
         )?;
         self.persist_process_observations(active.manifest.generation.clone())
@@ -640,24 +835,32 @@ impl HostComposition {
         self.registry
             .activate(generation)
             .map_err(HostError::Installation)?;
-        let result =
-            self.jobs.cutover_with_rollback(
-                candidate_kernel.as_ref(),
-                candidate_store.as_ref(),
-                prior_kernel.as_ref(),
-                prior_store.as_ref(),
-                &candidate.manifest.generation,
-                &candidate.manifest.config_digest,
-                candidate.manifest.artifact_digests.first().ok_or_else(|| {
-                    HostError::ProcessContour("candidate has no artifact".to_owned())
-                })?,
-                &prior.manifest.generation,
-                &prior.manifest.config_digest,
-                prior.manifest.artifact_digests.first().ok_or_else(|| {
-                    HostError::ProcessContour("prior generation has no artifact".to_owned())
-                })?,
-                &self.host,
-            );
+        let (candidate_kernel_artifact, candidate_store_artifact) = candidate
+            .manifest
+            .runtime_artifact_digests()
+            .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+        let (prior_kernel_artifact, prior_store_artifact) = prior
+            .manifest
+            .runtime_artifact_digests()
+            .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+        let config_path = configured_generation_config()?;
+        let result = self.jobs.cutover_with_rollback(
+            candidate_kernel.as_ref(),
+            candidate_store.as_ref(),
+            prior_kernel.as_ref(),
+            prior_store.as_ref(),
+            &candidate.manifest.generation,
+            &candidate.manifest.config_digest,
+            &config_path,
+            candidate_kernel_artifact,
+            candidate_store_artifact,
+            &prior.manifest.generation,
+            &prior.manifest.config_digest,
+            &config_path,
+            prior_kernel_artifact,
+            prior_store_artifact,
+            &self.host,
+        );
         match result {
             Ok(()) => {
                 self.registry_store
@@ -675,59 +878,62 @@ impl HostComposition {
 
     /// Reconciles the approved contour and records fresh process observations.
     #[cfg(windows)]
-    pub fn reconcile_approved_contour(&mut self) -> Result<(), HostError> {
+    pub fn reconcile_approved_contour(&mut self) -> Result<HostBranchDisposition, HostError> {
         let active = self
             .registry
             .active()
             .ok_or_else(|| HostError::ProcessContour("no approved active generation".to_owned()))?;
-        let artifact = active.manifest.artifact_digests.first().ok_or_else(|| {
-            HostError::ProcessContour("active generation has no artifact".to_owned())
-        })?;
-        self.jobs.reconcile(
+        let (kernel_artifact, store_artifact) = active
+            .manifest
+            .runtime_artifact_digests()
+            .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+        let config_path = configured_generation_config()?;
+        let disposition = self.jobs.reconcile(
             &active.manifest.generation,
             &active.manifest.config_digest,
-            artifact,
+            &config_path,
+            kernel_artifact,
+            store_artifact,
             &self.host,
         )?;
-        self.persist_process_observations(active.manifest.generation.clone())
+        self.persist_process_observations(active.manifest.generation.clone())?;
+        Ok(disposition)
     }
 
-    /// Returns whether both approved process branches have been admitted.
+    /// Returns whether either approved process branch or its bounded recovery
+    /// record remains present for reconciliation.
     #[cfg(windows)]
     #[must_use]
     pub fn has_process_contour(&self) -> bool {
-        self.jobs.kernel_process().is_some() && self.jobs.store_process().is_some()
+        self.jobs.has_recorded_contour()
     }
 
     #[cfg(windows)]
     fn persist_process_observations(&self, generation: PlatformHandle) -> Result<(), HostError> {
-        let kernel = self.jobs.kernel_process().ok_or_else(|| {
-            HostError::ProcessContour("Kernel process observation is unavailable".to_owned())
-        })?;
-        let store = self.jobs.store_process().ok_or_else(|| {
-            HostError::ProcessContour("store process observation is unavailable".to_owned())
-        })?;
-        let kernel_record = process_record(kernel, "Kernel", &self.host)?;
-        let store_record = process_record(store, "Store", &self.host)?;
-        let kernel_recovery = self.jobs.kernel_recovery_binding(&generation)?;
-        self.state_store
-            .commit_activation_with_recovery(
-                eliot_platform::HostActivationTransition {
-                    context: lifecycle_context(&self.host, "kernel-activation")?,
+        if let Some(kernel) = self.jobs.kernel_process() {
+            let kernel_record = process_record(kernel, "Kernel", &self.host)?;
+            let kernel_recovery = self.jobs.kernel_recovery_binding(&generation)?;
+            self.state_store
+                .commit_activation_with_recovery(
+                    eliot_platform::HostActivationTransition {
+                        context: lifecycle_context(&self.host, "kernel-activation")?,
+                        installation: self.host.installation.clone(),
+                        process: kernel_record,
+                    },
+                    kernel_recovery,
+                )
+                .map_err(HostError::State)?;
+        }
+        if let Some(store) = self.jobs.store_process() {
+            let store_record = process_record(store, "Store", &self.host)?;
+            self.state_store
+                .record_dependency(eliot_platform::ManagedDependencyTransition {
+                    context: lifecycle_context(&self.host, "store-observation")?,
                     installation: self.host.installation.clone(),
-                    process: kernel_record,
-                },
-                kernel_recovery,
-            )
-            .map_err(HostError::State)?;
-        self.state_store
-            .record_dependency(eliot_platform::ManagedDependencyTransition {
-                context: lifecycle_context(&self.host, "store-observation")?,
-                installation: self.host.installation.clone(),
-                dependency: store_record,
-            })
-            .map_err(HostError::State)?;
-        let _ = generation;
+                    dependency: store_record,
+                })
+                .map_err(HostError::State)?;
+        }
         Ok(())
     }
 
@@ -965,6 +1171,22 @@ fn configured_image(name: &str) -> Result<PathBuf, HostError> {
         return Err(HostError::ProcessContour(format!(
             "{name} must name an absolute executable file"
         )));
+    }
+    Ok(path)
+}
+
+#[cfg(windows)]
+fn configured_generation_config() -> Result<PathBuf, HostError> {
+    let value = std::env::var_os("ELIOT_GENERATION_CONFIG_PATH").ok_or_else(|| {
+        HostError::ProcessContour(
+            "ELIOT_GENERATION_CONFIG_PATH is required for approved launch".to_owned(),
+        )
+    })?;
+    let path = PathBuf::from(value);
+    if !path.is_absolute() || !path.is_file() {
+        return Err(HostError::ProcessContour(
+            "ELIOT_GENERATION_CONFIG_PATH must name an absolute regular file".to_owned(),
+        ));
     }
     Ok(path)
 }
