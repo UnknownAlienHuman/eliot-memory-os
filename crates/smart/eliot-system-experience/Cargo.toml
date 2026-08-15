@@ -1,0 +1,13 @@
+[package]
+name = "eliot-system-experience"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.89"
+license = "MIT"
+description = "Governed append-only system-experience evidence owner for ELIOT"
+
+[dependencies]
+eliot-evidence = { path = "../../foundation/eliot-evidence", version = "0.1.0" }
+eliot-contracts = { path = "../../foundation/eliot-contracts", version = "0.1.0" }
+serde = { version = "1.0.228", features = ["derive"] }
+thiserror = "2.0.18"
