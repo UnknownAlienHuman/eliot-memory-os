@@ -81,6 +81,7 @@ struct StreamCapture {
     total_bytes: u64,
     truncated: bool,
     complete: bool,
+    read_error: bool,
     captured: bool,
 }
 
@@ -93,6 +94,7 @@ impl StreamCapture {
             total_bytes: 0,
             truncated: false,
             complete: false,
+            read_error: false,
             captured: false,
         }
     }
@@ -123,6 +125,7 @@ enum CaptureFailureDisposition {
     Timeout,
     Panicked,
     Incomplete,
+    ReadFailed,
 }
 
 #[cfg(windows)]
@@ -866,7 +869,14 @@ fn join_streams(operation: &mut Operation) -> bool {
         failures.push(failure.clone());
     }
     if let Ok(thread_id) = &stdout_result {
-        if !capture_complete(&operation.stdout) {
+        let (complete, read_error) = capture_status(&operation.stdout);
+        if read_error {
+            failures.push(CaptureFailure {
+                stream: "stdout",
+                thread_id: thread_id.clone(),
+                disposition: CaptureFailureDisposition::ReadFailed,
+            });
+        } else if !complete {
             failures.push(CaptureFailure {
                 stream: "stdout",
                 thread_id: thread_id.clone(),
@@ -879,7 +889,14 @@ fn join_streams(operation: &mut Operation) -> bool {
         }
     }
     if let Ok(thread_id) = &stderr_result {
-        if !capture_complete(&operation.stderr) {
+        let (complete, read_error) = capture_status(&operation.stderr);
+        if read_error {
+            failures.push(CaptureFailure {
+                stream: "stderr",
+                thread_id: thread_id.clone(),
+                disposition: CaptureFailureDisposition::ReadFailed,
+            });
+        } else if !complete {
             failures.push(CaptureFailure {
                 stream: "stderr",
                 thread_id: thread_id.clone(),
@@ -942,11 +959,11 @@ fn join_capture_thread(
 }
 
 #[cfg(windows)]
-fn capture_complete(capture: &Arc<Mutex<StreamCapture>>) -> bool {
+fn capture_status(capture: &Arc<Mutex<StreamCapture>>) -> (bool, bool) {
     capture
         .lock()
-        .map(|guard| !guard.requested || guard.complete)
-        .unwrap_or(false)
+        .map(|guard| (!guard.requested || guard.complete, guard.read_error))
+        .unwrap_or((false, true))
 }
 
 #[cfg(windows)]
@@ -976,9 +993,13 @@ fn spawn_capture(
                 return;
             }
             let mut buffer = [0_u8; STREAM_CHUNK_BYTES];
+            let mut reached_eof = false;
             loop {
                 match file.read(&mut buffer) {
-                    Ok(0) => break,
+                    Ok(0) => {
+                        reached_eof = true;
+                        break;
+                    }
                     Ok(read) => {
                         let Some(mut guard) = capture.lock().ok() else {
                             return;
@@ -991,11 +1012,18 @@ fn spawn_capture(
                             guard.truncated = true;
                         }
                     }
-                    Err(_) => break,
+                    Err(_) => {
+                        if let Ok(mut guard) = capture.lock() {
+                            guard.read_error = true;
+                        }
+                        break;
+                    }
                 }
             }
-            if let Ok(mut guard) = capture.lock() {
-                guard.complete = true;
+            if reached_eof {
+                if let Ok(mut guard) = capture.lock() {
+                    guard.complete = true;
+                }
             }
         })
         .map_err(|error| unavailable(format!("{stream} capture reader spawn failed: {error}")))?;
