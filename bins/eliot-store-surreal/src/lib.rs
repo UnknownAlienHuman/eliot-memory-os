@@ -5,15 +5,13 @@
 //! This process exposes only the store-neutral EBP contract.  SurrealDB
 //! credentials, provider transport and query text stay inside
 //! `eliot-store-surreal-adapter`; this root only assembles the adapter and
-//! serializes bounded contract receipts.  Blob is an injected capability and
-//! has one public owner, so a co-located implementation cannot create a
-//! second root owner or a semantic write path.
+//! serializes bounded contract receipts. Blob contributes one process/root
+//! claim identity; it is not a second store or semantic write path.
 
-use std::path::Path;
-use std::sync::Arc;
+use std::path::{Component, Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use eliot_blob_api::BlobStoreClient;
+use eliot_blob::BlobRootOwner;
 use eliot_platform::ClockObservation;
 use eliot_store_api::{
     CanonicalStoreClient, NamedReadRequest, NamedReadResponse, OperationId,
@@ -24,47 +22,20 @@ use eliot_store_surreal_adapter::{
     AdapterError, AdapterHealth, MigrationReceipt, SchemaGeneration, SemanticReadiness,
     SurrealAdapterConfig, SurrealStoreAdapter,
 };
-use eliot_types::GovernorConfig;
+use eliot_types::{CredentialProviderKind, GovernorConfig};
 use secrecy::SecretString;
 use serde::{Deserialize, Serialize};
 
 pub const SERVICE_NAME: &str = "eliot-store-surreal";
 pub const PROTOCOL_VERSION: &str = "eliot.s03.ebp.v1";
 const SCHEMA_GENERATION: &str = "1.0.0";
-const PASSWORD_ENV: &str = "ELIOT_SURREAL_PASSWORD";
 
-/// The one process-level Blob owner.  The concrete service remains behind the
-/// provider-neutral S-04 contract and is responsible for claiming its root.
-#[derive(Clone)]
-pub struct BlobOwner {
-    client: Arc<dyn BlobStoreClient>,
-}
-
-impl BlobOwner {
-    /// Injects the already-constructed owner.  Construction of a concrete
-    /// `BlobStoreService` claims the root exactly once.
-    pub fn new(client: Arc<dyn BlobStoreClient>) -> Self {
-        Self { client }
-    }
-
-    /// Returns the sole provider-neutral Blob capability.
-    pub fn client(&self) -> &dyn BlobStoreClient {
-        self.client.as_ref()
-    }
-}
-
-impl std::fmt::Debug for BlobOwner {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str("BlobOwner(<provider-neutral capability>)")
-    }
-}
-
-/// Canonical store composition.  All provider authority is held by the one
-/// adapter; the optional Blob owner is only an injected capability and never a
-/// semantic store or alternate transition path.
+/// Canonical store composition. All provider authority is held by the one
+/// adapter and one process/root Blob claim; Blob does not become a semantic
+/// store or alternate transition path.
 pub struct StoreComposition {
     store: SurrealStoreAdapter,
-    blob: Option<BlobOwner>,
+    blob: BlobRootOwner,
 }
 
 impl std::fmt::Debug for StoreComposition {
@@ -72,37 +43,38 @@ impl std::fmt::Debug for StoreComposition {
         formatter
             .debug_struct("StoreComposition")
             .field("store", &self.store)
-            .field("blob_owner_present", &self.blob.is_some())
+            .field("blob_owner", &self.blob)
             .finish()
     }
 }
 
 impl StoreComposition {
-    /// Builds the adapter from the existing process configuration.  The
-    /// password is resolved only in this process and passed directly to the
-    /// adapter as a redacted secret value; it is never deserialized from the
-    /// config file or exposed in this API.
+    /// Builds the adapter from the existing process configuration. The
+    /// configured provider is the only credential authority; this process
+    /// never accepts an ambient password environment variable or an empty
+    /// fallback.
     pub fn new(config: GovernorConfig) -> Result<Self, String> {
         config.validate().map_err(|error| error.to_string())?;
-        Ok(Self {
-            store: SurrealStoreAdapter::new(adapter_config(&config)?),
-            blob: None,
-        })
+        let store = SurrealStoreAdapter::new(adapter_config(&config)?);
+        let blob = BlobRootOwner::claim(
+            config.blob_store.root.clone(),
+            format!("store-composition:{}", config.service.instance_id),
+            std::process::id(),
+        )
+        .map_err(|error| format!("claim Blob root owner: {error}"))?;
+        Ok(Self { store, blob })
     }
 
-    /// Adds the one co-located/process-backed Blob capability.  A second owner
-    /// is rejected instead of silently replacing the active root owner.
-    pub fn with_blob_owner(mut self, owner: BlobOwner) -> Result<Self, String> {
-        if self.blob.is_some() {
-            return Err("exactly one Blob root owner is permitted".to_owned());
-        }
-        self.blob = Some(owner);
-        Ok(self)
+    /// Rejects attempts to add a second process/root owner after composition.
+    pub fn with_blob_owner(self, _owner: BlobRootOwner) -> Result<Self, String> {
+        Err("exactly one Blob root owner is composed by StoreComposition::new".to_owned())
     }
 
-    /// Returns the configured provider-neutral Blob capability, if composed.
-    pub fn blob(&self) -> Option<&dyn BlobStoreClient> {
-        self.blob.as_ref().map(BlobOwner::client)
+    /// Returns the sole process/root claim identity. It carries no semantic
+    /// write authority and does not mint Blob receipts.
+    #[must_use]
+    pub fn blob_owner(&self) -> &BlobRootOwner {
+        &self.blob
     }
 
     /// Bounded adapter/provider health observation.
@@ -172,17 +144,93 @@ impl StoreComposition {
 fn adapter_config(config: &GovernorConfig) -> Result<SurrealAdapterConfig, String> {
     let schema_generation =
         SchemaGeneration::new(SCHEMA_GENERATION).map_err(|error| error.to_string())?;
-    let password = std::env::var(PASSWORD_ENV).unwrap_or_default();
     Ok(SurrealAdapterConfig {
         endpoint: config.db.surreal.endpoint.clone(),
         namespace: config.db.surreal.ns.clone(),
         database: config.db.surreal.db.clone(),
         username: config.db.surreal.user.clone(),
-        password: SecretString::new(password.into()),
+        password: resolve_surreal_password(config)?,
         connect_timeout_ms: config.db.surreal.startup_timeout_ms,
         query_timeout_ms: config.db.surreal.query_timeout_ms,
         expected_schema_generation: schema_generation,
     })
+}
+
+fn resolve_surreal_password(config: &GovernorConfig) -> Result<SecretString, String> {
+    let surreal = &config.db.surreal;
+    match surreal.credential_provider {
+        CredentialProviderKind::WindowsCredentialManager => {
+            let bytes = eliot_windows_ipc::credential_read_current_user(&surreal.credential_id)
+                .map_err(|error| format!("read configured Windows credential: {error}"))?
+                .ok_or_else(|| {
+                    format!(
+                        "configured Windows credential is missing: {}",
+                        surreal.credential_id
+                    )
+                })?;
+            let password = String::from_utf8(bytes)
+                .map_err(|_| "configured Windows credential is not UTF-8".to_owned())?;
+            non_empty_secret(password, "configured Windows credential")
+        }
+        CredentialProviderKind::LegacyPasswordFile => {
+            if std::env::var("ELIOT_ALLOW_LEGACY_PASSWORD_FILE_MIGRATION").as_deref() != Ok("1") {
+                return Err(
+                    "legacy SurrealDB password_file requires the explicit migration gate"
+                        .to_owned(),
+                );
+            }
+            let path = resolve_password_path(&surreal.password_file)?;
+            let password = std::fs::read_to_string(&path).map_err(|error| {
+                format!(
+                    "read configured SurrealDB password file {}: {error}",
+                    path.display()
+                )
+            })?;
+            non_empty_secret(password, "configured SurrealDB password file")
+        }
+        provider => Err(format!(
+            "unsupported configured SurrealDB credential provider: {provider:?}"
+        )),
+    }
+}
+
+fn non_empty_secret(value: String, source: &str) -> Result<SecretString, String> {
+    let value = value.trim().to_owned();
+    if value.is_empty() {
+        return Err(format!("{source} is empty"));
+    }
+    Ok(SecretString::new(value.into()))
+}
+
+fn resolve_password_path(configured: &str) -> Result<PathBuf, String> {
+    let prefix = ["%LOCALAPPDATA%/", "%LOCALAPPDATA%\\"]
+        .into_iter()
+        .find(|prefix| {
+            configured
+                .get(..prefix.len())
+                .is_some_and(|value| value.eq_ignore_ascii_case(prefix))
+        })
+        .ok_or_else(|| "db.surreal.password_file must use the %LOCALAPPDATA%/ prefix".to_owned())?;
+    let local_app_data = std::env::var_os("LOCALAPPDATA")
+        .ok_or_else(|| "LOCALAPPDATA is required by db.surreal.password_file".to_owned())?;
+    let local_app_data = PathBuf::from(local_app_data);
+    if !local_app_data.is_absolute() {
+        return Err("LOCALAPPDATA must be absolute for db.surreal.password_file".to_owned());
+    }
+    let relative = &configured[prefix.len()..];
+    let relative_path = Path::new(relative);
+    if relative.is_empty()
+        || configured.ends_with(['/', '\\'])
+        || !relative_path
+            .components()
+            .all(|component| matches!(component, Component::Normal(_)))
+        || relative_path.file_name().is_none()
+    {
+        return Err(
+            "db.surreal.password_file must be a normalized file below LOCALAPPDATA".to_owned(),
+        );
+    }
+    Ok(local_app_data.join(relative_path))
 }
 
 fn observed_clock() -> ClockObservation {
@@ -199,7 +247,7 @@ fn observed_clock() -> ClockObservation {
 }
 
 /// Loads the process's non-secret configuration.  Secret material is resolved
-/// from `ELIOT_SURREAL_PASSWORD` only inside [`StoreComposition::new`].
+/// from the configured SecretRef/provider only inside [`StoreComposition::new`].
 pub fn load_config(path: Option<&Path>) -> Result<GovernorConfig, String> {
     let Some(path) = path else {
         return Ok(GovernorConfig::default());
@@ -262,33 +310,14 @@ impl From<SemanticReadiness> for ReadinessReceipt {
 #[derive(Debug, Serialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum Response {
-    Ready {
-        service: &'static str,
-        protocol: &'static str,
-        operation_manifest_digest: String,
-    },
-    Health {
-        record: AdapterHealth,
-    },
-    Readiness {
-        receipt: ReadinessReceipt,
-    },
-    Migrated {
-        receipt: MigrationResponse,
-    },
-    Named {
-        response: NamedReadResponse,
-    },
-    Transaction {
-        receipt: WriteReceipt,
-    },
-    Receipt {
-        receipt: Option<WriteReceipt>,
-    },
+    Health { record: AdapterHealth },
+    Readiness { receipt: ReadinessReceipt },
+    Migrated { receipt: MigrationResponse },
+    Named { response: NamedReadResponse },
+    Transaction { receipt: WriteReceipt },
+    Receipt { receipt: Option<WriteReceipt> },
     Stopped,
-    Error {
-        error: String,
-    },
+    Error { error: String },
 }
 
 /// Closed process request catalogue.  No provider SDK, table, query string or

@@ -871,6 +871,22 @@ async fn write_transaction(
     if cas_result.is_empty() {
         return Err(AdapterError::ProviderConflict);
     }
+    let revision_result = response
+        .take::<Vec<Value>>(1)
+        .map_err(|error| AdapterError::Serialization(error.to_string()))?;
+    if revision_result.is_empty() {
+        return Err(AdapterError::ProviderConflict);
+    }
+    let mut result_index = 2;
+    for _ in &plan.next_ordering_heads {
+        let ordering_result = response
+            .take::<Vec<Value>>(result_index)
+            .map_err(|error| AdapterError::Serialization(error.to_string()))?;
+        if ordering_result.is_empty() {
+            return Err(AdapterError::ProviderConflict);
+        }
+        result_index += if initial_state { 1 } else { 2 };
+    }
     Ok(())
 }
 

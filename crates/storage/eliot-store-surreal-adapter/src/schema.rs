@@ -77,31 +77,31 @@ pub(crate) const TX_BEGIN: &str = "BEGIN TRANSACTION;";
 pub(crate) const TX_COMMIT: &str = "COMMIT TRANSACTION;";
 
 /// Upsert of the canonical fence singleton.
-pub(crate) const TX_UPSERT_FENCE: &str = "UPDATE type::thing($fence_table, $fence_key) CONTENT $fence WHERE state_fence = $expected_state_fence AND next_commit_sequence = $expected_commit_sequence AND next_outbox_sequence = $expected_outbox_sequence RETURN AFTER;";
+pub(crate) const TX_UPSERT_FENCE: &str = "UPDATE type::record($fence_table, $fence_key) CONTENT $fence WHERE state_fence = $expected_state_fence AND next_commit_sequence = $expected_commit_sequence AND next_outbox_sequence = $expected_outbox_sequence RETURN AFTER;";
 pub(crate) const TX_CREATE_FENCE: &str =
-    "CREATE type::thing($fence_table, $fence_key) CONTENT $fence RETURN AFTER;";
+    "CREATE type::record($fence_table, $fence_key) CONTENT $fence RETURN AFTER;";
 /// Upsert of one revision head. Exactly one revision key exists per transition.
-pub(crate) const TX_UPSERT_REVISION: &str = "UPDATE type::thing($revision_table, $revision_key) CONTENT $revision_record WHERE body.revision = $expected_revision AND body.state_fence = $expected_state_fence RETURN AFTER;";
+pub(crate) const TX_UPSERT_REVISION: &str = "UPDATE type::record($revision_table, $revision_key) CONTENT $revision_record WHERE body.revision = $expected_revision AND body.state_fence = $expected_state_fence RETURN AFTER;";
 pub(crate) const TX_CREATE_REVISION: &str =
-    "CREATE type::thing($revision_table, $revision_key) CONTENT $revision_record RETURN AFTER;";
+    "CREATE type::record($revision_table, $revision_key) CONTENT $revision_record RETURN AFTER;";
 /// Upsert of one ordering head. `{i}` selects the binding index.
-pub(crate) const TX_UPSERT_ORDERING: &str = "UPDATE type::thing($ordering_table{i}, $ordering_scope{i}) CONTENT $ordering_record{i} WHERE body.sequence = $expected_ordering_sequence{i} AND body.state_fence = $expected_state_fence RETURN AFTER;";
-pub(crate) const TX_CREATE_ORDERING: &str = "CREATE type::thing($ordering_table{i}, $ordering_scope{i}) CONTENT $ordering_record{i} RETURN AFTER;";
+pub(crate) const TX_UPSERT_ORDERING: &str = "LET $ordering_cas{i} = (UPSERT type::record($ordering_table{i}, $ordering_scope{i}) CONTENT $ordering_record{i} WHERE body.sequence = $expected_ordering_sequence{i} AND body.state_fence = $expected_state_fence RETURN AFTER); IF array::len($ordering_cas{i} ?? []) = 0 { THROW 'ordering_head_cas_conflict'; };";
+pub(crate) const TX_CREATE_ORDERING: &str = "CREATE type::record($ordering_table{i}, $ordering_scope{i}) CONTENT $ordering_record{i} RETURN AFTER;";
 /// Create of one canonical event (immutable). `{i}` selects the binding index.
 pub(crate) const TX_CREATE_EVENT: &str =
-    "CREATE type::thing($event_table{i}, $event_id{i}) CONTENT $event{i};";
+    "CREATE type::record($event_table{i}, $event_id{i}) CONTENT $event{i};";
 /// Create of one projection publication (immutable). `{i}` selects the index.
 pub(crate) const TX_CREATE_PROJECTION: &str =
-    "CREATE type::thing($projection_table{i}, $publication_id{i}) CONTENT $projection{i};";
+    "CREATE type::record($projection_table{i}, $publication_id{i}) CONTENT $projection{i};";
 /// Create one typed relation intent. `{i}` selects the index.
 pub(crate) const TX_CREATE_RELATION: &str =
-    "CREATE type::thing($relation_table{i}, $relation_id{i}) CONTENT $relation{i};";
+    "CREATE type::record($relation_table{i}, $relation_id{i}) CONTENT $relation{i};";
 /// Create of one outbox intent (immutable). `{i}` selects the binding index.
 pub(crate) const TX_CREATE_OUTBOX: &str =
-    "CREATE type::thing($outbox_table{i}, $outbox_id{i}) CONTENT $outbox{i};";
+    "CREATE type::record($outbox_table{i}, $outbox_id{i}) CONTENT $outbox{i};";
 /// Create of the write receipt, the durable linearization point.
 pub(crate) const TX_CREATE_RECEIPT: &str =
-    "CREATE type::thing($receipt_table, $receipt_operation_id) CONTENT $receipt;";
+    "CREATE type::record($receipt_table, $receipt_operation_id) CONTENT $receipt;";
 
 /// Renders an indexed transaction template for the given binding index.
 pub(crate) fn indexed(template: &str, index: usize) -> String {
@@ -111,7 +111,7 @@ pub(crate) fn indexed(template: &str, index: usize) -> String {
 /// Migration metadata is part of the same provider transaction as DDL.  The
 /// APPLIED marker is therefore never published by a second writer step.
 pub(crate) const TX_UPSERT_SCHEMA_META: &str =
-    "UPSERT type::thing($schema_meta_table, $schema_meta_key) CONTENT $schema_meta_record;";
+    "UPSERT type::record($schema_meta_table, $schema_meta_key) CONTENT $schema_meta_record;";
 
 /// Closed read templates. Results select `body` values so they deserialize
 /// back into store-API types without a SurrealDB `id` field.
@@ -121,7 +121,7 @@ pub(crate) const READ_SCHEMA_GENERATION: &str =
 pub(crate) const READ_FENCE: &str = "SELECT * FROM ONLY canonical_fence:current;";
 
 pub(crate) const READ_RECEIPT_BY_OPERATION: &str =
-    "SELECT VALUE body FROM ONLY type::thing($table, $key);";
+    "SELECT VALUE body FROM ONLY type::record($table, $key);";
 
 pub(crate) const READ_RECEIPT_IDEMPOTENCY: &str = r#"
 SELECT VALUE body FROM write_receipt WHERE operation_id = $operation_id LIMIT 1;

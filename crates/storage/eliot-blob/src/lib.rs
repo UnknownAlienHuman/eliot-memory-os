@@ -14,13 +14,16 @@
 //! re-claim a root and never create a second receipt issuer. There is no global
 //! state lock: reads overlap through shared platform/codec/key/AEAD locks, and
 //! same-content or same-operation identities serialize through striped shard
-//! locks. Blocking filesystem/codec work still executes on the calling task
-//! until the P-11 task API is admitted (documented blocker).
+//! locks. The only process-global lock is the bounded startup root-claim
+//! registry; it is not on the blob operation hot path. Blocking
+//! filesystem/codec work still executes on the calling task until the P-11
+//! task API is admitted (documented blocker).
 
 #![forbid(unsafe_code)]
 #![allow(clippy::missing_errors_doc)]
 
-use std::sync::{Arc, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
+use std::collections::BTreeSet;
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use blake3::Hasher;
 use eliot_blob_api::{
@@ -48,6 +51,75 @@ const MAX_BLOB_PLAINTEXT_BYTES: u64 = 32 * 1024 * 1024;
 const MAX_METADATA_BYTES: u64 = 64 * 1024;
 const MAX_JOURNAL_BYTES: u64 = 64 * 1024;
 const SHARD_COUNT: usize = 64;
+
+/// The process-owned S-04 root claim used by composition roots that do not
+/// expose a second Blob service seam. Claiming is process-scoped and
+/// single-use: a second composition for the same process/root identity is
+/// rejected instead of silently creating another root owner.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BlobRootOwner {
+    root_id: String,
+    owner_id: BlobId,
+    process_id: u32,
+    claim_id: String,
+}
+
+static PROCESS_ROOT_CLAIMS: OnceLock<Mutex<BTreeSet<String>>> = OnceLock::new();
+
+impl BlobRootOwner {
+    /// Claims exactly one process/root identity. Physical path containment,
+    /// encryption and durable publication remain owned by the concrete
+    /// `BlobStoreService` platform ports; this identity is not a semantic
+    /// write authority.
+    pub fn claim(
+        root_id: impl Into<String>,
+        owner_id: impl Into<String>,
+        process_id: u32,
+    ) -> Result<Self, BlobError> {
+        let root_id = root_id.into();
+        if root_id.trim().is_empty() || root_id.chars().any(char::is_control) || process_id == 0 {
+            return Err(BlobError::InvalidContract(
+                "Blob root claim requires a non-blank root and process identity".to_owned(),
+            ));
+        }
+        let owner_id = BlobId::new(owner_id)?;
+        let claim_id = format!("process:{process_id}:root:{root_id}:owner:{owner_id}");
+        let root_claim_key = format!("process:{process_id}:root:{root_id}");
+        let claims = PROCESS_ROOT_CLAIMS.get_or_init(|| Mutex::new(BTreeSet::new()));
+        let mut claims = claims
+            .lock()
+            .map_err(|_| BlobError::Provider("Blob root claim lock poisoned".to_owned()))?;
+        if !claims.insert(root_claim_key) {
+            return Err(BlobError::OwnerConflict);
+        }
+        Ok(Self {
+            root_id,
+            owner_id,
+            process_id,
+            claim_id,
+        })
+    }
+
+    #[must_use]
+    pub fn root_id(&self) -> &str {
+        &self.root_id
+    }
+
+    #[must_use]
+    pub fn owner_id(&self) -> &BlobId {
+        &self.owner_id
+    }
+
+    #[must_use]
+    pub const fn process_id(&self) -> u32 {
+        self.process_id
+    }
+
+    #[must_use]
+    pub fn claim_id(&self) -> &str {
+        &self.claim_id
+    }
+}
 
 /// Proof returned only after the adapter has exclusively claimed a root.
 #[derive(Clone, Debug, Eq, PartialEq)]

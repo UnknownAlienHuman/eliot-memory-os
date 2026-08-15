@@ -1,50 +1,113 @@
-use std::io::{self, BufRead, Write};
+use std::collections::BTreeSet;
+use std::io::{self, Read, Write};
 use std::path::PathBuf;
 
+use eliot_ipc::{ReplayDisposition, ReplayLedger, TransportLimits};
+use eliot_protocol::{
+    ClientHello, EncodingProfile, Frame, FrameKind, MessageType, ProtocolPayload, ProtocolRange,
+    ProtocolVersion, ServerHello,
+};
+use eliot_store_api::{StateFence, StoreError};
 use eliot_store_surreal::{
     PROTOCOL_VERSION, Request, Response, SERVICE_NAME, StoreComposition, load_config,
 };
+
+const CAPABILITY_HEALTH: &str = "store.health";
+const CAPABILITY_READINESS: &str = "store.readiness";
+const CAPABILITY_MIGRATE: &str = "store.migrate";
+const CAPABILITY_NAMED_READ: &str = "store.named_read";
+const CAPABILITY_APPLY: &str = "store.apply";
+const CAPABILITY_RECEIPT: &str = "store.receipt";
+const CAPABILITY_SHUTDOWN: &str = "store.shutdown";
+const CAPABILITIES: &[&str] = &[
+    CAPABILITY_HEALTH,
+    CAPABILITY_READINESS,
+    CAPABILITY_MIGRATE,
+    CAPABILITY_NAMED_READ,
+    CAPABILITY_APPLY,
+    CAPABILITY_RECEIPT,
+    CAPABILITY_SHUTDOWN,
+];
+const EFFECTS: &[&str] = &["read", "migration", "canonical_write"];
+
+struct Session {
+    connection_id: String,
+    protocol_version: ProtocolVersion,
+    state_fence: StateFence,
+    max_frame_bytes: usize,
+    capabilities: BTreeSet<String>,
+    replay: ReplayLedger,
+}
 
 #[tokio::main]
 async fn main() {
     let config_path = match parse_config_path() {
         Ok(path) => path,
         Err(error) => {
-            write_response(Response::Error { error });
+            eprintln!("{SERVICE_NAME}: {error}");
             return;
         }
     };
     let config = match load_config(config_path.as_deref()) {
         Ok(config) => config,
         Err(error) => {
-            write_response(Response::Error { error });
+            eprintln!("{SERVICE_NAME}: {error}");
             return;
         }
     };
     let composition = match StoreComposition::new(config) {
         Ok(composition) => composition,
         Err(error) => {
-            write_response(Response::Error { error });
+            eprintln!("{SERVICE_NAME}: {error}");
             return;
         }
     };
-    if !write_response(Response::Ready {
-        service: SERVICE_NAME,
-        protocol: PROTOCOL_VERSION,
-        operation_manifest_digest: composition.operation_manifest_digest().to_owned(),
-    }) {
+
+    let limits = TransportLimits::default();
+    let stdin = io::stdin();
+    let mut input = stdin.lock();
+    let stdout = io::stdout();
+    let mut output = stdout.lock();
+
+    let (mut session, server_hello) = match read_handshake(&mut input, limits, &composition) {
+        Ok(value) => value,
+        Err(error) => {
+            eprintln!("{SERVICE_NAME}: EBP handshake rejected: {error}");
+            return;
+        }
+    };
+    let mut negotiated_limits = limits;
+    negotiated_limits.max_frame_bytes = session.max_frame_bytes;
+    let handshake_frame = control_frame(
+        &session.connection_id,
+        session.protocol_version,
+        MessageType::Ready,
+        serde_json::to_value(server_hello).expect("server hello is serializable"),
+    );
+    if let Err(error) = write_frame(&mut output, &handshake_frame, negotiated_limits) {
+        eprintln!("{SERVICE_NAME}: EBP handshake response failed: {error}");
         return;
     }
-    for line in io::stdin().lock().lines() {
-        let response = match line {
-            Ok(line) if line.trim().is_empty() => continue,
-            Ok(line) => dispatch(&composition, &line).await,
-            Err(error) => Response::Error {
-                error: error.to_string(),
-            },
+
+    loop {
+        let frame = match read_frame(&mut input, negotiated_limits) {
+            Ok(frame) => frame,
+            Err(error) => {
+                eprintln!("{SERVICE_NAME}: EBP frame rejected: {error}");
+                break;
+            }
+        };
+        let response = match validate_request_frame(&mut session, &frame) {
+            Ok(request) => dispatch(&composition, request).await,
+            Err(error) => Response::Error { error },
         };
         let stop = matches!(response, Response::Stopped);
-        if !write_response(response) || stop {
+        let response_frame = response_frame(&session, &frame, response);
+        if let Err(error) = write_frame(&mut output, &response_frame, negotiated_limits) {
+            eprintln!("{SERVICE_NAME}: EBP response failed: {error}");
+            break;
+        }
+        if stop {
             break;
         }
     }
@@ -62,12 +125,182 @@ fn parse_config_path() -> Result<Option<PathBuf>, String> {
     }
 }
 
-async fn dispatch(composition: &StoreComposition, line: &str) -> Response {
-    match serde_json::from_str::<Request>(line) {
-        Ok(Request::Health) => Response::Health {
+fn read_handshake<R: Read>(
+    reader: &mut R,
+    limits: TransportLimits,
+    composition: &StoreComposition,
+) -> Result<(Session, ServerHello), String> {
+    let frame = read_frame(reader, limits)?;
+    if frame.kind != FrameKind::Control
+        || frame.message_type != MessageType::Start
+        || frame.request_id.is_some()
+        || frame.request_identity.is_some()
+    {
+        return Err("first frame must be an uncorrelated Control/Start hello".to_owned());
+    }
+    let ProtocolPayload::Json(payload) = frame.payload else {
+        return Err("EBP hello payload must use json-v1".to_owned());
+    };
+    let hello: ClientHello =
+        serde_json::from_value(payload).map_err(|error| format!("decode ClientHello: {error}"))?;
+    hello
+        .validate()
+        .map_err(|error| format!("validate ClientHello: {error}"))?;
+    if hello.module_bridge_identity != SERVICE_NAME {
+        return Err(format!(
+            "ClientHello module_bridge_identity must be {SERVICE_NAME}"
+        ));
+    }
+    let server_range = ProtocolRange {
+        minimum: ProtocolVersion::CURRENT,
+        maximum: ProtocolVersion::CURRENT,
+    };
+    let protocol_version = hello
+        .protocol_range
+        .select(server_range)
+        .map_err(|error| format!("negotiate EBP version: {error}"))?;
+    if usize::try_from(hello.max_frame).unwrap_or(usize::MAX) > limits.max_frame_bytes {
+        return Err("ClientHello max_frame exceeds the bounded transport limit".to_owned());
+    }
+    let capabilities: Vec<String> = CAPABILITIES
+        .iter()
+        .filter(|capability| hello.capabilities.iter().any(|value| value == **capability))
+        .map(|capability| (*capability).to_owned())
+        .collect();
+    let effects: Vec<String> = EFFECTS.iter().map(|effect| (*effect).to_owned()).collect();
+    let server_hello = ServerHello {
+        selected_protocol: protocol_version,
+        session_principal_binding: format!("{SERVICE_NAME}:{}", std::process::id()),
+        allowed_capabilities: capabilities.clone(),
+        allowed_effects: effects,
+        config_snapshot: serde_json::json!({
+            "service": SERVICE_NAME,
+            "protocol": PROTOCOL_VERSION,
+            "operation_manifest_digest": composition.operation_manifest_digest(),
+            "blob_root_owner": {
+                "root_id": composition.blob_owner().root_id(),
+                "owner_id": composition.blob_owner().owner_id().as_str(),
+                "process_id": composition.blob_owner().process_id(),
+                "claim_id": composition.blob_owner().claim_id(),
+            },
+        }),
+        heartbeat_ms: 30_000,
+        control_channel: "stdio".to_owned(),
+        rejection_reason: None,
+        authority_epoch: hello.authority_epoch,
+    };
+    server_hello
+        .validate()
+        .map_err(|error| format!("validate ServerHello: {error}"))?;
+    let state_fence = hello.module_generation.state_fence;
+    Ok((
+        Session {
+            connection_id: frame.connection_id,
+            protocol_version,
+            state_fence,
+            max_frame_bytes: usize::try_from(hello.max_frame)
+                .map_err(|_| "ClientHello max_frame does not fit usize".to_owned())?,
+            capabilities: capabilities.into_iter().collect(),
+            replay: ReplayLedger::default(),
+        },
+        server_hello,
+    ))
+}
+
+fn validate_request_frame(session: &mut Session, frame: &Frame) -> Result<Request, String> {
+    if frame.protocol_version != session.protocol_version
+        || frame.connection_id != session.connection_id
+        || frame.kind != FrameKind::Request
+        || frame.message_type != MessageType::Execute
+    {
+        return Err("request frame is outside the negotiated EBP session".to_owned());
+    }
+    let identity = frame
+        .request_identity
+        .as_ref()
+        .ok_or_else(|| "request identity is required".to_owned())?;
+    if identity.request.state_fence != session.state_fence {
+        return Err("request identity state fence does not match the handshake fence".to_owned());
+    }
+    let request_id = frame
+        .request_id
+        .as_ref()
+        .ok_or_else(|| "request_id is required".to_owned())?
+        .to_string();
+    match session.replay.observe(request_id, frame) {
+        ReplayDisposition::Conflict => {
+            return Err("request identity conflicts with a prior frame".to_owned());
+        }
+        ReplayDisposition::New | ReplayDisposition::Duplicate => {}
+    }
+    let ProtocolPayload::Json(payload) = &frame.payload else {
+        return Err("request payload must use json-v1".to_owned());
+    };
+    let request: Request = serde_json::from_value(payload.clone())
+        .map_err(|error| format!("decode store request: {error}"))?;
+    let capability = request_capability(&request);
+    if !session.capabilities.contains(capability) {
+        return Err(format!("capability is not admitted: {capability}"));
+    }
+    validate_request_fence(&request, identity)?;
+    Ok(request)
+}
+
+fn request_capability(request: &Request) -> &'static str {
+    match request {
+        Request::Health => CAPABILITY_HEALTH,
+        Request::Readiness => CAPABILITY_READINESS,
+        Request::Migrate => CAPABILITY_MIGRATE,
+        Request::Named { .. } => CAPABILITY_NAMED_READ,
+        Request::Apply { .. } => CAPABILITY_APPLY,
+        Request::Receipt { .. } => CAPABILITY_RECEIPT,
+        Request::Stop => CAPABILITY_SHUTDOWN,
+    }
+}
+
+fn validate_request_fence(
+    request: &Request,
+    identity: &eliot_protocol::RequestIdentity,
+) -> Result<(), String> {
+    match request {
+        Request::Named { request } => {
+            request.validate().map_err(store_error)?;
+            if request.state_fence != identity.request.state_fence {
+                return Err("named request fence does not match request identity".to_owned());
+            }
+        }
+        Request::Apply {
+            context,
+            transition,
+            ..
+        } => {
+            context.validate().map_err(|error| error.to_string())?;
+            if context != &identity.request.metadata {
+                return Err("apply context does not match request identity metadata".to_owned());
+            }
+            if transition.state_fence != identity.request.state_fence {
+                return Err("prepared transition fence does not match request identity".to_owned());
+            }
+        }
+        Request::Health
+        | Request::Readiness
+        | Request::Migrate
+        | Request::Receipt { .. }
+        | Request::Stop => {}
+    }
+    Ok(())
+}
+
+fn store_error(error: StoreError) -> String {
+    error.to_string()
+}
+
+async fn dispatch(composition: &StoreComposition, request: Request) -> Response {
+    match request {
+        Request::Health => Response::Health {
             record: composition.health().await,
         },
-        Ok(Request::Readiness) => match composition.readiness().await {
+        Request::Readiness => match composition.readiness().await {
             Ok(readiness) => Response::Readiness {
                 receipt: readiness.into(),
             },
@@ -75,7 +308,7 @@ async fn dispatch(composition: &StoreComposition, line: &str) -> Response {
                 error: error.to_string(),
             },
         },
-        Ok(Request::Migrate) => match composition.migrate().await {
+        Request::Migrate => match composition.migrate().await {
             Ok(receipt) => Response::Migrated {
                 receipt: receipt.into(),
             },
@@ -83,18 +316,18 @@ async fn dispatch(composition: &StoreComposition, line: &str) -> Response {
                 error: error.to_string(),
             },
         },
-        Ok(Request::Named { request }) => match composition.named(request).await {
+        Request::Named { request } => match composition.named(request).await {
             Ok(response) => Response::Named { response },
             Err(error) => Response::Error {
                 error: error.to_string(),
             },
         },
-        Ok(Request::Apply {
+        Request::Apply {
             context,
             transition,
             expected_revision_heads,
             expected_ordering_heads,
-        }) => match composition
+        } => match composition
             .apply(
                 &context,
                 transition,
@@ -108,23 +341,84 @@ async fn dispatch(composition: &StoreComposition, line: &str) -> Response {
                 error: error.to_string(),
             },
         },
-        Ok(Request::Receipt { operation_id }) => match composition.receipt(operation_id).await {
+        Request::Receipt { operation_id } => match composition.receipt(operation_id).await {
             Ok(receipt) => Response::Receipt { receipt },
             Err(error) => Response::Error {
                 error: error.to_string(),
             },
         },
-        Ok(Request::Stop) => Response::Stopped,
-        Err(error) => Response::Error {
-            error: error.to_string(),
-        },
+        Request::Stop => Response::Stopped,
     }
 }
 
-fn write_response(response: Response) -> bool {
-    let stdout = io::stdout();
-    let mut output = stdout.lock();
-    serde_json::to_writer(&mut output, &response).is_ok()
-        && output.write_all(b"\n").is_ok()
-        && output.flush().is_ok()
+fn control_frame(
+    connection_id: &str,
+    protocol_version: ProtocolVersion,
+    message_type: MessageType,
+    payload: serde_json::Value,
+) -> Frame {
+    Frame {
+        protocol_version,
+        encoding_profile: EncodingProfile::JsonV1,
+        connection_id: connection_id.to_owned(),
+        request_id: None,
+        kind: FrameKind::Control,
+        message_type,
+        request_identity: None,
+        payload: ProtocolPayload::Json(payload),
+        trace_context: std::collections::BTreeMap::new(),
+    }
+}
+
+fn response_frame(session: &Session, request: &Frame, response: Response) -> Frame {
+    Frame {
+        protocol_version: session.protocol_version,
+        encoding_profile: EncodingProfile::JsonV1,
+        connection_id: session.connection_id.clone(),
+        request_id: request.request_id.clone(),
+        kind: FrameKind::Response,
+        message_type: MessageType::Result,
+        request_identity: None,
+        payload: ProtocolPayload::Json(
+            serde_json::to_value(response).expect("store response is serializable"),
+        ),
+        trace_context: std::collections::BTreeMap::new(),
+    }
+}
+
+fn read_frame<R: Read>(reader: &mut R, limits: TransportLimits) -> Result<Frame, String> {
+    let mut prefix = [0_u8; 4];
+    reader
+        .read_exact(&mut prefix)
+        .map_err(|error| format!("read frame prefix: {error}"))?;
+    let length = usize::try_from(u32::from_le_bytes(prefix))
+        .map_err(|_| "frame length does not fit usize".to_owned())?;
+    if length == 0 || length > limits.max_frame_bytes {
+        return Err(format!(
+            "frame body length {length} exceeds bounded limit {}",
+            limits.max_frame_bytes
+        ));
+    }
+    let mut wire = Vec::with_capacity(4 + length);
+    wire.extend_from_slice(&prefix);
+    let mut body = vec![0_u8; length];
+    reader
+        .read_exact(&mut body)
+        .map_err(|error| format!("read frame body: {error}"))?;
+    wire.extend_from_slice(&body);
+    eliot_ipc::decode_frame(&wire, limits).map_err(|error| error.to_string())
+}
+
+fn write_frame<W: Write>(
+    writer: &mut W,
+    frame: &Frame,
+    limits: TransportLimits,
+) -> Result<(), String> {
+    let wire = eliot_ipc::encode_frame(frame, limits).map_err(|error| error.to_string())?;
+    writer
+        .write_all(&wire)
+        .map_err(|error| format!("write frame: {error}"))?;
+    writer
+        .flush()
+        .map_err(|error| format!("flush frame: {error}"))
 }

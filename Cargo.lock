@@ -1509,11 +1509,14 @@ dependencies = [
 name = "eliot-store-surreal"
 version = "0.1.0"
 dependencies = [
- "eliot-blob-api",
+ "eliot-blob",
+ "eliot-ipc",
  "eliot-platform",
+ "eliot-protocol",
  "eliot-store-api",
  "eliot-store-surreal-adapter",
  "eliot-types",
+ "eliot-windows-ipc",
  "secrecy",
  "serde",
  "serde_json",
