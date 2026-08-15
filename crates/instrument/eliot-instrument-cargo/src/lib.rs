@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use eliot_instrument_api::{ExecutionStatus, InstrumentInvocation};
 use eliot_process::{
-    CancellationReceipt, ProcessEvidence, ProcessEvidenceSink, ProcessExecutionError,
+    CancellationReceipt, OperationId, ProcessEvidence, ProcessEvidenceSink, ProcessExecutionError,
     ProcessExecutionView, ProcessExecutor, ProcessRequest, ProcessStartReceipt,
 };
 use thiserror::Error;
@@ -28,10 +28,7 @@ pub const CONTRACT_VERSION: (u16, u16, u16) = (1, 0, 0);
 /// or replacing them here.
 pub trait CargoProcessRequestPort: Send + Sync {
     /// Binds an admitted instrument invocation to one immutable P-03 request.
-    fn bind(
-        &self,
-        invocation: &InstrumentInvocation,
-    ) -> Result<ProcessRequest, CargoAdapterError>;
+    fn bind(&self, invocation: &InstrumentInvocation) -> Result<ProcessRequest, CargoAdapterError>;
 }
 
 /// Failures raised before or during a Cargo invocation.
@@ -56,12 +53,15 @@ pub enum CargoAdapterError {
 
 /// The immutable pair passed between the adapter's admission and execution
 /// methods.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct CargoBinding {
     /// The provider-neutral invocation admitted by the caller.
     pub invocation: InstrumentInvocation,
     /// The exact request delegated to P-03.
-    pub process_request: ProcessRequest,
+    process_request: Option<ProcessRequest>,
+    operation_id: OperationId,
+    request_digest: String,
+    generation: u64,
 }
 
 impl CargoBinding {
@@ -82,18 +82,24 @@ impl CargoBinding {
         }
         Ok(Self {
             invocation,
-            process_request,
+            operation_id: process_request.operation_id().clone(),
+            request_digest: process_request.invocation_digest().to_owned(),
+            generation: process_request.generation().get(),
+            process_request: Some(process_request),
         })
+    }
+
+    /// Returns the operation identity without exposing the consuming request.
+    pub const fn operation_id(&self) -> &OperationId {
+        &self.operation_id
     }
 }
 
 /// Receipt returned after P-03 accepts a Cargo process.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct CargoStartReceipt {
     /// Original instrument invocation.
     pub invocation: InstrumentInvocation,
-    /// Immutable process request used for the launch.
-    pub process_request: ProcessRequest,
     /// P-03's acceptance receipt.
     pub process: ProcessStartReceipt,
 }
@@ -127,22 +133,22 @@ impl<E: ProcessExecutor + 'static> CargoInstrumentationAdapter<E> {
     /// Launches the exact bound Cargo request through P-03.
     pub async fn launch(
         &self,
-        binding: &CargoBinding,
+        binding: &mut CargoBinding,
         sink: Arc<dyn ProcessEvidenceSink>,
     ) -> Result<CargoStartReceipt, CargoAdapterError> {
-        let process = self
-            .executor
-            .start(binding.process_request.clone(), sink)
-            .await?;
-        if process.operation_id() != binding.process_request.operation_id() {
+        let process_request = binding
+            .process_request
+            .take()
+            .ok_or(CargoAdapterError::IdentityMismatch)?;
+        let process = self.executor.start(process_request, sink).await?;
+        if process.operation_id() != &binding.operation_id {
             return Err(CargoAdapterError::IdentityMismatch);
         }
-        if process.accepted_generation() != binding.process_request.generation() {
+        if process.accepted_generation().get() != binding.generation {
             return Err(CargoAdapterError::GenerationMismatch);
         }
         Ok(CargoStartReceipt {
             invocation: binding.invocation.clone(),
-            process_request: binding.process_request.clone(),
             process,
         })
     }
@@ -152,12 +158,9 @@ impl<E: ProcessExecutor + 'static> CargoInstrumentationAdapter<E> {
         &self,
         binding: &CargoBinding,
     ) -> Result<CargoObservation, CargoAdapterError> {
-        let view = self
-            .executor
-            .inspect(binding.process_request.operation_id().clone())
-            .await?;
-        if view.operation_id() != binding.process_request.operation_id()
-            || view.request_digest() != binding.process_request.invocation_digest()
+        let view = self.executor.inspect(binding.operation_id.clone()).await?;
+        if view.operation_id() != &binding.operation_id
+            || view.request_digest() != binding.request_digest
         {
             return Err(CargoAdapterError::IdentityMismatch);
         }
@@ -173,10 +176,7 @@ impl<E: ProcessExecutor + 'static> CargoInstrumentationAdapter<E> {
         &self,
         binding: &CargoBinding,
     ) -> Result<CancellationReceipt, CargoAdapterError> {
-        Ok(self
-            .executor
-            .cancel(binding.process_request.operation_id().clone())
-            .await?)
+        Ok(self.executor.cancel(binding.operation_id.clone()).await?)
     }
 
     /// Reconciles an unknown Cargo result and retains the P-03 evidence record.
@@ -186,7 +186,7 @@ impl<E: ProcessExecutor + 'static> CargoInstrumentationAdapter<E> {
     ) -> Result<ProcessEvidence, CargoAdapterError> {
         Ok(self
             .executor
-            .reconcile(binding.process_request.operation_id().clone())
+            .reconcile(binding.operation_id.clone())
             .await?)
     }
 }
@@ -203,13 +203,13 @@ fn execution_status(view: &ProcessExecutionView) -> ExecutionStatus {
         ProcessLifecycle::UnknownOutcome => ExecutionStatus::Unknown,
         ProcessLifecycle::Quarantined => ExecutionStatus::Unknown,
         ProcessLifecycle::Reconciled => ExecutionStatus::Partial,
-        ProcessLifecycle::Exited | ProcessLifecycle::Failed => match view.exit().map(|exit| exit.disposition()) {
-            Some(ExitDisposition::Completed) if view.exit().and_then(|exit| exit.code()) == Some(0) => {
-                ExecutionStatus::Succeeded
+        ProcessLifecycle::Exited | ProcessLifecycle::Failed => {
+            match view.exit().map(|exit| exit.disposition()) {
+                Some(ExitDisposition::Completed) => ExecutionStatus::Succeeded,
+                Some(ExitDisposition::Cancelled) => ExecutionStatus::Cancelled,
+                Some(ExitDisposition::Unknown) | None => ExecutionStatus::Unknown,
+                _ => ExecutionStatus::Failed,
             }
-            Some(ExitDisposition::Cancelled) => ExecutionStatus::Cancelled,
-            Some(ExitDisposition::Unknown) | None => ExecutionStatus::Unknown,
-            _ => ExecutionStatus::Failed,
-        },
+        }
     }
 }

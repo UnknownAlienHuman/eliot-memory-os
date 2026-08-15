@@ -12,7 +12,7 @@ use std::sync::Arc;
 
 use eliot_instrument_api::{ExecutionStatus, InstrumentInvocation};
 use eliot_process::{
-    CancellationReceipt, ProcessEvidence, ProcessEvidenceSink, ProcessExecutionError,
+    CancellationReceipt, OperationId, ProcessEvidence, ProcessEvidenceSink, ProcessExecutionError,
     ProcessExecutionView, ProcessExecutor, ProcessRequest, ProcessStartReceipt,
 };
 use thiserror::Error;
@@ -56,12 +56,15 @@ pub enum RunnerError {
 }
 
 /// The immutable invocation/request pair used for every runner operation.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct InstrumentBinding {
     /// Provider-neutral instrument invocation.
     pub invocation: InstrumentInvocation,
     /// Exact sealed process request delegated to P-03.
-    pub process_request: ProcessRequest,
+    process_request: Option<ProcessRequest>,
+    operation_id: OperationId,
+    request_digest: String,
+    generation: u64,
 }
 
 impl InstrumentBinding {
@@ -82,7 +85,10 @@ impl InstrumentBinding {
         }
         Ok(Self {
             invocation,
-            process_request,
+            operation_id: process_request.operation_id().clone(),
+            request_digest: process_request.invocation_digest().to_owned(),
+            generation: process_request.generation().get(),
+            process_request: Some(process_request),
         })
     }
 
@@ -102,18 +108,24 @@ impl InstrumentBinding {
         }
         Ok(Self {
             invocation,
-            process_request,
+            operation_id: process_request.operation_id().clone(),
+            request_digest: process_request.invocation_digest().to_owned(),
+            generation: process_request.generation().get(),
+            process_request: Some(process_request),
         })
+    }
+
+    /// Returns the operation identity without exposing the consuming request.
+    pub const fn operation_id(&self) -> &OperationId {
+        &self.operation_id
     }
 }
 
 /// Receipt returned after the physical executor accepts an instrument.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct InstrumentStartReceipt {
     /// Original provider-neutral invocation.
     pub invocation: InstrumentInvocation,
-    /// Immutable process request used for launch.
-    pub process_request: ProcessRequest,
     /// P-03 acceptance receipt.
     pub process: ProcessStartReceipt,
 }
@@ -150,29 +162,29 @@ impl<E: ProcessExecutor + 'static> InstrumentRunner<E> {
         port: &dyn InstrumentRequestPort,
         sink: Arc<dyn ProcessEvidenceSink>,
     ) -> Result<InstrumentStartReceipt, RunnerError> {
-        let binding = InstrumentBinding::bind(invocation, port)?;
-        self.launch(&binding, sink).await
+        let mut binding = InstrumentBinding::bind(invocation, port)?;
+        self.launch(&mut binding, sink).await
     }
 
     /// Launches the exact immutable binding through P-03.
     pub async fn launch(
         &self,
-        binding: &InstrumentBinding,
+        binding: &mut InstrumentBinding,
         sink: Arc<dyn ProcessEvidenceSink>,
     ) -> Result<InstrumentStartReceipt, RunnerError> {
-        let process = self
-            .executor
-            .start(binding.process_request.clone(), sink)
-            .await?;
-        if process.operation_id() != binding.process_request.operation_id()
-            || process.request_digest() != binding.process_request.invocation_digest()
-            || process.accepted_generation() != binding.process_request.generation()
+        let process_request = binding
+            .process_request
+            .take()
+            .ok_or(RunnerError::ReceiptMismatch)?;
+        let process = self.executor.start(process_request, sink).await?;
+        if process.operation_id() != &binding.operation_id
+            || process.request_digest() != binding.request_digest
+            || process.accepted_generation().get() != binding.generation
         {
             return Err(RunnerError::ReceiptMismatch);
         }
         Ok(InstrumentStartReceipt {
             invocation: binding.invocation.clone(),
-            process_request: binding.process_request.clone(),
             process,
         })
     }
@@ -182,13 +194,10 @@ impl<E: ProcessExecutor + 'static> InstrumentRunner<E> {
         &self,
         binding: &InstrumentBinding,
     ) -> Result<InstrumentObservation, RunnerError> {
-        let view = self
-            .executor
-            .inspect(binding.process_request.operation_id().clone())
-            .await?;
-        if view.operation_id() != binding.process_request.operation_id()
-            || view.request_digest() != binding.process_request.invocation_digest()
-            || view.generation() != binding.process_request.generation()
+        let view = self.executor.inspect(binding.operation_id.clone()).await?;
+        if view.operation_id() != &binding.operation_id
+            || view.request_digest() != binding.request_digest
+            || view.fence().generation().get() != binding.generation
         {
             return Err(RunnerError::ObservationMismatch);
         }
@@ -204,10 +213,7 @@ impl<E: ProcessExecutor + 'static> InstrumentRunner<E> {
         &self,
         binding: &InstrumentBinding,
     ) -> Result<CancellationReceipt, RunnerError> {
-        Ok(self
-            .executor
-            .cancel(binding.process_request.operation_id().clone())
-            .await?)
+        Ok(self.executor.cancel(binding.operation_id.clone()).await?)
     }
 
     /// Reconciles an unknown operation and returns retained process evidence.
@@ -217,10 +223,10 @@ impl<E: ProcessExecutor + 'static> InstrumentRunner<E> {
     ) -> Result<ProcessEvidence, RunnerError> {
         let evidence = self
             .executor
-            .reconcile(binding.process_request.operation_id().clone())
+            .reconcile(binding.operation_id.clone())
             .await?;
-        if evidence.operation_id() != binding.process_request.operation_id()
-            || evidence.request_digest() != binding.process_request.invocation_digest()
+        if evidence.operation_id() != &binding.operation_id
+            || evidence.request_digest() != binding.request_digest
         {
             return Err(RunnerError::ObservationMismatch);
         }
@@ -238,15 +244,17 @@ fn execution_status(view: &ProcessExecutionView) -> ExecutionStatus {
     match view.lifecycle() {
         ProcessLifecycle::Created | ProcessLifecycle::Starting => ExecutionStatus::Accepted,
         ProcessLifecycle::Running | ProcessLifecycle::Cancelling => ExecutionStatus::Running,
-        ProcessLifecycle::UnknownOutcome | ProcessLifecycle::Quarantined => ExecutionStatus::Unknown,
+        ProcessLifecycle::UnknownOutcome | ProcessLifecycle::Quarantined => {
+            ExecutionStatus::Unknown
+        }
         ProcessLifecycle::Reconciled => ExecutionStatus::Partial,
-        ProcessLifecycle::Exited | ProcessLifecycle::Failed => match view.exit().map(|exit| exit.disposition()) {
-            Some(ExitDisposition::Completed) if view.exit().and_then(|exit| exit.code()) == Some(0) => {
-                ExecutionStatus::Succeeded
+        ProcessLifecycle::Exited | ProcessLifecycle::Failed => {
+            match view.exit().map(|exit| exit.disposition()) {
+                Some(ExitDisposition::Completed) => ExecutionStatus::Succeeded,
+                Some(ExitDisposition::Cancelled) => ExecutionStatus::Cancelled,
+                Some(ExitDisposition::Unknown) | None => ExecutionStatus::Unknown,
+                _ => ExecutionStatus::Failed,
             }
-            Some(ExitDisposition::Cancelled) => ExecutionStatus::Cancelled,
-            Some(ExitDisposition::Unknown) | None => ExecutionStatus::Unknown,
-            _ => ExecutionStatus::Failed,
-        },
+        }
     }
 }

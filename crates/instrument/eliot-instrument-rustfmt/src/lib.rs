@@ -9,7 +9,9 @@
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
-use eliot_instrument_api::{ExecutionStatus, InstrumentInvocation, InstrumentKind, VerificationOutcome};
+use eliot_instrument_api::{
+    ExecutionStatus, InstrumentInvocation, InstrumentKind, VerificationOutcome,
+};
 use eliot_process::{
     CancellationReceipt, ProcessEvidence, ProcessEvidenceSink, ProcessExecutionError,
     ProcessExecutionView, ProcessExecutor, ProcessRequest, ProcessStartReceipt,
@@ -163,10 +165,13 @@ impl<E: ProcessExecutor + 'static> RustfmtAdapter<E> {
         if !command.matches_request(&request) {
             return Err(RustfmtError::CommandMismatch);
         }
-        let receipt = self.executor.start(request.clone(), sink).await?;
-        if receipt.operation_id() != request.operation_id()
-            || receipt.request_digest() != request.invocation_digest()
-            || receipt.accepted_generation() != request.generation()
+        let operation_id = request.operation_id().clone();
+        let request_digest = request.invocation_digest().to_owned();
+        let generation = request.generation().get();
+        let receipt = self.executor.start(request, sink).await?;
+        if receipt.operation_id() != &operation_id
+            || receipt.request_digest() != request_digest
+            || receipt.accepted_generation().get() != generation
         {
             return Err(RustfmtError::ReceiptMismatch);
         }

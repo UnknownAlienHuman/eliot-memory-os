@@ -1014,12 +1014,9 @@ dependencies = [
 name = "eliot-instrument-dotnet"
 version = "0.1.0"
 dependencies = [
- "blake3",
  "eliot-instrument-api",
  "eliot-process",
- "sha2 0.10.9",
  "thiserror",
- "tokio",
 ]
 
 [[package]]
@@ -1730,8 +1727,11 @@ version = "0.1.0"
 dependencies = [
  "eliot-instrument-api",
  "eliot-process",
+ "eliot-process-executor",
+ "eliot-testd-core",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "thiserror",
 ]
 

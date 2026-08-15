@@ -7,14 +7,15 @@
 
 #![forbid(unsafe_code)]
 
-use eliot_instrument_api::{ExecutionStatus, InstrumentInvocation, VerificationRun};
+use eliot_instrument_api::{
+    ExecutionStatus, InstrumentInvocation, InstrumentKind, VerificationRun,
+};
 use eliot_process::ProcessRequest;
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
 use std::path::Path;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -53,18 +54,16 @@ pub enum TestdError {
     /// A contract supplied by an instrument or process adapter is invalid.
     #[error("contract validation failed: {0}")]
     Contract(String),
+    /// The durable plane only admits test profiles.
+    #[error("testd accepts only TEST instrument invocations")]
+    WrongInstrumentKind,
+    /// The instrument request and process admission were not bound together.
+    #[error("instrument and process admissions are not bound")]
+    InvalidBinding,
 }
 
 fn database<E: std::fmt::Display>(error: E) -> TestdError {
     TestdError::Database(error.to_string())
-}
-
-fn now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |duration| {
-            duration.as_millis().min(u128::from(u64::MAX)) as u64
-        })
 }
 
 fn validate_text(value: &str, field: &'static str) -> Result<(), TestdError> {
@@ -100,7 +99,32 @@ impl JobState {
     }
 }
 
-/// A test request plus the process invocation that will execute it.
+/// The serializable portion of a one-shot process admission.
+///
+/// `ProcessRequest` intentionally cannot be cloned or deserialized: its permit
+/// is a consuming capability.  Testd persists this identity projection and
+/// receives a freshly-issued request from Kernel for each physical attempt.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProcessAdmission {
+    pub operation_id: String,
+    pub process_tree_id: String,
+    pub generation: u64,
+    pub invocation_digest: String,
+}
+
+impl ProcessAdmission {
+    fn from_request(request: &ProcessRequest) -> Self {
+        Self {
+            operation_id: request.operation_id().as_str().to_owned(),
+            process_tree_id: request.process_tree_id().as_str().to_owned(),
+            generation: request.generation().get(),
+            invocation_digest: request.invocation_digest().to_owned(),
+        }
+    }
+}
+
+/// A durable test job plus the process identity it must be re-issued for.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct TestJob {
     /// Caller-owned idempotency key.
@@ -111,8 +135,8 @@ pub struct TestJob {
     pub project_sequence: u64,
     /// Instrument contract to execute.
     pub invocation: InstrumentInvocation,
-    /// Sealed process contract used by the process adapter.
-    pub process: ProcessRequest,
+    /// Identity projection of the consuming process contract.
+    pub process: ProcessAdmission,
     /// Scheduling priority; larger values run first among ready heads.
     pub priority: i32,
     /// Durable lifecycle state.
@@ -132,6 +156,11 @@ pub struct TestJob {
     /// Immutable digest of the submitted contracts and scheduling fields.
     pub payload_digest: String,
 }
+
+/// Contract spelling used by the test-execution-plane boundary.
+pub type TestdJob = TestJob;
+/// A worker fence is the durable lease for one physical attempt.
+pub type Fence = Lease;
 
 /// Fencing lease for one physical attempt.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -247,7 +276,14 @@ impl TestdStore {
         process
             .validate()
             .map_err(|error| TestdError::Contract(error.to_string()))?;
+        if !matches!(invocation.kind, InstrumentKind::Test) {
+            return Err(TestdError::WrongInstrumentKind);
+        }
+        if invocation.request.request_id.as_str() != process.operation_id().as_str() {
+            return Err(TestdError::InvalidBinding);
+        }
         let digest = payload_digest(&invocation, &process, priority)?;
+        let process = ProcessAdmission::from_request(&process);
         let write = self.database.begin_write().map_err(database)?;
         let existing = {
             let table = write.open_table(JOBS).map_err(database)?;

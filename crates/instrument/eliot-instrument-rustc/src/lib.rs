@@ -57,7 +57,11 @@ impl RustcCommand {
             }
             arguments.push(option);
         }
-        Ok(Self { executable: RUSTC_EXECUTABLE.to_owned(), arguments, target })
+        Ok(Self {
+            executable: RUSTC_EXECUTABLE.to_owned(),
+            arguments,
+            target,
+        })
     }
 
     /// Checks that a process request is exactly this command projection.
@@ -85,7 +89,11 @@ impl RustcReport {
     /// Maps parsed diagnostics to an execution status without treating a
     /// warning as a failed compilation.
     pub fn execution_status(&self) -> ExecutionStatus {
-        if self.errors != 0 { ExecutionStatus::Failed } else { ExecutionStatus::Succeeded }
+        if self.errors != 0 {
+            ExecutionStatus::Failed
+        } else {
+            ExecutionStatus::Succeeded
+        }
     }
 }
 
@@ -101,7 +109,9 @@ pub fn parse_jsonl(bytes: &[u8]) -> Result<RustcReport, RustcError> {
         }
         let line = std::str::from_utf8(line).map_err(|_| RustcError::MalformedDiagnostic)?;
         let line = line.trim();
-        if line.is_empty() { continue; }
+        if line.is_empty() {
+            continue;
+        }
         let diagnostic: JsonDiagnostic =
             serde_json::from_str(line).map_err(|_| RustcError::MalformedDiagnostic)?;
         match diagnostic.reason.as_deref() {
@@ -132,7 +142,9 @@ pub struct RustcAdapter<E> {
 
 impl<E> RustcAdapter<E> {
     /// Creates an adapter using the supplied process implementation.
-    pub fn new(executor: Arc<E>) -> Self { Self { executor } }
+    pub fn new(executor: Arc<E>) -> Self {
+        Self { executor }
+    }
 }
 
 impl<E: ProcessExecutor + 'static> RustcAdapter<E> {
@@ -144,7 +156,9 @@ impl<E: ProcessExecutor + 'static> RustcAdapter<E> {
         request: ProcessRequest,
         sink: Arc<dyn ProcessEvidenceSink>,
     ) -> Result<ProcessStartReceipt, RustcError> {
-        invocation.validate().map_err(|error| RustcError::Invocation(error.to_string()))?;
+        invocation
+            .validate()
+            .map_err(|error| RustcError::Invocation(error.to_string()))?;
         if invocation.kind != InstrumentKind::Build
             || invocation.instrument.to_string() != RUSTC_INSTRUMENT
         {
@@ -153,10 +167,13 @@ impl<E: ProcessExecutor + 'static> RustcAdapter<E> {
         if !command.matches_request(&request) {
             return Err(RustcError::CommandMismatch);
         }
-        let receipt = self.executor.start(request.clone(), sink).await?;
-        if receipt.operation_id() != request.operation_id()
-            || receipt.request_digest() != request.invocation_digest()
-            || receipt.accepted_generation() != request.generation()
+        let operation_id = request.operation_id().clone();
+        let request_digest = request.invocation_digest().to_owned();
+        let generation = request.generation().get();
+        let receipt = self.executor.start(request, sink).await?;
+        if receipt.operation_id() != &operation_id
+            || receipt.request_digest() != request_digest
+            || receipt.accepted_generation().get() != generation
         {
             return Err(RustcError::ReceiptMismatch);
         }

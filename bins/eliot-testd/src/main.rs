@@ -1,16 +1,19 @@
 use std::io::{self, BufRead, Write};
+use std::path::PathBuf;
+use std::sync::Arc;
 
 use eliot_testd::{
-    TestReceipt, TestRequest, TestdComposition, TestdError, PROTOCOL_VERSION, SERVICE_NAME,
+    PROTOCOL_VERSION, SERVICE_NAME, TestReceipt, TestdComposition, TestdJobRequest,
+    UnavailableProcessIssuer,
 };
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
 enum Request {
-    Submit { request: TestRequest },
-    Status { request_id: String },
-    Cancel { request_id: String },
+    Submit { request: TestdJobRequest },
+    Status { job_id: String },
+    Cancel { job_id: String },
 }
 
 #[derive(Debug, Serialize)]
@@ -29,9 +32,22 @@ enum Response {
 }
 
 fn main() {
-    let stdin = io::stdin();
+    let state_path = std::env::var_os("ELIOT_TESTD_STATE")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(".eliot-testd.redb"));
     let mut output = io::BufWriter::new(io::stdout().lock());
-    let mut daemon = TestdComposition::default();
+    let daemon = match TestdComposition::open(state_path, Arc::new(UnavailableProcessIssuer)) {
+        Ok(daemon) => daemon,
+        Err(error) => {
+            let _ = write_response(
+                &mut output,
+                Response::Error {
+                    error: error.to_string(),
+                },
+            );
+            return;
+        }
+    };
     if !write_response(
         &mut output,
         Response::Ready {
@@ -41,10 +57,10 @@ fn main() {
     ) {
         return;
     }
-    for line in stdin.lock().lines() {
+    for line in io::stdin().lock().lines() {
         let response = match line {
             Ok(line) if line.trim().is_empty() => continue,
-            Ok(line) => dispatch(&mut daemon, &line),
+            Ok(line) => dispatch(&daemon, &line),
             Err(error) => Response::Error {
                 error: format!("input: {error}"),
             },
@@ -55,24 +71,25 @@ fn main() {
     }
 }
 
-fn dispatch(daemon: &mut TestdComposition, line: &str) -> Response {
+fn dispatch(daemon: &TestdComposition, line: &str) -> Response {
     let request = match serde_json::from_str::<Request>(line) {
         Ok(request) => request,
         Err(error) => {
             return Response::Error {
                 error: format!("request: {error}"),
-            }
+            };
         }
     };
     let result = match request {
         Request::Submit { request } => daemon.submit(request),
-        Request::Status { request_id } => daemon.status(&request_id),
-        Request::Cancel { request_id } => daemon.cancel(&request_id),
+        Request::Status { job_id } => daemon.status(&job_id),
+        Request::Cancel { job_id } => daemon.cancel(&job_id),
     };
     result
         .map(|receipt| Response::Receipt { receipt })
-        .map_err(|error: TestdError| error.to_string())
-        .unwrap_or_else(|error| Response::Error { error })
+        .unwrap_or_else(|error| Response::Error {
+            error: error.to_string(),
+        })
 }
 
 fn write_response(output: &mut impl Write, response: Response) -> bool {
