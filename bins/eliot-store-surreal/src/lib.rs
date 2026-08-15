@@ -283,7 +283,7 @@ pub fn load_config(path: Option<&Path>) -> Result<StoreLaunchConfig, String> {
             Ok(config)
         }
         Some("toml") => {
-            let config =
+            let config: StoreLaunchConfig =
                 toml::from_slice(&bytes).map_err(|error| format!("parse TOML config: {error}"))?;
             config.validate()?;
             Ok(config)
