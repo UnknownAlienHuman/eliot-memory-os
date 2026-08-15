@@ -1,0 +1,18 @@
+[package]
+name = "eliot-test-selection"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Impact-based test selection planning over the ELIOT source graph"
+
+[dependencies]
+eliot-contracts.workspace = true
+eliot-graph-api.workspace = true
+eliot-instrument-api.workspace = true
+schemars.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true
