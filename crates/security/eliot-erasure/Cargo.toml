@@ -1,0 +1,19 @@
+[package]
+name = "eliot-erasure"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Governed privacy erasure orchestration for ELIOT"
+
+[dependencies]
+eliot-contracts = { workspace = true }
+eliot-evidence = { workspace = true }
+eliot-security-contracts = { workspace = true }
+eliot-store-api = { workspace = true }
+schemars.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true
