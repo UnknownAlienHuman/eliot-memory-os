@@ -642,6 +642,9 @@ impl RedbHostStateStore {
             .validate()
             .map_err(|_| HostStateError::InvalidRecord)?;
         process_recovery.validate()?;
+        if !process_recovery.binds_to(&transition.installation, &transition.process) {
+            return Err(HostStateError::InvalidRecord);
+        }
         let receipt = HostActivationReceipt {
             request_id: transition.context.request_id.clone(),
             installation: transition.installation.clone(),

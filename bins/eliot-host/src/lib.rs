@@ -716,6 +716,7 @@ pub struct HostComposition {
     jobs: HostJobBranches,
     owner_lease: HostOwnerLease,
     pending_release: Option<RedbHostReleaseToken>,
+    durable_finalized: bool,
     owner_released: bool,
     shutdown_failed: bool,
 }
@@ -775,6 +776,7 @@ impl HostComposition {
             jobs,
             owner_lease,
             pending_release: None,
+            durable_finalized: false,
             owner_released: false,
             shutdown_failed: false,
         };
@@ -818,10 +820,14 @@ impl HostComposition {
         state_store
             .finalize_recovery_clear(&token)
             .map_err(HostError::State)?;
-        owner_lease.release().map_err(owner_lease_release_error)?;
+        // Keep the installation owner mutex through both durable recovery
+        // mutations. Releasing first would allow a second Host to observe
+        // the intermediate RecoveryFinalized projection and race the final
+        // clean transition.
         state_store
             .finalize_clean_shutdown(token)
-            .map_err(HostError::State)
+            .map_err(HostError::State)?;
+        owner_lease.release().map_err(owner_lease_release_error)
     }
 
     /// Returns the Host epoch bound to this process.
@@ -1227,10 +1233,25 @@ impl HostComposition {
                 .prepare_release_pending(marker)
                 .map_err(HostError::State)?;
             self.pending_release = Some(token);
+            self.durable_finalized = false;
         }
         let token = self.pending_release.take().ok_or_else(|| {
             HostError::OwnerLeaseRecovery("release token is unavailable".to_owned())
         })?;
+        if !self.durable_finalized {
+            if let Err(error) = self
+                .state_store
+                .finalize_clean_shutdown(token.clone())
+                .map_err(HostError::State)
+            {
+                // ReleasePending remains durable and ownership is retained;
+                // a retry must complete this mutation before release.
+                self.pending_release = Some(token);
+                self.shutdown_failed = true;
+                return Err(error);
+            }
+            self.durable_finalized = true;
+        }
         if !self.owner_released {
             if let Err(error) = self
                 .owner_lease
@@ -1242,18 +1263,6 @@ impl HostComposition {
                 return Err(error);
             }
             self.owner_released = true;
-        }
-        if let Err(error) = self
-            .state_store
-            .finalize_clean_shutdown(token.clone())
-            .map_err(HostError::State)
-        {
-            // The durable ReleasePending disposition remains in place and
-            // the owner handle/ownership is retained by the platform adapter
-            // for a bounded retry. Drop must not turn this into Clean.
-            self.pending_release = Some(token);
-            self.shutdown_failed = true;
-            return Err(error);
         }
         self.running = false;
         self.shutdown_failed = false;

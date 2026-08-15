@@ -397,6 +397,31 @@ impl ServiceProcessRecord {
     pub fn validate(&self) -> Result<(), RuntimeContractError> {
         text(&self.process_id, "process_id")?;
         text(&self.owner, "owner")?;
+        AuthorityEpoch::new(self.authority_epoch.value()).map_err(|_| {
+            RuntimeContractError::InvalidField {
+                field: "authority_epoch",
+                reason: "must be non-zero",
+            }
+        })?;
+        let fully_healthy = self.health.is_fully_healthy();
+        if matches!(self.state, ServiceProcessState::Ready) && !fully_healthy {
+            return Err(RuntimeContractError::InvalidField {
+                field: "health",
+                reason: "READY process must be fully healthy",
+            });
+        }
+        if matches!(self.state, ServiceProcessState::Degraded) && fully_healthy {
+            return Err(RuntimeContractError::InvalidField {
+                field: "health",
+                reason: "DEGRADED process must expose a non-healthy dimension",
+            });
+        }
+        if self.state.is_terminal() && fully_healthy {
+            return Err(RuntimeContractError::InvalidField {
+                field: "health",
+                reason: "terminal process must not claim full health",
+            });
+        }
         Ok(())
     }
 }
@@ -964,6 +989,39 @@ mod tests {
         let mut health = HealthVector::healthy();
         health.freshness = HealthDimension::Unknown;
         assert!(!health.is_fully_healthy());
+    }
+
+    #[test]
+    fn service_process_rejects_ready_with_degraded_health() {
+        let mut health = HealthVector::healthy();
+        health.integrity = HealthDimension::Degraded;
+        let record = ServiceProcessRecord {
+            process_id: "123:456".to_owned(),
+            owner: "Kernel".to_owned(),
+            state: ServiceProcessState::Ready,
+            health,
+            authority_epoch: AuthorityEpoch::genesis(),
+        };
+        assert!(record.validate().is_err());
+    }
+
+    #[test]
+    fn service_process_rejects_malformed_authority_epoch_fixture() {
+        let malformed = serde_json::json!({
+            "process_id": "123:456",
+            "owner": "Kernel",
+            "state": "READY",
+            "health": {
+                "liveness": "HEALTHY",
+                "readiness": "HEALTHY",
+                "freshness": "HEALTHY",
+                "compatibility": "HEALTHY",
+                "integrity": "HEALTHY",
+                "capacity": "HEALTHY"
+            },
+            "authority_epoch": 0
+        });
+        assert!(serde_json::from_value::<ServiceProcessRecord>(malformed).is_err());
     }
 
     #[test]

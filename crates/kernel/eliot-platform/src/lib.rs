@@ -848,12 +848,12 @@ impl HostInstallationState {
         }
         self.disposition.validate()?;
         match (&self.active_process, &self.active_process_recovery) {
-            (Some(_), Some(recovery)) => recovery.validate()?,
-            // Activation is committed before the platform-specific process
-            // identity is attached. If the process dies in that narrow
-            // window, admission remains recovery-required because the
-            // projection is deliberately incomplete rather than guessed.
-            (Some(_), None) => {}
+            (Some(process), Some(recovery)) => {
+                recovery.validate()?;
+                if !recovery.binds_to(&self.installation, process) {
+                    return Err(HostStateError::InvalidRecord);
+                }
+            }
             (None, None) => {}
             _ => return Err(HostStateError::InvalidRecord),
         }
@@ -1210,6 +1210,9 @@ impl HostStateStore for FakeHostStateStore {
     ) -> Result<HostActivationReceipt, HostStateError> {
         transition.validate()?;
         process_recovery.validate()?;
+        if !process_recovery.binds_to(&transition.installation, &transition.process) {
+            return Err(HostStateError::InvalidRecord);
+        }
         let mut state = self
             .state
             .lock()
@@ -1802,6 +1805,35 @@ mod tests {
                 branch: HostBranchKind::Kernel,
                 ..
             })
+        ));
+    }
+
+    #[test]
+    fn installation_state_rejects_substituted_recovery_process() {
+        let installation = handle("installation-substituted-binding");
+        let active = process("101:1", "Host", ServiceProcessState::Ready);
+        let substituted = process("202:2", "Host", ServiceProcessState::Ready);
+        let recovery = HostProcessRecoveryBinding {
+            installation: installation.clone(),
+            observed_process: substituted,
+            process_generation: handle("generation-substituted-binding"),
+            process_id: 202,
+            image_path: handle("host-image"),
+            job: HostJobDisposition::NotAssigned,
+        };
+        let state = HostInstallationState {
+            installation,
+            active_process: Some(active),
+            managed_dependencies: Vec::new(),
+            last_clean_shutdown: None,
+            disposition: HostShutdownDisposition::Clean,
+            active_process_recovery: Some(recovery),
+            last_recovery_evidence: None,
+            recovery_fence: None,
+        };
+        assert!(matches!(
+            state.validate(),
+            Err(HostStateError::InvalidRecord)
         ));
     }
 

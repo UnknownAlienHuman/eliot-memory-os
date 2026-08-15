@@ -184,6 +184,7 @@ where
     state: HostServiceState,
     failure: Option<HostFailure>,
     pending_release: Option<S::ReleaseToken>,
+    durable_finalized: bool,
     owner_lease: HostOwnerLease,
     owner_released: bool,
     admission_closed: bool,
@@ -230,6 +231,7 @@ where
             state,
             failure: None,
             pending_release: None,
+            durable_finalized: false,
             owner_lease,
             owner_released: false,
             admission_closed: snapshot.active_process.is_some()
@@ -586,6 +588,7 @@ where
             }
         };
         self.pending_release = Some(token);
+        self.durable_finalized = false;
         // The platform process is stopped, but the owner-release proof has not
         // completed yet. Keep Host in recovery until the caller proves release
         // and invokes `finalize_clean_shutdown`.
@@ -615,6 +618,15 @@ where
                 "owner capability is bound to another installation".to_owned(),
             ));
         }
+        if !self.durable_finalized {
+            if let Err(error) = self.state_store.finalize_clean_shutdown(token.clone()) {
+                self.pending_release = Some(token);
+                self.fail(HostFailure::StateStore(error.to_string()));
+                self.admission_closed = true;
+                return Err(HostServiceError::StateStore(error));
+            }
+            self.durable_finalized = true;
+        }
         if !self.owner_released {
             if let Err(error) = self.owner_lease.release() {
                 self.pending_release = Some(token);
@@ -624,12 +636,6 @@ where
                 return Err(error);
             }
             self.owner_released = true;
-        }
-        if let Err(error) = self.state_store.finalize_clean_shutdown(token.clone()) {
-            self.pending_release = Some(token);
-            self.fail(HostFailure::StateStore(error.to_string()));
-            self.admission_closed = true;
-            return Err(HostServiceError::StateStore(error));
         }
         self.state = HostServiceState::StoppedClean;
         self.failure = None;
