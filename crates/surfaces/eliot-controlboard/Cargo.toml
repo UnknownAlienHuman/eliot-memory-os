@@ -1,0 +1,27 @@
+[package]
+name = "eliot-controlboard"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.89"
+license = "MIT"
+description = "Provider-neutral role-filtered ELIOT ControlBoard contract"
+
+[package.metadata.eliot]
+work_id = "A-08"
+functional_cell = "controlboard"
+lifecycle_owner = "A-08"
+source_layer = "C3"
+proof_entrypoint = "cargo test --manifest-path crates/surfaces/eliot-controlboard/Cargo.toml"
+
+[workspace]
+
+[dependencies]
+eliot-evaluation-contracts = { path = "../../foundation/eliot-evaluation-contracts", version = "0.1.0" }
+eliot-evidence = { path = "../../foundation/eliot-evidence", version = "0.1.0" }
+eliot-observation-contracts = { path = "../../foundation/eliot-observation-contracts", version = "0.1.0" }
+eliot-receipts = { path = "../../foundation/eliot-receipts", version = "0.1.0" }
+eliot-security-contracts = { path = "../../foundation/eliot-security-contracts", version = "0.1.0" }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.150"
+sha2 = "0.10.7"
+thiserror = "2.0.18"
