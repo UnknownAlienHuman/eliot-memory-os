@@ -131,6 +131,117 @@ impl ProcessAdmission {
     }
 }
 
+/// Neutral request delivered to the injected Kernel/Governor admission port.
+///
+/// This is an inert description only. It contains no contour authority and
+/// cannot be used to construct a process permit without the core sealing
+/// boundary below.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct KernelProcessAdmissionRequest {
+    pub job_id: String,
+    pub project_id: String,
+    pub invocation: InstrumentInvocation,
+    pub source_root: String,
+    pub target_root: String,
+    pub cache_root: String,
+}
+
+impl KernelProcessAdmissionRequest {
+    fn validate(&self) -> Result<(), TestdError> {
+        validate_text(&self.job_id, "job_id")?;
+        validate_text(&self.project_id, "project_id")?;
+        for (field, value) in [
+            ("source_root", self.source_root.as_str()),
+            ("target_root", self.target_root.as_str()),
+            ("cache_root", self.cache_root.as_str()),
+        ] {
+            validate_text(value, field)?;
+        }
+        self.invocation
+            .validate()
+            .map_err(|error| TestdError::Contract(error.to_string()))
+    }
+}
+
+/// Evidence returned by the Kernel/Governor admission provider.
+///
+/// The consuming [`ProcessRequest`] is already authenticated by Kernel. The
+/// contour and grant identity remain inert provider evidence until this crate
+/// privately seals them into [`ProcessAdmissionPermit`].
+#[derive(Debug)]
+pub struct KernelProcessAdmissionEvidence {
+    pub process: ProcessRequest,
+    pub contour_root: String,
+    pub grant_id: String,
+}
+
+/// Public neutral seam for the external Kernel/Governor admission owner.
+///
+/// Implementations return the already-issued one-shot process request and
+/// issuer-selected contour evidence. They never construct a Testd grant or
+/// permit; [`issue_process_admission`] performs that private sealing step.
+pub trait KernelProcessAdmissionProvider: Send + Sync {
+    fn admit(
+        &self,
+        request: &KernelProcessAdmissionRequest,
+    ) -> Result<KernelProcessAdmissionEvidence, TestdError>;
+}
+
+/// Seals one provider response into a consuming, non-serializable permit.
+pub fn issue_process_admission(
+    provider: &dyn KernelProcessAdmissionProvider,
+    request: &KernelProcessAdmissionRequest,
+) -> Result<ProcessAdmissionPermit, TestdError> {
+    request.validate()?;
+    let evidence = provider.admit(request)?;
+    evidence
+        .process
+        .validate()
+        .map_err(|error| TestdError::Contract(error.to_string()))?;
+    if evidence.process.job_id().as_str() != request.job_id
+        || evidence.process.operation_id().as_str()
+            != request.invocation.request.request_id.as_str()
+        || evidence.process.working_directory() != request.source_root
+        || evidence
+            .process
+            .environment()
+            .non_secret()
+            .get("CARGO_TARGET_DIR")
+            != Some(&request.target_root)
+        || evidence
+            .process
+            .environment()
+            .non_secret()
+            .get("CARGO_HOME")
+            != Some(&request.cache_root)
+        || evidence.process.fence().authority_epoch()
+            != request
+                .invocation
+                .request
+                .state_fence
+                .authority_epoch
+                .value()
+        || evidence.process.generation().get()
+            != request
+                .invocation
+                .request
+                .state_fence
+                .resource_generation
+                .value()
+    {
+        return Err(TestdError::InvalidBinding);
+    }
+    let grant = ExecutionContourGrant::issue(
+        evidence.contour_root,
+        request.job_id.clone(),
+        request.invocation.request.request_id.as_str().to_owned(),
+        &evidence.process,
+        evidence.grant_id,
+    )?;
+    ProcessAdmissionPermit::issued(evidence.process, grant)
+}
+
 /// Governor/Kernel-issued external execution contour grant.
 ///
 /// Fields are private and the grant is neither deserializable nor cloneable.

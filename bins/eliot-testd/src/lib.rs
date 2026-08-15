@@ -17,8 +17,9 @@ use eliot_process::{
 };
 use eliot_process_executor::{DispatchValidationPort, WindowsProcessExecutor};
 use eliot_testd_core::{
+    KernelProcessAdmissionEvidence, KernelProcessAdmissionProvider, KernelProcessAdmissionRequest,
     Lease, ProcessAdmissionPermit, TargetRoots, TestJob, TestdError, TestdStore,
-    validate_running_lease,
+    issue_process_admission, validate_running_lease,
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -303,25 +304,18 @@ pub struct TestReceipt {
     pub state: String,
 }
 
-/// Supplies a fresh consuming process request for each physical attempt.
-pub trait ProcessRequestIssuer: Send + Sync {
-    fn issue(
-        &self,
-        invocation: &InstrumentInvocation,
-        target: &TargetContract,
-    ) -> Result<ProcessAdmissionPermit, TestdError>;
-}
+/// Compatibility export for callers migrating to the neutral core seam.
+pub use eliot_testd_core::KernelProcessAdmissionProvider as ProcessRequestIssuer;
 
 /// Explicit failure issuer used by the standalone line protocol until Kernel
 /// binds a live authority.  It prevents testd from minting local permits.
 pub struct UnavailableProcessIssuer;
 
-impl ProcessRequestIssuer for UnavailableProcessIssuer {
-    fn issue(
+impl KernelProcessAdmissionProvider for UnavailableProcessIssuer {
+    fn admit(
         &self,
-        _invocation: &InstrumentInvocation,
-        _target: &TargetContract,
-    ) -> Result<ProcessAdmissionPermit, TestdError> {
+        _request: &KernelProcessAdmissionRequest,
+    ) -> Result<KernelProcessAdmissionEvidence, TestdError> {
         Err(TestdError::Contract(
             "Kernel-issued ProcessRequest is required".to_owned(),
         ))
@@ -331,18 +325,18 @@ impl ProcessRequestIssuer for UnavailableProcessIssuer {
 /// Composition root over the durable TestdJob store.
 pub struct TestdComposition {
     store: TestdStore,
-    issuer: Arc<dyn ProcessRequestIssuer>,
+    provider: Arc<dyn KernelProcessAdmissionProvider>,
 }
 
 impl TestdComposition {
     /// Opens the local execution-plane state and binds a request issuer.
     pub fn open(
         path: impl AsRef<std::path::Path>,
-        issuer: Arc<dyn ProcessRequestIssuer>,
+        provider: Arc<dyn KernelProcessAdmissionProvider>,
     ) -> Result<Self, TestdError> {
         Ok(Self {
             store: TestdStore::open(path, Default::default())?,
-            issuer,
+            provider,
         })
     }
 
@@ -358,9 +352,15 @@ impl TestdComposition {
                 reason: "profile argument limit exceeded",
             });
         }
-        let permit = self
-            .issuer
-            .issue(&request.invocation, &request.target_contract)?;
+        let admission_request = KernelProcessAdmissionRequest {
+            job_id: request.job_id.clone(),
+            project_id: request.project_id.clone(),
+            invocation: request.invocation.clone(),
+            source_root: request.target_contract.target.clone(),
+            target_root: request.target_contract.build_root.clone(),
+            cache_root: request.target_contract.cache_root.clone(),
+        };
+        let permit = issue_process_admission(self.provider.as_ref(), &admission_request)?;
         let roots = request
             .target_contract
             .validated_roots(permit.grant().contour_root())?;
@@ -507,6 +507,14 @@ pub enum ProtocolError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use eliot_process::{
+        ActionLeaseRef, DispatchAuthorityId, DispatchPermitAuthority, EnvironmentInheritance,
+        EnvironmentProjection, FencingToken, Generation, ImageId, JobId, KernelDispatchKey,
+        OperationId, PermitIssuance, ProcessIntent, ProcessRequest, ProcessTreeId, ResourceLimits,
+        SessionId,
+    };
+    use std::collections::BTreeMap;
+    use std::sync::Mutex;
 
     fn test_root(label: &str) -> PathBuf {
         let nonce = std::time::SystemTime::now()
@@ -516,6 +524,151 @@ mod tests {
             "eliot-testd-{label}-{}-{nonce}",
             std::process::id()
         ))
+    }
+
+    struct ExternalKernelProvider {
+        process: Mutex<Option<ProcessRequest>>,
+        contour_root: String,
+    }
+
+    impl KernelProcessAdmissionProvider for ExternalKernelProvider {
+        fn admit(
+            &self,
+            _request: &KernelProcessAdmissionRequest,
+        ) -> Result<KernelProcessAdmissionEvidence, TestdError> {
+            let process = self
+                .process
+                .lock()
+                .map_err(|_| TestdError::Contract("provider lock failed".to_owned()))?
+                .take()
+                .ok_or_else(|| TestdError::Contract("process was already consumed".to_owned()))?;
+            Ok(KernelProcessAdmissionEvidence {
+                process,
+                contour_root: self.contour_root.clone(),
+                grant_id: "grant-external-1".to_owned(),
+            })
+        }
+    }
+
+    fn external_process_request(source: &str, target: &str, cache: &str) -> ProcessRequest {
+        let generation = Generation::new(1).unwrap();
+        let intent = ProcessIntent::new(
+            OperationId::new("operation-1").unwrap(),
+            ProcessTreeId::new("tree-1").unwrap(),
+            JobId::new("job-1").unwrap(),
+            ImageId::new("image-1").unwrap(),
+            SessionId::new("session-1").unwrap(),
+            generation,
+            "C:\\tools\\worker.exe",
+            "c".repeat(64),
+            vec!["--check".to_owned()],
+            source,
+            EnvironmentProjection::new(
+                BTreeMap::from([
+                    ("CARGO_TARGET_DIR".to_owned(), target.to_owned()),
+                    ("CARGO_HOME".to_owned(), cache.to_owned()),
+                ]),
+                Vec::new(),
+                EnvironmentInheritance::None,
+            )
+            .unwrap(),
+            ResourceLimits::new(10_000, Some(5_000), Some(1_048_576), 4096, 4096, 4).unwrap(),
+        )
+        .unwrap();
+        let mut authority = DispatchPermitAuthority::activate(
+            DispatchAuthorityId::new("authority-1").unwrap(),
+            KernelDispatchKey::from_secret_bytes([0x5a; 32]).unwrap(),
+        );
+        let permit = authority
+            .issue(
+                &intent,
+                PermitIssuance::new(
+                    ActionLeaseRef::new("lease-1").unwrap(),
+                    FencingToken::new(7, generation, "fence-1").unwrap(),
+                    BTreeMap::from([
+                        ("authority".to_owned(), "a".repeat(64)),
+                        ("state".to_owned(), "b".repeat(64)),
+                    ]),
+                    1,
+                    2,
+                    "nonce-1",
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        ProcessRequest::new(intent, permit).unwrap()
+    }
+
+    fn external_invocation() -> InstrumentInvocation {
+        serde_json::from_value(serde_json::json!({
+            "request": {
+                "request_id": "operation-1",
+                "session_id": null,
+                "task_id": null,
+                "product_id": "product-1",
+                "source_id": "source-1",
+                "state_fence": {
+                    "authority_epoch": 7,
+                    "resource_generation": 1,
+                    "task_revision": null,
+                    "policy_revision": null,
+                    "integration_revision": null
+                },
+                "clock": {
+                    "valid_time_ms": 1,
+                    "known_time_ms": 1,
+                    "transaction_sequence": null,
+                    "monotonic_ns": 1
+                }
+            },
+            "instrument": "eliot.instrument.test",
+            "kind": "TEST",
+            "profile": "cargo-test",
+            "target": "C:\\source",
+            "arguments": [],
+            "input_artifacts": [],
+            "declared_scope": "workspace",
+            "requested_at": {
+                "valid_time_ms": 1,
+                "known_time_ms": 1,
+                "transaction_sequence": null,
+                "monotonic_ns": 1
+            }
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn external_kernel_provider_seals_bound_permit_without_caller_contour() {
+        let source = "C:\\source";
+        let target = "C:\\contour\\build";
+        let contour = "C:\\contour";
+        let provider = ExternalKernelProvider {
+            process: Mutex::new(Some(external_process_request(source, target, target))),
+            contour_root: contour.to_owned(),
+        };
+        let invocation = external_invocation();
+        let request = KernelProcessAdmissionRequest {
+            job_id: "job-1".to_owned(),
+            project_id: "project-1".to_owned(),
+            invocation,
+            source_root: source.to_owned(),
+            target_root: target.to_owned(),
+            cache_root: target.to_owned(),
+        };
+        let permit = issue_process_admission(&provider, &request).unwrap();
+        assert_eq!(permit.grant().contour_root(), contour);
+        let (process, grant) = permit.into_parts();
+        assert_eq!(process.job_id().as_str(), "job-1");
+        assert_eq!(grant.contour_root(), contour);
+
+        let forged = serde_json::json!({
+            "target": source,
+            "build_root": target,
+            "cache_root": target,
+            "allowed_contour_root": "C:\\caller-widened"
+        });
+        assert!(serde_json::from_value::<TargetContract>(forged).is_err());
     }
 
     #[test]
