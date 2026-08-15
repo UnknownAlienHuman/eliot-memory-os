@@ -451,7 +451,7 @@ impl Governor {
                     )
                 })
             });
-        if let Some(service) = failed_required {
+        if let Some(service) = any_required_failed {
             self.state = GovernorState::Failed;
             return Err(GovernorError::RequiredServiceUnavailable(service));
         }

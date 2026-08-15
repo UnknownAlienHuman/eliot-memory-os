@@ -2,7 +2,7 @@
 # Pinned rather than tracking stable: the workspace uses recent language
 # features, and a toolchain that moves underneath the build is a difference
 # nobody recorded. Raise this deliberately, not because a newer one exists.
-channel = "1.96.1"
+channel = "1.97.1"
 profile = "default"
 components = ["clippy", "rustfmt", "rust-analyzer", "rust-src"]
 targets = ["x86_64-pc-windows-msvc"]

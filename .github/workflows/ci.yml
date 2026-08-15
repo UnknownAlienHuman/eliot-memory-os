@@ -11,6 +11,7 @@ on:
     branches: [main]
 
 env:
+  CARGO_TARGET_DIR: ${{ runner.temp }}/eliot-target
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
 
@@ -36,7 +37,6 @@ jobs:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            target
           key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
 
       - name: Metadata
@@ -48,7 +48,7 @@ jobs:
       - name: Workspace check
         run: cargo check --workspace --all-targets
 
-      - name: Provision pinned SurrealDB 3.1.4
+      - name: Provision pinned SurrealDB 3.2.3
         shell: pwsh
         env:
           GITHUB_TOKEN: ${{ github.token }}
@@ -62,17 +62,17 @@ jobs:
           }
           $release = Invoke-RestMethod `
             -Headers $headers `
-            -Uri "https://api.github.com/repos/surrealdb/surrealdb/releases/tags/v3.1.4"
+            -Uri "https://api.github.com/repos/surrealdb/surrealdb/releases/tags/v3.2.3"
           $assets = @(
             $release.assets |
-              Where-Object { $_.name -eq "surreal-v3.1.4.windows-amd64.exe" }
+              Where-Object { $_.name -eq "surreal-v3.2.3.windows-amd64.exe" }
           )
           if ($assets.Count -ne 1) {
-            throw "Expected one pinned SurrealDB 3.1.4 Windows asset; found $($assets.Count)"
+            throw "Expected one pinned SurrealDB 3.2.3 Windows asset; found $($assets.Count)"
           }
           $surreal = Join-Path `
             $env:RUNNER_TEMP `
-            "surreal-v3.1.4.windows-amd64.exe"
+            "surreal-v3.2.3.windows-amd64.exe"
           Invoke-WebRequest `
             -Headers @{ "User-Agent" = "eliot-memory-os-ci" } `
             -Uri $assets[0].browser_download_url `
@@ -81,8 +81,8 @@ jobs:
             throw "Pinned SurrealDB executable was not downloaded"
           }
           $version = (& $surreal version | Out-String).Trim()
-          if ($LASTEXITCODE -ne 0 -or $version -notmatch "^3\.1\.4\b") {
-            throw "Expected SurrealDB 3.1.4, got '$version'"
+          if ($LASTEXITCODE -ne 0 -or $version -notmatch "^3\.2\.3\b") {
+            throw "Expected SurrealDB 3.2.3, got '$version'"
           }
           Add-Content `
             -LiteralPath $env:GITHUB_ENV `
@@ -98,8 +98,8 @@ jobs:
             throw "ELIOT_SURREAL_EXE is missing"
           }
           $version = (& $env:ELIOT_SURREAL_EXE version | Out-String).Trim()
-          if ($LASTEXITCODE -ne 0 -or $version -notmatch "^3\.1\.4\b") {
-            throw "Expected SurrealDB 3.1.4 before tests, got '$version'"
+          if ($LASTEXITCODE -ne 0 -or $version -notmatch "^3\.2\.3\b") {
+            throw "Expected SurrealDB 3.2.3 before tests, got '$version'"
           }
           cargo test --workspace
           if ($LASTEXITCODE -ne 0) {

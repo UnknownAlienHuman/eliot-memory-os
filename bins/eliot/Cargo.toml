@@ -1,23 +1,19 @@
 [package]
-name = "eliot-governor"
+name = "eliot"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-description = "ELIOT production Governor command-line entrypoint"
+description = "ELIOT canonical one-shot command-line client"
 
 [[bin]]
-name = "eliot-governor"
+name = "eliot"
 path = "src/main.rs"
 
 [dependencies]
 anyhow.workspace = true
 clap.workspace = true
 eliot-cli.workspace = true
-eliot-engine.workspace = true
-eliot-types.workspace = true
-serde_json.workspace = true
-tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 

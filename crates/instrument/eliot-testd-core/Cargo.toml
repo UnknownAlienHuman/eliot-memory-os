@@ -6,8 +6,6 @@ rust-version = "1.89"
 license = "MIT"
 description = "Persistent scheduling and state core for the ELIOT instrument test daemon"
 
-[workspace]
-
 [dependencies]
 blake3 = "1.8.5"
 eliot-instrument-api = { path = "../eliot-instrument-api" }

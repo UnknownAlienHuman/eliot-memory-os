@@ -124,6 +124,14 @@ members = [
   "workspace/tools/eliot-runtime-compiler",
   "workspace/tools/eliot-campaign-executor",
 ]
+default-members = [
+  "bins/eliot",
+  "bins/eliot-host",
+  "bins/eliot-kernel",
+  "bins/eliot-store-surreal",
+  "bins/eliot-watchdog",
+  "bins/eliotd",
+]
 resolver = "3"
 
 [workspace.package]

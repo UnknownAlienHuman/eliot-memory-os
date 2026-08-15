@@ -10,5 +10,3 @@ description = "Provider-neutral rustfmt instrumentation adapter"
 eliot-instrument-api = { path = "../eliot-instrument-api" }
 eliot-process = { path = "../../kernel/eliot-process" }
 thiserror = "2.0.18"
-
-[workspace]
