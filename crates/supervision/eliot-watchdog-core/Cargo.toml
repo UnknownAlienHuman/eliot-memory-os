@@ -8,5 +8,8 @@ license = "MIT"
 [lib]
 path = "src/lib.rs"
 
+[dependencies]
+eliot-runtime-contracts.workspace = true
+
 [lints.rust]
 unsafe_code = "forbid"

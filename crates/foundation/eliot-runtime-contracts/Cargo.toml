@@ -14,6 +14,7 @@ source_layer = "C0"
 proof_entrypoint = "cargo test -p eliot-runtime-contracts"
 
 [dependencies]
+ed25519-dalek.workspace = true
 eliot-contracts.workspace = true
 schemars.workspace = true
 serde.workspace = true

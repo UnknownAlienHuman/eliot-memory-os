@@ -9,6 +9,8 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+pub use eliot_runtime_contracts::{LeaseState, SupervisionLease};
+
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct Epoch(pub u64);
 
@@ -54,48 +56,6 @@ pub enum CircuitState {
     Closed,
     Open,
     HalfOpen,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum LeaseState {
-    Requested,
-    Active,
-    Expiring,
-    Released,
-    Expired,
-    Revoked,
-    Closed,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct SupervisionLease {
-    pub lease_id: String,
-    pub scope_ref: String,
-    pub kernel_epoch: Epoch,
-    pub watchdog_epoch: Epoch,
-    pub state: LeaseState,
-}
-
-impl SupervisionLease {
-    pub fn validate(&self, current_watchdog_epoch: Epoch) -> Result<(), WatchdogError> {
-        if self.lease_id.is_empty() || self.scope_ref.is_empty() {
-            return Err(WatchdogError::InvalidObservation(
-                "empty supervision lease identity",
-            ));
-        }
-        if self.watchdog_epoch != current_watchdog_epoch {
-            return Err(WatchdogError::StaleGeneration {
-                expected: current_watchdog_epoch.0,
-                observed: self.watchdog_epoch.0,
-            });
-        }
-        if self.state != LeaseState::Active {
-            return Err(WatchdogError::InvalidObservation(
-                "supervision lease is not active",
-            ));
-        }
-        Ok(())
-    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

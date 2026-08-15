@@ -16,6 +16,19 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+mod supervision_lease;
+
+pub use supervision_lease::{
+    Ed25519SupervisionLeaseSigner, RegisteredActivityWakePolicy, SUPERVISION_LEASE_CONTRACT_NAME,
+    SUPERVISION_LEASE_CONTRACT_VERSION, SUPERVISION_LEASE_PUBLIC_KEY_BYTES,
+    SUPERVISION_LEASE_SCHEMA, SUPERVISION_LEASE_SIGNATURE_ALGORITHM,
+    SUPERVISION_LEASE_SIGNATURE_BYTES, SignedSupervisionLease, SupervisionGenerationBinding,
+    SupervisionLease, SupervisionLeaseError, SupervisionLeaseSigner,
+    SupervisionLeaseTerminalDisposition, SupervisionLeaseVerificationContext,
+    SupervisionLeaseVerifier, SupervisionObservationScope, SupervisionTrustAnchor,
+    VerifiedSupervisionLease,
+};
+
 /// Stable wire name for this contract family.
 pub const CONTRACT_NAME: &str = "eliot.foundation.runtime-contracts";
 /// Current wire revision for this contract family.
@@ -756,30 +769,6 @@ impl RuntimeLease {
         text(&self.lease_id, "lease_id")?;
         text(&self.scope_ref, "scope_ref")?;
         self.state_fence.validate()?;
-        Ok(())
-    }
-}
-
-/// Independent supervision coverage lease.
-#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct SupervisionLease {
-    /// Stable lease identity.
-    pub lease_id: String,
-    /// Opaque observation scope.
-    pub scope_ref: String,
-    /// Watchdog and Kernel epochs that issued the lease.
-    pub kernel_epoch: AuthorityEpoch,
-    pub watchdog_epoch: AuthorityEpoch,
-    /// Current lifecycle state.
-    pub state: LeaseState,
-}
-
-impl SupervisionLease {
-    /// Validates identity and epoch binding.
-    pub fn validate(&self) -> Result<(), RuntimeContractError> {
-        text(&self.lease_id, "lease_id")?;
-        text(&self.scope_ref, "scope_ref")?;
         Ok(())
     }
 }
