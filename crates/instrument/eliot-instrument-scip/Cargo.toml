@@ -1,0 +1,16 @@
+[package]
+name = "eliot-instrument-scip"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Bounded SCIP index decoder and graph projection adapter"
+
+[dependencies]
+eliot-contracts.workspace = true
+eliot-graph-api.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true
