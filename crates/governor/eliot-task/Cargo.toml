@@ -1,0 +1,16 @@
+[package]
+name = "eliot-task"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Deterministic, fenced owner of the governed task lifecycle"
+
+[dependencies]
+eliot-contracts.workspace = true
+schemars.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true
