@@ -399,7 +399,7 @@ pub mod kernel_client {
         config: KernelClientConfig,
         request_identity: Option<RequestIdentity>,
         #[cfg(windows)]
-        config_lease: Option<ProtectedPathLease>,
+        config_lease: ProtectedPathLease,
     }
 
     impl KernelClient {
@@ -430,20 +430,9 @@ pub mod kernel_client {
                 Ok(Self {
                     config,
                     request_identity: None,
-                    config_lease: Some(lease),
+                    config_lease: lease,
                 })
             }
-        }
-
-        /// Creates a client from an already loaded installation declaration.
-        pub fn from_config(config: KernelClientConfig) -> Result<Self, KernelClientError> {
-            validate_config(&config)?;
-            Ok(Self {
-                config,
-                request_identity: None,
-                #[cfg(windows)]
-                config_lease: None,
-            })
         }
 
         /// Binds the exact caller identity for the next application request.
@@ -503,12 +492,10 @@ pub mod kernel_client {
         async fn connect(
             &self,
         ) -> Result<(NamedPipeTransport, TransportLimits), KernelClientError> {
-            if let Some(lease) = &self.config_lease {
-                lease
-                    .verify_stable_identity()
-                    .and_then(|()| lease.verify_path_identity())
-                    .map_err(|error| KernelClientError::Configuration(error.to_string()))?;
-            }
+            self.config_lease
+                .verify_stable_identity()
+                .and_then(|()| self.config_lease.verify_path_identity())
+                .map_err(|error| KernelClientError::Configuration(error.to_string()))?;
             let expectation = NamedPipePeerExpectation::new(
                 &self.config.expected_kernel_sid,
                 self.config.expected_kernel_session_id,
