@@ -133,7 +133,7 @@ impl DaemonComposition {
     /// Returns the authenticated kernel transport selected for this generation.
     #[must_use]
     pub fn ipc_name(&self) -> &str {
-        self.kernel.ipc().name()
+        self.kernel.ipc()
     }
 
     /// Produces the canonical Governor runtime status projection.

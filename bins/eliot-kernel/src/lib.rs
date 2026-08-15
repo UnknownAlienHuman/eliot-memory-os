@@ -47,7 +47,7 @@ pub const DEFAULT_PIPE_NAME: &str = r"\\.\pipe\eliot\kernel\frontdoor";
 
 /// The only transport implementation admitted by the Windows-first Kernel.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub enum IpcImplementation {
+enum IpcImplementation {
     /// Local authenticated EBP/1 named pipe.
     WindowsNamedPipe { name: String },
 }
@@ -61,7 +61,7 @@ impl IpcImplementation {
 
     /// Returns the selected transport name.
     #[must_use]
-    pub fn name(&self) -> &str {
+    fn name(&self) -> &str {
         match self {
             Self::WindowsNamedPipe { name } => name,
         }
@@ -69,7 +69,7 @@ impl IpcImplementation {
 
     /// Returns the transport limits selected by the Kernel composition.
     #[must_use]
-    pub const fn limits(&self) -> TransportLimits {
+    const fn limits(&self) -> TransportLimits {
         TransportLimits {
             max_frame_bytes: eliot_protocol::MAX_FRAME_BYTES,
             queue_capacity: 128,
@@ -77,20 +77,6 @@ impl IpcImplementation {
             control_reserve: 4,
             operation_timeout: Duration::from_secs(30),
         }
-    }
-
-    /// Performs the complete server-authoritative principal/session binding.
-    ///
-    /// The peer must already be authenticated by the platform transport.  A
-    /// client assertion alone is never promoted into Kernel authority.
-    pub fn bind_session(
-        &self,
-        connection_id: impl Into<String>,
-        peer: PeerIdentity,
-        client: &eliot_protocol::ClientHello,
-        policy: &ServerHandshakePolicy,
-    ) -> Result<HandshakeResult, eliot_ipc::TransportError> {
-        Session::establish_with_server(connection_id, peer, client, policy)
     }
 }
 
@@ -443,33 +429,29 @@ impl KernelComposition {
         })
     }
 
-    /// Returns the selected local IPC implementation.
+    /// Returns the selected local IPC name for diagnostics and ready output.
+    ///
+    /// This is intentionally only a string snapshot.  It carries no
+    /// transport or handshake authority and cannot be used to establish a
+    /// session.
     #[must_use]
-    pub const fn ipc(&self) -> &IpcImplementation {
-        &self.ipc
+    pub fn ipc(&self) -> &str {
+        self.ipc.name()
+    }
+
+    /// Returns the fixed transport limits for receive/send loops.
+    ///
+    /// The limits are diagnostic configuration only; session establishment
+    /// remains owned by [`Self::bind_session`].
+    #[must_use]
+    pub const fn ipc_limits(&self) -> TransportLimits {
+        self.ipc.limits()
     }
 
     /// Returns the platform surface owned by this composition.
     #[must_use]
     pub const fn platform(&self) -> &WindowsPlatform {
         &self.platform
-    }
-
-    /// Returns the server-owned EBP handshake policy.
-    #[must_use]
-    pub fn front_door_policy(&self) -> Result<ServerHandshakePolicy, TransportError> {
-        if self
-            .generation_poison
-            .lock()
-            .map_err(|_| TransportError::SessionFenced)?
-            .is_some()
-        {
-            return Err(TransportError::SessionFenced);
-        }
-        self.front_door_policy
-            .lock()
-            .map(|policy| policy.clone())
-            .map_err(|_| TransportError::SessionFenced)
     }
 
     /// Binds an authenticated local peer to the selected principal/session.
@@ -479,19 +461,30 @@ impl KernelComposition {
         peer: PeerIdentity,
         client: &eliot_protocol::ClientHello,
     ) -> Result<HandshakeResult, eliot_ipc::TransportError> {
-        if self
+        let generation_poison = self
             .generation_poison
             .lock()
-            .map_err(|_| TransportError::SessionFenced)?
-            .is_some()
-        {
+            .map_err(|_| TransportError::SessionFenced)?;
+        if generation_poison.is_some() {
             return Err(TransportError::SessionFenced);
         }
         let policy = self
             .front_door_policy
             .lock()
             .map_err(|_| TransportError::SessionFenced)?;
-        self.ipc.bind_session(connection_id, peer, client, &policy)
+        Session::establish_with_server(connection_id, peer, client, &policy)
+    }
+
+    #[cfg(test)]
+    fn poison_generation_for_test(&self) {
+        let mut generation_poison = self
+            .generation_poison
+            .lock()
+            .expect("generation poison lock");
+        *generation_poison = Some("test publication failure".to_owned());
+        if let Ok(mut service) = self.service.lock() {
+            let _ = service.fence_generation("test publication failure");
+        }
     }
 
     /// Runs the currently admitted, deliberately closed semantic gateway.
@@ -752,4 +745,95 @@ pub fn default_work_root() -> Result<PathBuf, std::io::Error> {
         .map(PathBuf::from)
         .unwrap_or(std::env::current_dir()?);
     std::fs::canonicalize(Path::new(&root))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use eliot_contracts::ContractVersion;
+    use eliot_runtime_contracts::ModuleContract;
+
+    fn test_client(policy: &ServerHandshakePolicy) -> eliot_protocol::ClientHello {
+        eliot_protocol::ClientHello {
+            protocol_range: policy.protocol_range,
+            module_bridge_identity: policy.module_id.clone(),
+            artifact_hash: policy.module_generation.artifact_id.clone(),
+            module_contract: ModuleContract {
+                module_id: policy.module_generation.module_id.clone(),
+                version: ContractVersion::new(1, 0, 0),
+                artifact_id: policy.module_generation.artifact_id.clone(),
+                protocols: vec![PROTOCOL_VERSION.to_owned()],
+                required_capabilities: Vec::new(),
+                optional_capabilities: Vec::new(),
+                advisory_capabilities: Vec::new(),
+                state_owner: SERVICE_NAME.to_owned(),
+                failure_domain: SERVICE_NAME.to_owned(),
+                hot_replace: false,
+            },
+            module_generation: policy.module_generation.clone(),
+            launch_nonce: policy.launch_nonce.clone(),
+            capabilities: policy.allowed_capabilities.clone(),
+            privacy_classes: policy.allowed_privacy_classes.clone(),
+            max_frame: policy.max_frame,
+            authority_epoch: policy.module_generation.state_fence.authority_epoch,
+        }
+    }
+
+    #[test]
+    fn pre_poison_ipc_handles_cannot_establish_handshake() {
+        let root = std::env::temp_dir().join(format!(
+            "eliot-kernel-ipc-fence-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).expect("test work root");
+        let kernel = KernelComposition::new(KernelConfig::new(&root)).expect("kernel composition");
+
+        // These are the only public IPC values retained across the fence:
+        // immutable diagnostics, not a transport or policy authority.
+        let saved_ipc_name = kernel.ipc().to_owned();
+        let saved_limits = kernel.ipc_limits();
+        let stale_client = {
+            let policy = kernel
+                .front_door_policy
+                .lock()
+                .expect("front-door policy lock");
+            test_client(&policy)
+        };
+
+        kernel.poison_generation_for_test();
+
+        assert_eq!(kernel.ipc(), saved_ipc_name);
+        assert_eq!(kernel.ipc_limits(), saved_limits);
+        assert!(matches!(
+            kernel.bind_session(
+                "pre-poison-connection",
+                PeerIdentity::Unavailable {
+                    reason: eliot_ipc::PeerIdentityUnavailable::ProviderProofNotComposed,
+                },
+                &stale_client,
+            ),
+            Err(TransportError::SessionFenced)
+        ));
+
+        #[cfg(windows)]
+        {
+            assert!(matches!(
+                kernel.bind_authenticated_front_door(),
+                Err(KernelBuildError::Principal(reason))
+                    if reason.contains("generation gateway fenced")
+            ));
+            assert!(matches!(
+                kernel.bind_authenticated_front_door_next(),
+                Err(KernelBuildError::Principal(reason))
+                    if reason.contains("generation gateway fenced")
+            ));
+        }
+
+        drop(kernel);
+        let _ = std::fs::remove_dir_all(root);
+    }
 }

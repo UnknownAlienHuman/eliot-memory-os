@@ -40,7 +40,7 @@ async fn main() {
         };
         let ready = format!(
             "{{\"service\":\"{SERVICE_NAME}\",\"protocol\":\"{PROTOCOL_VERSION}\",\"ipc\":\"{}\"}}",
-            kernel.ipc().name()
+            kernel.ipc()
         );
         if !write_line(&ready) {
             return;
@@ -114,7 +114,7 @@ async fn main() {
     {
         let ready = format!(
             "{{\"service\":\"{SERVICE_NAME}\",\"protocol\":\"{PROTOCOL_VERSION}\",\"ipc\":\"{}\"}}",
-            kernel.ipc().name()
+            kernel.ipc()
         );
         if !write_line(&ready) {
             return;
@@ -139,7 +139,7 @@ async fn serve_connection(
     mut front_door: NamedPipeServer,
     mut shutdown: watch::Receiver<bool>,
 ) -> Result<(), TransportError> {
-    let limits = kernel.ipc().limits();
+    let limits = kernel.ipc_limits();
     let Some(client_frame) =
         receive_frame_or_shutdown(&mut front_door, limits, &mut shutdown).await?
     else {
