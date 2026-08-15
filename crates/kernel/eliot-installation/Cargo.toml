@@ -1,0 +1,24 @@
+[package]
+name = "eliot-installation"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Provider-neutral governed installation profiles, discovery and transaction state"
+
+[package.metadata.eliot]
+work_id = "P-08"
+functional_cell = "installation"
+lifecycle_owner = "P-08"
+source_layer = "C1"
+proof_entrypoint = "cargo test -p eliot-installation"
+
+[dependencies]
+eliot-contracts.workspace = true
+eliot-platform.workspace = true
+schemars.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true
