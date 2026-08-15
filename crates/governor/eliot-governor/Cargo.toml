@@ -1,0 +1,17 @@
+[package]
+name = "eliot-governor"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Production Governor orchestration and readiness owner"
+
+[dependencies]
+eliot-contracts.workspace = true
+eliot-runtime-contracts.workspace = true
+schemars.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true
