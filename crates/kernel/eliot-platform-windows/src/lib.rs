@@ -2216,12 +2216,24 @@ impl<V> RunningJobChild<V> {
         self.inner.wait_for_empty_history(timeout)
     }
 
+    /// Terminates and reaps the complete Job without consuming this owner.
+    ///
+    /// A failed termination or bounded wait leaves the process and Job
+    /// handles attached to this value so the owning executor can retry and
+    /// retain exact cleanup evidence.
+    pub fn terminate_in_place(
+        &mut self,
+        exit_code: u32,
+    ) -> Result<TerminatedJobChild, WindowsAdapterError> {
+        terminalize(&mut self.inner, exit_code)
+    }
+
     /// Consumes and terminates the complete Job exactly once.
     ///
     /// # Errors
     /// Returns a typed adapter error when termination or bounded reap fails.
     pub fn terminate(mut self, exit_code: u32) -> Result<TerminatedJobChild, WindowsAdapterError> {
-        terminalize(&mut self.inner, exit_code)
+        self.terminate_in_place(exit_code)
     }
 }
 

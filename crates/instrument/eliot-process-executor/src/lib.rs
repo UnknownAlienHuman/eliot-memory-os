@@ -115,6 +115,7 @@ struct Operation {
     deadline: Instant,
     timed_out: bool,
     cleanup_required: bool,
+    termination: Option<TerminatedJobChild>,
 }
 
 #[cfg(not(windows))]
@@ -274,10 +275,15 @@ impl WindowsProcessExecutor {
         }
     }
 
-    /// Terminates every still-owned child and clears the operation registry.
+    /// Terminates every still-owned child and clears the operation registry
+    /// only when every cleanup owner reaches a terminal projection.
     ///
     /// This is the final physical cleanup contour used during Kernel
     /// shutdown and Drop; it does not claim a successful process outcome.
+    ///
+    /// # Errors
+    /// Returns [`ProcessExecutionError::UnknownOutcome`] and retains the
+    /// operation registry when any child or cleanup marker remains owned.
     pub fn shutdown(&self) -> Result<(), ProcessExecutionError> {
         #[cfg(windows)]
         {
@@ -290,8 +296,9 @@ impl WindowsProcessExecutor {
                 let mut guard = operation
                     .lock()
                     .map_err(|_| unavailable("operation lock poisoned"))?;
-                retain_cleanup_owners |= guard.cleanup_required;
-                if guard.child.is_some() {
+                retain_cleanup_owners |= guard.cleanup_required
+                    || guard.state.view().lifecycle() == ProcessLifecycle::UnknownOutcome;
+                if guard.child.is_some() && guard.termination.is_none() {
                     if finalize_operation(&mut guard, ExitDisposition::Unknown, false).is_err() {
                         poison_operation(&mut guard, &self.poisoned);
                         retain_cleanup_owners = true;
@@ -305,8 +312,9 @@ impl WindowsProcessExecutor {
                     .lock()
                     .map_err(|_| unavailable("operation reservation lock poisoned"))?
                     .clear();
+                return Ok(());
             }
-            return Ok(());
+            return Err(ProcessExecutionError::UnknownOutcome);
         }
         #[cfg(not(windows))]
         {
@@ -436,6 +444,7 @@ impl ProcessExecutor for WindowsProcessExecutor {
                     .ok_or_else(|| unavailable("wall timeout overflows monotonic clock"))?,
                 timed_out: false,
                 cleanup_required: false,
+                termination: None,
             }));
             self.operations
                 .lock()
@@ -459,7 +468,10 @@ impl ProcessExecutor for WindowsProcessExecutor {
             let mut guard = operation
                 .lock()
                 .map_err(|_| unavailable("operation lock poisoned"))?;
-            refresh_operation(&mut guard)?;
+            if let Err(error) = refresh_operation(&mut guard) {
+                poison_operation(&mut guard, &self.poisoned);
+                return Err(error);
+            }
             return Ok(guard.state.view());
         }
         #[cfg(not(windows))]
@@ -485,9 +497,19 @@ impl ProcessExecutor for WindowsProcessExecutor {
                 .lock()
                 .map_err(|_| unavailable("operation lock poisoned"))?;
             let binding = guard.state.view().binding().clone();
-            let receipt = guard.state.cancel(&CancellationRequest::new(binding))?;
+            let receipt = match guard.state.cancel(&CancellationRequest::new(binding)) {
+                Ok(receipt) => receipt,
+                Err(error) => {
+                    poison_operation(&mut guard, &self.poisoned);
+                    return Err(error.into());
+                }
+            };
             if guard.state.view().lifecycle() == ProcessLifecycle::Cancelling {
-                finalize_operation(&mut guard, ExitDisposition::Cancelled, true)?;
+                if let Err(error) = finalize_operation(&mut guard, ExitDisposition::Cancelled, true)
+                {
+                    poison_operation(&mut guard, &self.poisoned);
+                    return Err(error);
+                }
             }
             return Ok(receipt);
         }
@@ -513,7 +535,10 @@ impl ProcessExecutor for WindowsProcessExecutor {
             let mut guard = operation
                 .lock()
                 .map_err(|_| unavailable("operation lock poisoned"))?;
-            refresh_operation(&mut guard)?;
+            if let Err(error) = refresh_operation(&mut guard) {
+                poison_operation(&mut guard, &self.poisoned);
+                return Err(error);
+            }
             if guard.state.view().lifecycle() == ProcessLifecycle::UnknownOutcome {
                 let Some(descendants) = guard.state.view().descendants().cloned() else {
                     return Err(ProcessExecutionError::UnknownOutcome);
@@ -602,63 +627,63 @@ fn finalize_operation(
     disposition: ExitDisposition,
     cancelled: bool,
 ) -> Result<(), ProcessExecutionError> {
-    let Some(child) = operation.child.take() else {
+    let Some(child) = operation.child.as_mut() else {
         return Err(ProcessExecutionError::UnknownOutcome);
     };
-    let observed_root_exit = child
-        .observe()
-        .ok()
-        .and_then(|observation| match observation {
-            RunningJobObservation::RootExited { exit_code, .. }
-            | RunningJobObservation::Exited { exit_code } => Some(exit_code),
-            RunningJobObservation::Running { .. } => None,
-        });
-    let termination = child.terminate(JOB_TERMINATION_CODE);
-    let observed_exit_code = termination
-        .as_ref()
-        .ok()
-        .map(TerminatedJobChild::observed_exit_code);
-    let history = termination.ok().map(|receipt| receipt.history().clone());
-    let (process_ids, complete, tree_terminated, evidence_ref) = history
-        .as_ref()
-        .map(|history| {
-            let ids = history
-                .processes()
-                .iter()
-                .filter_map(|observation| {
-                    ProcessId::new(format!(
-                        "windows-process:{}",
-                        short_digest(observation.process().stable_key().as_bytes())
-                    ))
-                    .ok()
-                })
-                .collect::<Vec<_>>();
-            let evidence_ref = format!(
-                "raw:p04-job-history:{}:{}:{}",
-                ids.len(),
-                history.complete(),
-                history.job_empty()
-            );
-            (
-                ids,
-                history.complete(),
-                history.job_empty(),
-                Some(evidence_ref),
-            )
+    let observed_root_exit = match child.observe().map_err(unavailable)? {
+        RunningJobObservation::RootExited { exit_code, .. }
+        | RunningJobObservation::Exited { exit_code } => Some(exit_code),
+        RunningJobObservation::Running { .. } => None,
+    };
+    let termination = child
+        .terminate_in_place(JOB_TERMINATION_CODE)
+        .map_err(unavailable)?;
+    let observed_exit_code = termination.observed_exit_code();
+    let history = termination.history().clone();
+    let ids = history
+        .processes()
+        .iter()
+        .filter_map(|observation| {
+            ProcessId::new(format!(
+                "windows-process:{}",
+                short_digest(observation.process().stable_key().as_bytes())
+            ))
+            .ok()
         })
-        .unwrap_or_else(|| (Vec::new(), false, false, None));
+        .collect::<Vec<_>>();
+    let evidence_ref = format!(
+        "raw:p04-job-history:{}:{}:{}",
+        ids.len(),
+        history.complete(),
+        history.job_empty()
+    );
+    let (process_ids, complete, tree_terminated, evidence_ref) = (
+        ids,
+        history.complete(),
+        history.job_empty(),
+        Some(evidence_ref),
+    );
     let view = operation.state.view();
     let Some(identity) = view.identity() else {
+        operation.termination = Some(termination);
+        operation.cleanup_required = true;
         return Err(ProcessExecutionError::UnknownOutcome);
     };
-    let descendants = DescendantEvidence::new(
+    let descendants = match DescendantEvidence::new(
         view.binding().clone(),
         identity.process_id().clone(),
         process_ids,
         complete,
         tree_terminated,
         evidence_ref,
-    )?;
+    ) {
+        Ok(descendants) => descendants,
+        Err(error) => {
+            operation.termination = Some(termination);
+            operation.cleanup_required = true;
+            return Err(error.into());
+        }
+    };
     let actual_disposition = if !complete || !tree_terminated {
         ExitDisposition::Unknown
     } else if observed_root_exit.is_some() {
@@ -677,10 +702,22 @@ fn finalize_operation(
     let code = if actual_disposition == ExitDisposition::Unknown {
         None
     } else {
-        observed_root_exit.or(observed_exit_code)
+        observed_root_exit.or(Some(observed_exit_code))
     };
-    let exit = ExitStatus::new(actual_disposition, code, None, now_ms())?;
-    operation.state.exit(exit, descendants)?;
+    let exit = match ExitStatus::new(actual_disposition, code, None, now_ms()) {
+        Ok(exit) => exit,
+        Err(error) => {
+            operation.termination = Some(termination);
+            operation.cleanup_required = true;
+            return Err(error.into());
+        }
+    };
+    if let Err(error) = operation.state.exit(exit, descendants) {
+        operation.termination = Some(termination);
+        operation.cleanup_required = true;
+        return Err(error.into());
+    }
+    let _ = operation.child.take();
     Ok(())
 }
 
@@ -731,9 +768,7 @@ fn spawn_deadline_watcher(operation: Arc<Mutex<Operation>>, poisoned: Arc<Atomic
                     // reason to detach the Job.  Fence the operation as
                     // unknown and retain it for explicit reconciliation or
                     // final shutdown cleanup.
-                    if finalize_operation(&mut guard, ExitDisposition::Unknown, false).is_err() {
-                        poison_operation(&mut guard, &poisoned);
-                    }
+                    poison_operation(&mut guard, &poisoned);
                     return;
                 }
             }

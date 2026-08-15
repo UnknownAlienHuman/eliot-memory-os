@@ -123,7 +123,14 @@ async fn main() {
             exit_error("SIGNAL_FAILURE", &error.to_string());
         }
     }
-    let _ = kernel.shutdown().await;
+    match kernel.shutdown().await {
+        Ok(outcome) if outcome.no_orphans => {}
+        Ok(outcome) => exit_error(
+            "SHUTDOWN_INCOMPLETE",
+            &format!("runtime shutdown outcome: {outcome:?}"),
+        ),
+        Err(error) => exit_error("SHUTDOWN_FAILURE", &error.to_string()),
+    }
 }
 
 #[cfg(windows)]

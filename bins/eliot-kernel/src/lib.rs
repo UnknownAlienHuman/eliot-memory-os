@@ -434,9 +434,11 @@ impl KernelComposition {
     }
 
     /// Completes the bounded cooperative-then-forced shutdown sequence.
-    pub async fn shutdown(&self) -> ShutdownOutcome {
-        let _ = self.process_executor.shutdown();
-        self.runtime.shutdown().await
+    pub async fn shutdown(&self) -> Result<ShutdownOutcome, ProcessExecutionError> {
+        let process_result = self.process_executor.shutdown();
+        let runtime_outcome = self.runtime.shutdown().await;
+        process_result?;
+        Ok(runtime_outcome)
     }
 }
 
