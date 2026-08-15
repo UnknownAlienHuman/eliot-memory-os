@@ -1,0 +1,247 @@
+//! Host↔Kernel protocol records.
+
+use eliot_contracts::AuthorityEpoch;
+use eliot_platform::{PlatformHandle, PortError};
+use eliot_runtime_contracts::{HealthVector, ServiceProcessState};
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
+use thiserror::Error;
+
+use crate::{KernelServiceError, validate_text};
+
+fn handle(value: &PlatformHandle, field: &'static str) -> Result<(), KernelServiceError> {
+    validate_text(value.as_str(), field)
+}
+
+/// A bounded restart budget owned by Host for one Kernel lineage.
+#[derive(Clone, Copy, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RestartBudget {
+    /// Number of starts still allowed before quarantine.
+    pub remaining: u32,
+    /// Maximum starts admitted for this lineage.
+    pub maximum: u32,
+}
+
+impl RestartBudget {
+    /// Creates a budget, rejecting an inconsistent remaining count.
+    pub const fn new(maximum: u32, remaining: u32) -> Result<Self, KernelServiceError> {
+        if maximum == 0 || remaining > maximum {
+            return Err(KernelServiceError::InvalidField {
+                field: "restart_budget",
+                reason: "maximum must be non-zero and remaining must not exceed maximum",
+            });
+        }
+        Ok(Self { remaining, maximum })
+    }
+
+    /// Consumes one permitted restart without wrapping.
+    pub const fn consume(self) -> Result<Self, KernelServiceError> {
+        if self.remaining == 0 {
+            return Err(KernelServiceError::RestartBudgetExhausted);
+        }
+        Ok(Self {
+            remaining: self.remaining - 1,
+            maximum: self.maximum,
+        })
+    }
+}
+
+/// A Host-observed process identity and lifecycle snapshot.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProcessObservation {
+    /// Exact physical process lineage identity.
+    pub process_id: PlatformHandle,
+    /// Host-owned Job Object identity.
+    pub job_object_id: PlatformHandle,
+    /// Current process state; survival alone does not imply readiness.
+    pub state: ServiceProcessState,
+    /// Six-dimensional process health evidence.
+    pub health: HealthVector,
+    /// Opaque evidence references proving the observation.
+    pub evidence_refs: Vec<PlatformHandle>,
+}
+
+impl ProcessObservation {
+    /// Validates the non-secret observation envelope.
+    pub fn validate(&self) -> Result<(), KernelServiceError> {
+        handle(&self.process_id, "process_observation.process_id")?;
+        handle(&self.job_object_id, "process_observation.job_object_id")?;
+        if self.evidence_refs.is_empty() {
+            return Err(KernelServiceError::InvalidField {
+                field: "process_observation.evidence_refs",
+                reason: "at least one evidence reference is required",
+            });
+        }
+        for evidence in &self.evidence_refs {
+            handle(evidence, "process_observation.evidence_refs")?;
+        }
+        Ok(())
+    }
+}
+
+/// The immutable Host lineage and activation binding presented to Kernel.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HostKernelHandshake {
+    /// Host installation identity.
+    pub installation_id: PlatformHandle,
+    /// Host installation epoch that owns this process.
+    pub host_epoch: AuthorityEpoch,
+    /// Kernel authority epoch proposed for this activation.
+    pub kernel_epoch: AuthorityEpoch,
+    /// Exact activation identity shared by Host state and Kernel.
+    pub activation_id: PlatformHandle,
+    /// Approved immutable Kernel artifact hash/reference.
+    pub artifact_hash: PlatformHandle,
+    /// Immutable configuration hash/reference.
+    pub config_hash: PlatformHandle,
+    /// One-time activation nonce. It is consumed exactly once.
+    pub activation_nonce: PlatformHandle,
+    /// Host-owned Kernel Job Object identity.
+    pub job_object_id: PlatformHandle,
+    /// Candidate/active authenticated local IPC identity.
+    pub pipe_identity: PlatformHandle,
+    /// Restart budget for this lineage.
+    pub restart_budget: RestartBudget,
+    /// Containment action required if the previous lineage is suspect.
+    pub containment_action: Option<ContainmentAction>,
+}
+
+impl HostKernelHandshake {
+    /// Validates all identity and epoch invariants before a candidate starts.
+    pub fn validate(&self) -> Result<(), KernelServiceError> {
+        for (value, field) in [
+            (&self.installation_id, "handshake.installation_id"),
+            (&self.activation_id, "handshake.activation_id"),
+            (&self.artifact_hash, "handshake.artifact_hash"),
+            (&self.config_hash, "handshake.config_hash"),
+            (&self.activation_nonce, "handshake.activation_nonce"),
+            (&self.job_object_id, "handshake.job_object_id"),
+            (&self.pipe_identity, "handshake.pipe_identity"),
+        ] {
+            handle(value, field)?;
+        }
+        if self.host_epoch.value() == 0 || self.kernel_epoch.value() == 0 {
+            return Err(KernelServiceError::InvalidField {
+                field: "handshake.epoch",
+                reason: "must be non-zero",
+            });
+        }
+        if self.host_epoch.value() > self.kernel_epoch.value() {
+            return Err(KernelServiceError::InvalidField {
+                field: "handshake.kernel_epoch",
+                reason: "must not precede host epoch",
+            });
+        }
+        if let Some(containment) = &self.containment_action {
+            containment.validate()?;
+        }
+        Ok(())
+    }
+}
+
+/// A Host containment action reference, not an instruction to perform OS work.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ContainmentAction {
+    /// Stable action identity recorded by Host/Watchdog.
+    pub action_id: PlatformHandle,
+    /// Evidence that the prior lineage was contained or marked suspect.
+    pub evidence_ref: PlatformHandle,
+}
+
+impl ContainmentAction {
+    /// Validates the action envelope.
+    pub fn validate(&self) -> Result<(), KernelServiceError> {
+        handle(&self.action_id, "containment.action_id")?;
+        handle(&self.evidence_ref, "containment.evidence_ref")
+    }
+}
+
+/// Receipt proving that a Kernel candidate consumed its Host handoff nonce.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct KernelReadyReceipt {
+    /// Activation identity echoed from the handshake.
+    pub activation_id: PlatformHandle,
+    /// Activation nonce echoed from the handshake.
+    pub activation_nonce: PlatformHandle,
+    /// Process and Job Object observation at readiness time.
+    pub process: ProcessObservation,
+    /// Kernel health vector at readiness time.
+    pub health: HealthVector,
+    /// Kernel-side readiness evidence references.
+    pub evidence_refs: Vec<PlatformHandle>,
+}
+
+impl KernelReadyReceipt {
+    /// Validates readiness without inferring success from process existence.
+    pub fn validate(&self, handshake: &HostKernelHandshake) -> Result<(), KernelServiceError> {
+        handle(&self.activation_id, "ready.activation_id")?;
+        handle(&self.activation_nonce, "ready.activation_nonce")?;
+        if self.activation_id != handshake.activation_id {
+            return Err(KernelServiceError::HandshakeMismatch {
+                field: "activation_id",
+            });
+        }
+        if self.activation_nonce != handshake.activation_nonce {
+            return Err(KernelServiceError::HandshakeMismatch {
+                field: "activation_nonce",
+            });
+        }
+        self.process.validate()?;
+        if self.process.job_object_id != handshake.job_object_id {
+            return Err(KernelServiceError::HandshakeMismatch {
+                field: "job_object_id",
+            });
+        }
+        if self.process.state != ServiceProcessState::Ready
+            || !self.process.health.is_fully_healthy()
+            || !self.health.is_fully_healthy()
+        {
+            return Err(KernelServiceError::ReadinessNotProven);
+        }
+        if self.evidence_refs.is_empty() {
+            return Err(KernelServiceError::InvalidField {
+                field: "ready.evidence_refs",
+                reason: "at least one readiness evidence reference is required",
+            });
+        }
+        for evidence in &self.evidence_refs {
+            handle(evidence, "ready.evidence_refs")?;
+        }
+        Ok(())
+    }
+}
+
+/// Control messages accepted by the Kernel service boundary.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE", deny_unknown_fields)]
+pub enum KernelControlCommand {
+    /// Begin reconciliation of one Host activation lineage.
+    Reconcile(HostKernelHandshake),
+    /// Enter side-by-side candidate mode without authority.
+    Shadow,
+    /// Record that Host prepared the exclusive handoff.
+    PrepareHandoff,
+    /// Begin consuming the one-time activation nonce.
+    Activate,
+    /// Publish a complete readiness receipt.
+    Ready(KernelReadyReceipt),
+    /// Close normal admission while retaining recovery control.
+    Degrade(PlatformHandle),
+    /// Drain normal work before stopping.
+    Drain,
+    /// Record a clean stop.
+    Stop,
+    /// Record a bounded failure and its recovery reference.
+    Fail(PlatformHandle),
+}
+
+impl From<PortError> for KernelServiceError {
+    fn from(error: PortError) -> Self {
+        Self::Platform(error.to_string())
+    }
+}

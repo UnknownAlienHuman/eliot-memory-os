@@ -1,0 +1,27 @@
+[package]
+name = "eliot-kernel-service"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Governed Kernel service lifecycle, Host handoff and readiness boundary"
+
+[package.metadata.eliot]
+work_id = "P-07"
+functional_cell = "kernel-service"
+lifecycle_owner = "P-07"
+source_layer = "C1"
+proof_entrypoint = "cargo test -p eliot-kernel-service"
+
+[dependencies]
+eliot-contracts.workspace = true
+eliot-kernel-core.workspace = true
+eliot-platform.workspace = true
+eliot-receipts.workspace = true
+eliot-runtime-contracts.workspace = true
+schemars.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true
