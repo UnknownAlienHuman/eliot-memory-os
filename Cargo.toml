@@ -34,6 +34,7 @@ members = [
   "crates/storage/eliot-store-memory",
   "crates/instrument/eliot-graph-api",
   "crates/instrument/eliot-instrument-api",
+  "crates/kernel/eliot-host-state",
   "crates/kernel/eliot-ipc",
   "crates/kernel/eliot-platform",
   "crates/kernel/eliot-platform-windows",
@@ -96,6 +97,7 @@ eliot-store-api = { path = "crates/storage/eliot-store-api", version = "0.1.0" }
 eliot-store-memory = { path = "crates/storage/eliot-store-memory", version = "0.1.0" }
 eliot-graph-api = { path = "crates/instrument/eliot-graph-api", version = "0.1.0" }
 eliot-instrument-api = { path = "crates/instrument/eliot-instrument-api", version = "0.1.0" }
+eliot-host-state = { path = "crates/kernel/eliot-host-state", version = "0.1.0" }
 eliot-ipc = { path = "crates/kernel/eliot-ipc", version = "0.1.0" }
 eliot-agent-bridge-core = { path = "crates/surfaces/eliot-agent-bridge-core", version = "0.1.0" }
 eliot-agent-bridge = { path = "bins/eliot-agent-bridge", version = "0.1.0" }

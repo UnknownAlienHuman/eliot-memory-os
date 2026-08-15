@@ -529,6 +529,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "eliot-host-state"
+version = "0.1.0"
+dependencies = [
+ "eliot-observation-contracts",
+ "eliot-platform",
+ "eliot-runtime-contracts",
+ "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
 name = "eliot-instrument-api"
 version = "0.1.0"
 dependencies = [
