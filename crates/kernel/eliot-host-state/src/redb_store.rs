@@ -39,6 +39,15 @@ pub struct HostRecoverySnapshot {
     pub active_process: ServiceProcessRecord,
     pub process: HostProcessRecoveryBinding,
     pub disposition: HostShutdownDisposition,
+    pub recovery_evidence: Option<HostRecoveryEvidence>,
+}
+
+/// Opaque state-owner capability returned by one exact pending-release or
+/// recovery preparation. The marker/evidence remain private and are consumed
+/// only by clean finalization.
+pub struct RedbHostReleaseToken {
+    marker: HostShutdownMarker,
+    recovery: Option<HostRecoveryEvidence>,
 }
 
 /// Host-local state store backed by a redb database.
@@ -92,14 +101,18 @@ impl RedbHostStateStore {
         let database = ReadOnlyDatabase::open(path).map_err(|_| HostStateError::Unavailable)?;
         let state = read_state_from(&database)?.ok_or(HostStateError::Unavailable)?;
         validate_admission_state(&state, installation)?;
-        let active_process = state
-            .active_process
-            .clone()
-            .ok_or(HostStateError::InvalidRecord)?;
-        let process = state
-            .active_process_recovery
-            .clone()
-            .ok_or(HostStateError::InvalidRecord)?;
+        let (active_process, process) = match (
+            state.active_process.clone(),
+            state.active_process_recovery.clone(),
+            state.last_recovery_evidence.clone(),
+        ) {
+            (Some(active_process), Some(process), _) => (active_process, process),
+            (None, None, Some(evidence)) if state.disposition.is_release_pending() => (
+                evidence.stale_active_process.clone(),
+                evidence.process.clone(),
+            ),
+            _ => return Err(HostStateError::InvalidRecord),
+        };
         let host_epoch = host_epoch_binding(
             read_epoch_from(&database)?
                 .as_ref()
@@ -111,6 +124,7 @@ impl RedbHostStateStore {
             active_process,
             process,
             disposition: state.disposition,
+            recovery_evidence: state.last_recovery_evidence,
         })
     }
 
@@ -141,7 +155,7 @@ impl RedbHostStateStore {
     pub fn prepare_release_pending(
         &self,
         marker: HostShutdownMarker,
-    ) -> Result<(), HostStateError> {
+    ) -> Result<RedbHostReleaseToken, HostStateError> {
         marker.validate()?;
         let installation = marker.installation.clone();
         self.mutate(installation.as_str(), |state| {
@@ -158,45 +172,77 @@ impl RedbHostStateStore {
                     disposition => disposition.clone(),
                 };
             }
-            state.disposition = HostShutdownDisposition::ReleasePending { marker };
+            state.disposition = HostShutdownDisposition::ReleasePending {
+                marker: marker.clone(),
+            };
             state.last_recovery_evidence = None;
             Ok(())
+        })?;
+        Ok(RedbHostReleaseToken {
+            marker,
+            recovery: None,
         })
     }
 
     /// Finalizes clean state only when the exact release-pending marker still
     /// owns the projection. A concurrent recovery mutation therefore cannot
     /// be overwritten by a late post-release finalizer.
-    pub fn finalize_clean_shutdown(
+    pub fn prepare_recovery_pending(
         &self,
-        marker: HostShutdownMarker,
-    ) -> Result<(), HostStateError> {
-        marker.validate()?;
-        let installation = marker.installation.clone();
+        evidence: HostRecoveryEvidence,
+    ) -> Result<RedbHostReleaseToken, HostStateError> {
+        evidence.validate()?;
+        let current_epoch = host_epoch_binding(
+            self.read_epoch()?
+                .as_ref()
+                .ok_or(HostStateError::Unavailable)?,
+        )?;
+        if current_epoch != evidence.host_epoch {
+            return Err(HostStateError::InvalidRecord);
+        }
+        let installation = evidence.installation.clone();
         self.mutate(installation.as_str(), |state| {
-            if state.active_process.as_ref() != Some(&marker.process)
-                || state.active_process_recovery.is_none()
-            {
+            let exact_existing = state.active_process.as_ref()
+                == Some(&evidence.stale_active_process)
+                && state.active_process_recovery.as_ref() == Some(&evidence.process)
+                && state.disposition == evidence.observed_disposition;
+            let retry_after_clear = state.active_process.is_none()
+                && state.active_process_recovery.is_none()
+                && state.last_recovery_evidence.as_ref() == Some(&evidence)
+                && matches!(
+                    state.disposition,
+                    HostShutdownDisposition::RecoveryFinalized { .. }
+                );
+            if !exact_existing && !retry_after_clear {
                 return Err(HostStateError::InvalidRecord);
             }
-            match &state.disposition {
-                HostShutdownDisposition::ReleasePending { marker: pending }
-                    if pending == &marker => {}
-                _ => return Err(HostStateError::InvalidRecord),
+            if retry_after_clear {
+                state.active_process = Some(evidence.stale_active_process.clone());
+                state.active_process_recovery = Some(evidence.process.clone());
             }
-            state.active_process = None;
-            state.active_process_recovery = None;
-            state.disposition = HostShutdownDisposition::Clean;
-            state.last_clean_shutdown = Some(marker);
-            state.last_recovery_evidence = None;
+            state.disposition = HostShutdownDisposition::ReleasePending {
+                marker: evidence.release_marker.clone(),
+            };
+            state.last_recovery_evidence = Some(evidence.clone());
             Ok(())
+        })?;
+        Ok(RedbHostReleaseToken {
+            marker: evidence.release_marker.clone(),
+            recovery: Some(evidence),
         })
     }
 
-    /// Clears a stale projection only when every identity in the typed
-    /// evidence matches the current durable state and epoch table.
-    pub fn clear_recovery(&self, evidence: HostRecoveryEvidence) -> Result<(), HostStateError> {
-        evidence.validate()?;
+    /// Completes the exact compare-and-clear only when every identity in the
+    /// private recovery token matches the current durable state and epoch
+    /// table. The caller must still hold the installation owner lease.
+    pub fn finalize_recovery_clear(
+        &self,
+        token: &RedbHostReleaseToken,
+    ) -> Result<(), HostStateError> {
+        let evidence = token
+            .recovery
+            .as_ref()
+            .ok_or(HostStateError::InvalidRecord)?;
         let current_epoch = host_epoch_binding(
             self.read_epoch()?
                 .as_ref()
@@ -209,32 +255,63 @@ impl RedbHostStateStore {
         self.mutate(installation.as_str(), |state| {
             if state.active_process.as_ref() != Some(&evidence.stale_active_process)
                 || state.active_process_recovery.as_ref() != Some(&evidence.process)
-                || state.disposition != evidence.observed_disposition
+                || state.disposition
+                    != (HostShutdownDisposition::ReleasePending {
+                        marker: evidence.release_marker.clone(),
+                    })
             {
                 return Err(HostStateError::InvalidRecord);
             }
             state.active_process = None;
             state.active_process_recovery = None;
-            state.disposition = HostShutdownDisposition::Clean;
-            state.last_recovery_evidence = Some(evidence);
+            state.disposition = HostShutdownDisposition::RecoveryFinalized {
+                marker: evidence.release_marker.clone(),
+            };
+            state.last_recovery_evidence = Some(evidence.clone());
             Ok(())
         })
     }
 
-    /// Attaches the measured process/PID/image/job projection to an already
-    /// committed activation. A missing projection is intentionally accepted
-    /// only as an incomplete recovery gate, never as healthy admission.
-    pub fn record_active_process_recovery(
+    /// Finalizes clean state only when the exact pending token still owns the
+    /// projection. Recovery tokens require the durable compare-and-clear phase.
+    pub fn finalize_clean_shutdown(
         &self,
-        installation: &PlatformHandle,
-        process: HostProcessRecoveryBinding,
+        token: RedbHostReleaseToken,
     ) -> Result<(), HostStateError> {
-        process.validate()?;
+        let installation = token.marker.installation.clone();
         self.mutate(installation.as_str(), |state| {
-            if state.active_process.is_none() {
-                return Err(HostStateError::InvalidRecord);
+            match token.recovery {
+                None => {
+                    if state.active_process.as_ref() != Some(&token.marker.process)
+                        || state.active_process_recovery.is_none()
+                        || state.disposition
+                            != (HostShutdownDisposition::ReleasePending {
+                                marker: token.marker.clone(),
+                            })
+                    {
+                        return Err(HostStateError::InvalidRecord);
+                    }
+                    state.active_process = None;
+                    state.active_process_recovery = None;
+                    state.disposition = HostShutdownDisposition::Clean;
+                    state.last_clean_shutdown = Some(token.marker.clone());
+                    state.last_recovery_evidence = None;
+                }
+                Some(evidence) => {
+                    if state.active_process.is_some()
+                        || state.active_process_recovery.is_some()
+                        || state.last_recovery_evidence.as_ref() != Some(&evidence)
+                        || state.disposition
+                            != (HostShutdownDisposition::RecoveryFinalized {
+                                marker: token.marker.clone(),
+                            })
+                    {
+                        return Err(HostStateError::InvalidRecord);
+                    }
+                    state.disposition = HostShutdownDisposition::Clean;
+                    state.last_clean_shutdown = Some(token.marker.clone());
+                }
             }
-            state.active_process_recovery = Some(process);
             Ok(())
         })
     }
@@ -486,19 +563,20 @@ fn next_epoch(
     Ok(epoch)
 }
 
-impl HostStateStore for RedbHostStateStore {
-    fn load_installation(&self) -> Result<HostInstallationState, HostStateError> {
-        self.read_state()?.ok_or(HostStateError::Unavailable)
-    }
-
-    fn commit_activation(
+impl RedbHostStateStore {
+    /// Commits activation and its exact process/PID/image/job recovery binding
+    /// in one redb write transaction. A crash cannot expose only half of this
+    /// projection.
+    pub fn commit_activation_with_recovery(
         &self,
         transition: HostActivationTransition,
+        process_recovery: HostProcessRecoveryBinding,
     ) -> Result<HostActivationReceipt, HostStateError> {
         transition
             .process
             .validate()
             .map_err(|_| HostStateError::InvalidRecord)?;
+        process_recovery.validate()?;
         let receipt = HostActivationReceipt {
             request_id: transition.context.request_id.clone(),
             installation: transition.installation.clone(),
@@ -506,13 +584,32 @@ impl HostStateStore for RedbHostStateStore {
         };
         self.mutate(transition.installation.as_str(), |state| {
             state.active_process = Some(transition.process);
+            state.active_process_recovery = Some(process_recovery);
             state.last_clean_shutdown = None;
             state.last_recovery_evidence = None;
             state.disposition = HostShutdownDisposition::Clean;
-            state.active_process_recovery = None;
             Ok(())
         })?;
         Ok(receipt)
+    }
+}
+
+impl HostStateStore for RedbHostStateStore {
+    type ReleaseToken = RedbHostReleaseToken;
+
+    fn load_installation(&self) -> Result<HostInstallationState, HostStateError> {
+        self.read_state()?.ok_or(HostStateError::Unavailable)
+    }
+
+    fn commit_activation(
+        &self,
+        _transition: HostActivationTransition,
+    ) -> Result<HostActivationReceipt, HostStateError> {
+        // The Redb production store cannot safely admit an active process
+        // without its exact PID/image/job recovery binding. Callers must use
+        // `commit_activation_with_recovery`, which commits both projections in
+        // one transaction.
+        Err(HostStateError::InvalidRecord)
     }
 
     fn record_dependency(
@@ -543,16 +640,14 @@ impl HostStateStore for RedbHostStateStore {
         Ok(receipt)
     }
 
-    fn mark_clean_shutdown(&self, marker: HostShutdownMarker) -> Result<(), HostStateError> {
-        marker.validate()?;
-        let installation = marker.installation.clone();
-        self.mutate(installation.as_str(), |state| {
-            state.active_process = None;
-            state.active_process_recovery = None;
-            state.disposition = HostShutdownDisposition::Clean;
-            state.last_clean_shutdown = Some(marker);
-            state.last_recovery_evidence = None;
-            Ok(())
-        })
+    fn prepare_release_pending(
+        &self,
+        marker: HostShutdownMarker,
+    ) -> Result<Self::ReleaseToken, HostStateError> {
+        RedbHostStateStore::prepare_release_pending(self, marker)
+    }
+
+    fn finalize_clean_shutdown(&self, token: Self::ReleaseToken) -> Result<(), HostStateError> {
+        RedbHostStateStore::finalize_clean_shutdown(self, token)
     }
 }

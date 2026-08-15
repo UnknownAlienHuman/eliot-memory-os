@@ -20,7 +20,9 @@ pub use service::{
     HostServiceState, KernelStartReceipt, ServiceStopReceipt,
 };
 
-use eliot_contracts::{ContractIdentity, ContractVersion, contract_identity as make_contract_identity};
+use eliot_contracts::{
+    ContractIdentity, ContractVersion, contract_identity as make_contract_identity,
+};
 use thiserror::Error;
 
 /// Stable wire name for the external Host Supervisor boundary.

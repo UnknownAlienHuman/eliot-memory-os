@@ -167,12 +167,16 @@ pub enum HostServiceError {
 }
 
 /// The external Host Supervisor over a platform service port and host state owner.
-pub struct HostService<P, S> {
+pub struct HostService<P, S>
+where
+    S: HostStateStore,
+{
     platform: P,
     state_store: S,
     installation: PlatformHandle,
     state: HostServiceState,
     failure: Option<HostFailure>,
+    pending_release: Option<S::ReleaseToken>,
 }
 
 impl<P, S> HostService<P, S>
@@ -195,21 +199,23 @@ where
         if snapshot.installation != installation {
             return Err(HostServiceError::IdentityMismatch);
         }
-        let state = if snapshot.active_process.is_some() {
-            HostServiceState::DegradedRecovery
-        } else if snapshot.last_clean_shutdown.is_some()
-            || snapshot.last_recovery_evidence.is_some()
-        {
-            HostServiceState::StoppedClean
-        } else {
-            HostServiceState::Stopped
-        };
+        let state =
+            if snapshot.active_process.is_some() || snapshot.disposition.is_release_pending() {
+                HostServiceState::DegradedRecovery
+            } else if snapshot.last_clean_shutdown.is_some()
+                || snapshot.last_recovery_evidence.is_some()
+            {
+                HostServiceState::StoppedClean
+            } else {
+                HostServiceState::Stopped
+            };
         Ok(Self {
             platform,
             state_store,
             installation,
             state,
             failure: None,
+            pending_release: None,
         })
     }
 
@@ -237,15 +243,35 @@ where
         validate_context(context)?;
         validate_handle(&service, "kernel.service")?;
         self.transition(HostServiceState::Starting)?;
-        let inspect = self.execute(context, "kernel-inspect", service.clone(), ServiceOperation::Inspect)?;
+        let inspect = self.execute(
+            context,
+            "kernel-inspect",
+            service.clone(),
+            ServiceOperation::Inspect,
+        )?;
         let (process, reused) = match inspect {
-            PortOutcome::Known(observation) if is_ready_process(&observation, &service, "Kernel") => {
-                (observation.process.ok_or(HostServiceError::ReadinessNotProven)?, true)
+            PortOutcome::Known(observation)
+                if is_ready_process(&observation, &service, "Kernel") =>
+            {
+                (
+                    observation
+                        .process
+                        .ok_or(HostServiceError::ReadinessNotProven)?,
+                    true,
+                )
             }
             PortOutcome::Known(observation)
-                if matches!(observation.state, ServiceState::Stopped | ServiceState::Absent) =>
+                if matches!(
+                    observation.state,
+                    ServiceState::Stopped | ServiceState::Absent
+                ) =>
             {
-                let started = self.execute(context, "kernel-start", service.clone(), ServiceOperation::Start)?;
+                let started = self.execute(
+                    context,
+                    "kernel-start",
+                    service.clone(),
+                    ServiceOperation::Start,
+                )?;
                 let process = match ready_process(started, &service, "Kernel") {
                     Ok(process) => process,
                     Err(error) => {
@@ -352,9 +378,9 @@ where
                 return Ok((BoundedRestartOutcome::RolledBack, receipt));
             }
         }
-        Err(HostServiceError::KernelHandoff(
-            last_error.unwrap_or_else(|| "candidate generation did not start".to_owned()),
-        ))
+        Err(HostServiceError::KernelHandoff(last_error.unwrap_or_else(
+            || "candidate generation did not start".to_owned(),
+        )))
     }
 
     /// Starts one independent managed dependency and records its observed process lineage.
@@ -365,7 +391,10 @@ where
     ) -> Result<ServiceProcessRecord, HostServiceError> {
         validate_context(context)?;
         plan.validate()?;
-        if !matches!(self.state, HostServiceState::ControlReady | HostServiceState::Active) {
+        if !matches!(
+            self.state,
+            HostServiceState::ControlReady | HostServiceState::Active
+        ) {
             return Err(HostServiceError::IllegalTransition {
                 from: self.state,
                 to: HostServiceState::Starting,
@@ -381,10 +410,15 @@ where
             PortOutcome::Known(observation)
                 if is_ready_process(&observation, &plan.service, &plan.expected_owner) =>
             {
-                observation.process.ok_or(HostServiceError::ReadinessNotProven)?
+                observation
+                    .process
+                    .ok_or(HostServiceError::ReadinessNotProven)?
             }
             PortOutcome::Known(observation)
-                if matches!(observation.state, ServiceState::Stopped | ServiceState::Absent) =>
+                if matches!(
+                    observation.state,
+                    ServiceState::Stopped | ServiceState::Absent
+                ) =>
             {
                 let started = self.execute(
                     context,
@@ -435,7 +469,12 @@ where
             });
         }
         self.state = HostServiceState::Draining;
-        let observation = self.execute(context, "kernel-stop-inspect", service.clone(), ServiceOperation::Inspect)?;
+        let observation = self.execute(
+            context,
+            "kernel-stop-inspect",
+            service.clone(),
+            ServiceOperation::Inspect,
+        )?;
         let prior_process = match observation {
             PortOutcome::Known(observation) => match observation.process {
                 Some(process) => process,
@@ -451,11 +490,19 @@ where
                 return Err(HostServiceError::Platform(error));
             }
         };
-        let stopped = self.execute(context, "kernel-stop", service.clone(), ServiceOperation::Stop)?;
+        let stopped = self.execute(
+            context,
+            "kernel-stop",
+            service.clone(),
+            ServiceOperation::Stop,
+        )?;
         match stopped {
             PortOutcome::Known(observation)
                 if observation.service == service
-                    && matches!(observation.state, ServiceState::Stopped | ServiceState::Absent)
+                    && matches!(
+                        observation.state,
+                        ServiceState::Stopped | ServiceState::Absent
+                    )
                     && observation.process.is_none() => {}
             PortOutcome::Partial { .. } | PortOutcome::Unknown(_) => return self.unknown_stop(),
             PortOutcome::Known(_) => {
@@ -472,16 +519,51 @@ where
             installation: self.installation.clone(),
             process: prior_process.clone(),
         };
-        if let Err(error) = self.state_store.mark_clean_shutdown(marker) {
-            self.fail(HostFailure::StateStore(error.to_string()));
-            return Err(HostServiceError::StateStore(error));
-        }
-        self.state = HostServiceState::StoppedClean;
+        let token = match self.state_store.prepare_release_pending(marker) {
+            Ok(token) => token,
+            Err(error) => {
+                self.fail(HostFailure::StateStore(error.to_string()));
+                return Err(HostServiceError::StateStore(error));
+            }
+        };
+        self.pending_release = Some(token);
+        // The platform process is stopped, but the owner-release proof has not
+        // completed yet. Keep Host in recovery until the caller proves release
+        // and invokes `finalize_clean_shutdown`.
+        self.state = HostServiceState::DegradedRecovery;
         self.failure = None;
         Ok(ServiceStopReceipt {
             service,
             prior_process,
         })
+    }
+
+    /// Finalizes a previously prepared clean stop after the caller has
+    /// released its installation-wide owner capability. The token is retained
+    /// when release fails, so a retry cannot bypass the durable pending gate.
+    pub fn finalize_clean_shutdown<F>(&mut self, release_owner: F) -> Result<(), HostServiceError>
+    where
+        F: FnOnce() -> Result<(), HostServiceError>,
+    {
+        let token = self
+            .pending_release
+            .take()
+            .ok_or(HostServiceError::IllegalTransition {
+                from: self.state,
+                to: HostServiceState::StoppedClean,
+            })?;
+        if let Err(error) = release_owner() {
+            self.pending_release = Some(token);
+            self.fail(HostFailure::Platform(error.to_string()));
+            return Err(error);
+        }
+        if let Err(error) = self.state_store.finalize_clean_shutdown(token) {
+            self.fail(HostFailure::StateStore(error.to_string()));
+            return Err(HostServiceError::StateStore(error));
+        }
+        self.state = HostServiceState::StoppedClean;
+        self.failure = None;
+        Ok(())
     }
 
     fn execute(
@@ -520,15 +602,39 @@ where
     fn transition(&mut self, next: HostServiceState) -> Result<(), HostServiceError> {
         let legal = matches!(
             (self.state, next),
-            (HostServiceState::Stopped | HostServiceState::StoppedClean, HostServiceState::Starting)
-                | (HostServiceState::DegradedRecovery, HostServiceState::Starting)
-                | (HostServiceState::Failed, HostServiceState::Starting)
-                | (HostServiceState::Starting, HostServiceState::ControlReady | HostServiceState::DegradedRecovery)
-                | (HostServiceState::ControlReady, HostServiceState::Active | HostServiceState::Draining | HostServiceState::DegradedRecovery)
-                | (HostServiceState::Active, HostServiceState::Draining | HostServiceState::DegradedRecovery)
-                | (HostServiceState::DegradedRecovery, HostServiceState::Draining | HostServiceState::Starting)
-                | (HostServiceState::Failed, HostServiceState::Draining | HostServiceState::Starting)
-                | (HostServiceState::Draining, HostServiceState::StoppedClean | HostServiceState::DegradedRecovery)
+            (
+                HostServiceState::Stopped | HostServiceState::StoppedClean,
+                HostServiceState::Starting
+            ) | (
+                HostServiceState::DegradedRecovery,
+                HostServiceState::Starting
+            ) | (HostServiceState::Failed, HostServiceState::Starting)
+                | (
+                    HostServiceState::Starting,
+                    HostServiceState::ControlReady | HostServiceState::DegradedRecovery
+                )
+                | (
+                    HostServiceState::ControlReady,
+                    HostServiceState::Active
+                        | HostServiceState::Draining
+                        | HostServiceState::DegradedRecovery
+                )
+                | (
+                    HostServiceState::Active,
+                    HostServiceState::Draining | HostServiceState::DegradedRecovery
+                )
+                | (
+                    HostServiceState::DegradedRecovery,
+                    HostServiceState::Draining | HostServiceState::Starting
+                )
+                | (
+                    HostServiceState::Failed,
+                    HostServiceState::Draining | HostServiceState::Starting
+                )
+                | (
+                    HostServiceState::Draining,
+                    HostServiceState::StoppedClean | HostServiceState::DegradedRecovery
+                )
         );
         if legal {
             self.state = next;
@@ -561,7 +667,10 @@ fn validate_context(context: &RequestMetadata) -> Result<(), HostServiceError> {
     Ok(())
 }
 
-fn derived_context(context: &RequestMetadata, suffix: &str) -> Result<RequestMetadata, HostServiceError> {
+fn derived_context(
+    context: &RequestMetadata,
+    suffix: &str,
+) -> Result<RequestMetadata, HostServiceError> {
     let request_id = RequestId::new(format!("{}:{suffix}", context.request_id.as_str()))?;
     let mut derived = context.clone();
     derived.request_id = request_id;
@@ -588,8 +697,12 @@ fn ready_process(
     expected_owner: &str,
 ) -> Result<ServiceProcessRecord, HostServiceError> {
     match outcome {
-        PortOutcome::Known(observation) if is_ready_process(&observation, service, expected_owner) => {
-            observation.process.ok_or(HostServiceError::ReadinessNotProven)
+        PortOutcome::Known(observation)
+            if is_ready_process(&observation, service, expected_owner) =>
+        {
+            observation
+                .process
+                .ok_or(HostServiceError::ReadinessNotProven)
         }
         PortOutcome::Known(_) => Err(HostServiceError::ReadinessNotProven),
         PortOutcome::Partial { .. } => Err(HostServiceError::IncompleteObservation),

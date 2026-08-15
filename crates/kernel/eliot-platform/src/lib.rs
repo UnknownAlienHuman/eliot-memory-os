@@ -648,6 +648,9 @@ pub struct HostRecoveryEvidence {
     pub stale_active_process: ServiceProcessRecord,
     pub process: HostProcessRecoveryBinding,
     pub observed_disposition: HostShutdownDisposition,
+    /// Exact owner-release marker used for the recovery pending/finalization
+    /// protocol. It must identify the same stale process and installation.
+    pub release_marker: HostShutdownMarker,
     pub reason: HostRecoveryReason,
     pub operator_identity: PlatformHandle,
     pub authority_identity: PlatformHandle,
@@ -667,6 +670,12 @@ impl HostRecoveryEvidence {
             .map_err(|_| HostStateError::InvalidRecord)?;
         self.process.validate()?;
         self.observed_disposition.validate()?;
+        self.release_marker.validate()?;
+        if self.release_marker.installation != self.installation
+            || self.release_marker.process != self.stale_active_process
+        {
+            return Err(HostStateError::InvalidRecord);
+        }
         validate_text(
             self.operator_identity.as_str(),
             "recovery.operator_identity",
@@ -695,7 +704,14 @@ impl HostRecoveryEvidence {
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum HostShutdownDisposition {
     Clean,
-    ReleasePending { marker: HostShutdownMarker },
+    ReleasePending {
+        marker: HostShutdownMarker,
+    },
+    /// Recovery compare-and-clear completed while the owner mutex was still
+    /// held; clean finalization remains gated until owner release succeeds.
+    RecoveryFinalized {
+        marker: HostShutdownMarker,
+    },
 }
 
 impl Default for HostShutdownDisposition {
@@ -708,13 +724,18 @@ impl HostShutdownDisposition {
     pub fn validate(&self) -> Result<(), HostStateError> {
         match self {
             Self::Clean => Ok(()),
-            Self::ReleasePending { marker } => marker.validate(),
+            Self::ReleasePending { marker } | Self::RecoveryFinalized { marker } => {
+                marker.validate()
+            }
         }
     }
 
     #[must_use]
     pub const fn is_release_pending(&self) -> bool {
-        matches!(self, Self::ReleasePending { .. })
+        matches!(
+            self,
+            Self::ReleasePending { .. } | Self::RecoveryFinalized { .. }
+        )
     }
 }
 
@@ -767,12 +788,33 @@ impl HostInstallationState {
                 return Err(HostStateError::InstallationMismatch);
             }
         }
-        if let HostShutdownDisposition::ReleasePending { marker } = &self.disposition {
-            if marker.installation != self.installation
-                || self.active_process.as_ref() != Some(&marker.process)
-            {
-                return Err(HostStateError::InvalidRecord);
+        match &self.disposition {
+            HostShutdownDisposition::ReleasePending { marker } => {
+                if marker.installation != self.installation
+                    || self.active_process.as_ref() != Some(&marker.process)
+                {
+                    return Err(HostStateError::InvalidRecord);
+                }
+                if let Some(evidence) = &self.last_recovery_evidence {
+                    if evidence.release_marker != *marker
+                        || evidence.stale_active_process != marker.process
+                    {
+                        return Err(HostStateError::InvalidRecord);
+                    }
+                }
             }
+            HostShutdownDisposition::RecoveryFinalized { marker } => {
+                if marker.installation != self.installation
+                    || self.active_process.is_some()
+                    || self.last_recovery_evidence.as_ref().is_none_or(|evidence| {
+                        evidence.release_marker != *marker
+                            || evidence.stale_active_process != marker.process
+                    })
+                {
+                    return Err(HostStateError::InvalidRecord);
+                }
+            }
+            HostShutdownDisposition::Clean => {}
         }
         Ok(())
     }
@@ -866,6 +908,11 @@ pub enum HostStateError {
 
 /// Exact Host-only operational state boundary from Implementation P.2.
 pub trait HostStateStore: Send + Sync {
+    /// Opaque state-owner capability returned by the pending-release phase.
+    /// Implementations keep its marker private and consume it exactly once at
+    /// clean finalization.
+    type ReleaseToken: Send;
+
     fn load_installation(&self) -> Result<HostInstallationState, HostStateError>;
     fn commit_activation(
         &self,
@@ -875,7 +922,11 @@ pub trait HostStateStore: Send + Sync {
         &self,
         transition: ManagedDependencyTransition,
     ) -> Result<ManagedDependencyReceipt, HostStateError>;
-    fn mark_clean_shutdown(&self, marker: HostShutdownMarker) -> Result<(), HostStateError>;
+    fn prepare_release_pending(
+        &self,
+        marker: HostShutdownMarker,
+    ) -> Result<Self::ReleaseToken, HostStateError>;
+    fn finalize_clean_shutdown(&self, token: Self::ReleaseToken) -> Result<(), HostStateError>;
 }
 
 /// A deterministic collection of fake ports for contract consumers and negative tests.
@@ -1038,6 +1089,12 @@ pub struct FakeHostStateStore {
     state: Mutex<HostInstallationState>,
 }
 
+/// Opaque pending-release capability used by the deterministic fake store.
+/// Production stores use their own private token type.
+pub struct FakeHostReleaseToken {
+    marker: HostShutdownMarker,
+}
+
 impl FakeHostStateStore {
     pub fn new(state: HostInstallationState) -> Result<Self, HostStateError> {
         state.validate()?;
@@ -1048,6 +1105,8 @@ impl FakeHostStateStore {
 }
 
 impl HostStateStore for FakeHostStateStore {
+    type ReleaseToken = FakeHostReleaseToken;
+
     fn load_installation(&self) -> Result<HostInstallationState, HostStateError> {
         self.state
             .lock()
@@ -1109,7 +1168,10 @@ impl HostStateStore for FakeHostStateStore {
         })
     }
 
-    fn mark_clean_shutdown(&self, marker: HostShutdownMarker) -> Result<(), HostStateError> {
+    fn prepare_release_pending(
+        &self,
+        marker: HostShutdownMarker,
+    ) -> Result<Self::ReleaseToken, HostStateError> {
         marker.validate()?;
         let mut state = self
             .state
@@ -1118,10 +1180,39 @@ impl HostStateStore for FakeHostStateStore {
         if state.installation != marker.installation {
             return Err(HostStateError::InstallationMismatch);
         }
+        if state.active_process.as_ref() != Some(&marker.process)
+            || state.active_process_recovery.is_none()
+        {
+            return Err(HostStateError::InvalidRecord);
+        }
+        state.disposition = HostShutdownDisposition::ReleasePending {
+            marker: marker.clone(),
+        };
+        state.last_recovery_evidence = None;
+        Ok(FakeHostReleaseToken { marker })
+    }
+
+    fn finalize_clean_shutdown(&self, token: Self::ReleaseToken) -> Result<(), HostStateError> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| HostStateError::Synchronization)?;
+        if state.installation != token.marker.installation {
+            return Err(HostStateError::InstallationMismatch);
+        }
+        if state.active_process.as_ref() != Some(&token.marker.process)
+            || state.active_process_recovery.is_none()
+            || state.disposition
+                != (HostShutdownDisposition::ReleasePending {
+                    marker: token.marker.clone(),
+                })
+        {
+            return Err(HostStateError::InvalidRecord);
+        }
         state.active_process = None;
         state.active_process_recovery = None;
         state.disposition = HostShutdownDisposition::Clean;
-        state.last_clean_shutdown = Some(marker);
+        state.last_clean_shutdown = Some(token.marker);
         state.last_recovery_evidence = None;
         Ok(())
     }
@@ -1434,6 +1525,15 @@ mod tests {
             })
             .unwrap_or_else(|_| unreachable!());
         assert_eq!(activation.process, host);
+        {
+            let mut state = store.state.lock().unwrap_or_else(|_| unreachable!());
+            state.active_process_recovery = Some(HostProcessRecoveryBinding {
+                process_generation: handle("generation-1"),
+                process_id: 1,
+                image_path: handle("image-1"),
+                job: HostJobDisposition::NotAssigned,
+            });
+        }
         let dependency = process("store-1", "CanonicalStore", ServiceProcessState::Ready);
         store
             .record_dependency(ManagedDependencyTransition {
@@ -1457,12 +1557,15 @@ mod tests {
             }),
             Err(HostStateError::InstallationMismatch)
         ));
-        store
-            .mark_clean_shutdown(HostShutdownMarker {
+        let token = store
+            .prepare_release_pending(HostShutdownMarker {
                 context: context("shutdown"),
                 installation,
                 process: host,
             })
+            .unwrap_or_else(|_| unreachable!());
+        store
+            .finalize_clean_shutdown(token)
             .unwrap_or_else(|_| unreachable!());
         let final_state = store.load_installation().unwrap_or_else(|_| unreachable!());
         assert!(final_state.active_process.is_none());

@@ -16,7 +16,8 @@ use eliot_contracts::{
     SourceId, StateFence,
 };
 use eliot_host_state::{
-    HostAdmissionState, HostInstallationEpoch, HostRecoverySnapshot, RedbHostStateStore,
+    HostAdmissionState, HostInstallationEpoch, HostRecoverySnapshot, RedbHostReleaseToken,
+    RedbHostStateStore,
 };
 use eliot_installation::{
     ApprovedGenerationRegistry, CandidateManifest, InstallationError, RedbInstallationRegistry,
@@ -404,6 +405,7 @@ pub struct HostComposition {
     #[cfg(windows)]
     jobs: HostJobBranches,
     owner_lease: HostOwnerLease,
+    pending_release: Option<RedbHostReleaseToken>,
     shutdown_failed: bool,
 }
 
@@ -439,14 +441,14 @@ impl HostComposition {
         // projection had no clean marker, this deliberately remains an
         // unclean recovery until stop() writes the shutdown receipt.
         state_store
-            .commit_activation(eliot_platform::HostActivationTransition {
-                context: lifecycle_context(&host, "host-open")?,
-                installation: host.installation.clone(),
-                process: host_process.clone(),
-            })
-            .map_err(HostError::State)?;
-        state_store
-            .record_active_process_recovery(&host.installation, host_recovery)
+            .commit_activation_with_recovery(
+                eliot_platform::HostActivationTransition {
+                    context: lifecycle_context(&host, "host-open")?,
+                    installation: host.installation.clone(),
+                    process: host_process.clone(),
+                },
+                host_recovery,
+            )
             .map_err(HostError::State)?;
         #[cfg(windows)]
         let jobs =
@@ -461,6 +463,7 @@ impl HostComposition {
             #[cfg(windows)]
             jobs,
             owner_lease,
+            pending_release: None,
             shutdown_failed: false,
         };
         #[cfg(windows)]
@@ -494,12 +497,18 @@ impl HostComposition {
         )?;
         validate_recovery_evidence(&snapshot, &evidence)?;
         let state_store = RedbHostStateStore::open_existing(path, &installation)?;
-        owner_lease.release().map_err(owner_lease_release_error)?;
-        // Keep the stale projection untouched until the owner release is
-        // proven. If release fails or this final atomic clear fails, the next
-        // Host start remains recovery-gated.
+        let token = state_store
+            .prepare_recovery_pending(evidence)
+            .map_err(HostError::State)?;
+        // Compare-and-clear is durable while the owner mutex is still held.
+        // The RecoveryFinalized disposition remains a gate until the owner
+        // release is proven and the exact token is cleanly finalized.
         state_store
-            .clear_recovery(evidence)
+            .finalize_recovery_clear(&token)
+            .map_err(HostError::State)?;
+        owner_lease.release().map_err(owner_lease_release_error)?;
+        state_store
+            .finalize_clean_shutdown(token)
             .map_err(HostError::State)
     }
 
@@ -702,14 +711,14 @@ impl HostComposition {
         let store_record = process_record(store, "Store", &self.host)?;
         let kernel_recovery = self.jobs.kernel_recovery_binding(&generation)?;
         self.state_store
-            .commit_activation(eliot_platform::HostActivationTransition {
-                context: lifecycle_context(&self.host, "kernel-activation")?,
-                installation: self.host.installation.clone(),
-                process: kernel_record,
-            })
-            .map_err(HostError::State)?;
-        self.state_store
-            .record_active_process_recovery(&self.host.installation, kernel_recovery)
+            .commit_activation_with_recovery(
+                eliot_platform::HostActivationTransition {
+                    context: lifecycle_context(&self.host, "kernel-activation")?,
+                    installation: self.host.installation.clone(),
+                    process: kernel_record,
+                },
+                kernel_recovery,
+            )
             .map_err(HostError::State)?;
         self.state_store
             .record_dependency(eliot_platform::ManagedDependencyTransition {
@@ -728,23 +737,30 @@ impl HostComposition {
         if !self.running {
             return Err(HostError::Stopped);
         }
-        let state = self.snapshot()?;
-        let process = state
-            .active_process
-            .unwrap_or_else(|| self.host_process.clone());
-        #[cfg(windows)]
-        {
-            self.jobs.terminate_kernel()?;
-            self.jobs.terminate_store()?;
+        if self.pending_release.is_none() {
+            let state = self.snapshot()?;
+            let process = state
+                .active_process
+                .unwrap_or_else(|| self.host_process.clone());
+            #[cfg(windows)]
+            {
+                self.jobs.terminate_kernel()?;
+                self.jobs.terminate_store()?;
+            }
+            let marker = eliot_platform::HostShutdownMarker {
+                context: lifecycle_context(&self.host, "host-stop")?,
+                installation: self.host.installation.clone(),
+                process,
+            };
+            let token = self
+                .state_store
+                .prepare_release_pending(marker)
+                .map_err(HostError::State)?;
+            self.pending_release = Some(token);
         }
-        let marker = eliot_platform::HostShutdownMarker {
-            context: lifecycle_context(&self.host, "host-stop")?,
-            installation: self.host.installation.clone(),
-            process,
-        };
-        self.state_store
-            .prepare_release_pending(marker.clone())
-            .map_err(HostError::State)?;
+        let token = self.pending_release.take().ok_or_else(|| {
+            HostError::OwnerLeaseRecovery("release token is unavailable".to_owned())
+        })?;
         if let Err(error) = self
             .owner_lease
             .release()
@@ -753,12 +769,13 @@ impl HostComposition {
             // The durable ReleasePending disposition remains in place and
             // the owner handle/ownership is retained by the platform adapter
             // for a bounded retry. Drop must not turn this into Clean.
+            self.pending_release = Some(token);
             self.shutdown_failed = true;
             return Err(error);
         }
         if let Err(error) = self
             .state_store
-            .finalize_clean_shutdown(marker)
+            .finalize_clean_shutdown(token)
             .map_err(HostError::State)
         {
             // The mutex is already released, so no further process admission
@@ -850,11 +867,13 @@ fn validate_recovery_evidence(
     evidence: &HostRecoveryEvidence,
 ) -> Result<(), HostError> {
     evidence.validate().map_err(HostError::State)?;
+    let disposition_matches = snapshot.disposition == evidence.observed_disposition
+        || snapshot.recovery_evidence.as_ref() == Some(evidence);
     if snapshot.installation != evidence.installation
         || snapshot.host_epoch != evidence.host_epoch
         || snapshot.active_process != evidence.stale_active_process
         || snapshot.process != evidence.process
-        || snapshot.disposition != evidence.observed_disposition
+        || !disposition_matches
     {
         return Err(HostError::OwnerLeaseRecovery(
             "recovery evidence does not exactly match the inspected stale Host projection"
