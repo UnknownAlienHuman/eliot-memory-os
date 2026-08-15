@@ -1,0 +1,17 @@
+[package]
+name = "eliot-skill"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Governor-owned governed Skill lifecycle and promotion contracts"
+
+[dependencies]
+eliot-contracts.workspace = true
+eliot-skills.workspace = true
+serde.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true
