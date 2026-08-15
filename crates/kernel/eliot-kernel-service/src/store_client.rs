@@ -372,12 +372,20 @@ impl<T: EbpStoreTransport + 'static> CanonicalStoreClient for EbpCanonicalStoreC
             Ok(StoreResponse::Transaction { receipt }) if receipt.operation_id == operation_id => {
                 Ok(receipt)
             }
-            Ok(StoreResponse::Transaction { .. }) => Err(StoreError::IdentityConflict),
-            Ok(_) => Err(StoreError::InvalidReceipt),
+            // Once Apply has crossed the transport boundary, a valid response
+            // with the wrong operation identity or response kind is itself an
+            // uncertain observation. Reconcile only the operation that this
+            // Kernel call admitted; never adopt an identity from the peer.
+            Ok(_) => self.receipt_exact(operation_id).await,
             Err(RequestFailure::Unknown {
                 operation_id: observed,
-                reason: _,
-            }) if observed == operation_id => self.receipt_exact(operation_id).await,
+                ..
+            }) => {
+                // The peer's identity is evidence of a mismatch only; the
+                // receipt lookup remains bound to our admitted operation.
+                let _ = observed;
+                self.receipt_exact(operation_id).await
+            }
             Err(error) => Err(error.into_store_error()),
         }
     }
@@ -653,9 +661,9 @@ mod windows_e2e_tests {
     use eliot_ipc::NamedPipeServer;
     use eliot_platform::PlatformHandle;
     use eliot_store_api::{
-        EventProjectionRelationIntents, NamedMutationOperation, NamedMutationRequest,
-        OperationIdentity, OperationManifestDigest, ReadinessReceipt, SecurityContext,
-        StoreResponse, TransitionClass,
+        CommitId, EventProjectionRelationIntents, NamedMutationOperation, NamedMutationRequest,
+        OperationIdentity, OperationManifestDigest, ReadinessReceipt, Resubmission,
+        SecurityContext, StoreResponse, TransitionClass, WriteReceiptStatus,
     };
     use eliot_store_surreal::{
         Request as StoreServiceRequest, Response as StoreServiceResponse, StoreDispatchBackend,
@@ -971,6 +979,33 @@ mod windows_e2e_tests {
         Correlation,
         Connection,
         Protocol,
+        WrongTransaction,
+        WrongUnknown,
+        UnexpectedKind,
+    }
+
+    fn wrong_transaction_receipt() -> WriteReceipt {
+        WriteReceipt {
+            operation_id: OperationId::new("wrong-operation").expect("operation id"),
+            idempotency_key: "idempotency-e2e".to_owned(),
+            canonical_request_hash: "c".repeat(64),
+            transition_class: TransitionClass::CaptureCandidate,
+            status: WriteReceiptStatus::Committed,
+            commit_id: Some(CommitId::new("wrong-commit").expect("commit id")),
+            state_fence: StateFence::new(AuthorityEpoch::genesis(), ResourceGeneration::genesis()),
+            ordering_sequences: Vec::new(),
+            revision_before_after: Vec::new(),
+            applied_command_ids: vec!["wrong-command".to_owned()],
+            emitted_event_ids: Vec::new(),
+            projection_refs: Vec::new(),
+            outbox_refs: Vec::new(),
+            operation_manifest_digest: OperationManifestDigest::new("manifest-e2e")
+                .expect("manifest"),
+            error_code: None,
+            resubmission: Resubmission::None,
+            committed_at: Some("wrong-commit-time".to_owned()),
+            envelope: None,
+        }
     }
 
     struct FakeTransport {
@@ -1028,11 +1063,27 @@ mod windows_e2e_tests {
             let request_id = self.last_request_id.clone().ok_or_else(|| {
                 StoreClientError::Contract("receipt was not requested".to_owned())
             })?;
+            let response_value = match self.boundary {
+                UnknownBoundary::WrongTransaction => StoreResponse::Transaction {
+                    receipt: wrong_transaction_receipt(),
+                },
+                UnknownBoundary::WrongUnknown => StoreResponse::Unknown {
+                    operation_id: OperationId::new("wrong-operation").expect("operation id"),
+                    reason: "peer reported a different operation identity".to_owned(),
+                },
+                UnknownBoundary::Send
+                | UnknownBoundary::Receive
+                | UnknownBoundary::Decode
+                | UnknownBoundary::Correlation
+                | UnknownBoundary::Connection
+                | UnknownBoundary::Protocol
+                | UnknownBoundary::UnexpectedKind => StoreResponse::Receipt { receipt: None },
+            };
             let mut response = eliot_store_api::response_frame(
                 "connection-e2e",
                 ProtocolVersion::CURRENT,
                 Some(request_id),
-                StoreResponse::Receipt { receipt: None },
+                response_value,
             )
             .map_err(|error| StoreClientError::Contract(error.to_string()))?;
             if self.applied.is_some() && self.reconciled.is_none() && !self.response_faulted {
@@ -1056,7 +1107,11 @@ mod windows_e2e_tests {
                             minor: ProtocolVersion::CURRENT.minor.saturating_add(1),
                         };
                     }
-                    UnknownBoundary::Send | UnknownBoundary::Receive => {}
+                    UnknownBoundary::Send
+                    | UnknownBoundary::Receive
+                    | UnknownBoundary::WrongTransaction
+                    | UnknownBoundary::WrongUnknown
+                    | UnknownBoundary::UnexpectedKind => {}
                 }
                 self.response_faulted = true;
             }
@@ -1156,6 +1211,36 @@ mod windows_e2e_tests {
     #[tokio::test(flavor = "current_thread")]
     async fn wrong_protocol_preserves_exact_operation_for_receipt_lookup() {
         let (error, reconciled) = apply_with_fake_boundary(UnknownBoundary::Protocol).await;
+        assert!(matches!(error, StoreError::Unavailable));
+        assert_eq!(
+            reconciled.expect("reconciliation request").as_str(),
+            "operation-e2e"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn wrong_transaction_operation_reconciles_exact_expected_operation() {
+        let (error, reconciled) = apply_with_fake_boundary(UnknownBoundary::WrongTransaction).await;
+        assert!(matches!(error, StoreError::Unavailable));
+        assert_eq!(
+            reconciled.expect("reconciliation request").as_str(),
+            "operation-e2e"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn wrong_unknown_operation_reconciles_exact_expected_operation() {
+        let (error, reconciled) = apply_with_fake_boundary(UnknownBoundary::WrongUnknown).await;
+        assert!(matches!(error, StoreError::Unavailable));
+        assert_eq!(
+            reconciled.expect("reconciliation request").as_str(),
+            "operation-e2e"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn unexpected_response_kind_reconciles_exact_expected_operation() {
+        let (error, reconciled) = apply_with_fake_boundary(UnknownBoundary::UnexpectedKind).await;
         assert!(matches!(error, StoreError::Unavailable));
         assert_eq!(
             reconciled.expect("reconciliation request").as_str(),
