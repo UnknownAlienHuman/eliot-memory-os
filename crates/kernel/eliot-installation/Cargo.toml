@@ -16,6 +16,7 @@ proof_entrypoint = "cargo test -p eliot-installation"
 [dependencies]
 eliot-contracts.workspace = true
 eliot-platform.workspace = true
+eliot-platform-windows.workspace = true
 redb.workspace = true
 schemars.workspace = true
 serde.workspace = true

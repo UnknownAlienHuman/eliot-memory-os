@@ -11,6 +11,9 @@ use eliot_platform::{
     HostShutdownDisposition, HostShutdownMarker, HostStateError, HostStateStore,
     ManagedDependencyReceipt, ManagedDependencyTransition, PlatformHandle,
 };
+use eliot_platform_windows::{
+    prepare_protected_directory, require_protected_program_data_path, validate_protected_file,
+};
 use eliot_runtime_contracts::ServiceProcessRecord;
 use redb::{Database, ReadOnlyDatabase, ReadableDatabase, ReadableTable, TableDefinition};
 
@@ -18,6 +21,18 @@ const STATE: TableDefinition<&str, &[u8]> = TableDefinition::new("eliot_host_sta
 const INSTALLATION: &str = "installation";
 const EPOCH: TableDefinition<&str, &[u8]> = TableDefinition::new("eliot_host_epoch_v1");
 const CURRENT_EPOCH: &str = "current";
+const HOST_STATE_RELATIVE_PATH: &str = "Eliot/host/host-state.redb";
+
+fn protected_state_path(path: &Path) -> Result<(), HostStateError> {
+    require_protected_program_data_path(path, HOST_STATE_RELATIVE_PATH)
+        .map(|_| ())
+        .map_err(|_| HostStateError::Unavailable)
+}
+
+fn prepare_state_parent(path: &Path) -> Result<(), HostStateError> {
+    let parent = path.parent().ok_or(HostStateError::Unavailable)?;
+    prepare_protected_directory(parent).map_err(|_| HostStateError::Unavailable)
+}
 
 /// Read-only admission result for one existing Host state database.
 ///
@@ -67,6 +82,7 @@ impl RedbHostStateStore {
         installation: &PlatformHandle,
     ) -> Result<HostAdmissionState, HostStateError> {
         let path = path.as_ref();
+        protected_state_path(path)?;
         match fs::symlink_metadata(path) {
             Ok(metadata) if metadata.is_file() => {}
             Ok(_) => return Err(HostStateError::Unavailable),
@@ -75,6 +91,7 @@ impl RedbHostStateStore {
             }
             Err(_) => return Err(HostStateError::Unavailable),
         }
+        validate_protected_file(path).map_err(|_| HostStateError::Unavailable)?;
         let database = ReadOnlyDatabase::open(path).map_err(|_| HostStateError::Unavailable)?;
         let state = read_state_from(&database)?.ok_or(HostStateError::Unavailable)?;
         validate_admission_state(&state, installation)?;
@@ -96,10 +113,12 @@ impl RedbHostStateStore {
         installation: &PlatformHandle,
     ) -> Result<HostRecoverySnapshot, HostStateError> {
         let path = path.as_ref();
+        protected_state_path(path)?;
         match fs::symlink_metadata(path) {
             Ok(metadata) if metadata.is_file() => {}
             Ok(_) | Err(_) => return Err(HostStateError::Unavailable),
         }
+        validate_protected_file(path).map_err(|_| HostStateError::Unavailable)?;
         let database = ReadOnlyDatabase::open(path).map_err(|_| HostStateError::Unavailable)?;
         let state = read_state_from(&database)?.ok_or(HostStateError::Unavailable)?;
         validate_admission_state(&state, installation)?;
@@ -140,10 +159,12 @@ impl RedbHostStateStore {
         installation: &PlatformHandle,
     ) -> Result<Self, HostStateError> {
         let path = path.as_ref();
+        protected_state_path(path)?;
         match fs::symlink_metadata(path) {
             Ok(metadata) if metadata.is_file() => {}
             Ok(_) | Err(_) => return Err(HostStateError::Unavailable),
         }
+        validate_protected_file(path).map_err(|_| HostStateError::Unavailable)?;
         let database = Database::open(path).map_err(|_| HostStateError::Unavailable)?;
         let store = Self { database };
         let state = store.read_state()?.ok_or(HostStateError::Unavailable)?;
@@ -310,11 +331,15 @@ impl RedbHostStateStore {
         path: impl AsRef<Path>,
         initial: HostInstallationState,
     ) -> Result<Self, HostStateError> {
+        let path = path.as_ref();
+        protected_state_path(path)?;
         initial.validate()?;
-        if let Some(parent) = path.as_ref().parent() {
-            fs::create_dir_all(parent).map_err(|_| HostStateError::Unavailable)?;
+        prepare_state_parent(path)?;
+        if fs::symlink_metadata(path).is_ok() {
+            validate_protected_file(path).map_err(|_| HostStateError::Unavailable)?;
         }
         let database = Database::create(path).map_err(|_| HostStateError::Unavailable)?;
+        validate_protected_file(path).map_err(|_| HostStateError::Unavailable)?;
         let store = Self { database };
         match store.read_state()? {
             Some(existing) if existing.installation != initial.installation => {
@@ -339,6 +364,8 @@ impl RedbHostStateStore {
         path: impl AsRef<Path>,
         installation: PlatformHandle,
     ) -> Result<(Self, HostInstallationEpoch), HostStateError> {
+        let path = path.as_ref();
+        protected_state_path(path)?;
         let initial = HostInstallationState {
             installation: installation.clone(),
             active_process: None,
@@ -350,10 +377,12 @@ impl RedbHostStateStore {
             recovery_fence: None,
         };
         initial.validate()?;
-        if let Some(parent) = path.as_ref().parent() {
-            fs::create_dir_all(parent).map_err(|_| HostStateError::Unavailable)?;
+        prepare_state_parent(path)?;
+        if fs::symlink_metadata(path).is_ok() {
+            validate_protected_file(path).map_err(|_| HostStateError::Unavailable)?;
         }
         let database = Database::create(path).map_err(|_| HostStateError::Unavailable)?;
+        validate_protected_file(path).map_err(|_| HostStateError::Unavailable)?;
         let store = Self { database };
         match store.read_state()? {
             Some(existing) if existing.installation != installation => {

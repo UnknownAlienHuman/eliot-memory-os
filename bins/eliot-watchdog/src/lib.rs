@@ -6,9 +6,8 @@
 
 #![forbid(unsafe_code)]
 
-use std::fs::{self, OpenOptions};
+use std::fs;
 use std::future::Future;
-use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -17,6 +16,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use eliot_contracts::{AuthorityEpoch, sha256_hex};
 use eliot_installation::RedbInstallationRegistry;
+use eliot_platform_windows::{
+    prepare_protected_directory, protected_program_data_path, read_protected_file,
+    require_protected_program_data_path, validate_protected_file,
+};
 use eliot_runtime::{
     ChildClass, Runtime, RuntimeConfig, ShutdownOutcome, SupervisionStrategy, TaskFailure,
 };
@@ -25,6 +28,7 @@ use eliot_runtime_contracts::{
     SupervisionTrustAnchor, VerifiedSupervisionLease,
 };
 use eliot_watchdog_core::{Epoch, Watchdog};
+use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 use thiserror::Error;
 
 pub const SERVICE_NAME: &str = "eliot-watchdog";
@@ -139,41 +143,399 @@ impl WatchdogAdmissionSource for FileWatchdogAdmission {
 pub enum SpoolError {
     #[error("watchdog spool I/O: {0}")]
     Io(#[from] std::io::Error),
-    #[error("watchdog spool path must be absolute")]
-    RelativePath,
-    #[error("watchdog spool must be below the canonical ProgramData protected root")]
+    #[error("watchdog spool path is not the canonical protected path")]
     InvalidProtectedRoot,
     #[error("watchdog spool serialization: {0}")]
     Serialization(String),
+    #[error("watchdog spool redb database: {0}")]
+    Database(String),
+    #[error("watchdog spool corruption requires recovery: {0}")]
+    Corrupt(String),
     #[error("watchdog lease is unavailable or invalid: {0}")]
     InvalidLease(String),
 }
 
-const SPOOL_LIMIT: u64 = 1024 * 1024;
-const SPOOL_ROTATIONS: usize = 3;
+const SPOOL_SCHEMA_VERSION: u16 = 1;
+const SPOOL_HEADER_KEY: u64 = 0;
+const SPOOL_MAX_RECORDS: u64 = 4096;
+const SPOOL_MAX_BYTES: u64 = 4 * 1024 * 1024;
+const SPOOL_MAX_RECORD_BYTES: usize = 64 * 1024;
+const SPOOL_RELATIVE_PATH: &str = "Eliot/watchdog/watchdog.redb";
+const SPOOL_TABLE: TableDefinition<u64, &[u8]> = TableDefinition::new("eliot_watchdog_spool_v1");
 
-#[derive(serde::Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields)]
-struct Heartbeat<'a> {
-    record_type: &'static str,
-    service: &'static str,
-    lease_id: &'a str,
-    scope_ref: &'a str,
-    kernel_epoch: u64,
-    watchdog_epoch: u64,
-    payload_digest: &'a str,
-    envelope_digest: &'a str,
-    signer_id: &'a str,
-    key_id: &'a str,
-    signature_algorithm: &'a str,
-    signature: &'a str,
-    public_key_fingerprint: &'a str,
-    lease_revision: u64,
+struct WatchdogSpoolHeader {
+    schema_version: u16,
+    next_sequence: u64,
+    first_sequence: u64,
+    record_count: u64,
+    bytes: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+#[serde(tag = "record_type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum WatchdogSpoolPayload {
+    Heartbeat {
+        service: String,
+        lease_id: String,
+        scope_ref: String,
+        kernel_epoch: u64,
+        watchdog_epoch: u64,
+        payload_digest: String,
+        envelope_digest: String,
+        signer_id: String,
+        key_id: String,
+        signature_algorithm: String,
+        signature: String,
+        public_key_fingerprint: String,
+        lease_revision: u64,
+    },
+    Gap {
+        service: String,
+        reason: GapRecoveryReason,
+        coverage_claimed: bool,
+    },
+    Recovery {
+        service: String,
+        reason: String,
+        corrupt_sequence: Option<u64>,
+        corrupt_digest: String,
+    },
+}
+
+/// One typed, ordered and bounded Watchdog spool record.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct WatchdogSpoolEntry {
+    pub schema_version: u16,
+    pub sequence: u64,
+    pub observed_at_ms: u64,
+    pub payload: WatchdogSpoolPayload,
+}
+
+#[derive(Debug)]
+struct WatchdogSpool {
+    database: Database,
+}
+
+impl WatchdogSpool {
+    fn open(path: &Path) -> Result<Self, SpoolError> {
+        let database =
+            Database::create(path).map_err(|error| SpoolError::Database(error.to_string()))?;
+        let spool = Self { database };
+        spool.initialize_or_recover()?;
+        Ok(spool)
+    }
+
+    fn readback(&self) -> Result<Vec<WatchdogSpoolEntry>, SpoolError> {
+        let read = self
+            .database
+            .begin_read()
+            .map_err(|error| SpoolError::Database(error.to_string()))?;
+        let table = match read.open_table(SPOOL_TABLE) {
+            Ok(table) => table,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
+            Err(error) => return Err(SpoolError::Database(error.to_string())),
+        };
+        let header = table
+            .get(SPOOL_HEADER_KEY)
+            .map_err(|error| SpoolError::Database(error.to_string()))?
+            .ok_or_else(|| SpoolError::Corrupt("spool header is missing".to_owned()))?;
+        let header: WatchdogSpoolHeader = serde_json::from_slice(header.value())
+            .map_err(|error| SpoolError::Corrupt(format!("invalid spool header: {error}")))?;
+        let entries = collect_entries(&table)?;
+        validate_header(&header, &entries)?;
+        Ok(entries)
+    }
+
+    fn initialize_or_recover(&self) -> Result<(), SpoolError> {
+        let read = self
+            .database
+            .begin_read()
+            .map_err(|error| SpoolError::Database(error.to_string()))?;
+        let table = match read.open_table(SPOOL_TABLE) {
+            Ok(table) => table,
+            Err(redb::TableError::TableDoesNotExist(_)) => {
+                drop(read);
+                return self.write_header(WatchdogSpoolHeader {
+                    schema_version: SPOOL_SCHEMA_VERSION,
+                    next_sequence: 1,
+                    first_sequence: 1,
+                    record_count: 0,
+                    bytes: 0,
+                });
+            }
+            Err(error) => return Err(SpoolError::Database(error.to_string())),
+        };
+        let header = table
+            .get(SPOOL_HEADER_KEY)
+            .map_err(|error| SpoolError::Database(error.to_string()))?;
+        let entries = collect_entries(&table);
+        let parsed_header = header
+            .as_ref()
+            .and_then(|value| serde_json::from_slice::<WatchdogSpoolHeader>(value.value()).ok());
+        let valid = parsed_header
+            .as_ref()
+            .zip(entries.as_ref().ok())
+            .is_some_and(|(header, entries)| validate_header(header, entries).is_ok());
+        if valid {
+            return Ok(());
+        }
+        let corrupt_digest = header
+            .as_ref()
+            .map(|value| sha256_hex(value.value()))
+            .unwrap_or_else(|| "missing".to_owned());
+        drop(table);
+        drop(read);
+        self.recover(
+            "existing spool header or record set failed validation",
+            None,
+            corrupt_digest,
+        )
+    }
+
+    fn write_header(&self, header: WatchdogSpoolHeader) -> Result<(), SpoolError> {
+        let bytes = serde_json::to_vec(&header)
+            .map_err(|error| SpoolError::Serialization(error.to_string()))?;
+        let write = self
+            .database
+            .begin_write()
+            .map_err(|error| SpoolError::Database(error.to_string()))?;
+        {
+            let mut table = write
+                .open_table(SPOOL_TABLE)
+                .map_err(|error| SpoolError::Database(error.to_string()))?;
+            table
+                .insert(SPOOL_HEADER_KEY, bytes.as_slice())
+                .map_err(|error| SpoolError::Database(error.to_string()))?;
+        }
+        write
+            .commit()
+            .map_err(|error| SpoolError::Database(error.to_string()))
+    }
+
+    fn recover(
+        &self,
+        reason: &str,
+        corrupt_sequence: Option<u64>,
+        corrupt_digest: String,
+    ) -> Result<(), SpoolError> {
+        let entry = WatchdogSpoolEntry {
+            schema_version: SPOOL_SCHEMA_VERSION,
+            sequence: 1,
+            observed_at_ms: current_unix_ms()?.max(1),
+            payload: WatchdogSpoolPayload::Recovery {
+                service: SERVICE_NAME.to_owned(),
+                reason: reason.to_owned(),
+                corrupt_sequence,
+                corrupt_digest,
+            },
+        };
+        let bytes = encode_entry(&entry)?;
+        let header = WatchdogSpoolHeader {
+            schema_version: SPOOL_SCHEMA_VERSION,
+            next_sequence: 2,
+            first_sequence: 1,
+            record_count: 1,
+            bytes: bytes.len() as u64,
+        };
+        let header_bytes = serde_json::to_vec(&header)
+            .map_err(|error| SpoolError::Serialization(error.to_string()))?;
+        let write = self
+            .database
+            .begin_write()
+            .map_err(|error| SpoolError::Database(error.to_string()))?;
+        {
+            let mut table = write
+                .open_table(SPOOL_TABLE)
+                .map_err(|error| SpoolError::Database(error.to_string()))?;
+            let keys = table
+                .iter()
+                .map_err(|error| SpoolError::Database(error.to_string()))?
+                .map(|item| {
+                    item.map(|(key, _)| key.value())
+                        .map_err(|error| SpoolError::Database(error.to_string()))
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            for key in keys {
+                table
+                    .remove(key)
+                    .map_err(|error| SpoolError::Database(error.to_string()))?;
+            }
+            table
+                .insert(SPOOL_HEADER_KEY, header_bytes.as_slice())
+                .map_err(|error| SpoolError::Database(error.to_string()))?;
+            table
+                .insert(entry.sequence, bytes.as_slice())
+                .map_err(|error| SpoolError::Database(error.to_string()))?;
+        }
+        write
+            .commit()
+            .map_err(|error| SpoolError::Database(error.to_string()))
+    }
+
+    fn append(&self, observed_at_ms: u64, payload: WatchdogSpoolPayload) -> Result<(), SpoolError> {
+        let write = self
+            .database
+            .begin_write()
+            .map_err(|error| SpoolError::Database(error.to_string()))?;
+        let mut table = write
+            .open_table(SPOOL_TABLE)
+            .map_err(|error| SpoolError::Database(error.to_string()))?;
+        let header_bytes = table
+            .get(SPOOL_HEADER_KEY)
+            .map_err(|error| SpoolError::Database(error.to_string()))?
+            .map(|value| value.value().to_vec())
+            .ok_or_else(|| SpoolError::Corrupt("spool header is missing".to_owned()))?;
+        let mut header: WatchdogSpoolHeader = serde_json::from_slice(&header_bytes)
+            .map_err(|error| SpoolError::Corrupt(format!("invalid spool header: {error}")))?;
+        let entries = collect_entries(&table)?;
+        validate_header(&header, &entries)?;
+        let sequence = header.next_sequence;
+        let entry = WatchdogSpoolEntry {
+            schema_version: SPOOL_SCHEMA_VERSION,
+            sequence,
+            observed_at_ms,
+            payload,
+        };
+        let bytes = encode_entry(&entry)?;
+        while header.record_count >= SPOOL_MAX_RECORDS
+            || header.bytes.saturating_add(bytes.len() as u64) > SPOOL_MAX_BYTES
+        {
+            if header.record_count == 0 {
+                break;
+            }
+            let old_sequence = header.first_sequence;
+            let old = table
+                .remove(old_sequence)
+                .map_err(|error| SpoolError::Database(error.to_string()))?
+                .ok_or_else(|| SpoolError::Corrupt("retention record is missing".to_owned()))?;
+            header.bytes = header
+                .bytes
+                .checked_sub(old.value().len() as u64)
+                .ok_or_else(|| SpoolError::Corrupt("spool byte counter underflow".to_owned()))?;
+            header.first_sequence = old_sequence
+                .checked_add(1)
+                .ok_or_else(|| SpoolError::Corrupt("spool sequence overflow".to_owned()))?;
+            header.record_count -= 1;
+        }
+        table
+            .insert(sequence, bytes.as_slice())
+            .map_err(|error| SpoolError::Database(error.to_string()))?;
+        header.schema_version = SPOOL_SCHEMA_VERSION;
+        header.next_sequence = sequence
+            .checked_add(1)
+            .ok_or_else(|| SpoolError::Corrupt("spool sequence overflow".to_owned()))?;
+        if header.record_count == 0 {
+            header.first_sequence = sequence;
+        }
+        header.record_count += 1;
+        header.bytes = header
+            .bytes
+            .checked_add(bytes.len() as u64)
+            .ok_or_else(|| SpoolError::Corrupt("spool byte counter overflow".to_owned()))?;
+        let header_bytes = serde_json::to_vec(&header)
+            .map_err(|error| SpoolError::Serialization(error.to_string()))?;
+        table
+            .insert(SPOOL_HEADER_KEY, header_bytes.as_slice())
+            .map_err(|error| SpoolError::Database(error.to_string()))?;
+        drop(table);
+        write
+            .commit()
+            .map_err(|error| SpoolError::Database(error.to_string()))
+    }
+}
+
+fn encode_entry(entry: &WatchdogSpoolEntry) -> Result<Vec<u8>, SpoolError> {
+    let bytes =
+        serde_json::to_vec(entry).map_err(|error| SpoolError::Serialization(error.to_string()))?;
+    if bytes.len() > SPOOL_MAX_RECORD_BYTES {
+        return Err(SpoolError::Serialization(
+            "watchdog spool record exceeds the bounded frame size".to_owned(),
+        ));
+    }
+    Ok(bytes)
+}
+
+fn collect_entries<T>(table: &T) -> Result<Vec<WatchdogSpoolEntry>, SpoolError>
+where
+    T: ReadableTable<u64, &'static [u8]>,
+{
+    let mut entries = Vec::new();
+    for item in table
+        .iter()
+        .map_err(|error| SpoolError::Database(error.to_string()))?
+    {
+        let (key, value) = item.map_err(|error| SpoolError::Database(error.to_string()))?;
+        if key.value() == SPOOL_HEADER_KEY {
+            continue;
+        }
+        if value.value().len() > SPOOL_MAX_RECORD_BYTES {
+            return Err(SpoolError::Corrupt(format!(
+                "record {} exceeds the bounded frame size",
+                key.value()
+            )));
+        }
+        let entry: WatchdogSpoolEntry = serde_json::from_slice(value.value()).map_err(|error| {
+            SpoolError::Corrupt(format!("record {} is invalid: {error}", key.value()))
+        })?;
+        if entry.schema_version != SPOOL_SCHEMA_VERSION || entry.sequence != key.value() {
+            return Err(SpoolError::Corrupt(format!(
+                "record {} has an invalid schema or sequence",
+                key.value()
+            )));
+        }
+        entries.push(entry);
+    }
+    entries.sort_by_key(|entry| entry.sequence);
+    Ok(entries)
+}
+
+fn validate_header(
+    header: &WatchdogSpoolHeader,
+    entries: &[WatchdogSpoolEntry],
+) -> Result<(), SpoolError> {
+    if header.schema_version != SPOOL_SCHEMA_VERSION
+        || header.next_sequence == 0
+        || header.first_sequence == 0
+        || header.record_count != entries.len() as u64
+        || header.record_count > SPOOL_MAX_RECORDS
+        || header.bytes > SPOOL_MAX_BYTES
+        || entries
+            .iter()
+            .map(|entry| serde_json::to_vec(entry).map(|bytes| bytes.len() as u64))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| SpoolError::Serialization(error.to_string()))?
+            .into_iter()
+            .sum::<u64>()
+            != header.bytes
+    {
+        return Err(SpoolError::Corrupt(
+            "spool header counters or schema are inconsistent".to_owned(),
+        ));
+    }
+    let expected_first = entries
+        .first()
+        .map_or(header.next_sequence, |entry| entry.sequence);
+    if header.first_sequence != expected_first
+        || entries
+            .windows(2)
+            .any(|window| window[1].sequence <= window[0].sequence)
+        || entries
+            .last()
+            .is_some_and(|entry| entry.sequence >= header.next_sequence)
+    {
+        return Err(SpoolError::Corrupt(
+            "spool sequence ordering is inconsistent".to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 /// Bounded, non-authoritative record emitted when admission is lost.  A gap
 /// never claims coverage and carries no replacement trust material.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum GapRecoveryReason {
     AdmissionUnavailable,
@@ -193,73 +555,56 @@ pub struct GapRecoveryDisposition {
 }
 
 /// Minimal independent sensor surface used by the SCM sibling process.
-///
-/// The spool is append-only and contains only bounded heartbeat observations;
-/// Kernel remains the sole effect owner. The decision core is intentionally
-/// composed here so a sensor tick can never bypass its generation fences.
 pub struct IndependentKernelSensor {
     watchdog: Mutex<Watchdog>,
-    spool: PathBuf,
+    spool: WatchdogSpool,
 }
 
 impl IndependentKernelSensor {
-    /// Opens a protected spool below the installation's durable data root.
+    /// Opens the one canonical protected redb spool below ProgramData.
     pub fn open(path: impl Into<PathBuf>, watchdog_epoch: u64) -> Result<Self, SpoolError> {
         let spool = path.into();
-        if !spool.is_absolute() {
-            return Err(SpoolError::RelativePath);
+        require_protected_program_data_path(&spool, SPOOL_RELATIVE_PATH)
+            .map_err(|_| SpoolError::InvalidProtectedRoot)?;
+        let parent = spool.parent().ok_or(SpoolError::InvalidProtectedRoot)?;
+        prepare_protected_directory(parent).map_err(|_| SpoolError::InvalidProtectedRoot)?;
+        if fs::symlink_metadata(&spool).is_ok() {
+            validate_protected_file(&spool).map_err(|_| SpoolError::InvalidProtectedRoot)?;
         }
-        let program_data = std::env::var_os("ProgramData")
-            .map(PathBuf::from)
-            .ok_or(SpoolError::InvalidProtectedRoot)?;
-        let root = fs::canonicalize(program_data)?;
-        let parent = spool.parent().ok_or(SpoolError::InvalidProtectedRoot)?;
-        ensure_contained_non_reparse(&root, parent)?;
-        let parent = spool.parent().ok_or(SpoolError::InvalidProtectedRoot)?;
-        fs::create_dir_all(parent)?;
-        ensure_non_reparse(parent)?;
-        OpenOptions::new().create(true).append(true).open(&spool)?;
-        ensure_non_reparse(&spool)?;
+        let spool_store = WatchdogSpool::open(&spool)?;
+        validate_protected_file(&spool).map_err(|_| SpoolError::InvalidProtectedRoot)?;
         let watchdog = Watchdog::new(
             eliot_watchdog_core::WatchdogConfig::default(),
             Epoch(watchdog_epoch),
         )
-        .map_err(|_| SpoolError::RelativePath)?;
+        .map_err(|_| SpoolError::InvalidLease("watchdog epoch is invalid".to_owned()))?;
         Ok(Self {
             watchdog: Mutex::new(watchdog),
-            spool,
+            spool: spool_store,
         })
     }
 
-    /// Opens the canonical protected watchdog spool below ProgramData.  The
-    /// root is canonicalized and every existing path component is rejected if
-    /// it is a symlink/reparse point, preventing redirection outside the
-    /// service data boundary.
+    /// Opens the exact canonical protected watchdog spool below ProgramData.
     pub fn open_program_data(
         relative_path: impl Into<PathBuf>,
         watchdog_epoch: u64,
     ) -> Result<Self, SpoolError> {
-        let program_data = std::env::var_os("ProgramData")
-            .map(PathBuf::from)
-            .ok_or(SpoolError::InvalidProtectedRoot)?;
-        if !program_data.is_absolute() {
-            return Err(SpoolError::InvalidProtectedRoot);
-        }
-        let root = fs::canonicalize(&program_data)?;
-        ensure_non_reparse(&root)?;
         let relative = relative_path.into();
-        if relative.is_absolute()
-            || relative
-                .components()
-                .any(|component| matches!(component, std::path::Component::ParentDir))
-        {
-            return Err(SpoolError::InvalidProtectedRoot);
-        }
-        let spool = root.join(relative);
-        let parent = spool.parent().ok_or(SpoolError::InvalidProtectedRoot)?;
-        fs::create_dir_all(parent)?;
-        ensure_contained_non_reparse(&root, parent)?;
+        let spool =
+            protected_program_data_path(&relative).map_err(|_| SpoolError::InvalidProtectedRoot)?;
         Self::open(spool, watchdog_epoch)
+    }
+
+    /// Reads and validates the ordered spool records for an independent
+    /// reader. The redb file remains observation-only and is not authority.
+    pub fn readback(path: impl AsRef<Path>) -> Result<Vec<WatchdogSpoolEntry>, SpoolError> {
+        let path = path.as_ref();
+        require_protected_program_data_path(path, SPOOL_RELATIVE_PATH)
+            .map_err(|_| SpoolError::InvalidProtectedRoot)?;
+        validate_protected_file(path).map_err(|_| SpoolError::InvalidProtectedRoot)?;
+        let database =
+            Database::open(path).map_err(|error| SpoolError::Database(error.to_string()))?;
+        WatchdogSpool { database }.readback()
     }
 
     fn record_heartbeat(
@@ -281,56 +626,41 @@ impl IndependentKernelSensor {
         let digest = lease
             .payload_digest()
             .map_err(|_| KernelWatchdogError::LeaseRejected)?;
-        let line = serde_json::to_vec(&Heartbeat {
-            record_type: "watchdog_heartbeat",
-            service: SERVICE_NAME,
-            lease_id: &lease.lease().lease_id,
-            scope_ref: &lease.lease().scope_ref,
-            kernel_epoch: lease.lease().kernel_epoch.value(),
-            watchdog_epoch: lease.lease().watchdog_epoch.value(),
-            payload_digest: &digest,
-            envelope_digest: lease.envelope_digest(),
-            signer_id: lease.signer_id(),
-            key_id: lease.key_id(),
-            signature_algorithm: lease.algorithm(),
-            signature: lease.signature(),
-            public_key_fingerprint: lease.public_key_fingerprint(),
-            lease_revision: lease.lease_revision(),
-        })
-        .map_err(|error| KernelWatchdogError::FailedWithDetail(error.to_string()))?;
-        self.write_spool_line(line)
+        self.spool
+            .append(
+                now_ms,
+                WatchdogSpoolPayload::Heartbeat {
+                    service: SERVICE_NAME.to_owned(),
+                    lease_id: lease.lease().lease_id.clone(),
+                    scope_ref: lease.lease().scope_ref.clone(),
+                    kernel_epoch: lease.lease().kernel_epoch.value(),
+                    watchdog_epoch: lease.lease().watchdog_epoch.value(),
+                    payload_digest: digest,
+                    envelope_digest: lease.envelope_digest().to_owned(),
+                    signer_id: lease.signer_id().to_owned(),
+                    key_id: lease.key_id().to_owned(),
+                    signature_algorithm: lease.algorithm().to_owned(),
+                    signature: lease.signature().to_owned(),
+                    public_key_fingerprint: lease.public_key_fingerprint().to_owned(),
+                    lease_revision: lease.lease_revision(),
+                },
+            )
+            .map_err(|error| KernelWatchdogError::FailedWithDetail(error.to_string()))
     }
 
     fn record_gap(&self, disposition: GapRecoveryDisposition) -> Result<(), KernelWatchdogError> {
-        let line = serde_json::to_vec(&disposition)
-            .map_err(|error| KernelWatchdogError::FailedWithDetail(error.to_string()))?;
-        self.write_spool_line(line)
-    }
-
-    fn write_spool_line(&self, mut line: Vec<u8>) -> Result<(), KernelWatchdogError> {
-        line.push(b'\n');
-        if let Some(parent) = self.spool.parent() {
-            ensure_non_reparse(parent).map_err(|_| KernelWatchdogError::Failed)?;
-        } else {
-            return Err(KernelWatchdogError::Failed);
-        }
-        ensure_non_reparse_if_present(&self.spool).map_err(|_| KernelWatchdogError::Failed)?;
-        rotate_if_needed(&self.spool, line.len() as u64)
-            .map_err(|_| KernelWatchdogError::Failed)?;
-        ensure_non_reparse_if_present(&self.spool).map_err(|_| KernelWatchdogError::Failed)?;
-        let mut file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.spool)
-            .map_err(|_| KernelWatchdogError::Failed)?;
-        ensure_non_reparse(&self.spool).map_err(|_| KernelWatchdogError::Failed)?;
-        file.write_all(&line)
-            .and_then(|()| file.flush())
-            .and_then(|()| file.sync_all())
-            .map_err(|_| KernelWatchdogError::Failed)
+        self.spool
+            .append(
+                disposition.observed_at_ms,
+                WatchdogSpoolPayload::Gap {
+                    service: disposition.service.to_owned(),
+                    reason: disposition.reason,
+                    coverage_claimed: disposition.coverage_claimed,
+                },
+            )
+            .map_err(|error| KernelWatchdogError::FailedWithDetail(error.to_string()))
     }
 }
-
 impl KernelWatchdogPort for IndependentKernelSensor {
     fn supervise<'a>(
         &'a self,
@@ -634,18 +964,17 @@ pub fn load_supervision_lease(
     admission_config_path: impl AsRef<Path>,
     registry_path: impl AsRef<Path>,
 ) -> Result<VerifiedWatchdogAdmission, SpoolError> {
-    let program_data = std::env::var_os("ProgramData")
-        .map(PathBuf::from)
-        .ok_or(SpoolError::InvalidProtectedRoot)?;
-    if !program_data.is_absolute() {
-        return Err(SpoolError::InvalidProtectedRoot);
-    }
-    let root = fs::canonicalize(program_data)?;
     let lease_path = lease_path.as_ref();
     let admission_config_path = admission_config_path.as_ref();
     let registry_path = registry_path.as_ref();
-    for path in [lease_path, admission_config_path, registry_path] {
-        validate_protected_file(&root, path)?;
+    for (path, relative) in [
+        (lease_path, "Eliot/host/supervision-lease.json"),
+        (admission_config_path, "Eliot/host/watchdog-admission.json"),
+        (registry_path, "Eliot/host/installation-registry.redb"),
+    ] {
+        require_protected_program_data_path(path, relative)
+            .map_err(|_| SpoolError::InvalidProtectedRoot)?;
+        validate_protected_file(path).map_err(|_| SpoolError::InvalidProtectedRoot)?;
     }
     let installation_id = std::env::var("ELIOT_INSTALLATION_ID")
         .map_err(|_| SpoolError::InvalidLease("installation identity is unavailable".to_owned()))?;
@@ -717,22 +1046,12 @@ fn current_unix_ms() -> Result<u64, SpoolError> {
 }
 
 fn read_bounded(path: &Path, limit: u64) -> Result<Vec<u8>, SpoolError> {
-    let size = fs::metadata(path)?.len();
-    if size > limit {
-        return Err(SpoolError::InvalidLease(
-            "protected admission file exceeds the bounded size".to_owned(),
-        ));
-    }
-    fs::read(path).map_err(SpoolError::Io)
-}
-
-fn validate_protected_file(root: &Path, path: &Path) -> Result<(), SpoolError> {
-    if !path.is_absolute() {
-        return Err(SpoolError::InvalidProtectedRoot);
-    }
-    let parent = path.parent().ok_or(SpoolError::InvalidProtectedRoot)?;
-    ensure_contained_non_reparse(root, parent)?;
-    ensure_non_reparse(path)
+    read_protected_file(path, limit).map_err(|error| match error {
+        eliot_platform_windows::ProtectedPathError::SizeExceeded => {
+            SpoolError::InvalidLease("protected admission file exceeds the bounded size".to_owned())
+        }
+        _ => SpoolError::InvalidProtectedRoot,
+    })
 }
 
 fn validate_text(value: &str, field: &str) -> Result<(), SpoolError> {
@@ -749,81 +1068,54 @@ fn is_sha256_hex(value: &str) -> bool {
             .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
 }
 
-fn rotate_if_needed(path: &std::path::Path, incoming: u64) -> io::Result<()> {
-    if incoming > SPOOL_LIMIT {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "watchdog heartbeat exceeds spool frame limit",
-        ));
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn heartbeat(sequence: u64) -> WatchdogSpoolEntry {
+        WatchdogSpoolEntry {
+            schema_version: SPOOL_SCHEMA_VERSION,
+            sequence,
+            observed_at_ms: sequence,
+            payload: WatchdogSpoolPayload::Gap {
+                service: SERVICE_NAME.to_owned(),
+                reason: GapRecoveryReason::AdmissionUnavailable,
+                coverage_claimed: false,
+            },
+        }
     }
-    let current = fs::metadata(path)
-        .map(|metadata| metadata.len())
-        .unwrap_or(0);
-    if current.saturating_add(incoming) <= SPOOL_LIMIT {
-        return Ok(());
-    }
-    for index in (1..=SPOOL_ROTATIONS).rev() {
-        let source = if index == 1 {
-            path.to_owned()
-        } else {
-            path.with_extension(format!(
-                "jsonl.{index_minus_one}",
-                index_minus_one = index - 1
-            ))
+
+    #[test]
+    fn spool_schema_roundtrips_and_binds_sequence() {
+        let entry = heartbeat(4);
+        let bytes = encode_entry(&entry).unwrap_or_else(|_| unreachable!());
+        let decoded: WatchdogSpoolEntry =
+            serde_json::from_slice(&bytes).unwrap_or_else(|_| unreachable!());
+        assert_eq!(decoded, entry);
+        let header = WatchdogSpoolHeader {
+            schema_version: SPOOL_SCHEMA_VERSION,
+            next_sequence: 5,
+            first_sequence: 4,
+            record_count: 1,
+            bytes: bytes.len() as u64,
         };
-        let destination = path.with_extension(format!("jsonl.{index}"));
-        if destination.exists() {
-            fs::remove_file(&destination)?;
-        }
-        if source.exists() {
-            fs::rename(source, destination)?;
-        }
+        assert!(validate_header(&header, &[entry]).is_ok());
     }
-    Ok(())
-}
 
-fn ensure_non_reparse(path: &std::path::Path) -> Result<(), SpoolError> {
-    let metadata = fs::symlink_metadata(path)?;
-    if metadata.file_type().is_symlink() {
-        return Err(SpoolError::InvalidProtectedRoot);
+    #[test]
+    fn spool_schema_rejects_counter_or_sequence_substitution() {
+        let entry = heartbeat(4);
+        let bytes = encode_entry(&entry).unwrap_or_else(|_| unreachable!());
+        let mut header = WatchdogSpoolHeader {
+            schema_version: SPOOL_SCHEMA_VERSION,
+            next_sequence: 5,
+            first_sequence: 4,
+            record_count: 2,
+            bytes: bytes.len() as u64,
+        };
+        assert!(validate_header(&header, &[entry.clone()]).is_err());
+        header.record_count = 1;
+        header.first_sequence = 3;
+        assert!(validate_header(&header, &[entry]).is_err());
     }
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::MetadataExt;
-        if metadata.file_attributes()
-            & windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT
-            != 0
-        {
-            return Err(SpoolError::InvalidProtectedRoot);
-        }
-    }
-    Ok(())
-}
-
-fn ensure_non_reparse_if_present(path: &std::path::Path) -> Result<(), SpoolError> {
-    match fs::symlink_metadata(path) {
-        Ok(_) => ensure_non_reparse(path),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(SpoolError::Io(error)),
-    }
-}
-
-fn ensure_contained_non_reparse(
-    root: &std::path::Path,
-    path: &std::path::Path,
-) -> Result<(), SpoolError> {
-    let canonical = fs::canonicalize(path)?;
-    if !canonical.starts_with(root) {
-        return Err(SpoolError::InvalidProtectedRoot);
-    }
-    let mut cursor = root.to_owned();
-    for component in canonical
-        .strip_prefix(root)
-        .unwrap_or(std::path::Path::new(""))
-        .components()
-    {
-        cursor.push(component);
-        ensure_non_reparse(&cursor)?;
-    }
-    Ok(())
 }

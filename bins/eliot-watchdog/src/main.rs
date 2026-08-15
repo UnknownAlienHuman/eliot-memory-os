@@ -3,6 +3,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use eliot_platform_windows::protected_program_data_path;
 use eliot_watchdog::{
     FileWatchdogAdmission, IndependentKernelSensor, SERVICE_NAME, WatchdogAdmissionSource,
     WatchdogComposition, WatchdogConfig,
@@ -28,24 +29,12 @@ fn main() {
 }
 
 fn run_watchdog(stop_signal: Arc<AtomicBool>) -> Result<(), String> {
-    let program_data = std::env::var_os("ProgramData")
-        .map(PathBuf::from)
-        .ok_or_else(|| "ProgramData is not configured".to_owned())?;
-    if !program_data.is_absolute() {
-        return Err("ProgramData must be an absolute path".to_owned());
-    }
-    let lease_path = program_data
-        .join("Eliot")
-        .join("host")
-        .join("supervision-lease.json");
-    let admission_config_path = program_data
-        .join("Eliot")
-        .join("host")
-        .join("watchdog-admission.json");
-    let registry_path = program_data
-        .join("Eliot")
-        .join("host")
-        .join("installation-registry.redb");
+    let lease_path = protected_program_data_path("Eliot/host/supervision-lease.json")
+        .map_err(|error| error.to_string())?;
+    let admission_config_path = protected_program_data_path("Eliot/host/watchdog-admission.json")
+        .map_err(|error| error.to_string())?;
+    let registry_path = protected_program_data_path("Eliot/host/installation-registry.redb")
+        .map_err(|error| error.to_string())?;
     // The lease is issued by the Host/Kernel contour.  There is deliberately
     // no genesis/default lease in this process: stale or missing durable bytes
     // fail closed before the watchdog can advertise readiness.  The source is
@@ -60,9 +49,7 @@ fn run_watchdog(stop_signal: Arc<AtomicBool>) -> Result<(), String> {
         .map_err(|error| error.to_string())?;
     let sensor = Arc::new(
         IndependentKernelSensor::open_program_data(
-            PathBuf::from("Eliot")
-                .join("watchdog")
-                .join("protected-spool.jsonl"),
+            PathBuf::from("Eliot/watchdog/watchdog.redb"),
             admission.watchdog_epoch().value(),
         )
         .map_err(|error| error.to_string())?,

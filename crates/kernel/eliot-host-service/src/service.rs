@@ -747,12 +747,9 @@ where
                 )
                 | (
                     HostServiceState::DegradedRecovery,
-                    HostServiceState::Draining | HostServiceState::Starting
+                    HostServiceState::Draining
                 )
-                | (
-                    HostServiceState::Failed,
-                    HostServiceState::Draining | HostServiceState::Starting
-                )
+                | (HostServiceState::Failed, HostServiceState::Draining)
                 | (
                     HostServiceState::Draining,
                     HostServiceState::StoppedClean | HostServiceState::DegradedRecovery

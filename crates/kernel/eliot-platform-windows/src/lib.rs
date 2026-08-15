@@ -129,6 +129,328 @@ impl std::fmt::Display for HostOwnerLeaseReleaseError {
 
 impl std::error::Error for HostOwnerLeaseReleaseError {}
 
+/// Protected ProgramData path policy used by Host, installation and
+/// Watchdog durable state.  The policy is intentionally shared so a caller
+/// cannot substitute a per-user or arbitrary working-directory root.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProtectedPathError {
+    /// ProgramData is missing, relative or cannot be canonicalized safely.
+    InvalidRoot,
+    /// The requested path is absolute, traverses a parent, or escapes the
+    /// canonical ProgramData contour.
+    InvalidPath,
+    /// A path component or target is a symlink/junction/reparse point.
+    ReparsePoint,
+    /// The protected service/admin ACL could not be applied or verified.
+    AclMismatch,
+    /// The filesystem operation failed before a safe classification existed.
+    Io,
+    /// The protected file exceeded the caller's explicit bounded read limit.
+    SizeExceeded,
+    /// Durable protected storage is intentionally unavailable off Windows.
+    UnsupportedPlatform,
+}
+
+impl std::fmt::Display for ProtectedPathError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::InvalidRoot => "ProgramData protected root is invalid",
+            Self::InvalidPath => "path is outside the protected ProgramData contour",
+            Self::ReparsePoint => "protected path contains a reparse point",
+            Self::AclMismatch => "protected path ACL does not match service/admin policy",
+            Self::Io => "protected path I/O failed",
+            Self::SizeExceeded => "protected file exceeds its bounded read limit",
+            Self::UnsupportedPlatform => "protected ProgramData storage requires Windows",
+        })
+    }
+}
+
+impl std::error::Error for ProtectedPathError {}
+
+/// Returns the canonical ProgramData directory after rejecting reparse
+/// substitution in the root and its existing ancestors.
+pub fn protected_program_data_root() -> Result<PathBuf, ProtectedPathError> {
+    let raw = std::env::var_os("ProgramData").ok_or(ProtectedPathError::InvalidRoot)?;
+    let raw = PathBuf::from(raw);
+    if !raw.is_absolute() {
+        return Err(ProtectedPathError::InvalidRoot);
+    }
+    reject_reparse_chain(&raw, true)?;
+    let canonical = std::fs::canonicalize(&raw).map_err(|_| ProtectedPathError::Io)?;
+    validate_directory_no_reparse(&canonical)?;
+    Ok(canonical)
+}
+
+/// Resolves a fixed relative path below the canonical ProgramData root.
+/// Missing leaf components are allowed so callers can create them under the
+/// protected parent; existing components are checked before the result is
+/// returned.
+pub fn protected_program_data_path(
+    relative: impl AsRef<Path>,
+) -> Result<PathBuf, ProtectedPathError> {
+    let relative = relative.as_ref();
+    if relative.as_os_str().is_empty()
+        || relative.is_absolute()
+        || relative.components().any(|component| {
+            matches!(
+                component,
+                std::path::Component::ParentDir
+                    | std::path::Component::RootDir
+                    | std::path::Component::Prefix(_)
+            )
+        })
+    {
+        return Err(ProtectedPathError::InvalidPath);
+    }
+    let root = protected_program_data_root()?;
+    let path = root.join(relative);
+    ensure_protected_containment(&root, &path)?;
+    Ok(path)
+}
+
+/// Requires a caller-provided path to equal one fixed ProgramData-relative
+/// identity and to remain below the canonical root.  This is the boundary
+/// used by public Host/Watchdog open APIs to reject arbitrary roots.
+pub fn require_protected_program_data_path(
+    path: &Path,
+    relative: impl AsRef<Path>,
+) -> Result<PathBuf, ProtectedPathError> {
+    let expected = protected_program_data_path(relative)?;
+    if path != expected {
+        return Err(ProtectedPathError::InvalidPath);
+    }
+    ensure_protected_containment(&expected_root()?, path)?;
+    Ok(expected)
+}
+
+/// Creates and protects one ProgramData descendant directory.  The directory
+/// and every newly materialized descendant receive the explicit
+/// LocalSystem/Builtin-Administrators DACL.
+pub fn prepare_protected_directory(path: &Path) -> Result<(), ProtectedPathError> {
+    let root = expected_root()?;
+    ensure_protected_containment(&root, path)?;
+    std::fs::create_dir_all(path).map_err(|_| ProtectedPathError::Io)?;
+    let canonical = std::fs::canonicalize(path).map_err(|_| ProtectedPathError::Io)?;
+    ensure_protected_containment(&root, &canonical)?;
+    protect_existing_path(&canonical, true)
+}
+
+/// Validates an existing protected file immediately before it is opened or
+/// read, including the no-follow/reparse and service/admin ACL checks.
+pub fn validate_protected_file(path: &Path) -> Result<(), ProtectedPathError> {
+    let root = expected_root()?;
+    ensure_protected_containment(&root, path)?;
+    let metadata = std::fs::symlink_metadata(path).map_err(|_| ProtectedPathError::Io)?;
+    if !metadata.is_file() {
+        return Err(ProtectedPathError::InvalidPath);
+    }
+    protect_existing_path(path, false)
+}
+
+/// Reads one protected file through a no-follow handle after validating its
+/// canonical path and ACL. This is used for lease/config bytes whose content
+/// must not be substituted between a metadata check and a regular read.
+pub fn read_protected_file(path: &Path, limit: u64) -> Result<Vec<u8>, ProtectedPathError> {
+    validate_protected_file(path)?;
+    if !cfg!(windows) {
+        return Err(ProtectedPathError::UnsupportedPlatform);
+    }
+    #[cfg(windows)]
+    {
+        use std::io::Read;
+        use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_OPEN_REPARSE_POINT, FILE_GENERIC_READ,
+            FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+        };
+        let mut options = std::fs::OpenOptions::new();
+        options.read(true);
+        options.access_mode(FILE_GENERIC_READ);
+        options.share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE);
+        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+        let mut file = options.open(path).map_err(|_| ProtectedPathError::Io)?;
+        let metadata = file.metadata().map_err(|_| ProtectedPathError::Io)?;
+        if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err(ProtectedPathError::ReparsePoint);
+        }
+        if metadata.len() > limit {
+            return Err(ProtectedPathError::SizeExceeded);
+        }
+        let mut bytes = Vec::with_capacity(metadata.len().try_into().unwrap_or(0));
+        file.read_to_end(&mut bytes)
+            .map_err(|_| ProtectedPathError::Io)?;
+        if bytes.len() as u64 > limit {
+            return Err(ProtectedPathError::SizeExceeded);
+        }
+        Ok(bytes)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (path, limit);
+        Err(ProtectedPathError::UnsupportedPlatform)
+    }
+}
+
+fn expected_root() -> Result<PathBuf, ProtectedPathError> {
+    protected_program_data_root()
+}
+
+fn ensure_protected_containment(root: &Path, path: &Path) -> Result<(), ProtectedPathError> {
+    if !path.is_absolute() || !path.starts_with(root) {
+        return Err(ProtectedPathError::InvalidPath);
+    }
+    reject_reparse_chain(path, false)?;
+    for ancestor in path.ancestors().take_while(|candidate| *candidate != root) {
+        match std::fs::symlink_metadata(ancestor) {
+            Ok(metadata) if metadata.file_type().is_symlink() || is_reparse_point(&metadata) => {
+                return Err(ProtectedPathError::ReparsePoint);
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => return Err(ProtectedPathError::Io),
+        }
+    }
+    Ok(())
+}
+
+fn reject_reparse_chain(path: &Path, require_existing: bool) -> Result<(), ProtectedPathError> {
+    for ancestor in path.ancestors() {
+        match std::fs::symlink_metadata(ancestor) {
+            Ok(metadata) if metadata.file_type().is_symlink() || is_reparse_point(&metadata) => {
+                return Err(ProtectedPathError::ReparsePoint);
+            }
+            Ok(_) => {}
+            Err(error) if !require_existing && error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Err(ProtectedPathError::InvalidRoot);
+            }
+            Err(_) => return Err(ProtectedPathError::Io),
+        }
+    }
+    Ok(())
+}
+
+fn validate_directory_no_reparse(path: &Path) -> Result<(), ProtectedPathError> {
+    let metadata = std::fs::symlink_metadata(path).map_err(|_| ProtectedPathError::Io)?;
+    if !metadata.is_dir() {
+        return Err(ProtectedPathError::InvalidRoot);
+    }
+    if metadata.file_type().is_symlink() || is_reparse_point(&metadata) {
+        return Err(ProtectedPathError::ReparsePoint);
+    }
+    Ok(())
+}
+
+fn protect_existing_path(path: &Path, directory: bool) -> Result<(), ProtectedPathError> {
+    if !cfg!(windows) {
+        return Err(ProtectedPathError::UnsupportedPlatform);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Foundation::{ERROR_SUCCESS, LocalFree};
+        use windows_sys::Win32::Security::Authorization::{GetSecurityInfo, SE_FILE_OBJECT};
+        use windows_sys::Win32::Security::{
+            DACL_SECURITY_INFORMATION, GetSecurityDescriptorControl,
+            PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, SE_DACL_PROTECTED,
+        };
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+            FILE_GENERIC_READ, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, WRITE_DAC,
+        };
+        let mut options = std::fs::OpenOptions::new();
+        options.read(true);
+        if !directory {
+            options.write(true);
+        }
+        options.access_mode(FILE_GENERIC_READ | WRITE_DAC);
+        options.share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE);
+        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS);
+        let file = options.open(path).map_err(|_| ProtectedPathError::Io)?;
+        let metadata = file.metadata().map_err(|_| ProtectedPathError::Io)?;
+        if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err(ProtectedPathError::ReparsePoint);
+        }
+        let descriptor = OwnedSecurityDescriptor::for_protected_storage()
+            .map_err(|_| ProtectedPathError::AclMismatch)?;
+        let dacl = descriptor
+            .dacl()
+            .map_err(|_| ProtectedPathError::AclMismatch)?;
+        let security = DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION;
+        let status = unsafe {
+            windows_sys::Win32::Security::Authorization::SetSecurityInfo(
+                file.as_raw_handle().cast(),
+                SE_FILE_OBJECT,
+                security,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                dacl,
+                std::ptr::null(),
+            )
+        };
+        if status != 0 {
+            return Err(ProtectedPathError::AclMismatch);
+        }
+        // Read the descriptor back from the same no-follow handle.  A
+        // successful SetSecurityInfo call alone does not prove that an
+        // inherited/unprotected DACL was not restored by the filesystem.
+        let mut descriptor: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+        let status = unsafe {
+            GetSecurityInfo(
+                file.as_raw_handle().cast(),
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                &raw mut descriptor,
+            )
+        };
+        if status != ERROR_SUCCESS || descriptor.is_null() {
+            if !descriptor.is_null() {
+                unsafe { LocalFree(descriptor.cast()) };
+            }
+            return Err(ProtectedPathError::AclMismatch);
+        }
+        let mut present = 0;
+        let mut actual_dacl = std::ptr::null_mut();
+        let mut defaulted = 0;
+        let dacl_matches = unsafe {
+            windows_sys::Win32::Security::GetSecurityDescriptorDacl(
+                descriptor,
+                &raw mut present,
+                &raw mut actual_dacl,
+                &raw mut defaulted,
+            ) != 0
+                && present != 0
+                && !actual_dacl.is_null()
+                && (*actual_dacl).AclSize == (*dacl).AclSize
+                && std::slice::from_raw_parts(
+                    actual_dacl.cast::<u8>(),
+                    usize::from((*actual_dacl).AclSize),
+                ) == std::slice::from_raw_parts(dacl.cast::<u8>(), usize::from((*dacl).AclSize))
+        };
+        let mut control: u16 = 0;
+        let mut revision: u32 = 0;
+        let protected = unsafe {
+            GetSecurityDescriptorControl(descriptor, &raw mut control, &raw mut revision) != 0
+                && control & SE_DACL_PROTECTED != 0
+        };
+        unsafe { LocalFree(descriptor.cast()) };
+        if !dacl_matches || !protected {
+            return Err(ProtectedPathError::AclMismatch);
+        }
+        Ok(())
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (path, directory);
+        Err(ProtectedPathError::UnsupportedPlatform)
+    }
+}
+
 /// Returns the canonical named mutex for one validated installation identity.
 ///
 /// The identity itself never enters the object-manager name.  SHA-256 keeps
@@ -851,6 +1173,31 @@ impl OwnedSecurityDescriptor {
 
     fn for_host_owner() -> Result<Self, WindowsAdapterError> {
         Self::from_sddl("D:P(A;;GA;;;SY)(A;;GA;;;OW)")
+    }
+
+    /// Protected durable state is writable only by LocalSystem and the local
+    /// Administrators group.  The descriptor is protected from inheriting a
+    /// weaker parent DACL before it is applied to the opened no-follow handle.
+    fn for_protected_storage() -> Result<Self, WindowsAdapterError> {
+        Self::from_sddl("D:P(A;;GA;;;SY)(A;;GA;;;BA)")
+    }
+
+    fn dacl(&self) -> Result<*const windows_sys::Win32::Security::ACL, WindowsAdapterError> {
+        use windows_sys::Win32::Security::GetSecurityDescriptorDacl;
+        let mut present = 0;
+        let mut dacl = std::ptr::null_mut();
+        let mut defaulted = 0;
+        // SAFETY: `self.raw` is the descriptor allocated by
+        // ConvertStringSecurityDescriptorToSecurityDescriptorW and remains
+        // valid for this call; all output pointers are valid locals.
+        if unsafe { GetSecurityDescriptorDacl(self.raw, &mut present, &mut dacl, &mut defaulted) }
+            == 0
+            || present == 0
+            || dacl.is_null()
+        {
+            return Err(WindowsAdapterError::AclMismatch);
+        }
+        Ok(dacl.cast_const())
     }
 
     fn from_sddl(sddl: &str) -> Result<Self, WindowsAdapterError> {
@@ -4612,6 +4959,18 @@ mod tests {
         assert!(validate_component("state\0.bin").is_err());
         assert!(valid_credential_key("nested/ok-key"));
         assert!(!valid_credential_key("../outside"));
+    }
+
+    #[test]
+    fn protected_program_data_path_rejects_substitution_inputs() {
+        assert_eq!(
+            protected_program_data_path(Path::new("../outside")),
+            Err(ProtectedPathError::InvalidPath)
+        );
+        assert_eq!(
+            protected_program_data_path(Path::new("C:/outside")),
+            Err(ProtectedPathError::InvalidPath)
+        );
     }
 
     #[test]

@@ -5,6 +5,7 @@ use std::path::PathBuf;
 use eliot_host::HostBranchDisposition;
 use eliot_host::{HostComposition, HostError, PROTOCOL_VERSION, SERVICE_NAME};
 use eliot_platform::PlatformHandle;
+use eliot_platform_windows::protected_program_data_path;
 use serde::{Deserialize, Serialize};
 
 #[derive(Deserialize)]
@@ -94,18 +95,8 @@ fn open_host() -> Result<HostComposition, HostError> {
 }
 
 fn state_path() -> Result<PathBuf, HostError> {
-    let program_data = std::env::var_os("ProgramData")
-        .map(PathBuf::from)
-        .ok_or_else(|| HostError::Platform("ProgramData is not configured".to_owned()))?;
-    if !program_data.is_absolute() {
-        return Err(HostError::Platform(
-            "ProgramData must be an absolute path".to_owned(),
-        ));
-    }
-    Ok(program_data
-        .join("Eliot")
-        .join("host")
-        .join("host-state.redb"))
+    protected_program_data_path("Eliot/host/host-state.redb")
+        .map_err(|error| HostError::Platform(error.to_string()))
 }
 
 fn dispatch(host: &mut HostComposition, line: &str) -> (Response, bool) {

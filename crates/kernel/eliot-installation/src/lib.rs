@@ -21,6 +21,9 @@ use eliot_platform::{
     InstallationObservation, InstallationPort, InstallationRequest, PlatformHandle, PortError,
     PortOutcome,
 };
+use eliot_platform_windows::{
+    prepare_protected_directory, require_protected_program_data_path, validate_protected_file,
+};
 use redb::{Database, ReadableDatabase, TableDefinition};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -64,14 +67,26 @@ pub fn contract_identity() -> Result<ContractIdentity, InstallationError> {
 pub enum InstallationError {
     /// A required field is blank, malformed or out of bounds.
     #[error("{field} is invalid: {reason}")]
-    InvalidField { field: String, reason: String },
+    InvalidField {
+        /// Field path rejected by installation validation.
+        field: String,
+        /// Stable reason for rejecting the field.
+        reason: String,
+    },
     /// A collection contains the same identity more than once.
     #[error("{kind} contains duplicate identity {identity}")]
-    Duplicate { kind: String, identity: String },
+    Duplicate {
+        /// Collection or identity kind containing a duplicate.
+        kind: String,
+        /// Duplicate stable identity.
+        identity: String,
+    },
     /// A state transition is not admitted by the transaction machine.
     #[error("illegal installation transition from {from:?} to {to:?}")]
     IllegalTransition {
+        /// Current transaction stage.
         from: InstallationStage,
+        /// Requested transaction stage.
         to: InstallationStage,
     },
     /// A caller attempted to use a request for another transaction.
@@ -79,7 +94,10 @@ pub enum InstallationError {
     IdentityConflict,
     /// A provider changed an external object without a durable acknowledgement.
     #[error("installation effect outcome is unknown at stage {stage:?}")]
-    UnknownOutcome { stage: InstallationStage },
+    UnknownOutcome {
+        /// Stage at which the provider outcome became unknown.
+        stage: InstallationStage,
+    },
     /// A known observation does not prove the requested postcondition.
     #[error("installation postcondition is incomplete: {0}")]
     IncompleteObservation(String),
@@ -763,6 +781,7 @@ pub struct ApprovedGenerationRegistry {
 
 const REGISTRY_TABLE: TableDefinition<&str, &[u8]> =
     TableDefinition::new("eliot_approved_generations_v1");
+const REGISTRY_RELATIVE_PATH: &str = "Eliot/host/installation-registry.redb";
 
 /// Durable redb owner for approved generations and LKG activation state.
 pub struct RedbInstallationRegistry {
@@ -772,11 +791,21 @@ pub struct RedbInstallationRegistry {
 impl RedbInstallationRegistry {
     /// Opens or creates the registry database.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, InstallationError> {
-        if let Some(parent) = path.as_ref().parent() {
-            fs::create_dir_all(parent)
+        let path = path.as_ref();
+        require_protected_program_data_path(path, REGISTRY_RELATIVE_PATH)
+            .map_err(|error| InstallationError::Platform(error.to_string()))?;
+        let parent = path
+            .parent()
+            .ok_or_else(|| InstallationError::Platform("registry path has no parent".to_owned()))?;
+        prepare_protected_directory(parent)
+            .map_err(|error| InstallationError::Platform(error.to_string()))?;
+        if fs::symlink_metadata(path).is_ok() {
+            validate_protected_file(path)
                 .map_err(|error| InstallationError::Platform(error.to_string()))?;
         }
         let database = Database::create(path)
+            .map_err(|error| InstallationError::Platform(error.to_string()))?;
+        validate_protected_file(path)
             .map_err(|error| InstallationError::Platform(error.to_string()))?;
         Ok(Self { database })
     }
@@ -1441,13 +1470,21 @@ pub trait InstallationEffectPort: Send {
 pub enum InstallationStepOutcome {
     /// The effect was observed and the transaction advanced.
     Applied {
+        /// Durable stage reached after the observed effect.
         stage: InstallationStage,
+        /// Evidence references proving the effect postcondition.
         evidence_refs: Vec<PlatformHandle>,
     },
     /// The effect changed an object but complete postcondition evidence is absent.
-    RollbackRequired { pending_refs: Vec<PlatformHandle> },
+    RollbackRequired {
+        /// Evidence references that must be reconciled before rollback.
+        pending_refs: Vec<PlatformHandle>,
+    },
     /// Rollback itself is indeterminate and the transaction is quarantined.
-    Quarantined { pending_refs: Vec<PlatformHandle> },
+    Quarantined {
+        /// External identities still requiring operator reconciliation.
+        pending_refs: Vec<PlatformHandle>,
+    },
     /// The effect could not be admitted before changing an external object.
     Rejected,
 }

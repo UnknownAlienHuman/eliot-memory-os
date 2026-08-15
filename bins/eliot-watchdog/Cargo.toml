@@ -16,9 +16,11 @@ path = "src/main.rs"
 [dependencies]
 eliot-contracts.workspace = true
 eliot-installation.workspace = true
+eliot-platform-windows.workspace = true
 eliot-watchdog-core.workspace = true
 eliot-runtime.workspace = true
 eliot-runtime-contracts.workspace = true
+redb.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
