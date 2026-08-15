@@ -1,4 +1,4 @@
-//! A-08's provider-neutral ControlBoard projection and operator contract.
+//! A-08's provider-neutral `ControlBoard` projection and operator contract.
 //!
 //! The board owns no canonical state, database, process, scheduler, authority,
 //! or review store. It reads one injected canonical snapshot and forwards
@@ -190,6 +190,7 @@ impl ReadRequest {
     }
 
     /// Pins the read to exact immutable identity.
+    #[must_use]
     pub fn pinned(mut self, revision: ViewRevision, fence: StateFence) -> Self {
         self.expected_revision = Some(revision);
         self.expected_fence = Some(fence);
@@ -662,9 +663,9 @@ impl ProjectionBinding {
             ProjectionProvider::I12 => RequiredProvider::I12ReportProjection,
         };
         text(&self.work_id, "projection.work_id")
-            .and_then(|_| text(&self.binding_id, "projection.binding_id"))
-            .and_then(|_| text(&self.binding_digest, "projection.binding_digest"))
-            .and_then(|_| text(&self.receipt_ref, "projection.receipt_ref"))
+            .and_then(|()| text(&self.binding_id, "projection.binding_id"))
+            .and_then(|()| text(&self.binding_digest, "projection.binding_digest"))
+            .and_then(|()| text(&self.receipt_ref, "projection.receipt_ref"))
             .map_err(|_| ControlBoardError::PlanGap(provider))
     }
 }
@@ -911,7 +912,7 @@ impl CommandRequest {
             _ => {}
         }
         let mut bound = self.clone();
-        bound.access_digest = access.digest.clone();
+        bound.access_digest.clone_from(&access.digest);
         Ok(bound)
     }
 }
@@ -1066,6 +1067,7 @@ impl ControlBoard {
     }
 
     /// Sends a typed action after re-reading and checking its exact fence.
+    #[allow(clippy::needless_pass_by_value)]
     pub fn submit(
         &mut self,
         request: &ReadRequest,

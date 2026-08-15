@@ -41,6 +41,7 @@ members = [
   "crates/security/eliot-source-assurance",
   "crates/surfaces/eliot-agent-bridge-core",
   "crates/surfaces/eliot-cli",
+  "crates/surfaces/eliot-controlboard",
   "crates/surfaces/eliot-mcp",
   "crates/surfaces/eliot-notify-core",
   "crates/surfaces/eliot-skills",
@@ -95,6 +96,7 @@ eliot-agent-bridge-core = { path = "crates/surfaces/eliot-agent-bridge-core", ve
 eliot-agent-bridge = { path = "bins/eliot-agent-bridge", version = "0.1.0" }
 eliot-wasm-host = { path = "bins/eliot-wasm-host", version = "0.1.0" }
 eliot-cli = { path = "crates/surfaces/eliot-cli", version = "0.1.0" }
+eliot-controlboard = { path = "crates/surfaces/eliot-controlboard", version = "0.1.0" }
 eliot-mcp = { path = "crates/surfaces/eliot-mcp", version = "0.1.0" }
 eliot-notify-core = { path = "crates/surfaces/eliot-notify-core", version = "0.1.0" }
 eliot-skills = { path = "crates/surfaces/eliot-skills", version = "0.1.0" }

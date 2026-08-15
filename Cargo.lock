@@ -462,6 +462,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "eliot-controlboard"
+version = "0.1.0"
+dependencies = [
+ "eliot-evaluation-contracts",
+ "eliot-evidence",
+ "eliot-observation-contracts",
+ "eliot-receipts",
+ "eliot-security-contracts",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror",
+]
+
+[[package]]
 name = "eliot-engine"
 version = "0.1.0"
 dependencies = [
