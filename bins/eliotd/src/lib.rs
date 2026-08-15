@@ -139,12 +139,8 @@ impl DaemonComposition {
     /// Produces the canonical Governor runtime status projection.
     #[must_use]
     pub fn status(&self) -> RuntimeStatusReport {
-        self.governor.status_report(
-            RuntimeMode::Daemon,
-            &self.data_root,
-            self.started,
-            true,
-        )
+        self.governor
+            .status_report(RuntimeMode::Daemon, &self.data_root, self.started, true)
     }
 
     /// Performs ordered Governor shutdown followed by kernel shutdown.

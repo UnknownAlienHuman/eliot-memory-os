@@ -1,7 +1,7 @@
 use std::io::{self, Write};
 use std::path::PathBuf;
 
-use eliotd::{DaemonComposition, DaemonConfig, canonical_root, SERVICE_NAME, PROTOCOL_VERSION};
+use eliotd::{DaemonComposition, DaemonConfig, PROTOCOL_VERSION, SERVICE_NAME, canonical_root};
 use serde::Serialize;
 
 #[derive(Debug, Default)]
@@ -21,7 +21,9 @@ enum ReadyMessage<'a> {
         pid: u32,
         ipc: &'a str,
     },
-    Error { error: String },
+    Error {
+        error: String,
+    },
 }
 
 #[tokio::main]
