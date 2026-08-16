@@ -1,0 +1,47 @@
+name: Runtime017 apply rustfmt
+
+on:
+  push:
+    branches:
+      - fix/runtime017-conformance
+
+permissions:
+  contents: write
+
+jobs:
+  rustfmt:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Install pinned Rust toolchain
+        run: rustup show active-toolchain
+
+      - name: Apply workspace rustfmt and commit only Rust sources
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          cargo fmt --all
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          git diff --check
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+          $changed = @(git diff --name-only)
+          if ($changed.Count -eq 0) {
+            Write-Host "Workspace is already formatted."
+            exit 0
+          }
+          $unexpected = @($changed | Where-Object { $_ -notmatch '\.rs$' })
+          if ($unexpected.Count -ne 0) {
+            throw "rustfmt changed non-Rust paths: $($unexpected -join ', ')"
+          }
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -- ':(glob)**/*.rs'
+          git commit -m "style: apply workspace rustfmt"
+          git push origin HEAD:fix/runtime017-conformance
