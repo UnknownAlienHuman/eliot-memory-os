@@ -144,7 +144,7 @@ impl<B: ResearchBridge> GovernedExchange<B> {
         let job = self
             .snapshot
             .jobs
-            .get(job_id)
+            .get_mut(job_id)
             .ok_or(ExchangeError::NotFound)?;
         if job.state_fence != *fence
             || !matches!(
