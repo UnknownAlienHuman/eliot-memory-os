@@ -48,7 +48,10 @@ jobs:
       - name: Workspace check
         run: cargo check --workspace --all-targets
 
-      - name: Provision pinned SurrealDB 3.2.3
+      # The server binary is pinned independently from the workspace SDK:
+      # crates use SurrealDB SDK 3.2.3, while the official Windows server
+      # release available for CI is v3.2.0.
+      - name: Provision pinned SurrealDB server 3.2.0
         shell: pwsh
         env:
           GITHUB_TOKEN: ${{ github.token }}
@@ -62,17 +65,20 @@ jobs:
           }
           $release = Invoke-RestMethod `
             -Headers $headers `
-            -Uri "https://api.github.com/repos/surrealdb/surrealdb/releases/tags/v3.2.3"
+            -Uri "https://api.github.com/repos/surrealdb/surrealdb/releases/tags/v3.2.0"
+          if ($release.tag_name -ne "v3.2.0") {
+            throw "Expected release tag v3.2.0, got '$($release.tag_name)'"
+          }
           $assets = @(
             $release.assets |
-              Where-Object { $_.name -eq "surreal-v3.2.3.windows-amd64.exe" }
+              Where-Object { $_.name -eq "surreal-v3.2.0.windows-amd64.exe" }
           )
           if ($assets.Count -ne 1) {
-            throw "Expected one pinned SurrealDB 3.2.3 Windows asset; found $($assets.Count)"
+            throw "Expected one pinned SurrealDB 3.2.0 Windows asset; found $($assets.Count)"
           }
           $surreal = Join-Path `
             $env:RUNNER_TEMP `
-            "surreal-v3.2.3.windows-amd64.exe"
+            "surreal-v3.2.0.windows-amd64.exe"
           Invoke-WebRequest `
             -Headers @{ "User-Agent" = "eliot-memory-os-ci" } `
             -Uri $assets[0].browser_download_url `
@@ -80,9 +86,14 @@ jobs:
           if (-not (Test-Path -LiteralPath $surreal -PathType Leaf)) {
             throw "Pinned SurrealDB executable was not downloaded"
           }
+          $expectedDigest = "sha256:9382a851a54df09aaf39c74c0b010a14b09f2565651f620e83c21dc1f1bca8d3"
+          $digest = "sha256:$((Get-FileHash -LiteralPath $surreal -Algorithm SHA256).Hash.ToLowerInvariant())"
+          if ($digest -ne $expectedDigest) {
+            throw "Pinned SurrealDB SHA256 mismatch: got '$digest'"
+          }
           $version = (& $surreal version | Out-String).Trim()
-          if ($LASTEXITCODE -ne 0 -or $version -notmatch "^3\.2\.3\b") {
-            throw "Expected SurrealDB 3.2.3, got '$version'"
+          if ($LASTEXITCODE -ne 0 -or $version -notmatch "^3\.2\.0\b") {
+            throw "Expected SurrealDB 3.2.0, got '$version'"
           }
           Add-Content `
             -LiteralPath $env:GITHUB_ENV `
@@ -98,8 +109,8 @@ jobs:
             throw "ELIOT_SURREAL_EXE is missing"
           }
           $version = (& $env:ELIOT_SURREAL_EXE version | Out-String).Trim()
-          if ($LASTEXITCODE -ne 0 -or $version -notmatch "^3\.2\.3\b") {
-            throw "Expected SurrealDB 3.2.3 before tests, got '$version'"
+          if ($LASTEXITCODE -ne 0 -or $version -notmatch "^3\.2\.0\b") {
+            throw "Expected SurrealDB server 3.2.0 before tests, got '$version'"
           }
           cargo test --workspace
           if ($LASTEXITCODE -ne 0) {
