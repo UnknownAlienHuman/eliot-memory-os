@@ -151,6 +151,20 @@ impl PeerIdentity {
             Self::Authenticated { .. } => Err(TransportError::UnauthenticatedPeer),
         }
     }
+
+    /// Returns the provider-observed, handle-bound process identity when peer
+    /// authentication succeeded.
+    ///
+    /// This is read-only evidence: callers still cannot construct an
+    /// [`IdentityProof`] or turn a PID/path supplied on the wire into an
+    /// authenticated peer.
+    #[must_use]
+    pub const fn process_binding(&self) -> Option<&ProcessBinding> {
+        match self {
+            Self::Authenticated { proof, .. } => Some(&proof.process),
+            Self::Unavailable { .. } => None,
+        }
+    }
 }
 
 /// Transport limits.  A queue item is admitted only when both item and byte
@@ -1664,28 +1678,32 @@ mod tests {
     #[test]
     fn invalid_limits_and_identity_fail_closed() {
         assert!(AdmissionQueue::new(TransportLimits::default()).is_ok());
-        let process = ProcessBinding::from_observation(1, 1, "C:/eliot-test.exe").expect("process");
+        let process = ProcessBinding::from_observation(1, 2, "C:/eliot-test.exe").expect("process");
+        let invalid = PeerIdentity::Authenticated {
+            process_id: 0,
+            user_identity: String::new(),
+            session_identity: String::new(),
+            proof: IdentityProof {
+                process,
+                sid: "sid".into(),
+                session: "session".into(),
+            },
+        };
+        assert_eq!(invalid.validate(), Err(TransportError::UnauthenticatedPeer));
+        let observed = invalid
+            .process_binding()
+            .expect("observed process remains evidence");
+        assert_eq!(observed.process_id(), 1);
+        assert_eq!(observed.start_time_100ns(), 2);
+        assert_eq!(observed.image_path(), "C:/eliot-test.exe");
+        let unavailable = PeerIdentity::Unavailable {
+            reason: PeerIdentityUnavailable::ProviderProofNotComposed,
+        };
         assert_eq!(
-            PeerIdentity::Authenticated {
-                process_id: 0,
-                user_identity: String::new(),
-                session_identity: String::new(),
-                proof: IdentityProof {
-                    process,
-                    sid: "sid".into(),
-                    session: "session".into(),
-                },
-            }
-            .validate(),
-            Err(TransportError::UnauthenticatedPeer)
-        );
-        assert_eq!(
-            PeerIdentity::Unavailable {
-                reason: PeerIdentityUnavailable::ProviderProofNotComposed,
-            }
-            .validate(),
+            unavailable.validate(),
             Err(TransportError::PeerIdentityUnavailable)
         );
+        assert!(unavailable.process_binding().is_none());
     }
 
     #[test]
