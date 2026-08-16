@@ -5,6 +5,10 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
+#[allow(
+    clippy::large_enum_variant,
+    reason = "Request is a public JSON protocol surface; boxing would change its deserialized API shape"
+)]
 enum Request {
     Submit { job: DreamJobInput },
     Cancel { job_id: String },
@@ -13,6 +17,10 @@ enum Request {
 
 #[derive(Debug, Serialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
+#[allow(
+    clippy::large_enum_variant,
+    reason = "Response is a public JSON protocol surface; boxing would change its serialized API shape"
+)]
 enum Response {
     Ready {
         service: &'static str,
@@ -32,7 +40,7 @@ fn main() {
     let mut service = DreamerComposition::default();
     write_response(
         &mut output,
-        Response::Ready {
+        &Response::Ready {
             service: eliot_dreamer::SERVICE_NAME,
             protocol: eliot_dreamer::PROTOCOL_VERSION,
         },
@@ -45,7 +53,7 @@ fn main() {
                 error: format!("input: {error}"),
             },
         };
-        if !write_response(&mut output, response) {
+        if !write_response(&mut output, &response) {
             break;
         }
     }
@@ -65,14 +73,15 @@ fn dispatch(service: &mut DreamerComposition, line: &str) -> Response {
         Request::Cancel { job_id } => service.cancel(&job_id),
         Request::Status { job_id } => service.status(&job_id),
     };
-    result
-        .map(|view| Response::Job { view })
-        .unwrap_or_else(|error| Response::Error {
+    result.map_or_else(
+        |error| Response::Error {
             error: error.to_string(),
-        })
+        },
+        |view| Response::Job { view },
+    )
 }
 
-fn write_response(output: &mut impl Write, response: Response) -> bool {
+fn write_response(output: &mut impl Write, response: &Response) -> bool {
     serde_json::to_writer(&mut *output, &response).is_ok()
         && output.write_all(b"\n").is_ok()
         && output.flush().is_ok()

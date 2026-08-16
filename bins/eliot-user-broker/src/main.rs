@@ -18,6 +18,8 @@ const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(1);
 
 #[derive(Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
+// The line protocol mirrors the existing launch contract without a second boxed wire shape.
+#[allow(clippy::large_enum_variant)]
 enum Request {
     Launch { request: LaunchRequest },
     Cancel { operation_id: OperationId },
@@ -37,6 +39,8 @@ enum Message {
     Error { code: &'static str, detail: String },
 }
 
+// One loop owns heartbeat timing, request dispatch, and fail-closed shutdown accounting.
+#[allow(clippy::too_many_lines)]
 fn main() {
     let root = match parse_root() {
         Ok(root) => root,
@@ -79,7 +83,7 @@ fn main() {
     }
     let readiness = serde_json::to_value(composition.readiness())
         .unwrap_or_else(|error| serde_json::json!({"error": error.to_string()}));
-    if !write_message(Message::Ready { readiness }) {
+    if !write_message(&Message::Ready { readiness }) {
         return;
     }
     // Keep stdin as an admitted-role operation stream while the composition
@@ -106,8 +110,8 @@ fn main() {
             continue;
         }
         let timeout = next_heartbeat.saturating_duration_since(Instant::now());
-        let received = match receiver.recv_timeout(timeout) {
-            Ok(received) => received,
+        let input_result = match receiver.recv_timeout(timeout) {
+            Ok(input_result) => input_result,
             Err(RecvTimeoutError::Timeout) => {
                 if let Err(error) = composition.heartbeat() {
                     heartbeat_failure(composition, error.to_string());
@@ -117,7 +121,7 @@ fn main() {
             }
             Err(RecvTimeoutError::Disconnected) => break,
         };
-        let response = match received {
+        let response = match input_result {
             Ok(line) if line.trim().is_empty() => continue,
             Ok(line) => dispatch(&mut composition, &line),
             Err(error) => Message::Error {
@@ -132,7 +136,7 @@ fn main() {
                 Err(error) => (
                     Message::Error {
                         code: "BROKER_CLOSE_REJECTED",
-                        detail: error.to_string(),
+                        detail: error,
                     },
                     true,
                 ),
@@ -140,7 +144,7 @@ fn main() {
             if !close_failed {
                 closed = true;
             }
-            if !write_message(response) {
+            if !write_message(&response) {
                 break;
             }
             if close_failed {
@@ -148,18 +152,12 @@ fn main() {
             }
             break;
         }
-        if !write_message(response) {
+        if !write_message(&response) {
             break;
         }
     }
-    if !closed {
-        if let Err(error) = close_with_retry(&mut composition) {
-            exit(
-                PROVIDER_REJECTED_EXIT,
-                "BROKER_CLOSE_REJECTED",
-                error.to_string(),
-            );
-        }
+    if !closed && let Err(error) = close_with_retry(&mut composition) {
+        exit(PROVIDER_REJECTED_EXIT, "BROKER_CLOSE_REJECTED", error);
     }
 }
 
@@ -218,9 +216,9 @@ fn dispatch(composition: &mut BrokerComposition, line: &str) -> Message {
         }
     };
     match request {
-        Request::Launch { request } => composition
-            .launch(request)
-            .map(|receipt| Message::Launched {
+        Request::Launch { request } => composition.launch(request).map_or_else(
+            |error| composition_error(error.to_string()),
+            |receipt| Message::Launched {
                 receipt: serde_json::json!({
                     "operation_id": receipt.operation_id.as_str(),
                     "request_digest": receipt.request_digest,
@@ -232,22 +230,22 @@ fn dispatch(composition: &mut BrokerComposition, line: &str) -> Message {
                     "lineage_verified": receipt.lineage_verified,
                     "disposition": receipt.disposition,
                 }),
-            })
-            .unwrap_or_else(|error| composition_error(error.to_string())),
-        Request::Cancel { operation_id } => composition
-            .cancel(operation_id)
-            .map(|receipt| Message::Cancelled {
+            },
+        ),
+        Request::Cancel { operation_id } => composition.cancel(&operation_id).map_or_else(
+            |error| composition_error(error.to_string()),
+            |receipt| Message::Cancelled {
                 receipt: serde_json::to_value(receipt)
                     .unwrap_or_else(|error| serde_json::json!({"error": error.to_string()})),
-            })
-            .unwrap_or_else(|error| composition_error(error.to_string())),
-        Request::Reconcile { operation_id } => composition
-            .reconcile(operation_id)
-            .map(|view| Message::Reconciled {
+            },
+        ),
+        Request::Reconcile { operation_id } => composition.reconcile(&operation_id).map_or_else(
+            |error| composition_error(error.to_string()),
+            |view| Message::Reconciled {
                 view: serde_json::to_value(view)
                     .unwrap_or_else(|error| serde_json::json!({"error": error.to_string()})),
-            })
-            .unwrap_or_else(|error| composition_error(error.to_string())),
+            },
+        ),
         Request::Status => Message::Ready {
             readiness: serde_json::to_value(composition.readiness())
                 .unwrap_or_else(|error| serde_json::json!({"error": error.to_string()})),
@@ -263,19 +261,20 @@ fn composition_error(detail: String) -> Message {
     }
 }
 
-fn write_message(message: Message) -> bool {
+fn write_message(message: &Message) -> bool {
     let stdout = io::stdout();
     let mut output = stdout.lock();
-    serde_json::to_writer(&mut output, &message).is_ok()
+    serde_json::to_writer(&mut output, message).is_ok()
         && output.write_all(b"\n").is_ok()
         && output.flush().is_ok()
 }
 
 fn exit(code: i32, error_code: &'static str, detail: String) -> ! {
-    let _ = write_message(Message::Error {
+    let message = Message::Error {
         code: error_code,
         detail,
-    });
+    };
+    let _ = write_message(&message);
     std::process::exit(code);
 }
 

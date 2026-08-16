@@ -57,6 +57,31 @@ fn eliot_entry() -> Value {
     })
 }
 
+#[test]
+fn governed_repo_root_rejects_missing_env_instead_of_using_cache_or_cwd() {
+    // This call is intentionally made without changing the process CWD: a
+    // cache-like CWD must be irrelevant when the governed env is absent.
+    let error = match super::governed_repo_root_from(None) {
+        Ok(root) => panic!("unexpectedly resolved source root {}", root.display()),
+        Err(error) => error,
+    };
+    assert!(error.to_string().contains("ELIOT_GOVERNOR_REPO_ROOT"));
+}
+
+#[test]
+fn governed_repo_root_accepts_only_the_canonical_git_checkout()
+-> Result<(), Box<dyn std::error::Error>> {
+    let manifest_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let workspace_root = manifest_root
+        .parent()
+        .and_then(Path::parent)
+        .ok_or("workspace root is missing")?;
+    let expected = std::fs::canonicalize(workspace_root)?;
+    let resolved = super::governed_repo_root_from(Some(expected.as_os_str()))?;
+    assert_eq!(resolved, expected);
+    Ok(())
+}
+
 fn instruction_entry() -> &'static str {
     "C:/Eliot/instructions/eliot-governor.md"
 }
@@ -2071,16 +2096,18 @@ fn codex_personal_marketplace_restores_a_preexisting_entry_at_the_same_index() -
 #[test]
 fn codex_plugin_materialization_uses_self_contained_controller_governor() -> anyhow::Result<()> {
     let governor = Path::new(r"C:\Program Files\Eliot\eliot-governor.exe");
+    let repo_root = Path::new(r"C:\Development\Rust\projects\eliot-memory-os");
     let mut mcp = json!({
         "mcpServers": {
             "eliot": {
                 "type": "stdio",
                 "command": "eliot-governor.exe",
-                "args": ["mcp", "stdio", "--host", "codex", "--profile", "codex_worker"]
+                "args": ["mcp", "stdio", "--host", "codex", "--profile", "codex_worker"],
+                "env": {"PRESERVED_INSTALL_ENV": "present"}
             }
         }
     });
-    materialize_codex_mcp_config(&mut mcp, governor)?;
+    materialize_codex_mcp_config(&mut mcp, governor, repo_root)?;
     assert_eq!(
         mcp["mcpServers"]["eliot"]["command"],
         "bin/eliot-governor.exe"
@@ -2095,6 +2122,14 @@ fn codex_plugin_materialization_uses_self_contained_controller_governor() -> any
             "--instance",
             "default"
         ])
+    );
+    assert_eq!(
+        mcp["mcpServers"]["eliot"]["env"]["ELIOT_GOVERNOR_REPO_ROOT"],
+        repo_root.to_string_lossy().as_ref()
+    );
+    assert_eq!(
+        mcp["mcpServers"]["eliot"]["env"]["PRESERVED_INSTALL_ENV"],
+        "present"
     );
 
     let hooks = json!({

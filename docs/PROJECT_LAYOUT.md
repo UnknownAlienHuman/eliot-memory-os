@@ -9,7 +9,7 @@
 | `integrations/` | portable agent skills and host integration packages |
 | `scripts/` | supported build, packaging, validation, and operations scripts |
 | `tests/` | cross-language tests and deterministic fixtures |
-| `docs/architecture/` | canonical vision, current implementation architecture, and future design |
+| `docs/architecture/` | historical and bounded architecture evidence; the normative pair is routed by `docs/ARCHITECTURE_CONTRACT.md` |
 | `docs/operations/` | current operator runbooks |
 | `docs/release/` | current packaging contract |
 

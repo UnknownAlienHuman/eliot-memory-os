@@ -871,7 +871,7 @@ impl ObservabilityBuffer {
             self.append_gap(gap)?;
             return Ok(BufferDisposition::GapRecorded);
         }
-        self.events.insert(event.event_id, (digest, event));
+        self.events.insert(event.event_id.clone(), (digest, event));
         Ok(BufferDisposition::Accepted)
     }
 
@@ -903,7 +903,8 @@ impl ObservabilityBuffer {
             self.append_gap(gap)?;
             return Ok(BufferDisposition::GapRecorded);
         }
-        self.metrics.insert(metric.sample_id, (digest, metric));
+        self.metrics
+            .insert(metric.sample_id.clone(), (digest, metric));
         Ok(BufferDisposition::Accepted)
     }
 

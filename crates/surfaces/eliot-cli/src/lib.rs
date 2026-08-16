@@ -6,7 +6,7 @@
 
 #![forbid(unsafe_code)]
 
-use std::{collections::BTreeSet, fmt::Write as _};
+use std::{collections::BTreeSet, fmt::Write as _, path::Path};
 
 use eliot_protocol::RequestIdentity;
 use eliot_receipts::{EffectClass, ProofCeiling};
@@ -92,7 +92,10 @@ impl CommandId {
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum CommandArguments {
-    SystemSnapshot,
+    SystemSnapshot {
+        repo_root: String,
+        output_path: String,
+    },
     BootstrapBrief {
         work_unit: String,
     },
@@ -152,7 +155,7 @@ pub enum CommandArguments {
 impl CommandArguments {
     fn command_id(&self) -> CommandId {
         match self {
-            Self::SystemSnapshot => CommandId::SystemSnapshot,
+            Self::SystemSnapshot { .. } => CommandId::SystemSnapshot,
             Self::BootstrapBrief { .. } => CommandId::BootstrapBrief,
             Self::RecoveryStatus => CommandId::RecoveryStatus,
             Self::Ui => CommandId::Ui,
@@ -187,8 +190,23 @@ impl CommandArguments {
         Ok(())
     }
 
+    fn validate_absolute_path(value: &str, field: &'static str) -> Result<(), CliError> {
+        Self::validate_text(value, field)?;
+        if !Path::new(value).is_absolute() {
+            return Err(CliError::InvalidArgument { field });
+        }
+        Ok(())
+    }
+
     fn validate(&self) -> Result<(), CliError> {
         match self {
+            Self::SystemSnapshot {
+                repo_root,
+                output_path,
+            } => {
+                Self::validate_absolute_path(repo_root, "repo_root")?;
+                Self::validate_absolute_path(output_path, "output_path")
+            }
             Self::BootstrapBrief { work_unit } => Self::validate_text(work_unit, "work_unit"),
             Self::DevPulse { objective_id } => Self::validate_text(objective_id, "objective_id"),
             Self::InstrumentRun { profile, scope } => {
@@ -220,8 +238,7 @@ impl CommandArguments {
                 Self::validate_text(generation, "generation")
             }
             Self::DoctorIntegration { profile } => Self::validate_text(profile, "profile"),
-            Self::SystemSnapshot
-            | Self::RecoveryStatus
+            Self::RecoveryStatus
             | Self::Ui
             | Self::Dashboard
             | Self::DevImpactChanged
@@ -410,7 +427,7 @@ pub mod kernel_client {
         UnknownOutcome(String),
     }
 
-    /// Exact server-owned configuration snapshot carried by ServerHello.
+    /// Exact server-owned configuration snapshot carried by `ServerHello`.
     /// This is deliberately closed: a plausible arbitrary JSON object cannot
     /// stand in for the Kernel's generation, authority and artifact binding.
     #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
@@ -776,7 +793,7 @@ pub mod kernel_client {
             ));
         }
         match &response.payload {
-            ProtocolPayload::Json(value) if !value.get("rejection_reason").is_some() => {
+            ProtocolPayload::Json(value) if value.get("rejection_reason").is_none() => {
                 Ok(value.clone())
             }
             ProtocolPayload::Json(_) => Err(KernelClientError::Rejected(
@@ -835,6 +852,9 @@ pub mod kernel_client {
     }
 
     #[cfg(test)]
+    // The platform delivery helper must remain cfg-gated beside production code;
+    // fixtures intentionally fail immediately for invalid static identities.
+    #[allow(clippy::expect_used, clippy::items_after_test_module)]
     mod tests {
         use super::*;
         use eliot_contracts::AuthorityEpoch;
@@ -929,6 +949,7 @@ pub struct CommandSpec {
 #[serde(rename_all = "snake_case")]
 pub enum ArgumentKind {
     Empty,
+    Snapshot,
     WorkUnit,
     Objective,
     Profile,
@@ -968,17 +989,14 @@ pub struct ProviderContract {
 static COMMANDS: &[CommandSpec] = &[
     CommandSpec {
         id: CommandId::SystemSnapshot,
-        usage: "eliot system snapshot",
-        summary: "compile a partial/full CurrentSystemEvidenceSnapshot",
+        usage: "eliot system snapshot --repo-root <ABSOLUTE> --output <ABSOLUTE>",
+        summary: "capture a current-system evidence snapshot",
         owner: "eliot-cli",
         required_work_id: "A-06",
-        argument_kind: ArgumentKind::Empty,
+        argument_kind: ArgumentKind::Snapshot,
         effect: EffectClass::Read,
         proof_ceiling: ProofCeiling::CandidateArtifact,
-        availability: CommandAvailability::PlanGap {
-            missing_work_id: "A-06",
-            dependency: "eliot-mcp",
-        },
+        availability: CommandAvailability::Admitted,
     },
     CommandSpec {
         id: CommandId::BootstrapBrief,
@@ -1468,6 +1486,33 @@ impl CommandCatalogue {
         Ok(response)
     }
 
+    /// Binds a locally captured artifact to the admitted snapshot command.
+    ///
+    /// The capture itself belongs to the short-lived `eliot` execution owner;
+    /// this method only performs the public request/response correlation and
+    /// availability proof.
+    pub fn forwarded_snapshot_response(
+        self,
+        request: &CommandRequest,
+        payload: Value,
+    ) -> Result<CommandResponse, CliError> {
+        self.validate()?;
+        request.validate()?;
+        if request.command != CommandId::SystemSnapshot {
+            return Err(CliError::ResultMismatch);
+        }
+        let spec = self.find(request.command)?;
+        let response = CommandResponse {
+            request: request.request.clone(),
+            command: request.command,
+            effect: spec.effect,
+            proof_ceiling: spec.proof_ceiling,
+            result: CommandResult::Forwarded { payload },
+        };
+        response.validate_for(self, request)?;
+        Ok(response)
+    }
+
     /// Validates and forwards one request through an injected Kernel port.
     ///
     /// This method is intentionally separate from [`Self::execute`]: the
@@ -1575,7 +1620,10 @@ pub fn validate_catalogue(
         if spec.proof_ceiling > ProofCeiling::CandidateArtifact {
             return Err(CatalogueError::ProofCeiling(id.to_owned()));
         }
-        if spec.availability == CommandAvailability::Admitted && spec.required_work_id != "A-11" {
+        if spec.availability == CommandAvailability::Admitted
+            && spec.required_work_id != "A-11"
+            && spec.id != CommandId::SystemSnapshot
+        {
             return Err(CatalogueError::InvalidProvider(id.to_owned()));
         }
     }

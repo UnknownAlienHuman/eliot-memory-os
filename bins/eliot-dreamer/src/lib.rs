@@ -159,6 +159,10 @@ pub struct CurationCandidate {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "result", rename_all = "snake_case")]
+#[allow(
+    clippy::large_enum_variant,
+    reason = "DreamResult is a public serialized protocol surface; boxing would change its wire/API shape"
+)]
 pub enum DreamResult {
     Packet(DreamPacket),
     Curation {

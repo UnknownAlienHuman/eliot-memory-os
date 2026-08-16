@@ -243,6 +243,11 @@ pub struct ModuleManifest {
 }
 
 impl ModuleManifest {
+    /// Constructs the wire manifest from its canonical public fields.
+    ///
+    /// The explicit arity mirrors the serialized/API contract; grouping these
+    /// values would be a public constructor change.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         artifact_digest: String,
         config_digest: String,
@@ -577,8 +582,11 @@ impl ModuleCatalogEntry {
     }
 }
 
+/// Public mutation envelope; inline admission preserves the established wire
+/// shape and constructor/API surface.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[allow(clippy::large_enum_variant)]
 pub enum CatalogMutation {
     Upsert {
         manifest: ModuleManifest,
@@ -655,7 +663,7 @@ pub struct PreparedCatalogTransition {
     pub approval_refs: Vec<String>,
 }
 
-/// Compatibility spelling used by the public ModuleCatalog boundary.
+/// Compatibility spelling used by the public `ModuleCatalog` boundary.
 pub type PreparedTransition = PreparedCatalogTransition;
 
 impl PreparedCatalogTransition {
@@ -857,7 +865,7 @@ impl ModuleCatalog {
             } => {
                 let mut current = entry.ok_or(ModuleError::NotFound)?;
                 current.desired_state = *desired_state;
-                current.removal_reason = removal_reason.clone();
+                current.removal_reason.clone_from(removal_reason);
                 current.catalog_revision = self.revision + 1;
                 current.state_fence = self.state_fence.clone();
                 current.validate()?;

@@ -45,6 +45,8 @@ pub struct ProvenanceRecord {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
+/// Public policy wire shape intentionally retains independent boolean gates.
+#[allow(clippy::struct_excessive_bools)]
 pub struct InfluencePolicy {
     pub policy_id: String,
     pub revision: u64,

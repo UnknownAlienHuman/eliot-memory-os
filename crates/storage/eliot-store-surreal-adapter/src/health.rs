@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 
 use eliot_protocol::ProtocolVersion;
 
-/// Liveness observation of the SurrealDB provider.
+/// Liveness observation of the `SurrealDB` provider.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ProviderHealth {
@@ -52,6 +52,8 @@ impl AdapterHealth {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::expect_used)]
+
     use super::*;
 
     #[test]

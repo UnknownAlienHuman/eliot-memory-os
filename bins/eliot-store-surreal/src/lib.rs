@@ -2,7 +2,7 @@
 
 //! Composition owner for the S-03 canonical store bridge.
 //!
-//! This process exposes only the store-neutral EBP contract.  SurrealDB
+//! This process exposes only the store-neutral EBP contract.  `SurrealDB`
 //! credentials, provider transport and query text stay inside
 //! `eliot-store-surreal-adapter`; this root only assembles the adapter and
 //! serializes bounded contract receipts. Blob contributes one process/root
@@ -192,10 +192,8 @@ pub fn launch_config_digest(config: &StoreLaunchConfig) -> Result<String, String
     };
     let bytes =
         serde_json::to_vec(&input).map_err(|error| format!("serialize launch digest: {error}"))?;
-    Ok(Sha256::digest(bytes)
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect())
+    let digest = Sha256::digest(bytes);
+    Ok(format!("{digest:x}"))
 }
 
 fn validate_digest(value: &str, field: &str) -> Result<(), String> {
@@ -240,8 +238,8 @@ impl StoreComposition {
     /// Builds the adapter from the explicit target launch configuration.
     /// Credential bytes are read only inside this process from the configured
     /// Windows Credential Manager reference and are retained only by the
-    /// adapter's redacted SecretString configuration.
-    pub fn new(config: StoreLaunchConfig) -> Result<Self, String> {
+    /// adapter's redacted `SecretString` configuration.
+    pub fn new(config: &StoreLaunchConfig) -> Result<Self, String> {
         config.validate()?;
         let blob = BlobRootOwner::claim(
             config.blob_root.clone(),
@@ -252,7 +250,7 @@ impl StoreComposition {
         let platform = WindowsPlatform::new(config.blob_root.clone())
             .map_err(|error| format!("validate Blob root for credential access: {error}"))?;
         let password = resolve_credential(&platform, &config.credential_ref)?;
-        let store = SurrealStoreAdapter::new(adapter_config(&config, password)?);
+        let store = SurrealStoreAdapter::new(adapter_config(config, password)?);
         Ok(Self { store, blob })
     }
 
@@ -364,9 +362,9 @@ impl StoreComposition {
     }
 }
 
-/// Immutable identity projected into the S-03 ServerHello.  The transport
+/// Immutable identity projected into the S-03 `ServerHello`.  The transport
 /// loop does not get to invent any provider or process authority; it receives
-/// this projection from the one StoreComposition.
+/// this projection from the one `StoreComposition`.
 #[derive(Clone, Debug)]
 pub struct StoreHandshakeIdentity {
     operation_manifest_digest: String,
@@ -418,7 +416,7 @@ impl StoreEbpSession {
     }
 }
 
-/// Admits the only supported S-03 ClientHello and binds the complete
+/// Admits the only supported S-03 `ClientHello` and binds the complete
 /// generation/fence/epoch lineage to the resulting session.
 pub fn admit_handshake(
     frame: Frame,
@@ -658,10 +656,10 @@ fn resolve_credential(
         .map_err(|error| format!("read configured credential reference: {error}"))?;
     let password = String::from_utf8(credential.expose().to_vec())
         .map_err(|_| "configured credential is not UTF-8".to_owned())?;
-    non_empty_secret(password, "configured credential")
+    non_empty_secret(&password, "configured credential")
 }
 
-fn non_empty_secret(value: String, source: &str) -> Result<SecretString, String> {
+fn non_empty_secret(value: &str, source: &str) -> Result<SecretString, String> {
     let value = value.trim().to_owned();
     if value.is_empty() {
         return Err(format!("{source} is empty"));
@@ -670,7 +668,7 @@ fn non_empty_secret(value: String, source: &str) -> Result<SecretString, String>
 }
 
 /// Loads the process's explicit non-secret launch configuration from the
-/// protected ProgramData contour. Secret material is resolved from the opaque
+/// protected `ProgramData` contour. Secret material is resolved from the opaque
 /// credential reference only inside `StoreComposition::new`. Missing or
 /// out-of-contour configuration is an error; there is no default or legacy
 /// configuration conversion.
@@ -701,6 +699,8 @@ pub fn load_config(path: Option<&Path>) -> Result<StoreLaunchConfig, String> {
 }
 
 #[cfg(test)]
+// Test fixtures intentionally fail immediately when their static identities are invalid.
+#[allow(clippy::expect_used)]
 mod tests {
     use super::*;
     use eliot_contracts::{
@@ -798,7 +798,8 @@ mod tests {
                 .map(|value| (*value).to_owned())
                 .collect(),
             privacy_classes: vec!["PUBLIC".to_owned()],
-            max_frame: eliot_protocol::MAX_FRAME_BYTES as u32,
+            max_frame: u32::try_from(eliot_protocol::MAX_FRAME_BYTES)
+                .expect("protocol frame limit fits the wire field"),
             authority_epoch,
         };
         eliot_ipc::client_hello_frame("connection-test", &hello).expect("hello frame")

@@ -770,9 +770,10 @@ impl HostRecoveryEvidence {
 /// Durable Host shutdown disposition. `ReleasePending` is intentionally not
 /// admission-clean: it remains a recovery gate until release and finalization
 /// both succeed.
-#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum HostShutdownDisposition {
+    #[default]
     Clean,
     ReleasePending {
         marker: HostShutdownMarker,
@@ -782,12 +783,6 @@ pub enum HostShutdownDisposition {
     RecoveryFinalized {
         marker: HostShutdownMarker,
     },
-}
-
-impl Default for HostShutdownDisposition {
-    fn default() -> Self {
-        Self::Clean
-    }
 }
 
 impl HostShutdownDisposition {
@@ -879,12 +874,11 @@ impl HostInstallationState {
                 {
                     return Err(HostStateError::InvalidRecord);
                 }
-                if let Some(evidence) = &self.last_recovery_evidence {
-                    if evidence.release_marker != *marker
-                        || evidence.stale_active_process != marker.process
-                    {
-                        return Err(HostStateError::InvalidRecord);
-                    }
+                if let Some(evidence) = &self.last_recovery_evidence
+                    && (evidence.release_marker != *marker
+                        || evidence.stale_active_process != marker.process)
+                {
+                    return Err(HostStateError::InvalidRecord);
                 }
             }
             HostShutdownDisposition::RecoveryFinalized { marker } => {
@@ -1210,15 +1204,15 @@ impl HostStateStore for FakeHostStateStore {
     ) -> Result<HostActivationReceipt, HostStateError> {
         transition.validate()?;
         process_recovery.validate()?;
-        if !process_recovery.binds_to(&transition.installation, &transition.process) {
-            return Err(HostStateError::InvalidRecord);
-        }
         let mut state = self
             .state
             .lock()
             .map_err(|_| HostStateError::Synchronization)?;
         if state.installation != transition.installation {
             return Err(HostStateError::InstallationMismatch);
+        }
+        if !process_recovery.binds_to(&transition.installation, &transition.process) {
+            return Err(HostStateError::InvalidRecord);
         }
         state.active_process = Some(transition.process.clone());
         state.last_clean_shutdown = None;

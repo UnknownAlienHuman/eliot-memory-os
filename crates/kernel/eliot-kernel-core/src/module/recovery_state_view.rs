@@ -143,6 +143,7 @@ fn authority_epoch_from(current: &EpochIdentity) -> Result<AuthorityEpoch, Kerne
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
 

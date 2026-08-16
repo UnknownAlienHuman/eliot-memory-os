@@ -276,8 +276,9 @@ pub fn plan_selection(request: &SelectionRequest) -> Result<SelectionPlan, Selec
                 .then_with(|| left.0.test_id.cmp(&right.0.test_id))
         });
         let mut total_cost = 0_u32;
+        let max_tests = usize::try_from(request.budget.max_tests).unwrap_or(usize::MAX);
         for (test, reason, score) in candidates {
-            if selected.len() as u32 >= request.budget.max_tests
+            if selected.len() >= max_tests
                 || total_cost.saturating_add(test.estimated_cost) > request.budget.max_cost
             {
                 continue;
@@ -332,10 +333,10 @@ fn best_match<'a>(
     let mut best = None;
     for test_coordinate in &test.impact_coordinates {
         for impacted_coordinate in impacted {
-            if let Some((reason, score)) = coordinate_match(test_coordinate, impacted_coordinate) {
-                if best.as_ref().is_none_or(|(_, _, current)| score > *current) {
-                    best = Some((test, reason, score));
-                }
+            if let Some((reason, score)) = coordinate_match(test_coordinate, impacted_coordinate)
+                && best.as_ref().is_none_or(|(_, _, current)| score > *current)
+            {
+                best = Some((test, reason, score));
             }
         }
     }

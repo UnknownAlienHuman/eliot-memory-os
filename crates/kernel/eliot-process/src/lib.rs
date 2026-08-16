@@ -2106,7 +2106,7 @@ impl ProcessState {
     /// accepted as a substitute for these inputs.
     pub fn recover_start(
         &mut self,
-        observation: RecoveryObservation,
+        observation: &RecoveryObservation,
         capability: &RecoveryCapability,
         current: &DispatchValidationContext,
         health: ProcessHealth,
@@ -2912,7 +2912,7 @@ mod tests {
             151,
         )?;
         let receipt = state.recover_start(
-            observation,
+            &observation,
             &capability,
             &current,
             ProcessHealth::new(ProcessHealthStatus::Healthy, true, 151, None)?,

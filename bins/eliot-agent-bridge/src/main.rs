@@ -10,6 +10,9 @@ const PROVIDER_PORT_EXIT: i32 = 69;
 
 #[derive(Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
+// This closed line protocol mirrors the existing frame contracts without an
+// extra heap representation at the trusted process boundary.
+#[allow(clippy::large_enum_variant)]
 enum Request {
     Attach {
         identity: RequestIdentity,
@@ -53,6 +56,9 @@ enum Response {
     },
 }
 
+// The entrypoint keeps the complete request/identity/response loop in one place
+// so every branch shares the same provider-failure exit accounting.
+#[allow(clippy::too_many_lines)]
 fn main() {
     let config = match parse_args(std::env::args().skip(1)) {
         Ok(config) => config,
@@ -89,12 +95,13 @@ fn main() {
             std::process::exit(PROVIDER_PORT_EXIT);
         }
     };
-    if !write_response(Response::Status {
+    let initial_status = Response::Status {
         profile: Profile::as_str(config.profile),
         control_capacity: runner.control_capacity(),
         activation_port: "authenticated Kernel HostActivationPort",
         forwarding_port: "authenticated Kernel McpForwardingPort",
-    }) {
+    };
+    if !write_response(&initial_status) {
         return;
     }
     let mut provider_failure = false;
@@ -112,7 +119,7 @@ fn main() {
                             Ok(_) => Response::Attached,
                             Err(error) => {
                                 provider_failure |= matches!(error, BridgeError::PlanGap(_));
-                                bridge_error(error)
+                                bridge_error(&error)
                             }
                         },
                     }
@@ -127,7 +134,7 @@ fn main() {
                             Ok(()) => Response::Forwarded,
                             Err(error) => {
                                 provider_failure |= is_provider_failure(&error);
-                                bridge_error(error)
+                                bridge_error(&error)
                             }
                         },
                     }
@@ -142,7 +149,7 @@ fn main() {
                             Ok(()) => Response::Forwarded,
                             Err(error) => {
                                 provider_failure |= is_provider_failure(&error);
-                                bridge_error(error)
+                                bridge_error(&error)
                             }
                         },
                     }
@@ -157,7 +164,7 @@ fn main() {
                             Ok(_) => Response::Forwarded,
                             Err(error) => {
                                 provider_failure |= is_provider_failure(&error);
-                                bridge_error(error)
+                                bridge_error(&error)
                             }
                         },
                     }
@@ -172,7 +179,7 @@ fn main() {
                             Ok(_) => Response::Reconciled,
                             Err(error) => {
                                 provider_failure |= is_provider_failure(&error);
-                                bridge_error(error)
+                                bridge_error(&error)
                             }
                         },
                     }
@@ -195,7 +202,7 @@ fn main() {
             },
         };
         let stop = matches!(response, Response::Stopped);
-        if !write_response(response) || stop {
+        if !write_response(&response) || stop {
             break;
         }
     }
@@ -204,7 +211,7 @@ fn main() {
     }
 }
 
-fn bridge_error(error: BridgeError) -> Response {
+fn bridge_error(error: &BridgeError) -> Response {
     if matches!(error, BridgeError::PlanGap(_)) {
         Response::Error {
             code: "KERNEL_ACTIVATION_PORT_REJECTED",
@@ -237,10 +244,10 @@ fn emit_error(code: &str, detail: &str) {
     let _ = writeln!(stderr, "{{\"error\":{code:?},\"detail\":{detail:?}}}");
 }
 
-fn write_response(response: Response) -> bool {
+fn write_response(response: &Response) -> bool {
     let stdout = io::stdout();
     let mut output = stdout.lock();
-    serde_json::to_writer(&mut output, &response).is_ok()
+    serde_json::to_writer(&mut output, response).is_ok()
         && output.write_all(b"\n").is_ok()
         && output.flush().is_ok()
 }

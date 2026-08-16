@@ -1,4 +1,4 @@
-//! The canonical BuildTestGraph projection.
+//! The canonical `BuildTestGraph` projection.
 //!
 //! This crate owns neither Cargo's compiler graph nor verifier execution.  It
 //! accepts immutable observations from those owners and compiles a conservative
@@ -16,6 +16,7 @@ use thiserror::Error;
 
 pub const CONTRACT_NAME: &str = "eliot.instrument.build-test-graph";
 pub const CONTRACT_VERSION: (u16, u16, u16) = (1, 0, 0);
+const HEX_DIGITS: &[u8; 16] = b"0123456789abcdef";
 
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
 pub enum GraphError {
@@ -59,8 +60,11 @@ fn digest_bytes(value: &[u8]) -> String {
     hasher
         .finalize()
         .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect()
+        .fold(String::with_capacity(64), |mut digest, byte| {
+            digest.push(HEX_DIGITS[(byte >> 4) as usize] as char);
+            digest.push(HEX_DIGITS[(byte & 0x0f) as usize] as char);
+            digest
+        })
 }
 
 fn canonical<T: Serialize>(value: &T) -> Result<String, GraphError> {
@@ -403,6 +407,7 @@ impl BuildTestGraph {
 }
 
 #[derive(Clone, Debug, Default, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[allow(clippy::struct_excessive_bools)]
 pub struct ChangeSet {
     pub changed_nodes: BTreeSet<String>,
     pub public_contract_changed: bool,

@@ -530,7 +530,11 @@ fn d09_prediction_resolves_against_real_verifier() -> TestResult {
             "project_id": project_id,
             "task_id": task_id,
             "goal": "resolve a machine-checkable UL prediction",
-            "candidate_handles": [],
+            "candidate_handles": [
+                "task-domain:operations",
+                "task-action:read_only",
+                "task-artifact:runtime"
+            ],
             "max_tokens": 2_000
         }),
     )?;
@@ -542,10 +546,12 @@ fn d09_prediction_resolves_against_real_verifier() -> TestResult {
                 .find(|item| item["verifier_id"] == "daemon-receipt-resolution")
         })
         .ok_or("registered receipt verifier missing")?;
+    let verifier_id = required_string(descriptor, "/verifier_id")?;
     let verifier_ref = required_string(descriptor, "/verifier_ref")?;
     let verifier_config_hash = required_string(descriptor, "/config_hash")?;
     let mut frame: MaterialPacketFrame = serde_json::from_value(packet["frame_stub"].clone())?;
-    frame.expected_observable = "verifier:daemon-receipt-resolution=pass".to_owned();
+    frame.verifier.clone_from(&verifier_id);
+    frame.expected_observable = format!("verifier:{verifier_id}=pass");
     let material_packet = harness.client.tool_call(
         72,
         "eliot_compile_packet_l3",
@@ -553,7 +559,11 @@ fn d09_prediction_resolves_against_real_verifier() -> TestResult {
             "project_id": project_id,
             "task_id": task_id,
             "goal": "resolve a machine-checkable UL prediction",
-            "candidate_handles": [],
+            "candidate_handles": [
+                "task-domain:operations",
+                "task-action:read_only",
+                "task-artifact:runtime"
+            ],
             "max_tokens": 2_000,
             "material_frame": frame
         }),

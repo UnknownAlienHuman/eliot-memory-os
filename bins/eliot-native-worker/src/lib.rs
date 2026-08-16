@@ -103,9 +103,8 @@ where
     /// Serves length-delimited JSON frames after the caller has completed start.
     pub async fn serve_stdio(&mut self) -> Result<(), NativeWorkerError> {
         loop {
-            let frame = match read_frame()? {
-                Some(frame) => frame,
-                None => return Ok(()),
+            let Some(frame) = read_frame()? else {
+                return Ok(());
             };
             let shutdown = matches!(
                 frame.body,

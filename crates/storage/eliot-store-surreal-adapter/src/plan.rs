@@ -2,7 +2,7 @@
 //! outbox derivation, receipt construction and write validation.
 //!
 //! Everything here is deterministic and independent of the physical store, so
-//! it is unit-testable without a running SurrealDB. It mirrors the in-memory
+//! it is unit-testable without a running `SurrealDB`. It mirrors the in-memory
 //! reference store so two stores produce equivalent receipts from the same
 //! inputs.
 

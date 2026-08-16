@@ -64,9 +64,7 @@ fn bounded<T>(items: &[T], field: &'static str, maximum: usize) -> Result<(), Cu
 }
 
 /// A canonical record projection supplied by the storage owner.
-#[derive(
-    Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize, JsonSchema,
-)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct CurationRecord {
     pub handle: String,
@@ -96,7 +94,7 @@ impl CurationRecord {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum LifecycleState {
     Active,
@@ -109,7 +107,8 @@ pub enum LifecycleState {
     Superseded,
 }
 
-#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[allow(clippy::struct_excessive_bools)]
 #[serde(deny_unknown_fields)]
 pub struct CurationMetadata {
     pub duplicate_of: Option<String>,
@@ -384,6 +383,7 @@ fn is_protected(record: &CurationRecord) -> bool {
             .eq_ignore_ascii_case("minority_pressure_record")
 }
 
+#[allow(clippy::too_many_lines)]
 fn candidate_for(record: &CurationRecord) -> Option<CurationCandidate> {
     let (finding, action, confidence, signal_refs, requirements) = if let Some(target) =
         &record.metadata.duplicate_of
@@ -516,7 +516,7 @@ fn make_cursor(offset: usize, scope: &str, revision: u64) -> String {
 
 fn parse_cursor(value: &str, scope: &str, revision: u64) -> Result<usize, CurationError> {
     let (offset, digest) = value.split_once(':').ok_or(CurationError::InvalidCursor)?;
-    if digest != &digest_for_cursor(scope, revision) {
+    if digest != digest_for_cursor(scope, revision) {
         return Err(CurationError::InvalidCursor);
     }
     offset.parse().map_err(|_| CurationError::InvalidCursor)

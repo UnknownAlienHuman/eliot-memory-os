@@ -9,7 +9,7 @@
 use eliot_store_api::StoreError;
 use thiserror::Error;
 
-/// Failure of the SurrealDB store bridge.
+/// Failure of the `SurrealDB` store bridge.
 #[derive(Clone, Debug, Error, PartialEq, Eq)]
 pub enum AdapterError {
     #[error("provider is unavailable")]

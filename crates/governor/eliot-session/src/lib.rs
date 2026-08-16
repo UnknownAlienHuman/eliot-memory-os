@@ -192,6 +192,7 @@ pub struct SessionLifecycleSnapshot {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[allow(clippy::large_enum_variant)]
 enum RequestResult {
     Register(SessionLifecycleEvent),
     Command(SessionCommand, SessionLifecycleEvent),
@@ -435,7 +436,7 @@ impl SessionLifecycleOwner {
         let record = self
             .sessions
             .get_mut(&session_id)
-            .expect("session checked above");
+            .ok_or_else(|| SessionError::SessionNotFound(session_id.clone()))?;
         record.status = target;
         if matches!(command, SessionCommand::Resume | SessionCommand::Activate) {
             record.heartbeat_at = context.now;
@@ -499,7 +500,7 @@ impl SessionLifecycleOwner {
         let record = self
             .sessions
             .get_mut(&req.session_id)
-            .expect("session checked above");
+            .ok_or_else(|| SessionError::SessionNotFound(req.session_id.clone()))?;
         record.heartbeat_at = req.now;
         record.expires_at = req.expires_at;
         self.requests.insert(
@@ -530,6 +531,7 @@ impl SessionLifecycleOwner {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn emit(
         &mut self,
         request_id: &str,

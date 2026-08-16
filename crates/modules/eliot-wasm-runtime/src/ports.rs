@@ -3,7 +3,7 @@ use thiserror::Error;
 
 use crate::{
     AuthorityResolution, DerivedExecutionEvidence, EngineBinding, EngineInvocation, EngineReport,
-    GovernorResolution, InvocationRequest, ProcessLaunchEnvelope, PromotionQuery,
+    GovernorResolution, InvocationRequest, ProcessBinding, ProcessLaunchEnvelope, PromotionQuery,
     PromotionVerification, SourceVerification,
 };
 
@@ -45,36 +45,36 @@ pub trait PromotionVerificationPort: Send {
     ) -> Result<(), PortError>;
 }
 
-/// P-03 executor boundary. It alone creates process requests and receipts.
+/// P-03 executor boundary. It alone creates and consumes process authority.
 pub trait P03ProcessPort: Send {
     fn prepare(&mut self, envelope: &ProcessLaunchEnvelope) -> Result<ProcessRequest, PortError>;
 
-    fn start(&mut self, request: &ProcessRequest) -> Result<ProcessStartReceipt, PortError>;
+    fn start(&mut self, request: ProcessRequest) -> Result<ProcessStartReceipt, PortError>;
 
-    fn cancel(&mut self, request: &ProcessRequest) -> Result<CancellationReceipt, PortError>;
+    fn cancel(&mut self, binding: &ProcessBinding) -> Result<CancellationReceipt, PortError>;
 
-    fn reconcile(&mut self, request: &ProcessRequest) -> Result<ProcessEvidence, PortError>;
+    fn reconcile(&mut self, binding: &ProcessBinding) -> Result<ProcessEvidence, PortError>;
 }
 
 /// Separate P-03 receipt verifier; neither A-12 nor the engine mints proof.
 pub trait P03ReceiptVerifierPort: Send {
     fn verify_start(
         &mut self,
-        request: &ProcessRequest,
+        binding: &ProcessBinding,
         receipt: &ProcessStartReceipt,
         envelope: &ProcessLaunchEnvelope,
     ) -> Result<(), PortError>;
 
     fn verify_cancellation(
         &mut self,
-        request: &ProcessRequest,
+        binding: &ProcessBinding,
         receipt: &CancellationReceipt,
         envelope: &ProcessLaunchEnvelope,
     ) -> Result<(), PortError>;
 
     fn verify_reconciliation(
         &mut self,
-        request: &ProcessRequest,
+        binding: &ProcessBinding,
         evidence: &ProcessEvidence,
         envelope: &ProcessLaunchEnvelope,
     ) -> Result<(), PortError>;

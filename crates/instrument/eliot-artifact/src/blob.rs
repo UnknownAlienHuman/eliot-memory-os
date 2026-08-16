@@ -72,7 +72,7 @@ pub type ArtifactFuture<'a, T> =
 pub trait ArtifactBlobReader: Send + Sync {
     /// Reads one authenticated, complete S-04 payload under the supplied
     /// bounded request.
-    fn read<'a>(&'a self, request: ArtifactBlobReadRequest) -> BlobReadFuture<'a>;
+    fn read(&self, request: ArtifactBlobReadRequest) -> BlobReadFuture<'_>;
 }
 
 /// Immutable reference to an artifact's bytes and its S-04 backing identity.
@@ -230,7 +230,7 @@ impl ArtifactReadReceipt {
 }
 
 /// The I-01 immutable artifact owner.  It owns identity and transfer policy,
-/// while S-04 remains the sole physical BlobStore owner.
+/// while S-04 remains the sole physical `BlobStore` owner.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ArtifactOwner {
     max_read_bytes: u64,
@@ -284,7 +284,7 @@ impl ArtifactOwner {
                 reason: format!("S-04 chunk integrity rejected: {error}"),
             })?;
             if chunk.ready_receipt().locator() != &reference.locator
-                || chunk.ready_receipt().receipt().receipt_id.as_str()
+                || chunk.ready_receipt().receipt().identity.receipt_id.as_str()
                     != reference.expected_ready_receipt_id
                 || chunk.ready_receipt().metadata_sha256() != reference.expected_metadata_sha256
                 || chunk.bytes().len() as u64 > self.max_read_bytes

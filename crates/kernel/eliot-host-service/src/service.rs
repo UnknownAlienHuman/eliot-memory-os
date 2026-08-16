@@ -76,7 +76,7 @@ impl HostDependencyPlan {
 pub struct KernelStartReceipt {
     /// The service identity that was started or reused.
     pub service: PlatformHandle,
-    /// Exact observed process record persisted by HostStateStore.
+    /// Exact observed process record persisted by `HostStateStore`.
     pub process: ServiceProcessRecord,
     /// Exact PID/image/Job recovery binding committed with the process record.
     pub process_recovery: HostProcessRecoveryBinding,
@@ -360,7 +360,7 @@ where
     pub fn accept_kernel_ready(
         &mut self,
         handshake: &HostKernelHandshake,
-        receipt: KernelReadyReceipt,
+        receipt: &KernelReadyReceipt,
     ) -> Result<(), HostServiceError> {
         if self.state != HostServiceState::ControlReady {
             return Err(HostServiceError::IllegalTransition {
@@ -387,9 +387,9 @@ where
         &mut self,
         context: &RequestMetadata,
         prior_service: PlatformHandle,
-        candidate_service: PlatformHandle,
+        candidate_service: &PlatformHandle,
         prior_recovery: HostProcessRecoveryBinding,
-        candidate_recovery: HostProcessRecoveryBinding,
+        candidate_recovery: &HostProcessRecoveryBinding,
         max_attempts: u32,
     ) -> Result<(BoundedRestartOutcome, KernelStartReceipt), HostServiceError> {
         validate_context(context)?;
@@ -418,7 +418,7 @@ where
                 Err(error) => last_error = Some(error.to_string()),
             }
         }
-        if candidate_service != prior_service {
+        if candidate_service != &prior_service {
             let rollback = self.start_kernel(context, prior_service, prior_recovery);
             if let Ok(receipt) = rollback {
                 return Ok((BoundedRestartOutcome::RolledBack, receipt));
@@ -433,7 +433,7 @@ where
     pub fn start_dependency(
         &mut self,
         context: &RequestMetadata,
-        plan: HostDependencyPlan,
+        plan: &HostDependencyPlan,
     ) -> Result<ServiceProcessRecord, HostServiceError> {
         validate_context(context)?;
         plan.validate()?;
@@ -495,13 +495,13 @@ where
         };
         if let Err(error) = self.state_store.record_dependency(transition) {
             self.admission_closed = true;
-            if !reused {
-                if let Err(cleanup_error) = self.cleanup_started_service(context, &plan.service) {
-                    self.fail(HostFailure::Platform(format!(
-                        "dependency persistence failed ({error}); cleanup failed: {cleanup_error}"
-                    )));
-                    return Err(cleanup_error);
-                }
+            if !reused
+                && let Err(cleanup_error) = self.cleanup_started_service(context, &plan.service)
+            {
+                self.fail(HostFailure::Platform(format!(
+                    "dependency persistence failed ({error}); cleanup failed: {cleanup_error}"
+                )));
+                return Err(cleanup_error);
             }
             self.fail(HostFailure::StateStore(error.to_string()));
             return Err(HostServiceError::StateStore(error));
@@ -537,15 +537,14 @@ where
             ServiceOperation::Inspect,
         )?;
         let prior_process = match observation {
-            PortOutcome::Known(observation) => match observation.process {
-                Some(process) => process,
-                None => {
+            PortOutcome::Known(observation) => {
+                let Some(process) = observation.process else {
                     self.fail(HostFailure::ReadinessNotProven);
                     return Err(HostServiceError::ReadinessNotProven);
-                }
-            },
-            PortOutcome::Partial { .. } => return self.unknown_stop(),
-            PortOutcome::Unknown(_) => return self.unknown_stop(),
+                };
+                process
+            }
+            PortOutcome::Partial { .. } | PortOutcome::Unknown(_) => return self.unknown_stop(),
             PortOutcome::Error(error) => {
                 self.fail(HostFailure::Platform(error.to_string()));
                 return Err(HostServiceError::Platform(error));
@@ -725,35 +724,28 @@ where
         let legal = matches!(
             (self.state, next),
             (
-                HostServiceState::Stopped | HostServiceState::StoppedClean,
-                HostServiceState::Starting
+                HostServiceState::Stopped
+                    | HostServiceState::StoppedClean
+                    | HostServiceState::DegradedRecovery
+                    | HostServiceState::Failed,
+                HostServiceState::Starting,
             ) | (
+                HostServiceState::Starting,
+                HostServiceState::ControlReady | HostServiceState::DegradedRecovery,
+            ) | (
+                HostServiceState::ControlReady,
+                HostServiceState::Active
+                    | HostServiceState::Draining
+                    | HostServiceState::DegradedRecovery,
+            ) | (
+                HostServiceState::Active
+                    | HostServiceState::DegradedRecovery
+                    | HostServiceState::Failed,
+                HostServiceState::Draining,
+            ) | (
+                HostServiceState::Active | HostServiceState::Draining,
                 HostServiceState::DegradedRecovery,
-                HostServiceState::Starting
-            ) | (HostServiceState::Failed, HostServiceState::Starting)
-                | (
-                    HostServiceState::Starting,
-                    HostServiceState::ControlReady | HostServiceState::DegradedRecovery
-                )
-                | (
-                    HostServiceState::ControlReady,
-                    HostServiceState::Active
-                        | HostServiceState::Draining
-                        | HostServiceState::DegradedRecovery
-                )
-                | (
-                    HostServiceState::Active,
-                    HostServiceState::Draining | HostServiceState::DegradedRecovery
-                )
-                | (
-                    HostServiceState::DegradedRecovery,
-                    HostServiceState::Draining
-                )
-                | (HostServiceState::Failed, HostServiceState::Draining)
-                | (
-                    HostServiceState::Draining,
-                    HostServiceState::StoppedClean | HostServiceState::DegradedRecovery
-                )
+            ) | (HostServiceState::Draining, HostServiceState::StoppedClean)
         );
         if legal {
             self.state = next;

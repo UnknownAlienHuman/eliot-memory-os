@@ -325,18 +325,38 @@ impl Harness {
             )
             .into());
         }
-        let value: Value = serde_json::from_slice(&output.stdout)?;
-        Ok(json_contains_true(&value))
+        parse_single_boolean_sql_result(&output.stdout)
     }
 }
 
-fn json_contains_true(value: &Value) -> bool {
-    match value {
-        Value::Bool(found) => *found,
-        Value::Array(values) => values.iter().any(json_contains_true),
-        Value::Object(fields) => fields.values().any(json_contains_true),
-        _ => false,
+fn parse_single_boolean_sql_result(stdout: &[u8]) -> TestResult<bool> {
+    let start = stdout
+        .iter()
+        .position(|byte| *byte == b'[')
+        .ok_or("SurrealDB SQL output did not contain a JSON result")?;
+    let end = stdout
+        .iter()
+        .rposition(|byte| *byte == b']')
+        .filter(|end| *end >= start)
+        .ok_or("SurrealDB SQL output contained an incomplete JSON result")?;
+    let value: Value = serde_json::from_slice(&stdout[start..=end])?;
+    match value.as_array().map(Vec::as_slice) {
+        Some([Value::Bool(found)]) => Ok(*found),
+        _ => Err("SurrealDB SQL output was not one boolean result".into()),
     }
+}
+
+#[test]
+fn surreal_sql_prompt_is_removed_from_boolean_json_result() -> TestResult {
+    let stdout = b"ultest/ultest> [false]\r\n\r\nultest/ultest> ";
+    assert!(!parse_single_boolean_sql_result(stdout)?);
+    Ok(())
+}
+
+#[test]
+fn surreal_sql_non_boolean_json_result_fails_closed() {
+    let stdout = b"ultest/ultest> [\"query failed\"]\r\n\r\nultest/ultest> ";
+    assert!(parse_single_boolean_sql_result(stdout).is_err());
 }
 
 impl Drop for Harness {

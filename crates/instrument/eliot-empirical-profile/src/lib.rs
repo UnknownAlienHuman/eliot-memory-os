@@ -9,6 +9,7 @@
 #![forbid(unsafe_code)]
 
 use std::collections::{BTreeMap, VecDeque};
+use std::fmt::Write as _;
 use std::sync::{Arc, RwLock};
 
 use eliot_instrument_api::{ExecutionStatus, InstrumentKind, VerificationOutcome};
@@ -47,11 +48,12 @@ fn digest<T: Serialize>(value: &T) -> Result<String, ProfileError> {
         serde_json::to_vec(value).map_err(|e| ProfileError::Serialization(e.to_string()))?;
     let mut hasher = Sha256::new();
     hasher.update(bytes);
-    Ok(hasher
-        .finalize()
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect())
+    let mut encoded = String::with_capacity(64);
+    for byte in hasher.finalize() {
+        write!(&mut encoded, "{byte:02x}")
+            .map_err(|error| ProfileError::Serialization(error.to_string()))?;
+    }
+    Ok(encoded)
 }
 
 /// Exact identity under which measurements may be pooled.
@@ -198,7 +200,7 @@ impl ProfileStatistics {
         self.count += 1;
         self.total_elapsed_ms = self
             .total_elapsed_ms
-            .saturating_add(observation.elapsed_ms as u128);
+            .saturating_add(u128::from(observation.elapsed_ms));
         self.minimum_elapsed_ms = self.minimum_elapsed_ms.min(observation.elapsed_ms);
         self.maximum_elapsed_ms = self.maximum_elapsed_ms.max(observation.elapsed_ms);
         self.last_observed_at_ms = self.last_observed_at_ms.max(observation.observed_at_ms);
@@ -206,8 +208,8 @@ impl ProfileStatistics {
             Some(VerificationOutcome::Pass) => self.successful_count += 1,
             Some(VerificationOutcome::Fail) => self.failed_count += 1,
             Some(VerificationOutcome::Partial) => self.partial_count += 1,
-            Some(VerificationOutcome::Unknown) | Some(VerificationOutcome::Cancelled) => {
-                self.unknown_count += 1
+            Some(VerificationOutcome::Unknown | VerificationOutcome::Cancelled) => {
+                self.unknown_count += 1;
             }
             Some(VerificationOutcome::Blocked) | None => self.blocked_count += 1,
         }
@@ -215,7 +217,8 @@ impl ProfileStatistics {
 
     pub fn mean_elapsed_ms(&self) -> Option<u64> {
         (self.count != 0).then(|| {
-            (self.total_elapsed_ms / u128::from(self.count)).min(u128::from(u64::MAX)) as u64
+            let mean = (self.total_elapsed_ms / u128::from(self.count)).min(u128::from(u64::MAX));
+            u64::try_from(mean).unwrap_or(u64::MAX)
         })
     }
 }
@@ -236,10 +239,10 @@ impl EmpiricalProfile {
         for observation in &observations {
             statistics.add(observation);
         }
-        let identity = (&key, &statistics, &observations);
+        let revision = digest(&(&key, &statistics, &observations))?;
         Ok(Self {
             key,
-            revision: digest(&identity)?,
+            revision,
             statistics,
             observations,
         })
@@ -302,8 +305,7 @@ impl EmpiricalProfileOwner {
             &entry
                 .observations
                 .front()
-                .map(|o| o.key.clone())
-                .unwrap_or_else(|| unreachable!()),
+                .map_or_else(|| unreachable!(), |o| o.key.clone()),
             entry,
         )
     }

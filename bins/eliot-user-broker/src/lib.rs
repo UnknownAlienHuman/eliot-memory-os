@@ -116,8 +116,7 @@ fn load_protected_launch_config()
         let bytes = lease
             .read_bounded(64 * 1024)
             .map_err(|error| CompositionError::Protected(error.to_string()))?;
-        let config =
-            serde_json::from_slice(&bytes).map_err(|error| CompositionError::Encoding(error))?;
+        let config = serde_json::from_slice(&bytes).map_err(CompositionError::Encoding)?;
         validate_launch_config(&config)?;
         Ok((config, lease))
     }
@@ -451,8 +450,9 @@ impl LocalProcessPort {
 
     fn map_error(error: ProcessExecutionError) -> PortError {
         match error {
-            ProcessExecutionError::UnknownOutcome => PortError::Unknown,
-            ProcessExecutionError::NotFound => PortError::Unknown,
+            ProcessExecutionError::UnknownOutcome | ProcessExecutionError::NotFound => {
+                PortError::Unknown
+            }
             ProcessExecutionError::Unavailable(_detail) => PortError::Unavailable,
             ProcessExecutionError::Contract(error) => PortError::Invalid(error.to_string()),
             ProcessExecutionError::EvidenceSink(error) => PortError::Invalid(error.to_string()),
@@ -543,17 +543,17 @@ struct FileRegistrationStore {
 }
 
 impl FileRegistrationStore {
-    fn open(_path: PathBuf) -> Result<Self, CompositionError> {
+    fn open(_path: &Path) -> Result<Self, CompositionError> {
         Err(CompositionError::Protected(
             "durable broker state requires the retained protected ProgramData lease".to_owned(),
         ))
     }
 
     #[cfg(windows)]
-    fn open_protected(path: PathBuf, relative: PathBuf) -> Result<Self, CompositionError> {
+    fn open_protected(path: &Path, relative: PathBuf) -> Result<Self, CompositionError> {
         let lease = ProtectedPathLease::open_or_create(&relative)
             .map_err(|error| CompositionError::Protected(error.to_string()))?;
-        let canonical_path = fs::canonicalize(&path).map_err(CompositionError::Durable)?;
+        let canonical_path = fs::canonicalize(path).map_err(CompositionError::Durable)?;
         if lease.path() != canonical_path {
             return Err(CompositionError::Protected(
                 "snapshot path is not the retained protected object".to_owned(),
@@ -615,15 +615,12 @@ impl FileRegistrationStore {
     /// path; all later operations re-verify that retained handle.
     #[cfg(windows)]
     fn reacquire_after_publication(&mut self, relative: &Path) -> Result<Vec<u8>, PortError> {
-        let replacement = match ProtectedPathLease::open_or_create(relative) {
-            Ok(replacement) => replacement,
-            Err(_) => {
-                // The old lease had to be released before replacement.  An
-                // unavailable replacement is therefore an explicit unknown
-                // state, never a successful save or a retryable failure.
-                self.lease = None;
-                return Err(PortError::Unknown);
-            }
+        let Ok(replacement) = ProtectedPathLease::open_or_create(relative) else {
+            // The old lease had to be released before replacement.  An
+            // unavailable replacement is therefore an explicit unknown
+            // state, never a successful save or a retryable failure.
+            self.lease = None;
+            return Err(PortError::Unknown);
         };
         let result = Self::read_verified_lease(&replacement, &self.path, true);
         self.lease = Some(replacement);
@@ -701,7 +698,7 @@ impl DurableRegistrationPort for FileRegistrationStore {
             // Any other bytes are an unresolvable publication race. Do not
             // classify this as a deterministic provider failure: the caller
             // must reconcile the exact registration snapshot before retrying.
-            return Err(PortError::Unknown);
+            Err(PortError::Unknown)
         }
         #[cfg(not(windows))]
         {
@@ -771,12 +768,12 @@ impl BrokerComposition {
                     CompositionError::InvalidConfiguration("snapshot filename missing".to_owned())
                 })?,
             );
-            FileRegistrationStore::open_protected(snapshot.clone(), relative)?
+            FileRegistrationStore::open_protected(&snapshot, relative)?
         } else {
-            FileRegistrationStore::open(snapshot.clone())?
+            FileRegistrationStore::open(&snapshot)?
         };
         #[cfg(not(windows))]
-        let mut durable = FileRegistrationStore::open(snapshot.clone())?;
+        let mut durable = FileRegistrationStore::open(&snapshot)?;
         if durable
             .load()
             .map_err(|error| CompositionError::InvalidConfiguration(error.to_string()))?
@@ -794,9 +791,8 @@ impl BrokerComposition {
         let mut broker = UserBroker::new(authority, process, Some(Box::new(durable)));
         broker.recover().map_err(CompositionError::Recovery)?;
         let registration_digest = broker.registration_digest().map(ToOwned::to_owned);
-        let (launch_config, launch_lease) = launch
-            .map(|(config, lease)| (Some(config), Some(lease)))
-            .unwrap_or((None, None));
+        let (launch_config, launch_lease) =
+            launch.map_or((None, None), |(config, lease)| (Some(config), Some(lease)));
         Ok(Self {
             broker,
             snapshot,
@@ -894,14 +890,14 @@ impl BrokerComposition {
     }
 
     /// Cancels a broker-owned operation selected by its admitted operation
-    /// identity.  The sealed operation permit remains inside UserBroker.
+    /// identity.  The sealed operation permit remains inside `UserBroker`.
     pub fn cancel(
         &mut self,
-        operation_id: OperationId,
+        operation_id: &OperationId,
     ) -> Result<CancellationReceipt, CompositionError> {
         self.verify_launch_lease()?;
         self.broker
-            .cancel_operation(&operation_id)
+            .cancel_operation(operation_id)
             .map_err(CompositionError::Recovery)
     }
 
@@ -909,11 +905,11 @@ impl BrokerComposition {
     /// identity.  No caller-supplied P-03 request or permit crosses stdin.
     pub fn reconcile(
         &mut self,
-        operation_id: OperationId,
+        operation_id: &OperationId,
     ) -> Result<ProcessExecutionView, CompositionError> {
         self.verify_launch_lease()?;
         self.broker
-            .reconcile_operation(&operation_id)
+            .reconcile_operation(operation_id)
             .map_err(CompositionError::Recovery)
     }
 

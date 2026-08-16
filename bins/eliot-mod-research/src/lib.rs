@@ -9,7 +9,7 @@
 use std::process::Command;
 
 use eliot_contracts::StateFence;
-use eliot_research_exchange::{ExchangeError, ExchangeJob, GovernedExchange, ResearchBridge};
+use eliot_research_exchange::{ExchangeError, ExchangeJob, ResearchBridge};
 use eliot_research_exchange_api::ResearchQueryRequest;
 use eliot_researcher::Researcher;
 use serde::Serialize;

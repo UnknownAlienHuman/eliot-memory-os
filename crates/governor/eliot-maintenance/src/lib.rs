@@ -54,7 +54,7 @@ pub enum MaintenanceFamily {
     SecurityDependencyScan,
     /// Derived-index differential rebuild.
     DerivedIndexRebuild,
-    /// SessionEpisode cursor and retrieval maintenance.
+    /// `SessionEpisode` cursor and retrieval maintenance.
     SessionEpisodeRetrieval,
     /// Grant and disclosure closure reconciliation.
     GrantDisclosureClosure,
@@ -146,23 +146,36 @@ pub enum AutomationDecision {
 #[derive(Clone, Copy, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum DecisionReason {
+    /// All policy, route, budget, schedule, and session gates permit execution.
     Eligible,
+    /// Background automation is disabled by policy.
     AutomationOff,
+    /// Policy permits a suggestion but not autonomous execution.
     SuggestOnly,
+    /// Policy requires a direct user request before execution.
     ExplicitRequestRequired,
+    /// The governed system is not currently idle.
     NotIdle,
+    /// The current time is outside the configured maintenance schedule.
     OutsideSchedule,
+    /// No eligible execution route is available.
     RouteUnavailable,
+    /// The required maintenance budget is unavailable.
     BudgetUnavailable,
+    /// Execution requires an active user session.
     UserSessionRequired,
+    /// An equivalent maintenance job is already active.
     DuplicateActiveJob,
+    /// The trigger or its authority has expired.
     Expired,
+    /// Safety policy requires recovery handling instead of normal execution.
     SafetyRecovery,
 }
 
 /// Inputs observed by the deterministic trigger evaluator.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[allow(clippy::struct_excessive_bools)]
 pub struct MaintenanceTriggerInput {
     /// Trigger identity used for deduplication and evidence binding.
     pub trigger_id: String,
@@ -207,10 +220,10 @@ impl MaintenanceTriggerInput {
         text(&self.scope_ref, "scope_ref")?;
         nonempty(&self.evidence_refs, "evidence_refs")?;
         unique_text(&self.evidence_refs, "evidence_refs")?;
-        if let Some(expiry) = self.expires_at_ms {
-            if expiry <= self.now_ms {
-                return Err(MaintenanceError::Expired);
-            }
+        if let Some(expiry) = self.expires_at_ms
+            && expiry <= self.now_ms
+        {
+            return Err(MaintenanceError::Expired);
         }
         if let Some(active) = &self.active_job_id {
             text(active, "active_job_id")?;
@@ -422,7 +435,7 @@ impl MaintenanceJob {
 }
 
 /// Evidence-backed resolution of an unknown external outcome.
-#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum ReconciliationDisposition {
     /// The provider proves the effect did not happen; same identity may retry.
@@ -531,7 +544,7 @@ impl<S: MaintenanceStateStore> MaintenanceController<S> {
             } else {
                 (AutomationDecision::Start, DecisionReason::SafetyRecovery)
             };
-            return Ok(self.decision(input, decision, reason));
+            return Ok(Self::decision(input, decision, reason));
         }
         let (decision, reason) = match input.mode {
             MaintenanceAutomationMode::Off => {
@@ -562,7 +575,7 @@ impl<S: MaintenanceStateStore> MaintenanceController<S> {
             ),
             _ => (AutomationDecision::Start, DecisionReason::Eligible),
         };
-        Ok(self.decision(input, decision, reason))
+        Ok(Self::decision(input, decision, reason))
     }
 
     /// Admits one new job only from a `START` decision.
@@ -792,7 +805,6 @@ impl<S: MaintenanceStateStore> MaintenanceController<S> {
     }
 
     fn decision(
-        &self,
         input: &MaintenanceTriggerInput,
         decision: AutomationDecision,
         reason: DecisionReason,

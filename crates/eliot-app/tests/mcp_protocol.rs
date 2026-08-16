@@ -8501,7 +8501,8 @@ fn mcp_child_command(
         .arg(test_config_path())
         .arg("mcp")
         .arg("stdio")
-        .env("ELIOT_DISABLE_REAL_PROVIDER", "1");
+        .env("ELIOT_DISABLE_REAL_PROVIDER", "1")
+        .env("ELIOT_GOVERNOR_REPO_ROOT", repo_root());
     for variable in [
         "SURREAL_USER",
         "SURREAL_PASS",

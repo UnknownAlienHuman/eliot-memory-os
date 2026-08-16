@@ -42,6 +42,54 @@ fn repo_root(config_path: &Path) -> PathBuf {
     std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
 }
 
+/// Resolve the repository root for installation from the explicit governed
+/// environment contract. Installation must never infer source authority from
+/// the process working directory or executable/cache location.
+fn governed_repo_root(_config_path: &Path) -> Result<PathBuf> {
+    governed_repo_root_from(std::env::var_os("ELIOT_GOVERNOR_REPO_ROOT").as_deref())
+}
+
+fn governed_repo_root_from(configured_root: Option<&std::ffi::OsStr>) -> Result<PathBuf> {
+    let configured_root = configured_root
+        .map(PathBuf::from)
+        .context("ELIOT_GOVERNOR_REPO_ROOT is required for host installation")?;
+    ensure!(
+        configured_root.is_absolute(),
+        "ELIOT_GOVERNOR_REPO_ROOT must be absolute"
+    );
+    let canonical = std::fs::canonicalize(&configured_root).with_context(|| {
+        format!(
+            "ELIOT_GOVERNOR_REPO_ROOT does not resolve: {}",
+            configured_root.display()
+        )
+    })?;
+    ensure!(
+        canonical.is_dir() && canonical.join("Cargo.toml").is_file(),
+        "ELIOT_GOVERNOR_REPO_ROOT must be a Cargo checkout: {}",
+        canonical.display()
+    );
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(&canonical)
+        .args(["rev-parse", "--show-toplevel"])
+        .output()
+        .context("validate ELIOT_GOVERNOR_REPO_ROOT with git")?;
+    ensure!(
+        output.status.success(),
+        "ELIOT_GOVERNOR_REPO_ROOT is not a Git checkout: {}",
+        canonical.display()
+    );
+    let git_root = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    let canonical_git_root = std::fs::canonicalize(&git_root)
+        .with_context(|| format!("canonicalize Git root returned for {}", canonical.display()))?;
+    ensure!(
+        canonical_git_root == canonical,
+        "ELIOT_GOVERNOR_REPO_ROOT must name the exact Git root: {}",
+        canonical.display()
+    );
+    Ok(canonical)
+}
+
 fn runtime_root(config_path: &Path) -> PathBuf {
     config_path
         .parent()

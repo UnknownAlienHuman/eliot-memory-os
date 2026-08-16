@@ -51,6 +51,10 @@ static JOB_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 pub trait DispatchValidationPort: Send + Sync {
     /// Consumes exactly one P-03 permit after fresh P-02 evidence has been
     /// bound to the request.
+    ///
+    /// # Errors
+    /// Returns an error when the request or suspended identity is invalid, or
+    /// when the active authority cannot consume the one-shot permit.
     fn validate_and_consume(
         &self,
         request: ProcessRequest,
@@ -73,6 +77,10 @@ pub struct CapturedStream {
     pub captured: bool,
 }
 
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "requested, captured, truncated, complete, and read_error are independent stream observations"
+)]
 #[derive(Debug)]
 struct StreamCapture {
     requested: bool,
@@ -233,6 +241,10 @@ impl WindowsProcessExecutor {
     }
 
     /// Returns the retained non-authoritative stream projections.
+    ///
+    /// # Errors
+    /// Returns an error when the operation is absent, a capture lock is
+    /// poisoned, or the Windows executor is unavailable.
     pub fn captured_output(
         &self,
         id: &OperationId,
@@ -268,6 +280,10 @@ impl WindowsProcessExecutor {
     /// Removes terminal operations after their descendants and streams have
     /// been observed.  The executor remains the sole owner of this cleanup;
     /// callers never receive a raw child or Job handle.
+    ///
+    /// # Errors
+    /// Returns an error when registry access fails or stream cleanup cannot be
+    /// proven complete. Incomplete cleanup is retained as an unknown outcome.
     pub fn cleanup_finished(&self) -> Result<usize, ProcessExecutionError> {
         #[cfg(windows)]
         {
@@ -329,11 +345,12 @@ impl WindowsProcessExecutor {
                     .map_err(|_| unavailable("operation lock poisoned"))?;
                 retain_cleanup_owners |= guard.cleanup_required
                     || guard.state.view().lifecycle() == ProcessLifecycle::UnknownOutcome;
-                if guard.child.is_some() && guard.termination.is_none() {
-                    if finalize_operation(&mut guard, ExitDisposition::Unknown, false).is_err() {
-                        poison_operation(&mut guard, &self.poisoned);
-                        retain_cleanup_owners = true;
-                    }
+                if guard.child.is_some()
+                    && guard.termination.is_none()
+                    && finalize_operation(&mut guard, ExitDisposition::Unknown, false).is_err()
+                {
+                    poison_operation(&mut guard, &self.poisoned);
+                    retain_cleanup_owners = true;
                 }
                 if !join_streams(&mut guard) {
                     poison_operation(&mut guard, &self.poisoned);
@@ -348,7 +365,7 @@ impl WindowsProcessExecutor {
                     .clear();
                 return Ok(());
             }
-            return Err(ProcessExecutionError::UnknownOutcome);
+            Err(ProcessExecutionError::UnknownOutcome)
         }
         #[cfg(not(windows))]
         {
@@ -364,6 +381,10 @@ impl Drop for WindowsProcessExecutor {
 }
 
 impl ProcessExecutor for WindowsProcessExecutor {
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the suspend, validate-and-consume, resume, capture, and registration order is security-critical"
+    )]
     async fn start(
         &self,
         request: ProcessRequest,
@@ -410,7 +431,7 @@ impl ProcessExecutor for WindowsProcessExecutor {
                 request.working_directory(),
                 environment,
             )
-            .map_err(|error| unavailable(error))?;
+            .map_err(unavailable)?;
             let active_limit = request
                 .resource_limits()
                 .max_descendants()
@@ -421,7 +442,7 @@ impl ProcessExecutor for WindowsProcessExecutor {
                 request.resource_limits().memory_bytes(),
                 Some(active_limit),
             )
-            .map_err(|error| unavailable(error))?;
+            .map_err(unavailable)?;
             let stdout_limit = request.resource_limits().stdout_bytes();
             let stderr_limit = request.resource_limits().stderr_bytes();
             let stdout_requested = stdout_limit > 0;
@@ -433,9 +454,9 @@ impl ProcessExecutor for WindowsProcessExecutor {
                 std::process::id(),
                 sequence
             ))
-            .map_err(|error| unavailable(error))?;
+            .map_err(unavailable)?;
             let child = SuspendedJobChild::spawn_named_with_limits(spec, job_name, limits)
-                .map_err(|error| unavailable(error))?;
+                .map_err(unavailable)?;
 
             let authority = Arc::clone(&self.authority);
             let validated = child
@@ -445,7 +466,7 @@ impl ProcessExecutor for WindowsProcessExecutor {
                 })
                 .map_err(validation_error)?;
             let mut state = ProcessState::from_validated(validated.validation());
-            let mut running = validated.resume().map_err(|error| unavailable(error))?;
+            let mut running = validated.resume().map_err(unavailable)?;
             let now = now_ms();
             state.mark_resumed(
                 now,
@@ -546,7 +567,7 @@ impl ProcessExecutor for WindowsProcessExecutor {
                 poison_operation(&mut guard, &self.poisoned);
                 return Err(error);
             }
-            return Ok(guard.state.view());
+            Ok(guard.state.view())
         }
         #[cfg(not(windows))]
         {
@@ -578,14 +599,13 @@ impl ProcessExecutor for WindowsProcessExecutor {
                     return Err(error.into());
                 }
             };
-            if guard.state.view().lifecycle() == ProcessLifecycle::Cancelling {
-                if let Err(error) = finalize_operation(&mut guard, ExitDisposition::Cancelled, true)
-                {
-                    poison_operation(&mut guard, &self.poisoned);
-                    return Err(error);
-                }
+            if guard.state.view().lifecycle() == ProcessLifecycle::Cancelling
+                && let Err(error) = finalize_operation(&mut guard, ExitDisposition::Cancelled, true)
+            {
+                poison_operation(&mut guard, &self.poisoned);
+                return Err(error);
             }
-            return Ok(receipt);
+            Ok(receipt)
         }
         #[cfg(not(windows))]
         {
@@ -634,7 +654,7 @@ impl ProcessExecutor for WindowsProcessExecutor {
                 EvidenceAxes::observed(),
             )?;
             guard.sink.record(evidence.clone())?;
-            return Ok(evidence);
+            Ok(evidence)
         }
         #[cfg(not(windows))]
         {
@@ -960,10 +980,9 @@ fn join_capture_thread(
 
 #[cfg(windows)]
 fn capture_status(capture: &Arc<Mutex<StreamCapture>>) -> (bool, bool) {
-    capture
-        .lock()
-        .map(|guard| (!guard.requested || guard.complete, guard.read_error))
-        .unwrap_or((false, true))
+    capture.lock().map_or((false, true), |guard| {
+        (!guard.requested || guard.complete, guard.read_error)
+    })
 }
 
 #[cfg(windows)]
@@ -1020,10 +1039,8 @@ fn spawn_capture(
                     }
                 }
             }
-            if reached_eof {
-                if let Ok(mut guard) = capture.lock() {
-                    guard.complete = true;
-                }
+            if reached_eof && let Ok(mut guard) = capture.lock() {
+                guard.complete = true;
             }
         })
         .map_err(|error| unavailable(format!("{stream} capture reader spawn failed: {error}")))?;

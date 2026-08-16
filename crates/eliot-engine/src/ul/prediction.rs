@@ -534,10 +534,9 @@ pub fn parse_expected_observable(value: &str) -> Option<(String, PredictionExpec
     let body = value.strip_prefix("verifier:")?;
     let (verifier, expected) = if let Some(verifier) = body.strip_suffix("=pass") {
         (verifier, PredictionExpectation::Pass)
-    } else if let Some(verifier) = body.strip_suffix("=fail") {
-        (verifier, PredictionExpectation::Fail)
     } else {
-        return None;
+        let verifier = body.strip_suffix("=fail")?;
+        (verifier, PredictionExpectation::Fail)
     };
     let verifier = normalize_verifier(verifier);
     (!verifier.is_empty()).then_some((verifier, expected))

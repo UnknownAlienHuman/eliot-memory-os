@@ -133,13 +133,7 @@ impl UnderstandingView {
     #[must_use]
     pub fn expansion_handles(&self) -> Vec<ArtifactId> {
         let mut handles = self.compiled.handle_only.clone();
-        handles.extend(
-            self.manifest
-                .suppressed_atoms
-                .iter()
-                .filter(|id| !handles.contains(id))
-                .cloned(),
-        );
+        handles.extend(self.manifest.suppressed_atoms.iter().cloned());
         handles.sort();
         handles.dedup();
         handles
@@ -262,10 +256,10 @@ fn manifest(compiled: &CompiledContext) -> UnderstandingManifest {
         match admission.disposition {
             AdmissionDisposition::Included => included_atoms.push(admission.atom_id.clone()),
             AdmissionDisposition::HandleOnly | AdmissionDisposition::Revalidate => {
-                handle_only_atoms.push(admission.atom_id.clone())
+                handle_only_atoms.push(admission.atom_id.clone());
             }
             AdmissionDisposition::Suppressed | AdmissionDisposition::Quarantined => {
-                suppressed_atoms.push(admission.atom_id.clone())
+                suppressed_atoms.push(admission.atom_id.clone());
             }
         }
     }

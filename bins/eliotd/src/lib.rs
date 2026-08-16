@@ -25,9 +25,9 @@ use thiserror::Error;
 pub const SERVICE_NAME: &str = "eliotd";
 /// Stable daemon protocol revision.
 pub const PROTOCOL_VERSION: &str = "eliot.daemon.v1";
-/// Protected Host-approved launch configuration relative to ProgramData.
+/// Protected Host-approved launch configuration relative to `ProgramData`.
 pub const PROTECTED_CONFIG_RELATIVE: &str = r"Eliot\governor\eliotd.json";
-/// Protected daemon state directory relative to ProgramData.
+/// Protected daemon state directory relative to `ProgramData`.
 pub const PROTECTED_STATE_RELATIVE: &str = r"Eliot\governor\state";
 /// Maximum accepted launch-config bytes.
 pub const MAX_CONFIG_BYTES: u64 = 128 * 1024;
@@ -35,7 +35,7 @@ pub const MAX_CONFIG_BYTES: u64 = 128 * 1024;
 /// Errors raised while loading or composing the daemon.
 #[derive(Debug, Error)]
 pub enum DaemonError {
-    /// Protected ProgramData path policy rejected the requested object.
+    /// Protected `ProgramData` path policy rejected the requested object.
     #[error("protected daemon path: {0}")]
     Protected(#[from] ProtectedPathError),
     /// The protected launch file was not a valid typed config.
@@ -50,7 +50,7 @@ pub enum DaemonError {
 }
 
 /// Typed protected launch inputs. The values are read from the fixed
-/// ProgramData path; environment variables, current directory and arbitrary
+/// `ProgramData` path; environment variables, current directory and arbitrary
 /// caller paths are not authority sources.
 #[derive(Debug)]
 pub struct DaemonConfig {
@@ -245,7 +245,7 @@ mod tests {
 
     #[test]
     fn production_config_has_no_root_or_environment_override() {
-        assert!(PROTECTED_CONFIG_RELATIVE.contains("ProgramData") == false);
+        assert!(!PROTECTED_CONFIG_RELATIVE.contains("ProgramData"));
         assert!(!PROTECTED_CONFIG_RELATIVE.contains(".."));
         assert!(!PROTECTED_STATE_RELATIVE.contains(".."));
     }

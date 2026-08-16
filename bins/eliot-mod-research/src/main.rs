@@ -5,6 +5,8 @@ use eliot_mod_research::{cancel, compose_from_environment, submit};
 use eliot_research_exchange_api::ResearchQueryRequest;
 use serde::{Deserialize, Serialize};
 
+/// JSON request envelope; inline submit preserves the established wire layout.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 enum Request {

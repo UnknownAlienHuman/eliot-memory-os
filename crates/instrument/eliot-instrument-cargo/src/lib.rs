@@ -29,6 +29,10 @@ pub const CONTRACT_VERSION: (u16, u16, u16) = (1, 0, 0);
 /// or replacing them here.
 pub trait CargoProcessRequestPort: Send + Sync {
     /// Binds an admitted instrument invocation to one immutable P-03 request.
+    ///
+    /// # Errors
+    /// Returns an adapter error when the request cannot be issued or does not
+    /// preserve the invocation identity.
     fn bind(&self, invocation: &InstrumentInvocation) -> Result<ProcessRequest, CargoAdapterError>;
 }
 
@@ -67,6 +71,10 @@ pub struct CargoBinding {
 
 impl CargoBinding {
     /// Validates the invocation and binds it through an explicit request port.
+    ///
+    /// # Errors
+    /// Returns an error when invocation validation, request binding, request
+    /// validation, or identity correlation fails.
     pub fn bind(
         invocation: InstrumentInvocation,
         port: &dyn CargoProcessRequestPort,
@@ -132,6 +140,10 @@ impl<E> CargoInstrumentationAdapter<E> {
 
 impl<E: ProcessExecutor + 'static> CargoInstrumentationAdapter<E> {
     /// Launches the exact bound Cargo request through P-03.
+    ///
+    /// # Errors
+    /// Returns an error when the binding is already consumed, process launch
+    /// fails, or the returned receipt does not preserve identity or generation.
     pub async fn launch(
         &self,
         binding: &mut CargoBinding,
@@ -155,6 +167,10 @@ impl<E: ProcessExecutor + 'static> CargoInstrumentationAdapter<E> {
     }
 
     /// Inspects a running or terminal Cargo operation without changing it.
+    ///
+    /// # Errors
+    /// Returns an error when process inspection fails or the observed operation
+    /// does not match the binding.
     pub async fn inspect(
         &self,
         binding: &CargoBinding,
@@ -173,6 +189,9 @@ impl<E: ProcessExecutor + 'static> CargoInstrumentationAdapter<E> {
     }
 
     /// Cancels Cargo through the process contract's current fence.
+    ///
+    /// # Errors
+    /// Returns an error when the process executor rejects cancellation.
     pub async fn cancel(
         &self,
         binding: &CargoBinding,
@@ -181,6 +200,9 @@ impl<E: ProcessExecutor + 'static> CargoInstrumentationAdapter<E> {
     }
 
     /// Reconciles an unknown Cargo result and retains the P-03 evidence record.
+    ///
+    /// # Errors
+    /// Returns an error when the process executor rejects reconciliation.
     pub async fn reconcile(
         &self,
         binding: &CargoBinding,
@@ -201,8 +223,9 @@ fn execution_status(view: &ProcessExecutionView) -> ExecutionStatus {
     match view.lifecycle() {
         ProcessLifecycle::Created | ProcessLifecycle::Starting => ExecutionStatus::Accepted,
         ProcessLifecycle::Running | ProcessLifecycle::Cancelling => ExecutionStatus::Running,
-        ProcessLifecycle::UnknownOutcome => ExecutionStatus::Unknown,
-        ProcessLifecycle::Quarantined => ExecutionStatus::Unknown,
+        ProcessLifecycle::UnknownOutcome | ProcessLifecycle::Quarantined => {
+            ExecutionStatus::Unknown
+        }
         ProcessLifecycle::Reconciled => ExecutionStatus::Partial,
         ProcessLifecycle::Exited => match view.exit() {
             Some(exit) if successful_exit(exit) => ExecutionStatus::Succeeded,

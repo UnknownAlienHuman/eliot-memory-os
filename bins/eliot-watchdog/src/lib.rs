@@ -36,7 +36,7 @@ const ADMISSION_CONFIG_LIMIT: u64 = 1024 * 1024;
 const LEASE_FILE_LIMIT: u64 = 1024 * 1024;
 
 /// Installation-owned Watchdog admission configuration.  It is loaded from a
-/// fixed ProgramData path and independently bound to the active registry
+/// fixed `ProgramData` path and independently bound to the active registry
 /// manifest digest; no value is selected from the lease envelope.
 #[derive(Clone, Debug, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -99,12 +99,22 @@ impl VerifiedWatchdogAdmission {
 /// every observation; the returned verified lease is never retained as a
 /// long-lived authority by the watchdog loop.
 pub trait WatchdogAdmissionSource: Send + Sync + 'static {
+    /// Reloads and verifies the current short-lived supervision authority.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any lease, trust, configuration, registry, or time
+    /// binding is unavailable or fails validation.
     fn reload(&self) -> Result<VerifiedWatchdogAdmission, SpoolError>;
 }
 
 /// File-backed admission source for the Host/Kernel lease and its independent
 /// trust/configuration/registry inputs.
 #[derive(Clone, Debug)]
+#[allow(
+    clippy::struct_field_names,
+    reason = "the explicit path suffix distinguishes three independently protected filesystem inputs"
+)]
 pub struct FileWatchdogAdmission {
     lease_path: PathBuf,
     admission_config_path: PathBuf,
@@ -301,7 +311,7 @@ impl WatchdogSpool {
             Ok(table) => table,
             Err(redb::TableError::TableDoesNotExist(_)) => {
                 drop(read);
-                return self.write_header(WatchdogSpoolHeader {
+                return self.write_header(&WatchdogSpoolHeader {
                     schema_version: SPOOL_SCHEMA_VERSION,
                     next_sequence: 1,
                     first_sequence: 1,
@@ -344,19 +354,15 @@ impl WatchdogSpool {
         if valid {
             return Ok(());
         }
-        if header_and_entries_valid {
-            if let Some(high_water) = parsed_high_water {
-                let (header, entries) = parsed_header
-                    .as_ref()
-                    .zip(entries.as_ref().ok())
-                    .expect("valid header and entries were checked above");
-                validate_high_water(header, entries, high_water)?;
-            }
+        if header_and_entries_valid
+            && let Some(high_water) = parsed_high_water
+            && let Some((header, entries)) = parsed_header.as_ref().zip(entries.as_ref().ok())
+        {
+            validate_high_water(header, entries, high_water)?;
         }
         let corrupt_digest = header
             .as_ref()
-            .map(|value| sha256_hex(value.value()))
-            .unwrap_or_else(|| "missing".to_owned());
+            .map_or_else(|| "missing".to_owned(), |value| sha256_hex(value.value()));
         drop(table);
         drop(read);
         self.recover(
@@ -366,8 +372,8 @@ impl WatchdogSpool {
         )
     }
 
-    fn write_header(&self, header: WatchdogSpoolHeader) -> Result<(), SpoolError> {
-        let bytes = serde_json::to_vec(&header)
+    fn write_header(&self, header: &WatchdogSpoolHeader) -> Result<(), SpoolError> {
+        let bytes = serde_json::to_vec(header)
             .map_err(|error| SpoolError::Serialization(error.to_string()))?;
         let high_water = header.next_sequence.saturating_sub(1);
         let high_water_bytes = encode_high_water(high_water)?;
@@ -756,7 +762,12 @@ pub struct IndependentKernelSensor {
 }
 
 impl IndependentKernelSensor {
-    /// Opens the one canonical protected redb spool below ProgramData.
+    /// Opens the one canonical protected redb spool below `ProgramData`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the path is outside the protected spool location,
+    /// the spool cannot be opened or recovered, or the epoch is invalid.
     pub fn open(path: impl Into<PathBuf>, watchdog_epoch: u64) -> Result<Self, SpoolError> {
         let spool = path.into();
         require_protected_program_data_path(&spool, SPOOL_RELATIVE_PATH)
@@ -773,7 +784,12 @@ impl IndependentKernelSensor {
         })
     }
 
-    /// Opens the exact canonical protected watchdog spool below ProgramData.
+    /// Opens the exact canonical protected watchdog spool below `ProgramData`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the protected path cannot be resolved, the spool
+    /// cannot be opened or recovered, or the epoch is invalid.
     pub fn open_program_data(
         relative_path: impl Into<PathBuf>,
         watchdog_epoch: u64,
@@ -786,6 +802,11 @@ impl IndependentKernelSensor {
 
     /// Reads and validates the ordered spool records for an independent
     /// reader. The redb file remains observation-only and is not authority.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the path is not the protected canonical spool or
+    /// if its retained identity, database, header, sequence, or records fail validation.
     pub fn readback(path: impl AsRef<Path>) -> Result<Vec<WatchdogSpoolEntry>, SpoolError> {
         let path = path.as_ref();
         require_protected_program_data_path(path, SPOOL_RELATIVE_PATH)
@@ -995,6 +1016,11 @@ pub struct WatchdogComposition {
 
 impl WatchdogComposition {
     /// Builds and admits the watchdog loop against an injected kernel port.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if runtime configuration or initial supervision
+    /// authority is invalid, or if the runtime is already shutting down.
     pub fn start(
         config: WatchdogConfig,
         admission: Arc<dyn WatchdogAdmissionSource>,
@@ -1005,6 +1031,11 @@ impl WatchdogComposition {
 
     /// Starts the composition with a caller-owned stop flag.  SCM control
     /// handlers use this flag because they execute outside the Tokio runtime.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if runtime configuration or initial supervision
+    /// authority is invalid, or if the runtime denies task admission.
     pub fn start_with_shutdown(
         config: WatchdogConfig,
         admission: Arc<dyn WatchdogAdmissionSource>,
@@ -1105,6 +1136,11 @@ impl WatchdogComposition {
     }
 
     /// Waits for process termination and performs ordered runtime shutdown.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the supervised watchdog task, shutdown signal, or
+    /// externally requested shutdown path fails.
     pub async fn run_until_shutdown(self) -> Result<ShutdownOutcome, TaskFailure> {
         let WatchdogComposition {
             runtime,
@@ -1159,6 +1195,11 @@ async fn wait_for_shutdown(shutdown_requested: Arc<AtomicBool>) -> bool {
 
 /// Loads and validates the current Host/Kernel-issued lease.  Missing,
 /// malformed, stale or non-active bytes are a hard startup failure.
+///
+/// # Errors
+///
+/// Returns an error if protected paths, bounded input bytes, registry state,
+/// trust material, signature, freshness, or installation/generation bindings fail validation.
 pub fn load_supervision_lease(
     lease_path: impl AsRef<Path>,
     admission_config_path: impl AsRef<Path>,
@@ -1314,7 +1355,7 @@ mod tests {
             record_count: 2,
             bytes: bytes.len() as u64,
         };
-        assert!(validate_header(&header, &[entry.clone()]).is_err());
+        assert!(validate_header(&header, std::slice::from_ref(&entry)).is_err());
         header.record_count = 1;
         header.first_sequence = 3;
         assert!(validate_header(&header, &[entry]).is_err());

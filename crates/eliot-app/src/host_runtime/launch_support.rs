@@ -350,6 +350,9 @@ impl CandidateDiffMetadata {
     }
 }
 
+// The final occupied-slot predicate is intentionally the inverse of `Option`'s
+// `?` semantics: duplicate metadata must fail closed.
+#[allow(clippy::question_mark)]
 fn parse_candidate_metadata_line(
     line: &str,
     metadata: &mut CandidateDiffMetadata,

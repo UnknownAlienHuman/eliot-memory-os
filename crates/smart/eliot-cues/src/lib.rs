@@ -276,6 +276,7 @@ impl CueRecord {
         self.lifecycle = next;
         Ok(())
     }
+    #[allow(clippy::needless_pass_by_value)]
     pub fn invalidate(&mut self, cause: InvalidationCause) -> Result<(), CueError> {
         let next = match cause {
             InvalidationCause::Superseded | InvalidationCause::Deleted => {
@@ -381,6 +382,7 @@ impl CueSnapshot {
         }
         Ok(())
     }
+    #[allow(clippy::needless_pass_by_value)]
     pub fn invalidate(
         &self,
         targets: &BTreeSet<ArtifactId>,
@@ -424,6 +426,7 @@ impl CueRuntime {
     ) -> Result<Self, CueError> {
         Self::new(self.snapshot.invalidate(targets, cause, revision)?)
     }
+    #[allow(clippy::too_many_lines)]
     pub fn fire(
         &self,
         observed: &[ObservedCue],
@@ -503,12 +506,15 @@ impl CueRuntime {
         }
         let mut activation = scores
             .into_iter()
-            .map(|(target, (score, depth, path))| ActivationHit {
-                target,
-                score_milli: score,
-                depth,
-                path,
-                direct: direct_targets.contains(&target),
+            .map(|(target, (score, depth, path))| {
+                let direct = direct_targets.contains(&target);
+                ActivationHit {
+                    target,
+                    score_milli: score,
+                    depth,
+                    path,
+                    direct,
+                }
             })
             .collect::<Vec<_>>();
         activation.sort_by(|a, b| {

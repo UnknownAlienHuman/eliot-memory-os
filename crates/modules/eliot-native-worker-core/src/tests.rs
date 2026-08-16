@@ -15,11 +15,13 @@ use eliot_agent_api::{
     ProposedEffect, WorkLeaseId,
 };
 use eliot_process::{
-    CancellationReceipt, DescendantEvidence, EnvironmentProjection, EvidenceSinkError,
-    FencingToken, Generation, OperationId, ProcessEvidence, ProcessEvidenceSink,
+    ActionLeaseRef, CancellationReceipt, CancellationRequest, DescendantEvidence,
+    DispatchAuthorityId, DispatchPermitAuthority, DispatchValidationContext, EnvironmentProjection,
+    EvidenceSinkError, ExitDisposition, ExitStatus, FencingToken, Generation, ImageId, JobId,
+    KernelDispatchKey, OperationId, PermitIssuance, ProcessEvidence, ProcessEvidenceSink,
     ProcessExecutionError, ProcessExecutionView, ProcessExecutor, ProcessHealth,
-    ProcessHealthStatus, ProcessIdentity, ProcessLifecycle, ProcessRequest, ProcessStartReceipt,
-    ProcessState, ProcessTreeId, ResourceLimits,
+    ProcessHealthStatus, ProcessId, ProcessIntent, ProcessRequest, ProcessStartReceipt,
+    ProcessState, ProcessTreeId, ResourceLimits, SessionId, SuspendedProcessIdentity,
 };
 
 use super::*;
@@ -42,7 +44,7 @@ struct ExecutorState {
     reconciliations: usize,
     start_mode: StartMode,
     cancel_unknown: bool,
-    request: Option<ProcessRequest>,
+    request: Option<ProcessBindingSnapshot>,
     process: Option<ProcessState>,
 }
 
@@ -82,58 +84,18 @@ impl ProcessExecutor for FakeExecutor {
     ) -> Result<ProcessStartReceipt, ProcessExecutionError> {
         let mut state = self.state.lock().expect("executor lock");
         state.starts += 1;
-        state.request = Some(request.clone());
+        state.request = Some(ProcessBindingSnapshot::from_request(&request));
         if state.start_mode == StartMode::Unknown {
             return Err(ProcessExecutionError::UnknownOutcome);
         }
 
-        let mut process = ProcessState::new(request.clone())?;
-        let identity = ProcessIdentity::new(
-            eliot_process::ProcessId::new("process-1")?,
-            request.process_tree_id().clone(),
-            request.generation(),
-            42,
-            100,
-            request.executable_sha256(),
-        )?;
-        process.start(identity)?;
-        process.mark_running(ProcessHealth::new(
-            ProcessHealthStatus::Healthy,
-            true,
-            101,
-            None,
-        )?)?;
-        let mut evidence = ProcessEvidence::new(
-            request.operation_id().clone(),
-            request.invocation_digest(),
-            process.view(),
-            None,
-            None,
-        )?;
+        let process = validated_process_state(request)?;
+        let receipt = ProcessStartReceipt::new(&process)?;
+        let mut evidence = observed_process_evidence(&process)?;
         if state.start_mode == StartMode::MismatchedEvidence {
             let other = process_request_with("operation-other", "tree-other", 2);
-            let mut other_process = ProcessState::new(other.clone())?;
-            other_process.start(ProcessIdentity::new(
-                eliot_process::ProcessId::new("process-other")?,
-                other.process_tree_id().clone(),
-                other.generation(),
-                43,
-                101,
-                other.executable_sha256(),
-            )?)?;
-            other_process.mark_running(ProcessHealth::new(
-                ProcessHealthStatus::Healthy,
-                true,
-                102,
-                None,
-            )?)?;
-            evidence = ProcessEvidence::new(
-                other.operation_id().clone(),
-                other.invocation_digest(),
-                other_process.view(),
-                None,
-                None,
-            )?;
+            let other_process = validated_process_state(other)?;
+            evidence = observed_process_evidence(&other_process)?;
         }
         if state.start_mode != StartMode::NoEvidence {
             sink.record(evidence)?;
@@ -142,12 +104,10 @@ impl ProcessExecutor for FakeExecutor {
 
         if state.start_mode == StartMode::MismatchedReceipt {
             let other = process_request_with("operation-other", "tree-other", 2);
-            return Ok(ProcessStartReceipt::new(&other, ProcessLifecycle::Running)?);
+            let other_process = validated_process_state(other)?;
+            return Ok(ProcessStartReceipt::new(&other_process)?);
         }
-        Ok(ProcessStartReceipt::new(
-            &request,
-            ProcessLifecycle::Running,
-        )?)
+        Ok(receipt)
     }
 
     async fn inspect(
@@ -175,11 +135,22 @@ impl ProcessExecutor for FakeExecutor {
             .as_mut()
             .ok_or(ProcessExecutionError::NotFound)?;
         if cancel_unknown {
-            process.transition(ProcessLifecycle::UnknownOutcome)?;
+            let identity = process.view().identity().expect("running identity").clone();
+            let descendants = DescendantEvidence::new(
+                process.binding().clone(),
+                identity.process_id().clone(),
+                Vec::new(),
+                false,
+                false,
+                None,
+            )?;
+            process.exit(
+                ExitStatus::new(ExitDisposition::Unknown, None, None, 202)?,
+                descendants,
+            )?;
             return Err(ProcessExecutionError::UnknownOutcome);
         }
-        let fence = process.request().fence().clone();
-        Ok(process.cancel(&fence)?)
+        Ok(process.cancel(&CancellationRequest::new(process.binding().clone()))?)
     }
 
     async fn reconcile(
@@ -192,20 +163,17 @@ impl ProcessExecutor for FakeExecutor {
             .process
             .as_mut()
             .ok_or(ProcessExecutionError::NotFound)?;
+        let identity = process.view().identity().expect("running identity").clone();
         let descendants = DescendantEvidence::new(
-            vec![eliot_process::ProcessId::new("process-1")?],
+            process.binding().clone(),
+            identity.process_id().clone(),
+            vec![ProcessId::new("descendant-1")?],
             true,
             true,
             Some("evidence-1".to_owned()),
         )?;
         process.reconcile(descendants)?;
-        Ok(ProcessEvidence::new(
-            process.request().operation_id().clone(),
-            process.request().invocation_digest(),
-            process.view(),
-            None,
-            None,
-        )?)
+        observed_process_evidence(process)
     }
 }
 
@@ -566,9 +534,12 @@ fn process_request() -> ProcessRequest {
 
 fn process_request_with(operation: &str, tree: &str, generation: u64) -> ProcessRequest {
     let generation = Generation::new(generation).expect("generation");
-    ProcessRequest::new(
+    let intent = ProcessIntent::new(
         OperationId::new(operation).expect("operation"),
         ProcessTreeId::new(tree).expect("tree"),
+        JobId::new(format!("job-{operation}")).expect("job"),
+        ImageId::new(format!("image-{operation}")).expect("image"),
+        SessionId::new(format!("session-{operation}")).expect("session"),
         generation,
         "worker.exe",
         "a".repeat(64),
@@ -576,9 +547,97 @@ fn process_request_with(operation: &str, tree: &str, generation: u64) -> Process
         "C:/work",
         EnvironmentProjection::default(),
         ResourceLimits::new(5_000, Some(1_000), Some(1_048_576), 4_096, 4_096, 2).expect("limits"),
-        FencingToken::new(1, generation, format!("process-fence-{generation:?}")).expect("fence"),
     )
-    .expect("process request")
+    .expect("process intent");
+    let fence =
+        FencingToken::new(1, generation, format!("process-fence-{generation:?}")).expect("fence");
+    let mut authority = DispatchPermitAuthority::activate(
+        DispatchAuthorityId::new("native-worker-authority").expect("authority"),
+        KernelDispatchKey::from_secret_bytes([0x5a; 32]).expect("key"),
+    );
+    let permit = authority
+        .issue(
+            &intent,
+            PermitIssuance::new(
+                ActionLeaseRef::new("native-worker-lease").expect("lease"),
+                fence,
+                revisions(),
+                100,
+                10_000,
+                "nonce-native-worker-1",
+            )
+            .expect("issuance"),
+        )
+        .expect("permit");
+    ProcessRequest::new(intent, permit).expect("process request")
+}
+
+fn revisions() -> BTreeMap<String, String> {
+    BTreeMap::from([
+        ("authority".to_owned(), "a".repeat(64)),
+        ("state".to_owned(), "b".repeat(64)),
+    ])
+}
+
+fn observed_process_evidence(
+    process: &ProcessState,
+) -> Result<ProcessEvidence, ProcessExecutionError> {
+    let axes = serde_json::from_value(serde_json::json!({
+        "status": "OBSERVED",
+        "assertability": "NON_ASSERTABLE_UNVERIFIED",
+        "accessibility": "AVAILABLE",
+        "influence": "ALLOWED",
+        "physical": "PRESENT",
+        "taint": "CLEAR"
+    }))
+    .expect("observed evidence axes");
+    Ok(ProcessEvidence::new(process.view(), None, None, axes)?)
+}
+
+fn validated_process_state(request: ProcessRequest) -> Result<ProcessState, ProcessExecutionError> {
+    let intent = request.intent().clone();
+    let fence = request.fence().clone();
+    let mut authority = DispatchPermitAuthority::activate(
+        DispatchAuthorityId::new("native-worker-authority")?,
+        KernelDispatchKey::from_secret_bytes([0x5a; 32])?,
+    );
+    let _permit = authority.issue(
+        &intent,
+        PermitIssuance::new(
+            ActionLeaseRef::new("native-worker-lease")?,
+            fence.clone(),
+            revisions(),
+            100,
+            10_000,
+            "nonce-native-worker-1",
+        )?,
+    )?;
+    let observed = SuspendedProcessIdentity::new(
+        ProcessId::new("process-1")?,
+        intent.process_tree_id().clone(),
+        intent.job_id().clone(),
+        intent.image_id().clone(),
+        intent.session_id().clone(),
+        intent.generation(),
+        4242,
+        120,
+        intent.executable_sha256(),
+    )?;
+    let clock = serde_json::from_value(serde_json::json!({
+        "valid_time_ms": 150,
+        "known_time_ms": 150,
+        "transaction_sequence": null,
+        "monotonic_ns": 1
+    }))
+    .expect("clock observation");
+    let context = DispatchValidationContext::new(clock, fence, 1, revisions(), 41)?;
+    let validated = authority.validate_and_consume(request, observed, &context)?;
+    let mut state = ProcessState::from_validated(&validated);
+    state.mark_resumed(
+        151,
+        ProcessHealth::new(ProcessHealthStatus::Healthy, true, 151, None)?,
+    )?;
+    Ok(state)
 }
 
 fn hello(connection: &str, request: &str) -> WorkerHello {
@@ -671,11 +730,11 @@ fn fixture_with_executor(
     (core, executor, admission, replay, sink)
 }
 
-fn start(core: &mut TestCore) -> ProcessRequest {
+fn start(core: &mut TestCore) -> ProcessBindingSnapshot {
     let process = process_request();
-    block_on(core.demand_start(hello("connection-1", "start-1"), process.clone()))
-        .expect("demand start");
-    process
+    let binding = ProcessBindingSnapshot::from_request(&process);
+    block_on(core.demand_start(hello("connection-1", "start-1"), process)).expect("demand start");
+    binding
 }
 
 #[test]
@@ -744,8 +803,7 @@ fn exact_process_start_receipt_and_evidence_precede_readiness() {
     assert_eq!(observed.process_tree_id(), process.process_tree_id());
     assert_eq!(observed.generation(), process.generation());
     assert!(observed.fence().matches(process.fence()));
-    assert_eq!(observed.resource_limits(), process.resource_limits());
-    assert_eq!(observed.invocation_digest(), process.invocation_digest());
+    assert_eq!(observed.request_digest(), process.request_digest());
     drop(state);
     assert_eq!(
         admission.state.lock().expect("admission lock").admissions,
@@ -755,7 +813,7 @@ fn exact_process_start_receipt_and_evidence_precede_readiness() {
     assert_eq!(replay.state.lock().expect("replay lock").events.len(), 1);
     let receipt = core.process_start_receipt().expect("start receipt");
     assert_eq!(receipt.operation_id(), process.operation_id());
-    assert_eq!(receipt.request_digest(), process.invocation_digest());
+    assert_eq!(receipt.request_digest(), process.request_digest());
 }
 
 #[test]
@@ -945,7 +1003,7 @@ fn unknown_cancel_blocks_work_until_exact_p03_reconciliation() {
 #[test]
 fn restart_uses_inspect_and_durable_replay_without_duplicate_start() {
     let (mut first, executor, admission, replay, sink) = fixture();
-    let process = start(&mut first);
+    let _process = start(&mut first);
     let heartbeat = block_on(first.handle(frame("heartbeat-1", WorkerFrameBody::Heartbeat)))
         .expect("heartbeat");
     let original_id = heartbeat[0].event_id.clone();
@@ -957,9 +1015,12 @@ fn restart_uses_inspect_and_durable_replay_without_duplicate_start() {
         Some(replay),
         Some(Arc::new(sink)),
     );
-    let recovery =
-        block_on(restarted.recover_after_restart(hello("connection-2", "recover-1"), process, 0))
-            .expect("recovery");
+    let recovery = block_on(restarted.recover_after_restart(
+        hello("connection-2", "recover-1"),
+        process_request(),
+        0,
+    ))
+    .expect("recovery");
     assert_eq!(recovery.lifecycle, WorkerLifecycle::Ready);
     assert!(
         recovery
@@ -1228,7 +1289,7 @@ fn reconnect_rejects_stale_out_of_order_and_ahead_cursors() {
 #[test]
 fn restart_rejects_invalid_durable_tail_without_installing_binding() {
     let (mut first, executor, admission, replay, sink) = fixture();
-    let process = start(&mut first);
+    let _process = start(&mut first);
     block_on(first.handle(frame("heartbeat-restart", WorkerFrameBody::Heartbeat)))
         .expect("heartbeat");
     replay
@@ -1246,7 +1307,7 @@ fn restart_rejects_invalid_durable_tail_without_installing_binding() {
     assert!(matches!(
         block_on(restarted.recover_after_restart(
             hello("connection-2", "recover-invalid-tail"),
-            process,
+            process_request(),
             0,
         )),
         Err(WorkerError::ReplayContract("replay_binding"))

@@ -61,6 +61,8 @@ pub enum CodexAdapterError {
     SessionMismatch,
     #[error("Codex state fence is stale")]
     StaleFence,
+    #[error("Codex process request has already been consumed")]
+    ProcessAlreadyStarted,
     #[error("Codex output is partial; outcome remains unknown")]
     PartialOutput,
     #[error("Codex output has no admissible semantic result")]
@@ -140,7 +142,7 @@ impl CodexSessionBinding {
 
 /// Input to the admission/attach boundary.  All authority and source proof is
 /// supplied by the caller; the adapter only narrows and validates it.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct CodexAttachInput {
     pub launch: AgentLaunchRequest,
     pub authority: AuthorityEnvelope,
@@ -152,13 +154,17 @@ pub struct CodexAttachInput {
 }
 
 /// Immutable receipt proving the exact inputs accepted by `attach`.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct CodexAttachReceipt {
     launch: AgentLaunchRequest,
     authority: AuthorityEnvelope,
     route: RouteFingerprint,
     session: CodexSessionBinding,
-    process_request: ProcessRequest,
+    process_request: Option<ProcessRequest>,
+    operation_id: eliot_process::OperationId,
+    generation: eliot_process::Generation,
+    invocation_digest: String,
+    permit_digest: String,
     source_digest: String,
 }
 
@@ -175,8 +181,20 @@ impl CodexAttachReceipt {
     pub fn session(&self) -> &CodexSessionBinding {
         &self.session
     }
-    pub fn process_request(&self) -> &ProcessRequest {
-        &self.process_request
+    pub fn process_request(&self) -> Option<&ProcessRequest> {
+        self.process_request.as_ref()
+    }
+    pub fn operation_id(&self) -> &eliot_process::OperationId {
+        &self.operation_id
+    }
+    pub fn generation(&self) -> eliot_process::Generation {
+        self.generation
+    }
+    pub fn invocation_digest(&self) -> &str {
+        &self.invocation_digest
+    }
+    pub fn permit_digest(&self) -> &str {
+        &self.permit_digest
     }
     pub fn source_digest(&self) -> &str {
         &self.source_digest
@@ -213,12 +231,20 @@ pub fn attach(input: CodexAttachInput) -> Result<CodexAttachReceipt, CodexAdapte
         AdmissionOutcome::Admitted { assurance_digest } => assurance_digest,
         other => return Err(CodexAdapterError::SourceNotAdmitted(format!("{other:?}"))),
     };
+    let operation_id = input.process_request.operation_id().clone();
+    let generation = input.process_request.generation();
+    let invocation_digest = input.process_request.invocation_digest().to_owned();
+    let permit_digest = input.process_request.permit_digest().to_owned();
     Ok(CodexAttachReceipt {
         launch: input.launch,
         authority: input.authority,
         route: input.route,
         session: input.session,
-        process_request: input.process_request,
+        process_request: Some(input.process_request),
+        operation_id,
+        generation,
+        invocation_digest,
+        permit_digest,
         source_digest,
     })
 }
@@ -260,15 +286,16 @@ impl<E: ProcessExecutor + 'static> CodexAdapter<E> {
     /// against the exact operation and generation in the attached request.
     pub async fn launch(
         &self,
-        attached: &CodexAttachReceipt,
+        attached: &mut CodexAttachReceipt,
         sink: Arc<dyn ProcessEvidenceSink>,
     ) -> Result<CodexLaunchReceipt, CodexAdapterError> {
-        let start = self
-            .executor
-            .start(attached.process_request.clone(), sink)
-            .await?;
-        if start.operation_id() != attached.process_request.operation_id()
-            || start.accepted_generation() != attached.process_request.generation()
+        let process_request = attached
+            .process_request
+            .take()
+            .ok_or(CodexAdapterError::ProcessAlreadyStarted)?;
+        let start = self.executor.start(process_request, sink).await?;
+        if start.operation_id() != attached.operation_id()
+            || start.accepted_generation() != attached.generation()
         {
             return Err(CodexAdapterError::StaleFence);
         }
@@ -287,7 +314,7 @@ impl<E: ProcessExecutor + 'static> CodexAdapter<E> {
     ) -> Result<CodexCancelReceipt, CodexAdapterError> {
         let process = self
             .executor
-            .cancel(attached.process_request.operation_id().clone())
+            .cancel(attached.operation_id().clone())
             .await?;
         Ok(CodexCancelReceipt {
             attempt_id: AttemptId::new(attached.launch.id.as_str())?,
@@ -302,7 +329,7 @@ impl<E: ProcessExecutor + 'static> CodexAdapter<E> {
     ) -> Result<ProcessEvidence, CodexAdapterError> {
         Ok(self
             .executor
-            .reconcile(attached.process_request.operation_id().clone())
+            .reconcile(attached.operation_id().clone())
             .await?)
     }
 }
@@ -673,8 +700,11 @@ mod tests {
         AuthorityEpoch, BudgetEnvelope, EffectKind, LaunchRequestId, QuotaKnowledge, WorkUnitId,
     };
     use eliot_process::{
-        EnvironmentInheritance, EnvironmentProjection, FencingToken, Generation,
-        ProcessExecutionView, ResourceLimits,
+        ActionLeaseRef, DispatchAuthorityId, DispatchPermitAuthority, DispatchValidationContext,
+        EnvironmentInheritance, EnvironmentProjection, FencingToken, Generation, ImageId, JobId,
+        KernelDispatchKey, OperationId, PermitIssuance, ProcessExecutionView, ProcessHealth,
+        ProcessHealthStatus, ProcessId, ProcessIntent, ProcessState, ProcessTreeId, ResourceLimits,
+        SessionId as ProcessSessionId, SuspendedProcessIdentity,
     };
     use eliot_source_assurance::{
         AdmissibleUse, AxisStatus, GoverningSourceIdentity, GoverningSourceSet, InstructionTaint,
@@ -791,9 +821,12 @@ mod tests {
 
     fn process_request() -> TestResult<ProcessRequest> {
         let generation = Generation::new(1)?;
-        Ok(ProcessRequest::new(
-            eliot_process::OperationId::new("op-1")?,
-            eliot_process::ProcessTreeId::new("tree-1")?,
+        let intent = ProcessIntent::new(
+            OperationId::new("op-1")?,
+            ProcessTreeId::new("tree-1")?,
+            JobId::new("job-1")?,
+            ImageId::new("image-1")?,
+            ProcessSessionId::new("session-1")?,
             generation,
             "codex-app-server",
             "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
@@ -801,8 +834,79 @@ mod tests {
             "C:\\workspace",
             EnvironmentProjection::new(BTreeMap::new(), Vec::new(), EnvironmentInheritance::None)?,
             ResourceLimits::new(1_000, None, None, 10_000, 10_000, 1)?,
-            FencingToken::new(1, generation, "nonce")?,
-        )?)
+        )?;
+        let fence = FencingToken::new(1, generation, "nonce")?;
+        let mut authority = DispatchPermitAuthority::activate(
+            DispatchAuthorityId::new("codex-authority")?,
+            KernelDispatchKey::from_secret_bytes([0x5a; 32])?,
+        );
+        let permit = authority.issue(
+            &intent,
+            PermitIssuance::new(
+                ActionLeaseRef::new("codex-lease")?,
+                fence,
+                revisions(),
+                100,
+                10_000,
+                "codex-nonce-1",
+            )?,
+        )?;
+        Ok(ProcessRequest::new(intent, permit)?)
+    }
+
+    fn revisions() -> BTreeMap<String, String> {
+        BTreeMap::from([
+            ("authority".to_owned(), "a".repeat(64)),
+            ("state".to_owned(), "b".repeat(64)),
+        ])
+    }
+
+    fn validated_process_state(
+        request: ProcessRequest,
+    ) -> Result<ProcessState, ProcessExecutionError> {
+        let intent = request.intent().clone();
+        let fence = request.fence().clone();
+        let mut authority = DispatchPermitAuthority::activate(
+            DispatchAuthorityId::new("codex-authority")?,
+            KernelDispatchKey::from_secret_bytes([0x5a; 32])?,
+        );
+        let _permit = authority.issue(
+            &intent,
+            PermitIssuance::new(
+                ActionLeaseRef::new("codex-lease")?,
+                fence.clone(),
+                revisions(),
+                100,
+                10_000,
+                "codex-nonce-1",
+            )?,
+        )?;
+        let observed = SuspendedProcessIdentity::new(
+            ProcessId::new("process-1")?,
+            intent.process_tree_id().clone(),
+            intent.job_id().clone(),
+            intent.image_id().clone(),
+            intent.session_id().clone(),
+            intent.generation(),
+            4242,
+            120,
+            intent.executable_sha256(),
+        )?;
+        let clock = serde_json::from_value(serde_json::json!({
+            "valid_time_ms": 150,
+            "known_time_ms": 150,
+            "transaction_sequence": null,
+            "monotonic_ns": 1
+        }))
+        .map_err(|_| ProcessExecutionError::Unavailable("fixture clock".to_owned()))?;
+        let context = DispatchValidationContext::new(clock, fence, 1, revisions(), 41)?;
+        let validated = authority.validate_and_consume(request, observed, &context)?;
+        let mut state = ProcessState::from_validated(&validated);
+        state.mark_resumed(
+            151,
+            ProcessHealth::new(ProcessHealthStatus::Healthy, true, 151, None)?,
+        )?;
+        Ok(state)
     }
 
     fn launch() -> TestResult<AgentLaunchRequest> {
@@ -887,8 +991,8 @@ mod tests {
             _sink: Arc<dyn ProcessEvidenceSink>,
         ) -> Result<ProcessStartReceipt, ProcessExecutionError> {
             self.starts.fetch_add(1, Ordering::SeqCst);
-            ProcessStartReceipt::new(&request, eliot_process::ProcessLifecycle::Starting)
-                .map_err(ProcessExecutionError::from)
+            let state = validated_process_state(request)?;
+            ProcessStartReceipt::new(&state).map_err(ProcessExecutionError::from)
         }
         async fn inspect(
             &self,
@@ -1047,11 +1151,13 @@ mod tests {
             starts: AtomicUsize::new(0),
         });
         let adapter = CodexAdapter::new(executor.clone());
-        let receipt = adapter.launch(&attached()?, Arc::new(Sink)).await?;
+        let mut attached = attached()?;
+        let receipt = adapter.launch(&mut attached, Arc::new(Sink)).await?;
         assert_eq!(
             receipt.process.lifecycle(),
-            eliot_process::ProcessLifecycle::Starting
+            eliot_process::ProcessLifecycle::Running
         );
+        assert!(attached.process_request().is_none());
         assert_eq!(executor.starts.load(Ordering::SeqCst), 1);
         Ok(())
     }

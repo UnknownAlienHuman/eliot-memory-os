@@ -17,7 +17,11 @@ fn request_json(command: &str) -> Value {
         "dashboard" => json!({"kind": "dashboard"}),
         "bootstrap-brief" => json!({"kind": "bootstrap_brief", "work_unit": "work-unit-1"}),
         "doctor-integration" => json!({"kind": "doctor_integration", "profile": "default"}),
-        _ => json!({"kind": "system_snapshot"}),
+        _ => json!({
+            "kind": "system_snapshot",
+            "repo_root": "C:\\Development\\Rust\\projects\\eliot-memory-os",
+            "output_path": "C:\\Temp\\eliot-current-system.json"
+        }),
     };
     json!({
         "request": {
@@ -70,7 +74,7 @@ fn help_and_schema_are_deterministic_projections_of_one_catalogue() {
     assert_eq!(catalogue.commands().len(), 25);
     assert_eq!(
         catalogue.commands().first().map(|spec| spec.usage),
-        Some("eliot system snapshot")
+        Some("eliot system snapshot --repo-root <ABSOLUTE> --output <ABSOLUTE>")
     );
     assert_eq!(
         catalogue.commands().last().map(|spec| spec.usage),
@@ -172,14 +176,20 @@ fn unknown_and_duplicate_commands_fail_closed() {
 #[test]
 fn missing_a06_and_a08_operations_are_typed_unavailable() {
     let catalogue = CommandCatalogue::current();
-    let plan_gap = must(catalogue.execute(&request("system-snapshot")));
+    let plan_gap = must(catalogue.execute(&request("ui")));
     assert!(matches!(
         &plan_gap.result,
         CommandResult::Unavailable {
             reason: UnavailableReason::PlanGap { .. }
         }
     ));
-    must(plan_gap.validate_for(catalogue, &request("system-snapshot")));
+    must(plan_gap.validate_for(catalogue, &request("ui")));
+
+    let snapshot = must(catalogue.forwarded_snapshot_response(
+        &request("system-snapshot"),
+        json!({"snapshot_sha256": "a".repeat(64), "receipt_sha256": "b".repeat(64)}),
+    ));
+    assert!(matches!(snapshot.result, CommandResult::Forwarded { .. }));
 
     let ui = must(catalogue.execute(&request("ui")));
     match &ui.result {
@@ -215,16 +225,14 @@ fn missing_a06_and_a08_operations_are_typed_unavailable() {
 }
 
 #[test]
-fn unavailable_result_preserves_effect_and_exact_correlation() {
+fn admitted_snapshot_result_preserves_effect_and_exact_correlation() {
     let catalogue = CommandCatalogue::current();
     let request = request("system-snapshot");
-    let response = must(catalogue.execute(&request));
-    assert!(matches!(
-        &response.result,
-        CommandResult::Unavailable {
-            reason: UnavailableReason::PlanGap { .. }
-        }
+    let response = must(catalogue.forwarded_snapshot_response(
+        &request,
+        json!({"snapshot_sha256": "a".repeat(64), "receipt_sha256": "b".repeat(64)}),
     ));
+    assert!(matches!(&response.result, CommandResult::Forwarded { .. }));
     assert_eq!(response.effect, eliot_receipts::EffectClass::Read);
     assert_eq!(
         response.proof_ceiling,
@@ -233,12 +241,7 @@ fn unavailable_result_preserves_effect_and_exact_correlation() {
     must(response.validate_for(catalogue, &request));
 
     let mut forged = response.clone();
-    if let CommandResult::Unavailable {
-        reason: UnavailableReason::PlanGap { dependency, .. },
-    } = &mut forged.result
-    {
-        dependency.push_str("-forged");
-    }
+    forged.command = CommandId::RecoveryStatus;
     assert!(forged.validate_for(catalogue, &request).is_err());
 
     let mut mismatched = response;

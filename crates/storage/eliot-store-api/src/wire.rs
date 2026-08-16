@@ -5,7 +5,7 @@
 //! query text, Blob bytes, lifecycle operations and maintenance services are
 //! intentionally not representable here.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use eliot_contracts::RequestId;
 use eliot_protocol::{
@@ -100,8 +100,8 @@ impl ReadinessReceipt {
                 }
             }
             ReadinessStatus::MigrationRequired => {
-                validate_optional_text(&self.expected_generation, "expected_generation")?;
-                validate_optional_text(&self.observed_generation, "observed_generation")?;
+                validate_optional_text(self.expected_generation.as_deref(), "expected_generation")?;
+                validate_optional_text(self.observed_generation.as_deref(), "observed_generation")?;
                 if self.expected_generation.is_none() {
                     return Err(StoreWireError::Invalid(
                         "migration_required readiness needs expected_generation".to_owned(),
@@ -109,8 +109,8 @@ impl ReadinessReceipt {
                 }
             }
             ReadinessStatus::Ready => {
-                validate_optional_text(&self.expected_generation, "expected_generation")?;
-                validate_optional_text(&self.observed_generation, "observed_generation")?;
+                validate_optional_text(self.expected_generation.as_deref(), "expected_generation")?;
+                validate_optional_text(self.observed_generation.as_deref(), "observed_generation")?;
                 if self.expected_generation.is_none() || self.observed_generation.is_none() {
                     return Err(StoreWireError::Invalid(
                         "ready readiness needs both schema generations".to_owned(),
@@ -125,6 +125,7 @@ impl ReadinessReceipt {
 /// Closed semantic store request catalogue.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
+#[allow(clippy::large_enum_variant)]
 pub enum StoreRequest {
     Health,
     Readiness,
@@ -152,7 +153,7 @@ impl StoreRequest {
     /// Validates the closed operation and all bounded list fields.
     pub fn validate(&self) -> Result<(), StoreError> {
         match self {
-            Self::Health | Self::Readiness => Ok(()),
+            Self::Health | Self::Readiness | Self::Receipt { .. } => Ok(()),
             Self::Named { request } => request.validate(),
             Self::Apply {
                 context,
@@ -185,7 +186,6 @@ impl StoreRequest {
                 }
                 Ok(())
             }
-            Self::Receipt { .. } => Ok(()),
             Self::RevisionHeads { keys } => bounded_unique(keys, "revision_keys", Clone::clone),
             Self::OrderingHeads { scopes } => {
                 bounded_unique(scopes, "ordering_scopes", Clone::clone)
@@ -435,7 +435,7 @@ pub fn request_frame(
             serde_json::to_value(request)
                 .map_err(|error| StoreWireError::Payload(error.to_string()))?,
         ),
-        trace_context: Default::default(),
+        trace_context: BTreeMap::default(),
     };
     frame
         .validate()
@@ -498,7 +498,7 @@ pub fn response_frame(
             serde_json::to_value(response)
                 .map_err(|error| StoreWireError::Payload(error.to_string()))?,
         ),
-        trace_context: Default::default(),
+        trace_context: BTreeMap::default(),
     };
     frame
         .validate()
@@ -575,10 +575,7 @@ where
     Ok(())
 }
 
-fn validate_optional_text(
-    value: &Option<String>,
-    field: &'static str,
-) -> Result<(), StoreWireError> {
+fn validate_optional_text(value: Option<&str>, field: &'static str) -> Result<(), StoreWireError> {
     if let Some(value) = value {
         validate_text(value, field)?;
     }

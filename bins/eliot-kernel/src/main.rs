@@ -7,6 +7,9 @@ use eliot_kernel::{
 };
 
 #[cfg(windows)]
+const MAX_SESSIONS: usize = 32;
+
+#[cfg(windows)]
 use eliot_ipc::{
     DeliveryOutcome, NamedPipeServer, TransportError, TransportLimits,
     decode_client_hello_frame_unbound, handshake_rejection_frame, server_hello_frame,
@@ -18,6 +21,9 @@ use tokio::sync::{Semaphore, watch};
 #[cfg(windows)]
 use tokio::task::JoinSet;
 
+/// Keeps startup, authenticated listener rotation, and fenced shutdown in one
+/// ordered authority path.
+#[allow(clippy::too_many_lines)]
 #[tokio::main]
 async fn main() {
     let root = match parse_root() {
@@ -26,7 +32,7 @@ async fn main() {
     };
     let kernel = Arc::new(match KernelComposition::new(KernelConfig::new(root)) {
         Ok(kernel) => kernel,
-        Err(error) => exit_build_error(error),
+        Err(error) => exit_build_error(&error),
     });
     #[cfg(windows)]
     {
@@ -36,7 +42,7 @@ async fn main() {
         };
         let mut front_door = match kernel.bind_authenticated_front_door() {
             Ok(server) => server,
-            Err(error) => exit_build_error(error),
+            Err(error) => exit_build_error(&error),
         };
         let ready = format!(
             "{{\"service\":\"{SERVICE_NAME}\",\"protocol\":\"{PROTOCOL_VERSION}\",\"ipc\":\"{}\"}}",
@@ -45,7 +51,6 @@ async fn main() {
         if !write_line(&ready) {
             return;
         }
-        const MAX_SESSIONS: usize = 32;
         let permits = Arc::new(Semaphore::new(MAX_SESSIONS));
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let mut sessions: JoinSet<Result<(), TransportError>> = JoinSet::new();
@@ -106,7 +111,7 @@ async fn main() {
         let _ = shutdown_tx.send(true);
         while let Some(joined) = sessions.join_next().await {
             match joined {
-                Ok(Ok(())) | Ok(Err(_)) | Err(_) => {}
+                Ok(Ok(()) | Err(_)) | Err(_) => {}
             }
         }
     }
@@ -256,7 +261,7 @@ fn parse_root() -> Result<std::path::PathBuf, std::io::Error> {
     }
 }
 
-fn exit_build_error(error: KernelBuildError) -> ! {
+fn exit_build_error(error: &KernelBuildError) -> ! {
     exit_error("COMPOSITION_FAILURE", &error.to_string())
 }
 

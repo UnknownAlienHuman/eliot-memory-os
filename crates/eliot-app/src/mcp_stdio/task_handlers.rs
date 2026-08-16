@@ -213,7 +213,8 @@ async fn dispatch_compile_packet_l3(
             .transpose()?
             .flatten()
     };
-    let codecortex_batch = fresh_codecortex_reports(state, &request, material_frame.as_ref())?;
+    let codecortex_batch =
+        fresh_codecortex_reports(state, &request, material_frame.as_ref(), packet_task.as_ref())?;
     let codecortex_reports = &codecortex_batch.reports;
     let current_git_scope =
         resolve_governed_packet_git_scope(&request, packet_task.as_ref(), codecortex_reports)
@@ -1081,6 +1082,7 @@ fn fresh_codecortex_reports(
     state: &McpState,
     request: &CompilePacketL3Request,
     frame: Option<&MaterialPacketFrame>,
+    task: Option<&TaskContract>,
 ) -> Result<CodeCortexCompileBatch> {
     let class = TaskExecutionClassifier::classify(request, frame, &[], &request.candidate_handles);
     if !TaskExecutionClassifier::should_attach_codecortex(request, frame, &[], &class) {
@@ -1106,7 +1108,10 @@ fn fresh_codecortex_reports(
         max_matches_per_pattern: 24,
         include_diagnostics: false,
     };
-    let project_root = eliot_engine::canonical_project_root(&state.root);
+    let project_root = resolve_codecortex_repo_root(
+        &state.root,
+        task,
+    )?;
     let service = CodeCortexService::new(project_root);
     if let Some(report) = latest_codecortex_report(&state.root)?
         && service.report_is_fresh(&report, &codecortex_request)?
@@ -2086,6 +2091,73 @@ async fn recover_packet_post_commit_outboxes(
 #[allow(clippy::expect_used)]
 mod packet_commit_unit_tests {
     use super::*;
+
+    #[test]
+    fn codecortex_root_resolution_fails_closed_for_non_git_launch_root() {
+        let launch_root = std::env::temp_dir().join(format!(
+            "eliot-codecortex-non-git-{}",
+            WriteId::new_v7()
+        ));
+        std::fs::create_dir_all(&launch_root).expect("create non-git launch root");
+        let result = resolve_codecortex_repo_root_from_sources(Some(&launch_root), None);
+        std::fs::remove_dir_all(&launch_root).expect("remove non-git launch root");
+        let error = result.expect_err("non-git launch root must not be CodeCortex source truth");
+        assert!(error.to_string().contains("Cargo checkout"));
+    }
+
+    #[test]
+    fn codecortex_root_resolution_ignores_stale_report_projections() {
+        let runtime_root = std::env::temp_dir().join(format!(
+            "eliot-codecortex-report-projection-{}",
+            WriteId::new_v7()
+        ));
+        let redirect_root = runtime_root.join("forged-repo-root");
+        std::fs::create_dir_all(runtime_root.join("reports/action-lease"))
+            .expect("create action lease report directory");
+        std::fs::create_dir_all(runtime_root.join("reports/work"))
+            .expect("create work report directory");
+        std::fs::write(
+            runtime_root.join("reports/action-lease/latest.json"),
+            serde_json::json!({
+                "record": {"lease": {"allowed_scope": {"repo_root": redirect_root}}
+                }
+            })
+            .to_string(),
+        )
+        .expect("write forged action lease report");
+        std::fs::write(
+            runtime_root.join("reports/work/state.json"),
+            serde_json::json!({"leases": [{"scope": {"repo_root": redirect_root}}]}).to_string(),
+        )
+        .expect("write forged work report");
+
+        let result = resolve_codecortex_repo_root(&runtime_root, None);
+        std::fs::remove_dir_all(&runtime_root).expect("remove forged report projection");
+        let error = result.expect_err("report projections must not supply CodeCortex root");
+        assert!(error
+            .to_string()
+            .contains("governed scope or ELIOT_GOVERNOR_REPO_ROOT"));
+    }
+
+    #[test]
+    fn codecortex_root_resolution_uses_configured_governor_root_fallback() {
+        let repo_root = std::fs::canonicalize(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../.."),
+        )
+        .expect("canonical project root");
+        let resolved = resolve_codecortex_repo_root_from_sources(None, Some(&repo_root))
+            .expect("configured Governor root must resolve");
+        assert_eq!(resolved, repo_root);
+    }
+
+    #[test]
+    fn codecortex_root_resolution_fails_closed_without_trusted_source() {
+        let error = resolve_codecortex_repo_root_from_sources(None, None)
+            .expect_err("missing governed root must fail closed");
+        assert!(error
+            .to_string()
+            .contains("governed scope or ELIOT_GOVERNOR_REPO_ROOT"));
+    }
 
     fn packet_response(
         project_id: ProjectId,

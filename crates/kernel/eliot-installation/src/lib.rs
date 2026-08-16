@@ -201,7 +201,7 @@ pub fn verify_file_digest_with_lease(
         .read_bounded(MAX_VERIFIED_FILE_BYTES)
         .map_err(|error| InstallationError::Platform(format!("{field}: {error}")))?;
     let digest = Sha256::digest(&bytes);
-    let actual = format!("{:x}", digest);
+    let actual = format!("{digest:x}");
     if actual != expected.as_str() {
         return Err(InstallationError::InvalidField {
             field: field.to_owned(),
@@ -879,7 +879,7 @@ impl ApprovedGenerationRegistry {
             return Ok(());
         }
         let previous = self.active_generation.take();
-        self.last_known_good_generation = previous.clone();
+        self.last_known_good_generation.clone_from(&previous);
         for item in &mut self.generations {
             item.active = false;
             // A cutover has exactly one LKG: the generation that was active
@@ -887,14 +887,13 @@ impl ApprovedGenerationRegistry {
             // before setting that projection below.
             item.last_known_good = false;
         }
-        if let Some(previous) = previous {
-            if let Some(item) = self
+        if let Some(previous) = previous
+            && let Some(item) = self
                 .generations
                 .iter_mut()
                 .find(|item| item.manifest.generation == previous)
-            {
-                item.last_known_good = true;
-            }
+        {
+            item.last_known_good = true;
         }
         self.generations[selected].active = true;
         self.generations[selected].last_known_good = false;
@@ -915,14 +914,13 @@ impl ApprovedGenerationRegistry {
         // The generation we just left is the one that failed the cutover; it
         // must not remain advertised as LKG after rollback.
         if prior_active.as_ref() != Some(&generation) {
-            if let Some(prior) = prior_active {
-                if let Some(item) = self
+            if let Some(prior) = prior_active
+                && let Some(item) = self
                     .generations
                     .iter_mut()
                     .find(|item| item.manifest.generation == prior)
-                {
-                    item.last_known_good = false;
-                }
+            {
+                item.last_known_good = false;
             }
             self.last_known_good_generation = None;
         }
@@ -1068,20 +1066,19 @@ impl InstallationStage {
         matches!(
             (self, next),
             (Self::Planned, Self::Staging)
-                | (Self::Staging, Self::StaticVerified)
-                | (Self::Staging, Self::RollbackRequired)
-                | (Self::StaticVerified, Self::Registering)
-                | (Self::StaticVerified, Self::RollbackRequired)
-                | (Self::Registering, Self::Activating)
-                | (Self::Registering, Self::RollbackRequired)
-                | (Self::Activating, Self::ActiveVerified)
-                | (Self::Activating, Self::RollbackRequired)
-                | (Self::ActiveVerified, Self::Cleaning)
-                | (Self::ActiveVerified, Self::Completed)
-                | (Self::Cleaning, Self::Completed)
-                | (Self::Cleaning, Self::RollbackRequired)
-                | (Self::RollbackRequired, Self::RolledBack)
-                | (Self::RollbackRequired, Self::Quarantined)
+                | (Self::Staging, Self::StaticVerified | Self::RollbackRequired)
+                | (
+                    Self::StaticVerified,
+                    Self::Registering | Self::RollbackRequired
+                )
+                | (Self::Registering, Self::Activating | Self::RollbackRequired)
+                | (
+                    Self::Activating,
+                    Self::ActiveVerified | Self::RollbackRequired
+                )
+                | (Self::ActiveVerified, Self::Cleaning | Self::Completed)
+                | (Self::Cleaning, Self::Completed | Self::RollbackRequired)
+                | (Self::RollbackRequired, Self::RolledBack | Self::Quarantined)
         )
     }
 }
@@ -1326,7 +1323,7 @@ impl InstallationTransaction {
     }
 }
 
-fn platform_error(error: PortError) -> InstallationError {
+fn platform_error(error: &PortError) -> InstallationError {
     InstallationError::Platform(error.to_string())
 }
 
@@ -1532,7 +1529,8 @@ where
             }
             PortOutcome::Unknown(reason) => {
                 let pending = vec![
-                    PlatformHandle::new(format!("unknown:{reason:?}")).map_err(platform_error)?,
+                    PlatformHandle::new(format!("unknown:{reason:?}"))
+                        .map_err(|error| platform_error(&error))?,
                 ];
                 if operation == InstallationEffectOperation::Rollback {
                     transaction.advance(InstallationStage::Quarantined, pending.clone())?;
@@ -1545,7 +1543,7 @@ where
                     pending_refs: pending,
                 })
             }
-            PortOutcome::Error(error) => Err(platform_error(error)),
+            PortOutcome::Error(error) => Err(platform_error(&error)),
         }
     }
 }
@@ -1601,11 +1599,15 @@ where
     }
 
     /// Inspects exact components without treating presence as admission.
+    #[allow(
+        clippy::needless_pass_by_value,
+        reason = "the public inspection façade preserves its owned request contract"
+    )]
     pub fn inspect(
         &mut self,
         request: InstallationRequest,
     ) -> Result<InstallationObservation, InstallationError> {
-        request.validate().map_err(platform_error)?;
+        request.validate().map_err(|error| platform_error(&error))?;
         let outcome = self.port.execute(&request);
         match outcome {
             PortOutcome::Known(observation) => Ok(observation),
@@ -1615,7 +1617,7 @@ where
             PortOutcome::Unknown(_) => Err(InstallationError::UnknownOutcome {
                 stage: InstallationStage::Planned,
             }),
-            PortOutcome::Error(error) => Err(platform_error(error)),
+            PortOutcome::Error(error) => Err(platform_error(&error)),
         }
     }
 

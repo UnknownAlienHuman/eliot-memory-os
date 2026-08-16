@@ -155,6 +155,9 @@ fn kernel_call(
 
 #[derive(Deserialize)]
 #[serde(tag = "kind", rename_all = "SCREAMING_SNAKE_CASE", deny_unknown_fields)]
+// The authenticated variant mirrors the closed Kernel wire contract; boxing it
+// would introduce a second representation solely to optimize a private decode.
+#[allow(clippy::large_enum_variant)]
 enum ActivationWireResponse {
     Authenticated {
         principal_id: PrincipalId,
@@ -281,11 +284,6 @@ impl McpForwardingPort for KernelMcpForwardingPort {
         binding: &AttachBinding,
         event: &EventEnvelope,
     ) -> Result<EventPortOutcome, ProviderFailure> {
-        let response = kernel_call(
-            &self.client,
-            "eliot.agent-bridge.forward-event",
-            json!({ "binding": binding_value(binding), "event": event }),
-        )?;
         #[derive(Deserialize)]
         #[serde(tag = "kind", rename_all = "SCREAMING_SNAKE_CASE", deny_unknown_fields)]
         enum Wire {
@@ -300,6 +298,11 @@ impl McpForwardingPort for KernelMcpForwardingPort {
                 reason_ref: String,
             },
         }
+        let response = kernel_call(
+            &self.client,
+            "eliot.agent-bridge.forward-event",
+            json!({ "binding": binding_value(binding), "event": event }),
+        )?;
         match serde_json::from_value(response).map_err(|_| provider_failure())? {
             Wire::Acknowledged {
                 stream_id,
@@ -334,17 +337,17 @@ impl McpForwardingPort for KernelMcpForwardingPort {
         &mut self,
         binding: &AttachBinding,
     ) -> Result<ReconciliationPortOutcome, ProviderFailure> {
-        let response = kernel_call(
-            &self.client,
-            "eliot.agent-bridge.reconcile-external",
-            json!({ "binding": binding_value(binding) }),
-        )?;
         #[derive(Deserialize)]
         #[serde(tag = "kind", rename_all = "SCREAMING_SNAKE_CASE", deny_unknown_fields)]
         enum Wire {
             Reconciled { receipt_ref: String },
             Denied { reason_code: String },
         }
+        let response = kernel_call(
+            &self.client,
+            "eliot.agent-bridge.reconcile-external",
+            json!({ "binding": binding_value(binding) }),
+        )?;
         match serde_json::from_value(response).map_err(|_| provider_failure())? {
             Wire::Reconciled { receipt_ref } => Ok(ReconciliationPortOutcome::Reconciled(
                 ReconciliationPortResult::reconciled(
@@ -436,14 +439,13 @@ pub struct BridgeRunner {
 /// Builds the production bridge's two injected Kernel-owned provider ports.
 /// The same authenticated client/session binding is shared by activation and
 /// forwarding, while A-16 remains the sole bridge state owner.
-pub fn kernel_ports() -> Result<
-    (
-        KernelClientHandle,
-        Box<dyn HostActivationPort>,
-        Box<dyn McpForwardingPort>,
-    ),
-    RuntimeBuildError,
-> {
+pub type KernelPorts = (
+    KernelClientHandle,
+    Box<dyn HostActivationPort>,
+    Box<dyn McpForwardingPort>,
+);
+
+pub fn kernel_ports() -> Result<KernelPorts, RuntimeBuildError> {
     let client = eliot_cli::kernel_client::KernelClient::load()
         .map_err(|error| RuntimeBuildError::KernelClient(error.to_string()))?;
     let client = Arc::new(Mutex::new(client));

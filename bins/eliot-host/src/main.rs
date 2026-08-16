@@ -55,13 +55,13 @@ fn run_console() -> bool {
     let mut host = match open_host() {
         Ok(host) => host,
         Err(error) => {
-            write_response(Response::Error {
+            write_response(&Response::Error {
                 error: error.to_string(),
             });
             return false;
         }
     };
-    if !write_response(Response::Ready {
+    if !write_response(&Response::Ready {
         service: SERVICE_NAME,
         protocol: PROTOCOL_VERSION,
     }) {
@@ -78,7 +78,7 @@ fn run_console() -> bool {
                 true,
             ),
         };
-        if !write_response(response) || terminate || !host.running() {
+        if !write_response(&response) || terminate || !host.running() {
             break;
         }
     }
@@ -148,10 +148,10 @@ fn finish_console_shutdown(host: &mut HostComposition, cause: &str) -> bool {
     }
 }
 
-fn write_response(response: Response) -> bool {
+fn write_response(response: &Response) -> bool {
     let stdout = io::stdout();
     let mut output = stdout.lock();
-    serde_json::to_writer(&mut output, &response).is_ok()
+    serde_json::to_writer(&mut output, response).is_ok()
         && output.write_all(b"\n").is_ok()
         && output.flush().is_ok()
 }
@@ -219,7 +219,7 @@ unsafe extern "system" fn service_main(_argc: u32, _argv: *mut *mut u16) {
         return;
     }
     let mut status = SERVICE_STATUS {
-        dwServiceType: 0x00000010,
+        dwServiceType: 0x0000_0010,
         dwCurrentState: SERVICE_START_PENDING,
         dwControlsAccepted: 0,
         dwWin32ExitCode: 0,
@@ -229,15 +229,12 @@ unsafe extern "system" fn service_main(_argc: u32, _argv: *mut *mut u16) {
     };
     // SAFETY: handle is registered and status is initialized.
     unsafe { SetServiceStatus(handle, &raw const status) };
-    let mut host = match open_host() {
-        Ok(host) => host,
-        Err(_) => {
-            status.dwCurrentState = SERVICE_STOPPED;
-            status.dwWin32ExitCode = 1;
-            // SAFETY: handle is registered and status is initialized.
-            unsafe { SetServiceStatus(handle, &raw const status) };
-            return;
-        }
+    let Ok(mut host) = open_host() else {
+        status.dwCurrentState = SERVICE_STOPPED;
+        status.dwWin32ExitCode = 1;
+        // SAFETY: handle is registered and status is initialized.
+        unsafe { SetServiceStatus(handle, &raw const status) };
+        return;
     };
     status.dwCurrentState = SERVICE_RUNNING;
     status.dwControlsAccepted = SERVICE_ACCEPT_STOP | SERVICE_ACCEPT_SHUTDOWN;

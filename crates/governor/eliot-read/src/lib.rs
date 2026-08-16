@@ -95,8 +95,8 @@ impl EliotResourceUri {
         }
         if value.len() > 2048 {
             return Err(ReadError::InvalidField {
-                field: "resource_uri",
-                reason: "exceeds 2048 bytes",
+                field: "resource_uri".to_owned(),
+                reason: "exceeds 2048 bytes".to_owned(),
             });
         }
         Ok(Self(value))
@@ -126,8 +126,8 @@ impl ProvenanceHandle {
         text(&value, "provenance_handle")?;
         if value.len() > 4096 {
             return Err(ReadError::InvalidField {
-                field: "provenance_handle",
-                reason: "exceeds 4096 bytes",
+                field: "provenance_handle".to_owned(),
+                reason: "exceeds 4096 bytes".to_owned(),
             });
         }
         Ok(Self(value))
@@ -369,7 +369,12 @@ pub struct ResourceContent {
 pub enum ReadError {
     /// A required field is malformed or out of bounds.
     #[error("invalid read field {field}: {reason}")]
-    InvalidField { field: String, reason: String },
+    InvalidField {
+        /// Name of the malformed field.
+        field: String,
+        /// Validation reason for the malformed field.
+        reason: String,
+    },
     /// A required textual field is blank.
     #[error("{0} must not be empty")]
     EmptyField(String),
@@ -466,6 +471,7 @@ impl<C: CanonicalStoreClient> ReadService<C> {
         self.store
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn execute(
         &self,
         ctx: &RequestMetadata,

@@ -41,6 +41,10 @@ pub struct ScipSymbol {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "SCIP relationship flags are the established public wire projection"
+)]
 pub struct ScipRelationship {
     pub symbol: String,
     pub definition: bool,
@@ -73,6 +77,10 @@ impl ScipIndex {
         Ok(Self { documents })
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "projection order is deterministic and parsing-dependent; keeping it contiguous preserves graph precedence"
+    )]
     pub fn graph_result(
         &self,
         query: &GraphQuery,
@@ -295,7 +303,10 @@ fn decode_relationship(bytes: &[u8]) -> Result<ScipRelationship, ScipError> {
     while let Some((field, wire)) = r.next()? {
         match (field, wire) {
             (1, 2) => symbol = Some(r.text()?),
-            2..=5 if wire == 0 => flags[(field - 2) as usize] = r.varint()? != 0,
+            (2..=5, 0) => {
+                let index = usize::try_from(field - 2).map_err(|_| ScipError::InvalidWire)?;
+                flags[index] = r.varint()? != 0;
+            }
             _ => r.skip(wire)?,
         }
     }
@@ -328,13 +339,15 @@ fn decode_occurrence(bytes: &[u8]) -> Result<ScipOccurrence, ScipError> {
             _ => r.skip(wire)?,
         }
     }
-    if range.len() < 2 || range[0] > u32::MAX as u64 || range[1] > u32::MAX as u64 {
+    if range.len() < 2 {
         return Err(ScipError::InvalidRange);
     }
+    let line = u32::try_from(range[0]).map_err(|_| ScipError::InvalidRange)?;
+    let column = u32::try_from(range[1]).map_err(|_| ScipError::InvalidRange)?;
     Ok(ScipOccurrence {
         symbol: symbol.ok_or(ScipError::MissingField("occurrence.symbol"))?,
-        line: range[0] as u32,
-        column: range[1] as u32,
+        line,
+        column,
         roles,
     })
 }
@@ -355,7 +368,7 @@ impl<'a> Reader<'a> {
             return Ok(None);
         }
         let key = self.varint()?;
-        let field = (key >> 3) as u32;
+        let field = u32::try_from(key >> 3).map_err(|_| ScipError::InvalidWire)?;
         let wire = (key & 7) as u8;
         if field == 0 || wire == 4 {
             return Err(ScipError::InvalidWire);
@@ -367,7 +380,7 @@ impl<'a> Reader<'a> {
         for shift in (0..70).step_by(7) {
             let byte = *self.bytes.get(self.pos).ok_or(ScipError::Truncated)?;
             self.pos += 1;
-            value |= ((byte & 0x7f) as u64) << shift;
+            value |= u64::from(byte & 0x7f) << shift;
             if byte & 0x80 == 0 {
                 return Ok(value);
             }
@@ -375,7 +388,7 @@ impl<'a> Reader<'a> {
         Err(ScipError::VarintOverflow)
     }
     fn bytes(&mut self) -> Result<&'a [u8], ScipError> {
-        let len = self.varint()? as usize;
+        let len = usize::try_from(self.varint()?).map_err(|_| ScipError::FieldTooLarge)?;
         if len > MAX_FIELD_BYTES {
             return Err(ScipError::FieldTooLarge);
         }
@@ -433,4 +446,27 @@ pub enum ScipError {
     InvalidRange,
     #[error("graph contract rejected SCIP projection: {0}")]
     Graph(String),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::decode_relationship;
+
+    #[test]
+    fn relationship_boolean_fields_require_varint_wire_type() -> Result<(), super::ScipError> {
+        let relationship = decode_relationship(&[
+            0x0a, 0x01, b'x', // symbol
+            0x10, 0x01, // definition
+            0x18, 0x00, // reference
+            0x20, 0x01, // implementation
+            0x28, 0x01, // type_definition
+        ])?;
+
+        assert_eq!(relationship.symbol, "x");
+        assert!(relationship.definition);
+        assert!(!relationship.reference);
+        assert!(relationship.implementation);
+        assert!(relationship.type_definition);
+        Ok(())
+    }
 }

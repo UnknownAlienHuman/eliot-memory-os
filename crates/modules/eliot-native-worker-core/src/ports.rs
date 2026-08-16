@@ -12,6 +12,57 @@ use thiserror::Error;
 
 use crate::protocol::{EventAckReceipt, WorkerEventDraft, WorkerEventEnvelope, WorkerHello};
 
+/// A-13's inert post-start binding.  `ProcessRequest` is authority-bearing and
+/// consumed by `ProcessExecutor::start`; this snapshot carries only the
+/// identity needed for later observation, cancellation, reconciliation, and
+/// checkpoint binding.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ProcessBindingSnapshot {
+    operation_id: OperationId,
+    process_tree_id: ProcessTreeId,
+    generation: Generation,
+    executable_sha256: String,
+    fence: FencingToken,
+    request_digest: String,
+}
+
+impl ProcessBindingSnapshot {
+    pub(crate) fn from_request(process: &ProcessRequest) -> Self {
+        Self {
+            operation_id: process.operation_id().clone(),
+            process_tree_id: process.process_tree_id().clone(),
+            generation: process.generation(),
+            executable_sha256: process.executable_sha256().to_owned(),
+            fence: process.fence().clone(),
+            request_digest: process.invocation_digest().to_owned(),
+        }
+    }
+
+    pub(crate) const fn operation_id(&self) -> &OperationId {
+        &self.operation_id
+    }
+
+    pub(crate) const fn process_tree_id(&self) -> &ProcessTreeId {
+        &self.process_tree_id
+    }
+
+    pub(crate) const fn generation(&self) -> Generation {
+        self.generation
+    }
+
+    pub(crate) fn executable_sha256(&self) -> &str {
+        &self.executable_sha256
+    }
+
+    pub(crate) const fn fence(&self) -> &FencingToken {
+        &self.fence
+    }
+
+    pub(crate) fn request_digest(&self) -> &str {
+        &self.request_digest
+    }
+}
+
 /// Opaque provider failure. It carries no authority and is never interpreted as success.
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
 #[error("provider {provider} failed: {detail}")]
@@ -666,7 +717,7 @@ impl DurableCheckpointRequest {
         checkpoint_ref: String,
         request_id: String,
         grant: &CapabilityGrant,
-        process: &ProcessRequest,
+        process: &ProcessBindingSnapshot,
     ) -> Self {
         Self {
             checkpoint_ref,
@@ -677,7 +728,7 @@ impl DurableCheckpointRequest {
             state_fence: grant.authority().state_fence.clone(),
             admission_revision: grant.admission_revision().to_owned(),
             operation_id: process.operation_id().clone(),
-            process_request_digest: process.invocation_digest().to_owned(),
+            process_request_digest: process.request_digest().to_owned(),
         }
     }
 

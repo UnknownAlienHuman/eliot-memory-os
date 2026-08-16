@@ -103,7 +103,7 @@ impl NotificationPort for NotificationPlatform {
 }
 
 impl NotificationComposition {
-    /// Binds notification delivery to one validated WorkScope root.
+    /// Binds notification delivery to one validated `WorkScope` root.
     pub fn new(
         work_root: impl Into<PathBuf>,
         ports: VerificationPorts,
@@ -123,7 +123,7 @@ impl NotificationComposition {
 
     /// Composes the separately registered Watchdog fallback path. It loads
     /// only installer-pinned local verification material and the protected
-    /// one-shot ledger; it never opens the Kernel front door or UserBroker.
+    /// one-shot ledger; it never opens the Kernel front door or `UserBroker`.
     pub fn from_fallback(work_root: impl Into<PathBuf>) -> Result<Self, NotifyBuildError> {
         let work_root = work_root.into();
         let ports = load_fallback_verification_ports(&work_root)?;
@@ -160,7 +160,7 @@ impl NotificationComposition {
     }
 }
 
-/// Resolves the process WorkScope root from the protected ProgramData contour.
+/// Resolves the process `WorkScope` root from the protected `ProgramData` contour.
 pub fn default_work_root() -> Result<PathBuf, std::io::Error> {
     let root = eliot_platform_windows::protected_program_data_path("Eliot/notify")
         .map_err(std::io::Error::other)?;
@@ -211,6 +211,9 @@ impl NotifyKernelExchange for KernelClient {
 }
 
 fn request_identity(request: &NotificationRequest) -> Result<RequestIdentity, KernelClientError> {
+    const MAX_CLOCK_SKEW_MS: u64 = 5_000;
+    const MAX_CLOCK_AGE_MS: u64 = 60_000;
+
     request
         .validate()
         .map_err(|error| KernelClientError::Configuration(error.to_string()))?;
@@ -223,8 +226,6 @@ fn request_identity(request: &NotificationRequest) -> Result<RequestIdentity, Ke
     let now_unix_ms = u64::try_from(now_unix_ms).map_err(|_| {
         KernelClientError::Configuration("host clock exceeds request deadline range".to_owned())
     })?;
-    const MAX_CLOCK_SKEW_MS: u64 = 5_000;
-    const MAX_CLOCK_AGE_MS: u64 = 60_000;
     for observed in [
         request.context.clock.valid_time_ms,
         request.context.clock.known_time_ms,
@@ -246,7 +247,11 @@ fn request_identity(request: &NotificationRequest) -> Result<RequestIdentity, Ke
         }
     }
     let deadline_unix_ms = now_unix_ms
-        .checked_add(Duration::from_secs(30).as_millis() as u64)
+        .checked_add(
+            u64::try_from(Duration::from_secs(30).as_millis()).map_err(|_| {
+                KernelClientError::Configuration("request deadline overflow".to_owned())
+            })?,
+        )
         .ok_or_else(|| KernelClientError::Configuration("request deadline overflow".to_owned()))?;
     let metadata = request.context.clone();
     let identity = RequestIdentity {
@@ -633,8 +638,8 @@ fn decode_hex(value: &str, expected_bytes: usize) -> Option<Vec<u8>> {
         .as_bytes()
         .chunks_exact(2)
         .map(|pair| {
-            let high = (pair[0] as char).to_digit(16)? as u8;
-            let low = (pair[1] as char).to_digit(16)? as u8;
+            let high = u8::try_from((pair[0] as char).to_digit(16)?).ok()?;
+            let low = u8::try_from((pair[1] as char).to_digit(16)?).ok()?;
             Some((high << 4) | low)
         })
         .collect()
@@ -1079,35 +1084,20 @@ impl WatchdogSignaturePort for LocalFallbackWatchdog {
         {
             return PortOutcome::Error(fallback_provider_error(ProviderErrorCode::InvalidRequest));
         }
-        let public_key = match decode_hex(&declaration.public_key, 32)
+        let Some(public_key) = decode_hex(&declaration.public_key, 32)
             .and_then(|bytes| bytes.try_into().ok())
             .and_then(|bytes: [u8; 32]| VerifyingKey::from_bytes(&bytes).ok())
-        {
-            Some(public_key) => public_key,
-            None => {
-                return PortOutcome::Error(fallback_provider_error(
-                    ProviderErrorCode::InvalidRequest,
-                ));
-            }
+        else {
+            return PortOutcome::Error(fallback_provider_error(ProviderErrorCode::InvalidRequest));
         };
-        let signature = match decode_hex(&envelope.signature, 64)
+        let Some(signature) = decode_hex(&envelope.signature, 64)
             .and_then(|bytes| bytes.try_into().ok())
             .map(|bytes: [u8; 64]| Signature::from_bytes(&bytes))
-        {
-            Some(signature) => signature,
-            None => {
-                return PortOutcome::Error(fallback_provider_error(
-                    ProviderErrorCode::InvalidRequest,
-                ));
-            }
+        else {
+            return PortOutcome::Error(fallback_provider_error(ProviderErrorCode::InvalidRequest));
         };
-        let payload = match watchdog_signature_payload(envelope) {
-            Ok(payload) => payload,
-            Err(_) => {
-                return PortOutcome::Error(fallback_provider_error(
-                    ProviderErrorCode::InvalidRequest,
-                ));
-            }
+        let Ok(payload) = watchdog_signature_payload(envelope) else {
+            return PortOutcome::Error(fallback_provider_error(ProviderErrorCode::InvalidRequest));
         };
         if public_key.verify_strict(&payload, &signature).is_err() {
             return PortOutcome::Error(fallback_provider_error(ProviderErrorCode::InvalidRequest));
@@ -1150,21 +1140,11 @@ impl A08AdmissionPort for LocalFallbackAdmission {
             principal: declaration.audience,
             role: eliot_notify_core::RecipientRole::RecoveryPrincipal,
         };
-        let one_shot_key = match request.one_shot_key(&recipient) {
-            Ok(value) => value,
-            Err(_) => {
-                return PortOutcome::Error(fallback_provider_error(
-                    ProviderErrorCode::InvalidRequest,
-                ));
-            }
+        let Ok(one_shot_key) = request.one_shot_key(&recipient) else {
+            return PortOutcome::Error(fallback_provider_error(ProviderErrorCode::InvalidRequest));
         };
-        let artifact_digest = match request.admission_artifact_digest(&recipient) {
-            Ok(value) => value,
-            Err(_) => {
-                return PortOutcome::Error(fallback_provider_error(
-                    ProviderErrorCode::InvalidRequest,
-                ));
-            }
+        let Ok(artifact_digest) = request.admission_artifact_digest(&recipient) else {
+            return PortOutcome::Error(fallback_provider_error(ProviderErrorCode::InvalidRequest));
         };
         let receipt = match issue_fallback_receipt(
             request.platform_request,
@@ -1390,6 +1370,10 @@ impl LocalFallbackLedger {
         self.state.poisoned_keys.insert(key.to_owned());
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "ordered persistence preserves the fallback ledger's compare-and-swap and poison-state transitions"
+    )]
     fn persist(
         &mut self,
         previous: &FallbackLedgerSnapshot,
@@ -1461,13 +1445,11 @@ impl LocalFallbackLedger {
         let durable_previous = if previous_bytes.is_empty() {
             FallbackLedgerSnapshot::default()
         } else {
-            match serde_json::from_slice(&previous_bytes) {
-                Ok(state) => state,
-                Err(_) => {
-                    self.lease = None;
-                    return Err(fallback_provider_error(ProviderErrorCode::Unavailable));
-                }
-            }
+            let Ok(state) = serde_json::from_slice(&previous_bytes) else {
+                self.lease = None;
+                return Err(fallback_provider_error(ProviderErrorCode::Unavailable));
+            };
+            state
         };
         if durable_previous != *previous {
             self.poison_key(key);
@@ -1497,13 +1479,11 @@ impl LocalFallbackLedger {
         let current = if current_bytes.is_empty() {
             FallbackLedgerSnapshot::default()
         } else {
-            match serde_json::from_slice(&current_bytes) {
-                Ok(current) => current,
-                Err(_) => {
-                    self.poison_key(key);
-                    return Err(fallback_provider_error(ProviderErrorCode::Unavailable));
-                }
-            }
+            let Ok(current) = serde_json::from_slice(&current_bytes) else {
+                self.poison_key(key);
+                return Err(fallback_provider_error(ProviderErrorCode::Unavailable));
+            };
+            current
         };
         if current == self.state {
             return Ok(match publication {
@@ -1534,12 +1514,9 @@ impl LocalFallbackLedger {
     }
 
     fn read_current_bytes_after_publication(&mut self) -> Result<Vec<u8>, PortError> {
-        let lease = match ProtectedPathLease::open_or_create(&self.relative) {
-            Ok(lease) => lease,
-            Err(_) => {
-                self.lease = None;
-                return Err(fallback_provider_error(ProviderErrorCode::Unavailable));
-            }
+        let Ok(lease) = ProtectedPathLease::open_or_create(&self.relative) else {
+            self.lease = None;
+            return Err(fallback_provider_error(ProviderErrorCode::Unavailable));
         };
         let result = lease
             .verify_stable_identity()
@@ -1584,11 +1561,11 @@ impl OneShotLedgerPort for LocalFallbackLedger {
             );
         }
         let previous = self.state.clone();
-        let (reservation_id, reservation_id_handle) =
-            match allocate_reservation_id(&mut self.state.next_reservation) {
-                Some(value) => value,
-                None => return LedgerReserveOutcome::Unavailable,
-            };
+        let Some((reservation_id, reservation_id_handle)) =
+            allocate_reservation_id(&mut self.state.next_reservation)
+        else {
+            return LedgerReserveOutcome::Unavailable;
+        };
         self.state.entries.insert(
             key.clone(),
             FallbackLedgerEntry {
@@ -1698,6 +1675,11 @@ fn load_fallback_verification_ports(root: &Path) -> Result<VerificationPorts, No
 
 #[cfg(test)]
 mod tests {
+    #![allow(
+        clippy::unwrap_used,
+        reason = "notification protocol tests use unwrap for fixed-valid fixture construction"
+    )]
+
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
 
@@ -1983,7 +1965,13 @@ mod tests {
     }
 
     fn encode_hex(bytes: &[u8]) -> String {
-        bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+        use std::fmt::Write as _;
+
+        let mut encoded = String::with_capacity(bytes.len().saturating_mul(2));
+        for byte in bytes {
+            let _ = write!(encoded, "{byte:02x}");
+        }
+        encoded
     }
 
     fn rebound_request(
@@ -2015,9 +2003,11 @@ mod tests {
         )
     }
 
+    type MemoryFallbackState = Arc<Mutex<BTreeMap<String, (String, Option<DeliveryObservation>)>>>;
+
     #[derive(Clone, Default)]
     struct MemoryFallbackLedger {
-        state: Arc<Mutex<BTreeMap<String, (String, Option<DeliveryObservation>)>>>,
+        state: MemoryFallbackState,
     }
 
     impl OneShotLedgerPort for MemoryFallbackLedger {
@@ -2254,7 +2244,7 @@ mod tests {
                     changed.context.request_id = serde_json::from_value(serde_json::json!(
                         "watchdog-replay-under-new-request-id"
                     ))
-                    .unwrap()
+                    .unwrap();
                 }
                 _ => unreachable!(),
             }

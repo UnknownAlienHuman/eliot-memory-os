@@ -1,7 +1,7 @@
 //! Private versioned named-operation WebSocket/RPC transport.
 //!
 //! This module owns the credential-bearing socket and the wire codec.  It is
-//! intentionally independent of a SurrealDB SDK: the provider is reached only
+//! intentionally independent of a `SurrealDB` SDK: the provider is reached only
 //! through the server's JSON WebSocket endpoint, while the adapter supplies a
 //! closed operation name and parameter map for every request.  No transport,
 //! RPC response or provider type crosses the S-03 boundary.
@@ -84,7 +84,7 @@ pub(crate) async fn query(
 }
 
 impl RpcResults {
-    fn from_value(value: Value) -> Result<Self, AdapterError> {
+    fn from_value(value: &Value) -> Result<Self, AdapterError> {
         let statements = value.as_array().ok_or_else(|| {
             AdapterError::Serialization("RPC query result was not an array".to_owned())
         })?;
@@ -217,7 +217,7 @@ impl RpcTransport {
         Ok(())
     }
 
-    /// Executes one closed named operation using SurrealDB's parameterized
+    /// Executes one closed named operation using `SurrealDB`'s parameterized
     /// `query` RPC.  The statement is private schema data; callers provide a
     /// name and bindings rather than a provider client or query result type.
     pub(crate) async fn query(
@@ -233,7 +233,7 @@ impl RpcTransport {
                 json!([statement, Value::Object(bindings)]),
             )
             .await?;
-        RpcResults::from_value(value)
+        RpcResults::from_value(&value)
     }
 
     async fn request(
@@ -336,11 +336,13 @@ const fn millis(ms: u64) -> Duration {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::expect_used)]
+
     use super::*;
 
     #[test]
     fn query_results_keep_statement_order_and_errors() {
-        let mut results = RpcResults::from_value(json!([
+        let mut results = RpcResults::from_value(&json!([
             {"status": "OK", "result": [1, 2]},
             {"status": "ERR", "result": "cas failed"}
         ]))

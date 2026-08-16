@@ -31,8 +31,8 @@ pub enum EpistemicError {
     FenceMismatch { handle: ArtifactId },
     #[error("requested state fence is invalid")]
     InvalidFence,
-    #[error("record {handle} has invalid evidence: {source}")]
-    InvalidEvidence { handle: ArtifactId, source: String },
+    #[error("record {handle} has invalid evidence: {reason}")]
+    InvalidEvidence { handle: ArtifactId, reason: String },
     #[error("inquiry {0} must be non-blank")]
     InvalidInquiry(String),
 }
@@ -96,7 +96,7 @@ impl EpistemicRecord {
             .validate()
             .map_err(|source| EpistemicError::InvalidEvidence {
                 handle: self.handle.clone(),
-                source: source.to_string(),
+                reason: source.to_string(),
             })?;
         if let Some(note) = &self.note {
             text(note, "record.note")?;
@@ -228,7 +228,7 @@ pub fn resolve(request: &PositionRequest) -> Result<CurrentEpistemicPosition, Ep
     if current.is_empty() {
         unknowns.insert(request.question.clone());
     }
-    let state = if !rivals.is_empty() {
+    let position_state = if !rivals.is_empty() {
         PositionState::Conflicted
     } else if !supporting.is_empty() {
         PositionState::Supported
@@ -240,7 +240,7 @@ pub fn resolve(request: &PositionRequest) -> Result<CurrentEpistemicPosition, Ep
         PositionState::Unknown
     };
     if matches!(
-        state,
+        position_state,
         PositionState::Conflicted | PositionState::Stale | PositionState::Unknown
     ) {
         inquiries.insert("perform the cheapest discriminative inquiry".to_owned());
@@ -257,7 +257,7 @@ pub fn resolve(request: &PositionRequest) -> Result<CurrentEpistemicPosition, Ep
         question: request.question.clone(),
         scope: request.scope.clone(),
         state_fence: request.state_fence.clone(),
-        state,
+        state: position_state,
         direct_observations: direct.into_iter().collect(),
         supporting_records: supporting.into_iter().collect(),
         rival_records: rivals.into_iter().collect(),
@@ -299,12 +299,13 @@ fn provenance_for(
         }
         assertability = lowest_assertability(assertability, record.evidence.assertability);
     }
+    let mixed_sources = sources_len(records, &selected) > 1;
     ProvenanceView {
         record_handles: selected.into_iter().collect(),
         source_ids: sources.into_iter().collect(),
         raw_handles: raw.into_iter().collect(),
         revisions: revisions.into_iter().collect(),
-        mixed_sources: sources_len(records, &selected) > 1,
+        mixed_sources,
         assertability,
     }
 }

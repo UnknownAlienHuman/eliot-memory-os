@@ -259,12 +259,10 @@ fn map_platform_error(error: eliot_platform_windows::WindowsAdapterError) -> Tra
         },
         WindowsAdapterError::Timeout => TransportError::Timeout,
         WindowsAdapterError::InvalidInput => TransportError::InvalidPipeName,
-        WindowsAdapterError::NotFound | WindowsAdapterError::AlreadyExists => {
-            TransportError::Io(error.to_string())
-        }
-        WindowsAdapterError::PermissionDenied | WindowsAdapterError::Failed => {
-            TransportError::Io(error.to_string())
-        }
+        WindowsAdapterError::NotFound
+        | WindowsAdapterError::AlreadyExists
+        | WindowsAdapterError::PermissionDenied
+        | WindowsAdapterError::Failed => TransportError::Io(error.to_string()),
     }
 }
 
@@ -389,11 +387,11 @@ pub struct HandshakeResult {
     pub effects: Vec<String>,
 }
 
-/// Encodes the typed ClientHello on the authenticated EBP control lane.
+/// Encodes the typed `ClientHello` on the authenticated EBP control lane.
 ///
 /// The authentication preface is deliberately separate from this frame. A
 /// caller must first pass the platform identity boundary, then send exactly
-/// one Control/Start frame containing the validated ClientHello JSON.
+/// one Control/Start frame containing the validated `ClientHello` JSON.
 pub fn client_hello_frame(
     connection_id: impl Into<String>,
     client: &ClientHello,
@@ -407,7 +405,7 @@ pub fn client_hello_frame(
     )
 }
 
-/// Decodes and validates a typed ClientHello from an authenticated EBP frame.
+/// Decodes and validates a typed `ClientHello` from an authenticated EBP frame.
 pub fn decode_client_hello_frame(
     frame: &Frame,
     expected_connection_id: &str,
@@ -424,7 +422,7 @@ pub fn decode_client_hello_frame(
     Ok(client)
 }
 
-/// Decodes a ClientHello before its client-selected connection identity has
+/// Decodes a `ClientHello` before its client-selected connection identity has
 /// been admitted by the server.
 ///
 /// The authenticated peer and server handshake policy remain independent
@@ -438,7 +436,7 @@ pub fn decode_client_hello_frame_unbound(frame: &Frame) -> Result<ClientHello, T
     Ok(client)
 }
 
-/// Encodes the server-authoritative typed ServerHello on the control lane.
+/// Encodes the server-authoritative typed `ServerHello` on the control lane.
 pub fn server_hello_frame(
     connection_id: impl Into<String>,
     server: &ServerHello,
@@ -452,7 +450,7 @@ pub fn server_hello_frame(
     )
 }
 
-/// Decodes and validates a typed ServerHello from an authenticated EBP frame.
+/// Decodes and validates a typed `ServerHello` from an authenticated EBP frame.
 pub fn decode_server_hello_frame(
     frame: &Frame,
     expected_connection_id: &str,

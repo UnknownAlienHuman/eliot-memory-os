@@ -1,7 +1,7 @@
 //! Rebuildable change observations and deterministic historical-anchor
 //! resolution.
 //!
-//! ChangeMonitor is an observation/projection component.  It does not watch a
+//! `ChangeMonitor` is an observation/projection component.  It does not watch a
 //! filesystem, open Git, execute tools, persist canonical history, or infer
 //! causal authority.  Adapters submit bounded observations; this crate
 //! validates, deduplicates, projects, and resolves them against explicit
@@ -72,15 +72,10 @@ impl From<ContractError> for ChangeMonitorError {
 }
 
 impl From<eliot_agent_contracts::ContractError> for ChangeMonitorError {
-    fn from(error: eliot_agent_contracts::ContractError) -> Self {
+    fn from(_error: eliot_agent_contracts::ContractError) -> Self {
         // Agent contract errors intentionally remain distinct at their own
         // surface; this projection exposes only a stable invalid-anchor class.
-        match error {
-            eliot_agent_contracts::ContractError::AmbiguousAnchor
-            | eliot_agent_contracts::ContractError::UnusableAnchor
-            | eliot_agent_contracts::ContractError::InvalidReference => Self::InvalidAnchor,
-            _ => Self::InvalidAnchor,
-        }
+        Self::InvalidAnchor
     }
 }
 
@@ -349,7 +344,7 @@ pub struct ObservationAdmission {
     pub invalidation_dependencies: Vec<String>,
 }
 
-/// Immutable record held by the rebuildable ChangeMonitor projection.
+/// Immutable record held by the rebuildable `ChangeMonitor` projection.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ObservedChangeRecord {
@@ -359,7 +354,7 @@ pub struct ObservedChangeRecord {
     pub observation_digest: String,
 }
 
-/// Rebuildable ChangeMonitor view.  It can be reconstructed from observation
+/// Rebuildable `ChangeMonitor` view.  It can be reconstructed from observation
 /// records and does not supersede canonical source history.
 #[derive(Clone, Debug, Default, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -512,6 +507,10 @@ pub struct EvolvingAnchorResolver;
 
 impl EvolvingAnchorResolver {
     /// Resolves one historical anchor without nearest-neighbour attachment.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "resolution order is priority-sensitive and kept contiguous to preserve deterministic status precedence"
+    )]
     pub fn resolve(
         &self,
         original: &AnchorReference,
@@ -673,7 +672,7 @@ impl ProvenanceEdge {
     }
 }
 
-/// Rebuildable bidirectional view consumed by CodeCortex and review surfaces.
+/// Rebuildable bidirectional view consumed by `CodeCortex` and review surfaces.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ChangeProvenanceView {

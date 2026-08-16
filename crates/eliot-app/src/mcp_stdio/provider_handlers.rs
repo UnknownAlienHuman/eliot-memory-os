@@ -20,10 +20,98 @@ async fn dispatch_codecortex_scan(state: &McpState, arguments: Value) -> Result<
         max_matches_per_pattern: input.max_matches_per_pattern.unwrap_or(24),
         include_diagnostics: input.include_diagnostics.unwrap_or(true),
     };
-    let mut report = CodeCortexService::new(std::env::current_dir()?).scan(&request)?;
+    let project_root = resolve_codecortex_repo_root(
+        &state.root,
+        None,
+    )?;
+    let mut report = CodeCortexService::new(project_root).scan(&request)?;
     write_codecortex_report_to_memory(state, &mut report).await?;
     write_json_report(&codecortex_latest_path(&state.root), &report)?;
     serde_json::to_value(report).map_err(Into::into)
+}
+
+const GOVERNOR_REPO_ROOT_ENV: &str = "ELIOT_GOVERNOR_REPO_ROOT";
+
+/// Resolve the physical source checkout for `CodeCortex`. Runtime data, the
+/// process working directory, and installed plugin/cache paths are not source
+/// authority. Existing governed scopes win; the environment contract is only
+/// a fallback and is validated against the live Git checkout.
+fn resolve_codecortex_repo_root(
+    _runtime_root: &Path,
+    task_contract: Option<&TaskContract>,
+) -> Result<PathBuf> {
+    let explicit_scope = task_contract.and_then(|task_contract| {
+        if !matches!(
+            task_contract.status,
+            TaskContractStatus::Active | TaskContractStatus::DoneVerified
+        ) {
+            return None;
+        }
+        let provenance = task_contract.action_provenance.as_ref()?;
+        if provenance.task_id != task_contract.task_id {
+            return None;
+        }
+        Some(provenance)
+    })
+    .and_then(|provenance| {
+            if provenance.source_scope.kind != "git_worktree" {
+                return None;
+            }
+            let mut material = provenance.clone();
+            let expected_hash = material.hash.clone();
+            material.hash.clear();
+            if canonical_struct_hash(&material).ok().as_deref() != Some(expected_hash.as_str()) {
+                return None;
+            }
+            provenance.source_scope.worktree_ref.as_deref()
+        })
+        .map(PathBuf::from);
+    let configured_root = std::env::var_os(GOVERNOR_REPO_ROOT_ENV).map(PathBuf::from);
+    resolve_codecortex_repo_root_from_sources(
+        explicit_scope.as_deref(),
+        configured_root.as_deref(),
+    )
+}
+
+fn resolve_codecortex_repo_root_from_sources(
+    explicit_scope: Option<&Path>,
+    configured_root: Option<&Path>,
+) -> Result<PathBuf> {
+    let candidate = explicit_scope
+        .or(configured_root)
+        .context("CodeCortex requires a governed scope or ELIOT_GOVERNOR_REPO_ROOT")?;
+    let canonical = std::fs::canonicalize(candidate).with_context(|| {
+        format!(
+            "CodeCortex trusted repo root does not resolve: {}",
+            candidate.display()
+        )
+    })?;
+    anyhow::ensure!(
+        canonical.is_dir() && canonical.join("Cargo.toml").is_file(),
+        "CodeCortex trusted repo root must be a Cargo checkout: {}",
+        canonical.display()
+    );
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(&canonical)
+        .args(["rev-parse", "--show-toplevel"])
+        .output()
+        .context("validate CodeCortex trusted repo root with git")?;
+    anyhow::ensure!(
+        output.status.success(),
+        "CodeCortex trusted repo root is not a Git checkout: {}",
+        canonical.display()
+    );
+    let git_root = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    let canonical_git_root = std::fs::canonicalize(&git_root).with_context(|| {
+        format!("canonicalize Git root returned for {}", canonical.display())
+    })?;
+    anyhow::ensure!(
+        canonical_git_root == canonical,
+        "CodeCortex trusted repo root differs from Git root: {}",
+        canonical.display()
+    );
+    Ok(canonical)
 }
 
 fn dispatch_codecortex_latest(state: &McpState) -> Result<Value> {

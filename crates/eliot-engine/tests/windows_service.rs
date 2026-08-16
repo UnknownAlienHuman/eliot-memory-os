@@ -176,13 +176,21 @@ fn h1_restart_budget_opens_incident_on_exhaustion() {
 
     let first = budget.record_failure("EliotGovernor", ServiceRestartReason::DbHealthFailed);
     let second = budget.record_failure("EliotGovernor", ServiceRestartReason::DbHealthFailed);
+    let exhausted = budget.record_failure("EliotGovernor", ServiceRestartReason::DbHealthFailed);
 
     assert_eq!(first.status, ServiceRestartStatus::Attempted);
+    assert_eq!(first.attempt_number, 1);
+    assert_eq!(first.budget_remaining, 1);
+    assert_eq!(second.status, ServiceRestartStatus::Attempted);
+    assert_eq!(second.attempt_number, 2);
+    assert_eq!(second.budget_remaining, 0);
     assert_eq!(
-        second.status,
+        exhausted.status,
         ServiceRestartStatus::BudgetExhaustedIncidentOpened
     );
-    assert!(second.incident_ref.is_some());
+    assert_eq!(exhausted.attempt_number, 3);
+    assert_eq!(exhausted.budget_remaining, 0);
+    assert!(exhausted.incident_ref.is_some());
 }
 
 #[test]

@@ -178,13 +178,13 @@ impl CodeGraphOwner {
     pub fn query(&self, query: &GraphQuery) -> Result<GraphQueryResult, CodeGraphError> {
         query.validate()?;
         let current = self.revision();
-        if let Some(expected) = query.expected_revision {
-            if expected != current {
-                return Err(CodeGraphError::RevisionMismatch {
-                    expected: expected.value(),
-                    actual: current.value(),
-                });
-            }
+        if let Some(expected) = query.expected_revision
+            && expected != current
+        {
+            return Err(CodeGraphError::RevisionMismatch {
+                expected: expected.value(),
+                actual: current.value(),
+            });
         }
         let projections = self
             .state

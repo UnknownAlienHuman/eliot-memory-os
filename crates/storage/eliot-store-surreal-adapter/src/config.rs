@@ -1,4 +1,4 @@
-//! Connection, credential and schema-generation configuration for the SurrealDB
+//! Connection, credential and schema-generation configuration for the `SurrealDB`
 //! store bridge.
 //!
 //! The credential is held as a [`secrecy::SecretString`] and is never placed in
@@ -12,7 +12,7 @@ use secrecy::SecretString;
 
 /// Stable identity of this adapter surface.
 pub const ADAPTER_NAME: &str = "eliot.storage.store-surreal-adapter";
-/// SurrealDB major version admitted by the pinned adapter/query surface.
+/// `SurrealDB` major version admitted by the pinned adapter/query surface.
 pub const PINNED_SURREALDB_MAJOR: u16 = 3;
 
 /// Non-blank, non-control-character schema generation identifier.
@@ -48,27 +48,27 @@ pub enum SchemaGenerationError {
     Invalid,
 }
 
-/// Connection and credential settings for the sole SurrealDB client owner.
+/// Connection and credential settings for the sole `SurrealDB` client owner.
 ///
 /// The password is the only credential value held by this crate. It is redacted
 /// by [`secrecy::SecretString`] in debug formatting and is never serialized.
 #[derive(Clone)]
 pub struct SurrealAdapterConfig {
-    /// SurrealDB WebSocket endpoint, for example `ws://127.0.0.1:18000/rpc`.
+    /// `SurrealDB` WebSocket endpoint, for example `ws://127.0.0.1:18000/rpc`.
     pub endpoint: String,
-    /// SurrealDB namespace.
+    /// `SurrealDB` namespace.
     pub namespace: String,
-    /// SurrealDB database.
+    /// `SurrealDB` database.
     pub database: String,
-    /// SurrealDB username used for sign-in.
+    /// `SurrealDB` username used for sign-in.
     pub username: String,
-    /// SurrealDB password credential, held opaque and redacted.
+    /// `SurrealDB` password credential, held opaque and redacted.
     pub password: SecretString,
     /// Connect deadline in milliseconds.
     pub connect_timeout_ms: u64,
     /// Query deadline in milliseconds.
     pub query_timeout_ms: u64,
-    /// SurrealDB server major version required by the pinned query surface.
+    /// `SurrealDB` server major version required by the pinned query surface.
     pub expected_provider_major: u16,
     /// Schema generation this bridge expects the database to be migrated to.
     pub expected_schema_generation: SchemaGeneration,
@@ -139,6 +139,8 @@ pub enum ConfigError {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::expect_used)]
+
     use secrecy::SecretString;
 
     use super::*;

@@ -153,7 +153,7 @@ pub struct CanonicalWriteEnvelope {
     pub request: RequestMetadata,
     /// Stable logical retry identity.
     pub idempotency_key: String,
-    /// WorkScope addressed by the transition.
+    /// `WorkScope` addressed by the transition.
     pub scope_id: ScopeId,
     /// Optional task binding; unbound capture remains cold evidence.
     pub task_id: Option<String>,
@@ -312,12 +312,12 @@ impl CanonicalWriteEnvelope {
     }
 }
 
-/// Rebuildable canonical state view for one WorkScope.  It is a projection,
+/// Rebuildable canonical state view for one `WorkScope`.  It is a projection,
 /// not a second mutable store or a source of authority.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CanonicalState {
-    /// Addressed WorkScope.
+    /// Addressed `WorkScope`.
     pub scope_id: ScopeId,
     /// Coherent revision and ordering projection.
     pub revision_view: ScopeRevisionView,
@@ -751,6 +751,7 @@ pub struct FinishDecision {
 }
 
 /// Derives the closed finish decision from strict input and rehydrated state.
+#[allow(clippy::too_many_lines)]
 pub fn derive_finish_decision(
     draft: &FinishAttemptDraft,
     evidence: &FinishEvidence,
@@ -824,11 +825,12 @@ pub fn derive_finish_decision(
         RequestedFinishOutcome::CompleteCandidate if !unresolved.is_empty() => {
             FinishDecisionOutcome::Blocked
         }
-        RequestedFinishOutcome::CompleteCandidate => FinishDecisionOutcome::DegradedNoProof,
+        RequestedFinishOutcome::CompleteCandidate | RequestedFinishOutcome::DegradedNoProof => {
+            FinishDecisionOutcome::DegradedNoProof
+        }
         RequestedFinishOutcome::Partial => FinishDecisionOutcome::Partial,
         RequestedFinishOutcome::Blocked => FinishDecisionOutcome::Blocked,
         RequestedFinishOutcome::FailedVerification => FinishDecisionOutcome::FailedVerification,
-        RequestedFinishOutcome::DegradedNoProof => FinishDecisionOutcome::DegradedNoProof,
         RequestedFinishOutcome::UnsafeToFinish => FinishDecisionOutcome::UnsafeToFinish,
         RequestedFinishOutcome::Cancelled => FinishDecisionOutcome::Cancelled,
         RequestedFinishOutcome::Superseded => FinishDecisionOutcome::Superseded,

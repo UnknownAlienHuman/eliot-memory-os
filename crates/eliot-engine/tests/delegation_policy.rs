@@ -462,7 +462,9 @@ fn delegation_no_raw_provider_surface() {
     let source = include_str!("../../eliot-app/src/delegation_runtime.rs");
     assert!(!source.contains("raw_argv"));
     assert!(!source.contains("run_gemini"));
-    assert_eq!(source.matches("AntigravityRunner.run_real").count(), 1);
+    assert!(!source.contains(".run_real("));
+    assert!(!source.contains(".run_real_recorded("));
+    assert_eq!(source.matches(".run_real_recorded_supervised(").count(), 1);
 }
 
 #[test]

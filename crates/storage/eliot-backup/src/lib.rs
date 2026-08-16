@@ -158,14 +158,14 @@ impl ExportFence {
             "revision_heads",
         )?;
         for head in &self.revision_heads {
-            head.validate()?;
+            head.validate().map_err(BackupError::Store)?;
         }
         unique(
             self.ordering_heads.iter().map(|head| head.scope.clone()),
             "ordering_heads",
         )?;
         for head in &self.ordering_heads {
-            head.validate()?;
+            head.validate().map_err(BackupError::Store)?;
         }
         unique(
             self.blob_reachability_manifest.iter().cloned(),
@@ -456,7 +456,7 @@ impl EncryptionSummary {
     }
 }
 
-/// ECXF manifest. Section checksums and integrity_sha256 bind the export.
+/// ECXF manifest. Section checksums and `integrity_sha256` bind the export.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct EcxfManifest {
@@ -581,6 +581,7 @@ impl BackupBundle {
     }
 
     /// Revalidates all integrity, fence, class, purge, and manifest rules.
+    #[allow(clippy::too_many_lines)]
     pub fn validate(&self) -> Result<(), BackupError> {
         self.manifest.validate_shape()?;
         self.export_fence.validate()?;
@@ -802,6 +803,7 @@ fn validate_receipts(
 }
 
 fn validate_class_requirements(bundle: &BackupBundle) -> Result<(), BackupError> {
+    const REQUIRED: [&str; 4] = ["config", "policy", "module", "host_dependency_build"];
     match bundle.manifest.class {
         BackupClass::FullRecovery => {
             if bundle.ors_snapshot.is_none() {
@@ -810,7 +812,6 @@ fn validate_class_requirements(bundle: &BackupBundle) -> Result<(), BackupError>
             if bundle.watchdog_spool.is_none() {
                 return Err(BackupError::MissingRecoveryComponent("watchdog_spool"));
             }
-            const REQUIRED: [&str; 4] = ["config", "policy", "module", "host_dependency_build"];
             for required in REQUIRED {
                 if !bundle
                     .artifacts
@@ -824,12 +825,7 @@ fn validate_class_requirements(bundle: &BackupBundle) -> Result<(), BackupError>
                 return Err(BackupError::FullRecoveryHasGaps);
             }
         }
-        BackupClass::CanonicalOnlyDegraded => {
-            if bundle.ors_snapshot.is_some() {
-                return Err(BackupError::UnexpectedRecoveryComponent("ors_snapshot"));
-            }
-        }
-        BackupClass::ScopeExport => {
+        BackupClass::CanonicalOnlyDegraded | BackupClass::ScopeExport => {
             if bundle.ors_snapshot.is_some() {
                 return Err(BackupError::UnexpectedRecoveryComponent("ors_snapshot"));
             }
@@ -1008,6 +1004,7 @@ impl RestorePlan {
 /// Evidence returned by the isolated target after all restore steps complete.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[allow(clippy::struct_excessive_bools)]
 pub struct RestoreEvidence {
     pub target_id: String,
     pub isolated_root: bool,

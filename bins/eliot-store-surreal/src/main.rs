@@ -13,8 +13,11 @@ use eliot_store_surreal::{
 };
 
 #[tokio::main]
+// This standalone service has no initialized telemetry sink before startup;
+// stderr is the only fail-closed launch diagnostic available to its supervisor.
+#[allow(clippy::print_stderr)]
 async fn main() {
-    if let Err(error) = run().await {
+    if let Err(error) = Box::pin(run()).await {
         eprintln!("{SERVICE_NAME}: {error}");
         std::process::exit(1);
     }
@@ -24,7 +27,7 @@ async fn main() {
 async fn run() -> Result<(), String> {
     let config_path = parse_config_path()?;
     let config = load_config(Some(&config_path))?;
-    let composition = StoreComposition::new(config.clone())?;
+    let composition = StoreComposition::new(&config)?;
 
     let limits = TransportLimits::default();
     let expectation = eliot_platform_windows::NamedPipePeerExpectation::new(
@@ -62,7 +65,8 @@ async fn run() -> Result<(), String> {
         session.connection_id(),
         session.protocol_version(),
         MessageType::Ready,
-        serde_json::to_value(server_hello).expect("server hello is serializable"),
+        serde_json::to_value(server_hello)
+            .map_err(|error| format!("serialize ServerHello: {error}"))?,
     );
     server
         .send_frame(&handshake_frame, negotiated_limits)

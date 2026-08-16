@@ -15,14 +15,14 @@ use std::sync::{Arc, Mutex};
 
 use eliot_agent_api::{AuthorizedEffect, ProposedEffect};
 use eliot_process::{
-    CancellationStatus, EvidenceSinkError, PROCESS_CONTRACT_SCHEMA_VERSION, ProcessEvidence,
-    ProcessEvidenceSink, ProcessExecutionError, ProcessExecutionView, ProcessExecutor,
-    ProcessLifecycle, ProcessRequest, ProcessStartReceipt,
+    CancellationStatus, EvidenceSinkError, FencingToken, OperationId,
+    PROCESS_CONTRACT_SCHEMA_VERSION, ProcessEvidence, ProcessEvidenceSink, ProcessExecutionError,
+    ProcessExecutionView, ProcessExecutor, ProcessLifecycle, ProcessRequest, ProcessStartReceipt,
 };
 use eliot_receipts::{ProofCeiling, ReceiptDisposition};
 use thiserror::Error;
 
-use ports::{AdmissionLiveness, CapabilityGrant, EffectAdmissionGrant};
+use ports::{AdmissionLiveness, CapabilityGrant, EffectAdmissionGrant, ProcessBindingSnapshot};
 pub use ports::{
     AdmissionLivenessFacts, AdmissionLivenessOutcome, CapabilityAdmissionFacts,
     CapabilityAdmissionOutcome, CapabilityAdmissionPort, CapabilityAdmissionRequest,
@@ -149,7 +149,7 @@ pub struct WorkerCore<E, A, R, C> {
     evidence_sink: Option<Arc<dyn ProcessEvidenceSink>>,
     lifecycle: WorkerLifecycle,
     grant: Option<CapabilityGrant>,
-    process_request: Option<ProcessRequest>,
+    process_binding: Option<ProcessBindingSnapshot>,
     process_start_receipt: Option<ProcessStartReceipt>,
     connection_id: Option<String>,
     last_event_id: Option<String>,
@@ -179,7 +179,7 @@ where
             evidence_sink,
             lifecycle: WorkerLifecycle::Created,
             grant: None,
-            process_request: None,
+            process_binding: None,
             process_start_receipt: None,
             connection_id: None,
             last_event_id: None,
@@ -249,6 +249,7 @@ where
             }
         };
         validate_grant(&grant, &hello, &process)?;
+        let process_binding = ProcessBindingSnapshot::from_request(&process);
 
         self.transition(WorkerLifecycle::Starting)?;
         let observing_sink = Arc::new(ObservingEvidenceSink::new(evidence_sink));
@@ -260,13 +261,13 @@ where
                 code: PROCESS_PROVIDER_PLAN_GAP,
                 detail: "P-03 ProcessExecutor was not injected",
             })?
-            .start(process.clone(), process_sink)
+            .start(process, process_sink)
             .await;
 
         let receipt = match start_result {
             Ok(receipt) => receipt,
             Err(ProcessExecutionError::UnknownOutcome) => {
-                self.install_binding(&hello, grant, process);
+                self.install_binding(&hello, grant, process_binding);
                 self.transition(WorkerLifecycle::UnknownOutcome)?;
                 let _ = self.append_from_hello(
                     &hello,
@@ -292,11 +293,11 @@ where
                 return Err(WorkerError::Process(error.to_string()));
             }
         };
-        if let Err(error) = validate_start_receipt(&receipt, &process) {
+        if let Err(error) = validate_start_receipt(&receipt, &process_binding) {
             return self.reject_start_proof(
                 &hello,
                 grant,
-                process,
+                process_binding.clone(),
                 "process start receipt did not bind the admitted request",
                 error,
             );
@@ -307,7 +308,7 @@ where
             return self.reject_start_proof(
                 &hello,
                 grant,
-                process,
+                process_binding.clone(),
                 "P-03 start produced no observed process evidence",
                 WorkerError::PlanGap {
                     code: PROCESS_EVIDENCE_PLAN_GAP,
@@ -322,7 +323,7 @@ where
                 code: PROCESS_PROVIDER_PLAN_GAP,
                 detail: "P-03 ProcessExecutor was not injected",
             })?
-            .inspect(process.operation_id().clone())
+            .inspect(process_binding.operation_id().clone())
             .await
         {
             Ok(view) => view,
@@ -331,23 +332,24 @@ where
                 return self.reject_start_proof(
                     &hello,
                     grant,
-                    process,
+                    process_binding.clone(),
                     "P-03 readiness inspection was unavailable or unknown",
                     error,
                 );
             }
         };
-        if let Err(error) = validate_start_proof(&receipt, &observed, &inspected, &process) {
+        if let Err(error) = validate_start_proof(&receipt, &observed, &inspected, &process_binding)
+        {
             return self.reject_start_proof(
                 &hello,
                 grant,
-                process,
+                process_binding.clone(),
                 "P-03 evidence or inspection did not bind readiness",
                 error,
             );
         }
 
-        self.install_binding(&hello, grant, process);
+        self.install_binding(&hello, grant, process_binding);
         self.process_start_receipt = Some(receipt.clone());
         self.transition(WorkerLifecycle::Ready)?;
         let ready_event = self.append_from_hello(
@@ -413,6 +415,7 @@ where
             }
         };
         validate_grant(&grant, &hello, &process)?;
+        let process_binding = ProcessBindingSnapshot::from_request(&process);
         let view = self
             .executor
             .as_ref()
@@ -420,16 +423,16 @@ where
                 code: PROCESS_PROVIDER_PLAN_GAP,
                 detail: "P-03 ProcessExecutor was not injected",
             })?
-            .inspect(process.operation_id().clone())
+            .inspect(process_binding.operation_id().clone())
             .await
             .map_err(map_process_error)?;
         validate_process_evidence_binding(
             view.operation_id(),
             view.request_digest(),
             view.fence(),
-            &process,
+            &process_binding,
         )?;
-        validate_recovered_process_view(&view, &process)?;
+        validate_recovered_process_view(&view, &process_binding)?;
         let recovered_lifecycle = worker_lifecycle_from_process(view.lifecycle());
         let replayed_events = self
             .replay
@@ -441,7 +444,7 @@ where
             .replay(grant.stream_id(), replay_after_sequence)
             .map_err(provider_error)?;
         validate_replayed_events(&replayed_events, &grant, Some(replay_after_sequence))?;
-        self.install_binding(&hello, grant, process);
+        self.install_binding(&hello, grant, process_binding);
         self.lifecycle = recovered_lifecycle;
         if let Some(tail) = replayed_events.last() {
             self.last_event_id = Some(tail.event_id.clone());
@@ -673,7 +676,7 @@ where
             return Err(WorkerError::InvalidLifecycle);
         }
         let operation_id = self
-            .process_request
+            .process_binding
             .as_ref()
             .ok_or(WorkerError::NotReady)?
             .operation_id()
@@ -732,7 +735,7 @@ where
         if self.lifecycle != WorkerLifecycle::UnknownOutcome {
             return Err(WorkerError::InvalidLifecycle);
         }
-        let process = self.process_request.clone().ok_or(WorkerError::NotReady)?;
+        let process = self.process_binding.clone().ok_or(WorkerError::NotReady)?;
         let evidence = self
             .executor
             .as_ref()
@@ -802,7 +805,7 @@ where
             return Err(WorkerError::InvalidRequest("checkpoint_ref"));
         }
         let grant = self.grant.clone().ok_or(WorkerError::NotReady)?;
-        let process = self.process_request.clone().ok_or(WorkerError::NotReady)?;
+        let process = self.process_binding.clone().ok_or(WorkerError::NotReady)?;
         let durable_request = DurableCheckpointRequest::new(
             request.checkpoint_ref.clone(),
             frame.request_id.clone(),
@@ -1152,18 +1155,18 @@ where
         &mut self,
         hello: &WorkerHello,
         grant: CapabilityGrant,
-        process: ProcessRequest,
+        process: ProcessBindingSnapshot,
     ) {
         self.connection_id = Some(hello.connection_id.clone());
         self.grant = Some(grant);
-        self.process_request = Some(process);
+        self.process_binding = Some(process);
     }
 
     fn reject_start_proof(
         &mut self,
         hello: &WorkerHello,
         grant: CapabilityGrant,
-        process: ProcessRequest,
+        process: ProcessBindingSnapshot,
         reason: &str,
         error: WorkerError,
     ) -> Result<WorkerReady, WorkerError> {
@@ -1279,12 +1282,12 @@ fn validate_grant(
 
 fn validate_start_receipt(
     receipt: &ProcessStartReceipt,
-    process: &ProcessRequest,
+    process: &ProcessBindingSnapshot,
 ) -> Result<(), WorkerError> {
     if receipt.operation_id() != process.operation_id() {
         return Err(WorkerError::ProcessReceiptMismatch("operation_id"));
     }
-    if receipt.request_digest() != process.invocation_digest() {
+    if receipt.request_digest() != process.request_digest() {
         return Err(WorkerError::ProcessReceiptMismatch("request_digest"));
     }
     if receipt.accepted_generation() != process.generation() {
@@ -1303,7 +1306,7 @@ fn validate_start_proof(
     receipt: &ProcessStartReceipt,
     observed: &[ProcessEvidence],
     inspected: &ProcessExecutionView,
-    process: &ProcessRequest,
+    process: &ProcessBindingSnapshot,
 ) -> Result<(), WorkerError> {
     if receipt.lifecycle() != ProcessLifecycle::Running {
         return Err(WorkerError::ProcessReceiptMismatch("receipt_not_running"));
@@ -1340,7 +1343,7 @@ fn validate_start_proof(
 
 fn validate_recovered_process_view(
     view: &ProcessExecutionView,
-    process: &ProcessRequest,
+    process: &ProcessBindingSnapshot,
 ) -> Result<(), WorkerError> {
     if view.lifecycle() == ProcessLifecycle::Running {
         if !view.health().ready() {
@@ -1528,7 +1531,7 @@ const fn delivery_ack_is_valid(delivery_class: DeliveryClass, ack_required: bool
 
 fn validate_process_evidence(
     evidence: &ProcessEvidence,
-    process: &ProcessRequest,
+    process: &ProcessBindingSnapshot,
 ) -> Result<(), WorkerError> {
     validate_process_evidence_binding(
         evidence.operation_id(),
@@ -1539,13 +1542,13 @@ fn validate_process_evidence(
 }
 
 fn validate_process_evidence_binding(
-    operation_id: &eliot_process::OperationId,
+    operation_id: &OperationId,
     request_digest: &str,
-    fence: &eliot_process::FencingToken,
-    process: &ProcessRequest,
+    fence: &FencingToken,
+    process: &ProcessBindingSnapshot,
 ) -> Result<(), WorkerError> {
     if operation_id != process.operation_id()
-        || request_digest != process.invocation_digest()
+        || request_digest != process.request_digest()
         || !fence.matches(process.fence())
     {
         return Err(WorkerError::ProcessReceiptMismatch("process_evidence"));

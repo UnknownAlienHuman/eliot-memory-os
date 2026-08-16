@@ -82,7 +82,7 @@ pub(super) fn install(
     dry_run: bool,
 ) -> Result<HostIntegrationReceipt> {
     ensure_installable_host(host)?;
-    let repo = repo_root(config_path);
+    let repo = governed_repo_root(config_path)?;
     let source = bundle_root(&repo, host);
     let base = install_base()?;
     let target = base.join(host.as_str());
@@ -168,6 +168,7 @@ pub(super) fn install(
     } else if host == AgentHostId::Codex {
         let global = install_codex_global(
             config_path,
+            &repo,
             &source,
             &target,
             &governor,
@@ -434,7 +435,15 @@ pub(super) fn remove_codex_marketplace_entry(
     Ok(value)
 }
 
-pub(super) fn materialize_codex_mcp_config(config: &mut Value, _governor: &Path) -> Result<()> {
+pub(super) fn materialize_codex_mcp_config(
+    config: &mut Value,
+    _governor: &Path,
+    repo_root: &Path,
+) -> Result<()> {
+    ensure!(
+        repo_root.is_absolute(),
+        "Codex plugin source repository root must be absolute"
+    );
     let server = config
         .get_mut("mcpServers")
         .and_then(Value::as_object_mut)
@@ -458,6 +467,15 @@ pub(super) fn materialize_codex_mcp_config(config: &mut Value, _governor: &Path)
         ]),
     );
     server.insert("cwd".to_owned(), Value::String(".".to_owned()));
+    let environment = server
+        .entry("env".to_owned())
+        .or_insert_with(|| json!({}))
+        .as_object_mut()
+        .context("Codex plugin mcpServers.eliot.env must be an object")?;
+    environment.insert(
+        "ELIOT_GOVERNOR_REPO_ROOT".to_owned(),
+        Value::String(repo_root.to_string_lossy().into_owned()),
+    );
     server.insert("enabled".to_owned(), Value::Bool(true));
     server.insert("required".to_owned(), Value::Bool(false));
     Ok(())
@@ -1312,7 +1330,7 @@ pub(super) fn codex_materialized_plugin_version(
     );
     Ok(format!(
         "{base_version}+codex.artifact-{}",
-        &digest[..32].to_ascii_lowercase()
+        digest[..32].to_ascii_lowercase()
     ))
 }
 
@@ -1502,9 +1520,11 @@ fn recover_codex_install_transaction(target: &Path, dry_run: bool) -> Result<boo
     Ok(recovered_owned_lifecycle)
 }
 
-#[allow(clippy::too_many_lines)]
+// The install transaction keeps every rollback and no-clobber input explicit.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 pub(super) fn install_codex_global(
     config_path: &Path,
+    repo_root: &Path,
     source: &Path,
     target: &Path,
     governor: &Path,
@@ -1561,7 +1581,7 @@ pub(super) fn install_codex_global(
     let installed_governor_sha256 = sha256_file(governor)?;
     let mut mcp_config: Value =
         serde_json::from_reader(std::fs::File::open(source.join(".mcp.json"))?)?;
-    materialize_codex_mcp_config(&mut mcp_config, &installed_governor)?;
+    materialize_codex_mcp_config(&mut mcp_config, &installed_governor, repo_root)?;
     let hooks: Value = serde_json::from_reader(std::fs::File::open(
         source.join("hooks").join("hooks.json"),
     )?)?;
@@ -1889,6 +1909,7 @@ pub(super) fn install_codex_global(
         return match recover_codex_install_transaction(target, false) {
             Ok(true) if !recovered_owned_lifecycle => install_codex_global(
                 config_path,
+                repo_root,
                 source,
                 target,
                 governor,

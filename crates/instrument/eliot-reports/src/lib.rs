@@ -6,6 +6,8 @@
 
 #![forbid(unsafe_code)]
 
+use std::fmt::Write as _;
+
 use eliot_contracts::{ClockReading, StateFence, canonical_json_bytes, sha256_hex};
 use eliot_instrument_api::{
     EvidenceCoverage, EvidenceFreshness, InstrumentInvocation, NormalizedEvidence,
@@ -87,6 +89,9 @@ pub enum ReportError {
     /// Canonical JSON could not be produced.
     #[error("canonical report serialization failed: {0}")]
     Serialization(#[from] serde_json::Error),
+    /// Markdown formatting could not be completed.
+    #[error("report formatting failed: {0}")]
+    Formatting(#[from] std::fmt::Error),
 }
 
 fn valid_text(value: &str, field: &'static str) -> Result<(), ReportError> {
@@ -174,22 +179,26 @@ impl InstrumentReport {
         self.validate()?;
         let mut output = String::new();
         output.push_str("# ELIOT Instrument Report\n\n");
-        output.push_str(&format!("- Report: `{}`\n", self.header.report_id));
-        output.push_str(&format!(
-            "- Kind: `{}`\n",
+        writeln!(output, "- Report: `{}`", self.header.report_id)?;
+        writeln!(
+            output,
+            "- Kind: `{}`",
             serde_json::to_string(&self.header.kind)?.trim_matches('"')
-        ));
-        output.push_str(&format!("- Revision: `{}`\n", self.header.revision));
-        output.push_str(&format!(
-            "- Policy: `{}`\n",
+        )?;
+        writeln!(output, "- Revision: `{}`", self.header.revision)?;
+        writeln!(
+            output,
+            "- Policy: `{}`",
             escape_markdown(&self.header.policy_version)
-        ));
-        output.push_str(&format!("- Outcome: `{}`\n", self.outcome));
-        output.push_str(&format!("- Report hash: `{}`\n", self.report_hash));
-        output.push_str(&format!(
-            "- Source records: `{}`\n\n",
+        )?;
+        writeln!(output, "- Outcome: `{}`", self.outcome)?;
+        writeln!(output, "- Report hash: `{}`", self.report_hash)?;
+        writeln!(
+            output,
+            "- Source records: `{}`",
             self.header.source_record_ids.len()
-        ));
+        )?;
+        output.push('\n');
         output.push_str("## Verification\n\n");
         if self.verification_runs.is_empty() {
             output.push_str("No verification runs were attached.\n");
@@ -198,22 +207,24 @@ impl InstrumentReport {
                 "| Run | Property | Outcome | Coverage | Freshness |\n|---|---|---|---|---|\n",
             );
             for run in &self.verification_runs {
-                output.push_str(&format!(
-                    "| `{}` | {} | `{}` | `{}` | `{}` |\n",
+                writeln!(
+                    output,
+                    "| `{}` | {} | `{}` | `{}` | `{}` |",
                     run.run_id,
                     escape_markdown(&run.property),
                     run.outcome,
                     coverage(run.coverage),
                     freshness(run.freshness)
-                ));
+                )?;
             }
         }
         output.push_str("\n## Evidence\n\n");
-        output.push_str(&format!(
-            "Normalized records: `{}`; raw handles: `{}`.\n",
+        writeln!(
+            output,
+            "Normalized records: `{}`; raw handles: `{}`.",
             self.normalized_evidence.len(),
             self.raw_evidence_ids.len()
-        ));
+        )?;
         Ok(output)
     }
 

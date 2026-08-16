@@ -95,11 +95,10 @@ impl RedbHostStateStore {
         protected_state_path(path)?;
         match std::fs::symlink_metadata(path) {
             Ok(metadata) if metadata.is_file() => {}
-            Ok(_) => return Err(HostStateError::Unavailable),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 return Ok(HostAdmissionState::FirstInstall);
             }
-            Err(_) => return Err(HostStateError::Unavailable),
+            Ok(_) | Err(_) => return Err(HostStateError::Unavailable),
         }
         let path_lease = open_state_lease(path, false)?;
         let database =
@@ -352,6 +351,10 @@ impl RedbHostStateStore {
 
     /// Opens or creates a Host state database and installs the initial
     /// installation identity on first use.
+    #[allow(
+        clippy::needless_pass_by_value,
+        reason = "the public constructor accepts the canonical owned installation snapshot"
+    )]
     pub fn open(
         path: impl AsRef<Path>,
         initial: HostInstallationState,

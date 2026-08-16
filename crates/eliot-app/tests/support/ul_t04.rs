@@ -291,7 +291,7 @@ impl Harness {
     }
 
     pub fn run_ul_onboard(&self, project_id: ProjectId, project_root: &Path) -> TestResult<Value> {
-        let output = governor_command(&self.config_path)
+        let output = governor_command(&self.config_path)?
             .arg("--config")
             .arg(&self.config_path)
             .args(["ul", "onboard", "--project"])
@@ -310,7 +310,7 @@ impl Harness {
     }
 
     pub fn run_ul_mine_git(&self, project_id: ProjectId, project_root: &Path) -> TestResult<Value> {
-        let output = governor_command(&self.config_path)
+        let output = governor_command(&self.config_path)?
             .arg("--config")
             .arg(&self.config_path)
             .args(["ul", "mine-git", "--project"])
@@ -568,7 +568,7 @@ pub struct McpClient {
 
 impl McpClient {
     fn start(config_path: &Path) -> TestResult<Self> {
-        let mut child = governor_command(config_path)
+        let mut child = governor_command(config_path)?
             .arg("--config")
             .arg(config_path)
             .args(["mcp", "stdio", "--profile", "codex_controller"])
@@ -804,7 +804,7 @@ fn start_surreal(exe: &Path, port: u16) -> TestResult<OwnedChild> {
 
 fn start_daemon(config_path: &Path) -> TestResult<OwnedChild> {
     OwnedChild::spawn(
-        governor_command(config_path)
+        governor_command(config_path)?
             .arg("--config")
             .arg(config_path)
             .args(["daemon", "run"])
@@ -814,7 +814,7 @@ fn start_daemon(config_path: &Path) -> TestResult<OwnedChild> {
     )
 }
 
-fn governor_command(config_path: &Path) -> Command {
+fn governor_command(config_path: &Path) -> TestResult<Command> {
     let mut command = Command::new(binary());
     for variable in [
         "ELIOT_GOVERNOR_CONFIG",
@@ -829,7 +829,8 @@ fn governor_command(config_path: &Path) -> Command {
     }
     command
         .env("ELIOT_DISABLE_REAL_PROVIDER", "1")
-        .env("ELIOT_ALLOW_LEGACY_PASSWORD_FILE_MIGRATION", "1");
+        .env("ELIOT_ALLOW_LEGACY_PASSWORD_FILE_MIGRATION", "1")
+        .env("ELIOT_GOVERNOR_REPO_ROOT", repository_root()?);
     eliot_windows_ipc::test_support::IsolatedTestCredentialBackend::EphemeralFile {
         root: config_path
             .parent()
@@ -838,7 +839,7 @@ fn governor_command(config_path: &Path) -> Command {
             .join("operator-cursor-credentials"),
     }
     .configure_command(&mut command);
-    command
+    Ok(command)
 }
 
 fn write_test_config(

@@ -1,7 +1,9 @@
 use std::collections::BTreeSet;
 
 use eliot_observation_contracts::{ObservationError, ObservationScope};
-use eliot_process::{ProcessRequest, ProcessStartReceipt};
+use eliot_process::{
+    FencingToken, Generation, OperationId, ProcessRequest, ProcessStartReceipt, ProcessTreeId,
+};
 use eliot_runtime_contracts::{ModuleGeneration, RuntimeContractError, RuntimeLease};
 use eliot_security_contracts::{PrivacyClass, SecurityContractError, SourceAssurance};
 use schemars::JsonSchema;
@@ -439,6 +441,53 @@ pub struct PromotionQuery {
     pub state_contract_digest: Sha256Digest,
 }
 
+/// Inert post-start identity retained after P-03 consumes its one-shot request.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProcessBinding {
+    operation_id: OperationId,
+    process_tree_id: ProcessTreeId,
+    generation: Generation,
+    fence: FencingToken,
+    request_digest: String,
+}
+
+impl ProcessBinding {
+    pub(crate) fn from_request(request: &ProcessRequest) -> Self {
+        Self {
+            operation_id: request.operation_id().clone(),
+            process_tree_id: request.process_tree_id().clone(),
+            generation: request.generation(),
+            fence: request.fence().clone(),
+            request_digest: request.invocation_digest().to_owned(),
+        }
+    }
+
+    #[must_use]
+    pub const fn operation_id(&self) -> &OperationId {
+        &self.operation_id
+    }
+
+    #[must_use]
+    pub const fn process_tree_id(&self) -> &ProcessTreeId {
+        &self.process_tree_id
+    }
+
+    #[must_use]
+    pub const fn generation(&self) -> Generation {
+        self.generation
+    }
+
+    #[must_use]
+    pub const fn fence(&self) -> &FencingToken {
+        &self.fence
+    }
+
+    #[must_use]
+    pub fn request_digest(&self) -> &str {
+        &self.request_digest
+    }
+}
+
 /// Exact authorized envelope used to request a P-03 process binding.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProcessLaunchEnvelope {
@@ -494,7 +543,7 @@ pub struct EngineInvocation {
     pub limits: InvocationLimits,
     pub input: Vec<u8>,
     pub deterministic_seed: u64,
-    pub process_request: ProcessRequest,
+    pub process_binding: ProcessBinding,
     pub process_start_receipt: ProcessStartReceipt,
 }
 

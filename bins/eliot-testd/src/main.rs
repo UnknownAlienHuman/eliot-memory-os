@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
 enum Request {
     Submit {
-        request: TestdJobRequest,
+        request: Box<TestdJobRequest>,
     },
     Status {
         job_id: String,
@@ -48,15 +48,14 @@ enum Response {
 
 fn main() {
     let state_path = std::env::var_os("ELIOT_TESTD_STATE")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(".eliot-testd.redb"));
+        .map_or_else(|| PathBuf::from(".eliot-testd.redb"), PathBuf::from);
     let mut output = io::BufWriter::new(io::stdout().lock());
     let daemon = match TestdComposition::open(state_path, Arc::new(UnavailableProcessIssuer)) {
         Ok(daemon) => daemon,
         Err(error) => {
             let _ = write_response(
                 &mut output,
-                Response::Error {
+                &Response::Error {
                     error: error.to_string(),
                 },
             );
@@ -65,7 +64,7 @@ fn main() {
     };
     if !write_response(
         &mut output,
-        Response::Ready {
+        &Response::Ready {
             service: SERVICE_NAME,
             protocol: PROTOCOL_VERSION,
         },
@@ -80,7 +79,7 @@ fn main() {
                 error: format!("input: {error}"),
             },
         };
-        if !write_response(&mut output, response) {
+        if !write_response(&mut output, &response) {
             break;
         }
     }
@@ -96,7 +95,7 @@ fn dispatch(daemon: &TestdComposition, line: &str) -> Response {
         }
     };
     let result = match request {
-        Request::Submit { request } => daemon.submit(request),
+        Request::Submit { request } => daemon.submit(*request),
         Request::Status { job_id } => daemon.status(&job_id),
         Request::Cancel {
             job_id,
@@ -104,15 +103,16 @@ fn dispatch(daemon: &TestdComposition, line: &str) -> Response {
             actor,
         } => daemon.cancel_with_lease(&job_id, lease.as_ref(), &actor),
     };
-    result
-        .map(|receipt| Response::Receipt { receipt })
-        .unwrap_or_else(|error| Response::Error {
+    result.map_or_else(
+        |error| Response::Error {
             error: error.to_string(),
-        })
+        },
+        |receipt| Response::Receipt { receipt },
+    )
 }
 
-fn write_response(output: &mut impl Write, response: Response) -> bool {
-    serde_json::to_writer(&mut *output, &response).is_ok()
+fn write_response(output: &mut impl Write, response: &Response) -> bool {
+    serde_json::to_writer(&mut *output, response).is_ok()
         && output.write_all(b"\n").is_ok()
         && output.flush().is_ok()
 }

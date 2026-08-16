@@ -202,6 +202,8 @@ fn t04_minimal_ack_derives_full_trace() -> TestResult {
 }
 
 #[test]
+// This end-to-end fixture keeps the complete frame/boot evidence sequence visible.
+#[allow(clippy::too_many_lines)]
 fn t04_frame_stub_and_boot() -> TestResult {
     let _guard = test_guard();
     if rerun_with_credential_gate("t04_frame_stub_and_boot")? {
@@ -239,7 +241,11 @@ fn t04_frame_stub_and_boot() -> TestResult {
             "project_id": project_id,
             "task_id": task_id,
             "goal": "compile a complete material frame stub",
-            "candidate_handles": [],
+            "candidate_handles": [
+                "task-domain:docs",
+                "task-action:read_only",
+                "task-artifact:report"
+            ],
             "max_tokens": 1200
         }),
     )?;
@@ -258,7 +264,11 @@ fn t04_frame_stub_and_boot() -> TestResult {
             "project_id": project_id,
             "task_id": task_id,
             "goal": "compile a complete material frame stub",
-            "candidate_handles": [],
+            "candidate_handles": [
+                "task-domain:docs",
+                "task-action:read_only",
+                "task-artifact:report"
+            ],
             "max_tokens": 1200,
             "material_frame": frame.clone()
         }),
@@ -284,7 +294,11 @@ fn t04_frame_stub_and_boot() -> TestResult {
             "project_id": project_id,
             "task_id": task_id,
             "goal": "compile a complete material frame stub",
-            "candidate_handles": [],
+            "candidate_handles": [
+                "task-domain:docs",
+                "task-action:read_only",
+                "task-artifact:report"
+            ],
             "max_tokens": 1200,
             "material_frame": frame
         }),

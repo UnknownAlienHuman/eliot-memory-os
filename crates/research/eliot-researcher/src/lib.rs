@@ -44,6 +44,9 @@ impl<B: ResearchBridge> Researcher<B> {
         self.exchange.submit(query)
     }
 
+    // Keep the protocol façade's explicit request fields stable; grouping them
+    // would broaden the public call-surface change beyond this lint fix.
+    #[allow(clippy::too_many_arguments)]
     pub fn request(
         &mut self,
         exchange_id: impl Into<String>,

@@ -55,6 +55,7 @@ fn operation(id: &str) -> IdempotencyIdentity {
 fn fence(host: &HostInstallationEpoch, activation: &EpochTransition) -> RecordFence {
     RecordFence {
         host: host.clone(),
+        activation_id: h("activation-one"),
         activation_generation: activation.clone(),
     }
 }
@@ -75,6 +76,17 @@ fn lifecycle_budget() -> DependencyLifecycleBudget {
         start_attempts_remaining: 2,
         stop_attempts_remaining: 2,
         restart_attempts_remaining: 3,
+    }
+}
+
+fn resource_budget() -> DependencyResourceBudget {
+    DependencyResourceBudget {
+        budget_identity: h("dependency-resource-budget"),
+        max_cpu_time_ms: 5_000,
+        max_memory_bytes: 1_048_576,
+        max_process_handles: 32,
+        max_io_bytes: 16_777_216,
+        max_child_processes: 4,
     }
 }
 
@@ -162,6 +174,7 @@ fn dependency_record(
         },
         pid_job_lineage_refs: Vec::new(),
         lifecycle_budget: lifecycle_budget(),
+        resource_budget: resource_budget(),
         approved_artifact_hash: h("sha256-artifact"),
         approved_config_hash: h("sha256-config"),
         disposition_evidence: vec![h("dependency-evidence")],
@@ -379,8 +392,8 @@ fn exact_replay_is_idempotent_and_changed_payload_conflicts() {
     let record = activation(&host, &generation, "same", ActivationState::Starting);
     let first = journal.append(record.clone()).unwrap();
     let replay = journal.append(record.clone()).unwrap();
-    assert_eq!(first.sequence, replay.sequence);
-    assert_eq!(replay.disposition, AppendDisposition::Replayed);
+    assert_eq!(first.sequence(), replay.sequence());
+    assert_eq!(replay.disposition(), AppendDisposition::Replayed);
     let mut conflict = record;
     let HostStateRecord::Activation(value) = &mut conflict else {
         unreachable!();
@@ -431,6 +444,7 @@ fn dependency_lifecycle_rejects_illegal_first_active_record() {
         outcome: PortOutcome::Unknown(UnknownReason::NotObserved),
         pid_job_lineage_refs: vec![],
         lifecycle_budget: lifecycle_budget(),
+        resource_budget: resource_budget(),
         approved_artifact_hash: h("sha256-artifact"),
         approved_config_hash: h("sha256-config"),
         disposition_evidence: vec![h("dependency-evidence")],
@@ -520,6 +534,7 @@ fn dependency_wake_and_drain_replay_or_conflict_by_exact_identity() {
         outcome: PortOutcome::Unknown(UnknownReason::NotObserved),
         pid_job_lineage_refs: vec![],
         lifecycle_budget: lifecycle_budget(),
+        resource_budget: resource_budget(),
         approved_artifact_hash: h("sha256-artifact"),
         approved_config_hash: h("sha256-config"),
         disposition_evidence: vec![h("dependency-evidence")],
@@ -536,7 +551,7 @@ fn dependency_wake_and_drain_replay_or_conflict_by_exact_identity() {
     for record in [&dependency, &wake, &drain] {
         journal.append(record.clone()).unwrap();
         assert_eq!(
-            journal.append(record.clone()).unwrap().disposition,
+            journal.append(record.clone()).unwrap().disposition(),
             AppendDisposition::Replayed
         );
     }
@@ -690,7 +705,7 @@ fn postcommit_unknown_reconciles_without_blind_retry() {
     );
     assert_eq!(journal.snapshot().unwrap().sequence, 1);
     assert_eq!(
-        journal.append(record).unwrap().disposition,
+        journal.append(record).unwrap().disposition(),
         AppendDisposition::Replayed
     );
 }

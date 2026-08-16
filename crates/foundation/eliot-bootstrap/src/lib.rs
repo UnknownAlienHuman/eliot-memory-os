@@ -17,6 +17,8 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+pub mod capture;
+
 /// Stable contract name for the C0-09 compiler surface.
 pub const CONTRACT_NAME: &str = "eliot.foundation.bootstrap";
 /// Wire revision of the C0-09 compiler surface.

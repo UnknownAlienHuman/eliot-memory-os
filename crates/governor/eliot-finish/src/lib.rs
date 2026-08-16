@@ -557,6 +557,7 @@ impl FinishService {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn receipt_digest(
     decision_id: &str,
     attempt_id: &str,
@@ -604,7 +605,9 @@ fn lifecycle_action(
         FinishDecisionOutcome::Partial if intent == FinishClosureIntent::ClosePartial => {
             FinishLifecycleAction::ClosePartial
         }
-        FinishDecisionOutcome::Partial => FinishLifecycleAction::EnterSuspended,
+        FinishDecisionOutcome::Partial | FinishDecisionOutcome::DegradedNoProof => {
+            FinishLifecycleAction::EnterSuspended
+        }
         FinishDecisionOutcome::Blocked | FinishDecisionOutcome::UnsafeToFinish => {
             FinishLifecycleAction::EnterBlocked
         }
@@ -615,7 +618,6 @@ fn lifecycle_action(
                 FinishLifecycleAction::ContinueActive
             }
         }
-        FinishDecisionOutcome::DegradedNoProof => FinishLifecycleAction::EnterSuspended,
         FinishDecisionOutcome::Cancelled => FinishLifecycleAction::CloseCancelled,
         FinishDecisionOutcome::Superseded => FinishLifecycleAction::CloseSuperseded,
     };

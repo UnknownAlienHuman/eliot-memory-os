@@ -118,9 +118,9 @@ pub enum TaskCommand {
 }
 
 impl TaskCommand {
-    fn target(&self, current: TaskState) -> TaskState {
+    fn target(&self) -> TaskState {
         match self {
-            Self::Open => TaskState::Open,
+            Self::Open | Self::Reopen { .. } => TaskState::Open,
             Self::Frame { .. } => TaskState::Framed,
             Self::RequireUnderstanding => TaskState::UnderstandingRequired,
             Self::AuthorizeAction { .. } => TaskState::ActionAuthorized,
@@ -130,7 +130,6 @@ impl TaskCommand {
             Self::Block { .. } => TaskState::Blocked,
             Self::Fail { .. } => TaskState::Failed,
             Self::MarkPartial { .. } => TaskState::Partial,
-            Self::Reopen { .. } => TaskState::Open,
         }
     }
 
@@ -145,8 +144,9 @@ impl TaskCommand {
                 text(understanding_ref, "understanding_ref")
             }
             Self::Verify { verification_ref } => text(verification_ref, "verification_ref"),
-            Self::Block { reason_ref } => text(reason_ref, "reason_ref"),
-            Self::Fail { reason_ref } => text(reason_ref, "reason_ref"),
+            Self::Block { reason_ref } | Self::Fail { reason_ref } => {
+                text(reason_ref, "reason_ref")
+            }
             Self::MarkPartial { result_ref } => text(result_ref, "result_ref"),
             Self::Reopen { reopen_ref } => text(reopen_ref, "reopen_ref"),
             Self::Open
@@ -378,8 +378,8 @@ impl TaskLifecycleOwner {
                 current: current.revision,
             });
         }
-        let target = command.target(current.state);
-        if !allowed(current.state, target, &command) {
+        let target = command.target();
+        if !allowed(current.state, &command) {
             return Err(TaskError::IllegalTransition {
                 from: current.state,
                 to: target,
@@ -399,15 +399,15 @@ impl TaskLifecycleOwner {
         record.state = target;
         record.revision += 1;
         record.last_sequence = event.sequence;
-        record.last_event_id = event.event_id.clone();
+        record.last_event_id.clone_from(&event.event_id);
         self.requests
             .insert(context.request_id, (task_id, Some(command), event.clone()));
         Ok(event)
     }
 
     #[must_use]
-    pub fn task(&self, task_id: TaskId) -> Option<&TaskRecord> {
-        self.tasks.get(&task_id)
+    pub fn task(&self, task_id: &TaskId) -> Option<&TaskRecord> {
+        self.tasks.get(task_id)
     }
 
     #[must_use]
@@ -461,7 +461,7 @@ impl TaskLifecycleOwner {
     }
 }
 
-fn allowed(from: TaskState, to: TaskState, command: &TaskCommand) -> bool {
+fn allowed(from: TaskState, command: &TaskCommand) -> bool {
     match command {
         TaskCommand::Open => from == TaskState::Proposed,
         TaskCommand::Frame { .. } => from == TaskState::Open,

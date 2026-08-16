@@ -1,6 +1,11 @@
-# Understanding Layer v1.4 progress
+# Historical Understanding Layer v1.4 progress
 
-Status: **IMPLEMENTATION COMPLETE — UL-11 AND UL-12 CERTIFIED**
+> Historical campaign evidence only, bound to the source identities recorded
+> below. It is not the current ELIOT product status and does not transfer PASS or
+> CERTIFIED to current bytes. Current status requires exact source/build/runtime
+> evidence under the Architecture 4.5 / Implementation 0.29 authority model.
+
+Historical campaign status: **IMPLEMENTATION COMPLETE — UL-11 AND UL-12 CERTIFIED**
 
 Start SHA: `f26985de335f0c6d1970eb3bc8663fce09d9f2cf`
 

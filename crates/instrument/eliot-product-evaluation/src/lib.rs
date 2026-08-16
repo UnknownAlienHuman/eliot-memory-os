@@ -24,6 +24,7 @@ use thiserror::Error;
 pub const CONTRACT_NAME: &str = "eliot.instrument.product-evaluation";
 /// Wire revision of this implementation surface.
 pub const CONTRACT_VERSION: ContractVersion = ContractVersion::new(1, 0, 0);
+const HEX_DIGITS: &[u8; 16] = b"0123456789abcdef";
 
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
 pub enum ProductEvaluationError {
@@ -86,8 +87,11 @@ fn digest<T: Serialize>(value: &T) -> Result<String, ProductEvaluationError> {
     Ok(hasher
         .finalize()
         .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect())
+        .fold(String::with_capacity(64), |mut digest, byte| {
+            digest.push(HEX_DIGITS[(byte >> 4) as usize] as char);
+            digest.push(HEX_DIGITS[(byte & 0x0f) as usize] as char);
+            digest
+        }))
 }
 
 /// Exact source anchor for a load-bearing evaluation claim.
@@ -279,7 +283,7 @@ pub fn compare_trials(
             TrialOutcome::NoChange { .. } => arm.unchanged_count += 1,
             TrialOutcome::Regressed { .. } => arm.regressed_count += 1,
             TrialOutcome::Inconclusive { .. } | TrialOutcome::Unknown { .. } => {
-                arm.uncertain_count += 1
+                arm.uncertain_count += 1;
             }
         }
         if matches!(trial.status, TrialStatus::Censored | TrialStatus::Excluded) {

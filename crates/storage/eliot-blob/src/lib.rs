@@ -106,6 +106,10 @@ struct RootLeaseState {
     heartbeat: Mutex<Option<JoinHandle<()>>>,
 }
 
+#[allow(
+    clippy::missing_fields_in_debug,
+    reason = "lease authority and synchronization internals must remain absent from Debug output"
+)]
 impl fmt::Debug for RootLeaseState {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -180,13 +184,10 @@ impl BlobRootOwner {
         let (lock_path, token, lock_file) =
             acquire_root_lease(&canonical_path, &root_claim_key, process_id)?;
         let claims = PROCESS_ROOT_CLAIMS.get_or_init(|| Mutex::new(BTreeSet::new()));
-        let mut claims = match claims.lock() {
-            Ok(claims) => claims,
-            Err(_) => {
-                return Err(BlobError::Provider(
-                    "Blob root claim lock poisoned".to_owned(),
-                ));
-            }
+        let Ok(mut claims) = claims.lock() else {
+            return Err(BlobError::Provider(
+                "Blob root claim lock poisoned".to_owned(),
+            ));
         };
         if !claims.insert(root_claim_key.clone()) {
             return Err(BlobError::OwnerConflict);
@@ -206,7 +207,7 @@ impl BlobRootOwner {
         let heartbeat_stop = Arc::clone(&stop);
         let heartbeat = match thread::Builder::new()
             .name("eliot-blob-root-lease".to_owned())
-            .spawn(move || heartbeat_root_lease(heartbeat_lease, heartbeat_stop))
+            .spawn(move || heartbeat_root_lease(&heartbeat_lease, &heartbeat_stop))
         {
             Ok(handle) => handle,
             Err(error) => {
@@ -216,15 +217,12 @@ impl BlobRootOwner {
                 )));
             }
         };
-        let mut heartbeat_slot = match lease.heartbeat.lock() {
-            Ok(slot) => slot,
-            Err(_) => {
-                claims.remove(&root_claim_key);
-                drop(heartbeat);
-                return Err(BlobError::Provider(
-                    "Blob root lease heartbeat lock poisoned".to_owned(),
-                ));
-            }
+        let Ok(mut heartbeat_slot) = lease.heartbeat.lock() else {
+            claims.remove(&root_claim_key);
+            drop(heartbeat);
+            return Err(BlobError::Provider(
+                "Blob root lease heartbeat lock poisoned".to_owned(),
+            ));
         };
         heartbeat_slot.replace(heartbeat);
         drop(heartbeat_slot);
@@ -309,13 +307,13 @@ fn canonical_identity(path: &Path) -> String {
 fn reject_reparse_components(path: &Path) -> Result<(), BlobError> {
     let mut current = Some(path);
     while let Some(candidate) = current {
-        if let Ok(metadata) = fs::symlink_metadata(candidate) {
-            if is_reparse_point(&metadata) {
-                return Err(BlobError::InvalidContract(format!(
-                    "Blob root contains reparse component {}",
-                    candidate.display()
-                )));
-            }
+        if let Ok(metadata) = fs::symlink_metadata(candidate)
+            && is_reparse_point(&metadata)
+        {
+            return Err(BlobError::InvalidContract(format!(
+                "Blob root contains reparse component {}",
+                candidate.display()
+            )));
         }
         current = candidate.parent();
     }
@@ -330,7 +328,7 @@ fn is_reparse_point(metadata: &fs::Metadata) -> bool {
     {
         use std::os::windows::fs::MetadataExt;
 
-        return metadata.file_attributes() & WINDOWS_REPARSE_POINT != 0;
+        metadata.file_attributes() & WINDOWS_REPARSE_POINT != 0
     }
     #[cfg(not(windows))]
     {
@@ -342,7 +340,7 @@ fn now_unix_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |duration| {
-            duration.as_millis().min(u64::MAX as u128) as u64
+            u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
         })
 }
 
@@ -461,7 +459,7 @@ fn write_lease_record(file: &mut fs::File, record: &RootLeaseRecord) -> std::io:
     file.sync_all()
 }
 
-fn heartbeat_root_lease(lease: Weak<RootLeaseState>, stop: Arc<AtomicBool>) {
+fn heartbeat_root_lease(lease: &Weak<RootLeaseState>, stop: &Arc<AtomicBool>) {
     while !stop.load(Ordering::Acquire) {
         thread::sleep(Duration::from_millis(ROOT_LEASE_HEARTBEAT_MS));
         if stop.load(Ordering::Acquire) {
@@ -1110,7 +1108,7 @@ where
         &self,
         metadata: &StoredMetadata,
     ) -> Result<VerifiedBlobReceipt, BlobError> {
-        let context = context_from_receipt(&metadata.receipt)?;
+        let context = context_from_receipt(&metadata.receipt);
         let binding = BlobReceiptBinding::for_blob(&context, &metadata.locator)?;
         verify_receipt(&self.issuer_anchor, &metadata.receipt_bytes, binding)
     }
@@ -1708,10 +1706,10 @@ where
         self.stage_locked(request, hash)
     }
 
-    fn read_sync(&self, request: BlobReadRequest) -> Result<BlobReadChunk, BlobError> {
+    fn read_sync(&self, request: &BlobReadRequest) -> Result<BlobReadChunk, BlobError> {
         let content_idx = content_shard(&request.locator.hash);
         let _guard = self.lock_shards(&[content_idx])?;
-        let (ready, bytes) = self.read_verified(&request)?;
+        let (ready, bytes) = self.read_verified(request)?;
         let artifact = ArtifactBinding {
             artifact_id: format!("blob-read-{}", request.locator.hash)
                 .parse()
@@ -2166,7 +2164,7 @@ where
 
     fn read(&self, request: BlobReadRequest) -> BlobFuture<'_, BlobReadChunk> {
         let core = Arc::clone(&self.core);
-        Box::pin(async move { core.read_sync(request) })
+        Box::pin(async move { core.read_sync(&request) })
     }
 
     fn reachability(
@@ -2203,8 +2201,8 @@ fn validate_sha256(value: &str, field: &'static str) -> Result<(), BlobError> {
     }
 }
 
-fn context_from_receipt(receipt: &Receipt) -> Result<BlobReceiptContext, BlobError> {
-    Ok(BlobReceiptContext {
+fn context_from_receipt(receipt: &Receipt) -> BlobReceiptContext {
+    BlobReceiptContext {
         work_scope: receipt.core.work_scope.clone(),
         task: receipt.core.task.clone(),
         session: receipt.core.session.clone(),
@@ -2212,7 +2210,7 @@ fn context_from_receipt(receipt: &Receipt) -> Result<BlobReceiptContext, BlobErr
         request: receipt.core.request.clone(),
         operation: receipt.core.operation.clone(),
         authority: receipt.core.authority.clone(),
-    })
+    }
 }
 
 fn is_stage_path(path: &WorkScopePath) -> bool {
@@ -2259,6 +2257,10 @@ fn map_resolve_key_error(
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::expect_used,
+    reason = "test fixtures use expect to make violated setup invariants fail immediately"
+)]
 mod tests {
     use super::*;
     use std::collections::BTreeMap;
@@ -2585,7 +2587,7 @@ mod tests {
             TestCompression,
             TestKeys,
             TestAead,
-            TestLiveSets::default(),
+            TestLiveSets,
             test_anchor(),
         )
         .expect("store")

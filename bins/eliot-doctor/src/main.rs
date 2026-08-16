@@ -5,6 +5,10 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
+#[allow(
+    clippy::large_enum_variant,
+    reason = "Request is a public JSON protocol surface; boxing would change its deserialized API shape"
+)]
 enum Request {
     Run { job: DoctorJob },
     Status { job_id: String },
@@ -13,6 +17,10 @@ enum Request {
 
 #[derive(Debug, Serialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
+#[allow(
+    clippy::large_enum_variant,
+    reason = "Response is a public JSON protocol surface; boxing would change its serialized API shape"
+)]
 enum Response {
     Ready {
         service: &'static str,
@@ -32,7 +40,7 @@ fn main() {
     let mut doctor = DoctorComposition::default();
     if !write_response(
         &mut output,
-        Response::Ready {
+        &Response::Ready {
             service: SERVICE_NAME,
             protocol: PROTOCOL_VERSION,
         },
@@ -47,7 +55,7 @@ fn main() {
                 error: format!("input: {error}"),
             },
         };
-        if !write_response(&mut output, response) {
+        if !write_response(&mut output, &response) {
             break;
         }
     }
@@ -67,14 +75,15 @@ fn dispatch(doctor: &mut DoctorComposition, line: &str) -> Response {
         Request::Status { job_id } => doctor.status(&job_id),
         Request::Cancel { job_id } => doctor.cancel(&job_id),
     };
-    result
-        .map(|report| Response::Report { report })
-        .unwrap_or_else(|error| Response::Error {
+    result.map_or_else(
+        |error| Response::Error {
             error: error.to_string(),
-        })
+        },
+        |report| Response::Report { report },
+    )
 }
 
-fn write_response(output: &mut impl Write, response: Response) -> bool {
+fn write_response(output: &mut impl Write, response: &Response) -> bool {
     serde_json::to_writer(&mut *output, &response).is_ok()
         && output.write_all(b"\n").is_ok()
         && output.flush().is_ok()

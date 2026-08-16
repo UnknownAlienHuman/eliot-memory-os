@@ -361,6 +361,7 @@ impl FrontDoor {
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used)]
 mod tests {
     use super::*;
     use eliot_contracts::{AuthorityEpoch, ContractId, ResourceGeneration};

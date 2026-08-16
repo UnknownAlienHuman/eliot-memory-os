@@ -102,6 +102,10 @@ impl HostJobBranches {
     /// Creates two owner-scoped Job identities.  The actual Job handles are
     /// created only by the approved suspended launch below; there is no
     /// unbound PID assignment path.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if either owner-scoped Job identity is invalid.
     pub fn new(host: &HostInstallationEpoch) -> Result<Self, WindowsAdapterError> {
         let suffix = format!(
             "{}-{}",
@@ -190,6 +194,11 @@ impl HostJobBranches {
         environment
     }
 
+    #[allow(
+        clippy::too_many_arguments,
+        clippy::too_many_lines,
+        reason = "the ordered suspended-launch inputs are separate authority bindings and must remain explicit"
+    )]
     fn launch(
         executable: &Path,
         executable_lease: &ProtectedPathLease,
@@ -311,6 +320,15 @@ impl HostJobBranches {
     /// Starts the approved Kernel and store images in separate Job Objects.
     /// Both images are pinned and validated while suspended, then resumed only
     /// after the generation identity has been accepted.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if an approved path, retained file identity, digest,
+    /// suspended launch, or rollback cleanup cannot be validated or completed.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "each argument is an independently validated process-contour authority binding"
+    )]
     pub fn start_approved(
         &mut self,
         kernel_executable: &Path,
@@ -413,6 +431,10 @@ impl HostJobBranches {
         Ok(())
     }
 
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "relaunch keeps every approved authority binding explicit at the process boundary"
+    )]
     fn relaunch_kernel(
         &mut self,
         generation: &PlatformHandle,
@@ -455,6 +477,10 @@ impl HostJobBranches {
         Ok(())
     }
 
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "relaunch keeps every approved authority binding explicit at the process boundary"
+    )]
     fn relaunch_store(
         &mut self,
         generation: &PlatformHandle,
@@ -512,6 +538,16 @@ impl HostJobBranches {
     /// Reconciles Kernel and store branches independently with one bounded
     /// restart attempt per branch failure. A failed branch never terminates a
     /// healthy sibling or reuses an observed PID.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if retained process/configuration identity changes or
+    /// a protected file, digest, or approved path cannot be revalidated.
+    #[allow(
+        clippy::too_many_arguments,
+        clippy::too_many_lines,
+        reason = "ordered branch reconciliation keeps all authority bindings visible and fail-closed"
+    )]
     pub fn reconcile(
         &mut self,
         generation: &PlatformHandle,
@@ -610,9 +646,7 @@ impl HostJobBranches {
         let mut store_degraded = false;
 
         if kernel_dead {
-            if self.terminate_kernel().is_err() {
-                kernel_degraded = true;
-            } else if self.kernel_restart_attempts >= 1 {
+            if self.terminate_kernel().is_err() || self.kernel_restart_attempts >= 1 {
                 kernel_degraded = true;
             } else {
                 self.kernel_restart_attempts += 1;
@@ -634,9 +668,7 @@ impl HostJobBranches {
         }
 
         if store_dead {
-            if self.terminate_store().is_err() {
-                store_degraded = true;
-            } else if self.store_restart_attempts >= 1 {
+            if self.terminate_store().is_err() || self.store_restart_attempts >= 1 {
                 store_degraded = true;
             } else {
                 self.store_restart_attempts += 1;
@@ -675,6 +707,15 @@ impl HostJobBranches {
     /// image.  The old branches are drained before the candidate is admitted;
     /// if candidate startup or suspended validation fails, only the supplied
     /// prior approved images may be relaunched.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when shutdown, candidate admission, or restoration of
+    /// the prior approved contour fails.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "candidate and rollback authority sets stay explicit to prevent cross-generation substitution"
+    )]
     pub fn cutover_with_rollback(
         &mut self,
         candidate_kernel: &Path,
@@ -746,6 +787,10 @@ impl HostJobBranches {
     }
 
     /// Terminates the Kernel branch during bounded rollback or shutdown.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the owned Kernel Job branch cannot be terminated.
     pub fn terminate_kernel(&mut self) -> Result<(), HostError> {
         if let Some(kernel) = self.kernel.take() {
             kernel
@@ -756,6 +801,10 @@ impl HostJobBranches {
     }
 
     /// Terminates the store branch during bounded rollback or shutdown.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the owned store Job branch cannot be terminated.
     pub fn terminate_store(&mut self) -> Result<(), HostError> {
         if let Some(store) = self.store.take() {
             store
@@ -830,6 +879,10 @@ impl HostJobBranches {
 }
 
 /// Host-owned lifecycle state and installation activation registry.
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "the lifecycle flags are independent durable shutdown and lease-release fences"
+)]
 pub struct HostComposition {
     state_store: RedbHostStateStore,
     registry_store: RedbInstallationRegistry,
@@ -849,6 +902,15 @@ pub struct HostComposition {
 impl HostComposition {
     /// Opens the durable Host contour for one installation identity and
     /// advances its persisted epoch before any process admission.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if installation identity, owner-lease acquisition,
+    /// durable admission, recovery state, or approved process startup fails.
+    #[allow(
+        clippy::needless_pass_by_value,
+        reason = "the public constructor owns the installation identity while retaining its established API"
+    )]
     pub fn open(path: impl AsRef<Path>, installation: PlatformHandle) -> Result<Self, HostError> {
         let path = path.as_ref();
         if installation.as_str().trim().is_empty() {
@@ -918,6 +980,15 @@ impl HostComposition {
     /// exactly matches the inspected stale process, epoch and Job disposition.
     /// This path does not advance an epoch or fabricate process identity and
     /// is intended for bounded offline recovery only.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the owner lease cannot be acquired, durable state
+    /// cannot be inspected, evidence mismatches, or recovery cannot finalize.
+    #[allow(
+        clippy::needless_pass_by_value,
+        reason = "the recovery API retains its established owned installation identity parameter"
+    )]
     pub fn recover_unclean(
         path: impl AsRef<Path>,
         installation: PlatformHandle,
@@ -971,6 +1042,10 @@ impl HostComposition {
     }
 
     /// Reads the Host-only operational state from redb.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the durable Host state cannot be loaded.
     pub fn snapshot(&self) -> Result<HostInstallationState, HostError> {
         self.state_store
             .load_installation()
@@ -984,6 +1059,10 @@ impl HostComposition {
     }
 
     /// Approves an immutable generation for a later activation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if approval validation or durable registry persistence fails.
     pub fn approve_generation(
         &mut self,
         manifest: CandidateManifest,
@@ -998,6 +1077,11 @@ impl HostComposition {
     }
 
     /// Activates an approved generation, preserving the previous one as LKG.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if admission is fenced, the generation is not
+    /// approved, an active contour requires cutover, or persistence fails.
     pub fn activate_generation(&mut self, generation: &PlatformHandle) -> Result<(), HostError> {
         self.ensure_admission_open()?;
         #[cfg(windows)]
@@ -1015,6 +1099,11 @@ impl HostComposition {
     }
 
     /// Rolls back to the registry's last-known-good generation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if admission is fenced, an active contour requires a
+    /// bounded rollback, no last-known-good generation exists, or persistence fails.
     pub fn rollback_generation(&mut self) -> Result<PlatformHandle, HostError> {
         self.ensure_admission_open()?;
         #[cfg(windows)]
@@ -1035,6 +1124,11 @@ impl HostComposition {
     /// any process is created, and the launch contour binds generation,
     /// configuration digest, installation and Host epoch into the child
     /// environment.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if admission is fenced, no approved generation exists,
+    /// or process identity, artifact, configuration, launch, or persistence fails.
     #[cfg(windows)]
     pub fn start_approved_contour(
         &mut self,
@@ -1066,7 +1160,7 @@ impl HostComposition {
             store_artifact,
             &self.host,
         )?;
-        if let Err(error) = self.persist_process_observations(active.manifest.generation.clone()) {
+        if let Err(error) = self.persist_process_observations(&active.manifest.generation) {
             self.cleanup_launched_contour(error)
         } else {
             Ok(())
@@ -1075,6 +1169,11 @@ impl HostComposition {
 
     /// Activates one approved generation only after a bounded process cutover;
     /// a rejected candidate restores the registry's previous LKG projection.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if admission is fenced, either generation is invalid,
+    /// cutover or rollback fails, or the registry cannot be persisted.
     #[cfg(windows)]
     pub fn cutover_generation(
         &mut self,
@@ -1150,7 +1249,8 @@ impl HostComposition {
                     let _ = self.registry_store.save(&self.registry);
                     return cleanup_error;
                 }
-                if let Err(error) = self.persist_process_observations(candidate.manifest.generation)
+                if let Err(error) =
+                    self.persist_process_observations(&candidate.manifest.generation)
                 {
                     let cleanup = self.cleanup_launched_contour(error);
                     // A post-launch observation failure must not leave the
@@ -1174,6 +1274,11 @@ impl HostComposition {
     }
 
     /// Reconciles the approved contour and records fresh process observations.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if admission is fenced, approved material cannot be
+    /// revalidated, branch reconciliation fails, or observations cannot persist.
     #[cfg(windows)]
     pub fn reconcile_approved_contour(&mut self) -> Result<HostBranchDisposition, HostError> {
         self.ensure_admission_open()?;
@@ -1199,11 +1304,10 @@ impl HostComposition {
             store_artifact,
             &self.host,
         )?;
-        if let Err(error) = self.persist_process_observations_with_disposition(
-            active.manifest.generation.clone(),
-            disposition,
-        ) {
-            return self.cleanup_launched_contour(error).map(|_| disposition);
+        if let Err(error) = self
+            .persist_process_observations_with_disposition(&active.manifest.generation, disposition)
+        {
+            return self.cleanup_launched_contour(error).map(|()| disposition);
         }
         Ok(disposition)
     }
@@ -1217,7 +1321,7 @@ impl HostComposition {
     }
 
     #[cfg(windows)]
-    fn persist_process_observations(&self, generation: PlatformHandle) -> Result<(), HostError> {
+    fn persist_process_observations(&self, generation: &PlatformHandle) -> Result<(), HostError> {
         self.persist_process_observations_with_disposition(
             generation,
             HostBranchDisposition::Healthy,
@@ -1227,13 +1331,13 @@ impl HostComposition {
     #[cfg(windows)]
     fn persist_process_observations_with_disposition(
         &self,
-        generation: PlatformHandle,
+        generation: &PlatformHandle,
         disposition: HostBranchDisposition,
     ) -> Result<(), HostError> {
         if let Some(kernel) = self.jobs.kernel_process() {
             let kernel_record = process_record(kernel, "Kernel", &self.host)?;
             let kernel_recovery = self.jobs.kernel_recovery_binding(
-                &generation,
+                generation,
                 &kernel_record,
                 &self.host.installation,
             )?;
@@ -1297,6 +1401,11 @@ impl HostComposition {
     }
 
     #[cfg(windows)]
+    /// Returns whether a durable degraded-branch recovery fence is active.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the durable Host state cannot be loaded.
     pub fn has_durable_branch_fence(&self) -> Result<bool, HostError> {
         Ok(self.snapshot()?.recovery_fence.is_some())
     }
@@ -1334,6 +1443,11 @@ impl HostComposition {
 
     /// Requests a bounded Host stop. SCM owns the sibling Watchdog and is not
     /// represented by either Host Job Object branch.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the Host is already stopped or if process
+    /// termination, durable shutdown finalization, or owner-lease release fails.
     pub fn stop(&mut self) -> Result<(), HostError> {
         if !self.running {
             return Err(HostError::Stopped);
@@ -1434,7 +1548,7 @@ fn host_process_recovery_binding(
     observed_process: &ServiceProcessRecord,
 ) -> Result<HostProcessRecoveryBinding, HostError> {
     let image_path = std::env::current_exe()
-        .and_then(|path| std::fs::canonicalize(path))
+        .and_then(std::fs::canonicalize)
         .map_err(|error| {
             HostError::Platform(format!("Host image identity unavailable: {error}"))
         })?;

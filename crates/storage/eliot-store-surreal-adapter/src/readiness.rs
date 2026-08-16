@@ -29,7 +29,7 @@ pub enum SemanticReadiness {
 pub struct CompiledMigration {
     /// Stable migration identity.
     pub(crate) migration_id: String,
-    /// SurrealQL statements applied inside a transaction.
+    /// `SurrealQL` statements applied inside a transaction.
     pub(crate) statements: String,
     /// SHA-256 checksum of the statements.
     pub(crate) checksum_sha256: String,
@@ -76,6 +76,8 @@ pub struct MigrationReceipt {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::expect_used)]
+
     use super::*;
 
     #[test]

@@ -130,15 +130,15 @@ impl std::fmt::Display for HostOwnerLeaseReleaseError {
 
 impl std::error::Error for HostOwnerLeaseReleaseError {}
 
-/// Protected ProgramData path policy used by Host, installation and
+/// Protected `ProgramData` path policy used by Host, installation and
 /// Watchdog durable state.  The policy is intentionally shared so a caller
 /// cannot substitute a per-user or arbitrary working-directory root.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ProtectedPathError {
-    /// ProgramData is missing, relative or cannot be canonicalized safely.
+    /// `ProgramData` is missing, relative or cannot be canonicalized safely.
     InvalidRoot,
     /// The requested path is absolute, traverses a parent, or escapes the
-    /// canonical ProgramData contour.
+    /// canonical `ProgramData` contour.
     InvalidPath,
     /// A path component or target is a symlink/junction/reparse point.
     ReparsePoint,
@@ -168,8 +168,13 @@ impl std::fmt::Display for ProtectedPathError {
 
 impl std::error::Error for ProtectedPathError {}
 
-/// Returns the canonical ProgramData directory after rejecting reparse
+/// Returns the canonical `ProgramData` directory after rejecting reparse
 /// substitution in the root and its existing ancestors.
+///
+/// # Errors
+///
+/// Returns an error when the root is absent, relative, cannot be canonicalized,
+/// or contains a reparse point.
 pub fn protected_program_data_root() -> Result<PathBuf, ProtectedPathError> {
     let raw = std::env::var_os("ProgramData").ok_or(ProtectedPathError::InvalidRoot)?;
     let raw = PathBuf::from(raw);
@@ -182,10 +187,15 @@ pub fn protected_program_data_root() -> Result<PathBuf, ProtectedPathError> {
     Ok(canonical)
 }
 
-/// Resolves a fixed relative path below the canonical ProgramData root.
+/// Resolves a fixed relative path below the canonical `ProgramData` root.
 /// Missing leaf components are allowed so callers can create them under the
 /// protected parent; existing components are checked before the result is
 /// returned.
+///
+/// # Errors
+///
+/// Returns an error when the relative path is invalid or escapes the protected
+/// root, or when the root cannot be verified safely.
 pub fn protected_program_data_path(
     relative: impl AsRef<Path>,
 ) -> Result<PathBuf, ProtectedPathError> {
@@ -212,6 +222,11 @@ pub fn protected_program_data_path(
 /// Requires a caller-provided path to equal one fixed ProgramData-relative
 /// identity and to remain below the canonical root.  This is the boundary
 /// used by public Host/Watchdog open APIs to reject arbitrary roots.
+///
+/// # Errors
+///
+/// Returns an error when the supplied path differs from the fixed protected
+/// identity or cannot be proven to remain within the protected root.
 pub fn require_protected_program_data_path(
     path: &Path,
     relative: impl AsRef<Path>,
@@ -224,7 +239,7 @@ pub fn require_protected_program_data_path(
     Ok(expected)
 }
 
-/// A retained no-follow lease for one protected ProgramData file.
+/// A retained no-follow lease for one protected `ProgramData` file.
 ///
 /// The lease owns a no-delete-sharing handle for every existing directory
 /// component and for the final file.  Consequently, once this value has been
@@ -251,20 +266,35 @@ impl std::fmt::Debug for ProtectedPathLease {
 }
 
 impl ProtectedPathLease {
-    /// Opens or creates one protected ProgramData file and retains its
+    /// Opens or creates one protected `ProgramData` file and retains its
     /// no-follow component handles.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an invalid path, reparse point, ACL mismatch,
+    /// filesystem failure, or unsupported platform.
     pub fn open_or_create(relative: impl AsRef<Path>) -> Result<Self, ProtectedPathError> {
         Self::open_relative(relative.as_ref(), true)
     }
 
-    /// Opens one existing protected ProgramData file and retains its
+    /// Opens one existing protected `ProgramData` file and retains its
     /// no-follow component handles.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the protected file or its contour cannot be
+    /// opened and verified without following a reparse point.
     pub fn open_existing(relative: impl AsRef<Path>) -> Result<Self, ProtectedPathError> {
         Self::open_relative(relative.as_ref(), false)
     }
 
     /// Opens one existing absolute path only after canonicalizing it into the
-    /// exact protected ProgramData contour.
+    /// exact protected `ProgramData` contour.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the path is outside the protected contour or the
+    /// retained file cannot be opened and verified safely.
     pub fn open_existing_absolute(path: &Path) -> Result<Self, ProtectedPathError> {
         let root = expected_root()?;
         ensure_protected_containment(&root, path)?;
@@ -290,6 +320,11 @@ impl ProtectedPathLease {
 
     /// Re-reads the identity from the retained handle and rejects any
     /// impossible handle/object change.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the retained handle cannot be inspected, its
+    /// identity changed, or retained-handle verification is unavailable.
     pub fn verify_stable_identity(&self) -> Result<(), ProtectedPathError> {
         #[cfg(windows)]
         {
@@ -309,6 +344,11 @@ impl ProtectedPathLease {
     /// Opens the path again with no-follow/no-delete-sharing and compares its
     /// identity to the retained lease.  This is the post-open proof required
     /// for redb, which accepts a path rather than an already-open handle.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the path cannot be reopened without following a
+    /// reparse point or its identity differs from the retained handle.
     pub fn verify_path_identity(&self) -> Result<(), ProtectedPathError> {
         #[cfg(windows)]
         {
@@ -327,6 +367,11 @@ impl ProtectedPathLease {
 
     /// Reads bounded bytes from the retained file handle.  No path is opened
     /// during this operation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when handle I/O fails, the file exceeds `limit`, or the
+    /// retained-handle implementation is unavailable.
     pub fn read_bounded(&self, limit: u64) -> Result<Vec<u8>, ProtectedPathError> {
         #[cfg(windows)]
         {
@@ -398,8 +443,13 @@ impl ProtectedPathLease {
     }
 }
 
-/// Creates and protects one ProgramData descendant directory.  Components
+/// Creates and protects one `ProgramData` descendant directory.  Components
 /// are created one at a time while each parent no-follow handle is retained.
+///
+/// # Errors
+///
+/// Returns an error when the path escapes the protected root, contains a
+/// reparse point, cannot receive the protected ACL, or cannot be created.
 pub fn prepare_protected_directory(path: &Path) -> Result<(), ProtectedPathError> {
     let root = expected_root()?;
     ensure_protected_containment(&root, path)?;
@@ -421,6 +471,11 @@ pub fn prepare_protected_directory(path: &Path) -> Result<(), ProtectedPathError
 /// Validates and retains an existing protected file immediately before a
 /// path-based consumer opens it.  Production consumers should retain the
 /// returned lease instead of calling this convenience validator.
+///
+/// # Errors
+///
+/// Returns an error when the file is outside the protected root or its
+/// no-follow identity and ACL cannot be verified.
 pub fn validate_protected_file(path: &Path) -> Result<(), ProtectedPathError> {
     let _lease = ProtectedPathLease::open_existing_absolute(path)?;
     Ok(())
@@ -428,6 +483,11 @@ pub fn validate_protected_file(path: &Path) -> Result<(), ProtectedPathError> {
 
 /// Reads one protected file through a retained no-follow handle.  The path is
 /// never reopened after the lease is acquired.
+///
+/// # Errors
+///
+/// Returns an error when the file cannot be opened safely, handle I/O fails,
+/// or the file exceeds `limit`.
 pub fn read_protected_file(path: &Path, limit: u64) -> Result<Vec<u8>, ProtectedPathError> {
     ProtectedPathLease::open_existing_absolute(path)?.read_bounded(limit)
 }
@@ -720,6 +780,11 @@ impl HostOwnerLease {
     /// any unclassified Win32 result are all returned as errors. The caller
     /// may proceed only on `Ok`, which means this process created and owns the
     /// mutex.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed error when the mutex already exists, creation or
+    /// ownership classification fails, or the platform is unsupported.
     pub fn acquire(installation: &PlatformHandle) -> Result<Self, HostOwnerLeaseError> {
         let name = host_owner_mutex_name(installation);
         #[cfg(windows)]
@@ -813,6 +878,11 @@ impl HostOwnerLease {
     /// Releases the owner mutex after the caller has durably recorded a
     /// release-pending Host disposition. Drop remains a last-resort close for
     /// error paths; callers must finalize clean state only after `Ok(())`.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed error when releasing or closing the mutex fails, or
+    /// when this operation is unavailable on the current platform.
     pub fn release(&mut self) -> Result<(), HostOwnerLeaseReleaseError> {
         #[cfg(windows)]
         {
@@ -836,7 +906,7 @@ impl HostOwnerLease {
                 });
             }
             self.handle = std::ptr::null_mut();
-            return Ok(());
+            Ok(())
         }
         #[cfg(not(windows))]
         {
@@ -1193,6 +1263,15 @@ impl WatchdogTaskRegistration {
     /// Creates a registration request from installer-pinned paths and
     /// digests.  The live SID/session and protected file identities are proved
     /// by [`register_interactive_watchdog_task`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when any fixed identity, absolute path, session, SID,
+    /// or artifact digest is invalid.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "installer-pinned paths, identity, session, and digests remain explicit"
+    )]
     pub fn new(
         task_name: impl Into<String>,
         notify_executable: impl Into<PathBuf>,
@@ -1330,6 +1409,11 @@ const WATCHDOG_FALLBACK_TASK_LEAF: &str = "WatchdogFallback";
 /// this boundary never manufactures, accepts or persists a logon token.  The
 /// task runs only in the installer-bound interactive SID/session and invokes
 /// the fixed no-stdin `--watchdog-fallback` mode.
+///
+/// # Errors
+///
+/// Returns an error when pinned registration evidence is invalid, the caller
+/// identity mismatches, or Task Scheduler registration/readback fails.
 pub fn register_interactive_watchdog_task(
     registration: &WatchdogTaskRegistration,
 ) -> Result<WatchdogTaskRegistrationReceipt, WindowsAdapterError> {
@@ -1391,6 +1475,11 @@ fn validate_watchdog_registration(
 
 /// Validates an installer-pinned executable with no-follow/reparse checks and
 /// returns the exact canonical path used for the digest proof.
+///
+/// # Errors
+///
+/// Returns an error when the path or digest is invalid, the artifact is absent
+/// or a reparse point, its identity changes, or its digest mismatches.
 pub fn validate_pinned_artifact(
     path: &Path,
     expected_sha256: &str,
@@ -1400,12 +1489,14 @@ pub fn validate_pinned_artifact(
     }
     #[cfg(windows)]
     {
+        use std::io::Read;
+        use std::os::windows::fs::OpenOptionsExt;
+
         reject_reparse_chain(path, true).map_err(|_| WindowsAdapterError::IdentityMismatch)?;
         let canonical = std::fs::canonicalize(path).map_err(|_| WindowsAdapterError::NotFound)?;
         reject_reparse_chain(&canonical, true)
             .map_err(|_| WindowsAdapterError::IdentityMismatch)?;
         let mut options = std::fs::OpenOptions::new();
-        use std::os::windows::fs::OpenOptionsExt;
         options.read(true).share_mode(
             windows_sys::Win32::Storage::FileSystem::FILE_SHARE_READ
                 | windows_sys::Win32::Storage::FileSystem::FILE_SHARE_WRITE,
@@ -1414,7 +1505,6 @@ pub fn validate_pinned_artifact(
         let mut file = options
             .open(&canonical)
             .map_err(|_| WindowsAdapterError::NotFound)?;
-        use std::io::Read;
         let metadata = file
             .metadata()
             .map_err(|_| WindowsAdapterError::Unavailable)?;
@@ -1516,6 +1606,11 @@ fn register_watchdog_task_windows(
 /// the protected Watchdog envelope is present.  A scheduler/API failure is
 /// returned as `Unavailable` so callers retain an unknown/reconcile cursor;
 /// it is never projected as a successful notification.
+///
+/// # Errors
+///
+/// Returns an error when pinned registration or envelope evidence is invalid,
+/// or when Task Scheduler cannot start and verify the fixed task.
 pub fn run_registered_watchdog_task(
     registration: &WatchdogTaskRegistration,
 ) -> Result<WatchdogTaskRunReceipt, WindowsAdapterError> {
@@ -1661,6 +1756,10 @@ fn readback_watchdog_task(
     Ok(actual_xml)
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "the fail-closed Task Scheduler XML shape remains one contiguous predicate"
+)]
 fn watchdog_task_readback_matches(
     registration: &WatchdogTaskRegistration,
     actual_xml: &str,
@@ -1892,7 +1991,7 @@ fn opening_tag<'a>(xml: &'a str, tag: &str) -> Option<&'a str> {
         matches!(
             xml.get(index + prefix.len()..)
                 .and_then(|rest| rest.chars().next()),
-            Some(' ') | Some('>') | Some('/')
+            Some(' ' | '>' | '/')
         )
         .then_some(index)
     })?;
@@ -1907,7 +2006,7 @@ fn count_xml_open_tag(xml: &str, tag: &str) -> usize {
             matches!(
                 xml.get(index + prefix.len()..)
                     .and_then(|rest| rest.chars().next()),
-                Some(' ') | Some('>') | Some('/')
+                Some(' ' | '>' | '/')
             )
         })
         .count()
@@ -2191,7 +2290,7 @@ impl OwnedSecurityDescriptor {
         Self::from_sddl("D:P(A;;GA;;;SY)(A;;GA;;;OW)")
     }
 
-    /// Protected durable state is writable only by LocalSystem and the local
+    /// Protected durable state is writable only by `LocalSystem` and the local
     /// Administrators group.  The descriptor is protected from inheriting a
     /// weaker parent DACL before it is applied to the opened no-follow handle.
     fn for_protected_storage() -> Result<Self, WindowsAdapterError> {
@@ -2206,8 +2305,14 @@ impl OwnedSecurityDescriptor {
         // SAFETY: `self.raw` is the descriptor allocated by
         // ConvertStringSecurityDescriptorToSecurityDescriptorW and remains
         // valid for this call; all output pointers are valid locals.
-        if unsafe { GetSecurityDescriptorDacl(self.raw, &mut present, &mut dacl, &mut defaulted) }
-            == 0
+        if unsafe {
+            GetSecurityDescriptorDacl(
+                self.raw,
+                &raw mut present,
+                &raw mut dacl,
+                &raw mut defaulted,
+            )
+        } == 0
             || present == 0
             || dacl.is_null()
         {
@@ -2280,7 +2385,7 @@ impl JobObject {
 
     /// Creates a fresh named Job Object and rejects an existing name.
     ///
-    /// The protected DACL grants full access only to LocalSystem and the
+    /// The protected DACL grants full access only to `LocalSystem` and the
     /// creating owner. A new generation therefore cannot silently join an
     /// older Job with the same durable identity.
     ///
@@ -2686,6 +2791,11 @@ pub struct PinnedRuntimeFile {
 impl PinnedRuntimeFile {
     /// Opens one regular non-reparse runtime input with replacement-blocking
     /// sharing semantics.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the path is not a regular absolute file, crosses
+    /// a reparse point, or cannot be opened with replacement-blocking sharing.
     pub fn open(path: &Path) -> Result<Self, WindowsAdapterError> {
         Ok(Self {
             _file: PinnedExecutable::open(path)?,
@@ -3024,10 +3134,11 @@ impl JobProcessObserver {
     }
 
     fn shutdown(&mut self) {
+        use windows_sys::Win32::System::IO::PostQueuedCompletionStatus;
+
         if self.thread.is_none() {
             return;
         }
-        use windows_sys::Win32::System::IO::PostQueuedCompletionStatus;
         // SAFETY: the port stays live until the observer thread is joined.
         let _ = unsafe {
             PostQueuedCompletionStatus(
@@ -3542,6 +3653,10 @@ impl SuspendedJobChild {
     /// # Errors
     /// Returns a typed adapter error before resume when any limit, Job, pipe,
     /// process, identity, or assignment operation fails.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "suspended launch and fail-closed cleanup ordering remain contiguous"
+    )]
     pub fn spawn_named_with_limits(
         spec: SuspendedLaunchSpec,
         job_identity: JobObjectIdentity,
@@ -3872,6 +3987,11 @@ impl<V> RunningJobChild<V> {
     /// A failed termination or bounded wait leaves the process and Job
     /// handles attached to this value so the owning executor can retry and
     /// retain exact cleanup evidence.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed adapter error when Job termination, bounded reap, or
+    /// final process evidence capture fails.
     pub fn terminate_in_place(
         &mut self,
         exit_code: u32,
@@ -3893,6 +4013,11 @@ impl<V> RunningJobChild<V> {
 /// `Ok(false)` means that the thread had no pending synchronous I/O when the
 /// cancellation was requested; callers still need to use their bounded wait
 /// policy before joining it.
+///
+/// # Errors
+///
+/// Returns a typed adapter error when Windows rejects the cancellation for a
+/// reason other than there being no pending synchronous I/O.
 #[cfg(windows)]
 pub fn cancel_capture_thread_io(
     thread: &std::thread::JoinHandle<()>,
@@ -4493,14 +4618,14 @@ fn deliver_shell_notification(_request: &NotificationRequest) -> Result<bool, Wi
     // zero-initialized; this selects the documented balloon timeout member.
     data.Anonymous.uTimeout = 10_000;
 
-    let added = unsafe { Shell_NotifyIconW(NIM_ADD, &data) != 0 };
+    let added = unsafe { Shell_NotifyIconW(NIM_ADD, &raw const data) != 0 };
     if !added {
         unsafe {
             DestroyWindow(hwnd);
         }
         return Ok(false);
     }
-    let accepted = unsafe { Shell_NotifyIconW(NIM_MODIFY, &data) != 0 };
+    let accepted = unsafe { Shell_NotifyIconW(NIM_MODIFY, &raw const data) != 0 };
     let delivered = if accepted {
         wait_for_shell_balloon(hwnd, data.uCallbackMessage)
     } else {
@@ -4509,7 +4634,7 @@ fn deliver_shell_notification(_request: &NotificationRequest) -> Result<bool, Wi
     // Keep the icon and hidden window alive until the bounded callback wait;
     // deleting immediately emits NIN_BALLOONHIDE and would falsify delivery.
     unsafe {
-        let _ = Shell_NotifyIconW(NIM_DELETE, &data);
+        let _ = Shell_NotifyIconW(NIM_DELETE, &raw const data);
         DestroyWindow(hwnd);
     }
     Ok(delivered)
@@ -4535,8 +4660,8 @@ fn wait_for_shell_balloon(hwnd: windows_sys::Win32::Foundation::HWND, callback: 
                 observed = true;
             }
             unsafe {
-                TranslateMessage(&message);
-                DispatchMessageW(&message);
+                TranslateMessage(&raw const message);
+                DispatchMessageW(&raw const message);
             }
         }
         if observed {

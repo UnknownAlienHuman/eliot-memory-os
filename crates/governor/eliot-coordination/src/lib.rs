@@ -432,6 +432,7 @@ impl CoordinationOwner {
         &self.events
     }
 
+    #[allow(clippy::unused_self)]
     fn common(&self, epoch: AuthorityEpoch, fence: &StateFence) -> Result<(), CoordinationError> {
         if epoch != fence.authority_epoch {
             return Err(CoordinationError::EpochMismatch);
@@ -440,6 +441,7 @@ impl CoordinationOwner {
             .validate()
             .map_err(|_| CoordinationError::FenceMismatch)
     }
+    #[allow(clippy::unused_self)]
     fn request(&self, id: &str) -> Result<(), CoordinationError> {
         text(id, "request_id")
     }
@@ -466,6 +468,7 @@ impl CoordinationOwner {
         self.events.push(event.clone());
         Ok(event)
     }
+    #[allow(clippy::too_many_arguments)]
     fn event(
         &self,
         request_id: &str,
@@ -811,6 +814,7 @@ impl CoordinationOwner {
         Ok(MailboxReceipt { message, event })
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn advance_item(
         &mut self,
         work_item_id: &str,
@@ -845,7 +849,7 @@ impl CoordinationOwner {
         }
         let event = self.event(
             request_id,
-            format!("{}:{}", work_item_id, request_id),
+            format!("{work_item_id}:{request_id}"),
             kind,
             work_item_id.to_owned(),
             session_id.to_owned(),
@@ -1065,10 +1069,10 @@ impl CoordinationOwner {
     ) -> Result<IntegrationLeaseDecision, CoordinationError> {
         text(&req.target_scope, "target_scope")?;
         self.session(&req.session_id, req.authority_epoch, &req.state_fence)?;
-        if let Some(old) = self.integrations.get(&req.target_scope) {
-            if old.expires_at >= req.now {
-                return Err(CoordinationError::WorkAlreadyOwned);
-            }
+        if let Some(old) = self.integrations.get(&req.target_scope)
+            && old.expires_at >= req.now
+        {
+            return Err(CoordinationError::WorkAlreadyOwned);
         }
         let lease = IntegrationLease {
             lease_id: req.lease_id.clone(),

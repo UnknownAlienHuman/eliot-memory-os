@@ -1054,22 +1054,39 @@ pub(super) fn task_tool_definitions() -> Vec<Value> {
             "eliot_task_contract_create",
             "Eliot TaskContract Create",
             "Create one canonical revision-fenced TaskContract with exactly two acceptance items.",
-            &json_schema(
-                &[
-                    ("project_id", "string"),
-                    ("task_id", "string"),
-                    ("write_id", "string"),
-                    ("title", "string"),
-                    ("acceptance_items", "array"),
-                ],
-                &[
+            &json!({
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                    "project_id": {"type": "string"},
+                    "task_id": {"type": "string"},
+                    "write_id": {"type": "string"},
+                    "title": {"type": "string"},
+                    "acceptance_items": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "additionalProperties": false,
+                            "properties": {
+                                "item_id": {"type": "string"},
+                                "description": {"type": "string"},
+                                "required_evidence": {
+                                    "type": "string",
+                                    "enum": ["observation", "verification"]
+                                }
+                            },
+                            "required": ["item_id", "description", "required_evidence"]
+                        }
+                    }
+                },
+                "required": [
                     "project_id",
                     "task_id",
                     "write_id",
                     "title",
-                    "acceptance_items",
-                ],
-            ),
+                    "acceptance_items"
+                ]
+            }),
         ),
         tool(
             "eliot_task_state",

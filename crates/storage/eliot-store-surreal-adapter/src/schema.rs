@@ -1,9 +1,9 @@
-//! Private SurrealDB physical schema and closed named-operation SurrealQL.
+//! Private `SurrealDB` physical schema and closed named-operation `SurrealQL`.
 //!
 //! Table names, record shapes, query strings and schema-generation mechanics
 //! never cross the crate boundary. Only [`eliot_store_api`] types and the
 //! bounded [`crate::error::AdapterError`] are exposed. This module is the
-//! single place that owns raw SurrealQL and physical names, so the "no SDK
+//! single place that owns raw `SurrealQL` and physical names, so the "no SDK
 //! types, credentials, table names or raw query strings outside the bridge"
 //! boundary is enforced structurally.
 
@@ -28,7 +28,7 @@ pub(crate) const SCHEMA_META_KEY: &str = "current";
 /// First-generation schema DDL for the canonical control tables. This is
 /// applied only through an explicit migration; it is never executed implicitly
 /// by the adapter.
-pub(crate) const SCHEMA_DDL: &str = r#"
+pub(crate) const SCHEMA_DDL: &str = r"
 DEFINE TABLE schema_meta SCHEMALESS;
 DEFINE FIELD generation ON schema_meta TYPE string;
 DEFINE FIELD migrations ON schema_meta TYPE array;
@@ -71,7 +71,7 @@ DEFINE INDEX oe_id ON outbox_event FIELDS outbox_id UNIQUE;
 DEFINE TABLE canonical_fence SCHEMALESS;
 DEFINE FIELD id ON canonical_fence TYPE string;
 DEFINE INDEX fence_id ON canonical_fence FIELDS id UNIQUE;
-"#;
+";
 /// Transaction delimiters for a single atomic apply.
 pub(crate) const TX_BEGIN: &str = "BEGIN TRANSACTION;";
 pub(crate) const TX_COMMIT: &str = "COMMIT TRANSACTION;";
@@ -112,7 +112,7 @@ pub(crate) const TX_UPSERT_SCHEMA_META: &str =
     "UPSERT type::record($schema_meta_table, $schema_meta_key) CONTENT $schema_meta_record;";
 
 /// Closed read templates. Results select `body` values so they deserialize
-/// back into store-API types without a SurrealDB `id` field.
+/// back into store-API types without a `SurrealDB` `id` field.
 pub(crate) const READ_SCHEMA_GENERATION: &str =
     "SELECT generation, migration_state FROM ONLY schema_meta:current;";
 
@@ -121,10 +121,10 @@ pub(crate) const READ_FENCE: &str = "SELECT * FROM ONLY canonical_fence:current;
 pub(crate) const READ_RECEIPT_BY_OPERATION: &str =
     "SELECT VALUE body FROM ONLY type::record($table, $key);";
 
-pub(crate) const READ_RECEIPT_IDEMPOTENCY: &str = r#"
+pub(crate) const READ_RECEIPT_IDEMPOTENCY: &str = r"
 SELECT VALUE body FROM write_receipt WHERE operation_id = $operation_id LIMIT 1;
 SELECT VALUE body FROM write_receipt WHERE idempotency_key = $idempotency_key LIMIT 1;
-"#;
+";
 
 pub(crate) const READ_REVISION_HEADS_BY_KEYS: &str =
     "SELECT VALUE body FROM revision_head WHERE revision_key IN $keys;";

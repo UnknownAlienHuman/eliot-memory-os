@@ -717,7 +717,10 @@ async fn canonical_l10_l12_records_are_idempotent_restart_safe_and_bounded()
         .await?;
     assert_eq!(candidates.candidates.len(), 1);
     assert!(candidates.truncation.truncated);
-    assert!(candidates.candidates[0].receipt_body["candidate_only"] == Value::Bool(true));
+    assert_eq!(
+        candidates.candidates[0].receipt_body["candidate_only"],
+        Value::Bool(true)
+    );
     assert_eq!(
         candidates.candidates[0]
             .canonical_receipt

@@ -3,9 +3,12 @@ use std::sync::{Arc, Mutex};
 
 use eliot_observation_contracts::ObservationScope;
 use eliot_process::{
-    CancellationReceipt, EnvironmentInheritance, EnvironmentProjection, FencingToken, Generation,
-    OperationId, ProcessEvidence, ProcessLifecycle, ProcessRequest, ProcessStartReceipt,
-    ProcessTreeId, ResourceLimits as ProcessLimits,
+    ActionLeaseRef, CancellationReceipt, CancellationRequest, DispatchAuthorityId,
+    DispatchPermitAuthority, DispatchValidationContext, EnvironmentInheritance,
+    EnvironmentProjection, FencingToken, Generation, ImageId, JobId, KernelDispatchKey,
+    OperationId, PermitIssuance, ProcessEvidence, ProcessHealth, ProcessHealthStatus, ProcessId,
+    ProcessIntent, ProcessRequest, ProcessStartReceipt, ProcessState, ProcessTreeId,
+    ResourceLimits as ProcessLimits, SessionId, SuspendedProcessIdentity,
 };
 use eliot_runtime_contracts::{ModuleGeneration, RuntimeLease};
 use eliot_security_contracts::{PrivacyClass, SourceAssurance};
@@ -250,6 +253,7 @@ struct MockState {
     process_start_calls: usize,
     cancel_calls: usize,
     engine_calls: usize,
+    process: Option<ProcessState>,
     last_invocation: Option<EngineInvocation>,
 }
 
@@ -388,18 +392,31 @@ impl PromotionVerificationPort for PromotionMock {
 struct ProcessMock {
     config: Config,
     state: Arc<Mutex<MockState>>,
+    authority: DispatchPermitAuthority,
 }
 
 impl P03ProcessPort for ProcessMock {
     fn prepare(&mut self, envelope: &ProcessLaunchEnvelope) -> Result<ProcessRequest, PortError> {
         let generation = must(Generation::new(envelope.generation.generation.value()));
-        ProcessRequest::new(
+        let intent = ProcessIntent::new(
             must(OperationId::new(envelope.invocation_id.as_str())),
             must(ProcessTreeId::new(if self.config.process_prepare_invalid {
                 "wrong-scope"
             } else {
                 "scope-1"
             })),
+            must(JobId::new(format!(
+                "job-{}",
+                envelope.invocation_id.as_str()
+            ))),
+            must(ImageId::new(format!(
+                "image-{}",
+                envelope.invocation_id.as_str()
+            ))),
+            must(SessionId::new(format!(
+                "session-{}",
+                envelope.invocation_id.as_str()
+            ))),
             generation,
             "eliot-wasm-host.exe",
             "e".repeat(64),
@@ -418,67 +435,132 @@ impl P03ProcessPort for ProcessMock {
                 envelope.limits.max_output_bytes,
                 0,
             )),
-            must(FencingToken::new(
-                envelope.lease.state_fence.authority_epoch.value(),
-                generation,
-                "fence-1",
-            )),
         )
-        .map_err(|_| PortError::Denied)
+        .map_err(|_| PortError::Denied)?;
+        let permit = self
+            .authority
+            .issue(
+                &intent,
+                must(PermitIssuance::new(
+                    must(ActionLeaseRef::new(format!(
+                        "process-lease-{}",
+                        envelope.invocation_id.as_str()
+                    ))),
+                    must(FencingToken::new(
+                        envelope.lease.state_fence.authority_epoch.value(),
+                        generation,
+                        format!("fence-{}", envelope.invocation_id.as_str()),
+                    )),
+                    process_revision_heads(),
+                    100,
+                    10_000,
+                    format!("nonce-{}", envelope.invocation_id.as_str()),
+                )),
+            )
+            .map_err(|_| PortError::Denied)?;
+        ProcessRequest::new(intent, permit).map_err(|_| PortError::Denied)
     }
 
-    fn start(&mut self, request: &ProcessRequest) -> Result<ProcessStartReceipt, PortError> {
+    fn start(&mut self, request: ProcessRequest) -> Result<ProcessStartReceipt, PortError> {
         lock_state(&self.state).process_start_calls += 1;
         if let Some(error) = self.config.process_start_error {
             return Err(error);
         }
-        ProcessStartReceipt::new(request, ProcessLifecycle::Running).map_err(|_| PortError::Denied)
+        let observed = SuspendedProcessIdentity::new(
+            ProcessId::new(format!("process-{}", request.operation_id().as_str()))
+                .map_err(|_| PortError::Denied)?,
+            request.process_tree_id().clone(),
+            request.job_id().clone(),
+            request.image_id().clone(),
+            request.session_id().clone(),
+            request.generation(),
+            4242,
+            120,
+            request.executable_sha256(),
+        )
+        .map_err(|_| PortError::Denied)?;
+        let clock = must(serde_json::from_value(json!({
+            "valid_time_ms": 150,
+            "known_time_ms": 150,
+            "transaction_sequence": null,
+            "monotonic_ns": 1
+        })));
+        let context = DispatchValidationContext::new(
+            clock,
+            request.fence().clone(),
+            request.fence().authority_epoch(),
+            process_revision_heads(),
+            1,
+        )
+        .map_err(|_| PortError::Denied)?;
+        let validated = self
+            .authority
+            .validate_and_consume(request, observed, &context)
+            .map_err(|_| PortError::Denied)?;
+        let mut process = ProcessState::from_validated(&validated);
+        process
+            .mark_resumed(
+                151,
+                ProcessHealth::new(ProcessHealthStatus::Healthy, true, 151, None)
+                    .map_err(|_| PortError::Denied)?,
+            )
+            .map_err(|_| PortError::Denied)?;
+        let receipt = ProcessStartReceipt::new(&process).map_err(|_| PortError::Denied)?;
+        lock_state(&self.state).process = Some(process);
+        Ok(receipt)
     }
 
-    fn cancel(&mut self, request: &ProcessRequest) -> Result<CancellationReceipt, PortError> {
-        lock_state(&self.state).cancel_calls += 1;
-        let operation_id = if self.config.cancel_receipt_mismatch {
-            "different-operation"
-        } else {
-            request.operation_id().as_str()
-        };
-        serde_json::from_value(json!({
-            "operation_id": operation_id,
-            "request_digest": request.invocation_digest(),
-            "status": "completed",
-            "lifecycle": "exited",
-            "no_effect_proven": true,
-            "descendants": {
-                "process_ids": [], "complete": true, "tree_terminated": true,
-                "evidence_ref": "cancel-evidence-1"
-            }
-        }))
-        .map_err(|_| PortError::UnknownOutcome)
+    fn cancel(&mut self, binding: &ProcessBinding) -> Result<CancellationReceipt, PortError> {
+        let mut state = lock_state(&self.state);
+        state.cancel_calls += 1;
+        let process = state.process.as_mut().ok_or(PortError::UnknownOutcome)?;
+        if !binding_matches_state(binding, process) {
+            return Err(PortError::Denied);
+        }
+        process
+            .cancel(&CancellationRequest::new(process.binding().clone()))
+            .map_err(|_| PortError::UnknownOutcome)
     }
 
-    fn reconcile(&mut self, request: &ProcessRequest) -> Result<ProcessEvidence, PortError> {
-        serde_json::from_value(json!({
-            "operation_id": request.operation_id().as_str(),
-            "request_digest": request.invocation_digest(),
-            "view": {
-                "operation_id": request.operation_id().as_str(),
-                "process_tree_id": request.process_tree_id().as_str(),
-                "generation": request.generation().get(),
-                "request_digest": request.invocation_digest(),
-                "lifecycle": "reconciled",
-                "health": {"status":"healthy","ready":false,"observed_at_unix_ms":1,"detail":null},
-                "cancellation": "completed", "identity": null, "exit": null,
-                "descendants": {"process_ids":[],"complete":true,"tree_terminated":true,"evidence_ref":"reconcile-1"},
-                "fence": {
-                    "authority_epoch": request.fence().authority_epoch(),
-                    "generation": request.fence().generation().get(),
-                    "nonce": request.fence().nonce()
-                }
-            },
-            "stdout_ref": null, "stderr_ref": null
-        }))
-        .map_err(|_| PortError::UnknownOutcome)
+    fn reconcile(&mut self, binding: &ProcessBinding) -> Result<ProcessEvidence, PortError> {
+        let state = lock_state(&self.state);
+        let process = state.process.as_ref().ok_or(PortError::UnknownOutcome)?;
+        if !binding_matches_state(binding, process) {
+            return Err(PortError::Denied);
+        }
+        let axes = must(serde_json::from_value(json!({
+            "status": "OBSERVED",
+            "assertability": "NON_ASSERTABLE_UNVERIFIED",
+            "accessibility": "AVAILABLE",
+            "influence": "ALLOWED",
+            "physical": "PRESENT",
+            "taint": "CLEAR"
+        })));
+        ProcessEvidence::new(process.view(), None, None, axes)
+            .map_err(|_| PortError::UnknownOutcome)
     }
+}
+
+fn process_authority() -> DispatchPermitAuthority {
+    DispatchPermitAuthority::activate(
+        must(DispatchAuthorityId::new("wasm-runtime-authority")),
+        must(KernelDispatchKey::from_secret_bytes([0x6b; 32])),
+    )
+}
+
+fn process_revision_heads() -> BTreeMap<String, String> {
+    BTreeMap::from([
+        ("authority".to_owned(), "a".repeat(64)),
+        ("state".to_owned(), "b".repeat(64)),
+    ])
+}
+
+fn binding_matches_state(binding: &ProcessBinding, process: &ProcessState) -> bool {
+    let observed = process.binding();
+    observed.operation_id() == binding.operation_id()
+        && observed.process_tree_id() == binding.process_tree_id()
+        && observed.request_digest() == binding.request_digest()
+        && observed.state_fence().matches(binding.fence())
 }
 
 struct ReceiptVerifierMock {
@@ -488,14 +570,15 @@ struct ReceiptVerifierMock {
 impl P03ReceiptVerifierPort for ReceiptVerifierMock {
     fn verify_start(
         &mut self,
-        request: &ProcessRequest,
+        binding: &ProcessBinding,
         receipt: &ProcessStartReceipt,
         envelope: &ProcessLaunchEnvelope,
     ) -> Result<(), PortError> {
         if self.config.reject_start_receipt
-            || receipt.operation_id() != request.operation_id()
-            || receipt.request_digest() != request.invocation_digest()
-            || request.fence().authority_epoch()
+            || receipt.operation_id() != binding.operation_id()
+            || receipt.request_digest() != binding.request_digest()
+            || !receipt.binding().state_fence().matches(binding.fence())
+            || binding.fence().authority_epoch()
                 != envelope.lease.state_fence.authority_epoch.value()
         {
             Err(PortError::Denied)
@@ -506,16 +589,18 @@ impl P03ReceiptVerifierPort for ReceiptVerifierMock {
 
     fn verify_cancellation(
         &mut self,
-        request: &ProcessRequest,
+        binding: &ProcessBinding,
         receipt: &CancellationReceipt,
         envelope: &ProcessLaunchEnvelope,
     ) -> Result<(), PortError> {
-        let value = serde_json::to_value(receipt).map_err(|_| PortError::UnknownOutcome)?;
-        let exact = value["operation_id"] == request.operation_id().as_str()
-            && value["request_digest"] == request.invocation_digest()
-            && request.fence().authority_epoch()
+        let receipt_binding = receipt.binding();
+        let exact = receipt_binding.operation_id() == binding.operation_id()
+            && receipt_binding.process_tree_id() == binding.process_tree_id()
+            && receipt_binding.request_digest() == binding.request_digest()
+            && receipt_binding.state_fence().matches(binding.fence())
+            && binding.fence().authority_epoch()
                 == envelope.lease.state_fence.authority_epoch.value();
-        if self.config.reject_cancel_receipt || !exact {
+        if self.config.cancel_receipt_mismatch || self.config.reject_cancel_receipt || !exact {
             Err(PortError::Denied)
         } else {
             Ok(())
@@ -524,13 +609,16 @@ impl P03ReceiptVerifierPort for ReceiptVerifierMock {
 
     fn verify_reconciliation(
         &mut self,
-        request: &ProcessRequest,
+        binding: &ProcessBinding,
         evidence: &ProcessEvidence,
         envelope: &ProcessLaunchEnvelope,
     ) -> Result<(), PortError> {
-        let exact = evidence.operation_id() == request.operation_id()
-            && evidence.request_digest() == request.invocation_digest()
-            && evidence.view().fence().authority_epoch()
+        let evidence_binding = evidence.binding();
+        let exact = evidence_binding.operation_id() == binding.operation_id()
+            && evidence_binding.process_tree_id() == binding.process_tree_id()
+            && evidence_binding.request_digest() == binding.request_digest()
+            && evidence_binding.state_fence().matches(binding.fence())
+            && binding.fence().authority_epoch()
                 == envelope.lease.state_fence.authority_epoch.value();
         if self.config.reject_reconcile_evidence || !exact {
             Err(PortError::Denied)
@@ -615,6 +703,7 @@ fn runtime(config: Config) -> (WasmRuntime, Arc<Mutex<MockState>>) {
         Box::new(ProcessMock {
             config: config.clone(),
             state: Arc::clone(&state),
+            authority: process_authority(),
         }),
         Box::new(ReceiptVerifierMock {
             config: config.clone(),
@@ -680,7 +769,7 @@ fn p03_start_and_separate_receipt_verification_precede_engine() {
 }
 
 #[test]
-fn engine_receives_the_exact_sealed_authority_and_limit_envelope() {
+fn engine_receives_exact_admission_limits_and_inert_process_binding() {
     let (mut runtime, state) = runtime(Config::default());
     assert_eq!(
         runtime.execute(request()).receipt.disposition,
@@ -720,6 +809,18 @@ fn engine_receives_the_exact_sealed_authority_and_limit_envelope() {
     assert!(invocation.limits.max_instances > 0);
     assert!(invocation.limits.max_stack_bytes > 0);
     assert!(invocation.limits.epoch.deadline_ticks > 0);
+    assert_eq!(
+        invocation.process_binding.operation_id().as_str(),
+        "invoke-1"
+    );
+    assert_eq!(
+        invocation.process_start_receipt.operation_id(),
+        invocation.process_binding.operation_id()
+    );
+    assert_eq!(
+        invocation.process_start_receipt.request_digest(),
+        invocation.process_binding.request_digest()
+    );
     assert!(
         invocation
             .limits
@@ -811,6 +912,65 @@ fn cancellation_receipt_must_bind_exact_request_and_fence() {
 }
 
 #[test]
+fn unknown_start_is_single_shot_and_follow_up_uses_inert_binding() {
+    let config = Config {
+        process_start_error: Some(PortError::UnknownOutcome),
+        ..Config::default()
+    };
+    let original = request();
+    let invocation_id = original.invocation_id.clone();
+    let request_digest = original.request_digest().clone();
+    let (mut runtime, state) = runtime(config);
+
+    let unknown = runtime.execute(original.clone());
+    assert_eq!(unknown.receipt.disposition, InvocationDisposition::Unknown);
+    assert_eq!(unknown.receipt.error, Some(RuntimeError::UnknownOutcome));
+    assert_eq!(lock_state(&state).process_start_calls, 1);
+
+    let cancellation = must(runtime.cancel(&invocation_id, &request_digest));
+    assert_eq!(
+        cancellation.receipt.disposition,
+        InvocationDisposition::Unknown
+    );
+    assert_eq!(
+        cancellation.receipt.error,
+        Some(RuntimeError::UnknownOutcome)
+    );
+    assert_eq!(lock_state(&state).cancel_calls, 1);
+    assert_eq!(runtime.execute(original), cancellation);
+    assert_eq!(lock_state(&state).process_start_calls, 1);
+}
+
+#[test]
+fn missing_descendant_evidence_keeps_cancellation_unknown() {
+    let mut partial = ReportSpec::terminated(EngineTermination::Partial);
+    partial.post_commit_known = false;
+    let config = Config {
+        report: partial,
+        ..Config::default()
+    };
+    let original = request();
+    let invocation_id = original.invocation_id.clone();
+    let request_digest = original.request_digest().clone();
+    let (mut runtime, state) = runtime(config);
+
+    assert_eq!(
+        runtime.execute(original).receipt.disposition,
+        InvocationDisposition::Unknown
+    );
+    let cancellation = must(runtime.cancel(&invocation_id, &request_digest));
+    assert_eq!(
+        cancellation.receipt.disposition,
+        InvocationDisposition::Unknown
+    );
+    assert_eq!(
+        cancellation.receipt.error,
+        Some(RuntimeError::UnknownOutcome)
+    );
+    assert_eq!(lock_state(&state).cancel_calls, 1);
+}
+
+#[test]
 fn extended_table_instance_stack_epoch_and_artifact_limits_fail_closed() {
     for invalid_limit in [
         InvalidLimit::Table,
@@ -849,6 +1009,16 @@ fn malformed_ids_digests_and_unknown_fields_fail_deserialization() {
     let mut unknown = value;
     unknown["authority"] = json!({});
     assert!(serde_json::from_value::<InvocationRequest>(unknown).is_err());
+}
+
+#[test]
+fn unsupported_guest_target_remains_fail_closed() {
+    let mut unsupported = manifest();
+    unsupported.guest_target = "wasm32-unknown-unknown".to_owned();
+    assert_eq!(
+        unsupported.validate(),
+        Err(RuntimeError::UnsupportedGuestTarget)
+    );
 }
 
 #[test]

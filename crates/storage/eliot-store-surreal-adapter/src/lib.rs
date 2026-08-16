@@ -1,6 +1,6 @@
-//! Sole SurrealDB credential and client owner for the ELIOT canonical store.
+//! Sole `SurrealDB` credential and client owner for the ELIOT canonical store.
 //!
-//! This crate is the only place that holds SurrealDB credentials and drives the
+//! This crate is the only place that holds `SurrealDB` credentials and drives the
 //! versioned named-operation WebSocket/RPC bridge. It implements the
 //! store-neutral [`CanonicalStoreClient`] contract so that no provider client
 //! type, credential, physical table name or raw query string crosses this
@@ -41,7 +41,7 @@ pub use error::AdapterError;
 pub use health::{AdapterAvailability, AdapterHealth, ProviderHealth};
 pub use readiness::{CompiledMigration, MigrationReceipt, SemanticReadiness};
 
-/// The sole SurrealDB credential and client owner for the ELIOT canonical
+/// The sole `SurrealDB` credential and client owner for the ELIOT canonical
 /// store.
 pub struct SurrealStoreAdapter {
     pub(crate) config: SurrealAdapterConfig,
@@ -57,6 +57,8 @@ impl fmt::Debug for SurrealStoreAdapter {
             .debug_struct("SurrealStoreAdapter")
             .field("config", &self.config)
             .field("connected", &self.client.get().is_some())
+            .field("write_lock", &"private")
+            .field("operation_manifest", &self.operation_manifest)
             .finish()
     }
 }
@@ -231,7 +233,7 @@ impl CanonicalStoreClient for SurrealStoreAdapter {
 }
 
 fn default_manifest() -> NamedOperationManifest {
-    NamedOperationManifest::new(
+    match NamedOperationManifest::new(
         ADAPTER_NAME,
         CONTRACT_VERSION,
         vec![
@@ -245,12 +247,18 @@ fn default_manifest() -> NamedOperationManifest {
         1024 * 1024,
         1024 * 1024,
         30_000,
-    )
-    .expect("built-in adapter manifest is valid")
+    ) {
+        Ok(manifest) => manifest,
+        Err(error) => unreachable!(
+            "built-in adapter manifest literals violated the typed manifest invariant: {error}"
+        ),
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::expect_used)]
+
     use secrecy::SecretString;
 
     use super::*;

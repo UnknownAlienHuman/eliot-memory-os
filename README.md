@@ -7,12 +7,12 @@ ELIOT is a governed memory, understanding, and learning system for AI agents.
 The repository contains the native Windows Rust Governor, canonical memory and
 governance schemas, host integrations, deterministic tests, migrations, and the
 operator application. [`docs/ARCHITECTURE_CONTRACT.md`](docs/ARCHITECTURE_CONTRACT.md)
-separates current implementation truth from the canonical vision and future
-design specifications.
+routes to the external Architecture 4.5 / Implementation 0.29 normative pair
+and separates target contracts from current source and runtime evidence.
 
 ## Development
 
-MSVC Rust 1.96.1, pinned exactly by `rust-toolchain.toml`.
+MSVC Rust 1.97.1, pinned exactly by `rust-toolchain.toml`.
 
 ```powershell
 cargo metadata --no-deps

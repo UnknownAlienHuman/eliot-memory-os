@@ -7,7 +7,7 @@
 #![forbid(unsafe_code)]
 
 use eliot_types::verification::{
-    SkippedTest, SkippedTestReason, TestCostClass, TestInventory, TestMetadata, TestStatefulness,
+    SkippedTest, SkippedTestReason, TestInventory, TestMetadata, TestStatefulness,
     TestSuiteProfile, VerificationCommandResult, VerificationCommandStatus, VerificationDecision,
     VerificationPlan, VerificationRun, VerificationRunStatus, VerificationVerdict,
 };
@@ -220,10 +220,10 @@ fn skip_reason(test: &TestMetadata, profile: &TestSuiteProfile) -> Option<Skippe
             _ => SkippedTestReason::OutOfScopeForProfile,
         });
     }
-    if let Some(max) = profile.max_cost_class {
-        if test.estimated_cost > max {
-            return Some(SkippedTestReason::DeepOnly);
-        }
+    if let Some(max) = profile.max_cost_class
+        && test.estimated_cost > max
+    {
+        return Some(SkippedTestReason::DeepOnly);
     }
     None
 }
@@ -346,8 +346,9 @@ pub fn verdict(
         VerificationRunStatus::Passed if warnings.is_empty() => VerificationDecision::Allow,
         VerificationRunStatus::Passed => VerificationDecision::AllowWithWarnings,
         VerificationRunStatus::Partial => VerificationDecision::RequireFullVerify,
-        VerificationRunStatus::Blocked => VerificationDecision::Block,
-        VerificationRunStatus::Failed => VerificationDecision::Block,
+        VerificationRunStatus::Blocked | VerificationRunStatus::Failed => {
+            VerificationDecision::Block
+        }
     };
     Ok(VerificationVerdict {
         verdict_id: id("verdict", (&run.run_id, &run.plan_id, &decision)),

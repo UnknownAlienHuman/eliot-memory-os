@@ -172,7 +172,6 @@ impl SignedWatchdogFallbackEnvelope {
 pub fn watchdog_signature_payload(
     signed: &SignedWatchdogFallbackEnvelope,
 ) -> Result<Vec<u8>, NotifyError> {
-    signed.validate_metadata_shape()?;
     #[derive(Serialize)]
     struct SignaturePayload<'a> {
         domain: &'a str,
@@ -180,6 +179,7 @@ pub fn watchdog_signature_payload(
         key_id: &'a PlatformHandle,
         envelope: &'a WatchdogFallbackEnvelope,
     }
+    signed.validate_metadata_shape()?;
     eliot_receipts::canonical_json_bytes(&SignaturePayload {
         domain: &signed.domain,
         algorithm: &signed.algorithm,

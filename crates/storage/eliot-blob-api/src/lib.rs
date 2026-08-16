@@ -761,7 +761,7 @@ fn hex_encode(bytes: &[u8]) -> String {
 }
 
 fn hex_decode(value: &str) -> Result<Vec<u8>, BlobError> {
-    if value.len() % 2 != 0 {
+    if !value.len().is_multiple_of(2) {
         return Err(BlobError::Receipt(
             "invalid issuer signature encoding".to_owned(),
         ));
@@ -1315,7 +1315,9 @@ pub struct BlobReadyReceipt {
 impl BlobReadyReceipt {
     /// Constructs a capability from an independently verified receipt. The
     /// verified binding must identify this exact locator and generations.
-    #[allow(clippy::too_many_arguments)]
+    /// Ownership-taking parameters retain the established public constructor
+    /// shape even where validation only needs borrowed views.
+    #[allow(clippy::needless_pass_by_value, clippy::too_many_arguments)]
     pub fn from_verified(
         verified: VerifiedBlobReceipt,
         expected_anchor: &BlobIssuerTrustAnchor,
@@ -1519,6 +1521,9 @@ pub struct BlobReadChunk {
 impl BlobReadChunk {
     /// Constructs a read capability from an independently verified receipt and
     /// an already verified ready capability.
+    /// Ownership-taking parameters retain the established public constructor
+    /// shape even where validation only needs borrowed views.
+    #[allow(clippy::needless_pass_by_value)]
     pub fn from_verified(
         verified: VerifiedBlobReceipt,
         expected_anchor: &BlobIssuerTrustAnchor,
@@ -1660,6 +1665,9 @@ pub struct BlobGcReceipt {
 }
 
 impl BlobGcReceipt {
+    /// Ownership-taking parameters retain the established public constructor
+    /// shape even where validation only needs borrowed views.
+    #[allow(clippy::needless_pass_by_value)]
     pub fn from_verified(
         verified: VerifiedBlobReceipt,
         expected_anchor: &BlobIssuerTrustAnchor,
@@ -2003,11 +2011,17 @@ mod tests {
     #[test]
     fn generated_paths_are_component_relative() {
         let locator = BlobLocator {
-            hash: BlobHash::new("a".repeat(64)).expect("hash"),
+            hash: match BlobHash::new("a".repeat(64)) {
+                Ok(hash) => hash,
+                Err(error) => panic!("hash: {error}"),
+            },
             root_generation: 7,
             path_generation: 1,
         };
-        let path = payload_path(&locator).expect("path");
+        let path = match payload_path(&locator) {
+            Ok(path) => path,
+            Err(error) => panic!("path: {error}"),
+        };
         assert_eq!(
             path.normalized_identity(),
             format!("objects/g7/aa/{}.p1", "a".repeat(64))

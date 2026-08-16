@@ -69,8 +69,7 @@ impl KernelServiceState {
     fn transition_to(self, next: Self) -> Result<Self, KernelServiceError> {
         let legal = matches!(
             (self, next),
-            (Self::Cold, Self::Reconciling)
-                | (Self::Stopped, Self::Reconciling)
+            (Self::Cold | Self::Stopped, Self::Reconciling)
                 | (Self::Failed, Self::Reconciling | Self::ManualRecovery)
                 | (Self::Reconciling, Self::ShadowNoAuthority | Self::Failed)
                 | (
@@ -302,10 +301,10 @@ impl KernelService {
         match command {
             KernelControlCommand::Reconcile(handshake) => self.reconcile(handshake)?,
             KernelControlCommand::Shadow => {
-                self.transition(KernelServiceState::ShadowNoAuthority)?
+                self.transition(KernelServiceState::ShadowNoAuthority)?;
             }
             KernelControlCommand::PrepareHandoff => {
-                self.transition(KernelServiceState::HandoffPrepared)?
+                self.transition(KernelServiceState::HandoffPrepared)?;
             }
             KernelControlCommand::Activate => self.transition(KernelServiceState::Activating)?,
             KernelControlCommand::Ready(receipt) => self.mark_ready(receipt)?,

@@ -110,7 +110,7 @@ pub fn execute<B: ErasureBackend>(
     ensure_exact_locations(&request.locations, &erased)?;
     let tombstone_digest = tombstone_digest(request, &request_digest);
     let purge = PurgeLedgerEntry {
-        purge_id: format!("purge-{}", request_digest),
+        purge_id: format!("purge-{request_digest}"),
         subject_ref: request.subject_ref.clone(),
         scope: request.scope.clone(),
         purged_locations: erased,

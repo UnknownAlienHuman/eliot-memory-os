@@ -11,8 +11,9 @@ use eliot_security_contracts::{
 use crate::{
     AuthorityResolution, DerivedExecutionEvidence, EngineInvocation, EngineReport,
     EngineTermination, GovernorResolution, InvocationDisposition, InvocationRequest,
-    InvocationResult, PortError, ProcessLaunchEnvelope, PromotionQuery, PromotionVerification,
-    RuntimeError, RuntimePorts, Sha256Digest, SourceVerification, canonical_digest, validate_text,
+    InvocationResult, PortError, ProcessBinding, ProcessLaunchEnvelope, PromotionQuery,
+    PromotionVerification, RuntimeError, RuntimePorts, Sha256Digest, SourceVerification,
+    canonical_digest, validate_text,
 };
 
 #[derive(Clone)]
@@ -28,7 +29,7 @@ struct CachedInvocation {
     request: InvocationRequest,
     admission: Option<SealedAdmission>,
     launch_envelope: Option<ProcessLaunchEnvelope>,
-    process_request: Option<ProcessRequest>,
+    process_binding: Option<ProcessBinding>,
     engine_invocation: Option<EngineInvocation>,
     result: InvocationResult,
 }
@@ -107,8 +108,8 @@ impl WasmRuntime {
         ) {
             return Err(RuntimeError::TerminalCancellationConflict);
         }
-        let process_request = cached
-            .process_request
+        let process_binding = cached
+            .process_binding
             .as_ref()
             .ok_or(RuntimeError::UnknownOutcome)?;
         let envelope = cached
@@ -118,7 +119,7 @@ impl WasmRuntime {
         let Some(ports) = self.ports.as_mut() else {
             return Err(RuntimeError::PlanGap);
         };
-        let Ok(receipt) = ports.process.cancel(process_request) else {
+        let Ok(receipt) = ports.process.cancel(process_binding) else {
             let result = plain_result(
                 &cached.request,
                 InvocationDisposition::Unknown,
@@ -128,13 +129,15 @@ impl WasmRuntime {
         };
         let verified = ports
             .process_receipt_verifier
-            .verify_cancellation(process_request, &receipt, envelope)
+            .verify_cancellation(process_binding, &receipt, envelope)
             .is_ok();
+        let descendants_complete = receipt
+            .descendants()
+            .is_some_and(|descendants| descendants.complete() && descendants.tree_terminated());
         let complete = verified
             && matches!(receipt.status(), CancellationStatus::Completed)
             && receipt.no_effect_proven()
-            && receipt.descendants().complete()
-            && receipt.descendants().tree_terminated();
+            && descendants_complete;
         let result = if complete {
             plain_result(
                 &cached.request,
@@ -189,11 +192,11 @@ impl WasmRuntime {
         };
         let process_evidence = ports
             .process
-            .reconcile(&invocation.process_request)
+            .reconcile(&invocation.process_binding)
             .map_err(|_| RuntimeError::UnknownOutcome)?;
         ports
             .process_receipt_verifier
-            .verify_reconciliation(&invocation.process_request, &process_evidence, envelope)
+            .verify_reconciliation(&invocation.process_binding, &process_evidence, envelope)
             .map_err(|_| RuntimeError::InvalidProcessReceipt)?;
         let report = ports
             .engine
@@ -228,7 +231,7 @@ impl WasmRuntime {
                 request,
                 admission: None,
                 launch_envelope: None,
-                process_request: None,
+                process_binding: None,
                 engine_invocation: None,
                 result: result.clone(),
             },
@@ -278,7 +281,8 @@ fn execute_uncached(
             RuntimeError::InvalidProcessBinding,
         );
     }
-    let start_receipt = match ports.process.start(&process_request) {
+    let process_binding = ProcessBinding::from_request(&process_request);
+    let start_receipt = match ports.process.start(process_request) {
         Ok(receipt) => receipt,
         Err(PortError::Denied) => {
             return cached_with_admission(
@@ -293,26 +297,26 @@ fn execute_uncached(
                 request,
                 admission,
                 envelope,
-                process_request,
+                process_binding,
                 RuntimeError::UnknownOutcome,
             );
         }
     };
-    if !basic_start_receipt_matches(&process_request, &start_receipt)
+    if !basic_start_receipt_matches(&process_binding, &start_receipt)
         || ports
             .process_receipt_verifier
-            .verify_start(&process_request, &start_receipt, &envelope)
+            .verify_start(&process_binding, &start_receipt, &envelope)
             .is_err()
     {
         return cached_with_process_unknown(
             request,
             admission,
             envelope,
-            process_request,
+            process_binding,
             RuntimeError::InvalidProcessReceipt,
         );
     }
-    let invocation = engine_invocation(&request, &admission, process_request, start_receipt);
+    let invocation = engine_invocation(&request, &admission, process_binding, start_receipt);
     let Ok(report) = ports.engine.invoke(&invocation) else {
         return cached_with_engine_unknown(
             request,
@@ -327,7 +331,7 @@ fn execute_uncached(
         request,
         admission: Some(admission),
         launch_envelope: Some(envelope),
-        process_request: Some(invocation.process_request.clone()),
+        process_binding: Some(invocation.process_binding.clone()),
         engine_invocation: Some(invocation),
         result,
     }
@@ -529,12 +533,13 @@ fn validate_process_binding(
 }
 
 fn basic_start_receipt_matches(
-    process: &ProcessRequest,
+    process: &ProcessBinding,
     receipt: &eliot_process::ProcessStartReceipt,
 ) -> bool {
     receipt.operation_id() == process.operation_id()
-        && receipt.request_digest() == process.invocation_digest()
+        && receipt.request_digest() == process.request_digest()
         && receipt.accepted_generation() == process.generation()
+        && receipt.binding().state_fence().matches(process.fence())
         && matches!(
             receipt.lifecycle(),
             ProcessLifecycle::Starting | ProcessLifecycle::Running
@@ -544,7 +549,7 @@ fn basic_start_receipt_matches(
 fn engine_invocation(
     request: &InvocationRequest,
     admission: &SealedAdmission,
-    process_request: ProcessRequest,
+    process_binding: ProcessBinding,
     process_start_receipt: eliot_process::ProcessStartReceipt,
 ) -> EngineInvocation {
     EngineInvocation {
@@ -579,7 +584,7 @@ fn engine_invocation(
         limits: admission.governor.limits.clone(),
         input: request.input.clone(),
         deterministic_seed: request.deterministic_seed,
-        process_request,
+        process_binding,
         process_start_receipt,
     }
 }
@@ -798,7 +803,7 @@ fn cached_plain(
         request,
         admission: None,
         launch_envelope: None,
-        process_request: None,
+        process_binding: None,
         engine_invocation: None,
         result,
     }
@@ -815,7 +820,7 @@ fn cached_with_admission(
         request,
         admission: Some(admission),
         launch_envelope: None,
-        process_request: None,
+        process_binding: None,
         engine_invocation: None,
         result,
     }
@@ -825,7 +830,7 @@ fn cached_with_process_unknown(
     request: InvocationRequest,
     admission: SealedAdmission,
     launch_envelope: ProcessLaunchEnvelope,
-    process_request: ProcessRequest,
+    process_binding: ProcessBinding,
     error: RuntimeError,
 ) -> CachedInvocation {
     let result = plain_result(&request, InvocationDisposition::Unknown, error);
@@ -833,7 +838,7 @@ fn cached_with_process_unknown(
         request,
         admission: Some(admission),
         launch_envelope: Some(launch_envelope),
-        process_request: Some(process_request),
+        process_binding: Some(process_binding),
         engine_invocation: None,
         result,
     }
@@ -851,7 +856,7 @@ fn cached_with_engine_unknown(
         request,
         admission: Some(admission),
         launch_envelope: Some(launch_envelope),
-        process_request: Some(engine_invocation.process_request.clone()),
+        process_binding: Some(engine_invocation.process_binding.clone()),
         engine_invocation: Some(engine_invocation),
         result,
     }

@@ -2,7 +2,7 @@
 //!
 //! Testd accepts a declared profile and a Kernel-issued, one-shot process
 //! request.  Durable scheduling is delegated to `eliot-testd-core`; physical
-//! process semantics are delegated to the shared Windows ProcessExecutor.  No
+//! process semantics are delegated to the shared Windows `ProcessExecutor`.  No
 //! task finish, budget, memory, or canonical-write authority exists here.
 
 #![forbid(unsafe_code)]
@@ -18,7 +18,7 @@ use eliot_process::{
 use eliot_process_executor::{DispatchValidationPort, WindowsProcessExecutor};
 use eliot_testd_core::{
     KernelProcessAdmissionEvidence, KernelProcessAdmissionProvider, KernelProcessAdmissionRequest,
-    Lease, ProcessAdmissionPermit, TargetRoots, TestJob, TestdError, TestdStore,
+    Lease, ProcessAdmissionPermit, RetryPolicy, TargetRoots, TestJob, TestdError, TestdStore,
     issue_process_admission, validate_running_lease,
 };
 use serde::{Deserialize, Serialize};
@@ -178,9 +178,9 @@ fn declared_paths_overlap(left: &Path, right: &Path) -> bool {
         let right = right.to_string_lossy().replace('/', "\\");
         let left = left.trim_end_matches('\\').to_ascii_lowercase();
         let right = right.trim_end_matches('\\').to_ascii_lowercase();
-        return left == right
+        left == right
             || left.starts_with(&format!("{right}\\"))
-            || right.starts_with(&format!("{left}\\"));
+            || right.starts_with(&format!("{left}\\"))
     }
     #[cfg(not(windows))]
     {
@@ -198,7 +198,7 @@ fn strict_descendant(path: &Path, parent: &Path) -> bool {
         let parent = parent.to_string_lossy().replace('/', "\\");
         let path = path.trim_end_matches('\\').to_ascii_lowercase();
         let parent = parent.trim_end_matches('\\').to_ascii_lowercase();
-        return path.starts_with(&format!("{parent}\\"));
+        path.starts_with(&format!("{parent}\\"))
     }
     #[cfg(not(windows))]
     {
@@ -322,7 +322,7 @@ impl KernelProcessAdmissionProvider for UnavailableProcessIssuer {
     }
 }
 
-/// Composition root over the durable TestdJob store.
+/// Composition root over the durable `TestdJob` store.
 pub struct TestdComposition {
     store: TestdStore,
     provider: Arc<dyn KernelProcessAdmissionProvider>,
@@ -335,7 +335,7 @@ impl TestdComposition {
         provider: Arc<dyn KernelProcessAdmissionProvider>,
     ) -> Result<Self, TestdError> {
         Ok(Self {
-            store: TestdStore::open(path, Default::default())?,
+            store: TestdStore::open(path, RetryPolicy::default())?,
             provider,
         })
     }
@@ -381,7 +381,7 @@ impl TestdComposition {
         self.store
             .get(job_id)?
             .map(|job| receipt(&job))
-            .ok_or_else(|| TestdError::Invalid {
+            .ok_or(TestdError::Invalid {
                 field: "job_id",
                 reason: "unknown job",
             })
@@ -403,10 +403,10 @@ impl TestdComposition {
         Ok(receipt(&job))
     }
 
-    /// Starts one claimed stage through the shared ProcessExecutor.
+    /// Starts one claimed stage through the shared `ProcessExecutor`.
     ///
     /// The request is intentionally supplied freshly by Kernel for this
-    /// attempt; the durable TestdJob projection can never be substituted for
+    /// attempt; the durable `TestdJob` projection can never be substituted for
     /// its consuming permit.
     pub async fn start_claimed<E: ProcessExecutor + 'static>(
         &self,
@@ -417,13 +417,10 @@ impl TestdComposition {
         executor: &E,
         sink: Arc<dyn ProcessEvidenceSink>,
     ) -> Result<ProcessStartReceipt, TestdError> {
-        let current = self
-            .store
-            .get(&job.job_id)?
-            .ok_or_else(|| TestdError::Invalid {
-                field: "job_id",
-                reason: "unknown job",
-            })?;
+        let current = self.store.get(&job.job_id)?.ok_or(TestdError::Invalid {
+            field: "job_id",
+            reason: "unknown job",
+        })?;
         validate_running_lease(&current, lease, now)?;
         current.target_roots.validate()?;
         let (request, grant) = permit.into_parts();
@@ -464,7 +461,7 @@ impl TestdComposition {
     }
 }
 
-/// Instantiates the sole concrete ProcessExecutor with an authority-owned
+/// Instantiates the sole concrete `ProcessExecutor` with an authority-owned
 /// validation port.  Testd owns this instance's operation trees; Kernel owns
 /// permit issuance and validation.
 pub fn compose_process_executor(
@@ -493,11 +490,11 @@ fn unix_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |duration| {
-            duration.as_millis().min(u128::from(u64::MAX)) as u64
+            u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
         })
 }
 
-/// Binary/protocol errors use the same typed TestdError surface.
+/// Binary/protocol errors use the same typed `TestdError` surface.
 #[derive(Debug, Error)]
 pub enum ProtocolError {
     #[error("instrument contract: {0}")]
@@ -505,6 +502,10 @@ pub enum ProtocolError {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    reason = "test fixtures intentionally panic when construction or filesystem setup invariants fail"
+)]
 mod tests {
     use super::*;
     use eliot_process::{

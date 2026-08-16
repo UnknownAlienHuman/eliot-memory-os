@@ -268,8 +268,8 @@ impl DoctorComposition {
             return Err(DoctorError::NotCancellable(job_id.to_owned()));
         }
         job.report.state = JobState::Cancelled;
-        job.report.verification =
-            "cancelled before governed effect or canonical transition".to_owned();
+        "cancelled before governed effect or canonical transition"
+            .clone_into(&mut job.report.verification);
         job.report.reconciliation_intent = format!(
             "cancelled:{}:{}",
             job.request.problem_id, job.request.fence.state_fence

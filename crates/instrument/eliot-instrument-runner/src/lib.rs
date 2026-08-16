@@ -30,6 +30,10 @@ pub const CONTRACT_VERSION: (u16, u16, u16) = (1, 0, 0);
 /// from the owning authority; the runner never derives or replaces them.
 pub trait InstrumentRequestPort: Send + Sync {
     /// Binds one admitted invocation to exactly one P-03 process request.
+    ///
+    /// # Errors
+    /// Returns a runner error when the request cannot be issued or does not
+    /// preserve the invocation identity.
     fn bind(&self, invocation: &InstrumentInvocation) -> Result<ProcessRequest, RunnerError>;
 }
 
@@ -70,6 +74,10 @@ pub struct InstrumentBinding {
 
 impl InstrumentBinding {
     /// Validates and binds an invocation through the owning request port.
+    ///
+    /// # Errors
+    /// Returns an error when invocation validation, request binding, request
+    /// validation, or identity correlation fails.
     pub fn bind(
         invocation: InstrumentInvocation,
         port: &dyn InstrumentRequestPort,
@@ -94,6 +102,10 @@ impl InstrumentBinding {
     }
 
     /// Creates a binding from a request already checked by the composition root.
+    ///
+    /// # Errors
+    /// Returns an error when the invocation or process request is invalid, or
+    /// when their identities do not match.
     pub fn from_request(
         invocation: InstrumentInvocation,
         process_request: ProcessRequest,
@@ -157,6 +169,10 @@ impl<E> InstrumentRunner<E> {
 
 impl<E: ProcessExecutor + 'static> InstrumentRunner<E> {
     /// Binds an invocation and launches it through P-03.
+    ///
+    /// # Errors
+    /// Returns an error when binding or process launch fails, or when the
+    /// returned receipt does not preserve the binding identity.
     pub async fn launch_bound(
         &self,
         invocation: InstrumentInvocation,
@@ -168,6 +184,10 @@ impl<E: ProcessExecutor + 'static> InstrumentRunner<E> {
     }
 
     /// Launches the exact immutable binding through P-03.
+    ///
+    /// # Errors
+    /// Returns an error when the binding is already consumed, process launch
+    /// fails, or the returned receipt does not preserve its identity.
     pub async fn launch(
         &self,
         binding: &mut InstrumentBinding,
@@ -191,6 +211,10 @@ impl<E: ProcessExecutor + 'static> InstrumentRunner<E> {
     }
 
     /// Inspects an operation and preserves the binding identity.
+    ///
+    /// # Errors
+    /// Returns an error when process inspection fails or the observed operation
+    /// does not match the binding.
     pub async fn inspect(
         &self,
         binding: &InstrumentBinding,
@@ -210,6 +234,9 @@ impl<E: ProcessExecutor + 'static> InstrumentRunner<E> {
     }
 
     /// Cancels an operation through the process contract's current fence.
+    ///
+    /// # Errors
+    /// Returns an error when the process executor rejects cancellation.
     pub async fn cancel(
         &self,
         binding: &InstrumentBinding,
@@ -218,6 +245,10 @@ impl<E: ProcessExecutor + 'static> InstrumentRunner<E> {
     }
 
     /// Reconciles an unknown operation and returns retained process evidence.
+    ///
+    /// # Errors
+    /// Returns an error when reconciliation fails or the returned evidence does
+    /// not preserve the binding identity.
     pub async fn reconcile(
         &self,
         binding: &InstrumentBinding,

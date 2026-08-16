@@ -646,13 +646,12 @@ impl PromotionGate {
         if !self.reversible {
             return Err(SkillError::NonReversiblePromotion);
         }
-        if candidate.proposed_action == LifecycleAction::Merge
+        if (candidate.proposed_action == LifecycleAction::Merge
             || candidate.proposed_action == LifecycleAction::Split
-            || self.independent_route_count > 1
+            || self.independent_route_count > 1)
+            && (self.independent_route_count < 2 || self.human_approval_ref.is_none())
         {
-            if self.independent_route_count < 2 || self.human_approval_ref.is_none() {
-                return Err(SkillError::IndependentEvidenceRequired);
-            }
+            return Err(SkillError::IndependentEvidenceRequired);
         }
         if let Some(approval) = &self.human_approval_ref {
             text(approval, "gate.human_approval_ref")?;
@@ -749,6 +748,8 @@ impl SkillRegistry {
         self.views.get(skill_id)
     }
 
+    /// Explicit fields mirror the public lifecycle/API contract.
+    #[allow(clippy::too_many_arguments)]
     pub fn propose(
         &self,
         base_skill_id: &str,
@@ -830,6 +831,8 @@ pub trait SkillLifecycleApi: Send + Sync {
         skill_id: String,
     ) -> Result<Option<SkillLifecycleView>, SkillError>;
 
+    /// Explicit fields mirror the public lifecycle/API contract.
+    #[allow(clippy::too_many_arguments)]
     async fn propose(
         &self,
         ctx: &RequestMetadata,

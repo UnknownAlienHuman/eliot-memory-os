@@ -5,14 +5,16 @@
 //! authority, or decides completion.  An uncertain apply is reconciled only
 //! by the exact operation identity carried by the prepared transition.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{
     Arc,
     atomic::{AtomicU64, Ordering},
 };
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use eliot_contracts::{ArtifactId, ContractId, ContractVersion, ProductId, RequestId, SourceId};
+use eliot_contracts::{
+    ArtifactId, ClockReading, ContractId, ContractVersion, ProductId, RequestId, SourceId,
+};
 use eliot_ipc::{DeliveryOutcome, TransportError, TransportLimits};
 use eliot_protocol::{
     ClientHello, Frame, ProtocolRange, ProtocolVersion, RequestIdentity, ServerHello,
@@ -170,12 +172,18 @@ impl<T: EbpStoreTransport + 'static> EbpCanonicalStoreClient<T> {
         context: Option<&RequestMeta>,
         idempotency_key: &str,
     ) -> Result<StoreResponse, RequestFailure> {
-        let request_id = context
-            .map(|value| value.request_id.clone())
-            .unwrap_or_else(|| self.next_request_id(idempotency_key));
-        let metadata = context
-            .cloned()
-            .unwrap_or_else(|| self.read_metadata(request_id.clone()));
+        let request_id = match context {
+            Some(value) => value.request_id.clone(),
+            None => self
+                .next_request_id(idempotency_key)
+                .map_err(RequestFailure::Contract)?,
+        };
+        let metadata = match context {
+            Some(value) => value.clone(),
+            None => self
+                .read_metadata(request_id.clone())
+                .map_err(RequestFailure::Contract)?,
+        };
         if metadata.state_fence != self.requirement.state_fence {
             return Err(RequestFailure::Store(StoreError::FenceMismatch));
         }
@@ -186,7 +194,7 @@ impl<T: EbpStoreTransport + 'static> EbpCanonicalStoreClient<T> {
             },
             idempotency_key: idempotency_key.to_owned(),
             deadline_unix_ms: unix_ms().saturating_add(30_000),
-            cancellation_id: format!("{}:cancel", request_id),
+            cancellation_id: format!("{request_id}:cancel"),
         };
         let operation_id = match &request {
             StoreRequest::Apply { transition, .. } => {
@@ -279,27 +287,27 @@ impl<T: EbpStoreTransport + 'static> EbpCanonicalStoreClient<T> {
         Ok(receipt)
     }
 
-    fn next_request_id(&self, operation: &str) -> RequestId {
+    fn next_request_id(&self, operation: &str) -> Result<RequestId, StoreClientError> {
         let counter = self.request_counter.fetch_add(1, Ordering::Relaxed);
         RequestId::new(format!(
-            "{}:{}:{}",
+            "{}:{operation}:{counter}",
             self.requirement.connection_id.as_str(),
-            operation,
-            counter
         ))
-        .expect("request identity is constructed from validated bootstrap data")
+        .map_err(|error| StoreClientError::Contract(error.to_string()))
     }
 
-    fn read_metadata(&self, request_id: RequestId) -> RequestMeta {
-        RequestMeta {
+    fn read_metadata(&self, request_id: RequestId) -> Result<RequestMeta, StoreClientError> {
+        Ok(RequestMeta {
             request_id,
             session_id: None,
             task_id: None,
-            product_id: ProductId::new("eliot-kernel").expect("static product id"),
-            source_id: SourceId::new("eliot-kernel-store-client").expect("static source id"),
+            product_id: ProductId::new("eliot-kernel")
+                .map_err(|error| StoreClientError::Contract(error.to_string()))?,
+            source_id: SourceId::new("eliot-kernel-store-client")
+                .map_err(|error| StoreClientError::Contract(error.to_string()))?,
             state_fence: self.requirement.state_fence.clone(),
-            clock: Default::default(),
-        }
+            clock: ClockReading::default(),
+        })
     }
 }
 
@@ -438,7 +446,7 @@ impl<T: EbpStoreTransport + 'static> CanonicalStoreClient for EbpCanonicalStoreC
             scope_id: Some(scope_id.clone()),
             consistency: ReadConsistency::ExactFence,
             state_fence: self.requirement.state_fence.clone(),
-            parameters: Default::default(),
+            parameters: BTreeMap::default(),
         };
         let response = self
             .execute_raw(
@@ -558,7 +566,8 @@ fn client_hello(
             .map(|value| (*value).to_owned())
             .collect(),
         privacy_classes: vec!["PUBLIC".to_owned()],
-        max_frame: eliot_protocol::MAX_FRAME_BYTES as u32,
+        max_frame: u32::try_from(eliot_protocol::MAX_FRAME_BYTES)
+            .map_err(|_| StoreClientError::Contract("protocol max frame exceeds u32".to_owned()))?,
         authority_epoch: requirement.authority_epoch(),
     })
 }
@@ -652,6 +661,11 @@ impl EbpStoreTransport for eliot_ipc::NamedPipeTransport {
 
 #[cfg(all(test, windows))]
 mod windows_e2e_tests {
+    #![allow(
+        clippy::expect_used,
+        reason = "Windows transport tests use expects for fixed-valid protocol fixtures"
+    )]
+
     use super::*;
     use std::collections::BTreeMap;
     use std::sync::{Arc, atomic::AtomicU64};
@@ -827,6 +841,10 @@ mod windows_e2e_tests {
         }
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "this test keeps the complete unknown-boundary reconciliation sequence together"
+    )]
     #[tokio::test(flavor = "current_thread")]
     async fn authenticated_s03_unknown_response_reconciles_exact_operation() {
         let pipe = format!(
@@ -954,7 +972,8 @@ mod windows_e2e_tests {
             .await
             .expect("S03 client handshake");
         let context = client
-            .read_metadata(eliot_contracts::RequestId::new("request-e2e").expect("request id"));
+            .read_metadata(eliot_contracts::RequestId::new("request-e2e").expect("request id"))
+            .expect("request metadata");
         let result = client
             .apply_prepared(
                 &context,
@@ -1099,7 +1118,7 @@ mod windows_e2e_tests {
                         );
                     }
                     UnknownBoundary::Connection => {
-                        response.connection_id = "wrong-connection".to_owned();
+                        "wrong-connection".clone_into(&mut response.connection_id);
                     }
                     UnknownBoundary::Protocol => {
                         response.protocol_version = ProtocolVersion {
@@ -1144,7 +1163,8 @@ mod windows_e2e_tests {
             request_counter: AtomicU64::new(1),
         };
         let context = client
-            .read_metadata(eliot_contracts::RequestId::new("request-fake").expect("request id"));
+            .read_metadata(eliot_contracts::RequestId::new("request-fake").expect("request id"))
+            .expect("request metadata");
         let result = client
             .apply_prepared(
                 &context,

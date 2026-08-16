@@ -84,6 +84,10 @@ pub struct ImprovementCandidate {
 }
 
 impl ImprovementCandidate {
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "this public constructor is the established candidate protocol façade"
+    )]
     pub fn new(
         project_id: impl Into<String>,
         target_surface: ImprovementSurface,

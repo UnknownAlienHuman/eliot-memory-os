@@ -598,11 +598,11 @@ impl SupervisionTrustAnchor {
                 observed: self.public_key.len(),
             });
         }
-        let fingerprint = decode_hex::<32>(
+        decode_hex::<32>(
             &self.public_key_fingerprint,
             "trust_anchor.public_key_fingerprint",
         )?;
-        if encode_hex(&sha256_bytes(&self.public_key)) != encode_hex(&fingerprint) {
+        if sha256_hex(&self.public_key) != self.public_key_fingerprint {
             return Err(SupervisionLeaseError::TrustAnchorFingerprintMismatch);
         }
         VerifyingKey::from_bytes(&self.public_key.as_slice().try_into().map_err(|_| {
@@ -1095,10 +1095,4 @@ fn hex_value(byte: u8) -> u8 {
         b'a'..=b'f' => byte - b'a' + 10,
         _ => 0,
     }
-}
-
-fn sha256_bytes(bytes: &[u8]) -> [u8; 32] {
-    let digest = sha256_hex(bytes);
-    let decoded = decode_hex::<32>(&digest, "sha256").expect("sha256_hex always emits valid hex");
-    decoded
 }

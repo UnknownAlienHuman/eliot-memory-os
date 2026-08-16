@@ -75,7 +75,7 @@ pub enum GovernorObservationError {
     /// A task-bound observation did not include exact selection evidence.
     #[error("task selection evidence is required")]
     TaskSelectionRequired,
-    /// Selection evidence names a different task or WorkScope.
+    /// Selection evidence names a different task or `WorkScope`.
     #[error("task selection is incompatible with observation scope")]
     TaskScopeIncompatible,
     /// A supplied plan or evidence envelope uses another State Fence.
@@ -189,7 +189,7 @@ pub struct TaskSelectionEvidence {
     pub task_revision: u64,
     /// Acceptance digest bound by the selection.
     pub acceptance_digest: String,
-    /// WorkScope identity used by the selection.
+    /// `WorkScope` identity used by the selection.
     pub work_scope_ref: String,
     /// Source/route that established the selection.
     pub selection_source_ref: String,
@@ -326,13 +326,12 @@ impl ObservationSubmission {
                 return Err(GovernorObservationError::FenceMismatch);
             }
         }
-        if let Some(gap) = &self.record.coverage_gap {
-            if gap.protected
-                && (self.durability != Durability::Protected
-                    || !route_supports(self.capture_route, Durability::Protected))
-            {
-                return Err(GovernorObservationError::InsufficientDurability);
-            }
+        if let Some(gap) = &self.record.coverage_gap
+            && gap.protected
+            && (self.durability != Durability::Protected
+                || !route_supports(self.capture_route, Durability::Protected))
+        {
+            return Err(GovernorObservationError::InsufficientDurability);
         }
         let task_ref = self
             .record
@@ -638,6 +637,10 @@ impl ObservationJournal {
     }
 
     /// Admits one observation, preserving exact rejection/replay identity.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "admission policy checks remain in explicit priority order"
+    )]
     pub fn admit(
         &mut self,
         submission: ObservationSubmission,
@@ -646,12 +649,8 @@ impl ObservationJournal {
         if let Some(existing) = self.entries.get(&submission.idempotency_key) {
             if existing.request_digest == request_digest {
                 return Ok(match &existing.result {
-                    ObservationAdmissionResult::Accepted { receipt } => {
-                        ObservationAdmissionResult::Replayed {
-                            receipt: receipt.clone(),
-                        }
-                    }
-                    ObservationAdmissionResult::Replayed { receipt } => {
+                    ObservationAdmissionResult::Accepted { receipt }
+                    | ObservationAdmissionResult::Replayed { receipt } => {
                         ObservationAdmissionResult::Replayed {
                             receipt: receipt.clone(),
                         }
@@ -663,35 +662,35 @@ impl ObservationJournal {
                     }
                 });
             }
-            return Ok(self.rejection_result(
+            return Ok(Self::rejection_result(
                 &submission,
-                request_digest,
+                &request_digest,
                 RejectionDisposition::Conflict,
                 vec!["IDENTITY_CONFLICT".to_owned()],
                 None,
             ));
         }
-        if let Some(existing_key) = self.record_keys.get(submission.record_id()) {
-            if existing_key != &submission.idempotency_key {
-                return Ok(self.store_rejection(
-                    &submission,
-                    request_digest,
-                    RejectionDisposition::Conflict,
-                    vec!["IDENTITY_CONFLICT".to_owned()],
-                    submission.candidate_fallback(),
-                ));
-            }
+        if let Some(existing_key) = self.record_keys.get(submission.record_id())
+            && existing_key != &submission.idempotency_key
+        {
+            return Ok(self.store_rejection(
+                &submission,
+                request_digest,
+                RejectionDisposition::Conflict,
+                vec!["IDENTITY_CONFLICT".to_owned()],
+                submission.candidate_fallback(),
+            ));
         }
-        if let Some(existing_key) = self.operation_keys.get(&submission.operation_id) {
-            if existing_key != &submission.idempotency_key {
-                return Ok(self.rejection_result(
-                    &submission,
-                    request_digest,
-                    RejectionDisposition::Conflict,
-                    vec!["IDENTITY_CONFLICT".to_owned()],
-                    submission.candidate_fallback(),
-                ));
-            }
+        if let Some(existing_key) = self.operation_keys.get(&submission.operation_id)
+            && existing_key != &submission.idempotency_key
+        {
+            return Ok(Self::rejection_result(
+                &submission,
+                &request_digest,
+                RejectionDisposition::Conflict,
+                vec!["IDENTITY_CONFLICT".to_owned()],
+                submission.candidate_fallback(),
+            ));
         }
         if let Err(error) = submission.validate() {
             return Ok(self.store_rejection(
@@ -753,9 +752,9 @@ impl ObservationJournal {
         errors: Vec<String>,
         safe_capture_fallback: Option<ObservationCandidate>,
     ) -> ObservationAdmissionResult {
-        let result = self.rejection_result(
+        let result = Self::rejection_result(
             submission,
-            request_digest.clone(),
+            &request_digest,
             disposition,
             errors,
             safe_capture_fallback,
@@ -772,9 +771,8 @@ impl ObservationJournal {
     }
 
     fn rejection_result(
-        &self,
         submission: &ObservationSubmission,
-        request_digest: String,
+        request_digest: &str,
         disposition: RejectionDisposition,
         errors: Vec<String>,
         safe_capture_fallback: Option<ObservationCandidate>,
@@ -782,7 +780,7 @@ impl ObservationJournal {
         let rejection = ObservationAdmissionRejection {
             operation_id: submission.operation_id.clone(),
             idempotency_key: submission.idempotency_key.clone(),
-            request_digest: request_digest.clone(),
+            request_digest: request_digest.to_owned(),
             disposition,
             all_contract_errors: errors,
             safe_capture_fallback,
@@ -807,6 +805,10 @@ impl ObservationJournal {
 
 /// Compiles the Governor-owned plan projection from admitted obligation
 /// profiles.  Producers cannot self-certify a plan by merely reporting events.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the public API keeps plan dimensions explicit for stable callers"
+)]
 pub fn compile_plan(
     plan_id: impl Into<String>,
     plan_revision: impl Into<String>,

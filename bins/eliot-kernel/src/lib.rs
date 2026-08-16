@@ -81,7 +81,7 @@ impl IpcImplementation {
 
     /// Returns the transport limits selected by the Kernel composition.
     #[must_use]
-    const fn limits(&self) -> TransportLimits {
+    const fn limits() -> TransportLimits {
         TransportLimits {
             max_frame_bytes: eliot_protocol::MAX_FRAME_BYTES,
             queue_capacity: 128,
@@ -95,7 +95,7 @@ impl IpcImplementation {
 /// Explicit construction input for the Kernel process.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct KernelConfig {
-    /// Existing absolute WorkScope root bound to the platform adapter.
+    /// Existing absolute `WorkScope` root bound to the platform adapter.
     pub work_root: PathBuf,
     /// Local pipe selected once by the composition root.
     pub pipe_name: String,
@@ -125,7 +125,7 @@ impl KernelConfig {
 /// Errors raised before the Kernel is admitted to its service loop.
 #[derive(Debug)]
 pub enum KernelBuildError {
-    /// The platform adapter rejected the WorkScope root.
+    /// The platform adapter rejected the `WorkScope` root.
     Platform(PortError),
     /// The selected transport is not valid.
     Transport(eliot_ipc::TransportError),
@@ -468,6 +468,9 @@ impl KernelComposition {
         Self::assemble(config, ors, authority)
     }
 
+    /// Keeps ordered generation, authority, and handoff construction in one
+    /// composition path so no intermediate partially wired authority escapes.
+    #[allow(clippy::too_many_lines)]
     fn assemble(
         config: KernelConfig,
         ors: OrsCoordinator<RedbRecoveryStore>,
@@ -539,7 +542,8 @@ impl KernelComposition {
                 "protocol": PROTOCOL_VERSION,
                 "generation": generation.value(),
             }),
-            max_frame: eliot_protocol::MAX_FRAME_BYTES as u32,
+            max_frame: u32::try_from(eliot_protocol::MAX_FRAME_BYTES)
+                .map_err(|_| KernelBuildError::Core("maximum frame exceeds u32".to_owned()))?,
         };
         let runtime = Runtime::new(
             RuntimeConfig {
@@ -595,7 +599,7 @@ impl KernelComposition {
     /// remains owned by [`Self::bind_session`].
     #[must_use]
     pub const fn ipc_limits(&self) -> TransportLimits {
-        self.ipc.limits()
+        IpcImplementation::limits()
     }
 
     /// Returns the Host-approved store bootstrap requirement, if injected.
@@ -647,8 +651,9 @@ impl KernelComposition {
         let client = EbpCanonicalStoreClient::connect(transport, requirement.clone())
             .await
             .map_err(|error| match error {
-                StoreClientError::Transport(error) => KernelBuildError::Service(error),
-                StoreClientError::Contract(error) => KernelBuildError::Service(error),
+                StoreClientError::Transport(error) | StoreClientError::Contract(error) => {
+                    KernelBuildError::Service(error)
+                }
                 StoreClientError::Store(error) => KernelBuildError::Service(error.to_string()),
             })?;
         let route_scope = RouteScope::new(STORE_BRIDGE_ROUTE)
@@ -719,10 +724,9 @@ impl KernelComposition {
 
     #[cfg(test)]
     fn poison_generation_for_test(&self) {
-        let mut generation_poison = self
-            .generation_poison
-            .lock()
-            .expect("generation poison lock");
+        let Ok(mut generation_poison) = self.generation_poison.lock() else {
+            panic!("generation poison lock");
+        };
         *generation_poison = Some("test publication failure".to_owned());
         if let Ok(mut service) = self.service.lock() {
             let _ = service.fence_generation("test publication failure");
@@ -851,7 +855,7 @@ impl KernelComposition {
     /// composition instance until restart/recovery proves a durable route.
     pub fn apply_generation_cutover(
         &self,
-        decision: eliot_kernel_core::CutoverDecision,
+        decision: &eliot_kernel_core::CutoverDecision,
     ) -> Result<(), KernelServiceError> {
         let mut poison = self.generation_poison.lock().map_err(|_| {
             KernelServiceError::Platform("generation poison lock poisoned".to_owned())
@@ -875,7 +879,7 @@ impl KernelComposition {
                 .lock()
                 .map_err(|_| "front-door policy lock poisoned".to_owned())?;
             self.generation_gateway.persist_and_publish(
-                &decision,
+                decision,
                 &mut generations,
                 &mut service,
                 &mut policy,
@@ -981,15 +985,14 @@ fn dispatch_key(work_root: &Path) -> [u8; 32] {
     hasher.finalize().into()
 }
 
-/// Resolves and validates the default WorkScope root for the binary entrypoint.
+/// Resolves and validates the default `WorkScope` root for the binary entrypoint.
 pub fn default_work_root() -> Result<PathBuf, std::io::Error> {
-    let root = std::env::var_os("ELIOT_WORK_ROOT")
-        .map(PathBuf::from)
-        .unwrap_or(std::env::current_dir()?);
+    let root = std::env::var_os("ELIOT_WORK_ROOT").map_or(std::env::current_dir()?, PathBuf::from);
     std::fs::canonicalize(Path::new(&root))
 }
 
 #[cfg(test)]
+#[allow(clippy::default_trait_access, clippy::expect_used)]
 mod tests {
     use super::*;
     use eliot_contracts::ContractVersion;
@@ -1104,6 +1107,7 @@ mod tests {
 }
 
 #[cfg(all(test, windows))]
+#[allow(clippy::default_trait_access, clippy::expect_used)]
 mod store_gateway_tests {
     use super::*;
     use std::collections::BTreeMap;

@@ -235,7 +235,7 @@ impl ContextRecipe {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ContextInput {
-    /// WorkScope identity, kept separate from project claims.
+    /// `WorkScope` identity, kept separate from project claims.
     pub scope: String,
     /// Task identity represented by the view.
     pub task_id: Option<DecisionId>,
@@ -270,6 +270,10 @@ impl ContextInput {
 }
 
 /// Dimensioned quality result; no scalar can hide a failed load-bearing axis.
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "each named dimension is independently observable on the wire"
+)]
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct PacketQualityScorecard {
@@ -472,7 +476,7 @@ pub enum AttentionResolution {
     Superseded,
 }
 
-/// Explicit attention state included by the caller as a ContextAtom.
+/// Explicit attention state included by the caller as a `ContextAtom`.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct CriticalAttention {
@@ -509,7 +513,11 @@ impl CriticalAttention {
 }
 
 /// Cue kind used by deterministic push orientation.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize, JsonSchema)]
+///
+/// Declaration order is the stable ordering used by [`CueIndex`].
+#[derive(
+    Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize, JsonSchema,
+)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum CueKind {
     Path,
@@ -697,5 +705,29 @@ impl OrientationRequest {
             gaps,
             state_fence: self.state_fence.clone(),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::CueKind;
+
+    #[test]
+    fn cue_kind_order_matches_deterministic_index_contract() {
+        let expected = [
+            CueKind::Path,
+            CueKind::Symbol,
+            CueKind::Error,
+            CueKind::Command,
+            CueKind::Service,
+            CueKind::TaskClass,
+            CueKind::Concept,
+            CueKind::Problem,
+        ];
+        let mut actual = expected;
+        actual.reverse();
+        actual.sort();
+
+        assert_eq!(actual, expected);
     }
 }

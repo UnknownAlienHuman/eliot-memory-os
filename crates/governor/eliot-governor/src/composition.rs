@@ -56,13 +56,10 @@ pub trait KernelTransitionPort: Send + Sync {
     ) -> KernelPortFuture<'a, WriteReceipt>;
 
     /// Reconciles one operation by its exact canonical identity.
-    fn receipt<'a>(
-        &'a self,
-        operation_id: OperationId,
-    ) -> KernelPortFuture<'a, Option<WriteReceipt>>;
+    fn receipt(&self, operation_id: OperationId) -> KernelPortFuture<'_, Option<WriteReceipt>>;
 
     /// Returns a bounded Kernel-owned health observation.
-    fn health<'a>(&'a self) -> KernelPortFuture<'a, StoreHealth>;
+    fn health(&self) -> KernelPortFuture<'_, StoreHealth>;
 }
 
 /// Object-safe future returned by a neutral Kernel transition port.
@@ -308,7 +305,7 @@ pub const MAX_OWNER_SNAPSHOT_BYTES: usize = 512 * 1024;
 )]
 #[serde(rename_all = "snake_case")]
 pub enum RecoveryOwner {
-    /// WorkScope projection.
+    /// `WorkScope` projection.
     WorkScope,
     /// Task projection.
     Task,
@@ -942,7 +939,7 @@ pub struct AuthorityOwner {
 
 impl AuthorityOwner {
     fn from_snapshot(
-        snapshot: AuthorityOwnerSnapshot,
+        snapshot: &AuthorityOwnerSnapshot,
         expected_fence: &StateFence,
     ) -> Result<Self, CompositionError> {
         if snapshot.state_fence != *expected_fence || snapshot.grant_graph_revision == 0 {
@@ -973,7 +970,7 @@ impl AuthorityOwner {
 
 /// All N4 owners, each represented by one field and one mutable projection.
 pub struct GovernorOwners<P: ?Sized> {
-    /// WorkScope identity/binding owner.
+    /// `WorkScope` identity/binding owner.
     pub work_scope: ScopeBindingGuard,
     /// Durable task lifecycle owner.
     pub task: TaskLifecycleOwner,
@@ -1008,9 +1005,13 @@ pub struct GovernorOwners<P: ?Sized> {
 }
 
 impl<P: KernelDurableJobPort + ?Sized> GovernorOwners<P> {
+    #[allow(
+        clippy::too_many_lines,
+        reason = "recovery reconstructs every closed owner in a fixed authority-sensitive order"
+    )]
     fn from_recovery(
         kernel: Arc<P>,
-        state_fence: StateFence,
+        state_fence: &StateFence,
         config_snapshot_digest: String,
         recovery: &GovernorRecoverySnapshot,
     ) -> Result<Self, CompositionError> {
@@ -1030,10 +1031,10 @@ impl<P: KernelDurableJobPort + ?Sized> GovernorOwners<P> {
         .map_err(|error| CompositionError::Recovery(error.to_string()))?;
         let authority_snapshot: AuthorityOwnerSnapshot =
             decode_owner_snapshot(recovery, RecoveryOwner::Authority)?;
-        let authority = AuthorityOwner::from_snapshot(authority_snapshot, &state_fence)?;
+        let authority = AuthorityOwner::from_snapshot(&authority_snapshot, state_fence)?;
         let budget_snapshot: BudgetOwnerSnapshot =
             decode_owner_snapshot(recovery, RecoveryOwner::Budget)?;
-        if budget_snapshot.state_fence != state_fence || budget_snapshot.revision == 0 {
+        if &budget_snapshot.state_fence != state_fence || budget_snapshot.revision == 0 {
             return Err(CompositionError::Recovery(
                 "budget snapshot has a stale fence or zero revision".to_owned(),
             ));
@@ -1050,7 +1051,7 @@ impl<P: KernelDurableJobPort + ?Sized> GovernorOwners<P> {
         }
         let config_snapshot: ConfigOwnerSnapshot =
             decode_owner_snapshot(recovery, RecoveryOwner::Config)?;
-        if config_snapshot.state_fence != state_fence
+        if &config_snapshot.state_fence != state_fence
             || config_snapshot.revision == 0
             || config_snapshot.config_digest != config_snapshot_digest
         {
@@ -1066,7 +1067,7 @@ impl<P: KernelDurableJobPort + ?Sized> GovernorOwners<P> {
             decode_owner_snapshot(recovery, RecoveryOwner::Finish)?;
         if finish_receipts
             .iter()
-            .any(|receipt| receipt.state_fence != state_fence)
+            .any(|receipt| &receipt.state_fence != state_fence)
         {
             return Err(CompositionError::Recovery(
                 "finish receipt snapshot contains a stale state fence".to_owned(),
@@ -1076,7 +1077,7 @@ impl<P: KernelDurableJobPort + ?Sized> GovernorOwners<P> {
             .map_err(|error| CompositionError::Recovery(error.to_string()))?;
         let problem_snapshot: ProblemOwnerSnapshot =
             decode_owner_snapshot(recovery, RecoveryOwner::Problem)?;
-        if problem_snapshot.state_fence != state_fence
+        if &problem_snapshot.state_fence != state_fence
             || problem_snapshot
                 .revisions
                 .values()
@@ -1092,7 +1093,7 @@ impl<P: KernelDurableJobPort + ?Sized> GovernorOwners<P> {
             .map_err(|error| CompositionError::Recovery(error.to_string()))?;
         let read_snapshot: ReadOwnerSnapshot =
             decode_owner_snapshot(recovery, RecoveryOwner::Read)?;
-        if read_snapshot.state_fence != state_fence || read_snapshot.revision == 0 {
+        if &read_snapshot.state_fence != state_fence || read_snapshot.revision == 0 {
             return Err(CompositionError::Recovery(
                 "read owner snapshot has a stale fence or zero revision".to_owned(),
             ));
@@ -1101,7 +1102,7 @@ impl<P: KernelDurableJobPort + ?Sized> GovernorOwners<P> {
             decode_owner_snapshot(recovery, RecoveryOwner::Skill)?;
         if skill_views
             .iter()
-            .any(|view| view.state_fence != state_fence)
+            .any(|view| &view.state_fence != state_fence)
         {
             return Err(CompositionError::Recovery(
                 "skill snapshot contains a stale state fence".to_owned(),
@@ -1123,7 +1124,7 @@ impl<P: KernelDurableJobPort + ?Sized> GovernorOwners<P> {
             RecoveryOwner::Maintenance,
         ] {
             let empty: EmptyOwnerSnapshot = decode_owner_snapshot(recovery, owner)?;
-            empty.validate(&state_fence)?;
+            empty.validate(state_fence)?;
         }
         let canonical =
             CanonicalAdmissionOwner::new(state_fence.clone(), recovery.canonical_scope.clone())?;
@@ -1240,7 +1241,7 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         }
         let owners = GovernorOwners::from_recovery(
             kernel.clone(),
-            state_fence,
+            &state_fence,
             snapshot.protected_snapshot_digest.clone(),
             &recovery,
         )?;
@@ -1473,6 +1474,11 @@ pub type GovernorQueueLimits = QueueLimits;
 
 #[cfg(test)]
 mod tests {
+    #![allow(
+        clippy::expect_used,
+        reason = "tests use expects for fixed-valid protocol fixtures"
+    )]
+
     use super::*;
     use crate::{STARTUP_ORDER, ServiceId};
     use eliot_contracts::{ClockReading, SessionId, TaskId};
@@ -1507,14 +1513,14 @@ mod tests {
             Box::pin(async { Err(KernelPortError::Unknown("test port".to_owned())) })
         }
 
-        fn receipt<'a>(
-            &'a self,
+        fn receipt(
+            &self,
             _operation_id: OperationId,
-        ) -> KernelPortFuture<'a, Option<WriteReceipt>> {
+        ) -> KernelPortFuture<'_, Option<WriteReceipt>> {
             Box::pin(async { Ok(None) })
         }
 
-        fn health<'a>(&'a self) -> KernelPortFuture<'a, StoreHealth> {
+        fn health(&self) -> KernelPortFuture<'_, StoreHealth> {
             Box::pin(async { Err(KernelPortError::NotAdmitted("test port".to_owned())) })
         }
     }

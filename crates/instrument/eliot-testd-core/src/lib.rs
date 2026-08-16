@@ -864,6 +864,7 @@ impl TestdStore {
     }
 
     /// Submits a job exactly once and assigns its project-local sequence.
+    #[allow(clippy::too_many_arguments)]
     pub fn submit(
         &self,
         job_id: impl Into<String>,
@@ -1035,6 +1036,7 @@ impl TestdStore {
     }
 
     /// Completes an attempt, or durably schedules a bounded retry.
+    #[allow(clippy::too_many_arguments)]
     pub fn finish(
         &self,
         job_id: &str,
@@ -1319,7 +1321,7 @@ fn is_strict_descendant(path: &Path, parent: &Path) -> bool {
         let parent = parent.to_string_lossy().replace('/', "\\");
         let path = path.trim_end_matches('\\').to_ascii_lowercase();
         let parent = parent.trim_end_matches('\\').to_ascii_lowercase();
-        return path.starts_with(&format!("{parent}\\"));
+        path.starts_with(&format!("{parent}\\"))
     }
     #[cfg(not(windows))]
     {

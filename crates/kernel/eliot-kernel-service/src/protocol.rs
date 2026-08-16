@@ -337,6 +337,11 @@ impl From<PortError> for KernelServiceError {
 
 #[cfg(test)]
 mod tests {
+    #![allow(
+        clippy::expect_used,
+        reason = "tests use expects for fixed-valid protocol fixtures"
+    )]
+
     use super::*;
 
     fn handle_value(value: &str) -> PlatformHandle {

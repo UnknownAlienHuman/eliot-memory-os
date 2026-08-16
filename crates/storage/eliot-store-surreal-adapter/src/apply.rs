@@ -1,7 +1,7 @@
 //! Database-backed store operations: atomic apply, reconciliation reads,
 //! named reads, health and migration.
 //!
-//! All SurrealQL and physical table access stays inside this module and
+//! All `SurrealQL` and physical table access stays inside this module and
 //! [`crate::schema`]. The public boundary only ever carries store-API types.
 
 use std::collections::BTreeSet;
@@ -39,6 +39,10 @@ struct SchemaMetaRecord {
     migration_state: String,
 }
 
+#[allow(
+    clippy::large_enum_variant,
+    reason = "replay carries the complete public receipt; boxing would add indirection to the internal recovery path"
+)]
 enum Idempotency {
     None,
     Replay(WriteReceipt),
@@ -107,7 +111,7 @@ pub(crate) async fn probe_readiness(
     adapter: &SurrealStoreAdapter,
 ) -> Result<SemanticReadiness, AdapterError> {
     let db = client(adapter).await?;
-    let observed = probe_generation(&db, &adapter.config).await?;
+    let observed = probe_generation(db, &adapter.config).await?;
     Ok(readiness_from_observation(
         observed,
         &adapter.config.expected_schema_generation,
@@ -198,7 +202,7 @@ pub(crate) async fn apply_migration(
     bindings.insert("schema_meta_key".to_owned(), json!(schema::SCHEMA_META_KEY));
     bindings.insert("schema_meta_record".to_owned(), record);
     let mut response =
-        client::query(&db, &adapter.config, "migration.apply", &sql, bindings).await?;
+        client::query(db, &adapter.config, "migration.apply", &sql, bindings).await?;
     if !response.take_errors().is_empty() {
         return Err(AdapterError::UnknownMigrationOutcome {
             migration_id: migration.migration_id.clone(),
@@ -213,11 +217,10 @@ pub(crate) async fn apply_migration(
 
 /// Bounded bridge health observation; never a semantic readiness verdict.
 pub(crate) async fn adapter_health(adapter: &SurrealStoreAdapter) -> AdapterHealth {
-    let db = match client(adapter).await {
-        Ok(db) => db,
-        Err(_) => return AdapterHealth::unprobed(),
+    let Ok(db) = client(adapter).await else {
+        return AdapterHealth::unprobed();
     };
-    match probe_generation(&db, &adapter.config).await {
+    match probe_generation(db, &adapter.config).await {
         Ok(Some(generation))
             if generation == adapter.config.expected_schema_generation.as_str() =>
         {
@@ -262,11 +265,11 @@ pub(crate) async fn apply_prepared(
     validate_transition(adapter, ctx, &transition)?;
 
     let db = client(adapter).await?;
-    ensure_ready(adapter, &db).await?;
+    ensure_ready(adapter, db).await?;
 
     let _guard = adapter.write_lock.lock().await;
 
-    match read_idempotency(&db, &adapter.config, &transition).await? {
+    match read_idempotency(db, &adapter.config, &transition).await? {
         Idempotency::Replay(receipt) => {
             validate_receipt_identity(&receipt, ctx, &transition)?;
             return Ok(receipt);
@@ -275,7 +278,7 @@ pub(crate) async fn apply_prepared(
         Idempotency::None => {}
     }
 
-    let fence = read_fence(&db, &adapter.config).await?;
+    let fence = read_fence(db, &adapter.config).await?;
     if let Some(fence) = &fence
         && fence.state_fence != transition.state_fence
     {
@@ -286,9 +289,9 @@ pub(crate) async fn apply_prepared(
 
     let revision_keys = union_revision_keys(&expected_revision_heads, &transition);
     let ordering_scopes = union_ordering_scopes(&expected_ordering_heads, &transition);
-    let current_revisions = read_revision_heads_inner(&db, &adapter.config, &revision_keys).await?;
+    let current_revisions = read_revision_heads_inner(db, &adapter.config, &revision_keys).await?;
     let current_orderings =
-        read_ordering_heads_inner(&db, &adapter.config, &ordering_scopes).await?;
+        read_ordering_heads_inner(db, &adapter.config, &ordering_scopes).await?;
 
     check_expected_revisions(
         &current_revisions,
@@ -311,7 +314,7 @@ pub(crate) async fn apply_prepared(
     let receipt = build_receipt(&transition, &plan)?;
 
     write_transaction(
-        &db,
+        db,
         &adapter.config,
         &transition,
         &plan,
@@ -346,8 +349,8 @@ pub(crate) async fn read_receipt(
     operation_id: OperationId,
 ) -> Result<Option<WriteReceipt>, AdapterError> {
     let db = client(adapter).await?;
-    ensure_ready(adapter, &db).await?;
-    read_receipt_by_operation(&db, &adapter.config, &operation_id).await
+    ensure_ready(adapter, db).await?;
+    read_receipt_by_operation(db, &adapter.config, &operation_id).await
 }
 
 async fn read_receipt_by_operation(
@@ -443,7 +446,7 @@ pub(crate) async fn read_revision_heads(
 ) -> Result<Vec<RevisionHead>, AdapterError> {
     ensure_unique_revision_keys(&keys)?;
     let db = client(adapter).await?;
-    ensure_ready(adapter, &db).await?;
+    ensure_ready(adapter, db).await?;
     if keys.is_empty() {
         return Ok(Vec::new());
     }
@@ -453,7 +456,7 @@ pub(crate) async fn read_revision_heads(
         to_value(&keys.iter().map(ToString::to_string).collect::<Vec<_>>())?,
     );
     let mut response = client::query(
-        &db,
+        db,
         &adapter.config,
         "read.revision_heads",
         schema::READ_REVISION_HEADS_BY_KEYS,
@@ -472,7 +475,7 @@ pub(crate) async fn read_ordering_heads(
 ) -> Result<Vec<OrderingHead>, AdapterError> {
     ensure_unique_ordering_scopes(&scopes)?;
     let db = client(adapter).await?;
-    ensure_ready(adapter, &db).await?;
+    ensure_ready(adapter, db).await?;
     if scopes.is_empty() {
         return Ok(Vec::new());
     }
@@ -482,7 +485,7 @@ pub(crate) async fn read_ordering_heads(
         to_value(&scopes.iter().map(ToString::to_string).collect::<Vec<_>>())?,
     );
     let mut response = client::query(
-        &db,
+        db,
         &adapter.config,
         "read.ordering_heads",
         schema::READ_ORDERING_HEADS_BY_SCOPES,
@@ -500,17 +503,17 @@ pub(crate) async fn read_scope_view(
     scope_id: ScopeId,
 ) -> Result<ScopeRevisionView, AdapterError> {
     let db = client(adapter).await?;
-    ensure_ready(adapter, &db).await?;
-    let fence = read_fence(&db, &adapter.config).await?;
+    ensure_ready(adapter, db).await?;
+    let fence = read_fence(db, &adapter.config).await?;
     let state_fence = fence.ok_or(StoreError::ReceiptNotFound)?.state_fence;
     let revision_heads = read_revision_heads_inner(
-        &db,
+        db,
         &adapter.config,
         &[RevisionKey::new(format!("scope:{scope_id}"))?],
     )
     .await?;
     let ordering_heads = read_ordering_heads_inner(
-        &db,
+        db,
         &adapter.config,
         &[OrderingScopeId::new(scope_id.as_str())?],
     )
@@ -532,9 +535,9 @@ pub(crate) async fn execute_named(
 ) -> Result<NamedReadResponse, AdapterError> {
     query.validate()?;
     let db = client(adapter).await?;
-    ensure_ready(adapter, &db).await?;
+    ensure_ready(adapter, db).await?;
 
-    let fence = read_fence(&db, &adapter.config).await?;
+    let fence = read_fence(db, &adapter.config).await?;
     let state_fence = match &fence {
         Some(fence) => fence.state_fence.clone(),
         None => query.state_fence.clone(),
@@ -543,8 +546,8 @@ pub(crate) async fn execute_named(
         return Err(AdapterError::Store(StoreError::FenceMismatch));
     }
 
-    let revision_heads = read_all_revision_heads(&db, &adapter.config).await?;
-    let payload = named_read_payload(adapter, &db, &query).await?;
+    let revision_heads = read_all_revision_heads(db, &adapter.config).await?;
+    let payload = named_read_payload(adapter, db, &query).await?;
     let response = NamedReadResponse {
         operation: query.operation,
         state_fence,
@@ -647,6 +650,11 @@ pub(crate) async fn health(adapter: &SurrealStoreAdapter) -> Result<StoreHealth,
 }
 
 /// Persists one fully planned transaction atomically.
+#[allow(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    reason = "the transaction writer preserves the closed named-operation order and atomic SQL assembly"
+)]
 async fn write_transaction(
     db: &client::RpcTransport,
     config: &SurrealAdapterConfig,
@@ -701,10 +709,11 @@ async fn write_transaction(
         "revision_table".to_owned(),
         json!(schema::table::REVISION_HEAD),
     );
-    let revision = plan
-        .next_revision_heads
-        .first()
-        .expect("a prepared transition always advances one revision key");
+    let revision = plan.next_revision_heads.first().ok_or_else(|| {
+        AdapterError::Serialization(
+            "prepared transition plan is missing its required revision head".to_owned(),
+        )
+    })?;
     bindings.insert("revision_key".to_owned(), json!(revision.key.to_string()));
     bindings.insert(
         "revision_record".to_owned(),

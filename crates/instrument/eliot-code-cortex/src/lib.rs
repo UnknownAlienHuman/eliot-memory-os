@@ -1,6 +1,6 @@
 //! Evidence-only semantic composition for bounded code understanding.
 //!
-//! CodeCortex deliberately has no parser, process runner, persistence engine,
+//! `CodeCortex` deliberately has no parser, process runner, persistence engine,
 //! or truth authority.  Adapters admit graph projections and normalized
 //! instrument evidence; this crate indexes those immutable observations and
 //! composes a task-scoped report while retaining freshness, coverage, and
@@ -226,6 +226,7 @@ impl CodeCortexService {
     }
 }
 
+#[allow(clippy::too_many_lines)]
 pub fn compose_snapshot(
     request: &CompositionRequest,
     snapshot: &IndexSnapshot,

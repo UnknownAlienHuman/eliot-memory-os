@@ -384,25 +384,31 @@ impl DoctorJob {
 }
 
 fn valid_transition(from: JobState, to: JobState) -> bool {
-    match (from, to) {
-        (JobState::Admitted, JobState::Diagnosing | JobState::Cancelled)
-        | (
+    matches!(
+        (from, to),
+        (
+            JobState::Admitted,
+            JobState::Diagnosing | JobState::Cancelled
+        ) | (
             JobState::Diagnosing,
             JobState::ReadyForRepair | JobState::Escalated | JobState::Cancelled,
-        )
-        | (
+        ) | (
             JobState::ReadyForRepair,
             JobState::Running | JobState::Escalated | JobState::Cancelled,
-        )
-        | (JobState::Running, JobState::Verifying | JobState::Failed | JobState::Cancelled)
-        | (
+        ) | (
+            JobState::Running,
+            JobState::Verifying | JobState::Failed | JobState::Cancelled
+        ) | (
             JobState::Verifying,
             JobState::Succeeded | JobState::Failed | JobState::Partial | JobState::Quarantined,
+        ) | (
+            JobState::Failed,
+            JobState::Diagnosing | JobState::Quarantined | JobState::Escalated
+        ) | (
+            JobState::Partial,
+            JobState::Diagnosing | JobState::Escalated
         )
-        | (JobState::Failed, JobState::Diagnosing | JobState::Quarantined | JobState::Escalated)
-        | (JobState::Partial, JobState::Diagnosing | JobState::Escalated) => true,
-        _ => false,
-    }
+    )
 }
 
 fn text(value: &str, field: &'static str) -> Result<(), DoctorError> {

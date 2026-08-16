@@ -32,6 +32,7 @@ mod identity;
 mod lineage;
 mod manifest;
 mod publication;
+#[allow(dead_code)]
 mod receipt;
 mod transfer;
 
@@ -192,20 +193,20 @@ impl ContentAddress {
 
     /// Verifies that the supplied bytes match this address.
     pub fn verify(&self, bytes: &[u8]) -> Result<(), ArtifactError> {
-        let actual = eliot_contracts::sha256_hex(bytes);
-        if actual != self.digest_hex {
-            return Err(ArtifactError::DigestMismatch {
-                field: "content",
-                expected: self.digest_hex.clone(),
-                actual,
-            });
-        }
         let observed = bytes.len() as u64;
         if observed != self.size_bytes {
             return Err(ArtifactError::LengthMismatch {
                 field: "content",
                 expected: self.size_bytes,
                 actual: observed,
+            });
+        }
+        let actual = eliot_contracts::sha256_hex(bytes);
+        if actual != self.digest_hex {
+            return Err(ArtifactError::DigestMismatch {
+                field: "content",
+                expected: self.digest_hex.clone(),
+                actual,
             });
         }
         Ok(())
@@ -298,6 +299,7 @@ pub(crate) fn validate_digest(value: &str, field: &'static str) -> Result<(), Ar
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used)]
 mod tests {
     use super::*;
     use eliot_contracts::{
@@ -381,7 +383,7 @@ mod tests {
         let address = ContentAddress::of_bytes(b"payload");
         assert!(address.verify(b"payload").is_ok());
         assert!(matches!(
-            address.verify(b"tampered"),
+            address.verify(b"tamperd"),
             Err(ArtifactError::DigestMismatch { .. })
         ));
         assert!(matches!(

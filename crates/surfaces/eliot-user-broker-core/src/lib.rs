@@ -398,6 +398,7 @@ pub trait DurableRegistrationPort: Send {
 /// external process outcome is unknown, so reconciliation can bind evidence to
 /// the exact one-shot invocation without transporting sealed P-03 authority.
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[allow(clippy::large_enum_variant)]
 pub enum ProcessStartOutcome {
     Started {
         /// Digest returned by the provider for the sealed one-shot request.
@@ -617,6 +618,7 @@ impl UserBroker {
     }
 
     #[allow(clippy::needless_pass_by_value)]
+    #[allow(clippy::too_many_lines)]
     pub fn launch(&mut self, request: LaunchRequest) -> Result<LaunchReceipt, BrokerError> {
         request.validate()?;
         let current = self.active_registration(request.observed_at)?.clone();
@@ -797,12 +799,12 @@ impl UserBroker {
                 eliot_process::ProcessLifecycle::Running
                 | eliot_process::ProcessLifecycle::Starting
                 | eliot_process::ProcessLifecycle::Cancelling => OperationState::Active,
-                eliot_process::ProcessLifecycle::UnknownOutcome => OperationState::Unknown,
+                eliot_process::ProcessLifecycle::UnknownOutcome
+                | eliot_process::ProcessLifecycle::Created => OperationState::Unknown,
                 eliot_process::ProcessLifecycle::Exited
                 | eliot_process::ProcessLifecycle::Failed
                 | eliot_process::ProcessLifecycle::Reconciled
                 | eliot_process::ProcessLifecycle::Quarantined => OperationState::Reconciled,
-                eliot_process::ProcessLifecycle::Created => OperationState::Unknown,
             };
             if record.cursor.state == OperationState::Reconciled {
                 record.receipt = None;

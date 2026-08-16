@@ -123,3 +123,42 @@ fn the_catalog_is_deterministically_ordered() {
     assert_eq!(tools, sorted);
     assert!(!tools.is_empty());
 }
+
+#[test]
+fn task_contract_create_catalog_matches_structured_acceptance_items()
+-> Result<(), Box<dyn std::error::Error>> {
+    let tool = super::catalog::task_tool_definitions()
+        .into_iter()
+        .find(|tool| tool["name"] == "eliot_task_contract_create")
+        .ok_or("TaskContract create tool missing")?;
+    let item_schema = &tool["inputSchema"]["properties"]["acceptance_items"]["items"];
+    assert_eq!(item_schema["type"], "object");
+    assert_eq!(
+        item_schema["required"],
+        serde_json::json!(["item_id", "description", "required_evidence"])
+    );
+    assert_eq!(
+        item_schema["properties"]["required_evidence"]["enum"],
+        serde_json::json!(["observation", "verification"])
+    );
+    assert_ne!(item_schema["type"], "string");
+
+    let request = serde_json::json!({
+        "project_id": "01900000-0000-7000-8000-000000000001",
+        "task_id": "01900000-0000-7000-8000-000000000002",
+        "write_id": "01900000-0000-7000-8000-000000000003",
+        "title": "structured acceptance items",
+        "acceptance_items": [
+            {"item_id": "observed", "description": "observe the result", "required_evidence": "observation"},
+            {"item_id": "verified", "description": "verify the result", "required_evidence": "verification"}
+        ]
+    });
+    let decoded: super::TaskContractCreateToolInput = serde_json::from_value(request)?;
+    assert_eq!(decoded.acceptance_items.len(), 2);
+    assert_eq!(decoded.acceptance_items[0].item_id, "observed");
+    assert_eq!(
+        decoded.acceptance_items[1].required_evidence,
+        eliot_types::TaskAcceptanceEvidenceKind::Verification
+    );
+    Ok(())
+}

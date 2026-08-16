@@ -1,10 +1,14 @@
 #![forbid(unsafe_code)]
+// Machine-readable and human CLI output is the public contract of this binary.
+#![allow(clippy::print_stdout)]
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
+use eliot_bootstrap::capture::{capture_snapshot, write_snapshot_artifact};
 use eliot_cli::{CommandCatalogue, CommandPort, CommandPortError, CommandRequest};
 use serde_json::json;
 use std::io::Read;
+use std::path::PathBuf;
 use tracing_subscriber::EnvFilter;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -26,7 +30,25 @@ enum Command {
     },
     /// Read one typed command request from stdin and forward it to Kernel.
     Dispatch,
+    /// Compile an immutable current-system evidence artifact.
+    System {
+        #[command(subcommand)]
+        command: SystemCommand,
+    },
     Version,
+}
+
+#[derive(Debug, Subcommand)]
+enum SystemCommand {
+    /// Capture source/build/runtime/store/integration evidence.
+    Snapshot {
+        /// Absolute repository root. Git evidence is always scoped to this path.
+        #[arg(long, value_parser = absolute_path)]
+        repo_root: PathBuf,
+        /// Absolute destination. Existing artifacts are never overwritten.
+        #[arg(long, value_parser = absolute_path)]
+        output: PathBuf,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -40,7 +62,7 @@ fn main() -> Result<()> {
     let exit_code = std::thread::Builder::new()
         .name("eliot-cli-main".to_owned())
         .stack_size(32 * 1024 * 1024)
-        .spawn(|| run())
+        .spawn(run)
         .context("spawn the CLI entrypoint")?
         .join()
         .map_err(|_| anyhow::anyhow!("CLI entrypoint panicked"))??;
@@ -59,10 +81,32 @@ fn run() -> Result<i32> {
             Ok(0)
         }
         Command::Catalogue { command } => {
-            run_catalogue(command)?;
+            run_catalogue(&command)?;
             Ok(0)
         }
+        Command::System { command } => run_system(command),
         Command::Dispatch => run_dispatch(),
+    }
+}
+
+fn run_system(command: SystemCommand) -> Result<i32> {
+    match command {
+        SystemCommand::Snapshot { repo_root, output } => {
+            let artifact =
+                capture_snapshot(&repo_root).context("capture current-system evidence")?;
+            write_snapshot_artifact(&artifact, &output).context("write current-system artifact")?;
+            println!("{}", serde_json::to_string_pretty(&artifact)?);
+            Ok(0)
+        }
+    }
+}
+
+fn absolute_path(value: &str) -> std::result::Result<PathBuf, String> {
+    let path = PathBuf::from(value);
+    if path.is_absolute() {
+        Ok(path)
+    } else {
+        Err("path must be absolute".to_owned())
     }
 }
 
@@ -180,7 +224,7 @@ impl CommandPort for AuthenticatedKernelPort {
     }
 }
 
-fn run_catalogue(command: CatalogueCommand) -> Result<()> {
+fn run_catalogue(command: &CatalogueCommand) -> Result<()> {
     let catalogue = eliot_cli::CommandCatalogue::current();
     match command {
         CatalogueCommand::Help => println!("{}", catalogue.help_text()?),

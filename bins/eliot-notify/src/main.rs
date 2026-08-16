@@ -32,7 +32,7 @@ enum Response {
     Delivered {
         service: &'static str,
         protocol: &'static str,
-        observation: eliot_notify_core::DeliveryObservation,
+        observation: Box<eliot_notify_core::DeliveryObservation>,
     },
     WatchdogTaskRegistered {
         service: &'static str,
@@ -58,6 +58,10 @@ enum Response {
     },
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "the one-shot launcher keeps protected root validation, scheduler modes, and stdin dispatch in an explicit ordered state machine"
+)]
 fn main() {
     let (root, mode) = match parse_launch() {
         Ok(root) => root,
@@ -90,7 +94,7 @@ fn main() {
             verifier_sha256: receipt.verifier_sha256().to_owned(),
             task_xml_sha256: receipt.task_xml_sha256().to_owned(),
         };
-        if !write_response(response) {
+        if !write_response(&response) {
             std::process::exit(PROVIDER_REJECTED_EXIT);
         }
         return;
@@ -112,7 +116,7 @@ fn main() {
             session_id: receipt.session_id(),
             task_xml_sha256: receipt.task_xml_sha256().to_owned(),
         };
-        if !write_response(response) {
+        if !write_response(&response) {
             std::process::exit(PROVIDER_REJECTED_EXIT);
         }
         return;
@@ -127,11 +131,11 @@ fn main() {
             ),
         };
         let response = match NotificationComposition::from_fallback(root) {
-            Ok(mut composition) => dispatch_fallback(&mut composition, envelope, request),
+            Ok(mut composition) => dispatch_fallback(&mut composition, &envelope, &request),
             Err(error) => composition_error(error.to_string()),
         };
         let provider_error = matches!(response, Response::Error { code, .. } if code == "NOTIFICATION_PROVIDER_REJECTED");
-        if !write_response(response) {
+        if !write_response(&response) {
             std::process::exit(PROVIDER_REJECTED_EXIT);
         }
         if provider_error {
@@ -143,23 +147,22 @@ fn main() {
     // Normal notification is intentionally one-shot. The caller selects the
     // Kernel-backed route through an authenticated provider operation; the
     // scheduler fallback above has no caller-supplied request authority.
-    let line = match io::stdin()
+    let Some(line) = io::stdin()
         .lock()
         .lines()
         .find_map(Result::ok)
         .filter(|line| !line.trim().is_empty())
-    {
-        Some(line) => line,
-        None => exit(
+    else {
+        exit(
             REQUEST_INVALID_EXIT,
             "NOTIFICATION_REQUEST_REQUIRED",
             "one JSON notification request is required".to_owned(),
-        ),
+        )
     };
     let response = match serde_json::from_str::<Request>(&line) {
         Ok(Request::Deliver { envelope, request }) => {
             match NotificationComposition::from_kernel(root) {
-                Ok(mut composition) => dispatch_deliver(&mut composition, envelope, request),
+                Ok(mut composition) => dispatch_deliver(&mut composition, &envelope, &request),
                 Err(error) => composition_error(error.to_string()),
             }
         }
@@ -169,7 +172,7 @@ fn main() {
         },
     };
     let provider_error = matches!(response, Response::Error { code, .. } if code == "NOTIFICATION_PROVIDER_REJECTED");
-    if !write_response(response) {
+    if !write_response(&response) {
         std::process::exit(PROVIDER_REJECTED_EXIT);
     }
     if provider_error {
@@ -180,10 +183,13 @@ fn main() {
 fn parse_launch() -> Result<(PathBuf, LaunchMode), String> {
     let expected = eliot_platform_windows::protected_program_data_path("Eliot/notify")
         .map_err(|error| error.to_string())?;
-    parse_launch_args(std::env::args_os().skip(1), expected)
+    parse_launch_args(std::env::args_os().skip(1), &expected)
 }
 
-fn parse_launch_args<I, S>(arguments: I, expected: PathBuf) -> Result<(PathBuf, LaunchMode), String>
+fn parse_launch_args<I, S>(
+    arguments: I,
+    expected: &PathBuf,
+) -> Result<(PathBuf, LaunchMode), String>
 where
     I: IntoIterator<Item = S>,
     S: Into<std::ffi::OsString>,
@@ -223,7 +229,7 @@ where
         || Ok(expected.clone()),
         |value| {
             let supplied = PathBuf::from(value);
-            if supplied != expected {
+            if supplied != *expected {
                 return Err(
                     "work root must equal the protected ProgramData notification contour"
                         .to_owned(),
@@ -242,32 +248,32 @@ where
 
 fn dispatch_deliver(
     composition: &mut NotificationComposition,
-    envelope: NotificationEnvelope,
-    request: NotificationRequest,
+    envelope: &NotificationEnvelope,
+    request: &NotificationRequest,
 ) -> Response {
-    composition
-        .deliver(&envelope, &request)
-        .map(|observation| Response::Delivered {
+    match composition.deliver(envelope, request) {
+        Ok(observation) => Response::Delivered {
             service: SERVICE_NAME,
             protocol: PROTOCOL_VERSION,
-            observation,
-        })
-        .unwrap_or_else(notify_error)
+            observation: Box::new(observation),
+        },
+        Err(error) => notify_error(&error),
+    }
 }
 
 fn dispatch_fallback(
     composition: &mut NotificationComposition,
-    envelope: SignedWatchdogFallbackEnvelope,
-    request: NotificationRequest,
+    envelope: &SignedWatchdogFallbackEnvelope,
+    request: &NotificationRequest,
 ) -> Response {
-    composition
-        .deliver_watchdog_fallback(&envelope, &request)
-        .map(|observation| Response::Delivered {
+    match composition.deliver_watchdog_fallback(envelope, request) {
+        Ok(observation) => Response::Delivered {
             service: SERVICE_NAME,
             protocol: PROTOCOL_VERSION,
-            observation,
-        })
-        .unwrap_or_else(notify_error)
+            observation: Box::new(observation),
+        },
+        Err(error) => notify_error(&error),
+    }
 }
 
 fn composition_error(detail: String) -> Response {
@@ -277,7 +283,7 @@ fn composition_error(detail: String) -> Response {
     }
 }
 
-fn notify_error(error: NotifyError) -> Response {
+fn notify_error(error: &NotifyError) -> Response {
     let code = if matches!(error, NotifyError::PlanGap { .. }) {
         "NOTIFICATION_PROVIDER_REJECTED"
     } else {
@@ -289,7 +295,7 @@ fn notify_error(error: NotifyError) -> Response {
     }
 }
 
-fn write_response(response: Response) -> bool {
+fn write_response(response: &Response) -> bool {
     let stdout = io::stdout();
     let mut output = stdout.lock();
     serde_json::to_writer(&mut output, &response).is_ok()
@@ -298,21 +304,27 @@ fn write_response(response: Response) -> bool {
 }
 
 fn exit(code: i32, error_code: &'static str, detail: String) -> ! {
-    let _ = write_response(Response::Error {
+    let response = Response::Error {
         code: error_code,
         detail,
-    });
+    };
+    let _ = write_response(&response);
     std::process::exit(code);
 }
 
 #[cfg(test)]
 mod tests {
+    #![allow(
+        clippy::expect_used,
+        reason = "launch-mode tests use expect for fixed-valid argument fixtures"
+    )]
+
     use super::*;
 
     #[test]
     fn watchdog_fallback_is_a_no_stdin_protected_launch_mode() {
         let expected = PathBuf::from(r"C:\ProgramData\Eliot\notify");
-        let (root, fallback) = parse_launch_args(["--watchdog-fallback"], expected.clone())
+        let (root, fallback) = parse_launch_args(["--watchdog-fallback"], &expected)
             .expect("watchdog mode parses without a request stream");
         assert_eq!(root, expected);
         assert_eq!(fallback, LaunchMode::WatchdogFallback);
@@ -323,18 +335,18 @@ mod tests {
                     "--work-root",
                     r"C:\ProgramData\Eliot\notify"
                 ],
-                PathBuf::from(r"C:\ProgramData\Eliot\notify")
+                &PathBuf::from(r"C:\ProgramData\Eliot\notify")
             )
             .is_err()
         );
         assert_eq!(
-            parse_launch_args(["--register-watchdog-fallback"], expected.clone())
+            parse_launch_args(["--register-watchdog-fallback"], &expected)
                 .expect("registration mode parses without stdin")
                 .1,
             LaunchMode::RegisterWatchdogFallback
         );
         assert_eq!(
-            parse_launch_args(["--activate-watchdog-fallback"], expected.clone())
+            parse_launch_args(["--activate-watchdog-fallback"], &expected)
                 .expect("activation mode parses without stdin")
                 .1,
             LaunchMode::ActivateWatchdogFallback
@@ -342,10 +354,10 @@ mod tests {
         assert!(
             parse_launch_args(
                 ["--watchdog-fallback", "--activate-watchdog-fallback"],
-                expected.clone()
+                &expected
             )
             .is_err()
         );
-        assert!(parse_launch_args(["--unknown"], PathBuf::from("C:\\notify")).is_err());
+        assert!(parse_launch_args(["--unknown"], &PathBuf::from("C:\\notify")).is_err());
     }
 }

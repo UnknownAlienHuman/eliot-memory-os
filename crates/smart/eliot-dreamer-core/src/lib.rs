@@ -11,7 +11,7 @@
 use std::collections::BTreeSet;
 
 use blake3::Hasher;
-use eliot_contracts::{ArtifactId, ContractVersion, StateFence};
+use eliot_contracts::{ArtifactId, ContractError, ContractVersion, StateFence};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -40,6 +40,8 @@ pub enum DreamerError {
     BudgetExhausted,
     #[error("candidate has no material content")]
     EmptyCandidate,
+    #[error("generated artifact id is invalid: {0}")]
+    InvalidArtifactId(#[from] ContractError),
 }
 
 fn text(value: &str, field: &'static str, maximum: usize) -> Result<(), DreamerError> {
@@ -294,6 +296,10 @@ impl ModelDraft {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "the boolean preservation dimensions are an established serialized report shape"
+)]
 pub struct PreservationReport {
     pub source_count: u32,
     pub counterevidence_count: u32,
@@ -356,10 +362,13 @@ impl CandidateGenerator {
         let mut source_count = 0_u32;
         for item in &draft.items {
             item.validate(input)?;
-            source_count = source_count.saturating_add(item.source_handles.len() as u32);
+            let item_source_count = u32::try_from(item.source_handles.len()).unwrap_or(u32::MAX);
+            let item_counterevidence_count =
+                u32::try_from(item.counterevidence.len()).unwrap_or(u32::MAX);
+            source_count = source_count.saturating_add(item_source_count);
             let preservation = PreservationReport {
-                source_count: item.source_handles.len() as u32,
-                counterevidence_count: item.counterevidence.len() as u32,
+                source_count: item_source_count,
+                counterevidence_count: item_counterevidence_count,
                 alternatives_preserved: !item.counterevidence.is_empty()
                     || !draft
                         .items
@@ -372,7 +381,7 @@ impl CandidateGenerator {
             let candidate_id = digest_id(
                 "candidate",
                 &[input.job_id.as_str(), &input.scope, &item.statement],
-            );
+            )?;
             candidates.push(CandidateArtifact {
                 candidate_id,
                 kind: item.kind,
@@ -392,7 +401,7 @@ impl CandidateGenerator {
         if candidates.is_empty() && draft.synthesis.trim().is_empty() {
             return Err(DreamerError::EmptyCandidate);
         }
-        let packet_id = digest_id("packet", &[input.job_id.as_str(), &input.question]);
+        let packet_id = digest_id("packet", &[input.job_id.as_str(), &input.question])?;
         let packet = DreamPacket {
             packet_id,
             job_id: input.job_id.clone(),
@@ -422,7 +431,7 @@ fn dedup_text(values: &[String]) -> Vec<String> {
     result
 }
 
-fn digest_id(prefix: &str, parts: &[&str]) -> ArtifactId {
+fn digest_id(prefix: &str, parts: &[&str]) -> Result<ArtifactId, DreamerError> {
     let mut hasher = Hasher::new();
     hasher.update(prefix.as_bytes());
     for part in parts {
@@ -433,5 +442,5 @@ fn digest_id(prefix: &str, parts: &[&str]) -> ArtifactId {
         "{prefix}:{}",
         &hasher.finalize().to_hex().to_string()[..32]
     ))
-    .expect("digest is a valid artifact id")
+    .map_err(DreamerError::InvalidArtifactId)
 }
