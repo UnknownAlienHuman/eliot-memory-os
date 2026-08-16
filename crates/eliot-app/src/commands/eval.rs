@@ -598,8 +598,8 @@ pub(super) fn ensure_integration_smoke_artifacts(
         &core.mismatch_receipt,
     );
     anyhow::ensure!(
-        benchmark_repair_decision.decision == EvalGateDecisionKind::Block,
-        "a mismatched benchmark integrity receipt must block the eval gate"
+        benchmark_repair_decision.decision == EvalGateDecisionKind::RequireBenchmarkRepair,
+        "a mismatched benchmark integrity receipt must require benchmark repair"
     );
     write_eval_report(
         root,
@@ -879,5 +879,40 @@ pub(super) fn parse_eval_family(value: &str) -> Result<EvalFamily> {
         "provider" => Ok(EvalFamily::Provider),
         "future" => Ok(EvalFamily::Future),
         other => bail!("unknown eval family: {other}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn integration_smoke_accepts_repairable_benchmark_integrity_state() -> Result<()> {
+        let root =
+            std::env::temp_dir().join(format!("eliot-app-eval-readiness-{}", uuid::Uuid::now_v7()));
+        let artifacts = ensure_integration_smoke_artifacts(&root, "core-smoke")?;
+
+        assert!(
+            artifacts.core.integrity_receipt.valid,
+            "the canonical smoke receipt should remain valid"
+        );
+        assert_eq!(
+            artifacts.gate_decision.decision,
+            EvalGateDecisionKind::Allow
+        );
+        let profile = EvalGateProfileService::find("fast-deterministic")
+            .context("fast-deterministic eval gate profile is missing")?;
+        let benchmark_repair_decision = EvalRegressionGateService::evaluate_comparison(
+            &profile,
+            &artifacts.comparison,
+            &artifacts.core.mismatch_receipt,
+        );
+        assert_eq!(
+            benchmark_repair_decision.decision,
+            EvalGateDecisionKind::RequireBenchmarkRepair
+        );
+
+        std::fs::remove_dir_all(root)?;
+        Ok(())
     }
 }
