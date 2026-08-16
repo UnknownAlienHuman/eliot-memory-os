@@ -159,7 +159,10 @@ impl PeerIdentity {
     /// [`IdentityProof`] or turn a PID/path supplied on the wire into an
     /// authenticated peer.
     #[must_use]
-    pub const fn process_binding(&self) -> Option<&ProcessBinding> {
+    pub fn process_binding(&self) -> Option<&ProcessBinding> {
+        if self.validate().is_err() {
+            return None;
+        }
         match self {
             Self::Authenticated { proof, .. } => Some(&proof.process),
             Self::Unavailable { .. } => None,
@@ -1690,12 +1693,23 @@ mod tests {
             },
         };
         assert_eq!(invalid.validate(), Err(TransportError::UnauthenticatedPeer));
-        let observed = invalid
-            .process_binding()
-            .expect("observed process remains evidence");
-        assert_eq!(observed.process_id(), 1);
-        assert_eq!(observed.start_time_100ns(), 2);
-        assert_eq!(observed.image_path(), "C:/eliot-test.exe");
+        assert!(invalid.process_binding().is_none());
+        let valid_process =
+            ProcessBinding::from_observation(7, 11, "C:/eliot-valid.exe").expect("process");
+        let valid = PeerIdentity::Authenticated {
+            process_id: 7,
+            user_identity: "sid".to_owned(),
+            session_identity: "session".to_owned(),
+            proof: IdentityProof {
+                process: valid_process,
+                sid: "sid".to_owned(),
+                session: "session".to_owned(),
+            },
+        };
+        let observed = valid.process_binding().expect("valid process evidence");
+        assert_eq!(observed.process_id(), 7);
+        assert_eq!(observed.start_time_100ns(), 11);
+        assert_eq!(observed.image_path(), "C:/eliot-valid.exe");
         let unavailable = PeerIdentity::Unavailable {
             reason: PeerIdentityUnavailable::ProviderProofNotComposed,
         };
