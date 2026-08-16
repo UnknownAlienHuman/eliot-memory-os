@@ -24,11 +24,14 @@ use eliot_notify_core::{
     watchdog_request_hash, watchdog_request_id, watchdog_signature_payload,
 };
 use eliot_platform::{
-    NotificationRequest, PlatformHandle, PortError, PortOutcome, ProviderError, ProviderErrorCode,
-    UnknownReason, WorkScopePath,
+    NotificationObservation, NotificationPort, NotificationRequest, PlatformHandle, PortError,
+    PortOutcome, ProviderError, ProviderErrorCode, UnknownReason, WorkScopePath,
 };
 use eliot_platform_windows::{
-    ProtectedPathLease, PublicationOutcome, WindowsPlatform, protected_program_data_path,
+    ProtectedPathLease, PublicationOutcome, WATCHDOG_FALLBACK_TASK_NAME, WatchdogTaskRegistration,
+    WatchdogTaskRegistrationReceipt, WatchdogTaskRunReceipt, WindowsPlatform,
+    current_process_named_pipe_expectation, protected_program_data_path,
+    register_interactive_watchdog_task, run_registered_watchdog_task, validate_pinned_artifact,
 };
 use eliot_protocol::RequestIdentity;
 use eliot_receipts::{
@@ -65,7 +68,38 @@ impl std::error::Error for NotifyBuildError {}
 /// supplied by the owning control plane; this process owns only the P-01
 /// adapter binding and the A-10 coordinator.
 pub struct NotificationComposition {
-    core: NotifyCore<WindowsPlatform>,
+    core: NotifyCore<NotificationPlatform>,
+}
+
+struct NotificationPlatform {
+    platform: WindowsPlatform,
+    recovery_banner: bool,
+}
+
+impl NotificationPlatform {
+    fn normal(platform: WindowsPlatform) -> Self {
+        Self {
+            platform,
+            recovery_banner: false,
+        }
+    }
+
+    fn recovery_banner(platform: WindowsPlatform) -> Self {
+        Self {
+            platform,
+            recovery_banner: true,
+        }
+    }
+}
+
+impl NotificationPort for NotificationPlatform {
+    fn deliver(&mut self, request: &NotificationRequest) -> PortOutcome<NotificationObservation> {
+        if self.recovery_banner {
+            self.platform.deliver_recovery_banner(request)
+        } else {
+            self.platform.deliver(request)
+        }
+    }
 }
 
 impl NotificationComposition {
@@ -93,14 +127,17 @@ impl NotificationComposition {
     pub fn from_fallback(work_root: impl Into<PathBuf>) -> Result<Self, NotifyBuildError> {
         let work_root = work_root.into();
         let ports = load_fallback_verification_ports(&work_root)?;
-        Self::new(work_root, ports)
+        let platform = WindowsPlatform::new(work_root).map_err(NotifyBuildError::Platform)?;
+        Ok(Self {
+            core: NotifyCore::new(NotificationPlatform::recovery_banner(platform), ports),
+        })
     }
 
     /// Composes A-10 with an already-created platform adapter.
     #[must_use]
     pub fn from_platform(platform: WindowsPlatform, ports: VerificationPorts) -> Self {
         Self {
-            core: NotifyCore::new(platform, ports),
+            core: NotifyCore::new(NotificationPlatform::normal(platform), ports),
         }
     }
 
@@ -531,6 +568,10 @@ struct FallbackVerificationDeclaration {
     key_id: eliot_platform::PlatformHandle,
     domain: String,
     public_key: String,
+    notify_executable: String,
+    notify_artifact_sha256: String,
+    interactive_user_sid: String,
+    interactive_session_id: u32,
 }
 
 struct FallbackMaterial {
@@ -613,6 +654,10 @@ fn validate_fallback_declaration(
             .public_key
             .bytes()
             .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+        || !Path::new(&declaration.notify_executable).is_absolute()
+        || !valid_sha256(&declaration.notify_artifact_sha256)
+        || !valid_sid(&declaration.interactive_user_sid)
+        || declaration.interactive_session_id == 0
     {
         return Err("watchdog verification declaration is invalid".to_owned());
     }
@@ -624,6 +669,23 @@ fn validate_fallback_declaration(
     VerifyingKey::from_bytes(&key_bytes)
         .map_err(|error| format!("watchdog public key is invalid: {error}"))?;
     Ok(())
+}
+
+fn valid_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+}
+
+fn valid_sid(value: &str) -> bool {
+    value.strip_prefix("S-1-").is_some_and(|tail| {
+        !tail.is_empty()
+            && tail.len() <= 180
+            && tail
+                .chars()
+                .all(|character| character.is_ascii_digit() || character == '-')
+    })
 }
 
 fn load_fallback_material() -> Result<FallbackMaterial, NotifyBuildError> {
@@ -654,12 +716,123 @@ fn load_fallback_material() -> Result<FallbackMaterial, NotifyBuildError> {
     })
 }
 
+/// Registers the installer-owned X-01 fallback task for the current
+/// interactive user.  The task receives no stdin and no caller-selected
+/// request; its only action is the fixed `--watchdog-fallback` launch.
+pub fn register_watchdog_fallback_task() -> Result<WatchdogTaskRegistrationReceipt, NotifyBuildError>
+{
+    let material = load_fallback_material()?;
+    #[cfg(not(windows))]
+    return Err(NotifyBuildError::Fallback(
+        "Watchdog Task Scheduler registration requires Windows".to_owned(),
+    ));
+    #[cfg(windows)]
+    {
+        let identity = current_process_named_pipe_expectation()
+            .map_err(|error| NotifyBuildError::Fallback(error.to_string()))?;
+        if identity.expected_sid() != material.declaration.interactive_user_sid
+            || identity.expected_session_id() != material.declaration.interactive_session_id
+        {
+            return Err(NotifyBuildError::Fallback(
+                "current interactive SID/session does not match installer declaration".to_owned(),
+            ));
+        }
+        let executable = PathBuf::from(&material.declaration.notify_executable);
+        let executable =
+            validate_pinned_artifact(&executable, &material.declaration.notify_artifact_sha256)
+                .map_err(|error| NotifyBuildError::Fallback(error.to_string()))?;
+        let verifier_path = protected_program_data_path(FALLBACK_VERIFIER_RELATIVE)
+            .map_err(|error| NotifyBuildError::Fallback(error.to_string()))?;
+        let envelope_path = protected_program_data_path(FALLBACK_ENVELOPE_RELATIVE)
+            .map_err(|error| NotifyBuildError::Fallback(error.to_string()))?;
+        let registration = WatchdogTaskRegistration::new(
+            WATCHDOG_FALLBACK_TASK_NAME,
+            executable,
+            verifier_path,
+            envelope_path,
+            material.declaration.interactive_user_sid.clone(),
+            material.declaration.interactive_session_id,
+            material.declaration.notify_artifact_sha256.clone(),
+            material.declaration_digest,
+        )
+        .map_err(|error| NotifyBuildError::Fallback(error.to_string()))?;
+        register_interactive_watchdog_task(&registration)
+            .map_err(|error| NotifyBuildError::Fallback(error.to_string()))
+    }
+}
+
+/// Activates an already registered X-01 fallback task after a protected
+/// signed envelope has been published.  This route has no stdin and returns a
+/// scheduler observation only after exact task readback plus `RunEx` success.
+pub fn activate_watchdog_fallback_task() -> Result<WatchdogTaskRunReceipt, NotifyBuildError> {
+    let material = load_fallback_material()?;
+    #[cfg(not(windows))]
+    return Err(NotifyBuildError::Fallback(
+        "Watchdog Task Scheduler activation requires Windows".to_owned(),
+    ));
+    #[cfg(windows)]
+    {
+        let identity = current_process_named_pipe_expectation()
+            .map_err(|error| NotifyBuildError::Fallback(error.to_string()))?;
+        if identity.expected_sid() != material.declaration.interactive_user_sid
+            || identity.expected_session_id() != material.declaration.interactive_session_id
+        {
+            return Err(NotifyBuildError::Fallback(
+                "current interactive SID/session does not match installer declaration".to_owned(),
+            ));
+        }
+        let executable = validate_pinned_artifact(
+            Path::new(&material.declaration.notify_executable),
+            &material.declaration.notify_artifact_sha256,
+        )
+        .map_err(|error| NotifyBuildError::Fallback(error.to_string()))?;
+        let verifier_path = protected_program_data_path(FALLBACK_VERIFIER_RELATIVE)
+            .map_err(|error| NotifyBuildError::Fallback(error.to_string()))?;
+        let envelope_path = protected_program_data_path(FALLBACK_ENVELOPE_RELATIVE)
+            .map_err(|error| NotifyBuildError::Fallback(error.to_string()))?;
+        let registration = WatchdogTaskRegistration::new(
+            WATCHDOG_FALLBACK_TASK_NAME,
+            executable,
+            verifier_path,
+            envelope_path,
+            material.declaration.interactive_user_sid.clone(),
+            material.declaration.interactive_session_id,
+            material.declaration.notify_artifact_sha256.clone(),
+            material.declaration_digest,
+        )
+        .map_err(|error| NotifyBuildError::Fallback(error.to_string()))?;
+        run_registered_watchdog_task(&registration)
+            .map_err(|error| NotifyBuildError::Fallback(error.to_string()))
+    }
+}
+
 /// Loads one autonomous scheduler envelope and derives every request identity
 /// from the protected declaration and signed payload. No stdin or caller-owned
 /// [`NotificationRequest`] participates in this route.
 pub fn load_watchdog_fallback_request()
 -> Result<(SignedWatchdogFallbackEnvelope, NotificationRequest), NotifyBuildError> {
     let material = load_fallback_material()?;
+    #[cfg(not(windows))]
+    return Err(NotifyBuildError::Fallback(
+        "Watchdog fallback requires an interactive Windows session".to_owned(),
+    ));
+    #[cfg(windows)]
+    {
+        let identity = current_process_named_pipe_expectation()
+            .map_err(|error| NotifyBuildError::Fallback(error.to_string()))?;
+        if identity.expected_sid() != material.declaration.interactive_user_sid
+            || identity.expected_session_id() != material.declaration.interactive_session_id
+        {
+            return Err(NotifyBuildError::Fallback(
+                "current interactive SID/session does not match installer declaration".to_owned(),
+            ));
+        }
+        validate_pinned_artifact(
+            Path::new(&material.declaration.notify_executable),
+            &material.declaration.notify_artifact_sha256,
+        )
+        .map_err(|error| NotifyBuildError::Fallback(error.to_string()))?;
+    }
     let envelope_path = protected_program_data_path(FALLBACK_ENVELOPE_RELATIVE)
         .map_err(|error| NotifyBuildError::Fallback(error.to_string()))?;
     let lease = ProtectedPathLease::open_existing_absolute(&envelope_path)
@@ -1724,6 +1897,10 @@ mod tests {
                 key_id: PlatformHandle::new("watchdog-key-1").unwrap(),
                 domain: WATCHDOG_SIGNATURE_DOMAIN.to_owned(),
                 public_key: encode_hex(&test_signing_key().verifying_key().to_bytes()),
+                notify_executable: r"C:\Eliot\eliot-notify.exe".to_owned(),
+                notify_artifact_sha256: "00".repeat(32),
+                interactive_user_sid: "S-1-5-21-1".to_owned(),
+                interactive_session_id: 1,
             },
             declaration_digest: "test-material".to_owned(),
             lease: None,

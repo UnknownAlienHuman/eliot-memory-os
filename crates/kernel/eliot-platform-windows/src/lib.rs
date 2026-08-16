@@ -1173,6 +1173,788 @@ pub struct NamedPipePeerExpectation {
     expected_session_id: u32,
 }
 
+/// Installer-pinned inputs for the separately registered Watchdog fallback
+/// task.  This value is configuration, not an authority token: registration
+/// still proves the live caller's SID/session and verifies both immutable
+/// artifact/config digests before touching Task Scheduler.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WatchdogTaskRegistration {
+    task_name: String,
+    notify_executable: PathBuf,
+    verifier_path: PathBuf,
+    envelope_path: PathBuf,
+    expected_sid: String,
+    expected_session_id: u32,
+    notify_artifact_sha256: String,
+    verifier_sha256: String,
+}
+
+impl WatchdogTaskRegistration {
+    /// Creates a registration request from installer-pinned paths and
+    /// digests.  The live SID/session and protected file identities are proved
+    /// by [`register_interactive_watchdog_task`].
+    pub fn new(
+        task_name: impl Into<String>,
+        notify_executable: impl Into<PathBuf>,
+        verifier_path: impl Into<PathBuf>,
+        envelope_path: impl Into<PathBuf>,
+        expected_sid: impl Into<String>,
+        expected_session_id: u32,
+        notify_artifact_sha256: impl Into<String>,
+        verifier_sha256: impl Into<String>,
+    ) -> Result<Self, WindowsAdapterError> {
+        let task_name = task_name.into();
+        let notify_executable = notify_executable.into();
+        let verifier_path = verifier_path.into();
+        let envelope_path = envelope_path.into();
+        let expected_sid = expected_sid.into();
+        let notify_artifact_sha256 = notify_artifact_sha256.into();
+        let verifier_sha256 = verifier_sha256.into();
+        if task_name != WATCHDOG_FALLBACK_TASK_NAME
+            || !notify_executable.is_absolute()
+            || !verifier_path.is_absolute()
+            || !envelope_path.is_absolute()
+            || !valid_sid_text(&expected_sid)
+            || expected_session_id == 0
+            || !valid_sha256_hex(&notify_artifact_sha256)
+            || !valid_sha256_hex(&verifier_sha256)
+        {
+            return Err(WindowsAdapterError::InvalidInput);
+        }
+        Ok(Self {
+            task_name,
+            notify_executable,
+            verifier_path,
+            envelope_path,
+            expected_sid,
+            expected_session_id,
+            notify_artifact_sha256,
+            verifier_sha256,
+        })
+    }
+
+    #[must_use]
+    pub fn task_name(&self) -> &str {
+        &self.task_name
+    }
+
+    #[must_use]
+    pub fn notify_executable(&self) -> &Path {
+        &self.notify_executable
+    }
+
+    #[must_use]
+    pub fn verifier_path(&self) -> &Path {
+        &self.verifier_path
+    }
+
+    #[must_use]
+    pub fn envelope_path(&self) -> &Path {
+        &self.envelope_path
+    }
+
+    #[must_use]
+    pub fn expected_sid(&self) -> &str {
+        &self.expected_sid
+    }
+
+    #[must_use]
+    pub const fn expected_session_id(&self) -> u32 {
+        self.expected_session_id
+    }
+
+    #[must_use]
+    pub fn notify_artifact_sha256(&self) -> &str {
+        &self.notify_artifact_sha256
+    }
+
+    #[must_use]
+    pub fn verifier_sha256(&self) -> &str {
+        &self.verifier_sha256
+    }
+}
+
+/// Observation returned only after Task Scheduler accepted the exact
+/// interactive-user registration.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WatchdogTaskRegistrationReceipt {
+    task_name: String,
+    sid: String,
+    session_id: u32,
+    notify_artifact_sha256: String,
+    verifier_sha256: String,
+    task_xml_sha256: String,
+}
+
+impl WatchdogTaskRegistrationReceipt {
+    #[must_use]
+    pub fn task_name(&self) -> &str {
+        &self.task_name
+    }
+
+    #[must_use]
+    pub fn sid(&self) -> &str {
+        &self.sid
+    }
+
+    #[must_use]
+    pub const fn session_id(&self) -> u32 {
+        self.session_id
+    }
+
+    #[must_use]
+    pub fn notify_artifact_sha256(&self) -> &str {
+        &self.notify_artifact_sha256
+    }
+
+    #[must_use]
+    pub fn verifier_sha256(&self) -> &str {
+        &self.verifier_sha256
+    }
+
+    #[must_use]
+    pub fn task_xml_sha256(&self) -> &str {
+        &self.task_xml_sha256
+    }
+}
+
+/// Fixed scheduler identity for the X-01 fallback.  A caller cannot choose a
+/// second task name or turn this route into a general command scheduler.
+pub const WATCHDOG_FALLBACK_TASK_NAME: &str = r"\Eliot\WatchdogFallback";
+const WATCHDOG_FALLBACK_TASK_FOLDER: &str = r"\Eliot";
+const WATCHDOG_FALLBACK_TASK_LEAF: &str = "WatchdogFallback";
+
+/// Registers the signed Watchdog fallback for the current interactive user.
+///
+/// The COM call uses `TASK_LOGON_INTERACTIVE_TOKEN` with empty credentials;
+/// this boundary never manufactures, accepts or persists a logon token.  The
+/// task runs only in the installer-bound interactive SID/session and invokes
+/// the fixed no-stdin `--watchdog-fallback` mode.
+pub fn register_interactive_watchdog_task(
+    registration: &WatchdogTaskRegistration,
+) -> Result<WatchdogTaskRegistrationReceipt, WindowsAdapterError> {
+    validate_watchdog_registration(registration)?;
+    #[cfg(windows)]
+    {
+        register_watchdog_task_windows(registration)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = registration;
+        Err(WindowsAdapterError::Unavailable)
+    }
+}
+
+#[cfg(windows)]
+fn validate_watchdog_registration(
+    registration: &WatchdogTaskRegistration,
+) -> Result<(), WindowsAdapterError> {
+    let current = current_process_named_pipe_expectation()?;
+    if current.expected_sid() != registration.expected_sid
+        || current.expected_session_id() != registration.expected_session_id
+    {
+        return Err(WindowsAdapterError::IdentityMismatch);
+    }
+    let executable = validate_pinned_artifact(
+        &registration.notify_executable,
+        &registration.notify_artifact_sha256,
+    )?;
+    if executable != registration.notify_executable {
+        return Err(WindowsAdapterError::IdentityMismatch);
+    }
+    let root = protected_program_data_root().map_err(|_| WindowsAdapterError::Unavailable)?;
+    ensure_protected_containment(&root, &registration.verifier_path)
+        .map_err(|_| WindowsAdapterError::IdentityMismatch)?;
+    ensure_protected_containment(&root, &registration.envelope_path)
+        .map_err(|_| WindowsAdapterError::IdentityMismatch)?;
+    let verifier = ProtectedPathLease::open_existing_absolute(&registration.verifier_path)
+        .map_err(|_| WindowsAdapterError::Unavailable)?;
+    verifier
+        .verify_stable_identity()
+        .and_then(|()| verifier.verify_path_identity())
+        .map_err(|_| WindowsAdapterError::Unavailable)?;
+    let bytes = verifier
+        .read_bounded(64 * 1024)
+        .map_err(|_| WindowsAdapterError::Unavailable)?;
+    if sha256_hex(&bytes) != registration.verifier_sha256 {
+        return Err(WindowsAdapterError::IdentityMismatch);
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn validate_watchdog_registration(
+    _registration: &WatchdogTaskRegistration,
+) -> Result<(), WindowsAdapterError> {
+    Err(WindowsAdapterError::Unavailable)
+}
+
+/// Validates an installer-pinned executable with no-follow/reparse checks and
+/// returns the exact canonical path used for the digest proof.
+pub fn validate_pinned_artifact(
+    path: &Path,
+    expected_sha256: &str,
+) -> Result<PathBuf, WindowsAdapterError> {
+    if !path.is_absolute() || !valid_sha256_hex(expected_sha256) {
+        return Err(WindowsAdapterError::InvalidInput);
+    }
+    #[cfg(windows)]
+    {
+        reject_reparse_chain(path, true).map_err(|_| WindowsAdapterError::IdentityMismatch)?;
+        let canonical = std::fs::canonicalize(path).map_err(|_| WindowsAdapterError::NotFound)?;
+        reject_reparse_chain(&canonical, true)
+            .map_err(|_| WindowsAdapterError::IdentityMismatch)?;
+        let mut options = std::fs::OpenOptions::new();
+        use std::os::windows::fs::OpenOptionsExt;
+        options.read(true).share_mode(
+            windows_sys::Win32::Storage::FileSystem::FILE_SHARE_READ
+                | windows_sys::Win32::Storage::FileSystem::FILE_SHARE_WRITE,
+        );
+        options.custom_flags(windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT);
+        let mut file = options
+            .open(&canonical)
+            .map_err(|_| WindowsAdapterError::NotFound)?;
+        use std::io::Read;
+        let metadata = file
+            .metadata()
+            .map_err(|_| WindowsAdapterError::Unavailable)?;
+        if !metadata.is_file() || is_reparse_point(&metadata) {
+            return Err(WindowsAdapterError::IdentityMismatch);
+        }
+        if metadata.len() > 256 * 1024 * 1024 {
+            return Err(WindowsAdapterError::InvalidInput);
+        }
+        let mut bytes = Vec::with_capacity(metadata.len().try_into().unwrap_or(0));
+        file.read_to_end(&mut bytes)
+            .map_err(|_| WindowsAdapterError::Unavailable)?;
+        if sha256_hex(&bytes) != expected_sha256 {
+            return Err(WindowsAdapterError::IdentityMismatch);
+        }
+        Ok(canonical)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (path, expected_sha256);
+        Err(WindowsAdapterError::Unavailable)
+    }
+}
+
+#[cfg(windows)]
+fn register_watchdog_task_windows(
+    registration: &WatchdogTaskRegistration,
+) -> Result<WatchdogTaskRegistrationReceipt, WindowsAdapterError> {
+    use windows::Win32::System::Com::{
+        CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED, CoCreateInstance, CoInitializeEx,
+        CoUninitialize,
+    };
+    use windows::Win32::System::TaskScheduler::{
+        CLSID_CTaskScheduler, ITaskService, TASK_CREATE_OR_UPDATE, TASK_LOGON_INTERACTIVE_TOKEN,
+    };
+    use windows::Win32::System::Variant::VARIANT;
+    use windows::core::BSTR;
+
+    let initialized = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
+    if initialized.0 < 0 {
+        return Err(WindowsAdapterError::Unavailable);
+    }
+    let result = (|| {
+        let service: ITaskService =
+            unsafe { CoCreateInstance(&CLSID_CTaskScheduler, None, CLSCTX_INPROC_SERVER) }
+                .map_err(|_| WindowsAdapterError::Unavailable)?;
+        let empty = VARIANT::default();
+        unsafe {
+            service
+                .Connect(&empty, &empty, &empty, &empty)
+                .map_err(|_| WindowsAdapterError::Unavailable)?;
+        }
+        let root = unsafe {
+            service
+                .GetFolder(&BSTR::from("\\"))
+                .map_err(|_| WindowsAdapterError::Unavailable)?
+        };
+        let folder = get_or_create_watchdog_folder(&root, &empty)?;
+        let xml = watchdog_task_xml(registration);
+        let registered = match unsafe {
+            folder.RegisterTask(
+                &BSTR::from(WATCHDOG_FALLBACK_TASK_LEAF),
+                &BSTR::from(xml),
+                TASK_CREATE_OR_UPDATE.0,
+                &empty,
+                &empty,
+                TASK_LOGON_INTERACTIVE_TOKEN,
+                &empty,
+            )
+        } {
+            Ok(registered) => registered,
+            Err(_) => {
+                // RegisterTask may have committed before its response was
+                // lost. Reopen the exact leaf and classify by readback.
+                unsafe {
+                    folder
+                        .GetTask(&BSTR::from(WATCHDOG_FALLBACK_TASK_LEAF))
+                        .map_err(|_| WindowsAdapterError::Unavailable)?
+                }
+            }
+        };
+        let actual_xml = readback_watchdog_task(&registered, registration)?;
+        Ok(WatchdogTaskRegistrationReceipt {
+            task_name: registration.task_name.clone(),
+            sid: registration.expected_sid.clone(),
+            session_id: registration.expected_session_id,
+            notify_artifact_sha256: registration.notify_artifact_sha256.clone(),
+            verifier_sha256: registration.verifier_sha256.clone(),
+            task_xml_sha256: sha256_hex(actual_xml.as_bytes()),
+        })
+    })();
+    unsafe {
+        CoUninitialize();
+    }
+    result
+}
+
+/// Requests one immediate run of an already registered fallback task after
+/// the protected Watchdog envelope is present.  A scheduler/API failure is
+/// returned as `Unavailable` so callers retain an unknown/reconcile cursor;
+/// it is never projected as a successful notification.
+pub fn run_registered_watchdog_task(
+    registration: &WatchdogTaskRegistration,
+) -> Result<WatchdogTaskRunReceipt, WindowsAdapterError> {
+    validate_watchdog_registration(registration)?;
+    let envelope = ProtectedPathLease::open_existing_absolute(&registration.envelope_path)
+        .map_err(|_| WindowsAdapterError::NotFound)?;
+    envelope
+        .verify_stable_identity()
+        .and_then(|()| envelope.verify_path_identity())
+        .and_then(|()| envelope.read_bounded(64 * 1024).map(|_| ()))
+        .map_err(|_| WindowsAdapterError::Unavailable)?;
+    #[cfg(windows)]
+    {
+        run_registered_watchdog_task_windows(registration)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = registration;
+        Err(WindowsAdapterError::Unavailable)
+    }
+}
+
+/// Observation returned only after Task Scheduler accepted a bounded run
+/// request for the registered interactive SID/session.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WatchdogTaskRunReceipt {
+    task_name: String,
+    sid: String,
+    session_id: u32,
+    task_xml_sha256: String,
+}
+
+impl WatchdogTaskRunReceipt {
+    #[must_use]
+    pub fn task_name(&self) -> &str {
+        &self.task_name
+    }
+
+    #[must_use]
+    pub fn sid(&self) -> &str {
+        &self.sid
+    }
+
+    #[must_use]
+    pub const fn session_id(&self) -> u32 {
+        self.session_id
+    }
+
+    #[must_use]
+    pub fn task_xml_sha256(&self) -> &str {
+        &self.task_xml_sha256
+    }
+}
+
+#[cfg(windows)]
+fn run_registered_watchdog_task_windows(
+    registration: &WatchdogTaskRegistration,
+) -> Result<WatchdogTaskRunReceipt, WindowsAdapterError> {
+    use windows::Win32::System::Com::{
+        CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED, CoCreateInstance, CoInitializeEx,
+        CoUninitialize,
+    };
+    use windows::Win32::System::TaskScheduler::{
+        CLSID_CTaskScheduler, ITaskService, TASK_RUN_USE_SESSION_ID,
+    };
+    use windows::Win32::System::Variant::VARIANT;
+    use windows::core::BSTR;
+
+    let initialized = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
+    if initialized.0 < 0 {
+        return Err(WindowsAdapterError::Unavailable);
+    }
+    let result = (|| {
+        let service: ITaskService =
+            unsafe { CoCreateInstance(&CLSID_CTaskScheduler, None, CLSCTX_INPROC_SERVER) }
+                .map_err(|_| WindowsAdapterError::Unavailable)?;
+        let empty = VARIANT::default();
+        unsafe {
+            service
+                .Connect(&empty, &empty, &empty, &empty)
+                .map_err(|_| WindowsAdapterError::Unavailable)?;
+        }
+        let root = unsafe {
+            service
+                .GetFolder(&BSTR::from("\\"))
+                .map_err(|_| WindowsAdapterError::Unavailable)?
+        };
+        let folder = unsafe {
+            root.GetFolder(&BSTR::from(WATCHDOG_FALLBACK_TASK_FOLDER))
+                .map_err(|_| WindowsAdapterError::Unavailable)?
+        };
+        let task = unsafe {
+            folder
+                .GetTask(&BSTR::from(WATCHDOG_FALLBACK_TASK_LEAF))
+                .map_err(|_| WindowsAdapterError::Unavailable)?
+        };
+        let actual_xml = readback_watchdog_task(&task, registration)?;
+        let session_id = i32::try_from(registration.expected_session_id())
+            .map_err(|_| WindowsAdapterError::InvalidInput)?;
+        if unsafe {
+            task.RunEx(
+                &empty,
+                TASK_RUN_USE_SESSION_ID.0,
+                session_id,
+                &BSTR::from(registration.expected_sid()),
+            )
+        }
+        .is_err()
+        {
+            // A lost HRESULT is not proof of a failed run. Re-read the exact
+            // task to reject replacement, then retain the unknown outcome
+            // because XML cannot bind a later state to this invocation.
+            let _ = readback_watchdog_task(&task, registration)?;
+            return Err(WindowsAdapterError::Unavailable);
+        }
+        Ok(WatchdogTaskRunReceipt {
+            task_name: registration.task_name.clone(),
+            sid: registration.expected_sid.clone(),
+            session_id: registration.expected_session_id,
+            task_xml_sha256: sha256_hex(actual_xml.as_bytes()),
+        })
+    })();
+    unsafe {
+        CoUninitialize();
+    }
+    result
+}
+
+#[cfg(windows)]
+fn readback_watchdog_task(
+    task: &windows::Win32::System::TaskScheduler::IRegisteredTask,
+    registration: &WatchdogTaskRegistration,
+) -> Result<String, WindowsAdapterError> {
+    let actual_path = unsafe { task.Path().map_err(|_| WindowsAdapterError::Unavailable)? };
+    let actual_xml = unsafe { task.Xml().map_err(|_| WindowsAdapterError::Unavailable)? };
+    let actual_xml =
+        String::try_from(&actual_xml).map_err(|_| WindowsAdapterError::IdentityMismatch)?;
+    if actual_path != registration.task_name()
+        || !watchdog_task_readback_matches(registration, &actual_xml)
+    {
+        return Err(WindowsAdapterError::IdentityMismatch);
+    }
+    Ok(actual_xml)
+}
+
+fn watchdog_task_readback_matches(
+    registration: &WatchdogTaskRegistration,
+    actual_xml: &str,
+) -> bool {
+    let Some(task) = xml_section(actual_xml, "Task") else {
+        return false;
+    };
+    let Some(registration_info) = xml_section(task, "RegistrationInfo") else {
+        return false;
+    };
+    let Some(triggers) = xml_section(task, "Triggers") else {
+        return false;
+    };
+    let Some(principals) = xml_section(task, "Principals") else {
+        return false;
+    };
+    let Some(settings) = xml_section(task, "Settings") else {
+        return false;
+    };
+    let Some(actions) = xml_section(task, "Actions") else {
+        return false;
+    };
+    if opening_tag(actual_xml, "Task")
+        != Some(
+            r#"<Task version="1.4" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">"#,
+        )
+        || !has_exact_tag_shape(
+            registration_info,
+            &[
+                ("RegistrationInfo", 1),
+                ("Author", 1),
+                ("Description", 1),
+                ("URI", 1),
+            ],
+        )
+        || opening_tag(principals, "Principal") != Some(r#"<Principal id="Author">"#)
+        || opening_tag(actions, "Actions") != Some(r#"<Actions Context="Author">"#)
+        || !has_exact_tag_shape(
+            triggers,
+            &[
+                ("Triggers", 1),
+                ("LogonTrigger", 1),
+                ("Enabled", 1),
+                ("UserId", 1),
+            ],
+        )
+        || !has_exact_tag_shape(
+            principals,
+            &[
+                ("Principals", 1),
+                ("Principal", 1),
+                ("UserId", 1),
+                ("LogonType", 1),
+                ("RunLevel", 1),
+            ],
+        )
+        || !has_exact_tag_shape(
+            settings,
+            &[
+                ("Settings", 1),
+                ("MultipleInstancesPolicy", 1),
+                ("DisallowStartIfOnBatteries", 1),
+                ("StopIfGoingOnBatteries", 1),
+                ("AllowHardTerminate", 1),
+                ("StartWhenAvailable", 1),
+                ("ExecutionTimeLimit", 1),
+                ("Priority", 1),
+            ],
+        )
+        || !has_exact_tag_shape(
+            actions,
+            &[
+                ("Actions", 1),
+                ("Exec", 1),
+                ("Command", 1),
+                ("Arguments", 1),
+                ("WorkingDirectory", 1),
+            ],
+        )
+    {
+        return false;
+    }
+    let escaped_sid = xml_escape(registration.expected_sid());
+    let escaped_executable = xml_escape(&registration.notify_executable.display().to_string());
+    let escaped_working_directory = xml_escape(
+        &registration
+            .notify_executable
+            .parent()
+            .unwrap_or_else(|| Path::new("\\"))
+            .display()
+            .to_string(),
+    );
+    let escaped_verifier = xml_escape(&registration.verifier_path.display().to_string());
+    let escaped_envelope = xml_escape(&registration.envelope_path.display().to_string());
+    let description = format!(
+        "X-01 signed one-shot Watchdog fallback; verifier={escaped_verifier}; envelope={escaped_envelope}; artifact={}; verifier_sha256={}",
+        registration.notify_artifact_sha256(),
+        registration.verifier_sha256()
+    );
+    element_text(actual_xml, "URI") == Some(registration.task_name())
+        && element_text(triggers, "Enabled") == Some("true")
+        && element_text(triggers, "UserId") == Some(escaped_sid.as_str())
+        && element_text(principals, "UserId") == Some(escaped_sid.as_str())
+        && element_text(principals, "LogonType") == Some("InteractiveToken")
+        && element_text(principals, "RunLevel") == Some("LeastPrivilege")
+        && element_text(settings, "MultipleInstancesPolicy") == Some("IgnoreNew")
+        && element_text(settings, "DisallowStartIfOnBatteries") == Some("false")
+        && element_text(settings, "StopIfGoingOnBatteries") == Some("false")
+        && element_text(settings, "AllowHardTerminate") == Some("true")
+        && element_text(settings, "StartWhenAvailable") == Some("true")
+        && element_text(settings, "ExecutionTimeLimit") == Some("PT5M")
+        && element_text(settings, "Priority") == Some("7")
+        && element_text(actions, "Command") == Some(escaped_executable.as_str())
+        && element_text(actions, "Arguments") == Some("--watchdog-fallback")
+        && element_text(actions, "WorkingDirectory") == Some(escaped_working_directory.as_str())
+        && element_text(registration_info, "Author") == Some("Eliot installer")
+        && element_text(registration_info, "Description") == Some(description.as_str())
+        && element_text(actual_xml, "Description") == Some(description.as_str())
+}
+
+fn watchdog_task_xml(registration: &WatchdogTaskRegistration) -> String {
+    let task_name = xml_escape(registration.task_name());
+    let sid = xml_escape(registration.expected_sid());
+    let executable = xml_escape(&registration.notify_executable.display().to_string());
+    let working_directory = xml_escape(
+        &registration
+            .notify_executable
+            .parent()
+            .unwrap_or_else(|| Path::new("\\"))
+            .display()
+            .to_string(),
+    );
+    let verifier = xml_escape(&registration.verifier_path.display().to_string());
+    let envelope = xml_escape(&registration.envelope_path.display().to_string());
+    let artifact_digest = xml_escape(registration.notify_artifact_sha256());
+    let verifier_digest = xml_escape(registration.verifier_sha256());
+    format!(
+        r#"<?xml version="1.0" encoding="UTF-16"?>
+<Task version="1.4" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <RegistrationInfo>
+    <Author>Eliot installer</Author>
+    <Description>X-01 signed one-shot Watchdog fallback; verifier={verifier}; envelope={envelope}; artifact={artifact_digest}; verifier_sha256={verifier_digest}</Description>
+    <URI>{task_name}</URI>
+  </RegistrationInfo>
+  <Triggers>
+    <LogonTrigger>
+      <Enabled>true</Enabled>
+      <UserId>{sid}</UserId>
+    </LogonTrigger>
+  </Triggers>
+  <Principals>
+    <Principal id="Author">
+      <UserId>{sid}</UserId>
+      <LogonType>InteractiveToken</LogonType>
+      <RunLevel>LeastPrivilege</RunLevel>
+    </Principal>
+  </Principals>
+  <Settings>
+    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
+    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
+    <AllowHardTerminate>true</AllowHardTerminate>
+    <StartWhenAvailable>true</StartWhenAvailable>
+    <ExecutionTimeLimit>PT5M</ExecutionTimeLimit>
+    <Priority>7</Priority>
+  </Settings>
+  <Actions Context="Author">
+    <Exec>
+      <Command>{executable}</Command>
+      <Arguments>--watchdog-fallback</Arguments>
+      <WorkingDirectory>{working_directory}</WorkingDirectory>
+    </Exec>
+  </Actions>
+</Task>"#
+    )
+}
+
+fn xml_escape(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&apos;")
+}
+
+#[cfg(windows)]
+fn get_or_create_watchdog_folder(
+    root: &windows::Win32::System::TaskScheduler::ITaskFolder,
+    empty: &windows::Win32::System::Variant::VARIANT,
+) -> Result<windows::Win32::System::TaskScheduler::ITaskFolder, WindowsAdapterError> {
+    use windows::core::BSTR;
+    match unsafe { root.GetFolder(&BSTR::from(WATCHDOG_FALLBACK_TASK_FOLDER)) } {
+        Ok(folder) => Ok(folder),
+        Err(_) => unsafe {
+            root.CreateFolder(&BSTR::from("Eliot"), empty)
+                .or_else(|_| root.GetFolder(&BSTR::from(WATCHDOG_FALLBACK_TASK_FOLDER)))
+        }
+        .map_err(|_| WindowsAdapterError::Unavailable),
+    }
+}
+
+fn xml_section<'a>(xml: &'a str, tag: &str) -> Option<&'a str> {
+    let open = format!("<{tag}");
+    let start = xml.find(&open)?;
+    let open_end = xml[start..].find('>')? + start + 1;
+    let close = format!("</{tag}>");
+    let close_start = xml[open_end..].find(&close)? + open_end;
+    if count_xml_open_tag(xml, tag) != 1 {
+        return None;
+    }
+    Some(&xml[start..close_start + close.len()])
+}
+
+fn element_text<'a>(xml: &'a str, tag: &str) -> Option<&'a str> {
+    let open = format!("<{tag}>");
+    let close = format!("</{tag}>");
+    if xml.match_indices(&open).count() != 1 || xml.match_indices(&close).count() != 1 {
+        return None;
+    }
+    let start = xml.find(&open)? + open.len();
+    let end = xml[start..].find(&close)? + start;
+    Some(xml[start..end].trim())
+}
+
+fn opening_tag<'a>(xml: &'a str, tag: &str) -> Option<&'a str> {
+    let prefix = format!("<{tag}");
+    let start = xml.match_indices(&prefix).find_map(|(index, _)| {
+        matches!(
+            xml.get(index + prefix.len()..)
+                .and_then(|rest| rest.chars().next()),
+            Some(' ') | Some('>') | Some('/')
+        )
+        .then_some(index)
+    })?;
+    let end = xml[start..].find('>')? + start + 1;
+    Some(&xml[start..end])
+}
+
+fn count_xml_open_tag(xml: &str, tag: &str) -> usize {
+    let prefix = format!("<{tag}");
+    xml.match_indices(&prefix)
+        .filter(|(index, _)| {
+            matches!(
+                xml.get(index + prefix.len()..)
+                    .and_then(|rest| rest.chars().next()),
+                Some(' ') | Some('>') | Some('/')
+            )
+        })
+        .count()
+}
+
+fn has_exact_tag_shape(xml: &str, expected: &[(&str, usize)]) -> bool {
+    let names = xml_open_tag_names(xml);
+    let expected_total = expected.iter().map(|(_, count)| *count).sum::<usize>();
+    names.len() == expected_total
+        && expected
+            .iter()
+            .all(|(tag, count)| names.iter().filter(|name| name.as_str() == *tag).count() == *count)
+}
+
+fn xml_open_tag_names(xml: &str) -> Vec<String> {
+    let bytes = xml.as_bytes();
+    let mut names = Vec::new();
+    let mut index = 0;
+    while index < bytes.len() {
+        let Some(relative) = xml[index..].find('<') else {
+            break;
+        };
+        let start = index + relative;
+        let Some(next) = bytes.get(start + 1).copied() else {
+            break;
+        };
+        if matches!(next, b'/' | b'!' | b'?') {
+            index = start + 1;
+            continue;
+        }
+        let name_start = start + 1;
+        let name_end = (name_start..bytes.len())
+            .find(|candidate| {
+                matches!(
+                    bytes[*candidate],
+                    b' ' | b'\t' | b'\r' | b'\n' | b'>' | b'/'
+                )
+            })
+            .unwrap_or(bytes.len());
+        if name_end > name_start {
+            names.push(xml[name_start..name_end].to_owned());
+        }
+        index = name_end.saturating_add(1);
+    }
+    names
+}
+
 impl NamedPipePeerExpectation {
     /// Creates inert expected SID/session policy.
     ///
@@ -3490,6 +4272,12 @@ pub fn current_process_named_pipe_expectation()
     NamedPipePeerExpectation::new(sid, session_id)
 }
 
+#[cfg(not(windows))]
+pub fn current_process_named_pipe_expectation()
+-> Result<NamedPipePeerExpectation, WindowsAdapterError> {
+    Err(WindowsAdapterError::Unavailable)
+}
+
 impl FilesystemPort for WindowsPlatform {
     fn execute(
         &mut self,
@@ -3605,7 +4393,211 @@ impl NotificationPort for WindowsPlatform {
         if let Err(error) = request.validate() {
             return PortOutcome::Error(error);
         }
+        // I11.6 normal delivery belongs to the interactive User Broker and a
+        // WinUI/AppNotificationManager owner. This low-level adapter is not a
+        // second toast authority; callers must keep the result unavailable
+        // until that owner returns authenticated OS acceptance evidence.
+        let _ = request;
         PortOutcome::Unknown(UnknownReason::Unsupported)
+    }
+}
+
+impl WindowsPlatform {
+    /// Delivers the narrowly scoped X-01 recovery banner. This is not the
+    /// normal notification route: it is used only by the separately signed
+    /// Watchdog fallback composition and requires a live, non-elevated user
+    /// session plus a bounded shell callback observation.
+    pub fn deliver_recovery_banner(
+        &mut self,
+        request: &NotificationRequest,
+    ) -> PortOutcome<NotificationObservation> {
+        if let Err(error) = request.validate() {
+            return PortOutcome::Error(error);
+        }
+        if !interactive_non_elevated_session() {
+            return PortOutcome::Unknown(UnknownReason::NotObserved);
+        }
+        match deliver_shell_notification(request) {
+            Ok(true) => PortOutcome::Known(NotificationObservation {
+                notification: request.notification.clone(),
+                delivered: true,
+            }),
+            Ok(false) => PortOutcome::Unknown(UnknownReason::NotObserved),
+            Err(_) => PortOutcome::Unknown(UnknownReason::Indeterminate),
+        }
+    }
+}
+
+/// Delivers one bounded Shell balloon and returns the observed API result.
+///
+/// The P-01 request contains only opaque notification/audience/digest handles,
+/// so the adapter never treats caller text as a trusted title or body. The
+/// Shell accepts the recovery banner through `NIM_MODIFY`; `true` means the
+/// bounded callback pump observed `NIN_BALLOONSHOW`, not that a human clicked
+/// or read the notification.
+#[cfg(windows)]
+fn deliver_shell_notification(_request: &NotificationRequest) -> Result<bool, WindowsAdapterError> {
+    use std::mem::size_of;
+    use std::ptr::{null, null_mut};
+
+    use windows_sys::Win32::UI::Shell::{
+        NIF_ICON, NIF_INFO, NIF_MESSAGE, NIIF_INFO, NIM_ADD, NIM_DELETE, NIM_MODIFY,
+        NOTIFYICONDATAW, Shell_NotifyIconW,
+    };
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        CreateWindowExW, DestroyWindow, IDI_INFORMATION, LoadIconW, WM_APP, WS_EX_TOOLWINDOW,
+        WS_POPUP,
+    };
+
+    let hwnd = unsafe {
+        CreateWindowExW(
+            WS_EX_TOOLWINDOW,
+            windows_sys::core::w!("STATIC"),
+            windows_sys::core::w!("Eliot notification"),
+            WS_POPUP,
+            0,
+            0,
+            0,
+            0,
+            null_mut(),
+            null_mut(),
+            null_mut(),
+            null(),
+        )
+    };
+    if hwnd.is_null() {
+        return Ok(false);
+    }
+
+    let mut data = NOTIFYICONDATAW {
+        cbSize: u32::try_from(size_of::<NOTIFYICONDATAW>())
+            .map_err(|_| WindowsAdapterError::InvalidInput)?,
+        hWnd: hwnd,
+        uID: 1,
+        uFlags: NIF_ICON | NIF_MESSAGE | NIF_INFO,
+        uCallbackMessage: WM_APP + 1,
+        hIcon: unsafe { LoadIconW(null_mut(), IDI_INFORMATION) },
+        dwInfoFlags: NIIF_INFO,
+        ..Default::default()
+    };
+    fill_utf16(&mut data.szTip, "Eliot");
+    // P-01 carries opaque handles, not presentation text.  Keep the banner
+    // useful without leaking audience or evidence identifiers into the
+    // desktop shell; the canonical UI resolves those handles separately.
+    fill_utf16(&mut data.szInfoTitle, "Eliot notification");
+    fill_utf16(
+        &mut data.szInfo,
+        "Eliot has a notification requiring review. Open Eliot recovery status.",
+    );
+    // The union is intentionally written only after the structure has been
+    // zero-initialized; this selects the documented balloon timeout member.
+    data.Anonymous.uTimeout = 10_000;
+
+    let added = unsafe { Shell_NotifyIconW(NIM_ADD, &data) != 0 };
+    if !added {
+        unsafe {
+            DestroyWindow(hwnd);
+        }
+        return Ok(false);
+    }
+    let accepted = unsafe { Shell_NotifyIconW(NIM_MODIFY, &data) != 0 };
+    let delivered = if accepted {
+        wait_for_shell_balloon(hwnd, data.uCallbackMessage)
+    } else {
+        false
+    };
+    // Keep the icon and hidden window alive until the bounded callback wait;
+    // deleting immediately emits NIN_BALLOONHIDE and would falsify delivery.
+    unsafe {
+        let _ = Shell_NotifyIconW(NIM_DELETE, &data);
+        DestroyWindow(hwnd);
+    }
+    Ok(delivered)
+}
+
+#[cfg(windows)]
+fn wait_for_shell_balloon(hwnd: windows_sys::Win32::Foundation::HWND, callback: u32) -> bool {
+    use std::time::{Duration, Instant};
+
+    use windows_sys::Win32::UI::Shell::NIN_BALLOONSHOW;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        DispatchMessageW, MSG, PM_REMOVE, PeekMessageW, TranslateMessage,
+    };
+
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < deadline {
+        let mut message = MSG::default();
+        let mut observed = false;
+        while unsafe { PeekMessageW(&raw mut message, hwnd, 0, 0, PM_REMOVE) } != 0 {
+            if message.message == callback
+                && message.lParam == isize::try_from(NIN_BALLOONSHOW).unwrap_or_default()
+            {
+                observed = true;
+            }
+            unsafe {
+                TranslateMessage(&message);
+                DispatchMessageW(&message);
+            }
+        }
+        if observed {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    false
+}
+
+#[cfg(not(windows))]
+fn deliver_shell_notification(_request: &NotificationRequest) -> Result<bool, WindowsAdapterError> {
+    Err(WindowsAdapterError::Unavailable)
+}
+
+#[cfg(windows)]
+fn interactive_non_elevated_session() -> bool {
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::Security::{
+        GetTokenInformation, TOKEN_ELEVATION, TOKEN_QUERY, TokenElevation,
+    };
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+
+    let Ok(expectation) = current_process_named_pipe_expectation() else {
+        return false;
+    };
+    if expectation.expected_session_id() == 0 {
+        return false;
+    }
+    let mut token = std::ptr::null_mut();
+    if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &raw mut token) } == 0 {
+        return false;
+    }
+    let mut elevation = TOKEN_ELEVATION::default();
+    let mut length = 0_u32;
+    let result = unsafe {
+        GetTokenInformation(
+            token,
+            TokenElevation,
+            (&raw mut elevation).cast(),
+            u32::try_from(std::mem::size_of::<TOKEN_ELEVATION>()).unwrap_or_default(),
+            &raw mut length,
+        ) != 0
+    };
+    unsafe {
+        CloseHandle(token);
+    }
+    result && elevation.TokenIsElevated == 0
+}
+
+#[cfg(not(windows))]
+const fn interactive_non_elevated_session() -> bool {
+    false
+}
+
+fn fill_utf16(buffer: &mut [u16], value: &str) {
+    let max = buffer.len().saturating_sub(1);
+    let encoded = value.encode_utf16().take(max).collect::<Vec<_>>();
+    buffer[..encoded.len()].copy_from_slice(&encoded);
+    if let Some(terminator) = buffer.get_mut(encoded.len()) {
+        *terminator = 0;
     }
 }
 
@@ -3724,6 +4716,17 @@ fn unix_millis(time: SystemTime) -> Option<i64> {
     time.duration_since(UNIX_EPOCH)
         .ok()
         .and_then(|duration| i64::try_from(duration.as_millis()).ok())
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(bytes))
+}
+
+fn valid_sha256_hex(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
 }
 
 fn unique_suffix() -> String {
@@ -5276,6 +6279,77 @@ mod tests {
     fn wrong_session_is_not_observed() {
         assert!(!session_matches(7, 8));
         assert!(session_matches(7, 7));
+    }
+
+    #[test]
+    fn notification_text_is_bounded_and_nul_terminated() {
+        let mut buffer = [0_u16; 8];
+        fill_utf16(&mut buffer, "Eliot notification text");
+        assert_eq!(buffer[7], 0);
+        assert_eq!(String::from_utf16_lossy(&buffer[..7]), "Eliot n");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn watchdog_task_readback_rejects_structural_substitution() {
+        let registration = WatchdogTaskRegistration::new(
+            WATCHDOG_FALLBACK_TASK_NAME,
+            r"C:\Eliot\eliot-notify.exe",
+            r"C:\ProgramData\Eliot\watchdog-verifier.json",
+            r"C:\ProgramData\Eliot\watchdog-envelope.json",
+            "S-1-5-21-1",
+            7,
+            "00".repeat(32),
+            "11".repeat(32),
+        )
+        .unwrap_or_else(|_| unreachable!());
+        let xml = watchdog_task_xml(&registration);
+        assert!(watchdog_task_readback_matches(&registration, &xml));
+
+        let extra_action = xml.replace(
+            "</Actions>",
+            "<Exec><Command>evil.exe</Command></Exec></Actions>",
+        );
+        assert!(!watchdog_task_readback_matches(
+            &registration,
+            &extra_action
+        ));
+
+        let extra_trigger = xml.replace(
+            "</Triggers>",
+            "<TimeTrigger><Enabled>true</Enabled></TimeTrigger></Triggers>",
+        );
+        assert!(!watchdog_task_readback_matches(
+            &registration,
+            &extra_trigger
+        ));
+
+        let extra_principal = xml.replace(
+            "</Principals>",
+            "<Principal id=\"Substitute\"><UserId>S-1-5-21-9</UserId></Principal></Principals>",
+        );
+        assert!(!watchdog_task_readback_matches(
+            &registration,
+            &extra_principal
+        ));
+
+        let extra_setting = xml.replace(
+            "</Settings>",
+            "<UnknownSetting>true</UnknownSetting></Settings>",
+        );
+        assert!(!watchdog_task_readback_matches(
+            &registration,
+            &extra_setting
+        ));
+
+        let changed_action = xml.replace(
+            "<Arguments>--watchdog-fallback</Arguments>",
+            "<Arguments>--changed</Arguments>",
+        );
+        assert!(!watchdog_task_readback_matches(
+            &registration,
+            &changed_action
+        ));
     }
 
     #[test]

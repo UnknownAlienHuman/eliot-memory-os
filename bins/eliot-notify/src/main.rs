@@ -9,6 +9,14 @@ use serde::{Deserialize, Serialize};
 const REQUEST_INVALID_EXIT: i32 = 2;
 const PROVIDER_REJECTED_EXIT: i32 = 69;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LaunchMode {
+    Normal,
+    WatchdogFallback,
+    RegisterWatchdogFallback,
+    ActivateWatchdogFallback,
+}
+
 #[derive(Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
 enum Request {
@@ -26,6 +34,24 @@ enum Response {
         protocol: &'static str,
         observation: eliot_notify_core::DeliveryObservation,
     },
+    WatchdogTaskRegistered {
+        service: &'static str,
+        protocol: &'static str,
+        task_name: String,
+        sid: String,
+        session_id: u32,
+        notify_artifact_sha256: String,
+        verifier_sha256: String,
+        task_xml_sha256: String,
+    },
+    WatchdogTaskActivated {
+        service: &'static str,
+        protocol: &'static str,
+        task_name: String,
+        sid: String,
+        session_id: u32,
+        task_xml_sha256: String,
+    },
     Error {
         code: &'static str,
         detail: String,
@@ -33,7 +59,7 @@ enum Response {
 }
 
 fn main() {
-    let (root, watchdog_fallback) = match parse_launch() {
+    let (root, mode) = match parse_launch() {
         Ok(root) => root,
         Err(error) => exit(PROVIDER_REJECTED_EXIT, "NOTIFY_ROOT_REJECTED", error),
     };
@@ -45,7 +71,53 @@ fn main() {
             error.to_string(),
         ),
     };
-    if watchdog_fallback {
+    if mode == LaunchMode::RegisterWatchdogFallback {
+        let receipt = match eliot_notify::register_watchdog_fallback_task() {
+            Ok(receipt) => receipt,
+            Err(error) => exit(
+                PROVIDER_REJECTED_EXIT,
+                "WATCHDOG_SCHEDULER_REJECTED",
+                error.to_string(),
+            ),
+        };
+        let response = Response::WatchdogTaskRegistered {
+            service: SERVICE_NAME,
+            protocol: PROTOCOL_VERSION,
+            task_name: receipt.task_name().to_owned(),
+            sid: receipt.sid().to_owned(),
+            session_id: receipt.session_id(),
+            notify_artifact_sha256: receipt.notify_artifact_sha256().to_owned(),
+            verifier_sha256: receipt.verifier_sha256().to_owned(),
+            task_xml_sha256: receipt.task_xml_sha256().to_owned(),
+        };
+        if !write_response(response) {
+            std::process::exit(PROVIDER_REJECTED_EXIT);
+        }
+        return;
+    }
+    if mode == LaunchMode::ActivateWatchdogFallback {
+        let receipt = match eliot_notify::activate_watchdog_fallback_task() {
+            Ok(receipt) => receipt,
+            Err(error) => exit(
+                PROVIDER_REJECTED_EXIT,
+                "WATCHDOG_SCHEDULER_UNKNOWN",
+                error.to_string(),
+            ),
+        };
+        let response = Response::WatchdogTaskActivated {
+            service: SERVICE_NAME,
+            protocol: PROTOCOL_VERSION,
+            task_name: receipt.task_name().to_owned(),
+            sid: receipt.sid().to_owned(),
+            session_id: receipt.session_id(),
+            task_xml_sha256: receipt.task_xml_sha256().to_owned(),
+        };
+        if !write_response(response) {
+            std::process::exit(PROVIDER_REJECTED_EXIT);
+        }
+        return;
+    }
+    if mode == LaunchMode::WatchdogFallback {
         let (envelope, request) = match eliot_notify::load_watchdog_fallback_request() {
             Ok(value) => value,
             Err(error) => exit(
@@ -105,26 +177,35 @@ fn main() {
     }
 }
 
-fn parse_launch() -> Result<(PathBuf, bool), String> {
+fn parse_launch() -> Result<(PathBuf, LaunchMode), String> {
     let expected = eliot_platform_windows::protected_program_data_path("Eliot/notify")
         .map_err(|error| error.to_string())?;
     parse_launch_args(std::env::args_os().skip(1), expected)
 }
 
-fn parse_launch_args<I, S>(arguments: I, expected: PathBuf) -> Result<(PathBuf, bool), String>
+fn parse_launch_args<I, S>(arguments: I, expected: PathBuf) -> Result<(PathBuf, LaunchMode), String>
 where
     I: IntoIterator<Item = S>,
     S: Into<std::ffi::OsString>,
 {
     let mut args = arguments.into_iter().map(Into::into);
-    let mut watchdog_fallback = false;
+    let mut mode = LaunchMode::Normal;
     let mut supplied_root = None;
     while let Some(value) = args.next() {
-        if value == "--watchdog-fallback" {
-            if watchdog_fallback {
-                return Err("--watchdog-fallback may only be supplied once".to_owned());
+        let requested_mode = if value == "--watchdog-fallback" {
+            Some(LaunchMode::WatchdogFallback)
+        } else if value == "--register-watchdog-fallback" {
+            Some(LaunchMode::RegisterWatchdogFallback)
+        } else if value == "--activate-watchdog-fallback" {
+            Some(LaunchMode::ActivateWatchdogFallback)
+        } else {
+            None
+        };
+        if let Some(requested_mode) = requested_mode {
+            if mode != LaunchMode::Normal {
+                return Err("only one Watchdog launch mode may be supplied".to_owned());
             }
-            watchdog_fallback = true;
+            mode = requested_mode;
         } else if value == "--work-root" {
             if supplied_root.is_some() {
                 return Err("--work-root may only be supplied once".to_owned());
@@ -151,12 +232,12 @@ where
             Ok(supplied)
         },
     )?;
-    if watchdog_fallback && supplied_root_given {
+    if mode != LaunchMode::Normal && supplied_root_given {
         // Keep the scheduler mode deterministic: it always resolves the
         // installer-owned contour and does not accept a caller-selected root.
         return Err("watchdog fallback does not accept --work-root".to_owned());
     }
-    Ok((root, watchdog_fallback))
+    Ok((root, mode))
 }
 
 fn dispatch_deliver(
@@ -234,7 +315,7 @@ mod tests {
         let (root, fallback) = parse_launch_args(["--watchdog-fallback"], expected.clone())
             .expect("watchdog mode parses without a request stream");
         assert_eq!(root, expected);
-        assert!(fallback);
+        assert_eq!(fallback, LaunchMode::WatchdogFallback);
         assert!(
             parse_launch_args(
                 [
@@ -243,6 +324,25 @@ mod tests {
                     r"C:\ProgramData\Eliot\notify"
                 ],
                 PathBuf::from(r"C:\ProgramData\Eliot\notify")
+            )
+            .is_err()
+        );
+        assert_eq!(
+            parse_launch_args(["--register-watchdog-fallback"], expected.clone())
+                .expect("registration mode parses without stdin")
+                .1,
+            LaunchMode::RegisterWatchdogFallback
+        );
+        assert_eq!(
+            parse_launch_args(["--activate-watchdog-fallback"], expected.clone())
+                .expect("activation mode parses without stdin")
+                .1,
+            LaunchMode::ActivateWatchdogFallback
+        );
+        assert!(
+            parse_launch_args(
+                ["--watchdog-fallback", "--activate-watchdog-fallback"],
+                expected.clone()
             )
             .is_err()
         );
