@@ -1112,6 +1112,25 @@ enum LedgerReconcileDecision {
     Poison,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[allow(dead_code)]
+enum LedgerPublicationOutcome {
+    Published,
+    Unknown,
+}
+
+/// Narrow publication seam for the protected fallback ledger. Production uses
+/// the Windows implementation below; tests can inject a publisher that
+/// reproduces lost-response and restart states without touching arbitrary
+/// files or weakening the protected-path contract.
+trait FallbackLedgerPublisher: Send {
+    fn read(&mut self) -> Result<FallbackLedgerSnapshot, PortError>;
+    fn publish(
+        &mut self,
+        desired: &FallbackLedgerSnapshot,
+    ) -> Result<LedgerPublicationOutcome, PortError>;
+}
+
 fn classify_ledger_reconciliation(
     previous: &FallbackLedgerSnapshot,
     desired: &FallbackLedgerSnapshot,
@@ -1138,9 +1157,10 @@ fn allocate_reservation_id(counter: &mut u64) -> Option<(String, PlatformHandle)
 struct LocalFallbackLedger {
     expected_authority_epoch: u64,
     state: FallbackLedgerSnapshot,
-    platform: WindowsPlatform,
+    platform: Option<WindowsPlatform>,
     relative: PathBuf,
     lease: Option<ProtectedPathLease>,
+    publisher: Option<Box<dyn FallbackLedgerPublisher>>,
 }
 
 impl LocalFallbackLedger {
@@ -1153,13 +1173,24 @@ impl LocalFallbackLedger {
         let bytes = lease
             .read_bounded(FALLBACK_BYTES_LIMIT)
             .map_err(|error| NotifyBuildError::Fallback(error.to_string()))?;
-        let state = if bytes.is_empty() {
+        let mut state = if bytes.is_empty() {
             FallbackLedgerSnapshot::default()
         } else {
             serde_json::from_slice(&bytes).map_err(|error| {
                 NotifyBuildError::Fallback(format!("decode fallback ledger: {error}"))
             })?
         };
+        // An entry without a delivery observation is the durable marker for
+        // an interrupted reservation/commit.  It is safe to preserve the
+        // marker across restart, but never safe to treat it as a retryable
+        // conflict: poison it in memory before any new platform effect.
+        for key in state
+            .entries
+            .iter()
+            .filter_map(|(key, entry)| entry.observation.is_none().then_some(key.clone()))
+        {
+            state.poisoned_keys.insert(key);
+        }
         let platform = WindowsPlatform::new(root)
             .map_err(|error| NotifyBuildError::Fallback(error.to_string()))?;
         if lease.path() != path {
@@ -1170,34 +1201,16 @@ impl LocalFallbackLedger {
         Ok(Self {
             expected_authority_epoch,
             state,
-            platform,
+            platform: Some(platform),
             relative,
             lease: Some(lease),
+            publisher: None,
         })
     }
 
     fn validate_request(&self, request: &NotificationRequest, intent: &LedgerIntent) -> bool {
         intent.request_id.as_str() == request.context.request_id.as_str()
             && request.context.state_fence.authority_epoch.value() == self.expected_authority_epoch
-    }
-
-    fn read_current(&mut self) -> Result<FallbackLedgerSnapshot, PortError> {
-        let lease = ProtectedPathLease::open_or_create(&self.relative)
-            .map_err(|_| fallback_provider_error(ProviderErrorCode::Unavailable))?;
-        lease
-            .verify_stable_identity()
-            .and_then(|()| lease.verify_path_identity())
-            .map_err(|_| fallback_provider_error(ProviderErrorCode::Unavailable))?;
-        let bytes = lease
-            .read_bounded(FALLBACK_BYTES_LIMIT)
-            .map_err(|_| fallback_provider_error(ProviderErrorCode::Unavailable))?;
-        self.lease = Some(lease);
-        if bytes.is_empty() {
-            Ok(FallbackLedgerSnapshot::default())
-        } else {
-            serde_json::from_slice(&bytes)
-                .map_err(|_| fallback_provider_error(ProviderErrorCode::Unavailable))
-        }
     }
 
     fn poison_key(&mut self, key: &str) {
@@ -1210,47 +1223,125 @@ impl LocalFallbackLedger {
         key: &str,
         effect_may_have_happened: bool,
     ) -> Result<LedgerPersistResult, PortError> {
+        if let Some(publisher) = self.publisher.as_mut() {
+            // A publisher error is indistinguishable from a lost response at
+            // this boundary.  Always perform the exact readback before
+            // deciding whether the desired state was published.
+            let publication = match publisher.publish(&self.state) {
+                Ok(publication) => publication,
+                Err(_) => LedgerPublicationOutcome::Unknown,
+            };
+            let current = match publisher.read() {
+                Ok(current) => current,
+                Err(error) => {
+                    self.poison_key(key);
+                    return Err(error);
+                }
+            };
+            if current == self.state {
+                return Ok(match publication {
+                    LedgerPublicationOutcome::Published => LedgerPersistResult::Published,
+                    LedgerPublicationOutcome::Unknown => LedgerPersistResult::Reconciled,
+                });
+            }
+            return match classify_ledger_reconciliation(
+                previous,
+                &self.state,
+                &current,
+                effect_may_have_happened,
+            ) {
+                LedgerReconcileDecision::PostState => Ok(LedgerPersistResult::Reconciled),
+                LedgerReconcileDecision::NotPublished => {
+                    self.state = current;
+                    Ok(LedgerPersistResult::NotPublished)
+                }
+                LedgerReconcileDecision::Poison => {
+                    self.poison_key(key);
+                    Err(fallback_provider_error(ProviderErrorCode::Unavailable))
+                }
+            };
+        }
         let bytes = serde_json::to_vec(&self.state)
             .map_err(|_| fallback_provider_error(ProviderErrorCode::Failed))?;
+        let previous_bytes = {
+            let lease = self
+                .lease
+                .as_ref()
+                .ok_or_else(|| fallback_provider_error(ProviderErrorCode::Unavailable))?;
+            let verified = lease
+                .verify_stable_identity()
+                .and_then(|()| lease.verify_path_identity())
+                .map_err(|_| fallback_provider_error(ProviderErrorCode::Unavailable));
+            verified.and_then(|()| {
+                lease
+                    .read_bounded(FALLBACK_BYTES_LIMIT)
+                    .map_err(|_| fallback_provider_error(ProviderErrorCode::Unavailable))
+            })
+        };
+        let previous_bytes = match previous_bytes {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                self.lease = None;
+                return Err(error);
+            }
+        };
+        let durable_previous = if previous_bytes.is_empty() {
+            FallbackLedgerSnapshot::default()
+        } else {
+            match serde_json::from_slice(&previous_bytes) {
+                Ok(state) => state,
+                Err(_) => {
+                    self.lease = None;
+                    return Err(fallback_provider_error(ProviderErrorCode::Unavailable));
+                }
+            }
+        };
+        if durable_previous != *previous {
+            self.poison_key(key);
+            return Err(fallback_provider_error(ProviderErrorCode::Unavailable));
+        }
+        let scope = WorkScopePath::new("watchdog-ledger.json")
+            .map_err(|_| fallback_provider_error(ProviderErrorCode::InvalidRequest))?;
         let lease = self
             .lease
             .take()
             .ok_or_else(|| fallback_provider_error(ProviderErrorCode::Unavailable))?;
-        let verified = lease
-            .verify_stable_identity()
-            .and_then(|()| lease.verify_path_identity());
-        if verified.is_err() {
-            self.lease = Some(lease);
-            self.poison_key(key);
-            return Err(fallback_provider_error(ProviderErrorCode::Unavailable));
-        }
+        // No fallible operation occurs between taking the old lease and the
+        // reacquire/readback below.  The replacement helper stores its lease
+        // before returning success or any proof/read failure.
         drop(lease);
-        let scope = WorkScopePath::new("watchdog-ledger.json")
-            .map_err(|_| fallback_provider_error(ProviderErrorCode::InvalidRequest))?;
-        let published = matches!(
-            self.platform.publish_atomic(&scope, &bytes),
-            Ok(PublicationOutcome::Published(_))
-        );
-        if published {
-            self.lease = ProtectedPathLease::open_or_create(&self.relative).ok();
-            if self.lease.is_none() {
+        let publication = match self.platform.as_ref() {
+            Some(platform) => platform.publish_atomic(&scope, &bytes),
+            None => Err(fallback_provider_error(ProviderErrorCode::Unavailable)),
+        };
+        let current_bytes = match self.read_current_bytes_after_publication() {
+            Ok(bytes) => bytes,
+            Err(error) => {
                 self.poison_key(key);
-                return Err(fallback_provider_error(ProviderErrorCode::Unavailable));
-            }
-            return Ok(LedgerPersistResult::Published);
-        }
-
-        // A publication error is not proof that the old bytes remain. Re-open
-        // through a fresh protected lease and compare the complete snapshot.
-        // An exact post-state is safe to acknowledge; anything else is kept
-        // unavailable and poisoned so a retry cannot duplicate an effect.
-        let current = match self.read_current() {
-            Ok(current) => current,
-            Err(_) => {
-                self.poison_key(key);
-                return Err(fallback_provider_error(ProviderErrorCode::Unavailable));
+                return Err(error);
             }
         };
+        let current = if current_bytes.is_empty() {
+            FallbackLedgerSnapshot::default()
+        } else {
+            match serde_json::from_slice(&current_bytes) {
+                Ok(current) => current,
+                Err(_) => {
+                    self.poison_key(key);
+                    return Err(fallback_provider_error(ProviderErrorCode::Unavailable));
+                }
+            }
+        };
+        if current == self.state {
+            return Ok(match publication {
+                Ok(PublicationOutcome::Published(_)) => LedgerPersistResult::Published,
+                Ok(PublicationOutcome::Unknown(_)) | Err(_) => LedgerPersistResult::Reconciled,
+            });
+        }
+        // A publication error is not proof that the old bytes remain. Re-open
+        // through a fresh protected lease and compare the complete snapshot.
+        // An exact pre-effect state can be retried only before an external
+        // effect; after an effect it poisons the durable ambiguous entry.
         match classify_ledger_reconciliation(
             previous,
             &self.state,
@@ -1265,6 +1356,31 @@ impl LocalFallbackLedger {
             LedgerReconcileDecision::Poison => {
                 self.poison_key(key);
                 Err(fallback_provider_error(ProviderErrorCode::Unavailable))
+            }
+        }
+    }
+
+    fn read_current_bytes_after_publication(&mut self) -> Result<Vec<u8>, PortError> {
+        let lease = match ProtectedPathLease::open_or_create(&self.relative) {
+            Ok(lease) => lease,
+            Err(_) => {
+                self.lease = None;
+                return Err(fallback_provider_error(ProviderErrorCode::Unavailable));
+            }
+        };
+        let result = lease
+            .verify_stable_identity()
+            .and_then(|()| lease.verify_path_identity())
+            .and_then(|()| lease.read_bounded(FALLBACK_BYTES_LIMIT))
+            .map_err(|_| fallback_provider_error(ProviderErrorCode::Unavailable));
+        match result {
+            Ok(bytes) => {
+                self.lease = Some(lease);
+                Ok(bytes)
+            }
+            Err(error) => {
+                self.lease = None;
+                Err(error)
             }
         }
     }
@@ -1288,7 +1404,7 @@ impl OneShotLedgerPort for LocalFallbackLedger {
                 return LedgerReserveOutcome::Conflict;
             }
             return entry.observation.clone().map_or(
-                LedgerReserveOutcome::Conflict,
+                LedgerReserveOutcome::Unavailable,
                 |observation| LedgerReserveOutcome::Replay {
                     observation: Box::new(observation),
                 },
@@ -1382,8 +1498,6 @@ impl OneShotLedgerPort for LocalFallbackLedger {
 
 fn load_fallback_verification_ports(root: &Path) -> Result<VerificationPorts, NotifyBuildError> {
     let expected_root = protected_program_data_path("Eliot/notify")
-        .map_err(|error| NotifyBuildError::Fallback(error.to_string()))?;
-    let expected_root = std::fs::canonicalize(expected_root)
         .map_err(|error| NotifyBuildError::Fallback(error.to_string()))?;
     let root = std::fs::canonicalize(root)
         .map_err(|error| NotifyBuildError::Fallback(error.to_string()))?;
@@ -1614,6 +1728,77 @@ mod tests {
             declaration_digest: "test-material".to_owned(),
             lease: None,
         }))
+    }
+
+    #[derive(Clone)]
+    #[allow(dead_code)]
+    enum InjectedPublishOutcome {
+        Published,
+        Unknown,
+        Error,
+    }
+
+    #[derive(Clone)]
+    struct InjectedFallbackPublisher {
+        state: Arc<Mutex<FallbackLedgerSnapshot>>,
+        outcomes: Arc<Mutex<Vec<(InjectedPublishOutcome, bool)>>>,
+    }
+
+    impl FallbackLedgerPublisher for InjectedFallbackPublisher {
+        fn read(&mut self) -> Result<FallbackLedgerSnapshot, PortError> {
+            self.state
+                .lock()
+                .map_err(|_| fallback_provider_error(ProviderErrorCode::Failed))
+                .map(|state| state.clone())
+        }
+
+        fn publish(
+            &mut self,
+            desired: &FallbackLedgerSnapshot,
+        ) -> Result<LedgerPublicationOutcome, PortError> {
+            let (outcome, write_before_return) = self
+                .outcomes
+                .lock()
+                .map_err(|_| fallback_provider_error(ProviderErrorCode::Failed))?
+                .pop()
+                .unwrap_or((InjectedPublishOutcome::Published, true));
+            if write_before_return {
+                *self
+                    .state
+                    .lock()
+                    .map_err(|_| fallback_provider_error(ProviderErrorCode::Failed))? =
+                    desired.clone();
+            }
+            match outcome {
+                InjectedPublishOutcome::Published => Ok(LedgerPublicationOutcome::Published),
+                InjectedPublishOutcome::Unknown => Ok(LedgerPublicationOutcome::Unknown),
+                InjectedPublishOutcome::Error => {
+                    Err(fallback_provider_error(ProviderErrorCode::Unavailable))
+                }
+            }
+        }
+    }
+
+    fn injected_ledger(
+        outcomes: Vec<(InjectedPublishOutcome, bool)>,
+    ) -> (LocalFallbackLedger, Arc<Mutex<FallbackLedgerSnapshot>>) {
+        let state = Arc::new(Mutex::new(FallbackLedgerSnapshot::default()));
+        let outcomes = Arc::new(Mutex::new(outcomes.into_iter().rev().collect()));
+        let publisher = InjectedFallbackPublisher {
+            state: Arc::clone(&state),
+            outcomes,
+        };
+        (
+            LocalFallbackLedger {
+                expected_authority_epoch: 1,
+                state: FallbackLedgerSnapshot::default(),
+                platform: None,
+                relative: std::path::PathBuf::new(),
+                lease: None,
+                publisher: Some(Box::new(publisher)),
+            },
+            state,
+        )
     }
 
     fn test_signing_key() -> SigningKey {
@@ -1948,6 +2133,125 @@ mod tests {
         let mut exhausted = u64::MAX;
         assert!(allocate_reservation_id(&mut exhausted).is_none());
         assert_eq!(exhausted, u64::MAX);
+    }
+
+    #[test]
+    fn protected_ledger_unknown_reserve_has_zero_platform_effect() {
+        let (envelope, request) = fallback_request("fallback-ledger-unknown-reserve", b"evidence");
+        let (ledger, _) = injected_ledger(vec![(InjectedPublishOutcome::Unknown, false)]);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut core = NotifyCore::new(
+            CountingNotification {
+                calls: Arc::clone(&calls),
+            },
+            fallback_ports(fallback_material(), Box::new(ledger)),
+        );
+        assert!(matches!(
+            core.deliver_watchdog_fallback(&envelope, &request),
+            Err(eliot_notify_core::NotifyError::PlanGap {
+                provider: ProviderId::OneShotLedger,
+                ..
+            })
+        ));
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn protected_ledger_publish_error_before_write_reconciles_without_effect() {
+        let (envelope, request) = fallback_request("fallback-ledger-error-before", b"evidence");
+        let (ledger, _) = injected_ledger(vec![(InjectedPublishOutcome::Error, false)]);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut core = NotifyCore::new(
+            CountingNotification {
+                calls: Arc::clone(&calls),
+            },
+            fallback_ports(fallback_material(), Box::new(ledger)),
+        );
+        assert!(matches!(
+            core.deliver_watchdog_fallback(&envelope, &request),
+            Err(eliot_notify_core::NotifyError::PlanGap {
+                provider: ProviderId::OneShotLedger,
+                ..
+            })
+        ));
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn protected_ledger_publish_error_after_write_reconciles_exact_post_state() {
+        let (envelope, request) = fallback_request("fallback-ledger-error-after", b"evidence");
+        let (ledger, _) = injected_ledger(vec![(InjectedPublishOutcome::Error, true)]);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut core = NotifyCore::new(
+            CountingNotification {
+                calls: Arc::clone(&calls),
+            },
+            fallback_ports(fallback_material(), Box::new(ledger)),
+        );
+        let result = core.deliver_watchdog_fallback(&envelope, &request);
+        assert!(
+            result.is_ok(),
+            "post-write error must reconcile: {result:?}"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn protected_ledger_unknown_commit_poison_survives_restart_without_replay() {
+        let (envelope, request) = fallback_request("fallback-ledger-unknown-commit", b"evidence");
+        let (ledger, state) = injected_ledger(vec![
+            (InjectedPublishOutcome::Published, true),
+            (InjectedPublishOutcome::Unknown, false),
+            (InjectedPublishOutcome::Published, true),
+        ]);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut core = NotifyCore::new(
+            CountingNotification {
+                calls: Arc::clone(&calls),
+            },
+            fallback_ports(fallback_material(), Box::new(ledger)),
+        );
+        assert!(matches!(
+            core.deliver_watchdog_fallback(&envelope, &request),
+            Err(eliot_notify_core::NotifyError::LedgerCommitUncertain(_))
+        ));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        let restarted = LocalFallbackLedger {
+            expected_authority_epoch: 1,
+            state: state.lock().unwrap().clone(),
+            platform: None,
+            relative: std::path::PathBuf::new(),
+            lease: None,
+            publisher: Some(Box::new(InjectedFallbackPublisher {
+                state: Arc::clone(&state),
+                outcomes: Arc::new(Mutex::new(Vec::new())),
+            })),
+        };
+        let mut restarted_core = NotifyCore::new(
+            CountingNotification {
+                calls: Arc::clone(&calls),
+            },
+            fallback_ports(fallback_material(), Box::new(restarted)),
+        );
+        assert!(matches!(
+            restarted_core.deliver_watchdog_fallback(&envelope, &request),
+            Err(eliot_notify_core::NotifyError::PlanGap {
+                provider: ProviderId::OneShotLedger,
+                ..
+            })
+        ));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn fallback_loader_rejects_non_installer_contour_before_protected_reads() {
+        let result = load_fallback_verification_ports(std::path::Path::new("."));
+        assert!(matches!(
+            result,
+            Err(NotifyBuildError::Fallback(detail))
+                if detail.contains("installer-owned notification contour")
+        ));
     }
 
     #[test]

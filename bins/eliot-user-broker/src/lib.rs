@@ -15,7 +15,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use eliot_platform::ClockObservation;
 use eliot_platform::WorkScopePath;
-use eliot_platform_windows::{ProtectedPathLease, PublicationOutcome, WindowsPlatform};
+use eliot_platform_windows::{ProtectedPathLease, WindowsPlatform};
 use eliot_process::{
     ActionLeaseRef, CancellationReceipt, DispatchAuthorityId, DispatchPermitAuthority,
     DispatchValidationContext, FencingToken, KernelDispatchKey, OperationId, PermitIssuance,
@@ -27,7 +27,8 @@ use eliot_protocol::RequestIdentity;
 use eliot_user_broker_core::{
     AuthorityPort, BrokerError, BrokerSnapshot, DurableRegistrationPort, HeartbeatReceipt,
     HeartbeatRequest, LaunchGrant, LaunchRequest, PortError, ProcessPort, ProcessStartOutcome,
-    RegistrationGrant, RegistrationReceipt, RegistrationRequest, RequiredProvider, UserBroker,
+    RegistrationFenceReceipt, RegistrationFenceRequest, RegistrationGrant, RegistrationReceipt,
+    RegistrationRequest, RequiredProvider, UserBroker,
 };
 use serde::Deserialize;
 use serde::Serialize;
@@ -249,6 +250,21 @@ impl AuthorityPort for KernelAuthorityPort {
         .and_then(|value| {
             serde_json::from_value(value)
                 .map_err(|error| PortError::Invalid(format!("decode launch grant: {error}")))
+        })
+    }
+
+    fn fence(
+        &mut self,
+        request: &RegistrationFenceRequest,
+    ) -> Result<RegistrationFenceReceipt, PortError> {
+        kernel_call(
+            &self.client,
+            "eliot.user-broker.fence",
+            serde_json::to_value(request).map_err(|error| PortError::Invalid(error.to_string()))?,
+        )
+        .and_then(|value| {
+            serde_json::from_value(value)
+                .map_err(|error| PortError::Invalid(format!("decode fence receipt: {error}")))
         })
     }
 }
@@ -555,6 +571,64 @@ impl FileRegistrationStore {
             protected_relative: Some(relative),
         })
     }
+
+    #[cfg(windows)]
+    fn read_verified_lease(
+        lease: &ProtectedPathLease,
+        path: &Path,
+        post_publication: bool,
+    ) -> Result<Vec<u8>, PortError> {
+        let verify = lease
+            .verify_stable_identity()
+            .and_then(|()| lease.verify_path_identity());
+        if let Err(error) = verify {
+            return Err(if post_publication {
+                PortError::Unknown
+            } else {
+                PortError::Invalid(error.to_string())
+            });
+        }
+        lease.read_bounded(SNAPSHOT_LIMIT).map_err(|error| {
+            if post_publication {
+                PortError::Unknown
+            } else {
+                PortError::Invalid(format!("read {}: {error}", path.display()))
+            }
+        })
+    }
+
+    #[cfg(windows)]
+    fn decode_snapshot(bytes: &[u8], path: &Path) -> Result<Option<BrokerSnapshot>, PortError> {
+        if bytes.is_empty() {
+            return Ok(None);
+        }
+        serde_json::from_slice(bytes)
+            .map(Some)
+            .map_err(|error| PortError::Invalid(format!("decode {}: {error}", path.display())))
+    }
+
+    /// Reacquires the exact protected object after an atomic publication.
+    ///
+    /// The replacement lease is installed before any result is returned.  A
+    /// successful open whose identity/read proof fails is still retained so
+    /// the next operation cannot accidentally fall back to an unprotected
+    /// path; all later operations re-verify that retained handle.
+    #[cfg(windows)]
+    fn reacquire_after_publication(&mut self, relative: &Path) -> Result<Vec<u8>, PortError> {
+        let replacement = match ProtectedPathLease::open_or_create(relative) {
+            Ok(replacement) => replacement,
+            Err(_) => {
+                // The old lease had to be released before replacement.  An
+                // unavailable replacement is therefore an explicit unknown
+                // state, never a successful save or a retryable failure.
+                self.lease = None;
+                return Err(PortError::Unknown);
+            }
+        };
+        let result = Self::read_verified_lease(&replacement, &self.path, true);
+        self.lease = Some(replacement);
+        result
+    }
 }
 
 impl DurableRegistrationPort for FileRegistrationStore {
@@ -585,37 +659,55 @@ impl DurableRegistrationPort for FileRegistrationStore {
         let bytes = serde_json::to_vec(snapshot)
             .map_err(|error| PortError::Invalid(format!("encode snapshot: {error}")))?;
         #[cfg(windows)]
-        if let (Some(platform), Some(relative), Some(lease)) = (
-            self.platform.as_ref(),
-            self.protected_relative.as_ref(),
-            self.lease.take(),
-        ) {
-            lease
-                .verify_stable_identity()
-                .and_then(|()| lease.verify_path_identity())
+        {
+            let relative = self
+                .protected_relative
+                .as_ref()
+                .ok_or(PortError::Unavailable)?
+                .clone();
+            let previous_bytes = {
+                let lease = self.lease.as_ref().ok_or(PortError::Unavailable)?;
+                Self::read_verified_lease(lease, &self.path, false)?
+            };
+            let previous = Self::decode_snapshot(&previous_bytes, &self.path)?;
+            let scope_name = self
+                .path
+                .file_name()
+                .ok_or(PortError::Invalid("snapshot filename missing".to_owned()))?
+                .to_string_lossy()
+                .into_owned();
+            let scope = WorkScopePath::new(scope_name)
                 .map_err(|error| PortError::Invalid(error.to_string()))?;
+
+            // The old no-delete-sharing lease must be released for the
+            // atomic replacement.  From this point onward there are no `?`
+            // exits until the replacement has been retained again.
+            let lease = self.lease.take().ok_or(PortError::Unavailable)?;
             drop(lease);
-            let scope = WorkScopePath::new(
-                self.path
-                    .file_name()
-                    .ok_or(PortError::Invalid("snapshot filename missing".to_owned()))?
-                    .to_string_lossy()
-                    .into_owned(),
-            )
-            .map_err(|error| PortError::Invalid(error.to_string()))?;
-            match platform.publish_atomic(&scope, &bytes) {
-                Ok(PublicationOutcome::Published(_)) => {}
-                Ok(PublicationOutcome::Unknown(_)) => return Err(PortError::Unknown),
-                Err(error) => return Err(PortError::Invalid(error.to_string())),
+            if let Some(platform) = self.platform.as_ref() {
+                let _ = platform.publish_atomic(&scope, &bytes);
             }
-            let replacement = ProtectedPathLease::open_or_create(relative)
-                .map_err(|error| PortError::Invalid(error.to_string()))?;
-            self.lease = Some(replacement);
-            return Ok(());
+
+            let current_bytes = self.reacquire_after_publication(&relative)?;
+            let current = Self::decode_snapshot(&current_bytes, &self.path)?;
+            if current.as_ref() == Some(snapshot) {
+                // The publish response may have been lost, but the exact
+                // desired bytes are now durable and can be acknowledged.
+                return Ok(());
+            }
+            if current == previous {
+                return Err(PortError::Unknown);
+            }
+            // Any other bytes are an unresolvable publication race. Do not
+            // classify this as a deterministic provider failure: the caller
+            // must reconcile the exact registration snapshot before retrying.
+            return Err(PortError::Unknown);
         }
         #[cfg(not(windows))]
-        let _ = bytes;
-        Err(PortError::Unavailable)
+        {
+            let _ = bytes;
+            Err(PortError::Unavailable)
+        }
     }
 }
 
@@ -778,6 +870,18 @@ impl BrokerComposition {
         Ok(receipt)
     }
 
+    /// Closes the authenticated registration before the broker process exits.
+    ///
+    /// A clean stdin EOF and an admitted `stop` operation use the same durable
+    /// close path; dropping the composition alone must never leave an active
+    /// registration lease for the next process instance.
+    pub fn close(&mut self) -> Result<(), CompositionError> {
+        self.verify_launch_lease()?;
+        self.broker.logoff().map_err(CompositionError::Recovery)?;
+        self.registration_digest = None;
+        Ok(())
+    }
+
     /// Heartbeats the protected registration before an admitted launch.
     pub fn launch(
         &mut self,
@@ -786,6 +890,30 @@ impl BrokerComposition {
         let _ = self.heartbeat()?;
         self.broker
             .launch(request)
+            .map_err(CompositionError::Recovery)
+    }
+
+    /// Cancels a broker-owned operation selected by its admitted operation
+    /// identity.  The sealed operation permit remains inside UserBroker.
+    pub fn cancel(
+        &mut self,
+        operation_id: OperationId,
+    ) -> Result<CancellationReceipt, CompositionError> {
+        self.verify_launch_lease()?;
+        self.broker
+            .cancel_operation(&operation_id)
+            .map_err(CompositionError::Recovery)
+    }
+
+    /// Reconciles a broker-owned operation selected by its admitted operation
+    /// identity.  No caller-supplied P-03 request or permit crosses stdin.
+    pub fn reconcile(
+        &mut self,
+        operation_id: OperationId,
+    ) -> Result<ProcessExecutionView, CompositionError> {
+        self.verify_launch_lease()?;
+        self.broker
+            .reconcile_operation(&operation_id)
             .map_err(CompositionError::Recovery)
     }
 

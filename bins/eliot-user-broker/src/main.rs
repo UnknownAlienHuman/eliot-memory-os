@@ -3,6 +3,7 @@ use std::path::PathBuf;
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::time::{Duration, Instant};
 
+use eliot_process::OperationId;
 use eliot_user_broker::{BrokerComposition, BrokerConfig, canonical_root};
 use eliot_user_broker_core::LaunchRequest;
 use serde::{Deserialize, Serialize};
@@ -19,6 +20,8 @@ const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(1);
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
 enum Request {
     Launch { request: LaunchRequest },
+    Cancel { operation_id: OperationId },
+    Reconcile { operation_id: OperationId },
     Status,
     Stop,
 }
@@ -28,6 +31,8 @@ enum Request {
 enum Message {
     Ready { readiness: Value },
     Launched { receipt: Value },
+    Cancelled { receipt: Value },
+    Reconciled { view: Value },
     Stopped,
     Error { code: &'static str, detail: String },
 }
@@ -91,14 +96,11 @@ fn main() {
         }
     });
     let mut next_heartbeat = Instant::now() + HEARTBEAT_INTERVAL;
+    let mut closed = false;
     loop {
         if Instant::now() >= next_heartbeat {
             if let Err(error) = composition.heartbeat() {
-                exit(
-                    PROVIDER_REJECTED_EXIT,
-                    "BROKER_HEARTBEAT_REJECTED",
-                    error.to_string(),
-                );
+                heartbeat_failure(composition, error.to_string());
             }
             next_heartbeat = Instant::now() + HEARTBEAT_INTERVAL;
             continue;
@@ -108,11 +110,7 @@ fn main() {
             Ok(received) => received,
             Err(RecvTimeoutError::Timeout) => {
                 if let Err(error) = composition.heartbeat() {
-                    exit(
-                        PROVIDER_REJECTED_EXIT,
-                        "BROKER_HEARTBEAT_REJECTED",
-                        error.to_string(),
-                    );
+                    heartbeat_failure(composition, error.to_string());
                 }
                 next_heartbeat = Instant::now() + HEARTBEAT_INTERVAL;
                 continue;
@@ -128,10 +126,60 @@ fn main() {
             },
         };
         let stop = matches!(response, Message::Stopped);
-        if !write_message(response) || stop {
+        if stop {
+            let (response, close_failed) = match close_with_retry(&mut composition) {
+                Ok(()) => (response, false),
+                Err(error) => (
+                    Message::Error {
+                        code: "BROKER_CLOSE_REJECTED",
+                        detail: error.to_string(),
+                    },
+                    true,
+                ),
+            };
+            if !close_failed {
+                closed = true;
+            }
+            if !write_message(response) {
+                break;
+            }
+            if close_failed {
+                std::process::exit(PROVIDER_REJECTED_EXIT);
+            }
+            break;
+        }
+        if !write_message(response) {
             break;
         }
     }
+    if !closed {
+        if let Err(error) = close_with_retry(&mut composition) {
+            exit(
+                PROVIDER_REJECTED_EXIT,
+                "BROKER_CLOSE_REJECTED",
+                error.to_string(),
+            );
+        }
+    }
+}
+
+fn close_with_retry(composition: &mut BrokerComposition) -> Result<(), String> {
+    match composition.close() {
+        Ok(()) => Ok(()),
+        Err(first) => composition
+            .close()
+            .map_err(|second| format!("{first}; retry: {second}")),
+    }
+}
+
+fn heartbeat_failure(composition: BrokerComposition, detail: String) -> ! {
+    // A failed heartbeat has an unknown ORS outcome, so issuing a second
+    // close request here could duplicate or misclassify the authoritative
+    // fence.  Dropping the composition first closes the broker-owned
+    // kill-on-close Job contour; its durable Active/Unknown snapshot remains
+    // for the next authenticated startup heartbeat/reconciliation pass.
+    drop(composition);
+    exit(PROVIDER_REJECTED_EXIT, "BROKER_HEARTBEAT_REJECTED", detail)
 }
 
 fn parse_root() -> Result<PathBuf, String> {
@@ -186,6 +234,20 @@ fn dispatch(composition: &mut BrokerComposition, line: &str) -> Message {
                 }),
             })
             .unwrap_or_else(|error| composition_error(error.to_string())),
+        Request::Cancel { operation_id } => composition
+            .cancel(operation_id)
+            .map(|receipt| Message::Cancelled {
+                receipt: serde_json::to_value(receipt)
+                    .unwrap_or_else(|error| serde_json::json!({"error": error.to_string()})),
+            })
+            .unwrap_or_else(|error| composition_error(error.to_string())),
+        Request::Reconcile { operation_id } => composition
+            .reconcile(operation_id)
+            .map(|view| Message::Reconciled {
+                view: serde_json::to_value(view)
+                    .unwrap_or_else(|error| serde_json::json!({"error": error.to_string()})),
+            })
+            .unwrap_or_else(|error| composition_error(error.to_string())),
         Request::Status => Message::Ready {
             readiness: serde_json::to_value(composition.readiness())
                 .unwrap_or_else(|error| serde_json::json!({"error": error.to_string()})),
@@ -219,6 +281,8 @@ fn exit(code: i32, error_code: &'static str, detail: String) -> ! {
 
 #[cfg(test)]
 mod tests {
+    use eliot_process::OperationId;
+
     use super::Request;
 
     #[test]
@@ -235,5 +299,17 @@ mod tests {
             serde_json::from_str::<Request>(r#"{"op":"launch","identity":{},"request":{}}"#)
                 .is_err()
         );
+        let cancel = serde_json::json!({
+            "op": "cancel",
+            "operation_id": "operation-1"
+        });
+        assert!(serde_json::from_value::<Request>(cancel).is_ok());
+        assert!(
+            serde_json::from_str::<Request>(
+                r#"{"op":"cancel","operation_id":"operation-1","permit":{}}"#
+            )
+            .is_err()
+        );
+        assert!(OperationId::new("operation-1").is_ok());
     }
 }

@@ -108,7 +108,15 @@ fn main() {
 fn parse_launch() -> Result<(PathBuf, bool), String> {
     let expected = eliot_platform_windows::protected_program_data_path("Eliot/notify")
         .map_err(|error| error.to_string())?;
-    let mut args = std::env::args_os().skip(1);
+    parse_launch_args(std::env::args_os().skip(1), expected)
+}
+
+fn parse_launch_args<I, S>(arguments: I, expected: PathBuf) -> Result<(PathBuf, bool), String>
+where
+    I: IntoIterator<Item = S>,
+    S: Into<std::ffi::OsString>,
+{
+    let mut args = arguments.into_iter().map(Into::into);
     let mut watchdog_fallback = false;
     let mut supplied_root = None;
     while let Some(value) = args.next() {
@@ -214,4 +222,30 @@ fn exit(code: i32, error_code: &'static str, detail: String) -> ! {
         detail,
     });
     std::process::exit(code);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn watchdog_fallback_is_a_no_stdin_protected_launch_mode() {
+        let expected = PathBuf::from(r"C:\ProgramData\Eliot\notify");
+        let (root, fallback) = parse_launch_args(["--watchdog-fallback"], expected.clone())
+            .expect("watchdog mode parses without a request stream");
+        assert_eq!(root, expected);
+        assert!(fallback);
+        assert!(
+            parse_launch_args(
+                [
+                    "--watchdog-fallback",
+                    "--work-root",
+                    r"C:\ProgramData\Eliot\notify"
+                ],
+                PathBuf::from(r"C:\ProgramData\Eliot\notify")
+            )
+            .is_err()
+        );
+        assert!(parse_launch_args(["--unknown"], PathBuf::from("C:\\notify")).is_err());
+    }
 }

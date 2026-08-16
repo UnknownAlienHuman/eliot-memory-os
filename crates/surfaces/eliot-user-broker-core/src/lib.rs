@@ -173,6 +173,33 @@ pub struct HeartbeatReceipt {
     pub expires_at: u64,
 }
 
+/// Exact ORS/Kernel fence request used when an interactive broker leaves its
+/// registration contour.  The operation identity is deterministic for the
+/// registration/status pair, so a lost response can be retried without
+/// creating a second detach/fence effect.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RegistrationFenceRequest {
+    pub registration: RegistrationReceipt,
+    pub status: RegistrationStatus,
+    pub operation_id: OperationId,
+}
+
+/// Authoritative fence receipt.  A local snapshot may be projected Closed or
+/// Draining only after this exact ORS/Kernel identity is returned.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RegistrationFenceReceipt {
+    pub registration_digest: String,
+    pub windows_sid: String,
+    pub interactive_session_id: String,
+    pub user_broker_epoch: u64,
+    pub authority_epoch: u64,
+    pub fence_id: String,
+    pub operation_id: OperationId,
+    pub status: RegistrationStatus,
+}
+
 /// The exact approved launch projection.  Credential material is never present.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -354,6 +381,12 @@ pub trait AuthorityPort: Send {
         receipt: &RegistrationReceipt,
         request: &LaunchRequest,
     ) -> Result<LaunchGrant, PortError>;
+    /// Fences/detaches the exact ORS registration before local close state is
+    /// projected.  Implementations must preserve Unknown for lost replies.
+    fn fence(
+        &mut self,
+        request: &RegistrationFenceRequest,
+    ) -> Result<RegistrationFenceReceipt, PortError>;
 }
 
 pub trait DurableRegistrationPort: Send {
@@ -421,6 +454,7 @@ pub struct UserBroker {
     process: Option<Box<dyn ProcessPort>>,
     durable: Option<Box<dyn DurableRegistrationPort>>,
     registration: Option<RegistrationReceipt>,
+    registration_reconciled: bool,
     broker_epoch: u64,
     operations: BTreeMap<String, OperationRecord>,
 }
@@ -436,6 +470,7 @@ impl UserBroker {
             process,
             durable,
             registration: None,
+            registration_reconciled: false,
             broker_epoch: 0,
             operations: BTreeMap::new(),
         }
@@ -450,6 +485,7 @@ impl UserBroker {
             .map_err(|error| map_port(RequiredProvider::DurableRegistration, error))?
             .ok_or(BrokerError::PlanGap(RequiredProvider::DurableRegistration))?;
         self.registration = snapshot.registration;
+        self.registration_reconciled = self.registration.is_none();
         self.broker_epoch = snapshot.user_broker_epoch;
         let Some(registration) = self.registration.as_ref() else {
             if snapshot.operation_cursors.is_empty() {
@@ -526,6 +562,7 @@ impl UserBroker {
         }
         self.broker_epoch = sealed.user_broker_epoch;
         self.registration = Some(sealed.clone());
+        self.registration_reconciled = true;
         self.persist()?;
         Ok(sealed)
     }
@@ -536,7 +573,22 @@ impl UserBroker {
         request: HeartbeatRequest,
     ) -> Result<HeartbeatReceipt, BrokerError> {
         text(&request.registration_digest, "registration_digest")?;
-        let current = self.active_registration(request.observed_at)?.clone();
+        let current = if self.registration_reconciled {
+            self.active_registration(request.observed_at)?.clone()
+        } else {
+            let current = self
+                .registration
+                .as_ref()
+                .ok_or(BrokerError::PlanGap(RequiredProvider::G01Authority))?
+                .clone();
+            if current.status != RegistrationStatus::Active {
+                return Err(BrokerError::LeaseExpired);
+            }
+            if request.observed_at >= current.expires_at {
+                return Err(BrokerError::LeaseExpired);
+            }
+            current
+        };
         if current.registration_digest != request.registration_digest {
             return Err(BrokerError::GrantBindingMismatch);
         }
@@ -554,6 +606,7 @@ impl UserBroker {
             }
         };
         self.registration = Some(refreshed.clone());
+        self.registration_reconciled = true;
         self.persist()?;
         Ok(HeartbeatReceipt {
             registration_digest: refreshed.registration_digest,
@@ -706,6 +759,22 @@ impl UserBroker {
             .map_err(|error| map_port(RequiredProvider::P03Process, error))
     }
 
+    /// Cancels a previously admitted operation by its broker-issued public
+    /// operation identity.  The private one-shot permit remains broker-owned;
+    /// stdin/UI callers cannot manufacture or widen it.
+    pub fn cancel_operation(
+        &mut self,
+        operation_id: &OperationId,
+    ) -> Result<CancellationReceipt, BrokerError> {
+        let permit = self
+            .operations
+            .values()
+            .find(|record| record.permit.operation_id == *operation_id)
+            .map(|record| record.permit.clone())
+            .ok_or(BrokerError::OperationNotFound)?;
+        self.cancel(&permit)
+    }
+
     pub fn reconcile(
         &mut self,
         permit: &OperationPermit,
@@ -724,11 +793,38 @@ impl UserBroker {
             .values_mut()
             .find(|record| record.permit.operation_id == operation_id)
         {
-            record.cursor.state = OperationState::Reconciled;
-            record.receipt = None;
+            record.cursor.state = match view.lifecycle() {
+                eliot_process::ProcessLifecycle::Running
+                | eliot_process::ProcessLifecycle::Starting
+                | eliot_process::ProcessLifecycle::Cancelling => OperationState::Active,
+                eliot_process::ProcessLifecycle::UnknownOutcome => OperationState::Unknown,
+                eliot_process::ProcessLifecycle::Exited
+                | eliot_process::ProcessLifecycle::Failed
+                | eliot_process::ProcessLifecycle::Reconciled
+                | eliot_process::ProcessLifecycle::Quarantined => OperationState::Reconciled,
+                eliot_process::ProcessLifecycle::Created => OperationState::Unknown,
+            };
+            if record.cursor.state == OperationState::Reconciled {
+                record.receipt = None;
+            }
         }
         self.persist()?;
         Ok(view)
+    }
+
+    /// Reconciles a broker-owned operation without transporting its sealed
+    /// process permit across the stdin/UI boundary.
+    pub fn reconcile_operation(
+        &mut self,
+        operation_id: &OperationId,
+    ) -> Result<ProcessExecutionView, BrokerError> {
+        let permit = self
+            .operations
+            .values()
+            .find(|record| record.permit.operation_id == *operation_id)
+            .map(|record| record.permit.clone())
+            .ok_or(BrokerError::OperationNotFound)?;
+        self.reconcile(&permit)
     }
 
     pub fn logoff(&mut self) -> Result<(), BrokerError> {
@@ -789,6 +885,9 @@ impl UserBroker {
         &mut self,
         observed_at: u64,
     ) -> Result<&RegistrationReceipt, BrokerError> {
+        if !self.registration_reconciled {
+            return Err(BrokerError::PlanGap(RequiredProvider::G01Authority));
+        }
         let expired = {
             let registration = self
                 .registration
@@ -810,14 +909,53 @@ impl UserBroker {
     }
 
     fn close(&mut self, status: RegistrationStatus) -> Result<(), BrokerError> {
-        if let Some(registration) = &mut self.registration {
-            registration.status = status;
+        let current = self
+            .registration
+            .as_ref()
+            .ok_or(BrokerError::PlanGap(RequiredProvider::G01Authority))?
+            .clone();
+        let already_projected = current.status == status;
+        if !already_projected {
+            let operation_id = fence_operation_id(&current, status)?;
+            let request = RegistrationFenceRequest {
+                registration: current.clone(),
+                status,
+                operation_id,
+            };
+            let receipt = self
+                .authority
+                .as_mut()
+                .ok_or(BrokerError::PlanGap(RequiredProvider::G01Authority))?
+                .fence(&request)
+                .map_err(|error| map_port(RequiredProvider::G01Authority, error))?;
+            validate_fence_receipt(&request, &receipt)?;
         }
-        self.persist()
+        let mut desired = current;
+        desired.status = status;
+        self.registration = Some(desired.clone());
+        self.registration_reconciled = true;
+        match self.persist() {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                // The authoritative fence is already known, but the local
+                // projection is not durably acknowledged.  Keep the fenced
+                // in-memory state so no new launch can cross the closed
+                // contour; the caller must retry persistence/reconciliation.
+                self.registration = Some(desired);
+                let reconciled = match self.durable.as_mut() {
+                    Some(durable) => match durable.load() {
+                        Ok(Some(snapshot)) => snapshot == self.snapshot(),
+                        Ok(None) | Err(_) => false,
+                    },
+                    None => false,
+                };
+                if reconciled { Ok(()) } else { Err(error) }
+            }
+        }
     }
 
-    fn persist(&mut self) -> Result<(), BrokerError> {
-        let snapshot = BrokerSnapshot {
+    fn snapshot(&self) -> BrokerSnapshot {
+        BrokerSnapshot {
             registration: self.registration.clone(),
             user_broker_epoch: self.broker_epoch,
             operation_cursors: self
@@ -825,7 +963,11 @@ impl UserBroker {
                 .values()
                 .map(|record| record.cursor.clone())
                 .collect(),
-        };
+        }
+    }
+
+    fn persist(&mut self) -> Result<(), BrokerError> {
+        let snapshot = self.snapshot();
         self.durable
             .as_mut()
             .ok_or(BrokerError::PlanGap(RequiredProvider::DurableRegistration))?
@@ -877,6 +1019,47 @@ fn seal_registration(
         expires_at: grant.expires_at,
         status: RegistrationStatus::Active,
     })
+}
+
+fn fence_operation_id(
+    registration: &RegistrationReceipt,
+    status: RegistrationStatus,
+) -> Result<OperationId, BrokerError> {
+    let status = match status {
+        RegistrationStatus::Active => "active",
+        RegistrationStatus::Draining => "draining",
+        RegistrationStatus::Closed => "closed",
+    };
+    OperationId::new(format!(
+        "user-broker-fence-{}-{status}",
+        registration.registration_digest
+    ))
+    .map_err(|error| BrokerError::Provider(error.to_string()))
+}
+
+fn validate_fence_receipt(
+    request: &RegistrationFenceRequest,
+    receipt: &RegistrationFenceReceipt,
+) -> Result<(), BrokerError> {
+    if receipt.registration_digest != request.registration.registration_digest
+        || receipt.windows_sid != request.registration.windows_sid
+        || receipt.interactive_session_id != request.registration.interactive_session_id
+        || receipt.user_broker_epoch != request.registration.user_broker_epoch
+        || receipt.authority_epoch != request.registration.authority_epoch
+        || receipt.fence_id != request.registration.fence_id
+        || receipt.operation_id != request.operation_id
+        || receipt.status != request.status
+    {
+        return Err(BrokerError::GrantBindingMismatch);
+    }
+    text(&receipt.registration_digest, "registration_digest")?;
+    text(&receipt.windows_sid, "windows_sid")?;
+    text(&receipt.interactive_session_id, "interactive_session_id")?;
+    text(&receipt.fence_id, "fence_id")?;
+    if receipt.user_broker_epoch == 0 || receipt.authority_epoch == 0 {
+        return Err(BrokerError::GrantBindingMismatch);
+    }
+    Ok(())
 }
 
 fn seal_registration_from_grant(
@@ -1075,6 +1258,7 @@ mod tests {
         LaunchEffect,
         LaunchFence,
         LaunchLease,
+        FenceReceipt,
     }
 
     struct FakeAuthority {
@@ -1167,7 +1351,8 @@ mod tests {
                 Tamper::None
                 | Tamper::RegistrationSid
                 | Tamper::RegistrationSession
-                | Tamper::RegistrationNonce => {}
+                | Tamper::RegistrationNonce
+                | Tamper::FenceReceipt => {}
             }
             let proof_ceiling = ProofCeiling::Observation;
             let request_digest = digest(request).expect("request digest");
@@ -1194,6 +1379,27 @@ mod tests {
                 grant_digest,
             })
         }
+
+        fn fence(
+            &mut self,
+            request: &RegistrationFenceRequest,
+        ) -> Result<RegistrationFenceReceipt, PortError> {
+            let registration_digest = if matches!(self.tamper, Tamper::FenceReceipt) {
+                "wrong-registration-digest".to_owned()
+            } else {
+                request.registration.registration_digest.clone()
+            };
+            Ok(RegistrationFenceReceipt {
+                registration_digest,
+                windows_sid: request.registration.windows_sid.clone(),
+                interactive_session_id: request.registration.interactive_session_id.clone(),
+                user_broker_epoch: request.registration.user_broker_epoch,
+                authority_epoch: request.registration.authority_epoch,
+                fence_id: request.registration.fence_id.clone(),
+                operation_id: request.operation_id.clone(),
+                status: request.status,
+            })
+        }
     }
 
     struct FakeDurable {
@@ -1206,6 +1412,32 @@ mod tests {
         }
         fn save(&mut self, snapshot: &BrokerSnapshot) -> Result<(), PortError> {
             self.snapshot = Some(snapshot.clone());
+            Ok(())
+        }
+    }
+
+    struct UncertainDurable {
+        snapshot: Arc<Mutex<Option<BrokerSnapshot>>>,
+        fail_next: Arc<AtomicBool>,
+        publish_before_fail: bool,
+    }
+
+    impl DurableRegistrationPort for UncertainDurable {
+        fn load(&mut self) -> Result<Option<BrokerSnapshot>, PortError> {
+            self.snapshot
+                .lock()
+                .map_err(|_| PortError::Unknown)
+                .map(|snapshot| snapshot.clone())
+        }
+
+        fn save(&mut self, snapshot: &BrokerSnapshot) -> Result<(), PortError> {
+            if self.fail_next.swap(false, Ordering::SeqCst) {
+                if self.publish_before_fail {
+                    *self.snapshot.lock().map_err(|_| PortError::Unknown)? = Some(snapshot.clone());
+                }
+                return Err(PortError::Unknown);
+            }
+            *self.snapshot.lock().map_err(|_| PortError::Unknown)? = Some(snapshot.clone());
             Ok(())
         }
     }
@@ -1572,6 +1804,126 @@ mod tests {
     }
 
     #[test]
+    fn close_unknown_publication_reconciles_exact_state_or_restores_active() {
+        for publish_before_fail in [false, true] {
+            let snapshot = Arc::new(Mutex::new(None));
+            let fail_next = Arc::new(AtomicBool::new(false));
+            let mut broker = UserBroker::new(
+                Some(Box::new(FakeAuthority::new())),
+                Some(Box::new(FakeProcess {
+                    state: None,
+                    unknown: false,
+                    wrong_receipt: false,
+                })),
+                Some(Box::new(UncertainDurable {
+                    snapshot: Arc::clone(&snapshot),
+                    fail_next: Arc::clone(&fail_next),
+                    publish_before_fail,
+                })),
+            );
+            let registered = broker
+                .register(registration_request())
+                .expect("registration");
+            fail_next.store(true, Ordering::SeqCst);
+            let closed = broker.logoff();
+            if publish_before_fail {
+                assert_eq!(closed, Ok(()));
+            } else {
+                assert_eq!(closed, Err(BrokerError::UnknownOutcome));
+            }
+            // The authoritative fence is known even when the local durable
+            // publication is uncertain, so the fenced broker must not renew
+            // or launch against the old ORS registration.
+            assert_eq!(
+                broker.heartbeat(HeartbeatRequest {
+                    registration_digest: registered.registration_digest,
+                    observed_at: 12,
+                }),
+                Err(BrokerError::LeaseExpired)
+            );
+        }
+    }
+
+    #[test]
+    fn fence_receipt_mismatch_never_projects_local_close() {
+        let mut authority = FakeAuthority::new();
+        authority.tamper = Tamper::FenceReceipt;
+        let mut broker = broker(
+            authority,
+            FakeProcess {
+                state: None,
+                unknown: false,
+                wrong_receipt: false,
+            },
+        );
+        let registered = broker
+            .register(registration_request())
+            .expect("registration");
+        assert_eq!(broker.logoff(), Err(BrokerError::GrantBindingMismatch));
+        assert!(
+            broker
+                .heartbeat(HeartbeatRequest {
+                    registration_digest: registered.registration_digest,
+                    observed_at: 12,
+                })
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn recovered_registration_is_gated_until_authoritative_heartbeat() {
+        let mut first = broker(
+            FakeAuthority::new(),
+            FakeProcess {
+                state: None,
+                unknown: false,
+                wrong_receipt: false,
+            },
+        );
+        first
+            .register(registration_request())
+            .expect("registration");
+        let snapshot = BrokerSnapshot {
+            registration: first.registration.clone(),
+            user_broker_epoch: first.broker_epoch,
+            operation_cursors: Vec::new(),
+        };
+        let registration_digest = snapshot
+            .registration
+            .as_ref()
+            .expect("registration")
+            .registration_digest
+            .clone();
+        let mut authority = FakeAuthority::new();
+        authority.broker_epoch = snapshot.user_broker_epoch;
+        authority.last = Some(registration_request());
+        let mut restarted = UserBroker::new(
+            Some(Box::new(authority)),
+            Some(Box::new(FakeProcess {
+                state: None,
+                unknown: false,
+                wrong_receipt: false,
+            })),
+            Some(Box::new(FakeDurable {
+                snapshot: Some(snapshot),
+            })),
+        );
+        restarted.recover().expect("recover");
+        assert_eq!(
+            restarted.launch(launch_request()),
+            Err(BrokerError::PlanGap(RequiredProvider::G01Authority))
+        );
+        assert!(
+            restarted
+                .heartbeat(HeartbeatRequest {
+                    registration_digest,
+                    observed_at: 11,
+                })
+                .is_ok()
+        );
+    }
+
+    #[test]
     fn heartbeat_expiry_and_session_events_close_admission() {
         let mut broker = broker(
             FakeAuthority::new(),
@@ -1859,7 +2211,7 @@ mod tests {
                 .expect("reconciled cursor")
                 .cursor
                 .state,
-            OperationState::Reconciled
+            OperationState::Active
         );
     }
 
