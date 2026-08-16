@@ -57,7 +57,7 @@ fn dispatch(service: &mut DreamerComposition, line: &str) -> Response {
         Err(error) => {
             return Response::Error {
                 error: format!("request: {error}"),
-            }
+            };
         }
     };
     let result: Result<JobView, DreamerError> = match request {

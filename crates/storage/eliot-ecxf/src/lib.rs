@@ -360,7 +360,10 @@ impl EcxfManifest {
         }
         text(&self.source_adapter, "source_adapter")?;
         text(&self.source_adapter_version, "source_adapter_version")?;
-        digest(&self.architecture_source_digest, "architecture_source_digest")?;
+        digest(
+            &self.architecture_source_digest,
+            "architecture_source_digest",
+        )?;
         digest(
             &self.normative_pair_identity_receipt_digest,
             "normative_pair_identity_receipt_digest",
@@ -481,7 +484,9 @@ impl EcxfArchive {
         for section in input.sections {
             section.validate()?;
             if sections.insert(section.kind, section).is_some() {
-                return Err(EcxfError::Duplicate { field: "sections.kind" });
+                return Err(EcxfError::Duplicate {
+                    field: "sections.kind",
+                });
             }
         }
         for blob in &input.blobs {
@@ -524,15 +529,18 @@ impl EcxfArchive {
         manifest.checksums = sections
             .iter()
             .map(|(kind, section)| {
-                (format!("{}/records", kind.wire_name()), section.canonical_sha256.clone())
+                (
+                    format!("{}/records", kind.wire_name()),
+                    section.canonical_sha256.clone(),
+                )
             })
             .collect();
-        manifest.checksums.extend(
-            input
-                .blobs
-                .iter()
-                .map(|blob| (format!("blobs/{}", blob.locator.hash), blob.sealed_sha256.clone())),
-        );
+        manifest.checksums.extend(input.blobs.iter().map(|blob| {
+            (
+                format!("blobs/{}", blob.locator.hash),
+                blob.sealed_sha256.clone(),
+            )
+        }));
         manifest.checksums.insert(
             "privacy-purge-ledger".to_owned(),
             sha256_hex(&canonical(&input.privacy_purge_ledger)?),
@@ -577,7 +585,10 @@ impl EcxfArchive {
             .sections
             .iter()
             .map(|(kind, section)| {
-                (kind.wire_name().to_owned(), section.canonical_sha256.clone())
+                (
+                    kind.wire_name().to_owned(),
+                    section.canonical_sha256.clone(),
+                )
             })
             .collect();
         self.integrity.blob_sha256 = self
@@ -603,17 +614,23 @@ impl EcxfArchive {
         let expected_sections: BTreeMap<_, _> = self
             .sections
             .iter()
-            .map(|(kind, section)| (kind.wire_name().to_owned(), section.canonical_sha256.clone()))
+            .map(|(kind, section)| {
+                (
+                    kind.wire_name().to_owned(),
+                    section.canonical_sha256.clone(),
+                )
+            })
             .collect();
         let mut expected_checksums = expected_sections
             .iter()
             .map(|(name, checksum)| (format!("{name}/records"), checksum.clone()))
             .collect::<BTreeMap<_, _>>();
-        expected_checksums.extend(
-            self.blobs
-                .iter()
-                .map(|blob| (format!("blobs/{}", blob.locator.hash), blob.sealed_sha256.clone())),
-        );
+        expected_checksums.extend(self.blobs.iter().map(|blob| {
+            (
+                format!("blobs/{}", blob.locator.hash),
+                blob.sealed_sha256.clone(),
+            )
+        }));
         expected_checksums.insert("privacy-purge-ledger".to_owned(), self.purge_digest()?);
         if self.manifest.checksums != expected_checksums {
             return Err(EcxfError::DigestMismatch {
@@ -673,7 +690,11 @@ impl EcxfArchive {
                 "sections": ["events", "projections", "receipts"],
             }))?,
         );
-        for kind in [SectionKind::Events, SectionKind::Projections, SectionKind::Receipts] {
+        for kind in [
+            SectionKind::Events,
+            SectionKind::Projections,
+            SectionKind::Receipts,
+        ] {
             if let Some(section) = self.sections.get(&kind) {
                 let encoded = codec.encode(&section.ndjson_bytes()?)?;
                 if encoded.len() > MAX_SECTION_BYTES {

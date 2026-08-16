@@ -309,7 +309,9 @@ impl ModuleManifest {
         text(&self.command_ref, "command_ref")?;
         text(&self.health_contract_ref, "health_contract_ref")?;
         unique(
-            self.dependencies.iter().map(|dependency| dependency.module_id.clone()),
+            self.dependencies
+                .iter()
+                .map(|dependency| dependency.module_id.clone()),
             "dependencies.module_id",
         )?;
         for dependency in &self.dependencies {
@@ -665,14 +667,8 @@ impl PreparedCatalogTransition {
         }
         digest(&self.before_catalog_digest, "before_catalog_digest")?;
         digest(&self.after_catalog_digest, "after_catalog_digest")?;
-        digest(
-            &self.canonical_request_digest,
-            "canonical_request_digest",
-        )?;
-        digest(
-            &self.admission_contract_digest,
-            "admission_contract_digest",
-        )?;
+        digest(&self.canonical_request_digest, "canonical_request_digest")?;
+        digest(&self.admission_contract_digest, "admission_contract_digest")?;
         self.state_fence
             .validate()
             .map_err(|error| ModuleError::Contract(error.to_string()))?;
@@ -744,11 +740,7 @@ impl ModuleCatalogSnapshot {
     }
 
     fn computed_digest(&self) -> Result<String, ModuleError> {
-        digest_value(&(
-            self.catalog_revision,
-            &self.state_fence,
-            &self.entries,
-        ))
+        digest_value(&(self.catalog_revision, &self.state_fence, &self.entries))
     }
 }
 
@@ -922,10 +914,8 @@ impl ModuleCatalog {
 
 #[allow(async_fn_in_trait)]
 pub trait ModuleCatalogApi: Send + Sync {
-    async fn desired(
-        &self,
-        module_id: ModuleId,
-    ) -> Result<Option<ModuleCatalogEntry>, ModuleError>;
+    async fn desired(&self, module_id: ModuleId)
+    -> Result<Option<ModuleCatalogEntry>, ModuleError>;
 
     async fn propose_change(
         &self,

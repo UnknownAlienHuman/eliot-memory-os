@@ -126,7 +126,10 @@ fn digest(value: &str, field: &'static str) -> Result<(), CanonicalError> {
     Ok(())
 }
 
-fn unique<T: Ord>(values: impl IntoIterator<Item = T>, field: &'static str) -> Result<(), CanonicalError> {
+fn unique<T: Ord>(
+    values: impl IntoIterator<Item = T>,
+    field: &'static str,
+) -> Result<(), CanonicalError> {
     let mut seen = BTreeSet::new();
     if values.into_iter().any(|value| !seen.insert(value)) {
         return Err(CanonicalError::Duplicate { field });
@@ -192,7 +195,9 @@ impl CanonicalWriteEnvelope {
             });
         }
         unique(
-            self.semantic_commands.iter().map(|command| command.operation),
+            self.semantic_commands
+                .iter()
+                .map(|command| command.operation),
             "semantic_commands",
         )?;
         for command in &self.semantic_commands {
@@ -216,11 +221,15 @@ impl CanonicalWriteEnvelope {
             text(reference, "required_proof_and_approval_ref")?;
         }
         unique(
-            self.expected_revision_heads.iter().map(|head| head.key.clone()),
+            self.expected_revision_heads
+                .iter()
+                .map(|head| head.key.clone()),
             "expected_revision_heads",
         )?;
         unique(
-            self.expected_ordering_heads.iter().map(|head| head.scope.clone()),
+            self.expected_ordering_heads
+                .iter()
+                .map(|head| head.scope.clone()),
             "expected_ordering_heads",
         )?;
         for head in &self.expected_revision_heads {
@@ -652,10 +661,16 @@ impl FinishEvidence {
                 field: "finish.evidence.acceptance",
             });
         }
-        unique(self.acceptance.iter().map(|item| item.item_id.clone()), "finish.evidence.acceptance")?;
+        unique(
+            self.acceptance.iter().map(|item| item.item_id.clone()),
+            "finish.evidence.acceptance",
+        )?;
         for item in &self.acceptance {
             text(&item.item_id, "finish.evidence.acceptance.item_id")?;
-            unique(item.evidence_refs.iter(), "finish.evidence.acceptance.evidence_refs")?;
+            unique(
+                item.evidence_refs.iter(),
+                "finish.evidence.acceptance.evidence_refs",
+            )?;
             unique(
                 item.verifier_run_refs.iter(),
                 "finish.evidence.acceptance.verifier_run_refs",
@@ -779,7 +794,9 @@ pub fn derive_finish_decision(
         coverage.push(format!("{}={}", item.item_id, item.satisfied));
         for verifier in &item.verifier_run_refs {
             bindings.push(verifier.clone());
-            if item.requires_verifier && (!executed.contains(verifier.as_str()) || stale.contains(verifier.as_str())) {
+            if item.requires_verifier
+                && (!executed.contains(verifier.as_str()) || stale.contains(verifier.as_str()))
+            {
                 verifier_gap = true;
                 missing.push(format!("verifier:{verifier}"));
             }
@@ -796,11 +813,17 @@ pub fn derive_finish_decision(
     unresolved.sort();
     unresolved.dedup();
     let outcome = match draft.requested_outcome {
-        RequestedFinishOutcome::CompleteCandidate if all_satisfied && !verifier_gap && unresolved.is_empty() => {
+        RequestedFinishOutcome::CompleteCandidate
+            if all_satisfied && !verifier_gap && unresolved.is_empty() =>
+        {
             FinishDecisionOutcome::VerifiedComplete
         }
-        RequestedFinishOutcome::CompleteCandidate if verifier_gap => FinishDecisionOutcome::FailedVerification,
-        RequestedFinishOutcome::CompleteCandidate if !unresolved.is_empty() => FinishDecisionOutcome::Blocked,
+        RequestedFinishOutcome::CompleteCandidate if verifier_gap => {
+            FinishDecisionOutcome::FailedVerification
+        }
+        RequestedFinishOutcome::CompleteCandidate if !unresolved.is_empty() => {
+            FinishDecisionOutcome::Blocked
+        }
         RequestedFinishOutcome::CompleteCandidate => FinishDecisionOutcome::DegradedNoProof,
         RequestedFinishOutcome::Partial => FinishDecisionOutcome::Partial,
         RequestedFinishOutcome::Blocked => FinishDecisionOutcome::Blocked,
@@ -829,10 +852,11 @@ pub fn derive_finish_decision(
         &unresolved,
         proof_ceiling,
     );
-    let proof_bytes = canonical_json_bytes(&proof_shape).map_err(|_| CanonicalError::InvalidField {
-        field: "finish.derived_proof",
-        reason: "cannot serialize derived proof",
-    })?;
+    let proof_bytes =
+        canonical_json_bytes(&proof_shape).map_err(|_| CanonicalError::InvalidField {
+            field: "finish.derived_proof",
+            reason: "cannot serialize derived proof",
+        })?;
     let proof = DerivedCompletionProof {
         task_id: draft.task_id.clone(),
         task_revision: evidence.current_task_revision,

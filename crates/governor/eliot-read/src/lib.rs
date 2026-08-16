@@ -18,8 +18,8 @@ use eliot_contracts::{
     contract_identity as make_contract_identity,
 };
 use eliot_store_api::{
-    CanonicalStoreClient, NamedReadOperation, NamedReadRequest, NamedReadResponse,
-    ReadConsistency, RevisionHead, RevisionKey, ScopeId, StoreError,
+    CanonicalStoreClient, NamedReadOperation, NamedReadRequest, NamedReadResponse, ReadConsistency,
+    RevisionHead, RevisionKey, ScopeId, StoreError,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -480,8 +480,10 @@ impl<C: CanonicalStoreClient> ReadService<C> {
             field: "request_metadata".to_owned(),
             reason: error.to_string(),
         })?;
-        if matches!(consistency, ReadConsistency::StableScope | ReadConsistency::ExactFence)
-            && dependencies.is_empty()
+        if matches!(
+            consistency,
+            ReadConsistency::StableScope | ReadConsistency::ExactFence
+        ) && dependencies.is_empty()
         {
             return Err(ReadError::MissingDependencies);
         }
@@ -507,7 +509,10 @@ impl<C: CanonicalStoreClient> ReadService<C> {
         }
         validate_response_heads(&response, &ctx.state_fence)?;
         validate_minimum_revisions(&response.revision_heads, dependencies)?;
-        if matches!(consistency, ReadConsistency::StableScope | ReadConsistency::ExactFence) {
+        if matches!(
+            consistency,
+            ReadConsistency::StableScope | ReadConsistency::ExactFence
+        ) {
             let after = self.store.revision_heads(keys).await?;
             validate_minimum_revisions(&after, dependencies)?;
             if !same_dependency_heads(&before, &after, dependencies) {

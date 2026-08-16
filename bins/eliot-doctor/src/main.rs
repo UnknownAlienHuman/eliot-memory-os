@@ -59,7 +59,7 @@ fn dispatch(doctor: &mut DoctorComposition, line: &str) -> Response {
         Err(error) => {
             return Response::Error {
                 error: format!("request: {error}"),
-            }
+            };
         }
     };
     let result = match request {

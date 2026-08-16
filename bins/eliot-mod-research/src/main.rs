@@ -59,7 +59,7 @@ fn handle(researcher: &mut eliot_mod_research::ResearchComposition, line: &str) 
         Err(error) => {
             return Response::Error {
                 error: format!("request: {error}"),
-            }
+            };
         }
     };
     match request {

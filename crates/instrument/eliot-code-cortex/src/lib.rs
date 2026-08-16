@@ -376,7 +376,7 @@ fn add_edge(
             conflicts.push(SemanticConflict {
                 subject: key,
                 alternatives: vec![
-                    "graph observations disagree on freshness or coverage".to_owned()
+                    "graph observations disagree on freshness or coverage".to_owned(),
                 ],
                 source_handles: vec![source.to_owned()],
             });

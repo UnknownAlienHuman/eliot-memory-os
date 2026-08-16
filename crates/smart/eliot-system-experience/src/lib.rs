@@ -11,8 +11,8 @@ use std::sync::{Arc, Mutex};
 
 use eliot_contracts::ArtifactId;
 use eliot_evidence::{
-    evidence_shape_digest, EpistemicStatus, EvidenceError, ExperienceRecord, LifecycleState,
-    MemoryLifecycleTransition, RelationRecord,
+    EpistemicStatus, EvidenceError, ExperienceRecord, LifecycleState, MemoryLifecycleTransition,
+    RelationRecord, evidence_shape_digest,
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -89,7 +89,9 @@ pub enum ExperienceError {
     UnknownEndpoint(ArtifactId),
     #[error("relation already exists: {0}")]
     RelationAlreadyExists(ArtifactId),
-    #[error("transition does not match the current lifecycle of {record}: expected {expected}, got {actual}")]
+    #[error(
+        "transition does not match the current lifecycle of {record}: expected {expected}, got {actual}"
+    )]
     StaleTransition {
         record: ArtifactId,
         expected: LifecycleState,

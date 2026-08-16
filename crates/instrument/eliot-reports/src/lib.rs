@@ -6,7 +6,7 @@
 
 #![forbid(unsafe_code)]
 
-use eliot_contracts::{canonical_json_bytes, sha256_hex, ClockReading, StateFence};
+use eliot_contracts::{ClockReading, StateFence, canonical_json_bytes, sha256_hex};
 use eliot_instrument_api::{
     EvidenceCoverage, EvidenceFreshness, InstrumentInvocation, NormalizedEvidence,
     VerificationOutcome, VerificationRun,

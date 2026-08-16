@@ -239,7 +239,7 @@ fn command_for(test: &TestMetadata) -> String {
 /// service call, but it must return only this normalized command observation.
 pub trait VerifierExecutionPort {
     fn execute(&self, command: &PlannedCommand)
-        -> Result<VerificationCommandResult, VerifierError>;
+    -> Result<VerificationCommandResult, VerifierError>;
 }
 
 /// Executes every planned command in order, stopping after a required failure.

@@ -595,11 +595,7 @@ impl BackupBundle {
         if self.manifest.class != BackupClass::ScopeExport && self.export_fence.scope_id.is_some() {
             return Err(BackupError::ScopeUnexpected);
         }
-        for record in self
-            .canonical_events
-            .iter()
-            .chain(self.projections.iter())
-        {
+        for record in self.canonical_events.iter().chain(self.projections.iter()) {
             record.validate()?;
         }
         unique(
@@ -619,7 +615,11 @@ impl BackupBundle {
                 subject: "event range count".to_owned(),
             });
         }
-        validate_receipts(&self.receipts, &self.canonical_events, &self.export_fence.state_fence)?;
+        validate_receipts(
+            &self.receipts,
+            &self.canonical_events,
+            &self.export_fence.state_fence,
+        )?;
         unique(
             self.blobs.iter().map(|blob| blob.locator.hash.clone()),
             "blobs",
@@ -702,7 +702,10 @@ impl BackupBundle {
 
     fn section_checksums(&self) -> Result<BTreeMap<String, String>, BackupError> {
         let mut sections = BTreeMap::new();
-        sections.insert("canonical_events".to_owned(), sha256(&self.canonical_events)?);
+        sections.insert(
+            "canonical_events".to_owned(),
+            sha256(&self.canonical_events)?,
+        );
         sections.insert("projections".to_owned(), sha256(&self.projections)?);
         sections.insert("receipts".to_owned(), sha256(&self.receipts)?);
         sections.insert("blobs".to_owned(), sha256(&self.blobs)?);
@@ -730,8 +733,7 @@ impl BackupBundle {
     /// by ECXF integrity records.
     pub fn encode(&self) -> Result<Vec<u8>, BackupError> {
         self.validate()?;
-        canonical_json_bytes(self)
-            .map_err(|error| BackupError::Serialization(error.to_string()))
+        canonical_json_bytes(self).map_err(|error| BackupError::Serialization(error.to_string()))
     }
 
     /// Decodes and fully validates one logical ECXF bundle before use.
@@ -750,9 +752,11 @@ fn normalize_bundle(bundle: &mut BackupBundle) {
     bundle
         .projections
         .sort_by(|left, right| left.record_id.cmp(&right.record_id));
-    bundle
-        .receipts
-        .sort_by(|left, right| left.operation_id.to_string().cmp(&right.operation_id.to_string()));
+    bundle.receipts.sort_by(|left, right| {
+        left.operation_id
+            .to_string()
+            .cmp(&right.operation_id.to_string())
+    });
     bundle
         .blobs
         .sort_by(|left, right| left.locator.hash.cmp(&right.locator.hash));
@@ -808,7 +812,11 @@ fn validate_class_requirements(bundle: &BackupBundle) -> Result<(), BackupError>
             }
             const REQUIRED: [&str; 4] = ["config", "policy", "module", "host_dependency_build"];
             for required in REQUIRED {
-                if !bundle.artifacts.iter().any(|artifact| artifact.kind == required) {
+                if !bundle
+                    .artifacts
+                    .iter()
+                    .any(|artifact| artifact.kind == required)
+                {
                     return Err(BackupError::MissingRecoveryComponent(required));
                 }
             }
@@ -1051,22 +1059,13 @@ pub trait RestoreTarget {
         context: &RestoreContext,
         restored_fence: &RestoredFence,
     ) -> Result<(), BackupError>;
-    fn apply_purge_ledger(
-        &mut self,
-        entries: &[PurgeLedgerEntry],
-    ) -> Result<(), BackupError>;
+    fn apply_purge_ledger(&mut self, entries: &[PurgeLedgerEntry]) -> Result<(), BackupError>;
     fn import_sealed_blob(&mut self, blob: &BackupBlob) -> Result<(), BackupError>;
     fn import_canonical_event(&mut self, record: &CanonicalRecord) -> Result<(), BackupError>;
     fn import_receipt(&mut self, receipt: &WriteReceipt) -> Result<(), BackupError>;
     fn import_projection(&mut self, record: &CanonicalRecord) -> Result<(), BackupError>;
-    fn suspend_ors_operations(
-        &mut self,
-        snapshot: &OrsSnapshotFence,
-    ) -> Result<(), BackupError>;
-    fn rebuild_projections(
-        &mut self,
-        restored_fence: &RestoredFence,
-    ) -> Result<(), BackupError>;
+    fn suspend_ors_operations(&mut self, snapshot: &OrsSnapshotFence) -> Result<(), BackupError>;
+    fn rebuild_projections(&mut self, restored_fence: &RestoredFence) -> Result<(), BackupError>;
     fn verify_receipt_event_chain(
         &mut self,
         receipts: &[WriteReceipt],

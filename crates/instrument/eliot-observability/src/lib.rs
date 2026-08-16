@@ -94,7 +94,10 @@ fn text(value: &str, field: &'static str) -> Result<(), ObservabilityError> {
     Ok(())
 }
 
-fn unique<T: Ord>(values: impl IntoIterator<Item = T>, field: &'static str) -> Result<(), ObservabilityError> {
+fn unique<T: Ord>(
+    values: impl IntoIterator<Item = T>,
+    field: &'static str,
+) -> Result<(), ObservabilityError> {
     let mut seen = BTreeSet::new();
     if values.into_iter().any(|value| !seen.insert(value)) {
         return Err(ObservabilityError::Duplicate { field });
@@ -127,8 +130,18 @@ fn validate_labels(labels: &BTreeMap<String, String>) -> Result<(), Observabilit
         text(value, "label.value")?;
         let normalized = key.to_ascii_lowercase();
         if [
-            "secret", "token", "password", "credential", "prompt", "content", "stdout",
-            "stderr", "arguments", "args", "raw", "payload",
+            "secret",
+            "token",
+            "password",
+            "credential",
+            "prompt",
+            "content",
+            "stdout",
+            "stderr",
+            "arguments",
+            "args",
+            "raw",
+            "payload",
         ]
         .iter()
         .any(|forbidden| normalized.contains(forbidden))
@@ -214,7 +227,9 @@ impl TraceContext {
 }
 
 /// Required operational event classes from the Instrument Plane.
-#[derive(Clone, Copy, Debug, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[derive(
+    Clone, Copy, Debug, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize, Deserialize,
+)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum OperationalEventKind {
     ProcessStart,
@@ -279,7 +294,9 @@ impl OperationalEventKind {
 }
 
 /// Lifecycle importance used for bounded retention and explicit gap handling.
-#[derive(Clone, Copy, Debug, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[derive(
+    Clone, Copy, Debug, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize, Deserialize,
+)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum EventPriority {
     Diagnostic,
@@ -343,8 +360,10 @@ impl OperationalEvent {
                 reason: "protected event class requires protected priority",
             });
         }
-        if matches!(self.coverage, EvidenceCoverage::PartialForScope | EvidenceCoverage::Unknown)
-            && self.blind_interval_ref.is_none()
+        if matches!(
+            self.coverage,
+            EvidenceCoverage::PartialForScope | EvidenceCoverage::Unknown
+        ) && self.blind_interval_ref.is_none()
         {
             return Err(ObservabilityError::InvalidField {
                 field: "event.blind_interval_ref",
@@ -428,7 +447,10 @@ impl RunTiming {
         for (clock, field) in [
             (self.first_output_at.as_ref(), "run_timing.first_output_at"),
             (self.finished_at.as_ref(), "run_timing.finished_at"),
-            (self.cleanup_finished_at.as_ref(), "run_timing.cleanup_finished_at"),
+            (
+                self.cleanup_finished_at.as_ref(),
+                "run_timing.cleanup_finished_at",
+            ),
         ] {
             if let Some(clock) = clock {
                 validate_clock(clock, field)?;
@@ -439,7 +461,8 @@ impl RunTiming {
             Some(self.started_at).and_then(|clock| clock.known_time_ms),
             self.first_output_at.and_then(|clock| clock.known_time_ms),
             self.finished_at.and_then(|clock| clock.known_time_ms),
-            self.cleanup_finished_at.and_then(|clock| clock.known_time_ms),
+            self.cleanup_finished_at
+                .and_then(|clock| clock.known_time_ms),
         ];
         let mut previous = None;
         for point in points.into_iter().flatten() {
@@ -479,9 +502,12 @@ pub enum CleanupStatus {
 
 impl ProcessResourceTelemetry {
     fn validate(&self) -> Result<(), ObservabilityError> {
-        for value in [self.process_tree_ref.as_deref(), self.resource_limit_ref.as_deref()]
-            .into_iter()
-            .flatten()
+        for value in [
+            self.process_tree_ref.as_deref(),
+            self.resource_limit_ref.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
         {
             text(value, "process_resource.reference")?;
         }
@@ -644,7 +670,12 @@ impl InstrumentRunTelemetry {
         unique(self.facts.iter(), "run.facts")?;
         unique(self.unknowns.iter(), "run.unknowns")?;
         unique(self.conflicts.iter(), "run.conflicts")?;
-        for value in self.facts.iter().chain(&self.unknowns).chain(&self.conflicts) {
+        for value in self
+            .facts
+            .iter()
+            .chain(&self.unknowns)
+            .chain(&self.conflicts)
+        {
             text(value, "run.observation_ref")?;
         }
         if let Some(tests) = self.tests {
@@ -759,12 +790,18 @@ pub struct ObservabilitySnapshot {
 impl ObservabilitySnapshot {
     /// Validates a projection before handing it to a durable or reporting owner.
     pub fn validate(&self) -> Result<(), ObservabilityError> {
-        unique(self.events.iter().map(|event| event.event_id.as_str()), "snapshot.events")?;
+        unique(
+            self.events.iter().map(|event| event.event_id.as_str()),
+            "snapshot.events",
+        )?;
         unique(
             self.metrics.iter().map(|metric| metric.sample_id.as_str()),
             "snapshot.metrics",
         )?;
-        unique(self.gaps.iter().map(|gap| gap.gap_id.as_str()), "snapshot.gaps")?;
+        unique(
+            self.gaps.iter().map(|gap| gap.gap_id.as_str()),
+            "snapshot.gaps",
+        )?;
         for event in &self.events {
             event.validate()?;
         }
@@ -807,7 +844,10 @@ impl ObservabilityBuffer {
     }
 
     /// Appends an event with idempotent replay and protected-capacity fencing.
-    pub fn append_event(&mut self, event: OperationalEvent) -> Result<BufferDisposition, ObservabilityError> {
+    pub fn append_event(
+        &mut self,
+        event: OperationalEvent,
+    ) -> Result<BufferDisposition, ObservabilityError> {
         let digest = event.digest()?;
         if let Some((existing_digest, _)) = self.events.get(&event.event_id) {
             if existing_digest == &digest {
@@ -836,7 +876,10 @@ impl ObservabilityBuffer {
     }
 
     /// Appends a metric, recording a visible gap when bounded retention drops it.
-    pub fn append_metric(&mut self, metric: MetricSample) -> Result<BufferDisposition, ObservabilityError> {
+    pub fn append_metric(
+        &mut self,
+        metric: MetricSample,
+    ) -> Result<BufferDisposition, ObservabilityError> {
         let digest = metric.digest()?;
         if let Some((existing_digest, _)) = self.metrics.get(&metric.sample_id) {
             if existing_digest == &digest {
@@ -847,10 +890,10 @@ impl ObservabilityBuffer {
         if self.metrics.len() >= self.limits.max_metrics {
             let gap = ObservabilityGap {
                 gap_id: format!("gap:metric:{}", metric.sample_id),
-                source_ref: metric
-                    .trace
-                    .as_ref()
-                    .map_or_else(|| "metric-buffer".to_owned(), |trace| trace.adapter_instance_ref.clone()),
+                source_ref: metric.trace.as_ref().map_or_else(
+                    || "metric-buffer".to_owned(),
+                    |trace| trace.adapter_instance_ref.clone(),
+                ),
                 reason_ref: "bounded-metric-capacity".to_owned(),
                 first_missing_sequence: metric.trace.as_ref().and_then(|trace| trace.event_cursor),
                 last_missing_sequence: metric.trace.as_ref().and_then(|trace| trace.event_cursor),
@@ -865,7 +908,10 @@ impl ObservabilityBuffer {
     }
 
     /// Appends a coverage gap, retaining protected gaps even under pressure.
-    pub fn append_gap(&mut self, gap: ObservabilityGap) -> Result<BufferDisposition, ObservabilityError> {
+    pub fn append_gap(
+        &mut self,
+        gap: ObservabilityGap,
+    ) -> Result<BufferDisposition, ObservabilityError> {
         gap.validate()?;
         if self.gaps.contains_key(&gap.gap_id) {
             if self.gaps.get(&gap.gap_id) == Some(&gap) {
@@ -886,8 +932,16 @@ impl ObservabilityBuffer {
     /// Returns a deterministic snapshot for an outer durable/audit owner.
     pub fn snapshot(&self) -> ObservabilitySnapshot {
         ObservabilitySnapshot {
-            events: self.events.values().map(|(_, event)| event.clone()).collect(),
-            metrics: self.metrics.values().map(|(_, metric)| metric.clone()).collect(),
+            events: self
+                .events
+                .values()
+                .map(|(_, event)| event.clone())
+                .collect(),
+            metrics: self
+                .metrics
+                .values()
+                .map(|(_, metric)| metric.clone())
+                .collect(),
             gaps: self.gaps.values().cloned().collect(),
         }
     }

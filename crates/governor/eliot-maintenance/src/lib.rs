@@ -15,7 +15,9 @@
 use std::collections::BTreeSet;
 use std::fmt;
 
-use eliot_contracts::{StateFence, ContractIdentity, ContractVersion, contract_identity as make_contract_identity};
+use eliot_contracts::{
+    ContractIdentity, ContractVersion, StateFence, contract_identity as make_contract_identity,
+};
 use eliot_runtime_contracts::{LeaseState, RuntimeLease};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -27,7 +29,9 @@ pub const CONTRACT_NAME: &str = "eliot.governor.maintenance";
 pub const CONTRACT_VERSION: ContractVersion = ContractVersion::new(1, 0, 0);
 
 /// Stable maintenance family registered by I14.22.
-#[derive(Clone, Copy, Debug, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[derive(
+    Clone, Copy, Debug, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize, Deserialize,
+)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum MaintenanceFamily {
     /// Backup and restore rehearsal without restoring active authority.
@@ -256,7 +260,10 @@ impl MaintenanceCheckpoint {
     pub fn validate(&self) -> Result<(), MaintenanceError> {
         text(&self.stage_ref, "checkpoint.stage_ref")?;
         text(&self.input_digest, "checkpoint.input_digest")?;
-        if self.total_units.is_some_and(|total| self.processed_units > total) {
+        if self
+            .total_units
+            .is_some_and(|total| self.processed_units > total)
+        {
             return Err(MaintenanceError::InvalidField("checkpoint.processed_units"));
         }
         if let Some(cursor) = &self.cursor_ref {
@@ -348,7 +355,9 @@ impl MaintenanceJob {
         self.state_fence
             .validate()
             .map_err(|_| MaintenanceError::FenceMismatch)?;
-        self.runtime_lease.validate().map_err(|_| MaintenanceError::LeaseInvalid)?;
+        self.runtime_lease
+            .validate()
+            .map_err(|_| MaintenanceError::LeaseInvalid)?;
         if self.runtime_lease.state != LeaseState::Active {
             return Err(MaintenanceError::LeaseInactive);
         }
@@ -370,11 +379,34 @@ impl MaintenanceJob {
     fn transition(&self, next: MaintenanceJobState) -> Result<Self, MaintenanceError> {
         let legal = matches!(
             (self.state, next),
-            (MaintenanceJobState::Admitted, MaintenanceJobState::Running | MaintenanceJobState::Deferred | MaintenanceJobState::Cancelled)
-                | (MaintenanceJobState::Running, MaintenanceJobState::Checkpointed | MaintenanceJobState::Completed | MaintenanceJobState::Failed | MaintenanceJobState::UnknownOutcome | MaintenanceJobState::Cancelled)
-                | (MaintenanceJobState::Checkpointed, MaintenanceJobState::Running | MaintenanceJobState::Deferred | MaintenanceJobState::Completed | MaintenanceJobState::Cancelled | MaintenanceJobState::UnknownOutcome)
-                | (MaintenanceJobState::Deferred, MaintenanceJobState::Running | MaintenanceJobState::Cancelled)
-                | (MaintenanceJobState::UnknownOutcome, MaintenanceJobState::Completed | MaintenanceJobState::RollbackRequired | MaintenanceJobState::Failed)
+            (
+                MaintenanceJobState::Admitted,
+                MaintenanceJobState::Running
+                    | MaintenanceJobState::Deferred
+                    | MaintenanceJobState::Cancelled
+            ) | (
+                MaintenanceJobState::Running,
+                MaintenanceJobState::Checkpointed
+                    | MaintenanceJobState::Completed
+                    | MaintenanceJobState::Failed
+                    | MaintenanceJobState::UnknownOutcome
+                    | MaintenanceJobState::Cancelled
+            ) | (
+                MaintenanceJobState::Checkpointed,
+                MaintenanceJobState::Running
+                    | MaintenanceJobState::Deferred
+                    | MaintenanceJobState::Completed
+                    | MaintenanceJobState::Cancelled
+                    | MaintenanceJobState::UnknownOutcome
+            ) | (
+                MaintenanceJobState::Deferred,
+                MaintenanceJobState::Running | MaintenanceJobState::Cancelled
+            ) | (
+                MaintenanceJobState::UnknownOutcome,
+                MaintenanceJobState::Completed
+                    | MaintenanceJobState::RollbackRequired
+                    | MaintenanceJobState::Failed
+            )
         );
         if !legal {
             return Err(MaintenanceError::IllegalTransition {
@@ -382,7 +414,10 @@ impl MaintenanceJob {
                 to: next,
             });
         }
-        Ok(Self { state: next, ..self.clone() })
+        Ok(Self {
+            state: next,
+            ..self.clone()
+        })
     }
 }
 
@@ -482,31 +517,49 @@ impl<S: MaintenanceStateStore> MaintenanceController<S> {
         }
         if input.safety_required {
             let (decision, reason) = if !input.route_available {
-                (AutomationDecision::Escalate, DecisionReason::RouteUnavailable)
+                (
+                    AutomationDecision::Escalate,
+                    DecisionReason::RouteUnavailable,
+                )
             } else if !input.budget_available {
                 (AutomationDecision::Defer, DecisionReason::BudgetUnavailable)
             } else if input.user_session_required && !input.user_session_available {
-                (AutomationDecision::Defer, DecisionReason::UserSessionRequired)
+                (
+                    AutomationDecision::Defer,
+                    DecisionReason::UserSessionRequired,
+                )
             } else {
                 (AutomationDecision::Start, DecisionReason::SafetyRecovery)
             };
             return Ok(self.decision(input, decision, reason));
         }
         let (decision, reason) = match input.mode {
-            MaintenanceAutomationMode::Off => (AutomationDecision::Block, DecisionReason::AutomationOff),
-            MaintenanceAutomationMode::SuggestOnly => (AutomationDecision::Suggest, DecisionReason::SuggestOnly),
-            MaintenanceAutomationMode::Manual if !input.explicit_request => {
-                (AutomationDecision::Suggest, DecisionReason::ExplicitRequestRequired)
+            MaintenanceAutomationMode::Off => {
+                (AutomationDecision::Block, DecisionReason::AutomationOff)
             }
-            MaintenanceAutomationMode::IdleOnly if !input.idle => (AutomationDecision::Defer, DecisionReason::NotIdle),
+            MaintenanceAutomationMode::SuggestOnly => {
+                (AutomationDecision::Suggest, DecisionReason::SuggestOnly)
+            }
+            MaintenanceAutomationMode::Manual if !input.explicit_request => (
+                AutomationDecision::Suggest,
+                DecisionReason::ExplicitRequestRequired,
+            ),
+            MaintenanceAutomationMode::IdleOnly if !input.idle => {
+                (AutomationDecision::Defer, DecisionReason::NotIdle)
+            }
             MaintenanceAutomationMode::Scheduled if !input.scheduled_window => {
                 (AutomationDecision::Defer, DecisionReason::OutsideSchedule)
             }
-            _ if !input.route_available => (AutomationDecision::Defer, DecisionReason::RouteUnavailable),
-            _ if !input.budget_available => (AutomationDecision::Defer, DecisionReason::BudgetUnavailable),
-            _ if input.user_session_required && !input.user_session_available => {
-                (AutomationDecision::Defer, DecisionReason::UserSessionRequired)
+            _ if !input.route_available => {
+                (AutomationDecision::Defer, DecisionReason::RouteUnavailable)
             }
+            _ if !input.budget_available => {
+                (AutomationDecision::Defer, DecisionReason::BudgetUnavailable)
+            }
+            _ if input.user_session_required && !input.user_session_available => (
+                AutomationDecision::Defer,
+                DecisionReason::UserSessionRequired,
+            ),
             _ => (AutomationDecision::Start, DecisionReason::Eligible),
         };
         Ok(self.decision(input, decision, reason))
@@ -553,7 +606,11 @@ impl<S: MaintenanceStateStore> MaintenanceController<S> {
     }
 
     /// Starts one admitted/deferred job under its exact current fence and lease.
-    pub fn start(&mut self, job_id: &str, fence: &StateFence) -> Result<MaintenanceJob, MaintenanceError> {
+    pub fn start(
+        &mut self,
+        job_id: &str,
+        fence: &StateFence,
+    ) -> Result<MaintenanceJob, MaintenanceError> {
         let job = self.load_checked(job_id, fence)?;
         if job.attempts >= job.max_attempts {
             return Err(MaintenanceError::BudgetExhausted);
@@ -562,7 +619,10 @@ impl<S: MaintenanceStateStore> MaintenanceController<S> {
             return Err(MaintenanceError::LeaseInactive);
         }
         let mut next = job.transition(MaintenanceJobState::Running)?;
-        next.attempts = next.attempts.checked_add(1).ok_or(MaintenanceError::BudgetExhausted)?;
+        next.attempts = next
+            .attempts
+            .checked_add(1)
+            .ok_or(MaintenanceError::BudgetExhausted)?;
         self.store.save(&next)?;
         Ok(next)
     }
@@ -589,7 +649,11 @@ impl<S: MaintenanceStateStore> MaintenanceController<S> {
     }
 
     /// Resumes a checkpointed job only with the same fence and active lease.
-    pub fn resume(&mut self, job_id: &str, fence: &StateFence) -> Result<MaintenanceJob, MaintenanceError> {
+    pub fn resume(
+        &mut self,
+        job_id: &str,
+        fence: &StateFence,
+    ) -> Result<MaintenanceJob, MaintenanceError> {
         let job = self.load_checked(job_id, fence)?;
         if job.runtime_lease.state != LeaseState::Active {
             return Err(MaintenanceError::LeaseInactive);
@@ -598,7 +662,10 @@ impl<S: MaintenanceStateStore> MaintenanceController<S> {
             return Err(MaintenanceError::BudgetExhausted);
         }
         let mut next = job.transition(MaintenanceJobState::Running)?;
-        next.attempts = next.attempts.checked_add(1).ok_or(MaintenanceError::BudgetExhausted)?;
+        next.attempts = next
+            .attempts
+            .checked_add(1)
+            .ok_or(MaintenanceError::BudgetExhausted)?;
         self.store.save(&next)?;
         Ok(next)
     }
@@ -682,7 +749,9 @@ impl<S: MaintenanceStateStore> MaintenanceController<S> {
         let target = match disposition {
             ReconciliationDisposition::ProvenNoEffect => MaintenanceJobState::Deferred,
             ReconciliationDisposition::ProvenApplied => MaintenanceJobState::Completed,
-            ReconciliationDisposition::StillUnknown => return Err(MaintenanceError::UnknownRequiresReconciliation),
+            ReconciliationDisposition::StillUnknown => {
+                return Err(MaintenanceError::UnknownRequiresReconciliation);
+            }
         };
         let mut next = job.transition(target)?;
         next.outcome_ref = Some(evidence_ref);
@@ -691,16 +760,26 @@ impl<S: MaintenanceStateStore> MaintenanceController<S> {
     }
 
     /// Cancels work before an irreversible external effect is acknowledged.
-    pub fn cancel(&mut self, job_id: &str, fence: &StateFence) -> Result<MaintenanceJob, MaintenanceError> {
+    pub fn cancel(
+        &mut self,
+        job_id: &str,
+        fence: &StateFence,
+    ) -> Result<MaintenanceJob, MaintenanceError> {
         let job = self.load_checked(job_id, fence)?;
         let next = job.transition(MaintenanceJobState::Cancelled)?;
         self.store.save(&next)?;
         Ok(next)
     }
 
-    fn load_checked(&mut self, job_id: &str, fence: &StateFence) -> Result<MaintenanceJob, MaintenanceError> {
+    fn load_checked(
+        &mut self,
+        job_id: &str,
+        fence: &StateFence,
+    ) -> Result<MaintenanceJob, MaintenanceError> {
         text(job_id, "job_id")?;
-        fence.validate().map_err(|_| MaintenanceError::FenceMismatch)?;
+        fence
+            .validate()
+            .map_err(|_| MaintenanceError::FenceMismatch)?;
         let job = self
             .store
             .load(job_id)?

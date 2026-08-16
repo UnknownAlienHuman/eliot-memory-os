@@ -1,6 +1,6 @@
 use std::collections::BTreeSet;
 
-use eliot_contracts::{canonical_json_bytes, sha256_hex, StateFence};
+use eliot_contracts::{StateFence, canonical_json_bytes, sha256_hex};
 use eliot_evidence::EvidenceEnvelope;
 use eliot_security_contracts::{PurgeLedgerEntry, PurgeLocation, PurgeState};
 use schemars::JsonSchema;

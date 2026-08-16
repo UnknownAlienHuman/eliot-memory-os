@@ -88,7 +88,10 @@ where
         &mut self,
         frame: WorkerFrame,
     ) -> Result<Vec<WorkerEventEnvelope>, NativeWorkerError> {
-        self.core.handle(frame).await.map_err(NativeWorkerError::from)
+        self.core
+            .handle(frame)
+            .await
+            .map_err(NativeWorkerError::from)
     }
 
     /// Returns the logical lifecycle owned by the worker protocol.
@@ -104,7 +107,10 @@ where
                 Some(frame) => frame,
                 None => return Ok(()),
             };
-            let shutdown = matches!(frame.body, eliot_native_worker_core::WorkerFrameBody::Shutdown);
+            let shutdown = matches!(
+                frame.body,
+                eliot_native_worker_core::WorkerFrameBody::Shutdown
+            );
             let events = self.handle(frame).await?;
             write_frame(&WorkerResponse { events })?;
             if shutdown {

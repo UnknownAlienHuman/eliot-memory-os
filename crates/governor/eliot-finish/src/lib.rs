@@ -99,7 +99,10 @@ fn text(value: &str, field: &'static str) -> Result<(), FinishError> {
     Ok(())
 }
 
-fn unique<T: Ord>(values: impl IntoIterator<Item = T>, field: &'static str) -> Result<(), FinishError> {
+fn unique<T: Ord>(
+    values: impl IntoIterator<Item = T>,
+    field: &'static str,
+) -> Result<(), FinishError> {
     let mut seen = BTreeSet::new();
     if values.into_iter().any(|value| !seen.insert(value)) {
         return Err(FinishError::Duplicate { field });
@@ -108,7 +111,9 @@ fn unique<T: Ord>(values: impl IntoIterator<Item = T>, field: &'static str) -> R
 }
 
 /// Operational task lifecycle, kept separate from one finish outcome.
-#[derive(Clone, Copy, Debug, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[derive(
+    Clone, Copy, Debug, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize, Deserialize,
+)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum TaskLifecycleState {
     Proposed,
@@ -221,7 +226,10 @@ impl FinishContext {
             });
         }
         self.current_state_fence.validate()?;
-        text(&self.finish_authority_ref, "finish_context.finish_authority_ref")?;
+        text(
+            &self.finish_authority_ref,
+            "finish_context.finish_authority_ref",
+        )?;
         if let Some(reference) = &self.closure_authority_ref {
             text(reference, "finish_context.closure_authority_ref")?;
         }
@@ -278,7 +286,10 @@ fn validate_closure_intent(
         | RequestedFinishOutcome::DegradedNoProof
         | RequestedFinishOutcome::UnsafeToFinish => intent == FinishClosureIntent::Continue,
         RequestedFinishOutcome::Partial => {
-            matches!(intent, FinishClosureIntent::Continue | FinishClosureIntent::ClosePartial)
+            matches!(
+                intent,
+                FinishClosureIntent::Continue | FinishClosureIntent::ClosePartial
+            )
         }
         RequestedFinishOutcome::Cancelled => intent == FinishClosureIntent::Cancel,
         RequestedFinishOutcome::Superseded => intent == FinishClosureIntent::Supersede,
@@ -531,8 +542,7 @@ impl FinishService {
             attempt_digest,
             receipt_digest,
         };
-        self.receipts
-            .insert(attempt.attempt_id, receipt.clone());
+        self.receipts.insert(attempt.attempt_id, receipt.clone());
         Ok(FinishAdmission::Accepted { receipt })
     }
 
@@ -575,10 +585,11 @@ fn receipt_digest(
         unresolved_descendant_refs,
         attempt_digest,
     );
-    let receipt_bytes = canonical_json_bytes(&receipt_shape).map_err(|_| FinishError::InvalidField {
-        field: "finish_decision_receipt",
-        reason: "cannot serialize decision receipt",
-    })?;
+    let receipt_bytes =
+        canonical_json_bytes(&receipt_shape).map_err(|_| FinishError::InvalidField {
+            field: "finish_decision_receipt",
+            reason: "cannot serialize decision receipt",
+        })?;
     Ok(sha256_hex(&receipt_bytes))
 }
 

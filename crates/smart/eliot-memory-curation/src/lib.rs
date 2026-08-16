@@ -64,7 +64,9 @@ fn bounded<T>(items: &[T], field: &'static str, maximum: usize) -> Result<(), Cu
 }
 
 /// A canonical record projection supplied by the storage owner.
-#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize, JsonSchema)]
+#[derive(
+    Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize, JsonSchema,
+)]
 #[serde(deny_unknown_fields)]
 pub struct CurationRecord {
     pub handle: String,
@@ -144,7 +146,10 @@ impl CurationMetadata {
         }
         for (field, value) in [
             ("metadata.duplicate_of", self.duplicate_of.as_ref()),
-            ("metadata.semantic_duplicate_of", self.semantic_duplicate_of.as_ref()),
+            (
+                "metadata.semantic_duplicate_of",
+                self.semantic_duplicate_of.as_ref(),
+            ),
             ("metadata.superseded_by", self.superseded_by.as_ref()),
             ("metadata.stale_reason_ref", self.stale_reason_ref.as_ref()),
         ] {
@@ -156,7 +161,9 @@ impl CurationMetadata {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize, JsonSchema)]
+#[derive(
+    Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize, JsonSchema,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum ProtectionRole {
     Counterexample,
@@ -167,7 +174,9 @@ pub enum ProtectionRole {
     FailureFingerprint,
 }
 
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize, JsonSchema)]
+#[derive(
+    Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize, JsonSchema,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum FindingKind {
     Duplicate,
@@ -178,7 +187,9 @@ pub enum FindingKind {
     StaleSuperseded,
 }
 
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize, JsonSchema)]
+#[derive(
+    Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize, JsonSchema,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum ReversibleAction {
     ProposeArchive,
@@ -244,7 +255,9 @@ impl PreviewRequest {
             return Err(CurationError::InvalidPageSize);
         }
         if self.ruleset_version != RULESET_VERSION {
-            return Err(CurationError::UnsupportedRuleset(self.ruleset_version.clone()));
+            return Err(CurationError::UnsupportedRuleset(
+                self.ruleset_version.clone(),
+            ));
         }
         self.snapshot_revision.ok_or(CurationError::MissingRevision)
     }
@@ -255,11 +268,15 @@ impl PreviewRequest {
 pub struct MemoryCurationOwner;
 
 impl Default for MemoryCurationOwner {
-    fn default() -> Self { Self }
+    fn default() -> Self {
+        Self
+    }
 }
 
 impl MemoryCurationOwner {
-    pub const fn new() -> Self { Self }
+    pub const fn new() -> Self {
+        Self
+    }
 
     /// Produces one stable page from a complete or bounded canonical snapshot.
     pub fn preview(
@@ -286,18 +303,26 @@ impl MemoryCurationOwner {
         let mut lifecycle_counts = BTreeMap::new();
         for record in scanned_records {
             *kind_counts.entry(record.record_kind.clone()).or_insert(0) += 1;
-            *lifecycle_counts.entry(record.lifecycle.clone()).or_insert(0) += 1;
+            *lifecycle_counts
+                .entry(record.lifecycle.clone())
+                .or_insert(0) += 1;
             if is_protected(record) {
                 protected_refs.push(record.handle.clone());
                 continue;
             }
-            if matches!(record.lifecycle, LifecycleState::Active | LifecycleState::Restored)
-                && let Some(candidate) = candidate_for(record)
+            if matches!(
+                record.lifecycle,
+                LifecycleState::Active | LifecycleState::Restored
+            ) && let Some(candidate) = candidate_for(record)
             {
                 candidates.push(candidate);
             }
         }
-        candidates.sort_by(|left, right| left.handle.cmp(&right.handle).then_with(|| left.finding.cmp(&right.finding)));
+        candidates.sort_by(|left, right| {
+            left.handle
+                .cmp(&right.handle)
+                .then_with(|| left.finding.cmp(&right.finding))
+        });
         protected_refs.sort();
         protected_refs.dedup();
         let total_matching = candidates.len();
@@ -311,7 +336,8 @@ impl MemoryCurationOwner {
             return Err(CurationError::CursorOutOfRange);
         }
         let end = offset.saturating_add(request.page_size).min(total_matching);
-        let next_cursor = (end < total_matching).then(|| make_cursor(end, &request.scope, revision));
+        let next_cursor =
+            (end < total_matching).then(|| make_cursor(end, &request.scope, revision));
         Ok(CurationPreview {
             scope: request.scope.clone(),
             snapshot_revision: revision,
@@ -338,29 +364,121 @@ fn is_protected(record: &CurationRecord) -> bool {
     record.metadata.protected
         || record.metadata.current_truth
         || record.metadata.audit_required
-        || matches!(record.metadata.role, Some(ProtectionRole::Counterexample | ProtectionRole::Minority | ProtectionRole::Protected | ProtectionRole::CurrentTruth | ProtectionRole::AuditHistory))
-        || (matches!(record.metadata.role, Some(ProtectionRole::FailureFingerprint)) && !record.metadata.evidence_sufficient)
+        || matches!(
+            record.metadata.role,
+            Some(
+                ProtectionRole::Counterexample
+                    | ProtectionRole::Minority
+                    | ProtectionRole::Protected
+                    | ProtectionRole::CurrentTruth
+                    | ProtectionRole::AuditHistory
+            )
+        )
+        || (matches!(
+            record.metadata.role,
+            Some(ProtectionRole::FailureFingerprint)
+        ) && !record.metadata.evidence_sufficient)
         || record.status.eq_ignore_ascii_case("verified")
-        || record.record_kind.eq_ignore_ascii_case("minority_pressure_record")
+        || record
+            .record_kind
+            .eq_ignore_ascii_case("minority_pressure_record")
 }
 
 fn candidate_for(record: &CurationRecord) -> Option<CurationCandidate> {
-    let (finding, action, confidence, signal_refs, requirements) = if let Some(target) = &record.metadata.duplicate_of {
-        (FindingKind::Duplicate, ReversibleAction::Archive, 99, vec![target.clone()], vec!["restore receipt with operator reason".to_owned()])
+    let (finding, action, confidence, signal_refs, requirements) = if let Some(target) =
+        &record.metadata.duplicate_of
+    {
+        (
+            FindingKind::Duplicate,
+            ReversibleAction::Archive,
+            99,
+            vec![target.clone()],
+            vec!["restore receipt with operator reason".to_owned()],
+        )
     } else if let Some(target) = &record.metadata.semantic_duplicate_of {
-        (FindingKind::SemanticDuplicate, if record.metadata.semantic_equivalence_verified { ReversibleAction::Archive } else { ReversibleAction::ProposeArchive }, if record.metadata.semantic_equivalence_verified { 92 } else { 70 }, vec![target.clone()], vec!["semantic equivalence must remain verified".to_owned(), "restore receipt with counterexample evidence".to_owned()])
+        (
+            FindingKind::SemanticDuplicate,
+            if record.metadata.semantic_equivalence_verified {
+                ReversibleAction::Archive
+            } else {
+                ReversibleAction::ProposeArchive
+            },
+            if record.metadata.semantic_equivalence_verified {
+                92
+            } else {
+                70
+            },
+            vec![target.clone()],
+            vec![
+                "semantic equivalence must remain verified".to_owned(),
+                "restore receipt with counterexample evidence".to_owned(),
+            ],
+        )
     } else if record.metadata.scope_match == Some(false) {
-        (FindingKind::WrongScope, ReversibleAction::Suppress, 95, Vec::new(), vec!["fresh scope applicability evidence".to_owned(), "restore receipt with revised scope".to_owned()])
+        (
+            FindingKind::WrongScope,
+            ReversibleAction::Suppress,
+            95,
+            Vec::new(),
+            vec![
+                "fresh scope applicability evidence".to_owned(),
+                "restore receipt with revised scope".to_owned(),
+            ],
+        )
     } else if record.metadata.unsafe_instruction && record.metadata.evidence_sufficient {
-        (FindingKind::UnsafeInstruction, ReversibleAction::Suppress, 99, record.metadata.unsafe_evidence_refs.clone(), vec!["explicit safety revalidation".to_owned(), "restore receipt with operator evidence".to_owned()])
-    } else if record.metadata.utility_score.is_some_and(|score| score <= 25.0) {
+        (
+            FindingKind::UnsafeInstruction,
+            ReversibleAction::Suppress,
+            99,
+            record.metadata.unsafe_evidence_refs.clone(),
+            vec![
+                "explicit safety revalidation".to_owned(),
+                "restore receipt with operator evidence".to_owned(),
+            ],
+        )
+    } else if record
+        .metadata
+        .utility_score
+        .is_some_and(|score| score <= 25.0)
+    {
         (FindingKind::LowUtilityInsufficientEvidence, ReversibleAction::ProposeArchive, 40, vec!["writer_utility_score_is_not_canonical_evidence".to_owned()], vec!["derive utility from canonical inclusion, influence, verification, cost, and regret records".to_owned(), "preserve the active handle until the governed utility ledger is complete".to_owned()])
-    } else if record.metadata.utility_delta.is_some_and(|delta| delta <= 0.0)
+    } else if record
+        .metadata
+        .utility_delta
+        .is_some_and(|delta| delta <= 0.0)
         && record.metadata.repeat_count.is_some_and(|count| count >= 2)
     {
-        (FindingKind::LowUtilityInsufficientEvidence, ReversibleAction::ProposeArchive, 40, vec!["writer_utility_delta_is_not_canonical_evidence".to_owned()], vec!["derive repeated low delta from complete canonical use and outcome records".to_owned(), "preserve the active handle until the governed utility ledger is complete".to_owned()])
+        (
+            FindingKind::LowUtilityInsufficientEvidence,
+            ReversibleAction::ProposeArchive,
+            40,
+            vec!["writer_utility_delta_is_not_canonical_evidence".to_owned()],
+            vec![
+                "derive repeated low delta from complete canonical use and outcome records"
+                    .to_owned(),
+                "preserve the active handle until the governed utility ledger is complete"
+                    .to_owned(),
+            ],
+        )
     } else if let Some(target) = &record.metadata.superseded_by {
-        (FindingKind::StaleSuperseded, if record.metadata.stale_reason_ref.is_some() { ReversibleAction::Archive } else { ReversibleAction::ProposeArchive }, if record.metadata.stale_reason_ref.is_some() { 95 } else { 80 }, vec![target.clone()], vec!["superseding record must remain current".to_owned(), "restore receipt after freshness revalidation".to_owned()])
+        (
+            FindingKind::StaleSuperseded,
+            if record.metadata.stale_reason_ref.is_some() {
+                ReversibleAction::Archive
+            } else {
+                ReversibleAction::ProposeArchive
+            },
+            if record.metadata.stale_reason_ref.is_some() {
+                95
+            } else {
+                80
+            },
+            vec![target.clone()],
+            vec![
+                "superseding record must remain current".to_owned(),
+                "restore receipt after freshness revalidation".to_owned(),
+            ],
+        )
     } else {
         return None;
     };
