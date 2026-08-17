@@ -1045,8 +1045,7 @@ impl ProcessExecutionGateway {
             && self
                 .controller
                 .lock()
-                .map(|controller| controller.authority_id() == &binding.authority_id)
-                .unwrap_or(false)
+                .is_ok_and(|controller| controller.authority_id() == &binding.authority_id)
     }
 
     #[cfg(windows)]
@@ -2789,6 +2788,10 @@ impl KernelComposition {
     }
 
     #[cfg(windows)]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "ordered live process, Job, authority, configuration, and Store proof remains explicit"
+    )]
     async fn self_authored_ready_receipt(
         &self,
         request: &KernelControlRequest,
