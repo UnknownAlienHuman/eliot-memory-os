@@ -2,6 +2,7 @@ use std::sync::Mutex;
 
 use eliot_platform::PlatformHandle;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use sha2::{Digest, Sha256};
 
 use crate::backend::{BackendReconcileState, CommittedAppend, DurableImage, PreparedAppend};
 use crate::model::{
@@ -67,14 +68,9 @@ fn decode<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, JournalError> {
     serde_json::from_slice(bytes).map_err(|error| JournalError::Invalid(error.to_string()))
 }
 
-/// Stable non-cryptographic corruption checksum; artifact approval hashes remain outside P-05.
+/// Lowercase SHA-256 digest used for frame integrity and idempotency binding.
 fn checksum(bytes: &[u8]) -> String {
-    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
-    for byte in bytes {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    format!("fnv1a64-{hash:016x}")
+    format!("{:x}", Sha256::digest(bytes))
 }
 
 pub fn record_checksum(record: &HostStateRecord) -> Result<String, JournalError> {

@@ -4,12 +4,14 @@ use serde::{Deserialize, Serialize};
 use crate::{BackendError, HostInstallationEpoch, IdempotencyIdentity};
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct StoredEpoch {
     pub host: HostInstallationEpoch,
     pub bytes: Vec<u8>,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DurableImage {
     /// Lossless, ordered journal bytes partitioned by Host epoch. Backends
     /// must preserve these bytes exactly; the reducer owns frame semantics.
@@ -31,6 +33,7 @@ pub struct PreparedAppend {
 
 /// Backend observation for an append that crossed its durable commit boundary.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CommittedAppend {
     pub transaction_id: PlatformHandle,
     pub host: HostInstallationEpoch,
