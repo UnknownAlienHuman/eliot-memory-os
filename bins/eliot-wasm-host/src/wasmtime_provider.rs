@@ -16,6 +16,7 @@ const WASMTIME_VERSION: &str = "47.0.0";
 const WIT_VERSION: &str = "1.0.0";
 const WIT_WORLD: &str = "eliot:wasm/guest";
 const RUN_EXPORT: &str = "run";
+const MAX_EFFECTIVE_EPOCH_DEADLINE: u64 = 1024;
 
 wasmtime::component::bindgen!({
     path: "wit/guest.wit",
@@ -175,8 +176,11 @@ impl WasmtimeComponentEngine {
         let mut instances = 0;
         let fuel_set = store.set_fuel(limits.max_fuel).is_ok();
         let wall_ticks = limits.wall_deadline_ms;
-        let epoch_deadline = limits.epoch.deadline_ticks;
-        store.set_epoch_deadline(epoch_deadline);
+        let effective_epoch_deadline = limits
+            .epoch
+            .deadline_ticks
+            .min(MAX_EFFECTIVE_EPOCH_DEADLINE);
+        store.set_epoch_deadline(effective_epoch_deadline);
         let stop_epoch = Arc::new(AtomicBool::new(false));
         let epoch_stop = Arc::clone(&stop_epoch);
         let wall_interrupted = Arc::new(AtomicBool::new(false));
@@ -190,7 +194,7 @@ impl WasmtimeComponentEngine {
                 thread::sleep(Duration::from_millis(1));
                 if Instant::now() >= wall_deadline {
                     wall_interrupted_thread.store(true, Ordering::Release);
-                    for _ in 0..=epoch_deadline {
+                    for _ in 0..=MAX_EFFECTIVE_EPOCH_DEADLINE {
                         epoch_engine.increment_epoch();
                         observed_epoch_ticks.fetch_add(1, Ordering::AcqRel);
                     }
@@ -456,6 +460,7 @@ mod tests {
 
     #[test]
     fn wall_deadline_interrupts_a_looping_guest() -> Result<(), String> {
+        let started = Instant::now();
         let artifact =
             wat::parse_file("tests/fixtures/guest_loop.wat").map_err(|error| error.to_string())?;
         let digest = Sha256Digest::of_bytes(&artifact);
@@ -463,12 +468,13 @@ mod tests {
             .map_err(|error| error.to_string())?;
         let mut limits = test_limits(digest);
         limits.wall_deadline_ms = 10;
-        limits.epoch.deadline_ticks = 10_000;
+        limits.epoch.deadline_ticks = u64::MAX;
         limits.max_fuel = u64::MAX;
         let report =
             engine.invoke_component(&Sha256Digest::of_bytes(b"deadline"), &limits, b"", true);
         assert_eq!(report.termination, EngineTermination::Deadline);
         assert!(report.usage.epoch_ticks.unwrap_or(0) > 0);
+        assert!(started.elapsed() < Duration::from_secs(2));
         Ok(())
     }
 
