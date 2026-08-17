@@ -1,14 +1,14 @@
 use std::sync::Mutex;
 
 use eliot_platform::PlatformHandle;
-use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::backend::{BackendReconcileState, CommittedAppend, DurableImage, PreparedAppend};
 use crate::model::{
-    AppliedOperation, EpochEvidence, HostInstallationEpoch, HostState, HostStateRecord,
-    IdempotencyIdentity, RecoveryLineageReason, activation_transition, dependency_transition,
-    drain_transition, kernel_transition, wake_transition,
+    activation_transition, dependency_transition, drain_transition, kernel_transition,
+    wake_transition, AppliedOperation, EpochEvidence, HostInstallationEpoch, HostState,
+    HostStateRecord, IdempotencyIdentity, RecoveryLineageReason,
 };
 use crate::{JournalBackend, JournalError, ReconcileOutcome};
 
@@ -125,15 +125,34 @@ fn replay(
 ) -> Result<HostState, JournalError> {
     host.validate()?;
     let mut state = HostState::new(host, retained);
-    replay_frames(bytes, &mut state, |_, _, _| {})?;
+    for frame in scan_frames(bytes)? {
+        apply(
+            &mut state,
+            &frame.record,
+            frame.header.sequence,
+            &frame.header.checksum,
+        )?;
+        state.sequence = frame.header.sequence;
+        state.last_checksum = Some(frame.header.checksum);
+    }
     Ok(state)
 }
 
-fn replay_frames<F>(bytes: &[u8], state: &mut HostState, mut inspect: F) -> Result<(), JournalError>
-where
-    F: FnMut(&[u8], &FrameHeader, &HostStateRecord),
-{
+/// Scans only the durable frame envelope and decodes its record.
+///
+/// This intentionally has no reducer state. Callers that need semantic
+/// validation must do so in their own boundary, and the replay path advances
+/// its reducer only after `apply` succeeds.
+struct ScannedFrame<'a> {
+    raw: &'a [u8],
+    header: FrameHeader,
+    record: HostStateRecord,
+}
+
+fn scan_frames(bytes: &[u8]) -> Result<Vec<ScannedFrame<'_>>, JournalError> {
     let mut offset = 0_usize;
+    let mut expected_sequence = 1_u64;
+    let mut frames = Vec::new();
     while offset < bytes.len() {
         let frame_start = offset;
         let magic_end = offset
@@ -172,21 +191,23 @@ where
                 sequence: header.sequence,
             });
         }
-        let expected = state
-            .sequence
-            .checked_add(1)
-            .ok_or(JournalError::Sequence)?;
-        if header.sequence != expected {
+        if header.sequence != expected_sequence {
             return Err(JournalError::Sequence);
         }
         let record: HostStateRecord = decode(payload)?;
-        inspect(&bytes[frame_start..newline], &header, &record);
-        apply(state, &record, header.sequence, &header.checksum)?;
-        state.sequence = header.sequence;
-        state.last_checksum = Some(header.checksum);
+        frames.push(ScannedFrame {
+            raw: &bytes[frame_start..newline],
+            header,
+            record,
+        });
+        if newline < bytes.len() {
+            expected_sequence = expected_sequence
+                .checked_add(1)
+                .ok_or(JournalError::Sequence)?;
+        }
         offset = newline;
     }
-    Ok(())
+    Ok(frames)
 }
 
 pub(crate) struct FrameBinding {
@@ -200,15 +221,18 @@ pub(crate) fn frame_bindings(
     host: &HostInstallationEpoch,
 ) -> Result<Vec<FrameBinding>, JournalError> {
     host.validate()?;
-    let mut state = HostState::new(host.clone(), Vec::new());
     let mut bindings = Vec::new();
-    replay_frames(epoch_bytes, &mut state, |frame, header, record| {
+    for frame in scan_frames(epoch_bytes)? {
+        frame.record.validate()?;
+        if frame.record.fence().host != *host {
+            return Err(JournalError::StaleFence);
+        }
         bindings.push(FrameBinding {
-            operation: record.operation().clone(),
-            record_checksum: header.checksum.clone(),
-            payload_digest: checksum(frame),
+            operation: frame.record.operation().clone(),
+            record_checksum: frame.header.checksum,
+            payload_digest: checksum(frame.raw),
         });
-    })?;
+    }
     Ok(bindings)
 }
 
@@ -443,6 +467,82 @@ fn load_epochs(
     })
 }
 
+fn validate_committed_receipts(
+    image: &DurableImage,
+    loaded: &LoadedEpochs,
+    requested_host: &HostInstallationEpoch,
+    recovery_reason: Option<RecoveryLineageReason>,
+) -> Result<(), JournalError> {
+    let mut binding_cache: Vec<Option<Vec<FrameBinding>>> =
+        (0..image.epochs.len()).map(|_| None).collect();
+    for receipt in &image.receipts {
+        let mut matching_epoch = None;
+        for (index, epoch) in image.epochs.iter().enumerate() {
+            if epoch.host == receipt.host {
+                if matching_epoch.replace(index).is_some() {
+                    return Err(JournalError::Invalid(
+                        "committed receipt does not name exactly one durable host epoch".into(),
+                    ));
+                }
+            }
+        }
+        let Some(epoch_index) = matching_epoch else {
+            return Err(JournalError::Invalid(
+                "committed receipt does not name exactly one durable host epoch".into(),
+            ));
+        };
+        let mut matching_evidence = None;
+        for evidence in &loaded.evidence {
+            if evidence.host == receipt.host {
+                if matching_evidence.replace(evidence).is_some() {
+                    return Err(JournalError::Invalid(
+                        "committed receipt does not name exactly one epoch evidence record".into(),
+                    ));
+                }
+            }
+        }
+        let Some(evidence) = matching_evidence else {
+            return Err(JournalError::Invalid(
+                "committed receipt does not name exactly one epoch evidence record".into(),
+            ));
+        };
+        if transaction_id_for(&receipt.operation, &receipt.host, &receipt.record_checksum)?
+            != receipt.transaction_id
+        {
+            return Err(JournalError::IdempotencyConflict);
+        }
+        if !evidence.replay_verified {
+            if recovery_reason == Some(RecoveryLineageReason::Corruption)
+                && receipt.host != *requested_host
+            {
+                // The receipt remains retained evidence, but it is not
+                // authoritative and cannot participate in reconciliation for
+                // this newly recovered Host lineage.
+                continue;
+            }
+            return Err(JournalError::Invalid(
+                "committed receipt belongs to an unverified host epoch".into(),
+            ));
+        }
+
+        if binding_cache[epoch_index].is_none() {
+            let epoch = &image.epochs[epoch_index];
+            binding_cache[epoch_index] = Some(frame_bindings(&epoch.bytes, &epoch.host)?);
+        }
+        let bindings = binding_cache[epoch_index]
+            .as_ref()
+            .ok_or_else(|| JournalError::Invalid("missing epoch frame bindings".into()))?;
+        if !bindings.iter().any(|binding| {
+            binding.operation == receipt.operation
+                && binding.record_checksum == receipt.record_checksum
+                && binding.payload_digest == receipt.payload_digest
+        }) {
+            return Err(JournalError::IdempotencyConflict);
+        }
+    }
+    Ok(())
+}
+
 fn state_for_host(
     image: &DurableImage,
     host: &HostInstallationEpoch,
@@ -450,6 +550,7 @@ fn state_for_host(
     let recovery_reason = host.recovery.as_ref().map(|recovery| recovery.reason);
     let tolerate_corruption = recovery_reason == Some(RecoveryLineageReason::Corruption);
     let loaded = load_epochs(image, tolerate_corruption)?;
+    validate_committed_receipts(image, &loaded, host, recovery_reason)?;
     let states = loaded.states;
     let all_evidence = loaded.evidence;
     if let Some(mut current) = states.iter().find(|state| &state.host == host).cloned() {
