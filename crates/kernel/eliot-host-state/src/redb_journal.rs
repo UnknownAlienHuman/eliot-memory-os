@@ -922,8 +922,7 @@ mod tests {
         let bytes = image
             .epochs
             .first()
-            .map(|epoch| epoch.bytes.clone())
-            .unwrap_or_else(|| unreachable!());
+            .map_or_else(|| unreachable!(), |epoch| epoch.bytes.clone());
         (
             PreparedAppend {
                 transaction_id: receipt.transaction_id,
