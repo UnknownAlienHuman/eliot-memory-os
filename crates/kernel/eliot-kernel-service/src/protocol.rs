@@ -1166,6 +1166,10 @@ impl KernelReadyReceipt {
 /// Control messages accepted by the Kernel service boundary.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE", deny_unknown_fields)]
+#[allow(
+    clippy::large_enum_variant,
+    reason = "preserve the established self-describing wire shape for the full Reconcile handshake"
+)]
 pub enum KernelControlCommand {
     /// Begin reconciliation of one Host activation lineage.
     Reconcile(HostKernelHandshake),
