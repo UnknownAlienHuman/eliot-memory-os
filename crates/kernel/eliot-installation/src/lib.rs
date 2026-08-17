@@ -105,6 +105,12 @@ pub enum InstallationError {
     /// The platform contract rejected the request.
     #[error("platform contract: {0}")]
     Platform(String),
+    /// Durable registry bytes are malformed or internally corrupt.
+    #[error("installation registry is corrupt: {reason}")]
+    CorruptRegistry {
+        /// Stable reason for rejecting the registry bytes.
+        reason: String,
+    },
     /// Existing durable installation state requires an explicit re-stage.
     #[error("installation migration required: {reason}")]
     MigrationRequired {
@@ -167,11 +173,40 @@ fn approved_path(value: &PlatformHandle, field: &str) -> Result<(), Installation
             reason: "must not contain parent-directory traversal".to_owned(),
         });
     }
+    if lexical_windows_path(value.as_str()).is_none() {
+        return Err(InstallationError::InvalidField {
+            field: field.to_owned(),
+            reason: "unsupported Windows device or NT path prefix".to_owned(),
+        });
+    }
     Ok(())
 }
 
-fn lexical_windows_path(value: &str) -> String {
-    let value = value.replace('/', "\\");
+fn lexical_windows_path(value: &str) -> Option<String> {
+    let mut value = value.replace('/', "\\");
+    let lower = value.to_ascii_lowercase();
+    if lower.starts_with("\\\\?\\unc\\") {
+        value = format!("\\\\{}", &value[8..]);
+    } else if lower.starts_with("\\\\?\\") {
+        let candidate = value.split_off(4);
+        if candidate.len() < 3
+            || !candidate.as_bytes()[0].is_ascii_alphabetic()
+            || candidate.as_bytes()[1] != b':'
+            || candidate.as_bytes()[2] != b'\\'
+        {
+            return None;
+        }
+        value = candidate;
+    } else if lower.starts_with("\\\\.\\")
+        || lower.starts_with("\\??\\")
+        || lower.starts_with("\\\\??\\")
+        || lower.starts_with("\\device\\")
+        || lower.starts_with("\\\\device\\")
+        || lower.starts_with("\\globalroot\\")
+        || lower.starts_with("\\\\globalroot\\")
+    {
+        return None;
+    }
     let (prefix, body) = if let Some(body) = value.strip_prefix("\\\\") {
         ("\\\\".to_owned(), body.to_owned())
     } else if value.len() >= 3 && value.as_bytes()[1] == b':' && value.as_bytes()[2] == b'\\' {
@@ -195,7 +230,7 @@ fn lexical_windows_path(value: &str) -> String {
     }
     let mut normalized = prefix.to_ascii_lowercase();
     normalized.push_str(&components.join("\\"));
-    normalized
+    Some(normalized)
 }
 
 fn reject_authority_alias(
@@ -203,9 +238,19 @@ fn reject_authority_alias(
     candidate_path: &PlatformHandle,
     candidate_field: &str,
 ) -> Result<(), InstallationError> {
-    if lexical_windows_path(authority_path.as_str())
-        == lexical_windows_path(candidate_path.as_str())
-    {
+    let Some(authority) = lexical_windows_path(authority_path.as_str()) else {
+        return Err(InstallationError::InvalidField {
+            field: "runtime_launch.authority_descriptor_path".to_owned(),
+            reason: "unsupported Windows device or NT path prefix".to_owned(),
+        });
+    };
+    let Some(candidate) = lexical_windows_path(candidate_path.as_str()) else {
+        return Err(InstallationError::InvalidField {
+            field: candidate_field.to_owned(),
+            reason: "unsupported Windows device or NT path prefix".to_owned(),
+        });
+    };
+    if authority == candidate {
         return Err(InstallationError::InvalidField {
             field: "runtime_launch.authority_descriptor_path".to_owned(),
             reason: format!("must not alias {candidate_field}"),
@@ -1258,11 +1303,105 @@ const REGISTRY_TABLE: TableDefinition<&str, &[u8]> =
     TableDefinition::new("eliot_approved_generations_v1");
 const REGISTRY_RELATIVE_PATH: &str = "Eliot/host/installation-registry.redb";
 
+#[allow(
+    dead_code,
+    reason = "legacy wire mirror is used for strict schema discrimination"
+)]
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LegacyRegistryWire {
+    generations: Vec<LegacyApprovedGenerationWire>,
+    active_generation: Option<PlatformHandle>,
+    last_known_good_generation: Option<PlatformHandle>,
+}
+
+#[allow(
+    dead_code,
+    reason = "legacy wire mirror is used for strict schema discrimination"
+)]
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LegacyApprovedGenerationWire {
+    manifest: LegacyCandidateManifestWire,
+    approval_ref: PlatformHandle,
+    active: bool,
+    last_known_good: bool,
+}
+
+#[allow(
+    dead_code,
+    reason = "legacy wire mirror is used for strict schema discrimination"
+)]
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LegacyCandidateManifestWire {
+    generation: PlatformHandle,
+    components: Vec<PlatformHandle>,
+    kernel_artifact_digest: PlatformHandle,
+    store_bridge_artifact_digest: PlatformHandle,
+    canonical_store_artifact_digest: PlatformHandle,
+    kernel_executable_path: PlatformHandle,
+    store_bridge_executable_path: PlatformHandle,
+    canonical_store_executable_path: PlatformHandle,
+    config_path: PlatformHandle,
+    dependency_closure_refs: Vec<PlatformHandle>,
+    license_refs: Vec<PlatformHandle>,
+    config_digest: PlatformHandle,
+    supervision_key_fingerprint: PlatformHandle,
+    signature_ref: PlatformHandle,
+    runtime_launch: LegacyRuntimeLaunchDescriptor,
+}
+
+#[allow(
+    dead_code,
+    reason = "legacy wire mirror is used for strict schema discrimination"
+)]
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LegacyRuntimeLaunchDescriptor {
+    profile: InstallationProfile,
+    portable_root: Option<PlatformHandle>,
+    kernel_work_root: PlatformHandle,
+    kernel_artifact_digest: PlatformHandle,
+    store_config_path: PlatformHandle,
+    store_bridge_executable_path: PlatformHandle,
+    store_bridge_artifact_digest: PlatformHandle,
+    store_bootstrap_descriptor_path: PlatformHandle,
+    store_bootstrap_descriptor_digest: PlatformHandle,
+    canonical_store_executable_path: PlatformHandle,
+    canonical_store_artifact_digest: PlatformHandle,
+    kernel_arguments: Vec<PlatformHandle>,
+    canonical_store_arguments: Vec<PlatformHandle>,
+    watchdog_executable_path: PlatformHandle,
+    watchdog_artifact_digest: PlatformHandle,
+    descriptor_digest: PlatformHandle,
+}
+
 fn decode_registry_bytes(bytes: &[u8]) -> Result<ApprovedGenerationRegistry, InstallationError> {
-    serde_json::from_slice(bytes).map_err(|_| InstallationError::MigrationRequired {
-        reason: "approved-generation registry requires re-stage; legacy launch fields cannot be synthesized"
-            .to_owned(),
-    })
+    match serde_json::from_slice::<ApprovedGenerationRegistry>(bytes) {
+        Ok(registry) => {
+            registry
+                .validate()
+                .map_err(|_| InstallationError::CorruptRegistry {
+                    reason: "current registry projection failed validation".to_owned(),
+                })?;
+            Ok(registry)
+        }
+        Err(_) => {
+            if serde_json::from_slice::<LegacyRegistryWire>(bytes).is_ok() {
+                Err(InstallationError::MigrationRequired {
+                    reason: "approved-generation registry requires re-stage; legacy launch fields cannot be synthesized"
+                        .to_owned(),
+                })
+            } else {
+                Err(InstallationError::CorruptRegistry {
+                    reason:
+                        "registry bytes are neither current nor structurally valid prior-v1 schema"
+                            .to_owned(),
+                })
+            }
+        }
+    }
 }
 
 /// Durable redb owner for approved generations and LKG activation state.
@@ -2596,7 +2735,36 @@ mod tests {
     }
 
     #[test]
-    fn existing_redb_v1_record_requires_migration_instead_of_becoming_empty() {
+    fn lexical_windows_path_unifies_supported_verbatim_aliases_only() {
+        assert_eq!(
+            lexical_windows_path(r"C:\x").as_deref(),
+            lexical_windows_path(r"\\?\C:\x").as_deref()
+        );
+        assert_eq!(
+            lexical_windows_path(r"\\server\share\x").as_deref(),
+            lexical_windows_path(r"\\?\UNC\server\share\x").as_deref()
+        );
+        assert_eq!(
+            lexical_windows_path(r"c:/Root/./Child/").as_deref(),
+            Some(r"c:\root\child")
+        );
+        assert_ne!(
+            lexical_windows_path(r"C:\x").as_deref(),
+            lexical_windows_path(r"C:\x-prefix").as_deref()
+        );
+        assert!(lexical_windows_path(r"\\.\pipe\eliot").is_none());
+        assert!(lexical_windows_path(r"\\?\Volume{abc}\x").is_none());
+        assert!(lexical_windows_path(r"\Device\HarddiskVolume1\x").is_none());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn approved_path_rejects_unsupported_windows_device_prefixes() {
+        assert!(approved_path(&test_handle(r"\\.\pipe\eliot"), "device_path").is_err());
+        assert!(approved_path(&test_handle(r"\\?\Volume{abc}\x"), "device_path").is_err());
+    }
+
+    fn legacy_registry_value() -> serde_json::Value {
         let transaction = registering_transaction();
         let generation = transaction.candidate_manifest.generation.clone();
         let registry = ApprovedGenerationRegistry {
@@ -2624,7 +2792,12 @@ mod tests {
         ] {
             runtime.remove(field);
         }
-        let legacy_bytes = must(serde_json::to_vec(&legacy));
+        legacy
+    }
+
+    #[test]
+    fn existing_redb_v1_record_requires_migration_instead_of_becoming_empty() {
+        let legacy_bytes = must(serde_json::to_vec(&legacy_registry_value()));
 
         let path = std::env::temp_dir().join(format!(
             "eliot-installation-legacy-registry-{}.redb",
@@ -2649,6 +2822,47 @@ mod tests {
         drop(read);
         drop(database);
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn registry_decode_classifies_nonlegacy_bytes_as_corruption() {
+        for bytes in [
+            b"{\"generations\":[".to_vec(),
+            must(serde_json::to_vec(&serde_json::json!([]))),
+            must(serde_json::to_vec(&serde_json::json!({
+                "generations": "wrong"
+            }))),
+            must(serde_json::to_vec(&serde_json::json!({
+                "unrelated": true
+            }))),
+        ] {
+            let Err(error) = decode_registry_bytes(&bytes) else {
+                panic!("corrupt registry must fail closed");
+            };
+            assert!(matches!(error, InstallationError::CorruptRegistry { .. }));
+        }
+
+        let mut current = must(serde_json::to_value(ApprovedGenerationRegistry {
+            generations: vec![ApprovedGeneration {
+                manifest: registering_transaction().candidate_manifest,
+                approval_ref: test_handle("approval:current"),
+                active: true,
+                last_known_good: false,
+            }],
+            active_generation: Some(test_handle("generation:missing")),
+            last_known_good_generation: None,
+        }));
+        let Err(error) = decode_registry_bytes(&must(serde_json::to_vec(&current))) else {
+            panic!("current corruption must fail closed");
+        };
+        assert!(matches!(error, InstallationError::CorruptRegistry { .. }));
+
+        current = legacy_registry_value();
+        current["unrelated"] = serde_json::json!(true);
+        let Err(error) = decode_registry_bytes(&must(serde_json::to_vec(&current))) else {
+            panic!("unknown legacy schema must fail closed");
+        };
+        assert!(matches!(error, InstallationError::CorruptRegistry { .. }));
     }
 
     #[test]
