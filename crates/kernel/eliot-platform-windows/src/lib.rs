@@ -2571,6 +2571,10 @@ impl NamedPipePeerExpectation {
 
     /// Alias for [`Self::new_with_process_identity`] with the policy role
     /// explicit at call sites.
+    ///
+    /// # Errors
+    /// Returns [`WindowsAdapterError::InvalidInput`] when the SID or approved
+    /// process identity is not a usable, handle-derived identity.
     pub fn new_with_approved_process(
         expected_sid: impl Into<String>,
         expected_session_id: u32,
@@ -2600,6 +2604,10 @@ impl NamedPipePeerExpectation {
 
     /// Alias for [`Self::with_process_identity`] that names the policy role
     /// explicitly at call sites.
+    ///
+    /// # Errors
+    /// Returns [`WindowsAdapterError::InvalidInput`] when the approved process
+    /// identity contains an unusable PID, start time, or image path.
     pub fn with_approved_process(
         self,
         approved_process: ProcessIdentity,
@@ -5101,10 +5109,11 @@ fn admit_named_pipe_peer_process(
     observed: &ProcessIdentity,
     expectation: &NamedPipePeerExpectation,
 ) -> Result<(), WindowsAdapterError> {
-    if let Some(approved) = expectation.approved_process() {
-        if approved != observed {
-            return Err(WindowsAdapterError::IdentityMismatch);
-        }
+    if expectation
+        .approved_process()
+        .is_some_and(|approved| approved != observed)
+    {
+        return Err(WindowsAdapterError::IdentityMismatch);
     }
     Ok(())
 }
