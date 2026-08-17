@@ -33,14 +33,15 @@ use eliot_kernel_service::{
 };
 #[cfg(test)]
 use eliot_ors::CanonicalEvidenceProvider;
-use eliot_ors::{OrsCoordinator, RedbRecoveryStore};
+use eliot_ors::{OperationalRecoveryStore, RedbRecoveryStore};
 use eliot_platform::PortError;
 use eliot_platform_windows::{RetainedProcessPathLease, WindowsPlatform};
 use eliot_process::{
     DispatchAuthorityId, DispatchValidationContext, Generation, KernelDispatchKey, PermitIssuance,
     ProcessEvidence, ProcessEvidenceSink, ProcessExecutionAdmissionRequest, ProcessExecutionError,
     ProcessExecutor, ProcessIntent, ProcessLaunchAdmission, ProcessOwnerBinding, ProcessRequest,
-    ProcessSessionBinding, ProcessStartReceipt, SuspendedProcessIdentity, ValidatedDispatch,
+    ProcessSessionBinding, ProcessStartReceipt, SuspendedLaunchEvidence, SuspendedProcessIdentity,
+    ValidatedDispatch,
 };
 use eliot_process_executor::{DispatchValidationPort, WindowsProcessExecutor};
 use eliot_protocol::{EncodingProfile, Frame, FrameKind, MessageType, ProtocolPayload};
@@ -327,6 +328,7 @@ impl ProcessLaunchAdmission for KernelPathAdmission {
         &self,
         request: &ProcessRequest,
         observed: &SuspendedProcessIdentity,
+        launch: &SuspendedLaunchEvidence,
     ) -> Result<(), eliot_process::ContractError> {
         let proofs =
             self.proofs
@@ -341,6 +343,10 @@ impl ProcessLaunchAdmission for KernelPathAdmission {
         if proof.executable.to_string_lossy() != request.executable()
             || proof.working_directory.to_string_lossy() != request.working_directory()
             || observed.executable_sha256() != request.executable_sha256()
+            || launch.requested_executable() != request.executable()
+            || launch.executable_volume_serial_number()
+                != proof.lease.executable_identity().volume_serial_number
+            || launch.executable_file_index() != proof.lease.executable_identity().file_index
         {
             return Err(eliot_process::ContractError::DispatchBindingMismatch);
         }
@@ -614,13 +620,18 @@ fn caller_binding(
         .peer
         .validate()
         .map_err(|_| TransportError::PeerIdentityUnavailable)?;
-    let mut principal = Sha256::new();
-    principal.update(format!("{:?}", session.peer).as_bytes());
-    principal.update(session.module_generation.module_id.as_str().as_bytes());
-    principal.update(session.authority_epoch.to_le_bytes());
     let generation = Generation::new(session.module_generation.generation.value())
         .map_err(|_| TransportError::SessionFenced)?;
-    let principal_digest = format!("{:x}", Sha256::digest(principal.finalize()));
+    let stable_sid = match &session.peer {
+        PeerIdentity::Authenticated { user_identity, .. } => user_identity,
+        PeerIdentity::Unavailable { .. } => return Err(TransportError::PeerIdentityUnavailable),
+    };
+    let principal_digest = stable_owner_principal_digest(
+        stable_sid,
+        session.module_generation.module_id.as_str(),
+        session.authority_epoch,
+        generation,
+    );
     let owner = ProcessOwnerBinding::new(
         session.module_generation.module_id.as_str(),
         principal_digest,
@@ -631,6 +642,20 @@ fn caller_binding(
     let session_binding = ProcessSessionBinding::new(&session.connection_id, session.session_epoch)
         .map_err(|_| TransportError::SessionFenced)?;
     Ok((owner, session_binding))
+}
+
+fn stable_owner_principal_digest(
+    stable_sid: &str,
+    module_id: &str,
+    authority_epoch: u64,
+    generation: Generation,
+) -> String {
+    let mut principal = Sha256::new();
+    principal.update(stable_sid.as_bytes());
+    principal.update(module_id.as_bytes());
+    principal.update(authority_epoch.to_le_bytes());
+    principal.update(generation.get().to_le_bytes());
+    format!("{:x}", Sha256::digest(principal.finalize()))
 }
 
 /// The concrete, non-generic S-03 gateway retained by one Kernel composition.
@@ -731,11 +756,11 @@ impl KernelStoreGateway {
 /// route table.  ORS owns the durable linearization point; this type owns no
 /// mutable store escape and publishes only after that point succeeds.
 struct OrsGenerationCoordinator {
-    ors: OrsCoordinator<RedbRecoveryStore>,
+    ors: Arc<RedbRecoveryStore>,
 }
 
 impl OrsGenerationCoordinator {
-    fn new(ors: OrsCoordinator<RedbRecoveryStore>) -> Self {
+    fn new(ors: Arc<RedbRecoveryStore>) -> Self {
         Self { ors }
     }
 
@@ -867,8 +892,10 @@ impl KernelComposition {
         let platform =
             Arc::new(WindowsPlatform::new(work_root.clone()).map_err(KernelBuildError::Platform)?);
         let ors_path = work_root.join(".eliot").join("kernel-ors.redb");
-        let ors = OrsCoordinator::open(&ors_path)
-            .map_err(|error| KernelBuildError::Ors(error.to_string()))?;
+        let ors = Arc::new(
+            RedbRecoveryStore::open(&ors_path)
+                .map_err(|error| KernelBuildError::Ors(error.to_string()))?,
+        );
         Self::assemble(config, ors, None, platform)
     }
 
@@ -883,15 +910,16 @@ impl KernelComposition {
         let platform =
             Arc::new(WindowsPlatform::new(work_root.clone()).map_err(KernelBuildError::Platform)?);
         let ors_path = work_root.join(".eliot").join("kernel-ors.redb");
-        let ors = OrsCoordinator::open(&ors_path)
-            .map_err(|error| KernelBuildError::Ors(error.to_string()))?;
-        let authority_store = RedbRecoveryStore::open(&ors_path)
-            .map_err(|error| KernelBuildError::Ors(error.to_string()))?;
+        let ors = Arc::new(
+            RedbRecoveryStore::open(&ors_path)
+                .map_err(|error| KernelBuildError::Ors(error.to_string()))?,
+        );
+        let authority_store: Arc<dyn OperationalRecoveryStore> = ors.clone();
         let controller = Arc::new(Mutex::new(
             ProcessDispatchAuthorityController::restore(
                 authority_config.authority_id,
                 authority_config.key,
-                Arc::new(authority_store),
+                authority_store,
                 authority_config.snapshot_codec,
                 &authority_config.snapshot_binding,
             )
@@ -921,7 +949,7 @@ impl KernelComposition {
         let platform =
             Arc::new(WindowsPlatform::new(work_root.clone()).map_err(KernelBuildError::Platform)?);
         let ors_path = work_root.join(".eliot").join("kernel-ors.redb");
-        let ors = OrsCoordinator::new(
+        let ors = Arc::new(
             RedbRecoveryStore::open_with_evidence(&ors_path, evidence)
                 .map_err(|error| KernelBuildError::Ors(error.to_string()))?,
         );
@@ -933,7 +961,7 @@ impl KernelComposition {
     #[allow(clippy::too_many_lines)]
     fn assemble(
         config: KernelConfig,
-        ors: OrsCoordinator<RedbRecoveryStore>,
+        ors: Arc<RedbRecoveryStore>,
         process_gateway: Option<Arc<ProcessExecutionGateway>>,
         platform: Arc<WindowsPlatform>,
     ) -> Result<Self, KernelBuildError> {
@@ -1777,6 +1805,7 @@ mod tests {
         std::fs::create_dir_all(&root).expect("test work root");
         let kernel = KernelComposition::new(KernelConfig::new(&root)).expect("composition");
         assert!(!kernel.process_execution_configured());
+        assert_eq!(Arc::strong_count(&kernel.generation_gateway.ors), 1);
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -1802,6 +1831,40 @@ mod tests {
         .expect("owner");
         for candidate in [wrong_module, wrong_principal, wrong_generation] {
             assert!(authorize_process_owner(&owner, &candidate).is_err());
+        }
+    }
+
+    #[test]
+    fn stable_sid_owner_digest_ignores_process_and_session_replacement() {
+        let generation = Generation::new(7).expect("generation");
+        let first_digest = stable_owner_principal_digest("S-1-5-18", "testd", 3, generation);
+        let restarted_digest = stable_owner_principal_digest("S-1-5-18", "testd", 3, generation);
+        assert_eq!(first_digest, restarted_digest);
+        let first = ProcessOwnerBinding::new("testd", first_digest, 3, generation).expect("owner");
+        let restarted =
+            ProcessOwnerBinding::new("testd", restarted_digest, 3, generation).expect("owner");
+        let first_session = ProcessSessionBinding::new("connection-a", 1).expect("session");
+        let restarted_session = ProcessSessionBinding::new("connection-b", 2).expect("session");
+        assert_ne!(first_session, restarted_session);
+        assert!(authorize_process_owner(&first, &restarted).is_ok());
+
+        for (sid, module, authority, candidate_generation) in [
+            ("S-1-5-19", "testd", 3, generation),
+            ("S-1-5-18", "native", 3, generation),
+            ("S-1-5-18", "testd", 4, generation),
+            (
+                "S-1-5-18",
+                "testd",
+                3,
+                Generation::new(8).expect("generation"),
+            ),
+        ] {
+            let digest =
+                stable_owner_principal_digest(sid, module, authority, candidate_generation);
+            let candidate =
+                ProcessOwnerBinding::new(module, digest, authority, candidate_generation)
+                    .expect("owner");
+            assert!(authorize_process_owner(&first, &candidate).is_err());
         }
     }
 }

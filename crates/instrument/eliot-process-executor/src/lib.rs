@@ -16,7 +16,7 @@ use eliot_process::{
     ExitStatus, OperationId, ProcessEvidence, ProcessEvidenceSink, ProcessExecutionError,
     ProcessExecutionView, ProcessExecutor, ProcessHealth, ProcessHealthStatus, ProcessId,
     ProcessLaunchAdmission, ProcessLifecycle, ProcessRequest, ProcessStartReceipt, ProcessState,
-    SuspendedProcessIdentity, ValidatedDispatch,
+    SuspendedLaunchEvidence, SuspendedProcessIdentity, ValidatedDispatch,
 };
 use sha2::{Digest as _, Sha256};
 use std::collections::BTreeMap;
@@ -482,8 +482,14 @@ impl ProcessExecutor for WindowsProcessExecutor {
             let validated = child
                 .validate(|evidence| {
                     let observed = suspended_identity(&request, evidence)?;
+                    let executable = evidence.executable_file_identity();
+                    let launch = SuspendedLaunchEvidence::new(
+                        evidence.requested_executable().to_string_lossy(),
+                        executable.volume_serial_number,
+                        executable.file_index,
+                    )?;
                     if let Some(admission) = &launch_admission {
-                        admission.validate_launch(&request, &observed)?;
+                        admission.validate_launch(&request, &observed, &launch)?;
                     }
                     authority.validate_and_consume(request, observed)
                 })

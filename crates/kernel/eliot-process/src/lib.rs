@@ -1418,6 +1418,58 @@ pub struct SuspendedProcessIdentity {
     executable_sha256: String,
 }
 
+/// Fresh provider-neutral evidence captured from the suspended child before
+/// any resume effect. The physical identity is intentionally reduced to the
+/// stable file identity fields needed by Kernel admission.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SuspendedLaunchEvidence {
+    requested_executable: String,
+    executable_volume_serial_number: u32,
+    executable_file_index: u64,
+}
+
+impl SuspendedLaunchEvidence {
+    /// Creates exact suspended-child executable evidence.
+    pub fn new(
+        requested_executable: impl Into<String>,
+        executable_volume_serial_number: u32,
+        executable_file_index: u64,
+    ) -> Result<Self, ContractError> {
+        let evidence = Self {
+            requested_executable: requested_executable.into(),
+            executable_volume_serial_number,
+            executable_file_index,
+        };
+        if evidence.requested_executable.trim().is_empty()
+            || evidence.requested_executable.chars().any(char::is_control)
+            || evidence.executable_volume_serial_number == 0
+            || evidence.executable_file_index == 0
+        {
+            return Err(ContractError::InvalidValue {
+                field: "suspended_launch_evidence",
+                reason: "requested path and executable identity must be valid",
+            });
+        }
+        Ok(evidence)
+    }
+
+    /// Returns the exact executable path requested by the suspended child.
+    pub fn requested_executable(&self) -> &str {
+        &self.requested_executable
+    }
+
+    /// Returns the volume serial number observed from the suspended image.
+    pub const fn executable_volume_serial_number(&self) -> u32 {
+        self.executable_volume_serial_number
+    }
+
+    /// Returns the file index observed from the suspended image.
+    pub const fn executable_file_index(&self) -> u64 {
+        self.executable_file_index
+    }
+}
+
 impl SuspendedProcessIdentity {
     /// Creates exact pre-resume identity from fresh retained-handle evidence.
     #[allow(clippy::too_many_arguments)]
@@ -2570,6 +2622,7 @@ pub trait ProcessLaunchAdmission: Send + Sync {
         &self,
         request: &ProcessRequest,
         observed: &SuspendedProcessIdentity,
+        launch: &SuspendedLaunchEvidence,
     ) -> Result<(), ContractError>;
 }
 

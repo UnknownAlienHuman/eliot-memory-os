@@ -4614,7 +4614,7 @@ impl WindowsPlatform {
             let mut executable_options = std::fs::OpenOptions::new();
             executable_options
                 .read(true)
-                .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+                .share_mode(FILE_SHARE_READ)
                 .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
             let mut executable_handle = executable_options
                 .open(executable)
@@ -4725,7 +4725,7 @@ impl RetainedProcessPathLease {
             let mut executable_options = std::fs::OpenOptions::new();
             executable_options
                 .read(true)
-                .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+                .share_mode(FILE_SHARE_READ)
                 .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
             let mut current_executable = executable_options
                 .open(executable)
@@ -7062,8 +7062,17 @@ mod tests {
             .retain_process_path_lease(&executable, &working, &digest)
             .expect("retained launch lease");
 
-        std::fs::write(&executable, b"substituted executable bytes").expect("substitute");
-        assert!(lease.validate(&executable, &working, &digest).is_err());
+        assert!(std::fs::write(&executable, b"substituted executable bytes").is_err());
+        assert!(lease.validate(&executable, &working, &digest).is_ok());
+        assert!(
+            lease
+                .validate(
+                    &executable,
+                    &working,
+                    &sha256_hex(b"substituted executable bytes")
+                )
+                .is_err()
+        );
         assert!(
             lease
                 .validate(&executable, &root.join("other"), &digest)
