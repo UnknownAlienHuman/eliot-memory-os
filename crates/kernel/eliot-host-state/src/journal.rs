@@ -290,6 +290,10 @@ fn apply(
                 state.drain_commit.is_some(),
             )?;
             if new_generation {
+                state.prior_kernel = state.kernel.take().or_else(|| state.prior_kernel.take());
+                state.prior_kernel_unknown = state.prior_kernel_unknown
+                    || (state.prior_kernel.is_none()
+                        && state.retained_epochs.iter().any(|item| !item.retired));
                 state.kernel = None;
                 state.dependencies.clear();
                 state.drain = None;
@@ -307,6 +311,23 @@ fn apply(
                 .ok_or(JournalError::StaleFence)?;
             if &next.activation_identity != activation_identity {
                 return Err(JournalError::StaleFence);
+            }
+            if state.prior_kernel_unknown {
+                return Err(JournalError::Invalid(
+                    "Kernel prior disposition is unknown; manual recovery is required".into(),
+                ));
+            }
+            match state.prior_kernel.as_ref() {
+                None if matches!(
+                    next.prior_kernel_disposition,
+                    crate::PriorKernelDisposition::NoPriorKernel
+                ) => {}
+                Some(prior) if next.prior_kernel_disposition.binds_to(prior) => {}
+                _ => {
+                    return Err(JournalError::Invalid(
+                        "Kernel prior disposition does not bind preserved reducer context".into(),
+                    ));
+                }
             }
             kernel_transition(state.kernel.as_ref(), next)?;
             state.kernel = Some(next.clone());
@@ -580,7 +601,9 @@ fn state_for_host(
         {
             return Err(JournalError::RecoveryRequiresNewEpoch);
         }
-        return Ok(HostState::new(host.clone(), all_evidence));
+        let mut recovered = HostState::new(host.clone(), all_evidence);
+        recovered.prior_kernel_unknown = true;
+        return Ok(recovered);
     }
     if host.recovery.is_some() {
         return Err(JournalError::RecoveryRequiresNewEpoch);
@@ -602,7 +625,13 @@ fn state_for_host(
     {
         return Err(JournalError::RecoveryRequiresNewEpoch);
     }
-    Ok(HostState::new(host.clone(), all_evidence))
+    let mut next = HostState::new(host.clone(), all_evidence);
+    next.prior_kernel = parent
+        .kernel
+        .clone()
+        .or_else(|| parent.prior_kernel.clone());
+    next.prior_kernel_unknown = parent.prior_kernel_unknown;
+    Ok(next)
 }
 
 fn validate_committed_append(
@@ -687,11 +716,22 @@ impl<B: JournalBackend> HostStateJournal<B> {
     /// Returns durable prepared transaction descriptors without attempting to
     /// replay, retry, or otherwise deliver any transaction.
     pub fn pending_transactions(&self) -> Result<Vec<PreparedAppend>, JournalError> {
-        self.backend
+        let host = self
+            .state
+            .lock()
+            .map_err(|_| JournalError::Synchronization)?
+            .host
+            .clone();
+        let pending = self
+            .backend
             .lock()
             .map_err(|_| JournalError::Synchronization)?
             .prepared_appends()
-            .map_err(map_backend_error)
+            .map_err(map_backend_error)?;
+        if pending.iter().any(|item| item.host != host) {
+            return Err(JournalError::StaleFence);
+        }
+        Ok(pending)
     }
 
     #[allow(clippy::needless_pass_by_value)]

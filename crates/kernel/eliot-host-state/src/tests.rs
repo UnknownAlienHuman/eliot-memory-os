@@ -94,8 +94,8 @@ fn resource_budget() -> DependencyResourceBudget {
 
 fn ready_kernel_process() -> ServiceProcessRecord {
     serde_json::from_value(json!({
-        "process_id": "kernel-process-lineage",
-        "owner": "Host",
+        "process_id": "1001",
+        "owner": "Kernel",
         "state": "READY",
         "health": {
             "liveness": "HEALTHY",
@@ -117,20 +117,24 @@ fn stopped_kernel_process() -> ServiceProcessRecord {
     process
 }
 
-fn terminated_prior(
-    history_complete: bool,
-    members: Vec<PlatformHandle>,
-) -> PriorKernelDisposition {
+fn terminated_prior(history_complete: bool, members: &[PlatformHandle]) -> PriorKernelDisposition {
     PriorKernelDisposition::Terminated(PriorKernelSource {
+        host: host(1),
+        activation_identity: h("activation-one"),
         generation: step("prior-kernel-lineage", 1),
         job: KernelJobBinding {
-            job_identity: h("prior-kernel-job"),
-            root_process_identity: h("prior-kernel-root"),
-            member_processes: members,
-            root_reaped: true,
+            job_name: h("prior-kernel-job"),
+            owner: h("Kernel"),
+            root_pid: 1001,
+            root_start_time_100ns: 10,
+            root_image_path: h("C:/eliot-kernel.exe"),
+            root_volume_serial_number: 1,
+            root_file_index: 1,
         },
         process: stopped_kernel_process(),
         history_complete,
+        job_empty: members.is_empty(),
+        root_reaped: true,
     })
 }
 
@@ -149,10 +153,13 @@ fn kernel_record(
             | KernelActivationState::Activating
     );
     let live_job = KernelJobBinding {
-        job_identity: h("kernel-job"),
-        root_process_identity: h("kernel-root"),
-        member_processes: vec![h("kernel-root")],
-        root_reaped: false,
+        job_name: h("kernel-job"),
+        owner: h("Kernel"),
+        root_pid: 1001,
+        root_start_time_100ns: 10,
+        root_image_path: h("C:/eliot-kernel.exe"),
+        root_volume_serial_number: 1,
+        root_file_index: 1,
     };
     KernelRecord {
         fence: fence(host, generation),
@@ -737,6 +744,32 @@ fn prepared_transaction_enumerates_and_survives_reopen_without_retry() {
 }
 
 #[test]
+fn foreign_prepared_transaction_fails_closed_on_enumeration() {
+    let foreign_host = recovery_host(RecoveryLineageReason::Restore, "foreign-lineage");
+    let generation = step("activation-lineage", 1);
+    let foreign = HostStateJournal::open(
+        MemoryBackend::with_fault(FaultPoint::AppendFailed),
+        foreign_host.clone(),
+    )
+    .unwrap_or_else(|_| unreachable!());
+    assert!(matches!(
+        foreign.append(activation(
+            &foreign_host,
+            &generation,
+            "foreign-prepared",
+            ActivationState::Starting,
+        )),
+        Err(JournalError::Backend(BackendError::Failed(_)))
+    ));
+    let backend = foreign.into_backend().unwrap_or_else(|_| unreachable!());
+    let current = HostStateJournal::open(backend, host(1)).unwrap_or_else(|_| unreachable!());
+    assert_eq!(
+        current.pending_transactions(),
+        Err(JournalError::StaleFence)
+    );
+}
+
+#[test]
 fn backend_failures_are_not_misreported_as_unknown_outcomes() {
     let host = host(1);
     let generation = step("activation-lineage", 1);
@@ -1279,7 +1312,6 @@ fn kernel_record_requires_approved_artifact_explicit_pipes_and_active_evidence()
     for missing in [
         "approved_artifact_hash",
         "active_pipe_identity",
-        "candidate_job_binding",
         "prior_kernel_disposition",
     ] {
         let mut value = encoded.clone();
@@ -1332,29 +1364,43 @@ fn kernel_old_terminated_rejects_opaque_or_incomplete_disposition() {
     let (journal, host, generation) = active_journal();
     let mut cases = vec![
         PriorKernelDisposition::Running(PriorKernelSource {
+            host: crate::tests::host(1),
+            activation_identity: h("activation-one"),
             generation: step("prior-kernel-lineage", 1),
             job: KernelJobBinding {
-                job_identity: h("prior-kernel-job"),
-                root_process_identity: h("prior-kernel-root"),
-                member_processes: vec![h("prior-kernel-root")],
-                root_reaped: false,
+                job_name: h("prior-kernel-job"),
+                owner: h("Kernel"),
+                root_pid: 1001,
+                root_start_time_100ns: 10,
+                root_image_path: h("C:/eliot-kernel.exe"),
+                root_volume_serial_number: 1,
+                root_file_index: 1,
             },
             process: ready_kernel_process(),
             history_complete: true,
+            job_empty: false,
+            root_reaped: false,
         }),
         PriorKernelDisposition::Unknown(PriorKernelSource {
+            host: crate::tests::host(1),
+            activation_identity: h("activation-one"),
             generation: step("prior-kernel-lineage", 1),
             job: KernelJobBinding {
-                job_identity: h("prior-kernel-job"),
-                root_process_identity: h("prior-kernel-root"),
-                member_processes: vec![],
-                root_reaped: true,
+                job_name: h("prior-kernel-job"),
+                owner: h("Kernel"),
+                root_pid: 1001,
+                root_start_time_100ns: 10,
+                root_image_path: h("C:/eliot-kernel.exe"),
+                root_volume_serial_number: 1,
+                root_file_index: 1,
             },
             process: stopped_kernel_process(),
             history_complete: false,
+            job_empty: true,
+            root_reaped: true,
         }),
-        terminated_prior(false, vec![]),
-        terminated_prior(true, vec![h("prior-kernel-root")]),
+        terminated_prior(false, &[]),
+        terminated_prior(true, &[h("prior-kernel-root")]),
     ];
     for (index, disposition) in cases.drain(..).enumerate() {
         let mut record = kernel_record(
@@ -1377,15 +1423,22 @@ fn kernel_old_terminated_rejects_opaque_or_incomplete_disposition() {
         KernelActivationState::OldTerminated,
     );
     opaque_only.prior_kernel_disposition = PriorKernelDisposition::Unknown(PriorKernelSource {
+        host: crate::tests::host(1),
+        activation_identity: h("activation-one"),
         generation: step("prior-kernel-lineage", 1),
         job: KernelJobBinding {
-            job_identity: h("prior-kernel-job"),
-            root_process_identity: h("prior-kernel-root"),
-            member_processes: vec![],
-            root_reaped: true,
+            job_name: h("prior-kernel-job"),
+            owner: h("Kernel"),
+            root_pid: 1001,
+            root_start_time_100ns: 10,
+            root_image_path: h("C:/eliot-kernel.exe"),
+            root_volume_serial_number: 1,
+            root_file_index: 1,
         },
         process: stopped_kernel_process(),
         history_complete: true,
+        job_empty: true,
+        root_reaped: true,
     });
     opaque_only.disposition_evidence = vec![h("looks-like-proof")];
     assert!(
@@ -1460,6 +1513,214 @@ fn kernel_nonce_is_absent_until_old_terminated_and_retained_through_active() {
 }
 
 #[test]
+fn kernel_active_transition_rejects_nonce_job_and_process_substitution() {
+    let (journal, host, generation) = active_journal();
+    for (state, op) in [
+        (KernelActivationState::Idle, "binding-idle"),
+        (KernelActivationState::ShadowNoAuthority, "binding-shadow"),
+        (KernelActivationState::HandoffPrepared, "binding-prepared"),
+        (KernelActivationState::OldTerminated, "binding-terminated"),
+        (KernelActivationState::NonceIssued, "binding-nonce"),
+        (KernelActivationState::Activating, "binding-activating"),
+    ] {
+        journal
+            .append(HostStateRecord::Kernel(kernel_record(
+                &host,
+                &generation,
+                op,
+                state,
+            )))
+            .unwrap_or_else(|error| panic!("Kernel setup failed: {error}"));
+    }
+
+    let mut wrong_nonce = kernel_record(
+        &host,
+        &generation,
+        "binding-wrong-nonce",
+        KernelActivationState::Active,
+    );
+    wrong_nonce.one_time_nonce.nonce_ref = Some(h("substituted-nonce"));
+    assert!(matches!(
+        journal.append(HostStateRecord::Kernel(wrong_nonce)),
+        Err(JournalError::Invalid(_))
+    ));
+
+    let mut wrong_job = kernel_record(
+        &host,
+        &generation,
+        "binding-wrong-job",
+        KernelActivationState::Active,
+    );
+    wrong_job
+        .candidate_job_binding
+        .as_mut()
+        .unwrap_or_else(|| unreachable!())
+        .job_name = h("substituted-job");
+    assert!(matches!(
+        journal.append(HostStateRecord::Kernel(wrong_job)),
+        Err(JournalError::StaleFence | JournalError::Invalid(_))
+    ));
+
+    let mut wrong_process = kernel_record(
+        &host,
+        &generation,
+        "binding-wrong-process",
+        KernelActivationState::Active,
+    );
+    wrong_process
+        .process
+        .as_mut()
+        .unwrap_or_else(|| unreachable!())
+        .process_id = "2002".into();
+    assert!(matches!(
+        journal.append(HostStateRecord::Kernel(wrong_process)),
+        Err(JournalError::Invalid(_))
+    ));
+}
+
+#[test]
+fn new_activation_generation_rejects_no_prior_after_previous_kernel() {
+    let (journal, host, generation) = active_journal();
+    for (state, op) in [
+        (KernelActivationState::Idle, "prior-idle"),
+        (KernelActivationState::ShadowNoAuthority, "prior-shadow"),
+        (KernelActivationState::HandoffPrepared, "prior-prepared"),
+        (KernelActivationState::OldTerminated, "prior-terminated"),
+        (KernelActivationState::NonceIssued, "prior-nonce"),
+        (KernelActivationState::Activating, "prior-activating"),
+        (KernelActivationState::Active, "prior-active"),
+    ] {
+        journal
+            .append(HostStateRecord::Kernel(kernel_record(
+                &host,
+                &generation,
+                op,
+                state,
+            )))
+            .unwrap_or_else(|error| panic!("prior Kernel transition failed: {error}"));
+    }
+    let mut recovery = activation(
+        &host,
+        &generation,
+        "activation-recovery",
+        ActivationState::DegradedRecovery,
+    );
+    if let HostStateRecord::Activation(record) = &mut recovery {
+        record.failure_and_recovery_directive = Some(FailureRecoveryDirective {
+            failure_ref: h("failure"),
+            recovery_owner: h("host"),
+            directive: h("recover-forward"),
+        });
+    }
+    journal
+        .append(recovery)
+        .unwrap_or_else(|error| panic!("activation recovery failed: {error}"));
+    let next_generation = step("activation-lineage", 2);
+    journal
+        .append(activation(
+            &host,
+            &next_generation,
+            "activation-next-generation",
+            ActivationState::Starting,
+        ))
+        .unwrap_or_else(|error| panic!("activation cutover failed: {error}"));
+    assert!(matches!(
+        journal.append(HostStateRecord::Kernel(kernel_record(
+            &host,
+            &next_generation,
+            "next-no-prior",
+            KernelActivationState::Idle,
+        ))),
+        Err(JournalError::Invalid(_))
+    ));
+}
+
+#[test]
+fn direct_child_reopen_requires_and_accepts_exact_prior_kernel_source() {
+    let (journal, parent_host, parent_generation) = active_journal();
+    for (state, op) in [
+        (KernelActivationState::Idle, "child-parent-idle"),
+        (
+            KernelActivationState::ShadowNoAuthority,
+            "child-parent-shadow",
+        ),
+        (
+            KernelActivationState::HandoffPrepared,
+            "child-parent-prepared",
+        ),
+        (
+            KernelActivationState::OldTerminated,
+            "child-parent-terminated",
+        ),
+        (KernelActivationState::NonceIssued, "child-parent-nonce"),
+        (KernelActivationState::Activating, "child-parent-activating"),
+        (KernelActivationState::Active, "child-parent-active"),
+    ] {
+        journal
+            .append(HostStateRecord::Kernel(kernel_record(
+                &parent_host,
+                &parent_generation,
+                op,
+                state,
+            )))
+            .unwrap_or_else(|error| panic!("parent Kernel setup failed: {error}"));
+    }
+    let prior = journal
+        .snapshot()
+        .unwrap_or_else(|_| unreachable!())
+        .kernel
+        .unwrap_or_else(|| unreachable!());
+    let job = prior
+        .candidate_job_binding
+        .clone()
+        .unwrap_or_else(|| unreachable!());
+    let mut stopped = ready_kernel_process();
+    stopped.state = eliot_runtime_contracts::ServiceProcessState::Stopped;
+    stopped.health.liveness = HealthDimension::Unknown;
+    let disposition = PriorKernelDisposition::Terminated(PriorKernelSource {
+        host: prior.fence.host.clone(),
+        activation_identity: prior.activation_identity.clone(),
+        generation: prior.kernel_generation.clone(),
+        job,
+        process: stopped,
+        history_complete: true,
+        job_empty: true,
+        root_reaped: true,
+    });
+    let backend = journal.into_backend().unwrap_or_else(|_| unreachable!());
+    let child_host = HostInstallationEpoch {
+        installation: parent_host.installation.clone(),
+        epoch: EpochTransition {
+            current: epoch("host-lineage", 2),
+            parent: Some(epoch("host-lineage", 1)),
+        },
+        nonce: h("nonce-child"),
+        recovery: None,
+    };
+    let child = HostStateJournal::open(backend, child_host.clone())
+        .unwrap_or_else(|error| panic!("child reopen failed: {error}"));
+    let child_generation = step("activation-lineage", 2);
+    child
+        .append(activation(
+            &child_host,
+            &child_generation,
+            "child-activation",
+            ActivationState::Starting,
+        ))
+        .unwrap_or_else(|error| panic!("child activation failed: {error}"));
+    let mut child_idle = kernel_record(
+        &child_host,
+        &child_generation,
+        "child-kernel-idle",
+        KernelActivationState::Idle,
+    );
+    child_idle.prior_kernel_disposition = disposition;
+    child
+        .append(HostStateRecord::Kernel(child_idle))
+        .unwrap_or_else(|error| panic!("exact prior source was rejected: {error}"));
+}
+
+#[test]
 fn kernel_append_must_bind_current_eliot_activation_identity() {
     let (journal, host, generation) = active_journal();
     let mut kernel = kernel_record(
@@ -1487,10 +1748,13 @@ fn kernel_transition_matrix_rejects_activation_without_handoff() {
         active_pipe_identity: h("kernel-stable-pipe"),
         candidate_pipe_identity: Some(h("kernel-candidate-pipe")),
         candidate_job_binding: Some(KernelJobBinding {
-            job_identity: h("kernel-job"),
-            root_process_identity: h("kernel-root"),
-            member_processes: vec![h("kernel-root")],
-            root_reaped: false,
+            job_name: h("kernel-job"),
+            owner: h("Kernel"),
+            root_pid: 1001,
+            root_start_time_100ns: 10,
+            root_image_path: h("C:/eliot-kernel.exe"),
+            root_volume_serial_number: 1,
+            root_file_index: 1,
         }),
         prior_kernel_disposition: PriorKernelDisposition::NoPriorKernel,
         kernel_generation: step("kernel-lineage", 1),

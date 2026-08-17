@@ -390,40 +390,34 @@ pub enum NonceState {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct KernelJobBinding {
-    pub job_identity: PlatformHandle,
-    pub root_process_identity: PlatformHandle,
-    pub member_processes: Vec<PlatformHandle>,
-    pub root_reaped: bool,
+    pub job_name: PlatformHandle,
+    pub owner: PlatformHandle,
+    pub root_pid: u32,
+    pub root_start_time_100ns: u64,
+    pub root_image_path: PlatformHandle,
+    pub root_volume_serial_number: u32,
+    pub root_file_index: u64,
 }
 
 impl KernelJobBinding {
     fn validate(&self) -> Result<(), JournalError> {
-        handle(&self.job_identity, "kernel.job_binding.job_identity")?;
-        handle(
-            &self.root_process_identity,
-            "kernel.job_binding.root_process_identity",
-        )?;
-        handles(
-            &self.member_processes,
-            "kernel.job_binding.member_processes",
-            false,
-        )?;
-        if self.root_reaped {
-            if self.member_processes.contains(&self.root_process_identity) {
-                return Err(JournalError::Invalid(
-                    "reaped Kernel root must not remain a Job member".into(),
-                ));
-            }
-        } else if !self.member_processes.contains(&self.root_process_identity) {
+        handle(&self.job_name, "kernel.job_binding.job_name")?;
+        handle(&self.owner, "kernel.job_binding.owner")?;
+        if self.root_pid == 0 || self.root_start_time_100ns == 0 {
             return Err(JournalError::Invalid(
-                "live Kernel Job binding must contain its root process".into(),
+                "Kernel Job binding requires non-zero PID and start time".into(),
+            ));
+        }
+        handle(&self.root_image_path, "kernel.job_binding.root_image_path")?;
+        if self.root_image_path.as_str().encode_utf16().count() > 32_767
+            || self.root_file_index == 0
+            || self.root_volume_serial_number == 0
+        {
+            return Err(JournalError::Invalid(
+                "Kernel Job binding has invalid image/file identity".into(),
             ));
         }
         Ok(())
-    }
-
-    fn is_terminal(&self) -> bool {
-        self.root_reaped && self.member_processes.is_empty()
     }
 }
 
@@ -431,23 +425,43 @@ impl KernelJobBinding {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PriorKernelSource {
+    pub host: HostInstallationEpoch,
+    pub activation_identity: PlatformHandle,
     pub generation: EpochTransition,
     pub job: KernelJobBinding,
     pub process: ServiceProcessRecord,
     pub history_complete: bool,
+    pub job_empty: bool,
+    pub root_reaped: bool,
 }
 
 impl PriorKernelSource {
     fn validate(&self) -> Result<(), JournalError> {
+        self.host.validate()?;
+        handle(
+            &self.activation_identity,
+            "prior_kernel.activation_identity",
+        )?;
         self.generation.validate()?;
         self.job.validate()?;
         self.process
             .validate()
-            .map_err(|error| JournalError::Invalid(error.to_string()))
+            .map_err(|error| JournalError::Invalid(error.to_string()))?;
+        if self.process.owner != self.job.owner.as_str()
+            || self.process.process_id != self.job.root_pid.to_string()
+        {
+            return Err(JournalError::Invalid(
+                "prior Kernel process does not match its Job root binding".into(),
+            ));
+        }
+        Ok(())
     }
 
     fn is_fully_terminated(&self) -> bool {
-        self.history_complete && self.process.state.is_terminal() && self.job.is_terminal()
+        self.history_complete
+            && self.job_empty
+            && self.root_reaped
+            && self.process.state.is_terminal()
     }
 }
 
@@ -478,6 +492,19 @@ impl PriorKernelDisposition {
             Self::Terminated(source) => source.is_fully_terminated(),
             Self::Running(_) | Self::Unknown(_) => false,
         }
+    }
+
+    pub(crate) fn binds_to(&self, prior: &KernelRecord) -> bool {
+        let source = match self {
+            Self::Terminated(source) | Self::Running(source) | Self::Unknown(source) => source,
+            Self::NoPriorKernel => return false,
+        };
+        prior.candidate_job_binding.as_ref().is_some_and(|job| {
+            source.host == prior.fence.host
+                && source.activation_identity == prior.activation_identity
+                && source.generation == prior.kernel_generation
+                && source.job == *job
+        })
     }
 }
 
@@ -620,9 +647,12 @@ impl KernelRecord {
                     "activating/active Kernel requires a candidate Job binding".into(),
                 ));
             };
-            if binding.root_reaped || binding.member_processes.is_empty() {
+            if let Some(process) = &self.process
+                && (process.owner != binding.owner.as_str()
+                    || process.process_id != binding.root_pid.to_string())
+            {
                 return Err(JournalError::Invalid(
-                    "activating/active Kernel requires a live non-empty Job binding".into(),
+                    "Kernel process does not match candidate Job root".into(),
                 ));
             }
         }
@@ -1108,6 +1138,13 @@ pub struct HostState {
     pub last_checksum: Option<String>,
     pub activation: Option<EliotActivationRecord>,
     pub kernel: Option<KernelRecord>,
+    /// Exact previous-generation Kernel projection retained across a Host
+    /// activation-generation cutover. This is reducer context, not caller
+    /// supplied disposition evidence.
+    pub prior_kernel: Option<KernelRecord>,
+    /// Retained/recovered evidence exists, but no exact prior Kernel record
+    /// was available. Kernel authority must remain fenced in this state.
+    pub prior_kernel_unknown: bool,
     pub dependencies: Vec<DependencyRecord>,
     pub drain: Option<DrainRecord>,
     pub drain_commit: Option<DrainCommitRecord>,
@@ -1127,6 +1164,8 @@ impl HostState {
             last_checksum: None,
             activation: None,
             kernel: None,
+            prior_kernel: None,
+            prior_kernel_unknown: false,
             dependencies: Vec::new(),
             drain: None,
             drain_commit: None,
