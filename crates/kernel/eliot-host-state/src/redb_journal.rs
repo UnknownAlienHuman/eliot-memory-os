@@ -3,7 +3,7 @@
 use std::path::{Path, PathBuf};
 
 use eliot_platform::{PlatformHandle, UnknownReason};
-use eliot_platform_windows::{require_protected_program_data_path, ProtectedPathLease};
+use eliot_platform_windows::{ProtectedPathLease, require_protected_program_data_path};
 use redb::{Database, ReadTransaction, ReadableDatabase, ReadableTable, TableDefinition};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};

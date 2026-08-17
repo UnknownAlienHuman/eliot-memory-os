@@ -1,14 +1,14 @@
 use std::sync::Mutex;
 
 use eliot_platform::PlatformHandle;
-use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use sha2::{Digest, Sha256};
 
 use crate::backend::{BackendReconcileState, CommittedAppend, DurableImage, PreparedAppend};
 use crate::model::{
-    activation_transition, dependency_transition, drain_transition, kernel_transition,
-    wake_transition, AppliedOperation, EpochEvidence, HostInstallationEpoch, HostState,
-    HostStateRecord, IdempotencyIdentity, RecoveryLineageReason,
+    AppliedOperation, EpochEvidence, HostInstallationEpoch, HostState, HostStateRecord,
+    IdempotencyIdentity, RecoveryLineageReason, activation_transition, dependency_transition,
+    drain_transition, kernel_transition, wake_transition,
 };
 use crate::{JournalBackend, JournalError, ReconcileOutcome};
 
