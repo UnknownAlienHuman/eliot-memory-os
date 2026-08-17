@@ -5,11 +5,28 @@ use eliot_runtime_contracts::{
     HealthDimension, KernelActivationState, ServiceProcessRecord, WakeIntent,
 };
 use serde_json::json;
+use sha2::{Digest, Sha256};
 
 use crate::*;
 
 fn h(value: &str) -> PlatformHandle {
     PlatformHandle::new(value).unwrap_or_else(|_| unreachable!())
+}
+
+fn raw_frame(sequence: u64, payload: &[u8]) -> Vec<u8> {
+    let header = json!({
+        "version": JOURNAL_VERSION,
+        "sequence": sequence,
+        "length": payload.len(),
+        "checksum": format!("{:x}", Sha256::digest(payload)),
+    });
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(JOURNAL_MAGIC);
+    bytes.extend_from_slice(&serde_json::to_vec(&header).unwrap_or_else(|_| unreachable!()));
+    bytes.push(b'\n');
+    bytes.extend_from_slice(payload);
+    bytes.push(b'\n');
+    bytes
 }
 
 fn epoch(lineage: &str, sequence: u64) -> EpochIdentity {
@@ -94,7 +111,7 @@ fn resource_budget() -> DependencyResourceBudget {
 
 fn ready_kernel_process() -> ServiceProcessRecord {
     serde_json::from_value(json!({
-        "process_id": "1001",
+        "process_id": "pid:1001:start:10",
         "owner": "Kernel",
         "state": "READY",
         "health": {
@@ -1360,6 +1377,67 @@ fn kernel_record_requires_approved_artifact_explicit_pipes_and_active_evidence()
 }
 
 #[test]
+fn legacy_kernel_frame_missing_new_fields_fails_same_host_replay() {
+    let host = host(1);
+    let generation = step("activation-lineage", 1);
+    let mut value = serde_json::to_value(HostStateRecord::Kernel(kernel_record(
+        &host,
+        &generation,
+        "legacy-kernel-frame",
+        KernelActivationState::Idle,
+    )))
+    .unwrap_or_else(|_| unreachable!());
+    value
+        .get_mut("kernel")
+        .and_then(serde_json::Value::as_object_mut)
+        .unwrap_or_else(|| unreachable!())
+        .remove("prior_kernel_disposition");
+    let payload = serde_json::to_vec(&value).unwrap_or_else(|_| unreachable!());
+    assert!(matches!(
+        HostStateJournal::<MemoryBackend>::replay_bytes(&raw_frame(1, &payload), host),
+        Err(JournalError::Invalid(_))
+    ));
+}
+
+#[test]
+fn corruption_recovery_fences_kernel_without_exact_prior_source() {
+    let old_host = host(1);
+    let generation = step("activation-lineage", 1);
+    let journal = HostStateJournal::open(MemoryBackend::default(), old_host.clone())
+        .unwrap_or_else(|_| unreachable!());
+    journal
+        .append(activation(
+            &old_host,
+            &generation,
+            "corruption-source",
+            ActivationState::Starting,
+        ))
+        .unwrap_or_else(|_| unreachable!());
+    let mut backend = journal.into_backend().unwrap_or_else(|_| unreachable!());
+    backend.corrupt_epoch_for_test(0);
+    let recovered_host = recovery_host(RecoveryLineageReason::Corruption, "recovered-lineage");
+    let recovered = HostStateJournal::open(backend, recovered_host.clone())
+        .unwrap_or_else(|error| panic!("corruption recovery open failed: {error}"));
+    recovered
+        .append(activation(
+            &recovered_host,
+            &generation,
+            "recovered-activation",
+            ActivationState::Starting,
+        ))
+        .unwrap_or_else(|_| unreachable!());
+    assert!(matches!(
+        recovered.append(HostStateRecord::Kernel(kernel_record(
+            &recovered_host,
+            &generation,
+            "recovered-kernel",
+            KernelActivationState::Idle,
+        ))),
+        Err(JournalError::Invalid(_))
+    ));
+}
+
+#[test]
 fn kernel_old_terminated_rejects_opaque_or_incomplete_disposition() {
     let (journal, host, generation) = active_journal();
     let mut cases = vec![
@@ -1472,6 +1550,20 @@ fn kernel_nonce_is_absent_until_old_terminated_and_retained_through_active() {
         "nonce-issued",
         KernelActivationState::NonceIssued,
     );
+    let mut nonce_with_job = nonce_issued.clone();
+    nonce_with_job.candidate_job_binding = Some(KernelJobBinding {
+        job_name: h("substituted-job"),
+        owner: h("Kernel"),
+        root_pid: 1001,
+        root_start_time_100ns: 10,
+        root_image_path: h("C:/eliot-kernel.exe"),
+        root_volume_serial_number: 1,
+        root_file_index: 1,
+    });
+    assert!(matches!(
+        journal.append(HostStateRecord::Kernel(nonce_with_job)),
+        Err(JournalError::Invalid(_))
+    ));
     let nonce = nonce_issued
         .one_time_nonce
         .nonce_ref
@@ -1513,6 +1605,7 @@ fn kernel_nonce_is_absent_until_old_terminated_and_retained_through_active() {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)]
 fn kernel_active_transition_rejects_nonce_job_and_process_substitution() {
     let (journal, host, generation) = active_journal();
     for (state, op) in [
@@ -1561,6 +1654,54 @@ fn kernel_active_transition_rejects_nonce_job_and_process_substitution() {
         Err(JournalError::StaleFence | JournalError::Invalid(_))
     ));
 
+    let mut wrong_start = kernel_record(
+        &host,
+        &generation,
+        "binding-wrong-start",
+        KernelActivationState::Active,
+    );
+    wrong_start
+        .candidate_job_binding
+        .as_mut()
+        .unwrap_or_else(|| unreachable!())
+        .root_start_time_100ns = 11;
+    assert!(matches!(
+        journal.append(HostStateRecord::Kernel(wrong_start)),
+        Err(JournalError::StaleFence | JournalError::Invalid(_))
+    ));
+
+    let mut wrong_image = kernel_record(
+        &host,
+        &generation,
+        "binding-wrong-image",
+        KernelActivationState::Active,
+    );
+    wrong_image
+        .candidate_job_binding
+        .as_mut()
+        .unwrap_or_else(|| unreachable!())
+        .root_image_path = h("C:/substituted-kernel.exe");
+    assert!(matches!(
+        journal.append(HostStateRecord::Kernel(wrong_image)),
+        Err(JournalError::StaleFence | JournalError::Invalid(_))
+    ));
+
+    let mut wrong_file = kernel_record(
+        &host,
+        &generation,
+        "binding-wrong-file",
+        KernelActivationState::Active,
+    );
+    wrong_file
+        .candidate_job_binding
+        .as_mut()
+        .unwrap_or_else(|| unreachable!())
+        .root_file_index = 2;
+    assert!(matches!(
+        journal.append(HostStateRecord::Kernel(wrong_file)),
+        Err(JournalError::StaleFence | JournalError::Invalid(_))
+    ));
+
     let mut wrong_process = kernel_record(
         &host,
         &generation,
@@ -1571,7 +1712,7 @@ fn kernel_active_transition_rejects_nonce_job_and_process_substitution() {
         .process
         .as_mut()
         .unwrap_or_else(|| unreachable!())
-        .process_id = "2002".into();
+        .process_id = "pid:2002:start:10".into();
     assert!(matches!(
         journal.append(HostStateRecord::Kernel(wrong_process)),
         Err(JournalError::Invalid(_))
@@ -1624,15 +1765,19 @@ fn new_activation_generation_rejects_no_prior_after_previous_kernel() {
             ActivationState::Starting,
         ))
         .unwrap_or_else(|error| panic!("activation cutover failed: {error}"));
-    assert!(matches!(
-        journal.append(HostStateRecord::Kernel(kernel_record(
-            &host,
-            &next_generation,
-            "next-no-prior",
-            KernelActivationState::Idle,
-        ))),
-        Err(JournalError::Invalid(_))
-    ));
+    let error = journal.append(HostStateRecord::Kernel(kernel_record(
+        &host,
+        &next_generation,
+        "next-no-prior",
+        KernelActivationState::Idle,
+    )));
+    assert!(
+        matches!(
+            error,
+            Err(JournalError::Invalid(_) | JournalError::StaleFence)
+        ),
+        "{error:?}"
+    );
 }
 
 #[test]
@@ -1714,7 +1859,15 @@ fn direct_child_reopen_requires_and_accepts_exact_prior_kernel_source() {
         "child-kernel-idle",
         KernelActivationState::Idle,
     );
+    child_idle.kernel_generation = step("kernel-lineage", 2);
     child_idle.prior_kernel_disposition = disposition;
+    let mut wrong_generation = child_idle.clone();
+    wrong_generation.operation = operation("child-kernel-wrong-generation");
+    wrong_generation.kernel_generation = step("kernel-lineage", 3);
+    assert_eq!(
+        child.append(HostStateRecord::Kernel(wrong_generation)),
+        Err(JournalError::StaleFence)
+    );
     child
         .append(HostStateRecord::Kernel(child_idle))
         .unwrap_or_else(|error| panic!("exact prior source was rejected: {error}"));

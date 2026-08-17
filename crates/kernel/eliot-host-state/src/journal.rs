@@ -317,6 +317,14 @@ fn apply(
                     "Kernel prior disposition is unknown; manual recovery is required".into(),
                 ));
             }
+            if state.kernel.is_none()
+                && let Some(prior) = state.prior_kernel.as_ref()
+                && !next
+                    .kernel_generation
+                    .is_direct_child_of(&prior.kernel_generation)?
+            {
+                return Err(JournalError::StaleFence);
+            }
             match state.prior_kernel.as_ref() {
                 None if matches!(
                     next.prior_kernel_disposition,
@@ -682,6 +690,30 @@ fn validate_expected_commit(
     Ok(())
 }
 
+fn validate_prepared_descriptor<B: JournalBackend>(
+    backend: &mut B,
+    transaction_id: &PlatformHandle,
+    host: &HostInstallationEpoch,
+) -> Result<(), JournalError> {
+    let pending = backend.prepared_appends().map_err(map_backend_error)?;
+    if pending.iter().any(|item| item.host != *host) {
+        return Err(JournalError::StaleFence);
+    }
+    let matches: Vec<_> = pending
+        .iter()
+        .filter(|item| item.transaction_id == *transaction_id)
+        .collect();
+    match matches.as_slice() {
+        [item] if item.host == *host && item.transaction_id == *transaction_id => Ok(()),
+        [] => Err(JournalError::Invalid(
+            "prepared reconcile descriptor is missing".into(),
+        )),
+        _ => Err(JournalError::Invalid(
+            "prepared reconcile descriptor is duplicated".into(),
+        )),
+    }
+}
+
 pub struct HostStateJournal<B> {
     backend: Mutex<B>,
     state: Mutex<HostState>,
@@ -787,6 +819,7 @@ impl<B: JournalBackend> HostStateJournal<B> {
                 });
             }
             BackendReconcileState::Prepared => {
+                validate_prepared_descriptor(&mut *backend, &transaction_id, &state.host)?;
                 return Err(JournalError::OutcomeUnknown { transaction_id });
             }
             BackendReconcileState::Absent => {}
@@ -842,7 +875,10 @@ impl<B: JournalBackend> HostStateJournal<B> {
                 *state = recovered;
                 Ok(ReconcileOutcome::Committed)
             }
-            BackendReconcileState::Prepared => Ok(ReconcileOutcome::StillUnknown),
+            BackendReconcileState::Prepared => {
+                validate_prepared_descriptor(&mut *backend, transaction_id, &state.host)?;
+                Ok(ReconcileOutcome::StillUnknown)
+            }
             BackendReconcileState::Absent => Ok(ReconcileOutcome::NotCommitted),
         }
     }

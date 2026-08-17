@@ -419,6 +419,10 @@ impl KernelJobBinding {
         }
         Ok(())
     }
+
+    fn root_process_handle(&self) -> String {
+        format!("pid:{}:start:{}", self.root_pid, self.root_start_time_100ns)
+    }
 }
 
 /// Durable source observation for the previous Kernel generation.
@@ -448,7 +452,7 @@ impl PriorKernelSource {
             .validate()
             .map_err(|error| JournalError::Invalid(error.to_string()))?;
         if self.process.owner != self.job.owner.as_str()
-            || self.process.process_id != self.job.root_pid.to_string()
+            || self.process.process_id != self.job.root_process_handle()
         {
             return Err(JournalError::Invalid(
                 "prior Kernel process does not match its Job root binding".into(),
@@ -577,6 +581,16 @@ impl KernelRecord {
         if let Some(binding) = &self.candidate_job_binding {
             binding.validate()?;
         }
+        if self.candidate_job_binding.is_some()
+            && !matches!(
+                self.state,
+                KernelActivationState::Activating | KernelActivationState::Active
+            )
+        {
+            return Err(JournalError::Invalid(
+                "candidate Job binding may first appear only at Activating".into(),
+            ));
+        }
         if let Some(process) = &self.process {
             process
                 .validate()
@@ -649,7 +663,7 @@ impl KernelRecord {
             };
             if let Some(process) = &self.process
                 && (process.owner != binding.owner.as_str()
-                    || process.process_id != binding.root_pid.to_string())
+                    || process.process_id != binding.root_process_handle())
             {
                 return Err(JournalError::Invalid(
                     "Kernel process does not match candidate Job root".into(),
