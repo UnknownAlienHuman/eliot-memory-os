@@ -36,7 +36,103 @@ struct FenceRecord {
 #[derive(Debug, Serialize, serde::Deserialize)]
 struct SchemaMetaRecord {
     generation: String,
+    migrations: Vec<SchemaMigrationIdentity>,
+    compatible_bridge_range: String,
     migration_state: String,
+    migration_id: String,
+    migration_checksum_sha256: String,
+    updated_at: String,
+}
+
+#[derive(Debug, Serialize, serde::Deserialize)]
+struct SchemaMigrationIdentity {
+    migration_id: String,
+    migration_checksum_sha256: String,
+    generation: String,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+enum MigrationPreflight {
+    Empty,
+    ExactReplay,
+}
+
+fn schema_meta_record(migration: &CompiledMigration, updated_at: &str) -> SchemaMetaRecord {
+    SchemaMetaRecord {
+        generation: migration.generation_after.as_str().to_owned(),
+        migrations: vec![SchemaMigrationIdentity {
+            migration_id: migration.migration_id.clone(),
+            migration_checksum_sha256: migration.checksum_sha256.clone(),
+            generation: migration.generation_after.as_str().to_owned(),
+        }],
+        compatible_bridge_range: crate::ADAPTER_NAME.to_owned(),
+        migration_state: "APPLIED".to_owned(),
+        migration_id: migration.migration_id.clone(),
+        migration_checksum_sha256: migration.checksum_sha256.clone(),
+        updated_at: updated_at.to_owned(),
+    }
+}
+
+fn validate_schema_meta_record(record: &SchemaMetaRecord) -> Result<(), AdapterError> {
+    let non_blank = |value: &str| !value.trim().is_empty() && !value.chars().any(char::is_control);
+    if !non_blank(&record.generation)
+        || record.migrations.is_empty()
+        || !non_blank(&record.compatible_bridge_range)
+        || !non_blank(&record.migration_state)
+        || !non_blank(&record.migration_id)
+        || !non_blank(&record.migration_checksum_sha256)
+        || !non_blank(&record.updated_at)
+    {
+        return Err(AdapterError::PartialOutcome);
+    }
+    let Some(last) = record.migrations.last() else {
+        return Err(AdapterError::PartialOutcome);
+    };
+    if !non_blank(&last.migration_id)
+        || !non_blank(&last.migration_checksum_sha256)
+        || !non_blank(&last.generation)
+        || last.migration_id != record.migration_id
+        || last.migration_checksum_sha256 != record.migration_checksum_sha256
+        || last.generation != record.generation
+    {
+        return Err(AdapterError::PartialOutcome);
+    }
+    Ok(())
+}
+
+fn migration_preflight(
+    record: Option<SchemaMetaRecord>,
+    migration: &CompiledMigration,
+) -> Result<MigrationPreflight, AdapterError> {
+    let Some(record) = record else {
+        return Ok(MigrationPreflight::Empty);
+    };
+    validate_schema_meta_record(&record)?;
+    if record.migration_state != "APPLIED" {
+        return Err(AdapterError::PartialOutcome);
+    }
+    if record.compatible_bridge_range != crate::ADAPTER_NAME {
+        return Err(AdapterError::Config(
+            "schema metadata belongs to an incompatible adapter".to_owned(),
+        ));
+    }
+    if record.migration_id == migration.migration_id
+        && record.migration_checksum_sha256 == migration.checksum_sha256
+        && record.generation == migration.generation_after.as_str()
+    {
+        return Ok(MigrationPreflight::ExactReplay);
+    }
+    Err(AdapterError::Config(
+        "schema migration identity does not match the admitted plan".to_owned(),
+    ))
+}
+
+fn migration_receipt(migration: &CompiledMigration) -> MigrationReceipt {
+    MigrationReceipt {
+        migration_id: migration.migration_id.clone(),
+        checksum_sha256: migration.checksum_sha256.clone(),
+        generation_after: migration.generation_after.clone(),
+    }
 }
 
 #[allow(
@@ -95,14 +191,47 @@ pub(crate) async fn probe_generation(
         db,
         config,
         "read.schema_generation",
-        schema::READ_SCHEMA_GENERATION,
+        schema::READ_SCHEMA_META,
         Map::new(),
     )
     .await?;
-    let record = take_optional::<SchemaMetaRecord>(&mut response, 0)?;
-    Ok(record
-        .filter(|record| record.migration_state == "APPLIED")
-        .map(|record| record.generation))
+    let record = take_schema_meta(&mut response, 0)?;
+    if let Some(record) = &record {
+        validate_schema_meta_record(record)?;
+        if record.migration_state != "APPLIED" {
+            return Ok(None);
+        }
+    }
+    Ok(record.map(|record| record.generation))
+}
+
+async fn read_schema_meta(
+    db: &client::RpcTransport,
+    config: &SurrealAdapterConfig,
+) -> Result<Option<SchemaMetaRecord>, AdapterError> {
+    let mut response = client::query(
+        db,
+        config,
+        "read.schema_meta",
+        schema::READ_SCHEMA_META,
+        Map::new(),
+    )
+    .await?;
+    take_schema_meta(&mut response, 0)
+}
+
+fn take_schema_meta(
+    response: &mut client::RpcResults,
+    index: usize,
+) -> Result<Option<SchemaMetaRecord>, AdapterError> {
+    if !response.take_errors().is_empty() {
+        return Err(AdapterError::PartialOutcome);
+    }
+    match take_optional(response, index) {
+        Ok(record) => Ok(record),
+        Err(AdapterError::Serialization(_)) => Err(AdapterError::PartialOutcome),
+        Err(error) => Err(error),
+    }
 }
 
 /// Observes the semantic readiness of the database against the configured
@@ -166,10 +295,14 @@ pub(crate) async fn apply_migration(
             "migration plan is not admitted by the S-03 schema compiler".to_owned(),
         ));
     }
+    let _guard = adapter.write_lock.lock().await;
+    let preflight = migration_preflight(read_schema_meta(db, &adapter.config).await?, migration)?;
+    if matches!(preflight, MigrationPreflight::ExactReplay) {
+        return Ok(migration_receipt(migration));
+    }
     observed_clock
         .validate()
         .map_err(|error| AdapterError::Config(error.to_string()))?;
-    let _guard = adapter.write_lock.lock().await;
     let updated_at = observed_clock
         .known_time_ms
         .or(observed_clock.valid_time_ms)
@@ -183,24 +316,17 @@ pub(crate) async fn apply_migration(
         "{} {} {} {}",
         schema::TX_BEGIN,
         statements,
-        schema::TX_UPSERT_SCHEMA_META,
+        schema::TX_CREATE_SCHEMA_META,
         schema::TX_COMMIT,
     );
-    let record = json!({
-        "generation": migration.generation_after.as_str(),
-        "migration_state": "APPLIED",
-        "migration_id": migration.migration_id,
-        "migration_checksum_sha256": migration.checksum_sha256,
-        "compatible_bridge_range": crate::ADAPTER_NAME,
-        "updated_at": updated_at.to_string(),
-    });
+    let record = schema_meta_record(migration, &updated_at.to_string());
     let mut bindings = Map::new();
     bindings.insert(
         "schema_meta_table".to_owned(),
         json!(schema::table::SCHEMA_META),
     );
     bindings.insert("schema_meta_key".to_owned(), json!(schema::SCHEMA_META_KEY));
-    bindings.insert("schema_meta_record".to_owned(), record);
+    bindings.insert("schema_meta_record".to_owned(), json!(record));
     let mut response =
         client::query(db, &adapter.config, "migration.apply", &sql, bindings).await?;
     if !response.take_errors().is_empty() {
@@ -208,11 +334,11 @@ pub(crate) async fn apply_migration(
             migration_id: migration.migration_id.clone(),
         });
     }
-    Ok(MigrationReceipt {
-        migration_id: migration.migration_id.clone(),
-        checksum_sha256: migration.checksum_sha256.clone(),
-        generation_after: migration.generation_after.clone(),
-    })
+    let observed = read_schema_meta(db, &adapter.config).await?;
+    match migration_preflight(observed, migration) {
+        Ok(MigrationPreflight::ExactReplay) => Ok(migration_receipt(migration)),
+        Ok(MigrationPreflight::Empty) | Err(_) => Err(AdapterError::PartialOutcome),
+    }
 }
 
 /// Bounded bridge health observation; never a semantic readiness verdict.
@@ -1053,4 +1179,77 @@ fn ensure_unique_ordering_scopes(scopes: &[OrderingScopeId]) -> Result<(), Adapt
 
 fn to_value<T: Serialize>(value: &T) -> Result<Value, AdapterError> {
     serde_json::to_value(value).map_err(|error| AdapterError::Serialization(error.to_string()))
+}
+
+#[cfg(test)]
+mod migration_tests {
+    #![allow(clippy::expect_used)]
+
+    use super::*;
+
+    fn migration() -> CompiledMigration {
+        CompiledMigration::new(
+            "eliot.store.surreal.schema.v1",
+            schema::SCHEMA_DDL,
+            SchemaGeneration::new("1.0.0").expect("valid generation"),
+        )
+    }
+
+    #[test]
+    fn exact_applied_identity_is_a_replay_without_provider_effect() {
+        let migration = migration();
+        let observed = schema_meta_record(&migration, "1000");
+
+        assert!(matches!(
+            migration_preflight(Some(observed), &migration),
+            Ok(MigrationPreflight::ExactReplay)
+        ));
+    }
+
+    #[test]
+    fn identity_mismatch_is_rejected_before_provider_effect() {
+        let migration = migration();
+        let mut observed = schema_meta_record(&migration, "1000");
+        observed.generation = "2.0.0".to_owned();
+        observed.migrations[0].generation = "2.0.0".to_owned();
+
+        assert!(matches!(
+            migration_preflight(Some(observed), &migration),
+            Err(AdapterError::Config(_))
+        ));
+    }
+
+    #[test]
+    fn empty_metadata_admits_the_compiled_migration() {
+        let migration = migration();
+
+        assert!(matches!(
+            migration_preflight(None, &migration),
+            Ok(MigrationPreflight::Empty)
+        ));
+    }
+
+    #[test]
+    fn post_read_requires_the_complete_durable_identity() {
+        let migration = migration();
+        let mut observed = schema_meta_record(&migration, "1000");
+        observed.migrations.clear();
+
+        assert_eq!(
+            migration_preflight(Some(observed), &migration),
+            Err(AdapterError::PartialOutcome)
+        );
+    }
+
+    #[test]
+    fn transitional_metadata_is_fail_closed() {
+        let migration = migration();
+        let mut observed = schema_meta_record(&migration, "1000");
+        observed.migration_state = "APPLYING".to_owned();
+
+        assert_eq!(
+            migration_preflight(Some(observed), &migration),
+            Err(AdapterError::PartialOutcome)
+        );
+    }
 }

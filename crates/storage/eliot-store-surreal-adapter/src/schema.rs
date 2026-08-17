@@ -106,15 +106,15 @@ pub(crate) fn indexed(template: &str, index: usize) -> String {
     template.replace("{i}", &index.to_string())
 }
 
-/// Migration metadata is part of the same provider transaction as DDL.  The
-/// APPLIED marker is therefore never published by a second writer step.
-pub(crate) const TX_UPSERT_SCHEMA_META: &str =
-    "UPSERT type::record($schema_meta_table, $schema_meta_key) CONTENT $schema_meta_record;";
+/// Migration metadata is part of the same provider transaction as DDL.  A
+/// first-write `CREATE` prevents a stale or racing writer from overwriting the
+/// durable identity; exact replays are handled by the adapter preflight.
+pub(crate) const TX_CREATE_SCHEMA_META: &str =
+    "CREATE type::record($schema_meta_table, $schema_meta_key) CONTENT $schema_meta_record;";
 
 /// Closed read templates. Results select `body` values so they deserialize
 /// back into store-API types without a `SurrealDB` `id` field.
-pub(crate) const READ_SCHEMA_GENERATION: &str =
-    "SELECT generation, migration_state FROM ONLY schema_meta:current;";
+pub(crate) const READ_SCHEMA_META: &str = "SELECT * FROM ONLY schema_meta:current;";
 
 pub(crate) const READ_FENCE: &str = "SELECT * FROM ONLY canonical_fence:current;";
 
