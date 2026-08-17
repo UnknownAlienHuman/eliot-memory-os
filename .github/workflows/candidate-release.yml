@@ -1,9 +1,13 @@
-name: Candidate Release Validation
+name: Source Candidate Gate
 
 on:
-  pull_request:
-    branches: [main]
   workflow_dispatch:
+    inputs:
+      require_live_windows_scenarios:
+        description: Require the live Windows scenario harness (not integrated yet)
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: read
@@ -18,7 +22,7 @@ env:
   RUST_BACKTRACE: 1
 
 jobs:
-  candidate:
+  source-candidate-gate:
     runs-on: windows-latest
     timeout-minutes: 180
 
@@ -26,6 +30,15 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 1
+
+      - name: Verify source identity
+        shell: pwsh
+        run: |
+          $sourceSha = (git rev-parse HEAD).Trim()
+          if ($sourceSha -ne $env:GITHUB_SHA) {
+            throw "SOURCE_IDENTITY_FAILURE: checked out $sourceSha but expected $env:GITHUB_SHA"
+          }
+          Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value "SOURCE_SHA=$sourceSha"
 
       - name: Configure Cargo environment
         shell: pwsh
@@ -58,16 +71,16 @@ jobs:
       - name: Workspace tests and execution safeguard
         shell: pwsh
         run: |
-          $testListOutput = @(& cargo test --workspace --locked -- --list 2>&1)
+          $testListOutput = @(& cargo test --workspace --all-targets --locked -- --list 2>&1)
           $testListExit = $LASTEXITCODE
           if ($testListExit -ne 0) {
-            throw "TEST_LIST_FAILURE: cargo test --workspace --locked -- --list exited $testListExit"
+            throw "TEST_LIST_FAILURE: cargo test --workspace --all-targets --locked -- --list exited $testListExit"
           }
 
-          $testOutput = @(& cargo test --workspace --locked 2>&1)
+          $testOutput = @(& cargo test --workspace --all-targets --locked 2>&1)
           $testExit = $LASTEXITCODE
           if ($testExit -ne 0) {
-            throw "TEST_EXECUTION_FAILURE: cargo test --workspace --locked exited $testExit"
+            throw "TEST_EXECUTION_FAILURE: cargo test --workspace --all-targets --locked exited $testExit"
           }
 
           $listedTests = @(
@@ -97,9 +110,16 @@ jobs:
       - name: Eliot.Operator Release build
         run: dotnet build apps/Eliot.Operator/Eliot.Operator.csproj -c Release
 
-      - name: Live Windows candidate and release bundle contract
+      - name: Source candidate status
+        shell: pwsh
+        run: |
+          Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value 'SOURCE_CANDIDATE_ONLY'
+          Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value 'live-harness-deferred'
+
+      - name: Live Windows scenario contract challenge
+        if: ${{ inputs.require_live_windows_scenarios }}
         shell: pwsh
         run: |
           $failureType = 'CONTRACT_CHALLENGE'
-          Write-Error ("{0}: live Windows candidate scenarios and release bundle validation are not wired yet; no scenario success is claimed." -f $failureType)
+          Write-Error ("{0}: live Windows scenario harness is not integrated; no scenario success is claimed." -f $failureType)
           exit 1

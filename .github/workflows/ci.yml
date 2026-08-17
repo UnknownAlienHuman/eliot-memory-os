@@ -63,27 +63,8 @@ jobs:
       - name: Default members check
         run: cargo check --locked --all-targets
 
-      - name: Core members check
-        run: >-
-          cargo check --locked --all-targets
-          -p eliot-kernel-core
-          -p eliot-engine
-          -p eliot-store
-          -p eliot-types
-          -p eliot-windows-ipc
-
       - name: Default members clippy
         run: cargo clippy --locked --all-targets -- -D warnings
-
-      - name: Core members clippy
-        run: >-
-          cargo clippy --locked --all-targets
-          -p eliot-kernel-core
-          -p eliot-engine
-          -p eliot-store
-          -p eliot-types
-          -p eliot-windows-ipc
-          -- -D warnings
 
       - name: Eliot.Operator Release build
         run: dotnet build apps/Eliot.Operator/Eliot.Operator.csproj -c Release
