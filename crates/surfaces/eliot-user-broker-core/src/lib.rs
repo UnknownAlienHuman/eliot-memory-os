@@ -20,10 +20,14 @@ use eliot_security_contracts::EffectCeiling;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
+#[cfg(test)]
+use uuid::Uuid;
 
 pub const CONTRACT_NAME: &str = "eliot.surfaces.user-broker-core/v1";
 pub const OPERATOR_ROLE: &str = "human_operator";
 pub const OPERATOR_CAPABILITIES: [&str; 2] = ["controlboard.read", "operator.command"];
+pub const OPERATOR_HANDOFF_TTL_MS: u64 = 5_000;
+pub const OPERATOR_PIPE_NAME: &str = r"\\.\pipe\eliot\operator\one-shot";
 
 /// Broker-to-Operator handoff bound to one interactive session and epoch.
 /// This envelope contains no bearer credential or filesystem auth reference.
@@ -71,16 +75,25 @@ pub struct OperatorArtifact {
     pub artifact_digest: String,
 }
 
+impl OperatorArtifact {
+    pub fn validate(&self) -> Result<(), BrokerError> {
+        text(&self.image_id, "operator_image_id")?;
+        text(&self.executable, "operator_executable")?;
+        text(&self.artifact_digest, "operator_artifact_digest")?;
+        hex_digest(&self.artifact_digest, "operator_artifact_digest")
+    }
+}
+
 /// Request accepted by the broker launch boundary.  It deliberately has no
 /// executable or capability fields: those are selected by the broker policy.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct OperatorHandoffRequest {
     pub role: String,
     pub capabilities: Vec<String>,
-    pub observed_at: u64,
-    pub expires_at: u64,
 }
 
+#[cfg(test)]
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct HandoffState {
     endpoint: OperatorEndpoint,
@@ -90,44 +103,58 @@ struct HandoffState {
 
 /// One-shot broker handoff authority.  The nonce is an authenticator for one
 /// inherited endpoint parse, not a reconnect token or durable credential.
+#[cfg(test)]
 #[derive(Clone, Debug)]
 pub struct OperatorHandoffAuthority {
     artifact: OperatorArtifact,
+    pipe_name: String,
+    broker_epoch: u64,
+    interactive_session_id: String,
     handoffs: BTreeMap<String, HandoffState>,
 }
 
+#[cfg(test)]
 impl OperatorHandoffAuthority {
-    pub fn new(artifact: OperatorArtifact) -> Result<Self, BrokerError> {
-        text(&artifact.image_id, "operator_image_id")?;
-        text(&artifact.executable, "operator_executable")?;
-        text(&artifact.artifact_digest, "operator_artifact_digest")?;
-        hex_digest(&artifact.artifact_digest, "operator_artifact_digest")?;
+    pub(crate) fn new(
+        artifact: OperatorArtifact,
+        pipe_name: String,
+        broker_epoch: u64,
+        interactive_session_id: String,
+    ) -> Result<Self, BrokerError> {
+        artifact.validate()?;
+        if pipe_name != OPERATOR_PIPE_NAME || broker_epoch == 0 {
+            return Err(BrokerError::InvalidField("operator_handoff_policy"));
+        }
+        text(&interactive_session_id, "interactive_session_id")?;
         Ok(Self {
             artifact,
+            pipe_name,
+            broker_epoch,
+            interactive_session_id,
             handoffs: BTreeMap::new(),
         })
     }
 
-    pub fn issue(
+    pub(crate) fn issue(
         &mut self,
         request: &OperatorHandoffRequest,
-        pipe_name: String,
-        broker_epoch: u64,
-        interactive_session_id: String,
-        nonce: String,
+        observed_at: u64,
     ) -> Result<OperatorEndpoint, BrokerError> {
         if request.role != OPERATOR_ROLE
             || !exact_operator_capabilities(&request.capabilities)
-            || request.observed_at == 0
-            || request.expires_at <= request.observed_at
+            || observed_at == 0
         {
             return Err(BrokerError::Denied);
         }
+        let expires_at = observed_at
+            .checked_add(OPERATOR_HANDOFF_TTL_MS)
+            .ok_or(BrokerError::Denied)?;
+        let nonce = Uuid::new_v4().simple().to_string();
         text(&nonce, "handoff_nonce")?;
         let endpoint = OperatorEndpoint {
-            pipe_name,
-            broker_epoch,
-            interactive_session_id,
+            pipe_name: self.pipe_name.clone(),
+            broker_epoch: self.broker_epoch,
+            interactive_session_id: self.interactive_session_id.clone(),
             handoff_nonce: nonce.clone(),
             role: OPERATOR_ROLE.to_owned(),
             capabilities: OPERATOR_CAPABILITIES
@@ -143,23 +170,19 @@ impl OperatorHandoffAuthority {
             nonce,
             HandoffState {
                 endpoint: endpoint.clone(),
-                expires_at: request.expires_at,
+                expires_at,
                 consumed: false,
             },
         );
         Ok(endpoint)
     }
 
-    pub fn consume(
+    pub(crate) fn consume(
         &mut self,
         endpoint: &OperatorEndpoint,
         now: u64,
-        requested_artifact: &OperatorArtifact,
     ) -> Result<&OperatorArtifact, BrokerError> {
         endpoint.validate()?;
-        if requested_artifact != &self.artifact {
-            return Err(BrokerError::GrantBindingMismatch);
-        }
         {
             let state = self
                 .handoffs
@@ -1451,11 +1474,16 @@ mod tests {
 
     #[test]
     fn operator_handoff_is_exact_approved_and_one_shot() {
-        let mut authority = OperatorHandoffAuthority::new(OperatorArtifact {
-            image_id: "eliot.operator.v1".to_owned(),
-            executable: r"C:\Program Files\Eliot\Eliot.Operator.exe".to_owned(),
-            artifact_digest: "a".repeat(64),
-        })
+        let mut authority = OperatorHandoffAuthority::new(
+            OperatorArtifact {
+                image_id: "eliot.operator.v1".to_owned(),
+                executable: r"C:\Program Files\Eliot\Eliot.Operator.exe".to_owned(),
+                artifact_digest: "a".repeat(64),
+            },
+            OPERATOR_PIPE_NAME.to_owned(),
+            4,
+            "session-1".to_owned(),
+        )
         .expect("artifact policy");
         let request = OperatorHandoffRequest {
             role: OPERATOR_ROLE.to_owned(),
@@ -1463,67 +1491,33 @@ mod tests {
                 .iter()
                 .map(|value| (*value).to_owned())
                 .collect(),
-            observed_at: 10,
-            expires_at: 20,
         };
-        let endpoint = authority
-            .issue(
-                &request,
-                r"\\.\pipe\eliot\operator\one-shot".to_owned(),
-                4,
-                "session-1".to_owned(),
-                "nonce-1".to_owned(),
-            )
-            .expect("issue handoff");
-        let artifact = OperatorArtifact {
-            image_id: "eliot.operator.v1".to_owned(),
-            executable: r"C:\Program Files\Eliot\Eliot.Operator.exe".to_owned(),
-            artifact_digest: "a".repeat(64),
-        };
-        authority
-            .consume(&endpoint, 11, &artifact)
-            .expect("consume once");
+        let endpoint = authority.issue(&request, 10).expect("issue handoff");
+        authority.consume(&endpoint, 11).expect("consume once");
         assert_eq!(
-            authority.consume(&endpoint, 11, &artifact),
+            authority.consume(&endpoint, 11),
             Err(BrokerError::ReplayConflict)
-        );
-        assert_eq!(
-            authority.consume(
-                &endpoint,
-                11,
-                &OperatorArtifact {
-                    artifact_digest: "b".repeat(64),
-                    ..artifact.clone()
-                }
-            ),
-            Err(BrokerError::GrantBindingMismatch)
         );
     }
 
     #[test]
     fn operator_handoff_expiry_and_capability_widening_fail_closed() {
-        let mut authority = OperatorHandoffAuthority::new(OperatorArtifact {
-            image_id: "eliot.operator.v1".to_owned(),
-            executable: "C:/Eliot/Eliot.Operator.exe".to_owned(),
-            artifact_digest: "a".repeat(64),
-        })
+        let mut authority = OperatorHandoffAuthority::new(
+            OperatorArtifact {
+                image_id: "eliot.operator.v1".to_owned(),
+                executable: "C:/Eliot/Eliot.Operator.exe".to_owned(),
+                artifact_digest: "a".repeat(64),
+            },
+            OPERATOR_PIPE_NAME.to_owned(),
+            1,
+            "session".to_owned(),
+        )
         .expect("artifact policy");
         let request = OperatorHandoffRequest {
             role: OPERATOR_ROLE.to_owned(),
             capabilities: vec!["operator.command".to_owned()],
-            observed_at: 10,
-            expires_at: 20,
         };
-        assert_eq!(
-            authority.issue(
-                &request,
-                "pipe".to_owned(),
-                1,
-                "session".to_owned(),
-                "nonce".to_owned()
-            ),
-            Err(BrokerError::Denied)
-        );
+        assert_eq!(authority.issue(&request, 10), Err(BrokerError::Denied));
         let valid = OperatorHandoffRequest {
             capabilities: OPERATOR_CAPABILITIES
                 .iter()
@@ -1531,27 +1525,70 @@ mod tests {
                 .collect(),
             ..request
         };
-        let endpoint = authority
-            .issue(
-                &valid,
-                "pipe".to_owned(),
-                1,
-                "session".to_owned(),
-                "nonce".to_owned(),
-            )
-            .expect("issue handoff");
+        let endpoint = authority.issue(&valid, 10).expect("issue handoff");
         assert_eq!(
-            authority.consume(
-                &endpoint,
-                20,
-                &OperatorArtifact {
-                    image_id: "eliot.operator.v1".to_owned(),
-                    executable: "C:/Eliot/Eliot.Operator.exe".to_owned(),
-                    artifact_digest: "a".repeat(64),
-                }
-            ),
+            authority.consume(&endpoint, 5_010),
             Err(BrokerError::StaleLease)
         );
+    }
+
+    #[test]
+    fn operator_handoff_binds_session_epoch_nonce_and_policy_without_caller_time() {
+        let artifact = OperatorArtifact {
+            image_id: "eliot.operator.v1".to_owned(),
+            executable: "C:/Eliot/Eliot.Operator.exe".to_owned(),
+            artifact_digest: "a".repeat(64),
+        };
+        let mut authority = OperatorHandoffAuthority::new(
+            artifact,
+            OPERATOR_PIPE_NAME.to_owned(),
+            7,
+            "session-7".to_owned(),
+        )
+        .expect("artifact policy");
+        let request = OperatorHandoffRequest {
+            role: OPERATOR_ROLE.to_owned(),
+            capabilities: OPERATOR_CAPABILITIES
+                .iter()
+                .map(|value| (*value).to_owned())
+                .collect(),
+        };
+        let endpoint = authority.issue(&request, 100).expect("issue handoff");
+        assert_eq!(endpoint.broker_epoch, 7);
+        assert_eq!(endpoint.interactive_session_id, "session-7");
+        assert_eq!(endpoint.pipe_name, OPERATOR_PIPE_NAME);
+        assert_ne!(endpoint.handoff_nonce, "caller-selected");
+        assert!(
+            serde_json::from_value::<OperatorHandoffRequest>(serde_json::json!({
+                "role": OPERATOR_ROLE,
+                "capabilities": OPERATOR_CAPABILITIES,
+                "observed_at": 100,
+                "expires_at": 105,
+                "pipe_name": OPERATOR_PIPE_NAME,
+                "handoff_nonce": "caller-selected"
+            }))
+            .is_err()
+        );
+
+        for tampered in [
+            OperatorEndpoint {
+                interactive_session_id: "other-session".to_owned(),
+                ..endpoint.clone()
+            },
+            OperatorEndpoint {
+                broker_epoch: 8,
+                ..endpoint.clone()
+            },
+            OperatorEndpoint {
+                handoff_nonce: "other-nonce".to_owned(),
+                ..endpoint.clone()
+            },
+        ] {
+            assert_eq!(
+                authority.consume(&tampered, 101),
+                Err(BrokerError::ReplayConflict)
+            );
+        }
     }
 
     #[derive(Clone, Copy)]

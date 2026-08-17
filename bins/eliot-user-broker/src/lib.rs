@@ -26,10 +26,9 @@ use eliot_process_executor::{DispatchValidationPort, WindowsProcessExecutor};
 use eliot_protocol::RequestIdentity;
 use eliot_user_broker_core::{
     AuthorityPort, BrokerError, BrokerSnapshot, DurableRegistrationPort, HeartbeatReceipt,
-    HeartbeatRequest, LaunchGrant, LaunchRequest, OperatorArtifact, OperatorHandoffAuthority,
-    OperatorHandoffRequest, PortError, ProcessPort, ProcessStartOutcome, RegistrationFenceReceipt,
-    RegistrationFenceRequest, RegistrationGrant, RegistrationReceipt, RegistrationRequest,
-    RequiredProvider, UserBroker,
+    HeartbeatRequest, LaunchGrant, LaunchRequest, OperatorArtifact, PortError, ProcessPort,
+    ProcessStartOutcome, RegistrationFenceReceipt, RegistrationFenceRequest, RegistrationGrant,
+    RegistrationReceipt, RegistrationRequest, RequiredProvider, UserBroker,
 };
 use serde::Deserialize;
 use serde::Serialize;
@@ -91,11 +90,12 @@ fn validate_launch_config(config: &BrokerLaunchConfig) -> Result<(), Composition
             "protected broker artifact digest does not match current executable".to_owned(),
         ));
     }
-    OperatorHandoffAuthority::new(OperatorArtifact {
+    OperatorArtifact {
         image_id: config.operator_artifact.image_id.clone(),
         executable: config.operator_artifact.executable.clone(),
         artifact_digest: config.operator_artifact.artifact_digest.clone(),
-    })
+    }
+    .validate()
     .map_err(|error| CompositionError::Launch(error.to_string()))?;
     #[cfg(windows)]
     {
@@ -115,8 +115,8 @@ fn validate_launch_config(config: &BrokerLaunchConfig) -> Result<(), Composition
 
 /// Loads the protected installation launch declaration and returns its retained
 /// no-follow/reparse-safe file lease to the composition owner.
-fn load_protected_launch_config()
--> Result<(BrokerLaunchConfig, ProtectedPathLease), CompositionError> {
+fn load_protected_launch_config(
+) -> Result<(BrokerLaunchConfig, ProtectedPathLease), CompositionError> {
     #[cfg(not(windows))]
     {
         Err(CompositionError::Kernel(
@@ -740,7 +740,6 @@ pub struct BrokerComposition {
     providers_admitted: bool,
     launch_config: Option<BrokerLaunchConfig>,
     launch_lease: Option<ProtectedPathLease>,
-    operator_handoff: Option<OperatorHandoffAuthority>,
     registration_digest: Option<String>,
 }
 
@@ -810,17 +809,6 @@ impl BrokerComposition {
         let registration_digest = broker.registration_digest().map(ToOwned::to_owned);
         let (launch_config, launch_lease) =
             launch.map_or((None, None), |(config, lease)| (Some(config), Some(lease)));
-        let operator_handoff = launch_config
-            .as_ref()
-            .map(|config| {
-                OperatorHandoffAuthority::new(OperatorArtifact {
-                    image_id: config.operator_artifact.image_id.clone(),
-                    executable: config.operator_artifact.executable.clone(),
-                    artifact_digest: config.operator_artifact.artifact_digest.clone(),
-                })
-            })
-            .transpose()
-            .map_err(|error| CompositionError::Launch(error.to_string()))?;
         Ok(Self {
             broker,
             snapshot,
@@ -828,7 +816,6 @@ impl BrokerComposition {
             providers_admitted,
             launch_config,
             launch_lease,
-            operator_handoff,
             registration_digest,
         })
     }
@@ -915,48 +902,6 @@ impl BrokerComposition {
         let _ = self.heartbeat()?;
         self.broker
             .launch(request)
-            .map_err(CompositionError::Recovery)
-    }
-
-    /// Issues an inherited one-shot endpoint; path/image/digest stay inside
-    /// the broker policy and are never accepted from the caller.
-    pub fn issue_operator_handoff(
-        &mut self,
-        role: String,
-        capabilities: Vec<String>,
-        observed_at: u64,
-        expires_at: u64,
-    ) -> Result<eliot_user_broker_core::OperatorEndpoint, CompositionError> {
-        let nonce = uuid::Uuid::new_v4().simple().to_string();
-        let broker_epoch = self.broker.broker_epoch();
-        let interactive_session_id = self
-            .launch_config
-            .as_ref()
-            .ok_or_else(|| {
-                CompositionError::Launch(
-                    "protected broker launch configuration is not composed".to_owned(),
-                )
-            })?
-            .registration
-            .interactive_session_id
-            .clone();
-        self.operator_handoff
-            .as_mut()
-            .ok_or_else(|| {
-                CompositionError::Launch("Operator artifact policy is not composed".to_owned())
-            })?
-            .issue(
-                &OperatorHandoffRequest {
-                    role,
-                    capabilities,
-                    observed_at,
-                    expires_at,
-                },
-                r"\\.\pipe\eliot\operator\one-shot".to_owned(),
-                broker_epoch,
-                interactive_session_id,
-                nonce,
-            )
             .map_err(CompositionError::Recovery)
     }
 

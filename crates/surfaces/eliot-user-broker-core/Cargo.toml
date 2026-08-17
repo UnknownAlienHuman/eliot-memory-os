@@ -26,6 +26,7 @@ thiserror.workspace = true
 
 [dev-dependencies]
 eliot-platform.workspace = true
+uuid.workspace = true
 
 [lints]
 workspace = true
