@@ -8,6 +8,7 @@
 
 use std::io::{self, Read, Write};
 
+use eliot_cli::kernel_client::{KernelClient, KernelClientError};
 use eliot_native_worker_core::{
     WorkerCore, WorkerError, WorkerEventEnvelope, WorkerFrame, WorkerHello, WorkerLifecycle,
 };
@@ -16,6 +17,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 const MAX_FRAME_BYTES: u32 = 4 * 1024 * 1024;
+pub const KERNEL_ADMISSION_REQUIRED: &str = "KERNEL_ADMISSION_REQUIRED";
 
 /// A transport response containing only durable events produced by the core.
 #[derive(Debug, Serialize, Deserialize)]
@@ -28,6 +30,8 @@ pub struct WorkerResponse {
 /// Errors at the process composition boundary.
 #[derive(Debug, Error)]
 pub enum NativeWorkerError {
+    #[error("{KERNEL_ADMISSION_REQUIRED}: {0}")]
+    KernelAdmissionRequired(String),
     #[error("worker core error: {0}")]
     Core(#[from] WorkerError),
     #[error("worker transport I/O failed: {0}")]
@@ -38,6 +42,45 @@ pub enum NativeWorkerError {
     FrameTooLarge { actual: u32, maximum: u32 },
     #[error("native-worker frame length cannot be zero")]
     EmptyFrame,
+}
+
+/// Authenticated Kernel front-door adapter for the worker's startup claim.
+///
+/// The current Kernel client exposes health and generic execute transport, but
+/// not the session-bound native-worker claim carrying identity, fence, clock,
+/// and one-shot process request.  This adapter therefore never fabricates a
+/// request or permit: it probes the operation and fails closed until that
+/// contract is supplied by Kernel.
+pub struct KernelNativeWorkerClient;
+
+impl KernelNativeWorkerClient {
+    pub fn connect() -> Result<Self, NativeWorkerError> {
+        let mut client = KernelClient::load().map_err(|error| kernel_admission_error(&error))?;
+        let health = client
+            .probe()
+            .map_err(|error| kernel_admission_error(&error))?;
+        if health.get("status").and_then(serde_json::Value::as_str) != Some("OPEN") {
+            return Err(NativeWorkerError::KernelAdmissionRequired(
+                "Kernel health handshake was not OPEN".to_owned(),
+            ));
+        }
+        let _claim = client
+            .transact_json(
+                "native_worker.claim",
+                serde_json::json!({
+                    "protocol": eliot_native_worker_core::PROTOCOL_VERSION,
+                    "operation": "claim"
+                }),
+            )
+            .map_err(|error| kernel_admission_error(&error))?;
+        Err(NativeWorkerError::KernelAdmissionRequired(
+            "Kernel returned no session-bound native-worker claim contract".to_owned(),
+        ))
+    }
+}
+
+fn kernel_admission_error(error: &KernelClientError) -> NativeWorkerError {
+    NativeWorkerError::KernelAdmissionRequired(error.to_string())
 }
 
 /// Composed native-worker generation with all governing dependencies explicit.
@@ -159,4 +202,20 @@ fn write_frame(response: &WorkerResponse) -> Result<(), NativeWorkerError> {
     output.write_all(&body)?;
     output.flush()?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn missing_session_bound_claim_is_typed_admission_failure() {
+        let error = kernel_admission_error(&KernelClientError::MissingRequestIdentity);
+
+        assert!(matches!(
+            error,
+            NativeWorkerError::KernelAdmissionRequired(detail)
+                if detail == "kernel request identity is missing"
+        ));
+    }
 }

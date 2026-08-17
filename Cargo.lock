@@ -1250,6 +1250,7 @@ dependencies = [
 name = "eliot-native-worker"
 version = "0.1.0"
 dependencies = [
+ "eliot-cli",
  "eliot-native-worker-core",
  "eliot-process",
  "serde",
