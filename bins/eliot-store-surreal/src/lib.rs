@@ -266,6 +266,7 @@ fn validate_launch_text(value: &str, field: &str) -> Result<(), String> {
 pub struct StoreComposition {
     store: SurrealStoreAdapter,
     blob: BlobRootOwner,
+    state_fence: StateFence,
 }
 
 impl std::fmt::Debug for StoreComposition {
@@ -274,6 +275,7 @@ impl std::fmt::Debug for StoreComposition {
             .debug_struct("StoreComposition")
             .field("store", &self.store)
             .field("blob_owner", &self.blob)
+            .field("state_fence", &self.state_fence)
             .finish()
     }
 }
@@ -294,8 +296,21 @@ impl StoreComposition {
         let platform = WindowsPlatform::new(config.blob_root.clone())
             .map_err(|error| format!("validate Blob root for credential access: {error}"))?;
         let password = resolve_credential(&platform, &config.credential_ref)?;
+        let state_fence = StateFence::new(
+            AuthorityEpoch::new(config.authority_epoch)
+                .map_err(|error| format!("invalid Store authority epoch: {error}"))?,
+            ResourceGeneration::new(config.store_generation)
+                .map_err(|error| format!("invalid Store generation: {error}"))?,
+        );
+        state_fence
+            .validate()
+            .map_err(|error| format!("invalid Store state fence: {error}"))?;
         let store = SurrealStoreAdapter::new(adapter_config(config, password)?);
-        Ok(Self { store, blob })
+        Ok(Self {
+            store,
+            blob,
+            state_fence,
+        })
     }
 
     /// Rejects attempts to add a second process/root owner after composition.
@@ -323,6 +338,13 @@ impl StoreComposition {
             .probe_readiness()
             .await
             .map_err(AdapterError::into_store_error)?;
+        if matches!(readiness, SemanticReadiness::Ready { .. }) {
+            let snapshot = self.store.validation_snapshot().await?;
+            snapshot.validate()?;
+            if snapshot.state_fence != self.state_fence {
+                return Err(StoreError::FenceMismatch);
+            }
+        }
         Ok(match readiness {
             SemanticReadiness::Unavailable => ReadinessReceipt::unavailable(),
             SemanticReadiness::MigrationRequired { expected, observed } => {
@@ -344,7 +366,7 @@ impl StoreComposition {
         let generation = self.store.config().expected_schema_generation.clone();
         let migration = SurrealStoreAdapter::initial_schema_migration(generation);
         self.store
-            .apply_migration(&migration, observed_clock)
+            .apply_migration(&migration, observed_clock, &self.state_fence)
             .await
             .map_err(map_adapter_error)
     }

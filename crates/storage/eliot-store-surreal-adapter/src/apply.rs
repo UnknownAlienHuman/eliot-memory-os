@@ -26,7 +26,7 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::{Map, Value, json};
 
-const READ_VALIDATION_SNAPSHOT: &str = "BEGIN TRANSACTION; SELECT VALUE body FROM ONLY canonical_fence:current; SELECT VALUE body FROM revision_head; COMMIT TRANSACTION;";
+const READ_VALIDATION_SNAPSHOT: &str = "BEGIN TRANSACTION; SELECT * FROM ONLY schema_meta:current; SELECT VALUE body FROM ONLY canonical_fence:current; SELECT VALUE body FROM revision_head; COMMIT TRANSACTION;";
 
 /// The durable canonical fence singleton.
 #[derive(Debug, Serialize, serde::Deserialize)]
@@ -98,6 +98,17 @@ fn validate_schema_meta_record(record: &SchemaMetaRecord) -> Result<(), AdapterE
         || last.migration_checksum_sha256 != record.migration_checksum_sha256
         || last.generation != record.generation
     {
+        return Err(AdapterError::PartialOutcome);
+    }
+    Ok(())
+}
+
+fn validate_fence_record(record: &FenceRecord) -> Result<(), AdapterError> {
+    record
+        .state_fence
+        .validate()
+        .map_err(StoreError::Foundation)?;
+    if record.next_commit_sequence == 0 || record.next_outbox_sequence == 0 {
         return Err(AdapterError::PartialOutcome);
     }
     Ok(())
@@ -244,10 +255,18 @@ pub(crate) async fn probe_readiness(
 ) -> Result<SemanticReadiness, AdapterError> {
     let db = client(adapter).await?;
     let observed = probe_generation(db, &adapter.config).await?;
-    Ok(readiness_from_observation(
-        observed,
-        &adapter.config.expected_schema_generation,
-    ))
+    let readiness =
+        readiness_from_observation(observed, &adapter.config.expected_schema_generation);
+    if matches!(readiness, SemanticReadiness::Ready { .. }) {
+        let Some(fence) = read_fence(db, &adapter.config).await? else {
+            return Ok(SemanticReadiness::MigrationRequired {
+                expected: adapter.config.expected_schema_generation.clone(),
+                observed: None,
+            });
+        };
+        validate_fence_record(&fence)?;
+    }
+    Ok(readiness)
 }
 
 fn readiness_from_observation(
@@ -288,6 +307,7 @@ pub(crate) async fn apply_migration(
     adapter: &SurrealStoreAdapter,
     migration: &CompiledMigration,
     observed_clock: &eliot_platform::ClockObservation,
+    state_fence: &StateFence,
 ) -> Result<MigrationReceipt, AdapterError> {
     let db = client(adapter).await?;
     migration
@@ -299,8 +319,17 @@ pub(crate) async fn apply_migration(
         ));
     }
     let _guard = adapter.write_lock.lock().await;
+    state_fence.validate().map_err(StoreError::Foundation)?;
     let preflight = migration_preflight(read_schema_meta(db, &adapter.config).await?, migration)?;
     if matches!(preflight, MigrationPreflight::ExactReplay) {
+        let fence = read_fence(db, &adapter.config).await?;
+        let Some(fence) = fence else {
+            return Err(AdapterError::PartialOutcome);
+        };
+        validate_fence_record(&fence)?;
+        if fence.state_fence != *state_fence {
+            return Err(AdapterError::PartialOutcome);
+        }
         return Ok(migration_receipt(migration));
     }
     observed_clock
@@ -316,9 +345,10 @@ pub(crate) async fn apply_migration(
         })?;
     let statements = migration.statements.trim();
     let sql = format!(
-        "{} {} {} {}",
+        "{} {} {} {} {}",
         schema::TX_BEGIN,
         statements,
+        schema::TX_CREATE_FENCE,
         schema::TX_CREATE_SCHEMA_META,
         schema::TX_COMMIT,
     );
@@ -330,6 +360,19 @@ pub(crate) async fn apply_migration(
     );
     bindings.insert("schema_meta_key".to_owned(), json!(schema::SCHEMA_META_KEY));
     bindings.insert("schema_meta_record".to_owned(), json!(record));
+    bindings.insert(
+        "fence_table".to_owned(),
+        json!(schema::table::CANONICAL_FENCE),
+    );
+    bindings.insert("fence_key".to_owned(), json!(schema::FENCE_KEY));
+    bindings.insert(
+        "fence".to_owned(),
+        json!({
+            "state_fence": state_fence,
+            "next_commit_sequence": 1_u64,
+            "next_outbox_sequence": 1_u64,
+        }),
+    );
     let mut response =
         client::query(db, &adapter.config, "migration.apply", &sql, bindings).await?;
     if !response.take_errors().is_empty() {
@@ -339,7 +382,17 @@ pub(crate) async fn apply_migration(
     }
     let observed = read_schema_meta(db, &adapter.config).await?;
     match migration_preflight(observed, migration) {
-        Ok(MigrationPreflight::ExactReplay) => Ok(migration_receipt(migration)),
+        Ok(MigrationPreflight::ExactReplay) => {
+            let fence = read_fence(db, &adapter.config).await?;
+            let Some(fence) = fence else {
+                return Err(AdapterError::PartialOutcome);
+            };
+            validate_fence_record(&fence)?;
+            if fence.state_fence != *state_fence {
+                return Err(AdapterError::PartialOutcome);
+            }
+            Ok(migration_receipt(migration))
+        }
         Ok(MigrationPreflight::Empty) | Err(_) => Err(AdapterError::PartialOutcome),
     }
 }
@@ -573,7 +626,6 @@ pub(crate) async fn read_validation_snapshot(
     adapter: &SurrealStoreAdapter,
 ) -> Result<CanonicalValidationSnapshot, AdapterError> {
     let db = client(adapter).await?;
-    ensure_ready(adapter, db).await?;
     let mut response = client::query(
         db,
         &adapter.config,
@@ -582,19 +634,63 @@ pub(crate) async fn read_validation_snapshot(
         Map::new(),
     )
     .await?;
-    if !response.take_errors().is_empty() {
-        return Err(AdapterError::PartialOutcome);
-    }
-    let fence = response
-        .take::<Option<FenceRecord>>(1)?
-        .ok_or(StoreError::Unavailable)?;
-    let revision_heads = response.take::<Vec<RevisionHead>>(2)?;
     let observed_at_unix_ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_err(|_| AdapterError::ProviderUnavailable)?
         .as_millis()
         .try_into()
         .map_err(|_| AdapterError::ProviderUnavailable)?;
+    parse_validation_snapshot(
+        &mut response,
+        &adapter.config.expected_schema_generation,
+        observed_at_unix_ms,
+    )
+}
+
+fn parse_validation_snapshot(
+    response: &mut client::RpcResults,
+    expected_generation: &SchemaGeneration,
+    observed_at_unix_ms: i64,
+) -> Result<CanonicalValidationSnapshot, AdapterError> {
+    if !response.take_errors().is_empty() {
+        return Err(AdapterError::PartialOutcome);
+    }
+    let schema = take_schema_meta(response, 1)?.ok_or(AdapterError::MigrationRequired)?;
+    validate_schema_meta_record(&schema)?;
+    if schema.migration_state != "APPLIED" || schema.generation != expected_generation.as_str() {
+        return Err(AdapterError::MigrationRequired);
+    }
+    let fence = response
+        .take::<Option<FenceRecord>>(2)?
+        .ok_or(StoreError::Unavailable)?;
+    validate_fence_record(&fence)?;
+    let revision_heads = response.take::<Vec<RevisionHead>>(3)?;
+    let commit_result = response.take::<Value>(4)?;
+    build_validation_snapshot(
+        Some(schema),
+        Some(fence),
+        revision_heads,
+        expected_generation,
+        observed_at_unix_ms,
+        commit_result,
+    )
+}
+
+fn build_validation_snapshot(
+    schema: Option<SchemaMetaRecord>,
+    fence: Option<FenceRecord>,
+    revision_heads: Vec<RevisionHead>,
+    expected_generation: &SchemaGeneration,
+    observed_at_unix_ms: i64,
+    _commit_result: Value,
+) -> Result<CanonicalValidationSnapshot, AdapterError> {
+    let schema = schema.ok_or(AdapterError::MigrationRequired)?;
+    validate_schema_meta_record(&schema)?;
+    if schema.migration_state != "APPLIED" || schema.generation != expected_generation.as_str() {
+        return Err(AdapterError::MigrationRequired);
+    }
+    let fence = fence.ok_or(StoreError::Unavailable)?;
+    validate_fence_record(&fence)?;
     let snapshot = CanonicalValidationSnapshot {
         state_fence: fence.state_fence,
         revision_heads,
@@ -1291,5 +1387,38 @@ mod migration_tests {
             migration_preflight(Some(observed), &migration),
             Err(AdapterError::PartialOutcome)
         );
+    }
+
+    #[test]
+    fn validation_query_keeps_schema_fence_heads_and_commit_in_one_transaction() {
+        assert!(READ_VALIDATION_SNAPSHOT.starts_with("BEGIN TRANSACTION;"));
+        assert!(READ_VALIDATION_SNAPSHOT.contains("schema_meta:current"));
+        assert!(READ_VALIDATION_SNAPSHOT.contains("canonical_fence:current"));
+        assert!(READ_VALIDATION_SNAPSHOT.contains("SELECT VALUE body FROM revision_head"));
+        assert!(READ_VALIDATION_SNAPSHOT.ends_with("COMMIT TRANSACTION;"));
+    }
+
+    #[test]
+    fn validation_result_indexes_admit_a_fresh_empty_canonical_store() {
+        let migration = migration();
+        let fence = StateFence::new(
+            eliot_contracts::AuthorityEpoch::new(1).expect("epoch"),
+            eliot_contracts::ResourceGeneration::new(1).expect("generation"),
+        );
+        let snapshot = build_validation_snapshot(
+            Some(schema_meta_record(&migration, "1000")),
+            Some(FenceRecord {
+                state_fence: fence,
+                next_commit_sequence: 1,
+                next_outbox_sequence: 1,
+            }),
+            Vec::new(),
+            &migration.generation_after,
+            1_000,
+            Value::Null,
+        )
+        .expect("fresh snapshot");
+        assert!(snapshot.revision_heads.is_empty());
+        assert_eq!(snapshot.validation_revision, 1);
     }
 }

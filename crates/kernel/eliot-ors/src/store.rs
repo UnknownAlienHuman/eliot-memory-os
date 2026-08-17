@@ -24,13 +24,13 @@ use crate::{
     GenerationTransition, GenerationTransitionReceipt, JobCheckpoint, KernelAuthoritySnapshot,
     OpaqueLabel, OperationalControlProjection, OperationalMutationReceipt, OperationalPhase,
     OperationalRecordContext, OperationalRecordInput, OrsError, OrsSnapshotReceipt,
-    OrsSnapshotRequest, PendingOperationPage, ProcessEvidenceRecord, ProcessStartReplayRecord,
-    ProcessStartReplayState, RecoveredAuthoritySnapshot, RecoveryCursor, RecoveryInboxDisposition,
-    RecoveryInboxItem, RecoveryInboxReceipt, RecoveryPage, RecoveryPayload,
-    RecoveryPayloadEnvelope, ReservationRecord, ReservationRequest, ReservationState,
-    ReservedScope, RetryState, ScopeTerminalReceipt, ScopeTerminalView, SessionBindingReceipt,
-    SessionDetach, StageReceipt, StagedOperation, StateFenceSnapshot, UserBrokerFence,
-    UserBrokerRegistration, UserBrokerRegistrationReceipt, WriterReservationToken,
+    OrsSnapshotRequest, PendingOperationPage, ProcessEvidenceRecord, ProcessStartReplayAbort,
+    ProcessStartReplayRecord, ProcessStartReplayState, RecoveredAuthoritySnapshot, RecoveryCursor,
+    RecoveryInboxDisposition, RecoveryInboxItem, RecoveryInboxReceipt, RecoveryPage,
+    RecoveryPayload, RecoveryPayloadEnvelope, ReservationRecord, ReservationRequest,
+    ReservationState, ReservedScope, RetryState, ScopeTerminalReceipt, ScopeTerminalView,
+    SessionBindingReceipt, SessionDetach, StageReceipt, StagedOperation, StateFenceSnapshot,
+    UserBrokerFence, UserBrokerRegistration, UserBrokerRegistrationReceipt, WriterReservationToken,
 };
 
 const META: TableDefinition<&str, &str> = TableDefinition::new("ors_meta_v1");
@@ -547,6 +547,47 @@ impl RedbRecoveryStore {
             }
         }
         write.commit().map_err(storage)
+    }
+
+    /// Compare-and-deletes exactly one reserved process-start record.
+    pub fn abort_process_start(
+        &self,
+        operation_id: &crate::OperationIdentity,
+        admission_digest: &str,
+        owner: &eliot_process::ProcessOwnerBinding,
+    ) -> Result<ProcessStartReplayAbort, OrsError> {
+        let write = self.database.begin_write().map_err(storage)?;
+        let key = operation_id.as_str();
+        let mut table = write.open_table(PROCESS_START_REPLAY).map_err(storage)?;
+        let existing = {
+            let Some(value) = table.get(key).map_err(storage)? else {
+                drop(table);
+                return Err(OrsError::IntegrityProblem {
+                    record_type: "process_start_replay",
+                    reason: "reserved replay record disappeared before abort".to_owned(),
+                });
+            };
+            decode::<ProcessStartReplayRecord>(value.value())?
+        };
+        existing.validate()?;
+        if existing.operation_id != *operation_id
+            || existing.admission_digest != admission_digest
+            || existing.owner != *owner
+        {
+            return Err(OrsError::IntegrityProblem {
+                record_type: "process_start_replay",
+                reason: "pre-effect abort identity mismatch".to_owned(),
+            });
+        }
+        let result = if existing.state == ProcessStartReplayState::Reserved {
+            table.remove(key).map_err(storage)?;
+            ProcessStartReplayAbort::Released
+        } else {
+            ProcessStartReplayAbort::NotReleased
+        };
+        drop(table);
+        write.commit().map_err(storage)?;
+        Ok(result)
     }
 
     /// Atomically reserves one typed authority handoff by create-if-absent.
@@ -3601,4 +3642,77 @@ fn decode_named<T: PersistedValue>(value: &str, record_type: &'static str) -> Re
 
 fn storage(error: impl std::fmt::Display) -> OrsError {
     OrsError::Storage(error.to_string())
+}
+
+#[cfg(test)]
+mod process_start_abort_tests {
+    use super::*;
+    use crate::OperationIdentity;
+
+    #[test]
+    fn reserved_abort_is_compare_delete_and_survives_reopen() -> Result<(), OrsError> {
+        let path = std::env::temp_dir().join(format!(
+            "eliot-process-start-abort-{}-{}.redb",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |duration| duration.as_nanos())
+        ));
+        let owner = eliot_process::ProcessOwnerBinding::new(
+            "testd",
+            "a".repeat(64),
+            1,
+            eliot_process::Generation::new(1).map_err(|error| OrsError::IntegrityProblem {
+                record_type: "test",
+                reason: error.to_string(),
+            })?,
+        )
+        .map_err(|error| OrsError::IntegrityProblem {
+            record_type: "test",
+            reason: error.to_string(),
+        })?;
+        let operation = OperationIdentity::new("abort-operation")?;
+        let record = ProcessStartReplayRecord {
+            operation_id: operation.clone(),
+            admission_digest: "ab".repeat(32),
+            owner: owner.clone(),
+            state: ProcessStartReplayState::Reserved,
+            receipt: None,
+        };
+        let store = RedbRecoveryStore::open(&path)?;
+        assert!(store.begin_process_start(&record)?.is_none());
+        assert_eq!(
+            store.abort_process_start(&operation, &record.admission_digest, &owner)?,
+            ProcessStartReplayAbort::Released
+        );
+        assert!(store.load_process_start(&operation)?.is_none());
+        drop(store);
+        let reopened = RedbRecoveryStore::open(&path)?;
+        assert!(reopened.load_process_start(&operation)?.is_none());
+
+        let unknown_operation = OperationIdentity::new("abort-unknown")?;
+        let unknown = ProcessStartReplayRecord {
+            operation_id: unknown_operation.clone(),
+            state: ProcessStartReplayState::Unknown,
+            ..record
+        };
+        assert!(reopened.begin_process_start(&unknown)?.is_none());
+        reopened.persist_process_start(&unknown)?;
+        assert_eq!(
+            reopened.abort_process_start(&unknown_operation, &unknown.admission_digest, &owner)?,
+            ProcessStartReplayAbort::NotReleased
+        );
+        assert_eq!(
+            reopened
+                .load_process_start(&unknown_operation)?
+                .ok_or_else(|| OrsError::IntegrityProblem {
+                    record_type: "test",
+                    reason: "unknown replay record disappeared".to_owned(),
+                })?
+                .state,
+            ProcessStartReplayState::Unknown
+        );
+        let _ = std::fs::remove_file(path);
+        Ok(())
+    }
 }

@@ -551,6 +551,296 @@ impl<T: EbpStoreTransport + 'static> CanonicalStoreClient for EbpCanonicalStoreC
     }
 }
 
+#[cfg(test)]
+#[allow(
+    clippy::cast_possible_wrap,
+    clippy::expect_used,
+    clippy::items_after_test_module,
+    clippy::too_many_lines
+)]
+mod tests {
+    use super::*;
+    use eliot_contracts::{AuthorityEpoch, ResourceGeneration, StateFence};
+    use eliot_ipc::DeliveryOutcome;
+    use eliot_platform::PlatformHandle;
+    use eliot_protocol::{FrameKind, MessageType, ProtocolPayload, ServerHello};
+    use eliot_store_api::StoreResponse;
+    use serde_json::json;
+
+    #[derive(Clone, Copy, Debug)]
+    enum SnapshotFault {
+        Valid,
+        Unavailable,
+        WrongRequestId,
+        WrongFence,
+        WrongGeneration,
+        WrongAuthority,
+        FutureTimestamp,
+        StaleTimestamp,
+        MalformedZeroRevision,
+        DuplicateHeads,
+        MixedHeadFence,
+        SubstitutedConnection,
+    }
+
+    struct FakeEbpStoreTransport {
+        requirement: HostStoreBootstrapRequirement,
+        pending: Option<Frame>,
+        fault: SnapshotFault,
+        validation_calls: usize,
+    }
+
+    impl FakeEbpStoreTransport {
+        fn new(requirement: HostStoreBootstrapRequirement, fault: SnapshotFault) -> Self {
+            Self {
+                requirement,
+                pending: None,
+                fault,
+                validation_calls: 0,
+            }
+        }
+
+        fn response(
+            connection_id: String,
+            request_id: RequestId,
+            response: StoreResponse,
+        ) -> Frame {
+            eliot_store_api::response_frame(
+                connection_id,
+                ProtocolVersion::CURRENT,
+                Some(request_id),
+                response,
+            )
+            .expect("fake response")
+        }
+
+        fn raw_snapshot(
+            connection_id: String,
+            request_id: RequestId,
+            value: serde_json::Value,
+        ) -> Frame {
+            Frame {
+                protocol_version: ProtocolVersion::CURRENT,
+                encoding_profile: eliot_protocol::EncodingProfile::JsonV1,
+                connection_id,
+                request_id: Some(request_id),
+                kind: FrameKind::Response,
+                message_type: MessageType::Result,
+                request_identity: None,
+                payload: ProtocolPayload::Json(value),
+                trace_context: BTreeMap::new(),
+            }
+        }
+    }
+
+    impl EbpStoreTransport for FakeEbpStoreTransport {
+        fn ensure_authenticated(
+            &self,
+            _requirement: &HostStoreBootstrapRequirement,
+        ) -> Result<(), StoreClientError> {
+            Ok(())
+        }
+
+        async fn send_frame(
+            &mut self,
+            frame: &Frame,
+            _limits: TransportLimits,
+        ) -> Result<DeliveryOutcome, StoreClientError> {
+            if frame.kind == FrameKind::Control {
+                let hello = ServerHello {
+                    selected_protocol: ProtocolVersion::CURRENT,
+                    session_principal_binding: "fake-store-session".to_owned(),
+                    allowed_capabilities: CAPABILITIES
+                        .iter()
+                        .map(|value| (*value).to_owned())
+                        .collect(),
+                    allowed_effects: EFFECTS.iter().map(|value| (*value).to_owned()).collect(),
+                    config_snapshot: json!({
+                        "config_hash": self.requirement.approved_config_hash.as_str(),
+                        "artifact_hash": self.requirement.approved_artifact_hash.as_str(),
+                    }),
+                    heartbeat_ms: 1_000,
+                    control_channel: "fake-store-control".to_owned(),
+                    rejection_reason: None,
+                    authority_epoch: self.requirement.authority_epoch(),
+                };
+                self.pending = Some(
+                    eliot_ipc::server_hello_frame(self.requirement.connection_id.as_str(), &hello)
+                        .expect("fake server hello"),
+                );
+                return Ok(DeliveryOutcome::Delivered);
+            }
+            let (request_id, _identity, request) =
+                eliot_store_api::decode_request_frame(frame).map_err(StoreClientError::from)?;
+            match request {
+                StoreRequest::Readiness => {
+                    self.pending = Some(Self::response(
+                        self.requirement.connection_id.as_str().to_owned(),
+                        request_id,
+                        StoreResponse::Readiness {
+                            receipt: eliot_store_api::ReadinessReceipt::ready("1.0.0".to_owned()),
+                        },
+                    ));
+                }
+                StoreRequest::ValidationSnapshot => {
+                    self.validation_calls += 1;
+                    let response_id = match self.fault {
+                        SnapshotFault::WrongRequestId => {
+                            RequestId::new("wrong-request").expect("id")
+                        }
+                        _ => request_id.clone(),
+                    };
+                    let connection_id = match self.fault {
+                        SnapshotFault::SubstitutedConnection => "substituted-connection".to_owned(),
+                        _ => self.requirement.connection_id.as_str().to_owned(),
+                    };
+                    let fence = match self.fault {
+                        SnapshotFault::WrongFence | SnapshotFault::WrongAuthority => {
+                            StateFence::new(
+                                AuthorityEpoch::new(2).expect("epoch"),
+                                ResourceGeneration::new(1).expect("generation"),
+                            )
+                        }
+                        SnapshotFault::WrongGeneration => StateFence::new(
+                            AuthorityEpoch::new(1).expect("epoch"),
+                            ResourceGeneration::new(2).expect("generation"),
+                        ),
+                        _ => self.requirement.state_fence.clone(),
+                    };
+                    let observed_at_unix_ms = match self.fault {
+                        SnapshotFault::FutureTimestamp => unix_ms().saturating_add(60_000) as i64,
+                        SnapshotFault::StaleTimestamp => unix_ms().saturating_sub(60_000) as i64,
+                        _ => unix_ms() as i64,
+                    };
+                    if matches!(self.fault, SnapshotFault::Unavailable) {
+                        self.pending = Some(Self::response(
+                            connection_id,
+                            response_id,
+                            StoreResponse::Error {
+                                error: "unavailable".to_owned(),
+                            },
+                        ));
+                    } else {
+                        let head = json!({
+                            "key": "scope:one",
+                            "revision": 1,
+                            "state_fence": fence,
+                        });
+                        let heads = match self.fault {
+                            SnapshotFault::MalformedZeroRevision => json!([{
+                                "key": "scope:one",
+                                "revision": 0,
+                                "state_fence": self.requirement.state_fence,
+                            }]),
+                            SnapshotFault::DuplicateHeads => json!([head.clone(), head]),
+                            SnapshotFault::MixedHeadFence => json!([
+                                head,
+                                {
+                                    "key": "scope:two",
+                                    "revision": 1,
+                                    "state_fence": StateFence::new(
+                                        AuthorityEpoch::new(1).expect("epoch"),
+                                        ResourceGeneration::new(2).expect("generation"),
+                                    ),
+                                }
+                            ]),
+                            _ => json!([]),
+                        };
+                        let snapshot = json!({
+                            "state_fence": fence,
+                            "revision_heads": heads,
+                            "validation_revision": 1,
+                            "observed_at_unix_ms": observed_at_unix_ms,
+                        });
+                        self.pending = Some(Self::raw_snapshot(
+                            connection_id,
+                            response_id,
+                            json!({ "status": "validation_snapshot", "snapshot": snapshot }),
+                        ));
+                    }
+                }
+                _ => {
+                    return Err(StoreClientError::Contract(
+                        "fake transport received unexpected request".to_owned(),
+                    ));
+                }
+            }
+            Ok(DeliveryOutcome::Delivered)
+        }
+
+        async fn receive_frame(
+            &mut self,
+            _limits: TransportLimits,
+        ) -> Result<Frame, StoreClientError> {
+            self.pending
+                .take()
+                .ok_or_else(|| StoreClientError::Transport("fake response missing".to_owned()))
+        }
+    }
+
+    fn requirement() -> HostStoreBootstrapRequirement {
+        let fence = StateFence::new(
+            AuthorityEpoch::new(1).expect("epoch"),
+            ResourceGeneration::new(1).expect("generation"),
+        );
+        HostStoreBootstrapRequirement {
+            route_identity: PlatformHandle::new("store_bridge").expect("route"),
+            canonical_pipe_identity: PlatformHandle::new(r"\\.\pipe\eliot\store").expect("pipe"),
+            store_generation: ResourceGeneration::new(1).expect("generation"),
+            state_fence: fence,
+            launch_nonce: PlatformHandle::new("launch").expect("launch"),
+            connection_id: PlatformHandle::new("connection").expect("connection"),
+            expected_peer_sid: PlatformHandle::new("S-1-5-18").expect("sid"),
+            expected_peer_session_id: 1,
+            approved_artifact_hash: PlatformHandle::new("a".repeat(64)).expect("artifact"),
+            approved_config_hash: PlatformHandle::new("b".repeat(64)).expect("config"),
+            timeout_ms: 30_000,
+        }
+    }
+
+    #[tokio::test]
+    async fn validation_snapshot_transport_matrix_is_one_call_and_fail_closed() {
+        let faults = [
+            SnapshotFault::Unavailable,
+            SnapshotFault::WrongRequestId,
+            SnapshotFault::WrongFence,
+            SnapshotFault::WrongGeneration,
+            SnapshotFault::WrongAuthority,
+            SnapshotFault::FutureTimestamp,
+            SnapshotFault::StaleTimestamp,
+            SnapshotFault::MalformedZeroRevision,
+            SnapshotFault::DuplicateHeads,
+            SnapshotFault::MixedHeadFence,
+            SnapshotFault::SubstitutedConnection,
+        ];
+        for fault in faults {
+            let req = requirement();
+            let transport = FakeEbpStoreTransport::new(req.clone(), fault);
+            let client = EbpCanonicalStoreClient::connect(transport, req)
+                .await
+                .expect("fake handshake and readiness");
+            assert!(
+                client.validation_snapshot().await.is_err(),
+                "fault {fault:?} unexpectedly produced a valid snapshot"
+            );
+            let transport = client.transport.lock().await;
+            assert_eq!(transport.validation_calls, 1);
+        }
+        let req = requirement();
+        let transport = FakeEbpStoreTransport::new(req.clone(), SnapshotFault::Valid);
+        let client = EbpCanonicalStoreClient::connect(transport, req)
+            .await
+            .expect("positive fake handshake and readiness");
+        let snapshot = client
+            .validation_snapshot()
+            .await
+            .expect("empty canonical snapshot");
+        assert!(snapshot.revision_heads.is_empty());
+        let transport = client.transport.lock().await;
+        assert_eq!(transport.validation_calls, 1);
+    }
+}
+
 fn client_hello(
     requirement: &HostStoreBootstrapRequirement,
 ) -> Result<ClientHello, StoreClientError> {

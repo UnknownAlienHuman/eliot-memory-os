@@ -50,6 +50,27 @@ pub use module::epoch_and_fence::{EpochActivation, RouteFence, RouteScope};
 pub use module::generation_routing::{CutoverDecision, GenerationRoute, GenerationRouter};
 pub use module::recovery_state_view::{RecoveryViewBuilder, project_operational_state};
 
+/// Result of releasing a pre-effect process-start replay reservation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProcessExecutionReplayAbort {
+    /// The exact reserved record was compare-and-deleted.
+    Released,
+    /// The record was not a releasable reservation; fail closed.
+    NotReleased,
+}
+
+/// Optional durable replay port used only before process authority is issued.
+/// The base replay store remains unchanged for existing K1B consumers.
+pub trait ProcessExecutionReplayStoreWithAbort: ProcessExecutionReplayStore {
+    /// Compare-and-deletes exactly one reserved pre-effect operation.
+    fn abort_process_start(
+        &self,
+        operation_id: &eliot_process::OperationId,
+        admission_digest: &str,
+        owner: &eliot_process::ProcessOwnerBinding,
+    ) -> KernelResult<ProcessExecutionReplayAbort>;
+}
+
 use eliot_contracts::{
     ContractIdentity, ContractVersion, contract_identity as make_contract_identity,
 };

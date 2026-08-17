@@ -2843,14 +2843,7 @@ fn validate_revision_heads(heads: &BTreeMap<String, String>) -> Result<(), Contr
     }
     for (name, digest) in heads {
         validate_opaque_id("revision_head_name", name.clone())?;
-        if digest.parse::<u64>().is_err() {
-            validate_hex_digest("revision_head_digest", digest)?;
-        } else if digest == "0" {
-            return Err(ContractError::InvalidValue {
-                field: "revision_head_revision",
-                reason: "must be non-zero",
-            });
-        }
+        validate_hex_digest("revision_head_digest", digest)?;
     }
     Ok(())
 }
@@ -2873,7 +2866,11 @@ fn validate_replay_nonces(field: &'static str, nonces: &[String]) -> Result<(), 
 }
 
 fn validate_hex_digest(field: &'static str, value: &str) -> Result<(), ContractError> {
-    if value.len() != 64 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+    if value.len() != 64
+        || !value
+            .bytes()
+            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+    {
         return Err(ContractError::InvalidValue {
             field,
             reason: "must be a 64-character hexadecimal digest",
@@ -3105,6 +3102,29 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn revision_heads_remain_strict_lowercase_sha256_bindings() -> TestResult {
+        for value in ["1", "01", &"A".repeat(64), &"g".repeat(64)] {
+            let mut heads = BTreeMap::new();
+            heads.insert("store:revision".to_owned(), value.to_string());
+            assert!(matches!(
+                PermitIssuance::new(
+                    ActionLeaseRef::new("lease-1")?,
+                    fence()?,
+                    heads,
+                    100,
+                    200,
+                    "strict-revision-test",
+                ),
+                Err(ContractError::InvalidValue {
+                    field: "revision_head_digest",
+                    ..
+                })
+            ));
+        }
+        Ok(())
+    }
+
     fn running_state() -> Result<ProcessState, ContractError> {
         let (_, validated) = validated()?;
         let mut state = ProcessState::from_validated(&validated);
@@ -3227,7 +3247,7 @@ mod tests {
         let mut changed_heads = context(150)?;
         changed_heads
             .revision_heads
-            .insert("scope:one".to_owned(), "2".to_owned());
+            .insert("scope:one".to_owned(), "c".repeat(64));
         assert!(matches!(
             authority_heads.validate_and_consume(request, observed(&intent)?, &changed_heads),
             Err(ContractError::StaleRevisionHeads)

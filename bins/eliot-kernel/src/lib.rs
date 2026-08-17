@@ -7,10 +7,10 @@
 
 #![forbid(unsafe_code)]
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, btree_map::Entry};
 use std::fmt;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -23,9 +23,10 @@ use eliot_ipc::{
 };
 use eliot_kernel_core::{
     AuthoritySnapshotBinding, AuthoritySnapshotBindingWire, DispatchSnapshotCodec, GenerationRoute,
-    GenerationRouter, ProcessDispatchAuthorityController, ProcessExecutionReplayBegin,
-    ProcessExecutionReplayRecord, ProcessExecutionReplayState, ProcessExecutionReplayStore,
-    RouteScope, process_admission_digest,
+    GenerationRouter, ProcessDispatchAuthorityController, ProcessExecutionReplayAbort,
+    ProcessExecutionReplayBegin, ProcessExecutionReplayRecord, ProcessExecutionReplayState,
+    ProcessExecutionReplayStore, ProcessExecutionReplayStoreWithAbort, RouteScope,
+    process_admission_digest,
 };
 use eliot_kernel_service::{
     EbpCanonicalStoreClient, HostStoreBootstrapRequirement, KernelControlCommand, KernelService,
@@ -62,7 +63,8 @@ use eliot_runtime_contracts::{
 };
 use eliot_store_api::{
     CanonicalStoreClient, CanonicalValidationSnapshot, OrderingHeadExpectation, PreparedTransition,
-    RevisionHeadExpectation, StoreError, WriteReceipt,
+    RevisionHead, RevisionHeadExpectation, StateFence as StoreStateFence, StoreError, WriteReceipt,
+    canonical_json_bytes,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
@@ -490,31 +492,159 @@ impl ProcessExecutionReplayStore for OrsProcessReplayStore {
     }
 }
 
+impl ProcessExecutionReplayStoreWithAbort for OrsProcessReplayStore {
+    fn abort_process_start(
+        &self,
+        operation_id: &eliot_process::OperationId,
+        admission_digest: &str,
+        owner: &ProcessOwnerBinding,
+    ) -> Result<ProcessExecutionReplayAbort, eliot_kernel_core::KernelError> {
+        self.store
+            .abort_process_start(
+                &eliot_ors::OperationIdentity::new(operation_id.as_str()).map_err(|error| {
+                    eliot_kernel_core::KernelError::DependencyUnavailable(error.to_string())
+                })?,
+                admission_digest,
+                owner,
+            )
+            .map(|result| match result {
+                eliot_ors::ProcessStartReplayAbort::Released => {
+                    ProcessExecutionReplayAbort::Released
+                }
+                eliot_ors::ProcessStartReplayAbort::NotReleased => {
+                    ProcessExecutionReplayAbort::NotReleased
+                }
+            })
+            .map_err(|error| {
+                eliot_kernel_core::KernelError::DependencyUnavailable(error.to_string())
+            })
+    }
+}
+
+const RESERVED_STORE_SNAPSHOT_HEAD: &str = "__eliot_store_snapshot__";
+const STORE_IDENTITY_BINDING: &str = "eliot.storage.store-api";
+
+#[derive(Serialize)]
+struct CanonicalStoreRevision<'a> {
+    key: &'a str,
+    revision: u64,
+    state_fence: &'a StoreStateFence,
+}
+
+#[derive(Serialize)]
+struct CanonicalStoreSnapshot<'a> {
+    store_identity: &'static str,
+    state_fence: &'a StoreStateFence,
+    revision_heads: Vec<CanonicalStoreRevision<'a>>,
+    validation_revision: u64,
+}
+
+fn project_store_snapshot(
+    snapshot: &CanonicalValidationSnapshot,
+) -> Result<(FencingToken, BTreeMap<String, String>), ProcessExecutionError> {
+    snapshot
+        .validate()
+        .map_err(|error| ProcessExecutionError::Unavailable(error.to_string()))?;
+    let mut ordered_heads: Vec<&RevisionHead> = snapshot.revision_heads.iter().collect();
+    ordered_heads.sort_by(|left, right| left.key.cmp(&right.key));
+    if ordered_heads
+        .iter()
+        .any(|head| head.key.as_str() == RESERVED_STORE_SNAPSHOT_HEAD)
+    {
+        return Err(ProcessExecutionError::Unavailable(
+            "Store revision key collides with reserved snapshot binding".to_owned(),
+        ));
+    }
+    let mut projected = BTreeMap::new();
+    let mut canonical_heads = Vec::with_capacity(ordered_heads.len());
+    for head in ordered_heads {
+        let binding = CanonicalStoreRevision {
+            key: head.key.as_str(),
+            revision: head.revision,
+            state_fence: &snapshot.state_fence,
+        };
+        let digest = sha256_hex(
+            &canonical_json_bytes(&binding)
+                .map_err(|error| ProcessExecutionError::Unavailable(error.to_string()))?,
+        );
+        projected.insert(head.key.to_string(), digest);
+        canonical_heads.push(binding);
+    }
+    let snapshot_binding = CanonicalStoreSnapshot {
+        store_identity: STORE_IDENTITY_BINDING,
+        state_fence: &snapshot.state_fence,
+        revision_heads: canonical_heads,
+        validation_revision: snapshot.validation_revision,
+    };
+    let snapshot_digest = sha256_hex(
+        &canonical_json_bytes(&snapshot_binding)
+            .map_err(|error| ProcessExecutionError::Unavailable(error.to_string()))?,
+    );
+    projected.insert(
+        RESERVED_STORE_SNAPSHOT_HEAD.to_owned(),
+        snapshot_digest.clone(),
+    );
+    let fence = FencingToken::new(
+        snapshot.state_fence.authority_epoch.value(),
+        Generation::new(snapshot.state_fence.resource_generation.value())
+            .map_err(|error| ProcessExecutionError::Unavailable(error.to_string()))?,
+        format!("store-snapshot-{snapshot_digest}"),
+    )
+    .map_err(|error| ProcessExecutionError::Unavailable(error.to_string()))?;
+    Ok((fence, projected))
+}
+
 struct ValidationContextSlot {
-    contexts: Mutex<BTreeMap<eliot_process::OperationId, DispatchValidationContext>>,
+    contexts: Mutex<BTreeMap<eliot_process::OperationId, (u64, DispatchValidationContext)>>,
+    next_owner: AtomicU64,
+}
+
+struct ValidationContextGuard {
+    slot: Arc<ValidationContextSlot>,
+    operation_id: eliot_process::OperationId,
+    owner: u64,
+    active: bool,
+}
+
+impl Drop for ValidationContextGuard {
+    fn drop(&mut self) {
+        if self.active {
+            self.slot.remove_owned(&self.operation_id, self.owner);
+        }
+    }
 }
 
 impl ValidationContextSlot {
     fn new() -> Self {
         Self {
             contexts: Mutex::new(BTreeMap::new()),
+            next_owner: AtomicU64::new(1),
         }
     }
 
     fn insert(
-        &self,
+        self: &Arc<Self>,
         operation_id: eliot_process::OperationId,
         context: DispatchValidationContext,
-    ) -> Result<(), ProcessExecutionError> {
+    ) -> Result<ValidationContextGuard, ProcessExecutionError> {
         let mut contexts = self.contexts.lock().map_err(|_| {
             ProcessExecutionError::Unavailable("validation context lock poisoned".to_owned())
         })?;
-        if contexts.insert(operation_id, context).is_some() {
-            return Err(ProcessExecutionError::Contract(
+        let owner = self.next_owner.fetch_add(1, Ordering::Relaxed);
+        match contexts.entry(operation_id.clone()) {
+            Entry::Vacant(entry) => {
+                entry.insert((owner, context));
+                Ok(ValidationContextGuard {
+                    slot: Arc::clone(self),
+                    operation_id,
+                    owner,
+                    active: true,
+                })
+            }
+            Entry::Occupied(_) => Err(ProcessExecutionError::Contract(
                 eliot_process::ContractError::DispatchBindingMismatch,
-            ));
+            )),
         }
-        Ok(())
     }
 
     fn take(
@@ -527,13 +657,18 @@ impl ValidationContextSlot {
                 ProcessExecutionError::Unavailable("validation context lock poisoned".to_owned())
             })?
             .remove(operation_id)
+            .map(|(_, context)| context)
             .ok_or(ProcessExecutionError::Contract(
                 eliot_process::ContractError::DispatchBindingMismatch,
             ))
     }
 
-    fn remove(&self, operation_id: &eliot_process::OperationId) {
-        if let Ok(mut contexts) = self.contexts.lock() {
+    fn remove_owned(&self, operation_id: &eliot_process::OperationId, owner: u64) {
+        if let Ok(mut contexts) = self.contexts.lock()
+            && contexts
+                .get(operation_id)
+                .is_some_and(|(current_owner, _)| *current_owner == owner)
+        {
             contexts.remove(operation_id);
         }
     }
@@ -565,13 +700,54 @@ impl DispatchValidationPort for ControllerDispatchPort {
 struct ProcessExecutionGateway {
     controller: Arc<Mutex<ProcessDispatchAuthorityController>>,
     executor: WindowsProcessExecutor,
-    replay_store: Arc<dyn ProcessExecutionReplayStore>,
+    replay_store: Arc<dyn ProcessExecutionReplayStoreWithAbort>,
     evidence_store: Arc<RedbRecoveryStore>,
     snapshot_binding: AuthoritySnapshotBinding,
     validation_contexts: Arc<ValidationContextSlot>,
     #[cfg(windows)]
     canonical_store: Arc<Mutex<Option<Arc<KernelStoreGateway>>>>,
     path_admission: Arc<KernelPathAdmission>,
+}
+
+struct ReplayReservationGuard {
+    store: Arc<dyn ProcessExecutionReplayStoreWithAbort>,
+    operation_id: eliot_process::OperationId,
+    admission_digest: String,
+    owner: ProcessOwnerBinding,
+    active: bool,
+}
+
+impl ReplayReservationGuard {
+    fn release(&mut self) -> Result<(), ProcessExecutionError> {
+        if !self.active {
+            return Ok(());
+        }
+        let result = self
+            .store
+            .abort_process_start(&self.operation_id, &self.admission_digest, &self.owner)
+            .map_err(|error| ProcessExecutionError::Unavailable(error.to_string()))?;
+        self.active = false;
+        match result {
+            ProcessExecutionReplayAbort::Released => Ok(()),
+            ProcessExecutionReplayAbort::NotReleased => Err(ProcessExecutionError::UnknownOutcome),
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.active = false;
+    }
+}
+
+impl Drop for ReplayReservationGuard {
+    fn drop(&mut self) {
+        if self.active {
+            let _ = self.store.abort_process_start(
+                &self.operation_id,
+                &self.admission_digest,
+                &self.owner,
+            );
+        }
+    }
 }
 
 /// Platform-owned path proof captured immediately before authority issuance.
@@ -588,6 +764,17 @@ struct KernelPathAdmission {
     proofs: Mutex<BTreeMap<eliot_process::OperationId, ProcessPathProof>>,
 }
 
+struct PathAdmissionGuard {
+    admission: Arc<KernelPathAdmission>,
+    operation_id: eliot_process::OperationId,
+}
+
+impl Drop for PathAdmissionGuard {
+    fn drop(&mut self) {
+        self.admission.remove(&self.operation_id);
+    }
+}
+
 impl KernelPathAdmission {
     fn new(_platform: Arc<WindowsPlatform>) -> Self {
         Self {
@@ -600,13 +787,18 @@ impl KernelPathAdmission {
         operation_id: eliot_process::OperationId,
         proof: ProcessPathProof,
     ) -> Result<(), ProcessExecutionError> {
-        self.proofs
-            .lock()
-            .map_err(|_| {
-                ProcessExecutionError::Unavailable("path admission lock poisoned".to_owned())
-            })?
-            .insert(operation_id, proof);
-        Ok(())
+        let mut proofs = self.proofs.lock().map_err(|_| {
+            ProcessExecutionError::Unavailable("path admission lock poisoned".to_owned())
+        })?;
+        match proofs.entry(operation_id) {
+            Entry::Vacant(entry) => {
+                entry.insert(proof);
+                Ok(())
+            }
+            Entry::Occupied(_) => Err(ProcessExecutionError::Contract(
+                eliot_process::ContractError::DispatchBindingMismatch,
+            )),
+        }
     }
 
     fn remove(&self, operation_id: &eliot_process::OperationId) {
@@ -662,6 +854,9 @@ impl ProcessExecutionGateway {
         path_admission: Arc<KernelPathAdmission>,
     ) -> Self {
         let validation_contexts = Arc::new(ValidationContextSlot::new());
+        let replay_store = Arc::new(OrsProcessReplayStore {
+            store: Arc::clone(&ors),
+        });
         let port = Arc::new(ControllerDispatchPort {
             controller: Arc::clone(&controller),
             binding: snapshot_binding.clone(),
@@ -671,9 +866,7 @@ impl ProcessExecutionGateway {
         Self {
             controller,
             executor: WindowsProcessExecutor::new_with_launch_admission(port, launch_admission),
-            replay_store: Arc::new(OrsProcessReplayStore {
-                store: Arc::clone(&ors),
-            }),
+            replay_store,
             evidence_store: ors,
             snapshot_binding,
             validation_contexts,
@@ -780,12 +973,18 @@ impl ProcessExecutionGateway {
                 eliot_process::ContractError::StaleStateFence,
             ));
         }
-        match self
+        let mut reservation = match self
             .replay_store
             .begin_process_start(admission.intent().operation_id(), &digest, owner)
             .map_err(|error| ProcessExecutionError::Unavailable(error.to_string()))?
         {
-            ProcessExecutionReplayBegin::Acquired => {}
+            ProcessExecutionReplayBegin::Acquired => ReplayReservationGuard {
+                store: Arc::clone(&self.replay_store),
+                operation_id: admission.intent().operation_id().clone(),
+                admission_digest: digest.clone(),
+                owner: owner.clone(),
+                active: true,
+            },
             ProcessExecutionReplayBegin::Existing(record) => {
                 if record.admission_digest != digest {
                     return Err(ProcessExecutionError::Contract(
@@ -809,46 +1008,57 @@ impl ProcessExecutionGateway {
                     }
                 };
             }
-        }
+        };
         let snapshot = {
             #[cfg(windows)]
             {
-                self.canonical_validation_snapshot().await?
+                match self.canonical_validation_snapshot().await {
+                    Ok(snapshot) => snapshot,
+                    Err(error) => {
+                        return Err(match reservation.release() {
+                            Ok(()) => error,
+                            Err(_) => ProcessExecutionError::UnknownOutcome,
+                        });
+                    }
+                }
             }
             #[cfg(not(windows))]
             {
-                return Err(ProcessExecutionError::Unavailable(
-                    "canonical store validation is unavailable on this platform".to_owned(),
-                ));
+                return Err(match reservation.release() {
+                    Ok(()) => ProcessExecutionError::Unavailable(
+                        "canonical store validation is unavailable on this platform".to_owned(),
+                    ),
+                    Err(_) => ProcessExecutionError::UnknownOutcome,
+                });
             }
         };
-        snapshot
-            .validate()
-            .map_err(|error| ProcessExecutionError::Unavailable(error.to_string()))?;
+        if let Err(error) = snapshot.validate() {
+            let failure = ProcessExecutionError::Unavailable(error.to_string());
+            return Err(match reservation.release() {
+                Ok(()) => failure,
+                Err(_) => ProcessExecutionError::UnknownOutcome,
+            });
+        }
         if admission.state_fence().authority_epoch() != snapshot.state_fence.authority_epoch.value()
             || admission.state_fence().generation().get()
                 != snapshot.state_fence.resource_generation.value()
         {
-            return Err(ProcessExecutionError::Contract(
-                eliot_process::ContractError::StaleStateFence,
-            ));
+            let failure =
+                ProcessExecutionError::Contract(eliot_process::ContractError::StaleStateFence);
+            return Err(match reservation.release() {
+                Ok(()) => failure,
+                Err(_) => ProcessExecutionError::UnknownOutcome,
+            });
         }
-        let store_fence = FencingToken::new(
-            snapshot.state_fence.authority_epoch.value(),
-            Generation::new(snapshot.state_fence.resource_generation.value())
-                .map_err(|error| ProcessExecutionError::Unavailable(error.to_string()))?,
-            format!(
-                "store-fence-{}-{}",
-                snapshot.state_fence.authority_epoch.value(),
-                snapshot.validation_revision
-            ),
-        )
-        .map_err(|error| ProcessExecutionError::Unavailable(error.to_string()))?;
-        let revision_heads = snapshot
-            .revision_heads
-            .iter()
-            .map(|head| (head.key.to_string(), head.revision.to_string()))
-            .collect::<BTreeMap<_, _>>();
+        let (store_fence, revision_heads) = match project_store_snapshot(&snapshot) {
+            Ok(projected) => projected,
+            Err(error) => {
+                return Err(match reservation.release() {
+                    Ok(()) => error,
+                    Err(_) => ProcessExecutionError::UnknownOutcome,
+                });
+            }
+        };
         let context = DispatchValidationContext::new(
             ClockObservation {
                 valid_time_ms: Some(snapshot.observed_at_unix_ms),
@@ -862,6 +1072,19 @@ impl ProcessExecutionGateway {
             snapshot.validation_revision,
         )
         .map_err(|error| ProcessExecutionError::Unavailable(error.to_string()))?;
+        let operation_id = admission.intent().operation_id().clone();
+        let context_guard = match self
+            .validation_contexts
+            .insert(operation_id.clone(), context)
+        {
+            Ok(guard) => guard,
+            Err(error) => {
+                return Err(match reservation.release() {
+                    Ok(()) => error,
+                    Err(_) => ProcessExecutionError::UnknownOutcome,
+                });
+            }
+        };
         let permit = match self
             .controller
             .lock()
@@ -889,30 +1112,32 @@ impl ProcessExecutionGateway {
         {
             Ok(permit) => permit,
             Err(error) => {
-                self.mark_unknown(admission.intent().operation_id(), &digest, owner);
-                return Err(error);
+                return Err(match reservation.release() {
+                    Ok(()) => error,
+                    Err(_) => ProcessExecutionError::UnknownOutcome,
+                });
             }
         };
         let request = match ProcessRequest::new(admission.intent().clone(), permit) {
             Ok(request) => request,
             Err(error) => {
-                self.mark_unknown(admission.intent().operation_id(), &digest, owner);
-                return Err(ProcessExecutionError::Contract(error));
+                let failure = ProcessExecutionError::Contract(error);
+                return Err(match reservation.release() {
+                    Ok(()) => failure,
+                    Err(_) => ProcessExecutionError::UnknownOutcome,
+                });
             }
         };
-        let operation_id = admission.intent().operation_id().clone();
         if let Err(error) = self.path_admission.insert(operation_id.clone(), path_proof) {
-            self.mark_unknown(&operation_id, &digest, owner);
-            return Err(error);
+            return Err(match reservation.release() {
+                Ok(()) => error,
+                Err(_) => ProcessExecutionError::UnknownOutcome,
+            });
         }
-        if let Err(error) = self
-            .validation_contexts
-            .insert(operation_id.clone(), context)
-        {
-            self.path_admission.remove(&operation_id);
-            self.mark_unknown(&operation_id, &digest, owner);
-            return Err(error);
-        }
+        let path_guard = PathAdmissionGuard {
+            admission: Arc::clone(&self.path_admission),
+            operation_id: operation_id.clone(),
+        };
         let receipt = match self
             .executor
             .start(
@@ -925,28 +1150,32 @@ impl ProcessExecutionGateway {
             .await
         {
             Ok(receipt) => {
-                self.validation_contexts.remove(&operation_id);
-                self.path_admission.remove(&operation_id);
+                drop(context_guard);
+                drop(path_guard);
                 receipt
             }
             Err(error) => {
-                self.validation_contexts.remove(&operation_id);
-                self.path_admission.remove(&operation_id);
+                drop(context_guard);
+                drop(path_guard);
+                reservation.disarm();
                 self.mark_unknown(admission.intent().operation_id(), &digest, owner);
                 return Err(error);
             }
         };
-        self.replay_store
-            .persist_process_start(
-                admission.intent().operation_id(),
-                ProcessExecutionReplayRecord {
-                    admission_digest: digest,
-                    owner: owner.clone(),
-                    state: ProcessExecutionReplayState::Completed,
-                    receipt: Some(receipt.clone()),
-                },
-            )
-            .map_err(|error| ProcessExecutionError::Unavailable(error.to_string()))?;
+        if let Err(error) = self.replay_store.persist_process_start(
+            admission.intent().operation_id(),
+            ProcessExecutionReplayRecord {
+                admission_digest: digest.clone(),
+                owner: owner.clone(),
+                state: ProcessExecutionReplayState::Completed,
+                receipt: Some(receipt.clone()),
+            },
+        ) {
+            reservation.disarm();
+            self.mark_unknown(admission.intent().operation_id(), &digest, owner);
+            return Err(ProcessExecutionError::Unavailable(error.to_string()));
+        }
+        reservation.disarm();
         Ok(receipt)
     }
 
@@ -965,9 +1194,7 @@ impl ProcessExecutionGateway {
         operation_id: eliot_process::OperationId,
     ) -> Result<eliot_process::CancellationReceipt, ProcessExecutionError> {
         self.authorize_operation(owner, &operation_id)?;
-        let result = self.executor.cancel(operation_id.clone()).await;
-        self.validation_contexts.remove(&operation_id);
-        result
+        self.executor.cancel(operation_id.clone()).await
     }
 
     async fn reconcile(
@@ -2247,6 +2474,7 @@ mod tests {
         ProcessTreeId, ResourceLimits, SessionId,
     };
     use eliot_runtime_contracts::ModuleContract;
+    use eliot_store_api::{RevisionHead, RevisionKey};
 
     fn test_client(policy: &ServerHandshakePolicy) -> eliot_protocol::ClientHello {
         eliot_protocol::ClientHello {
@@ -2344,6 +2572,23 @@ mod tests {
                 .expect("limits"),
         )
         .expect("intent")
+    }
+
+    fn test_validation_context(seed: &str) -> DispatchValidationContext {
+        DispatchValidationContext::new(
+            ClockObservation {
+                valid_time_ms: Some(1_000),
+                known_time_ms: Some(1_000),
+                transaction_sequence: None,
+                monotonic_ns: None,
+            },
+            FencingToken::new(1, Generation::new(1).expect("generation"), "context-fence")
+                .expect("fence"),
+            1,
+            BTreeMap::from([(seed.to_owned(), "a".repeat(64))]),
+            1,
+        )
+        .expect("context")
     }
 
     #[cfg(windows)]
@@ -2551,6 +2796,103 @@ mod tests {
         assert!(!kernel.process_execution_configured());
         assert_eq!(Arc::strong_count(&kernel.generation_gateway.ors), 1);
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn validation_context_slot_is_entry_based_and_one_shot() {
+        let slot = Arc::new(ValidationContextSlot::new());
+        let operation = OperationId::new("slot-operation").expect("operation");
+        let first = test_validation_context("first");
+        let second = test_validation_context("second");
+        let guard = slot
+            .insert(operation.clone(), first.clone())
+            .expect("first insertion");
+        assert!(slot.insert(operation.clone(), second).is_err());
+        assert_eq!(slot.take(&operation).expect("take first"), first);
+        assert!(slot.take(&operation).is_err());
+        drop(guard);
+        let guard = slot
+            .insert(operation.clone(), test_validation_context("replacement"))
+            .expect("replacement insertion");
+        drop(guard);
+        assert!(slot.take(&operation).is_err());
+    }
+
+    #[test]
+    fn validation_context_slot_guards_independent_operations_and_abort_cleanup() {
+        let slot = Arc::new(ValidationContextSlot::new());
+        let first_id = OperationId::new("slot-first").expect("operation");
+        let second_id = OperationId::new("slot-second").expect("operation");
+        let first_guard = slot
+            .insert(first_id.clone(), test_validation_context("first"))
+            .expect("first insertion");
+        let second_guard = slot
+            .insert(second_id.clone(), test_validation_context("second"))
+            .expect("second insertion");
+        let second = slot.take(&second_id).expect("second take");
+        assert_eq!(second, test_validation_context("second"));
+        drop(first_guard);
+        drop(second_guard);
+        assert!(slot.take(&first_id).is_err());
+        assert!(slot.take(&second_id).is_err());
+    }
+
+    #[test]
+    fn store_projection_is_deterministic_and_binds_empty_and_full_fence_state() {
+        let fence = StoreStateFence::new(
+            eliot_contracts::AuthorityEpoch::new(3).expect("epoch"),
+            eliot_contracts::ResourceGeneration::new(4).expect("generation"),
+        );
+        let first = CanonicalValidationSnapshot {
+            state_fence: fence.clone(),
+            revision_heads: vec![RevisionHead {
+                key: RevisionKey::new("scope:b").expect("key"),
+                revision: 2,
+                state_fence: fence.clone(),
+            }],
+            validation_revision: 9,
+            observed_at_unix_ms: 1_000,
+        };
+        let mut reordered = first.clone();
+        reordered.observed_at_unix_ms = 2_000;
+        let (first_fence, first_heads) = project_store_snapshot(&first).expect("projection");
+        let (reordered_fence, reordered_heads) =
+            project_store_snapshot(&reordered).expect("projection");
+        assert_eq!(first_fence, reordered_fence);
+        assert_eq!(first_heads, reordered_heads);
+        assert!(first_heads.contains_key(RESERVED_STORE_SNAPSHOT_HEAD));
+        assert_eq!(first_heads.len(), 2);
+
+        let empty = CanonicalValidationSnapshot {
+            state_fence: fence.clone(),
+            revision_heads: Vec::new(),
+            validation_revision: 1,
+            observed_at_unix_ms: 1_000,
+        };
+        let (_, empty_heads) = project_store_snapshot(&empty).expect("empty projection");
+        assert_eq!(empty_heads.len(), 1);
+        assert!(empty_heads.contains_key(RESERVED_STORE_SNAPSHOT_HEAD));
+
+        let mut changed = first.clone();
+        changed.state_fence.task_revision =
+            Some(eliot_contracts::TaskRevision::new(1).expect("task revision"));
+        for head in &mut changed.revision_heads {
+            head.state_fence = changed.state_fence.clone();
+        }
+        let (changed_fence, changed_heads) = project_store_snapshot(&changed).expect("changed");
+        assert_ne!(first_fence, changed_fence);
+        assert_ne!(first_heads, changed_heads);
+
+        let mut changed_head = first.clone();
+        changed_head.revision_heads[0].revision += 1;
+        let (_, changed_head_projection) =
+            project_store_snapshot(&changed_head).expect("changed head");
+        assert_ne!(first_heads, changed_head_projection);
+        let mut changed_validation_revision = first;
+        changed_validation_revision.validation_revision += 1;
+        let (_, changed_revision_projection) =
+            project_store_snapshot(&changed_validation_revision).expect("changed revision");
+        assert_ne!(first_heads, changed_revision_projection);
     }
 
     #[test]

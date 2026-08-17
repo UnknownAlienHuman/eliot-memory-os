@@ -61,6 +61,13 @@ pub struct ProcessStartReplayRecord {
     pub receipt: Option<eliot_process::ProcessStartReceipt>,
 }
 
+/// Durable result of compare-and-deleting a pre-effect process reservation.
+#[derive(Clone, Copy, Debug, Eq, JsonSchema, PartialEq)]
+pub enum ProcessStartReplayAbort {
+    Released,
+    NotReleased,
+}
+
 impl ProcessStartReplayRecord {
     pub fn validate(&self) -> Result<(), OrsError> {
         validate_text(self.operation_id.as_str(), "process_start_operation_id")?;

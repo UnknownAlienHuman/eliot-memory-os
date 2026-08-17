@@ -124,8 +124,9 @@ impl SurrealStoreAdapter {
         &self,
         migration: &CompiledMigration,
         observed_clock: &ClockObservation,
+        state_fence: &eliot_store_api::StateFence,
     ) -> Result<MigrationReceipt, AdapterError> {
-        apply::apply_migration(self, migration, observed_clock).await
+        apply::apply_migration(self, migration, observed_clock, state_fence).await
     }
 
     /// Applies one prepared S-01 transition and its optimistic head
