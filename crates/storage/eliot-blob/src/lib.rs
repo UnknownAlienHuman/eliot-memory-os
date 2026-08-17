@@ -547,6 +547,23 @@ pub trait BlobPlatformPort: Send + Sync {
     fn read_bounded(&self, path: &WorkScopePath, max_bytes: u64) -> Result<Vec<u8>, BlobError>;
     fn write_new_durable(&mut self, path: &WorkScopePath, bytes: &[u8]) -> Result<(), BlobError>;
     fn replace_durable(&mut self, path: &WorkScopePath, bytes: &[u8]) -> Result<(), BlobError>;
+    /// Replaces one durable record only when its exact prior bytes still have
+    /// the supplied digest. Providers with an atomic CAS should override this
+    /// default; the fallback remains fail-closed on a stale observed digest.
+    fn compare_and_replace_durable(
+        &mut self,
+        path: &WorkScopePath,
+        expected_sha256: &str,
+        bytes: &[u8],
+    ) -> Result<(), BlobError> {
+        let current = self.read_bounded(path, MAX_JOURNAL_BYTES)?;
+        if sha256_hex(&current) != expected_sha256 {
+            return Err(BlobError::PlanGap(
+                "durable blob journal CAS revision is stale".to_owned(),
+            ));
+        }
+        self.replace_durable(path, bytes)
+    }
     fn rename_no_replace_durable(
         &mut self,
         source: &WorkScopePath,
@@ -615,18 +632,85 @@ pub struct LiveSetRevalidation {
     pub still_complete_and_current: bool,
 }
 
+/// Provider-observed result of one exact GC deletion/quarantine effect. The
+/// coordinator validates this identity before advancing the durable tombstone;
+/// it never constructs a successful effect receipt itself.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BlobDeletionReceipt {
+    pub operation_id: String,
+    pub proof_id: BlobId,
+    pub snapshot_sha256: String,
+    pub revision: u64,
+    pub locator: BlobLocator,
+    pub path_digest_sha256: String,
+    pub disposition: BlobDeletionDisposition,
+    pub payload_deleted: bool,
+    pub metadata_deleted: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum BlobDeletionDisposition {
+    Deleted,
+    Quarantined,
+}
+
+/// Reconciliation result for a durable GC intent. Unknown never authorizes a
+/// blind retry of the physical deletion.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum BlobDeletionReconciliation {
+    Applied(BlobDeletionReceipt),
+    NotApplied,
+    Unknown,
+}
+
 /// Runtime port to G-04/S-01 authority. `BlobStore` cannot self-certify reachability.
 pub trait BlobLiveSetPort: Send + Sync {
     fn revalidate(&mut self, proof: &BlobLiveSetProof) -> Result<LiveSetRevalidation, BlobError>;
+
+    /// Reconciles an existing deletion intent against the provider target.
+    /// Implementations must return `Unknown` when they cannot prove the exact
+    /// effect identity and must not perform a blind retry.
+    fn reconcile_delete(
+        &mut self,
+        _operation_id: &str,
+        _proof: &BlobLiveSetProof,
+        _locator: &BlobLocator,
+        _intent_revision: u64,
+    ) -> Result<BlobDeletionReconciliation, BlobError> {
+        Ok(BlobDeletionReconciliation::Unknown)
+    }
+
+    /// Applies one deletion/quarantine effect while the canonical
+    /// compare-and-delete guard is held, returning a target-observed receipt.
+    /// The legacy `compare_and_delete` seam remains available, but is not
+    /// accepted by the production GC coordinator.
+    fn compare_and_delete_observed(
+        &mut self,
+        _operation_id: &str,
+        _proof: &BlobLiveSetProof,
+        _locator: &BlobLocator,
+        _intent_revision: u64,
+        _delete: &mut dyn FnMut() -> Result<(), BlobError>,
+    ) -> Result<BlobDeletionReconciliation, BlobError> {
+        Err(BlobError::PlanGap(
+            "GC target-observed deletion receipt is required".to_owned(),
+        ))
+    }
 
     /// Serializes canonical-reference creation against physical deletion and
     /// invokes `delete` while the same compare-and-delete guard is held.
     fn compare_and_delete(
         &mut self,
-        proof: &BlobLiveSetProof,
-        locator: &BlobLocator,
-        delete: &mut dyn FnMut() -> Result<(), BlobError>,
-    ) -> Result<ConditionalDeleteOutcome, BlobError>;
+        _proof: &BlobLiveSetProof,
+        _locator: &BlobLocator,
+        _delete: &mut dyn FnMut() -> Result<(), BlobError>,
+    ) -> Result<ConditionalDeleteOutcome, BlobError> {
+        Err(BlobError::PlanGap(
+            "legacy GC deletion seam is not accepted without a target receipt".to_owned(),
+        ))
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -785,6 +869,8 @@ impl StageJournal {
 #[serde(deny_unknown_fields)]
 struct Tombstone {
     operation_id: String,
+    revision: u64,
+    intent_revision: u64,
     proof_id: BlobId,
     proof_snapshot_sha256: String,
     locator: BlobLocator,
@@ -792,11 +878,17 @@ struct Tombstone {
     payload: WorkScopePath,
     metadata: WorkScopePath,
     state: GcState,
+    receipt: Option<BlobDeletionReceipt>,
 }
 
 impl Tombstone {
     fn validate(&self) -> Result<(), BlobError> {
         valid_operation_text(&self.operation_id, "tombstone.operation_id")?;
+        if self.revision == 0 || self.intent_revision == 0 || self.intent_revision > self.revision {
+            return Err(BlobError::PlanGap(
+                "GC tombstone revision is missing".to_owned(),
+            ));
+        }
         validate_sha256(&self.proof_snapshot_sha256, "tombstone.snapshot_sha256")?;
         self.locator.validate()?;
         self.live_set.validate_complete()?;
@@ -805,8 +897,46 @@ impl Tombstone {
         {
             return Err(BlobError::IncompleteLiveSet);
         }
+        if matches!(self.state, GcState::TombstoneCleaned) != self.receipt.is_some() {
+            return Err(BlobError::PlanGap(
+                "GC tombstone state/receipt mismatch".to_owned(),
+            ));
+        }
+        if let Some(receipt) = &self.receipt {
+            validate_deletion_receipt(receipt, self)?;
+        }
         Ok(())
     }
+}
+
+fn deletion_path_digest(payload: &WorkScopePath, metadata: &WorkScopePath) -> String {
+    sha256_hex(format!("{}\n{}", payload.as_str(), metadata.as_str()).as_bytes())
+}
+
+fn validate_deletion_receipt(
+    receipt: &BlobDeletionReceipt,
+    tombstone: &Tombstone,
+) -> Result<(), BlobError> {
+    valid_operation_text(&receipt.operation_id, "deletion_receipt.operation_id")?;
+    validate_sha256(&receipt.snapshot_sha256, "deletion_receipt.snapshot_sha256")?;
+    validate_sha256(
+        &receipt.path_digest_sha256,
+        "deletion_receipt.path_digest_sha256",
+    )?;
+    receipt.locator.validate()?;
+    if receipt.operation_id != tombstone.operation_id
+        || receipt.proof_id != tombstone.proof_id
+        || receipt.snapshot_sha256 != tombstone.proof_snapshot_sha256
+        || receipt.revision != tombstone.intent_revision
+        || receipt.locator != tombstone.locator
+        || receipt.path_digest_sha256
+            != deletion_path_digest(&tombstone.payload, &tombstone.metadata)
+        || !receipt.payload_deleted
+        || !receipt.metadata_deleted
+    {
+        return Err(BlobError::MetadataPayloadMismatch);
+    }
+    Ok(())
 }
 
 /// Immutable claimed-root state shared by every cloned service handle.
@@ -947,6 +1077,16 @@ where
         self.platform_write()?.replace_durable(path, bytes)
     }
 
+    fn platform_compare_and_replace(
+        &self,
+        path: &WorkScopePath,
+        expected_sha256: &str,
+        bytes: &[u8],
+    ) -> Result<(), BlobError> {
+        self.platform_write()?
+            .compare_and_replace_durable(path, expected_sha256, bytes)
+    }
+
     fn platform_rename(
         &self,
         source: &WorkScopePath,
@@ -1028,16 +1168,31 @@ where
             .revalidate(proof)
     }
 
-    fn live_sets_compare_and_delete(
+    fn live_sets_reconcile_delete(
         &self,
+        operation_id: &str,
         proof: &BlobLiveSetProof,
         locator: &BlobLocator,
-        delete: &mut dyn FnMut() -> Result<(), BlobError>,
-    ) -> Result<ConditionalDeleteOutcome, BlobError> {
+        intent_revision: u64,
+    ) -> Result<BlobDeletionReconciliation, BlobError> {
         self.live_sets
             .lock()
             .map_err(|_| BlobError::Provider("blob live-set lock poisoned".to_owned()))?
-            .compare_and_delete(proof, locator, delete)
+            .reconcile_delete(operation_id, proof, locator, intent_revision)
+    }
+
+    fn live_sets_compare_and_delete_observed(
+        &self,
+        operation_id: &str,
+        proof: &BlobLiveSetProof,
+        locator: &BlobLocator,
+        intent_revision: u64,
+        delete: &mut dyn FnMut() -> Result<(), BlobError>,
+    ) -> Result<BlobDeletionReconciliation, BlobError> {
+        self.live_sets
+            .lock()
+            .map_err(|_| BlobError::Provider("blob live-set lock poisoned".to_owned()))?
+            .compare_and_delete_observed(operation_id, proof, locator, intent_revision, delete)
     }
 
     fn ensure_lease(&self, lease: &BlobRootLease) -> Result<(), BlobError> {
@@ -1181,6 +1336,37 @@ where
         }
     }
 
+    fn persist_tombstone(
+        &self,
+        path: &WorkScopePath,
+        tombstone: &Tombstone,
+        expected_revision: Option<u64>,
+    ) -> Result<(), BlobError> {
+        tombstone.validate()?;
+        self.contained(path)?;
+        let current_digest = if let Some(expected) = expected_revision {
+            let current_bytes = self.read_bounded_file(path, MAX_JOURNAL_BYTES)?;
+            let current: Tombstone = serde_json::from_slice(&current_bytes)
+                .map_err(|_| BlobError::MetadataPayloadMismatch)?;
+            current.validate()?;
+            if current.revision != expected {
+                return Err(BlobError::PlanGap(
+                    "GC tombstone CAS revision is stale".to_owned(),
+                ));
+            }
+            Some(sha256_hex(&current_bytes))
+        } else {
+            None
+        };
+        let bytes = serde_json::to_vec(tombstone)
+            .map_err(|error| BlobError::InvalidContract(error.to_string()))?;
+        if let Some(current_digest) = current_digest {
+            self.platform_compare_and_replace(path, &current_digest, &bytes)
+        } else {
+            self.platform_write_new(path, &bytes)
+        }
+    }
+
     #[allow(clippy::too_many_lines)]
     fn finish_journal(
         &self,
@@ -1316,44 +1502,147 @@ where
         self.finish_journal(path, &mut journal)
     }
 
+    #[allow(clippy::too_many_lines)]
     fn reconcile_tombstone_path(
         &self,
         path: &WorkScopePath,
     ) -> Result<ConditionalDeleteOutcome, BlobError> {
         self.contained(path)?;
         let bytes = self.read_bounded_file(path, MAX_JOURNAL_BYTES)?;
-        let tombstone: Tombstone =
+        let mut tombstone: Tombstone =
             serde_json::from_slice(&bytes).map_err(|_| BlobError::MetadataPayloadMismatch)?;
         tombstone.validate()?;
+        if let Some(receipt) = &tombstone.receipt {
+            validate_deletion_receipt(receipt, &tombstone)?;
+            return Ok(ConditionalDeleteOutcome::Deleted);
+        }
         // The live-set authority holds its compare-and-delete guard across the
         // physical effects. Reference creation cannot race between a check and
         // the remove calls.
+        if matches!(tombstone.state, GcState::TombstoneDurable) {
+            let observed = self.live_sets_revalidate(&tombstone.live_set)?;
+            Self::validate_live_set_revalidation(&tombstone.live_set, &observed)?;
+            let previous_revision = tombstone.revision;
+            tombstone.revision = previous_revision
+                .checked_add(1)
+                .ok_or_else(|| BlobError::PlanGap("GC tombstone revision overflow".to_owned()))?;
+            tombstone.intent_revision = tombstone.revision;
+            tombstone.state = GcState::LiveSetRevalidated;
+            self.persist_tombstone(path, &tombstone, Some(previous_revision))?;
+        }
+
         let payload = tombstone.payload.clone();
         let metadata = tombstone.metadata.clone();
         let operation_id = tombstone.operation_id.clone();
+        let live_set = tombstone.live_set.clone();
+        let locator = tombstone.locator.clone();
+        let intent_revision = tombstone.intent_revision;
         let mut delete = || -> Result<(), BlobError> {
             for (target, state) in [
                 (&payload, GcState::PayloadDeleteAttempt),
                 (&metadata, GcState::MetadataDeleteAttempt),
             ] {
                 self.contained(target)?;
-                if self.platform_stat(target)? != BlobPathState::Missing {
-                    self.platform_remove(target)
-                        .map_err(|_| BlobError::UnknownGcOutcome {
-                            operation_id: operation_id.clone(),
-                            state,
+                match self.platform_stat(target)? {
+                    BlobPathState::Missing => {}
+                    BlobPathState::File { .. } => {
+                        let previous_revision = tombstone.revision;
+                        tombstone.revision = previous_revision.checked_add(1).ok_or_else(|| {
+                            BlobError::PlanGap("GC tombstone revision overflow".to_owned())
                         })?;
+                        tombstone.state = state;
+                        self.persist_tombstone(path, &tombstone, Some(previous_revision))?;
+                        self.platform_remove(target)
+                            .map_err(|_| BlobError::UnknownGcOutcome {
+                                operation_id: operation_id.clone(),
+                                state,
+                            })?;
+                    }
+                    BlobPathState::ReparsePoint => {
+                        return Err(BlobError::PlanGap(
+                            "P-02 rejected a reparse point during GC deletion".to_owned(),
+                        ));
+                    }
+                    BlobPathState::Directory | BlobPathState::Other => {
+                        return Err(BlobError::MetadataPayloadMismatch);
+                    }
                 }
             }
             Ok(())
         };
-        let outcome = self.live_sets_compare_and_delete(
-            &tombstone.live_set,
-            &tombstone.locator,
-            &mut delete,
-        )?;
-        self.remove_if_present(path)?;
-        Ok(outcome)
+        let reconciliation =
+            self.live_sets_reconcile_delete(&operation_id, &live_set, &locator, intent_revision)?;
+        let applied = match reconciliation {
+            BlobDeletionReconciliation::Applied(receipt) => receipt,
+            BlobDeletionReconciliation::NotApplied => {
+                match self.live_sets_compare_and_delete_observed(
+                    &operation_id,
+                    &live_set,
+                    &locator,
+                    intent_revision,
+                    &mut delete,
+                )? {
+                    BlobDeletionReconciliation::Applied(receipt) => receipt,
+                    BlobDeletionReconciliation::NotApplied
+                    | BlobDeletionReconciliation::Unknown => {
+                        return Err(BlobError::UnknownGcOutcome {
+                            operation_id,
+                            state: GcState::LiveSetRevalidated,
+                        });
+                    }
+                }
+            }
+            BlobDeletionReconciliation::Unknown => {
+                return Err(BlobError::UnknownGcOutcome {
+                    operation_id,
+                    state: GcState::LiveSetRevalidated,
+                });
+            }
+        };
+        validate_deletion_receipt(&applied, &tombstone)?;
+        if matches!(applied.disposition, BlobDeletionDisposition::Deleted) {
+            for target in [&tombstone.payload, &tombstone.metadata] {
+                match self.platform_stat(target)? {
+                    BlobPathState::Missing => {}
+                    BlobPathState::ReparsePoint => {
+                        return Err(BlobError::PlanGap(
+                            "P-02 rejected a reparse point while confirming GC receipt".to_owned(),
+                        ));
+                    }
+                    BlobPathState::File { .. }
+                    | BlobPathState::Directory
+                    | BlobPathState::Other => {
+                        return Err(BlobError::MetadataPayloadMismatch);
+                    }
+                }
+            }
+        }
+        let previous_revision = tombstone.revision;
+        tombstone.revision = previous_revision
+            .checked_add(1)
+            .ok_or_else(|| BlobError::PlanGap("GC tombstone revision overflow".to_owned()))?;
+        tombstone.state = GcState::TombstoneCleaned;
+        tombstone.receipt = Some(applied);
+        self.persist_tombstone(path, &tombstone, Some(previous_revision))?;
+        Ok(ConditionalDeleteOutcome::Deleted)
+    }
+
+    fn ensure_not_revoked(&self, locator: &BlobLocator) -> Result<(), BlobError> {
+        let tombstones = WorkScopePath::new("tombstones")
+            .map_err(|error| BlobError::InvalidContract(error.to_string()))?;
+        self.contained(&tombstones)?;
+        for path in self.platform_list(&tombstones)? {
+            let bytes = self.read_bounded_file(&path, MAX_JOURNAL_BYTES)?;
+            let tombstone: Tombstone =
+                serde_json::from_slice(&bytes).map_err(|_| BlobError::MetadataPayloadMismatch)?;
+            tombstone.validate()?;
+            if tombstone.locator == *locator {
+                return Err(BlobError::PlanGap(
+                    "purged or quarantined blob content cannot be re-admitted".to_owned(),
+                ));
+            }
+        }
+        Ok(())
     }
 
     #[allow(clippy::too_many_lines)]
@@ -1371,6 +1660,7 @@ where
         let metadata_path_value = metadata_path(&locator)?;
         self.contained(&payload)?;
         self.contained(&metadata_path_value)?;
+        self.ensure_not_revoked(&locator)?;
 
         let journal_path = Self::operation_path(&request.context, "stage")?;
         let commit_path = Self::operation_path(&request.context, "commit")?;
@@ -1809,6 +2099,7 @@ where
         })
     }
 
+    #[allow(clippy::too_many_lines)]
     fn gc(&self, request: BlobGcRequest) -> Result<BlobGcReceipt, BlobError> {
         request.validate()?;
         self.ensure_lease(&request.root_lease)?;
@@ -1826,6 +2117,32 @@ where
             let _guard = self.lock_shards(&[content_idx])?;
             let payload = payload_path(locator)?;
             let metadata = metadata_path(locator)?;
+            let tombstone_path = WorkScopePath::new(format!(
+                "tombstones/{}-{}.json",
+                request.context.operation.operation_id.as_str(),
+                locator.hash
+            ))
+            .map_err(|error| BlobError::InvalidContract(error.to_string()))?;
+            self.contained(&tombstone_path)?;
+            if self.platform_stat(&tombstone_path)? != BlobPathState::Missing {
+                let bytes = self.read_bounded_file(&tombstone_path, MAX_JOURNAL_BYTES)?;
+                let tombstone: Tombstone = serde_json::from_slice(&bytes)
+                    .map_err(|_| BlobError::MetadataPayloadMismatch)?;
+                tombstone.validate()?;
+                if tombstone.locator != *locator
+                    || tombstone.proof_id != request.live_set.proof_id
+                    || tombstone.proof_snapshot_sha256 != request.live_set.snapshot_sha256
+                {
+                    return Err(BlobError::PlanGap(
+                        "GC tombstone identity does not match the exact request".to_owned(),
+                    ));
+                }
+                match self.reconcile_tombstone_path(&tombstone_path)? {
+                    ConditionalDeleteOutcome::Deleted => deleted.push(locator.clone()),
+                    ConditionalDeleteOutcome::RetainedLive => retained.push(locator.clone()),
+                }
+                continue;
+            }
             let modified = match self.platform_stat(&payload)? {
                 BlobPathState::File {
                     modified_unix_ms, ..
@@ -1843,6 +2160,18 @@ where
                     return Err(BlobError::MetadataPayloadMismatch);
                 }
             };
+            match self.platform_stat(&metadata)? {
+                BlobPathState::File { .. } => {}
+                BlobPathState::Missing => return Err(BlobError::MetadataPayloadMismatch),
+                BlobPathState::ReparsePoint => {
+                    return Err(BlobError::PlanGap(
+                        "P-02 rejected a metadata reparse point during GC".to_owned(),
+                    ));
+                }
+                BlobPathState::Directory | BlobPathState::Other => {
+                    return Err(BlobError::MetadataPayloadMismatch);
+                }
+            }
             if now.saturating_sub(modified) < request.grace_period_seconds.saturating_mul(1_000) {
                 retained.push(locator.clone());
                 continue;
@@ -1850,14 +2179,10 @@ where
             // Revalidate at each destructive boundary, not once per batch.
             let current = self.live_sets_revalidate(&request.live_set)?;
             Self::validate_revalidation(&request, &current)?;
-            let tombstone_path = WorkScopePath::new(format!(
-                "tombstones/{}-{}.json",
-                request.context.operation.operation_id.as_str(),
-                locator.hash
-            ))
-            .map_err(|error| BlobError::InvalidContract(error.to_string()))?;
             let tombstone = Tombstone {
                 operation_id: request.context.operation.operation_id.to_string(),
+                revision: 1,
+                intent_revision: 1,
                 proof_id: request.live_set.proof_id.clone(),
                 proof_snapshot_sha256: request.live_set.snapshot_sha256.clone(),
                 locator: locator.clone(),
@@ -1865,21 +2190,9 @@ where
                 payload,
                 metadata,
                 state: GcState::TombstoneDurable,
+                receipt: None,
             };
-            tombstone.validate()?;
-            let bytes = serde_json::to_vec(&tombstone)
-                .map_err(|error| BlobError::InvalidContract(error.to_string()))?;
-            self.contained(&tombstone_path)?;
-            match self.platform_write_new(&tombstone_path, &bytes) {
-                Ok(()) => {}
-                Err(_)
-                    if self.exact_bytes_at(
-                        &tombstone_path,
-                        &sha256_hex(&bytes),
-                        MAX_JOURNAL_BYTES,
-                    )? => {}
-                Err(error) => return Err(error),
-            }
+            self.persist_tombstone(&tombstone_path, &tombstone, None)?;
             match self.reconcile_tombstone_path(&tombstone_path)? {
                 ConditionalDeleteOutcome::Deleted => deleted.push(locator.clone()),
                 ConditionalDeleteOutcome::RetainedLive => retained.push(locator.clone()),
@@ -2263,6 +2576,7 @@ fn map_resolve_key_error(
 )]
 mod tests {
     use super::*;
+    use eliot_blob_api::LiveSetCompleteness;
     use std::collections::BTreeMap;
     use std::future::Future;
     use std::pin::Pin;
@@ -2505,8 +2819,21 @@ mod tests {
         }
     }
 
+    #[derive(Clone, Copy, Default)]
+    enum TestGcMode {
+        #[default]
+        Unknown,
+        NotApplied,
+        Applied,
+    }
+
     #[derive(Default)]
-    struct TestLiveSets;
+    struct TestLiveSets {
+        mode: TestGcMode,
+        stale: bool,
+        tamper_receipt: bool,
+        delete_calls: usize,
+    }
 
     impl BlobLiveSetPort for TestLiveSets {
         fn revalidate(
@@ -2516,9 +2843,52 @@ mod tests {
             Ok(LiveSetRevalidation {
                 proof_id: proof.proof_id.clone(),
                 snapshot_sha256: proof.snapshot_sha256.clone(),
-                revision: proof.revision,
-                still_complete_and_current: true,
+                revision: if self.stale {
+                    proof.revision.saturating_add(1)
+                } else {
+                    proof.revision
+                },
+                still_complete_and_current: !self.stale,
             })
+        }
+
+        fn reconcile_delete(
+            &mut self,
+            operation_id: &str,
+            proof: &BlobLiveSetProof,
+            locator: &BlobLocator,
+            intent_revision: u64,
+        ) -> Result<BlobDeletionReconciliation, BlobError> {
+            match self.mode {
+                TestGcMode::Applied => Ok(BlobDeletionReconciliation::Applied(deletion_receipt(
+                    operation_id,
+                    proof,
+                    locator,
+                    intent_revision,
+                ))),
+                TestGcMode::NotApplied => Ok(BlobDeletionReconciliation::NotApplied),
+                TestGcMode::Unknown => Ok(BlobDeletionReconciliation::Unknown),
+            }
+        }
+
+        fn compare_and_delete_observed(
+            &mut self,
+            operation_id: &str,
+            proof: &BlobLiveSetProof,
+            locator: &BlobLocator,
+            intent_revision: u64,
+            delete: &mut dyn FnMut() -> Result<(), BlobError>,
+        ) -> Result<BlobDeletionReconciliation, BlobError> {
+            if self.stale {
+                return Err(BlobError::IncompleteLiveSet);
+            }
+            delete()?;
+            self.delete_calls = self.delete_calls.saturating_add(1);
+            let mut receipt = deletion_receipt(operation_id, proof, locator, intent_revision);
+            if self.tamper_receipt {
+                receipt.path_digest_sha256 = sha256_hex(b"wrong-path");
+            }
+            Ok(BlobDeletionReconciliation::Applied(receipt))
         }
 
         fn compare_and_delete(
@@ -2533,6 +2903,27 @@ mod tests {
             }
             delete()?;
             Ok(ConditionalDeleteOutcome::Deleted)
+        }
+    }
+
+    fn deletion_receipt(
+        operation_id: &str,
+        proof: &BlobLiveSetProof,
+        locator: &BlobLocator,
+        intent_revision: u64,
+    ) -> BlobDeletionReceipt {
+        let payload = payload_path(locator).expect("payload path");
+        let metadata = metadata_path(locator).expect("metadata path");
+        BlobDeletionReceipt {
+            operation_id: operation_id.to_owned(),
+            proof_id: proof.proof_id.clone(),
+            snapshot_sha256: proof.snapshot_sha256.clone(),
+            revision: intent_revision,
+            locator: locator.clone(),
+            path_digest_sha256: deletion_path_digest(&payload, &metadata),
+            disposition: BlobDeletionDisposition::Deleted,
+            payload_deleted: true,
+            metadata_deleted: true,
         }
     }
 
@@ -2587,10 +2978,58 @@ mod tests {
             TestCompression,
             TestKeys,
             TestAead,
-            TestLiveSets,
+            TestLiveSets::default(),
             test_anchor(),
         )
         .expect("store")
+    }
+
+    fn gc_store(
+        mode: TestGcMode,
+        stale: bool,
+    ) -> BlobStoreService<MemoryPlatform, TestCompression, TestKeys, TestAead, TestLiveSets> {
+        let request = stage_request("bootstrap", b"");
+        BlobStoreService::new(
+            request.root_lease,
+            MemoryPlatform::default(),
+            TestCompression,
+            TestKeys,
+            TestAead,
+            TestLiveSets {
+                mode,
+                stale,
+                tamper_receipt: false,
+                delete_calls: 0,
+            },
+            test_anchor(),
+        )
+        .expect("store")
+    }
+
+    fn gc_request(live: Vec<BlobLocator>, candidates: Vec<BlobLocator>) -> BlobGcRequest {
+        let context: BlobReceiptContext = serde_json::from_str(&context_json(
+            "REVERSIBLE_MUTATION",
+            "gc-operation",
+            "request-gc-operation",
+        ))
+        .expect("context");
+        let live_set = BlobLiveSetProof {
+            proof_id: BlobId::new("proof-gc").expect("proof id"),
+            canonical_owner_ref: BlobId::new("canonical-owner").expect("owner ref"),
+            completeness: LiveSetCompleteness::Complete,
+            snapshot_sha256: sha256_hex(b"live-set-snapshot"),
+            revision: 1,
+            fence_binding: context.request.clone(),
+            live,
+            receipt_refs: vec!["receipt-gc".to_owned()],
+        };
+        BlobGcRequest {
+            root_lease: lease(&context),
+            context,
+            live_set,
+            candidates,
+            grace_period_seconds: 0,
+        }
     }
 
     fn read_request(ready: &BlobReadyReceipt, operation: &str) -> BlobReadRequest {
@@ -2634,5 +3073,130 @@ mod tests {
         assert_eq!(first, replay);
         let conflict = block_on(store.stage(stage_request("idem", b"different")));
         assert_eq!(conflict, Err(BlobError::IdempotencyConflict));
+    }
+
+    #[test]
+    fn gc_retains_live_and_removes_unreachable_once() {
+        let store = gc_store(TestGcMode::NotApplied, false);
+        let live = block_on(store.stage(stage_request("live", b"live-payload"))).expect("live");
+        let unreachable =
+            block_on(store.stage(stage_request("orphan", b"orphan-payload"))).expect("orphan");
+        let request = gc_request(
+            vec![live.locator().clone()],
+            vec![live.locator().clone(), unreachable.locator().clone()],
+        );
+        let receipt = block_on(store.gc(request.clone())).expect("gc");
+        assert!(receipt.deleted().contains(unreachable.locator()));
+        assert!(receipt.retained().contains(live.locator()));
+        assert!(matches!(
+            block_on(store.read(read_request(&unreachable, "orphan-read"))),
+            Err(BlobError::NotFound)
+        ));
+        assert_eq!(
+            block_on(store.stage(stage_request("orphan-replay", b"orphan-payload"))),
+            Err(BlobError::PlanGap(
+                "purged or quarantined blob content cannot be re-admitted".to_owned()
+            ))
+        );
+        let replay = block_on(store.gc(request)).expect("exact gc replay");
+        assert_eq!(replay, receipt);
+    }
+
+    #[test]
+    fn stale_reachability_plan_is_rejected_before_tombstone() {
+        let store = gc_store(TestGcMode::NotApplied, true);
+        let orphan =
+            block_on(store.stage(stage_request("stale-orphan", b"payload"))).expect("orphan");
+        let request = gc_request(Vec::new(), vec![orphan.locator().clone()]);
+        assert_eq!(
+            block_on(store.gc(request)),
+            Err(BlobError::IncompleteLiveSet)
+        );
+        assert!(block_on(store.read(read_request(&orphan, "stale-read"))).is_ok());
+    }
+
+    #[test]
+    fn target_receipt_path_digest_mismatch_is_rejected() {
+        let store = gc_store(TestGcMode::NotApplied, false);
+        store
+            .core
+            .live_sets
+            .lock()
+            .expect("live-set lock")
+            .tamper_receipt = true;
+        let orphan =
+            block_on(store.stage(stage_request("bad-receipt", b"payload"))).expect("orphan");
+        let request = gc_request(Vec::new(), vec![orphan.locator().clone()]);
+        assert_eq!(
+            block_on(store.gc(request)),
+            Err(BlobError::MetadataPayloadMismatch)
+        );
+    }
+
+    #[test]
+    fn unknown_gc_outcome_is_durable_and_not_blindly_retried() {
+        let store = gc_store(TestGcMode::Unknown, false);
+        let orphan =
+            block_on(store.stage(stage_request("unknown-orphan", b"payload"))).expect("orphan");
+        let request = gc_request(Vec::new(), vec![orphan.locator().clone()]);
+        assert!(matches!(
+            block_on(store.gc(request.clone())),
+            Err(BlobError::UnknownGcOutcome { .. })
+        ));
+        assert!(block_on(store.read(read_request(&orphan, "unknown-read"))).is_ok());
+        assert_eq!(
+            block_on(store.gc(request)),
+            Err(BlobError::UnknownGcOutcome {
+                operation_id: "gc-operation".to_owned(),
+                state: GcState::LiveSetRevalidated,
+            })
+        );
+        assert!(block_on(store.read(read_request(&orphan, "unknown-read-2"))).is_ok());
+    }
+
+    #[test]
+    fn applied_reconciliation_after_effect_does_not_delete_again() {
+        let store = gc_store(TestGcMode::Unknown, false);
+        let orphan =
+            block_on(store.stage(stage_request("crash-orphan", b"payload"))).expect("orphan");
+        let request = gc_request(Vec::new(), vec![orphan.locator().clone()]);
+        assert!(matches!(
+            block_on(store.gc(request.clone())),
+            Err(BlobError::UnknownGcOutcome { .. })
+        ));
+
+        let payload = payload_path(orphan.locator()).expect("payload path");
+        let metadata = metadata_path(orphan.locator()).expect("metadata path");
+        store
+            .core
+            .platform
+            .write()
+            .expect("platform lock")
+            .remove_durable(&payload)
+            .expect("payload effect");
+        store
+            .core
+            .platform
+            .write()
+            .expect("platform lock")
+            .remove_durable(&metadata)
+            .expect("metadata effect");
+        store.core.live_sets.lock().expect("live-set lock").mode = TestGcMode::Applied;
+
+        let receipt = block_on(store.gc(request)).expect("applied reconcile");
+        assert!(receipt.deleted().contains(orphan.locator()));
+        assert_eq!(
+            store
+                .core
+                .live_sets
+                .lock()
+                .expect("live-set lock")
+                .delete_calls,
+            0
+        );
+        assert!(matches!(
+            block_on(store.read(read_request(&orphan, "crash-read"))),
+            Err(BlobError::NotFound)
+        ));
     }
 }
