@@ -217,7 +217,7 @@ fn read_epochs(read: &ReadTransaction) -> Result<Vec<(String, StoredEpoch)>, Bac
     let table = read
         .open_table(EPOCHS)
         .map_err(|_| BackendError::Unavailable)?;
-    let mut result = Vec::new();
+    let mut result: Vec<(String, StoredEpoch)> = Vec::new();
     for item in table.iter().map_err(|_| BackendError::Unavailable)? {
         let (key, value) = item.map_err(|_| BackendError::Unavailable)?;
         let key = key.value().to_owned();
@@ -1095,8 +1095,9 @@ mod tests {
         {
             let mut table = write.open_table(EPOCHS).unwrap_or_else(|_| unreachable!());
             let encoded = serde_json::to_vec(&epoch).unwrap_or_else(|_| unreachable!());
+            let key = epoch_key(2);
             table
-                .insert(&epoch_key(2), encoded.as_slice())
+                .insert(key.as_str(), encoded.as_slice())
                 .unwrap_or_else(|_| unreachable!());
         }
         write.commit().unwrap_or_else(|_| unreachable!());
