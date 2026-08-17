@@ -1,10 +1,16 @@
 use std::io::{self, Write};
+use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
+use eliot_contracts::{AuthorityEpoch, ResourceGeneration, StateFence};
 use eliot_kernel::{
     KernelBuildError, KernelComposition, KernelConfig, PROTOCOL_VERSION, SERVICE_NAME,
     default_work_root,
 };
+use eliot_kernel_service::HostStoreBootstrapRequirement;
+use eliot_platform::PlatformHandle;
+use eliot_store_surreal::{StoreLaunchConfig, load_config};
 
 #[cfg(windows)]
 const MAX_SESSIONS: usize = 32;
@@ -26,16 +32,32 @@ use tokio::task::JoinSet;
 #[allow(clippy::too_many_lines)]
 #[tokio::main]
 async fn main() {
-    let root = match parse_root() {
-        Ok(root) => root,
+    let options = match parse_launch_options(std::env::args_os().skip(1)) {
+        Ok(options) => options,
         Err(error) => exit_error("INVALID_CONFIGURATION", &error.to_string()),
     };
-    let kernel = Arc::new(match KernelComposition::new(KernelConfig::new(root)) {
+    let prepared_store = match prepare_store_bootstrap(&options) {
+        Ok(prepared) => prepared,
+        Err(error) => exit_error("INVALID_STORE_BOOTSTRAP", &error),
+    };
+    let store_is_configured = prepared_store.is_some();
+    let mut kernel_config = KernelConfig::new(options.work_root);
+    if let Some(prepared) = &prepared_store {
+        kernel_config = kernel_config.with_store_bootstrap(prepared.requirement.clone());
+    }
+    let kernel = Arc::new(match KernelComposition::new(kernel_config) {
         Ok(kernel) => kernel,
         Err(error) => exit_build_error(&error),
     });
     #[cfg(windows)]
     {
+        if let Some(prepared) = prepared_store
+            && let Err(error) = kernel
+                .connect_canonical_store(prepared.connect_timeout)
+                .await
+        {
+            exit_build_error(&error);
+        }
         let principal = match eliot_platform_windows::current_process_named_pipe_expectation() {
             Ok(expectation) => expectation,
             Err(error) => exit_error("PRINCIPAL_FAILURE", &error.to_string()),
@@ -44,10 +66,7 @@ async fn main() {
             Ok(server) => server,
             Err(error) => exit_build_error(&error),
         };
-        let ready = format!(
-            "{{\"service\":\"{SERVICE_NAME}\",\"protocol\":\"{PROTOCOL_VERSION}\",\"ipc\":\"{}\"}}",
-            kernel.ipc()
-        );
+        let ready = ready_line(&kernel, store_is_configured);
         if !write_line(&ready) {
             return;
         }
@@ -117,10 +136,13 @@ async fn main() {
     }
     #[cfg(not(windows))]
     {
-        let ready = format!(
-            "{{\"service\":\"{SERVICE_NAME}\",\"protocol\":\"{PROTOCOL_VERSION}\",\"ipc\":\"{}\"}}",
-            kernel.ipc()
-        );
+        if store_is_configured {
+            exit_error(
+                "STORE_BOOTSTRAP_UNSUPPORTED",
+                "the canonical Store bootstrap requires Windows authenticated named pipes",
+            );
+        }
+        let ready = ready_line(&kernel, false);
         if !write_line(&ready) {
             return;
         }
@@ -243,22 +265,155 @@ async fn send_checked(
     }
 }
 
-fn parse_root() -> Result<std::path::PathBuf, std::io::Error> {
-    let mut args = std::env::args_os().skip(1);
-    match args.next() {
-        None => default_work_root(),
-        Some(value) if value == "--work-root" => match args.next() {
-            Some(root) if args.next().is_none() => std::fs::canonicalize(root),
-            _ => Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "--work-root requires exactly one path",
-            )),
-        },
-        Some(value) => Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            format!("unknown argument: {}", value.to_string_lossy()),
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum StoreConfigLocator {
+    Protected(PathBuf),
+    PortableDev { root: PathBuf, path: PathBuf },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct KernelLaunchOptions {
+    work_root: PathBuf,
+    store_config: Option<StoreConfigLocator>,
+}
+
+struct PreparedStoreBootstrap {
+    requirement: HostStoreBootstrapRequirement,
+    connect_timeout: Duration,
+}
+
+fn parse_launch_options<I>(args: I) -> Result<KernelLaunchOptions, std::io::Error>
+where
+    I: IntoIterator<Item = std::ffi::OsString>,
+{
+    let args = args.into_iter().collect::<Vec<_>>();
+    match args.as_slice() {
+        [] => Ok(KernelLaunchOptions {
+            work_root: default_work_root()?,
+            store_config: None,
+        }),
+        [work_flag, work_root] if work_flag == "--work-root" => Ok(KernelLaunchOptions {
+            work_root: canonical_directory(work_root)?,
+            store_config: None,
+        }),
+        [work_flag, work_root, store_flag, store_config]
+            if work_flag == "--work-root" && store_flag == "--store-config" =>
+        {
+            Ok(KernelLaunchOptions {
+                work_root: canonical_directory(work_root)?,
+                store_config: Some(StoreConfigLocator::Protected(PathBuf::from(store_config))),
+            })
+        }
+        [
+            portable_flag,
+            portable_root,
+            work_flag,
+            work_root,
+            store_flag,
+            store_config,
+        ] if portable_flag == "--portable-dev-root"
+            && work_flag == "--work-root"
+            && store_flag == "--store-config" =>
+        {
+            let portable_root = canonical_directory(portable_root)?;
+            let work_root = canonical_directory(work_root)?;
+            if !work_root.starts_with(&portable_root) {
+                return Err(invalid_input(
+                    "portable-dev work root must remain under --portable-dev-root",
+                ));
+            }
+            Ok(KernelLaunchOptions {
+                work_root,
+                store_config: Some(StoreConfigLocator::PortableDev {
+                    root: portable_root,
+                    path: PathBuf::from(store_config),
+                }),
+            })
+        }
+        _ => Err(invalid_input(
+            "expected no args, --work-root <path>, --work-root <path> --store-config <path>, or --portable-dev-root <root> --work-root <path> --store-config <path>",
         )),
     }
+}
+
+fn canonical_directory(value: &std::ffi::OsStr) -> Result<PathBuf, std::io::Error> {
+    let path = PathBuf::from(value);
+    let canonical = std::fs::canonicalize(&path)?;
+    if !canonical.is_dir() {
+        return Err(invalid_input(
+            "configured root must be an existing directory",
+        ));
+    }
+    Ok(canonical)
+}
+
+fn invalid_input(message: &str) -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::InvalidInput, message)
+}
+
+fn prepare_store_bootstrap(
+    options: &KernelLaunchOptions,
+) -> Result<Option<PreparedStoreBootstrap>, String> {
+    let Some(locator) = &options.store_config else {
+        return Ok(None);
+    };
+    let config = match locator {
+        StoreConfigLocator::Protected(path) => load_config(Some(path))?,
+        StoreConfigLocator::PortableDev { root, path } => {
+            let root = eliot_platform_windows::UserOwnedRootLease::open_existing(root)
+                .map_err(|error| format!("open portable-dev root: {error}"))?;
+            eliot_store_surreal::load_portable_dev_config(&root, path)?
+        }
+    };
+    let connect_timeout = Duration::from_millis(config.connect_timeout_ms);
+    let requirement = store_bootstrap_requirement(&config)?;
+    Ok(Some(PreparedStoreBootstrap {
+        requirement,
+        connect_timeout,
+    }))
+}
+
+fn store_bootstrap_requirement(
+    config: &StoreLaunchConfig,
+) -> Result<HostStoreBootstrapRequirement, String> {
+    config.validate()?;
+    let authority_epoch = AuthorityEpoch::new(config.authority_epoch)
+        .map_err(|error| format!("invalid Store authority epoch: {error}"))?;
+    let store_generation = ResourceGeneration::new(config.store_generation)
+        .map_err(|error| format!("invalid Store generation: {error}"))?;
+    let connection_id = format!(
+        "kernel-store:{}:{}",
+        config.instance_id, config.launch_nonce
+    );
+    Ok(HostStoreBootstrapRequirement {
+        store_pipe: platform_handle(&config.store_pipe, "store pipe")?,
+        store_generation,
+        schema_generation: platform_handle(&config.schema_generation, "schema generation")?,
+        state_fence: StateFence::new(authority_epoch, store_generation),
+        launch_nonce: platform_handle(&config.launch_nonce, "launch nonce")?,
+        connection_id: platform_handle(&connection_id, "connection id")?,
+        expected_peer_sid: platform_handle(&config.expected_client_sid, "Store peer SID")?,
+        expected_peer_session_id: config.expected_client_session_id,
+        approved_artifact_hash: platform_handle(
+            &config.approved_artifact_hash,
+            "Store artifact digest",
+        )?,
+        approved_config_hash: platform_handle(&config.approved_config_hash, "Store config digest")?,
+    })
+}
+
+fn platform_handle(value: &str, field: &str) -> Result<PlatformHandle, String> {
+    PlatformHandle::new(value).map_err(|error| format!("invalid {field}: {error}"))
+}
+
+fn ready_line(kernel: &KernelComposition, store_is_configured: bool) -> String {
+    serde_json::json!({
+        "service": SERVICE_NAME,
+        "protocol": PROTOCOL_VERSION,
+        "ipc": kernel.ipc(),
+        "canonical_store": if store_is_configured { "READY" } else { "NOT_CONFIGURED" },
+    })
+    .to_string()
 }
 
 fn exit_build_error(error: &KernelBuildError) -> ! {
@@ -282,4 +437,114 @@ fn write_line(line: &str) -> bool {
     stdout.write_all(line.as_bytes()).is_ok()
         && stdout.write_all(b"\n").is_ok()
         && stdout.flush().is_ok()
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used, clippy::panic)]
+mod tests {
+    use super::*;
+    use eliot_store_surreal::launch_config_digest;
+
+    struct TempRoot(PathBuf);
+
+    impl TempRoot {
+        fn new() -> Self {
+            let root = std::env::temp_dir().join(format!(
+                "eliot-kernel-options-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .expect("system clock")
+                    .as_nanos()
+            ));
+            std::fs::create_dir_all(root.join("work")).expect("create test root");
+            Self(root)
+        }
+    }
+
+    impl Drop for TempRoot {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn store_config() -> StoreLaunchConfig {
+        let mut config = StoreLaunchConfig {
+            store_pipe: r"\\.\pipe\eliot\store-kernel-main-test".to_owned(),
+            launch_nonce: "kernel-main-test".to_owned(),
+            expected_client_sid: "S-1-5-18".to_owned(),
+            expected_client_session_id: 0,
+            approved_artifact_hash: "a".repeat(64),
+            approved_config_hash: String::new(),
+            store_generation: 9,
+            authority_epoch: 7,
+            endpoint: "ws://127.0.0.1:8000".to_owned(),
+            namespace: "eliot".to_owned(),
+            database: "eliot".to_owned(),
+            username: "store".to_owned(),
+            connect_timeout_ms: 5_000,
+            query_timeout_ms: 5_000,
+            schema_generation: "1.0.0".to_owned(),
+            blob_root: r"C:\Eliot\blob".to_owned(),
+            instance_id: "kernel-main-test".to_owned(),
+            credential_ref: "eliot/store".to_owned(),
+        };
+        config.approved_config_hash = launch_config_digest(&config).expect("config digest");
+        config
+    }
+
+    #[test]
+    fn portable_dev_args_bind_work_and_config_to_explicit_root() {
+        let root = TempRoot::new();
+        let work = root.0.join("work");
+        let config = root.0.join("store.json");
+        let options = parse_launch_options([
+            "--portable-dev-root".into(),
+            root.0.clone().into_os_string(),
+            "--work-root".into(),
+            work.clone().into_os_string(),
+            "--store-config".into(),
+            config.clone().into_os_string(),
+        ])
+        .expect("portable args");
+        assert_eq!(
+            options.work_root,
+            std::fs::canonicalize(work).expect("work")
+        );
+        assert_eq!(
+            options.store_config,
+            Some(StoreConfigLocator::PortableDev {
+                root: std::fs::canonicalize(&root.0).expect("root"),
+                path: config,
+            })
+        );
+    }
+
+    #[test]
+    fn portable_dev_args_reject_work_root_outside_contour() {
+        let root = TempRoot::new();
+        let outside = TempRoot::new();
+        let result = parse_launch_options([
+            "--portable-dev-root".into(),
+            root.0.clone().into_os_string(),
+            "--work-root".into(),
+            outside.0.join("work").into_os_string(),
+            "--store-config".into(),
+            root.0.join("store.json").into_os_string(),
+        ]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn store_bootstrap_uses_non_genesis_config_fence() {
+        let config = store_config();
+        let requirement = store_bootstrap_requirement(&config).expect("bootstrap requirement");
+        assert_eq!(requirement.authority_epoch().value(), 7);
+        assert_eq!(requirement.store_generation.value(), 9);
+        assert_eq!(requirement.state_fence.resource_generation.value(), 9);
+        assert_eq!(
+            requirement.approved_config_hash.as_str(),
+            config.approved_config_hash
+        );
+    }
 }

@@ -9,6 +9,7 @@ dist/
 !crates/**/src/bin/**
 
 # Runtime state
+.eliot-dev/
 .eliot-governor/
 **/.eliot-governor/
 logs/

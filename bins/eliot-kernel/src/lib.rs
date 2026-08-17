@@ -481,9 +481,21 @@ impl KernelComposition {
         let platform =
             WindowsPlatform::new(config.work_root).map_err(KernelBuildError::Platform)?;
         let ipc = IpcImplementation::new(config.pipe_name)?;
-        let authority_epoch = AuthorityEpoch::genesis();
-        let generation = ResourceGeneration::genesis();
-        let mut generations = GenerationRouter::new();
+        // An integrated Kernel must construct its active store route from the
+        // exact Host-approved bootstrap fence. Falling back to genesis is
+        // reserved for the explicitly standalone composition, where no Store
+        // authority has been injected.
+        let (authority_epoch, generation) = store_bootstrap.as_ref().map_or(
+            (AuthorityEpoch::genesis(), ResourceGeneration::genesis()),
+            |requirement| {
+                (
+                    requirement.state_fence.authority_epoch,
+                    requirement.state_fence.resource_generation,
+                )
+            },
+        );
+        let mut generations = GenerationRouter::at_epoch(authority_epoch)
+            .map_err(|error| KernelBuildError::Core(error.to_string()))?;
         generations
             .register(
                 GenerationRoute::new(
@@ -562,6 +574,9 @@ impl KernelComposition {
         .map_err(KernelBuildError::Runtime)?;
         let generation_gateway = OrsGenerationCoordinator::new(ors);
         let mut service = service;
+        service
+            .synchronize_authority_epoch(authority_epoch)
+            .map_err(|error| KernelBuildError::Service(error.to_string()))?;
         let mut policy = front_door_policy;
         generation_gateway
             .recover(&mut generations, &mut service, &mut policy)
@@ -1296,6 +1311,36 @@ mod store_gateway_tests {
         kernel
             .apply_control(KernelControlCommand::Ready(ready))
             .expect("ready");
+    }
+
+    #[test]
+    fn non_genesis_store_bootstrap_initializes_the_store_route_from_its_fence() {
+        let mut requirement = requirement(r"\\.\pipe\eliot\kernel-store-route-test".to_owned());
+        let authority_epoch = AuthorityEpoch::new(7).expect("authority epoch");
+        let store_generation = ResourceGeneration::new(9).expect("store generation");
+        requirement.store_generation = store_generation;
+        requirement.state_fence = StateFence::new(authority_epoch, store_generation);
+        let root = std::env::temp_dir().join(format!(
+            "eliot-kernel-store-route-root-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).expect("test root");
+        let kernel =
+            KernelComposition::new(KernelConfig::new(&root).with_store_bootstrap(requirement))
+                .expect("kernel composition");
+        let routes = kernel
+            .generation_route_snapshot()
+            .expect("generation route snapshot");
+        let scope = RouteScope::new(STORE_BRIDGE_ROUTE).expect("store route scope");
+        let route = routes.route(&scope).expect("store route");
+        assert_eq!(route.authority_epoch(), authority_epoch);
+        assert_eq!(route.active_generation(), store_generation);
+        drop(kernel);
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[tokio::test(flavor = "current_thread")]

@@ -443,6 +443,382 @@ impl ProtectedPathLease {
     }
 }
 
+/// A user-owned `portable_dev` root lease.
+///
+/// This contour is intentionally separate from [`ProtectedPathLease`]: it is
+/// for an explicit, already-existing absolute directory owned by the current
+/// process identity, rather than the installation-wide `ProgramData` policy.
+/// The root handle is retained with delete sharing disabled for the lifetime
+/// of the lease.
+pub struct UserOwnedRootLease {
+    path: PathBuf,
+    identity: FileIdentity,
+    sid: String,
+    #[cfg(windows)]
+    handle: std::fs::File,
+}
+
+impl std::fmt::Debug for UserOwnedRootLease {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("UserOwnedRootLease")
+            .field("path", &self.path)
+            .field("identity", &self.identity)
+            .field("sid", &self.sid)
+            .finish_non_exhaustive()
+    }
+}
+
+impl UserOwnedRootLease {
+    /// Opens one existing absolute directory for the current process SID.
+    ///
+    /// Every existing ancestor is checked for symlink/reparse substitution,
+    /// and the opened root receives an exact protected DACL containing only
+    /// `SYSTEM` and the current process SID.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the root is not an existing safe directory, the
+    /// current SID cannot be resolved, or the protected DACL proof fails.
+    pub fn open_existing(root: &Path) -> Result<Self, ProtectedPathError> {
+        #[cfg(windows)]
+        {
+            let path = validate_user_owned_root(root)?;
+            let sid = current_process_sid()?;
+            let handle = open_user_owned_directory(&path, &sid)?;
+            let identity =
+                file_identity_from_handle(&handle).map_err(|_| ProtectedPathError::Io)?;
+            Ok(Self {
+                path,
+                identity,
+                sid,
+                handle,
+            })
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = root;
+            Err(ProtectedPathError::UnsupportedPlatform)
+        }
+    }
+
+    /// Returns the explicit root path retained by this lease.
+    #[must_use]
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Returns the current process SID captured during acquisition.
+    #[must_use]
+    pub fn current_user_sid(&self) -> &str {
+        &self.sid
+    }
+
+    /// Returns the root file-object identity captured from the retained handle.
+    #[must_use]
+    pub const fn identity(&self) -> FileIdentity {
+        self.identity
+    }
+
+    /// Re-checks that the retained root handle still names the same object.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the handle cannot be inspected or its identity
+    /// no longer matches the acquisition proof.
+    pub fn verify_stable_identity(&self) -> Result<(), ProtectedPathError> {
+        #[cfg(windows)]
+        {
+            let identity =
+                file_identity_from_handle(&self.handle).map_err(|_| ProtectedPathError::Io)?;
+            (identity == self.identity)
+                .then_some(())
+                .ok_or(ProtectedPathError::Io)
+        }
+        #[cfg(not(windows))]
+        {
+            Err(ProtectedPathError::UnsupportedPlatform)
+        }
+    }
+}
+
+/// A retained file lease under a [`UserOwnedRootLease`].
+///
+/// The file must already exist.  The retained root, every parent directory,
+/// and the file itself use no-follow handles with delete sharing disabled.
+pub struct UserOwnedPathLease {
+    path: PathBuf,
+    identity: FileIdentity,
+    sid: String,
+    #[cfg(windows)]
+    _root: std::fs::File,
+    #[cfg(windows)]
+    _directories: Vec<std::fs::File>,
+    #[cfg(windows)]
+    file: std::fs::File,
+}
+
+impl std::fmt::Debug for UserOwnedPathLease {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("UserOwnedPathLease")
+            .field("path", &self.path)
+            .field("identity", &self.identity)
+            .field("sid", &self.sid)
+            .finish_non_exhaustive()
+    }
+}
+
+impl UserOwnedPathLease {
+    /// Opens one existing absolute file below the retained root.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the path is outside the root, is a reparse
+    /// substitution, cannot be opened with no-delete sharing, or fails the
+    /// DACL/identity proof.
+    pub fn open_existing(
+        root: &UserOwnedRootLease,
+        path: &Path,
+    ) -> Result<Self, ProtectedPathError> {
+        #[cfg(windows)]
+        {
+            if !path.is_absolute() {
+                return Err(ProtectedPathError::InvalidPath);
+            }
+            ensure_user_owned_containment(&root.path, path)?;
+            let parent = path.parent().ok_or(ProtectedPathError::InvalidPath)?;
+            let relative_parent = parent
+                .strip_prefix(&root.path)
+                .map_err(|_| ProtectedPathError::InvalidPath)?;
+            let directories =
+                open_user_owned_directory_contour(&root.path, relative_parent, &root.sid)?;
+            let file = open_user_owned_file(path, &root.sid)?;
+            let identity = file_identity_from_handle(&file).map_err(|_| ProtectedPathError::Io)?;
+            let root_handle = root
+                .handle
+                .try_clone()
+                .map_err(|_| ProtectedPathError::Io)?;
+            Ok(Self {
+                path: path.to_path_buf(),
+                identity,
+                sid: root.sid.clone(),
+                _root: root_handle,
+                _directories: directories,
+                file,
+            })
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = (root, path);
+            Err(ProtectedPathError::UnsupportedPlatform)
+        }
+    }
+
+    /// Returns the explicit file path retained by this lease.
+    #[must_use]
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Returns the current process SID captured by the root lease.
+    #[must_use]
+    pub fn current_user_sid(&self) -> &str {
+        &self.sid
+    }
+
+    /// Returns the file-object identity captured from the retained handle.
+    #[must_use]
+    pub const fn identity(&self) -> FileIdentity {
+        self.identity
+    }
+
+    /// Re-checks the identity of the retained file handle.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the retained handle cannot be inspected or its
+    /// identity no longer matches the acquisition proof.
+    pub fn verify_stable_identity(&self) -> Result<(), ProtectedPathError> {
+        #[cfg(windows)]
+        {
+            let identity =
+                file_identity_from_handle(&self.file).map_err(|_| ProtectedPathError::Io)?;
+            (identity == self.identity)
+                .then_some(())
+                .ok_or(ProtectedPathError::Io)
+        }
+        #[cfg(not(windows))]
+        {
+            Err(ProtectedPathError::UnsupportedPlatform)
+        }
+    }
+
+    /// Reopens the path with no-follow semantics and proves stable identity.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the path cannot be reopened safely or its object
+    /// identity differs from the retained handle.
+    pub fn verify_path_identity(&self) -> Result<(), ProtectedPathError> {
+        #[cfg(windows)]
+        {
+            let file = open_user_owned_file(&self.path, &self.sid)?;
+            let identity = file_identity_from_handle(&file).map_err(|_| ProtectedPathError::Io)?;
+            (identity == self.identity)
+                .then_some(())
+                .ok_or(ProtectedPathError::Io)
+        }
+        #[cfg(not(windows))]
+        {
+            Err(ProtectedPathError::UnsupportedPlatform)
+        }
+    }
+
+    /// Reads bytes from the retained handle without reopening the path.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when handle I/O fails or the file exceeds `limit`.
+    pub fn read_bounded(&self, limit: u64) -> Result<Vec<u8>, ProtectedPathError> {
+        #[cfg(windows)]
+        {
+            let mut file = self.file.try_clone().map_err(|_| ProtectedPathError::Io)?;
+            file.seek(SeekFrom::Start(0))
+                .map_err(|_| ProtectedPathError::Io)?;
+            let metadata = file.metadata().map_err(|_| ProtectedPathError::Io)?;
+            if metadata.len() > limit {
+                return Err(ProtectedPathError::SizeExceeded);
+            }
+            let mut bytes = Vec::with_capacity(metadata.len().try_into().unwrap_or(0));
+            file.read_to_end(&mut bytes)
+                .map_err(|_| ProtectedPathError::Io)?;
+            if bytes.len() as u64 > limit {
+                return Err(ProtectedPathError::SizeExceeded);
+            }
+            Ok(bytes)
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = limit;
+            Err(ProtectedPathError::UnsupportedPlatform)
+        }
+    }
+}
+
+#[cfg(windows)]
+fn validate_user_owned_root(root: &Path) -> Result<PathBuf, ProtectedPathError> {
+    if !root.is_absolute() {
+        return Err(ProtectedPathError::InvalidRoot);
+    }
+    if root.components().any(|component| {
+        matches!(
+            component,
+            std::path::Component::ParentDir | std::path::Component::CurDir
+        )
+    }) {
+        return Err(ProtectedPathError::InvalidRoot);
+    }
+    reject_reparse_chain(root, true)?;
+    validate_directory_no_reparse(root)?;
+    Ok(root.to_path_buf())
+}
+
+#[cfg(windows)]
+fn ensure_user_owned_containment(root: &Path, path: &Path) -> Result<(), ProtectedPathError> {
+    if path == root || !path.starts_with(root) {
+        return Err(ProtectedPathError::InvalidPath);
+    }
+    let relative = path
+        .strip_prefix(root)
+        .map_err(|_| ProtectedPathError::InvalidPath)?;
+    if relative
+        .components()
+        .any(|component| !matches!(component, std::path::Component::Normal(_)))
+    {
+        return Err(ProtectedPathError::InvalidPath);
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn current_process_sid() -> Result<String, ProtectedPathError> {
+    use windows_sys::Win32::Security::TOKEN_QUERY;
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+    let mut token = std::ptr::null_mut();
+    if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &raw mut token) } == 0 {
+        return Err(ProtectedPathError::AclMismatch);
+    }
+    let result = token_identity(token)
+        .map(|(sid, _)| sid)
+        .map_err(|_| ProtectedPathError::AclMismatch);
+    unsafe { windows_sys::Win32::Foundation::CloseHandle(token) };
+    result
+}
+
+#[cfg(windows)]
+fn open_user_owned_directory(path: &Path, sid: &str) -> Result<std::fs::File, ProtectedPathError> {
+    use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+        FILE_GENERIC_READ, FILE_SHARE_READ, FILE_SHARE_WRITE, WRITE_DAC,
+    };
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    options.access_mode(FILE_GENERIC_READ | WRITE_DAC);
+    options.share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE);
+    options.custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT);
+    let file = options.open(path).map_err(|_| ProtectedPathError::Io)?;
+    let metadata = file.metadata().map_err(|_| ProtectedPathError::Io)?;
+    if !metadata.is_dir() || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        return Err(ProtectedPathError::ReparsePoint);
+    }
+    protect_user_owned_opened_handle(&file, true, sid)?;
+    Ok(file)
+}
+
+#[cfg(windows)]
+fn open_user_owned_directory_contour(
+    root: &Path,
+    relative: &Path,
+    sid: &str,
+) -> Result<Vec<std::fs::File>, ProtectedPathError> {
+    let mut directories = vec![open_user_owned_directory(root, sid)?];
+    let mut current = root.to_path_buf();
+    for component in relative.components() {
+        let std::path::Component::Normal(component) = component else {
+            return Err(ProtectedPathError::InvalidPath);
+        };
+        current.push(component);
+        directories.push(open_user_owned_directory(&current, sid)?);
+    }
+    Ok(directories)
+}
+
+#[cfg(windows)]
+fn open_user_owned_file(path: &Path, sid: &str) -> Result<std::fs::File, ProtectedPathError> {
+    use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_OPEN_REPARSE_POINT, FILE_GENERIC_READ,
+        FILE_SHARE_READ, FILE_SHARE_WRITE, WRITE_DAC,
+    };
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    options.access_mode(FILE_GENERIC_READ | WRITE_DAC);
+    options.share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE);
+    options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    let file = options.open(path).map_err(|_| ProtectedPathError::Io)?;
+    let metadata = file.metadata().map_err(|_| ProtectedPathError::Io)?;
+    if !metadata.is_file() {
+        return Err(ProtectedPathError::InvalidPath);
+    }
+    if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        return Err(ProtectedPathError::ReparsePoint);
+    }
+    protect_user_owned_opened_handle(&file, false, sid)?;
+    Ok(file)
+}
+
 /// Creates and protects one `ProgramData` descendant directory.  Components
 /// are created one at a time while each parent no-follow handle is retained.
 ///
@@ -701,6 +1077,101 @@ fn protect_opened_handle(file: &std::fs::File, directory: bool) -> Result<(), Pr
             file.as_raw_handle().cast(),
             SE_FILE_OBJECT,
             DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &raw mut descriptor,
+        )
+    };
+    if status != ERROR_SUCCESS || descriptor.is_null() {
+        if !descriptor.is_null() {
+            unsafe { LocalFree(descriptor.cast()) };
+        }
+        return Err(ProtectedPathError::AclMismatch);
+    }
+    let mut present = 0;
+    let mut actual_dacl = std::ptr::null_mut();
+    let mut defaulted = 0;
+    let dacl_matches = unsafe {
+        windows_sys::Win32::Security::GetSecurityDescriptorDacl(
+            descriptor,
+            &raw mut present,
+            &raw mut actual_dacl,
+            &raw mut defaulted,
+        ) != 0
+            && present != 0
+            && !actual_dacl.is_null()
+            && (*actual_dacl).AclSize == (*dacl).AclSize
+            && std::slice::from_raw_parts(
+                actual_dacl.cast::<u8>(),
+                usize::from((*actual_dacl).AclSize),
+            ) == std::slice::from_raw_parts(dacl.cast::<u8>(), usize::from((*dacl).AclSize))
+    };
+    let mut control: u16 = 0;
+    let mut revision: u32 = 0;
+    let protected = unsafe {
+        GetSecurityDescriptorControl(descriptor, &raw mut control, &raw mut revision) != 0
+            && control & SE_DACL_PROTECTED != 0
+    };
+    unsafe { LocalFree(descriptor.cast()) };
+    if !dacl_matches || !protected {
+        return Err(ProtectedPathError::AclMismatch);
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn protect_user_owned_opened_handle(
+    file: &std::fs::File,
+    directory: bool,
+    sid: &str,
+) -> Result<(), ProtectedPathError> {
+    use std::os::windows::fs::MetadataExt;
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Foundation::{ERROR_SUCCESS, LocalFree};
+    use windows_sys::Win32::Security::Authorization::{GetSecurityInfo, SE_FILE_OBJECT};
+    use windows_sys::Win32::Security::{
+        DACL_SECURITY_INFORMATION, GetSecurityDescriptorControl,
+        PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, SE_DACL_PROTECTED,
+    };
+    use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
+    if !valid_sid_text(sid) {
+        return Err(ProtectedPathError::AclMismatch);
+    }
+    let metadata = file.metadata().map_err(|_| ProtectedPathError::Io)?;
+    if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        return Err(ProtectedPathError::ReparsePoint);
+    }
+    if directory != metadata.is_dir() {
+        return Err(ProtectedPathError::InvalidPath);
+    }
+    let expected = OwnedSecurityDescriptor::for_user_owned_storage(sid, directory)
+        .map_err(|_| ProtectedPathError::AclMismatch)?;
+    let dacl = expected
+        .dacl()
+        .map_err(|_| ProtectedPathError::AclMismatch)?;
+    let security = DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION;
+    let status = unsafe {
+        windows_sys::Win32::Security::Authorization::SetSecurityInfo(
+            file.as_raw_handle().cast(),
+            SE_FILE_OBJECT,
+            security,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            dacl,
+            std::ptr::null(),
+        )
+    };
+    if status != 0 {
+        return Err(ProtectedPathError::AclMismatch);
+    }
+    let mut descriptor: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+    let status = unsafe {
+        GetSecurityInfo(
+            file.as_raw_handle().cast(),
+            SE_FILE_OBJECT,
+            security,
             std::ptr::null_mut(),
             std::ptr::null_mut(),
             std::ptr::null_mut(),
@@ -2295,6 +2766,18 @@ impl OwnedSecurityDescriptor {
     /// weaker parent DACL before it is applied to the opened no-follow handle.
     fn for_protected_storage() -> Result<Self, WindowsAdapterError> {
         Self::from_sddl("D:P(A;;GA;;;SY)(A;;GA;;;BA)")
+    }
+
+    fn for_user_owned_storage(sid: &str, directory: bool) -> Result<Self, WindowsAdapterError> {
+        if !valid_sid_text(sid) {
+            return Err(WindowsAdapterError::InvalidInput);
+        }
+        // `FA` is the concrete file-all mask. Windows expands generic `GA`
+        // before storing the DACL, so using `GA` would defeat byte proof.
+        let inheritance = if directory { "OICI" } else { "" };
+        Self::from_sddl(&format!(
+            "D:P(A;{inheritance};FA;;;SY)(A;{inheritance};FA;;;{sid})"
+        ))
     }
 
     fn dacl(&self) -> Result<*const windows_sys::Win32::Security::ACL, WindowsAdapterError> {
@@ -6072,45 +6555,21 @@ fn classify_service_error(name: &str, error: &std::io::Error) -> PortOutcome<Ser
 
 #[cfg(windows)]
 fn inspect_credential(request: &SecretRequest) -> PortOutcome<eliot_platform::SecretObservation> {
-    use std::os::windows::ffi::OsStrExt;
-    use windows_sys::Win32::Foundation::ERROR_NOT_FOUND;
-    use windows_sys::Win32::Security::Credentials::{
-        CRED_TYPE_GENERIC, CREDENTIALW, CredFree, CredReadW,
-    };
     if !is_windows_secret_provider(request.reference.provider.as_str()) {
         return PortOutcome::Unknown(UnknownReason::Unsupported);
     }
     if !valid_credential_key(request.reference.key.as_str()) {
         return PortOutcome::Error(PortError::InvalidPath);
     }
-    let name = std::ffi::OsStr::new(request.reference.key.as_str())
-        .encode_wide()
-        .chain(Some(0))
-        .collect::<Vec<_>>();
-    let mut credential: *mut CREDENTIALW = std::ptr::null_mut();
-    // SAFETY: name is NUL-terminated; Windows writes only the opaque credential pointer.
-    let found = unsafe { CredReadW(name.as_ptr(), CRED_TYPE_GENERIC, 0, &raw mut credential) } != 0;
-    let read_error = (!found).then(std::io::Error::last_os_error);
-    if !credential.is_null() {
-        unsafe { CredFree(credential.cast()) };
-    }
-    if found {
-        PortOutcome::Known(eliot_platform::SecretObservation {
+    match eliot_windows_ipc::credential_status_current_user(request.reference.key.as_str()) {
+        Ok(status) => PortOutcome::Known(eliot_platform::SecretObservation {
             reference: request.reference.clone(),
-            present: true,
-            version: None,
-        })
-    } else {
-        let error = read_error.unwrap_or_else(std::io::Error::last_os_error);
-        if error.raw_os_error() == Some(ERROR_NOT_FOUND.cast_signed()) {
-            PortOutcome::Known(eliot_platform::SecretObservation {
-                reference: request.reference.clone(),
-                present: false,
-                version: None,
-            })
-        } else {
-            PortOutcome::Error(PortError::Provider(provider_from_io(&error)))
-        }
+            present: status.present,
+            version: status
+                .version
+                .and_then(|version| PlatformHandle::new(version.to_string()).ok()),
+        }),
+        Err(error) => PortOutcome::Error(PortError::Provider(provider_from_io(&error))),
     }
 }
 
@@ -6139,31 +6598,11 @@ fn valid_credential_key(value: &str) -> bool {
 
 #[cfg(windows)]
 fn credential_write(key: &str, secret: &[u8]) -> Result<(), WindowsAdapterError> {
-    use std::os::windows::ffi::OsStrExt;
-    use windows_sys::Win32::Security::Credentials::{
-        CRED_PERSIST_LOCAL_MACHINE, CRED_TYPE_GENERIC, CREDENTIALW, CredWriteW,
-    };
     if !valid_credential_key(key) || secret.is_empty() || secret.len() > 2560 {
         return Err(WindowsAdapterError::InvalidInput);
     }
-    let mut target = std::ffi::OsStr::new(key)
-        .encode_wide()
-        .chain(Some(0))
-        .collect::<Vec<_>>();
-    let mut credential = CREDENTIALW {
-        Type: CRED_TYPE_GENERIC,
-        TargetName: target.as_mut_ptr(),
-        CredentialBlobSize: u32::try_from(secret.len())
-            .map_err(|_| WindowsAdapterError::InvalidInput)?,
-        CredentialBlob: secret.as_ptr().cast_mut(),
-        Persist: CRED_PERSIST_LOCAL_MACHINE,
-        ..Default::default()
-    };
-    if unsafe { CredWriteW(&raw mut credential, 0) } == 0 {
-        Err(last_windows_adapter_error())
-    } else {
-        Ok(())
-    }
+    eliot_windows_ipc::credential_write_current_user(key, secret)
+        .map_err(|error| windows_adapter_from_io(&error))
 }
 
 #[cfg(not(windows))]
@@ -6173,33 +6612,15 @@ fn credential_write(_key: &str, _secret: &[u8]) -> Result<(), WindowsAdapterErro
 
 #[cfg(windows)]
 fn credential_read(key: &str) -> Result<CredentialSecret, WindowsAdapterError> {
-    use std::os::windows::ffi::OsStrExt;
-    use windows_sys::Win32::Security::Credentials::{
-        CRED_TYPE_GENERIC, CREDENTIALW, CredFree, CredReadW,
-    };
     if !valid_credential_key(key) {
         return Err(WindowsAdapterError::InvalidInput);
     }
-    let target = std::ffi::OsStr::new(key)
-        .encode_wide()
-        .chain(Some(0))
-        .collect::<Vec<_>>();
-    let mut credential: *mut CREDENTIALW = std::ptr::null_mut();
-    if unsafe { CredReadW(target.as_ptr(), CRED_TYPE_GENERIC, 0, &raw mut credential) } == 0
-        || credential.is_null()
+    match eliot_windows_ipc::credential_read_current_user(key)
+        .map_err(|error| windows_adapter_from_io(&error))?
     {
-        return Err(last_windows_adapter_error());
+        Some(value) => Ok(CredentialSecret(value)),
+        None => Err(WindowsAdapterError::Unavailable),
     }
-    let value = unsafe {
-        let credential_ref = &*credential;
-        std::slice::from_raw_parts(
-            credential_ref.CredentialBlob,
-            usize::try_from(credential_ref.CredentialBlobSize).unwrap_or(0),
-        )
-        .to_vec()
-    };
-    unsafe { CredFree(credential.cast()) };
-    Ok(CredentialSecret(value))
 }
 
 #[cfg(not(windows))]
@@ -6209,19 +6630,15 @@ fn credential_read(_key: &str) -> Result<CredentialSecret, WindowsAdapterError> 
 
 #[cfg(windows)]
 fn credential_delete(key: &str) -> Result<(), WindowsAdapterError> {
-    use std::os::windows::ffi::OsStrExt;
-    use windows_sys::Win32::Security::Credentials::{CRED_TYPE_GENERIC, CredDeleteW};
     if !valid_credential_key(key) {
         return Err(WindowsAdapterError::InvalidInput);
     }
-    let target = std::ffi::OsStr::new(key)
-        .encode_wide()
-        .chain(Some(0))
-        .collect::<Vec<_>>();
-    if unsafe { CredDeleteW(target.as_ptr(), CRED_TYPE_GENERIC, 0) } == 0 {
-        Err(last_windows_adapter_error())
-    } else {
+    if eliot_windows_ipc::credential_delete_current_user(key)
+        .map_err(|error| windows_adapter_from_io(&error))?
+    {
         Ok(())
+    } else {
+        Err(WindowsAdapterError::Unavailable)
     }
 }
 
@@ -7269,5 +7686,111 @@ mod tests {
         ));
         let _ = std::fs::remove_dir_all(&root);
         let _ = std::fs::remove_dir_all(&outside);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn user_owned_portable_dev_root_and_path_roundtrip() {
+        let root = std::env::temp_dir().join(format!("eliot-user-owned-{}", unique_suffix()));
+        let path = root.join("nested/state.bin");
+        std::fs::create_dir_all(path.parent().unwrap_or_else(|| unreachable!()))
+            .unwrap_or_else(|_| unreachable!());
+        std::fs::write(&path, b"portable-dev").unwrap_or_else(|_| unreachable!());
+
+        let root_lease = UserOwnedRootLease::open_existing(&root)
+            .unwrap_or_else(|error| panic!("root lease failed: {error}"));
+        let file_lease = UserOwnedPathLease::open_existing(&root_lease, &path)
+            .unwrap_or_else(|error| panic!("path lease failed: {error}"));
+        assert_eq!(
+            file_lease.read_bounded(1024).unwrap_or_default(),
+            b"portable-dev"
+        );
+        root_lease
+            .verify_stable_identity()
+            .unwrap_or_else(|_| unreachable!());
+        file_lease
+            .verify_stable_identity()
+            .unwrap_or_else(|_| unreachable!());
+        file_lease
+            .verify_path_identity()
+            .unwrap_or_else(|_| unreachable!());
+        assert_eq!(file_lease.current_user_sid(), root_lease.current_user_sid());
+
+        drop(file_lease);
+        drop(root_lease);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn user_owned_portable_dev_rejects_outside_root() {
+        let root = std::env::temp_dir().join(format!("eliot-user-owned-root-{}", unique_suffix()));
+        let outside =
+            std::env::temp_dir().join(format!("eliot-user-owned-outside-{}", unique_suffix()));
+        std::fs::create_dir(&root).unwrap_or_else(|_| unreachable!());
+        std::fs::create_dir(&outside).unwrap_or_else(|_| unreachable!());
+        let outside_file = outside.join("outside.bin");
+        std::fs::write(&outside_file, b"outside").unwrap_or_else(|_| unreachable!());
+        let root_lease = UserOwnedRootLease::open_existing(&root)
+            .unwrap_or_else(|error| panic!("root lease failed: {error}"));
+        assert_eq!(
+            UserOwnedPathLease::open_existing(&root_lease, &outside_file).err(),
+            Some(ProtectedPathError::InvalidPath)
+        );
+        drop(root_lease);
+        let _ = std::fs::remove_dir_all(root);
+        let _ = std::fs::remove_dir_all(outside);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn user_owned_portable_dev_rejects_reparse_path_when_available() {
+        use std::os::windows::fs::symlink_dir;
+
+        let root =
+            std::env::temp_dir().join(format!("eliot-user-owned-reparse-{}", unique_suffix()));
+        let outside = std::env::temp_dir().join(format!(
+            "eliot-user-owned-reparse-outside-{}",
+            unique_suffix()
+        ));
+        std::fs::create_dir(&root).unwrap_or_else(|_| unreachable!());
+        std::fs::create_dir(&outside).unwrap_or_else(|_| unreachable!());
+        if symlink_dir(&outside, root.join("link")).is_err() {
+            let _ = std::fs::remove_dir_all(&root);
+            let _ = std::fs::remove_dir_all(&outside);
+            return;
+        }
+        let target = root.join("link/state.bin");
+        std::fs::write(outside.join("state.bin"), b"must-not-open")
+            .unwrap_or_else(|_| unreachable!());
+        let root_lease = UserOwnedRootLease::open_existing(&root)
+            .unwrap_or_else(|error| panic!("root lease failed: {error}"));
+        assert!(matches!(
+            UserOwnedPathLease::open_existing(&root_lease, &target),
+            Err(ProtectedPathError::ReparsePoint | ProtectedPathError::Io)
+        ));
+        drop(root_lease);
+        let _ = std::fs::remove_dir_all(root);
+        let _ = std::fs::remove_dir_all(outside);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn user_owned_portable_dev_bounded_read_rejects_oversize() {
+        let root = std::env::temp_dir().join(format!("eliot-user-owned-limit-{}", unique_suffix()));
+        std::fs::create_dir(&root).unwrap_or_else(|_| unreachable!());
+        let path = root.join("state.bin");
+        std::fs::write(&path, b"1234").unwrap_or_else(|_| unreachable!());
+        let root_lease = UserOwnedRootLease::open_existing(&root)
+            .unwrap_or_else(|error| panic!("root lease failed: {error}"));
+        let file_lease = UserOwnedPathLease::open_existing(&root_lease, &path)
+            .unwrap_or_else(|error| panic!("path lease failed: {error}"));
+        assert_eq!(
+            file_lease.read_bounded(3).err(),
+            Some(ProtectedPathError::SizeExceeded)
+        );
+        drop(file_lease);
+        drop(root_lease);
+        let _ = std::fs::remove_dir_all(root);
     }
 }

@@ -13,7 +13,11 @@ use std::path::Path;
 
 use eliot_blob::BlobRootOwner;
 use eliot_ipc::{ReplayDisposition, ReplayLedger, TransportLimits};
-use eliot_platform_windows::{NamedPipePeerExpectation, WindowsPlatform, read_protected_file};
+use eliot_platform::ClockObservation;
+use eliot_platform_windows::{
+    NamedPipePeerExpectation, UserOwnedPathLease, UserOwnedRootLease, WindowsPlatform,
+    read_protected_file,
+};
 use eliot_protocol::{
     ClientHello, EncodingProfile, Frame, FrameKind, MessageType, ProtocolPayload, ProtocolRange,
     ProtocolVersion, ServerHello,
@@ -26,7 +30,7 @@ use eliot_store_api::{
 };
 pub use eliot_store_api::{ReadinessReceipt, StoreRequest as Request, StoreResponse as Response};
 use eliot_store_surreal_adapter::{
-    AdapterError, PINNED_SURREALDB_MAJOR, SchemaGeneration, SemanticReadiness,
+    AdapterError, MigrationReceipt, PINNED_SURREALDB_MAJOR, SchemaGeneration, SemanticReadiness,
     SurrealAdapterConfig, SurrealStoreAdapter,
 };
 use secrecy::SecretString;
@@ -288,6 +292,21 @@ impl StoreComposition {
                 ReadinessReceipt::ready(generation.to_string())
             }
         })
+    }
+
+    /// Applies exactly the adapter's explicit first-generation schema plan.
+    /// Normal Store startup never calls this method; portable development must
+    /// opt into the separate schema-initialization CLI mode.
+    pub async fn apply_initial_schema_migration(
+        &self,
+        observed_clock: &ClockObservation,
+    ) -> Result<MigrationReceipt, StoreCompositionError> {
+        let generation = self.store.config().expected_schema_generation.clone();
+        let migration = SurrealStoreAdapter::initial_schema_migration(generation);
+        self.store
+            .apply_migration(&migration, observed_clock)
+            .await
+            .map_err(map_adapter_error)
     }
 
     /// Executes one closed named read from the store API catalogue.
@@ -678,16 +697,36 @@ pub fn load_config(path: Option<&Path>) -> Result<StoreLaunchConfig, String> {
     };
     let bytes = read_protected_file(path, MAX_LAUNCH_CONFIG_BYTES)
         .map_err(|error| format!("read protected config: {error}"))?;
+    parse_config_bytes(path, &bytes)
+}
+
+/// Loads a portable-development launch configuration through a retained
+/// user-owned root and file lease.  The lease is the only read surface: the
+/// path must remain inside the caller-provided existing root and the bytes are
+/// bounded before deserialization.
+pub fn load_portable_dev_config(
+    root: &UserOwnedRootLease,
+    path: &Path,
+) -> Result<StoreLaunchConfig, String> {
+    let lease = UserOwnedPathLease::open_existing(root, path)
+        .map_err(|error| format!("open portable-dev config: {error}"))?;
+    let bytes = lease
+        .read_bounded(MAX_LAUNCH_CONFIG_BYTES)
+        .map_err(|error| format!("read portable-dev config: {error}"))?;
+    parse_config_bytes(path, &bytes)
+}
+
+fn parse_config_bytes(path: &Path, bytes: &[u8]) -> Result<StoreLaunchConfig, String> {
     match path.extension().and_then(|extension| extension.to_str()) {
         Some("json") => {
-            let config: StoreLaunchConfig = serde_json::from_slice(&bytes)
+            let config: StoreLaunchConfig = serde_json::from_slice(bytes)
                 .map_err(|error| format!("parse JSON config: {error}"))?;
             config.validate()?;
             Ok(config)
         }
         Some("toml") => {
             let config: StoreLaunchConfig =
-                toml::from_slice(&bytes).map_err(|error| format!("parse TOML config: {error}"))?;
+                toml::from_slice(bytes).map_err(|error| format!("parse TOML config: {error}"))?;
             config.validate()?;
             Ok(config)
         }
@@ -745,6 +784,17 @@ mod tests {
         let mut endpoint_altered = config;
         endpoint_altered.endpoint = "ws://127.0.0.1:9000".to_owned();
         assert!(endpoint_altered.validate().is_err());
+    }
+
+    #[test]
+    fn bounded_config_parser_supports_json_and_rejects_other_extensions() {
+        let config = config();
+        let json = serde_json::to_vec(&config).expect("JSON config");
+        let parsed =
+            parse_config_bytes(Path::new("store.json"), &json).expect("JSON config parses");
+        assert_eq!(parsed.store_pipe, config.store_pipe);
+        assert_eq!(parsed.approved_config_hash, config.approved_config_hash);
+        assert!(parse_config_bytes(Path::new("store.txt"), &json).is_err());
     }
 
     #[test]

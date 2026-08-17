@@ -55,11 +55,6 @@ struct RpcErrorBody {
     data: Option<Value>,
 }
 
-#[derive(Debug, Deserialize)]
-struct SurrealVersionResponse {
-    version: String,
-}
-
 /// Decoded results of one parameterized provider query.  Each entry is the
 /// `result` member of one statement in order; provider `ERR` statuses remain
 /// observable to the caller so write paths can classify them as unknown.
@@ -195,20 +190,7 @@ impl RpcTransport {
                 ),
                 error => error,
             })?;
-        let response: SurrealVersionResponse = serde_json::from_value(value).map_err(|error| {
-            AdapterError::Serialization(format!("invalid SurrealDB version RPC result: {error}"))
-        })?;
-        let major = response
-            .version
-            .split('.')
-            .next()
-            .and_then(|value| value.parse::<u16>().ok())
-            .ok_or_else(|| {
-                AdapterError::Config(format!(
-                    "SurrealDB version RPC returned an invalid version: {}",
-                    response.version
-                ))
-            })?;
+        let major = provider_major_from_rpc(&value)?;
         if major != expected_major {
             return Err(AdapterError::Config(format!(
                 "SurrealDB server major {major} is incompatible with pinned major {expected_major}"
@@ -318,6 +300,28 @@ impl RpcTransport {
     }
 }
 
+fn provider_major_from_rpc(value: &Value) -> Result<u16, AdapterError> {
+    let version = value.as_str().ok_or_else(|| {
+        AdapterError::Serialization(
+            "SurrealDB version RPC result was not the canonical string".to_owned(),
+        )
+    })?;
+    let numeric_version = version.strip_prefix("surrealdb-").ok_or_else(|| {
+        AdapterError::Config(format!(
+            "SurrealDB version RPC returned an invalid version: {version}"
+        ))
+    })?;
+    numeric_version
+        .split('.')
+        .next()
+        .and_then(|value| value.parse::<u16>().ok())
+        .ok_or_else(|| {
+            AdapterError::Config(format!(
+                "SurrealDB version RPC returned an invalid version: {version}"
+            ))
+        })
+}
+
 fn parse_response(text: &str) -> Result<RpcResponse, AdapterError> {
     serde_json::from_str(text).map_err(|error| AdapterError::Serialization(error.to_string()))
 }
@@ -358,5 +362,14 @@ mod tests {
     fn request_ids_are_versioned_by_construction() {
         let id = format!("{RPC_PROTOCOL_VERSION}:named-operation:request");
         assert!(id.starts_with("eliot.s03.rpc.v1:named-operation:"));
+    }
+
+    #[test]
+    fn provider_version_rpc_uses_the_canonical_surrealdb_string() {
+        assert_eq!(
+            provider_major_from_rpc(&json!("surrealdb-3.1.4")).expect("canonical response"),
+            3
+        );
+        assert!(provider_major_from_rpc(&json!({"version": "3.1.4"})).is_err());
     }
 }

@@ -1501,9 +1501,13 @@ where
                     return Err(InstallationError::IdentityConflict);
                 }
                 if observation.crossed_no_return {
-                    transaction.record_no_return_boundary(observation.external_identity.clone())?;
+                    let mut activated = transaction.clone();
+                    activated.advance(expected, observation.evidence_refs.clone())?;
+                    activated.record_no_return_boundary(observation.external_identity.clone())?;
+                    *transaction = activated;
+                } else {
+                    transaction.advance(expected, observation.evidence_refs.clone())?;
                 }
-                transaction.advance(expected, observation.evidence_refs.clone())?;
                 if operation == InstallationEffectOperation::Rollback {
                     transaction.pending_external_changes.clear();
                 }
@@ -1625,5 +1629,143 @@ where
     #[must_use]
     pub const fn port(&self) -> &P {
         &self.port
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct KnownEffectPort {
+        observation: InstallationEffectObservation,
+    }
+
+    impl InstallationEffectPort for KnownEffectPort {
+        fn execute(
+            &mut self,
+            _request: &InstallationEffectRequest,
+        ) -> PortOutcome<InstallationEffectObservation> {
+            PortOutcome::Known(self.observation.clone())
+        }
+    }
+
+    fn must<T, E>(result: Result<T, E>) -> T
+    where
+        E: std::fmt::Display,
+    {
+        match result {
+            Ok(value) => value,
+            Err(error) => panic!("invalid installation test fixture: {error}"),
+        }
+    }
+
+    fn test_handle(value: impl Into<String>) -> PlatformHandle {
+        must(PlatformHandle::new(value.into()))
+    }
+
+    fn test_path(root: &Path, name: &str) -> PlatformHandle {
+        test_handle(root.join(name).to_string_lossy().into_owned())
+    }
+
+    fn registering_transaction() -> InstallationTransaction {
+        let root = std::env::temp_dir().join("eliot-installation-activate-regression");
+        let candidate_generation = test_handle("generation:candidate");
+        let rollback_plan = test_handle("rollback:plan");
+        let candidate_manifest = CandidateManifest {
+            generation: candidate_generation.clone(),
+            components: vec![
+                test_handle("component:kernel"),
+                test_handle("component:store"),
+            ],
+            artifact_digests: vec![test_handle("0".repeat(64)), test_handle("1".repeat(64))],
+            kernel_executable_path: test_path(&root, "eliot-kernel.exe"),
+            store_executable_path: test_path(&root, "eliot-store-surreal.exe"),
+            config_path: test_path(&root, "generation.json"),
+            dependency_closure_refs: vec![test_handle("evidence:dependency-closure")],
+            license_refs: vec![test_handle("evidence:licenses")],
+            config_digest: test_handle("2".repeat(64)),
+            supervision_key_fingerprint: test_handle("3".repeat(64)),
+            signature_ref: test_handle("evidence:signature"),
+        };
+        let request = ManagedEnvironmentChangeRequest {
+            request_id: test_handle("request:install"),
+            requester_and_reason: test_handle("requester:test"),
+            action: ManagedEnvironmentAction::Install,
+            target_family: test_handle("family:eliot"),
+            exact_candidate: candidate_generation,
+            expected_delta: test_handle("delta:installed"),
+            source_assurance_refs: vec![test_handle("evidence:source-assurance")],
+            affected_refs: Vec::new(),
+            impact_class: test_handle("impact:test"),
+            required_owner: test_handle("owner:installation"),
+            rollback_plan: rollback_plan.clone(),
+            verifier: test_handle("verifier:installation"),
+            budget: test_handle("budget:test"),
+            stop_condition: test_handle("stop:on-failure"),
+        };
+        let mut transaction = must(InstallationTransaction::new(
+            test_handle("transaction:activate"),
+            InstallationEpoch {
+                installation: test_handle("installation:test"),
+                lineage_id: test_handle("lineage:test"),
+                sequence: 1,
+            },
+            InstallationProfile::PortableDev,
+            request,
+            None,
+            candidate_manifest,
+            test_path(&root, "staging"),
+            vec![PlannedChange {
+                change_id: test_handle("change:activation-pointer"),
+                target: test_handle("target:activation-pointer"),
+                precondition_refs: vec![test_handle("evidence:precondition")],
+                postcondition_refs: vec![test_handle("evidence:postcondition")],
+            }],
+            vec![test_handle("evidence:plan-precondition")],
+            test_handle("recovery:command"),
+        ));
+        must(transaction.advance(
+            InstallationStage::Staging,
+            vec![test_handle("evidence:staged")],
+        ));
+        must(transaction.advance(
+            InstallationStage::StaticVerified,
+            vec![test_handle("evidence:static-verified")],
+        ));
+        must(transaction.advance(
+            InstallationStage::Registering,
+            vec![test_handle("evidence:registered")],
+        ));
+        transaction
+    }
+
+    #[test]
+    fn activate_with_crossed_no_return_advances_before_recording_boundary() {
+        let mut transaction = registering_transaction();
+        let evidence = test_handle("evidence:activated");
+        let boundary = test_handle("activation:pointer:generation-candidate");
+        let starting_revision = transaction.revision;
+        let observation = InstallationEffectObservation {
+            transaction_id: transaction.transaction_id.clone(),
+            operation: InstallationEffectOperation::Activate,
+            external_identity: boundary.clone(),
+            evidence_refs: vec![evidence.clone()],
+            crossed_no_return: true,
+        };
+        let mut coordinator = InstallationCoordinator::new(KnownEffectPort { observation });
+
+        let outcome =
+            must(coordinator.apply(&mut transaction, InstallationEffectOperation::Activate));
+
+        assert_eq!(
+            outcome,
+            InstallationStepOutcome::Applied {
+                stage: InstallationStage::Activating,
+                evidence_refs: vec![evidence],
+            }
+        );
+        assert_eq!(transaction.stage, InstallationStage::Activating);
+        assert_eq!(transaction.no_return_boundary.as_ref(), Some(&boundary));
+        assert_eq!(transaction.revision, starting_revision + 1);
     }
 }
