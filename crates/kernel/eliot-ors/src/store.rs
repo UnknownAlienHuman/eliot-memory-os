@@ -15,21 +15,22 @@ use serde_json::json;
 use crate::{
     ActiveSessionBinding, AdmissionReservation, AdmissionReservationActivation,
     AdmissionReservationReceipt, AdmissionReservationRelease, AuthorityActivationReceipt,
-    AuthorityRevocation, AuthorityRevocationReceipt, AuthoritySnapshotReceipt,
-    CanonicalDisposition, CanonicalReconciliation, CapabilityGrantActivation,
-    CapabilityGrantRevocation, CapabilityIntroductionActivation, CapabilityIntroductionFence,
-    CapabilityIntroductionReceipt, DeliveryAcknowledgement, DeliveryCursorReceipt,
-    DeliveryCursorState, EpochIdentity, EpochLineage, GenerationCutoverReceipt,
-    GenerationCutoverRecord, GenerationCutoverSnapshot, GenerationTransition,
-    GenerationTransitionReceipt, JobCheckpoint, KernelAuthoritySnapshot, OpaqueLabel,
-    OperationalControlProjection, OperationalMutationReceipt, OperationalPhase,
+    AuthorityHandoffBegin, AuthorityHandoffRecord, AuthorityHandoffState, AuthorityRevocation,
+    AuthorityRevocationReceipt, AuthoritySnapshotReceipt, CanonicalDisposition,
+    CanonicalReconciliation, CapabilityGrantActivation, CapabilityGrantRevocation,
+    CapabilityIntroductionActivation, CapabilityIntroductionFence, CapabilityIntroductionReceipt,
+    DeliveryAcknowledgement, DeliveryCursorReceipt, DeliveryCursorState, EpochIdentity,
+    EpochLineage, GenerationCutoverReceipt, GenerationCutoverRecord, GenerationCutoverSnapshot,
+    GenerationTransition, GenerationTransitionReceipt, JobCheckpoint, KernelAuthoritySnapshot,
+    OpaqueLabel, OperationalControlProjection, OperationalMutationReceipt, OperationalPhase,
     OperationalRecordContext, OperationalRecordInput, OrsError, OrsSnapshotReceipt,
-    OrsSnapshotRequest, PendingOperationPage, ProcessStartReplayRecord, RecoveredAuthoritySnapshot,
-    RecoveryCursor, RecoveryInboxDisposition, RecoveryInboxItem, RecoveryInboxReceipt,
-    RecoveryPage, RecoveryPayload, RecoveryPayloadEnvelope, ReservationRecord, ReservationRequest,
-    ReservationState, ReservedScope, RetryState, ScopeTerminalReceipt, ScopeTerminalView,
-    SessionBindingReceipt, SessionDetach, StageReceipt, StagedOperation, StateFenceSnapshot,
-    UserBrokerFence, UserBrokerRegistration, UserBrokerRegistrationReceipt, WriterReservationToken,
+    OrsSnapshotRequest, PendingOperationPage, ProcessEvidenceRecord, ProcessStartReplayRecord,
+    ProcessStartReplayState, RecoveredAuthoritySnapshot, RecoveryCursor, RecoveryInboxDisposition,
+    RecoveryInboxItem, RecoveryInboxReceipt, RecoveryPage, RecoveryPayload,
+    RecoveryPayloadEnvelope, ReservationRecord, ReservationRequest, ReservationState,
+    ReservedScope, RetryState, ScopeTerminalReceipt, ScopeTerminalView, SessionBindingReceipt,
+    SessionDetach, StageReceipt, StagedOperation, StateFenceSnapshot, UserBrokerFence,
+    UserBrokerRegistration, UserBrokerRegistrationReceipt, WriterReservationToken,
 };
 
 const META: TableDefinition<&str, &str> = TableDefinition::new("ors_meta_v1");
@@ -49,6 +50,10 @@ const RECOVERY_INBOX_HISTORY: TableDefinition<&str, &str> =
     TableDefinition::new("ors_recovery_inbox_history_v1");
 const PROCESS_START_REPLAY: TableDefinition<&str, &str> =
     TableDefinition::new("ors_process_start_replay_v1");
+const AUTHORITY_HANDOFFS: TableDefinition<&str, &str> =
+    TableDefinition::new("ors_authority_handoffs_v1");
+const PROCESS_EVIDENCE: TableDefinition<&str, &str> =
+    TableDefinition::new("ors_process_evidence_v1");
 const NEXT_GLOBAL_ORDER: &str = "next_global_order";
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -355,12 +360,24 @@ impl RedbRecoveryStore {
         &self,
         record: &ProcessStartReplayRecord,
     ) -> Result<Option<ProcessStartReplayRecord>, OrsError> {
+        record.validate()?;
         let write = self.database.begin_write().map_err(storage)?;
         let key = record.operation_id.as_str();
         let existing = {
             let mut table = write.open_table(PROCESS_START_REPLAY).map_err(storage)?;
             if let Some(existing) = table.get(key).map_err(storage)? {
-                Some(decode(existing.value())?)
+                let existing: ProcessStartReplayRecord = decode(existing.value())?;
+                existing.validate()?;
+                if existing.admission_digest != record.admission_digest
+                    || existing.owner != record.owner
+                {
+                    return Err(OrsError::IntegrityProblem {
+                        record_type: "process_start_replay",
+                        reason: "existing operation identity, digest, or owner conflicts"
+                            .to_owned(),
+                    });
+                }
+                Some(existing)
             } else {
                 let payload = encode(&record)?;
                 table.insert(key, payload.as_str()).map_err(storage)?;
@@ -387,12 +404,14 @@ impl RedbRecoveryStore {
 
     /// Persists a replay projection without allowing identity replacement.
     pub fn persist_process_start(&self, record: &ProcessStartReplayRecord) -> Result<(), OrsError> {
+        record.validate()?;
         let write = self.database.begin_write().map_err(storage)?;
         let key = record.operation_id.as_str();
         {
             let mut table = write.open_table(PROCESS_START_REPLAY).map_err(storage)?;
             if let Some(existing) = table.get(key).map_err(storage)? {
                 let existing: ProcessStartReplayRecord = decode(existing.value())?;
+                existing.validate()?;
                 if existing.admission_digest != record.admission_digest
                     || existing.owner != record.owner
                 {
@@ -401,11 +420,180 @@ impl RedbRecoveryStore {
                         reason: "identity replacement rejected".to_owned(),
                     });
                 }
+                let allowed = match (existing.state, record.state) {
+                    (
+                        ProcessStartReplayState::Reserved,
+                        ProcessStartReplayState::Reserved
+                        | ProcessStartReplayState::Completed
+                        | ProcessStartReplayState::Unknown,
+                    ) => true,
+                    (ProcessStartReplayState::Completed, ProcessStartReplayState::Completed)
+                    | (ProcessStartReplayState::Unknown, ProcessStartReplayState::Unknown) => {
+                        existing == *record
+                    }
+                    _ => false,
+                };
+                if !allowed {
+                    return Err(OrsError::IntegrityProblem {
+                        record_type: "process_start_replay",
+                        reason: "non-monotonic or conflicting replay transition".to_owned(),
+                    });
+                }
             }
             let payload = encode(&record)?;
             table.insert(key, payload.as_str()).map_err(storage)?;
         }
         write.commit().map_err(storage)
+    }
+
+    /// Atomically reserves one typed authority handoff by create-if-absent.
+    pub fn begin_authority_handoff(
+        &self,
+        record: &AuthorityHandoffRecord,
+    ) -> Result<AuthorityHandoffBegin, OrsError> {
+        record.validate()?;
+        if record.state != AuthorityHandoffState::Reserved {
+            return Err(OrsError::IntegrityProblem {
+                record_type: "authority_handoff",
+                reason: "begin requires a RESERVED candidate".to_owned(),
+            });
+        }
+        let write = self.database.begin_write().map_err(storage)?;
+        let outcome = {
+            let mut table = write.open_table(AUTHORITY_HANDOFFS).map_err(storage)?;
+            if let Some(existing) = table.get(record.handoff_id.as_str()).map_err(storage)? {
+                let existing: AuthorityHandoffRecord = decode(existing.value())?;
+                existing.validate()?;
+                if !existing.same_identity(record) {
+                    return Err(OrsError::IntegrityProblem {
+                        record_type: "authority_handoff",
+                        reason: "same handoff id has conflicting identity".to_owned(),
+                    });
+                }
+                AuthorityHandoffBegin::Existing(existing)
+            } else {
+                let payload = encode(record)?;
+                table
+                    .insert(record.handoff_id.as_str(), payload.as_str())
+                    .map_err(storage)?;
+                AuthorityHandoffBegin::Acquired
+            }
+        };
+        write.commit().map_err(storage)?;
+        Ok(outcome)
+    }
+
+    /// Commits a handoff outcome without replacing its immutable identity.
+    pub fn persist_authority_handoff(
+        &self,
+        record: &AuthorityHandoffRecord,
+    ) -> Result<(), OrsError> {
+        record.validate()?;
+        let write = self.database.begin_write().map_err(storage)?;
+        {
+            let mut table = write.open_table(AUTHORITY_HANDOFFS).map_err(storage)?;
+            let existing: Option<AuthorityHandoffRecord> = table
+                .get(record.handoff_id.as_str())
+                .map_err(storage)?
+                .map(|value| decode(value.value()))
+                .transpose()?;
+            let existing: AuthorityHandoffRecord =
+                existing.ok_or(OrsError::AuthoritySnapshotUnavailable)?;
+            existing.validate()?;
+            if !existing.same_identity(record) {
+                return Err(OrsError::IntegrityProblem {
+                    record_type: "authority_handoff",
+                    reason: "handoff identity replacement rejected".to_owned(),
+                });
+            }
+            let allowed = match (existing.state, record.state) {
+                (
+                    AuthorityHandoffState::Reserved,
+                    AuthorityHandoffState::Consumed | AuthorityHandoffState::Unknown,
+                ) => true,
+                (AuthorityHandoffState::Consumed, AuthorityHandoffState::Consumed)
+                | (AuthorityHandoffState::Unknown, AuthorityHandoffState::Unknown) => {
+                    existing == *record
+                }
+                _ => false,
+            };
+            if !allowed {
+                return Err(OrsError::IntegrityProblem {
+                    record_type: "authority_handoff",
+                    reason: "non-monotonic or conflicting handoff transition".to_owned(),
+                });
+            }
+            let payload = encode(record)?;
+            table
+                .insert(record.handoff_id.as_str(), payload.as_str())
+                .map_err(storage)?;
+        }
+        write.commit().map_err(storage)
+    }
+
+    /// Reads one handoff for bounded recovery/reconciliation.
+    pub fn load_authority_handoff(
+        &self,
+        handoff_id: &crate::OperationIdentity,
+    ) -> Result<Option<AuthorityHandoffRecord>, OrsError> {
+        let read = self.database.begin_read().map_err(storage)?;
+        let table = read.open_table(AUTHORITY_HANDOFFS).map_err(storage)?;
+        table
+            .get(handoff_id.as_str())
+            .map_err(storage)?
+            .map(|value| {
+                let record: AuthorityHandoffRecord = decode(value.value())?;
+                record.validate()?;
+                Ok(record)
+            })
+            .transpose()
+    }
+
+    /// Appends one observation-only evidence projection, preserving conflicts.
+    pub fn persist_process_evidence(&self, record: &ProcessEvidenceRecord) -> Result<(), OrsError> {
+        record.validate()?;
+        let write = self.database.begin_write().map_err(storage)?;
+        {
+            let mut table = write.open_table(PROCESS_EVIDENCE).map_err(storage)?;
+            let existing: Option<ProcessEvidenceRecord> = table
+                .get(record.operation_id.as_str())
+                .map_err(storage)?
+                .map(|value| decode(value.value()))
+                .transpose()?;
+            if let Some(existing) = existing {
+                existing.validate()?;
+                if existing != *record {
+                    return Err(OrsError::IntegrityProblem {
+                        record_type: "process_evidence",
+                        reason: "conflicting evidence replacement rejected".to_owned(),
+                    });
+                }
+            } else {
+                let payload = encode(record)?;
+                table
+                    .insert(record.operation_id.as_str(), payload.as_str())
+                    .map_err(storage)?;
+            }
+        }
+        write.commit().map_err(storage)
+    }
+
+    /// Reads one observation-only evidence record after validation.
+    pub fn load_process_evidence(
+        &self,
+        operation_id: &crate::OperationIdentity,
+    ) -> Result<Option<ProcessEvidenceRecord>, OrsError> {
+        let read = self.database.begin_read().map_err(storage)?;
+        let table = read.open_table(PROCESS_EVIDENCE).map_err(storage)?;
+        table
+            .get(operation_id.as_str())
+            .map_err(storage)?
+            .map(|value| {
+                let record: ProcessEvidenceRecord = decode(value.value())?;
+                record.validate()?;
+                Ok(record)
+            })
+            .transpose()
     }
 
     /// Opens or creates an ORS database and converts interrupted execution to reconciliation.
@@ -455,6 +643,8 @@ impl RedbRecoveryStore {
             drop(write.open_table(RECOVERY_INBOX).map_err(storage)?);
             drop(write.open_table(RECOVERY_INBOX_HISTORY).map_err(storage)?);
             drop(write.open_table(PROCESS_START_REPLAY).map_err(storage)?);
+            drop(write.open_table(AUTHORITY_HANDOFFS).map_err(storage)?);
+            drop(write.open_table(PROCESS_EVIDENCE).map_err(storage)?);
         }
         write.commit().map_err(storage)
     }
@@ -3041,24 +3231,23 @@ impl PersistedValue for ProcessStartReplayRecord {
     const RECORD_TYPE: &'static str = "process_start_replay";
 
     fn validate_persisted(&self) -> Result<(), OrsError> {
-        crate::model::validate_digest(&self.admission_digest, "process_start_admission_digest")?;
-        if self.operation_id.as_str().trim().is_empty() {
-            return Err(OrsError::InvalidField {
-                field: "process_start_operation_id",
-                reason: "must not be blank",
-            });
-        }
-        eliot_process::ProcessOwnerBinding::new(
-            self.owner.module_id(),
-            self.owner.principal_digest(),
-            self.owner.authority_epoch(),
-            self.owner.generation(),
-        )
-        .map_err(|error| OrsError::IntegrityProblem {
-            record_type: Self::RECORD_TYPE,
-            reason: error.to_string(),
-        })?;
-        Ok(())
+        self.validate()
+    }
+}
+
+impl PersistedValue for AuthorityHandoffRecord {
+    const RECORD_TYPE: &'static str = "authority_handoff";
+
+    fn validate_persisted(&self) -> Result<(), OrsError> {
+        self.validate()
+    }
+}
+
+impl PersistedValue for ProcessEvidenceRecord {
+    const RECORD_TYPE: &'static str = "process_evidence";
+
+    fn validate_persisted(&self) -> Result<(), OrsError> {
+        self.validate()
     }
 }
 

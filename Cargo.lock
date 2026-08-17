@@ -1364,6 +1364,7 @@ dependencies = [
  "eliot-contracts",
  "eliot-ipc",
  "eliot-kernel-core",
+ "eliot-ors",
  "eliot-platform",
  "eliot-platform-windows",
  "eliot-process",

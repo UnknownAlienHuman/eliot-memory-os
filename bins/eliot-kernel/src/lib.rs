@@ -29,17 +29,21 @@ use eliot_kernel_core::{
 };
 use eliot_kernel_service::{
     EbpCanonicalStoreClient, HostStoreBootstrapRequirement, KernelControlCommand, KernelService,
-    KernelServiceError, KernelServiceState, ProcessExecutionRequest, ProcessExecutionResponse,
-    StoreClientError,
+    KernelServiceError, KernelServiceState, ProcessAuthorityHandoffDescriptor,
+    ProcessExecutionRequest, ProcessExecutionResponse, StoreClientError,
 };
 #[cfg(test)]
 use eliot_ors::CanonicalEvidenceProvider;
-use eliot_ors::{OperationalRecoveryStore, RedbRecoveryStore};
 use eliot_ors::{
+    AuthorityHandoffBegin, AuthorityHandoffRecord, AuthorityHandoffState, ProcessEvidenceRecord,
     ProcessStartReplayRecord as OrsReplayRecord, ProcessStartReplayState as OrsReplayState,
 };
+use eliot_ors::{OperationalRecoveryStore, RedbRecoveryStore};
 use eliot_platform::PortError;
-use eliot_platform_windows::{ProtectedSecret, RetainedProcessPathLease, WindowsPlatform};
+use eliot_platform_windows::{
+    ProtectedPathLease, ProtectedSecret, RetainedProcessPathLease, UserOwnedPathLease,
+    UserOwnedRootLease, WindowsPlatform,
+};
 use eliot_process::{
     DispatchAuthorityId, DispatchValidationContext, Generation, KernelDispatchKey, PermitIssuance,
     ProcessEvidence, ProcessEvidenceSink, ProcessExecutionAdmissionRequest, ProcessExecutionError,
@@ -161,6 +165,56 @@ pub enum KernelBuildError {
     Principal(String),
 }
 
+/// Exact protected contour selected for one authority descriptor read.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum AuthorityDescriptorContour {
+    /// Current-user portable contour rooted at an existing user-owned directory.
+    PortableCurrentUser { root: PathBuf },
+    /// Installation-wide protected `ProgramData` contour.
+    ProgramData,
+}
+
+/// Typed fail-closed result for protected authority preparation.
+#[derive(Debug, Eq, PartialEq)]
+pub enum AuthorityPreparationError {
+    /// The descriptor path could not be retained and read in the selected contour.
+    ProtectedInput,
+    /// The independent expected digest was malformed or did not match the bytes.
+    DigestMismatch,
+    /// The descriptor failed its closed contract validation.
+    DescriptorInvalid,
+    /// Credential Manager did not return an acceptable secret.
+    CredentialUnavailable,
+    /// The credential was not exactly one non-zero 32-byte dispatch key.
+    CredentialInvalid,
+    /// The durable one-shot handoff was already reserved, consumed, or unknown.
+    Replay,
+    /// Durable handoff persistence did not establish a known outcome.
+    PersistenceUnknown,
+}
+
+impl fmt::Display for AuthorityPreparationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::ProtectedInput => "protected authority input unavailable",
+            Self::DigestMismatch => "authority descriptor digest mismatch",
+            Self::DescriptorInvalid => "authority descriptor is invalid",
+            Self::CredentialUnavailable => "authority credential unavailable",
+            Self::CredentialInvalid => "authority credential is invalid",
+            Self::Replay => "authority handoff replay or recovery is required",
+            Self::PersistenceUnknown => "authority handoff persistence outcome is unknown",
+        })
+    }
+}
+
+impl std::error::Error for AuthorityPreparationError {}
+
+#[allow(dead_code)]
+struct PreparedAuthorityMaterial {
+    descriptor: ProcessAuthorityHandoffDescriptor,
+    key: KernelDispatchKey,
+}
+
 impl fmt::Display for KernelBuildError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -234,10 +288,6 @@ pub struct ProcessExecutionAuthorityConfig {
     pub snapshot_binding: AuthoritySnapshotBinding,
     /// Host/platform codec for the opaque durable authority snapshot.
     pub snapshot_codec: Arc<dyn DispatchSnapshotCodec>,
-    /// Durable replay projection store for start receipts.
-    pub replay_store: Arc<dyn ProcessExecutionReplayStore>,
-    /// Evidence sink owned by the Kernel/Host boundary.
-    pub evidence_sink: Arc<dyn ProcessEvidenceSink>,
     /// Live ORS-backed validation context. It must ignore caller-provided
     /// fences and read the current Kernel clock, fence and revision heads.
     pub validation_context: Arc<dyn ProcessValidationContextProvider>,
@@ -254,6 +304,27 @@ pub trait ProcessValidationContextProvider: Send + Sync {
 
 struct OrsProcessReplayStore {
     store: Arc<RedbRecoveryStore>,
+}
+
+struct OrsProcessEvidenceSink {
+    store: Arc<RedbRecoveryStore>,
+    owner: ProcessOwnerBinding,
+}
+
+impl ProcessEvidenceSink for OrsProcessEvidenceSink {
+    fn record(&self, evidence: ProcessEvidence) -> Result<(), eliot_process::EvidenceSinkError> {
+        let observed_at_ms = i64::try_from(unix_ms()).unwrap_or(i64::MAX);
+        let record =
+            ProcessEvidenceRecord::from_evidence(evidence, self.owner.clone(), observed_at_ms)
+                .map_err(|error| eliot_process::EvidenceSinkError {
+                    message: error.to_string(),
+                })?;
+        self.store
+            .persist_process_evidence(&record)
+            .map_err(|error| eliot_process::EvidenceSinkError {
+                message: error.to_string(),
+            })
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -334,9 +405,8 @@ impl DispatchSnapshotCodec for WindowsDispatchSnapshotCodec {
             .map_err(|error| {
                 eliot_kernel_core::KernelError::RecoveryUnavailable(error.to_string())
             })?;
-        let expected =
-            AuthoritySnapshotBinding::from_wire(envelope.binding, binding.authority_id())?;
-        if envelope.authority_id != *binding.authority_id() || expected != *binding {
+        AuthoritySnapshotBinding::from_wire_exact(envelope.binding, binding)?;
+        if envelope.authority_id != *binding.authority_id() {
             return Err(eliot_kernel_core::KernelError::FenceMismatch);
         }
         envelope.snapshot.validate().map_err(|error| {
@@ -458,7 +528,7 @@ struct ProcessExecutionGateway {
     controller: Arc<Mutex<ProcessDispatchAuthorityController>>,
     executor: WindowsProcessExecutor,
     replay_store: Arc<dyn ProcessExecutionReplayStore>,
-    evidence_sink: Arc<dyn ProcessEvidenceSink>,
+    evidence_store: Arc<RedbRecoveryStore>,
     snapshot_binding: AuthoritySnapshotBinding,
     validation_context: Arc<dyn ProcessValidationContextProvider>,
     path_admission: Arc<KernelPathAdmission>,
@@ -547,8 +617,7 @@ impl ProcessLaunchAdmission for KernelPathAdmission {
 impl ProcessExecutionGateway {
     fn new(
         controller: Arc<Mutex<ProcessDispatchAuthorityController>>,
-        replay_store: Arc<dyn ProcessExecutionReplayStore>,
-        evidence_sink: Arc<dyn ProcessEvidenceSink>,
+        ors: Arc<RedbRecoveryStore>,
         snapshot_binding: AuthoritySnapshotBinding,
         validation_context: Arc<dyn ProcessValidationContextProvider>,
         path_admission: Arc<KernelPathAdmission>,
@@ -562,8 +631,10 @@ impl ProcessExecutionGateway {
         Self {
             controller,
             executor: WindowsProcessExecutor::new_with_launch_admission(port, launch_admission),
-            replay_store,
-            evidence_sink,
+            replay_store: Arc::new(OrsProcessReplayStore {
+                store: Arc::clone(&ors),
+            }),
+            evidence_store: ors,
             snapshot_binding,
             validation_context,
             path_admission,
@@ -707,7 +778,13 @@ impl ProcessExecutionGateway {
         }
         let receipt = match self
             .executor
-            .start(request, Arc::clone(&self.evidence_sink))
+            .start(
+                request,
+                Arc::new(OrsProcessEvidenceSink {
+                    store: Arc::clone(&self.evidence_store),
+                    owner: owner.clone(),
+                }),
+            )
             .await
         {
             Ok(receipt) => {
@@ -1109,18 +1186,127 @@ impl KernelComposition {
             .map_err(|error| KernelBuildError::Core(error.to_string()))?,
         ));
         let path_admission = Arc::new(KernelPathAdmission::new(Arc::clone(&platform)));
-        let replay_store: Arc<dyn ProcessExecutionReplayStore> = Arc::new(OrsProcessReplayStore {
-            store: Arc::clone(&ors),
-        });
         let gateway = Arc::new(ProcessExecutionGateway::new(
             Arc::clone(&controller),
-            replay_store,
-            authority_config.evidence_sink,
+            Arc::clone(&ors),
             authority_config.snapshot_binding,
             authority_config.validation_context,
             path_admission,
         ));
         Self::assemble(config, ors, Some(gateway), platform)
+    }
+
+    /// Reads, validates, and consumes one protected authority descriptor.
+    ///
+    /// This remains Kernel-private until the live Store-derived validation
+    /// context is available in K1C. The descriptor and credential never leave
+    /// this process as serialized authority material.
+    #[allow(dead_code)]
+    fn prepare_authority_descriptor(
+        &self,
+        path: &Path,
+        expected_sha256: &str,
+        contour: AuthorityDescriptorContour,
+    ) -> Result<PreparedAuthorityMaterial, AuthorityPreparationError> {
+        if !is_lower_sha256(expected_sha256) {
+            return Err(AuthorityPreparationError::DigestMismatch);
+        }
+        let bytes = match contour {
+            AuthorityDescriptorContour::PortableCurrentUser { root } => {
+                let root_lease = UserOwnedRootLease::open_existing(&root)
+                    .map_err(|_| AuthorityPreparationError::ProtectedInput)?;
+                let file_lease = UserOwnedPathLease::open_existing(&root_lease, path)
+                    .map_err(|_| AuthorityPreparationError::ProtectedInput)?;
+                file_lease
+                    .verify_stable_identity()
+                    .and_then(|()| file_lease.verify_path_identity())
+                    .map_err(|_| AuthorityPreparationError::ProtectedInput)?;
+                file_lease
+                    .read_bounded(1024 * 1024)
+                    .map_err(|_| AuthorityPreparationError::ProtectedInput)?
+            }
+            AuthorityDescriptorContour::ProgramData => {
+                let file_lease = ProtectedPathLease::open_existing_absolute(path)
+                    .map_err(|_| AuthorityPreparationError::ProtectedInput)?;
+                file_lease
+                    .verify_stable_identity()
+                    .and_then(|()| file_lease.verify_path_identity())
+                    .map_err(|_| AuthorityPreparationError::ProtectedInput)?;
+                file_lease
+                    .read_bounded(1024 * 1024)
+                    .map_err(|_| AuthorityPreparationError::ProtectedInput)?
+            }
+        };
+        if sha256_hex(&bytes) != expected_sha256 {
+            return Err(AuthorityPreparationError::DigestMismatch);
+        }
+        let descriptor: ProcessAuthorityHandoffDescriptor = serde_json::from_slice(&bytes)
+            .map_err(|_| AuthorityPreparationError::DescriptorInvalid)?;
+        let now = i64::try_from(unix_ms()).unwrap_or(i64::MAX);
+        descriptor
+            .validate(now)
+            .map_err(|_| AuthorityPreparationError::DescriptorInvalid)?;
+        let secret = self
+            .platform
+            .read_credential(descriptor.dispatch_key.key.as_str())
+            .map_err(|_| AuthorityPreparationError::CredentialUnavailable)?;
+        if secret.expose().len() != 32 || secret.expose().iter().all(|byte| *byte == 0) {
+            return Err(AuthorityPreparationError::CredentialInvalid);
+        }
+        let mut key_bytes = [0_u8; 32];
+        key_bytes.copy_from_slice(secret.expose());
+        let key = KernelDispatchKey::from_secret_bytes(key_bytes)
+            .map_err(|_| AuthorityPreparationError::CredentialInvalid)?;
+
+        let handoff_id = eliot_ors::OperationIdentity::new(descriptor.handoff_id.as_str())
+            .map_err(|_| AuthorityPreparationError::DescriptorInvalid)?;
+        let candidate = AuthorityHandoffRecord {
+            contract_version: eliot_ors::CONTRACT_VERSION,
+            handoff_id,
+            descriptor_digest: descriptor.descriptor_sha256.clone(),
+            authority_id: eliot_ors::OpaqueLabel::new(descriptor.authority_id.as_str())
+                .map_err(|_| AuthorityPreparationError::DescriptorInvalid)?,
+            snapshot_record_id: descriptor.snapshot_binding.record_id.clone(),
+            snapshot_binding_digest: sha256_json(&descriptor.snapshot_binding)
+                .map_err(|_| AuthorityPreparationError::DescriptorInvalid)?,
+            authority_epoch: descriptor.state_fence.authority_epoch.value(),
+            generation: descriptor.generation.value(),
+            state_fence_digest: sha256_json(&descriptor.state_fence)
+                .map_err(|_| AuthorityPreparationError::DescriptorInvalid)?,
+            secret_reference_identity_digest: sha256_json(&descriptor.dispatch_key)
+                .map_err(|_| AuthorityPreparationError::DescriptorInvalid)?,
+            state: AuthorityHandoffState::Reserved,
+            issued_at_ms: descriptor.issued_at_ms,
+            expires_at_ms: descriptor.expires_at_ms,
+            consumed_at_ms: None,
+            reconciliation_evidence: None,
+        };
+        let ors = &self.generation_gateway.ors;
+        match ors
+            .begin_authority_handoff(&candidate)
+            .map_err(|_| AuthorityPreparationError::PersistenceUnknown)?
+        {
+            AuthorityHandoffBegin::Acquired => {}
+            AuthorityHandoffBegin::Existing(_) => return Err(AuthorityPreparationError::Replay),
+        }
+        let consumed = AuthorityHandoffRecord {
+            state: AuthorityHandoffState::Consumed,
+            consumed_at_ms: Some(now),
+            ..candidate.clone()
+        };
+        if ors.persist_authority_handoff(&consumed).is_err() {
+            let unknown = AuthorityHandoffRecord {
+                state: AuthorityHandoffState::Unknown,
+                reconciliation_evidence: Some(
+                    eliot_ors::OpaqueLabel::new("consume-commit-outcome-unknown")
+                        .map_err(|_| AuthorityPreparationError::PersistenceUnknown)?,
+                ),
+                ..candidate
+            };
+            let _ = ors.persist_authority_handoff(&unknown);
+            return Err(AuthorityPreparationError::PersistenceUnknown);
+        }
+        Ok(PreparedAuthorityMaterial { descriptor, key })
     }
 
     /// Builds the production composition with Host-owned canonical evidence
@@ -1862,6 +2048,31 @@ fn dispatch_key(work_root: &Path) -> [u8; 32] {
     hasher.finalize().into()
 }
 
+#[allow(dead_code)]
+fn is_lower_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+}
+
+#[allow(dead_code)]
+fn sha256_hex(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let digest = Sha256::digest(bytes);
+    let mut output = String::with_capacity(64);
+    for byte in digest {
+        output.push(char::from(HEX[usize::from(byte >> 4)]));
+        output.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    output
+}
+
+#[allow(dead_code)]
+fn sha256_json<T: Serialize>(value: &T) -> Result<String, serde_json::Error> {
+    Ok(sha256_hex(&serde_json::to_vec(value)?))
+}
+
 /// Resolves and validates the default `WorkScope` root for the binary entrypoint.
 pub fn default_work_root() -> Result<PathBuf, std::io::Error> {
     let root = std::env::var_os("ELIOT_WORK_ROOT").map_or(std::env::current_dir()?, PathBuf::from);
@@ -1881,8 +2092,8 @@ mod tests {
     use eliot_platform::SecretReference;
     use eliot_process::{
         ActionLeaseRef, DispatchPermitReplaySnapshot, EnvironmentInheritance,
-        EnvironmentProjection, EvidenceSinkError, FencingToken, ImageId, JobId, OperationId,
-        PermitIssuance, ProcessEvidence, ProcessTreeId, ResourceLimits, SessionId,
+        EnvironmentProjection, FencingToken, ImageId, JobId, OperationId, PermitIssuance,
+        ProcessTreeId, ResourceLimits, SessionId,
     };
     use eliot_runtime_contracts::ModuleContract;
 
@@ -1939,46 +2150,6 @@ mod tests {
             };
             serde_json::from_slice(ciphertext)
                 .map_err(|error| KernelError::RecoveryUnavailable(error.to_string()))
-        }
-    }
-
-    struct UnusedReplayStore;
-
-    impl ProcessExecutionReplayStore for UnusedReplayStore {
-        fn load_process_start(
-            &self,
-            _operation_id: &OperationId,
-        ) -> KernelResult<Option<ProcessExecutionReplayRecord>> {
-            Ok(None)
-        }
-
-        fn begin_process_start(
-            &self,
-            _operation_id: &OperationId,
-            _admission_digest: &str,
-            _owner: &ProcessOwnerBinding,
-        ) -> KernelResult<ProcessExecutionReplayBegin> {
-            Err(KernelError::DependencyUnavailable(
-                "fixture replay store is not used".to_owned(),
-            ))
-        }
-
-        fn persist_process_start(
-            &self,
-            _operation_id: &OperationId,
-            _record: ProcessExecutionReplayRecord,
-        ) -> KernelResult<()> {
-            Err(KernelError::DependencyUnavailable(
-                "fixture replay store is not used".to_owned(),
-            ))
-        }
-    }
-
-    struct UnusedEvidenceSink;
-
-    impl ProcessEvidenceSink for UnusedEvidenceSink {
-        fn record(&self, _evidence: ProcessEvidence) -> Result<(), EvidenceSinkError> {
-            Ok(())
         }
     }
 
@@ -2184,14 +2355,12 @@ mod tests {
                 key: KernelDispatchKey::from_secret_bytes([0x4a; 32]).expect("restore key"),
                 snapshot_binding: binding,
                 snapshot_codec: codec,
-                replay_store: Arc::new(UnusedReplayStore),
-                evidence_sink: Arc::new(UnusedEvidenceSink),
                 validation_context: Arc::new(UnusedValidationContext),
             },
         )
         .expect("process authority constructor");
         assert!(kernel.process_execution_configured());
-        assert_eq!(Arc::strong_count(&kernel.generation_gateway.ors), 3);
+        assert_eq!(Arc::strong_count(&kernel.generation_gateway.ors), 4);
         drop(kernel);
         let _ = std::fs::remove_dir_all(root);
     }
@@ -2219,6 +2388,36 @@ mod tests {
         for candidate in [wrong_module, wrong_principal, wrong_generation] {
             assert!(authorize_process_owner(&owner, &candidate).is_err());
         }
+    }
+
+    #[test]
+    fn protected_authority_preparation_rejects_untrusted_input_before_consumption() {
+        let root = std::env::temp_dir().join(format!(
+            "eliot-kernel-authority-preparation-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).expect("test work root");
+        let kernel = KernelComposition::new(KernelConfig::new(&root)).expect("composition");
+        let descriptor_path = root.join("authority.json");
+        assert!(matches!(
+            kernel.prepare_authority_descriptor(
+                &descriptor_path,
+                "not-a-digest",
+                AuthorityDescriptorContour::ProgramData,
+            ),
+            Err(AuthorityPreparationError::DigestMismatch)
+        ));
+        let empty_digest = sha256_hex(&[]);
+        assert!(matches!(
+            kernel.prepare_authority_descriptor(
+                &descriptor_path,
+                &empty_digest,
+                AuthorityDescriptorContour::ProgramData,
+            ),
+            Err(AuthorityPreparationError::ProtectedInput)
+        ));
+        drop(kernel);
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]

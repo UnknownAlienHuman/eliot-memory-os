@@ -61,6 +61,43 @@ pub struct ProcessStartReplayRecord {
     pub receipt: Option<eliot_process::ProcessStartReceipt>,
 }
 
+impl ProcessStartReplayRecord {
+    pub fn validate(&self) -> Result<(), OrsError> {
+        validate_text(self.operation_id.as_str(), "process_start_operation_id")?;
+        validate_digest(&self.admission_digest, "process_start_admission_digest")?;
+        eliot_process::ProcessOwnerBinding::new(
+            self.owner.module_id(),
+            self.owner.principal_digest(),
+            self.owner.authority_epoch(),
+            self.owner.generation(),
+        )
+        .map_err(|error| OrsError::IntegrityProblem {
+            record_type: "process_start_replay",
+            reason: error.to_string(),
+        })?;
+        match (&self.state, &self.receipt) {
+            (ProcessStartReplayState::Completed, Some(receipt)) => {
+                if receipt.operation_id().as_str() != self.operation_id.as_str() {
+                    return Err(OrsError::IntegrityProblem {
+                        record_type: "process_start_replay",
+                        reason: "completion receipt does not bind the reserved operation"
+                            .to_owned(),
+                    });
+                }
+            }
+            (ProcessStartReplayState::Completed, None)
+            | (ProcessStartReplayState::Reserved | ProcessStartReplayState::Unknown, Some(_)) => {
+                return Err(OrsError::IntegrityProblem {
+                    record_type: "process_start_replay",
+                    reason: "state and receipt combination is invalid".to_owned(),
+                });
+            }
+            (ProcessStartReplayState::Reserved | ProcessStartReplayState::Unknown, None) => {}
+        }
+        Ok(())
+    }
+}
+
 /// Process-start replay disposition persisted by ORS.
 #[derive(Clone, Copy, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
@@ -68,6 +105,250 @@ pub enum ProcessStartReplayState {
     Reserved,
     Completed,
     Unknown,
+}
+
+/// Durable one-shot authority handoff disposition.
+#[derive(Clone, Copy, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum AuthorityHandoffState {
+    Reserved,
+    Consumed,
+    Unknown,
+}
+
+/// Secret-free identity and outcome record for one authority handoff.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AuthorityHandoffRecord {
+    pub contract_version: u16,
+    pub handoff_id: OperationIdentity,
+    pub descriptor_digest: String,
+    pub authority_id: OpaqueLabel,
+    pub snapshot_record_id: OperationIdentity,
+    pub snapshot_binding_digest: String,
+    pub authority_epoch: u64,
+    pub generation: u64,
+    pub state_fence_digest: String,
+    pub secret_reference_identity_digest: String,
+    pub state: AuthorityHandoffState,
+    pub issued_at_ms: i64,
+    pub expires_at_ms: i64,
+    pub consumed_at_ms: Option<i64>,
+    pub reconciliation_evidence: Option<OpaqueLabel>,
+}
+
+impl AuthorityHandoffRecord {
+    pub(crate) fn validate(&self) -> Result<(), OrsError> {
+        if self.contract_version != CONTRACT_VERSION {
+            return Err(OrsError::UnsupportedContractVersion(self.contract_version));
+        }
+        validate_text(self.handoff_id.as_str(), "authority_handoff_id")?;
+        validate_text(self.authority_id.as_str(), "authority_handoff_authority_id")?;
+        validate_text(
+            self.snapshot_record_id.as_str(),
+            "authority_handoff_snapshot_record_id",
+        )?;
+        for (value, field) in [
+            (
+                &self.descriptor_digest,
+                "authority_handoff_descriptor_digest",
+            ),
+            (
+                &self.snapshot_binding_digest,
+                "authority_handoff_binding_digest",
+            ),
+            (
+                &self.state_fence_digest,
+                "authority_handoff_state_fence_digest",
+            ),
+            (
+                &self.secret_reference_identity_digest,
+                "authority_handoff_secret_reference_digest",
+            ),
+        ] {
+            validate_digest(value, field)?;
+        }
+        if self.authority_epoch == 0 || self.generation == 0 {
+            return Err(OrsError::InvalidField {
+                field: "authority_handoff_identity",
+                reason: "authority epoch and generation must be non-zero",
+            });
+        }
+        if self.expires_at_ms <= self.issued_at_ms {
+            return Err(OrsError::InvalidExpiry);
+        }
+        match (
+            &self.state,
+            self.consumed_at_ms,
+            &self.reconciliation_evidence,
+        ) {
+            (AuthorityHandoffState::Reserved, None, None)
+            | (AuthorityHandoffState::Unknown, None, Some(_)) => {}
+            (AuthorityHandoffState::Consumed, Some(consumed), None)
+                if consumed >= self.issued_at_ms && consumed <= self.expires_at_ms => {}
+            _ => {
+                return Err(OrsError::IntegrityProblem {
+                    record_type: "authority_handoff",
+                    reason: "state and outcome evidence combination is invalid".to_owned(),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn same_identity(&self, other: &Self) -> bool {
+        self.handoff_id == other.handoff_id
+            && self.descriptor_digest == other.descriptor_digest
+            && self.authority_id == other.authority_id
+            && self.snapshot_record_id == other.snapshot_record_id
+            && self.snapshot_binding_digest == other.snapshot_binding_digest
+            && self.authority_epoch == other.authority_epoch
+            && self.generation == other.generation
+            && self.state_fence_digest == other.state_fence_digest
+            && self.secret_reference_identity_digest == other.secret_reference_identity_digest
+            && self.issued_at_ms == other.issued_at_ms
+            && self.expires_at_ms == other.expires_at_ms
+    }
+}
+
+/// Result of the atomic one-shot handoff reservation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[allow(clippy::large_enum_variant)]
+pub enum AuthorityHandoffBegin {
+    Acquired,
+    Existing(AuthorityHandoffRecord),
+}
+
+/// Observation-only process evidence retained by ORS.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProcessEvidenceRecord {
+    pub contract_version: u16,
+    pub operation_id: OperationIdentity,
+    pub request_digest: String,
+    pub process_tree_id: OpaqueLabel,
+    pub job_id: OpaqueLabel,
+    pub image_id: OpaqueLabel,
+    pub session_id: OpaqueLabel,
+    pub owner: eliot_process::ProcessOwnerBinding,
+    pub authority_epoch: u64,
+    pub generation: u64,
+    pub state_fence_digest: String,
+    pub binding_digest: String,
+    pub evidence_digest: String,
+    pub observed_at_ms: i64,
+    pub evidence: eliot_process::ProcessEvidence,
+}
+
+impl ProcessEvidenceRecord {
+    pub fn from_evidence(
+        evidence: eliot_process::ProcessEvidence,
+        owner: eliot_process::ProcessOwnerBinding,
+        observed_at_ms: i64,
+    ) -> Result<Self, OrsError> {
+        let binding = evidence.binding();
+        let binding_bytes =
+            serde_json::to_vec(binding).map_err(|error| OrsError::Encoding(error.to_string()))?;
+        let state_fence_bytes = serde_json::to_vec(binding.state_fence())
+            .map_err(|error| OrsError::Encoding(error.to_string()))?;
+        let evidence_bytes =
+            serde_json::to_vec(&evidence).map_err(|error| OrsError::Encoding(error.to_string()))?;
+        let record = Self {
+            contract_version: CONTRACT_VERSION,
+            operation_id: OperationIdentity::new(binding.operation_id().as_str())?,
+            request_digest: binding.request_digest().to_owned(),
+            process_tree_id: OpaqueLabel::new(binding.process_tree_id().as_str())?,
+            job_id: OpaqueLabel::new(binding.job_id().as_str())?,
+            image_id: OpaqueLabel::new(binding.image_id().as_str())?,
+            session_id: OpaqueLabel::new(binding.session_id().as_str())?,
+            authority_epoch: owner.authority_epoch(),
+            generation: owner.generation().get(),
+            owner,
+            state_fence_digest: sha256_hex(&state_fence_bytes),
+            binding_digest: sha256_hex(&binding_bytes),
+            evidence_digest: sha256_hex(&evidence_bytes),
+            observed_at_ms,
+            evidence,
+        };
+        record.validate()?;
+        Ok(record)
+    }
+
+    pub(crate) fn validate(&self) -> Result<(), OrsError> {
+        if self.contract_version != CONTRACT_VERSION {
+            return Err(OrsError::UnsupportedContractVersion(self.contract_version));
+        }
+        validate_text(self.operation_id.as_str(), "process_evidence_operation_id")?;
+        validate_digest(&self.request_digest, "process_evidence_request_digest")?;
+        for (value, field) in [
+            (&self.process_tree_id, "process_evidence_process_tree_id"),
+            (&self.job_id, "process_evidence_job_id"),
+            (&self.image_id, "process_evidence_image_id"),
+            (&self.session_id, "process_evidence_session_id"),
+        ] {
+            validate_text(value.as_str(), field)?;
+        }
+        validate_digest(
+            &self.state_fence_digest,
+            "process_evidence_state_fence_digest",
+        )?;
+        validate_digest(&self.binding_digest, "process_evidence_binding_digest")?;
+        validate_digest(&self.evidence_digest, "process_evidence_digest")?;
+        if self.authority_epoch == 0 || self.generation == 0 || self.observed_at_ms <= 0 {
+            return Err(OrsError::InvalidField {
+                field: "process_evidence_identity",
+                reason: "epoch, generation, and observation time must be positive",
+            });
+        }
+        let owner = eliot_process::ProcessOwnerBinding::new(
+            self.owner.module_id(),
+            self.owner.principal_digest(),
+            self.owner.authority_epoch(),
+            self.owner.generation(),
+        )
+        .map_err(|error| OrsError::IntegrityProblem {
+            record_type: "process_evidence",
+            reason: error.to_string(),
+        })?;
+        if owner != self.owner
+            || self.authority_epoch != self.owner.authority_epoch()
+            || self.generation != self.owner.generation().get()
+            || self.operation_id.as_str() != self.evidence.operation_id().as_str()
+            || self.request_digest != self.evidence.request_digest()
+        {
+            return Err(OrsError::IntegrityProblem {
+                record_type: "process_evidence",
+                reason: "evidence identity does not match its durable projection".to_owned(),
+            });
+        }
+        let binding = self.evidence.binding();
+        let binding_bytes =
+            serde_json::to_vec(binding).map_err(|error| OrsError::Encoding(error.to_string()))?;
+        let state_fence_bytes = serde_json::to_vec(binding.state_fence())
+            .map_err(|error| OrsError::Encoding(error.to_string()))?;
+        let evidence_bytes = serde_json::to_vec(&self.evidence)
+            .map_err(|error| OrsError::Encoding(error.to_string()))?;
+        if sha256_hex(&binding_bytes) != self.binding_digest
+            || sha256_hex(&state_fence_bytes) != self.state_fence_digest
+            || sha256_hex(&evidence_bytes) != self.evidence_digest
+        {
+            return Err(OrsError::PayloadIntegrityMismatch);
+        }
+        let fence: Value = serde_json::from_slice(&state_fence_bytes)
+            .map_err(|error| OrsError::Encoding(error.to_string()))?;
+        let fence_epoch = fence
+            .get("authority_epoch")
+            .and_then(Value::as_u64)
+            .ok_or(OrsError::FenceMismatch)?;
+        let fence_generation = fence
+            .get("generation")
+            .and_then(Value::as_u64)
+            .ok_or(OrsError::FenceMismatch)?;
+        if fence_epoch != self.authority_epoch || fence_generation != self.generation {
+            return Err(OrsError::FenceMismatch);
+        }
+        Ok(())
+    }
 }
 
 /// Exact canonical snapshot of a provider-owned State Fence.
@@ -103,7 +384,7 @@ impl StateFenceSnapshot {
         })
     }
 
-    pub(crate) fn validate(&self) -> Result<(), OrsError> {
+    pub fn validate(&self) -> Result<(), OrsError> {
         validate_digest(&self.sha256, "state_fence_sha256")?;
         if self.observed_authority_epoch == 0
             || sha256_hex(self.canonical_json.as_bytes()) != self.sha256

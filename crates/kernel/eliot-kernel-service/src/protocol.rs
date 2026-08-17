@@ -11,6 +11,7 @@ use eliot_runtime_contracts::{HealthVector, ServiceProcessState};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::collections::BTreeSet;
 use std::fmt::Write as _;
 
 use crate::{KernelServiceError, validate_text};
@@ -46,6 +47,56 @@ pub struct ProcessAuthorityHandoffDescriptor {
 impl ProcessAuthorityHandoffDescriptor {
     /// Current descriptor schema revision.
     pub const CONTRACT_VERSION: u16 = 1;
+    /// Maximum number of contour references admitted in one handoff.
+    pub const MAX_CONTOUR_REFS: usize = 32;
+
+    /// Returns the canonical secret-free bytes covered by `descriptor_sha256`.
+    pub fn canonical_unsigned_bytes(&self) -> Result<Vec<u8>, KernelServiceError> {
+        let mut unsigned = self.clone();
+        unsigned.descriptor_sha256.clear();
+        serde_json::to_vec(&unsigned).map_err(|_| KernelServiceError::InvalidField {
+            field: "descriptor_sha256",
+            reason: "cannot canonicalize descriptor",
+        })
+    }
+
+    /// Computes the descriptor digest through the one canonical procedure.
+    pub fn compute_digest(&self) -> Result<String, KernelServiceError> {
+        let observed = Sha256::digest(self.canonical_unsigned_bytes()?);
+        let mut digest = String::with_capacity(64);
+        for byte in observed {
+            let _ = write!(&mut digest, "{byte:02x}");
+        }
+        Ok(digest)
+    }
+
+    /// Returns a descriptor with its checked canonical digest populated.
+    pub fn with_computed_digest(mut self) -> Result<Self, KernelServiceError> {
+        self.descriptor_sha256 = self.compute_digest()?;
+        Ok(self)
+    }
+
+    /// Verifies the explicit descriptor digest without performing other checks.
+    pub fn verify_digest(&self) -> Result<(), KernelServiceError> {
+        if self.descriptor_sha256.len() != 64
+            || !self
+                .descriptor_sha256
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+        {
+            return Err(KernelServiceError::InvalidField {
+                field: "descriptor_sha256",
+                reason: "must be a lowercase SHA-256 digest",
+            });
+        }
+        if self.compute_digest()? != self.descriptor_sha256 {
+            return Err(KernelServiceError::InvalidField {
+                field: "descriptor_sha256",
+                reason: "descriptor digest mismatch",
+            });
+        }
+        Ok(())
+    }
 
     /// Validates syntax, digest material, time bounds, and exact fence bindings.
     pub fn validate(&self, now_ms: i64) -> Result<(), KernelServiceError> {
@@ -68,10 +119,26 @@ impl ProcessAuthorityHandoffDescriptor {
                 reason: "must not be empty",
             });
         }
+        if self.contour_refs.len() > Self::MAX_CONTOUR_REFS {
+            return Err(KernelServiceError::InvalidField {
+                field: "contour_refs",
+                reason: "exceeds the bounded contour reference limit",
+            });
+        }
+        let mut unique_refs = BTreeSet::new();
         for value in &self.contour_refs {
             handle(value, "contour_refs")?;
+            if !unique_refs.insert(value.as_str()) {
+                return Err(KernelServiceError::InvalidField {
+                    field: "contour_refs",
+                    reason: "references must be unique",
+                });
+            }
         }
-        if self.expires_at_ms <= self.issued_at_ms || self.expires_at_ms <= now_ms {
+        if self.issued_at_ms < 0
+            || self.expires_at_ms <= self.issued_at_ms
+            || self.expires_at_ms <= now_ms
+        {
             return Err(KernelServiceError::InvalidField {
                 field: "expires_at_ms",
                 reason: "descriptor is expired or has invalid bounds",
@@ -105,25 +172,131 @@ impl ProcessAuthorityHandoffDescriptor {
                 reason: "must be a SHA-256 digest",
             });
         }
-        let mut unsigned = self.clone();
-        unsigned.descriptor_sha256.clear();
-        let bytes =
-            serde_json::to_vec(&unsigned).map_err(|_| KernelServiceError::InvalidField {
-                field: "descriptor_sha256",
-                reason: "cannot canonicalize descriptor",
-            })?;
-        let observed = Sha256::digest(&bytes);
-        let mut observed_hex = String::with_capacity(64);
-        for byte in observed {
-            let _ = write!(&mut observed_hex, "{byte:02x}");
+        AuthoritySnapshotBindingWire::validate(&self.snapshot_binding)?;
+        self.verify_digest()
+    }
+}
+
+#[cfg(test)]
+mod descriptor_tests {
+    #![allow(clippy::expect_used, clippy::unwrap_used)]
+
+    use super::*;
+    use eliot_contracts::{AuthorityEpoch, ResourceGeneration, StateFence};
+    use eliot_ors::{
+        EpochIdentity, EpochLineage, OpaqueLabel, OperationIdentity, StateFenceSnapshot,
+    };
+
+    fn descriptor() -> ProcessAuthorityHandoffDescriptor {
+        let authority_id =
+            eliot_process::DispatchAuthorityId::new("authority-1").expect("authority");
+        let epoch = EpochLineage {
+            current: EpochIdentity {
+                lineage_id: OpaqueLabel::new("lineage-1").expect("lineage"),
+                epoch: 1,
+            },
+            predecessor: None,
+        };
+        let snapshot_fence =
+            StateFenceSnapshot::capture(&serde_json::json!({"resource_generation": 1}), 1)
+                .expect("snapshot fence");
+        let binding = AuthoritySnapshotBindingWire {
+            authority_id: authority_id.clone(),
+            record_id: OperationIdentity::new("snapshot-record").expect("record"),
+            authority_epoch: epoch,
+            state_fence: snapshot_fence,
+            created_at_ms: 100,
+            cleanup_after_ms: Some(200),
+        };
+        ProcessAuthorityHandoffDescriptor {
+            contract_version: ProcessAuthorityHandoffDescriptor::CONTRACT_VERSION,
+            handoff_id: PlatformHandle::new("handoff-1").expect("handoff"),
+            handoff_nonce: PlatformHandle::new("nonce-1").expect("nonce"),
+            authority_id,
+            snapshot_binding: binding,
+            state_fence: StateFence::new(AuthorityEpoch::genesis(), ResourceGeneration::genesis()),
+            generation: ResourceGeneration::genesis(),
+            revision_policy_binding: PlatformHandle::new("policy-1").expect("policy"),
+            dispatch_key: SecretReference::new("windows-credential-manager", "dispatch-key-1")
+                .expect("reference"),
+            descriptor_sha256: String::new(),
+            issued_at_ms: 100,
+            expires_at_ms: 1_000,
+            contour_refs: vec![
+                PlatformHandle::new("portable_dev").expect("contour"),
+                PlatformHandle::new("authority_descriptor").expect("descriptor contour"),
+            ],
         }
-        if observed_hex != self.descriptor_sha256.to_ascii_lowercase() {
-            return Err(KernelServiceError::InvalidField {
-                field: "descriptor_sha256",
-                reason: "descriptor digest mismatch",
-            });
-        }
-        Ok(())
+    }
+
+    #[test]
+    fn descriptor_checked_digest_round_trip_is_secret_free() {
+        let descriptor = descriptor().with_computed_digest().expect("digest");
+        descriptor.validate(500).expect("valid descriptor");
+        let bytes = serde_json::to_vec(&descriptor).expect("wire");
+        let text = String::from_utf8(bytes.clone()).expect("utf8");
+        assert!(!text.contains("KernelDispatchKey"));
+        assert!(!text.contains("ProcessRequest"));
+        assert!(!text.contains("raw-secret"));
+        let round_trip: ProcessAuthorityHandoffDescriptor =
+            serde_json::from_slice(&bytes).expect("round trip");
+        round_trip.validate(500).expect("round trip validation");
+    }
+
+    #[test]
+    fn descriptor_rejects_unknown_duplicate_blank_and_malformed_inputs() {
+        let descriptor = descriptor().with_computed_digest().expect("digest");
+        let mut unknown = serde_json::to_value(&descriptor).expect("value");
+        unknown["unexpected"] = serde_json::json!(true);
+        assert!(serde_json::from_value::<ProcessAuthorityHandoffDescriptor>(unknown).is_err());
+
+        let mut duplicate = descriptor.clone();
+        duplicate
+            .contour_refs
+            .push(duplicate.contour_refs[0].clone());
+        assert!(duplicate.validate(500).is_err());
+        let mut blank = serde_json::to_value(&descriptor).expect("blank value");
+        blank["contour_refs"][0] = serde_json::json!(" ");
+        let blank: ProcessAuthorityHandoffDescriptor =
+            serde_json::from_value(blank).expect("blank wire shape");
+        assert!(blank.validate(500).is_err());
+        let mut oversized = descriptor.clone();
+        oversized.contour_refs = (0..=ProcessAuthorityHandoffDescriptor::MAX_CONTOUR_REFS)
+            .map(|index| PlatformHandle::new(format!("contour-{index}")))
+            .collect::<Result<Vec<_>, _>>()
+            .expect("contours");
+        assert!(oversized.validate(500).is_err());
+        let mut malformed = descriptor;
+        malformed.descriptor_sha256 = "not-a-digest".to_owned();
+        assert!(malformed.validate(500).is_err());
+    }
+
+    #[test]
+    fn wire_binding_revalidates_nested_fence_and_identity() {
+        let descriptor = descriptor();
+        descriptor
+            .snapshot_binding
+            .validate()
+            .expect("wire binding");
+        let mut wrong_authority = descriptor.snapshot_binding.clone();
+        wrong_authority.authority_id =
+            eliot_process::DispatchAuthorityId::new("other").expect("other authority");
+        assert!(wrong_authority.validate().is_ok());
+        let expected = eliot_kernel_core::AuthoritySnapshotBinding::from_wire(
+            descriptor.snapshot_binding.clone(),
+            &descriptor.authority_id,
+        )
+        .expect("expected binding");
+        assert!(
+            eliot_kernel_core::AuthoritySnapshotBinding::from_wire_exact(
+                wrong_authority,
+                &expected,
+            )
+            .is_err()
+        );
+        let mut broken_fence = descriptor.snapshot_binding;
+        broken_fence.state_fence.sha256 = "00".repeat(32);
+        assert!(broken_fence.validate().is_err());
     }
 }
 

@@ -1,6 +1,8 @@
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::Barrier;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::thread;
 
 use eliot_contracts::{AuthorityEpoch, ResourceGeneration};
 use eliot_platform::SecretReference;
@@ -367,6 +369,125 @@ fn envelope_validation_rejects_tamper_version_and_bad_fence() -> TestResult {
         wrong_fence.validate(),
         Err(OrsError::FenceMismatch)
     ));
+    Ok(())
+}
+
+#[test]
+fn process_start_replay_has_one_atomic_winner_and_rejects_substitution() -> TestResult {
+    let path = database_path("process-replay-state-machine");
+    let store = Arc::new(RedbRecoveryStore::open(&path)?);
+    let operation_id = OperationIdentity::new("process-replay-operation")?;
+    let owner = eliot_process::ProcessOwnerBinding::new(
+        "testd",
+        "a".repeat(64),
+        1,
+        eliot_process::Generation::new(1)?,
+    )?;
+    let record = ProcessStartReplayRecord {
+        operation_id: operation_id.clone(),
+        admission_digest: "ab".repeat(32),
+        owner: owner.clone(),
+        state: ProcessStartReplayState::Reserved,
+        receipt: None,
+    };
+    let barrier = Arc::new(Barrier::new(8));
+    let mut workers = Vec::new();
+    for _ in 0..8 {
+        let store = Arc::clone(&store);
+        let barrier = Arc::clone(&barrier);
+        let record = record.clone();
+        workers.push(thread::spawn(move || {
+            barrier.wait();
+            store.begin_process_start(&record)
+        }));
+    }
+    let mut acquired = 0;
+    for worker in workers {
+        match worker.join().map_err(|_| "replay worker panicked")?? {
+            None => acquired += 1,
+            Some(existing) => assert_eq!(existing, record),
+        }
+    }
+    assert_eq!(acquired, 1);
+
+    let mut wrong_digest = record.clone();
+    wrong_digest.admission_digest = "cd".repeat(32);
+    assert!(matches!(
+        store.begin_process_start(&wrong_digest),
+        Err(OrsError::IntegrityProblem { .. })
+    ));
+    let mut unknown = record.clone();
+    unknown.state = ProcessStartReplayState::Unknown;
+    store.persist_process_start(&unknown)?;
+    assert_eq!(
+        store
+            .load_process_start(&operation_id)?
+            .ok_or("unknown replay state")?
+            .state,
+        ProcessStartReplayState::Unknown
+    );
+    assert!(store.persist_process_start(&record).is_err());
+    drop(store);
+    let reopened = RedbRecoveryStore::open(&path)?;
+    assert_eq!(
+        reopened
+            .load_process_start(&operation_id)?
+            .ok_or("replay restart state")?
+            .state,
+        ProcessStartReplayState::Unknown
+    );
+    cleanup(&path);
+    Ok(())
+}
+
+fn handoff_record(state: AuthorityHandoffState) -> Result<AuthorityHandoffRecord, OrsError> {
+    Ok(AuthorityHandoffRecord {
+        contract_version: CONTRACT_VERSION,
+        handoff_id: OperationIdentity::new("authority-handoff-operation")?,
+        descriptor_digest: "01".repeat(32),
+        authority_id: OpaqueLabel::new("authority-1")?,
+        snapshot_record_id: OperationIdentity::new("snapshot-record")?,
+        snapshot_binding_digest: "02".repeat(32),
+        authority_epoch: 1,
+        generation: 1,
+        state_fence_digest: "03".repeat(32),
+        secret_reference_identity_digest: "04".repeat(32),
+        state,
+        issued_at_ms: 100,
+        expires_at_ms: 200,
+        consumed_at_ms: (state == AuthorityHandoffState::Consumed).then_some(150),
+        reconciliation_evidence: (state == AuthorityHandoffState::Unknown)
+            .then(|| OpaqueLabel::new("manual-reconciliation-required"))
+            .transpose()?,
+    })
+}
+
+#[test]
+fn authority_handoff_is_typed_one_shot_and_survives_restart() -> TestResult {
+    let path = database_path("authority-handoff");
+    let store = RedbRecoveryStore::open(&path)?;
+    let reserved = handoff_record(AuthorityHandoffState::Reserved)?;
+    assert!(matches!(
+        store.begin_authority_handoff(&reserved)?,
+        AuthorityHandoffBegin::Acquired
+    ));
+    assert!(matches!(
+        store.begin_authority_handoff(&reserved)?,
+        AuthorityHandoffBegin::Existing(_)
+    ));
+    let consumed = handoff_record(AuthorityHandoffState::Consumed)?;
+    store.persist_authority_handoff(&consumed)?;
+    assert!(store.persist_authority_handoff(&reserved).is_err());
+    drop(store);
+    let reopened = RedbRecoveryStore::open(&path)?;
+    assert_eq!(
+        reopened
+            .load_authority_handoff(&reserved.handoff_id)?
+            .ok_or("handoff restart")?
+            .state,
+        AuthorityHandoffState::Consumed
+    );
+    cleanup(&path);
     Ok(())
 }
 

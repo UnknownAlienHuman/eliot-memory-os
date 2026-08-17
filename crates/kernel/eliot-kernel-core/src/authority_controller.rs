@@ -136,6 +136,40 @@ pub struct AuthoritySnapshotBindingWire {
     pub cleanup_after_ms: Option<i64>,
 }
 
+impl AuthoritySnapshotBindingWire {
+    /// Revalidates every nested identity, epoch, fence, and timestamp before
+    /// a wire binding is admitted to a Kernel-only authority path.
+    pub fn validate(&self) -> KernelResult<()> {
+        self.authority_epoch.validate()?;
+        self.state_fence.validate()?;
+        if self.state_fence.observed_authority_epoch != self.authority_epoch.current.epoch {
+            return Err(KernelError::FenceMismatch);
+        }
+        if self.record_id.as_str().trim().is_empty() {
+            return Err(KernelError::InvalidField {
+                field: "record_id",
+                reason: "must be non-blank",
+            });
+        }
+        if self.created_at_ms < 0 {
+            return Err(KernelError::InvalidField {
+                field: "created_at_ms",
+                reason: "must not be negative",
+            });
+        }
+        if self
+            .cleanup_after_ms
+            .is_some_and(|value| value <= self.created_at_ms)
+        {
+            return Err(KernelError::InvalidField {
+                field: "cleanup_after_ms",
+                reason: "must be later than created_at_ms",
+            });
+        }
+        Ok(())
+    }
+}
+
 impl AuthoritySnapshotBinding {
     /// Creates a binding for one active authority identity and fence.
     pub fn new(
@@ -147,6 +181,13 @@ impl AuthoritySnapshotBinding {
         cleanup_after_ms: Option<i64>,
     ) -> KernelResult<Self> {
         authority_epoch.validate()?;
+        if record_id.as_str().trim().is_empty() {
+            return Err(KernelError::InvalidField {
+                field: "record_id",
+                reason: "must be non-blank",
+            });
+        }
+        state_fence.validate()?;
         if state_fence.observed_authority_epoch != authority_epoch.current.epoch {
             return Err(KernelError::FenceMismatch);
         }
@@ -184,6 +225,7 @@ impl AuthoritySnapshotBinding {
         wire: AuthoritySnapshotBindingWire,
         expected_authority_id: &DispatchAuthorityId,
     ) -> KernelResult<Self> {
+        wire.validate()?;
         if &wire.authority_id != expected_authority_id {
             return Err(KernelError::InvalidField {
                 field: "authority_id",
@@ -198,6 +240,19 @@ impl AuthoritySnapshotBinding {
             wire.created_at_ms,
             wire.cleanup_after_ms,
         )
+    }
+
+    /// Reconstructs and compares a wire binding against one exact retained
+    /// binding, rejecting record, epoch, fence, or timestamp substitution.
+    pub fn from_wire_exact(
+        wire: AuthoritySnapshotBindingWire,
+        expected: &Self,
+    ) -> KernelResult<Self> {
+        let observed = Self::from_wire(wire, expected.authority_id())?;
+        if observed != *expected {
+            return Err(KernelError::FenceMismatch);
+        }
+        Ok(observed)
     }
 
     /// Returns the exact process authority identity.
