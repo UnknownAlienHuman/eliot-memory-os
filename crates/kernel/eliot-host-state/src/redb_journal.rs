@@ -206,7 +206,7 @@ impl RedbJournalBackend {
         let prepared = read_prepared(&read, &mut budget)?;
         let receipts = read_receipts(&read, &mut budget)?;
         let payloads = read_payloads(&read, &mut budget)?;
-        validate_snapshot(&epochs, &prepared, &receipts, &payloads)?;
+        validate_snapshot(&prepared, &receipts, &payloads)?;
         Ok(BackendSnapshot {
             epochs,
             prepared,
@@ -388,7 +388,6 @@ fn read_payloads(
 }
 
 fn validate_snapshot(
-    epochs: &[(String, StoredEpoch)],
     prepared: &[(String, StoredPrepared)],
     receipts: &[(String, CommittedAppend)],
     payloads: &[(String, Vec<u8>)],
