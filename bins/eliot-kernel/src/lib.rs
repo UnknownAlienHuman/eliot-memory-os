@@ -29,10 +29,11 @@ use eliot_kernel_core::{
     process_admission_digest,
 };
 use eliot_kernel_service::{
-    EbpCanonicalStoreClient, HostStoreBootstrapRequirement, KERNEL_CONTROL_PIPE,
-    KernelControlCommand, KernelControlRequest, KernelControlResponse, KernelService,
-    KernelServiceError, KernelServiceState, ProcessAuthorityHandoffDescriptor,
-    ProcessExecutionRequest, ProcessExecutionResponse, StoreClientError,
+    EbpCanonicalStoreClient, HostKernelHandshake, HostStoreBootstrapRequirement,
+    KERNEL_CONTROL_PIPE, KernelControlCommand, KernelControlRequest, KernelControlResponse,
+    KernelReadyReceipt, KernelService, KernelServiceError, KernelServiceState,
+    ProcessAuthorityHandoffDescriptor, ProcessExecutionRequest, ProcessExecutionResponse,
+    ProcessObservation, StoreClientError,
 };
 #[cfg(test)]
 use eliot_ors::CanonicalEvidenceProvider;
@@ -43,8 +44,8 @@ use eliot_ors::{
 use eliot_ors::{OperationalRecoveryStore, RedbRecoveryStore};
 use eliot_platform::{ClockObservation, PortError};
 use eliot_platform_windows::{
-    ProtectedPathLease, ProtectedSecret, RetainedProcessPathLease, UserOwnedPathLease,
-    UserOwnedRootLease, WindowsPlatform,
+    ProtectedPathLease, ProtectedSecret, RecoverableJobBinding, RecoverableJobObject,
+    RetainedProcessPathLease, UserOwnedPathLease, UserOwnedRootLease, WindowsPlatform,
 };
 #[cfg(test)]
 use eliot_process::ProcessIntent;
@@ -64,8 +65,8 @@ use eliot_runtime_contracts::{
 };
 use eliot_store_api::{
     CanonicalStoreClient, CanonicalValidationSnapshot, OrderingHeadExpectation, PreparedTransition,
-    RevisionHead, RevisionHeadExpectation, StateFence as StoreStateFence, StoreError, WriteReceipt,
-    canonical_json_bytes,
+    RevisionHead, RevisionHeadExpectation, StateFence as StoreStateFence, StoreError, StoreHealth,
+    StoreHealthStatus, WriteReceipt, canonical_json_bytes,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
@@ -143,6 +144,15 @@ impl KernelConfig {
     #[must_use]
     pub fn with_store_bootstrap(mut self, requirement: HostStoreBootstrapRequirement) -> Self {
         self.store_bootstrap = Some(requirement);
+        self
+    }
+
+    /// Selects the trusted launch-context control pipe for this Kernel
+    /// generation. Production Host launch strips inherited overrides before
+    /// injecting this value.
+    #[must_use]
+    pub fn with_pipe_name(mut self, pipe_name: impl Into<String>) -> Self {
+        self.pipe_name = pipe_name.into();
         self
     }
 }
@@ -255,6 +265,7 @@ pub struct KernelComposition {
     front_door_policy: Mutex<ServerHandshakePolicy>,
     process_gateway: Option<Arc<ProcessExecutionGateway>>,
     store_bootstrap: Option<HostStoreBootstrapRequirement>,
+    approved_config_hash: Option<String>,
     canonical_store_claimed: AtomicBool,
     #[cfg(windows)]
     canonical_store_gateway: Mutex<Option<Arc<KernelStoreGateway>>>,
@@ -1028,6 +1039,16 @@ impl ProcessExecutionGateway {
         }
     }
 
+    fn readiness_configuration_valid(&self) -> bool {
+        let binding = self.snapshot_binding.to_wire();
+        binding.validate().is_ok()
+            && self
+                .controller
+                .lock()
+                .map(|controller| controller.authority_id() == &binding.authority_id)
+                .unwrap_or(false)
+    }
+
     #[cfg(windows)]
     fn attach_canonical_store(
         &self,
@@ -1682,6 +1703,17 @@ impl KernelStoreGateway {
             .await
             .map_err(|error| error.to_string())
     }
+
+    /// Reads and validates the retained canonical Store health observation.
+    pub async fn health(&self) -> Result<StoreHealth, String> {
+        let health = self
+            .store
+            .health()
+            .await
+            .map_err(|error| error.to_string())?;
+        health.validate().map_err(|error| error.to_string())?;
+        Ok(health)
+    }
 }
 
 /// The sole semantic bridge between ORS cutover evidence and the in-memory
@@ -2076,6 +2108,14 @@ impl KernelComposition {
     ) -> Result<Self, KernelBuildError> {
         let work_root = config.work_root.clone();
         let store_bootstrap = config.store_bootstrap.clone();
+        let approved_config_hash = std::env::var("ELIOT_GENERATION_CONFIG_DIGEST").ok();
+        if let Some(config_hash) = &approved_config_hash
+            && !is_lower_sha256(config_hash)
+        {
+            return Err(KernelBuildError::Service(
+                "ELIOT_GENERATION_CONFIG_DIGEST is not a lowercase SHA-256 digest".to_owned(),
+            ));
+        }
         let _ = &platform;
         let ipc = IpcImplementation::new(config.pipe_name)?;
         // An integrated Kernel must construct its active store route from the
@@ -2195,6 +2235,7 @@ impl KernelComposition {
             front_door_policy: Mutex::new(policy),
             process_gateway,
             store_bootstrap,
+            approved_config_hash,
             canonical_store_claimed: AtomicBool::new(false),
             #[cfg(windows)]
             canonical_store_gateway: Mutex::new(None),
@@ -2747,9 +2788,150 @@ impl KernelComposition {
             .apply(command)
     }
 
+    #[cfg(windows)]
+    async fn self_authored_ready_receipt(
+        &self,
+        request: &KernelControlRequest,
+        peer: &PeerIdentity,
+    ) -> Result<KernelReadyReceipt, KernelServiceError> {
+        let handshake: &HostKernelHandshake = &request.handshake;
+        let observed_peer = peer.process_binding().ok_or(KernelServiceError::Platform(
+            "authenticated Host process binding is unavailable".to_owned(),
+        ))?;
+        if observed_peer.process_id() != handshake.host_process.process_id
+            || observed_peer.start_time_100ns() != handshake.host_process.start_time_100ns
+            || observed_peer.image_path() != handshake.host_process.image_path
+        {
+            return Err(KernelServiceError::HandshakeMismatch {
+                field: "host_process",
+            });
+        }
+        let binding: RecoverableJobBinding =
+            serde_json::from_value(serde_json::to_value(&handshake.job_binding).map_err(|_| {
+                KernelServiceError::Platform("Kernel Job binding cannot be encoded".to_owned())
+            })?)
+            .map_err(|_| {
+                KernelServiceError::Platform("Kernel Job binding is malformed".to_owned())
+            })?;
+        if binding.job_identity().name() != handshake.job_object_id.as_str() {
+            return Err(KernelServiceError::HandshakeMismatch {
+                field: "job_object_id",
+            });
+        }
+        let job = RecoverableJobObject::open(binding)
+            .map_err(|error| KernelServiceError::Platform(error.to_string()))?;
+        let current = self
+            .platform
+            .process_identity(std::process::id())
+            .map_err(|error| KernelServiceError::Platform(error.to_string()))?;
+        let root = job.binding().root().process();
+        if root != &current
+            || !job
+                .live_processes()
+                .map_err(|error| KernelServiceError::Platform(error.to_string()))?
+                .iter()
+                .any(|process| process.process() == &current)
+        {
+            return Err(KernelServiceError::ReadinessNotProven);
+        }
+        if !self
+            .process_gateway
+            .as_ref()
+            .is_some_and(|gateway| gateway.readiness_configuration_valid())
+        {
+            return Err(KernelServiceError::ReadinessNotProven);
+        }
+        if self.approved_config_hash.as_deref() != Some(handshake.config_hash.as_str()) {
+            return Err(KernelServiceError::HandshakeMismatch {
+                field: "config_hash",
+            });
+        }
+        {
+            let service = self
+                .service
+                .lock()
+                .map_err(|_| KernelServiceError::Platform("service lock poisoned".to_owned()))?;
+            if service.state() != KernelServiceState::Activating
+                || service.handshake() != Some(handshake)
+            {
+                return Err(KernelServiceError::ReadinessNotProven);
+            }
+        }
+        let gateway = self
+            .canonical_store_gateway
+            .lock()
+            .map_err(|_| KernelServiceError::Platform("store gateway lock poisoned".to_owned()))?
+            .clone()
+            .ok_or(KernelServiceError::ReadinessNotProven)?;
+        let health = gateway
+            .health()
+            .await
+            .map_err(KernelServiceError::Platform)?;
+        if health.status != StoreHealthStatus::Ready {
+            return Err(KernelServiceError::ReadinessNotProven);
+        }
+        let snapshot = gateway
+            .validation_snapshot()
+            .await
+            .map_err(KernelServiceError::Platform)?;
+        snapshot
+            .validate()
+            .map_err(|error| KernelServiceError::Platform(error.to_string()))?;
+        if snapshot.state_fence.authority_epoch != handshake.kernel_epoch
+            || snapshot.state_fence.resource_generation != request.generation
+        {
+            return Err(KernelServiceError::HandshakeMismatch {
+                field: "store_state_fence",
+            });
+        }
+        let process_id = PlatformHandle::new(format!(
+            "pid:{}:start:{}",
+            current.process_id, current.start_time_100ns
+        ))
+        .map_err(|error| KernelServiceError::Platform(error.to_string()))?;
+        let process = ProcessObservation {
+            process_id,
+            job_object_id: handshake.job_object_id.clone(),
+            state: eliot_runtime_contracts::ServiceProcessState::Ready,
+            health: HealthVector::healthy(),
+            evidence_refs: vec![
+                PlatformHandle::new(format!(
+                    "kernel-process:{}:{}",
+                    current.process_id, current.start_time_100ns
+                ))
+                .map_err(|error| KernelServiceError::Platform(error.to_string()))?,
+                PlatformHandle::new(format!(
+                    "kernel-job:{}:{}",
+                    handshake.job_object_id.as_str(),
+                    job.active_process_count()
+                        .map_err(|error| KernelServiceError::Platform(error.to_string()))?
+                ))
+                .map_err(|error| KernelServiceError::Platform(error.to_string()))?,
+            ],
+        };
+        Ok(KernelReadyReceipt {
+            activation_id: handshake.activation_id.clone(),
+            activation_nonce: handshake.activation_nonce.clone(),
+            process,
+            health: HealthVector::healthy(),
+            evidence_refs: vec![
+                PlatformHandle::new(format!(
+                    "kernel-store-validation:{}",
+                    snapshot.validation_revision
+                ))
+                .map_err(|error| KernelServiceError::Platform(error.to_string()))?,
+                PlatformHandle::new(format!(
+                    "kernel-store-health:{}",
+                    health.manifest_digest.as_str()
+                ))
+                .map_err(|error| KernelServiceError::Platform(error.to_string()))?,
+            ],
+        })
+    }
+
     /// Applies one authenticated Host control request after binding the
     /// transport's handle-proven peer and the approved generation contour.
-    pub fn apply_control_request(
+    pub async fn apply_control_request(
         &self,
         request: KernelControlRequest,
         peer: &PeerIdentity,
@@ -2765,6 +2947,9 @@ impl KernelComposition {
         if request.sequence != expected_sequence
             || request.peer_process_id != observed_peer.process_id()
             || request.handshake.pipe_identity.as_str() != self.ipc.name()
+            || observed_peer.process_id() != request.handshake.host_process.process_id
+            || observed_peer.start_time_100ns() != request.handshake.host_process.start_time_100ns
+            || observed_peer.image_path() != request.handshake.host_process.image_path
         {
             return Err(TransportError::SessionFenced);
         }
@@ -2777,6 +2962,10 @@ impl KernelComposition {
                 != policy.module_generation.state_fence.authority_epoch
             || request.handshake.artifact_hash.as_str()
                 != policy.module_generation.artifact_id.as_str()
+            || self
+                .approved_config_hash
+                .as_deref()
+                .is_some_and(|hash| hash != request.handshake.config_hash.as_str())
         {
             return Err(TransportError::SessionFenced);
         }
@@ -2786,12 +2975,33 @@ impl KernelComposition {
         {
             return Err(TransportError::SessionFenced);
         }
-        let receipt = match &request.command {
-            KernelControlCommand::Ready(receipt) => Some(receipt.clone()),
-            _ => None,
+        let is_probe = matches!(&request.command, KernelControlCommand::ProbeReady);
+        let receipt = if is_probe {
+            #[cfg(windows)]
+            {
+                Some(
+                    self.self_authored_ready_receipt(&request, peer)
+                        .await
+                        .map_err(|_| TransportError::SessionFenced)?,
+                )
+            }
+            #[cfg(not(windows))]
+            {
+                return Err(TransportError::SessionFenced);
+            }
+        } else {
+            None
         };
-        self.apply_control(request.command)
-            .map_err(|_| TransportError::SessionFenced)?;
+        if let Some(receipt) = &receipt {
+            self.service
+                .lock()
+                .map_err(|_| TransportError::SessionFenced)?
+                .publish_ready(receipt.clone())
+                .map_err(|_| TransportError::SessionFenced)?;
+        } else {
+            self.apply_control(request.command)
+                .map_err(|_| TransportError::SessionFenced)?;
+        }
         let state = self
             .service_state()
             .map_err(|_| TransportError::SessionFenced)?;

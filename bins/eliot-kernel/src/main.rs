@@ -27,7 +27,10 @@ use tokio::task::JoinSet;
 
 use eliot_contracts::sha256_hex;
 #[cfg(windows)]
-use eliot_platform_windows::{ProtectedPathLease, UserOwnedPathLease, UserOwnedRootLease};
+use eliot_platform_windows::{
+    ProtectedPathLease, UserOwnedPathLease, UserOwnedRootLease,
+    current_process_named_pipe_expectation, observe_named_pipe_peer_process,
+};
 
 /// Keeps startup, authenticated listener rotation, and fenced shutdown in one
 /// ordered authority path.
@@ -42,8 +45,15 @@ async fn main() {
         Ok(prepared) => prepared,
         Err(error) => exit_error("INVALID_STORE_BOOTSTRAP", &error),
     };
-    let store_is_configured = prepared_store.is_some();
     let mut kernel_config = KernelConfig::new(options.work_root.clone());
+    let pipe_name = match std::env::var("ELIOT_KERNEL_CONTROL_PIPE") {
+        Ok(value) => value,
+        Err(_) => exit_error(
+            "INVALID_CONFIGURATION",
+            "Host launch context did not inject the generation-specific Kernel control pipe",
+        ),
+    };
+    kernel_config = kernel_config.with_pipe_name(pipe_name);
     if let Some(prepared) = &prepared_store {
         kernel_config = kernel_config.with_store_bootstrap(prepared.requirement.clone());
     }
@@ -88,7 +98,48 @@ async fn main() {
                 exit_error("STORE_UNAVAILABLE", "canonical Store did not become ready");
             }
         }
-        let principal = match eliot_platform_windows::current_process_named_pipe_expectation() {
+        let host_pid = match std::env::var("ELIOT_HOST_PROCESS_ID")
+            .ok()
+            .and_then(|value| value.parse::<u32>().ok())
+        {
+            Some(pid) if pid != 0 => pid,
+            _ => exit_error(
+                "PRINCIPAL_FAILURE",
+                "Host launch context did not inject a valid Host process binding",
+            ),
+        };
+        let host_start = match std::env::var("ELIOT_HOST_PROCESS_START")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+        {
+            Some(start) if start != 0 => start,
+            _ => exit_error(
+                "PRINCIPAL_FAILURE",
+                "Host launch context did not inject a valid Host process start time",
+            ),
+        };
+        let host_image = match std::env::var("ELIOT_HOST_PROCESS_IMAGE") {
+            Ok(image) if !image.trim().is_empty() => image,
+            _ => exit_error(
+                "PRINCIPAL_FAILURE",
+                "Host launch context did not inject a Host process image",
+            ),
+        };
+        let observed_host = match observe_named_pipe_peer_process(host_pid) {
+            Ok(binding) => binding,
+            Err(error) => exit_error("PRINCIPAL_FAILURE", &error.to_string()),
+        };
+        if observed_host.start_time_100ns() != host_start
+            || observed_host.image_path() != host_image
+        {
+            exit_error(
+                "PRINCIPAL_FAILURE",
+                "live Host process binding changed before Kernel admission",
+            );
+        }
+        let principal = match current_process_named_pipe_expectation()
+            .and_then(|expectation| expectation.with_process_binding(observed_host))
+        {
             Ok(expectation) => expectation,
             Err(error) => exit_error("PRINCIPAL_FAILURE", &error.to_string()),
         };
@@ -162,7 +213,7 @@ async fn main() {
     }
     #[cfg(not(windows))]
     {
-        let _ = (kernel, store_is_configured);
+        let _ = kernel;
         exit_error(
             "AUTHENTICATED_CONTROL_UNSUPPORTED",
             "Host/Kernel control requires the Windows authenticated named-pipe boundary",
@@ -291,8 +342,10 @@ async fn serve_control_connection(
             }
         };
         let request = decode_control_request_frame(&received)?;
-        let is_ready = matches!(&request.command, KernelControlCommand::Ready(_));
-        let response = kernel.apply_control_request(request, &peer, expected_sequence)?;
+        let is_ready = matches!(&request.command, KernelControlCommand::ProbeReady);
+        let response = kernel
+            .apply_control_request(request, &peer, expected_sequence)
+            .await?;
         expected_sequence = expected_sequence.saturating_add(1);
         let response_frame = control_response_frame(&received.connection_id, &response)?;
         send_checked(&mut front_door, &response_frame, limits).await?;

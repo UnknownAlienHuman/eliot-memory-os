@@ -29,6 +29,106 @@ pub const KERNEL_CONTROL_WIRE_VERSION: u16 = 1;
 /// Canonical authenticated Kernel front-door pipe.
 pub const KERNEL_CONTROL_PIPE: &str = r"\\.\pipe\eliot\kernel\frontdoor";
 
+/// Handle-bound process identity carried as an inert Host claim.
+///
+/// Kernel never treats this projection as proof.  It compares it with the
+/// process identity observed by the authenticated named-pipe adapter before
+/// admitting any lifecycle command.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HostProcessBinding {
+    /// Process identifier observed by Host before launch/connect.
+    pub process_id: u32,
+    /// Handle-bound process creation time in Windows 100-nanosecond units.
+    pub start_time_100ns: u64,
+    /// Canonical process image path observed by Host.
+    pub image_path: String,
+}
+
+impl HostProcessBinding {
+    /// Validates the bounded, inert wire projection.
+    pub fn validate(&self) -> Result<(), KernelServiceError> {
+        if self.process_id == 0
+            || self.start_time_100ns == 0
+            || self.image_path.trim().is_empty()
+            || self.image_path.chars().any(char::is_control)
+            || self.image_path.len() > 32_767
+        {
+            return Err(KernelServiceError::InvalidField {
+                field: "host_process_binding",
+                reason: "must contain a bounded non-zero process identity",
+            });
+        }
+        Ok(())
+    }
+}
+
+/// Inert projection of the Host-created Kernel Job binding.
+///
+/// The Kernel reconstructs the platform binding and calls
+/// `RecoverableJobObject::open`; these fields alone never grant Job authority.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HostJobBinding {
+    /// Exact object-manager Job identity.
+    pub job: HostJobIdentity,
+    /// Root process and executable identity retained by Host.
+    pub root: HostJobRoot,
+}
+
+/// Inert Job object name projection.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HostJobIdentity {
+    /// Exact Windows object-manager name.
+    pub name: String,
+}
+
+/// Inert root process/file projection for one Host Job binding.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HostJobRoot {
+    /// Root process identity observed by Host.
+    pub process: HostProcessBinding,
+    /// Root executable file-object identity observed by Host.
+    pub executable: HostFileIdentity,
+}
+
+/// Inert file-object identity projection.
+#[derive(Clone, Copy, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HostFileIdentity {
+    /// Volume serial number.
+    pub volume_serial_number: u32,
+    /// File index on the volume.
+    pub file_index: u64,
+}
+
+impl HostJobBinding {
+    /// Validates only bounded shape; the Kernel must still reopen the Job.
+    pub fn validate(&self) -> Result<(), KernelServiceError> {
+        handle_text(&self.job.name, "host_job_binding.job.name")?;
+        if self.job.name.len() > 480 {
+            return Err(KernelServiceError::InvalidField {
+                field: "host_job_binding.job.name",
+                reason: "exceeds the bounded Job name length",
+            });
+        }
+        self.root.process.validate()?;
+        if self.root.executable.volume_serial_number == 0 || self.root.executable.file_index == 0 {
+            return Err(KernelServiceError::InvalidField {
+                field: "host_job_binding.root.executable",
+                reason: "must contain a non-zero file identity",
+            });
+        }
+        Ok(())
+    }
+}
+
+fn handle_text(value: &str, field: &'static str) -> Result<(), KernelServiceError> {
+    validate_text(value, field)
+}
+
 /// One authenticated Host lifecycle command.  The command is repeated with
 /// the complete handshake so reconnects cannot silently inherit stale Host
 /// identity, generation, or nonce state.
@@ -150,7 +250,7 @@ pub struct KernelControlResponse {
     pub request_digest: String,
     /// Accepted Kernel lifecycle state.
     pub state: KernelServiceState,
-    /// Receipt returned only after the Ready command is validated.
+    /// Receipt returned only after Kernel-owned readiness observation.
     pub receipt: Option<KernelReadyReceipt>,
     /// Stable rejection detail, when the command was not accepted.
     pub error: Option<String>,
@@ -944,6 +1044,10 @@ pub struct HostKernelHandshake {
     pub job_object_id: PlatformHandle,
     /// Candidate/active authenticated local IPC identity.
     pub pipe_identity: PlatformHandle,
+    /// Host process identity observed before it opened the control pipe.
+    pub host_process: HostProcessBinding,
+    /// Host-retained Kernel Job binding; Kernel must reopen and reobserve it.
+    pub job_binding: HostJobBinding,
     /// Restart budget for this lineage.
     pub restart_budget: RestartBudget,
     /// Containment action required if the previous lineage is suspect.
@@ -964,6 +1068,8 @@ impl HostKernelHandshake {
         ] {
             handle(value, field)?;
         }
+        self.host_process.validate()?;
+        self.job_binding.validate()?;
         if self.host_epoch.value() == 0 || self.kernel_epoch.value() == 0 {
             return Err(KernelServiceError::InvalidField {
                 field: "handshake.epoch",
@@ -1069,8 +1175,9 @@ pub enum KernelControlCommand {
     PrepareHandoff,
     /// Begin consuming the one-time activation nonce.
     Activate,
-    /// Publish a complete readiness receipt.
-    Ready(KernelReadyReceipt),
+    /// Ask Kernel to prove readiness from live observations and self-author a
+    /// receipt.  No caller-shaped receipt is accepted on this wire.
+    ProbeReady,
     /// Close normal admission while retaining recovery control.
     Degrade(PlatformHandle),
     /// Drain normal work before stopping.
@@ -1154,6 +1261,27 @@ mod tests {
             activation_nonce: handle_value("nonce-1"),
             job_object_id: handle_value("Local\\Eliot-Host-Kernel-test"),
             pipe_identity: handle_value(KERNEL_CONTROL_PIPE),
+            host_process: HostProcessBinding {
+                process_id: 7,
+                start_time_100ns: 9,
+                image_path: "C:\\\\eliot\\\\host.exe".to_owned(),
+            },
+            job_binding: HostJobBinding {
+                job: HostJobIdentity {
+                    name: "Local\\Eliot-Host-Kernel-test".to_owned(),
+                },
+                root: HostJobRoot {
+                    process: HostProcessBinding {
+                        process_id: 42,
+                        start_time_100ns: 10,
+                        image_path: "C:\\\\eliot\\\\kernel.exe".to_owned(),
+                    },
+                    executable: HostFileIdentity {
+                        volume_serial_number: 1,
+                        file_index: 2,
+                    },
+                },
+            },
             restart_budget: RestartBudget::new(1, 1).expect("budget"),
             containment_action: None,
         }
@@ -1222,5 +1350,36 @@ mod tests {
         let mut missing_evidence = receipt;
         missing_evidence.evidence_refs.clear();
         assert!(missing_evidence.validate(&handshake).is_err());
+    }
+
+    #[test]
+    fn probe_ready_is_unit_wire_and_cannot_carry_host_receipt() {
+        let command = KernelControlCommand::ProbeReady;
+        assert_eq!(
+            serde_json::to_value(&command).expect("probe json"),
+            serde_json::Value::String("PROBE_READY".to_owned())
+        );
+        let forged = serde_json::json!({
+            "PROBE_READY": {
+                "activation_id": "host-authored",
+                "activation_nonce": "nonce-1"
+            }
+        });
+        assert!(serde_json::from_value::<KernelControlCommand>(forged).is_err());
+    }
+
+    #[test]
+    fn host_process_and_job_binding_are_required_and_bounded() {
+        let mut missing_process = control_handshake();
+        missing_process.host_process.process_id = 0;
+        assert!(missing_process.validate().is_err());
+
+        let mut missing_root = control_handshake();
+        missing_root.job_binding.root.process.start_time_100ns = 0;
+        assert!(missing_root.validate().is_err());
+
+        let mut missing_file = control_handshake();
+        missing_file.job_binding.root.executable.file_index = 0;
+        assert!(missing_file.validate().is_err());
     }
 }
