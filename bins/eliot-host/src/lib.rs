@@ -167,7 +167,6 @@ pub struct HostJobBranches {
     store_lease: Option<LaunchLease>,
     config_path: Option<PathBuf>,
     config_lease: Option<LaunchLease>,
-    store_config_lease: Option<LaunchLease>,
     config_pin: Option<PinnedRuntimeFile>,
     portable_root: Option<UserOwnedRootLease>,
     launch: Option<RuntimeLaunchDescriptor>,
@@ -194,6 +193,18 @@ pub enum HostBranchDisposition {
 
 #[cfg(windows)]
 impl HostJobBranches {
+    fn kernel_relaunch_admitted(
+        store_dead: bool,
+        store_degraded: bool,
+        store_present: bool,
+    ) -> bool {
+        !store_dead && !store_degraded && store_present
+    }
+
+    fn restart_allowed(attempts: u8) -> bool {
+        attempts < 1
+    }
+
     /// Creates two owner-scoped Job identities.  The actual Job handles are
     /// created only by the approved suspended launch below; there is no
     /// unbound PID assignment path.
@@ -220,7 +231,6 @@ impl HostJobBranches {
             store_lease: None,
             config_path: None,
             config_lease: None,
-            store_config_lease: None,
             config_pin: None,
             portable_root: None,
             launch: None,
@@ -504,26 +514,34 @@ impl HostJobBranches {
         verify_launch_digest(&config_lease, config_digest, "runtime.config")?;
         let store_config_path = approved_locator(
             Path::new(launch.store_config_path.as_str()),
-            &PlatformHandle::new(launch.store_config_path.as_str())
-                .map_err(|error| HostError::ProcessContour(error.to_string()))?,
+            approved_config_path,
             launch.profile,
         )?;
-        if launch.profile == InstallationProfile::PortableDev
-            && !store_config_path.starts_with(
-                portable_root
-                    .as_ref()
-                    .ok_or_else(|| {
-                        HostError::ProcessContour("portable root lease is missing".to_owned())
-                    })?
-                    .path(),
-            )
-        {
+        if store_config_path != config_path {
             return Err(HostError::ProcessContour(
-                "portable Store config is outside the retained root".to_owned(),
+                "Store config is not the approved generation config".to_owned(),
             ));
         }
-        let store_config_lease =
-            open_launch_lease(launch.profile, portable_root.as_ref(), &store_config_path)?;
+        let working_directory = if launch.profile == InstallationProfile::PortableDev {
+            let root = portable_root
+                .as_ref()
+                .ok_or_else(|| {
+                    HostError::ProcessContour("portable root lease is missing".to_owned())
+                })?
+                .path();
+            let config_inside_root = config_path.starts_with(root);
+            let working_directory =
+                std::fs::canonicalize(Path::new(launch.kernel_work_root.as_str()))
+                    .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+            if !config_inside_root || !working_directory.starts_with(root) {
+                return Err(HostError::ProcessContour(
+                    "portable launch path is outside the retained root".to_owned(),
+                ));
+            }
+            working_directory
+        } else {
+            PathBuf::from(launch.kernel_work_root.as_str())
+        };
         // Store must be live before Kernel is admitted.
         let store = Self::launch(
             &store_executable,
@@ -539,7 +557,7 @@ impl HostJobBranches {
             &config_pin,
             host,
             &launch.store_arguments,
-            Path::new(launch.kernel_work_root.as_str()),
+            &working_directory,
         )?;
         let kernel = match Self::launch(
             &kernel_executable,
@@ -555,7 +573,7 @@ impl HostJobBranches {
             &config_pin,
             host,
             &launch.kernel_arguments,
-            Path::new(launch.kernel_work_root.as_str()),
+            &working_directory,
         ) {
             Ok(kernel) => kernel,
             Err(error) => {
@@ -569,7 +587,6 @@ impl HostJobBranches {
         self.store_lease = Some(store_lease);
         self.config_path = Some(config_path);
         self.config_lease = Some(config_lease);
-        self.store_config_lease = Some(store_config_lease);
         self.config_pin = Some(config_pin);
         self.portable_root = portable_root;
         self.launch = Some(launch.clone());
@@ -808,14 +825,19 @@ impl HostJobBranches {
             verify_launch_digest(lease, store_artifact, "runtime.store_artifact")?;
         }
         let kernel_dead = Self::branch_dead(self.kernel.as_ref()).unwrap_or(true);
-        let mut store_dead = Self::branch_dead(self.store.as_ref()).unwrap_or(true);
+        let store_observation = Self::branch_dead(self.store.as_ref());
+        let mut store_dead = store_observation.unwrap_or(true);
         let mut kernel_degraded = false;
-        let mut store_degraded = false;
+        let mut store_degraded = store_observation.is_err();
 
         // When both branches are gone, restore the dependency before admitting
         // Kernel. A failed Kernel launch must not leave a newly started Store.
-        if kernel_dead && store_dead {
-            if self.terminate_store().is_err() || self.store_restart_attempts >= 1 {
+        let both_dead = kernel_dead && store_dead;
+        if both_dead {
+            if store_observation.is_err()
+                || self.terminate_store().is_err()
+                || !Self::restart_allowed(self.store_restart_attempts)
+            {
                 store_degraded = true;
             } else {
                 self.store_restart_attempts += 1;
@@ -832,13 +854,24 @@ impl HostJobBranches {
                     .is_err()
                 {
                     store_degraded = true;
+                } else if self.store.is_none()
+                    || Self::branch_dead(self.store.as_ref()).unwrap_or(true)
+                {
+                    store_degraded = true;
+                    let _ = self.terminate_store();
                 }
             }
-            store_dead = false;
+            store_dead = self.store.is_none() || store_degraded;
         }
 
-        if kernel_dead {
-            if self.terminate_kernel().is_err() || self.kernel_restart_attempts >= 1 {
+        // Kernel is admitted only after Store relaunch and observation prove an
+        // owned live Store child. Unknown Store state remains degraded.
+        if kernel_dead
+            && Self::kernel_relaunch_admitted(store_dead, store_degraded, self.store.is_some())
+        {
+            if self.terminate_kernel().is_err()
+                || !Self::restart_allowed(self.kernel_restart_attempts)
+            {
                 kernel_degraded = true;
             } else {
                 self.kernel_restart_attempts += 1;
@@ -857,10 +890,14 @@ impl HostJobBranches {
                     kernel_degraded = true;
                 }
             }
+        } else if kernel_dead {
+            kernel_degraded = true;
         }
 
-        if store_dead {
-            if self.terminate_store().is_err() || self.store_restart_attempts >= 1 {
+        if store_dead && !both_dead {
+            if self.terminate_store().is_err()
+                || !Self::restart_allowed(self.store_restart_attempts)
+            {
                 store_degraded = true;
             } else {
                 self.store_restart_attempts += 1;
@@ -1017,7 +1054,6 @@ impl HostJobBranches {
         self.store_lease = None;
         self.config_path = None;
         self.config_lease = None;
-        self.store_config_lease = None;
         self.config_pin = None;
         self.kernel_artifact_digest = None;
         self.store_artifact_digest = None;
@@ -1950,6 +1986,37 @@ fn configured_image(name: &str) -> Result<PathBuf, HostError> {
         )));
     }
     Ok(path)
+}
+
+#[cfg(all(test, windows))]
+mod tests {
+    use super::HostJobBranches;
+
+    #[test]
+    fn store_success_admits_kernel_after_store() {
+        let mut launches = Vec::new();
+        launches.push("Store");
+        if HostJobBranches::kernel_relaunch_admitted(false, false, true) {
+            launches.push("Kernel");
+        }
+        assert_eq!(launches, ["Store", "Kernel"]);
+    }
+
+    #[test]
+    fn store_failure_admits_zero_kernel_launches() {
+        assert!(!HostJobBranches::kernel_relaunch_admitted(
+            true, true, false
+        ));
+    }
+
+    #[test]
+    fn surviving_store_admits_one_kernel_restart_and_bound_is_one() {
+        assert!(HostJobBranches::kernel_relaunch_admitted(
+            false, false, true
+        ));
+        assert!(HostJobBranches::restart_allowed(0));
+        assert!(!HostJobBranches::restart_allowed(1));
+    }
 }
 
 impl From<io::Error> for HostError {

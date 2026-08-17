@@ -791,6 +791,12 @@ impl CandidateManifest {
             "manifest.store_executable_path",
         )?;
         approved_path(&self.config_path, "manifest.config_path")?;
+        if self.runtime_launch.store_config_path != self.config_path {
+            return Err(InstallationError::InvalidField {
+                field: "manifest.runtime_launch.store_config_path".to_owned(),
+                reason: "must exactly equal the approved manifest config_path".to_owned(),
+            });
+        }
         handles(
             &self.dependency_closure_refs,
             "manifest.dependency_closure_refs",
@@ -1933,5 +1939,22 @@ mod tests {
         let mut missing_root = descriptor.clone();
         missing_root.portable_root = None;
         assert!(missing_root.validate().is_err());
+    }
+
+    #[test]
+    fn manifest_rejects_unbound_store_config_alias() {
+        let mut manifest = registering_transaction().candidate_manifest;
+        manifest.runtime_launch.store_config_path = test_handle(
+            std::env::temp_dir()
+                .join("eliot-installation-unbound-store.json")
+                .to_string_lossy()
+                .into_owned(),
+        );
+        let error = manifest
+            .validate()
+            .expect_err("unbound Store config must fail closed");
+        assert!(
+            matches!(error, InstallationError::InvalidField { field, .. } if field == "manifest.runtime_launch.store_config_path")
+        );
     }
 }
