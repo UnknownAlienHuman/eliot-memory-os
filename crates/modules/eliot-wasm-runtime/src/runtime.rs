@@ -77,6 +77,13 @@ impl WasmRuntime {
                 RuntimeError::ReplayConflict,
             );
         }
+        if self.cache.len() >= MAX_CACHED_INVOCATIONS {
+            return plain_result(
+                &request,
+                InvocationDisposition::Rejected,
+                RuntimeError::ReplayCapacityExceeded,
+            );
+        }
         if request.cancellation_requested {
             return self.cache_plain(
                 request,
@@ -200,12 +207,25 @@ impl WasmRuntime {
             .process_receipt_verifier
             .verify_reconciliation(&invocation.process_binding, &process_evidence, envelope)
             .map_err(|_| RuntimeError::InvalidProcessReceipt)?;
-        let report = cached
-            .terminal_report
-            .clone()
-            .ok_or(RuntimeError::UnknownOutcome)?;
-        let result = classify_engine_report(ports, &cached.request, admission, invocation, report);
-        self.replace_cached_result(invocation_id, result)
+        let p03_reaped = process_evidence.view().lifecycle().is_terminal();
+        let report = ports
+            .engine
+            .reconcile(invocation)
+            .map_err(|_| RuntimeError::UnknownOutcome)?;
+        let result = classify_engine_report(
+            ports,
+            &cached.request,
+            admission,
+            invocation,
+            report.clone(),
+            p03_reaped,
+        );
+        let Some(cached) = self.cache.get_mut(invocation_id) else {
+            return Err(RuntimeError::UnknownOutcome);
+        };
+        cached.terminal_report = Some(report);
+        cached.result = result.clone();
+        Ok(result)
     }
 
     fn replace_cached_result(
@@ -221,11 +241,8 @@ impl WasmRuntime {
     }
 
     fn cache_insert(&mut self, invocation_id: crate::InvocationId, cached: CachedInvocation) {
-        if self.cache.len() >= MAX_CACHED_INVOCATIONS
-            && !self.cache.contains_key(&invocation_id)
-            && let Some(oldest) = self.cache.keys().next().cloned()
-        {
-            self.cache.remove(&oldest);
+        if self.cache.len() >= MAX_CACHED_INVOCATIONS && !self.cache.contains_key(&invocation_id) {
+            return;
         }
         self.cache.insert(invocation_id, cached);
     }
@@ -340,7 +357,13 @@ fn execute_uncached(
         );
     };
     let terminal_report = Some(report.clone());
-    let result = classify_engine_report(ports, &request, &admission, &invocation, report);
+    let p03_reaped = if matches!(report.termination, EngineTermination::Completed) {
+        verify_p03_reap(ports, &invocation, &envelope)
+    } else {
+        false
+    };
+    let result =
+        classify_engine_report(ports, &request, &admission, &invocation, report, p03_reaped);
     CachedInvocation {
         request,
         admission: Some(admission),
@@ -610,6 +633,7 @@ fn classify_engine_report(
     admission: &SealedAdmission,
     invocation: &EngineInvocation,
     report: EngineReport,
+    p03_reaped: bool,
 ) -> InvocationResult {
     if !report_contract_valid(invocation, &report) {
         return InvocationResult::classified(
@@ -680,7 +704,8 @@ fn classify_engine_report(
         );
     }
     let usage = report.usage.clone();
-    let (disposition, error, output, effects, state_delta) = classify_termination(report);
+    let (disposition, error, output, effects, state_delta) =
+        classify_termination(report, p03_reaped);
     InvocationResult::classified(
         request,
         disposition,
@@ -697,7 +722,9 @@ fn report_contract_valid(invocation: &EngineInvocation, report: &EngineReport) -
     let limits = &invocation.limits;
     report.request_digest == invocation.request_digest
         && report.usage.output_bytes == report.output.len() as u64
-        && report.usage.output_bytes <= limits.max_output_bytes
+        && report.usage.attempted_output_bytes >= report.usage.output_bytes
+        && (report.usage.attempted_output_bytes <= limits.max_output_bytes
+            || matches!(report.termination, EngineTermination::OutputLimit))
         && report.usage.host_calls <= limits.max_host_calls
         && report.usage.fuel_consumed <= limits.max_fuel
         && report
@@ -708,7 +735,8 @@ fn report_contract_valid(invocation: &EngineInvocation, report: &EngineReport) -
             .usage
             .table_elements
             .is_none_or(|value| value <= limits.max_table_elements)
-        && report.usage.instances <= limits.max_instances
+        && (report.usage.instances <= limits.max_instances
+            || matches!(report.termination, EngineTermination::InstanceLimit))
         && report
             .usage
             .stack_bytes
@@ -768,7 +796,7 @@ type TerminationClassification = (
     Option<Vec<u8>>,
 );
 
-fn classify_termination(report: EngineReport) -> TerminationClassification {
+fn classify_termination(report: EngineReport, p03_reaped: bool) -> TerminationClassification {
     let unknown = || {
         (
             InvocationDisposition::Unknown,
@@ -778,7 +806,9 @@ fn classify_termination(report: EngineReport) -> TerminationClassification {
             None,
         )
     };
-    if !report.reaped || !report.post_commit_known {
+    if (matches!(report.termination, EngineTermination::Completed) && !p03_reaped)
+        || !report.post_commit_known
+    {
         return unknown();
     }
     match report.termination {
@@ -803,6 +833,24 @@ fn classify_termination(report: EngineReport) -> TerminationClassification {
         EngineTermination::Cancelled => rejected(RuntimeError::Cancelled),
         EngineTermination::Partial | EngineTermination::PostCommitUnknown => unknown(),
     }
+}
+
+fn verify_p03_reap(
+    ports: &mut RuntimePorts,
+    invocation: &EngineInvocation,
+    envelope: &ProcessLaunchEnvelope,
+) -> bool {
+    let Ok(evidence) = ports.process.reconcile(&invocation.process_binding) else {
+        return false;
+    };
+    if ports
+        .process_receipt_verifier
+        .verify_reconciliation(&invocation.process_binding, &evidence, envelope)
+        .is_err()
+    {
+        return false;
+    }
+    evidence.view().lifecycle().is_terminal()
 }
 
 fn rejected(error: RuntimeError) -> TerminationClassification {

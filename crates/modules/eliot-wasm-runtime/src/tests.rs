@@ -3,12 +3,13 @@ use std::sync::{Arc, Mutex};
 
 use eliot_observation_contracts::ObservationScope;
 use eliot_process::{
-    ActionLeaseRef, CancellationReceipt, CancellationRequest, DispatchAuthorityId,
-    DispatchPermitAuthority, DispatchValidationContext, EnvironmentInheritance,
-    EnvironmentProjection, FencingToken, Generation, ImageId, JobId, KernelDispatchKey,
-    OperationId, PermitIssuance, ProcessEvidence, ProcessHealth, ProcessHealthStatus, ProcessId,
-    ProcessIntent, ProcessRequest, ProcessStartReceipt, ProcessState, ProcessTreeId,
-    ResourceLimits as ProcessLimits, SessionId, SuspendedProcessIdentity,
+    ActionLeaseRef, CancellationReceipt, CancellationRequest, DescendantEvidence,
+    DispatchAuthorityId, DispatchPermitAuthority, DispatchValidationContext,
+    EnvironmentInheritance, EnvironmentProjection, ExitDisposition, ExitStatus, FencingToken,
+    Generation, ImageId, JobId, KernelDispatchKey, OperationId, PermitIssuance, ProcessEvidence,
+    ProcessHealth, ProcessHealthStatus, ProcessId, ProcessIntent, ProcessLifecycle, ProcessRequest,
+    ProcessStartReceipt, ProcessState, ProcessTreeId, ResourceLimits as ProcessLimits, SessionId,
+    SuspendedProcessIdentity,
 };
 use eliot_runtime_contracts::{ModuleGeneration, RuntimeLease};
 use eliot_security_contracts::{PrivacyClass, SourceAssurance};
@@ -161,6 +162,13 @@ fn request() -> InvocationRequest {
     ))
 }
 
+fn request_with_id(id: usize) -> InvocationRequest {
+    let mut request = request();
+    request.invocation_id = must(InvocationId::new(format!("invoke-{id}")));
+    must(request.refresh_digest());
+    request
+}
+
 #[derive(Clone)]
 struct ReportSpec {
     termination: EngineTermination,
@@ -218,6 +226,7 @@ struct Config {
     cancel_receipt_mismatch: bool,
     reject_cancel_receipt: bool,
     reject_reconcile_evidence: bool,
+    process_reaped: bool,
     invalid_limit: Option<InvalidLimit>,
     stale_source: bool,
     promotion_mismatch: bool,
@@ -239,6 +248,7 @@ impl Default for Config {
             cancel_receipt_mismatch: false,
             reject_cancel_receipt: false,
             reject_reconcile_evidence: false,
+            process_reaped: true,
             invalid_limit: None,
             stale_source: false,
             promotion_mismatch: false,
@@ -523,11 +533,40 @@ impl P03ProcessPort for ProcessMock {
     }
 
     fn reconcile(&mut self, binding: &ProcessBinding) -> Result<ProcessEvidence, PortError> {
-        let state = lock_state(&self.state);
+        let mut state = lock_state(&self.state);
         let process = state.process.as_ref().ok_or(PortError::UnknownOutcome)?;
         if !binding_matches_state(binding, process) {
             return Err(PortError::Denied);
         }
+        if self.config.process_reaped && process.view().lifecycle() == ProcessLifecycle::Running {
+            let root = process
+                .view()
+                .identity()
+                .ok_or(PortError::UnknownOutcome)?
+                .process_id()
+                .clone();
+            let process_binding = process.binding().clone();
+            let descendants = DescendantEvidence::new(
+                process_binding,
+                root.clone(),
+                vec![root],
+                true,
+                true,
+                Some("reaped".to_owned()),
+            )
+            .map_err(|_| PortError::UnknownOutcome)?;
+            state
+                .process
+                .as_mut()
+                .ok_or(PortError::UnknownOutcome)?
+                .exit(
+                    ExitStatus::new(ExitDisposition::Completed, Some(0), None, 200)
+                        .map_err(|_| PortError::UnknownOutcome)?,
+                    descendants,
+                )
+                .map_err(|_| PortError::UnknownOutcome)?;
+        }
+        let process = state.process.as_ref().ok_or(PortError::UnknownOutcome)?;
         let axes = must(serde_json::from_value(json!({
             "status": "OBSERVED",
             "assertability": "NON_ASSERTABLE_UNVERIFIED",
@@ -645,6 +684,7 @@ impl EngineMock {
             request_digest: invocation.request_digest.clone(),
             termination: spec.termination,
             usage: EngineUsage {
+                attempted_output_bytes: output_bytes,
                 output_bytes,
                 host_calls: 0,
                 fuel_consumed: 10,
@@ -1107,11 +1147,52 @@ fn partial_and_post_commit_unknown_reconcile_only_after_p03_evidence() {
         let reconciled = must(runtime.reconcile(&invocation_id, &request_digest));
         assert_eq!(
             reconciled.receipt.disposition,
-            InvocationDisposition::Unknown
+            InvocationDisposition::Succeeded
         );
-        assert_eq!(lock_state(&state).engine_calls, 1);
+        assert_eq!(lock_state(&state).engine_calls, 2);
+        let replayed = must(runtime.reconcile(&invocation_id, &request_digest));
+        assert_eq!(replayed.receipt, reconciled.receipt);
+        assert_eq!(lock_state(&state).engine_calls, 2);
         assert_eq!(runtime.execute(original), reconciled);
     }
+}
+
+#[test]
+fn replay_capacity_fails_closed_without_eviction_or_second_execution() {
+    let (mut runtime, state) = runtime(Config::default());
+    let first = request_with_id(0);
+    let first_result = runtime.execute(first.clone());
+    for id in 1..256 {
+        assert_eq!(
+            runtime.execute(request_with_id(id)).receipt.disposition,
+            InvocationDisposition::Succeeded
+        );
+    }
+    let rejected = runtime.execute(request_with_id(256));
+    assert_eq!(
+        rejected.receipt.error,
+        Some(RuntimeError::ReplayCapacityExceeded)
+    );
+    let state_after_reject = lock_state(&state);
+    assert_eq!(state_after_reject.process_start_calls, 256);
+    assert_eq!(state_after_reject.engine_calls, 256);
+    drop(state_after_reject);
+    assert_eq!(runtime.execute(first), first_result);
+    let state_after_replay = lock_state(&state);
+    assert_eq!(state_after_replay.process_start_calls, 256);
+    assert_eq!(state_after_replay.engine_calls, 256);
+}
+
+#[test]
+fn running_p03_process_cannot_authorize_success() {
+    let config = Config {
+        process_reaped: false,
+        ..Config::default()
+    };
+    let (mut runtime, _) = runtime(config);
+    let result = runtime.execute(request());
+    assert_eq!(result.receipt.disposition, InvocationDisposition::Unknown);
+    assert_eq!(result.receipt.error, Some(RuntimeError::UnknownOutcome));
 }
 
 #[test]

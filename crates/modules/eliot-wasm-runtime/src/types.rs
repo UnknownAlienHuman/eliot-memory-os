@@ -551,6 +551,8 @@ pub struct EngineInvocation {
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct EngineUsage {
+    /// Bytes observed from the guest result before the output ceiling was applied.
+    pub attempted_output_bytes: u64,
     pub output_bytes: u64,
     pub host_calls: u32,
     pub fuel_consumed: u64,
@@ -676,6 +678,8 @@ pub enum RuntimeError {
     InvalidProcessReceipt,
     #[error("replay key was reused for different request bytes")]
     ReplayConflict,
+    #[error("replay capacity is full; new invocation rejected")]
+    ReplayCapacityExceeded,
     #[error("terminal result cannot be overwritten by cancellation")]
     TerminalCancellationConflict,
     #[error("cancelled")]
