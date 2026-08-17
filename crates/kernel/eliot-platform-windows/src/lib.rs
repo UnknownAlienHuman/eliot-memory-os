@@ -3160,6 +3160,7 @@ impl RecoverableJobObject {
     pub fn open(binding: RecoverableJobBinding) -> Result<Self, WindowsAdapterError> {
         const JOB_OBJECT_QUERY_ACCESS: u32 = 0x0004;
         const JOB_OBJECT_TERMINATE_ACCESS: u32 = 0x0008;
+        const JOB_OBJECT_ASSIGN_PROCESS_ACCESS: u32 = 0x0001;
         use windows_sys::Win32::System::JobObjects::OpenJobObjectW;
         binding.validate()?;
         let name = nul_terminated_wide(std::ffi::OsStr::new(binding.job_identity().name()))
@@ -3167,7 +3168,9 @@ impl RecoverableJobObject {
         // SAFETY: name is NUL-terminated and the call returns a new handle.
         let handle = unsafe {
             OpenJobObjectW(
-                JOB_OBJECT_QUERY_ACCESS | JOB_OBJECT_TERMINATE_ACCESS,
+                JOB_OBJECT_QUERY_ACCESS
+                    | JOB_OBJECT_TERMINATE_ACCESS
+                    | JOB_OBJECT_ASSIGN_PROCESS_ACCESS,
                 0,
                 name.as_ptr(),
             )
@@ -3231,6 +3234,26 @@ impl RecoverableJobObject {
         .map_err(|_| WindowsAdapterError::Failed)
     }
 
+    #[cfg(windows)]
+    fn assign_process_handle(
+        &self,
+        process: windows_sys::Win32::Foundation::HANDLE,
+    ) -> Result<(), WindowsAdapterError> {
+        use windows_sys::Win32::System::JobObjects::AssignProcessToJobObject;
+        if unsafe { AssignProcessToJobObject(self.handle.0, process) } == 0 {
+            Err(last_windows_adapter_error())
+        } else {
+            Ok(())
+        }
+    }
+
+    #[cfg(windows)]
+    fn contains_process(&self, process_id: u32) -> Result<bool, WindowsAdapterError> {
+        job_process_ids(self.handle.0)
+            .map(|processes| processes.into_iter().any(|pid| pid == process_id))
+            .map_err(|error| windows_adapter_from_io(&error))
+    }
+
     /// Terminates all current members.
     ///
     /// # Errors
@@ -3265,6 +3288,31 @@ impl RecoverableJobObject {
             }
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
+    }
+
+    /// Launches one validated child into this already-open Job Object.
+    ///
+    /// The returned typestate borrows this recovery handle for its whole
+    /// lifetime. It therefore cannot outlive the shared Job owner and never
+    /// owns, closes, or terminates that Job. Only the new process is owned by
+    /// the member typestate.
+    ///
+    /// # Errors
+    /// Returns a typed adapter error when the retained root is no longer a
+    /// member, launch material is invalid, assignment fails, or exact member
+    /// identity cannot be observed before publication.
+    pub fn spawn_member(
+        &self,
+        spec: SuspendedLaunchSpec,
+    ) -> Result<SuspendedExistingJobChild<'_>, WindowsAdapterError> {
+        if !self
+            .live_processes()?
+            .iter()
+            .any(|process| process == self.binding.root())
+        {
+            return Err(WindowsAdapterError::IdentityMismatch);
+        }
+        spawn_existing_job_member(self, spec)
     }
 }
 
@@ -4109,6 +4157,477 @@ impl Drop for JobChildHandles {
     }
 }
 
+#[cfg(windows)]
+struct ExistingJobMemberHandles {
+    process: OwnedProcessHandle,
+    thread: OwnedProcessHandle,
+    spawn_identity: ProcessIdentity,
+    executable: PinnedExecutable,
+    spec: SuspendedLaunchSpec,
+    command_line_utf16: Vec<u16>,
+    stdout: Option<std::fs::File>,
+    stderr: Option<std::fs::File>,
+    job_identity: JobObjectIdentity,
+    terminal: bool,
+}
+
+#[cfg(windows)]
+impl ExistingJobMemberHandles {
+    fn fresh_evidence(
+        &self,
+        job: &RecoverableJobObject,
+    ) -> Result<SuspendedProcessEvidence, WindowsAdapterError> {
+        use windows_sys::Win32::System::Threading::GetProcessId;
+        let process_id = unsafe { GetProcessId(self.process.0) };
+        if process_id == 0 || process_id != self.spawn_identity.process_id {
+            return Err(WindowsAdapterError::IdentityMismatch);
+        }
+        let process = inspect_process_handle(process_id, self.process.0)
+            .map_err(|error| windows_adapter_from_io(&error))?;
+        if process.start_time_100ns != self.spawn_identity.start_time_100ns
+            || !same_windows_path(&process.image_path, &self.spawn_identity.image_path)
+        {
+            return Err(WindowsAdapterError::IdentityMismatch);
+        }
+        let observed_file = file_identity(Path::new(&process.image_path))
+            .map_err(|error| windows_adapter_from_io(&error))?;
+        if observed_file != self.executable.identity
+            || !same_windows_path(&process.image_path, &self.spec.executable.to_string_lossy())
+            || !job.contains_process(process_id)?
+        {
+            return Err(WindowsAdapterError::IdentityMismatch);
+        }
+        let count = u32::try_from(
+            job_process_ids(job.handle.0)
+                .map_err(|error| windows_adapter_from_io(&error))?
+                .len(),
+        )
+        .map_err(|_| WindowsAdapterError::Failed)?;
+        if count == 0 {
+            return Err(WindowsAdapterError::IdentityMismatch);
+        }
+        Ok(SuspendedProcessEvidence {
+            process,
+            executable: observed_file,
+            job: self.job_identity.clone(),
+            requested_executable: self.spec.executable.clone(),
+            arguments: self.spec.arguments.clone(),
+            working_directory: self.spec.working_directory.clone(),
+            environment: self.spec.environment.clone(),
+            command_line_utf16: self.command_line_utf16.clone(),
+            job_process_count: count,
+        })
+    }
+
+    fn process_observation(&self) -> Result<Option<i32>, WindowsAdapterError> {
+        use windows_sys::Win32::Foundation::{WAIT_OBJECT_0, WAIT_TIMEOUT};
+        use windows_sys::Win32::System::Threading::{GetExitCodeProcess, WaitForSingleObject};
+        match unsafe { WaitForSingleObject(self.process.0, 0) } {
+            WAIT_TIMEOUT => Ok(None),
+            WAIT_OBJECT_0 => {
+                let mut code = 0_u32;
+                if unsafe { GetExitCodeProcess(self.process.0, &raw mut code) } == 0 {
+                    return Err(last_windows_adapter_error());
+                }
+                Ok(Some(i32::from_ne_bytes(code.to_ne_bytes())))
+            }
+            _ => Err(last_windows_adapter_error()),
+        }
+    }
+
+    fn terminate_and_reap(
+        &mut self,
+        requested_exit_code: u32,
+        job: &RecoverableJobObject,
+    ) -> Result<TerminatedExistingJobChild, WindowsAdapterError> {
+        use windows_sys::Win32::Foundation::WAIT_OBJECT_0;
+        use windows_sys::Win32::System::Threading::{TerminateProcess, WaitForSingleObject};
+        if unsafe { TerminateProcess(self.process.0, requested_exit_code) } == 0 {
+            let error = last_windows_adapter_error();
+            if self.process_observation()?.is_none() {
+                return Err(error);
+            }
+        }
+        if unsafe { WaitForSingleObject(self.process.0, 5_000) } != WAIT_OBJECT_0 {
+            return Err(WindowsAdapterError::Timeout);
+        }
+        let observed_exit_code = self
+            .process_observation()?
+            .ok_or(WindowsAdapterError::Failed)?;
+        let job_member_count = job.active_process_count()?;
+        self.terminal = true;
+        Ok(TerminatedExistingJobChild {
+            process: self.spawn_identity.clone(),
+            job: self.job_identity.clone(),
+            requested_exit_code,
+            observed_exit_code,
+            job_member_count,
+        })
+    }
+
+    fn best_effort_cleanup(&mut self) {
+        use windows_sys::Win32::System::Threading::{TerminateProcess, WaitForSingleObject};
+        if self.terminal {
+            return;
+        }
+        let _ = unsafe { TerminateProcess(self.process.0, 0xE1_04) };
+        let _ = unsafe { WaitForSingleObject(self.process.0, 5_000) };
+        self.terminal = true;
+    }
+}
+
+#[cfg(windows)]
+impl Drop for ExistingJobMemberHandles {
+    fn drop(&mut self) {
+        self.best_effort_cleanup();
+    }
+}
+
+#[cfg(windows)]
+#[allow(
+    clippy::too_many_lines,
+    reason = "existing-Job launch keeps assignment and fail-closed cleanup contiguous"
+)]
+fn spawn_existing_job_member(
+    job: &RecoverableJobObject,
+    spec: SuspendedLaunchSpec,
+) -> Result<SuspendedExistingJobChild<'_>, WindowsAdapterError> {
+    use windows_sys::Win32::System::Threading::{
+        CREATE_NO_WINDOW, CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, CreateProcessW,
+        EXTENDED_STARTUPINFO_PRESENT, PROCESS_INFORMATION, STARTF_USESTDHANDLES, STARTUPINFOEXW,
+    };
+    let executable = PinnedExecutable::open(&spec.executable)?;
+    let application = nul_terminated_wide(spec.executable.as_os_str())
+        .map_err(|error| windows_adapter_from_io(&error))?;
+    let command_line_utf16 = command_line(&spec.executable, &spec.arguments)
+        .map_err(|error| windows_adapter_from_io(&error))?;
+    let mut command_line = command_line_utf16.clone();
+    let mut environment = command_environment(&spec.environment);
+    let current_directory = nul_terminated_wide(spec.working_directory.as_os_str())
+        .map_err(|error| windows_adapter_from_io(&error))?;
+    let (stdin_read, stdin_write) = inheritable_pipe()?;
+    let (stdout_read, stdout_write) = inheritable_pipe()?;
+    let (stderr_read, stderr_write) = inheritable_pipe()?;
+    make_non_inheritable(stdin_write.0)?;
+    make_non_inheritable(stdout_read.0)?;
+    make_non_inheritable(stderr_read.0)?;
+    let inherited_handles = [stdin_read.0, stdout_write.0, stderr_write.0];
+    let attributes = ProcThreadAttributeList::for_inherited_handles(&inherited_handles)?;
+    let mut startup = STARTUPINFOEXW {
+        StartupInfo: windows_sys::Win32::System::Threading::STARTUPINFOW {
+            cb: u32::try_from(std::mem::size_of::<STARTUPINFOEXW>())
+                .map_err(|_| WindowsAdapterError::Failed)?,
+            dwFlags: STARTF_USESTDHANDLES,
+            hStdInput: stdin_read.0,
+            hStdOutput: stdout_write.0,
+            hStdError: stderr_write.0,
+            ..Default::default()
+        },
+        lpAttributeList: attributes.list,
+    };
+    let mut information = PROCESS_INFORMATION::default();
+    // SAFETY: all buffers and the STARTUPINFOEX attribute list remain live;
+    // handle inheritance is restricted to the explicit standard handles.
+    if unsafe {
+        CreateProcessW(
+            application.as_ptr(),
+            command_line.as_mut_ptr(),
+            std::ptr::null(),
+            std::ptr::null(),
+            1,
+            CREATE_SUSPENDED
+                | CREATE_UNICODE_ENVIRONMENT
+                | CREATE_NO_WINDOW
+                | EXTENDED_STARTUPINFO_PRESENT,
+            environment.as_mut_ptr().cast(),
+            current_directory.as_ptr(),
+            &raw mut startup.StartupInfo,
+            &raw mut information,
+        )
+    } == 0
+    {
+        return Err(last_windows_adapter_error());
+    }
+    if information.hProcess.is_null() || information.hThread.is_null() {
+        use windows_sys::Win32::Foundation::CloseHandle;
+        use windows_sys::Win32::System::Threading::{
+            OpenProcess, PROCESS_TERMINATE, TerminateProcess, WaitForSingleObject,
+        };
+        let cleanup_process = if information.hProcess.is_null() && information.dwProcessId != 0 {
+            unsafe { OpenProcess(PROCESS_TERMINATE | 0x0010_0000, 0, information.dwProcessId) }
+        } else {
+            information.hProcess
+        };
+        if !cleanup_process.is_null() {
+            let _ = unsafe { TerminateProcess(cleanup_process, 0xE1_04) };
+            let _ = unsafe { WaitForSingleObject(cleanup_process, 5_000) };
+            if cleanup_process != information.hProcess {
+                unsafe { CloseHandle(cleanup_process) };
+            }
+        }
+        if !information.hThread.is_null() {
+            unsafe { CloseHandle(information.hThread) };
+        }
+        if !information.hProcess.is_null() {
+            unsafe { CloseHandle(information.hProcess) };
+        }
+        return Err(WindowsAdapterError::Failed);
+    }
+    drop(stdin_read);
+    drop(stdin_write);
+    drop(stdout_write);
+    drop(stderr_write);
+    let process = OwnedProcessHandle::new(information.hProcess)?;
+    let thread = OwnedProcessHandle::new(information.hThread)?;
+    let mut cleanup = SuspendedProcessCleanup {
+        process: process.0,
+        armed: true,
+    };
+    let spawn_identity = inspect_process_handle(information.dwProcessId, process.0)
+        .map_err(|error| windows_adapter_from_io(&error))?;
+    let mut inner = ExistingJobMemberHandles {
+        process,
+        thread,
+        spawn_identity,
+        executable,
+        spec,
+        command_line_utf16,
+        stdout: Some(stdout_read.into_file()),
+        stderr: Some(stderr_read.into_file()),
+        job_identity: job.identity().clone(),
+        terminal: false,
+    };
+    job.assign_process_handle(inner.process.0)?;
+    if !job.contains_process(inner.spawn_identity.process_id)? {
+        inner.best_effort_cleanup();
+        return Err(WindowsAdapterError::IdentityMismatch);
+    }
+    let observed_file = file_identity(Path::new(&inner.spawn_identity.image_path))
+        .map_err(|error| windows_adapter_from_io(&error))?;
+    if observed_file != inner.executable.identity
+        || !same_windows_path(
+            &inner.spawn_identity.image_path,
+            &inner.spec.executable.to_string_lossy(),
+        )
+    {
+        inner.best_effort_cleanup();
+        return Err(WindowsAdapterError::IdentityMismatch);
+    }
+    cleanup.disarm();
+    Ok(SuspendedExistingJobChild { job, inner })
+}
+
+#[cfg(windows)]
+impl<'job> SuspendedExistingJobChild<'job> {
+    /// Returns the process identifier captured from the newly-created handle.
+    /// The PID is only a diagnostic lookup key; all validation remains
+    /// handle-bound and includes start time and image identity.
+    #[must_use]
+    pub const fn id(&self) -> u32 {
+        self.inner.spawn_identity.process_id
+    }
+
+    /// Consumes the suspended member and requires caller-owned policy to
+    /// return an opaque validation token before resume.
+    ///
+    /// # Errors
+    /// Returns [`SuspendedValidationError::Mechanics`] when exact process or
+    /// Job membership cannot be re-observed, or `Rejected` for the caller's
+    /// policy error. Both paths kill and reap only this candidate.
+    pub fn validate<V, E, F>(
+        mut self,
+        validator: F,
+    ) -> Result<ValidatedSuspendedExistingJobChild<'job, V>, SuspendedValidationError<E>>
+    where
+        F: FnOnce(&SuspendedProcessEvidence) -> Result<V, E>,
+    {
+        let evidence = match self.inner.fresh_evidence(self.job) {
+            Ok(evidence) => evidence,
+            Err(error) => {
+                self.inner.best_effort_cleanup();
+                return Err(SuspendedValidationError::Mechanics(error));
+            }
+        };
+        let validation = match validator(&evidence) {
+            Ok(validation) => validation,
+            Err(error) => {
+                self.inner.best_effort_cleanup();
+                return Err(SuspendedValidationError::Rejected(error));
+            }
+        };
+        Ok(ValidatedSuspendedExistingJobChild {
+            job: self.job,
+            inner: self.inner,
+            evidence,
+            validation,
+        })
+    }
+
+    /// Consumes and terminates only this suspended member.
+    ///
+    /// # Errors
+    /// Returns a typed adapter error when the member cannot be terminated or
+    /// reaped within the bounded wait.
+    pub fn terminate(
+        mut self,
+        exit_code: u32,
+    ) -> Result<TerminatedExistingJobChild, WindowsAdapterError> {
+        self.inner.terminate_and_reap(exit_code, self.job)
+    }
+}
+
+#[cfg(windows)]
+impl<'job, V> ValidatedSuspendedExistingJobChild<'job, V> {
+    #[must_use]
+    pub fn evidence(&self) -> &SuspendedProcessEvidence {
+        &self.evidence
+    }
+
+    #[must_use]
+    pub const fn validation(&self) -> &V {
+        &self.validation
+    }
+
+    /// Consumes the validated member and resumes exactly once.
+    ///
+    /// Fresh exact identity and Job membership are checked immediately before
+    /// and after `ResumeThread`. Any unknown or inconsistent result kills and
+    /// reaps only this member; the shared Job and its root remain untouched.
+    ///
+    /// # Errors
+    /// Returns a typed adapter error when validation evidence changes,
+    /// `ResumeThread` is unknown, or post-resume identity/membership is not
+    /// exact. The candidate is killed and reaped on every error path.
+    pub fn resume(mut self) -> Result<RunningExistingJobChild<'job, V>, WindowsAdapterError> {
+        use windows_sys::Win32::System::Threading::ResumeThread;
+        let before = match self.inner.fresh_evidence(self.job) {
+            Ok(evidence) => evidence,
+            Err(error) => {
+                self.inner.best_effort_cleanup();
+                return Err(error);
+            }
+        };
+        if before.process != self.evidence.process
+            || before.executable != self.evidence.executable
+            || before.job != self.evidence.job
+        {
+            self.inner.best_effort_cleanup();
+            return Err(WindowsAdapterError::IdentityMismatch);
+        }
+        let resumed = unsafe { ResumeThread(self.inner.thread.0) };
+        if resumed == u32::MAX || resumed != 1 {
+            let error = if resumed == u32::MAX {
+                last_windows_adapter_error()
+            } else {
+                WindowsAdapterError::IdentityMismatch
+            };
+            self.inner.best_effort_cleanup();
+            return Err(error);
+        }
+        let after = match self.inner.fresh_evidence(self.job) {
+            Ok(evidence) => evidence,
+            Err(error) => {
+                self.inner.best_effort_cleanup();
+                return Err(error);
+            }
+        };
+        if after.process != before.process
+            || after.executable != before.executable
+            || after.job != before.job
+        {
+            self.inner.best_effort_cleanup();
+            return Err(WindowsAdapterError::IdentityMismatch);
+        }
+        Ok(RunningExistingJobChild {
+            job: self.job,
+            inner: self.inner,
+            evidence: after,
+            validation: self.validation,
+        })
+    }
+
+    /// Consumes and terminates only this suspended member.
+    ///
+    /// # Errors
+    /// Returns a typed adapter error when the member cannot be terminated or
+    /// reaped within the bounded wait.
+    pub fn terminate(
+        mut self,
+        exit_code: u32,
+    ) -> Result<TerminatedExistingJobChild, WindowsAdapterError> {
+        self.inner.terminate_and_reap(exit_code, self.job)
+    }
+}
+
+#[cfg(windows)]
+impl<V> RunningExistingJobChild<'_, V> {
+    #[must_use]
+    pub fn evidence(&self) -> &SuspendedProcessEvidence {
+        &self.evidence
+    }
+
+    #[must_use]
+    pub const fn validation(&self) -> &V {
+        &self.validation
+    }
+
+    /// Returns the shared Job identity without exposing a Job handle.
+    #[must_use]
+    pub const fn job_identity(&self) -> &JobObjectIdentity {
+        self.job.identity()
+    }
+
+    #[must_use]
+    pub fn process(&self) -> &ProcessIdentity {
+        self.evidence.process()
+    }
+
+    #[must_use]
+    pub const fn executable_file_identity(&self) -> FileIdentity {
+        self.evidence.executable_file_identity()
+    }
+
+    #[must_use]
+    pub fn take_stdout(&mut self) -> Option<std::fs::File> {
+        self.inner.stdout.take()
+    }
+
+    #[must_use]
+    pub fn take_stderr(&mut self) -> Option<std::fs::File> {
+        self.inner.stderr.take()
+    }
+
+    /// Observes only this process and the current member count of the shared
+    /// Job. It never terminates the Job.
+    ///
+    /// # Errors
+    /// Returns a typed adapter error when process exit state or Job membership
+    /// cannot be observed.
+    pub fn observe(&self) -> Result<ExistingJobMemberObservation, WindowsAdapterError> {
+        let active_processes = self.job.active_process_count()?;
+        match self.inner.process_observation()? {
+            None => Ok(ExistingJobMemberObservation::Running { active_processes }),
+            Some(exit_code) => Ok(ExistingJobMemberObservation::Exited {
+                exit_code,
+                active_processes,
+            }),
+        }
+    }
+
+    /// Terminates and reaps only this member process. The shared Job and all
+    /// other members remain alive.
+    ///
+    /// # Errors
+    /// Returns a typed adapter error when the member cannot be terminated or
+    /// reaped within the bounded wait.
+    pub fn terminate(
+        mut self,
+        exit_code: u32,
+    ) -> Result<TerminatedExistingJobChild, WindowsAdapterError> {
+        self.inner.terminate_and_reap(exit_code, self.job)
+    }
+}
+
 /// Newly created suspended child. Validation and resume are consuming
 /// typestate transitions, so neither transition can be repeated.
 #[cfg(windows)]
@@ -4130,6 +4649,92 @@ pub struct RunningJobChild<V> {
     inner: JobChildHandles,
     evidence: SuspendedProcessEvidence,
     validation: V,
+}
+
+/// Newly created suspended member of an already authenticated/reopened Job.
+///
+/// The lifetime ties the candidate to the retained recovery capability. The
+/// candidate owns only its process resources; the shared Job remains owned by
+/// [`RecoverableJobObject`].
+#[cfg(windows)]
+pub struct SuspendedExistingJobChild<'job> {
+    job: &'job RecoverableJobObject,
+    inner: ExistingJobMemberHandles,
+}
+
+/// Suspended existing-Job member carrying the caller-owned validation token.
+#[cfg(windows)]
+pub struct ValidatedSuspendedExistingJobChild<'job, V> {
+    job: &'job RecoverableJobObject,
+    inner: ExistingJobMemberHandles,
+    evidence: SuspendedProcessEvidence,
+    validation: V,
+}
+
+/// Running process member contained by an existing Job without owning it.
+#[cfg(windows)]
+pub struct RunningExistingJobChild<'job, V> {
+    job: &'job RecoverableJobObject,
+    inner: ExistingJobMemberHandles,
+    evidence: SuspendedProcessEvidence,
+    validation: V,
+}
+
+/// Idempotent observation of one running member in an existing Job.
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ExistingJobMemberObservation {
+    Running {
+        active_processes: u32,
+    },
+    Exited {
+        exit_code: i32,
+        active_processes: u32,
+    },
+}
+
+/// Terminal receipt for one member process. The shared Job is never
+/// terminated as part of producing this receipt.
+#[cfg(windows)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TerminatedExistingJobChild {
+    process: ProcessIdentity,
+    job: JobObjectIdentity,
+    requested_exit_code: u32,
+    observed_exit_code: i32,
+    job_member_count: u32,
+}
+
+#[cfg(windows)]
+impl TerminatedExistingJobChild {
+    /// Returns the exact process identity captured before launch.
+    #[must_use]
+    pub const fn process(&self) -> &ProcessIdentity {
+        &self.process
+    }
+
+    /// Returns the shared Job identity without exposing a Job handle.
+    #[must_use]
+    pub const fn job_identity(&self) -> &JobObjectIdentity {
+        &self.job
+    }
+
+    #[must_use]
+    pub const fn requested_exit_code(&self) -> u32 {
+        self.requested_exit_code
+    }
+
+    #[must_use]
+    pub const fn observed_exit_code(&self) -> i32 {
+        self.observed_exit_code
+    }
+
+    /// Returns the number of remaining Job members after this process was
+    /// reaped. A non-zero value is expected when the Kernel root remains live.
+    #[must_use]
+    pub const fn remaining_job_members(&self) -> u32 {
+        self.job_member_count
+    }
 }
 
 /// Typed, idempotent observation of a resumed child.
@@ -8491,6 +9096,210 @@ mod tests {
         );
         drop(file_lease);
         drop(root_lease);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(windows)]
+    fn wait_for_marker(marker: &Path) {
+        for _ in 0..100 {
+            if marker.exists() {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        panic!("child marker did not appear: {}", marker.display());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn reopened_job_member_uses_exact_job_and_member_termination_preserves_root() {
+        let root =
+            std::env::temp_dir().join(format!("eliot-existing-job-member-{}", unique_suffix()));
+        std::fs::create_dir(&root).unwrap_or_else(|_| unreachable!());
+        let root_marker = root.join("root");
+        let member_marker = root.join("member");
+        let root_child = spawn_suspended_child(&root_marker, &root, false);
+        let running_root = root_child
+            .validate::<(), &'static str, _>(|_| Ok(()))
+            .unwrap_or_else(|_| unreachable!())
+            .resume()
+            .unwrap_or_else(|_| unreachable!());
+        wait_for_marker(&root_marker);
+        let binding = running_root.evidence().recoverable_job_binding();
+        let recovered = RecoverableJobObject::open(binding)
+            .unwrap_or_else(|error| panic!("exact Job reopen failed: {error}"));
+        let root_job = running_root.job_identity().clone();
+        let member = recovered
+            .spawn_member(suspended_spec(&member_marker, &root, false))
+            .unwrap_or_else(|error| panic!("member spawn failed: {error}"));
+        let member_pid = member.id();
+        let validated = member
+            .validate::<(), &'static str, _>(|evidence| {
+                assert_eq!(evidence.job_identity(), &root_job);
+                assert!(evidence.job_process_count() >= 2);
+                assert_ne!(
+                    evidence.process().process_id,
+                    running_root.evidence().process().process_id
+                );
+                assert_ne!(evidence.executable_file_identity().file_index, 0);
+                Ok(())
+            })
+            .unwrap_or_else(|_| unreachable!());
+        let running_member = validated
+            .resume()
+            .unwrap_or_else(|error| panic!("member resume failed: {error}"));
+        wait_for_marker(&member_marker);
+        assert_eq!(running_member.job_identity(), &root_job);
+        assert!(matches!(
+            running_root.observe().unwrap_or_else(|_| unreachable!()),
+            RunningJobObservation::Running { active_processes } if active_processes >= 2
+        ));
+        let terminal = running_member
+            .terminate(0xE1_31)
+            .unwrap_or_else(|error| panic!("member termination failed: {error}"));
+        assert_eq!(terminal.process().process_id, member_pid);
+        assert_eq!(terminal.requested_exit_code(), 0xE1_31);
+        assert!(terminal.remaining_job_members() >= 1);
+        assert!(wait_for_process_gone(member_pid));
+        assert!(matches!(
+            running_root.observe().unwrap_or_else(|_| unreachable!()),
+            RunningJobObservation::Running { active_processes } if active_processes >= 1
+        ));
+        running_root
+            .terminate(0xE132)
+            .unwrap_or_else(|error| panic!("root termination failed: {error}"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn existing_job_member_rejection_and_validator_panic_preserve_root() {
+        let root =
+            std::env::temp_dir().join(format!("eliot-existing-job-reject-{}", unique_suffix()));
+        std::fs::create_dir(&root).unwrap_or_else(|_| unreachable!());
+        let root_marker = root.join("root");
+        let root_child = spawn_suspended_child(&root_marker, &root, false);
+        let running_root = root_child
+            .validate::<(), &'static str, _>(|_| Ok(()))
+            .unwrap_or_else(|_| unreachable!())
+            .resume()
+            .unwrap_or_else(|_| unreachable!());
+        wait_for_marker(&root_marker);
+        let recovered =
+            RecoverableJobObject::open(running_root.evidence().recoverable_job_binding())
+                .unwrap_or_else(|_| unreachable!());
+
+        let rejected_marker = root.join("rejected");
+        let rejected = recovered
+            .spawn_member(suspended_spec(&rejected_marker, &root, false))
+            .unwrap_or_else(|_| unreachable!());
+        let rejected_pid = rejected.id();
+        let result = rejected.validate::<(), &'static str, _>(|evidence| {
+            assert!(evidence.process().start_time_100ns != 0);
+            Err("wrong-image-or-policy")
+        });
+        assert_eq!(
+            result.err(),
+            Some(SuspendedValidationError::Rejected("wrong-image-or-policy"))
+        );
+        assert!(wait_for_process_gone(rejected_pid));
+        assert!(
+            running_root
+                .active_process_count()
+                .unwrap_or_else(|_| unreachable!())
+                >= 1
+        );
+
+        let panic_marker = root.join("panic");
+        let panicking = recovered
+            .spawn_member(suspended_spec(&panic_marker, &root, false))
+            .unwrap_or_else(|_| unreachable!());
+        let panic_pid = panicking.id();
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = panicking.validate::<(), (), _>(|_| panic!("member validator panic"));
+        }));
+        assert!(panic.is_err());
+        assert!(wait_for_process_gone(panic_pid));
+        assert!(
+            running_root
+                .active_process_count()
+                .unwrap_or_else(|_| unreachable!())
+                >= 1
+        );
+        assert!(matches!(
+            running_root.observe().unwrap_or_else(|_| unreachable!()),
+            RunningJobObservation::Running { active_processes } if active_processes >= 1
+        ));
+        running_root
+            .terminate(0xE1_33)
+            .unwrap_or_else(|_| unreachable!());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn whole_job_termination_reaps_reopened_member_and_reopen_can_launch_again() {
+        let root =
+            std::env::temp_dir().join(format!("eliot-existing-job-reap-{}", unique_suffix()));
+        std::fs::create_dir(&root).unwrap_or_else(|_| unreachable!());
+        let root_marker = root.join("root");
+        let first_marker = root.join("first");
+        let second_marker = root.join("second");
+        let root_child = spawn_suspended_child(&root_marker, &root, false);
+        let running_root = root_child
+            .validate::<(), &'static str, _>(|_| Ok(()))
+            .unwrap_or_else(|_| unreachable!())
+            .resume()
+            .unwrap_or_else(|_| unreachable!());
+        wait_for_marker(&root_marker);
+        let binding = running_root.evidence().recoverable_job_binding();
+        let recovered =
+            RecoverableJobObject::open(binding.clone()).unwrap_or_else(|_| unreachable!());
+        let first = recovered
+            .spawn_member(suspended_spec(&first_marker, &root, false))
+            .unwrap_or_else(|_| unreachable!())
+            .validate::<(), &'static str, _>(|_| Ok(()))
+            .unwrap_or_else(|_| unreachable!())
+            .resume()
+            .unwrap_or_else(|_| unreachable!());
+        let first_pid = first.process().process_id;
+        wait_for_marker(&first_marker);
+        running_root
+            .terminate(0xE1_34)
+            .unwrap_or_else(|error| panic!("whole Job termination failed: {error}"));
+        assert!(wait_for_process_gone(first_pid));
+        assert!(matches!(
+            first.observe().unwrap_or_else(|_| unreachable!()),
+            ExistingJobMemberObservation::Exited {
+                active_processes: 0,
+                ..
+            }
+        ));
+
+        let root_child = spawn_suspended_child(&root_marker, &root, false);
+        let replacement_root = root_child
+            .validate::<(), &'static str, _>(|_| Ok(()))
+            .unwrap_or_else(|_| unreachable!())
+            .resume()
+            .unwrap_or_else(|_| unreachable!());
+        wait_for_marker(&root_marker);
+        let replacement_recovered =
+            RecoverableJobObject::open(replacement_root.evidence().recoverable_job_binding())
+                .unwrap_or_else(|_| unreachable!());
+        let replacement = replacement_recovered
+            .spawn_member(suspended_spec(&second_marker, &root, false))
+            .unwrap_or_else(|_| unreachable!())
+            .validate::<(), &'static str, _>(|_| Ok(()))
+            .unwrap_or_else(|_| unreachable!())
+            .resume()
+            .unwrap_or_else(|_| unreachable!());
+        wait_for_marker(&second_marker);
+        replacement
+            .terminate(0xE1_35)
+            .unwrap_or_else(|_| unreachable!());
+        replacement_root
+            .terminate(0xE1_36)
+            .unwrap_or_else(|_| unreachable!());
         let _ = std::fs::remove_dir_all(root);
     }
 }
