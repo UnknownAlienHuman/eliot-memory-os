@@ -115,8 +115,8 @@ fn validate_launch_config(config: &BrokerLaunchConfig) -> Result<(), Composition
 
 /// Loads the protected installation launch declaration and returns its retained
 /// no-follow/reparse-safe file lease to the composition owner.
-fn load_protected_launch_config(
-) -> Result<(BrokerLaunchConfig, ProtectedPathLease), CompositionError> {
+fn load_protected_launch_config()
+-> Result<(BrokerLaunchConfig, ProtectedPathLease), CompositionError> {
     #[cfg(not(windows))]
     {
         Err(CompositionError::Kernel(
