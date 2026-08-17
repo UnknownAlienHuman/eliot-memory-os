@@ -22,7 +22,7 @@ pub use lifecycle::{
 };
 pub use protocol::{
     ContainmentAction, HostKernelHandshake, HostStoreBootstrapRequirement, KernelControlCommand,
-    KernelReadyReceipt, ProcessObservation, RestartBudget,
+    KernelReadyReceipt, ProcessObservation, RestartBudget, StoreBootstrapDescriptor,
 };
 pub use store_client::{EbpCanonicalStoreClient, EbpStoreTransport, StoreClientError};
 
@@ -35,6 +35,10 @@ use thiserror::Error;
 pub const CONTRACT_NAME: &str = "eliot.kernel.service";
 /// Current wire revision for the Kernel service boundary.
 pub const CONTRACT_VERSION: ContractVersion = ContractVersion::new(1, 0, 0);
+/// Stable neutral route identity for the canonical Store bridge.
+pub const STORE_ROUTE_IDENTITY: &str = "store_bridge";
+/// Stable neutral module identity used by the Store EBP contract.
+pub const STORE_MODULE_IDENTITY: &str = "eliot-store";
 
 /// Errors produced while deriving the service contract identity.
 #[derive(Clone, Debug, Error, PartialEq, Eq)]

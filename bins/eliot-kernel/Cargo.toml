@@ -26,7 +26,6 @@ eliot-platform-windows.workspace = true
 eliot-runtime.workspace = true
 eliot-runtime-contracts.workspace = true
 eliot-store-api.workspace = true
-eliot-store-surreal = { path = "../eliot-store-surreal" }
 eliot-process.workspace = true
 serde_json.workspace = true
 sha2.workspace = true

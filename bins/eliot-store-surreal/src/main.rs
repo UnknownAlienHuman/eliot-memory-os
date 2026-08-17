@@ -18,7 +18,7 @@ use eliot_protocol::{
 };
 use eliot_store_surreal::{
     SERVICE_NAME, StoreComposition, StoreHandshakeIdentity, admit_handshake, dispatch, load_config,
-    load_portable_dev_config, validate_request_frame,
+    load_portable_dev_config, store_bootstrap_descriptor, validate_request_frame,
 };
 
 #[derive(Debug, Eq, PartialEq)]
@@ -30,6 +30,10 @@ enum LaunchMode {
         root: PathBuf,
         config_path: PathBuf,
         initialize_schema_only: bool,
+    },
+    EmitBootstrapDescriptor {
+        config_path: PathBuf,
+        output_path: PathBuf,
     },
 }
 
@@ -48,6 +52,19 @@ async fn main() {
 #[allow(clippy::print_stdout)]
 async fn run() -> Result<(), String> {
     let mode = parse_launch_mode(std::env::args_os().skip(1))?;
+    if let LaunchMode::EmitBootstrapDescriptor {
+        config_path,
+        output_path,
+    } = &mode
+    {
+        let config = load_config(Some(config_path))?;
+        let descriptor = store_bootstrap_descriptor(&config)?;
+        let bytes = serde_json::to_vec_pretty(&descriptor)
+            .map_err(|error| format!("serialize neutral bootstrap descriptor: {error}"))?;
+        std::fs::write(output_path, bytes)
+            .map_err(|error| format!("write neutral bootstrap descriptor: {error}"))?;
+        return Ok(());
+    }
     let Some(config) = prepare_launch(mode).await? else {
         return Ok(());
     };
@@ -126,6 +143,9 @@ async fn prepare_launch(
     mode: LaunchMode,
 ) -> Result<Option<eliot_store_surreal::StoreLaunchConfig>, String> {
     match mode {
+        LaunchMode::EmitBootstrapDescriptor { .. } => {
+            Err("descriptor emission must be handled before Store composition launch".to_owned())
+        }
         LaunchMode::Protected { config_path } => load_config(Some(&config_path)).map(Some),
         LaunchMode::PortableDev {
             root,
@@ -214,6 +234,7 @@ async fn run() -> Result<(), String> {
 /// Supported launch forms are deliberately closed:
 ///
 /// - `eliot-store-surreal --config <protected .json or .toml path>`
+/// - `eliot-store-surreal --emit-bootstrap-descriptor <config path> <descriptor path>`
 /// - `eliot-store-surreal --portable-dev-root <absolute existing root> --config <path>`
 /// - `eliot-store-surreal --portable-dev-root <absolute existing root> --config <path> --initialize-schema-only`
 fn parse_launch_mode<I>(args: I) -> Result<LaunchMode, String>
@@ -223,6 +244,23 @@ where
     let mut args = args.into_iter();
     match args.next() {
         None => Err("--config is required; launch config must be explicit".to_owned()),
+        Some(value) if value == "--emit-bootstrap-descriptor" => {
+            let config_path = args
+                .next()
+                .map(PathBuf::from)
+                .ok_or_else(|| "--emit-bootstrap-descriptor requires a config path".to_owned())?;
+            let output_path = args
+                .next()
+                .map(PathBuf::from)
+                .ok_or_else(|| "--emit-bootstrap-descriptor requires an output path".to_owned())?;
+            if args.next().is_some() {
+                return Err("--emit-bootstrap-descriptor requires exactly two paths".to_owned());
+            }
+            Ok(LaunchMode::EmitBootstrapDescriptor {
+                config_path,
+                output_path,
+            })
+        }
         Some(value) if value == "--config" => match args.next() {
             Some(path) if args.next().is_none() => Ok(LaunchMode::Protected {
                 config_path: PathBuf::from(path),

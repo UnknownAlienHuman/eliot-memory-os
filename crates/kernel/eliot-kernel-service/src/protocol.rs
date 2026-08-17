@@ -12,7 +12,7 @@ fn handle(value: &PlatformHandle, field: &'static str) -> Result<(), KernelServi
     validate_text(value.as_str(), field)
 }
 
-/// Host-approved canonical-store bootstrap identity.
+/// Host-approved, store-neutral canonical-store bootstrap descriptor.
 ///
 /// These values are an admission prerequisite, not caller-supplied store
 /// authority.  The Kernel/store client binds every EBP handshake and request
@@ -20,12 +20,12 @@ fn handle(value: &PlatformHandle, field: &'static str) -> Result<(), KernelServi
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct HostStoreBootstrapRequirement {
-    /// Authenticated local store pipe selected by Host.
-    pub store_pipe: PlatformHandle,
+    /// Stable Kernel route identity selected by Host.
+    pub route_identity: PlatformHandle,
+    /// Canonical authenticated local-store pipe identity selected by Host.
+    pub canonical_pipe_identity: PlatformHandle,
     /// Store module generation selected by Kernel/Host cutover.
     pub store_generation: ResourceGeneration,
-    /// Canonical schema generation expected at readiness.
-    pub schema_generation: PlatformHandle,
     /// Authority/resource fence captured for this store binding.
     pub state_fence: StateFence,
     /// Host-issued launch nonce for this store lineage.
@@ -40,13 +40,26 @@ pub struct HostStoreBootstrapRequirement {
     pub approved_artifact_hash: PlatformHandle,
     /// Host-approved store configuration digest echoed by the store handshake.
     pub approved_config_hash: PlatformHandle,
+    /// Bounded connection timeout selected by Host, in milliseconds.
+    pub timeout_ms: u64,
 }
+
+/// Store-neutral name for the Host handoff descriptor.
+pub type StoreBootstrapDescriptor = HostStoreBootstrapRequirement;
 
 impl HostStoreBootstrapRequirement {
     /// Validates the complete Host-approved store binding.
     pub fn validate(&self) -> Result<(), KernelServiceError> {
-        handle(&self.store_pipe, "store_bootstrap.store_pipe")?;
-        handle(&self.schema_generation, "store_bootstrap.schema_generation")?;
+        handle(&self.route_identity, "store_bootstrap.route_identity")?;
+        if self.route_identity.as_str() != crate::STORE_ROUTE_IDENTITY {
+            return Err(KernelServiceError::HandshakeMismatch {
+                field: "route_identity",
+            });
+        }
+        handle(
+            &self.canonical_pipe_identity,
+            "store_bootstrap.canonical_pipe_identity",
+        )?;
         handle(&self.launch_nonce, "store_bootstrap.launch_nonce")?;
         handle(&self.connection_id, "store_bootstrap.connection_id")?;
         handle(&self.expected_peer_sid, "store_bootstrap.expected_peer_sid")?;
@@ -90,7 +103,13 @@ impl HostStoreBootstrapRequirement {
                 field: "store_generation",
             });
         }
-        eliot_ipc::validate_pipe_name(self.store_pipe.as_str())
+        if self.timeout_ms == 0 || self.timeout_ms > 300_000 {
+            return Err(KernelServiceError::InvalidField {
+                field: "store_bootstrap.timeout_ms",
+                reason: "must be between 1 and 300000 milliseconds",
+            });
+        }
+        eliot_ipc::validate_pipe_name(self.canonical_pipe_identity.as_str())
             .map_err(|error| KernelServiceError::Platform(error.to_string()))?;
         Ok(())
     }
@@ -99,6 +118,12 @@ impl HostStoreBootstrapRequirement {
     #[must_use]
     pub const fn authority_epoch(&self) -> AuthorityEpoch {
         self.state_fence.authority_epoch
+    }
+
+    /// Returns the Host-approved bounded connection timeout.
+    #[must_use]
+    pub const fn timeout_ms(&self) -> u64 {
+        self.timeout_ms
     }
 }
 
@@ -351,9 +376,9 @@ mod tests {
     fn requirement() -> HostStoreBootstrapRequirement {
         let fence = StateFence::new(AuthorityEpoch::genesis(), ResourceGeneration::genesis());
         HostStoreBootstrapRequirement {
-            store_pipe: handle_value(r"\\.\pipe\eliot\store"),
+            route_identity: handle_value(crate::STORE_ROUTE_IDENTITY),
+            canonical_pipe_identity: handle_value(r"\\.\pipe\eliot\store"),
             store_generation: ResourceGeneration::genesis(),
-            schema_generation: handle_value("1.0.0"),
             state_fence: fence,
             launch_nonce: handle_value("nonce-1"),
             connection_id: handle_value("connection-1"),
@@ -361,6 +386,7 @@ mod tests {
             expected_peer_session_id: 0,
             approved_artifact_hash: handle_value(&"a".repeat(64)),
             approved_config_hash: handle_value(&"b".repeat(64)),
+            timeout_ms: 5_000,
         }
     }
 

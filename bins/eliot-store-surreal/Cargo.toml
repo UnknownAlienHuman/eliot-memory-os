@@ -16,6 +16,7 @@ path = "src/main.rs"
 [dependencies]
 eliot-blob.workspace = true
 eliot-contracts.workspace = true
+eliot-kernel-service.workspace = true
 eliot-ipc.workspace = true
 eliot-platform.workspace = true
 eliot-platform-windows.workspace = true

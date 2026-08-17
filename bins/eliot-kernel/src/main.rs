@@ -3,14 +3,11 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use eliot_contracts::{AuthorityEpoch, ResourceGeneration, StateFence};
 use eliot_kernel::{
     KernelBuildError, KernelComposition, KernelConfig, PROTOCOL_VERSION, SERVICE_NAME,
     default_work_root,
 };
 use eliot_kernel_service::HostStoreBootstrapRequirement;
-use eliot_platform::PlatformHandle;
-use eliot_store_surreal::{StoreLaunchConfig, load_config};
 
 #[cfg(windows)]
 const MAX_SESSIONS: usize = 32;
@@ -53,7 +50,7 @@ async fn main() {
     {
         if let Some(prepared) = prepared_store
             && let Err(error) = kernel
-                .connect_canonical_store(prepared.connect_timeout)
+                .connect_canonical_store(Duration::from_millis(prepared.requirement.timeout_ms()))
                 .await
         {
             exit_build_error(&error);
@@ -267,8 +264,7 @@ async fn send_checked(
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum StoreConfigLocator {
-    Protected(PathBuf),
-    PortableDev { root: PathBuf, path: PathBuf },
+    NeutralDescriptor(PathBuf),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -279,7 +275,6 @@ struct KernelLaunchOptions {
 
 struct PreparedStoreBootstrap {
     requirement: HostStoreBootstrapRequirement,
-    connect_timeout: Duration,
 }
 
 fn parse_launch_options<I>(args: I) -> Result<KernelLaunchOptions, std::io::Error>
@@ -296,42 +291,18 @@ where
             work_root: canonical_directory(work_root)?,
             store_config: None,
         }),
-        [work_flag, work_root, store_flag, store_config]
-            if work_flag == "--work-root" && store_flag == "--store-config" =>
+        [work_flag, work_root, store_flag, descriptor]
+            if work_flag == "--work-root" && store_flag == "--store-bootstrap" =>
         {
             Ok(KernelLaunchOptions {
                 work_root: canonical_directory(work_root)?,
-                store_config: Some(StoreConfigLocator::Protected(PathBuf::from(store_config))),
-            })
-        }
-        [
-            portable_flag,
-            portable_root,
-            work_flag,
-            work_root,
-            store_flag,
-            store_config,
-        ] if portable_flag == "--portable-dev-root"
-            && work_flag == "--work-root"
-            && store_flag == "--store-config" =>
-        {
-            let portable_root = canonical_directory(portable_root)?;
-            let work_root = canonical_directory(work_root)?;
-            if !work_root.starts_with(&portable_root) {
-                return Err(invalid_input(
-                    "portable-dev work root must remain under --portable-dev-root",
-                ));
-            }
-            Ok(KernelLaunchOptions {
-                work_root,
-                store_config: Some(StoreConfigLocator::PortableDev {
-                    root: portable_root,
-                    path: PathBuf::from(store_config),
-                }),
+                store_config: Some(StoreConfigLocator::NeutralDescriptor(PathBuf::from(
+                    descriptor,
+                ))),
             })
         }
         _ => Err(invalid_input(
-            "expected no args, --work-root <path>, --work-root <path> --store-config <path>, or --portable-dev-root <root> --work-root <path> --store-config <path>",
+            "expected no args, --work-root <path>, or --work-root <path> --store-bootstrap <validated descriptor path>",
         )),
     }
 }
@@ -357,53 +328,15 @@ fn prepare_store_bootstrap(
     let Some(locator) = &options.store_config else {
         return Ok(None);
     };
-    let config = match locator {
-        StoreConfigLocator::Protected(path) => load_config(Some(path))?,
-        StoreConfigLocator::PortableDev { root, path } => {
-            let root = eliot_platform_windows::UserOwnedRootLease::open_existing(root)
-                .map_err(|error| format!("open portable-dev root: {error}"))?;
-            eliot_store_surreal::load_portable_dev_config(&root, path)?
-        }
-    };
-    let connect_timeout = Duration::from_millis(config.connect_timeout_ms);
-    let requirement = store_bootstrap_requirement(&config)?;
-    Ok(Some(PreparedStoreBootstrap {
-        requirement,
-        connect_timeout,
-    }))
-}
-
-fn store_bootstrap_requirement(
-    config: &StoreLaunchConfig,
-) -> Result<HostStoreBootstrapRequirement, String> {
-    config.validate()?;
-    let authority_epoch = AuthorityEpoch::new(config.authority_epoch)
-        .map_err(|error| format!("invalid Store authority epoch: {error}"))?;
-    let store_generation = ResourceGeneration::new(config.store_generation)
-        .map_err(|error| format!("invalid Store generation: {error}"))?;
-    let connection_id = format!(
-        "kernel-store:{}:{}",
-        config.instance_id, config.launch_nonce
-    );
-    Ok(HostStoreBootstrapRequirement {
-        store_pipe: platform_handle(&config.store_pipe, "store pipe")?,
-        store_generation,
-        schema_generation: platform_handle(&config.schema_generation, "schema generation")?,
-        state_fence: StateFence::new(authority_epoch, store_generation),
-        launch_nonce: platform_handle(&config.launch_nonce, "launch nonce")?,
-        connection_id: platform_handle(&connection_id, "connection id")?,
-        expected_peer_sid: platform_handle(&config.expected_client_sid, "Store peer SID")?,
-        expected_peer_session_id: config.expected_client_session_id,
-        approved_artifact_hash: platform_handle(
-            &config.approved_artifact_hash,
-            "Store artifact digest",
-        )?,
-        approved_config_hash: platform_handle(&config.approved_config_hash, "Store config digest")?,
-    })
-}
-
-fn platform_handle(value: &str, field: &str) -> Result<PlatformHandle, String> {
-    PlatformHandle::new(value).map_err(|error| format!("invalid {field}: {error}"))
+    let StoreConfigLocator::NeutralDescriptor(path) = locator;
+    let bytes = std::fs::read(path)
+        .map_err(|error| format!("read neutral store bootstrap descriptor: {error}"))?;
+    let requirement: HostStoreBootstrapRequirement = serde_json::from_slice(&bytes)
+        .map_err(|error| format!("parse neutral store bootstrap descriptor: {error}"))?;
+    requirement
+        .validate()
+        .map_err(|error| format!("validate neutral store bootstrap descriptor: {error}"))?;
+    Ok(Some(PreparedStoreBootstrap { requirement }))
 }
 
 fn ready_line(kernel: &KernelComposition, store_is_configured: bool) -> String {
@@ -443,8 +376,6 @@ fn write_line(line: &str) -> bool {
 #[allow(clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
-    use eliot_store_surreal::launch_config_digest;
-
     struct TempRoot(PathBuf);
 
     impl TempRoot {
@@ -468,83 +399,68 @@ mod tests {
         }
     }
 
-    fn store_config() -> StoreLaunchConfig {
-        let mut config = StoreLaunchConfig {
-            store_pipe: r"\\.\pipe\eliot\store-kernel-main-test".to_owned(),
-            launch_nonce: "kernel-main-test".to_owned(),
-            expected_client_sid: "S-1-5-18".to_owned(),
-            expected_client_session_id: 0,
-            approved_artifact_hash: "a".repeat(64),
-            approved_config_hash: String::new(),
-            store_generation: 9,
-            authority_epoch: 7,
-            endpoint: "ws://127.0.0.1:8000".to_owned(),
-            namespace: "eliot".to_owned(),
-            database: "eliot".to_owned(),
-            username: "store".to_owned(),
-            connect_timeout_ms: 5_000,
-            query_timeout_ms: 5_000,
-            schema_generation: "1.0.0".to_owned(),
-            blob_root: r"C:\Eliot\blob".to_owned(),
-            instance_id: "kernel-main-test".to_owned(),
-            credential_ref: "eliot/store".to_owned(),
-        };
-        config.approved_config_hash = launch_config_digest(&config).expect("config digest");
-        config
+    fn descriptor() -> HostStoreBootstrapRequirement {
+        use eliot_contracts::{AuthorityEpoch, ResourceGeneration, StateFence};
+        use eliot_platform::PlatformHandle;
+        let generation = ResourceGeneration::new(9).expect("generation");
+        HostStoreBootstrapRequirement {
+            route_identity: PlatformHandle::new("store_bridge").expect("route"),
+            canonical_pipe_identity: PlatformHandle::new(r"\\.\pipe\eliot\store-kernel-main-test")
+                .expect("pipe"),
+            store_generation: generation,
+            state_fence: StateFence::new(AuthorityEpoch::new(7).expect("epoch"), generation),
+            launch_nonce: PlatformHandle::new("kernel-main-test").expect("nonce"),
+            connection_id: PlatformHandle::new("kernel-store:kernel-main-test")
+                .expect("connection"),
+            expected_peer_sid: PlatformHandle::new("S-1-5-18").expect("sid"),
+            expected_peer_session_id: 0,
+            approved_artifact_hash: PlatformHandle::new("a".repeat(64)).expect("artifact"),
+            approved_config_hash: PlatformHandle::new("b".repeat(64)).expect("config"),
+            timeout_ms: 5_000,
+        }
     }
 
     #[test]
-    fn portable_dev_args_bind_work_and_config_to_explicit_root() {
+    fn neutral_descriptor_args_bind_only_a_validated_descriptor() {
         let root = TempRoot::new();
         let work = root.0.join("work");
-        let config = root.0.join("store.json");
+        let descriptor_path = root.0.join("store-bootstrap.json");
+        std::fs::write(
+            &descriptor_path,
+            serde_json::to_vec(&descriptor()).expect("descriptor JSON"),
+        )
+        .expect("descriptor file");
         let options = parse_launch_options([
-            "--portable-dev-root".into(),
-            root.0.clone().into_os_string(),
             "--work-root".into(),
             work.clone().into_os_string(),
-            "--store-config".into(),
-            config.clone().into_os_string(),
+            "--store-bootstrap".into(),
+            descriptor_path.clone().into_os_string(),
         ])
-        .expect("portable args");
+        .expect("neutral args");
         assert_eq!(
             options.work_root,
             std::fs::canonicalize(work).expect("work")
         );
         assert_eq!(
             options.store_config,
-            Some(StoreConfigLocator::PortableDev {
-                root: std::fs::canonicalize(&root.0).expect("root"),
-                path: config,
-            })
+            Some(StoreConfigLocator::NeutralDescriptor(descriptor_path))
         );
+        let prepared = prepare_store_bootstrap(&options)
+            .expect("prepare descriptor")
+            .expect("descriptor present");
+        assert_eq!(prepared.requirement.authority_epoch().value(), 7);
+        assert_eq!(prepared.requirement.store_generation.value(), 9);
     }
 
     #[test]
-    fn portable_dev_args_reject_work_root_outside_contour() {
+    fn descriptor_args_reject_concrete_store_config_flag() {
         let root = TempRoot::new();
-        let outside = TempRoot::new();
         let result = parse_launch_options([
-            "--portable-dev-root".into(),
-            root.0.clone().into_os_string(),
             "--work-root".into(),
-            outside.0.join("work").into_os_string(),
+            root.0.join("work").into_os_string(),
             "--store-config".into(),
             root.0.join("store.json").into_os_string(),
         ]);
         assert!(result.is_err());
-    }
-
-    #[test]
-    fn store_bootstrap_uses_non_genesis_config_fence() {
-        let config = store_config();
-        let requirement = store_bootstrap_requirement(&config).expect("bootstrap requirement");
-        assert_eq!(requirement.authority_epoch().value(), 7);
-        assert_eq!(requirement.store_generation.value(), 9);
-        assert_eq!(requirement.state_fence.resource_generation.value(), 9);
-        assert_eq!(
-            requirement.approved_config_hash.as_str(),
-            config.approved_config_hash
-        );
     }
 }

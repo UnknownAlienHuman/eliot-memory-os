@@ -12,8 +12,12 @@ use std::collections::BTreeSet;
 use std::path::Path;
 
 use eliot_blob::BlobRootOwner;
+use eliot_contracts::{AuthorityEpoch, ResourceGeneration, StateFence};
 use eliot_ipc::{ReplayDisposition, ReplayLedger, TransportLimits};
-use eliot_platform::ClockObservation;
+use eliot_kernel_service::{
+    HostStoreBootstrapRequirement, STORE_MODULE_IDENTITY, STORE_ROUTE_IDENTITY,
+};
+use eliot_platform::{ClockObservation, PlatformHandle};
 use eliot_platform_windows::{
     NamedPipePeerExpectation, UserOwnedPathLease, UserOwnedRootLease, WindowsPlatform,
     read_protected_file,
@@ -25,8 +29,8 @@ use eliot_protocol::{
 use eliot_store_api::{
     CAPABILITIES, CanonicalStoreClient, EFFECTS, NamedReadRequest, NamedReadResponse, OperationId,
     OrderingHead, OrderingHeadExpectation, OrderingScopeId, PreparedTransition, RequestMeta,
-    RevisionHead, RevisionHeadExpectation, RevisionKey, StateFence, StoreError, StoreHealth,
-    WriteReceipt, decode_request_frame,
+    RevisionHead, RevisionHeadExpectation, RevisionKey, StoreError, StoreHealth, WriteReceipt,
+    decode_request_frame,
 };
 pub use eliot_store_api::{ReadinessReceipt, StoreRequest as Request, StoreResponse as Response};
 use eliot_store_surreal_adapter::{
@@ -150,6 +154,42 @@ impl StoreLaunchConfig {
         }
         Ok(())
     }
+}
+
+/// Constructs the exact store-neutral bootstrap descriptor consumed by
+/// Kernel from this boundary's already-validated concrete launch config.
+///
+/// Concrete endpoint, namespace, database, credential and Blob fields never
+/// cross this seam. The descriptor binds only the route/fence, authenticated
+/// pipe peer, approved digests, launch identity and bounded timeout.
+pub fn store_bootstrap_descriptor(
+    config: &StoreLaunchConfig,
+) -> Result<HostStoreBootstrapRequirement, String> {
+    config.validate()?;
+    let authority_epoch = AuthorityEpoch::new(config.authority_epoch)
+        .map_err(|error| format!("invalid Store authority epoch: {error}"))?;
+    let store_generation = ResourceGeneration::new(config.store_generation)
+        .map_err(|error| format!("invalid Store generation: {error}"))?;
+    let handle = |value: &str, field: &str| {
+        PlatformHandle::new(value).map_err(|error| format!("invalid {field}: {error}"))
+    };
+    let connection_id = format!(
+        "kernel-store:{}:{}",
+        config.instance_id, config.launch_nonce
+    );
+    Ok(HostStoreBootstrapRequirement {
+        route_identity: handle(STORE_ROUTE_IDENTITY, "route identity")?,
+        canonical_pipe_identity: handle(&config.store_pipe, "canonical pipe identity")?,
+        store_generation,
+        state_fence: StateFence::new(authority_epoch, store_generation),
+        launch_nonce: handle(&config.launch_nonce, "launch nonce")?,
+        connection_id: handle(&connection_id, "connection identity")?,
+        expected_peer_sid: handle(&config.expected_client_sid, "Store peer SID")?,
+        expected_peer_session_id: config.expected_client_session_id,
+        approved_artifact_hash: handle(&config.approved_artifact_hash, "Store artifact digest")?,
+        approved_config_hash: handle(&config.approved_config_hash, "Store config digest")?,
+        timeout_ms: config.connect_timeout_ms,
+    })
 }
 
 /// Computes the Host-approved digest over every operational launch field.
@@ -463,9 +503,9 @@ pub fn admit_handshake(
     hello
         .validate()
         .map_err(|error| format!("validate ClientHello: {error}"))?;
-    if hello.module_bridge_identity != SERVICE_NAME {
+    if hello.module_bridge_identity != STORE_MODULE_IDENTITY {
         return Err(format!(
-            "ClientHello module_bridge_identity must be {SERVICE_NAME}"
+            "ClientHello module_bridge_identity must be {STORE_MODULE_IDENTITY}"
         ));
     }
     let state_fence = &hello.module_generation.state_fence;
@@ -787,6 +827,31 @@ mod tests {
     }
 
     #[test]
+    fn neutral_descriptor_excludes_concrete_provider_configuration() {
+        let config = config();
+        let descriptor = store_bootstrap_descriptor(&config).expect("neutral descriptor");
+        descriptor.validate().expect("descriptor validates");
+        assert_eq!(descriptor.route_identity.as_str(), STORE_ROUTE_IDENTITY);
+        assert_eq!(
+            descriptor.canonical_pipe_identity.as_str(),
+            config.store_pipe
+        );
+        assert_eq!(descriptor.timeout_ms, config.connect_timeout_ms);
+        let encoded = serde_json::to_value(&descriptor).expect("descriptor JSON");
+        for forbidden in [
+            "endpoint",
+            "namespace",
+            "database",
+            "username",
+            "credential_ref",
+            "blob_root",
+            "schema_generation",
+        ] {
+            assert!(encoded.get(forbidden).is_none(), "leaked {forbidden}");
+        }
+    }
+
+    #[test]
     fn bounded_config_parser_supports_json_and_rejects_other_extensions() {
         let config = config();
         let json = serde_json::to_vec(&config).expect("JSON config");
@@ -810,7 +875,7 @@ mod tests {
     }
 
     fn client_hello_frame(config: &StoreLaunchConfig) -> Frame {
-        let module_id = ContractId::new(SERVICE_NAME).expect("module id");
+        let module_id = ContractId::new(STORE_MODULE_IDENTITY).expect("module id");
         let artifact_id =
             ArtifactId::new(config.approved_artifact_hash.as_str()).expect("artifact");
         let authority_epoch = AuthorityEpoch::new(config.authority_epoch).expect("epoch");
@@ -820,7 +885,7 @@ mod tests {
                 minimum: ProtocolVersion::CURRENT,
                 maximum: ProtocolVersion::CURRENT,
             },
-            module_bridge_identity: SERVICE_NAME.to_owned(),
+            module_bridge_identity: STORE_MODULE_IDENTITY.to_owned(),
             artifact_hash: artifact_id.clone(),
             module_contract: ModuleContract {
                 module_id: module_id.clone(),
