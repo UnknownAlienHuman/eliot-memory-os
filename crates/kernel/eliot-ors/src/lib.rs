@@ -19,6 +19,8 @@ pub use store::{
 pub const CONTRACT_VERSION: u16 = 1;
 /// Hard ceiling for one recovery page.
 pub const MAX_RECOVERY_PAGE: u16 = 256;
+/// Hard ceiling for one operation's retained process-evidence history.
+pub const MAX_PROCESS_EVIDENCE_READBACK: u16 = 256;
 /// Hard ceiling for ciphertext held inline by one ORS record.
 pub const MAX_INLINE_RECOVERY_BYTES: u64 = 4 * 1024 * 1024;
 /// Hard ceiling for one detached inbox signature.

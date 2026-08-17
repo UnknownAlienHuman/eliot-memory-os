@@ -144,12 +144,22 @@ impl ProcessAuthorityHandoffDescriptor {
                 reason: "descriptor is expired or has invalid bounds",
             });
         }
-        if self.state_fence.authority_epoch.value()
-            != self.snapshot_binding.state_fence.observed_authority_epoch
-            || self.state_fence.resource_generation != self.generation
+        self.state_fence
+            .validate()
+            .map_err(|_| KernelServiceError::HandshakeMismatch {
+                field: "state_fence",
+            })?;
+        let exact_epoch = self.state_fence.authority_epoch.value();
+        let exact_state_fence =
+            eliot_ors::StateFenceSnapshot::capture(&self.state_fence, exact_epoch).map_err(
+                |_| KernelServiceError::HandshakeMismatch {
+                    field: "state_fence",
+                },
+            )?;
+        if self.state_fence.resource_generation != self.generation
             || self.snapshot_binding.authority_id != self.authority_id
-            || self.snapshot_binding.state_fence.observed_authority_epoch
-                != self.snapshot_binding.authority_epoch.current.epoch
+            || self.snapshot_binding.authority_epoch.current.epoch != exact_epoch
+            || self.snapshot_binding.state_fence != exact_state_fence
         {
             return Err(KernelServiceError::HandshakeMismatch {
                 field: "authority_binding",
@@ -182,7 +192,7 @@ mod descriptor_tests {
     #![allow(clippy::expect_used, clippy::unwrap_used)]
 
     use super::*;
-    use eliot_contracts::{AuthorityEpoch, ResourceGeneration, StateFence};
+    use eliot_contracts::{AuthorityEpoch, ResourceGeneration, StateFence, TaskRevision};
     use eliot_ors::{
         EpochIdentity, EpochLineage, OpaqueLabel, OperationIdentity, StateFenceSnapshot,
     };
@@ -197,8 +207,9 @@ mod descriptor_tests {
             },
             predecessor: None,
         };
+        let state_fence = StateFence::new(AuthorityEpoch::genesis(), ResourceGeneration::genesis());
         let snapshot_fence =
-            StateFenceSnapshot::capture(&serde_json::json!({"resource_generation": 1}), 1)
+            StateFenceSnapshot::capture(&state_fence, state_fence.authority_epoch.value())
                 .expect("snapshot fence");
         let binding = AuthoritySnapshotBindingWire {
             authority_id: authority_id.clone(),
@@ -214,7 +225,7 @@ mod descriptor_tests {
             handoff_nonce: PlatformHandle::new("nonce-1").expect("nonce"),
             authority_id,
             snapshot_binding: binding,
-            state_fence: StateFence::new(AuthorityEpoch::genesis(), ResourceGeneration::genesis()),
+            state_fence,
             generation: ResourceGeneration::genesis(),
             revision_policy_binding: PlatformHandle::new("policy-1").expect("policy"),
             dispatch_key: SecretReference::new("windows-credential-manager", "dispatch-key-1")
@@ -297,6 +308,14 @@ mod descriptor_tests {
         let mut broken_fence = descriptor.snapshot_binding;
         broken_fence.state_fence.sha256 = "00".repeat(32);
         assert!(broken_fence.validate().is_err());
+    }
+
+    #[test]
+    fn descriptor_rejects_same_epoch_and_generation_with_different_fence_content() {
+        let mut descriptor = descriptor();
+        descriptor.state_fence.task_revision = Some(TaskRevision::new(2).expect("task revision"));
+        descriptor = descriptor.with_computed_digest().expect("digest");
+        assert!(descriptor.validate(500).is_err());
     }
 }
 

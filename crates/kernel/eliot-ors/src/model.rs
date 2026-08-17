@@ -240,6 +240,17 @@ pub struct ProcessEvidenceRecord {
     pub evidence: eliot_process::ProcessEvidence,
 }
 
+#[derive(Serialize)]
+struct ProcessEvidenceRecordIdentity<'a> {
+    operation_id: &'a str,
+    process_tree_id: &'a str,
+    job_id: &'a str,
+    image_id: &'a str,
+    session_id: &'a str,
+    evidence_digest: &'a str,
+    observed_at_ms: i64,
+}
+
 impl ProcessEvidenceRecord {
     pub fn from_evidence(
         evidence: eliot_process::ProcessEvidence,
@@ -274,6 +285,27 @@ impl ProcessEvidenceRecord {
         Ok(record)
     }
 
+    /// Returns the canonical immutable key for this one observation.
+    pub fn record_key(&self) -> Result<String, OrsError> {
+        self.validate()?;
+        let identity = ProcessEvidenceRecordIdentity {
+            operation_id: self.operation_id.as_str(),
+            process_tree_id: self.process_tree_id.as_str(),
+            job_id: self.job_id.as_str(),
+            image_id: self.image_id.as_str(),
+            session_id: self.session_id.as_str(),
+            evidence_digest: &self.evidence_digest,
+            observed_at_ms: self.observed_at_ms,
+        };
+        let identity_bytes =
+            serde_json::to_vec(&identity).map_err(|error| OrsError::Encoding(error.to_string()))?;
+        Ok(format!(
+            "{}::{:}",
+            self.operation_id.as_str(),
+            sha256_hex(&identity_bytes)
+        ))
+    }
+
     pub(crate) fn validate(&self) -> Result<(), OrsError> {
         if self.contract_version != CONTRACT_VERSION {
             return Err(OrsError::UnsupportedContractVersion(self.contract_version));
@@ -298,6 +330,18 @@ impl ProcessEvidenceRecord {
             return Err(OrsError::InvalidField {
                 field: "process_evidence_identity",
                 reason: "epoch, generation, and observation time must be positive",
+            });
+        }
+        let axes = self.evidence.axes();
+        let axes =
+            serde_json::to_value(axes).map_err(|error| OrsError::Encoding(error.to_string()))?;
+        if axes.get("status").and_then(Value::as_str) != Some("OBSERVED")
+            || axes.get("assertability").and_then(Value::as_str)
+                != Some("NON_ASSERTABLE_UNVERIFIED")
+        {
+            return Err(OrsError::IntegrityProblem {
+                record_type: "process_evidence",
+                reason: "process evidence is not observation-only C0 evidence".to_owned(),
             });
         }
         let owner = eliot_process::ProcessOwnerBinding::new(

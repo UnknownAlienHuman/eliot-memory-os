@@ -393,8 +393,11 @@ impl ProcessDispatchAuthorityController {
         })?;
         let record = recovered.snapshot().record();
         if record.subject_id != subject
+            || record.record_id != *binding.record_id()
             || record.authority_epoch != *binding.authority_epoch()
             || record.state_fence != *binding.state_fence()
+            || record.created_at_ms != binding.created_at_ms()
+            || record.cleanup_after_ms != binding.cleanup_after_ms()
         {
             return Err(KernelError::FenceMismatch);
         }

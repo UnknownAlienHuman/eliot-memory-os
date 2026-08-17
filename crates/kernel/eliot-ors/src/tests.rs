@@ -419,6 +419,7 @@ fn process_start_replay_has_one_atomic_winner_and_rejects_substitution() -> Test
     let mut unknown = record.clone();
     unknown.state = ProcessStartReplayState::Unknown;
     store.persist_process_start(&unknown)?;
+    store.persist_process_start(&unknown)?;
     assert_eq!(
         store
             .load_process_start(&operation_id)?
@@ -427,6 +428,32 @@ fn process_start_replay_has_one_atomic_winner_and_rejects_substitution() -> Test
         ProcessStartReplayState::Unknown
     );
     assert!(store.persist_process_start(&record).is_err());
+
+    let completed_id = OperationIdentity::new("process-replay-completed")?;
+    let completed_receipt = process_start_receipt(completed_id.as_str(), &"55".repeat(32))?;
+    let completed_reservation = ProcessStartReplayRecord {
+        operation_id: completed_id.clone(),
+        admission_digest: record.admission_digest.clone(),
+        owner: record.owner.clone(),
+        state: ProcessStartReplayState::Reserved,
+        receipt: None,
+    };
+    let completed = ProcessStartReplayRecord {
+        state: ProcessStartReplayState::Completed,
+        receipt: Some(completed_receipt.clone()),
+        ..completed_reservation.clone()
+    };
+    store.begin_process_start(&completed_reservation)?;
+    store.persist_process_start(&completed)?;
+    store.persist_process_start(&completed)?;
+    let mut replacement_receipt = serde_json::to_value(completed_receipt)?;
+    replacement_receipt["binding"]["permit_digest"] = json!("66".repeat(32));
+    let conflicting_completed = ProcessStartReplayRecord {
+        receipt: Some(serde_json::from_value(replacement_receipt)?),
+        ..completed
+    };
+    assert!(store.persist_process_start(&conflicting_completed).is_err());
+
     drop(store);
     let reopened = RedbRecoveryStore::open(&path)?;
     assert_eq!(
@@ -436,6 +463,11 @@ fn process_start_replay_has_one_atomic_winner_and_rejects_substitution() -> Test
             .state,
         ProcessStartReplayState::Unknown
     );
+    let mut corrupted = record;
+    corrupted.state = ProcessStartReplayState::Completed;
+    corrupted.receipt = None;
+    reopened.write_process_start_raw_for_test(&corrupted)?;
+    assert!(reopened.load_process_start(&operation_id).is_err());
     cleanup(&path);
     Ok(())
 }
@@ -460,6 +492,166 @@ fn handoff_record(state: AuthorityHandoffState) -> Result<AuthorityHandoffRecord
             .then(|| OpaqueLabel::new("manual-reconciliation-required"))
             .transpose()?,
     })
+}
+
+fn process_evidence(
+    operation_id: &str,
+    lifecycle: &str,
+) -> TestResult<eliot_process::ProcessEvidence> {
+    Ok(serde_json::from_value(json!({
+        "view": {
+            "binding": {
+                "operation_id": operation_id,
+                "process_tree_id": "tree-1",
+                "job_id": "job-1",
+                "image_id": "image-1",
+                "session_id": "session-1",
+                "generation": 1,
+                "action_lease_ref": "lease-1",
+                "authority_id": "authority-1",
+                "authority_epoch": 1,
+                "state_fence": {
+                    "authority_epoch": 1,
+                    "generation": 1,
+                    "nonce": "fence-1"
+                },
+                "request_digest": "11".repeat(32),
+                "permit_digest": "22".repeat(32),
+                "effect_digest": "33".repeat(32),
+                "validation_revision": 1
+            },
+            "lifecycle": lifecycle,
+            "health": {
+                "status": "healthy",
+                "ready": false,
+                "observed_at_unix_ms": 1,
+                "detail": null
+            },
+            "cancellation": "not_requested",
+            "identity": null,
+            "exit": null,
+            "descendants": null
+        },
+        "stdout_ref": null,
+        "stderr_ref": null,
+        "axes": {
+            "status": "OBSERVED",
+            "assertability": "NON_ASSERTABLE_UNVERIFIED",
+            "accessibility": "AVAILABLE",
+            "influence": "ALLOWED",
+            "physical": "PRESENT",
+            "taint": "CLEAR"
+        }
+    }))?)
+}
+
+fn process_evidence_record(
+    operation_id: &str,
+    lifecycle: &str,
+    observed_at_ms: i64,
+) -> TestResult<ProcessEvidenceRecord> {
+    let owner = eliot_process::ProcessOwnerBinding::new(
+        "testd",
+        "aa".repeat(32),
+        1,
+        eliot_process::Generation::new(1)?,
+    )?;
+    Ok(ProcessEvidenceRecord::from_evidence(
+        process_evidence(operation_id, lifecycle)?,
+        owner,
+        observed_at_ms,
+    )?)
+}
+
+fn process_start_receipt(
+    operation_id: &str,
+    permit_digest: &str,
+) -> TestResult<eliot_process::ProcessStartReceipt> {
+    Ok(serde_json::from_value(json!({
+        "binding": {
+            "operation_id": operation_id,
+            "process_tree_id": "tree-1",
+            "job_id": "job-1",
+            "image_id": "image-1",
+            "session_id": "session-1",
+            "generation": 1,
+            "action_lease_ref": "lease-1",
+            "authority_id": "authority-1",
+            "authority_epoch": 1,
+            "state_fence": {
+                "authority_epoch": 1,
+                "generation": 1,
+                "nonce": "fence-1"
+            },
+            "request_digest": "11".repeat(32),
+            "permit_digest": permit_digest,
+            "effect_digest": "33".repeat(32),
+            "validation_revision": 1
+        },
+        "identity": {
+            "suspended": {
+                "process_id": "process-1",
+                "process_tree_id": "tree-1",
+                "job_id": "job-1",
+                "image_id": "image-1",
+                "session_id": "session-1",
+                "generation": 1,
+                "pid": 1,
+                "created_suspended_at_unix_ms": 1,
+                "executable_sha256": "aa".repeat(32)
+            },
+            "resumed_at_unix_ms": 2
+        },
+        "lifecycle": "running"
+    }))?)
+}
+
+#[test]
+fn process_evidence_appends_history_idempotently_and_recovers_in_order() -> TestResult {
+    let path = database_path("process-evidence-history");
+    let store = RedbRecoveryStore::open(&path)?;
+    let operation_id = OperationIdentity::new("process-evidence-operation")?;
+    let first = process_evidence_record(operation_id.as_str(), "running", 100)?;
+    let second = process_evidence_record(operation_id.as_str(), "exited", 200)?;
+
+    assert_ne!(first.record_key()?, second.record_key()?);
+    store.persist_process_evidence(&first)?;
+    store.persist_process_evidence(&second)?;
+    store.persist_process_evidence(&first)?;
+    assert_eq!(
+        store.load_process_evidence(&operation_id)?,
+        vec![first.clone(), second.clone()]
+    );
+
+    let mut conflicting = first.clone();
+    conflicting.request_digest = "44".repeat(32);
+    assert!(matches!(
+        store.persist_process_evidence(&conflicting),
+        Err(OrsError::IntegrityProblem { .. })
+    ));
+    let mut mismatched = first.clone();
+    mismatched.operation_id = OperationIdentity::new("other-operation")?;
+    assert!(matches!(
+        store.persist_process_evidence(&mismatched),
+        Err(OrsError::IntegrityProblem { .. })
+    ));
+    let mut escalated = first.clone();
+    let mut escalated_wire = serde_json::to_value(&escalated.evidence)?;
+    escalated_wire["axes"]["status"] = json!("VERIFIED");
+    escalated.evidence = serde_json::from_value(escalated_wire)?;
+    assert!(matches!(
+        store.persist_process_evidence(&escalated),
+        Err(OrsError::IntegrityProblem { .. })
+    ));
+
+    drop(store);
+    let reopened = RedbRecoveryStore::open(&path)?;
+    assert_eq!(
+        reopened.load_process_evidence(&operation_id)?,
+        vec![first, second]
+    );
+    cleanup(&path);
+    Ok(())
 }
 
 #[test]

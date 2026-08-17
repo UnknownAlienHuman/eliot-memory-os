@@ -2346,6 +2346,43 @@ mod tests {
             )
             .expect("production authority snapshot seed");
         drop(seeder);
+
+        let subject = OperationIdentity::new(authority_id.as_str()).expect("authority subject");
+        let original_input = store
+            .load_authority_snapshot(&subject)
+            .expect("load seeded authority snapshot")
+            .expect("seeded authority snapshot")
+            .snapshot()
+            .record()
+            .clone();
+        for substitution in 0..3 {
+            let mut tampered = original_input.clone();
+            match substitution {
+                0 => {
+                    tampered.record_id =
+                        OperationIdentity::new("substituted-record").expect("record");
+                }
+                1 => tampered.created_at_ms += 1,
+                2 => tampered.cleanup_after_ms = Some(3_000),
+                _ => unreachable!(),
+            }
+            store
+                .replace_authority_snapshot_record_for_test(tampered)
+                .expect("persist metadata substitution");
+            assert!(
+                ProcessDispatchAuthorityController::restore(
+                    authority_id.clone(),
+                    KernelDispatchKey::from_secret_bytes([0x4a; 32]).expect("restore key"),
+                    store.clone(),
+                    Arc::clone(&codec),
+                    &binding,
+                )
+                .is_err()
+            );
+            store
+                .replace_authority_snapshot_record_for_test(original_input.clone())
+                .expect("restore original metadata");
+        }
         drop(store);
 
         let kernel = KernelComposition::new_with_process_authority(

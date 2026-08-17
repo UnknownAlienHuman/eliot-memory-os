@@ -355,6 +355,44 @@ pub struct RedbRecoveryStore {
 }
 
 impl RedbRecoveryStore {
+    #[cfg(test)]
+    pub(crate) fn write_process_start_raw_for_test(
+        &self,
+        record: &ProcessStartReplayRecord,
+    ) -> Result<(), OrsError> {
+        let write = self.database.begin_write().map_err(storage)?;
+        {
+            let mut table = write.open_table(PROCESS_START_REPLAY).map_err(storage)?;
+            let payload = encode(record)?;
+            table
+                .insert(record.operation_id.as_str(), payload.as_str())
+                .map_err(storage)?;
+        }
+        write.commit().map_err(storage)
+    }
+
+    #[cfg(feature = "test-support")]
+    pub fn replace_authority_snapshot_record_for_test(
+        &self,
+        input: OperationalRecordInput,
+    ) -> Result<(), OrsError> {
+        input.validate()?;
+        let key = Self::operational_key(OperationalKind::AuthoritySnapshot, &input.subject_id);
+        let write = self.database.begin_write().map_err(storage)?;
+        let mut record = {
+            let current = write.open_table(OPERATIONAL_CURRENT).map_err(storage)?;
+            let value = current
+                .get(key.as_str())
+                .map_err(storage)?
+                .ok_or(OrsError::AuthoritySnapshotUnavailable)?;
+            decode_named::<DurableOperationalRecord>(value.value(), "operational_current")?
+        };
+        record.input = input;
+        record.operation_order = Self::next_operational_order(&write)?;
+        Self::persist_operational_record(&write, &key, &record)?;
+        write.commit().map_err(storage)
+    }
+
     /// Atomically reserves a process start, preserving every prior outcome.
     pub fn begin_process_start(
         &self,
@@ -398,7 +436,18 @@ impl RedbRecoveryStore {
         table
             .get(operation_id.as_str())
             .map_err(storage)?
-            .map(|value| decode(value.value()))
+            .map(|value| {
+                let record: ProcessStartReplayRecord = decode(value.value())?;
+                record.validate()?;
+                if record.operation_id != *operation_id {
+                    return Err(OrsError::IntegrityProblem {
+                        record_type: "process_start_replay",
+                        reason: "replay record operation identity does not match its key"
+                            .to_owned(),
+                    });
+                }
+                Ok(record)
+            })
             .transpose()
     }
 
@@ -409,8 +458,12 @@ impl RedbRecoveryStore {
         let key = record.operation_id.as_str();
         {
             let mut table = write.open_table(PROCESS_START_REPLAY).map_err(storage)?;
-            if let Some(existing) = table.get(key).map_err(storage)? {
-                let existing: ProcessStartReplayRecord = decode(existing.value())?;
+            let existing: Option<ProcessStartReplayRecord> = table
+                .get(key)
+                .map_err(storage)?
+                .map(|value| decode(value.value()))
+                .transpose()?;
+            if let Some(existing) = &existing {
                 existing.validate()?;
                 if existing.admission_digest != record.admission_digest
                     || existing.owner != record.owner
@@ -429,7 +482,7 @@ impl RedbRecoveryStore {
                     ) => true,
                     (ProcessStartReplayState::Completed, ProcessStartReplayState::Completed)
                     | (ProcessStartReplayState::Unknown, ProcessStartReplayState::Unknown) => {
-                        existing == *record
+                        *existing == *record
                     }
                     _ => false,
                 };
@@ -440,8 +493,10 @@ impl RedbRecoveryStore {
                     });
                 }
             }
-            let payload = encode(&record)?;
-            table.insert(key, payload.as_str()).map_err(storage)?;
+            if existing.as_ref().is_none_or(|current| current != record) {
+                let payload = encode(&record)?;
+                table.insert(key, payload.as_str()).map_err(storage)?;
+            }
         }
         write.commit().map_err(storage)
     }
@@ -552,11 +607,12 @@ impl RedbRecoveryStore {
     /// Appends one observation-only evidence projection, preserving conflicts.
     pub fn persist_process_evidence(&self, record: &ProcessEvidenceRecord) -> Result<(), OrsError> {
         record.validate()?;
+        let key = record.record_key()?;
         let write = self.database.begin_write().map_err(storage)?;
         {
             let mut table = write.open_table(PROCESS_EVIDENCE).map_err(storage)?;
             let existing: Option<ProcessEvidenceRecord> = table
-                .get(record.operation_id.as_str())
+                .get(key.as_str())
                 .map_err(storage)?
                 .map(|value| decode(value.value()))
                 .transpose()?;
@@ -571,29 +627,49 @@ impl RedbRecoveryStore {
             } else {
                 let payload = encode(record)?;
                 table
-                    .insert(record.operation_id.as_str(), payload.as_str())
+                    .insert(key.as_str(), payload.as_str())
                     .map_err(storage)?;
             }
         }
         write.commit().map_err(storage)
     }
 
-    /// Reads one observation-only evidence record after validation.
+    /// Reads bounded observation-only evidence history for one operation.
     pub fn load_process_evidence(
         &self,
         operation_id: &crate::OperationIdentity,
-    ) -> Result<Option<ProcessEvidenceRecord>, OrsError> {
+    ) -> Result<Vec<ProcessEvidenceRecord>, OrsError> {
         let read = self.database.begin_read().map_err(storage)?;
         let table = read.open_table(PROCESS_EVIDENCE).map_err(storage)?;
-        table
-            .get(operation_id.as_str())
-            .map_err(storage)?
-            .map(|value| {
-                let record: ProcessEvidenceRecord = decode(value.value())?;
-                record.validate()?;
-                Ok(record)
-            })
-            .transpose()
+        let start = format!("{}::", operation_id.as_str());
+        let end = format!("{start}\u{10ffff}");
+        let mut records = Vec::new();
+        for entry in table.range(start.as_str()..end.as_str()).map_err(storage)? {
+            let (key, value) = entry.map_err(storage)?;
+            let key = key.value();
+            let record: ProcessEvidenceRecord = decode(value.value())?;
+            record.validate()?;
+            if record.operation_id != *operation_id || !key.starts_with(&start) {
+                return Err(OrsError::IntegrityProblem {
+                    record_type: "process_evidence",
+                    reason: "evidence record operation identity does not match its key".to_owned(),
+                });
+            }
+            records.push(record);
+            if records.len() > usize::from(crate::MAX_PROCESS_EVIDENCE_READBACK) {
+                return Err(OrsError::IntegrityProblem {
+                    record_type: "process_evidence",
+                    reason: "evidence history exceeds the bounded readback limit".to_owned(),
+                });
+            }
+        }
+        records.sort_by(|left, right| {
+            left.observed_at_ms
+                .cmp(&right.observed_at_ms)
+                .then_with(|| left.evidence_digest.cmp(&right.evidence_digest))
+                .then_with(|| left.record_key().ok().cmp(&right.record_key().ok()))
+        });
+        Ok(records)
     }
 
     /// Opens or creates an ORS database and converts interrupted execution to reconciliation.
