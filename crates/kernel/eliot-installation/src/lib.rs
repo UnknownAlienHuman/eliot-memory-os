@@ -1950,9 +1950,10 @@ mod tests {
                 .to_string_lossy()
                 .into_owned(),
         );
-        let error = manifest
-            .validate()
-            .expect_err("unbound Store config must fail closed");
+        let error = match manifest.validate() {
+            Ok(()) => panic!("unbound Store config must fail closed"),
+            Err(error) => error,
+        };
         assert!(
             matches!(error, InstallationError::InvalidField { field, .. } if field == "manifest.runtime_launch.store_config_path")
         );

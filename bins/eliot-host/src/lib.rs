@@ -55,6 +55,8 @@ pub enum HostError {
     ProcessContour(String),
     #[error("Store child is not live ({evidence})")]
     StoreNotLive { evidence: StoreLivenessEvidence },
+    #[error("Host child cleanup requires recovery: {0}")]
+    RecoveryRequired(String),
     #[error("another live Host owns this installation")]
     OwnerLeaseHeld,
     #[error("Host owner lease recovery is required: {0}")]
@@ -70,28 +72,51 @@ pub enum StoreLivenessEvidence {
 }
 
 #[cfg(windows)]
+enum StoreKernelLaunchError<S> {
+    Launch(HostError),
+    StoreNotLive { evidence: StoreLivenessEvidence },
+    CleanupRequired { store: S, reason: String },
+    Kernel { error: HostError },
+}
+
+#[cfg(windows)]
 fn launch_store_then_kernel<S, K, LF, OF, KF, CF>(
     launch_store: LF,
     observe_store: OF,
     launch_kernel: KF,
     cleanup_store: CF,
-) -> Result<(S, K), HostError>
+) -> Result<(S, K), StoreKernelLaunchError<S>>
 where
     LF: FnOnce() -> Result<S, HostError>,
     OF: FnOnce(&S) -> Result<(), StoreLivenessEvidence>,
     KF: FnOnce() -> Result<K, HostError>,
-    CF: FnOnce(S),
+    CF: FnOnce(S) -> Result<(), Box<(S, String)>>,
 {
-    let store = launch_store()?;
+    let store = launch_store().map_err(StoreKernelLaunchError::Launch)?;
     if let Err(evidence) = observe_store(&store) {
-        cleanup_store(store);
-        return Err(HostError::StoreNotLive { evidence });
+        return match cleanup_store(store) {
+            Ok(()) => Err(StoreKernelLaunchError::StoreNotLive { evidence }),
+            Err(boxed) => {
+                let (store, reason) = *boxed;
+                Err(StoreKernelLaunchError::CleanupRequired { store, reason })
+            }
+        };
     }
     let kernel = match launch_kernel() {
         Ok(kernel) => kernel,
         Err(error) => {
-            cleanup_store(store);
-            return Err(error);
+            return match cleanup_store(store) {
+                Ok(()) => Err(StoreKernelLaunchError::Kernel { error }),
+                Err(boxed) => {
+                    let (store, reason) = *boxed;
+                    Err(StoreKernelLaunchError::CleanupRequired {
+                        store,
+                        reason: format!(
+                            "Kernel launch failed ({error}); Store cleanup is unknown: {reason}"
+                        ),
+                    })
+                }
+            };
         }
     };
     Ok((store, kernel))
@@ -227,6 +252,13 @@ pub enum HostBranchDisposition {
     StoreDegraded,
     /// Both process branches are unavailable after their independent bounds.
     BothDegraded,
+}
+
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BranchLiveness {
+    Live,
+    Dead,
 }
 
 #[cfg(windows)]
@@ -580,7 +612,7 @@ impl HostJobBranches {
         } else {
             PathBuf::from(launch.kernel_work_root.as_str())
         };
-        let (store, kernel) = launch_store_then_kernel(
+        let launch_result = launch_store_then_kernel(
             || {
                 Self::launch(
                     &store_executable,
@@ -599,13 +631,22 @@ impl HostJobBranches {
                     &working_directory,
                 )
             },
-            |store| match store.observe() {
-                Ok(eliot_platform_windows::RunningJobObservation::Running { .. }) => Ok(()),
-                Ok(
-                    eliot_platform_windows::RunningJobObservation::RootExited { .. }
-                    | eliot_platform_windows::RunningJobObservation::Exited { .. },
-                ) => Err(StoreLivenessEvidence::Dead),
-                Err(error) => Err(StoreLivenessEvidence::Unknown(error.to_string())),
+            |store| -> Result<(), StoreLivenessEvidence> {
+                match store.observe() {
+                    Ok(eliot_platform_windows::RunningJobObservation::Running {
+                        active_processes,
+                    }) if active_processes > 0 => Ok(()),
+                    Ok(eliot_platform_windows::RunningJobObservation::Running { .. }) => {
+                        Err(StoreLivenessEvidence::Unknown(
+                            "Store reports zero active processes".to_owned(),
+                        ))
+                    }
+                    Ok(
+                        eliot_platform_windows::RunningJobObservation::RootExited { .. }
+                        | eliot_platform_windows::RunningJobObservation::Exited { .. },
+                    ) => Err(StoreLivenessEvidence::Dead),
+                    Err(error) => Err(StoreLivenessEvidence::Unknown(error.to_string())),
+                }
             },
             || {
                 Self::launch(
@@ -625,27 +666,62 @@ impl HostJobBranches {
                     &working_directory,
                 )
             },
-            |store| {
-                let _ = store.terminate(0xE017_0002);
+            |mut store| {
+                store
+                    .terminate_in_place(0xE017_0002)
+                    .map(|_| ())
+                    .map_err(|error| Box::new((store, error.to_string())))
             },
-        )?;
-        self.kernel_executable = Some(kernel_executable);
-        self.store_executable = Some(store_executable);
-        self.kernel_lease = Some(kernel_lease);
-        self.store_lease = Some(store_lease);
-        self.config_path = Some(config_path);
-        self.config_lease = Some(config_lease);
-        self.config_pin = Some(config_pin);
-        self.portable_root = portable_root;
-        self.launch = Some(launch.clone());
-        self.kernel_artifact_digest = Some(kernel_artifact.clone());
-        self.store_artifact_digest = Some(store_artifact.clone());
-        self.config_digest = Some(config_digest.clone());
-        self.kernel_restart_attempts = 0;
-        self.store_restart_attempts = 0;
-        self.kernel = Some(kernel);
-        self.store = Some(store);
-        Ok(())
+        );
+        match launch_result {
+            Ok((store, kernel)) => {
+                self.kernel_executable = Some(kernel_executable);
+                self.store_executable = Some(store_executable);
+                self.kernel_lease = Some(kernel_lease);
+                self.store_lease = Some(store_lease);
+                self.config_path = Some(config_path);
+                self.config_lease = Some(config_lease);
+                self.config_pin = Some(config_pin);
+                self.portable_root = portable_root;
+                self.launch = Some(launch.clone());
+                self.kernel_artifact_digest = Some(kernel_artifact.clone());
+                self.store_artifact_digest = Some(store_artifact.clone());
+                self.config_digest = Some(config_digest.clone());
+                self.kernel_restart_attempts = 0;
+                self.store_restart_attempts = 0;
+                self.kernel = Some(kernel);
+                self.store = Some(store);
+                Ok(())
+            }
+            Err(
+                StoreKernelLaunchError::Launch(error) | StoreKernelLaunchError::Kernel { error },
+            ) => {
+                self.clear_recorded_contour();
+                Err(error)
+            }
+            Err(StoreKernelLaunchError::StoreNotLive { evidence }) => {
+                self.clear_recorded_contour();
+                Err(HostError::StoreNotLive { evidence })
+            }
+            Err(StoreKernelLaunchError::CleanupRequired { store, reason }) => {
+                self.kernel_executable = Some(kernel_executable);
+                self.store_executable = Some(store_executable);
+                self.kernel_lease = Some(kernel_lease);
+                self.store_lease = Some(store_lease);
+                self.config_path = Some(config_path);
+                self.config_lease = Some(config_lease);
+                self.config_pin = Some(config_pin);
+                self.portable_root = portable_root;
+                self.launch = Some(launch.clone());
+                self.kernel_artifact_digest = Some(kernel_artifact.clone());
+                self.store_artifact_digest = Some(store_artifact.clone());
+                self.config_digest = Some(config_digest.clone());
+                self.kernel_restart_attempts = 0;
+                self.store_restart_attempts = 0;
+                self.store = Some(store);
+                Err(HostError::RecoveryRequired(reason))
+            }
+        }
     }
 
     #[allow(
@@ -772,15 +848,25 @@ impl HostJobBranches {
         Ok(())
     }
 
-    fn branch_dead(
+    fn branch_state(
         child: Option<&RunningJobChild<PlatformHandle>>,
-    ) -> Result<bool, WindowsAdapterError> {
+    ) -> Result<BranchLiveness, String> {
         match child {
-            Some(child) => Ok(!matches!(
-                child.observe()?,
-                eliot_platform_windows::RunningJobObservation::Running { .. }
-            )),
-            None => Ok(true),
+            Some(child) => match child.observe().map_err(|error| error.to_string())? {
+                eliot_platform_windows::RunningJobObservation::Running { active_processes }
+                    if active_processes > 0 =>
+                {
+                    Ok(BranchLiveness::Live)
+                }
+                eliot_platform_windows::RunningJobObservation::Running { .. } => {
+                    Err("running observation reports zero active processes".to_owned())
+                }
+                eliot_platform_windows::RunningJobObservation::RootExited { .. }
+                | eliot_platform_windows::RunningJobObservation::Exited { .. } => {
+                    Ok(BranchLiveness::Dead)
+                }
+            },
+            None => Ok(BranchLiveness::Dead),
         }
     }
 
@@ -872,17 +958,21 @@ impl HostJobBranches {
             lease.verify().map_err(HostError::ProcessContour)?;
             verify_launch_digest(lease, store_artifact, "runtime.store_artifact")?;
         }
-        let kernel_dead = Self::branch_dead(self.kernel.as_ref()).unwrap_or(true);
-        let store_observation = Self::branch_dead(self.store.as_ref());
-        let mut store_dead = store_observation.unwrap_or(true);
+        let kernel_observation = Self::branch_state(self.kernel.as_ref());
+        let store_observation = Self::branch_state(self.store.as_ref());
+        let kernel_dead = matches!(kernel_observation, Ok(BranchLiveness::Dead));
+        let mut store_dead = matches!(store_observation, Ok(BranchLiveness::Dead));
         let mut kernel_degraded = false;
         let mut store_degraded = store_observation.is_err();
+        if kernel_observation.is_err() {
+            kernel_degraded = true;
+        }
 
         // When both branches are gone, restore the dependency before admitting
         // Kernel. A failed Kernel launch must not leave a newly started Store.
         let both_dead = kernel_dead && store_dead;
         if both_dead {
-            if store_observation.is_err()
+            if store_degraded
                 || self.terminate_store().is_err()
                 || !Self::restart_allowed(self.store_restart_attempts)
             {
@@ -903,7 +993,10 @@ impl HostJobBranches {
                 {
                     store_degraded = true;
                 } else if self.store.is_none()
-                    || Self::branch_dead(self.store.as_ref()).unwrap_or(true)
+                    || !matches!(
+                        Self::branch_state(self.store.as_ref()),
+                        Ok(BranchLiveness::Live)
+                    )
                 {
                     store_degraded = true;
                     let _ = self.terminate_store();
@@ -960,6 +1053,10 @@ impl HostJobBranches {
                         host,
                     )
                     .is_err()
+                    || !matches!(
+                        Self::branch_state(self.store.as_ref()),
+                        Ok(BranchLiveness::Live)
+                    )
                 {
                     store_degraded = true;
                 }
@@ -1073,10 +1170,11 @@ impl HostJobBranches {
     ///
     /// Returns an error if the owned Kernel Job branch cannot be terminated.
     pub fn terminate_kernel(&mut self) -> Result<(), HostError> {
-        if let Some(kernel) = self.kernel.take() {
+        if let Some(kernel) = self.kernel.as_mut() {
             kernel
-                .terminate(0xE017_0001)
-                .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+                .terminate_in_place(0xE017_0001)
+                .map_err(|error| HostError::RecoveryRequired(error.to_string()))?;
+            self.kernel.take();
         }
         Ok(())
     }
@@ -1087,10 +1185,11 @@ impl HostJobBranches {
     ///
     /// Returns an error if the owned store Job branch cannot be terminated.
     pub fn terminate_store(&mut self) -> Result<(), HostError> {
-        if let Some(store) = self.store.take() {
+        if let Some(store) = self.store.as_mut() {
             store
-                .terminate(0xE017_0002)
-                .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+                .terminate_in_place(0xE017_0002)
+                .map_err(|error| HostError::RecoveryRequired(error.to_string()))?;
+            self.store.take();
         }
         Ok(())
     }
@@ -1755,11 +1854,13 @@ impl HostComposition {
     fn cleanup_launched_contour(&mut self, error: HostError) -> Result<(), HostError> {
         let kernel = self.jobs.terminate_kernel();
         let store = self.jobs.terminate_store();
-        self.jobs.clear_recorded_contour();
         match (kernel, store) {
-            (Ok(()), Ok(())) => Err(error),
-            (kernel, store) => Err(HostError::ProcessContour(format!(
-                "persistence failed ({error}); launched contour cleanup failed: kernel={kernel:?}, store={store:?}"
+            (Ok(()), Ok(())) => {
+                self.jobs.clear_recorded_contour();
+                Err(error)
+            }
+            (kernel, store) => Err(HostError::RecoveryRequired(format!(
+                "persistence failed ({error}); launched contour cleanup requires recovery: kernel={kernel:?}, store={store:?}"
             ))),
         }
     }
@@ -2040,7 +2141,9 @@ fn configured_image(name: &str) -> Result<PathBuf, HostError> {
 mod tests {
     use std::cell::RefCell;
 
-    use super::{HostError, StoreLivenessEvidence, launch_store_then_kernel};
+    use super::{
+        HostError, StoreKernelLaunchError, StoreLivenessEvidence, launch_store_then_kernel,
+    };
 
     #[test]
     fn approved_launch_records_store_before_kernel() {
@@ -2050,12 +2153,12 @@ mod tests {
                 launches.borrow_mut().push("Store");
                 Ok::<_, HostError>(())
             },
-            |_| Ok(()),
+            |()| -> Result<(), StoreLivenessEvidence> { Ok(()) },
             || {
                 launches.borrow_mut().push("Kernel");
                 Ok::<_, HostError>(())
             },
-            |_| {},
+            |()| -> Result<(), Box<((), String)>> { Ok(()) },
         );
         assert!(result.is_ok());
         assert_eq!(*launches.borrow(), ["Store", "Kernel"]);
@@ -2070,16 +2173,19 @@ mod tests {
                 launches.borrow_mut().push("Store");
                 Ok::<_, HostError>(())
             },
-            |_| Err(StoreLivenessEvidence::Dead),
+            |()| -> Result<(), StoreLivenessEvidence> { Err(StoreLivenessEvidence::Dead) },
             || {
                 launches.borrow_mut().push("Kernel");
                 Ok::<_, HostError>(())
             },
-            |_| *cleaned.borrow_mut() = true,
+            |()| -> Result<(), Box<((), String)>> {
+                *cleaned.borrow_mut() = true;
+                Ok(())
+            },
         );
         assert!(matches!(
             result,
-            Err(HostError::StoreNotLive {
+            Err(StoreKernelLaunchError::StoreNotLive {
                 evidence: StoreLivenessEvidence::Dead
             })
         ));
@@ -2095,7 +2201,7 @@ mod tests {
                 launches.borrow_mut().push("Store");
                 Ok::<_, HostError>(())
             },
-            |_| {
+            |()| {
                 Err(StoreLivenessEvidence::Unknown(
                     "observation failed".to_owned(),
                 ))
@@ -2104,11 +2210,11 @@ mod tests {
                 launches.borrow_mut().push("Kernel");
                 Ok::<_, HostError>(())
             },
-            |_| {},
+            |()| -> Result<(), Box<((), String)>> { Ok(()) },
         );
         assert!(matches!(
             result,
-            Err(HostError::StoreNotLive {
+            Err(StoreKernelLaunchError::StoreNotLive {
                 evidence: StoreLivenessEvidence::Unknown(_)
             })
         ));
@@ -2124,16 +2230,44 @@ mod tests {
                 launches.borrow_mut().push("Store");
                 Ok::<_, HostError>(())
             },
-            |_| Ok(()),
+            |()| -> Result<(), StoreLivenessEvidence> { Ok(()) },
             || {
                 launches.borrow_mut().push("Kernel");
                 Err::<(), _>(HostError::ProcessContour("kernel launch failed".to_owned()))
             },
-            |_| *cleaned.borrow_mut() += 1,
+            |()| -> Result<(), Box<((), String)>> {
+                *cleaned.borrow_mut() += 1;
+                Ok(())
+            },
         );
         assert!(result.is_err());
         assert_eq!(*launches.borrow(), ["Store", "Kernel"]);
         assert_eq!(*cleaned.borrow(), 1);
+    }
+
+    #[test]
+    fn unknown_store_cleanup_retains_owner_and_blocks_kernel() {
+        let launches = RefCell::new(Vec::new());
+        let result = launch_store_then_kernel(
+            || {
+                launches.borrow_mut().push("Store");
+                Ok::<_, HostError>(42_u8)
+            },
+            |store| {
+                assert_eq!(*store, 42);
+                Err(StoreLivenessEvidence::Unknown("reap timeout".to_owned()))
+            },
+            || {
+                launches.borrow_mut().push("Kernel");
+                Ok::<_, HostError>(())
+            },
+            |store| Err(Box::new((store, "bounded termination failed".to_owned()))),
+        );
+        assert!(matches!(
+            result,
+            Err(StoreKernelLaunchError::CleanupRequired { store: 42, .. })
+        ));
+        assert_eq!(*launches.borrow(), ["Store"]);
     }
 }
 
