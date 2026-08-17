@@ -391,6 +391,48 @@ fn commit_write(write: redb::WriteTransaction) -> Result<(), BackendError> {
         .map_err(|_| BackendError::Unknown(UnknownReason::Indeterminate))
 }
 
+fn persist_commit(
+    database: &Database,
+    transaction_id: &PlatformHandle,
+    epoch_key: &str,
+    epoch: &StoredEpoch,
+    committed: &CommittedAppend,
+    bytes: &[u8],
+) -> Result<(), BackendError> {
+    let epoch_encoded = encode_bounded(epoch, MAX_METADATA_BYTES + MAX_APPEND_BYTES)?;
+    let receipt_encoded = encode_bounded(committed, MAX_METADATA_BYTES)?;
+    let write = database
+        .begin_write()
+        .map_err(|_| BackendError::Unavailable)?;
+    {
+        let mut epoch_table = write
+            .open_table(EPOCHS)
+            .map_err(|_| BackendError::Unavailable)?;
+        let mut receipt_table = write
+            .open_table(RECEIPTS)
+            .map_err(|_| BackendError::Unavailable)?;
+        let mut prepared_table = write
+            .open_table(PREPARED)
+            .map_err(|_| BackendError::Unavailable)?;
+        let mut payload_table = write
+            .open_table(PAYLOADS)
+            .map_err(|_| BackendError::Unavailable)?;
+        epoch_table
+            .insert(epoch_key, epoch_encoded.as_slice())
+            .map_err(|_| BackendError::Unavailable)?;
+        receipt_table
+            .insert(transaction_id.as_str(), receipt_encoded.as_slice())
+            .map_err(|_| BackendError::Unavailable)?;
+        payload_table
+            .insert(transaction_id.as_str(), bytes)
+            .map_err(|_| BackendError::Unavailable)?;
+        prepared_table
+            .remove(transaction_id.as_str())
+            .map_err(|_| BackendError::Unavailable)?;
+    }
+    commit_write(write)
+}
+
 impl JournalBackend for RedbJournalBackend {
     fn load(&mut self) -> Result<DurableImage, BackendError> {
         let snapshot = self.snapshot()?;
@@ -606,39 +648,14 @@ impl JournalBackend for RedbJournalBackend {
             .find(|(key, _)| *key == epoch_key)
             .map(|(_, epoch)| epoch)
             .ok_or(BackendError::Unavailable)?;
-        let epoch_encoded = encode_bounded(epoch, MAX_METADATA_BYTES + MAX_APPEND_BYTES)?;
-        let receipt_encoded = encode_bounded(&committed, MAX_METADATA_BYTES)?;
-        let write = self
-            .database
-            .begin_write()
-            .map_err(|_| BackendError::Unavailable)?;
-        {
-            let mut epoch_table = write
-                .open_table(EPOCHS)
-                .map_err(|_| BackendError::Unavailable)?;
-            let mut receipt_table = write
-                .open_table(RECEIPTS)
-                .map_err(|_| BackendError::Unavailable)?;
-            let mut prepared_table = write
-                .open_table(PREPARED)
-                .map_err(|_| BackendError::Unavailable)?;
-            let mut payload_table = write
-                .open_table(PAYLOADS)
-                .map_err(|_| BackendError::Unavailable)?;
-            epoch_table
-                .insert(epoch_key.as_str(), epoch_encoded.as_slice())
-                .map_err(|_| BackendError::Unavailable)?;
-            receipt_table
-                .insert(transaction_id.as_str(), receipt_encoded.as_slice())
-                .map_err(|_| BackendError::Unavailable)?;
-            payload_table
-                .insert(transaction_id.as_str(), prepared.bytes.as_slice())
-                .map_err(|_| BackendError::Unavailable)?;
-            prepared_table
-                .remove(transaction_id.as_str())
-                .map_err(|_| BackendError::Unavailable)?;
-        }
-        commit_write(write)
+        persist_commit(
+            &self.database,
+            transaction_id,
+            epoch_key.as_str(),
+            epoch,
+            &committed,
+            &prepared.bytes,
+        )
     }
 
     fn reconcile(
@@ -875,7 +892,11 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap_or_else(|_| unreachable!());
     }
 
-    fn rewrite_prepared(backend: &RedbJournalBackend, transaction: &str, value: serde_json::Value) {
+    fn rewrite_prepared(
+        backend: &RedbJournalBackend,
+        transaction: &str,
+        value: &serde_json::Value,
+    ) {
         let write = backend
             .database
             .begin_write()
@@ -1044,7 +1065,7 @@ mod tests {
         })
         .unwrap_or_else(|_| unreachable!());
         value["bytes"] = serde_json::json!([]);
-        rewrite_prepared(&backend, descriptor.transaction_id.as_str(), value);
+        rewrite_prepared(&backend, descriptor.transaction_id.as_str(), &value);
         assert!(backend.load().is_err());
         drop(backend);
         remove(&root);
@@ -1061,7 +1082,7 @@ mod tests {
             synced: true,
         })
         .unwrap_or_else(|_| unreachable!());
-        rewrite_prepared(&backend, descriptor.transaction_id.as_str(), value);
+        rewrite_prepared(&backend, descriptor.transaction_id.as_str(), &value);
         assert!(backend.load().is_err());
         drop(backend);
         remove(&root);
@@ -1166,8 +1187,7 @@ mod tests {
             let raw = table
                 .get(descriptor.transaction_id.as_str())
                 .unwrap_or_else(|_| unreachable!())
-                .map(|value| value.value().to_vec())
-                .unwrap_or_else(|| unreachable!());
+                .map_or_else(|| unreachable!(), |value| value.value().to_vec());
             let mut value: serde_json::Value =
                 serde_json::from_slice(&raw).unwrap_or_else(|_| unreachable!());
             value["payload_digest"] = serde_json::json!(sha256_digest(b"tampered"));
