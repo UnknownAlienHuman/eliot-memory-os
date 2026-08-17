@@ -42,7 +42,7 @@ use eliot_ors::{
     ProcessStartReplayRecord as OrsReplayRecord, ProcessStartReplayState as OrsReplayState,
 };
 use eliot_ors::{OperationalRecoveryStore, RedbRecoveryStore};
-use eliot_platform::{ClockObservation, PortError};
+use eliot_platform::{ClockObservation, PlatformHandle, PortError};
 use eliot_platform_windows::{
     ProtectedPathLease, ProtectedSecret, RecoverableJobBinding, RecoverableJobObject,
     RetainedProcessPathLease, UserOwnedPathLease, UserOwnedRootLease, WindowsPlatform,
