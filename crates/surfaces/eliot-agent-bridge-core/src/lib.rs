@@ -154,6 +154,20 @@ pub struct ProviderReadiness {
 }
 
 impl ProviderReadiness {
+    /// Starts with every provider unprobed and therefore unavailable.
+    ///
+    /// Readiness is an observation, not a construction default. Composition
+    /// owners must admit each provider only after its exact operation probe
+    /// succeeds.
+    pub fn unprobed() -> Self {
+        Self {
+            admitted: RequiredProvider::ALL_CONTRACTS
+                .into_iter()
+                .map(|provider| (provider, false))
+                .collect(),
+        }
+    }
+
     pub fn all_admitted() -> Self {
         Self {
             admitted: RequiredProvider::ALL_CONTRACTS
@@ -167,6 +181,23 @@ impl ProviderReadiness {
     pub fn with_unavailable(mut self, provider: RequiredProvider) -> Self {
         self.admitted.insert(provider, false);
         self
+    }
+
+    /// Records one exact operation-probe result for a provider.
+    #[must_use]
+    pub fn with_probe_result(mut self, provider: RequiredProvider, admitted: bool) -> Self {
+        self.admitted.insert(provider, admitted);
+        self
+    }
+
+    #[must_use]
+    pub fn is_ready(&self) -> bool {
+        self.first_gap().is_none()
+    }
+
+    #[must_use]
+    pub fn first_unavailable(&self) -> Option<RequiredProvider> {
+        self.first_gap().map(|gap| gap.missing_provider)
     }
 
     fn first_gap(&self) -> Option<PlanGap> {
@@ -964,6 +995,12 @@ impl AgentBridgeCore {
         frame
             .validate()
             .map_err(|error| BridgeError::ProviderContract(error.to_string()))?;
+        if frame.request_identity.is_some() {
+            return Err(BridgeError::InvalidContract {
+                field: "frame.request_identity",
+                reason: "request identity is Kernel-bound and cannot cross the bridge line protocol",
+            });
+        }
         let binding = self.binding()?.clone();
         if frame.connection_id != binding.connection_id.as_str() {
             return Err(BridgeError::StaleTransport);

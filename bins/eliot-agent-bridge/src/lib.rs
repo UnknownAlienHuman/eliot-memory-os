@@ -133,8 +133,10 @@ pub struct CliConfig {
 /// Shared transport session handle used by the binary to bind each request's
 /// independent EBP identity before entering A-16.
 pub type KernelClientHandle = Arc<Mutex<eliot_cli::kernel_client::KernelClient>>;
+#[allow(dead_code)]
 type SharedKernelClient = KernelClientHandle;
 
+#[allow(dead_code)]
 fn provider_failure() -> ProviderFailure {
     ProviderFailure::new(
         "eliot-kernel-front-door",
@@ -142,6 +144,7 @@ fn provider_failure() -> ProviderFailure {
     )
 }
 
+#[allow(dead_code)]
 fn kernel_call(
     client: &SharedKernelClient,
     operation: &str,
@@ -158,6 +161,7 @@ fn kernel_call(
 // The authenticated variant mirrors the closed Kernel wire contract; boxing it
 // would introduce a second representation solely to optimize a private decode.
 #[allow(clippy::large_enum_variant)]
+#[allow(dead_code)]
 enum ActivationWireResponse {
     Authenticated {
         principal_id: PrincipalId,
@@ -176,6 +180,7 @@ enum ActivationWireResponse {
     },
 }
 
+#[allow(dead_code)]
 struct KernelHostActivationPort {
     client: SharedKernelClient,
 }
@@ -230,10 +235,12 @@ impl HostActivationPort for KernelHostActivationPort {
     }
 }
 
+#[allow(dead_code)]
 struct KernelMcpForwardingPort {
     client: SharedKernelClient,
 }
 
+#[allow(dead_code)]
 fn binding_value(binding: &AttachBinding) -> Value {
     json!({
         "principal_id": binding.principal_id().as_str(),
@@ -439,22 +446,16 @@ pub struct BridgeRunner {
 /// Builds the production bridge's two injected Kernel-owned provider ports.
 /// The same authenticated client/session binding is shared by activation and
 /// forwarding, while A-16 remains the sole bridge state owner.
-pub type KernelPorts = (
-    KernelClientHandle,
-    Box<dyn HostActivationPort>,
-    Box<dyn McpForwardingPort>,
-);
+pub type KernelPorts = (Box<dyn HostActivationPort>, Box<dyn McpForwardingPort>);
 
 pub fn kernel_ports() -> Result<KernelPorts, RuntimeBuildError> {
-    let client = eliot_cli::kernel_client::KernelClient::load()
+    let mut client = eliot_cli::kernel_client::KernelClient::load()
         .map_err(|error| RuntimeBuildError::KernelClient(error.to_string()))?;
-    let client = Arc::new(Mutex::new(client));
-    Ok((
-        client.clone(),
-        Box::new(KernelHostActivationPort {
-            client: client.clone(),
-        }),
-        Box::new(KernelMcpForwardingPort { client }),
+    client
+        .probe()
+        .map_err(|error| RuntimeBuildError::KernelAdmissionRequired(error.to_string()))?;
+    Err(RuntimeBuildError::KernelAdmissionRequired(
+        "authenticated health is available, but Kernel bridge admission did not return one session, fence, and route binding".to_owned(),
     ))
 }
 
@@ -604,6 +605,8 @@ pub enum RuntimeBuildError {
     BridgeContract(BridgeError),
     /// The installation-owned authenticated Kernel front door was not composed.
     KernelClient(String),
+    /// Kernel has no exact bridge admission operation; never infer readiness.
+    KernelAdmissionRequired(String),
 }
 
 impl fmt::Display for RuntimeBuildError {
@@ -615,6 +618,9 @@ impl fmt::Display for RuntimeBuildError {
             Self::Runtime(_) => formatter.write_str("RUNTIME_CONFIG_INVALID"),
             Self::BridgeContract(error) => write!(formatter, "BRIDGE_CONTRACT_INVALID:{error}"),
             Self::KernelClient(error) => write!(formatter, "KERNEL_CLIENT_REJECTED:{error}"),
+            Self::KernelAdmissionRequired(error) => {
+                write!(formatter, "KERNEL_ADMISSION_REQUIRED:{error}")
+            }
         }
     }
 }

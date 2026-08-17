@@ -1,8 +1,8 @@
 use std::io::{self, BufRead, Write};
 
 use eliot_agent_bridge::{BridgeRunner, CliError, Profile, kernel_ports, parse_args};
-use eliot_agent_bridge_core::{AttachRequest, BridgeError, HostEventEnvelope, ProviderReadiness};
-use eliot_protocol::{EventEnvelope, Frame, RequestIdentity};
+use eliot_agent_bridge_core::{AttachRequest, BridgeError, HostEventEnvelope};
+use eliot_protocol::{EventEnvelope, Frame};
 use serde::{Deserialize, Serialize};
 
 const INVALID_ARGUMENT_EXIT: i32 = 2;
@@ -14,25 +14,11 @@ const PROVIDER_PORT_EXIT: i32 = 69;
 // extra heap representation at the trusted process boundary.
 #[allow(clippy::large_enum_variant)]
 enum Request {
-    Attach {
-        identity: RequestIdentity,
-        request: AttachRequest,
-    },
-    ForwardFrame {
-        identity: RequestIdentity,
-        frame: Frame,
-    },
-    ForwardHook {
-        identity: RequestIdentity,
-        event: HostEventEnvelope,
-    },
-    ForwardEvent {
-        identity: RequestIdentity,
-        event: EventEnvelope,
-    },
-    ReconcileExternal {
-        identity: RequestIdentity,
-    },
+    Attach { request: AttachRequest },
+    ForwardFrame { frame: Frame },
+    ForwardHook { event: HostEventEnvelope },
+    ForwardEvent { event: EventEnvelope },
+    ReconcileExternal {},
     Status,
     Stop,
 }
@@ -76,16 +62,24 @@ fn main() {
         }
     };
 
-    let (kernel_client, host_activation, mcp_forwarding) = match kernel_ports() {
+    let (host_activation, mcp_forwarding) = match kernel_ports() {
         Ok(ports) => ports,
         Err(error) => {
-            emit_error("KERNEL_CLIENT_REJECTED", &error.to_string());
+            let code = if matches!(
+                error,
+                eliot_agent_bridge::RuntimeBuildError::KernelAdmissionRequired(_)
+            ) {
+                "KERNEL_ADMISSION_REQUIRED"
+            } else {
+                "KERNEL_CLIENT_REJECTED"
+            };
+            emit_error(code, &error.to_string());
             std::process::exit(PROVIDER_PORT_EXIT);
         }
     };
     let mut runner = match BridgeRunner::new(
         config.profile,
-        ProviderReadiness::all_admitted(),
+        eliot_agent_bridge_core::ProviderReadiness::unprobed(),
         Some(host_activation),
         Some(mcp_forwarding),
     ) {
@@ -95,100 +89,51 @@ fn main() {
             std::process::exit(PROVIDER_PORT_EXIT);
         }
     };
-    let initial_status = Response::Status {
-        profile: Profile::as_str(config.profile),
-        control_capacity: runner.control_capacity(),
-        activation_port: "authenticated Kernel HostActivationPort",
-        forwarding_port: "authenticated Kernel McpForwardingPort",
-    };
-    if !write_response(&initial_status) {
-        return;
-    }
     let mut provider_failure = false;
     for line in io::stdin().lock().lines() {
         let response = match line {
             Ok(line) if line.trim().is_empty() => continue,
             Ok(line) => match serde_json::from_str::<Request>(&line) {
-                Ok(Request::Attach { identity, request }) => {
-                    match bind_identity(&kernel_client, identity) {
-                        Err(detail) => Response::Error {
-                            code: "KERNEL_CLIENT_REJECTED",
-                            detail,
-                        },
-                        Ok(()) => match runner.attach(request) {
-                            Ok(_) => Response::Attached,
-                            Err(error) => {
-                                provider_failure |= matches!(error, BridgeError::PlanGap(_));
-                                bridge_error(&error)
-                            }
-                        },
+                Ok(Request::Attach { request }) => match runner.attach(request) {
+                    Ok(_) => Response::Attached,
+                    Err(error) => {
+                        provider_failure |= matches!(error, BridgeError::PlanGap(_));
+                        bridge_error(&error)
                     }
-                }
-                Ok(Request::ForwardFrame { identity, frame }) => {
-                    match bind_identity(&kernel_client, identity) {
-                        Err(detail) => Response::Error {
-                            code: "KERNEL_CLIENT_REJECTED",
-                            detail,
-                        },
-                        Ok(()) => match runner.forward_frame(&frame) {
-                            Ok(()) => Response::Forwarded,
-                            Err(error) => {
-                                provider_failure |= is_provider_failure(&error);
-                                bridge_error(&error)
-                            }
-                        },
+                },
+                Ok(Request::ForwardFrame { frame }) => match runner.forward_frame(&frame) {
+                    Ok(()) => Response::Forwarded,
+                    Err(error) => {
+                        provider_failure |= is_provider_failure(&error);
+                        bridge_error(&error)
                     }
-                }
-                Ok(Request::ForwardHook { identity, event }) => {
-                    match bind_identity(&kernel_client, identity) {
-                        Err(detail) => Response::Error {
-                            code: "KERNEL_CLIENT_REJECTED",
-                            detail,
-                        },
-                        Ok(()) => match runner.forward_hook(&event) {
-                            Ok(()) => Response::Forwarded,
-                            Err(error) => {
-                                provider_failure |= is_provider_failure(&error);
-                                bridge_error(&error)
-                            }
-                        },
+                },
+                Ok(Request::ForwardHook { event }) => match runner.forward_hook(&event) {
+                    Ok(()) => Response::Forwarded,
+                    Err(error) => {
+                        provider_failure |= is_provider_failure(&error);
+                        bridge_error(&error)
                     }
-                }
-                Ok(Request::ForwardEvent { identity, event }) => {
-                    match bind_identity(&kernel_client, identity) {
-                        Err(detail) => Response::Error {
-                            code: "KERNEL_CLIENT_REJECTED",
-                            detail,
-                        },
-                        Ok(()) => match runner.forward_event(&event) {
-                            Ok(_) => Response::Forwarded,
-                            Err(error) => {
-                                provider_failure |= is_provider_failure(&error);
-                                bridge_error(&error)
-                            }
-                        },
+                },
+                Ok(Request::ForwardEvent { event }) => match runner.forward_event(&event) {
+                    Ok(_) => Response::Forwarded,
+                    Err(error) => {
+                        provider_failure |= is_provider_failure(&error);
+                        bridge_error(&error)
                     }
-                }
-                Ok(Request::ReconcileExternal { identity }) => {
-                    match bind_identity(&kernel_client, identity) {
-                        Err(detail) => Response::Error {
-                            code: "KERNEL_CLIENT_REJECTED",
-                            detail,
-                        },
-                        Ok(()) => match runner.reconcile_external() {
-                            Ok(_) => Response::Reconciled,
-                            Err(error) => {
-                                provider_failure |= is_provider_failure(&error);
-                                bridge_error(&error)
-                            }
-                        },
+                },
+                Ok(Request::ReconcileExternal {}) => match runner.reconcile_external() {
+                    Ok(_) => Response::Reconciled,
+                    Err(error) => {
+                        provider_failure |= is_provider_failure(&error);
+                        bridge_error(&error)
                     }
-                }
+                },
                 Ok(Request::Status) => Response::Status {
                     profile: Profile::as_str(config.profile),
                     control_capacity: runner.control_capacity(),
-                    activation_port: "authenticated Kernel HostActivationPort",
-                    forwarding_port: "authenticated Kernel McpForwardingPort",
+                    activation_port: "observed after Kernel admission",
+                    forwarding_port: "observed after Kernel admission",
                 },
                 Ok(Request::Stop) => Response::Stopped,
                 Err(error) => Response::Error {
@@ -223,16 +168,6 @@ fn bridge_error(error: &BridgeError) -> Response {
             detail: error.to_string(),
         }
     }
-}
-
-fn bind_identity(
-    client: &eliot_agent_bridge::KernelClientHandle,
-    identity: RequestIdentity,
-) -> Result<(), String> {
-    client
-        .lock()
-        .map_err(|_| "Kernel client lock poisoned".to_owned())
-        .map(|mut client| client.set_request_identity(identity))
 }
 
 fn is_provider_failure(error: &BridgeError) -> bool {

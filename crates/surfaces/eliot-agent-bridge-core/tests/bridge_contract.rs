@@ -877,6 +877,20 @@ fn unavailable_admitted_contracts_and_ports_return_typed_plan_gap()
 }
 
 #[test]
+fn readiness_is_unavailable_until_each_exact_provider_probe_admits_it() {
+    let readiness = ProviderReadiness::unprobed();
+    assert!(!readiness.is_ready());
+    assert!(matches!(
+        readiness
+            .clone()
+            .with_probe_result(RequiredProvider::A01AgentApi, true)
+            .with_probe_result(RequiredProvider::A06McpSurface, false)
+            .first_unavailable(),
+        Some(RequiredProvider::A06McpSurface)
+    ));
+}
+
+#[test]
 fn trusted_activation_and_reconciliation_ports_return_typed_denial_or_plan_gap()
 -> Result<(), Box<dyn std::error::Error>> {
     let denying_host = SequencedHost {
