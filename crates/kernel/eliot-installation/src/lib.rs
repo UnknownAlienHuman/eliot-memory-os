@@ -19,7 +19,9 @@ use eliot_platform::{
     InstallationObservation, InstallationPort, InstallationRequest, PlatformHandle, PortError,
     PortOutcome,
 };
-use eliot_platform_windows::{ProtectedPathLease, require_protected_program_data_path};
+use eliot_platform_windows::{
+    ProtectedPathLease, UserOwnedPathLease, require_protected_program_data_path,
+};
 use redb::{Database, ReadableDatabase, TableDefinition};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -196,6 +198,31 @@ pub fn verify_file_digest_with_lease(
         .map_err(|error| InstallationError::Platform(format!("{field}: {error}")))?;
     lease
         .verify_path_identity()
+        .map_err(|error| InstallationError::Platform(format!("{field}: {error}")))?;
+    let bytes = lease
+        .read_bounded(MAX_VERIFIED_FILE_BYTES)
+        .map_err(|error| InstallationError::Platform(format!("{field}: {error}")))?;
+    let digest = Sha256::digest(&bytes);
+    let actual = format!("{digest:x}");
+    if actual != expected.as_str() {
+        return Err(InstallationError::InvalidField {
+            field: field.to_owned(),
+            reason: format!("content digest mismatch (actual {actual})"),
+        });
+    }
+    Ok(())
+}
+
+/// Verifies bytes from a retained portable-dev file lease.
+pub fn verify_file_digest_with_user_lease(
+    lease: &UserOwnedPathLease,
+    expected: &PlatformHandle,
+    field: &str,
+) -> Result<(), InstallationError> {
+    sha256_handle(expected, field)?;
+    lease
+        .verify_stable_identity()
+        .and_then(|()| lease.verify_path_identity())
         .map_err(|error| InstallationError::Platform(format!("{field}: {error}")))?;
     let bytes = lease
         .read_bounded(MAX_VERIFIED_FILE_BYTES)
@@ -627,6 +654,111 @@ pub struct CandidateManifest {
     pub supervision_key_fingerprint: PlatformHandle,
     /// Signature/approval evidence reference.
     pub signature_ref: PlatformHandle,
+    /// Exact Host-owned runtime launch contour bound to this approval.
+    pub runtime_launch: RuntimeLaunchDescriptor,
+}
+
+/// Immutable, digest-bound process launch inputs owned by Host.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeLaunchDescriptor {
+    /// Installation profile selected for this generation.
+    pub profile: InstallationProfile,
+    /// Canonical repository root for `portable_dev`, when applicable.
+    pub portable_root: Option<PlatformHandle>,
+    /// Explicit Kernel working directory.
+    pub kernel_work_root: PlatformHandle,
+    /// Explicit Store configuration path.
+    pub store_config_path: PlatformHandle,
+    /// Exact Kernel child arguments, excluding argv[0].
+    pub kernel_arguments: Vec<PlatformHandle>,
+    /// Exact Store child arguments, excluding argv[0].
+    pub store_arguments: Vec<PlatformHandle>,
+    /// Canonical SCM Watchdog image and its approved digest.
+    pub watchdog_executable_path: PlatformHandle,
+    /// SHA-256 digest of the Watchdog image.
+    pub watchdog_artifact_digest: PlatformHandle,
+    /// SHA-256 of the descriptor fields excluding this digest.
+    pub descriptor_digest: PlatformHandle,
+}
+
+impl RuntimeLaunchDescriptor {
+    fn unsigned_bytes(&self) -> Result<Vec<u8>, InstallationError> {
+        #[derive(Serialize)]
+        struct Unsigned<'a> {
+            profile: InstallationProfile,
+            portable_root: &'a Option<PlatformHandle>,
+            kernel_work_root: &'a PlatformHandle,
+            store_config_path: &'a PlatformHandle,
+            kernel_arguments: &'a [PlatformHandle],
+            store_arguments: &'a [PlatformHandle],
+            watchdog_executable_path: &'a PlatformHandle,
+            watchdog_artifact_digest: &'a PlatformHandle,
+        }
+        serde_json::to_vec(&Unsigned {
+            profile: self.profile,
+            portable_root: &self.portable_root,
+            kernel_work_root: &self.kernel_work_root,
+            store_config_path: &self.store_config_path,
+            kernel_arguments: &self.kernel_arguments,
+            store_arguments: &self.store_arguments,
+            watchdog_executable_path: &self.watchdog_executable_path,
+            watchdog_artifact_digest: &self.watchdog_artifact_digest,
+        })
+        .map_err(|error| InstallationError::InvalidField {
+            field: "manifest.runtime_launch".to_owned(),
+            reason: error.to_string(),
+        })
+    }
+
+    /// Validates the explicit launch contour and its self-digest.
+    pub fn validate(&self) -> Result<(), InstallationError> {
+        handle(&self.kernel_work_root, "runtime_launch.kernel_work_root")?;
+        approved_path(&self.kernel_work_root, "runtime_launch.kernel_work_root")?;
+        handle(&self.store_config_path, "runtime_launch.store_config_path")?;
+        approved_path(&self.store_config_path, "runtime_launch.store_config_path")?;
+        approved_path(
+            &self.watchdog_executable_path,
+            "runtime_launch.watchdog_executable_path",
+        )?;
+        sha256_handle(
+            &self.watchdog_artifact_digest,
+            "runtime_launch.watchdog_artifact_digest",
+        )?;
+        match (self.profile, &self.portable_root) {
+            (InstallationProfile::PortableDev, Some(root)) => {
+                approved_path(root, "runtime_launch.portable_root")?;
+            }
+            (InstallationProfile::PortableDev, None) => {
+                return Err(InstallationError::ProfileViolation(
+                    "portable_dev requires an explicit portable root".to_owned(),
+                ));
+            }
+            (_, Some(_)) => {
+                return Err(InstallationError::ProfileViolation(
+                    "portable root is only valid for portable_dev".to_owned(),
+                ));
+            }
+            (_, None) => {}
+        }
+        for (arguments, field) in [
+            (&self.kernel_arguments, "runtime_launch.kernel_arguments"),
+            (&self.store_arguments, "runtime_launch.store_arguments"),
+        ] {
+            for argument in arguments {
+                handle(argument, field)?;
+            }
+        }
+        sha256_handle(&self.descriptor_digest, "runtime_launch.descriptor_digest")?;
+        let actual = Sha256::digest(&self.unsigned_bytes()?);
+        if format!("{actual:x}") != self.descriptor_digest.as_str() {
+            return Err(InstallationError::InvalidField {
+                field: "runtime_launch.descriptor_digest".to_owned(),
+                reason: "descriptor digest mismatch".to_owned(),
+            });
+        }
+        Ok(())
+    }
 }
 
 impl CandidateManifest {
@@ -671,6 +803,7 @@ impl CandidateManifest {
             "manifest.supervision_key_fingerprint",
         )?;
         handle(&self.signature_ref, "manifest.signature_ref")
+            .and_then(|()| self.runtime_launch.validate())
     }
 
     /// Returns the ordered Kernel and canonical-store artifact digests used by
@@ -1686,6 +1819,22 @@ mod tests {
             config_digest: test_handle("2".repeat(64)),
             supervision_key_fingerprint: test_handle("3".repeat(64)),
             signature_ref: test_handle("evidence:signature"),
+            runtime_launch: {
+                let mut descriptor = RuntimeLaunchDescriptor {
+                    profile: InstallationProfile::PortableDev,
+                    portable_root: Some(test_path(&root, "portable")),
+                    kernel_work_root: test_path(&root, "portable"),
+                    store_config_path: test_path(&root, "generation.json"),
+                    kernel_arguments: vec![test_handle("--kernel")],
+                    store_arguments: vec![test_handle("--store")],
+                    watchdog_executable_path: test_path(&root, "eliot-watchdog.exe"),
+                    watchdog_artifact_digest: test_handle("4".repeat(64)),
+                    descriptor_digest: test_handle("0".repeat(64)),
+                };
+                let digest = Sha256::digest(must(descriptor.unsigned_bytes()));
+                descriptor.descriptor_digest = test_handle(format!("{digest:x}"));
+                descriptor
+            },
         };
         let request = ManagedEnvironmentChangeRequest {
             request_id: test_handle("request:install"),
@@ -1767,5 +1916,22 @@ mod tests {
         assert_eq!(transaction.stage, InstallationStage::Activating);
         assert_eq!(transaction.no_return_boundary.as_ref(), Some(&boundary));
         assert_eq!(transaction.revision, starting_revision + 1);
+    }
+
+    #[test]
+    fn runtime_launch_descriptor_binds_exact_arguments_and_rejects_tampering() {
+        let transaction = registering_transaction();
+        let descriptor = &transaction.candidate_manifest.runtime_launch;
+        assert_eq!(descriptor.kernel_arguments[0].as_str(), "--kernel");
+        assert_eq!(descriptor.store_arguments[0].as_str(), "--store");
+        assert!(descriptor.validate().is_ok());
+
+        let mut tampered = descriptor.clone();
+        tampered.store_arguments[0] = test_handle("--outside-root");
+        assert!(tampered.validate().is_err());
+
+        let mut missing_root = descriptor.clone();
+        missing_root.portable_root = None;
+        assert!(missing_root.validate().is_err());
     }
 }
