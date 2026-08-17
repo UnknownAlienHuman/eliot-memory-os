@@ -1,15 +1,12 @@
 #![forbid(unsafe_code)]
 
+#[cfg(test)]
 use std::collections::BTreeMap;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use eliot_cli::kernel_client::{KernelClient, KernelClientError};
-use eliot_contracts::{
-    ClockReading, ProductId, RequestId, RequestMetadata, SourceId, StateFence, TaskId,
-};
-use eliot_protocol::RequestIdentity;
-use eliot_receipts::RequestBinding;
+use eliot_contracts::StateFence;
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
 use thiserror::Error;
 
 pub const SERVICE_NAME: &str = "eliot-dreamer";
@@ -87,50 +84,18 @@ impl KernelJobAdmission {
         ] {
             validate_text(name, value)?;
         }
-        if self.deadline_unix_ms == 0 {
-            return Err(DreamerError::InvalidAdmission(
-                "Kernel deadline must be positive",
-            ));
+        let now_unix_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|_| DreamerError::InvalidAdmission("Kernel clock is unavailable"))?
+            .as_millis();
+        let now_unix_ms = u64::try_from(now_unix_ms)
+            .map_err(|_| DreamerError::InvalidAdmission("Kernel clock exceeds wire range"))?;
+        if self.deadline_unix_ms <= now_unix_ms {
+            return Err(DreamerError::InvalidAdmission("Kernel deadline is stale"));
         }
         self.state_fence
             .validate()
             .map_err(|error| DreamerError::KernelAdmissionRequired(error.to_string()))
-    }
-
-    fn request_identity(
-        &self,
-        scope_id: &str,
-        task_id_value: Option<&str>,
-    ) -> Result<RequestIdentity, DreamerError> {
-        self.validate()?;
-        let request_id = RequestId::new(self.request_id.clone())
-            .map_err(|error| DreamerError::KernelAdmissionRequired(error.to_string()))?;
-        let product_id = ProductId::new(scope_id.to_owned())
-            .map_err(|error| DreamerError::KernelAdmissionRequired(error.to_string()))?;
-        let source_id = SourceId::new(SERVICE_NAME)
-            .map_err(|error| DreamerError::KernelAdmissionRequired(error.to_string()))?;
-        let task_id = task_id_value
-            .map(TaskId::new)
-            .transpose()
-            .map_err(|error| DreamerError::KernelAdmissionRequired(error.to_string()))?;
-        let metadata = RequestMetadata {
-            request_id,
-            session_id: None,
-            task_id,
-            product_id,
-            source_id,
-            state_fence: self.state_fence.clone(),
-            clock: ClockReading::default(),
-        };
-        Ok(RequestIdentity {
-            request: RequestBinding {
-                metadata,
-                state_fence: self.state_fence.clone(),
-            },
-            idempotency_key: self.idempotency_key.clone(),
-            deadline_unix_ms: self.deadline_unix_ms,
-            cancellation_id: self.cancellation_id.clone(),
-        })
     }
 }
 
@@ -138,6 +103,7 @@ impl KernelJobAdmission {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct KernelHandshake {
     pub authority_epoch: u64,
+    pub dreamer_claim_supported: bool,
 }
 
 /// Provider-neutral Kernel job contract used by the production composition.
@@ -162,44 +128,33 @@ pub struct AuthenticatedKernelJobPort {
 
 impl AuthenticatedKernelJobPort {
     pub fn connect() -> Result<Self, DreamerError> {
-        Ok(Self {
-            client: KernelClient::load().map_err(|error| kernel_admission_error(&error))?,
-        })
-    }
-
-    fn execute(
-        &mut self,
-        operation: &str,
-        admission: &KernelJobAdmission,
-        job: &DreamJobInput,
-        payload: Value,
-    ) -> Result<JobView, DreamerError> {
-        let identity = admission.request_identity(&job.scope_id, job.task_id.as_deref())?;
-        self.client.set_request_identity(identity);
-        let response = self
-            .client
-            .transact_json(operation, payload)
+        let mut client = KernelClient::load().map_err(|error| kernel_admission_error(&error))?;
+        let health = client
+            .probe()
             .map_err(|error| kernel_admission_error(&error))?;
-        decode_job_view(response)
+        if health.get("status").and_then(serde_json::Value::as_str) != Some("OPEN") {
+            return Err(DreamerError::KernelAdmissionRequired(
+                "Kernel health handshake was not OPEN and fenced".to_owned(),
+            ));
+        }
+        let _ = client
+            .transact_json(
+                "dreamer.claim",
+                serde_json::json!({ "protocol": PROTOCOL_VERSION }),
+            )
+            .map_err(|error| kernel_admission_error(&error))?;
+        Err(DreamerError::KernelAdmissionRequired(
+            "KernelClient has no session-bound Dreamer job claim contract".to_owned(),
+        ))
     }
 }
 
 impl KernelJobPort for AuthenticatedKernelJobPort {
     fn handshake(&mut self) -> Result<KernelHandshake, DreamerError> {
-        let response = self
-            .client
-            .probe()
-            .map_err(|error| kernel_admission_error(&error))?;
-        let status = response.get("status").and_then(Value::as_str);
-        let authority_epoch = response.get("authority_epoch").and_then(Value::as_u64);
-        match (status, authority_epoch) {
-            (Some("OPEN"), Some(epoch)) if epoch > 0 => Ok(KernelHandshake {
-                authority_epoch: epoch,
-            }),
-            _ => Err(DreamerError::KernelAdmissionRequired(
-                "Kernel health handshake was not OPEN and fenced".to_owned(),
-            )),
-        }
+        let _ = &self.client;
+        Err(DreamerError::KernelAdmissionRequired(
+            "KernelClient has no session-bound Dreamer handshake contract".to_owned(),
+        ))
     }
 
     fn submit(
@@ -207,56 +162,32 @@ impl KernelJobPort for AuthenticatedKernelJobPort {
         admission: &KernelJobAdmission,
         job: &DreamJobInput,
     ) -> Result<JobView, DreamerError> {
-        self.execute(
-            "dreamer.submit",
-            admission,
-            job,
-            json!({ "admission": admission, "job": job }),
-        )
+        let _ = (admission, job);
+        Err(DreamerError::KernelAdmissionRequired(
+            "KernelClient cannot forward a session-bound Dreamer submit".to_owned(),
+        ))
     }
 
     fn cancel(&mut self, admission: &KernelJobAdmission) -> Result<JobView, DreamerError> {
-        let identity = admission.request_identity(&admission.scope_id, None)?;
-        self.client.set_request_identity(identity);
-        let response = self
-            .client
-            .transact_json("dreamer.cancel", json!({ "admission": admission }))
-            .map_err(|error| kernel_admission_error(&error))?;
-        decode_job_view(response)
+        let _ = admission;
+        Err(DreamerError::KernelAdmissionRequired(
+            "KernelClient cannot forward a session-bound Dreamer cancel".to_owned(),
+        ))
     }
 
     fn status(&mut self, admission: &KernelJobAdmission) -> Result<JobView, DreamerError> {
-        let identity = admission.request_identity(&admission.scope_id, None)?;
-        self.client.set_request_identity(identity);
-        let response = self
-            .client
-            .transact_json("dreamer.status", json!({ "admission": admission }))
-            .map_err(|error| kernel_admission_error(&error))?;
-        decode_job_view(response)
+        let _ = admission;
+        Err(DreamerError::KernelAdmissionRequired(
+            "KernelClient cannot forward a session-bound Dreamer status".to_owned(),
+        ))
     }
 
     fn reconcile(&mut self, admission: &KernelJobAdmission) -> Result<JobView, DreamerError> {
-        let identity = admission.request_identity(&admission.scope_id, None)?;
-        self.client.set_request_identity(identity);
-        let response = self
-            .client
-            .transact_json("dreamer.reconcile", json!({ "admission": admission }))
-            .map_err(|error| kernel_admission_error(&error))?;
-        decode_job_view(response)
-    }
-}
-
-fn decode_job_view(response: Value) -> Result<JobView, DreamerError> {
-    let view = response
-        .get("view")
-        .cloned()
-        .or_else(|| response.get("job").cloned())
-        .unwrap_or(response);
-    serde_json::from_value(view).map_err(|error| {
-        DreamerError::KernelAdmissionRequired(format!(
-            "Kernel returned no typed Dreamer job view: {error}"
+        let _ = admission;
+        Err(DreamerError::KernelAdmissionRequired(
+            "KernelClient cannot forward a session-bound Dreamer reconcile".to_owned(),
         ))
-    })
+    }
 }
 
 fn kernel_admission_error(error: &KernelClientError) -> DreamerError {
@@ -442,6 +373,11 @@ impl<P: KernelJobPort> KernelSupervisedComposition<P> {
                 "Kernel handshake omitted the authority epoch".to_owned(),
             ));
         }
+        if !handshake.dreamer_claim_supported {
+            return Err(DreamerError::KernelAdmissionRequired(
+                "Kernel health is OPEN but Dreamer job claim is unavailable".to_owned(),
+            ));
+        }
         Ok(Self { port, handshake })
     }
 
@@ -486,6 +422,7 @@ impl<P: KernelJobPort> KernelSupervisedComposition<P> {
     }
 }
 
+#[cfg(test)]
 struct StoredJob {
     input: DreamJobInput,
     state: JobState,
@@ -494,17 +431,20 @@ struct StoredJob {
 
 /// Composition root for the demand-start Dreamer process. It has no database,
 /// provider credentials, process-launch capability, or canonical write path.
+#[cfg(test)]
 pub struct DreamerComposition {
     jobs: BTreeMap<String, StoredJob>,
     max_jobs: usize,
 }
 
+#[cfg(test)]
 impl Default for DreamerComposition {
     fn default() -> Self {
         Self::new(128)
     }
 }
 
+#[cfg(test)]
 impl DreamerComposition {
     #[must_use]
     pub fn new(max_jobs: usize) -> Self {
@@ -563,6 +503,7 @@ impl DreamerComposition {
     }
 }
 
+#[cfg(test)]
 fn view(job_id: &str, job: &StoredJob) -> JobView {
     JobView {
         job_id: job_id.into(),
@@ -571,6 +512,7 @@ fn view(job_id: &str, job: &StoredJob) -> JobView {
     }
 }
 
+#[cfg(test)]
 fn build_result(input: &DreamJobInput) -> DreamResult {
     if input.job_class == JobClass::Clarification {
         return DreamResult::Clarification {
@@ -617,6 +559,7 @@ fn build_result(input: &DreamJobInput) -> DreamResult {
     })
 }
 
+#[cfg(test)]
 fn all_handles(input: &DreamJobInput) -> Vec<String> {
     input
         .evidence_handles

@@ -779,8 +779,6 @@ version = "0.1.0"
 dependencies = [
  "eliot-cli",
  "eliot-contracts",
- "eliot-protocol",
- "eliot-receipts",
  "serde",
  "serde_json",
  "thiserror",

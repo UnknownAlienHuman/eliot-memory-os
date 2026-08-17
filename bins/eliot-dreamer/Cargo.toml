@@ -16,8 +16,6 @@ path = "src/main.rs"
 [dependencies]
 eliot-cli.workspace = true
 eliot-contracts.workspace = true
-eliot-protocol.workspace = true
-eliot-receipts.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

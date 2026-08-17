@@ -1,143 +1,28 @@
-use std::io::{self, BufRead, Write};
+use std::io::{self, Write};
 use std::process::ExitCode;
-use std::sync::mpsc;
-use std::time::Duration;
 
-use eliot_dreamer::{
-    AuthenticatedKernelJobPort, DreamJobInput, DreamerError, JobView, KernelJobAdmission,
-    KernelSupervisedComposition, PROTOCOL_VERSION, SERVICE_NAME,
-};
-use serde::{Deserialize, Serialize};
+use eliot_dreamer::{AuthenticatedKernelJobPort, DreamerError};
+use serde::Serialize;
 
 const KERNEL_ADMISSION_EXIT: u8 = 78;
-const MAX_REQUESTS: usize = 128;
-const IDLE_EXIT: Duration = Duration::from_secs(30);
-
-#[derive(Debug, Deserialize)]
-#[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
-#[allow(
-    clippy::large_enum_variant,
-    reason = "Request is a public JSON protocol surface; boxing would change its deserialized API shape"
-)]
-enum Request {
-    Submit {
-        admission: KernelJobAdmission,
-        job: DreamJobInput,
-    },
-    Cancel {
-        admission: KernelJobAdmission,
-    },
-    Status {
-        admission: KernelJobAdmission,
-    },
-    Reconcile {
-        admission: KernelJobAdmission,
-    },
-}
 
 #[derive(Debug, Serialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
-#[allow(
-    clippy::large_enum_variant,
-    reason = "Response is a public JSON protocol surface; boxing would change its serialized API shape"
-)]
 enum Response {
-    Ready {
-        service: &'static str,
-        protocol: &'static str,
-        transport: &'static str,
-    },
-    Job {
-        view: JobView,
-    },
-    Error {
-        code: &'static str,
-        error: String,
-    },
+    Error { code: &'static str, error: String },
 }
 
 fn main() -> ExitCode {
-    let stdin = io::stdin();
     let mut output = io::BufWriter::new(io::stdout().lock());
-    let port = match AuthenticatedKernelJobPort::connect() {
-        Ok(port) => port,
-        Err(error) => {
-            let _ = write_response(&mut output, &error_response(&error));
-            return ExitCode::from(KERNEL_ADMISSION_EXIT);
-        }
+    let error = match AuthenticatedKernelJobPort::connect() {
+        Ok(_) => DreamerError::KernelAdmissionRequired(
+            "Kernel job claim unexpectedly became available without a session-bound identity"
+                .to_owned(),
+        ),
+        Err(error) => error,
     };
-    let mut service = match KernelSupervisedComposition::connect(port) {
-        Ok(service) => service,
-        Err(error) => {
-            let _ = write_response(&mut output, &error_response(&error));
-            return ExitCode::from(KERNEL_ADMISSION_EXIT);
-        }
-    };
-    if !write_response(
-        &mut output,
-        &Response::Ready {
-            service: SERVICE_NAME,
-            protocol: PROTOCOL_VERSION,
-            transport: "authenticated_kernel_front_door",
-        },
-    ) {
-        return ExitCode::SUCCESS;
-    }
-
-    let (sender, receiver) = mpsc::channel();
-    std::thread::spawn(move || {
-        for line in stdin.lock().lines() {
-            if sender.send(line).is_err() {
-                break;
-            }
-        }
-    });
-
-    for _ in 0..MAX_REQUESTS {
-        let line = match receiver.recv_timeout(IDLE_EXIT) {
-            Ok(Ok(line)) => line,
-            Ok(Err(error)) => {
-                if !write_response(&mut output, &error_response(&io_error(&error))) {
-                    break;
-                }
-                continue;
-            }
-            Err(mpsc::RecvTimeoutError::Timeout | mpsc::RecvTimeoutError::Disconnected) => break,
-        };
-        if line.trim().is_empty() {
-            continue;
-        }
-        let response = dispatch(&mut service, &line);
-        if !write_response(&mut output, &response) {
-            break;
-        }
-    }
-    ExitCode::SUCCESS
-}
-
-fn dispatch(
-    service: &mut KernelSupervisedComposition<AuthenticatedKernelJobPort>,
-    line: &str,
-) -> Response {
-    let request = match serde_json::from_str::<Request>(line) {
-        Ok(request) => request,
-        Err(error) => {
-            return Response::Error {
-                code: "DREAMER_REQUEST_REJECTED",
-                error: format!("request: {error}"),
-            };
-        }
-    };
-    let result = match request {
-        Request::Submit { admission, job } => service.submit(&admission, &job),
-        Request::Cancel { admission } => service.cancel(&admission),
-        Request::Status { admission } => service.status(&admission),
-        Request::Reconcile { admission } => service.reconcile(&admission),
-    };
-    result.map_or_else(
-        |error| error_response(&error),
-        |view| Response::Job { view },
-    )
+    let _ = write_response(&mut output, &error_response(&error));
+    ExitCode::from(KERNEL_ADMISSION_EXIT)
 }
 
 fn error_response(error: &DreamerError) -> Response {
@@ -145,10 +30,6 @@ fn error_response(error: &DreamerError) -> Response {
         code: error.code(),
         error: error.to_string(),
     }
-}
-
-fn io_error(error: &io::Error) -> DreamerError {
-    DreamerError::KernelAdmissionRequired(format!("control transport: {error}"))
 }
 
 fn write_response(output: &mut impl Write, response: &Response) -> bool {
@@ -161,6 +42,9 @@ fn write_response(output: &mut impl Write, response: &Response) -> bool {
 mod tests {
     use super::*;
     use eliot_contracts::{AuthorityEpoch, ResourceGeneration, StateFence};
+    use eliot_dreamer::{
+        DreamJobInput, JobClass, JobView, KernelJobAdmission, KernelSupervisedComposition,
+    };
     use std::collections::VecDeque;
 
     struct ClosedKernel {
@@ -213,7 +97,7 @@ mod tests {
             request_id: "request-1".to_owned(),
             idempotency_key: "job-1:attempt-1".to_owned(),
             cancellation_id: "cancel-1".to_owned(),
-            deadline_unix_ms: 1,
+            deadline_unix_ms: u64::MAX,
             state_fence: StateFence::new(AuthorityEpoch::genesis(), ResourceGeneration::genesis()),
         }
     }
@@ -233,7 +117,25 @@ mod tests {
     #[test]
     fn bad_kernel_handshake_never_constructs_ready_service() {
         let result = KernelSupervisedComposition::connect(ClosedKernel {
-            handshake: Ok(eliot_dreamer::KernelHandshake { authority_epoch: 0 }),
+            handshake: Ok(eliot_dreamer::KernelHandshake {
+                authority_epoch: 0,
+                dreamer_claim_supported: true,
+            }),
+            responses: VecDeque::new(),
+        });
+        assert!(matches!(
+            result,
+            Err(DreamerError::KernelAdmissionRequired(_))
+        ));
+    }
+
+    #[test]
+    fn open_health_without_dreamer_claim_never_constructs_ready_service() {
+        let result = KernelSupervisedComposition::connect(ClosedKernel {
+            handshake: Ok(eliot_dreamer::KernelHandshake {
+                authority_epoch: 1,
+                dreamer_claim_supported: false,
+            }),
             responses: VecDeque::new(),
         });
         assert!(matches!(
@@ -245,7 +147,10 @@ mod tests {
     #[test]
     fn replay_and_cancel_are_fail_closed_without_local_terminal_state() {
         let result = KernelSupervisedComposition::connect(ClosedKernel {
-            handshake: Ok(eliot_dreamer::KernelHandshake { authority_epoch: 1 }),
+            handshake: Ok(eliot_dreamer::KernelHandshake {
+                authority_epoch: 1,
+                dreamer_claim_supported: true,
+            }),
             responses: VecDeque::from([
                 Err(DreamerError::KernelAdmissionRequired(
                     "replay unavailable".to_owned(),
@@ -268,5 +173,70 @@ mod tests {
             service.cancel(&admission).map_err(|error| error.code()),
             Err(eliot_dreamer::KERNEL_ADMISSION_REQUIRED)
         );
+    }
+
+    #[test]
+    fn caller_cannot_switch_admitted_job_or_fence() {
+        let result = KernelSupervisedComposition::connect(ClosedKernel {
+            handshake: Ok(eliot_dreamer::KernelHandshake {
+                authority_epoch: 1,
+                dreamer_claim_supported: true,
+            }),
+            responses: VecDeque::from([Err(DreamerError::KernelAdmissionRequired(
+                "not reached".to_owned(),
+            ))]),
+        });
+        let Ok(mut service) = result else {
+            return;
+        };
+        let admission = admission();
+        let mut job = DreamJobInput {
+            job_id: admission.job_id.clone(),
+            job_class: JobClass::Orientation,
+            exact_question: "question".to_owned(),
+            requester: "requester".to_owned(),
+            scope_id: admission.scope_id.clone(),
+            task_id: None,
+            state_fence: "kernel-owned".to_owned(),
+            evidence_handles: Vec::new(),
+            memory_handles: Vec::new(),
+            architecture_handles: Vec::new(),
+            implementation_handles: Vec::new(),
+            conformance_handles: Vec::new(),
+            conflicts_and_unknowns: Vec::new(),
+            privacy_profile: "local".to_owned(),
+            allowed_tools: Vec::new(),
+            allowed_model_routes: vec!["kernel-route".to_owned()],
+            budget_units: 1,
+            deadline_ms: 1,
+            output_schema: "candidate".to_owned(),
+            forbidden_effects: Vec::new(),
+        };
+        job.job_id = "caller-switched-job".to_owned();
+        assert_eq!(
+            service
+                .submit(&admission, &job)
+                .map_err(|error| error.code()),
+            Err(eliot_dreamer::KERNEL_ADMISSION_REQUIRED)
+        );
+        let mut switched = admission;
+        let Ok(switched_epoch) = AuthorityEpoch::new(2) else {
+            return;
+        };
+        switched.state_fence.authority_epoch = switched_epoch;
+        assert_eq!(
+            service.status(&switched).map_err(|error| error.code()),
+            Err(eliot_dreamer::KERNEL_ADMISSION_REQUIRED)
+        );
+    }
+
+    #[test]
+    fn stale_deadline_is_rejected_before_kernel_dispatch() {
+        let mut stale = admission();
+        stale.deadline_unix_ms = 1;
+        assert!(matches!(
+            stale.validate(),
+            Err(DreamerError::InvalidAdmission("Kernel deadline is stale"))
+        ));
     }
 }
