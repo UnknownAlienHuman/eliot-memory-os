@@ -22,11 +22,11 @@ use eliot_protocol::{
 use eliot_receipts::RequestBinding;
 use eliot_runtime_contracts::{ModuleContract, ModuleGeneration, ModuleGenerationState};
 use eliot_store_api::{
-    CAPABILITIES, CanonicalStoreClient, EFFECTS, NamedReadOperation, NamedReadRequest,
-    NamedReadResponse, OperationId, OrderingHead, OrderingHeadExpectation, OrderingScopeId,
-    PreparedTransition, ReadConsistency, RequestMeta, RevisionHead, RevisionHeadExpectation,
-    RevisionKey, ScopeId, ScopeRevisionView, StoreError, StoreHealth, StoreRequest, StoreResponse,
-    StoreWireError, WriteReceipt,
+    CAPABILITIES, CanonicalStoreClient, CanonicalValidationSnapshot, EFFECTS, NamedReadOperation,
+    NamedReadRequest, NamedReadResponse, OperationId, OrderingHead, OrderingHeadExpectation,
+    OrderingScopeId, PreparedTransition, ReadConsistency, RequestMeta, RevisionHead,
+    RevisionHeadExpectation, RevisionKey, ScopeId, ScopeRevisionView, StoreError, StoreHealth,
+    StoreRequest, StoreResponse, StoreWireError, WriteReceipt,
 };
 use thiserror::Error;
 use tokio::sync::Mutex;
@@ -435,6 +435,34 @@ impl<T: EbpStoreTransport + 'static> CanonicalStoreClient for EbpCanonicalStoreC
         }
     }
 
+    async fn validation_snapshot(&self) -> Result<CanonicalValidationSnapshot, StoreError> {
+        let response = self
+            .execute_raw(
+                StoreRequest::ValidationSnapshot,
+                None,
+                "store-validation-snapshot",
+            )
+            .await
+            .map_err(RequestFailure::into_store_error)?;
+        let StoreResponse::ValidationSnapshot { snapshot } = response else {
+            return Err(StoreError::InvalidReceipt);
+        };
+        snapshot.validate()?;
+        if snapshot.state_fence != self.requirement.state_fence
+            || snapshot.state_fence.resource_generation != self.requirement.store_generation
+            || snapshot.state_fence.authority_epoch != self.requirement.authority_epoch()
+        {
+            return Err(StoreError::FenceMismatch);
+        }
+        let now = i64::try_from(unix_ms()).unwrap_or(i64::MAX);
+        if snapshot.observed_at_unix_ms > now
+            || now.saturating_sub(snapshot.observed_at_unix_ms) > 30_000
+        {
+            return Err(StoreError::Unavailable);
+        }
+        Ok(snapshot)
+    }
+
     async fn scope_revision_view(
         &self,
         scope_id: ScopeId,
@@ -535,7 +563,11 @@ fn client_hello(
         version: ContractVersion::new(1, 0, 0),
         artifact_id: artifact_id.clone(),
         protocols: vec!["eliot.s03.ebp.v1".to_owned()],
-        required_capabilities: vec!["store.readiness".to_owned(), "store.apply".to_owned()],
+        required_capabilities: vec![
+            "store.readiness".to_owned(),
+            "store.apply".to_owned(),
+            "store.validation_snapshot".to_owned(),
+        ],
         optional_capabilities: Vec::new(),
         advisory_capabilities: Vec::new(),
         state_owner: "eliot-kernel".to_owned(),

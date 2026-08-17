@@ -32,10 +32,11 @@ pub use config::{
 };
 use eliot_platform::ClockObservation;
 use eliot_store_api::{
-    CONTRACT_VERSION, CanonicalStoreClient, EffectClass, NamedOperationManifest, NamedReadRequest,
-    NamedReadResponse, OperationId, OrderingHead, OrderingHeadExpectation, OrderingScopeId,
-    PreparedTransition, RequestMeta, RevisionHead, RevisionHeadExpectation, RevisionKey, ScopeId,
-    ScopeRevisionView, StoreError, StoreHealth, TransitionClass, WriteReceipt,
+    CONTRACT_VERSION, CanonicalStoreClient, CanonicalValidationSnapshot, EffectClass,
+    NamedOperationManifest, NamedReadRequest, NamedReadResponse, OperationId, OrderingHead,
+    OrderingHeadExpectation, OrderingScopeId, PreparedTransition, RequestMeta, RevisionHead,
+    RevisionHeadExpectation, RevisionKey, ScopeId, ScopeRevisionView, StoreError, StoreHealth,
+    TransitionClass, WriteReceipt,
 };
 pub use error::AdapterError;
 pub use health::{AdapterAvailability, AdapterHealth, ProviderHealth};
@@ -196,6 +197,12 @@ impl CanonicalStoreClient for SurrealStoreAdapter {
         keys: Vec<RevisionKey>,
     ) -> Result<Vec<RevisionHead>, StoreError> {
         apply::read_revision_heads(self, keys)
+            .await
+            .map_err(AdapterError::into_store_error)
+    }
+
+    async fn validation_snapshot(&self) -> Result<CanonicalValidationSnapshot, StoreError> {
+        apply::read_validation_snapshot(self)
             .await
             .map_err(AdapterError::into_store_error)
     }

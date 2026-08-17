@@ -39,17 +39,19 @@ use eliot_ors::{
     ProcessStartReplayRecord as OrsReplayRecord, ProcessStartReplayState as OrsReplayState,
 };
 use eliot_ors::{OperationalRecoveryStore, RedbRecoveryStore};
-use eliot_platform::PortError;
+use eliot_platform::{ClockObservation, PortError};
 use eliot_platform_windows::{
     ProtectedPathLease, ProtectedSecret, RetainedProcessPathLease, UserOwnedPathLease,
     UserOwnedRootLease, WindowsPlatform,
 };
+#[cfg(test)]
+use eliot_process::ProcessIntent;
 use eliot_process::{
-    DispatchAuthorityId, DispatchValidationContext, Generation, KernelDispatchKey, PermitIssuance,
-    ProcessEvidence, ProcessEvidenceSink, ProcessExecutionAdmissionRequest, ProcessExecutionError,
-    ProcessExecutor, ProcessIntent, ProcessLaunchAdmission, ProcessOwnerBinding, ProcessRequest,
-    ProcessSessionBinding, ProcessStartReceipt, SuspendedLaunchEvidence, SuspendedProcessIdentity,
-    ValidatedDispatch,
+    DispatchAuthorityId, DispatchValidationContext, FencingToken, Generation, KernelDispatchKey,
+    PermitIssuance, ProcessEvidence, ProcessEvidenceSink, ProcessExecutionAdmissionRequest,
+    ProcessExecutionError, ProcessExecutor, ProcessLaunchAdmission, ProcessOwnerBinding,
+    ProcessRequest, ProcessSessionBinding, ProcessStartReceipt, SuspendedLaunchEvidence,
+    SuspendedProcessIdentity, ValidatedDispatch,
 };
 use eliot_process_executor::{DispatchValidationPort, WindowsProcessExecutor};
 use eliot_protocol::{EncodingProfile, Frame, FrameKind, MessageType, ProtocolPayload};
@@ -59,8 +61,8 @@ use eliot_runtime_contracts::{
     HealthVector, ModuleGeneration, ModuleGenerationState,
 };
 use eliot_store_api::{
-    CanonicalStoreClient, OrderingHeadExpectation, PreparedTransition, RevisionHeadExpectation,
-    StoreError, WriteReceipt,
+    CanonicalStoreClient, CanonicalValidationSnapshot, OrderingHeadExpectation, PreparedTransition,
+    RevisionHeadExpectation, StoreError, WriteReceipt,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
@@ -288,18 +290,6 @@ pub struct ProcessExecutionAuthorityConfig {
     pub snapshot_binding: AuthoritySnapshotBinding,
     /// Host/platform codec for the opaque durable authority snapshot.
     pub snapshot_codec: Arc<dyn DispatchSnapshotCodec>,
-    /// Live ORS-backed validation context. It must ignore caller-provided
-    /// fences and read the current Kernel clock, fence and revision heads.
-    pub validation_context: Arc<dyn ProcessValidationContextProvider>,
-}
-
-/// Kernel-owned source of current dispatch validation material.
-pub trait ProcessValidationContextProvider: Send + Sync {
-    /// Reads current clock, authority fence, revision heads and validation
-    /// revision from the durable Kernel/ORS state.
-    fn current_context(&self) -> Result<DispatchValidationContext, ProcessExecutionError>;
-    /// Validates the immutable launch ceilings against current Kernel policy.
-    fn validate_intent(&self, intent: &ProcessIntent) -> Result<(), ProcessExecutionError>;
 }
 
 struct OrsProcessReplayStore {
@@ -500,10 +490,59 @@ impl ProcessExecutionReplayStore for OrsProcessReplayStore {
     }
 }
 
+struct ValidationContextSlot {
+    contexts: Mutex<BTreeMap<eliot_process::OperationId, DispatchValidationContext>>,
+}
+
+impl ValidationContextSlot {
+    fn new() -> Self {
+        Self {
+            contexts: Mutex::new(BTreeMap::new()),
+        }
+    }
+
+    fn insert(
+        &self,
+        operation_id: eliot_process::OperationId,
+        context: DispatchValidationContext,
+    ) -> Result<(), ProcessExecutionError> {
+        let mut contexts = self.contexts.lock().map_err(|_| {
+            ProcessExecutionError::Unavailable("validation context lock poisoned".to_owned())
+        })?;
+        if contexts.insert(operation_id, context).is_some() {
+            return Err(ProcessExecutionError::Contract(
+                eliot_process::ContractError::DispatchBindingMismatch,
+            ));
+        }
+        Ok(())
+    }
+
+    fn take(
+        &self,
+        operation_id: &eliot_process::OperationId,
+    ) -> Result<DispatchValidationContext, ProcessExecutionError> {
+        self.contexts
+            .lock()
+            .map_err(|_| {
+                ProcessExecutionError::Unavailable("validation context lock poisoned".to_owned())
+            })?
+            .remove(operation_id)
+            .ok_or(ProcessExecutionError::Contract(
+                eliot_process::ContractError::DispatchBindingMismatch,
+            ))
+    }
+
+    fn remove(&self, operation_id: &eliot_process::OperationId) {
+        if let Ok(mut contexts) = self.contexts.lock() {
+            contexts.remove(operation_id);
+        }
+    }
+}
+
 struct ControllerDispatchPort {
     controller: Arc<Mutex<ProcessDispatchAuthorityController>>,
     binding: AuthoritySnapshotBinding,
-    validation_context: Arc<dyn ProcessValidationContextProvider>,
+    validation_contexts: Arc<ValidationContextSlot>,
 }
 
 impl DispatchValidationPort for ControllerDispatchPort {
@@ -512,8 +551,7 @@ impl DispatchValidationPort for ControllerDispatchPort {
         request: ProcessRequest,
         observed: SuspendedProcessIdentity,
     ) -> Result<ValidatedDispatch, ProcessExecutionError> {
-        self.validation_context.validate_intent(request.intent())?;
-        let current = self.validation_context.current_context()?;
+        let current = self.validation_contexts.take(request.operation_id())?;
         self.controller
             .lock()
             .map_err(|_| {
@@ -530,7 +568,9 @@ struct ProcessExecutionGateway {
     replay_store: Arc<dyn ProcessExecutionReplayStore>,
     evidence_store: Arc<RedbRecoveryStore>,
     snapshot_binding: AuthoritySnapshotBinding,
-    validation_context: Arc<dyn ProcessValidationContextProvider>,
+    validation_contexts: Arc<ValidationContextSlot>,
+    #[cfg(windows)]
+    canonical_store: Arc<Mutex<Option<Arc<KernelStoreGateway>>>>,
     path_admission: Arc<KernelPathAdmission>,
 }
 
@@ -619,13 +659,13 @@ impl ProcessExecutionGateway {
         controller: Arc<Mutex<ProcessDispatchAuthorityController>>,
         ors: Arc<RedbRecoveryStore>,
         snapshot_binding: AuthoritySnapshotBinding,
-        validation_context: Arc<dyn ProcessValidationContextProvider>,
         path_admission: Arc<KernelPathAdmission>,
     ) -> Self {
+        let validation_contexts = Arc::new(ValidationContextSlot::new());
         let port = Arc::new(ControllerDispatchPort {
             controller: Arc::clone(&controller),
             binding: snapshot_binding.clone(),
-            validation_context: Arc::clone(&validation_context),
+            validation_contexts: Arc::clone(&validation_contexts),
         });
         let launch_admission: Arc<dyn ProcessLaunchAdmission> = path_admission.clone();
         Self {
@@ -636,9 +676,47 @@ impl ProcessExecutionGateway {
             }),
             evidence_store: ors,
             snapshot_binding,
-            validation_context,
+            validation_contexts,
+            #[cfg(windows)]
+            canonical_store: Arc::new(Mutex::new(None)),
             path_admission,
         }
+    }
+
+    #[cfg(windows)]
+    fn attach_canonical_store(
+        &self,
+        gateway: Arc<KernelStoreGateway>,
+    ) -> Result<(), KernelBuildError> {
+        let mut retained = self
+            .canonical_store
+            .lock()
+            .map_err(|_| KernelBuildError::Service("store gateway lock poisoned".to_owned()))?;
+        if retained.is_some() {
+            return Err(KernelBuildError::StoreAlreadyConnected);
+        }
+        *retained = Some(gateway);
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    async fn canonical_validation_snapshot(
+        &self,
+    ) -> Result<CanonicalValidationSnapshot, ProcessExecutionError> {
+        let gateway = self
+            .canonical_store
+            .lock()
+            .map_err(|_| {
+                ProcessExecutionError::Unavailable("store gateway lock poisoned".to_owned())
+            })?
+            .clone()
+            .ok_or_else(|| {
+                ProcessExecutionError::Unavailable("canonical store is not connected".to_owned())
+            })?;
+        gateway
+            .validation_snapshot()
+            .await
+            .map_err(ProcessExecutionError::Unavailable)
     }
 
     fn mark_unknown(
@@ -678,8 +756,6 @@ impl ProcessExecutionGateway {
                 eliot_process::ContractError::DispatchBindingMismatch,
             ));
         }
-        self.validation_context
-            .validate_intent(admission.intent())?;
         if admission.recipient_module_id() != owner.module_id()
             || admission.state_fence().authority_epoch() != owner.authority_epoch()
             || admission.state_fence().generation().get() != owner.generation().get()
@@ -734,6 +810,58 @@ impl ProcessExecutionGateway {
                 };
             }
         }
+        let snapshot = {
+            #[cfg(windows)]
+            {
+                self.canonical_validation_snapshot().await?
+            }
+            #[cfg(not(windows))]
+            {
+                return Err(ProcessExecutionError::Unavailable(
+                    "canonical store validation is unavailable on this platform".to_owned(),
+                ));
+            }
+        };
+        snapshot
+            .validate()
+            .map_err(|error| ProcessExecutionError::Unavailable(error.to_string()))?;
+        if admission.state_fence().authority_epoch() != snapshot.state_fence.authority_epoch.value()
+            || admission.state_fence().generation().get()
+                != snapshot.state_fence.resource_generation.value()
+        {
+            return Err(ProcessExecutionError::Contract(
+                eliot_process::ContractError::StaleStateFence,
+            ));
+        }
+        let store_fence = FencingToken::new(
+            snapshot.state_fence.authority_epoch.value(),
+            Generation::new(snapshot.state_fence.resource_generation.value())
+                .map_err(|error| ProcessExecutionError::Unavailable(error.to_string()))?,
+            format!(
+                "store-fence-{}-{}",
+                snapshot.state_fence.authority_epoch.value(),
+                snapshot.validation_revision
+            ),
+        )
+        .map_err(|error| ProcessExecutionError::Unavailable(error.to_string()))?;
+        let revision_heads = snapshot
+            .revision_heads
+            .iter()
+            .map(|head| (head.key.to_string(), head.revision.to_string()))
+            .collect::<BTreeMap<_, _>>();
+        let context = DispatchValidationContext::new(
+            ClockObservation {
+                valid_time_ms: Some(snapshot.observed_at_unix_ms),
+                known_time_ms: Some(snapshot.observed_at_unix_ms),
+                transaction_sequence: None,
+                monotonic_ns: None,
+            },
+            store_fence.clone(),
+            snapshot.state_fence.authority_epoch.value(),
+            revision_heads.clone(),
+            snapshot.validation_revision,
+        )
+        .map_err(|error| ProcessExecutionError::Unavailable(error.to_string()))?;
         let permit = match self
             .controller
             .lock()
@@ -742,16 +870,17 @@ impl ProcessExecutionGateway {
             })?
             .issue(
                 admission.intent(),
-                PermitIssuance::new(
+                PermitIssuance::new_with_validation_revision(
                     admission.action_lease_ref().clone(),
-                    admission.state_fence().clone(),
-                    admission.expected_revision_heads().clone(),
+                    store_fence,
+                    revision_heads,
                     now,
                     admission.deadline_unix_ms(),
                     format!(
                         "process-start:{}",
                         admission.intent().operation_id().as_str()
                     ),
+                    snapshot.validation_revision,
                 )
                 .map_err(|error| ProcessExecutionError::Unavailable(error.to_string()))?,
                 &self.snapshot_binding,
@@ -776,6 +905,14 @@ impl ProcessExecutionGateway {
             self.mark_unknown(&operation_id, &digest, owner);
             return Err(error);
         }
+        if let Err(error) = self
+            .validation_contexts
+            .insert(operation_id.clone(), context)
+        {
+            self.path_admission.remove(&operation_id);
+            self.mark_unknown(&operation_id, &digest, owner);
+            return Err(error);
+        }
         let receipt = match self
             .executor
             .start(
@@ -788,10 +925,12 @@ impl ProcessExecutionGateway {
             .await
         {
             Ok(receipt) => {
+                self.validation_contexts.remove(&operation_id);
                 self.path_admission.remove(&operation_id);
                 receipt
             }
             Err(error) => {
+                self.validation_contexts.remove(&operation_id);
                 self.path_admission.remove(&operation_id);
                 self.mark_unknown(admission.intent().operation_id(), &digest, owner);
                 return Err(error);
@@ -826,7 +965,9 @@ impl ProcessExecutionGateway {
         operation_id: eliot_process::OperationId,
     ) -> Result<eliot_process::CancellationReceipt, ProcessExecutionError> {
         self.authorize_operation(owner, &operation_id)?;
-        self.executor.cancel(operation_id).await
+        let result = self.executor.cancel(operation_id.clone()).await;
+        self.validation_contexts.remove(&operation_id);
+        result
     }
 
     async fn reconcile(
@@ -1010,6 +1151,14 @@ impl KernelStoreGateway {
         drop(lease);
         result
     }
+
+    /// Reads one Host-bound canonical validation snapshot.
+    pub async fn validation_snapshot(&self) -> Result<CanonicalValidationSnapshot, String> {
+        self.store
+            .validation_snapshot()
+            .await
+            .map_err(|error| error.to_string())
+    }
 }
 
 /// The sole semantic bridge between ORS cutover evidence and the in-memory
@@ -1190,7 +1339,6 @@ impl KernelComposition {
             Arc::clone(&controller),
             Arc::clone(&ors),
             authority_config.snapshot_binding,
-            authority_config.validation_context,
             path_admission,
         ));
         Self::assemble(config, ors, Some(gateway), platform)
@@ -1569,6 +1717,9 @@ impl KernelComposition {
             return Err(KernelBuildError::StoreAlreadyConnected);
         }
         *retained = Some(gateway.clone());
+        if let Some(process_gateway) = &self.process_gateway {
+            process_gateway.attach_canonical_store(gateway.clone())?;
+        }
         Ok(gateway)
     }
 
@@ -2153,20 +2304,6 @@ mod tests {
         }
     }
 
-    struct UnusedValidationContext;
-
-    impl ProcessValidationContextProvider for UnusedValidationContext {
-        fn current_context(&self) -> Result<DispatchValidationContext, ProcessExecutionError> {
-            Err(ProcessExecutionError::Unavailable(
-                "fixture validation context is not used".to_owned(),
-            ))
-        }
-
-        fn validate_intent(&self, _intent: &ProcessIntent) -> Result<(), ProcessExecutionError> {
-            Ok(())
-        }
-    }
-
     fn authority_binding(authority_id: &DispatchAuthorityId) -> AuthoritySnapshotBinding {
         let epoch = EpochLineage {
             current: EpochIdentity {
@@ -2518,7 +2655,6 @@ mod tests {
                 key: KernelDispatchKey::from_secret_bytes([0x4a; 32]).expect("restore key"),
                 snapshot_binding: binding,
                 snapshot_codec: codec,
-                validation_context: Arc::new(UnusedValidationContext),
             },
         )
         .expect("process authority constructor");

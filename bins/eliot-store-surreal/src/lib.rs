@@ -27,10 +27,10 @@ use eliot_protocol::{
     ProtocolVersion, ServerHello,
 };
 use eliot_store_api::{
-    CAPABILITIES, CanonicalStoreClient, EFFECTS, NamedReadRequest, NamedReadResponse, OperationId,
-    OrderingHead, OrderingHeadExpectation, OrderingScopeId, PreparedTransition, RequestMeta,
-    RevisionHead, RevisionHeadExpectation, RevisionKey, StoreError, StoreHealth, WriteReceipt,
-    decode_request_frame,
+    CAPABILITIES, CanonicalStoreClient, CanonicalValidationSnapshot, EFFECTS, NamedReadRequest,
+    NamedReadResponse, OperationId, OrderingHead, OrderingHeadExpectation, OrderingScopeId,
+    PreparedTransition, RequestMeta, RevisionHead, RevisionHeadExpectation, RevisionKey,
+    StoreError, StoreHealth, WriteReceipt, decode_request_frame,
 };
 pub use eliot_store_api::{ReadinessReceipt, StoreRequest as Request, StoreResponse as Response};
 use eliot_store_surreal_adapter::{
@@ -406,6 +406,11 @@ impl StoreComposition {
         self.store.revision_heads(keys).await
     }
 
+    /// Reads one coherent canonical validation snapshot.
+    pub async fn validation_snapshot(&self) -> Result<CanonicalValidationSnapshot, StoreError> {
+        self.store.validation_snapshot().await
+    }
+
     /// Reads ordering heads through the neutral store boundary.
     pub async fn ordering_heads(
         &self,
@@ -679,6 +684,12 @@ impl StoreDispatchBackend for StoreComposition {
             },
             Request::OrderingHeads { scopes } => match self.ordering_heads(scopes).await {
                 Ok(heads) => Response::OrderingHeads { heads },
+                Err(error) => Response::Error {
+                    error: error.to_string(),
+                },
+            },
+            Request::ValidationSnapshot => match self.validation_snapshot().await {
+                Ok(snapshot) => Response::ValidationSnapshot { snapshot },
                 Err(error) => Response::Error {
                     error: error.to_string(),
                 },

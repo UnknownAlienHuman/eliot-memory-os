@@ -16,9 +16,9 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::{
-    NamedReadRequest, NamedReadResponse, OperationId, OrderingHead, OrderingHeadExpectation,
-    OrderingScopeId, PreparedTransition, RequestMeta, RevisionHead, RevisionHeadExpectation,
-    RevisionKey, StoreError, StoreHealth, WriteReceipt,
+    CanonicalValidationSnapshot, NamedReadRequest, NamedReadResponse, OperationId, OrderingHead,
+    OrderingHeadExpectation, OrderingScopeId, PreparedTransition, RequestMeta, RevisionHead,
+    RevisionHeadExpectation, RevisionKey, StoreError, StoreHealth, WriteReceipt,
 };
 use schemars::JsonSchema;
 
@@ -32,6 +32,7 @@ pub const CAPABILITY_APPLY: &str = "store.apply";
 pub const CAPABILITY_RECEIPT: &str = "store.receipt";
 pub const CAPABILITY_REVISION_HEADS: &str = "store.revision_heads";
 pub const CAPABILITY_ORDERING_HEADS: &str = "store.ordering_heads";
+pub const CAPABILITY_VALIDATION_SNAPSHOT: &str = "store.validation_snapshot";
 
 /// Capabilities advertised by the canonical store process.
 pub const CAPABILITIES: &[&str] = &[
@@ -42,6 +43,7 @@ pub const CAPABILITIES: &[&str] = &[
     CAPABILITY_RECEIPT,
     CAPABILITY_REVISION_HEADS,
     CAPABILITY_ORDERING_HEADS,
+    CAPABILITY_VALIDATION_SNAPSHOT,
 ];
 
 /// Effects exposed by the canonical store process.
@@ -147,13 +149,16 @@ pub enum StoreRequest {
     OrderingHeads {
         scopes: Vec<OrderingScopeId>,
     },
+    ValidationSnapshot,
 }
 
 impl StoreRequest {
     /// Validates the closed operation and all bounded list fields.
     pub fn validate(&self) -> Result<(), StoreError> {
         match self {
-            Self::Health | Self::Readiness | Self::Receipt { .. } => Ok(()),
+            Self::Health | Self::Readiness | Self::Receipt { .. } | Self::ValidationSnapshot => {
+                Ok(())
+            }
             Self::Named { request } => request.validate(),
             Self::Apply {
                 context,
@@ -203,6 +208,7 @@ impl StoreRequest {
             Self::Receipt { .. } => CAPABILITY_RECEIPT,
             Self::RevisionHeads { .. } => CAPABILITY_REVISION_HEADS,
             Self::OrderingHeads { .. } => CAPABILITY_ORDERING_HEADS,
+            Self::ValidationSnapshot => CAPABILITY_VALIDATION_SNAPSHOT,
         }
     }
 
@@ -295,6 +301,9 @@ pub enum StoreResponse {
     OrderingHeads {
         heads: Vec<OrderingHead>,
     },
+    ValidationSnapshot {
+        snapshot: CanonicalValidationSnapshot,
+    },
     /// Explicitly unknown/rejected reconciliation outcome; never a success.
     Unknown {
         operation_id: OperationId,
@@ -384,6 +393,9 @@ impl StoreResponse {
                     head.validate().map_err(StoreWireError::Store)?;
                 }
                 Ok(())
+            }
+            Self::ValidationSnapshot { snapshot } => {
+                snapshot.validate().map_err(StoreWireError::Store)
             }
             Self::Unknown { reason, .. } => validate_text(reason, "unknown.reason"),
             Self::Error { error } => validate_text(error, "error"),

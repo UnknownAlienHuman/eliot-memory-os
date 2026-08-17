@@ -5,6 +5,7 @@
 //! [`crate::schema`]. The public boundary only ever carries store-API types.
 
 use std::collections::BTreeSet;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::SurrealStoreAdapter;
 use crate::config::{SchemaGeneration, SurrealAdapterConfig};
@@ -16,14 +17,16 @@ use crate::plan::{
 use crate::readiness::{CompiledMigration, MigrationReceipt, SemanticReadiness};
 use crate::{client, schema};
 use eliot_store_api::{
-    CONTRACT_VERSION, NamedReadOperation, NamedReadRequest, NamedReadResponse, OperationId,
-    OrderingHead, OrderingHeadExpectation, OrderingScopeId, RevisionHead, RevisionHeadExpectation,
-    RevisionKey, ScopeId, ScopeRevisionView, StateFence, StoreError, StoreHealth,
-    StoreHealthStatus, WriteReceipt,
+    CONTRACT_VERSION, CanonicalValidationSnapshot, NamedReadOperation, NamedReadRequest,
+    NamedReadResponse, OperationId, OrderingHead, OrderingHeadExpectation, OrderingScopeId,
+    RevisionHead, RevisionHeadExpectation, RevisionKey, ScopeId, ScopeRevisionView, StateFence,
+    StoreError, StoreHealth, StoreHealthStatus, WriteReceipt,
 };
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::{Map, Value, json};
+
+const READ_VALIDATION_SNAPSHOT: &str = "BEGIN TRANSACTION; SELECT VALUE body FROM ONLY canonical_fence:current; SELECT VALUE body FROM revision_head; COMMIT TRANSACTION;";
 
 /// The durable canonical fence singleton.
 #[derive(Debug, Serialize, serde::Deserialize)]
@@ -563,6 +566,43 @@ async fn read_fence(
     )
     .await?;
     take_optional::<FenceRecord>(&mut response, 0)
+}
+
+/// Reads the canonical fence and all revision heads at one provider boundary.
+pub(crate) async fn read_validation_snapshot(
+    adapter: &SurrealStoreAdapter,
+) -> Result<CanonicalValidationSnapshot, AdapterError> {
+    let db = client(adapter).await?;
+    ensure_ready(adapter, db).await?;
+    let mut response = client::query(
+        db,
+        &adapter.config,
+        "read.validation_snapshot",
+        READ_VALIDATION_SNAPSHOT,
+        Map::new(),
+    )
+    .await?;
+    if !response.take_errors().is_empty() {
+        return Err(AdapterError::PartialOutcome);
+    }
+    let fence = response
+        .take::<Option<FenceRecord>>(1)?
+        .ok_or(StoreError::Unavailable)?;
+    let revision_heads = response.take::<Vec<RevisionHead>>(2)?;
+    let observed_at_unix_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| AdapterError::ProviderUnavailable)?
+        .as_millis()
+        .try_into()
+        .map_err(|_| AdapterError::ProviderUnavailable)?;
+    let snapshot = CanonicalValidationSnapshot {
+        state_fence: fence.state_fence,
+        revision_heads,
+        validation_revision: fence.next_commit_sequence,
+        observed_at_unix_ms,
+    };
+    snapshot.validate()?;
+    Ok(snapshot)
 }
 
 /// Reads revision heads for the requested keys, deduplicated and validated.

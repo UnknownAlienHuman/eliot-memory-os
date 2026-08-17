@@ -568,7 +568,6 @@ pub struct ProcessExecutionAdmissionRequest {
     intent: ProcessIntent,
     action_lease_ref: ActionLeaseRef,
     state_fence: FencingToken,
-    expected_revision_heads: BTreeMap<String, String>,
     deadline_unix_ms: u64,
 }
 
@@ -673,7 +672,6 @@ impl ProcessExecutionAdmissionRequest {
         intent: ProcessIntent,
         action_lease_ref: ActionLeaseRef,
         state_fence: FencingToken,
-        expected_revision_heads: BTreeMap<String, String>,
         deadline_unix_ms: u64,
     ) -> Result<Self, ContractError> {
         let request = Self {
@@ -684,7 +682,6 @@ impl ProcessExecutionAdmissionRequest {
             intent,
             action_lease_ref,
             state_fence,
-            expected_revision_heads,
             deadline_unix_ms,
         };
         request.validate()?;
@@ -699,7 +696,6 @@ impl ProcessExecutionAdmissionRequest {
         if self.state_fence.generation != self.intent.generation {
             return Err(ContractError::FenceMismatch);
         }
-        validate_revision_heads(&self.expected_revision_heads)?;
         if self.deadline_unix_ms == 0 {
             return Err(ContractError::InvalidValue {
                 field: "deadline_unix_ms",
@@ -729,11 +725,6 @@ impl ProcessExecutionAdmissionRequest {
         &self.state_fence
     }
 
-    /// Returns expected ordering/revision heads.
-    pub const fn expected_revision_heads(&self) -> &BTreeMap<String, String> {
-        &self.expected_revision_heads
-    }
-
     /// Returns the absolute deadline.
     pub const fn deadline_unix_ms(&self) -> u64 {
         self.deadline_unix_ms
@@ -749,6 +740,7 @@ pub struct PermitIssuance {
     issued_at_unix_ms: u64,
     expires_at_unix_ms: u64,
     one_shot_nonce: String,
+    validation_revision: Option<u64>,
 }
 
 impl PermitIssuance {
@@ -775,7 +767,36 @@ impl PermitIssuance {
             issued_at_unix_ms,
             expires_at_unix_ms,
             one_shot_nonce: validate_opaque_id("one_shot_nonce", one_shot_nonce.into())?,
+            validation_revision: None,
         })
+    }
+
+    /// Creates Store-bound permit material with an exact validation revision.
+    pub fn new_with_validation_revision(
+        action_lease_ref: ActionLeaseRef,
+        state_fence: FencingToken,
+        expected_revision_heads: BTreeMap<String, String>,
+        issued_at_unix_ms: u64,
+        expires_at_unix_ms: u64,
+        one_shot_nonce: impl Into<String>,
+        validation_revision: u64,
+    ) -> Result<Self, ContractError> {
+        if validation_revision == 0 {
+            return Err(ContractError::InvalidValue {
+                field: "validation_revision",
+                reason: "must be non-zero",
+            });
+        }
+        let mut issuance = Self::new(
+            action_lease_ref,
+            state_fence,
+            expected_revision_heads,
+            issued_at_unix_ms,
+            expires_at_unix_ms,
+            one_shot_nonce,
+        )?;
+        issuance.validation_revision = Some(validation_revision);
+        Ok(issuance)
     }
 }
 
@@ -827,6 +848,7 @@ pub struct DispatchPermit {
     issued_at_unix_ms: u64,
     expires_at_unix_ms: u64,
     one_shot_nonce: String,
+    validation_revision: Option<u64>,
     authentication_tag: String,
     permit_digest: String,
 }
@@ -848,6 +870,7 @@ struct UnsignedPermit<'a> {
     issued_at_unix_ms: u64,
     expires_at_unix_ms: u64,
     one_shot_nonce: &'a str,
+    validation_revision: Option<u64>,
 }
 
 impl DispatchPermit {
@@ -868,6 +891,7 @@ impl DispatchPermit {
             issued_at_unix_ms: self.issued_at_unix_ms,
             expires_at_unix_ms: self.expires_at_unix_ms,
             one_shot_nonce: &self.one_shot_nonce,
+            validation_revision: self.validation_revision,
         }
     }
 
@@ -886,6 +910,12 @@ impl DispatchPermit {
             return Err(ContractError::InvalidValue {
                 field: "permit_freshness",
                 reason: "issue time must be non-zero and precede expiry",
+            });
+        }
+        if self.validation_revision == Some(0) {
+            return Err(ContractError::InvalidValue {
+                field: "validation_revision",
+                reason: "must be non-zero",
             });
         }
         if self.state_fence.generation != self.generation {
@@ -1039,6 +1069,7 @@ impl DispatchPermitAuthority {
             issued_at_unix_ms: issuance.issued_at_unix_ms,
             expires_at_unix_ms: issuance.expires_at_unix_ms,
             one_shot_nonce: issuance.one_shot_nonce,
+            validation_revision: issuance.validation_revision,
             authentication_tag: String::new(),
             permit_digest: String::new(),
         };
@@ -1092,6 +1123,11 @@ impl DispatchPermitAuthority {
             return Err(ContractError::StaleAuthorityEpoch);
         }
         if permit.expected_revision_heads != current.revision_heads {
+            return Err(ContractError::StaleRevisionHeads);
+        }
+        if permit.validation_revision.is_some()
+            && permit.validation_revision != Some(current.validation_revision)
+        {
             return Err(ContractError::StaleRevisionHeads);
         }
         let now = current.now_unix_ms()?;
@@ -2807,7 +2843,14 @@ fn validate_revision_heads(heads: &BTreeMap<String, String>) -> Result<(), Contr
     }
     for (name, digest) in heads {
         validate_opaque_id("revision_head_name", name.clone())?;
-        validate_hex_digest("revision_head_digest", digest)?;
+        if digest.parse::<u64>().is_err() {
+            validate_hex_digest("revision_head_digest", digest)?;
+        } else if digest == "0" {
+            return Err(ContractError::InvalidValue {
+                field: "revision_head_revision",
+                reason: "must be non-zero",
+            });
+        }
     }
     Ok(())
 }
@@ -3009,6 +3052,7 @@ mod tests {
             issued_at_unix_ms: permit.issued_at_unix_ms,
             expires_at_unix_ms: permit.expires_at_unix_ms,
             one_shot_nonce: permit.one_shot_nonce.clone(),
+            validation_revision: permit.validation_revision,
             authentication_tag: permit.authentication_tag.clone(),
             permit_digest: permit.permit_digest.clone(),
         }
@@ -3031,13 +3075,17 @@ mod tests {
             intent()?,
             ActionLeaseRef::new("lease-1")?,
             fence()?,
-            revisions(),
             200,
         )?;
         let wire = serde_json::to_vec(&request)?;
         let restored: ProcessExecutionAdmissionRequest = serde_json::from_slice(&wire)?;
         assert_eq!(request, restored);
         assert_eq!(restored.recipient_module_id(), "eliotd");
+        let wire = serde_json::to_value(&request)?;
+        assert!(wire.get("expected_revision_heads").is_none());
+        let mut legacy = wire;
+        legacy["expected_revision_heads"] = serde_json::json!({"legacy": "a".repeat(64)});
+        assert!(serde_json::from_value::<ProcessExecutionAdmissionRequest>(legacy).is_err());
         Ok(())
     }
 
@@ -3049,7 +3097,6 @@ mod tests {
             intent()?,
             ActionLeaseRef::new("lease-1")?,
             stale,
-            revisions(),
             200,
         ) else {
             return Err("a generation-substituted fence must fail closed".into());
@@ -3133,6 +3180,92 @@ mod tests {
             Err(ContractError::ExpiredDispatchPermit)
         ));
         assert_eq!(authority.consumed_permit_count(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn store_bound_permit_rejects_changed_fence_heads_or_revision_before_consumption() -> TestResult
+    {
+        let intent = intent()?;
+
+        let mut authority_revision = authority()?;
+        let permit = authority_revision.issue(
+            &intent,
+            PermitIssuance::new_with_validation_revision(
+                ActionLeaseRef::new("lease-1")?,
+                fence()?,
+                revisions(),
+                100,
+                200,
+                "store-revision",
+                41,
+            )?,
+        )?;
+        let request = ProcessRequest::new(intent.clone(), permit)?;
+        let mut changed_revision = context(150)?;
+        changed_revision.validation_revision = 42;
+        assert!(matches!(
+            authority_revision.validate_and_consume(request, observed(&intent)?, &changed_revision),
+            Err(ContractError::StaleRevisionHeads)
+        ));
+        assert_eq!(authority_revision.consumed_permit_count(), 0);
+
+        let mut authority_heads = authority()?;
+        let permit = authority_heads.issue(
+            &intent,
+            PermitIssuance::new_with_validation_revision(
+                ActionLeaseRef::new("lease-1")?,
+                fence()?,
+                revisions(),
+                100,
+                200,
+                "store-heads",
+                41,
+            )?,
+        )?;
+        let request = ProcessRequest::new(intent.clone(), permit)?;
+        let mut changed_heads = context(150)?;
+        changed_heads
+            .revision_heads
+            .insert("scope:one".to_owned(), "2".to_owned());
+        assert!(matches!(
+            authority_heads.validate_and_consume(request, observed(&intent)?, &changed_heads),
+            Err(ContractError::StaleRevisionHeads)
+        ));
+        assert_eq!(authority_heads.consumed_permit_count(), 0);
+
+        let mut authority_fence = authority()?;
+        let permit = authority_fence.issue(
+            &intent,
+            PermitIssuance::new_with_validation_revision(
+                ActionLeaseRef::new("lease-1")?,
+                fence()?,
+                revisions(),
+                100,
+                200,
+                "store-fence",
+                41,
+            )?,
+        )?;
+        let request = ProcessRequest::new(intent.clone(), permit)?;
+        let changed_fence = FencingToken::new(8, Generation::new(1)?, "other-fence")?;
+        let changed_context = DispatchValidationContext::new(
+            ClockObservation {
+                valid_time_ms: Some(150),
+                known_time_ms: Some(150),
+                transaction_sequence: None,
+                monotonic_ns: Some(1),
+            },
+            changed_fence,
+            8,
+            revisions(),
+            41,
+        )?;
+        assert!(matches!(
+            authority_fence.validate_and_consume(request, observed(&intent)?, &changed_context),
+            Err(ContractError::StaleStateFence)
+        ));
+        assert_eq!(authority_fence.consumed_permit_count(), 0);
         Ok(())
     }
 

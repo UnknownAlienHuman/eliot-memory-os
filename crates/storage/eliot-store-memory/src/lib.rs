@@ -7,16 +7,17 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Mutex, MutexGuard, TryLockError};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use eliot_store_api::{
-    CanonicalStoreClient, CommitId, EventId, EventProjectionRelationIntents, NamedReadOperation,
-    NamedReadRequest, NamedReadResponse, OperationId, OperationManifestDigest, OrderingHead,
-    OrderingHeadExpectation, OrderingScopeId, OutboxId, OutboxIntent, OutboxState,
-    PreparedTransition, ProjectionMode, ProjectionPublicationId, ProjectionPublicationRecord,
-    ProjectionStatus, RequestMeta, Resubmission, RevisionDelta, RevisionHead,
-    RevisionHeadExpectation, RevisionKey, ScopeId, ScopeRevisionView, SplitView, StateFence,
-    StoreError, StoreHealth, StoreHealthStatus, WriteReceipt, WriteReceiptStatus,
-    canonical_json_bytes, sha256_hex,
+    CanonicalStoreClient, CanonicalValidationSnapshot, CommitId, EventId,
+    EventProjectionRelationIntents, NamedReadOperation, NamedReadRequest, NamedReadResponse,
+    OperationId, OperationManifestDigest, OrderingHead, OrderingHeadExpectation, OrderingScopeId,
+    OutboxId, OutboxIntent, OutboxState, PreparedTransition, ProjectionMode,
+    ProjectionPublicationId, ProjectionPublicationRecord, ProjectionStatus, RequestMeta,
+    Resubmission, RevisionDelta, RevisionHead, RevisionHeadExpectation, RevisionKey, ScopeId,
+    ScopeRevisionView, SplitView, StateFence, StoreError, StoreHealth, StoreHealthStatus,
+    WriteReceipt, WriteReceiptStatus, canonical_json_bytes, sha256_hex,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -390,6 +391,24 @@ impl MemoryStore {
             .collect())
     }
 
+    fn validation_snapshot_sync(&self) -> Result<CanonicalValidationSnapshot, StoreError> {
+        let state = self.lock_state()?;
+        let state_fence = state.fences.clone().ok_or(StoreError::Unavailable)?;
+        let snapshot = CanonicalValidationSnapshot {
+            state_fence,
+            revision_heads: state.revision_heads.values().cloned().collect(),
+            validation_revision: state.next_commit_sequence,
+            observed_at_unix_ms: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_err(|_| StoreError::Unavailable)?
+                .as_millis()
+                .try_into()
+                .map_err(|_| StoreError::Unavailable)?,
+        };
+        snapshot.validate()?;
+        Ok(snapshot)
+    }
+
     fn ordering_heads_sync(
         &self,
         scopes: &[OrderingScopeId],
@@ -532,6 +551,10 @@ impl CanonicalStoreClient for MemoryStore {
         keys: Vec<RevisionKey>,
     ) -> Result<Vec<RevisionHead>, StoreError> {
         self.revision_heads_sync(&keys)
+    }
+
+    async fn validation_snapshot(&self) -> Result<CanonicalValidationSnapshot, StoreError> {
+        self.validation_snapshot_sync()
     }
 
     async fn scope_revision_view(
@@ -929,6 +952,26 @@ mod tests {
         assert!(matches!(error, Err(StoreError::RevisionConflict)));
         assert_eq!(before, store.snapshot()?);
         Ok(())
+    }
+
+    #[test]
+    fn validation_snapshot_is_one_coherent_store_read() -> Result<(), StoreError> {
+        let state_fence = fence();
+        let store = store()?;
+        store.apply_transaction(
+            &metadata(&state_fence)?,
+            transition("snapshot", &state_fence)?,
+            &[],
+            &[],
+        )?;
+
+        let snapshot = store.validation_snapshot_sync()?;
+        assert_eq!(snapshot.state_fence, state_fence);
+        assert_eq!(snapshot.revision_heads.len(), 1);
+        assert_eq!(snapshot.revision_heads[0].revision, 2);
+        assert_eq!(snapshot.validation_revision, 2);
+        assert!(snapshot.observed_at_unix_ms > 0);
+        snapshot.validate()
     }
 
     #[test]

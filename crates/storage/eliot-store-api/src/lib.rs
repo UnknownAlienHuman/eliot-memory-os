@@ -29,8 +29,9 @@ mod wire;
 pub use wire::{
     CAPABILITIES, CAPABILITY_APPLY, CAPABILITY_HEALTH, CAPABILITY_NAMED_READ,
     CAPABILITY_ORDERING_HEADS, CAPABILITY_READINESS, CAPABILITY_RECEIPT, CAPABILITY_REVISION_HEADS,
-    EFFECTS, ReadinessReceipt, ReadinessStatus, StoreRequest, StoreResponse, StoreWireError,
-    decode_request_frame, decode_response_frame, request_frame, response_frame,
+    CAPABILITY_VALIDATION_SNAPSHOT, EFFECTS, ReadinessReceipt, ReadinessStatus, StoreRequest,
+    StoreResponse, StoreWireError, decode_request_frame, decode_response_frame, request_frame,
+    response_frame,
 };
 
 /// Stable identity of this contract surface.
@@ -314,6 +315,49 @@ impl RevisionHead {
             });
         }
         self.state_fence.validate().map_err(StoreError::Foundation)
+    }
+}
+
+/// One coherent canonical-store validation observation.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CanonicalValidationSnapshot {
+    pub state_fence: StateFence,
+    pub revision_heads: Vec<RevisionHead>,
+    pub validation_revision: u64,
+    pub observed_at_unix_ms: i64,
+}
+
+impl CanonicalValidationSnapshot {
+    /// Validates the complete, same-fence snapshot before it is consumed.
+    pub fn validate(&self) -> Result<(), StoreError> {
+        self.state_fence
+            .validate()
+            .map_err(StoreError::Foundation)?;
+        if self.validation_revision == 0 {
+            return Err(StoreError::InvalidField {
+                field: "validation_revision",
+                reason: "must be non-zero",
+            });
+        }
+        if self.observed_at_unix_ms <= 0 {
+            return Err(StoreError::InvalidField {
+                field: "observed_at_unix_ms",
+                reason: "must be a positive Unix timestamp",
+            });
+        }
+        unique(
+            self.revision_heads.iter().map(|head| head.key.clone()),
+            "revision_heads",
+        )?;
+        if self.revision_heads.len() > 128 {
+            return Err(StoreError::PayloadTooLarge);
+        }
+        for head in &self.revision_heads {
+            head.validate()?;
+            ensure_same_fence(&self.state_fence, &head.state_fence)?;
+        }
+        Ok(())
     }
 }
 
@@ -1098,6 +1142,8 @@ pub trait CanonicalStoreClient: Send + Sync {
     /// Reads revision heads by stable key.
     async fn revision_heads(&self, keys: Vec<RevisionKey>)
     -> Result<Vec<RevisionHead>, StoreError>;
+    /// Reads one coherent store fence/revision validation snapshot.
+    async fn validation_snapshot(&self) -> Result<CanonicalValidationSnapshot, StoreError>;
     /// Reads a rebuildable scope revision view.
     async fn scope_revision_view(&self, scope_id: ScopeId)
     -> Result<ScopeRevisionView, StoreError>;
@@ -1124,6 +1170,19 @@ mod tests {
 
     fn id(value: &str) -> Result<OperationId, StoreError> {
         OperationId::new(value).map_err(StoreError::Foundation)
+    }
+
+    fn validation_snapshot() -> Result<CanonicalValidationSnapshot, StoreError> {
+        Ok(CanonicalValidationSnapshot {
+            state_fence: fence(),
+            revision_heads: vec![RevisionHead {
+                key: RevisionKey::new("scope:one")?,
+                revision: 1,
+                state_fence: fence(),
+            }],
+            validation_revision: 2,
+            observed_at_unix_ms: 1_000,
+        })
     }
 
     #[test]
@@ -1215,6 +1274,50 @@ mod tests {
             EffectClass::ExternalEffect
         ));
         assert!(!manifest.admits(TransitionClass::TaskControl, EffectClass::Candidate));
+        Ok(())
+    }
+
+    #[test]
+    fn canonical_validation_snapshot_rejects_corrupt_shape()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let valid = validation_snapshot()?;
+        assert!(valid.validate().is_ok());
+
+        let mut duplicate = valid.clone();
+        duplicate.revision_heads.push(RevisionHead {
+            key: RevisionKey::new("scope:one")?,
+            revision: 2,
+            state_fence: fence(),
+        });
+        assert!(matches!(
+            duplicate.validate(),
+            Err(StoreError::Duplicate {
+                field: "revision_heads"
+            })
+        ));
+
+        let mut mixed_fence = valid.clone();
+        mixed_fence.revision_heads[0].state_fence =
+            StateFence::new(AuthorityEpoch::new(2)?, ResourceGeneration::genesis());
+        assert_eq!(mixed_fence.validate(), Err(StoreError::FenceMismatch));
+
+        let mut zero_revision = valid.clone();
+        zero_revision.validation_revision = 0;
+        assert!(matches!(
+            zero_revision.validate(),
+            Err(StoreError::InvalidField {
+                field: "validation_revision",
+                ..
+            })
+        ));
+
+        let mut invalid_time = valid.clone();
+        invalid_time.observed_at_unix_ms = 0;
+        assert!(invalid_time.validate().is_err());
+
+        let mut unknown = serde_json::to_value(valid)?;
+        unknown["unknown"] = serde_json::json!(true);
+        assert!(serde_json::from_value::<CanonicalValidationSnapshot>(unknown).is_err());
         Ok(())
     }
 }
