@@ -1948,11 +1948,20 @@ dependencies = [
 name = "eliotd"
 version = "0.1.0"
 dependencies = [
+ "eliot-contracts",
  "eliot-governor",
+ "eliot-ipc",
+ "eliot-maintenance",
+ "eliot-platform",
  "eliot-platform-windows",
+ "eliot-protocol",
+ "eliot-receipts",
+ "eliot-runtime-contracts",
+ "eliot-store-api",
  "serde",
  "serde_json",
  "thiserror",
+ "tokio",
 ]
 
 [[package]]
