@@ -888,6 +888,101 @@ pub enum RestoreStep {
     FinalizeIsolatedRoot,
 }
 
+/// Stable identity for one recoverable restore transaction. The identity is
+/// bound to the exact bundle, compiled plan and target context; none of these
+/// values may drift while a journaled restore is resumed.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RestoreTransaction {
+    pub transaction_id: String,
+    pub bundle_sha256: String,
+    pub plan_sha256: String,
+    pub context_sha256: String,
+}
+
+/// One externally visible restore boundary. Item identities are stable and do
+/// not rely on vector positions, so replay remains exact after restart.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RestorePhase {
+    Pending,
+    PrepareIsolatedRoot,
+    ApplyPurgeLedger,
+    ImportSealedBlob { hash: String },
+    ImportCanonicalEvent { record_id: String },
+    ImportReceipt { operation_id: String },
+    ImportProjection { record_id: String },
+    SuspendOrsOperations,
+    RebuildProjections,
+    VerifyReceiptEventChain,
+    FinalizeIsolatedRoot,
+}
+
+/// Journal state is deliberately narrower than a provider's internal state.
+/// An intent without a durable receipt is never treated as success.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RestoreJournalState {
+    Ready,
+    IntentPersisted,
+    ReceiptPersisted,
+    Completed,
+    RollbackRequired,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RestoreIntent {
+    pub transaction_id: String,
+    pub phase: RestorePhase,
+    pub input_digest: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RestoreEffectReceipt {
+    pub transaction_id: String,
+    pub phase: RestorePhase,
+    pub observed_identity_sha256: String,
+}
+
+/// Result of reconciling an intent whose effect may have happened before a
+/// process restart. Only an exact applied receipt may resume the transaction.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RestoreReconciliation {
+    Applied(RestoreEffectReceipt),
+    NotApplied,
+    Unknown,
+}
+
+/// Durable journal row. Implementations persist this record in their own
+/// governed substrate; this crate does not create a second store or fallback.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RestoreJournalRecord {
+    pub transaction: RestoreTransaction,
+    pub revision: u64,
+    pub completed_phases: u64,
+    pub phase: RestorePhase,
+    pub state: RestoreJournalState,
+    pub intent: Option<RestoreIntent>,
+    pub receipt: Option<RestoreEffectReceipt>,
+    pub final_receipt: Option<RestoreReceipt>,
+}
+
+/// Durable restore journal seam. `compare_and_swap` must reject any stale
+/// expected revision and must durably commit the complete next record.
+pub trait RestoreJournalPort {
+    fn load(&mut self, transaction_id: &str) -> Result<Option<RestoreJournalRecord>, BackupError>;
+    fn compare_and_swap(
+        &mut self,
+        transaction_id: &str,
+        expected_revision: u64,
+        next: RestoreJournalRecord,
+    ) -> Result<(), BackupError>;
+}
+
 /// A validated isolated restore plan. It never performs cutover.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -923,22 +1018,7 @@ impl RestorePlan {
             resource_generation: target.target_resource_generation,
         };
         restored_fence.validate()?;
-        let mut steps = vec![
-            RestoreStep::PrepareIsolatedRoot,
-            RestoreStep::ApplyPurgeLedger,
-            RestoreStep::ImportSealedBlobs,
-            RestoreStep::ImportCanonicalEvents,
-            RestoreStep::ImportReceipts,
-            RestoreStep::ImportProjections,
-        ];
-        if bundle.ors_snapshot.is_some() {
-            steps.push(RestoreStep::SuspendOrsOperations);
-        }
-        steps.extend([
-            RestoreStep::RebuildProjections,
-            RestoreStep::VerifyReceiptEventChain,
-            RestoreStep::FinalizeIsolatedRoot,
-        ]);
+        let steps = expected_restore_steps(bundle);
         Ok(Self {
             plan_id: format!("restore-plan-{}", bundle.manifest.backup_id),
             bundle_sha256: bundle.bundle_sha256()?,
@@ -948,57 +1028,472 @@ impl RestorePlan {
         })
     }
 
+    /// Derives the stable transaction identity for this exact plan/context.
+    pub fn transaction(&self) -> Result<RestoreTransaction, BackupError> {
+        let bundle_sha256 = self.bundle_sha256.clone();
+        digest(&bundle_sha256, "restore.transaction.bundle_sha256")?;
+        let plan_sha256 = sha256(self)?;
+        let context_sha256 = sha256(&self.target)?;
+        let transaction_material = (self.plan_id.as_str(), bundle_sha256.as_str());
+        let transaction_id = format!("restore-transaction-{}", sha256(&transaction_material)?);
+        Ok(RestoreTransaction {
+            transaction_id,
+            bundle_sha256,
+            plan_sha256,
+            context_sha256,
+        })
+    }
+
     /// Executes the plan against a provider-owned isolated target.
     pub fn execute<T: RestoreTarget>(
         &self,
         bundle: &BackupBundle,
         target: &mut T,
     ) -> Result<RestoreReceipt, BackupError> {
+        let _ = (bundle, target);
+        Err(BackupError::RestoreJournalRequired)
+    }
+
+    /// Executes or resumes an isolated restore through an injected durable
+    /// journal. Every target effect is preceded by an intent CAS and followed
+    /// by a typed receipt CAS. No active cutover is performed here.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the coordinator keeps the journal state machine and its CAS boundaries together"
+    )]
+    pub fn execute_with_journal<T: RestoreTarget, J: RestoreJournalPort>(
+        &self,
+        bundle: &BackupBundle,
+        target: &mut T,
+        journal: &mut J,
+    ) -> Result<RestoreReceipt, BackupError> {
         bundle.validate()?;
         if bundle.bundle_sha256()? != self.bundle_sha256 {
             return Err(BackupError::PlanMismatch);
         }
-        target.prepare_isolated(&self.target, &self.restored_fence)?;
-        target.apply_purge_ledger(&bundle.purge_ledger)?;
-        for blob in &bundle.blobs {
+        if self.steps != expected_restore_steps(bundle)
+            || self.restored_fence.source_state_fence != bundle.export_fence.state_fence
+            || self.target.validate().is_err()
+            || self.restored_fence.validate().is_err()
+        {
+            return Err(BackupError::PlanMismatch);
+        }
+        let transaction = self.transaction()?;
+        let phases = restore_phases(bundle);
+        let mut record = if let Some(record) = journal.load(&transaction.transaction_id)? {
+            record
+        } else {
+            let initial = RestoreJournalRecord {
+                transaction: transaction.clone(),
+                revision: 0,
+                completed_phases: 0,
+                phase: RestorePhase::Pending,
+                state: RestoreJournalState::Ready,
+                intent: None,
+                receipt: None,
+                final_receipt: None,
+            };
+            journal.compare_and_swap(&transaction.transaction_id, 0, initial.clone())?;
+            initial
+        };
+        validate_journal_record(&record, &transaction, &phases)?;
+
+        loop {
+            validate_journal_record(&record, &transaction, &phases)?;
+            match record.state {
+                RestoreJournalState::Completed => {
+                    return record
+                        .final_receipt
+                        .clone()
+                        .ok_or(BackupError::RestoreJournalCorrupt);
+                }
+                RestoreJournalState::IntentPersisted => {
+                    let intent = record
+                        .intent
+                        .as_ref()
+                        .ok_or(BackupError::RestoreJournalCorrupt)?;
+                    match target.reconcile_restore_effect(intent)? {
+                        RestoreReconciliation::Applied(receipt) => {
+                            validate_effect_receipt(intent, &receipt)?;
+                            let mut observed = record.clone();
+                            observed.revision = next_revision(record.revision)?;
+                            observed.state = RestoreJournalState::ReceiptPersisted;
+                            observed.receipt = Some(receipt);
+                            journal.compare_and_swap(
+                                &transaction.transaction_id,
+                                record.revision,
+                                observed.clone(),
+                            )?;
+                            record = observed;
+                        }
+                        RestoreReconciliation::NotApplied | RestoreReconciliation::Unknown => {
+                            return Err(BackupError::RestoreRollbackRequired);
+                        }
+                    }
+                }
+                RestoreJournalState::RollbackRequired => {
+                    return Err(BackupError::RestoreRollbackRequired);
+                }
+                RestoreJournalState::ReceiptPersisted => {
+                    let index = phase_index(&phases, &record.phase)?;
+                    if index + 1 == phases.len() {
+                        let mut completed = record.clone();
+                        completed.revision = next_revision(record.revision)?;
+                        completed.completed_phases = phases.len() as u64;
+                        completed.state = RestoreJournalState::Completed;
+                        journal.compare_and_swap(
+                            &transaction.transaction_id,
+                            record.revision,
+                            completed.clone(),
+                        )?;
+                        record = completed;
+                    } else {
+                        let mut advanced = record.clone();
+                        advanced.revision = next_revision(record.revision)?;
+                        advanced.completed_phases = (index + 1) as u64;
+                        advanced.phase = phases[index + 1].clone();
+                        advanced.state = RestoreJournalState::Ready;
+                        advanced.intent = None;
+                        advanced.receipt = None;
+                        journal.compare_and_swap(
+                            &transaction.transaction_id,
+                            record.revision,
+                            advanced.clone(),
+                        )?;
+                        record = advanced;
+                    }
+                }
+                RestoreJournalState::Ready => {
+                    if matches!(record.phase, RestorePhase::Pending) {
+                        if phases.is_empty() {
+                            return Err(BackupError::RestoreJournalCorrupt);
+                        }
+                        let mut advanced = record.clone();
+                        advanced.revision = next_revision(record.revision)?;
+                        advanced.phase = phases[0].clone();
+                        journal.compare_and_swap(
+                            &transaction.transaction_id,
+                            record.revision,
+                            advanced.clone(),
+                        )?;
+                        record = advanced;
+                        continue;
+                    }
+                    let intent = restore_intent(&transaction, &record.phase)?;
+                    let mut intent_record = record.clone();
+                    intent_record.revision = next_revision(record.revision)?;
+                    intent_record.state = RestoreJournalState::IntentPersisted;
+                    intent_record.intent = Some(intent.clone());
+                    intent_record.receipt = None;
+                    journal.compare_and_swap(
+                        &transaction.transaction_id,
+                        record.revision,
+                        intent_record.clone(),
+                    )?;
+                    record = intent_record;
+
+                    let final_receipt =
+                        apply_restore_phase(self, bundle, target, &transaction, &record.phase)?;
+                    let receipt = restore_effect_receipt(&intent)?;
+                    let mut observed = record.clone();
+                    observed.revision = next_revision(record.revision)?;
+                    observed.state = RestoreJournalState::ReceiptPersisted;
+                    observed.receipt = Some(receipt);
+                    observed.final_receipt = final_receipt;
+                    journal.compare_and_swap(
+                        &transaction.transaction_id,
+                        record.revision,
+                        observed.clone(),
+                    )?;
+                    record = observed;
+                }
+            }
+        }
+    }
+}
+
+fn expected_restore_steps(bundle: &BackupBundle) -> Vec<RestoreStep> {
+    let mut steps = vec![
+        RestoreStep::PrepareIsolatedRoot,
+        RestoreStep::ApplyPurgeLedger,
+        RestoreStep::ImportSealedBlobs,
+        RestoreStep::ImportCanonicalEvents,
+        RestoreStep::ImportReceipts,
+        RestoreStep::ImportProjections,
+    ];
+    if bundle.ors_snapshot.is_some() {
+        steps.push(RestoreStep::SuspendOrsOperations);
+    }
+    steps.extend([
+        RestoreStep::RebuildProjections,
+        RestoreStep::VerifyReceiptEventChain,
+        RestoreStep::FinalizeIsolatedRoot,
+    ]);
+    steps
+}
+
+fn restore_phases(bundle: &BackupBundle) -> Vec<RestorePhase> {
+    let mut phases = vec![
+        RestorePhase::PrepareIsolatedRoot,
+        RestorePhase::ApplyPurgeLedger,
+    ];
+    phases.extend(
+        bundle
+            .blobs
+            .iter()
+            .map(|blob| RestorePhase::ImportSealedBlob {
+                hash: blob.locator.hash.to_string(),
+            }),
+    );
+    phases.extend(bundle.canonical_events.iter().map(|record| {
+        RestorePhase::ImportCanonicalEvent {
+            record_id: record.record_id.clone(),
+        }
+    }));
+    phases.extend(
+        bundle
+            .receipts
+            .iter()
+            .map(|receipt| RestorePhase::ImportReceipt {
+                operation_id: receipt.operation_id.to_string(),
+            }),
+    );
+    phases.extend(
+        bundle
+            .projections
+            .iter()
+            .map(|record| RestorePhase::ImportProjection {
+                record_id: record.record_id.clone(),
+            }),
+    );
+    if bundle.ors_snapshot.is_some() {
+        phases.push(RestorePhase::SuspendOrsOperations);
+    }
+    phases.extend([
+        RestorePhase::RebuildProjections,
+        RestorePhase::VerifyReceiptEventChain,
+        RestorePhase::FinalizeIsolatedRoot,
+    ]);
+    phases
+}
+
+fn phase_index(phases: &[RestorePhase], phase: &RestorePhase) -> Result<usize, BackupError> {
+    phases
+        .iter()
+        .position(|candidate| candidate == phase)
+        .ok_or(BackupError::RestorePhaseMismatch)
+}
+
+fn next_revision(revision: u64) -> Result<u64, BackupError> {
+    revision
+        .checked_add(1)
+        .ok_or(BackupError::RestoreJournalCorrupt)
+}
+
+fn validate_journal_record(
+    record: &RestoreJournalRecord,
+    transaction: &RestoreTransaction,
+    phases: &[RestorePhase],
+) -> Result<(), BackupError> {
+    if record.transaction != *transaction {
+        return Err(BackupError::RestoreJournalMismatch);
+    }
+    let completed_phases =
+        usize::try_from(record.completed_phases).map_err(|_| BackupError::RestorePhaseMismatch)?;
+    if completed_phases > phases.len() {
+        return Err(BackupError::RestorePhaseMismatch);
+    }
+    if matches!(record.phase, RestorePhase::Pending) {
+        if completed_phases != 0 || !matches!(record.state, RestoreJournalState::Ready) {
+            return Err(BackupError::RestorePhaseMismatch);
+        }
+    } else if !matches!(record.state, RestoreJournalState::Completed) {
+        let index = phase_index(phases, &record.phase)?;
+        if index != completed_phases {
+            return Err(BackupError::RestorePhaseMismatch);
+        }
+    }
+    match record.state {
+        RestoreJournalState::Ready => {
+            if record.intent.is_some() || record.receipt.is_some() {
+                return Err(BackupError::RestoreJournalCorrupt);
+            }
+        }
+        RestoreJournalState::IntentPersisted => {
+            let intent = record
+                .intent
+                .as_ref()
+                .ok_or(BackupError::RestoreJournalCorrupt)?;
+            if intent.transaction_id != transaction.transaction_id
+                || intent.phase != record.phase
+                || record.receipt.is_some()
+                || intent.input_digest
+                    != sha256(&(transaction.transaction_id.as_str(), &record.phase))?
+            {
+                return Err(BackupError::RestoreJournalCorrupt);
+            }
+        }
+        RestoreJournalState::ReceiptPersisted => {
+            let intent = record
+                .intent
+                .as_ref()
+                .ok_or(BackupError::RestoreJournalCorrupt)?;
+            let receipt = record
+                .receipt
+                .as_ref()
+                .ok_or(BackupError::RestoreJournalCorrupt)?;
+            if intent.transaction_id != transaction.transaction_id
+                || intent.phase != record.phase
+                || receipt.transaction_id != transaction.transaction_id
+                || receipt.phase != record.phase
+            {
+                return Err(BackupError::RestoreJournalCorrupt);
+            }
+            validate_effect_receipt(intent, receipt)?;
+            if matches!(record.phase, RestorePhase::FinalizeIsolatedRoot)
+                && record.final_receipt.is_none()
+            {
+                return Err(BackupError::RestoreJournalCorrupt);
+            }
+        }
+        RestoreJournalState::Completed => {
+            if completed_phases != phases.len()
+                || !matches!(record.phase, RestorePhase::FinalizeIsolatedRoot)
+                || record.final_receipt.is_none()
+            {
+                return Err(BackupError::RestoreJournalCorrupt);
+            }
+            let final_receipt = record
+                .final_receipt
+                .as_ref()
+                .ok_or(BackupError::RestoreJournalCorrupt)?;
+            if final_receipt.bundle_sha256 != transaction.bundle_sha256 {
+                return Err(BackupError::RestoreJournalMismatch);
+            }
+        }
+        RestoreJournalState::RollbackRequired => {}
+    }
+    Ok(())
+}
+
+fn restore_intent(
+    transaction: &RestoreTransaction,
+    phase: &RestorePhase,
+) -> Result<RestoreIntent, BackupError> {
+    let input_digest = sha256(&(transaction.transaction_id.as_str(), phase))?;
+    Ok(RestoreIntent {
+        transaction_id: transaction.transaction_id.clone(),
+        phase: phase.clone(),
+        input_digest,
+    })
+}
+
+fn restore_effect_receipt(intent: &RestoreIntent) -> Result<RestoreEffectReceipt, BackupError> {
+    Ok(RestoreEffectReceipt {
+        transaction_id: intent.transaction_id.clone(),
+        phase: intent.phase.clone(),
+        observed_identity_sha256: sha256(intent)?,
+    })
+}
+
+fn validate_effect_receipt(
+    intent: &RestoreIntent,
+    receipt: &RestoreEffectReceipt,
+) -> Result<(), BackupError> {
+    if receipt.transaction_id != intent.transaction_id
+        || receipt.phase != intent.phase
+        || receipt.observed_identity_sha256 != sha256(intent)?
+    {
+        return Err(BackupError::RestoreJournalCorrupt);
+    }
+    Ok(())
+}
+
+fn apply_restore_phase<T: RestoreTarget>(
+    plan: &RestorePlan,
+    bundle: &BackupBundle,
+    target: &mut T,
+    transaction: &RestoreTransaction,
+    phase: &RestorePhase,
+) -> Result<Option<RestoreReceipt>, BackupError> {
+    match phase {
+        RestorePhase::PrepareIsolatedRoot => {
+            target.prepare_isolated(&plan.target, &plan.restored_fence)?;
+        }
+        RestorePhase::ApplyPurgeLedger => {
+            target.apply_purge_ledger(&bundle.purge_ledger)?;
+        }
+        RestorePhase::ImportSealedBlob { hash } => {
+            let blob = bundle
+                .blobs
+                .iter()
+                .find(|blob| blob.locator.hash.to_string() == *hash)
+                .ok_or(BackupError::MissingBlob)?;
             target.import_sealed_blob(blob)?;
         }
-        for event in &bundle.canonical_events {
-            target.import_canonical_event(event)?;
+        RestorePhase::ImportCanonicalEvent { record_id } => {
+            let record = bundle
+                .canonical_events
+                .iter()
+                .find(|record| record.record_id == *record_id)
+                .ok_or(BackupError::RestorePhaseMismatch)?;
+            target.import_canonical_event(record)?;
         }
-        for receipt in &bundle.receipts {
+        RestorePhase::ImportReceipt { operation_id } => {
+            let receipt = bundle
+                .receipts
+                .iter()
+                .find(|receipt| receipt.operation_id.to_string() == *operation_id)
+                .ok_or(BackupError::RestorePhaseMismatch)?;
             target.import_receipt(receipt)?;
         }
-        for projection in &bundle.projections {
-            target.import_projection(projection)?;
+        RestorePhase::ImportProjection { record_id } => {
+            let record = bundle
+                .projections
+                .iter()
+                .find(|record| record.record_id == *record_id)
+                .ok_or(BackupError::RestorePhaseMismatch)?;
+            target.import_projection(record)?;
         }
-        if let Some(ors) = &bundle.ors_snapshot {
+        RestorePhase::SuspendOrsOperations => {
+            let ors = bundle
+                .ors_snapshot
+                .as_ref()
+                .ok_or(BackupError::RestorePhaseMismatch)?;
             target.suspend_ors_operations(ors)?;
         }
-        target.rebuild_projections(&self.restored_fence)?;
-        target.verify_receipt_event_chain(&bundle.receipts, &bundle.canonical_events)?;
-        let evidence = target.finalize_isolated(&self.restored_fence)?;
-        evidence.validate()?;
-        if bundle.ors_snapshot.is_some() && !evidence.ors_suspended {
-            return Err(BackupError::RestoreEvidenceIncomplete);
+        RestorePhase::RebuildProjections => {
+            target.rebuild_projections(&plan.restored_fence)?;
         }
-        if evidence.target_id != self.target.target_id
-            || evidence.authority_epoch != self.restored_fence.authority_epoch
-            || evidence.resource_generation != self.restored_fence.resource_generation
-        {
-            return Err(BackupError::FinalizeEvidenceMismatch);
+        RestorePhase::VerifyReceiptEventChain => {
+            target.verify_receipt_event_chain(&bundle.receipts, &bundle.canonical_events)?;
         }
-        Ok(RestoreReceipt {
-            receipt_id: format!("restore-receipt-{}", self.plan_id),
-            plan_id: self.plan_id.clone(),
-            bundle_sha256: self.bundle_sha256.clone(),
-            target_id: self.target.target_id.clone(),
-            restored_fence: self.restored_fence.clone(),
-            canonical_only: bundle.manifest.class != BackupClass::FullRecovery,
-            operational_recovery_ready: bundle.manifest.class == BackupClass::FullRecovery,
-            cutover_performed: false,
-        })
+        RestorePhase::FinalizeIsolatedRoot => {
+            let evidence = target.finalize_isolated(&plan.restored_fence)?;
+            evidence.validate()?;
+            if bundle.ors_snapshot.is_some() && !evidence.ors_suspended {
+                return Err(BackupError::RestoreEvidenceIncomplete);
+            }
+            if evidence.target_id != plan.target.target_id
+                || evidence.authority_epoch != plan.restored_fence.authority_epoch
+                || evidence.resource_generation != plan.restored_fence.resource_generation
+            {
+                return Err(BackupError::FinalizeEvidenceMismatch);
+            }
+            return Ok(Some(RestoreReceipt {
+                receipt_id: format!("restore-receipt-{}", plan.plan_id),
+                plan_id: plan.plan_id.clone(),
+                bundle_sha256: transaction.bundle_sha256.clone(),
+                target_id: plan.target.target_id.clone(),
+                restored_fence: plan.restored_fence.clone(),
+                canonical_only: bundle.manifest.class != BackupClass::FullRecovery,
+                operational_recovery_ready: bundle.manifest.class == BackupClass::FullRecovery,
+                cutover_performed: false,
+            }));
+        }
+        RestorePhase::Pending => return Err(BackupError::RestorePhaseMismatch),
     }
+    Ok(None)
 }
 
 /// Evidence returned by the isolated target after all restore steps complete.
@@ -1051,6 +1546,15 @@ pub struct RestoreReceipt {
 /// Provider-owned isolated restore target. Implementations must not make the
 /// target current authority as part of any method in this trait.
 pub trait RestoreTarget {
+    /// Reconciles an intent left durable by a prior process. The default is
+    /// deliberately unknown, forcing rollback/escalation rather than guessing.
+    fn reconcile_restore_effect(
+        &mut self,
+        _intent: &RestoreIntent,
+    ) -> Result<RestoreReconciliation, BackupError> {
+        Ok(RestoreReconciliation::Unknown)
+    }
+
     fn prepare_isolated(
         &mut self,
         context: &RestoreContext,
@@ -1118,6 +1622,18 @@ pub enum BackupError {
     StaleRestoreLineage,
     #[error("restore plan does not match the supplied bundle")]
     PlanMismatch,
+    #[error("restore journal is required for recoverable execution")]
+    RestoreJournalRequired,
+    #[error("restore journal transaction does not match the exact plan/context identity")]
+    RestoreJournalMismatch,
+    #[error("restore journal has an invalid phase/state transition")]
+    RestorePhaseMismatch,
+    #[error("restore journal record is corrupt or incomplete")]
+    RestoreJournalCorrupt,
+    #[error("restore journal CAS revision is stale")]
+    RestoreJournalCasConflict,
+    #[error("ROLLBACK_REQUIRED: restore effect outcome is not durably reconciled")]
+    RestoreRollbackRequired,
     #[error("restore target returned incomplete evidence")]
     RestoreEvidenceIncomplete,
     #[error("restore target evidence does not match the plan")]
@@ -1141,5 +1657,361 @@ pub enum BackupError {
 impl From<BlobError> for BackupError {
     fn from(error: BlobError) -> Self {
         Self::Blob(error.to_string())
+    }
+}
+
+#[cfg(test)]
+mod restore_tests {
+    #![allow(clippy::expect_used)]
+
+    use super::*;
+    use eliot_contracts::{AuthorityEpoch, ResourceGeneration, StateFence};
+
+    #[derive(Default)]
+    struct TestJournal {
+        record: Option<RestoreJournalRecord>,
+    }
+
+    impl RestoreJournalPort for TestJournal {
+        fn load(
+            &mut self,
+            transaction_id: &str,
+        ) -> Result<Option<RestoreJournalRecord>, BackupError> {
+            Ok(self
+                .record
+                .clone()
+                .filter(|record| record.transaction.transaction_id == transaction_id))
+        }
+
+        fn compare_and_swap(
+            &mut self,
+            transaction_id: &str,
+            expected_revision: u64,
+            next: RestoreJournalRecord,
+        ) -> Result<(), BackupError> {
+            if next.transaction.transaction_id != transaction_id
+                || self.record.as_ref().map_or(0, |record| record.revision) != expected_revision
+            {
+                return Err(BackupError::RestoreJournalCasConflict);
+            }
+            self.record = Some(next);
+            Ok(())
+        }
+    }
+
+    #[derive(Default)]
+    struct TestTarget {
+        calls: Vec<&'static str>,
+        fail_rebuild: bool,
+    }
+
+    impl RestoreTarget for TestTarget {
+        fn prepare_isolated(
+            &mut self,
+            _context: &RestoreContext,
+            _restored_fence: &RestoredFence,
+        ) -> Result<(), BackupError> {
+            self.calls.push("prepare");
+            Ok(())
+        }
+
+        fn apply_purge_ledger(&mut self, _entries: &[PurgeLedgerEntry]) -> Result<(), BackupError> {
+            self.calls.push("purge");
+            Ok(())
+        }
+
+        fn import_sealed_blob(&mut self, _blob: &BackupBlob) -> Result<(), BackupError> {
+            self.calls.push("blob");
+            Ok(())
+        }
+
+        fn import_canonical_event(&mut self, _record: &CanonicalRecord) -> Result<(), BackupError> {
+            self.calls.push("event");
+            Ok(())
+        }
+
+        fn import_receipt(&mut self, _receipt: &WriteReceipt) -> Result<(), BackupError> {
+            self.calls.push("receipt");
+            Ok(())
+        }
+
+        fn import_projection(&mut self, _record: &CanonicalRecord) -> Result<(), BackupError> {
+            self.calls.push("projection");
+            Ok(())
+        }
+
+        fn suspend_ors_operations(
+            &mut self,
+            _snapshot: &OrsSnapshotFence,
+        ) -> Result<(), BackupError> {
+            self.calls.push("ors");
+            Ok(())
+        }
+
+        fn rebuild_projections(
+            &mut self,
+            _restored_fence: &RestoredFence,
+        ) -> Result<(), BackupError> {
+            self.calls.push("rebuild");
+            if self.fail_rebuild {
+                return Err(BackupError::Target("simulated process loss".to_owned()));
+            }
+            Ok(())
+        }
+
+        fn verify_receipt_event_chain(
+            &mut self,
+            _receipts: &[WriteReceipt],
+            _events: &[CanonicalRecord],
+        ) -> Result<(), BackupError> {
+            self.calls.push("verify");
+            Ok(())
+        }
+
+        fn finalize_isolated(
+            &mut self,
+            _restored_fence: &RestoredFence,
+        ) -> Result<RestoreEvidence, BackupError> {
+            self.calls.push("finalize");
+            Ok(RestoreEvidence {
+                target_id: "target".to_owned(),
+                isolated_root: true,
+                purge_applied: true,
+                blobs_imported: true,
+                projections_rebuilt: true,
+                receipt_event_chain_verified: true,
+                ors_suspended: false,
+                active_authority_restored: false,
+                authority_epoch: AuthorityEpoch::new(2).expect("epoch"),
+                resource_generation: ResourceGeneration::new(2).expect("generation"),
+            })
+        }
+    }
+
+    fn plan() -> RestorePlan {
+        let source_fence =
+            StateFence::new(AuthorityEpoch::genesis(), ResourceGeneration::genesis());
+        let bundle = BackupBundle::build(BackupInput {
+            backup_id: "backup".to_owned(),
+            class: BackupClass::CanonicalOnlyDegraded,
+            source_adapter: "test".to_owned(),
+            schema_generation: "1".to_owned(),
+            export_fence: ExportFence {
+                export_id: "export".to_owned(),
+                store_generation: "store".to_owned(),
+                state_fence: source_fence,
+                scope_id: None,
+                revision_heads: Vec::new(),
+                ordering_heads: Vec::new(),
+                event_range: EventRange {
+                    first_sequence: None,
+                    last_sequence: None,
+                    count: 0,
+                },
+                blob_reachability_manifest: Vec::new(),
+                consistent: true,
+            },
+            canonical_events: Vec::new(),
+            projections: Vec::new(),
+            receipts: Vec::new(),
+            blobs: Vec::new(),
+            purge_ledger: Vec::new(),
+            ors_snapshot: None,
+            artifacts: Vec::new(),
+            watchdog_spool: None,
+            host_audit: None,
+            missing_features: Vec::new(),
+            purge_ledger_revision: 1,
+        })
+        .expect("bundle");
+        RestorePlan::compile(
+            &bundle,
+            RestoreContext {
+                target_id: "target".to_owned(),
+                target_authority_epoch: AuthorityEpoch::new(2).expect("epoch"),
+                target_resource_generation: ResourceGeneration::new(2).expect("generation"),
+            },
+        )
+        .expect("plan")
+    }
+
+    fn bundle_for(plan: &RestorePlan) -> BackupBundle {
+        let source_fence = plan.restored_fence.source_state_fence.clone();
+        BackupBundle::build(BackupInput {
+            backup_id: "backup".to_owned(),
+            class: BackupClass::CanonicalOnlyDegraded,
+            source_adapter: "test".to_owned(),
+            schema_generation: "1".to_owned(),
+            export_fence: ExportFence {
+                export_id: "export".to_owned(),
+                store_generation: "store".to_owned(),
+                state_fence: source_fence,
+                scope_id: None,
+                revision_heads: Vec::new(),
+                ordering_heads: Vec::new(),
+                event_range: EventRange {
+                    first_sequence: None,
+                    last_sequence: None,
+                    count: 0,
+                },
+                blob_reachability_manifest: Vec::new(),
+                consistent: true,
+            },
+            canonical_events: Vec::new(),
+            projections: Vec::new(),
+            receipts: Vec::new(),
+            blobs: Vec::new(),
+            purge_ledger: Vec::new(),
+            ors_snapshot: None,
+            artifacts: Vec::new(),
+            watchdog_spool: None,
+            host_audit: None,
+            missing_features: Vec::new(),
+            purge_ledger_revision: 1,
+        })
+        .expect("bundle")
+    }
+
+    #[test]
+    fn purge_is_the_first_external_restore_boundary() {
+        let plan = plan();
+        let bundle = bundle_for(&plan);
+        let mut journal = TestJournal::default();
+        let mut target = TestTarget::default();
+
+        let receipt = plan
+            .execute_with_journal(&bundle, &mut target, &mut journal)
+            .expect("restore");
+        assert!(!receipt.cutover_performed);
+        assert_eq!(&target.calls[..2], &["prepare", "purge"]);
+    }
+
+    #[test]
+    fn exact_replay_returns_durable_receipt_without_target_effects() {
+        let plan = plan();
+        let bundle = bundle_for(&plan);
+        let mut journal = TestJournal::default();
+        let mut first_target = TestTarget::default();
+        let first = plan
+            .execute_with_journal(&bundle, &mut first_target, &mut journal)
+            .expect("first restore");
+        let mut replay_target = TestTarget::default();
+        let replay = plan
+            .execute_with_journal(&bundle, &mut replay_target, &mut journal)
+            .expect("replay");
+
+        assert_eq!(first, replay);
+        assert!(replay_target.calls.is_empty());
+        assert_eq!(
+            journal.record.as_ref().expect("journal").state,
+            RestoreJournalState::Completed
+        );
+    }
+
+    #[test]
+    fn crash_after_two_boundaries_requires_rollback_on_resume() {
+        let plan = plan();
+        let bundle = bundle_for(&plan);
+        let mut journal = TestJournal::default();
+        let mut target = TestTarget {
+            fail_rebuild: true,
+            ..TestTarget::default()
+        };
+        assert!(matches!(
+            plan.execute_with_journal(&bundle, &mut target, &mut journal),
+            Err(BackupError::Target(_))
+        ));
+        assert_eq!(
+            journal.record.as_ref().expect("intent").state,
+            RestoreJournalState::IntentPersisted
+        );
+        let mut resumed_target = TestTarget::default();
+        assert_eq!(
+            plan.execute_with_journal(&bundle, &mut resumed_target, &mut journal),
+            Err(BackupError::RestoreRollbackRequired)
+        );
+        assert!(resumed_target.calls.is_empty());
+    }
+
+    #[test]
+    fn context_digest_drift_is_rejected_by_existing_transaction() {
+        let plan = plan();
+        let bundle = bundle_for(&plan);
+        let mut journal = TestJournal::default();
+        let mut target = TestTarget::default();
+        plan.execute_with_journal(&bundle, &mut target, &mut journal)
+            .expect("restore");
+
+        let mut changed = plan.clone();
+        changed.target.target_id = "other-target".to_owned();
+        let mut changed_target = TestTarget::default();
+        assert_eq!(
+            changed.execute_with_journal(&bundle, &mut changed_target, &mut journal),
+            Err(BackupError::RestoreJournalMismatch)
+        );
+    }
+
+    #[test]
+    fn plan_digest_drift_is_rejected_by_existing_transaction() {
+        let plan = plan();
+        let bundle = bundle_for(&plan);
+        let mut journal = TestJournal::default();
+        let mut target = TestTarget::default();
+        plan.execute_with_journal(&bundle, &mut target, &mut journal)
+            .expect("restore");
+
+        let mut changed = plan.clone();
+        changed.steps.reverse();
+        let mut changed_target = TestTarget::default();
+        assert_eq!(
+            changed.execute_with_journal(&bundle, &mut changed_target, &mut journal),
+            Err(BackupError::PlanMismatch)
+        );
+    }
+
+    #[test]
+    fn stale_cas_is_rejected() {
+        let plan = plan();
+        let transaction = plan.transaction().expect("transaction");
+        let mut journal = TestJournal::default();
+        let record = RestoreJournalRecord {
+            transaction,
+            revision: 0,
+            completed_phases: 0,
+            phase: RestorePhase::Pending,
+            state: RestoreJournalState::Ready,
+            intent: None,
+            receipt: None,
+            final_receipt: None,
+        };
+        journal
+            .compare_and_swap(&record.transaction.transaction_id, 0, record.clone())
+            .expect("create");
+        let transaction_id = record.transaction.transaction_id.clone();
+        assert_eq!(
+            journal.compare_and_swap(&transaction_id, 999, record),
+            Err(BackupError::RestoreJournalCasConflict)
+        );
+    }
+
+    #[test]
+    fn phase_skip_is_rejected_fail_closed() {
+        let plan = plan();
+        let transaction = plan.transaction().expect("transaction");
+        let phases = restore_phases(&bundle_for(&plan));
+        let record = RestoreJournalRecord {
+            transaction: transaction.clone(),
+            revision: 1,
+            completed_phases: 0,
+            phase: RestorePhase::FinalizeIsolatedRoot,
+            state: RestoreJournalState::Ready,
+            intent: None,
+            receipt: None,
+            final_receipt: None,
+        };
+        assert_eq!(
+            validate_journal_record(&record, &transaction, &phases),
+            Err(BackupError::RestorePhaseMismatch)
+        );
     }
 }
