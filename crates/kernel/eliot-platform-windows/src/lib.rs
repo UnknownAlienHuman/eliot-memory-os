@@ -2588,6 +2588,17 @@ impl NamedPipePeerEvidence {
 pub struct ProtectedSecret(Vec<u8>);
 
 impl ProtectedSecret {
+    /// Adopts opaque DPAPI ciphertext returned by durable storage.
+    ///
+    /// # Errors
+    /// Returns [`WindowsAdapterError::InvalidInput`] for empty ciphertext.
+    pub fn from_ciphertext(ciphertext: Vec<u8>) -> Result<Self, WindowsAdapterError> {
+        if ciphertext.is_empty() {
+            return Err(WindowsAdapterError::InvalidInput);
+        }
+        Ok(Self(ciphertext))
+    }
+
     #[must_use]
     pub fn as_bytes(&self) -> &[u8] {
         &self.0

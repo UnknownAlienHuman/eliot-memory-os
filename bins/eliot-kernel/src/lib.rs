@@ -22,9 +22,10 @@ use eliot_ipc::{
     HandshakeResult, PeerIdentity, ServerHandshakePolicy, Session, TransportError, TransportLimits,
 };
 use eliot_kernel_core::{
-    AuthoritySnapshotBinding, DispatchSnapshotCodec, GenerationRoute, GenerationRouter,
-    ProcessDispatchAuthorityController, ProcessExecutionReplayBegin, ProcessExecutionReplayRecord,
-    ProcessExecutionReplayState, ProcessExecutionReplayStore, RouteScope, process_admission_digest,
+    AuthoritySnapshotBinding, AuthoritySnapshotBindingWire, DispatchSnapshotCodec, GenerationRoute,
+    GenerationRouter, ProcessDispatchAuthorityController, ProcessExecutionReplayBegin,
+    ProcessExecutionReplayRecord, ProcessExecutionReplayState, ProcessExecutionReplayStore,
+    RouteScope, process_admission_digest,
 };
 use eliot_kernel_service::{
     EbpCanonicalStoreClient, HostStoreBootstrapRequirement, KernelControlCommand, KernelService,
@@ -34,8 +35,11 @@ use eliot_kernel_service::{
 #[cfg(test)]
 use eliot_ors::CanonicalEvidenceProvider;
 use eliot_ors::{OperationalRecoveryStore, RedbRecoveryStore};
+use eliot_ors::{
+    ProcessStartReplayRecord as OrsReplayRecord, ProcessStartReplayState as OrsReplayState,
+};
 use eliot_platform::PortError;
-use eliot_platform_windows::{RetainedProcessPathLease, WindowsPlatform};
+use eliot_platform_windows::{ProtectedSecret, RetainedProcessPathLease, WindowsPlatform};
 use eliot_process::{
     DispatchAuthorityId, DispatchValidationContext, Generation, KernelDispatchKey, PermitIssuance,
     ProcessEvidence, ProcessEvidenceSink, ProcessExecutionAdmissionRequest, ProcessExecutionError,
@@ -54,6 +58,7 @@ use eliot_store_api::{
     CanonicalStoreClient, OrderingHeadExpectation, PreparedTransition, RevisionHeadExpectation,
     StoreError, WriteReceipt,
 };
+use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
 #[cfg(windows)]
@@ -245,6 +250,184 @@ pub trait ProcessValidationContextProvider: Send + Sync {
     fn current_context(&self) -> Result<DispatchValidationContext, ProcessExecutionError>;
     /// Validates the immutable launch ceilings against current Kernel policy.
     fn validate_intent(&self, intent: &ProcessIntent) -> Result<(), ProcessExecutionError>;
+}
+
+struct OrsProcessReplayStore {
+    store: Arc<RedbRecoveryStore>,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProtectedDispatchSnapshot {
+    authority_id: DispatchAuthorityId,
+    binding: AuthoritySnapshotBindingWire,
+    snapshot: eliot_process::DispatchPermitReplaySnapshot,
+}
+
+/// Production DPAPI-backed snapshot codec with exact binding checks.
+pub struct WindowsDispatchSnapshotCodec {
+    platform: Arc<WindowsPlatform>,
+    key_reference: eliot_platform::SecretReference,
+}
+
+impl WindowsDispatchSnapshotCodec {
+    /// Creates a codec bound to one Credential Manager reference.
+    pub fn new(
+        platform: Arc<WindowsPlatform>,
+        key_reference: eliot_platform::SecretReference,
+    ) -> Self {
+        Self {
+            platform,
+            key_reference,
+        }
+    }
+}
+
+impl DispatchSnapshotCodec for WindowsDispatchSnapshotCodec {
+    fn seal(
+        &self,
+        snapshot: &eliot_process::DispatchPermitReplaySnapshot,
+        binding: &AuthoritySnapshotBinding,
+    ) -> Result<eliot_kernel_core::SealedAuthoritySnapshot, eliot_kernel_core::KernelError> {
+        let envelope = ProtectedDispatchSnapshot {
+            authority_id: binding.authority_id().clone(),
+            binding: binding.to_wire(),
+            snapshot: snapshot.clone(),
+        };
+        let plaintext = serde_json::to_vec(&envelope).map_err(|error| {
+            eliot_kernel_core::KernelError::DependencyUnavailable(error.to_string())
+        })?;
+        let ciphertext = self.platform.protect_secret(&plaintext).map_err(|error| {
+            eliot_kernel_core::KernelError::DependencyUnavailable(error.to_string())
+        })?;
+        eliot_kernel_core::SealedAuthoritySnapshot::new(
+            self.key_reference.clone(),
+            ciphertext.as_bytes().to_vec(),
+        )
+    }
+
+    fn open(
+        &self,
+        payload: &eliot_ors::RecoveryPayload,
+        binding: &AuthoritySnapshotBinding,
+    ) -> Result<eliot_process::DispatchPermitReplaySnapshot, eliot_kernel_core::KernelError> {
+        let eliot_ors::RecoveryPayload::Encrypted { key, ciphertext } = payload else {
+            return Err(eliot_kernel_core::KernelError::RecoveryUnavailable(
+                "authority snapshot is not encrypted".to_owned(),
+            ));
+        };
+        if key != &self.key_reference {
+            return Err(eliot_kernel_core::KernelError::RecoveryUnavailable(
+                "authority snapshot credential reference mismatch".to_owned(),
+            ));
+        }
+        let protected = ProtectedSecret::from_ciphertext(ciphertext.clone()).map_err(|error| {
+            eliot_kernel_core::KernelError::DependencyUnavailable(error.to_string())
+        })?;
+        let plaintext = self
+            .platform
+            .unprotect_secret(&protected)
+            .map_err(|error| {
+                eliot_kernel_core::KernelError::DependencyUnavailable(error.to_string())
+            })?;
+        let envelope: ProtectedDispatchSnapshot = serde_json::from_slice(plaintext.expose())
+            .map_err(|error| {
+                eliot_kernel_core::KernelError::RecoveryUnavailable(error.to_string())
+            })?;
+        let expected =
+            AuthoritySnapshotBinding::from_wire(envelope.binding, binding.authority_id())?;
+        if envelope.authority_id != *binding.authority_id() || expected != *binding {
+            return Err(eliot_kernel_core::KernelError::FenceMismatch);
+        }
+        envelope.snapshot.validate().map_err(|error| {
+            eliot_kernel_core::KernelError::DependencyUnavailable(error.to_string())
+        })?;
+        Ok(envelope.snapshot)
+    }
+}
+
+impl ProcessExecutionReplayStore for OrsProcessReplayStore {
+    fn load_process_start(
+        &self,
+        operation_id: &eliot_process::OperationId,
+    ) -> Result<Option<ProcessExecutionReplayRecord>, eliot_kernel_core::KernelError> {
+        self.store
+            .load_process_start(
+                &eliot_ors::OperationIdentity::new(operation_id.as_str()).map_err(|e| {
+                    eliot_kernel_core::KernelError::DependencyUnavailable(e.to_string())
+                })?,
+            )
+            .map_err(|e| eliot_kernel_core::KernelError::DependencyUnavailable(e.to_string()))?
+            .map(|record| {
+                Ok(ProcessExecutionReplayRecord {
+                    admission_digest: record.admission_digest,
+                    owner: record.owner,
+                    state: match record.state {
+                        OrsReplayState::Reserved => ProcessExecutionReplayState::Reserved,
+                        OrsReplayState::Completed => ProcessExecutionReplayState::Completed,
+                        OrsReplayState::Unknown => ProcessExecutionReplayState::Unknown,
+                    },
+                    receipt: record.receipt,
+                })
+            })
+            .transpose()
+    }
+
+    fn begin_process_start(
+        &self,
+        operation_id: &eliot_process::OperationId,
+        admission_digest: &str,
+        owner: &ProcessOwnerBinding,
+    ) -> Result<ProcessExecutionReplayBegin, eliot_kernel_core::KernelError> {
+        let record = OrsReplayRecord {
+            operation_id: eliot_ors::OperationIdentity::new(operation_id.as_str()).map_err(
+                |e| eliot_kernel_core::KernelError::DependencyUnavailable(e.to_string()),
+            )?,
+            admission_digest: admission_digest.to_owned(),
+            owner: owner.clone(),
+            state: OrsReplayState::Reserved,
+            receipt: None,
+        };
+        self.store
+            .begin_process_start(&record)
+            .map_err(|e| eliot_kernel_core::KernelError::DependencyUnavailable(e.to_string()))
+            .map(|existing| {
+                existing.map_or(ProcessExecutionReplayBegin::Acquired, |record| {
+                    ProcessExecutionReplayBegin::Existing(ProcessExecutionReplayRecord {
+                        admission_digest: record.admission_digest,
+                        owner: record.owner,
+                        state: match record.state {
+                            OrsReplayState::Reserved => ProcessExecutionReplayState::Reserved,
+                            OrsReplayState::Completed => ProcessExecutionReplayState::Completed,
+                            OrsReplayState::Unknown => ProcessExecutionReplayState::Unknown,
+                        },
+                        receipt: record.receipt,
+                    })
+                })
+            })
+    }
+
+    fn persist_process_start(
+        &self,
+        operation_id: &eliot_process::OperationId,
+        record: ProcessExecutionReplayRecord,
+    ) -> Result<(), eliot_kernel_core::KernelError> {
+        self.store
+            .persist_process_start(&OrsReplayRecord {
+                operation_id: eliot_ors::OperationIdentity::new(operation_id.as_str()).map_err(
+                    |e| eliot_kernel_core::KernelError::DependencyUnavailable(e.to_string()),
+                )?,
+                admission_digest: record.admission_digest,
+                owner: record.owner,
+                state: match record.state {
+                    ProcessExecutionReplayState::Reserved => OrsReplayState::Reserved,
+                    ProcessExecutionReplayState::Completed => OrsReplayState::Completed,
+                    ProcessExecutionReplayState::Unknown => OrsReplayState::Unknown,
+                },
+                receipt: record.receipt,
+            })
+            .map_err(|e| eliot_kernel_core::KernelError::DependencyUnavailable(e.to_string()))
+    }
 }
 
 struct ControllerDispatchPort {
@@ -926,9 +1109,12 @@ impl KernelComposition {
             .map_err(|error| KernelBuildError::Core(error.to_string()))?,
         ));
         let path_admission = Arc::new(KernelPathAdmission::new(Arc::clone(&platform)));
+        let replay_store: Arc<dyn ProcessExecutionReplayStore> = Arc::new(OrsProcessReplayStore {
+            store: Arc::clone(&ors),
+        });
         let gateway = Arc::new(ProcessExecutionGateway::new(
             Arc::clone(&controller),
-            authority_config.replay_store,
+            replay_store,
             authority_config.evidence_sink,
             authority_config.snapshot_binding,
             authority_config.validation_context,
@@ -2005,7 +2191,7 @@ mod tests {
         )
         .expect("process authority constructor");
         assert!(kernel.process_execution_configured());
-        assert_eq!(Arc::strong_count(&kernel.generation_gateway.ors), 2);
+        assert_eq!(Arc::strong_count(&kernel.generation_gateway.ors), 3);
         drop(kernel);
         let _ = std::fs::remove_dir_all(root);
     }

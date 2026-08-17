@@ -24,6 +24,8 @@ use eliot_process::{
     ProcessIntent, ProcessOwnerBinding, ProcessRequest, ProcessStartReceipt, RecoveryCapability,
     SuspendedProcessIdentity, ValidatedDispatch,
 };
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
 
 use crate::error::{KernelError, KernelResult};
 
@@ -116,6 +118,24 @@ pub struct AuthoritySnapshotBinding {
     cleanup_after_ms: Option<i64>,
 }
 
+/// Checked, secret-free transport projection of an authority snapshot binding.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AuthoritySnapshotBindingWire {
+    /// Process authority identity.
+    pub authority_id: DispatchAuthorityId,
+    /// ORS record identity.
+    pub record_id: OperationIdentity,
+    /// Exact epoch lineage.
+    pub authority_epoch: EpochLineage,
+    /// Exact state fence snapshot.
+    pub state_fence: StateFenceSnapshot,
+    /// ORS creation timestamp.
+    pub created_at_ms: i64,
+    /// Optional ORS cleanup timestamp.
+    pub cleanup_after_ms: Option<i64>,
+}
+
 impl AuthoritySnapshotBinding {
     /// Creates a binding for one active authority identity and fence.
     pub fn new(
@@ -146,6 +166,40 @@ impl AuthoritySnapshotBinding {
         })
     }
 
+    /// Projects the checked binding into an inert wire value.
+    #[must_use]
+    pub fn to_wire(&self) -> AuthoritySnapshotBindingWire {
+        AuthoritySnapshotBindingWire {
+            authority_id: self.authority_id.clone(),
+            record_id: self.record_id.clone(),
+            authority_epoch: self.authority_epoch.clone(),
+            state_fence: self.state_fence.clone(),
+            created_at_ms: self.created_at_ms,
+            cleanup_after_ms: self.cleanup_after_ms,
+        }
+    }
+
+    /// Reconstructs a binding only after rechecking every nested invariant.
+    pub fn from_wire(
+        wire: AuthoritySnapshotBindingWire,
+        expected_authority_id: &DispatchAuthorityId,
+    ) -> KernelResult<Self> {
+        if &wire.authority_id != expected_authority_id {
+            return Err(KernelError::InvalidField {
+                field: "authority_id",
+                reason: "does not match expected authority",
+            });
+        }
+        Self::new(
+            wire.authority_id,
+            wire.record_id,
+            wire.authority_epoch,
+            wire.state_fence,
+            wire.created_at_ms,
+            wire.cleanup_after_ms,
+        )
+    }
+
     /// Returns the exact process authority identity.
     #[must_use]
     pub fn authority_id(&self) -> &DispatchAuthorityId {
@@ -168,6 +222,18 @@ impl AuthoritySnapshotBinding {
     #[must_use]
     pub const fn state_fence(&self) -> &StateFenceSnapshot {
         &self.state_fence
+    }
+
+    /// Returns the creation timestamp bound to the ORS record.
+    #[must_use]
+    pub const fn created_at_ms(&self) -> i64 {
+        self.created_at_ms
+    }
+
+    /// Returns the optional cleanup deadline bound to the ORS record.
+    #[must_use]
+    pub const fn cleanup_after_ms(&self) -> Option<i64> {
+        self.cleanup_after_ms
     }
 }
 

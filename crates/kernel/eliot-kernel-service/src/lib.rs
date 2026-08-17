@@ -26,8 +26,9 @@ pub use lifecycle::{
 };
 pub use protocol::{
     ContainmentAction, HostKernelHandshake, HostStoreBootstrapRequirement, KernelControlCommand,
-    KernelReadyReceipt, ProcessExecutionRejection, ProcessExecutionRequest,
-    ProcessExecutionResponse, ProcessObservation, RestartBudget, StoreBootstrapDescriptor,
+    KernelReadyReceipt, ProcessAuthorityHandoffDescriptor, ProcessExecutionRejection,
+    ProcessExecutionRequest, ProcessExecutionResponse, ProcessObservation, RestartBudget,
+    StoreBootstrapDescriptor,
 };
 pub use store_client::{EbpCanonicalStoreClient, EbpStoreTransport, StoreClientError};
 

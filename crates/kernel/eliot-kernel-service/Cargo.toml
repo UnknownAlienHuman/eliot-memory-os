@@ -24,6 +24,7 @@ eliot-runtime-contracts.workspace = true
 eliot-protocol.workspace = true
 eliot-store-api.workspace = true
 schemars.workspace = true
+sha2.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true

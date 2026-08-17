@@ -36,9 +36,10 @@ pub use authority::{
     AuthorityGrant, AuthorityGrantRequest, AuthorityReceipt, KernelAuthority, KernelAuthorityKey,
 };
 pub use authority_controller::{
-    AuthoritySnapshotBinding, DispatchSnapshotCodec, ProcessDispatchAuthorityController,
-    ProcessExecutionReplayBegin, ProcessExecutionReplayRecord, ProcessExecutionReplayState,
-    ProcessExecutionReplayStore, SealedAuthoritySnapshot, process_admission_digest,
+    AuthoritySnapshotBinding, AuthoritySnapshotBindingWire, DispatchSnapshotCodec,
+    ProcessDispatchAuthorityController, ProcessExecutionReplayBegin, ProcessExecutionReplayRecord,
+    ProcessExecutionReplayState, ProcessExecutionReplayStore, SealedAuthoritySnapshot,
+    process_admission_digest,
 };
 pub use error::{KernelError, KernelResult};
 pub use module::control_reserve_front_door::{

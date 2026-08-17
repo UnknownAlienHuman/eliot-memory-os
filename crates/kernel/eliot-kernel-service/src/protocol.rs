@@ -1,7 +1,8 @@
 //! Host↔Kernel protocol records.
 
 use eliot_contracts::{AuthorityEpoch, ResourceGeneration, StateFence};
-use eliot_platform::{PlatformHandle, PortError};
+use eliot_kernel_core::AuthoritySnapshotBindingWire;
+use eliot_platform::{PlatformHandle, PortError, SecretReference};
 use eliot_process::{
     CancellationReceipt, OperationId, ProcessEvidence, ProcessExecutionAdmissionRequest,
     ProcessExecutionError, ProcessExecutionView, ProcessStartReceipt,
@@ -9,11 +10,121 @@ use eliot_process::{
 use eliot_runtime_contracts::{HealthVector, ServiceProcessState};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use std::fmt::Write as _;
 
 use crate::{KernelServiceError, validate_text};
 
 fn handle(value: &PlatformHandle, field: &'static str) -> Result<(), KernelServiceError> {
     validate_text(value.as_str(), field)
+}
+
+/// Versioned, secret-free one-shot process-authority handoff.
+///
+/// This record contains only identities, bindings, policy references and a
+/// Credential Manager locator. It is not authority and cannot be used without
+/// the matching secret and durable ORS snapshot.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+#[allow(missing_docs)]
+pub struct ProcessAuthorityHandoffDescriptor {
+    pub contract_version: u16,
+    pub handoff_id: PlatformHandle,
+    pub handoff_nonce: PlatformHandle,
+    pub authority_id: eliot_process::DispatchAuthorityId,
+    pub snapshot_binding: AuthoritySnapshotBindingWire,
+    pub state_fence: StateFence,
+    pub generation: ResourceGeneration,
+    pub revision_policy_binding: PlatformHandle,
+    pub dispatch_key: SecretReference,
+    pub descriptor_sha256: String,
+    pub issued_at_ms: i64,
+    pub expires_at_ms: i64,
+    pub contour_refs: Vec<PlatformHandle>,
+}
+
+impl ProcessAuthorityHandoffDescriptor {
+    /// Current descriptor schema revision.
+    pub const CONTRACT_VERSION: u16 = 1;
+
+    /// Validates syntax, digest material, time bounds, and exact fence bindings.
+    pub fn validate(&self, now_ms: i64) -> Result<(), KernelServiceError> {
+        if self.contract_version != Self::CONTRACT_VERSION {
+            return Err(KernelServiceError::InvalidField {
+                field: "contract_version",
+                reason: "unsupported version",
+            });
+        }
+        for (value, field) in [
+            (&self.handoff_id, "handoff_id"),
+            (&self.handoff_nonce, "handoff_nonce"),
+            (&self.revision_policy_binding, "revision_policy_binding"),
+        ] {
+            handle(value, field)?;
+        }
+        if self.contour_refs.is_empty() {
+            return Err(KernelServiceError::InvalidField {
+                field: "contour_refs",
+                reason: "must not be empty",
+            });
+        }
+        for value in &self.contour_refs {
+            handle(value, "contour_refs")?;
+        }
+        if self.expires_at_ms <= self.issued_at_ms || self.expires_at_ms <= now_ms {
+            return Err(KernelServiceError::InvalidField {
+                field: "expires_at_ms",
+                reason: "descriptor is expired or has invalid bounds",
+            });
+        }
+        if self.state_fence.authority_epoch.value()
+            != self.snapshot_binding.state_fence.observed_authority_epoch
+            || self.state_fence.resource_generation != self.generation
+            || self.snapshot_binding.authority_id != self.authority_id
+            || self.snapshot_binding.state_fence.observed_authority_epoch
+                != self.snapshot_binding.authority_epoch.current.epoch
+        {
+            return Err(KernelServiceError::HandshakeMismatch {
+                field: "authority_binding",
+            });
+        }
+        if self.dispatch_key.provider.as_str() != "windows-credential-manager" {
+            return Err(KernelServiceError::HandshakeMismatch {
+                field: "dispatch_key.provider",
+            });
+        }
+        handle(&self.dispatch_key.key, "dispatch_key.key")?;
+        if self.descriptor_sha256.len() != 64
+            || !self
+                .descriptor_sha256
+                .bytes()
+                .all(|b| b.is_ascii_hexdigit())
+        {
+            return Err(KernelServiceError::InvalidField {
+                field: "descriptor_sha256",
+                reason: "must be a SHA-256 digest",
+            });
+        }
+        let mut unsigned = self.clone();
+        unsigned.descriptor_sha256.clear();
+        let bytes =
+            serde_json::to_vec(&unsigned).map_err(|_| KernelServiceError::InvalidField {
+                field: "descriptor_sha256",
+                reason: "cannot canonicalize descriptor",
+            })?;
+        let observed = Sha256::digest(&bytes);
+        let mut observed_hex = String::with_capacity(64);
+        for byte in observed {
+            let _ = write!(&mut observed_hex, "{byte:02x}");
+        }
+        if observed_hex != self.descriptor_sha256.to_ascii_lowercase() {
+            return Err(KernelServiceError::InvalidField {
+                field: "descriptor_sha256",
+                reason: "descriptor digest mismatch",
+            });
+        }
+        Ok(())
+    }
 }
 
 /// Host-approved, store-neutral canonical-store bootstrap descriptor.

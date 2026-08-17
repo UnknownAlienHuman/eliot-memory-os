@@ -4,6 +4,7 @@ use eliot_platform::{PlatformHandle, SecretReference};
 use eliot_receipts::ReceiptEnvelope;
 use eliot_runtime_contracts::GenerationCutoverRecord as RuntimeGenerationCutoverRecord;
 use eliot_security_contracts::PrivacyClass;
+use schemars::JsonSchema;
 use serde::{Deserialize, Deserializer, Serialize, de};
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
@@ -12,7 +13,7 @@ use thiserror::Error;
 use crate::{CONTRACT_VERSION, MAX_RECOVERY_PAGE};
 
 /// A validated opaque label that carries no semantic authority.
-#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[derive(Clone, Debug, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(transparent)]
 pub struct OpaqueLabel(String);
 
@@ -49,8 +50,28 @@ pub type RecoveryOwner = OpaqueLabel;
 /// Operation/checkpoint identity preserved without creating an authority owner.
 pub type OperationIdentity = OpaqueLabel;
 
+/// Durable one-shot process-start replay state.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProcessStartReplayRecord {
+    pub operation_id: OperationIdentity,
+    pub admission_digest: String,
+    pub owner: eliot_process::ProcessOwnerBinding,
+    pub state: ProcessStartReplayState,
+    pub receipt: Option<eliot_process::ProcessStartReceipt>,
+}
+
+/// Process-start replay disposition persisted by ORS.
+#[derive(Clone, Copy, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum ProcessStartReplayState {
+    Reserved,
+    Completed,
+    Unknown,
+}
+
 /// Exact canonical snapshot of a provider-owned State Fence.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct StateFenceSnapshot {
     pub canonical_json: String,
@@ -102,7 +123,7 @@ impl StateFenceSnapshot {
 }
 
 /// Exact epoch identity, including its lineage namespace.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct EpochIdentity {
     pub lineage_id: OpaqueLabel,
@@ -110,7 +131,7 @@ pub struct EpochIdentity {
 }
 
 /// One current epoch plus the exact predecessor that authorizes its succession.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct EpochLineage {
     pub current: EpochIdentity,

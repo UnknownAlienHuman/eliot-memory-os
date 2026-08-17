@@ -24,9 +24,9 @@ use crate::{
     GenerationTransitionReceipt, JobCheckpoint, KernelAuthoritySnapshot, OpaqueLabel,
     OperationalControlProjection, OperationalMutationReceipt, OperationalPhase,
     OperationalRecordContext, OperationalRecordInput, OrsError, OrsSnapshotReceipt,
-    OrsSnapshotRequest, PendingOperationPage, RecoveredAuthoritySnapshot, RecoveryCursor,
-    RecoveryInboxDisposition, RecoveryInboxItem, RecoveryInboxReceipt, RecoveryPage,
-    RecoveryPayload, RecoveryPayloadEnvelope, ReservationRecord, ReservationRequest,
+    OrsSnapshotRequest, PendingOperationPage, ProcessStartReplayRecord, RecoveredAuthoritySnapshot,
+    RecoveryCursor, RecoveryInboxDisposition, RecoveryInboxItem, RecoveryInboxReceipt,
+    RecoveryPage, RecoveryPayload, RecoveryPayloadEnvelope, ReservationRecord, ReservationRequest,
     ReservationState, ReservedScope, RetryState, ScopeTerminalReceipt, ScopeTerminalView,
     SessionBindingReceipt, SessionDetach, StageReceipt, StagedOperation, StateFenceSnapshot,
     UserBrokerFence, UserBrokerRegistration, UserBrokerRegistrationReceipt, WriterReservationToken,
@@ -47,6 +47,8 @@ const OPERATIONAL_HISTORY: TableDefinition<&str, &str> =
 const RECOVERY_INBOX: TableDefinition<&str, &str> = TableDefinition::new("ors_recovery_inbox_v1");
 const RECOVERY_INBOX_HISTORY: TableDefinition<&str, &str> =
     TableDefinition::new("ors_recovery_inbox_history_v1");
+const PROCESS_START_REPLAY: TableDefinition<&str, &str> =
+    TableDefinition::new("ors_process_start_replay_v1");
 const NEXT_GLOBAL_ORDER: &str = "next_global_order";
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -348,6 +350,64 @@ pub struct RedbRecoveryStore {
 }
 
 impl RedbRecoveryStore {
+    /// Atomically reserves a process start, preserving every prior outcome.
+    pub fn begin_process_start(
+        &self,
+        record: &ProcessStartReplayRecord,
+    ) -> Result<Option<ProcessStartReplayRecord>, OrsError> {
+        let write = self.database.begin_write().map_err(storage)?;
+        let key = record.operation_id.as_str();
+        let existing = {
+            let mut table = write.open_table(PROCESS_START_REPLAY).map_err(storage)?;
+            if let Some(existing) = table.get(key).map_err(storage)? {
+                Some(decode(existing.value())?)
+            } else {
+                let payload = encode(&record)?;
+                table.insert(key, payload.as_str()).map_err(storage)?;
+                None
+            }
+        };
+        write.commit().map_err(storage)?;
+        Ok(existing)
+    }
+
+    /// Loads one process-start replay projection.
+    pub fn load_process_start(
+        &self,
+        operation_id: &crate::OperationIdentity,
+    ) -> Result<Option<ProcessStartReplayRecord>, OrsError> {
+        let read = self.database.begin_read().map_err(storage)?;
+        let table = read.open_table(PROCESS_START_REPLAY).map_err(storage)?;
+        table
+            .get(operation_id.as_str())
+            .map_err(storage)?
+            .map(|value| decode(value.value()))
+            .transpose()
+    }
+
+    /// Persists a replay projection without allowing identity replacement.
+    pub fn persist_process_start(&self, record: &ProcessStartReplayRecord) -> Result<(), OrsError> {
+        let write = self.database.begin_write().map_err(storage)?;
+        let key = record.operation_id.as_str();
+        {
+            let mut table = write.open_table(PROCESS_START_REPLAY).map_err(storage)?;
+            if let Some(existing) = table.get(key).map_err(storage)? {
+                let existing: ProcessStartReplayRecord = decode(existing.value())?;
+                if existing.admission_digest != record.admission_digest
+                    || existing.owner != record.owner
+                {
+                    return Err(OrsError::IntegrityProblem {
+                        record_type: "process_start_replay",
+                        reason: "identity replacement rejected".to_owned(),
+                    });
+                }
+            }
+            let payload = encode(&record)?;
+            table.insert(key, payload.as_str()).map_err(storage)?;
+        }
+        write.commit().map_err(storage)
+    }
+
     /// Opens or creates an ORS database and converts interrupted execution to reconciliation.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, OrsError> {
         let path = path.as_ref();
@@ -394,6 +454,7 @@ impl RedbRecoveryStore {
             drop(write.open_table(OPERATIONAL_HISTORY).map_err(storage)?);
             drop(write.open_table(RECOVERY_INBOX).map_err(storage)?);
             drop(write.open_table(RECOVERY_INBOX_HISTORY).map_err(storage)?);
+            drop(write.open_table(PROCESS_START_REPLAY).map_err(storage)?);
         }
         write.commit().map_err(storage)
     }
@@ -2973,6 +3034,31 @@ impl PersistedValue for RecoveryPayloadEnvelope {
 
     fn validate_persisted(&self) -> Result<(), OrsError> {
         self.validate()
+    }
+}
+
+impl PersistedValue for ProcessStartReplayRecord {
+    const RECORD_TYPE: &'static str = "process_start_replay";
+
+    fn validate_persisted(&self) -> Result<(), OrsError> {
+        crate::model::validate_digest(&self.admission_digest, "process_start_admission_digest")?;
+        if self.operation_id.as_str().trim().is_empty() {
+            return Err(OrsError::InvalidField {
+                field: "process_start_operation_id",
+                reason: "must not be blank",
+            });
+        }
+        eliot_process::ProcessOwnerBinding::new(
+            self.owner.module_id(),
+            self.owner.principal_digest(),
+            self.owner.authority_epoch(),
+            self.owner.generation(),
+        )
+        .map_err(|error| OrsError::IntegrityProblem {
+            record_type: Self::RECORD_TYPE,
+            reason: error.to_string(),
+        })?;
+        Ok(())
     }
 }
 
