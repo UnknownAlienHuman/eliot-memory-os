@@ -1,6 +1,8 @@
 name: Source Candidate Gate
 
 on:
+  pull_request:
+    branches: [main]
   workflow_dispatch:
     inputs:
       require_live_windows_scenarios:
@@ -117,7 +119,7 @@ jobs:
           Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value 'live-harness-deferred'
 
       - name: Live Windows scenario contract challenge
-        if: ${{ inputs.require_live_windows_scenarios }}
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.require_live_windows_scenarios }}
         shell: pwsh
         run: |
           $failureType = 'CONTRACT_CHALLENGE'
