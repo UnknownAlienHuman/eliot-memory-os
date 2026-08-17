@@ -164,6 +164,24 @@ fn approved_path(value: &PlatformHandle, field: &str) -> Result<(), Installation
     Ok(())
 }
 
+fn approved_filename(
+    value: &PlatformHandle,
+    expected: &str,
+    field: &str,
+) -> Result<(), InstallationError> {
+    if Path::new(value.as_str())
+        .file_name()
+        .and_then(|name| name.to_str())
+        != Some(expected)
+    {
+        return Err(InstallationError::InvalidField {
+            field: field.to_owned(),
+            reason: format!("must select the approved {expected} filename"),
+        });
+    }
+    Ok(())
+}
+
 const MAX_VERIFIED_FILE_BYTES: u64 = 512 * 1024 * 1024;
 
 /// Opens one installation-owned file through the protected no-follow lease,
@@ -636,8 +654,13 @@ pub struct CandidateManifest {
     pub generation: PlatformHandle,
     /// Component identities included in the candidate.
     pub components: Vec<PlatformHandle>,
-    /// Immutable artifact digests.
-    pub artifact_digests: Vec<PlatformHandle>,
+    /// SHA-256 digest of the approved Kernel image.
+    pub kernel_artifact_digest: PlatformHandle,
+    /// SHA-256 digest of the approved Store bridge image. The bridge is route
+    /// evidence only and is not a Host-owned process.
+    pub store_bridge_artifact_digest: PlatformHandle,
+    /// SHA-256 digest of the approved canonical Store engine image.
+    pub canonical_store_artifact_digest: PlatformHandle,
     /// Canonical installation-approved Kernel executable path.
     pub kernel_executable_path: PlatformHandle,
     /// Canonical installation-approved eliot-store-surreal bridge path.
@@ -670,8 +693,14 @@ pub struct RuntimeLaunchDescriptor {
     pub portable_root: Option<PlatformHandle>,
     /// Explicit Kernel working directory.
     pub kernel_work_root: PlatformHandle,
+    /// SHA-256 digest of the approved Kernel image.
+    pub kernel_artifact_digest: PlatformHandle,
     /// Explicit concrete Store bridge configuration path.
     pub store_config_path: PlatformHandle,
+    /// Approved Store bridge image retained for the later Kernel route.
+    pub store_bridge_executable_path: PlatformHandle,
+    /// SHA-256 digest of the approved Store bridge image.
+    pub store_bridge_artifact_digest: PlatformHandle,
     /// Neutral Store bootstrap descriptor consumed by Kernel.
     pub store_bootstrap_descriptor_path: PlatformHandle,
     /// SHA-256 digest of the neutral Store bootstrap descriptor.
@@ -682,8 +711,6 @@ pub struct RuntimeLaunchDescriptor {
     pub canonical_store_artifact_digest: PlatformHandle,
     /// Exact Kernel child arguments, excluding argv[0].
     pub kernel_arguments: Vec<PlatformHandle>,
-    /// Exact Store child arguments, excluding argv[0].
-    pub store_arguments: Vec<PlatformHandle>,
     /// Exact canonical Surreal engine arguments, excluding argv[0].
     pub canonical_store_arguments: Vec<PlatformHandle>,
     /// Canonical SCM Watchdog image and its approved digest.
@@ -737,7 +764,7 @@ impl RuntimeLaunchDescriptor {
         let expected_store = self.expected_store_arguments(config_path);
         let expected_kernel = self.expected_kernel_arguments(config_path);
         let actual_store = self
-            .store_arguments
+            .canonical_store_arguments
             .iter()
             .map(|value| value.as_str().to_owned())
             .collect::<Vec<_>>();
@@ -748,14 +775,8 @@ impl RuntimeLaunchDescriptor {
             .collect::<Vec<_>>();
         if actual_store != expected_store {
             return Err(InstallationError::InvalidField {
-                field: "runtime_launch.store_arguments".to_owned(),
-                reason: "must exactly select the approved generation config".to_owned(),
-            });
-        }
-        if self.canonical_store_arguments.is_empty() {
-            return Err(InstallationError::InvalidField {
                 field: "runtime_launch.canonical_store_arguments".to_owned(),
-                reason: "must select the approved canonical engine".to_owned(),
+                reason: "must exactly select the approved generation config".to_owned(),
             });
         }
         if actual_kernel != expected_kernel {
@@ -773,13 +794,15 @@ impl RuntimeLaunchDescriptor {
             profile: InstallationProfile,
             portable_root: &'a Option<PlatformHandle>,
             kernel_work_root: &'a PlatformHandle,
+            kernel_artifact_digest: &'a PlatformHandle,
             store_config_path: &'a PlatformHandle,
             store_bootstrap_descriptor_path: &'a PlatformHandle,
             store_bootstrap_descriptor_digest: &'a PlatformHandle,
             canonical_store_executable_path: &'a PlatformHandle,
             canonical_store_artifact_digest: &'a PlatformHandle,
             kernel_arguments: &'a [PlatformHandle],
-            store_arguments: &'a [PlatformHandle],
+            store_bridge_executable_path: &'a PlatformHandle,
+            store_bridge_artifact_digest: &'a PlatformHandle,
             canonical_store_arguments: &'a [PlatformHandle],
             watchdog_executable_path: &'a PlatformHandle,
             watchdog_artifact_digest: &'a PlatformHandle,
@@ -788,13 +811,15 @@ impl RuntimeLaunchDescriptor {
             profile: self.profile,
             portable_root: &self.portable_root,
             kernel_work_root: &self.kernel_work_root,
+            kernel_artifact_digest: &self.kernel_artifact_digest,
             store_config_path: &self.store_config_path,
             store_bootstrap_descriptor_path: &self.store_bootstrap_descriptor_path,
             store_bootstrap_descriptor_digest: &self.store_bootstrap_descriptor_digest,
             canonical_store_executable_path: &self.canonical_store_executable_path,
             canonical_store_artifact_digest: &self.canonical_store_artifact_digest,
             kernel_arguments: &self.kernel_arguments,
-            store_arguments: &self.store_arguments,
+            store_bridge_executable_path: &self.store_bridge_executable_path,
+            store_bridge_artifact_digest: &self.store_bridge_artifact_digest,
             canonical_store_arguments: &self.canonical_store_arguments,
             watchdog_executable_path: &self.watchdog_executable_path,
             watchdog_artifact_digest: &self.watchdog_artifact_digest,
@@ -809,6 +834,10 @@ impl RuntimeLaunchDescriptor {
     pub fn validate(&self) -> Result<(), InstallationError> {
         handle(&self.kernel_work_root, "runtime_launch.kernel_work_root")?;
         approved_path(&self.kernel_work_root, "runtime_launch.kernel_work_root")?;
+        sha256_handle(
+            &self.kernel_artifact_digest,
+            "runtime_launch.kernel_artifact_digest",
+        )?;
         handle(&self.store_config_path, "runtime_launch.store_config_path")?;
         approved_path(&self.store_config_path, "runtime_launch.store_config_path")?;
         handle(
@@ -831,12 +860,35 @@ impl RuntimeLaunchDescriptor {
             &self.canonical_store_executable_path,
             "runtime_launch.canonical_store_executable_path",
         )?;
+        approved_filename(
+            &self.canonical_store_executable_path,
+            "surreal.exe",
+            "runtime_launch.canonical_store_executable_path",
+        )?;
         sha256_handle(
             &self.canonical_store_artifact_digest,
             "runtime_launch.canonical_store_artifact_digest",
         )?;
         approved_path(
+            &self.store_bridge_executable_path,
+            "runtime_launch.store_bridge_executable_path",
+        )?;
+        approved_filename(
+            &self.store_bridge_executable_path,
+            "eliot-store-surreal.exe",
+            "runtime_launch.store_bridge_executable_path",
+        )?;
+        sha256_handle(
+            &self.store_bridge_artifact_digest,
+            "runtime_launch.store_bridge_artifact_digest",
+        )?;
+        approved_path(
             &self.watchdog_executable_path,
+            "runtime_launch.watchdog_executable_path",
+        )?;
+        approved_filename(
+            &self.watchdog_executable_path,
+            "eliot-watchdog.exe",
             "runtime_launch.watchdog_executable_path",
         )?;
         sha256_handle(
@@ -861,7 +913,6 @@ impl RuntimeLaunchDescriptor {
         }
         for (arguments, field) in [
             (&self.kernel_arguments, "runtime_launch.kernel_arguments"),
-            (&self.store_arguments, "runtime_launch.store_arguments"),
             (
                 &self.canonical_store_arguments,
                 "runtime_launch.canonical_store_arguments",
@@ -888,34 +939,54 @@ impl CandidateManifest {
     pub fn validate(&self) -> Result<(), InstallationError> {
         handle(&self.generation, "manifest.generation")?;
         handles(&self.components, "manifest.components", true)?;
-        if self.artifact_digests.is_empty() {
-            return Err(InstallationError::InvalidField {
-                field: "manifest.artifact_digests".to_owned(),
-                reason: "must not be empty".to_owned(),
-            });
-        }
-        let mut artifact_identities = BTreeSet::new();
-        for digest in &self.artifact_digests {
-            sha256_handle(digest, "manifest.artifact_digests")?;
-            if !artifact_identities.insert(digest.as_str()) {
-                return Err(InstallationError::Duplicate {
-                    kind: "manifest.artifact_digests".to_owned(),
-                    identity: digest.as_str().to_owned(),
-                });
-            }
-        }
+        sha256_handle(
+            &self.kernel_artifact_digest,
+            "manifest.kernel_artifact_digest",
+        )?;
+        sha256_handle(
+            &self.store_bridge_artifact_digest,
+            "manifest.store_bridge_artifact_digest",
+        )?;
+        sha256_handle(
+            &self.canonical_store_artifact_digest,
+            "manifest.canonical_store_artifact_digest",
+        )?;
         approved_path(
             &self.kernel_executable_path,
+            "manifest.kernel_executable_path",
+        )?;
+        approved_filename(
+            &self.kernel_executable_path,
+            "eliot-kernel.exe",
             "manifest.kernel_executable_path",
         )?;
         approved_path(
             &self.store_bridge_executable_path,
             "manifest.store_bridge_executable_path",
         )?;
+        approved_filename(
+            &self.store_bridge_executable_path,
+            "eliot-store-surreal.exe",
+            "manifest.store_bridge_executable_path",
+        )?;
         approved_path(
             &self.canonical_store_executable_path,
             "manifest.canonical_store_executable_path",
         )?;
+        approved_filename(
+            &self.canonical_store_executable_path,
+            "surreal.exe",
+            "manifest.canonical_store_executable_path",
+        )?;
+        if self.kernel_executable_path == self.store_bridge_executable_path
+            || self.kernel_executable_path == self.canonical_store_executable_path
+            || self.store_bridge_executable_path == self.canonical_store_executable_path
+        {
+            return Err(InstallationError::Duplicate {
+                kind: "manifest.named_artifact_paths".to_owned(),
+                identity: "aliased executable path".to_owned(),
+            });
+        }
         approved_path(&self.config_path, "manifest.config_path")?;
         if self.runtime_launch.store_config_path != self.config_path {
             return Err(InstallationError::InvalidField {
@@ -937,6 +1008,17 @@ impl CandidateManifest {
                 reason: "must exactly equal the approved canonical engine path".to_owned(),
             });
         }
+        if self.runtime_launch.store_bridge_executable_path != self.store_bridge_executable_path
+            || self.runtime_launch.kernel_artifact_digest != self.kernel_artifact_digest
+            || self.runtime_launch.store_bridge_artifact_digest != self.store_bridge_artifact_digest
+            || self.runtime_launch.canonical_store_artifact_digest
+                != self.canonical_store_artifact_digest
+        {
+            return Err(InstallationError::InvalidField {
+                field: "manifest.runtime_launch.artifact_bindings".to_owned(),
+                reason: "named artifact bindings do not exactly match the manifest".to_owned(),
+            });
+        }
         handles(
             &self.dependency_closure_refs,
             "manifest.dependency_closure_refs",
@@ -952,32 +1034,23 @@ impl CandidateManifest {
             .and_then(|()| self.runtime_launch.validate_for_config(&self.config_path))
     }
 
-    /// Returns the ordered Kernel and canonical-store artifact digests used by
-    /// the Host process contour. Other artifacts remain installation evidence;
-    /// launch admission rejects an ambiguous runtime list.
+    /// Returns the named Kernel, canonical Store, and bridge artifact digests.
     pub fn runtime_artifact_digests(
         &self,
     ) -> Result<(&PlatformHandle, &PlatformHandle, &PlatformHandle), InstallationError> {
         self.validate()?;
-        if self.artifact_digests.len() != 3 {
-            return Err(InstallationError::IncompleteObservation(
-                "Host runtime admission requires exactly Kernel, bridge, and canonical engine artifact digests"
-                    .to_owned(),
-            ));
-        }
         Ok((
-            &self.artifact_digests[0],
-            &self.artifact_digests[1],
-            &self.artifact_digests[2],
+            &self.kernel_artifact_digest,
+            &self.canonical_store_artifact_digest,
+            &self.store_bridge_artifact_digest,
         ))
     }
 
-    /// Returns the canonical Kernel, Store bridge and configuration paths recorded by
-    /// installation policy.
+    /// Returns the canonical Kernel, canonical Store engine and configuration paths.
     pub fn runtime_paths(&self) -> (&PlatformHandle, &PlatformHandle, &PlatformHandle) {
         (
             &self.kernel_executable_path,
-            &self.store_bridge_executable_path,
+            &self.canonical_store_executable_path,
             &self.config_path,
         )
     }
@@ -1961,11 +2034,9 @@ mod tests {
                 test_handle("component:kernel"),
                 test_handle("component:store"),
             ],
-            artifact_digests: vec![
-                test_handle("0".repeat(64)),
-                test_handle("1".repeat(64)),
-                test_handle("5".repeat(64)),
-            ],
+            kernel_artifact_digest: test_handle("0".repeat(64)),
+            store_bridge_artifact_digest: test_handle("1".repeat(64)),
+            canonical_store_artifact_digest: test_handle("5".repeat(64)),
             kernel_executable_path: test_path(&root, "eliot-kernel.exe"),
             store_bridge_executable_path: test_path(&root, "eliot-store-surreal.exe"),
             canonical_store_executable_path: test_path(&root, "surreal.exe"),
@@ -1980,7 +2051,10 @@ mod tests {
                     profile: InstallationProfile::PortableDev,
                     portable_root: Some(test_path(&root, "portable")),
                     kernel_work_root: test_path(&root, "portable"),
+                    kernel_artifact_digest: test_handle("0".repeat(64)),
                     store_config_path: test_path(&root, "generation.json"),
+                    store_bridge_executable_path: test_path(&root, "eliot-store-surreal.exe"),
+                    store_bridge_artifact_digest: test_handle("1".repeat(64)),
                     store_bootstrap_descriptor_path: test_path(&root, "store-bootstrap.json"),
                     store_bootstrap_descriptor_digest: test_handle("6".repeat(64)),
                     canonical_store_executable_path: test_path(&root, "surreal.exe"),
@@ -1991,15 +2065,11 @@ mod tests {
                         test_handle("--store-bootstrap"),
                         test_path(&root, "store-bootstrap.json"),
                     ],
-                    store_arguments: vec![
+                    canonical_store_arguments: vec![
                         test_handle("--portable-dev-root"),
                         test_path(&root, "portable"),
                         test_handle("--config"),
                         test_path(&root, "generation.json"),
-                    ],
-                    canonical_store_arguments: vec![
-                        test_handle("start"),
-                        test_handle("--log").clone(),
                     ],
                     watchdog_executable_path: test_path(&root, "eliot-watchdog.exe"),
                     watchdog_artifact_digest: test_handle("4".repeat(64)),
@@ -2097,27 +2167,27 @@ mod tests {
         let transaction = registering_transaction();
         let descriptor = &transaction.candidate_manifest.runtime_launch;
         assert_eq!(descriptor.kernel_arguments[0].as_str(), "--work-root");
-        assert_eq!(descriptor.store_arguments[2].as_str(), "--config");
+        assert_eq!(descriptor.canonical_store_arguments[2].as_str(), "--config");
         assert!(descriptor.validate().is_ok());
         let config = &transaction.candidate_manifest.config_path;
         assert!(descriptor.validate_for_config(config).is_ok());
 
         let mut tampered = descriptor.clone();
-        tampered.store_arguments[0] = test_handle("--outside-root");
+        tampered.canonical_store_arguments[0] = test_handle("--outside-root");
         assert!(tampered.validate_for_config(config).is_err());
 
         let mut missing_config = descriptor.clone();
-        missing_config.store_arguments.truncate(2);
+        missing_config.canonical_store_arguments.truncate(2);
         assert!(missing_config.validate_for_config(config).is_err());
 
         let mut duplicate_config = descriptor.clone();
         duplicate_config
-            .store_arguments
+            .canonical_store_arguments
             .push(test_handle(config.as_str()));
         assert!(duplicate_config.validate_for_config(config).is_err());
 
         let mut alternate_config = descriptor.clone();
-        alternate_config.store_arguments[3] = test_path(
+        alternate_config.canonical_store_arguments[3] = test_path(
             &std::env::temp_dir(),
             "eliot-installation-alternate-config.json",
         );
@@ -2144,5 +2214,17 @@ mod tests {
         assert!(
             matches!(error, InstallationError::InvalidField { field, .. } if field == "manifest.runtime_launch.store_config_path")
         );
+    }
+
+    #[test]
+    fn manifest_rejects_bridge_as_canonical_engine_and_aliased_paths() {
+        let mut manifest = registering_transaction().candidate_manifest;
+        manifest.canonical_store_executable_path = manifest.store_bridge_executable_path.clone();
+        assert!(manifest.validate().is_err());
+
+        let mut swapped = registering_transaction().candidate_manifest;
+        swapped.canonical_store_executable_path =
+            test_path(&std::env::temp_dir(), "wrong-canonical-engine.exe");
+        assert!(swapped.validate().is_err());
     }
 }

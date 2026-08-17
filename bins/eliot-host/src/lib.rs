@@ -263,7 +263,7 @@ pub struct HostJobBranches {
     kernel_identity: JobObjectIdentity,
     store_identity: JobObjectIdentity,
     kernel_executable: Option<PathBuf>,
-    store_executable: Option<PathBuf>,
+    canonical_store_executable: Option<PathBuf>,
     kernel_lease: Option<LaunchLease>,
     store_lease: Option<LaunchLease>,
     config_path: Option<PathBuf>,
@@ -442,7 +442,7 @@ impl HostJobBranches {
             kernel_identity,
             store_identity,
             kernel_executable: None,
-            store_executable: None,
+            canonical_store_executable: None,
             kernel_lease: None,
             store_lease: None,
             config_path: None,
@@ -677,12 +677,12 @@ impl HostJobBranches {
     pub fn start_approved(
         &mut self,
         kernel_executable: &Path,
-        store_executable: &Path,
+        canonical_store_executable: &Path,
         generation: &PlatformHandle,
         config_digest: &PlatformHandle,
         config_path: &Path,
         approved_kernel_path: &PlatformHandle,
-        approved_store_path: &PlatformHandle,
+        approved_canonical_store_path: &PlatformHandle,
         approved_config_path: &PlatformHandle,
         kernel_artifact: &PlatformHandle,
         store_artifact: &PlatformHandle,
@@ -722,10 +722,16 @@ impl HostJobBranches {
         let kernel_lease =
             open_launch_lease(launch.profile, portable_root.as_ref(), &kernel_executable)?;
         verify_launch_digest(&kernel_lease, kernel_artifact, "runtime.kernel_artifact")?;
-        let store_executable =
-            approved_locator(store_executable, approved_store_path, launch.profile)?;
-        let store_lease =
-            open_launch_lease(launch.profile, portable_root.as_ref(), &store_executable)?;
+        let canonical_store_executable = approved_locator(
+            canonical_store_executable,
+            approved_canonical_store_path,
+            launch.profile,
+        )?;
+        let store_lease = open_launch_lease(
+            launch.profile,
+            portable_root.as_ref(),
+            &canonical_store_executable,
+        )?;
         verify_launch_digest(&store_lease, store_artifact, "runtime.store_artifact")?;
         let config_path = approved_locator(config_path, approved_config_path, launch.profile)?;
         let config_pin = PinnedRuntimeFile::open(&config_path)
@@ -782,7 +788,7 @@ impl HostJobBranches {
         let launch_result = launch_store_then_kernel(
             || {
                 Self::launch(
-                    &store_executable,
+                    &canonical_store_executable,
                     &store_lease,
                     &self.store_identity,
                     generation,
@@ -790,11 +796,11 @@ impl HostJobBranches {
                     store_artifact,
                     &config_path,
                     &config_lease,
-                    approved_store_path,
+                    approved_canonical_store_path,
                     approved_config_path,
                     &config_pin,
                     host,
-                    &launch.store_arguments,
+                    &launch.canonical_store_arguments,
                     &working_directory,
                 )
             },
@@ -843,7 +849,7 @@ impl HostJobBranches {
         match launch_result {
             Ok((store, kernel)) => {
                 self.kernel_executable = Some(kernel_executable);
-                self.store_executable = Some(store_executable);
+                self.canonical_store_executable = Some(canonical_store_executable);
                 self.kernel_lease = Some(kernel_lease);
                 self.store_lease = Some(store_lease);
                 self.config_path = Some(config_path);
@@ -898,7 +904,7 @@ impl HostJobBranches {
             }
             Err(StoreKernelLaunchError::CleanupRequired { store, reason }) => {
                 self.kernel_executable = Some(kernel_executable);
-                self.store_executable = Some(store_executable);
+                self.canonical_store_executable = Some(canonical_store_executable);
                 self.kernel_lease = Some(kernel_lease);
                 self.store_lease = Some(store_lease);
                 self.config_path = Some(config_path);
@@ -994,7 +1000,7 @@ impl HostJobBranches {
         host: &HostInstallationEpoch,
     ) -> Result<RunningJobChild<PlatformHandle>, HostError> {
         let executable = self
-            .store_executable
+            .canonical_store_executable
             .clone()
             .ok_or_else(|| HostError::ProcessContour("store image is not recorded".to_owned()))?;
         let executable_lease = self
@@ -1026,7 +1032,7 @@ impl HostJobBranches {
                 .ok_or_else(|| {
                     HostError::ProcessContour("runtime launch descriptor is missing".to_owned())
                 })?
-                .store_arguments,
+                .canonical_store_arguments,
             Path::new(
                 self.launch
                     .as_ref()
@@ -1094,7 +1100,7 @@ impl HostJobBranches {
         config_digest: &PlatformHandle,
         config_path: &Path,
         approved_kernel_path: &PlatformHandle,
-        approved_store_path: &PlatformHandle,
+        approved_canonical_store_path: &PlatformHandle,
         approved_config_path: &PlatformHandle,
         kernel_artifact: &PlatformHandle,
         store_artifact: &PlatformHandle,
@@ -1121,6 +1127,22 @@ impl HostJobBranches {
             .launch
             .as_ref()
             .map_or(InstallationProfile::SystemService, |launch| launch.profile);
+        if let Some(root) = self.portable_root.as_ref() {
+            root.verify_stable_identity()
+                .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+            let approved_root = self
+                .launch
+                .as_ref()
+                .and_then(|launch| launch.portable_root.as_ref())
+                .ok_or_else(|| {
+                    HostError::ProcessContour("portable root binding is missing".to_owned())
+                })?;
+            if root.path() != Path::new(approved_root.as_str()) {
+                return Err(HostError::ProcessContour(
+                    "portable root lease path changed outside the approved contour".to_owned(),
+                ));
+            }
+        }
         let canonical_config = approved_locator(config_path, approved_config_path, profile)?;
         if self.config_path.as_ref() != Some(&canonical_config) {
             return Err(HostError::ProcessContour(
@@ -1150,8 +1172,8 @@ impl HostJobBranches {
             lease.verify().map_err(HostError::ProcessContour)?;
             verify_launch_digest(lease, kernel_artifact, "runtime.kernel_artifact")?;
         }
-        if let Some(store) = &self.store_executable {
-            let approved = approved_locator(store, approved_store_path, profile)?;
+        if let Some(store) = &self.canonical_store_executable {
+            let approved = approved_locator(store, approved_canonical_store_path, profile)?;
             let lease = self.store_lease.as_ref().ok_or_else(|| {
                 HostError::ProcessContour("store image lease is missing".to_owned())
             })?;
@@ -1209,7 +1231,7 @@ impl HostJobBranches {
                     config_digest,
                     config_path,
                     store_artifact,
-                    approved_store_path,
+                    approved_canonical_store_path,
                     approved_config_path,
                     host,
                 )
@@ -1274,8 +1296,7 @@ impl HostJobBranches {
         prior_launch: &RuntimeLaunchDescriptor,
         host: &HostInstallationEpoch,
     ) -> Result<(), HostError> {
-        self.terminate_store()?;
-        self.terminate_kernel()?;
+        self.terminate_store_then_kernel()?;
         match self.start_approved(
             candidate_kernel,
             candidate_store,
@@ -1352,9 +1373,20 @@ impl HostJobBranches {
         Ok(())
     }
 
+    fn terminate_store_then_kernel(&mut self) -> Result<(), HostError> {
+        let store = self.terminate_store();
+        let kernel = self.terminate_kernel();
+        match (store, kernel) {
+            (Ok(()), Ok(())) => Ok(()),
+            (store, kernel) => Err(HostError::RecoveryRequired(format!(
+                "Store-first termination was incomplete: store={store:?}; kernel={kernel:?}"
+            ))),
+        }
+    }
+
     fn clear_recorded_contour(&mut self) {
         self.kernel_executable = None;
-        self.store_executable = None;
+        self.canonical_store_executable = None;
         self.kernel_lease = None;
         self.store_lease = None;
         self.config_path = None;
@@ -1397,7 +1429,7 @@ impl HostJobBranches {
         self.kernel.is_some()
             || self.store.is_some()
             || self.kernel_executable.is_some()
-            || self.store_executable.is_some()
+            || self.canonical_store_executable.is_some()
     }
 
     fn kernel_recovery_binding(
@@ -2107,10 +2139,11 @@ impl HostComposition {
                 .active_process
                 .unwrap_or_else(|| self.host_process.clone());
             #[cfg(windows)]
-            {
-                self.jobs.terminate_store()?;
-                self.jobs.terminate_kernel()?;
-            }
+            let termination = {
+                let store = self.jobs.terminate_store();
+                let kernel = self.jobs.terminate_kernel();
+                (store, kernel)
+            };
             let marker = eliot_platform::HostShutdownMarker {
                 context: lifecycle_context(&self.host, "host-stop")?,
                 installation: self.host.installation.clone(),
@@ -2122,6 +2155,14 @@ impl HostComposition {
                 .map_err(HostError::State)?;
             self.pending_release = Some(token);
             self.durable_finalized = false;
+            #[cfg(windows)]
+            if termination.0.is_err() || termination.1.is_err() {
+                self.shutdown_failed = true;
+                return Err(HostError::RecoveryRequired(format!(
+                    "Store-first stop requires recovery: store={:?}; kernel={:?}",
+                    termination.0, termination.1
+                )));
+            }
         }
         let token = self.pending_release.take().ok_or_else(|| {
             HostError::OwnerLeaseRecovery("release token is unavailable".to_owned())
