@@ -262,19 +262,115 @@ enum BranchLiveness {
 }
 
 #[cfg(windows)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ReconciliationObservation {
+    Live,
+    Dead,
+    Unknown,
+}
+
+#[cfg(windows)]
+struct ReconciliationState<S, K> {
+    store: Option<S>,
+    kernel: Option<K>,
+    store_restart_attempts: u8,
+    kernel_restart_attempts: u8,
+}
+
+#[cfg(windows)]
+fn reconcile_state_machine<S, K, SO, KO, ST, KT, SL, KL>(
+    state: &mut ReconciliationState<S, K>,
+    mut observe_store: SO,
+    mut observe_kernel: KO,
+    mut terminate_store: ST,
+    mut terminate_kernel: KT,
+    mut launch_store: SL,
+    mut launch_kernel: KL,
+) -> HostBranchDisposition
+where
+    SO: FnMut(Option<&S>) -> ReconciliationObservation,
+    KO: FnMut(Option<&K>) -> ReconciliationObservation,
+    ST: FnMut(&mut Option<S>) -> Result<(), ()>,
+    KT: FnMut(&mut Option<K>) -> Result<(), ()>,
+    SL: FnMut() -> Result<S, ()>,
+    KL: FnMut() -> Result<K, ()>,
+{
+    let kernel_observation = observe_kernel(state.kernel.as_ref());
+    let store_observation = observe_store(state.store.as_ref());
+    let kernel_dead = kernel_observation == ReconciliationObservation::Dead;
+    let mut store_dead = store_observation == ReconciliationObservation::Dead;
+    let mut kernel_degraded = kernel_observation == ReconciliationObservation::Unknown;
+    let mut store_degraded = store_observation == ReconciliationObservation::Unknown;
+
+    let both_dead = kernel_dead && store_dead;
+    if both_dead {
+        if store_degraded
+            || terminate_store(&mut state.store).is_err()
+            || state.store_restart_attempts >= 1
+        {
+            store_degraded = true;
+        } else {
+            state.store_restart_attempts += 1;
+            if let Ok(store) = launch_store() {
+                state.store = Some(store);
+                if observe_store(state.store.as_ref()) != ReconciliationObservation::Live {
+                    store_degraded = true;
+                    let _ = terminate_store(&mut state.store);
+                }
+            } else {
+                store_degraded = true;
+            }
+        }
+        store_dead = state.store.is_none() || store_degraded;
+    }
+
+    if kernel_dead && !store_dead && !store_degraded && state.store.is_some() {
+        if terminate_kernel(&mut state.kernel).is_err() || state.kernel_restart_attempts >= 1 {
+            kernel_degraded = true;
+        } else {
+            state.kernel_restart_attempts += 1;
+            if let Ok(kernel) = launch_kernel() {
+                state.kernel = Some(kernel);
+            } else {
+                kernel_degraded = true;
+            }
+        }
+    } else if kernel_dead {
+        kernel_degraded = true;
+    }
+
+    if store_dead && !both_dead {
+        if terminate_store(&mut state.store).is_err() || state.store_restart_attempts >= 1 {
+            store_degraded = true;
+        } else {
+            state.store_restart_attempts += 1;
+            if let Ok(store) = launch_store() {
+                state.store = Some(store);
+                if observe_store(state.store.as_ref()) != ReconciliationObservation::Live {
+                    store_degraded = true;
+                }
+            } else {
+                store_degraded = true;
+            }
+        }
+    }
+
+    if state.kernel.is_none() {
+        kernel_degraded = true;
+    }
+    if state.store.is_none() {
+        store_degraded = true;
+    }
+    match (kernel_degraded, store_degraded) {
+        (false, false) => HostBranchDisposition::Healthy,
+        (true, false) => HostBranchDisposition::KernelDegraded,
+        (false, true) => HostBranchDisposition::StoreDegraded,
+        (true, true) => HostBranchDisposition::BothDegraded,
+    }
+}
+
+#[cfg(windows)]
 impl HostJobBranches {
-    fn kernel_relaunch_admitted(
-        store_dead: bool,
-        store_degraded: bool,
-        store_present: bool,
-    ) -> bool {
-        !store_dead && !store_degraded && store_present
-    }
-
-    fn restart_allowed(attempts: u8) -> bool {
-        attempts < 1
-    }
-
     /// Creates two owner-scoped Job identities.  The actual Job handles are
     /// created only by the approved suspended launch below; there is no
     /// unbound PID assignment path.
@@ -729,7 +825,7 @@ impl HostJobBranches {
         reason = "relaunch keeps every approved authority binding explicit at the process boundary"
     )]
     fn relaunch_kernel(
-        &mut self,
+        &self,
         generation: &PlatformHandle,
         config_digest: &PlatformHandle,
         config_path: &Path,
@@ -737,7 +833,7 @@ impl HostJobBranches {
         approved_executable_path: &PlatformHandle,
         approved_config_path: &PlatformHandle,
         host: &HostInstallationEpoch,
-    ) -> Result<(), HostError> {
+    ) -> Result<RunningJobChild<PlatformHandle>, HostError> {
         let executable = self
             .kernel_executable
             .clone()
@@ -782,8 +878,7 @@ impl HostJobBranches {
                     .as_str(),
             ),
         )?;
-        self.kernel = Some(child);
-        Ok(())
+        Ok(child)
     }
 
     #[allow(
@@ -791,7 +886,7 @@ impl HostJobBranches {
         reason = "relaunch keeps every approved authority binding explicit at the process boundary"
     )]
     fn relaunch_store(
-        &mut self,
+        &self,
         generation: &PlatformHandle,
         config_digest: &PlatformHandle,
         config_path: &Path,
@@ -799,7 +894,7 @@ impl HostJobBranches {
         approved_executable_path: &PlatformHandle,
         approved_config_path: &PlatformHandle,
         host: &HostInstallationEpoch,
-    ) -> Result<(), HostError> {
+    ) -> Result<RunningJobChild<PlatformHandle>, HostError> {
         let executable = self
             .store_executable
             .clone()
@@ -844,8 +939,7 @@ impl HostJobBranches {
                     .as_str(),
             ),
         )?;
-        self.store = Some(child);
-        Ok(())
+        Ok(child)
     }
 
     fn branch_state(
@@ -958,123 +1052,76 @@ impl HostJobBranches {
             lease.verify().map_err(HostError::ProcessContour)?;
             verify_launch_digest(lease, store_artifact, "runtime.store_artifact")?;
         }
-        let kernel_observation = Self::branch_state(self.kernel.as_ref());
-        let store_observation = Self::branch_state(self.store.as_ref());
-        let kernel_dead = matches!(kernel_observation, Ok(BranchLiveness::Dead));
-        let mut store_dead = matches!(store_observation, Ok(BranchLiveness::Dead));
-        let mut kernel_degraded = false;
-        let mut store_degraded = store_observation.is_err();
-        if kernel_observation.is_err() {
-            kernel_degraded = true;
-        }
-
-        // When both branches are gone, restore the dependency before admitting
-        // Kernel. A failed Kernel launch must not leave a newly started Store.
-        let both_dead = kernel_dead && store_dead;
-        if both_dead {
-            if store_degraded
-                || self.terminate_store().is_err()
-                || !Self::restart_allowed(self.store_restart_attempts)
-            {
-                store_degraded = true;
-            } else {
-                self.store_restart_attempts += 1;
-                if self
-                    .relaunch_store(
-                        generation,
-                        config_digest,
-                        config_path,
-                        store_artifact,
-                        approved_store_path,
-                        approved_config_path,
-                        host,
-                    )
-                    .is_err()
-                {
-                    store_degraded = true;
-                } else if self.store.is_none()
-                    || !matches!(
-                        Self::branch_state(self.store.as_ref()),
-                        Ok(BranchLiveness::Live)
-                    )
-                {
-                    store_degraded = true;
-                    let _ = self.terminate_store();
-                }
-            }
-            store_dead = self.store.is_none() || store_degraded;
-        }
-
-        // Kernel is admitted only after Store relaunch and observation prove an
-        // owned live Store child. Unknown Store state remains degraded.
-        if kernel_dead
-            && Self::kernel_relaunch_admitted(store_dead, store_degraded, self.store.is_some())
-        {
-            if self.terminate_kernel().is_err()
-                || !Self::restart_allowed(self.kernel_restart_attempts)
-            {
-                kernel_degraded = true;
-            } else {
-                self.kernel_restart_attempts += 1;
-                if self
-                    .relaunch_kernel(
-                        generation,
-                        config_digest,
-                        config_path,
-                        kernel_artifact,
-                        approved_kernel_path,
-                        approved_config_path,
-                        host,
-                    )
-                    .is_err()
-                {
-                    kernel_degraded = true;
-                }
-            }
-        } else if kernel_dead {
-            kernel_degraded = true;
-        }
-
-        if store_dead && !both_dead {
-            if self.terminate_store().is_err()
-                || !Self::restart_allowed(self.store_restart_attempts)
-            {
-                store_degraded = true;
-            } else {
-                self.store_restart_attempts += 1;
-                if self
-                    .relaunch_store(
-                        generation,
-                        config_digest,
-                        config_path,
-                        store_artifact,
-                        approved_store_path,
-                        approved_config_path,
-                        host,
-                    )
-                    .is_err()
-                    || !matches!(
-                        Self::branch_state(self.store.as_ref()),
-                        Ok(BranchLiveness::Live)
-                    )
-                {
-                    store_degraded = true;
-                }
-            }
-        }
-
-        if self.kernel.is_none() {
-            kernel_degraded = true;
-        }
-        if self.store.is_none() {
-            store_degraded = true;
-        }
-        Ok(match (kernel_degraded, store_degraded) {
-            (false, false) => HostBranchDisposition::Healthy,
-            (true, false) => HostBranchDisposition::KernelDegraded,
-            (false, true) => HostBranchDisposition::StoreDegraded,
-            (true, true) => HostBranchDisposition::BothDegraded,
-        })
+        let mut state = ReconciliationState {
+            store: self.store.take(),
+            kernel: self.kernel.take(),
+            store_restart_attempts: self.store_restart_attempts,
+            kernel_restart_attempts: self.kernel_restart_attempts,
+        };
+        let disposition = reconcile_state_machine(
+            &mut state,
+            |store| match Self::branch_state(store) {
+                Ok(BranchLiveness::Live) => ReconciliationObservation::Live,
+                Ok(BranchLiveness::Dead) => ReconciliationObservation::Dead,
+                Err(_) => ReconciliationObservation::Unknown,
+            },
+            |kernel| match Self::branch_state(kernel) {
+                Ok(BranchLiveness::Live) => ReconciliationObservation::Live,
+                Ok(BranchLiveness::Dead) => ReconciliationObservation::Dead,
+                Err(_) => ReconciliationObservation::Unknown,
+            },
+            |store| {
+                let Some(child) = store.as_mut() else {
+                    return Ok(());
+                };
+                child
+                    .terminate_in_place(0xE017_0002)
+                    .map(|_| {
+                        store.take();
+                    })
+                    .map_err(|_| ())
+            },
+            |kernel| {
+                let Some(child) = kernel.as_mut() else {
+                    return Ok(());
+                };
+                child
+                    .terminate_in_place(0xE017_0001)
+                    .map(|_| {
+                        kernel.take();
+                    })
+                    .map_err(|_| ())
+            },
+            || {
+                self.relaunch_store(
+                    generation,
+                    config_digest,
+                    config_path,
+                    store_artifact,
+                    approved_store_path,
+                    approved_config_path,
+                    host,
+                )
+                .map_err(|_| ())
+            },
+            || {
+                self.relaunch_kernel(
+                    generation,
+                    config_digest,
+                    config_path,
+                    kernel_artifact,
+                    approved_kernel_path,
+                    approved_config_path,
+                    host,
+                )
+                .map_err(|_| ())
+            },
+        );
+        self.store = state.store;
+        self.kernel = state.kernel;
+        self.store_restart_attempts = state.store_restart_attempts;
+        self.kernel_restart_attempts = state.kernel_restart_attempts;
+        Ok(disposition)
     }
 
     /// Performs a bounded side-by-side cutover with an explicit rollback
@@ -2142,8 +2189,23 @@ mod tests {
     use std::cell::RefCell;
 
     use super::{
-        HostError, StoreKernelLaunchError, StoreLivenessEvidence, launch_store_then_kernel,
+        HostBranchDisposition, HostError, ReconciliationObservation, ReconciliationState,
+        StoreKernelLaunchError, StoreLivenessEvidence, launch_store_then_kernel,
+        reconcile_state_machine,
     };
+
+    #[derive(Debug, Eq, PartialEq)]
+    struct MockChild {
+        id: u8,
+        live: bool,
+    }
+
+    fn mock_observation(child: Option<&MockChild>) -> ReconciliationObservation {
+        match child {
+            Some(child) if child.live => ReconciliationObservation::Live,
+            Some(_) | None => ReconciliationObservation::Dead,
+        }
+    }
 
     #[test]
     fn approved_launch_records_store_before_kernel() {
@@ -2268,6 +2330,153 @@ mod tests {
             Err(StoreKernelLaunchError::CleanupRequired { store: 42, .. })
         ));
         assert_eq!(*launches.borrow(), ["Store"]);
+    }
+
+    #[test]
+    fn reconcile_store_first_then_kernel() {
+        let events = RefCell::new(Vec::new());
+        let mut state = ReconciliationState {
+            store: None,
+            kernel: None,
+            store_restart_attempts: 0,
+            kernel_restart_attempts: 0,
+        };
+        let disposition = reconcile_state_machine(
+            &mut state,
+            |child| {
+                if child.is_some() {
+                    events.borrow_mut().push("observe Store");
+                }
+                mock_observation(child)
+            },
+            mock_observation,
+            |_| Ok(()),
+            |_| Ok(()),
+            || {
+                events.borrow_mut().push("launch Store");
+                Ok(MockChild { id: 1, live: true })
+            },
+            || {
+                events.borrow_mut().push("launch Kernel");
+                Ok(MockChild { id: 2, live: true })
+            },
+        );
+        assert_eq!(disposition, HostBranchDisposition::Healthy);
+        assert_eq!(
+            *events.borrow(),
+            ["launch Store", "observe Store", "launch Kernel"]
+        );
+    }
+
+    #[test]
+    fn reconcile_store_failure_or_unknown_blocks_kernel() {
+        for unknown in [false, true] {
+            let kernel_launches = RefCell::new(0);
+            let mut state = ReconciliationState {
+                store: unknown.then_some(MockChild { id: 7, live: true }),
+                kernel: None,
+                store_restart_attempts: 0,
+                kernel_restart_attempts: 0,
+            };
+            let disposition = reconcile_state_machine(
+                &mut state,
+                |child| {
+                    if unknown {
+                        ReconciliationObservation::Unknown
+                    } else {
+                        mock_observation(child)
+                    }
+                },
+                mock_observation,
+                |_| Ok(()),
+                |_| Ok(()),
+                || {
+                    if unknown {
+                        Ok(MockChild { id: 8, live: true })
+                    } else {
+                        Err(())
+                    }
+                },
+                || {
+                    *kernel_launches.borrow_mut() += 1;
+                    Ok(MockChild { id: 9, live: true })
+                },
+            );
+            assert_eq!(disposition, HostBranchDisposition::BothDegraded);
+            assert_eq!(*kernel_launches.borrow(), 0);
+        }
+    }
+
+    #[test]
+    fn reconcile_live_store_restarts_kernel_once_and_then_is_bounded() {
+        let kernel_launches = RefCell::new(0);
+        let mut state = ReconciliationState {
+            store: Some(MockChild { id: 7, live: true }),
+            kernel: None,
+            store_restart_attempts: 0,
+            kernel_restart_attempts: 0,
+        };
+        let run = |state: &mut ReconciliationState<MockChild, MockChild>| {
+            reconcile_state_machine(
+                state,
+                mock_observation,
+                mock_observation,
+                |_| Ok(()),
+                |_| Ok(()),
+                || Ok(MockChild { id: 8, live: true }),
+                || {
+                    *kernel_launches.borrow_mut() += 1;
+                    Ok(MockChild { id: 9, live: true })
+                },
+            )
+        };
+        assert_eq!(run(&mut state), HostBranchDisposition::Healthy);
+        state.kernel.as_mut().expect("kernel restart").live = false;
+        assert_eq!(run(&mut state), HostBranchDisposition::KernelDegraded);
+        assert_eq!(*kernel_launches.borrow(), 1);
+    }
+
+    #[test]
+    fn reconcile_failed_termination_retains_owned_handle() {
+        let mut state = ReconciliationState {
+            store: Some(MockChild { id: 7, live: false }),
+            kernel: Some(MockChild { id: 9, live: true }),
+            store_restart_attempts: 0,
+            kernel_restart_attempts: 0,
+        };
+        let disposition = reconcile_state_machine(
+            &mut state,
+            mock_observation,
+            mock_observation,
+            |_| Err(()),
+            |_| Ok(()),
+            || Ok(MockChild { id: 8, live: true }),
+            || Ok(MockChild { id: 10, live: true }),
+        );
+        assert_eq!(disposition, HostBranchDisposition::StoreDegraded);
+        assert_eq!(state.store, Some(MockChild { id: 7, live: false }));
+    }
+
+    #[test]
+    fn reconcile_kernel_failure_retains_restarted_store() {
+        let mut state = ReconciliationState {
+            store: None,
+            kernel: None,
+            store_restart_attempts: 0,
+            kernel_restart_attempts: 0,
+        };
+        let disposition = reconcile_state_machine(
+            &mut state,
+            mock_observation,
+            mock_observation,
+            |_| Ok(()),
+            |_| Ok(()),
+            || Ok(MockChild { id: 7, live: true }),
+            || Err(()),
+        );
+        assert_eq!(disposition, HostBranchDisposition::KernelDegraded);
+        assert_eq!(state.store, Some(MockChild { id: 7, live: true }));
+        assert!(state.kernel.is_none());
     }
 }
 
