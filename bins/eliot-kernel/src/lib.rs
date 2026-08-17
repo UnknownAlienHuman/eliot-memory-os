@@ -778,13 +778,10 @@ where
     Ok(())
 }
 
-#[cfg(windows)]
 trait ProcessStartGuard: Send {}
 
-#[cfg(windows)]
 impl<T: Send> ProcessStartGuard for T {}
 
-#[cfg(windows)]
 #[allow(async_fn_in_trait)]
 trait ProcessStartPorts {
     type PathProof;
@@ -814,6 +811,14 @@ trait ProcessStartPorts {
         record: ProcessExecutionReplayRecord,
     ) -> Result<Option<Self::Receipt>, ProcessExecutionError>;
     async fn snapshot(&self) -> Result<CanonicalValidationSnapshot, ProcessExecutionError>;
+    fn build_context(
+        &self,
+        clock: ClockObservation,
+        store_fence: FencingToken,
+        authority_epoch: u64,
+        revision_heads: BTreeMap<String, String>,
+        validation_revision: u64,
+    ) -> Result<DispatchValidationContext, ProcessExecutionError>;
     fn insert_context(
         &self,
         operation_id: eliot_process::OperationId,
@@ -858,7 +863,6 @@ trait ProcessStartPorts {
     ) -> Result<ProcessExecutionReplayAbort, ProcessExecutionError>;
 }
 
-#[cfg(windows)]
 struct ProcessStartReservation<'a, P: ProcessStartPorts + ?Sized> {
     ports: &'a P,
     operation_id: eliot_process::OperationId,
@@ -867,51 +871,6 @@ struct ProcessStartReservation<'a, P: ProcessStartPorts + ?Sized> {
     active: bool,
 }
 
-#[cfg(not(windows))]
-struct ReplayReservationGuard {
-    store: Arc<dyn ProcessExecutionReplayStoreWithAbort>,
-    operation_id: eliot_process::OperationId,
-    admission_digest: String,
-    owner: ProcessOwnerBinding,
-    active: bool,
-}
-
-#[cfg(not(windows))]
-impl ReplayReservationGuard {
-    fn release(&mut self) -> Result<(), ProcessExecutionError> {
-        if !self.active {
-            return Ok(());
-        }
-        let result = self
-            .store
-            .abort_process_start(&self.operation_id, &self.admission_digest, &self.owner)
-            .map_err(|error| ProcessExecutionError::Unavailable(error.to_string()))?;
-        self.active = false;
-        match result {
-            ProcessExecutionReplayAbort::Released => Ok(()),
-            ProcessExecutionReplayAbort::NotReleased => Err(ProcessExecutionError::UnknownOutcome),
-        }
-    }
-
-    fn disarm(&mut self) {
-        self.active = false;
-    }
-}
-
-#[cfg(not(windows))]
-impl Drop for ReplayReservationGuard {
-    fn drop(&mut self) {
-        if self.active {
-            let _ = self.store.abort_process_start(
-                &self.operation_id,
-                &self.admission_digest,
-                &self.owner,
-            );
-        }
-    }
-}
-
-#[cfg(windows)]
 impl<P: ProcessStartPorts + ?Sized> ProcessStartReservation<'_, P> {
     fn release(&mut self) -> Result<(), ProcessExecutionError> {
         if !self.active {
@@ -932,7 +891,6 @@ impl<P: ProcessStartPorts + ?Sized> ProcessStartReservation<'_, P> {
     }
 }
 
-#[cfg(windows)]
 impl<P: ProcessStartPorts + ?Sized> Drop for ProcessStartReservation<'_, P> {
     fn drop(&mut self) {
         if self.active {
@@ -1109,7 +1067,6 @@ impl ProcessExecutionGateway {
             .map_err(ProcessExecutionError::Unavailable)
     }
 
-    #[cfg(windows)]
     fn attach_path_proof(
         &self,
         operation_id: eliot_process::OperationId,
@@ -1140,7 +1097,6 @@ impl ProcessExecutionGateway {
         );
     }
 
-    #[cfg(windows)]
     async fn start(
         &self,
         owner: &ProcessOwnerBinding,
@@ -1148,257 +1104,6 @@ impl ProcessExecutionGateway {
         path_proof: ProcessPathProof,
     ) -> Result<ProcessStartReceipt, ProcessExecutionError> {
         run_process_start(self, owner, admission, path_proof).await
-    }
-
-    #[cfg(not(windows))]
-    #[allow(
-        clippy::too_many_lines,
-        reason = "reservation, authority issuance, executor handoff, and replay linearization are one-shot ordered"
-    )]
-    async fn start(
-        &self,
-        owner: &ProcessOwnerBinding,
-        admission: ProcessExecutionAdmissionRequest,
-        path_proof: ProcessPathProof,
-    ) -> Result<ProcessStartReceipt, ProcessExecutionError> {
-        admission.validate()?;
-        if path_proof.executable.to_string_lossy() != admission.intent().executable()
-            || path_proof.working_directory.to_string_lossy()
-                != admission.intent().working_directory()
-            || path_proof.lease.executable_identity().file_index == 0
-        {
-            return Err(ProcessExecutionError::Contract(
-                eliot_process::ContractError::DispatchBindingMismatch,
-            ));
-        }
-        if admission.recipient_module_id() != owner.module_id()
-            || admission.state_fence().authority_epoch() != owner.authority_epoch()
-            || admission.state_fence().generation().get() != owner.generation().get()
-        {
-            return Err(ProcessExecutionError::Contract(
-                eliot_process::ContractError::DispatchBindingMismatch,
-            ));
-        }
-        let digest = process_admission_digest(&admission)
-            .map_err(|error| ProcessExecutionError::Unavailable(error.to_string()))?;
-        let now = unix_ms();
-        if admission.deadline_unix_ms() <= now {
-            return Err(ProcessExecutionError::Contract(
-                eliot_process::ContractError::ExpiredDispatchPermit,
-            ));
-        }
-        if admission.state_fence().authority_epoch()
-            != self.snapshot_binding.authority_epoch().current.epoch
-            || admission.state_fence().generation() != admission.intent().generation()
-        {
-            return Err(ProcessExecutionError::Contract(
-                eliot_process::ContractError::StaleStateFence,
-            ));
-        }
-        let mut reservation = match self
-            .replay_store
-            .begin_process_start(admission.intent().operation_id(), &digest, owner)
-            .map_err(|error| ProcessExecutionError::Unavailable(error.to_string()))?
-        {
-            ProcessExecutionReplayBegin::Acquired => ReplayReservationGuard {
-                store: Arc::clone(&self.replay_store),
-                operation_id: admission.intent().operation_id().clone(),
-                admission_digest: digest.clone(),
-                owner: owner.clone(),
-                active: true,
-            },
-            ProcessExecutionReplayBegin::Existing(record) => {
-                if record.admission_digest != digest {
-                    return Err(ProcessExecutionError::Contract(
-                        eliot_process::ContractError::DispatchBindingMismatch,
-                    ));
-                }
-                if record.owner != *owner {
-                    return Err(ProcessExecutionError::Contract(
-                        eliot_process::ContractError::DispatchBindingMismatch,
-                    ));
-                }
-                return match (record.state, record.receipt) {
-                    (ProcessExecutionReplayState::Completed, Some(receipt)) => Ok(receipt),
-                    (
-                        ProcessExecutionReplayState::Reserved
-                        | ProcessExecutionReplayState::Unknown,
-                        _,
-                    ) => Err(ProcessExecutionError::UnknownOutcome),
-                    (ProcessExecutionReplayState::Completed, None) => {
-                        Err(ProcessExecutionError::UnknownOutcome)
-                    }
-                };
-            }
-        };
-        let snapshot = {
-            #[cfg(windows)]
-            {
-                match self.canonical_validation_snapshot().await {
-                    Ok(snapshot) => snapshot,
-                    Err(error) => {
-                        return Err(match reservation.release() {
-                            Ok(()) => error,
-                            Err(_) => ProcessExecutionError::UnknownOutcome,
-                        });
-                    }
-                }
-            }
-            #[cfg(not(windows))]
-            {
-                return Err(match reservation.release() {
-                    Ok(()) => ProcessExecutionError::Unavailable(
-                        "canonical store validation is unavailable on this platform".to_owned(),
-                    ),
-                    Err(_) => ProcessExecutionError::UnknownOutcome,
-                });
-            }
-        };
-        if let Err(error) = snapshot.validate() {
-            let failure = ProcessExecutionError::Unavailable(error.to_string());
-            return Err(match reservation.release() {
-                Ok(()) => failure,
-                Err(_) => ProcessExecutionError::UnknownOutcome,
-            });
-        }
-        if admission.state_fence().authority_epoch() != snapshot.state_fence.authority_epoch.value()
-            || admission.state_fence().generation().get()
-                != snapshot.state_fence.resource_generation.value()
-        {
-            let failure =
-                ProcessExecutionError::Contract(eliot_process::ContractError::StaleStateFence);
-            return Err(match reservation.release() {
-                Ok(()) => failure,
-                Err(_) => ProcessExecutionError::UnknownOutcome,
-            });
-        }
-        let (store_fence, revision_heads) = match project_store_snapshot(&snapshot) {
-            Ok(projected) => projected,
-            Err(error) => {
-                return Err(match reservation.release() {
-                    Ok(()) => error,
-                    Err(_) => ProcessExecutionError::UnknownOutcome,
-                });
-            }
-        };
-        let context = DispatchValidationContext::new(
-            ClockObservation {
-                valid_time_ms: Some(snapshot.observed_at_unix_ms),
-                known_time_ms: Some(snapshot.observed_at_unix_ms),
-                transaction_sequence: None,
-                monotonic_ns: None,
-            },
-            store_fence.clone(),
-            snapshot.state_fence.authority_epoch.value(),
-            revision_heads.clone(),
-            snapshot.validation_revision,
-        )
-        .map_err(|error| ProcessExecutionError::Unavailable(error.to_string()))?;
-        let operation_id = admission.intent().operation_id().clone();
-        let context_guard = match self
-            .validation_contexts
-            .insert(operation_id.clone(), context)
-        {
-            Ok(guard) => guard,
-            Err(error) => {
-                return Err(match reservation.release() {
-                    Ok(()) => error,
-                    Err(_) => ProcessExecutionError::UnknownOutcome,
-                });
-            }
-        };
-        let permit = match self
-            .controller
-            .lock()
-            .map_err(|_| {
-                ProcessExecutionError::Unavailable("process authority lock poisoned".to_owned())
-            })?
-            .issue(
-                admission.intent(),
-                PermitIssuance::new_with_validation_revision(
-                    admission.action_lease_ref().clone(),
-                    store_fence,
-                    revision_heads,
-                    now,
-                    admission.deadline_unix_ms(),
-                    format!(
-                        "process-start:{}",
-                        admission.intent().operation_id().as_str()
-                    ),
-                    snapshot.validation_revision,
-                )
-                .map_err(|error| ProcessExecutionError::Unavailable(error.to_string()))?,
-                &self.snapshot_binding,
-            )
-            .map_err(|error| ProcessExecutionError::Unavailable(error.to_string()))
-        {
-            Ok(permit) => permit,
-            Err(error) => {
-                return Err(match reservation.release() {
-                    Ok(()) => error,
-                    Err(_) => ProcessExecutionError::UnknownOutcome,
-                });
-            }
-        };
-        let request = match ProcessRequest::new(admission.intent().clone(), permit) {
-            Ok(request) => request,
-            Err(error) => {
-                let failure = ProcessExecutionError::Contract(error);
-                return Err(match reservation.release() {
-                    Ok(()) => failure,
-                    Err(_) => ProcessExecutionError::UnknownOutcome,
-                });
-            }
-        };
-        if let Err(error) = self.path_admission.insert(operation_id.clone(), path_proof) {
-            return Err(match reservation.release() {
-                Ok(()) => error,
-                Err(_) => ProcessExecutionError::UnknownOutcome,
-            });
-        }
-        let path_guard = PathAdmissionGuard {
-            admission: Arc::clone(&self.path_admission),
-            operation_id: operation_id.clone(),
-        };
-        let receipt = match self
-            .executor
-            .start(
-                request,
-                Arc::new(OrsProcessEvidenceSink {
-                    store: Arc::clone(&self.evidence_store),
-                    owner: owner.clone(),
-                }),
-            )
-            .await
-        {
-            Ok(receipt) => {
-                drop(context_guard);
-                drop(path_guard);
-                receipt
-            }
-            Err(error) => {
-                drop(context_guard);
-                drop(path_guard);
-                reservation.disarm();
-                self.mark_unknown(admission.intent().operation_id(), &digest, owner);
-                return Err(error);
-            }
-        };
-        if let Err(error) = self.replay_store.persist_process_start(
-            admission.intent().operation_id(),
-            ProcessExecutionReplayRecord {
-                admission_digest: digest.clone(),
-                owner: owner.clone(),
-                state: ProcessExecutionReplayState::Completed,
-                receipt: Some(receipt.clone()),
-            },
-        ) {
-            reservation.disarm();
-            self.mark_unknown(admission.intent().operation_id(), &digest, owner);
-            return Err(ProcessExecutionError::Unavailable(error.to_string()));
-        }
-        reservation.disarm();
-        Ok(receipt)
     }
 
     async fn inspect(
@@ -1442,7 +1147,6 @@ impl ProcessExecutionGateway {
     }
 }
 
-#[cfg(windows)]
 #[allow(
     clippy::too_many_lines,
     reason = "reservation, canonical projection, authority issue, executor handoff, and replay linearization are one ordered operation"
@@ -1524,7 +1228,7 @@ async fn run_process_start<P: ProcessStartPorts>(
             });
         }
     };
-    let context = DispatchValidationContext::new(
+    let context = match ports.build_context(
         ClockObservation {
             valid_time_ms: Some(snapshot.observed_at_unix_ms),
             known_time_ms: Some(snapshot.observed_at_unix_ms),
@@ -1535,8 +1239,15 @@ async fn run_process_start<P: ProcessStartPorts>(
         snapshot.state_fence.authority_epoch.value(),
         revision_heads.clone(),
         snapshot.validation_revision,
-    )
-    .map_err(|error| ProcessExecutionError::Unavailable(error.to_string()))?;
+    ) {
+        Ok(context) => context,
+        Err(error) => {
+            return Err(match reservation.release() {
+                Ok(()) => error,
+                Err(_) => ProcessExecutionError::UnknownOutcome,
+            });
+        }
+    };
     let operation_id = admission.intent().operation_id().clone();
     let context_guard = match ports.insert_context(operation_id.clone(), context) {
         Ok(guard) => guard,
@@ -1597,7 +1308,6 @@ async fn run_process_start<P: ProcessStartPorts>(
     Ok(receipt)
 }
 
-#[cfg(windows)]
 impl ProcessStartPorts for ProcessExecutionGateway {
     type PathProof = ProcessPathProof;
     type Request = ProcessRequest;
@@ -1667,7 +1377,34 @@ impl ProcessStartPorts for ProcessExecutionGateway {
     }
 
     async fn snapshot(&self) -> Result<CanonicalValidationSnapshot, ProcessExecutionError> {
-        self.canonical_validation_snapshot().await
+        #[cfg(windows)]
+        {
+            self.canonical_validation_snapshot().await
+        }
+        #[cfg(not(windows))]
+        {
+            Err(ProcessExecutionError::Unavailable(
+                "canonical store validation is unavailable on this platform".to_owned(),
+            ))
+        }
+    }
+
+    fn build_context(
+        &self,
+        clock: ClockObservation,
+        store_fence: FencingToken,
+        authority_epoch: u64,
+        revision_heads: BTreeMap<String, String>,
+        validation_revision: u64,
+    ) -> Result<DispatchValidationContext, ProcessExecutionError> {
+        DispatchValidationContext::new(
+            clock,
+            store_fence,
+            authority_epoch,
+            revision_heads,
+            validation_revision,
+        )
+        .map_err(|error| ProcessExecutionError::Unavailable(error.to_string()))
     }
 
     fn insert_context(
@@ -3164,13 +2901,11 @@ mod tests {
         .expect("context")
     }
 
-    #[cfg(windows)]
     #[derive(Clone)]
     struct GatewayTestPorts {
         state: Arc<Mutex<GatewayTestState>>,
     }
 
-    #[cfg(windows)]
     struct GatewayTestState {
         snapshot: Result<CanonicalValidationSnapshot, String>,
         snapshot_calls: usize,
@@ -3180,12 +2915,15 @@ mod tests {
         resumes: usize,
         retained_contexts: BTreeMap<OperationId, (FencingToken, BTreeMap<String, String>, u64)>,
         retained_paths: std::collections::BTreeSet<OperationId>,
+        context_count_tx: tokio::sync::watch::Sender<usize>,
         replay: BTreeMap<OperationId, ProcessExecutionReplayRecord>,
         completed_persisted: usize,
+        fail_context: bool,
+        abort_not_released: bool,
+        abort_calls: usize,
         pause_executor: Option<Arc<tokio::sync::Notify>>,
     }
 
-    #[cfg(windows)]
     #[derive(Clone, Debug, Eq, PartialEq)]
     struct GatewayTestRequest {
         operation_id: OperationId,
@@ -3194,20 +2932,17 @@ mod tests {
         validation_revision: u64,
     }
 
-    #[cfg(windows)]
     #[derive(Clone, Debug, Eq, PartialEq)]
     struct GatewayTestReceipt {
         operation_id: OperationId,
     }
 
-    #[cfg(windows)]
     struct GatewayTestGuard {
         state: Arc<Mutex<GatewayTestState>>,
         operation_id: OperationId,
         context: bool,
     }
 
-    #[cfg(windows)]
     impl Drop for GatewayTestGuard {
         fn drop(&mut self) {
             if let Ok(mut state) = self.state.lock() {
@@ -3216,11 +2951,11 @@ mod tests {
                 } else {
                     state.retained_paths.remove(&self.operation_id);
                 }
+                let _ = state.context_count_tx.send(state.retained_contexts.len());
             }
         }
     }
 
-    #[cfg(windows)]
     fn gateway_test_snapshot() -> CanonicalValidationSnapshot {
         let fence = StoreStateFence::new(
             eliot_contracts::AuthorityEpoch::new(1).expect("epoch"),
@@ -3238,7 +2973,6 @@ mod tests {
         }
     }
 
-    #[cfg(windows)]
     fn gateway_test_owner() -> ProcessOwnerBinding {
         ProcessOwnerBinding::new(
             "eliotd",
@@ -3249,7 +2983,6 @@ mod tests {
         .expect("owner")
     }
 
-    #[cfg(windows)]
     fn gateway_test_admission(operation: &str) -> ProcessExecutionAdmissionRequest {
         let mut intent = seed_intent();
         intent = ProcessIntent::new(
@@ -3282,9 +3015,9 @@ mod tests {
         .expect("admission")
     }
 
-    #[cfg(windows)]
     impl GatewayTestPorts {
         fn new(snapshot: Result<CanonicalValidationSnapshot, String>) -> Self {
+            let (context_count_tx, _context_count_rx) = tokio::sync::watch::channel(0_usize);
             Self {
                 state: Arc::new(Mutex::new(GatewayTestState {
                     snapshot,
@@ -3295,15 +3028,47 @@ mod tests {
                     resumes: 0,
                     retained_contexts: BTreeMap::new(),
                     retained_paths: std::collections::BTreeSet::new(),
+                    context_count_tx,
                     replay: BTreeMap::new(),
                     completed_persisted: 0,
+                    fail_context: false,
+                    abort_not_released: false,
+                    abort_calls: 0,
                     pause_executor: None,
                 })),
             }
         }
 
+        async fn wait_contexts(&self, target: usize) {
+            let mut receiver = self
+                .state
+                .lock()
+                .expect("test state")
+                .context_count_tx
+                .subscribe();
+            while *receiver.borrow() < target {
+                receiver.changed().await.expect("context count channel");
+            }
+        }
+
         fn pause_executor(&self, pause: Arc<tokio::sync::Notify>) {
             self.state.lock().expect("test state").pause_executor = Some(pause);
+        }
+
+        fn fail_context(&self) {
+            self.state.lock().expect("test state").fail_context = true;
+        }
+
+        fn allow_context(&self) {
+            self.state.lock().expect("test state").fail_context = false;
+        }
+
+        fn fail_abort(&self) {
+            self.state.lock().expect("test state").abort_not_released = true;
+        }
+
+        fn allow_abort(&self) {
+            self.state.lock().expect("test state").abort_not_released = false;
         }
 
         fn counts(&self) -> (usize, usize, usize, usize, usize) {
@@ -3321,9 +3086,12 @@ mod tests {
             let state = self.state.lock().expect("test state");
             (state.retained_contexts.len(), state.retained_paths.len())
         }
+
+        fn abort_calls(&self) -> usize {
+            self.state.lock().expect("test state").abort_calls
+        }
     }
 
-    #[cfg(windows)]
     impl ProcessStartPorts for GatewayTestPorts {
         type PathProof = ();
         type Request = GatewayTestRequest;
@@ -3393,6 +3161,29 @@ mod tests {
             snapshot.map_err(ProcessExecutionError::Unavailable)
         }
 
+        fn build_context(
+            &self,
+            clock: ClockObservation,
+            store_fence: FencingToken,
+            authority_epoch: u64,
+            revision_heads: BTreeMap<String, String>,
+            validation_revision: u64,
+        ) -> Result<DispatchValidationContext, ProcessExecutionError> {
+            if self.state.lock().expect("test state").fail_context {
+                return Err(ProcessExecutionError::Unavailable(
+                    "injected validation context failure".to_owned(),
+                ));
+            }
+            DispatchValidationContext::new(
+                clock,
+                store_fence,
+                authority_epoch,
+                revision_heads,
+                validation_revision,
+            )
+            .map_err(|error| ProcessExecutionError::Unavailable(error.to_string()))
+        }
+
         fn insert_context(
             &self,
             operation_id: OperationId,
@@ -3415,6 +3206,7 @@ mod tests {
                         0,
                     ),
                 );
+                let _ = state.context_count_tx.send(state.retained_contexts.len());
             }
             Ok(Box::new(GatewayTestGuard {
                 state: Arc::clone(&self.state),
@@ -3550,6 +3342,10 @@ mod tests {
             owner: &ProcessOwnerBinding,
         ) -> Result<ProcessExecutionReplayAbort, ProcessExecutionError> {
             let mut state = self.state.lock().expect("test state");
+            state.abort_calls += 1;
+            if state.abort_not_released {
+                return Ok(ProcessExecutionReplayAbort::NotReleased);
+            }
             let Some(record) = state.replay.get(operation_id) else {
                 return Err(ProcessExecutionError::Unavailable(
                     "missing replay".to_owned(),
@@ -3918,7 +3714,6 @@ mod tests {
         assert!(slot.take(&second_id).is_err());
     }
 
-    #[cfg(windows)]
     #[tokio::test]
     async fn actual_process_start_orchestration_proves_canonical_ordering() {
         let ports = GatewayTestPorts::new(Ok(gateway_test_snapshot()));
@@ -3942,7 +3737,6 @@ mod tests {
         );
     }
 
-    #[cfg(windows)]
     #[tokio::test]
     async fn actual_process_start_orchestration_fails_closed_and_releases_reserved() {
         let mut malformed = gateway_test_snapshot();
@@ -3989,7 +3783,49 @@ mod tests {
         }
     }
 
-    #[cfg(windows)]
+    #[tokio::test]
+    async fn actual_process_start_context_failure_explicitly_aborts_and_maps_abort_failure() {
+        let ports = GatewayTestPorts::new(Ok(gateway_test_snapshot()));
+        ports.fail_context();
+        ports.fail_abort();
+        let owner = gateway_test_owner();
+        let admission = gateway_test_admission("gateway-context-failure");
+        assert!(matches!(
+            run_process_start(&ports, &owner, admission.clone(), ()).await,
+            Err(ProcessExecutionError::UnknownOutcome)
+        ));
+        assert_eq!(ports.counts(), (1, 0, 0, 0, 0));
+        assert_eq!(ports.abort_calls(), 1);
+        assert_eq!(ports.retained(), (0, 0));
+        assert_eq!(
+            ports
+                .state
+                .lock()
+                .expect("test state")
+                .replay
+                .get(admission.intent().operation_id())
+                .expect("reserved replay")
+                .state,
+            ProcessExecutionReplayState::Reserved
+        );
+
+        ports.allow_abort();
+        let digest = process_admission_digest(&admission).expect("digest");
+        assert!(matches!(
+            ports.abort(admission.intent().operation_id(), &digest, &owner),
+            Ok(ProcessExecutionReplayAbort::Released)
+        ));
+        ports.allow_context();
+        assert!(
+            run_process_start(&ports, &owner, admission, ())
+                .await
+                .is_ok(),
+            "exact retry after explicit release"
+        );
+        assert_eq!(ports.abort_calls(), 2);
+        assert_eq!(ports.retained(), (0, 0));
+    }
+
     #[tokio::test]
     async fn actual_process_start_orchestration_isolated_for_concurrent_and_duplicate_ops() {
         let ports = GatewayTestPorts::new(Ok(gateway_test_snapshot()));
@@ -4024,30 +3860,15 @@ mod tests {
         let paused = GatewayTestPorts::new(Ok(gateway_test_snapshot()));
         let pause = Arc::new(tokio::sync::Notify::new());
         paused.pause_executor(Arc::clone(&pause));
+        let duplicate_admission = gateway_test_admission("gateway-duplicate");
+        let first_admission = duplicate_admission.clone();
         let duplicate_ports = paused.clone();
         let duplicate_owner = owner.clone();
         let first = tokio::spawn(async move {
-            run_process_start(
-                &duplicate_ports,
-                &duplicate_owner,
-                gateway_test_admission("gateway-duplicate"),
-                (),
-            )
-            .await
+            run_process_start(&duplicate_ports, &duplicate_owner, first_admission, ()).await
         });
-        for _ in 0..100 {
-            if paused.retained().0 == 1 {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
-        let duplicate = run_process_start(
-            &paused,
-            &owner,
-            gateway_test_admission("gateway-duplicate"),
-            (),
-        )
-        .await;
+        paused.wait_contexts(1).await;
+        let duplicate = run_process_start(&paused, &owner, duplicate_admission, ()).await;
         assert!(matches!(
             duplicate,
             Err(ProcessExecutionError::UnknownOutcome)
@@ -4058,7 +3879,6 @@ mod tests {
         assert_eq!(paused.retained(), (0, 0));
     }
 
-    #[cfg(windows)]
     #[tokio::test]
     async fn actual_process_start_orchestration_abort_cleans_exact_context_path_and_replay() {
         let ports = GatewayTestPorts::new(Ok(gateway_test_snapshot()));
@@ -4076,12 +3896,7 @@ mod tests {
             )
             .await
         });
-        for _ in 0..100 {
-            if ports.retained() == (1, 1) {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
+        ports.wait_contexts(1).await;
         assert_eq!(ports.retained(), (1, 1));
         task.abort();
         assert!(task.await.expect_err("cancelled task").is_cancelled());
