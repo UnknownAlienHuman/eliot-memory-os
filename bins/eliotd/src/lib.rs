@@ -49,9 +49,9 @@ use eliot_ipc::{DeliveryOutcome, NamedPipeTransport, TransportLimits};
 pub const SERVICE_NAME: &str = "eliotd";
 /// Stable daemon protocol revision.
 pub const PROTOCOL_VERSION: &str = "eliot.daemon.v1";
-/// Protected Host-approved launch configuration relative to ProgramData.
+/// Protected Host-approved launch configuration relative to `ProgramData`.
 pub const PROTECTED_CONFIG_RELATIVE: &str = r"Eliot\governor\eliotd.json";
-/// Protected daemon state directory relative to ProgramData.
+/// Protected daemon state directory relative to `ProgramData`.
 pub const PROTECTED_STATE_RELATIVE: &str = r"Eliot\governor\state";
 /// Maximum accepted launch-config bytes.
 pub const MAX_CONFIG_BYTES: u64 = 128 * 1024;
@@ -78,7 +78,7 @@ struct KernelLaunchBinding {
 /// Errors raised while loading or composing the daemon.
 #[derive(Debug, Error)]
 pub enum DaemonError {
-    /// Protected ProgramData path policy rejected the requested object.
+    /// Protected `ProgramData` path policy rejected the requested object.
     #[error("protected daemon path: {0}")]
     Protected(#[from] ProtectedPathError),
     /// The protected launch file was not a valid typed config.
@@ -96,7 +96,7 @@ pub enum DaemonError {
 }
 
 /// Typed protected launch inputs. The values are read from the fixed
-/// ProgramData path; environment variables, current directory and arbitrary
+/// `ProgramData` path; environment variables, current directory and arbitrary
 /// caller paths are not authority sources.
 #[derive(Debug)]
 pub struct DaemonConfig {
@@ -254,7 +254,7 @@ impl DaemonKernelClient {
                 .map_err(|error| DaemonError::Kernel(error.to_string()))?;
             let mut client = client;
             client.snapshot = snapshot;
-            return Ok(Arc::new(client));
+            Ok(Arc::new(client))
         }
         #[cfg(not(windows))]
         {
@@ -544,8 +544,8 @@ impl DaemonKernelClient {
                 .map_err(|error| KernelClientError::Contract(error.to_string()))?,
             state_fence: fence.clone(),
             clock: ClockReading {
-                valid_time_ms: Some(unix_ms() as i64),
-                known_time_ms: Some(unix_ms() as i64),
+                valid_time_ms: Some(unix_ms_i64()),
+                known_time_ms: Some(unix_ms_i64()),
                 transaction_sequence: None,
                 monotonic_ns: None,
             },
@@ -555,13 +555,13 @@ impl DaemonKernelClient {
                 metadata,
                 state_fence: fence,
             },
-            idempotency_key: format!("{}:{}:{}", SERVICE_NAME, operation, sequence),
+            idempotency_key: format!("{SERVICE_NAME}:{operation}:{sequence}"),
             deadline_unix_ms: unix_ms().saturating_add(30_000),
-            cancellation_id: format!("{}:{}:{}:cancel", SERVICE_NAME, operation, sequence),
+            cancellation_id: format!("{SERVICE_NAME}:{operation}:{sequence}:cancel"),
         })
     }
 
-    fn blocking<T, F>(&self, future: F) -> Result<T, KernelPortError>
+    fn blocking<T, F>(future: F) -> Result<T, KernelPortError>
     where
         T: Send + 'static,
         F: std::future::Future<Output = Result<T, KernelClientError>> + Send + 'static,
@@ -572,7 +572,7 @@ impl DaemonKernelClient {
                 .enable_all()
                 .build()
                 .map_err(|error| KernelPortError::NotAdmitted(error.to_string()))?;
-            return runtime.block_on(future).map_err(kernel_port_error);
+            runtime.block_on(future).map_err(kernel_port_error)
         }
         #[cfg(not(windows))]
         {
@@ -589,7 +589,7 @@ impl DaemonKernelClient {
         payload: serde_json::Value,
     ) -> Result<serde_json::Value, KernelPortError> {
         let client = self.clone_for_future();
-        self.blocking(async move { client.transact_async(operation, payload).await })
+        Self::blocking(async move { client.transact_async(operation, payload).await })
     }
 
     fn clone_for_future(&self) -> Arc<Self> {
@@ -604,7 +604,7 @@ impl DaemonKernelClient {
 }
 
 fn kind_value(
-    value: serde_json::Value,
+    value: &serde_json::Value,
     expected_kind: &str,
 ) -> Result<serde_json::Value, KernelPortError> {
     let object = value.as_object().ok_or_else(|| {
@@ -652,16 +652,13 @@ impl KernelTransitionPort for DaemonKernelClient {
                 )
                 .await
                 .map_err(kernel_port_error)?;
-            let value = kind_value(value, "write_receipt")?;
+            let value = kind_value(&value, "write_receipt")?;
             serde_json::from_value(value)
                 .map_err(|error| KernelPortError::Contract(error.to_string()))
         })
     }
 
-    fn receipt<'a>(
-        &'a self,
-        operation_id: OperationId,
-    ) -> KernelPortFuture<'a, Option<WriteReceipt>> {
+    fn receipt(&self, operation_id: OperationId) -> KernelPortFuture<'_, Option<WriteReceipt>> {
         Box::pin(async move {
             let value = self
                 .transact_async(
@@ -670,19 +667,19 @@ impl KernelTransitionPort for DaemonKernelClient {
                 )
                 .await
                 .map_err(kernel_port_error)?;
-            let value = kind_value(value, "receipt")?;
+            let value = kind_value(&value, "receipt")?;
             serde_json::from_value(value)
                 .map_err(|error| KernelPortError::Contract(error.to_string()))
         })
     }
 
-    fn health<'a>(&'a self) -> KernelPortFuture<'a, StoreHealth> {
+    fn health(&self) -> KernelPortFuture<'_, StoreHealth> {
         Box::pin(async move {
             let value = self
                 .transact_async("health", serde_json::json!({}))
                 .await
                 .map_err(kernel_port_error)?;
-            let value = kind_value(value, "health")?;
+            let value = kind_value(&value, "health")?;
             serde_json::from_value(value)
                 .map_err(|error| KernelPortError::Contract(error.to_string()))
         })
@@ -696,7 +693,7 @@ impl KernelRecoveryPort for DaemonKernelClient {
     ) -> Result<Option<KernelNamedReadReply>, KernelPortError> {
         let value =
             self.request_blocking("named_read", serde_json::json!({ "request": request }))?;
-        let value = kind_value(value, "named_read")?;
+        let value = kind_value(&value, "named_read")?;
         serde_json::from_value(value).map_err(|error| KernelPortError::Contract(error.to_string()))
     }
 
@@ -723,7 +720,7 @@ impl KernelRecoveryPort for DaemonKernelClient {
                 "protected_snapshot_digest": protected_snapshot_digest,
             }),
         )?;
-        let value = kind_value(value, "canonical_scope")?;
+        let value = kind_value(&value, "canonical_scope")?;
         serde_json::from_value(value).map_err(|error| KernelPortError::Contract(error.to_string()))
     }
 
@@ -739,7 +736,7 @@ impl KernelRecoveryPort for DaemonKernelClient {
                 "protected_snapshot_digest": protected_snapshot_digest,
             }),
         )?;
-        let value = kind_value(value, "receipts")?;
+        let value = kind_value(&value, "receipts")?;
         serde_json::from_value(value).map_err(|error| KernelPortError::Contract(error.to_string()))
     }
 
@@ -755,7 +752,7 @@ impl KernelRecoveryPort for DaemonKernelClient {
                 "protected_snapshot_digest": protected_snapshot_digest,
             }),
         )?;
-        let value = kind_value(value, "durable_jobs")?;
+        let value = kind_value(&value, "durable_jobs")?;
         serde_json::from_value(value).map_err(|error| KernelPortError::Contract(error.to_string()))
     }
 
@@ -771,7 +768,7 @@ impl KernelRecoveryPort for DaemonKernelClient {
                 "protected_snapshot_digest": protected_snapshot_digest,
             }),
         )?;
-        let value = kind_value(value, "services")?;
+        let value = kind_value(&value, "services")?;
         serde_json::from_value(value).map_err(|error| KernelPortError::Contract(error.to_string()))
     }
 }
@@ -786,7 +783,7 @@ impl KernelDurableJobPort for DaemonKernelClient {
             "load_durable_job",
             serde_json::json!({ "job_id": job_id, "state_fence": state_fence }),
         )?;
-        let value = kind_value(value, "durable_job")?;
+        let value = kind_value(&value, "durable_job")?;
         serde_json::from_value(value).map_err(|error| KernelPortError::Contract(error.to_string()))
     }
 
@@ -833,7 +830,7 @@ fn client_hello(binding: &KernelLaunchBinding) -> Result<ClientHello, KernelClie
         hot_replace: true,
     };
     let generation = ModuleGeneration {
-        module_id: module_id,
+        module_id,
         generation: binding.module_generation,
         artifact_id,
         state: ModuleGenerationState::Starting,
@@ -852,7 +849,8 @@ fn client_hello(binding: &KernelLaunchBinding) -> Result<ClientHello, KernelClie
         launch_nonce: binding.launch_nonce.clone(),
         capabilities: vec!["daemon".to_owned()],
         privacy_classes: vec!["PUBLIC".to_owned()],
-        max_frame: eliot_protocol::MAX_FRAME_BYTES as u32,
+        max_frame: u32::try_from(eliot_protocol::MAX_FRAME_BYTES)
+            .map_err(|_| KernelClientError::Contract("maximum frame exceeds u32".to_owned()))?,
         authority_epoch: binding.authority_epoch,
     })
 }
@@ -897,13 +895,10 @@ fn operation_payload(
     operation: &str,
     payload: serde_json::Value,
 ) -> Result<serde_json::Value, KernelClientError> {
-    let mut object = match payload {
-        serde_json::Value::Object(object) => object,
-        _ => {
-            return Err(KernelClientError::Contract(
-                "Kernel application payload must be an object".to_owned(),
-            ));
-        }
+    let serde_json::Value::Object(mut object) = payload else {
+        return Err(KernelClientError::Contract(
+            "Kernel application payload must be an object".to_owned(),
+        ));
     };
     object.insert(
         "operation".to_owned(),
@@ -928,8 +923,12 @@ fn unix_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(1, |duration| {
-            duration.as_millis().min(u128::from(u64::MAX)) as u64
+            u64::try_from(duration.as_millis().min(u128::from(u64::MAX))).unwrap_or(u64::MAX)
         })
+}
+
+fn unix_ms_i64() -> i64 {
+    i64::try_from(unix_ms()).unwrap_or(i64::MAX)
 }
 
 /// Readiness/status projection emitted by the daemon. It is derived only
@@ -1083,30 +1082,33 @@ mod tests {
 
     #[test]
     fn production_config_has_no_root_or_environment_override() {
-        assert!(PROTECTED_CONFIG_RELATIVE.contains("ProgramData") == false);
+        assert!(!PROTECTED_CONFIG_RELATIVE.contains("ProgramData"));
         assert!(!PROTECTED_CONFIG_RELATIVE.contains(".."));
         assert!(!PROTECTED_STATE_RELATIVE.contains(".."));
     }
 
     #[test]
-    fn application_payload_always_carries_a_closed_operation_identity() {
-        let payload = operation_payload("health", serde_json::json!({})).expect("object");
+    fn application_payload_always_carries_a_closed_operation_identity()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let payload = operation_payload("health", serde_json::json!({}))?;
         assert_eq!(payload["operation"], "health");
         assert!(operation_payload("health", serde_json::json!([])).is_err());
+        Ok(())
     }
 
     #[test]
-    fn unknown_kernel_outcome_is_not_treated_as_success() {
+    fn unknown_kernel_outcome_is_not_treated_as_success() -> Result<(), Box<dyn std::error::Error>>
+    {
         let outcome: WireOutcome = serde_json::from_value(serde_json::json!({
             "status": "unknown",
             "reason": "delivery outcome was not proven"
-        }))
-        .expect("typed unknown outcome");
+        }))?;
         assert!(matches!(outcome, WireOutcome::Unknown { .. }));
+        Ok(())
     }
 
     #[test]
-    fn snapshot_expectation_rejects_unbound_digest() {
+    fn snapshot_expectation_rejects_unbound_digest() -> Result<(), Box<dyn std::error::Error>> {
         let launch = GovernorLaunchConfig {
             instance_id: "test-instance".to_owned(),
             kernel: eliot_governor::KernelGenerationExpectation {
@@ -1115,11 +1117,12 @@ mod tests {
                 artifact_digest: "a".repeat(64),
                 protected_snapshot_digest: "b".repeat(64),
                 principal: "local-user".to_owned(),
-                generation: ResourceGeneration::new(1).expect("generation"),
-                authority_epoch: AuthorityEpoch::new(1).expect("epoch"),
+                generation: ResourceGeneration::new(1)?,
+                authority_epoch: AuthorityEpoch::new(1)?,
             },
             protected_snapshot_digest: "c".repeat(64),
         };
         assert!(launch.validate().is_err());
+        Ok(())
     }
 }

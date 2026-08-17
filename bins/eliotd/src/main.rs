@@ -2,7 +2,7 @@
 //!
 //! Host/N1 owns the authenticated Kernel-generation transport. This binary
 //! composes Governor only from that transport and never creates a local Store,
-//! ProcessExecutor, or authority source.
+//! `ProcessExecutor`, or authority source.
 
 use std::io::{self, Write};
 use std::sync::Arc;
@@ -119,7 +119,7 @@ async fn run_loop(kernel: Arc<DaemonKernelClient>) -> Result<(), String> {
                 signal.map_err(|error| format!("daemon shutdown signal: {error}"))?;
                 return Ok(());
             }
-            _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {
+            () = tokio::time::sleep(std::time::Duration::from_secs(5)) => {
                 KernelTransitionPort::health(&*kernel)
                     .await
                     .map_err(|error| format!("Kernel health heartbeat: {error}"))?;
