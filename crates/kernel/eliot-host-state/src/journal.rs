@@ -684,6 +684,16 @@ impl<B: JournalBackend> HostStateJournal<B> {
             .map_err(|_| JournalError::Synchronization)
     }
 
+    /// Returns durable prepared transaction descriptors without attempting to
+    /// replay, retry, or otherwise deliver any transaction.
+    pub fn pending_transactions(&self) -> Result<Vec<PreparedAppend>, JournalError> {
+        self.backend
+            .lock()
+            .map_err(|_| JournalError::Synchronization)?
+            .prepared_appends()
+            .map_err(map_backend_error)
+    }
+
     #[allow(clippy::needless_pass_by_value)]
     pub fn append(&self, record: HostStateRecord) -> Result<AppendReceipt, JournalError> {
         record.validate()?;

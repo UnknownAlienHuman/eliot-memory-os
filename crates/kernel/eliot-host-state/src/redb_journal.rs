@@ -479,6 +479,15 @@ impl JournalBackend for RedbJournalBackend {
         })
     }
 
+    fn prepared_appends(&mut self) -> Result<Vec<PreparedAppend>, BackendError> {
+        Ok(self
+            .snapshot()?
+            .prepared
+            .into_iter()
+            .map(|(_, prepared)| prepared.descriptor)
+            .collect())
+    }
+
     fn prepare(&mut self, append: &PreparedAppend) -> Result<(), BackendError> {
         validate_descriptor(append)?;
         let snapshot = self.snapshot()?;
@@ -1071,6 +1080,7 @@ mod tests {
         drop(backend);
         let mut reopened = RedbJournalBackend::open_unprotected_for_test(root.join("journal.redb"))
             .unwrap_or_else(|_| unreachable!());
+        assert_eq!(reopened.prepared_appends(), Ok(vec![descriptor.clone()]));
         assert_eq!(
             reopened.reconcile(&descriptor.transaction_id),
             Ok(BackendReconcileState::Prepared)

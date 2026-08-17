@@ -28,9 +28,10 @@ pub use model::{
     EliotActivationRecord, EpochEvidence, EpochIdentity, EpochRetirementRecord, EpochTransition,
     FailureRecoveryDirective, HostInstallationEpoch, HostKernelStoreLineage, HostObservationRecord,
     HostState, HostStateRecord, IdempotencyIdentity, ImmutableProcessManifest, JournalManifest,
-    KernelRecord, LifecycleTimestamps, NonceState, OneTimeNonceState, ReadinessEvidence,
-    RecordFence, RecoveryLineageEvidence, RecoveryLineageReason, ServiceSafetyClass,
-    WakeDisposition, WakeRecord,
+    KernelJobBinding, KernelRecord, LifecycleTimestamps, NonceState, OneTimeNonceState,
+    PriorKernelDisposition, PriorKernelSource, ReadinessEvidence, RecordFence,
+    RecoveryLineageEvidence, RecoveryLineageReason, ServiceSafetyClass, WakeDisposition,
+    WakeRecord,
 };
 pub use redb_journal::RedbJournalBackend;
 pub use redb_store::{

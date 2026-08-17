@@ -1,7 +1,9 @@
 use std::sync::Arc;
 
 use eliot_platform::{PlatformHandle, PortOutcome, UnknownReason};
-use eliot_runtime_contracts::{KernelActivationState, ServiceProcessRecord, WakeIntent};
+use eliot_runtime_contracts::{
+    HealthDimension, KernelActivationState, ServiceProcessRecord, WakeIntent,
+};
 use serde_json::json;
 
 use crate::*;
@@ -108,6 +110,30 @@ fn ready_kernel_process() -> ServiceProcessRecord {
     .unwrap_or_else(|_| unreachable!())
 }
 
+fn stopped_kernel_process() -> ServiceProcessRecord {
+    let mut process = ready_kernel_process();
+    process.state = eliot_runtime_contracts::ServiceProcessState::Stopped;
+    process.health.liveness = HealthDimension::Unknown;
+    process
+}
+
+fn terminated_prior(
+    history_complete: bool,
+    members: Vec<PlatformHandle>,
+) -> PriorKernelDisposition {
+    PriorKernelDisposition::Terminated(PriorKernelSource {
+        generation: step("prior-kernel-lineage", 1),
+        job: KernelJobBinding {
+            job_identity: h("prior-kernel-job"),
+            root_process_identity: h("prior-kernel-root"),
+            member_processes: members,
+            root_reaped: true,
+        },
+        process: stopped_kernel_process(),
+        history_complete,
+    })
+}
+
 fn kernel_record(
     host: &HostInstallationEpoch,
     generation: &EpochTransition,
@@ -122,6 +148,12 @@ fn kernel_record(
             | KernelActivationState::NonceIssued
             | KernelActivationState::Activating
     );
+    let live_job = KernelJobBinding {
+        job_identity: h("kernel-job"),
+        root_process_identity: h("kernel-root"),
+        member_processes: vec![h("kernel-root")],
+        root_reaped: false,
+    };
     KernelRecord {
         fence: fence(host, generation),
         operation: operation(op),
@@ -129,9 +161,23 @@ fn kernel_record(
         approved_artifact_hash: h("sha256-kernel-artifact"),
         active_pipe_identity: h("kernel-stable-pipe"),
         candidate_pipe_identity: handoff.then(|| h("kernel-candidate-pipe")),
+        candidate_job_binding: matches!(
+            state,
+            KernelActivationState::Activating | KernelActivationState::Active
+        )
+        .then_some(live_job),
+        prior_kernel_disposition: PriorKernelDisposition::NoPriorKernel,
         kernel_generation: step("kernel-lineage", 1),
         one_time_nonce: OneTimeNonceState {
-            nonce_ref: h("kernel-nonce"),
+            nonce_ref: matches!(
+                state,
+                KernelActivationState::NonceIssued
+                    | KernelActivationState::Activating
+                    | KernelActivationState::Active
+                    | KernelActivationState::Failed
+                    | KernelActivationState::ManualRecovery
+            )
+            .then(|| h("kernel-nonce")),
             state: match state {
                 KernelActivationState::NonceIssued | KernelActivationState::Activating => {
                     NonceState::Issued
@@ -648,6 +694,46 @@ fn unknown_prepare_is_exposed_with_stable_transaction_identity() {
         .unwrap_err();
     assert!(matches!(error, JournalError::OutcomeUnknown { .. }));
     assert_eq!(journal.snapshot().unwrap().sequence, 0);
+}
+
+#[test]
+fn prepared_transaction_enumerates_and_survives_reopen_without_retry() {
+    let host = host(1);
+    let generation = step("activation-lineage", 1);
+    let journal = HostStateJournal::open(
+        MemoryBackend::with_fault(FaultPoint::AppendFailed),
+        host.clone(),
+    )
+    .unwrap_or_else(|_| unreachable!());
+    let result = journal.append(activation(
+        &host,
+        &generation,
+        "prepared-enumeration",
+        ActivationState::Starting,
+    ));
+    assert!(matches!(
+        result,
+        Err(JournalError::Backend(BackendError::Failed(_)))
+    ));
+    let pending = journal
+        .pending_transactions()
+        .unwrap_or_else(|_| unreachable!());
+    assert_eq!(pending.len(), 1);
+    let transaction_id = pending[0].transaction_id.clone();
+    let backend = journal.into_backend().unwrap_or_else(|_| unreachable!());
+    let reopened = HostStateJournal::open(backend, host).unwrap_or_else(|_| unreachable!());
+    assert_eq!(
+        reopened
+            .pending_transactions()
+            .unwrap_or_else(|_| unreachable!()),
+        pending
+    );
+    assert_eq!(
+        reopened
+            .reconcile(&transaction_id)
+            .unwrap_or_else(|_| unreachable!()),
+        ReconcileOutcome::StillUnknown
+    );
 }
 
 #[test]
@@ -1190,7 +1276,12 @@ fn kernel_record_requires_approved_artifact_explicit_pipes_and_active_evidence()
         KernelActivationState::Idle,
     ));
     let encoded = serde_json::to_value(idle).unwrap();
-    for missing in ["approved_artifact_hash", "active_pipe_identity"] {
+    for missing in [
+        "approved_artifact_hash",
+        "active_pipe_identity",
+        "candidate_job_binding",
+        "prior_kernel_disposition",
+    ] {
         let mut value = encoded.clone();
         value["kernel"]
             .as_object_mut()
@@ -1237,6 +1328,138 @@ fn kernel_record_requires_approved_artifact_explicit_pipes_and_active_evidence()
 }
 
 #[test]
+fn kernel_old_terminated_rejects_opaque_or_incomplete_disposition() {
+    let (journal, host, generation) = active_journal();
+    let mut cases = vec![
+        PriorKernelDisposition::Running(PriorKernelSource {
+            generation: step("prior-kernel-lineage", 1),
+            job: KernelJobBinding {
+                job_identity: h("prior-kernel-job"),
+                root_process_identity: h("prior-kernel-root"),
+                member_processes: vec![h("prior-kernel-root")],
+                root_reaped: false,
+            },
+            process: ready_kernel_process(),
+            history_complete: true,
+        }),
+        PriorKernelDisposition::Unknown(PriorKernelSource {
+            generation: step("prior-kernel-lineage", 1),
+            job: KernelJobBinding {
+                job_identity: h("prior-kernel-job"),
+                root_process_identity: h("prior-kernel-root"),
+                member_processes: vec![],
+                root_reaped: true,
+            },
+            process: stopped_kernel_process(),
+            history_complete: false,
+        }),
+        terminated_prior(false, vec![]),
+        terminated_prior(true, vec![h("prior-kernel-root")]),
+    ];
+    for (index, disposition) in cases.drain(..).enumerate() {
+        let mut record = kernel_record(
+            &host,
+            &generation,
+            &format!("kernel-invalid-disposition-{index}"),
+            KernelActivationState::OldTerminated,
+        );
+        record.prior_kernel_disposition = disposition;
+        assert!(matches!(
+            journal.append(HostStateRecord::Kernel(record)),
+            Err(JournalError::Invalid(_))
+        ));
+    }
+
+    let mut opaque_only = kernel_record(
+        &host,
+        &generation,
+        "kernel-opaque-only",
+        KernelActivationState::OldTerminated,
+    );
+    opaque_only.prior_kernel_disposition = PriorKernelDisposition::Unknown(PriorKernelSource {
+        generation: step("prior-kernel-lineage", 1),
+        job: KernelJobBinding {
+            job_identity: h("prior-kernel-job"),
+            root_process_identity: h("prior-kernel-root"),
+            member_processes: vec![],
+            root_reaped: true,
+        },
+        process: stopped_kernel_process(),
+        history_complete: true,
+    });
+    opaque_only.disposition_evidence = vec![h("looks-like-proof")];
+    assert!(
+        journal
+            .append(HostStateRecord::Kernel(opaque_only))
+            .is_err()
+    );
+}
+
+#[test]
+fn kernel_nonce_is_absent_until_old_terminated_and_retained_through_active() {
+    let (journal, host, generation) = active_journal();
+    for (state, op) in [
+        (KernelActivationState::Idle, "nonce-idle"),
+        (KernelActivationState::ShadowNoAuthority, "nonce-shadow"),
+        (KernelActivationState::HandoffPrepared, "nonce-prepared"),
+        (KernelActivationState::OldTerminated, "nonce-terminated"),
+    ] {
+        journal
+            .append(HostStateRecord::Kernel(kernel_record(
+                &host,
+                &generation,
+                op,
+                state,
+            )))
+            .unwrap_or_else(|error| panic!("kernel transition failed: {error}"));
+    }
+    let nonce_issued = kernel_record(
+        &host,
+        &generation,
+        "nonce-issued",
+        KernelActivationState::NonceIssued,
+    );
+    let nonce = nonce_issued
+        .one_time_nonce
+        .nonce_ref
+        .clone()
+        .unwrap_or_else(|| unreachable!());
+    journal
+        .append(HostStateRecord::Kernel(nonce_issued))
+        .unwrap_or_else(|error| panic!("nonce issuance failed: {error}"));
+    let activating = kernel_record(
+        &host,
+        &generation,
+        "nonce-activating",
+        KernelActivationState::Activating,
+    );
+    assert_eq!(activating.one_time_nonce.nonce_ref, Some(nonce.clone()));
+    journal
+        .append(HostStateRecord::Kernel(activating))
+        .unwrap_or_else(|error| panic!("activation failed: {error}"));
+    let active = kernel_record(
+        &host,
+        &generation,
+        "nonce-active",
+        KernelActivationState::Active,
+    );
+    assert_eq!(active.one_time_nonce.nonce_ref, Some(nonce));
+    journal
+        .append(HostStateRecord::Kernel(active))
+        .unwrap_or_else(|error| panic!("active transition failed: {error}"));
+    assert_eq!(
+        journal
+            .snapshot()
+            .unwrap()
+            .kernel
+            .unwrap()
+            .one_time_nonce
+            .state,
+        NonceState::Consumed
+    );
+}
+
+#[test]
 fn kernel_append_must_bind_current_eliot_activation_identity() {
     let (journal, host, generation) = active_journal();
     let mut kernel = kernel_record(
@@ -1263,9 +1486,16 @@ fn kernel_transition_matrix_rejects_activation_without_handoff() {
         approved_artifact_hash: h("sha256-kernel-artifact"),
         active_pipe_identity: h("kernel-stable-pipe"),
         candidate_pipe_identity: Some(h("kernel-candidate-pipe")),
+        candidate_job_binding: Some(KernelJobBinding {
+            job_identity: h("kernel-job"),
+            root_process_identity: h("kernel-root"),
+            member_processes: vec![h("kernel-root")],
+            root_reaped: false,
+        }),
+        prior_kernel_disposition: PriorKernelDisposition::NoPriorKernel,
         kernel_generation: step("kernel-lineage", 1),
         one_time_nonce: OneTimeNonceState {
-            nonce_ref: h("kernel-nonce"),
+            nonce_ref: Some(h("kernel-nonce")),
             state: NonceState::Consumed,
         },
         state: KernelActivationState::Active,

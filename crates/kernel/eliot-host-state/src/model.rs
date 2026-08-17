@@ -377,19 +377,6 @@ impl EliotActivationRecord {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct OneTimeNonceState {
-    pub nonce_ref: PlatformHandle,
-    pub state: NonceState,
-}
-
-impl OneTimeNonceState {
-    fn validate(&self) -> Result<(), JournalError> {
-        handle(&self.nonce_ref, "kernel.nonce_ref")
-    }
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum NonceState {
@@ -397,6 +384,123 @@ pub enum NonceState {
     Issued,
     Consumed,
     Revoked,
+}
+
+/// Exact durable binding needed to reopen the candidate Kernel Job.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct KernelJobBinding {
+    pub job_identity: PlatformHandle,
+    pub root_process_identity: PlatformHandle,
+    pub member_processes: Vec<PlatformHandle>,
+    pub root_reaped: bool,
+}
+
+impl KernelJobBinding {
+    fn validate(&self) -> Result<(), JournalError> {
+        handle(&self.job_identity, "kernel.job_binding.job_identity")?;
+        handle(
+            &self.root_process_identity,
+            "kernel.job_binding.root_process_identity",
+        )?;
+        handles(
+            &self.member_processes,
+            "kernel.job_binding.member_processes",
+            false,
+        )?;
+        if self.root_reaped {
+            if self.member_processes.contains(&self.root_process_identity) {
+                return Err(JournalError::Invalid(
+                    "reaped Kernel root must not remain a Job member".into(),
+                ));
+            }
+        } else if !self.member_processes.contains(&self.root_process_identity) {
+            return Err(JournalError::Invalid(
+                "live Kernel Job binding must contain its root process".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn is_terminal(&self) -> bool {
+        self.root_reaped && self.member_processes.is_empty()
+    }
+}
+
+/// Durable source observation for the previous Kernel generation.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PriorKernelSource {
+    pub generation: EpochTransition,
+    pub job: KernelJobBinding,
+    pub process: ServiceProcessRecord,
+    pub history_complete: bool,
+}
+
+impl PriorKernelSource {
+    fn validate(&self) -> Result<(), JournalError> {
+        self.generation.validate()?;
+        self.job.validate()?;
+        self.process
+            .validate()
+            .map_err(|error| JournalError::Invalid(error.to_string()))
+    }
+
+    fn is_fully_terminated(&self) -> bool {
+        self.history_complete && self.process.state.is_terminal() && self.job.is_terminal()
+    }
+}
+
+/// Non-opaque prior-Kernel disposition. `disposition_evidence` is forensic
+/// context only and cannot substitute for these variants.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE", deny_unknown_fields)]
+pub enum PriorKernelDisposition {
+    NoPriorKernel,
+    Running(PriorKernelSource),
+    Terminated(PriorKernelSource),
+    Unknown(PriorKernelSource),
+}
+
+impl PriorKernelDisposition {
+    fn validate(&self) -> Result<(), JournalError> {
+        match self {
+            Self::NoPriorKernel => Ok(()),
+            Self::Running(source) | Self::Terminated(source) | Self::Unknown(source) => {
+                source.validate()
+            }
+        }
+    }
+
+    fn proves_terminated(&self) -> bool {
+        match self {
+            Self::NoPriorKernel => true,
+            Self::Terminated(source) => source.is_fully_terminated(),
+            Self::Running(_) | Self::Unknown(_) => false,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OneTimeNonceState {
+    /// Absent until the old Kernel disposition is durably proven.
+    pub nonce_ref: Option<PlatformHandle>,
+    pub state: NonceState,
+}
+
+impl OneTimeNonceState {
+    fn validate(&self) -> Result<(), JournalError> {
+        match (&self.nonce_ref, self.state) {
+            (None, NonceState::Unissued) => Ok(()),
+            (Some(nonce), NonceState::Issued | NonceState::Consumed | NonceState::Revoked) => {
+                handle(nonce, "kernel.nonce_ref")
+            }
+            _ => Err(JournalError::Invalid(
+                "one-time nonce must be absent before issuance and present thereafter".into(),
+            )),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -408,6 +512,8 @@ pub struct KernelRecord {
     pub approved_artifact_hash: PlatformHandle,
     pub active_pipe_identity: PlatformHandle,
     pub candidate_pipe_identity: Option<PlatformHandle>,
+    pub candidate_job_binding: Option<KernelJobBinding>,
+    pub prior_kernel_disposition: PriorKernelDisposition,
     pub kernel_generation: EpochTransition,
     pub one_time_nonce: OneTimeNonceState,
     pub state: KernelActivationState,
@@ -417,6 +523,7 @@ pub struct KernelRecord {
 }
 
 impl KernelRecord {
+    #[allow(clippy::too_many_lines)]
     fn validate(&self) -> Result<(), JournalError> {
         self.fence.validate()?;
         self.operation.validate()?;
@@ -439,6 +546,10 @@ impl KernelRecord {
         }
         self.kernel_generation.validate()?;
         self.one_time_nonce.validate()?;
+        self.prior_kernel_disposition.validate()?;
+        if let Some(binding) = &self.candidate_job_binding {
+            binding.validate()?;
+        }
         if let Some(process) = &self.process {
             process
                 .validate()
@@ -487,6 +598,33 @@ impl KernelRecord {
             return Err(JournalError::Invalid(
                 "candidate Kernel pipe identity is required during handoff".into(),
             ));
+        }
+        if matches!(
+            self.state,
+            KernelActivationState::OldTerminated
+                | KernelActivationState::NonceIssued
+                | KernelActivationState::Activating
+                | KernelActivationState::Active
+        ) && !self.prior_kernel_disposition.proves_terminated()
+        {
+            return Err(JournalError::Invalid(
+                "Kernel authority requires exact prior disposition proof".into(),
+            ));
+        }
+        if matches!(
+            self.state,
+            KernelActivationState::Activating | KernelActivationState::Active
+        ) {
+            let Some(binding) = self.candidate_job_binding.as_ref() else {
+                return Err(JournalError::Invalid(
+                    "activating/active Kernel requires a candidate Job binding".into(),
+                ));
+            };
+            if binding.root_reaped || binding.member_processes.is_empty() {
+                return Err(JournalError::Invalid(
+                    "activating/active Kernel requires a live non-empty Job binding".into(),
+                ));
+            }
         }
         if self.state == KernelActivationState::Active
             && !self.process.as_ref().is_some_and(|process| {
@@ -1074,6 +1212,7 @@ pub(crate) fn activation_transition(
     Ok(())
 }
 
+#[allow(clippy::too_many_lines)]
 pub(crate) fn kernel_transition(
     current: Option<&KernelRecord>,
     next: &KernelRecord,
@@ -1133,11 +1272,102 @@ pub(crate) fn kernel_transition(
             KernelActivationState::ManualRecovery
         )
     );
-    if legal {
-        Ok(())
-    } else {
-        Err(illegal("kernel", current.state, next.state))
+    if !legal {
+        return Err(illegal("kernel", current.state, next.state));
     }
+
+    if next.state == KernelActivationState::OldTerminated
+        && !next.prior_kernel_disposition.proves_terminated()
+    {
+        return Err(JournalError::Invalid(
+            "OldTerminated requires exact prior disposition proof".into(),
+        ));
+    }
+    if matches!(
+        next.state,
+        KernelActivationState::NonceIssued
+            | KernelActivationState::Activating
+            | KernelActivationState::Active
+    ) && !next.prior_kernel_disposition.proves_terminated()
+    {
+        return Err(JournalError::Invalid(
+            "Kernel authority requires exact prior disposition proof".into(),
+        ));
+    }
+    if matches!(
+        current.state,
+        KernelActivationState::OldTerminated
+            | KernelActivationState::NonceIssued
+            | KernelActivationState::Activating
+            | KernelActivationState::Active
+    ) && current.prior_kernel_disposition != next.prior_kernel_disposition
+    {
+        return Err(JournalError::StaleFence);
+    }
+    if matches!(
+        next.state,
+        KernelActivationState::Activating | KernelActivationState::Active
+    ) && next.candidate_job_binding.is_none()
+    {
+        return Err(JournalError::Invalid(
+            "activating/active Kernel requires a candidate Job binding".into(),
+        ));
+    }
+    if current.state == KernelActivationState::Activating
+        && next.state == KernelActivationState::Active
+        && current.candidate_job_binding != next.candidate_job_binding
+    {
+        return Err(JournalError::StaleFence);
+    }
+
+    match (current.one_time_nonce.nonce_ref.as_ref(), next.state) {
+        (Some(current_nonce), KernelActivationState::Activating) => {
+            if next.one_time_nonce.nonce_ref.as_ref() != Some(current_nonce)
+                || next.one_time_nonce.state != NonceState::Issued
+            {
+                return Err(JournalError::Invalid(
+                    "Activating must retain the issued nonce exactly".into(),
+                ));
+            }
+        }
+        (Some(current_nonce), KernelActivationState::Active) => {
+            if next.one_time_nonce.nonce_ref.as_ref() != Some(current_nonce)
+                || next.one_time_nonce.state != NonceState::Consumed
+            {
+                return Err(JournalError::Invalid(
+                    "Active must consume the exact issued nonce".into(),
+                ));
+            }
+        }
+        (Some(current_nonce), KernelActivationState::Failed) => {
+            if next.one_time_nonce.nonce_ref.as_ref() != Some(current_nonce)
+                || next.one_time_nonce.state != NonceState::Revoked
+            {
+                return Err(JournalError::Invalid(
+                    "failed Kernel must revoke the exact issued nonce".into(),
+                ));
+            }
+        }
+        (None, KernelActivationState::NonceIssued) => {
+            if next.one_time_nonce.nonce_ref.is_none()
+                || next.one_time_nonce.state != NonceState::Issued
+            {
+                return Err(JournalError::Invalid(
+                    "NonceIssued requires a newly persisted nonce".into(),
+                ));
+            }
+        }
+        (None, KernelActivationState::Failed | KernelActivationState::ManualRecovery)
+            if next.one_time_nonce.nonce_ref.is_some()
+                || next.one_time_nonce.state != NonceState::Unissued =>
+        {
+            return Err(JournalError::Invalid(
+                "pre-issuance failure must not create an active nonce".into(),
+            ));
+        }
+        _ => {}
+    }
+    Ok(())
 }
 
 pub(crate) fn dependency_transition(

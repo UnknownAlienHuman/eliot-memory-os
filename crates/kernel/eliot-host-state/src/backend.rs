@@ -74,6 +74,10 @@ pub enum BackendReconcileState {
 /// of preserving [`DurableImage`] and reporting commit-boundary observations.
 pub trait JournalBackend: Send {
     fn load(&mut self) -> Result<DurableImage, BackendError>;
+    /// Enumerate descriptors left in the durable PREPARED transaction set.
+    /// This is intentionally separate from [`DurableImage`], which contains
+    /// only committed receipts and journal epochs.
+    fn prepared_appends(&mut self) -> Result<Vec<PreparedAppend>, BackendError>;
     fn prepare(&mut self, append: &PreparedAppend) -> Result<(), BackendError>;
     fn append_prepared(
         &mut self,
@@ -177,6 +181,14 @@ impl MemoryBackend {
 impl JournalBackend for MemoryBackend {
     fn load(&mut self) -> Result<DurableImage, BackendError> {
         Ok(self.image.clone())
+    }
+
+    fn prepared_appends(&mut self) -> Result<Vec<PreparedAppend>, BackendError> {
+        Ok(self
+            .staged
+            .iter()
+            .map(|item| item.descriptor.clone())
+            .collect())
     }
 
     fn prepare(&mut self, append: &PreparedAppend) -> Result<(), BackendError> {
