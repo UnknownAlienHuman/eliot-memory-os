@@ -20,9 +20,9 @@ use eliot_ors::{
 use eliot_platform::SecretReference;
 use eliot_process::{
     DispatchAuthorityId, DispatchPermit, DispatchPermitAuthority, DispatchPermitReplaySnapshot,
-    DispatchValidationContext, KernelDispatchKey, PermitIssuance, ProcessCallerBinding,
-    ProcessExecutionAdmissionRequest, ProcessIntent, ProcessRequest, ProcessStartReceipt,
-    RecoveryCapability, SuspendedProcessIdentity, ValidatedDispatch,
+    DispatchValidationContext, KernelDispatchKey, PermitIssuance, ProcessExecutionAdmissionRequest,
+    ProcessIntent, ProcessOwnerBinding, ProcessRequest, ProcessStartReceipt, RecoveryCapability,
+    SuspendedProcessIdentity, ValidatedDispatch,
 };
 
 use crate::error::{KernelError, KernelResult};
@@ -33,7 +33,7 @@ pub struct ProcessExecutionReplayRecord {
     /// Canonical digest of the inert admission request.
     pub admission_digest: String,
     /// Exact authenticated caller binding that owns the operation.
-    pub caller: ProcessCallerBinding,
+    pub owner: ProcessOwnerBinding,
     /// Durable operation disposition.
     pub state: ProcessExecutionReplayState,
     /// Exact start receipt returned after resume, when completion is proven.
@@ -78,7 +78,7 @@ pub trait ProcessExecutionReplayStore: Send + Sync {
         &self,
         operation_id: &eliot_process::OperationId,
         admission_digest: &str,
-        caller: &ProcessCallerBinding,
+        owner: &ProcessOwnerBinding,
     ) -> KernelResult<ProcessExecutionReplayBegin>;
 
     /// Persists the projection at the one-shot start linearization point.

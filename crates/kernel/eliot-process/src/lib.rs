@@ -572,55 +572,47 @@ pub struct ProcessExecutionAdmissionRequest {
     deadline_unix_ms: u64,
 }
 
-/// Authenticated caller projection carried by every Kernel process operation.
-/// It is inert data: only the established Kernel Session can produce the
-/// matching principal digest and no field grants dispatch authority.
+/// Stable authenticated owner projection retained with a process operation.
+///
+/// This deliberately excludes transport connection and session nonce data so
+/// a fresh authenticated session for the same principal can reconcile an
+/// unknown operation after reconnect.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct ProcessCallerBinding {
+pub struct ProcessOwnerBinding {
     module_id: String,
-    connection_id: String,
     principal_digest: String,
     authority_epoch: u64,
     generation: Generation,
-    session_epoch: u64,
 }
 
-impl ProcessCallerBinding {
-    /// Creates a validated inert caller binding.
+impl ProcessOwnerBinding {
+    /// Creates a validated stable owner binding.
     pub fn new(
         module_id: impl Into<String>,
-        connection_id: impl Into<String>,
         principal_digest: impl Into<String>,
         authority_epoch: u64,
         generation: Generation,
-        session_epoch: u64,
     ) -> Result<Self, ContractError> {
-        if authority_epoch == 0 || session_epoch == 0 {
+        if authority_epoch == 0 {
             return Err(ContractError::InvalidValue {
-                field: "caller_epoch",
-                reason: "authority and session epochs must be non-zero",
+                field: "owner_authority_epoch",
+                reason: "authority epoch must be non-zero",
             });
         }
         let binding = Self {
-            module_id: validate_opaque_id("caller_module_id", module_id.into())?,
-            connection_id: validate_opaque_id("caller_connection_id", connection_id.into())?,
+            module_id: validate_opaque_id("owner_module_id", module_id.into())?,
             principal_digest: principal_digest.into(),
             authority_epoch,
             generation,
-            session_epoch,
         };
-        validate_hex_digest("caller_principal_digest", &binding.principal_digest)?;
+        validate_hex_digest("owner_principal_digest", &binding.principal_digest)?;
         Ok(binding)
     }
 
     /// Returns the authenticated module identity.
     pub fn module_id(&self) -> &str {
         &self.module_id
-    }
-    /// Returns the established connection/session identity.
-    pub fn connection_id(&self) -> &str {
-        &self.connection_id
     }
     /// Returns the opaque principal digest.
     pub fn principal_digest(&self) -> &str {
@@ -634,6 +626,40 @@ impl ProcessCallerBinding {
     pub const fn generation(&self) -> Generation {
         self.generation
     }
+}
+
+/// Ephemeral binding derived from the currently authenticated transport
+/// session. It is never persisted as process ownership.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProcessSessionBinding {
+    connection_id: String,
+    session_epoch: u64,
+}
+
+impl ProcessSessionBinding {
+    /// Creates a validated transport-session binding.
+    pub fn new(
+        connection_id: impl Into<String>,
+        session_epoch: u64,
+    ) -> Result<Self, ContractError> {
+        if session_epoch == 0 {
+            return Err(ContractError::InvalidValue {
+                field: "session_epoch",
+                reason: "session epoch must be non-zero",
+            });
+        }
+        Ok(Self {
+            connection_id: validate_opaque_id("connection_id", connection_id.into())?,
+            session_epoch,
+        })
+    }
+
+    /// Returns the established connection identity.
+    pub fn connection_id(&self) -> &str {
+        &self.connection_id
+    }
+
     /// Returns the transport session epoch.
     pub const fn session_epoch(&self) -> u64 {
         self.session_epoch
@@ -1444,6 +1470,11 @@ impl SuspendedProcessIdentity {
     /// Returns the Job identity.
     pub const fn job_id(&self) -> &JobId {
         &self.job_id
+    }
+
+    /// Returns the observed executable digest captured before resume.
+    pub fn executable_sha256(&self) -> &str {
+        &self.executable_sha256
     }
 }
 
@@ -2535,7 +2566,11 @@ pub trait ProcessExecutor: Send + Sync {
 /// the physical child is resumed.
 pub trait ProcessLaunchAdmission: Send + Sync {
     /// Revalidates retained path/identity material for one exact request.
-    fn validate_launch(&self, request: &ProcessRequest) -> Result<(), ContractError>;
+    fn validate_launch(
+        &self,
+        request: &ProcessRequest,
+        observed: &SuspendedProcessIdentity,
+    ) -> Result<(), ContractError>;
 }
 
 /// Errors belonging to the P-03 process contract.

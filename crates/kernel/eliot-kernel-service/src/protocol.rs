@@ -3,9 +3,8 @@
 use eliot_contracts::{AuthorityEpoch, ResourceGeneration, StateFence};
 use eliot_platform::{PlatformHandle, PortError};
 use eliot_process::{
-    CancellationReceipt, OperationId, ProcessCallerBinding, ProcessEvidence,
-    ProcessExecutionAdmissionRequest, ProcessExecutionError, ProcessExecutionView,
-    ProcessStartReceipt,
+    CancellationReceipt, OperationId, ProcessEvidence, ProcessExecutionAdmissionRequest,
+    ProcessExecutionError, ProcessExecutionView, ProcessStartReceipt,
 };
 use eliot_runtime_contracts::{HealthVector, ServiceProcessState};
 use schemars::JsonSchema;
@@ -74,24 +73,6 @@ pub enum ProcessExecutionRequest {
         /// Exact operation identity to reconcile.
         operation_id: OperationId,
     },
-}
-
-/// Process operation plus the authenticated Session projection that produced
-/// it. Kernel replaces/validates this binding at the established front door.
-#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ProcessExecutionEnvelope {
-    /// Caller/session/principal projection.
-    pub caller: ProcessCallerBinding,
-    /// Closed process operation.
-    pub request: ProcessExecutionRequest,
-}
-
-impl ProcessExecutionEnvelope {
-    /// Validates caller and operation projections.
-    pub fn validate(&self) -> Result<(), KernelServiceError> {
-        self.request.validate()
-    }
 }
 
 impl ProcessExecutionRequest {
@@ -527,5 +508,15 @@ mod tests {
         let mut wrong_digest = requirement();
         wrong_digest.approved_config_hash = handle_value(&"C".repeat(64));
         assert!(wrong_digest.validate().is_err());
+    }
+
+    #[test]
+    fn process_wire_operation_has_no_caller_projection() {
+        let operation = ProcessExecutionRequest::Inspect {
+            operation_id: OperationId::new("op-1").expect("operation"),
+        };
+        let value = serde_json::to_value(operation).expect("json");
+        assert!(value.get("caller").is_none());
+        assert_eq!(value["operation"], "Inspect");
     }
 }

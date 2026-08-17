@@ -28,19 +28,19 @@ use eliot_kernel_core::{
 };
 use eliot_kernel_service::{
     EbpCanonicalStoreClient, HostStoreBootstrapRequirement, KernelControlCommand, KernelService,
-    KernelServiceError, KernelServiceState, ProcessExecutionEnvelope, ProcessExecutionRequest,
-    ProcessExecutionResponse, StoreClientError,
+    KernelServiceError, KernelServiceState, ProcessExecutionRequest, ProcessExecutionResponse,
+    StoreClientError,
 };
 #[cfg(test)]
 use eliot_ors::CanonicalEvidenceProvider;
 use eliot_ors::{OrsCoordinator, RedbRecoveryStore};
-use eliot_platform::{PortError, WorkScopePath};
-use eliot_platform_windows::{FileIdentity, WindowsPlatform};
+use eliot_platform::PortError;
+use eliot_platform_windows::{RetainedProcessPathLease, WindowsPlatform};
 use eliot_process::{
     DispatchAuthorityId, DispatchValidationContext, Generation, KernelDispatchKey, PermitIssuance,
-    ProcessCallerBinding, ProcessEvidence, ProcessEvidenceSink, ProcessExecutionAdmissionRequest,
-    ProcessExecutionError, ProcessExecutor, ProcessIntent, ProcessLaunchAdmission, ProcessRequest,
-    ProcessStartReceipt, SuspendedProcessIdentity, ValidatedDispatch,
+    ProcessEvidence, ProcessEvidenceSink, ProcessExecutionAdmissionRequest, ProcessExecutionError,
+    ProcessExecutor, ProcessIntent, ProcessLaunchAdmission, ProcessOwnerBinding, ProcessRequest,
+    ProcessSessionBinding, ProcessStartReceipt, SuspendedProcessIdentity, ValidatedDispatch,
 };
 use eliot_process_executor::{DispatchValidationPort, WindowsProcessExecutor};
 use eliot_protocol::{EncodingProfile, Frame, FrameKind, MessageType, ProtocolPayload};
@@ -208,8 +208,10 @@ pub enum KernelFrameAction {
     Process {
         /// Correlation identity to echo in the response.
         request_id: RequestId,
-        /// Validated inert operation plus established-session binding.
-        envelope: ProcessExecutionEnvelope,
+        /// Validated inert operation.
+        request: ProcessExecutionRequest,
+        /// Server-derived ephemeral session binding; never wire supplied.
+        session_binding: ProcessSessionBinding,
     },
     /// Return a typed rejection, then fence the connection.
     Fence(Frame),
@@ -281,24 +283,20 @@ struct ProcessExecutionGateway {
 /// Platform-owned path proof captured immediately before authority issuance.
 /// The executor receives the proof as an opaque Kernel-owned handoff; raw
 /// lexical/canonical containment is never used as the admission rule.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Debug)]
 struct ProcessPathProof {
     executable: PathBuf,
-    executable_scope: WorkScopePath,
-    working_scope: WorkScopePath,
-    executable_identity: FileIdentity,
     working_directory: PathBuf,
+    lease: Arc<RetainedProcessPathLease>,
 }
 
 struct KernelPathAdmission {
-    platform: Arc<WindowsPlatform>,
     proofs: Mutex<BTreeMap<eliot_process::OperationId, ProcessPathProof>>,
 }
 
 impl KernelPathAdmission {
-    fn new(platform: Arc<WindowsPlatform>) -> Self {
+    fn new(_platform: Arc<WindowsPlatform>) -> Self {
         Self {
-            platform,
             proofs: Mutex::new(BTreeMap::new()),
         }
     }
@@ -328,6 +326,7 @@ impl ProcessLaunchAdmission for KernelPathAdmission {
     fn validate_launch(
         &self,
         request: &ProcessRequest,
+        observed: &SuspendedProcessIdentity,
     ) -> Result<(), eliot_process::ContractError> {
         let proofs =
             self.proofs
@@ -341,22 +340,18 @@ impl ProcessLaunchAdmission for KernelPathAdmission {
             .ok_or(eliot_process::ContractError::DispatchBindingMismatch)?;
         if proof.executable.to_string_lossy() != request.executable()
             || proof.working_directory.to_string_lossy() != request.working_directory()
+            || observed.executable_sha256() != request.executable_sha256()
         {
             return Err(eliot_process::ContractError::DispatchBindingMismatch);
         }
-        let observed = self
-            .platform
-            .file_identity(&proof.executable_scope)
-            .map_err(|_| eliot_process::ContractError::DispatchBindingMismatch)?;
-        if observed != proof.executable_identity {
-            return Err(eliot_process::ContractError::DispatchBindingMismatch);
-        }
-        let working = std::fs::symlink_metadata(&proof.working_directory)
-            .map_err(|_| eliot_process::ContractError::DispatchBindingMismatch)?;
-        if working.file_type().is_symlink() || !working.is_dir() {
-            return Err(eliot_process::ContractError::DispatchBindingMismatch);
-        }
-        Ok(())
+        proof
+            .lease
+            .validate(
+                Path::new(request.executable()),
+                Path::new(request.working_directory()),
+                request.executable_sha256(),
+            )
+            .map_err(|_| eliot_process::ContractError::DispatchBindingMismatch)
     }
 }
 
@@ -390,13 +385,13 @@ impl ProcessExecutionGateway {
         &self,
         operation_id: &eliot_process::OperationId,
         digest: &str,
-        caller: &ProcessCallerBinding,
+        owner: &ProcessOwnerBinding,
     ) {
         let _ = self.replay_store.persist_process_start(
             operation_id,
             ProcessExecutionReplayRecord {
                 admission_digest: digest.to_owned(),
-                caller: caller.clone(),
+                owner: owner.clone(),
                 state: ProcessExecutionReplayState::Unknown,
                 receipt: None,
             },
@@ -409,7 +404,7 @@ impl ProcessExecutionGateway {
     )]
     async fn start(
         &self,
-        caller: &ProcessCallerBinding,
+        owner: &ProcessOwnerBinding,
         admission: ProcessExecutionAdmissionRequest,
         path_proof: ProcessPathProof,
     ) -> Result<ProcessStartReceipt, ProcessExecutionError> {
@@ -417,7 +412,7 @@ impl ProcessExecutionGateway {
         if path_proof.executable.to_string_lossy() != admission.intent().executable()
             || path_proof.working_directory.to_string_lossy()
                 != admission.intent().working_directory()
-            || path_proof.executable_identity.file_index == 0
+            || path_proof.lease.executable_identity().file_index == 0
         {
             return Err(ProcessExecutionError::Contract(
                 eliot_process::ContractError::DispatchBindingMismatch,
@@ -425,10 +420,9 @@ impl ProcessExecutionGateway {
         }
         self.validation_context
             .validate_intent(admission.intent())?;
-        if admission.recipient_module_id() != caller.module_id()
-            || admission.intent().session_id().as_str() != caller.connection_id()
-            || admission.state_fence().authority_epoch() != caller.authority_epoch()
-            || admission.state_fence().generation().get() != caller.generation().get()
+        if admission.recipient_module_id() != owner.module_id()
+            || admission.state_fence().authority_epoch() != owner.authority_epoch()
+            || admission.state_fence().generation().get() != owner.generation().get()
         {
             return Err(ProcessExecutionError::Contract(
                 eliot_process::ContractError::DispatchBindingMismatch,
@@ -452,7 +446,7 @@ impl ProcessExecutionGateway {
         }
         match self
             .replay_store
-            .begin_process_start(admission.intent().operation_id(), &digest, caller)
+            .begin_process_start(admission.intent().operation_id(), &digest, owner)
             .map_err(|error| ProcessExecutionError::Unavailable(error.to_string()))?
         {
             ProcessExecutionReplayBegin::Acquired => {}
@@ -462,7 +456,7 @@ impl ProcessExecutionGateway {
                         eliot_process::ContractError::DispatchBindingMismatch,
                     ));
                 }
-                if record.caller != *caller {
+                if record.owner != *owner {
                     return Err(ProcessExecutionError::Contract(
                         eliot_process::ContractError::DispatchBindingMismatch,
                     ));
@@ -506,20 +500,20 @@ impl ProcessExecutionGateway {
         {
             Ok(permit) => permit,
             Err(error) => {
-                self.mark_unknown(admission.intent().operation_id(), &digest, caller);
+                self.mark_unknown(admission.intent().operation_id(), &digest, owner);
                 return Err(error);
             }
         };
         let request = match ProcessRequest::new(admission.intent().clone(), permit) {
             Ok(request) => request,
             Err(error) => {
-                self.mark_unknown(admission.intent().operation_id(), &digest, caller);
+                self.mark_unknown(admission.intent().operation_id(), &digest, owner);
                 return Err(ProcessExecutionError::Contract(error));
             }
         };
         let operation_id = admission.intent().operation_id().clone();
         if let Err(error) = self.path_admission.insert(operation_id.clone(), path_proof) {
-            self.mark_unknown(&operation_id, &digest, caller);
+            self.mark_unknown(&operation_id, &digest, owner);
             return Err(error);
         }
         let receipt = match self
@@ -533,7 +527,7 @@ impl ProcessExecutionGateway {
             }
             Err(error) => {
                 self.path_admission.remove(&operation_id);
-                self.mark_unknown(admission.intent().operation_id(), &digest, caller);
+                self.mark_unknown(admission.intent().operation_id(), &digest, owner);
                 return Err(error);
             }
         };
@@ -542,7 +536,7 @@ impl ProcessExecutionGateway {
                 admission.intent().operation_id(),
                 ProcessExecutionReplayRecord {
                     admission_digest: digest,
-                    caller: caller.clone(),
+                    owner: owner.clone(),
                     state: ProcessExecutionReplayState::Completed,
                     receipt: Some(receipt.clone()),
                 },
@@ -553,34 +547,34 @@ impl ProcessExecutionGateway {
 
     async fn inspect(
         &self,
-        caller: &ProcessCallerBinding,
+        owner: &ProcessOwnerBinding,
         operation_id: eliot_process::OperationId,
     ) -> Result<eliot_process::ProcessExecutionView, ProcessExecutionError> {
-        self.authorize_operation(caller, &operation_id)?;
+        self.authorize_operation(owner, &operation_id)?;
         self.executor.inspect(operation_id).await
     }
 
     async fn cancel(
         &self,
-        caller: &ProcessCallerBinding,
+        owner: &ProcessOwnerBinding,
         operation_id: eliot_process::OperationId,
     ) -> Result<eliot_process::CancellationReceipt, ProcessExecutionError> {
-        self.authorize_operation(caller, &operation_id)?;
+        self.authorize_operation(owner, &operation_id)?;
         self.executor.cancel(operation_id).await
     }
 
     async fn reconcile(
         &self,
-        caller: &ProcessCallerBinding,
+        owner: &ProcessOwnerBinding,
         operation_id: eliot_process::OperationId,
     ) -> Result<ProcessEvidence, ProcessExecutionError> {
-        self.authorize_operation(caller, &operation_id)?;
+        self.authorize_operation(owner, &operation_id)?;
         self.executor.reconcile(operation_id).await
     }
 
     fn authorize_operation(
         &self,
-        caller: &ProcessCallerBinding,
+        owner: &ProcessOwnerBinding,
         operation_id: &eliot_process::OperationId,
     ) -> Result<(), ProcessExecutionError> {
         let record = self
@@ -588,13 +582,20 @@ impl ProcessExecutionGateway {
             .load_process_start(operation_id)
             .map_err(|error| ProcessExecutionError::Unavailable(error.to_string()))?
             .ok_or(ProcessExecutionError::NotFound)?;
-        if record.caller != *caller {
-            return Err(ProcessExecutionError::Contract(
-                eliot_process::ContractError::DispatchBindingMismatch,
-            ));
-        }
-        Ok(())
+        authorize_process_owner(&record.owner, owner)
     }
+}
+
+fn authorize_process_owner(
+    expected: &ProcessOwnerBinding,
+    presented: &ProcessOwnerBinding,
+) -> Result<(), ProcessExecutionError> {
+    if expected != presented {
+        return Err(ProcessExecutionError::Contract(
+            eliot_process::ContractError::DispatchBindingMismatch,
+        ));
+    }
+    Ok(())
 }
 
 fn unix_ms() -> u64 {
@@ -606,30 +607,30 @@ fn unix_ms() -> u64 {
         .unwrap_or(u64::MAX)
 }
 
-fn caller_binding(session: &Session) -> Result<ProcessCallerBinding, TransportError> {
+fn caller_binding(
+    session: &Session,
+) -> Result<(ProcessOwnerBinding, ProcessSessionBinding), TransportError> {
     session
         .peer
         .validate()
         .map_err(|_| TransportError::PeerIdentityUnavailable)?;
     let mut principal = Sha256::new();
     principal.update(format!("{:?}", session.peer).as_bytes());
-    principal.update(session.connection_id.as_bytes());
-    principal.update(session.launch_nonce.as_bytes());
     principal.update(session.module_generation.module_id.as_str().as_bytes());
     principal.update(session.authority_epoch.to_le_bytes());
-    principal.update(session.session_epoch.to_le_bytes());
     let generation = Generation::new(session.module_generation.generation.value())
         .map_err(|_| TransportError::SessionFenced)?;
     let principal_digest = format!("{:x}", Sha256::digest(principal.finalize()));
-    ProcessCallerBinding::new(
+    let owner = ProcessOwnerBinding::new(
         session.module_generation.module_id.as_str(),
-        &session.connection_id,
         principal_digest,
         session.authority_epoch,
         generation,
-        session.session_epoch,
     )
-    .map_err(|_| TransportError::SessionFenced)
+    .map_err(|_| TransportError::SessionFenced)?;
+    let session_binding = ProcessSessionBinding::new(&session.connection_id, session.session_epoch)
+        .map_err(|_| TransportError::SessionFenced)?;
+    Ok((owner, session_binding))
 }
 
 /// The concrete, non-generic S-03 gateway retained by one Kernel composition.
@@ -1309,12 +1310,11 @@ impl KernelComposition {
                     return Err(TransportError::SessionFenced);
                 }
             }
+            let (_, session_binding) = caller_binding(session)?;
             return Ok(KernelFrameAction::Process {
                 request_id,
-                envelope: ProcessExecutionEnvelope {
-                    caller: caller_binding(session)?,
-                    request,
-                },
+                request,
+                session_binding,
             });
         }
 
@@ -1332,9 +1332,10 @@ impl KernelComposition {
     pub async fn execute_process_request(
         &self,
         session: &Session,
-        envelope: ProcessExecutionEnvelope,
+        session_binding: ProcessSessionBinding,
+        request: ProcessExecutionRequest,
     ) -> ProcessExecutionResponse {
-        let Ok(expected_caller) = caller_binding(session) else {
+        let Ok((owner, expected_session_binding)) = caller_binding(session) else {
             return ProcessExecutionResponse::Rejected(
                 eliot_kernel_service::ProcessExecutionRejection {
                     code: "AUTHENTICATED_CALLER_REQUIRED".to_owned(),
@@ -1343,18 +1344,14 @@ impl KernelComposition {
                 },
             );
         };
-        if envelope.caller != expected_caller {
+        if session_binding != expected_session_binding {
             return ProcessExecutionResponse::Rejected(
                 eliot_kernel_service::ProcessExecutionRejection {
-                    code: "CALLER_BINDING_MISMATCH".to_owned(),
-                    detail:
-                        "process operation caller binding does not match the authenticated session"
-                            .to_owned(),
+                    code: "SESSION_BINDING_MISMATCH".to_owned(),
+                    detail: "process operation session binding does not match the established authenticated session".to_owned(),
                 },
             );
         }
-        let caller = &envelope.caller;
-        let request = envelope.request;
         let Some(gateway) = &self.process_gateway else {
             return ProcessExecutionResponse::Rejected(
                 eliot_kernel_service::ProcessExecutionRejection {
@@ -1374,20 +1371,20 @@ impl KernelComposition {
                     }
                 };
                 gateway
-                    .start(caller, admission, proof)
+                    .start(&owner, admission, proof)
                     .await
                     .map(ProcessExecutionResponse::Started)
             }
             ProcessExecutionRequest::Inspect { operation_id } => gateway
-                .inspect(caller, operation_id)
+                .inspect(&owner, operation_id)
                 .await
                 .map(ProcessExecutionResponse::Status),
             ProcessExecutionRequest::Cancel { operation_id } => gateway
-                .cancel(caller, operation_id)
+                .cancel(&owner, operation_id)
                 .await
                 .map(ProcessExecutionResponse::Cancelled),
             ProcessExecutionRequest::Reconcile { operation_id } => gateway
-                .reconcile(caller, operation_id)
+                .reconcile(&owner, operation_id)
                 .await
                 .map(ProcessExecutionResponse::Reconciled),
         };
@@ -1404,13 +1401,13 @@ impl KernelComposition {
     ) -> Result<ProcessPathProof, ProcessExecutionError> {
         let executable = PathBuf::from(admission.intent().executable());
         let working_directory = PathBuf::from(admission.intent().working_directory());
-        let executable_relative = executable.strip_prefix(&self.work_root).map_err(|_| {
+        executable.strip_prefix(&self.work_root).map_err(|_| {
             ProcessExecutionError::Contract(eliot_process::ContractError::InvalidValue {
                 field: "process_root",
                 reason: "executable is outside the retained WorkScope root",
             })
         })?;
-        let working_relative = working_directory
+        working_directory
             .strip_prefix(&self.work_root)
             .map_err(|_| {
                 ProcessExecutionError::Contract(eliot_process::ContractError::InvalidValue {
@@ -1418,33 +1415,18 @@ impl KernelComposition {
                     reason: "working directory is outside the retained WorkScope root",
                 })
             })?;
-        let executable_scope =
-            WorkScopePath::new(executable_relative.to_string_lossy().replace('\\', "/"))
-                .map_err(|error| ProcessExecutionError::Unavailable(error.to_string()))?;
-        let working_scope =
-            WorkScopePath::new(working_relative.to_string_lossy().replace('\\', "/"))
-                .map_err(|error| ProcessExecutionError::Unavailable(error.to_string()))?;
-        let executable_identity = self
+        let lease = self
             .platform
-            .file_identity(&executable_scope)
+            .retain_process_path_lease(
+                &executable,
+                &working_directory,
+                admission.intent().executable_sha256(),
+            )
             .map_err(|error| ProcessExecutionError::Unavailable(error.to_string()))?;
-        let pinned = eliot_platform_windows::validate_pinned_artifact(
-            &executable,
-            admission.intent().executable_sha256(),
-        )
-        .map_err(|error| ProcessExecutionError::Unavailable(error.to_string()))?;
-        if pinned != executable {
-            return Err(ProcessExecutionError::Contract(
-                eliot_process::ContractError::DispatchBindingMismatch,
-            ));
-        }
-        let _ = working_scope;
         Ok(ProcessPathProof {
-            executable: pinned,
-            executable_scope,
-            working_scope,
-            executable_identity,
+            executable,
             working_directory,
+            lease: Arc::new(lease),
         })
     }
 
@@ -1796,6 +1778,31 @@ mod tests {
         let kernel = KernelComposition::new(KernelConfig::new(&root)).expect("composition");
         assert!(!kernel.process_execution_configured());
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn process_owner_survives_reconnect_but_rejects_cross_owner() {
+        let generation = Generation::new(7).expect("generation");
+        let owner =
+            ProcessOwnerBinding::new("testd", "a".repeat(64), 3, generation).expect("owner");
+        let reconnected =
+            ProcessOwnerBinding::new("testd", "a".repeat(64), 3, generation).expect("owner");
+        assert!(authorize_process_owner(&owner, &reconnected).is_ok());
+
+        let wrong_module =
+            ProcessOwnerBinding::new("native", "a".repeat(64), 3, generation).expect("owner");
+        let wrong_principal =
+            ProcessOwnerBinding::new("testd", "b".repeat(64), 3, generation).expect("owner");
+        let wrong_generation = ProcessOwnerBinding::new(
+            "testd",
+            "a".repeat(64),
+            3,
+            Generation::new(8).expect("generation"),
+        )
+        .expect("owner");
+        for candidate in [wrong_module, wrong_principal, wrong_generation] {
+            assert!(authorize_process_owner(&owner, &candidate).is_err());
+        }
     }
 }
 

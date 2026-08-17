@@ -4545,6 +4545,254 @@ pub struct WindowsPlatform {
     _root_pin: std::fs::File,
 }
 
+/// Retained no-follow launch proof for an executable and its working scope.
+///
+/// The open handles and ancestor pins remain owned by this value through the
+/// suspended `CreateProcess` validation and resume boundary. Reopening a path
+/// is only a comparison against these retained identities; it is never the
+/// sole proof of containment.
+pub struct RetainedProcessPathLease {
+    root: PathBuf,
+    executable_path: PathBuf,
+    working_directory: PathBuf,
+    executable_identity: FileIdentity,
+    working_directory_identity: FileIdentity,
+    #[cfg(windows)]
+    executable: std::fs::File,
+    #[cfg(windows)]
+    working_directory_handle: std::fs::File,
+    #[cfg(windows)]
+    ancestor_pins: Vec<std::fs::File>,
+    #[cfg(windows)]
+    ancestor_identities: Vec<(PathBuf, FileIdentity)>,
+}
+
+impl std::fmt::Debug for RetainedProcessPathLease {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RetainedProcessPathLease")
+            .field("root", &self.root)
+            .field("executable_path", &self.executable_path)
+            .field("working_directory", &self.working_directory)
+            .field("executable_identity", &self.executable_identity)
+            .field(
+                "working_directory_identity",
+                &self.working_directory_identity,
+            )
+            .finish_non_exhaustive()
+    }
+}
+
+impl WindowsPlatform {
+    /// Retains exact no-follow handles and ancestor identities for a launch.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed path/provider error when containment, identity, or
+    /// digest validation cannot be established.
+    pub fn retain_process_path_lease(
+        &self,
+        executable: &Path,
+        working_directory: &Path,
+        expected_sha256: &str,
+    ) -> Result<RetainedProcessPathLease, PortError> {
+        if !executable.is_absolute()
+            || !working_directory.is_absolute()
+            || !valid_sha256_hex(expected_sha256)
+        {
+            return Err(PortError::InvalidPath);
+        }
+        validate_containment(&self.root, executable)?;
+        validate_containment(&self.root, working_directory)?;
+        #[cfg(windows)]
+        {
+            use std::io::Read;
+            use std::os::windows::fs::OpenOptionsExt;
+            use windows_sys::Win32::Storage::FileSystem::{
+                FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ, FILE_SHARE_WRITE,
+            };
+            let mut executable_options = std::fs::OpenOptions::new();
+            executable_options
+                .read(true)
+                .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+                .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+            let mut executable_handle = executable_options
+                .open(executable)
+                .map_err(|_| PortError::InvalidPath)?;
+            let executable_metadata = executable_handle
+                .metadata()
+                .map_err(|_| PortError::InvalidPath)?;
+            if !executable_metadata.is_file() || is_reparse_point(&executable_metadata) {
+                return Err(PortError::InvalidPath);
+            }
+            let executable_identity = file_identity_from_handle(&executable_handle)
+                .map_err(|_| PortError::Provider(provider_failed()))?;
+            let mut bytes = Vec::with_capacity(executable_metadata.len().try_into().unwrap_or(0));
+            executable_handle
+                .read_to_end(&mut bytes)
+                .map_err(|_| PortError::Provider(provider_failed()))?;
+            if sha256_hex(&bytes) != expected_sha256.to_ascii_lowercase() {
+                return Err(PortError::InvalidPath);
+            }
+            let mut directory_options = std::fs::OpenOptions::new();
+            directory_options
+                .read(true)
+                .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+                .custom_flags(
+                    windows_sys::Win32::Storage::FileSystem::FILE_FLAG_BACKUP_SEMANTICS
+                        | FILE_FLAG_OPEN_REPARSE_POINT,
+                );
+            let working_handle = directory_options
+                .open(working_directory)
+                .map_err(|_| PortError::InvalidPath)?;
+            let working_metadata = working_handle
+                .metadata()
+                .map_err(|_| PortError::InvalidPath)?;
+            if !working_metadata.is_dir() || is_reparse_point(&working_metadata) {
+                return Err(PortError::InvalidPath);
+            }
+            let working_directory_identity = file_identity_from_handle(&working_handle)
+                .map_err(|_| PortError::Provider(provider_failed()))?;
+            let parent = executable.parent().ok_or(PortError::InvalidPath)?;
+            let mut ancestor_pins = pin_ancestors(&self.root, parent)?;
+            ancestor_pins.extend(pin_ancestors(&self.root, working_directory)?);
+            let mut ancestor_identities = Vec::new();
+            for path in executable
+                .ancestors()
+                .take_while(|path| *path != self.root)
+                .chain(
+                    working_directory
+                        .ancestors()
+                        .take_while(|path| *path != self.root),
+                )
+            {
+                if path.is_dir() {
+                    let handle = pin_directory(path).map_err(|_| PortError::InvalidPath)?;
+                    let identity = file_identity_from_handle(&handle)
+                        .map_err(|_| PortError::Provider(provider_failed()))?;
+                    ancestor_identities.push((path.to_path_buf(), identity));
+                }
+            }
+            Ok(RetainedProcessPathLease {
+                root: self.root.clone(),
+                executable_path: executable.to_path_buf(),
+                working_directory: working_directory.to_path_buf(),
+                executable_identity,
+                working_directory_identity,
+                executable: executable_handle,
+                working_directory_handle: working_handle,
+                ancestor_pins,
+                ancestor_identities,
+            })
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = (executable, working_directory, expected_sha256);
+            Err(PortError::Provider(provider_failed()))
+        }
+    }
+}
+
+impl RetainedProcessPathLease {
+    /// Returns the identity retained for the executable handle.
+    pub const fn executable_identity(&self) -> FileIdentity {
+        self.executable_identity
+    }
+
+    /// Validates current path projections against retained handles and pins.
+    ///
+    /// # Errors
+    ///
+    /// Returns `InvalidPath` or a provider error when an identity, digest,
+    /// ancestor, or no-follow check cannot be proven.
+    pub fn validate(
+        &self,
+        executable: &Path,
+        working_directory: &Path,
+        expected_sha256: &str,
+    ) -> Result<(), PortError> {
+        if executable != self.executable_path || working_directory != self.working_directory {
+            return Err(PortError::InvalidPath);
+        }
+        #[cfg(windows)]
+        {
+            use std::io::Read;
+            use std::os::windows::fs::OpenOptionsExt;
+            use windows_sys::Win32::Storage::FileSystem::{
+                FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ,
+                FILE_SHARE_WRITE,
+            };
+            let mut executable_options = std::fs::OpenOptions::new();
+            executable_options
+                .read(true)
+                .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+                .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+            let mut current_executable = executable_options
+                .open(executable)
+                .map_err(|_| PortError::InvalidPath)?;
+            let metadata = current_executable
+                .metadata()
+                .map_err(|_| PortError::InvalidPath)?;
+            if !metadata.is_file() || is_reparse_point(&metadata) {
+                return Err(PortError::InvalidPath);
+            }
+            if file_identity_from_handle(&current_executable)
+                .map_err(|_| PortError::Provider(provider_failed()))?
+                != self.executable_identity
+            {
+                return Err(PortError::InvalidPath);
+            }
+            let mut bytes = Vec::new();
+            current_executable
+                .read_to_end(&mut bytes)
+                .map_err(|_| PortError::Provider(provider_failed()))?;
+            if sha256_hex(&bytes) != expected_sha256.to_ascii_lowercase() {
+                return Err(PortError::InvalidPath);
+            }
+            let mut directory_options = std::fs::OpenOptions::new();
+            directory_options
+                .read(true)
+                .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+                .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT);
+            let current_working = directory_options
+                .open(working_directory)
+                .map_err(|_| PortError::InvalidPath)?;
+            let metadata = current_working
+                .metadata()
+                .map_err(|_| PortError::InvalidPath)?;
+            if !metadata.is_dir() || is_reparse_point(&metadata) {
+                return Err(PortError::InvalidPath);
+            }
+            if file_identity_from_handle(&current_working)
+                .map_err(|_| PortError::Provider(provider_failed()))?
+                != self.working_directory_identity
+            {
+                return Err(PortError::InvalidPath);
+            }
+            for (path, identity) in &self.ancestor_identities {
+                let handle = pin_directory(path).map_err(|_| PortError::InvalidPath)?;
+                if file_identity_from_handle(&handle)
+                    .map_err(|_| PortError::Provider(provider_failed()))?
+                    != *identity
+                {
+                    return Err(PortError::InvalidPath);
+                }
+            }
+            let _ = (
+                &self.executable,
+                &self.working_directory_handle,
+                &self.ancestor_pins,
+            );
+            Ok(())
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = (executable, working_directory, expected_sha256);
+            Err(PortError::Provider(provider_failed()))
+        }
+    }
+}
+
 impl WindowsPlatform {
     /// Binds the adapter to an absolute, existing, non-reparse work root.
     ///
@@ -6797,6 +7045,31 @@ mod tests {
             protected_program_data_path(Path::new("C:/outside")),
             Err(ProtectedPathError::InvalidPath)
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn retained_process_lease_rejects_identity_or_digest_substitution() {
+        let root = std::env::temp_dir().join(format!("eliot-process-lease-{}", unique_suffix()));
+        let working = root.join("work");
+        let executable = root.join("worker.bin");
+        std::fs::create_dir_all(&working).expect("working directory");
+        let original = b"original executable bytes";
+        std::fs::write(&executable, original).expect("executable");
+        let platform = WindowsPlatform::new(&root).expect("platform");
+        let digest = sha256_hex(original);
+        let lease = platform
+            .retain_process_path_lease(&executable, &working, &digest)
+            .expect("retained launch lease");
+
+        std::fs::write(&executable, b"substituted executable bytes").expect("substitute");
+        assert!(lease.validate(&executable, &working, &digest).is_err());
+        assert!(
+            lease
+                .validate(&executable, &root.join("other"), &digest)
+                .is_err()
+        );
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]

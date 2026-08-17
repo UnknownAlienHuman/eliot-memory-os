@@ -26,9 +26,8 @@ pub use lifecycle::{
 };
 pub use protocol::{
     ContainmentAction, HostKernelHandshake, HostStoreBootstrapRequirement, KernelControlCommand,
-    KernelReadyReceipt, ProcessExecutionEnvelope, ProcessExecutionRejection,
-    ProcessExecutionRequest, ProcessExecutionResponse, ProcessObservation, RestartBudget,
-    StoreBootstrapDescriptor,
+    KernelReadyReceipt, ProcessExecutionRejection, ProcessExecutionRequest,
+    ProcessExecutionResponse, ProcessObservation, RestartBudget, StoreBootstrapDescriptor,
 };
 pub use store_client::{EbpCanonicalStoreClient, EbpStoreTransport, StoreClientError};
 
@@ -42,7 +41,7 @@ pub type ProcessExecutionFuture<'a> =
 /// port never receives [`eliot_process::ProcessRequest`] or a dispatch permit.
 pub trait ProcessExecutionClient: Send + Sync {
     /// Submits one closed process operation to the Kernel front door.
-    fn execute(&self, request: ProcessExecutionEnvelope) -> ProcessExecutionFuture<'_>;
+    fn execute(&self, request: ProcessExecutionRequest) -> ProcessExecutionFuture<'_>;
 }
 
 use eliot_contracts::{

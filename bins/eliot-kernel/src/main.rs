@@ -230,9 +230,12 @@ async fn serve_connection(
             }
             KernelFrameAction::Process {
                 request_id,
-                envelope,
+                request,
+                session_binding,
             } => {
-                let response = kernel.execute_process_request(&session, envelope).await;
+                let response = kernel
+                    .execute_process_request(&session, session_binding, request)
+                    .await;
                 let reply = kernel.process_response_frame(&session, request_id, &response)?;
                 if let Err(error) = send_checked(&mut front_door, &reply, limits).await {
                     session.fence();

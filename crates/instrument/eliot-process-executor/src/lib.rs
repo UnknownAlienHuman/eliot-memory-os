@@ -483,7 +483,7 @@ impl ProcessExecutor for WindowsProcessExecutor {
                 .validate(|evidence| {
                     let observed = suspended_identity(&request, evidence)?;
                     if let Some(admission) = &launch_admission {
-                        admission.validate_launch(&request)?;
+                        admission.validate_launch(&request, &observed)?;
                     }
                     authority.validate_and_consume(request, observed)
                 })
