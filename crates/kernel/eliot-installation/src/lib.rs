@@ -13,7 +13,7 @@ use std::collections::BTreeSet;
 use std::path::Path;
 
 use eliot_contracts::{
-    ContractIdentity, ContractVersion, ResourceGeneration, StateFence, canonical_json_bytes,
+    ContractIdentity, ContractVersion, ResourceGeneration, StateFence,
     contract_identity as make_contract_identity, sha256_hex,
 };
 use eliot_platform::{
@@ -105,6 +105,12 @@ pub enum InstallationError {
     /// The platform contract rejected the request.
     #[error("platform contract: {0}")]
     Platform(String),
+    /// Existing durable installation state requires an explicit re-stage.
+    #[error("installation migration required: {reason}")]
+    MigrationRequired {
+        /// Why the existing state cannot be admitted as the current schema.
+        reason: String,
+    },
 }
 
 fn text(value: &str, field: &str) -> Result<(), InstallationError> {
@@ -159,6 +165,50 @@ fn approved_path(value: &PlatformHandle, field: &str) -> Result<(), Installation
         return Err(InstallationError::InvalidField {
             field: field.to_owned(),
             reason: "must not contain parent-directory traversal".to_owned(),
+        });
+    }
+    Ok(())
+}
+
+fn lexical_windows_path(value: &str) -> String {
+    let value = value.replace('/', "\\");
+    let (prefix, body) = if let Some(body) = value.strip_prefix("\\\\") {
+        ("\\\\".to_owned(), body.to_owned())
+    } else if value.len() >= 3 && value.as_bytes()[1] == b':' && value.as_bytes()[2] == b'\\' {
+        (format!("{}\\", &value[..2]), value[3..].to_owned())
+    } else if let Some(body) = value.strip_prefix('\\') {
+        ("\\".to_owned(), body.to_owned())
+    } else if value.len() >= 2 && value.as_bytes()[1] == b':' {
+        (value[..2].to_owned(), value[2..].to_owned())
+    } else {
+        (String::new(), value)
+    };
+    let mut components = Vec::new();
+    for component in body.split('\\') {
+        match component {
+            "" | "." => {}
+            ".." => {
+                components.pop();
+            }
+            component => components.push(component.to_ascii_lowercase()),
+        }
+    }
+    let mut normalized = prefix.to_ascii_lowercase();
+    normalized.push_str(&components.join("\\"));
+    normalized
+}
+
+fn reject_authority_alias(
+    authority_path: &PlatformHandle,
+    candidate_path: &PlatformHandle,
+    candidate_field: &str,
+) -> Result<(), InstallationError> {
+    if lexical_windows_path(authority_path.as_str())
+        == lexical_windows_path(candidate_path.as_str())
+    {
+        return Err(InstallationError::InvalidField {
+            field: "runtime_launch.authority_descriptor_path".to_owned(),
+            reason: format!("must not alias {candidate_field}"),
         });
     }
     Ok(())
@@ -755,6 +805,8 @@ impl RuntimeLaunchDescriptor {
             self.kernel_work_root.as_str().to_owned(),
             "--store-bootstrap".to_owned(),
             self.store_bootstrap_descriptor_path.as_str().to_owned(),
+            "--store-bootstrap-sha256".to_owned(),
+            self.store_bootstrap_descriptor_digest.as_str().to_owned(),
             "--authority-descriptor".to_owned(),
             self.authority_descriptor_path.as_str().to_owned(),
             "--authority-descriptor-sha256".to_owned(),
@@ -827,7 +879,7 @@ impl RuntimeLaunchDescriptor {
             watchdog_executable_path: &'a PlatformHandle,
             watchdog_artifact_digest: &'a PlatformHandle,
         }
-        canonical_json_bytes(&Unsigned {
+        serde_json::to_vec(&Unsigned {
             profile: self.profile,
             portable_root: &self.portable_root,
             installation_epoch: &self.installation_epoch,
@@ -967,6 +1019,35 @@ impl RuntimeLaunchDescriptor {
             }
             (_, None) => {}
         }
+        for (candidate, field) in [
+            (
+                &self.store_bridge_executable_path,
+                "runtime_launch.store_bridge_executable_path",
+            ),
+            (
+                &self.canonical_store_executable_path,
+                "runtime_launch.canonical_store_executable_path",
+            ),
+            (
+                &self.watchdog_executable_path,
+                "runtime_launch.watchdog_executable_path",
+            ),
+            (&self.store_config_path, "runtime_launch.store_config_path"),
+            (
+                &self.store_bootstrap_descriptor_path,
+                "runtime_launch.store_bootstrap_descriptor_path",
+            ),
+            (&self.kernel_work_root, "runtime_launch.kernel_work_root"),
+        ] {
+            reject_authority_alias(&self.authority_descriptor_path, candidate, field)?;
+        }
+        if let Some(portable_root) = &self.portable_root {
+            reject_authority_alias(
+                &self.authority_descriptor_path,
+                portable_root,
+                "runtime_launch.portable_root",
+            )?;
+        }
         for (arguments, field) in [
             (&self.kernel_arguments, "runtime_launch.kernel_arguments"),
             (
@@ -1074,6 +1155,11 @@ impl CandidateManifest {
                 reason: "authority descriptor must be distinct from Store descriptors".to_owned(),
             });
         }
+        reject_authority_alias(
+            &self.runtime_launch.authority_descriptor_path,
+            &self.kernel_executable_path,
+            "manifest.kernel_executable_path",
+        )?;
         if self.runtime_launch.canonical_store_executable_path
             != self.canonical_store_executable_path
         {
@@ -1172,6 +1258,13 @@ const REGISTRY_TABLE: TableDefinition<&str, &[u8]> =
     TableDefinition::new("eliot_approved_generations_v1");
 const REGISTRY_RELATIVE_PATH: &str = "Eliot/host/installation-registry.redb";
 
+fn decode_registry_bytes(bytes: &[u8]) -> Result<ApprovedGenerationRegistry, InstallationError> {
+    serde_json::from_slice(bytes).map_err(|_| InstallationError::MigrationRequired {
+        reason: "approved-generation registry requires re-stage; legacy launch fields cannot be synthesized"
+            .to_owned(),
+    })
+}
+
 /// Durable redb owner for approved generations and LKG activation state.
 pub struct RedbInstallationRegistry {
     database: Database,
@@ -1221,8 +1314,7 @@ impl RedbInstallationRegistry {
         else {
             return Ok(ApprovedGenerationRegistry::new());
         };
-        let registry: ApprovedGenerationRegistry = serde_json::from_slice(value.value())
-            .map_err(|error| InstallationError::Platform(error.to_string()))?;
+        let registry = decode_registry_bytes(value.value())?;
         // A durable registry is an authority projection, not an opaque cache.
         // Never allow malformed or contradictory bytes to become an empty or
         // partially trusted activation decision.
@@ -1574,6 +1666,11 @@ impl InstallationTransaction {
         installation_epoch.validate()?;
         request.validate()?;
         candidate_manifest.validate()?;
+        if candidate_manifest.runtime_launch.profile != profile {
+            return Err(InstallationError::ProfileViolation(
+                "transaction profile must equal the candidate runtime launch profile".to_owned(),
+            ));
+        }
         if candidate_manifest.runtime_launch.installation_epoch != installation_epoch {
             return Err(InstallationError::InvalidField {
                 field: "candidate_manifest.runtime_launch.installation_epoch".to_owned(),
@@ -1636,6 +1733,11 @@ impl InstallationTransaction {
         self.installation_epoch.validate()?;
         self.request.validate()?;
         self.candidate_manifest.validate()?;
+        if self.profile != self.candidate_manifest.runtime_launch.profile {
+            return Err(InstallationError::ProfileViolation(
+                "transaction profile must equal the candidate runtime launch profile".to_owned(),
+            ));
+        }
         if self.candidate_manifest.runtime_launch.installation_epoch != self.installation_epoch {
             return Err(InstallationError::InvalidField {
                 field: "candidate_manifest.runtime_launch.installation_epoch".to_owned(),
@@ -2163,6 +2265,8 @@ mod tests {
                         test_path(&root, "portable"),
                         test_handle("--store-bootstrap"),
                         test_path(&root, "store-bootstrap.json"),
+                        test_handle("--store-bootstrap-sha256"),
+                        test_handle("6".repeat(64)),
                         test_handle("--authority-descriptor"),
                         test_path(&root, "authority.json"),
                         test_handle("--authority-descriptor-sha256"),
@@ -2280,6 +2384,8 @@ mod tests {
                 descriptor.kernel_work_root.as_str(),
                 "--store-bootstrap",
                 descriptor.store_bootstrap_descriptor_path.as_str(),
+                "--store-bootstrap-sha256",
+                descriptor.store_bootstrap_descriptor_digest.as_str(),
                 "--authority-descriptor",
                 descriptor.authority_descriptor_path.as_str(),
                 "--authority-descriptor-sha256",
@@ -2325,8 +2431,35 @@ mod tests {
         assert!(uppercase_authority_digest.validate().is_err());
 
         let mut missing_authority = descriptor.clone();
-        missing_authority.kernel_arguments.truncate(6);
+        missing_authority.kernel_arguments.truncate(4);
         assert!(missing_authority.validate_for_config(config).is_err());
+
+        let mut missing_store_digest = descriptor.clone();
+        missing_store_digest.kernel_arguments.remove(4);
+        missing_store_digest.kernel_arguments.remove(4);
+        assert!(missing_store_digest.validate_for_config(config).is_err());
+
+        let mut substituted_store_digest = descriptor.clone();
+        substituted_store_digest.kernel_arguments[5] = test_handle("9".repeat(64));
+        assert!(
+            substituted_store_digest
+                .validate_for_config(config)
+                .is_err()
+        );
+
+        let mut duplicate_store_flag = descriptor.clone();
+        duplicate_store_flag
+            .kernel_arguments
+            .insert(4, test_handle("--store-bootstrap"));
+        assert!(duplicate_store_flag.validate_for_config(config).is_err());
+
+        let mut unknown_store_flag = descriptor.clone();
+        unknown_store_flag.kernel_arguments[4] = test_handle("--unknown-store");
+        assert!(unknown_store_flag.validate_for_config(config).is_err());
+
+        let mut wrong_store_order = descriptor.clone();
+        wrong_store_order.kernel_arguments.swap(4, 6);
+        assert!(wrong_store_order.validate_for_config(config).is_err());
 
         let mut duplicate_authority = descriptor.clone();
         duplicate_authority
@@ -2339,13 +2472,17 @@ mod tests {
         assert!(unknown_authority.validate_for_config(config).is_err());
 
         let mut wrong_authority_order = descriptor.clone();
-        wrong_authority_order.kernel_arguments.swap(4, 6);
+        wrong_authority_order.kernel_arguments.swap(6, 8);
         assert!(wrong_authority_order.validate_for_config(config).is_err());
     }
 
     #[test]
     fn runtime_launch_digest_covers_store_and_authority_inputs() {
         let descriptor = registering_transaction().candidate_manifest.runtime_launch;
+        assert_eq!(
+            descriptor.descriptor_digest.as_str(),
+            "10aece7fcb9a1af26e5c8793d4a0bc5bc913fafc00c45218e95e5bdf2651096f"
+        );
         let original = descriptor.descriptor_digest.clone();
 
         let mut store_path = descriptor.clone();
@@ -2388,6 +2525,130 @@ mod tests {
             .installation_epoch
             .sequence = 2;
         assert!(wrong_installation.validate().is_err());
+
+        let mut wrong_profile = registering_transaction();
+        wrong_profile.profile = InstallationProfile::SystemService;
+        assert!(wrong_profile.validate().is_err());
+
+        let transaction = registering_transaction();
+        let result = InstallationTransaction::new(
+            transaction.transaction_id.clone(),
+            transaction.installation_epoch.clone(),
+            InstallationProfile::SystemService,
+            transaction.request.clone(),
+            transaction.current_active_manifest.clone(),
+            transaction.candidate_manifest.clone(),
+            transaction.staging_root.clone(),
+            transaction.planned_changes.clone(),
+            transaction.precondition_evidence.clone(),
+            transaction.recovery_command.clone(),
+        );
+        assert!(result.is_err());
+    }
+
+    fn authority_alias(path: &PlatformHandle) -> PlatformHandle {
+        let path = Path::new(path.as_str());
+        let parent = match path.parent() {
+            Some(parent) => parent,
+            None => panic!("fixture path parent"),
+        }
+        .to_string_lossy()
+        .replace('\\', "/")
+        .to_ascii_uppercase();
+        let file = match path.file_name() {
+            Some(file) => file,
+            None => panic!("fixture path file"),
+        }
+        .to_string_lossy()
+        .to_ascii_uppercase();
+        test_handle(format!("{parent}/./{file}/"))
+    }
+
+    fn reseal(descriptor: &mut RuntimeLaunchDescriptor) {
+        descriptor.descriptor_digest = test_handle(sha256_hex(&must(descriptor.unsigned_bytes())));
+    }
+
+    #[test]
+    fn authority_path_rejects_windows_lexical_aliases_without_rejecting_prefixes() {
+        let transaction = registering_transaction();
+        let mut manifest = transaction.candidate_manifest;
+        let config = manifest.config_path.clone();
+        manifest.runtime_launch.authority_descriptor_path = authority_alias(&config);
+        reseal(&mut manifest.runtime_launch);
+        assert!(manifest.validate().is_err());
+
+        let mut prefix = registering_transaction().candidate_manifest.runtime_launch;
+        let root = Path::new(prefix.authority_descriptor_path.as_str());
+        prefix.authority_descriptor_path = test_handle(
+            match root.parent() {
+                Some(parent) => parent.join("generation.jsonx"),
+                None => panic!("authority parent"),
+            }
+            .to_string_lossy()
+            .into_owned(),
+        );
+        reseal(&mut prefix);
+        assert!(prefix.validate().is_ok());
+
+        let valid = registering_transaction().candidate_manifest.runtime_launch;
+        assert_eq!(valid.portable_root.as_ref(), Some(&valid.kernel_work_root));
+        assert!(valid.validate().is_ok());
+    }
+
+    #[test]
+    fn existing_redb_v1_record_requires_migration_instead_of_becoming_empty() {
+        let transaction = registering_transaction();
+        let generation = transaction.candidate_manifest.generation.clone();
+        let registry = ApprovedGenerationRegistry {
+            generations: vec![ApprovedGeneration {
+                manifest: transaction.candidate_manifest,
+                approval_ref: test_handle("approval:legacy"),
+                active: true,
+                last_known_good: false,
+            }],
+            active_generation: Some(generation),
+            last_known_good_generation: None,
+        };
+        let mut legacy = must(serde_json::to_value(registry));
+        let Some(runtime) = legacy["generations"][0]["manifest"]["runtime_launch"].as_object_mut()
+        else {
+            panic!("legacy fixture runtime launch");
+        };
+        for field in [
+            "installation_epoch",
+            "generation",
+            "authority_generation",
+            "authority_state_fence",
+            "authority_descriptor_path",
+            "authority_descriptor_digest",
+        ] {
+            runtime.remove(field);
+        }
+        let legacy_bytes = must(serde_json::to_vec(&legacy));
+
+        let path = std::env::temp_dir().join(format!(
+            "eliot-installation-legacy-registry-{}.redb",
+            std::process::id()
+        ));
+        let database = must(Database::create(&path));
+        let write = must(database.begin_write());
+        {
+            let mut table = must(write.open_table(REGISTRY_TABLE));
+            must(table.insert("registry", legacy_bytes.as_slice()));
+        }
+        must(write.commit());
+        let read = must(database.begin_read());
+        let table = must(read.open_table(REGISTRY_TABLE));
+        let Some(value) = must(table.get("registry")) else {
+            panic!("legacy registry fixture record");
+        };
+        let Err(error) = decode_registry_bytes(value.value()) else {
+            panic!("migration must be required");
+        };
+        assert!(matches!(error, InstallationError::MigrationRequired { .. }));
+        drop(read);
+        drop(database);
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]

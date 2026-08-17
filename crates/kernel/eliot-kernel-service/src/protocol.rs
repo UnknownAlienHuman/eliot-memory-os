@@ -1,8 +1,6 @@
 //! Host↔Kernel protocol records.
 
-use eliot_contracts::{
-    AuthorityEpoch, ResourceGeneration, StateFence, canonical_json_bytes, sha256_hex,
-};
+use eliot_contracts::{AuthorityEpoch, ResourceGeneration, StateFence, sha256_hex};
 use eliot_kernel_core::AuthoritySnapshotBindingWire;
 use eliot_platform::{PlatformHandle, PortError, SecretReference};
 use eliot_process::{
@@ -54,7 +52,7 @@ impl ProcessAuthorityHandoffDescriptor {
     pub fn canonical_unsigned_bytes(&self) -> Result<Vec<u8>, KernelServiceError> {
         let mut unsigned = self.clone();
         unsigned.descriptor_sha256.clear();
-        canonical_json_bytes(&unsigned).map_err(|_| KernelServiceError::InvalidField {
+        serde_json::to_vec(&unsigned).map_err(|_| KernelServiceError::InvalidField {
             field: "descriptor_sha256",
             reason: "cannot canonicalize descriptor",
         })
@@ -247,6 +245,15 @@ mod descriptor_tests {
         let round_trip: ProcessAuthorityHandoffDescriptor =
             serde_json::from_slice(&bytes).expect("round trip");
         round_trip.validate(500).expect("round trip validation");
+    }
+
+    #[test]
+    fn contract_v1_digest_preserves_legacy_json_field_order() {
+        let descriptor = descriptor();
+        assert_eq!(
+            descriptor.compute_digest().expect("legacy digest"),
+            "7df4185c6311ec6f0f9395076f8dde4c55dd0a4c0c578af23b18f3a14544b570"
+        );
     }
 
     #[test]
