@@ -551,7 +551,35 @@ impl HostJobBranches {
             .kernel
             .as_ref()
             .ok_or_else(|| HostError::ProcessContour("Kernel process is missing".to_owned()))?;
-        let process = kernel.process();
+        let process = kernel.evidence().process();
+        if !kernel
+            .job_processes()
+            .map_err(|error| HostError::ProcessContour(error.to_string()))?
+            .iter()
+            .any(|observed| observed == process)
+        {
+            return Err(HostError::ProcessContour(
+                "Job observation does not contain the exact launched Kernel process".to_owned(),
+            ));
+        }
+        match kernel
+            .observe()
+            .map_err(|error| HostError::ProcessContour(error.to_string()))?
+        {
+            eliot_platform_windows::RunningJobObservation::Running { active_processes }
+                if active_processes > 0 => {}
+            eliot_platform_windows::RunningJobObservation::Running { .. } => {
+                return Err(HostError::ProcessContour(
+                    "Kernel Job reports zero active processes".to_owned(),
+                ));
+            }
+            eliot_platform_windows::RunningJobObservation::RootExited { .. }
+            | eliot_platform_windows::RunningJobObservation::Exited { .. } => {
+                return Err(HostError::ProcessContour(
+                    "Kernel exited before authenticated control".to_owned(),
+                ));
+            }
+        }
         let expected_kernel_image = self
             .kernel_executable
             .as_ref()

@@ -245,7 +245,7 @@ pub fn control_request_frame(
 ) -> Result<Frame, TransportError> {
     request
         .validate()
-        .map_err(|error| TransportError::SessionFenced)?;
+        .map_err(|_error| TransportError::SessionFenced)?;
     let frame = Frame {
         protocol_version: ProtocolVersion::CURRENT,
         encoding_profile: EncodingProfile::JsonV1,
