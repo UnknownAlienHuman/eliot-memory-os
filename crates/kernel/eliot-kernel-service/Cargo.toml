@@ -18,6 +18,7 @@ eliot-contracts.workspace = true
 eliot-ipc.workspace = true
 eliot-kernel-core.workspace = true
 eliot-platform.workspace = true
+eliot-process.workspace = true
 eliot-receipts.workspace = true
 eliot-runtime-contracts.workspace = true
 eliot-protocol.workspace = true

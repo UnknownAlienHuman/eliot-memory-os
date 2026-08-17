@@ -13,18 +13,36 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+use std::future::Future;
+use std::pin::Pin;
+
 mod lifecycle;
 mod protocol;
 mod store_client;
 
+pub use eliot_process::ProcessExecutionAdmissionRequest;
 pub use lifecycle::{
     AdmissionLease, KernelService, KernelServiceError, KernelServiceState, ServiceFailure,
 };
 pub use protocol::{
     ContainmentAction, HostKernelHandshake, HostStoreBootstrapRequirement, KernelControlCommand,
-    KernelReadyReceipt, ProcessObservation, RestartBudget, StoreBootstrapDescriptor,
+    KernelReadyReceipt, ProcessExecutionRejection, ProcessExecutionRequest,
+    ProcessExecutionResponse, ProcessObservation, RestartBudget, StoreBootstrapDescriptor,
 };
 pub use store_client::{EbpCanonicalStoreClient, EbpStoreTransport, StoreClientError};
+
+/// Boxed future for provider-neutral Kernel process operations.
+pub type ProcessExecutionFuture<'a> =
+    Pin<Box<dyn Future<Output = ProcessExecutionResponse> + Send + 'a>>;
+
+/// Production client/port used by authenticated testd/native callers.
+///
+/// Implementations exchange only inert request and response projections. A
+/// port never receives [`eliot_process::ProcessRequest`] or a dispatch permit.
+pub trait ProcessExecutionClient: Send + Sync {
+    /// Submits one closed process operation to the Kernel front door.
+    fn execute(&self, request: ProcessExecutionRequest) -> ProcessExecutionFuture<'_>;
+}
 
 use eliot_contracts::{
     ContractIdentity, ContractVersion, contract_identity as make_contract_identity,

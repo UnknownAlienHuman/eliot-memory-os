@@ -37,7 +37,8 @@ pub use authority::{
 };
 pub use authority_controller::{
     AuthoritySnapshotBinding, DispatchSnapshotCodec, ProcessDispatchAuthorityController,
-    SealedAuthoritySnapshot,
+    ProcessExecutionReplayBegin, ProcessExecutionReplayRecord, ProcessExecutionReplayState,
+    ProcessExecutionReplayStore, SealedAuthoritySnapshot, process_admission_digest,
 };
 pub use error::{KernelError, KernelResult};
 pub use module::control_reserve_front_door::{

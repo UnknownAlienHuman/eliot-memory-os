@@ -2,6 +2,10 @@
 
 use eliot_contracts::{AuthorityEpoch, ResourceGeneration, StateFence};
 use eliot_platform::{PlatformHandle, PortError};
+use eliot_process::{
+    CancellationReceipt, OperationId, ProcessEvidence, ProcessExecutionAdmissionRequest,
+    ProcessExecutionError, ProcessExecutionView, ProcessStartReceipt,
+};
 use eliot_runtime_contracts::{HealthVector, ServiceProcessState};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -46,6 +50,106 @@ pub struct HostStoreBootstrapRequirement {
 
 /// Store-neutral name for the Host handoff descriptor.
 pub type StoreBootstrapDescriptor = HostStoreBootstrapRequirement;
+
+/// Closed Kernel process-execution operation set for authenticated clients.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, tag = "operation", content = "payload")]
+#[allow(clippy::large_enum_variant)]
+pub enum ProcessExecutionRequest {
+    /// Admit and start one exact process intent.
+    Start(ProcessExecutionAdmissionRequest),
+    /// Inspect one admitted operation.
+    Inspect {
+        /// Exact operation identity to inspect.
+        operation_id: OperationId,
+    },
+    /// Cancel one admitted operation.
+    Cancel {
+        /// Exact operation identity to cancel.
+        operation_id: OperationId,
+    },
+    /// Reconcile one operation after an unknown delivery/result boundary.
+    Reconcile {
+        /// Exact operation identity to reconcile.
+        operation_id: OperationId,
+    },
+}
+
+impl ProcessExecutionRequest {
+    /// Validates the closed operation payload.
+    pub fn validate(&self) -> Result<(), KernelServiceError> {
+        match self {
+            Self::Start(request) => request
+                .validate()
+                .map_err(|error| KernelServiceError::Platform(error.to_string())),
+            Self::Inspect { operation_id }
+            | Self::Cancel { operation_id }
+            | Self::Reconcile { operation_id } => {
+                if operation_id.as_str().trim().is_empty() {
+                    return Err(KernelServiceError::InvalidField {
+                        field: "operation_id",
+                        reason: "must be non-blank",
+                    });
+                }
+                Ok(())
+            }
+        }
+    }
+
+    /// Returns the exact operation identity when one is present.
+    pub fn operation_id(&self) -> Option<&OperationId> {
+        match self {
+            Self::Start(request) => Some(request.intent().operation_id()),
+            Self::Inspect { operation_id }
+            | Self::Cancel { operation_id }
+            | Self::Reconcile { operation_id } => Some(operation_id),
+        }
+    }
+}
+
+/// Provider-neutral response projection; no child handle or permit crosses
+/// the Kernel front door.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, tag = "result", content = "payload")]
+pub enum ProcessExecutionResponse {
+    /// Exact receipt after a child was admitted and resumed.
+    Started(ProcessStartReceipt),
+    /// Current non-authoritative operation projection.
+    Status(ProcessExecutionView),
+    /// Exact cancellation projection.
+    Cancelled(CancellationReceipt),
+    /// Observation-only reconciliation evidence.
+    Reconciled(ProcessEvidence),
+    /// Bounded provider-neutral rejection.
+    Rejected(ProcessExecutionRejection),
+}
+
+/// Stable error projection for cross-process callers.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProcessExecutionRejection {
+    /// Stable category, never a raw child/provider error.
+    pub code: String,
+    /// Bounded diagnostic detail.
+    pub detail: String,
+}
+
+impl ProcessExecutionRejection {
+    /// Converts a process execution error into a bounded transport projection.
+    pub fn from_error(error: &ProcessExecutionError) -> Self {
+        Self {
+            code: match error {
+                ProcessExecutionError::UnknownOutcome => "UNKNOWN_OUTCOME",
+                ProcessExecutionError::NotFound => "NOT_FOUND",
+                ProcessExecutionError::Contract(_) => "CONTRACT_REJECTED",
+                ProcessExecutionError::Unavailable(_) => "UNAVAILABLE",
+                ProcessExecutionError::EvidenceSink(_) => "EVIDENCE_REJECTED",
+            }
+            .to_owned(),
+            detail: error.to_string().chars().take(512).collect(),
+        }
+    }
+}
 
 impl HostStoreBootstrapRequirement {
     /// Validates the complete Host-approved store binding.

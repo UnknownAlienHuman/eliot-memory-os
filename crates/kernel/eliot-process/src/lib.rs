@@ -555,6 +555,97 @@ impl ProcessIntent {
     }
 }
 
+/// Inert cross-process request accepted by the Kernel execution front door.
+///
+/// This is deliberately not a [`ProcessRequest`]: it carries no permit and
+/// cannot grant execution authority. Kernel validates the exact caller/fence,
+/// creates the one-shot permit and immediately moves the unique request into
+/// the sole [`ProcessExecutor`].
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProcessExecutionAdmissionRequest {
+    recipient_module_id: String,
+    intent: ProcessIntent,
+    action_lease_ref: ActionLeaseRef,
+    state_fence: FencingToken,
+    expected_revision_heads: BTreeMap<String, String>,
+    deadline_unix_ms: u64,
+}
+
+impl ProcessExecutionAdmissionRequest {
+    /// Creates an inert, bounded admission request.
+    pub fn new(
+        recipient_module_id: impl Into<String>,
+        intent: ProcessIntent,
+        action_lease_ref: ActionLeaseRef,
+        state_fence: FencingToken,
+        expected_revision_heads: BTreeMap<String, String>,
+        deadline_unix_ms: u64,
+    ) -> Result<Self, ContractError> {
+        let request = Self {
+            recipient_module_id: validate_opaque_id(
+                "recipient_module_id",
+                recipient_module_id.into(),
+            )?,
+            intent,
+            action_lease_ref,
+            state_fence,
+            expected_revision_heads,
+            deadline_unix_ms,
+        };
+        request.validate()?;
+        Ok(request)
+    }
+
+    /// Validates the inert request without issuing authority.
+    pub fn validate(&self) -> Result<(), ContractError> {
+        validate_opaque_id("recipient_module_id", self.recipient_module_id.clone())?;
+        self.intent.validate()?;
+        self.action_lease_ref.validate()?;
+        if self.state_fence.generation != self.intent.generation {
+            return Err(ContractError::FenceMismatch);
+        }
+        validate_revision_heads(&self.expected_revision_heads)?;
+        if self.deadline_unix_ms == 0 {
+            return Err(ContractError::InvalidValue {
+                field: "deadline_unix_ms",
+                reason: "must be non-zero",
+            });
+        }
+        Ok(())
+    }
+
+    /// Returns the authenticated recipient module identity.
+    pub fn recipient_module_id(&self) -> &str {
+        &self.recipient_module_id
+    }
+
+    /// Returns the immutable intent.
+    pub const fn intent(&self) -> &ProcessIntent {
+        &self.intent
+    }
+
+    /// Returns the Kernel-visible lease reference.
+    pub const fn action_lease_ref(&self) -> &ActionLeaseRef {
+        &self.action_lease_ref
+    }
+
+    /// Returns the requested state fence.
+    pub const fn state_fence(&self) -> &FencingToken {
+        &self.state_fence
+    }
+
+    /// Returns expected ordering/revision heads.
+    pub const fn expected_revision_heads(&self) -> &BTreeMap<String, String> {
+        &self.expected_revision_heads
+    }
+
+    /// Returns the absolute deadline.
+    pub const fn deadline_unix_ms(&self) -> u64 {
+        self.deadline_unix_ms
+    }
+}
+
 /// Freshness, lease, fence, and revision material supplied by Kernel at issue time.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PermitIssuance {
@@ -1140,6 +1231,12 @@ impl ProcessRequest {
     /// Returns the authenticated fence.
     pub const fn fence(&self) -> &FencingToken {
         &self.permit.state_fence
+    }
+
+    /// Returns the authenticated ordering/revision heads without exposing
+    /// dispatch authority material.
+    pub const fn expected_revision_heads(&self) -> &BTreeMap<String, String> {
+        &self.permit.expected_revision_heads
     }
 }
 
@@ -2762,6 +2859,40 @@ mod tests {
         let validated =
             authority.validate_and_consume(request, observed(&intent)?, &context(150)?)?;
         Ok((authority, validated))
+    }
+
+    #[test]
+    fn cross_process_admission_round_trips_without_dispatch_authority() -> TestResult {
+        let request = ProcessExecutionAdmissionRequest::new(
+            "eliotd",
+            intent()?,
+            ActionLeaseRef::new("lease-1")?,
+            fence()?,
+            revisions(),
+            200,
+        )?;
+        let wire = serde_json::to_vec(&request)?;
+        let restored: ProcessExecutionAdmissionRequest = serde_json::from_slice(&wire)?;
+        assert_eq!(request, restored);
+        assert_eq!(restored.recipient_module_id(), "eliotd");
+        Ok(())
+    }
+
+    #[test]
+    fn cross_process_admission_rejects_stale_generation_fence() -> TestResult {
+        let stale = FencingToken::new(7, Generation::new(2)?, "fence-7-2")?;
+        let Err(error) = ProcessExecutionAdmissionRequest::new(
+            "eliotd",
+            intent()?,
+            ActionLeaseRef::new("lease-1")?,
+            stale,
+            revisions(),
+            200,
+        ) else {
+            return Err("a generation-substituted fence must fail closed".into());
+        };
+        assert_eq!(error, ContractError::FenceMismatch);
+        Ok(())
     }
 
     fn running_state() -> Result<ProcessState, ContractError> {

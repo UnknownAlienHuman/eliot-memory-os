@@ -222,6 +222,17 @@ async fn serve_connection(
                     return Err(error);
                 }
             }
+            KernelFrameAction::Process {
+                request_id,
+                request,
+            } => {
+                let response = kernel.execute_process_request(request).await;
+                let reply = kernel.process_response_frame(&session, request_id, &response)?;
+                if let Err(error) = send_checked(&mut front_door, &reply, limits).await {
+                    session.fence();
+                    return Err(error);
+                }
+            }
             KernelFrameAction::Fence(rejection) => {
                 let result = send_checked(&mut front_door, &rejection, limits).await;
                 session.fence();

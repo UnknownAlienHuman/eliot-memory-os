@@ -20,11 +20,77 @@ use eliot_ors::{
 use eliot_platform::SecretReference;
 use eliot_process::{
     DispatchAuthorityId, DispatchPermit, DispatchPermitAuthority, DispatchPermitReplaySnapshot,
-    DispatchValidationContext, KernelDispatchKey, PermitIssuance, ProcessIntent, ProcessRequest,
-    RecoveryCapability, SuspendedProcessIdentity, ValidatedDispatch,
+    DispatchValidationContext, KernelDispatchKey, PermitIssuance, ProcessExecutionAdmissionRequest,
+    ProcessIntent, ProcessRequest, ProcessStartReceipt, RecoveryCapability,
+    SuspendedProcessIdentity, ValidatedDispatch,
 };
 
 use crate::error::{KernelError, KernelResult};
+
+/// Durable replay projection for one admitted process start.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProcessExecutionReplayRecord {
+    /// Canonical digest of the inert admission request.
+    pub admission_digest: String,
+    /// Durable operation disposition.
+    pub state: ProcessExecutionReplayState,
+    /// Exact start receipt returned after resume, when completion is proven.
+    pub receipt: Option<ProcessStartReceipt>,
+}
+
+/// Durable one-shot start disposition.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProcessExecutionReplayState {
+    /// Reservation was durably acquired before any child effect.
+    Reserved,
+    /// Child start and receipt persistence are proven.
+    Completed,
+    /// Delivery/effect outcome is unknown and must reconcile by operation id.
+    Unknown,
+}
+
+/// Result of the atomic durable start reservation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[allow(clippy::large_enum_variant)]
+pub enum ProcessExecutionReplayBegin {
+    /// This caller owns the only reservation for a new operation.
+    Acquired,
+    /// An earlier reservation or completion already exists.
+    Existing(ProcessExecutionReplayRecord),
+}
+
+/// External durable store for process start replay projections.
+///
+/// Kernel requires this binding for production execution. There is no default
+/// in-memory implementation, because replay safety must survive caller and
+/// Kernel restart.
+pub trait ProcessExecutionReplayStore: Send + Sync {
+    /// Atomically reserves an operation before any process effect.
+    fn begin_process_start(
+        &self,
+        operation_id: &eliot_process::OperationId,
+        admission_digest: &str,
+    ) -> KernelResult<ProcessExecutionReplayBegin>;
+
+    /// Persists the projection at the one-shot start linearization point.
+    fn persist_process_start(
+        &self,
+        operation_id: &eliot_process::OperationId,
+        record: ProcessExecutionReplayRecord,
+    ) -> KernelResult<()>;
+}
+
+/// Computes the canonical replay identity for an inert admission request.
+pub fn process_admission_digest(
+    request: &ProcessExecutionAdmissionRequest,
+) -> KernelResult<String> {
+    let bytes = serde_json::to_vec(request).map_err(|error| {
+        KernelError::DependencyUnavailable(format!(
+            "process admission digest serialization: {error}"
+        ))
+    })?;
+    Ok(blake3::hash(&bytes).to_hex().to_string())
+}
 
 /// Exact ORS metadata required to bind one process-authority replay snapshot.
 ///
