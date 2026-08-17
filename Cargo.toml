@@ -255,6 +255,7 @@ eliot-research-exchange-api = { path = "crates/research/eliot-research-exchange-
 eliot-researcher = { path = "crates/research/eliot-researcher", version = "0.1.0" }
 futures-util = { version = "0.3.32", features = ["sink"] }
 wasmtime = { version = "=47.0.0", default-features = false, features = ["component-model", "cranelift", "runtime", "std"] }
+wat = "1.256.0"
 jsonc-parser = { version = "0.33.0", features = ["cst", "serde_json"] }
 redb = "4.1.0"
 schemars = { version = "1.2.1", features = ["derive", "uuid1"] }

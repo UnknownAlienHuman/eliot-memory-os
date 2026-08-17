@@ -700,12 +700,28 @@ fn report_contract_valid(invocation: &EngineInvocation, report: &EngineReport) -
         && report.usage.output_bytes <= limits.max_output_bytes
         && report.usage.host_calls <= limits.max_host_calls
         && report.usage.fuel_consumed <= limits.max_fuel
-        && report.usage.peak_memory_bytes <= limits.max_memory_bytes
-        && report.usage.table_elements <= limits.max_table_elements
+        && report
+            .usage
+            .peak_memory_bytes
+            .is_none_or(|value| value <= limits.max_memory_bytes)
+        && report
+            .usage
+            .table_elements
+            .is_none_or(|value| value <= limits.max_table_elements)
         && report.usage.instances <= limits.max_instances
-        && report.usage.stack_bytes <= limits.max_stack_bytes
-        && report.usage.elapsed_ms <= limits.wall_deadline_ms
-        && report.usage.epoch_ticks <= limits.epoch.deadline_ticks
+        && report
+            .usage
+            .stack_bytes
+            .is_none_or(|value| value <= limits.max_stack_bytes)
+        && (report.usage.elapsed_ms <= limits.wall_deadline_ms
+            || matches!(
+                report.termination,
+                EngineTermination::Deadline | EngineTermination::EpochDeadline
+            ))
+        && report
+            .usage
+            .epoch_ticks
+            .is_none_or(|value| value <= limits.epoch.deadline_ticks)
         && report.usage.artifact_reads <= limits.artifact_access.max_reads
         && report.usage.artifact_bytes <= limits.artifact_access.max_bytes
         && u32::try_from(report.host_calls.len()).ok() == Some(report.usage.host_calls)
@@ -726,6 +742,11 @@ fn report_contract_valid(invocation: &EngineInvocation, report: &EngineReport) -
             .all(|digest| limits.artifact_access.allowed_digests.contains(digest))
         && (!matches!(invocation.contour, crate::ExecutionContour::Shadow)
             || report.proposed_effects.is_empty())
+        && (!matches!(report.termination, EngineTermination::Completed)
+            || (report.usage.peak_memory_bytes.is_some()
+                && report.usage.table_elements.is_some()
+                && report.usage.stack_bytes.is_some()
+                && report.usage.epoch_ticks.is_some()))
 }
 
 fn derive_execution(report: &EngineReport) -> Result<DerivedExecutionEvidence, RuntimeError> {

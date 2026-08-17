@@ -83,7 +83,7 @@ impl Sha256Digest {
         Ok(Self(value))
     }
 
-    pub(crate) fn of_bytes(bytes: &[u8]) -> Self {
+    pub fn of_bytes(bytes: &[u8]) -> Self {
         Self(format!("{:x}", Sha256::digest(bytes)))
     }
 
@@ -554,12 +554,12 @@ pub struct EngineUsage {
     pub output_bytes: u64,
     pub host_calls: u32,
     pub fuel_consumed: u64,
-    pub peak_memory_bytes: u64,
-    pub table_elements: u32,
+    pub peak_memory_bytes: Option<u64>,
+    pub table_elements: Option<u32>,
     pub instances: u32,
-    pub stack_bytes: u64,
+    pub stack_bytes: Option<u64>,
     pub elapsed_ms: u64,
-    pub epoch_ticks: u64,
+    pub epoch_ticks: Option<u64>,
     pub artifact_reads: u32,
     pub artifact_bytes: u64,
     pub accessed_artifact_digests: Vec<Sha256Digest>,
