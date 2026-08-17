@@ -2677,6 +2677,26 @@ mod tests {
         let missing =
             authority_descriptor(&format!("{suffix}-missing"), "windows-credential-manager");
         let (missing_path, missing_digest) = write_authority_descriptor(&root, "missing", &missing);
+        let mismatch_digest = "0".repeat(64);
+        let mismatch_handoff_id =
+            OperationIdentity::new(missing.handoff_id.as_str()).expect("handoff id");
+        assert_ne!(missing_digest, mismatch_digest);
+        assert!(matches!(
+            kernel.prepare_authority_descriptor(
+                &missing_path,
+                &mismatch_digest,
+                AuthorityDescriptorContour::PortableCurrentUser { root: root.clone() },
+            ),
+            Err(AuthorityPreparationError::DigestMismatch)
+        ));
+        assert!(
+            kernel
+                .generation_gateway
+                .ors
+                .load_authority_handoff(&mismatch_handoff_id)
+                .expect("digest mismatch lookup")
+                .is_none()
+        );
         assert!(matches!(
             kernel.prepare_authority_descriptor(
                 &missing_path,
