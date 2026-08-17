@@ -2953,23 +2953,24 @@ impl KernelComposition {
         {
             return Err(TransportError::SessionFenced);
         }
-        let policy = self
-            .front_door_policy
-            .lock()
-            .map_err(|_| TransportError::SessionFenced)?;
-        if request.generation != policy.module_generation.generation
-            || request.handshake.kernel_epoch
-                != policy.module_generation.state_fence.authority_epoch
-            || request.handshake.artifact_hash.as_str()
-                != policy.module_generation.artifact_id.as_str()
-            || self
-                .approved_config_hash
-                .as_deref()
-                .is_some_and(|hash| hash != request.handshake.config_hash.as_str())
         {
-            return Err(TransportError::SessionFenced);
+            let policy = self
+                .front_door_policy
+                .lock()
+                .map_err(|_| TransportError::SessionFenced)?;
+            if request.generation != policy.module_generation.generation
+                || request.handshake.kernel_epoch
+                    != policy.module_generation.state_fence.authority_epoch
+                || request.handshake.artifact_hash.as_str()
+                    != policy.module_generation.artifact_id.as_str()
+                || self
+                    .approved_config_hash
+                    .as_deref()
+                    .is_some_and(|hash| hash != request.handshake.config_hash.as_str())
+            {
+                return Err(TransportError::SessionFenced);
+            }
         }
-        drop(policy);
         if let KernelControlCommand::Reconcile(handshake) = &request.command
             && handshake != &request.handshake
         {
