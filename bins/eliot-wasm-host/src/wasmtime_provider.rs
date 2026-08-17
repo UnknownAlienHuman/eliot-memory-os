@@ -18,8 +18,9 @@ const WIT_WORLD: &str = "eliot:wasm/guest";
 const RUN_EXPORT: &str = "run";
 const MAX_EFFECTIVE_EPOCH_DEADLINE: u64 = 1024;
 const PROVIDER_STACK_SIZE: usize = 8 * 1024;
-const CONFIGURATION_DESCRIPTOR: &[u8] =
-    b"wasmtime=47.0.0;component_model=true;fuel=true;epoch_interruption=true;stack=8192;typed_abi=guest.run";
+#[cfg(test)]
+const COMPONENT_CONFIGURATION: &[u8] =
+    b"component=guest;world=eliot:wasm/guest;export=run;imports=closed";
 
 wasmtime::component::bindgen!({
     path: "wit/guest.wit",
@@ -75,15 +76,22 @@ impl ResourceLimiter for StoreState {
         }
         Ok(allowed)
     }
+
+    fn instances(&self) -> usize {
+        self.limits.instances()
+    }
 }
 
 /// Concrete typed Wasmtime Component Model provider for one admitted artifact.
 /// The linker is deliberately empty: this world has no host imports or WASI.
 pub struct WasmtimeComponentEngine {
-    engine: Engine,
-    component: Component,
+    epoch_engine: Engine,
+    epoch_component: Component,
+    fuel_engine: Engine,
+    fuel_component: Component,
     binding: EngineBinding,
     artifact_digest: Sha256Digest,
+    component_configuration_digest: Sha256Digest,
     artifact_bytes: u64,
 }
 
@@ -112,6 +120,8 @@ pub enum WasmtimeBuildError {
     WitDigestMismatch,
     #[error("engine configuration digest does not match provider settings")]
     ConfigurationDigestMismatch,
+    #[error("component configuration digest does not match supplied bytes")]
+    ComponentConfigurationDigestMismatch,
 }
 
 impl WasmtimeComponentEngine {
@@ -120,6 +130,7 @@ impl WasmtimeComponentEngine {
         binding: EngineBinding,
         artifact_digest: Sha256Digest,
         artifact: &[u8],
+        component_configuration: &[u8],
     ) -> Result<Self, WasmtimeBuildError> {
         if binding.implementation_id != "wasmtime-component"
             || binding.exact_version != WASMTIME_VERSION
@@ -137,17 +148,21 @@ impl WasmtimeComponentEngine {
         if binding.engine_configuration_digest != configuration_digest() {
             return Err(WasmtimeBuildError::ConfigurationDigestMismatch);
         }
-        let mut config = Config::new();
-        config.wasm_component_model(true);
-        config.consume_fuel(true);
-        config.epoch_interruption(true);
-        let engine = Engine::new(&config).map_err(WasmtimeBuildError::Config)?;
-        let component = Component::new(&engine, artifact).map_err(WasmtimeBuildError::Compile)?;
+        let component_configuration_digest = Sha256Digest::of_bytes(component_configuration);
+        let epoch_engine = configured_engine(false)?;
+        let fuel_engine = configured_engine(true)?;
+        let epoch_component =
+            Component::new(&epoch_engine, artifact).map_err(WasmtimeBuildError::Compile)?;
+        let fuel_component =
+            Component::new(&fuel_engine, artifact).map_err(WasmtimeBuildError::Compile)?;
         Ok(Self {
-            engine,
-            component,
+            epoch_engine,
+            epoch_component,
+            fuel_engine,
+            fuel_component,
             binding,
             artifact_digest,
+            component_configuration_digest,
             artifact_bytes: artifact.len() as u64,
         })
     }
@@ -160,18 +175,14 @@ impl WasmtimeComponentEngine {
         input: &[u8],
         post_commit_known: bool,
     ) -> EngineReport {
-        if limits.max_instances < 2 {
-            return instance_limit_report(
-                request_digest,
-                &self.artifact_digest,
-                self.artifact_bytes,
-            );
-        }
-        if usize::try_from(limits.max_stack_bytes).ok() != Some(PROVIDER_STACK_SIZE) {
-            return host_contract_report(request_digest, self.artifact_bytes);
-        }
-        let invocation_engine = &self.engine;
-        let component = &self.component;
+        let (invocation_engine, component) = match limits.epoch.cancellation {
+            eliot_wasm_runtime::CancellationPolicy::EpochInterruption => {
+                (&self.epoch_engine, &self.epoch_component)
+            }
+            eliot_wasm_runtime::CancellationPolicy::EpochAndFuel => {
+                (&self.fuel_engine, &self.fuel_component)
+            }
+        };
         let start = Instant::now();
         let mut store = Store::new(
             invocation_engine,
@@ -190,11 +201,10 @@ impl WasmtimeComponentEngine {
         );
         store.limiter(|state| state);
         let mut instances = 0;
-        let fuel_for_invocation = match limits.epoch.cancellation {
-            eliot_wasm_runtime::CancellationPolicy::EpochAndFuel => limits.max_fuel,
-            eliot_wasm_runtime::CancellationPolicy::EpochInterruption => u64::MAX,
-        };
-        let fuel_set = store.set_fuel(fuel_for_invocation).is_ok();
+        let fuel_set = matches!(
+            limits.epoch.cancellation,
+            eliot_wasm_runtime::CancellationPolicy::EpochAndFuel
+        ) && store.set_fuel(limits.max_fuel).is_ok();
         let wall_ticks = limits.wall_deadline_ms;
         let effective_epoch_deadline = limits
             .epoch
@@ -250,7 +260,7 @@ impl WasmtimeComponentEngine {
                     let termination = match store.data().limit_hit {
                         Some(ResourceLimitHit::Memory) => EngineTermination::MemoryLimit,
                         Some(ResourceLimitHit::Table) => EngineTermination::TableLimit,
-                        None if limits.max_instances < 2 => EngineTermination::InstanceLimit,
+                        None if is_instance_limit_error(&error) => EngineTermination::InstanceLimit,
                         None => classify_trap(&error),
                     };
                     (termination, Vec::new(), 0)
@@ -308,8 +318,6 @@ impl WasmtimeComponentEngine {
             host_calls: Vec::new(),
             proposed_effects: Vec::new(),
             observed_state_delta: Vec::new(),
-            // Joining the watchdog proves only watchdog lifecycle, not P-03 reap.
-            reaped: false,
             post_commit_known: epoch_joined
                 && post_commit_known
                 && !matches!(
@@ -338,6 +346,8 @@ impl ComponentEnginePort for WasmtimeComponentEngine {
                 .contains(&self.artifact_digest)
             || manifest.artifact_digest != self.artifact_digest
             || manifest.engine != self.binding
+            || manifest.configuration_digest != self.component_configuration_digest
+            || usize::try_from(invocation.limits.max_stack_bytes).ok() != Some(PROVIDER_STACK_SIZE)
             || manifest.world.as_str() != WIT_WORLD
             || manifest.wit_version != WIT_VERSION
             || !manifest.imports.is_empty()
@@ -371,70 +381,26 @@ fn classify_trap(error: &wasmtime::Error) -> EngineTermination {
     }
 }
 
-fn host_contract_report(request_digest: &Sha256Digest, artifact_bytes: u64) -> EngineReport {
-    EngineReport {
-        request_digest: request_digest.clone(),
-        termination: EngineTermination::Trap(TrapClass::HostContractViolation),
-        usage: EngineUsage {
-            attempted_output_bytes: 0,
-            output_bytes: 0,
-            host_calls: 0,
-            fuel_consumed: 0,
-            peak_memory_bytes: Some(0),
-            table_elements: Some(0),
-            instances: 0,
-            stack_bytes: None,
-            enforced_stack_limit_bytes: None,
-            elapsed_ms: 0,
-            epoch_ticks: Some(0),
-            artifact_reads: 1,
-            artifact_bytes,
-            accessed_artifact_digests: Vec::new(),
-        },
-        output: Vec::new(),
-        host_calls: Vec::new(),
-        proposed_effects: Vec::new(),
-        observed_state_delta: Vec::new(),
-        reaped: true,
-        post_commit_known: true,
-    }
-}
-
-fn instance_limit_report(
-    request_digest: &Sha256Digest,
-    artifact_digest: &Sha256Digest,
-    artifact_bytes: u64,
-) -> EngineReport {
-    EngineReport {
-        request_digest: request_digest.clone(),
-        termination: EngineTermination::InstanceLimit,
-        usage: EngineUsage {
-            attempted_output_bytes: 0,
-            output_bytes: 0,
-            host_calls: 0,
-            fuel_consumed: 0,
-            peak_memory_bytes: Some(0),
-            table_elements: Some(0),
-            instances: 2,
-            stack_bytes: None,
-            enforced_stack_limit_bytes: Some(PROVIDER_STACK_SIZE as u64),
-            elapsed_ms: 0,
-            epoch_ticks: Some(0),
-            artifact_reads: 1,
-            artifact_bytes,
-            accessed_artifact_digests: vec![artifact_digest.clone()],
-        },
-        output: Vec::new(),
-        host_calls: Vec::new(),
-        proposed_effects: Vec::new(),
-        observed_state_delta: Vec::new(),
-        reaped: false,
-        post_commit_known: true,
-    }
+fn is_instance_limit_error(error: &wasmtime::Error) -> bool {
+    let message = error.to_string().to_ascii_lowercase();
+    message.contains("instance") && (message.contains("limit") || message.contains("maximum"))
 }
 
 fn configuration_digest() -> Sha256Digest {
-    Sha256Digest::of_bytes(CONFIGURATION_DESCRIPTOR)
+    Sha256Digest::of_bytes(canonical_configuration_descriptor())
+}
+
+fn canonical_configuration_descriptor() -> &'static [u8] {
+    b"wasmtime=47.0.0;component_model=true;typed_abi=guest.run;max_wasm_stack=8192;epoch_only.consume_fuel=false;epoch_only.epoch_interruption=true;epoch_and_fuel.consume_fuel=true;epoch_and_fuel.epoch_interruption=true"
+}
+
+fn configured_engine(consume_fuel: bool) -> Result<Engine, WasmtimeBuildError> {
+    let mut config = Config::new();
+    config.wasm_component_model(true);
+    config.consume_fuel(consume_fuel);
+    config.epoch_interruption(true);
+    config.max_wasm_stack(PROVIDER_STACK_SIZE);
+    Engine::new(&config).map_err(WasmtimeBuildError::Config)
 }
 
 #[cfg(test)]
@@ -458,11 +424,16 @@ mod tests {
             wat::parse_file("tests/fixtures/guest.wat").map_err(|error| error.to_string())?;
         let wrong_digest = Sha256Digest::of_bytes(b"different");
         assert!(matches!(
-            WasmtimeComponentEngine::new(binding(), wrong_digest, &artifact),
+            WasmtimeComponentEngine::new(
+                binding(),
+                wrong_digest,
+                &artifact,
+                COMPONENT_CONFIGURATION
+            ),
             Err(WasmtimeBuildError::ArtifactDigestMismatch)
         ));
         let digest = Sha256Digest::of_bytes(&artifact);
-        WasmtimeComponentEngine::new(binding(), digest, &artifact)
+        WasmtimeComponentEngine::new(binding(), digest, &artifact, COMPONENT_CONFIGURATION)
             .map_err(|error| format!("{error:?}"))?;
         Ok(())
     }
@@ -472,8 +443,13 @@ mod tests {
         let artifact =
             wat::parse_file("tests/fixtures/guest.wat").map_err(|error| error.to_string())?;
         let digest = Sha256Digest::of_bytes(&artifact);
-        let engine = WasmtimeComponentEngine::new(binding(), digest.clone(), &artifact)
-            .map_err(|error| error.to_string())?;
+        let engine = WasmtimeComponentEngine::new(
+            binding(),
+            digest.clone(),
+            &artifact,
+            COMPONENT_CONFIGURATION,
+        )
+        .map_err(|error| error.to_string())?;
         let limits = InvocationLimits {
             max_input_bytes: 64,
             max_output_bytes: 64,
@@ -512,8 +488,13 @@ mod tests {
         let artifact =
             wat::parse_file("tests/fixtures/guest.wat").map_err(|error| error.to_string())?;
         let digest = Sha256Digest::of_bytes(&artifact);
-        let engine = WasmtimeComponentEngine::new(binding(), digest.clone(), &artifact)
-            .map_err(|error| error.to_string())?;
+        let engine = WasmtimeComponentEngine::new(
+            binding(),
+            digest.clone(),
+            &artifact,
+            COMPONENT_CONFIGURATION,
+        )
+        .map_err(|error| error.to_string())?;
         let mut limits = test_limits(digest);
         limits.max_output_bytes = 3;
         let output_limited = engine.invoke_component(
@@ -546,8 +527,13 @@ mod tests {
         let artifact =
             wat::parse_file("tests/fixtures/guest_loop.wat").map_err(|error| error.to_string())?;
         let digest = Sha256Digest::of_bytes(&artifact);
-        let engine = WasmtimeComponentEngine::new(binding(), digest.clone(), &artifact)
-            .map_err(|error| error.to_string())?;
+        let engine = WasmtimeComponentEngine::new(
+            binding(),
+            digest.clone(),
+            &artifact,
+            COMPONENT_CONFIGURATION,
+        )
+        .map_err(|error| error.to_string())?;
         let mut limits = test_limits(digest);
         limits.wall_deadline_ms = 10;
         limits.epoch.deadline_ticks = u64::MAX;
@@ -565,8 +551,13 @@ mod tests {
         let artifact =
             wat::parse_file("tests/fixtures/guest_loop.wat").map_err(|error| error.to_string())?;
         let digest = Sha256Digest::of_bytes(&artifact);
-        let engine = WasmtimeComponentEngine::new(binding(), digest.clone(), &artifact)
-            .map_err(|error| error.to_string())?;
+        let engine = WasmtimeComponentEngine::new(
+            binding(),
+            digest.clone(),
+            &artifact,
+            COMPONENT_CONFIGURATION,
+        )
+        .map_err(|error| error.to_string())?;
         let mut limits = test_limits(digest);
         limits.wall_deadline_ms = 10;
         limits.max_fuel = 1;
@@ -585,8 +576,13 @@ mod tests {
         let artifact = wat::parse_file("tests/fixtures/guest_instances.wat")
             .map_err(|error| error.to_string())?;
         let digest = Sha256Digest::of_bytes(&artifact);
-        let engine = WasmtimeComponentEngine::new(binding(), digest.clone(), &artifact)
-            .map_err(|error| error.to_string())?;
+        let engine = WasmtimeComponentEngine::new(
+            binding(),
+            digest.clone(),
+            &artifact,
+            COMPONENT_CONFIGURATION,
+        )
+        .map_err(|error| error.to_string())?;
         let mut limits = test_limits(digest);
         limits.max_instances = 1;
         let report =
@@ -603,13 +599,18 @@ mod tests {
         let mut wrong_wit = binding();
         wrong_wit.wit_interface_digest = Sha256Digest::of_bytes(b"wrong-wit");
         assert!(matches!(
-            WasmtimeComponentEngine::new(wrong_wit, digest.clone(), &artifact),
+            WasmtimeComponentEngine::new(
+                wrong_wit,
+                digest.clone(),
+                &artifact,
+                COMPONENT_CONFIGURATION
+            ),
             Err(WasmtimeBuildError::WitDigestMismatch)
         ));
         let mut wrong_config = binding();
         wrong_config.engine_configuration_digest = Sha256Digest::of_bytes(b"wrong-config");
         assert!(matches!(
-            WasmtimeComponentEngine::new(wrong_config, digest, &artifact),
+            WasmtimeComponentEngine::new(wrong_config, digest, &artifact, COMPONENT_CONFIGURATION),
             Err(WasmtimeBuildError::ConfigurationDigestMismatch)
         ));
         Ok(())

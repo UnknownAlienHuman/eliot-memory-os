@@ -175,7 +175,6 @@ struct ReportSpec {
     output: Vec<u8>,
     effects: Vec<EffectProposal>,
     state_delta: Vec<u8>,
-    reaped: bool,
     post_commit_known: bool,
     over_meter: bool,
 }
@@ -187,7 +186,6 @@ impl ReportSpec {
             output: vec![4, 5],
             effects: Vec::new(),
             state_delta: vec![6],
-            reaped: true,
             post_commit_known: true,
             over_meter: false,
         }
@@ -232,6 +230,7 @@ struct Config {
     promotion_mismatch: bool,
     report: ReportSpec,
     reconcile_report: ReportSpec,
+    reconcile_error: Option<PortError>,
 }
 
 impl Default for Config {
@@ -254,6 +253,7 @@ impl Default for Config {
             promotion_mismatch: false,
             report: ReportSpec::success(),
             reconcile_report: ReportSpec::success(),
+            reconcile_error: None,
         }
     }
 }
@@ -703,7 +703,6 @@ impl EngineMock {
             host_calls: Vec::new(),
             proposed_effects: spec.effects.clone(),
             observed_state_delta: spec.state_delta.clone(),
-            reaped: spec.reaped,
             post_commit_known: spec.post_commit_known,
         }
     }
@@ -723,6 +722,9 @@ impl ComponentEnginePort for EngineMock {
 
     fn reconcile(&mut self, invocation: &EngineInvocation) -> Result<EngineReport, PortError> {
         lock_state(&self.state).engine_calls += 1;
+        if let Some(error) = self.config.reconcile_error {
+            return Err(error);
+        }
         Ok(Self::report(invocation, &self.config.reconcile_report))
     }
 }
@@ -1155,6 +1157,73 @@ fn partial_and_post_commit_unknown_reconcile_only_after_p03_evidence() {
         assert_eq!(lock_state(&state).engine_calls, 2);
         assert_eq!(runtime.execute(original), reconciled);
     }
+}
+
+#[test]
+fn reconciliation_engine_error_is_cached_and_single_shot() {
+    let original = request();
+    let invocation_id = original.invocation_id.clone();
+    let request_digest = original.request_digest().clone();
+    let mut initial = ReportSpec::terminated(EngineTermination::Partial);
+    initial.post_commit_known = false;
+    let (mut runtime, state) = runtime(Config {
+        report: initial,
+        reconcile_error: Some(PortError::UnknownOutcome),
+        ..Config::default()
+    });
+    assert_eq!(
+        runtime.execute(original.clone()).receipt.disposition,
+        InvocationDisposition::Unknown
+    );
+    let first = must(runtime.reconcile(&invocation_id, &request_digest));
+    let second = must(runtime.reconcile(&invocation_id, &request_digest));
+    assert_eq!(first, second);
+    assert_eq!(first.receipt.disposition, InvocationDisposition::Unknown);
+    assert_eq!(lock_state(&state).engine_calls, 2);
+    assert_eq!(runtime.execute(original), first);
+}
+
+#[test]
+fn unknown_reconciliation_report_is_cached_and_replayed() {
+    let original = request();
+    let invocation_id = original.invocation_id.clone();
+    let request_digest = original.request_digest().clone();
+    let mut initial = ReportSpec::terminated(EngineTermination::Partial);
+    initial.post_commit_known = false;
+    let mut reconcile_report = ReportSpec::terminated(EngineTermination::PostCommitUnknown);
+    reconcile_report.post_commit_known = false;
+    let (mut runtime, state) = runtime(Config {
+        report: initial,
+        reconcile_report,
+        ..Config::default()
+    });
+    runtime.execute(original.clone());
+    let first = must(runtime.reconcile(&invocation_id, &request_digest));
+    let second = must(runtime.reconcile(&invocation_id, &request_digest));
+    assert_eq!(first, second);
+    assert_eq!(first.receipt.disposition, InvocationDisposition::Unknown);
+    assert_eq!(lock_state(&state).engine_calls, 2);
+}
+
+#[test]
+fn failed_p03_reconciliation_verification_does_not_consume_engine_attempt() {
+    let original = request();
+    let invocation_id = original.invocation_id.clone();
+    let request_digest = original.request_digest().clone();
+    let (mut runtime, state) = runtime(Config {
+        reject_reconcile_evidence: true,
+        ..Config::default()
+    });
+    runtime.execute(original);
+    assert_eq!(
+        runtime.reconcile(&invocation_id, &request_digest),
+        Err(RuntimeError::InvalidProcessReceipt)
+    );
+    assert_eq!(
+        runtime.reconcile(&invocation_id, &request_digest),
+        Err(RuntimeError::InvalidProcessReceipt)
+    );
+    assert_eq!(lock_state(&state).engine_calls, 1);
 }
 
 #[test]

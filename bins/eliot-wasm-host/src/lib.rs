@@ -406,6 +406,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(all(
+        feature = "eliot-profile-d2-operational",
+        feature = "eliot-profile-full-composition"
+    )))]
     fn absent_profile_is_rejected_before_surface_use() {
         let opposite = if test_profile() == Profile::D2Operational {
             Profile::FullComposition

@@ -610,7 +610,6 @@ pub struct EngineReport {
     pub host_calls: Vec<CapabilityId>,
     pub proposed_effects: Vec<EffectProposal>,
     pub observed_state_delta: Vec<u8>,
-    pub reaped: bool,
     pub post_commit_known: bool,
 }
 

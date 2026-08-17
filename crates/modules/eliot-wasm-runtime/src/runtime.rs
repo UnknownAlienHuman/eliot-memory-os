@@ -34,7 +34,14 @@ struct CachedInvocation {
     process_binding: Option<ProcessBinding>,
     engine_invocation: Option<EngineInvocation>,
     terminal_report: Option<EngineReport>,
+    reconciliation_attempt: ReconciliationAttempt,
     result: InvocationResult,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ReconciliationAttempt {
+    NotAttempted,
+    Consumed,
 }
 
 /// Idempotent A-12 facade. It owns only its request/result replay cache.
@@ -187,6 +194,12 @@ impl WasmRuntime {
         ) {
             return Ok(cached.result);
         }
+        if matches!(
+            cached.reconciliation_attempt,
+            ReconciliationAttempt::Consumed
+        ) {
+            return Ok(cached.result);
+        }
         let admission = cached.admission.as_ref().ok_or(RuntimeError::PlanGap)?;
         let envelope = cached
             .launch_envelope
@@ -207,23 +220,35 @@ impl WasmRuntime {
             .process_receipt_verifier
             .verify_reconciliation(&invocation.process_binding, &process_evidence, envelope)
             .map_err(|_| RuntimeError::InvalidProcessReceipt)?;
-        let p03_reaped = process_evidence.view().lifecycle().is_terminal();
-        let report = ports
-            .engine
-            .reconcile(invocation)
-            .map_err(|_| RuntimeError::UnknownOutcome)?;
+        if !process_evidence.view().lifecycle().is_terminal() {
+            return Ok(cached.result);
+        }
+        let Ok(report) = ports.engine.reconcile(invocation) else {
+            let result = plain_result(
+                &cached.request,
+                InvocationDisposition::Unknown,
+                RuntimeError::UnknownOutcome,
+            );
+            let Some(cached) = self.cache.get_mut(invocation_id) else {
+                return Err(RuntimeError::UnknownOutcome);
+            };
+            cached.reconciliation_attempt = ReconciliationAttempt::Consumed;
+            cached.result = result.clone();
+            return Ok(result);
+        };
         let result = classify_engine_report(
             ports,
             &cached.request,
             admission,
             invocation,
             report.clone(),
-            p03_reaped,
+            true,
         );
         let Some(cached) = self.cache.get_mut(invocation_id) else {
             return Err(RuntimeError::UnknownOutcome);
         };
         cached.terminal_report = Some(report);
+        cached.reconciliation_attempt = ReconciliationAttempt::Consumed;
         cached.result = result.clone();
         Ok(result)
     }
@@ -263,6 +288,7 @@ impl WasmRuntime {
                 process_binding: None,
                 engine_invocation: None,
                 terminal_report: None,
+                reconciliation_attempt: ReconciliationAttempt::NotAttempted,
                 result: result.clone(),
             },
         );
@@ -270,6 +296,7 @@ impl WasmRuntime {
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn execute_uncached(
     ports: Option<&mut RuntimePorts>,
     request: InvocationRequest,
@@ -357,13 +384,19 @@ fn execute_uncached(
         );
     };
     let terminal_report = Some(report.clone());
-    let p03_reaped = if matches!(report.termination, EngineTermination::Completed) {
+    let p03_verified = if matches!(report.termination, EngineTermination::Completed) {
         verify_p03_reap(ports, &invocation, &envelope)
     } else {
         false
     };
-    let result =
-        classify_engine_report(ports, &request, &admission, &invocation, report, p03_reaped);
+    let result = classify_engine_report(
+        ports,
+        &request,
+        &admission,
+        &invocation,
+        report,
+        p03_verified,
+    );
     CachedInvocation {
         request,
         admission: Some(admission),
@@ -371,6 +404,7 @@ fn execute_uncached(
         process_binding: Some(invocation.process_binding.clone()),
         engine_invocation: Some(invocation),
         terminal_report,
+        reconciliation_attempt: ReconciliationAttempt::NotAttempted,
         result,
     }
 }
@@ -633,7 +667,7 @@ fn classify_engine_report(
     admission: &SealedAdmission,
     invocation: &EngineInvocation,
     report: EngineReport,
-    p03_reaped: bool,
+    p03_verified: bool,
 ) -> InvocationResult {
     if !report_contract_valid(invocation, &report) {
         return InvocationResult::classified(
@@ -705,7 +739,7 @@ fn classify_engine_report(
     }
     let usage = report.usage.clone();
     let (disposition, error, output, effects, state_delta) =
-        classify_termination(report, p03_reaped);
+        classify_termination(report, p03_verified);
     InvocationResult::classified(
         request,
         disposition,
@@ -796,7 +830,7 @@ type TerminationClassification = (
     Option<Vec<u8>>,
 );
 
-fn classify_termination(report: EngineReport, p03_reaped: bool) -> TerminationClassification {
+fn classify_termination(report: EngineReport, p03_verified: bool) -> TerminationClassification {
     let unknown = || {
         (
             InvocationDisposition::Unknown,
@@ -806,7 +840,7 @@ fn classify_termination(report: EngineReport, p03_reaped: bool) -> TerminationCl
             None,
         )
     };
-    if (matches!(report.termination, EngineTermination::Completed) && !p03_reaped)
+    if (matches!(report.termination, EngineTermination::Completed) && !p03_verified)
         || !report.post_commit_known
     {
         return unknown();
@@ -893,6 +927,7 @@ fn cached_plain(
         process_binding: None,
         engine_invocation: None,
         terminal_report: None,
+        reconciliation_attempt: ReconciliationAttempt::NotAttempted,
         result,
     }
 }
@@ -911,6 +946,7 @@ fn cached_with_admission(
         process_binding: None,
         engine_invocation: None,
         terminal_report: None,
+        reconciliation_attempt: ReconciliationAttempt::NotAttempted,
         result,
     }
 }
@@ -930,6 +966,7 @@ fn cached_with_process_unknown(
         process_binding: Some(process_binding),
         engine_invocation: None,
         terminal_report: None,
+        reconciliation_attempt: ReconciliationAttempt::NotAttempted,
         result,
     }
 }
@@ -949,6 +986,7 @@ fn cached_with_engine_unknown(
         process_binding: Some(engine_invocation.process_binding.clone()),
         engine_invocation: Some(engine_invocation),
         terminal_report: None,
+        reconciliation_attempt: ReconciliationAttempt::NotAttempted,
         result,
     }
 }
