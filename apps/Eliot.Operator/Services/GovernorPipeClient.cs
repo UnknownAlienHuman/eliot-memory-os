@@ -11,7 +11,7 @@ public sealed class GovernorPipeClient(RuntimeDiscoveryService discovery) : IGov
     private NamedPipeClientStream? _pipe;
     private StreamReader? _reader;
     private StreamWriter? _writer;
-    private DiscoveredRuntime? _runtime;
+    private OperatorEndpoint? _endpoint;
     private long _requestId;
     private readonly SemaphoreSlim _requestGate = new(1, 1);
 
@@ -112,9 +112,9 @@ public sealed class GovernorPipeClient(RuntimeDiscoveryService discovery) : IGov
     {
         var activeRuntime = await discovery.DiscoverAsync(cancellationToken);
         if (_pipe?.IsConnected == true
-            && _runtime?.Publication.RuntimeId == activeRuntime.Publication.RuntimeId
-            && _runtime.Publication.AuthGeneration == activeRuntime.Publication.AuthGeneration
-            && _runtime.Authentication.TokenGenerationId == activeRuntime.Authentication.TokenGenerationId)
+            && _endpoint?.BrokerEpoch == activeRuntime.BrokerEpoch
+            && _endpoint.InteractiveSessionId == activeRuntime.InteractiveSessionId
+            && _endpoint.HandoffNonce == activeRuntime.HandoffNonce)
         {
             return;
         }
@@ -122,8 +122,8 @@ public sealed class GovernorPipeClient(RuntimeDiscoveryService discovery) : IGov
         {
             await DisconnectAsync();
         }
-        _runtime = activeRuntime;
-        var pipeName = _runtime.Publication.PipeName.Replace(@"\\.\pipe\", string.Empty, StringComparison.OrdinalIgnoreCase);
+        _endpoint = activeRuntime;
+        var pipeName = _endpoint.PipeName.Replace(@"\\.\pipe\", string.Empty, StringComparison.OrdinalIgnoreCase);
         _pipe = new NamedPipeClientStream(".", pipeName, PipeDirection.InOut, PipeOptions.Asynchronous);
         await _pipe.ConnectAsync(TimeSpan.FromSeconds(10), cancellationToken);
         _reader = new StreamReader(_pipe, Encoding.UTF8, false, 4096, leaveOpen: true);
@@ -132,10 +132,9 @@ public sealed class GovernorPipeClient(RuntimeDiscoveryService discovery) : IGov
         {
             kind = "eliot_ipc_handshake",
             protocol_version = OperatorProtocol.IpcProtocolVersion,
-            instance_name = _runtime.Publication.InstanceName,
-            runtime_id = _runtime.Publication.RuntimeId,
-            token = _runtime.Authentication.Token,
-            token_generation_id = _runtime.Authentication.TokenGenerationId,
+            broker_epoch = _endpoint.BrokerEpoch,
+            interactive_session_id = _endpoint.InteractiveSessionId,
+            handoff_nonce = _endpoint.HandoffNonce,
             client_nonce = Guid.NewGuid().ToString("N"),
             profile = "human_operator",
             requested_session_id = (string?)null
@@ -192,7 +191,7 @@ public sealed class GovernorPipeClient(RuntimeDiscoveryService discovery) : IGov
         _writer = null;
         _reader = null;
         _pipe = null;
-        _runtime = null;
+        _endpoint = null;
         try
         {
             if (writer is not null) await writer.DisposeAsync();

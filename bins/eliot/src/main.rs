@@ -6,9 +6,11 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use eliot_bootstrap::capture::{capture_snapshot, write_snapshot_artifact};
 use eliot_cli::{CommandCatalogue, CommandPort, CommandPortError, CommandRequest};
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::io::Read;
 use std::path::PathBuf;
+use std::time::{SystemTime, UNIX_EPOCH};
 use tracing_subscriber::EnvFilter;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -36,6 +38,8 @@ enum Command {
         command: SystemCommand,
     },
     Version,
+    /// Start or reuse the authenticated User Broker and launch Operator.
+    Ui,
 }
 
 #[derive(Debug, Subcommand)]
@@ -86,7 +90,68 @@ fn run() -> Result<i32> {
         }
         Command::System { command } => run_system(command),
         Command::Dispatch => run_dispatch(),
+        Command::Ui => run_ui(),
     }
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct OperatorEndpoint {
+    pipe_name: String,
+    broker_epoch: u64,
+    interactive_session_id: String,
+    handoff_nonce: String,
+    role: String,
+    capabilities: Vec<String>,
+}
+
+#[cfg(windows)]
+fn run_ui() -> Result<i32> {
+    let mut client =
+        AuthenticatedKernelPort::load().map_err(|error| anyhow::anyhow!(error.to_string()))?;
+    let endpoint = client.ensure_operator_endpoint()?;
+    if endpoint.role != "human_operator"
+        || endpoint.broker_epoch == 0
+        || endpoint.pipe_name.trim().is_empty()
+        || endpoint.interactive_session_id.trim().is_empty()
+        || endpoint.handoff_nonce.trim().is_empty()
+        || endpoint.capabilities.is_empty()
+    {
+        anyhow::bail!("Kernel returned an invalid role-filtered Operator endpoint");
+    }
+    let operator = std::env::var_os("ELIOT_OPERATOR_EXE")
+        .map_or_else(
+            || {
+                std::env::current_exe().ok().and_then(|path| {
+                    path.parent()
+                        .map(|parent| parent.join("Eliot.Operator.exe").into_os_string())
+                })
+            },
+            Some,
+        )
+        .ok_or_else(|| anyhow::anyhow!("ELIOT_OPERATOR_EXE is not configured"))?;
+    let status = std::process::Command::new(operator)
+        .env(
+            "ELIOT_OPERATOR_ENDPOINT",
+            serde_json::to_string(&endpoint).context("encode Operator endpoint")?,
+        )
+        .spawn()
+        .context("launch Eliot.Operator through the authenticated User Broker")?;
+    println!(
+        "eliot ui attached to User Broker epoch {}",
+        endpoint.broker_epoch
+    );
+    drop(status);
+    Ok(0)
+}
+
+#[cfg(not(windows))]
+fn run_ui() -> Result<i32> {
+    write_json_error(
+        "KERNEL_APPLICATION_PORT_CLOSED",
+        "Windows authenticated User Broker UI",
+    );
+    Ok(FRONT_DOOR_CLOSED_EXIT)
 }
 
 fn run_system(command: SystemCommand) -> Result<i32> {
@@ -198,6 +263,57 @@ impl AuthenticatedKernelPort {
                 }
                 other => CommandPortError::Rejected(other.to_string()),
             })
+    }
+
+    fn ensure_operator_endpoint(&mut self) -> Result<OperatorEndpoint> {
+        let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis();
+        let request_id = format!("eliot-ui-{now}-{}", std::process::id());
+        let identity: eliot_protocol::RequestIdentity = serde_json::from_value(json!({
+            "request": {
+                "metadata": {
+                    "request_id": request_id,
+                    "session_id": null,
+                    "task_id": null,
+                    "product_id": "eliot-ui",
+                    "source_id": "eliot-cli",
+                    "state_fence": {
+                        "authority_epoch": 1,
+                        "resource_generation": 1,
+                        "task_revision": null,
+                        "policy_revision": null,
+                        "integration_revision": null
+                    },
+                    "clock": {
+                        "valid_time_ms": now,
+                        "known_time_ms": now,
+                        "transaction_sequence": null,
+                        "monotonic_ns": null
+                    }
+                },
+                "state_fence": {
+                    "authority_epoch": 1,
+                    "resource_generation": 1,
+                    "task_revision": null,
+                    "policy_revision": null,
+                    "integration_revision": null
+                }
+            },
+            "idempotency_key": format!("eliot-ui-{now}"),
+            "deadline_unix_ms": now + 30_000,
+            "cancellation_id": format!("eliot-ui:{now}")
+        }))?;
+        self.client.set_request_identity(identity);
+        let payload = self
+            .client
+            .transact_json(
+                "eliot.user-broker.ensure-operator",
+                json!({
+                    "role": "human_operator",
+                    "capabilities": ["controlboard.read", "operator.command"]
+                }),
+            )
+            .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+        serde_json::from_value(payload).context("decode User Broker Operator endpoint")
     }
 }
 

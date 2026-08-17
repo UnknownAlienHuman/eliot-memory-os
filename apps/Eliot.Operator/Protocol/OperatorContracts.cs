@@ -11,25 +11,14 @@ public static class OperatorProtocol
     public const int MaxPageSize = 100;
 }
 
-public sealed record RuntimePublication(
-    [property: JsonPropertyName("schema_version")] string SchemaVersion,
-    [property: JsonPropertyName("protocol_version")] string ProtocolVersion,
-    [property: JsonPropertyName("instance_name")] string InstanceName,
-    [property: JsonPropertyName("runtime_id")] string RuntimeId,
-    [property: JsonPropertyName("auth_generation")] string AuthGeneration,
+/// One broker-owned, one-shot UI binding. It contains no bearer credential.
+public sealed record OperatorEndpoint(
     [property: JsonPropertyName("pipe_name")] string PipeName,
-    [property: JsonPropertyName("state")] string State,
-    [property: JsonPropertyName("auth_ref")] string AuthRef);
-
-public sealed record RuntimeAuthentication(
-    [property: JsonPropertyName("schema_version")] string SchemaVersion,
-    [property: JsonPropertyName("protocol_version")] string ProtocolVersion,
-    [property: JsonPropertyName("instance_name")] string InstanceName,
-    [property: JsonPropertyName("runtime_id")] string RuntimeId,
-    [property: JsonPropertyName("pipe_name")] string PipeName,
-    [property: JsonPropertyName("token")] string Token,
-    [property: JsonPropertyName("auth_generation")] string AuthGeneration,
-    [property: JsonPropertyName("token_generation_id")] string TokenGenerationId);
+    [property: JsonPropertyName("broker_epoch")] ulong BrokerEpoch,
+    [property: JsonPropertyName("interactive_session_id")] string InteractiveSessionId,
+    [property: JsonPropertyName("handoff_nonce")] string HandoffNonce,
+    [property: JsonPropertyName("role")] string Role,
+    [property: JsonPropertyName("capabilities")] IReadOnlyList<string> Capabilities);
 
 public sealed record OperatorContractResponse(
     [property: JsonPropertyName("schema_version")] string SchemaVersion,

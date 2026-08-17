@@ -1,4 +1,3 @@
-using System.Text.Json;
 using Eliot.Operator.Protocol;
 
 namespace Eliot.Operator.Services;
@@ -8,53 +7,44 @@ public sealed class RuntimeDiscoveryException(string code, string message) : Exc
     public string Code { get; } = code;
 }
 
-public sealed record DiscoveredRuntime(RuntimePublication Publication, RuntimeAuthentication Authentication);
-
 public sealed class RuntimeDiscoveryService
 {
-    private static readonly JsonSerializerOptions Json = new(JsonSerializerDefaults.Web);
+    internal const string EndpointEnvironmentVariable = "ELIOT_OPERATOR_ENDPOINT";
 
-    public async Task<DiscoveredRuntime> DiscoverAsync(CancellationToken cancellationToken = default)
+    public Task<OperatorEndpoint> DiscoverAsync(CancellationToken cancellationToken = default)
     {
-        var localAppData = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
-        var publicationPath = Path.Combine(localAppData, "Eliot", "instances", "default", "runtime", "publication.json");
-        if (!File.Exists(publicationPath))
+        cancellationToken.ThrowIfCancellationRequested();
+        var encoded = Environment.GetEnvironmentVariable(EndpointEnvironmentVariable);
+        if (string.IsNullOrWhiteSpace(encoded))
         {
-            throw new RuntimeDiscoveryException("publication_missing", $"ELIOT runtime publication not found: {publicationPath}");
+            throw new RuntimeDiscoveryException("endpoint_missing", "authenticated User Broker endpoint was not inherited");
         }
 
-        var publication = JsonSerializer.Deserialize<RuntimePublication>(
-            await File.ReadAllTextAsync(publicationPath, cancellationToken), Json)
-            ?? throw new RuntimeDiscoveryException("publication_unreadable", "ELIOT runtime publication is empty");
-        if (publication.ProtocolVersion != OperatorProtocol.IpcProtocolVersion || publication.State != "ready")
+        try
         {
-            throw new RuntimeDiscoveryException("publication_not_ready", "ELIOT runtime protocol or readiness state does not match");
+            var endpoint = System.Text.Json.JsonSerializer.Deserialize<OperatorEndpoint>(encoded)
+                ?? throw new RuntimeDiscoveryException("endpoint_unreadable", "User Broker endpoint is empty");
+            ValidateEndpoint(endpoint);
+            return Task.FromResult(endpoint);
         }
-        if (!File.Exists(publication.AuthRef))
+        catch (System.Text.Json.JsonException error)
         {
-            throw new RuntimeDiscoveryException("authentication_missing", "ELIOT runtime authentication reference is missing");
+            throw new RuntimeDiscoveryException("endpoint_unreadable", error.Message);
         }
-
-        var authentication = JsonSerializer.Deserialize<RuntimeAuthentication>(
-            await File.ReadAllTextAsync(publication.AuthRef, cancellationToken), Json)
-            ?? throw new RuntimeDiscoveryException("authentication_unreadable", "ELIOT runtime authentication file is empty");
-        ValidateGeneration(publication, authentication);
-        return new DiscoveredRuntime(publication, authentication);
     }
 
-    public static void ValidateGeneration(
-        RuntimePublication publication,
-        RuntimeAuthentication authentication)
+    public static void ValidateEndpoint(OperatorEndpoint endpoint)
     {
-        if (authentication.ProtocolVersion != publication.ProtocolVersion
-            || authentication.InstanceName != publication.InstanceName
-            || authentication.RuntimeId != publication.RuntimeId
-            || authentication.AuthGeneration != publication.AuthGeneration
-            || authentication.PipeName != publication.PipeName
-            || authentication.TokenGenerationId != publication.AuthGeneration
-            || string.IsNullOrWhiteSpace(authentication.Token))
+        if (string.IsNullOrWhiteSpace(endpoint.PipeName)
+            || !endpoint.PipeName.StartsWith(@"\\.\pipe\", StringComparison.OrdinalIgnoreCase)
+            || endpoint.BrokerEpoch == 0
+            || string.IsNullOrWhiteSpace(endpoint.InteractiveSessionId)
+            || string.IsNullOrWhiteSpace(endpoint.HandoffNonce)
+            || endpoint.Role != "human_operator"
+            || endpoint.Capabilities.Count == 0
+            || endpoint.Capabilities.Any(string.IsNullOrWhiteSpace))
         {
-            throw new RuntimeDiscoveryException("stale_auth", "ELIOT runtime authentication does not match the active generation");
+            throw new RuntimeDiscoveryException("endpoint_invalid", "User Broker endpoint is not a role-filtered authenticated binding");
         }
     }
 }

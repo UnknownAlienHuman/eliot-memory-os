@@ -363,6 +363,7 @@ dependencies = [
  "clap",
  "eliot-bootstrap",
  "eliot-cli",
+ "eliot-protocol",
  "serde",
  "serde_json",
  "tracing",

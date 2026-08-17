@@ -23,6 +23,31 @@ use thiserror::Error;
 
 pub const CONTRACT_NAME: &str = "eliot.surfaces.user-broker-core/v1";
 
+/// Broker-to-Operator handoff bound to one interactive session and epoch.
+/// This envelope contains no bearer credential or filesystem auth reference.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OperatorEndpoint {
+    pub pipe_name: String,
+    pub broker_epoch: u64,
+    pub interactive_session_id: String,
+    pub handoff_nonce: String,
+    pub role: String,
+    pub capabilities: Vec<String>,
+}
+
+impl OperatorEndpoint {
+    pub fn validate(&self) -> Result<(), BrokerError> {
+        text(&self.pipe_name, "pipe_name")?;
+        text(&self.interactive_session_id, "interactive_session_id")?;
+        text(&self.handoff_nonce, "handoff_nonce")?;
+        if self.broker_epoch == 0 || self.role != "human_operator" || self.capabilities.is_empty() {
+            return Err(BrokerError::InvalidField("operator_endpoint_binding"));
+        }
+        unique(&self.capabilities, "capabilities")
+    }
+}
+
 fn text(value: &str, field: &'static str) -> Result<(), BrokerError> {
     if value.trim().is_empty() || value.chars().any(char::is_control) {
         return Err(BrokerError::InvalidField(field));
@@ -1248,6 +1273,47 @@ mod tests {
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
     };
+
+    #[test]
+    fn operator_endpoint_is_role_filtered_and_credential_free() {
+        let endpoint = OperatorEndpoint {
+            pipe_name: r"\\.\pipe\eliot\operator\one-shot".to_owned(),
+            broker_epoch: 4,
+            interactive_session_id: "session-1".to_owned(),
+            handoff_nonce: "nonce-1".to_owned(),
+            role: "human_operator".to_owned(),
+            capabilities: vec![
+                "controlboard.read".to_owned(),
+                "operator.command".to_owned(),
+            ],
+        };
+        endpoint.validate().expect("valid endpoint");
+        let wire = serde_json::to_string(&endpoint).expect("endpoint json");
+        assert!(!wire.contains("token"));
+        assert!(!wire.contains("auth_ref"));
+        assert!(
+            serde_json::from_str::<serde_json::Value>(&wire)
+                .expect("endpoint value")
+                .get("role")
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn operator_endpoint_rejects_unfiltered_role() {
+        let endpoint = OperatorEndpoint {
+            pipe_name: r"\\.\pipe\eliot\operator\one-shot".to_owned(),
+            broker_epoch: 1,
+            interactive_session_id: "session-1".to_owned(),
+            handoff_nonce: "nonce-1".to_owned(),
+            role: "kernel".to_owned(),
+            capabilities: vec!["controlboard.read".to_owned()],
+        };
+        assert_eq!(
+            endpoint.validate(),
+            Err(BrokerError::InvalidField("operator_endpoint_binding"))
+        );
+    }
 
     #[derive(Clone, Copy)]
     enum Tamper {
