@@ -19,7 +19,8 @@ pub struct DurableImage {
     pub receipts: Vec<CommittedAppend>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PreparedAppend {
     pub transaction_id: PlatformHandle,
     pub host: HostInstallationEpoch,
