@@ -2,11 +2,19 @@
 
 use std::collections::BTreeMap;
 
+use eliot_cli::kernel_client::{KernelClient, KernelClientError};
+use eliot_contracts::{
+    ClockReading, ProductId, RequestId, RequestMetadata, SourceId, StateFence, TaskId,
+};
+use eliot_protocol::RequestIdentity;
+use eliot_receipts::RequestBinding;
 use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
 use thiserror::Error;
 
 pub const SERVICE_NAME: &str = "eliot-dreamer";
 pub const PROTOCOL_VERSION: &str = "eliot.dreamer.v1";
+pub const KERNEL_ADMISSION_REQUIRED: &str = "KERNEL_ADMISSION_REQUIRED";
 const MAX_TEXT: usize = 16_384;
 const MAX_ITEMS: usize = 256;
 
@@ -47,6 +55,212 @@ pub struct DreamJobInput {
     pub deadline_ms: i64,
     pub output_schema: String,
     pub forbidden_effects: Vec<String>,
+}
+
+/// Exact identity inherited from the Kernel for one Dreamer job attempt.
+///
+/// This is deliberately separate from [`DreamJobInput`]: semantic input is a
+/// candidate bundle, while the Kernel owns the job/attempt idempotency and
+/// fencing authority.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct KernelJobAdmission {
+    pub job_id: String,
+    pub attempt_id: String,
+    pub scope_id: String,
+    pub request_id: String,
+    pub idempotency_key: String,
+    pub cancellation_id: String,
+    pub deadline_unix_ms: u64,
+    pub state_fence: StateFence,
+}
+
+impl KernelJobAdmission {
+    pub fn validate(&self) -> Result<(), DreamerError> {
+        for (name, value) in [
+            ("job_id", &self.job_id),
+            ("attempt_id", &self.attempt_id),
+            ("scope_id", &self.scope_id),
+            ("request_id", &self.request_id),
+            ("idempotency_key", &self.idempotency_key),
+            ("cancellation_id", &self.cancellation_id),
+        ] {
+            validate_text(name, value)?;
+        }
+        if self.deadline_unix_ms == 0 {
+            return Err(DreamerError::InvalidAdmission(
+                "Kernel deadline must be positive",
+            ));
+        }
+        self.state_fence
+            .validate()
+            .map_err(|error| DreamerError::KernelAdmissionRequired(error.to_string()))
+    }
+
+    fn request_identity(
+        &self,
+        scope_id: &str,
+        task_id_value: Option<&str>,
+    ) -> Result<RequestIdentity, DreamerError> {
+        self.validate()?;
+        let request_id = RequestId::new(self.request_id.clone())
+            .map_err(|error| DreamerError::KernelAdmissionRequired(error.to_string()))?;
+        let product_id = ProductId::new(scope_id.to_owned())
+            .map_err(|error| DreamerError::KernelAdmissionRequired(error.to_string()))?;
+        let source_id = SourceId::new(SERVICE_NAME)
+            .map_err(|error| DreamerError::KernelAdmissionRequired(error.to_string()))?;
+        let task_id = task_id_value
+            .map(TaskId::new)
+            .transpose()
+            .map_err(|error| DreamerError::KernelAdmissionRequired(error.to_string()))?;
+        let metadata = RequestMetadata {
+            request_id,
+            session_id: None,
+            task_id,
+            product_id,
+            source_id,
+            state_fence: self.state_fence.clone(),
+            clock: ClockReading::default(),
+        };
+        Ok(RequestIdentity {
+            request: RequestBinding {
+                metadata,
+                state_fence: self.state_fence.clone(),
+            },
+            idempotency_key: self.idempotency_key.clone(),
+            deadline_unix_ms: self.deadline_unix_ms,
+            cancellation_id: self.cancellation_id.clone(),
+        })
+    }
+}
+
+/// The authenticated Kernel handshake snapshot bound to this process.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct KernelHandshake {
+    pub authority_epoch: u64,
+}
+
+/// Provider-neutral Kernel job contract used by the production composition.
+/// Implementations own no semantic state; replay and terminal readback remain
+/// Kernel-owned by idempotency key and exact job/attempt identity.
+pub trait KernelJobPort {
+    fn handshake(&mut self) -> Result<KernelHandshake, DreamerError>;
+    fn submit(
+        &mut self,
+        admission: &KernelJobAdmission,
+        job: &DreamJobInput,
+    ) -> Result<JobView, DreamerError>;
+    fn cancel(&mut self, admission: &KernelJobAdmission) -> Result<JobView, DreamerError>;
+    fn status(&mut self, admission: &KernelJobAdmission) -> Result<JobView, DreamerError>;
+    fn reconcile(&mut self, admission: &KernelJobAdmission) -> Result<JobView, DreamerError>;
+}
+
+/// Authenticated production adapter over the installation-owned Kernel client.
+pub struct AuthenticatedKernelJobPort {
+    client: KernelClient,
+}
+
+impl AuthenticatedKernelJobPort {
+    pub fn connect() -> Result<Self, DreamerError> {
+        Ok(Self {
+            client: KernelClient::load().map_err(|error| kernel_admission_error(&error))?,
+        })
+    }
+
+    fn execute(
+        &mut self,
+        operation: &str,
+        admission: &KernelJobAdmission,
+        job: &DreamJobInput,
+        payload: Value,
+    ) -> Result<JobView, DreamerError> {
+        let identity = admission.request_identity(&job.scope_id, job.task_id.as_deref())?;
+        self.client.set_request_identity(identity);
+        let response = self
+            .client
+            .transact_json(operation, payload)
+            .map_err(|error| kernel_admission_error(&error))?;
+        decode_job_view(response)
+    }
+}
+
+impl KernelJobPort for AuthenticatedKernelJobPort {
+    fn handshake(&mut self) -> Result<KernelHandshake, DreamerError> {
+        let response = self
+            .client
+            .probe()
+            .map_err(|error| kernel_admission_error(&error))?;
+        let status = response.get("status").and_then(Value::as_str);
+        let authority_epoch = response.get("authority_epoch").and_then(Value::as_u64);
+        match (status, authority_epoch) {
+            (Some("OPEN"), Some(epoch)) if epoch > 0 => Ok(KernelHandshake {
+                authority_epoch: epoch,
+            }),
+            _ => Err(DreamerError::KernelAdmissionRequired(
+                "Kernel health handshake was not OPEN and fenced".to_owned(),
+            )),
+        }
+    }
+
+    fn submit(
+        &mut self,
+        admission: &KernelJobAdmission,
+        job: &DreamJobInput,
+    ) -> Result<JobView, DreamerError> {
+        self.execute(
+            "dreamer.submit",
+            admission,
+            job,
+            json!({ "admission": admission, "job": job }),
+        )
+    }
+
+    fn cancel(&mut self, admission: &KernelJobAdmission) -> Result<JobView, DreamerError> {
+        let identity = admission.request_identity(&admission.scope_id, None)?;
+        self.client.set_request_identity(identity);
+        let response = self
+            .client
+            .transact_json("dreamer.cancel", json!({ "admission": admission }))
+            .map_err(|error| kernel_admission_error(&error))?;
+        decode_job_view(response)
+    }
+
+    fn status(&mut self, admission: &KernelJobAdmission) -> Result<JobView, DreamerError> {
+        let identity = admission.request_identity(&admission.scope_id, None)?;
+        self.client.set_request_identity(identity);
+        let response = self
+            .client
+            .transact_json("dreamer.status", json!({ "admission": admission }))
+            .map_err(|error| kernel_admission_error(&error))?;
+        decode_job_view(response)
+    }
+
+    fn reconcile(&mut self, admission: &KernelJobAdmission) -> Result<JobView, DreamerError> {
+        let identity = admission.request_identity(&admission.scope_id, None)?;
+        self.client.set_request_identity(identity);
+        let response = self
+            .client
+            .transact_json("dreamer.reconcile", json!({ "admission": admission }))
+            .map_err(|error| kernel_admission_error(&error))?;
+        decode_job_view(response)
+    }
+}
+
+fn decode_job_view(response: Value) -> Result<JobView, DreamerError> {
+    let view = response
+        .get("view")
+        .cloned()
+        .or_else(|| response.get("job").cloned())
+        .unwrap_or(response);
+    serde_json::from_value(view).map_err(|error| {
+        DreamerError::KernelAdmissionRequired(format!(
+            "Kernel returned no typed Dreamer job view: {error}"
+        ))
+    })
+}
+
+fn kernel_admission_error(error: &KernelClientError) -> DreamerError {
+    DreamerError::KernelAdmissionRequired(error.to_string())
 }
 
 impl DreamJobInput {
@@ -199,6 +413,77 @@ pub enum DreamerError {
     UnknownJob(String),
     #[error("job is not cancellable: {0}")]
     NotCancellable(String),
+    #[error("{KERNEL_ADMISSION_REQUIRED}: {0}")]
+    KernelAdmissionRequired(String),
+}
+
+impl DreamerError {
+    #[must_use]
+    pub const fn code(&self) -> &'static str {
+        match self {
+            Self::KernelAdmissionRequired(_) => KERNEL_ADMISSION_REQUIRED,
+            _ => "DREAMER_REQUEST_REJECTED",
+        }
+    }
+}
+
+/// Production Dreamer composition. It has no local job map: all admission,
+/// cancellation, replay and terminal readback are delegated to Kernel.
+pub struct KernelSupervisedComposition<P> {
+    port: P,
+    handshake: KernelHandshake,
+}
+
+impl<P: KernelJobPort> KernelSupervisedComposition<P> {
+    pub fn connect(mut port: P) -> Result<Self, DreamerError> {
+        let handshake = port.handshake()?;
+        if handshake.authority_epoch == 0 {
+            return Err(DreamerError::KernelAdmissionRequired(
+                "Kernel handshake omitted the authority epoch".to_owned(),
+            ));
+        }
+        Ok(Self { port, handshake })
+    }
+
+    pub fn submit(
+        &mut self,
+        admission: &KernelJobAdmission,
+        job: &DreamJobInput,
+    ) -> Result<JobView, DreamerError> {
+        job.validate()?;
+        self.validate_fence(admission)?;
+        if admission.job_id != job.job_id || admission.scope_id != job.scope_id {
+            return Err(DreamerError::KernelAdmissionRequired(
+                "job/attempt identity does not match the admitted semantic input".to_owned(),
+            ));
+        }
+        self.port.submit(admission, job)
+    }
+
+    pub fn cancel(&mut self, admission: &KernelJobAdmission) -> Result<JobView, DreamerError> {
+        self.validate_fence(admission)?;
+        self.port.cancel(admission)
+    }
+
+    pub fn status(&mut self, admission: &KernelJobAdmission) -> Result<JobView, DreamerError> {
+        self.validate_fence(admission)?;
+        self.port.status(admission)
+    }
+
+    pub fn reconcile(&mut self, admission: &KernelJobAdmission) -> Result<JobView, DreamerError> {
+        self.validate_fence(admission)?;
+        self.port.reconcile(admission)
+    }
+
+    fn validate_fence(&self, admission: &KernelJobAdmission) -> Result<(), DreamerError> {
+        admission.validate()?;
+        if admission.state_fence.authority_epoch.value() != self.handshake.authority_epoch {
+            return Err(DreamerError::KernelAdmissionRequired(
+                "job state fence does not match the authenticated Kernel epoch".to_owned(),
+            ));
+        }
+        Ok(())
+    }
 }
 
 struct StoredJob {
