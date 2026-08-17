@@ -683,6 +683,75 @@ pub struct RuntimeLaunchDescriptor {
 }
 
 impl RuntimeLaunchDescriptor {
+    fn expected_store_arguments(&self, config_path: &PlatformHandle) -> Vec<String> {
+        match self.profile {
+            InstallationProfile::PortableDev => vec![
+                "--portable-dev-root".to_owned(),
+                self.portable_root
+                    .as_ref()
+                    .map_or_else(String::new, |root| root.as_str().to_owned()),
+                "--config".to_owned(),
+                config_path.as_str().to_owned(),
+            ],
+            InstallationProfile::SystemService | InstallationProfile::UserMode => {
+                vec!["--config".to_owned(), config_path.as_str().to_owned()]
+            }
+        }
+    }
+
+    fn expected_kernel_arguments(&self, config_path: &PlatformHandle) -> Vec<String> {
+        let mut arguments = Vec::new();
+        if self.profile == InstallationProfile::PortableDev {
+            arguments.push("--portable-dev-root".to_owned());
+            arguments.push(
+                self.portable_root
+                    .as_ref()
+                    .map_or_else(String::new, |root| root.as_str().to_owned()),
+            );
+        }
+        arguments.extend([
+            "--work-root".to_owned(),
+            self.kernel_work_root.as_str().to_owned(),
+            "--store-config".to_owned(),
+            config_path.as_str().to_owned(),
+        ]);
+        arguments
+    }
+
+    /// Validates the launch contour against the exact approved generation
+    /// configuration. Child argv is an authority input, not caller metadata.
+    pub fn validate_for_config(
+        &self,
+        config_path: &PlatformHandle,
+    ) -> Result<(), InstallationError> {
+        self.validate()?;
+        let expected_store = self.expected_store_arguments(config_path);
+        let expected_kernel = self.expected_kernel_arguments(config_path);
+        let actual_store = self
+            .store_arguments
+            .iter()
+            .map(|value| value.as_str().to_owned())
+            .collect::<Vec<_>>();
+        let actual_kernel = self
+            .kernel_arguments
+            .iter()
+            .map(|value| value.as_str().to_owned())
+            .collect::<Vec<_>>();
+        if actual_store != expected_store {
+            return Err(InstallationError::InvalidField {
+                field: "runtime_launch.store_arguments".to_owned(),
+                reason: "must exactly select the approved generation config".to_owned(),
+            });
+        }
+        if actual_kernel != expected_kernel {
+            return Err(InstallationError::InvalidField {
+                field: "runtime_launch.kernel_arguments".to_owned(),
+                reason: "must exactly select the approved generation config".to_owned(),
+            });
+        }
+        Ok(())
+    }
+
     fn unsigned_bytes(&self) -> Result<Vec<u8>, InstallationError> {
         #[derive(Serialize)]
         struct Unsigned<'a> {
@@ -809,7 +878,7 @@ impl CandidateManifest {
             "manifest.supervision_key_fingerprint",
         )?;
         handle(&self.signature_ref, "manifest.signature_ref")
-            .and_then(|()| self.runtime_launch.validate())
+            .and_then(|()| self.runtime_launch.validate_for_config(&self.config_path))
     }
 
     /// Returns the ordered Kernel and canonical-store artifact digests used by
@@ -1831,8 +1900,20 @@ mod tests {
                     portable_root: Some(test_path(&root, "portable")),
                     kernel_work_root: test_path(&root, "portable"),
                     store_config_path: test_path(&root, "generation.json"),
-                    kernel_arguments: vec![test_handle("--kernel")],
-                    store_arguments: vec![test_handle("--store")],
+                    kernel_arguments: vec![
+                        test_handle("--portable-dev-root"),
+                        test_path(&root, "portable"),
+                        test_handle("--work-root"),
+                        test_path(&root, "portable"),
+                        test_handle("--store-config"),
+                        test_path(&root, "generation.json"),
+                    ],
+                    store_arguments: vec![
+                        test_handle("--portable-dev-root"),
+                        test_path(&root, "portable"),
+                        test_handle("--config"),
+                        test_path(&root, "generation.json"),
+                    ],
                     watchdog_executable_path: test_path(&root, "eliot-watchdog.exe"),
                     watchdog_artifact_digest: test_handle("4".repeat(64)),
                     descriptor_digest: test_handle("0".repeat(64)),
@@ -1928,13 +2009,35 @@ mod tests {
     fn runtime_launch_descriptor_binds_exact_arguments_and_rejects_tampering() {
         let transaction = registering_transaction();
         let descriptor = &transaction.candidate_manifest.runtime_launch;
-        assert_eq!(descriptor.kernel_arguments[0].as_str(), "--kernel");
-        assert_eq!(descriptor.store_arguments[0].as_str(), "--store");
+        assert_eq!(
+            descriptor.kernel_arguments[0].as_str(),
+            "--portable-dev-root"
+        );
+        assert_eq!(descriptor.store_arguments[2].as_str(), "--config");
         assert!(descriptor.validate().is_ok());
+        let config = &transaction.candidate_manifest.config_path;
+        assert!(descriptor.validate_for_config(config).is_ok());
 
         let mut tampered = descriptor.clone();
         tampered.store_arguments[0] = test_handle("--outside-root");
-        assert!(tampered.validate().is_err());
+        assert!(tampered.validate_for_config(config).is_err());
+
+        let mut missing_config = descriptor.clone();
+        missing_config.store_arguments.truncate(2);
+        assert!(missing_config.validate_for_config(config).is_err());
+
+        let mut duplicate_config = descriptor.clone();
+        duplicate_config
+            .store_arguments
+            .push(test_handle(config.as_str()));
+        assert!(duplicate_config.validate_for_config(config).is_err());
+
+        let mut alternate_config = descriptor.clone();
+        alternate_config.store_arguments[3] = test_path(
+            &std::env::temp_dir(),
+            "eliot-installation-alternate-config.json",
+        );
+        assert!(alternate_config.validate_for_config(config).is_err());
 
         let mut missing_root = descriptor.clone();
         missing_root.portable_root = None;

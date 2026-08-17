@@ -315,7 +315,9 @@ where
                 state.store = Some(store);
                 if observe_store(state.store.as_ref()) != ReconciliationObservation::Live {
                     store_degraded = true;
-                    let _ = terminate_store(&mut state.store);
+                    if terminate_store(&mut state.store).is_err() {
+                        store_degraded = true;
+                    }
                 }
             } else {
                 store_degraded = true;
@@ -331,6 +333,12 @@ where
             state.kernel_restart_attempts += 1;
             if let Ok(kernel) = launch_kernel() {
                 state.kernel = Some(kernel);
+                if observe_kernel(state.kernel.as_ref()) != ReconciliationObservation::Live {
+                    kernel_degraded = true;
+                    if terminate_kernel(&mut state.kernel).is_err() {
+                        kernel_degraded = true;
+                    }
+                }
             } else {
                 kernel_degraded = true;
             }
@@ -348,6 +356,9 @@ where
                 state.store = Some(store);
                 if observe_store(state.store.as_ref()) != ReconciliationObservation::Live {
                     store_degraded = true;
+                    if terminate_store(&mut state.store).is_err() {
+                        store_degraded = true;
+                    }
                 }
             } else {
                 store_degraded = true;
@@ -644,7 +655,10 @@ impl HostJobBranches {
             ));
         }
         launch
-            .validate()
+            .validate_for_config(
+                &PlatformHandle::new(config_path.to_string_lossy().into_owned())
+                    .map_err(|error| HostError::ProcessContour(error.to_string()))?,
+            )
             .map_err(|error| HostError::ProcessContour(error.to_string()))?;
         let portable_root = if launch.profile == InstallationProfile::PortableDev {
             let root = PathBuf::from(
@@ -787,7 +801,32 @@ impl HostJobBranches {
                 self.store_restart_attempts = 0;
                 self.kernel = Some(kernel);
                 self.store = Some(store);
-                Ok(())
+                let kernel_live = match Self::branch_state(self.kernel.as_ref()) {
+                    Ok(BranchLiveness::Live) => Ok(()),
+                    Ok(BranchLiveness::Dead) => {
+                        Err("Kernel exited immediately after launch".to_owned())
+                    }
+                    Err(error) => Err(error),
+                };
+                match kernel_live {
+                    Ok(()) => Ok(()),
+                    Err(reason) => {
+                        let store_cleanup = self.terminate_store();
+                        let kernel_cleanup = self.terminate_kernel();
+                        if store_cleanup.is_ok() && kernel_cleanup.is_ok() {
+                            self.clear_recorded_contour();
+                        }
+                        Err(if store_cleanup.is_err() || kernel_cleanup.is_err() {
+                            HostError::RecoveryRequired(format!(
+                                "Kernel launch observation failed ({reason}); Store cleanup={store_cleanup:?}; Kernel cleanup={kernel_cleanup:?}"
+                            ))
+                        } else {
+                            HostError::ProcessContour(format!(
+                                "Kernel child is not live after launch ({reason})"
+                            ))
+                        })
+                    }
+                }
             }
             Err(
                 StoreKernelLaunchError::Launch(error) | StoreKernelLaunchError::Kernel { error },
@@ -946,20 +985,33 @@ impl HostJobBranches {
         child: Option<&RunningJobChild<PlatformHandle>>,
     ) -> Result<BranchLiveness, String> {
         match child {
-            Some(child) => match child.observe().map_err(|error| error.to_string())? {
-                eliot_platform_windows::RunningJobObservation::Running { active_processes }
-                    if active_processes > 0 =>
+            Some(child) => {
+                let process = child.evidence().process();
+                if !child
+                    .job_processes()
+                    .map_err(|error| error.to_string())?
+                    .iter()
+                    .any(|observed| observed == process)
                 {
-                    Ok(BranchLiveness::Live)
+                    return Err(
+                        "Job observation does not contain the exact launched process".to_owned(),
+                    );
                 }
-                eliot_platform_windows::RunningJobObservation::Running { .. } => {
-                    Err("running observation reports zero active processes".to_owned())
+                match child.observe().map_err(|error| error.to_string())? {
+                    eliot_platform_windows::RunningJobObservation::Running { active_processes }
+                        if active_processes > 0 =>
+                    {
+                        Ok(BranchLiveness::Live)
+                    }
+                    eliot_platform_windows::RunningJobObservation::Running { .. } => {
+                        Err("running observation reports zero active processes".to_owned())
+                    }
+                    eliot_platform_windows::RunningJobObservation::RootExited { .. }
+                    | eliot_platform_windows::RunningJobObservation::Exited { .. } => {
+                        Ok(BranchLiveness::Dead)
+                    }
                 }
-                eliot_platform_windows::RunningJobObservation::RootExited { .. }
-                | eliot_platform_windows::RunningJobObservation::Exited { .. } => {
-                    Ok(BranchLiveness::Dead)
-                }
-            },
+            }
             None => Ok(BranchLiveness::Dead),
         }
     }
@@ -1163,8 +1215,8 @@ impl HostJobBranches {
         prior_launch: &RuntimeLaunchDescriptor,
         host: &HostInstallationEpoch,
     ) -> Result<(), HostError> {
-        self.terminate_kernel()?;
         self.terminate_store()?;
+        self.terminate_kernel()?;
         match self.start_approved(
             candidate_kernel,
             candidate_store,
@@ -1899,8 +1951,8 @@ impl HostComposition {
 
     #[cfg(windows)]
     fn cleanup_launched_contour(&mut self, error: HostError) -> Result<(), HostError> {
-        let kernel = self.jobs.terminate_kernel();
         let store = self.jobs.terminate_store();
+        let kernel = self.jobs.terminate_kernel();
         match (kernel, store) {
             (Ok(()), Ok(())) => {
                 self.jobs.clear_recorded_contour();
@@ -1948,8 +2000,8 @@ impl HostComposition {
                 .unwrap_or_else(|| self.host_process.clone());
             #[cfg(windows)]
             {
-                self.jobs.terminate_kernel()?;
                 self.jobs.terminate_store()?;
+                self.jobs.terminate_kernel()?;
             }
             let marker = eliot_platform::HostShutdownMarker {
                 context: lifecycle_context(&self.host, "host-stop")?,
@@ -2477,6 +2529,66 @@ mod tests {
         assert_eq!(disposition, HostBranchDisposition::KernelDegraded);
         assert_eq!(state.store, Some(MockChild { id: 7, live: true }));
         assert!(state.kernel.is_none());
+    }
+
+    #[test]
+    fn replacement_kernel_dead_or_unknown_is_not_healthy() {
+        for observation in [
+            ReconciliationObservation::Dead,
+            ReconciliationObservation::Unknown,
+        ] {
+            let mut state = ReconciliationState {
+                store: Some(MockChild { id: 1, live: true }),
+                kernel: Some(MockChild { id: 2, live: false }),
+                store_restart_attempts: 0,
+                kernel_restart_attempts: 0,
+            };
+            let disposition = reconcile_state_machine(
+                &mut state,
+                mock_observation,
+                |child| {
+                    if child.is_some() {
+                        observation
+                    } else {
+                        ReconciliationObservation::Dead
+                    }
+                },
+                |_| Ok(()),
+                |kernel| {
+                    kernel.take();
+                    Ok(())
+                },
+                || Ok(MockChild { id: 3, live: true }),
+                || Ok(MockChild { id: 4, live: false }),
+            );
+            assert_eq!(disposition, HostBranchDisposition::KernelDegraded);
+            if observation == ReconciliationObservation::Dead {
+                assert!(state.kernel.is_none());
+            } else {
+                assert_eq!(state.kernel, Some(MockChild { id: 2, live: false }));
+            }
+        }
+    }
+
+    #[test]
+    fn replacement_kernel_termination_failure_retains_binding() {
+        let mut state = ReconciliationState {
+            store: Some(MockChild { id: 1, live: true }),
+            kernel: Some(MockChild { id: 2, live: false }),
+            store_restart_attempts: 0,
+            kernel_restart_attempts: 0,
+        };
+        let disposition = reconcile_state_machine(
+            &mut state,
+            mock_observation,
+            mock_observation,
+            |_| Ok(()),
+            |_| Err(()),
+            || Ok(MockChild { id: 3, live: true }),
+            || Ok(MockChild { id: 4, live: true }),
+        );
+        assert_eq!(disposition, HostBranchDisposition::KernelDegraded);
+        assert_eq!(state.kernel, Some(MockChild { id: 2, live: false }));
     }
 }
 
