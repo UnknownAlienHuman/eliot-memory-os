@@ -1020,7 +1020,7 @@ mod tests {
             .prepare(&descriptor)
             .unwrap_or_else(|_| unreachable!());
         backend
-            .append_prepared(&descriptor.transaction_id, bytes)
+            .append_prepared(&descriptor.transaction_id, &bytes)
             .unwrap_or_else(|_| unreachable!());
         backend
             .flush(&descriptor.transaction_id)
@@ -1056,10 +1056,10 @@ mod tests {
             .prepare(&descriptor)
             .unwrap_or_else(|_| unreachable!());
         backend
-            .append_prepared(&descriptor.transaction_id, bytes)
+            .append_prepared(&descriptor.transaction_id, &bytes)
             .unwrap_or_else(|_| unreachable!());
         backend
-            .append_prepared(&descriptor.transaction_id, bytes)
+            .append_prepared(&descriptor.transaction_id, &bytes)
             .unwrap_or_else(|_| unreachable!());
         backend
             .flush(&descriptor.transaction_id)
@@ -1171,7 +1171,7 @@ mod tests {
             .prepare(&descriptor)
             .unwrap_or_else(|_| unreachable!());
         backend
-            .append_prepared(&descriptor.transaction_id, bytes)
+            .append_prepared(&descriptor.transaction_id, &bytes)
             .unwrap_or_else(|_| unreachable!());
         backend
             .flush(&descriptor.transaction_id)
@@ -1238,7 +1238,7 @@ mod tests {
             .prepare(&descriptor)
             .unwrap_or_else(|_| unreachable!());
         backend
-            .append_prepared(&descriptor.transaction_id, bytes)
+            .append_prepared(&descriptor.transaction_id, &bytes)
             .unwrap_or_else(|_| unreachable!());
         backend
             .flush(&descriptor.transaction_id)
