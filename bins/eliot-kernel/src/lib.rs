@@ -1687,6 +1687,17 @@ pub fn default_work_root() -> Result<PathBuf, std::io::Error> {
 mod tests {
     use super::*;
     use eliot_contracts::ContractVersion;
+    use eliot_kernel_core::{KernelError, KernelResult, SealedAuthoritySnapshot};
+    use eliot_ors::{
+        EpochIdentity, EpochLineage, OpaqueLabel, OperationIdentity, RecoveryPayload,
+        StateFenceSnapshot,
+    };
+    use eliot_platform::SecretReference;
+    use eliot_process::{
+        ActionLeaseRef, DispatchPermitReplaySnapshot, EnvironmentInheritance,
+        EnvironmentProjection, EvidenceSinkError, FencingToken, ImageId, JobId, OperationId,
+        PermitIssuance, ProcessEvidence, ProcessTreeId, ResourceLimits, SessionId,
+    };
     use eliot_runtime_contracts::ModuleContract;
 
     fn test_client(policy: &ServerHandshakePolicy) -> eliot_protocol::ClientHello {
@@ -1713,6 +1724,132 @@ mod tests {
             max_frame: policy.max_frame,
             authority_epoch: policy.module_generation.state_fence.authority_epoch,
         }
+    }
+
+    struct JsonSnapshotCodec;
+
+    impl DispatchSnapshotCodec for JsonSnapshotCodec {
+        fn seal(
+            &self,
+            snapshot: &DispatchPermitReplaySnapshot,
+            _binding: &AuthoritySnapshotBinding,
+        ) -> KernelResult<SealedAuthoritySnapshot> {
+            let ciphertext = serde_json::to_vec(snapshot)
+                .map_err(|error| KernelError::DependencyUnavailable(error.to_string()))?;
+            let key = SecretReference::new("test-provider", "kernel-authority")
+                .map_err(|error| KernelError::DependencyUnavailable(error.to_string()))?;
+            SealedAuthoritySnapshot::new(key, ciphertext)
+        }
+
+        fn open(
+            &self,
+            payload: &RecoveryPayload,
+            _binding: &AuthoritySnapshotBinding,
+        ) -> KernelResult<DispatchPermitReplaySnapshot> {
+            let RecoveryPayload::Encrypted { ciphertext, .. } = payload else {
+                return Err(KernelError::RecoveryUnavailable(
+                    "authority fixture payload is not encrypted".to_owned(),
+                ));
+            };
+            serde_json::from_slice(ciphertext)
+                .map_err(|error| KernelError::RecoveryUnavailable(error.to_string()))
+        }
+    }
+
+    struct UnusedReplayStore;
+
+    impl ProcessExecutionReplayStore for UnusedReplayStore {
+        fn load_process_start(
+            &self,
+            _operation_id: &OperationId,
+        ) -> KernelResult<Option<ProcessExecutionReplayRecord>> {
+            Ok(None)
+        }
+
+        fn begin_process_start(
+            &self,
+            _operation_id: &OperationId,
+            _admission_digest: &str,
+            _owner: &ProcessOwnerBinding,
+        ) -> KernelResult<ProcessExecutionReplayBegin> {
+            Err(KernelError::DependencyUnavailable(
+                "fixture replay store is not used".to_owned(),
+            ))
+        }
+
+        fn persist_process_start(
+            &self,
+            _operation_id: &OperationId,
+            _record: ProcessExecutionReplayRecord,
+        ) -> KernelResult<()> {
+            Err(KernelError::DependencyUnavailable(
+                "fixture replay store is not used".to_owned(),
+            ))
+        }
+    }
+
+    struct UnusedEvidenceSink;
+
+    impl ProcessEvidenceSink for UnusedEvidenceSink {
+        fn record(&self, _evidence: ProcessEvidence) -> Result<(), EvidenceSinkError> {
+            Ok(())
+        }
+    }
+
+    struct UnusedValidationContext;
+
+    impl ProcessValidationContextProvider for UnusedValidationContext {
+        fn current_context(&self) -> Result<DispatchValidationContext, ProcessExecutionError> {
+            Err(ProcessExecutionError::Unavailable(
+                "fixture validation context is not used".to_owned(),
+            ))
+        }
+
+        fn validate_intent(&self, _intent: &ProcessIntent) -> Result<(), ProcessExecutionError> {
+            Ok(())
+        }
+    }
+
+    fn authority_binding(authority_id: &DispatchAuthorityId) -> AuthoritySnapshotBinding {
+        let epoch = EpochLineage {
+            current: EpochIdentity {
+                lineage_id: OpaqueLabel::new("kernel-test-lineage").expect("lineage"),
+                epoch: 1,
+            },
+            predecessor: None,
+        };
+        let state_fence =
+            StateFenceSnapshot::capture(&serde_json::json!({"authority": "kernel-test"}), 1)
+                .expect("state fence");
+        AuthoritySnapshotBinding::new(
+            authority_id.clone(),
+            OperationIdentity::new("kernel-test-authority-record").expect("record id"),
+            epoch,
+            state_fence,
+            1,
+            None,
+        )
+        .expect("authority binding")
+    }
+
+    fn seed_intent() -> ProcessIntent {
+        ProcessIntent::new(
+            OperationId::new("kernel-authority-seed-operation").expect("operation"),
+            ProcessTreeId::new("kernel-authority-seed-tree").expect("tree"),
+            JobId::new("kernel-authority-seed-job").expect("job"),
+            ImageId::new("kernel-authority-seed-image").expect("image"),
+            SessionId::new("kernel-authority-seed-session").expect("session"),
+            Generation::new(1).expect("generation"),
+            "C:\\eliot\\seed-worker.exe",
+            "c".repeat(64),
+            vec!["--seed".to_owned()],
+            "C:\\eliot",
+            EnvironmentProjection::new(BTreeMap::new(), Vec::new(), EnvironmentInheritance::None)
+                .expect("environment"),
+            ResourceLimits::new(10_000, Some(5_000), Some(1_048_576), 4096, 4096, 4)
+                .expect("limits"),
+        )
+        .expect("intent")
     }
 
     #[test]
@@ -1806,6 +1943,70 @@ mod tests {
         let kernel = KernelComposition::new(KernelConfig::new(&root)).expect("composition");
         assert!(!kernel.process_execution_configured());
         assert_eq!(Arc::strong_count(&kernel.generation_gateway.ors), 1);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn process_authority_constructor_reuses_one_real_ors_store() {
+        let root = std::env::temp_dir().join(format!(
+            "eliot-kernel-process-authority-constructor-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).expect("test work root");
+        let ors_path = root.join(".eliot").join("kernel-ors.redb");
+        let authority_id = DispatchAuthorityId::new("kernel-test-authority").expect("authority");
+        let binding = authority_binding(&authority_id);
+        let codec: Arc<dyn DispatchSnapshotCodec> = Arc::new(JsonSnapshotCodec);
+        let store = Arc::new(RedbRecoveryStore::open(&ors_path).expect("real ORS store"));
+        let seed_store: Arc<dyn OperationalRecoveryStore> = store.clone();
+        let seed_key = KernelDispatchKey::from_secret_bytes([0x4a; 32]).expect("seed key");
+        let mut seeder = ProcessDispatchAuthorityController::activate(
+            authority_id.clone(),
+            seed_key,
+            seed_store,
+            Arc::clone(&codec),
+        );
+        let seed_fence =
+            FencingToken::new(1, Generation::new(1).expect("generation"), "seed-fence")
+                .expect("seed fence");
+        seeder
+            .issue(
+                &seed_intent(),
+                PermitIssuance::new(
+                    ActionLeaseRef::new("seed-lease").expect("lease"),
+                    seed_fence,
+                    BTreeMap::from([("authority".to_owned(), "a".repeat(64))]),
+                    1,
+                    2,
+                    "seed-nonce",
+                )
+                .expect("issuance"),
+                &binding,
+            )
+            .expect("production authority snapshot seed");
+        drop(seeder);
+        drop(store);
+
+        let kernel = KernelComposition::new_with_process_authority(
+            KernelConfig::new(&root),
+            ProcessExecutionAuthorityConfig {
+                authority_id,
+                key: KernelDispatchKey::from_secret_bytes([0x4a; 32]).expect("restore key"),
+                snapshot_binding: binding,
+                snapshot_codec: codec,
+                replay_store: Arc::new(UnusedReplayStore),
+                evidence_sink: Arc::new(UnusedEvidenceSink),
+                validation_context: Arc::new(UnusedValidationContext),
+            },
+        )
+        .expect("process authority constructor");
+        assert!(kernel.process_execution_configured());
+        assert_eq!(Arc::strong_count(&kernel.generation_gateway.ors), 2);
+        drop(kernel);
         let _ = std::fs::remove_dir_all(root);
     }
 
