@@ -1,8 +1,9 @@
 use std::io::{self, Write};
 
-use eliot_wasm_host::{CliError, Profile, Transport, parse_args};
+use eliot_wasm_host::{CliError, parse_args};
 
 const INVALID_ARGUMENT_EXIT: i32 = 2;
+const ADMISSION_REQUIRED_EXIT: i32 = 1;
 
 fn emit_error(code: &str, detail: &str) {
     let mut stderr = io::stderr().lock();
@@ -26,14 +27,10 @@ fn main() {
         }
     };
 
-    let transport = match config.transport {
-        Transport::Stdio => "stdio",
-        Transport::Loopback => "loopback",
-    };
-    let detail = format!(
-        "profile={} transport={} provider=wasmtime-component version=47.0.0 status=ready; admission=Kernel",
-        Profile::as_str(config.profile),
-        transport
+    let _ = config;
+    emit_error(
+        "KERNEL_ADMISSION_REQUIRED",
+        "Kernel RuntimePorts, admitted artifact, authenticated request loop, and live service are not bound",
     );
-    emit_error("READY", &detail);
+    std::process::exit(ADMISSION_REQUIRED_EXIT);
 }

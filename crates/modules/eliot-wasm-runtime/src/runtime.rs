@@ -16,6 +16,8 @@ use crate::{
     canonical_digest, validate_text,
 };
 
+const MAX_CACHED_INVOCATIONS: usize = 256;
+
 #[derive(Clone)]
 struct SealedAdmission {
     governor: GovernorResolution,
@@ -31,6 +33,7 @@ struct CachedInvocation {
     launch_envelope: Option<ProcessLaunchEnvelope>,
     process_binding: Option<ProcessBinding>,
     engine_invocation: Option<EngineInvocation>,
+    terminal_report: Option<EngineReport>,
     result: InvocationResult,
 }
 
@@ -83,8 +86,7 @@ impl WasmRuntime {
         }
         let cached = execute_uncached(self.ports.as_mut(), request);
         let result = cached.result.clone();
-        self.cache
-            .insert(cached.request.invocation_id.clone(), cached);
+        self.cache_insert(cached.request.invocation_id.clone(), cached);
         result
     }
 
@@ -198,10 +200,10 @@ impl WasmRuntime {
             .process_receipt_verifier
             .verify_reconciliation(&invocation.process_binding, &process_evidence, envelope)
             .map_err(|_| RuntimeError::InvalidProcessReceipt)?;
-        let report = ports
-            .engine
-            .reconcile(invocation)
-            .map_err(|_| RuntimeError::UnknownOutcome)?;
+        let report = cached
+            .terminal_report
+            .clone()
+            .ok_or(RuntimeError::UnknownOutcome)?;
         let result = classify_engine_report(ports, &cached.request, admission, invocation, report);
         self.replace_cached_result(invocation_id, result)
     }
@@ -218,6 +220,16 @@ impl WasmRuntime {
         Ok(result)
     }
 
+    fn cache_insert(&mut self, invocation_id: crate::InvocationId, cached: CachedInvocation) {
+        if self.cache.len() >= MAX_CACHED_INVOCATIONS
+            && !self.cache.contains_key(&invocation_id)
+            && let Some(oldest) = self.cache.keys().next().cloned()
+        {
+            self.cache.remove(&oldest);
+        }
+        self.cache.insert(invocation_id, cached);
+    }
+
     fn cache_plain(
         &mut self,
         request: InvocationRequest,
@@ -225,7 +237,7 @@ impl WasmRuntime {
         error: RuntimeError,
     ) -> InvocationResult {
         let result = plain_result(&request, disposition, error);
-        self.cache.insert(
+        self.cache_insert(
             request.invocation_id.clone(),
             CachedInvocation {
                 request,
@@ -233,6 +245,7 @@ impl WasmRuntime {
                 launch_envelope: None,
                 process_binding: None,
                 engine_invocation: None,
+                terminal_report: None,
                 result: result.clone(),
             },
         );
@@ -326,6 +339,7 @@ fn execute_uncached(
             RuntimeError::UnknownOutcome,
         );
     };
+    let terminal_report = Some(report.clone());
     let result = classify_engine_report(ports, &request, &admission, &invocation, report);
     CachedInvocation {
         request,
@@ -333,6 +347,7 @@ fn execute_uncached(
         launch_envelope: Some(envelope),
         process_binding: Some(invocation.process_binding.clone()),
         engine_invocation: Some(invocation),
+        terminal_report,
         result,
     }
 }
@@ -805,6 +820,7 @@ fn cached_plain(
         launch_envelope: None,
         process_binding: None,
         engine_invocation: None,
+        terminal_report: None,
         result,
     }
 }
@@ -822,6 +838,7 @@ fn cached_with_admission(
         launch_envelope: None,
         process_binding: None,
         engine_invocation: None,
+        terminal_report: None,
         result,
     }
 }
@@ -840,6 +857,7 @@ fn cached_with_process_unknown(
         launch_envelope: Some(launch_envelope),
         process_binding: Some(process_binding),
         engine_invocation: None,
+        terminal_report: None,
         result,
     }
 }
@@ -858,6 +876,7 @@ fn cached_with_engine_unknown(
         launch_envelope: Some(launch_envelope),
         process_binding: Some(engine_invocation.process_binding.clone()),
         engine_invocation: Some(engine_invocation),
+        terminal_report: None,
         result,
     }
 }

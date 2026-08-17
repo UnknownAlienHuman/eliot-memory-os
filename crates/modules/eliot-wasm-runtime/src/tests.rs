@@ -681,6 +681,7 @@ impl ComponentEnginePort for EngineMock {
     }
 
     fn reconcile(&mut self, invocation: &EngineInvocation) -> Result<EngineReport, PortError> {
+        lock_state(&self.state).engine_calls += 1;
         Ok(Self::report(invocation, &self.config.reconcile_report))
     }
 }
@@ -1097,7 +1098,7 @@ fn partial_and_post_commit_unknown_reconcile_only_after_p03_evidence() {
         let original = request();
         let invocation_id = original.invocation_id.clone();
         let request_digest = original.request_digest().clone();
-        let (mut runtime, _) = runtime(config);
+        let (mut runtime, state) = runtime(config);
         assert_eq!(
             runtime.execute(original.clone()).receipt.disposition,
             InvocationDisposition::Unknown
@@ -1105,8 +1106,9 @@ fn partial_and_post_commit_unknown_reconcile_only_after_p03_evidence() {
         let reconciled = must(runtime.reconcile(&invocation_id, &request_digest));
         assert_eq!(
             reconciled.receipt.disposition,
-            InvocationDisposition::Succeeded
+            InvocationDisposition::Unknown
         );
+        assert_eq!(lock_state(&state).engine_calls, 1);
         assert_eq!(runtime.execute(original), reconciled);
     }
 }
