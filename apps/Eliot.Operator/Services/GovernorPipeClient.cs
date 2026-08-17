@@ -74,33 +74,28 @@ public sealed class GovernorPipeClient(RuntimeDiscoveryService discovery) : IGov
         await _requestGate.WaitAsync(cancellationToken);
         try
         {
-            for (var attempt = 0; attempt < 2; attempt++)
+            try
             {
-                try
+                await EnsureConnectedAsync(cancellationToken);
+                var response = await RequestAsync<JsonRpcResponse<McpToolResult>>(new
                 {
-                    await EnsureConnectedAsync(cancellationToken);
-                    var response = await RequestAsync<JsonRpcResponse<McpToolResult>>(new
-                    {
-                        jsonrpc = "2.0",
-                        id = Interlocked.Increment(ref _requestId),
-                        method = "tools/call",
-                        @params = new { name = tool, arguments }
-                    }, cancellationToken);
-                    if (response.Error is not null || response.Result is null)
-                    {
-                        throw new InvalidOperationException($"Governor rejected operator tool {tool}");
-                    }
-                    return response.Result.StructuredContent.Deserialize<T>(Json)
-                        ?? throw new InvalidOperationException($"Governor returned an empty {tool} result");
-                }
-                catch (Exception error) when (
-                    attempt == 0
-                    && error is IOException or UnauthorizedAccessException or RuntimeDiscoveryException)
+                    jsonrpc = "2.0",
+                    id = Interlocked.Increment(ref _requestId),
+                    method = "tools/call",
+                    @params = new { name = tool, arguments }
+                }, cancellationToken);
+                if (response.Error is not null || response.Result is null)
                 {
-                    await DisconnectAsync();
+                    throw new InvalidOperationException($"Governor rejected operator tool {tool}");
                 }
+                return response.Result.StructuredContent.Deserialize<T>(Json)
+                    ?? throw new InvalidOperationException($"Governor returned an empty {tool} result");
             }
-            throw new IOException("Governor named-pipe reconnect failed");
+            catch (IOException)
+            {
+                await DisconnectAsync();
+                throw;
+            }
         }
         finally
         {
@@ -110,14 +105,11 @@ public sealed class GovernorPipeClient(RuntimeDiscoveryService discovery) : IGov
 
     private async Task EnsureConnectedAsync(CancellationToken cancellationToken)
     {
-        var activeRuntime = await discovery.DiscoverAsync(cancellationToken);
-        if (_pipe?.IsConnected == true
-            && _endpoint?.BrokerEpoch == activeRuntime.BrokerEpoch
-            && _endpoint.InteractiveSessionId == activeRuntime.InteractiveSessionId
-            && _endpoint.HandoffNonce == activeRuntime.HandoffNonce)
+        if (_pipe?.IsConnected == true && _endpoint is not null)
         {
             return;
         }
+        var activeRuntime = await discovery.DiscoverAsync(cancellationToken);
         if (_pipe is not null)
         {
             await DisconnectAsync();

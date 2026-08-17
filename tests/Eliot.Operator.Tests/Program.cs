@@ -10,6 +10,23 @@ Equal(OperatorProtocol.SchemaVersion, manifest.RootElement.GetProperty("schema_v
 Equal(OperatorProtocol.IpcProtocolVersion, manifest.RootElement.GetProperty("ipc_protocol_version").GetString(), "IPC version");
 Equal(64, OperatorProtocol.PinnedContractHash.Length, "pinned BLAKE3 contract hash length");
 True(!OperatorProtocol.PinnedContractHash.Contains("PENDING", StringComparison.Ordinal), "contract hash finalized");
+
+var endpoint = new OperatorEndpoint(
+    @"\\.\pipe\eliot\operator\one-shot", 7, "session-1", "nonce-1",
+    "human_operator", ["controlboard.read", "operator.command"]);
+RuntimeDiscoveryService.ValidateEndpoint(endpoint);
+var wrongCapabilities = endpoint with { Capabilities = ["operator.command"] };
+var wrongCapabilitiesRejected = false;
+try { RuntimeDiscoveryService.ValidateEndpoint(wrongCapabilities); }
+catch (RuntimeDiscoveryException error) when (error.Code == "endpoint_invalid") { wrongCapabilitiesRejected = true; }
+True(wrongCapabilitiesRejected, "exact Operator capability allowlist");
+Environment.SetEnvironmentVariable(
+    RuntimeDiscoveryService.EndpointEnvironmentVariable,
+    JsonSerializer.Serialize(endpoint));
+await new RuntimeDiscoveryService().DiscoverAsync();
+True(
+    Environment.GetEnvironmentVariable(RuntimeDiscoveryService.EndpointEnvironmentVariable) is null,
+    "one-shot endpoint environment cleared after parse");
 Equal(
     "3c1a50d6581e90838a2375fadd70f6868a499d48f4e83223613a0a5fdedf2278",
     OperatorProtocol.PinnedContractHash,
@@ -31,20 +48,6 @@ True(OperatorPageCatalog.All.Any(page => page.Tag == "causal_provenance"), "nati
 True(OperatorPageCatalog.All.Any(page => page.Tag == "query_lab"), "semantic query lab page");
 Equal(6, manifest.RootElement.GetProperty("schema_families").GetArrayLength(), "live schema families");
 Equal(6, manifest.RootElement.GetProperty("query_operations").GetArrayLength(), "closed query operations");
-
-var publication = Runtime("runtime-a", "generation-a");
-var authentication = Auth("runtime-a", "generation-a");
-RuntimeDiscoveryService.ValidateGeneration(publication, authentication);
-var staleRejected = false;
-try
-{
-    RuntimeDiscoveryService.ValidateGeneration(publication, Auth("runtime-a", "generation-stale"));
-}
-catch (RuntimeDiscoveryException error) when (error.Code == "stale_auth")
-{
-    staleRejected = true;
-}
-True(staleRejected, "stale authentication generation rejected");
 
 var client = new FakeGovernorClient();
 var viewModel = new MainViewModel(client)
@@ -122,14 +125,6 @@ await cancelled;
 Equal("Request cancelled", viewModel.StatusTitle, "nonblocking cancellation surfaced");
 
 Console.WriteLine("ELIOT Operator protocol, auth, paging, view-model and command tests passed");
-
-static RuntimePublication Runtime(string runtimeId, string generation) => new(
-    "eliot-runtime-publication-v1", OperatorProtocol.IpcProtocolVersion, "default", runtimeId,
-    generation, @"\\.\pipe\eliot", "ready", "auth.json");
-
-static RuntimeAuthentication Auth(string runtimeId, string generation) => new(
-    "eliot-runtime-auth-v1", OperatorProtocol.IpcProtocolVersion, "default", runtimeId,
-    @"\\.\pipe\eliot", "secret", generation, generation);
 
 static void True(bool condition, string label)
 {

@@ -15,6 +15,8 @@ public sealed class RuntimeDiscoveryService
     {
         cancellationToken.ThrowIfCancellationRequested();
         var encoded = Environment.GetEnvironmentVariable(EndpointEnvironmentVariable);
+        // The inherited value is a consuming authenticator, never a reconnect token.
+        Environment.SetEnvironmentVariable(EndpointEnvironmentVariable, null);
         if (string.IsNullOrWhiteSpace(encoded))
         {
             throw new RuntimeDiscoveryException("endpoint_missing", "authenticated User Broker endpoint was not inherited");
@@ -41,8 +43,9 @@ public sealed class RuntimeDiscoveryService
             || string.IsNullOrWhiteSpace(endpoint.InteractiveSessionId)
             || string.IsNullOrWhiteSpace(endpoint.HandoffNonce)
             || endpoint.Role != "human_operator"
-            || endpoint.Capabilities.Count == 0
-            || endpoint.Capabilities.Any(string.IsNullOrWhiteSpace))
+            || !endpoint.Capabilities.SequenceEqual(
+                ["controlboard.read", "operator.command"],
+                StringComparer.Ordinal))
         {
             throw new RuntimeDiscoveryException("endpoint_invalid", "User Broker endpoint is not a role-filtered authenticated binding");
         }

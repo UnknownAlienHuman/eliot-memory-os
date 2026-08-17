@@ -427,6 +427,26 @@ pub mod kernel_client {
         UnknownOutcome(String),
     }
 
+    /// Provider-neutral request for the interactive Operator contour.  The
+    /// Kernel must bind this request to its admitted handshake snapshot; the
+    /// CLI never supplies a path, image, digest, capability, fence, or clock.
+    #[derive(Clone, Debug, Deserialize, serde::Serialize, PartialEq, Eq)]
+    #[serde(deny_unknown_fields)]
+    pub struct OperatorLaunchRequest {
+        pub role: String,
+        pub capabilities: Vec<String>,
+    }
+
+    /// Provider-neutral launch receipt returned by the User Broker/Kernel
+    /// boundary.  Its fields intentionally remain opaque to the CLI.
+    #[derive(Clone, Debug, Deserialize, serde::Serialize, PartialEq, Eq)]
+    #[serde(deny_unknown_fields)]
+    pub struct OperatorLaunchReceipt {
+        pub operation_id: String,
+        pub status: String,
+        pub receipt: Value,
+    }
+
     /// Exact server-owned configuration snapshot carried by `ServerHello`.
     /// This is deliberately closed: a plausible arbitrary JSON object cannot
     /// stand in for the Kernel's generation, authority and artifact binding.
@@ -485,6 +505,23 @@ pub mod kernel_client {
         /// Binds the exact caller identity for the next application request.
         pub fn set_request_identity(&mut self, identity: RequestIdentity) {
             self.request_identity = Some(identity);
+        }
+
+        /// Requests the broker-owned Operator launch.  This remains closed
+        /// until Kernel advertises the operation and its handshake snapshot
+        /// includes the current fence and observed clock needed to construct
+        /// the request identity.  No local identity is a valid substitute.
+        pub fn ensure_operator_launch(&mut self) -> Result<Value, KernelClientError> {
+            let _request = OperatorLaunchRequest {
+                role: "human_operator".to_owned(),
+                capabilities: vec![
+                    "controlboard.read".to_owned(),
+                    "operator.command".to_owned(),
+                ],
+            };
+            Err(KernelClientError::FrontDoorClosed(
+                "Kernel user-broker Operator launch contract with admitted fence/clock snapshot",
+            ))
         }
 
         /// Performs a bounded authenticated health exchange with Kernel.

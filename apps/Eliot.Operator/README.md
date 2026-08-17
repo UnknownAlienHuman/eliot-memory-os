@@ -14,7 +14,7 @@ Build and verify with the installed x64 .NET SDK `10.0.302`:
 dotnet publish apps/Eliot.Operator/Eliot.Operator.csproj -c Release -r win-x64 --self-contained true -o dist/windows-x64/Eliot.Operator
 ```
 
-The app discovers `%LOCALAPPDATA%\Eliot\instances\default\runtime\publication.json`, validates its referenced auth generation, connects with `NamedPipeClientStream`, uses the `human_operator` profile, and reconnects once after runtime rotation.
+The app consumes only the inherited one-shot `ELIOT_OPERATOR_ENDPOINT`, clears it immediately after parsing, validates the exact `human_operator` capability set, and connects with `NamedPipeClientStream`. It does not discover publication, authentication-reference, token, or Governor files and does not replay a consumed nonce.
 
 The L8 live smoke loaded canonical task cognition, displayed exactly one autonomy
 run, and drove `DRAFT -> RUNNING -> PAUSED_BY_OPERATOR -> RUNNING` through typed
