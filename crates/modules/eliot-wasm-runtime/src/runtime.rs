@@ -713,6 +713,8 @@ fn report_contract_valid(invocation: &EngineInvocation, report: &EngineReport) -
             .usage
             .stack_bytes
             .is_none_or(|value| value <= limits.max_stack_bytes)
+        && (report.usage.stack_bytes.is_some()
+            || report.usage.enforced_stack_limit_bytes == Some(limits.max_stack_bytes))
         && (report.usage.elapsed_ms <= limits.wall_deadline_ms
             || matches!(
                 report.termination,
@@ -745,7 +747,8 @@ fn report_contract_valid(invocation: &EngineInvocation, report: &EngineReport) -
         && (!matches!(report.termination, EngineTermination::Completed)
             || (report.usage.peak_memory_bytes.is_some()
                 && report.usage.table_elements.is_some()
-                && report.usage.stack_bytes.is_some()
+                && (report.usage.stack_bytes.is_some()
+                    || report.usage.enforced_stack_limit_bytes == Some(limits.max_stack_bytes))
                 && report.usage.epoch_ticks.is_some()))
 }
 

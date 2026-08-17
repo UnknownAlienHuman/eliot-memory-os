@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 
 use eliot_wasm_runtime::{
     ComponentEnginePort, EngineBinding, EngineInvocation, EngineReport, EngineTermination,
-    EngineUsage, PortError, Sha256Digest, TrapClass,
+    EngineUsage, InvocationLimits, PortError, Sha256Digest, TrapClass,
 };
 use wasmtime::component::{Component, Linker};
 use wasmtime::{Config, Engine, ResourceLimiter, Store, StoreLimits, StoreLimitsBuilder};
@@ -76,8 +76,7 @@ impl ResourceLimiter for StoreState {
 /// Concrete typed Wasmtime Component Model provider for one admitted artifact.
 /// The linker is deliberately empty: this world has no host imports or WASI.
 pub struct WasmtimeComponentEngine {
-    engine: Engine,
-    component: Component,
+    artifact: Vec<u8>,
     binding: EngineBinding,
     artifact_digest: Sha256Digest,
     artifact_bytes: u64,
@@ -126,10 +125,9 @@ impl WasmtimeComponentEngine {
         config.consume_fuel(true);
         config.epoch_interruption(true);
         let engine = Engine::new(&config).map_err(WasmtimeBuildError::Config)?;
-        let component = Component::new(&engine, artifact).map_err(WasmtimeBuildError::Compile)?;
+        Component::new(&engine, artifact).map_err(WasmtimeBuildError::Compile)?;
         Ok(Self {
-            engine,
-            component,
+            artifact: artifact.to_vec(),
             binding,
             artifact_digest,
             artifact_bytes: artifact.len() as u64,
@@ -137,10 +135,28 @@ impl WasmtimeComponentEngine {
     }
 
     #[allow(clippy::too_many_lines)]
-    fn invoke_component(&self, invocation: &EngineInvocation) -> EngineReport {
-        let limits = &invocation.limits;
+    fn invoke_component(
+        &self,
+        request_digest: &Sha256Digest,
+        limits: &InvocationLimits,
+        input: &[u8],
+        post_commit_known: bool,
+    ) -> EngineReport {
+        let stack_size = usize::try_from(limits.max_stack_bytes).unwrap_or(usize::MAX);
+        let mut config = Config::new();
+        config.wasm_component_model(true);
+        config.consume_fuel(true);
+        config.epoch_interruption(true);
+        config.max_wasm_stack(stack_size);
+        config.async_stack_size(stack_size);
+        let Ok(invocation_engine) = Engine::new(&config) else {
+            return host_contract_report(request_digest, self.artifact_bytes);
+        };
+        let Ok(component) = Component::new(&invocation_engine, &self.artifact) else {
+            return host_contract_report(request_digest, self.artifact_bytes);
+        };
         let mut store = Store::new(
-            &self.engine,
+            &invocation_engine,
             StoreState {
                 limits: StoreLimitsBuilder::new()
                     .memory_size(usize::try_from(limits.max_memory_bytes).unwrap_or(usize::MAX))
@@ -159,28 +175,38 @@ impl WasmtimeComponentEngine {
         let mut instances = 0;
         let fuel_set = store.set_fuel(limits.max_fuel).is_ok();
         let wall_ticks = limits.wall_deadline_ms;
-        let epoch_deadline = limits.epoch.deadline_ticks.min(wall_ticks);
+        let epoch_deadline = limits.epoch.deadline_ticks;
         store.set_epoch_deadline(epoch_deadline);
         let stop_epoch = Arc::new(AtomicBool::new(false));
         let epoch_stop = Arc::clone(&stop_epoch);
+        let wall_interrupted = Arc::new(AtomicBool::new(false));
+        let wall_interrupted_thread = Arc::clone(&wall_interrupted);
         let epoch_ticks = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let observed_epoch_ticks = Arc::clone(&epoch_ticks);
-        let epoch_engine = self.engine.clone();
+        let epoch_engine = invocation_engine.clone();
         let epoch_thread = thread::spawn(move || {
+            let wall_deadline = Instant::now() + Duration::from_millis(wall_ticks);
             while !epoch_stop.load(Ordering::Acquire) {
                 thread::sleep(Duration::from_millis(1));
+                if Instant::now() >= wall_deadline {
+                    wall_interrupted_thread.store(true, Ordering::Release);
+                    for _ in 0..=epoch_deadline {
+                        epoch_engine.increment_epoch();
+                        observed_epoch_ticks.fetch_add(1, Ordering::AcqRel);
+                    }
+                    break;
+                }
                 epoch_engine.increment_epoch();
                 observed_epoch_ticks.fetch_add(1, Ordering::AcqRel);
             }
         });
 
         let (termination, output) = if fuel_set {
-            let linker = Linker::new(&self.engine);
-            let call =
-                Guest::instantiate(&mut store, &self.component, &linker).and_then(|instance| {
-                    instances = 1;
-                    instance.call_run(&mut store, &invocation.input)
-                });
+            let linker = Linker::new(&invocation_engine);
+            let call = Guest::instantiate(&mut store, &component, &linker).and_then(|instance| {
+                instances = 1;
+                instance.call_run(&mut store, input)
+            });
             match call {
                 Ok(Ok(value)) if value.len() as u64 <= limits.max_output_bytes => {
                     (EngineTermination::Completed, value)
@@ -211,24 +237,14 @@ impl WasmtimeComponentEngine {
         drop(store);
         let elapsed_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
         let fuel_consumed = limits.max_fuel.saturating_sub(remaining_fuel);
-        let wall_deadline = elapsed_ms >= limits.wall_deadline_ms;
         let termination = match termination {
-            EngineTermination::Completed if wall_deadline => {
-                if limits.wall_deadline_ms <= limits.epoch.deadline_ticks {
-                    EngineTermination::Deadline
-                } else {
-                    EngineTermination::EpochDeadline
-                }
-            }
-            EngineTermination::EpochDeadline
-                if wall_deadline && limits.wall_deadline_ms <= limits.epoch.deadline_ticks =>
-            {
+            EngineTermination::EpochDeadline if wall_interrupted.load(Ordering::Acquire) => {
                 EngineTermination::Deadline
             }
             other => other,
         };
         EngineReport {
-            request_digest: invocation.request_digest.clone(),
+            request_digest: request_digest.clone(),
             termination,
             usage: EngineUsage {
                 output_bytes: output.len() as u64,
@@ -238,6 +254,7 @@ impl WasmtimeComponentEngine {
                 table_elements,
                 instances,
                 stack_bytes: None,
+                enforced_stack_limit_bytes: Some(limits.max_stack_bytes),
                 elapsed_ms,
                 epoch_ticks: Some(epoch_ticks),
                 artifact_reads: 1,
@@ -250,7 +267,7 @@ impl WasmtimeComponentEngine {
             observed_state_delta: Vec::new(),
             reaped: epoch_joined,
             post_commit_known: epoch_joined
-                && invocation.manifest.imports.is_empty()
+                && post_commit_known
                 && !matches!(
                     termination,
                     EngineTermination::Partial | EngineTermination::PostCommitUnknown
@@ -285,7 +302,12 @@ impl ComponentEnginePort for WasmtimeComponentEngine {
         {
             return Err(PortError::Denied);
         }
-        Ok(self.invoke_component(invocation))
+        Ok(self.invoke_component(
+            &invocation.request_digest,
+            &invocation.limits,
+            &invocation.input,
+            invocation.manifest.imports.is_empty(),
+        ))
     }
 
     fn reconcile(&mut self, _invocation: &EngineInvocation) -> Result<EngineReport, PortError> {
@@ -300,7 +322,36 @@ fn classify_trap(error: &wasmtime::Error) -> EngineTermination {
     match *trap {
         wasmtime::Trap::OutOfFuel => EngineTermination::FuelExhausted,
         wasmtime::Trap::Interrupt => EngineTermination::EpochDeadline,
+        wasmtime::Trap::StackOverflow => EngineTermination::StackLimit,
         _ => EngineTermination::Trap(TrapClass::GuestTrap),
+    }
+}
+
+fn host_contract_report(request_digest: &Sha256Digest, artifact_bytes: u64) -> EngineReport {
+    EngineReport {
+        request_digest: request_digest.clone(),
+        termination: EngineTermination::Trap(TrapClass::HostContractViolation),
+        usage: EngineUsage {
+            output_bytes: 0,
+            host_calls: 0,
+            fuel_consumed: 0,
+            peak_memory_bytes: Some(0),
+            table_elements: Some(0),
+            instances: 0,
+            stack_bytes: None,
+            enforced_stack_limit_bytes: None,
+            elapsed_ms: 0,
+            epoch_ticks: Some(0),
+            artifact_reads: 1,
+            artifact_bytes,
+            accessed_artifact_digests: Vec::new(),
+        },
+        output: Vec::new(),
+        host_calls: Vec::new(),
+        proposed_effects: Vec::new(),
+        observed_state_delta: Vec::new(),
+        reaped: true,
+        post_commit_known: true,
     }
 }
 
@@ -320,15 +371,127 @@ mod tests {
     }
 
     #[test]
-    fn artifact_digest_is_verified_before_component_compilation() -> Result<(), String> {
-        let artifact = wat::parse_str("(component)").map_err(|error| error.to_string())?;
+    fn checked_in_guest_component_is_compiled_and_digest_bound() -> Result<(), String> {
+        let artifact =
+            wat::parse_file("tests/fixtures/guest.wat").map_err(|error| error.to_string())?;
         let wrong_digest = Sha256Digest::of_bytes(b"different");
         assert!(matches!(
             WasmtimeComponentEngine::new(binding(), wrong_digest, &artifact),
             Err(WasmtimeBuildError::ArtifactDigestMismatch)
         ));
         let digest = Sha256Digest::of_bytes(&artifact);
-        assert!(WasmtimeComponentEngine::new(binding(), digest, &artifact).is_ok());
+        WasmtimeComponentEngine::new(binding(), digest, &artifact)
+            .map_err(|error| format!("{error:?}"))?;
         Ok(())
+    }
+
+    #[test]
+    fn checked_in_guest_executes_typed_input_and_output() -> Result<(), String> {
+        let artifact =
+            wat::parse_file("tests/fixtures/guest.wat").map_err(|error| error.to_string())?;
+        let digest = Sha256Digest::of_bytes(&artifact);
+        let engine = WasmtimeComponentEngine::new(binding(), digest.clone(), &artifact)
+            .map_err(|error| error.to_string())?;
+        let limits = InvocationLimits {
+            max_input_bytes: 64,
+            max_output_bytes: 64,
+            max_host_calls: 1,
+            max_fuel: 10_000,
+            max_memory_bytes: 65_536,
+            max_table_elements: 1,
+            max_instances: 2,
+            max_stack_bytes: 8 * 1024,
+            wall_deadline_ms: 500,
+            epoch: eliot_wasm_runtime::EpochPolicy {
+                deadline_ticks: 100,
+                cancellation: eliot_wasm_runtime::CancellationPolicy::EpochAndFuel,
+            },
+            artifact_access: eliot_wasm_runtime::ArtifactAccessLimits {
+                allowed_digests: [digest].into_iter().collect(),
+                max_reads: 1,
+                max_bytes: 65_536,
+            },
+        };
+        let report = engine.invoke_component(
+            &Sha256Digest::of_bytes(b"request"),
+            &limits,
+            b"typed guest input",
+            true,
+        );
+        assert_eq!(report.termination, EngineTermination::Completed);
+        assert_eq!(report.output, b"typed guest input");
+        assert_eq!(report.usage.enforced_stack_limit_bytes, Some(8 * 1024));
+        assert!(report.usage.stack_bytes.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn output_limit_and_fuel_are_reported_from_execution() -> Result<(), String> {
+        let artifact =
+            wat::parse_file("tests/fixtures/guest.wat").map_err(|error| error.to_string())?;
+        let digest = Sha256Digest::of_bytes(&artifact);
+        let engine = WasmtimeComponentEngine::new(binding(), digest.clone(), &artifact)
+            .map_err(|error| error.to_string())?;
+        let mut limits = test_limits(digest);
+        limits.max_output_bytes = 3;
+        let output_limited = engine.invoke_component(
+            &Sha256Digest::of_bytes(b"output-limit"),
+            &limits,
+            b"typed guest input",
+            true,
+        );
+        assert_eq!(output_limited.termination, EngineTermination::OutputLimit);
+
+        limits.max_output_bytes = 64;
+        limits.max_fuel = 1;
+        let fuel_limited = engine.invoke_component(
+            &Sha256Digest::of_bytes(b"fuel-limit"),
+            &limits,
+            b"typed guest input",
+            true,
+        );
+        assert_eq!(fuel_limited.termination, EngineTermination::FuelExhausted);
+        Ok(())
+    }
+
+    #[test]
+    fn wall_deadline_interrupts_a_looping_guest() -> Result<(), String> {
+        let artifact =
+            wat::parse_file("tests/fixtures/guest_loop.wat").map_err(|error| error.to_string())?;
+        let digest = Sha256Digest::of_bytes(&artifact);
+        let engine = WasmtimeComponentEngine::new(binding(), digest.clone(), &artifact)
+            .map_err(|error| error.to_string())?;
+        let mut limits = test_limits(digest);
+        limits.wall_deadline_ms = 10;
+        limits.epoch.deadline_ticks = 10_000;
+        limits.max_fuel = u64::MAX;
+        let report =
+            engine.invoke_component(&Sha256Digest::of_bytes(b"deadline"), &limits, b"", true);
+        assert_eq!(report.termination, EngineTermination::Deadline);
+        assert!(report.usage.epoch_ticks.unwrap_or(0) > 0);
+        Ok(())
+    }
+
+    fn test_limits(digest: Sha256Digest) -> InvocationLimits {
+        InvocationLimits {
+            max_input_bytes: 64,
+            max_output_bytes: 64,
+            max_host_calls: 1,
+            max_fuel: 10_000,
+            max_memory_bytes: 65_536,
+            max_table_elements: 1,
+            max_instances: 2,
+            max_stack_bytes: 8 * 1024,
+            wall_deadline_ms: 500,
+            epoch: eliot_wasm_runtime::EpochPolicy {
+                deadline_ticks: 100,
+                cancellation: eliot_wasm_runtime::CancellationPolicy::EpochAndFuel,
+            },
+            artifact_access: eliot_wasm_runtime::ArtifactAccessLimits {
+                allowed_digests: [digest].into_iter().collect(),
+                max_reads: 1,
+                max_bytes: 65_536,
+            },
+        }
     }
 }

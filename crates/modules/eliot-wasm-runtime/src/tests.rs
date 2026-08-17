@@ -652,6 +652,7 @@ impl EngineMock {
                 table_elements: Some(1),
                 instances: 1,
                 stack_bytes: Some(1_024),
+                enforced_stack_limit_bytes: None,
                 elapsed_ms: 10,
                 epoch_ticks: Some(10),
                 artifact_reads: 1,

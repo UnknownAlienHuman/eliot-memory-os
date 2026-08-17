@@ -558,6 +558,9 @@ pub struct EngineUsage {
     pub table_elements: Option<u32>,
     pub instances: u32,
     pub stack_bytes: Option<u64>,
+    /// The exact per-invocation stack ceiling enforced by the adapter when
+    /// Wasmtime cannot expose observed stack usage.
+    pub enforced_stack_limit_bytes: Option<u64>,
     pub elapsed_ms: u64,
     pub epoch_ticks: Option<u64>,
     pub artifact_reads: u32,
