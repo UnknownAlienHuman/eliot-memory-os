@@ -14,10 +14,7 @@ name = "eliot-doctor"
 path = "src/main.rs"
 
 [dependencies]
-serde.workspace = true
-serde_json.workspace = true
-thiserror.workspace = true
-uuid.workspace = true
+eliot-doctor-core.workspace = true
 
 [lints]
 workspace = true

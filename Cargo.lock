@@ -760,10 +760,7 @@ dependencies = [
 name = "eliot-doctor"
 version = "0.1.0"
 dependencies = [
- "serde",
- "serde_json",
- "thiserror",
- "uuid",
+ "eliot-doctor-core",
 ]
 
 [[package]]
@@ -774,7 +771,6 @@ dependencies = [
  "serde",
  "thiserror",
  "time",
- "uuid",
 ]
 
 [[package]]

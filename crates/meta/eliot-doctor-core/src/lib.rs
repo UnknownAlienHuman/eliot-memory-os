@@ -5,10 +5,10 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use thiserror::Error;
 use time::{Duration, OffsetDateTime};
-use uuid::Uuid;
 
 pub const CONTRACT_NAME: &str = "eliot.meta.doctor";
 pub const CONTRACT_VERSION: &str = "1.0.0";
+pub const KERNEL_ADMISSION_REQUIRED: &str = "KERNEL_ADMISSION_REQUIRED";
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -112,9 +112,7 @@ impl RecoveryLease {
         if self.expires_at <= now {
             return Err(DoctorError::LeaseExpired);
         }
-        if self.allowed_effects.is_empty()
-            || self.allowed_effects.iter().any(|e| e.trim().is_empty())
-        {
+        if self.allowed_effects.iter().any(|e| e.trim().is_empty()) {
             return Err(DoctorError::MissingField("allowed_effects"));
         }
         Ok(())
@@ -184,14 +182,16 @@ impl RepairRecipe {
         if self.revision == 0 || self.attempt_budget == 0 {
             return Err(DoctorError::InvalidBudget);
         }
-        if self.problem_classes.is_empty()
-            || self.components.is_empty()
-            || self.allowed_effects.is_empty()
-        {
+        if self.problem_classes.is_empty() || self.components.is_empty() {
             return Err(DoctorError::MissingField("recipe scope"));
         }
+        if !matches!(self.repair_class, RepairClass::DiagnoseOnly)
+            && self.allowed_effects.is_empty()
+        {
+            return Err(DoctorError::MissingField("allowed effects"));
+        }
         text(&self.required_authority, "required authority")?;
-        if self.operations.is_empty()
+        if (!matches!(self.repair_class, RepairClass::DiagnoseOnly) && self.operations.is_empty())
             || self.expected_observables.is_empty()
             || self.verification_contract.is_empty()
         {
@@ -200,7 +200,53 @@ impl RepairRecipe {
         if self.cooldown.is_negative() {
             return Err(DoctorError::InvalidBudget);
         }
+        if matches!(self.repair_class, RepairClass::DiagnoseOnly)
+            && (!self.allowed_effects.is_empty() || !self.operations.is_empty())
+        {
+            return Err(DoctorError::DiagnoseEffects);
+        }
         Ok(())
+    }
+
+    /// Digest of the exact recipe contract. It is compared with the digest
+    /// issued by Kernel; Doctor never substitutes a local recipe.
+    pub fn digest(&self) -> String {
+        let mut hasher = Hasher::new();
+        for value in [
+            self.recipe_id.as_str(),
+            &self.revision.to_string(),
+            &format!("{:?}", self.repair_class),
+            &self.required_authority,
+            &self.attempt_budget.to_string(),
+            &self.cooldown.to_string(),
+        ] {
+            hasher.update(value.as_bytes());
+            hasher.update(&[0]);
+        }
+        for values in [
+            &self.problem_classes,
+            &self.components,
+            &self.allowed_effects,
+        ] {
+            for value in values {
+                hasher.update(value.as_bytes());
+                hasher.update(&[0]);
+            }
+        }
+        for values in [
+            &self.prerequisites,
+            &self.operations,
+            &self.expected_observables,
+            &self.verification_contract,
+            &self.rollback_or_compensation,
+            &self.stop_conditions,
+        ] {
+            for value in values {
+                hasher.update(value.as_bytes());
+                hasher.update(&[0]);
+            }
+        }
+        hasher.finalize().to_hex().to_string()
     }
     pub fn applies_to(&self, brief: &DiagnosticBrief) -> bool {
         self.problem_classes.contains(&brief.failure_class)
@@ -218,6 +264,7 @@ pub struct RepairRequest {
     pub last_known_good: Option<EvidenceHandle>,
     pub cancellation: bool,
     pub escalation_target: String,
+    pub approval: Option<String>,
 }
 
 impl RepairRequest {
@@ -234,8 +281,177 @@ impl RepairRequest {
         if let Some(value) = &self.last_known_good {
             value.validate()?;
         }
+        if matches!(self.recipe.repair_class, RepairClass::Guarded)
+            && self.approval.as_deref().is_none_or(str::is_empty)
+        {
+            return Err(DoctorError::ApprovalRequired);
+        }
         Ok(())
     }
+}
+
+/// The complete, authenticated admission issued by Kernel for one invocation.
+/// All identity-bearing values are opaque to Doctor and must be echoed back.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct KernelAdmission {
+    pub operation: String,
+    pub job_id: String,
+    pub attempt_id: String,
+    pub fence: StateFence,
+    pub lease: RecoveryLease,
+    pub recipe_id: String,
+    pub recipe_revision: u64,
+    pub recipe_digest: String,
+    pub allowed_effects: BTreeSet<String>,
+    pub deadline: OffsetDateTime,
+    pub budget_units: u64,
+    pub approval: Option<String>,
+}
+
+impl KernelAdmission {
+    pub fn validate_for(
+        &self,
+        request: &RepairRequest,
+        now: OffsetDateTime,
+    ) -> Result<(), DoctorError> {
+        text(&self.operation, "operation")?;
+        if self.operation != CONTRACT_NAME {
+            return Err(DoctorError::OperationNotAdmitted);
+        }
+        text(&self.job_id, "job id")?;
+        text(&self.attempt_id, "attempt id")?;
+        self.fence.validate()?;
+        self.lease.validate_at(now)?;
+        if self.deadline <= now || self.budget_units == 0 {
+            return Err(DoctorError::DeadlineOrBudget);
+        }
+        if self.job_id != request.request_id
+            || self.fence != request.fence
+            || self.recipe_id != request.recipe.recipe_id
+            || self.recipe_revision != request.recipe.revision
+            || self.recipe_digest != request.recipe.digest()
+        {
+            return Err(DoctorError::AdmissionMismatch);
+        }
+        if self.allowed_effects != request.recipe.allowed_effects
+            || self
+                .allowed_effects
+                .iter()
+                .any(|effect| !self.lease.permits(effect))
+        {
+            return Err(DoctorError::EffectAuthorizationMismatch);
+        }
+        if matches!(request.recipe.repair_class, RepairClass::Guarded)
+            && self.approval.as_deref() != request.approval.as_deref()
+        {
+            return Err(DoctorError::ApprovalMismatch);
+        }
+        if matches!(request.recipe.repair_class, RepairClass::DiagnoseOnly)
+            && !self.allowed_effects.is_empty()
+        {
+            return Err(DoctorError::DiagnoseEffects);
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct EffectIntent {
+    pub job_id: String,
+    pub attempt_id: String,
+    pub recipe_digest: String,
+    pub effect_digest: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum EffectOutcome {
+    Receipt(AttemptReceipt),
+    Unknown { reconciliation_key: String },
+}
+
+/// Provider-neutral Kernel contour. Implementations perform authenticated IPC;
+/// Doctor has no fallback authority when the operation is not advertised.
+pub trait KernelDoctorClient {
+    type Error;
+
+    fn advertise_doctor(&mut self) -> Result<bool, Self::Error>;
+    fn admit(&mut self, request: &RepairRequest) -> Result<KernelAdmission, Self::Error>;
+    fn record_intent(&mut self, intent: &EffectIntent) -> Result<(), Self::Error>;
+    fn execute(&mut self, intent: &EffectIntent) -> Result<EffectOutcome, Self::Error>;
+    fn reconcile(&mut self, job_id: &str, attempt_id: &str) -> Result<EffectOutcome, Self::Error>;
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum InvocationOutcome {
+    Diagnosed(DoctorJob),
+    Completed(DoctorJob),
+    ReconciliationRequired {
+        job: DoctorJob,
+        reconciliation_key: String,
+    },
+}
+
+#[derive(Debug, Error)]
+pub enum InvocationError<E> {
+    #[error("Kernel does not advertise the Doctor operation")]
+    KernelAdmissionRequired,
+    #[error("Kernel client error: {0}")]
+    Kernel(E),
+    #[error("Doctor contract error: {0}")]
+    Contract(#[from] DoctorError),
+}
+
+/// Executes exactly one admitted contour. A provider owns durable status,
+/// replay protection, effect execution, and reconciliation.
+pub fn invoke_once<C>(
+    client: &mut C,
+    request: RepairRequest,
+    now: OffsetDateTime,
+) -> Result<InvocationOutcome, InvocationError<C::Error>>
+where
+    C: KernelDoctorClient,
+{
+    if !client.advertise_doctor().map_err(InvocationError::Kernel)? {
+        return Err(InvocationError::KernelAdmissionRequired);
+    }
+    let admission = client.admit(&request).map_err(InvocationError::Kernel)?;
+    admission.validate_for(&request, now)?;
+    let mut job = DoctorJob::admit(request, now)?;
+    if job.state == JobState::Cancelled {
+        return Ok(InvocationOutcome::Diagnosed(job));
+    }
+    job.transition(JobState::Diagnosing, now)?;
+    if job.plan.diagnosis_only {
+        job.transition(JobState::Escalated, now)?;
+        return Ok(InvocationOutcome::Diagnosed(job));
+    }
+    job.transition(JobState::ReadyForRepair, now)?;
+    job.transition(JobState::Running, now)?;
+    let intent = EffectIntent {
+        job_id: admission.job_id.clone(),
+        attempt_id: admission.attempt_id.clone(),
+        recipe_digest: admission.recipe_digest,
+        effect_digest: job.plan.effect_digest.clone(),
+    };
+    client
+        .record_intent(&intent)
+        .map_err(InvocationError::Kernel)?;
+    match client.execute(&intent).map_err(InvocationError::Kernel)? {
+        EffectOutcome::Unknown { reconciliation_key } => {
+            return Ok(InvocationOutcome::ReconciliationRequired {
+                job,
+                reconciliation_key,
+            });
+        }
+        EffectOutcome::Receipt(receipt) => {
+            if receipt.attempt_id != admission.attempt_id {
+                return Err(InvocationError::Contract(DoctorError::ReceiptMismatch));
+            }
+            job.transition(JobState::Verifying, now)?;
+            job.record_attempt(receipt, now)?;
+        }
+    }
+    Ok(InvocationOutcome::Completed(job))
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -272,14 +488,15 @@ impl RepairPlan {
             }
             hasher.update(operation.as_bytes());
         }
+        let effect_digest = hasher.finalize().to_hex().to_string();
         Ok(Self {
-            plan_id: Uuid::now_v7().to_string(),
+            plan_id: format!("{}:{effect_digest}", request.request_id),
             request_id: request.request_id.clone(),
             recipe_id: request.recipe.recipe_id.clone(),
             repair_class: request.recipe.repair_class,
             operations: request.recipe.operations.clone(),
             verification_contract: request.recipe.verification_contract.clone(),
-            effect_digest: hasher.finalize().to_hex().to_string(),
+            effect_digest,
             requires_governor_transition,
             diagnosis_only,
         })
@@ -317,7 +534,7 @@ impl DoctorJob {
             JobState::Admitted
         };
         Ok(Self {
-            job_id: Uuid::now_v7().to_string(),
+            job_id: request.request_id.clone(),
             request,
             plan,
             state,
@@ -454,4 +671,151 @@ pub enum DoctorError {
     ReceiptMismatch,
     #[error("repair attempt budget exhausted; component must be quarantined")]
     BudgetExhausted,
+    #[error("Kernel has not admitted the Doctor operation")]
+    OperationNotAdmitted,
+    #[error("Kernel admission does not match the requested recipe or fence")]
+    AdmissionMismatch,
+    #[error("Kernel effect authorization does not match the recipe")]
+    EffectAuthorizationMismatch,
+    #[error("guarded repair approval does not match Kernel admission")]
+    ApprovalMismatch,
+    #[error("Kernel admission deadline or budget is invalid")]
+    DeadlineOrBudget,
+    #[error("guarded repair requires exact approval")]
+    ApprovalRequired,
+    #[error("diagnose-only recipes cannot declare effects")]
+    DiagnoseEffects,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn now() -> OffsetDateTime {
+        OffsetDateTime::UNIX_EPOCH + Duration::seconds(100)
+    }
+
+    fn request(class: RepairClass, effects: &[&str]) -> RepairRequest {
+        let operations = if class == RepairClass::DiagnoseOnly {
+            Vec::new()
+        } else {
+            effects.iter().map(|value| (*value).to_owned()).collect()
+        };
+        let recipe = RepairRecipe {
+            recipe_id: "recipe".into(),
+            revision: 3,
+            problem_classes: ["failure".into()].into_iter().collect(),
+            components: ["component".into()].into_iter().collect(),
+            repair_class: class,
+            prerequisites: vec!["precondition".into()],
+            required_authority: "kernel.recovery".into(),
+            allowed_effects: effects.iter().map(|value| (*value).to_owned()).collect(),
+            operations,
+            expected_observables: vec!["healthy".into()],
+            verification_contract: vec!["verify".into()],
+            rollback_or_compensation: vec!["rollback".into()],
+            attempt_budget: 1,
+            cooldown: Duration::ZERO,
+            stop_conditions: vec!["stop".into()],
+        };
+        RepairRequest {
+            request_id: "job-1".into(),
+            brief: DiagnosticBrief {
+                problem_id: "problem".into(),
+                component: "component".into(),
+                failure_class: "failure".into(),
+                symptom: "symptom".into(),
+                impact: "impact".into(),
+                evidence: vec![EvidenceHandle::new("evidence", "a".repeat(64)).unwrap()],
+                unknowns: Vec::new(),
+            },
+            recipe,
+            fence: StateFence::new(1, 1, "b".repeat(64)).unwrap(),
+            lease: RecoveryLease {
+                lease_id: "lease".into(),
+                owner: "kernel".into(),
+                expires_at: now() + Duration::seconds(30),
+                allowed_effects: effects.iter().map(|value| (*value).to_owned()).collect(),
+            },
+            last_known_good: None,
+            cancellation: false,
+            escalation_target: "operator".into(),
+            approval: (class == RepairClass::Guarded).then(|| "approval".into()),
+        }
+    }
+
+    fn admission(request: &RepairRequest) -> KernelAdmission {
+        KernelAdmission {
+            operation: CONTRACT_NAME.into(),
+            job_id: request.request_id.clone(),
+            attempt_id: "attempt-from-kernel".into(),
+            fence: request.fence.clone(),
+            lease: request.lease.clone(),
+            recipe_id: request.recipe.recipe_id.clone(),
+            recipe_revision: request.recipe.revision,
+            recipe_digest: request.recipe.digest(),
+            allowed_effects: request.recipe.allowed_effects.clone(),
+            deadline: now() + Duration::seconds(10),
+            budget_units: 1,
+            approval: request.approval.clone(),
+        }
+    }
+
+    #[test]
+    fn admission_rejects_stale_fence_or_expired_lease() {
+        let request = request(RepairClass::AutomaticSafe, &["restart"]);
+        let mut admitted = admission(&request);
+        admitted.fence.generation = 2;
+        assert_eq!(
+            admitted.validate_for(&request, now()),
+            Err(DoctorError::AdmissionMismatch)
+        );
+        let mut admitted = admission(&request);
+        admitted.lease.expires_at = now();
+        assert_eq!(
+            admitted.validate_for(&request, now()),
+            Err(DoctorError::LeaseExpired)
+        );
+    }
+
+    #[test]
+    fn admission_rejects_recipe_digest_or_effect_mismatch() {
+        let request = request(RepairClass::AutomaticSafe, &["restart"]);
+        let mut admitted = admission(&request);
+        admitted.recipe_digest = "c".repeat(64);
+        assert_eq!(
+            admitted.validate_for(&request, now()),
+            Err(DoctorError::AdmissionMismatch)
+        );
+        let mut admitted = admission(&request);
+        admitted.allowed_effects.insert("write".into());
+        assert_eq!(
+            admitted.validate_for(&request, now()),
+            Err(DoctorError::EffectAuthorizationMismatch)
+        );
+    }
+
+    #[test]
+    fn guarded_requires_exact_approval_and_diagnosis_has_zero_effects() {
+        let mut guarded = request(RepairClass::Guarded, &["restart"]);
+        guarded.approval = Some("wrong".into());
+        let mut guarded_admission = admission(&guarded);
+        guarded_admission.approval = Some("approval".into());
+        assert_eq!(
+            guarded_admission.validate_for(&guarded, now()),
+            Err(DoctorError::ApprovalMismatch)
+        );
+        let diagnosis = request(RepairClass::DiagnoseOnly, &[]);
+        assert_eq!(diagnosis.validate(now()), Ok(()));
+        assert!(diagnosis.recipe.allowed_effects.is_empty());
+    }
+
+    #[test]
+    fn cancellation_is_terminal_and_budget_does_not_loop() {
+        let mut request = request(RepairClass::AutomaticSafe, &["restart"]);
+        request.cancellation = true;
+        let job = DoctorJob::admit(request, now()).unwrap();
+        assert_eq!(job.state, JobState::Cancelled);
+        assert_eq!(job.attempts_remaining(), 1);
+    }
 }
