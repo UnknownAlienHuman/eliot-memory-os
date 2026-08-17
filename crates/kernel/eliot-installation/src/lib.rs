@@ -13,7 +13,8 @@ use std::collections::BTreeSet;
 use std::path::Path;
 
 use eliot_contracts::{
-    ContractIdentity, ContractVersion, contract_identity as make_contract_identity,
+    ContractIdentity, ContractVersion, ResourceGeneration, StateFence, canonical_json_bytes,
+    contract_identity as make_contract_identity, sha256_hex,
 };
 use eliot_platform::{
     InstallationObservation, InstallationPort, InstallationRequest, PlatformHandle, PortError,
@@ -25,7 +26,6 @@ use eliot_platform_windows::{
 use redb::{Database, ReadableDatabase, TableDefinition};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 /// Stable wire name for the installation contract.
@@ -220,8 +220,7 @@ pub fn verify_file_digest_with_lease(
     let bytes = lease
         .read_bounded(MAX_VERIFIED_FILE_BYTES)
         .map_err(|error| InstallationError::Platform(format!("{field}: {error}")))?;
-    let digest = Sha256::digest(&bytes);
-    let actual = format!("{digest:x}");
+    let actual = sha256_hex(&bytes);
     if actual != expected.as_str() {
         return Err(InstallationError::InvalidField {
             field: field.to_owned(),
@@ -245,8 +244,7 @@ pub fn verify_file_digest_with_user_lease(
     let bytes = lease
         .read_bounded(MAX_VERIFIED_FILE_BYTES)
         .map_err(|error| InstallationError::Platform(format!("{field}: {error}")))?;
-    let digest = Sha256::digest(&bytes);
-    let actual = format!("{digest:x}");
+    let actual = sha256_hex(&bytes);
     if actual != expected.as_str() {
         return Err(InstallationError::InvalidField {
             field: field.to_owned(),
@@ -691,6 +689,18 @@ pub struct RuntimeLaunchDescriptor {
     pub profile: InstallationProfile,
     /// Canonical repository root for `portable_dev`, when applicable.
     pub portable_root: Option<PlatformHandle>,
+    /// Installation lineage that approved this launch contour.
+    pub installation_epoch: InstallationEpoch,
+    /// Exact candidate generation that approved this launch contour.
+    pub generation: PlatformHandle,
+    /// Authority generation copied from the approved handoff descriptor.
+    pub authority_generation: ResourceGeneration,
+    /// Authority fence copied from the approved handoff descriptor.
+    pub authority_state_fence: StateFence,
+    /// Absolute, installation-approved `ProcessAuthorityHandoffDescriptor` path.
+    pub authority_descriptor_path: PlatformHandle,
+    /// Independent lowercase SHA-256 digest of the authority descriptor bytes.
+    pub authority_descriptor_digest: PlatformHandle,
     /// Explicit Kernel working directory.
     pub kernel_work_root: PlatformHandle,
     /// SHA-256 digest of the approved Kernel image.
@@ -745,6 +755,10 @@ impl RuntimeLaunchDescriptor {
             self.kernel_work_root.as_str().to_owned(),
             "--store-bootstrap".to_owned(),
             self.store_bootstrap_descriptor_path.as_str().to_owned(),
+            "--authority-descriptor".to_owned(),
+            self.authority_descriptor_path.as_str().to_owned(),
+            "--authority-descriptor-sha256".to_owned(),
+            self.authority_descriptor_digest.as_str().to_owned(),
         ]
     }
 
@@ -793,6 +807,12 @@ impl RuntimeLaunchDescriptor {
         struct Unsigned<'a> {
             profile: InstallationProfile,
             portable_root: &'a Option<PlatformHandle>,
+            installation_epoch: &'a InstallationEpoch,
+            generation: &'a PlatformHandle,
+            authority_generation: ResourceGeneration,
+            authority_state_fence: &'a StateFence,
+            authority_descriptor_path: &'a PlatformHandle,
+            authority_descriptor_digest: &'a PlatformHandle,
             kernel_work_root: &'a PlatformHandle,
             kernel_artifact_digest: &'a PlatformHandle,
             store_config_path: &'a PlatformHandle,
@@ -807,9 +827,15 @@ impl RuntimeLaunchDescriptor {
             watchdog_executable_path: &'a PlatformHandle,
             watchdog_artifact_digest: &'a PlatformHandle,
         }
-        serde_json::to_vec(&Unsigned {
+        canonical_json_bytes(&Unsigned {
             profile: self.profile,
             portable_root: &self.portable_root,
+            installation_epoch: &self.installation_epoch,
+            generation: &self.generation,
+            authority_generation: self.authority_generation,
+            authority_state_fence: &self.authority_state_fence,
+            authority_descriptor_path: &self.authority_descriptor_path,
+            authority_descriptor_digest: &self.authority_descriptor_digest,
             kernel_work_root: &self.kernel_work_root,
             kernel_artifact_digest: &self.kernel_artifact_digest,
             store_config_path: &self.store_config_path,
@@ -831,7 +857,37 @@ impl RuntimeLaunchDescriptor {
     }
 
     /// Validates the explicit launch contour and its self-digest.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the launch contour is one fail-closed validation boundary"
+    )]
     pub fn validate(&self) -> Result<(), InstallationError> {
+        self.installation_epoch.validate()?;
+        handle(&self.generation, "runtime_launch.generation")?;
+        self.authority_state_fence
+            .validate()
+            .map_err(|error| InstallationError::InvalidField {
+                field: "runtime_launch.authority_state_fence".to_owned(),
+                reason: error.to_string(),
+            })?;
+        if self.authority_generation != self.authority_state_fence.resource_generation {
+            return Err(InstallationError::InvalidField {
+                field: "runtime_launch.authority_generation".to_owned(),
+                reason: "must exactly equal the authority fence resource generation".to_owned(),
+            });
+        }
+        handle(
+            &self.authority_descriptor_path,
+            "runtime_launch.authority_descriptor_path",
+        )?;
+        approved_path(
+            &self.authority_descriptor_path,
+            "runtime_launch.authority_descriptor_path",
+        )?;
+        sha256_handle(
+            &self.authority_descriptor_digest,
+            "runtime_launch.authority_descriptor_digest",
+        )?;
         handle(&self.kernel_work_root, "runtime_launch.kernel_work_root")?;
         approved_path(&self.kernel_work_root, "runtime_launch.kernel_work_root")?;
         sha256_handle(
@@ -923,8 +979,7 @@ impl RuntimeLaunchDescriptor {
             }
         }
         sha256_handle(&self.descriptor_digest, "runtime_launch.descriptor_digest")?;
-        let actual = Sha256::digest(&self.unsigned_bytes()?);
-        if format!("{actual:x}") != self.descriptor_digest.as_str() {
+        if sha256_hex(&self.unsigned_bytes()?) != self.descriptor_digest.as_str() {
             return Err(InstallationError::InvalidField {
                 field: "runtime_launch.descriptor_digest".to_owned(),
                 reason: "descriptor digest mismatch".to_owned(),
@@ -936,6 +991,10 @@ impl RuntimeLaunchDescriptor {
 
 impl CandidateManifest {
     /// Validates candidate identity and complete assurance references.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "manifest validation keeps all generation bindings in one boundary"
+    )]
     pub fn validate(&self) -> Result<(), InstallationError> {
         handle(&self.generation, "manifest.generation")?;
         handles(&self.components, "manifest.components", true)?;
@@ -988,6 +1047,12 @@ impl CandidateManifest {
             });
         }
         approved_path(&self.config_path, "manifest.config_path")?;
+        if self.runtime_launch.generation != self.generation {
+            return Err(InstallationError::InvalidField {
+                field: "manifest.runtime_launch.generation".to_owned(),
+                reason: "must exactly equal the approved manifest generation".to_owned(),
+            });
+        }
         if self.runtime_launch.store_config_path != self.config_path {
             return Err(InstallationError::InvalidField {
                 field: "manifest.runtime_launch.store_config_path".to_owned(),
@@ -998,6 +1063,15 @@ impl CandidateManifest {
             return Err(InstallationError::InvalidField {
                 field: "manifest.runtime_launch.store_bootstrap_descriptor_path".to_owned(),
                 reason: "neutral descriptor must be distinct from concrete Store config".to_owned(),
+            });
+        }
+        if self.runtime_launch.authority_descriptor_path == self.config_path
+            || self.runtime_launch.authority_descriptor_path
+                == self.runtime_launch.store_bootstrap_descriptor_path
+        {
+            return Err(InstallationError::InvalidField {
+                field: "manifest.runtime_launch.authority_descriptor_path".to_owned(),
+                reason: "authority descriptor must be distinct from Store descriptors".to_owned(),
             });
         }
         if self.runtime_launch.canonical_store_executable_path
@@ -1500,6 +1574,12 @@ impl InstallationTransaction {
         installation_epoch.validate()?;
         request.validate()?;
         candidate_manifest.validate()?;
+        if candidate_manifest.runtime_launch.installation_epoch != installation_epoch {
+            return Err(InstallationError::InvalidField {
+                field: "candidate_manifest.runtime_launch.installation_epoch".to_owned(),
+                reason: "must exactly equal the transaction installation epoch".to_owned(),
+            });
+        }
         if let Some(manifest) = &current_active_manifest {
             manifest.validate()?;
         }
@@ -1556,6 +1636,12 @@ impl InstallationTransaction {
         self.installation_epoch.validate()?;
         self.request.validate()?;
         self.candidate_manifest.validate()?;
+        if self.candidate_manifest.runtime_launch.installation_epoch != self.installation_epoch {
+            return Err(InstallationError::InvalidField {
+                field: "candidate_manifest.runtime_launch.installation_epoch".to_owned(),
+                reason: "must exactly equal the transaction installation epoch".to_owned(),
+            });
+        }
         if let Some(manifest) = &self.current_active_manifest {
             manifest.validate()?;
         }
@@ -2050,6 +2136,19 @@ mod tests {
                 let mut descriptor = RuntimeLaunchDescriptor {
                     profile: InstallationProfile::PortableDev,
                     portable_root: Some(test_path(&root, "portable")),
+                    installation_epoch: InstallationEpoch {
+                        installation: test_handle("installation:test"),
+                        lineage_id: test_handle("lineage:test"),
+                        sequence: 1,
+                    },
+                    generation: test_handle("generation:candidate"),
+                    authority_generation: ResourceGeneration::genesis(),
+                    authority_state_fence: StateFence::new(
+                        eliot_contracts::AuthorityEpoch::genesis(),
+                        ResourceGeneration::genesis(),
+                    ),
+                    authority_descriptor_path: test_path(&root, "authority.json"),
+                    authority_descriptor_digest: test_handle("7".repeat(64)),
                     kernel_work_root: test_path(&root, "portable"),
                     kernel_artifact_digest: test_handle("0".repeat(64)),
                     store_config_path: test_path(&root, "generation.json"),
@@ -2064,6 +2163,10 @@ mod tests {
                         test_path(&root, "portable"),
                         test_handle("--store-bootstrap"),
                         test_path(&root, "store-bootstrap.json"),
+                        test_handle("--authority-descriptor"),
+                        test_path(&root, "authority.json"),
+                        test_handle("--authority-descriptor-sha256"),
+                        test_handle("7".repeat(64)),
                     ],
                     canonical_store_arguments: vec![
                         test_handle("--portable-dev-root"),
@@ -2075,8 +2178,8 @@ mod tests {
                     watchdog_artifact_digest: test_handle("4".repeat(64)),
                     descriptor_digest: test_handle("0".repeat(64)),
                 };
-                let digest = Sha256::digest(must(descriptor.unsigned_bytes()));
-                descriptor.descriptor_digest = test_handle(format!("{digest:x}"));
+                descriptor.descriptor_digest =
+                    test_handle(sha256_hex(&must(descriptor.unsigned_bytes())));
                 descriptor
             },
         };
@@ -2166,7 +2269,23 @@ mod tests {
     fn runtime_launch_descriptor_binds_exact_arguments_and_rejects_tampering() {
         let transaction = registering_transaction();
         let descriptor = &transaction.candidate_manifest.runtime_launch;
-        assert_eq!(descriptor.kernel_arguments[0].as_str(), "--work-root");
+        assert_eq!(
+            descriptor
+                .kernel_arguments
+                .iter()
+                .map(PlatformHandle::as_str)
+                .collect::<Vec<_>>(),
+            vec![
+                "--work-root",
+                descriptor.kernel_work_root.as_str(),
+                "--store-bootstrap",
+                descriptor.store_bootstrap_descriptor_path.as_str(),
+                "--authority-descriptor",
+                descriptor.authority_descriptor_path.as_str(),
+                "--authority-descriptor-sha256",
+                descriptor.authority_descriptor_digest.as_str(),
+            ]
+        );
         assert_eq!(descriptor.canonical_store_arguments[2].as_str(), "--config");
         assert!(descriptor.validate().is_ok());
         let config = &transaction.candidate_manifest.config_path;
@@ -2196,6 +2315,79 @@ mod tests {
         let mut missing_root = descriptor.clone();
         missing_root.portable_root = None;
         assert!(missing_root.validate().is_err());
+
+        let mut relative_authority = descriptor.clone();
+        relative_authority.authority_descriptor_path = test_handle("authority.json");
+        assert!(relative_authority.validate().is_err());
+
+        let mut uppercase_authority_digest = descriptor.clone();
+        uppercase_authority_digest.authority_descriptor_digest = test_handle("A".repeat(64));
+        assert!(uppercase_authority_digest.validate().is_err());
+
+        let mut missing_authority = descriptor.clone();
+        missing_authority.kernel_arguments.truncate(6);
+        assert!(missing_authority.validate_for_config(config).is_err());
+
+        let mut duplicate_authority = descriptor.clone();
+        duplicate_authority
+            .kernel_arguments
+            .insert(4, test_handle("--authority-descriptor"));
+        assert!(duplicate_authority.validate_for_config(config).is_err());
+
+        let mut unknown_authority = descriptor.clone();
+        unknown_authority.kernel_arguments[4] = test_handle("--unknown-authority");
+        assert!(unknown_authority.validate_for_config(config).is_err());
+
+        let mut wrong_authority_order = descriptor.clone();
+        wrong_authority_order.kernel_arguments.swap(4, 6);
+        assert!(wrong_authority_order.validate_for_config(config).is_err());
+    }
+
+    #[test]
+    fn runtime_launch_digest_covers_store_and_authority_inputs() {
+        let descriptor = registering_transaction().candidate_manifest.runtime_launch;
+        let original = descriptor.descriptor_digest.clone();
+
+        let mut store_path = descriptor.clone();
+        store_path.store_bridge_executable_path =
+            test_path(&std::env::temp_dir(), "alternate-eliot-store-surreal.exe");
+        assert_ne!(
+            sha256_hex(&must(store_path.unsigned_bytes())),
+            original.as_str()
+        );
+
+        let mut authority_digest = descriptor;
+        authority_digest.authority_descriptor_digest = test_handle("8".repeat(64));
+        assert_ne!(
+            sha256_hex(&must(authority_digest.unsigned_bytes())),
+            original.as_str()
+        );
+    }
+
+    #[test]
+    fn runtime_launch_rejects_binding_mismatches_and_unknown_fields() {
+        let transaction = registering_transaction();
+        let descriptor = &transaction.candidate_manifest.runtime_launch;
+
+        let mut unknown = must(serde_json::to_value(descriptor));
+        unknown["unexpected"] = serde_json::json!(true);
+        assert!(serde_json::from_value::<RuntimeLaunchDescriptor>(unknown).is_err());
+
+        let mut wrong_generation = transaction.candidate_manifest.clone();
+        wrong_generation.runtime_launch.generation = test_handle("generation:other");
+        assert!(wrong_generation.validate().is_err());
+
+        let mut wrong_fence = descriptor.clone();
+        wrong_fence.authority_generation = must(ResourceGeneration::new(2));
+        assert!(wrong_fence.validate().is_err());
+
+        let mut wrong_installation = transaction;
+        wrong_installation
+            .candidate_manifest
+            .runtime_launch
+            .installation_epoch
+            .sequence = 2;
+        assert!(wrong_installation.validate().is_err());
     }
 
     #[test]

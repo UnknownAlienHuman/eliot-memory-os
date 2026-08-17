@@ -1,6 +1,8 @@
 //! Host↔Kernel protocol records.
 
-use eliot_contracts::{AuthorityEpoch, ResourceGeneration, StateFence};
+use eliot_contracts::{
+    AuthorityEpoch, ResourceGeneration, StateFence, canonical_json_bytes, sha256_hex,
+};
 use eliot_kernel_core::AuthoritySnapshotBindingWire;
 use eliot_platform::{PlatformHandle, PortError, SecretReference};
 use eliot_process::{
@@ -10,9 +12,7 @@ use eliot_process::{
 use eliot_runtime_contracts::{HealthVector, ServiceProcessState};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
-use std::fmt::Write as _;
 
 use crate::{KernelServiceError, validate_text};
 
@@ -54,7 +54,7 @@ impl ProcessAuthorityHandoffDescriptor {
     pub fn canonical_unsigned_bytes(&self) -> Result<Vec<u8>, KernelServiceError> {
         let mut unsigned = self.clone();
         unsigned.descriptor_sha256.clear();
-        serde_json::to_vec(&unsigned).map_err(|_| KernelServiceError::InvalidField {
+        canonical_json_bytes(&unsigned).map_err(|_| KernelServiceError::InvalidField {
             field: "descriptor_sha256",
             reason: "cannot canonicalize descriptor",
         })
@@ -62,12 +62,7 @@ impl ProcessAuthorityHandoffDescriptor {
 
     /// Computes the descriptor digest through the one canonical procedure.
     pub fn compute_digest(&self) -> Result<String, KernelServiceError> {
-        let observed = Sha256::digest(self.canonical_unsigned_bytes()?);
-        let mut digest = String::with_capacity(64);
-        for byte in observed {
-            let _ = write!(&mut digest, "{byte:02x}");
-        }
-        Ok(digest)
+        Ok(sha256_hex(&self.canonical_unsigned_bytes()?))
     }
 
     /// Returns a descriptor with its checked canonical digest populated.
@@ -280,6 +275,10 @@ mod descriptor_tests {
         let mut malformed = descriptor;
         malformed.descriptor_sha256 = "not-a-digest".to_owned();
         assert!(malformed.validate(500).is_err());
+
+        let mut uppercase = malformed;
+        uppercase.descriptor_sha256 = "A".repeat(64);
+        assert!(uppercase.validate(500).is_err());
     }
 
     #[test]
