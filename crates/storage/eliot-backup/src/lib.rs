@@ -943,7 +943,18 @@ pub struct RestoreIntent {
 pub struct RestoreEffectReceipt {
     pub transaction_id: String,
     pub phase: RestorePhase,
-    pub observed_identity_sha256: String,
+    pub input_digest: String,
+    pub external_identity_sha256: String,
+    pub evidence_sha256: String,
+}
+
+/// Target-owned observation of one applied restore effect. The coordinator
+/// never constructs this value; it only validates and journals it.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RestoreAppliedEffect {
+    pub receipt: RestoreEffectReceipt,
+    pub final_evidence: Option<RestoreEvidence>,
 }
 
 /// Result of reconciling an intent whose effect may have happened before a
@@ -951,7 +962,7 @@ pub struct RestoreEffectReceipt {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RestoreReconciliation {
-    Applied(RestoreEffectReceipt),
+    Applied(RestoreAppliedEffect),
     NotApplied,
     Unknown,
 }
@@ -961,6 +972,7 @@ pub enum RestoreReconciliation {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RestoreJournalRecord {
+    pub journal_key: String,
     pub transaction: RestoreTransaction,
     pub revision: u64,
     pub completed_phases: u64,
@@ -974,10 +986,10 @@ pub struct RestoreJournalRecord {
 /// Durable restore journal seam. `compare_and_swap` must reject any stale
 /// expected revision and must durably commit the complete next record.
 pub trait RestoreJournalPort {
-    fn load(&mut self, transaction_id: &str) -> Result<Option<RestoreJournalRecord>, BackupError>;
+    fn load(&mut self, journal_key: &str) -> Result<Option<RestoreJournalRecord>, BackupError>;
     fn compare_and_swap(
         &mut self,
-        transaction_id: &str,
+        journal_key: &str,
         expected_revision: u64,
         next: RestoreJournalRecord,
     ) -> Result<(), BackupError>;
@@ -1034,7 +1046,12 @@ impl RestorePlan {
         digest(&bundle_sha256, "restore.transaction.bundle_sha256")?;
         let plan_sha256 = sha256(self)?;
         let context_sha256 = sha256(&self.target)?;
-        let transaction_material = (self.plan_id.as_str(), bundle_sha256.as_str());
+        let transaction_material = (
+            self.plan_id.as_str(),
+            bundle_sha256.as_str(),
+            plan_sha256.as_str(),
+            context_sha256.as_str(),
+        );
         let transaction_id = format!("restore-transaction-{}", sha256(&transaction_material)?);
         Ok(RestoreTransaction {
             transaction_id,
@@ -1042,6 +1059,10 @@ impl RestorePlan {
             plan_sha256,
             context_sha256,
         })
+    }
+
+    fn journal_key(&self) -> Result<String, BackupError> {
+        sha256(&(self.plan_id.as_str(), self.bundle_sha256.as_str()))
     }
 
     /// Executes the plan against a provider-owned isolated target.
@@ -1079,11 +1100,13 @@ impl RestorePlan {
             return Err(BackupError::PlanMismatch);
         }
         let transaction = self.transaction()?;
+        let journal_key = self.journal_key()?;
         let phases = restore_phases(bundle);
-        let mut record = if let Some(record) = journal.load(&transaction.transaction_id)? {
+        let mut record = if let Some(record) = journal.load(&journal_key)? {
             record
         } else {
             let initial = RestoreJournalRecord {
+                journal_key: journal_key.clone(),
                 transaction: transaction.clone(),
                 revision: 0,
                 completed_phases: 0,
@@ -1093,13 +1116,13 @@ impl RestorePlan {
                 receipt: None,
                 final_receipt: None,
             };
-            journal.compare_and_swap(&transaction.transaction_id, 0, initial.clone())?;
+            journal.compare_and_swap(&journal_key, 0, initial.clone())?;
             initial
         };
-        validate_journal_record(&record, &transaction, &phases)?;
+        validate_journal_record(&record, &journal_key, &transaction, &phases)?;
 
         loop {
-            validate_journal_record(&record, &transaction, &phases)?;
+            validate_journal_record(&record, &journal_key, &transaction, &phases)?;
             match record.state {
                 RestoreJournalState::Completed => {
                     return record
@@ -1113,20 +1136,52 @@ impl RestorePlan {
                         .as_ref()
                         .ok_or(BackupError::RestoreJournalCorrupt)?;
                     match target.reconcile_restore_effect(intent)? {
-                        RestoreReconciliation::Applied(receipt) => {
-                            validate_effect_receipt(intent, &receipt)?;
+                        RestoreReconciliation::Applied(applied) => {
+                            let final_receipt = validate_applied_effect(
+                                self,
+                                bundle,
+                                &transaction,
+                                intent,
+                                &applied,
+                            )?;
                             let mut observed = record.clone();
                             observed.revision = next_revision(record.revision)?;
                             observed.state = RestoreJournalState::ReceiptPersisted;
-                            observed.receipt = Some(receipt);
+                            observed.receipt = Some(applied.receipt);
+                            observed.final_receipt = final_receipt;
                             journal.compare_and_swap(
-                                &transaction.transaction_id,
+                                &journal_key,
                                 record.revision,
                                 observed.clone(),
                             )?;
                             record = observed;
                         }
-                        RestoreReconciliation::NotApplied | RestoreReconciliation::Unknown => {
+                        RestoreReconciliation::NotApplied => {
+                            let applied = apply_restore_phase(self, bundle, target, intent)?;
+                            let final_receipt = validate_applied_effect(
+                                self,
+                                bundle,
+                                &transaction,
+                                intent,
+                                &applied,
+                            )?;
+                            let mut observed = record.clone();
+                            observed.revision = next_revision(record.revision)?;
+                            observed.state = RestoreJournalState::ReceiptPersisted;
+                            observed.receipt = Some(applied.receipt);
+                            observed.final_receipt = final_receipt;
+                            journal.compare_and_swap(
+                                &journal_key,
+                                record.revision,
+                                observed.clone(),
+                            )?;
+                            record = observed;
+                        }
+                        RestoreReconciliation::Unknown => {
+                            let mut rollback = record.clone();
+                            rollback.revision = next_revision(record.revision)?;
+                            rollback.state = RestoreJournalState::RollbackRequired;
+                            journal.compare_and_swap(&journal_key, record.revision, rollback)?;
                             return Err(BackupError::RestoreRollbackRequired);
                         }
                     }
@@ -1142,7 +1197,7 @@ impl RestorePlan {
                         completed.completed_phases = phases.len() as u64;
                         completed.state = RestoreJournalState::Completed;
                         journal.compare_and_swap(
-                            &transaction.transaction_id,
+                            &journal_key,
                             record.revision,
                             completed.clone(),
                         )?;
@@ -1156,7 +1211,7 @@ impl RestorePlan {
                         advanced.intent = None;
                         advanced.receipt = None;
                         journal.compare_and_swap(
-                            &transaction.transaction_id,
+                            &journal_key,
                             record.revision,
                             advanced.clone(),
                         )?;
@@ -1172,7 +1227,7 @@ impl RestorePlan {
                         advanced.revision = next_revision(record.revision)?;
                         advanced.phase = phases[0].clone();
                         journal.compare_and_swap(
-                            &transaction.transaction_id,
+                            &journal_key,
                             record.revision,
                             advanced.clone(),
                         )?;
@@ -1186,25 +1241,21 @@ impl RestorePlan {
                     intent_record.intent = Some(intent.clone());
                     intent_record.receipt = None;
                     journal.compare_and_swap(
-                        &transaction.transaction_id,
+                        &journal_key,
                         record.revision,
                         intent_record.clone(),
                     )?;
                     record = intent_record;
 
+                    let applied = apply_restore_phase(self, bundle, target, &intent)?;
                     let final_receipt =
-                        apply_restore_phase(self, bundle, target, &transaction, &record.phase)?;
-                    let receipt = restore_effect_receipt(&intent)?;
+                        validate_applied_effect(self, bundle, &transaction, &intent, &applied)?;
                     let mut observed = record.clone();
                     observed.revision = next_revision(record.revision)?;
                     observed.state = RestoreJournalState::ReceiptPersisted;
-                    observed.receipt = Some(receipt);
+                    observed.receipt = Some(applied.receipt);
                     observed.final_receipt = final_receipt;
-                    journal.compare_and_swap(
-                        &transaction.transaction_id,
-                        record.revision,
-                        observed.clone(),
-                    )?;
+                    journal.compare_and_swap(&journal_key, record.revision, observed.clone())?;
                     record = observed;
                 }
             }
@@ -1292,10 +1343,11 @@ fn next_revision(revision: u64) -> Result<u64, BackupError> {
 
 fn validate_journal_record(
     record: &RestoreJournalRecord,
+    journal_key: &str,
     transaction: &RestoreTransaction,
     phases: &[RestorePhase],
 ) -> Result<(), BackupError> {
-    if record.transaction != *transaction {
+    if record.journal_key != journal_key || record.transaction != *transaction {
         return Err(BackupError::RestoreJournalMismatch);
     }
     let completed_phases =
@@ -1315,7 +1367,8 @@ fn validate_journal_record(
     }
     match record.state {
         RestoreJournalState::Ready => {
-            if record.intent.is_some() || record.receipt.is_some() {
+            if record.intent.is_some() || record.receipt.is_some() || record.final_receipt.is_some()
+            {
                 return Err(BackupError::RestoreJournalCorrupt);
             }
         }
@@ -1346,6 +1399,8 @@ fn validate_journal_record(
                 || intent.phase != record.phase
                 || receipt.transaction_id != transaction.transaction_id
                 || receipt.phase != record.phase
+                || (matches!(record.phase, RestorePhase::FinalizeIsolatedRoot)
+                    != record.final_receipt.is_some())
             {
                 return Err(BackupError::RestoreJournalCorrupt);
             }
@@ -1370,8 +1425,25 @@ fn validate_journal_record(
             if final_receipt.bundle_sha256 != transaction.bundle_sha256 {
                 return Err(BackupError::RestoreJournalMismatch);
             }
+            let effect_receipt = record
+                .receipt
+                .as_ref()
+                .ok_or(BackupError::RestoreJournalCorrupt)?;
+            let intent = record
+                .intent
+                .as_ref()
+                .ok_or(BackupError::RestoreJournalCorrupt)?;
+            validate_effect_receipt(intent, effect_receipt)?;
+            if final_receipt.effect_receipt_sha256 != sha256(effect_receipt)? {
+                return Err(BackupError::RestoreJournalCorrupt);
+            }
         }
-        RestoreJournalState::RollbackRequired => {}
+        RestoreJournalState::RollbackRequired => {
+            if record.intent.is_none() || record.receipt.is_some() || record.final_receipt.is_some()
+            {
+                return Err(BackupError::RestoreJournalCorrupt);
+            }
+        }
     }
     Ok(())
 }
@@ -1388,24 +1460,23 @@ fn restore_intent(
     })
 }
 
-fn restore_effect_receipt(intent: &RestoreIntent) -> Result<RestoreEffectReceipt, BackupError> {
-    Ok(RestoreEffectReceipt {
-        transaction_id: intent.transaction_id.clone(),
-        phase: intent.phase.clone(),
-        observed_identity_sha256: sha256(intent)?,
-    })
-}
-
 fn validate_effect_receipt(
     intent: &RestoreIntent,
     receipt: &RestoreEffectReceipt,
 ) -> Result<(), BackupError> {
     if receipt.transaction_id != intent.transaction_id
         || receipt.phase != intent.phase
-        || receipt.observed_identity_sha256 != sha256(intent)?
+        || receipt.input_digest != intent.input_digest
     {
         return Err(BackupError::RestoreJournalCorrupt);
     }
+    digest(
+        &receipt.external_identity_sha256,
+        "restore.external_identity_sha256",
+    )
+    .map_err(|_| BackupError::RestoreJournalCorrupt)?;
+    digest(&receipt.evidence_sha256, "restore.evidence_sha256")
+        .map_err(|_| BackupError::RestoreJournalCorrupt)?;
     Ok(())
 }
 
@@ -1413,87 +1484,57 @@ fn apply_restore_phase<T: RestoreTarget>(
     plan: &RestorePlan,
     bundle: &BackupBundle,
     target: &mut T,
-    transaction: &RestoreTransaction,
-    phase: &RestorePhase,
-) -> Result<Option<RestoreReceipt>, BackupError> {
-    match phase {
-        RestorePhase::PrepareIsolatedRoot => {
-            target.prepare_isolated(&plan.target, &plan.restored_fence)?;
-        }
-        RestorePhase::ApplyPurgeLedger => {
-            target.apply_purge_ledger(&bundle.purge_ledger)?;
-        }
-        RestorePhase::ImportSealedBlob { hash } => {
-            let blob = bundle
-                .blobs
-                .iter()
-                .find(|blob| blob.locator.hash.to_string() == *hash)
-                .ok_or(BackupError::MissingBlob)?;
-            target.import_sealed_blob(blob)?;
-        }
-        RestorePhase::ImportCanonicalEvent { record_id } => {
-            let record = bundle
-                .canonical_events
-                .iter()
-                .find(|record| record.record_id == *record_id)
-                .ok_or(BackupError::RestorePhaseMismatch)?;
-            target.import_canonical_event(record)?;
-        }
-        RestorePhase::ImportReceipt { operation_id } => {
-            let receipt = bundle
-                .receipts
-                .iter()
-                .find(|receipt| receipt.operation_id.to_string() == *operation_id)
-                .ok_or(BackupError::RestorePhaseMismatch)?;
-            target.import_receipt(receipt)?;
-        }
-        RestorePhase::ImportProjection { record_id } => {
-            let record = bundle
-                .projections
-                .iter()
-                .find(|record| record.record_id == *record_id)
-                .ok_or(BackupError::RestorePhaseMismatch)?;
-            target.import_projection(record)?;
-        }
-        RestorePhase::SuspendOrsOperations => {
-            let ors = bundle
-                .ors_snapshot
-                .as_ref()
-                .ok_or(BackupError::RestorePhaseMismatch)?;
-            target.suspend_ors_operations(ors)?;
-        }
-        RestorePhase::RebuildProjections => {
-            target.rebuild_projections(&plan.restored_fence)?;
-        }
-        RestorePhase::VerifyReceiptEventChain => {
-            target.verify_receipt_event_chain(&bundle.receipts, &bundle.canonical_events)?;
-        }
-        RestorePhase::FinalizeIsolatedRoot => {
-            let evidence = target.finalize_isolated(&plan.restored_fence)?;
-            evidence.validate()?;
-            if bundle.ors_snapshot.is_some() && !evidence.ors_suspended {
-                return Err(BackupError::RestoreEvidenceIncomplete);
-            }
-            if evidence.target_id != plan.target.target_id
-                || evidence.authority_epoch != plan.restored_fence.authority_epoch
-                || evidence.resource_generation != plan.restored_fence.resource_generation
-            {
-                return Err(BackupError::FinalizeEvidenceMismatch);
-            }
-            return Ok(Some(RestoreReceipt {
-                receipt_id: format!("restore-receipt-{}", plan.plan_id),
-                plan_id: plan.plan_id.clone(),
-                bundle_sha256: transaction.bundle_sha256.clone(),
-                target_id: plan.target.target_id.clone(),
-                restored_fence: plan.restored_fence.clone(),
-                canonical_only: bundle.manifest.class != BackupClass::FullRecovery,
-                operational_recovery_ready: bundle.manifest.class == BackupClass::FullRecovery,
-                cutover_performed: false,
-            }));
-        }
-        RestorePhase::Pending => return Err(BackupError::RestorePhaseMismatch),
+    intent: &RestoreIntent,
+) -> Result<RestoreAppliedEffect, BackupError> {
+    if matches!(intent.phase, RestorePhase::Pending) {
+        return Err(BackupError::RestorePhaseMismatch);
     }
-    Ok(None)
+    target.apply_restore_effect(plan, bundle, intent)
+}
+
+fn validate_applied_effect(
+    plan: &RestorePlan,
+    bundle: &BackupBundle,
+    transaction: &RestoreTransaction,
+    intent: &RestoreIntent,
+    applied: &RestoreAppliedEffect,
+) -> Result<Option<RestoreReceipt>, BackupError> {
+    validate_effect_receipt(intent, &applied.receipt)?;
+    let is_final = matches!(intent.phase, RestorePhase::FinalizeIsolatedRoot);
+    if !is_final {
+        if applied.final_evidence.is_some() {
+            return Err(BackupError::RestoreJournalCorrupt);
+        }
+        return Ok(None);
+    }
+    let evidence = applied
+        .final_evidence
+        .as_ref()
+        .ok_or(BackupError::RestoreEvidenceIncomplete)?;
+    evidence.validate()?;
+    if sha256(evidence)? != applied.receipt.evidence_sha256 {
+        return Err(BackupError::FinalizeEvidenceMismatch);
+    }
+    if bundle.ors_snapshot.is_some() && !evidence.ors_suspended {
+        return Err(BackupError::RestoreEvidenceIncomplete);
+    }
+    if evidence.target_id != plan.target.target_id
+        || evidence.authority_epoch != plan.restored_fence.authority_epoch
+        || evidence.resource_generation != plan.restored_fence.resource_generation
+    {
+        return Err(BackupError::FinalizeEvidenceMismatch);
+    }
+    Ok(Some(RestoreReceipt {
+        receipt_id: format!("restore-receipt-{}", plan.plan_id),
+        plan_id: plan.plan_id.clone(),
+        bundle_sha256: transaction.bundle_sha256.clone(),
+        target_id: plan.target.target_id.clone(),
+        restored_fence: plan.restored_fence.clone(),
+        effect_receipt_sha256: sha256(&applied.receipt)?,
+        canonical_only: bundle.manifest.class != BackupClass::FullRecovery,
+        operational_recovery_ready: bundle.manifest.class == BackupClass::FullRecovery,
+        cutover_performed: false,
+    }))
 }
 
 /// Evidence returned by the isolated target after all restore steps complete.
@@ -1538,6 +1579,7 @@ pub struct RestoreReceipt {
     pub bundle_sha256: String,
     pub target_id: String,
     pub restored_fence: RestoredFence,
+    pub effect_receipt_sha256: String,
     pub canonical_only: bool,
     pub operational_recovery_ready: bool,
     pub cutover_performed: bool,
@@ -1546,6 +1588,18 @@ pub struct RestoreReceipt {
 /// Provider-owned isolated restore target. Implementations must not make the
 /// target current authority as part of any method in this trait.
 pub trait RestoreTarget {
+    /// Applies one exact intent and returns a target-observed receipt. The
+    /// default is fail-closed so legacy targets cannot mint coordinator-side
+    /// success without migrating to this receipt-bearing seam.
+    fn apply_restore_effect(
+        &mut self,
+        _plan: &RestorePlan,
+        _bundle: &BackupBundle,
+        _intent: &RestoreIntent,
+    ) -> Result<RestoreAppliedEffect, BackupError> {
+        Err(BackupError::RestoreTargetReceiptRequired)
+    }
+
     /// Reconciles an intent left durable by a prior process. The default is
     /// deliberately unknown, forcing rollback/escalation rather than guessing.
     fn reconcile_restore_effect(
@@ -1632,6 +1686,8 @@ pub enum BackupError {
     RestoreJournalCorrupt,
     #[error("restore journal CAS revision is stale")]
     RestoreJournalCasConflict,
+    #[error("restore target must return an observed effect receipt")]
+    RestoreTargetReceiptRequired,
     #[error("ROLLBACK_REQUIRED: restore effect outcome is not durably reconciled")]
     RestoreRollbackRequired,
     #[error("restore target returned incomplete evidence")]
@@ -1670,28 +1726,30 @@ mod restore_tests {
     #[derive(Default)]
     struct TestJournal {
         record: Option<RestoreJournalRecord>,
+        fail_receipt_cas: bool,
     }
 
     impl RestoreJournalPort for TestJournal {
-        fn load(
-            &mut self,
-            transaction_id: &str,
-        ) -> Result<Option<RestoreJournalRecord>, BackupError> {
+        fn load(&mut self, journal_key: &str) -> Result<Option<RestoreJournalRecord>, BackupError> {
             Ok(self
                 .record
                 .clone()
-                .filter(|record| record.transaction.transaction_id == transaction_id))
+                .filter(|record| record.journal_key == journal_key))
         }
 
         fn compare_and_swap(
             &mut self,
-            transaction_id: &str,
+            journal_key: &str,
             expected_revision: u64,
             next: RestoreJournalRecord,
         ) -> Result<(), BackupError> {
-            if next.transaction.transaction_id != transaction_id
+            if next.journal_key != journal_key
                 || self.record.as_ref().map_or(0, |record| record.revision) != expected_revision
             {
+                return Err(BackupError::RestoreJournalCasConflict);
+            }
+            if self.fail_receipt_cas && next.state == RestoreJournalState::ReceiptPersisted {
+                self.fail_receipt_cas = false;
                 return Err(BackupError::RestoreJournalCasConflict);
             }
             self.record = Some(next);
@@ -1703,9 +1761,49 @@ mod restore_tests {
     struct TestTarget {
         calls: Vec<&'static str>,
         fail_rebuild: bool,
+        bad_receipt: bool,
+        reconcile_mode: ReconcileMode,
+    }
+
+    #[derive(Default)]
+    enum ReconcileMode {
+        #[default]
+        Unknown,
+        NotApplied,
+        Applied,
     }
 
     impl RestoreTarget for TestTarget {
+        fn apply_restore_effect(
+            &mut self,
+            _plan: &RestorePlan,
+            _bundle: &BackupBundle,
+            intent: &RestoreIntent,
+        ) -> Result<RestoreAppliedEffect, BackupError> {
+            self.calls.push(phase_call_name(&intent.phase));
+            if self.fail_rebuild && matches!(intent.phase, RestorePhase::RebuildProjections) {
+                return Err(BackupError::Target("simulated process loss".to_owned()));
+            }
+            let mut applied = applied_effect(intent);
+            if self.bad_receipt {
+                applied.receipt.input_digest = "0".repeat(64);
+            }
+            Ok(applied)
+        }
+
+        fn reconcile_restore_effect(
+            &mut self,
+            intent: &RestoreIntent,
+        ) -> Result<RestoreReconciliation, BackupError> {
+            match self.reconcile_mode {
+                ReconcileMode::Unknown => Ok(RestoreReconciliation::Unknown),
+                ReconcileMode::NotApplied => Ok(RestoreReconciliation::NotApplied),
+                ReconcileMode::Applied => {
+                    Ok(RestoreReconciliation::Applied(applied_effect(intent)))
+                }
+            }
+        }
+
         fn prepare_isolated(
             &mut self,
             _context: &RestoreContext,
@@ -1785,6 +1883,50 @@ mod restore_tests {
                 authority_epoch: AuthorityEpoch::new(2).expect("epoch"),
                 resource_generation: ResourceGeneration::new(2).expect("generation"),
             })
+        }
+    }
+
+    fn phase_call_name(phase: &RestorePhase) -> &'static str {
+        match phase {
+            RestorePhase::PrepareIsolatedRoot => "prepare",
+            RestorePhase::ApplyPurgeLedger => "purge",
+            RestorePhase::RebuildProjections => "rebuild",
+            RestorePhase::VerifyReceiptEventChain => "verify",
+            RestorePhase::FinalizeIsolatedRoot => "finalize",
+            _ => "other",
+        }
+    }
+
+    fn applied_effect(intent: &RestoreIntent) -> RestoreAppliedEffect {
+        let final_evidence = if matches!(intent.phase, RestorePhase::FinalizeIsolatedRoot) {
+            Some(RestoreEvidence {
+                target_id: "target".to_owned(),
+                isolated_root: true,
+                purge_applied: true,
+                blobs_imported: true,
+                projections_rebuilt: true,
+                receipt_event_chain_verified: true,
+                ors_suspended: false,
+                active_authority_restored: false,
+                authority_epoch: AuthorityEpoch::new(2).expect("epoch"),
+                resource_generation: ResourceGeneration::new(2).expect("generation"),
+            })
+        } else {
+            None
+        };
+        let evidence_sha256 = final_evidence.as_ref().map_or_else(
+            || sha256_hex(b"target-observed-effect"),
+            |evidence| sha256(evidence).expect("evidence digest"),
+        );
+        RestoreAppliedEffect {
+            receipt: RestoreEffectReceipt {
+                transaction_id: intent.transaction_id.clone(),
+                phase: intent.phase.clone(),
+                input_digest: intent.input_digest.clone(),
+                external_identity_sha256: sha256(&intent.phase).expect("phase digest"),
+                evidence_sha256,
+            },
+            final_evidence,
         }
     }
 
@@ -1931,6 +2073,86 @@ mod restore_tests {
             Err(BackupError::RestoreRollbackRequired)
         );
         assert!(resumed_target.calls.is_empty());
+        assert_eq!(
+            journal.record.as_ref().expect("rollback record").state,
+            RestoreJournalState::RollbackRequired
+        );
+        let mut replay_target = TestTarget::default();
+        assert_eq!(
+            plan.execute_with_journal(&bundle, &mut replay_target, &mut journal),
+            Err(BackupError::RestoreRollbackRequired)
+        );
+        assert!(replay_target.calls.is_empty());
+    }
+
+    #[test]
+    fn target_mismatched_receipt_is_rejected_without_success() {
+        let plan = plan();
+        let bundle = bundle_for(&plan);
+        let mut journal = TestJournal::default();
+        let mut target = TestTarget {
+            bad_receipt: true,
+            ..TestTarget::default()
+        };
+
+        assert_eq!(
+            plan.execute_with_journal(&bundle, &mut target, &mut journal),
+            Err(BackupError::RestoreJournalCorrupt)
+        );
+        let record = journal.record.as_ref().expect("intent record");
+        assert_eq!(record.state, RestoreJournalState::IntentPersisted);
+        assert!(record.receipt.is_none());
+    }
+
+    #[test]
+    fn crash_after_effect_before_receipt_cas_reconciles_without_duplicate_effect() {
+        let plan = plan();
+        let bundle = bundle_for(&plan);
+        let mut journal = TestJournal {
+            fail_receipt_cas: true,
+            ..TestJournal::default()
+        };
+        let mut first_target = TestTarget::default();
+        assert_eq!(
+            plan.execute_with_journal(&bundle, &mut first_target, &mut journal),
+            Err(BackupError::RestoreJournalCasConflict)
+        );
+        assert_eq!(first_target.calls, vec!["prepare"]);
+
+        let mut resumed_target = TestTarget {
+            reconcile_mode: ReconcileMode::Applied,
+            ..TestTarget::default()
+        };
+        plan.execute_with_journal(&bundle, &mut resumed_target, &mut journal)
+            .expect("reconcile and continue");
+        assert!(!resumed_target.calls.contains(&"prepare"));
+        assert_eq!(
+            resumed_target.calls,
+            vec!["purge", "rebuild", "verify", "finalize"]
+        );
+    }
+
+    #[test]
+    fn not_applied_replays_existing_intent_exactly_once() {
+        let plan = plan();
+        let bundle = bundle_for(&plan);
+        let mut journal = TestJournal::default();
+        let mut first_target = TestTarget {
+            fail_rebuild: true,
+            ..TestTarget::default()
+        };
+        assert!(matches!(
+            plan.execute_with_journal(&bundle, &mut first_target, &mut journal),
+            Err(BackupError::Target(_))
+        ));
+
+        let mut resumed_target = TestTarget {
+            reconcile_mode: ReconcileMode::NotApplied,
+            ..TestTarget::default()
+        };
+        plan.execute_with_journal(&bundle, &mut resumed_target, &mut journal)
+            .expect("apply persisted intent");
+        assert_eq!(resumed_target.calls, vec!["rebuild", "verify", "finalize"]);
     }
 
     #[test]
@@ -1944,6 +2166,10 @@ mod restore_tests {
 
         let mut changed = plan.clone();
         changed.target.target_id = "other-target".to_owned();
+        assert_ne!(
+            plan.transaction().expect("transaction").transaction_id,
+            changed.transaction().expect("transaction").transaction_id
+        );
         let mut changed_target = TestTarget::default();
         assert_eq!(
             changed.execute_with_journal(&bundle, &mut changed_target, &mut journal),
@@ -1962,6 +2188,10 @@ mod restore_tests {
 
         let mut changed = plan.clone();
         changed.steps.reverse();
+        assert_ne!(
+            plan.transaction().expect("transaction").transaction_id,
+            changed.transaction().expect("transaction").transaction_id
+        );
         let mut changed_target = TestTarget::default();
         assert_eq!(
             changed.execute_with_journal(&bundle, &mut changed_target, &mut journal),
@@ -1972,9 +2202,11 @@ mod restore_tests {
     #[test]
     fn stale_cas_is_rejected() {
         let plan = plan();
+        let journal_key = plan.journal_key().expect("journal key");
         let transaction = plan.transaction().expect("transaction");
         let mut journal = TestJournal::default();
         let record = RestoreJournalRecord {
+            journal_key: journal_key.clone(),
             transaction,
             revision: 0,
             completed_phases: 0,
@@ -1985,11 +2217,10 @@ mod restore_tests {
             final_receipt: None,
         };
         journal
-            .compare_and_swap(&record.transaction.transaction_id, 0, record.clone())
+            .compare_and_swap(&journal_key, 0, record.clone())
             .expect("create");
-        let transaction_id = record.transaction.transaction_id.clone();
         assert_eq!(
-            journal.compare_and_swap(&transaction_id, 999, record),
+            journal.compare_and_swap(&journal_key, 999, record),
             Err(BackupError::RestoreJournalCasConflict)
         );
     }
@@ -1997,9 +2228,11 @@ mod restore_tests {
     #[test]
     fn phase_skip_is_rejected_fail_closed() {
         let plan = plan();
+        let journal_key = plan.journal_key().expect("journal key");
         let transaction = plan.transaction().expect("transaction");
         let phases = restore_phases(&bundle_for(&plan));
         let record = RestoreJournalRecord {
+            journal_key,
             transaction: transaction.clone(),
             revision: 1,
             completed_phases: 0,
@@ -2010,7 +2243,7 @@ mod restore_tests {
             final_receipt: None,
         };
         assert_eq!(
-            validate_journal_record(&record, &transaction, &phases),
+            validate_journal_record(&record, &record.journal_key, &transaction, &phases),
             Err(BackupError::RestorePhaseMismatch)
         );
     }
