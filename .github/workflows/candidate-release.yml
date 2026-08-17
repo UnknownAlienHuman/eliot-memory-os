@@ -1,0 +1,105 @@
+name: Candidate Release Validation
+
+on:
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_TERM_VERBOSE: false
+  RUST_BACKTRACE: 1
+
+jobs:
+  candidate:
+    runs-on: windows-latest
+    timeout-minutes: 180
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Configure Cargo environment
+        shell: pwsh
+        run: |
+          Add-Content -LiteralPath $env:GITHUB_ENV -Value "CARGO_TARGET_DIR=$env:RUNNER_TEMP\eliot-candidate-release-target"
+          Add-Content -LiteralPath $env:GITHUB_ENV -Value "CARGO_INCREMENTAL=0"
+          Add-Content -LiteralPath $env:GITHUB_ENV -Value "CARGO_BUILD_JOBS=4"
+
+      # rust-toolchain.toml pins stable Rust and the MSVC target.
+      - name: Install pinned Rust toolchain
+        run: rustup show active-toolchain
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
+
+      - name: Formatting
+        run: cargo fmt --all -- --check
+
+      - name: Workspace all-target check
+        run: cargo check --workspace --all-targets --locked
+
+      - name: Workspace all-target clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      - name: Workspace tests and execution safeguard
+        shell: pwsh
+        run: |
+          $testListOutput = @(& cargo test --workspace --locked -- --list 2>&1)
+          $testListExit = $LASTEXITCODE
+          if ($testListExit -ne 0) {
+            throw "TEST_LIST_FAILURE: cargo test --workspace --locked -- --list exited $testListExit"
+          }
+
+          $testOutput = @(& cargo test --workspace --locked 2>&1)
+          $testExit = $LASTEXITCODE
+          if ($testExit -ne 0) {
+            throw "TEST_EXECUTION_FAILURE: cargo test --workspace --locked exited $testExit"
+          }
+
+          $listedTests = @(
+            $testListOutput |
+              ForEach-Object { "$_" } |
+              Where-Object { $_ -match '^\s*.+:\s+test\s*$' }
+          ).Count
+          $executedTests = 0
+          foreach ($line in $testOutput) {
+            $text = "$line"
+            if ($text -match 'test result: .*?(\d+) passed;\s+(\d+) failed;\s+(\d+) ignored;\s+(\d+) measured;') {
+              $executedTests += [int]$Matches[1] + [int]$Matches[2]
+            }
+          }
+
+          Write-Host "TEST_EVIDENCE: listed=$listedTests executed=$executedTests"
+          if ($listedTests -eq 0) {
+            throw "TEST_CONTRACT_FAILURE: cargo test listed zero test cases"
+          }
+          if ($executedTests -eq 0) {
+            throw "TEST_CONTRACT_FAILURE: cargo test executed zero test cases"
+          }
+
+      - name: Workspace all-target build
+        run: cargo build --workspace --all-targets --locked
+
+      - name: Eliot.Operator Release build
+        run: dotnet build apps/Eliot.Operator/Eliot.Operator.csproj -c Release
+
+      - name: Live Windows candidate and release bundle contract
+        shell: pwsh
+        run: |
+          $failureType = 'CONTRACT_CHALLENGE'
+          Write-Error ("{0}: live Windows candidate scenarios and release bundle validation are not wired yet; no scenario success is claimed." -f $failureType)
+          exit 1
