@@ -1004,6 +1004,22 @@ mod tests {
         write.commit().unwrap_or_else(|_| unreachable!());
     }
 
+    fn rewrite_payload(backend: &RedbJournalBackend, transaction: &str, bytes: &[u8]) {
+        let write = backend
+            .database
+            .begin_write()
+            .unwrap_or_else(|_| unreachable!());
+        {
+            let mut table = write
+                .open_table(PAYLOADS)
+                .unwrap_or_else(|_| unreachable!());
+            table
+                .insert(transaction, bytes)
+                .unwrap_or_else(|_| unreachable!());
+        }
+        write.commit().unwrap_or_else(|_| unreachable!());
+    }
+
     fn rewrite_epoch(backend: &RedbJournalBackend, key: &str, epoch: &StoredEpoch) {
         let write = backend
             .database
@@ -1328,6 +1344,54 @@ mod tests {
         assert!(backend.load().is_err());
         drop(backend);
         assert!(RedbJournalBackend::open_unprotected_for_test(root.join("journal.redb")).is_err());
+        remove(&root);
+    }
+
+    #[test]
+    fn redb_valid_receipt_payload_digest_still_requires_frame_binding() {
+        let (mut backend, root) = new_backend();
+        let (descriptor, bytes) = make_framed_append(test_host(), "tamper-frame-binding");
+        backend
+            .prepare(&descriptor)
+            .unwrap_or_else(|_| unreachable!());
+        backend
+            .append_prepared(&descriptor.transaction_id, &bytes)
+            .unwrap_or_else(|_| unreachable!());
+        backend
+            .flush(&descriptor.transaction_id)
+            .unwrap_or_else(|_| unreachable!());
+        backend
+            .sync(&descriptor.transaction_id)
+            .unwrap_or_else(|_| unreachable!());
+        backend
+            .commit(&descriptor.transaction_id)
+            .unwrap_or_else(|_| unreachable!());
+
+        let replacement = b"valid-storage-payload-but-not-a-journal-frame";
+        let write = backend
+            .database
+            .begin_read()
+            .unwrap_or_else(|_| unreachable!());
+        let table = write
+            .open_table(RECEIPTS)
+            .unwrap_or_else(|_| unreachable!());
+        let raw = table
+            .get(descriptor.transaction_id.as_str())
+            .unwrap_or_else(|_| unreachable!())
+            .map_or_else(|| unreachable!(), |value| value.value().to_vec());
+        let mut receipt: serde_json::Value =
+            serde_json::from_slice(&raw).unwrap_or_else(|_| unreachable!());
+        drop(table);
+        drop(write);
+        receipt["payload_digest"] = serde_json::json!(sha256_digest(replacement));
+        rewrite_receipt(&backend, descriptor.transaction_id.as_str(), &receipt);
+        rewrite_payload(&backend, descriptor.transaction_id.as_str(), replacement);
+
+        assert!(backend.load().is_ok());
+        assert!(matches!(
+            HostStateJournal::open(backend, test_host()),
+            Err(crate::JournalError::IdempotencyConflict)
+        ));
         remove(&root);
     }
 
