@@ -240,6 +240,14 @@ fn activation(
     })
 }
 
+pub(crate) fn redb_test_activation(
+    host: &HostInstallationEpoch,
+    generation: &EpochTransition,
+    op: &str,
+) -> HostStateRecord {
+    activation(host, generation, op, ActivationState::Starting)
+}
+
 fn advance_activation(
     journal: &HostStateJournal<MemoryBackend>,
     host: &HostInstallationEpoch,

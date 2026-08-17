@@ -173,9 +173,9 @@ impl RedbJournalBackend {
         validate_schema_marker(&read)?;
         let epochs = read_epochs(&read)?;
         let prepared = read_prepared(&read)?;
-        let receipts = read_receipts(&read)?;
+        let (receipts, receipt_bytes) = read_receipts(&read)?;
         let payloads = read_payloads(&read)?;
-        validate_snapshot(&epochs, &prepared, &receipts, &payloads)?;
+        validate_snapshot(&epochs, &prepared, &receipts, &payloads, receipt_bytes)?;
         Ok(BackendSnapshot {
             epochs,
             prepared,
@@ -270,11 +270,14 @@ fn read_prepared(read: &ReadTransaction) -> Result<Vec<(String, StoredPrepared)>
     Ok(result)
 }
 
-fn read_receipts(read: &ReadTransaction) -> Result<Vec<(String, CommittedAppend)>, BackendError> {
+fn read_receipts(
+    read: &ReadTransaction,
+) -> Result<(Vec<(String, CommittedAppend)>, usize), BackendError> {
     let table = read
         .open_table(RECEIPTS)
         .map_err(|_| BackendError::Unavailable)?;
     let mut result = Vec::new();
+    let mut raw_bytes = 0_usize;
     for item in table.iter().map_err(|_| BackendError::Unavailable)? {
         let (key, value) = item.map_err(|_| BackendError::Unavailable)?;
         let key = key.value().to_owned();
@@ -282,6 +285,9 @@ fn read_receipts(read: &ReadTransaction) -> Result<Vec<(String, CommittedAppend)
         if bytes.len() > MAX_METADATA_BYTES {
             return Err(BackendError::Unavailable);
         }
+        raw_bytes = raw_bytes
+            .checked_add(bytes.len())
+            .ok_or(BackendError::Unavailable)?;
         let receipt: CommittedAppend =
             serde_json::from_slice(bytes).map_err(|_| BackendError::Unavailable)?;
         validate_transaction_key(&key, &receipt.transaction_id)?;
@@ -297,7 +303,7 @@ fn read_receipts(read: &ReadTransaction) -> Result<Vec<(String, CommittedAppend)
             return Err(BackendError::Unavailable);
         }
     }
-    Ok(result)
+    Ok((result, raw_bytes))
 }
 
 fn read_payloads(read: &ReadTransaction) -> Result<Vec<(String, Vec<u8>)>, BackendError> {
@@ -328,8 +334,9 @@ fn validate_snapshot(
     prepared: &[(String, StoredPrepared)],
     receipts: &[(String, CommittedAppend)],
     payloads: &[(String, Vec<u8>)],
+    receipt_bytes: usize,
 ) -> Result<(), BackendError> {
-    let mut total = 0_usize;
+    let mut total = receipt_bytes;
     for epoch in epochs.iter().map(|(_, item)| item) {
         total = total
             .checked_add(epoch.bytes.len())
@@ -348,17 +355,35 @@ fn validate_snapshot(
     if total > MAX_TOTAL_BYTES {
         return Err(BackendError::Unavailable);
     }
+    let frame_bindings = if receipts.is_empty() {
+        Vec::new()
+    } else {
+        epochs
+            .iter()
+            .map(|(_, epoch)| {
+                crate::journal::frame_bindings(&epoch.bytes, &epoch.host)
+                    .map_err(|_| BackendError::Unavailable)
+            })
+            .collect::<Result<Vec<_>, _>>()?
+    };
     for (_, receipt) in receipts {
         let payload = payloads
             .iter()
             .find(|(key, _)| key.as_str() == receipt.transaction_id.as_str())
             .map(|(_, bytes)| bytes)
             .ok_or(BackendError::Unavailable)?;
-        if sha256_digest(payload) != receipt.payload_digest
-            || !epochs
-                .iter()
-                .any(|(_, epoch)| contains_bytes(&epoch.bytes, payload))
-        {
+        let epoch_index = epochs
+            .iter()
+            .enumerate()
+            .find(|(_, (_, epoch))| epoch.host == receipt.host)
+            .map(|(index, _)| index)
+            .ok_or(BackendError::Unavailable)?;
+        let frame_matches = frame_bindings[epoch_index].iter().any(|frame| {
+            frame.operation == receipt.operation
+                && frame.record_checksum == receipt.record_checksum
+                && frame.payload_digest == receipt.payload_digest
+        });
+        if sha256_digest(payload) != receipt.payload_digest || !frame_matches {
             return Err(BackendError::Unavailable);
         }
         if prepared
@@ -376,13 +401,6 @@ fn validate_snapshot(
         return Err(BackendError::Unavailable);
     }
     Ok(())
-}
-
-fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
-    !needle.is_empty()
-        && haystack
-            .windows(needle.len())
-            .any(|window| window == needle)
 }
 
 fn commit_write(write: redb::WriteTransaction) -> Result<(), BackendError> {
@@ -840,7 +858,10 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     use super::*;
-    use crate::{EpochIdentity, EpochTransition, HostInstallationEpoch, IdempotencyIdentity};
+    use crate::{
+        EpochIdentity, EpochTransition, HostInstallationEpoch, HostStateJournal,
+        IdempotencyIdentity, MemoryBackend,
+    };
 
     static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
 
@@ -874,6 +895,45 @@ mod tests {
             record_checksum: sha256_digest(b"record"),
             payload_digest: sha256_digest(bytes),
         }
+    }
+
+    fn make_framed_append(
+        host: HostInstallationEpoch,
+        operation: &str,
+    ) -> (PreparedAppend, Vec<u8>) {
+        let generation = EpochTransition {
+            current: EpochIdentity {
+                lineage: handle("test-activation-lineage"),
+                sequence: 1,
+            },
+            parent: None,
+        };
+        let record = crate::tests::redb_test_activation(&host, &generation, operation);
+        let journal = HostStateJournal::open(MemoryBackend::default(), host)
+            .unwrap_or_else(|_| unreachable!());
+        journal.append(record).unwrap_or_else(|_| unreachable!());
+        let backend = journal.into_backend().unwrap_or_else(|_| unreachable!());
+        let image = backend.durable_image().clone();
+        let receipt = image
+            .receipts
+            .first()
+            .cloned()
+            .unwrap_or_else(|| unreachable!());
+        let bytes = image
+            .epochs
+            .first()
+            .map(|epoch| epoch.bytes.clone())
+            .unwrap_or_else(|| unreachable!());
+        (
+            PreparedAppend {
+                transaction_id: receipt.transaction_id,
+                host: receipt.host,
+                operation: receipt.operation,
+                record_checksum: receipt.record_checksum,
+                payload_digest: receipt.payload_digest,
+            },
+            bytes,
+        )
     }
 
     fn new_backend() -> (RedbJournalBackend, std::path::PathBuf) {
@@ -913,6 +973,23 @@ mod tests {
         write.commit().unwrap_or_else(|_| unreachable!());
     }
 
+    fn rewrite_receipt(backend: &RedbJournalBackend, transaction: &str, value: &serde_json::Value) {
+        let write = backend
+            .database
+            .begin_write()
+            .unwrap_or_else(|_| unreachable!());
+        {
+            let mut table = write
+                .open_table(RECEIPTS)
+                .unwrap_or_else(|_| unreachable!());
+            let encoded = serde_json::to_vec(value).unwrap_or_else(|_| unreachable!());
+            table
+                .insert(transaction, encoded.as_slice())
+                .unwrap_or_else(|_| unreachable!());
+        }
+        write.commit().unwrap_or_else(|_| unreachable!());
+    }
+
     #[test]
     fn redb_prepare_reopen_reconcile_distinguishes_prepared_and_absent() {
         let (mut backend, root) = new_backend();
@@ -938,8 +1015,7 @@ mod tests {
     #[test]
     fn redb_commit_reopen_preserves_exact_bytes_and_receipt() {
         let (mut backend, root) = new_backend();
-        let bytes = b"exact-frame-bytes\0\xff";
-        let descriptor = make_descriptor("tx-commit", bytes);
+        let (descriptor, bytes) = make_framed_append(test_host(), "exact-frame");
         backend
             .prepare(&descriptor)
             .unwrap_or_else(|_| unreachable!());
@@ -972,8 +1048,7 @@ mod tests {
     #[test]
     fn redb_duplicate_operations_are_idempotent() {
         let (mut backend, root) = new_backend();
-        let bytes = b"duplicate-frame";
-        let descriptor = make_descriptor("tx-duplicate", bytes);
+        let (descriptor, bytes) = make_framed_append(test_host(), "duplicate-frame");
         backend
             .prepare(&descriptor)
             .unwrap_or_else(|_| unreachable!());
@@ -1091,8 +1166,7 @@ mod tests {
     #[test]
     fn redb_sparse_epoch_key_fails_closed() {
         let (mut backend, root) = new_backend();
-        let bytes = b"epoch-bytes";
-        let descriptor = make_descriptor("tx-sparse", bytes);
+        let (descriptor, bytes) = make_framed_append(test_host(), "sparse-epoch");
         backend
             .prepare(&descriptor)
             .unwrap_or_else(|_| unreachable!());
@@ -1159,8 +1233,7 @@ mod tests {
     #[test]
     fn redb_tampered_payload_digest_fails_reopen() {
         let (mut backend, root) = new_backend();
-        let bytes = b"tamper-payload";
-        let descriptor = make_descriptor("tx-tamper-payload", bytes);
+        let (descriptor, bytes) = make_framed_append(test_host(), "tamper-payload");
         backend
             .prepare(&descriptor)
             .unwrap_or_else(|_| unreachable!());
@@ -1201,5 +1274,96 @@ mod tests {
         drop(backend);
         assert!(RedbJournalBackend::open_unprotected_for_test(root.join("journal.redb")).is_err());
         remove(&root);
+    }
+
+    #[test]
+    fn redb_valid_digest_wrong_epoch_operation_or_frame_fails_reopen() {
+        for tamper in ["epoch", "operation", "frame"] {
+            let (mut backend, root) = new_backend();
+            let (descriptor, bytes) = make_framed_append(test_host(), tamper);
+            backend
+                .prepare(&descriptor)
+                .unwrap_or_else(|_| unreachable!());
+            backend
+                .append_prepared(&descriptor.transaction_id, &bytes)
+                .unwrap_or_else(|_| unreachable!());
+            backend
+                .flush(&descriptor.transaction_id)
+                .unwrap_or_else(|_| unreachable!());
+            backend
+                .sync(&descriptor.transaction_id)
+                .unwrap_or_else(|_| unreachable!());
+            backend
+                .commit(&descriptor.transaction_id)
+                .unwrap_or_else(|_| unreachable!());
+
+            let write = backend
+                .database
+                .begin_read()
+                .unwrap_or_else(|_| unreachable!());
+            let table = write
+                .open_table(RECEIPTS)
+                .unwrap_or_else(|_| unreachable!());
+            let raw = table
+                .get(descriptor.transaction_id.as_str())
+                .unwrap_or_else(|_| unreachable!())
+                .map_or_else(|| unreachable!(), |value| value.value().to_vec());
+            let mut value: serde_json::Value =
+                serde_json::from_slice(&raw).unwrap_or_else(|_| unreachable!());
+            drop(table);
+            drop(write);
+
+            match tamper {
+                "epoch" => {
+                    let mut wrong_host = test_host();
+                    wrong_host.epoch.current.lineage = handle("wrong-epoch-lineage");
+                    value["host"] =
+                        serde_json::to_value(wrong_host).unwrap_or_else(|_| unreachable!());
+                }
+                "operation" => {
+                    value["operation"] = serde_json::json!({
+                        "operation_id": "wrong-operation",
+                        "idempotency_key": "wrong-operation-key"
+                    });
+                }
+                "frame" => {
+                    value["record_checksum"] = serde_json::json!(sha256_digest(b"wrong-frame"));
+                }
+                _ => unreachable!(),
+            }
+            assert_eq!(
+                value["payload_digest"],
+                serde_json::json!(descriptor.payload_digest.clone())
+            );
+            rewrite_receipt(&backend, descriptor.transaction_id.as_str(), &value);
+            assert!(backend.load().is_err());
+            drop(backend);
+            assert!(
+                RedbJournalBackend::open_unprotected_for_test(root.join("journal.redb")).is_err()
+            );
+            remove(&root);
+        }
+    }
+
+    #[test]
+    fn receipt_metadata_counts_toward_checked_total_bound() {
+        assert!(
+            validate_snapshot(
+                &[],
+                &[],
+                &[],
+                &[],
+                MAX_TOTAL_BYTES
+                    .checked_add(1)
+                    .unwrap_or_else(|| unreachable!()),
+            )
+            .is_err()
+        );
+
+        let epoch = StoredEpoch {
+            host: test_host(),
+            bytes: vec![0],
+        };
+        assert!(validate_snapshot(&[(epoch_key(0), epoch)], &[], &[], &[], usize::MAX,).is_err());
     }
 }

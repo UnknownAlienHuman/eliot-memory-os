@@ -125,8 +125,17 @@ fn replay(
 ) -> Result<HostState, JournalError> {
     host.validate()?;
     let mut state = HostState::new(host, retained);
+    replay_frames(bytes, &mut state, |_, _, _| {})?;
+    Ok(state)
+}
+
+fn replay_frames<F>(bytes: &[u8], state: &mut HostState, mut inspect: F) -> Result<(), JournalError>
+where
+    F: FnMut(&[u8], &FrameHeader, &HostStateRecord),
+{
     let mut offset = 0_usize;
     while offset < bytes.len() {
+        let frame_start = offset;
         let magic_end = offset
             .checked_add(JOURNAL_MAGIC.len())
             .ok_or(JournalError::Torn { offset })?;
@@ -171,12 +180,36 @@ fn replay(
             return Err(JournalError::Sequence);
         }
         let record: HostStateRecord = decode(payload)?;
-        apply(&mut state, &record, header.sequence, &header.checksum)?;
+        inspect(&bytes[frame_start..newline], &header, &record);
+        apply(state, &record, header.sequence, &header.checksum)?;
         state.sequence = header.sequence;
         state.last_checksum = Some(header.checksum);
         offset = newline;
     }
-    Ok(state)
+    Ok(())
+}
+
+pub(crate) struct FrameBinding {
+    pub(crate) operation: IdempotencyIdentity,
+    pub(crate) record_checksum: String,
+    pub(crate) payload_digest: String,
+}
+
+pub(crate) fn frame_bindings(
+    epoch_bytes: &[u8],
+    host: &HostInstallationEpoch,
+) -> Result<Vec<FrameBinding>, JournalError> {
+    host.validate()?;
+    let mut state = HostState::new(host.clone(), Vec::new());
+    let mut bindings = Vec::new();
+    replay_frames(epoch_bytes, &mut state, |frame, header, record| {
+        bindings.push(FrameBinding {
+            operation: record.operation().clone(),
+            record_checksum: header.checksum.clone(),
+            payload_digest: checksum(frame),
+        });
+    })?;
+    Ok(bindings)
 }
 
 // Keeping the record union in one exhaustive match makes the one-writer state
