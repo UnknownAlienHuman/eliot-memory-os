@@ -24,7 +24,11 @@ use eliot_installation::{
     RedbInstallationRegistry, RuntimeLaunchDescriptor, verify_approved_path,
     verify_file_digest_with_lease, verify_file_digest_with_user_lease,
 };
-use eliot_kernel_service::HostStoreBootstrapRequirement;
+use eliot_kernel_service::{
+    HostKernelHandshake, HostStoreBootstrapRequirement, KERNEL_CONTROL_PIPE, KernelControlCommand,
+    KernelControlRequest, KernelReadyReceipt, KernelServiceState, ProcessObservation,
+    RestartBudget, control_request_frame, decode_control_response_frame,
+};
 use eliot_platform::{
     HostBranchKind, HostBranchRecoveryFence, HostInstallationState, HostJobDisposition,
     HostProcessRecoveryBinding, HostRecoveryEvidence, HostStateStore, PlatformHandle, PortOutcome,
@@ -36,6 +40,9 @@ use eliot_platform_windows::{
 };
 use eliot_runtime_contracts::{HealthVector, ServiceProcessRecord, ServiceProcessState};
 use sha2::{Digest as _, Sha256};
+
+#[cfg(windows)]
+use eliot_ipc::{DeliveryOutcome, NamedPipeTransport, TransportLimits};
 use thiserror::Error;
 
 pub const SERVICE_NAME: &str = "eliot-host";
@@ -229,7 +236,11 @@ fn validate_store_bootstrap_descriptor(
     expected_nonce: &PlatformHandle,
 ) -> Result<HostStoreBootstrapRequirement, HostError> {
     lease.verify().map_err(HostError::ProcessContour)?;
-    let bytes = std::fs::read(lease.path()).map_err(|error| {
+    let bytes = match lease {
+        LaunchLease::Protected(lease) => lease.read_bounded(1024 * 1024),
+        LaunchLease::Portable(lease) => lease.read_bounded(1024 * 1024),
+    }
+    .map_err(|error| {
         HostError::ProcessContour(format!("read Store bootstrap descriptor: {error}"))
     })?;
     let actual = Sha256::digest(&bytes);
@@ -517,6 +528,193 @@ impl HostJobBranches {
             ),
         ]);
         environment
+    }
+
+    /// Completes the authenticated Host↔Kernel lifecycle before Host
+    /// publishes any successful contour observation.
+    fn complete_kernel_control(
+        &self,
+        generation: &PlatformHandle,
+        host: &HostInstallationEpoch,
+    ) -> Result<(HostKernelHandshake, KernelReadyReceipt), HostError> {
+        let launch = self.launch.as_ref().ok_or_else(|| {
+            HostError::ProcessContour("runtime launch descriptor is missing".to_owned())
+        })?;
+        let kernel_artifact = self.kernel_artifact_digest.as_ref().ok_or_else(|| {
+            HostError::ProcessContour("Kernel artifact digest is missing".to_owned())
+        })?;
+        let config_digest = self
+            .config_digest
+            .as_ref()
+            .ok_or_else(|| HostError::ProcessContour("config digest is missing".to_owned()))?;
+        let kernel = self
+            .kernel
+            .as_ref()
+            .ok_or_else(|| HostError::ProcessContour("Kernel process is missing".to_owned()))?;
+        let process = kernel.process();
+        let expected_kernel_image = self
+            .kernel_executable
+            .as_ref()
+            .ok_or_else(|| HostError::ProcessContour("Kernel image is missing".to_owned()))?
+            .clone();
+        let authority_epoch = AuthorityEpoch::new(host.epoch.current.sequence)
+            .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+        let activation_id = PlatformHandle::new(format!(
+            "host-kernel:{}:{}",
+            host.epoch.current.lineage.as_str(),
+            host.epoch.current.sequence
+        ))
+        .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+        let handshake = HostKernelHandshake {
+            installation_id: host.installation.clone(),
+            host_epoch: authority_epoch,
+            kernel_epoch: launch.authority_state_fence.authority_epoch,
+            activation_id,
+            artifact_hash: kernel_artifact.clone(),
+            config_hash: config_digest.clone(),
+            activation_nonce: host.nonce.clone(),
+            job_object_id: PlatformHandle::new(kernel.job_identity().name())
+                .map_err(|error| HostError::ProcessContour(error.to_string()))?,
+            pipe_identity: PlatformHandle::new(KERNEL_CONTROL_PIPE)
+                .map_err(|error| HostError::ProcessContour(error.to_string()))?,
+            restart_budget: RestartBudget::new(3, 3)
+                .map_err(|error| HostError::ProcessContour(error.to_string()))?,
+            containment_action: None,
+        };
+        handshake
+            .validate()
+            .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+        let observation = ProcessObservation {
+            process_id: PlatformHandle::new(format!(
+                "pid:{}:start:{}",
+                process.process_id, process.start_time_100ns
+            ))
+            .map_err(|error| HostError::ProcessContour(error.to_string()))?,
+            job_object_id: handshake.job_object_id.clone(),
+            state: ServiceProcessState::Ready,
+            health: HealthVector::healthy(),
+            evidence_refs: vec![
+                PlatformHandle::new(format!(
+                    "host-retained-process:{}:{}:{}",
+                    generation.as_str(),
+                    process.process_id,
+                    process.start_time_100ns
+                ))
+                .map_err(|error| HostError::ProcessContour(error.to_string()))?,
+            ],
+        };
+        let receipt = KernelReadyReceipt {
+            activation_id: handshake.activation_id.clone(),
+            activation_nonce: handshake.activation_nonce.clone(),
+            process: observation,
+            health: HealthVector::healthy(),
+            evidence_refs: vec![
+                PlatformHandle::new(format!("host-kernel-ready:{}", generation.as_str()))
+                    .map_err(|error| HostError::ProcessContour(error.to_string()))?,
+            ],
+        };
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+        let ready = runtime.block_on(async {
+            let expectation = eliot_platform_windows::current_process_named_pipe_expectation()
+                .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+            let mut transport = NamedPipeTransport::connect_authenticated(
+                KERNEL_CONTROL_PIPE,
+                std::time::Duration::from_secs(5),
+                &expectation,
+            )
+            .await
+            .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+            let peer = transport.peer_identity().process_binding().ok_or_else(|| {
+                HostError::ProcessContour("Kernel peer identity is unavailable".to_owned())
+            })?;
+            let observed_image = std::fs::canonicalize(peer.image_path())
+                .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+            let approved_image = std::fs::canonicalize(&expected_kernel_image)
+                .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+            if peer.process_id() != process.process_id || observed_image != approved_image {
+                return Err(HostError::ProcessContour(
+                    "authenticated Kernel peer is not the retained approved process".to_owned(),
+                ));
+            }
+            let limits = TransportLimits::default();
+            let commands = [
+                KernelControlCommand::Reconcile(handshake.clone()),
+                KernelControlCommand::Shadow,
+                KernelControlCommand::PrepareHandoff,
+                KernelControlCommand::Activate,
+                KernelControlCommand::Ready(receipt.clone()),
+            ];
+            let mut final_receipt = None;
+            for (index, command) in commands.into_iter().enumerate() {
+                let sequence = u64::try_from(index + 1)
+                    .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+                let message_id = PlatformHandle::new(format!(
+                    "{}:{}",
+                    handshake.activation_id.as_str(),
+                    sequence
+                ))
+                .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+                let request = KernelControlRequest {
+                    wire_id: eliot_kernel_service::KERNEL_CONTROL_WIRE_ID.to_owned(),
+                    wire_version: eliot_kernel_service::KERNEL_CONTROL_WIRE_VERSION,
+                    message_id: message_id.clone(),
+                    sequence,
+                    peer_process_id: std::process::id(),
+                    generation: launch.authority_generation,
+                    handshake: handshake.clone(),
+                    command,
+                    payload_digest: String::new(),
+                }
+                .with_computed_digest()
+                .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+                let frame = control_request_frame(
+                    format!("host-control:{}", handshake.activation_id.as_str()),
+                    &request,
+                )
+                .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+                match transport
+                    .send_frame(&frame, limits)
+                    .await
+                    .map_err(|error| HostError::ProcessContour(error.to_string()))?
+                {
+                    DeliveryOutcome::Delivered => {}
+                    DeliveryOutcome::UnknownOutcome => {
+                        return Err(HostError::RecoveryRequired(
+                            "Kernel control delivery outcome is unknown".to_owned(),
+                        ));
+                    }
+                }
+                let response = transport
+                    .receive_frame(limits)
+                    .await
+                    .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+                let response = decode_control_response_frame(&response)
+                    .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+                if response.message_id != message_id
+                    || response.request_digest != request.payload_digest
+                    || response.error.is_some()
+                    || (matches!(&request.command, KernelControlCommand::Ready(_))
+                        && response.state != KernelServiceState::Ready)
+                {
+                    return Err(HostError::ProcessContour(
+                        "Kernel control response binding failed".to_owned(),
+                    ));
+                }
+                if let Some(observed) = response.receipt {
+                    observed
+                        .validate(&handshake)
+                        .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+                    final_receipt = Some(observed);
+                }
+            }
+            final_receipt.ok_or_else(|| {
+                HostError::ProcessContour("Kernel did not return a ready receipt".to_owned())
+            })
+        })?;
+        Ok((handshake, ready))
     }
 
     #[allow(
@@ -1833,11 +2031,37 @@ impl HostComposition {
             &self.host,
             &active.manifest.runtime_launch,
         )?;
+        let (handshake, receipt) = match self
+            .jobs
+            .complete_kernel_control(&active.manifest.generation, &self.host)
+        {
+            Ok(value) => value,
+            Err(error) => return self.cleanup_launched_contour(error),
+        };
+        if let Err(error) = self.accept_kernel_ready(&handshake, &receipt) {
+            return self.cleanup_launched_contour(error);
+        }
         if let Err(error) = self.persist_process_observations(&active.manifest.generation) {
             self.cleanup_launched_contour(error)
         } else {
             Ok(())
         }
+    }
+
+    #[cfg(windows)]
+    fn accept_kernel_ready(
+        &self,
+        handshake: &HostKernelHandshake,
+        receipt: &KernelReadyReceipt,
+    ) -> Result<(), HostError> {
+        if handshake.installation_id != self.host.installation {
+            return Err(HostError::ProcessContour(
+                "Kernel ready receipt installation mismatch".to_owned(),
+            ));
+        }
+        receipt
+            .validate(handshake)
+            .map_err(|error| HostError::ProcessContour(error.to_string()))
     }
 
     /// Activates one approved generation only after a bounded process cutover;
