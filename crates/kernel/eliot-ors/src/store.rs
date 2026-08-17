@@ -3648,8 +3648,57 @@ fn storage(error: impl std::fmt::Display) -> OrsError {
 mod process_start_abort_tests {
     use super::*;
     use crate::OperationIdentity;
+    use serde_json::json;
+
+    fn process_start_receipt(
+        operation_id: &str,
+        permit_digest: &str,
+    ) -> Result<eliot_process::ProcessStartReceipt, OrsError> {
+        serde_json::from_value(json!({
+            "binding": {
+                "operation_id": operation_id,
+                "process_tree_id": "tree-1",
+                "job_id": "job-1",
+                "image_id": "image-1",
+                "session_id": "session-1",
+                "generation": 1,
+                "action_lease_ref": "lease-1",
+                "authority_id": "authority-1",
+                "authority_epoch": 1,
+                "state_fence": {
+                    "authority_epoch": 1,
+                    "generation": 1,
+                    "nonce": "fence-1"
+                },
+                "request_digest": "11".repeat(32),
+                "permit_digest": permit_digest,
+                "effect_digest": "33".repeat(32),
+                "validation_revision": 1
+            },
+            "identity": {
+                "suspended": {
+                    "process_id": "process-1",
+                    "process_tree_id": "tree-1",
+                    "job_id": "job-1",
+                    "image_id": "image-1",
+                    "session_id": "session-1",
+                    "generation": 1,
+                    "pid": 1,
+                    "created_suspended_at_unix_ms": 1,
+                    "executable_sha256": "aa".repeat(32)
+                },
+                "resumed_at_unix_ms": 2
+            },
+            "lifecycle": "running"
+        }))
+        .map_err(|error| OrsError::IntegrityProblem {
+            record_type: "test",
+            reason: error.to_string(),
+        })
+    }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn reserved_abort_is_compare_delete_and_survives_reopen() -> Result<(), OrsError> {
         let path = std::env::temp_dir().join(format!(
             "eliot-process-start-abort-{}-{}.redb",
@@ -3681,6 +3730,37 @@ mod process_start_abort_tests {
         };
         let store = RedbRecoveryStore::open(&path)?;
         assert!(store.begin_process_start(&record)?.is_none());
+        let wrong_owner = eliot_process::ProcessOwnerBinding::new(
+            "testd",
+            "b".repeat(64),
+            1,
+            eliot_process::Generation::new(1).map_err(|error| OrsError::IntegrityProblem {
+                record_type: "test",
+                reason: error.to_string(),
+            })?,
+        )
+        .map_err(|error| OrsError::IntegrityProblem {
+            record_type: "test",
+            reason: error.to_string(),
+        })?;
+        assert!(matches!(
+            store.abort_process_start(&operation, &"cd".repeat(32), &owner),
+            Err(OrsError::IntegrityProblem { .. })
+        ));
+        assert!(matches!(
+            store.abort_process_start(&operation, &record.admission_digest, &wrong_owner),
+            Err(OrsError::IntegrityProblem { .. })
+        ));
+        assert_eq!(
+            store
+                .load_process_start(&operation)?
+                .ok_or_else(|| OrsError::IntegrityProblem {
+                    record_type: "test",
+                    reason: "mismatched abort deleted reservation".to_owned(),
+                })?
+                .state,
+            ProcessStartReplayState::Reserved
+        );
         assert_eq!(
             store.abort_process_start(&operation, &record.admission_digest, &owner)?,
             ProcessStartReplayAbort::Released
@@ -3689,6 +3769,47 @@ mod process_start_abort_tests {
         drop(store);
         let reopened = RedbRecoveryStore::open(&path)?;
         assert!(reopened.load_process_start(&operation)?.is_none());
+
+        let completed_operation = OperationIdentity::new("abort-completed")?;
+        let completed_reservation = ProcessStartReplayRecord {
+            operation_id: completed_operation.clone(),
+            admission_digest: "ef".repeat(32),
+            owner: owner.clone(),
+            state: ProcessStartReplayState::Reserved,
+            receipt: None,
+        };
+        let completed = ProcessStartReplayRecord {
+            state: ProcessStartReplayState::Completed,
+            receipt: Some(process_start_receipt(
+                completed_operation.as_str(),
+                &"55".repeat(32),
+            )?),
+            ..completed_reservation.clone()
+        };
+        assert!(
+            reopened
+                .begin_process_start(&completed_reservation)?
+                .is_none()
+        );
+        reopened.persist_process_start(&completed)?;
+        assert_eq!(
+            reopened.abort_process_start(
+                &completed_operation,
+                &completed.admission_digest,
+                &completed.owner
+            )?,
+            ProcessStartReplayAbort::NotReleased
+        );
+        assert_eq!(
+            reopened.load_process_start(&completed_operation)?,
+            Some(completed.clone())
+        );
+        drop(reopened);
+        let reopened = RedbRecoveryStore::open(&path)?;
+        assert_eq!(
+            reopened.load_process_start(&completed_operation)?,
+            Some(completed)
+        );
 
         let unknown_operation = OperationIdentity::new("abort-unknown")?;
         let unknown = ProcessStartReplayRecord {

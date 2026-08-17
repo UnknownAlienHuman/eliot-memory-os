@@ -709,6 +709,75 @@ struct ProcessExecutionGateway {
     path_admission: Arc<KernelPathAdmission>,
 }
 
+#[cfg(windows)]
+struct CanonicalStoreAttachment<'a> {
+    gateway: Arc<KernelStoreGateway>,
+    process_gateway: &'a ProcessExecutionGateway,
+    active: bool,
+}
+
+#[cfg(windows)]
+trait CanonicalStoreAttachmentTransaction: Send {
+    fn commit(self: Box<Self>);
+}
+
+#[cfg(windows)]
+impl CanonicalStoreAttachment<'_> {
+    fn commit(mut self) {
+        self.active = false;
+    }
+}
+
+#[cfg(windows)]
+impl CanonicalStoreAttachmentTransaction for CanonicalStoreAttachment<'_> {
+    fn commit(self: Box<Self>) {
+        (*self).commit();
+    }
+}
+
+#[cfg(windows)]
+impl Drop for CanonicalStoreAttachment<'_> {
+    fn drop(&mut self) {
+        if !self.active {
+            return;
+        }
+        if let Ok(mut retained) = self.process_gateway.canonical_store.lock()
+            && retained
+                .as_ref()
+                .is_some_and(|current| Arc::ptr_eq(current, &self.gateway))
+        {
+            *retained = None;
+        }
+    }
+}
+
+#[cfg(windows)]
+fn attach_then_retain_canonical_store<'a, T, Attach>(
+    gateway: Arc<T>,
+    retained: &'a Mutex<Option<Arc<T>>>,
+    attach: Attach,
+) -> Result<(), KernelBuildError>
+where
+    T: Send + Sync + 'static,
+    Attach: FnOnce(
+            Arc<T>,
+        )
+            -> Result<Box<dyn CanonicalStoreAttachmentTransaction + 'a>, KernelBuildError>
+        + 'a,
+{
+    let process_attachment = attach(Arc::clone(&gateway))?;
+    let mut retained = retained
+        .lock()
+        .map_err(|_| KernelBuildError::Service("store gateway lock poisoned".to_owned()))?;
+    if retained.is_some() {
+        return Err(KernelBuildError::StoreAlreadyConnected);
+    }
+    *retained = Some(gateway);
+    drop(retained);
+    process_attachment.commit();
+    Ok(())
+}
+
 struct ReplayReservationGuard {
     store: Arc<dyn ProcessExecutionReplayStoreWithAbort>,
     operation_id: eliot_process::OperationId,
@@ -880,7 +949,7 @@ impl ProcessExecutionGateway {
     fn attach_canonical_store(
         &self,
         gateway: Arc<KernelStoreGateway>,
-    ) -> Result<(), KernelBuildError> {
+    ) -> Result<CanonicalStoreAttachment<'_>, KernelBuildError> {
         let mut retained = self
             .canonical_store
             .lock()
@@ -888,8 +957,12 @@ impl ProcessExecutionGateway {
         if retained.is_some() {
             return Err(KernelBuildError::StoreAlreadyConnected);
         }
-        *retained = Some(gateway);
-        Ok(())
+        *retained = Some(Arc::clone(&gateway));
+        Ok(CanonicalStoreAttachment {
+            gateway,
+            process_gateway: self,
+            active: true,
+        })
     }
 
     #[cfg(windows)]
@@ -1936,17 +2009,32 @@ impl KernelComposition {
             Arc::new(client),
             route,
         ));
-        let mut retained = self
-            .canonical_store_gateway
-            .lock()
-            .map_err(|_| KernelBuildError::Service("store gateway lock poisoned".to_owned()))?;
-        if retained.is_some() {
-            return Err(KernelBuildError::StoreAlreadyConnected);
-        }
-        *retained = Some(gateway.clone());
-        if let Some(process_gateway) = &self.process_gateway {
-            process_gateway.attach_canonical_store(gateway.clone())?;
-        }
+        // Attach to the process gateway first.  The returned transaction rolls
+        // that exact pointer back if composition retention fails, so a failed
+        // attach cannot poison the retry path or disturb another gateway.
+        attach_then_retain_canonical_store(
+            Arc::clone(&gateway),
+            &self.canonical_store_gateway,
+            |gateway| {
+                self.process_gateway.as_ref().map_or_else(
+                    || {
+                        struct NoopAttachment;
+                        impl CanonicalStoreAttachmentTransaction for NoopAttachment {
+                            fn commit(self: Box<Self>) {}
+                        }
+                        Ok(Box::new(NoopAttachment)
+                            as Box<dyn CanonicalStoreAttachmentTransaction>)
+                    },
+                    |process_gateway| {
+                        process_gateway
+                            .attach_canonical_store(gateway)
+                            .map(|attachment| {
+                                Box::new(attachment) as Box<dyn CanonicalStoreAttachmentTransaction>
+                            })
+                    },
+                )
+            },
+        )?;
         Ok(gateway)
     }
 
@@ -2783,6 +2871,112 @@ mod tests {
 
         drop(kernel);
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(windows)]
+    struct TestCanonicalStoreAttachment {
+        slot: Arc<Mutex<Option<Arc<u8>>>>,
+        gateway: Arc<u8>,
+        active: Arc<AtomicBool>,
+    }
+
+    #[cfg(windows)]
+    impl CanonicalStoreAttachmentTransaction for TestCanonicalStoreAttachment {
+        fn commit(self: Box<Self>) {
+            self.active.store(false, Ordering::Release);
+        }
+    }
+
+    #[cfg(windows)]
+    impl Drop for TestCanonicalStoreAttachment {
+        fn drop(&mut self) {
+            if self.active.load(Ordering::Acquire)
+                && let Ok(mut slot) = self.slot.lock()
+                && slot
+                    .as_ref()
+                    .is_some_and(|current| Arc::ptr_eq(current, &self.gateway))
+            {
+                *slot = None;
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn canonical_store_attach_failure_does_not_retain_or_poison_retry() {
+        let retained = Mutex::new(None);
+        let gateway = Arc::new(7_u8);
+        assert!(matches!(
+            attach_then_retain_canonical_store(Arc::clone(&gateway), &retained, |_| {
+                Err(KernelBuildError::StoreAlreadyConnected)
+            }),
+            Err(KernelBuildError::StoreAlreadyConnected)
+        ));
+        assert!(retained.lock().expect("retained lock").is_none());
+
+        let process_slot = Arc::new(Mutex::new(None));
+        let active = Arc::new(AtomicBool::new(true));
+        assert!(retained.lock().expect("retry lock").is_none());
+        assert!(
+            attach_then_retain_canonical_store(Arc::clone(&gateway), &retained, |gateway| {
+                *process_slot.lock().expect("process slot") = Some(Arc::clone(&gateway));
+                Ok(Box::new(TestCanonicalStoreAttachment {
+                    slot: Arc::clone(&process_slot),
+                    gateway,
+                    active: Arc::clone(&active),
+                })
+                    as Box<dyn CanonicalStoreAttachmentTransaction>)
+            },)
+            .is_ok()
+        );
+        assert!(retained.lock().expect("retry lock").is_some());
+        assert!(!active.load(Ordering::Acquire));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn canonical_store_retain_failure_rolls_back_only_new_process_attachment() {
+        let retained = Arc::new(Mutex::new(None));
+        let poisoned = Arc::clone(&retained);
+        let _ = std::thread::spawn(move || {
+            let _guard = poisoned.lock().expect("poison lock");
+            panic!("force composition retain failure");
+        })
+        .join();
+
+        let process_slot = Arc::new(Mutex::new(None));
+        let unrelated = Arc::new(99_u8);
+        let unrelated_slot = Arc::new(Mutex::new(Some(Arc::clone(&unrelated))));
+        let gateway = Arc::new(7_u8);
+        assert!(matches!(
+            attach_then_retain_canonical_store(
+                Arc::clone(&gateway),
+                &retained,
+                |gateway| {
+                    *process_slot.lock().expect("process slot") = Some(Arc::clone(&gateway));
+                    Ok(Box::new(TestCanonicalStoreAttachment {
+                        slot: Arc::clone(&process_slot),
+                        gateway,
+                        active: Arc::new(AtomicBool::new(true)),
+                    }) as Box<dyn CanonicalStoreAttachmentTransaction>)
+                },
+            ),
+            Err(KernelBuildError::Service(reason)) if reason == "store gateway lock poisoned"
+        ));
+        assert!(
+            process_slot
+                .lock()
+                .expect("process rollback slot")
+                .is_none()
+        );
+        assert!(Arc::ptr_eq(
+            unrelated_slot
+                .lock()
+                .expect("unrelated slot")
+                .as_ref()
+                .expect("unrelated gateway"),
+            &unrelated
+        ));
     }
 
     #[test]
