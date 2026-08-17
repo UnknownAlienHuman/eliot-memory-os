@@ -352,6 +352,9 @@ pub trait OperationalRecoveryStore: Send + Sync {
 pub struct RedbRecoveryStore {
     database: Database,
     evidence: Arc<dyn CanonicalEvidenceProvider>,
+    #[cfg(feature = "test-support")]
+    authority_handoff_failpoint:
+        std::sync::Mutex<Option<Arc<crate::test_support::AuthorityHandoffPersistenceFailpoint>>>,
 }
 
 impl RedbRecoveryStore {
@@ -371,14 +374,44 @@ impl RedbRecoveryStore {
         write.commit().map_err(storage)
     }
 
-    #[cfg(feature = "test-support")]
-    pub fn replace_authority_snapshot_record_for_test(
+    #[cfg(test)]
+    pub(crate) fn write_process_evidence_raw_for_test(
         &self,
-        input: OperationalRecordInput,
+        key: &str,
+        record: &ProcessEvidenceRecord,
     ) -> Result<(), OrsError> {
-        input.validate()?;
-        let key = Self::operational_key(OperationalKind::AuthoritySnapshot, &input.subject_id);
         let write = self.database.begin_write().map_err(storage)?;
+        {
+            let mut table = write.open_table(PROCESS_EVIDENCE).map_err(storage)?;
+            let payload = encode(record)?;
+            table.insert(key, payload.as_str()).map_err(storage)?;
+        }
+        write.commit().map_err(storage)
+    }
+
+    #[cfg(feature = "test-support")]
+    pub(crate) fn substitute_authority_snapshot_metadata_for_test(
+        &self,
+        substitution: crate::test_support::AuthoritySnapshotMetadataSubstitution,
+    ) -> Result<(), OrsError> {
+        let write = self.database.begin_write().map_err(storage)?;
+        let key = {
+            let current = write.open_table(OPERATIONAL_CURRENT).map_err(storage)?;
+            current
+                .iter()
+                .map_err(storage)?
+                .find_map(|entry| {
+                    let (key, value) = entry.ok()?;
+                    let record = decode_named::<DurableOperationalRecord>(
+                        value.value(),
+                        "operational_current",
+                    )
+                    .ok()?;
+                    (record.kind == OperationalKind::AuthoritySnapshot)
+                        .then(|| key.value().to_owned())
+                })
+                .ok_or(OrsError::AuthoritySnapshotUnavailable)?
+        };
         let mut record = {
             let current = write.open_table(OPERATIONAL_CURRENT).map_err(storage)?;
             let value = current
@@ -387,10 +420,25 @@ impl RedbRecoveryStore {
                 .ok_or(OrsError::AuthoritySnapshotUnavailable)?;
             decode_named::<DurableOperationalRecord>(value.value(), "operational_current")?
         };
-        record.input = input;
+        let key =
+            Self::operational_key(OperationalKind::AuthoritySnapshot, &record.input.subject_id);
+        record.input.record_id = substitution.record_id;
+        record.input.created_at_ms = substitution.created_at_ms;
+        record.input.cleanup_after_ms = substitution.cleanup_after_ms;
+        record.input.validate()?;
         record.operation_order = Self::next_operational_order(&write)?;
         Self::persist_operational_record(&write, &key, &record)?;
         write.commit().map_err(storage)
+    }
+
+    #[cfg(feature = "test-support")]
+    pub(crate) fn install_authority_handoff_failpoint(
+        &self,
+        failpoint: Arc<crate::test_support::AuthorityHandoffPersistenceFailpoint>,
+    ) {
+        if let Ok(mut slot) = self.authority_handoff_failpoint.lock() {
+            *slot = Some(failpoint);
+        }
     }
 
     /// Atomically reserves a process start, preserving every prior outcome.
@@ -565,7 +613,8 @@ impl RedbRecoveryStore {
                 (
                     AuthorityHandoffState::Reserved,
                     AuthorityHandoffState::Consumed | AuthorityHandoffState::Unknown,
-                ) => true,
+                )
+                | (AuthorityHandoffState::Consumed, AuthorityHandoffState::Unknown) => true,
                 (AuthorityHandoffState::Consumed, AuthorityHandoffState::Consumed)
                 | (AuthorityHandoffState::Unknown, AuthorityHandoffState::Unknown) => {
                     existing == *record
@@ -583,7 +632,21 @@ impl RedbRecoveryStore {
                 .insert(record.handoff_id.as_str(), payload.as_str())
                 .map_err(storage)?;
         }
-        write.commit().map_err(storage)
+        write.commit().map_err(storage)?;
+        #[cfg(feature = "test-support")]
+        if record.state == AuthorityHandoffState::Consumed
+            && self
+                .authority_handoff_failpoint
+                .lock()
+                .ok()
+                .and_then(|slot| slot.as_ref().map(Arc::clone))
+                .is_some_and(|failpoint| failpoint.take_consume_commit_failure())
+        {
+            return Err(OrsError::Storage(
+                "test-only uncertain consume commit outcome".to_owned(),
+            ));
+        }
+        Ok(())
     }
 
     /// Reads one handoff for bounded recovery/reconciliation.
@@ -649,10 +712,11 @@ impl RedbRecoveryStore {
             let key = key.value();
             let record: ProcessEvidenceRecord = decode(value.value())?;
             record.validate()?;
-            if record.operation_id != *operation_id || !key.starts_with(&start) {
+            let canonical_key = record.record_key()?;
+            if record.operation_id != *operation_id || key != canonical_key {
                 return Err(OrsError::IntegrityProblem {
                     record_type: "process_evidence",
-                    reason: "evidence record operation identity does not match its key".to_owned(),
+                    reason: "evidence record does not match its canonical key".to_owned(),
                 });
             }
             records.push(record);
@@ -682,6 +746,8 @@ impl RedbRecoveryStore {
         let store = Self {
             database,
             evidence: Arc::new(RejectUnboundEvidence),
+            #[cfg(feature = "test-support")]
+            authority_handoff_failpoint: std::sync::Mutex::new(None),
         };
         store.initialize()?;
         store.recover_interrupted_execution()?;
@@ -698,7 +764,12 @@ impl RedbRecoveryStore {
             std::fs::create_dir_all(parent).map_err(storage)?;
         }
         let database = Database::create(path).map_err(storage)?;
-        let store = Self { database, evidence };
+        let store = Self {
+            database,
+            evidence,
+            #[cfg(feature = "test-support")]
+            authority_handoff_failpoint: std::sync::Mutex::new(None),
+        };
         store.initialize()?;
         store.recover_interrupted_execution()?;
         Ok(store)

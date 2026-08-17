@@ -2089,7 +2089,7 @@ mod tests {
         EpochIdentity, EpochLineage, OpaqueLabel, OperationIdentity, RecoveryPayload,
         StateFenceSnapshot,
     };
-    use eliot_platform::SecretReference;
+    use eliot_platform::{PlatformHandle, SecretReference};
     use eliot_process::{
         ActionLeaseRef, DispatchPermitReplaySnapshot, EnvironmentInheritance,
         EnvironmentProjection, FencingToken, ImageId, JobId, OperationId, PermitIssuance,
@@ -2209,6 +2209,119 @@ mod tests {
         .expect("intent")
     }
 
+    #[cfg(windows)]
+    fn authority_test_suffix() -> String {
+        format!(
+            "{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock")
+                .as_nanos()
+        )
+    }
+
+    #[cfg(windows)]
+    struct AuthorityTestCleanup {
+        paths: Vec<PathBuf>,
+    }
+
+    #[cfg(windows)]
+    impl Drop for AuthorityTestCleanup {
+        fn drop(&mut self) {
+            for path in &self.paths {
+                let _ = std::fs::remove_dir_all(path);
+                let _ = std::fs::remove_file(path);
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    struct CredentialCleanup {
+        platform: Arc<WindowsPlatform>,
+        key: String,
+    }
+
+    #[cfg(windows)]
+    impl Drop for CredentialCleanup {
+        fn drop(&mut self) {
+            let _ = self.platform.delete_credential(&self.key);
+        }
+    }
+
+    #[cfg(windows)]
+    fn authority_descriptor(suffix: &str, provider: &str) -> ProcessAuthorityHandoffDescriptor {
+        let authority_id =
+            DispatchAuthorityId::new(format!("authority-{suffix}")).expect("authority id");
+        let state_fence = StateFence::new(AuthorityEpoch::genesis(), ResourceGeneration::genesis());
+        let epoch = EpochLineage {
+            current: EpochIdentity {
+                lineage_id: OpaqueLabel::new(format!("handoff-lineage-{suffix}")).expect("lineage"),
+                epoch: 1,
+            },
+            predecessor: None,
+        };
+        let snapshot_binding = AuthoritySnapshotBindingWire {
+            authority_id: authority_id.clone(),
+            record_id: OperationIdentity::new(format!("snapshot-{suffix}"))
+                .expect("snapshot record"),
+            authority_epoch: epoch,
+            state_fence: StateFenceSnapshot::capture(&state_fence, 1).expect("snapshot fence"),
+            created_at_ms: 1,
+            cleanup_after_ms: Some(2),
+        };
+        let now = i64::try_from(unix_ms()).expect("test clock");
+        ProcessAuthorityHandoffDescriptor {
+            contract_version: ProcessAuthorityHandoffDescriptor::CONTRACT_VERSION,
+            handoff_id: PlatformHandle::new(format!("handoff-{suffix}")).expect("handoff"),
+            handoff_nonce: PlatformHandle::new(format!("nonce-{suffix}")).expect("nonce"),
+            authority_id,
+            snapshot_binding,
+            state_fence,
+            generation: ResourceGeneration::genesis(),
+            revision_policy_binding: PlatformHandle::new(format!("policy-{suffix}"))
+                .expect("policy"),
+            dispatch_key: SecretReference::new(provider, format!("eliot/kernel/test/{suffix}"))
+                .expect("credential reference"),
+            descriptor_sha256: String::new(),
+            issued_at_ms: now.saturating_sub(1_000),
+            expires_at_ms: now.saturating_add(60_000),
+            contour_refs: vec![
+                PlatformHandle::new("portable_dev").expect("contour"),
+                PlatformHandle::new("authority_descriptor").expect("descriptor contour"),
+            ],
+        }
+        .with_computed_digest()
+        .expect("descriptor digest")
+    }
+
+    #[cfg(windows)]
+    fn write_authority_descriptor(
+        root: &Path,
+        name: &str,
+        descriptor: &ProcessAuthorityHandoffDescriptor,
+    ) -> (PathBuf, String) {
+        let bytes = serde_json::to_vec(descriptor).expect("descriptor bytes");
+        let path = root.join(format!("{name}.json"));
+        std::fs::write(&path, &bytes).expect("descriptor file");
+        (path, sha256_hex(&bytes))
+    }
+
+    #[cfg(windows)]
+    fn write_authority_bytes(root: &Path, name: &str, bytes: &[u8]) -> (PathBuf, String) {
+        let path = root.join(format!("{name}.json"));
+        std::fs::write(&path, bytes).expect("descriptor bytes");
+        (path, sha256_hex(bytes))
+    }
+
+    #[cfg(windows)]
+    fn credential_cleanup(platform: &Arc<WindowsPlatform>, key: &str) -> CredentialCleanup {
+        CredentialCleanup {
+            platform: Arc::clone(platform),
+            key: key.to_owned(),
+        }
+    }
+
     #[test]
     fn pre_poison_ipc_handles_cannot_establish_handshake() {
         let root = std::env::temp_dir().join(format!(
@@ -2304,6 +2417,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn process_authority_constructor_reuses_one_real_ors_store() {
         let root = std::env::temp_dir().join(format!(
             "eliot-kernel-process-authority-constructor-{}-{}",
@@ -2366,9 +2480,15 @@ mod tests {
                 2 => tampered.cleanup_after_ms = Some(3_000),
                 _ => unreachable!(),
             }
-            store
-                .replace_authority_snapshot_record_for_test(tampered)
-                .expect("persist metadata substitution");
+            eliot_ors::test_support::substitute_authority_snapshot_metadata(
+                &store,
+                eliot_ors::test_support::AuthoritySnapshotMetadataSubstitution {
+                    record_id: tampered.record_id,
+                    created_at_ms: tampered.created_at_ms,
+                    cleanup_after_ms: tampered.cleanup_after_ms,
+                },
+            )
+            .expect("persist metadata substitution");
             assert!(
                 ProcessDispatchAuthorityController::restore(
                     authority_id.clone(),
@@ -2379,9 +2499,15 @@ mod tests {
                 )
                 .is_err()
             );
-            store
-                .replace_authority_snapshot_record_for_test(original_input.clone())
-                .expect("restore original metadata");
+            eliot_ors::test_support::substitute_authority_snapshot_metadata(
+                &store,
+                eliot_ors::test_support::AuthoritySnapshotMetadataSubstitution {
+                    record_id: original_input.record_id.clone(),
+                    created_at_ms: original_input.created_at_ms,
+                    cleanup_after_ms: original_input.cleanup_after_ms,
+                },
+            )
+            .expect("restore original metadata");
         }
         drop(store);
 
@@ -2455,6 +2581,340 @@ mod tests {
         ));
         drop(kernel);
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn protected_authority_preparation_acceptance_matrix() {
+        let suffix = authority_test_suffix();
+        let root = std::env::temp_dir().join(format!("eliot-kernel-authority-{suffix}"));
+        let outside = std::env::temp_dir().join(format!("eliot-kernel-authority-outside-{suffix}"));
+        let _cleanup = AuthorityTestCleanup {
+            paths: vec![root.clone(), outside.clone()],
+        };
+        std::fs::create_dir_all(&root).expect("test work root");
+        std::fs::create_dir_all(&outside).expect("outside root");
+        let kernel = KernelComposition::new(KernelConfig::new(&root)).expect("composition");
+        let platform = Arc::new(WindowsPlatform::new(&root).expect("platform"));
+
+        let positive =
+            authority_descriptor(&format!("{suffix}-positive"), "windows-credential-manager");
+        let (positive_path, positive_digest) =
+            write_authority_descriptor(&root, "positive", &positive);
+        let positive_key = positive.dispatch_key.key.as_str().to_owned();
+        let positive_cleanup = credential_cleanup(&platform, &positive_key);
+        platform
+            .write_credential(&positive_key, &[0x5a; 32])
+            .expect("positive credential");
+        let prepared = kernel
+            .prepare_authority_descriptor(
+                &positive_path,
+                &positive_digest,
+                AuthorityDescriptorContour::PortableCurrentUser { root: root.clone() },
+            )
+            .expect("positive authority preparation");
+        assert_eq!(prepared.descriptor, positive);
+        let handoff_id = OperationIdentity::new(positive.handoff_id.as_str()).expect("handoff id");
+        let consumed = kernel
+            .generation_gateway
+            .ors
+            .load_authority_handoff(&handoff_id)
+            .expect("load consumed handoff")
+            .expect("consumed handoff");
+        assert_eq!(consumed.state, AuthorityHandoffState::Consumed);
+        assert_eq!(consumed.descriptor_digest, positive.descriptor_sha256);
+        assert_eq!(
+            consumed.authority_id.as_str(),
+            positive.authority_id.as_str()
+        );
+        assert_eq!(
+            consumed.snapshot_record_id,
+            positive.snapshot_binding.record_id
+        );
+        assert_eq!(
+            consumed.snapshot_binding_digest,
+            sha256_json(&positive.snapshot_binding).expect("binding digest")
+        );
+        assert_eq!(
+            consumed.authority_epoch,
+            positive.state_fence.authority_epoch.value()
+        );
+        assert_eq!(consumed.generation, positive.generation.value());
+        assert_eq!(
+            consumed.state_fence_digest,
+            sha256_json(&positive.state_fence).expect("state fence digest")
+        );
+        assert_eq!(
+            consumed.secret_reference_identity_digest,
+            sha256_json(&positive.dispatch_key).expect("secret reference digest")
+        );
+        drop(positive_cleanup);
+        assert!(matches!(
+            kernel.prepare_authority_descriptor(
+                &positive_path,
+                &positive_digest,
+                AuthorityDescriptorContour::PortableCurrentUser { root: root.clone() },
+            ),
+            Err(AuthorityPreparationError::CredentialUnavailable)
+        ));
+
+        let replay_key = positive.dispatch_key.key.as_str().to_owned();
+        let replay_cleanup = credential_cleanup(&platform, &replay_key);
+        platform
+            .write_credential(&replay_key, &[0x5a; 32])
+            .expect("replay credential");
+        assert!(matches!(
+            kernel.prepare_authority_descriptor(
+                &positive_path,
+                &positive_digest,
+                AuthorityDescriptorContour::PortableCurrentUser { root: root.clone() },
+            ),
+            Err(AuthorityPreparationError::Replay)
+        ));
+        drop(replay_cleanup);
+
+        let missing =
+            authority_descriptor(&format!("{suffix}-missing"), "windows-credential-manager");
+        let (missing_path, missing_digest) = write_authority_descriptor(&root, "missing", &missing);
+        assert!(matches!(
+            kernel.prepare_authority_descriptor(
+                &missing_path,
+                &missing_digest,
+                AuthorityDescriptorContour::PortableCurrentUser { root: root.clone() },
+            ),
+            Err(AuthorityPreparationError::CredentialUnavailable)
+        ));
+
+        for (name, secret) in [("short", vec![1_u8]), ("long", vec![1_u8; 33])] {
+            let descriptor =
+                authority_descriptor(&format!("{suffix}-{name}"), "windows-credential-manager");
+            let (path, digest) = write_authority_descriptor(&root, name, &descriptor);
+            let key = descriptor.dispatch_key.key.as_str().to_owned();
+            let cleanup = credential_cleanup(&platform, &key);
+            platform
+                .write_credential(&key, &secret)
+                .expect("invalid credential");
+            assert!(matches!(
+                kernel.prepare_authority_descriptor(
+                    &path,
+                    &digest,
+                    AuthorityDescriptorContour::PortableCurrentUser { root: root.clone() },
+                ),
+                Err(AuthorityPreparationError::CredentialInvalid)
+            ));
+            drop(cleanup);
+        }
+
+        let zero = authority_descriptor(&format!("{suffix}-zero"), "windows-credential-manager");
+        let (zero_path, zero_digest) = write_authority_descriptor(&root, "zero", &zero);
+        let zero_key = zero.dispatch_key.key.as_str().to_owned();
+        let zero_cleanup = credential_cleanup(&platform, &zero_key);
+        platform
+            .write_credential(&zero_key, &[0_u8; 32])
+            .expect("zero credential");
+        assert!(matches!(
+            kernel.prepare_authority_descriptor(
+                &zero_path,
+                &zero_digest,
+                AuthorityDescriptorContour::PortableCurrentUser { root: root.clone() },
+            ),
+            Err(AuthorityPreparationError::CredentialInvalid)
+        ));
+        drop(zero_cleanup);
+
+        let wrong_provider = authority_descriptor(&format!("{suffix}-provider"), "not-a-provider");
+        let (wrong_provider_path, wrong_provider_digest) =
+            write_authority_descriptor(&root, "wrong-provider", &wrong_provider);
+        assert!(matches!(
+            kernel.prepare_authority_descriptor(
+                &wrong_provider_path,
+                &wrong_provider_digest,
+                AuthorityDescriptorContour::PortableCurrentUser { root: root.clone() },
+            ),
+            Err(AuthorityPreparationError::DescriptorInvalid)
+        ));
+
+        let malformed = b"not-json".to_vec();
+        let (malformed_path, malformed_digest) =
+            write_authority_bytes(&root, "malformed", &malformed);
+        assert!(matches!(
+            kernel.prepare_authority_descriptor(
+                &malformed_path,
+                &malformed_digest,
+                AuthorityDescriptorContour::PortableCurrentUser { root: root.clone() },
+            ),
+            Err(AuthorityPreparationError::DescriptorInvalid)
+        ));
+
+        let unknown =
+            authority_descriptor(&format!("{suffix}-unknown"), "windows-credential-manager");
+        let mut unknown_wire = serde_json::to_value(&unknown).expect("unknown descriptor value");
+        unknown_wire["unknown"] = serde_json::json!(true);
+        let unknown_bytes = serde_json::to_vec(&unknown_wire).expect("unknown descriptor bytes");
+        let (unknown_path, unknown_digest) =
+            write_authority_bytes(&root, "unknown", &unknown_bytes);
+        assert!(matches!(
+            kernel.prepare_authority_descriptor(
+                &unknown_path,
+                &unknown_digest,
+                AuthorityDescriptorContour::PortableCurrentUser { root: root.clone() },
+            ),
+            Err(AuthorityPreparationError::DescriptorInvalid)
+        ));
+
+        let mut expired =
+            authority_descriptor(&format!("{suffix}-expired"), "windows-credential-manager");
+        expired.issued_at_ms = 1;
+        expired.expires_at_ms = 2;
+        expired = expired.with_computed_digest().expect("expired digest");
+        let (expired_path, expired_digest) = write_authority_descriptor(&root, "expired", &expired);
+        assert!(matches!(
+            kernel.prepare_authority_descriptor(
+                &expired_path,
+                &expired_digest,
+                AuthorityDescriptorContour::PortableCurrentUser { root: root.clone() },
+            ),
+            Err(AuthorityPreparationError::DescriptorInvalid)
+        ));
+
+        let valid_substitution = authority_descriptor(
+            &format!("{suffix}-substitution"),
+            "windows-credential-manager",
+        );
+        let mut descriptor_substitution = valid_substitution.clone();
+        descriptor_substitution.authority_id =
+            DispatchAuthorityId::new(format!("substituted-{suffix}"))
+                .expect("substituted authority");
+        descriptor_substitution = descriptor_substitution
+            .with_computed_digest()
+            .expect("substituted descriptor digest");
+        let (descriptor_substitution_path, descriptor_substitution_digest) =
+            write_authority_descriptor(&root, "descriptor-substitution", &descriptor_substitution);
+        assert!(matches!(
+            kernel.prepare_authority_descriptor(
+                &descriptor_substitution_path,
+                &descriptor_substitution_digest,
+                AuthorityDescriptorContour::PortableCurrentUser { root: root.clone() },
+            ),
+            Err(AuthorityPreparationError::DescriptorInvalid)
+        ));
+        let descriptor_substitution_id =
+            OperationIdentity::new(descriptor_substitution.handoff_id.as_str())
+                .expect("handoff id");
+        assert!(
+            kernel
+                .generation_gateway
+                .ors
+                .load_authority_handoff(&descriptor_substitution_id)
+                .expect("substitution lookup")
+                .is_none()
+        );
+
+        let mut state_fence_substitution = valid_substitution;
+        state_fence_substitution.state_fence = StateFence::new(
+            AuthorityEpoch::new(2).expect("epoch"),
+            ResourceGeneration::genesis(),
+        );
+        state_fence_substitution = state_fence_substitution
+            .with_computed_digest()
+            .expect("state fence substitution digest");
+        let (state_fence_path, state_fence_digest) = write_authority_descriptor(
+            &root,
+            "state-fence-substitution",
+            &state_fence_substitution,
+        );
+        assert!(matches!(
+            kernel.prepare_authority_descriptor(
+                &state_fence_path,
+                &state_fence_digest,
+                AuthorityDescriptorContour::PortableCurrentUser { root: root.clone() },
+            ),
+            Err(AuthorityPreparationError::DescriptorInvalid)
+        ));
+        let state_fence_id = OperationIdentity::new(state_fence_substitution.handoff_id.as_str())
+            .expect("handoff id");
+        assert!(
+            kernel
+                .generation_gateway
+                .ors
+                .load_authority_handoff(&state_fence_id)
+                .expect("state fence lookup")
+                .is_none()
+        );
+
+        let out_of_contour_descriptor = authority_descriptor(
+            &format!("{suffix}-out-of-contour"),
+            "windows-credential-manager",
+        );
+        let outside_path = outside.join("authority.json");
+        let outside_bytes = serde_json::to_vec(&out_of_contour_descriptor).expect("outside bytes");
+        std::fs::write(&outside_path, &outside_bytes).expect("outside descriptor");
+        assert!(matches!(
+            kernel.prepare_authority_descriptor(
+                &outside_path,
+                &sha256_hex(&outside_bytes),
+                AuthorityDescriptorContour::PortableCurrentUser { root: root.clone() },
+            ),
+            Err(AuthorityPreparationError::ProtectedInput)
+        ));
+        // Reparse/junction substitution coverage is lower-layer-owned by
+        // user_owned_portable_dev_rejects_reparse_path_when_available and
+        // protected_path_lease_rejects_directory_and_file_reparse_substitution.
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn protected_authority_preparation_persists_unknown_after_uncertain_consume() {
+        let suffix = authority_test_suffix();
+        let root = std::env::temp_dir().join(format!("eliot-kernel-authority-unknown-{suffix}"));
+        let _cleanup = AuthorityTestCleanup {
+            paths: vec![root.clone()],
+        };
+        std::fs::create_dir_all(&root).expect("test work root");
+        let kernel = KernelComposition::new(KernelConfig::new(&root)).expect("composition");
+        let platform = Arc::new(WindowsPlatform::new(&root).expect("platform"));
+        let descriptor = authority_descriptor(
+            &format!("{suffix}-unknown-outcome"),
+            "windows-credential-manager",
+        );
+        let (path, digest) = write_authority_descriptor(&root, "unknown-outcome", &descriptor);
+        let key = descriptor.dispatch_key.key.as_str().to_owned();
+        let credential = credential_cleanup(&platform, &key);
+        platform
+            .write_credential(&key, &[0x6b; 32])
+            .expect("credential");
+        let failpoint =
+            Arc::new(eliot_ors::test_support::AuthorityHandoffPersistenceFailpoint::default());
+        eliot_ors::test_support::install_authority_handoff_failpoint(
+            &kernel.generation_gateway.ors,
+            Arc::clone(&failpoint),
+        );
+        failpoint.fail_next_consume_commit_after_durable_effect();
+        assert!(matches!(
+            kernel.prepare_authority_descriptor(
+                &path,
+                &digest,
+                AuthorityDescriptorContour::PortableCurrentUser { root: root.clone() },
+            ),
+            Err(AuthorityPreparationError::PersistenceUnknown)
+        ));
+        let handoff_id =
+            OperationIdentity::new(descriptor.handoff_id.as_str()).expect("handoff id");
+        let unknown = kernel
+            .generation_gateway
+            .ors
+            .load_authority_handoff(&handoff_id)
+            .expect("load unknown handoff")
+            .expect("unknown handoff");
+        assert_eq!(unknown.state, AuthorityHandoffState::Unknown);
+        assert!(
+            unknown
+                .reconciliation_evidence
+                .as_ref()
+                .is_some_and(|evidence| !evidence.as_str().trim().is_empty())
+        );
+        drop(credential);
     }
 
     #[test]

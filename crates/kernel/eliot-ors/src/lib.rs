@@ -10,6 +10,9 @@
 mod model;
 mod store;
 
+#[cfg(feature = "test-support")]
+pub mod test_support;
+
 pub use model::*;
 pub use store::{
     CanonicalEvidenceProvider, OperationalRecoveryStore, OrsCoordinator, RedbRecoveryStore,

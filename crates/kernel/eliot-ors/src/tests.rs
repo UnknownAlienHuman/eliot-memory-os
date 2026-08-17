@@ -624,11 +624,21 @@ fn process_evidence_appends_history_idempotently_and_recovers_in_order() -> Test
     );
 
     let mut conflicting = first.clone();
-    conflicting.request_digest = "44".repeat(32);
+    conflicting.owner = eliot_process::ProcessOwnerBinding::new(
+        "native",
+        conflicting.owner.principal_digest(),
+        conflicting.owner.authority_epoch(),
+        conflicting.owner.generation(),
+    )?;
+    assert_eq!(conflicting.record_key()?, first.record_key()?);
     assert!(matches!(
         store.persist_process_evidence(&conflicting),
         Err(OrsError::IntegrityProblem { .. })
     ));
+    assert_eq!(
+        store.load_process_evidence(&operation_id)?,
+        vec![first.clone(), second.clone()]
+    );
     let mut mismatched = first.clone();
     mismatched.operation_id = OperationIdentity::new("other-operation")?;
     assert!(matches!(
@@ -650,6 +660,24 @@ fn process_evidence_appends_history_idempotently_and_recovers_in_order() -> Test
         reopened.load_process_evidence(&operation_id)?,
         vec![first, second]
     );
+    cleanup(&path);
+    Ok(())
+}
+
+#[test]
+fn process_evidence_readback_rejects_noncanonical_raw_key_suffix() -> TestResult {
+    let path = database_path("process-evidence-canonical-key");
+    let store = RedbRecoveryStore::open(&path)?;
+    let operation_id = OperationIdentity::new("process-evidence-canonical-operation")?;
+    let record = process_evidence_record(operation_id.as_str(), "running", 100)?;
+    let canonical = record.record_key()?;
+    let tampered = format!("{}::{}", operation_id.as_str(), "0".repeat(64));
+    assert_ne!(tampered, canonical);
+    store.write_process_evidence_raw_for_test(&tampered, &record)?;
+    assert!(matches!(
+        store.load_process_evidence(&operation_id),
+        Err(OrsError::IntegrityProblem { .. })
+    ));
     cleanup(&path);
     Ok(())
 }
