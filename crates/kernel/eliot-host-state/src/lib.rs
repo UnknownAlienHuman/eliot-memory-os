@@ -10,6 +10,7 @@ mod backend;
 mod error;
 mod journal;
 mod model;
+mod redb_journal;
 mod redb_store;
 
 pub use backend::{
@@ -27,12 +28,15 @@ pub use model::{
     EliotActivationRecord, EpochEvidence, EpochIdentity, EpochRetirementRecord, EpochTransition,
     FailureRecoveryDirective, HostInstallationEpoch, HostKernelStoreLineage, HostObservationRecord,
     HostState, HostStateRecord, IdempotencyIdentity, ImmutableProcessManifest, JournalManifest,
-    KernelRecord, LifecycleTimestamps, NonceState, OneTimeNonceState, ReadinessEvidence,
-    RecordFence, RecoveryLineageEvidence, RecoveryLineageReason, ServiceSafetyClass,
-    WakeDisposition, WakeRecord,
+    KernelJobBinding, KernelRecord, LifecycleTimestamps, NonceState, OneTimeNonceState,
+    PriorKernelDisposition, PriorKernelSource, ReadinessEvidence, RecordFence,
+    RecoveryLineageEvidence, RecoveryLineageReason, ServiceSafetyClass, WakeDisposition,
+    WakeRecord,
 };
+pub use redb_journal::{RedbJournalBackend, RedbJournalInspection};
 pub use redb_store::{
-    HostAdmissionState, HostRecoverySnapshot, RedbHostReleaseToken, RedbHostStateStore,
+    HostAdmissionState, HostRecoverySnapshot, RedbHostReleaseToken, RedbHostStateInspection,
+    RedbHostStateStore,
 };
 #[cfg(test)]
 mod tests;

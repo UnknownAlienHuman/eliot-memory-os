@@ -1,23 +1,435 @@
 //! Host↔Kernel protocol records.
 
-use eliot_contracts::{AuthorityEpoch, ResourceGeneration, StateFence};
+use eliot_contracts::{AuthorityEpoch, ResourceGeneration, StateFence, sha256_hex};
+use eliot_ipc::TransportError;
 use eliot_kernel_core::AuthoritySnapshotBindingWire;
 use eliot_platform::{PlatformHandle, PortError, SecretReference};
 use eliot_process::{
     CancellationReceipt, OperationId, ProcessEvidence, ProcessExecutionAdmissionRequest,
     ProcessExecutionError, ProcessExecutionView, ProcessStartReceipt,
 };
+use eliot_protocol::{
+    EncodingProfile, Frame, FrameKind, MessageType, ProtocolPayload, ProtocolVersion,
+};
 use eliot_runtime_contracts::{HealthVector, ServiceProcessState};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
-use std::fmt::Write as _;
 
-use crate::{KernelServiceError, validate_text};
+use crate::{KernelServiceError, KernelServiceState, validate_text};
 
 fn handle(value: &PlatformHandle, field: &'static str) -> Result<(), KernelServiceError> {
     validate_text(value.as_str(), field)
+}
+
+/// Stable identity for the Host↔Kernel lifecycle control wire.
+pub const KERNEL_CONTROL_WIRE_ID: &str = "eliot.kernel.host-control";
+/// Current version of the Host↔Kernel lifecycle control wire.
+pub const KERNEL_CONTROL_WIRE_VERSION: u16 = 1;
+/// Canonical authenticated Kernel front-door pipe.
+pub const KERNEL_CONTROL_PIPE: &str = r"\\.\pipe\eliot\kernel\frontdoor";
+
+/// Handle-bound process identity carried as an inert Host claim.
+///
+/// Kernel never treats this projection as proof.  It compares it with the
+/// process identity observed by the authenticated named-pipe adapter before
+/// admitting any lifecycle command.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HostProcessBinding {
+    /// Process identifier observed by Host before launch/connect.
+    pub process_id: u32,
+    /// Handle-bound process creation time in Windows 100-nanosecond units.
+    pub start_time_100ns: u64,
+    /// Canonical process image path observed by Host.
+    pub image_path: String,
+}
+
+impl HostProcessBinding {
+    /// Validates the bounded, inert wire projection.
+    pub fn validate(&self) -> Result<(), KernelServiceError> {
+        if self.process_id == 0
+            || self.start_time_100ns == 0
+            || self.image_path.trim().is_empty()
+            || self.image_path.chars().any(char::is_control)
+            || self.image_path.len() > 32_767
+        {
+            return Err(KernelServiceError::InvalidField {
+                field: "host_process_binding",
+                reason: "must contain a bounded non-zero process identity",
+            });
+        }
+        Ok(())
+    }
+}
+
+/// Inert projection of the Host-created Kernel Job binding.
+///
+/// The Kernel reconstructs the platform binding and calls
+/// `RecoverableJobObject::open`; these fields alone never grant Job authority.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HostJobBinding {
+    /// Exact object-manager Job identity.
+    pub job: HostJobIdentity,
+    /// Root process and executable identity retained by Host.
+    pub root: HostJobRoot,
+}
+
+/// Inert Job object name projection.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HostJobIdentity {
+    /// Exact Windows object-manager name.
+    pub name: String,
+}
+
+/// Inert root process/file projection for one Host Job binding.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HostJobRoot {
+    /// Root process identity observed by Host.
+    pub process: HostProcessBinding,
+    /// Root executable file-object identity observed by Host.
+    pub executable: HostFileIdentity,
+}
+
+/// Inert file-object identity projection.
+#[derive(Clone, Copy, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HostFileIdentity {
+    /// Volume serial number.
+    pub volume_serial_number: u32,
+    /// File index on the volume.
+    pub file_index: u64,
+}
+
+impl HostJobBinding {
+    /// Validates only bounded shape; the Kernel must still reopen the Job.
+    pub fn validate(&self) -> Result<(), KernelServiceError> {
+        handle_text(&self.job.name, "host_job_binding.job.name")?;
+        if self.job.name.len() > 480 {
+            return Err(KernelServiceError::InvalidField {
+                field: "host_job_binding.job.name",
+                reason: "exceeds the bounded Job name length",
+            });
+        }
+        self.root.process.validate()?;
+        if self.root.executable.volume_serial_number == 0 || self.root.executable.file_index == 0 {
+            return Err(KernelServiceError::InvalidField {
+                field: "host_job_binding.root.executable",
+                reason: "must contain a non-zero file identity",
+            });
+        }
+        Ok(())
+    }
+}
+
+fn handle_text(value: &str, field: &'static str) -> Result<(), KernelServiceError> {
+    validate_text(value, field)
+}
+
+/// One authenticated Host lifecycle command.  The command is repeated with
+/// the complete handshake so reconnects cannot silently inherit stale Host
+/// identity, generation, or nonce state.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct KernelControlRequest {
+    /// Wire identity.
+    pub wire_id: String,
+    /// Wire revision.
+    pub wire_version: u16,
+    /// Host-owned request identity.
+    pub message_id: PlatformHandle,
+    /// Strict in-connection sequence.
+    pub sequence: u64,
+    /// Process identity proven by the authenticated pipe peer.
+    pub peer_process_id: u32,
+    /// Approved generation bound to this control exchange.
+    pub generation: ResourceGeneration,
+    /// Complete Host lineage binding.
+    pub handshake: HostKernelHandshake,
+    /// One closed lifecycle command.
+    pub command: KernelControlCommand,
+    /// Digest over all fields except this digest.
+    pub payload_digest: String,
+}
+
+impl KernelControlRequest {
+    /// Returns canonical bytes covered by `payload_digest`.
+    pub fn canonical_unsigned_bytes(&self) -> Result<Vec<u8>, KernelServiceError> {
+        #[derive(Serialize)]
+        struct Unsigned<'a> {
+            wire_id: &'a str,
+            wire_version: u16,
+            message_id: &'a PlatformHandle,
+            sequence: u64,
+            peer_process_id: u32,
+            generation: ResourceGeneration,
+            handshake: &'a HostKernelHandshake,
+            command: &'a KernelControlCommand,
+        }
+        serde_json::to_vec(&Unsigned {
+            wire_id: &self.wire_id,
+            wire_version: self.wire_version,
+            message_id: &self.message_id,
+            sequence: self.sequence,
+            peer_process_id: self.peer_process_id,
+            generation: self.generation,
+            handshake: &self.handshake,
+            command: &self.command,
+        })
+        .map_err(|_| KernelServiceError::InvalidField {
+            field: "control.payload_digest",
+            reason: "cannot canonicalize request",
+        })
+    }
+
+    /// Computes the canonical lowercase SHA-256 digest.
+    pub fn compute_digest(&self) -> Result<String, KernelServiceError> {
+        Ok(sha256_hex(&self.canonical_unsigned_bytes()?))
+    }
+
+    /// Populates the canonical digest.
+    pub fn with_computed_digest(mut self) -> Result<Self, KernelServiceError> {
+        self.payload_digest = self.compute_digest()?;
+        Ok(self)
+    }
+
+    /// Validates the bounded control request and its independent digest.
+    pub fn validate(&self) -> Result<(), KernelServiceError> {
+        if self.wire_id != KERNEL_CONTROL_WIRE_ID
+            || self.wire_version != KERNEL_CONTROL_WIRE_VERSION
+        {
+            return Err(KernelServiceError::InvalidField {
+                field: "control.wire",
+                reason: "unsupported control wire",
+            });
+        }
+        handle(&self.message_id, "control.message_id")?;
+        if self.sequence == 0 || self.peer_process_id == 0 {
+            return Err(KernelServiceError::InvalidField {
+                field: "control.sequence_or_peer",
+                reason: "sequence and peer process identity must be non-zero",
+            });
+        }
+        if self.generation.value() == 0 {
+            return Err(KernelServiceError::InvalidField {
+                field: "control.generation",
+                reason: "must be non-zero",
+            });
+        }
+        self.handshake.validate()?;
+        if self.payload_digest.len() != 64
+            || !self
+                .payload_digest
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+            || self.compute_digest()? != self.payload_digest
+        {
+            return Err(KernelServiceError::InvalidField {
+                field: "control.payload_digest",
+                reason: "must be the matching lowercase SHA-256 digest",
+            });
+        }
+        Ok(())
+    }
+}
+
+/// Typed response to one authenticated Host lifecycle command.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct KernelControlResponse {
+    /// Wire identity.
+    pub wire_id: String,
+    /// Wire revision.
+    pub wire_version: u16,
+    /// Echoed request identity.
+    pub message_id: PlatformHandle,
+    /// Echoed request digest.
+    pub request_digest: String,
+    /// Accepted Kernel lifecycle state.
+    pub state: KernelServiceState,
+    /// Receipt returned only after Kernel-owned readiness observation.
+    pub receipt: Option<KernelReadyReceipt>,
+    /// Stable rejection detail, when the command was not accepted.
+    pub error: Option<String>,
+    /// Digest over all fields except this digest.
+    pub payload_digest: String,
+}
+
+impl KernelControlResponse {
+    /// Returns canonical bytes covered by `payload_digest`.
+    pub fn canonical_unsigned_bytes(&self) -> Result<Vec<u8>, KernelServiceError> {
+        #[derive(Serialize)]
+        struct Unsigned<'a> {
+            wire_id: &'a str,
+            wire_version: u16,
+            message_id: &'a PlatformHandle,
+            request_digest: &'a str,
+            state: KernelServiceState,
+            receipt: &'a Option<KernelReadyReceipt>,
+            error: &'a Option<String>,
+        }
+        serde_json::to_vec(&Unsigned {
+            wire_id: &self.wire_id,
+            wire_version: self.wire_version,
+            message_id: &self.message_id,
+            request_digest: &self.request_digest,
+            state: self.state,
+            receipt: &self.receipt,
+            error: &self.error,
+        })
+        .map_err(|_| KernelServiceError::InvalidField {
+            field: "control.payload_digest",
+            reason: "cannot canonicalize response",
+        })
+    }
+
+    /// Computes the canonical lowercase SHA-256 digest.
+    pub fn compute_digest(&self) -> Result<String, KernelServiceError> {
+        Ok(sha256_hex(&self.canonical_unsigned_bytes()?))
+    }
+
+    /// Populates the canonical digest.
+    pub fn with_computed_digest(mut self) -> Result<Self, KernelServiceError> {
+        self.payload_digest = self.compute_digest()?;
+        Ok(self)
+    }
+
+    /// Validates the response envelope and digest.
+    pub fn validate(&self) -> Result<(), KernelServiceError> {
+        if self.wire_id != KERNEL_CONTROL_WIRE_ID
+            || self.wire_version != KERNEL_CONTROL_WIRE_VERSION
+        {
+            return Err(KernelServiceError::InvalidField {
+                field: "control.wire",
+                reason: "unsupported control wire",
+            });
+        }
+        handle(&self.message_id, "control.message_id")?;
+        if self.request_digest.len() != 64
+            || !self
+                .request_digest
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+        {
+            return Err(KernelServiceError::InvalidField {
+                field: "control.request_digest",
+                reason: "must be a lowercase SHA-256 digest",
+            });
+        }
+        if let Some(error) = &self.error {
+            validate_text(error, "control.error")?;
+        }
+        if self.payload_digest.len() != 64
+            || !self
+                .payload_digest
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+            || self.compute_digest()? != self.payload_digest
+        {
+            return Err(KernelServiceError::InvalidField {
+                field: "control.payload_digest",
+                reason: "must be the matching lowercase SHA-256 digest",
+            });
+        }
+        Ok(())
+    }
+}
+
+/// Encodes one control request as a bounded authenticated EBP control frame.
+pub fn control_request_frame(
+    connection_id: impl Into<String>,
+    request: &KernelControlRequest,
+) -> Result<Frame, TransportError> {
+    request
+        .validate()
+        .map_err(|_error| TransportError::SessionFenced)?;
+    let frame = Frame {
+        protocol_version: ProtocolVersion::CURRENT,
+        encoding_profile: EncodingProfile::JsonV1,
+        connection_id: connection_id.into(),
+        request_id: None,
+        kind: FrameKind::Control,
+        message_type: MessageType::Start,
+        request_identity: None,
+        payload: ProtocolPayload::Json(
+            serde_json::to_value(request).map_err(|_| TransportError::SessionFenced)?,
+        ),
+        trace_context: std::collections::BTreeMap::new(),
+    };
+    frame.validate()?;
+    Ok(frame)
+}
+
+/// Decodes one control request from the authenticated EBP control lane.
+pub fn decode_control_request_frame(frame: &Frame) -> Result<KernelControlRequest, TransportError> {
+    frame.validate()?;
+    if frame.kind != FrameKind::Control
+        || frame.message_type != MessageType::Start
+        || frame.request_id.is_some()
+        || frame.request_identity.is_some()
+    {
+        return Err(TransportError::SessionFenced);
+    }
+    let ProtocolPayload::Json(payload) = &frame.payload else {
+        return Err(TransportError::SessionFenced);
+    };
+    let request: KernelControlRequest =
+        serde_json::from_value(payload.clone()).map_err(|_| TransportError::SessionFenced)?;
+    request
+        .validate()
+        .map_err(|_| TransportError::SessionFenced)?;
+    Ok(request)
+}
+
+/// Encodes one typed control response.
+pub fn control_response_frame(
+    connection_id: impl Into<String>,
+    response: &KernelControlResponse,
+) -> Result<Frame, TransportError> {
+    response
+        .validate()
+        .map_err(|_| TransportError::SessionFenced)?;
+    let frame = Frame {
+        protocol_version: ProtocolVersion::CURRENT,
+        encoding_profile: EncodingProfile::JsonV1,
+        connection_id: connection_id.into(),
+        request_id: None,
+        kind: FrameKind::Control,
+        message_type: MessageType::Ready,
+        request_identity: None,
+        payload: ProtocolPayload::Json(
+            serde_json::to_value(response).map_err(|_| TransportError::SessionFenced)?,
+        ),
+        trace_context: std::collections::BTreeMap::new(),
+    };
+    frame.validate()?;
+    Ok(frame)
+}
+
+/// Decodes one typed control response.
+pub fn decode_control_response_frame(
+    frame: &Frame,
+) -> Result<KernelControlResponse, TransportError> {
+    frame.validate()?;
+    if frame.kind != FrameKind::Control
+        || frame.message_type != MessageType::Ready
+        || frame.request_id.is_some()
+        || frame.request_identity.is_some()
+    {
+        return Err(TransportError::SessionFenced);
+    }
+    let ProtocolPayload::Json(payload) = &frame.payload else {
+        return Err(TransportError::SessionFenced);
+    };
+    let response: KernelControlResponse =
+        serde_json::from_value(payload.clone()).map_err(|_| TransportError::SessionFenced)?;
+    response
+        .validate()
+        .map_err(|_| TransportError::SessionFenced)?;
+    Ok(response)
 }
 
 /// Versioned, secret-free one-shot process-authority handoff.
@@ -62,12 +474,7 @@ impl ProcessAuthorityHandoffDescriptor {
 
     /// Computes the descriptor digest through the one canonical procedure.
     pub fn compute_digest(&self) -> Result<String, KernelServiceError> {
-        let observed = Sha256::digest(self.canonical_unsigned_bytes()?);
-        let mut digest = String::with_capacity(64);
-        for byte in observed {
-            let _ = write!(&mut digest, "{byte:02x}");
-        }
-        Ok(digest)
+        Ok(sha256_hex(&self.canonical_unsigned_bytes()?))
     }
 
     /// Returns a descriptor with its checked canonical digest populated.
@@ -255,6 +662,15 @@ mod descriptor_tests {
     }
 
     #[test]
+    fn contract_v1_digest_preserves_legacy_json_field_order() {
+        let descriptor = descriptor();
+        assert_eq!(
+            descriptor.compute_digest().expect("legacy digest"),
+            "7df4185c6311ec6f0f9395076f8dde4c55dd0a4c0c578af23b18f3a14544b570"
+        );
+    }
+
+    #[test]
     fn descriptor_rejects_unknown_duplicate_blank_and_malformed_inputs() {
         let descriptor = descriptor().with_computed_digest().expect("digest");
         let mut unknown = serde_json::to_value(&descriptor).expect("value");
@@ -280,6 +696,10 @@ mod descriptor_tests {
         let mut malformed = descriptor;
         malformed.descriptor_sha256 = "not-a-digest".to_owned();
         assert!(malformed.validate(500).is_err());
+
+        let mut uppercase = malformed;
+        uppercase.descriptor_sha256 = "A".repeat(64);
+        assert!(uppercase.validate(500).is_err());
     }
 
     #[test]
@@ -624,6 +1044,10 @@ pub struct HostKernelHandshake {
     pub job_object_id: PlatformHandle,
     /// Candidate/active authenticated local IPC identity.
     pub pipe_identity: PlatformHandle,
+    /// Host process identity observed before it opened the control pipe.
+    pub host_process: HostProcessBinding,
+    /// Host-retained Kernel Job binding; Kernel must reopen and reobserve it.
+    pub job_binding: HostJobBinding,
     /// Restart budget for this lineage.
     pub restart_budget: RestartBudget,
     /// Containment action required if the previous lineage is suspect.
@@ -644,6 +1068,8 @@ impl HostKernelHandshake {
         ] {
             handle(value, field)?;
         }
+        self.host_process.validate()?;
+        self.job_binding.validate()?;
         if self.host_epoch.value() == 0 || self.kernel_epoch.value() == 0 {
             return Err(KernelServiceError::InvalidField {
                 field: "handshake.epoch",
@@ -740,6 +1166,10 @@ impl KernelReadyReceipt {
 /// Control messages accepted by the Kernel service boundary.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE", deny_unknown_fields)]
+#[allow(
+    clippy::large_enum_variant,
+    reason = "preserve the established self-describing wire shape for the full Reconcile handshake"
+)]
 pub enum KernelControlCommand {
     /// Begin reconciliation of one Host activation lineage.
     Reconcile(HostKernelHandshake),
@@ -749,8 +1179,9 @@ pub enum KernelControlCommand {
     PrepareHandoff,
     /// Begin consuming the one-time activation nonce.
     Activate,
-    /// Publish a complete readiness receipt.
-    Ready(KernelReadyReceipt),
+    /// Ask Kernel to prove readiness from live observations and self-author a
+    /// receipt.  No caller-shaped receipt is accepted on this wire.
+    ProbeReady,
     /// Close normal admission while retaining recovery control.
     Degrade(PlatformHandle),
     /// Drain normal work before stopping.
@@ -821,5 +1252,138 @@ mod tests {
         let value = serde_json::to_value(operation).expect("json");
         assert!(value.get("caller").is_none());
         assert_eq!(value["operation"], "Inspect");
+    }
+
+    fn control_handshake() -> HostKernelHandshake {
+        HostKernelHandshake {
+            installation_id: handle_value("installation-1"),
+            host_epoch: AuthorityEpoch::new(1).expect("host epoch"),
+            kernel_epoch: AuthorityEpoch::new(1).expect("kernel epoch"),
+            activation_id: handle_value("activation-1"),
+            artifact_hash: handle_value("artifact-1"),
+            config_hash: handle_value("config-1"),
+            activation_nonce: handle_value("nonce-1"),
+            job_object_id: handle_value("Local\\Eliot-Host-Kernel-test"),
+            pipe_identity: handle_value(KERNEL_CONTROL_PIPE),
+            host_process: HostProcessBinding {
+                process_id: 7,
+                start_time_100ns: 9,
+                image_path: "C:\\\\eliot\\\\host.exe".to_owned(),
+            },
+            job_binding: HostJobBinding {
+                job: HostJobIdentity {
+                    name: "Local\\Eliot-Host-Kernel-test".to_owned(),
+                },
+                root: HostJobRoot {
+                    process: HostProcessBinding {
+                        process_id: 42,
+                        start_time_100ns: 10,
+                        image_path: "C:\\\\eliot\\\\kernel.exe".to_owned(),
+                    },
+                    executable: HostFileIdentity {
+                        volume_serial_number: 1,
+                        file_index: 2,
+                    },
+                },
+            },
+            restart_budget: RestartBudget::new(1, 1).expect("budget"),
+            containment_action: None,
+        }
+    }
+
+    #[test]
+    fn control_wire_digest_and_unknown_fields_are_fail_closed() {
+        let request = KernelControlRequest {
+            wire_id: KERNEL_CONTROL_WIRE_ID.to_owned(),
+            wire_version: KERNEL_CONTROL_WIRE_VERSION,
+            message_id: handle_value("message-1"),
+            sequence: 1,
+            peer_process_id: 42,
+            generation: ResourceGeneration::new(1).expect("generation"),
+            handshake: control_handshake(),
+            command: KernelControlCommand::Shadow,
+            payload_digest: String::new(),
+        }
+        .with_computed_digest()
+        .expect("digest");
+        let frame = control_request_frame("control-1", &request).expect("frame");
+        let decoded = decode_control_request_frame(&frame).expect("decode");
+        assert_eq!(decoded, request);
+        let mut tampered = request;
+        tampered.sequence = 2;
+        assert!(tampered.validate().is_err());
+        let mut json = serde_json::to_value(decoded).expect("json");
+        json["unknown"] = serde_json::Value::Bool(true);
+        assert!(serde_json::from_value::<KernelControlRequest>(json).is_err());
+    }
+
+    fn ready_receipt(handshake: &HostKernelHandshake) -> KernelReadyReceipt {
+        KernelReadyReceipt {
+            activation_id: handshake.activation_id.clone(),
+            activation_nonce: handshake.activation_nonce.clone(),
+            process: ProcessObservation {
+                process_id: handle_value("pid:42:start:1"),
+                job_object_id: handshake.job_object_id.clone(),
+                state: ServiceProcessState::Ready,
+                health: HealthVector::healthy(),
+                evidence_refs: vec![handle_value("process-evidence-1")],
+            },
+            health: HealthVector::healthy(),
+            evidence_refs: vec![handle_value("ready-evidence-1")],
+        }
+    }
+
+    #[test]
+    fn ready_receipt_rejects_nonce_job_health_and_evidence_substitution() {
+        let handshake = control_handshake();
+        let receipt = ready_receipt(&handshake);
+        assert!(receipt.validate(&handshake).is_ok());
+
+        let mut wrong_nonce = receipt.clone();
+        wrong_nonce.activation_nonce = handle_value("nonce-other");
+        assert!(wrong_nonce.validate(&handshake).is_err());
+
+        let mut wrong_job = receipt.clone();
+        wrong_job.process.job_object_id = handle_value("Local\\Eliot-Other-Job");
+        assert!(wrong_job.validate(&handshake).is_err());
+
+        let mut unhealthy = receipt.clone();
+        unhealthy.health.liveness = eliot_runtime_contracts::HealthDimension::Degraded;
+        assert!(unhealthy.validate(&handshake).is_err());
+
+        let mut missing_evidence = receipt;
+        missing_evidence.evidence_refs.clear();
+        assert!(missing_evidence.validate(&handshake).is_err());
+    }
+
+    #[test]
+    fn probe_ready_is_unit_wire_and_cannot_carry_host_receipt() {
+        let command = KernelControlCommand::ProbeReady;
+        assert_eq!(
+            serde_json::to_value(&command).expect("probe json"),
+            serde_json::Value::String("PROBE_READY".to_owned())
+        );
+        let forged = serde_json::json!({
+            "PROBE_READY": {
+                "activation_id": "host-authored",
+                "activation_nonce": "nonce-1"
+            }
+        });
+        assert!(serde_json::from_value::<KernelControlCommand>(forged).is_err());
+    }
+
+    #[test]
+    fn host_process_and_job_binding_are_required_and_bounded() {
+        let mut missing_process = control_handshake();
+        missing_process.host_process.process_id = 0;
+        assert!(missing_process.validate().is_err());
+
+        let mut missing_root = control_handshake();
+        missing_root.job_binding.root.process.start_time_100ns = 0;
+        assert!(missing_root.validate().is_err());
+
+        let mut missing_file = control_handshake();
+        missing_file.job_binding.root.executable.file_index = 0;
+        assert!(missing_file.validate().is_err());
     }
 }

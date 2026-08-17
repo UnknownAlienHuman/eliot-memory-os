@@ -2,6 +2,7 @@ use std::sync::Mutex;
 
 use eliot_platform::PlatformHandle;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use sha2::{Digest, Sha256};
 
 use crate::backend::{BackendReconcileState, CommittedAppend, DurableImage, PreparedAppend};
 use crate::model::{
@@ -67,14 +68,9 @@ fn decode<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, JournalError> {
     serde_json::from_slice(bytes).map_err(|error| JournalError::Invalid(error.to_string()))
 }
 
-/// Stable non-cryptographic corruption checksum; artifact approval hashes remain outside P-05.
+/// Lowercase SHA-256 digest used for frame integrity and idempotency binding.
 fn checksum(bytes: &[u8]) -> String {
-    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
-    for byte in bytes {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    format!("fnv1a64-{hash:016x}")
+    format!("{:x}", Sha256::digest(bytes))
 }
 
 pub fn record_checksum(record: &HostStateRecord) -> Result<String, JournalError> {
@@ -129,8 +125,36 @@ fn replay(
 ) -> Result<HostState, JournalError> {
     host.validate()?;
     let mut state = HostState::new(host, retained);
+    for frame in scan_frames(bytes)? {
+        apply(
+            &mut state,
+            &frame.record,
+            frame.header.sequence,
+            &frame.header.checksum,
+        )?;
+        state.sequence = frame.header.sequence;
+        state.last_checksum = Some(frame.header.checksum);
+    }
+    Ok(state)
+}
+
+/// Scans only the durable frame envelope and decodes its record.
+///
+/// This intentionally has no reducer state. Callers that need semantic
+/// validation must do so in their own boundary, and the replay path advances
+/// its reducer only after `apply` succeeds.
+struct ScannedFrame<'a> {
+    raw: &'a [u8],
+    header: FrameHeader,
+    record: HostStateRecord,
+}
+
+fn scan_frames(bytes: &[u8]) -> Result<Vec<ScannedFrame<'_>>, JournalError> {
     let mut offset = 0_usize;
+    let mut expected_sequence = 1_u64;
+    let mut frames = Vec::new();
     while offset < bytes.len() {
+        let frame_start = offset;
         let magic_end = offset
             .checked_add(JOURNAL_MAGIC.len())
             .ok_or(JournalError::Torn { offset })?;
@@ -167,20 +191,49 @@ fn replay(
                 sequence: header.sequence,
             });
         }
-        let expected = state
-            .sequence
-            .checked_add(1)
-            .ok_or(JournalError::Sequence)?;
-        if header.sequence != expected {
+        if header.sequence != expected_sequence {
             return Err(JournalError::Sequence);
         }
         let record: HostStateRecord = decode(payload)?;
-        apply(&mut state, &record, header.sequence, &header.checksum)?;
-        state.sequence = header.sequence;
-        state.last_checksum = Some(header.checksum);
+        frames.push(ScannedFrame {
+            raw: &bytes[frame_start..newline],
+            header,
+            record,
+        });
+        if newline < bytes.len() {
+            expected_sequence = expected_sequence
+                .checked_add(1)
+                .ok_or(JournalError::Sequence)?;
+        }
         offset = newline;
     }
-    Ok(state)
+    Ok(frames)
+}
+
+pub(crate) struct FrameBinding {
+    pub(crate) operation: IdempotencyIdentity,
+    pub(crate) record_checksum: String,
+    pub(crate) payload_digest: String,
+}
+
+pub(crate) fn frame_bindings(
+    epoch_bytes: &[u8],
+    host: &HostInstallationEpoch,
+) -> Result<Vec<FrameBinding>, JournalError> {
+    host.validate()?;
+    let mut bindings = Vec::new();
+    for frame in scan_frames(epoch_bytes)? {
+        frame.record.validate()?;
+        if frame.record.fence().host != *host {
+            return Err(JournalError::StaleFence);
+        }
+        bindings.push(FrameBinding {
+            operation: frame.record.operation().clone(),
+            record_checksum: frame.header.checksum,
+            payload_digest: checksum(frame.raw),
+        });
+    }
+    Ok(bindings)
 }
 
 // Keeping the record union in one exhaustive match makes the one-writer state
@@ -237,6 +290,10 @@ fn apply(
                 state.drain_commit.is_some(),
             )?;
             if new_generation {
+                state.prior_kernel = state.kernel.take().or_else(|| state.prior_kernel.take());
+                state.prior_kernel_unknown = state.prior_kernel_unknown
+                    || (state.prior_kernel.is_none()
+                        && state.retained_epochs.iter().any(|item| !item.retired));
                 state.kernel = None;
                 state.dependencies.clear();
                 state.drain = None;
@@ -254,6 +311,31 @@ fn apply(
                 .ok_or(JournalError::StaleFence)?;
             if &next.activation_identity != activation_identity {
                 return Err(JournalError::StaleFence);
+            }
+            if state.prior_kernel_unknown {
+                return Err(JournalError::Invalid(
+                    "Kernel prior disposition is unknown; manual recovery is required".into(),
+                ));
+            }
+            if state.kernel.is_none()
+                && let Some(prior) = state.prior_kernel.as_ref()
+                && !next
+                    .kernel_generation
+                    .is_direct_child_of(&prior.kernel_generation)?
+            {
+                return Err(JournalError::StaleFence);
+            }
+            match state.prior_kernel.as_ref() {
+                None if matches!(
+                    next.prior_kernel_disposition,
+                    crate::PriorKernelDisposition::NoPriorKernel
+                ) => {}
+                Some(prior) if next.prior_kernel_disposition.binds_to(prior) => {}
+                _ => {
+                    return Err(JournalError::Invalid(
+                        "Kernel prior disposition does not bind preserved reducer context".into(),
+                    ));
+                }
             }
             kernel_transition(state.kernel.as_ref(), next)?;
             state.kernel = Some(next.clone());
@@ -414,6 +496,78 @@ fn load_epochs(
     })
 }
 
+fn validate_committed_receipts(
+    image: &DurableImage,
+    loaded: &LoadedEpochs,
+    requested_host: &HostInstallationEpoch,
+    recovery_reason: Option<RecoveryLineageReason>,
+) -> Result<(), JournalError> {
+    let mut binding_cache: Vec<Option<Vec<FrameBinding>>> =
+        (0..image.epochs.len()).map(|_| None).collect();
+    for receipt in &image.receipts {
+        let mut matching_epoch = None;
+        for (index, epoch) in image.epochs.iter().enumerate() {
+            if epoch.host == receipt.host && matching_epoch.replace(index).is_some() {
+                return Err(JournalError::Invalid(
+                    "committed receipt does not name exactly one durable host epoch".into(),
+                ));
+            }
+        }
+        let Some(epoch_index) = matching_epoch else {
+            return Err(JournalError::Invalid(
+                "committed receipt does not name exactly one durable host epoch".into(),
+            ));
+        };
+        let mut matching_evidence = None;
+        for evidence in &loaded.evidence {
+            if evidence.host == receipt.host && matching_evidence.replace(evidence).is_some() {
+                return Err(JournalError::Invalid(
+                    "committed receipt does not name exactly one epoch evidence record".into(),
+                ));
+            }
+        }
+        let Some(evidence) = matching_evidence else {
+            return Err(JournalError::Invalid(
+                "committed receipt does not name exactly one epoch evidence record".into(),
+            ));
+        };
+        if transaction_id_for(&receipt.operation, &receipt.host, &receipt.record_checksum)?
+            != receipt.transaction_id
+        {
+            return Err(JournalError::IdempotencyConflict);
+        }
+        if !evidence.replay_verified {
+            if recovery_reason == Some(RecoveryLineageReason::Corruption)
+                && receipt.host != *requested_host
+            {
+                // The receipt remains retained evidence, but it is not
+                // authoritative and cannot participate in reconciliation for
+                // this newly recovered Host lineage.
+                continue;
+            }
+            return Err(JournalError::Invalid(
+                "committed receipt belongs to an unverified host epoch".into(),
+            ));
+        }
+
+        if binding_cache[epoch_index].is_none() {
+            let epoch = &image.epochs[epoch_index];
+            binding_cache[epoch_index] = Some(frame_bindings(&epoch.bytes, &epoch.host)?);
+        }
+        let bindings = binding_cache[epoch_index]
+            .as_ref()
+            .ok_or_else(|| JournalError::Invalid("missing epoch frame bindings".into()))?;
+        if !bindings.iter().any(|binding| {
+            binding.operation == receipt.operation
+                && binding.record_checksum == receipt.record_checksum
+                && binding.payload_digest == receipt.payload_digest
+        }) {
+            return Err(JournalError::IdempotencyConflict);
+        }
+    }
+    Ok(())
+}
+
 fn state_for_host(
     image: &DurableImage,
     host: &HostInstallationEpoch,
@@ -421,6 +575,7 @@ fn state_for_host(
     let recovery_reason = host.recovery.as_ref().map(|recovery| recovery.reason);
     let tolerate_corruption = recovery_reason == Some(RecoveryLineageReason::Corruption);
     let loaded = load_epochs(image, tolerate_corruption)?;
+    validate_committed_receipts(image, &loaded, host, recovery_reason)?;
     let states = loaded.states;
     let all_evidence = loaded.evidence;
     if let Some(mut current) = states.iter().find(|state| &state.host == host).cloned() {
@@ -454,7 +609,9 @@ fn state_for_host(
         {
             return Err(JournalError::RecoveryRequiresNewEpoch);
         }
-        return Ok(HostState::new(host.clone(), all_evidence));
+        let mut recovered = HostState::new(host.clone(), all_evidence);
+        recovered.prior_kernel_unknown = true;
+        return Ok(recovered);
     }
     if host.recovery.is_some() {
         return Err(JournalError::RecoveryRequiresNewEpoch);
@@ -476,7 +633,13 @@ fn state_for_host(
     {
         return Err(JournalError::RecoveryRequiresNewEpoch);
     }
-    Ok(HostState::new(host.clone(), all_evidence))
+    let mut next = HostState::new(host.clone(), all_evidence);
+    next.prior_kernel = parent
+        .kernel
+        .clone()
+        .or_else(|| parent.prior_kernel.clone());
+    next.prior_kernel_unknown = parent.prior_kernel_unknown;
+    Ok(next)
 }
 
 fn validate_committed_append(
@@ -527,6 +690,30 @@ fn validate_expected_commit(
     Ok(())
 }
 
+fn validate_prepared_descriptor<B: JournalBackend>(
+    backend: &mut B,
+    transaction_id: &PlatformHandle,
+    host: &HostInstallationEpoch,
+) -> Result<(), JournalError> {
+    let pending = backend.prepared_appends().map_err(map_backend_error)?;
+    if pending.iter().any(|item| item.host != *host) {
+        return Err(JournalError::StaleFence);
+    }
+    let matches: Vec<_> = pending
+        .iter()
+        .filter(|item| item.transaction_id == *transaction_id)
+        .collect();
+    match matches.as_slice() {
+        [item] if item.host == *host && item.transaction_id == *transaction_id => Ok(()),
+        [] => Err(JournalError::Invalid(
+            "prepared reconcile descriptor is missing".into(),
+        )),
+        _ => Err(JournalError::Invalid(
+            "prepared reconcile descriptor is duplicated".into(),
+        )),
+    }
+}
+
 pub struct HostStateJournal<B> {
     backend: Mutex<B>,
     state: Mutex<HostState>,
@@ -556,6 +743,27 @@ impl<B: JournalBackend> HostStateJournal<B> {
             .lock()
             .map(|state| state.clone())
             .map_err(|_| JournalError::Synchronization)
+    }
+
+    /// Returns durable prepared transaction descriptors without attempting to
+    /// replay, retry, or otherwise deliver any transaction.
+    pub fn pending_transactions(&self) -> Result<Vec<PreparedAppend>, JournalError> {
+        let host = self
+            .state
+            .lock()
+            .map_err(|_| JournalError::Synchronization)?
+            .host
+            .clone();
+        let pending = self
+            .backend
+            .lock()
+            .map_err(|_| JournalError::Synchronization)?
+            .prepared_appends()
+            .map_err(map_backend_error)?;
+        if pending.iter().any(|item| item.host != host) {
+            return Err(JournalError::StaleFence);
+        }
+        Ok(pending)
     }
 
     #[allow(clippy::needless_pass_by_value)]
@@ -611,6 +819,7 @@ impl<B: JournalBackend> HostStateJournal<B> {
                 });
             }
             BackendReconcileState::Prepared => {
+                validate_prepared_descriptor(&mut *backend, &transaction_id, &state.host)?;
                 return Err(JournalError::OutcomeUnknown { transaction_id });
             }
             BackendReconcileState::Absent => {}
@@ -666,7 +875,10 @@ impl<B: JournalBackend> HostStateJournal<B> {
                 *state = recovered;
                 Ok(ReconcileOutcome::Committed)
             }
-            BackendReconcileState::Prepared => Ok(ReconcileOutcome::StillUnknown),
+            BackendReconcileState::Prepared => {
+                validate_prepared_descriptor(&mut *backend, transaction_id, &state.host)?;
+                Ok(ReconcileOutcome::StillUnknown)
+            }
             BackendReconcileState::Absent => Ok(ReconcileOutcome::NotCommitted),
         }
     }

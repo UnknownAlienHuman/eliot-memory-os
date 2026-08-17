@@ -307,7 +307,12 @@ impl KernelService {
                 self.transition(KernelServiceState::HandoffPrepared)?;
             }
             KernelControlCommand::Activate => self.transition(KernelServiceState::Activating)?,
-            KernelControlCommand::Ready(receipt) => self.mark_ready(receipt)?,
+            KernelControlCommand::ProbeReady => {
+                // A wire command cannot carry a caller-shaped readiness
+                // receipt. The composition root must perform live
+                // observations and call `publish_ready` with its own receipt.
+                return Err(KernelServiceError::ReadinessNotProven);
+            }
             KernelControlCommand::Degrade(reason) => {
                 validate_text(reason.as_str(), "degrade.reason")?;
                 self.transition(KernelServiceState::Degraded)?;
@@ -371,6 +376,15 @@ impl KernelService {
         self.failure = None;
         self.transition(KernelServiceState::Ready)?;
         Ok(())
+    }
+
+    /// Publishes a receipt authored by the Kernel composition after its live
+    /// process, Job, authority, configuration, and Store observations pass.
+    ///
+    /// The receipt type remains private to the Kernel-owned composition path
+    /// on the control wire: `ProbeReady` carries no receipt payload.
+    pub fn publish_ready(&mut self, receipt: KernelReadyReceipt) -> Result<(), KernelServiceError> {
+        self.mark_ready(receipt)
     }
 
     /// Raises the Kernel authority epoch, fencing every previously issued receipt.
@@ -538,6 +552,17 @@ mod tests {
             service.acquire_admission(),
             Err(KernelServiceError::GenerationFenced)
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn probe_ready_never_accepts_a_caller_receipt() -> Result<(), Box<dyn std::error::Error>> {
+        let mut service = KernelService::new([11; 32], 2, 4)?;
+        assert!(matches!(
+            service.apply(KernelControlCommand::ProbeReady),
+            Err(KernelServiceError::ReadinessNotProven)
+        ));
+        assert_eq!(service.state(), KernelServiceState::Cold);
         Ok(())
     }
 }

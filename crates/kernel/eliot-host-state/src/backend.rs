@@ -4,12 +4,14 @@ use serde::{Deserialize, Serialize};
 use crate::{BackendError, HostInstallationEpoch, IdempotencyIdentity};
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct StoredEpoch {
     pub host: HostInstallationEpoch,
     pub bytes: Vec<u8>,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DurableImage {
     /// Lossless, ordered journal bytes partitioned by Host epoch. Backends
     /// must preserve these bytes exactly; the reducer owns frame semantics.
@@ -19,7 +21,8 @@ pub struct DurableImage {
     pub receipts: Vec<CommittedAppend>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PreparedAppend {
     pub transaction_id: PlatformHandle,
     pub host: HostInstallationEpoch,
@@ -30,6 +33,7 @@ pub struct PreparedAppend {
 
 /// Backend observation for an append that crossed its durable commit boundary.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CommittedAppend {
     pub transaction_id: PlatformHandle,
     pub host: HostInstallationEpoch,
@@ -70,6 +74,10 @@ pub enum BackendReconcileState {
 /// of preserving [`DurableImage`] and reporting commit-boundary observations.
 pub trait JournalBackend: Send {
     fn load(&mut self) -> Result<DurableImage, BackendError>;
+    /// Enumerate descriptors left in the durable PREPARED transaction set.
+    /// This is intentionally separate from [`DurableImage`], which contains
+    /// only committed receipts and journal epochs.
+    fn prepared_appends(&mut self) -> Result<Vec<PreparedAppend>, BackendError>;
     fn prepare(&mut self, append: &PreparedAppend) -> Result<(), BackendError>;
     fn append_prepared(
         &mut self,
@@ -173,6 +181,14 @@ impl MemoryBackend {
 impl JournalBackend for MemoryBackend {
     fn load(&mut self) -> Result<DurableImage, BackendError> {
         Ok(self.image.clone())
+    }
+
+    fn prepared_appends(&mut self) -> Result<Vec<PreparedAppend>, BackendError> {
+        Ok(self
+            .staged
+            .iter()
+            .map(|item| item.descriptor.clone())
+            .collect())
     }
 
     fn prepare(&mut self, append: &PreparedAppend) -> Result<(), BackendError> {

@@ -1142,6 +1142,7 @@ dependencies = [
  "eliot-contracts",
  "eliot-host-state",
  "eliot-installation",
+ "eliot-ipc",
  "eliot-kernel-service",
  "eliot-platform",
  "eliot-platform-windows",
@@ -1150,6 +1151,7 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "thiserror",
+ "tokio",
  "windows-sys",
 ]
 
@@ -1178,6 +1180,7 @@ dependencies = [
  "redb",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "thiserror",
 ]
 
