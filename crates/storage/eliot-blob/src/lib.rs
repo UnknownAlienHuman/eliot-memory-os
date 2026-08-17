@@ -632,7 +632,7 @@ pub struct LiveSetRevalidation {
     pub still_complete_and_current: bool,
 }
 
-/// Provider-observed result of one exact GC deletion/quarantine effect. The
+/// Provider-observed result of one exact GC deletion effect. The
 /// coordinator validates this identity before advancing the durable tombstone;
 /// it never constructs a successful effect receipt itself.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -644,16 +644,8 @@ pub struct BlobDeletionReceipt {
     pub revision: u64,
     pub locator: BlobLocator,
     pub path_digest_sha256: String,
-    pub disposition: BlobDeletionDisposition,
     pub payload_deleted: bool,
     pub metadata_deleted: bool,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
-pub enum BlobDeletionDisposition {
-    Deleted,
-    Quarantined,
 }
 
 /// Reconciliation result for a durable GC intent. Unknown never authorizes a
@@ -682,7 +674,7 @@ pub trait BlobLiveSetPort: Send + Sync {
         Ok(BlobDeletionReconciliation::Unknown)
     }
 
-    /// Applies one deletion/quarantine effect while the canonical
+    /// Applies one deletion effect while the canonical
     /// compare-and-delete guard is held, returning a target-observed receipt.
     /// The legacy `compare_and_delete` seam remains available, but is not
     /// accepted by the production GC coordinator.
@@ -1600,20 +1592,16 @@ where
             }
         };
         validate_deletion_receipt(&applied, &tombstone)?;
-        if matches!(applied.disposition, BlobDeletionDisposition::Deleted) {
-            for target in [&tombstone.payload, &tombstone.metadata] {
-                match self.platform_stat(target)? {
-                    BlobPathState::Missing => {}
-                    BlobPathState::ReparsePoint => {
-                        return Err(BlobError::PlanGap(
-                            "P-02 rejected a reparse point while confirming GC receipt".to_owned(),
-                        ));
-                    }
-                    BlobPathState::File { .. }
-                    | BlobPathState::Directory
-                    | BlobPathState::Other => {
-                        return Err(BlobError::MetadataPayloadMismatch);
-                    }
+        for target in [&tombstone.payload, &tombstone.metadata] {
+            match self.platform_stat(target)? {
+                BlobPathState::Missing => {}
+                BlobPathState::ReparsePoint => {
+                    return Err(BlobError::PlanGap(
+                        "P-02 rejected a reparse point while confirming GC receipt".to_owned(),
+                    ));
+                }
+                BlobPathState::File { .. } | BlobPathState::Directory | BlobPathState::Other => {
+                    return Err(BlobError::MetadataPayloadMismatch);
                 }
             }
         }
@@ -2240,6 +2228,48 @@ where
         Ok(())
     }
 
+    fn tombstones_recovery_clean(
+        &self,
+        tombstones: &WorkScopePath,
+        degraded: &mut Vec<String>,
+    ) -> bool {
+        let paths = match self.platform_list(tombstones) {
+            Ok(paths) => paths,
+            Err(error) => {
+                degraded.push(format!("tombstone scan failed: {error}"));
+                return false;
+            }
+        };
+        let mut clean = true;
+        for path in paths {
+            let result = (|| -> Result<(), BlobError> {
+                let bytes = self.read_bounded_file(&path, MAX_JOURNAL_BYTES)?;
+                let tombstone: Tombstone = serde_json::from_slice(&bytes)
+                    .map_err(|_| BlobError::MetadataPayloadMismatch)?;
+                tombstone.validate()?;
+                if !matches!(tombstone.state, GcState::TombstoneCleaned)
+                    || tombstone.receipt.is_none()
+                {
+                    return Err(BlobError::UnknownGcOutcome {
+                        operation_id: tombstone.operation_id,
+                        state: tombstone.state,
+                    });
+                }
+                for target in [&tombstone.payload, &tombstone.metadata] {
+                    if !matches!(self.platform_stat(target)?, BlobPathState::Missing) {
+                        return Err(BlobError::MetadataPayloadMismatch);
+                    }
+                }
+                Ok(())
+            })();
+            if let Err(error) = result {
+                clean = false;
+                degraded.push(format!("tombstone recovery validation failed: {error}"));
+            }
+        }
+        clean
+    }
+
     fn health(&self) -> Result<BlobHealth, BlobError> {
         let mut degraded = Vec::new();
         let (owner_matches, containment_proven, permissions_proven) = match self
@@ -2269,13 +2299,7 @@ where
                 false
             },
             |items| !items.iter().any(is_stage_path),
-        ) && self.platform_list(&tombstones).map_or_else(
-            |error| {
-                degraded.push(format!("tombstone scan failed: {error}"));
-                false
-            },
-            |items| items.is_empty(),
-        );
+        ) && self.tombstones_recovery_clean(&tombstones, &mut degraded);
         if !recovery_clean {
             degraded.push("pending recovery journal or tombstone".to_owned());
         }
@@ -2921,7 +2945,6 @@ mod tests {
             revision: intent_revision,
             locator: locator.clone(),
             path_digest_sha256: deletion_path_digest(&payload, &metadata),
-            disposition: BlobDeletionDisposition::Deleted,
             payload_deleted: true,
             metadata_deleted: true,
         }
@@ -3098,6 +3121,9 @@ mod tests {
                 "purged or quarantined blob content cannot be re-admitted".to_owned()
             ))
         );
+        let health = block_on(store.health()).expect("health");
+        assert!(health.ready);
+        assert!(health.recovery_clean);
         let replay = block_on(store.gc(request)).expect("exact gc replay");
         assert_eq!(replay, receipt);
     }
@@ -3134,6 +3160,19 @@ mod tests {
     }
 
     #[test]
+    fn applied_receipt_with_live_targets_is_rejected() {
+        let store = gc_store(TestGcMode::Applied, false);
+        let orphan = block_on(store.stage(stage_request("live-target-receipt", b"payload")))
+            .expect("orphan");
+        let request = gc_request(Vec::new(), vec![orphan.locator().clone()]);
+        assert_eq!(
+            block_on(store.gc(request)),
+            Err(BlobError::MetadataPayloadMismatch)
+        );
+        assert!(block_on(store.read(read_request(&orphan, "live-target-read"))).is_ok());
+    }
+
+    #[test]
     fn unknown_gc_outcome_is_durable_and_not_blindly_retried() {
         let store = gc_store(TestGcMode::Unknown, false);
         let orphan =
@@ -3144,6 +3183,9 @@ mod tests {
             Err(BlobError::UnknownGcOutcome { .. })
         ));
         assert!(block_on(store.read(read_request(&orphan, "unknown-read"))).is_ok());
+        let health = block_on(store.health()).expect("health");
+        assert!(!health.ready);
+        assert!(!health.recovery_clean);
         assert_eq!(
             block_on(store.gc(request)),
             Err(BlobError::UnknownGcOutcome {
