@@ -24,16 +24,18 @@ use eliot_installation::{
     RedbInstallationRegistry, RuntimeLaunchDescriptor, verify_approved_path,
     verify_file_digest_with_lease, verify_file_digest_with_user_lease,
 };
+use eliot_kernel_service::HostStoreBootstrapRequirement;
 use eliot_platform::{
     HostBranchKind, HostBranchRecoveryFence, HostInstallationState, HostJobDisposition,
     HostProcessRecoveryBinding, HostRecoveryEvidence, HostStateStore, PlatformHandle, PortOutcome,
-    ServiceOperation, ServicePort, ServiceRequest,
+    ServiceOperation, ServicePort, ServiceRequest, ServiceState,
 };
 use eliot_platform_windows::{
     HostOwnerLease, HostOwnerLeaseError, HostOwnerLeaseReleaseError, ProtectedPathLease,
     ServiceAccount, ServiceRegistrationRequest, ServiceStartMode, WindowsPlatform,
 };
 use eliot_runtime_contracts::{HealthVector, ServiceProcessRecord, ServiceProcessState};
+use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 
 pub const SERVICE_NAME: &str = "eliot-host";
@@ -219,6 +221,42 @@ fn verify_launch_digest(
 }
 
 #[cfg(windows)]
+fn validate_store_bootstrap_descriptor(
+    lease: &LaunchLease,
+    approved_digest: &PlatformHandle,
+    expected_artifact: &PlatformHandle,
+    expected_config: &PlatformHandle,
+    expected_nonce: &PlatformHandle,
+) -> Result<HostStoreBootstrapRequirement, HostError> {
+    lease.verify().map_err(HostError::ProcessContour)?;
+    let bytes = std::fs::read(lease.path()).map_err(|error| {
+        HostError::ProcessContour(format!("read Store bootstrap descriptor: {error}"))
+    })?;
+    let actual = Sha256::digest(&bytes);
+    if format!("{actual:x}") != approved_digest.as_str() {
+        return Err(HostError::ProcessContour(
+            "Store bootstrap descriptor digest changed before launch".to_owned(),
+        ));
+    }
+    let requirement: HostStoreBootstrapRequirement =
+        serde_json::from_slice(&bytes).map_err(|error| {
+            HostError::ProcessContour(format!("parse Store bootstrap descriptor: {error}"))
+        })?;
+    requirement.validate().map_err(|error| {
+        HostError::ProcessContour(format!("validate Store bootstrap descriptor: {error}"))
+    })?;
+    if requirement.approved_artifact_hash != *expected_artifact
+        || requirement.approved_config_hash != *expected_config
+        || requirement.launch_nonce != *expected_nonce
+    {
+        return Err(HostError::ProcessContour(
+            "Store bootstrap descriptor is not bound to the approved generation".to_owned(),
+        ));
+    }
+    Ok(requirement)
+}
+
+#[cfg(windows)]
 pub struct HostJobBranches {
     kernel: Option<RunningJobChild<PlatformHandle>>,
     store: Option<RunningJobChild<PlatformHandle>>,
@@ -230,6 +268,7 @@ pub struct HostJobBranches {
     store_lease: Option<LaunchLease>,
     config_path: Option<PathBuf>,
     config_lease: Option<LaunchLease>,
+    store_bootstrap_lease: Option<LaunchLease>,
     config_pin: Option<PinnedRuntimeFile>,
     portable_root: Option<UserOwnedRootLease>,
     launch: Option<RuntimeLaunchDescriptor>,
@@ -408,6 +447,7 @@ impl HostJobBranches {
             store_lease: None,
             config_path: None,
             config_lease: None,
+            store_bootstrap_lease: None,
             config_pin: None,
             portable_root: None,
             launch: None,
@@ -692,6 +732,23 @@ impl HostJobBranches {
             .map_err(|error| HostError::ProcessContour(error.to_string()))?;
         let config_lease = open_launch_lease(launch.profile, portable_root.as_ref(), &config_path)?;
         verify_launch_digest(&config_lease, config_digest, "runtime.config")?;
+        let store_bootstrap_path = approved_locator(
+            Path::new(launch.store_bootstrap_descriptor_path.as_str()),
+            &launch.store_bootstrap_descriptor_path,
+            launch.profile,
+        )?;
+        let store_bootstrap_lease = open_launch_lease(
+            launch.profile,
+            portable_root.as_ref(),
+            &store_bootstrap_path,
+        )?;
+        validate_store_bootstrap_descriptor(
+            &store_bootstrap_lease,
+            &launch.store_bootstrap_descriptor_digest,
+            store_artifact,
+            config_digest,
+            &host.nonce,
+        )?;
         let store_config_path = approved_locator(
             Path::new(launch.store_config_path.as_str()),
             approved_config_path,
@@ -791,6 +848,7 @@ impl HostJobBranches {
                 self.store_lease = Some(store_lease);
                 self.config_path = Some(config_path);
                 self.config_lease = Some(config_lease);
+                self.store_bootstrap_lease = Some(store_bootstrap_lease);
                 self.config_pin = Some(config_pin);
                 self.portable_root = portable_root;
                 self.launch = Some(launch.clone());
@@ -845,6 +903,7 @@ impl HostJobBranches {
                 self.store_lease = Some(store_lease);
                 self.config_path = Some(config_path);
                 self.config_lease = Some(config_lease);
+                self.store_bootstrap_lease = Some(store_bootstrap_lease);
                 self.config_pin = Some(config_pin);
                 self.portable_root = portable_root;
                 self.launch = Some(launch.clone());
@@ -1300,6 +1359,7 @@ impl HostJobBranches {
         self.store_lease = None;
         self.config_path = None;
         self.config_lease = None;
+        self.store_bootstrap_lease = None;
         self.config_pin = None;
         self.kernel_artifact_digest = None;
         self.store_artifact_digest = None;
@@ -1635,18 +1695,62 @@ impl HostComposition {
             ServiceAccount::LocalSystem,
         )
         .map_err(|error| HostError::Platform(error.to_string()))?;
-        platform
+        let registration = platform
             .register_service(&request)
             .map_err(|error| HostError::Platform(error.to_string()))?;
+        if matches!(
+            &registration,
+            eliot_platform_windows::ServiceRegistrationOutcome::EffectUnknown
+        ) {
+            return Err(HostError::Platform(
+                "Watchdog SCM registration outcome is unknown".to_owned(),
+            ));
+        }
         let service = PlatformHandle::new("eliot-watchdog")
             .map_err(|error| HostError::Platform(error.to_string()))?;
+        let inspect_context = lifecycle_context(&self.host, "watchdog-inspect")?;
+        let mut inspect = || {
+            platform.execute(&ServiceRequest {
+                context: inspect_context.clone(),
+                service: service.clone(),
+                operation: ServiceOperation::Inspect,
+            })
+        };
+        if matches!(
+            &registration,
+            eliot_platform_windows::ServiceRegistrationOutcome::ExistingRequiresReconciliation
+        ) {
+            match inspect() {
+                PortOutcome::Known(observation)
+                    if observation.state == ServiceState::Stopped
+                        || observation.state == ServiceState::Absent => {}
+                PortOutcome::Known(observation) => {
+                    return Err(HostError::Platform(format!(
+                        "Watchdog existing service is not safely reconcilable: {:?}",
+                        observation.state
+                    )));
+                }
+                PortOutcome::Partial { .. } | PortOutcome::Unknown(_) | PortOutcome::Error(_) => {
+                    return Err(HostError::Platform(
+                        "Watchdog existing service observation is not authoritative".to_owned(),
+                    ));
+                }
+            }
+        }
         let outcome = platform.execute(&ServiceRequest {
             context: lifecycle_context(&self.host, "watchdog-start")?,
             service,
             operation: ServiceOperation::Start,
         });
         match outcome {
-            PortOutcome::Known(_) | PortOutcome::Partial { .. } => Ok(()),
+            PortOutcome::Known(observation) if observation.state == ServiceState::Running => Ok(()),
+            PortOutcome::Known(observation) => Err(HostError::Platform(format!(
+                "Watchdog did not reach Known(Running): {:?}",
+                observation.state
+            ))),
+            PortOutcome::Partial { .. } => Err(HostError::Platform(
+                "Watchdog SCM start observation is partial".to_owned(),
+            )),
             PortOutcome::Unknown(reason) => Err(HostError::Platform(format!(
                 "Watchdog SCM start outcome is unknown: {reason:?}"
             ))),
@@ -1676,7 +1780,7 @@ impl HostComposition {
             .active()
             .ok_or_else(|| HostError::ProcessContour("no approved active generation".to_owned()))?;
         self.request_watchdog(&active.manifest.runtime_launch)?;
-        let (kernel_artifact, store_artifact) = active
+        let (kernel_artifact, store_artifact, _canonical_store_artifact) = active
             .manifest
             .runtime_artifact_digests()
             .map_err(|error| HostError::ProcessContour(error.to_string()))?;
@@ -1733,11 +1837,15 @@ impl HostComposition {
             .ok_or_else(|| {
                 HostError::ProcessContour("candidate generation is not approved".to_owned())
             })?;
-        let (candidate_kernel_artifact, candidate_store_artifact) = candidate
+        let (
+            candidate_kernel_artifact,
+            candidate_store_artifact,
+            _candidate_canonical_store_artifact,
+        ) = candidate
             .manifest
             .runtime_artifact_digests()
             .map_err(|error| HostError::ProcessContour(error.to_string()))?;
-        let (prior_kernel_artifact, prior_store_artifact) = prior
+        let (prior_kernel_artifact, prior_store_artifact, _prior_canonical_store_artifact) = prior
             .manifest
             .runtime_artifact_digests()
             .map_err(|error| HostError::ProcessContour(error.to_string()))?;
@@ -1825,7 +1933,7 @@ impl HostComposition {
             .registry
             .active()
             .ok_or_else(|| HostError::ProcessContour("no approved active generation".to_owned()))?;
-        let (kernel_artifact, store_artifact) = active
+        let (kernel_artifact, store_artifact, _canonical_store_artifact) = active
             .manifest
             .runtime_artifact_digests()
             .map_err(|error| HostError::ProcessContour(error.to_string()))?;

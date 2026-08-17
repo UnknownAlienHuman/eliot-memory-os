@@ -1142,11 +1142,13 @@ dependencies = [
  "eliot-contracts",
  "eliot-host-state",
  "eliot-installation",
+ "eliot-kernel-service",
  "eliot-platform",
  "eliot-platform-windows",
  "eliot-runtime-contracts",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "thiserror",
  "windows-sys",
 ]
