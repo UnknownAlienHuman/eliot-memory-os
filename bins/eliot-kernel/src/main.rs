@@ -46,12 +46,11 @@ async fn main() {
         Err(error) => exit_error("INVALID_STORE_BOOTSTRAP", &error),
     };
     let mut kernel_config = KernelConfig::new(options.work_root.clone());
-    let pipe_name = match std::env::var("ELIOT_KERNEL_CONTROL_PIPE") {
-        Ok(value) => value,
-        Err(_) => exit_error(
+    let Ok(pipe_name) = std::env::var("ELIOT_KERNEL_CONTROL_PIPE") else {
+        exit_error(
             "INVALID_CONFIGURATION",
             "Host launch context did not inject the generation-specific Kernel control pipe",
-        ),
+        );
     };
     kernel_config = kernel_config.with_pipe_name(pipe_name);
     if let Some(prepared) = &prepared_store {
@@ -196,8 +195,12 @@ async fn main() {
                     let task_kernel = Arc::clone(&kernel);
                     let task_shutdown = shutdown_rx.clone();
                     sessions.spawn(async move {
-                        let result =
-                            serve_connection(task_kernel, accepted_server, task_shutdown).await;
+                        let result = Box::pin(serve_connection(
+                            task_kernel,
+                            accepted_server,
+                            task_shutdown,
+                        ))
+                        .await;
                         drop(permit);
                         result
                     });
