@@ -117,3 +117,14 @@ Obtained and licensed by the operator independently of the Work. Reached over
 the WebSocket/RPC transport implemented in `eliot-store`. Neither vendored nor
 redistributed, and not linked. Treated as the present implementation of the
 canonical store capability, not as a permanent architectural commitment.
+
+### `wasmtime` 40.0.0
+
+Wasmtime is pinned exactly at 40.0.0, whose declared MSRV is Rust 1.89.0, and
+is licensed Apache-2.0 WITH LLVM-exception. The dependency uses only the
+component-model, cranelift, runtime, and std features, with default features
+disabled; WASI, async, cache, pooling, profiling, and parallel compilation are
+not enabled. JIT execution through Cranelift and the Component Model provide
+the bounded typed guest ABI required here, with no host imports. This choice
+has material binary size and compile-time cost. Any upgrade requires a fresh
+MSRV, license, feature, and security review, followed by all full WASM gates.

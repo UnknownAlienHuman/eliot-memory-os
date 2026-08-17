@@ -12,7 +12,7 @@ use eliot_wasm_runtime::{
 use wasmtime::component::{Component, Linker};
 use wasmtime::{Config, Engine, ResourceLimiter, Store, StoreLimits, StoreLimitsBuilder};
 
-const WASMTIME_VERSION: &str = "47.0.0";
+const WASMTIME_VERSION: &str = "40.0.0";
 const WIT_VERSION: &str = "1.0.0";
 const WIT_WORLD: &str = "eliot:wasm/guest";
 const RUN_EXPORT: &str = "run";
@@ -391,7 +391,7 @@ fn configuration_digest() -> Sha256Digest {
 }
 
 fn canonical_configuration_descriptor() -> &'static [u8] {
-    b"wasmtime=47.0.0;component_model=true;typed_abi=guest.run;max_wasm_stack=8192;epoch_only.consume_fuel=false;epoch_only.epoch_interruption=true;epoch_and_fuel.consume_fuel=true;epoch_and_fuel.epoch_interruption=true"
+    b"wasmtime=40.0.0;component_model=true;typed_abi=guest.run;max_wasm_stack=8192;epoch_only.consume_fuel=false;epoch_only.epoch_interruption=true;epoch_and_fuel.consume_fuel=true;epoch_and_fuel.epoch_interruption=true"
 }
 
 fn configured_engine(consume_fuel: bool) -> Result<Engine, WasmtimeBuildError> {
