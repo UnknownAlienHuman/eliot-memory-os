@@ -1697,8 +1697,7 @@ impl ProcessIdentity {
     fn is_usable(&self) -> bool {
         self.process_id != 0
             && self.start_time_100ns != 0
-            && !self.image_path.is_empty()
-            && !self.image_path.chars().any(char::is_control)
+            && valid_process_image_path(&self.image_path)
     }
 
     /// Stable comparison key; a PID alone is never sufficient.
@@ -1711,6 +1710,51 @@ impl ProcessIdentity {
     }
 }
 
+/// OS-observed process identity that may be used to pin named-pipe admission.
+///
+/// The identity is private and this type has no deserializer or public
+/// constructor. Callers can obtain it only through
+/// [`observe_named_pipe_peer_process`], which opens and observes the live
+/// process handle. The contained identity is evidence, not request data.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NamedPipePeerProcessBinding {
+    identity: ProcessIdentity,
+}
+
+impl NamedPipePeerProcessBinding {
+    fn from_observed(identity: ProcessIdentity) -> Result<Self, WindowsAdapterError> {
+        if !identity.is_usable() {
+            return Err(WindowsAdapterError::InvalidInput);
+        }
+        Ok(Self { identity })
+    }
+
+    /// Returns the read-only process evidence captured by the platform.
+    #[must_use]
+    pub const fn identity(&self) -> &ProcessIdentity {
+        &self.identity
+    }
+
+    /// Returns the observed process identifier.
+    #[must_use]
+    pub const fn process_id(&self) -> u32 {
+        self.identity.process_id
+    }
+
+    /// Returns the observed process creation time in Windows 100-nanosecond
+    /// units.
+    #[must_use]
+    pub const fn start_time_100ns(&self) -> u64 {
+        self.identity.start_time_100ns
+    }
+
+    /// Returns the observed process image path.
+    #[must_use]
+    pub fn image_path(&self) -> &str {
+        &self.identity.image_path
+    }
+}
+
 /// Expected authorization context for a named-pipe server.
 ///
 /// The expectation is inert policy input.  It becomes evidence only after the
@@ -1719,7 +1763,7 @@ impl ProcessIdentity {
 pub struct NamedPipePeerExpectation {
     expected_sid: String,
     expected_session_id: u32,
-    approved_process: Option<ProcessIdentity>,
+    approved_process: Option<NamedPipePeerProcessBinding>,
 }
 
 /// Installer-pinned inputs for the separately registered Watchdog fallback
@@ -2553,66 +2597,35 @@ impl NamedPipePeerExpectation {
         })
     }
 
-    /// Creates an expectation that additionally admits one exact process
-    /// identity. The identity is compared after the pipe peer has been read
-    /// from a live process handle; a PID supplied by a request cannot replace
-    /// this binding.
+    /// Creates an expectation that additionally admits one exact OS-observed
+    /// process binding. A PID supplied by a request cannot replace this
+    /// binding.
     ///
     /// # Errors
-    /// Returns `InvalidInput` when the SID or approved process identity is not
-    /// a usable, handle-derived identity.
-    pub fn new_with_process_identity(
+    /// Returns `InvalidInput` when the SID or binding is invalid.
+    pub fn new_with_process_binding(
         expected_sid: impl Into<String>,
         expected_session_id: u32,
-        approved_process: ProcessIdentity,
+        approved_process: NamedPipePeerProcessBinding,
     ) -> Result<Self, WindowsAdapterError> {
-        Self::new(expected_sid, expected_session_id)?.with_process_identity(approved_process)
+        let mut expectation = Self::new(expected_sid, expected_session_id)?;
+        expectation.approved_process = Some(approved_process);
+        Ok(expectation)
     }
 
-    /// Alias for [`Self::new_with_process_identity`] with the policy role
-    /// explicit at call sites.
-    ///
-    /// # Errors
-    /// Returns [`WindowsAdapterError::InvalidInput`] when the SID or approved
-    /// process identity is not a usable, handle-derived identity.
-    pub fn new_with_approved_process(
-        expected_sid: impl Into<String>,
-        expected_session_id: u32,
-        approved_process: ProcessIdentity,
-    ) -> Result<Self, WindowsAdapterError> {
-        Self::new_with_process_identity(expected_sid, expected_session_id, approved_process)
-    }
-
-    /// Adds one exact approved process identity to this expectation.
+    /// Adds one exact OS-observed process binding to this expectation.
     ///
     /// This is a typed builder rather than a request-field setter: admission
     /// still obtains the observed identity from the operating system.
     ///
     /// # Errors
-    /// Returns `InvalidInput` when the process identity contains an unusable
-    /// PID, start time, or image path.
-    pub fn with_process_identity(
+    /// Returns `InvalidInput` when the binding is invalid.
+    pub fn with_process_binding(
         mut self,
-        approved_process: ProcessIdentity,
+        approved_process: NamedPipePeerProcessBinding,
     ) -> Result<Self, WindowsAdapterError> {
-        if !approved_process.is_usable() {
-            return Err(WindowsAdapterError::InvalidInput);
-        }
         self.approved_process = Some(approved_process);
         Ok(self)
-    }
-
-    /// Alias for [`Self::with_process_identity`] that names the policy role
-    /// explicitly at call sites.
-    ///
-    /// # Errors
-    /// Returns [`WindowsAdapterError::InvalidInput`] when the approved process
-    /// identity contains an unusable PID, start time, or image path.
-    pub fn with_approved_process(
-        self,
-        approved_process: ProcessIdentity,
-    ) -> Result<Self, WindowsAdapterError> {
-        self.with_process_identity(approved_process)
     }
 
     #[must_use]
@@ -2625,16 +2638,11 @@ impl NamedPipePeerExpectation {
         self.expected_session_id
     }
 
-    /// Returns the optional exact process identity admitted by this policy.
+    /// Returns the optional exact OS-observed process binding admitted by this
+    /// policy.
     #[must_use]
-    pub fn approved_process(&self) -> Option<&ProcessIdentity> {
+    pub fn approved_process_binding(&self) -> Option<&NamedPipePeerProcessBinding> {
         self.approved_process.as_ref()
-    }
-
-    /// Returns the optional exact approved process identity.
-    #[must_use]
-    pub fn approved_process_identity(&self) -> Option<&ProcessIdentity> {
-        self.approved_process()
     }
 }
 
@@ -5110,12 +5118,31 @@ fn admit_named_pipe_peer_process(
     expectation: &NamedPipePeerExpectation,
 ) -> Result<(), WindowsAdapterError> {
     if expectation
-        .approved_process()
-        .is_some_and(|approved| approved != observed)
+        .approved_process_binding()
+        .is_some_and(|approved| !same_process_identity(observed, approved.identity()))
     {
         return Err(WindowsAdapterError::IdentityMismatch);
     }
     Ok(())
+}
+
+fn same_process_identity(observed: &ProcessIdentity, approved: &ProcessIdentity) -> bool {
+    if observed.process_id != approved.process_id
+        || observed.start_time_100ns != approved.start_time_100ns
+        || !valid_process_image_path(&observed.image_path)
+        || !valid_process_image_path(&approved.image_path)
+    {
+        return false;
+    }
+
+    #[cfg(windows)]
+    {
+        same_windows_path(&observed.image_path, &approved.image_path)
+    }
+    #[cfg(not(windows))]
+    {
+        observed.image_path == approved.image_path
+    }
 }
 
 /// Authenticates the server bound to a connected client-end named-pipe handle.
@@ -6741,6 +6768,31 @@ fn same_windows_path(left: &str, right: &str) -> bool {
 }
 
 #[cfg(windows)]
+fn valid_process_image_path(value: &str) -> bool {
+    if value.is_empty() || value.chars().any(char::is_control) {
+        return false;
+    }
+    let normalized = value.replace('/', "\\");
+    let uppercase = normalized.to_uppercase();
+    if uppercase.starts_with(r"\\.\")
+        || uppercase.starts_with(r"\DEVICE\")
+        || uppercase.starts_with(r"\\?\GLOBALROOT\")
+    {
+        return false;
+    }
+    let bytes = normalized.as_bytes();
+    let drive_absolute =
+        bytes.len() >= 3 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' && bytes[2] == b'\\';
+    let unc_absolute = normalized.starts_with(r"\\");
+    drive_absolute || unc_absolute
+}
+
+#[cfg(not(windows))]
+fn valid_process_image_path(value: &str) -> bool {
+    !value.is_empty() && !value.chars().any(char::is_control)
+}
+
+#[cfg(windows)]
 fn wait_for_job_empty(
     job: windows_sys::Win32::Foundation::HANDLE,
     timeout: std::time::Duration,
@@ -6895,6 +6947,34 @@ fn inspect_process_identity(_process_id: u32) -> std::io::Result<ProcessIdentity
     Err(std::io::Error::other(
         "Windows process identity unavailable",
     ))
+}
+
+/// Observes one live process for use as a named-pipe admission binding.
+///
+/// The process identifier is only a lookup key. Windows opens the live
+/// process and captures PID, creation time, and image path from that handle;
+/// callers cannot construct the returned binding from request data.
+///
+/// # Errors
+/// Returns a typed adapter error when the PID is invalid, the process cannot
+/// be opened, or its identity cannot be observed and validated.
+#[cfg(windows)]
+pub fn observe_named_pipe_peer_process(
+    process_id: u32,
+) -> Result<NamedPipePeerProcessBinding, WindowsAdapterError> {
+    if process_id == 0 {
+        return Err(WindowsAdapterError::InvalidInput);
+    }
+    inspect_process_identity(process_id)
+        .map_err(|error| windows_adapter_from_io(&error))
+        .and_then(NamedPipePeerProcessBinding::from_observed)
+}
+
+#[cfg(not(windows))]
+pub fn observe_named_pipe_peer_process(
+    _process_id: u32,
+) -> Result<NamedPipePeerProcessBinding, WindowsAdapterError> {
+    Err(WindowsAdapterError::Unavailable)
 }
 
 #[cfg(windows)]
@@ -7321,102 +7401,139 @@ mod tests {
         );
     }
 
-    fn test_process_identity() -> ProcessIdentity {
-        ProcessIdentity {
-            process_id: 41,
-            start_time_100ns: 7,
-            image_path: r"C:\Windows\System32\eliot-test.exe".to_owned(),
-        }
+    #[cfg(windows)]
+    fn test_process_binding() -> NamedPipePeerProcessBinding {
+        use windows_sys::Win32::System::Threading::GetCurrentProcessId;
+
+        observe_named_pipe_peer_process(unsafe { GetCurrentProcessId() })
+            .unwrap_or_else(|_| unreachable!())
     }
 
-    #[test]
-    fn pipe_expectation_admits_exact_approved_process_identity() {
-        let approved = test_process_identity();
-        let expectation = NamedPipePeerExpectation::new_with_process_identity(
-            "S-1-5-21-1-2-3-1001",
-            1,
-            approved.clone(),
-        )
-        .unwrap_or_else(|_| unreachable!());
-        assert_eq!(expectation.approved_process(), Some(&approved));
-        assert_eq!(
-            admit_named_pipe_peer_process(&approved, &expectation),
-            Ok(())
-        );
+    #[cfg(windows)]
+    fn test_process_expectation(binding: NamedPipePeerProcessBinding) -> NamedPipePeerExpectation {
+        current_process_named_pipe_expectation()
+            .unwrap_or_else(|_| unreachable!())
+            .with_process_binding(binding)
+            .unwrap_or_else(|_| unreachable!())
     }
 
+    #[cfg(windows)]
     #[test]
-    fn pipe_expectation_rejects_wrong_pid() {
-        let approved = test_process_identity();
-        let observed = ProcessIdentity {
-            process_id: approved.process_id + 1,
-            ..approved.clone()
-        };
-        let expectation =
-            NamedPipePeerExpectation::new_with_process_identity("S-1-5-21-1-2-3-1001", 1, approved)
-                .unwrap_or_else(|_| unreachable!());
+    fn pipe_expectation_admits_only_sealed_live_process_binding() {
+        let binding = test_process_binding();
+        let observed = binding.identity().clone();
+        let expectation = test_process_expectation(binding.clone());
+        assert_eq!(expectation.approved_process_binding(), Some(&binding));
         assert_eq!(
             admit_named_pipe_peer_process(&observed, &expectation),
-            Err(WindowsAdapterError::IdentityMismatch)
-        );
-    }
-
-    #[test]
-    fn pipe_expectation_rejects_pid_reuse_by_start_time() {
-        let approved = test_process_identity();
-        let observed = ProcessIdentity {
-            start_time_100ns: approved.start_time_100ns + 1,
-            ..approved.clone()
-        };
-        let expectation =
-            NamedPipePeerExpectation::new_with_process_identity("S-1-5-21-1-2-3-1001", 1, approved)
-                .unwrap_or_else(|_| unreachable!());
-        assert_eq!(
-            admit_named_pipe_peer_process(&observed, &expectation),
-            Err(WindowsAdapterError::IdentityMismatch)
-        );
-    }
-
-    #[test]
-    fn pipe_expectation_rejects_wrong_image_identity() {
-        let approved = test_process_identity();
-        let observed = ProcessIdentity {
-            image_path: r"C:\Windows\System32\other.exe".to_owned(),
-            ..approved.clone()
-        };
-        let expectation =
-            NamedPipePeerExpectation::new_with_process_identity("S-1-5-21-1-2-3-1001", 1, approved)
-                .unwrap_or_else(|_| unreachable!());
-        assert_eq!(
-            admit_named_pipe_peer_process(&observed, &expectation),
-            Err(WindowsAdapterError::IdentityMismatch)
-        );
-    }
-
-    #[test]
-    fn pipe_expectation_preserves_sid_session_only_legacy_behavior() {
-        let expectation = NamedPipePeerExpectation::new("S-1-5-21-1-2-3-1001", 1)
-            .unwrap_or_else(|_| unreachable!());
-        assert!(expectation.approved_process().is_none());
-        assert_eq!(
-            admit_named_pipe_peer_process(&test_process_identity(), &expectation),
             Ok(())
         );
     }
 
     #[cfg(windows)]
     #[test]
-    fn live_process_identity_binding_uses_the_existing_handle_api() {
-        use windows_sys::Win32::System::Threading::GetCurrentProcessId;
-
-        let identity = inspect_process_identity(unsafe { GetCurrentProcessId() })
-            .unwrap_or_else(|_| unreachable!());
-        let expectation = current_process_named_pipe_expectation()
-            .unwrap_or_else(|_| unreachable!())
-            .with_approved_process(identity.clone())
-            .unwrap_or_else(|_| unreachable!());
+    fn pipe_expectation_rejects_wrong_pid() {
+        let binding = test_process_binding();
+        let approved = binding.identity().clone();
+        let observed = ProcessIdentity {
+            process_id: approved.process_id + 1,
+            ..approved.clone()
+        };
+        let expectation = test_process_expectation(binding);
         assert_eq!(
-            admit_named_pipe_peer_process(&identity, &expectation),
+            admit_named_pipe_peer_process(&observed, &expectation),
+            Err(WindowsAdapterError::IdentityMismatch)
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn pipe_expectation_rejects_pid_reuse_by_start_time() {
+        let binding = test_process_binding();
+        let approved = binding.identity().clone();
+        let observed = ProcessIdentity {
+            start_time_100ns: approved.start_time_100ns + 1,
+            ..approved.clone()
+        };
+        let expectation = test_process_expectation(binding);
+        assert_eq!(
+            admit_named_pipe_peer_process(&observed, &expectation),
+            Err(WindowsAdapterError::IdentityMismatch)
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn pipe_expectation_rejects_wrong_image_identity() {
+        let binding = test_process_binding();
+        let approved = binding.identity().clone();
+        let observed = ProcessIdentity {
+            image_path: r"C:\Windows\System32\other.exe".to_owned(),
+            ..approved.clone()
+        };
+        let expectation = test_process_expectation(binding);
+        assert_eq!(
+            admit_named_pipe_peer_process(&observed, &expectation),
+            Err(WindowsAdapterError::IdentityMismatch)
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn pipe_identity_accepts_only_equivalent_normalized_windows_paths() {
+        let binding = test_process_binding();
+        let approved = binding.identity().clone();
+        let expectation = test_process_expectation(binding);
+        for image_path in [
+            approved.image_path.to_ascii_lowercase(),
+            approved.image_path.replace('\\', "/"),
+        ] {
+            let observed = ProcessIdentity {
+                image_path,
+                ..approved.clone()
+            };
+            assert!(same_process_identity(&observed, &approved));
+            assert_eq!(
+                admit_named_pipe_peer_process(&observed, &expectation),
+                Ok(())
+            );
+        }
+        if approved.image_path.as_bytes().get(1) == Some(&b':') {
+            let observed = ProcessIdentity {
+                image_path: format!(r"\\?\{}", approved.image_path),
+                ..approved.clone()
+            };
+            assert!(same_process_identity(&observed, &approved));
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn pipe_identity_rejects_malformed_image_paths() {
+        let binding = test_process_binding();
+        let approved = binding.identity().clone();
+        let expectation = test_process_expectation(binding);
+        for image_path in ["relative.exe", r"\\.\C:\Windows\System32\device.exe"] {
+            let observed = ProcessIdentity {
+                image_path: image_path.to_owned(),
+                ..approved.clone()
+            };
+            assert_eq!(
+                admit_named_pipe_peer_process(&observed, &expectation),
+                Err(WindowsAdapterError::IdentityMismatch)
+            );
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn pipe_expectation_preserves_sid_session_only_legacy_behavior() {
+        let expectation =
+            current_process_named_pipe_expectation().unwrap_or_else(|_| unreachable!());
+        let observed = test_process_binding().identity().clone();
+        assert!(expectation.approved_process_binding().is_none());
+        assert_eq!(
+            admit_named_pipe_peer_process(&observed, &expectation),
             Ok(())
         );
     }
