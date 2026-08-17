@@ -9,12 +9,19 @@
 #![forbid(unsafe_code)]
 
 use std::fmt;
+#[cfg(test)]
 use std::time::Duration;
 
-use eliot_runtime::{Runtime, RuntimeConfig, ShutdownHandle, ShutdownOutcome};
+#[cfg(test)]
+use eliot_runtime::RuntimeConfig;
+use eliot_runtime::{Runtime, ShutdownHandle, ShutdownOutcome};
 use eliot_wasm_runtime::{
-    InvocationId, InvocationRequest, InvocationResult, RuntimeError, WasmRuntime,
+    InvocationId, InvocationRequest, InvocationResult, RuntimeError, RuntimePorts, WasmRuntime,
 };
+
+mod wasmtime_provider;
+
+pub use wasmtime_provider::{WasmtimeBuildError, WasmtimeComponentEngine};
 
 /// The canonical B-12 composition profiles.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -215,27 +222,19 @@ impl WasmHostRunner {
         Self::new(profile, runtime, wasm_runtime)
     }
 
-    /// Builds the binary's typed-unavailable local composition.
+    /// Binds the concrete Wasmtime provider to the existing authority ports.
     ///
-    /// No concrete Wasmtime engine, route, kernel endpoint, process provider,
-    /// manifest provider, or verifier is admitted by this default path.
-    pub fn unavailable(profile: Profile) -> Result<Self, RuntimeBuildError> {
-        let runtime = Runtime::new(
-            RuntimeConfig {
-                mailbox_capacity: 32,
-                control_reserve: 4,
-                concurrency: 1,
-                control_concurrency_reserve: 1,
-                fairness_quantum: 8,
-                restart_budget: 0,
-                restart_window: Duration::from_secs(60),
-                restart_backoff: Duration::from_millis(50),
-                shutdown_grace: Duration::from_secs(1),
-            },
-            None,
-        )
-        .map_err(RuntimeBuildError::Runtime)?;
-        Self::new(profile, runtime, WasmRuntime::new(None))
+    /// The supplied ports remain the owners of admission, generation, fencing,
+    /// process authority, and promotion. This method only replaces the engine
+    /// slot with the provider-specific adapter.
+    pub fn with_wasmtime_engine(
+        profile: Profile,
+        runtime: Runtime,
+        mut ports: RuntimePorts,
+        engine: WasmtimeComponentEngine,
+    ) -> Result<Self, RuntimeBuildError> {
+        ports.engine = Box::new(engine);
+        Self::new(profile, runtime, WasmRuntime::new(Some(ports)))
     }
 
     /// Returns the selected profile.
@@ -380,17 +379,6 @@ mod tests {
     }
 
     #[test]
-    fn unavailable_default_is_a_typed_plan_gap() {
-        let mut runner = WasmHostRunner::unavailable(test_profile()).expect("runner");
-        let result = runner.execute(request(false));
-        assert_eq!(
-            result.receipt.disposition,
-            InvocationDisposition::Unavailable
-        );
-        assert_eq!(result.receipt.error, Some(RuntimeError::PlanGap));
-    }
-
-    #[test]
     fn injected_a12_surface_preserves_typed_cancellation() {
         let mut runner = WasmHostRunner::new(
             test_profile(),
@@ -450,7 +438,26 @@ mod tests {
 
     #[test]
     fn shutdown_is_only_forwarded_to_p11() {
-        let runner = WasmHostRunner::unavailable(test_profile()).expect("runner");
+        let runner = WasmHostRunner::new(
+            test_profile(),
+            Runtime::new(
+                RuntimeConfig {
+                    mailbox_capacity: 4,
+                    control_reserve: 1,
+                    concurrency: 1,
+                    control_concurrency_reserve: 1,
+                    fairness_quantum: 1,
+                    restart_budget: 0,
+                    restart_window: Duration::from_secs(1),
+                    restart_backoff: Duration::from_millis(1),
+                    shutdown_grace: Duration::from_millis(1),
+                },
+                None,
+            )
+            .expect("runtime"),
+            WasmRuntime::new(None),
+        )
+        .expect("runner");
         assert_eq!(runner.control_capacity(), 1);
         assert!(runner.request_shutdown());
         assert!(!runner.request_shutdown());

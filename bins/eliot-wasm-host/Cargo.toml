@@ -21,6 +21,8 @@ eliot-profile-full-composition = []
 [dependencies]
 eliot-runtime.workspace = true
 eliot-wasm-runtime.workspace = true
+wasmtime.workspace = true
+thiserror.workspace = true
 
 [lints]
 workspace = true

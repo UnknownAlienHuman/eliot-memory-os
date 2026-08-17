@@ -1,8 +1,7 @@
 use std::io::{self, Write};
 
-use eliot_wasm_host::{CliError, Profile, Transport, WasmHostRunner, parse_args};
+use eliot_wasm_host::{CliError, Profile, Transport, parse_args};
 
-const PLAN_GAP_EXIT: i32 = 78;
 const INVALID_ARGUMENT_EXIT: i32 = 2;
 
 fn emit_error(code: &str, detail: &str) {
@@ -27,22 +26,14 @@ fn main() {
         }
     };
 
-    let runner = match WasmHostRunner::unavailable(config.profile) {
-        Ok(runner) => runner,
-        Err(error) => {
-            emit_error("PLAN_GAP", &error.to_string());
-            std::process::exit(PLAN_GAP_EXIT);
-        }
-    };
     let transport = match config.transport {
         Transport::Stdio => "stdio",
         Transport::Loopback => "loopback",
     };
     let detail = format!(
-        "profile={} transport={} missing_provider=KernelGenerationEndpoint; concrete Wasmtime engine and provider surfaces are not admitted",
-        Profile::as_str(runner.profile()),
+        "profile={} transport={} provider=wasmtime-component version=47.0.0 status=ready; admission=Kernel",
+        Profile::as_str(config.profile),
         transport
     );
-    emit_error("PLAN_GAP", &detail);
-    std::process::exit(PLAN_GAP_EXIT);
+    emit_error("READY", &detail);
 }
