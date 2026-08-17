@@ -15,8 +15,8 @@ use eliot_process::{
     CancellationReceipt, CancellationRequest, ContractError, DescendantEvidence, ExitDisposition,
     ExitStatus, OperationId, ProcessEvidence, ProcessEvidenceSink, ProcessExecutionError,
     ProcessExecutionView, ProcessExecutor, ProcessHealth, ProcessHealthStatus, ProcessId,
-    ProcessLifecycle, ProcessRequest, ProcessStartReceipt, ProcessState, SuspendedProcessIdentity,
-    ValidatedDispatch,
+    ProcessLaunchAdmission, ProcessLifecycle, ProcessRequest, ProcessStartReceipt, ProcessState,
+    SuspendedProcessIdentity, ValidatedDispatch,
 };
 use sha2::{Digest as _, Sha256};
 use std::collections::BTreeMap;
@@ -160,6 +160,7 @@ struct Operation;
 /// the physical implementation.
 pub struct WindowsProcessExecutor {
     authority: Arc<dyn DispatchValidationPort>,
+    launch_admission: Option<Arc<dyn ProcessLaunchAdmission>>,
     operations: Mutex<BTreeMap<OperationId, Arc<Mutex<Operation>>>>,
     reservations: Mutex<std::collections::BTreeSet<OperationId>>,
     capture_limit: usize,
@@ -185,6 +186,23 @@ impl WindowsProcessExecutor {
     pub fn new(authority: Arc<dyn DispatchValidationPort>) -> Self {
         Self {
             authority,
+            launch_admission: None,
+            operations: Mutex::new(BTreeMap::new()),
+            reservations: Mutex::new(std::collections::BTreeSet::new()),
+            capture_limit: DEFAULT_CAPTURE_LIMIT,
+            poisoned: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    /// Creates one executor with a Kernel-owned retained launch-proof seam.
+    #[must_use]
+    pub fn new_with_launch_admission(
+        authority: Arc<dyn DispatchValidationPort>,
+        launch_admission: Arc<dyn ProcessLaunchAdmission>,
+    ) -> Self {
+        Self {
+            authority,
+            launch_admission: Some(launch_admission),
             operations: Mutex::new(BTreeMap::new()),
             reservations: Mutex::new(std::collections::BTreeSet::new()),
             capture_limit: DEFAULT_CAPTURE_LIMIT,
@@ -200,6 +218,7 @@ impl WindowsProcessExecutor {
     ) -> Self {
         Self {
             authority,
+            launch_admission: None,
             operations: Mutex::new(BTreeMap::new()),
             reservations: Mutex::new(std::collections::BTreeSet::new()),
             capture_limit: capture_limit.max(1),
@@ -459,9 +478,13 @@ impl ProcessExecutor for WindowsProcessExecutor {
                 .map_err(unavailable)?;
 
             let authority = Arc::clone(&self.authority);
+            let launch_admission = self.launch_admission.as_ref().map(Arc::clone);
             let validated = child
                 .validate(|evidence| {
                     let observed = suspended_identity(&request, evidence)?;
+                    if let Some(admission) = &launch_admission {
+                        admission.validate_launch(&request)?;
+                    }
                     authority.validate_and_consume(request, observed)
                 })
                 .map_err(validation_error)?;

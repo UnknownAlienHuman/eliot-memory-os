@@ -3,8 +3,9 @@
 use eliot_contracts::{AuthorityEpoch, ResourceGeneration, StateFence};
 use eliot_platform::{PlatformHandle, PortError};
 use eliot_process::{
-    CancellationReceipt, OperationId, ProcessEvidence, ProcessExecutionAdmissionRequest,
-    ProcessExecutionError, ProcessExecutionView, ProcessStartReceipt,
+    CancellationReceipt, OperationId, ProcessCallerBinding, ProcessEvidence,
+    ProcessExecutionAdmissionRequest, ProcessExecutionError, ProcessExecutionView,
+    ProcessStartReceipt,
 };
 use eliot_runtime_contracts::{HealthVector, ServiceProcessState};
 use schemars::JsonSchema;
@@ -73,6 +74,24 @@ pub enum ProcessExecutionRequest {
         /// Exact operation identity to reconcile.
         operation_id: OperationId,
     },
+}
+
+/// Process operation plus the authenticated Session projection that produced
+/// it. Kernel replaces/validates this binding at the established front door.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProcessExecutionEnvelope {
+    /// Caller/session/principal projection.
+    pub caller: ProcessCallerBinding,
+    /// Closed process operation.
+    pub request: ProcessExecutionRequest,
+}
+
+impl ProcessExecutionEnvelope {
+    /// Validates caller and operation projections.
+    pub fn validate(&self) -> Result<(), KernelServiceError> {
+        self.request.validate()
+    }
 }
 
 impl ProcessExecutionRequest {

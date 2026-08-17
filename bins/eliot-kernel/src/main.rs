@@ -46,6 +46,12 @@ async fn main() {
         Ok(kernel) => kernel,
         Err(error) => exit_build_error(&error),
     });
+    if !kernel.process_execution_configured() {
+        exit_error(
+            "PROCESS_AUTHORITY_CONFIGURATION_REQUIRED",
+            "Host/installation must inject the external process authority handoff before Kernel readiness",
+        );
+    }
     #[cfg(windows)]
     {
         if let Some(prepared) = prepared_store
@@ -224,9 +230,9 @@ async fn serve_connection(
             }
             KernelFrameAction::Process {
                 request_id,
-                request,
+                envelope,
             } => {
-                let response = kernel.execute_process_request(request).await;
+                let response = kernel.execute_process_request(&session, envelope).await;
                 let reply = kernel.process_response_frame(&session, request_id, &response)?;
                 if let Err(error) = send_checked(&mut front_door, &reply, limits).await {
                     session.fence();

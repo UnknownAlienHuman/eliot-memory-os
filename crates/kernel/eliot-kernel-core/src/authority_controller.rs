@@ -20,9 +20,9 @@ use eliot_ors::{
 use eliot_platform::SecretReference;
 use eliot_process::{
     DispatchAuthorityId, DispatchPermit, DispatchPermitAuthority, DispatchPermitReplaySnapshot,
-    DispatchValidationContext, KernelDispatchKey, PermitIssuance, ProcessExecutionAdmissionRequest,
-    ProcessIntent, ProcessRequest, ProcessStartReceipt, RecoveryCapability,
-    SuspendedProcessIdentity, ValidatedDispatch,
+    DispatchValidationContext, KernelDispatchKey, PermitIssuance, ProcessCallerBinding,
+    ProcessExecutionAdmissionRequest, ProcessIntent, ProcessRequest, ProcessStartReceipt,
+    RecoveryCapability, SuspendedProcessIdentity, ValidatedDispatch,
 };
 
 use crate::error::{KernelError, KernelResult};
@@ -32,6 +32,8 @@ use crate::error::{KernelError, KernelResult};
 pub struct ProcessExecutionReplayRecord {
     /// Canonical digest of the inert admission request.
     pub admission_digest: String,
+    /// Exact authenticated caller binding that owns the operation.
+    pub caller: ProcessCallerBinding,
     /// Durable operation disposition.
     pub state: ProcessExecutionReplayState,
     /// Exact start receipt returned after resume, when completion is proven.
@@ -65,11 +67,18 @@ pub enum ProcessExecutionReplayBegin {
 /// in-memory implementation, because replay safety must survive caller and
 /// Kernel restart.
 pub trait ProcessExecutionReplayStore: Send + Sync {
+    /// Loads the durable operation owner before status/cancel/reconcile.
+    fn load_process_start(
+        &self,
+        operation_id: &eliot_process::OperationId,
+    ) -> KernelResult<Option<ProcessExecutionReplayRecord>>;
+
     /// Atomically reserves an operation before any process effect.
     fn begin_process_start(
         &self,
         operation_id: &eliot_process::OperationId,
         admission_digest: &str,
+        caller: &ProcessCallerBinding,
     ) -> KernelResult<ProcessExecutionReplayBegin>;
 
     /// Persists the projection at the one-shot start linearization point.

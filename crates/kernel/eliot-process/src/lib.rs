@@ -572,6 +572,74 @@ pub struct ProcessExecutionAdmissionRequest {
     deadline_unix_ms: u64,
 }
 
+/// Authenticated caller projection carried by every Kernel process operation.
+/// It is inert data: only the established Kernel Session can produce the
+/// matching principal digest and no field grants dispatch authority.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProcessCallerBinding {
+    module_id: String,
+    connection_id: String,
+    principal_digest: String,
+    authority_epoch: u64,
+    generation: Generation,
+    session_epoch: u64,
+}
+
+impl ProcessCallerBinding {
+    /// Creates a validated inert caller binding.
+    pub fn new(
+        module_id: impl Into<String>,
+        connection_id: impl Into<String>,
+        principal_digest: impl Into<String>,
+        authority_epoch: u64,
+        generation: Generation,
+        session_epoch: u64,
+    ) -> Result<Self, ContractError> {
+        if authority_epoch == 0 || session_epoch == 0 {
+            return Err(ContractError::InvalidValue {
+                field: "caller_epoch",
+                reason: "authority and session epochs must be non-zero",
+            });
+        }
+        let binding = Self {
+            module_id: validate_opaque_id("caller_module_id", module_id.into())?,
+            connection_id: validate_opaque_id("caller_connection_id", connection_id.into())?,
+            principal_digest: principal_digest.into(),
+            authority_epoch,
+            generation,
+            session_epoch,
+        };
+        validate_hex_digest("caller_principal_digest", &binding.principal_digest)?;
+        Ok(binding)
+    }
+
+    /// Returns the authenticated module identity.
+    pub fn module_id(&self) -> &str {
+        &self.module_id
+    }
+    /// Returns the established connection/session identity.
+    pub fn connection_id(&self) -> &str {
+        &self.connection_id
+    }
+    /// Returns the opaque principal digest.
+    pub fn principal_digest(&self) -> &str {
+        &self.principal_digest
+    }
+    /// Returns the bound authority epoch.
+    pub const fn authority_epoch(&self) -> u64 {
+        self.authority_epoch
+    }
+    /// Returns the bound generation.
+    pub const fn generation(&self) -> Generation {
+        self.generation
+    }
+    /// Returns the transport session epoch.
+    pub const fn session_epoch(&self) -> u64 {
+        self.session_epoch
+    }
+}
+
 impl ProcessExecutionAdmissionRequest {
     /// Creates an inert, bounded admission request.
     pub fn new(
@@ -2461,6 +2529,13 @@ pub trait ProcessExecutor: Send + Sync {
         &self,
         operation_id: OperationId,
     ) -> Result<ProcessEvidence, ProcessExecutionError>;
+}
+
+/// Kernel-owned launch proof checked after suspension and immediately before
+/// the physical child is resumed.
+pub trait ProcessLaunchAdmission: Send + Sync {
+    /// Revalidates retained path/identity material for one exact request.
+    fn validate_launch(&self, request: &ProcessRequest) -> Result<(), ContractError>;
 }
 
 /// Errors belonging to the P-03 process contract.
