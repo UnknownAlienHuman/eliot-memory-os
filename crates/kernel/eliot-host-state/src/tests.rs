@@ -769,12 +769,10 @@ fn committed_backend_receipt_must_match_durable_operation_checksum() {
     };
     let mut backend = journal.into_backend().unwrap();
     backend.rewrite_committed_checksum_for_test(&transaction_id, "fnv1a64-deadbeefdeadbeef");
-    let reopened = HostStateJournal::open(backend, host).unwrap();
-    assert_eq!(
-        reopened.reconcile(&transaction_id),
+    assert!(matches!(
+        HostStateJournal::open(backend, host),
         Err(JournalError::IdempotencyConflict)
-    );
-    assert_eq!(reopened.snapshot().unwrap().sequence, 1);
+    ));
 }
 
 #[test]

@@ -1559,7 +1559,7 @@ mod tests {
             raw_table_bytes(&backend, PAYLOADS),
         ]
         .into_iter()
-        .try_fold(0_usize, |total, item| total.checked_add(item))
+        .try_fold(0_usize, usize::checked_add)
         .unwrap_or_else(|| unreachable!());
         assert!(total > 1);
         assert!(backend.load_with_limit_for_test(total - 1).is_err());

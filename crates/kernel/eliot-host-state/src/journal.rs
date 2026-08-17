@@ -478,12 +478,10 @@ fn validate_committed_receipts(
     for receipt in &image.receipts {
         let mut matching_epoch = None;
         for (index, epoch) in image.epochs.iter().enumerate() {
-            if epoch.host == receipt.host {
-                if matching_epoch.replace(index).is_some() {
-                    return Err(JournalError::Invalid(
-                        "committed receipt does not name exactly one durable host epoch".into(),
-                    ));
-                }
+            if epoch.host == receipt.host && matching_epoch.replace(index).is_some() {
+                return Err(JournalError::Invalid(
+                    "committed receipt does not name exactly one durable host epoch".into(),
+                ));
             }
         }
         let Some(epoch_index) = matching_epoch else {
@@ -493,12 +491,10 @@ fn validate_committed_receipts(
         };
         let mut matching_evidence = None;
         for evidence in &loaded.evidence {
-            if evidence.host == receipt.host {
-                if matching_evidence.replace(evidence).is_some() {
-                    return Err(JournalError::Invalid(
-                        "committed receipt does not name exactly one epoch evidence record".into(),
-                    ));
-                }
+            if evidence.host == receipt.host && matching_evidence.replace(evidence).is_some() {
+                return Err(JournalError::Invalid(
+                    "committed receipt does not name exactly one epoch evidence record".into(),
+                ));
             }
         }
         let Some(evidence) = matching_evidence else {
