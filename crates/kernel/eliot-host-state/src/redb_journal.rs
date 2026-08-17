@@ -4,7 +4,9 @@ use std::path::{Path, PathBuf};
 
 use eliot_platform::{PlatformHandle, UnknownReason};
 use eliot_platform_windows::{ProtectedPathLease, require_protected_program_data_path};
-use redb::{Database, ReadTransaction, ReadableDatabase, ReadableTable, TableDefinition};
+use redb::{
+    Database, ReadOnlyDatabase, ReadTransaction, ReadableDatabase, ReadableTable, TableDefinition,
+};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -51,6 +53,16 @@ pub struct RedbJournalBackend {
     _path_lease: JournalPathLease,
 }
 
+/// Complete mutation-free view of an existing Host journal. The read-only
+/// database and protected path lease are retained until this value is dropped;
+/// callers must drop it before opening the journal for mutation.
+pub struct RedbJournalInspection {
+    pub image: DurableImage,
+    pub prepared: Vec<PreparedAppend>,
+    _database: ReadOnlyDatabase,
+    _path_lease: JournalPathLease,
+}
+
 enum JournalPathLease {
     Protected {
         _lease: ProtectedPathLease,
@@ -91,6 +103,59 @@ impl ReadBudget {
 }
 
 impl RedbJournalBackend {
+    /// Inspects an existing journal without creating a file, directory, or
+    /// schema and without opening a writable redb handle. `None` is returned
+    /// only when the exact protected file does not exist.
+    pub fn inspect_existing(
+        path: impl AsRef<Path>,
+    ) -> Result<Option<RedbJournalInspection>, BackendError> {
+        let path = path.as_ref();
+        require_protected_program_data_path(path, HOST_JOURNAL_RELATIVE_PATH)
+            .map_err(|_| BackendError::Unavailable)?;
+        match std::fs::symlink_metadata(path) {
+            Ok(metadata) if metadata.is_file() => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Ok(_) | Err(_) => return Err(BackendError::Unavailable),
+        }
+        let path_lease = ProtectedPathLease::open_existing(HOST_JOURNAL_RELATIVE_PATH)
+            .map_err(|_| BackendError::Unavailable)?;
+        if path_lease.path() != path {
+            return Err(BackendError::Unavailable);
+        }
+        path_lease
+            .verify_path_identity()
+            .map_err(|_| BackendError::Unavailable)?;
+        let database =
+            ReadOnlyDatabase::open(path_lease.path()).map_err(|_| BackendError::Unavailable)?;
+        path_lease
+            .verify_path_identity()
+            .map_err(|_| BackendError::Unavailable)?;
+        let read = database
+            .begin_read()
+            .map_err(|_| BackendError::Unavailable)?;
+        let snapshot = snapshot_from_read(&read, MAX_TOTAL_BYTES)?;
+        let prepared = snapshot
+            .prepared
+            .iter()
+            .map(|(_, item)| item.descriptor.clone())
+            .collect();
+        let image = DurableImage {
+            epochs: snapshot.epochs.into_iter().map(|(_, item)| item).collect(),
+            receipts: snapshot
+                .receipts
+                .into_iter()
+                .map(|(_, item)| item)
+                .collect(),
+        };
+        drop(read);
+        Ok(Some(RedbJournalInspection {
+            image,
+            prepared,
+            _database: database,
+            _path_lease: JournalPathLease::Protected { _lease: path_lease },
+        }))
+    }
+
     /// Opens or creates the dedicated Host journal database.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, BackendError> {
         let path = path.as_ref();
@@ -136,6 +201,43 @@ impl RedbJournalBackend {
         backend.ensure_schema()?;
         backend.snapshot()?;
         Ok(backend)
+    }
+
+    #[cfg(test)]
+    fn inspect_unprotected_for_test(
+        path: impl AsRef<Path>,
+    ) -> Result<Option<RedbJournalInspection>, BackendError> {
+        let path = path.as_ref();
+        match std::fs::symlink_metadata(path) {
+            Ok(metadata) if metadata.is_file() => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Ok(_) | Err(_) => return Err(BackendError::Unavailable),
+        }
+        let database = ReadOnlyDatabase::open(path).map_err(|_| BackendError::Unavailable)?;
+        let read = database
+            .begin_read()
+            .map_err(|_| BackendError::Unavailable)?;
+        let snapshot = snapshot_from_read(&read, MAX_TOTAL_BYTES)?;
+        let prepared = snapshot
+            .prepared
+            .iter()
+            .map(|(_, item)| item.descriptor.clone())
+            .collect();
+        let image = DurableImage {
+            epochs: snapshot.epochs.into_iter().map(|(_, item)| item).collect(),
+            receipts: snapshot
+                .receipts
+                .into_iter()
+                .map(|(_, item)| item)
+                .collect(),
+        };
+        drop(read);
+        Ok(Some(RedbJournalInspection {
+            image,
+            prepared,
+            _database: database,
+            _path_lease: JournalPathLease::Unprotected,
+        }))
     }
 
     /// Returns the exact protected path used by this backend.
@@ -200,18 +302,7 @@ impl RedbJournalBackend {
             .database
             .begin_read()
             .map_err(|_| BackendError::Unavailable)?;
-        let mut budget = ReadBudget::new(limit);
-        validate_schema_marker(&read, &mut budget)?;
-        let epochs = read_epochs(&read, &mut budget)?;
-        let prepared = read_prepared(&read, &mut budget)?;
-        let receipts = read_receipts(&read, &mut budget)?;
-        let payloads = read_payloads(&read, &mut budget)?;
-        validate_snapshot(&prepared, &receipts, &payloads)?;
-        Ok(BackendSnapshot {
-            epochs,
-            prepared,
-            receipts,
-        })
+        snapshot_from_read(&read, limit)
     }
 
     #[cfg(test)]
@@ -226,6 +317,24 @@ impl RedbJournalBackend {
                 .collect(),
         })
     }
+}
+
+fn snapshot_from_read(
+    read: &ReadTransaction,
+    limit: usize,
+) -> Result<BackendSnapshot, BackendError> {
+    let mut budget = ReadBudget::new(limit);
+    validate_schema_marker(read, &mut budget)?;
+    let epochs = read_epochs(read, &mut budget)?;
+    let prepared = read_prepared(read, &mut budget)?;
+    let receipts = read_receipts(read, &mut budget)?;
+    let payloads = read_payloads(read, &mut budget)?;
+    validate_snapshot(&prepared, &receipts, &payloads)?;
+    Ok(BackendSnapshot {
+        epochs,
+        prepared,
+        receipts,
+    })
 }
 
 fn has_table(
@@ -321,6 +430,11 @@ fn read_prepared(
             serde_json::from_slice(bytes).map_err(|_| BackendError::Unavailable)?;
         validate_transaction_key(&key, &prepared.descriptor.transaction_id)?;
         validate_prepared(&prepared)?;
+        if result.iter().any(|(_, prior): &(String, StoredPrepared)| {
+            prior.descriptor.transaction_id == prepared.descriptor.transaction_id
+        }) {
+            return Err(BackendError::Unavailable);
+        }
         result.push((key, prepared));
     }
     Ok(result)
@@ -1648,5 +1762,63 @@ mod tests {
         let mut total_overflow = ReadBudget::new(usize::MAX);
         total_overflow.used = usize::MAX - 1;
         assert!(total_overflow.charge(0, 2).is_err());
+    }
+
+    #[test]
+    fn readonly_inspection_missing_file_does_not_create_parent_or_file() {
+        let serial = NEXT_TEMP.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!("eliot-redb-inspect-missing-{serial}"));
+        let path = root.join("nested").join("journal.redb");
+        assert!(!root.exists());
+        assert!(
+            RedbJournalBackend::inspect_unprotected_for_test(&path)
+                .unwrap_or_else(|_| unreachable!())
+                .is_none()
+        );
+        assert!(!root.exists());
+    }
+
+    #[test]
+    fn readonly_inspection_is_byte_stable_and_surfaces_prepared() {
+        let (mut backend, root) = new_backend();
+        let path = root.join("journal.redb");
+        let (descriptor, bytes) = make_framed_append(test_host(), "readonly-inspection");
+        backend
+            .prepare(&descriptor)
+            .unwrap_or_else(|_| unreachable!());
+        backend
+            .append_prepared(&descriptor.transaction_id, &bytes)
+            .unwrap_or_else(|_| unreachable!());
+        backend
+            .flush(&descriptor.transaction_id)
+            .unwrap_or_else(|_| unreachable!());
+        backend
+            .sync(&descriptor.transaction_id)
+            .unwrap_or_else(|_| unreachable!());
+        drop(backend);
+        let before = std::fs::read(&path).unwrap_or_else(|_| unreachable!());
+        let modified = std::fs::metadata(&path)
+            .unwrap_or_else(|_| unreachable!())
+            .modified()
+            .unwrap_or_else(|_| unreachable!());
+        let inspection = RedbJournalBackend::inspect_unprotected_for_test(&path)
+            .unwrap_or_else(|_| unreachable!())
+            .unwrap_or_else(|| unreachable!());
+        assert_eq!(inspection.prepared, vec![descriptor]);
+        assert!(inspection.image.epochs.is_empty());
+        assert!(inspection.image.receipts.is_empty());
+        drop(inspection);
+        assert_eq!(
+            std::fs::read(&path).unwrap_or_else(|_| unreachable!()),
+            before
+        );
+        assert_eq!(
+            std::fs::metadata(&path)
+                .unwrap_or_else(|_| unreachable!())
+                .modified()
+                .unwrap_or_else(|_| unreachable!()),
+            modified
+        );
+        remove(&root);
     }
 }

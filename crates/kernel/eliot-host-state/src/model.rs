@@ -8,6 +8,15 @@ use serde::{Deserialize, Serialize};
 
 use crate::JournalError;
 
+fn deserialize_required_active_pipe<'de, D>(
+    deserializer: D,
+) -> Result<Option<PlatformHandle>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Option::<PlatformHandle>::deserialize(deserializer)
+}
+
 fn handle(value: &PlatformHandle, field: &'static str) -> Result<(), JournalError> {
     let text = value.as_str();
     if text.trim().is_empty() || text.chars().any(char::is_control) {
@@ -541,7 +550,10 @@ pub struct KernelRecord {
     pub operation: IdempotencyIdentity,
     pub activation_identity: PlatformHandle,
     pub approved_artifact_hash: PlatformHandle,
-    pub active_pipe_identity: PlatformHandle,
+    /// Exact pipe identity after the Kernel reaches Active.  There is no
+    /// sentinel identity: before Active this must remain absent.
+    #[serde(deserialize_with = "deserialize_required_active_pipe")]
+    pub active_pipe_identity: Option<PlatformHandle>,
     pub candidate_pipe_identity: Option<PlatformHandle>,
     pub candidate_job_binding: Option<KernelJobBinding>,
     pub prior_kernel_disposition: PriorKernelDisposition,
@@ -566,14 +578,11 @@ impl KernelRecord {
             &self.approved_artifact_hash,
             "kernel.approved_artifact_hash",
         )?;
-        handle(&self.active_pipe_identity, "kernel.active_pipe_identity")?;
+        if let Some(active_pipe) = &self.active_pipe_identity {
+            handle(active_pipe, "kernel.active_pipe_identity")?;
+        }
         if let Some(candidate) = &self.candidate_pipe_identity {
             handle(candidate, "kernel.candidate_pipe_identity")?;
-            if candidate == &self.active_pipe_identity {
-                return Err(JournalError::Invalid(
-                    "active and candidate Kernel pipe identities must differ".into(),
-                ));
-            }
         }
         self.kernel_generation.validate()?;
         self.one_time_nonce.validate()?;
@@ -639,6 +648,36 @@ impl KernelRecord {
             return Err(JournalError::Invalid(
                 "candidate Kernel pipe identity is required during handoff".into(),
             ));
+        }
+        if self.active_pipe_identity.is_some() != (self.state == KernelActivationState::Active) {
+            return Err(JournalError::Invalid(
+                "active Kernel pipe identity must be present if and only if state is Active".into(),
+            ));
+        }
+        match self.state {
+            KernelActivationState::Idle
+            | KernelActivationState::ShadowNoAuthority
+            | KernelActivationState::HandoffPrepared
+            | KernelActivationState::OldTerminated
+            | KernelActivationState::NonceIssued
+            | KernelActivationState::Activating
+                if self.active_pipe_identity.is_some() =>
+            {
+                return Err(JournalError::Invalid(
+                    "active Kernel pipe identity must be absent before Active".into(),
+                ));
+            }
+            KernelActivationState::Active => {
+                let Some(active_pipe) = self.active_pipe_identity.as_ref() else {
+                    return Err(JournalError::Invalid(
+                        "active Kernel requires an active pipe identity".into(),
+                    ));
+                };
+                if self.candidate_pipe_identity.as_ref() != Some(active_pipe) {
+                    return Err(JournalError::StaleFence);
+                }
+            }
+            _ => {}
         }
         if matches!(
             self.state,
@@ -1369,6 +1408,41 @@ pub(crate) fn kernel_transition(
     if current.state == KernelActivationState::Activating
         && next.state == KernelActivationState::Active
         && current.candidate_job_binding != next.candidate_job_binding
+    {
+        return Err(JournalError::StaleFence);
+    }
+    if matches!(
+        next.state,
+        KernelActivationState::Idle
+            | KernelActivationState::ShadowNoAuthority
+            | KernelActivationState::HandoffPrepared
+            | KernelActivationState::OldTerminated
+            | KernelActivationState::NonceIssued
+            | KernelActivationState::Activating
+    ) && next.active_pipe_identity.is_some()
+    {
+        return Err(JournalError::Invalid(
+            "active Kernel pipe identity must remain absent before Active".into(),
+        ));
+    }
+    if current.state == KernelActivationState::Active
+        && let (Some(current_pipe), Some(next_pipe)) = (
+            current.active_pipe_identity.as_ref(),
+            next.active_pipe_identity.as_ref(),
+        )
+        && current_pipe != next_pipe
+    {
+        return Err(JournalError::StaleFence);
+    }
+    if let (Some(current_candidate), Some(next_candidate)) = (
+        current.candidate_pipe_identity.as_ref(),
+        next.candidate_pipe_identity.as_ref(),
+    ) && current_candidate != next_candidate
+    {
+        return Err(JournalError::StaleFence);
+    }
+    if next.state == KernelActivationState::Active
+        && next.active_pipe_identity != next.candidate_pipe_identity
     {
         return Err(JournalError::StaleFence);
     }

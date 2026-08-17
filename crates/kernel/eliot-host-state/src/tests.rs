@@ -168,6 +168,7 @@ fn kernel_record(
             | KernelActivationState::OldTerminated
             | KernelActivationState::NonceIssued
             | KernelActivationState::Activating
+            | KernelActivationState::Active
     );
     let live_job = KernelJobBinding {
         job_name: h("kernel-job"),
@@ -183,7 +184,8 @@ fn kernel_record(
         operation: operation(op),
         activation_identity: h("activation-one"),
         approved_artifact_hash: h("sha256-kernel-artifact"),
-        active_pipe_identity: h("kernel-stable-pipe"),
+        active_pipe_identity: (state == KernelActivationState::Active)
+            .then(|| h("kernel-candidate-pipe")),
         candidate_pipe_identity: handoff.then(|| h("kernel-candidate-pipe")),
         candidate_job_binding: matches!(
             state,
@@ -1345,7 +1347,8 @@ fn kernel_record_requires_approved_artifact_explicit_pipes_and_active_evidence()
         "kernel-same-pipe",
         KernelActivationState::ShadowNoAuthority,
     );
-    same_pipe.candidate_pipe_identity = Some(same_pipe.active_pipe_identity.clone());
+    same_pipe.active_pipe_identity = Some(h("kernel-active-pipe"));
+    same_pipe.candidate_pipe_identity = Some(h("kernel-active-pipe"));
     assert!(matches!(
         journal.append(HostStateRecord::Kernel(same_pipe)),
         Err(JournalError::Invalid(_))
@@ -1717,6 +1720,18 @@ fn kernel_active_transition_rejects_nonce_job_and_process_substitution() {
         journal.append(HostStateRecord::Kernel(wrong_process)),
         Err(JournalError::Invalid(_))
     ));
+
+    let mut wrong_pipe = kernel_record(
+        &host,
+        &generation,
+        "binding-wrong-pipe",
+        KernelActivationState::Active,
+    );
+    wrong_pipe.active_pipe_identity = Some(h("substituted-pipe"));
+    assert_eq!(
+        journal.append(HostStateRecord::Kernel(wrong_pipe)),
+        Err(JournalError::StaleFence)
+    );
 }
 
 #[test]
@@ -1898,7 +1913,7 @@ fn kernel_transition_matrix_rejects_activation_without_handoff() {
         operation: operation("kernel-illegal"),
         activation_identity: h("activation-one"),
         approved_artifact_hash: h("sha256-kernel-artifact"),
-        active_pipe_identity: h("kernel-stable-pipe"),
+        active_pipe_identity: Some(h("kernel-candidate-pipe")),
         candidate_pipe_identity: Some(h("kernel-candidate-pipe")),
         candidate_job_binding: Some(KernelJobBinding {
             job_name: h("kernel-job"),
@@ -1927,4 +1942,89 @@ fn kernel_transition_matrix_rejects_activation_without_handoff() {
             ..
         })
     ));
+}
+
+#[test]
+fn kernel_failure_and_manual_recovery_require_no_active_pipe_identity() {
+    let (journal, host, generation) = active_journal();
+    journal
+        .append(HostStateRecord::Kernel(kernel_record(
+            &host,
+            &generation,
+            "failure-idle",
+            KernelActivationState::Idle,
+        )))
+        .unwrap_or_else(|_| unreachable!());
+    journal
+        .append(HostStateRecord::Kernel(kernel_record(
+            &host,
+            &generation,
+            "failure-shadow",
+            KernelActivationState::ShadowNoAuthority,
+        )))
+        .unwrap_or_else(|_| unreachable!());
+
+    let mut failed_with_pipe = kernel_record(
+        &host,
+        &generation,
+        "failure-with-pipe",
+        KernelActivationState::Failed,
+    );
+    failed_with_pipe.one_time_nonce = OneTimeNonceState {
+        nonce_ref: None,
+        state: NonceState::Unissued,
+    };
+    failed_with_pipe.active_pipe_identity = Some(h("invalid-failed-pipe"));
+    assert!(matches!(
+        journal.append(HostStateRecord::Kernel(failed_with_pipe)),
+        Err(JournalError::Invalid(_))
+    ));
+
+    let mut failed = kernel_record(
+        &host,
+        &generation,
+        "failure-valid",
+        KernelActivationState::Failed,
+    );
+    failed.one_time_nonce = OneTimeNonceState {
+        nonce_ref: None,
+        state: NonceState::Unissued,
+    };
+    journal
+        .append(HostStateRecord::Kernel(failed))
+        .unwrap_or_else(|_| unreachable!());
+
+    let mut manual_with_pipe = kernel_record(
+        &host,
+        &generation,
+        "manual-with-pipe",
+        KernelActivationState::ManualRecovery,
+    );
+    manual_with_pipe.one_time_nonce = OneTimeNonceState {
+        nonce_ref: None,
+        state: NonceState::Unissued,
+    };
+    manual_with_pipe.active_pipe_identity = Some(h("invalid-manual-pipe"));
+    assert!(matches!(
+        journal.append(HostStateRecord::Kernel(manual_with_pipe)),
+        Err(JournalError::Invalid(_))
+    ));
+
+    let mut manual = kernel_record(
+        &host,
+        &generation,
+        "manual-valid",
+        KernelActivationState::ManualRecovery,
+    );
+    manual.one_time_nonce = OneTimeNonceState {
+        nonce_ref: None,
+        state: NonceState::Unissued,
+    };
+    journal
+        .append(HostStateRecord::Kernel(manual))
+        .unwrap_or_else(|_| unreachable!());
+    assert_eq!(
+        journal.snapshot().unwrap().kernel.unwrap().state,
+        KernelActivationState::ManualRecovery
+    );
 }

@@ -33,9 +33,10 @@ pub use model::{
     RecoveryLineageEvidence, RecoveryLineageReason, ServiceSafetyClass, WakeDisposition,
     WakeRecord,
 };
-pub use redb_journal::RedbJournalBackend;
+pub use redb_journal::{RedbJournalBackend, RedbJournalInspection};
 pub use redb_store::{
-    HostAdmissionState, HostRecoverySnapshot, RedbHostReleaseToken, RedbHostStateStore,
+    HostAdmissionState, HostRecoverySnapshot, RedbHostReleaseToken, RedbHostStateInspection,
+    RedbHostStateStore,
 };
 #[cfg(test)]
 mod tests;

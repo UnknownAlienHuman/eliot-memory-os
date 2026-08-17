@@ -66,6 +66,24 @@ pub struct HostRecoverySnapshot {
     pub recovery_evidence: Option<HostRecoveryEvidence>,
 }
 
+/// Complete mutation-free view of the Host state file. The read-only database
+/// and protected path lease stay live until this value is dropped, preventing a
+/// path replacement between inspection and the caller's admission decision.
+pub struct RedbHostStateInspection {
+    pub state: HostInstallationState,
+    pub epoch: HostInstallationEpoch,
+    _database: ReadOnlyDatabase,
+    _path_lease: HostStatePathLease,
+}
+
+enum HostStatePathLease {
+    Protected {
+        _lease: ProtectedPathLease,
+    },
+    #[cfg(test)]
+    Unprotected,
+}
+
 /// Opaque state-owner capability returned by one exact pending-release or
 /// recovery preparation. The marker/evidence remain private and are consumed
 /// only by clean finalization.
@@ -85,19 +103,18 @@ pub struct RedbHostStateStore {
 }
 
 impl RedbHostStateStore {
-    /// Inspects existing Host state without creating directories, opening a
-    /// writable database, advancing an epoch, or mutating activation state.
-    pub fn inspect_admission(
+    /// Inspects the exact existing Host state and epoch in one read
+    /// transaction. A missing file is the only first-install result; this
+    /// method never creates parent directories, a database, tables, or an
+    /// initial state record.
+    pub fn inspect_existing(
         path: impl AsRef<Path>,
-        installation: &PlatformHandle,
-    ) -> Result<HostAdmissionState, HostStateError> {
+    ) -> Result<Option<RedbHostStateInspection>, HostStateError> {
         let path = path.as_ref();
         protected_state_path(path)?;
         match std::fs::symlink_metadata(path) {
             Ok(metadata) if metadata.is_file() => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                return Ok(HostAdmissionState::FirstInstall);
-            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Ok(_) | Err(_) => return Err(HostStateError::Unavailable),
         }
         let path_lease = open_state_lease(path, false)?;
@@ -106,8 +123,63 @@ impl RedbHostStateStore {
         path_lease
             .verify_path_identity()
             .map_err(|_| HostStateError::Unavailable)?;
-        let state = read_state_from(&database)?.ok_or(HostStateError::Unavailable)?;
-        validate_admission_state(&state, installation)?;
+        Self::inspect_opened(
+            database,
+            HostStatePathLease::Protected { _lease: path_lease },
+        )
+    }
+
+    fn inspect_opened(
+        database: ReadOnlyDatabase,
+        path_lease: HostStatePathLease,
+    ) -> Result<Option<RedbHostStateInspection>, HostStateError> {
+        let read = database
+            .begin_read()
+            .map_err(|_| HostStateError::Unavailable)?;
+        let state = read_state_from_read(&read)?;
+        let epoch = read_epoch_from_read(&read)?;
+        let (Some(state), Some(epoch)) = (state, epoch) else {
+            return Err(HostStateError::Unavailable);
+        };
+        state.validate()?;
+        epoch.validate().map_err(|_| HostStateError::Unavailable)?;
+        if state.installation != epoch.installation {
+            return Err(HostStateError::InstallationMismatch);
+        }
+        drop(read);
+        Ok(Some(RedbHostStateInspection {
+            state,
+            epoch,
+            _database: database,
+            _path_lease: path_lease,
+        }))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn inspect_unprotected_for_test(
+        path: impl AsRef<Path>,
+    ) -> Result<Option<RedbHostStateInspection>, HostStateError> {
+        let path = path.as_ref();
+        match std::fs::symlink_metadata(path) {
+            Ok(metadata) if metadata.is_file() => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Ok(_) | Err(_) => return Err(HostStateError::Unavailable),
+        }
+        let database = ReadOnlyDatabase::open(path).map_err(|_| HostStateError::Unavailable)?;
+        Self::inspect_opened(database, HostStatePathLease::Unprotected)
+    }
+
+    /// Inspects existing Host state without creating directories, opening a
+    /// writable database, advancing an epoch, or mutating activation state.
+    pub fn inspect_admission(
+        path: impl AsRef<Path>,
+        installation: &PlatformHandle,
+    ) -> Result<HostAdmissionState, HostStateError> {
+        let Some(inspection) = Self::inspect_existing(path)? else {
+            return Ok(HostAdmissionState::FirstInstall);
+        };
+        let state = &inspection.state;
+        validate_admission_state(state, installation)?;
         if state.active_process.is_some()
             || state.disposition.is_release_pending()
             || state.recovery_fence.is_some()
@@ -125,20 +197,9 @@ impl RedbHostStateStore {
         path: impl AsRef<Path>,
         installation: &PlatformHandle,
     ) -> Result<HostRecoverySnapshot, HostStateError> {
-        let path = path.as_ref();
-        protected_state_path(path)?;
-        match std::fs::symlink_metadata(path) {
-            Ok(metadata) if metadata.is_file() => {}
-            Ok(_) | Err(_) => return Err(HostStateError::Unavailable),
-        }
-        let path_lease = open_state_lease(path, false)?;
-        let database =
-            ReadOnlyDatabase::open(path_lease.path()).map_err(|_| HostStateError::Unavailable)?;
-        path_lease
-            .verify_path_identity()
-            .map_err(|_| HostStateError::Unavailable)?;
-        let state = read_state_from(&database)?.ok_or(HostStateError::Unavailable)?;
-        validate_admission_state(&state, installation)?;
+        let inspection = Self::inspect_existing(path)?.ok_or(HostStateError::Unavailable)?;
+        let state = &inspection.state;
+        validate_admission_state(state, installation)?;
         let (active_process, process) = match (
             state.active_process.clone(),
             state.active_process_recovery.clone(),
@@ -151,18 +212,14 @@ impl RedbHostStateStore {
             ),
             _ => return Err(HostStateError::InvalidRecord),
         };
-        let host_epoch = host_epoch_binding(
-            read_epoch_from(&database)?
-                .as_ref()
-                .ok_or(HostStateError::Unavailable)?,
-        )?;
+        let host_epoch = host_epoch_binding(&inspection.epoch)?;
         Ok(HostRecoverySnapshot {
             installation: installation.clone(),
             host_epoch,
             active_process,
             process,
-            disposition: state.disposition,
-            recovery_evidence: state.last_recovery_evidence,
+            disposition: state.disposition.clone(),
+            recovery_evidence: state.last_recovery_evidence.clone(),
         })
     }
 
@@ -575,6 +632,12 @@ fn read_epoch_from<D: ReadableDatabase>(
     let read = database
         .begin_read()
         .map_err(|_| HostStateError::Unavailable)?;
+    read_epoch_from_read(&read)
+}
+
+fn read_epoch_from_read(
+    read: &redb::ReadTransaction,
+) -> Result<Option<HostInstallationEpoch>, HostStateError> {
     let table = match read.open_table(EPOCH) {
         Ok(table) => table,
         Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
@@ -612,6 +675,12 @@ fn read_state_from<D: ReadableDatabase>(
     let read = database
         .begin_read()
         .map_err(|_| HostStateError::Unavailable)?;
+    read_state_from_read(&read)
+}
+
+fn read_state_from_read(
+    read: &redb::ReadTransaction,
+) -> Result<Option<HostInstallationState>, HostStateError> {
     let table = match read.open_table(STATE) {
         Ok(table) => table,
         Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
@@ -821,5 +890,143 @@ impl HostStateStore for RedbHostStateStore {
 
     fn finalize_clean_shutdown(&self, token: Self::ReleaseToken) -> Result<(), HostStateError> {
         RedbHostStateStore::finalize_clean_shutdown(self, token)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    use super::*;
+
+    static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
+
+    fn handle(value: &str) -> PlatformHandle {
+        PlatformHandle::new(value).unwrap_or_else(|_| unreachable!())
+    }
+
+    fn state(installation: &PlatformHandle) -> HostInstallationState {
+        HostInstallationState {
+            installation: installation.clone(),
+            active_process: None,
+            managed_dependencies: Vec::new(),
+            last_clean_shutdown: None,
+            disposition: HostShutdownDisposition::Clean,
+            active_process_recovery: None,
+            last_recovery_evidence: None,
+            recovery_fence: None,
+        }
+    }
+
+    fn epoch(installation: &PlatformHandle) -> HostInstallationEpoch {
+        HostInstallationEpoch {
+            installation: installation.clone(),
+            epoch: EpochTransition {
+                current: EpochIdentity {
+                    lineage: handle("host-test-lineage"),
+                    sequence: 1,
+                },
+                parent: None,
+            },
+            nonce: handle("host-test-nonce"),
+            recovery: None,
+        }
+    }
+
+    fn write_database(
+        path: &Path,
+        state: Option<&HostInstallationState>,
+        epoch: Option<&HostInstallationEpoch>,
+    ) {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).unwrap_or_else(|_| unreachable!());
+        }
+        let database = Database::create(path).unwrap_or_else(|_| unreachable!());
+        let write = database.begin_write().unwrap_or_else(|_| unreachable!());
+        if let Some(state) = state {
+            let bytes = serde_json::to_vec(state).unwrap_or_else(|_| unreachable!());
+            let mut table = write.open_table(STATE).unwrap_or_else(|_| unreachable!());
+            table
+                .insert(INSTALLATION, bytes.as_slice())
+                .unwrap_or_else(|_| unreachable!());
+        }
+        if let Some(epoch) = epoch {
+            let bytes = serde_json::to_vec(epoch).unwrap_or_else(|_| unreachable!());
+            let mut table = write.open_table(EPOCH).unwrap_or_else(|_| unreachable!());
+            table
+                .insert(CURRENT_EPOCH, bytes.as_slice())
+                .unwrap_or_else(|_| unreachable!());
+        }
+        write.commit().unwrap_or_else(|_| unreachable!());
+        drop(database);
+    }
+
+    fn temp_path(label: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+        let serial = NEXT_TEMP.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!("eliot-host-inspect-{label}-{serial}"));
+        (root.clone(), root.join("nested").join("host-state.redb"))
+    }
+
+    #[test]
+    fn readonly_missing_nested_host_state_does_not_create_path() {
+        let (root, path) = temp_path("missing");
+        assert!(!root.exists());
+        assert!(
+            RedbHostStateStore::inspect_unprotected_for_test(&path)
+                .unwrap_or_else(|_| unreachable!())
+                .is_none()
+        );
+        assert!(!root.exists());
+    }
+
+    #[test]
+    fn readonly_host_state_returns_exact_pair_without_mutation() {
+        let (root, path) = temp_path("valid");
+        let installation = handle("host-test-installation");
+        let expected_state = state(&installation);
+        let expected_epoch = epoch(&installation);
+        write_database(&path, Some(&expected_state), Some(&expected_epoch));
+        let before = std::fs::read(&path).unwrap_or_else(|_| unreachable!());
+        let metadata = std::fs::metadata(&path).unwrap_or_else(|_| unreachable!());
+        let modified = metadata.modified().unwrap_or_else(|_| unreachable!());
+        let length = metadata.len();
+        let inspection = RedbHostStateStore::inspect_unprotected_for_test(&path)
+            .unwrap_or_else(|_| unreachable!())
+            .unwrap_or_else(|| unreachable!());
+        assert_eq!(inspection.state, expected_state);
+        assert_eq!(inspection.epoch, expected_epoch);
+        drop(inspection);
+        let after_metadata = std::fs::metadata(&path).unwrap_or_else(|_| unreachable!());
+        assert_eq!(
+            std::fs::read(&path).unwrap_or_else(|_| unreachable!()),
+            before
+        );
+        assert_eq!(after_metadata.len(), length);
+        assert_eq!(
+            after_metadata.modified().unwrap_or_else(|_| unreachable!()),
+            modified
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn readonly_host_state_rejects_partial_and_mismatched_records() {
+        let installation = handle("host-test-installation");
+        let other = handle("other-installation");
+        for (label, state_record, epoch_record) in [
+            ("state-only", Some(state(&installation)), None),
+            ("epoch-only", None, Some(epoch(&installation))),
+            ("both-absent", None, None),
+            (
+                "mismatched",
+                Some(state(&installation)),
+                Some(epoch(&other)),
+            ),
+        ] {
+            let (root, path) = temp_path(label);
+            write_database(&path, state_record.as_ref(), epoch_record.as_ref());
+            assert!(RedbHostStateStore::inspect_unprotected_for_test(&path).is_err());
+            let _ = std::fs::remove_dir_all(root);
+        }
     }
 }
