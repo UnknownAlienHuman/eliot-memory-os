@@ -34,7 +34,7 @@ struct StoredPrepared {
     synced: bool,
 }
 
-/// Production HostStateJournal backend backed by a separate Host-owned redb file.
+/// Production `HostStateJournal` backend backed by a separate Host-owned redb file.
 ///
 /// The retained [`ProtectedPathLease`] is held for the lifetime of the database,
 /// so redb never reopens a path whose final component could have been replaced.
