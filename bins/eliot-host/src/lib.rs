@@ -532,6 +532,10 @@ impl HostJobBranches {
 
     /// Completes the authenticated Host↔Kernel lifecycle before Host
     /// publishes any successful contour observation.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "ordered authenticated control sequencing keeps every authority transition visible"
+    )]
     fn complete_kernel_control(
         &self,
         generation: &PlatformHandle,

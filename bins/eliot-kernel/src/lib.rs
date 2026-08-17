@@ -2122,12 +2122,13 @@ impl KernelComposition {
             .map_err(|error| KernelBuildError::Service(error.to_string()))?;
         let module_id =
             ContractId::new("eliotd").map_err(|error| KernelBuildError::Core(error.to_string()))?;
-        let artifact_id = std::env::var("ELIOT_APPROVED_ARTIFACT")
-            .ok()
-            .and_then(|value| ArtifactId::new(value).ok())
-            .unwrap_or_else(|| {
-                ArtifactId::new("eliotd-child-generation").expect("static artifact")
-            });
+        let artifact_id = match std::env::var("ELIOT_APPROVED_ARTIFACT") {
+            Ok(value) => {
+                ArtifactId::new(value).map_err(|error| KernelBuildError::Core(error.to_string()))?
+            }
+            Err(_) => ArtifactId::new("eliotd-child-generation")
+                .map_err(|error| KernelBuildError::Core(error.to_string()))?,
+        };
         let module_generation = ModuleGeneration {
             module_id: module_id.clone(),
             generation,
@@ -2780,10 +2781,10 @@ impl KernelComposition {
             return Err(TransportError::SessionFenced);
         }
         drop(policy);
-        if let KernelControlCommand::Reconcile(handshake) = &request.command {
-            if handshake != &request.handshake {
-                return Err(TransportError::SessionFenced);
-            }
+        if let KernelControlCommand::Reconcile(handshake) = &request.command
+            && handshake != &request.handshake
+        {
+            return Err(TransportError::SessionFenced);
         }
         let receipt = match &request.command {
             KernelControlCommand::Ready(receipt) => Some(receipt.clone()),
