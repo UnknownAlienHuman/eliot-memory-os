@@ -5716,6 +5716,67 @@ fn sha256_hex(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
 
+const ACTIVATION_NONCE_PREFIX: &str = "eliot-activation-";
+const ACTIVATION_NONCE_RANDOM_BYTES: usize = 32;
+const ACTIVATION_NONCE_HEX_BYTES: usize = ACTIVATION_NONCE_RANDOM_BYTES * 2;
+
+/// Issues one fresh Host-owned activation nonce from the Windows system RNG.
+///
+/// The nonce deliberately has no lineage, time, process, or other caller
+/// input.  Any `BCrypt` failure is terminal for this issuance attempt; callers
+/// must not substitute a deterministic or weak fallback.
+///
+/// # Errors
+///
+/// Returns [`WindowsAdapterError::Failed`] when the system RNG rejects the
+/// request, or [`WindowsAdapterError::InvalidInput`] if the resulting handle
+/// cannot satisfy the bounded nonce shape.
+#[cfg(windows)]
+pub fn fresh_activation_nonce() -> Result<PlatformHandle, WindowsAdapterError> {
+    use windows_sys::Win32::Security::Cryptography::{
+        BCRYPT_USE_SYSTEM_PREFERRED_RNG, BCryptGenRandom,
+    };
+
+    let mut random = [0_u8; ACTIVATION_NONCE_RANDOM_BYTES];
+    let status = unsafe {
+        // SAFETY: `random` is an initialized, writable fixed-size buffer and
+        // its length is within BCryptGenRandom's u32 parameter range.
+        BCryptGenRandom(
+            std::ptr::null_mut(),
+            random.as_mut_ptr(),
+            u32::try_from(random.len()).map_err(|_| WindowsAdapterError::InvalidInput)?,
+            BCRYPT_USE_SYSTEM_PREFERRED_RNG,
+        )
+    };
+    if status != 0 {
+        return Err(WindowsAdapterError::Failed);
+    }
+
+    let mut value =
+        String::with_capacity(ACTIVATION_NONCE_PREFIX.len() + ACTIVATION_NONCE_HEX_BYTES);
+    value.push_str(ACTIVATION_NONCE_PREFIX);
+    for byte in random {
+        use std::fmt::Write;
+        write!(&mut value, "{byte:02x}").map_err(|_| WindowsAdapterError::Failed)?;
+    }
+
+    let handle = PlatformHandle::new(value).map_err(|_| WindowsAdapterError::InvalidInput)?;
+    if !handle.as_str().starts_with(ACTIVATION_NONCE_PREFIX)
+        || handle.as_str().len() != ACTIVATION_NONCE_PREFIX.len() + ACTIVATION_NONCE_HEX_BYTES
+        || !handle.as_str()[ACTIVATION_NONCE_PREFIX.len()..]
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    {
+        return Err(WindowsAdapterError::InvalidInput);
+    }
+    Ok(handle)
+}
+
+#[cfg(not(windows))]
+pub fn fresh_activation_nonce() -> Result<PlatformHandle, WindowsAdapterError> {
+    Err(WindowsAdapterError::Unavailable)
+}
+
 fn valid_sha256_hex(value: &str) -> bool {
     value.len() == 64
         && value
@@ -7216,6 +7277,35 @@ mod tests {
     #[test]
     fn atomic_suffix_is_nonempty_and_not_secret_derived() {
         assert!(!unique_suffix().is_empty());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn activation_nonce_has_bounded_lowercase_hex_shape() {
+        let nonce =
+            fresh_activation_nonce().unwrap_or_else(|error| panic!("nonce failed: {error}"));
+        let value = nonce.as_str();
+        assert!(value.starts_with(ACTIVATION_NONCE_PREFIX));
+        assert_eq!(
+            value.len(),
+            ACTIVATION_NONCE_PREFIX.len() + ACTIVATION_NONCE_HEX_BYTES
+        );
+        assert!(
+            value[ACTIVATION_NONCE_PREFIX.len()..]
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn sequential_activation_nonces_are_distinct() {
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..256 {
+            let nonce = fresh_activation_nonce()
+                .unwrap_or_else(|error| panic!("nonce issuance failed: {error}"));
+            assert!(seen.insert(nonce.as_str().to_owned()));
+        }
     }
 
     #[test]
