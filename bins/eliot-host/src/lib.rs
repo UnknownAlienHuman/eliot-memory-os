@@ -25,9 +25,9 @@ use eliot_installation::{
     verify_file_digest_with_lease, verify_file_digest_with_user_lease,
 };
 use eliot_kernel_service::{
-    HostKernelHandshake, HostStoreBootstrapRequirement, KERNEL_CONTROL_PIPE, KernelControlCommand,
-    KernelControlRequest, KernelReadyReceipt, KernelServiceState, ProcessObservation,
-    RestartBudget, control_request_frame, decode_control_response_frame,
+    HostJobBinding, HostKernelHandshake, HostProcessBinding, HostStoreBootstrapRequirement,
+    KERNEL_CONTROL_PIPE, KernelControlCommand, KernelControlRequest, KernelReadyReceipt,
+    KernelServiceState, RestartBudget, control_request_frame, decode_control_response_frame,
 };
 use eliot_platform::{
     HostBranchKind, HostBranchRecoveryFence, HostInstallationState, HostJobDisposition,
@@ -597,6 +597,33 @@ impl HostJobBranches {
             host.epoch.current.sequence
         ))
         .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+        // Kernel authenticates the connected Host peer against this exact
+        // value, so it is read from the live current-process handle. A PID
+        // alone would not make PID reuse or image substitution observable.
+        let platform = WindowsPlatform::new(PathBuf::from(launch.kernel_work_root.as_str()))
+            .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+        let host_identity = platform
+            .process_identity(std::process::id())
+            .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+        let host_process = HostProcessBinding {
+            process_id: host_identity.process_id,
+            start_time_100ns: host_identity.start_time_100ns,
+            image_path: host_identity.image_path.clone(),
+        };
+        host_process
+            .validate()
+            .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+        // Inert projection of the Host-retained Kernel Job. It grants nothing:
+        // Kernel must reopen the named Job and re-observe its own root
+        // membership before it will author readiness.
+        let job_binding: HostJobBinding = serde_json::from_value(
+            serde_json::to_value(kernel.evidence().recoverable_job_binding())
+                .map_err(|error| HostError::ProcessContour(error.to_string()))?,
+        )
+        .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+        job_binding
+            .validate()
+            .map_err(|error| HostError::ProcessContour(error.to_string()))?;
         let handshake = HostKernelHandshake {
             installation_id: host.installation.clone(),
             host_epoch: authority_epoch,
@@ -609,6 +636,8 @@ impl HostJobBranches {
                 .map_err(|error| HostError::ProcessContour(error.to_string()))?,
             pipe_identity: PlatformHandle::new(KERNEL_CONTROL_PIPE)
                 .map_err(|error| HostError::ProcessContour(error.to_string()))?,
+            host_process,
+            job_binding,
             restart_budget: RestartBudget::new(3, 3)
                 .map_err(|error| HostError::ProcessContour(error.to_string()))?,
             containment_action: None,
@@ -616,35 +645,9 @@ impl HostJobBranches {
         handshake
             .validate()
             .map_err(|error| HostError::ProcessContour(error.to_string()))?;
-        let observation = ProcessObservation {
-            process_id: PlatformHandle::new(format!(
-                "pid:{}:start:{}",
-                process.process_id, process.start_time_100ns
-            ))
-            .map_err(|error| HostError::ProcessContour(error.to_string()))?,
-            job_object_id: handshake.job_object_id.clone(),
-            state: ServiceProcessState::Ready,
-            health: HealthVector::healthy(),
-            evidence_refs: vec![
-                PlatformHandle::new(format!(
-                    "host-retained-process:{}:{}:{}",
-                    generation.as_str(),
-                    process.process_id,
-                    process.start_time_100ns
-                ))
-                .map_err(|error| HostError::ProcessContour(error.to_string()))?,
-            ],
-        };
-        let receipt = KernelReadyReceipt {
-            activation_id: handshake.activation_id.clone(),
-            activation_nonce: handshake.activation_nonce.clone(),
-            process: observation,
-            health: HealthVector::healthy(),
-            evidence_refs: vec![
-                PlatformHandle::new(format!("host-kernel-ready:{}", generation.as_str()))
-                    .map_err(|error| HostError::ProcessContour(error.to_string()))?,
-            ],
-        };
+        // Host deliberately authors no readiness receipt. Readiness is proven
+        // by Kernel from its own live process, Job, authority, configuration
+        // and Store observations, and arrives on the ProbeReady response.
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -677,7 +680,7 @@ impl HostJobBranches {
                 KernelControlCommand::Shadow,
                 KernelControlCommand::PrepareHandoff,
                 KernelControlCommand::Activate,
-                KernelControlCommand::Ready(receipt.clone()),
+                KernelControlCommand::ProbeReady,
             ];
             let mut final_receipt = None;
             for (index, command) in commands.into_iter().enumerate() {
@@ -703,7 +706,11 @@ impl HostJobBranches {
                 .with_computed_digest()
                 .map_err(|error| HostError::ProcessContour(error.to_string()))?;
                 let frame = control_request_frame(
-                    format!("host-control:{}", handshake.activation_id.as_str()),
+                    format!(
+                        "host-control:{}:{}",
+                        generation.as_str(),
+                        handshake.activation_id.as_str()
+                    ),
                     &request,
                 )
                 .map_err(|error| HostError::ProcessContour(error.to_string()))?;
@@ -728,7 +735,7 @@ impl HostJobBranches {
                 if response.message_id != message_id
                     || response.request_digest != request.payload_digest
                     || response.error.is_some()
-                    || (matches!(&request.command, KernelControlCommand::Ready(_))
+                    || (matches!(&request.command, KernelControlCommand::ProbeReady)
                         && response.state != KernelServiceState::Ready)
                 {
                     return Err(HostError::ProcessContour(
