@@ -135,4 +135,96 @@ Two observations that matter more than the score:
 
 ---
 
-(Q3–Q6 pending)
+## Q3. `A10` swarm / delegation — durable coordination
+
+### The decisive structural fact: the repo contains TWO products
+
+Before answering, this must be stated because it determines every status below.
+
+`crates/eliot-app` (103,810 LOC) + `crates/eliot-engine` (64,720 LOC) + `crates/eliot-store` (14,218 LOC) + `crates/eliot-types` + `crates/eliot-windows-ipc` form a **self-contained ~185k-LOC island**. `crates/eliot-app/Cargo.toml:14-30` lists its entire ELIOT dependency set: `eliot-engine`, `eliot-store`, `eliot-types`, `eliot-windows-ipc`. It depends on **none** of the ~110 architecture-shaped crates. It builds `[[bin]] name = "eliot-governor"` (`crates/eliot-app/Cargo.toml:8-10`) — the MCP server.
+
+Only **two** edges cross from the new tree into the island, both trivial: `crates/kernel/eliot-platform-windows/Cargo.toml:10` → `eliot-windows-ipc`, and `crates/instrument/eliot-verifier/Cargo.toml:10` → `eliot-types`.
+
+So: the swarm mechanisms are implemented **twice**, in two disconnected halves.
+
+### Half A — the legacy island: mailbox + blackboard are REAL and shipped
+
+| `I10.18` element | Status | Evidence |
+|---|---|---|
+| Mailbox: message-id idempotency | IMPLEMENTED | `crates/eliot-engine/src/collective.rs:176-184` — `send()` returns the existing message when `message_id` already present |
+| Mailbox: ordered sequence per recipient/task | IMPLEMENTED | `collective.rs:188` `next_sequence(state, project_id, task_id, &recipient)` |
+| Mailbox: ack for control messages | IMPLEMENTED | `collective.rs:198-201` `requires_ack: input.requires_ack.unwrap_or_else(|| message_kind_requires_ack(input.kind))`; `acknowledge()` at `:226-237` |
+| Mailbox: expiry | IMPLEMENTED | `collective.rs:239-253` `expire_stale()` moves `Pending|Delivered` → `Expired` |
+| Mailbox: large payload by handle | IMPLEMENTED | `payload_ref` field, `collective.rs:196` |
+| Blackboard typed items | IMPLEMENTED | `BlackboardService` at `collective.rs:55`, with `create_item/list/acknowledge/resolve/reject/supersede/expire_old` at `:73-174` |
+| Agent-loss reassignment (`ARCH-SWM-02`) | IMPLEMENTED | `LostAgentRecoveryService::scan` at `collective.rs:259` |
+| Agent-facing surface | IMPLEMENTED | MCP tools `eliot_blackboard_add/list/ack` and `eliot_mailbox_send/inbox/ack` registered at `crates/eliot-app/src/mcp_stdio/catalog.rs:2174-2208` |
+
+**But its durability violates the architecture.** `WorkState` — which holds `blackboard_items` and `mailbox_messages` (`crates/eliot-engine/src/work.rs:36,38`) — is persisted as a **plain JSON file**:
+
+- `crates/eliot-app/src/commands/support.rs:785-791` `load_work_state()` = `serde_json::from_reader(File::open(reports/work/state.json))`, defaulting to `WorkState::default()` when absent
+- `:793-809` `save_work_state_and_report()` writes the whole blob back
+- path: `:811-813` `root/reports/work/state.json`
+
+No canonical store, no transaction, no `StateFence`, no authority epoch, no receipt, no operation identity. It is last-writer-wins read-modify-write on a file under `reports/` — a directory `docs/PROJECT_LAYOUT.md` does not even list. Two concurrent agents lose each other's messages.
+
+### Half B — the architecture tree: correct logic, not wired
+
+**`crates/governor/eliot-coordination`** — package description at `Cargo.toml:7` literally reads `"Durable, idempotent and epoch-fenced multi-actor coordination owner"`, i.e. it claims `ARCH-SWM-02` by name. The logic is genuinely good:
+
+- epoch/fence gate on every entry point: `self.common(req.authority_epoch, &req.state_fence)?` — `src/lib.rs:647`, `:759`, and every other mutator
+- idempotent lease re-acquisition: `src/lib.rs:660-675` returns the prior `WorkLeaseDecision` when the same `lease_id` re-claims, else `WorkAlreadyOwned`
+- idempotent mailbox send with digest equality check: `src/lib.rs:769-783`
+- leases with `expires_at`, `last_heartbeat`, `attempt` counter: `:681-693`, `:712`
+
+Three problems:
+
+1. **It is never driven.** `CoordinationOwner` is `use`d once (`crates/governor/eliot-governor/src/composition.rs:23`), reconstructed from a recovery snapshot (`:1062-1064`), and stored as a struct field (`:988`, `:1146`). A repo-wide grep for callers of `register_session`, `register_work`, `acquire_work`, `heartbeat`, `send_message`, `checkpoint`, `submit_result`, `reassign`, `submit_integration_candidate`, `acquire_integration`, `record_coordination_event` outside `crates/governor/eliot-coordination/` returns **zero** hits on `CoordinationOwner`. It is a state machine with no request handler. Status: **SHELL at the wiring level** despite a fully implemented body.
+2. **It is not durable by itself.** `Cargo.toml:9-13` — its only ELIOT dependency is `eliot-contracts`. State is `BTreeMap` in memory. Durability is delegated entirely to Governor snapshot/recovery, which is a legitimate design, but the crate's own description overstates it.
+3. **No test file.** `grep -c '#\[test\]' crates/governor/eliot-coordination/src/lib.rs` = **0**, and the crate has no `tests/` directory (`ls crates/governor/eliot-coordination/` → `Cargo.toml`, `src`). 1131 lines of fencing/idempotency logic with zero tests.
+
+**`crates/agent/eliot-swarm`** (2546 LOC lib + 1406 LOC `repair_tests.rs`) — implements the negotiated-partition pipeline as pure admission functions: `admit_plan` (`src/lib.rs:807`), `begin_execution` (`:1159`), `admit_wave` (`:1296`), `apply_terminal_updates` (`:1402`), `accept_cross_review` (`:1517`), `selectively_replan` (`:1677`), `accept_blind_audit` (`:1806`), `accept_synthesis_contribution` (`:1971`), `synthesize` (`:2132`), `admit_concilium` (`:2218`), `checkpoint_controller` (`:2412`), `restore_controller` (`:2511`). No `todo!`/`unimplemented!`. `RECIPE = "NegotiatedInterdependentInvestigation"` at `:28`.
+
+Durability and routing are delegated to three injected traits (`src/lib.rs:298`, `:306`, `:312`): `AgentRouteProvider`, `ReceiptVerificationPort`, `SwarmCheckpointProvider`. **The only implementations in the entire repository are test doubles**: `impl AgentRouteProvider for A02` at `crates/agent/eliot-swarm/src/repair_tests.rs:222` and `impl SwarmCheckpointProvider for M04` at `repair_tests.rs:1211`. And the crate has **zero workspace dependents** (Q1d). Status: **SHELL** — pure core is real, nothing composes it, no production provider exists. The crate even encodes this itself: `SwarmError::PlanGap(RequiredProvider)` at `src/lib.rs:112`.
+
+**`crates/agent/eliot-agent-coordinator`** (1767 + 696 + 1090 LOC) — implements the `I10.18` live-peer delivery state machine for real: `LivePeerMessageState::Draft → Queued → Delivered` at `src/core.rs:1131`, `:1150`, `:1358-1368`, with `peer_message_payloads: BTreeMap<MessageId, LivePeerMessage>` at `:118` and `mailbox_route_handle` assignment at `:1108`. Zero workspace dependents. Status: **SHELL**.
+
+**`crates/agent/eliot-agent-contracts`** — `AnchoredReviewItem` (`src/lib.rs:803-815`) with `ReviewLifecycle`, `validate()` (`:817-841`), `validate_resolution()` (`:843-857`) and `transition_to()`. This is a validated type, and it *is* reachable (via `eliot-protocol` → `bins/eliot`). But there is **no owner, no store, no delivery, no `ReviewBatch` envelope** — grep for `AnchoredReview` across `crates` and `bins` returns hits only inside `eliot-agent-contracts/src/lib.rs` and its own inline tests (`:1202`, `:1215`, `:1251`, `:1371`). Status: **SHELL**.
+
+**Blackboard in the architecture tree: ABSENT.** `grep -rn -i 'blackboard'` over `crates/agent crates/governor crates/surfaces crates/foundation crates/kernel bins` returns **zero** hits. The only blackboard in the repo is the legacy one.
+
+### Answer
+
+**Types-plus-real-pure-logic, but not a durable multi-agent system.**
+
+- `ARCH-SWM-02` (durable, idempotent, epoch-fenced) — the *logic* exists and is correct in `eliot-coordination`, but is `SHELL`: never invoked, never tested. The only coordination that actually runs (legacy) is idempotent and ordered but has **no epoch fence and no durable store** — a JSON file.
+- Mailbox — `IMPLEMENTED` in the legacy island, `SHELL` in the architecture tree.
+- Blackboard — `IMPLEMENTED` in the legacy island, `ABSENT` in the architecture tree.
+- Negotiated partition — `SHELL` (`eliot-swarm`, 0 dependents, providers are test doubles only).
+- Anchored review — `SHELL` (validated type, no owner).
+- Live peer delivery — `SHELL` (`eliot-agent-coordinator`, 0 dependents).
+
+---
+
+## Q4. Integrations — which of EBP / MCP / Codex / Claude / OpenCode / ACP have real transport code
+
+| Integration | Real transport? | Where | Status |
+|---|---|---|---|
+| **EBP/1** | **YES** | Contracts: `crates/foundation/eliot-protocol/src/lib.rs` (`EBP_MAJOR=1` `:32`, `Frame` `:387`, `FrameKind` `:255`, `ClientHello` `:728`, `ServerHello` `:797`). Wire transport: `crates/kernel/eliot-ipc/src/lib.rs:1195` `NamedPipeTransport`, `:1271` `NamedPipeServer` over real `tokio::net::windows::named_pipe` (`:1272`, `:1299`, `:1445`), `connect_authenticated` at `:1382` with `NamedPipePeerExpectation` (SID + session id). Reachable from `bins/eliot`, `bins/eliot-kernel`, `bins/eliot-host`, `bins/eliot-store-surreal`, `bins/eliotd`. | **IMPLEMENTED** |
+| **MCP — legacy island** | **YES** | `crates/eliot-app/src/mcp_stdio*` = **40,338 LOC**. Entry `mcp_stdio::run()` at `crates/eliot-app/src/mcp_stdio.rs:704`, dispatched from clap at `crates/eliot-app/src/main.rs:2390-2404` (`Command::Mcp { McpCommand::Stdio }`). Host-aware: accepts `codex \| antigravity \| opencode \| claude \| claude-desktop` (`mcp_stdio.rs:718-724`). Access-profile scoping (`:729-751`), inherited-DB-credential rejection (`:711-714`), named-pipe IPC to a daemon (`:717`, `:753-762`). Shipped as `bin/eliot-governor.exe mcp stdio --profile codex_controller` per `plugin/eliot-governor/.mcp.json`. | **IMPLEMENTED** |
+| **MCP — architecture tree** | **NO** | `crates/surfaces/eliot-mcp` (1894 LOC) is contracts + `McpCore::execute` over an injected `KernelGovernorPort` trait (`src/core.rs:244`, `:434`). Repo-wide, the **only** implementations are `impl KernelGovernorPort for NoProviderPort` at `src/core.rs:573` (fail-closed) and 6 test doubles in `crates/surfaces/eliot-mcp/tests/contract.rs:158,207,548,669,771,796`. No stdio/pipe/socket code. Zero workspace dependents. | **SHELL** |
+| **OpenCode** | **YES — the best-built integration in the new tree** | `crates/agent/eliot-agent-opencode` = 5808 LOC. Hand-written HTTP/1.1 client over `tokio::net::TcpStream` (`src/http.rs:11`, `send()` at `:394-413` with connect/IO timeouts), chunked transfer decoding (`:865-868`), SSE stream reader (`src/sse.rs`, 690 LOC), loopback-only endpoint type (`src/endpoint.rs`, 311 LOC), typed API surface (`src/types.rs`, 1428 LOC), client (`src/client.rs`, 1823 LOC). Runnable binary `eliot-opencode-bootstrap`: reads `OPENCODE_SERVER_PASSWORD`/`OPENCODE_SERVER_USERNAME`, parses a `LoopbackEndpoint`, builds `BasicAuth`, `ReadOnlyRunRequest`, `OpenCodeRunPolicy`, `OpenCodeClient::new(...)` — `src/bin/eliot-opencode-bootstrap.rs:169-209`. Note it uses **zero ELIOT dependencies** (`Cargo.toml:8-16` — only base64/secrecy/serde/serde_json/sha2/thiserror/tokio), so it is not bound to authority, fence, or receipts. | **IMPLEMENTED (transport) / not integrated** |
+| **Codex** | **PARTIAL** | `crates/agent/eliot-agent-codex/src/lib.rs` (1164 LOC) implements the App Server wire layer for real: `CodexWireMessage::parse_line` (`:411`), `initialize` (`:439`), `thread_start` (`:454`), `turn_start` (`:458`), `turn_interrupt` (`:466`), `correlate_response` (`:476`), `translate_host_event` (`:536`), `translate_result` (`:598`), `wire_schema` (`:678`), plus route fingerprinting (`codex_route` `:77`), session binding (`:121-144`) and attach receipts with `invocation_digest`/`permit_digest`/`source_digest` (`:193-201`). **It never spawns anything itself** — process launch is delegated to `eliot_process::ProcessExecutor` (`Cargo.toml` dep `eliot-process`; `CodexAdapter<E>` at `:268`). Zero workspace dependents: nothing composes `CodexAdapter` with an executor. | **SHELL (unwired) over a real codec** |
+| **ACP** | **PARTIAL** | `crates/agent/eliot-agent-acp/src/lib.rs` (1724 LOC): `AcpFrameCodec` with bounded header/frame limits (`:122-215`), JSON-RPC request/notification/response types (`:319-385`), capability negotiation with explicit probe-not-advertisement rule (`AcpCapabilitySet::probe` `:509`, `negotiate` `:549`), `AcpVersionLine` v1/v2 gating (`:567`), session registry (`:715-755`), typed `AcpUnavailableReason`/`AcpUnknownOutcome` (`:67`, `:88`). The doc comment at `:120` states it plainly: *"this codec accepts arbitrary chunks and never reads stdin itself."* Grep for `TcpStream`/`Command::new`/`stdin` in the crate returns nothing but that comment. Zero workspace dependents. | **SHELL (codec only)** |
+| **Claude** | **ABSENT in code** | `grep -ril 'claude'` over `crates/agent crates/surfaces crates/foundation bins` returns **zero files**. No Agent SDK sidecar, no NDJSON bridge, no Managed Agents adapter — nothing `I10.5` describes. What exists is **packaging only**: `integrations/claude/eliot/.mcp.json`, `.claude-plugin/plugin.json`, `hooks/hooks.json`, `integrations/claude/claude-desktop/mcpb/manifest.json`, `integrations/claude/canonical/connector.json`. Claude reaches ELIOT only as an MCP *client* of the legacy `eliot-governor` server. | **ABSENT** (route) / IMPLEMENTED (packaging) |
+| Antigravity | packaging only | `plugin/eliot-antigravity-official/plugin.json` + rules markdown; `integrations/antigravity/integration.json`; CLI surface `AntigravityMcpCommand::{ConfigStatus, Register}` at `crates/eliot-app/src/main.rs:2874-2878` | partial |
+
+### The process substrate is real, but nothing above it is plugged in
+
+`crates/instrument/eliot-process-executor/src/lib.rs:402` `impl ProcessExecutor for WindowsProcessExecutor` is a genuine implementation: SHA-256 verification of the executable against `ProcessRequest.executable_sha256` before launch (`:434-438`), refusal of unadmitted secret env refs (`:429-433`), `SuspendedLaunchSpec` (`:446`), `JobObjectLimits` with CPU/memory/descendant caps (`:459-465`), stdout/stderr byte caps (`:466-467`), wall timeout (`:470`). It is consumed by `bins/eliot-kernel`, `bins/eliot-testd`, `bins/eliot-user-broker`.
+
+So the pattern across the whole integration layer is consistent: **the bottom (EBP + named pipes + hardened process launch) is real, the top (Codex/ACP codecs) is real, and the middle — the composition that joins them — does not exist.** `bins/eliot-agent-bridge/src/main.rs:80-84` makes this literal: it constructs `BridgeRunner::new(config.profile, ProviderReadiness::unprobed(), …)`, and `ProviderReadiness::unprobed()` (`crates/surfaces/eliot-agent-bridge-core/src/lib.rs:162-169`) sets **every** provider to `false` by construction, with the doc comment "Readiness is an observation, not a construction default." The binary therefore runs a real NDJSON stdin loop (`main.rs:92-100`) that can only ever emit `BridgeError::PlanGap` and exit `PROVIDER_PORT_EXIT`.
+
+---
+
+(Q5–Q6 pending)
