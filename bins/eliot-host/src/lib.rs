@@ -43,9 +43,9 @@ use eliot_platform::{
     PlatformHandle, PortOutcome, ServiceOperation, ServicePort, ServiceRequest, ServiceState,
 };
 use eliot_platform_windows::{
-    HostOwnerLease, HostOwnerLeaseError, HostOwnerLeaseReleaseError, ProtectedPathLease,
-    ServiceAccount, ServiceRegistrationRequest, ServiceStartMode, WindowsPlatform,
-    fresh_kernel_activation_nonce,
+    ELIOT_HOST_SERVICE_NAME, ELIOT_WATCHDOG_SERVICE_NAME, HostOwnerLease, HostOwnerLeaseError,
+    HostOwnerLeaseReleaseError, ProtectedPathLease, ServiceAccount, ServiceRegistrationInspection,
+    ServiceRegistrationRequest, ServiceStartMode, WindowsPlatform, fresh_kernel_activation_nonce,
 };
 use eliot_runtime_contracts::{
     HealthDimension, HealthVector, KernelActivationState, ServiceProcessRecord, ServiceProcessState,
@@ -57,7 +57,7 @@ use eliot_ipc::{DeliveryOutcome, NamedPipeTransport, PeerIdentity, TransportLimi
 use thiserror::Error;
 use uuid::Uuid;
 
-pub const SERVICE_NAME: &str = "eliot-host";
+pub const SERVICE_NAME: &str = ELIOT_HOST_SERVICE_NAME;
 pub const PROTOCOL_VERSION: &str = "eliot.host.v1";
 pub const HOST_JOURNAL_RELATIVE_PATH: &str = "Eliot/host/host-state-journal.redb";
 
@@ -2228,6 +2228,105 @@ fn fresh_identity(prefix: &str) -> Result<PlatformHandle, HostError> {
         .map_err(|error| HostError::Platform(error.to_string()))
 }
 
+#[cfg(windows)]
+trait InstalledWatchdogControl {
+    fn inspect_registration(
+        &mut self,
+        request: &ServiceRegistrationRequest,
+    ) -> ServiceRegistrationInspection;
+
+    fn start(
+        &mut self,
+        request: &ServiceRequest,
+    ) -> PortOutcome<eliot_platform::ServiceObservation>;
+}
+
+#[cfg(windows)]
+impl InstalledWatchdogControl for WindowsPlatform {
+    fn inspect_registration(
+        &mut self,
+        request: &ServiceRegistrationRequest,
+    ) -> ServiceRegistrationInspection {
+        self.inspect_service_registration(request)
+    }
+
+    fn start(
+        &mut self,
+        request: &ServiceRequest,
+    ) -> PortOutcome<eliot_platform::ServiceObservation> {
+        debug_assert_eq!(request.operation, ServiceOperation::Start);
+        self.execute(request)
+    }
+}
+
+#[cfg(windows)]
+fn start_installed_watchdog<C>(
+    control: &mut C,
+    registration: &ServiceRegistrationRequest,
+    context: RequestMetadata,
+) -> Result<(), HostError>
+where
+    C: InstalledWatchdogControl,
+{
+    match control.inspect_registration(registration) {
+        ServiceRegistrationInspection::Matching { observation }
+            if observation.state == ServiceState::Running =>
+        {
+            return Ok(());
+        }
+        ServiceRegistrationInspection::Matching { observation }
+            if observation.state == ServiceState::Stopped => {}
+        ServiceRegistrationInspection::Matching { observation } => {
+            return Err(HostError::Platform(format!(
+                "canonical Watchdog service is not startable from observed state {:?}",
+                observation.state
+            )));
+        }
+        ServiceRegistrationInspection::Absent => {
+            return Err(HostError::Platform(
+                "canonical Watchdog service is not installed".to_owned(),
+            ));
+        }
+        ServiceRegistrationInspection::Mismatched => {
+            return Err(HostError::Platform(
+                "canonical Watchdog service registration does not match the approved plan"
+                    .to_owned(),
+            ));
+        }
+        ServiceRegistrationInspection::Unknown => {
+            return Err(HostError::Platform(
+                "canonical Watchdog service registration is not authoritatively observable"
+                    .to_owned(),
+            ));
+        }
+    }
+
+    let service = PlatformHandle::new(ELIOT_WATCHDOG_SERVICE_NAME)
+        .map_err(|error| HostError::Platform(error.to_string()))?;
+    match control.start(&ServiceRequest {
+        context,
+        service,
+        operation: ServiceOperation::Start,
+    }) {
+        PortOutcome::Known(observation)
+        | PortOutcome::Partial {
+            value: observation, ..
+        } if observation.state == ServiceState::Running => Ok(()),
+        PortOutcome::Known(observation) => Err(HostError::Platform(format!(
+            "Watchdog did not reach Known(Running): {:?}",
+            observation.state
+        ))),
+        PortOutcome::Partial { value, .. } => Err(HostError::RecoveryRequired(format!(
+            "Watchdog start observation is partial and state is {:?}",
+            value.state
+        ))),
+        PortOutcome::Unknown(reason) => Err(HostError::RecoveryRequired(format!(
+            "Watchdog SCM start outcome is unknown: {reason:?}"
+        ))),
+        PortOutcome::Error(error) => Err(HostError::Platform(error.to_string())),
+    }
+}
+
 fn sha256_json(value: &impl serde::Serialize) -> Result<String, HostError> {
     let bytes =
         serde_json::to_vec(value).map_err(|error| HostError::ProcessContour(error.to_string()))?;
@@ -2797,75 +2896,19 @@ impl HostComposition {
         )?;
         let mut platform = WindowsPlatform::new(PathBuf::from(launch.kernel_work_root.as_str()))
             .map_err(|error| HostError::Platform(error.to_string()))?;
-        let request = ServiceRegistrationRequest::new(
-            "eliot-watchdog",
+        let registration = ServiceRegistrationRequest::new(
+            ELIOT_WATCHDOG_SERVICE_NAME,
             "Eliot Watchdog",
             &image,
-            ServiceStartMode::Demand,
-            ServiceAccount::LocalSystem,
+            ServiceStartMode::Automatic,
+            ServiceAccount::LocalService,
         )
         .map_err(|error| HostError::Platform(error.to_string()))?;
-        let registration = platform
-            .register_service(&request)
-            .map_err(|error| HostError::Platform(error.to_string()))?;
-        if matches!(
+        start_installed_watchdog(
+            &mut platform,
             &registration,
-            eliot_platform_windows::ServiceRegistrationOutcome::EffectUnknown
-        ) {
-            return Err(HostError::Platform(
-                "Watchdog SCM registration outcome is unknown".to_owned(),
-            ));
-        }
-        let service = PlatformHandle::new("eliot-watchdog")
-            .map_err(|error| HostError::Platform(error.to_string()))?;
-        let inspect_context = lifecycle_context(&self.host, "watchdog-inspect")?;
-        let mut inspect = || {
-            platform.execute(&ServiceRequest {
-                context: inspect_context.clone(),
-                service: service.clone(),
-                operation: ServiceOperation::Inspect,
-            })
-        };
-        if matches!(
-            &registration,
-            eliot_platform_windows::ServiceRegistrationOutcome::ExistingRequiresReconciliation
-        ) {
-            match inspect() {
-                PortOutcome::Known(observation)
-                    if observation.state == ServiceState::Stopped
-                        || observation.state == ServiceState::Absent => {}
-                PortOutcome::Known(observation) => {
-                    return Err(HostError::Platform(format!(
-                        "Watchdog existing service is not safely reconcilable: {:?}",
-                        observation.state
-                    )));
-                }
-                PortOutcome::Partial { .. } | PortOutcome::Unknown(_) | PortOutcome::Error(_) => {
-                    return Err(HostError::Platform(
-                        "Watchdog existing service observation is not authoritative".to_owned(),
-                    ));
-                }
-            }
-        }
-        let outcome = platform.execute(&ServiceRequest {
-            context: lifecycle_context(&self.host, "watchdog-start")?,
-            service,
-            operation: ServiceOperation::Start,
-        });
-        match outcome {
-            PortOutcome::Known(observation) if observation.state == ServiceState::Running => Ok(()),
-            PortOutcome::Known(observation) => Err(HostError::Platform(format!(
-                "Watchdog did not reach Known(Running): {:?}",
-                observation.state
-            ))),
-            PortOutcome::Partial { .. } => Err(HostError::Platform(
-                "Watchdog SCM start observation is partial".to_owned(),
-            )),
-            PortOutcome::Unknown(reason) => Err(HostError::Platform(format!(
-                "Watchdog SCM start outcome is unknown: {reason:?}"
-            ))),
-            PortOutcome::Error(error) => Err(HostError::Platform(error.to_string())),
-        }
+            lifecycle_context(&self.host, "watchdog-start")?,
+        )
     }
 
     #[cfg(windows)]
@@ -3702,6 +3745,132 @@ fn configured_image(name: &str) -> Result<PathBuf, HostError> {
         )));
     }
     Ok(path)
+}
+
+#[cfg(all(test, windows))]
+mod watchdog_service_tests {
+    use super::*;
+
+    struct FakeInstalledWatchdog {
+        inspection: Option<ServiceRegistrationInspection>,
+        start_outcome: Option<PortOutcome<eliot_platform::ServiceObservation>>,
+        starts: usize,
+    }
+
+    impl InstalledWatchdogControl for FakeInstalledWatchdog {
+        fn inspect_registration(
+            &mut self,
+            _request: &ServiceRegistrationRequest,
+        ) -> ServiceRegistrationInspection {
+            self.inspection.take().unwrap_or_else(|| unreachable!())
+        }
+
+        fn start(
+            &mut self,
+            _request: &ServiceRequest,
+        ) -> PortOutcome<eliot_platform::ServiceObservation> {
+            self.starts += 1;
+            self.start_outcome.take().unwrap_or_else(|| unreachable!())
+        }
+    }
+
+    fn registration() -> ServiceRegistrationRequest {
+        ServiceRegistrationRequest::new(
+            ELIOT_WATCHDOG_SERVICE_NAME,
+            "Eliot Watchdog",
+            std::env::current_exe().unwrap_or_else(|_| unreachable!()),
+            ServiceStartMode::Automatic,
+            ServiceAccount::LocalService,
+        )
+        .unwrap_or_else(|_| unreachable!())
+    }
+
+    fn observation(state: ServiceState) -> eliot_platform::ServiceObservation {
+        eliot_platform::ServiceObservation {
+            service: PlatformHandle::new(ELIOT_WATCHDOG_SERVICE_NAME)
+                .unwrap_or_else(|_| unreachable!()),
+            state,
+            generation: None,
+            process: None,
+        }
+    }
+
+    fn context() -> RequestMetadata {
+        let host = fresh_host_epoch(
+            PlatformHandle::new("installation:test").unwrap_or_else(|_| unreachable!()),
+            None,
+        )
+        .unwrap_or_else(|_| unreachable!());
+        lifecycle_context(&host, "watchdog-test").unwrap_or_else(|_| unreachable!())
+    }
+
+    #[test]
+    fn host_watchdog_surface_contains_no_registration_mutation() {
+        let source = include_str!("lib.rs");
+        let registration_mutation = [".register_", "service("].concat();
+        let registration_operation = ["ServiceOperation::", "Register"].concat();
+        assert!(!source.contains(&registration_mutation));
+        assert!(!source.contains(&registration_operation));
+        assert_eq!(SERVICE_NAME, ELIOT_HOST_SERVICE_NAME);
+    }
+
+    #[test]
+    fn absent_mismatched_or_unknown_registration_never_starts() {
+        for inspection in [
+            ServiceRegistrationInspection::Absent,
+            ServiceRegistrationInspection::Mismatched,
+            ServiceRegistrationInspection::Unknown,
+        ] {
+            let mut control = FakeInstalledWatchdog {
+                inspection: Some(inspection),
+                start_outcome: None,
+                starts: 0,
+            };
+
+            assert!(start_installed_watchdog(&mut control, &registration(), context()).is_err());
+            assert_eq!(control.starts, 0);
+        }
+    }
+
+    #[test]
+    fn exact_stopped_registration_is_started_and_observed() {
+        let mut control = FakeInstalledWatchdog {
+            inspection: Some(ServiceRegistrationInspection::Matching {
+                observation: observation(ServiceState::Stopped),
+            }),
+            start_outcome: Some(PortOutcome::Partial {
+                value: observation(ServiceState::Running),
+                missing: vec![
+                    PlatformHandle::new("authority_bound_process_record")
+                        .unwrap_or_else(|_| unreachable!()),
+                ],
+            }),
+            starts: 0,
+        };
+
+        start_installed_watchdog(&mut control, &registration(), context())
+            .unwrap_or_else(|_| unreachable!());
+        assert_eq!(control.starts, 1);
+    }
+
+    #[test]
+    fn unknown_start_outcome_requires_recovery() {
+        let mut control = FakeInstalledWatchdog {
+            inspection: Some(ServiceRegistrationInspection::Matching {
+                observation: observation(ServiceState::Stopped),
+            }),
+            start_outcome: Some(PortOutcome::Unknown(
+                eliot_platform::UnknownReason::Indeterminate,
+            )),
+            starts: 0,
+        };
+
+        assert!(matches!(
+            start_installed_watchdog(&mut control, &registration(), context()),
+            Err(HostError::RecoveryRequired(_))
+        ));
+        assert_eq!(control.starts, 1);
+    }
 }
 
 #[cfg(test)]

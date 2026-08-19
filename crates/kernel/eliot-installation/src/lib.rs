@@ -21,8 +21,9 @@ use eliot_platform::{
     PortOutcome,
 };
 use eliot_platform_windows::{
-    ProtectedPathError, ProtectedPathLease, ProtectedRootLease, UserOwnedPathLease,
-    UserOwnedRootReadLease, current_user_local_app_data_root, protected_program_data_root,
+    ELIOT_HOST_SERVICE_NAME, ELIOT_WATCHDOG_SERVICE_NAME, ProtectedPathError, ProtectedPathLease,
+    ProtectedRootLease, UserOwnedPathLease, UserOwnedRootReadLease,
+    current_user_local_app_data_root, protected_program_data_root,
     require_protected_program_data_path,
 };
 use redb::{Database, ReadOnlyDatabase, ReadableDatabase, TableDefinition};
@@ -2799,7 +2800,13 @@ fn validate_installer_effects(
                     "installer_effect.root",
                 )?);
             }
-            InstallerEffectPlan::RegisterService { role, account, .. } => {
+            InstallerEffectPlan::RegisterService {
+                role,
+                service_name,
+                executable_path,
+                account,
+                ..
+            } => {
                 if profile != InstallationProfile::SystemService {
                     return Err(InstallationError::ProfileViolation(
                         "SCM effects are admitted only for SystemService".to_owned(),
@@ -2809,6 +2816,24 @@ fn validate_installer_effects(
                     return Err(InstallationError::ProfileViolation(
                         "Host and Watchdog must run as LocalService".to_owned(),
                     ));
+                }
+                let (expected_name, expected_image) = match role {
+                    InstallerServiceRole::Host => (ELIOT_HOST_SERVICE_NAME, "eliot-host.exe"),
+                    InstallerServiceRole::Watchdog => {
+                        (ELIOT_WATCHDOG_SERVICE_NAME, "eliot-watchdog.exe")
+                    }
+                };
+                let observed_image = executable_path
+                    .as_str()
+                    .rsplit(['\\', '/'])
+                    .next()
+                    .unwrap_or_default();
+                if service_name.as_str() != expected_name
+                    || !observed_image.eq_ignore_ascii_case(expected_image)
+                {
+                    return Err(InstallationError::ProfileViolation(format!(
+                        "{role:?} must register canonical service {expected_name} from {expected_image}"
+                    )));
                 }
                 if !service_roles.insert(*role) {
                     return Err(InstallationError::Duplicate {
@@ -4094,14 +4119,35 @@ mod tests {
             )
             .is_ok()
         );
-        assert!(
-            effects
-                .iter()
-                .filter_map(|effect| match effect {
-                    InstallerEffectPlan::RegisterService { account, .. } => Some(account),
-                    _ => None,
-                })
-                .all(|account| *account == InstallerServiceAccount::LocalService)
+        let services = effects
+            .iter()
+            .filter_map(|effect| match effect {
+                InstallerEffectPlan::RegisterService {
+                    role,
+                    service_name,
+                    account,
+                    automatic_start,
+                    ..
+                } => Some((*role, service_name.as_str(), *account, *automatic_start)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            services,
+            vec![
+                (
+                    InstallerServiceRole::Host,
+                    ELIOT_HOST_SERVICE_NAME,
+                    InstallerServiceAccount::LocalService,
+                    true,
+                ),
+                (
+                    InstallerServiceRole::Watchdog,
+                    ELIOT_WATCHDOG_SERVICE_NAME,
+                    InstallerServiceAccount::LocalService,
+                    true,
+                ),
+            ]
         );
         let mut transaction = registering_transaction();
         let outcome = must(transaction.record_store_free_space(
@@ -4114,6 +4160,42 @@ mod tests {
             InstallationStepOutcome::RollbackRequired { .. }
         ));
         assert_eq!(transaction.stage, InstallationStage::RollbackRequired);
+    }
+
+    #[test]
+    fn installer_rejects_swapped_or_legacy_service_identity() {
+        let program_data = must(protected_program_data_root());
+        let roots = must(RuntimeStateRoots::derive_profiled(
+            InstallationProfile::SystemService,
+            test_handle(program_data.to_string_lossy().into_owned()),
+            &"e".repeat(64),
+        ));
+        let (changes, mut effects) = installer_plan_parts(&roots);
+        let host = effects
+            .iter_mut()
+            .find(|effect| {
+                matches!(
+                    effect,
+                    InstallerEffectPlan::RegisterService {
+                        role: InstallerServiceRole::Host,
+                        ..
+                    }
+                )
+            })
+            .unwrap_or_else(|| unreachable!());
+        if let InstallerEffectPlan::RegisterService { service_name, .. } = host {
+            *service_name = test_handle("eliot-host");
+        }
+
+        assert!(
+            validate_installer_effects(
+                InstallationProfile::SystemService,
+                &roots,
+                &changes,
+                &effects,
+            )
+            .is_err()
+        );
     }
 
     #[test]

@@ -3305,6 +3305,23 @@ pub enum ServiceRegistrationOutcome {
     EffectUnknown,
 }
 
+/// Read-only classification of one canonical Runtime Live SCM registration.
+///
+/// `Matching` means the SCM name, binary command, own-process service type,
+/// automatic start mode, and `LocalService` account all match the validated
+/// request.  Every other variant is fail-closed for Host startup.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ServiceRegistrationInspection {
+    /// Exact configuration and current service state were observed.
+    Matching { observation: ServiceObservation },
+    /// The canonical service name is not registered.
+    Absent,
+    /// A service exists at the canonical name with different configuration.
+    Mismatched,
+    /// SCM could not provide authoritative configuration and state readback.
+    Unknown,
+}
+
 #[cfg(windows)]
 static JOB_OBJECT_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
@@ -6109,6 +6126,21 @@ impl WindowsPlatform {
         register_service(request)
     }
 
+    /// Reads back the complete canonical registration without mutating SCM.
+    ///
+    /// # Errors
+    ///
+    /// This inspection preserves provider uncertainty in
+    /// [`ServiceRegistrationInspection::Unknown`] rather than returning an
+    /// error that a caller could accidentally reinterpret as absence.
+    #[must_use]
+    pub fn inspect_service_registration(
+        &self,
+        request: &ServiceRegistrationRequest,
+    ) -> ServiceRegistrationInspection {
+        inspect_service_registration(request)
+    }
+
     /// Publishes bytes by staging beside the destination and replacing it once.
     ///
     /// # Errors
@@ -7713,18 +7745,9 @@ fn register_service(
                 if code == ERROR_SERVICE_EXISTS.cast_signed()
                     || code == ERROR_SERVICE_MARKED_FOR_DELETE.cast_signed()
         ) {
-            return match existing_service_matches(request) {
-                Ok(true) => match inspect_service(request.service_name()) {
-                    PortOutcome::Known(observation)
-                    | PortOutcome::Partial {
-                        value: observation, ..
-                    } => Ok(ServiceRegistrationOutcome::Registered { observation }),
-                    PortOutcome::Unknown(_) | PortOutcome::Error(_) => {
-                        Ok(ServiceRegistrationOutcome::EffectUnknown)
-                    }
-                },
-                Ok(false) | Err(()) => Ok(ServiceRegistrationOutcome::EffectUnknown),
-            };
+            return Ok(registration_outcome_from_inspection(
+                inspect_service_registration(request),
+            ));
         }
         return Err(windows_adapter_from_io(&error));
     }
@@ -7732,26 +7755,33 @@ fn register_service(
         CloseServiceHandle(service);
         CloseServiceHandle(manager);
     }
-    if !service_readback_is_acceptable(existing_service_matches(request)) {
-        return Ok(ServiceRegistrationOutcome::EffectUnknown);
-    }
-    Ok(match inspect_service(request.service_name()) {
-        PortOutcome::Known(observation)
-        | PortOutcome::Partial {
-            value: observation, ..
-        } => ServiceRegistrationOutcome::Registered { observation },
-        PortOutcome::Unknown(_) | PortOutcome::Error(_) => {
-            ServiceRegistrationOutcome::EffectUnknown
-        }
-    })
+    Ok(registration_outcome_from_inspection(
+        inspect_service_registration(request),
+    ))
 }
 
 fn canonical_runtime_service_name(name: &str) -> bool {
     matches!(name, ELIOT_HOST_SERVICE_NAME | ELIOT_WATCHDOG_SERVICE_NAME)
 }
 
-fn service_readback_is_acceptable(readback: Result<bool, ()>) -> bool {
-    matches!(readback, Ok(true))
+fn service_readback_is_acceptable(readback: &ServiceRegistrationInspection) -> bool {
+    matches!(readback, ServiceRegistrationInspection::Matching { .. })
+}
+
+fn registration_outcome_from_inspection(
+    inspection: ServiceRegistrationInspection,
+) -> ServiceRegistrationOutcome {
+    if !service_readback_is_acceptable(&inspection) {
+        return ServiceRegistrationOutcome::EffectUnknown;
+    }
+    match inspection {
+        ServiceRegistrationInspection::Matching { observation } => {
+            ServiceRegistrationOutcome::Registered { observation }
+        }
+        ServiceRegistrationInspection::Absent
+        | ServiceRegistrationInspection::Mismatched
+        | ServiceRegistrationInspection::Unknown => ServiceRegistrationOutcome::EffectUnknown,
+    }
 }
 
 fn exact_service_configuration_matches(
@@ -7769,9 +7799,12 @@ fn exact_service_configuration_matches(
 }
 
 #[cfg(windows)]
-fn existing_service_matches(request: &ServiceRegistrationRequest) -> Result<bool, ()> {
+fn inspect_service_registration(
+    request: &ServiceRegistrationRequest,
+) -> ServiceRegistrationInspection {
     use std::ffi::OsStr;
     use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Foundation::ERROR_SERVICE_DOES_NOT_EXIST;
     use windows_sys::Win32::System::Services::{
         CloseServiceHandle, OpenSCManagerW, OpenServiceW, QUERY_SERVICE_CONFIGW,
         QueryServiceConfigW, SC_MANAGER_CONNECT, SERVICE_AUTO_START, SERVICE_QUERY_CONFIG,
@@ -7784,12 +7817,17 @@ fn existing_service_matches(request: &ServiceRegistrationRequest) -> Result<bool
         .collect::<Vec<_>>();
     let manager = unsafe { OpenSCManagerW(std::ptr::null(), std::ptr::null(), SC_MANAGER_CONNECT) };
     if manager.is_null() {
-        return Err(());
+        return ServiceRegistrationInspection::Unknown;
     }
     let service = unsafe { OpenServiceW(manager, name.as_ptr(), SERVICE_QUERY_CONFIG) };
     if service.is_null() {
+        let error = std::io::Error::last_os_error();
         unsafe { CloseServiceHandle(manager) };
-        return Err(());
+        return if error.raw_os_error() == Some(ERROR_SERVICE_DOES_NOT_EXIST.cast_signed()) {
+            ServiceRegistrationInspection::Absent
+        } else {
+            ServiceRegistrationInspection::Unknown
+        };
     }
 
     let mut required = 0;
@@ -7801,7 +7839,7 @@ fn existing_service_matches(request: &ServiceRegistrationRequest) -> Result<bool
             CloseServiceHandle(service);
             CloseServiceHandle(manager);
         }
-        return Err(());
+        return ServiceRegistrationInspection::Unknown;
     }
     let config_size = std::mem::size_of::<QUERY_SERVICE_CONFIGW>();
     let words = (required as usize).saturating_add(config_size - 1) / config_size;
@@ -7813,7 +7851,7 @@ fn existing_service_matches(request: &ServiceRegistrationRequest) -> Result<bool
             CloseServiceHandle(service);
             CloseServiceHandle(manager);
         }
-        return Err(());
+        return ServiceRegistrationInspection::Unknown;
     }
     let config = &buffer[0];
     let binary = service_config_string(config.lpBinaryPathName);
@@ -7829,7 +7867,23 @@ fn existing_service_matches(request: &ServiceRegistrationRequest) -> Result<bool
         CloseServiceHandle(service);
         CloseServiceHandle(manager);
     }
-    Ok(matches)
+    if !matches {
+        return ServiceRegistrationInspection::Mismatched;
+    }
+    match inspect_service(request.service_name()) {
+        PortOutcome::Known(observation)
+        | PortOutcome::Partial {
+            value: observation, ..
+        } => ServiceRegistrationInspection::Matching { observation },
+        PortOutcome::Unknown(_) | PortOutcome::Error(_) => ServiceRegistrationInspection::Unknown,
+    }
+}
+
+#[cfg(not(windows))]
+fn inspect_service_registration(
+    _request: &ServiceRegistrationRequest,
+) -> ServiceRegistrationInspection {
+    ServiceRegistrationInspection::Unknown
 }
 
 #[cfg(windows)]
@@ -9251,9 +9305,21 @@ mod tests {
 
     #[test]
     fn post_create_readback_failure_cannot_report_success() {
-        assert!(!service_readback_is_acceptable(Ok(false)));
-        assert!(!service_readback_is_acceptable(Err(())));
-        assert!(service_readback_is_acceptable(Ok(true)));
+        let observation = ServiceObservation {
+            service: handle(ELIOT_HOST_SERVICE_NAME),
+            state: ServiceState::Stopped,
+            generation: None,
+            process: None,
+        };
+        assert!(!service_readback_is_acceptable(
+            &ServiceRegistrationInspection::Mismatched
+        ));
+        assert!(!service_readback_is_acceptable(
+            &ServiceRegistrationInspection::Unknown
+        ));
+        assert!(service_readback_is_acceptable(
+            &ServiceRegistrationInspection::Matching { observation }
+        ));
     }
 
     #[test]
