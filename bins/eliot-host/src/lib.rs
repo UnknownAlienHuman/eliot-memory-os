@@ -150,7 +150,65 @@ where
 use eliot_platform_windows::{
     JobObjectIdentity, PinnedRuntimeFile, ProcessIdentity, RunningJobChild, SuspendedJobChild,
     SuspendedLaunchSpec, UserOwnedPathLease, UserOwnedRootLease, WindowsAdapterError,
+    observe_named_pipe_peer_process,
 };
+
+#[cfg(windows)]
+const KERNEL_BOOTSTRAP_ENVIRONMENT: [&str; 4] = [
+    "ELIOT_KERNEL_CONTROL_PIPE",
+    "ELIOT_HOST_PROCESS_ID",
+    "ELIOT_HOST_PROCESS_START",
+    "ELIOT_HOST_PROCESS_IMAGE",
+];
+
+#[cfg(windows)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct KernelLaunchBinding {
+    pipe_identity: PlatformHandle,
+    host_process: HostProcessBinding,
+}
+
+#[cfg(windows)]
+impl KernelLaunchBinding {
+    fn observe_current() -> Result<Self, WindowsAdapterError> {
+        let observed = observe_named_pipe_peer_process(std::process::id())?;
+        let host_process = HostProcessBinding {
+            process_id: observed.process_id(),
+            start_time_100ns: observed.start_time_100ns(),
+            image_path: observed.image_path().to_owned(),
+        };
+        host_process
+            .validate()
+            .map_err(|_| WindowsAdapterError::IdentityMismatch)?;
+        let pipe_identity = PlatformHandle::new(KERNEL_CONTROL_PIPE)
+            .map_err(|_| WindowsAdapterError::InvalidInput)?;
+        Ok(Self {
+            pipe_identity,
+            host_process,
+        })
+    }
+
+    fn validate_current(&self) -> Result<(), HostError> {
+        let observed = observe_named_pipe_peer_process(std::process::id())
+            .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+        if !self.matches_observed(
+            observed.process_id(),
+            observed.start_time_100ns(),
+            observed.image_path(),
+        ) {
+            return Err(HostError::ProcessContour(
+                "retained Host process identity changed before Kernel control".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn matches_observed(&self, process_id: u32, start_time_100ns: u64, image_path: &str) -> bool {
+        self.host_process.process_id == process_id
+            && self.host_process.start_time_100ns == start_time_100ns
+            && self.host_process.image_path == image_path
+    }
+}
 
 /// The two physical process ownership branches controlled by Host.
 #[cfg(windows)]
@@ -701,6 +759,7 @@ pub struct HostJobBranches {
     store: Option<RunningJobChild<PlatformHandle>>,
     kernel_identity: JobObjectIdentity,
     store_identity: JobObjectIdentity,
+    kernel_launch_binding: KernelLaunchBinding,
     kernel_executable: Option<PathBuf>,
     store_bridge_executable: Option<PathBuf>,
     kernel_lease: Option<LaunchLease>,
@@ -1204,11 +1263,13 @@ impl HostJobBranches {
         );
         let kernel_identity = JobObjectIdentity::new(format!("Local\\Eliot-Host-Kernel-{suffix}"))?;
         let store_identity = JobObjectIdentity::new(format!("Local\\Eliot-Host-Store-{suffix}"))?;
+        let kernel_launch_binding = KernelLaunchBinding::observe_current()?;
         Ok(Self {
             kernel: None,
             store: None,
             kernel_identity,
             store_identity,
+            kernel_launch_binding,
             kernel_executable: None,
             store_bridge_executable: None,
             kernel_lease: None,
@@ -1231,27 +1292,40 @@ impl HostJobBranches {
         })
     }
 
-    fn environment(
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "each value is an explicit launch-authority binding; ambient input is injectable only for scrub tests"
+    )]
+    fn environment_from<I>(
+        ambient: I,
         host: &HostInstallationEpoch,
         generation: &PlatformHandle,
         config_digest: &PlatformHandle,
         artifact: &PlatformHandle,
         config_path: &Path,
         job_identity: &JobObjectIdentity,
-    ) -> Vec<(OsString, OsString)> {
-        let mut environment = std::env::vars_os()
+        kernel_launch_binding: Option<&KernelLaunchBinding>,
+    ) -> Vec<(OsString, OsString)>
+    where
+        I: IntoIterator<Item = (OsString, OsString)>,
+    {
+        let mut environment = ambient
+            .into_iter()
             .filter(|(key, _)| {
-                !matches!(
-                    key.to_string_lossy().as_ref(),
-                    "ELIOT_APPROVED_GENERATION"
-                        | "ELIOT_GENERATION_CONFIG_DIGEST"
-                        | "ELIOT_APPROVED_ARTIFACT"
-                        | "ELIOT_GENERATION_CONFIG_PATH"
-                        | "ELIOT_HOST_INSTALLATION"
-                        | "ELIOT_HOST_EPOCH"
-                        | "ELIOT_ACTIVATION_NONCE"
-                        | "ELIOT_JOB_OBJECT_ID"
-                )
+                let key = key.to_string_lossy();
+                ![
+                    "ELIOT_APPROVED_GENERATION",
+                    "ELIOT_GENERATION_CONFIG_DIGEST",
+                    "ELIOT_APPROVED_ARTIFACT",
+                    "ELIOT_GENERATION_CONFIG_PATH",
+                    "ELIOT_HOST_INSTALLATION",
+                    "ELIOT_HOST_EPOCH",
+                    "ELIOT_ACTIVATION_NONCE",
+                    "ELIOT_JOB_OBJECT_ID",
+                ]
+                .into_iter()
+                .chain(KERNEL_BOOTSTRAP_ENVIRONMENT)
+                .any(|reserved| key.eq_ignore_ascii_case(reserved))
             })
             .collect::<Vec<_>>();
         environment.extend([
@@ -1284,7 +1358,48 @@ impl HostJobBranches {
                 OsString::from(job_identity.name()),
             ),
         ]);
+        if let Some(binding) = kernel_launch_binding {
+            environment.extend([
+                (
+                    OsString::from(KERNEL_BOOTSTRAP_ENVIRONMENT[0]),
+                    OsString::from(binding.pipe_identity.as_str()),
+                ),
+                (
+                    OsString::from(KERNEL_BOOTSTRAP_ENVIRONMENT[1]),
+                    OsString::from(binding.host_process.process_id.to_string()),
+                ),
+                (
+                    OsString::from(KERNEL_BOOTSTRAP_ENVIRONMENT[2]),
+                    OsString::from(binding.host_process.start_time_100ns.to_string()),
+                ),
+                (
+                    OsString::from(KERNEL_BOOTSTRAP_ENVIRONMENT[3]),
+                    OsString::from(&binding.host_process.image_path),
+                ),
+            ]);
+        }
         environment
+    }
+
+    fn environment(
+        host: &HostInstallationEpoch,
+        generation: &PlatformHandle,
+        config_digest: &PlatformHandle,
+        artifact: &PlatformHandle,
+        config_path: &Path,
+        job_identity: &JobObjectIdentity,
+        kernel_launch_binding: Option<&KernelLaunchBinding>,
+    ) -> Vec<(OsString, OsString)> {
+        Self::environment_from(
+            std::env::vars_os(),
+            host,
+            generation,
+            config_digest,
+            artifact,
+            config_path,
+            job_identity,
+            kernel_launch_binding,
+        )
     }
 
     /// Completes the authenticated Host↔Kernel lifecycle before Host
@@ -1358,19 +1473,7 @@ impl HostJobBranches {
         // Kernel authenticates the connected Host peer against this exact
         // value, so it is read from the live current-process handle. A PID
         // alone would not make PID reuse or image substitution observable.
-        let platform = WindowsPlatform::new(PathBuf::from(launch.kernel_work_root.as_str()))
-            .map_err(|error| HostError::ProcessContour(error.to_string()))?;
-        let host_identity = platform
-            .process_identity(std::process::id())
-            .map_err(|error| HostError::ProcessContour(error.to_string()))?;
-        let host_process = HostProcessBinding {
-            process_id: host_identity.process_id,
-            start_time_100ns: host_identity.start_time_100ns,
-            image_path: host_identity.image_path.clone(),
-        };
-        host_process
-            .validate()
-            .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+        self.kernel_launch_binding.validate_current()?;
         // Inert projection of the Host-retained Kernel Job. It grants nothing:
         // Kernel must reopen the named Job and re-observe its own root
         // membership before it will author readiness.
@@ -1392,9 +1495,8 @@ impl HostJobBranches {
             config_hash: config_digest.clone(),
             job_object_id: PlatformHandle::new(kernel.job_identity().name())
                 .map_err(|error| HostError::ProcessContour(error.to_string()))?,
-            pipe_identity: PlatformHandle::new(KERNEL_CONTROL_PIPE)
-                .map_err(|error| HostError::ProcessContour(error.to_string()))?,
-            host_process,
+            pipe_identity: self.kernel_launch_binding.pipe_identity.clone(),
+            host_process: self.kernel_launch_binding.host_process.clone(),
             job_binding,
             restart_budget: RestartBudget::new(3, 3)
                 .map_err(|error| HostError::ProcessContour(error.to_string()))?,
@@ -1900,6 +2002,7 @@ impl HostJobBranches {
         host: &HostInstallationEpoch,
         arguments: &[eliot_platform::PlatformHandle],
         working_directory: &Path,
+        kernel_launch_binding: Option<&KernelLaunchBinding>,
     ) -> Result<RunningJobChild<PlatformHandle>, HostError> {
         if executable_lease.path() != executable || config_lease.path() != config_path {
             return Err(HostError::ProcessContour(
@@ -1963,6 +2066,7 @@ impl HostJobBranches {
                 artifact,
                 config_path,
                 identity,
+                kernel_launch_binding,
             ),
         )
         .map_err(|error| HostError::ProcessContour(error.to_string()))?;
@@ -2163,6 +2267,7 @@ impl HostJobBranches {
                     host,
                     &launch.store_bridge_arguments,
                     &working_directory,
+                    None,
                 )
             },
             |store| -> Result<(), StoreLivenessEvidence> {
@@ -2198,6 +2303,7 @@ impl HostJobBranches {
                     host,
                     &launch.kernel_arguments,
                     &working_directory,
+                    Some(&self.kernel_launch_binding),
                 )
             },
             |mut store| {
@@ -2350,6 +2456,7 @@ impl HostJobBranches {
                     .kernel_work_root
                     .as_str(),
             ),
+            Some(&self.kernel_launch_binding),
         )?;
         Ok(child)
     }
@@ -2411,6 +2518,7 @@ impl HostJobBranches {
                     .kernel_work_root
                     .as_str(),
             ),
+            None,
         )?;
         Ok(child)
     }
@@ -6146,13 +6254,19 @@ mod journal_tests {
 #[cfg(all(test, windows))]
 mod tests {
     use std::cell::RefCell;
+    use std::collections::BTreeMap;
+    use std::ffi::OsString;
+    use std::path::Path;
 
     use super::{
-        CutoverLaunchOutcome, HostBranchDisposition, HostError, KernelControlResponse,
-        KernelServiceState, PlatformHandle, ReconciliationObservation, ReconciliationState,
-        StoreKernelLaunchError, StoreLivenessEvidence, activation_response_or_reconcile,
+        CutoverLaunchOutcome, HostBranchDisposition, HostError, HostJobBranches,
+        HostProcessBinding, KERNEL_BOOTSTRAP_ENVIRONMENT, KERNEL_CONTROL_PIPE,
+        KernelControlResponse, KernelLaunchBinding, KernelServiceState, PlatformHandle,
+        ReconciliationObservation, ReconciliationState, StoreKernelLaunchError,
+        StoreLivenessEvidence, activation_response_or_reconcile, fresh_host_epoch,
         launch_store_then_kernel, reconcile_state_machine,
     };
+    use eliot_platform_windows::JobObjectIdentity;
 
     #[derive(Debug, Eq, PartialEq)]
     struct MockChild {
@@ -6165,6 +6279,119 @@ mod tests {
             Some(child) if child.live => ReconciliationObservation::Live,
             Some(_) | None => ReconciliationObservation::Dead,
         }
+    }
+
+    fn launch_environment(kernel: Option<&KernelLaunchBinding>) -> BTreeMap<String, String> {
+        let host = fresh_host_epoch(
+            PlatformHandle::new("launch-test-installation").expect("installation"),
+            None,
+        )
+        .expect("host epoch");
+        HostJobBranches::environment_from(
+            [
+                (OsString::from("Path"), OsString::from(r"C:\\Windows")),
+                (
+                    OsString::from("eliot_kernel_control_pipe"),
+                    OsString::from("ambient-pipe"),
+                ),
+                (
+                    OsString::from("ELIOT_HOST_PROCESS_ID"),
+                    OsString::from("999"),
+                ),
+                (
+                    OsString::from("eliot_host_process_start"),
+                    OsString::from("888"),
+                ),
+                (
+                    OsString::from("ELIOT_HOST_PROCESS_IMAGE"),
+                    OsString::from("ambient.exe"),
+                ),
+                (
+                    OsString::from("ELIOT_ACTIVATION_NONCE"),
+                    OsString::from("must-not-cross-process-boundary"),
+                ),
+            ],
+            &host,
+            &PlatformHandle::new("generation").expect("generation"),
+            &PlatformHandle::new("config-digest").expect("config"),
+            &PlatformHandle::new("artifact-digest").expect("artifact"),
+            Path::new(r"C:\\eliot\\config.json"),
+            &JobObjectIdentity::new(r"Local\Eliot-Host-Test").expect("job"),
+            kernel,
+        )
+        .into_iter()
+        .map(|(key, value)| {
+            (
+                key.to_string_lossy().into_owned(),
+                value.to_string_lossy().into_owned(),
+            )
+        })
+        .collect()
+    }
+
+    #[test]
+    fn store_and_unrelated_child_environment_scrubs_kernel_bootstrap_authority() {
+        let environment = launch_environment(None);
+        assert_eq!(
+            environment.get("Path").map(String::as_str),
+            Some(r"C:\\Windows")
+        );
+        for name in KERNEL_BOOTSTRAP_ENVIRONMENT {
+            assert!(!environment.keys().any(|key| key.eq_ignore_ascii_case(name)));
+        }
+        assert!(!environment.contains_key("ELIOT_ACTIVATION_NONCE"));
+    }
+
+    #[test]
+    fn kernel_launch_environment_uses_exact_retained_binding() {
+        let binding = KernelLaunchBinding {
+            pipe_identity: PlatformHandle::new(KERNEL_CONTROL_PIPE).expect("pipe"),
+            host_process: HostProcessBinding {
+                process_id: 41,
+                start_time_100ns: 73,
+                image_path: r"C:\\eliot\\eliot-host.exe".to_owned(),
+            },
+        };
+        let environment = launch_environment(Some(&binding));
+        assert_eq!(
+            environment
+                .get("ELIOT_KERNEL_CONTROL_PIPE")
+                .map(String::as_str),
+            Some(KERNEL_CONTROL_PIPE)
+        );
+        assert_eq!(
+            environment.get("ELIOT_HOST_PROCESS_ID").map(String::as_str),
+            Some("41")
+        );
+        assert_eq!(
+            environment
+                .get("ELIOT_HOST_PROCESS_START")
+                .map(String::as_str),
+            Some("73")
+        );
+        assert_eq!(
+            environment
+                .get("ELIOT_HOST_PROCESS_IMAGE")
+                .map(String::as_str),
+            Some(r"C:\\eliot\\eliot-host.exe")
+        );
+        assert!(!environment.contains_key("ELIOT_ACTIVATION_NONCE"));
+    }
+
+    #[test]
+    fn retained_host_binding_rejects_pid_reuse_and_image_substitution() {
+        let binding = KernelLaunchBinding {
+            pipe_identity: PlatformHandle::new(KERNEL_CONTROL_PIPE).expect("pipe"),
+            host_process: HostProcessBinding {
+                process_id: 41,
+                start_time_100ns: 73,
+                image_path: r"C:\\eliot\\eliot-host.exe".to_owned(),
+            },
+        };
+        assert!(binding.matches_observed(41, 73, r"C:\\eliot\\eliot-host.exe"));
+        assert!(!binding.matches_observed(42, 73, r"C:\\eliot\\eliot-host.exe"));
+        assert!(!binding.matches_observed(41, 74, r"C:\\eliot\\eliot-host.exe"));
+        assert!(!binding.matches_observed(41, 73, r"C:\\eliot\\replacement.exe"));
     }
 
     #[test]

@@ -7,7 +7,7 @@ use eliot_kernel::{AuthorityDescriptorContour, KernelBuildError, KernelCompositi
 use eliot_kernel_service::HostStoreBootstrapRequirement;
 #[cfg(windows)]
 use eliot_kernel_service::{
-    KernelControlCommand, control_response_frame, decode_control_request_frame,
+    KERNEL_CONTROL_PIPE, KernelControlCommand, control_response_frame, decode_control_request_frame,
 };
 
 #[cfg(windows)]
@@ -28,9 +28,90 @@ use tokio::task::JoinSet;
 use eliot_contracts::sha256_hex;
 #[cfg(windows)]
 use eliot_platform_windows::{
-    ProtectedPathLease, UserOwnedPathLease, UserOwnedRootLease,
+    NamedPipePeerProcessBinding, ProtectedPathLease, UserOwnedPathLease, UserOwnedRootLease,
     current_process_named_pipe_expectation, observe_named_pipe_peer_process,
 };
+
+#[cfg(windows)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct KernelStartupBinding {
+    control_pipe: String,
+    host_process_id: u32,
+    host_process_start: u64,
+    host_process_image: String,
+}
+
+#[cfg(windows)]
+impl KernelStartupBinding {
+    fn from_environment() -> Result<Self, String> {
+        Self::parse(
+            std::env::var("ELIOT_KERNEL_CONTROL_PIPE").ok(),
+            std::env::var("ELIOT_HOST_PROCESS_ID").ok(),
+            std::env::var("ELIOT_HOST_PROCESS_START").ok(),
+            std::env::var("ELIOT_HOST_PROCESS_IMAGE").ok(),
+        )
+    }
+
+    fn parse(
+        control_pipe: Option<String>,
+        host_process_id: Option<String>,
+        host_process_start: Option<String>,
+        host_process_image: Option<String>,
+    ) -> Result<Self, String> {
+        let control_pipe = control_pipe
+            .filter(|pipe| pipe == KERNEL_CONTROL_PIPE)
+            .ok_or_else(|| {
+                "Host launch context did not inject the exact Kernel control pipe".to_owned()
+            })?;
+        let host_process_id = host_process_id
+            .and_then(|value| value.parse::<u32>().ok())
+            .filter(|value| *value != 0)
+            .ok_or_else(|| {
+                "Host launch context did not inject a valid Host process binding".to_owned()
+            })?;
+        let host_process_start = host_process_start
+            .and_then(|value| value.parse::<u64>().ok())
+            .filter(|value| *value != 0)
+            .ok_or_else(|| {
+                "Host launch context did not inject a valid Host process start time".to_owned()
+            })?;
+        let host_process_image = host_process_image
+            .filter(|image| {
+                !image.trim().is_empty()
+                    && image == image.trim()
+                    && !image.chars().any(char::is_control)
+                    && Path::new(image).is_absolute()
+            })
+            .ok_or_else(|| {
+                "Host launch context did not inject a canonical Host process image".to_owned()
+            })?;
+        Ok(Self {
+            control_pipe,
+            host_process_id,
+            host_process_start,
+            host_process_image,
+        })
+    }
+
+    fn observe_host(&self) -> Result<NamedPipePeerProcessBinding, String> {
+        let observed = observe_named_pipe_peer_process(self.host_process_id)
+            .map_err(|error| error.to_string())?;
+        if !self.matches_observed(
+            observed.process_id(),
+            observed.start_time_100ns(),
+            observed.image_path(),
+        ) {
+            return Err("live Host process binding changed before Kernel admission".to_owned());
+        }
+        Ok(observed)
+    }
+
+    fn matches_observed(&self, process_id: u32, start_time_100ns: u64, image_path: &str) -> bool {
+        self.host_process_id == process_id
+            && self.host_process_start == start_time_100ns
+            && self.host_process_image == image_path
+    }
+}
 
 /// Keeps startup, authenticated listener rotation, and fenced shutdown in one
 /// ordered authority path.
@@ -41,17 +122,20 @@ async fn main() {
         Ok(options) => options,
         Err(error) => exit_error("INVALID_CONFIGURATION", &error.to_string()),
     };
+    #[cfg(windows)]
+    let startup_binding = match KernelStartupBinding::from_environment() {
+        Ok(binding) => binding,
+        Err(error) => exit_error("PRINCIPAL_FAILURE", &error),
+    };
     let prepared_store = match prepare_store_bootstrap(&options) {
         Ok(prepared) => prepared,
         Err(error) => exit_error("INVALID_STORE_BOOTSTRAP", &error),
     };
     let mut kernel_config = KernelConfig::new(options.work_root.clone());
-    let Ok(pipe_name) = std::env::var("ELIOT_KERNEL_CONTROL_PIPE") else {
-        exit_error(
-            "INVALID_CONFIGURATION",
-            "Host launch context did not inject the generation-specific Kernel control pipe",
-        );
-    };
+    #[cfg(windows)]
+    let pipe_name = startup_binding.control_pipe.clone();
+    #[cfg(not(windows))]
+    let pipe_name = std::env::var("ELIOT_KERNEL_CONTROL_PIPE").unwrap_or_default();
     kernel_config = kernel_config.with_pipe_name(pipe_name);
     if let Some(prepared) = &prepared_store {
         kernel_config = kernel_config.with_store_bootstrap(prepared.requirement.clone());
@@ -97,45 +181,10 @@ async fn main() {
                 exit_error("STORE_UNAVAILABLE", "canonical Store did not become ready");
             }
         }
-        let host_pid = match std::env::var("ELIOT_HOST_PROCESS_ID")
-            .ok()
-            .and_then(|value| value.parse::<u32>().ok())
-        {
-            Some(pid) if pid != 0 => pid,
-            _ => exit_error(
-                "PRINCIPAL_FAILURE",
-                "Host launch context did not inject a valid Host process binding",
-            ),
-        };
-        let host_start = match std::env::var("ELIOT_HOST_PROCESS_START")
-            .ok()
-            .and_then(|value| value.parse::<u64>().ok())
-        {
-            Some(start) if start != 0 => start,
-            _ => exit_error(
-                "PRINCIPAL_FAILURE",
-                "Host launch context did not inject a valid Host process start time",
-            ),
-        };
-        let host_image = match std::env::var("ELIOT_HOST_PROCESS_IMAGE") {
-            Ok(image) if !image.trim().is_empty() => image,
-            _ => exit_error(
-                "PRINCIPAL_FAILURE",
-                "Host launch context did not inject a Host process image",
-            ),
-        };
-        let observed_host = match observe_named_pipe_peer_process(host_pid) {
+        let observed_host = match startup_binding.observe_host() {
             Ok(binding) => binding,
-            Err(error) => exit_error("PRINCIPAL_FAILURE", &error.to_string()),
+            Err(error) => exit_error("PRINCIPAL_FAILURE", &error),
         };
-        if observed_host.start_time_100ns() != host_start
-            || observed_host.image_path() != host_image
-        {
-            exit_error(
-                "PRINCIPAL_FAILURE",
-                "live Host process binding changed before Kernel admission",
-            );
-        }
         let principal = match current_process_named_pipe_expectation()
             .and_then(|expectation| expectation.with_process_binding(observed_host))
         {
@@ -654,5 +703,91 @@ mod tests {
         let mut duplicate = valid;
         duplicate[6] = "--store-bootstrap".into();
         assert!(parse_launch_options(duplicate).is_err());
+    }
+
+    #[cfg(windows)]
+    fn exact_startup_binding() -> KernelStartupBinding {
+        KernelStartupBinding::parse(
+            Some(KERNEL_CONTROL_PIPE.to_owned()),
+            Some("41".to_owned()),
+            Some("73".to_owned()),
+            Some(r"C:\eliot\eliot-host.exe".to_owned()),
+        )
+        .expect("exact startup binding")
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn kernel_startup_binding_requires_every_exact_launch_value() {
+        let exact = [
+            Some(KERNEL_CONTROL_PIPE.to_owned()),
+            Some("41".to_owned()),
+            Some("73".to_owned()),
+            Some(r"C:\eliot\eliot-host.exe".to_owned()),
+        ];
+        for missing in 0..exact.len() {
+            let mut values = exact.clone();
+            values[missing] = None;
+            assert!(
+                KernelStartupBinding::parse(
+                    values[0].clone(),
+                    values[1].clone(),
+                    values[2].clone(),
+                    values[3].clone(),
+                )
+                .is_err()
+            );
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn kernel_startup_binding_rejects_substituted_pipe_pid_start_and_image() {
+        assert!(
+            KernelStartupBinding::parse(
+                Some(r"\\.\pipe\eliot\kernel\substitute".to_owned()),
+                Some("41".to_owned()),
+                Some("73".to_owned()),
+                Some(r"C:\eliot\eliot-host.exe".to_owned()),
+            )
+            .is_err()
+        );
+        assert!(
+            KernelStartupBinding::parse(
+                Some(KERNEL_CONTROL_PIPE.to_owned()),
+                Some("0".to_owned()),
+                Some("73".to_owned()),
+                Some(r"C:\eliot\eliot-host.exe".to_owned()),
+            )
+            .is_err()
+        );
+        assert!(
+            KernelStartupBinding::parse(
+                Some(KERNEL_CONTROL_PIPE.to_owned()),
+                Some("41".to_owned()),
+                Some("0".to_owned()),
+                Some(r"C:\eliot\eliot-host.exe".to_owned()),
+            )
+            .is_err()
+        );
+        assert!(
+            KernelStartupBinding::parse(
+                Some(KERNEL_CONTROL_PIPE.to_owned()),
+                Some("41".to_owned()),
+                Some("73".to_owned()),
+                Some("eliot-host.exe".to_owned()),
+            )
+            .is_err()
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn kernel_startup_binding_rejects_pid_reuse_and_image_substitution() {
+        let binding = exact_startup_binding();
+        assert!(binding.matches_observed(41, 73, r"C:\eliot\eliot-host.exe"));
+        assert!(!binding.matches_observed(42, 73, r"C:\eliot\eliot-host.exe"));
+        assert!(!binding.matches_observed(41, 74, r"C:\eliot\eliot-host.exe"));
+        assert!(!binding.matches_observed(41, 73, r"C:\eliot\replacement.exe"));
     }
 }
