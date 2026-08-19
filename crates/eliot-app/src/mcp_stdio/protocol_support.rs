@@ -108,6 +108,10 @@ fn agent_candidate_schema() -> Value {
     eliot_types::agent_candidate_input_schema()
 }
 
+fn observe_schema() -> Value {
+    eliot_types::observe_input_schema()
+}
+
 fn understanding_proof_schema() -> Value {
     json_schema(
         &[

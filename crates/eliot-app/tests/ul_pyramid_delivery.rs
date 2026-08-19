@@ -689,7 +689,9 @@ fn cue(value: &str) -> Vec<CueBinding> {
         cue_value: value.to_owned(),
         match_mode: CueMatchMode::Exact,
         strength: CueStrength::Primary,
-        expected_reuse_note: "when working in this subsystem or its boundary paths".to_owned(),
+        expected_reuse_note: Some(
+            "when working in this subsystem or its boundary paths".to_owned(),
+        ),
     }]
 }
 

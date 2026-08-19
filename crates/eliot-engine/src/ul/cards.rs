@@ -373,7 +373,7 @@ fn file_binding(path: &str, strength: CueStrength) -> CueBinding {
         cue_value: path.to_owned(),
         match_mode: CueMatchMode::Exact,
         strength,
-        expected_reuse_note: EXPECTED_REUSE_NOTE.to_owned(),
+        expected_reuse_note: Some(EXPECTED_REUSE_NOTE.to_owned()),
     }
 }
 

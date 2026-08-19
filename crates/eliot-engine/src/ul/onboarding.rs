@@ -783,7 +783,7 @@ fn concept_cues<'a>(
         cue_value: name.to_owned(),
         match_mode: CueMatchMode::Exact,
         strength: CueStrength::Primary,
-        expected_reuse_note: EXPECTED_REUSE_NOTE.to_owned(),
+        expected_reuse_note: Some(EXPECTED_REUSE_NOTE.to_owned()),
     }];
     bindings.extend(
         boundaries
@@ -795,7 +795,7 @@ fn concept_cues<'a>(
                 cue_value: boundary.clone(),
                 match_mode: CueMatchMode::Prefix,
                 strength: CueStrength::Primary,
-                expected_reuse_note: EXPECTED_REUSE_NOTE.to_owned(),
+                expected_reuse_note: Some(EXPECTED_REUSE_NOTE.to_owned()),
             }),
     );
     bindings.extend(hotspots.take(3).map(|path| CueBinding {
@@ -803,7 +803,7 @@ fn concept_cues<'a>(
         cue_value: path.to_owned(),
         match_mode: CueMatchMode::Exact,
         strength: CueStrength::Secondary,
-        expected_reuse_note: EXPECTED_REUSE_NOTE.to_owned(),
+        expected_reuse_note: Some(EXPECTED_REUSE_NOTE.to_owned()),
     }));
     normalize_bindings(bindings, None)
         .map_err(|error| EngineError::WriteRejected(error.to_string()))

@@ -44,7 +44,7 @@ async fn t03_candidate_persists_normalized_bindings() -> TestResult {
             cue_value: r"Crates\Eliot-Store\src\LIB.rs".to_owned(),
             match_mode: CueMatchMode::Exact,
             strength: CueStrength::Primary,
-            expected_reuse_note: "Reuse for canonical store edits.".to_owned(),
+            expected_reuse_note: Some("Reuse for canonical store edits.".to_owned()),
         }],
         auto_bind: None,
         expected_reuse_note: "Reuse when the canonical store is active.".to_owned(),

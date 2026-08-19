@@ -755,6 +755,7 @@ pub(super) async fn dispatch_tool(
         "eliot_agent_candidate_submit" => {
             Box::pin(dispatch_agent_candidate_submit(state, context, arguments)).await?
         }
+        "eliot.observe" => Box::pin(dispatch_observe(state, context, arguments)).await?,
         "eliot_task_verification_run" => {
             Box::pin(dispatch_task_verification_run(state, context, arguments)).await?
         }

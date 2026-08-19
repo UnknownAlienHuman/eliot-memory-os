@@ -516,7 +516,7 @@ fn source(
             cue_value: path.to_owned(),
             match_mode: CueMatchMode::Exact,
             strength: CueStrength::Primary,
-            expected_reuse_note: "fixture".to_owned(),
+            expected_reuse_note: Some("fixture".to_owned()),
         }],
         negative_memory,
         lifecycle: "active".to_owned(),

@@ -10,9 +10,9 @@ use super::{
     action_lease_status_schema, action_plan_schema, agent_candidate_schema, blackboard_ack_schema,
     blackboard_add_schema, codecortex_scan_schema, cognitive_record_schema, compile_packet_schema,
     json_schema, mailbox_ack_schema, mailbox_send_schema, memory_influence_trace_schema,
-    patch_apply_schema, tool, understanding_proof_schema, work_claim_schema, work_create_schema,
-    work_lease_schema, work_status_schema, worktree_create_schema, worktree_lease_schema,
-    worktree_review_schema, worktree_status_schema,
+    observe_schema, patch_apply_schema, tool, understanding_proof_schema, work_claim_schema,
+    work_create_schema, work_lease_schema, work_status_schema, worktree_create_schema,
+    worktree_lease_schema, worktree_review_schema, worktree_status_schema,
 };
 use anyhow::{Context as _, Result};
 use eliot_types::{ClaudeSurface, ProviderMcpToolProfileBinding};
@@ -628,7 +628,10 @@ pub(crate) fn tool_definitions_for_profile(profile: McpAccessProfile) -> Vec<Val
                     "idempotentHint": true,
                     "openWorldHint": false
                 });
-            } else if name == "eliot_agent_candidate_submit" {
+            } else if matches!(
+                name.as_str(),
+                "eliot_agent_candidate_submit" | "eliot.observe"
+            ) {
                 definition["annotations"] = json!({
                     "readOnlyHint": false,
                     "destructiveHint": false,
@@ -1114,6 +1117,12 @@ pub(super) fn task_tool_definitions() -> Vec<Value> {
             "Eliot Agent Candidate Submit",
             "Save a lesson/decision/failure to memory. Use after solving anything non-obvious or failing. Needs: statement, kind, expected_reuse_note (bindings auto from your session). Returns: handle.",
             &agent_candidate_schema(),
+        ),
+        tool(
+            "eliot.observe",
+            "Eliot Observe",
+            "Capture an observation, decision, failure, or outcome as candidate-only memory; automatic cue binding is best effort and task-unbound captures remain cold.",
+            &observe_schema(),
         ),
         tool(
             "eliot_write_cognitive_observation",

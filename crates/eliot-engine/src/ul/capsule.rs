@@ -979,7 +979,7 @@ fn target_cues(value: &str) -> Result<Vec<CueBinding>, EngineError> {
             cue_value: value.to_owned(),
             match_mode: CueMatchMode::Exact,
             strength: CueStrength::Primary,
-            expected_reuse_note: "when orienting to this project".to_owned(),
+            expected_reuse_note: Some("when orienting to this project".to_owned()),
         }],
         None,
     )

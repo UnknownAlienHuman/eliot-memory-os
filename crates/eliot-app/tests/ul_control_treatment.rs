@@ -783,7 +783,7 @@ fn failure_command(project_id: ProjectId) -> SemanticCommand {
                 cue_value: "src/net/session.rs".to_owned(),
                 match_mode: CueMatchMode::Exact,
                 strength: CueStrength::Primary,
-                expected_reuse_note: "reuse when this exact file is touched".to_owned(),
+                expected_reuse_note: Some("reuse when this exact file is touched".to_owned()),
             }]
         }),
     })
@@ -813,7 +813,7 @@ fn claim_command(project_id: ProjectId, claim_id: ClaimId) -> SemanticCommand {
                     cue_value: "src/net/session.rs".to_owned(),
                     match_mode: CueMatchMode::Exact,
                     strength: CueStrength::Primary,
-                    expected_reuse_note: "reuse when this exact file is touched".to_owned(),
+                    expected_reuse_note: Some("reuse when this exact file is touched".to_owned()),
                 }],
                 "normal_claim_payload": "must be suppressed in handles-only mode"
             }),
@@ -841,7 +841,7 @@ fn seed_invariant_capsule(prepared: &mut PreparedHarness, project_id: ProjectId)
             cue_value: "invariant-subsystem".to_owned(),
             match_mode: CueMatchMode::Exact,
             strength: CueStrength::Primary,
-            expected_reuse_note: "reuse for invariant subsystem work".to_owned(),
+            expected_reuse_note: Some("reuse for invariant subsystem work".to_owned()),
         }],
         source_refs: Vec::new(),
     };
@@ -861,7 +861,7 @@ fn seed_invariant_capsule(prepared: &mut PreparedHarness, project_id: ProjectId)
             cue_value: "src/invariant/lib.rs".to_owned(),
             match_mode: CueMatchMode::Exact,
             strength: CueStrength::Primary,
-            expected_reuse_note: "reuse for the invariant entrypoint".to_owned(),
+            expected_reuse_note: Some("reuse for the invariant entrypoint".to_owned()),
         }],
         source_refs: Vec::new(),
     };

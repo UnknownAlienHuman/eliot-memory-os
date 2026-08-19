@@ -810,7 +810,9 @@ fn failure_command(project_id: ProjectId, fingerprint: &str) -> SemanticCommand 
                 cue_value: "src/net/session.rs".to_owned(),
                 match_mode: CueMatchMode::Exact,
                 strength: CueStrength::Primary,
-                expected_reuse_note: "Reuse when the network session path is touched.".to_owned(),
+                expected_reuse_note: Some(
+                    "Reuse when the network session path is touched.".to_owned(),
+                ),
             }]
         }),
     })

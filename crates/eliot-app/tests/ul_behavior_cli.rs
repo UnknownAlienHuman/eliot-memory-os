@@ -320,7 +320,7 @@ fn replay_card(project_id: ProjectId, index: usize) -> ModuleCard {
             cue_value: format!("src/module-{index:03}.rs"),
             match_mode: CueMatchMode::Exact,
             strength: CueStrength::Primary,
-            expected_reuse_note: "when editing this deterministic replay module".to_owned(),
+            expected_reuse_note: Some("when editing this deterministic replay module".to_owned()),
         }],
         build_fingerprint: format!("h5-fingerprint-{index:03}"),
         dependency_manifest: eliot_types::DependencyManifest::default(),
@@ -374,7 +374,7 @@ fn failure_command(project_id: ProjectId, path: &str, source_revision: u64) -> S
                 match_mode: CueMatchMode::Exact,
                 strength: CueStrength::Primary,
                 expected_reuse_note:
-                    "when editing this module or investigating its failures".to_owned(),
+                    Some("when editing this module or investigating its failures".to_owned()),
             }],
         }),
     })

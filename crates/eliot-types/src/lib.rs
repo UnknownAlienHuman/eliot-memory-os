@@ -230,8 +230,9 @@ pub use lifecycle::{
 };
 pub use mcp_contract::{
     AgentCandidateCurationInput, AgentCandidateSubmitInput, CompilePacketToolInput, InvalidField,
-    ToolInputError, ToolInputErrorData, agent_candidate_input_schema, compile_packet_input_schema,
-    compile_packet_minimal_example,
+    OBSERVE_INPUT_SCHEMA_VERSION, ObserveHint, ObserveInput, ToolInputError, ToolInputErrorData,
+    agent_candidate_input_schema, compile_packet_input_schema, compile_packet_minimal_example,
+    observe_input_schema,
 };
 pub use memory::{
     ActionKind, ActionLease, ActionLeaseRecord, ActionProvenanceSet, ActionRequest, ActionScope,
@@ -422,10 +423,11 @@ pub use ul::cross_agent::{
     ul_cross_agent_dispatch_decision,
 };
 pub use ul::cue::{
-    CueBinding, CueBindingError, CueBindingPage, CueIndexRow, CueKind, CueMatchMode,
-    CueRecordSource, CueStrength, MAX_CUE_BINDING_PAGE_BYTES, MAX_CUE_BINDINGS_PER_PAGE,
-    cue_binding_page_id, cue_binding_page_set_hash, cue_row_id, normalize_binding,
-    normalize_binding_pages, normalize_bindings, ul_token_estimate,
+    CUE_BINDING_PAGE_SCHEMA_VERSION_V1, CUE_BINDING_PAGE_SCHEMA_VERSION_V2, CueBinding,
+    CueBindingError, CueBindingPage, CueIndexRow, CueKind, CueMatchMode, CueRecordSource,
+    CueStrength, MAX_CUE_BINDING_PAGE_BYTES, MAX_CUE_BINDINGS_PER_PAGE, cue_binding_page_id,
+    cue_binding_page_set_hash, cue_row_id, normalize_binding, normalize_binding_pages,
+    normalize_bindings, ul_token_estimate,
 };
 pub use ul::dependency::{
     UlArtifactDirtyState, UlDependencyKind, UlDependencyRebuildReport, UlDependencyRef,

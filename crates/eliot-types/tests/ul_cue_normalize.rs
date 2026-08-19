@@ -1,7 +1,9 @@
 use eliot_types::{
-    AgentCandidateSubmitInput, CueBinding, CueKind, CueMatchMode, CueStrength,
-    agent_candidate_input_schema, command_pattern, error_signature, normalize_path,
-    normalize_query_tokens, path_matches_boundary,
+    AgentCandidateSubmitInput, BlobRef, CUE_BINDING_PAGE_SCHEMA_VERSION_V1,
+    CUE_BINDING_PAGE_SCHEMA_VERSION_V2, CueBinding, CueKind, CueMatchMode, CueStrength,
+    ObserveInput, agent_candidate_input_schema, command_pattern, cue_binding_page_id,
+    error_signature, normalize_binding, normalize_binding_pages, normalize_path,
+    normalize_query_tokens, observe_input_schema, path_matches_boundary,
 };
 use serde_json::{Value, json};
 use std::fs;
@@ -127,7 +129,7 @@ fn t03_candidate_schema_roundtrip() -> Result<(), Box<dyn std::error::Error>> {
             cue_value: "crates/eliot-store/src/lib.rs".to_owned(),
             match_mode: CueMatchMode::Exact,
             strength: CueStrength::Primary,
-            expected_reuse_note: "Reuse for canonical store changes.".to_owned(),
+            expected_reuse_note: Some("Reuse for canonical store changes.".to_owned()),
         }],
         auto_bind: None,
         expected_reuse_note: "Reuse when the canonical store is in scope.".to_owned(),
@@ -141,9 +143,129 @@ fn t03_candidate_schema_roundtrip() -> Result<(), Box<dyn std::error::Error>> {
         .ok_or("candidate schema omitted required")?;
     assert!(!required.contains(&json!("cue_bindings")));
     assert!(required.contains(&json!("expected_reuse_note")));
+    let Some(cue_binding) = schema
+        .get("$defs")
+        .or_else(|| schema.get("definitions"))
+        .and_then(Value::as_object)
+        .and_then(|definitions| definitions.get("CueBinding"))
+    else {
+        return Err("legacy schema omitted CueBinding definition".into());
+    };
+    assert!(
+        cue_binding["required"]
+            .as_array()
+            .is_some_and(|required| required.contains(&json!("expected_reuse_note")))
+    );
     assert_eq!(
         serde_json::from_value::<AgentCandidateSubmitInput>(value)?,
         input
+    );
+    Ok(())
+}
+
+#[test]
+fn canonical_observe_optional_note_keeps_legacy_some_and_uses_v2_for_none()
+-> Result<(), Box<dyn std::error::Error>> {
+    let observe: ObserveInput = serde_json::from_value(json!({
+        "text_or_structured_payload": "safe capture",
+        "hint": "observation"
+    }))?;
+    assert!(observe.expected_reuse_note.is_none());
+    assert!(
+        observe_input_schema()["properties"]
+            .get("project_id")
+            .is_none()
+    );
+
+    let legacy: CueBinding = serde_json::from_value(json!({
+        "cue_kind": "file_path",
+        "cue_value": "crates/eliot-store/src/lib.rs",
+        "match_mode": "exact",
+        "strength": "primary",
+        "expected_reuse_note": "legacy v1 note"
+    }))?;
+    assert_eq!(
+        legacy.expected_reuse_note.as_deref(),
+        Some("legacy v1 note")
+    );
+    let long_note = Some("n".repeat(201));
+    assert!(
+        normalize_binding(
+            CueBinding {
+                expected_reuse_note: long_note,
+                ..legacy.clone()
+            },
+            None
+        )
+        .is_ok()
+    );
+
+    let blob = BlobRef {
+        algorithm: "blake3".to_owned(),
+        digest_hex: "a".repeat(64),
+        size_bytes: 1,
+        relative_path: "observations/raw".to_owned(),
+    };
+    let legacy_pages = normalize_binding_pages("memory:legacy", &blob, vec![legacy.clone()], None)?;
+    assert_eq!(
+        legacy_pages[0].schema_version,
+        CUE_BINDING_PAGE_SCHEMA_VERSION_V1
+    );
+    assert_eq!(
+        legacy_pages[0].page_id,
+        cue_binding_page_id("memory:legacy", &blob, 0, &legacy_pages[0].cue_bindings)
+    );
+    assert_eq!(
+        legacy_pages[0].page_id,
+        "cue-page:3a70a8a3ae2f949c30b8cdea6cef2a8d74f04864a684bab59820f895ca4a0c30"
+    );
+
+    let legacy_marker = normalize_binding_pages(
+        "memory:marker",
+        &blob,
+        vec![CueBinding {
+            expected_reuse_note: Some("<none>".to_owned()),
+            ..legacy.clone()
+        }],
+        None,
+    )?;
+
+    let cold_pages = normalize_binding_pages(
+        "memory:marker",
+        &blob,
+        vec![CueBinding {
+            expected_reuse_note: None,
+            ..legacy.clone()
+        }],
+        None,
+    )?;
+    assert_eq!(
+        cold_pages[0].schema_version,
+        CUE_BINDING_PAGE_SCHEMA_VERSION_V2
+    );
+    assert_ne!(legacy_marker[0].page_id, cold_pages[0].page_id);
+
+    let mixed_bindings = (0..12)
+        .map(|index| CueBinding {
+            cue_value: format!("crates/eliot-store/src/file-{index}.rs"),
+            expected_reuse_note: Some("legacy v1 note".to_owned()),
+            ..legacy.clone()
+        })
+        .chain(std::iter::once(CueBinding {
+            cue_value: "crates/eliot-store/src/zzzz-cold.rs".to_owned(),
+            expected_reuse_note: None,
+            ..legacy
+        }))
+        .collect();
+    let mixed_pages = normalize_binding_pages("memory:mixed", &blob, mixed_bindings, None)?;
+    assert_eq!(mixed_pages.len(), 2);
+    assert_eq!(
+        mixed_pages[0].schema_version,
+        CUE_BINDING_PAGE_SCHEMA_VERSION_V1
+    );
+    assert_eq!(
+        mixed_pages[1].schema_version,
+        CUE_BINDING_PAGE_SCHEMA_VERSION_V2
     );
     Ok(())
 }

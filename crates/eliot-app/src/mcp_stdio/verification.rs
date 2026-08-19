@@ -7,6 +7,288 @@
 //! reading either alone tells you nothing about what is actually guaranteed.
 
 use super::*;
+use eliot_types::{ObserveHint, ObserveInput};
+
+/// Capture-first canonical observation route.
+///
+/// This route intentionally does not share the legacy candidate-submit input:
+/// the latter is a strict task-memory bridge with required fields and remains
+/// v1-compatible. `eliot.observe` can retain a safe candidate with no task or
+/// cue binding, so capture is never rejected merely because automatic reuse
+/// binding had no admissible result.
+#[allow(clippy::too_many_lines)]
+pub(super) async fn dispatch_observe(
+    state: &McpState,
+    context: AuthenticatedRequestContext,
+    arguments: Value,
+) -> Result<Value> {
+    let input: ObserveInput = serde_json::from_value(arguments)?;
+    if input.schema_version != eliot_types::OBSERVE_INPUT_SCHEMA_VERSION {
+        anyhow::bail!(
+            "unsupported eliot.observe schema_version: {}",
+            input.schema_version
+        );
+    }
+    if input.text_or_structured_payload.is_null() {
+        anyhow::bail!("eliot.observe text_or_structured_payload must not be null");
+    }
+    if !eliot_types::inspect_text_encoding(&input.text_or_structured_payload).is_empty() {
+        anyhow::bail!("eliot.observe content failed the shared encoding guard");
+    }
+    validate_candidate_list("affected_resources", &input.affected_resources, 0, 32, 500)?;
+    validate_candidate_list("source_handles", &input.source_handles, 0, 32, 1_000)?;
+    if let Some(note) = input.expected_reuse_note.as_deref() {
+        validate_reuse_note(note)?;
+    }
+
+    let project_id = observe_bound_project(context)?;
+
+    let explicit_task = input
+        .task_id
+        .as_deref()
+        .map(|value| TaskId::from_str(value).context("parse observe task_id"))
+        .transpose()?;
+    if let (Some(bound), Some(explicit)) = (context.bound_task_id, explicit_task)
+        && bound != explicit
+    {
+        anyhow::bail!(
+            "TASK_SCOPE_MISMATCH: explicit task_id differs from the Governor-bound session"
+        );
+    }
+    let task_id = explicit_task.or(context.bound_task_id);
+    if let Some(task_id) = task_id {
+        let _task = require_task(state, project_id, task_id).await?;
+    }
+
+    let write_id = input
+        .write_id
+        .as_deref()
+        .map(|value| WriteId::from_str(value).context("parse observe write_id"))
+        .transpose()?
+        .unwrap_or_else(WriteId::new_v7);
+    let statement = observe_statement(&input.text_or_structured_payload)?;
+    let cue_bindings = auto_observe_bindings(state, context, project_id, &input, &statement);
+    // A capture without a task cannot be silently promoted by a cue match. Keep
+    // it cold even when a reusable cue is recorded for a later pull/selection.
+    let cold = cue_bindings.is_empty() || task_id.is_none();
+    let hint = observe_hint_name(input.hint);
+    let candidate_disposition = if cold { "cold" } else { "task_bound" };
+    let mut payload = json!({
+        "schema_version": eliot_types::OBSERVE_INPUT_SCHEMA_VERSION,
+        "record_kind": "observation_candidate",
+        "candidate_only": true,
+        "capture_first": true,
+        "candidate_disposition": candidate_disposition,
+        "reason": if cold { "unbound-capture" } else { "automatic-cue-binding" },
+        "profile": state.profile.as_str(),
+        "task_id": task_id,
+        "hint": hint,
+        "text_or_structured_payload": input.text_or_structured_payload,
+        "statement": statement,
+        "affected_resources": input.affected_resources,
+        "source_handles": input.source_handles,
+        "expected_reuse_note": input.expected_reuse_note,
+    });
+    attach_observe_cue_bindings(&mut payload, cold, &cue_bindings);
+    let governor_bound = context.bound_project_id == Some(project_id);
+    let bound_session = governor_bound.then_some(context.session_id);
+    let command = SemanticCommand::ClaimPropose(eliot_types::ClaimProposeCommand {
+        context: CommandContext {
+            write_id,
+            agent_id: AgentId::from_uuid(
+                bound_session.map_or(write_id.as_uuid(), eliot_types::SessionId::as_uuid),
+            ),
+            session_id: bound_session,
+            project_id,
+            task_id,
+            scope: task_id.map_or_else(
+                || format!("project:{project_id}:observation-candidate"),
+                |task_id| format!("task:{task_id}:observation-candidate"),
+            ),
+            authority: format!("mcp-profile:{}", state.profile.as_str()),
+            visibility: Visibility::Project,
+            taint: TaintClass::ExternalAgent,
+            lifecycle_status: LifecycleStatus::Active,
+        },
+        claim: ClaimCardInput {
+            claim_id: ClaimId::from_uuid(write_id.as_uuid()),
+            statement,
+            status: EpistemicStatus::Candidate,
+            payload,
+        },
+    });
+    let receipt = state
+        .writer
+        .submit(WriteAdmissionService.admit(&command)?)
+        .await?;
+    Ok(json!({
+        "status": "observation_candidate_committed",
+        "schema_version": eliot_types::OBSERVE_INPUT_SCHEMA_VERSION,
+        "candidate_only": true,
+        "record_kind": "observation_candidate",
+        "candidate_disposition": candidate_disposition,
+        "cold": cold,
+        "candidate_id": format!("candidate:{}", write_id),
+        "cue_binding_summary": cue_binding_summary(
+            if cold { "none" } else { "auto" },
+            &command_claim_bindings(&command),
+        ),
+        "write_receipt": receipt,
+    }))
+}
+
+pub(super) fn observe_bound_project(context: AuthenticatedRequestContext) -> Result<ProjectId> {
+    context
+        .bound_project_id
+        .context("eliot.observe requires a Governor-bound project")
+}
+
+fn command_claim_bindings(command: &SemanticCommand) -> Vec<eliot_types::CueBinding> {
+    match command {
+        SemanticCommand::ClaimPropose(command) => command
+            .claim
+            .payload
+            .get("cue_bindings")
+            .cloned()
+            .and_then(|value| serde_json::from_value(value).ok())
+            .unwrap_or_default(),
+        _ => Vec::new(),
+    }
+}
+
+pub(super) fn attach_observe_cue_bindings(
+    payload: &mut Value,
+    cold: bool,
+    cue_bindings: &[eliot_types::CueBinding],
+) {
+    let Some(object) = payload.as_object_mut() else {
+        return;
+    };
+    object.insert(
+        "cue_binding_state".to_owned(),
+        json!(if cold { "cold" } else { "auto_bound" }),
+    );
+    // The cue projection treats presence of this field as an indexable source;
+    // a cold candidate must remain exact-fetchable without entering that index.
+    if !cold {
+        object.insert("cue_bindings".to_owned(), json!(cue_bindings));
+    }
+}
+
+fn observe_statement(payload: &Value) -> Result<String> {
+    match payload {
+        Value::String(value) => Ok(value.clone()),
+        value => serde_json::to_string(value).context("serialize structured observation"),
+    }
+}
+
+fn observe_hint_name(hint: ObserveHint) -> &'static str {
+    match hint {
+        ObserveHint::Observation => "observation",
+        ObserveHint::Decision => "decision",
+        ObserveHint::Failure => "failure",
+        ObserveHint::Outcome => "outcome",
+        ObserveHint::Unknown => "unknown",
+        ObserveHint::ReuseCandidate => "reuse_candidate",
+        ObserveHint::Auto => "auto",
+    }
+}
+
+fn auto_observe_bindings(
+    state: &McpState,
+    context: AuthenticatedRequestContext,
+    project_id: ProjectId,
+    input: &ObserveInput,
+    statement: &str,
+) -> Vec<eliot_types::CueBinding> {
+    let note = input.expected_reuse_note.clone();
+    let corpus = [
+        statement,
+        &input.affected_resources.join(" "),
+        &input.source_handles.join(" "),
+    ]
+    .join(" ")
+    .chars()
+    .flat_map(char::to_lowercase)
+    .collect::<String>();
+    let mut candidates = Vec::new();
+    for resource in &input.affected_resources {
+        candidates.push(eliot_types::CueBinding {
+            cue_kind: eliot_types::CueKind::FilePath,
+            cue_value: resource.clone(),
+            match_mode: eliot_types::CueMatchMode::Exact,
+            strength: eliot_types::CueStrength::Primary,
+            expected_reuse_note: note.clone(),
+        });
+    }
+    for cue in state
+        .ul
+        .touched
+        .recent_cues(project_id, context.session_id, 16)
+    {
+        let value = cue
+            .value
+            .chars()
+            .flat_map(char::to_lowercase)
+            .collect::<String>();
+        if value.is_empty() || (!corpus.contains(&value) && !candidates.is_empty()) {
+            continue;
+        }
+        if candidates.iter().any(|binding: &eliot_types::CueBinding| {
+            binding.cue_kind == cue.kind && binding.cue_value == cue.value
+        }) {
+            continue;
+        }
+        candidates.push(eliot_types::CueBinding {
+            match_mode: match cue.kind {
+                eliot_types::CueKind::DirPath => eliot_types::CueMatchMode::Prefix,
+                eliot_types::CueKind::ErrorSignature => eliot_types::CueMatchMode::Signature,
+                _ => eliot_types::CueMatchMode::Exact,
+            },
+            cue_kind: cue.kind,
+            cue_value: cue.value,
+            strength: if candidates.is_empty() {
+                eliot_types::CueStrength::Primary
+            } else {
+                eliot_types::CueStrength::Secondary
+            },
+            expected_reuse_note: note.clone(),
+        });
+        if candidates.len() >= 5 {
+            break;
+        }
+    }
+    normalize_auto_observe_bindings(candidates, state.root.to_str())
+}
+
+pub(super) fn normalize_auto_observe_bindings(
+    candidates: Vec<eliot_types::CueBinding>,
+    project_root: Option<&str>,
+) -> Vec<eliot_types::CueBinding> {
+    let mut normalized: Vec<eliot_types::CueBinding> = Vec::new();
+    for candidate in candidates {
+        let Ok(candidate) = eliot_types::normalize_binding(candidate, project_root) else {
+            // Automatic binding is advisory. Invalid candidate cues must not
+            // turn an otherwise valid observation into a rejected request.
+            continue;
+        };
+        if let Some(index) = normalized.iter().position(|existing| {
+            existing.cue_kind == candidate.cue_kind
+                && existing.cue_value == candidate.cue_value
+                && existing.match_mode == candidate.match_mode
+        }) {
+            if candidate.strength == eliot_types::CueStrength::Primary {
+                normalized[index] = candidate;
+            }
+            continue;
+        }
+        normalized.push(candidate);
+        if normalized.len() >= 5 {
+            break;
+        }
+    }
+    normalized
+}
 
 #[allow(clippy::too_many_lines)]
 pub(super) async fn dispatch_agent_candidate_submit(
@@ -19,7 +301,7 @@ pub(super) async fn dispatch_agent_candidate_submit(
     validate_candidate_field("topic", &input.topic, 160)?;
     validate_candidate_field("statement", &input.statement, 4_000)?;
     validate_candidate_field("freshness_rule", &input.freshness_rule, 1_000)?;
-    validate_candidate_field("expected_reuse_note", &input.expected_reuse_note, 200)?;
+    validate_reuse_note(&input.expected_reuse_note)?;
     validate_candidate_list("where_applicable", &input.where_applicable, 0, 32, 500)?;
     validate_candidate_list(
         "where_not_applicable",
@@ -51,6 +333,15 @@ pub(super) async fn dispatch_agent_candidate_submit(
         binding_source = "auto";
     } else {
         binding_source = "explicit";
+    }
+    if input
+        .cue_bindings
+        .iter()
+        .any(|binding| binding.expected_reuse_note.is_none())
+    {
+        return Err(invalid_cue_input_message(
+            "legacy candidate-submit cue_bindings require expected_reuse_note",
+        ));
     }
     let submitted_bindings = input.cue_bindings.clone();
     let normalized_bindings =
@@ -343,7 +634,7 @@ fn auto_candidate_bindings(
                 cue_kind: cue.kind,
                 cue_value: cue.value,
                 strength,
-                expected_reuse_note: input.expected_reuse_note.clone(),
+                expected_reuse_note: Some(input.expected_reuse_note.clone()),
             })
         })
         .collect()
@@ -419,6 +710,16 @@ pub(super) fn normalize_candidate_text(value: &str) -> String {
 pub(super) fn validate_candidate_field(name: &str, value: &str, max_bytes: usize) -> Result<()> {
     if value.trim().is_empty() || value.len() > max_bytes {
         anyhow::bail!("candidate {name} must be non-empty and no larger than {max_bytes} bytes");
+    }
+    Ok(())
+}
+
+pub(super) fn validate_reuse_note(value: &str) -> Result<()> {
+    if value.trim().is_empty() {
+        anyhow::bail!("expected_reuse_note must be non-blank");
+    }
+    if !eliot_types::inspect_text_encoding(&json!(value)).is_empty() {
+        anyhow::bail!("expected_reuse_note failed the shared encoding guard");
     }
     Ok(())
 }

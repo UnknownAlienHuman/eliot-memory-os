@@ -112,6 +112,105 @@ fn governor_bound_scope_defaults_ids_and_rejects_scope_spoofing() -> Result<()> 
 }
 
 #[test]
+fn cold_observe_candidate_is_fetchable_but_not_cue_indexed() {
+    let mut payload = json!({
+        "record_kind": "observation_candidate",
+        "candidate_only": true,
+        "capture_first": true,
+        "candidate_disposition": "cold"
+    });
+    attach_observe_cue_bindings(&mut payload, true, &[]);
+    assert_eq!(payload["record_kind"], "observation_candidate");
+    assert_eq!(payload["candidate_only"], true);
+    assert_eq!(payload["cue_binding_state"], "cold");
+    assert!(payload.get("cue_bindings").is_none());
+
+    let mut bound_payload = json!({
+        "record_kind": "observation_candidate",
+        "candidate_only": true,
+        "capture_first": true,
+        "candidate_disposition": "task_bound"
+    });
+    let binding = eliot_types::CueBinding {
+        cue_kind: eliot_types::CueKind::FilePath,
+        cue_value: "crates/eliot-app/src/lib.rs".to_owned(),
+        match_mode: eliot_types::CueMatchMode::Exact,
+        strength: eliot_types::CueStrength::Primary,
+        expected_reuse_note: None,
+    };
+    attach_observe_cue_bindings(&mut bound_payload, false, &[binding]);
+    assert_eq!(bound_payload["cue_binding_state"], "auto_bound");
+    assert_eq!(
+        bound_payload["cue_bindings"].as_array().map(Vec::len),
+        Some(1)
+    );
+}
+
+#[test]
+fn automatic_observe_binding_is_bounded_and_invalid_cues_fall_back_to_cold() {
+    let unusable = (0..32)
+        .map(|index| eliot_types::CueBinding {
+            cue_kind: eliot_types::CueKind::ErrorSignature,
+            cue_value: format!("not-a-signature-{index}"),
+            match_mode: eliot_types::CueMatchMode::Signature,
+            strength: eliot_types::CueStrength::Primary,
+            expected_reuse_note: None,
+        })
+        .collect();
+    let normalized = normalize_auto_observe_bindings(unusable, None);
+    assert!(normalized.is_empty());
+
+    let mut cold_payload = json!({
+        "record_kind": "observation_candidate",
+        "candidate_only": true,
+        "capture_first": true,
+        "candidate_disposition": "cold"
+    });
+    attach_observe_cue_bindings(&mut cold_payload, true, &normalized);
+    assert_eq!(cold_payload["cue_binding_state"], "cold");
+    assert!(cold_payload.get("cue_bindings").is_none());
+
+    let too_many_valid = (0..32)
+        .map(|index| eliot_types::CueBinding {
+            cue_kind: eliot_types::CueKind::FilePath,
+            cue_value: format!("crates/eliot-app/src/file-{index}.rs"),
+            match_mode: eliot_types::CueMatchMode::Exact,
+            strength: eliot_types::CueStrength::Primary,
+            expected_reuse_note: None,
+        })
+        .collect();
+    assert_eq!(
+        normalize_auto_observe_bindings(too_many_valid, None).len(),
+        5
+    );
+}
+
+#[test]
+fn observe_scope_is_server_bound_and_has_no_project_selector() -> Result<()> {
+    let Err(error) = observe_bound_project(AuthenticatedRequestContext {
+        session_id: SessionId::new_v7(),
+        bound_project_id: None,
+        bound_task_id: None,
+    }) else {
+        return Err(anyhow::anyhow!(
+            "unbound observe must not select a project from the request"
+        ));
+    };
+    assert!(error.to_string().contains("Governor-bound project"));
+
+    let schema = catalog::tool_definitions_for_profile(McpAccessProfile::ExternalAuditor)
+        .into_iter()
+        .find(|tool| tool["name"] == "eliot.observe")
+        .context("eliot.observe must be catalogued")?;
+    assert!(
+        schema["inputSchema"]["properties"]
+            .get("project_id")
+            .is_none()
+    );
+    Ok(())
+}
+
+#[test]
 fn bound_current_state_exposes_canonical_task_without_changing_unbound_shape() {
     let project_id = ProjectId::new_v7();
     let task_id = TaskId::new_v7();

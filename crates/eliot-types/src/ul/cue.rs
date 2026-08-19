@@ -77,11 +77,16 @@ pub struct CueBinding {
     pub cue_value: String,
     pub match_mode: CueMatchMode,
     pub strength: CueStrength,
-    pub expected_reuse_note: String,
+    /// Optional reuse guidance. Legacy v1 strings deserialize as `Some`;
+    /// `None` is emitted only by the capture-first optional-note domain.
+    #[serde(default)]
+    pub expected_reuse_note: Option<String>,
 }
 
 pub const MAX_CUE_BINDINGS_PER_PAGE: usize = 12;
 pub const MAX_CUE_BINDING_PAGE_BYTES: usize = 96 * 1024;
+pub const CUE_BINDING_PAGE_SCHEMA_VERSION_V1: &str = "eliot-cue-binding-page-v1";
+pub const CUE_BINDING_PAGE_SCHEMA_VERSION_V2: &str = "eliot-cue-binding-page-v2";
 
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 pub struct CueBindingPage {
@@ -101,7 +106,7 @@ pub enum CueBindingError {
     InvalidCount,
     #[error("cue binding collection must contain at least one primary binding")]
     MissingPrimary,
-    #[error("expected_reuse_note must contain 1..=200 UTF-8 bytes")]
+    #[error("expected_reuse_note must be non-blank when supplied")]
     InvalidReuseNote,
     #[error("cue_value is empty")]
     EmptyValue,
@@ -132,8 +137,11 @@ pub fn normalize_binding(
     mut binding: CueBinding,
     project_root: Option<&str>,
 ) -> Result<CueBinding, CueBindingError> {
-    let note_len = binding.expected_reuse_note.len();
-    if binding.expected_reuse_note.trim().is_empty() || note_len > 200 {
+    if binding
+        .expected_reuse_note
+        .as_deref()
+        .is_some_and(|note| note.trim().is_empty())
+    {
         return Err(CueBindingError::InvalidReuseNote);
     }
     if !inspect_text_encoding(&json!(binding.cue_value)).is_empty() {
@@ -226,6 +234,7 @@ pub fn normalize_bindings(
 /// then emits deterministic bounded pages. The existing inline validator stays
 /// capped at twelve; callers use these pages for overflow instead of dropping
 /// valuable bindings.
+#[allow(clippy::too_many_lines)]
 pub fn normalize_binding_pages(
     parent_handle: &str,
     blob: &BlobRef,
@@ -314,8 +323,16 @@ pub fn normalize_binding_pages(
         .map(|(page_ordinal, page_bindings)| {
             let page_ordinal =
                 u64::try_from(page_ordinal).map_err(|_| CueBindingError::InvalidCount)?;
+            let page_schema_version = if page_bindings
+                .iter()
+                .any(|binding| binding.expected_reuse_note.is_none())
+            {
+                CUE_BINDING_PAGE_SCHEMA_VERSION_V2
+            } else {
+                CUE_BINDING_PAGE_SCHEMA_VERSION_V1
+            };
             Ok(CueBindingPage {
-                schema_version: "eliot-cue-binding-page-v1".to_owned(),
+                schema_version: page_schema_version.to_owned(),
                 page_id: cue_binding_page_id(parent_handle, blob, page_ordinal, &page_bindings),
                 parent_handle: parent_handle.to_owned(),
                 blob: blob.clone(),
@@ -338,8 +355,16 @@ fn cue_binding_page_transport_bytes(
     blob: &BlobRef,
     bindings: &[CueBinding],
 ) -> usize {
+    let schema_version = if bindings
+        .iter()
+        .any(|binding| binding.expected_reuse_note.is_none())
+    {
+        CUE_BINDING_PAGE_SCHEMA_VERSION_V2
+    } else {
+        CUE_BINDING_PAGE_SCHEMA_VERSION_V1
+    };
     serde_json::to_vec(&CueBindingPage {
-        schema_version: "eliot-cue-binding-page-v1".to_owned(),
+        schema_version: schema_version.to_owned(),
         page_id: format!("cue-page:{}", "f".repeat(64)),
         parent_handle: parent_handle.to_owned(),
         blob: blob.clone(),
@@ -365,6 +390,12 @@ pub fn cue_binding_page_id(
     hasher.update(&blob.size_bytes.to_le_bytes());
     hasher.update(blob.relative_path.as_bytes());
     hasher.update(&page_ordinal.to_le_bytes());
+    let optional_note_domain = bindings
+        .iter()
+        .any(|binding| binding.expected_reuse_note.is_none());
+    if optional_note_domain {
+        hasher.update(b"eliot-cue-binding-page-v2");
+    }
     for binding in bindings {
         hasher.update(binding.cue_kind.as_str().as_bytes());
         hasher.update(binding.cue_value.as_bytes());
@@ -373,7 +404,22 @@ pub fn cue_binding_page_id(
             CueStrength::Primary => b"primary",
             CueStrength::Secondary => b"secondary",
         });
-        hasher.update(binding.expected_reuse_note.as_bytes());
+        if optional_note_domain {
+            match &binding.expected_reuse_note {
+                Some(note) => {
+                    hasher.update(b"some:");
+                    hasher.update(note.as_bytes());
+                }
+                None => {
+                    hasher.update(b"none");
+                }
+            }
+        } else {
+            // Keep the historical v1 Some(note) hash material byte-identical.
+            if let Some(note) = &binding.expected_reuse_note {
+                hasher.update(note.as_bytes());
+            }
+        }
     }
     format!("cue-page:{}", hasher.finalize().to_hex())
 }
@@ -461,7 +507,7 @@ mod tests {
                 } else {
                     CueStrength::Secondary
                 },
-                expected_reuse_note: "capacity paging test".to_owned(),
+                expected_reuse_note: Some("capacity paging test".to_owned()),
             })
             .collect();
         let pages = normalize_binding_pages(
@@ -522,7 +568,7 @@ mod tests {
                 } else {
                     CueStrength::Secondary
                 },
-                expected_reuse_note: "transport bound".to_owned(),
+                expected_reuse_note: Some("transport bound".to_owned()),
             })
             .collect();
         let pages = normalize_binding_pages("memory:byte-bound", &blob, bindings, None)?;
@@ -537,7 +583,7 @@ mod tests {
             cue_value: format!("too-large-{}", "z".repeat(MAX_CUE_BINDING_PAGE_BYTES)),
             match_mode: CueMatchMode::Exact,
             strength: CueStrength::Primary,
-            expected_reuse_note: "must fail explicitly".to_owned(),
+            expected_reuse_note: Some("must fail explicitly".to_owned()),
         }];
         assert!(matches!(
             normalize_binding_pages("memory:oversized", &blob, oversized, None),

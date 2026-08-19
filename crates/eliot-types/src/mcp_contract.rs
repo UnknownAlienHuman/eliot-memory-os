@@ -3,6 +3,14 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+/// Wire/schema revision for the capture-first `eliot.observe` surface.
+///
+/// This is deliberately separate from the legacy candidate-submit schema. The
+/// legacy payload and its cue-page inputs remain v1-compatible, including
+/// `AgentCandidateSubmitInput.expected_reuse_note: String` and the page-id
+/// hash material for old `Some(note)` cue bindings.
+pub const OBSERVE_INPUT_SCHEMA_VERSION: &str = "eliot.observe-v1";
+
 #[derive(Clone, Debug, JsonSchema, Serialize, Deserialize)]
 pub struct CompilePacketToolInput {
     #[serde(flatten)]
@@ -127,8 +135,89 @@ pub struct AgentCandidateCurationInput {
 
 #[allow(clippy::expect_used)]
 pub fn agent_candidate_input_schema() -> Value {
-    serde_json::to_value(schemars::schema_for!(AgentCandidateSubmitInput))
-        .expect("AgentCandidateSubmitInput schema must serialize")
+    let mut schema = serde_json::to_value(schemars::schema_for!(AgentCandidateSubmitInput))
+        .expect("AgentCandidateSubmitInput schema must serialize");
+    // CueBinding is optional-note for capture-first pages, but the legacy
+    // candidate-submit wire remains strict and requires a semantic note.
+    for definitions_key in ["$defs", "definitions"] {
+        let Some(definitions) = schema
+            .get_mut(definitions_key)
+            .and_then(Value::as_object_mut)
+        else {
+            continue;
+        };
+        let Some(cue_binding) = definitions
+            .get_mut("CueBinding")
+            .and_then(Value::as_object_mut)
+        else {
+            continue;
+        };
+        let required = cue_binding
+            .entry("required")
+            .or_insert_with(|| json!([]))
+            .as_array_mut();
+        if let Some(required) = required
+            && !required.iter().any(|value| value == "expected_reuse_note")
+        {
+            required.push(json!("expected_reuse_note"));
+        }
+    }
+    schema
+}
+
+/// Capture-first observation input. The server supplies the trusted session,
+/// project and task context; callers cannot select an arbitrary project.
+#[derive(Clone, Debug, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ObserveInput {
+    /// Natural language or structured JSON observation content.
+    pub text_or_structured_payload: Value,
+    /// Optional first-pass classification hint. Classification never grants
+    /// promotion or task authority.
+    #[serde(default, alias = "kind")]
+    pub hint: ObserveHint,
+    /// Optional task selector. An absent task keeps the capture cold.
+    #[serde(default)]
+    pub task_id: Option<String>,
+    /// Paths/entities affected by the observation.
+    #[serde(default)]
+    pub affected_resources: Vec<String>,
+    /// Exact source/evidence handles, when available.
+    #[serde(default)]
+    pub source_handles: Vec<String>,
+    /// Optional agent-supplied reuse guidance. Automatically generated cue
+    /// bindings retain `None` when this is omitted.
+    #[serde(default)]
+    pub expected_reuse_note: Option<String>,
+    /// Optional retry identity. When omitted, the server allocates one.
+    #[serde(default)]
+    pub write_id: Option<String>,
+    /// Explicit schema revision for callers that pin the wire shape.
+    #[serde(default = "default_observe_schema_version")]
+    pub schema_version: String,
+}
+
+fn default_observe_schema_version() -> String {
+    OBSERVE_INPUT_SCHEMA_VERSION.to_owned()
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ObserveHint {
+    Observation,
+    Decision,
+    Failure,
+    Outcome,
+    Unknown,
+    ReuseCandidate,
+    #[default]
+    Auto,
+}
+
+#[allow(clippy::expect_used)]
+pub fn observe_input_schema() -> Value {
+    serde_json::to_value(schemars::schema_for!(ObserveInput))
+        .expect("ObserveInput schema must serialize")
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]

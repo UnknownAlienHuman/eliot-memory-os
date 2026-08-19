@@ -1461,7 +1461,9 @@ mod tests {
                     cue_value: path.to_owned(),
                     match_mode: CueMatchMode::Exact,
                     strength: CueStrength::Primary,
-                    expected_reuse_note: "reuse when editing the live revision fixture".to_owned(),
+                    expected_reuse_note: Some(
+                        "reuse when editing the live revision fixture".to_owned(),
+                    ),
                 }]
             }),
         })
@@ -1488,7 +1490,9 @@ mod tests {
                 cue_value: path.to_owned(),
                 match_mode: CueMatchMode::Exact,
                 strength: CueStrength::Primary,
-                expected_reuse_note: "reuse when editing the live revision fixture".to_owned(),
+                expected_reuse_note: Some(
+                    "reuse when editing the live revision fixture".to_owned(),
+                ),
             }],
             build_fingerprint: "c7-03c-live-card-stable".to_owned(),
             dependency_manifest: eliot_types::DependencyManifest::default(),

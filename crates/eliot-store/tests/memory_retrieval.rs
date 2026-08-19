@@ -140,7 +140,7 @@ async fn canonical_capacity_parent_and_tail_segment_are_reachable_through_normal
             cue_value: "capacity-l2-tail".to_owned(),
             match_mode: CueMatchMode::Exact,
             strength: CueStrength::Primary,
-            expected_reuse_note: "normal exact-L2 expansion".to_owned(),
+            expected_reuse_note: Some("normal exact-L2 expansion".to_owned()),
         }],
         None,
     )?;

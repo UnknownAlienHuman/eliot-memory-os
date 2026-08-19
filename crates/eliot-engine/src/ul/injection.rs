@@ -905,7 +905,7 @@ mod tests {
                 cue_value: "b.rs".to_owned(),
                 match_mode: CueMatchMode::Exact,
                 strength: CueStrength::Primary,
-                expected_reuse_note: "test".to_owned(),
+                expected_reuse_note: Some("test".to_owned()),
             }],
             negative_memory: false,
             lifecycle: "active".to_owned(),

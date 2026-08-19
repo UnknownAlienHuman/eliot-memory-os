@@ -2,7 +2,8 @@ use crate::StoreError;
 use eliot_types::secret_boundary::MAX_SECRET_BOUNDARY_BYTES;
 use eliot_types::{
     BlobRef, BlobStoreConfig, CANONICAL_MEMORY_SCHEMA_VERSION,
-    CANONICAL_MEMORY_SEGMENT_TARGET_BYTES, CanonicalMemoryManifest, CanonicalMemorySegment,
+    CANONICAL_MEMORY_SEGMENT_TARGET_BYTES, CUE_BINDING_PAGE_SCHEMA_VERSION_V1,
+    CUE_BINDING_PAGE_SCHEMA_VERSION_V2, CanonicalMemoryManifest, CanonicalMemorySegment,
     CommandContext, CueBinding, CueBindingPage, MAX_CUE_BINDING_PAGE_BYTES,
     MAX_CUE_BINDINGS_PER_PAGE, SemanticCommand, ToolObservationRecordCommand, WriteId,
     cue_binding_page_id, cue_binding_page_set_hash, inspect_secret_bytes, normalize_binding_pages,
@@ -632,7 +633,16 @@ pub(crate) fn verify_canonical_memory_child_set(
     ordered_pages.sort_by_key(|page| page.page_ordinal);
     for (index, page) in ordered_pages.iter().enumerate() {
         let expected_ordinal = u64::try_from(index).map_err(|_| StoreError::BlobTooLarge)?;
-        if page.schema_version != "eliot-cue-binding-page-v1"
+        let has_none_note = page
+            .cue_bindings
+            .iter()
+            .any(|binding| binding.expected_reuse_note.is_none());
+        let schema_matches_note_domain =
+            (page.schema_version == CUE_BINDING_PAGE_SCHEMA_VERSION_V1 && !has_none_note)
+                || (page.schema_version == CUE_BINDING_PAGE_SCHEMA_VERSION_V2 && has_none_note);
+        if !(page.schema_version == CUE_BINDING_PAGE_SCHEMA_VERSION_V1
+            || page.schema_version == CUE_BINDING_PAGE_SCHEMA_VERSION_V2)
+            || !schema_matches_note_domain
             || page.parent_handle != manifest.memory_handle
             || page.blob != manifest.blob
             || page.page_ordinal != expected_ordinal
@@ -765,7 +775,7 @@ mod tests {
                 } else {
                     CueStrength::Secondary
                 },
-                expected_reuse_note: "large canonical reconstruction".to_owned(),
+                expected_reuse_note: Some("large canonical reconstruction".to_owned()),
             })
             .collect();
         let plan = store.stage_canonical_memory(
@@ -802,6 +812,45 @@ mod tests {
             &plan.manifest,
             &plan.segments,
             &plan.cue_pages,
+        )?;
+        let mixed_cues = (0..12)
+            .map(|index| CueBinding {
+                cue_kind: CueKind::Concept,
+                cue_value: format!("mixed-legacy-{index:02}"),
+                match_mode: CueMatchMode::Exact,
+                strength: CueStrength::Primary,
+                expected_reuse_note: Some("legacy v1 note".to_owned()),
+            })
+            .chain(std::iter::once(CueBinding {
+                cue_kind: CueKind::Concept,
+                cue_value: "mixed-zzzz-cold".to_owned(),
+                match_mode: CueMatchMode::Exact,
+                strength: CueStrength::Primary,
+                expected_reuse_note: None,
+            }))
+            .collect();
+        let mixed_plan = store.stage_canonical_memory(
+            "memory:mixed-note-pages",
+            "synthetic_evidence",
+            "text/plain; charset=utf-8",
+            b"mixed note pages",
+            mixed_cues,
+            None,
+        )?;
+        assert_eq!(mixed_plan.cue_pages.len(), 2);
+        assert_eq!(
+            mixed_plan.cue_pages[0].schema_version,
+            eliot_types::CUE_BINDING_PAGE_SCHEMA_VERSION_V1
+        );
+        assert_eq!(
+            mixed_plan.cue_pages[1].schema_version,
+            eliot_types::CUE_BINDING_PAGE_SCHEMA_VERSION_V2
+        );
+        verify_canonical_memory_child_set(
+            Some(&store),
+            &mixed_plan.manifest,
+            &mixed_plan.segments,
+            &mixed_plan.cue_pages,
         )?;
         let mut non_contiguous_set = plan.segments.clone();
         non_contiguous_set[1].byte_start = non_contiguous_set[1].byte_start.saturating_add(1);

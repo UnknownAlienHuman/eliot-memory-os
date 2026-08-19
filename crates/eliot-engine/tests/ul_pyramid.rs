@@ -226,7 +226,9 @@ fn concept(project_id: ProjectId, name: &str, boundary: &str, source_ref: &str) 
             cue_value: name.to_owned(),
             match_mode: CueMatchMode::Exact,
             strength: CueStrength::Primary,
-            expected_reuse_note: "when working in this subsystem or its boundary paths".to_owned(),
+            expected_reuse_note: Some(
+                "when working in this subsystem or its boundary paths".to_owned(),
+            ),
         }],
         source_refs: vec![source_ref.to_owned()],
     }

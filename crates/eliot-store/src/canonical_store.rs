@@ -5573,7 +5573,18 @@ fn validate_capacity_receipt(receipt_kind: Option<&str>, body: &Value) -> Result
             let page: CueBindingPage = serde_json::from_value(body.clone())
                 .map_err(|error| StoreError::Decode(error.to_string()))?;
             validate_capacity_blob_ref(&page.blob)?;
-            if page.schema_version != "eliot-cue-binding-page-v1"
+            let has_none_note = page
+                .cue_bindings
+                .iter()
+                .any(|binding| binding.expected_reuse_note.is_none());
+            let schema_matches_note_domain = (page.schema_version
+                == eliot_types::CUE_BINDING_PAGE_SCHEMA_VERSION_V1
+                && !has_none_note)
+                || (page.schema_version == eliot_types::CUE_BINDING_PAGE_SCHEMA_VERSION_V2
+                    && has_none_note);
+            if !(page.schema_version == eliot_types::CUE_BINDING_PAGE_SCHEMA_VERSION_V1
+                || page.schema_version == eliot_types::CUE_BINDING_PAGE_SCHEMA_VERSION_V2)
+                || !schema_matches_note_domain
                 || page.parent_handle.trim().is_empty()
                 || page.parent_handle.len() > 512
                 || page.page_count == 0

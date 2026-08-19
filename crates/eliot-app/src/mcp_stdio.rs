@@ -284,6 +284,7 @@ const GOVERNED_TOOLS: &[&str] = &[
     "eliot_task_observation_record",
     "eliot_write_cognitive_observation",
     "eliot_agent_candidate_submit",
+    "eliot.observe",
     "eliot_task_verification_run",
     "eliot_host_session_status",
     "eliot_project_identity",
@@ -507,6 +508,7 @@ pub(crate) const PART_E_WORKER_TOOLS: &[&str] = &[
     "eliot_fetch_l2",
     "eliot_compile_packet_l3",
     "eliot_agent_candidate_submit",
+    "eliot.observe",
     "eliot_memory_influence_trace",
     "eliot_write_cognitive_observation",
 ];
