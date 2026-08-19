@@ -26,7 +26,7 @@ use tokio::net::windows::named_pipe::{ClientOptions, NamedPipeClient, NamedPipeS
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(2);
-pub(crate) const IPC_PROTOCOL_VERSION: &str = "eliot-ipc-l3-v1";
+pub(crate) const IPC_PROTOCOL_VERSION: &str = "eliot-ipc-l3-v2";
 const MAX_REPLAY_NONCES: usize = 4096;
 pub(crate) const MAX_FRAME_BYTES: usize = 1_048_576;
 pub(crate) const MAX_CONNECTIONS: usize = 16;
@@ -42,9 +42,9 @@ const FORBIDDEN_FACADE_DB_ENV: &[&str] = &[
 #[derive(Clone, Copy, Debug)]
 #[allow(clippy::struct_field_names)]
 pub(crate) struct RequestedSessionScope {
-    pub session_id: SessionId,
+    pub session_id: Option<SessionId>,
     pub project_id: ProjectId,
-    pub task_id: TaskId,
+    pub task_id: Option<TaskId>,
 }
 
 pub(crate) fn pipe_name(config_path: &Path) -> String {
@@ -187,9 +187,7 @@ async fn serve_connection(
     daemon: Arc<McpDaemon>,
     authentication: Arc<IpcAuthenticationState>,
 ) -> Result<()> {
-    let client_process = eliot_windows_ipc::named_pipe_client_process(&connection)
-        .and_then(ClientProcessAttestation::from_kernel_identity)
-        .ok();
+    let client_process_identity = eliot_windows_ipc::named_pipe_client_process(&connection).ok();
     let (reader, mut writer) = tokio::io::split(connection);
     let mut reader = BufReader::new(reader);
     let handshake_line =
@@ -205,6 +203,12 @@ async fn serve_connection(
             Ok(Ok(None)) => return Ok(()),
             Ok(Ok(Some(line))) => line,
         };
+    let client_process = if handshake_requires_process_attestation(&handshake_line) {
+        client_process_identity
+            .and_then(|identity| ClientProcessAttestation::from_kernel_identity(identity).ok())
+    } else {
+        None
+    };
     let mut principal = match authentication
         .authenticate(&handshake_line, client_process.as_ref())
         .await
@@ -263,6 +267,15 @@ async fn serve_connection(
         }
     }
     Ok(())
+}
+
+fn handshake_requires_process_attestation(line: &str) -> bool {
+    serde_json::from_str::<IpcClientHandshake>(line).is_ok_and(|handshake| {
+        matches!(
+            handshake.kind.as_str(),
+            "eliot_cognitive_governor_handshake" | "eliot_host_governor_handshake"
+        )
+    })
 }
 
 #[cfg(windows)]
@@ -402,9 +415,13 @@ async fn connect_global_client(
         token_generation_id: auth_file.auth_generation,
         client_nonce: Uuid::new_v4().to_string(),
         profile: profile.to_owned(),
-        requested_session_id: requested_scope.map(|scope| scope.session_id.to_string()),
+        requested_session_id: requested_scope
+            .and_then(|scope| scope.session_id)
+            .map(|session_id| session_id.to_string()),
         requested_project_id: requested_scope.map(|scope| scope.project_id.to_string()),
-        requested_task_id: requested_scope.map(|scope| scope.task_id.to_string()),
+        requested_task_id: requested_scope
+            .and_then(|scope| scope.task_id)
+            .map(|task_id| task_id.to_string()),
         capability_file: None,
         capability_token: None,
     };
@@ -959,10 +976,11 @@ impl IpcAuthenticationState {
                 {
                     return Err("invalid_token");
                 }
-                let has_session = handshake.requested_session_id.is_some();
-                let has_complete_scope = handshake.requested_project_id.is_some()
-                    && handshake.requested_task_id.is_some();
-                if has_session != has_complete_scope {
+                if !valid_normal_scope_shape(
+                    handshake.requested_session_id.is_some(),
+                    handshake.requested_project_id.is_some(),
+                    handshake.requested_task_id.is_some(),
+                ) {
                     return Err("invalid_session_scope");
                 }
             }
@@ -1104,6 +1122,13 @@ fn allowed_ipc_profile(profile: &str) -> bool {
             | "human_operator"
             | "human_readonly"
             | "cognitive_control"
+    )
+}
+
+fn valid_normal_scope_shape(has_session: bool, has_project: bool, has_task: bool) -> bool {
+    matches!(
+        (has_session, has_project, has_task),
+        (false, _, false) | (true, true, true)
     )
 }
 
@@ -1297,7 +1322,8 @@ mod tests {
     use super::{
         ClientProcessAttestation, IPC_PROTOCOL_VERSION, IpcAuthenticationState, IpcClientHandshake,
         MAX_REPLAY_NONCES, ReplayWindow, allowed_ipc_profile, decode_bounded_line,
-        private_host_governor_method_allowed, sha256_file,
+        handshake_requires_process_attestation, private_host_governor_method_allowed, sha256_file,
+        valid_normal_scope_shape,
     };
     use anyhow::{Context as _, Result};
     use tokio::sync::Mutex;
@@ -1307,6 +1333,51 @@ mod tests {
     fn claude_desktop_is_an_authenticated_ipc_profile() {
         assert!(allowed_ipc_profile("claude_desktop"));
         assert!(!allowed_ipc_profile("raw_patch_runner"));
+    }
+
+    #[test]
+    fn normal_ipc_scope_accepts_project_only_without_task_authority() {
+        assert!(valid_normal_scope_shape(false, false, false));
+        assert!(valid_normal_scope_shape(false, true, false));
+        assert!(valid_normal_scope_shape(true, true, true));
+
+        assert!(!valid_normal_scope_shape(true, false, false));
+        assert!(!valid_normal_scope_shape(true, true, false));
+        assert!(!valid_normal_scope_shape(false, false, true));
+        assert!(!valid_normal_scope_shape(false, true, true));
+    }
+
+    #[test]
+    fn process_attestation_is_reserved_for_private_governor_handshakes() -> Result<()> {
+        let handshake = |kind: &str| {
+            serde_json::to_string(&IpcClientHandshake {
+                kind: kind.to_owned(),
+                protocol_version: IPC_PROTOCOL_VERSION.to_owned(),
+                instance_name: "default".to_owned(),
+                runtime_id: Uuid::new_v4().to_string(),
+                token: "token".to_owned(),
+                token_generation_id: "generation".to_owned(),
+                client_nonce: Uuid::new_v4().to_string(),
+                profile: "dynamic_agent".to_owned(),
+                requested_session_id: None,
+                requested_project_id: None,
+                requested_task_id: None,
+                capability_file: None,
+                capability_token: None,
+            })
+        };
+
+        assert!(!handshake_requires_process_attestation(&handshake(
+            "eliot_ipc_handshake"
+        )?));
+        assert!(handshake_requires_process_attestation(&handshake(
+            "eliot_cognitive_governor_handshake"
+        )?));
+        assert!(handshake_requires_process_attestation(&handshake(
+            "eliot_host_governor_handshake"
+        )?));
+        assert!(!handshake_requires_process_attestation("not-json"));
+        Ok(())
     }
 
     #[test]

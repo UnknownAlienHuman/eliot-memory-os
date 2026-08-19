@@ -1,6 +1,6 @@
 {
   "schema_version": "eliot-operator-contract-v1",
-  "ipc_protocol_version": "eliot-ipc-l3-v1",
+  "ipc_protocol_version": "eliot-ipc-l3-v2",
   "transport": "authenticated_windows_named_pipe",
   "request_envelope": "MCP JSON-RPC tools/call over the existing Governor pipe",
   "projections": [

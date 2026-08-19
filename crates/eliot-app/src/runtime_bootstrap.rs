@@ -17,7 +17,7 @@ use std::os::windows::process::CommandExt as _;
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 const START_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 const OWNED_STOP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
-const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(750);
+const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 fn daemon_run_arguments(instance_name: &str) -> [&str; 4] {
     ["daemon", "run", "--instance", instance_name]

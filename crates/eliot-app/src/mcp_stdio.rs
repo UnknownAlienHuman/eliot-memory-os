@@ -845,9 +845,9 @@ fn scoped_host_session_from_env(
         anyhow::bail!("ELIOT scoped MCP session has no active matching TaskRoleLease");
     }
     Ok(Some(named_pipe_ipc::RequestedSessionScope {
-        session_id,
+        session_id: Some(session_id),
         project_id,
-        task_id,
+        task_id: Some(task_id),
     }))
 }
 

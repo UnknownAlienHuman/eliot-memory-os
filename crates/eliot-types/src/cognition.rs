@@ -20,7 +20,7 @@ use std::collections::BTreeMap;
 use time::OffsetDateTime;
 
 pub const OPERATOR_SCHEMA_VERSION: &str = "eliot-operator-contract-v1";
-pub const OPERATOR_IPC_PROTOCOL_VERSION: &str = "eliot-ipc-l3-v1";
+pub const OPERATOR_IPC_PROTOCOL_VERSION: &str = "eliot-ipc-l3-v2";
 pub const OPERATOR_CONTRACT_MANIFEST: &str = include_str!("../schema/operator-contract-v1.json");
 
 pub fn operator_contract_hash() -> String {
@@ -1052,7 +1052,7 @@ mod contract_tests {
         let hash = operator_contract_hash();
         assert_eq!(
             hash,
-            "3c1a50d6581e90838a2375fadd70f6868a499d48f4e83223613a0a5fdedf2278"
+            "b00a82807e003ad1e1b9b717a9759024335ffe461a0cc3f5d67867ec8750394f"
         );
         let lf = OPERATOR_CONTRACT_MANIFEST.replace("\r\n", "\n");
         let crlf = lf.replace('\n', "\r\n");
