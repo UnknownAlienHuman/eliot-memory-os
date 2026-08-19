@@ -767,6 +767,82 @@ mod tests {
     }
 
     #[test]
+    fn dispatch_intent_can_release_before_provider_spawn_without_consuming_budget() -> Result<()> {
+        let fixture = Fixture::new()?;
+        let preregistration = seal_or_reuse_preregistration(
+            &fixture.root,
+            &fixture.campaign_id,
+            fixture.project_id,
+            fixture.task_id,
+            "question",
+            &[],
+            None,
+        )?;
+        let owner = ProviderCallReservationOwner::new(&fixture.root);
+        owner.open_campaign(ProviderCallCampaignRequest {
+            campaign_id: fixture.campaign_id.clone(),
+            max_calls: 1,
+            closed: false,
+        })?;
+        let reservation = match owner.reserve(ProviderCallReservationRequest {
+            campaign_id: fixture.campaign_id.clone(),
+            task_id: fixture.task_id,
+            provider: PROVIDER.to_owned(),
+            idempotency_key: preregistration.idempotency_key.clone(),
+            gate_decision_ref: "gate:test".to_owned(),
+        })? {
+            ProviderCallReservationDecision::Reserved(reservation) => reservation,
+            other => panic!("expected first reservation, got {other:?}"),
+        };
+        record_reservation(
+            &fixture.root,
+            &fixture.campaign_id,
+            &preregistration.preregistration_id,
+            &reservation,
+        )?;
+        let dispatching = owner.mark_dispatching(&reservation.reservation_id)?;
+        record_dispatching(
+            &fixture.root,
+            &fixture.campaign_id,
+            &dispatching.reservation_id,
+        )?;
+        let released = owner.release_pre_dispatch(
+            &reservation.reservation_id,
+            "provider process was never spawned",
+        )?;
+        record_execution_terminal(
+            &fixture.root,
+            &fixture.campaign_id,
+            &preregistration.preregistration_id,
+            &released,
+        )?;
+
+        let state = calibration_runtime::load_state(&fixture.root)?;
+        let campaign = &state.campaigns[0];
+        assert_eq!(
+            campaign.state,
+            DelegationCalibrationCampaignState::ReleasedPreDispatch
+        );
+        assert_eq!(campaign.observed_provider_calls, 0);
+        assert_eq!(campaign.transition_history.len(), 3);
+        assert_eq!(
+            campaign.closeout_status,
+            DelegationCalibrationCampaignCloseoutStatus::Cancelled
+        );
+        let ledger = owner.snapshot()?;
+        assert_eq!(ledger.reservations.len(), 1);
+        assert_eq!(
+            ledger.reservations[0].state,
+            ProviderCallReservationState::ReleasedPreDispatch
+        );
+        assert!(ledger.reservations[0].dispatch_started_at.is_none());
+        assert!(ledger.reservations[0].external_invocation_ref.is_none());
+        assert!(!ledger.reservations[0].consumes_budget);
+        assert_eq!(ledger.budgets[0].remaining_calls, 1);
+        Ok(())
+    }
+
+    #[test]
     fn operator_intent_and_budget_slot_remain_required() {
         let mut input = crate::delegation_runtime::DelegationReviewInput {
             project_id: "project".to_owned(),

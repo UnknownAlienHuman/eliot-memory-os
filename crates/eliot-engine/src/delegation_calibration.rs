@@ -236,6 +236,7 @@ impl DelegationCalibrationCampaignService {
             ) | (
                 DelegationCalibrationCampaignState::Dispatching,
                 DelegationCalibrationCampaignState::ProviderExecuted
+                    | DelegationCalibrationCampaignState::ReleasedPreDispatch
                     | DelegationCalibrationCampaignState::FailedProvider
                     | DelegationCalibrationCampaignState::UnknownOutcome
             ) | (

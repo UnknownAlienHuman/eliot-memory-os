@@ -68,6 +68,38 @@ fn campaign_replay_of_same_transition_is_idempotent() -> TestResult {
 }
 
 #[test]
+fn dispatch_intent_may_terminate_as_proven_pre_dispatch_release() -> TestResult {
+    let mut campaign = campaign();
+    let service = DelegationCalibrationCampaignService;
+    for state in [
+        DelegationCalibrationCampaignState::Ready,
+        DelegationCalibrationCampaignState::Reserved,
+        DelegationCalibrationCampaignState::Dispatching,
+        DelegationCalibrationCampaignState::ReleasedPreDispatch,
+    ] {
+        assert!(service.transition(&mut campaign, state)?);
+    }
+    assert_eq!(
+        campaign.state,
+        DelegationCalibrationCampaignState::ReleasedPreDispatch
+    );
+    assert_eq!(
+        campaign.closeout_status,
+        DelegationCalibrationCampaignCloseoutStatus::Cancelled
+    );
+    assert!(campaign.closed_at.is_some());
+    assert!(
+        service
+            .transition(
+                &mut campaign,
+                DelegationCalibrationCampaignState::ProviderExecuted
+            )
+            .is_err()
+    );
+    Ok(())
+}
+
+#[test]
 fn review_requires_frozen_baseline_before_execution() {
     let mut state = state_with_ready_campaign();
     state.campaigns[0].baseline_state_hash.clear();
