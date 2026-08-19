@@ -1,5 +1,17 @@
 //! LocalService-only Store credential provisioning behind the Host owner epoch.
 
+#![allow(
+    clippy::doc_markdown,
+    clippy::ignored_unit_patterns,
+    clippy::implicit_clone,
+    clippy::manual_let_else,
+    clippy::redundant_closure_for_method_calls,
+    clippy::single_match,
+    clippy::single_match_else,
+    clippy::too_many_lines,
+    reason = "the credential state machine keeps fail-closed branches explicit"
+)]
+
 use std::path::{Path, PathBuf};
 
 use eliot_host_state::HostInstallationEpoch;
@@ -13,10 +25,10 @@ use eliot_installation::{
 use eliot_ipc::{NamedPipeServer, TransportLimits};
 use eliot_platform::PlatformHandle;
 use eliot_platform_windows::{
-    CredentialSecret, InstallerRootObjectSnapshot, InstallerRootPrimitiveObservation,
-    InstallerRootPrimitiveSpec, InstallerRootProfile, WindowsInstallerRootPrimitive,
-    WindowsLocalServiceCredentialProvider, observe_named_pipe_peer_process,
-    protected_program_data_root, windows_path_identity_digest, windows_paths_equal,
+    CredentialSecret, HostCredentialMutationCapability, InstallerRootObjectSnapshot,
+    InstallerRootPrimitiveObservation, InstallerRootPrimitiveSpec, InstallerRootProfile,
+    WindowsInstallerRootPrimitive, observe_named_pipe_peer_process, protected_program_data_root,
+    windows_path_identity_digest, windows_paths_equal,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
@@ -72,11 +84,20 @@ trait CredentialBackend {
     fn principal_sid(&self) -> Result<PlatformHandle, String>;
     fn read(&self, target: &PlatformHandle) -> Result<Option<CredentialSecret>, String>;
     fn generate(&self) -> Result<CredentialSecret, String>;
-    fn write(&self, target: &PlatformHandle, bytes: Vec<u8>) -> Result<(), String>;
-    fn delete(&self, target: &PlatformHandle) -> Result<(), String>;
+    fn write_if_absent(
+        &self,
+        target: &PlatformHandle,
+        bytes: Vec<u8>,
+    ) -> Result<CredentialSecret, String>;
+    fn delete_if_matching(
+        &self,
+        target: &PlatformHandle,
+        expected_digest: &PlatformHandle,
+        verify: &mut dyn FnMut(&CredentialSecret) -> bool,
+    ) -> Result<(), String>;
 }
 
-struct ProductionCredentialBackend(WindowsLocalServiceCredentialProvider);
+struct ProductionCredentialBackend(HostCredentialMutationCapability);
 
 impl CredentialBackend for ProductionCredentialBackend {
     fn principal_sid(&self) -> Result<PlatformHandle, String> {
@@ -93,15 +114,26 @@ impl CredentialBackend for ProductionCredentialBackend {
         self.0.generate_secret().map_err(|error| error.to_string())
     }
 
-    fn write(&self, target: &PlatformHandle, bytes: Vec<u8>) -> Result<(), String> {
+    fn write_if_absent(
+        &self,
+        target: &PlatformHandle,
+        bytes: Vec<u8>,
+    ) -> Result<CredentialSecret, String> {
         let secret = CredentialSecret::from_bytes(bytes).map_err(|error| error.to_string())?;
         self.0
-            .write(target, &secret)
+            .write_if_absent(target, secret)
             .map_err(|error| error.to_string())
     }
 
-    fn delete(&self, target: &PlatformHandle) -> Result<(), String> {
-        self.0.delete(target).map_err(|error| error.to_string())
+    fn delete_if_matching(
+        &self,
+        target: &PlatformHandle,
+        expected_digest: &PlatformHandle,
+        verify: &mut dyn FnMut(&CredentialSecret) -> bool,
+    ) -> Result<(), String> {
+        self.0
+            .delete_if_matching(target, expected_digest, verify)
+            .map_err(|error| error.to_string())
     }
 }
 
@@ -123,19 +155,20 @@ struct HostCredentialControlCore<B> {
 
 impl HostCredentialControl {
     /// Creates the handler after Host owner epoch acquisition.
-    pub fn new(
+    pub(super) fn new(
         host_epoch: HostInstallationEpoch,
         host_state_root: PathBuf,
+        capability: HostCredentialMutationCapability,
     ) -> Result<Self, String> {
         let installation_root = host_state_root
             .parent()
             .ok_or_else(|| "host_state_root has no installation parent".to_owned())?
             .to_path_buf();
         let profile_anchor = protected_program_data_root().map_err(|error| error.to_string())?;
-        let host_epoch_digest = handle_digest(
-            &serde_json::to_vec(&host_epoch)
-                .map_err(|error| format!("serialize Host owner epoch: {error}"))?,
-        )?;
+        // The owner binding is stable across a clean child Host epoch.  The
+        // journal/marker still carries the exact epoch, while Credential
+        // Manager bytes must remain recoverable by the next Host process.
+        let host_epoch_digest = host_owner_epoch_binding(&host_epoch)?;
         let process = observe_named_pipe_peer_process(std::process::id())
             .map_err(|error| error.to_string())?;
         let host_process_digest = handle_digest(process.identity().stable_key().as_bytes())?;
@@ -153,19 +186,24 @@ impl HostCredentialControl {
                     profile: InstallerRootProfile::SystemService,
                 },
                 primitive: WindowsInstallerRootPrimitive::new(),
-                backend: ProductionCredentialBackend(WindowsLocalServiceCredentialProvider::new()),
+                backend: ProductionCredentialBackend(capability),
             },
         })
     }
 
     /// Handles one already-authenticated request. No secret is returned.
-    pub fn handle(&self, request: &HostCredentialControlRequest) -> HostCredentialControlResponse {
+    fn handle(&self, request: &HostCredentialControlRequest) -> HostCredentialControlResponse {
         self.core.handle(request)
     }
 
     /// Serves one bounded request through the existing authenticated EBP
     /// named-pipe transport. The DACL and impersonated client token both
     /// require enabled built-in Administrators membership.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the authenticated transport or one bounded
+    /// request cannot be established.
     pub async fn serve_one(&self, timeout: std::time::Duration) -> Result<(), String> {
         let installer =
             eliot_platform_windows::NamedPipePeerExpectation::new_for_builtin_administrators()
@@ -291,12 +329,49 @@ impl<B: CredentialBackend> HostCredentialControlCore<B> {
                         .as_ref()
                         .unwrap_or_else(|| unreachable!());
                     return if target.is_none() {
-                        deleted_response(
-                            request,
-                            &self.host_epoch_digest,
-                            &self.host_process_digest,
-                            &receipt.marker,
-                        )
+                        deleted_response_for_receipt(request, receipt)
+                    } else if let Some(target) = target {
+                        // A crash may occur after the protected marker delete
+                        // and before the response reaches the installer.  An
+                        // exact durable receipt is sufficient authority to
+                        // clean the matching credential, but never to adopt a
+                        // target without that receipt.
+                        let marker = marker_snapshot(&receipt.marker);
+                        let valid = handle_digest(target.expose()).ok().as_ref()
+                            == Some(&receipt.credential_envelope_digest)
+                            && decode_envelope(
+                                request,
+                                key,
+                                &receipt.host_owner_epoch,
+                                &marker,
+                                target.expose(),
+                            )
+                            .is_ok();
+                        if !valid {
+                            return unknown("credential-target-without-marker");
+                        }
+                        let mut verify = |value: &CredentialSecret| {
+                            decode_envelope(
+                                request,
+                                key,
+                                &receipt.host_owner_epoch,
+                                &marker,
+                                value.expose(),
+                            )
+                            .is_ok()
+                        };
+                        if self
+                            .backend
+                            .delete_if_matching(
+                                &request.intent.provision.target,
+                                &receipt.credential_envelope_digest,
+                                &mut verify,
+                            )
+                            .is_err()
+                        {
+                            return unknown("credential-target-without-marker-delete");
+                        }
+                        deleted_response_for_receipt(request, receipt)
                     } else {
                         unknown("credential-target-without-marker")
                     };
@@ -332,7 +407,6 @@ impl<B: CredentialBackend> HostCredentialControlCore<B> {
         if request.expected_receipt.as_ref().is_some_and(|receipt| {
             receipt.marker != marker_identity(&marker.0)
                 || receipt.host_owner_epoch != self.host_epoch_digest
-                || receipt.host_process_identity != self.host_process_digest
         }) {
             return unknown("credential-reconcile-receipt-binding");
         }
@@ -366,21 +440,14 @@ impl<B: CredentialBackend> HostCredentialControlCore<B> {
                 {
                     return unknown("credential-reconcile-marker-delete");
                 }
-                return deleted_response(
-                    request,
-                    &self.host_epoch_digest,
-                    &self.host_process_digest,
-                    &marker_identity(&marker.0),
-                );
+                let receipt = request
+                    .expected_receipt
+                    .as_ref()
+                    .unwrap_or_else(|| unreachable!());
+                return deleted_response_for_receipt(request, receipt);
             }
             if matches!(marker.1.phase, MarkerPhase::Finalized) {
                 return unknown("credential-final-marker-without-target");
-            }
-            // Required second absence check after the create-new marker.
-            match self.backend.read(&request.intent.provision.target) {
-                Ok(None) => {}
-                Ok(Some(_)) => return unknown("credential-target-raced-after-marker"),
-                Err(_) => return unknown("credential-target-second-read"),
             }
             let generated = match self.backend.generate() {
                 Ok(value) => value,
@@ -396,10 +463,9 @@ impl<B: CredentialBackend> HostCredentialControlCore<B> {
                 Ok(value) => value,
                 Err(_) => return unknown("credential-envelope"),
             };
-            // Final immediate pre-write observation makes injected/cooperating
-            // races fail closed. The unpredictable target and marker are the
-            // same-LocalService trust boundary until this exact Host call.
-            let readback = match write_after_final_absence(
+            // The capability holds a protected Host-state interlock across
+            // the final absence check, CredWriteW and authoritative readback.
+            let readback = match write_if_absent(
                 &self.backend,
                 &request.intent.provision.target,
                 bytes.clone(),
@@ -501,7 +567,6 @@ impl<B: CredentialBackend> HostCredentialControlCore<B> {
         };
         if expected_receipt.marker != marker_identity(&readback.object)
             || expected_receipt.host_owner_epoch != self.host_epoch_digest
-            || expected_receipt.host_process_identity != self.host_process_digest
         {
             return unknown("credential-delete-receipt-binding");
         }
@@ -524,9 +589,9 @@ impl<B: CredentialBackend> HostCredentialControlCore<B> {
         }
         let absence_digest = match credential_deleted_response_digest(
             &request.intent.request_digest,
-            &self.host_epoch_digest,
-            &self.host_process_digest,
-            &marker_identity(&readback.object),
+            &expected_receipt.host_owner_epoch,
+            &expected_receipt.host_process_identity,
+            &expected_receipt.marker,
         ) {
             Ok(value) => value,
             Err(_) => return unknown("credential-delete-digest"),
@@ -543,24 +608,16 @@ fn delete_credential_with_readback<B: CredentialBackend>(
     marker: &InstallerRootObjectSnapshot,
     expected_receipt: &CredentialAccessReceipt,
 ) -> Result<(), ()> {
-    if let Some(target) = backend
-        .read(&request.intent.provision.target)
-        .map_err(|_| ())?
-    {
-        let target_digest = handle_digest(target.expose()).map_err(|_| ())?;
-        if target_digest != expected_receipt.credential_envelope_digest
-            || decode_envelope(request, ownership_key, host_epoch, marker, target.expose()).is_err()
-        {
-            return Err(());
-        }
-        backend
-            .delete(&request.intent.provision.target)
-            .map_err(|_| ())?;
-    }
-    match backend.read(&request.intent.provision.target) {
-        Ok(None) => Ok(()),
-        Ok(Some(_)) | Err(_) => Err(()),
-    }
+    let mut verify = |target: &CredentialSecret| {
+        decode_envelope(request, ownership_key, host_epoch, marker, target.expose()).is_ok()
+    };
+    backend
+        .delete_if_matching(
+            &request.intent.provision.target,
+            &expected_receipt.credential_envelope_digest,
+            &mut verify,
+        )
+        .map_err(|_| ())
 }
 
 fn marker_path(root: &Path, request: &HostCredentialControlRequest) -> PathBuf {
@@ -584,6 +641,15 @@ fn marker_identity(value: &InstallerRootObjectSnapshot) -> CredentialOwnershipMa
         file_index: value.file_index,
         security_descriptor_digest: PlatformHandle::new(value.security_descriptor_digest.clone())
             .unwrap_or_else(|_| unreachable!()),
+    }
+}
+
+fn marker_snapshot(value: &CredentialOwnershipMarkerIdentity) -> InstallerRootObjectSnapshot {
+    InstallerRootObjectSnapshot {
+        canonical_path_digest: value.canonical_path_digest.as_str().to_owned(),
+        volume_serial_number: value.volume_serial_number,
+        file_index: value.file_index,
+        security_descriptor_digest: value.security_descriptor_digest.as_str().to_owned(),
     }
 }
 
@@ -755,6 +821,18 @@ fn deleted_response(
     }
 }
 
+fn deleted_response_for_receipt(
+    request: &HostCredentialControlRequest,
+    receipt: &CredentialAccessReceipt,
+) -> HostCredentialControlResponse {
+    deleted_response(
+        request,
+        &receipt.host_owner_epoch,
+        &receipt.host_process_identity,
+        &receipt.marker,
+    )
+}
+
 fn path_absent(path: &Path) -> Result<bool, ()> {
     match std::fs::symlink_metadata(path) {
         Ok(_) => Ok(false),
@@ -763,27 +841,32 @@ fn path_absent(path: &Path) -> Result<bool, ()> {
     }
 }
 
-fn write_after_final_absence<B: CredentialBackend>(
+fn write_if_absent<B: CredentialBackend>(
     backend: &B,
     target: &PlatformHandle,
     bytes: Vec<u8>,
 ) -> Result<CredentialSecret, &'static str> {
-    match backend.read(target) {
-        Ok(None) => {}
-        Ok(Some(_)) => return Err("credential-target-prewrite-race"),
-        Err(_) => return Err("credential-target-prewrite-read"),
-    }
-    backend
-        .write(target, bytes)
-        .map_err(|_| "credential-write")?;
-    backend
-        .read(target)
-        .map_err(|_| "credential-write-readback")?
-        .ok_or("credential-write-readback")
+    backend.write_if_absent(target, bytes).map_err(|error| {
+        if error.contains("already") || error.contains("exists") {
+            "credential-target-prewrite-race"
+        } else {
+            "credential-write"
+        }
+    })
 }
 
 fn path_digest(path: &Path) -> Result<PlatformHandle, String> {
     PlatformHandle::new(windows_path_identity_digest(path)).map_err(|error| error.to_string())
+}
+
+fn host_owner_epoch_binding(host_epoch: &HostInstallationEpoch) -> Result<PlatformHandle, String> {
+    handle_digest(
+        &serde_json::to_vec(&(
+            host_epoch.installation.clone(),
+            host_epoch.epoch.current.lineage.clone(),
+        ))
+        .map_err(|error| format!("serialize Host owner epoch: {error}"))?,
+    )
 }
 
 fn handle_digest(bytes: &[u8]) -> Result<PlatformHandle, String> {
@@ -942,6 +1025,40 @@ mod tests {
     }
 
     #[test]
+    fn credential_owner_binding_survives_child_host_epoch() {
+        let installation = handle("installation:test");
+        let lineage = handle("lineage:test");
+        let parent = HostInstallationEpoch {
+            installation: installation.clone(),
+            epoch: eliot_host_state::EpochTransition {
+                current: eliot_host_state::EpochIdentity {
+                    lineage: lineage.clone(),
+                    sequence: 1,
+                },
+                parent: None,
+            },
+            nonce: handle("nonce:one"),
+            recovery: None,
+        };
+        let child = HostInstallationEpoch {
+            installation,
+            epoch: eliot_host_state::EpochTransition {
+                current: eliot_host_state::EpochIdentity {
+                    lineage,
+                    sequence: 2,
+                },
+                parent: Some(parent.epoch.current.clone()),
+            },
+            nonce: handle("nonce:two"),
+            recovery: None,
+        };
+        assert_eq!(
+            host_owner_epoch_binding(&parent).unwrap(),
+            host_owner_epoch_binding(&child).unwrap()
+        );
+    }
+
+    #[test]
     fn marker_before_credential_crash_is_resumable_and_finalization_is_bound() {
         let request = request(HostCredentialControlOperation::Provision);
         let identity = identity();
@@ -1072,20 +1189,52 @@ mod tests {
             CredentialSecret::from_bytes(vec![3; 32]).map_err(|error| error.to_string())
         }
 
-        fn write(&self, _target: &PlatformHandle, bytes: Vec<u8>) -> Result<(), String> {
+        fn write_if_absent(
+            &self,
+            target: &PlatformHandle,
+            bytes: Vec<u8>,
+        ) -> Result<CredentialSecret, String> {
+            match self.read(target)? {
+                Some(_) => return Err("credential target already exists".to_owned()),
+                None => {}
+            }
+            // The fake backend models the provider's atomic create-if-absent
+            // boundary for the unit race harness; production uses the
+            // protected Win32 mutex in HostCredentialMutationCapability.
+            match self.read(target)? {
+                Some(_) => return Err("credential target already exists".to_owned()),
+                None => {}
+            }
             self.writes
                 .lock()
                 .unwrap_or_else(|error| error.into_inner())
-                .push(bytes);
-            Ok(())
+                .push(bytes.clone());
+            self.read(target)?
+                .ok_or_else(|| "credential write readback missing".to_owned())
         }
 
-        fn delete(&self, _target: &PlatformHandle) -> Result<(), String> {
-            *self
-                .deletes
-                .lock()
-                .unwrap_or_else(|error| error.into_inner()) += 1;
-            Ok(())
+        fn delete_if_matching(
+            &self,
+            target: &PlatformHandle,
+            expected_digest: &PlatformHandle,
+            verify: &mut dyn FnMut(&CredentialSecret) -> bool,
+        ) -> Result<(), String> {
+            if let Some(value) = self.read(target)? {
+                if handle_digest(value.expose()).map_err(|error| error.to_string())?
+                    != *expected_digest
+                    || !verify(&value)
+                {
+                    return Err("credential identity mismatch".to_owned());
+                }
+                *self
+                    .deletes
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner()) += 1;
+            }
+            match self.read(target)? {
+                None => Ok(()),
+                Some(_) => Err("credential delete readback present".to_owned()),
+            }
         }
     }
 
@@ -1098,7 +1247,7 @@ mod tests {
         };
         assert!(matches!(backend.read(&provision().target), Ok(None)));
         assert_eq!(
-            write_after_final_absence(&backend, &provision().target, vec![7; 64]).err(),
+            write_if_absent(&backend, &provision().target, vec![7; 64]).err(),
             Some("credential-target-prewrite-race")
         );
         assert!(
@@ -1118,7 +1267,7 @@ mod tests {
             deletes: Mutex::new(0),
         };
         assert_eq!(
-            write_after_final_absence(&backend, &provision().target, vec![7; 64]).err(),
+            write_if_absent(&backend, &provision().target, vec![7; 64]).err(),
             Some("credential-target-prewrite-race")
         );
         assert!(

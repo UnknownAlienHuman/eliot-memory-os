@@ -3781,6 +3781,27 @@ impl HostComposition {
         &self.host
     }
 
+    /// Creates the credential control only from this live Host composition's
+    /// owner lease.  Callers receive an opaque authenticated server handle;
+    /// the raw `LocalService` Credential Manager provider is not public.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the live Host owner capability or protected state
+    /// root cannot be admitted.
+    #[cfg(windows)]
+    pub fn credential_control(
+        &self,
+        host_state_root: std::path::PathBuf,
+    ) -> Result<HostCredentialControl, HostError> {
+        let capability = self
+            .owner_lease
+            .credential_mutation_capability()
+            .map_err(|error| HostError::Platform(error.to_string()))?;
+        HostCredentialControl::new(self.host.clone(), host_state_root, capability)
+            .map_err(HostError::Platform)
+    }
+
     /// Returns the canonical owner-object name held for this composition.
     ///
     /// The handle itself remains private and is released only after durable

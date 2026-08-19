@@ -2,8 +2,7 @@ use std::io::{self, BufRead, Write};
 use std::path::PathBuf;
 
 use eliot_host::{
-    HOST_JOURNAL_RELATIVE_PATH, HostComposition, HostCredentialControl, HostError,
-    PROTOCOL_VERSION, SERVICE_NAME,
+    HOST_JOURNAL_RELATIVE_PATH, HostComposition, HostError, PROTOCOL_VERSION, SERVICE_NAME,
 };
 #[cfg(windows)]
 use eliot_host::{HostBranchDisposition, HostLivenessTick};
@@ -323,22 +322,18 @@ fn spawn_credential_control(
         .parent()
         .ok_or_else(|| HostError::Platform("Host journal has no state root".to_owned()))?
         .to_path_buf();
-    let control = HostCredentialControl::new(host.host_epoch().clone(), host_state_root)
-        .map_err(HostError::Platform)?;
+    let control = host.credential_control(host_state_root)?;
     std::thread::Builder::new()
         .name("eliot-host-credential-control".to_owned())
         .spawn(move || {
             use std::sync::atomic::Ordering;
-            let runtime = match tokio::runtime::Builder::new_current_thread()
+            let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
                 .enable_io()
                 .enable_time()
                 .build()
-            {
-                Ok(runtime) => runtime,
-                Err(_) => {
-                    STOP_REQUESTED.store(true, Ordering::Release);
-                    return;
-                }
+            else {
+                STOP_REQUESTED.store(true, Ordering::Release);
+                return;
             };
             while !STOP_REQUESTED.load(Ordering::Acquire) {
                 if runtime

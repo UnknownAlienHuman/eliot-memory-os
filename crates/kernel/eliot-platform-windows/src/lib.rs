@@ -117,6 +117,17 @@ pub const HOST_OWNER_MUTEX_PREFIX: &str = "Global\\Eliot-Host-Owner-";
 /// Shared in-process authority gate between a Host owner lease and every
 /// capability derived from it.  The gate is held for the complete mutation,
 /// so release/Drop can revoke the capability before closing the OS mutex.
+/// Prefix for the Host-owned per-target Credential Manager interlock.
+///
+/// The name is derived from the installation owner and the exact credential
+/// target.  It is an inter-process exclusion primitive, not a durable
+/// transaction record; the protected Host marker and installation journal
+/// remain the authority for recovery.
+const HOST_CREDENTIAL_MUTEX_PREFIX: &str = "Global\\Eliot-Host-Credential-";
+
+/// The gate is held for every complete Host or credential mutation, so lease
+/// release cannot revoke or close the owner mutex underneath an in-flight
+/// operation.
 #[derive(Debug, Default)]
 struct HostLeaseAuthority {
     gate: Mutex<()>,
@@ -1916,6 +1927,33 @@ impl HostOwnerLease {
         }
     }
 
+    /// Issues the opaque Host-only credential mutation capability.
+    ///
+    /// The capability can only be derived from a freshly-created owner lease;
+    /// callers cannot construct the raw `LocalService` Credential Manager
+    /// primitive directly.  The lease itself must remain live for the Host
+    /// composition lifetime.
+    ///
+    /// # Errors
+    ///
+    /// Returns `IdentityMismatch` when this lease no longer owns its mutex.
+    pub fn credential_mutation_capability(
+        &self,
+    ) -> Result<HostCredentialMutationCapability, WindowsAdapterError> {
+        let _gate = self
+            .authority
+            .gate
+            .lock()
+            .map_err(|_| WindowsAdapterError::IdentityMismatch)?;
+        if !self.owns || self.authority.revoked.load(Ordering::Acquire) {
+            return Err(WindowsAdapterError::IdentityMismatch);
+        }
+        Ok(HostCredentialMutationCapability {
+            installation_digest: host_owner_identity_digest(&self.name),
+            authority: Arc::clone(&self.authority),
+        })
+    }
+
     /// Releases the owner mutex after the caller has durably recorded a
     /// release-pending Host disposition. Drop remains a last-resort close for
     /// error paths; callers must finalize clean state only after `Ok(())`.
@@ -1925,9 +1963,9 @@ impl HostOwnerLease {
     /// Returns a typed error when releasing or closing the mutex fails, or
     /// when this operation is unavailable on the current platform.
     pub fn release(&mut self) -> Result<(), HostOwnerLeaseReleaseError> {
-        // Serialize revocation with every derived Host mutation. A poisoned
-        // gate is still recovered here so the capability is revoked before
-        // touching the OS owner mutex.
+        // Serialize revocation with every derived Host or credential mutation.
+        // A poisoned gate is still recovered so capability state is revoked
+        // before touching the OS owner mutex.
         let _gate = self
             .authority
             .gate
@@ -3576,13 +3614,17 @@ impl WindowsInstallerSecretProvider {
     }
 }
 
-/// Raw current-token Credential Manager primitive used by the `LocalService` Host.
-///
-/// This type grants no installation ownership. The caller must independently
-/// prove `S-1-5-19`, durable intent, an exact create-new marker, and readback.
+/// Raw current-token Credential Manager primitive used by the `LocalService`
+/// Host.  It is deliberately private: callers must obtain the opaque
+/// Host-owned capability from a live [`HostOwnerLease`].
 #[derive(Clone, Copy, Debug, Default)]
-pub struct WindowsLocalServiceCredentialProvider;
+struct WindowsLocalServiceCredentialProvider;
 
+#[allow(
+    clippy::trivially_copy_pass_by_ref,
+    clippy::unused_self,
+    reason = "the provider methods are kept as an opaque instance boundary"
+)]
 impl WindowsLocalServiceCredentialProvider {
     /// Creates the primitive without reading or mutating Credential Manager.
     #[must_use]
@@ -3648,6 +3690,199 @@ impl WindowsLocalServiceCredentialProvider {
             return Err(WindowsAdapterError::InvalidInput);
         }
         credential_delete(target.as_str())
+    }
+}
+
+/// Opaque capability for the authenticated Host credential boundary.
+///
+/// The capability owns no secret and exposes only operations needed by the
+/// Host composition.  The write-if-absent operation holds a protected,
+/// per-installation/per-target mutex across the final read, `CredWriteW`, and
+/// authoritative readback.  This closes the real `WinCred` read/write race;
+/// a second observation immediately before `CredWriteW` is not an atomic
+/// ownership check.
+#[derive(Debug)]
+pub struct HostCredentialMutationCapability {
+    installation_digest: String,
+    authority: Arc<HostLeaseAuthority>,
+}
+
+#[allow(
+    clippy::missing_errors_doc,
+    clippy::needless_pass_by_value,
+    clippy::trivially_copy_pass_by_ref,
+    clippy::unused_self,
+    reason = "this opaque capability deliberately preserves the provider API boundary"
+)]
+impl HostCredentialMutationCapability {
+    pub fn principal_sid(&self) -> Result<PlatformHandle, WindowsAdapterError> {
+        self.with_authority(|| WindowsLocalServiceCredentialProvider::new().principal_sid())
+    }
+
+    pub fn read_optional(
+        &self,
+        target: &PlatformHandle,
+    ) -> Result<Option<CredentialSecret>, WindowsAdapterError> {
+        self.with_authority(|| WindowsLocalServiceCredentialProvider::new().read_optional(target))
+    }
+
+    pub fn generate_secret(&self) -> Result<CredentialSecret, WindowsAdapterError> {
+        self.with_authority(|| WindowsLocalServiceCredentialProvider::new().generate_secret())
+    }
+
+    pub fn write_if_absent(
+        &self,
+        target: &PlatformHandle,
+        secret: CredentialSecret,
+    ) -> Result<CredentialSecret, WindowsAdapterError> {
+        self.with_authority(|| {
+            let primitive = WindowsLocalServiceCredentialProvider::new();
+            primitive.with_target_interlock(&self.installation_digest, target, || {
+                if primitive.read_optional(target)?.is_some() {
+                    return Err(WindowsAdapterError::AlreadyExists);
+                }
+                primitive.write(target, &secret)?;
+                primitive
+                    .read_optional(target)?
+                    .ok_or(WindowsAdapterError::Unavailable)
+            })
+        })
+    }
+
+    pub fn delete(&self, target: &PlatformHandle) -> Result<(), WindowsAdapterError> {
+        self.with_authority(|| {
+            let primitive = WindowsLocalServiceCredentialProvider::new();
+            primitive.with_target_interlock(&self.installation_digest, target, || {
+                primitive.delete(target)
+            })
+        })
+    }
+
+    pub fn delete_if_matching(
+        &self,
+        target: &PlatformHandle,
+        expected_digest: &PlatformHandle,
+        mut verify: impl FnMut(&CredentialSecret) -> bool,
+    ) -> Result<(), WindowsAdapterError> {
+        self.with_authority(|| {
+            let primitive = WindowsLocalServiceCredentialProvider::new();
+            primitive.with_target_interlock(&self.installation_digest, target, || {
+                if let Some(value) = primitive.read_optional(target)? {
+                    if format!("{:x}", Sha256::digest(value.expose())) != expected_digest.as_str()
+                        || !verify(&value)
+                    {
+                        return Err(WindowsAdapterError::IdentityMismatch);
+                    }
+                    primitive.delete(target)?;
+                }
+                if primitive.read_optional(target)?.is_some() {
+                    return Err(WindowsAdapterError::Unavailable);
+                }
+                Ok(())
+            })
+        })
+    }
+
+    fn with_authority<T>(
+        &self,
+        operation: impl FnOnce() -> Result<T, WindowsAdapterError>,
+    ) -> Result<T, WindowsAdapterError> {
+        let _gate = self
+            .authority
+            .gate
+            .lock()
+            .map_err(|_| WindowsAdapterError::IdentityMismatch)?;
+        if self.authority.revoked.load(Ordering::Acquire) {
+            return Err(WindowsAdapterError::IdentityMismatch);
+        }
+        operation()
+    }
+}
+
+fn host_owner_identity_digest(name: &str) -> String {
+    format!("{:x}", Sha256::digest(name.as_bytes()))
+}
+
+#[allow(
+    clippy::trivially_copy_pass_by_ref,
+    clippy::unused_self,
+    reason = "the provider methods are kept as an opaque instance boundary"
+)]
+impl WindowsLocalServiceCredentialProvider {
+    fn with_target_interlock<T>(
+        &self,
+        installation_digest: &str,
+        target: &PlatformHandle,
+        operation: impl FnOnce() -> Result<T, WindowsAdapterError>,
+    ) -> Result<T, WindowsAdapterError> {
+        let _interlock = HostCredentialInterlock::acquire(installation_digest, target)?;
+        operation()
+    }
+}
+
+struct HostCredentialInterlock {
+    #[cfg(windows)]
+    handle: windows_sys::Win32::Foundation::HANDLE,
+}
+
+impl HostCredentialInterlock {
+    fn acquire(
+        installation_digest: &str,
+        target: &PlatformHandle,
+    ) -> Result<Self, WindowsAdapterError> {
+        #[cfg(windows)]
+        {
+            use windows_sys::Win32::Foundation::{WAIT_ABANDONED, WAIT_OBJECT_0};
+            use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
+            use windows_sys::Win32::System::Threading::{CreateMutexW, WaitForSingleObject};
+            let digest =
+                Sha256::digest(format!("{installation_digest}\0{}", target.as_str()).as_bytes());
+            let mut suffix = String::with_capacity(digest.len() * 2);
+            for byte in digest {
+                use std::fmt::Write as _;
+                let _ = write!(suffix, "{byte:02x}");
+            }
+            let name = format!("{HOST_CREDENTIAL_MUTEX_PREFIX}{suffix}");
+            let wide_name = nul_terminated_wide(std::ffi::OsStr::new(&name))
+                .map_err(|_| WindowsAdapterError::InvalidInput)?;
+            let descriptor = OwnedSecurityDescriptor::for_host_owner()?;
+            let attributes = SECURITY_ATTRIBUTES {
+                nLength: u32::try_from(std::mem::size_of::<SECURITY_ATTRIBUTES>())
+                    .map_err(|_| WindowsAdapterError::InvalidInput)?,
+                lpSecurityDescriptor: descriptor.raw,
+                bInheritHandle: 0,
+            };
+            let handle = unsafe { CreateMutexW(&raw const attributes, 0, wide_name.as_ptr()) };
+            if handle.is_null() {
+                return Err(last_windows_adapter_error());
+            }
+            let wait = unsafe { WaitForSingleObject(handle, u32::MAX) };
+            if wait == WAIT_OBJECT_0 {
+                Ok(Self { handle })
+            } else {
+                let _ = unsafe { windows_sys::Win32::Foundation::CloseHandle(handle) };
+                Err(if wait == WAIT_ABANDONED {
+                    WindowsAdapterError::IdentityMismatch
+                } else {
+                    last_windows_adapter_error()
+                })
+            }
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = (installation_digest, target);
+            Err(WindowsAdapterError::Unavailable)
+        }
+    }
+}
+
+#[cfg(windows)]
+impl Drop for HostCredentialInterlock {
+    fn drop(&mut self) {
+        use windows_sys::Win32::Foundation::CloseHandle;
+        use windows_sys::Win32::System::Threading::ReleaseMutex;
+        let _ = unsafe { ReleaseMutex(self.handle) };
+        let _ = unsafe { CloseHandle(self.handle) };
     }
 }
 
@@ -4214,7 +4449,12 @@ impl OwnedSecurityDescriptor {
     }
 
     fn for_local_service_host_marker() -> Result<Self, WindowsAdapterError> {
-        Self::from_sddl("O:LSD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;LS)")
+        // The marker is Host transaction authority, not administrator UI
+        // state.  Granting BA full access lets an unrelated administrator
+        // strand a LocalService credential by deleting or rewriting only the
+        // marker.  Host (LocalService) and recovery-capable LocalSystem are
+        // sufficient owners for this protected file.
+        Self::from_sddl("O:LSD:P(A;;FA;;;SY)(A;;FA;;;LS)")
     }
 
     fn for_user_owned_storage(sid: &str, directory: bool) -> Result<Self, WindowsAdapterError> {
@@ -12665,15 +12905,25 @@ mod tests {
             capability.live_guard().err(),
             Some(WindowsAdapterError::IdentityMismatch)
         );
+    }
 
-        let capability = {
-            let lease = test_owner_lease(Arc::new(HostLeaseAuthority::default()));
-            lease.activation_capability()
-        };
+    #[cfg(windows)]
+    #[test]
+    fn credential_capability_is_revoked_by_release_and_drop() {
+        let authority = Arc::new(HostLeaseAuthority::default());
+        let mut lease = test_owner_lease(Arc::clone(&authority));
+        let capability = lease
+            .credential_mutation_capability()
+            .unwrap_or_else(|_| unreachable!());
+        capability
+            .with_authority(|| Ok::<_, WindowsAdapterError>(()))
+            .unwrap_or_else(|_| unreachable!());
+        lease.release().unwrap_or_else(|_| unreachable!());
         assert_eq!(
-            capability.live_guard().err(),
-            Some(WindowsAdapterError::IdentityMismatch)
+            capability.with_authority(|| Ok::<_, WindowsAdapterError>(())),
+            Err(WindowsAdapterError::IdentityMismatch)
         );
+
     }
 
     #[cfg(windows)]
@@ -12691,6 +12941,35 @@ mod tests {
                 let _guard = capability.live_guard().unwrap_or_else(|_| unreachable!());
                 entered_worker.wait();
                 std::thread::sleep(std::time::Duration::from_millis(100));
+            });
+            entered.wait();
+            let started = std::time::Instant::now();
+            lease.release().unwrap_or_else(|_| unreachable!());
+            assert!(started.elapsed() >= std::time::Duration::from_millis(75));
+        });
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn credential_release_waits_for_in_flight_authority_operation() {
+        use std::sync::Barrier;
+
+        let authority = Arc::new(HostLeaseAuthority::default());
+        let mut lease = test_owner_lease(Arc::clone(&authority));
+        let capability = lease
+            .credential_mutation_capability()
+            .unwrap_or_else(|_| unreachable!());
+        let entered = Arc::new(Barrier::new(2));
+        let entered_worker = Arc::clone(&entered);
+        std::thread::scope(|scope| {
+            scope.spawn(move || {
+                capability
+                    .with_authority(|| {
+                        entered_worker.wait();
+                        std::thread::sleep(std::time::Duration::from_millis(100));
+                        Ok::<_, WindowsAdapterError>(())
+                    })
+                    .unwrap_or_else(|_| unreachable!());
             });
             entered.wait();
             let started = std::time::Instant::now();
