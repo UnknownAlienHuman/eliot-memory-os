@@ -12923,7 +12923,6 @@ mod tests {
             capability.with_authority(|| Ok::<_, WindowsAdapterError>(())),
             Err(WindowsAdapterError::IdentityMismatch)
         );
-
     }
 
     #[cfg(windows)]

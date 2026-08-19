@@ -31,8 +31,8 @@ use eliot_platform_windows::{
     ServiceRegistrationOutcome, ServiceRegistrationRequest, ServiceStartMode, UserOwnedPathLease,
     UserOwnedRootReadLease, WindowsInstallerRootPrimitive, WindowsInstallerSecretProvider,
     WindowsPlatform, current_user_local_app_data_root, fresh_service_registration_nonce,
-    observe_running_eliot_host_process,
-    protected_program_data_root, require_protected_program_data_path,
+    observe_running_eliot_host_process, protected_program_data_root,
+    require_protected_program_data_path,
 };
 use redb::{Database, ReadOnlyDatabase, ReadableDatabase, TableDefinition};
 use schemars::JsonSchema;
@@ -4943,6 +4943,10 @@ pub struct InstallationEffectRequest {
 
 impl InstallationEffectRequest {
     /// Validates an exact effect request before it crosses the adapter boundary.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the request validator keeps all cross-effect identity and lifecycle invariants together"
+    )]
     pub fn validate(&self) -> Result<(), InstallationError> {
         handle(&self.transaction_id, "effect.transaction_id")?;
         self.plan.validate()?;
@@ -7364,8 +7368,11 @@ where
                         )?;
                     }
                     (InstallerEffectPlan::CreateRoot { .. }, None)
-                    | (InstallerEffectPlan::ApplyAcl { .. }, Some(_))
-                    | (InstallerEffectPlan::ProvisionStoreCredential { .. }, Some(_)) => {
+                    | (
+                        InstallerEffectPlan::ApplyAcl { .. }
+                        | InstallerEffectPlan::ProvisionStoreCredential { .. },
+                        Some(_),
+                    ) => {
                         return self.persist_unknown(
                             transaction,
                             index,
