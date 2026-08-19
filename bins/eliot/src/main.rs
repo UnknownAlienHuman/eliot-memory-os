@@ -12,6 +12,7 @@ use eliot_installation::{
     WindowsInstallationCoordinator, decode_installation_transaction_json,
     parse_installation_transaction_id,
 };
+use eliot_platform_windows::{ProtectedRootLease, canonical_windows_path};
 use serde_json::json;
 use std::path::PathBuf;
 use std::{fs, io::Read, path::Path};
@@ -294,7 +295,69 @@ fn run_installation_create(input: &Path, store_path: &Path) -> Result<i32> {
 }
 
 fn run_installation_registry_status(registry: &Path) -> Result<i32> {
-    let registry_value = match RedbInstallationRegistry::inspect_existing(registry) {
+    let registry_file_name = registry.file_name().and_then(|value| value.to_str());
+    if registry_file_name
+        .is_none_or(|value| !value.eq_ignore_ascii_case("installation-registry.redb"))
+    {
+        write_json_error(
+            "INSTALLATION_STATUS_INVALID",
+            "registry must name the fixed installation-registry.redb child",
+        );
+        return Ok(INVALID_REQUEST_EXIT);
+    }
+    match std::fs::symlink_metadata(registry) {
+        Ok(metadata) if metadata.is_file() => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            write_json_error(
+                "INSTALLATION_STATUS_UNAVAILABLE",
+                "registry does not exist; status never creates it",
+            );
+            return Ok(INVALID_REQUEST_EXIT);
+        }
+        Ok(_) | Err(_) => {
+            write_json_error(
+                "INSTALLATION_STATUS_INVALID",
+                "registry is not an existing regular file",
+            );
+            return Ok(INVALID_REQUEST_EXIT);
+        }
+    }
+    let Some(host_state_root) = registry.parent() else {
+        write_json_error(
+            "INSTALLATION_STATUS_INVALID",
+            "registry has no absolute Host-state parent",
+        );
+        return Ok(INVALID_REQUEST_EXIT);
+    };
+    let host_state_root = match ProtectedRootLease::open_existing(host_state_root) {
+        Ok(root) => root,
+        Err(error) => {
+            write_json_error("INSTALLATION_STATUS_INVALID", &error.to_string());
+            return Ok(INVALID_REQUEST_EXIT);
+        }
+    };
+    let expected_registry = match host_state_root.canonical_path() {
+        Ok(root) => root.join("installation-registry.redb"),
+        Err(error) => {
+            write_json_error("INSTALLATION_STATUS_INVALID", &error.to_string());
+            return Ok(INVALID_REQUEST_EXIT);
+        }
+    };
+    let observed_registry = match canonical_windows_path(registry) {
+        Ok(path) => path,
+        Err(error) => {
+            write_json_error("INSTALLATION_STATUS_INVALID", &error.to_string());
+            return Ok(INVALID_REQUEST_EXIT);
+        }
+    };
+    if observed_registry != expected_registry {
+        write_json_error(
+            "INSTALLATION_STATUS_INVALID",
+            "registry is not the exact retained Host-state child",
+        );
+        return Ok(INVALID_REQUEST_EXIT);
+    }
+    let registry_value = match RedbInstallationRegistry::inspect_existing_at(host_state_root) {
         Ok(Some(registry_value)) => registry_value,
         Ok(None) => {
             write_json_error(

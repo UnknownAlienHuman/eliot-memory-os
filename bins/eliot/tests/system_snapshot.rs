@@ -109,7 +109,7 @@ fn installation_status_requires_existing_explicit_registry() {
     let temp_root =
         std::env::temp_dir().join(format!("eliot-installation-status-{}", std::process::id()));
     fs::create_dir_all(&temp_root).expect("create status fixture");
-    let registry = temp_root.join("missing.redb");
+    let registry = temp_root.join("installation-registry.redb");
     let result = Command::new(env!("CARGO_BIN_EXE_eliot"))
         .current_dir(&temp_root)
         .args([
@@ -125,6 +125,32 @@ fn installation_status_requires_existing_explicit_registry() {
     assert!(!registry.exists(), "status created a missing registry");
     let output: Value = serde_json::from_slice(&result.stdout).expect("status JSON error");
     assert_eq!(output["code"], "INSTALLATION_STATUS_UNAVAILABLE");
+    let _ = fs::remove_dir_all(temp_root);
+}
+
+#[test]
+fn installation_status_rejects_a_noncanonical_registry_child_without_creation() {
+    let temp_root = std::env::temp_dir().join(format!(
+        "eliot-installation-status-substitution-{}",
+        std::process::id()
+    ));
+    fs::create_dir_all(&temp_root).expect("create status substitution fixture");
+    let registry = temp_root.join("other.redb");
+    let result = Command::new(env!("CARGO_BIN_EXE_eliot"))
+        .current_dir(&temp_root)
+        .args([
+            "installation",
+            "status",
+            "--registry",
+            registry.to_str().expect("registry is utf8"),
+        ])
+        .output()
+        .expect("run substituted status command");
+
+    assert!(!result.status.success());
+    assert!(!registry.exists(), "status created a substituted registry");
+    let output: Value = serde_json::from_slice(&result.stdout).expect("status JSON error");
+    assert_eq!(output["code"], "INSTALLATION_STATUS_INVALID");
     let _ = fs::remove_dir_all(temp_root);
 }
 

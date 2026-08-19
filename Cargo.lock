@@ -561,6 +561,7 @@ dependencies = [
  "eliot-bootstrap",
  "eliot-cli",
  "eliot-installation",
+ "eliot-platform-windows",
  "eliot-protocol",
  "serde",
  "serde_json",
