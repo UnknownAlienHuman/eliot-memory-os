@@ -5,7 +5,8 @@ use eliot_engine::{
     DelegationCalibrationIngestService, DelegationCalibrationRollupService,
     DelegationCounterfactualService, DelegationPolicyCandidateService,
     DelegationPromotionGateService, DelegationShadowEvaluationService,
-    IndependentOutcomeEvidenceService, ProviderUtilityAssessmentService,
+    IndependentOutcomeEvidenceService, ProviderUtilityAssessmentService, WorkState,
+    work_lease_is_active,
 };
 use eliot_types::{
     AntigravityNormalizedResult, CalibrationCompleteness, CalibrationEvidenceClass,
@@ -56,15 +57,12 @@ pub fn campaign_preview(
     if input.selection_rule.trim().is_empty() || input.policy_snapshot_id.trim().is_empty() {
         bail!("campaign selection rule and policy snapshot are required");
     }
-    let project_root = root
-        .parent()
-        .filter(|path| !path.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new("."));
-    let dirty = git_output(project_root, &["status", "--porcelain=v1"])?;
+    let project_root = campaign_project_root(root, input.project_id, input.task_id)?;
+    let dirty = git_output(&project_root, &["status", "--porcelain=v1"])?;
     if !dirty.trim().is_empty() {
         bail!("campaign baseline freeze requires a clean Git tree");
     }
-    let baseline_commit = git_output(project_root, &["rev-parse", "HEAD"])?;
+    let baseline_commit = git_output(&project_root, &["rev-parse", "HEAD"])?;
     let baseline_state_hash = baseline_hash(
         baseline_commit.trim(),
         &input.policy_snapshot_id,
@@ -125,6 +123,52 @@ pub fn campaign_preview(
         "campaign":campaign,
         "provider_process_started":false
     }))
+}
+
+fn campaign_project_root(root: &Path, project_id: ProjectId, task_id: TaskId) -> Result<PathBuf> {
+    let work_state = crate::delegation_runtime::load_work_state(root)?;
+    let declared_root = select_campaign_repo_root(&work_state, project_id, task_id)?;
+    let project_root = PathBuf::from(declared_root)
+        .canonicalize()
+        .context("active WorkLease repository root is unavailable")?;
+    if !project_root.is_absolute() {
+        bail!("active WorkLease repository root must be absolute");
+    }
+    let observed_git_root =
+        PathBuf::from(git_output(&project_root, &["rev-parse", "--show-toplevel"])?.trim())
+            .canonicalize()
+            .context("active WorkLease repository root is not a canonical Git root")?;
+    if observed_git_root != project_root {
+        bail!("active WorkLease repository root must be the exact Git root");
+    }
+    Ok(project_root)
+}
+
+fn select_campaign_repo_root(
+    work_state: &WorkState,
+    project_id: ProjectId,
+    task_id: TaskId,
+) -> Result<&str> {
+    select_unique_campaign_repo_root(work_state.leases.iter().filter_map(|lease| {
+        (lease.project_id == project_id && lease.task_id == task_id && work_lease_is_active(lease))
+            .then_some(lease.scope.repo_root.as_str())
+    }))
+}
+
+fn select_unique_campaign_repo_root<'a>(
+    roots: impl IntoIterator<Item = &'a str>,
+) -> Result<&'a str> {
+    let mut roots = roots.into_iter();
+    let first = roots
+        .next()
+        .context("campaign requires an active WorkLease for the exact project and task")?;
+    if first.trim().is_empty() {
+        bail!("active WorkLease repository root is empty");
+    }
+    if roots.any(|candidate| candidate != first) {
+        bail!("active WorkLeases disagree on the campaign repository root");
+    }
+    Ok(first)
 }
 
 #[allow(clippy::too_many_lines)]
@@ -965,4 +1009,31 @@ fn baseline_hash(commit: &str, policy_snapshot: &str, frozen_refs: &[String]) ->
 #[allow(dead_code)]
 fn parse_ids(project: &str, task: &str) -> Result<(ProjectId, TaskId)> {
     Ok((ProjectId::from_str(project)?, TaskId::from_str(task)?))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::select_unique_campaign_repo_root;
+
+    #[test]
+    fn campaign_root_is_the_exact_active_work_scope_root() {
+        let root = r"C:\Development\Rust\projects\eliot-memory-os";
+        assert_eq!(
+            select_unique_campaign_repo_root([root, root]).ok(),
+            Some(root)
+        );
+    }
+
+    #[test]
+    fn campaign_root_rejects_missing_empty_or_divergent_work_scopes() {
+        assert!(select_unique_campaign_repo_root(std::iter::empty()).is_err());
+        assert!(select_unique_campaign_repo_root([""]).is_err());
+        assert!(
+            select_unique_campaign_repo_root([
+                r"C:\Development\Rust\projects\eliot-memory-os",
+                r"C:\Development\Rust\worktrees\runtime-live-v3\integration-staging",
+            ])
+            .is_err()
+        );
+    }
 }
