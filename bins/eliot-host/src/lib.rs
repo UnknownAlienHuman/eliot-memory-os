@@ -1109,12 +1109,14 @@ enum BranchLiveness {
 }
 
 #[cfg(windows)]
+#[allow(dead_code)]
 enum CutoverLaunchOutcome {
     Candidate,
     Rollback { candidate_error: String },
 }
 
 #[cfg(windows)]
+#[allow(dead_code)]
 impl CutoverLaunchOutcome {
     fn activation_generation<'a>(
         &self,
@@ -2880,6 +2882,7 @@ impl HostJobBranches {
     /// the prior approved contour fails.
     #[allow(
         clippy::too_many_arguments,
+        dead_code,
         reason = "candidate and rollback authority sets stay explicit to prevent cross-generation substitution"
     )]
     fn cutover_with_rollback(
@@ -2984,6 +2987,7 @@ impl HostJobBranches {
         Ok(())
     }
 
+    #[allow(dead_code)]
     fn terminate_store_then_kernel(&mut self) -> Result<(), HostError> {
         let store = self.terminate_store();
         let kernel = self.terminate_kernel();
@@ -3518,15 +3522,138 @@ fn append_clean_marker<B: JournalBackend>(
     Ok(())
 }
 
+/// Digest of the immutable installer identity that a Host journal activation
+/// must carry before it can be reconciled after a process crash.  The journal
+/// does not become an authority source: this digest only proves that its
+/// self-authored Active contour is the same pending candidate the registry
+/// still names.
+fn pending_activation_binding(
+    pending: &eliot_installation::PendingActivation,
+) -> Result<PlatformHandle, HostError> {
+    let digest = sha256_json(&(
+        "pending-activation-binding-v1",
+        &pending.transaction_id,
+        &pending.plan_digest,
+        &pending.manifest.generation,
+        &pending.config_digest,
+        &pending.kernel_artifact_digest,
+        &pending.store_bridge_artifact_digest,
+        &pending.canonical_store_artifact_digest,
+        &pending.runtime_state_roots_digest,
+        &pending.manifest_digest,
+    ))?;
+    PlatformHandle::new(format!("pending-activation-binding:{digest}"))
+        .map_err(|error| HostError::Platform(error.to_string()))
+}
+
+struct PendingActivationReopenProof {
+    binding: PlatformHandle,
+}
+
+/// Accepts the only journal state that may finish a registry commit after a
+/// crash.  In particular, this never treats a merely Starting/ControlReady
+/// contour as active and never relaunches a candidate while reconciling.
+fn validate_pending_activation_reopen(
+    state: &HostState,
+    pending: &eliot_installation::PendingActivation,
+) -> Result<PendingActivationReopenProof, HostError> {
+    let activation = state.activation.as_ref().ok_or_else(|| {
+        HostError::RecoveryRequired("pending activation journal has no Host record".to_owned())
+    })?;
+    if activation.state != ActivationState::Active
+        || !activation.readiness.control_ready
+        || !activation.readiness.supervision_ready
+    {
+        return Err(HostError::RecoveryRequired(
+            "pending activation journal is not durably Host Active".to_owned(),
+        ));
+    }
+    if state.host.installation
+        != pending
+            .manifest
+            .runtime_launch
+            .installation_epoch
+            .installation
+    {
+        return Err(HostError::RecoveryRequired(
+            "pending activation journal installation binding differs".to_owned(),
+        ));
+    }
+    let binding = pending_activation_binding(pending)?;
+    if !activation
+        .trigger_evidence
+        .iter()
+        .any(|value| value == &binding)
+    {
+        return Err(HostError::RecoveryRequired(
+            "pending activation journal lacks the exact candidate binding".to_owned(),
+        ));
+    }
+    let kernel = state.kernel.as_ref().ok_or_else(|| {
+        HostError::RecoveryRequired("pending activation journal has no Kernel record".to_owned())
+    })?;
+    if kernel.state != KernelActivationState::Active
+        || kernel.one_time_nonce.state() != NonceState::Consumed
+        || kernel.active_pipe_identity.is_none()
+        || kernel.approved_artifact_hash != pending.kernel_artifact_digest
+    {
+        return Err(HostError::RecoveryRequired(
+            "pending activation journal lacks exact active Kernel evidence".to_owned(),
+        ));
+    }
+    let process = kernel.process.as_ref().ok_or_else(|| {
+        HostError::RecoveryRequired(
+            "pending activation Kernel process evidence is absent".to_owned(),
+        )
+    })?;
+    let job = kernel.candidate_job_binding.as_ref().ok_or_else(|| {
+        HostError::RecoveryRequired("pending activation Kernel Job evidence is absent".to_owned())
+    })?;
+    if process.state != ServiceProcessState::Ready
+        || process.health.liveness != HealthDimension::Healthy
+        || process.health.readiness != HealthDimension::Healthy
+    {
+        return Err(HostError::RecoveryRequired(
+            "pending activation Kernel process is not durably healthy".to_owned(),
+        ));
+    }
+    let observation = state
+        .readiness_observations
+        .iter()
+        .rev()
+        .find(|observation| {
+            observation.fence == kernel.fence
+                && observation.config_digest == pending.config_digest
+                && observation.kernel_process.process_id == process.process_id
+                && observation.kernel_job == *job
+        })
+        .ok_or_else(|| {
+            HostError::RecoveryRequired(
+                "pending activation lacks exact persisted readiness evidence".to_owned(),
+            )
+        })?;
+    if observation.store_fence.as_str().is_empty()
+        || observation.authority_epoch != process.authority_epoch.value()
+    {
+        return Err(HostError::RecoveryRequired(
+            "pending activation readiness evidence is incomplete".to_owned(),
+        ));
+    }
+    Ok(PendingActivationReopenProof { binding })
+}
+
+#[allow(clippy::too_many_lines)]
 fn open_production_epoch(
     path: &Path,
     installation: PlatformHandle,
+    pending: Option<&eliot_installation::PendingActivation>,
 ) -> Result<
     (
         ProductionHostStateJournal,
         HostInstallationEpoch,
         EpochTransition,
         PlatformHandle,
+        Option<PendingActivationReopenProof>,
     ),
     HostError,
 > {
@@ -3537,7 +3664,7 @@ fn open_production_epoch(
         .map(|epoch| epoch.host.clone());
     drop(inspection);
 
-    let (journal, host, activation_generation) = if let Some(last_host) = last_host {
+    let (journal, host, activation_generation, reopen_proof) = if let Some(last_host) = last_host {
         if last_host.installation != installation {
             return Err(HostError::OwnerLeaseRecovery(
                 "Host journal installation identity does not match admission".to_owned(),
@@ -3555,24 +3682,41 @@ fn open_production_epoch(
             }
         }
         let replayed = current.snapshot()?;
-        if replayed.clean_marker.is_none() {
-            return Err(HostError::OwnerLeaseRecovery(
-                "current Host journal epoch is unclean; explicit new-lineage recovery is required"
-                    .to_owned(),
-            ));
-        }
-        let activation_generation = replayed
-            .activation
-            .as_ref()
-            .map(|activation| activation.fence.activation_generation.direct_child())
-            .transpose()?
-            .unwrap_or(root_epoch(fresh_identity("activation-lineage")?));
+        let reopen_proof = match pending {
+            Some(pending) => Some(validate_pending_activation_reopen(&replayed, pending)?),
+            None if replayed.clean_marker.is_none() => {
+                return Err(HostError::OwnerLeaseRecovery(
+                    "current Host journal epoch is unclean; explicit new-lineage recovery is required"
+                        .to_owned(),
+                ));
+            }
+            None => None,
+        };
+        let activation_generation = if reopen_proof.is_some() {
+            replayed
+                .activation
+                .as_ref()
+                .map(|activation| activation.fence.activation_generation.clone())
+                .ok_or_else(|| {
+                    HostError::RecoveryRequired(
+                        "pending activation reopen lost the activation fence".to_owned(),
+                    )
+                })?
+        } else {
+            replayed
+                .activation
+                .as_ref()
+                .map(|activation| activation.fence.activation_generation.direct_child())
+                .transpose()?
+                .unwrap_or(root_epoch(fresh_identity("activation-lineage")?))
+        };
         let host = child_host_epoch(&last_host)?;
         let backend = current.into_backend()?;
         (
             HostStateJournalService::from_backend(backend, host.clone())?,
             host,
             activation_generation,
+            reopen_proof,
         )
     } else {
         let host = fresh_host_epoch(installation, None)?;
@@ -3580,20 +3724,42 @@ fn open_production_epoch(
             ProductionHostStateJournal::open(path, host.clone())?,
             host,
             root_epoch(fresh_identity("activation-lineage")?),
+            None,
         )
     };
-    let activation_id = fresh_identity("activation")?;
-    append_reconciled(
-        &journal,
-        HostStateRecord::Activation(initial_activation_record(
-            &host,
-            &activation_id,
-            &activation_generation,
-            ActivationState::Stopped,
-            "host-open",
-        )?),
-    )?;
-    Ok((journal, host, activation_generation, activation_id))
+    let activation_id = if reopen_proof.is_some() {
+        journal
+            .snapshot()?
+            .activation
+            .as_ref()
+            .map(|activation| activation.activation_id.clone())
+            .ok_or_else(|| {
+                HostError::RecoveryRequired(
+                    "pending activation reopen lost the active activation identity".to_owned(),
+                )
+            })?
+    } else {
+        fresh_identity("activation")?
+    };
+    if reopen_proof.is_none() {
+        append_reconciled(
+            &journal,
+            HostStateRecord::Activation(initial_activation_record(
+                &host,
+                &activation_id,
+                &activation_generation,
+                ActivationState::Stopped,
+                "host-open",
+            )?),
+        )?;
+    }
+    Ok((
+        journal,
+        host,
+        activation_generation,
+        activation_id,
+        reopen_proof,
+    ))
 }
 
 /// Host-owned lifecycle state and installation activation registry.
@@ -3638,11 +3804,12 @@ impl HostComposition {
             return Err(HostError::MissingInstallation);
         }
         let owner_lease = HostOwnerLease::acquire(&installation).map_err(owner_lease_error)?;
-        let (journal, host, activation_generation, activation_id) =
-            open_production_epoch(path, installation)?;
         let registry_path = path.with_file_name("installation-registry.redb");
         let registry_store = RedbInstallationRegistry::open(registry_path)?;
         let registry = registry_store.load()?;
+        let pending_for_reopen = registry.pending_activation().cloned();
+        let (journal, host, activation_generation, activation_id, reopen_proof) =
+            open_production_epoch(path, installation, pending_for_reopen.as_ref())?;
         #[cfg(windows)]
         let jobs =
             HostJobBranches::new(&host).map_err(|error| HostError::Platform(error.to_string()))?;
@@ -3666,7 +3833,7 @@ impl HostComposition {
         };
         #[cfg(windows)]
         if let Some(pending) = composition.registry.pending_activation().cloned() {
-            composition.reconcile_pending_activation(&pending)?;
+            composition.reconcile_pending_activation(&pending, reopen_proof.as_ref())?;
         } else if let Some(active) = composition.registry.active().cloned() {
             composition.start_approved_contour(
                 PathBuf::from(active.manifest.kernel_executable_path.as_str()),
@@ -3840,6 +4007,7 @@ impl HostComposition {
     }
 
     #[cfg(windows)]
+    #[allow(dead_code)]
     fn fail_current_kernel_record(&self, evidence: &str) -> Result<(), HostError> {
         let current = self.journal.snapshot()?.kernel.ok_or_else(|| {
             HostError::OwnerLeaseRecovery(
@@ -3850,6 +4018,7 @@ impl HostComposition {
     }
 
     #[cfg(windows)]
+    #[allow(dead_code)]
     fn activate_launched_kernel(
         &mut self,
         generation: &PlatformHandle,
@@ -3904,6 +4073,7 @@ impl HostComposition {
             &active.manifest,
             kernel_executable.as_ref(),
             store_executable.as_ref(),
+            None,
         )
     }
 
@@ -3913,8 +4083,23 @@ impl HostComposition {
         manifest: &CandidateManifest,
         kernel_executable: &Path,
         store_executable: &Path,
+        pending: Option<&eliot_installation::PendingActivation>,
     ) -> Result<(), HostError> {
-        self.transition_activation(ActivationState::Starting, "host-start-approved")?;
+        if let Some(pending) = pending {
+            let current = self.journal.snapshot()?.activation.ok_or_else(|| {
+                HostError::OwnerLeaseRecovery("activation record is absent".to_owned())
+            })?;
+            let mut next = transition_activation_record(
+                &current,
+                ActivationState::Starting,
+                "host-start-pending",
+            )?;
+            next.trigger_evidence
+                .push(pending_activation_binding(pending)?);
+            self.append_record(HostStateRecord::Activation(next))?;
+        } else {
+            self.transition_activation(ActivationState::Starting, "host-start-approved")?;
+        }
         self.request_watchdog(&manifest.runtime_launch)?;
         let (kernel_artifact, store_artifact) = manifest
             .host_child_artifact_digests()
@@ -3980,9 +4165,12 @@ impl HostComposition {
     fn reconcile_pending_activation(
         &mut self,
         pending: &eliot_installation::PendingActivation,
+        reopen_proof: Option<&PendingActivationReopenProof>,
     ) -> Result<(), HostError> {
         self.ensure_admission_open()?;
+        let host_capability = self.owner_lease.activation_capability();
         let pending = self.registry.claim_pending_activation(
+            &host_capability,
             &pending.transaction_id,
             &pending.plan_digest,
             &pending.manifest.generation,
@@ -3999,14 +4187,30 @@ impl HostComposition {
                 "pending activation installation epoch is stale".to_owned(),
             ));
         }
+        if reopen_proof.is_some() {
+            let expected_binding = pending_activation_binding(&pending)?;
+            if reopen_proof.is_some_and(|proof| proof.binding != expected_binding) {
+                return Err(HostError::RecoveryRequired(
+                    "pending activation reopen proof changed during registry claim".to_owned(),
+                ));
+            }
+            self.commit_pending_durable(&pending, &host_capability)?;
+            return Ok(());
+        }
         let kernel = PathBuf::from(pending.manifest.kernel_executable_path.as_str());
         let store = PathBuf::from(pending.manifest.canonical_store_executable_path.as_str());
-        if let Err(error) = self.start_manifest_contour(&pending.manifest, &kernel, &store) {
+        if let Err(error) =
+            self.start_manifest_contour(&pending.manifest, &kernel, &store, Some(&pending))
+        {
             if pending.prior_active_generation.is_none() {
-                self.registry
-                    .abort_pending_activation(&pending.transaction_id, &pending.plan_digest)?;
+                self.registry.abort_pending_activation(
+                    &host_capability,
+                    &pending.transaction_id,
+                    &pending.plan_digest,
+                )?;
             } else {
                 self.registry.mark_pending_recovery(
+                    &host_capability,
                     &pending.transaction_id,
                     &pending.plan_digest,
                     error.to_string(),
@@ -4015,7 +4219,7 @@ impl HostComposition {
             self.registry_store.save(&self.registry)?;
             return Err(error);
         }
-        self.commit_pending_durable(&pending)?;
+        self.commit_pending_durable(&pending, &host_capability)?;
         Ok(())
     }
 
@@ -4023,9 +4227,11 @@ impl HostComposition {
     fn commit_pending_durable(
         &mut self,
         pending: &eliot_installation::PendingActivation,
+        host_capability: &eliot_platform_windows::HostOwnerEpochCapability,
     ) -> Result<(), HostError> {
         let before = self.registry.clone();
         self.registry.commit_pending_activation(
+            host_capability,
             &pending.transaction_id,
             &pending.plan_digest,
             &pending.manifest.generation,
@@ -4033,6 +4239,7 @@ impl HostComposition {
         if let Err(error) = self.registry_store.save(&self.registry) {
             self.registry = before;
             let recovery = self.registry.mark_pending_recovery(
+                host_capability,
                 &pending.transaction_id,
                 &pending.plan_digest,
                 "activation commit outcome is unknown",
@@ -4065,9 +4272,10 @@ impl HostComposition {
     #[cfg(windows)]
     #[allow(
         clippy::too_many_lines,
+        dead_code,
         reason = "candidate activation and exact rollback reactivation form one ordered durable cutover transaction"
     )]
-    pub fn cutover_generation(
+    fn cutover_generation(
         &mut self,
         generation: &PlatformHandle,
         candidate_kernel: impl AsRef<Path>,
@@ -4076,6 +4284,7 @@ impl HostComposition {
         prior_store: impl AsRef<Path>,
     ) -> Result<(), HostError> {
         self.ensure_admission_open()?;
+        let host_capability = self.owner_lease.activation_capability();
         let pending = self.registry.pending_activation().cloned().ok_or_else(|| {
             HostError::ProcessContour("cutover requires a pending activation".to_owned())
         })?;
@@ -4139,6 +4348,7 @@ impl HostComposition {
             Ok(launch) => launch,
             Err(error) => {
                 let _ = self.registry.mark_pending_recovery(
+                    &host_capability,
                     &pending.transaction_id,
                     &pending.plan_digest,
                     error.to_string(),
@@ -4150,6 +4360,7 @@ impl HostComposition {
         if let Err(error) = self.fail_current_kernel_record("kernel-cutover-prior-terminated") {
             let cleanup = self.cleanup_launched_contour(error);
             let _ = self.registry.mark_pending_recovery(
+                &host_capability,
                 &pending.transaction_id,
                 &pending.plan_digest,
                 "prior Kernel termination evidence failed",
@@ -4179,6 +4390,7 @@ impl HostComposition {
                 )));
             }
             if let Err(error) = self.registry.mark_pending_recovery(
+                &host_capability,
                 &pending.transaction_id,
                 &pending.plan_digest,
                 candidate_error.clone(),
@@ -4236,6 +4448,7 @@ impl HostComposition {
                 )));
             }
             if let Err(error) = self.registry.mark_pending_recovery(
+                &host_capability,
                 &pending.transaction_id,
                 &pending.plan_digest,
                 candidate_error.to_string(),
@@ -4262,6 +4475,7 @@ impl HostComposition {
             let cleanup =
                 self.cleanup_active_kernel_contour(error, "candidate-process-observation-failed");
             let _ = self.registry.mark_pending_recovery(
+                &host_capability,
                 &pending.transaction_id,
                 &pending.plan_digest,
                 reason,
@@ -4269,7 +4483,7 @@ impl HostComposition {
             let _ = self.registry_store.save(&self.registry);
             cleanup
         } else {
-            self.commit_pending_durable(&pending)?;
+            self.commit_pending_durable(&pending, &host_capability)?;
             Ok(())
         }
     }
@@ -5992,6 +6206,80 @@ mod journal_tests {
                 .readiness_observations
                 .is_empty()
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn pending_activation_reopen_requires_exact_active_journal_before_commit() {
+        let fixture = active_readiness_fixture();
+        let (mut manifest, _root) = liveness_manifest_with_distinct_store_digests();
+        manifest.runtime_launch.installation_epoch.installation = fixture
+            .journal
+            .snapshot()
+            .unwrap()
+            .host
+            .installation
+            .clone();
+        let pending = eliot_installation::PendingActivation {
+            transaction_id: PlatformHandle::new("transaction:reopen").unwrap(),
+            plan_digest: PlatformHandle::new("e".repeat(64)).unwrap(),
+            config_digest: manifest.config_digest.clone(),
+            kernel_artifact_digest: manifest.kernel_artifact_digest.clone(),
+            store_bridge_artifact_digest: manifest.store_bridge_artifact_digest.clone(),
+            canonical_store_artifact_digest: manifest.canonical_store_artifact_digest.clone(),
+            runtime_state_roots_digest: manifest.runtime_state_roots_digest.clone(),
+            manifest_digest: PlatformHandle::new(sha256_json(&manifest).unwrap()).unwrap(),
+            prior_active_generation: None,
+            approval_ref: PlatformHandle::new("approval:reopen").unwrap(),
+            manifest,
+            state: eliot_installation::PendingActivationState::Pending,
+        };
+        let proof = authenticated_proof(&fixture, 17);
+        append_authenticated_kernel_readiness(
+            &fixture.journal,
+            &proof,
+            &fixture.kernel_artifact,
+            &fixture.config,
+        )
+        .unwrap();
+        let snapshot = fixture.journal.snapshot().unwrap();
+        let mut control_ready = transition_activation_record(
+            snapshot.activation.as_ref().unwrap(),
+            ActivationState::ControlReady,
+            "pending-reopen-control-ready",
+        )
+        .unwrap();
+        control_ready
+            .trigger_evidence
+            .push(pending_activation_binding(&pending).unwrap());
+        append_reconciled(&fixture.journal, HostStateRecord::Activation(control_ready)).unwrap();
+        let ready_snapshot = fixture.journal.snapshot().unwrap();
+        let active = transition_activation_record(
+            ready_snapshot.activation.as_ref().unwrap(),
+            ActivationState::Active,
+            "pending-reopen-active",
+        )
+        .unwrap();
+        append_reconciled(&fixture.journal, HostStateRecord::Activation(active)).unwrap();
+
+        // Reopen the persisted journal image before evaluating admission.  This
+        // keeps the regression on the same durable replay boundary as a Host
+        // restart instead of validating only the in-memory projection.
+        let host = fixture.journal.snapshot().unwrap().host;
+        let backend = fixture.journal.into_backend().unwrap();
+        let reopened = HostStateJournalService::from_backend(
+            ImageBackend {
+                image: backend.durable_image().clone(),
+            },
+            host,
+        )
+        .unwrap();
+        let durable = reopened.snapshot().unwrap();
+        assert!(validate_pending_activation_reopen(&durable, &pending).is_ok());
+
+        let mut partial = durable;
+        partial.activation.as_mut().unwrap().state = ActivationState::ControlReady;
+        assert!(validate_pending_activation_reopen(&partial, &pending).is_err());
     }
 
     #[test]

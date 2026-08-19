@@ -1746,6 +1746,16 @@ pub struct HostOwnerLease {
     name: String,
 }
 
+/// Compile-time proof that the caller owns the installation Host epoch.
+///
+/// The field is intentionally private and the only constructor is exposed by
+/// [`HostOwnerLease::activation_capability`].  Consumers can carry this proof
+/// across crate boundaries, but cannot forge or deserialize one.
+#[derive(Debug)]
+pub struct HostOwnerEpochCapability {
+    _private: (),
+}
+
 impl HostOwnerLease {
     /// Acquires the canonical installation-wide Host owner mutex.
     ///
@@ -1846,6 +1856,20 @@ impl HostOwnerLease {
     #[must_use]
     pub fn is_for_installation(&self, installation: &PlatformHandle) -> bool {
         self.name == host_owner_mutex_name(installation)
+    }
+
+    /// Returns a Host-only activation capability while this owner lease is held.
+    #[must_use]
+    pub const fn activation_capability(&self) -> HostOwnerEpochCapability {
+        HostOwnerEpochCapability { _private: () }
+    }
+
+    /// Creates the inert capability used by provider-neutral tests on targets
+    /// without a Windows owner mutex. Production Windows callers must obtain
+    /// this value from [`Self::activation_capability`] instead.
+    #[cfg(not(windows))]
+    pub const fn unsupported_platform_test_capability() -> HostOwnerEpochCapability {
+        HostOwnerEpochCapability { _private: () }
     }
 
     /// Releases the owner mutex after the caller has durably recorded a

@@ -21,15 +21,15 @@ use eliot_platform::{
     PortOutcome, ProviderError, ProviderErrorCode, UnknownReason,
 };
 use eliot_platform_windows::{
-    ELIOT_HOST_SERVICE_NAME, ELIOT_WATCHDOG_SERVICE_NAME, InstallerRootAbsentSnapshot,
-    InstallerRootCreateDisposition, InstallerRootError, InstallerRootObjectSnapshot,
-    InstallerRootPrimitiveObservation, InstallerRootPrimitiveSpec, InstallerRootProfile,
-    InstallerSecretCreateDisposition, InstallerSecretObservation, ProtectedPathError,
-    ProtectedPathLease, ProtectedRootLease, ServiceAccount, ServiceBootstrapArguments,
-    ServiceRegistrationCurrent, ServiceRegistrationInspection, ServiceRegistrationOutcome,
-    ServiceRegistrationRequest, ServiceStartMode, UserOwnedPathLease, UserOwnedRootReadLease,
-    WindowsInstallerRootPrimitive, WindowsInstallerSecretProvider, WindowsPlatform,
-    current_user_local_app_data_root, fresh_service_registration_nonce,
+    ELIOT_HOST_SERVICE_NAME, ELIOT_WATCHDOG_SERVICE_NAME, HostOwnerEpochCapability,
+    InstallerRootAbsentSnapshot, InstallerRootCreateDisposition, InstallerRootError,
+    InstallerRootObjectSnapshot, InstallerRootPrimitiveObservation, InstallerRootPrimitiveSpec,
+    InstallerRootProfile, InstallerSecretCreateDisposition, InstallerSecretObservation,
+    ProtectedPathError, ProtectedPathLease, ProtectedRootLease, ServiceAccount,
+    ServiceBootstrapArguments, ServiceRegistrationCurrent, ServiceRegistrationInspection,
+    ServiceRegistrationOutcome, ServiceRegistrationRequest, ServiceStartMode, UserOwnedPathLease,
+    UserOwnedRootReadLease, WindowsInstallerRootPrimitive, WindowsInstallerSecretProvider,
+    WindowsPlatform, current_user_local_app_data_root, fresh_service_registration_nonce,
     protected_program_data_root, require_protected_program_data_path,
 };
 use redb::{Database, ReadOnlyDatabase, ReadableDatabase, TableDefinition};
@@ -2790,10 +2790,24 @@ impl ApprovedGenerationRegistry {
     }
 
     /// Host-only claim/retry transition for one exact pending identity.
+    ///
+    /// The capability is minted only by the live Host owner lease. An external
+    /// installer or plugin cannot call this method without that proof.
+    ///
+    /// ```compile_fail
+    /// # use eliot_installation::ApprovedGenerationRegistry;
+    /// # use eliot_platform::PlatformHandle;
+    /// # let mut registry = ApprovedGenerationRegistry::new();
+    /// # let transaction = PlatformHandle::new("tx").unwrap();
+    /// # let plan = PlatformHandle::new("plan").unwrap();
+    /// # let generation = PlatformHandle::new("generation").unwrap();
+    /// registry.claim_pending_activation(&transaction, &plan, &generation);
+    /// ```
     /// Recovery-required records may be retried with the same transaction and
     /// plan digest; substitutions are rejected before any process launch.
     pub fn claim_pending_activation(
         &mut self,
+        _host: &HostOwnerEpochCapability,
         transaction_id: &PlatformHandle,
         plan_digest: &PlatformHandle,
         generation: &PlatformHandle,
@@ -2836,6 +2850,7 @@ impl ApprovedGenerationRegistry {
     /// The transaction and plan digest are mandatory idempotency bindings.
     pub fn commit_pending_activation(
         &mut self,
+        _host: &HostOwnerEpochCapability,
         transaction_id: &PlatformHandle,
         plan_digest: &PlatformHandle,
         generation: &PlatformHandle,
@@ -2866,6 +2881,7 @@ impl ApprovedGenerationRegistry {
     /// Records an unknown/failed Host attempt without advertising the candidate.
     pub fn mark_pending_recovery(
         &mut self,
+        _host: &HostOwnerEpochCapability,
         transaction_id: &PlatformHandle,
         plan_digest: &PlatformHandle,
         reason: impl Into<String>,
@@ -2886,6 +2902,7 @@ impl ApprovedGenerationRegistry {
     /// Aborts a first-install candidate without creating an active/LKG state.
     pub fn abort_pending_activation(
         &mut self,
+        _host: &HostOwnerEpochCapability,
         transaction_id: &PlatformHandle,
         plan_digest: &PlatformHandle,
     ) -> Result<(), InstallationError> {
@@ -7051,8 +7068,28 @@ mod tests {
     use super::*;
     #[cfg(windows)]
     use eliot_platform_windows::UserOwnedRootLease;
+    use eliot_platform_windows::{HostOwnerEpochCapability, HostOwnerLease};
 
     static NEXT_TRANSACTION_ROOT: AtomicU64 = AtomicU64::new(0);
+
+    fn host_capability() -> HostOwnerEpochCapability {
+        #[cfg(not(windows))]
+        {
+            HostOwnerLease::unsupported_platform_test_capability()
+        }
+        #[cfg(windows)]
+        {
+            let installation = test_handle(format!(
+                "test-host-owner-{}",
+                NEXT_TRANSACTION_ROOT.fetch_add(1, Ordering::Relaxed)
+            ));
+            Box::leak(Box::new(
+                HostOwnerLease::acquire(&installation)
+                    .unwrap_or_else(|error| panic!("test Host owner lease: {error}")),
+            ))
+            .activation_capability()
+        }
+    }
 
     #[derive(Clone, Default)]
     struct SharedStore {
@@ -9387,6 +9424,7 @@ mod tests {
     #[test]
     fn pending_activation_is_not_active_until_host_commit_and_retries_by_digest() {
         let transaction = registering_transaction();
+        let host = host_capability();
         let mut registry = ApprovedGenerationRegistry::new();
         must(registry.stage_pending_activation(
             transaction.transaction_id.clone(),
@@ -9403,12 +9441,14 @@ mod tests {
             test_handle("approval:pending"),
         ));
         must(registry.mark_pending_recovery(
+            &host,
             &transaction.transaction_id,
             &transaction.installer_plan_digest,
             "simulated pre-launch crash",
         ));
         assert!(matches!(
             must(registry.claim_pending_activation(
+                &host,
                 &transaction.transaction_id,
                 &transaction.installer_plan_digest,
                 &transaction.candidate_manifest.generation,
@@ -9419,6 +9459,7 @@ mod tests {
         let wrong_plan = test_handle("f".repeat(64));
         assert!(matches!(
             registry.commit_pending_activation(
+                &host,
                 &transaction.transaction_id,
                 &wrong_plan,
                 &transaction.candidate_manifest.generation,
@@ -9426,6 +9467,7 @@ mod tests {
             Err(InstallationError::IdentityConflict)
         ));
         must(registry.commit_pending_activation(
+            &host,
             &transaction.transaction_id,
             &transaction.installer_plan_digest,
             &transaction.candidate_manifest.generation,
@@ -9441,6 +9483,7 @@ mod tests {
     #[test]
     fn upgrade_failure_preserves_prior_active_and_rejects_binding_substitution() {
         let first = registering_transaction();
+        let host = host_capability();
         let mut registry = ApprovedGenerationRegistry::new();
         must(registry.stage_pending_activation(
             first.transaction_id.clone(),
@@ -9449,6 +9492,7 @@ mod tests {
             test_handle("approval:first"),
         ));
         must(registry.commit_pending_activation(
+            &host,
             &first.transaction_id,
             &first.installer_plan_digest,
             &first.candidate_manifest.generation,
@@ -9491,6 +9535,7 @@ mod tests {
         assert!(registry.validate().is_err());
         registry.pending_activation = Some(original_pending);
         must(registry.mark_pending_recovery(
+            &host,
             &upgrade_tx,
             &upgrade_plan,
             "journal-active-before-commit",
@@ -9505,6 +9550,7 @@ mod tests {
     #[test]
     fn first_install_pending_abort_leaves_registry_empty() {
         let transaction = registering_transaction();
+        let host = host_capability();
         let mut registry = ApprovedGenerationRegistry::new();
         must(registry.stage_pending_activation(
             transaction.transaction_id.clone(),
@@ -9513,6 +9559,7 @@ mod tests {
             test_handle("approval:abort"),
         ));
         must(registry.abort_pending_activation(
+            &host,
             &transaction.transaction_id,
             &transaction.installer_plan_digest,
         ));
