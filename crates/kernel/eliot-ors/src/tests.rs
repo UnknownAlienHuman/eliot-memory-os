@@ -1388,6 +1388,41 @@ fn authority_handoff_is_typed_one_shot_and_survives_restart() -> TestResult {
 }
 
 #[test]
+fn authority_handoff_terminal_consume_can_follow_expired_admission() -> TestResult {
+    let path = database_path("authority-handoff-expired-admission");
+    let store = RedbRecoveryStore::open(&path)?;
+    let reserved = handoff_record(AuthorityHandoffState::Reserved)?;
+    assert!(matches!(
+        store.begin_authority_handoff(&reserved)?,
+        AuthorityHandoffBegin::Acquired
+    ));
+    let consumed = AuthorityHandoffRecord {
+        state: AuthorityHandoffState::Consumed,
+        consumed_at_ms: Some(250),
+        ..reserved.clone()
+    };
+    store.persist_authority_handoff(&consumed)?;
+    assert_eq!(
+        store
+            .load_authority_handoff(&reserved.handoff_id)?
+            .ok_or("expired-admission handoff")?
+            .state,
+        AuthorityHandoffState::Consumed
+    );
+    assert!(
+        store
+            .persist_authority_handoff(&AuthorityHandoffRecord {
+                state: AuthorityHandoffState::Unknown,
+                reconciliation_evidence: Some(OpaqueLabel::new("must-not-demote")?),
+                ..consumed
+            })
+            .is_err()
+    );
+    cleanup(&path);
+    Ok(())
+}
+
+#[test]
 fn multi_scope_reservation_is_atomic_ordered_and_conflict_on_duplicate() -> TestResult {
     let path = database_path("atomic");
     cleanup(&path);

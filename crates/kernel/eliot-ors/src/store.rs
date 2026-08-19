@@ -675,8 +675,7 @@ impl RedbRecoveryStore {
                 (
                     AuthorityHandoffState::Reserved,
                     AuthorityHandoffState::Consumed | AuthorityHandoffState::Unknown,
-                )
-                | (AuthorityHandoffState::Consumed, AuthorityHandoffState::Unknown) => true,
+                ) => true,
                 (AuthorityHandoffState::Consumed, AuthorityHandoffState::Consumed)
                 | (AuthorityHandoffState::Unknown, AuthorityHandoffState::Unknown) => {
                     existing == *record

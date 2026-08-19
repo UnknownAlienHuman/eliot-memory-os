@@ -836,8 +836,13 @@ impl AuthorityHandoffRecord {
         ) {
             (AuthorityHandoffState::Reserved, None, None)
             | (AuthorityHandoffState::Unknown, None, Some(_)) => {}
+            // `expires_at_ms` bounds fresh admission, not recovery of an
+            // already activated authority.  A crash may leave the exact
+            // Reserved handoff and replay snapshot durable while the
+            // one-shot admission interval elapses; Kernel then records the
+            // terminal Consumed state during restart reconciliation.
             (AuthorityHandoffState::Consumed, Some(consumed), None)
-                if consumed >= self.issued_at_ms && consumed <= self.expires_at_ms => {}
+                if consumed >= self.issued_at_ms => {}
             _ => {
                 return Err(OrsError::IntegrityProblem {
                     record_type: "authority_handoff",

@@ -765,8 +765,15 @@ impl ProcessAuthorityHandoffDescriptor {
         Ok(())
     }
 
-    /// Validates syntax, digest material, time bounds, and exact fence bindings.
-    pub fn validate(&self, now_ms: i64) -> Result<(), KernelServiceError> {
+    /// Validates syntax, digest material, and exact fence bindings without
+    /// applying the one-shot admission expiry.
+    ///
+    /// Recovery must be able to inspect an immutable descriptor after its
+    /// admission interval has elapsed.  The durable ORS handoff and exact
+    /// replay snapshot decide whether that is a permitted restart; callers
+    /// admitting a fresh Reserved handoff must additionally require
+    /// `expires_at_ms > now_ms`.
+    pub fn validate_structure(&self) -> Result<(), KernelServiceError> {
         if self.contract_version != Self::CONTRACT_VERSION {
             return Err(KernelServiceError::InvalidField {
                 field: "contract_version",
@@ -802,13 +809,10 @@ impl ProcessAuthorityHandoffDescriptor {
                 });
             }
         }
-        if self.issued_at_ms < 0
-            || self.expires_at_ms <= self.issued_at_ms
-            || self.expires_at_ms <= now_ms
-        {
+        if self.issued_at_ms < 0 || self.expires_at_ms <= self.issued_at_ms {
             return Err(KernelServiceError::InvalidField {
                 field: "expires_at_ms",
-                reason: "descriptor is expired or has invalid bounds",
+                reason: "descriptor has invalid bounds",
             });
         }
         self.state_fence
@@ -851,6 +855,19 @@ impl ProcessAuthorityHandoffDescriptor {
         }
         AuthoritySnapshotBindingWire::validate(&self.snapshot_binding)?;
         self.verify_digest()
+    }
+
+    /// Validates syntax, digest material, time bounds, and exact fence
+    /// bindings for a fresh one-shot admission.
+    pub fn validate(&self, now_ms: i64) -> Result<(), KernelServiceError> {
+        self.validate_structure()?;
+        if self.expires_at_ms <= now_ms {
+            return Err(KernelServiceError::InvalidField {
+                field: "expires_at_ms",
+                reason: "descriptor is expired",
+            });
+        }
+        Ok(())
     }
 }
 
@@ -919,6 +936,17 @@ mod descriptor_tests {
         let round_trip: ProcessAuthorityHandoffDescriptor =
             serde_json::from_slice(&bytes).expect("round trip");
         round_trip.validate(500).expect("round trip validation");
+    }
+
+    #[test]
+    fn descriptor_structure_survives_expiry_for_recovery_inspection() {
+        let mut descriptor = descriptor().with_computed_digest().expect("digest");
+        descriptor.expires_at_ms = 200;
+        descriptor = descriptor.with_computed_digest().expect("updated digest");
+        descriptor
+            .validate_structure()
+            .expect("expired descriptor remains structurally inspectable");
+        assert!(descriptor.validate(500).is_err());
     }
 
     #[test]

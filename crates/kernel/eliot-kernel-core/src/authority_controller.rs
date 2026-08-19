@@ -373,6 +373,54 @@ impl ProcessDispatchAuthorityController {
         }
     }
 
+    /// Activates a fresh authority and commits its empty replay fence before
+    /// the caller can expose the controller to any gateway.
+    ///
+    /// A clean first boot has no replay snapshot to restore.  The initial
+    /// snapshot is nevertheless durable evidence of the exact authority
+    /// binding and is the linearization point that makes a later restart safe.
+    pub fn activate_and_persist_initial(
+        authority_id: DispatchAuthorityId,
+        key: KernelDispatchKey,
+        store: Arc<dyn OperationalRecoveryStore>,
+        codec: Arc<dyn DispatchSnapshotCodec>,
+        binding: &AuthoritySnapshotBinding,
+    ) -> KernelResult<Self> {
+        ensure_binding(&authority_id, binding)?;
+        let mut controller = Self::activate(authority_id, key, store, codec);
+        controller.persist_snapshot(binding)?;
+        Ok(controller)
+    }
+
+    /// Checks whether ORS contains the exact metadata-bound replay snapshot
+    /// for an authority without consuming the caller's secret key.
+    ///
+    /// This is used to choose between clean activation and restart recovery.
+    /// An existing but mismatched record is an integrity failure, never an
+    /// invitation to overwrite it with a fresh empty snapshot.
+    pub fn exact_snapshot_present(
+        authority_id: &DispatchAuthorityId,
+        store: &dyn OperationalRecoveryStore,
+        binding: &AuthoritySnapshotBinding,
+    ) -> KernelResult<bool> {
+        ensure_binding(authority_id, binding)?;
+        let subject = subject_id(authority_id)?;
+        let Some(recovered) = store.load_authority_snapshot(&subject)? else {
+            return Ok(false);
+        };
+        let record = recovered.snapshot().record();
+        if record.subject_id != subject
+            || record.record_id != *binding.record_id()
+            || record.authority_epoch != *binding.authority_epoch()
+            || record.state_fence != *binding.state_fence()
+            || record.created_at_ms != binding.created_at_ms()
+            || record.cleanup_after_ms != binding.cleanup_after_ms()
+        {
+            return Err(KernelError::FenceMismatch);
+        }
+        Ok(true)
+    }
+
     /// Restores one exact replay snapshot from P-06 before exposing the
     /// controller to callers.
     ///
