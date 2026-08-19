@@ -5,6 +5,38 @@ $ErrorActionPreference = 'Stop'
 $repo = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
 . (Join-Path $repo 'scripts/build-eliot-windows-x64-release.ps1')
 
+$metadata = (& cargo metadata --format-version 1 --no-deps 2>$null | Out-String) | ConvertFrom-Json
+if ($LASTEXITCODE -ne 0) {
+    throw 'failed to load Cargo metadata for runtime artifact contract tests'
+}
+$runtimePlan = @(Get-RuntimeArtifactPlan $metadata)
+$expectedRuntime = @(
+    'eliot/eliot/cli/runtime/eliot.exe'
+    'eliot-host/eliot-host/host/runtime/eliot-host.exe'
+    'eliot-watchdog/eliot-watchdog/watchdog/runtime/eliot-watchdog.exe'
+    'eliot-kernel/eliot-kernel/kernel/runtime/eliot-kernel.exe'
+    'eliot-store-surreal/eliot-store-surreal/store_bridge/runtime/eliot-store-surreal.exe'
+)
+$actualRuntime = @($runtimePlan | ForEach-Object { "$($_.package)/$($_.binary)/$($_.role)/$($_.relative_path)" })
+if ($actualRuntime.Count -ne $expectedRuntime.Count -or
+    (Compare-Object -ReferenceObject $expectedRuntime -DifferenceObject $actualRuntime).Count -ne 0) {
+    throw 'Cargo runtime package/bin contract does not match the SystemService contour'
+}
+$missingMetadata = [pscustomobject]@{
+    target_directory = $metadata.target_directory
+    packages = @($metadata.packages | Where-Object { [string]$_.name -ne 'eliot-watchdog' })
+}
+$missingRejected = $false
+try {
+    Get-RuntimeArtifactPlan $missingMetadata | Out-Null
+}
+catch {
+    $missingRejected = $_.Exception.Message -match 'eliot-watchdog'
+}
+if (-not $missingRejected) {
+    throw 'missing runtime package metadata was not rejected'
+}
+
 $tempBase = [System.IO.Path]::GetFullPath([System.IO.Path]::GetTempPath())
 $root = Join-Path $tempBase "eliot-release-security-$([guid]::NewGuid().ToString('N'))"
 try {

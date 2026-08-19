@@ -10,6 +10,105 @@ param(
 
 $ErrorActionPreference = 'Stop'
 $repo = Split-Path -Parent $PSScriptRoot
+$runtimeArtifactDefinitions = @(
+    [pscustomobject]@{
+        package = 'eliot'
+        binary = 'eliot'
+        role = 'cli'
+        relative_path = 'runtime/eliot.exe'
+    }
+    [pscustomobject]@{
+        package = 'eliot-host'
+        binary = 'eliot-host'
+        role = 'host'
+        relative_path = 'runtime/eliot-host.exe'
+    }
+    [pscustomobject]@{
+        package = 'eliot-watchdog'
+        binary = 'eliot-watchdog'
+        role = 'watchdog'
+        relative_path = 'runtime/eliot-watchdog.exe'
+    }
+    [pscustomobject]@{
+        package = 'eliot-kernel'
+        binary = 'eliot-kernel'
+        role = 'kernel'
+        relative_path = 'runtime/eliot-kernel.exe'
+    }
+    [pscustomobject]@{
+        package = 'eliot-store-surreal'
+        binary = 'eliot-store-surreal'
+        role = 'store_bridge'
+        relative_path = 'runtime/eliot-store-surreal.exe'
+    }
+)
+
+function Get-RuntimeArtifactDefinitions {
+    return @($runtimeArtifactDefinitions | ForEach-Object {
+            [pscustomobject]@{
+                package = [string]$_.package
+                binary = [string]$_.binary
+                role = [string]$_.role
+                relative_path = [string]$_.relative_path
+            }
+        })
+}
+
+function Get-RuntimeArtifactPlan([object]$Metadata) {
+    if (-not $Metadata -or [string]::IsNullOrWhiteSpace([string]$Metadata.target_directory)) {
+        throw 'Cargo metadata did not provide a target directory for runtime artifacts'
+    }
+    $targetDirectory = [System.IO.Path]::GetFullPath([string]$Metadata.target_directory)
+    $packages = @{}
+    foreach ($package in @($Metadata.packages)) {
+        $packageName = [string]$package.name
+        if ($packageName -and $packages.ContainsKey($packageName)) {
+            throw "Cargo metadata contains a duplicate package name: $packageName"
+        }
+        if ($packageName) {
+            $packages[$packageName] = $package
+        }
+    }
+
+    $plan = foreach ($definition in Get-RuntimeArtifactDefinitions) {
+        if (-not $packages.ContainsKey($definition.package)) {
+            throw "Cargo metadata is missing required runtime package: $($definition.package)"
+        }
+        $targets = @($packages[$definition.package].targets | Where-Object {
+                [string]$_.name -eq $definition.binary -and @($_.kind) -contains 'bin'
+            })
+        if ($targets.Count -ne 1) {
+            throw "Cargo metadata must expose exactly one binary target '$($definition.binary)' for package '$($definition.package)'"
+        }
+        [pscustomobject]@{
+            package = $definition.package
+            binary = $definition.binary
+            role = $definition.role
+            relative_path = $definition.relative_path
+            path = Join-Path $targetDirectory "release\$($definition.binary).exe"
+        }
+    }
+    return @($plan)
+}
+
+function Get-VerifiedRuntimeArtifacts([object[]]$Plan) {
+    $artifacts = foreach ($entry in @($Plan)) {
+        if (-not (Test-Path -LiteralPath $entry.path -PathType Leaf)) {
+            throw "required runtime executable is missing: $($entry.path)"
+        }
+        $file = Get-Item -LiteralPath $entry.path
+        Assert-NoSecretFile $file $entry.relative_path
+        [ordered]@{
+            package = $entry.package
+            binary = $entry.binary
+            role = $entry.role
+            path = $entry.relative_path
+            sha256 = (Get-FileHash -LiteralPath $file.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+            bytes = $file.Length
+        }
+    }
+    return @($artifacts)
+}
 
 function Assert-SafeRelativePath([string]$Path, [string]$Purpose) {
     $normalized = $Path.Replace('\', '/')
@@ -183,6 +282,12 @@ function Test-ReleaseBundle([string]$Path) {
     Assert-NoReleaseSecrets $resolved
     $required = @(
         'eliot-governor.exe',
+        'runtime/eliot.exe',
+        'runtime/eliot-host.exe',
+        'runtime/eliot-watchdog.exe',
+        'runtime/eliot-kernel.exe',
+        'runtime/eliot-store-surreal.exe',
+        'runtime/RUNTIME_ARTIFACTS.json',
         'operator/Eliot.Operator.exe',
         'config',
         'integrations',
@@ -267,6 +372,58 @@ function Test-ReleaseBundle([string]$Path) {
         throw 'release Codex plugin binary differs from the release Governor binary'
     }
 
+    $runtimeManifestPath = Join-Path $resolved 'runtime/RUNTIME_ARTIFACTS.json'
+    $runtimeManifest = Get-Content -LiteralPath $runtimeManifestPath -Raw | ConvertFrom-Json
+    if ([string]$runtimeManifest.schema -ne 'eliot-runtime-artifact-set-v1' -or
+        [string]$runtimeManifest.source_commit -notmatch '^[0-9a-f]{40}$' -or
+        [string]$runtimeManifest.installation_approval -ne 'not-issued' -or
+        $runtimeManifest.signed -ne $false) {
+        throw 'runtime artifact manifest is missing its verified-build-only boundary'
+    }
+    if ([string]$runtimeManifest.source_commit -ne [string]$release.source_commit -or
+        [string]$runtimeManifest.version -ne [string]$release.version -or
+        [string]$runtimeManifest.architecture -ne 'windows-x64') {
+        throw 'runtime artifact manifest does not match RELEASE.json'
+    }
+    $expectedRuntime = @(Get-RuntimeArtifactDefinitions)
+    $declaredRuntime = @($runtimeManifest.artifacts)
+    if ($declaredRuntime.Count -ne $expectedRuntime.Count) {
+        throw "runtime artifact manifest count mismatch: declared=$($declaredRuntime.Count) expected=$($expectedRuntime.Count)"
+    }
+    $runtimePaths = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    foreach ($expected in $expectedRuntime) {
+        $entry = @($declaredRuntime | Where-Object {
+                [string]$_.package -eq $expected.package -and [string]$_.binary -eq $expected.binary
+            })
+        if ($entry.Count -ne 1) {
+            throw "runtime artifact manifest is missing or duplicates $($expected.package)/$($expected.binary)"
+        }
+        $entry = $entry[0]
+        if ([string]$entry.role -ne $expected.role -or [string]$entry.path -ne $expected.relative_path -or
+            [string]$entry.sha256 -notmatch '^[0-9a-f]{64}$' -or [int64]$entry.bytes -le 0) {
+            throw "runtime artifact manifest has invalid metadata for $($expected.package)/$($expected.binary)"
+        }
+        $relative = ([string]$entry.path).Replace('\', '/')
+        if (-not $runtimePaths.Add($relative) -or $relative -ne $expected.relative_path) {
+            throw "runtime artifact manifest path is duplicated or non-canonical: $relative"
+        }
+        $candidate = Join-Path $resolved $relative.Replace('/', '\')
+        if (-not (Test-Path -LiteralPath $candidate -PathType Leaf)) {
+            throw "runtime artifact is missing: $relative"
+        }
+        $file = Get-Item -LiteralPath $candidate
+        $actualHash = (Get-FileHash -LiteralPath $candidate -Algorithm SHA256).Hash.ToLowerInvariant()
+        if ($actualHash -ne [string]$entry.sha256 -or $file.Length -ne [int64]$entry.bytes) {
+            throw "runtime artifact digest mismatch: $relative"
+        }
+    }
+    $actualRuntimeExecutables = @(Get-ChildItem -LiteralPath (Join-Path $resolved 'runtime') -Filter '*.exe' -File |
+        ForEach-Object { $_.FullName.Substring($resolved.Length).TrimStart([char]'\').Replace('\', '/') })
+    if ($actualRuntimeExecutables.Count -ne $expectedRuntime.Count -or
+        @($actualRuntimeExecutables | Where-Object { -not $runtimePaths.Contains($_) }).Count -ne 0) {
+        throw 'runtime directory contains an unmanifested executable'
+    }
+
     $manifest = Get-Content -LiteralPath (Join-Path $resolved 'SHA256SUMS.json') -Raw | ConvertFrom-Json
     if ([string]$release.source_commit -notmatch '^[0-9a-f]{40}$' -or $release.source_commit -ne $manifest.source_commit) {
         throw 'release source commit is missing, malformed, or differs from the checksum manifest'
@@ -325,6 +482,7 @@ $cargoMetadata = (& cargo metadata --format-version 1 --no-deps 2>$null | Out-St
 if ($LASTEXITCODE -ne 0 -or -not $cargoMetadata.target_directory) {
     throw 'failed to resolve the Cargo target directory'
 }
+$runtimeArtifactPlan = Get-RuntimeArtifactPlan $cargoMetadata
 $governorPath = Join-Path ([string]$cargoMetadata.target_directory) 'release\eliot-governor.exe'
 $sourceCommit = (& git -C $repo rev-parse HEAD 2>$null | Out-String).Trim()
 if ($LASTEXITCODE -ne 0 -or $sourceCommit -notmatch '^[0-9a-f]{40}$') {
@@ -353,7 +511,16 @@ $plan = [ordered]@{
     codex_plugin_source = $codexPluginSource
     codex_plugin_base_version = $codexPluginBaseVersion
     codex_mcp_profile = 'codex_controller'
-    includes = @('governor', 'operator', 'config', 'integrations', 'codex-marketplace', 'codex-plugin', 'skills', 'migrations', 'operations-runbooks')
+    runtime_artifacts = @($runtimeArtifactPlan | ForEach-Object {
+            [ordered]@{
+                package = $_.package
+                binary = $_.binary
+                role = $_.role
+                path = $_.relative_path
+                build_path = $_.path
+            }
+        })
+    includes = @('governor', 'runtime-artifacts', 'operator', 'config', 'integrations', 'codex-marketplace', 'codex-plugin', 'skills', 'migrations', 'operations-runbooks')
     signing_required_before_public_distribution = $true
 }
 
@@ -378,9 +545,15 @@ try {
     if ($SkipBuild) {
         throw 'SkipBuild is not permitted for staged releases because it cannot prove Governor source provenance'
     }
-    & cargo build --release -p eliot-app
+    & cargo build --release -p eliot-app --bin eliot-governor
     if ($LASTEXITCODE -ne 0) {
-        throw "cargo release build failed with exit code $LASTEXITCODE"
+        throw "cargo Governor release build failed with exit code $LASTEXITCODE"
+    }
+    foreach ($artifact in $runtimeArtifactPlan) {
+        & cargo build --release -p $artifact.package --bin $artifact.binary
+        if ($LASTEXITCODE -ne 0) {
+            throw "cargo runtime release build failed for $($artifact.package)/$($artifact.binary) with exit code $LASTEXITCODE"
+        }
     }
     $postBuildCommit = (& git -C $repo rev-parse HEAD 2>$null | Out-String).Trim()
     $postBuildChanges = @(& git -C $repo status --porcelain --untracked-files=no)
@@ -392,6 +565,7 @@ try {
     if (-not (Test-Path -LiteralPath $governor -PathType Leaf)) {
         throw "release governor executable is missing: $governor"
     }
+    $verifiedRuntimeArtifacts = @(Get-VerifiedRuntimeArtifacts $runtimeArtifactPlan)
 
     if (Test-Path -LiteralPath $bundle) {
         throw "release bundle already exists; choose another version or output root: $bundle"
@@ -399,6 +573,22 @@ try {
     New-Item -ItemType Directory -Path $bundle | Out-Null
     Assert-NoSecretFile (Get-Item -LiteralPath $governor) 'eliot-governor.exe'
     Copy-Item -LiteralPath $governor -Destination $bundle
+    $runtimeRoot = Join-Path $bundle 'runtime'
+    New-Item -ItemType Directory -Path $runtimeRoot -Force | Out-Null
+    foreach ($artifact in $runtimeArtifactPlan) {
+        Copy-Item -LiteralPath $artifact.path -Destination (Join-Path $bundle $artifact.relative_path)
+    }
+    [ordered]@{
+        schema = 'eliot-runtime-artifact-set-v1'
+        component = 'eliot_runtime_verified_build_artifacts'
+        version = $Version
+        source_commit = $sourceCommit
+        architecture = 'windows-x64'
+        build_profile = 'release'
+        signed = $false
+        installation_approval = 'not-issued'
+        artifacts = @($verifiedRuntimeArtifacts)
+    } | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath (Join-Path $runtimeRoot 'RUNTIME_ARTIFACTS.json') -Encoding utf8
     Copy-TrackedTree $repo $sourceCommit 'config' (Join-Path $bundle 'config')
     Copy-TrackedTree $repo $sourceCommit 'integrations' (Join-Path $bundle 'integrations')
     $codexPluginRoot = Join-Path $bundle 'integrations/codex/plugins/eliot-governor'
@@ -434,6 +624,8 @@ try {
         operator_protocol_version = $protocolVersion
         operator_protocol_hash = $protocolHash
         codex_plugin_base_version = $codexPluginBaseVersion
+        runtime_artifacts_manifest = 'runtime/RUNTIME_ARTIFACTS.json'
+        runtime_artifact_count = $runtimeArtifactPlan.Count
         architecture = 'windows-x64'
         signed = $false
         public_distribution_ready = $false
