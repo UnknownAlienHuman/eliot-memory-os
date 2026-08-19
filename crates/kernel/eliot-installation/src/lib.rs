@@ -6087,9 +6087,9 @@ impl WindowsInstallationEffectPort {
             .as_ref()
             .ok_or(PortError::InvalidRequestMetadata)?;
         // `effect_request` has already validated the transaction-bound
-        // installation root before this sealed port is reached. Host's
-        // selector is therefore the only admitted fixed child; Watchdog keeps
-        // its original four bootstrap pairs plus nonce.
+        // installation root before this sealed port is reached. Host and its
+        // sibling Watchdog must select the same fixed Host-state child; neither
+        // service may infer the legacy global contour.
         let installation_root = PathBuf::from(request.installation_root.as_str());
         let bootstrap = ServiceBootstrapArguments::new(
             Path::new(bootstrap.descriptor_path.as_str()).to_path_buf(),
@@ -6098,12 +6098,7 @@ impl WindowsInstallationEffectPort {
             bootstrap.plan_generation,
             Vec::<String>::new(),
         )
-        .and_then(|value| match role {
-            InstallerServiceRole::Host => {
-                value.with_host_state_root(installation_root.join("host"))
-            }
-            InstallerServiceRole::Watchdog => Ok(value),
-        })
+        .and_then(|value| value.with_host_state_root(installation_root.join("host")))
         .and_then(|value| value.with_registration_nonce(nonce.as_str()))
         .map_err(|_| PortError::InvalidRequestMetadata)?;
         let mut registration = ServiceRegistrationRequest::with_bootstrap(
@@ -9772,7 +9767,11 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn service_context_binds_host_root_only_for_host_argv() {
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one table-style regression preserves the complete ordered Host and Watchdog SCM argv"
+    )]
+    fn service_context_binds_same_host_root_for_host_and_watchdog_argv() {
         let root =
             std::env::temp_dir().join(format!("eliot-service-context-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
@@ -9869,6 +9868,8 @@ mod tests {
                 "installation:service".to_owned(),
                 "--tx-plan-generation".to_owned(),
                 "7".to_owned(),
+                "--host-state-root".to_owned(),
+                root.join("host").to_string_lossy().into_owned(),
                 "--registration-nonce".to_owned(),
                 "c".repeat(64),
             ]
