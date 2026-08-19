@@ -105,6 +105,7 @@ pub fn run_ul_doctor(host: UlDoctorHostArg) -> Result<()> {
         "eliot_fetch_l2",
         "eliot_compile_packet_l3",
         "eliot_agent_candidate_submit",
+        "eliot.observe",
         "eliot_memory_influence_trace",
         "eliot_write_cognitive_observation",
     ];
@@ -116,7 +117,7 @@ pub fn run_ul_doctor(host: UlDoctorHostArg) -> Result<()> {
         "part-e-tool-list",
         names == exact_names.into_iter().collect(),
         format!(
-            "use exact seven-tool profile in {}",
+            "use exact eight-tool profile in {}",
             root.join("crates/eliot-app/src/mcp_stdio.rs").display()
         ),
     ));

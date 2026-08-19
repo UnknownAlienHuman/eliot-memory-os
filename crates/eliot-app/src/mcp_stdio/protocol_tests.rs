@@ -1381,7 +1381,32 @@ fn installed_codex_profile_resolves_to_exact_worker_surface() -> Result<()> {
 }
 
 #[test]
-fn c5_all_native_worker_hosts_share_exact_seven_tool_schemas() -> Result<()> {
+fn c5_all_native_worker_hosts_share_exact_eight_tool_schemas() -> Result<()> {
+    let expected_names = [
+        "eliot_current_state",
+        "eliot_recall_l0",
+        "eliot_fetch_l2",
+        "eliot_compile_packet_l3",
+        "eliot_agent_candidate_submit",
+        "eliot.observe",
+        "eliot_memory_influence_trace",
+        "eliot_write_cognitive_observation",
+    ]
+    .into_iter()
+    .map(str::to_owned)
+    .collect::<BTreeSet<_>>();
+    assert_eq!(expected_names.len(), 8);
+    assert!(expected_names.contains("eliot.observe"));
+    assert_eq!(
+        expected_names,
+        PART_E_WORKER_TOOLS
+            .iter()
+            .copied()
+            .map(str::to_owned)
+            .collect::<BTreeSet<_>>(),
+        "the native worker expectation must track the canonical Part-E surface"
+    );
+
     let mut canonical = None;
     for host in ["codex", "claude", "antigravity", "opencode"] {
         let profile = resolve_effective_profile("default", Some(host), false)?;
@@ -1390,16 +1415,12 @@ fn c5_all_native_worker_hosts_share_exact_seven_tool_schemas() -> Result<()> {
             .iter()
             .filter_map(|tool| tool["name"].as_str().map(str::to_owned))
             .collect::<BTreeSet<_>>();
+        assert_eq!(names, expected_names, "{host} worker semantics drifted");
         assert_eq!(
-            names,
-            PART_E_WORKER_TOOLS
-                .iter()
-                .copied()
-                .map(str::to_owned)
-                .collect(),
-            "{host} worker semantics drifted"
+            tools.len(),
+            expected_names.len(),
+            "{host} must expose exactly the eight expected tools"
         );
-        assert_eq!(tools.len(), 7, "{host} must expose exactly seven tools");
         assert!(
             profile_instructions(profile).contains("Host identity grants no controller"),
             "{host} inferred authority from host identity"

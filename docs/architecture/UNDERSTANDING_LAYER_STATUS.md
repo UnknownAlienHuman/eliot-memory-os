@@ -10,7 +10,7 @@ Status: **certified**
 | Cue binding, indexing, and firing | PASS | UL E-surface and MVP integration suites |
 | Dependency dirty maintenance | PASS | canonical maintenance and workspace verification |
 | Deterministic activation | PASS | control/treatment and activation contracts |
-| Part-E surface | PASS | exact seven-tool surface on admitted worker profiles |
+| Part-E surface | PASS | exact eight-tool surface, including `eliot.observe`, on admitted worker profiles |
 | Canonical skills | PASS | byte-identical `eliot-work`, `eliot-remember`, `eliot-recover`, and `eliot-finish` packages |
 | Native host packages | PASS | Codex plugin, Claude Code plugin, and Antigravity official skills/MCP package |
 | Unicode multi-kind Librarian | PASS | Unicode recall and L2 expansion regressions |
