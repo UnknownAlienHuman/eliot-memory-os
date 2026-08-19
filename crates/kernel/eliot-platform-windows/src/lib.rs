@@ -10006,6 +10006,17 @@ mod tests {
     use super::*;
 
     #[cfg(windows)]
+    static PROCESS_JOB_SPAWN_TEST_LOCK: OnceLock<std::sync::Mutex<()>> = OnceLock::new();
+
+    #[cfg(windows)]
+    fn process_job_spawn_test_guard() -> std::sync::MutexGuard<'static, ()> {
+        PROCESS_JOB_SPAWN_TEST_LOCK
+            .get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    #[cfg(windows)]
     fn test_lease(
         root: &Path,
         relative: &Path,
@@ -11371,6 +11382,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn suspended_launch_does_not_start_before_consuming_validation() {
+        let _spawn_guard = process_job_spawn_test_guard();
         let root = std::env::temp_dir().join(format!("eliot-p02-suspended-{}", unique_suffix()));
         std::fs::create_dir(&root).unwrap_or_else(|_| unreachable!());
         let marker = root.join("started");
@@ -11389,6 +11401,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn consuming_validation_binds_exact_launch_evidence_before_resume() {
+        let _spawn_guard = process_job_spawn_test_guard();
         let root = std::env::temp_dir().join(format!("eliot-p02-evidence-{}", unique_suffix()));
         std::fs::create_dir(&root).unwrap_or_else(|_| unreachable!());
         let marker = root.join("started");
@@ -11445,6 +11458,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn caller_pid_image_mismatch_rejection_kills_and_reaps_job() {
+        let _spawn_guard = process_job_spawn_test_guard();
         let root = std::env::temp_dir().join(format!("eliot-p02-reject-{}", unique_suffix()));
         std::fs::create_dir(&root).unwrap_or_else(|_| unreachable!());
         let marker = root.join("started");
@@ -11471,6 +11485,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn stale_validation_cannot_validate_a_new_process_generation() {
+        let _spawn_guard = process_job_spawn_test_guard();
         let root = std::env::temp_dir().join(format!("eliot-p02-stale-{}", unique_suffix()));
         std::fs::create_dir(&root).unwrap_or_else(|_| unreachable!());
         let first_marker = root.join("first");
@@ -11505,6 +11520,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn validator_panic_still_kills_and_reaps_suspended_job() {
+        let _spawn_guard = process_job_spawn_test_guard();
         let root = std::env::temp_dir().join(format!("eliot-p02-panic-{}", unique_suffix()));
         std::fs::create_dir(&root).unwrap_or_else(|_| unreachable!());
         let marker = root.join("started");
@@ -11522,6 +11538,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn resumed_tree_termination_is_consuming_and_reaps_every_member() {
+        let _spawn_guard = process_job_spawn_test_guard();
         let root = std::env::temp_dir().join(format!("eliot-p02-tree-{}", unique_suffix()));
         std::fs::create_dir(&root).unwrap_or_else(|_| unreachable!());
         let marker = root.join("started");
@@ -12100,6 +12117,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn reopened_job_member_uses_exact_job_and_member_termination_preserves_root() {
+        let _spawn_guard = process_job_spawn_test_guard();
         let root =
             std::env::temp_dir().join(format!("eliot-existing-job-member-{}", unique_suffix()));
         std::fs::create_dir(&root).unwrap_or_else(|_| unreachable!());
@@ -12161,6 +12179,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn existing_job_member_rejection_and_validator_panic_preserve_root() {
+        let _spawn_guard = process_job_spawn_test_guard();
         let root =
             std::env::temp_dir().join(format!("eliot-existing-job-reject-{}", unique_suffix()));
         std::fs::create_dir(&root).unwrap_or_else(|_| unreachable!());
@@ -12226,6 +12245,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn whole_job_termination_reaps_reopened_member_and_reopen_can_launch_again() {
+        let _spawn_guard = process_job_spawn_test_guard();
         let root =
             std::env::temp_dir().join(format!("eliot-existing-job-reap-{}", unique_suffix()));
         std::fs::create_dir(&root).unwrap_or_else(|_| unreachable!());
