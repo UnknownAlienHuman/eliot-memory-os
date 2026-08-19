@@ -1898,14 +1898,14 @@ impl WatchdogComposition {
                 runtime.shutdown_handle().request();
                 let result = task_result.await;
                 let shutdown = runtime.shutdown().await;
-                result.map(|_| shutdown)
+                complete_requested_shutdown(result, shutdown)
             }
             result = wait_for_shutdown(shutdown_requested) => {
                 if result {
                     runtime.shutdown_handle().request();
                     let result = task_result.await;
                     let shutdown = runtime.shutdown().await;
-                    result.map(|_| shutdown)
+                    complete_requested_shutdown(result, shutdown)
                 } else {
                     Err(TaskFailure::Failed("watchdog shutdown signal failed".to_owned()))
                 }
@@ -1916,6 +1916,16 @@ impl WatchdogComposition {
     /// Requests bounded shutdown from an SCM control path.
     pub fn request_shutdown(&self) {
         self.shutdown_requested.store(true, Ordering::Release);
+    }
+}
+
+fn complete_requested_shutdown<T>(
+    result: Result<T, TaskFailure>,
+    shutdown: ShutdownOutcome,
+) -> Result<ShutdownOutcome, TaskFailure> {
+    match result {
+        Ok(_) | Err(TaskFailure::Cancelled) => Ok(shutdown),
+        Err(error) => Err(error),
     }
 }
 
