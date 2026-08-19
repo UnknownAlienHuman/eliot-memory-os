@@ -26,8 +26,15 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+mod installer_root;
 mod tcp_listener_owner;
 
+pub use installer_root::{
+    InstallerProtectedFileReadback, InstallerRootAbsentSnapshot, InstallerRootCreateDisposition,
+    InstallerRootError, InstallerRootObjectSnapshot, InstallerRootPrimitiveCreate,
+    InstallerRootPrimitiveObservation, InstallerRootPrimitiveSpec, InstallerRootProfile,
+    WindowsInstallerRootPrimitive,
+};
 pub use tcp_listener_owner::{
     TcpListenerOwnerError, TcpListenerOwnerObservation, observe_loopback_tcp_listener_owner,
 };
@@ -3208,6 +3215,158 @@ impl Drop for CredentialSecret {
     }
 }
 
+/// Readback of one installer-owned Credential Manager target.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum InstallerSecretObservation {
+    /// The exact target does not exist.
+    Absent,
+    /// The exact target contains a bounded 256-bit ownership key.
+    Present,
+}
+
+/// Result of creating an installer ownership key at an already-durable target.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum InstallerSecretCreateDisposition {
+    /// This call created the exact Credential Manager entry.
+    Created,
+    /// The exact target already contained a valid ownership key.
+    AlreadyExists,
+}
+
+/// Narrow current-user Credential Manager provider for installer ownership keys.
+///
+/// The provider never returns generated key bytes from creation. Callers durably
+/// persist only the unpredictable target returned by [`Self::fresh_reference`]
+/// and must commit that reference before calling [`Self::create_at`].
+///
+/// This is an OS/Credential Manager primitive, not transaction authority. The
+/// current-user SID and `CredMan` vault are the trust boundary; the installation
+/// adapter alone combines this primitive with durable intent and an HMAC-bound
+/// receipt. User/portable profiles therefore have the explicitly weaker
+/// same-user boundary provided by Windows Credential Manager.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct WindowsInstallerSecretProvider;
+
+impl WindowsInstallerSecretProvider {
+    const KEY_BYTES: usize = 32;
+    const REFERENCE_RANDOM_BYTES: usize = 16;
+
+    /// Creates a provider without opening or changing Credential Manager.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self
+    }
+
+    /// Returns the exact Windows SID owning this current-user provider scope.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed provider error when the process token cannot be observed.
+    pub fn principal_sid(&self) -> Result<PlatformHandle, WindowsAdapterError> {
+        let sid = current_process_sid().map_err(|_| WindowsAdapterError::Unavailable)?;
+        PlatformHandle::new(sid).map_err(|_| WindowsAdapterError::InvalidInput)
+    }
+
+    /// Issues a non-secret unpredictable Credential Manager target.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed provider error when Windows CSPRNG is unavailable.
+    pub fn fresh_reference(&self) -> Result<PlatformHandle, WindowsAdapterError> {
+        let mut random = [0_u8; Self::REFERENCE_RANDOM_BYTES];
+        fill_system_random(&mut random)?;
+        let reference = format!("eliot/installer-root/v1/{}", hex_lower(&random));
+        random.fill(0);
+        PlatformHandle::new(reference).map_err(|_| WindowsAdapterError::InvalidInput)
+    }
+
+    /// Authoritatively observes the exact target without creating it.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed provider error for invalid targets, provider failure, or
+    /// a present credential whose secret is not exactly 256 bits.
+    pub fn inspect(
+        &self,
+        reference: &PlatformHandle,
+    ) -> Result<InstallerSecretObservation, WindowsAdapterError> {
+        if !valid_installer_credential_target(reference.as_str()) {
+            return Err(WindowsAdapterError::InvalidInput);
+        }
+        match credential_read_optional(reference.as_str())? {
+            Some(secret) if secret.expose().len() == Self::KEY_BYTES => {
+                Ok(InstallerSecretObservation::Present)
+            }
+            Some(_) => Err(WindowsAdapterError::InvalidInput),
+            None => Ok(InstallerSecretObservation::Absent),
+        }
+    }
+
+    /// Creates a 256-bit key at an exact target whose intent is already durable.
+    ///
+    /// Key bytes are generated inside this call, written to Credential Manager,
+    /// and cleared before return. Existing valid entries are never overwritten.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed provider error for invalid targets, RNG failure, or
+    /// Credential Manager failure.
+    pub fn create_at(
+        &self,
+        reference: &PlatformHandle,
+    ) -> Result<InstallerSecretCreateDisposition, WindowsAdapterError> {
+        if !valid_installer_credential_target(reference.as_str()) {
+            return Err(WindowsAdapterError::InvalidInput);
+        }
+        match self.inspect(reference)? {
+            InstallerSecretObservation::Present => {
+                return Ok(InstallerSecretCreateDisposition::AlreadyExists);
+            }
+            InstallerSecretObservation::Absent => {}
+        }
+        let mut secret = [0_u8; Self::KEY_BYTES];
+        fill_system_random(&mut secret)?;
+        let result = credential_write(reference.as_str(), &secret);
+        secret.fill(0);
+        result?;
+        match self.inspect(reference)? {
+            InstallerSecretObservation::Present => Ok(InstallerSecretCreateDisposition::Created),
+            InstallerSecretObservation::Absent => Err(WindowsAdapterError::Unavailable),
+        }
+    }
+
+    /// Reads the exact 256-bit key into a zeroizing value.
+    ///
+    /// # Errors
+    ///
+    /// Missing, inaccessible, or malformed entries fail closed.
+    pub fn read(
+        &self,
+        reference: &PlatformHandle,
+    ) -> Result<CredentialSecret, WindowsAdapterError> {
+        if !valid_installer_credential_target(reference.as_str()) {
+            return Err(WindowsAdapterError::InvalidInput);
+        }
+        let secret = credential_read(reference.as_str())?;
+        if secret.expose().len() != Self::KEY_BYTES {
+            return Err(WindowsAdapterError::InvalidInput);
+        }
+        Ok(secret)
+    }
+
+    /// Deletes an exact terminal ownership credential.
+    ///
+    /// # Errors
+    ///
+    /// Missing and inaccessible entries remain explicit failures.
+    pub fn delete(&self, reference: &PlatformHandle) -> Result<(), WindowsAdapterError> {
+        if !valid_installer_credential_target(reference.as_str()) {
+            return Err(WindowsAdapterError::InvalidInput);
+        }
+        credential_delete(reference.as_str())
+    }
+}
+
 /// Account under which SCM starts an ELIOT-owned Windows service.
 ///
 /// Password-bearing custom accounts are intentionally absent. P-10 must use a
@@ -3714,6 +3873,13 @@ impl OwnedSecurityDescriptor {
     /// weaker parent DACL before it is applied to the opened no-follow handle.
     fn for_protected_storage() -> Result<Self, WindowsAdapterError> {
         Self::from_sddl("D:P(A;;GA;;;SY)(A;;GA;;;BA)")
+    }
+
+    fn for_installer_system_object(directory: bool) -> Result<Self, WindowsAdapterError> {
+        let inheritance = if directory { "OICI" } else { "" };
+        Self::from_sddl(&format!(
+            "O:SYD:P(A;{inheritance};FA;;;SY)(A;{inheritance};FA;;;BA)(A;{inheritance};FA;;;LS)"
+        ))
     }
 
     fn for_user_owned_storage(sid: &str, directory: bool) -> Result<Self, WindowsAdapterError> {
@@ -6465,6 +6631,9 @@ impl WindowsPlatform {
     /// # Errors
     /// Returns a typed adapter error for invalid keys, size or provider failure.
     pub fn write_credential(&self, key: &str, secret: &[u8]) -> Result<(), WindowsAdapterError> {
+        if installer_credential_target(key) {
+            return Err(WindowsAdapterError::InvalidInput);
+        }
         credential_write(key, secret)
     }
 
@@ -6473,6 +6642,9 @@ impl WindowsPlatform {
     /// # Errors
     /// Returns a typed adapter error when the key is invalid, absent or inaccessible.
     pub fn read_credential(&self, key: &str) -> Result<CredentialSecret, WindowsAdapterError> {
+        if installer_credential_target(key) {
+            return Err(WindowsAdapterError::InvalidInput);
+        }
         credential_read(key)
     }
 
@@ -6482,6 +6654,9 @@ impl WindowsPlatform {
     /// # Errors
     /// Returns a typed adapter error when the key is invalid, absent or inaccessible.
     pub fn delete_credential(&self, key: &str) -> Result<(), WindowsAdapterError> {
+        if installer_credential_target(key) {
+            return Err(WindowsAdapterError::InvalidInput);
+        }
         credential_delete(key)
     }
 
@@ -7251,6 +7426,44 @@ fn unix_millis(time: SystemTime) -> Option<i64> {
 
 fn sha256_hex(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
+}
+
+fn hex_lower(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+
+    let mut value = String::with_capacity(bytes.len().saturating_mul(2));
+    for byte in bytes {
+        let _ = write!(&mut value, "{byte:02x}");
+    }
+    value
+}
+
+#[cfg(windows)]
+fn fill_system_random(bytes: &mut [u8]) -> Result<(), WindowsAdapterError> {
+    use windows_sys::Win32::Security::Cryptography::{
+        BCRYPT_USE_SYSTEM_PREFERRED_RNG, BCryptGenRandom,
+    };
+
+    let length = u32::try_from(bytes.len()).map_err(|_| WindowsAdapterError::InvalidInput)?;
+    let status = unsafe {
+        // SAFETY: `bytes` is a live writable slice and `length` exactly matches it.
+        BCryptGenRandom(
+            std::ptr::null_mut(),
+            bytes.as_mut_ptr(),
+            length,
+            BCRYPT_USE_SYSTEM_PREFERRED_RNG,
+        )
+    };
+    if status == 0 {
+        Ok(())
+    } else {
+        Err(WindowsAdapterError::Failed)
+    }
+}
+
+#[cfg(not(windows))]
+fn fill_system_random(_bytes: &mut [u8]) -> Result<(), WindowsAdapterError> {
+    Err(WindowsAdapterError::Unavailable)
 }
 
 const ACTIVATION_NONCE_PREFIX: &str = "eliot-activation-";
@@ -9351,6 +9564,23 @@ fn valid_credential_key(value: &str) -> bool {
         })
 }
 
+const INSTALLER_CREDENTIAL_TARGET_PREFIX: &str = "eliot/installer-root/v1/";
+
+fn installer_credential_target(value: &str) -> bool {
+    value.starts_with(INSTALLER_CREDENTIAL_TARGET_PREFIX)
+}
+
+fn valid_installer_credential_target(value: &str) -> bool {
+    value
+        .strip_prefix(INSTALLER_CREDENTIAL_TARGET_PREFIX)
+        .is_some_and(|token| {
+            token.len() == 32
+                && token
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        })
+}
+
 #[cfg(windows)]
 fn credential_write(key: &str, secret: &[u8]) -> Result<(), WindowsAdapterError> {
     if !valid_credential_key(key) || secret.is_empty() || secret.len() > 2560 {
@@ -9376,6 +9606,21 @@ fn credential_read(key: &str) -> Result<CredentialSecret, WindowsAdapterError> {
         Some(value) => Ok(CredentialSecret(value)),
         None => Err(WindowsAdapterError::Unavailable),
     }
+}
+
+#[cfg(windows)]
+fn credential_read_optional(key: &str) -> Result<Option<CredentialSecret>, WindowsAdapterError> {
+    if !valid_credential_key(key) {
+        return Err(WindowsAdapterError::InvalidInput);
+    }
+    eliot_windows_ipc::credential_read_current_user(key)
+        .map(|secret| secret.map(CredentialSecret))
+        .map_err(|error| windows_adapter_from_io(&error))
+}
+
+#[cfg(not(windows))]
+fn credential_read_optional(_key: &str) -> Result<Option<CredentialSecret>, WindowsAdapterError> {
+    Err(WindowsAdapterError::Unavailable)
 }
 
 #[cfg(not(windows))]
@@ -9713,6 +9958,19 @@ mod tests {
         assert!(validate_component("state\0.bin").is_err());
         assert!(valid_credential_key("nested/ok-key"));
         assert!(!valid_credential_key("../outside"));
+        assert!(installer_credential_target(
+            "eliot/installer-root/v1/0123456789abcdef"
+        ));
+        assert!(valid_installer_credential_target(
+            "eliot/installer-root/v1/0123456789abcdef0123456789abcdef"
+        ));
+        assert!(!valid_installer_credential_target(
+            "eliot/installer-root/v1/0123456789ABCDEF0123456789ABCDEF"
+        ));
+        assert!(!valid_installer_credential_target(
+            "eliot/installer-root/v1/short"
+        ));
+        assert!(!installer_credential_target("runtime/dispatch-key"));
     }
 
     #[test]
@@ -11051,6 +11309,64 @@ mod tests {
             Some(WindowsAdapterError::Unavailable)
         );
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn generic_credential_api_cannot_access_installer_authority_namespace() {
+        let root = std::env::temp_dir().join(format!("eliot-p02-cred-guard-{}", unique_suffix()));
+        std::fs::create_dir(&root).unwrap_or_else(|_| unreachable!());
+        let adapter = WindowsPlatform::new(&root).unwrap_or_else(|_| unreachable!());
+        let target = format!("{INSTALLER_CREDENTIAL_TARGET_PREFIX}{}", unique_suffix());
+
+        assert_eq!(
+            adapter.write_credential(&target, &[0x5a; 32]),
+            Err(WindowsAdapterError::InvalidInput)
+        );
+        assert_eq!(
+            adapter.read_credential(&target).err(),
+            Some(WindowsAdapterError::InvalidInput)
+        );
+        assert_eq!(
+            adapter.delete_credential(&target),
+            Err(WindowsAdapterError::InvalidInput)
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn installer_secret_provider_rejects_missing_and_malformed_keys() {
+        let provider = WindowsInstallerSecretProvider::new();
+        let missing = provider
+            .fresh_reference()
+            .unwrap_or_else(|error| panic!("reference issuance failed: {error}"));
+        assert_eq!(
+            provider
+                .inspect(&missing)
+                .unwrap_or_else(|error| panic!("missing inspect failed: {error}")),
+            InstallerSecretObservation::Absent
+        );
+        assert_eq!(
+            provider.read(&missing).err(),
+            Some(WindowsAdapterError::Unavailable)
+        );
+
+        let malformed = provider
+            .fresh_reference()
+            .unwrap_or_else(|error| panic!("reference issuance failed: {error}"));
+        credential_write(malformed.as_str(), b"not-a-256-bit-key")
+            .unwrap_or_else(|error| panic!("malformed fixture write failed: {error}"));
+        assert_eq!(
+            provider.inspect(&malformed),
+            Err(WindowsAdapterError::InvalidInput)
+        );
+        assert_eq!(
+            provider.read(&malformed).err(),
+            Some(WindowsAdapterError::InvalidInput)
+        );
+        credential_delete(malformed.as_str())
+            .unwrap_or_else(|error| panic!("malformed credential cleanup failed: {error}"));
     }
 
     #[cfg(windows)]
