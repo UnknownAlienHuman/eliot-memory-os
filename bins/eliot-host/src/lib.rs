@@ -3665,10 +3665,13 @@ impl HostComposition {
             shutdown_failed: false,
         };
         #[cfg(windows)]
-        if composition.registry.active().is_some() {
-            let kernel = configured_image("ELIOT_KERNEL_BINARY")?;
-            let store = configured_image("ELIOT_STORE_BINARY")?;
-            composition.start_approved_contour(kernel, store)?;
+        if let Some(pending) = composition.registry.pending_activation().cloned() {
+            composition.reconcile_pending_activation(&pending)?;
+        } else if let Some(active) = composition.registry.active().cloned() {
+            composition.start_approved_contour(
+                PathBuf::from(active.manifest.kernel_executable_path.as_str()),
+                PathBuf::from(active.manifest.canonical_store_executable_path.as_str()),
+            )?;
         }
         Ok(composition)
     }
@@ -3737,67 +3740,6 @@ impl HostComposition {
             &current, state, label,
         )?))?;
         Ok(())
-    }
-
-    /// Approves an immutable generation for a later activation.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if approval validation or durable registry persistence fails.
-    pub fn approve_generation(
-        &mut self,
-        manifest: CandidateManifest,
-        approval_ref: PlatformHandle,
-    ) -> Result<(), HostError> {
-        self.registry
-            .approve(manifest, approval_ref)
-            .map_err(HostError::Installation)?;
-        self.registry_store
-            .save(&self.registry)
-            .map_err(HostError::Installation)
-    }
-
-    /// Activates an approved generation, preserving the previous one as LKG.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if admission is fenced, the generation is not
-    /// approved, an active contour requires cutover, or persistence fails.
-    pub fn activate_generation(&mut self, generation: &PlatformHandle) -> Result<(), HostError> {
-        self.ensure_admission_open()?;
-        #[cfg(windows)]
-        if self.has_process_contour() {
-            return Err(HostError::ProcessContour(
-                "active process contour requires cutover_generation".to_owned(),
-            ));
-        }
-        self.registry
-            .activate(generation)
-            .map_err(HostError::Installation)?;
-        self.registry_store
-            .save(&self.registry)
-            .map_err(HostError::Installation)
-    }
-
-    /// Rolls back to the registry's last-known-good generation.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if admission is fenced, an active contour requires a
-    /// bounded rollback, no last-known-good generation exists, or persistence fails.
-    pub fn rollback_generation(&mut self) -> Result<PlatformHandle, HostError> {
-        self.ensure_admission_open()?;
-        #[cfg(windows)]
-        if self.has_process_contour() {
-            return Err(HostError::ProcessContour(
-                "active process contour requires bounded cutover rollback".to_owned(),
-            ));
-        }
-        let generation = self.registry.rollback().map_err(HostError::Installation)?;
-        self.registry_store
-            .save(&self.registry)
-            .map_err(HostError::Installation)?;
-        Ok(generation)
     }
 
     #[cfg(windows)]
@@ -3958,28 +3900,40 @@ impl HostComposition {
             self.registry.active().cloned().ok_or_else(|| {
                 HostError::ProcessContour("no approved active generation".to_owned())
             })?;
+        self.start_manifest_contour(
+            &active.manifest,
+            kernel_executable.as_ref(),
+            store_executable.as_ref(),
+        )
+    }
+
+    #[cfg(windows)]
+    fn start_manifest_contour(
+        &mut self,
+        manifest: &CandidateManifest,
+        kernel_executable: &Path,
+        store_executable: &Path,
+    ) -> Result<(), HostError> {
         self.transition_activation(ActivationState::Starting, "host-start-approved")?;
-        self.request_watchdog(&active.manifest.runtime_launch)?;
-        let (kernel_artifact, store_artifact) = active
-            .manifest
+        self.request_watchdog(&manifest.runtime_launch)?;
+        let (kernel_artifact, store_artifact) = manifest
             .host_child_artifact_digests()
             .map_err(|error| HostError::ProcessContour(error.to_string()))?;
         let (approved_kernel_path, approved_store_path, approved_config_path) =
-            active.manifest.host_child_paths();
+            manifest.host_child_paths();
         let config_path = PathBuf::from(approved_config_path.as_str());
         let (prior_kernel, kernel_generation, kernel_authority_epoch) = self
             .next_kernel_activation_context(
-                active
-                    .manifest
+                manifest
                     .runtime_launch
                     .authority_state_fence
                     .authority_epoch,
             )?;
         self.jobs.start_approved(
-            kernel_executable.as_ref(),
-            store_executable.as_ref(),
-            &active.manifest.generation,
-            &active.manifest.config_digest,
+            kernel_executable,
+            store_executable,
+            &manifest.generation,
+            &manifest.config_digest,
             &config_path,
             approved_kernel_path,
             approved_store_path,
@@ -3987,10 +3941,10 @@ impl HostComposition {
             kernel_artifact,
             store_artifact,
             &self.host,
-            &active.manifest.runtime_launch,
+            &manifest.runtime_launch,
         )?;
         let (_activation_receipt, receipt) = match self.jobs.complete_kernel_control(
-            &active.manifest.generation,
+            &manifest.generation,
             &self.host,
             &self.journal,
             &self.activation_id,
@@ -4015,11 +3969,80 @@ impl HostComposition {
         {
             return self.cleanup_active_kernel_contour(error, "host-active-commit-failed");
         }
-        if let Err(error) = self.persist_process_observations(&active.manifest.generation) {
+        if let Err(error) = self.persist_process_observations(&manifest.generation) {
             self.cleanup_active_kernel_contour(error, "host-process-observation-failed")
         } else {
             Ok(())
         }
+    }
+
+    #[cfg(windows)]
+    fn reconcile_pending_activation(
+        &mut self,
+        pending: &eliot_installation::PendingActivation,
+    ) -> Result<(), HostError> {
+        self.ensure_admission_open()?;
+        let pending = self.registry.claim_pending_activation(
+            &pending.transaction_id,
+            &pending.plan_digest,
+            &pending.manifest.generation,
+        )?;
+        self.registry_store.save(&self.registry)?;
+        if pending
+            .manifest
+            .runtime_launch
+            .installation_epoch
+            .installation
+            != self.host.installation
+        {
+            return Err(HostError::RecoveryRequired(
+                "pending activation installation epoch is stale".to_owned(),
+            ));
+        }
+        let kernel = PathBuf::from(pending.manifest.kernel_executable_path.as_str());
+        let store = PathBuf::from(pending.manifest.canonical_store_executable_path.as_str());
+        if let Err(error) = self.start_manifest_contour(&pending.manifest, &kernel, &store) {
+            if pending.prior_active_generation.is_none() {
+                self.registry
+                    .abort_pending_activation(&pending.transaction_id, &pending.plan_digest)?;
+            } else {
+                self.registry.mark_pending_recovery(
+                    &pending.transaction_id,
+                    &pending.plan_digest,
+                    error.to_string(),
+                )?;
+            }
+            self.registry_store.save(&self.registry)?;
+            return Err(error);
+        }
+        self.commit_pending_durable(&pending)?;
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    fn commit_pending_durable(
+        &mut self,
+        pending: &eliot_installation::PendingActivation,
+    ) -> Result<(), HostError> {
+        let before = self.registry.clone();
+        self.registry.commit_pending_activation(
+            &pending.transaction_id,
+            &pending.plan_digest,
+            &pending.manifest.generation,
+        )?;
+        if let Err(error) = self.registry_store.save(&self.registry) {
+            self.registry = before;
+            let recovery = self.registry.mark_pending_recovery(
+                &pending.transaction_id,
+                &pending.plan_digest,
+                "activation commit outcome is unknown",
+            );
+            if recovery.is_ok() {
+                let _ = self.registry_store.save(&self.registry);
+            }
+            return Err(error.into());
+        }
+        Ok(())
     }
 
     #[cfg(windows)]
@@ -4053,12 +4076,20 @@ impl HostComposition {
         prior_store: impl AsRef<Path>,
     ) -> Result<(), HostError> {
         self.ensure_admission_open()?;
+        let pending = self.registry.pending_activation().cloned().ok_or_else(|| {
+            HostError::ProcessContour("cutover requires a pending activation".to_owned())
+        })?;
+        if pending.manifest.generation != *generation {
+            return Err(HostError::ProcessContour(
+                "cutover pending generation does not match request".to_owned(),
+            ));
+        }
         let prior = self.registry.active().cloned().ok_or_else(|| {
             HostError::ProcessContour("no active generation to cut over".to_owned())
         })?;
         let candidate = self
             .registry
-            .generations
+            .generations()
             .iter()
             .find(|item| item.manifest.generation == *generation)
             .cloned()
@@ -4079,13 +4110,6 @@ impl HostComposition {
             prior.manifest.host_child_paths();
         let candidate_config_locator = PathBuf::from(candidate_config_path.as_str());
         let prior_config_locator = PathBuf::from(prior_config_path.as_str());
-        // Resolve every candidate and rollback locator before mutating the
-        // in-memory active projection.  A malformed manifest must not leave
-        // the registry pointed at a generation that never entered the
-        // bounded cutover contour.
-        self.registry
-            .activate(generation)
-            .map_err(HostError::Installation)?;
         let result = self.jobs.cutover_with_rollback(
             candidate_kernel.as_ref(),
             candidate_store.as_ref(),
@@ -4114,14 +4138,22 @@ impl HostComposition {
         let launch = match result {
             Ok(launch) => launch,
             Err(error) => {
-                let _ = self.registry.rollback();
+                let _ = self.registry.mark_pending_recovery(
+                    &pending.transaction_id,
+                    &pending.plan_digest,
+                    error.to_string(),
+                );
                 let _ = self.registry_store.save(&self.registry);
                 return Err(error);
             }
         };
         if let Err(error) = self.fail_current_kernel_record("kernel-cutover-prior-terminated") {
             let cleanup = self.cleanup_launched_contour(error);
-            let _ = self.registry.rollback();
+            let _ = self.registry.mark_pending_recovery(
+                &pending.transaction_id,
+                &pending.plan_digest,
+                "prior Kernel termination evidence failed",
+            );
             let _ = self.registry_store.save(&self.registry);
             return cleanup;
         }
@@ -4134,7 +4166,6 @@ impl HostComposition {
                     "cutover launch target discriminator was inconsistent".to_owned(),
                 ));
             };
-            self.registry.rollback().map_err(HostError::Installation)?;
             if let Err(error) = self.activate_launched_kernel(
                 &prior.manifest.generation,
                 prior
@@ -4146,6 +4177,13 @@ impl HostComposition {
                 return self.cleanup_launched_contour(HostError::RecoveryRequired(format!(
                     "candidate launch failed ({candidate_error}); rollback activation failed ({error})"
                 )));
+            }
+            if let Err(error) = self.registry.mark_pending_recovery(
+                &pending.transaction_id,
+                &pending.plan_digest,
+                candidate_error.clone(),
+            ) {
+                return Err(error.into());
             }
             if let Err(error) = self.registry_store.save(&self.registry) {
                 return self.cleanup_active_kernel_contour(
@@ -4171,7 +4209,6 @@ impl HostComposition {
                 .authority_epoch,
         ) {
             self.jobs.terminate_store_then_kernel()?;
-            self.registry.rollback().map_err(HostError::Installation)?;
             self.jobs.start_approved(
                 prior_kernel.as_ref(),
                 prior_store.as_ref(),
@@ -4198,6 +4235,13 @@ impl HostComposition {
                     "candidate activation failed ({candidate_error}); rollback activation failed ({rollback_error})"
                 )));
             }
+            if let Err(error) = self.registry.mark_pending_recovery(
+                &pending.transaction_id,
+                &pending.plan_digest,
+                candidate_error.to_string(),
+            ) {
+                return Err(error.into());
+            }
             if let Err(error) = self.registry_store.save(&self.registry) {
                 return self.cleanup_active_kernel_contour(
                     HostError::Installation(error),
@@ -4213,22 +4257,19 @@ impl HostComposition {
             )));
         }
 
-        if let Err(error) = self.registry_store.save(&self.registry) {
-            let cleanup = self.cleanup_active_kernel_contour(
-                HostError::Installation(error),
-                "candidate-registry-save-failed",
-            );
-            let _ = self.registry.rollback();
-            let _ = self.registry_store.save(&self.registry);
-            return cleanup;
-        }
         if let Err(error) = self.persist_process_observations(&candidate.manifest.generation) {
+            let reason = error.to_string();
             let cleanup =
                 self.cleanup_active_kernel_contour(error, "candidate-process-observation-failed");
-            let _ = self.registry.rollback();
+            let _ = self.registry.mark_pending_recovery(
+                &pending.transaction_id,
+                &pending.plan_digest,
+                reason,
+            );
             let _ = self.registry_store.save(&self.registry);
             cleanup
         } else {
+            self.commit_pending_durable(&pending)?;
             Ok(())
         }
     }
@@ -4886,19 +4927,6 @@ fn owner_lease_release_error(error: HostOwnerLeaseReleaseError) -> HostError {
     HostError::OwnerLeaseRecovery(format!(
         "owner release failed; durable recovery remains required: {error}"
     ))
-}
-
-#[cfg(windows)]
-fn configured_image(name: &str) -> Result<PathBuf, HostError> {
-    let value = std::env::var_os(name)
-        .ok_or_else(|| HostError::ProcessContour(format!("{name} is not configured")))?;
-    let path = PathBuf::from(value);
-    if !path.is_absolute() || !path.is_file() {
-        return Err(HostError::ProcessContour(format!(
-            "{name} must name an absolute executable file"
-        )));
-    }
-    Ok(path)
 }
 
 #[cfg(all(test, windows))]

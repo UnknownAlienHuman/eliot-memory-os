@@ -154,9 +154,9 @@ fn run_installation(command: InstallationCommand) -> Result<i32> {
                     "contract": "eliot.kernel.installation",
                     "contract_version": "2.0.0",
                     "status": if registry_value.active().is_some() { "ACTIVE_GENERATION" } else { "NO_ACTIVE_GENERATION" },
-                    "active_generation": registry_value.active_generation,
-                    "last_known_good_generation": registry_value.last_known_good_generation,
-                    "generations": registry_value.generations,
+                    "active_generation": registry_value.active_generation(),
+                    "last_known_good_generation": registry_value.last_known_good_generation(),
+                    "generations": registry_value.generations(),
                 }))?
             );
             Ok(0)
