@@ -3476,6 +3476,7 @@ pub struct ServiceBootstrapArguments {
     config_descriptor_digest: String,
     installation_id: String,
     transaction_plan_generation: u64,
+    registration_nonce: Option<String>,
     extra_args: Vec<String>,
 }
 
@@ -3515,8 +3516,25 @@ impl ServiceBootstrapArguments {
             config_descriptor_digest,
             installation_id,
             transaction_plan_generation,
+            registration_nonce: None,
             extra_args,
         })
+    }
+
+    /// Binds this bootstrap to one durable installer registration intent.
+    ///
+    /// # Errors
+    /// Returns `InvalidInput` when the nonce is not canonical SHA-256 text.
+    pub fn with_registration_nonce(
+        mut self,
+        registration_nonce: impl Into<String>,
+    ) -> Result<Self, WindowsAdapterError> {
+        let registration_nonce = registration_nonce.into();
+        if !valid_sha256_hex(&registration_nonce) {
+            return Err(WindowsAdapterError::InvalidInput);
+        }
+        self.registration_nonce = Some(registration_nonce);
+        Ok(self)
     }
 
     #[must_use]
@@ -3545,6 +3563,11 @@ impl ServiceBootstrapArguments {
     }
 
     #[must_use]
+    pub fn registration_nonce(&self) -> Option<&str> {
+        self.registration_nonce.as_deref()
+    }
+
+    #[must_use]
     pub fn extra_args(&self) -> &[String] {
         &self.extra_args
     }
@@ -3563,6 +3586,9 @@ impl ServiceBootstrapArguments {
             "--tx-plan-generation".to_owned(),
             self.transaction_plan_generation.to_string(),
         ];
+        if let Some(nonce) = &self.registration_nonce {
+            argv.extend(["--registration-nonce".to_owned(), nonce.clone()]);
+        }
         argv.extend(self.extra_args.iter().cloned());
         argv
     }
@@ -3579,6 +3605,12 @@ impl ServiceBootstrapArguments {
             std::ffi::OsString::from("--tx-plan-generation"),
             std::ffi::OsString::from(self.transaction_plan_generation.to_string()),
         ];
+        if let Some(nonce) = &self.registration_nonce {
+            argv.extend([
+                std::ffi::OsString::from("--registration-nonce"),
+                std::ffi::OsString::from(nonce),
+            ]);
+        }
         argv.extend(
             self.extra_args
                 .iter()
@@ -3647,6 +3679,7 @@ fn is_reserved_bootstrap_arg(value: &str) -> bool {
             | "--config-descriptor-sha256"
             | "--installation-id"
             | "--tx-plan-generation"
+            | "--registration-nonce"
     )
 }
 
@@ -3860,9 +3893,23 @@ impl ServiceRegistrationRequest {
 /// reconciliation before it can be called successful.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ServiceRegistrationOutcome {
-    Registered { observation: ServiceObservation },
-    Updated { observation: ServiceObservation },
-    Unchanged { observation: ServiceObservation },
+    /// The SCM object was absent and this call created it successfully.
+    CreatedNow {
+        observation: ServiceObservation,
+    },
+    /// The exact object was already present before this call.
+    PreexistingMatching {
+        observation: ServiceObservation,
+    },
+    Registered {
+        observation: ServiceObservation,
+    },
+    Updated {
+        observation: ServiceObservation,
+    },
+    Unchanged {
+        observation: ServiceObservation,
+    },
     Deleted,
     AlreadyAbsent,
     ExistingRequiresReconciliation,
@@ -7551,6 +7598,21 @@ fn fill_system_random(_bytes: &mut [u8]) -> Result<(), WindowsAdapterError> {
     Err(WindowsAdapterError::Unavailable)
 }
 
+/// Issues an unpredictable public nonce for one durable SCM registration
+/// intent.  The value is not a secret; it is bound into the service command
+/// line and the protected installer ownership marker.
+///
+/// # Errors
+/// Returns `Unavailable` when the Windows system CSPRNG cannot issue a nonce.
+#[must_use = "the nonce must be durably bound before SCM mutation"]
+pub fn fresh_service_registration_nonce() -> Result<PlatformHandle, WindowsAdapterError> {
+    let mut random = [0_u8; 32];
+    fill_system_random(&mut random)?;
+    let value = hex_lower(&random);
+    random.fill(0);
+    PlatformHandle::new(value).map_err(|_| WindowsAdapterError::InvalidInput)
+}
+
 const ACTIVATION_NONCE_PREFIX: &str = "eliot-activation-";
 const ACTIVATION_NONCE_RANDOM_BYTES: usize = 32;
 const ACTIVATION_NONCE_HEX_BYTES: usize = ACTIVATION_NONCE_RANDOM_BYTES * 2;
@@ -8517,7 +8579,7 @@ fn register_service(
 
     match inspect_service_registration(request) {
         ServiceRegistrationInspection::Matching { observation } => {
-            return Ok(ServiceRegistrationOutcome::Registered { observation });
+            return Ok(ServiceRegistrationOutcome::PreexistingMatching { observation });
         }
         ServiceRegistrationInspection::Mismatched => {
             return Ok(ServiceRegistrationOutcome::ExistingRequiresReconciliation);
@@ -8586,9 +8648,10 @@ fn register_service(
                 if code == ERROR_SERVICE_EXISTS.cast_signed()
                     || code == ERROR_SERVICE_MARKED_FOR_DELETE.cast_signed()
         ) {
-            return Ok(registration_outcome_from_inspection(
-                inspect_service_registration(request),
-            ));
+            // A concurrent creator is not transaction ownership.  Preserve
+            // the ambiguity so the durable installer cannot adopt or delete
+            // a service it did not create.
+            return Ok(ServiceRegistrationOutcome::ExistingRequiresReconciliation);
         }
         return Err(windows_adapter_from_io(&error));
     }
@@ -8596,9 +8659,14 @@ fn register_service(
         CloseServiceHandle(service);
         CloseServiceHandle(manager);
     }
-    Ok(registration_outcome_from_inspection(
-        inspect_service_registration(request),
-    ))
+    match inspect_service_registration(request) {
+        ServiceRegistrationInspection::Matching { observation } => {
+            Ok(ServiceRegistrationOutcome::CreatedNow { observation })
+        }
+        ServiceRegistrationInspection::Absent
+        | ServiceRegistrationInspection::Mismatched
+        | ServiceRegistrationInspection::Unknown => Ok(ServiceRegistrationOutcome::EffectUnknown),
+    }
 }
 
 #[cfg(windows)]
@@ -8788,22 +8856,6 @@ fn canonical_runtime_service_name(name: &str) -> bool {
 #[cfg(test)]
 fn service_readback_is_acceptable(readback: &ServiceRegistrationInspection) -> bool {
     matches!(readback, ServiceRegistrationInspection::Matching { .. })
-}
-
-fn registration_outcome_from_inspection(
-    inspection: ServiceRegistrationInspection,
-) -> ServiceRegistrationOutcome {
-    match inspection {
-        ServiceRegistrationInspection::Matching { observation } => {
-            ServiceRegistrationOutcome::Registered { observation }
-        }
-        ServiceRegistrationInspection::Mismatched => {
-            ServiceRegistrationOutcome::ExistingRequiresReconciliation
-        }
-        ServiceRegistrationInspection::Absent | ServiceRegistrationInspection::Unknown => {
-            ServiceRegistrationOutcome::EffectUnknown
-        }
-    }
 }
 
 #[cfg(windows)]
@@ -10718,6 +10770,49 @@ mod tests {
         }
     }
 
+    #[test]
+    fn service_bootstrap_nonce_is_typed_and_part_of_canonical_argv() {
+        let bootstrap = ServiceBootstrapArguments::new(
+            PathBuf::from(r"C:\ProgramData\Eliot\authority.json"),
+            "a".repeat(64),
+            "installation",
+            7,
+            Vec::<String>::new(),
+        )
+        .and_then(|bootstrap| bootstrap.with_registration_nonce("b".repeat(64)))
+        .unwrap_or_else(|error| panic!("bootstrap failed: {error}"));
+        assert_eq!(
+            bootstrap.registration_nonce(),
+            Some("b".repeat(64).as_str())
+        );
+        assert_eq!(
+            bootstrap.argv(),
+            vec![
+                "--config-descriptor",
+                r"C:\ProgramData\Eliot\authority.json",
+                "--config-descriptor-sha256",
+                &"a".repeat(64),
+                "--installation-id",
+                "installation",
+                "--tx-plan-generation",
+                "7",
+                "--registration-nonce",
+                &"b".repeat(64),
+            ]
+        );
+        assert_eq!(
+            ServiceBootstrapArguments::new(
+                PathBuf::from(r"C:\ProgramData\Eliot\authority.json"),
+                "a".repeat(64),
+                "installation",
+                7,
+                Vec::<String>::new(),
+            )
+            .and_then(|bootstrap| bootstrap.with_registration_nonce("not-a-digest")),
+            Err(WindowsAdapterError::InvalidInput)
+        );
+    }
+
     #[cfg(windows)]
     #[test]
     fn service_mutation_requires_expected_current_and_rejects_substitution() {
@@ -10961,7 +11056,7 @@ mod tests {
             &ServiceRegistrationInspection::Matching { observation }
         ));
         assert_eq!(
-            registration_outcome_from_inspection(ServiceRegistrationInspection::Mismatched),
+            ServiceRegistrationOutcome::ExistingRequiresReconciliation,
             ServiceRegistrationOutcome::ExistingRequiresReconciliation
         );
     }

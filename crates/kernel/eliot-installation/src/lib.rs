@@ -10,7 +10,7 @@
 #![warn(missing_docs)]
 
 use std::collections::BTreeSet;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use eliot_contracts::{
     ContractIdentity, ContractVersion, ResourceGeneration, StateFence,
@@ -25,10 +25,12 @@ use eliot_platform_windows::{
     InstallerRootCreateDisposition, InstallerRootError, InstallerRootObjectSnapshot,
     InstallerRootPrimitiveObservation, InstallerRootPrimitiveSpec, InstallerRootProfile,
     InstallerSecretCreateDisposition, InstallerSecretObservation, ProtectedPathError,
-    ProtectedPathLease, ProtectedRootLease, UserOwnedPathLease, UserOwnedRootReadLease,
-    WindowsInstallerRootPrimitive, WindowsInstallerSecretProvider,
-    current_user_local_app_data_root, protected_program_data_root,
-    require_protected_program_data_path,
+    ProtectedPathLease, ProtectedRootLease, ServiceAccount, ServiceBootstrapArguments,
+    ServiceRegistrationCurrent, ServiceRegistrationInspection, ServiceRegistrationOutcome,
+    ServiceRegistrationRequest, ServiceStartMode, UserOwnedPathLease, UserOwnedRootReadLease,
+    WindowsInstallerRootPrimitive, WindowsInstallerSecretProvider, WindowsPlatform,
+    current_user_local_app_data_root, fresh_service_registration_nonce,
+    protected_program_data_root, require_protected_program_data_path,
 };
 use redb::{Database, ReadOnlyDatabase, ReadableDatabase, TableDefinition};
 use schemars::JsonSchema;
@@ -3424,6 +3426,9 @@ pub struct InstallationEffectProgress {
     pub admitted_precondition: Option<InstallationEffectPrecondition>,
     /// Credential Manager reference retained across restart and recovery.
     pub ownership_secret: Option<InstallationOwnershipSecret>,
+    /// Unpredictable public nonce retained for one SCM registration effect.
+    #[serde(default)]
+    pub registration_nonce: Option<PlatformHandle>,
     /// Current durable effect state.
     pub state: InstallationEffectProgressState,
 }
@@ -3584,6 +3589,7 @@ impl InstallationTransaction {
                 effect_id: effect.effect_id().clone(),
                 admitted_precondition: None,
                 ownership_secret: None,
+                registration_nonce: None,
                 state: InstallationEffectProgressState::Pending,
             })
             .collect();
@@ -3821,6 +3827,24 @@ impl InstallationTransaction {
                     }
                 }
             }
+            if let Some(nonce) = &progress.registration_nonce {
+                if !matches!(effect, InstallerEffectPlan::RegisterService { .. }) {
+                    return Err(InstallationError::IdentityConflict);
+                }
+                sha256_handle(nonce, "effect_progress.registration_nonce")?;
+            }
+            if matches!(
+                &progress.state,
+                InstallationEffectProgressState::IntentCommitted { .. }
+                    | InstallationEffectProgressState::Applied { .. }
+            ) && matches!(effect, InstallerEffectPlan::RegisterService { .. })
+                && progress.registration_nonce.is_none()
+            {
+                return Err(InstallationError::InvalidField {
+                    field: "effect_progress.registration_nonce".to_owned(),
+                    reason: "service intent requires durable nonce".to_owned(),
+                });
+            }
             match (
                 &progress.state,
                 effect,
@@ -3879,6 +3903,7 @@ impl InstallationTransaction {
                     ..
                 } if !unsettled_seen => {
                     if *disposition == InstallationEffectDisposition::CreatedByTransaction
+                        && !matches!(effect, InstallerEffectPlan::RegisterService { .. })
                         && progress.ownership_secret.as_ref().is_none_or(|ownership| {
                             ownership.create_disposition != InstallationCreateDisposition::Created
                         })
@@ -4195,6 +4220,38 @@ impl InstallationEffectPrecondition {
 /// Request sent to the effect executor for exactly one immutable plan entry.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct InstallationServiceBootstrap {
+    /// Exact authority descriptor path consumed by Host and Watchdog.
+    pub descriptor_path: PlatformHandle,
+    /// SHA-256 digest of the descriptor bytes.
+    pub descriptor_digest: PlatformHandle,
+    /// Installation identity bound to the descriptor.
+    pub installation_id: PlatformHandle,
+    /// Authority generation bound to this candidate launch.
+    pub plan_generation: u64,
+}
+
+impl InstallationServiceBootstrap {
+    fn validate(&self) -> Result<(), InstallationError> {
+        approved_path(&self.descriptor_path, "service_bootstrap.descriptor_path")?;
+        sha256_handle(
+            &self.descriptor_digest,
+            "service_bootstrap.descriptor_digest",
+        )?;
+        handle(&self.installation_id, "service_bootstrap.installation_id")?;
+        if self.plan_generation == 0 {
+            return Err(InstallationError::InvalidField {
+                field: "service_bootstrap.plan_generation".to_owned(),
+                reason: "must be non-zero".to_owned(),
+            });
+        }
+        Ok(())
+    }
+}
+
+/// Request sent to the effect executor for exactly one immutable plan entry.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct InstallationEffectRequest {
     /// Transaction identity.
     pub transaction_id: PlatformHandle,
@@ -4218,6 +4275,12 @@ pub struct InstallationEffectRequest {
     pub action: InstallationEffectAction,
     /// Required exact identity for rollback; absent for apply.
     pub expected_external_identity: Option<PlatformHandle>,
+    /// Candidate launch authority used to render canonical SCM argv.
+    #[serde(default)]
+    pub service_bootstrap: Option<InstallationServiceBootstrap>,
+    /// Public unpredictable nonce retained by the transaction and marker.
+    #[serde(default)]
+    pub registration_nonce: Option<PlatformHandle>,
 }
 
 impl InstallationEffectRequest {
@@ -4239,6 +4302,12 @@ impl InstallationEffectRequest {
         }
         sha256_handle(&self.plan_digest, "effect.plan_digest")?;
         self.precondition.validate()?;
+        if let Some(bootstrap) = &self.service_bootstrap {
+            bootstrap.validate()?;
+        }
+        if let Some(nonce) = &self.registration_nonce {
+            sha256_handle(nonce, "effect.registration_nonce")?;
+        }
         if let Some(ownership) = &self.ownership_secret {
             ownership.validate()?;
         }
@@ -4257,7 +4326,16 @@ impl InstallationEffectRequest {
                 Some(ownership),
             ) if ownership.lifecycle != InstallationSecretLifecycle::Deleted => {}
             (InstallerEffectPlan::ApplyAcl { .. }, InstallationEffectAction::Apply, None)
-            | (InstallerEffectPlan::RegisterService { .. }, _, None) => {}
+            | (InstallerEffectPlan::RegisterService { .. }, _, None) => {
+                if matches!(&self.plan, InstallerEffectPlan::RegisterService { .. })
+                    && self.service_bootstrap.is_none()
+                {
+                    return Err(InstallationError::InvalidField {
+                        field: "effect.service_bootstrap".to_owned(),
+                        reason: "service effects require descriptor and nonce bindings".to_owned(),
+                    });
+                }
+            }
             _ => {
                 return Err(InstallationError::InvalidField {
                     field: "effect.ownership_secret".to_owned(),
@@ -4328,13 +4406,27 @@ pub enum InstallationEffectObservation {
 
 impl InstallationEffectObservation {
     fn validate(&self) -> Result<(), InstallationError> {
+        self.validate_with_service_absence(false)
+    }
+
+    fn validate_for_effect(&self, effect: &InstallerEffectPlan) -> Result<(), InstallationError> {
+        self.validate_with_service_absence(matches!(
+            effect,
+            InstallerEffectPlan::RegisterService { .. }
+        ))
+    }
+
+    fn validate_with_service_absence(
+        &self,
+        allow_service_absence: bool,
+    ) -> Result<(), InstallationError> {
         match self {
             Self::Absent {
                 observed_precondition,
                 evidence,
             } => {
                 observed_precondition.validate()?;
-                if observed_precondition.os_snapshot.is_none() {
+                if observed_precondition.os_snapshot.is_none() && !allow_service_absence {
                     return Err(InstallationError::InvalidField {
                         field: "observation.observed_precondition".to_owned(),
                         reason: "absence must contain an independently observed OS snapshot"
@@ -4370,6 +4462,15 @@ pub struct InstallationEffectExecution {
 
 /// Object-safe adapter seam for bounded installation effects.
 pub trait InstallationEffectPort: Send {
+    /// Issues an unpredictable public nonce before an SCM registration intent
+    /// is committed. The call must not mutate SCM or the protected state root.
+    fn fresh_service_registration_nonce(
+        &mut self,
+        _request: &InstallationEffectRequest,
+    ) -> PortOutcome<PlatformHandle> {
+        PortOutcome::Unknown(UnknownReason::Unsupported)
+    }
+
     /// Issues a non-secret unpredictable Credential Manager target.
     ///
     /// This call must not create a credential or mutate the requested root.
@@ -4385,6 +4486,14 @@ pub trait InstallationEffectPort: Send {
         &mut self,
         request: &InstallationEffectRequest,
     ) -> PortOutcome<InstallationEffectExecution>;
+
+    /// Executes one service effect after the coordinator committed intent.
+    fn execute_service(
+        &mut self,
+        _request: &InstallationEffectRequest,
+    ) -> PortOutcome<InstallationEffectExecution> {
+        PortOutcome::Unknown(UnknownReason::Unsupported)
+    }
 
     /// Performs authoritative readback before a first execution.
     fn inspect(
@@ -4426,6 +4535,106 @@ impl WindowsInstallationEffectPort {
             primitive: WindowsInstallerRootPrimitive::new(),
             secrets: WindowsInstallerSecretProvider::new(),
         }
+    }
+
+    fn service_context(
+        request: &InstallationEffectRequest,
+    ) -> Result<
+        (
+            WindowsPlatform,
+            ServiceRegistrationRequest,
+            InstallerRootPrimitiveSpec,
+        ),
+        PortError,
+    > {
+        let (role, service_name, executable_path) = match &request.plan {
+            InstallerEffectPlan::RegisterService {
+                role,
+                service_name,
+                executable_path,
+                ..
+            } => (*role, service_name.as_str(), executable_path.as_str()),
+            _ => return Err(PortError::InvalidRequestMetadata),
+        };
+        let expected_name = match role {
+            InstallerServiceRole::Host => ELIOT_HOST_SERVICE_NAME,
+            InstallerServiceRole::Watchdog => ELIOT_WATCHDOG_SERVICE_NAME,
+        };
+        if service_name != expected_name {
+            return Err(PortError::InvalidRequestMetadata);
+        }
+        let bootstrap = request
+            .service_bootstrap
+            .as_ref()
+            .ok_or(PortError::InvalidRequestMetadata)?;
+        let nonce = request
+            .registration_nonce
+            .as_ref()
+            .ok_or(PortError::InvalidRequestMetadata)?;
+        let bootstrap = ServiceBootstrapArguments::new(
+            Path::new(bootstrap.descriptor_path.as_str()).to_path_buf(),
+            bootstrap.descriptor_digest.as_str(),
+            bootstrap.installation_id.as_str(),
+            bootstrap.plan_generation,
+            Vec::<String>::new(),
+        )
+        .and_then(|value| value.with_registration_nonce(nonce.as_str()))
+        .map_err(|_| PortError::InvalidRequestMetadata)?;
+        let mut registration = ServiceRegistrationRequest::with_bootstrap(
+            service_name,
+            match role {
+                InstallerServiceRole::Host => {
+                    eliot_platform_windows::ELIOT_HOST_SERVICE_DISPLAY_NAME
+                }
+                InstallerServiceRole::Watchdog => {
+                    eliot_platform_windows::ELIOT_WATCHDOG_SERVICE_DISPLAY_NAME
+                }
+            },
+            Path::new(executable_path).to_path_buf(),
+            ServiceStartMode::Automatic,
+            ServiceAccount::LocalService,
+            bootstrap,
+        )
+        .map_err(|_| PortError::InvalidRequestMetadata)?;
+        if request.action == InstallationEffectAction::Rollback {
+            let expected = request
+                .expected_external_identity
+                .as_ref()
+                .ok_or(PortError::InvalidRequestMetadata)?;
+            registration = registration
+                .with_expected_current(
+                    ServiceRegistrationCurrent::new(service_name, expected.as_str())
+                        .map_err(|_| PortError::InvalidRequestMetadata)?,
+                )
+                .map_err(|_| PortError::InvalidRequestMetadata)?;
+        }
+        let installation_root = PathBuf::from(request.installation_root.as_str());
+        let platform = WindowsPlatform::new(installation_root.clone())
+            .map_err(|_| PortError::InvalidRequestMetadata)?;
+        let profile = match request.profile {
+            InstallationProfile::SystemService => InstallerRootProfile::SystemService,
+            InstallationProfile::UserMode => InstallerRootProfile::UserMode,
+            InstallationProfile::PortableDev => InstallerRootProfile::PortableDev,
+        };
+        let profile_anchor = match request.profile {
+            InstallationProfile::SystemService => {
+                protected_program_data_root().map_err(|_| PortError::InvalidRequestMetadata)?
+            }
+            InstallationProfile::UserMode => {
+                current_user_local_app_data_root().map_err(|_| PortError::InvalidRequestMetadata)?
+            }
+            InstallationProfile::PortableDev => installation_root
+                .parent()
+                .ok_or(PortError::InvalidRequestMetadata)?
+                .to_path_buf(),
+        };
+        let spec = InstallerRootPrimitiveSpec {
+            root: installation_root.clone(),
+            installation_root,
+            profile_anchor,
+            profile,
+        };
+        Ok((platform, registration, spec))
     }
 
     fn secret_target<'a>(
@@ -4543,9 +4752,98 @@ impl WindowsInstallationEffectPort {
             }
         }
     }
+
+    fn inspect_service(
+        &self,
+        request: &InstallationEffectRequest,
+    ) -> Result<InstallationEffectObservation, PortError> {
+        let (platform, registration, spec) = Self::service_context(request)?;
+        let service_name = registration.service_name().to_owned();
+        match platform.inspect_service_registration(&registration) {
+            ServiceRegistrationInspection::Absent => {
+                if std::fs::symlink_metadata(service_marker_path(request)).is_ok() {
+                    return Ok(root_mismatch("service-marker-before-intent"));
+                }
+                service_absent_observation(request)
+            }
+            ServiceRegistrationInspection::Matching { .. } => {
+                let digest = registration.expected_configuration_digest();
+                match service_marker_read(&self.primitive, &spec, request, &service_name, &digest)?
+                {
+                    Some(_) => Ok(root_mismatch("service-marker-before-intent")),
+                    None => service_matching_observation(
+                        request,
+                        InstallationEffectDisposition::PreexistingMatching,
+                        &digest,
+                        &PlatformHandle::new("service-preexisting-marker-absent")
+                            .map_err(|_| PortError::InvalidRequestMetadata)?,
+                    ),
+                }
+            }
+            ServiceRegistrationInspection::Mismatched => Ok(root_mismatch("service-config")),
+            ServiceRegistrationInspection::Unknown => Ok(root_mismatch("service-readback")),
+        }
+    }
+
+    fn reconcile_service(
+        &self,
+        request: &InstallationEffectRequest,
+    ) -> Result<InstallationEffectObservation, PortError> {
+        let (platform, registration, spec) = Self::service_context(request)?;
+        let service_name = registration.service_name().to_owned();
+        let digest = registration.expected_configuration_digest();
+        match platform.inspect_service_registration(&registration) {
+            ServiceRegistrationInspection::Absent => service_absent_observation(request),
+            ServiceRegistrationInspection::Matching { .. } => {
+                let marker = if let Some(marker) =
+                    service_marker_read(&self.primitive, &spec, request, &service_name, &digest)?
+                {
+                    marker
+                } else {
+                    let marker =
+                        WindowsServiceOwnershipMarker::new(request, &service_name, &digest)?;
+                    let marker_path = service_marker_path(request);
+                    match self
+                        .primitive
+                        .create_protected_file(&spec, &marker_path, |_| {
+                            serde_json::to_vec(&marker)
+                                .map_err(|_| InstallerRootError::Indeterminate)
+                        }) {
+                        Ok(_) | Err(InstallerRootError::ReceiptMismatch) => {}
+                        Err(error) => return Err(root_port_error(error)),
+                    }
+                    service_marker_read(&self.primitive, &spec, request, &service_name, &digest)?
+                        .ok_or(PortError::InvalidRequestMetadata)?
+                };
+                let (_, marker) = marker;
+                let marker_digest = marker.digest()?;
+                service_matching_observation(
+                    request,
+                    InstallationEffectDisposition::CreatedByTransaction,
+                    &digest,
+                    &marker_digest,
+                )
+            }
+            ServiceRegistrationInspection::Mismatched => Ok(root_mismatch("service-config")),
+            ServiceRegistrationInspection::Unknown => Ok(root_mismatch("service-readback")),
+        }
+    }
 }
 
 impl InstallationEffectPort for WindowsInstallationEffectPort {
+    fn fresh_service_registration_nonce(
+        &mut self,
+        request: &InstallationEffectRequest,
+    ) -> PortOutcome<PlatformHandle> {
+        if !matches!(&request.plan, InstallerEffectPlan::RegisterService { .. }) {
+            return PortOutcome::Error(PortError::InvalidRequestMetadata);
+        }
+        match fresh_service_registration_nonce() {
+            Ok(nonce) => PortOutcome::Known(nonce),
+            Err(error) => secret_outcome(error),
+        }
+    }
+
     fn fresh_ownership_secret_reference(
         &mut self,
         request: &InstallationEffectRequest,
@@ -4578,6 +4876,9 @@ impl InstallationEffectPort for WindowsInstallationEffectPort {
         &mut self,
         request: &InstallationEffectRequest,
     ) -> PortOutcome<InstallationEffectExecution> {
+        if matches!(&request.plan, InstallerEffectPlan::RegisterService { .. }) {
+            return self.execute_service(request);
+        }
         let (spec, operation) = match windows_root_spec(request) {
             Ok(value) => value,
             Err(error) => return PortOutcome::Error(error),
@@ -4692,11 +4993,140 @@ impl InstallationEffectPort for WindowsInstallationEffectPort {
         }
     }
 
+    #[allow(clippy::too_many_lines)]
+    fn execute_service(
+        &mut self,
+        request: &InstallationEffectRequest,
+    ) -> PortOutcome<InstallationEffectExecution> {
+        let (platform, registration, spec) = match Self::service_context(request) {
+            Ok(value) => value,
+            Err(error) => return PortOutcome::Error(error),
+        };
+        if request.action == InstallationEffectAction::Rollback {
+            let observed = match self.reconcile_service(request) {
+                Ok(observed) => observed,
+                Err(error) => return PortOutcome::Error(error),
+            };
+            let InstallationEffectObservation::Matching {
+                disposition: InstallationEffectDisposition::CreatedByTransaction,
+                external_identity,
+                ..
+            } = observed
+            else {
+                return PortOutcome::Unknown(UnknownReason::Indeterminate);
+            };
+            if request.expected_external_identity.as_ref() != Some(&external_identity) {
+                return PortOutcome::Unknown(UnknownReason::Indeterminate);
+            }
+            let marker_path = service_marker_path(request);
+            let marker =
+                match self
+                    .primitive
+                    .read_protected_file(&spec, &marker_path, SERVICE_MARKER_LIMIT)
+                {
+                    Ok(marker) => marker,
+                    Err(error) => return root_execution_error(error),
+                };
+            match platform.delete_service_registration(&registration) {
+                Ok(ServiceRegistrationOutcome::Deleted) => {}
+                Ok(
+                    ServiceRegistrationOutcome::AlreadyAbsent
+                    | ServiceRegistrationOutcome::ExistingRequiresReconciliation
+                    | ServiceRegistrationOutcome::EffectUnknown
+                    | ServiceRegistrationOutcome::CreatedNow { .. }
+                    | ServiceRegistrationOutcome::PreexistingMatching { .. }
+                    | ServiceRegistrationOutcome::Registered { .. }
+                    | ServiceRegistrationOutcome::Updated { .. }
+                    | ServiceRegistrationOutcome::Unchanged { .. },
+                ) => {
+                    return PortOutcome::Unknown(UnknownReason::Indeterminate);
+                }
+                Err(_) => return PortOutcome::Unknown(UnknownReason::Indeterminate),
+            }
+            if self
+                .primitive
+                .delete_file(&marker_path, &marker.object)
+                .is_err()
+                || std::fs::symlink_metadata(&marker_path).is_ok()
+            {
+                return PortOutcome::Unknown(UnknownReason::Indeterminate);
+            }
+            return PortOutcome::Known(InstallationEffectExecution {
+                evidence: vec![
+                    PlatformHandle::new("rollback-service-and-marker-exact-identity")
+                        .unwrap_or_else(|_| unreachable!()),
+                ],
+                create_disposition: None,
+            });
+        }
+        let configuration_digest = registration.expected_configuration_digest();
+        match platform.register_service(&registration) {
+            Ok(ServiceRegistrationOutcome::CreatedNow { .. }) => {}
+            Ok(
+                ServiceRegistrationOutcome::PreexistingMatching { .. }
+                | ServiceRegistrationOutcome::Registered { .. }
+                | ServiceRegistrationOutcome::ExistingRequiresReconciliation
+                | ServiceRegistrationOutcome::EffectUnknown
+                | ServiceRegistrationOutcome::Updated { .. }
+                | ServiceRegistrationOutcome::Unchanged { .. }
+                | ServiceRegistrationOutcome::Deleted
+                | ServiceRegistrationOutcome::AlreadyAbsent,
+            ) => {
+                return PortOutcome::Unknown(UnknownReason::Indeterminate);
+            }
+            Err(_) => return PortOutcome::Unknown(UnknownReason::Indeterminate),
+        }
+        let marker = match WindowsServiceOwnershipMarker::new(
+            request,
+            registration.service_name(),
+            &configuration_digest,
+        ) {
+            Ok(marker) => marker,
+            Err(error) => return PortOutcome::Error(error),
+        };
+        let marker_path = service_marker_path(request);
+        let marker_object = match self
+            .primitive
+            .create_protected_file(&spec, &marker_path, |_| {
+                serde_json::to_vec(&marker).map_err(|_| InstallerRootError::Indeterminate)
+            }) {
+            Ok(object) => object,
+            Err(error) => return root_execution_error(error),
+        };
+        let marker_digest = match marker.digest() {
+            Ok(digest) => digest,
+            Err(error) => return PortOutcome::Error(error),
+        };
+        if self
+            .primitive
+            .read_protected_file(&spec, &marker_path, SERVICE_MARKER_LIMIT)
+            .is_err()
+        {
+            return PortOutcome::Unknown(UnknownReason::Indeterminate);
+        }
+        PortOutcome::Known(InstallationEffectExecution {
+            evidence: vec![
+                marker_digest,
+                PlatformHandle::new(format!(
+                    "service-marker-object:{}:{}",
+                    marker_object.volume_serial_number, marker_object.file_index
+                ))
+                .unwrap_or_else(|_| unreachable!()),
+            ],
+            create_disposition: Some(InstallationCreateDisposition::Created),
+        })
+    }
+
     fn inspect(
         &mut self,
         request: &InstallationEffectRequest,
     ) -> PortOutcome<InstallationEffectObservation> {
-        match self.inspect_primitive(request) {
+        let result = if matches!(&request.plan, InstallerEffectPlan::RegisterService { .. }) {
+            self.inspect_service(request)
+        } else {
+            self.inspect_primitive(request)
+        };
+        match result {
             Ok(observation) => PortOutcome::Known(observation),
             Err(error) => PortOutcome::Error(error),
         }
@@ -4706,7 +5136,12 @@ impl InstallationEffectPort for WindowsInstallationEffectPort {
         &mut self,
         request: &InstallationEffectRequest,
     ) -> PortOutcome<InstallationEffectObservation> {
-        match self.reconcile_primitive(request) {
+        let result = if matches!(&request.plan, InstallerEffectPlan::RegisterService { .. }) {
+            self.reconcile_service(request)
+        } else {
+            self.reconcile_primitive(request)
+        };
+        match result {
             Ok(observation) => PortOutcome::Known(observation),
             Err(error) => PortOutcome::Error(error),
         }
@@ -5138,6 +5573,169 @@ fn root_mismatch(reason: &str) -> InstallationEffectObservation {
     }
 }
 
+const SERVICE_MARKER_VERSION: u32 = 1;
+const SERVICE_MARKER_LIMIT: u64 = 16 * 1024;
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct WindowsServiceOwnershipMarker {
+    version: u32,
+    transaction_id: String,
+    effect_id: String,
+    plan_digest: String,
+    service_name: String,
+    registration_nonce: String,
+    configuration_digest: String,
+}
+
+impl WindowsServiceOwnershipMarker {
+    fn new(
+        request: &InstallationEffectRequest,
+        service_name: &str,
+        configuration_digest: &str,
+    ) -> Result<Self, PortError> {
+        Ok(Self {
+            version: SERVICE_MARKER_VERSION,
+            transaction_id: request.transaction_id.as_str().to_owned(),
+            effect_id: request.effect_id.as_str().to_owned(),
+            plan_digest: request.plan_digest.as_str().to_owned(),
+            service_name: service_name.to_owned(),
+            registration_nonce: request
+                .registration_nonce
+                .as_ref()
+                .ok_or(PortError::InvalidRequestMetadata)?
+                .as_str()
+                .to_owned(),
+            configuration_digest: configuration_digest.to_owned(),
+        })
+    }
+
+    fn matches(
+        &self,
+        request: &InstallationEffectRequest,
+        service_name: &str,
+        digest: &str,
+    ) -> bool {
+        self.version == SERVICE_MARKER_VERSION
+            && self.transaction_id == request.transaction_id.as_str()
+            && self.effect_id == request.effect_id.as_str()
+            && self.plan_digest == request.plan_digest.as_str()
+            && self.service_name == service_name
+            && request
+                .registration_nonce
+                .as_ref()
+                .is_some_and(|nonce| self.registration_nonce == nonce.as_str())
+            && self.configuration_digest == digest
+    }
+
+    fn digest(&self) -> Result<PlatformHandle, PortError> {
+        PlatformHandle::new(sha256_hex(
+            &serde_json::to_vec(self).map_err(|_| PortError::InvalidRequestMetadata)?,
+        ))
+        .map_err(|_| PortError::InvalidRequestMetadata)
+    }
+}
+
+fn service_marker_path(request: &InstallationEffectRequest) -> PathBuf {
+    let name = sha256_hex(
+        format!(
+            "service-marker-v1\0{}\0{}\0{}\0{}",
+            request.transaction_id.as_str(),
+            request.effect_id.as_str(),
+            request.plan_digest.as_str(),
+            request
+                .registration_nonce
+                .as_ref()
+                .map_or("", PlatformHandle::as_str),
+        )
+        .as_bytes(),
+    );
+    Path::new(request.installation_root.as_str()).join(format!(".eliot-service-{name}.marker"))
+}
+
+fn service_marker_read(
+    primitive: &WindowsInstallerRootPrimitive,
+    spec: &InstallerRootPrimitiveSpec,
+    request: &InstallationEffectRequest,
+    service_name: &str,
+    configuration_digest: &str,
+) -> Result<Option<(InstallerRootObjectSnapshot, WindowsServiceOwnershipMarker)>, PortError> {
+    let path = service_marker_path(request);
+    match std::fs::symlink_metadata(&path) {
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(_) => return Err(root_port_error(InstallerRootError::Indeterminate)),
+    }
+    let readback = primitive
+        .read_protected_file(spec, &path, SERVICE_MARKER_LIMIT)
+        .map_err(root_port_error)?;
+    let marker: WindowsServiceOwnershipMarker =
+        serde_json::from_slice(&readback.bytes).map_err(|_| PortError::InvalidRequestMetadata)?;
+    if !marker.matches(request, service_name, configuration_digest) {
+        return Err(PortError::Provider(ProviderError {
+            code: ProviderErrorCode::Failed,
+            retryable: false,
+        }));
+    }
+    Ok(Some((readback.object, marker)))
+}
+
+fn service_absent_observation(
+    request: &InstallationEffectRequest,
+) -> Result<InstallationEffectObservation, PortError> {
+    Ok(InstallationEffectObservation::Absent {
+        observed_precondition: request.precondition.clone(),
+        evidence: vec![
+            PlatformHandle::new(sha256_hex(
+                format!(
+                    "service-absent-v1\0{}\0{}",
+                    request.effect_id.as_str(),
+                    request.plan_digest.as_str()
+                )
+                .as_bytes(),
+            ))
+            .map_err(|_| PortError::InvalidRequestMetadata)?,
+        ],
+    })
+}
+
+fn service_matching_observation(
+    request: &InstallationEffectRequest,
+    disposition: InstallationEffectDisposition,
+    configuration_digest: &str,
+    marker_digest: &PlatformHandle,
+) -> Result<InstallationEffectObservation, PortError> {
+    let external_identity =
+        PlatformHandle::new(configuration_digest).map_err(|_| PortError::InvalidRequestMetadata)?;
+    let evidence = PlatformHandle::new(sha256_hex(
+        format!(
+            "service-matching-v1\0{}\0{}\0{}\0{}",
+            request.effect_id.as_str(),
+            request.plan_digest.as_str(),
+            configuration_digest,
+            marker_digest.as_str(),
+        )
+        .as_bytes(),
+    ))
+    .map_err(|_| PortError::InvalidRequestMetadata)?;
+    let postcondition_digest = PlatformHandle::new(sha256_hex(
+        format!(
+            "service-postcondition-v1\0{}\0{}\0{}",
+            request.effect_id.as_str(),
+            configuration_digest,
+            marker_digest.as_str(),
+        )
+        .as_bytes(),
+    ))
+    .map_err(|_| PortError::InvalidRequestMetadata)?;
+    Ok(InstallationEffectObservation::Matching {
+        disposition,
+        external_identity,
+        evidence: vec![evidence],
+        postcondition_digest,
+    })
+}
+
 fn root_port_error(error: InstallerRootError) -> PortError {
     match error {
         InstallerRootError::InvalidPath | InstallerRootError::MissingParent => {
@@ -5360,6 +5958,35 @@ where
             }
             InstallationEffectProgressState::Applied { .. } => unreachable!(),
         };
+        if matches!(
+            transaction.installer_effects[index],
+            InstallerEffectPlan::RegisterService { .. }
+        ) && transaction.effect_progress[index]
+            .registration_nonce
+            .is_none()
+            && matches!(
+                &transaction.effect_progress[index].state,
+                InstallationEffectProgressState::Pending
+            )
+        {
+            let expected = TransactionVersion::of(&transaction)?;
+            let provisional = effect_request(
+                &transaction,
+                index,
+                attempt,
+                InstallationEffectAction::Apply,
+                None,
+            )?;
+            let nonce = match self.port.fresh_service_registration_nonce(&provisional) {
+                PortOutcome::Known(nonce) => nonce,
+                other => return self.persist_unknown(transaction, index, port_pending(other)),
+            };
+            sha256_handle(&nonce, "effect.registration_nonce")?;
+            transaction.effect_progress[index].registration_nonce = Some(nonce);
+            increment_revision(&mut transaction)?;
+            transaction.validate()?;
+            self.store.compare_and_save(expected, &transaction)?;
+        }
         let request = effect_request(
             &transaction,
             index,
@@ -5393,7 +6020,7 @@ where
             }
             _ => unreachable!(),
         };
-        observation.validate()?;
+        observation.validate_for_effect(&transaction.installer_effects[index])?;
         match observation {
             InstallationEffectObservation::Matching {
                 disposition,
@@ -5454,7 +6081,10 @@ where
                 evidence: _,
             } => {
                 if observed_precondition.evidence_refs != request.precondition.evidence_refs
-                    || observed_precondition.os_snapshot.is_none()
+                    || (!matches!(
+                        transaction.installer_effects[index],
+                        InstallerEffectPlan::RegisterService { .. }
+                    ) && observed_precondition.os_snapshot.is_none())
                     || (was_intent && observed_precondition != request.precondition)
                 {
                     return self.persist_unknown(
@@ -5549,11 +6179,7 @@ where
                         )?;
                     }
                     (InstallerEffectPlan::CreateRoot { .. }, None)
-                    | (
-                        InstallerEffectPlan::ApplyAcl { .. }
-                        | InstallerEffectPlan::RegisterService { .. },
-                        Some(_),
-                    ) => {
+                    | (InstallerEffectPlan::ApplyAcl { .. }, Some(_)) => {
                         return self.persist_unknown(
                             transaction,
                             index,
@@ -5565,13 +6191,14 @@ where
                         InstallerEffectPlan::ApplyAcl { .. }
                         | InstallerEffectPlan::RegisterService { .. },
                         None,
-                    ) => {}
+                    )
+                    | (InstallerEffectPlan::RegisterService { .. }, Some(_)) => {}
                 }
                 let reconciled = match self.port.reconcile(&request) {
                     PortOutcome::Known(observation) => observation,
                     other => return self.persist_unknown(transaction, index, port_pending(other)),
                 };
-                reconciled.validate()?;
+                reconciled.validate_for_effect(&transaction.installer_effects[index])?;
                 match reconciled {
                     InstallationEffectObservation::Matching {
                         disposition,
@@ -5582,11 +6209,17 @@ where
                         let ownership =
                             transaction.effect_progress[index].ownership_secret.as_ref();
                         let authorized = match disposition {
-                            InstallationEffectDisposition::CreatedByTransaction => ownership
-                                .is_some_and(|ownership| {
+                            InstallationEffectDisposition::CreatedByTransaction => {
+                                ownership.is_some_and(|ownership| {
                                     ownership.create_disposition
                                         == InstallationCreateDisposition::Created
-                                }),
+                                }) || (matches!(
+                                    transaction.installer_effects[index],
+                                    InstallerEffectPlan::RegisterService { .. }
+                                ) && transaction.effect_progress[index]
+                                    .registration_nonce
+                                    .is_some())
+                            }
                             InstallationEffectDisposition::PreexistingMatching => {
                                 ownership.is_none()
                             }
@@ -5961,6 +6594,7 @@ fn effect_request(
         .effect_progress
         .get(index)
         .ok_or(InstallationError::IdentityConflict)?;
+    let is_service = matches!(&plan, InstallerEffectPlan::RegisterService { .. });
     let request = InstallationEffectRequest {
         transaction_id: transaction.transaction_id.clone(),
         plan,
@@ -5981,6 +6615,30 @@ fn effect_request(
         ownership_secret: progress.ownership_secret.clone(),
         action,
         expected_external_identity,
+        service_bootstrap: is_service.then(|| InstallationServiceBootstrap {
+            descriptor_path: transaction
+                .candidate_manifest
+                .runtime_launch
+                .authority_descriptor_path
+                .clone(),
+            descriptor_digest: transaction
+                .candidate_manifest
+                .runtime_launch
+                .authority_descriptor_digest
+                .clone(),
+            installation_id: transaction
+                .candidate_manifest
+                .runtime_launch
+                .installation_epoch
+                .installation
+                .clone(),
+            plan_generation: transaction
+                .candidate_manifest
+                .runtime_launch
+                .authority_generation
+                .value(),
+        }),
+        registration_nonce: progress.registration_nonce.clone(),
     };
     request.validate()?;
     Ok(request)
@@ -6749,6 +7407,29 @@ mod tests {
             saved.effect_progress[0].state,
             InstallationEffectProgressState::Unknown { .. }
         ));
+    }
+
+    #[test]
+    fn service_marker_requires_exact_transaction_nonce_and_configuration() {
+        let transaction = planned_transaction();
+        let mut request = must(effect_request(
+            &transaction,
+            0,
+            1,
+            InstallationEffectAction::Apply,
+            None,
+        ));
+        request.registration_nonce = Some(test_handle("a".repeat(64)));
+        let marker = must(WindowsServiceOwnershipMarker::new(
+            &request,
+            ELIOT_HOST_SERVICE_NAME,
+            &"b".repeat(64),
+        ));
+        assert!(marker.matches(&request, ELIOT_HOST_SERVICE_NAME, &"b".repeat(64)));
+        assert!(!marker.matches(&request, ELIOT_WATCHDOG_SERVICE_NAME, &"b".repeat(64)));
+        assert!(!marker.matches(&request, ELIOT_HOST_SERVICE_NAME, &"c".repeat(64)));
+        request.registration_nonce = Some(test_handle("d".repeat(64)));
+        assert!(!marker.matches(&request, ELIOT_HOST_SERVICE_NAME, &"b".repeat(64)));
     }
 
     #[test]
