@@ -3230,6 +3230,233 @@ pub enum ServiceStartMode {
 /// Canonical SCM names owned by the Runtime Live installer.
 pub const ELIOT_HOST_SERVICE_NAME: &str = "EliotHost";
 pub const ELIOT_WATCHDOG_SERVICE_NAME: &str = "EliotWatchdog";
+pub const ELIOT_HOST_SERVICE_DISPLAY_NAME: &str = "Eliot Host";
+pub const ELIOT_WATCHDOG_SERVICE_DISPLAY_NAME: &str = "Eliot Watchdog";
+
+/// Provider-neutral, typed authority passed to an SCM service through argv.
+///
+/// The four named values are deliberately not read from ambient environment
+/// state. `extra_args` is retained in caller order and is validated as argv
+/// data; it is never accepted as an already-rendered command line.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ServiceBootstrapArguments {
+    config_descriptor_path: PathBuf,
+    config_descriptor_digest: String,
+    installation_id: String,
+    transaction_plan_generation: u64,
+    extra_args: Vec<String>,
+}
+
+impl ServiceBootstrapArguments {
+    /// Creates the canonical bootstrap binding used by durable services.
+    ///
+    /// # Errors
+    /// Returns `InvalidInput` when a path, digest, identity, generation, or
+    /// extra argv value is not canonical.
+    pub fn new<I, S>(
+        config_descriptor_path: impl Into<PathBuf>,
+        config_descriptor_digest: impl Into<String>,
+        installation_id: impl Into<String>,
+        transaction_plan_generation: u64,
+        extra_args: I,
+    ) -> Result<Self, WindowsAdapterError>
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        let config_descriptor_path = config_descriptor_path.into();
+        let config_descriptor_digest = config_descriptor_digest.into();
+        let installation_id = installation_id.into();
+        let extra_args = extra_args.into_iter().map(Into::into).collect::<Vec<_>>();
+        if !config_descriptor_path.is_absolute()
+            || !valid_os_path(config_descriptor_path.as_path())
+            || !valid_sha256_hex(&config_descriptor_digest)
+            || !valid_bootstrap_identity(&installation_id)
+            || transaction_plan_generation == 0
+            || extra_args.iter().any(|arg| !valid_bootstrap_text(arg))
+            || extra_args.iter().any(|arg| is_reserved_bootstrap_arg(arg))
+        {
+            return Err(WindowsAdapterError::InvalidInput);
+        }
+        Ok(Self {
+            config_descriptor_path,
+            config_descriptor_digest,
+            installation_id,
+            transaction_plan_generation,
+            extra_args,
+        })
+    }
+
+    #[must_use]
+    pub fn config_descriptor_path(&self) -> &Path {
+        &self.config_descriptor_path
+    }
+
+    #[must_use]
+    pub fn config_descriptor_digest(&self) -> &str {
+        &self.config_descriptor_digest
+    }
+
+    #[must_use]
+    pub fn installation_id(&self) -> &str {
+        &self.installation_id
+    }
+
+    #[must_use]
+    pub const fn transaction_plan_generation(&self) -> u64 {
+        self.transaction_plan_generation
+    }
+
+    #[must_use]
+    pub const fn tx_plan_generation(&self) -> u64 {
+        self.transaction_plan_generation
+    }
+
+    #[must_use]
+    pub fn extra_args(&self) -> &[String] {
+        &self.extra_args
+    }
+
+    /// Returns typed fields rendered as ordered argv values.
+    #[must_use]
+    pub fn argv(&self) -> Vec<String> {
+        let config_descriptor_path = exact_path_text(&self.config_descriptor_path);
+        let mut argv = vec![
+            "--config-descriptor".to_owned(),
+            config_descriptor_path,
+            "--config-descriptor-sha256".to_owned(),
+            self.config_descriptor_digest.clone(),
+            "--installation-id".to_owned(),
+            self.installation_id.clone(),
+            "--tx-plan-generation".to_owned(),
+            self.transaction_plan_generation.to_string(),
+        ];
+        argv.extend(self.extra_args.iter().cloned());
+        argv
+    }
+
+    #[cfg(windows)]
+    fn argv_os(&self) -> Vec<std::ffi::OsString> {
+        let mut argv = vec![
+            std::ffi::OsString::from("--config-descriptor"),
+            self.config_descriptor_path.as_os_str().to_os_string(),
+            std::ffi::OsString::from("--config-descriptor-sha256"),
+            std::ffi::OsString::from(&self.config_descriptor_digest),
+            std::ffi::OsString::from("--installation-id"),
+            std::ffi::OsString::from(&self.installation_id),
+            std::ffi::OsString::from("--tx-plan-generation"),
+            std::ffi::OsString::from(self.transaction_plan_generation.to_string()),
+        ];
+        argv.extend(
+            self.extra_args
+                .iter()
+                .cloned()
+                .map(std::ffi::OsString::from),
+        );
+        argv
+    }
+}
+
+/// Exact current configuration identity required before installer mutation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ServiceRegistrationCurrent {
+    service_name: String,
+    configuration_digest: String,
+}
+
+impl ServiceRegistrationCurrent {
+    /// Creates an expected current SCM identity and configuration digest.
+    ///
+    /// # Errors
+    /// Returns `InvalidInput` for a non-canonical service name or digest.
+    pub fn new(
+        service_name: impl Into<String>,
+        configuration_digest: impl Into<String>,
+    ) -> Result<Self, WindowsAdapterError> {
+        let service_name = service_name.into();
+        let configuration_digest = configuration_digest.into();
+        if !canonical_runtime_service_name(&service_name)
+            || !valid_sha256_hex(&configuration_digest)
+        {
+            return Err(WindowsAdapterError::InvalidInput);
+        }
+        Ok(Self {
+            service_name,
+            configuration_digest,
+        })
+    }
+
+    #[must_use]
+    pub fn service_name(&self) -> &str {
+        &self.service_name
+    }
+
+    #[must_use]
+    pub fn configuration_digest(&self) -> &str {
+        &self.configuration_digest
+    }
+}
+
+fn valid_bootstrap_text(value: &str) -> bool {
+    !value.is_empty()
+        && value
+            .chars()
+            .all(|character| !character.is_control() && character != '\0')
+}
+
+fn valid_bootstrap_identity(value: &str) -> bool {
+    valid_bootstrap_text(value) && !value.contains('"')
+}
+
+fn is_reserved_bootstrap_arg(value: &str) -> bool {
+    matches!(
+        value,
+        "--config-descriptor"
+            | "--config-descriptor-sha256"
+            | "--installation-id"
+            | "--tx-plan-generation"
+    )
+}
+
+fn utf16_text(value: &str) -> Vec<u16> {
+    value.encode_utf16().collect()
+}
+
+fn exact_utf16_text(value: &[u16]) -> String {
+    String::from_utf16(value).unwrap_or_default()
+}
+
+fn exact_path_text(path: &Path) -> String {
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        exact_utf16_text(&path.as_os_str().encode_wide().collect::<Vec<_>>())
+    }
+    #[cfg(not(windows))]
+    {
+        path.to_str().unwrap_or_default().to_owned()
+    }
+}
+
+fn valid_os_path(path: &Path) -> bool {
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        let units = path.as_os_str().encode_wide().collect::<Vec<_>>();
+        String::from_utf16(&units).is_ok()
+            && units
+                .iter()
+                .all(|unit| *unit != 0 && !matches!(unit, 9..=13))
+    }
+    #[cfg(not(windows))]
+    {
+        path.to_str().is_some_and(|value| {
+            !value
+                .chars()
+                .any(|character| character == '\0' || character.is_control())
+        })
+    }
+}
 
 /// Validated, password-free request for registering one own-process service.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -3239,6 +3466,8 @@ pub struct ServiceRegistrationRequest {
     binary_path: PathBuf,
     start_mode: ServiceStartMode,
     account: ServiceAccount,
+    bootstrap: Option<ServiceBootstrapArguments>,
+    expected_current: Option<ServiceRegistrationCurrent>,
 }
 
 impl ServiceRegistrationRequest {
@@ -3260,10 +3489,13 @@ impl ServiceRegistrationRequest {
             || !valid_display_name(&display_name)
             || !binary_path.is_absolute()
             || !binary_path.is_file()
+            || !valid_os_path(binary_path.as_path())
             || !canonical_runtime_service_name(&service_name)
+            || canonical_runtime_service_display_name(&service_name)
+                .is_some_and(|expected| display_name != expected)
             || start_mode != ServiceStartMode::Automatic
             || account != ServiceAccount::LocalService
-            || binary_path.to_string_lossy().contains('"')
+            || exact_path_text(binary_path.as_path()).contains('"')
         {
             return Err(WindowsAdapterError::InvalidInput);
         }
@@ -3273,7 +3505,43 @@ impl ServiceRegistrationRequest {
             binary_path,
             start_mode,
             account,
+            bootstrap: None,
+            expected_current: None,
         })
+    }
+
+    /// Creates a request with the immutable, argv-only bootstrap authority.
+    ///
+    /// # Errors
+    /// Returns `InvalidInput` when the service shape or bootstrap binding is
+    /// not canonical.
+    pub fn with_bootstrap(
+        service_name: impl Into<String>,
+        display_name: impl Into<String>,
+        binary_path: impl Into<PathBuf>,
+        start_mode: ServiceStartMode,
+        account: ServiceAccount,
+        bootstrap: ServiceBootstrapArguments,
+    ) -> Result<Self, WindowsAdapterError> {
+        let mut request = Self::new(service_name, display_name, binary_path, start_mode, account)?;
+        request.bootstrap = Some(bootstrap);
+        Ok(request)
+    }
+
+    /// Binds the exact current service configuration allowed for installer
+    /// update or delete.
+    /// # Errors
+    /// Returns `InvalidInput` when the expected service identity does not
+    /// match this request's canonical service name.
+    pub fn with_expected_current(
+        mut self,
+        expected_current: ServiceRegistrationCurrent,
+    ) -> Result<Self, WindowsAdapterError> {
+        if expected_current.service_name() != self.service_name {
+            return Err(WindowsAdapterError::InvalidInput);
+        }
+        self.expected_current = Some(expected_current);
+        Ok(self)
     }
 
     #[must_use]
@@ -3300,6 +3568,60 @@ impl ServiceRegistrationRequest {
     pub const fn account(&self) -> ServiceAccount {
         self.account
     }
+
+    #[must_use]
+    pub fn bootstrap(&self) -> Option<&ServiceBootstrapArguments> {
+        self.bootstrap.as_ref()
+    }
+
+    #[must_use]
+    pub fn expected_current(&self) -> Option<&ServiceRegistrationCurrent> {
+        self.expected_current.as_ref()
+    }
+
+    #[must_use]
+    pub fn expected_configuration_digest(&self) -> String {
+        service_configuration_digest(
+            &self.binary_command_wide(),
+            &utf16_text(self.display_name()),
+            &utf16_text("NT AUTHORITY\\LocalService"),
+            0x0000_0010,
+            0x0000_0002,
+            0x0000_0001,
+            0,
+            &[],
+            &[],
+        )
+    }
+
+    #[cfg(windows)]
+    fn binary_command_wide(&self) -> Vec<u16> {
+        let mut command = quote_service_os_argument(self.binary_path.as_os_str(), true);
+        if let Some(bootstrap) = &self.bootstrap {
+            for argument in bootstrap.argv_os() {
+                command.push(' ' as u16);
+                command.extend(quote_service_os_argument(&argument, false));
+            }
+        }
+        command
+    }
+
+    #[cfg(not(windows))]
+    fn binary_command_wide(&self) -> Vec<u16> {
+        let mut command = quote_service_argument(&exact_path_text(&self.binary_path), true);
+        if let Some(bootstrap) = &self.bootstrap {
+            for argument in bootstrap.argv() {
+                command.push(' ');
+                command.push_str(&quote_service_argument(&argument, false));
+            }
+        }
+        command.encode_utf16().collect()
+    }
+
+    #[must_use]
+    pub fn binary_command(&self) -> String {
+        exact_utf16_text(&self.binary_command_wide())
+    }
 }
 
 /// Registration result preserving whether an external SCM effect requires
@@ -3307,6 +3629,10 @@ impl ServiceRegistrationRequest {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ServiceRegistrationOutcome {
     Registered { observation: ServiceObservation },
+    Updated { observation: ServiceObservation },
+    Unchanged { observation: ServiceObservation },
+    Deleted,
+    AlreadyAbsent,
     ExistingRequiresReconciliation,
     EffectUnknown,
 }
@@ -6176,6 +6502,31 @@ impl WindowsPlatform {
         register_service(request)
     }
 
+    /// Updates one existing canonical service and verifies the complete SCM
+    /// configuration after the provider call.
+    ///
+    /// # Errors
+    /// Returns a typed adapter error if the request cannot be admitted before
+    /// the provider call.
+    pub fn update_service_registration(
+        &self,
+        request: &ServiceRegistrationRequest,
+    ) -> Result<ServiceRegistrationOutcome, WindowsAdapterError> {
+        update_service_registration(request)
+    }
+
+    /// Deletes one canonical service and requires an `Absent` post-readback.
+    ///
+    /// # Errors
+    /// Returns a typed adapter error if the request cannot be admitted before
+    /// the provider call.
+    pub fn delete_service_registration(
+        &self,
+        request: &ServiceRegistrationRequest,
+    ) -> Result<ServiceRegistrationOutcome, WindowsAdapterError> {
+        delete_service_registration(request)
+    }
+
     /// Reads back the complete canonical registration without mutating SCM.
     ///
     /// # Errors
@@ -6522,8 +6873,10 @@ impl ServicePort for WindowsPlatform {
             // P-01 deliberately carries no binary path, account or start-mode
             // registration configuration. Guessing those would fabricate SCM
             // authority, so registration remains a typed unsupported outcome.
-            ServiceOperation::Register => PortOutcome::Unknown(UnknownReason::Unsupported),
-            ServiceOperation::Start | ServiceOperation::Stop | ServiceOperation::Unregister => {
+            ServiceOperation::Register | ServiceOperation::Unregister => {
+                PortOutcome::Unknown(UnknownReason::Unsupported)
+            }
+            ServiceOperation::Start | ServiceOperation::Stop => {
                 mutate_service(request.service.as_str(), request.operation)
             }
         }
@@ -7389,6 +7742,129 @@ fn valid_display_name(value: &str) -> bool {
         && value.chars().all(|character| !character.is_control())
 }
 
+fn canonical_runtime_service_display_name(name: &str) -> Option<&'static str> {
+    match name {
+        ELIOT_HOST_SERVICE_NAME => Some(ELIOT_HOST_SERVICE_DISPLAY_NAME),
+        ELIOT_WATCHDOG_SERVICE_NAME => Some(ELIOT_WATCHDOG_SERVICE_DISPLAY_NAME),
+        _ => None,
+    }
+}
+
+/// Quotes one argv element using the Windows command-line backslash rules.
+/// The executable is always quoted; ordinary arguments are quoted only when
+/// required by whitespace or an embedded quote.
+#[cfg(windows)]
+fn quote_service_os_argument(value: &std::ffi::OsStr, force: bool) -> Vec<u16> {
+    use std::os::windows::ffi::OsStrExt;
+    let raw = value.encode_wide().collect::<Vec<_>>();
+    let needs_quotes = force
+        || raw.is_empty()
+        || raw
+            .iter()
+            .any(|unit| matches!(*unit, 9 | 10 | 11 | 12 | 13 | 32))
+        || raw.contains(&(u16::from(b'"')));
+    if !needs_quotes {
+        return raw;
+    }
+    let mut quoted = Vec::with_capacity(raw.len() + 2);
+    quoted.push(u16::from(b'"'));
+    let mut backslashes = 0usize;
+    for unit in raw {
+        if unit == u16::from(b'\\') {
+            backslashes += 1;
+        } else if unit == u16::from(b'"') {
+            quoted.extend(std::iter::repeat_n(u16::from(b'\\'), backslashes * 2 + 1));
+            quoted.push(unit);
+            backslashes = 0;
+        } else {
+            quoted.extend(std::iter::repeat_n(u16::from(b'\\'), backslashes));
+            quoted.push(unit);
+            backslashes = 0;
+        }
+    }
+    quoted.extend(std::iter::repeat_n(u16::from(b'\\'), backslashes * 2));
+    quoted.push(u16::from(b'"'));
+    quoted
+}
+
+#[cfg(not(windows))]
+fn quote_service_argument(value: &str, force: bool) -> String {
+    let needs_quotes =
+        force || value.is_empty() || value.chars().any(char::is_whitespace) || value.contains('"');
+    if !needs_quotes {
+        return value.to_owned();
+    }
+    let mut quoted = String::with_capacity(value.len() + 2);
+    quoted.push('"');
+    let mut backslashes = 0usize;
+    for character in value.chars() {
+        if character == '\\' {
+            backslashes += 1;
+        } else if character == '"' {
+            quoted.extend(std::iter::repeat_n('\\', backslashes * 2 + 1));
+            quoted.push(character);
+            backslashes = 0;
+        } else {
+            quoted.extend(std::iter::repeat_n('\\', backslashes));
+            quoted.push(character);
+            backslashes = 0;
+        }
+    }
+    quoted.extend(std::iter::repeat_n('\\', backslashes * 2));
+    quoted.push('"');
+    quoted
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the digest input mirrors every QUERY_SERVICE_CONFIGW identity field"
+)]
+fn service_configuration_digest(
+    binary: &[u16],
+    display: &[u16],
+    account: &[u16],
+    service_type: u32,
+    start_type: u32,
+    error_control: u32,
+    tag_id: u32,
+    load_order_group: &[u16],
+    dependencies: &[Vec<u16>],
+) -> String {
+    let mut bytes = Vec::new();
+    for (tag, value) in [(b'b', binary), (b'd', display), (b'a', account)] {
+        bytes.push(tag);
+        bytes.extend((value.len() as u64).to_le_bytes());
+        for unit in value {
+            let normalized = if tag == b'a' {
+                char::from_u32(u32::from(*unit))
+                    .map_or(*unit, |character| character.to_ascii_lowercase() as u16)
+            } else {
+                *unit
+            };
+            bytes.extend(normalized.to_le_bytes());
+        }
+    }
+    bytes.push(b'l');
+    bytes.extend((load_order_group.len() as u64).to_le_bytes());
+    bytes.extend(load_order_group.iter().flat_map(|unit| unit.to_le_bytes()));
+    bytes.push(b'p');
+    bytes.extend((dependencies.len() as u64).to_le_bytes());
+    for dependency in dependencies {
+        bytes.extend((dependency.len() as u64).to_le_bytes());
+        bytes.extend(dependency.iter().flat_map(|unit| unit.to_le_bytes()));
+    }
+    for (tag, value) in [
+        (b't', service_type),
+        (b's', start_type),
+        (b'e', error_control),
+        (b'g', tag_id),
+    ] {
+        bytes.push(tag);
+        bytes.extend(value.to_le_bytes());
+    }
+    sha256_hex(&bytes)
+}
+
 fn windows_adapter_from_io(error: &std::io::Error) -> WindowsAdapterError {
     #[cfg(windows)]
     if let Some(code) = error.raw_os_error() {
@@ -7728,7 +8204,7 @@ fn dpapi_unprotect(_protected: &[u8]) -> Result<CredentialSecret, WindowsAdapter
 fn register_service(
     request: &ServiceRegistrationRequest,
 ) -> Result<ServiceRegistrationOutcome, WindowsAdapterError> {
-    use std::ffi::{OsStr, OsString};
+    use std::ffi::OsStr;
     use std::os::windows::ffi::OsStrExt;
     use windows_sys::Win32::Foundation::{ERROR_SERVICE_EXISTS, ERROR_SERVICE_MARKED_FOR_DELETE};
     use windows_sys::Win32::System::Services::{
@@ -7737,13 +8213,30 @@ fn register_service(
         SERVICE_QUERY_STATUS, SERVICE_WIN32_OWN_PROCESS,
     };
 
+    if request.bootstrap().is_none() {
+        return Err(WindowsAdapterError::InvalidInput);
+    }
+
+    match inspect_service_registration(request) {
+        ServiceRegistrationInspection::Matching { observation } => {
+            return Ok(ServiceRegistrationOutcome::Registered { observation });
+        }
+        ServiceRegistrationInspection::Mismatched => {
+            return Ok(ServiceRegistrationOutcome::ExistingRequiresReconciliation);
+        }
+        ServiceRegistrationInspection::Unknown => {
+            return Ok(ServiceRegistrationOutcome::EffectUnknown);
+        }
+        ServiceRegistrationInspection::Absent => {}
+    }
     let wide_text = |value: &OsStr| value.encode_wide().chain(Some(0)).collect::<Vec<_>>();
     let service_name = wide_text(OsStr::new(request.service_name()));
     let display_name = wide_text(OsStr::new(request.display_name()));
-    let mut binary_command = OsString::from("\"");
-    binary_command.push(request.binary_path());
-    binary_command.push("\"");
-    let binary_command = wide_text(&binary_command);
+    let binary_command = request
+        .binary_command_wide()
+        .into_iter()
+        .chain(Some(0))
+        .collect::<Vec<_>>();
     let account = match request.account() {
         ServiceAccount::LocalSystem => None,
         ServiceAccount::LocalService => Some(wide_text(OsStr::new("NT AUTHORITY\\LocalService"))),
@@ -7810,10 +8303,191 @@ fn register_service(
     ))
 }
 
+#[cfg(windows)]
+#[allow(clippy::unnecessary_wraps)]
+fn update_service_registration(
+    request: &ServiceRegistrationRequest,
+) -> Result<ServiceRegistrationOutcome, WindowsAdapterError> {
+    use std::ffi::OsStr;
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::System::Services::{
+        ChangeServiceConfigW, CloseServiceHandle, OpenSCManagerW, OpenServiceW, SC_MANAGER_CONNECT,
+        SERVICE_AUTO_START, SERVICE_CHANGE_CONFIG, SERVICE_ERROR_NORMAL, SERVICE_QUERY_CONFIG,
+        SERVICE_QUERY_STATUS, SERVICE_WIN32_OWN_PROCESS,
+    };
+    if request.bootstrap().is_none() {
+        return Err(WindowsAdapterError::InvalidInput);
+    }
+    let Some(expected_current) = request.expected_current() else {
+        return Ok(ServiceRegistrationOutcome::ExistingRequiresReconciliation);
+    };
+    if expected_current.service_name() != request.service_name() {
+        return Ok(ServiceRegistrationOutcome::ExistingRequiresReconciliation);
+    }
+    let wide = |value: &str| {
+        OsStr::new(value)
+            .encode_wide()
+            .chain(Some(0))
+            .collect::<Vec<_>>()
+    };
+    let name = wide(request.service_name());
+    let display = wide(request.display_name());
+    let command = request
+        .binary_command_wide()
+        .into_iter()
+        .chain(Some(0))
+        .collect::<Vec<_>>();
+    let account = wide("NT AUTHORITY\\LocalService");
+    let empty_load_order_group = [0_u16];
+    let empty_dependencies = [0_u16, 0_u16];
+    let manager = unsafe { OpenSCManagerW(std::ptr::null(), std::ptr::null(), SC_MANAGER_CONNECT) };
+    if manager.is_null() {
+        return Ok(ServiceRegistrationOutcome::EffectUnknown);
+    }
+    let service = unsafe {
+        OpenServiceW(
+            manager,
+            name.as_ptr(),
+            SERVICE_CHANGE_CONFIG | SERVICE_QUERY_CONFIG | SERVICE_QUERY_STATUS,
+        )
+    };
+    if service.is_null() {
+        unsafe { CloseServiceHandle(manager) };
+        return Ok(ServiceRegistrationOutcome::EffectUnknown);
+    }
+    let Some(configuration) = query_service_configuration(service) else {
+        unsafe {
+            CloseServiceHandle(service);
+            CloseServiceHandle(manager);
+        }
+        return Ok(ServiceRegistrationOutcome::EffectUnknown);
+    };
+    if !service_current_matches(request, expected_current, &configuration) {
+        unsafe {
+            CloseServiceHandle(service);
+            CloseServiceHandle(manager);
+        }
+        return Ok(ServiceRegistrationOutcome::ExistingRequiresReconciliation);
+    }
+    let changed = unsafe {
+        ChangeServiceConfigW(
+            service,
+            SERVICE_WIN32_OWN_PROCESS,
+            SERVICE_AUTO_START,
+            SERVICE_ERROR_NORMAL,
+            command.as_ptr(),
+            empty_load_order_group.as_ptr(),
+            std::ptr::null_mut(),
+            empty_dependencies.as_ptr(),
+            account.as_ptr(),
+            std::ptr::null(),
+            display.as_ptr(),
+        )
+    };
+    unsafe {
+        CloseServiceHandle(service);
+        CloseServiceHandle(manager);
+    }
+    if changed == 0 {
+        return Ok(ServiceRegistrationOutcome::EffectUnknown);
+    }
+    match inspect_service_registration(request) {
+        ServiceRegistrationInspection::Matching { observation } => {
+            Ok(ServiceRegistrationOutcome::Updated { observation })
+        }
+        ServiceRegistrationInspection::Absent
+        | ServiceRegistrationInspection::Mismatched
+        | ServiceRegistrationInspection::Unknown => Ok(ServiceRegistrationOutcome::EffectUnknown),
+    }
+}
+
+#[cfg(not(windows))]
+fn update_service_registration(
+    _request: &ServiceRegistrationRequest,
+) -> Result<ServiceRegistrationOutcome, WindowsAdapterError> {
+    Ok(ServiceRegistrationOutcome::EffectUnknown)
+}
+
+#[cfg(windows)]
+#[allow(clippy::unnecessary_wraps)]
+fn delete_service_registration(
+    request: &ServiceRegistrationRequest,
+) -> Result<ServiceRegistrationOutcome, WindowsAdapterError> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::System::Services::{
+        CloseServiceHandle, DeleteService, OpenSCManagerW, OpenServiceW, SC_MANAGER_CONNECT,
+        SERVICE_QUERY_CONFIG, SERVICE_QUERY_STATUS,
+    };
+    if request.bootstrap().is_none() {
+        return Err(WindowsAdapterError::InvalidInput);
+    }
+    let Some(expected_current) = request.expected_current() else {
+        return Ok(ServiceRegistrationOutcome::ExistingRequiresReconciliation);
+    };
+    if expected_current.service_name() != request.service_name() {
+        return Ok(ServiceRegistrationOutcome::ExistingRequiresReconciliation);
+    }
+    let name = std::ffi::OsStr::new(request.service_name())
+        .encode_wide()
+        .chain(Some(0))
+        .collect::<Vec<_>>();
+    let manager = unsafe { OpenSCManagerW(std::ptr::null(), std::ptr::null(), SC_MANAGER_CONNECT) };
+    if manager.is_null() {
+        return Ok(ServiceRegistrationOutcome::EffectUnknown);
+    }
+    let service = unsafe {
+        OpenServiceW(
+            manager,
+            name.as_ptr(),
+            0x0001_0000 | SERVICE_QUERY_CONFIG | SERVICE_QUERY_STATUS,
+        )
+    };
+    if service.is_null() {
+        unsafe { CloseServiceHandle(manager) };
+        return Ok(ServiceRegistrationOutcome::EffectUnknown);
+    }
+    let Some(configuration) = query_service_configuration(service) else {
+        unsafe {
+            CloseServiceHandle(service);
+            CloseServiceHandle(manager);
+        }
+        return Ok(ServiceRegistrationOutcome::EffectUnknown);
+    };
+    if !service_current_matches(request, expected_current, &configuration) {
+        unsafe {
+            CloseServiceHandle(service);
+            CloseServiceHandle(manager);
+        }
+        return Ok(ServiceRegistrationOutcome::ExistingRequiresReconciliation);
+    }
+    let deleted = unsafe { DeleteService(service) };
+    unsafe {
+        CloseServiceHandle(service);
+        CloseServiceHandle(manager);
+    }
+    if deleted == 0 {
+        return Ok(ServiceRegistrationOutcome::EffectUnknown);
+    }
+    match inspect_service_registration(request) {
+        ServiceRegistrationInspection::Absent => Ok(ServiceRegistrationOutcome::Deleted),
+        ServiceRegistrationInspection::Matching { .. }
+        | ServiceRegistrationInspection::Mismatched
+        | ServiceRegistrationInspection::Unknown => Ok(ServiceRegistrationOutcome::EffectUnknown),
+    }
+}
+
+#[cfg(not(windows))]
+fn delete_service_registration(
+    _request: &ServiceRegistrationRequest,
+) -> Result<ServiceRegistrationOutcome, WindowsAdapterError> {
+    Ok(ServiceRegistrationOutcome::EffectUnknown)
+}
+
 fn canonical_runtime_service_name(name: &str) -> bool {
     matches!(name, ELIOT_HOST_SERVICE_NAME | ELIOT_WATCHDOG_SERVICE_NAME)
 }
 
+#[cfg(test)]
 fn service_readback_is_acceptable(readback: &ServiceRegistrationInspection) -> bool {
     matches!(readback, ServiceRegistrationInspection::Matching { .. })
 }
@@ -7821,31 +8495,205 @@ fn service_readback_is_acceptable(readback: &ServiceRegistrationInspection) -> b
 fn registration_outcome_from_inspection(
     inspection: ServiceRegistrationInspection,
 ) -> ServiceRegistrationOutcome {
-    if !service_readback_is_acceptable(&inspection) {
-        return ServiceRegistrationOutcome::EffectUnknown;
-    }
     match inspection {
         ServiceRegistrationInspection::Matching { observation } => {
             ServiceRegistrationOutcome::Registered { observation }
         }
-        ServiceRegistrationInspection::Absent
-        | ServiceRegistrationInspection::Mismatched
-        | ServiceRegistrationInspection::Unknown => ServiceRegistrationOutcome::EffectUnknown,
+        ServiceRegistrationInspection::Mismatched => {
+            ServiceRegistrationOutcome::ExistingRequiresReconciliation
+        }
+        ServiceRegistrationInspection::Absent | ServiceRegistrationInspection::Unknown => {
+            ServiceRegistrationOutcome::EffectUnknown
+        }
     }
 }
 
+#[cfg(windows)]
+#[derive(Clone)]
+struct ServiceConfigurationReadback {
+    binary: Vec<u16>,
+    display: Vec<u16>,
+    account: Vec<u16>,
+    load_order_group: Vec<u16>,
+    dependencies: Vec<Vec<u16>>,
+    service_type: u32,
+    start_type: u32,
+    error_control: u32,
+    tag_id: u32,
+}
+
+#[cfg(windows)]
 fn exact_service_configuration_matches(
     request: &ServiceRegistrationRequest,
-    binary: &str,
-    account: &str,
-    own_process: bool,
-    automatic_start: bool,
+    configuration: &ServiceConfigurationReadback,
 ) -> bool {
-    let expected_binary = format!("\"{}\"", request.binary_path().display());
-    own_process
-        && automatic_start
-        && binary == expected_binary
-        && account.eq_ignore_ascii_case("NT AUTHORITY\\LocalService")
+    let expected_account = utf16_text("NT AUTHORITY\\LocalService");
+    configuration.service_type == 0x0000_0010
+        && configuration.start_type == 0x0000_0002
+        && configuration.error_control == 0x0000_0001
+        && configuration.tag_id == 0
+        && configuration.binary == request.binary_command_wide()
+        && configuration.display == utf16_text(request.display_name())
+        && configuration.load_order_group.is_empty()
+        && configuration.dependencies.is_empty()
+        && utf16_eq_ignore_ascii_case(&configuration.account, &expected_account)
+}
+
+#[cfg(windows)]
+fn service_current_matches(
+    request: &ServiceRegistrationRequest,
+    expected: &ServiceRegistrationCurrent,
+    configuration: &ServiceConfigurationReadback,
+) -> bool {
+    expected.service_name() == request.service_name()
+        && service_configuration_digest(
+            &configuration.binary,
+            &configuration.display,
+            &configuration.account,
+            configuration.service_type,
+            configuration.start_type,
+            configuration.error_control,
+            configuration.tag_id,
+            &configuration.load_order_group,
+            &configuration.dependencies,
+        ) == expected.configuration_digest()
+}
+
+fn utf16_eq_ignore_ascii_case(left: &[u16], right: &[u16]) -> bool {
+    left.len() == right.len()
+        && left.iter().zip(right).all(|(left, right)| {
+            char::from_u32(u32::from(*left))
+                .zip(char::from_u32(u32::from(*right)))
+                .is_some_and(|(left, right)| left.eq_ignore_ascii_case(&right))
+        })
+}
+
+#[cfg(windows)]
+fn query_service_configuration(
+    service: windows_sys::Win32::Foundation::HANDLE,
+) -> Option<ServiceConfigurationReadback> {
+    use windows_sys::Win32::System::Services::{QUERY_SERVICE_CONFIGW, QueryServiceConfigW};
+    let mut required = 0;
+    unsafe {
+        QueryServiceConfigW(service, std::ptr::null_mut(), 0, &raw mut required);
+    }
+    if required == 0 {
+        return None;
+    }
+    let config_size = std::mem::size_of::<QUERY_SERVICE_CONFIGW>();
+    let buffer_bytes = required as usize;
+    if buffer_bytes < config_size {
+        return None;
+    }
+    let words = buffer_bytes.saturating_add(config_size - 1) / config_size;
+    let mut buffer = vec![QUERY_SERVICE_CONFIGW::default(); words];
+    if unsafe { QueryServiceConfigW(service, buffer.as_mut_ptr(), required, &raw mut required) }
+        == 0
+    {
+        return None;
+    }
+    let config = &buffer[0];
+    let buffer_start = buffer.as_ptr().cast::<u8>();
+    Some(ServiceConfigurationReadback {
+        binary: service_config_wide(config.lpBinaryPathName, buffer_start, buffer_bytes)?,
+        display: service_config_wide(config.lpDisplayName, buffer_start, buffer_bytes)?,
+        account: service_config_wide(config.lpServiceStartName, buffer_start, buffer_bytes)?,
+        load_order_group: service_config_wide_or_empty(
+            config.lpLoadOrderGroup,
+            buffer_start,
+            buffer_bytes,
+        )?,
+        dependencies: service_config_multi_sz(config.lpDependencies, buffer_start, buffer_bytes)?,
+        service_type: config.dwServiceType,
+        start_type: config.dwStartType,
+        error_control: config.dwErrorControl,
+        tag_id: config.dwTagId,
+    })
+}
+
+#[cfg(windows)]
+fn service_config_buffer_tail_words(
+    pointer: *const u16,
+    buffer_start: *const u8,
+    buffer_bytes: usize,
+) -> Option<usize> {
+    let start = buffer_start as usize;
+    let end = start.checked_add(buffer_bytes)?;
+    let pointer_address = pointer as usize;
+    if pointer_address < start
+        || pointer_address >= end
+        || !pointer_address.is_multiple_of(std::mem::align_of::<u16>())
+    {
+        return None;
+    }
+    let remaining_bytes = end.checked_sub(pointer_address)?;
+    if !remaining_bytes.is_multiple_of(std::mem::size_of::<u16>()) {
+        return None;
+    }
+    Some(remaining_bytes / std::mem::size_of::<u16>())
+}
+
+#[cfg(windows)]
+fn service_config_wide(
+    pointer: *const u16,
+    buffer_start: *const u8,
+    buffer_bytes: usize,
+) -> Option<Vec<u16>> {
+    if pointer.is_null() {
+        return None;
+    }
+    let bounded = unsafe {
+        std::slice::from_raw_parts(
+            pointer,
+            service_config_buffer_tail_words(pointer, buffer_start, buffer_bytes)?,
+        )
+    };
+    let length = bounded.iter().position(|unit| *unit == 0)?;
+    Some(bounded[..length].to_vec())
+}
+
+#[cfg(windows)]
+fn service_config_wide_or_empty(
+    pointer: *const u16,
+    buffer_start: *const u8,
+    buffer_bytes: usize,
+) -> Option<Vec<u16>> {
+    if pointer.is_null() {
+        Some(Vec::new())
+    } else {
+        service_config_wide(pointer, buffer_start, buffer_bytes)
+    }
+}
+
+#[cfg(windows)]
+fn service_config_multi_sz(
+    pointer: *const u16,
+    buffer_start: *const u8,
+    buffer_bytes: usize,
+) -> Option<Vec<Vec<u16>>> {
+    if pointer.is_null() {
+        return Some(Vec::new());
+    }
+    let bounded = unsafe {
+        std::slice::from_raw_parts(
+            pointer,
+            service_config_buffer_tail_words(pointer, buffer_start, buffer_bytes)?,
+        )
+    };
+    let mut dependencies = Vec::new();
+    let mut offset = 0usize;
+    loop {
+        let tail = bounded.get(offset..)?;
+        if tail.first() == Some(&0) {
+            if !dependencies.is_empty() || tail.get(1) == Some(&0) {
+                return Some(dependencies);
+            }
+            return None;
+        }
+        let length = tail.iter().position(|unit| *unit == 0)?;
+        dependencies.push(tail[..length].to_vec());
+        offset = offset.checked_add(length)?.checked_add(1)?;
+    }
 }
 
 #[cfg(windows)]
@@ -7856,9 +8704,7 @@ fn inspect_service_registration(
     use std::os::windows::ffi::OsStrExt;
     use windows_sys::Win32::Foundation::ERROR_SERVICE_DOES_NOT_EXIST;
     use windows_sys::Win32::System::Services::{
-        CloseServiceHandle, OpenSCManagerW, OpenServiceW, QUERY_SERVICE_CONFIGW,
-        QueryServiceConfigW, SC_MANAGER_CONNECT, SERVICE_AUTO_START, SERVICE_QUERY_CONFIG,
-        SERVICE_WIN32_OWN_PROCESS,
+        CloseServiceHandle, OpenSCManagerW, OpenServiceW, SC_MANAGER_CONNECT, SERVICE_QUERY_CONFIG,
     };
 
     let name = OsStr::new(request.service_name())
@@ -7880,39 +8726,14 @@ fn inspect_service_registration(
         };
     }
 
-    let mut required = 0;
-    unsafe {
-        QueryServiceConfigW(service, std::ptr::null_mut(), 0, &raw mut required);
-    }
-    if required == 0 {
+    let Some(configuration) = query_service_configuration(service) else {
         unsafe {
             CloseServiceHandle(service);
             CloseServiceHandle(manager);
         }
         return ServiceRegistrationInspection::Unknown;
-    }
-    let config_size = std::mem::size_of::<QUERY_SERVICE_CONFIGW>();
-    let words = (required as usize).saturating_add(config_size - 1) / config_size;
-    let mut buffer = vec![QUERY_SERVICE_CONFIGW::default(); words];
-    let config =
-        unsafe { QueryServiceConfigW(service, buffer.as_mut_ptr(), required, &raw mut required) };
-    if config == 0 {
-        unsafe {
-            CloseServiceHandle(service);
-            CloseServiceHandle(manager);
-        }
-        return ServiceRegistrationInspection::Unknown;
-    }
-    let config = &buffer[0];
-    let binary = service_config_string(config.lpBinaryPathName);
-    let account = service_config_string(config.lpServiceStartName);
-    let matches = exact_service_configuration_matches(
-        request,
-        &binary,
-        &account,
-        config.dwServiceType == SERVICE_WIN32_OWN_PROCESS,
-        config.dwStartType == SERVICE_AUTO_START,
-    );
+    };
+    let matches = exact_service_configuration_matches(request, &configuration);
     unsafe {
         CloseServiceHandle(service);
         CloseServiceHandle(manager);
@@ -7920,13 +8741,7 @@ fn inspect_service_registration(
     if !matches {
         return ServiceRegistrationInspection::Mismatched;
     }
-    match inspect_service(request.service_name()) {
-        PortOutcome::Known(observation)
-        | PortOutcome::Partial {
-            value: observation, ..
-        } => ServiceRegistrationInspection::Matching { observation },
-        PortOutcome::Unknown(_) | PortOutcome::Error(_) => ServiceRegistrationInspection::Unknown,
-    }
+    service_registration_inspection_from_status(inspect_service(request.service_name()))
 }
 
 #[cfg(not(windows))]
@@ -7936,17 +8751,14 @@ fn inspect_service_registration(
     ServiceRegistrationInspection::Unknown
 }
 
-#[cfg(windows)]
-fn service_config_string(pointer: *const u16) -> String {
-    if pointer.is_null() {
-        return String::new();
-    }
-    let mut length = 0;
-    unsafe {
-        while *pointer.add(length) != 0 {
-            length += 1;
+fn service_registration_inspection_from_status(
+    status: PortOutcome<ServiceObservation>,
+) -> ServiceRegistrationInspection {
+    match status {
+        PortOutcome::Known(observation) => ServiceRegistrationInspection::Matching { observation },
+        PortOutcome::Partial { .. } | PortOutcome::Unknown(_) | PortOutcome::Error(_) => {
+            ServiceRegistrationInspection::Unknown
         }
-        String::from_utf16_lossy(std::slice::from_raw_parts(pointer, length))
     }
 }
 
@@ -8042,9 +8854,8 @@ fn mutate_service(name: &str, operation: ServiceOperation) -> PortOutcome<Servic
     use std::os::windows::ffi::OsStrExt;
     use windows_sys::Win32::Foundation::ERROR_SERVICE_DOES_NOT_EXIST;
     use windows_sys::Win32::System::Services::{
-        CloseServiceHandle, ControlService, DeleteService, OpenSCManagerW, OpenServiceW,
-        SC_MANAGER_CONNECT, SERVICE_CONTROL_STOP, SERVICE_START, SERVICE_STATUS, SERVICE_STOP,
-        StartServiceW,
+        CloseServiceHandle, ControlService, OpenSCManagerW, OpenServiceW, SC_MANAGER_CONNECT,
+        SERVICE_CONTROL_STOP, SERVICE_START, SERVICE_STATUS, SERVICE_STOP, StartServiceW,
     };
     let name_wide = std::ffi::OsStr::new(name)
         .encode_wide()
@@ -8053,8 +8864,7 @@ fn mutate_service(name: &str, operation: ServiceOperation) -> PortOutcome<Servic
     let access = match operation {
         ServiceOperation::Start => SERVICE_START,
         ServiceOperation::Stop => SERVICE_STOP,
-        ServiceOperation::Unregister => 0x0001_0000,
-        ServiceOperation::Inspect | ServiceOperation::Register => {
+        ServiceOperation::Inspect | ServiceOperation::Register | ServiceOperation::Unregister => {
             return PortOutcome::Unknown(UnknownReason::Unsupported);
         }
     };
@@ -8084,8 +8894,7 @@ fn mutate_service(name: &str, operation: ServiceOperation) -> PortOutcome<Servic
             let mut status = SERVICE_STATUS::default();
             unsafe { ControlService(service, SERVICE_CONTROL_STOP, &raw mut status) }
         }
-        ServiceOperation::Unregister => unsafe { DeleteService(service) },
-        ServiceOperation::Inspect | ServiceOperation::Register => 0,
+        ServiceOperation::Inspect | ServiceOperation::Register | ServiceOperation::Unregister => 0,
     };
     let error = (ok == 0).then(std::io::Error::last_os_error);
     unsafe {
@@ -9309,6 +10118,268 @@ mod tests {
                 Err(WindowsAdapterError::InvalidInput)
             );
         }
+        assert_eq!(
+            ServiceRegistrationRequest::new(
+                ELIOT_HOST_SERVICE_NAME,
+                ELIOT_WATCHDOG_SERVICE_DISPLAY_NAME,
+                &image,
+                ServiceStartMode::Automatic,
+                ServiceAccount::LocalService,
+            ),
+            Err(WindowsAdapterError::InvalidInput)
+        );
+    }
+
+    #[test]
+    fn service_bootstrap_arguments_preserve_typed_order_and_substitution() {
+        let bootstrap = ServiceBootstrapArguments::new(
+            PathBuf::from(r"C:\ProgramData\Eliot\generation 7\runtime.json"),
+            "a".repeat(64),
+            "installation-7",
+            7,
+            ["--extra".to_owned(), "value with spaces".to_owned()],
+        )
+        .unwrap_or_else(|error| panic!("bootstrap failed: {error}"));
+        assert_eq!(
+            bootstrap.argv(),
+            vec![
+                "--config-descriptor".to_owned(),
+                r"C:\ProgramData\Eliot\generation 7\runtime.json".to_owned(),
+                "--config-descriptor-sha256".to_owned(),
+                "a".repeat(64),
+                "--installation-id".to_owned(),
+                "installation-7".to_owned(),
+                "--tx-plan-generation".to_owned(),
+                "7".to_owned(),
+                "--extra".to_owned(),
+                "value with spaces".to_owned(),
+            ]
+        );
+        let image = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("missing"));
+        let request = ServiceRegistrationRequest::with_bootstrap(
+            ELIOT_HOST_SERVICE_NAME,
+            ELIOT_HOST_SERVICE_DISPLAY_NAME,
+            &image,
+            ServiceStartMode::Automatic,
+            ServiceAccount::LocalService,
+            bootstrap,
+        )
+        .unwrap_or_else(|error| panic!("request failed: {error}"));
+        let command = request.binary_command();
+        assert!(command.starts_with('"'));
+        assert!(command.contains("--config-descriptor"));
+        assert!(command.contains("\"value with spaces\""));
+        assert!(command.contains("--tx-plan-generation 7"));
+    }
+
+    #[test]
+    fn service_bootstrap_arguments_reject_substitution_and_reserved_flags() {
+        assert_eq!(
+            ServiceBootstrapArguments::new(
+                PathBuf::from(r"C:\runtime.json"),
+                "A".repeat(64),
+                "installation",
+                1,
+                Vec::<String>::new(),
+            ),
+            Err(WindowsAdapterError::InvalidInput)
+        );
+        assert_eq!(
+            ServiceBootstrapArguments::new(
+                PathBuf::from(r"C:\runtime.json"),
+                "a".repeat(64),
+                "installation",
+                1,
+                vec!["--installation-id".to_owned()],
+            ),
+            Err(WindowsAdapterError::InvalidInput)
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn service_bootstrap_command_preserves_unicode_quotes_and_trailing_slashes() {
+        let bootstrap = ServiceBootstrapArguments::new(
+            PathBuf::from(r"C:\ProgramData\Eliot\Δ generation\config.json"),
+            "b".repeat(64),
+            "installation-unicode",
+            9,
+            [
+                "--label=quoted\"value".to_owned(),
+                r"C:\ProgramData\Eliot\tail\".to_owned(),
+            ],
+        )
+        .unwrap_or_else(|error| panic!("bootstrap failed: {error}"));
+        let image = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("missing"));
+        let request = ServiceRegistrationRequest::with_bootstrap(
+            ELIOT_HOST_SERVICE_NAME,
+            ELIOT_HOST_SERVICE_DISPLAY_NAME,
+            image,
+            ServiceStartMode::Automatic,
+            ServiceAccount::LocalService,
+            bootstrap,
+        )
+        .unwrap_or_else(|error| panic!("request failed: {error}"));
+        let command = request.binary_command();
+        assert!(command.contains("Δ generation"));
+        assert!(command.contains("--label=quoted"));
+        assert!(command.contains("\\\"value"));
+        assert!(command.contains(r"C:\ProgramData\Eliot\tail\"));
+        assert_eq!(
+            service_configuration_digest(
+                &request.binary_command_wide(),
+                &utf16_text(request.display_name()),
+                &utf16_text("NT AUTHORITY\\LocalService"),
+                0x0000_0010,
+                0x0000_0002,
+                0x0000_0001,
+                0,
+                &[],
+                &[],
+            ),
+            request.expected_configuration_digest()
+        );
+    }
+
+    #[test]
+    fn service_bootstrap_rejects_nul_and_mutations_require_bootstrap() {
+        assert_eq!(
+            ServiceBootstrapArguments::new(
+                PathBuf::from(r"C:\runtime.json"),
+                "a".repeat(64),
+                "installation",
+                1,
+                vec!["bad\0arg".to_owned()],
+            ),
+            Err(WindowsAdapterError::InvalidInput)
+        );
+        assert_eq!(
+            ServiceBootstrapArguments::new(
+                PathBuf::from("C:\\runtime\0.json"),
+                "a".repeat(64),
+                "installation",
+                1,
+                Vec::<String>::new(),
+            ),
+            Err(WindowsAdapterError::InvalidInput)
+        );
+
+        #[cfg(windows)]
+        {
+            let image = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("missing"));
+            let request = ServiceRegistrationRequest::new(
+                ELIOT_HOST_SERVICE_NAME,
+                ELIOT_HOST_SERVICE_DISPLAY_NAME,
+                image,
+                ServiceStartMode::Automatic,
+                ServiceAccount::LocalService,
+            )
+            .unwrap_or_else(|error| panic!("request failed: {error}"));
+            assert_eq!(
+                register_service(&request),
+                Err(WindowsAdapterError::InvalidInput)
+            );
+            assert_eq!(
+                update_service_registration(&request),
+                Err(WindowsAdapterError::InvalidInput)
+            );
+            assert_eq!(
+                delete_service_registration(&request),
+                Err(WindowsAdapterError::InvalidInput)
+            );
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn service_mutation_requires_expected_current_and_rejects_substitution() {
+        let bootstrap = ServiceBootstrapArguments::new(
+            PathBuf::from(r"C:\ProgramData\Eliot\config.json"),
+            "c".repeat(64),
+            "installation",
+            1,
+            Vec::<String>::new(),
+        )
+        .unwrap_or_else(|error| panic!("bootstrap failed: {error}"));
+        let image = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("missing"));
+        let request = ServiceRegistrationRequest::with_bootstrap(
+            ELIOT_HOST_SERVICE_NAME,
+            ELIOT_HOST_SERVICE_DISPLAY_NAME,
+            image,
+            ServiceStartMode::Automatic,
+            ServiceAccount::LocalService,
+            bootstrap,
+        )
+        .unwrap_or_else(|error| panic!("request failed: {error}"));
+        assert_eq!(
+            update_service_registration(&request),
+            Ok(ServiceRegistrationOutcome::ExistingRequiresReconciliation)
+        );
+        assert_eq!(
+            delete_service_registration(&request),
+            Ok(ServiceRegistrationOutcome::ExistingRequiresReconciliation)
+        );
+
+        let matching = ServiceConfigurationReadback {
+            binary: request.binary_command_wide(),
+            display: utf16_text(request.display_name()),
+            account: utf16_text("NT AUTHORITY\\LocalService"),
+            load_order_group: Vec::new(),
+            dependencies: Vec::new(),
+            service_type: 0x0000_0010,
+            start_type: 0x0000_0002,
+            error_control: 0x0000_0001,
+            tag_id: 0,
+        };
+        let expected = ServiceRegistrationCurrent::new(
+            ELIOT_HOST_SERVICE_NAME,
+            service_configuration_digest(
+                &matching.binary,
+                &matching.display,
+                &matching.account,
+                matching.service_type,
+                matching.start_type,
+                matching.error_control,
+                matching.tag_id,
+                &matching.load_order_group,
+                &matching.dependencies,
+            ),
+        )
+        .unwrap_or_else(|error| panic!("current failed: {error}"));
+        assert!(service_current_matches(&request, &expected, &matching));
+        let substituted = ServiceConfigurationReadback {
+            binary: utf16_text(r#""C:\wrong\eliot-host.exe""#),
+            ..matching.clone()
+        };
+        assert!(!service_current_matches(&request, &expected, &substituted));
+        let mut substituted_error_control = matching.clone();
+        substituted_error_control.error_control = 0x0000_0002;
+        assert!(!service_current_matches(
+            &request,
+            &expected,
+            &substituted_error_control
+        ));
+        let mut substituted_tag = matching.clone();
+        substituted_tag.tag_id = 3;
+        assert!(!service_current_matches(
+            &request,
+            &expected,
+            &substituted_tag
+        ));
+        let mut substituted_load_order_group = matching.clone();
+        substituted_load_order_group.load_order_group = utf16_text("EliotGroup");
+        assert!(!service_current_matches(
+            &request,
+            &expected,
+            &substituted_load_order_group
+        ));
+        let mut substituted_dependencies = matching;
+        substituted_dependencies.dependencies = vec![utf16_text("Tcpip")];
+        assert!(!service_current_matches(
+            &request,
+            &expected,
+            &substituted_dependencies
+        ));
     }
 
     #[test]
@@ -9322,35 +10393,126 @@ mod tests {
             ServiceAccount::LocalService,
         )
         .unwrap_or_else(|error| panic!("request failed: {error}"));
-        let binary = format!("\"{}\"", image.display());
-        assert!(exact_service_configuration_matches(
-            &request,
-            &binary,
-            "NT AUTHORITY\\LocalService",
-            true,
-            true,
-        ));
+        let matching = ServiceConfigurationReadback {
+            binary: request.binary_command_wide(),
+            display: utf16_text("Eliot Host"),
+            account: utf16_text("NT AUTHORITY\\LocalService"),
+            load_order_group: Vec::new(),
+            dependencies: Vec::new(),
+            service_type: 0x0000_0010,
+            start_type: 0x0000_0002,
+            error_control: 0x0000_0001,
+            tag_id: 0,
+        };
+        assert!(exact_service_configuration_matches(&request, &matching));
+        let mut wrong_binary = matching.clone();
+        wrong_binary.binary = utf16_text("\"C:\\wrong\\eliot-host.exe\"");
         assert!(!exact_service_configuration_matches(
             &request,
-            "\"C:\\wrong\\eliot-host.exe\"",
-            "NT AUTHORITY\\LocalService",
-            true,
-            true,
+            &wrong_binary
         ));
+        let mut wrong_account = matching.clone();
+        wrong_account.account = utf16_text("LocalSystem");
         assert!(!exact_service_configuration_matches(
             &request,
-            &binary,
-            "LocalSystem",
-            true,
-            true,
+            &wrong_account
         ));
+        let mut wrong_type = matching.clone();
+        wrong_type.service_type = 0x0000_0011;
+        assert!(!exact_service_configuration_matches(&request, &wrong_type));
+        let mut wrong_start = matching.clone();
+        wrong_start.start_type = 0x0000_0003;
+        assert!(!exact_service_configuration_matches(&request, &wrong_start));
+        let mut wrong_error_control = matching.clone();
+        wrong_error_control.error_control = 0x0000_0002;
         assert!(!exact_service_configuration_matches(
             &request,
-            &binary,
-            "NT AUTHORITY\\LocalService",
-            true,
-            false,
+            &wrong_error_control
         ));
+        let mut wrong_tag = matching.clone();
+        wrong_tag.tag_id = 7;
+        assert!(!exact_service_configuration_matches(&request, &wrong_tag));
+        let mut wrong_load_order_group = matching.clone();
+        wrong_load_order_group.load_order_group = utf16_text("EliotGroup");
+        assert!(!exact_service_configuration_matches(
+            &request,
+            &wrong_load_order_group
+        ));
+        let mut wrong_dependencies = matching;
+        wrong_dependencies.dependencies = vec![utf16_text("Tcpip")];
+        assert!(!exact_service_configuration_matches(
+            &request,
+            &wrong_dependencies
+        ));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn service_dependency_multisz_readback_is_ordered_and_canonical() {
+        let raw = [
+            u16::from(b'T'),
+            u16::from(b'c'),
+            u16::from(b'p'),
+            u16::from(b'i'),
+            u16::from(b'p'),
+            0,
+            u16::from(b'D'),
+            u16::from(b'n'),
+            u16::from(b's'),
+            0,
+            0,
+        ];
+        assert_eq!(
+            service_config_multi_sz(
+                raw.as_ptr(),
+                raw.as_ptr().cast(),
+                std::mem::size_of_val(&raw),
+            ),
+            Some(vec![utf16_text("Tcpip"), utf16_text("Dns")])
+        );
+        assert_eq!(
+            service_config_multi_sz(std::ptr::null(), raw.as_ptr().cast(), 0),
+            Some(Vec::new())
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn service_configuration_strings_fail_closed_at_query_buffer_boundary() {
+        let unterminated = [u16::from(b'E'), u16::from(b'l')];
+        let start = unterminated.as_ptr().cast::<u8>();
+        let bytes = std::mem::size_of_val(&unterminated);
+        assert_eq!(
+            service_config_wide(unterminated.as_ptr(), start, bytes),
+            None
+        );
+        assert_eq!(
+            service_config_multi_sz(unterminated.as_ptr(), start, bytes),
+            None
+        );
+
+        let single_terminated = [u16::from(b'E'), 0];
+        assert_eq!(
+            service_config_multi_sz(
+                single_terminated.as_ptr(),
+                single_terminated.as_ptr().cast(),
+                std::mem::size_of_val(&single_terminated),
+            ),
+            None
+        );
+
+        let empty_multi_sz = [0_u16, 0];
+        assert_eq!(
+            service_config_multi_sz(
+                empty_multi_sz.as_ptr(),
+                empty_multi_sz.as_ptr().cast(),
+                std::mem::size_of_val(&empty_multi_sz),
+            ),
+            Some(Vec::new())
+        );
+
+        let outside = unsafe { unterminated.as_ptr().add(unterminated.len()) };
+        assert_eq!(service_config_wide(outside, start, bytes), None);
     }
 
     #[test]
@@ -9370,6 +10532,10 @@ mod tests {
         assert!(service_readback_is_acceptable(
             &ServiceRegistrationInspection::Matching { observation }
         ));
+        assert_eq!(
+            registration_outcome_from_inspection(ServiceRegistrationInspection::Mismatched),
+            ServiceRegistrationOutcome::ExistingRequiresReconciliation
+        );
     }
 
     #[test]
@@ -9382,6 +10548,23 @@ mod tests {
         assert_eq!(
             reconcile_service_effect(PortOutcome::Unknown(UnknownReason::NotObserved)),
             PortOutcome::Unknown(UnknownReason::Indeterminate)
+        );
+    }
+
+    #[test]
+    fn partial_service_status_never_maps_to_matching() {
+        let observation = ServiceObservation {
+            service: handle(ELIOT_HOST_SERVICE_NAME),
+            state: ServiceState::Running,
+            generation: None,
+            process: None,
+        };
+        assert_eq!(
+            service_registration_inspection_from_status(PortOutcome::Partial {
+                value: observation,
+                missing: vec![handle("authority")],
+            }),
+            ServiceRegistrationInspection::Unknown
         );
     }
 
