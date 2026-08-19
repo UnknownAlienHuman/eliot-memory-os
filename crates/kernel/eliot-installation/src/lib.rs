@@ -9439,6 +9439,70 @@ mod tests {
     }
 
     #[test]
+    fn upgrade_failure_preserves_prior_active_and_rejects_binding_substitution() {
+        let first = registering_transaction();
+        let mut registry = ApprovedGenerationRegistry::new();
+        must(registry.stage_pending_activation(
+            first.transaction_id.clone(),
+            first.installer_plan_digest.clone(),
+            first.candidate_manifest.clone(),
+            test_handle("approval:first"),
+        ));
+        must(registry.commit_pending_activation(
+            &first.transaction_id,
+            &first.installer_plan_digest,
+            &first.candidate_manifest.generation,
+        ));
+
+        let mut upgrade = first.candidate_manifest.clone();
+        upgrade.generation = test_handle("generation:upgrade");
+        upgrade.runtime_launch.generation = upgrade.generation.clone();
+        upgrade.runtime_launch.descriptor_digest =
+            test_handle(sha256_hex(&must(upgrade.runtime_launch.unsigned_bytes())));
+        must(upgrade.validate());
+        let upgrade_tx = test_handle("transaction:upgrade");
+        let upgrade_plan = test_handle("a".repeat(64));
+        must(registry.stage_pending_activation(
+            upgrade_tx.clone(),
+            upgrade_plan.clone(),
+            upgrade.clone(),
+            test_handle("approval:upgrade"),
+        ));
+        assert_eq!(
+            registry.active_generation(),
+            Some(&first.candidate_manifest.generation)
+        );
+        assert_eq!(
+            registry
+                .pending_activation()
+                .and_then(|pending| pending.prior_active_generation.as_ref()),
+            Some(&first.candidate_manifest.generation)
+        );
+        let original_pending = registry
+            .pending_activation()
+            .cloned()
+            .unwrap_or_else(|| unreachable!());
+        let wrong_root = {
+            let mut pending = original_pending.clone();
+            pending.runtime_state_roots_digest = test_handle("b".repeat(64));
+            pending
+        };
+        registry.pending_activation = Some(wrong_root);
+        assert!(registry.validate().is_err());
+        registry.pending_activation = Some(original_pending);
+        must(registry.mark_pending_recovery(
+            &upgrade_tx,
+            &upgrade_plan,
+            "journal-active-before-commit",
+        ));
+        assert_eq!(
+            registry.active_generation(),
+            Some(&first.candidate_manifest.generation)
+        );
+        assert_eq!(registry.last_known_good_generation(), None);
+    }
+
+    #[test]
     fn first_install_pending_abort_leaves_registry_empty() {
         let transaction = registering_transaction();
         let mut registry = ApprovedGenerationRegistry::new();
