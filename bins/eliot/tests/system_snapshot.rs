@@ -7,6 +7,13 @@ use std::{
     process::Command,
 };
 
+use eliot_installation::{
+    AuthorityEpoch, CandidateManifest, InstallationEpoch, InstallationProfile,
+    InstallationTransaction, InstallerAclPrincipal, InstallerEffectPlan, ManagedEnvironmentAction,
+    ManagedEnvironmentChangeRequest, PlannedChange, RedbInstallationTransactionStore,
+    ResourceGeneration, RuntimeLaunchDescriptor, RuntimeStateRoots, StateFence, UserOwnedRootLease,
+    parse_installation_transaction_id,
+};
 use serde_json::Value;
 
 fn repository_root() -> PathBuf {
@@ -118,6 +125,496 @@ fn installation_status_requires_existing_explicit_registry() {
     assert!(!registry.exists(), "status created a missing registry");
     let output: Value = serde_json::from_slice(&result.stdout).expect("status JSON error");
     assert_eq!(output["code"], "INSTALLATION_STATUS_UNAVAILABLE");
+    let _ = fs::remove_dir_all(temp_root);
+}
+
+#[test]
+fn installation_create_rejects_migration_before_creating_store() {
+    let temp_root =
+        std::env::temp_dir().join(format!("eliot-installation-create-{}", std::process::id()));
+    fs::create_dir_all(&temp_root).expect("create create fixture");
+    let input = temp_root.join("plan.json");
+    let store = temp_root.join("transactions.redb");
+    fs::write(
+        &input,
+        r#"{"transaction_wire_version":{"major":5,"minor":0,"patch":0}}"#,
+    )
+    .expect("write migration fixture");
+
+    let result = Command::new(env!("CARGO_BIN_EXE_eliot"))
+        .current_dir(&temp_root)
+        .args([
+            "installation",
+            "create",
+            "--input",
+            input.to_str().expect("input is utf8"),
+            "--store",
+            store.to_str().expect("store is utf8"),
+        ])
+        .output()
+        .expect("run create command");
+
+    assert!(!result.status.success());
+    let output: Value = serde_json::from_slice(&result.stdout).expect("create JSON error");
+    assert_eq!(output["code"], "INSTALLATION_CREATE_MIGRATION_REQUIRED");
+    assert!(!store.exists(), "rejected input created a durable store");
+    let _ = fs::remove_dir_all(temp_root);
+}
+
+fn fixture_handle(value: impl Into<String>) -> eliot_installation::PlatformHandle {
+    parse_installation_transaction_id(value).expect("valid fixture handle")
+}
+
+fn fixture_path(root: &Path, name: &str) -> eliot_installation::PlatformHandle {
+    fixture_handle(root.join(name).to_string_lossy().into_owned())
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "the positive CLI fixture spells out the constructor's complete durable contract"
+)]
+fn portable_cli_transaction(root: &Path) -> InstallationTransaction {
+    let portable_root = fixture_handle(root.to_string_lossy().into_owned());
+    let runtime_state_roots =
+        RuntimeStateRoots::derive_portable(portable_root.clone()).expect("portable roots");
+    let installation_epoch = InstallationEpoch {
+        installation: fixture_handle("installation:cli-positive"),
+        lineage_id: fixture_handle("lineage:cli-positive"),
+        sequence: 1,
+    };
+    let generation = fixture_handle("generation:cli-positive");
+    let mut runtime_launch = RuntimeLaunchDescriptor {
+        profile: InstallationProfile::PortableDev,
+        portable_root: Some(portable_root.clone()),
+        installation_epoch: installation_epoch.clone(),
+        generation: generation.clone(),
+        authority_generation: ResourceGeneration::genesis(),
+        authority_state_fence: StateFence::new(
+            AuthorityEpoch::genesis(),
+            ResourceGeneration::genesis(),
+        ),
+        authority_descriptor_path: fixture_path(root, "authority.json"),
+        authority_descriptor_digest: fixture_handle("7".repeat(64)),
+        runtime_state_roots: runtime_state_roots.clone(),
+        kernel_work_root: runtime_state_roots.kernel_work_root.clone(),
+        kernel_artifact_digest: fixture_handle("0".repeat(64)),
+        eliotd_executable_path: fixture_path(root, "eliotd.exe"),
+        eliotd_artifact_digest: fixture_handle("8".repeat(64)),
+        eliotd_config_path: fixture_path(root, "eliotd-governor.json"),
+        eliotd_config_digest: fixture_handle("4".repeat(64)),
+        eliotd_descriptor_path: fixture_path(root, "eliotd.json"),
+        eliotd_descriptor_digest: fixture_handle("9".repeat(64)),
+        eliotd_launch_nonce: fixture_handle(format!("eliotd:{}", "a".repeat(32))),
+        store_config_path: fixture_path(root, "generation.json"),
+        store_credential_target: fixture_handle("eliot/store/v1/0123456789abcdef0123456789abcdef"),
+        store_bridge_executable_path: fixture_path(root, "eliot-store-surreal.exe"),
+        store_bridge_artifact_digest: fixture_handle("1".repeat(64)),
+        store_bootstrap_descriptor_path: fixture_path(root, "store-bootstrap.json"),
+        store_bootstrap_descriptor_digest: fixture_handle("6".repeat(64)),
+        canonical_store_executable_path: fixture_path(root, "surreal.exe"),
+        canonical_store_artifact_digest: fixture_handle("5".repeat(64)),
+        kernel_arguments: vec![
+            fixture_handle("--work-root"),
+            runtime_state_roots.kernel_work_root.clone(),
+            fixture_handle("--store-bootstrap"),
+            fixture_path(root, "store-bootstrap.json"),
+            fixture_handle("--store-bootstrap-sha256"),
+            fixture_handle("6".repeat(64)),
+            fixture_handle("--authority-descriptor"),
+            fixture_path(root, "authority.json"),
+            fixture_handle("--authority-descriptor-sha256"),
+            fixture_handle("7".repeat(64)),
+            fixture_handle("--kernel-artifact-sha256"),
+            fixture_handle("0".repeat(64)),
+            fixture_handle("--eliotd-descriptor"),
+            fixture_path(root, "eliotd.json"),
+            fixture_handle("--eliotd-descriptor-sha256"),
+            fixture_handle("9".repeat(64)),
+        ],
+        store_bridge_arguments: vec![
+            fixture_handle("--portable-dev-root"),
+            portable_root.clone(),
+            fixture_handle("--config"),
+            fixture_path(root, "generation.json"),
+        ],
+        canonical_store_arguments: vec![
+            fixture_handle("start"),
+            fixture_handle("--no-banner"),
+            fixture_handle("--bind"),
+            fixture_handle("127.0.0.1:8000"),
+            fixture_handle("--temporary-directory"),
+            runtime_state_roots.store_temp_root.clone(),
+            fixture_handle("--log-file-enabled"),
+            fixture_handle("--log-file-path"),
+            runtime_state_roots.store_work_root.clone(),
+            fixture_handle("--log-file-name"),
+            fixture_handle("surrealdb.log"),
+            fixture_handle(format!(
+                "surrealkv://{}",
+                runtime_state_roots
+                    .store_data_root
+                    .as_str()
+                    .replace('\\', "/")
+            )),
+        ],
+        host_executable_path: fixture_path(root, "eliot-host.exe"),
+        host_artifact_digest: fixture_handle("8".repeat(64)),
+        watchdog_executable_path: fixture_path(root, "eliot-watchdog.exe"),
+        watchdog_artifact_digest: fixture_handle("4".repeat(64)),
+        descriptor_digest: fixture_handle("0".repeat(64)),
+    };
+    runtime_launch = runtime_launch
+        .with_computed_digest()
+        .expect("sealed runtime launch");
+    let candidate_manifest = CandidateManifest {
+        generation: generation.clone(),
+        components: vec![
+            fixture_handle("component:kernel"),
+            fixture_handle("component:store"),
+        ],
+        kernel_artifact_digest: fixture_handle("0".repeat(64)),
+        store_bridge_artifact_digest: fixture_handle("1".repeat(64)),
+        canonical_store_artifact_digest: fixture_handle("5".repeat(64)),
+        host_artifact_digest: fixture_handle("8".repeat(64)),
+        kernel_executable_path: fixture_path(root, "eliot-kernel.exe"),
+        store_bridge_executable_path: fixture_path(root, "eliot-store-surreal.exe"),
+        canonical_store_executable_path: fixture_path(root, "surreal.exe"),
+        host_executable_path: fixture_path(root, "eliot-host.exe"),
+        config_path: fixture_path(root, "generation.json"),
+        dependency_closure_refs: vec![fixture_handle("evidence:dependency-closure")],
+        license_refs: vec![fixture_handle("evidence:licenses")],
+        config_digest: fixture_handle("2".repeat(64)),
+        store_credential_target: fixture_handle("eliot/store/v1/0123456789abcdef0123456789abcdef"),
+        supervision_key_fingerprint: fixture_handle("3".repeat(64)),
+        signature_ref: fixture_handle("evidence:signature"),
+        runtime_state_roots_digest: runtime_state_roots.roots_digest.clone(),
+        runtime_launch,
+    };
+    let rollback_plan = fixture_handle("rollback:cli-positive");
+    let request = ManagedEnvironmentChangeRequest {
+        request_id: fixture_handle("request:cli-positive"),
+        requester_and_reason: fixture_handle("requester:test"),
+        action: ManagedEnvironmentAction::Install,
+        target_family: fixture_handle("family:eliot"),
+        exact_candidate: generation,
+        expected_delta: fixture_handle("delta:installed"),
+        source_assurance_refs: vec![fixture_handle("evidence:source-assurance")],
+        affected_refs: Vec::new(),
+        impact_class: fixture_handle("impact:test"),
+        required_owner: fixture_handle("owner:installation"),
+        rollback_plan: rollback_plan.clone(),
+        verifier: fixture_handle("verifier:installation"),
+        budget: fixture_handle("budget:test"),
+        stop_condition: fixture_handle("stop:on-failure"),
+    };
+    let roots = [
+        runtime_state_roots.installation_root.clone(),
+        runtime_state_roots.host_state_root.clone(),
+        runtime_state_roots.kernel_ors_root.clone(),
+        runtime_state_roots.kernel_work_root.clone(),
+        runtime_state_roots.store_data_root.clone(),
+        runtime_state_roots.store_work_root.clone(),
+        runtime_state_roots.store_temp_root.clone(),
+        runtime_state_roots.watchdog_state_root.clone(),
+    ];
+    let mut planned_changes = Vec::new();
+    let mut installer_effects = Vec::new();
+    for (index, root) in roots.iter().enumerate() {
+        let effect_id = fixture_handle(format!("effect:create-root-{index}"));
+        planned_changes.push(PlannedChange {
+            change_id: effect_id.clone(),
+            target: root.clone(),
+            precondition_refs: vec![fixture_handle(format!("evidence:precondition-{index}"))],
+            postcondition_refs: vec![fixture_handle(format!("evidence:postcondition-{index}"))],
+        });
+        installer_effects.push(InstallerEffectPlan::CreateRoot {
+            effect_id,
+            root: root.clone(),
+        });
+    }
+    for (index, root) in roots.iter().enumerate() {
+        let effect_id = fixture_handle(format!("effect:apply-acl-{index}"));
+        planned_changes.push(PlannedChange {
+            change_id: effect_id.clone(),
+            target: root.clone(),
+            precondition_refs: vec![fixture_handle(format!("evidence:acl-precondition-{index}"))],
+            postcondition_refs: vec![fixture_handle(format!(
+                "evidence:acl-postcondition-{index}"
+            ))],
+        });
+        installer_effects.push(InstallerEffectPlan::ApplyAcl {
+            effect_id,
+            root: root.clone(),
+            principals: vec![
+                InstallerAclPrincipal::CurrentUser,
+                InstallerAclPrincipal::LocalSystem,
+            ],
+        });
+    }
+    InstallationTransaction::new(
+        fixture_handle("transaction:cli-positive"),
+        installation_epoch,
+        InstallationProfile::PortableDev,
+        request,
+        None,
+        candidate_manifest,
+        fixture_path(root, "staging"),
+        planned_changes,
+        installer_effects,
+        1,
+        vec![fixture_handle("evidence:plan-precondition")],
+        rollback_plan,
+    )
+    .expect("constructor-produced PortableDev transaction")
+}
+
+#[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "the round-trip assertion keeps the production CLI boundary evidence together"
+)]
+fn installation_cli_create_status_apply_round_trip_uses_one_durable_coordinator() {
+    let temp_root = std::env::temp_dir().join(format!(
+        "eliot-installation-cli-round-trip-{}",
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&temp_root);
+    fs::create_dir_all(&temp_root).expect("create portable fixture root");
+    let portable_root = temp_root.join("portable");
+    fs::create_dir_all(&portable_root).expect("create nested portable fixture root");
+    drop(UserOwnedRootLease::open_existing(&portable_root).expect("protect portable fixture root"));
+    let transaction = portable_cli_transaction(&portable_root);
+    let input = temp_root.join("transaction.json");
+    let store = temp_root.join("transaction.redb");
+    fs::write(
+        &input,
+        serde_json::to_vec_pretty(&transaction).expect("serialize constructor transaction"),
+    )
+    .expect("write constructor transaction");
+
+    let plan = Command::new(env!("CARGO_BIN_EXE_eliot"))
+        .current_dir(&temp_root)
+        .args([
+            "installation",
+            "plan",
+            "--input",
+            input.to_str().expect("input is utf8"),
+        ])
+        .output()
+        .expect("run plan command");
+    assert!(
+        plan.status.success(),
+        "plan failed: {}",
+        String::from_utf8_lossy(&plan.stderr)
+    );
+    let planned: Value = serde_json::from_slice(&plan.stdout).expect("plan JSON");
+    assert_eq!(
+        planned["transaction_wire_version"],
+        serde_json::json!({"major": 7, "minor": 0, "patch": 0})
+    );
+
+    let create = Command::new(env!("CARGO_BIN_EXE_eliot"))
+        .current_dir(&temp_root)
+        .args([
+            "installation",
+            "create",
+            "--input",
+            input.to_str().expect("input is utf8"),
+            "--store",
+            store.to_str().expect("store is utf8"),
+        ])
+        .output()
+        .expect("run create command");
+    assert!(
+        create.status.success(),
+        "create failed: {}",
+        String::from_utf8_lossy(&create.stderr)
+    );
+    let created: Value = serde_json::from_slice(&create.stdout).expect("create JSON");
+    assert_eq!(created["status"], "CREATED");
+    assert_eq!(created["contract_version"], "3.0.0");
+    assert_eq!(
+        created["transaction_wire_version"],
+        serde_json::json!({"major": 7, "minor": 0, "patch": 0})
+    );
+    assert_eq!(created["transaction_id"], "transaction:cli-positive");
+    assert_eq!(created["revision"], 1);
+
+    let status = Command::new(env!("CARGO_BIN_EXE_eliot"))
+        .current_dir(&temp_root)
+        .args([
+            "installation",
+            "status",
+            "--store",
+            store.to_str().expect("store is utf8"),
+            "--transaction-id",
+            "transaction:cli-positive",
+        ])
+        .output()
+        .expect("run transaction status command");
+    assert!(
+        status.status.success(),
+        "status failed: {}",
+        String::from_utf8_lossy(&status.stderr)
+    );
+    let status_value: Value = serde_json::from_slice(&status.stdout).expect("status JSON");
+    assert_eq!(status_value["status"], "TRANSACTION_STATUS");
+    assert_eq!(status_value["transaction_id"], "transaction:cli-positive");
+    assert_eq!(status_value["revision"], 1);
+    assert_eq!(status_value["stage"], "PLANNED");
+    assert_eq!(
+        status_value["transaction"]["transaction_wire_version"],
+        serde_json::json!({"major": 7, "minor": 0, "patch": 0})
+    );
+
+    let apply = Command::new(env!("CARGO_BIN_EXE_eliot"))
+        .current_dir(&temp_root)
+        .args([
+            "installation",
+            "apply",
+            "--store",
+            store.to_str().expect("store is utf8"),
+            "--transaction-id",
+            "transaction:cli-positive",
+        ])
+        .output()
+        .expect("run apply command");
+    assert!(
+        apply.status.success(),
+        "apply failed: {}",
+        String::from_utf8_lossy(&apply.stderr)
+    );
+    let applied: Value = serde_json::from_slice(&apply.stdout).expect("apply JSON");
+    assert_eq!(applied["status"], "EFFECT_APPLIED");
+    assert_eq!(applied["revision"], 2);
+    assert_eq!(applied["stage"], "PLANNED");
+    assert_eq!(applied["completed"], false);
+    assert_eq!(
+        applied["transaction"]["effect_progress"][0]["state"]["state"],
+        "APPLIED"
+    );
+    assert_eq!(
+        applied["transaction"]["effect_progress"][0]["state"]["disposition"],
+        "PREEXISTING_MATCHING"
+    );
+    assert_eq!(
+        applied["transaction"]["transaction_wire_version"],
+        serde_json::json!({"major": 7, "minor": 0, "patch": 0})
+    );
+
+    let status_after_apply = Command::new(env!("CARGO_BIN_EXE_eliot"))
+        .current_dir(&temp_root)
+        .args([
+            "installation",
+            "status",
+            "--store",
+            store.to_str().expect("store is utf8"),
+            "--transaction-id",
+            "transaction:cli-positive",
+        ])
+        .output()
+        .expect("run status-after-apply command");
+    assert!(
+        status_after_apply.status.success(),
+        "status-after-apply failed: {}",
+        String::from_utf8_lossy(&status_after_apply.stderr)
+    );
+    let status_after_apply_value: Value =
+        serde_json::from_slice(&status_after_apply.stdout).expect("status-after-apply JSON");
+    assert_eq!(
+        status_after_apply_value["transaction_id"],
+        "transaction:cli-positive"
+    );
+    assert_eq!(status_after_apply_value["revision"], 2);
+    assert_eq!(status_after_apply_value["stage"], "PLANNED");
+
+    let _ = fs::remove_dir_all(temp_root);
+}
+
+#[test]
+fn installation_apply_opens_only_existing_transaction_store() {
+    let temp_root =
+        std::env::temp_dir().join(format!("eliot-installation-apply-{}", std::process::id()));
+    fs::create_dir_all(&temp_root).expect("create apply fixture");
+    let store = temp_root.join("missing.redb");
+    let result = Command::new(env!("CARGO_BIN_EXE_eliot"))
+        .current_dir(&temp_root)
+        .args([
+            "installation",
+            "apply",
+            "--store",
+            store.to_str().expect("store is utf8"),
+            "--transaction-id",
+            "transaction-fixture",
+        ])
+        .output()
+        .expect("run apply command");
+
+    assert!(!result.status.success());
+    let output: Value = serde_json::from_slice(&result.stdout).expect("apply JSON error");
+    assert_eq!(output["code"], "INSTALLATION_APPLY_UNAVAILABLE");
+    assert!(!store.exists(), "apply created a missing transaction store");
+    let _ = fs::remove_dir_all(temp_root);
+}
+
+#[test]
+fn installation_transaction_status_reads_existing_store_without_inventing_transaction() {
+    let temp_root = std::env::temp_dir().join(format!(
+        "eliot-installation-transaction-status-{}",
+        std::process::id()
+    ));
+    fs::create_dir_all(&temp_root).expect("create transaction status fixture");
+    let store_path = temp_root.join("transactions.redb");
+    RedbInstallationTransactionStore::create_at_exact_path(&store_path)
+        .expect("create empty transaction store");
+
+    let result = Command::new(env!("CARGO_BIN_EXE_eliot"))
+        .current_dir(&temp_root)
+        .args([
+            "installation",
+            "status",
+            "--store",
+            store_path.to_str().expect("store is utf8"),
+            "--transaction-id",
+            "transaction-fixture",
+        ])
+        .output()
+        .expect("run transaction status command");
+
+    assert!(!result.status.success());
+    let output: Value = serde_json::from_slice(&result.stdout).expect("status JSON error");
+    assert_eq!(output["code"], "INSTALLATION_TRANSACTION_NOT_FOUND");
+    let _ = fs::remove_dir_all(temp_root);
+}
+
+#[test]
+fn installation_remove_canary_is_a_non_mutating_blocker() {
+    let temp_root = std::env::temp_dir().join(format!(
+        "eliot-installation-remove-canary-{}",
+        std::process::id()
+    ));
+    fs::create_dir_all(&temp_root).expect("create remove-canary fixture");
+    let store_path = temp_root.join("transactions.redb");
+    let result = Command::new(env!("CARGO_BIN_EXE_eliot"))
+        .current_dir(&temp_root)
+        .args([
+            "installation",
+            "remove-canary",
+            "--store",
+            store_path.to_str().expect("store is utf8"),
+            "--transaction-id",
+            "transaction-fixture",
+        ])
+        .output()
+        .expect("run remove-canary command");
+
+    assert!(!result.status.success());
+    let output: Value = serde_json::from_slice(&result.stdout).expect("remove-canary JSON error");
+    assert_eq!(output["code"], "INSTALLATION_REMOVE_CANARY_UNSUPPORTED");
+    assert!(
+        !store_path.exists(),
+        "remove-canary created a transaction store"
+    );
     let _ = fs::remove_dir_all(temp_root);
 }
 

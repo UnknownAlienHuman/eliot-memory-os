@@ -12,27 +12,30 @@
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
+pub use eliot_contracts::{AuthorityEpoch, ResourceGeneration, StateFence};
 use eliot_contracts::{
-    ContractIdentity, ContractVersion, ResourceGeneration, StateFence,
-    contract_identity as make_contract_identity, sha256_hex,
+    ContractIdentity, ContractVersion, contract_identity as make_contract_identity, sha256_hex,
 };
 use eliot_ipc::{NamedPipeTransport, TransportLimits};
+pub use eliot_platform::PlatformHandle;
 use eliot_platform::{
-    InstallationObservation, InstallationPort, InstallationRequest, PlatformHandle, PortError,
-    PortOutcome, ProviderError, ProviderErrorCode, UnknownReason,
+    InstallationObservation, InstallationPort, InstallationRequest, PortError, PortOutcome,
+    ProviderError, ProviderErrorCode, UnknownReason,
 };
+pub use eliot_platform_windows::UserOwnedRootLease;
 use eliot_platform_windows::{
     ELIOT_HOST_SERVICE_NAME, ELIOT_WATCHDOG_SERVICE_NAME, HostOwnerEpochCapability,
     InstallerRootAbsentSnapshot, InstallerRootCreateDisposition, InstallerRootError,
     InstallerRootObjectSnapshot, InstallerRootPrimitiveObservation, InstallerRootPrimitiveSpec,
     InstallerRootProfile, InstallerSecretCreateDisposition, InstallerSecretObservation,
-    ProtectedPathError, ProtectedPathLease, ProtectedRootLease, ServiceAccount,
-    ServiceBootstrapArguments, ServiceRegistrationCurrent, ServiceRegistrationInspection,
-    ServiceRegistrationOutcome, ServiceRegistrationRequest, ServiceStartMode, UserOwnedPathLease,
-    UserOwnedRootReadLease, WindowsInstallerRootPrimitive, WindowsInstallerSecretProvider,
-    WindowsPlatform, WindowsStoreCredentialTargetGenerator, current_user_local_app_data_root,
-    fresh_service_registration_nonce, observe_running_eliot_host_process,
-    protected_program_data_root, require_protected_program_data_path,
+    ProtectedPathError, ProtectedPathLease, ProtectedRootLease, ProtectedRuntimePathLease,
+    ServiceAccount, ServiceBootstrapArguments, ServiceRegistrationCurrent,
+    ServiceRegistrationInspection, ServiceRegistrationOutcome, ServiceRegistrationRequest,
+    ServiceStartMode, UserOwnedPathLease, UserOwnedRootReadLease, WindowsInstallerRootPrimitive,
+    WindowsInstallerSecretProvider, WindowsPlatform, WindowsStoreCredentialTargetGenerator,
+    current_user_local_app_data_root, fresh_service_registration_nonce,
+    observe_running_eliot_host_process, protected_program_data_root,
+    require_protected_program_data_path,
 };
 use redb::{Database, ReadOnlyDatabase, ReadableDatabase, TableDefinition};
 use schemars::JsonSchema;
@@ -2600,6 +2603,7 @@ pub enum PendingActivationState {
 const REGISTRY_TABLE: TableDefinition<&str, &[u8]> =
     TableDefinition::new("eliot_approved_generations_v1");
 const REGISTRY_RELATIVE_PATH: &str = "Eliot/host/installation-registry.redb";
+const INSTALLATION_REGISTRY_FILE_NAME: &str = "installation-registry.redb";
 
 #[allow(
     dead_code,
@@ -3153,7 +3157,17 @@ fn decode_registry_bytes(bytes: &[u8]) -> Result<ApprovedGenerationRegistry, Ins
 /// Durable redb owner for approved generations and LKG activation state.
 pub struct RedbInstallationRegistry {
     database: Database,
-    _path_lease: ProtectedPathLease,
+    _path_lease: RegistryPathLease,
+}
+
+enum RegistryPathLease {
+    Legacy {
+        _lease: ProtectedPathLease,
+    },
+    InstallationHost {
+        _root: ProtectedRootLease,
+        _file: ProtectedRuntimePathLease,
+    },
 }
 
 impl RedbInstallationRegistry {
@@ -3176,8 +3190,89 @@ impl RedbInstallationRegistry {
             .map_err(|error| InstallationError::Platform(error.to_string()))?;
         Ok(Self {
             database,
-            _path_lease: path_lease,
+            _path_lease: RegistryPathLease::Legacy { _lease: path_lease },
         })
+    }
+
+    /// Opens or creates the registry below one retained per-installation
+    /// Host root.
+    ///
+    /// The caller transfers ownership of the retained root lease to this
+    /// database owner. The registry file is a fixed direct child of that
+    /// canonical root; no arbitrary path, legacy system-data location, or
+    /// ACL-rewriting lease is accepted. The runtime-file lease proves the
+    /// installer-provisioned BA+LS+SY ACL and retains the no-follow contour
+    /// for redb's path-based reopen.
+    #[allow(
+        clippy::needless_pass_by_value,
+        reason = "the registry owner must retain the caller-provided Host root lease"
+    )]
+    pub fn open_at(host_root: ProtectedRootLease) -> Result<Self, InstallationError> {
+        let path = installation_registry_path(&host_root)?;
+        let file = ProtectedRuntimePathLease::open_or_create_absolute(&path)
+            .map_err(|error| InstallationError::Platform(error.to_string()))?;
+        if file.path() != path {
+            return Err(InstallationError::Platform(
+                "installation registry path is not the retained canonical Host child".to_owned(),
+            ));
+        }
+        let database = Database::create(file.path())
+            .map_err(|error| InstallationError::Platform(error.to_string()))?;
+        file.verify_path_identity()
+            .map_err(|error| InstallationError::Platform(error.to_string()))?;
+        Ok(Self {
+            database,
+            _path_lease: RegistryPathLease::InstallationHost {
+                _root: host_root,
+                _file: file,
+            },
+        })
+    }
+
+    /// Opens an existing registry below one retained per-installation Host
+    /// root without creating a file or database.
+    ///
+    /// The returned owner retains both the caller-provided Host root and the
+    /// installer-provisioned runtime-file lease while callers validate and
+    /// load its durable projection. None means only that the fixed registry
+    /// child is absent.
+    #[allow(
+        clippy::needless_pass_by_value,
+        reason = "the registry owner must retain the caller-provided Host root lease"
+    )]
+    pub fn open_existing_at(
+        host_root: ProtectedRootLease,
+    ) -> Result<Option<Self>, InstallationError> {
+        let path = installation_registry_path(&host_root)?;
+        match std::fs::symlink_metadata(&path) {
+            Ok(metadata) if metadata.is_file() => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Ok(_) | Err(_) => {
+                return Err(InstallationError::Platform(
+                    "installation registry path is not an existing regular file".to_owned(),
+                ));
+            }
+        }
+        let file = ProtectedRuntimePathLease::open_existing_absolute(&path)
+            .map_err(|error| InstallationError::Platform(error.to_string()))?;
+        if file.path() != path {
+            return Err(InstallationError::Platform(
+                "installation registry path is not the retained canonical Host child".to_owned(),
+            ));
+        }
+        file.verify_path_identity()
+            .map_err(|error| InstallationError::Platform(error.to_string()))?;
+        let database = Database::open(file.path())
+            .map_err(|error| InstallationError::Platform(error.to_string()))?;
+        file.verify_path_identity()
+            .map_err(|error| InstallationError::Platform(error.to_string()))?;
+        Ok(Some(Self {
+            database,
+            _path_lease: RegistryPathLease::InstallationHost {
+                _root: host_root,
+                _file: file,
+            },
+        }))
     }
 
     /// Inspects an existing registry without creating a file, database or
@@ -3234,6 +3329,45 @@ impl RedbInstallationRegistry {
         Ok(Some(registry))
     }
 
+    /// Inspects an existing registry below one retained per-installation
+    /// Host root without creating a file, database, table, or ACL.
+    ///
+    /// The retained root is consumed for the duration of this read so the
+    /// caller cannot drop the containment proof while redb is open. None
+    /// means only that the fixed registry child is absent.
+    #[allow(
+        clippy::needless_pass_by_value,
+        reason = "the inspection must retain the caller-provided Host root lease during the read"
+    )]
+    pub fn inspect_existing_at(
+        host_root: ProtectedRootLease,
+    ) -> Result<Option<ApprovedGenerationRegistry>, InstallationError> {
+        let path = installation_registry_path(&host_root)?;
+        match std::fs::symlink_metadata(&path) {
+            Ok(metadata) if metadata.is_file() => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Ok(_) | Err(_) => {
+                return Err(InstallationError::Platform(
+                    "installation registry path is not an existing regular file".to_owned(),
+                ));
+            }
+        }
+        let file = ProtectedRuntimePathLease::open_existing_absolute(&path)
+            .map_err(|error| InstallationError::Platform(error.to_string()))?;
+        if file.path() != path {
+            return Err(InstallationError::Platform(
+                "installation registry path is not the retained canonical Host child".to_owned(),
+            ));
+        }
+        file.verify_path_identity()
+            .map_err(|error| InstallationError::Platform(error.to_string()))?;
+        let database = ReadOnlyDatabase::open(file.path())
+            .map_err(|error| InstallationError::Platform(error.to_string()))?;
+        file.verify_path_identity()
+            .map_err(|error| InstallationError::Platform(error.to_string()))?;
+        read_existing_registry(&database).map(Some)
+    }
+
     /// Loads the registry, returning an empty value on first use.
     pub fn load(&self) -> Result<ApprovedGenerationRegistry, InstallationError> {
         let read = self
@@ -3282,6 +3416,65 @@ impl RedbInstallationRegistry {
             .commit()
             .map_err(|error| InstallationError::Platform(error.to_string()))
     }
+}
+
+fn installation_registry_path(
+    host_root: &ProtectedRootLease,
+) -> Result<PathBuf, InstallationError> {
+    host_root
+        .verify_stable_identity()
+        .map_err(|error| InstallationError::Platform(error.to_string()))?;
+    let canonical_root = host_root
+        .canonical_path()
+        .map_err(|error| InstallationError::Platform(error.to_string()))?;
+    validate_installation_host_root(&canonical_root)?;
+    Ok(canonical_root.join(INSTALLATION_REGISTRY_FILE_NAME))
+}
+
+fn validate_installation_host_root(path: &Path) -> Result<(), InstallationError> {
+    let identity = WindowsPathIdentity::parse_root(
+        &path.to_string_lossy(),
+        "installation_registry.host_root",
+    )?;
+    let Some(key) = identity
+        .components
+        .get(identity.components.len().saturating_sub(2))
+    else {
+        return Err(InstallationError::InvalidField {
+            field: "installation_registry.host_root".to_owned(),
+            reason: "retained root must be an installation Host root".to_owned(),
+        });
+    };
+    if !valid_installation_key(key) || !identity.ends_with(&["eliot", "installations", key, "host"])
+    {
+        return Err(InstallationError::InvalidField {
+            field: "installation_registry.host_root".to_owned(),
+            reason: "retained root must end in Eliot/installations/<sha256-key>/host".to_owned(),
+        });
+    }
+    Ok(())
+}
+
+fn read_existing_registry(
+    database: &ReadOnlyDatabase,
+) -> Result<ApprovedGenerationRegistry, InstallationError> {
+    let read = database
+        .begin_read()
+        .map_err(|error| InstallationError::Platform(error.to_string()))?;
+    let table = match read.open_table(REGISTRY_TABLE) {
+        Ok(table) => table,
+        Err(redb::TableError::TableDoesNotExist(_)) => return Ok(ApprovedGenerationRegistry::new()),
+        Err(error) => return Err(InstallationError::Platform(error.to_string())),
+    };
+    let Some(value) = table
+        .get("registry")
+        .map_err(|error| InstallationError::Platform(error.to_string()))?
+    else {
+        return Ok(ApprovedGenerationRegistry::new());
+    };
+    let registry = decode_registry_bytes(value.value())?;
+    registry.validate()?;
+    Ok(registry)
 }
 
 impl ApprovedGenerationRegistry {
@@ -5314,6 +5507,21 @@ pub fn decode_installation_transaction_json(
         })?;
     transaction.validate()?;
     Ok(transaction)
+}
+
+/// Parses the stable identity used to address one durable installation transaction.
+///
+/// This narrow adapter keeps CLI callers on the installation contract without
+/// importing the platform crate or constructing a second transaction identity
+/// path. It performs only the same text validation used by the transaction
+/// constructor; the durable store remains the authority for existence and CAS.
+pub fn parse_installation_transaction_id(
+    value: impl Into<String>,
+) -> Result<PlatformHandle, InstallationError> {
+    PlatformHandle::new(value.into()).map_err(|error| InstallationError::InvalidField {
+        field: "transaction_id".to_owned(),
+        reason: error.to_string(),
+    })
 }
 
 fn platform_error(error: &PortError) -> InstallationError {
@@ -10476,6 +10684,84 @@ mod tests {
     }
 
     #[test]
+    fn create_planned_at_exact_path_rejects_advanced_state_before_file_creation() {
+        let path = std::env::temp_dir().join(format!(
+            "eliot-installation-create-planned-{}.redb",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let mut transaction = planned_transaction();
+        transaction.stage = InstallationStage::Staging;
+        transaction.completed_stage_refs = vec![test_handle("evidence:advanced")];
+        transaction.revision = 2;
+
+        assert!(
+            RedbInstallationTransactionStore::create_planned_at_exact_path(&path, &transaction,)
+                .is_err()
+        );
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn create_planned_at_exact_path_publishes_populated_store_without_overwrite() {
+        let path = std::env::temp_dir().join(format!(
+            "eliot-installation-create-planned-publish-{}.redb",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let transaction = planned_transaction();
+        let store = must(
+            RedbInstallationTransactionStore::create_planned_at_exact_path(&path, &transaction),
+        );
+        assert_eq!(
+            must(store.load(&transaction.transaction_id))
+                .unwrap_or_else(|| unreachable!())
+                .revision(),
+            transaction.revision()
+        );
+        drop(store);
+        let file_name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or_else(|| unreachable!());
+        let temporary_prefix = format!(".{file_name}.eliot-transaction-");
+        let temporary_files = std::fs::read_dir(path.parent().unwrap_or_else(|| unreachable!()))
+            .into_iter()
+            .flatten()
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_str()
+                    .is_some_and(|name| name.starts_with(&temporary_prefix))
+            })
+            .collect::<Vec<_>>();
+        assert!(temporary_files.is_empty(), "temporary publication leaked");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn create_planned_at_exact_path_never_overwrites_publish_conflict() {
+        let path = std::env::temp_dir().join(format!(
+            "eliot-installation-create-planned-conflict-{}.redb",
+            std::process::id()
+        ));
+        let original = b"caller-owned-not-a-transaction-store";
+        let _ = std::fs::remove_file(&path);
+        std::fs::write(&path, original).unwrap_or_else(|error| panic!("write conflict: {error}"));
+        let transaction = planned_transaction();
+        assert!(
+            RedbInstallationTransactionStore::create_planned_at_exact_path(&path, &transaction)
+                .is_err()
+        );
+        assert_eq!(
+            std::fs::read(&path).unwrap_or_else(|error| panic!("read conflict: {error}")),
+            original
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
     fn pre_v7_transaction_json_requires_explicit_migration() {
         let mut legacy = must(serde_json::to_value(planned_transaction()));
         let object = legacy.as_object_mut().unwrap_or_else(|| unreachable!());
@@ -11749,6 +12035,31 @@ mod tests {
             None
         );
         assert!(!path.exists(), "read-only inspection created a registry");
+    }
+
+    #[test]
+    fn installation_registry_host_root_shape_is_exact_and_non_reparse_lexical() {
+        let key = "a".repeat(64);
+        let accepted = PathBuf::from(format!(r"C:\ProgramData\Eliot\installations\{key}\host"));
+        assert!(validate_installation_host_root(&accepted).is_ok());
+
+        for rejected in [
+            PathBuf::from(r"C:\ProgramData\Eliot\host"),
+            PathBuf::from(r"C:\ProgramData\Eliot\installations\not-a-key\host"),
+            PathBuf::from(format!(r"C:\ProgramData\Eliot\installations\{key}\wrong")),
+            PathBuf::from(format!(
+                r"C:\ProgramData\Eliot\installations\{key}\host\..\host"
+            )),
+            PathBuf::from(format!(
+                r"\\?\C:\ProgramData\Eliot\installations\{key}\host"
+            )),
+        ] {
+            assert!(
+                validate_installation_host_root(&rejected).is_err(),
+                "accepted wrong/reparse-shaped host root {}",
+                rejected.display()
+            );
+        }
     }
 
     #[test]

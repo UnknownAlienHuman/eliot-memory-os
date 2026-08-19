@@ -7,7 +7,10 @@ use clap::{Parser, Subcommand};
 use eliot_bootstrap::capture::{capture_snapshot, write_snapshot_artifact};
 use eliot_cli::{CommandCatalogue, CommandPort, CommandPortError, CommandRequest};
 use eliot_installation::{
-    InstallationError, RedbInstallationRegistry, decode_installation_transaction_json,
+    InstallationError, InstallationStepOutcome, InstallationTransaction,
+    InstallationTransactionStore, RedbInstallationRegistry, RedbInstallationTransactionStore,
+    WindowsInstallationCoordinator, decode_installation_transaction_json,
+    parse_installation_transaction_id,
 };
 use serde_json::json;
 use std::path::PathBuf;
@@ -18,6 +21,7 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 const INVALID_REQUEST_EXIT: i32 = 2;
 const FRONT_DOOR_CLOSED_EXIT: i32 = 69;
 const INSTALLATION_INPUT_LIMIT: u64 = 16 * 1024 * 1024;
+const INSTALLATION_CONTRACT_VERSION: &str = "3.0.0";
 
 #[derive(Debug, Parser)]
 #[command(name = "eliot", about = "ELIOT Memory OS command-line client")]
@@ -57,11 +61,55 @@ enum InstallationCommand {
         #[arg(long, value_parser = absolute_path)]
         input: PathBuf,
     },
-    /// Read the existing approved-generation registry without changing it.
-    Status {
-        /// Absolute path to an existing installation registry redb file.
+    /// Persist one validated constructor-produced transaction in an exact redb file.
+    Create {
+        /// Absolute path to an existing serialized `InstallationTransaction`.
         #[arg(long, value_parser = absolute_path)]
-        registry: PathBuf,
+        input: PathBuf,
+        /// Absolute path to a new transaction redb file.
+        #[arg(long, value_parser = absolute_path)]
+        store: PathBuf,
+    },
+    /// Drive exactly one durable effect through the production coordinator.
+    #[command(alias = "resume")]
+    Apply {
+        /// Absolute path to an existing transaction redb file.
+        #[arg(long, value_parser = absolute_path)]
+        store: PathBuf,
+        /// Stable transaction identity retained in the durable store.
+        #[arg(long)]
+        transaction_id: String,
+    },
+    /// Reconcile and roll back a transaction already marked `ROLLBACK_REQUIRED`.
+    Recover {
+        /// Absolute path to an existing transaction redb file.
+        #[arg(long, value_parser = absolute_path)]
+        store: PathBuf,
+        /// Stable transaction identity retained in the durable store.
+        #[arg(long)]
+        transaction_id: String,
+    },
+    /// Read the existing approved-generation registry without changing it.
+    #[command(alias = "open")]
+    Status {
+        /// Absolute path to an existing approved-generation registry redb file.
+        #[arg(long, value_parser = absolute_path)]
+        registry: Option<PathBuf>,
+        /// Absolute path to an existing durable transaction redb file.
+        #[arg(long, value_parser = absolute_path)]
+        store: Option<PathBuf>,
+        /// Stable transaction identity retained in the durable store.
+        #[arg(long)]
+        transaction_id: Option<String>,
+    },
+    /// Report the unsupported canary-removal seam without mutating the machine.
+    RemoveCanary {
+        /// Optional transaction store, accepted only to make the refusal scope explicit.
+        #[arg(long, value_parser = absolute_path)]
+        store: Option<PathBuf>,
+        /// Optional transaction identity, accepted only to make the refusal scope explicit.
+        #[arg(long)]
+        transaction_id: Option<String>,
     },
 }
 
@@ -142,34 +190,320 @@ fn run_installation(command: InstallationCommand) -> Result<i32> {
             println!("{}", serde_json::to_string_pretty(&transaction)?);
             Ok(0)
         }
-        InstallationCommand::Status { registry } => {
-            let registry_value = match RedbInstallationRegistry::inspect_existing(&registry) {
-                Ok(Some(registry_value)) => registry_value,
-                Ok(None) => {
-                    write_json_error(
-                        "INSTALLATION_STATUS_UNAVAILABLE",
-                        "registry does not exist; status never creates it",
-                    );
-                    return Ok(INVALID_REQUEST_EXIT);
+        InstallationCommand::Create { input, store } => run_installation_create(&input, &store),
+        InstallationCommand::Apply {
+            store,
+            transaction_id,
+        } => run_installation_effect(&store, &transaction_id, false),
+        InstallationCommand::Recover {
+            store,
+            transaction_id,
+        } => run_installation_effect(&store, &transaction_id, true),
+        InstallationCommand::Status {
+            registry,
+            store,
+            transaction_id,
+        } => match (registry, store, transaction_id) {
+            (Some(registry), None, None) => run_installation_registry_status(&registry),
+            (None, Some(store), Some(transaction_id)) => {
+                run_installation_transaction_status(&store, &transaction_id)
+            }
+            _ => {
+                write_json_error(
+                    "INSTALLATION_STATUS_INVALID",
+                    "status requires either --registry or both --store and --transaction-id",
+                );
+                Ok(INVALID_REQUEST_EXIT)
+            }
+        },
+        InstallationCommand::RemoveCanary {
+            store,
+            transaction_id,
+        } => {
+            let scope = match (store, transaction_id) {
+                (Some(store), Some(transaction_id)) => {
+                    format!(" for transaction {transaction_id} in {}", store.display())
                 }
-                Err(error) => {
-                    write_json_error("INSTALLATION_STATUS_INVALID", &error.to_string());
-                    return Ok(INVALID_REQUEST_EXIT);
-                }
+                (Some(store), None) => format!(" for store {}", store.display()),
+                (None, Some(transaction_id)) => format!(" for transaction {transaction_id}"),
+                (None, None) => String::new(),
             };
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&json!({
-                    "contract": "eliot.kernel.installation",
-                    "contract_version": "3.0.0",
-                    "status": if registry_value.active().is_some() { "ACTIVE_GENERATION" } else { "NO_ACTIVE_GENERATION" },
-                    "active_generation": registry_value.active_generation(),
-                    "last_known_good_generation": registry_value.last_known_good_generation(),
-                    "generations": registry_value.generations(),
-                }))?
+            write_json_error(
+                "INSTALLATION_REMOVE_CANARY_UNSUPPORTED",
+                &format!(
+                    "remove-canary{scope} is not implemented: no durable canary removal, activation, or generation-retirement API exists; no filesystem or SCM mutation was attempted"
+                ),
             );
-            Ok(0)
+            Ok(INVALID_REQUEST_EXIT)
         }
+    }
+}
+
+fn run_installation_create(input: &Path, store_path: &Path) -> Result<i32> {
+    let bytes = match load_input(input) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            write_json_error("INSTALLATION_CREATE_INVALID", &error.to_string());
+            return Ok(INVALID_REQUEST_EXIT);
+        }
+    };
+    let transaction = match decode_installation_transaction_json(&bytes) {
+        Ok(transaction) => transaction,
+        Err(error @ InstallationError::MigrationRequired { .. }) => {
+            write_json_error("INSTALLATION_CREATE_MIGRATION_REQUIRED", &error.to_string());
+            return Ok(INVALID_REQUEST_EXIT);
+        }
+        Err(error) => {
+            write_json_error("INSTALLATION_CREATE_INVALID", &error.to_string());
+            return Ok(INVALID_REQUEST_EXIT);
+        }
+    };
+    let store = match RedbInstallationTransactionStore::create_planned_at_exact_path(
+        store_path,
+        &transaction,
+    ) {
+        Ok(store) => store,
+        Err(error) => {
+            let code = match &error {
+                InstallationError::InvalidField { field, .. } if field == "transaction" => {
+                    "INSTALLATION_CREATE_REJECTED"
+                }
+                _ => "INSTALLATION_CREATE_STORE_INVALID",
+            };
+            write_json_error(code, &error.to_string());
+            return Ok(INVALID_REQUEST_EXIT);
+        }
+    };
+    drop(store);
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&json!({
+            "contract": "eliot.kernel.installation",
+            "contract_version": INSTALLATION_CONTRACT_VERSION,
+            "status": "CREATED",
+            "store": store_path.display().to_string(),
+            "transaction_id": transaction.transaction_id,
+            "transaction_wire_version": transaction.transaction_wire_version,
+            "stage": transaction.stage(),
+            "revision": transaction.revision(),
+            "effect_count": transaction.effect_progress().len(),
+            "scope": "durable_transaction_only",
+        }))?
+    );
+    Ok(0)
+}
+
+fn run_installation_registry_status(registry: &Path) -> Result<i32> {
+    let registry_value = match RedbInstallationRegistry::inspect_existing(registry) {
+        Ok(Some(registry_value)) => registry_value,
+        Ok(None) => {
+            write_json_error(
+                "INSTALLATION_STATUS_UNAVAILABLE",
+                "registry does not exist; status never creates it",
+            );
+            return Ok(INVALID_REQUEST_EXIT);
+        }
+        Err(error) => {
+            write_json_error("INSTALLATION_STATUS_INVALID", &error.to_string());
+            return Ok(INVALID_REQUEST_EXIT);
+        }
+    };
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&json!({
+            "contract": "eliot.kernel.installation",
+            "contract_version": INSTALLATION_CONTRACT_VERSION,
+            "status": if registry_value.active().is_some() { "ACTIVE_GENERATION" } else { "NO_ACTIVE_GENERATION" },
+            "active_generation": registry_value.active_generation(),
+            "last_known_good_generation": registry_value.last_known_good_generation(),
+            "generations": registry_value.generations(),
+        }))?
+    );
+    Ok(0)
+}
+
+fn run_installation_transaction_status(store_path: &Path, raw_transaction_id: &str) -> Result<i32> {
+    let transaction_id = match parse_installation_transaction_id(raw_transaction_id) {
+        Ok(transaction_id) => transaction_id,
+        Err(error) => {
+            write_json_error("INSTALLATION_STATUS_INVALID", &error.to_string());
+            return Ok(INVALID_REQUEST_EXIT);
+        }
+    };
+    let store = match RedbInstallationTransactionStore::open_existing_exact_path(store_path) {
+        Ok(store) => store,
+        Err(error) => {
+            write_json_error("INSTALLATION_STATUS_UNAVAILABLE", &error.to_string());
+            return Ok(INVALID_REQUEST_EXIT);
+        }
+    };
+    let transaction = match store.load(&transaction_id) {
+        Ok(Some(transaction)) => transaction,
+        Ok(None) => {
+            write_json_error(
+                "INSTALLATION_TRANSACTION_NOT_FOUND",
+                &format!("transaction is not present in {}", store_path.display()),
+            );
+            return Ok(INVALID_REQUEST_EXIT);
+        }
+        Err(error) => {
+            write_json_error("INSTALLATION_STATUS_INVALID", &error.to_string());
+            return Ok(INVALID_REQUEST_EXIT);
+        }
+    };
+    print_transaction_projection("TRANSACTION_STATUS", store_path, &transaction, None)?;
+    Ok(0)
+}
+
+fn run_installation_effect(
+    store_path: &Path,
+    raw_transaction_id: &str,
+    recover: bool,
+) -> Result<i32> {
+    let transaction_id = match parse_installation_transaction_id(raw_transaction_id) {
+        Ok(transaction_id) => transaction_id,
+        Err(error) => {
+            write_json_error(
+                if recover {
+                    "INSTALLATION_RECOVER_INVALID"
+                } else {
+                    "INSTALLATION_APPLY_INVALID"
+                },
+                &error.to_string(),
+            );
+            return Ok(INVALID_REQUEST_EXIT);
+        }
+    };
+    let store = match RedbInstallationTransactionStore::open_existing_exact_path(store_path) {
+        Ok(store) => store,
+        Err(error) => {
+            write_json_error(
+                if recover {
+                    "INSTALLATION_RECOVER_UNAVAILABLE"
+                } else {
+                    "INSTALLATION_APPLY_UNAVAILABLE"
+                },
+                &error.to_string(),
+            );
+            return Ok(INVALID_REQUEST_EXIT);
+        }
+    };
+    let mut coordinator = WindowsInstallationCoordinator::new(store);
+    let outcome = if recover {
+        coordinator.rollback(&transaction_id)
+    } else {
+        coordinator.drive_effect(&transaction_id)
+    };
+    let outcome = match outcome {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            write_json_error(
+                if recover {
+                    "INSTALLATION_RECOVER_REJECTED"
+                } else {
+                    "INSTALLATION_APPLY_REJECTED"
+                },
+                &error.to_string(),
+            );
+            return Ok(INVALID_REQUEST_EXIT);
+        }
+    };
+    drop(coordinator);
+    let store = match RedbInstallationTransactionStore::open_existing_exact_path(store_path) {
+        Ok(store) => store,
+        Err(error) => {
+            write_json_error(
+                "INSTALLATION_STATE_UNAVAILABLE",
+                &format!(
+                    "effect outcome was returned but durable state could not be reopened: {error}"
+                ),
+            );
+            return Ok(INVALID_REQUEST_EXIT);
+        }
+    };
+    let transaction = match store.load(&transaction_id) {
+        Ok(Some(transaction)) => transaction,
+        Ok(None) => {
+            write_json_error(
+                "INSTALLATION_STATE_UNAVAILABLE",
+                "effect outcome was returned but the transaction disappeared from the durable store",
+            );
+            return Ok(INVALID_REQUEST_EXIT);
+        }
+        Err(error) => {
+            write_json_error("INSTALLATION_STATE_INVALID", &error.to_string());
+            return Ok(INVALID_REQUEST_EXIT);
+        }
+    };
+    print_transaction_projection(
+        if recover {
+            "RECOVERY_RESULT"
+        } else {
+            "EFFECT_RESULT"
+        },
+        store_path,
+        &transaction,
+        Some(&outcome),
+    )?;
+    Ok(installation_outcome_exit_code(&outcome))
+}
+
+fn print_transaction_projection(
+    status: &str,
+    store_path: &Path,
+    transaction: &InstallationTransaction,
+    outcome: Option<&InstallationStepOutcome>,
+) -> Result<()> {
+    let transaction_value = serde_json::to_value(transaction)?;
+    let outcome_value = outcome.map(serde_json::to_value).transpose()?;
+    let outcome_status = outcome.map(installation_outcome_status);
+    let completed = matches!(
+        transaction.stage(),
+        eliot_installation::InstallationStage::Completed
+    );
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&json!({
+            "contract": "eliot.kernel.installation",
+            "contract_version": INSTALLATION_CONTRACT_VERSION,
+            "status": outcome_status.unwrap_or(status),
+            "store": store_path.display().to_string(),
+            "transaction_id": transaction.transaction_id,
+            "transaction_wire_version": transaction.transaction_wire_version,
+            "stage": transaction.stage(),
+            "revision": transaction.revision(),
+            "completed": completed,
+            "outcome": outcome_value,
+            "transaction": transaction_value,
+            "scope": "one_durable_effect_or_exact_rollback",
+            "deferred_scope": [
+                "package_staging",
+                "static_verification",
+                "generation_activation",
+                "service_start",
+                "runtime_health",
+                "canary_removal"
+            ],
+        }))?
+    );
+    Ok(())
+}
+
+fn installation_outcome_status(outcome: &InstallationStepOutcome) -> &'static str {
+    match outcome {
+        InstallationStepOutcome::Applied { .. } => "EFFECT_APPLIED",
+        InstallationStepOutcome::RollbackRequired { .. } => "ROLLBACK_REQUIRED",
+        InstallationStepOutcome::Quarantined { .. } => "QUARANTINED",
+        InstallationStepOutcome::Rejected => "EFFECT_REJECTED",
+    }
+}
+
+fn installation_outcome_exit_code(outcome: &InstallationStepOutcome) -> i32 {
+    match outcome {
+        InstallationStepOutcome::Applied { .. } => 0,
+        InstallationStepOutcome::RollbackRequired { .. }
+        | InstallationStepOutcome::Quarantined { .. }
+        | InstallationStepOutcome::Rejected => INVALID_REQUEST_EXIT,
     }
 }
 

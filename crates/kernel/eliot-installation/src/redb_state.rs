@@ -1,6 +1,10 @@
 //! Explicit-path redb persistence for durable installer transactions.
 
+use std::ffi::OsString;
+use std::fs::{self, File, OpenOptions};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use redb::{Database, ReadOnlyDatabase, ReadableDatabase, ReadableTable, TableDefinition};
 use serde::{Deserialize, Serialize};
@@ -15,6 +19,8 @@ use eliot_platform::PlatformHandle;
 
 const TRANSACTION_TABLE: TableDefinition<&str, &[u8]> =
     TableDefinition::new("installation_transactions_v7");
+const TRANSACTION_TEMP_CREATE_ATTEMPTS: usize = 16;
+static NEXT_TRANSACTION_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -45,6 +51,70 @@ impl RedbInstallationTransactionStore {
         Ok(Self {
             path: path.to_path_buf(),
         })
+    }
+
+    /// Creates and atomically publishes a new exact-path database containing
+    /// one planned constructor-produced transaction in its v7 table.
+    ///
+    /// The transaction is committed and synced in a unique same-directory
+    /// temporary database before a no-clobber hard-link publication. A caller
+    /// cannot observe an empty final store between database creation and the
+    /// first durable transaction record, and a publication race never
+    /// overwrites an existing path. The published path is reopened and
+    /// classified before this method returns.
+    pub fn create_planned_at_exact_path(
+        path: impl AsRef<Path>,
+        transaction: &InstallationTransaction,
+    ) -> Result<Self, InstallationError> {
+        transaction.validate()?;
+        if !transaction.is_constructor_planned() {
+            return Err(InstallationError::InvalidField {
+                field: "transaction".to_owned(),
+                reason: "create_planned accepts only constructor-produced Planned/Pending v7 state"
+                    .to_owned(),
+            });
+        }
+        let path = path.as_ref();
+        require_existing_parent(path)?;
+        if path.exists() {
+            return Err(existing_path_error());
+        }
+
+        let (publication, reserved) = PendingTransactionStorePublication::reserve(path)?;
+        drop(reserved);
+        let temporary = publication.temporary().to_owned();
+        let database = Database::create(&temporary)
+            .map_err(|error| InstallationError::Platform(format!("temporary create: {error}")))?;
+        insert_planned(&database, transaction).map_err(|error| match error {
+            InstallationError::Platform(reason) => {
+                InstallationError::Platform(format!("temporary populate: {reason}"))
+            }
+            other => other,
+        })?;
+        drop(database);
+        OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(publication.temporary())
+            .and_then(|file| file.sync_all())
+            .map_err(|error| InstallationError::Platform(format!("temporary sync: {error}")))?;
+        publication.publish(path).map_err(|error| match error {
+            InstallationError::Platform(reason) => {
+                InstallationError::Platform(format!("publish: {reason}"))
+            }
+            other => other,
+        })?;
+        let store = Self {
+            path: path.to_path_buf(),
+        };
+        let reopened = Self::open_existing_exact_path(path).map_err(|error| match error {
+            InstallationError::Platform(reason) => {
+                InstallationError::Platform(format!("published reopen: {reason}"))
+            }
+            other => other,
+        })?;
+        drop(reopened);
+        Ok(store)
     }
 
     /// Opens an existing regular database file without creating any path.
@@ -80,6 +150,147 @@ impl RedbInstallationTransactionStore {
     }
 }
 
+struct PendingTransactionStorePublication {
+    temporary: PathBuf,
+    owns_temporary: bool,
+}
+
+impl PendingTransactionStorePublication {
+    fn reserve(destination: &Path) -> Result<(Self, File), InstallationError> {
+        let directory = destination
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .ok_or_else(|| InstallationError::InvalidField {
+                field: "transaction_store.path".to_owned(),
+                reason: "exact path must name a file".to_owned(),
+            })?;
+        let file_name = destination
+            .file_name()
+            .ok_or_else(|| InstallationError::InvalidField {
+                field: "transaction_store.path".to_owned(),
+                reason: "exact path must name a file".to_owned(),
+            })?;
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |duration| duration.as_nanos());
+        for _ in 0..TRANSACTION_TEMP_CREATE_ATTEMPTS {
+            let sequence = NEXT_TRANSACTION_TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+            let mut temporary_name = OsString::from(".");
+            temporary_name.push(file_name);
+            temporary_name.push(format!(
+                ".eliot-transaction-{}-{nonce}-{sequence}.tmp",
+                std::process::id()
+            ));
+            let temporary = directory.join(temporary_name);
+            match OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&temporary)
+            {
+                Ok(file) => {
+                    return Ok((
+                        Self {
+                            temporary,
+                            owns_temporary: true,
+                        },
+                        file,
+                    ));
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(error) => return Err(InstallationError::Platform(error.to_string())),
+            }
+        }
+        Err(InstallationError::InvalidField {
+            field: "transaction_store.path".to_owned(),
+            reason: "could not reserve a unique same-directory temporary file".to_owned(),
+        })
+    }
+
+    fn temporary(&self) -> &Path {
+        &self.temporary
+    }
+
+    fn publish(mut self, destination: &Path) -> Result<(), InstallationError> {
+        match fs::hard_link(&self.temporary, destination) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                return Err(existing_path_error());
+            }
+            Err(error) => return Err(InstallationError::Platform(error.to_string())),
+        }
+        let directory = destination
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .ok_or_else(|| InstallationError::InvalidField {
+                field: "transaction_store.path".to_owned(),
+                reason: "exact path must name a file".to_owned(),
+            })?;
+        sync_parent_directory(directory)?;
+        self.remove_temporary()?;
+        sync_parent_directory(directory)
+    }
+
+    fn remove_temporary(&mut self) -> Result<(), InstallationError> {
+        match fs::remove_file(&self.temporary) {
+            Ok(()) => {
+                self.owns_temporary = false;
+                Ok(())
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                self.owns_temporary = false;
+                Ok(())
+            }
+            Err(error) => Err(InstallationError::Platform(error.to_string())),
+        }
+    }
+}
+
+impl Drop for PendingTransactionStorePublication {
+    fn drop(&mut self) {
+        if self.owns_temporary {
+            let _ = fs::remove_file(&self.temporary);
+        }
+    }
+}
+
+fn existing_path_error() -> InstallationError {
+    InstallationError::InvalidField {
+        field: "transaction_store.path".to_owned(),
+        reason: "create requires an absent exact file".to_owned(),
+    }
+}
+
+#[cfg(unix)]
+fn sync_parent_directory(directory: &Path) -> Result<(), InstallationError> {
+    File::open(directory)
+        .and_then(|file| file.sync_all())
+        .map_err(|error| InstallationError::Platform(error.to_string()))
+}
+
+#[cfg(windows)]
+fn sync_parent_directory(directory: &Path) -> Result<(), InstallationError> {
+    use std::os::windows::fs::OpenOptionsExt;
+
+    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+    OpenOptions::new()
+        .read(true)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+        .open(directory)
+        .and_then(|file| file.sync_all())
+        .or_else(|error| match error.kind() {
+            std::io::ErrorKind::InvalidInput
+            | std::io::ErrorKind::PermissionDenied
+            | std::io::ErrorKind::Unsupported => Ok(()),
+            _ => Err(error),
+        })
+        .map_err(|error| InstallationError::Platform(error.to_string()))
+}
+
+#[cfg(not(any(unix, windows)))]
+fn sync_parent_directory(_directory: &Path) -> Result<(), InstallationError> {
+    Ok(())
+}
+
 impl InstallationTransactionStore for RedbInstallationTransactionStore {
     fn create_planned(
         &mut self,
@@ -93,34 +304,8 @@ impl InstallationTransactionStore for RedbInstallationTransactionStore {
                     .to_owned(),
             });
         }
-        let bytes = encode(transaction)?;
         let database = self.open_for_mutation()?;
-        classify_v7_table(&database)?;
-        let write = database
-            .begin_write()
-            .map_err(|error| InstallationError::Platform(error.to_string()))?;
-        {
-            let mut table = write
-                .open_table(TRANSACTION_TABLE)
-                .map_err(|error| InstallationError::Platform(error.to_string()))?;
-            let key = transaction.transaction_id.as_str();
-            if table
-                .get(key)
-                .map_err(|error| InstallationError::Platform(error.to_string()))?
-                .is_some()
-            {
-                return Err(InstallationError::CompareAndSaveConflict {
-                    expected: 0,
-                    actual: transaction.revision,
-                });
-            }
-            table
-                .insert(key, bytes.as_slice())
-                .map_err(|error| InstallationError::Platform(error.to_string()))?;
-        }
-        write
-            .commit()
-            .map_err(|error| InstallationError::Platform(error.to_string()))
+        insert_planned(&database, transaction)
     }
 
     fn load(
@@ -217,6 +402,39 @@ impl transaction_store_private::Sealed for RedbInstallationTransactionStore {
             .commit()
             .map_err(|error| InstallationError::Platform(error.to_string()))
     }
+}
+
+fn insert_planned(
+    database: &Database,
+    transaction: &InstallationTransaction,
+) -> Result<(), InstallationError> {
+    let bytes = encode(transaction)?;
+    classify_v7_table(database)?;
+    let write = database
+        .begin_write()
+        .map_err(|error| InstallationError::Platform(error.to_string()))?;
+    {
+        let mut table = write
+            .open_table(TRANSACTION_TABLE)
+            .map_err(|error| InstallationError::Platform(error.to_string()))?;
+        let key = transaction.transaction_id.as_str();
+        if table
+            .get(key)
+            .map_err(|error| InstallationError::Platform(error.to_string()))?
+            .is_some()
+        {
+            return Err(InstallationError::CompareAndSaveConflict {
+                expected: 0,
+                actual: transaction.revision,
+            });
+        }
+        table
+            .insert(key, bytes.as_slice())
+            .map_err(|error| InstallationError::Platform(error.to_string()))?;
+    }
+    write
+        .commit()
+        .map_err(|error| InstallationError::Platform(error.to_string()))
 }
 
 fn classify_v7_table(database: &impl ReadableDatabase) -> Result<bool, InstallationError> {
@@ -353,6 +571,32 @@ mod tests {
             "eliot-installation-transaction-{name}-{}.redb",
             std::process::id()
         ))
+    }
+
+    #[test]
+    fn publication_conflict_never_overwrites_and_cleans_temporary() {
+        let directory = std::env::temp_dir().join(format!(
+            "eliot-installation-publication-conflict-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&directory);
+        fs::create_dir_all(&directory)
+            .unwrap_or_else(|error| panic!("create publication fixture directory: {error}"));
+        let destination = directory.join("transaction.redb");
+        let (publication, reserved) = PendingTransactionStorePublication::reserve(&destination)
+            .unwrap_or_else(|error| panic!("reserve temporary: {error}"));
+        drop(reserved);
+        let temporary = publication.temporary().to_owned();
+        let original = b"caller-owned-publish-conflict";
+        fs::write(&destination, original)
+            .unwrap_or_else(|error| panic!("create publication race: {error}"));
+
+        assert!(publication.publish(&destination).is_err());
+        let actual =
+            fs::read(&destination).unwrap_or_else(|error| panic!("read conflict: {error}"));
+        assert_eq!(actual.as_slice(), original);
+        assert!(!temporary.exists(), "failed publication leaked temporary");
+        let _ = fs::remove_dir_all(&directory);
     }
 
     #[test]
