@@ -90,7 +90,7 @@ pub struct SupervisionGenerationBinding {
     pub process_generation: ResourceGeneration,
 }
 
-/// Signed mirror identity proving which committed ORS revision backed a lease.
+/// Signed binding to an ORS-reserved revision and its predecessor receipt.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SupervisionOrsMirrorBinding {
@@ -100,10 +100,10 @@ pub struct SupervisionOrsMirrorBinding {
     pub subject_lease_id: String,
     /// Positive monotonic lease revision in the ORS record.
     pub lease_revision: u64,
-    /// SHA-256 of the committed ORS receipt which admitted this revision.
-    pub committed_receipt_sha256: String,
-    /// Optional SHA-256 of the immediately previous revision.
-    pub previous_revision_sha256: Option<String>,
+    /// SHA-256 of the ORS commit ticket reserved before this payload was signed.
+    pub ticket_sha256: String,
+    /// Optional SHA-256 of the immediately previous committed ORS receipt.
+    pub previous_receipt_sha256: Option<String>,
 }
 
 impl SupervisionOrsMirrorBinding {
@@ -116,18 +116,24 @@ impl SupervisionOrsMirrorBinding {
                 "must be greater than zero",
             ));
         }
-        if !is_sha256_hex(&self.committed_receipt_sha256) {
+        if !is_sha256_hex(&self.ticket_sha256) {
             return Err(invalid_lease_field(
-                "ors_mirror.committed_receipt_sha256",
+                "ors_mirror.ticket_sha256",
                 "must be a lowercase SHA-256 digest",
             ));
         }
-        if let Some(previous) = &self.previous_revision_sha256
+        if let Some(previous) = &self.previous_receipt_sha256
             && !is_sha256_hex(previous)
         {
             return Err(invalid_lease_field(
-                "ors_mirror.previous_revision_sha256",
+                "ors_mirror.previous_receipt_sha256",
                 "must be absent or a lowercase SHA-256 digest",
+            ));
+        }
+        if (self.lease_revision == 1) != self.previous_receipt_sha256.is_none() {
+            return Err(invalid_lease_field(
+                "ors_mirror.previous_receipt_sha256",
+                "must be absent only for the first revision",
             ));
         }
         Ok(())
@@ -229,7 +235,7 @@ pub struct SupervisionLease {
     pub generation_binding: SupervisionGenerationBinding,
     /// State fence captured with the activation.
     pub state_fence: StateFence,
-    /// Committed ORS mirror receipt and revision binding.
+    /// ORS ticket, predecessor receipt and monotonic revision binding.
     pub ors_mirror: SupervisionOrsMirrorBinding,
     /// Inclusive issue time in Unix milliseconds.
     pub issued_at_ms: u64,
@@ -773,6 +779,50 @@ impl SupervisionLeaseVerificationContext {
     }
 }
 
+/// ORS predecessor values bound by a signed terminal transition.
+///
+/// This value is not authority by itself.  A terminal verifier binds it to an
+/// exact verified active envelope, and ORS must still compare it with the
+/// current durable receipt before committing the transition.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SupervisionLeasePredecessorProof {
+    /// Stable lease identity of the active predecessor.
+    pub lease_id: String,
+    /// ORS record identity of the active predecessor.
+    pub record_id: String,
+    /// Positive ORS revision of the active predecessor.
+    pub lease_revision: u64,
+    /// Canonical digest of the active predecessor's committed ORS receipt.
+    pub receipt_sha256: String,
+    /// Canonical digest of the active predecessor's signed envelope.
+    pub envelope_sha256: String,
+}
+
+impl SupervisionLeasePredecessorProof {
+    /// Validates shape only; ORS performs the authoritative durable comparison.
+    pub fn validate(&self) -> Result<(), SupervisionLeaseError> {
+        non_empty_text_for_lease(&self.lease_id, "predecessor.lease_id")?;
+        non_empty_text_for_lease(&self.record_id, "predecessor.record_id")?;
+        if self.lease_revision == 0 {
+            return Err(SupervisionLeaseError::InvalidContext(
+                "predecessor.lease_revision must be greater than zero".to_owned(),
+            ));
+        }
+        if !is_sha256_hex(&self.receipt_sha256) {
+            return Err(SupervisionLeaseError::InvalidContext(
+                "predecessor.receipt_sha256 must be lowercase SHA-256".to_owned(),
+            ));
+        }
+        if !is_sha256_hex(&self.envelope_sha256) {
+            return Err(SupervisionLeaseError::InvalidContext(
+                "predecessor.envelope_sha256 must be lowercase SHA-256".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// Verified lease newtype.  It can only be constructed by a trust-anchor verifier.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct VerifiedSupervisionLease {
@@ -835,6 +885,36 @@ impl VerifiedSupervisionLease {
     /// Returns the installation-pinned public-key fingerprint used to verify.
     pub fn public_key_fingerprint(&self) -> &str {
         &self.public_key_fingerprint
+    }
+}
+
+/// Sealed verification token for a signed terminal transition.
+///
+/// It cannot be constructed from a caller-authored terminal context.  The
+/// installation trust anchor authenticates the terminal envelope and binds it
+/// to an exact prior [`VerifiedSupervisionLease`] plus an ORS predecessor proof.
+/// ORS remains responsible for comparing that proof with durable current state.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VerifiedSupervisionLeaseTerminalTransition {
+    prior_active: VerifiedSupervisionLease,
+    predecessor: SupervisionLeasePredecessorProof,
+    terminal_envelope: SignedSupervisionLease,
+}
+
+impl VerifiedSupervisionLeaseTerminalTransition {
+    /// Returns the exact authenticated active predecessor.
+    pub fn prior_active(&self) -> &VerifiedSupervisionLease {
+        &self.prior_active
+    }
+
+    /// Returns the predecessor values which ORS must compare durably.
+    pub fn predecessor(&self) -> &SupervisionLeasePredecessorProof {
+        &self.predecessor
+    }
+
+    /// Returns the authenticated terminal signed envelope.
+    pub fn envelope(&self) -> &SignedSupervisionLease {
+        &self.terminal_envelope
     }
 }
 
@@ -944,6 +1024,128 @@ impl SupervisionLeaseVerifier for SupervisionTrustAnchor {
     }
 }
 
+impl SupervisionTrustAnchor {
+    /// Authenticates a terminal revision against an exact verified active
+    /// predecessor without widening the active admission verifier.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "terminal authentication must bind anchor, predecessor, lineage and signature"
+    )]
+    pub fn verify_terminal_transition(
+        &self,
+        prior_active: &VerifiedSupervisionLease,
+        terminal_envelope: &SignedSupervisionLease,
+        predecessor: &SupervisionLeasePredecessorProof,
+    ) -> Result<VerifiedSupervisionLeaseTerminalTransition, SupervisionLeaseError> {
+        self.validate()?;
+        predecessor.validate()?;
+        terminal_envelope.validate()?;
+
+        if prior_active.signer_id != self.signer_id
+            || prior_active.key_id != self.key_id
+            || prior_active.algorithm != self.algorithm
+            || prior_active.public_key_fingerprint != self.public_key_fingerprint
+            || prior_active.payload.installation_id != self.installation_id
+        {
+            return Err(SupervisionLeaseError::TrustAnchorMismatch(
+                "active_predecessor",
+            ));
+        }
+        if terminal_envelope.signer_id != self.signer_id {
+            return Err(SupervisionLeaseError::TrustAnchorMismatch("signer_id"));
+        }
+        if terminal_envelope.key_id != self.key_id {
+            return Err(SupervisionLeaseError::TrustAnchorMismatch("key_id"));
+        }
+        if terminal_envelope.algorithm != self.algorithm {
+            return Err(SupervisionLeaseError::TrustAnchorMismatch("algorithm"));
+        }
+
+        let prior = &prior_active.payload;
+        let terminal = &terminal_envelope.payload;
+        if prior.state != LeaseState::Active || prior.terminal_disposition.is_some() {
+            return Err(SupervisionLeaseError::InactiveLease);
+        }
+        if !matches!(
+            terminal.state,
+            LeaseState::Released
+                | LeaseState::Expired
+                | LeaseState::Revoked
+                | LeaseState::Superseded
+                | LeaseState::Closed
+        ) {
+            return Err(SupervisionLeaseError::InactiveLease);
+        }
+        if predecessor.lease_id != prior.lease_id
+            || predecessor.record_id != prior.ors_mirror.record_id
+            || predecessor.lease_revision != prior.ors_mirror.lease_revision
+            || predecessor.envelope_sha256 != prior_active.envelope_sha256
+        {
+            return Err(SupervisionLeaseError::TerminalTransitionMismatch(
+                "active predecessor",
+            ));
+        }
+        let expected_revision = predecessor.lease_revision.checked_add(1).ok_or(
+            SupervisionLeaseError::TerminalTransitionMismatch("revision overflow"),
+        )?;
+        if terminal.ors_mirror.lease_revision != expected_revision
+            || terminal.ors_mirror.previous_receipt_sha256.as_deref()
+                != Some(predecessor.receipt_sha256.as_str())
+            || terminal.ors_mirror.record_id == predecessor.record_id
+        {
+            return Err(SupervisionLeaseError::TerminalTransitionMismatch(
+                "ORS predecessor binding",
+            ));
+        }
+        if terminal.lease_id != prior.lease_id
+            || terminal.ors_mirror.subject_lease_id != prior.lease_id
+            || terminal.scope_ref != prior.scope_ref
+            || terminal.observation_scope != prior.observation_scope
+            || terminal.installation_id != prior.installation_id
+            || terminal.host_epoch != prior.host_epoch
+            || terminal.activation_id != prior.activation_id
+            || terminal.activation_generation != prior.activation_generation
+            || terminal.kernel_epoch != prior.kernel_epoch
+            || terminal.watchdog_epoch != prior.watchdog_epoch
+            || terminal.generation_binding != prior.generation_binding
+            || terminal.state_fence != prior.state_fence
+            || terminal.issued_at_ms != prior.issued_at_ms
+            || terminal.expires_at_ms != prior.expires_at_ms
+            || terminal.renew_before_ms != prior.renew_before_ms
+            || terminal.wake_policy != prior.wake_policy
+        {
+            return Err(SupervisionLeaseError::TerminalTransitionMismatch(
+                "lease lineage",
+            ));
+        }
+
+        let signature = decode_hex::<{ SUPERVISION_LEASE_SIGNATURE_BYTES }>(
+            &terminal_envelope.signature,
+            "signature",
+        )?;
+        let public_key: &[u8; SUPERVISION_LEASE_PUBLIC_KEY_BYTES] =
+            self.public_key.as_slice().try_into().map_err(|_| {
+                SupervisionLeaseError::InvalidPublicKeyLength {
+                    observed: self.public_key.len(),
+                }
+            })?;
+        let verifying_key = VerifyingKey::from_bytes(public_key)
+            .map_err(|error| SupervisionLeaseError::InvalidPublicKey(error.to_string()))?;
+        verifying_key
+            .verify_strict(
+                &terminal.canonical_bytes()?,
+                &Signature::from_bytes(&signature),
+            )
+            .map_err(|error| SupervisionLeaseError::SignatureInvalid(error.to_string()))?;
+
+        Ok(VerifiedSupervisionLeaseTerminalTransition {
+            prior_active: prior_active.clone(),
+            predecessor: predecessor.clone(),
+            terminal_envelope: terminal_envelope.clone(),
+        })
+    }
+}
+
 /// Errors raised by signed lease construction and verification.
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
 pub enum SupervisionLeaseError {
@@ -1004,6 +1206,9 @@ pub enum SupervisionLeaseError {
     /// Lease is outside its signed validity window.
     #[error("supervision lease is expired or not yet valid")]
     Expired,
+    /// Terminal revision does not bind the exact verified active predecessor.
+    #[error("supervision lease terminal transition mismatch for {0}")]
+    TerminalTransitionMismatch(&'static str),
     /// Verification context is incomplete or invalid.
     #[error("invalid supervision lease verification context: {0}")]
     InvalidContext(String),

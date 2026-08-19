@@ -4,11 +4,16 @@ use std::sync::Barrier;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 
-use eliot_contracts::{AuthorityEpoch, ResourceGeneration};
+use eliot_contracts::{AuthorityEpoch, ResourceGeneration, StateFence};
 use eliot_platform::SecretReference;
 use eliot_receipts::{ReceiptCore, ReceiptEnvelope};
 use eliot_runtime_contracts::{
-    GenerationCutoverRecord as RuntimeGenerationCutoverRecord, GenerationCutoverState,
+    Ed25519SupervisionLeaseSigner, GenerationCutoverRecord as RuntimeGenerationCutoverRecord,
+    GenerationCutoverState, LeaseState, RegisteredActivityWakePolicy, SignedSupervisionLease,
+    SupervisionGenerationBinding, SupervisionLeaseActiveStateBinding,
+    SupervisionLeasePredecessorProof, SupervisionLeaseSigner, SupervisionLeaseTerminalDisposition,
+    SupervisionLeaseVerificationContext, SupervisionLeaseVerifier, SupervisionObservationScope,
+    SupervisionTrustAnchor, VerifiedSupervisionLease, VerifiedSupervisionLeaseTerminalTransition,
 };
 use eliot_security_contracts::PrivacyClass;
 use redb::ReadableTable;
@@ -486,6 +491,654 @@ fn process_start_replay_has_one_atomic_winner_and_rejects_substitution() -> Test
     corrupted.receipt = None;
     reopened.write_process_start_raw_for_test(&corrupted)?;
     assert!(reopened.load_process_start(&operation_id).is_err());
+    cleanup(&path);
+    Ok(())
+}
+
+fn supervision_binding(
+    state: LeaseState,
+    issued_at_ms: u64,
+) -> TestResult<SupervisionLeaseBinding> {
+    let terminal_disposition = match state {
+        LeaseState::Released => Some(SupervisionLeaseTerminalDisposition::Released),
+        LeaseState::Expired => Some(SupervisionLeaseTerminalDisposition::Expired),
+        LeaseState::Revoked => Some(SupervisionLeaseTerminalDisposition::Revoked),
+        LeaseState::Superseded => Some(SupervisionLeaseTerminalDisposition::Superseded),
+        LeaseState::Closed => Some(SupervisionLeaseTerminalDisposition::Closed),
+        LeaseState::Requested
+        | LeaseState::Active
+        | LeaseState::Expiring
+        | LeaseState::Reconciling => None,
+    };
+    let revoked = state == LeaseState::Revoked;
+    Ok(SupervisionLeaseBinding {
+        scope_ref: label("scope-supervision")?,
+        observation_scope: SupervisionObservationScope {
+            targets: vec!["target-1".to_owned()],
+            sensor_profile: "kernel-heartbeat".to_owned(),
+            claimed_coverage: vec!["process".to_owned(), "job".to_owned()],
+            governance_axis: "runtime-live".to_owned(),
+        },
+        installation_id: label("installation-1")?,
+        host_epoch: AuthorityEpoch::new(1)?,
+        activation_id: label("activation-1")?,
+        activation_generation: ResourceGeneration::new(1)?,
+        kernel_epoch: AuthorityEpoch::new(2)?,
+        watchdog_epoch: AuthorityEpoch::new(1)?,
+        generation_binding: SupervisionGenerationBinding {
+            target_id: "target-1".to_owned(),
+            target_generation: ResourceGeneration::new(1)?,
+            module_id: "module-1".to_owned(),
+            module_generation: ResourceGeneration::new(1)?,
+            process_id: "kernel-process-1".to_owned(),
+            process_generation: ResourceGeneration::new(1)?,
+        },
+        state_fence: StateFence::new(AuthorityEpoch::new(2)?, ResourceGeneration::new(1)?),
+        issued_at_ms,
+        expires_at_ms: issued_at_ms + 900,
+        renew_before_ms: issued_at_ms + 450,
+        wake_policy: RegisteredActivityWakePolicy::Disabled,
+        state,
+        terminal_disposition,
+        revocation_reason: revoked.then(|| "test revocation".to_owned()),
+        revocation_id: revoked.then(|| "revoke-1".to_owned()),
+        revocation_epoch: revoked.then(|| AuthorityEpoch::new(2)).transpose()?,
+    })
+}
+
+fn supervision_request(
+    ticket_id: &str,
+    operation_id: &str,
+    lease_id: &str,
+    expected_revision: Option<u64>,
+    operation: SupervisionLeaseOperation,
+    binding: SupervisionLeaseBinding,
+) -> Result<SupervisionLeasePrepareRequest, OrsError> {
+    Ok(SupervisionLeasePrepareRequest {
+        ticket_id: label(ticket_id)?,
+        operation_id: label(operation_id)?,
+        lease_id: label(lease_id)?,
+        expected_revision,
+        operation,
+        binding,
+    })
+}
+
+fn verified_supervision_stage(
+    stage: &SupervisionLeaseStageReceipt,
+) -> TestResult<VerifiedSupervisionLease> {
+    verified_supervision_ticket(&stage.ticket)
+}
+
+fn signed_supervision_ticket(
+    ticket: &SupervisionLeaseCommitTicket,
+) -> TestResult<SignedSupervisionLease> {
+    let signer =
+        Ed25519SupervisionLeaseSigner::from_secret_key("kernel-1", "kernel-key-1", [7; 32])?;
+    Ok(ticket.expected_payload()?.sign(&signer)?)
+}
+
+fn verified_supervision_ticket(
+    ticket: &SupervisionLeaseCommitTicket,
+) -> TestResult<VerifiedSupervisionLease> {
+    verify_supervision_envelope(&signed_supervision_ticket(ticket)?)
+}
+
+fn verify_supervision_envelope(
+    envelope: &SignedSupervisionLease,
+) -> TestResult<VerifiedSupervisionLease> {
+    let (anchor, context) = supervision_verification_inputs(envelope)?;
+    Ok(anchor.verify(envelope, &context)?)
+}
+
+fn supervision_predecessor_proof(
+    prior_active: &VerifiedSupervisionLease,
+    snapshot: &SupervisionLeaseSnapshot,
+) -> SupervisionLeasePredecessorProof {
+    SupervisionLeasePredecessorProof {
+        lease_id: snapshot.record.lease_id.as_str().to_owned(),
+        record_id: snapshot.record.record_id.as_str().to_owned(),
+        lease_revision: snapshot.record.revision,
+        receipt_sha256: snapshot.receipt.receipt_sha256.clone(),
+        envelope_sha256: prior_active.envelope_digest().to_owned(),
+    }
+}
+
+fn verified_terminal_supervision_ticket(
+    ticket: &SupervisionLeaseCommitTicket,
+    prior_active: &VerifiedSupervisionLease,
+    predecessor: &SupervisionLeasePredecessorProof,
+) -> TestResult<VerifiedSupervisionLeaseTerminalTransition> {
+    let envelope = signed_supervision_ticket(ticket)?;
+    let (anchor, _) = supervision_verification_inputs(&envelope)?;
+    Ok(anchor.verify_terminal_transition(prior_active, &envelope, predecessor)?)
+}
+
+fn assert_active_verifier_rejects_terminal_and_expired(
+    active_envelope: &SignedSupervisionLease,
+    terminal_envelope: &SignedSupervisionLease,
+) -> TestResult {
+    let (terminal_anchor, terminal_context) = supervision_verification_inputs(terminal_envelope)?;
+    assert!(matches!(
+        terminal_anchor.verify(terminal_envelope, &terminal_context),
+        Err(eliot_runtime_contracts::SupervisionLeaseError::InactiveLease)
+    ));
+    let (active_anchor, mut expired_context) = supervision_verification_inputs(active_envelope)?;
+    expired_context.now_ms = active_envelope.payload.expires_at_ms;
+    assert!(matches!(
+        active_anchor.verify(active_envelope, &expired_context),
+        Err(eliot_runtime_contracts::SupervisionLeaseError::Expired)
+    ));
+    Ok(())
+}
+
+fn assert_terminal_verifier_rejects_missing_or_wrong_predecessor(
+    anchor: &SupervisionTrustAnchor,
+    active: &VerifiedSupervisionLease,
+    terminal_envelope: &SignedSupervisionLease,
+    predecessor: &SupervisionLeasePredecessorProof,
+    active_ticket: &SupervisionLeaseCommitTicket,
+) -> TestResult {
+    let mut missing_evidence = predecessor.clone();
+    missing_evidence.receipt_sha256.clear();
+    assert!(matches!(
+        anchor.verify_terminal_transition(active, terminal_envelope, &missing_evidence),
+        Err(eliot_runtime_contracts::SupervisionLeaseError::InvalidContext(_))
+    ));
+
+    let mut wrong_prior_ticket = active_ticket.clone();
+    wrong_prior_ticket.ticket_id = label("ticket-wrong-prior")?;
+    wrong_prior_ticket.operation_id = label("operation-wrong-prior")?;
+    wrong_prior_ticket.lease_id = label("lease-wrong-prior")?;
+    wrong_prior_ticket.record_id = label("lease-wrong-prior::r00000000000000000001")?;
+    let wrong_prior = verified_supervision_ticket(&wrong_prior_ticket)?;
+    assert!(matches!(
+        anchor.verify_terminal_transition(&wrong_prior, terminal_envelope, predecessor),
+        Err(
+            eliot_runtime_contracts::SupervisionLeaseError::TerminalTransitionMismatch(
+                "active predecessor"
+            )
+        )
+    ));
+    Ok(())
+}
+
+fn supervision_verification_inputs(
+    envelope: &SignedSupervisionLease,
+) -> TestResult<(SupervisionTrustAnchor, SupervisionLeaseVerificationContext)> {
+    let payload = &envelope.payload;
+    let signer =
+        Ed25519SupervisionLeaseSigner::from_secret_key("kernel-1", "kernel-key-1", [7; 32])?;
+    let anchor = SupervisionTrustAnchor::new(
+        payload.installation_id.clone(),
+        signer.signer_id(),
+        signer.key_id(),
+        signer.public_key().to_vec(),
+    )?;
+    let generation = &payload.generation_binding;
+    let context = SupervisionLeaseVerificationContext {
+        now_ms: payload.issued_at_ms + 1,
+        lease_id: payload.lease_id.clone(),
+        host_epoch: payload.host_epoch,
+        activation_id: payload.activation_id.clone(),
+        activation_generation: payload.activation_generation,
+        kernel_epoch: payload.kernel_epoch,
+        watchdog_epoch: payload.watchdog_epoch,
+        state_fence: payload.state_fence.clone(),
+        scope_ref: payload.scope_ref.clone(),
+        observation_scope: payload.observation_scope.clone(),
+        target_id: generation.target_id.clone(),
+        module_id: generation.module_id.clone(),
+        process_id: generation.process_id.clone(),
+        target_generation: generation.target_generation,
+        module_generation: generation.module_generation,
+        process_generation: generation.process_generation,
+        public_key_fingerprint: anchor.public_key_fingerprint().to_owned(),
+        ors_mirror: payload.ors_mirror.clone(),
+        active_state: SupervisionLeaseActiveStateBinding {
+            state: payload.state,
+            revocation_id: payload.revocation_id.clone(),
+            revocation_epoch: payload.revocation_epoch,
+        },
+    };
+    Ok((anchor, context))
+}
+
+#[test]
+fn supervision_lease_stage_is_non_authoritative_and_survives_reopen() -> TestResult {
+    let path = database_path("supervision-stage-reopen");
+    let store = RedbRecoveryStore::open(&path)?;
+    let request = supervision_request(
+        "ticket-1",
+        "operation-1",
+        "lease-1",
+        None,
+        SupervisionLeaseOperation::Commit,
+        supervision_binding(LeaseState::Active, 100)?,
+    )?;
+    let stage = store.prepare_supervision_lease(request.clone())?;
+    assert_eq!(stage.ticket.revision, 1);
+    assert_eq!(stage.projection, SupervisionLeaseProjection::Staged);
+    assert!(
+        store
+            .load_current_supervision_lease(&label("lease-1")?)?
+            .is_none()
+    );
+    assert_eq!(store.reconcile_staged_supervision_leases(8)?.len(), 1);
+    drop(store);
+
+    let reopened = RedbRecoveryStore::open(&path)?;
+    let recovered = reopened.reconcile_staged_supervision_lease(&label("lease-1")?)?;
+    assert_eq!(recovered, Some(stage.clone()));
+    assert!(
+        reopened
+            .load_current_supervision_lease(&label("lease-1")?)?
+            .is_none()
+    );
+    let snapshot =
+        reopened.commit_supervision_lease(&stage.ticket, &verified_supervision_stage(&stage)?)?;
+    assert_eq!(snapshot.record.revision, 1);
+    assert_eq!(
+        snapshot.record.projection,
+        SupervisionLeaseProjection::Active
+    );
+    assert_eq!(reopened.reconcile_staged_supervision_leases(8)?.len(), 0);
+    assert_eq!(
+        reopened
+            .load_supervision_lease_history(&label("lease-1")?, 8)?
+            .len(),
+        1
+    );
+    drop(reopened);
+    let committed_reopen = RedbRecoveryStore::open(&path)?;
+    let reopened_current = committed_reopen
+        .load_current_supervision_lease(&label("lease-1")?)?
+        .ok_or("committed lease disappeared after reopen")?;
+    assert_eq!(reopened_current.record.revision, 1);
+    assert_eq!(
+        committed_reopen
+            .load_supervision_lease_history(&label("lease-1")?, 8)?
+            .len(),
+        1
+    );
+    drop(committed_reopen);
+    cleanup(&path);
+    Ok(())
+}
+
+#[test]
+fn supervision_lease_commit_rejects_substitution_and_replays_exactly() -> TestResult {
+    let path = database_path("supervision-commit-binding");
+    let store = RedbRecoveryStore::open(&path)?;
+    let stage = store.prepare_supervision_lease(supervision_request(
+        "ticket-2",
+        "operation-2",
+        "lease-2",
+        None,
+        SupervisionLeaseOperation::Commit,
+        supervision_binding(LeaseState::Active, 100)?,
+    )?)?;
+    let valid = verified_supervision_stage(&stage)?;
+    let mut forged = signed_supervision_ticket(&stage.ticket)?;
+    forged.payload.activation_id = "substituted-activation".to_owned();
+    forged.payload_sha256 = forged.payload.digest()?;
+    assert!(forged.validate().is_ok());
+    let Err(forged_error) = verify_supervision_envelope(&forged) else {
+        return Err("forged signature accepted".into());
+    };
+    assert!(matches!(
+        forged_error.downcast_ref::<eliot_runtime_contracts::SupervisionLeaseError>(),
+        Some(eliot_runtime_contracts::SupervisionLeaseError::SignatureInvalid(_))
+    ));
+    assert!(
+        store
+            .reconcile_staged_supervision_lease(&label("lease-2")?)?
+            .is_some()
+    );
+    let first = store.commit_supervision_lease(&stage.ticket, &valid)?;
+    let replay = store.commit_supervision_lease(&stage.ticket, &valid)?;
+    assert_eq!(first, replay);
+    drop(store);
+    cleanup(&path);
+    Ok(())
+}
+
+#[test]
+fn supervision_lease_renew_is_monotonic_and_history_is_bounded() -> TestResult {
+    let path = database_path("supervision-renew-history");
+    let store = RedbRecoveryStore::open(&path)?;
+    let first_stage = store.prepare_supervision_lease(supervision_request(
+        "ticket-3a",
+        "operation-3a",
+        "lease-3",
+        None,
+        SupervisionLeaseOperation::Commit,
+        supervision_binding(LeaseState::Active, 100)?,
+    )?)?;
+    let first = store.commit_supervision_lease(
+        &first_stage.ticket,
+        &verified_supervision_stage(&first_stage)?,
+    )?;
+    let second_stage = store.prepare_supervision_lease(supervision_request(
+        "ticket-3b",
+        "operation-3b",
+        "lease-3",
+        Some(1),
+        SupervisionLeaseOperation::Renew,
+        supervision_binding(LeaseState::Active, 200)?,
+    )?)?;
+    assert_eq!(second_stage.ticket.revision, 2);
+    assert_eq!(
+        second_stage.ticket.previous_receipt_sha256.as_deref(),
+        Some(first.receipt.receipt_sha256.as_str())
+    );
+    let second = store.commit_supervision_lease(
+        &second_stage.ticket,
+        &verified_supervision_stage(&second_stage)?,
+    )?;
+    assert!(second.receipt.operation_order > first.receipt.operation_order);
+    assert_eq!(second.record.revision, 2);
+    assert!(matches!(
+        store.prepare_supervision_lease(supervision_request(
+            "ticket-stale",
+            "operation-stale",
+            "lease-3",
+            Some(1),
+            SupervisionLeaseOperation::Renew,
+            supervision_binding(LeaseState::Active, 300)?,
+        )?),
+        Err(OrsError::SupervisionLeaseStaleRevision)
+    ));
+    let mut mismatched_binding = supervision_binding(LeaseState::Active, 250)?;
+    mismatched_binding.kernel_epoch = AuthorityEpoch::new(3)?;
+    mismatched_binding.state_fence =
+        StateFence::new(AuthorityEpoch::new(3)?, ResourceGeneration::new(1)?);
+    assert!(matches!(
+        store.prepare_supervision_lease(supervision_request(
+            "ticket-fence-mismatch",
+            "operation-fence-mismatch",
+            "lease-3",
+            Some(2),
+            SupervisionLeaseOperation::Renew,
+            mismatched_binding,
+        )?),
+        Err(OrsError::SupervisionLeaseBindingMismatch)
+    ));
+    let mut generation_mismatch = supervision_binding(LeaseState::Active, 250)?;
+    generation_mismatch.generation_binding.process_generation = ResourceGeneration::new(2)?;
+    assert!(matches!(
+        store.prepare_supervision_lease(supervision_request(
+            "ticket-generation-mismatch",
+            "operation-generation-mismatch",
+            "lease-3",
+            Some(2),
+            SupervisionLeaseOperation::Renew,
+            generation_mismatch,
+        )?),
+        Err(OrsError::SupervisionLeaseBindingMismatch)
+    ));
+
+    let third_stage = store.prepare_supervision_lease(supervision_request(
+        "ticket-3c",
+        "operation-3c",
+        "lease-3",
+        Some(2),
+        SupervisionLeaseOperation::Renew,
+        supervision_binding(LeaseState::Active, 300)?,
+    )?)?;
+    store.commit_supervision_lease(
+        &third_stage.ticket,
+        &verified_supervision_stage(&third_stage)?,
+    )?;
+    let history = store.load_supervision_lease_history(&label("lease-3")?, 2)?;
+    assert_eq!(history.len(), 2);
+    assert_eq!(history[0].record.revision, 3);
+    assert_eq!(history[1].record.revision, 2);
+    drop(store);
+    cleanup(&path);
+    Ok(())
+}
+
+#[test]
+fn supervision_lease_terminal_requires_verified_durable_predecessor() -> TestResult {
+    let path = database_path("supervision-terminal-fence");
+    let store = RedbRecoveryStore::open(&path)?;
+    let active_stage = store.prepare_supervision_lease(supervision_request(
+        "ticket-4a",
+        "operation-4a",
+        "lease-4",
+        None,
+        SupervisionLeaseOperation::Commit,
+        supervision_binding(LeaseState::Active, 100)?,
+    )?)?;
+    let active_envelope = signed_supervision_ticket(&active_stage.ticket)?;
+    let active_verified = verify_supervision_envelope(&active_envelope)?;
+    let active = store.commit_supervision_lease(&active_stage.ticket, &active_verified)?;
+    let revoke_stage = store.prepare_supervision_lease(supervision_request(
+        "ticket-4b",
+        "operation-4b",
+        "lease-4",
+        Some(1),
+        SupervisionLeaseOperation::Revoke,
+        supervision_binding(LeaseState::Revoked, 100)?,
+    )?)?;
+    let terminal_envelope = signed_supervision_ticket(&revoke_stage.ticket)?;
+    assert_active_verifier_rejects_terminal_and_expired(&active_envelope, &terminal_envelope)?;
+    assert!(matches!(
+        store.commit_supervision_lease(&revoke_stage.ticket, &active_verified),
+        Err(OrsError::InvalidTransition)
+    ));
+
+    let predecessor = supervision_predecessor_proof(&active_verified, &active);
+    let (terminal_anchor, _) = supervision_verification_inputs(&terminal_envelope)?;
+    assert_terminal_verifier_rejects_missing_or_wrong_predecessor(
+        &terminal_anchor,
+        &active_verified,
+        &terminal_envelope,
+        &predecessor,
+        &active_stage.ticket,
+    )?;
+
+    assert_ne!(active.record.ticket_sha256, active.receipt.receipt_sha256);
+    assert_eq!(
+        terminal_envelope.payload.ors_mirror.ticket_sha256,
+        revoke_stage.ticket_sha256
+    );
+    assert_eq!(
+        terminal_envelope
+            .payload
+            .ors_mirror
+            .previous_receipt_sha256
+            .as_deref(),
+        Some(active.receipt.receipt_sha256.as_str())
+    );
+    let mut substituted_proof = predecessor.clone();
+    substituted_proof.receipt_sha256 = active.record.ticket_sha256.clone();
+    let mut substituted_payload = revoke_stage.ticket.expected_payload()?;
+    substituted_payload.ors_mirror.previous_receipt_sha256 =
+        Some(substituted_proof.receipt_sha256.clone());
+    let signer =
+        Ed25519SupervisionLeaseSigner::from_secret_key("kernel-1", "kernel-key-1", [7; 32])?;
+    let substituted_envelope = substituted_payload.sign(&signer)?;
+    let substituted = terminal_anchor.verify_terminal_transition(
+        &active_verified,
+        &substituted_envelope,
+        &substituted_proof,
+    )?;
+    assert!(matches!(
+        store.commit_terminal_supervision_lease(&revoke_stage.ticket, &substituted),
+        Err(OrsError::SupervisionLeaseBindingMismatch)
+    ));
+
+    let terminal_verified =
+        verified_terminal_supervision_ticket(&revoke_stage.ticket, &active_verified, &predecessor)?;
+    let revoked =
+        store.commit_terminal_supervision_lease(&revoke_stage.ticket, &terminal_verified)?;
+    assert_eq!(
+        revoked.record.projection,
+        SupervisionLeaseProjection::Terminal
+    );
+    assert!(matches!(
+        store.prepare_supervision_lease(supervision_request(
+            "ticket-4c",
+            "operation-4c",
+            "lease-4",
+            Some(2),
+            SupervisionLeaseOperation::Renew,
+            supervision_binding(LeaseState::Active, 200)?,
+        )?),
+        Err(OrsError::InvalidTransition)
+    ));
+    drop(store);
+    cleanup(&path);
+    Ok(())
+}
+
+#[test]
+fn supervision_lease_unstaged_ticket_is_authoritatively_absent_and_retryable() -> TestResult {
+    let path = database_path("supervision-unstaged-ticket");
+    let store = RedbRecoveryStore::open(&path)?;
+    let request = supervision_request(
+        "ticket-never-staged",
+        "operation-never-staged",
+        "lease-never-staged",
+        None,
+        SupervisionLeaseOperation::Commit,
+        supervision_binding(LeaseState::Active, 100)?,
+    )?;
+    let unstaged = SupervisionLeaseCommitTicket {
+        ticket_id: request.ticket_id.clone(),
+        operation_id: request.operation_id.clone(),
+        lease_id: request.lease_id.clone(),
+        record_id: label("lease-never-staged::r00000000000000000001")?,
+        expected_revision: None,
+        revision: 1,
+        operation: request.operation,
+        binding: request.binding.clone(),
+        previous_receipt_sha256: None,
+        reservation_order: 99,
+    };
+    let unstaged_verified = verified_supervision_ticket(&unstaged)?;
+    assert!(matches!(
+        store.commit_supervision_lease(&unstaged, &unstaged_verified),
+        Err(OrsError::SupervisionLeaseTicketNotStaged)
+    ));
+    assert!(
+        store
+            .load_current_supervision_lease(&request.lease_id)?
+            .is_none()
+    );
+    assert!(
+        store
+            .load_supervision_lease_history(&request.lease_id, 8)?
+            .is_empty()
+    );
+
+    let stage = store.prepare_supervision_lease(request)?;
+    let committed =
+        store.commit_supervision_lease(&stage.ticket, &verified_supervision_stage(&stage)?)?;
+    assert_eq!(committed.record.revision, 1);
+    drop(store);
+    cleanup(&path);
+    Ok(())
+}
+
+#[test]
+fn supervision_lease_successor_rejects_corrupt_current_snapshot() -> TestResult {
+    let path = database_path("supervision-corrupt-current");
+    let store = RedbRecoveryStore::open(&path)?;
+    let active_stage = store.prepare_supervision_lease(supervision_request(
+        "ticket-corrupt-a",
+        "operation-corrupt-a",
+        "lease-corrupt",
+        None,
+        SupervisionLeaseOperation::Commit,
+        supervision_binding(LeaseState::Active, 100)?,
+    )?)?;
+    store.commit_supervision_lease(
+        &active_stage.ticket,
+        &verified_supervision_stage(&active_stage)?,
+    )?;
+    let renew_stage = store.prepare_supervision_lease(supervision_request(
+        "ticket-corrupt-b",
+        "operation-corrupt-b",
+        "lease-corrupt",
+        Some(1),
+        SupervisionLeaseOperation::Renew,
+        supervision_binding(LeaseState::Active, 200)?,
+    )?)?;
+    let renew_verified = verified_supervision_stage(&renew_stage)?;
+    drop(store);
+
+    let database = redb::Database::create(&path)?;
+    let write = database.begin_write()?;
+    {
+        let definition: redb::TableDefinition<&str, &str> =
+            redb::TableDefinition::new("ors_supervision_lease_current_v1");
+        let mut table = write.open_table(definition)?;
+        let value = table
+            .get("lease-corrupt")?
+            .ok_or("missing current supervision lease")?;
+        let mut invalid: Value = serde_json::from_str(value.value())?;
+        drop(value);
+        invalid["receipt"]["receipt_sha256"] = json!("00".repeat(32));
+        let encoded = serde_json::to_string(&invalid)?;
+        table.insert("lease-corrupt", encoded.as_str())?;
+    }
+    write.commit()?;
+    drop(database);
+
+    let reopened = RedbRecoveryStore::open(&path)?;
+    assert!(matches!(
+        reopened.commit_supervision_lease(&renew_stage.ticket, &renew_verified),
+        Err(OrsError::IntegrityProblem {
+            record_type: "supervision_lease_current",
+            ..
+        })
+    ));
+    assert!(
+        reopened
+            .reconcile_staged_supervision_lease(&label("lease-corrupt")?)?
+            .is_some()
+    );
+    assert_eq!(
+        reopened
+            .load_supervision_lease_history(&label("lease-corrupt")?, 8)?
+            .len(),
+        1
+    );
+    drop(reopened);
+    cleanup(&path);
+    Ok(())
+}
+
+#[test]
+fn supervision_lease_conflicting_stage_is_rejected_and_exact_stage_is_idempotent() -> TestResult {
+    let path = database_path("supervision-stage-conflict");
+    let store = RedbRecoveryStore::open(&path)?;
+    let request = supervision_request(
+        "ticket-5a",
+        "operation-5a",
+        "lease-5",
+        None,
+        SupervisionLeaseOperation::Commit,
+        supervision_binding(LeaseState::Active, 100)?,
+    )?;
+    let first = store.prepare_supervision_lease(request.clone())?;
+    let replay = store.prepare_supervision_lease(request)?;
+    assert_eq!(first, replay);
+    assert!(matches!(
+        store.prepare_supervision_lease(supervision_request(
+            "ticket-5b",
+            "operation-5b",
+            "lease-5",
+            None,
+            SupervisionLeaseOperation::Commit,
+            supervision_binding(LeaseState::Active, 101)?,
+        )?),
+        Err(OrsError::SupervisionLeaseTicketConflict)
+    ));
+    drop(store);
     cleanup(&path);
     Ok(())
 }

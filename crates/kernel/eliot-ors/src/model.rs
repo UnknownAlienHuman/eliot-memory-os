@@ -1,8 +1,14 @@
 use std::collections::BTreeSet;
 
+use eliot_contracts::{AuthorityEpoch, ResourceGeneration, StateFence, canonical_json_bytes};
 use eliot_platform::{PlatformHandle, SecretReference};
 use eliot_receipts::ReceiptEnvelope;
-use eliot_runtime_contracts::GenerationCutoverRecord as RuntimeGenerationCutoverRecord;
+use eliot_runtime_contracts::{
+    GenerationCutoverRecord as RuntimeGenerationCutoverRecord, LeaseState, SignedSupervisionLease,
+    SupervisionGenerationBinding, SupervisionLease, SupervisionLeaseTerminalDisposition,
+    SupervisionObservationScope, SupervisionOrsMirrorBinding, VerifiedSupervisionLease,
+    VerifiedSupervisionLeaseTerminalTransition,
+};
 use eliot_security_contracts::PrivacyClass;
 use schemars::JsonSchema;
 use serde::{Deserialize, Deserializer, Serialize, de};
@@ -49,6 +55,639 @@ pub type OrderingScope = OpaqueLabel;
 pub type RecoveryOwner = OpaqueLabel;
 /// Operation/checkpoint identity preserved without creating an authority owner.
 pub type OperationIdentity = OpaqueLabel;
+
+/// Operation reserved by ORS for one authenticated supervision-lease revision.
+///
+/// The operation is deliberately separate from the lifecycle state.  ORS
+/// decides which transitions are legal; the Kernel supplies the signed
+/// envelope only after the ticket has been durably reserved.
+#[derive(Clone, Copy, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum SupervisionLeaseOperation {
+    /// Create the first active revision for a lease.
+    Commit,
+    /// Replace an active/expiring revision with a fresh active revision.
+    Renew,
+    /// Fence a revision by an explicit revocation.
+    Revoke,
+    /// Record that the revision reached its expiry boundary.
+    Expire,
+    /// Fence the revision because a newer activation superseded it.
+    Supersede,
+    /// Close an expiring or reconciling revision.
+    Close,
+}
+
+impl SupervisionLeaseOperation {
+    /// Returns the only target lifecycle state admitted for this operation.
+    pub const fn target_state(self) -> LeaseState {
+        match self {
+            Self::Commit | Self::Renew => LeaseState::Active,
+            Self::Revoke => LeaseState::Revoked,
+            Self::Expire => LeaseState::Expired,
+            Self::Supersede => LeaseState::Superseded,
+            Self::Close => LeaseState::Closed,
+        }
+    }
+
+    /// Checks the operation against an existing ORS lifecycle state.
+    pub const fn allowed_from(self, prior: Option<LeaseState>) -> bool {
+        matches!(
+            (self, prior),
+            (Self::Commit, None)
+                | (Self::Renew, Some(LeaseState::Active | LeaseState::Expiring))
+                | (
+                    Self::Revoke,
+                    Some(
+                        LeaseState::Requested
+                            | LeaseState::Active
+                            | LeaseState::Expiring
+                            | LeaseState::Reconciling,
+                    ),
+                )
+                | (
+                    Self::Expire,
+                    Some(LeaseState::Active | LeaseState::Expiring | LeaseState::Reconciling),
+                )
+                | (Self::Supersede, Some(LeaseState::Active))
+                | (
+                    Self::Close,
+                    Some(LeaseState::Expiring | LeaseState::Reconciling)
+                )
+        )
+    }
+}
+
+/// Active/terminal projection of a committed ORS supervision-lease revision.
+#[derive(Clone, Copy, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum SupervisionLeaseProjection {
+    /// A ticket has been reserved, but no signed envelope has committed it.
+    Staged,
+    /// The committed revision is the currently admitted revision.
+    Active,
+    /// The committed revision is fenced and cannot be resurrected.
+    Terminal,
+}
+
+impl SupervisionLeaseProjection {
+    pub const fn for_state(state: LeaseState) -> Self {
+        match state {
+            LeaseState::Active => Self::Active,
+            LeaseState::Requested
+            | LeaseState::Expiring
+            | LeaseState::Released
+            | LeaseState::Expired
+            | LeaseState::Revoked
+            | LeaseState::Superseded
+            | LeaseState::Reconciling
+            | LeaseState::Closed => Self::Terminal,
+        }
+    }
+}
+
+/// The non-secret identity and state fence ORS reserves before signing.
+///
+/// This is intentionally a value object rather than a second signed-envelope
+/// contract.  `to_payload` materializes the existing
+/// [`eliot_runtime_contracts::SupervisionLease`] after ORS assigns the
+/// revision and the reserved receipt/ticket digest.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SupervisionLeaseBinding {
+    pub scope_ref: OpaqueLabel,
+    pub observation_scope: SupervisionObservationScope,
+    pub installation_id: OpaqueLabel,
+    pub host_epoch: AuthorityEpoch,
+    pub activation_id: OpaqueLabel,
+    pub activation_generation: ResourceGeneration,
+    pub kernel_epoch: AuthorityEpoch,
+    pub watchdog_epoch: AuthorityEpoch,
+    pub generation_binding: SupervisionGenerationBinding,
+    pub state_fence: StateFence,
+    pub issued_at_ms: u64,
+    pub expires_at_ms: u64,
+    pub renew_before_ms: u64,
+    pub wake_policy: eliot_runtime_contracts::RegisteredActivityWakePolicy,
+    pub state: LeaseState,
+    pub terminal_disposition: Option<SupervisionLeaseTerminalDisposition>,
+    pub revocation_reason: Option<String>,
+    pub revocation_id: Option<String>,
+    pub revocation_epoch: Option<AuthorityEpoch>,
+}
+
+impl SupervisionLeaseBinding {
+    pub(crate) fn same_lineage_as(&self, successor: &Self) -> bool {
+        self.scope_ref == successor.scope_ref
+            && self.observation_scope == successor.observation_scope
+            && self.installation_id == successor.installation_id
+            && self.host_epoch == successor.host_epoch
+            && self.activation_id == successor.activation_id
+            && self.activation_generation == successor.activation_generation
+            && self.kernel_epoch == successor.kernel_epoch
+            && self.watchdog_epoch == successor.watchdog_epoch
+            && self.generation_binding == successor.generation_binding
+            && self.state_fence == successor.state_fence
+            && self.wake_policy == successor.wake_policy
+    }
+
+    fn to_payload(
+        &self,
+        lease_id: &OperationIdentity,
+        record_id: &OperationIdentity,
+        revision: u64,
+        ticket_sha256: &str,
+        previous_receipt_sha256: Option<String>,
+    ) -> Result<SupervisionLease, OrsError> {
+        let payload = SupervisionLease {
+            schema: eliot_runtime_contracts::SUPERVISION_LEASE_SCHEMA.to_owned(),
+            contract_name: eliot_runtime_contracts::SUPERVISION_LEASE_CONTRACT_NAME.to_owned(),
+            contract_version: eliot_runtime_contracts::SUPERVISION_LEASE_CONTRACT_VERSION,
+            lease_id: lease_id.as_str().to_owned(),
+            scope_ref: self.scope_ref.as_str().to_owned(),
+            observation_scope: self.observation_scope.clone(),
+            installation_id: self.installation_id.as_str().to_owned(),
+            host_epoch: self.host_epoch,
+            activation_id: self.activation_id.as_str().to_owned(),
+            activation_generation: self.activation_generation,
+            kernel_epoch: self.kernel_epoch,
+            watchdog_epoch: self.watchdog_epoch,
+            generation_binding: self.generation_binding.clone(),
+            state_fence: self.state_fence.clone(),
+            ors_mirror: SupervisionOrsMirrorBinding {
+                record_id: record_id.as_str().to_owned(),
+                subject_lease_id: lease_id.as_str().to_owned(),
+                lease_revision: revision,
+                // The signed payload binds the reservation which existed
+                // before the signature, avoiding a cycle through the final
+                // envelope and receipt digests.
+                ticket_sha256: ticket_sha256.to_owned(),
+                previous_receipt_sha256,
+            },
+            issued_at_ms: self.issued_at_ms,
+            expires_at_ms: self.expires_at_ms,
+            renew_before_ms: self.renew_before_ms,
+            wake_policy: self.wake_policy.clone(),
+            state: self.state,
+            terminal_disposition: self.terminal_disposition,
+            revocation_reason: self.revocation_reason.clone(),
+            revocation_id: self.revocation_id.clone(),
+            revocation_epoch: self.revocation_epoch,
+        };
+        payload
+            .validate()
+            .map_err(|error| OrsError::Contract(error.to_string()))?;
+        Ok(payload)
+    }
+}
+
+/// Caller request for a one-time ORS lease ticket.  No revision or operation
+/// order is accepted from the caller; both are assigned in the ORS write.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SupervisionLeasePrepareRequest {
+    pub ticket_id: OperationIdentity,
+    pub operation_id: OperationIdentity,
+    pub lease_id: OperationIdentity,
+    pub expected_revision: Option<u64>,
+    pub operation: SupervisionLeaseOperation,
+    pub binding: SupervisionLeaseBinding,
+}
+
+impl SupervisionLeasePrepareRequest {
+    pub(crate) fn validate(&self) -> Result<(), OrsError> {
+        validate_text(self.ticket_id.as_str(), "supervision_ticket_id")?;
+        validate_text(self.operation_id.as_str(), "supervision_operation_id")?;
+        validate_text(self.lease_id.as_str(), "supervision_lease_id")?;
+        if self.expected_revision.is_some_and(|revision| revision == 0) {
+            return Err(OrsError::InvalidField {
+                field: "supervision_expected_revision",
+                reason: "must be absent or greater than zero",
+            });
+        }
+        if self.binding.state != self.operation.target_state() {
+            return Err(OrsError::InvalidField {
+                field: "supervision_binding.state",
+                reason: "does not match the operation target state",
+            });
+        }
+        self.binding
+            .state_fence
+            .validate()
+            .map_err(|error| OrsError::Contract(error.to_string()))?;
+        Ok(())
+    }
+}
+
+/// Immutable ORS reservation.  Its canonical digest is the value the
+/// Kernel must place in `SupervisionOrsMirrorBinding.ticket_sha256`.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SupervisionLeaseCommitTicket {
+    pub ticket_id: OperationIdentity,
+    pub operation_id: OperationIdentity,
+    pub lease_id: OperationIdentity,
+    pub record_id: OperationIdentity,
+    pub expected_revision: Option<u64>,
+    pub revision: u64,
+    pub operation: SupervisionLeaseOperation,
+    pub binding: SupervisionLeaseBinding,
+    pub previous_receipt_sha256: Option<String>,
+    pub reservation_order: u64,
+}
+
+impl SupervisionLeaseCommitTicket {
+    fn validate_basic(&self) -> Result<(), OrsError> {
+        validate_text(self.ticket_id.as_str(), "supervision_ticket_id")?;
+        validate_text(self.operation_id.as_str(), "supervision_operation_id")?;
+        validate_text(self.lease_id.as_str(), "supervision_lease_id")?;
+        validate_text(self.record_id.as_str(), "supervision_record_id")?;
+        if self.revision == 0 || self.reservation_order == 0 {
+            return Err(OrsError::InvalidField {
+                field: "supervision_ticket_sequence",
+                reason: "revision and reservation order must be greater than zero",
+            });
+        }
+        if self.revision
+            != self
+                .expected_revision
+                .unwrap_or(0)
+                .checked_add(1)
+                .ok_or_else(|| OrsError::IntegrityProblem {
+                    record_type: "supervision_lease_ticket",
+                    reason: "revision counter exhausted".to_owned(),
+                })?
+        {
+            return Err(OrsError::SupervisionLeaseStaleRevision);
+        }
+        if self.expected_revision.is_some() != self.previous_receipt_sha256.is_some() {
+            return Err(OrsError::IntegrityProblem {
+                record_type: "supervision_lease_ticket",
+                reason: "only successor tickets must carry a predecessor receipt digest".to_owned(),
+            });
+        }
+        if let Some(previous) = &self.previous_receipt_sha256 {
+            validate_digest(previous, "supervision_previous_receipt_sha256")?;
+        }
+        if self.binding.state != self.operation.target_state() {
+            return Err(OrsError::InvalidField {
+                field: "supervision_binding.state",
+                reason: "does not match the operation target state",
+            });
+        }
+        self.binding
+            .state_fence
+            .validate()
+            .map_err(|error| OrsError::Contract(error.to_string()))?;
+        Ok(())
+    }
+
+    /// Computes the canonical digest before a signature exists.
+    pub fn ticket_sha256(&self) -> Result<String, OrsError> {
+        self.validate_basic()?;
+        let bytes =
+            canonical_json_bytes(self).map_err(|error| OrsError::Encoding(error.to_string()))?;
+        Ok(sha256_hex(&bytes))
+    }
+
+    /// Materializes the exact payload that the Kernel must sign.
+    pub fn expected_payload(&self) -> Result<SupervisionLease, OrsError> {
+        let ticket_sha256 = self.ticket_sha256()?;
+        self.binding.to_payload(
+            &self.lease_id,
+            &self.record_id,
+            self.revision,
+            &ticket_sha256,
+            self.previous_receipt_sha256.clone(),
+        )
+    }
+
+    pub(crate) fn validate(&self) -> Result<(), OrsError> {
+        self.expected_payload()?;
+        Ok(())
+    }
+}
+
+/// Durable stage projection returned before the Kernel signs.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SupervisionLeaseStageReceipt {
+    pub ticket: SupervisionLeaseCommitTicket,
+    pub ticket_sha256: String,
+    pub projection: SupervisionLeaseProjection,
+}
+
+impl SupervisionLeaseStageReceipt {
+    pub fn ticket(&self) -> &SupervisionLeaseCommitTicket {
+        &self.ticket
+    }
+
+    pub fn ticket_sha256(&self) -> &str {
+        &self.ticket_sha256
+    }
+
+    pub(crate) fn validate(&self) -> Result<(), OrsError> {
+        let expected = self.ticket.ticket_sha256()?;
+        if self.ticket_sha256 != expected || self.projection != SupervisionLeaseProjection::Staged {
+            return Err(OrsError::PayloadIntegrityMismatch);
+        }
+        Ok(())
+    }
+}
+
+pub(crate) fn signed_supervision_lease_from_verified(
+    verified: &VerifiedSupervisionLease,
+) -> Result<SignedSupervisionLease, OrsError> {
+    let envelope = SignedSupervisionLease {
+        payload: verified.payload().clone(),
+        payload_sha256: verified
+            .payload_digest()
+            .map_err(|error| OrsError::Contract(error.to_string()))?,
+        signer_id: verified.signer_id().to_owned(),
+        key_id: verified.key_id().to_owned(),
+        algorithm: verified.algorithm().to_owned(),
+        signature: verified.signature().to_owned(),
+    };
+    envelope
+        .validate()
+        .map_err(|error| OrsError::Contract(error.to_string()))?;
+    let envelope_digest = envelope
+        .envelope_digest()
+        .map_err(|error| OrsError::Contract(error.to_string()))?;
+    if envelope_digest != verified.envelope_digest() {
+        return Err(OrsError::SupervisionLeaseBindingMismatch);
+    }
+    Ok(envelope)
+}
+
+pub(crate) fn signed_terminal_supervision_lease_from_verified(
+    verified: &VerifiedSupervisionLeaseTerminalTransition,
+) -> Result<SignedSupervisionLease, OrsError> {
+    let envelope = verified.envelope().clone();
+    envelope
+        .validate()
+        .map_err(|error| OrsError::Contract(error.to_string()))?;
+    Ok(envelope)
+}
+
+/// Canonical receipt issued at the ORS commit linearization point.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SupervisionLeaseReceipt {
+    pub ticket_id: OperationIdentity,
+    pub operation_id: OperationIdentity,
+    pub record_id: OperationIdentity,
+    pub lease_id: OperationIdentity,
+    pub revision: u64,
+    pub operation: SupervisionLeaseOperation,
+    pub state: LeaseState,
+    pub projection: SupervisionLeaseProjection,
+    pub operation_order: u64,
+    pub ticket_sha256: String,
+    pub artifact_sha256: String,
+    pub previous_receipt_sha256: Option<String>,
+    pub receipt_sha256: String,
+}
+
+#[derive(Serialize)]
+struct SupervisionLeaseReceiptCore<'a> {
+    ticket_id: &'a OperationIdentity,
+    operation_id: &'a OperationIdentity,
+    record_id: &'a OperationIdentity,
+    lease_id: &'a OperationIdentity,
+    revision: u64,
+    operation: SupervisionLeaseOperation,
+    state: LeaseState,
+    projection: SupervisionLeaseProjection,
+    operation_order: u64,
+    ticket_sha256: &'a str,
+    artifact_sha256: &'a str,
+    previous_receipt_sha256: Option<&'a str>,
+}
+
+pub(crate) struct SupervisionLeaseReceiptInput {
+    pub(crate) ticket_id: OperationIdentity,
+    pub(crate) operation_id: OperationIdentity,
+    pub(crate) record_id: OperationIdentity,
+    pub(crate) lease_id: OperationIdentity,
+    pub(crate) revision: u64,
+    pub(crate) operation: SupervisionLeaseOperation,
+    pub(crate) state: LeaseState,
+    pub(crate) operation_order: u64,
+    pub(crate) ticket_sha256: String,
+    pub(crate) artifact_sha256: String,
+    pub(crate) previous_receipt_sha256: Option<String>,
+}
+
+impl SupervisionLeaseReceipt {
+    fn core(&self) -> SupervisionLeaseReceiptCore<'_> {
+        SupervisionLeaseReceiptCore {
+            ticket_id: &self.ticket_id,
+            operation_id: &self.operation_id,
+            record_id: &self.record_id,
+            lease_id: &self.lease_id,
+            revision: self.revision,
+            operation: self.operation,
+            state: self.state,
+            projection: self.projection,
+            operation_order: self.operation_order,
+            ticket_sha256: &self.ticket_sha256,
+            artifact_sha256: &self.artifact_sha256,
+            previous_receipt_sha256: self.previous_receipt_sha256.as_deref(),
+        }
+    }
+
+    pub(crate) fn issue(input: SupervisionLeaseReceiptInput) -> Result<Self, OrsError> {
+        if input.operation_order == 0 || input.revision == 0 {
+            return Err(OrsError::InvalidField {
+                field: "supervision_receipt_sequence",
+                reason: "revision and operation order must be greater than zero",
+            });
+        }
+        validate_digest(&input.ticket_sha256, "supervision_ticket_sha256")?;
+        validate_digest(&input.artifact_sha256, "supervision_artifact_sha256")?;
+        if let Some(previous) = &input.previous_receipt_sha256 {
+            validate_digest(previous, "supervision_previous_receipt_sha256")?;
+        }
+        if (input.revision == 1) != input.previous_receipt_sha256.is_none() {
+            return Err(OrsError::IntegrityProblem {
+                record_type: "supervision_lease_receipt",
+                reason: "only successor receipts must bind a predecessor receipt".to_owned(),
+            });
+        }
+        let projection = SupervisionLeaseProjection::for_state(input.state);
+        let mut receipt = Self {
+            ticket_id: input.ticket_id,
+            operation_id: input.operation_id,
+            record_id: input.record_id,
+            lease_id: input.lease_id,
+            revision: input.revision,
+            operation: input.operation,
+            state: input.state,
+            projection,
+            operation_order: input.operation_order,
+            ticket_sha256: input.ticket_sha256,
+            artifact_sha256: input.artifact_sha256,
+            previous_receipt_sha256: input.previous_receipt_sha256,
+            receipt_sha256: String::new(),
+        };
+        let bytes = canonical_json_bytes(&receipt.core())
+            .map_err(|error| OrsError::Encoding(error.to_string()))?;
+        receipt.receipt_sha256 = sha256_hex(&bytes);
+        Ok(receipt)
+    }
+
+    pub(crate) fn validate(&self) -> Result<(), OrsError> {
+        validate_text(self.ticket_id.as_str(), "supervision_receipt_ticket_id")?;
+        validate_text(
+            self.operation_id.as_str(),
+            "supervision_receipt_operation_id",
+        )?;
+        validate_text(self.record_id.as_str(), "supervision_receipt_record_id")?;
+        validate_text(self.lease_id.as_str(), "supervision_receipt_lease_id")?;
+        if self.revision == 0 || self.operation_order == 0 {
+            return Err(OrsError::InvalidField {
+                field: "supervision_receipt_sequence",
+                reason: "revision and operation order must be greater than zero",
+            });
+        }
+        validate_digest(&self.ticket_sha256, "supervision_ticket_sha256")?;
+        validate_digest(&self.artifact_sha256, "supervision_artifact_sha256")?;
+        validate_digest(&self.receipt_sha256, "supervision_receipt_sha256")?;
+        if let Some(previous) = &self.previous_receipt_sha256 {
+            validate_digest(previous, "supervision_previous_receipt_sha256")?;
+        }
+        if (self.revision == 1) != self.previous_receipt_sha256.is_none() {
+            return Err(OrsError::IntegrityProblem {
+                record_type: "supervision_lease_receipt",
+                reason: "only successor receipts must bind a predecessor receipt".to_owned(),
+            });
+        }
+        if self.projection != SupervisionLeaseProjection::for_state(self.state) {
+            return Err(OrsError::IntegrityProblem {
+                record_type: "supervision_lease_receipt",
+                reason: "projection does not match lifecycle state".to_owned(),
+            });
+        }
+        let bytes = canonical_json_bytes(&self.core())
+            .map_err(|error| OrsError::Encoding(error.to_string()))?;
+        if sha256_hex(&bytes) != self.receipt_sha256 {
+            return Err(OrsError::PayloadIntegrityMismatch);
+        }
+        Ok(())
+    }
+}
+
+/// Authoritative current/history projection returned after a commit.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SupervisionLeaseRecord {
+    pub ticket_id: OperationIdentity,
+    pub operation_id: OperationIdentity,
+    pub record_id: OperationIdentity,
+    pub lease_id: OperationIdentity,
+    pub revision: u64,
+    pub operation: SupervisionLeaseOperation,
+    pub state: LeaseState,
+    pub projection: SupervisionLeaseProjection,
+    pub binding: SupervisionLeaseBinding,
+    pub previous_receipt_sha256: Option<String>,
+    pub ticket_sha256: String,
+    pub operation_order: u64,
+    pub artifact: SignedSupervisionLease,
+    pub receipt_sha256: String,
+}
+
+impl SupervisionLeaseRecord {
+    fn validate(&self, receipt: &SupervisionLeaseReceipt) -> Result<(), OrsError> {
+        validate_text(self.ticket_id.as_str(), "supervision_ticket_id")?;
+        validate_text(self.operation_id.as_str(), "supervision_operation_id")?;
+        validate_text(self.record_id.as_str(), "supervision_record_id")?;
+        validate_text(self.lease_id.as_str(), "supervision_lease_id")?;
+        if self.revision == 0 || self.operation_order == 0 {
+            return Err(OrsError::InvalidField {
+                field: "supervision_record_sequence",
+                reason: "revision and operation order must be greater than zero",
+            });
+        }
+        validate_digest(&self.ticket_sha256, "supervision_ticket_sha256")?;
+        if let Some(previous) = &self.previous_receipt_sha256 {
+            validate_digest(previous, "supervision_previous_receipt_sha256")?;
+        }
+        if (self.revision == 1) != self.previous_receipt_sha256.is_none() {
+            return Err(OrsError::IntegrityProblem {
+                record_type: "supervision_lease_record",
+                reason: "only successor records must bind a predecessor receipt".to_owned(),
+            });
+        }
+        self.binding
+            .state_fence
+            .validate()
+            .map_err(|error| OrsError::Contract(error.to_string()))?;
+        if self.state != self.binding.state
+            || self.projection != SupervisionLeaseProjection::for_state(self.state)
+        {
+            return Err(OrsError::IntegrityProblem {
+                record_type: "supervision_lease_record",
+                reason: "state or projection does not match the binding".to_owned(),
+            });
+        }
+        let expected = self.binding.to_payload(
+            &self.lease_id,
+            &self.record_id,
+            self.revision,
+            &self.ticket_sha256,
+            self.previous_receipt_sha256.clone(),
+        )?;
+        if self.artifact.payload != expected {
+            return Err(OrsError::SupervisionLeaseBindingMismatch);
+        }
+        let artifact_digest = self
+            .artifact
+            .envelope_digest()
+            .map_err(|error| OrsError::Contract(error.to_string()))?;
+        receipt.validate()?;
+        if receipt.ticket_id != self.ticket_id
+            || receipt.operation_id != self.operation_id
+            || receipt.record_id != self.record_id
+            || receipt.lease_id != self.lease_id
+            || receipt.revision != self.revision
+            || receipt.operation != self.operation
+            || receipt.state != self.state
+            || receipt.projection != self.projection
+            || receipt.operation_order != self.operation_order
+            || receipt.ticket_sha256 != self.ticket_sha256
+            || receipt.artifact_sha256 != artifact_digest
+            || receipt.previous_receipt_sha256 != self.previous_receipt_sha256
+            || receipt.receipt_sha256 != self.receipt_sha256
+        {
+            return Err(OrsError::SupervisionLeaseBindingMismatch);
+        }
+        Ok(())
+    }
+}
+
+/// Paired current/history record and its canonical receipt.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SupervisionLeaseSnapshot {
+    pub record: SupervisionLeaseRecord,
+    pub receipt: SupervisionLeaseReceipt,
+}
+
+impl SupervisionLeaseSnapshot {
+    pub(crate) fn validate(&self) -> Result<(), OrsError> {
+        self.record.validate(&self.receipt)
+    }
+
+    pub fn record(&self) -> &SupervisionLeaseRecord {
+        &self.record
+    }
+
+    pub fn receipt(&self) -> &SupervisionLeaseReceipt {
+        &self.receipt
+    }
+}
 
 /// Durable one-shot process-start replay state.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
@@ -1452,6 +2091,16 @@ pub enum OrsError {
     AuthoritySnapshotUnavailable,
     #[error("operational projection exceeds its declared bound")]
     ProjectionLimitExceeded,
+    #[error("supervision-lease revision is stale or does not match the current ORS head")]
+    SupervisionLeaseStaleRevision,
+    #[error("supervision-lease ticket or commit artifact conflicts with durable ORS state")]
+    SupervisionLeaseTicketConflict,
+    #[error("supervision-lease commit artifact does not bind the staged ticket exactly")]
+    SupervisionLeaseBindingMismatch,
+    #[error("supervision-lease ticket is neither staged nor durably committed")]
+    SupervisionLeaseTicketNotStaged,
+    #[error("supervision-lease history limit must be between 1 and {MAX_RECOVERY_PAGE}")]
+    InvalidSupervisionLeaseHistoryLimit,
     #[error("durable ORS integrity problem in {record_type}: {reason}")]
     IntegrityProblem {
         record_type: &'static str,

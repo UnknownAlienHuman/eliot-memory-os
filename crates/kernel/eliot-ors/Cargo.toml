@@ -17,6 +17,7 @@ source_layer = "P"
 proof_entrypoint = "cargo test -p eliot-ors"
 
 [dependencies]
+eliot-contracts.workspace = true
 eliot-platform.workspace = true
 eliot-process.workspace = true
 eliot-receipts.workspace = true

@@ -6,7 +6,8 @@ use eliot_platform::PlatformHandle;
 use eliot_receipts::{ReceiptDispositionKind, ReceiptEnvelope};
 use eliot_runtime_contracts::{
     GenerationCutoverRecord as RuntimeGenerationCutoverRecord, GenerationCutoverState,
-    HealthDimension, OperationalRecoveryState,
+    HealthDimension, OperationalRecoveryState, SignedSupervisionLease, VerifiedSupervisionLease,
+    VerifiedSupervisionLeaseTerminalTransition,
 };
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -30,7 +31,11 @@ use crate::{
     RecoveryPayload, RecoveryPayloadEnvelope, ReservationRecord, ReservationRequest,
     ReservationState, ReservedScope, RetryState, ScopeTerminalReceipt, ScopeTerminalView,
     SessionBindingReceipt, SessionDetach, StageReceipt, StagedOperation, StateFenceSnapshot,
-    UserBrokerFence, UserBrokerRegistration, UserBrokerRegistrationReceipt, WriterReservationToken,
+    SupervisionLeaseCommitTicket, SupervisionLeasePrepareRequest, SupervisionLeaseProjection,
+    SupervisionLeaseReceipt, SupervisionLeaseReceiptInput, SupervisionLeaseRecord,
+    SupervisionLeaseSnapshot, SupervisionLeaseStageReceipt, UserBrokerFence,
+    UserBrokerRegistration, UserBrokerRegistrationReceipt, WriterReservationToken,
+    signed_supervision_lease_from_verified, signed_terminal_supervision_lease_from_verified,
 };
 
 const META: TableDefinition<&str, &str> = TableDefinition::new("ors_meta_v1");
@@ -54,6 +59,14 @@ const AUTHORITY_HANDOFFS: TableDefinition<&str, &str> =
     TableDefinition::new("ors_authority_handoffs_v1");
 const PROCESS_EVIDENCE: TableDefinition<&str, &str> =
     TableDefinition::new("ors_process_evidence_v1");
+const SUPERVISION_LEASE_STAGED: TableDefinition<&str, &str> =
+    TableDefinition::new("ors_supervision_lease_staged_v1");
+const SUPERVISION_LEASE_CURRENT: TableDefinition<&str, &str> =
+    TableDefinition::new("ors_supervision_lease_current_v1");
+const SUPERVISION_LEASE_HISTORY: TableDefinition<&str, &str> =
+    TableDefinition::new("ors_supervision_lease_history_v1");
+const SUPERVISION_LEASE_RESULTS: TableDefinition<&str, &str> =
+    TableDefinition::new("ors_supervision_lease_results_v1");
 const NEXT_GLOBAL_ORDER: &str = "next_global_order";
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -182,6 +195,14 @@ struct DurableInboxRecord {
     operation_order: u64,
     terminal_receipt_id: Option<OpaqueLabel>,
     terminal_receipt_sha256: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DurableSupervisionLeaseResult {
+    ticket: SupervisionLeaseCommitTicket,
+    artifact: SignedSupervisionLease,
+    snapshot: SupervisionLeaseSnapshot,
 }
 
 /// Durable operational store boundary. Implementations must preserve atomic method semantics.
@@ -777,6 +798,545 @@ impl RedbRecoveryStore {
         Ok(records)
     }
 
+    /// Reserves one supervision-lease revision and its canonical receipt
+    /// preimage.  This method never accepts a caller-supplied revision or
+    /// operation order and never publishes an authoritative lease.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one ORS write transaction reserves the revision, receipt preimage and staged row"
+    )]
+    pub fn prepare_supervision_lease(
+        &self,
+        request: SupervisionLeasePrepareRequest,
+    ) -> Result<SupervisionLeaseStageReceipt, OrsError> {
+        request.validate()?;
+        let write = self.database.begin_write().map_err(storage)?;
+        let existing_stage = {
+            let staged = write
+                .open_table(SUPERVISION_LEASE_STAGED)
+                .map_err(storage)?;
+            staged
+                .get(request.lease_id.as_str())
+                .map_err(storage)?
+                .map(|value| {
+                    decode_named::<SupervisionLeaseStageReceipt>(
+                        value.value(),
+                        "supervision_lease_staged",
+                    )
+                })
+                .transpose()?
+        };
+        if let Some(stage) = existing_stage {
+            stage.validate()?;
+            let same_request = stage.ticket.ticket_id == request.ticket_id
+                && stage.ticket.operation_id == request.operation_id
+                && stage.ticket.lease_id == request.lease_id
+                && stage.ticket.expected_revision == request.expected_revision
+                && stage.ticket.operation == request.operation
+                && stage.ticket.binding == request.binding;
+            if !same_request {
+                return Err(OrsError::SupervisionLeaseTicketConflict);
+            }
+            write.commit().map_err(storage)?;
+            return Ok(stage);
+        }
+
+        let current = {
+            let table = write
+                .open_table(SUPERVISION_LEASE_CURRENT)
+                .map_err(storage)?;
+            table
+                .get(request.lease_id.as_str())
+                .map_err(storage)?
+                .map(|value| {
+                    let snapshot: SupervisionLeaseSnapshot =
+                        decode_named(value.value(), "supervision_lease_current")?;
+                    snapshot.validate()?;
+                    if snapshot.record.lease_id != request.lease_id {
+                        return Err(OrsError::IntegrityProblem {
+                            record_type: "supervision_lease_current",
+                            reason: "current key does not match lease identity".to_owned(),
+                        });
+                    }
+                    Ok(snapshot)
+                })
+                .transpose()?
+        };
+        let prior_state = current.as_ref().map(|snapshot| snapshot.record.state);
+        match (current.as_ref(), request.expected_revision) {
+            (None, None) => {}
+            (Some(snapshot), Some(expected)) if snapshot.record.revision == expected => {}
+            _ => return Err(OrsError::SupervisionLeaseStaleRevision),
+        }
+        if !request.operation.allowed_from(prior_state) {
+            return Err(OrsError::InvalidTransition);
+        }
+        if current
+            .as_ref()
+            .is_some_and(|snapshot| !snapshot.record.binding.same_lineage_as(&request.binding))
+        {
+            return Err(OrsError::SupervisionLeaseBindingMismatch);
+        }
+        let revision = request
+            .expected_revision
+            .unwrap_or(0)
+            .checked_add(1)
+            .ok_or_else(|| OrsError::IntegrityProblem {
+                record_type: "supervision_lease_ticket",
+                reason: "revision counter exhausted".to_owned(),
+            })?;
+        let record_id = crate::OperationIdentity::new(format!(
+            "{}::r{:020}",
+            request.lease_id.as_str(),
+            revision
+        ))?;
+        let previous_receipt_sha256 = current
+            .as_ref()
+            .map(|snapshot| snapshot.receipt.receipt_sha256.clone());
+        let ticket = SupervisionLeaseCommitTicket {
+            ticket_id: request.ticket_id,
+            operation_id: request.operation_id,
+            lease_id: request.lease_id,
+            record_id,
+            expected_revision: request.expected_revision,
+            revision,
+            operation: request.operation,
+            binding: request.binding,
+            previous_receipt_sha256,
+            reservation_order: Self::next_operational_order(&write)?,
+        };
+        ticket.validate()?;
+        let ticket_sha256 = ticket.ticket_sha256()?;
+        let stage = SupervisionLeaseStageReceipt {
+            ticket,
+            ticket_sha256,
+            projection: SupervisionLeaseProjection::Staged,
+        };
+        stage.validate()?;
+        {
+            let mut staged = write
+                .open_table(SUPERVISION_LEASE_STAGED)
+                .map_err(storage)?;
+            let encoded = encode(&stage)?;
+            staged
+                .insert(stage.ticket.lease_id.as_str(), encoded.as_str())
+                .map_err(storage)?;
+        }
+        write.commit().map_err(storage)?;
+        Ok(stage)
+    }
+
+    /// Commits an active revision using the existing active/time-valid
+    /// trust-anchor verification boundary.
+    pub fn commit_supervision_lease(
+        &self,
+        ticket: &SupervisionLeaseCommitTicket,
+        verified: &VerifiedSupervisionLease,
+    ) -> Result<SupervisionLeaseSnapshot, OrsError> {
+        if !matches!(
+            ticket.operation,
+            crate::SupervisionLeaseOperation::Commit | crate::SupervisionLeaseOperation::Renew
+        ) {
+            return Err(OrsError::InvalidTransition);
+        }
+        let artifact = signed_supervision_lease_from_verified(verified)?;
+        self.commit_supervision_lease_artifact(ticket, artifact, None)
+    }
+
+    /// Commits a terminal revision only from a sealed transition token whose
+    /// active predecessor is compared with the current durable ORS snapshot.
+    pub fn commit_terminal_supervision_lease(
+        &self,
+        ticket: &SupervisionLeaseCommitTicket,
+        verified: &VerifiedSupervisionLeaseTerminalTransition,
+    ) -> Result<SupervisionLeaseSnapshot, OrsError> {
+        if matches!(
+            ticket.operation,
+            crate::SupervisionLeaseOperation::Commit | crate::SupervisionLeaseOperation::Renew
+        ) {
+            return Err(OrsError::InvalidTransition);
+        }
+        let artifact = signed_terminal_supervision_lease_from_verified(verified)?;
+        self.commit_supervision_lease_artifact(ticket, artifact, Some(verified))
+    }
+
+    /// The current revision, history row, replay row and stage removal are one
+    /// local redb transaction.  Therefore absence of both a staged ticket and
+    /// its durable replay result is authoritative absence, not an unknown
+    /// commit outcome.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one ORS write transaction atomically promotes current, history and replay state"
+    )]
+    fn commit_supervision_lease_artifact(
+        &self,
+        ticket: &SupervisionLeaseCommitTicket,
+        artifact: SignedSupervisionLease,
+        terminal: Option<&VerifiedSupervisionLeaseTerminalTransition>,
+    ) -> Result<SupervisionLeaseSnapshot, OrsError> {
+        ticket.validate()?;
+        let ticket_sha256 = ticket.ticket_sha256()?;
+        let expected = ticket.expected_payload()?;
+        if artifact.payload != expected {
+            return Err(OrsError::SupervisionLeaseBindingMismatch);
+        }
+        let write = self.database.begin_write().map_err(storage)?;
+        let stage = {
+            let staged = write
+                .open_table(SUPERVISION_LEASE_STAGED)
+                .map_err(storage)?;
+            staged
+                .get(ticket.lease_id.as_str())
+                .map_err(storage)?
+                .map(|value| {
+                    decode_named::<SupervisionLeaseStageReceipt>(
+                        value.value(),
+                        "supervision_lease_staged",
+                    )
+                })
+                .transpose()?
+        };
+        let Some(stage) = stage else {
+            let result = {
+                let results = write
+                    .open_table(SUPERVISION_LEASE_RESULTS)
+                    .map_err(storage)?;
+                results
+                    .get(ticket.ticket_id.as_str())
+                    .map_err(storage)?
+                    .map(|value| {
+                        decode_named::<DurableSupervisionLeaseResult>(
+                            value.value(),
+                            "supervision_lease_result",
+                        )
+                    })
+                    .transpose()?
+            };
+            let Some(result) = result else {
+                return Err(OrsError::SupervisionLeaseTicketNotStaged);
+            };
+            result.snapshot.validate()?;
+            if result.ticket != *ticket || result.artifact != artifact {
+                return Err(OrsError::SupervisionLeaseTicketConflict);
+            }
+            write.commit().map_err(storage)?;
+            return Ok(result.snapshot);
+        };
+        stage.validate()?;
+        if stage.ticket != *ticket || stage.ticket_sha256 != ticket_sha256 {
+            return Err(OrsError::SupervisionLeaseTicketConflict);
+        }
+        let current = {
+            let current = write
+                .open_table(SUPERVISION_LEASE_CURRENT)
+                .map_err(storage)?;
+            current
+                .get(ticket.lease_id.as_str())
+                .map_err(storage)?
+                .map(|value| {
+                    let snapshot = decode_named::<SupervisionLeaseSnapshot>(
+                        value.value(),
+                        "supervision_lease_current",
+                    )?;
+                    snapshot
+                        .validate()
+                        .map_err(|error| OrsError::IntegrityProblem {
+                            record_type: "supervision_lease_current",
+                            reason: error.to_string(),
+                        })?;
+                    if snapshot.record.lease_id != ticket.lease_id {
+                        return Err(OrsError::IntegrityProblem {
+                            record_type: "supervision_lease_current",
+                            reason: "current key does not match lease identity".to_owned(),
+                        });
+                    }
+                    Ok(snapshot)
+                })
+                .transpose()?
+        };
+        match (current.as_ref(), ticket.expected_revision) {
+            (None, None) => {}
+            (Some(snapshot), Some(expected)) if snapshot.record.revision == expected => {}
+            _ => return Err(OrsError::SupervisionLeaseStaleRevision),
+        }
+        if !ticket
+            .operation
+            .allowed_from(current.as_ref().map(|snapshot| snapshot.record.state))
+        {
+            return Err(OrsError::InvalidTransition);
+        }
+        if current
+            .as_ref()
+            .is_some_and(|snapshot| !snapshot.record.binding.same_lineage_as(&ticket.binding))
+        {
+            return Err(OrsError::SupervisionLeaseBindingMismatch);
+        }
+        if let Some(terminal) = terminal {
+            Self::validate_terminal_supervision_predecessor(ticket, current.as_ref(), terminal)?;
+        }
+        let artifact_sha256 = artifact
+            .envelope_digest()
+            .map_err(|error| OrsError::Contract(error.to_string()))?;
+        let operation_order = Self::next_operational_order(&write)?;
+        let previous_receipt_sha256 = match ticket.previous_receipt_sha256.as_ref() {
+            Some(expected_previous) => {
+                let current = current
+                    .as_ref()
+                    .ok_or(OrsError::SupervisionLeaseStaleRevision)?;
+                if current.receipt.receipt_sha256 != *expected_previous {
+                    return Err(OrsError::SupervisionLeaseStaleRevision);
+                }
+                Some(current.receipt.receipt_sha256.clone())
+            }
+            None => None,
+        };
+        let receipt = SupervisionLeaseReceipt::issue(SupervisionLeaseReceiptInput {
+            ticket_id: ticket.ticket_id.clone(),
+            operation_id: ticket.operation_id.clone(),
+            record_id: ticket.record_id.clone(),
+            lease_id: ticket.lease_id.clone(),
+            revision: ticket.revision,
+            operation: ticket.operation,
+            state: ticket.binding.state,
+            operation_order,
+            ticket_sha256: ticket_sha256.clone(),
+            artifact_sha256,
+            previous_receipt_sha256,
+        })?;
+        let record = SupervisionLeaseRecord {
+            ticket_id: ticket.ticket_id.clone(),
+            operation_id: ticket.operation_id.clone(),
+            record_id: ticket.record_id.clone(),
+            lease_id: ticket.lease_id.clone(),
+            revision: ticket.revision,
+            operation: ticket.operation,
+            state: ticket.binding.state,
+            projection: SupervisionLeaseProjection::for_state(ticket.binding.state),
+            binding: ticket.binding.clone(),
+            previous_receipt_sha256: ticket.previous_receipt_sha256.clone(),
+            ticket_sha256,
+            operation_order,
+            artifact,
+            receipt_sha256: receipt.receipt_sha256.clone(),
+        };
+        let snapshot = SupervisionLeaseSnapshot { record, receipt };
+        snapshot.validate()?;
+        let result = DurableSupervisionLeaseResult {
+            ticket: ticket.clone(),
+            artifact: snapshot.record.artifact.clone(),
+            snapshot: snapshot.clone(),
+        };
+        Self::persist_supervision_snapshot(&write, &snapshot, &result)?;
+        {
+            let mut staged = write
+                .open_table(SUPERVISION_LEASE_STAGED)
+                .map_err(storage)?;
+            staged.remove(ticket.lease_id.as_str()).map_err(storage)?;
+        }
+        write.commit().map_err(storage)?;
+        Ok(snapshot)
+    }
+
+    fn validate_terminal_supervision_predecessor(
+        ticket: &SupervisionLeaseCommitTicket,
+        current: Option<&SupervisionLeaseSnapshot>,
+        terminal: &VerifiedSupervisionLeaseTerminalTransition,
+    ) -> Result<(), OrsError> {
+        let current = current.ok_or(OrsError::SupervisionLeaseBindingMismatch)?;
+        let predecessor = terminal.predecessor();
+        let prior_artifact = signed_supervision_lease_from_verified(terminal.prior_active())?;
+        let prior_artifact_sha256 = prior_artifact
+            .envelope_digest()
+            .map_err(|error| OrsError::Contract(error.to_string()))?;
+        if current.record.state != eliot_runtime_contracts::LeaseState::Active
+            || current.record.projection != SupervisionLeaseProjection::Active
+            || current.record.lease_id.as_str() != predecessor.lease_id
+            || current.record.record_id.as_str() != predecessor.record_id
+            || current.record.revision != predecessor.lease_revision
+            || current.receipt.receipt_sha256 != predecessor.receipt_sha256
+            || current.record.artifact != prior_artifact
+            || prior_artifact_sha256 != predecessor.envelope_sha256
+            || ticket.lease_id.as_str() != predecessor.lease_id
+            || ticket.expected_revision != Some(predecessor.lease_revision)
+            || ticket.previous_receipt_sha256.as_deref()
+                != Some(predecessor.receipt_sha256.as_str())
+        {
+            return Err(OrsError::SupervisionLeaseBindingMismatch);
+        }
+        Ok(())
+    }
+
+    /// Returns an interrupted staged ticket without promoting it.
+    pub fn reconcile_staged_supervision_lease(
+        &self,
+        lease_id: &crate::OperationIdentity,
+    ) -> Result<Option<SupervisionLeaseStageReceipt>, OrsError> {
+        let read = self.database.begin_read().map_err(storage)?;
+        let staged = read.open_table(SUPERVISION_LEASE_STAGED).map_err(storage)?;
+        staged
+            .get(lease_id.as_str())
+            .map_err(storage)?
+            .map(|value| {
+                let stage: SupervisionLeaseStageReceipt =
+                    decode_named(value.value(), "supervision_lease_staged")?;
+                stage.validate()?;
+                if stage.ticket.lease_id != *lease_id {
+                    return Err(OrsError::IntegrityProblem {
+                        record_type: "supervision_lease_staged",
+                        reason: "staged key does not match lease identity".to_owned(),
+                    });
+                }
+                Ok(stage)
+            })
+            .transpose()
+    }
+
+    /// Reads a bounded set of staged tickets for recovery.  It performs no
+    /// write and therefore cannot guess whether a remote commit crossed.
+    pub fn reconcile_staged_supervision_leases(
+        &self,
+        limit: u16,
+    ) -> Result<Vec<SupervisionLeaseStageReceipt>, OrsError> {
+        if limit == 0 || limit > crate::MAX_RECOVERY_PAGE {
+            return Err(OrsError::InvalidSupervisionLeaseHistoryLimit);
+        }
+        let read = self.database.begin_read().map_err(storage)?;
+        let staged = read.open_table(SUPERVISION_LEASE_STAGED).map_err(storage)?;
+        let mut stage_receipts = Vec::new();
+        for row in staged.iter().map_err(storage)? {
+            let (_, value) = row.map_err(storage)?;
+            let stage: SupervisionLeaseStageReceipt =
+                decode_named(value.value(), "supervision_lease_staged")?;
+            stage.validate()?;
+            stage_receipts.push(stage);
+            if stage_receipts.len() == usize::from(limit) {
+                break;
+            }
+        }
+        stage_receipts.sort_by_key(|stage| stage.ticket.reservation_order);
+        Ok(stage_receipts)
+    }
+
+    /// Reads the current authoritative committed projection for a lease.
+    pub fn load_current_supervision_lease(
+        &self,
+        lease_id: &crate::OperationIdentity,
+    ) -> Result<Option<SupervisionLeaseSnapshot>, OrsError> {
+        let read = self.database.begin_read().map_err(storage)?;
+        let current = read
+            .open_table(SUPERVISION_LEASE_CURRENT)
+            .map_err(storage)?;
+        current
+            .get(lease_id.as_str())
+            .map_err(storage)?
+            .map(|value| {
+                let snapshot: SupervisionLeaseSnapshot =
+                    decode_named(value.value(), "supervision_lease_current")?;
+                snapshot.validate()?;
+                if snapshot.record.lease_id != *lease_id {
+                    return Err(OrsError::IntegrityProblem {
+                        record_type: "supervision_lease_current",
+                        reason: "current key does not match lease identity".to_owned(),
+                    });
+                }
+                Ok(snapshot)
+            })
+            .transpose()
+    }
+
+    /// Reads newest-first bounded committed history for one lease.
+    pub fn load_supervision_lease_history(
+        &self,
+        lease_id: &crate::OperationIdentity,
+        limit: u16,
+    ) -> Result<Vec<SupervisionLeaseSnapshot>, OrsError> {
+        if limit == 0 || limit > crate::MAX_RECOVERY_PAGE {
+            return Err(OrsError::InvalidSupervisionLeaseHistoryLimit);
+        }
+        let read = self.database.begin_read().map_err(storage)?;
+        let history = read
+            .open_table(SUPERVISION_LEASE_HISTORY)
+            .map_err(storage)?;
+        let start = format!("{}::", lease_id.as_str());
+        let end = format!("{start}\u{10ffff}");
+        let mut snapshots = Vec::new();
+        for row in history
+            .range(start.as_str()..end.as_str())
+            .map_err(storage)?
+        {
+            let (key, value) = row.map_err(storage)?;
+            let snapshot: SupervisionLeaseSnapshot =
+                decode_named(value.value(), "supervision_lease_history")?;
+            snapshot.validate()?;
+            if snapshot.record.lease_id != *lease_id
+                || key.value() != Self::supervision_history_key(lease_id, snapshot.record.revision)
+            {
+                return Err(OrsError::IntegrityProblem {
+                    record_type: "supervision_lease_history",
+                    reason: "history key does not match lease identity or revision".to_owned(),
+                });
+            }
+            snapshots.push(snapshot);
+        }
+        snapshots.sort_by_key(|snapshot| std::cmp::Reverse(snapshot.record.revision));
+        snapshots.truncate(usize::from(limit));
+        Ok(snapshots)
+    }
+
+    fn supervision_history_key(lease_id: &crate::OperationIdentity, revision: u64) -> String {
+        format!("{}::{:020}", lease_id.as_str(), revision)
+    }
+
+    fn persist_supervision_snapshot(
+        write: &redb::WriteTransaction,
+        snapshot: &SupervisionLeaseSnapshot,
+        result: &DurableSupervisionLeaseResult,
+    ) -> Result<(), OrsError> {
+        let encoded = encode(snapshot)?;
+        {
+            let mut current = write
+                .open_table(SUPERVISION_LEASE_CURRENT)
+                .map_err(storage)?;
+            current
+                .insert(snapshot.record.lease_id.as_str(), encoded.as_str())
+                .map_err(storage)?;
+        }
+        {
+            let history_key =
+                Self::supervision_history_key(&snapshot.record.lease_id, snapshot.record.revision);
+            let mut history = write
+                .open_table(SUPERVISION_LEASE_HISTORY)
+                .map_err(storage)?;
+            if history
+                .get(history_key.as_str())
+                .map_err(storage)?
+                .is_some()
+            {
+                return Err(OrsError::SupervisionLeaseTicketConflict);
+            }
+            history
+                .insert(history_key.as_str(), encoded.as_str())
+                .map_err(storage)?;
+        }
+        {
+            let encoded = encode(result)?;
+            let mut results = write
+                .open_table(SUPERVISION_LEASE_RESULTS)
+                .map_err(storage)?;
+            if results
+                .get(result.ticket.ticket_id.as_str())
+                .map_err(storage)?
+                .is_some()
+            {
+                return Err(OrsError::SupervisionLeaseTicketConflict);
+            }
+            results
+                .insert(result.ticket.ticket_id.as_str(), encoded.as_str())
+                .map_err(storage)?;
+        }
+        Ok(())
+    }
+
     /// Opens or creates an ORS database and converts interrupted execution to reconciliation.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, OrsError> {
         let path = path.as_ref();
@@ -833,6 +1393,26 @@ impl RedbRecoveryStore {
             drop(write.open_table(PROCESS_START_REPLAY).map_err(storage)?);
             drop(write.open_table(AUTHORITY_HANDOFFS).map_err(storage)?);
             drop(write.open_table(PROCESS_EVIDENCE).map_err(storage)?);
+            drop(
+                write
+                    .open_table(SUPERVISION_LEASE_STAGED)
+                    .map_err(storage)?,
+            );
+            drop(
+                write
+                    .open_table(SUPERVISION_LEASE_CURRENT)
+                    .map_err(storage)?,
+            );
+            drop(
+                write
+                    .open_table(SUPERVISION_LEASE_HISTORY)
+                    .map_err(storage)?,
+            );
+            drop(
+                write
+                    .open_table(SUPERVISION_LEASE_RESULTS)
+                    .map_err(storage)?,
+            );
         }
         write.commit().map_err(storage)
     }
@@ -3617,6 +4197,35 @@ impl PersistedValue for ScopeTerminalReceipt {
                 record_type: Self::RECORD_TYPE,
                 reason: "invalid terminal sequence or gap disposition".to_owned(),
             });
+        }
+        Ok(())
+    }
+}
+
+impl PersistedValue for SupervisionLeaseStageReceipt {
+    const RECORD_TYPE: &'static str = "supervision_lease_staged";
+
+    fn validate_persisted(&self) -> Result<(), OrsError> {
+        self.validate()
+    }
+}
+
+impl PersistedValue for SupervisionLeaseSnapshot {
+    const RECORD_TYPE: &'static str = "supervision_lease_snapshot";
+
+    fn validate_persisted(&self) -> Result<(), OrsError> {
+        self.validate()
+    }
+}
+
+impl PersistedValue for DurableSupervisionLeaseResult {
+    const RECORD_TYPE: &'static str = "supervision_lease_result";
+
+    fn validate_persisted(&self) -> Result<(), OrsError> {
+        self.ticket.validate()?;
+        self.snapshot.validate()?;
+        if self.snapshot.record.artifact != self.artifact {
+            return Err(OrsError::SupervisionLeaseBindingMismatch);
         }
         Ok(())
     }
