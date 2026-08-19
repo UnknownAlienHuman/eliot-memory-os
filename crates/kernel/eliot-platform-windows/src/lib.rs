@@ -16,10 +16,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use eliot_platform::{
     AdapterPathInput, ClockPort, ClockRequest, FileKind, FilesystemObservation,
     FilesystemOperation, FilesystemPort, InstallationObservation, InstallationOperation,
-    InstallationPort, InstallationRequest, InstallationState, NotificationObservation,
-    NotificationPort, NotificationRequest, PlatformHandle, PortError, PortOutcome, SecretPort,
-    SecretRequest, ServiceObservation, ServiceOperation, ServicePort, ServiceRequest, ServiceState,
-    SessionObservation, SessionPort, SessionRequest, UnknownReason, WorkScopePath,
+    InstallationPort, InstallationRequest, InstallationState, KernelActivationNonce,
+    NotificationObservation, NotificationPort, NotificationRequest, PlatformHandle, PortError,
+    PortOutcome, SecretPort, SecretRequest, ServiceObservation, ServiceOperation, ServicePort,
+    ServiceRequest, ServiceState, SessionObservation, SessionPort, SessionRequest, UnknownReason,
+    WorkScopePath,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -6835,9 +6836,22 @@ pub fn fresh_activation_nonce_material() -> Result<PlatformHandle, WindowsAdapte
     Err(WindowsAdapterError::Unavailable)
 }
 
+/// Issues the canonical typed one-use Kernel activation permit from Windows OS RNG material.
+///
+/// This is the production composition seam. It cannot accept a Host-process
+/// nonce and its formatting remains redacted by [`KernelActivationNonce`].
+///
+/// # Errors
+///
+/// Returns the classified OS RNG failure, or [`WindowsAdapterError::InvalidInput`]
+/// if the generated material violates the canonical 256-bit nonce contract.
+pub fn fresh_kernel_activation_nonce() -> Result<KernelActivationNonce, WindowsAdapterError> {
+    KernelActivationNonce::new(fresh_activation_nonce_material()?)
+        .map_err(|_| WindowsAdapterError::InvalidInput)
+}
+
 /// Compatibility wrapper retaining the historical prefixed handle shape.
-/// New Kernel activation code must wrap [`fresh_activation_nonce_material`]
-/// directly in the canonical provider-neutral nonce type.
+/// New Kernel activation code must call [`fresh_kernel_activation_nonce`].
 pub fn fresh_activation_nonce() -> Result<PlatformHandle, WindowsAdapterError> {
     let material = fresh_activation_nonce_material()?;
     PlatformHandle::new(format!("{ACTIVATION_NONCE_PREFIX}{}", material.as_str()))
@@ -8524,6 +8538,27 @@ mod tests {
                 .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
         );
         assert_ne!(first, second);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn typed_activation_nonce_has_canonical_shape_and_redacted_formatting() {
+        let nonce = fresh_kernel_activation_nonce()
+            .unwrap_or_else(|error| panic!("typed nonce failed: {error}"));
+        let material = nonce.as_handle().as_str();
+        assert_eq!(material.len(), 64);
+        assert!(
+            material
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+        );
+
+        let debug = format!("{nonce:?}");
+        let display = format!("{nonce}");
+        assert_eq!(debug, "KernelActivationNonce(<redacted>)");
+        assert_eq!(display, "<redacted>");
+        assert!(!debug.contains(material));
+        assert!(!display.contains(material));
     }
 
     #[cfg(windows)]

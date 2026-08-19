@@ -632,7 +632,7 @@ pub struct ValidatedRuntimeRootLeases<L> {
 
 /// Real Windows retained root lease used by production composition.
 pub enum WindowsRuntimeRootLease {
-    /// SystemService lease backed by a protected sentinel file and retained contour.
+    /// SystemService lease backed by a retained read-only directory contour.
     Protected {
         /// Contract-declared root path.
         declared_path: String,
