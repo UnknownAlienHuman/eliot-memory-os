@@ -31,10 +31,20 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+mod redb_state;
+
+pub use redb_state::RedbInstallationTransactionStore;
+
 /// Stable wire name for the installation contract.
 pub const CONTRACT_NAME: &str = "eliot.kernel.installation";
 /// Current installation contract revision.
 pub const CONTRACT_VERSION: ContractVersion = ContractVersion::new(2, 0, 0);
+/// Breaking wire revision for durable [`InstallationTransaction`] records.
+///
+/// This discriminator is intentionally independent from [`CONTRACT_VERSION`]
+/// so the accepted runtime-launch, candidate-manifest and approved-registry
+/// v2 wires remain unchanged.
+pub const INSTALLATION_TRANSACTION_WIRE_VERSION: ContractVersion = ContractVersion::new(3, 0, 0);
 
 /// Returns the stable contract identity for handshakes and provenance.
 pub fn contract_identity() -> Result<ContractIdentity, InstallationError> {
@@ -119,6 +129,20 @@ pub enum InstallationError {
     MigrationRequired {
         /// Why the existing state cannot be admitted as the current schema.
         reason: String,
+    },
+    /// Durable transaction state changed since it was loaded.
+    #[error("installation transaction CAS conflict: expected revision {expected}, actual {actual}")]
+    CompareAndSaveConflict {
+        /// Revision supplied by the coordinator.
+        expected: u64,
+        /// Revision currently held by the durable store.
+        actual: u64,
+    },
+    /// The requested durable transaction does not exist.
+    #[error("installation transaction was not found: {transaction_id}")]
+    TransactionNotFound {
+        /// Stable transaction identity that was absent.
+        transaction_id: String,
     },
 }
 
@@ -2940,10 +2964,77 @@ impl InstallationStage {
     }
 }
 
+/// Proven ownership of an observed installer effect.
+#[derive(Clone, Copy, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum InstallationEffectDisposition {
+    /// The exact external object was created by this transaction intent.
+    CreatedByTransaction,
+    /// The exact requested postcondition already existed before execution.
+    PreexistingMatching,
+}
+
+/// Durable progress for exactly one immutable installer effect.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(
+    tag = "state",
+    rename_all = "SCREAMING_SNAKE_CASE",
+    deny_unknown_fields
+)]
+pub enum InstallationEffectProgressState {
+    /// No effect intent has been committed.
+    Pending,
+    /// The exact intent was durably committed before the platform call.
+    IntentCommitted {
+        /// Non-zero execution attempt.
+        attempt: u32,
+        /// Digest of the exact request authorized for this attempt.
+        intent_digest: PlatformHandle,
+    },
+    /// Authoritative readback proved the exact postcondition.
+    Applied {
+        /// Whether this transaction created or merely adopted the object.
+        disposition: InstallationEffectDisposition,
+        /// Exact provider object identity observed after the effect.
+        external_identity: PlatformHandle,
+        /// Evidence proving the authoritative postcondition.
+        evidence: Vec<PlatformHandle>,
+        /// Digest of the authoritative postcondition.
+        postcondition_digest: PlatformHandle,
+    },
+    /// Authoritative classification was impossible or mismatched.
+    Unknown {
+        /// Stable evidence/reference requiring recovery.
+        pending_ref: PlatformHandle,
+    },
+}
+
+/// One-to-one durable progress entry bound to an installer effect identity.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InstallationEffectProgress {
+    /// Immutable effect identity from the installer plan.
+    pub effect_id: PlatformHandle,
+    /// Current durable effect state.
+    pub state: InstallationEffectProgressState,
+}
+
 /// Durable installation/update transaction and its recovery projection.
+///
+/// Mutable durability state is intentionally read-only outside this crate:
+///
+/// ```compile_fail
+/// use eliot_installation::{InstallationStage, InstallationTransaction};
+///
+/// fn forge_stage(transaction: &mut InstallationTransaction) {
+///     transaction.stage = InstallationStage::Completed;
+/// }
+/// ```
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct InstallationTransaction {
+    /// Required breaking discriminator for this transaction projection only.
+    pub transaction_wire_version: ContractVersion,
     /// Stable transaction identity.
     pub transaction_id: PlatformHandle,
     /// Installation lineage at transaction creation.
@@ -2966,10 +3057,12 @@ pub struct InstallationTransaction {
     pub minimum_store_available_bytes: u64,
     /// Digest binding the sole transaction identity to its immutable installer plan.
     pub installer_plan_digest: PlatformHandle,
+    /// One-to-one ordered durable progress for `installer_effects`.
+    effect_progress: Vec<InstallationEffectProgress>,
     /// Precondition observations captured before staging.
     pub precondition_evidence: Vec<PlatformHandle>,
     /// Current durable stage.
-    pub stage: InstallationStage,
+    stage: InstallationStage,
     /// Evidence references for completed stages.
     pub completed_stage_refs: Vec<PlatformHandle>,
     /// External objects changed but not yet acknowledged.
@@ -2985,7 +3078,7 @@ pub struct InstallationTransaction {
     /// Operator recovery command/reference.
     pub recovery_command: PlatformHandle,
     /// Monotonic state revision.
-    pub revision: u64,
+    revision: u64,
 }
 
 impl InstallationTransaction {
@@ -3072,7 +3165,15 @@ impl InstallationTransaction {
                 field: "installer_plan_digest".to_owned(),
                 reason: error.to_string(),
             })?;
+        let effect_progress = installer_effects
+            .iter()
+            .map(|effect| InstallationEffectProgress {
+                effect_id: effect.effect_id().clone(),
+                state: InstallationEffectProgressState::Pending,
+            })
+            .collect();
         Ok(Self {
+            transaction_wire_version: INSTALLATION_TRANSACTION_WIRE_VERSION,
             transaction_id,
             installation_epoch,
             profile,
@@ -3084,6 +3185,7 @@ impl InstallationTransaction {
             installer_effects,
             minimum_store_available_bytes,
             installer_plan_digest,
+            effect_progress,
             precondition_evidence,
             stage: InstallationStage::Planned,
             completed_stage_refs: Vec::new(),
@@ -3095,6 +3197,24 @@ impl InstallationTransaction {
             recovery_command,
             revision: 1,
         })
+    }
+
+    /// Returns the current durable stage without exposing a mutation seam.
+    #[must_use]
+    pub const fn stage(&self) -> InstallationStage {
+        self.stage
+    }
+
+    /// Returns the ordered effect progress as a read-only projection.
+    #[must_use]
+    pub fn effect_progress(&self) -> &[InstallationEffectProgress] {
+        &self.effect_progress
+    }
+
+    /// Returns the monotonic durable revision.
+    #[must_use]
+    pub const fn revision(&self) -> u64 {
+        self.revision
     }
 
     fn installer_plan_unsigned_bytes(
@@ -3126,7 +3246,19 @@ impl InstallationTransaction {
     }
 
     /// Validates the complete transaction projection.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the complete transaction invariant is intentionally audited in one boundary"
+    )]
     pub fn validate(&self) -> Result<(), InstallationError> {
+        if self.transaction_wire_version != INSTALLATION_TRANSACTION_WIRE_VERSION {
+            return Err(InstallationError::MigrationRequired {
+                reason: format!(
+                    "installation transaction wire {} cannot be read as {}",
+                    self.transaction_wire_version, INSTALLATION_TRANSACTION_WIRE_VERSION
+                ),
+            });
+        }
         handle(&self.transaction_id, "transaction_id")?;
         self.installation_epoch.validate()?;
         self.request.validate()?;
@@ -3177,6 +3309,7 @@ impl InstallationTransaction {
                 reason: "installer plan digest mismatch".to_owned(),
             });
         }
+        self.validate_effect_progress()?;
         if self.revision == 0 {
             return Err(InstallationError::InvalidField {
                 field: "revision".to_owned(),
@@ -3222,6 +3355,72 @@ impl InstallationTransaction {
             ));
         }
         Ok(())
+    }
+
+    fn validate_effect_progress(&self) -> Result<(), InstallationError> {
+        if self.effect_progress.len() != self.installer_effects.len() {
+            return Err(InstallationError::IdentityConflict);
+        }
+        let mut unsettled_seen = false;
+        for (effect, progress) in self.installer_effects.iter().zip(&self.effect_progress) {
+            if progress.effect_id != *effect.effect_id() {
+                return Err(InstallationError::IdentityConflict);
+            }
+            match &progress.state {
+                InstallationEffectProgressState::Applied {
+                    external_identity,
+                    evidence,
+                    postcondition_digest,
+                    ..
+                } if !unsettled_seen => {
+                    handle(external_identity, "effect_progress.external_identity")?;
+                    handles(evidence, "effect_progress.evidence", true)?;
+                    sha256_handle(postcondition_digest, "effect_progress.postcondition_digest")?;
+                }
+                InstallationEffectProgressState::Pending => unsettled_seen = true,
+                InstallationEffectProgressState::IntentCommitted {
+                    attempt,
+                    intent_digest,
+                } if !unsettled_seen => {
+                    if *attempt == 0 {
+                        return Err(InstallationError::InvalidField {
+                            field: "effect_progress.attempt".to_owned(),
+                            reason: "must be non-zero".to_owned(),
+                        });
+                    }
+                    sha256_handle(intent_digest, "effect_progress.intent_digest")?;
+                    unsettled_seen = true;
+                }
+                InstallationEffectProgressState::Unknown { pending_ref } if !unsettled_seen => {
+                    handle(pending_ref, "effect_progress.pending_ref")?;
+                    unsettled_seen = true;
+                }
+                InstallationEffectProgressState::Applied { .. }
+                | InstallationEffectProgressState::IntentCommitted { .. }
+                | InstallationEffectProgressState::Unknown { .. } => {
+                    return Err(InstallationError::InvalidField {
+                        field: "effect_progress".to_owned(),
+                        reason: "progress must be an applied prefix followed by at most one active state and a pending suffix".to_owned(),
+                    });
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn is_constructor_planned(&self) -> bool {
+        self.transaction_wire_version == INSTALLATION_TRANSACTION_WIRE_VERSION
+            && self.stage == InstallationStage::Planned
+            && self.revision == 1
+            && self.completed_stage_refs.is_empty()
+            && self.pending_external_changes.is_empty()
+            && self.observed_postconditions.is_empty()
+            && self.last_known_good.is_none()
+            && self.no_return_boundary.is_none()
+            && self
+                .effect_progress
+                .iter()
+                .all(|progress| matches!(progress.state, InstallationEffectProgressState::Pending))
     }
 
     /// Records the real Store-volume observation through this transaction's
@@ -3332,104 +3531,332 @@ impl InstallationTransaction {
     }
 }
 
+/// Decodes the canonical transaction JSON and classifies pre-v3 records as an
+/// explicit migration requirement rather than synthesizing missing progress.
+pub fn decode_installation_transaction_json(
+    bytes: &[u8],
+) -> Result<InstallationTransaction, InstallationError> {
+    let value: serde_json::Value =
+        serde_json::from_slice(bytes).map_err(|error| InstallationError::CorruptRegistry {
+            reason: error.to_string(),
+        })?;
+    let version = value.get("transaction_wire_version").ok_or_else(|| {
+        InstallationError::MigrationRequired {
+            reason: "installation transaction predates the required v3 discriminator".to_owned(),
+        }
+    })?;
+    let version: ContractVersion = serde_json::from_value(version.clone()).map_err(|_| {
+        InstallationError::MigrationRequired {
+            reason: "installation transaction has an unsupported wire discriminator".to_owned(),
+        }
+    })?;
+    if version != INSTALLATION_TRANSACTION_WIRE_VERSION {
+        return Err(InstallationError::MigrationRequired {
+            reason: format!(
+                "installation transaction wire {version} requires explicit migration to {INSTALLATION_TRANSACTION_WIRE_VERSION}"
+            ),
+        });
+    }
+    let transaction: InstallationTransaction =
+        serde_json::from_value(value).map_err(|error| InstallationError::CorruptRegistry {
+            reason: error.to_string(),
+        })?;
+    transaction.validate()?;
+    Ok(transaction)
+}
+
 fn platform_error(error: &PortError) -> InstallationError {
     InstallationError::Platform(error.to_string())
 }
 
-/// Bounded external installation operation selected by the transaction owner.
+/// Whether an exact effect request applies or rolls back one plan entry.
 #[derive(Clone, Copy, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
-pub enum InstallationEffectOperation {
-    /// Copy candidate bytes into an isolated staging root.
-    Stage,
-    /// Register candidate service/tasks/plugins without activation authority.
-    Register,
-    /// Switch the selected activation pointer or service configuration.
-    Activate,
-    /// Remove superseded staging/registrations after the rollback window.
-    Clean,
-    /// Apply the explicit rollback or forward-repair plan.
+pub enum InstallationEffectAction {
+    /// Apply the exact immutable effect plan.
+    Apply,
+    /// Remove only the exact identity previously created by this transaction.
     Rollback,
 }
 
-/// Request sent to the effect executor; it carries references, never payload bytes.
+/// Exact precondition bound into an effect intent.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct InstallationEffectRequest {
-    /// Transaction identity.
-    pub transaction_id: PlatformHandle,
-    /// Installation identity.
-    pub installation: PlatformHandle,
-    /// Selected profile.
-    pub profile: InstallationProfile,
-    /// Effect operation.
-    pub operation: InstallationEffectOperation,
-    /// Candidate generation.
-    pub candidate_generation: PlatformHandle,
-    /// Exact planned changes selected for this operation.
-    pub change_refs: Vec<PlatformHandle>,
-    /// Rollback/recovery plan reference.
-    pub rollback_plan: PlatformHandle,
-}
-
-impl InstallationEffectRequest {
-    /// Validates an effect request before it crosses the adapter boundary.
-    pub fn validate(&self) -> Result<(), InstallationError> {
-        for (value, field) in [
-            (&self.transaction_id, "effect.transaction_id"),
-            (&self.installation, "effect.installation"),
-            (&self.candidate_generation, "effect.candidate_generation"),
-            (&self.rollback_plan, "effect.rollback_plan"),
-        ] {
-            handle(value, field)?;
-        }
-        handles(
-            &self.change_refs,
-            "effect.change_refs",
-            self.operation != InstallationEffectOperation::Rollback,
-        )
-    }
-}
-
-/// Observed postcondition returned by an effect executor.
-#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct InstallationEffectObservation {
-    /// Echoed transaction identity.
-    pub transaction_id: PlatformHandle,
-    /// Operation actually observed.
-    pub operation: InstallationEffectOperation,
-    /// Provider/external object identity observed after the effect.
-    pub external_identity: PlatformHandle,
-    /// Evidence proving the effect and its postcondition.
+pub struct InstallationEffectPrecondition {
+    /// Evidence references captured for the matching planned change.
     pub evidence_refs: Vec<PlatformHandle>,
-    /// Whether the external object crossed its no-return boundary.
-    pub crossed_no_return: bool,
+    /// Digest binding those references in order.
+    pub digest: PlatformHandle,
 }
 
-impl InstallationEffectObservation {
-    /// Validates an observed effect without asserting semantic capability health.
-    pub fn validate(&self) -> Result<(), InstallationError> {
-        handle(&self.transaction_id, "observation.transaction_id")?;
-        handle(&self.external_identity, "observation.external_identity")?;
-        handles(&self.evidence_refs, "observation.evidence_refs", true)?;
-        if self.crossed_no_return && self.operation != InstallationEffectOperation::Activate {
+impl InstallationEffectPrecondition {
+    fn from_change(change: &PlannedChange) -> Result<Self, InstallationError> {
+        let digest = PlatformHandle::new(sha256_hex(
+            &serde_json::to_vec(&change.precondition_refs).map_err(|error| {
+                InstallationError::InvalidField {
+                    field: "effect.precondition".to_owned(),
+                    reason: error.to_string(),
+                }
+            })?,
+        ))
+        .map_err(|error| platform_error(&error))?;
+        Ok(Self {
+            evidence_refs: change.precondition_refs.clone(),
+            digest,
+        })
+    }
+
+    fn validate(&self) -> Result<(), InstallationError> {
+        handles(
+            &self.evidence_refs,
+            "effect.precondition.evidence_refs",
+            true,
+        )?;
+        sha256_handle(&self.digest, "effect.precondition.digest")?;
+        let expected = sha256_hex(&serde_json::to_vec(&self.evidence_refs).map_err(|error| {
+            InstallationError::InvalidField {
+                field: "effect.precondition".to_owned(),
+                reason: error.to_string(),
+            }
+        })?);
+        if expected != self.digest.as_str() {
             return Err(InstallationError::InvalidField {
-                field: "observation.crossed_no_return".to_owned(),
-                reason: "only activation may cross the no-return boundary".to_owned(),
+                field: "effect.precondition.digest".to_owned(),
+                reason: "precondition digest mismatch".to_owned(),
             });
         }
         Ok(())
     }
 }
 
+/// Request sent to the effect executor for exactly one immutable plan entry.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InstallationEffectRequest {
+    /// Transaction identity.
+    pub transaction_id: PlatformHandle,
+    /// Exact immutable effect plan.
+    pub plan: InstallerEffectPlan,
+    /// Effect identity echoed outside the tagged plan for adapter routing.
+    pub effect_id: PlatformHandle,
+    /// Non-zero attempt durably committed before execution.
+    pub attempt: u32,
+    /// Digest of the complete immutable installer plan.
+    pub plan_digest: PlatformHandle,
+    /// Exact precondition admitted for this attempt.
+    pub precondition: InstallationEffectPrecondition,
+    /// Apply or exact-identity rollback.
+    pub action: InstallationEffectAction,
+    /// Required exact identity for rollback; absent for apply.
+    pub expected_external_identity: Option<PlatformHandle>,
+}
+
+impl InstallationEffectRequest {
+    /// Validates an exact effect request before it crosses the adapter boundary.
+    pub fn validate(&self) -> Result<(), InstallationError> {
+        handle(&self.transaction_id, "effect.transaction_id")?;
+        self.plan.validate()?;
+        handle(&self.effect_id, "effect.effect_id")?;
+        if self.effect_id != *self.plan.effect_id() {
+            return Err(InstallationError::IdentityConflict);
+        }
+        if self.attempt == 0 {
+            return Err(InstallationError::InvalidField {
+                field: "effect.attempt".to_owned(),
+                reason: "must be non-zero".to_owned(),
+            });
+        }
+        sha256_handle(&self.plan_digest, "effect.plan_digest")?;
+        self.precondition.validate()?;
+        match (&self.action, &self.expected_external_identity) {
+            (InstallationEffectAction::Apply, None) => Ok(()),
+            (InstallationEffectAction::Rollback, Some(identity)) => {
+                handle(identity, "effect.expected_external_identity")
+            }
+            _ => Err(InstallationError::InvalidField {
+                field: "effect.expected_external_identity".to_owned(),
+                reason: "must be absent for apply and present for rollback".to_owned(),
+            }),
+        }
+    }
+
+    fn intent_digest(&self) -> Result<PlatformHandle, InstallationError> {
+        let bytes = serde_json::to_vec(self).map_err(|error| InstallationError::InvalidField {
+            field: "effect.intent".to_owned(),
+            reason: error.to_string(),
+        })?;
+        PlatformHandle::new(sha256_hex(&bytes)).map_err(|error| platform_error(&error))
+    }
+}
+
+/// Authoritative readback for one exact effect request.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(
+    tag = "status",
+    rename_all = "SCREAMING_SNAKE_CASE",
+    deny_unknown_fields
+)]
+pub enum InstallationEffectObservation {
+    /// The exact external object is authoritatively absent.
+    Absent {
+        /// Digest of the precondition observed during the readback.
+        precondition_digest: PlatformHandle,
+        /// Evidence proving absence.
+        evidence: Vec<PlatformHandle>,
+    },
+    /// The exact requested postcondition is authoritatively present.
+    Matching {
+        /// Proven ownership of the observed object.
+        disposition: InstallationEffectDisposition,
+        /// Exact provider object identity.
+        external_identity: PlatformHandle,
+        /// Evidence proving the postcondition.
+        evidence: Vec<PlatformHandle>,
+        /// Digest of the authoritative postcondition.
+        postcondition_digest: PlatformHandle,
+    },
+    /// Readback proved a conflicting object or precondition.
+    Mismatch {
+        /// Stable evidence/reference requiring recovery.
+        pending_ref: PlatformHandle,
+    },
+}
+
+impl InstallationEffectObservation {
+    fn validate(&self) -> Result<(), InstallationError> {
+        match self {
+            Self::Absent {
+                precondition_digest,
+                evidence,
+            } => {
+                sha256_handle(precondition_digest, "observation.precondition_digest")?;
+                handles(evidence, "observation.evidence", true)
+            }
+            Self::Matching {
+                external_identity,
+                evidence,
+                postcondition_digest,
+                ..
+            } => {
+                handle(external_identity, "observation.external_identity")?;
+                handles(evidence, "observation.evidence", true)?;
+                sha256_handle(postcondition_digest, "observation.postcondition_digest")
+            }
+            Self::Mismatch { pending_ref } => handle(pending_ref, "observation.pending_ref"),
+        }
+    }
+}
+
+/// Acknowledgement from the mutating call; success is not a postcondition.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InstallationEffectExecution {
+    /// Non-authoritative evidence emitted by the mutating adapter call.
+    pub evidence: Vec<PlatformHandle>,
+}
+
 /// Object-safe adapter seam for bounded installation effects.
 pub trait InstallationEffectPort: Send {
-    /// Executes one operation and reports known, partial or unknown outcome.
+    /// Executes the exact committed intent. This result never proves success.
     fn execute(
         &mut self,
         request: &InstallationEffectRequest,
+    ) -> PortOutcome<InstallationEffectExecution>;
+
+    /// Performs authoritative readback before a first execution.
+    fn inspect(
+        &mut self,
+        request: &InstallationEffectRequest,
     ) -> PortOutcome<InstallationEffectObservation>;
+
+    /// Reconciles a committed intent after execution or process restart.
+    fn reconcile(
+        &mut self,
+        request: &InstallationEffectRequest,
+    ) -> PortOutcome<InstallationEffectObservation>;
+}
+
+mod transaction_store_private {
+    use super::{InstallationError, InstallationTransaction, sha256_hex};
+
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    pub struct TransactionVersion {
+        pub revision: u64,
+        pub checksum: String,
+    }
+
+    impl TransactionVersion {
+        pub fn of(transaction: &InstallationTransaction) -> Result<Self, InstallationError> {
+            transaction.validate()?;
+            let bytes = serde_json::to_vec(transaction).map_err(|error| {
+                InstallationError::CorruptRegistry {
+                    reason: error.to_string(),
+                }
+            })?;
+            Ok(Self {
+                revision: transaction.revision,
+                checksum: sha256_hex(&bytes),
+            })
+        }
+    }
+
+    pub trait Sealed {
+        fn compare_and_save(
+            &mut self,
+            expected: TransactionVersion,
+            transaction: &InstallationTransaction,
+        ) -> Result<(), InstallationError>;
+    }
+}
+
+use transaction_store_private::TransactionVersion;
+
+/// Durable read/create boundary for installation transactions.
+///
+/// The trait is sealed so arbitrary implementations cannot participate in the
+/// coordinator's private compare-and-save capability:
+///
+/// ```compile_fail
+/// use eliot_installation::{
+///     InstallationError, InstallationTransaction, InstallationTransactionStore,
+/// };
+/// use eliot_platform::PlatformHandle;
+///
+/// struct ForgingStore;
+/// impl InstallationTransactionStore for ForgingStore {
+///     fn create_planned(
+///         &mut self,
+///         _: &InstallationTransaction,
+///     ) -> Result<(), InstallationError> { Ok(()) }
+///     fn load(
+///         &self,
+///         _: &PlatformHandle,
+///     ) -> Result<Option<InstallationTransaction>, InstallationError> { Ok(None) }
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use eliot_installation::{InstallationTransaction, RedbInstallationTransactionStore};
+///
+/// fn overwrite(
+///     store: &mut RedbInstallationTransactionStore,
+///     transaction: &InstallationTransaction,
+/// ) {
+///     store.compare_and_save(1, transaction);
+/// }
+/// ```
+pub trait InstallationTransactionStore: transaction_store_private::Sealed + Send {
+    /// Creates a constructor-produced v3 `Planned`/`Pending` transaction.
+    fn create_planned(
+        &mut self,
+        transaction: &InstallationTransaction,
+    ) -> Result<(), InstallationError>;
+
+    /// Loads one exact durable transaction.
+    fn load(
+        &self,
+        transaction_id: &PlatformHandle,
+    ) -> Result<Option<InstallationTransaction>, InstallationError>;
 }
 
 /// Result of one coordinator step.
@@ -3457,19 +3884,21 @@ pub enum InstallationStepOutcome {
     Rejected,
 }
 
-/// Coordinates one installation transaction without owning platform mechanics.
-pub struct InstallationCoordinator<P> {
+/// Coordinates one durable installation transaction without owning platform mechanics.
+pub struct InstallationCoordinator<P, S> {
     port: P,
+    store: S,
 }
 
-impl<P> InstallationCoordinator<P>
+impl<P, S> InstallationCoordinator<P, S>
 where
     P: InstallationEffectPort,
+    S: InstallationTransactionStore,
 {
-    /// Creates a coordinator around one platform effect port.
+    /// Creates a coordinator around one platform effect port and durable store.
     #[must_use]
-    pub const fn new(port: P) -> Self {
-        Self { port }
+    pub const fn new(port: P, store: S) -> Self {
+        Self { port, store }
     }
 
     /// Borrows the underlying effect port for composition or inspection.
@@ -3478,122 +3907,456 @@ where
         &self.port
     }
 
-    /// Applies one effect, preserving unknown outcomes as rollback-required.
-    pub fn apply(
+    /// Borrows the underlying durable store.
+    #[must_use]
+    pub const fn store(&self) -> &S {
+        &self.store
+    }
+
+    /// Drives exactly one effect through durable intent and authoritative readback.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "ordered crash-window transitions remain in one auditable coordinator boundary"
+    )]
+    pub fn drive_effect(
         &mut self,
-        transaction: &mut InstallationTransaction,
-        operation: InstallationEffectOperation,
+        transaction_id: &PlatformHandle,
     ) -> Result<InstallationStepOutcome, InstallationError> {
+        let mut transaction = self.store.load(transaction_id)?.ok_or_else(|| {
+            InstallationError::TransactionNotFound {
+                transaction_id: transaction_id.as_str().to_owned(),
+            }
+        })?;
         transaction.validate()?;
-        let expected = expected_stage(transaction.stage, operation)?;
-        let request = InstallationEffectRequest {
-            transaction_id: transaction.transaction_id.clone(),
-            installation: transaction.installation_epoch.installation.clone(),
-            profile: transaction.profile,
-            operation,
-            candidate_generation: transaction.candidate_manifest.generation.clone(),
-            change_refs: transaction
-                .planned_changes
-                .iter()
-                .map(|change| change.change_id.clone())
-                .collect(),
-            rollback_plan: transaction.rollback_plan.clone(),
+        let Some(index) = transaction.effect_progress.iter().position(|progress| {
+            !matches!(
+                progress.state,
+                InstallationEffectProgressState::Applied { .. }
+            )
+        }) else {
+            return Ok(InstallationStepOutcome::Applied {
+                stage: transaction.stage,
+                evidence_refs: transaction.observed_postconditions.clone(),
+            });
         };
-        request.validate()?;
-        let outcome = self.port.execute(&request);
-        match outcome {
-            PortOutcome::Known(observation) => {
-                observation.validate()?;
-                if observation.transaction_id != transaction.transaction_id
-                    || observation.operation != operation
-                {
-                    return Err(InstallationError::IdentityConflict);
+        let attempt = match transaction.effect_progress[index].state {
+            InstallationEffectProgressState::Pending => 1,
+            InstallationEffectProgressState::IntentCommitted { attempt, .. } => attempt,
+            InstallationEffectProgressState::Unknown { ref pending_ref } => {
+                return Ok(InstallationStepOutcome::RollbackRequired {
+                    pending_refs: vec![pending_ref.clone()],
+                });
+            }
+            InstallationEffectProgressState::Applied { .. } => unreachable!(),
+        };
+        let request = effect_request(
+            &transaction,
+            index,
+            attempt,
+            InstallationEffectAction::Apply,
+            None,
+        )?;
+        let state = transaction.effect_progress[index].state.clone();
+        let was_intent = matches!(
+            state,
+            InstallationEffectProgressState::IntentCommitted { .. }
+        );
+        let observation = match state {
+            InstallationEffectProgressState::Pending => match self.port.inspect(&request) {
+                PortOutcome::Known(observation) => observation,
+                other => return self.persist_unknown(transaction, index, port_pending(other)),
+            },
+            InstallationEffectProgressState::IntentCommitted { intent_digest, .. } => {
+                if request.intent_digest()? != intent_digest {
+                    return self.persist_unknown(
+                        transaction,
+                        index,
+                        PlatformHandle::new("mismatch:intent-digest")
+                            .map_err(|error| platform_error(&error))?,
+                    );
                 }
-                if observation.crossed_no_return {
-                    let mut activated = transaction.clone();
-                    activated.advance(expected, observation.evidence_refs.clone())?;
-                    activated.record_no_return_boundary(observation.external_identity.clone())?;
-                    *transaction = activated;
+                match self.port.reconcile(&request) {
+                    PortOutcome::Known(observation) => observation,
+                    other => return self.persist_unknown(transaction, index, port_pending(other)),
+                }
+            }
+            _ => unreachable!(),
+        };
+        observation.validate()?;
+        match observation {
+            InstallationEffectObservation::Matching {
+                disposition,
+                external_identity,
+                evidence,
+                postcondition_digest,
+            } => {
+                if !was_intent {
+                    if disposition != InstallationEffectDisposition::PreexistingMatching {
+                        return self.persist_unknown(
+                            transaction,
+                            index,
+                            PlatformHandle::new("mismatch:uncommitted-created-disposition")
+                                .map_err(|error| platform_error(&error))?,
+                        );
+                    }
+                    let expected = TransactionVersion::of(&transaction)?;
+                    transaction.effect_progress[index].state =
+                        InstallationEffectProgressState::IntentCommitted {
+                            attempt,
+                            intent_digest: request.intent_digest()?,
+                        };
+                    increment_revision(&mut transaction)?;
+                    transaction.validate()?;
+                    self.store.compare_and_save(expected, &transaction)?;
+                }
+                self.persist_applied(
+                    transaction,
+                    index,
+                    disposition,
+                    external_identity,
+                    evidence,
+                    postcondition_digest,
+                )
+            }
+            InstallationEffectObservation::Mismatch { pending_ref } => {
+                self.persist_unknown(transaction, index, pending_ref)
+            }
+            InstallationEffectObservation::Absent {
+                precondition_digest,
+                ..
+            } => {
+                if precondition_digest != request.precondition.digest {
+                    return self.persist_unknown(
+                        transaction,
+                        index,
+                        PlatformHandle::new("mismatch:precondition")
+                            .map_err(|error| platform_error(&error))?,
+                    );
+                }
+                let next_attempt = if was_intent {
+                    attempt
+                        .checked_add(1)
+                        .ok_or_else(|| InstallationError::InvalidField {
+                            field: "effect.attempt".to_owned(),
+                            reason: "overflow".to_owned(),
+                        })?
                 } else {
-                    transaction.advance(expected, observation.evidence_refs.clone())?;
+                    attempt
+                };
+                let request = effect_request(
+                    &transaction,
+                    index,
+                    next_attempt,
+                    InstallationEffectAction::Apply,
+                    None,
+                )?;
+                let expected = TransactionVersion::of(&transaction)?;
+                transaction.effect_progress[index].state =
+                    InstallationEffectProgressState::IntentCommitted {
+                        attempt: next_attempt,
+                        intent_digest: request.intent_digest()?,
+                    };
+                increment_revision(&mut transaction)?;
+                transaction.validate()?;
+                self.store.compare_and_save(expected, &transaction)?;
+                let _execution = self.port.execute(&request);
+                let reconciled = match self.port.reconcile(&request) {
+                    PortOutcome::Known(observation) => observation,
+                    other => return self.persist_unknown(transaction, index, port_pending(other)),
+                };
+                reconciled.validate()?;
+                match reconciled {
+                    InstallationEffectObservation::Matching {
+                        disposition,
+                        external_identity,
+                        evidence,
+                        postcondition_digest,
+                    } => self.persist_applied(
+                        transaction,
+                        index,
+                        disposition,
+                        external_identity,
+                        evidence,
+                        postcondition_digest,
+                    ),
+                    InstallationEffectObservation::Absent {
+                        precondition_digest,
+                        ..
+                    } if precondition_digest == request.precondition.digest => {
+                        // The durable intent remains authoritative. A later
+                        // drive must reconcile it again and may retry only
+                        // after proving the same absence and precondition.
+                        Ok(InstallationStepOutcome::Rejected)
+                    }
+                    InstallationEffectObservation::Absent { .. } => self.persist_unknown(
+                        transaction,
+                        index,
+                        PlatformHandle::new("mismatch:post-execute-precondition")
+                            .map_err(|error| platform_error(&error))?,
+                    ),
+                    InstallationEffectObservation::Mismatch { pending_ref } => {
+                        self.persist_unknown(transaction, index, pending_ref)
+                    }
                 }
-                if operation == InstallationEffectOperation::Rollback {
-                    transaction.pending_external_changes.clear();
-                }
-                Ok(InstallationStepOutcome::Applied {
-                    stage: transaction.stage,
-                    evidence_refs: observation.evidence_refs,
-                })
             }
-            PortOutcome::Partial { value, missing } => {
-                value.validate()?;
-                let mut pending = missing;
-                pending.push(value.external_identity);
-                if operation == InstallationEffectOperation::Rollback {
-                    transaction.advance(InstallationStage::Quarantined, pending.clone())?;
-                    return Ok(InstallationStepOutcome::Quarantined {
-                        pending_refs: pending,
-                    });
-                }
-                transaction.mark_unknown(pending.clone())?;
-                Ok(InstallationStepOutcome::RollbackRequired {
-                    pending_refs: pending,
-                })
-            }
-            PortOutcome::Unknown(reason) => {
-                let pending = vec![
-                    PlatformHandle::new(format!("unknown:{reason:?}"))
-                        .map_err(|error| platform_error(&error))?,
-                ];
-                if operation == InstallationEffectOperation::Rollback {
-                    transaction.advance(InstallationStage::Quarantined, pending.clone())?;
-                    return Ok(InstallationStepOutcome::Quarantined {
-                        pending_refs: pending,
-                    });
-                }
-                transaction.mark_unknown(pending.clone())?;
-                Ok(InstallationStepOutcome::RollbackRequired {
-                    pending_refs: pending,
-                })
-            }
-            PortOutcome::Error(error) => Err(platform_error(&error)),
         }
+    }
+
+    /// Rolls back only exact identities proven `CreatedByTransaction`.
+    #[allow(
+        clippy::needless_continue,
+        reason = "explicit absence branches document the reverse-order rollback proof"
+    )]
+    pub fn rollback(
+        &mut self,
+        transaction_id: &PlatformHandle,
+    ) -> Result<InstallationStepOutcome, InstallationError> {
+        let mut transaction = self.store.load(transaction_id)?.ok_or_else(|| {
+            InstallationError::TransactionNotFound {
+                transaction_id: transaction_id.as_str().to_owned(),
+            }
+        })?;
+        transaction.validate()?;
+        if transaction.stage != InstallationStage::RollbackRequired {
+            return Err(InstallationError::IllegalTransition {
+                from: transaction.stage,
+                to: InstallationStage::RolledBack,
+            });
+        }
+        let unreconciled = transaction
+            .effect_progress
+            .iter()
+            .find_map(|progress| match &progress.state {
+                InstallationEffectProgressState::Unknown { pending_ref } => {
+                    Some(pending_ref.clone())
+                }
+                InstallationEffectProgressState::IntentCommitted { intent_digest, .. } => {
+                    Some(intent_digest.clone())
+                }
+                InstallationEffectProgressState::Pending
+                | InstallationEffectProgressState::Applied { .. } => None,
+            });
+        if let Some(pending_ref) = unreconciled {
+            return self.persist_quarantined(transaction, pending_ref);
+        }
+        for index in (0..transaction.effect_progress.len()).rev() {
+            let InstallationEffectProgressState::Applied {
+                disposition: InstallationEffectDisposition::CreatedByTransaction,
+                ref external_identity,
+                ..
+            } = transaction.effect_progress[index].state
+            else {
+                continue;
+            };
+            let request = effect_request(
+                &transaction,
+                index,
+                1,
+                InstallationEffectAction::Rollback,
+                Some(external_identity.clone()),
+            )?;
+            let observed = match self.port.reconcile(&request) {
+                PortOutcome::Known(observed) => {
+                    observed.validate()?;
+                    observed
+                }
+                other => return self.persist_quarantined(transaction, port_pending(other)),
+            };
+            match observed {
+                InstallationEffectObservation::Absent { .. } => continue,
+                InstallationEffectObservation::Matching {
+                    disposition: InstallationEffectDisposition::CreatedByTransaction,
+                    ref external_identity,
+                    ..
+                } if request.expected_external_identity.as_ref() == Some(external_identity) => {
+                    let _execution = self.port.execute(&request);
+                    let reconciled = match self.port.reconcile(&request) {
+                        PortOutcome::Known(reconciled) => {
+                            reconciled.validate()?;
+                            reconciled
+                        }
+                        other => return self.persist_quarantined(transaction, port_pending(other)),
+                    };
+                    match reconciled {
+                        InstallationEffectObservation::Absent { .. } => continue,
+                        other => {
+                            return self
+                                .persist_quarantined(transaction, observation_pending(&other));
+                        }
+                    }
+                }
+                other => {
+                    return self.persist_quarantined(transaction, observation_pending(&other));
+                }
+            }
+        }
+        let expected = TransactionVersion::of(&transaction)?;
+        transaction.pending_external_changes.clear();
+        transaction.stage = InstallationStage::RolledBack;
+        transaction.completed_stage_refs.push(
+            PlatformHandle::new("rollback:authoritative-absence")
+                .map_err(|error| platform_error(&error))?,
+        );
+        increment_revision(&mut transaction)?;
+        transaction.validate()?;
+        self.store.compare_and_save(expected, &transaction)?;
+        Ok(InstallationStepOutcome::Applied {
+            stage: InstallationStage::RolledBack,
+            evidence_refs: transaction.completed_stage_refs,
+        })
+    }
+
+    fn persist_applied(
+        &mut self,
+        mut transaction: InstallationTransaction,
+        index: usize,
+        disposition: InstallationEffectDisposition,
+        external_identity: PlatformHandle,
+        evidence: Vec<PlatformHandle>,
+        postcondition_digest: PlatformHandle,
+    ) -> Result<InstallationStepOutcome, InstallationError> {
+        let expected = TransactionVersion::of(&transaction)?;
+        transaction.effect_progress[index].state = InstallationEffectProgressState::Applied {
+            disposition,
+            external_identity,
+            evidence: evidence.clone(),
+            postcondition_digest,
+        };
+        transaction.observed_postconditions.extend(evidence.clone());
+        increment_revision(&mut transaction)?;
+        transaction.validate()?;
+        self.store.compare_and_save(expected, &transaction)?;
+        Ok(InstallationStepOutcome::Applied {
+            stage: transaction.stage,
+            evidence_refs: evidence,
+        })
+    }
+
+    fn persist_unknown(
+        &mut self,
+        mut transaction: InstallationTransaction,
+        index: usize,
+        pending_ref: PlatformHandle,
+    ) -> Result<InstallationStepOutcome, InstallationError> {
+        if matches!(
+            transaction.effect_progress[index].state,
+            InstallationEffectProgressState::Pending
+        ) {
+            let request = effect_request(
+                &transaction,
+                index,
+                1,
+                InstallationEffectAction::Apply,
+                None,
+            )?;
+            let expected = TransactionVersion::of(&transaction)?;
+            transaction.effect_progress[index].state =
+                InstallationEffectProgressState::IntentCommitted {
+                    attempt: 1,
+                    intent_digest: request.intent_digest()?,
+                };
+            increment_revision(&mut transaction)?;
+            transaction.validate()?;
+            self.store.compare_and_save(expected, &transaction)?;
+        }
+        let expected = TransactionVersion::of(&transaction)?;
+        transaction.effect_progress[index].state = InstallationEffectProgressState::Unknown {
+            pending_ref: pending_ref.clone(),
+        };
+        transaction.pending_external_changes = vec![pending_ref.clone()];
+        transaction.stage = InstallationStage::RollbackRequired;
+        increment_revision(&mut transaction)?;
+        transaction.validate()?;
+        self.store.compare_and_save(expected, &transaction)?;
+        Ok(InstallationStepOutcome::RollbackRequired {
+            pending_refs: vec![pending_ref],
+        })
+    }
+
+    fn persist_quarantined(
+        &mut self,
+        mut transaction: InstallationTransaction,
+        pending_ref: PlatformHandle,
+    ) -> Result<InstallationStepOutcome, InstallationError> {
+        let expected = TransactionVersion::of(&transaction)?;
+        transaction.pending_external_changes = vec![pending_ref.clone()];
+        transaction.stage = InstallationStage::Quarantined;
+        increment_revision(&mut transaction)?;
+        transaction.validate()?;
+        self.store.compare_and_save(expected, &transaction)?;
+        Ok(InstallationStepOutcome::Quarantined {
+            pending_refs: vec![pending_ref],
+        })
     }
 }
 
-fn expected_stage(
-    current: InstallationStage,
-    operation: InstallationEffectOperation,
-) -> Result<InstallationStage, InstallationError> {
-    let (expected, allowed) = match operation {
-        InstallationEffectOperation::Stage => (
-            InstallationStage::Staging,
-            matches!(current, InstallationStage::Planned),
-        ),
-        InstallationEffectOperation::Register => (
-            InstallationStage::Registering,
-            current == InstallationStage::StaticVerified,
-        ),
-        InstallationEffectOperation::Activate => (
-            InstallationStage::Activating,
-            current == InstallationStage::Registering,
-        ),
-        InstallationEffectOperation::Clean => (
-            InstallationStage::Cleaning,
-            current == InstallationStage::ActiveVerified,
-        ),
-        InstallationEffectOperation::Rollback => (
-            InstallationStage::RolledBack,
-            current == InstallationStage::RollbackRequired,
-        ),
+fn increment_revision(transaction: &mut InstallationTransaction) -> Result<(), InstallationError> {
+    transaction.revision =
+        transaction
+            .revision
+            .checked_add(1)
+            .ok_or_else(|| InstallationError::InvalidField {
+                field: "revision".to_owned(),
+                reason: "overflow".to_owned(),
+            })?;
+    Ok(())
+}
+
+fn effect_request(
+    transaction: &InstallationTransaction,
+    index: usize,
+    attempt: u32,
+    action: InstallationEffectAction,
+    expected_external_identity: Option<PlatformHandle>,
+) -> Result<InstallationEffectRequest, InstallationError> {
+    let plan = transaction
+        .installer_effects
+        .get(index)
+        .ok_or(InstallationError::IdentityConflict)?
+        .clone();
+    let effect_id = plan.effect_id().clone();
+    let change = transaction
+        .planned_changes
+        .iter()
+        .find(|change| change.change_id == effect_id)
+        .ok_or(InstallationError::IdentityConflict)?;
+    let request = InstallationEffectRequest {
+        transaction_id: transaction.transaction_id.clone(),
+        plan,
+        effect_id,
+        attempt,
+        plan_digest: transaction.installer_plan_digest.clone(),
+        precondition: InstallationEffectPrecondition::from_change(change)?,
+        action,
+        expected_external_identity,
     };
-    if !allowed {
-        return Err(InstallationError::IllegalTransition {
-            from: current,
-            to: expected,
-        });
+    request.validate()?;
+    Ok(request)
+}
+
+fn port_pending<T>(outcome: PortOutcome<T>) -> PlatformHandle {
+    let value = match outcome {
+        PortOutcome::Known(_) => "unknown:unexpected-known".to_owned(),
+        PortOutcome::Unknown(reason) => format!("unknown:{reason:?}"),
+        PortOutcome::Partial { missing, .. } => missing.first().map_or_else(
+            || "unknown:partial".to_owned(),
+            |value| value.as_str().to_owned(),
+        ),
+        PortOutcome::Error(error) => format!("error:{error}"),
+    };
+    PlatformHandle::new(value).unwrap_or_else(|_| unreachable!())
+}
+
+fn observation_pending(observation: &InstallationEffectObservation) -> PlatformHandle {
+    match observation {
+        InstallationEffectObservation::Mismatch { pending_ref } => pending_ref.clone(),
+        InstallationEffectObservation::Matching {
+            external_identity, ..
+        } => external_identity.clone(),
+        InstallationEffectObservation::Absent { evidence, .. } => {
+            evidence.first().cloned().unwrap_or_else(|| unreachable!())
+        }
     }
-    Ok(expected)
 }
 
 /// A read-only adapter-backed inspection helper.
@@ -3643,20 +4406,161 @@ where
 
 #[cfg(test)]
 mod tests {
+    use std::collections::VecDeque;
+    use std::sync::{Arc, Mutex};
+
     use super::*;
     #[cfg(windows)]
     use eliot_platform_windows::UserOwnedRootLease;
 
-    struct KnownEffectPort {
-        observation: InstallationEffectObservation,
+    #[derive(Clone, Default)]
+    struct SharedStore {
+        state: Arc<Mutex<Option<InstallationTransaction>>>,
+        conflict_next: Arc<Mutex<bool>>,
     }
 
-    impl InstallationEffectPort for KnownEffectPort {
+    impl InstallationTransactionStore for SharedStore {
+        fn create_planned(
+            &mut self,
+            transaction: &InstallationTransaction,
+        ) -> Result<(), InstallationError> {
+            transaction.validate()?;
+            if !transaction.is_constructor_planned() {
+                return Err(InstallationError::InvalidField {
+                    field: "transaction".to_owned(),
+                    reason: "not constructor-planned".to_owned(),
+                });
+            }
+            let mut state = self.state.lock().unwrap_or_else(|_| unreachable!());
+            if state.is_some() {
+                return Err(InstallationError::CompareAndSaveConflict {
+                    expected: 0,
+                    actual: transaction.revision,
+                });
+            }
+            *state = Some(transaction.clone());
+            Ok(())
+        }
+
+        fn load(
+            &self,
+            transaction_id: &PlatformHandle,
+        ) -> Result<Option<InstallationTransaction>, InstallationError> {
+            Ok(self
+                .state
+                .lock()
+                .unwrap_or_else(|_| unreachable!())
+                .as_ref()
+                .filter(|transaction| transaction.transaction_id == *transaction_id)
+                .cloned())
+        }
+    }
+
+    impl transaction_store_private::Sealed for SharedStore {
+        fn compare_and_save(
+            &mut self,
+            expected: TransactionVersion,
+            transaction: &InstallationTransaction,
+        ) -> Result<(), InstallationError> {
+            if std::mem::take(&mut *self.conflict_next.lock().unwrap_or_else(|_| unreachable!())) {
+                return Err(InstallationError::CompareAndSaveConflict {
+                    expected: expected.revision,
+                    actual: expected.revision + 1,
+                });
+            }
+            let mut state = self.state.lock().unwrap_or_else(|_| unreachable!());
+            let current = state
+                .as_ref()
+                .ok_or_else(|| InstallationError::TransactionNotFound {
+                    transaction_id: transaction.transaction_id.as_str().to_owned(),
+                })?;
+            let current_version = TransactionVersion::of(current)?;
+            if current_version.revision != expected.revision {
+                return Err(InstallationError::CompareAndSaveConflict {
+                    expected: expected.revision,
+                    actual: current_version.revision,
+                });
+            }
+            if current_version.checksum != expected.checksum {
+                return Err(InstallationError::IdentityConflict);
+            }
+            if transaction.revision != expected.revision + 1 {
+                return Err(InstallationError::InvalidField {
+                    field: "revision".to_owned(),
+                    reason: "compare_and_save requires exactly one revision step".to_owned(),
+                });
+            }
+            *state = Some(transaction.clone());
+            Ok(())
+        }
+    }
+
+    struct FakeEffectPort {
+        shared: SharedStore,
+        inspections: VecDeque<PortOutcome<InstallationEffectObservation>>,
+        reconciliations: VecDeque<PortOutcome<InstallationEffectObservation>>,
+        execute_count: Arc<Mutex<usize>>,
+        panic_reconcile_once: bool,
+    }
+
+    impl InstallationEffectPort for FakeEffectPort {
         fn execute(
+            &mut self,
+            request: &InstallationEffectRequest,
+        ) -> PortOutcome<InstallationEffectExecution> {
+            let state = self
+                .shared
+                .load(&request.transaction_id)
+                .unwrap_or_else(|_| unreachable!())
+                .unwrap_or_else(|| unreachable!());
+            assert!(state.effect_progress.iter().any(|progress| {
+                if progress.effect_id != request.effect_id {
+                    return false;
+                }
+                match request.action {
+                    InstallationEffectAction::Apply => matches!(
+                        progress.state,
+                        InstallationEffectProgressState::IntentCommitted { attempt, .. }
+                            if attempt == request.attempt
+                    ),
+                    InstallationEffectAction::Rollback => matches!(
+                        &progress.state,
+                        InstallationEffectProgressState::Applied {
+                            disposition: InstallationEffectDisposition::CreatedByTransaction,
+                            external_identity,
+                            ..
+                        } if request.expected_external_identity.as_ref() == Some(external_identity)
+                    ),
+                }
+            }));
+            *self.execute_count.lock().unwrap_or_else(|_| unreachable!()) += 1;
+            PortOutcome::Known(InstallationEffectExecution {
+                evidence: vec![test_handle("evidence:execute-ack")],
+            })
+        }
+
+        fn inspect(
             &mut self,
             _request: &InstallationEffectRequest,
         ) -> PortOutcome<InstallationEffectObservation> {
-            PortOutcome::Known(self.observation.clone())
+            self.inspections.pop_front().unwrap_or(PortOutcome::Unknown(
+                eliot_platform::UnknownReason::Indeterminate,
+            ))
+        }
+
+        fn reconcile(
+            &mut self,
+            _request: &InstallationEffectRequest,
+        ) -> PortOutcome<InstallationEffectObservation> {
+            assert!(
+                !std::mem::take(&mut self.panic_reconcile_once),
+                "simulated crash after external mutation"
+            );
+            self.reconciliations
+                .pop_front()
+                .unwrap_or(PortOutcome::Unknown(
+                    eliot_platform::UnknownReason::Indeterminate,
+                ))
         }
     }
 
@@ -3941,6 +4845,454 @@ mod tests {
         transaction
     }
 
+    fn planned_transaction() -> InstallationTransaction {
+        let transaction = registering_transaction();
+        must(InstallationTransaction::new(
+            transaction.transaction_id,
+            transaction.installation_epoch,
+            transaction.profile,
+            transaction.request,
+            transaction.current_active_manifest,
+            transaction.candidate_manifest,
+            transaction.staging_root,
+            transaction.planned_changes,
+            transaction.installer_effects,
+            transaction.minimum_store_available_bytes,
+            transaction.precondition_evidence,
+            transaction.recovery_command,
+        ))
+    }
+
+    fn absent(transaction: &InstallationTransaction) -> InstallationEffectObservation {
+        let precondition = must(InstallationEffectPrecondition::from_change(
+            &transaction.planned_changes[0],
+        ));
+        InstallationEffectObservation::Absent {
+            precondition_digest: precondition.digest,
+            evidence: vec![test_handle("evidence:absent")],
+        }
+    }
+
+    fn matching(disposition: InstallationEffectDisposition) -> InstallationEffectObservation {
+        InstallationEffectObservation::Matching {
+            disposition,
+            external_identity: test_handle("external:effect-0"),
+            evidence: vec![test_handle("evidence:matching")],
+            postcondition_digest: test_handle("a".repeat(64)),
+        }
+    }
+
+    fn fake_port(
+        store: SharedStore,
+        inspections: Vec<PortOutcome<InstallationEffectObservation>>,
+        reconciliations: Vec<PortOutcome<InstallationEffectObservation>>,
+        execute_count: Arc<Mutex<usize>>,
+    ) -> FakeEffectPort {
+        FakeEffectPort {
+            shared: store,
+            inspections: inspections.into(),
+            reconciliations: reconciliations.into(),
+            execute_count,
+            panic_reconcile_once: false,
+        }
+    }
+
+    #[test]
+    fn durable_coordinator_commits_intent_before_effect() {
+        let transaction = planned_transaction();
+        let transaction_id = transaction.transaction_id.clone();
+        let mut store = SharedStore::default();
+        must(store.create_planned(&transaction));
+        let execute_count = Arc::new(Mutex::new(0));
+        let port = fake_port(
+            store.clone(),
+            vec![PortOutcome::Known(absent(&transaction))],
+            vec![PortOutcome::Known(matching(
+                InstallationEffectDisposition::CreatedByTransaction,
+            ))],
+            execute_count.clone(),
+        );
+        let mut coordinator = InstallationCoordinator::new(port, store.clone());
+
+        let outcome = must(coordinator.drive_effect(&transaction_id));
+
+        assert!(matches!(outcome, InstallationStepOutcome::Applied { .. }));
+        assert_eq!(*execute_count.lock().unwrap_or_else(|_| unreachable!()), 1);
+        let saved = must(store.load(&transaction_id)).unwrap_or_else(|| unreachable!());
+        assert!(matches!(
+            saved.effect_progress[0].state,
+            InstallationEffectProgressState::Applied {
+                disposition: InstallationEffectDisposition::CreatedByTransaction,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn crash_after_mutation_reconciles_without_replay_and_receipt_never_replays() {
+        let transaction = planned_transaction();
+        let transaction_id = transaction.transaction_id.clone();
+        let mut store = SharedStore::default();
+        must(store.create_planned(&transaction));
+        let execute_count = Arc::new(Mutex::new(0));
+        let mut crashing_port = fake_port(
+            store.clone(),
+            vec![PortOutcome::Known(absent(&transaction))],
+            Vec::new(),
+            execute_count.clone(),
+        );
+        crashing_port.panic_reconcile_once = true;
+        let mut coordinator = InstallationCoordinator::new(crashing_port, store.clone());
+        let crashed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = coordinator.drive_effect(&transaction_id);
+        }));
+        assert!(crashed.is_err());
+        assert_eq!(*execute_count.lock().unwrap_or_else(|_| unreachable!()), 1);
+        let intent = must(store.load(&transaction_id)).unwrap_or_else(|| unreachable!());
+        assert!(matches!(
+            intent.effect_progress[0].state,
+            InstallationEffectProgressState::IntentCommitted { .. }
+        ));
+
+        let recovering_port = fake_port(
+            store.clone(),
+            Vec::new(),
+            vec![PortOutcome::Known(matching(
+                InstallationEffectDisposition::CreatedByTransaction,
+            ))],
+            execute_count.clone(),
+        );
+        let mut recovering = InstallationCoordinator::new(recovering_port, store.clone());
+        must(recovering.drive_effect(&transaction_id));
+        assert_eq!(*execute_count.lock().unwrap_or_else(|_| unreachable!()), 1);
+
+        let mut complete = must(store.load(&transaction_id)).unwrap_or_else(|| unreachable!());
+        for (index, progress) in complete.effect_progress.iter_mut().enumerate().skip(1) {
+            progress.state = InstallationEffectProgressState::Applied {
+                disposition: InstallationEffectDisposition::PreexistingMatching,
+                external_identity: test_handle(format!("external:receipt-{index}")),
+                evidence: vec![test_handle(format!("evidence:receipt-{index}"))],
+                postcondition_digest: test_handle(format!("{index:064x}")),
+            };
+        }
+        complete.revision += 1;
+        must(complete.validate());
+        *store.state.lock().unwrap_or_else(|_| unreachable!()) = Some(complete);
+
+        let receipt_port = fake_port(store.clone(), Vec::new(), Vec::new(), execute_count.clone());
+        let mut receipt = InstallationCoordinator::new(receipt_port, store);
+        must(receipt.drive_effect(&transaction_id));
+        assert_eq!(*execute_count.lock().unwrap_or_else(|_| unreachable!()), 1);
+    }
+
+    #[test]
+    fn preexisting_matching_is_receipted_without_execution() {
+        let transaction = planned_transaction();
+        let transaction_id = transaction.transaction_id.clone();
+        let mut store = SharedStore::default();
+        must(store.create_planned(&transaction));
+        let execute_count = Arc::new(Mutex::new(0));
+        let port = fake_port(
+            store.clone(),
+            vec![PortOutcome::Known(matching(
+                InstallationEffectDisposition::PreexistingMatching,
+            ))],
+            Vec::new(),
+            execute_count.clone(),
+        );
+        let mut coordinator = InstallationCoordinator::new(port, store.clone());
+        must(coordinator.drive_effect(&transaction_id));
+        assert_eq!(*execute_count.lock().unwrap_or_else(|_| unreachable!()), 0);
+        let saved = must(store.load(&transaction_id)).unwrap_or_else(|| unreachable!());
+        assert!(matches!(
+            saved.effect_progress[0].state,
+            InstallationEffectProgressState::Applied {
+                disposition: InstallationEffectDisposition::PreexistingMatching,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn cas_conflict_happens_before_external_effect() {
+        let transaction = planned_transaction();
+        let transaction_id = transaction.transaction_id.clone();
+        let mut store = SharedStore::default();
+        must(store.create_planned(&transaction));
+        *store
+            .conflict_next
+            .lock()
+            .unwrap_or_else(|_| unreachable!()) = true;
+        let execute_count = Arc::new(Mutex::new(0));
+        let port = fake_port(
+            store.clone(),
+            vec![PortOutcome::Known(absent(&transaction))],
+            Vec::new(),
+            execute_count.clone(),
+        );
+        let mut coordinator = InstallationCoordinator::new(port, store);
+        let result = coordinator.drive_effect(&transaction_id);
+        assert!(matches!(
+            result,
+            Err(InstallationError::CompareAndSaveConflict { .. })
+        ));
+        assert_eq!(*execute_count.lock().unwrap_or_else(|_| unreachable!()), 0);
+    }
+
+    #[test]
+    fn cas_binds_full_previous_state_at_the_same_revision() {
+        let transaction = planned_transaction();
+        let expected = must(TransactionVersion::of(&transaction));
+        let mut store = SharedStore::default();
+        must(store.create_planned(&transaction));
+
+        let mut drifted = transaction.clone();
+        drifted
+            .precondition_evidence
+            .push(test_handle("evidence:same-revision-drift"));
+        must(drifted.validate());
+        *store.state.lock().unwrap_or_else(|_| unreachable!()) = Some(drifted);
+
+        let mut advanced = transaction;
+        must(advanced.advance(
+            InstallationStage::Staging,
+            vec![test_handle("evidence:advance")],
+        ));
+        assert!(matches!(
+            transaction_store_private::Sealed::compare_and_save(&mut store, expected, &advanced),
+            Err(InstallationError::IdentityConflict)
+        ));
+    }
+
+    #[test]
+    fn retry_requires_authoritative_absence_and_unchanged_precondition() {
+        let transaction = planned_transaction();
+        let transaction_id = transaction.transaction_id.clone();
+        let mut store = SharedStore::default();
+        must(store.create_planned(&transaction));
+        let execute_count = Arc::new(Mutex::new(0));
+        let port = fake_port(
+            store.clone(),
+            vec![PortOutcome::Known(absent(&transaction))],
+            vec![
+                PortOutcome::Known(absent(&transaction)),
+                PortOutcome::Known(absent(&transaction)),
+                PortOutcome::Known(matching(
+                    InstallationEffectDisposition::CreatedByTransaction,
+                )),
+            ],
+            execute_count.clone(),
+        );
+        let mut coordinator = InstallationCoordinator::new(port, store.clone());
+        assert_eq!(
+            must(coordinator.drive_effect(&transaction_id)),
+            InstallationStepOutcome::Rejected
+        );
+        assert_eq!(*execute_count.lock().unwrap_or_else(|_| unreachable!()), 1);
+        must(coordinator.drive_effect(&transaction_id));
+        assert_eq!(*execute_count.lock().unwrap_or_else(|_| unreachable!()), 2);
+        let saved = must(store.load(&transaction_id)).unwrap_or_else(|| unreachable!());
+        assert!(matches!(
+            saved.effect_progress[0].state,
+            InstallationEffectProgressState::Applied { .. }
+        ));
+    }
+
+    #[test]
+    fn inspect_unknown_entering_rollback_persists_quarantine() {
+        let transaction = planned_transaction();
+        let transaction_id = transaction.transaction_id.clone();
+        let mut store = SharedStore::default();
+        must(store.create_planned(&transaction));
+        let execute_count = Arc::new(Mutex::new(0));
+        let port = fake_port(store.clone(), Vec::new(), Vec::new(), execute_count.clone());
+        let mut coordinator = InstallationCoordinator::new(port, store.clone());
+        let outcome = must(coordinator.drive_effect(&transaction_id));
+        assert!(matches!(
+            outcome,
+            InstallationStepOutcome::RollbackRequired { .. }
+        ));
+        let saved = must(store.load(&transaction_id)).unwrap_or_else(|| unreachable!());
+        assert_eq!(saved.stage, InstallationStage::RollbackRequired);
+        let rollback_port = fake_port(store.clone(), Vec::new(), Vec::new(), execute_count);
+        let mut rollback = InstallationCoordinator::new(rollback_port, store.clone());
+        let outcome = must(rollback.rollback(&transaction_id));
+        assert!(matches!(
+            outcome,
+            InstallationStepOutcome::Quarantined { .. }
+        ));
+        let saved = must(store.load(&transaction_id)).unwrap_or_else(|| unreachable!());
+        assert_eq!(saved.stage, InstallationStage::Quarantined);
+        assert!(matches!(
+            saved.effect_progress[0].state,
+            InstallationEffectProgressState::Unknown { .. }
+        ));
+    }
+
+    #[test]
+    fn unreconciled_intent_entering_rollback_persists_quarantine() {
+        let mut transaction = planned_transaction();
+        let transaction_id = transaction.transaction_id.clone();
+        let intent_digest = must(effect_request(
+            &transaction,
+            0,
+            1,
+            InstallationEffectAction::Apply,
+            None,
+        ))
+        .intent_digest()
+        .unwrap_or_else(|error| panic!("intent digest: {error}"));
+        transaction.effect_progress[0].state = InstallationEffectProgressState::IntentCommitted {
+            attempt: 1,
+            intent_digest: intent_digest.clone(),
+        };
+        transaction.pending_external_changes = vec![intent_digest];
+        transaction.stage = InstallationStage::RollbackRequired;
+        transaction.revision = 3;
+        must(transaction.validate());
+        let store = SharedStore {
+            state: Arc::new(Mutex::new(Some(transaction))),
+            ..SharedStore::default()
+        };
+        let execute_count = Arc::new(Mutex::new(0));
+        let port = fake_port(store.clone(), Vec::new(), Vec::new(), execute_count.clone());
+        let mut coordinator = InstallationCoordinator::new(port, store.clone());
+
+        assert!(matches!(
+            must(coordinator.rollback(&transaction_id)),
+            InstallationStepOutcome::Quarantined { .. }
+        ));
+        assert_eq!(*execute_count.lock().unwrap_or_else(|_| unreachable!()), 0);
+        let saved = must(store.load(&transaction_id)).unwrap_or_else(|| unreachable!());
+        assert_eq!(saved.stage, InstallationStage::Quarantined);
+    }
+
+    #[test]
+    fn progress_is_exactly_one_to_one_and_plan_digest_is_immutable() {
+        let mut transaction = planned_transaction();
+        transaction.effect_progress.pop();
+        assert!(matches!(
+            transaction.validate(),
+            Err(InstallationError::IdentityConflict)
+        ));
+
+        let mut transaction = planned_transaction();
+        transaction.effect_progress[0].effect_id = test_handle("effect:wrong");
+        assert!(matches!(
+            transaction.validate(),
+            Err(InstallationError::IdentityConflict)
+        ));
+
+        let mut transaction = planned_transaction();
+        transaction.installer_plan_digest = test_handle("c".repeat(64));
+        assert!(transaction.validate().is_err());
+
+        let mut transaction = planned_transaction();
+        transaction.effect_progress[1].state = InstallationEffectProgressState::Applied {
+            disposition: InstallationEffectDisposition::PreexistingMatching,
+            external_identity: test_handle("external:out-of-order"),
+            evidence: vec![test_handle("evidence:out-of-order")],
+            postcondition_digest: test_handle("d".repeat(64)),
+        };
+        assert!(transaction.validate().is_err());
+    }
+
+    #[test]
+    fn effect_request_carries_exactly_one_plan_and_precondition() {
+        let transaction = planned_transaction();
+        let request = must(effect_request(
+            &transaction,
+            0,
+            1,
+            InstallationEffectAction::Apply,
+            None,
+        ));
+        assert_eq!(
+            request.effect_id,
+            *transaction.installer_effects[0].effect_id()
+        );
+        assert_eq!(request.plan_digest, transaction.installer_plan_digest);
+        assert_eq!(
+            request.precondition.evidence_refs,
+            transaction.planned_changes[0].precondition_refs
+        );
+        let encoded = must(serde_json::to_value(request));
+        assert!(encoded.get("plan").is_some());
+        assert!(encoded.get("change_refs").is_none());
+        assert!(encoded.get("candidate_generation").is_none());
+        assert!(encoded.get("installation").is_none());
+    }
+
+    #[test]
+    fn create_planned_rejects_caller_advanced_state() {
+        let mut transaction = planned_transaction();
+        transaction.stage = InstallationStage::Staging;
+        transaction.completed_stage_refs = vec![test_handle("evidence:advanced")];
+        transaction.revision = 2;
+        let mut store = SharedStore::default();
+        assert!(store.create_planned(&transaction).is_err());
+    }
+
+    #[test]
+    fn v2_transaction_json_requires_explicit_migration() {
+        let mut legacy = must(serde_json::to_value(planned_transaction()));
+        let object = legacy.as_object_mut().unwrap_or_else(|| unreachable!());
+        object.remove("transaction_wire_version");
+        object.remove("effect_progress");
+        let bytes = must(serde_json::to_vec(&legacy));
+        assert!(matches!(
+            decode_installation_transaction_json(&bytes),
+            Err(InstallationError::MigrationRequired { .. })
+        ));
+    }
+
+    #[test]
+    fn redb_transaction_store_round_trips_and_enforces_cas() {
+        let path = std::env::temp_dir().join(format!(
+            "eliot-installation-transaction-roundtrip-{}.redb",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let transaction = planned_transaction();
+        let id = transaction.transaction_id.clone();
+        let mut store = must(RedbInstallationTransactionStore::create_at_exact_path(
+            &path,
+        ));
+        must(store.create_planned(&transaction));
+        assert_eq!(must(store.load(&id)), Some(transaction.clone()));
+        drop(store);
+        let mut store = must(RedbInstallationTransactionStore::open_existing_exact_path(
+            &path,
+        ));
+
+        let mut advanced = transaction;
+        must(advanced.advance(
+            InstallationStage::Staging,
+            vec![test_handle("evidence:redb-cas")],
+        ));
+        let initial_version = must(TransactionVersion::of(
+            &must(store.load(&id)).unwrap_or_else(|| unreachable!()),
+        ));
+        must(transaction_store_private::Sealed::compare_and_save(
+            &mut store,
+            initial_version.clone(),
+            &advanced,
+        ));
+        assert!(matches!(
+            transaction_store_private::Sealed::compare_and_save(
+                &mut store,
+                initial_version,
+                &advanced,
+            ),
+            Err(InstallationError::CompareAndSaveConflict {
+                expected: 1,
+                actual: 2
+            })
+        ));
+        drop(store);
+        let _ = std::fs::remove_file(path);
+    }
+
     #[test]
     fn portable_runtime_roots_accept_distinct_sibling_topology() {
         let directory = std::env::temp_dir().join("eliot-portable-root-siblings");
@@ -4215,36 +5567,6 @@ mod tests {
 
         transaction.installer_effects[0] = transaction.installer_effects[1].clone();
         assert!(transaction.validate().is_err());
-    }
-
-    #[test]
-    fn activate_with_crossed_no_return_advances_before_recording_boundary() {
-        let mut transaction = registering_transaction();
-        let evidence = test_handle("evidence:activated");
-        let boundary = test_handle("activation:pointer:generation-candidate");
-        let starting_revision = transaction.revision;
-        let observation = InstallationEffectObservation {
-            transaction_id: transaction.transaction_id.clone(),
-            operation: InstallationEffectOperation::Activate,
-            external_identity: boundary.clone(),
-            evidence_refs: vec![evidence.clone()],
-            crossed_no_return: true,
-        };
-        let mut coordinator = InstallationCoordinator::new(KnownEffectPort { observation });
-
-        let outcome =
-            must(coordinator.apply(&mut transaction, InstallationEffectOperation::Activate));
-
-        assert_eq!(
-            outcome,
-            InstallationStepOutcome::Applied {
-                stage: InstallationStage::Activating,
-                evidence_refs: vec![evidence],
-            }
-        );
-        assert_eq!(transaction.stage, InstallationStage::Activating);
-        assert_eq!(transaction.no_return_boundary.as_ref(), Some(&boundary));
-        assert_eq!(transaction.revision, starting_revision + 1);
     }
 
     #[test]
