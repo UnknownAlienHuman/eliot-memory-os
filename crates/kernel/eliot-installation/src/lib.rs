@@ -52,7 +52,7 @@ pub use credential_provision::{
     credential_absent_response_digest, credential_control_request_frame,
     credential_control_response_frame, credential_deleted_response_digest,
     credential_matching_response_digest, decode_credential_control_request_frame,
-    decode_credential_control_response_frame,
+    decode_credential_control_response_frame, validate_store_credential_target,
 };
 pub use redb_state::RedbInstallationTransactionStore;
 
@@ -1503,6 +1503,8 @@ pub struct CandidateManifest {
     pub license_refs: Vec<PlatformHandle>,
     /// Candidate configuration digest.
     pub config_digest: PlatformHandle,
+    /// Exact Credential Manager target bound to this candidate generation.
+    pub store_credential_target: PlatformHandle,
     /// Installation-approved public-key fingerprint for supervision leases.
     pub supervision_key_fingerprint: PlatformHandle,
     /// Signature/approval evidence reference.
@@ -1545,6 +1547,12 @@ pub struct RuntimeLaunchDescriptor {
     pub kernel_artifact_digest: PlatformHandle,
     /// Explicit concrete Store bridge configuration path.
     pub store_config_path: PlatformHandle,
+    /// Exact Credential Manager target provisioned for this Store generation.
+    ///
+    /// This is the same canonical target admitted by
+    /// [`StoreCredentialProvisionPlan`]. It is part of the launch descriptor
+    /// digest and therefore cannot be changed without re-staging the manifest.
+    pub store_credential_target: PlatformHandle,
     /// Approved Store bridge image retained for the later Kernel route.
     pub store_bridge_executable_path: PlatformHandle,
     /// SHA-256 digest of the approved Store bridge image.
@@ -1714,6 +1722,7 @@ impl RuntimeLaunchDescriptor {
             kernel_work_root: &'a PlatformHandle,
             kernel_artifact_digest: &'a PlatformHandle,
             store_config_path: &'a PlatformHandle,
+            store_credential_target: &'a PlatformHandle,
             store_bootstrap_descriptor_path: &'a PlatformHandle,
             store_bootstrap_descriptor_digest: &'a PlatformHandle,
             canonical_store_executable_path: &'a PlatformHandle,
@@ -1739,6 +1748,7 @@ impl RuntimeLaunchDescriptor {
             kernel_work_root: &self.kernel_work_root,
             kernel_artifact_digest: &self.kernel_artifact_digest,
             store_config_path: &self.store_config_path,
+            store_credential_target: &self.store_credential_target,
             store_bootstrap_descriptor_path: &self.store_bootstrap_descriptor_path,
             store_bootstrap_descriptor_digest: &self.store_bootstrap_descriptor_digest,
             canonical_store_executable_path: &self.canonical_store_executable_path,
@@ -1812,6 +1822,17 @@ impl RuntimeLaunchDescriptor {
         )?;
         handle(&self.store_config_path, "runtime_launch.store_config_path")?;
         approved_path(&self.store_config_path, "runtime_launch.store_config_path")?;
+        handle(
+            &self.store_credential_target,
+            "runtime_launch.store_credential_target",
+        )?;
+        if let Err(reason) = validate_store_credential_target(self.store_credential_target.as_str())
+        {
+            return Err(InstallationError::InvalidField {
+                field: "runtime_launch.store_credential_target".to_owned(),
+                reason,
+            });
+        }
         handle(
             &self.store_bootstrap_descriptor_path,
             "runtime_launch.store_bootstrap_descriptor_path",
@@ -2059,6 +2080,23 @@ impl CandidateManifest {
             return Err(InstallationError::InvalidField {
                 field: "manifest.runtime_launch.store_config_path".to_owned(),
                 reason: "must exactly equal the approved manifest config_path".to_owned(),
+            });
+        }
+        handle(
+            &self.store_credential_target,
+            "manifest.store_credential_target",
+        )?;
+        if let Err(reason) = validate_store_credential_target(self.store_credential_target.as_str())
+        {
+            return Err(InstallationError::InvalidField {
+                field: "manifest.store_credential_target".to_owned(),
+                reason,
+            });
+        }
+        if self.runtime_launch.store_credential_target != self.store_credential_target {
+            return Err(InstallationError::InvalidField {
+                field: "manifest.runtime_launch.store_credential_target".to_owned(),
+                reason: "must exactly equal the approved manifest credential target".to_owned(),
             });
         }
         if self.runtime_launch.store_bootstrap_descriptor_path == self.config_path {
@@ -2537,6 +2575,93 @@ struct V1RuntimeLaunchDescriptorWire {
     descriptor_digest: PlatformHandle,
 }
 
+#[allow(
+    dead_code,
+    reason = "pre-credential-binding wire mirror is used for strict migration discrimination"
+)]
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PreCredentialBindingRegistryWire {
+    generations: Vec<PreCredentialBindingApprovedGenerationWire>,
+    active_generation: Option<PlatformHandle>,
+    last_known_good_generation: Option<PlatformHandle>,
+    #[serde(default)]
+    pending_activation: Option<serde_json::Value>,
+    #[serde(default)]
+    last_terminal_activation: Option<serde_json::Value>,
+}
+
+#[allow(
+    dead_code,
+    reason = "pre-credential-binding wire mirror is used for strict migration discrimination"
+)]
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PreCredentialBindingApprovedGenerationWire {
+    manifest: PreCredentialBindingCandidateManifestWire,
+    approval_ref: PlatformHandle,
+    active: bool,
+    last_known_good: bool,
+}
+
+#[allow(
+    dead_code,
+    reason = "pre-credential-binding wire mirror is used for strict migration discrimination"
+)]
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PreCredentialBindingCandidateManifestWire {
+    generation: PlatformHandle,
+    components: Vec<PlatformHandle>,
+    kernel_artifact_digest: PlatformHandle,
+    store_bridge_artifact_digest: PlatformHandle,
+    canonical_store_artifact_digest: PlatformHandle,
+    kernel_executable_path: PlatformHandle,
+    store_bridge_executable_path: PlatformHandle,
+    canonical_store_executable_path: PlatformHandle,
+    config_path: PlatformHandle,
+    dependency_closure_refs: Vec<PlatformHandle>,
+    license_refs: Vec<PlatformHandle>,
+    config_digest: PlatformHandle,
+    supervision_key_fingerprint: PlatformHandle,
+    signature_ref: PlatformHandle,
+    runtime_state_roots_digest: PlatformHandle,
+    runtime_launch: PreCredentialBindingRuntimeLaunchDescriptorWire,
+}
+
+#[allow(
+    dead_code,
+    reason = "pre-credential-binding wire mirror is used for strict migration discrimination"
+)]
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PreCredentialBindingRuntimeLaunchDescriptorWire {
+    profile: InstallationProfile,
+    portable_root: Option<PlatformHandle>,
+    installation_epoch: InstallationEpoch,
+    generation: PlatformHandle,
+    authority_generation: ResourceGeneration,
+    authority_state_fence: StateFence,
+    authority_descriptor_path: PlatformHandle,
+    authority_descriptor_digest: PlatformHandle,
+    runtime_state_roots: RuntimeStateRoots,
+    kernel_work_root: PlatformHandle,
+    kernel_artifact_digest: PlatformHandle,
+    store_config_path: PlatformHandle,
+    store_bridge_executable_path: PlatformHandle,
+    store_bridge_artifact_digest: PlatformHandle,
+    store_bootstrap_descriptor_path: PlatformHandle,
+    store_bootstrap_descriptor_digest: PlatformHandle,
+    canonical_store_executable_path: PlatformHandle,
+    canonical_store_artifact_digest: PlatformHandle,
+    kernel_arguments: Vec<PlatformHandle>,
+    store_bridge_arguments: Vec<PlatformHandle>,
+    canonical_store_arguments: Vec<PlatformHandle>,
+    watchdog_executable_path: PlatformHandle,
+    watchdog_artifact_digest: PlatformHandle,
+    descriptor_digest: PlatformHandle,
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct PrePendingRegistryWire {
@@ -2556,7 +2681,12 @@ fn decode_registry_bytes(bytes: &[u8]) -> Result<ApprovedGenerationRegistry, Ins
             Ok(registry)
         }
         Err(_) => {
-            if serde_json::from_slice::<PreSplitRegistryWire>(bytes).is_ok() {
+            if serde_json::from_slice::<PreCredentialBindingRegistryWire>(bytes).is_ok() {
+                Err(InstallationError::MigrationRequired {
+                    reason: "approved-generation registry predates the descriptor-bound Store credential target and requires explicit re-stage"
+                        .to_owned(),
+                })
+            } else if serde_json::from_slice::<PreSplitRegistryWire>(bytes).is_ok() {
                 Err(InstallationError::MigrationRequired {
                     reason: "approved-generation registry predates split Store bridge/provider argv and requires explicit re-stage"
                         .to_owned(),
@@ -3487,6 +3617,7 @@ fn validate_effect_profile(
 fn validate_installer_effects(
     profile: InstallationProfile,
     roots: &RuntimeStateRoots,
+    store_credential_target: &PlatformHandle,
     planned_changes: &[PlannedChange],
     effects: &[InstallerEffectPlan],
 ) -> Result<(), InstallationError> {
@@ -3605,6 +3736,13 @@ fn validate_installer_effects(
                 }
             }
             InstallerEffectPlan::ProvisionStoreCredential { provision, .. } => {
+                if provision.target != *store_credential_target {
+                    return Err(InstallationError::InvalidField {
+                        field: "installer_effect.provision.target".to_owned(),
+                        reason: "must exactly equal the candidate runtime launch credential target"
+                            .to_owned(),
+                    });
+                }
                 let host_root = WindowsPathIdentity::parse_root(
                     roots.host_state_root.as_str(),
                     "runtime_roots.host_state_root",
@@ -4108,6 +4246,7 @@ impl InstallationTransaction {
         validate_installer_effects(
             profile,
             &candidate_manifest.runtime_launch.runtime_state_roots,
+            &candidate_manifest.store_credential_target,
             &planned_changes,
             &installer_effects,
         )?;
@@ -4260,6 +4399,7 @@ impl InstallationTransaction {
         validate_installer_effects(
             self.profile,
             &self.candidate_manifest.runtime_launch.runtime_state_roots,
+            &self.candidate_manifest.store_credential_target,
             &self.planned_changes,
             &self.installer_effects,
         )?;
@@ -8598,6 +8738,7 @@ mod tests {
             dependency_closure_refs: vec![test_handle("evidence:dependency-closure")],
             license_refs: vec![test_handle("evidence:licenses")],
             config_digest: test_handle("2".repeat(64)),
+            store_credential_target: test_handle("eliot/store/v1/0123456789abcdef0123456789abcdef"),
             supervision_key_fingerprint: test_handle("3".repeat(64)),
             signature_ref: test_handle("evidence:signature"),
             runtime_state_roots_digest: runtime_state_roots.roots_digest.clone(),
@@ -8622,6 +8763,9 @@ mod tests {
                     kernel_work_root: runtime_state_roots.kernel_work_root.clone(),
                     kernel_artifact_digest: test_handle("0".repeat(64)),
                     store_config_path: test_path(&root, "generation.json"),
+                    store_credential_target: test_handle(
+                        "eliot/store/v1/0123456789abcdef0123456789abcdef",
+                    ),
                     store_bridge_executable_path: test_path(&root, "eliot-store-surreal.exe"),
                     store_bridge_artifact_digest: test_handle("1".repeat(64)),
                     store_bootstrap_descriptor_path: test_path(&root, "store-bootstrap.json"),
@@ -10087,6 +10231,7 @@ mod tests {
             validate_installer_effects(
                 InstallationProfile::SystemService,
                 &roots,
+                &test_handle("eliot/store/v1/0123456789abcdef0123456789abcdef"),
                 &changes,
                 &effects,
             )
@@ -10136,6 +10281,39 @@ mod tests {
     }
 
     #[test]
+    fn installer_plan_rejects_credential_target_not_bound_to_candidate_launch() {
+        let program_data = must(protected_program_data_root());
+        let roots = must(RuntimeStateRoots::derive_profiled(
+            InstallationProfile::SystemService,
+            test_handle(program_data.to_string_lossy().into_owned()),
+            &"f".repeat(64),
+        ));
+        let (changes, mut effects) = installer_plan_parts(&roots);
+        let credential_effect = effects
+            .iter_mut()
+            .find_map(|effect| match effect {
+                InstallerEffectPlan::ProvisionStoreCredential { provision, .. } => Some(provision),
+                _ => None,
+            })
+            .unwrap_or_else(|| unreachable!());
+        credential_effect.target = test_handle("eliot/store/v1/fedcba9876543210fedcba9876543210");
+        let Err(error) = validate_installer_effects(
+            InstallationProfile::SystemService,
+            &roots,
+            &test_handle("eliot/store/v1/0123456789abcdef0123456789abcdef"),
+            &changes,
+            &effects,
+        ) else {
+            panic!("mismatched credential target must fail closed");
+        };
+        assert!(matches!(
+            error,
+            InstallationError::InvalidField { field, .. }
+                if field == "installer_effect.provision.target"
+        ));
+    }
+
+    #[test]
     fn installer_rejects_swapped_or_legacy_service_identity() {
         let program_data = must(protected_program_data_root());
         let roots = must(RuntimeStateRoots::derive_profiled(
@@ -10164,6 +10342,7 @@ mod tests {
             validate_installer_effects(
                 InstallationProfile::SystemService,
                 &roots,
+                &test_handle("eliot/store/v1/0123456789abcdef0123456789abcdef"),
                 &changes,
                 &effects,
             )
@@ -10371,6 +10550,17 @@ mod tests {
         wrong_generation.runtime_launch.generation = test_handle("generation:other");
         assert!(wrong_generation.validate().is_err());
 
+        let mut wrong_credential_target = transaction.candidate_manifest.clone();
+        wrong_credential_target.store_credential_target =
+            test_handle("eliot/store/v1/fedcba9876543210fedcba9876543210");
+        assert!(wrong_credential_target.validate().is_err());
+
+        let mut invalid_credential_target = transaction.candidate_manifest.clone();
+        invalid_credential_target
+            .runtime_launch
+            .store_credential_target = test_handle("eliot/store");
+        assert!(invalid_credential_target.validate().is_err());
+
         let mut wrong_fence = descriptor.clone();
         wrong_fence.authority_generation = must(ResourceGeneration::new(2));
         assert!(wrong_fence.validate().is_err());
@@ -10512,11 +10702,13 @@ mod tests {
         else {
             panic!("legacy fixture runtime launch");
         };
+        runtime.remove("store_credential_target");
         runtime.remove("store_bridge_arguments");
         runtime.remove("runtime_state_roots");
         let Some(manifest) = legacy["generations"][0]["manifest"].as_object_mut() else {
             panic!("v1 fixture manifest");
         };
+        manifest.remove("store_credential_target");
         manifest.remove("runtime_state_roots_digest");
         legacy
     }
@@ -10541,14 +10733,47 @@ mod tests {
             panic!("pre-split registry object");
         };
         object.remove("pending_activation");
+        let Some(manifest) = value["generations"][0]["manifest"].as_object_mut() else {
+            panic!("pre-split fixture manifest");
+        };
+        manifest.remove("store_credential_target");
         let Some(runtime) = value["generations"][0]["manifest"]["runtime_launch"].as_object_mut()
         else {
             panic!("pre-split fixture runtime launch");
         };
+        runtime.remove("store_credential_target");
         let bridge_arguments = runtime
             .remove("store_bridge_arguments")
             .unwrap_or_else(|| panic!("pre-split bridge arguments"));
         runtime.insert("canonical_store_arguments".to_owned(), bridge_arguments);
+        value
+    }
+
+    fn pre_credential_binding_registry_value() -> serde_json::Value {
+        let transaction = registering_transaction();
+        let generation = transaction.candidate_manifest.generation.clone();
+        let registry = ApprovedGenerationRegistry {
+            generations: vec![ApprovedGeneration {
+                manifest: transaction.candidate_manifest,
+                approval_ref: test_handle("approval:pre-credential-binding"),
+                active: true,
+                last_known_good: false,
+            }],
+            active_generation: Some(generation),
+            last_known_good_generation: None,
+            pending_activation: None,
+            last_terminal_activation: None,
+        };
+        let mut value = must(serde_json::to_value(registry));
+        let Some(manifest) = value["generations"][0]["manifest"].as_object_mut() else {
+            panic!("pre-credential-binding fixture manifest");
+        };
+        manifest.remove("store_credential_target");
+        let Some(runtime) = value["generations"][0]["manifest"]["runtime_launch"].as_object_mut()
+        else {
+            panic!("pre-credential-binding fixture runtime launch");
+        };
+        runtime.remove("store_credential_target");
         value
     }
 
@@ -10558,6 +10783,19 @@ mod tests {
         assert!(matches!(
             decode_registry_bytes(&bytes),
             Err(InstallationError::MigrationRequired { .. })
+        ));
+    }
+
+    #[test]
+    fn pre_credential_binding_registry_requires_explicit_restage() {
+        let bytes = must(serde_json::to_vec(&pre_credential_binding_registry_value()));
+        let Err(error) = decode_registry_bytes(&bytes) else {
+            panic!("pre-credential-binding registry must require migration");
+        };
+        assert!(matches!(
+            error,
+            InstallationError::MigrationRequired { reason }
+                if reason.contains("descriptor-bound Store credential target")
         ));
     }
 

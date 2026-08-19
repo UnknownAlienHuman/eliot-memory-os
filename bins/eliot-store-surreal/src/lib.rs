@@ -15,7 +15,7 @@ use eliot_blob::BlobRootOwner;
 use eliot_contracts::StateFence;
 use eliot_installation::{
     InstallationProfile, RuntimeLaunchDescriptor, ValidatedRuntimeRootLeases,
-    WindowsRuntimeRootLease, WindowsRuntimeRootLeaseProvider,
+    WindowsRuntimeRootLease, WindowsRuntimeRootLeaseProvider, validate_store_credential_target,
 };
 use eliot_ipc::{ReplayDisposition, ReplayLedger, TransportLimits};
 use eliot_kernel_service::{
@@ -141,6 +141,14 @@ impl StoreLaunchConfig {
         self.runtime_launch
             .validate()
             .map_err(|error| format!("invalid runtime_launch: {error}"))?;
+        validate_store_credential_target(&self.credential_ref)
+            .map_err(|reason| format!("invalid credential_ref: {reason}"))?;
+        if self.credential_ref != self.runtime_launch.store_credential_target.as_str() {
+            return Err(
+                "credential_ref must exactly equal runtime_launch.store_credential_target"
+                    .to_owned(),
+            );
+        }
         if self.approved_artifact_hash != self.runtime_launch.store_bridge_artifact_digest.as_str()
         {
             return Err(
@@ -1063,6 +1071,7 @@ mod tests {
             kernel_work_root: &'a PlatformHandle,
             kernel_artifact_digest: &'a PlatformHandle,
             store_config_path: &'a PlatformHandle,
+            store_credential_target: &'a PlatformHandle,
             store_bootstrap_descriptor_path: &'a PlatformHandle,
             store_bootstrap_descriptor_digest: &'a PlatformHandle,
             canonical_store_executable_path: &'a PlatformHandle,
@@ -1088,6 +1097,7 @@ mod tests {
             kernel_work_root: &descriptor.kernel_work_root,
             kernel_artifact_digest: &descriptor.kernel_artifact_digest,
             store_config_path: &descriptor.store_config_path,
+            store_credential_target: &descriptor.store_credential_target,
             store_bootstrap_descriptor_path: &descriptor.store_bootstrap_descriptor_path,
             store_bootstrap_descriptor_digest: &descriptor.store_bootstrap_descriptor_digest,
             canonical_store_executable_path: &descriptor.canonical_store_executable_path,
@@ -1131,6 +1141,7 @@ mod tests {
             kernel_work_root: roots.kernel_work_root.clone(),
             kernel_artifact_digest: handle("0".repeat(64)),
             store_config_path: config_path.clone(),
+            store_credential_target: handle("eliot/store/v1/0123456789abcdef0123456789abcdef"),
             store_bridge_executable_path: handle(
                 r"C:\ProgramData\Eliot\bin\eliot-store-surreal.exe",
             ),
@@ -1195,7 +1206,7 @@ mod tests {
             schema_generation: "1.0.0".to_owned(),
             blob_root: r"C:\ProgramData\Eliot\blob".to_owned(),
             instance_id: "store-test".to_owned(),
-            credential_ref: "eliot/store".to_owned(),
+            credential_ref: "eliot/store/v1/0123456789abcdef0123456789abcdef".to_owned(),
             runtime_launch: runtime_launch(),
         };
         config.approved_config_hash = launch_config_digest(&config).expect("config digest");
@@ -1212,6 +1223,21 @@ mod tests {
         let mut endpoint_altered = config;
         endpoint_altered.endpoint = "ws://127.0.0.1:9000".to_owned();
         assert!(endpoint_altered.validate().is_err());
+    }
+
+    #[test]
+    fn credential_ref_must_match_descriptor_bound_target() {
+        let config = config();
+        assert!(config.validate().is_ok());
+
+        let mut mismatched = config;
+        mismatched.credential_ref = "eliot/store/v1/fedcba9876543210fedcba9876543210".to_owned();
+        mismatched.approved_config_hash =
+            launch_config_digest(&mismatched).expect("mismatched config digest");
+        let error = mismatched
+            .validate()
+            .expect_err("credential target mismatch");
+        assert!(error.contains("credential_ref must exactly equal"));
     }
 
     #[test]

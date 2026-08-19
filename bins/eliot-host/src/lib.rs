@@ -5644,6 +5644,7 @@ mod journal_tests {
             kernel_work_root: &'a PlatformHandle,
             kernel_artifact_digest: &'a PlatformHandle,
             store_config_path: &'a PlatformHandle,
+            store_credential_target: &'a PlatformHandle,
             store_bootstrap_descriptor_path: &'a PlatformHandle,
             store_bootstrap_descriptor_digest: &'a PlatformHandle,
             canonical_store_executable_path: &'a PlatformHandle,
@@ -5678,6 +5679,7 @@ mod journal_tests {
         let config_path = path(&root, "generation.json");
         let bootstrap_path = path(&root, "store-bootstrap.json");
         let authority_path = path(&root, "authority.json");
+        let credential_target = handle("eliot/store/v1/0123456789abcdef0123456789abcdef");
         let bridge_path = path(&root, "eliot-store-surreal.exe");
         let provider_path = path(&root, "surreal.exe");
         let mut runtime_launch = RuntimeLaunchDescriptor {
@@ -5700,6 +5702,7 @@ mod journal_tests {
             kernel_work_root: runtime_state_roots.kernel_work_root.clone(),
             kernel_artifact_digest: kernel_digest.clone(),
             store_config_path: config_path.clone(),
+            store_credential_target: credential_target,
             store_bridge_executable_path: bridge_path.clone(),
             store_bridge_artifact_digest: bridge_digest.clone(),
             store_bootstrap_descriptor_path: bootstrap_path.clone(),
@@ -5761,6 +5764,7 @@ mod journal_tests {
             kernel_work_root: &runtime_launch.kernel_work_root,
             kernel_artifact_digest: &runtime_launch.kernel_artifact_digest,
             store_config_path: &runtime_launch.store_config_path,
+            store_credential_target: &runtime_launch.store_credential_target,
             store_bootstrap_descriptor_path: &runtime_launch.store_bootstrap_descriptor_path,
             store_bootstrap_descriptor_digest: &runtime_launch.store_bootstrap_descriptor_digest,
             canonical_store_executable_path: &runtime_launch.canonical_store_executable_path,
@@ -5788,6 +5792,7 @@ mod journal_tests {
             dependency_closure_refs: vec![handle("evidence:dependency-closure")],
             license_refs: vec![handle("evidence:licenses")],
             config_digest,
+            store_credential_target: handle("eliot/store/v1/0123456789abcdef0123456789abcdef"),
             supervision_key_fingerprint: handle("6".repeat(64)),
             signature_ref: handle("evidence:signature"),
             runtime_state_roots_digest: runtime_state_roots.roots_digest.clone(),

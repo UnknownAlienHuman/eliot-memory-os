@@ -21,6 +21,25 @@ pub const HOST_CREDENTIAL_CONTROL_PIPE: &str = r"\\.\pipe\eliot-host-store-crede
 /// Exact Windows SID of the built-in `LocalService` principal.
 pub const LOCAL_SERVICE_SID: &str = "S-1-5-19";
 
+/// Validates the one canonical Credential Manager target admitted for Store.
+///
+/// The target is an opaque `PlatformHandle` at the wire boundary, but its
+/// namespace and unpredictable token are part of the installation authority.
+/// Callers must compare the exact validated value; no target may be derived,
+/// defaulted or substituted at runtime.
+pub fn validate_store_credential_target(value: &str) -> Result<(), String> {
+    let target_token = value.strip_prefix("eliot/store/v1/");
+    if target_token.is_none_or(|token| {
+        token.len() != 32
+            || !token
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    }) {
+        return Err("must be an unpredictable reserved Store credential target".to_owned());
+    }
+    Ok(())
+}
+
 /// Credential provider admitted for the production Store process.
 #[derive(Clone, Copy, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
@@ -78,16 +97,10 @@ impl StoreCredentialProvisionPlan {
             });
         }
         handle(&self.target, "credential.target")?;
-        let target_token = self.target.as_str().strip_prefix("eliot/store/v1/");
-        if target_token.is_none_or(|token| {
-            token.len() != 32
-                || !token
-                    .bytes()
-                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-        }) {
+        if let Err(reason) = validate_store_credential_target(self.target.as_str()) {
             return Err(InstallationError::InvalidField {
                 field: "credential.target".to_owned(),
-                reason: "must be an unpredictable reserved Store credential target".to_owned(),
+                reason,
             });
         }
         handle(
