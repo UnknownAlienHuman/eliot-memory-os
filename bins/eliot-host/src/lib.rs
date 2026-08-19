@@ -66,6 +66,273 @@ pub const SERVICE_NAME: &str = ELIOT_HOST_SERVICE_NAME;
 pub const PROTOCOL_VERSION: &str = "eliot.host.v1";
 pub const HOST_JOURNAL_RELATIVE_PATH: &str = "Eliot/host/host-state-journal.redb";
 
+/// Exact launch authority supplied by the Runtime Live SCM registration.
+///
+/// `SystemService` Host startup is argv-bound.  The service must not recover any
+/// of these values from ambient environment or current-directory state.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HostLaunchOptions {
+    config_descriptor_path: PathBuf,
+    config_descriptor_digest: PlatformHandle,
+    installation: PlatformHandle,
+    transaction_plan_generation: u64,
+    registration_nonce: Option<PlatformHandle>,
+}
+
+impl HostLaunchOptions {
+    /// Parses the canonical SCM argv after argv[0] (the service name).
+    ///
+    /// The four authority pairs must appear exactly once and in the order
+    /// rendered by [`ServiceBootstrapArguments`].  The established optional
+    /// registration nonce is accepted only as the final pair. That nonce is
+    /// effect-scoped SCM readback evidence, not a Host admission binding; the
+    /// approved manifest's four authority values remain independently required.
+    /// All other flags and all substitutions are rejected.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HostError::Platform`] when the argv shape or a typed value is
+    /// invalid.
+    pub fn parse<I, S>(args: I) -> Result<Self, HostError>
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<OsString>,
+    {
+        let args = args.into_iter().map(Into::into).collect::<Vec<_>>();
+        if args.len() != 8 && args.len() != 10 {
+            return Err(Self::invalid_argv("expected exactly four authority pairs"));
+        }
+        let flag = |index: usize, expected: &str| {
+            args.get(index)
+                .and_then(|value| value.to_str())
+                .is_some_and(|actual| actual == expected)
+        };
+        if !flag(0, "--config-descriptor")
+            || !flag(2, "--config-descriptor-sha256")
+            || !flag(4, "--installation-id")
+            || !flag(6, "--tx-plan-generation")
+        {
+            return Err(Self::invalid_argv(
+                "authority flags are missing, reordered, or substituted",
+            ));
+        }
+        if args.len() == 10 && !flag(8, "--registration-nonce") {
+            return Err(Self::invalid_argv("unknown or substituted trailing flag"));
+        }
+
+        let config_descriptor_path = PathBuf::from(&args[1]);
+        if !config_descriptor_path.is_absolute()
+            || config_descriptor_path.as_os_str().is_empty()
+            || !valid_launch_os_path(config_descriptor_path.as_os_str())
+        {
+            return Err(Self::invalid_argv(
+                "config descriptor path must be absolute and valid",
+            ));
+        }
+        let config_descriptor_digest = parse_launch_text(&args[3], "config descriptor digest")?;
+        if !valid_sha256_text(&config_descriptor_digest) {
+            return Err(Self::invalid_argv(
+                "config descriptor digest must be lowercase SHA-256",
+            ));
+        }
+        let installation_value = parse_launch_text(&args[5], "installation id")?;
+        if !valid_launch_identity(&installation_value) {
+            return Err(Self::invalid_argv("installation id is invalid"));
+        }
+        let transaction_plan_generation =
+            parse_launch_text(&args[7], "transaction plan generation")
+                .ok()
+                .and_then(|value| value.parse::<u64>().ok())
+                .filter(|value| *value != 0)
+                .ok_or_else(|| {
+                    Self::invalid_argv("transaction plan generation must be non-zero")
+                })?;
+        let registration_nonce = if args.len() == 10 {
+            let nonce = parse_launch_text(&args[9], "registration nonce")?;
+            if !valid_sha256_text(&nonce) {
+                return Err(Self::invalid_argv(
+                    "registration nonce must be lowercase SHA-256",
+                ));
+            }
+            Some(
+                PlatformHandle::new(nonce)
+                    .map_err(|error| Self::invalid_argv(&error.to_string()))?,
+            )
+        } else {
+            None
+        };
+        let installation = PlatformHandle::new(installation_value)
+            .map_err(|error| Self::invalid_argv(&error.to_string()))?;
+        let config_descriptor_digest = PlatformHandle::new(config_descriptor_digest)
+            .map_err(|error| Self::invalid_argv(&error.to_string()))?;
+        Ok(Self {
+            config_descriptor_path,
+            config_descriptor_digest,
+            installation,
+            transaction_plan_generation,
+            registration_nonce,
+        })
+    }
+
+    /// Parses the mandatory argv contract for an installed `SystemService`.
+    ///
+    /// Installer service effects persist a registration nonce before SCM
+    /// mutation, so a live SCM callback must include that final pair. The
+    /// nonce remains effect-scoped readback evidence; the four manifest
+    /// bindings below are still the Host admission authority.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HostError::Platform`] when the canonical argv is malformed or
+    /// omits the required registration nonce.
+    pub fn parse_system_service<I, S>(args: I) -> Result<Self, HostError>
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<OsString>,
+    {
+        let options = Self::parse(args)?;
+        if options.registration_nonce.is_none() {
+            return Err(Self::invalid_argv(
+                "SystemService requires the registration nonce pair",
+            ));
+        }
+        Ok(options)
+    }
+
+    #[must_use]
+    pub fn config_descriptor_path(&self) -> &Path {
+        &self.config_descriptor_path
+    }
+
+    #[must_use]
+    pub fn config_descriptor_digest(&self) -> &PlatformHandle {
+        &self.config_descriptor_digest
+    }
+
+    #[must_use]
+    pub const fn installation(&self) -> &PlatformHandle {
+        &self.installation
+    }
+
+    #[must_use]
+    pub const fn transaction_plan_generation(&self) -> u64 {
+        self.transaction_plan_generation
+    }
+
+    #[must_use]
+    pub fn registration_nonce(&self) -> Option<&PlatformHandle> {
+        self.registration_nonce.as_ref()
+    }
+
+    fn invalid_argv(reason: &str) -> HostError {
+        HostError::Platform(format!("invalid Host launch argv: {reason}"))
+    }
+}
+
+fn parse_launch_text(value: &OsString, field: &str) -> Result<String, HostError> {
+    value
+        .to_str()
+        .filter(|value| !value.is_empty() && !value.chars().any(char::is_control))
+        .map(str::to_owned)
+        .ok_or_else(|| HostLaunchOptions::invalid_argv(&format!("{field} is not valid text")))
+}
+
+fn valid_launch_os_path(value: &std::ffi::OsStr) -> bool {
+    value
+        .to_str()
+        .is_some_and(|value| !value.is_empty() && !value.chars().any(char::is_control))
+}
+
+fn valid_sha256_text(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|value| value.is_ascii_digit() || matches!(value, b'a'..=b'f'))
+}
+
+fn valid_launch_identity(value: &str) -> bool {
+    !value.is_empty() && !value.contains('"') && !value.chars().any(char::is_control)
+}
+
+#[cfg(test)]
+mod launch_options_tests {
+    use super::*;
+    use eliot_platform_windows::ServiceBootstrapArguments;
+
+    fn valid_bootstrap() -> ServiceBootstrapArguments {
+        ServiceBootstrapArguments::new(
+            std::env::temp_dir().join("eliot-authority.json"),
+            "a".repeat(64),
+            "installation-7",
+            7,
+            std::iter::empty::<String>(),
+        )
+        .and_then(|bootstrap| bootstrap.with_registration_nonce("b".repeat(64)))
+        .unwrap_or_else(|error| panic!("{error}"))
+    }
+
+    fn valid_args() -> Vec<OsString> {
+        valid_bootstrap()
+            .argv()
+            .into_iter()
+            .map(OsString::from)
+            .collect()
+    }
+
+    #[test]
+    fn launch_options_parse_exact_registration_contract() {
+        let bootstrap = valid_bootstrap();
+        let options =
+            HostLaunchOptions::parse(bootstrap.argv()).unwrap_or_else(|error| panic!("{error}"));
+        assert_eq!(
+            options.config_descriptor_path(),
+            &std::env::temp_dir().join("eliot-authority.json")
+        );
+        assert_eq!(options.config_descriptor_digest().as_str(), "a".repeat(64));
+        assert_eq!(options.installation().as_str(), "installation-7");
+        assert_eq!(options.transaction_plan_generation(), 7);
+        assert_eq!(
+            options.registration_nonce().map(PlatformHandle::as_str),
+            Some("b".repeat(64).as_str())
+        );
+    }
+
+    #[test]
+    fn launch_options_reject_missing_duplicate_reordered_unknown_and_substituted_args() {
+        let mut missing = valid_args();
+        missing.truncate(8);
+        missing.remove(6);
+        missing.remove(6);
+        assert!(HostLaunchOptions::parse(missing).is_err());
+
+        let mut duplicate = valid_args();
+        duplicate[8] = OsString::from("--config-descriptor");
+        assert!(HostLaunchOptions::parse(duplicate).is_err());
+
+        let mut reordered = valid_args();
+        reordered.swap(0, 2);
+        reordered.swap(1, 3);
+        assert!(HostLaunchOptions::parse(reordered).is_err());
+
+        let mut unknown = valid_args();
+        unknown[8] = OsString::from("--unknown");
+        assert!(HostLaunchOptions::parse(unknown).is_err());
+
+        let mut substituted = valid_args();
+        substituted[1] = OsString::from("relative-authority.json");
+        assert!(HostLaunchOptions::parse(substituted).is_err());
+    }
+
+    #[test]
+    fn system_service_launch_options_require_registration_nonce() {
+        let mut without_nonce = valid_args();
+        without_nonce.truncate(8);
+        assert!(HostLaunchOptions::parse(without_nonce.clone()).is_ok());
+        assert!(HostLaunchOptions::parse_system_service(without_nonce).is_err());
+        assert!(HostLaunchOptions::parse_system_service(valid_args()).is_ok());
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum HostError {
     #[error("host state store: {0}")]
@@ -2220,7 +2487,53 @@ impl HostJobBranches {
             .map_err(|error| HostError::ProcessContour(error.to_string()))
     }
 
-    /// Starts the approved Kernel and store images in separate Job Objects.
+    /// Resolves the approved Kernel and Store working directories.
+    fn approved_working_directories(
+        launch: &RuntimeLaunchDescriptor,
+        portable_root: Option<&UserOwnedRootLease>,
+        config_path: &Path,
+    ) -> Result<(PathBuf, PathBuf), HostError> {
+        if launch.profile != InstallationProfile::PortableDev {
+            return Ok((
+                PathBuf::from(launch.runtime_state_roots.kernel_work_root.as_str()),
+                PathBuf::from(launch.runtime_state_roots.store_work_root.as_str()),
+            ));
+        }
+        let root = portable_root
+            .ok_or_else(|| HostError::ProcessContour("portable root lease is missing".to_owned()))?
+            .path();
+        let root = std::fs::canonicalize(root)
+            .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+        let config_path = std::fs::canonicalize(config_path)
+            .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+        if !config_path.starts_with(&root) {
+            return Err(HostError::ProcessContour(
+                "portable launch config is outside the retained root".to_owned(),
+            ));
+        }
+        let canonicalize = |path: &PlatformHandle, field: &str| {
+            let working_directory = std::fs::canonicalize(Path::new(path.as_str()))
+                .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+            if !working_directory.starts_with(&root) {
+                return Err(HostError::ProcessContour(format!(
+                    "portable {field} is outside the retained root"
+                )));
+            }
+            Ok(working_directory)
+        };
+        Ok((
+            canonicalize(
+                &launch.runtime_state_roots.kernel_work_root,
+                "Kernel working directory",
+            )?,
+            canonicalize(
+                &launch.runtime_state_roots.store_work_root,
+                "Store working directory",
+            )?,
+        ))
+    }
+
+    /// Starts the approved Kernel and Store images in separate Job Objects.
     /// Both images are pinned and validated while suspended, then resumed only
     /// after the generation identity has been accepted.
     ///
@@ -2324,26 +2637,8 @@ impl HostJobBranches {
                 "Store config is not the approved generation config".to_owned(),
             ));
         }
-        let working_directory = if launch.profile == InstallationProfile::PortableDev {
-            let root = portable_root
-                .as_ref()
-                .ok_or_else(|| {
-                    HostError::ProcessContour("portable root lease is missing".to_owned())
-                })?
-                .path();
-            let config_inside_root = config_path.starts_with(root);
-            let working_directory =
-                std::fs::canonicalize(Path::new(launch.kernel_work_root.as_str()))
-                    .map_err(|error| HostError::ProcessContour(error.to_string()))?;
-            if !config_inside_root || !working_directory.starts_with(root) {
-                return Err(HostError::ProcessContour(
-                    "portable launch path is outside the retained root".to_owned(),
-                ));
-            }
-            working_directory
-        } else {
-            PathBuf::from(launch.kernel_work_root.as_str())
-        };
+        let (kernel_working_directory, store_working_directory) =
+            Self::approved_working_directories(launch, portable_root.as_ref(), &config_path)?;
         let launch_result = launch_store_then_kernel(
             || {
                 Self::launch(
@@ -2360,7 +2655,7 @@ impl HostJobBranches {
                     &config_pin,
                     host,
                     &launch.store_bridge_arguments,
-                    &working_directory,
+                    &store_working_directory,
                     None,
                 )
             },
@@ -2405,7 +2700,7 @@ impl HostJobBranches {
                     &config_pin,
                     host,
                     &launch.kernel_arguments,
-                    &working_directory,
+                    &kernel_working_directory,
                     Some(&self.kernel_launch_binding),
                 )
             },
@@ -2530,6 +2825,11 @@ impl HostJobBranches {
         let config_pin = self.config_pin.as_ref().ok_or_else(|| {
             HostError::ProcessContour("generation config pin is missing".to_owned())
         })?;
+        let launch = self.launch.as_ref().ok_or_else(|| {
+            HostError::ProcessContour("runtime launch descriptor is missing".to_owned())
+        })?;
+        let (kernel_working_directory, _) =
+            Self::approved_working_directories(launch, self.portable_root.as_ref(), config_path)?;
         let child = Self::launch(
             &executable,
             executable_lease,
@@ -2543,22 +2843,8 @@ impl HostJobBranches {
             approved_config_path,
             config_pin,
             host,
-            &self
-                .launch
-                .as_ref()
-                .ok_or_else(|| {
-                    HostError::ProcessContour("runtime launch descriptor is missing".to_owned())
-                })?
-                .kernel_arguments,
-            Path::new(
-                self.launch
-                    .as_ref()
-                    .ok_or_else(|| {
-                        HostError::ProcessContour("runtime launch descriptor is missing".to_owned())
-                    })?
-                    .kernel_work_root
-                    .as_str(),
-            ),
+            &launch.kernel_arguments,
+            &kernel_working_directory,
             Some(&self.kernel_launch_binding),
         )?;
         Ok(child)
@@ -2592,6 +2878,11 @@ impl HostJobBranches {
         let config_pin = self.config_pin.as_ref().ok_or_else(|| {
             HostError::ProcessContour("generation config pin is missing".to_owned())
         })?;
+        let launch = self.launch.as_ref().ok_or_else(|| {
+            HostError::ProcessContour("runtime launch descriptor is missing".to_owned())
+        })?;
+        let (_, store_working_directory) =
+            Self::approved_working_directories(launch, self.portable_root.as_ref(), config_path)?;
         let child = Self::launch(
             &executable,
             executable_lease,
@@ -2605,22 +2896,8 @@ impl HostJobBranches {
             approved_config_path,
             config_pin,
             host,
-            &self
-                .launch
-                .as_ref()
-                .ok_or_else(|| {
-                    HostError::ProcessContour("runtime launch descriptor is missing".to_owned())
-                })?
-                .store_bridge_arguments,
-            Path::new(
-                self.launch
-                    .as_ref()
-                    .ok_or_else(|| {
-                        HostError::ProcessContour("runtime launch descriptor is missing".to_owned())
-                    })?
-                    .kernel_work_root
-                    .as_str(),
-            ),
+            &launch.store_bridge_arguments,
+            &store_working_directory,
             None,
         )?;
         Ok(child)
@@ -3684,6 +3961,7 @@ pub struct HostComposition {
     journal: ProductionHostStateJournal,
     registry_store: RedbInstallationRegistry,
     registry: ApprovedGenerationRegistry,
+    launch_options: HostLaunchOptions,
     host: HostInstallationEpoch,
     activation_generation: EpochTransition,
     activation_id: PlatformHandle,
@@ -3700,6 +3978,44 @@ pub struct HostComposition {
 }
 
 impl HostComposition {
+    fn validate_launch_options_for_manifest(
+        options: &HostLaunchOptions,
+        manifest: &CandidateManifest,
+    ) -> Result<(), HostError> {
+        let launch = &manifest.runtime_launch;
+        // The optional registration nonce belongs to the installer effect
+        // receipt. It has no approved-generation field to bind here, so it is
+        // deliberately excluded; none of the four Host authority fields may
+        // be substituted by it.
+        let manifest_descriptor_path = PathBuf::from(launch.authority_descriptor_path.as_str());
+        if manifest_descriptor_path != options.config_descriptor_path
+            || launch.authority_descriptor_digest != *options.config_descriptor_digest()
+            || launch.installation_epoch.installation != *options.installation()
+            || launch.authority_generation.value() != options.transaction_plan_generation()
+        {
+            return Err(HostError::ProcessContour(
+                "SCM launch authority does not match the approved generation".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn validate_launch_options_for_registry(
+        options: &HostLaunchOptions,
+        registry: &ApprovedGenerationRegistry,
+        pending: Option<&eliot_installation::PendingActivation>,
+    ) -> Result<(), HostError> {
+        if let Some(pending) = pending {
+            return Self::validate_launch_options_for_manifest(options, &pending.manifest);
+        }
+        if let Some(active) = registry.active() {
+            return Self::validate_launch_options_for_manifest(options, &active.manifest);
+        }
+        Err(HostError::ProcessContour(
+            "SCM launch authority has no approved generation".to_owned(),
+        ))
+    }
+
     /// Opens the durable Host contour for one installation identity and
     /// advances its persisted epoch before any process admission.
     ///
@@ -3711,16 +4027,25 @@ impl HostComposition {
         clippy::needless_pass_by_value,
         reason = "the public constructor owns the installation identity while retaining its established API"
     )]
-    pub fn open(path: impl AsRef<Path>, installation: PlatformHandle) -> Result<Self, HostError> {
+    pub fn open(
+        path: impl AsRef<Path>,
+        launch_options: HostLaunchOptions,
+    ) -> Result<Self, HostError> {
         let path = path.as_ref();
-        if installation.as_str().trim().is_empty() {
+        if launch_options.installation().as_str().trim().is_empty() {
             return Err(HostError::MissingInstallation);
         }
+        let installation = launch_options.installation().clone();
         let owner_lease = HostOwnerLease::acquire(&installation).map_err(owner_lease_error)?;
         let registry_path = path.with_file_name("installation-registry.redb");
         let registry_store = RedbInstallationRegistry::open(registry_path)?;
         let mut registry = registry_store.load()?;
         let pending_for_reopen = registry.pending_activation().cloned();
+        Self::validate_launch_options_for_registry(
+            &launch_options,
+            &registry,
+            pending_for_reopen.as_ref(),
+        )?;
         if let Some(pending) = pending_for_reopen.as_ref()
             && pending
                 .manifest
@@ -3749,6 +4074,7 @@ impl HostComposition {
             journal,
             registry_store,
             registry,
+            launch_options,
             host,
             activation_generation,
             activation_id,
@@ -4038,6 +4364,7 @@ impl HostComposition {
         store_executable: &Path,
         pending: Option<&eliot_installation::PendingActivation>,
     ) -> Result<(), HostError> {
+        Self::validate_launch_options_for_manifest(&self.launch_options, manifest)?;
         if let Some(pending) = pending {
             let current = self.journal.snapshot()?.activation.ok_or_else(|| {
                 HostError::OwnerLeaseRecovery("activation record is absent".to_owned())
@@ -5802,6 +6129,107 @@ mod journal_tests {
             .validate()
             .unwrap_or_else(|error| panic!("liveness manifest: {error}"));
         (manifest, root)
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn host_launch_options_bind_exact_manifest_and_require_registry_evidence() {
+        let (manifest, root) = liveness_manifest_with_distinct_store_digests();
+        let options = HostLaunchOptions {
+            config_descriptor_path: PathBuf::from(
+                manifest.runtime_launch.authority_descriptor_path.as_str(),
+            ),
+            config_descriptor_digest: manifest.runtime_launch.authority_descriptor_digest.clone(),
+            installation: manifest
+                .runtime_launch
+                .installation_epoch
+                .installation
+                .clone(),
+            transaction_plan_generation: manifest.runtime_launch.authority_generation.value(),
+            registration_nonce: Some(PlatformHandle::new("e".repeat(64)).unwrap()),
+        };
+        assert!(HostComposition::validate_launch_options_for_manifest(&options, &manifest).is_ok());
+
+        let mut substituted = options.clone();
+        substituted.config_descriptor_digest =
+            PlatformHandle::new("f".repeat(64)).unwrap_or_else(|_| unreachable!());
+        assert!(
+            HostComposition::validate_launch_options_for_manifest(&substituted, &manifest).is_err()
+        );
+        let mut nonce_substitution = options.clone();
+        nonce_substitution.config_descriptor_digest = nonce_substitution
+            .registration_nonce
+            .clone()
+            .unwrap_or_else(|| unreachable!());
+        assert!(
+            HostComposition::validate_launch_options_for_manifest(&nonce_substitution, &manifest,)
+                .is_err()
+        );
+        assert!(
+            HostComposition::validate_launch_options_for_registry(
+                &options,
+                &ApprovedGenerationRegistry::new(),
+                None,
+            )
+            .is_err()
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn production_start_and_relaunch_store_cwd_use_canonical_store_root() {
+        let (manifest, root) = liveness_manifest_with_distinct_store_digests();
+        for directory in [
+            manifest
+                .runtime_launch
+                .runtime_state_roots
+                .kernel_work_root
+                .as_str(),
+            manifest
+                .runtime_launch
+                .runtime_state_roots
+                .store_work_root
+                .as_str(),
+        ] {
+            std::fs::create_dir_all(directory).unwrap_or_else(|error| panic!("{error}"));
+        }
+        let portable_root = manifest
+            .runtime_launch
+            .portable_root
+            .as_ref()
+            .map_or_else(|| unreachable!(), |path| PathBuf::from(path.as_str()));
+        let lease = UserOwnedRootLease::open_existing(&portable_root)
+            .unwrap_or_else(|error| panic!("portable root lease: {error}"));
+        let config_path = portable_root.join("generation.json");
+        std::fs::write(&config_path, b"fixture").unwrap_or_else(|error| panic!("{error}"));
+        let start = HostJobBranches::approved_working_directories(
+            &manifest.runtime_launch,
+            Some(&lease),
+            &config_path,
+        )
+        .unwrap_or_else(|error| panic!("start cwd: {error}"));
+        let relaunch = HostJobBranches::approved_working_directories(
+            &manifest.runtime_launch,
+            Some(&lease),
+            &config_path,
+        )
+        .unwrap_or_else(|error| panic!("relaunch cwd: {error}"));
+        assert_eq!(start, relaunch);
+        assert_ne!(start.0, start.1);
+        assert_eq!(
+            start.1,
+            std::fs::canonicalize(
+                manifest
+                    .runtime_launch
+                    .runtime_state_roots
+                    .store_work_root
+                    .as_str(),
+            )
+            .unwrap_or_else(|error| panic!("{error}"))
+        );
+        drop(lease);
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[cfg(windows)]

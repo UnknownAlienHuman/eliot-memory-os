@@ -2,11 +2,11 @@ use std::io::{self, BufRead, Write};
 use std::path::PathBuf;
 
 use eliot_host::{
-    HOST_JOURNAL_RELATIVE_PATH, HostComposition, HostError, PROTOCOL_VERSION, SERVICE_NAME,
+    HOST_JOURNAL_RELATIVE_PATH, HostComposition, HostError, HostLaunchOptions, PROTOCOL_VERSION,
+    SERVICE_NAME,
 };
 #[cfg(windows)]
 use eliot_host::{HostBranchDisposition, HostLivenessTick};
-use eliot_platform::PlatformHandle;
 use eliot_platform_windows::protected_program_data_path;
 use serde::{Deserialize, Serialize};
 
@@ -54,7 +54,16 @@ fn main() {
 }
 
 fn run_console() -> bool {
-    let mut host = match open_host() {
+    let launch_options = match HostLaunchOptions::parse(std::env::args_os().skip(1)) {
+        Ok(options) => options,
+        Err(error) => {
+            write_response(&Response::Error {
+                error: error.to_string(),
+            });
+            return false;
+        }
+    };
+    let mut host = match open_host(launch_options) {
         Ok(host) => host,
         Err(error) => {
             write_response(&Response::Error {
@@ -87,13 +96,9 @@ fn run_console() -> bool {
     finish_console_shutdown(&mut host, "console input ended")
 }
 
-fn open_host() -> Result<HostComposition, HostError> {
-    let installation_value =
-        std::env::var("ELIOT_INSTALLATION_ID").map_err(|_| HostError::MissingInstallation)?;
-    let installation = PlatformHandle::new(installation_value)
-        .map_err(|error| HostError::Platform(format!("invalid ELIOT_INSTALLATION_ID: {error}")))?;
+fn open_host(launch_options: HostLaunchOptions) -> Result<HostComposition, HostError> {
     let path = state_path()?;
-    HostComposition::open(path, installation)
+    HostComposition::open(path, launch_options)
 }
 
 fn state_path() -> Result<PathBuf, HostError> {
@@ -203,7 +208,11 @@ fn run_as_scm_service() -> Result<bool, u32> {
 }
 
 #[cfg(windows)]
-unsafe extern "system" fn service_main(_argc: u32, _argv: *mut *mut u16) {
+#[allow(
+    clippy::too_many_lines,
+    reason = "the SCM callback owns the complete fail-closed service lifecycle"
+)]
+unsafe extern "system" fn service_main(service_arg_count: u32, service_arg_vector: *mut *mut u16) {
     use std::ffi::OsStr;
     use std::os::windows::ffi::OsStrExt;
     use std::sync::atomic::Ordering;
@@ -235,7 +244,22 @@ unsafe extern "system" fn service_main(_argc: u32, _argv: *mut *mut u16) {
     };
     // SAFETY: handle is registered and status is initialized.
     unsafe { SetServiceStatus(handle, &raw const status) };
-    let Ok(mut host) = open_host() else {
+    let launch_options =
+        match unsafe { service_launch_options(service_arg_count, service_arg_vector) } {
+            Ok(options) => options,
+            Err(error) => {
+                let _ = writeln!(
+                    io::stderr().lock(),
+                    "eliot-host: invalid SCM launch argv: {error}"
+                );
+                status.dwCurrentState = SERVICE_STOPPED;
+                status.dwWin32ExitCode = 1;
+                // SAFETY: handle is registered and status is initialized.
+                unsafe { SetServiceStatus(handle, &raw const status) };
+                return;
+            }
+        };
+    let Ok(mut host) = open_host(launch_options) else {
         status.dwCurrentState = SERVICE_STOPPED;
         status.dwWin32ExitCode = 1;
         // SAFETY: handle is registered and status is initialized.
@@ -311,6 +335,43 @@ unsafe extern "system" fn service_main(_argc: u32, _argv: *mut *mut u16) {
     }
     // SAFETY: handle is registered and status is initialized.
     unsafe { SetServiceStatus(handle, &raw const status) };
+}
+
+#[cfg(windows)]
+unsafe fn service_launch_options(
+    service_arg_count: u32,
+    service_arg_vector: *mut *mut u16,
+) -> Result<HostLaunchOptions, HostError> {
+    use std::ffi::OsString;
+    use std::os::windows::ffi::OsStringExt;
+    const MAX_SERVICE_ARG_UNITS: usize = 64 * 1024;
+
+    if service_arg_vector.is_null() || service_arg_count != 11 {
+        return Err(HostError::Platform(
+            "SCM did not provide the canonical nonce-bound service argv".to_owned(),
+        ));
+    }
+    let raw = unsafe {
+        std::slice::from_raw_parts(service_arg_vector.cast_const(), service_arg_count as usize)
+    };
+    let mut launch_args = Vec::with_capacity(raw.len().saturating_sub(1));
+    for pointer in raw.iter().skip(1) {
+        if pointer.is_null() {
+            return Err(HostError::Platform(
+                "SCM provided a null service argv value".to_owned(),
+            ));
+        }
+        let mut length = 0usize;
+        while length < MAX_SERVICE_ARG_UNITS && unsafe { *pointer.add(length) } != 0 {
+            length += 1;
+        }
+        if length == MAX_SERVICE_ARG_UNITS {
+            return Err(HostError::Platform("SCM argv value is too long".to_owned()));
+        }
+        let value = unsafe { std::slice::from_raw_parts(*pointer, length) };
+        launch_args.push(OsString::from_wide(value));
+    }
+    HostLaunchOptions::parse_system_service(launch_args)
 }
 
 #[cfg(windows)]
